@@ -91,11 +91,6 @@ class _FakeKVManager:
         # preserves pre-#10 behavior (staging_enabled ⇒ fallback) for
         # any existing test that didn't set this explicitly.
         self.is_mla_backend = False
-        # #33-C NOOP fake-success: sender.send reads this flag to decide
-        # whether to short-circuit the aux finalizer. Default False
-        # keeps production-style behavior in tests that didn't set it.
-        self._lp_hook_noop_fake_success = False
-
     # --- methods MooncakeKVSender / MooncakeKVManager use ---
 
     def update_status(self, bootstrap_room, status):
@@ -1260,10 +1255,10 @@ class TestMakeLayerPipelineHookDraftLayerSlots(unittest.TestCase):
 
     First fix attempt (#35, reverted in B2): used `num_main - 1` for `is_last` AND extended `layer_end =
     num_layers` on the final main fire to ship draft KV alongside main 76/77 in one RDMA submit. The H200
-    KV_HASH_VERIFY smoke test (2026-05-26) proved this wrong: the LP hook fires from inside
+    H200 smoke test (2026-05-26) proved this wrong: the LP hook fires from inside
     `forward_target_extend`, BEFORE `forward_draft_extend` runs (both inside the same
     `forward_batch_generation` per eagle_worker.py:299-323). At hook fire time the prefill draft pool still
-    holds stale / zero bytes — RDMA snapshotted those and decode L78 ended up all zeros.
+    holds stale / zero bytes; RDMA snapshotted those and decode L78 ended up all zeros.
 
     Final design (B2): hook keeps `num_main - 1` for `is_last` (fixes the original "main 76/77 dropped" bug)
     but does NOT extend layer_end into draft. Draft KV is shipped by a SEPARATE `MooncakeKVSender.send_draft_kv`
@@ -1363,83 +1358,6 @@ class TestSenderHookMixedPathDetection(unittest.TestCase):
         self.assertFalse(sender._hook_handled_in_current_send)
 
 
-def _make_instrumented_hook_mgr(*, num_layers=8, group_size=4):
-    """Build a mgr with the #33-C instrumentation counters attached so timing/noop env paths can be exercised."""
-    from sglang.srt.disaggregation.mooncake.conn import (
-        MooncakeKVManager,
-        _LayerPipelineRequestDispatch,
-    )
-    import types as _types
-
-    captured = []
-    mgr = SimpleNamespace(
-        layer_group_size=group_size,
-        local_num_kv_layers=lambda: num_layers,
-        add_transfer_request=lambda *a, **kw: captured.append(kw),
-        kv_args=SimpleNamespace(prefill_start_layer=0),
-        # #33-C instrumentation state, normally set by MooncakeKVManager.__init__
-        _hook_timing_total_ns=0,
-        _hook_timing_fire_count=0,
-        _hook_timing_dispatch_count=0,
-        _HOOK_TIMING_LOG_EVERY_FIRES=200,
-        _hook_instrumentation_logged_init=False,
-    )
-    mgr.make_layer_pipeline_hook = _types.MethodType(
-        MooncakeKVManager.make_layer_pipeline_hook, mgr
-    )
-    sender = SimpleNamespace(_hook_enqueued_chunks=0, bootstrap_room=910)
-    dispatch = [
-        _LayerPipelineRequestDispatch(
-            room=910,
-            sender=sender,
-            page_indices=np.array([0], dtype=np.int32),
-            index_slice=slice(0, 1),
-        )
-    ]
-    return mgr, dispatch, captured, sender
-
-
-def _fire_hook_with_envs(
-    mgr,
-    dispatch,
-    layer_ids,
-    *,
-    timing=False,
-    noop=False,
-):
-    """Set env vars then fire the hook for `layer_ids`. Restores env on exit."""
-    import os
-    import torch as _torch
-
-    class _FakeEv:
-        def record(self):
-            pass
-
-    keys = {
-        "SGLANG_DISAGG_LAYER_PIPELINE_HOOK_TIMING": "1" if timing else "0",
-        "SGLANG_DISAGG_LAYER_PIPELINE_HOOK_NOOP": "1" if noop else "0",
-    }
-    saved = {k: os.environ.get(k) for k in keys}
-    for k, v in keys.items():
-        os.environ[k] = v
-    original_event = _torch.cuda.Event
-    _torch.cuda.Event = _FakeEv
-    try:
-        hook = mgr.make_layer_pipeline_hook(dispatch)
-        extend_fb = SimpleNamespace(
-            forward_mode=SimpleNamespace(is_extend=lambda: True)
-        )
-        for lid in layer_ids:
-            hook(lid, extend_fb)
-    finally:
-        _torch.cuda.Event = original_event
-        for k, v in saved.items():
-            if v is None:
-                os.environ.pop(k, None)
-            else:
-                os.environ[k] = v
-
-
 def _make_metrics_mgr():
     """Build a minimal `MooncakeKVManager`-method-callable mock with only the LP metrics state pre-wired.
     Bypasses the real __init__ (which needs RDMA + ZMQ) by binding the two public methods to a SimpleNamespace."""
@@ -1523,8 +1441,7 @@ class TestMooncakeKVSenderSendDraftKV(unittest.TestCase):
 
     Pre-B2 (#35 fix): main LP hook's final fire extended layer_range to include draft slots — but that fires
     BEFORE `forward_draft_extend` (eagle_worker.py:299-323 runs target_fwd then draft_fwd sequentially inside
-    the same forward_batch_generation), so RDMA snapshotted stale draft pool bytes. H200 KV_HASH_VERIFY smoke
-    proved decode L78 == 0.
+    the same forward_batch_generation), so RDMA snapshotted stale draft pool bytes and decode L78 was all zeros.
 
     B2 design: main hook covers MAIN ONLY (revert #35's layer_end extension). Draft KV is shipped by
     `send_draft_kv` called from scheduler BEFORE `sender.send` — by then draft fwd has completed. Draft chunk

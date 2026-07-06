@@ -344,17 +344,6 @@ class Envs:
     SGLANG_DISAGG_LAYER_PIPELINE = EnvBool(False)
     SGLANG_DISAGG_LAYER_GROUP_SIZE = EnvInt(4)
     SGLANG_DISAGG_LAYER_PIPELINE_MIN_PREFILL_LEN = EnvInt(2048)
-    # Debug: synchronize and probe KV bytes at hook fire time. Adds cuda.synchronize.
-    SGLANG_DISAGG_LAYER_PIPELINE_VERIFY_KV = EnvBool(False)
-    # Debug: timing instrumentation on the per-fire hook body.
-    SGLANG_DISAGG_LAYER_PIPELINE_HOOK_TIMING = EnvBool(False)
-    # Debug: fire hook + bookkeeping but skip RDMA submit (sender short-circuits
-    # to Success). Decode receives no bytes — prefill-overhead measurement only.
-    SGLANG_DISAGG_LAYER_PIPELINE_HOOK_NOOP = EnvBool(False)
-    # Debug: sample KV bytes per LP chunk and log CRC32 hashes.
-    SGLANG_DISAGG_LAYER_PIPELINE_HASH_LOG = EnvBool(False)
-    # Debug: per-request KV hash verification logs on both prefill and decode.
-    SGLANG_DISAGG_KV_HASH_VERIFY = EnvBool(False)
 
     # Scheduler: others:
     # in seconds. Set if you observe high memory accumulation over a long serving period.

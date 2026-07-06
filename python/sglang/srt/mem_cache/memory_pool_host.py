@@ -342,8 +342,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                     )
             elif self.layout == "page_first":
                 if self.can_use_write_back_jit:
-                    # Staged JIT requires CPU/cuda_host dst indices; fail
-                    # clearly instead of an opaque TVM device mismatch.
+                    # Staged JIT requires CPU/cuda_host dst indices.
                     if host_indices.is_cuda:
                         raise RuntimeError(
                             "HiCache staged write-back expects CPU/cuda_host "
@@ -2310,8 +2309,7 @@ class DSAIndexerPoolHost(HostKVCache):
                 )
             elif self.layout == "page_first":
                 if self.can_use_write_back_jit:
-                    # Staged JIT requires CPU/cuda_host dst indices; fail
-                    # clearly instead of an opaque TVM device mismatch.
+                    # Staged JIT requires CPU/cuda_host dst indices.
                     if host_page_indices.is_cuda:
                         raise RuntimeError(
                             "HiCache DSA indexer staged write-back expects "

@@ -70,14 +70,9 @@ class KVArgs:
     kv_buf_groups: int
     # Only used of npu, for decode total kv layers
     total_kv_layers: int
-    # Main-model KV layer count when draft (MTP/EAGLE) ptrs are appended, so
-    # the LP hook's is_last fires on the last main layer, not past it.
-    # None ⇒ no draft, len(kv_data_ptrs) is all main.
+    # Main-model KV layer count when draft ptrs are appended.
     prefill_num_main_kv_layers: Optional[int] = None
-    # Local main-model KV layer count (excludes draft tail). Equals
-    # ``prefill_num_main_kv_layers`` on prefill; on decode it holds the
-    # full-model main count so the connection layer can fail-loud when the
-    # cross-side layout doesn't match. None ⇒ no draft pool on this side.
+    # Local main-model KV layer count; None means no draft pool.
     num_main_kv_layers: Optional[int] = None
 
 
@@ -107,13 +102,7 @@ class BaseKVManager(ABC):
         ...
 
     def make_layer_pipeline_hook_for_reqs(self, reqs_with_indices):
-        """Build a per-batch forward hook for layer-pipelined KV transfer.
-
-        Returns ``None`` by default — non-Mooncake backends opt out.
-        ``MooncakeKVManager`` overrides this. The caller
-        (``Scheduler.build_layer_pipeline_hook``) MUST NOT install a hook
-        when this returns ``None``.
-        """
+        """Build a per-batch LP hook; non-Mooncake backends opt out."""
         return None
 
 
@@ -150,12 +139,7 @@ class BaseKVSender(ABC):
         return 0
 
     def send_draft_kv(self, kv_indices: npt.NDArray[np.int32]) -> None:
-        """Ship the draft (MTP/EAGLE NEXTN) KV slice for this token chunk.
-
-        Default no-op — backends without a separate draft pool or layer-pipelined
-        transfer don't need it. ``MooncakeKVSender`` overrides this. Callers may
-        invoke it unconditionally; the default keeps the call duck-typing-free.
-        """
+        """Ship draft KV when the backend has a separate draft pool."""
         return
 
     def should_send_kv_chunk(self, num_pages: int, last_chunk: bool) -> bool:

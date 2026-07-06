@@ -39,6 +39,7 @@ from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
+    filter_kv_indices_for_cp_rank,
     get_dsv4_c128_state_indices,
     get_kv_class,
     is_aborted,
@@ -162,24 +163,15 @@ class PrefillBootstrapQueue:
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
             self.token_to_kv_pool.get_contiguous_buf_infos()
         )
-        # Draft-layout validation reorders the draft KV layout and advertises
-        # the main/draft split via num_main_kv_layers. Gated separately from
-        # LP (forced on under LP); with both off the wire protocol matches
-        # the pre-LP build (naive concat, no num_main_kv_layers).
         draft_layout_validation = getattr(
             self.scheduler.server_args,
             "enable_disagg_draft_layout_validation",
             False,
         )
         if draft_layout_validation:
-            # Capture main pool's layer count BEFORE appending draft pool; the
-            # LP hook uses it so is_last fires on the last main layer.
             kv_args.prefill_num_main_kv_layers = len(kv_data_ptrs) // (
                 1 if self.is_mla_backend else 2
             )
-            # Mirror into the side-agnostic ``num_main_kv_layers`` so the
-            # registration layer can ship it to decode without special-casing
-            # the "prefill_" naming. Receivers fail loud on draft-tail mismatch.
             kv_args.num_main_kv_layers = kv_args.prefill_num_main_kv_layers
 
         if self.draft_token_to_kv_pool is not None:
@@ -189,10 +181,6 @@ class PrefillBootstrapQueue:
                 self.draft_token_to_kv_pool.get_contiguous_buf_infos()
             )
             if draft_layout_validation:
-                # MHA per-pool layout is [all K..., all V...]; naive concat
-                # would interleave main/draft K/V and break the //2 split in
-                # `get_mha_kv_ptrs_with_pp`. The helper reorders to keep K and
-                # V halves contiguous; MLA falls through to simple concat.
                 kv_data_ptrs, kv_data_lens, kv_item_lens = (
                     merge_main_and_draft_kv_layout(
                         kv_data_ptrs,
@@ -205,7 +193,6 @@ class PrefillBootstrapQueue:
                     )
                 )
             else:
-                # Pre-LP behavior: naive concat (no main/draft reorder).
                 kv_data_ptrs += draft_kv_data_ptrs
                 kv_data_lens += draft_kv_data_lens
                 kv_item_lens += draft_kv_item_lens
@@ -1001,12 +988,7 @@ class SchedulerDisaggregationPrefillMixin:
         ):
             return
 
-        # Cached-prefix early-send ships main KV only (state_indices=None) and
-        # advances start_send_idx, so under layer pipeline the prefix pages
-        # fall outside the LP hook's range and their DSA indexer state is
-        # never sent -> decode reads a zero indexer buffer -> garbled output.
-        # Disable early-send when state ships via LP (DSA); non-DSA models,
-        # which have no LP-shipped state, keep the optimization.
+        # DSA state ships via LP; cached-prefix early-send would skip that state.
         bootstrap_queue = getattr(self, "disagg_prefill_bootstrap_queue", None)
         kv_mgr = getattr(bootstrap_queue, "kv_manager", None)
         if kv_mgr is not None and getattr(
@@ -1155,9 +1137,6 @@ class SchedulerDisaggregationPrefillMixin:
         page_indices = kv_to_page_indices(kv_indices, page_size)
         if not req.disagg_kv_sender.should_send_kv_chunk(len(page_indices), last_chunk):
             return
-        # Draft KV must enqueue before the aux finalizer. Only send it after
-        # the main LP hook fired, or on empty-main-owner CP ranks; otherwise
-        # the draft bump could mask a missing main hook.
         kv_mgr = getattr(self.disagg_prefill_bootstrap_queue, "kv_manager", None)
         sender = req.disagg_kv_sender
         main_hook_fired = getattr(sender, "_hook_enqueued_chunks", 0) > getattr(
@@ -1180,7 +1159,6 @@ class SchedulerDisaggregationPrefillMixin:
         if bootstrap_queue is None:
             return None
         kv_mgr = bootstrap_queue.kv_manager
-        # Defensive early return: keep the LP-off path cost-free.
         if not getattr(kv_mgr, "layer_pipeline_enabled", False):
             return None
         builder = getattr(kv_mgr, "make_layer_pipeline_hook_for_reqs", None)
@@ -1226,28 +1204,17 @@ class SchedulerDisaggregationPrefillMixin:
                 continue
             page_start = start_idx // page_size
             index_slice = slice(page_start, page_start + len(page_indices))
-            # When all CP ranks transfer, filter pages so each ships its
-            # share (else duplicate writes). Under layer-shard mode each
-            # rank owns ALL pages for its owned layer groups, so keep the
-            # full page set and partition in the hook instead.
             if getattr(kv_mgr, "enable_all_cp_ranks_for_transfer", False):
                 use_layer_cp_shard = getattr(
                     kv_mgr, "use_layer_cp_shard_for_transfer", lambda: False
                 )()
                 if not use_layer_cp_shard:
-                    from sglang.srt.disaggregation.utils import (
-                        filter_kv_indices_for_cp_rank,
-                    )
-
                     page_indices, index_slice = filter_kv_indices_for_cp_rank(
                         kv_mgr, page_indices, index_slice,
                         total_pages=sender.num_kv_indices,
                     )
                     if len(page_indices) == 0:
-                        continue  # this CP rank has no share of the current chunk
-            # NSA state shares page numbering with KV in NSATokenToKVPool,
-            # so reuse the already-CP-filtered page_indices. Non-NSA
-            # models pass None; legacy aux finalizer handles state then.
+                        continue
             state_indices = page_indices if ship_state_via_lp else None
             reqs_with_indices.append(
                 (sender, page_indices, index_slice, state_indices)

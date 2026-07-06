@@ -247,22 +247,6 @@ class MooncakeKVManager(CommonKVManager):
             if self.layer_pipeline_enabled:
                 self.layer_pipeline_progress: Dict[int, _RoomLayerPipelineProgress] = {}
                 self.layer_pipeline_progress_lock = threading.Lock()
-                self._hook_timing_total_ns: int = 0
-                self._hook_timing_fire_count: int = 0
-                self._hook_timing_dispatch_count: int = 0
-                self._HOOK_TIMING_LOG_EVERY_FIRES: int = 200
-                self._hook_instrumentation_logged_init: bool = False
-                # Prefill-only diagnostic: skip RDMA and fake Success.
-                self._lp_hook_noop_fake_success: bool = (
-                    envs.SGLANG_DISAGG_LAYER_PIPELINE_HOOK_NOOP.get()
-                )
-                if self._lp_hook_noop_fake_success:
-                    logger.warning(
-                        "[layer-pipeline] HOOK_NOOP fake-success ENABLED. "
-                        "Prefill batches will short-circuit to Success without "
-                        "any RDMA submit; decode side WILL fail. NEVER set in "
-                        "production."
-                    )
                 self._lp_metrics_lock = threading.Lock()
                 self._lp_chunks_total: int = 0
                 self._lp_chunks_periodic: int = 0
@@ -1758,19 +1742,6 @@ class MooncakeKVManager(CommonKVManager):
             getattr(self, "attn_cp_rank", 0) if use_layer_cp_shard else 0
         )
 
-        instrumentation_timing = envs.SGLANG_DISAGG_LAYER_PIPELINE_HOOK_TIMING.get()
-        instrumentation_noop = envs.SGLANG_DISAGG_LAYER_PIPELINE_HOOK_NOOP.get()
-        if (instrumentation_timing or instrumentation_noop) and not getattr(
-            self, "_hook_instrumentation_logged_init", False
-        ):
-            logger.warning(
-                "[layer-pipeline] hook diagnostic ENABLED — "
-                "TIMING=%s NOOP=%s. NEVER enable in production.",
-                instrumentation_timing,
-                instrumentation_noop,
-            )
-            self._hook_instrumentation_logged_init = True
-
         def _hook(layer_id: int, _fb: "ForwardBatch") -> None:
             if not _fb.forward_mode.is_extend():
                 return
@@ -1786,76 +1757,29 @@ class MooncakeKVManager(CommonKVManager):
                 layer_start, _ = layer_groups[-1]
             else:
                 layer_start = layer_end - group_size
-            if envs.SGLANG_DISAGG_LAYER_PIPELINE_VERIFY_KV.get():
-                _torch.cuda.synchronize()
-                logger.info(
-                    "[layer-pipeline VERIFY_KV] hook fire local_id=%s "
-                    "layer_range=(%s,%s) dispatches=%s",
-                    local_id,
-                    layer_start,
-                    layer_end,
-                    len(dispatch),
-                )
-            ev = _torch.cuda.Event() if not instrumentation_noop else None
-            if ev is not None:
-                ev.record()
+            ev = _torch.cuda.Event()
+            ev.record()
             layer_group_id = local_id // group_size
             if (
                 cp_size_for_shard > 1
                 and layer_group_id % cp_size_for_shard != cp_rank_for_shard
             ):
                 return
-            t_start_ns = (
-                time.perf_counter_ns() if instrumentation_timing else 0
-            )
             for entry in dispatch:
-                if not instrumentation_noop:
-                    self.add_transfer_request(
-                        bootstrap_room=entry.room,
-                        kv_indices=entry.page_indices,
-                        index_slice=entry.index_slice,
-                        is_last_chunk=False,
-                        aux_index=None,
-                        state_indices=entry.state_indices,
-                        layer_group_id=layer_group_id,
-                        layer_range=(layer_start, layer_end),
-                        total_layer_groups=total_layer_groups,
-                        total_chunks_in_request=None,
-                        transfer_event=ev,
-                    )
+                self.add_transfer_request(
+                    bootstrap_room=entry.room,
+                    kv_indices=entry.page_indices,
+                    index_slice=entry.index_slice,
+                    is_last_chunk=False,
+                    aux_index=None,
+                    state_indices=entry.state_indices,
+                    layer_group_id=layer_group_id,
+                    layer_range=(layer_start, layer_end),
+                    total_layer_groups=total_layer_groups,
+                    total_chunks_in_request=None,
+                    transfer_event=ev,
+                )
                 entry.sender._hook_enqueued_chunks += 1
-            if instrumentation_timing:
-                elapsed_ns = time.perf_counter_ns() - t_start_ns
-                self._hook_timing_total_ns += elapsed_ns
-                self._hook_timing_fire_count += 1
-                self._hook_timing_dispatch_count += len(dispatch)
-                if (
-                    self._hook_timing_fire_count
-                    % self._HOOK_TIMING_LOG_EVERY_FIRES
-                    == 0
-                ):
-                    avg_per_fire_us = (
-                        self._hook_timing_total_ns
-                        / self._hook_timing_fire_count
-                        / 1000.0
-                    )
-                    avg_per_dispatch_us = (
-                        self._hook_timing_total_ns
-                        / max(self._hook_timing_dispatch_count, 1)
-                        / 1000.0
-                    )
-                    logger.info(
-                        "[layer-pipeline] hook timing: "
-                        "fires=%d dispatches=%d total=%dms "
-                        "avg/fire=%.1fus avg/dispatch=%.1fus "
-                        "noop_mode=%s",
-                        self._hook_timing_fire_count,
-                        self._hook_timing_dispatch_count,
-                        self._hook_timing_total_ns // 1_000_000,
-                        avg_per_fire_us,
-                        avg_per_dispatch_us,
-                        instrumentation_noop,
-                    )
 
         return _hook
 
@@ -2681,11 +2605,6 @@ class MooncakeKVSender(CommonKVSender):
                             f"receiver-side watermark accounting."
                         )
                 if not is_last_chunk:
-                    return
-                if self.kv_mgr._lp_hook_noop_fake_success:
-                    self.kv_mgr.update_status(
-                        self.bootstrap_room, KVPoll.Success
-                    )
                     return
                 self._chunks_sent = self._hook_enqueued_chunks + 1
                 aux_state_indices = None if hook_handled_state else state_indices

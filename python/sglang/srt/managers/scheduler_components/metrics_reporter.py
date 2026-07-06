@@ -666,17 +666,13 @@ class SchedulerMetricsReporter:
                     if bootstrap_queue is not None
                     else None
                 )
-                # Gate on layer_pipeline_enabled (not method presence) so a
-                # backend that defines the method but doesn't run LP doesn't
-                # export zero-valued metrics that pollute Prometheus.
                 if kv_mgr is not None and getattr(
                     kv_mgr, "layer_pipeline_enabled", False
                 ):
-                    pop_lp_metrics = kv_mgr.pop_layer_pipeline_metrics
                     (
                         self.stats.kv_transfer_layer_group_chunks_delta,
                         self.stats.kv_transfer_layer_group_ms_samples,
-                    ) = pop_lp_metrics()
+                    ) = kv_mgr.pop_layer_pipeline_metrics()
             elif self.scheduler.disaggregation_mode == DisaggregationMode.DECODE:
                 self.stats.num_decode_prealloc_queue_reqs = QueueCount.from_reqs(
                     self.scheduler.disagg_decode_prealloc_queue.queue, priority_enabled

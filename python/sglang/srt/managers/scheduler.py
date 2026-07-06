@@ -3222,6 +3222,13 @@ class Scheduler(
             return None
         return self._maybe_build_layer_pipeline_hook(batch)
 
+    def _add_layer_pipeline_hook_kwarg(
+        self, batch: ScheduleBatch, kwargs: Dict[str, Any]
+    ) -> None:
+        hook = self._maybe_build_layer_pipeline_hook_for_worker(batch)
+        if hook is not None:
+            kwargs["layer_pipeline_hook"] = hook
+
     @scheduler_nvtx_method("scheduler.run_batch")
     def run_batch(
         self,
@@ -3280,14 +3287,7 @@ class Scheduler(
                             if not batch.spec_algorithm.is_none()
                             else {}
                         )
-                        layer_pipeline_hook = (
-                            self._maybe_build_layer_pipeline_hook_for_worker(batch)
-                        )
-                        # Only pass the kwarg when LP produced a hook, so
-                        # workers without layer_pipeline_hook keep the pre-LP
-                        # call signature.
-                        if layer_pipeline_hook is not None:
-                            fwd_kwargs["layer_pipeline_hook"] = layer_pipeline_hook
+                        self._add_layer_pipeline_hook_kwarg(batch, fwd_kwargs)
 
                         # FIXME: pp is not compatible with overlap
                         batch_result = self.model_worker.forward_batch_generation(
@@ -3358,11 +3358,7 @@ class Scheduler(
                 resolve_forward_inputs(batch, self.future_map)
                 with self._forward_isolation(batch, overlap=False):
                     fwd_kwargs = {}
-                    layer_pipeline_hook = (
-                        self._maybe_build_layer_pipeline_hook_for_worker(batch)
-                    )
-                    if layer_pipeline_hook is not None:
-                        fwd_kwargs["layer_pipeline_hook"] = layer_pipeline_hook
+                    self._add_layer_pipeline_hook_kwarg(batch, fwd_kwargs)
                     batch_result = self.model_worker.forward_batch_generation(
                         batch, **fwd_kwargs
                     )
@@ -3389,11 +3385,7 @@ class Scheduler(
                     else {}
                 )
                 resolve_forward_inputs(batch, self.future_map)
-                layer_pipeline_hook = self._maybe_build_layer_pipeline_hook_for_worker(
-                    batch
-                )
-                if layer_pipeline_hook is not None:
-                    kwargs["layer_pipeline_hook"] = layer_pipeline_hook
+                self._add_layer_pipeline_hook_kwarg(batch, kwargs)
                 batch_result = self.model_worker.forward_batch_generation(
                     batch, **kwargs
                 )

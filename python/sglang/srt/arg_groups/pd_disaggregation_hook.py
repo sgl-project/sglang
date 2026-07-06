@@ -14,20 +14,18 @@ logger = logging.getLogger(__name__)
 
 def handle_pd_disaggregation(server_args: ServerArgs) -> None:
     """Validate and normalize PD-disaggregation server args."""
-    if envs.SGLANG_DISAGG_LAYER_PIPELINE.is_set():
-        server_args.enable_disagg_layer_pipeline = (
-            envs.SGLANG_DISAGG_LAYER_PIPELINE.get()
-        )
-    if envs.SGLANG_DISAGG_LAYER_GROUP_SIZE.is_set():
-        server_args.disagg_layer_group_size = envs.SGLANG_DISAGG_LAYER_GROUP_SIZE.get()
-    if envs.SGLANG_DISAGG_LAYER_PIPELINE_MIN_PREFILL_LEN.is_set():
-        server_args.disagg_layer_pipeline_min_prefill_len = (
-            envs.SGLANG_DISAGG_LAYER_PIPELINE_MIN_PREFILL_LEN.get()
-        )
+    for env, attr in (
+        (envs.SGLANG_DISAGG_LAYER_PIPELINE, "enable_disagg_layer_pipeline"),
+        (envs.SGLANG_DISAGG_LAYER_GROUP_SIZE, "disagg_layer_group_size"),
+        (
+            envs.SGLANG_DISAGG_LAYER_PIPELINE_MIN_PREFILL_LEN,
+            "disagg_layer_pipeline_min_prefill_len",
+        ),
+    ):
+        if env.is_set():
+            setattr(server_args, attr, env.get())
 
     if server_args.enable_disagg_layer_pipeline:
-        # The layer-pipeline hook relies on the main/draft layer split that
-        # draft-layout validation establishes, so force it on under LP.
         server_args.enable_disagg_draft_layout_validation = True
         if server_args.disaggregation_mode not in ("prefill", "decode"):
             raise ValueError(
@@ -126,31 +124,4 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                 f"SGLANG_DISAGG_STAGING_BUFFER requires "
                 f"disaggregation_transfer_backend='mooncake' or 'nixl', "
                 f"got '{server_args.disaggregation_transfer_backend}'."
-            )
-
-    # Surface LP debug env vars at startup. These can silently corrupt KV
-    # (HOOK_NOOP fakes RDMA success) or add large per-layer overhead
-    # (KV_HASH_VERIFY); warn loudly so operators don't misconfigure. Only
-    # checked under LP — with LP off these flags are inert.
-    if server_args.enable_disagg_layer_pipeline:
-        _lp_debug_envs = (
-            ("SGLANG_DISAGG_LAYER_PIPELINE_HOOK_NOOP",
-             envs.SGLANG_DISAGG_LAYER_PIPELINE_HOOK_NOOP),
-            ("SGLANG_DISAGG_LAYER_PIPELINE_VERIFY_KV",
-             envs.SGLANG_DISAGG_LAYER_PIPELINE_VERIFY_KV),
-            ("SGLANG_DISAGG_LAYER_PIPELINE_HOOK_TIMING",
-             envs.SGLANG_DISAGG_LAYER_PIPELINE_HOOK_TIMING),
-            ("SGLANG_DISAGG_LAYER_PIPELINE_HASH_LOG",
-             envs.SGLANG_DISAGG_LAYER_PIPELINE_HASH_LOG),
-            ("SGLANG_DISAGG_KV_HASH_VERIFY",
-             envs.SGLANG_DISAGG_KV_HASH_VERIFY),
-        )
-        _active = [name for name, env in _lp_debug_envs if env.get()]
-        if _active:
-            logger.warning(
-                "Layer-pipeline DEBUG env var(s) active: %s. "
-                "These flags are for development only — HOOK_NOOP causes "
-                "silent KV corruption, KV_HASH_VERIFY / HASH_LOG add large "
-                "per-layer overhead. Unset before serving production traffic.",
-                ", ".join(_active),
             )

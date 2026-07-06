@@ -784,30 +784,7 @@ def merge_main_and_draft_kv_layout(
     *,
     is_mla_backend: bool,
 ) -> Tuple[List[int], List[int], List[int]]:
-    """Combine main + draft KV pool buf infos for the disagg transfer layout.
-
-    `CommonKVManager.get_mha_kv_ptrs_with_pp` splits the merged
-    `kv_data_ptrs` as `src[:half]` (all K) and `src[half:]` (all V),
-    relying on the invariant that the first half is K pointers and the
-    second half is V pointers. The per-pool `get_contiguous_buf_infos`
-    already returns `[K_*, V_*]` for MHA — a naive `main + draft`
-    concat produces `[K_main, V_main, K_draft, V_draft]`, then the
-    `// 2` split interleaves the two pools' K/V and the transfer reads
-    V bytes for K slots (silent KV corruption).
-
-    Reorder so the merged MHA layout is `[K_main, K_draft, V_main,
-    V_draft]` — the first half stays all-K, the second half all-V,
-    and logical layer indices [0, n_main) map to main while
-    [n_main, n_main+n_draft) map to draft on BOTH halves.
-
-    MLA / NSA pools store 1 ptr per layer (no K/V split), so simple
-    concat is correct there.
-
-    Apply identically on prefill and decode sides — the two layouts
-    must match or per-layer transfer points at the wrong tensor.
-    """
-    # Fail loud on malformed input — a wrong descriptor only surfaces as
-    # KV corruption downstream.
+    """Merge main/draft KV descriptors while preserving MHA K/V halves."""
     if len(main_ptrs) != len(main_lens) or len(main_ptrs) != len(main_item_lens):
         raise ValueError(
             "main_ptrs / main_lens / main_item_lens length mismatch: "
@@ -824,8 +801,7 @@ def merge_main_and_draft_kv_layout(
             main_lens + draft_lens,
             main_item_lens + draft_item_lens,
         )
-    # MHA: each pool's buf info is [K_*, V_*], so length must be even for the
-    # //2 K/V split to hold.
+    # MHA pools are [K_*, V_*]; merged layout must be [K_main, K_draft, V_main, V_draft].
     if len(main_ptrs) % 2 != 0:
         raise ValueError(
             "MHA main_ptrs length must be even (each layer contributes K + V); "

@@ -162,14 +162,6 @@ test = [
 
 dev = ["sglang[test]"]
 
-# Optional dependencies for the benchmark/disaggregation/ tools
-# (bench_pd_quality.py needs lm-eval + PyYAML; bench_pd_ttft.py only
-# needs `requests`, which is already a runtime dep).
-bench_disagg = [
-  "lm-eval>=0.4.0",
-  "PyYAML>=6.0",
-]
-
 all = [
   "sglang[diffusion]",
   "sglang[http2]",

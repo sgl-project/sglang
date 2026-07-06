@@ -2387,11 +2387,11 @@ class ServerArgs:
     ] = 4
     disagg_layer_pipeline_min_prefill_len: A[
         int,
-        "Minimum prefill request total length in tokens required to use layer-group disaggregated KV transfer.",
+        "Minimum prefill length in tokens required for layer-pipeline KV transfer.",
     ] = 2048
     enable_disagg_draft_layout_validation: A[
         bool,
-        "Validate and reorder draft KV layout across prefill/decode. Forced on when layer pipeline is enabled.",
+        "Validate and reorder draft KV layout across prefill/decode.",
     ] = False
     disaggregation_cp_transfer_shard_mode: A[
         str,

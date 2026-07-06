@@ -117,19 +117,6 @@ inspect the `sglang:kv_transfer_layer_group_chunks_total` counter
 delta. Per-request LP attribution lives in the request's time_stats
 under `transfer_latency_ms`.
 
-### Debug-only environment variables
-
-These flags exist for development; they are NOT for production. A
-startup `WARNING` lists any that are set:
-
-| Env | Effect | Risk |
-|---|---|---|
-| `SGLANG_DISAGG_LAYER_PIPELINE_HOOK_NOOP=1` | Hook fires but skips RDMA, marks success. | **Silent KV corruption on decode.** |
-| `SGLANG_DISAGG_LAYER_PIPELINE_VERIFY_KV=1` | `cuda.synchronize()` + log at every hook fire. | Massive slowdown. |
-| `SGLANG_DISAGG_LAYER_PIPELINE_HOOK_TIMING=1` | Records per-fire hook latency. | Minor overhead. |
-| `SGLANG_DISAGG_LAYER_PIPELINE_HASH_LOG=1` | CRC32 sampling of KV bytes per chunk. | Per-layer D2H copy. |
-| `SGLANG_DISAGG_KV_HASH_VERIFY=1` | Per-request KV hash logs on both sides. | Per-layer D2H copy. |
-
 ## Limitations
 
 - **Mooncake only.** The LP flag requires Mooncake; NIXL / Mori should
