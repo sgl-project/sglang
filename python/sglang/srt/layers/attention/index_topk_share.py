@@ -10,8 +10,10 @@ if TYPE_CHECKING:
 
 
 class IndexTopKShareState:
-    """Adapter around the ForwardBatch fields that carry DSA indexer topk across
-    an MTP draft iteration (``reuse_mtp_topk_indices`` / ``topk_indices``).
+    """Adapter around the state that carries DSA indexer topk across an MTP
+    draft iteration: the ``reuse_mtp_topk_indices`` flag on ForwardBatch and the
+    carried topk on ``spec_info.mtp_topk_indices`` (the carry must live on
+    spec_info, not ForwardBatch — per-step ForwardBatch copies drop it, #29654).
 
     Replaces raw attribute writes scattered across the EAGLE V2 draft worker and
     the NextN decoder with an explicit begin/store/read/clear lifecycle, plus an
@@ -29,24 +31,24 @@ class IndexTopKShareState:
     @classmethod
     def begin_mtp_iteration(cls, forward_batch: ForwardBatch) -> IndexTopKShareState:
         forward_batch.reuse_mtp_topk_indices = True
-        forward_batch.topk_indices = None
+        forward_batch.spec_info.mtp_topk_indices = None
         return cls(forward_batch)
 
     @property
     def enabled(self) -> bool:
-        return bool(getattr(self.forward_batch, "reuse_mtp_topk_indices", False))
+        return bool(self.forward_batch.reuse_mtp_topk_indices)
 
     def prev_topk_indices(self) -> Optional[torch.Tensor]:
         if not self.enabled:
             return None
-        return getattr(self.forward_batch, "topk_indices", None)
+        return self.forward_batch.spec_info.mtp_topk_indices
 
     def store_topk_indices(self, topk_indices: Optional[torch.Tensor]) -> None:
         if self.enabled:
-            self.forward_batch.topk_indices = topk_indices
+            self.forward_batch.spec_info.mtp_topk_indices = topk_indices
 
     def clear_mtp_iteration(self) -> None:
-        self.forward_batch.topk_indices = None
+        self.forward_batch.spec_info.mtp_topk_indices = None
         self.forward_batch.reuse_mtp_topk_indices = False
 
     @classmethod

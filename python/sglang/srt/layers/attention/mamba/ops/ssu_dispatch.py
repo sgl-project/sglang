@@ -45,12 +45,19 @@ class MambaSSUBackend(ABC):
 class TritonSSUBackend(MambaSSUBackend):
     """Triton-based selective-state-update backend."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        enable_stochastic_rounding: bool = False,
+        cache_philox_rounds: int = 0,
+    ) -> None:
         from sglang.srt.layers.attention.mamba.ops.mamba_ssm import (
             selective_state_update,
         )
 
         self._kernel = selective_state_update
+        self._enable_stochastic_rounding = enable_stochastic_rounding
+        self._cache_philox_rounds = cache_philox_rounds
 
     @property
     def name(self) -> str:
@@ -96,16 +103,25 @@ class TritonSSUBackend(MambaSSUBackend):
             cache_steps=cache_steps,
             retrieve_parent_token=retrieve_parent_token,
             intermediate_state_indices=intermediate_state_indices,
+            enable_stochastic_rounding=self._enable_stochastic_rounding,
+            cache_philox_rounds=self._cache_philox_rounds,
         )
 
 
 class FlashInferSSUBackend(MambaSSUBackend):
     """FlashInfer-based selective-state-update backend."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        enable_stochastic_rounding: bool = False,
+        cache_philox_rounds: int = 0,
+    ) -> None:
         from flashinfer.mamba import selective_state_update
 
         self._kernel = selective_state_update
+        self._enable_stochastic_rounding = enable_stochastic_rounding
+        self._cache_philox_rounds = cache_philox_rounds
 
     @property
     def name(self) -> str:
@@ -137,6 +153,11 @@ class FlashInferSSUBackend(MambaSSUBackend):
                 "FlashInfer backend does not support retrieve_parent_token. "
                 "Use --mamba-backend triton for EAGLE tree attention."
             )
+        rand_seed = (
+            torch.randint(0, 2**32, (1,), device=state.device)
+            if self._enable_stochastic_rounding
+            else None
+        )
         # FlashInfer expects cache_steps as an int (0 when unused).
         self._kernel(
             state,
@@ -156,6 +177,8 @@ class FlashInferSSUBackend(MambaSSUBackend):
             intermediate_states_buffer=intermediate_states_buffer,
             cache_steps=0 if cache_steps is None else cache_steps,
             intermediate_state_indices=intermediate_state_indices,
+            rand_seed=rand_seed,
+            philox_rounds=self._cache_philox_rounds or 10,
         )
 
 
@@ -190,7 +213,12 @@ def initialize_mamba_selective_state_update_backend(server_args: ServerArgs) -> 
         )
 
     try:
-        _mamba_ssu_backend = backend_cls()
+        _mamba_ssu_backend = backend_cls(
+            enable_stochastic_rounding=(
+                server_args.enable_mamba_cache_stochastic_rounding
+            ),
+            cache_philox_rounds=server_args.mamba_cache_philox_rounds,
+        )
     except ImportError:
         raise ValueError(
             f"Mamba backend '{requested}' requested but its dependencies are not "

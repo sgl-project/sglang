@@ -24,6 +24,7 @@ from safetensors.torch import load_file
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.jit_kernel.fused_eh_norm import fused_eh_norm
 from sglang.srt.configs.model_config import is_deepseek_dsa
 from sglang.srt.distributed import get_pp_group
 from sglang.srt.environ import envs
@@ -57,7 +58,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.deepseek_common.utils import enable_nextn_moe_bf16_cast_to_fp8
 from sglang.srt.models.deepseek_v2 import DeepseekV2DecoderLayer, DeepseekV3ForCausalLM
 from sglang.srt.models.utils import WeightsMapper
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_flags, get_parallel
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import BumpAllocator, add_prefix, is_cuda, is_npu
 
@@ -172,7 +173,7 @@ class DeepseekModelNextN(nn.Module):
         if (
             _is_npu
             and self.quant_config is None
-            and get_global_server_args().quantization is not None
+            and get_flags().quantization is not None
         ):
             # ascend mtp unquant
             exit_stack.enter_context(envs.SGLANG_DEEPEP_BF16_DISPATCH.override(True))
@@ -197,19 +198,27 @@ class DeepseekModelNextN(nn.Module):
                 hidden_states = input_embeds
 
             if hidden_states.shape[0] > 0:
-                eh_input = torch.cat(
-                    (
-                        self.enorm(hidden_states),
-                        self.hnorm(
-                            forward_batch.spec_info.hidden_states
-                            if self.rot_weight is None
-                            else torch.matmul(
-                                forward_batch.spec_info.hidden_states, self.rot_weight
-                            )
+                previous_hidden_states = forward_batch.spec_info.hidden_states
+                if self.rot_weight is not None:
+                    previous_hidden_states = torch.matmul(
+                        previous_hidden_states, self.rot_weight
+                    )
+                if _is_cuda:
+                    eh_input = fused_eh_norm(
+                        hidden_states,
+                        previous_hidden_states,
+                        self.enorm.weight,
+                        self.hnorm.weight,
+                        self.enorm.variance_epsilon,
+                    )
+                else:
+                    eh_input = torch.cat(
+                        (
+                            self.enorm(hidden_states),
+                            self.hnorm(previous_hidden_states),
                         ),
-                    ),
-                    dim=-1,
-                )
+                        dim=-1,
+                    )
                 if isinstance(self.eh_proj, ReplicatedLinear):
                     hidden_states, _ = self.eh_proj(eh_input)
                 else:
@@ -309,7 +318,7 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
             config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("model.shared_head.head", prefix),
-            use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+            use_attn_tp_group=get_flags().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
 

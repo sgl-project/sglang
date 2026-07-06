@@ -35,7 +35,6 @@ from sglang.srt.utils import (
     is_cpu,
     is_hip,
     is_npu,
-    next_power_of_2,
     set_weight_attrs,
     use_intel_amx_backend,
     use_intel_xpu_backend,
@@ -61,12 +60,6 @@ if _use_aiter:
 
 if _is_npu:
     from sglang.srt.hardware_backend.npu.utils import npu_format_cast
-
-try:
-    from flashinfer.fused_moe import cutlass_fused_moe as flashinfer_cutlass_fused_moe
-    from flashinfer.fused_moe.core import ActivationType
-except ImportError:
-    flashinfer_cutlass_fused_moe = None
 
 
 class UnquantizedEmbeddingMethod(QuantizeMethodBase):
@@ -344,14 +337,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             layer.w2_weight.data = layer.w2_weight.data.reshape(
                 layer.num_local_experts, *new_shape_w2
             )
-
         if _is_npu:
             for weight_name in ["w13_weight", "w2_weight"]:
                 weight = getattr(layer, weight_name)
-                origin_weight = weight.data.transpose(1, 2)
-                new_weight = origin_weight.contiguous()
-                origin_weight.untyped_storage().resize_(0)
-                weight.data = npu_format_cast(new_weight)
+                weight.data = npu_format_cast(weight)
 
         return
 
@@ -412,6 +401,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 if get_moe_runner_backend().is_flashinfer_trtllm_routed()
                 else MoeRunnerBackend.FLASHINFER_TRTLLM
             )
+        elif self.use_flashinfer_cutlass:
+            import sglang.srt.layers.moe.moe_runner.flashinfer_cutlass  # noqa: F401
+
+            backend = MoeRunnerBackend.FLASHINFER_CUTLASS
         elif self.use_deep_gemm:
             backend = MoeRunnerBackend.DEEP_GEMM
         elif self.use_triton_kernels:
@@ -467,11 +460,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
-        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
-
         x = dispatch_output.hidden_states
-
-        moe_runner_config = self.moe_runner_config
 
         backend = self.runner.runner_backend
         if backend.is_triton_kernels():
@@ -501,34 +490,22 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             )
             return self.runner.run(dispatch_output, quant_info)
         elif self.use_flashinfer_cutlass:
-            topk_output = dispatch_output.topk_output
-            output = flashinfer_cutlass_fused_moe(
-                input=x,
-                token_selected_experts=topk_output.topk_ids,
-                token_final_scales=topk_output.topk_weights,
-                fc1_expert_weights=layer.w13_weight,
-                fc2_expert_weights=layer.w2_weight,
+            from sglang.srt.layers.moe.moe_runner.flashinfer_cutlass import (
+                FlashInferCutlassMoeQuantInfo,
+            )
+
+            quant_info = FlashInferCutlassMoeQuantInfo(
+                quant_type="bf16",
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
                 output_dtype=x.dtype,
-                quant_scales=None,
-                ep_size=layer.moe_ep_size,
-                ep_rank=layer.moe_ep_rank,
-                tp_size=layer.moe_tp_size,
-                tp_rank=layer.moe_tp_rank,
-                tune_max_num_tokens=next_power_of_2(x.shape[0]),
-                activation_type=(
-                    ActivationType.Relu2
-                    if moe_runner_config.activation == "relu2"
-                    else ActivationType.Swiglu
-                ),
-            )[0]
-
-            if (
-                not layer.should_fuse_routed_scaling_factor_in_topk
-                and moe_runner_config.routed_scaling_factor is not None
-            ):
-                output.mul_(moe_runner_config.routed_scaling_factor)
-
-            return StandardCombineInput(hidden_states=output)
+                moe_ep_size=layer.moe_ep_size,
+                moe_ep_rank=layer.moe_ep_rank,
+                moe_tp_size=layer.moe_tp_size,
+                moe_tp_rank=layer.moe_tp_rank,
+                apply_routed_scaling_factor=not layer.should_fuse_routed_scaling_factor_in_topk,
+            )
+            return self.runner.run(dispatch_output, quant_info)
         elif self.use_flashinfer_trtllm_moe:
             from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
                 FlashInferTrtllmBf16MoeQuantInfo,
@@ -716,7 +693,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         # gmm1: gate_up_proj
         hidden_states = torch.ops.npu.npu_grouped_matmul(
             x=[hidden_states],
-            weight=[layer.w13_weight],
+            weight=[layer.w13_weight.transpose(1, 2)],
             bias=w13_bias,
             split_item=2,
             group_list_type=1,
@@ -752,7 +729,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         # gmm2: down_proj
         hidden_states = torch.ops.npu.npu_grouped_matmul(
             x=[hidden_states],
-            weight=[layer.w2_weight],
+            weight=[layer.w2_weight.transpose(1, 2)],
             bias=w2_bias,
             split_item=2,
             group_list_type=1,
