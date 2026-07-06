@@ -49,7 +49,6 @@ ONE_NPU_CASES: list[DiffusionTestCase] = [
             extras=EXTRAS_DISABLE_WARMUP,
         ),
         COSMOS3_NANO_CI_sampling_params,
-        run_perf_check=False,
         run_consistency_check=False,
         run_component_accuracy_check=False,
     ),
@@ -179,7 +178,6 @@ TWO_NPU_CASES: list[DiffusionTestCase] = [
             dit_layerwise_offload=True,
             extras=EXTRAS_DISABLE_WARMUP,
         ),
-        run_perf_check=False,
         run_consistency_check=False,
     ),
 ]
