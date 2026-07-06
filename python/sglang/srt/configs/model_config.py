@@ -110,6 +110,8 @@ def is_deepseek_dsa(config) -> bool:
             "MistralLarge3ForCausalLM",
             "PixtralForConditionalGeneration",
             "GlmMoeDsaForCausalLM",
+            "LongcatFlashForCausalLM",
+            "LongcatFlashForCausalLMNextN",
         )
         and _hf_attr(config, "index_topk") is not None
     )
