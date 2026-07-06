@@ -483,16 +483,15 @@ class BaseMultimodalProcessor(ABC):
                 "resized_height",
                 "resized_width"
             )
-            hf_video_kwargs = {}
-            for k, v in kwargs.items():
-                if k not in sglang_video_keys:
-                    hf_video_kwargs[k] = v
+            for k in sglang_video_keys:
+                kwargs["videos_kwargs"].pop(k, None)
             result = processor.__call__(
                 text=[input_text],
                 padding=True,
                 return_tensors="pt",
-                **hf_video_kwargs,
+                **kwargs,
             )
+
         if not self.server_args.keep_mm_feature_on_device:
             # move feature tensors to cpu
             for feature_name in self.FEATURE_NAMES:
