@@ -11,7 +11,7 @@ from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.distributed.vla_topology import (
     VLAParallelTopology,
 )
-from sglang.multimodal_gen.runtime.models.pi05 import Pi05PolicyModel
+from sglang.multimodal_gen.runtime.models.vlas import Pi05PolicyModel
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )

@@ -20,7 +20,7 @@ from sglang.multimodal_gen.runtime.distributed.vla import (
     broadcast_timing,
     get_vla_split_group,
 )
-from sglang.multimodal_gen.runtime.models.pi05 import Pi05PolicyModel
+from sglang.multimodal_gen.runtime.models.vlas import Pi05PolicyModel
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
     OutputBatch,
     Req,

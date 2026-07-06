@@ -16,7 +16,7 @@ from transformers.models.gemma import modeling_gemma
 
 from sglang.multimodal_gen.configs.pipeline_configs.pi05 import Pi05PipelineConfig
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
-from sglang.multimodal_gen.runtime.models.pi05.pi_gemma import (
+from sglang.multimodal_gen.runtime.models.vlas.pi05_pigemma import (
     PaliGemmaForConditionalGenerationWithPiGemma,
     PiGemmaForCausalLM,
     gated_residual,
@@ -470,7 +470,7 @@ class PaliGemmaWithExpertModel(nn.Module):
         return outputs, None
 
 
-class Pi05TorchModel(nn.Module):
+class Pi05CoreModel(nn.Module):
     def __init__(
         self,
         config: Pi05PipelineConfig,

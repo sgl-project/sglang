@@ -27,7 +27,7 @@ from sglang.multimodal_gen.runtime.loader.utils import (
 from sglang.multimodal_gen.runtime.loader.weight_utils import (
     safetensors_weights_iterator,
 )
-from sglang.multimodal_gen.runtime.models.pi05.torch_model import Pi05TorchModel
+from sglang.multimodal_gen.runtime.models.vlas.pi05_core import Pi05CoreModel
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_model
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -53,7 +53,7 @@ class Pi05CheckpointManifest:
 
 
 class Pi05ActionExpert(nn.Module):
-    def __init__(self, config: Pi05PipelineConfig, core_model: Pi05TorchModel):
+    def __init__(self, config: Pi05PipelineConfig, core_model: Pi05CoreModel):
         super().__init__()
         self.config = config
         self.core_model = core_model
@@ -110,7 +110,7 @@ class Pi05PolicyModel(nn.Module):
             mp_policy=mp_policy,
         )
         with set_default_torch_dtype(dtype), skip_init_modules():
-            self.core_model = Pi05TorchModel(config, runtime_role=self.runtime_role)
+            self.core_model = Pi05CoreModel(config, runtime_role=self.runtime_role)
         self.core_model.eval()
         if device.type == "cuda":
             if self._use_componentwise_empty_init():
