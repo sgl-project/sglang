@@ -52,8 +52,8 @@ pub struct GenerationOutput {
     pub prompt_tokens: u32,
     /// Output token count for this chunk (the accumulator sums them).
     pub completion_tokens: u64,
-    /// `Some(reason)` on the final step, `None` while streaming.
-    pub finish_reason: Option<String>,
+    /// Full finish-reason dict on the final step; `None` while streaming.
+    pub finish_reason: Option<serde_json::Value>,
     /// Output-token logprobs (delta for this chunk; the accumulator concatenates
     /// them). Parallel `val`/`idx` buffers. Empty unless `return_logprob`.
     #[serde(default)]
@@ -420,23 +420,13 @@ pub fn frame_egress_batch(header: &[u8], data: &[u8]) -> Bytes {
     Bytes::from(buf)
 }
 
-/// Columnar scalar header for a whole decode batch. The bulk token ids ride as a
-/// single concatenated i32 buffer alongside (split per request by `tok_lens`),
-/// mirroring the ingress `input_ids` split. Logprob/hidden columns are NOT on
-/// this path — requests that need them use the per-request `push_chunk` frame.
-/// Columnar header for a whole batch. Scalars are per-request lists; the numeric
-/// columns ride in `data` (concatenated across all requests, one global column
-/// at a time) and are split back out using these length vectors. Flat logprob
-/// families carry a per-request element count (`*_lens`, len N); ragged families
-/// and hidden states carry a per-request position/row count (`*_reqlens`, len N)
-/// plus a flat per-position length stream (`*_poslens`). All numeric fields are
-/// `#[serde(default)]`, so the hot path (no extras) emits just the first four.
+/// Columnar scalar header for a whole decode batch. . All numeric fields are
+/// `#[serde(default)]`, the hot path (no extras) emits just the first four.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct BatchHeader {
     pub rids: Vec<String>,
-    pub finish_reasons: Vec<Option<String>>,
+    pub finish_reasons: Vec<Option<serde_json::Value>>,
     pub prompt_tokens: Vec<u32>,
-    /// Per-request output-token count; splits the concatenated id buffer.
     pub tok_lens: Vec<u32>,
     #[serde(default)]
     pub out_lp_lens: Vec<u32>,
@@ -687,8 +677,8 @@ pub struct ChunkEvent {
     pub seq: u64,
     /// New token ids for this step. Empty allowed (e.g. metadata-only frames).
     pub token_ids: Vec<i32>,
-    /// `None` while streaming, `Some(reason)` on the final chunk.
-    pub finish_reason: Option<String>,
+    /// `None` while streaming, the full finish-reason dict on the final chunk.
+    pub finish_reason: Option<serde_json::Value>,
     /// Prompt token count for this request (constant across its chunks).
     /// `#[serde(default)]` keeps the wire backward-compatible with 4-field frames.
     #[serde(default)]
@@ -754,11 +744,15 @@ mod chunk_event_tests {
     #[test]
     fn decodes_batch_frame() {
         use rmpv::Value;
-        // 3 requests: rids "1","2","3"; finish [nil, "stop", nil];
+        // 3 requests: rids "1","2","3"; finish [nil, {type:stop,matched:5}, nil];
         // prompt_tokens [4,5,6]; tok_lens [2,0,1] -> ids [10,11 | (none) | 12].
+        let stop = Value::Map(vec![
+            (Value::from("type"), Value::from("stop")),
+            (Value::from("matched"), Value::from(5)),
+        ]);
         let header_arr = Value::Array(vec![
             Value::Array(vec![Value::from("1"), Value::from("2"), Value::from("3")]),
-            Value::Array(vec![Value::Nil, Value::from("stop"), Value::Nil]),
+            Value::Array(vec![Value::Nil, stop, Value::Nil]),
             Value::Array(vec![
                 Value::from(4u32),
                 Value::from(5u32),
@@ -787,7 +781,11 @@ mod chunk_event_tests {
         assert!(events[0].finish_reason.is_none());
         assert_eq!(events[1].rid, "2");
         assert!(events[1].token_ids.is_empty());
-        assert_eq!(events[1].finish_reason.as_deref(), Some("stop"));
+        // The whole dict survives (type + matched), not just the type.
+        assert_eq!(
+            events[1].finish_reason,
+            Some(serde_json::json!({ "type": "stop", "matched": 5 }))
+        );
         assert_eq!(events[2].rid, "3");
         assert_eq!(events[2].token_ids, vec![12]);
         assert_eq!(events[2].prompt_tokens, 6);
