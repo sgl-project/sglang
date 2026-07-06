@@ -26,7 +26,7 @@ on:
           - 'nightly-test-specialized-8-gpu-b200'
           - 'nightly-test-perf-4-gpu-gb300'
           - 'nightly-test-kernel-1-gpu-h100'
-          - 'nightly-test-diffusion-comparison'
+          - 'nightly-test-diffusion'
           - 'nightly-test-kernel-8-gpu-h200'
           - 'nightly-test-precision-8-gpu-h200'
   workflow_call:
@@ -628,9 +628,9 @@ jobs:
       - uses: ./.github/actions/upload-cuda-coredumps
         if: failure()
 
-  # Diffusion cross-framework comparison
-  nightly-test-diffusion-comparison:
-    if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-diffusion-comparison')
+  # SGLang-Diffusion nightly benchmark
+  nightly-test-diffusion:
+    if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-diffusion')
     runs-on: 4-gpu-h100
     timeout-minutes: 300
     steps:
@@ -643,7 +643,7 @@ jobs:
         run: |
           bash scripts/ci/cuda/ci_install_dependency.sh diffusion
 
-      - name: Run cross-framework comparison
+      - name: Run diffusion benchmark
         env:
           GITHUB_SHA: ${{ github.sha }}
           GITHUB_RUN_ID: ${{ github.run_id }}
@@ -676,11 +676,11 @@ jobs:
             --dashboard dashboard.md \
             --charts-dir comparison-charts
 
-      - name: Upload comparison artifacts
+      - name: Upload benchmark artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: diffusion-comparison-${{ github.run_id }}
+          name: diffusion-benchmark-${{ github.run_id }}
           path: |
             comparison-results.json
             dashboard.md
@@ -783,7 +783,7 @@ jobs:
       - nightly-test-perf-4-gpu-b200
       - nightly-test-specialized-8-gpu-b200
       - nightly-test-perf-4-gpu-gb300
-      - nightly-test-diffusion-comparison
+      - nightly-test-diffusion
       - nightly-test-precision-8-gpu-h200
       - consolidate-metrics
     runs-on: ubuntu-latest
