@@ -38,7 +38,6 @@ class DSparkMarkovHead(nn.Module):
         self,
         vocab_size: int,
         markov_rank: int,
-        quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -51,7 +50,6 @@ class DSparkMarkovHead(nn.Module):
         self.markov_w2 = ParallelLMHead(
             vocab_size,
             markov_rank,
-            quant_config=quant_config,
             prefix=add_prefix("markov_w2", prefix),
             use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
         )
@@ -137,7 +135,6 @@ class DeepseekV4DSparkModel(nn.Module):
         self.markov_head = DSparkMarkovHead(
             config.vocab_size,
             config.dspark_markov_rank,
-            quant_config=quant_config,
             prefix=add_prefix("markov_head", prefix),
         )
         self.confidence_head = DSparkConfidenceHead(
