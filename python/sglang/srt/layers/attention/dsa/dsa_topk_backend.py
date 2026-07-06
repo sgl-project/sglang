@@ -88,6 +88,25 @@ class DSATopKBackend(Enum):
         if not envs.SGLANG_DSA_FUSE_TOPK.get() or force_unfused_topk:
             return self.topk_func(logits, lengths, topk, row_starts=row_starts)
 
+        # Fast path: the DeepSeek-V4 top-k v2 JIT kernel fuses top-k selection and
+        # the page-table transform in a single launch and, unlike the legacy path,
+        # consumes the indexer's own page_size>=1 page table directly (no page_size=1
+        # table needs to be materialized). Shared by DeepSeek-V3.2 and GLM DSA, which
+        # route through this same backend. Engaged only for the decode-shaped PAGED
+        # case it is defined for; every other case falls through unchanged.
+        if envs.SGLANG_OPT_USE_TOPK_V2.get():
+            v2_result = _try_topk_transform_v2_paged(
+                logits=logits,
+                lengths=lengths,
+                topk=topk,
+                topk_transform_method=topk_transform_method,
+                attn_metadata=attn_metadata,
+                row_starts=row_starts,
+                batch_idx_list=batch_idx_list,
+            )
+            if v2_result is not None:
+                return v2_result
+
         if self.is_sgl_kernel():
             from sgl_kernel import (
                 fast_topk_transform_fused,
@@ -205,6 +224,76 @@ def _topk_unfused(
     topk_indices[:, :valid_topk] = topk_local_indices
 
     return topk_indices
+
+
+def _try_topk_transform_v2_paged(
+    logits: torch.Tensor,
+    lengths: torch.Tensor,
+    topk: int,
+    topk_transform_method: TopkTransformMethod,
+    attn_metadata,
+    row_starts: Optional[torch.Tensor],
+    batch_idx_list: Optional[List[int]],
+) -> Optional[torch.Tensor]:
+    """Fused top-k + page-table transform via the DeepSeek-V4 v2 JIT kernel.
+
+    Returns the transformed page indices ``(num_rows, topk)`` int32 (physical
+    page_size=1 KV slots, ``-1`` padded) -- identical in meaning to
+    ``fast_topk_transform_fused`` / ``flashinfer.top_k_page_table_transform`` --
+    or ``None`` when this fast path does not apply, so the caller falls back to
+    the existing implementation.
+
+    The v2 kernel selects, per row, the top-k of ``logits[row, :lengths[row]]``
+    and maps each selected position ``p`` through the page table as
+    ``real_page_table[row, p // page_size] * page_size + (p % page_size)``. Feeding
+    it the indexer's compact ``real_page_table`` (page_size = pool page size,
+    typically 64) yields the same physical slots as gathering the page_size=1
+    table, without materializing that wide table.
+
+    Preconditions (else ``None``): PAGED method, no ragged ``row_starts`` offset
+    (the kernel always scores from position 0), no ``batch_idx_list`` remap, one
+    score row per batch aligned 1:1 with the page table, ``0 < topk <= 2048``, and
+    a fp32 score buffer whose row stride is a multiple of 4 (16B vectorized load).
+    """
+    if topk_transform_method != TopkTransformMethod.PAGED:
+        return None
+    # The kernel has no per-row start offset and no row->batch remap; it scores
+    # each row from position 0 against its own page-table row.
+    if row_starts is not None or batch_idx_list is not None:
+        return None
+    if not (0 < topk <= 2048):
+        return None
+    if logits.dim() != 2 or logits.dtype != torch.float32:
+        return None
+
+    page_table = attn_metadata.real_page_table
+    num_rows = logits.shape[0]
+    # Decode shape: one query row per batch, aligned 1:1 with the page table rows.
+    if lengths.shape[0] != num_rows or page_table.shape[0] != num_rows:
+        return None
+
+    from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
+
+    page_size = get_token_to_kv_pool().page_size
+
+    # score_stride must be a multiple of 4; make contiguous and pad the row width
+    # up to a multiple of 4 if needed (positions >= seq_len are never read).
+    scores = logits.contiguous()
+    if scores.shape[1] % 4 != 0:
+        pad = (-scores.shape[1]) % 4
+        scores = torch.nn.functional.pad(scores, (0, pad), value=float("-inf"))
+
+    lengths_i32 = lengths.to(torch.int32)
+    page_table = page_table.to(torch.int32).contiguous()
+    out = scores.new_full((num_rows, topk), -1, dtype=torch.int32)
+
+    from sglang.jit_kernel.dsv4.topk import plan_topk_v2, topk_transform_512_v2
+
+    metadata = plan_topk_v2(lengths_i32)
+    topk_transform_512_v2(
+        scores, lengths_i32, page_table, out, page_size, metadata
+    )
+    return out
 
 
 def _build_flashinfer_paged_args(
