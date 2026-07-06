@@ -292,6 +292,29 @@ class RadixKey:
 
 class TreeNode:
 
+    # __slots__ avoids a per-node __dict__: RadixCache holds one TreeNode per
+    # cached segment, so this cuts per-node memory and speeds attribute access
+    # (relevant on the hot insert/split path). `counter` is a class variable and
+    # must stay out of __slots__. Keep this list in sync with every attribute set
+    # on a RadixCache TreeNode; other cache implementations define their own
+    # TreeNode classes and are unaffected.
+    __slots__ = (
+        "children",
+        "parent",
+        "key",
+        "value",
+        "lock_ref",
+        "last_access_time",
+        "creation_time",
+        "hit_count",
+        "host_ref_counter",
+        "host_value",
+        "write_through_pending_id",
+        "hash_value",
+        "priority",
+        "id",
+    )
+
     counter = 0
 
     def __init__(self, id: Optional[int] = None, priority: int = 0):
@@ -300,8 +323,11 @@ class TreeNode:
         self.key: RadixKey = None
         self.value: Optional[torch.Tensor] = None
         self.lock_ref = 0
-        self.last_access_time = time.monotonic()
-        self.creation_time = time.monotonic()
+        # Single clock read shared by both timestamps: they are equal at creation
+        # and time.monotonic() is a non-trivial syscall-backed call.
+        now = time.monotonic()
+        self.last_access_time = now
+        self.creation_time = now
 
         self.hit_count = 0
         # indicating the node is locked to protect from eviction
