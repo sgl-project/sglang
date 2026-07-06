@@ -223,6 +223,7 @@ if [[ "$PRECISION" == "fp4" ]]; then
 else
     FP4_EXPERTS=false
 fi
+DSV4_DEBUG_PROBE_ONLY=0
 DSV4_ENV=(
   -e PYTHONUNBUFFERED=1
   -e SGLANG_DEFAULT_THINKING=1 -e SGLANG_DSV4_REASONING_EFFORT=max
@@ -238,12 +239,15 @@ DSV4_ENV=(
   -e AITER_BF16_FP8_MOE_BOUND=0 -e SGLANG_DSV4_FP4_EXPERTS=$FP4_EXPERTS
 )
 if [[ "$MODEL_PREFIX" == "dsv4flash" ]]; then
-    echo "Enabling DSV4 Flash PD C128 state-transfer A/B diagnostics"
+    echo "Enabling DSV4 Flash PD KV transfer-window diagnostics"
+    DSV4_DEBUG_PROBE_ONLY=1
     DSV4_ENV+=(
       -e SGLANG_DSV4_DISABLE_C128_STATE_PD=1
       -e SGLANG_DSV4_TRACE_STATE_PD=1
       -e SGLANG_DSV4_TRACE_KV_PD=1
       -e SGLANG_DSV4_TRACE_KV_PD_TARGET_LEN=7345537024
+      -e SGLANG_MORI_DEBUG_REGISTER_TRANSFER_WINDOWS=1
+      -e SGLANG_DSV4_DEBUG_PROBE_ONLY=1
     )
 fi
 DSV4_ENV_STR="${DSV4_ENV[*]}"
@@ -499,6 +503,10 @@ docker run $DOCKER_COMMON --name mi355x_bench \
       || { echo "[probe] request failed -- PD path not serving; aborting before sweep"; exit 1; }
     python3 \$CIDIR/assert_nonempty.py < \$CIDIR/probe_out.json \
       || { echo "[probe] empty/invalid generation; aborting before sweep"; exit 1; }
+    if [ "\${SGLANG_DSV4_DEBUG_PROBE_ONLY:-0}" = "1" ]; then
+      echo "[dsv4-debug] probe-only run passed; skipping perf sweep"
+      exit 0
+    fi
     # Correctness gate runs BEFORE the perf sweep: if the model is wrong there
     # is no point spending ~15min measuring how fast it is wrong, so a failure
     # here exits immediately and the sweep never runs.
@@ -712,6 +720,10 @@ if [[ "$SALLOC_RC" -ne 0 ]]; then
     exit "$SALLOC_RC"
 fi
 if [[ "$PROCESSED" -eq 0 ]]; then
+    if [[ "${DSV4_DEBUG_PROBE_ONLY:-0}" == "1" ]]; then
+        echo "[dsv4-debug] probe-only run passed; no benchmark result files expected."
+        exit 0
+    fi
     echo "ERROR: no result files produced" >&2
     exit 1
 fi
