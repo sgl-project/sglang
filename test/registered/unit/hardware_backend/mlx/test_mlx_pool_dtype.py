@@ -115,3 +115,7 @@ class TestPoolDtypeInference(CustomTestCase):
         bytes_per_slot = 2 * num_layers * n_kv_heads * head_dim * dtype.size
         fp32_bytes_per_slot = 2 * num_layers * n_kv_heads * head_dim * 4
         self.assertEqual(bytes_per_slot * 2, fp32_bytes_per_slot)
+
+
+if __name__ == "__main__":
+    unittest.main()
