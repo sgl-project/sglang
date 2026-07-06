@@ -13,7 +13,7 @@
 //! axum's worker threads.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 pub mod channels;
@@ -208,22 +208,32 @@ impl ServerArgs {
     }
 }
 
-/// Live runtime. Held by the pyo3 bridge; the Python boundary reads
-/// `ingress` and `egress`. Dropping joins all threads via `shutdown`.
+/// Live runtime. Held by the pyo3 bridge; the Python boundary reads `ingress`
+/// and `egress`. `request_shutdown` (also run on `Drop`) stops every stage.
 pub struct Runtime {
     pub ingress: IngressConsumer,
     pub egress: EgressProducer,
-    /// Join handles kept alive for the lifetime of the runtime; threads are
-    /// detached daemons that exit when their channels close on shutdown.
-    #[allow(dead_code)]
-    threads: Vec<JoinHandle<()>>,
-    shutdown: Arc<std::sync::atomic::AtomicBool>,
+    /// Worker join handles, joined by `request_shutdown` / `Drop`.
+    threads: Mutex<Vec<JoinHandle<()>>>,
+    /// The single shutdown sender.
+    shutdown_tx: Mutex<Option<flume::Sender<()>>>,
 }
 
 impl Runtime {
+    /// Stop the runtime and join every worker thread.
     pub fn request_shutdown(&self) {
-        self.shutdown
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        // TODO(drain): split into a non-blocking `drain()` (close listener, keep pools up)
+        // + `shutdown()` so in-flight requests finish before the pools stop.
+        drop(self.shutdown_tx.lock().unwrap().take());
+        for h in self.threads.lock().unwrap().drain(..) {
+            let _ = h.join();
+        }
+    }
+}
+
+impl Drop for Runtime {
+    fn drop(&mut self) {
+        self.request_shutdown();
     }
 }
 
@@ -231,7 +241,7 @@ impl Runtime {
 /// so the Python caller regains control of the GIL immediately. `Err` on a
 /// startup misconfiguration (e.g. no tokenizer for a non-skip server).
 pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
-    let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (shutdown_tx, shutdown_rx) = flume::unbounded::<()>();
     let mut threads = Vec::new();
     let plan = plan_cores(&cfg);
 
@@ -323,11 +333,13 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
             .map(|c| vec![c]);
         let mut egress_rx = Some(egress_rx); // moved into the single worker
         let activity = egress_activity.clone();
+        let shutdown_rx = shutdown_rx.clone();
         spawn_pool("tm-egress", cores, 1, &mut threads, |_| {
             tokenizer_manager::Egress::new(
                 egress_rx.take().unwrap(),
                 senders.clone(),
                 activity.clone(),
+                shutdown_rx.clone(),
             )
         });
     }
@@ -341,9 +353,16 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
             .and_then(|p| p.tm.get(1).or_else(|| p.tm.first()).copied())
             .map(|c| vec![c]);
         let mut parts = Some((tm_rx, ingress_tx)); // moved into the single worker
+        let shutdown_rx = shutdown_rx.clone();
         spawn_pool("tm-ingress", cores, 1, &mut threads, |_| {
             let (tm_rx, ingress_tx) = parts.take().unwrap();
-            tokenizer_manager::Ingress::new(tm_rx, senders.clone(), ingress_tx, skip_tokenizer_init)
+            tokenizer_manager::Ingress::new(
+                tm_rx,
+                senders.clone(),
+                ingress_tx,
+                skip_tokenizer_init,
+                shutdown_rx.clone(),
+            )
         });
     }
 
@@ -354,6 +373,7 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
         let senders = senders.clone();
         let id_gen = id_gen.clone();
         let api_activity = egress_activity.clone();
+        let shutdown_rx = shutdown_rx.clone();
         let handle = std::thread::Builder::new()
             .name("api-runtime".into())
             .spawn(move || {
@@ -377,6 +397,7 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
                     cfg.server_args.clone(),
                     // Egress heartbeat watched by `/health_generate`.
                     api_activity,
+                    shutdown_rx,
                 ))
             })
             .expect("spawn api runtime");
@@ -386,7 +407,55 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
     Ok(Runtime {
         ingress: ingress_rx,
         egress: egress_tx,
-        threads,
-        shutdown,
+        threads: Mutex::new(threads),
+        shutdown_tx: Mutex::new(Some(shutdown_tx)),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression: `request_shutdown` must actually stop the API server — it joins
+    /// the api thread once the listener closes, so the port stops accepting.
+    /// (Previously it set an unread flag and the port kept accepting.)
+    #[test]
+    fn request_shutdown_closes_listener() {
+        // Pick a free port: bind :0, read the assigned addr, release it.
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = probe.local_addr().unwrap();
+        drop(probe);
+
+        // `skip_tokenizer_init` → no tokenizer/detok model load; minimal boot.
+        let server_args = ServerArgs::from_json(r#"{"skip_tokenizer_init": true}"#).unwrap();
+        let cfg = RuntimeConfig {
+            bind: addr,
+            pin_cores: false,
+            api_worker_num: 1,
+            tokenizer_worker_num: 1,
+            detokenizer_worker_num: 1,
+            server_args: Arc::new(server_args),
+            ..Default::default()
+        };
+        let rt = start(cfg).expect("start runtime");
+
+        // The listener binds asynchronously on the api thread; wait for it.
+        let mut up = false;
+        for _ in 0..100 {
+            if std::net::TcpStream::connect(addr).is_ok() {
+                up = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(up, "server never started listening on {addr}");
+
+        // Joins the api thread; the listener is closed by the time it returns.
+        rt.request_shutdown();
+
+        assert!(
+            std::net::TcpStream::connect(addr).is_err(),
+            "port still accepting connections after shutdown",
+        );
+    }
 }
