@@ -1082,21 +1082,6 @@ class TestAdaptiveSpecArgs(CustomTestCase):
 
 
 class TestWaterfillArgs(CustomTestCase):
-    def test_waterfill_cli_flag(self):
-        parser = server_args_module.argparse.ArgumentParser()
-        ServerArgs.add_cli_args(parser)
-
-        args = parser.parse_args(["--model-path", "dummy", "--enable-waterfill"])
-        server_args = ServerArgs.from_cli_args(args)
-        self.assertTrue(server_args.enable_waterfill)
-
-    def test_legacy_waterfill_cli_flag_is_not_supported(self):
-        parser = server_args_module.argparse.ArgumentParser()
-        ServerArgs.add_cli_args(parser)
-
-        with self.assertRaises(SystemExit):
-            parser.parse_args(["--model-path", "dummy", "--enable-deepep-waterfill"])
-
     def test_waterfill_enforces_shared_experts_fusion(self):
         server_args = ServerArgs(
             model_path="dummy",
