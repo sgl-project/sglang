@@ -982,17 +982,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             num_fused_shared_experts = 0
 
         # Under speculative decoding the decode cuda-graph captures
-        # TARGET_VERIFY with `num_tokens_per_bs` draft tokens per sequence;
-        # size the routed-experts capture buffers for that multi-token layout.
+        # TARGET_VERIFY with `num_verify_tokens_per_seq` (= speculative_num_draft_tokens,
+        # e.g. 4) draft tokens per sequence; size the routed-experts capture
+        # buffers for that multi-token layout. Plain decode -> 1 token/seq.
         if self.spec_algorithm.is_speculative():
-            routed_experts_num_tokens_per_bs = (
+            num_verify_tokens_per_seq = (
                 self.spec_algorithm.get_num_tokens_per_bs_for_target_verify(
                     self.server_args.speculative_num_draft_tokens,
                     self.is_draft_worker,
                 )
             )
         else:
-            routed_experts_num_tokens_per_bs = 1
+            num_verify_tokens_per_seq = 1
 
         set_global_experts_capturer(
             RoutedExpertsCapturer.create(
@@ -1002,7 +1003,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 num_tokens=self.max_total_num_tokens + self.page_size,
                 max_running_requests=self.max_running_requests,
                 device=self.device,
-                num_tokens_per_bs=routed_experts_num_tokens_per_bs,
+                num_tokens_per_bs=num_verify_tokens_per_seq,
             )
         )
 
