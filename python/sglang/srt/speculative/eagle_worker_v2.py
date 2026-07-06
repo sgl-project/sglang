@@ -52,7 +52,6 @@ from sglang.srt.runtime_context import (
     get_spec,
 )
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.speculative import spec_cycle_profiler
 from sglang.srt.speculative.adaptive_runtime_state import (
     AdaptiveController,
     SpecRuntimeState,
@@ -515,12 +514,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             else contextlib.nullcontext()
         )
 
-        draft_ctx = (
-            spec_cycle_profiler.draft_phase()
-            if spec_cycle_profiler.enabled()
-            else contextlib.nullcontext()
-        )
-        with canary_outside_ctx, draft_ctx:
+        with canary_outside_ctx:
             # Run draft
             if can_run_decode_cuda_graph:
                 parent_list, top_scores_index, draft_tokens, draft_probs = (
