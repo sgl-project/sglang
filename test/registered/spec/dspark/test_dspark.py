@@ -133,8 +133,17 @@ What is 2 + 2?<|im_end|>
         assert self.process.poll() is None
 
     def test_greedy_determinism(self):
+        # Compare two warm (radix-cache-hit) requests rather than cold-vs-warm:
+        # the first request on a fresh prefix runs the prefill kernel path
+        # while later identical requests reuse the cached prefix, and bf16
+        # exact logit ties can legitimately argmax-flip across those two
+        # kernel paths (observed on target-only Qwen3-4B with no speculation
+        # at all). Warm-vs-warm requests share one path and must match.
         client = openai.Client(base_url=self.base_url + "/v1", api_key="EMPTY")
         prompt = "The capital of France is"
+        client.completions.create(
+            model=self.model, prompt=prompt, max_tokens=32, temperature=0
+        )
         outputs = []
         for _ in range(2):
             response = client.completions.create(

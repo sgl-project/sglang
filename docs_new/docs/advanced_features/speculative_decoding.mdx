@@ -617,7 +617,7 @@ One model class (`Qwen3DSparkModel`) serves two released checkpoints, config-gat
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>deepseek-ai/dflash_qwen3_4b_block7</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Neither (<code>markov_rank=0</code>)</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>--speculative-algorithm DFLASH</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Not currently servable — see Notes</td>
     </tr>
   </tbody>
 </table>
@@ -634,7 +634,7 @@ python3 -m sglang.launch_server \
 **Notes**
 
 - Measured on a single RTX A6000 (48GB, SM86/Ampere, bf16, `--attention-backend triton`): GSM8K 5-shot/200q/greedy accuracy holds at parity with the non-speculative target (0.875-0.885 vs. a 0.880 baseline), with 3.9-4.8 accepted tokens per verify round during GSM8K and roughly a 1.9x single-stream decode speedup.
-- `deepseek-ai/dflash_qwen3_4b_block7` is architecturally servable by the same `Qwen3DSparkModel` class but is meant to run under plain `DFLASH`, not `DSPARK` — see the table above.
+- `deepseek-ai/dflash_qwen3_4b_block7` declares the same `Qwen3DSparkModel` architecture string and loads through the same class, but is **not currently servable**: it is intended for plain `DFLASH`, and `DFlashWorkerV2` expects a flat draft-model shape this class does not provide, so a `DFLASH` launch fails cleanly at startup. Resolving that flat-vs-nested worker-shape split is tracked as an open question in the DSpark-Qwen3 PR.
 
 ---
 
