@@ -179,7 +179,9 @@ class TestHiSparseUnit(unittest.TestCase):
         self.coordinator.req_device_buffer_token_locs.fill_(-1)
         self.coordinator.lru_slots[:] = self.coordinator._lru_init.view(1, 1, -1)
         self.coordinator.ack_staging_queue.clear()
+        self.coordinator.pending_prefill_backups.clear()
         self.coordinator._has_pending_backup = False
+        self.coordinator.active_reqs.clear()
         for i in range(len(self.coordinator._skip_first_backup)):
             self.coordinator._skip_first_backup[i] = False
 
@@ -628,6 +630,7 @@ class TestHiSparseUnit(unittest.TestCase):
         self.assertEqual(len(ready), 1)
         self.assertFalse(req.hisparse_staging)
         self.assertTrue(self.coordinator._skip_first_backup[req.req_pool_idx])
+        self.assertIn(req.req_pool_idx, self.coordinator.active_reqs)
 
         tokens = self._build_topk_tokens(fill_len)
         batch = tokens.unsqueeze(0)
@@ -643,6 +646,33 @@ class TestHiSparseUnit(unittest.TestCase):
 
         self._cleanup_req(req, kv_loc)
         self._assert_sizes_restored(initial, "staging_path")
+
+    def test_collect_ready_does_not_wait_for_prefill_backup(self):
+        """Staged requests can enter decode before their host backup finishes."""
+        req = _make_req("staging-pending-backup", [0])
+        self._alloc_req_slot(req)
+        req.hisparse_staging = True
+
+        finish_event = SimpleNamespace(done=False)
+        finish_event.query = lambda: finish_event.done
+        finish_event.synchronize = lambda: setattr(finish_event, "done", True)
+        self.coordinator.ack_staging_queue.append(
+            SimpleNamespace(req=req, finish_event=finish_event)
+        )
+
+        ready = self.coordinator.collect_ready_reqs()
+        self.assertEqual(ready, [req])
+        self.assertFalse(req.hisparse_staging)
+        self.assertIn(req.req_pool_idx, self.coordinator.active_reqs)
+        self.assertIn(req.req_pool_idx, self.coordinator.pending_prefill_backups)
+        self.assertTrue(self.coordinator.has_ongoing_staging())
+
+        finish_event.done = True
+        self.assertFalse(self.coordinator.has_ongoing_staging())
+
+        self.coordinator.pending_prefill_backups.pop(req.req_pool_idx, None)
+        self.coordinator.active_reqs.pop(req.req_pool_idx, None)
+        self._free_req_slot(req)
 
     # ==================================================================
     # Test: Single-node staging host page allocation
@@ -846,6 +876,75 @@ class TestHiSparseUnit(unittest.TestCase):
             self._cleanup_req(req, kv_locs[i], logical_only=is_long)
 
         self._assert_sizes_restored(initial, "batch_multiple")
+
+    def test_dynamic_mixed_resident_and_swap_requests(self):
+        """Dynamic mixed batch: resident rows use mapping, swap rows use LRU."""
+        initial = self._get_initial_sizes()
+
+        resident_len = DEVICE_BUFFER_SIZE + self.page_size * 3
+        swap_len = DEVICE_BUFFER_SIZE + self.page_size * 4
+        resident = _make_req("dynamic-resident", list(range(resident_len)))
+        swap = _make_req("dynamic-swap", list(range(swap_len)))
+
+        self._alloc_req_slot(resident)
+        resident_kv = self._alloc_kv(resident, resident_len)
+        self._write_device_patterns(resident_kv, resident_len)
+        self.coordinator.active_reqs[resident.req_pool_idx] = resident
+
+        self._alloc_req_slot(swap)
+        swap_kv = self._alloc_kv(swap, swap_len, logical_only=True)
+        self._populate_host_pool(swap, swap_len)
+        self.coordinator.admit_request_direct(swap)
+
+        reqs = [resident, swap]
+        fill_lens = [resident_len, swap_len]
+        rpi, sls = self._make_batch_tensors(reqs, fill_lens)
+        top_k_batch = torch.stack(
+            [
+                self._build_topk_tokens(resident_len - 1),
+                self._build_topk_tokens(swap_len - 1),
+            ]
+        )
+
+        self.coordinator.num_real_reqs[0] = len(reqs)
+
+        for lid in range(LAYER_NUM):
+            locs = self.coordinator.swap_in_selected_pages(rpi, sls, top_k_batch, lid)
+
+            resident_tokens = top_k_batch[0]
+            valid = resident_tokens >= 0
+            logical_locs = self.req_to_token_pool.req_to_token[
+                resident.req_pool_idx, resident_tokens[valid].long()
+            ]
+            expected_locs = (
+                self.allocator.full_to_hisparse_device_index_mapping[
+                    logical_locs.long()
+                ]
+                .to(torch.int32)
+                .cpu()
+            )
+            self.assertTrue(
+                torch.equal(locs[0][valid].cpu(), expected_locs),
+                f"Layer {lid}: dynamic resident locs != mapping",
+            )
+            self._assert_kv_correct(
+                locs[0],
+                resident_tokens,
+                lid,
+                int(valid.sum().item()),
+                msg="Dynamic resident: ",
+            )
+            self._assert_kv_correct(
+                locs[1],
+                top_k_batch[1],
+                lid,
+                TOP_K,
+                msg="Dynamic swap: ",
+            )
+
+        self._cleanup_req(resident, resident_kv)
+        self._cleanup_req(swap, swap_kv, logical_only=True)
+        self._assert_sizes_restored(initial, "dynamic_mixed")
 
 
 if __name__ == "__main__":

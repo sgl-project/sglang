@@ -12,7 +12,27 @@ from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
 from sglang.srt.utils.common import get_num_new_pages
 
 
-class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
+class HiSparseDemotionMixin:
+    def set_demote_until_hisparse_available(self, callback):
+        self._demote_until_hisparse_available = weakref.WeakMethod(callback)
+
+    def _ensure_hisparse_available(self, need_tokens: int) -> bool:
+        if self.hisparse_attn_allocator.available_size() >= need_tokens:
+            return True
+
+        callback_ref = getattr(self, "_demote_until_hisparse_available", None)
+        if callback_ref is None:
+            return False
+
+        callback = callback_ref()
+        return (
+            callback is not None
+            and callback(need_tokens)
+            and self.hisparse_attn_allocator.available_size() >= need_tokens
+        )
+
+
+class HiSparseTokenToKVPoolAllocator(HiSparseDemotionMixin, BaseTokenToKVPoolAllocator):
     def __init__(
         self,
         size: int,
@@ -77,10 +97,7 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return self._size_full
 
     def available_size(self) -> int:
-        return min(
-            self.logical_attn_allocator.available_size(),
-            self.hisparse_attn_allocator.available_size(),
-        )
+        return self.logical_attn_allocator.available_size()
 
     def get_kvcache(self):
         return self._kvcache
@@ -91,6 +108,10 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 "HiSparse generic allocation is only supported for page_size=1. "
                 "Use alloc_extend for paged allocation."
             )
+        if need_size > self.logical_attn_allocator.available_size():
+            return None
+        if not self._ensure_hisparse_available(need_size):
+            return None
 
         logical_indices = self.logical_attn_allocator.alloc(need_size)
         if logical_indices is None:
@@ -197,7 +218,8 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             num_new_pages
             > self.hisparse_attn_allocator.available_size() // self.page_size
         ):
-            return None
+            if not self._ensure_hisparse_available(num_new_pages * self.page_size):
+                return None
 
         logical_indices = self.logical_attn_allocator.alloc_extend(
             prefix_lens,
@@ -273,7 +295,9 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
 
 
-class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
+class DeepSeekV4HiSparseTokenToKVPoolAllocator(
+    HiSparseDemotionMixin, BaseTokenToKVPoolAllocator
+):
 
     def __init__(
         self,
@@ -360,10 +384,7 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return self.logical_attn_allocator.translate_loc_from_full_to_swa(kv_indices)
 
     def full_available_size(self):
-        return min(
-            self.logical_attn_allocator.full_available_size(),
-            self.hisparse_attn_allocator.available_size() * self.compress_ratio,
-        )
+        return self.logical_attn_allocator.full_available_size()
 
     def swa_available_size(self):
         return self.logical_attn_allocator.swa_available_size()
@@ -372,10 +393,7 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.logical_attn_allocator.free_swa(free_indices)
 
     def available_size(self) -> int:
-        return min(
-            self.logical_attn_allocator.available_size(),
-            self.hisparse_attn_allocator.available_size() * self.compress_ratio,
-        )
+        return self.logical_attn_allocator.available_size()
 
     def alloc(self, need_size: int):
         raise NotImplementedError(
@@ -493,7 +511,10 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             num_new_pages_hisparse
             > self.hisparse_attn_allocator.available_size() // self.hisparse_page_size
         ):
-            return None
+            if not self._ensure_hisparse_available(
+                num_new_pages_hisparse * self.hisparse_page_size
+            ):
+                return None
 
         logical_indices = self.logical_attn_allocator.alloc_extend(
             prefix_lens,

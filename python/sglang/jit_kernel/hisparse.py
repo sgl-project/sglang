@@ -91,6 +91,8 @@ def _load_cache_to_device_buffer_mla(
     page_size: int,
     block_size: int,
     num_real_reqs: torch.Tensor | None,
+    req_to_token: torch.Tensor | None = None,
+    full_to_hisparse_device_index_mapping: torch.Tensor | None = None,
 ) -> None:
     assert (
         hot_buffer_size >= num_top_k
@@ -111,6 +113,12 @@ def _load_cache_to_device_buffer_mla(
         num_real_reqs = torch.tensor(
             [top_k_tokens.size(0)], dtype=torch.int32, device=top_k_tokens.device
         )
+    if req_to_token is None:
+        req_to_token = torch.empty(0, dtype=torch.int32, device=top_k_tokens.device)
+    if full_to_hisparse_device_index_mapping is None:
+        full_to_hisparse_device_index_mapping = torch.empty(
+            0, dtype=torch.int64, device=top_k_tokens.device
+        )
 
     module.load_cache_to_device_buffer(
         top_k_tokens,
@@ -122,6 +130,8 @@ def _load_cache_to_device_buffer_mla(
         device_buffer,
         empty,
         top_k_device_locs,
+        req_to_token,
+        full_to_hisparse_device_index_mapping,
         req_pool_indices,
         seq_lens,
         lru_slots,
@@ -148,6 +158,8 @@ def load_cache_to_device_buffer_mla(
     page_size: int = 1,
     block_size: int = 256,
     num_real_reqs: torch.Tensor | None = None,
+    req_to_token: torch.Tensor | None = None,
+    full_to_hisparse_device_index_mapping: torch.Tensor | None = None,
 ) -> None:
     """Generic MLA hisparse swap-in: device + host both linear (stride=item_size_bytes)."""
     _load_cache_to_device_buffer_mla(
@@ -168,6 +180,8 @@ def load_cache_to_device_buffer_mla(
         page_size=page_size,
         block_size=block_size,
         num_real_reqs=num_real_reqs,
+        req_to_token=req_to_token,
+        full_to_hisparse_device_index_mapping=full_to_hisparse_device_index_mapping,
     )
 
 
@@ -188,6 +202,8 @@ def load_cache_to_device_buffer_dsv4_mla(
     page_size: int = 1,
     block_size: int = 256,
     num_real_reqs: torch.Tensor | None = None,
+    req_to_token: torch.Tensor | None = None,
+    full_to_hisparse_device_index_mapping: torch.Tensor | None = None,
 ) -> None:
     """DSv4 hisparse swap-in: page-padded device + page-padded host C4 layout."""
     _load_cache_to_device_buffer_mla(
@@ -208,4 +224,6 @@ def load_cache_to_device_buffer_dsv4_mla(
         page_size=page_size,
         block_size=block_size,
         num_real_reqs=num_real_reqs,
+        req_to_token=req_to_token,
+        full_to_hisparse_device_index_mapping=full_to_hisparse_device_index_mapping,
     )

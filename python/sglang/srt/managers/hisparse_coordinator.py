@@ -146,6 +146,10 @@ class HiSparseCoordinator:
 
         self.tp_group = tp_group
         self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
+        self.active_reqs = {}
+        self.token_to_kv_pool_allocator.set_demote_until_hisparse_available(
+            self.demote_until_hisparse_available
+        )
 
         # initialize data structures for swap-in kernel
         layer_num = self.mem_pool_device.layer_num
@@ -197,6 +201,141 @@ class HiSparseCoordinator:
         self.write_staging_stream.synchronize()
         self.decode_backup_stream.synchronize()
         self.mem_pool_host.destroy()
+
+    def _hisparse_device_locs(self, compressed_locs: torch.Tensor) -> torch.Tensor:
+        return self.mem_pool_device.full_to_hisparse_device_index_mapping[
+            compressed_locs
+        ]
+
+    def _resident_token_device_locs(
+        self, req_pool_indices: torch.Tensor, compressed_positions: torch.Tensor
+    ) -> torch.Tensor:
+        token_positions = compressed_positions
+        if self.compress_ratio != 1:
+            token_positions = compressed_positions * self.compress_ratio + (
+                self.compress_ratio - 1
+            )
+        logical_locs = self.req_to_token_pool.req_to_token[
+            req_pool_indices, token_positions
+        ]
+        return self._hisparse_device_locs(
+            self.mem_pool_device.translate_loc_from_full_to_compressed(logical_locs)
+        )
+
+    def _free_stale_hisparse_mapping(
+        self, compressed_locs: torch.Tensor, new_device_locs: torch.Tensor
+    ) -> None:
+        """Free stale ROCm-only temporary slots before remapping token locations.
+
+        The decode remap can create a temporary hisparse device slot per new
+        token on ROCm. If that slot is replaced by a device-buffer slot and left
+        allocated, later swap-in lookups can see stale mappings. CUDA consumes
+        top_k_device_locs directly, so the old mapping is harmless there.
+        """
+        if not _is_hip or self.is_dsv4_hisparse:
+            return
+
+        stale_locs = self._hisparse_device_locs(compressed_locs)
+        stale_locs = stale_locs[(stale_locs > 0) & (stale_locs != new_device_locs)]
+        if stale_locs.numel() > 0:
+            self.token_to_kv_pool_allocator.free_hisparse_indices(stale_locs)
+
+    def _device_buffer_alloc_size(self, kv_allocated_len: int) -> int:
+        page_size = self.mem_pool_device.page_size
+        alloc_size = min(
+            ((self.host_token_len(kv_allocated_len) + page_size - 1) // page_size)
+            * page_size,
+            self.device_buffer_size,
+        )
+        return (
+            self.padded_buffer_size
+            if alloc_size == self.device_buffer_size
+            else alloc_size
+        )
+
+    def demote_until_hisparse_available(
+        self,
+        need_tokens: int,
+    ) -> bool:
+        allocator = self.token_to_kv_pool_allocator.hisparse_attn_allocator
+        if allocator.available_size() >= need_tokens:
+            return True
+
+        candidates = [
+            req
+            for req_idx, req in self.active_reqs.items()
+            if int(self.req_device_buffer_size[req_idx]) == 0
+            and self.host_token_len(req.kv_allocated_len)
+            > self._device_buffer_alloc_size(req.kv_allocated_len)
+        ]
+        candidates.sort(key=lambda req: req.kv_allocated_len, reverse=True)
+        if candidates:
+            self.wait_for_pending_backup()
+        for req in candidates:
+            self.alloc_device_buffer(req)
+            if allocator.available_size() >= need_tokens:
+                return True
+
+        return allocator.available_size() >= need_tokens
+
+    @staticmethod
+    def _has_free_hisparse_pages(allocator, num_new_pages: int) -> bool:
+        if allocator.need_sort and num_new_pages > len(allocator.free_pages):
+            allocator.merge_and_sort_free()
+        return num_new_pages <= len(allocator.free_pages)
+
+    def _alloc_resident_last_locs(
+        self,
+        resident_positions: List[int],
+        active_seq_lens: torch.Tensor,
+        resident_seq_lens_cpu: torch.Tensor,
+        active_out_cache_loc: torch.Tensor,
+        active_req_pool_indices: torch.Tensor,
+    ) -> None:
+        allocator = self.token_to_kv_pool_allocator.hisparse_attn_allocator
+        if len(resident_positions) == len(active_seq_lens):
+            seq_lens = active_seq_lens
+            req_pool_indices = active_req_pool_indices
+            out_cache_loc = active_out_cache_loc
+        else:
+            pos_tensor = torch.tensor(
+                resident_positions, dtype=torch.int64, device=self.device
+            )
+            seq_lens = active_seq_lens[pos_tensor]
+            req_pool_indices = active_req_pool_indices[pos_tensor]
+            out_cache_loc = active_out_cache_loc[pos_tensor]
+
+        prev_compressed_pos = seq_lens - 2
+        has_previous_token = int(resident_seq_lens_cpu.min()) > 1
+        prev_device_locs = self._resident_token_device_locs(
+            req_pool_indices,
+            (
+                prev_compressed_pos
+                if has_previous_token
+                else prev_compressed_pos.clamp_min(0)
+            ),
+        )
+        if not has_previous_token:
+            prev_device_locs = torch.where(
+                prev_compressed_pos >= 0,
+                prev_device_locs,
+                torch.full_like(prev_device_locs, -1),
+            )
+        hisparse_indices = allocator.alloc_decode(
+            seq_lens,
+            resident_seq_lens_cpu,
+            prev_device_locs,
+        )
+        if hisparse_indices is None:
+            raise RuntimeError("HiSparse dynamic decode allocation failed")
+
+        compressed_locs = self.token_to_kv_pool_allocator.get_last_loc_compressed(
+            out_cache_loc
+        )
+        self._free_stale_hisparse_mapping(compressed_locs, hisparse_indices)
+        self.mem_pool_device.full_to_hisparse_device_index_mapping[compressed_locs] = (
+            hisparse_indices
+        )
 
     def get_token_stats(self) -> HiSparseTokenStats:
         device_allocator = self.token_to_kv_pool_allocator.hisparse_attn_allocator
@@ -286,6 +425,7 @@ class HiSparseCoordinator:
 
         req.hisparse_staging = False
         self._skip_first_backup[req.req_pool_idx] = True
+        self.active_reqs[req.req_pool_idx] = req
         logger.debug("HiSparse: admitting request %s directly", req.rid)
 
     def host_token_len(self, kv_allocated_len: int) -> int:
@@ -452,10 +592,9 @@ class HiSparseCoordinator:
         finish_count = int(queue_size.item())
         while finish_count > 0:
             _, _, req = self.ack_staging_queue.pop(0)
-            # prepare device buffer and update req
-            self.alloc_device_buffer(req)
             self._skip_first_backup[req.req_pool_idx] = True
             req.hisparse_staging = False
+            self.active_reqs[req.req_pool_idx] = req
             finish_count -= 1
             ready_reqs.append(req)
         return ready_reqs
@@ -472,65 +611,77 @@ class HiSparseCoordinator:
             seq_lens, req_pool_indices, seq_lens_cpu, req_pool_indices_cpu
         )
 
-        if not self.is_dsv4_hisparse:
-            # Grow device buffers if needed and resolve the latest-token slot.
+        if self.compress_ratio == 1:
+            active_positions = torch.arange(
+                len(seq_lens_cpu), dtype=torch.int64, device=seq_lens_cpu.device
+            )
+        else:
+            active_positions = torch.where(seq_lens_cpu % self.compress_ratio == 0)[0]
+        if active_positions.numel() == 0:
+            return
+
+        active_pos_tensor = active_positions.to(device=self.device)
+        active_seq_lens = seq_lens[active_pos_tensor] // self.compress_ratio
+        active_seq_lens_cpu = seq_lens_cpu[active_positions] // self.compress_ratio
+        active_out_cache_loc = out_cache_loc[active_pos_tensor]
+        active_req_pool_indices = req_pool_indices[active_pos_tensor]
+        active_req_pool_indices_cpu = req_pool_indices_cpu[active_positions]
+
+        swap_mask = self.req_device_buffer_size[active_req_pool_indices_cpu] > 0
+        swap_positions = torch.where(swap_mask)[0].tolist()
+        resident_positions = torch.where(~swap_mask)[0].tolist()
+
+        if resident_positions:
+            resident_seq_lens_cpu = active_seq_lens_cpu[resident_positions]
+            allocator = self.token_to_kv_pool_allocator.hisparse_attn_allocator
+            num_new_pages = int(
+                (resident_seq_lens_cpu % allocator.page_size == 1).int().sum().item()
+            )
+            if not self._has_free_hisparse_pages(allocator, num_new_pages):
+                need_tokens = num_new_pages * allocator.page_size
+                if not self.demote_until_hisparse_available(need_tokens):
+                    raise RuntimeError("HiSparse dynamic decode allocation failed")
+                swap_mask = self.req_device_buffer_size[active_req_pool_indices_cpu] > 0
+                swap_positions = torch.where(swap_mask)[0].tolist()
+                resident_positions = torch.where(~swap_mask)[0].tolist()
+                resident_seq_lens_cpu = active_seq_lens_cpu[resident_positions]
+                num_new_pages = int(
+                    (resident_seq_lens_cpu % allocator.page_size == 1)
+                    .int()
+                    .sum()
+                    .item()
+                )
+                if not self._has_free_hisparse_pages(allocator, num_new_pages):
+                    raise RuntimeError("HiSparse dynamic decode allocation failed")
+            if resident_positions:
+                self._alloc_resident_last_locs(
+                    resident_positions,
+                    active_seq_lens,
+                    active_seq_lens_cpu[resident_positions],
+                    active_out_cache_loc,
+                    active_req_pool_indices,
+                )
+
+        if swap_positions:
+            pos_tensor = torch.tensor(
+                swap_positions, dtype=torch.int64, device=self.device
+            )
             reserved_buffer_loc = self._grow_device_buffers(
-                seq_lens, req_pool_indices, seq_lens_cpu, req_pool_indices_cpu
+                active_seq_lens[pos_tensor],
+                active_req_pool_indices[pos_tensor],
+                active_seq_lens_cpu[swap_positions],
+                active_req_pool_indices_cpu[swap_positions],
             )
             self.req_device_buffer_token_locs[
-                :, req_pool_indices, self.device_buffer_size
+                :, active_req_pool_indices[pos_tensor], self.device_buffer_size
             ] = reserved_buffer_loc.to(torch.int32)
-
             compressed_locs = self.token_to_kv_pool_allocator.get_last_loc_compressed(
-                out_cache_loc
+                active_out_cache_loc[pos_tensor]
             )
-            # ROCm: the decode remap creates a temporary hisparse device slot per
-            # new token (via the page_size==1 allocator path). Free the stale
-            # slot before pointing the mapping at the reserved device-buffer slot,
-            # otherwise the temporary slots leak and corrupt later swap-in lookups.
-            # CUDA keeps the original behavior: the swap-in kernel consumes only
-            # top_k_device_locs, so stale mapping entries are harmless there.
-            if _is_hip:
-                previous_locs = self.mem_pool_device._translate_loc_to_hisparse_device(
-                    compressed_locs
-                )
-                stale_locs = previous_locs[
-                    (previous_locs > 0) & (previous_locs != reserved_buffer_loc)
-                ]
-                if stale_locs.numel() > 0:
-                    self.token_to_kv_pool_allocator.free_hisparse_indices(stale_locs)
-
+            self._free_stale_hisparse_mapping(compressed_locs, reserved_buffer_loc)
             self.mem_pool_device.full_to_hisparse_device_index_mapping[
                 compressed_locs
             ] = reserved_buffer_loc
-            return
-
-        active_reqs = seq_lens % self.compress_ratio == 0
-        if not torch.any(active_reqs):
-            return
-
-        active_seq_lens = seq_lens[active_reqs]
-        active_out_cache_loc = out_cache_loc[active_reqs]
-        active_req_pool_indices = req_pool_indices[active_reqs]
-
-        compressed_seq_lens = active_seq_lens // self.compress_ratio
-        reserved_positions = (compressed_seq_lens - 1).clamp(
-            max=self.device_buffer_size
-        )
-        reserved_buffer_loc = self.req_to_device_buffer[
-            active_req_pool_indices, reserved_positions
-        ]
-
-        self.req_device_buffer_token_locs[
-            :, active_req_pool_indices, self.device_buffer_size
-        ] = reserved_buffer_loc.to(torch.int32)
-
-        compressed_locs = self.token_to_kv_pool_allocator.get_last_loc_compressed(
-            active_out_cache_loc
-        )
-        self.mem_pool_device.full_to_hisparse_device_index_mapping[compressed_locs] = (
-            reserved_buffer_loc
-        )
 
     def _eager_backup_previous_token(
         self,
@@ -582,6 +733,20 @@ class HiSparseCoordinator:
         buffer_slot = actual_compressed_pos.clamp(max=self.device_buffer_size)
 
         device_locs = self.req_to_device_buffer[backup_req_indices, buffer_slot]
+        resident_backup_indices = [
+            j
+            for j, i in enumerate(backup_indices)
+            if int(self.req_device_buffer_size[int(req_pool_indices_cpu[i])]) == 0
+        ]
+        if resident_backup_indices:
+            resident_positions = torch.tensor(
+                resident_backup_indices, dtype=torch.int64, device=self.device
+            )
+            device_locs = device_locs.clone()
+            device_locs[resident_positions] = self._resident_token_device_locs(
+                backup_req_indices[resident_positions],
+                actual_compressed_pos[resident_positions],
+            )
 
         host_locs_list = []
         for i in backup_indices:
@@ -778,13 +943,26 @@ class HiSparseCoordinator:
             if all_hi.numel() > 0:
                 self.token_to_kv_pool_allocator.free_hisparse_indices(all_hi)
 
-        allocated_locs = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, :allocated_len
-        ]
-        compressed_locs = self.mem_pool_device.translate_loc_from_full_to_compressed(
-            allocated_locs
-        )
-        self.mem_pool_device.full_to_hisparse_device_index_mapping[compressed_locs] = 0
+        is_resident_req = current_cap == 0
+        if current_cap > 0 or (self.is_dsv4_hisparse and is_resident_req):
+            allocated_locs = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, :allocated_len
+            ]
+            compressed_locs = (
+                self.mem_pool_device.translate_loc_from_full_to_compressed(
+                    allocated_locs
+                )
+            )
+            if self.is_dsv4_hisparse and is_resident_req:
+                hisparse_indices = self._hisparse_device_locs(compressed_locs)
+                hisparse_indices = hisparse_indices[hisparse_indices > 0]
+                if hisparse_indices.numel() > 0:
+                    self.token_to_kv_pool_allocator.free_hisparse_indices(
+                        hisparse_indices
+                    )
+            self.mem_pool_device.full_to_hisparse_device_index_mapping[
+                compressed_locs
+            ] = 0
 
         host_indices = self.mem_pool_host.allocated_host_indices(
             self.req_to_host_pool,
@@ -803,6 +981,7 @@ class HiSparseCoordinator:
         self.req_to_host_pool_allocated_len[req.req_pool_idx] = 0
         self.lru_slots[:, req.req_pool_idx, :].copy_(self._lru_init)
         self._skip_first_backup[req.req_pool_idx] = False
+        self.active_reqs.pop(req.req_pool_idx, None)
 
     def swap_in_selected_pages(
         self,
@@ -839,5 +1018,9 @@ class HiSparseCoordinator:
             page_size=1,
             block_size=self.swap_in_block_size,
             num_real_reqs=self.num_real_reqs,
+            req_to_token=self.req_to_token_pool.req_to_token,
+            full_to_hisparse_device_index_mapping=(
+                self.token_to_kv_pool_allocator.full_to_hisparse_device_index_mapping
+            ),
         )
         return top_k_indices
