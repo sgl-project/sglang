@@ -165,7 +165,7 @@ class LoRAAdapter(nn.Module):
         from sglang.srt.lora.utils import get_normalized_target_modules
 
         normalized_target_modules = get_normalized_target_modules(
-            self.config.target_modules
+            self.config.target_modules, self.base_model
         )
 
         # Remap PEFT "unembed_tokens" key to "lm_head" so the weight is
@@ -200,10 +200,18 @@ class LoRAAdapter(nn.Module):
             )
 
     def _normalize_weights(self):
+        from sglang.srt.lora.utils import has_literal_w_modules
+
+        # Skip the HF w1/w3/w2 renames for models that keep those literal
+        # module names at runtime (e.g. InternLM2) — see has_literal_w_modules.
+        rename_w_to_proj = self.base_model is None or not has_literal_w_modules(
+            self.base_model
+        )
         for layer in self.layers:
             weight_names = list(layer.weights.keys())
             self.normalize_qkv_proj(weight_names, layer.weights)
-            self._rename_expert_w_to_proj(layer.weights)
+            if rename_w_to_proj:
+                self._rename_expert_w_to_proj(layer.weights)
             # Stack gate_proj + x_proj → in_proj for Mamba layers (before gate_up normalization)
             self._normalize_in_proj(layer.weights)
             # Stack in_proj_q + in_proj_k + in_proj_v + in_proj_z → in_proj_qkvz for GDN layers

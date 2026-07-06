@@ -226,8 +226,26 @@ def get_hidden_dim(
             )
 
 
+_HF_W_PROJ_NAMES = ("w1", "w2", "w3")
+
+
+def has_literal_w_modules(base_model: torch.nn.Module) -> bool:
+    """Whether the runtime model keeps HF-style ``w1``/``w2``/``w3`` module
+    names (e.g. InternLM2's ``w2`` down projection).
+
+    For such models the w1/w3/w2 -> gate_up_proj/down_proj renames must be
+    skipped: the renamed targets/weights would no longer match the live
+    modules and the adapter would be silently dropped.
+    """
+    return any(
+        name.rsplit(".", 1)[-1] in _HF_W_PROJ_NAMES
+        for name, _ in base_model.named_modules()
+    )
+
+
 def get_normalized_target_modules(
     target_modules: Union[str, Iterable[str]],
+    base_model: Optional[torch.nn.Module] = None,
 ) -> set[str]:
     """
     Mapping a list of target module name to names of the normalized LoRA weights.
@@ -237,6 +255,10 @@ def get_normalized_target_modules(
     {"all"} as a sentinel value.  Callers that need a concrete module set
     should use :func:`auto_detect_lora_target_modules` to resolve the shorthand
     against the loaded base model.
+
+    When ``base_model`` is provided, the HF-checkpoint w1/w3/w2 renames are
+    only applied if the model does not keep those literal module names at
+    runtime (see :func:`has_literal_w_modules`).
     """
     # Handle PEFT shorthand strings — return {"all"} as sentinel.
     # Callers can resolve to concrete names via auto_detect_lora_target_modules().
@@ -273,6 +295,10 @@ def get_normalized_target_modules(
         "wk": "indexer.wk",
         "weights_proj": "indexer.weights_proj",
     }
+
+    if base_model is not None and has_literal_w_modules(base_model):
+        for w_name in _HF_W_PROJ_NAMES:
+            del params_mapping[w_name]
 
     result = set()
     for name in target_modules:
@@ -403,7 +429,7 @@ def auto_detect_lora_target_modules(model: "torch.nn.Module") -> set:
             else:
                 raw_names.add(leaf_name)
 
-    normalized = get_normalized_target_modules(raw_names)
+    normalized = get_normalized_target_modules(raw_names, model)
     result = normalized & _KNOWN_LORA_TARGET_MODULES
 
     # Most MoE models name their router `gate` (a ReplicatedLinear the walk
