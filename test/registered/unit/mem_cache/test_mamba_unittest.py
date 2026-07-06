@@ -755,6 +755,65 @@ class TestMamba(unittest.TestCase):
 
         tree.sanity_check()
 
+    def test_lazy_mamba_track_slot_allocation(self):
+        """Verify mamba_track_slot is lazily allocated and properly freed."""
+        _, _, req_to_token_pool, make_dummy_req = self._setup_tree_and_allocator()
+        mamba_pool = req_to_token_pool.mamba_pool
+
+        req = make_dummy_req()
+
+        # After alloc, mamba_pool_idx is set but mamba_track_slot remains None (lazy).
+        self.assertIsNotNone(req.mamba_pool_idx)
+        self.assertIsNone(req.mamba_track_slot)
+
+        # Manually allocate a track slot (simulates what _alloc_mamba_track_slot does).
+        avail_before = mamba_pool.available_size()
+        slot = mamba_pool.alloc(1)
+        self.assertIsNotNone(slot)
+        req.mamba_track_slot = slot
+        self.assertEqual(mamba_pool.available_size(), avail_before - 1)
+
+        # free_mamba_cache with enable_mamba_extra_buffer=True frees both slots.
+        req_to_token_pool.enable_mamba_extra_buffer = True
+        avail_before_free = mamba_pool.available_size()
+        req_to_token_pool.free_mamba_cache(req)
+        # mamba_pool_idx (1 slot) + mamba_track_slot (1 slot) = 2 freed
+        self.assertEqual(mamba_pool.available_size(), avail_before_free + 2)
+        self.assertIsNone(req.mamba_pool_idx)
+        self.assertIsNone(req.mamba_track_slot)
+
+    def test_lazy_mamba_track_slot_donated_to_tree(self):
+        """When donated_to_tree=True, track slot is cleared but not freed back to pool."""
+        _, _, req_to_token_pool, make_dummy_req = self._setup_tree_and_allocator()
+        mamba_pool = req_to_token_pool.mamba_pool
+
+        req = make_dummy_req()
+        slot = mamba_pool.alloc(1)
+        req.mamba_track_slot = slot
+
+        req_to_token_pool.enable_mamba_extra_buffer = True
+        avail_before_free = mamba_pool.available_size()
+        req_to_token_pool.free_mamba_cache(req, donated_to_tree=True)
+        # mamba_pool_idx freed (1 slot), but track slot NOT freed (donated to tree)
+        self.assertEqual(mamba_pool.available_size(), avail_before_free + 1)
+        self.assertIsNone(req.mamba_pool_idx)
+        self.assertIsNone(req.mamba_track_slot)
+
+    def test_lazy_mamba_track_slot_none_on_free(self):
+        """When mamba_track_slot is None, free_mamba_cache only frees mamba_pool_idx."""
+        _, _, req_to_token_pool, make_dummy_req = self._setup_tree_and_allocator()
+        mamba_pool = req_to_token_pool.mamba_pool
+
+        req = make_dummy_req()
+        self.assertIsNone(req.mamba_track_slot)
+
+        req_to_token_pool.enable_mamba_extra_buffer = True
+        avail_before_free = mamba_pool.available_size()
+        req_to_token_pool.free_mamba_cache(req)
+        # Only mamba_pool_idx freed (1 slot), track slot was None
+        self.assertEqual(mamba_pool.available_size(), avail_before_free + 1)
+        self.assertIsNone(req.mamba_pool_idx)
+
 
 if __name__ == "__main__":
     unittest.main()

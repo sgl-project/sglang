@@ -71,7 +71,7 @@ def _should_enable_lazy_compaction() -> bool:
 
 
 # the ratio of mamba cache pool size to max_running_requests
-MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO = 3
+MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO = 1
 MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP = 2
 MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP_LAZY = 1
 MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_OVERLAP = 1
@@ -1240,7 +1240,8 @@ class ModelRunnerKVCacheMixin:
         if self.mambaish_config is not None:
             ratio = self._calculate_mamba_ratio()
             max_num_reqs = min(
-                max_num_reqs, self.server_args.max_mamba_cache_size // ratio
+                max_num_reqs,
+                self.server_args.max_mamba_cache_size // ratio,
             )
 
             if max_num_reqs <= 0:

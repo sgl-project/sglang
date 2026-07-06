@@ -1,15 +1,26 @@
 import logging
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
+from sglang.srt.managers.schedule_batch import set_mamba_track_indices_from_reqs
+from sglang.srt.mem_cache.common import (
+    alloc_paged_token_slots_extend,
+    alloc_token_slots,
+    get_last_loc,
+)
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
+from sglang.srt.speculative.triton_ops.cache_locs import assign_req_to_token_pool_func
+from sglang.srt.utils.async_probe import maybe_detect_oob
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import ScheduleBatch
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +92,61 @@ class EagleVerifyInput(SpecInput):
             seq_lens_sum=0,
             seq_lens_cpu=torch.empty((0,), dtype=torch.int64),
         )
+
+
+    def prepare_for_verify(self, batch: "ScheduleBatch", page_size: int):
+
+        if batch.forward_mode.is_idle():
+            return
+
+        batch.input_ids = self.draft_token
+        maybe_detect_oob(
+            batch.input_ids,
+            0,
+            batch.model_config.vocab_size,
+            "eagle prepare_for_verify input_ids",
+        )
+
+        if page_size == 1:
+            batch.out_cache_loc = alloc_token_slots(
+                batch.tree_cache,
+                len(batch.input_ids),
+            )
+            end_offset = batch.seq_lens + self.draft_token_num
+        else:
+            prefix_lens = batch.seq_lens
+            prefix_lens_cpu = batch.seq_lens_cpu
+            end_offset = prefix_lens + self.draft_token_num
+            end_offset_cpu = prefix_lens_cpu + self.draft_token_num
+            last_loc = get_last_loc(
+                batch.req_to_token_pool.req_to_token,
+                batch.req_pool_indices,
+                prefix_lens,
+            )
+            batch.out_cache_loc = alloc_paged_token_slots_extend(
+                batch.tree_cache,
+                prefix_lens,
+                prefix_lens_cpu,
+                end_offset,
+                end_offset_cpu,
+                last_loc,
+                len(batch.input_ids),
+            )
+
+        bs = batch.batch_size()
+        assign_req_to_token_pool_func(
+            batch.req_pool_indices,
+            batch.req_to_token_pool.req_to_token,
+            batch.seq_lens,
+            end_offset,
+            batch.out_cache_loc,
+            bs,
+        )
+
+        if get_global_server_args().enable_mamba_extra_buffer():
+            set_mamba_track_indices_from_reqs(batch)
+            batch.mamba_track_mask = None
+            batch.mamba_track_seqlens = None
 
     def generate_attn_arg_prefill(
         self,

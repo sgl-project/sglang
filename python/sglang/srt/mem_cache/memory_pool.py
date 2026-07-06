@@ -844,7 +844,6 @@ class HybridReqToTokenPool(ReqToTokenPool):
             enable_memory_saver=enable_memory_saver,
         )
 
-        self.mamba_ping_pong_track_buffer_size = 2 if enable_overlap_schedule else 1
         self.enable_mamba_extra_buffer = enable_mamba_extra_buffer
         self.enable_mamba_extra_buffer_lazy = enable_mamba_extra_buffer_lazy
         self.enable_memory_saver = enable_memory_saver
@@ -916,14 +915,6 @@ class HybridReqToTokenPool(ReqToTokenPool):
         self.req_index_to_mamba_index_mapping: torch.Tensor = torch.zeros(
             req_pool_size, dtype=torch.int32, device=self.device
         )
-        if enable_mamba_extra_buffer:
-            self.req_index_to_mamba_ping_pong_track_buffer_mapping: torch.Tensor = (
-                torch.zeros(
-                    (req_pool_size, self.mamba_ping_pong_track_buffer_size),
-                    dtype=torch.int64,
-                    device=self.device,
-                )
-            )
 
     def register_layer_transfer_counter(self, layer_transfer_counter: LayerDoneCounter):
         self.layer_transfer_counter = layer_transfer_counter
@@ -936,7 +927,6 @@ class HybridReqToTokenPool(ReqToTokenPool):
             return None
 
         mamba_indices: list[torch.Tensor] = []
-        mamba_ping_pong_track_buffers: list[torch.Tensor] = []
         for req in reqs:
             if req.mamba_pool_idx is not None:  # for radix cache / continuing chunked
                 pass
@@ -954,24 +944,11 @@ class HybridReqToTokenPool(ReqToTokenPool):
                 if self.mamba_pool.replayssm_write_pos is not None:
                     self.mamba_pool.replayssm_write_pos[req.mamba_pool_idx] = 0
             mamba_indices.append(req.mamba_pool_idx)
-            if self.enable_mamba_extra_buffer:
-                if req.mamba_ping_pong_track_buffer is None:
-                    self._alloc_ping_pong_buffer(req)
-                mamba_ping_pong_track_buffers.append(req.mamba_ping_pong_track_buffer)
         assert len(select_index) == len(
             mamba_indices
-        ), "Not enough space for mamba cache, try to increase --mamba-full-memory-ratio or --max-mamba-cache-size."
-        if self.enable_mamba_extra_buffer:
-            assert len(select_index) == len(
-                mamba_ping_pong_track_buffers
-            ), "Not enough space for mamba ping pong idx, try to increase --mamba-full-memory-ratio."
+        ), f"Not enough space for mamba cache, try to increase --mamba-full-memory-ratio or --max-mamba-cache-size."
         mamba_index_tensor = torch.stack(mamba_indices).to(dtype=torch.int32)
         self.req_index_to_mamba_index_mapping[select_index] = mamba_index_tensor
-        if self.enable_mamba_extra_buffer:
-            ping_pong_tensor = torch.stack(mamba_ping_pong_track_buffers)
-            self.req_index_to_mamba_ping_pong_track_buffer_mapping[select_index] = (
-                ping_pong_tensor
-            )
         return select_index
 
     def get_mamba_indices(self, req_indices: torch.Tensor) -> torch.Tensor:
@@ -1000,135 +977,19 @@ class HybridReqToTokenPool(ReqToTokenPool):
     def get_state_dim_per_tensor(self):
         return self.mamba_pool.get_state_dim_per_tensor()
 
-    def get_mamba_ping_pong_other_idx(self, mamba_next_track_idx: int) -> int:
-        if self.mamba_ping_pong_track_buffer_size == 2:
-            return 1 - mamba_next_track_idx
-        else:
-            return mamba_next_track_idx
-
-    def get_mamba_ping_pong_keep_idx(self, req: Req) -> int:
-        """Return the ping-pong index holding the most recent tracked state.
-
-        In lazy mode the valid state stays at next_track_idx (no eager swap).
-        In normal mode it is at the "other" index (swapped after each track).
-        """
-        if self.enable_mamba_extra_buffer_lazy:
-            return req.mamba_next_track_idx
-        return self.get_mamba_ping_pong_other_idx(req.mamba_next_track_idx)
-
-    def _alloc_ping_pong_buffer(self, req: Req):
-        """Allocate the ping-pong track buffer for a new request.
-
-        Lazy mode allocates 1 slot with the second set to -1 (allocated
-        on demand at track boundaries). Normal mode allocates all slots upfront.
-        """
-        n = (
-            1
-            if self.enable_mamba_extra_buffer_lazy
-            else self.mamba_ping_pong_track_buffer_size
-        )
-        slots = self.mamba_allocator.alloc(n)
-        assert slots is not None, (
-            "Not enough space for mamba ping pong idx, "
-            "try to increase --mamba-full-memory-ratio."
-        )
-        buf = torch.full(
-            (self.mamba_ping_pong_track_buffer_size,),
-            -1,
-            dtype=slots.dtype,
-            device=slots.device,
-        )
-        buf[:n] = slots
-        req.mamba_ping_pong_track_buffer = buf
-        req.mamba_next_track_idx = 0
-
-    def set_mamba_ping_pong_slot(self, req: Req, idx: int, value):
-        """Update a ping-pong slot value and sync the device-side mapping.
-
-        The req holds the authoritative buffer; this keeps the
-        req_index_to_mamba_ping_pong_track_buffer_mapping in sync so that
-        set_mamba_track_indices_from_reqs reads correct slot indices.
-        """
-        req.mamba_ping_pong_track_buffer[idx] = value
-        self.req_index_to_mamba_ping_pong_track_buffer_mapping[req.req_pool_idx] = (
-            req.mamba_ping_pong_track_buffer
-        )
-
-    def donate_mamba_ping_pong_slot(
-        self, req: Req, new_slot: torch.Tensor
-    ) -> torch.Tensor:
-        """Donate the tracked-state ping-pong slot to the radix cache.
-
-        Returns the old slot index (shape [1]) for cache insertion and
-        replaces it with new_slot so the request can continue tracking.
-        In lazy mode the valid state is at next_track_idx; in normal mode
-        it is at the "other" index.
-        """
-        donate_idx = self.get_mamba_ping_pong_keep_idx(req)
-        mamba_value_donated = (
-            req.mamba_ping_pong_track_buffer[donate_idx].unsqueeze(-1).clone()
-        )
-        assert mamba_value_donated.item() != -1, (
-            f"Donated mamba slot is -1: donate_idx={donate_idx}, "
-            f"buf={req.mamba_ping_pong_track_buffer.tolist()}, "
-            f"next_track_idx={req.mamba_next_track_idx}, "
-            f"rid={req.rid}"
-        )
-        self.set_mamba_ping_pong_slot(req, donate_idx, new_slot[0])
-        return mamba_value_donated
-
-    def free_mamba_cache(
-        self, req: Req, mamba_ping_pong_track_buffer_to_keep: Optional[int] = None
-    ):
+    def free_mamba_cache(self, req: "Req", donated_to_tree: bool = False):
         mamba_index = req.mamba_pool_idx
         assert mamba_index is not None, "double free? mamba_index is None"
-        self.mamba_allocator.free(mamba_index.unsqueeze(0))
-        req.mamba_pool_idx = None
 
-        if self.enable_mamba_extra_buffer:
-            mamba_ping_pong_track_buffer_to_free = (
-                self.req_index_to_mamba_ping_pong_track_buffer_mapping[req.req_pool_idx]
-            )
-            if mamba_ping_pong_track_buffer_to_keep is not None:
-                assert mamba_ping_pong_track_buffer_to_keep in [
-                    0,
-                    1,
-                ], f"mamba_ping_pong_track_buffer_to_keep must be 0 or 1, {mamba_ping_pong_track_buffer_to_keep=}"
-                # Avoid Python-list advanced indexing on a device tensor.
-                # The ping-pong buffer size is either 2 (normal) or 1 (spec decode).
-                if self.mamba_ping_pong_track_buffer_size == 2:
-                    idx_to_free = 1 - mamba_ping_pong_track_buffer_to_keep
-                    mamba_ping_pong_track_buffer_to_free = (
-                        mamba_ping_pong_track_buffer_to_free[
-                            idx_to_free : idx_to_free + 1
-                        ]
-                    )
-                else:
-                    assert self.mamba_ping_pong_track_buffer_size == 1, (
-                        f"Unexpected mamba_ping_pong_track_buffer_size="
-                        f"{self.mamba_ping_pong_track_buffer_size}"
-                    )
-                    assert mamba_ping_pong_track_buffer_to_keep == 0, (
-                        "mamba_ping_pong_track_buffer_to_keep must be 0 when "
-                        "mamba_ping_pong_track_buffer_size is 1"
-                    )
-                    # Keep the only slot, so free nothing.
-                    mamba_ping_pong_track_buffer_to_free = (
-                        mamba_ping_pong_track_buffer_to_free[0:0]
-                    )
-            if self.enable_mamba_extra_buffer_lazy:
-                mamba_ping_pong_track_buffer_to_free = (
-                    mamba_ping_pong_track_buffer_to_free[
-                        mamba_ping_pong_track_buffer_to_free != -1
-                    ]
-                )
-            self.mamba_allocator.free(mamba_ping_pong_track_buffer_to_free)
-            # Match the req.mamba_pool_idx=None clear above so the next
-            # alloc() doesn't see a stale ping-pong reference on the req
-            # and skip allocation (which would silently reuse a freed
-            # tensor on the req side while the new pool slot leaks).
-            req.mamba_ping_pong_track_buffer = None
-            req.mamba_next_track_idx = None
+        if self.enable_mamba_extra_buffer and req.mamba_track_slot is not None:
+            self.mamba_allocator.free(mamba_index.unsqueeze(0))
+            if not donated_to_tree:
+                self.mamba_allocator.free(req.mamba_track_slot)
+            req.mamba_track_slot = None
+        elif not donated_to_tree:
+            self.mamba_allocator.free(mamba_index.unsqueeze(0))
+
+        req.mamba_pool_idx = None
 
     def clear(self):
         logger.info("Reset HybridReqToTokenPool")
@@ -1141,8 +1002,6 @@ class HybridReqToTokenPool(ReqToTokenPool):
         if self.mamba_ckpt_pool is not None:
             self.mamba_ckpt_pool.clear()
         self.req_index_to_mamba_index_mapping.zero_()
-        if self.enable_mamba_extra_buffer:
-            self.req_index_to_mamba_ping_pong_track_buffer_mapping.zero_()
 
 
 @dataclass

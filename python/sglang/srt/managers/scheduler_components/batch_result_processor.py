@@ -873,80 +873,21 @@ class SchedulerBatchResultProcessor:
         result: GenerationBatchResult,
         i: int,
     ) -> None:
-        """Update mamba track state at ping-pong boundaries.
-
-        Non-lazy: swap the ping-pong index so the next forward writes to
-        the alternate slot.
-        Lazy: keep the same index (prealloc handles the swap) and run
-        post-decode cleanup to free the temporary second slot.
-        """
-        if req.mamba_ping_pong_track_buffer is None:
-            return
-
-        lazy = get_global_server_args().enable_mamba_extra_buffer_lazy()
-        at_boundary, track_seqlen = self._mamba_check_track_boundary(
-            req, batch, result, i
-        )
-
-        if not at_boundary:
-            return
-
-        req.mamba_last_track_seqlen = track_seqlen
-        if lazy:
-            self.mamba_lazy_post_decode_at_boundary(req, batch)
-        else:
-            req.mamba_next_track_idx = (
-                batch.req_to_token_pool.get_mamba_ping_pong_other_idx(
-                    req.mamba_next_track_idx
-                )
-            )
-
-    def _mamba_check_track_boundary(self, req, batch, result, i):
-        """Check if this decode step crosses a mamba track interval boundary.
-
-        Returns (at_boundary, track_seqlen).  The boundary condition
-        matches what the forward's tracking mask used:
-        ``prepare_for_decode`` increments both ``seq_lens_cpu`` and
-        ``kv_committed_len`` by 1, then checks
-        ``seq_lens_cpu % interval == 0``.  Using ``kv_committed_len``
-        here reproduces that check exactly, and the value is always a
-        multiple of ``interval`` (hence page-aligned).
-
-        For spec decode, the boundary is detected by comparing the
-        accepted seq_len range against interval boundaries.
-        """
-        interval = get_global_server_args().mamba_track_interval
-
-        if batch.spec_algorithm.is_none():
-            if req.kv_committed_len % interval == 0:
-                return True, req.kv_committed_len
-        elif result.num_correct_drafts_per_req_cpu is not None:
-            cur = req.seqlen - 1
-            prev = cur - result.num_correct_drafts_per_req_cpu[i] - 1
-            if cur // interval != prev // interval:
-                return True, cur // interval * interval
-
-        return False, 0
-
-    def mamba_lazy_post_decode_at_boundary(self, req: Req, batch: ScheduleBatch):
-        """Post-decode cleanup at a lazy-mode track boundary.
-
-        Finished reqs: if prealloc failed (other slot is -1), the forward
-        overwrote the only slot with corrupted state, so mark
-        is_insert=False to skip the cache insert.  If the other slot is
-        occupied (stale prealloc from an overlap extra forward), free it
-        so the prealloc assert in the next prepare_for_decode holds.
-
-        Running reqs: free the old ping-pong slot so we go back to
-        holding only 1 slot until the next boundary.
-        """
-        other_idx = 1 - req.mamba_next_track_idx
-        other_val = req.mamba_ping_pong_track_buffer[other_idx].item()
-        if other_val != -1:
-            pool = batch.req_to_token_pool
-            pool.mamba_allocator.free(
-                req.mamba_ping_pong_track_buffer[other_idx].unsqueeze(0)
-            )
-            pool.set_mamba_ping_pong_slot(req, other_idx, -1)
-        elif req.finished():
-            req.mamba_lazy_is_insert = False
+        seq_len = len(req.origin_input_ids) + len(req.output_ids) - 1
+        if get_global_server_args().enable_mamba_extra_buffer():
+            mamba_track_interval = get_global_server_args().mamba_track_interval
+            if batch.spec_algorithm.is_none() and seq_len % mamba_track_interval == 0:
+                req.mamba_last_track_seqlen = seq_len
+            elif (
+                not batch.spec_algorithm.is_none()
+                and result.num_correct_drafts_per_req_cpu is not None
+            ):
+                actual_seq_len = req.seqlen - 1
+                if (
+                    actual_seq_len // mamba_track_interval
+                    != (actual_seq_len - result.num_correct_drafts_per_req_cpu[i] - 1)
+                    // mamba_track_interval
+                ):
+                    req.mamba_last_track_seqlen = (
+                        actual_seq_len // mamba_track_interval * mamba_track_interval
+                    )
