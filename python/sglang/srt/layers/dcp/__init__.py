@@ -26,6 +26,8 @@ Package-internal helpers (the @triton.jit kernels, ``CPTritonContext``,
 ``sglang.srt.layers.dcp.{kernels,comm}`` if ever needed internally."""
 
 from sglang.srt.layers.dcp.comm import (
+    dcp_a2a_lse_reduce,
+    init_fi_a2a_workspace,
     all_gather_kv_cache_for_dcp,
     all_gather_kv_cache_for_mha_chunk_extend,
     all_gather_kv_cache_for_mha_extend,
@@ -37,7 +39,11 @@ from sglang.srt.layers.dcp.comm import (
     get_attention_dcp_rank,
     get_attention_dcp_world_size,
 )
-from sglang.srt.layers.dcp.kernels import create_triton_kv_indices_for_dcp_triton
+from sglang.srt.layers.dcp.kernels import (
+    _lse_weighted_combine_cpu,
+    create_triton_kv_indices_for_dcp_triton,
+    dcp_lse_combine_triton,
+)
 from sglang.srt.layers.dcp.layout import (
     filter_dcp_local_kv_indices,
     get_dcp_lens,
@@ -55,6 +61,9 @@ from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
 
 __all__ = [
     "DecodeContextParallelMetadata",
+    "dcp_a2a_lse_reduce",
+    "dcp_lse_combine_triton",
+    "init_fi_a2a_workspace",
     "all_gather_kv_cache_for_dcp",
     "all_gather_kv_cache_for_mha_chunk_extend",
     "all_gather_kv_cache_for_mha_extend",

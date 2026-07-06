@@ -15,7 +15,7 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.attention.dcp_a2a import (
+from sglang.srt.layers.dcp import (
     _lse_weighted_combine_cpu,
     dcp_lse_combine_triton,
 )

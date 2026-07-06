@@ -31,7 +31,7 @@ class TestLSECombineTritonVsCPU(CustomTestCase):
     def _run_combine_test(
         self, N, B, H_local, D, is_base_e, dtype=torch.bfloat16, atol=1e-2
     ):
-        from sglang.srt.layers.attention.dcp_a2a import (
+        from sglang.srt.layers.dcp import (
             _lse_weighted_combine_cpu,
             dcp_lse_combine_triton,
         )
@@ -104,7 +104,7 @@ class TestLSECombineSingleShard(CustomTestCase):
         cls.device = "cuda"
 
     def test_single_shard(self):
-        from sglang.srt.layers.attention.dcp_a2a import dcp_lse_combine_triton
+        from sglang.srt.layers.dcp import dcp_lse_combine_triton
 
         N, B, H_local, D = 1, 4, 8, 64
         partial_outputs = torch.randn(
@@ -136,7 +136,7 @@ class TestLSECombineReturnLSE(CustomTestCase):
         cls.device = "cuda"
 
     def test_return_lse(self):
-        from sglang.srt.layers.attention.dcp_a2a import dcp_lse_combine_triton
+        from sglang.srt.layers.dcp import dcp_lse_combine_triton
 
         N, B, H_local, D = 2, 4, 8, 64
         partial_outputs = torch.randn(
@@ -166,7 +166,7 @@ class TestLSECombineEdgeCases(CustomTestCase):
 
     def test_one_shard_dominant(self):
         """One shard has much larger LSE -- output should be close to that shard."""
-        from sglang.srt.layers.attention.dcp_a2a import (
+        from sglang.srt.layers.dcp import (
             _lse_weighted_combine_cpu,
             dcp_lse_combine_triton,
         )
@@ -198,7 +198,7 @@ class TestLSECombineEdgeCases(CustomTestCase):
 
     def test_equal_lse(self):
         """Equal LSE across shards -- output should be mean of outputs."""
-        from sglang.srt.layers.attention.dcp_a2a import dcp_lse_combine_triton
+        from sglang.srt.layers.dcp import dcp_lse_combine_triton
 
         N, B, H_local, D = 2, 1, 1, 64
         partial_outputs = torch.randn(
@@ -222,7 +222,7 @@ class TestCPUReference(CustomTestCase):
     """Test the CPU reference implementation independently."""
 
     def test_basic_combine(self):
-        from sglang.srt.layers.attention.dcp_a2a import _lse_weighted_combine_cpu
+        from sglang.srt.layers.dcp import _lse_weighted_combine_cpu
 
         N, B, H, D = 2, 2, 4, 8
         outputs = torch.randn(N, B, H, D)
@@ -233,7 +233,7 @@ class TestCPUReference(CustomTestCase):
         self.assertFalse(torch.isnan(result).any())
 
     def test_base2_vs_base_e(self):
-        from sglang.srt.layers.attention.dcp_a2a import _lse_weighted_combine_cpu
+        from sglang.srt.layers.dcp import _lse_weighted_combine_cpu
 
         N, B, H, D = 2, 2, 4, 8
         outputs = torch.randn(N, B, H, D)
@@ -245,7 +245,7 @@ class TestCPUReference(CustomTestCase):
         self.assertFalse(torch.allclose(result_e, result_2, atol=1e-3))
 
     def test_nan_lse_handled(self):
-        from sglang.srt.layers.attention.dcp_a2a import _lse_weighted_combine_cpu
+        from sglang.srt.layers.dcp import _lse_weighted_combine_cpu
 
         N, B, H, D = 2, 1, 1, 8
         outputs = torch.randn(N, B, H, D)
@@ -255,7 +255,7 @@ class TestCPUReference(CustomTestCase):
         self.assertFalse(torch.isnan(result).any())
 
     def test_inf_lse_handled(self):
-        from sglang.srt.layers.attention.dcp_a2a import _lse_weighted_combine_cpu
+        from sglang.srt.layers.dcp import _lse_weighted_combine_cpu
 
         N, B, H, D = 2, 1, 1, 8
         outputs = torch.randn(N, B, H, D)
@@ -302,7 +302,7 @@ class TestDCPA2AReduceWithCUDAGraphBuffers(CustomTestCase):
         }
 
     def test_cuda_graph_buffers_same_as_dynamic(self):
-        from sglang.srt.layers.attention.dcp_a2a import dcp_a2a_lse_reduce
+        from sglang.srt.layers.dcp import dcp_a2a_lse_reduce
 
         torch.manual_seed(123)
         N, B, H_per_rank, D = 2, 4, 8, 128
@@ -336,7 +336,7 @@ class TestDCPA2AReduceWithCUDAGraphBuffers(CustomTestCase):
         )
 
     def test_cuda_graph_buffers_n4(self):
-        from sglang.srt.layers.attention.dcp_a2a import dcp_a2a_lse_reduce
+        from sglang.srt.layers.dcp import dcp_a2a_lse_reduce
 
         torch.manual_seed(456)
         N, B, H_per_rank, D = 4, 2, 4, 64
@@ -371,7 +371,7 @@ class TestDCPA2AReduceWithCUDAGraphBuffers(CustomTestCase):
 
     def test_cuda_graph_buffers_partial_batch(self):
         """Buffer max_bs > actual B -- should correctly slice."""
-        from sglang.srt.layers.attention.dcp_a2a import dcp_a2a_lse_reduce
+        from sglang.srt.layers.dcp import dcp_a2a_lse_reduce
 
         torch.manual_seed(789)
         N, B, H_per_rank, D = 2, 3, 8, 128
@@ -398,7 +398,7 @@ class TestDCPA2AReduceWithCUDAGraphBuffers(CustomTestCase):
 
     def test_a2a_reduce_allocates_when_no_buffers(self):
         """Without cuda_graph_buffers, dcp_a2a_lse_reduce still works (eager mode)."""
-        from sglang.srt.layers.attention.dcp_a2a import dcp_a2a_lse_reduce
+        from sglang.srt.layers.dcp import dcp_a2a_lse_reduce
 
         N, B, H_per_rank, D = 2, 4, 8, 64
         H = H_per_rank * N
@@ -421,7 +421,7 @@ class TestDCPA2AReduceWithCUDAGraphBuffers(CustomTestCase):
 
     def test_buffers_have_fixed_data_ptrs(self):
         """Pre-allocated buffer data_ptr must not change -- required for graph replay."""
-        from sglang.srt.layers.attention.dcp_a2a import dcp_a2a_lse_reduce
+        from sglang.srt.layers.dcp import dcp_a2a_lse_reduce
 
         N, B, H_per_rank, D = 2, 4, 8, 64
         H = H_per_rank * N

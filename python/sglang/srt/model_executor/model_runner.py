@@ -928,7 +928,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             and self.server_args.dcp_comm_backend == "fi_a2a"
         ):
             from sglang.srt.distributed.parallel_state import get_dcp_group
-            from sglang.srt.layers.attention.dcp_a2a import init_fi_a2a_workspace
+            from sglang.srt.layers.dcp import init_fi_a2a_workspace
 
             init_fi_a2a_workspace(get_dcp_group())
 
