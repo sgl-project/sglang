@@ -228,6 +228,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._accept_anomaly_dump_count = 0
         self._last_draft_block_metadata_debug: Optional[dict] = None
         self._last_draft_block_ids_debug: Optional[list[int]] = None
+        self._last_draft_visible_block_swa_locs_debug: Optional[list[int]] = None
         self._last_context_kv_path_debug: Optional[str] = None
         self._boundary_debug_by_req_pool: dict[int, dict] = {}
         self._target_aux_debug_by_req_pool: dict[int, dict] = {}
@@ -978,6 +979,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             .cpu()
             .tolist()
         ]
+        self._last_draft_visible_block_swa_locs_debug = None
         try:
             with torch.inference_mode():
                 if os.getenv("SGLANG_DSPARK_DISABLE_DRAFT_CUDA_GRAPH", "0") == "1":
@@ -1107,10 +1109,20 @@ class DSparkWorkerV2(BaseSpecWorker):
                 out[f"{label}_valid_last8"] = [
                     int(x) for x in valid[-8:].tolist()
                 ]
+                block_locs = valid[-int(self.block_size) :]
+                out[f"{label}_valid_block_locs"] = [
+                    int(x) for x in block_locs.tolist()
+                ]
             return out
 
         swa_page_indices = getattr(core, "swa_page_indices", None)
         swa_topk_lengths = getattr(core, "swa_topk_lengths", None)
+        valid_edges = valid_first_last_row_edges(swa_page_indices, swa_topk_lengths)
+        self._last_draft_visible_block_swa_locs_debug = (
+            None
+            if valid_edges is None
+            else valid_edges.get("last_valid_block_locs")
+        )
         return {
             "draft_can_run_graph": can_run_graph,
             "draft_forward_mode": str(
@@ -1155,9 +1167,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             "draft_swa_indices_edges": first_last_row_edges(
                 swa_page_indices
             ),
-            "draft_swa_valid_edges": valid_first_last_row_edges(
-                swa_page_indices, swa_topk_lengths
-            ),
+            "draft_swa_valid_edges": valid_edges,
         }
 
     def _summarize_hidden_rows(self, rows: torch.Tensor) -> Optional[dict]:
@@ -1379,12 +1389,23 @@ class DSparkWorkerV2(BaseSpecWorker):
                 layer_ids.append(int(layers[0].self_attn.layer_id))
                 if len(layers) > 1:
                     layer_ids.append(int(layers[-1].self_attn.layer_id))
+            visible_block_swa_locs = self._last_draft_visible_block_swa_locs_debug
+            visible_block_swa = (
+                torch.tensor(
+                    visible_block_swa_locs,
+                    device=swa_locs.device,
+                    dtype=torch.int64,
+                )
+                if visible_block_swa_locs
+                else None
+            )
             return {
                 "logical_first_last": [int(start), int(end - 1)],
                 "full_first8": [int(x) for x in full_locs[:8].detach().cpu().tolist()],
                 "full_last8": [int(x) for x in full_locs[-8:].detach().cpu().tolist()],
                 "swa_first8": [int(x) for x in swa_locs[:8].detach().cpu().tolist()],
                 "swa_last8": [int(x) for x in swa_locs[-8:].detach().cpu().tolist()],
+                "visible_block_swa_locs": visible_block_swa_locs,
                 "boundary_debug": self._boundary_debug_by_req_pool.get(
                     int(req_pool_idx)
                 ),
@@ -1405,6 +1426,17 @@ class DSparkWorkerV2(BaseSpecWorker):
                     )
                     for layer_id in layer_ids
                 ],
+                "visible_block_kv_checksums": (
+                    [
+                        self._checksum_swa_kv_rows(
+                            layer_id=layer_id,
+                            swa_locs=visible_block_swa,
+                        )
+                        for layer_id in layer_ids
+                    ]
+                    if visible_block_swa is not None
+                    else None
+                ),
             }
         except Exception as e:
             return {"error": str(e)}
