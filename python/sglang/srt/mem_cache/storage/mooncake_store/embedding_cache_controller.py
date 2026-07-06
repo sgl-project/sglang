@@ -463,35 +463,54 @@ class EmbeddingCacheController:
 
             try:
                 op = self.prefetch_queue.get_nowait()
-                results = self.mooncake_store.batch_get(op.keys, op.ptrs, op.sizes)
-                success_count = sum(results)
-                logger.info(
-                    f"Mooncake GET Finished: Req {op.req_id}, Successfully fetched {success_count}/{len(op.keys)} images."
-                )
-                op.mark_done(all(results))
-                # Release ref counts now that RDMA GET is complete
-                with self.lock:
-                    for h in op.keys:
-                        self._release_hash(h)
-                self.prefetch_queue.task_done()
-                processed_any = True
             except Empty:
-                pass
+                op = None
+            if op is not None:
+                try:
+                    results = self.mooncake_store.batch_get(op.keys, op.ptrs, op.sizes)
+                    success_count = sum(results)
+                    logger.info(
+                        f"Mooncake GET Finished: Req {op.req_id}, Successfully fetched {success_count}/{len(op.keys)} images."
+                    )
+                    op.mark_done(all(results))
+                except Exception:
+                    logger.error(
+                        f"Mooncake GET failed for req {op.req_id}; marking prefetch as failed."
+                    )
+                    # Signal failure so the consumer fails fast instead of
+                    # spinning until its 60s timeout.
+                    op.mark_done(False)
+                finally:
+                    # Release ref counts once the RDMA attempt has finished,
+                    # regardless of whether the backend call succeeded.
+                    with self.lock:
+                        for h in op.keys:
+                            self._release_hash(h)
+                    self.prefetch_queue.task_done()
+                processed_any = True
 
             try:
                 op = self.insert_queue.get_nowait()
-                self.mooncake_store.batch_put(op.keys, op.ptrs, op.sizes)
-                logger.info(
-                    f"Mooncake PUT Finished: Successfully stored {len(op.keys)} keys in cluster."
-                )
-                # Release ref counts now that RDMA PUT is complete
-                with self.lock:
-                    for h in op.keys:
-                        self._release_hash(h)
-                self.insert_queue.task_done()
-                processed_any = True
             except Empty:
-                pass
+                op = None
+            if op is not None:
+                try:
+                    self.mooncake_store.batch_put(op.keys, op.ptrs, op.sizes)
+                    logger.info(
+                        f"Mooncake PUT Finished: Successfully stored {len(op.keys)} keys in cluster."
+                    )
+                except Exception:
+                    logger.error(
+                        "Mooncake PUT failed; embeddings not stored in cluster."
+                    )
+                finally:
+                    # Release ref counts once the RDMA attempt has finished,
+                    # regardless of whether the backend call succeeded.
+                    with self.lock:
+                        for h in op.keys:
+                            self._release_hash(h)
+                    self.insert_queue.task_done()
+                processed_any = True
 
             if not processed_any:
                 time.sleep(0.001)
