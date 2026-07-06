@@ -1943,7 +1943,9 @@ class DeepseekV4Model(nn.Module):
             and forward_batch.can_run_tbo
             and forward_batch.tbo_children is not None
             and forward_batch.global_forward_mode is not None
-            and forward_batch.global_forward_mode.is_extend()
+            # MTP target-verify also reports is_extend(); only real prefill
+            # should enter the prefill TBO strategy.
+            and forward_batch.global_forward_mode.is_extend_without_speculative()
             and not dsa_use_prefill_cp(forward_batch)
             and self.pp_group.world_size == 1
         )

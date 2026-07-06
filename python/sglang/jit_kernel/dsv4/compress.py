@@ -211,6 +211,20 @@ class CompressorPrefillPlan(NamedTuple):
             dtype=torch.uint8,
             pin_memory=not is_gpu_input,
         )
+        # DP-safe empty-batch guard: a TBO ubatch (or tail batch) can have 0
+        # query tokens (num_q_tokens==0) on THIS rank while other DP ranks are
+        # non-empty. The global TBO decision must stay uniform across ranks, so
+        # return an empty plan here (downstream compressor then processes 0
+        # tokens = no-op) instead of skipping TBO per-rank. Avoids the
+        # c_plan.cuh RuntimeCheck(batch_size <= num_q_tokens) failure at B>=1.
+        if int(num_q_tokens) == 0:
+            _dev = req_to_token.device
+            return CompressorPrefillPlan(
+                compress_ratio,
+                torch.empty((0, 16), dtype=torch.uint8, device=_dev),
+                torch.empty((0, 8), dtype=torch.uint8, device=_dev),
+                pin_buffer,
+            )
         module = _jit_compress_plan_module()
         plan_c, plan_w = module.plan_prefill(
             req_pool_indices,
