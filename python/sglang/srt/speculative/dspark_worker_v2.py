@@ -2056,6 +2056,143 @@ class DSparkWorkerV2(BaseSpecWorker):
         except Exception as e:
             return {"error": str(e)}
 
+    def _build_accept_anomaly_logit_score_debug(
+        self,
+        *,
+        row_idx: int,
+        block_hidden: torch.Tensor,
+        candidates: torch.Tensor,
+        target_predict: torch.Tensor,
+    ) -> Optional[list[dict]]:
+        try:
+            if (
+                block_hidden is None
+                or block_hidden.numel() == 0
+                or candidates.numel() == 0
+                or target_predict.numel() == 0
+            ):
+                return None
+            row_idx = int(row_idx)
+            if row_idx >= int(block_hidden.shape[0]):
+                return None
+
+            vocab_size = int(self._draft_inner.vocab_size)
+            logits_processor = self.draft_model.logits_processor
+
+            def _gather_full_vocab(logits_shard: torch.Tensor, head) -> torch.Tensor:
+                def _reindex_sharded_vocab(logits: torch.Tensor) -> torch.Tensor:
+                    mapping_fn = getattr(head, "get_sharded_to_full_mapping", None)
+                    if mapping_fn is None:
+                        return logits[..., :vocab_size]
+                    mapping = mapping_fn()
+                    if mapping is None:
+                        return logits[..., :vocab_size]
+                    cache_key = (id(head), int(logits.shape[-1]), logits.device)
+                    mapping_tensor = self._vocab_shard_mapping_cache.get(cache_key)
+                    if mapping_tensor is None or mapping_tensor.numel() != len(mapping):
+                        mapping_tensor = torch.tensor(
+                            mapping, dtype=torch.long, device=logits.device
+                        )
+                        self._vocab_shard_mapping_cache[cache_key] = mapping_tensor
+                    return logits.index_select(-1, mapping_tensor)[..., :vocab_size]
+
+                if logits_shard.shape[-1] >= vocab_size:
+                    return _reindex_sharded_vocab(logits_shard)
+                if getattr(head, "use_attn_tp_group", False):
+                    group = get_attn_tp_group()
+                    if group.world_size == 1:
+                        return logits_shard[..., :vocab_size]
+                    logits = group.all_gather(logits_shard, dim=-1)
+                    return _reindex_sharded_vocab(logits)
+                tp_size = get_tensor_model_parallel_world_size()
+                if tp_size == 1:
+                    return logits_shard[..., :vocab_size]
+                logits = tensor_model_parallel_all_gather(logits_shard, dim=-1)
+                return _reindex_sharded_vocab(logits)
+
+            def _compute_full_vocab_logits(hidden_states: torch.Tensor, head):
+                logits_shard = logits_processor._compute_lm_head(hidden_states, head)
+                return _gather_full_vocab(logits_shard, head)
+
+            with (
+                self.draft_tp_context(self.draft_model_runner.tp_group),
+                speculative_moe_backend_context(),
+                speculative_moe_a2a_backend_context(),
+                torch.inference_mode(),
+            ):
+                row_hidden = block_hidden[row_idx : row_idx + 1]
+                row_hidden_for_logits = self._draft_inner.shared_head.norm(row_hidden)
+                base_logits = _compute_full_vocab_logits(
+                    row_hidden_for_logits, self.draft_model.lm_head
+                )
+                markov_head = self._draft_inner.markov_head
+                candidate_row = candidates[row_idx]
+                target_row = target_predict[row_idx]
+                draft_width = min(
+                    int(self.block_size),
+                    int(base_logits.shape[1]),
+                    int(target_row.numel()),
+                    max(int(candidate_row.numel()) - 1, 0),
+                )
+                out = []
+                prev_tokens = candidate_row[:draft_width].to(
+                    device=block_hidden.device, dtype=torch.int64
+                )
+                for step in range(draft_width):
+                    prev_token = prev_tokens[step].view(1)
+                    candidate_token = int(candidate_row[step + 1].detach().cpu())
+                    target_token = int(target_row[step].detach().cpu())
+                    prev_embed = markov_head.get_prev_embeddings(prev_token)
+                    bias_logits = _compute_full_vocab_logits(
+                        prev_embed, markov_head.markov_w2
+                    )[0]
+                    base_step = base_logits[0, step]
+                    final_step = base_step + bias_logits
+
+                    def _score(logits: torch.Tensor, token: int) -> tuple[float, int]:
+                        value = logits[int(token)]
+                        rank = int((logits > value).sum().detach().cpu())
+                        return float(value.detach().cpu()), rank
+
+                    base_candidate, base_candidate_rank = _score(
+                        base_step, candidate_token
+                    )
+                    base_target, base_target_rank = _score(base_step, target_token)
+                    bias_candidate, bias_candidate_rank = _score(
+                        bias_logits, candidate_token
+                    )
+                    bias_target, bias_target_rank = _score(bias_logits, target_token)
+                    final_candidate, final_candidate_rank = _score(
+                        final_step, candidate_token
+                    )
+                    final_target, final_target_rank = _score(final_step, target_token)
+                    out.append(
+                        {
+                            "step": int(step),
+                            "prev_token": int(prev_token.detach().cpu()[0]),
+                            "candidate": candidate_token,
+                            "target": target_token,
+                            "base_candidate_logit": base_candidate,
+                            "base_target_logit": base_target,
+                            "base_candidate_rank": base_candidate_rank,
+                            "base_target_rank": base_target_rank,
+                            "bias_candidate_logit": bias_candidate,
+                            "bias_target_logit": bias_target,
+                            "bias_candidate_rank": bias_candidate_rank,
+                            "bias_target_rank": bias_target_rank,
+                            "final_candidate_logit": final_candidate,
+                            "final_target_logit": final_target,
+                            "final_candidate_rank": final_candidate_rank,
+                            "final_target_rank": final_target_rank,
+                            "final_margin_candidate_minus_target": (
+                                final_candidate - final_target
+                            ),
+                        }
+                    )
+                return out
+        except Exception as e:
+            return [{"error": str(e)}]
+
     def _maybe_log_accept_anomaly(
         self,
         *,
@@ -2070,6 +2207,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         prefix_lens: torch.Tensor,
         new_seq_lens: torch.Tensor,
         positions: torch.Tensor,
+        block_hidden: Optional[torch.Tensor] = None,
         target_logits: Optional[torch.Tensor] = None,
         ignore_mask: Optional[torch.Tensor] = None,
     ) -> None:
@@ -2302,6 +2440,14 @@ class DSparkWorkerV2(BaseSpecWorker):
             ):
                 self._accept_anomaly_dumped.add(key)
                 self._accept_anomaly_dump_count += 1
+                score_debug = None
+                if block_hidden is not None:
+                    score_debug = self._build_accept_anomaly_logit_score_debug(
+                        row_idx=i,
+                        block_hidden=block_hidden,
+                        candidates=candidates,
+                        target_predict=target_predict,
+                    )
                 if not self._is_tp0():
                     continue
                 kv_debug = self._build_accept_anomaly_kv_debug(
@@ -2315,6 +2461,8 @@ class DSparkWorkerV2(BaseSpecWorker):
                     target_predict=target_cpu,
                     confidence=confidence_cpu,
                 )
+                if markov_debug is not None and score_debug is not None:
+                    markov_debug["logit_score_debug"] = score_debug
                 if (
                     markov_debug is not None
                     and target_logits is not None
@@ -2902,6 +3050,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             prefix_lens=prefix_lens,
             new_seq_lens=new_seq_lens,
             positions=verify_positions,
+            block_hidden=block_hidden,
             target_logits=logits_output.next_token_logits,
             ignore_mask=transfer_warmup_mask,
         )
