@@ -63,9 +63,8 @@ impl Runnable for Egress {
                 // Python side used to track is now implicit in rid-based routing.
                 EGRESS_TAG_BATCH => {
                     let ok = for_each_chunk(body, |ev| {
-                        if let Some(rid) = parse_rid(&ev.rid) {
-                            self.route(rid, DetokMsg::Chunk(ev));
-                        }
+                        // rid is a raw u64 already (numeric column) — no parse.
+                        self.route(RequestId(ev.rid), DetokMsg::Chunk(ev));
                     });
                     if !ok {
                         tracing::warn!("egress: bad batch frame");

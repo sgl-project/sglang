@@ -308,7 +308,10 @@ class RustServer:
         # is by rid, so the old per-rid load-balance seq is no longer tracked
         # here). Collapsing N per-request encodes + N FFI crossings to one is what
         # keeps 4k-16k-request PD decode steps off the scheduler's critical path.
-        rids = payload.rids
+        # rids ship as raw u64 (the Rust `RequestIdGen` counter, stringified only
+        # on the ingress wire) — a numeric column, so the Rust side skips the
+        # per-request string decode + clone + parse. `int()` no-ops if already int.
+        rids = [int(r) for r in payload.rids]
         # Ship the WHOLE finish-reason dict per request (type + matched + message
         # + status_code + err_type + length).
         finish_reasons = [
