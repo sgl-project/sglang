@@ -3822,7 +3822,7 @@ class ServerArgs:
                         "shared layers would run sparse attention without indices."
                     )
 
-                if not is_npu() and not is_xpu():  # CUDA or ROCm GPU
+                if not is_npu() and not is_xpu() and not is_cpu():  # CUDA or ROCm GPU
                     if self.enable_prefill_cp:
                         # The DSA CP field declarations moved to the override
                         # registry (arg_groups/overrides.py:

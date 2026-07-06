@@ -3049,7 +3049,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
         # num head == 1 and head dim == 128 for index_k in DSA
         assert index_head_dim == 128
 
-        if _is_hip:
+        if _is_hip or _is_cpu:
             if aiter_can_use_preshuffle_paged_mqa():
                 assert (
                     self.page_size % 16 == 0

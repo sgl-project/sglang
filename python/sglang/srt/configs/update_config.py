@@ -89,7 +89,50 @@ def adjust_tp_num_heads_if_necessary(model_config, tp_size, is_post_update):
     # is_post_update: whether to update an existing config
     from sglang.srt.layers.vocab_parallel_embedding import pad_vocab_size
 
-    # Linear attn check logic
+    # GLM/DeepSeekV2 MLA check logic.
+    if all(
+        hasattr(model_config, attr)
+        for attr in ["num_attention_heads", "qk_nope_head_dim", "v_head_dim"]
+    ):
+        import math
+
+        old_num_attention_heads = model_config.num_attention_heads
+        kv_b_head_dim = model_config.qk_nope_head_dim + model_config.v_head_dim
+
+        block_n = None
+        quant_config = getattr(model_config, "quantization_config", None)
+        if isinstance(quant_config, dict):
+            weight_block_size = quant_config.get("weight_block_size")
+            if isinstance(weight_block_size, list) and len(weight_block_size) >= 1:
+                block_n = weight_block_size[0]
+
+        required_multiple = tp_size
+        if block_n is not None:
+            # Ensure (num_heads * kv_b_head_dim / tp_size) aligns to block_n.
+            align_base = tp_size * block_n
+            heads_multiple_for_block = align_base // math.gcd(kv_b_head_dim, align_base)
+            required_multiple = math.lcm(required_multiple, heads_multiple_for_block)
+
+        new_num_attention_heads = pad_vocab_size(
+            old_num_attention_heads, required_multiple
+        )
+        if new_num_attention_heads != old_num_attention_heads:
+            update_config(model_config, "num_attention_heads", new_num_attention_heads)
+
+            # Keep KV-head ratio unchanged when applicable.
+            if hasattr(model_config, "num_key_value_heads"):
+                old_num_kv_heads = model_config.num_key_value_heads
+                if (
+                    isinstance(old_num_kv_heads, int)
+                    and old_num_kv_heads > 0
+                    and old_num_attention_heads % old_num_kv_heads == 0
+                ):
+                    query_heads_per_kv = old_num_attention_heads // old_num_kv_heads
+                    if new_num_attention_heads % query_heads_per_kv == 0:
+                        new_num_kv_heads = new_num_attention_heads // query_heads_per_kv
+                        update_config(model_config, "num_key_value_heads", new_num_kv_heads)
+
+    # Linear attention check logic for mamba/qwen models.
     if hasattr(model_config, "linear_num_key_heads") and hasattr(
         model_config, "linear_num_value_heads"
     ):
@@ -190,13 +233,50 @@ def update_config(model_config, attr_name, new_value):
     setattr(model_config, attr_name, new_value)
 
 
+def _iter_hf_text_like_configs(model_config):
+    """Yield unique HF config objects that may carry text head fields."""
+    seen = set()
+    candidates = [
+        getattr(model_config, "hf_config", None),
+        getattr(model_config, "hf_text_config", None),
+        getattr(getattr(model_config, "hf_config", None), "text_config", None),
+    ]
+    for cfg in candidates:
+        if cfg is None:
+            continue
+        cfg_id = id(cfg)
+        if cfg_id in seen:
+            continue
+        seen.add(cfg_id)
+        yield cfg
+
+
+def _sync_attention_head_fields(model_config):
+    """Keep ModelConfig caches and all text-like HF configs consistent."""
+    source_cfg = getattr(model_config, "hf_text_config", None)
+    if source_cfg is None:
+        source_cfg = getattr(getattr(model_config, "hf_config", None), "text_config", None)
+    if source_cfg is None:
+        source_cfg = getattr(model_config, "hf_config", None)
+    if source_cfg is None:
+        return
+
+    for field in ["num_attention_heads", "num_key_value_heads"]:
+        if not hasattr(source_cfg, field):
+            continue
+        value = getattr(source_cfg, field)
+        update_config(model_config, field, value)
+        for cfg in _iter_hf_text_like_configs(model_config):
+            update_config(cfg, field, value)
+
+
 def adjust_config_with_unaligned_cpu_tp(
     model_config: ModelConfig, load_config: LoadConfig, tp_size: int
 ) -> ModelConfig:
     # Support the case where the num_attention_heads is not divisible by the TP size.
     weight_block_size = may_get_weight_block_size(model_config, load_config)
 
-    for config in [model_config.hf_config, model_config.hf_text_config]:
+    for config in _iter_hf_text_like_configs(model_config):
         update_config(
             config,
             "original_num_attention_heads",
@@ -237,19 +317,14 @@ def adjust_config_with_unaligned_cpu_tp(
         num_key_value_heads = pad_vocab_size(total_kv_heads, pad_size)
 
         num_attention_heads = num_key_value_heads * query_heads_per_kv
-        for config in [
-            model_config,
-            model_config.hf_config,
-            model_config.hf_text_config,
-        ]:
+        for config in [model_config, *_iter_hf_text_like_configs(model_config)]:
             update_config(config, "num_key_value_heads", num_key_value_heads)
             update_config(config, "num_attention_heads", num_attention_heads)
 
-    adjust_tp_num_heads_if_necessary(model_config.hf_config, tp_size, True)
-    if hasattr(model_config.hf_config, "text_config"):
-        adjust_tp_num_heads_if_necessary(
-            model_config.hf_config.text_config, tp_size, True
-        )
+    for config in _iter_hf_text_like_configs(model_config):
+        adjust_tp_num_heads_if_necessary(config, tp_size, True)
+
+    _sync_attention_head_fields(model_config)
 
     intermediate_padding_size = tp_size * get_moe_padding_size(weight_block_size)
     for moe_intermediate_attr in [

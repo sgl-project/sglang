@@ -41,7 +41,9 @@ from sglang.srt.state_capturer.indexer_topk import (
 from sglang.srt.utils import (
     add_prefix,
     ceil_align,
+    cpu_has_amx_support,
     get_bool_env_var,
+    is_cpu,
     is_cuda,
     is_gfx95_supported,
     is_hip,
@@ -55,6 +57,8 @@ global _use_multi_stream
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
+_is_cpu = is_cpu()
+_cpu_amx = cpu_has_amx_support()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_fp8_fnuz = is_fp8_fnuz()
 _is_gfx95_supported = is_gfx95_supported()
@@ -80,6 +84,13 @@ if _use_aiter:
 if is_npu():
     import torch_npu
     from sglang.srt.hardware_backend.npu.utils import get_indexer_weight_stream
+
+if _is_cpu and _cpu_amx:
+
+    def act_quant_cpu(
+        x: torch.Tensor, block_size: int = 128, scale_fmt: Optional[str] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        return torch.ops.sgl_kernel.act_quant_cpu(x, block_size, scale_fmt)
 
 from sglang.srt.distributed import (
     get_attn_tp_group,
@@ -416,7 +427,10 @@ class Indexer(MultiPlatformOp):
                 prefix=add_prefix("weights_proj", prefix),
             )
         self.k_norm = LayerNorm(
-            self.head_dim, dtype=torch.bfloat16 if _use_aiter else torch.float32
+            self.head_dim,
+            dtype=torch.bfloat16
+            if (_use_aiter or (_is_cpu and _cpu_amx))
+            else torch.float32,
         )
         self.rotary_emb = get_rope_wrapper(
             rope_head_dim,
@@ -620,6 +634,7 @@ class Indexer(MultiPlatformOp):
     ):
         # Non-fusion path only; self.wk does not exist when fusion is on.
         key, _ = self.wk(x)
+        key = key.to(torch.bfloat16)
         key = self.k_norm(key)
         k_rope, _ = torch.split(
             key, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
@@ -2264,6 +2279,97 @@ class Indexer(MultiPlatformOp):
         )
         return topk_indices_prev[0], topk_indices_next[0]
 
+    def forward_cpu(
+        self,
+        x: torch.Tensor,
+        q_lora: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        return_indices: bool = True,
+    ) -> Optional[torch.Tensor]:
+        if TYPE_CHECKING:
+            assert isinstance(get_token_to_kv_pool(), DSATokenToKVPool)
+
+        # When upstream uses fused FP8 RMSNorm+quant, activations may be passed as
+        # a tuple like (x_fp8, x_scale[, y]). Use `x_meta` for shape/device queries.
+        x_meta = x[0] if isinstance(x, tuple) else x
+        metadata = get_attn_backend().get_indexer_metadata(layer_id, forward_batch)
+        if metadata is None:
+            return None
+
+        # Determine if should skip topk based on sequence length
+        skip_logits_computation = False
+        if forward_batch.forward_mode.is_extend_without_speculative():
+            if forward_batch.seq_lens_cpu is not None:
+                max_kv_len = forward_batch.seq_lens_cpu.max().item()
+                skip_logits_computation = max_kv_len <= self.index_topk
+
+        # Optimization: fast path when skipping topk computation
+        if skip_logits_computation and (not self.dsa_enable_prefill_cp):
+            topk_result = self._forward_cuda_k_only(
+                x,
+                positions,
+                forward_batch,
+                layer_id,
+                act_quant_cpu,
+                False,
+                metadata,
+                return_indices,
+            )
+            topk_result = _broadcast_indexer_topk_from_rank0(topk_result)
+            return maybe_capture_indexer_topk(layer_id, topk_result)
+
+        query, key = self._get_q_k_bf16(
+            q_lora, x, positions, False, forward_batch=forward_batch
+        )
+        q_fp8, q_scale = act_quant_cpu(query, self.block_size, self.scale_fmt)
+        self._store_index_k_cache(
+            forward_batch=forward_batch,
+            layer_id=layer_id,
+            key=key,
+            act_quant=act_quant_cpu,
+        )
+        if isinstance(x, tuple):
+            assert len(x) in (
+                2,
+                3,
+            ), "For tuple input, only (x, x_s) or (x, x_s, y) formats are accepted"
+            x_q, x_s = x[0], x[1]
+            if (
+                x_s is not None
+                and x_q.dim() == 2
+                and x_s.dim() == 2
+                and x_q.shape[0] == x_s.shape[0]
+            ):
+                m, n = x_q.shape
+                ng = x_s.shape[1]
+                if ng > 0 and n % ng == 0:
+                    group = n // ng
+                    x_for_gate = (
+                        x_q.to(torch.float32)
+                        .view(m, ng, group)
+                        .mul_(x_s.to(torch.float32).unsqueeze(-1))
+                        .view(m, n)
+                        .to(torch.bfloat16)
+                    )
+                else:
+                    x_for_gate = x_q.to(torch.bfloat16)
+            else:
+                x_for_gate = x_q.to(torch.bfloat16)
+        else:
+            x_for_gate = x
+        weights = self._get_logits_head_gate(x_for_gate, q_scale)
+
+        topk_result = self.forward_indexer(
+                q_fp8.contiguous(),
+                weights,
+                forward_batch,
+                topk=self.index_topk,
+                layer_id=layer_id,
+            )
+        topk_result = _broadcast_indexer_topk_from_rank0(topk_result)
+        return maybe_capture_indexer_topk(layer_id, topk_result)
 
 @register_custom_op(mutates_args=["topk_result"])
 @register_split_op()
