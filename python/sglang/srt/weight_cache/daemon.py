@@ -179,10 +179,8 @@ class WeightCacheDaemon:
         from sglang.srt.configs.device_config import DeviceConfig
         from sglang.srt.configs.model_config import ModelConfig
         from sglang.srt.model_loader.loader import get_model_loader
-        from sglang.srt.server_args import (
-            ServerArgs,
-            set_global_server_args_for_scheduler,
-        )
+        from sglang.srt.runtime_context import get_context
+        from sglang.srt.server_args import ServerArgs
 
         # Set up global server args (required by model __init__ and weight loading)
         server_args = ServerArgs(
@@ -195,7 +193,7 @@ class WeightCacheDaemon:
             load_format=self.load_format,
             model_loader_extra_config=self.model_loader_extra_config,
         )
-        set_global_server_args_for_scheduler(server_args)
+        get_context().set_server_args(server_args)
 
         # Initialize distributed backend for model loading
         # (must be done after server_args and model_config are available)
