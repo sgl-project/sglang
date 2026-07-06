@@ -13,7 +13,10 @@ jobs:
   check-changes:
     runs-on: ubuntu-latest
     outputs:
+      changes_exist: ${{ steps.filter.outputs.main_package == 'true'
+        || steps.filter.outputs.sgl_kernel == 'true' }}
       main_package: ${{ steps.filter.outputs.main_package }}
+      sgl_kernel: ${{ steps.filter.outputs.sgl_kernel }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -27,19 +30,20 @@ jobs:
               - "python/sglang/!(multimodal_gen)/**/!(*.md)"
               - "python/pyproject_other.toml"
               - "test/**/!(*.md)"
-              - "sgl-kernel/**/!(*.md|THIRDPARTYNOTICES.txt|LICENSE)"
               - ".github/workflows/pr-test-mlx.yml"
+            sgl_kernel:
+              - "sgl-kernel/**/!(*.md|THIRDPARTYNOTICES.txt|LICENSE)"
 
   # ==================== PR Gate ==================== #
   pr-gate:
     needs: check-changes
-    if: needs.check-changes.outputs.main_package == 'true'
+    if: needs.check-changes.outputs.changes_exist == 'true'
     uses: ./.github/workflows/pr-gate.yml
     secrets: inherit
 
   mlx-unit-test:
     needs: [check-changes, pr-gate]
-    if: needs.check-changes.outputs.main_package == 'true'
+    if: needs.check-changes.outputs.main_package == 'true' || needs.check-changes.outputs.sgl_kernel == 'true'
     runs-on: macos-26
     timeout-minutes: 60
     env:
