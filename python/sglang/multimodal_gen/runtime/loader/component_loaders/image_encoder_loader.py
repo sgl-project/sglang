@@ -50,8 +50,7 @@ class ImageEncoderLoader(TextEncoderLoader):
 
         encoder_config = server_args.pipeline_config.image_encoder_config
         encoder_config.update_model_arch(model_config)
-        # Resolve fold vs replicate for the encoder_parallel policy (image
-        # encoders are small, so "auto" normally reverts to replicated).
+        # real dims are populated now; resolve fold vs replicate
         finalize_encoder_folding(encoder_config, server_args.encoder_parallel)
 
         # Always start with local device; load_model will adjust for offload if needed

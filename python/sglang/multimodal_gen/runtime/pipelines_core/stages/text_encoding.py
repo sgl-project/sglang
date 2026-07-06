@@ -24,6 +24,7 @@ from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_c
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
 )
+from sglang.multimodal_gen.runtime.models.encoders.base import encoder_dp_worthwhile
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.condition_encoding import (
     ConditionEncodingStage,
@@ -41,27 +42,17 @@ logger = init_logger(__name__)
 
 
 def _data_parallel_text_encode(forward_fn, forward_kwargs: dict, group):
-    """Data-parallel text encoding across a replicated encoder's ranks.
+    """each rank encodes its 1/world_size batch slice, then all-gathers
 
-    When the text encoder is replicated (every rank redundantly encodes the
-    whole prompt batch), split the batch so each rank encodes only its
-    1/world_size slice, then all-gather so every rank ends up with the full
-    batch output. Each rank still runs the full, unsharded encoder on its
-    slice, so the result is bit-identical to the replicated forward (no
-    sharding FP-reorder) while cutting per-rank encode compute ~world_size.
-
-    The batch is padded to a multiple of world_size (padding rows are dropped
-    after the gather). All output tensors are batch-major (dim 0), and the
-    tokenized sequence length is uniform across ranks (the full batch is
-    tokenized identically on every rank), so the gather is a plain concat.
+    every rank runs the full unsharded encoder, so the gathered output is
+    bit-identical to the replicated forward; the batch is padded to a multiple
+    of world_size and padding rows are dropped after the gather
     """
     world = group.world_size
     rank = group.rank_in_group
     input_ids = forward_kwargs["input_ids"]
     bs = input_ids.shape[0]
-    # The whole group must enter this path in lockstep with the same batch size
-    # (all ranks process the same request; the caller gates identically). Verify
-    # cheaply so a desync fails fast here instead of hanging in the all-gather.
+    # fail fast on a cross-rank batch-size desync instead of hanging in the gather
     bs_sum = int(
         group.all_reduce(
             torch.tensor([bs], device=input_ids.device, dtype=torch.int64)
@@ -189,11 +180,9 @@ class TextEncodingStage(ConditionEncodingStage):
         this is a one-slot cache for the model-default negative prompt:
         most requests don't override the negative prompt, the cache hit rate is considerably high
 
-        Rank-sync invariant: hit/miss must be identical across every rank of the
-        DiT replica, because a miss runs encode_text which now contains collective
-        ops (folded encoders all_reduce; data-parallel encoding all_gathers) -- a
-        split hit/miss would deadlock. The key is deterministic and requests are
-        processed in lockstep, so this holds; keep any future eviction rank-global.
+        invariant: hit/miss must match across ranks -- a miss runs encode_text,
+        which may issue collectives (folding, dp encoding), so a split would
+        deadlock; keep any future eviction rank-global
         """
         negative_cache_key = self._build_negative_text_cache_key(
             batch, server_args, all_indices
@@ -521,23 +510,14 @@ class TextEncodingStage(ConditionEncodingStage):
             return text_encoder(**encoder_forward_kwargs)
 
     def _text_encode_dp_group(self, server_args, encoder_config, batch_size):
-        """Group to data-parallel a batched text-encode over, or None.
+        """group to data-parallel a batched text-encode over, or None
 
-        Only worth it when the encoder is *replicated* across a multi-rank
-        single replica (tp==1, dp==1, not folded), so every rank would
-        otherwise redundantly encode the whole batch -- each rank encodes a
-        shard of the batch instead, then all-gathers. A folded encoder is
-        already model-parallel (not replicated), and tp>1 already shards it;
-        dp>1 would need the per-replica group instead of the world group, so
-        skip those here.
-
-        Gated by the ``encoder_parallel`` policy: only "auto" and "dp" data-
-        parallel; "fold" folds instead and "replicate" keeps the redundant
-        per-rank encode.
+        requires a replicated encoder (tp==1, dp==1, not folded): each rank
+        would otherwise redundantly encode the whole batch
         """
         if (
             getattr(server_args, "encoder_parallel", "auto") not in ("auto", "dp")
-            or batch_size <= 1
+            or not encoder_dp_worthwhile(encoder_config, batch_size)
             or (server_args.tp_size or 1) != 1
             or (server_args.dp_size or 1) != 1
             or encoder_config.parallel_folding_mode is not None

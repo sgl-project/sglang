@@ -25,14 +25,8 @@ from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
 
 def get_folding_tp_group(config: EncoderConfig):
-    """Group an encoder should tensor-parallel over.
-
-    ``config.parallel_folding_mode`` is set by ServerArgs.adjust_pipeline_config
-    when the encoder is folded over a larger group than its own TP (the idle DiT
-    replica during the encoding stage); when it is None the encoder uses the
-    default TP group. Shared by every text/image encoder so the choice lives in
-    one place.
-    """
+    """group an encoder tensor-parallels over; the default TP group unless a
+    fold mode is set"""
     mode = config.parallel_folding_mode
     if mode == "sp":
         return get_sp_group()
@@ -46,11 +40,14 @@ def get_folding_tp_group(config: EncoderConfig):
     return get_tp_group()
 
 
-# Folding pays off only for wide encoders: measured ~-22% encode latency for
-# T5-XXL (hidden 4096) and larger for Mistral-24B (hidden 5120), but a net loss
-# for narrower ones (Qwen3 hidden 2560, CLIP 512) whose per-layer all_reduce
-# dominates the sharded compute. Decided on the real (post-load) hidden size.
+# measured on 2/4xH100: folding wins only for wide encoders (T5-XXL 4096: -20%
+# at batch 1, R-insensitive); narrower ones lose to the per-layer all_reduce
+# (Qwen3 2560: +35%, CLIP 768: +50%)
 FOLD_MIN_HIDDEN_SIZE = 4096
+# below this width the encoder stays latency-bound across batch sizes, so
+# data-parallel encoding saves no compute and the all_gather is a pure loss
+# (CLIP 768: dp slower at every batch/R measured)
+DP_MIN_HIDDEN_SIZE = 1024
 
 
 def _encoder_dims(config: EncoderConfig):
@@ -85,9 +82,7 @@ def _encoder_dims_divide(config: EncoderConfig, group_size: int) -> bool:
 
 
 def encoder_folding_worthwhile(config: EncoderConfig, group_size: int) -> bool:
-    """Fold only encoders wide enough to benefit whose heads and MLP divide the
-    fold group. Size-based (not per-architecture), so the same encoder family at
-    different parameter counts is handled correctly."""
+    """size-based, so the same family at different parameter counts differs"""
     hidden, _, _ = _encoder_dims(config)
     return (
         _encoder_dims_divide(config, group_size)
@@ -96,24 +91,15 @@ def encoder_folding_worthwhile(config: EncoderConfig, group_size: int) -> bool:
     )
 
 
+def encoder_dp_worthwhile(config: EncoderConfig, batch_size: int) -> bool:
+    hidden, _, _ = _encoder_dims(config)
+    return batch_size > 1 and hidden is not None and hidden >= DP_MIN_HIDDEN_SIZE
+
+
 def finalize_encoder_folding(config: EncoderConfig, policy: str = "auto") -> None:
-    """Loader hook: resolve the load-time encoder layout (fold vs replicate) for
-    the ``encoder_parallel`` policy, after the real dims are populated
-    (update_model_arch) and before construction.
-
-    adjust_pipeline_config proposes a fold group from the parallelism alone; here
-    we keep it only when the policy asks to fold AND the encoder can (dims divide
-    the group), otherwise clear the mode so the encoder loads replicated -- a full
-    copy per rank, which the encode stage can data-parallel at batch > 1.
-
-      - "auto": fold only encoders wide enough to benefit at their real size;
-      - "fold": fold wherever the dims divide the group (size-agnostic override);
-      - "dp" / "replicate": never fold -> always replicated.
-
-    fold and dp/replicate are mutually exclusive here: folding shards the weights
-    (model-parallel), dp/replicate keep a full copy per rank; a loaded model is
-    one or the other.
-    """
+    """resolve fold-vs-replicate once real dims are known (post update_model_arch,
+    pre construction); folding shards the weights, so it excludes dp/replicate
+    for the lifetime of the loaded model"""
     if config.parallel_folding_mode is None:
         return
     if policy in ("dp", "replicate"):

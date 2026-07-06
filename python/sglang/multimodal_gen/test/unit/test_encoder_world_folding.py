@@ -1,19 +1,9 @@
-"""Unit test for the encoder_parallel decision (three stages).
+"""Unit test for the encoder_parallel decision.
 
-Stage 1 - ServerArgs.adjust_pipeline_config proposes a fold group from the
-parallelism alone (mode = "world"/"sp"/None), the same for every encoder;
-the "dp"/"replicate" policies short-circuit it (never fold).
-
-Stage 2 - encoder_folding_worthwhile / _encoder_dims_divide (applied by the
-loader once real dims are known) decide whether an encoder is wide enough to
-benefit and whether its heads/MLP divide the group. Size-based (not
-per-architecture), so the same family at different parameter counts is handled.
-
-Stage 3 - finalize_encoder_folding dispatches on the encoder_parallel policy:
-"auto" keeps only worthwhile folds, "fold" keeps any divisible fold, and
-"dp"/"replicate" clear the fold (load replicated).
-
-Pure logic, no GPU / distributed init (the fold group is monkeypatched).
+adjust_pipeline_config proposes a fold group from the parallelism alone;
+finalize_encoder_folding resolves fold-vs-replicate per policy on real dims;
+encoder_dp_worthwhile gates the runtime batch data-parallel. Pure logic, no
+GPU / distributed init (the fold group is monkeypatched).
 """
 
 from types import SimpleNamespace
@@ -28,6 +18,7 @@ from sglang.multimodal_gen.runtime.models.encoders import base as _base_mod
 from sglang.multimodal_gen.runtime.models.encoders.base import (
     FOLD_MIN_HIDDEN_SIZE,
     _encoder_dims_divide,
+    encoder_dp_worthwhile,
     encoder_folding_worthwhile,
     finalize_encoder_folding,
 )
@@ -184,6 +175,15 @@ def test_dims_divide():
     assert _encoder_dims_divide(_enc(4096, 6, 10240), 4) is False  # heads
     assert _encoder_dims_divide(_enc(4096, 64, 10250), 4) is False  # intermediate
     assert _encoder_dims_divide(_enc(4096, 64, 10240), 1) is False  # group of 1
+
+
+def test_dp_worthwhile():
+    # batch data-parallel pays only above the latency-bound width and batch>1.
+    assert encoder_dp_worthwhile(_enc(4096, 64, 10240), batch_size=2) is True
+    assert encoder_dp_worthwhile(_enc(2560, 32, 9728), batch_size=4) is True
+    assert encoder_dp_worthwhile(_enc(768, 12, 3072), batch_size=8) is False  # CLIP-L
+    assert encoder_dp_worthwhile(_enc(4096, 64, 10240), batch_size=1) is False
+    assert encoder_dp_worthwhile(TextEncoderConfig(), batch_size=4) is False
 
 
 # --- stage 3: finalize dispatches on the encoder_parallel policy --------------
