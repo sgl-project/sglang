@@ -715,5 +715,23 @@ class Qwen3ForCausalLM(nn.Module):
         # layer `k` (HF-style), we capture before layer `k + 1`.
         self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
+    def set_dspark_layers_to_capture(self, layer_ids: List[int]):
+        # DSpark's target aux-hidden-state capture is mechanically identical
+        # to DFLASH's on this architecture: same `capture_aux_hidden_states`
+        # flag, same underlying `model.layers_to_capture` list, and the same
+        # "before layer i" -> "+1" offset requirement documented above (this
+        # model's `Qwen2Model.forward` records a layer's *input*, so capturing
+        # HF-style layer `k`'s *output* means capturing before layer `k + 1`).
+        # Only the downstream draft-side consumer (DSparkWorkerV2 vs
+        # DFlashWorkerV2) differs, so delegate rather than duplicate.
+        #
+        # NOTE: this is NOT the same as deepseek_v4.py's
+        # `set_dspark_layers_to_capture`, which passes `layer_ids` through
+        # unshifted -- that model's forward loop checks `layers_to_capture`
+        # *after* running each layer, so it needs no offset. Don't copy that
+        # version here; the offset is a property of this file's capture loop,
+        # not of the DSpark algorithm.
+        self.set_dflash_layers_to_capture(layer_ids)
+
 
 EntryClass = Qwen3ForCausalLM
