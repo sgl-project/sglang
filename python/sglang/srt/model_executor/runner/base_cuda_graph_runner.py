@@ -93,12 +93,9 @@ def get_batch_sizes_to_capture(
     capture_bs = list(sorted(set(capture_bs)))
 
     # A capture bs above the DeepEP low_latency dispatch cap trips the deep_ep assert.
-    from sglang.srt.layers.moe.utils import MoeA2ABackend
+    from sglang.srt.model_executor.deepep_capacity import is_deepep_low_latency
 
-    if (
-        MoeA2ABackend(server_args.moe_a2a_backend).is_deepep()
-        and server_args.deepep_mode != "normal"
-    ):
+    if is_deepep_low_latency(server_args):
         deepep_cap = envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
         # Clamp on the max draft tokens, not the startup value: adaptive spec can
         # grow it at runtime, and each request dispatches num_tokens_per_bs tokens.

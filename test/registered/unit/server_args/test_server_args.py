@@ -1418,108 +1418,40 @@ class TestDeepEPCaptureBsClamp(unittest.TestCase):
         self.assertIn(512, capture_bs)
 
 
-class TestDeepEPMemReserveTiering(unittest.TestCase):
-    """_adjust_mem_fraction_for_deepep_capture tiers the reserved num_max down so
-    the low_latency buffer + capture reservation fits under the cap: a tight,
-    short-context / high-concurrency config (V3.2 TBO on a 140 GiB H200) picks a
-    smaller num_max than the 1024 ceiling, while a wide-memory / large-slack
-    config keeps 1024 so decode throughput is unaffected.
+class TestAutoMemChunkedSlack(unittest.TestCase):
+    """_auto_mem_chunked_slack records how much the auto mem_fraction formula
+    over-reserves for chunked-prefill activations under DP attention (it counts
+    the un-divided chunked_prefill_size; the runtime uses the per-rank slice).
+    deepep_capacity credits this slack against its KV-budget reservation.
     """
 
-    def _reserve(
-        self,
-        *,
-        gpu_gib,
-        slack_gib,
-        hidden,
-        num_experts,
-        moe_intermediate,
-        max_running=None,
-        dp_size=8,
-        mem_fraction=0.858,
-    ):
-        hf_config = SimpleNamespace(
-            n_routed_experts=num_experts,
-            moe_intermediate_size=moe_intermediate,
-        )
-        model_config = SimpleNamespace(hidden_size=hidden, hf_config=hf_config)
+    def _slack(self, chunked, dp_size, dp_attention=True):
         ns = SimpleNamespace(
-            _auto_mem_fraction_gpu_mib=gpu_gib * 1024,
-            moe_a2a_backend="deepep",
-            deepep_mode="auto",
-            max_speculative_num_draft_tokens=None,
-            speculative_num_draft_tokens=None,
-            max_running_requests=max_running,
+            chunked_prefill_size=chunked,
+            enable_dp_attention=dp_attention,
             dp_size=dp_size,
-            _auto_mem_chunked_slack_mib=slack_gib * 1024,
-            mem_fraction_static=mem_fraction,
-            get_model_config=lambda: model_config,
         )
-        ServerArgs._adjust_mem_fraction_for_deepep_capture(ns)
-        return ns
+        return ServerArgs._auto_mem_chunked_slack(ns)
 
-    def test_tight_card_tiers_num_max_down(self):
-        # V3.2-class: 140 GiB H200, short-context slack ~10.5 GiB, 256x2048x7168.
-        # The 1024 ceiling's ~14 GiB buffer + capture exceeds the 12% cap, so the
-        # reservation tiers down to 512 (its buffer fits un-clamped).
-        ns = self._reserve(
-            gpu_gib=139.8,
-            slack_gib=10.5,
-            hidden=7168,
-            num_experts=256,
-            moe_intermediate=2048,
-        )
-        self.assertEqual(ns._deepep_reserved_num_max, 512)
-        self.assertLess(ns.mem_fraction_static, 0.858)
+    def test_zero_without_dp_attention(self):
+        self.assertEqual(self._slack(32768, 4, dp_attention=False), 0.0)
 
-    def test_wide_card_keeps_ceiling(self):
-        # GLM-5.2-class on GB300: large chunked slack credits buffer + capture, so
-        # the 1024 ceiling fits and is kept (no decode-concurrency clamp).
-        ns = self._reserve(
-            gpu_gib=185,
-            slack_gib=36,
-            hidden=6144,
-            num_experts=256,
-            moe_intermediate=2048,
-        )
-        self.assertEqual(ns._deepep_reserved_num_max, 1024)
+    def test_zero_for_single_dp_rank(self):
+        self.assertEqual(self._slack(32768, 1), 0.0)
 
-    def test_user_max_running_caps_num_max(self):
-        # An explicit --max-running-requests bounds num_max below the ceiling even
-        # on a wide card (per-rank concurrency is the real dispatch bound).
-        ns = self._reserve(
-            gpu_gib=185,
-            slack_gib=36,
-            hidden=6144,
-            num_experts=256,
-            moe_intermediate=2048,
-            max_running=2048,
-            dp_size=8,
-        )
-        self.assertEqual(ns._deepep_reserved_num_max, 256)
+    def test_zero_when_chunked_disabled(self):
+        self.assertEqual(self._slack(-1, 4), 0.0)
 
-    def test_unreadable_config_falls_back_conservative(self):
-        # An unreadable model config must not silently skip: that leaves no reserved
-        # ceiling and re-arms the unbounded num_max auto-tune. Pin the conservative
-        # default (128) and leave mem_fraction untouched.
-        def _raise():
-            raise RuntimeError("no config")
+    def test_undivided_minus_per_rank_times_reserve_coef(self):
+        # GLM-5.2 balanced: (32768 - 8192) * 1.5 = 36 GiB.
+        self.assertEqual(self._slack(32768, 4), (32768 - 8192) * 1.5)
 
-        ns = SimpleNamespace(
-            _auto_mem_fraction_gpu_mib=139.8 * 1024,
-            moe_a2a_backend="deepep",
-            deepep_mode="auto",
-            max_speculative_num_draft_tokens=None,
-            speculative_num_draft_tokens=None,
-            max_running_requests=None,
-            dp_size=8,
-            _auto_mem_chunked_slack_mib=10.5 * 1024,
-            mem_fraction_static=0.858,
-            get_model_config=_raise,
-        )
-        ServerArgs._adjust_mem_fraction_for_deepep_capture(ns)
-        self.assertEqual(ns._deepep_reserved_num_max, 128)
-        self.assertEqual(ns.mem_fraction_static, 0.858)
+    def test_per_rank_floor_matches_reserved_mem_formula(self):
+        # reserved_mem uses max(chunked, 2048); a per-rank slice below 2048
+        # would still be reserved at the 2048 floor, so the slack must subtract
+        # the floored per-rank value or it overstates the credit by 1.5 GiB
+        # here: (8192 - 2048) * 1.5, not (8192 - 1024) * 1.5.
+        self.assertEqual(self._slack(8192, 8), (8192 - 2048) * 1.5)
 
 
 if __name__ == "__main__":

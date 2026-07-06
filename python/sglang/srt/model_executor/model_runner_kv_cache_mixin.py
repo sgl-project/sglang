@@ -38,9 +38,11 @@ from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.model_executor.deepep_capacity import plan_deepep_capacity
 from sglang.srt.platforms import current_platform
 from sglang.srt.utils.common import (
     get_available_gpu_memory,
+    get_device_memory_capacity,
     is_float4_e2m1fn_x2,
     is_hip,
     is_npu,
@@ -117,7 +119,38 @@ class ModelRunnerKVCacheMixin:
                 f"decoding, draft weights are now counted."
             )
 
+        rest_memory = self._reserve_deepep_capacity(rest_memory)
+
         return int(rest_memory * (1 << 30))  # return in bytes
+
+    def _reserve_deepep_capacity(self: ModelRunner, rest_memory: float) -> float:
+        """Set aside the DeepEP low_latency RDMA buffer + capture footprint from
+        the KV budget. Both land after the KV pool (the buffer via nvshmem,
+        outside the torch allocator), so the budget must make room up front."""
+        plan = self.deepep_capacity_plan
+        if plan is None or plan.reserve_mib <= 0:
+            return rest_memory
+        reserve_gib = plan.reserve_mib / 1024
+        if rest_memory - reserve_gib <= 0:
+            raise ValueError(
+                f"DeepEP auto mem reserve ({reserve_gib:.2f} GiB for "
+                f"num_max<={plan.ceiling}: buffer {plan.rdma_mib / 1024:.2f} GiB "
+                f"+ capture {plan.capture_mib / 1024:.2f} GiB) leaves no GPU "
+                f"memory for the KV cache ({rest_memory:.2f} GiB before the "
+                f"reservation). Set --mem-fraction-static, or lower "
+                f"SGLANG_DEEPEP_MAX_RESERVE_FRACTION / --max-running-requests."
+            )
+        logger.info(
+            "DeepEP auto mem reserve: num_max<=%d buffer=%.2f GiB "
+            "capture=%.2f GiB slack=%.2f GiB; KV budget %.2f -> %.2f GiB",
+            plan.ceiling,
+            plan.rdma_mib / 1024,
+            plan.capture_mib / 1024,
+            plan.slack_mib / 1024,
+            rest_memory,
+            rest_memory - reserve_gib,
+        )
+        return rest_memory - reserve_gib
 
     def handle_max_mamba_cache(self: ModelRunner, total_rest_memory):
         config = self.mambaish_config
@@ -1020,14 +1053,6 @@ class ModelRunnerKVCacheMixin:
 
         return self._clamp_deepep_low_latency_concurrency(max_num_reqs)
 
-    def _is_deepep_low_latency(self: ModelRunner) -> bool:
-        from sglang.srt.layers.moe.utils import MoeA2ABackend
-
-        return (
-            MoeA2ABackend(self.server_args.moe_a2a_backend).is_deepep()
-            and self.server_args.deepep_mode != "normal"
-        )
-
     def _clamp_deepep_low_latency_concurrency(
         self: ModelRunner, max_num_reqs: int
     ) -> int:
@@ -1041,29 +1066,17 @@ class ModelRunnerKVCacheMixin:
             DEEPEP_LOW_LATENCY_MAX_DISPATCH_TOKENS,
         )
 
-        if not self._is_deepep_low_latency():
+        plan = self.deepep_capacity_plan
+        if plan is None:
             return max_num_reqs
 
-        # Each request dispatches num_tokens_per_bs tokens, so the concurrency
-        # ceiling shrinks by that multiplier.
-        tokens_per_req = (
-            self.server_args.max_speculative_num_draft_tokens
-            or self.server_args.speculative_num_draft_tokens
-            or 1
-        )
-        # Bound concurrency by the num_max the buffer is actually sized for, else the
-        # decode batch dispatches past it and trips the deep_ep assert. That num_max is
-        # the reserved ceiling when the auto mem_fraction set one and the env isn't
-        # overridden, else the env value (a user setting, or the static default when no
-        # reservation ran — e.g. the kill-switch is off, where it would otherwise stay
-        # at the loose FINISHED_SUM_TAG bound while the buffer is the small default).
-        env = envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK
-        hard = getattr(self.server_args, "_deepep_reserved_num_max", None)
-        buffer_num_max = hard if (hard is not None and not env.is_set()) else env.get()
+        # Bound concurrency by the ceiling the buffer reservation covers, else
+        # the decode batch dispatches past the buffer and trips the deep_ep
+        # assert.
         capped = min(
             max_num_reqs,
-            DEEPEP_LOW_LATENCY_MAX_DISPATCH_TOKENS // tokens_per_req,
-            max(1, buffer_num_max // tokens_per_req),
+            DEEPEP_LOW_LATENCY_MAX_DISPATCH_TOKENS // plan.tokens_per_req,
+            max(1, plan.ceiling // plan.tokens_per_req),
         )
         ep_group = get_moe_ep_group()
         if ep_group.world_size > 1:
@@ -1122,6 +1135,12 @@ class ModelRunnerKVCacheMixin:
             create_memory_pool_configurator,
         )
 
+        self.deepep_capacity_plan = plan_deepep_capacity(
+            self.server_args,
+            self.model_config,
+            gpu_total_mib=get_device_memory_capacity(self.server_args.device),
+            moe_ep_size=self.moe_ep_size,
+        )
         available_bytes = self._profile_available_bytes(pre_model_load_memory)
         page_size = self.server_args.page_size
 

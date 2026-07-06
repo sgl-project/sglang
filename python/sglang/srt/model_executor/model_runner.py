@@ -148,6 +148,10 @@ from sglang.srt.model_executor.cuda_graph_config import (
     check_cuda_graph_backend,
     cuda_graph_fully_disabled,
 )
+from sglang.srt.model_executor.deepep_capacity import (
+    DeepEPCapacityPlan,
+    resolve_deepep_num_max,
+)
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
@@ -371,6 +375,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # workers so they reuse target's resolved sizes (replaces legacy
         # `server_args._draft_pool_config` mutation hack).
         self.memory_pool_config = memory_pool_config
+        # Set on target by `_resolve_memory_pool_config`; stays None on draft
+        # workers (the target resolves and exports the shared dispatch bound).
+        self.deepep_capacity_plan: Optional[DeepEPCapacityPlan] = None
         self.device = server_args.device
         self.gpu_id = gpu_id
         self.tp_rank = tp_rank
@@ -947,87 +954,19 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.canary_manager.mark_init_finished()
 
     def _maybe_auto_tune_deepep_num_max_dispatch_tokens(self):
-        """Auto-size the DeepEP low_latency dispatch cap when the user didn't set it."""
-        from sglang.srt.layers.moe.token_dispatcher.deepep import (
-            DEEPEP_LOW_LATENCY_MAX_DISPATCH_TOKENS,
-        )
-
-        env = envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK
-        if env.is_set():
+        """Resolve the DeepEP low_latency dispatch cap from the capacity plan."""
+        plan = self.deepep_capacity_plan
+        if plan is None or self.is_draft_worker:
             return
-        if not self._is_deepep_low_latency():
-            return
-
-        # Only auto-tune when the auto mem_fraction reserved the buffer (it publishes
-        # the ceiling here); without a reservation — kill-switch off, a user-set
-        # mem_fraction, or an unreadable config — raising num_max would allocate a
-        # buffer nobody reserved and OOM at capture, so stay at the static default.
-        hard = getattr(self.server_args, "_deepep_reserved_num_max", None)
-        if hard is None:
-            return
-
-        # num_max is a per-rank token cap, not a request count: spec/MTP verify packs
-        # num_tokens_per_bs tokens per request, so size it by that multiplier.
-        tokens_per_req = (
-            self.server_args.max_speculative_num_draft_tokens
-            or self.server_args.speculative_num_draft_tokens
-            or 1
-        )
-        num_max = min(
-            self.req_to_token_pool.size * tokens_per_req,
-            DEEPEP_LOW_LATENCY_MAX_DISPATCH_TOKENS,
-            hard,
-        )
-        if num_max != env.get():
-            env.set(num_max)
+        prev = envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
+        num_max = resolve_deepep_num_max(plan, self.req_to_token_pool.size)
+        if num_max != prev:
             log_info_on_rank0(
                 logger,
                 f"Auto-tuned SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK={num_max} "
                 f"(decode concurrency={self.req_to_token_pool.size}, "
-                f"reserved ceiling={hard}).",
+                f"ceiling={plan.ceiling}).",
             )
-        self._warn_on_deepep_buffer_size_drift(env.get())
-
-    def _warn_on_deepep_buffer_size_drift(self, num_max: int):
-        """Warn if the pure-Python buffer-size replica drifts from DeepEP's native
-        hint, so an upstream config.hpp change is caught not silently mis-reserved.
-        """
-        try:
-            from deep_ep import Buffer
-
-            from sglang.srt.layers.moe.token_dispatcher.deepep import (
-                estimate_low_latency_rdma_size_bytes,
-            )
-
-            hidden = self.model_config.hidden_size
-            num_experts = None
-            for attr in (
-                "n_routed_experts",
-                "num_experts",
-                "num_local_experts",
-                "moe_num_experts",
-            ):
-                value = getattr(self.model_config.hf_config, attr, None)
-                if value:
-                    num_experts = int(value)
-                    break
-            if not hidden or not num_experts:
-                return
-            native = Buffer.get_low_latency_rdma_size_hint(
-                num_max, hidden, max(self.moe_ep_size, 1), num_experts
-            )
-            replica = estimate_low_latency_rdma_size_bytes(num_max, hidden, num_experts)
-            if native and abs(native - replica) / native > 0.001:
-                logger.warning(
-                    "DeepEP low_latency buffer-size replica drifted from the native "
-                    "hint (replica=%d, native=%d, num_max=%d); the auto mem_fraction "
-                    "reservation may be off — update estimate_low_latency_rdma_size_bytes.",
-                    replica,
-                    native,
-                    num_max,
-                )
-        except Exception:
-            return
 
     def adjust_hybrid_swa_layers_for_pp(self):
         if not self.is_hybrid_swa:
@@ -2697,16 +2636,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self._validate_deepep_capture_reservation(after_mem)
 
     def _validate_deepep_capture_reservation(self, after_mem_gb: float):
-        """Warn if the auto mem_fraction left too little post-capture headroom for
-        DeepEP. ERROR (not raise) so the diagnostic surfaces without killing the serve.
+        """Warn if the capacity reservation left too little post-capture headroom
+        for DeepEP. ERROR (not raise) so the diagnostic surfaces without killing
+        the serve.
         """
-        if not self._is_deepep_low_latency():
+        if self.deepep_capacity_plan is None:
             return
         safety_floor_gib = 2.0
         if after_mem_gb < safety_floor_gib:
             logger.error(
                 "DeepEP capture left only %.2f GiB free (< %.1f GiB safety floor); "
-                "the auto mem_fraction reservation is too small for this config — "
+                "the capacity reservation is too small for this config — "
                 "set --mem-fraction-static lower or raise SGLANG_DEEPEP_CAPTURE_COEF.",
                 after_mem_gb,
                 safety_floor_gib,
