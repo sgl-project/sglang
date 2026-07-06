@@ -9,7 +9,7 @@ import torch
 
 try:
     from aiter.ops.triton.quant import dynamic_mxfp4_quant
-except ImportError as err:
+except ImportError:
 
     def raise_aiter_import_error(*args, **kwargs):
         raise ImportError(

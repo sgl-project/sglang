@@ -15,6 +15,7 @@
 #include <sgl_kernel/utils.h>   // For RuntimeCheck, div_ceil
 
 #include <sgl_kernel/utils.cuh>  // For LaunchKernel
+#include <sgl_kernel/vec.cuh>    // For device::AlignedVector
 
 #include <cstdint>
 
@@ -41,10 +42,7 @@ __global__ void __launch_bounds__(kBlockSize) cat_pad_flat_kernel(
     int64_t pad_d_left,
     int64_t pad_h_top,
     int64_t pad_w_left) {
-  union Pack {
-    ET elem[kVec];
-    uint4 raw;
-  };
+  using Pack = device::AlignedVector<ET, kVec>;
 
   const int64_t nthreads = static_cast<int64_t>(gridDim.x) * blockDim.x;
   for (int64_t vid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; vid < total_vecs; vid += nthreads) {
@@ -81,7 +79,7 @@ __global__ void __launch_bounds__(kBlockSize) cat_pad_flat_kernel(
           value = SGLANG_LDG(src + iw);
         }
       }
-      pack.elem[i] = value;
+      pack[i] = value;
 
       if (++ow == out_w) {
         ow = 0;
@@ -110,7 +108,7 @@ __global__ void __launch_bounds__(kBlockSize) cat_pad_flat_kernel(
       }
     }
 
-    reinterpret_cast<uint4*>(out)[vid] = pack.raw;
+    pack.store(out, vid);
   }
 }
 
@@ -179,19 +177,19 @@ struct CausalConv3dCatPadKernel {
     auto out_h = SymbolicSize{"out_h"};
     auto out_w = SymbolicSize{"out_w"};
     auto device = SymbolicDevice{};
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
 
     TensorMatcher({bsz, channels, t_size, h_size, w_size})
         .with_dtype<T>()
-        .template with_device<kDLCUDA>(device)
+        .template with_device<kDLGPU>(device)
         .verify(x);
     TensorMatcher({bsz, channels, cache_t, h_size, w_size})
         .with_dtype<T>()
-        .template with_device<kDLCUDA>(device)
+        .template with_device<kDLGPU>(device)
         .verify(cache);
     TensorMatcher({bsz, channels, out_t, out_h, out_w})
         .with_dtype<T>()
-        .template with_device<kDLCUDA>(device)
+        .template with_device<kDLGPU>(device)
         .verify(out);
 
     const int64_t depth_left = pad_d_left - cache_t.unwrap();

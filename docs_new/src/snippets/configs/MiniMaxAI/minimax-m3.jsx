@@ -14,6 +14,9 @@
 export const config = {
   modelName: "MiniMax-M3",
 
+  // TTFT/TPOT were recorded as Mean (no percentile restated in the source runs).
+  latencyPercentile: "Mean",
+
   supportedHardware: ["b200", "b300", "gb200", "gb300", "mi300x", "mi325x", "mi350x", "mi355x", "h200"],
 
   variants: [

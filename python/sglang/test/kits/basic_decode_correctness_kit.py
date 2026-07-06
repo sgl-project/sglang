@@ -2,7 +2,7 @@
 
 Probes that catch the model producing wrong output: weight load
 failure, sampling path bugs, KV / attention corruption, and cuda graph
-edge cases. Single-prompt smoke only -- dataset-driven accuracy gates
+edge cases. Single-prompt coverage only -- dataset-driven accuracy gates
 belong to the consuming test class, not this kit.
 
 Mix into any ``CustomTestCase`` subclass that exposes ``self.base_url``

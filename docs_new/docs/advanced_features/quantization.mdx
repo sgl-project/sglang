@@ -57,6 +57,13 @@ The following table summarizes quantization method support across NVIDIA and AMD
       <td>Ascend NPU only; online MXFP8 quantization for Diffusion models (e.g., Wan2.2) and LLM Dense Linear on A5 series; uses CANN <code>npu_dynamic_mx_quant</code> / <code>npu_quant_matmul</code> kernels</td>
     </tr>
     <tr>
+      <td><code>mxfp_w4a8</code></td>
+      <td>No</td>
+      <td>No</td>
+      <td>Yes (A5)</td>
+      <td>Ascend NPU only; online W4A8 for Qwen3 dense LLM (MXFP4 weights + MXFP8 activations) on A5 series; offline <code>W4A8_MXFP</code> checkpoints are auto-detected via <code>modelslim</code></td>
+    </tr>
+    <tr>
       <td><code>blockwise_int8</code></td>
       <td>Yes</td>
       <td>Yes</td>

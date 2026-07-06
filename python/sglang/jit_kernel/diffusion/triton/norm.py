@@ -38,7 +38,6 @@ def triton_autotune_configs():
         for warp_count in [1, 2, 4, 8, 16, 32]
         if warp_count * warp_size <= max_threads_per_block
     ]
-    # return [triton.Config({}, num_warps=8)]
 
 
 # Copied from flash-attn

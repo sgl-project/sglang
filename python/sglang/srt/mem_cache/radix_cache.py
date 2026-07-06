@@ -21,7 +21,6 @@ limitations under the License.
 The radix tree data structure for managing the KV cache.
 """
 
-import hashlib
 import heapq
 import logging
 import sys
@@ -48,7 +47,11 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.events import KVCacheEventMixin
 from sglang.srt.mem_cache.session_radix_cache import SessionRadixCacheMixin
-from sglang.srt.mem_cache.utils import get_eviction_strategy, split_node_hash_value
+from sglang.srt.mem_cache.utils import (
+    get_eviction_strategy,
+    get_hash_str,
+    split_node_hash_value,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -206,18 +209,9 @@ class RadixKey:
 
     def hash_page(self, start: int, end: int, prior_hash: Optional[str] = None) -> str:
         """SHA256 for logical units [start, end); bigram mode feeds overlapping (t_i, t_{i+1}) byte pairs."""
-        hasher = hashlib.sha256()
-        if prior_hash:
-            hasher.update(bytes.fromhex(prior_hash))
-        t = self.token_ids
-        if self.is_bigram:
-            for j in range(start, end):
-                hasher.update(t[j].to_bytes(4, byteorder="little", signed=False))
-                hasher.update(t[j + 1].to_bytes(4, byteorder="little", signed=False))
-        else:
-            for j in range(start, end):
-                hasher.update(t[j].to_bytes(4, byteorder="little", signed=False))
-        return hasher.hexdigest()
+        hash_value = get_hash_str(self[start:end], prior_hash)
+        assert isinstance(hash_value, str)
+        return hash_value
 
 
 class TreeNode:

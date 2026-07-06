@@ -148,12 +148,17 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
         enable_torch_compile_warmup to drive FX / inductor through
         every shape without capturing cuda graphs yet."""
         language_model = self._language_model
+        # Some multimodal models (e.g. Gemma4) store the inner transformer
+        # directly as `language_model` rather than wrapping it in a
+        # ForCausalLM that has a `.model` child.  Fall back to the module
+        # itself when `.model` is absent.
+        inner_model = getattr(language_model, "model", language_model)
         compiler = self._compile_config.compiler
         with enable_tc_piecewise_cuda_graph():
             try:
                 if compiler != "eager":
                     _toggle_multi_platform_ops(
-                        language_model.model, reverse=False, num_tokens=16
+                        inner_model, reverse=False, num_tokens=16
                     )
 
                 cuda_graph_runner._run_dummy_forward(
@@ -167,7 +172,7 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
                 set_graph_pool_id(self._pool)
 
                 self.install_compile(
-                    language_model.model,
+                    inner_model,
                     compile_config=self._compile_config,
                     graph_pool=self._pool,
                 )
@@ -196,9 +201,7 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
                                 )
                             cuda_graph_runner._run_dummy_forward(num_tokens=num_tokens)
             finally:
-                _toggle_multi_platform_ops(
-                    language_model.model, reverse=True, num_tokens=16
-                )
+                _toggle_multi_platform_ops(inner_model, reverse=True, num_tokens=16)
 
     @contextmanager
     def capture_session(self, stream: torch.cuda.Stream):

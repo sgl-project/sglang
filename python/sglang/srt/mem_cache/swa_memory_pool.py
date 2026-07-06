@@ -29,7 +29,6 @@ class SWAKVPool(BaseSWAKVPool):
         head_dim: int,
         swa_attention_layer_ids: List[int],
         full_attention_layer_ids: List[int],
-        enable_kvcache_transpose: bool,
         device: str,
         token_to_kv_pool_class: KVCache = MHATokenToKVPool,
         **kwargs,
@@ -52,8 +51,6 @@ class SWAKVPool(BaseSWAKVPool):
         kwargs["head_num"] = head_num
         kwargs["head_dim"] = head_dim
         kwargs["device"] = device
-        # TODO MHATransposedTokenToKVPool if enable_kvcache_transpose is True
-        assert not enable_kvcache_transpose
 
         # for disagg with nvlink
         self.enable_custom_mem_pool, self.custom_mem_pool, _ = (
@@ -163,7 +160,7 @@ class SWAKVPool(BaseSWAKVPool):
         v_scale: float = 1.0,
     ):
         # loc_info bundles the full loc and the pre-translated SWA loc.
-        loc, swa_loc = unwrap_write_loc(loc_info)
+        loc, swa_loc, _ = unwrap_write_loc(loc_info)
         layer_id = layer.layer_id
         layer_id_pool, is_swa_layer = self.layers_mapping[layer_id]
         if is_swa_layer:

@@ -2930,7 +2930,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             page_size=self.tree_cache.page_size,
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-            drop_page_margin=self.tree_cache.is_chunk_cache(),
+            is_chunk_cache=self.tree_cache.is_chunk_cache(),
         )
 
     def __str__(self):

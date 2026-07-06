@@ -124,7 +124,9 @@ class TestTypeBasedDispatcher(unittest.TestCase):
             TokenizedGenerateReqInput(
                 input_text="",
                 input_ids=[1, 2],
+                input_embeds=None,
                 mm_inputs=dict(),
+                token_type_ids=None,
                 sampling_params=SamplingParams(),
                 return_logprob=False,
                 logprob_start_len=0,
@@ -138,7 +140,7 @@ class TestTypeBasedDispatcher(unittest.TestCase):
             TokenizedEmbeddingReqInput(
                 input_text="",
                 input_ids=[1, 2],
-                image_inputs=dict(),
+                mm_inputs=dict(),
                 token_type_ids=[1, 2],
                 sampling_params=SamplingParams(),
             )
@@ -150,7 +152,9 @@ class TestTypeBasedDispatcher(unittest.TestCase):
                     TokenizedGenerateReqInput(
                         input_text="",
                         input_ids=[1, 2],
+                        input_embeds=None,
                         mm_inputs=dict(),
+                        token_type_ids=None,
                         sampling_params=SamplingParams(),
                         return_logprob=False,
                         logprob_start_len=0,
@@ -167,7 +171,7 @@ class TestTypeBasedDispatcher(unittest.TestCase):
                     TokenizedEmbeddingReqInput(
                         input_text="",
                         input_ids=[1, 2],
-                        image_inputs=dict(),
+                        mm_inputs=dict(),
                         token_type_ids=[1, 2],
                         sampling_params=SamplingParams(),
                     )

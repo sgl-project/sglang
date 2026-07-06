@@ -1262,11 +1262,11 @@ class SequenceParallelGroupCoordinator(GroupCoordinator):
         ring_group = kwargs.get("ring_group", None)
         if ulysses_group is None:
             raise RuntimeError(
-                f"Please pass argument 'ulysses_group' when calling init func of SequenceParallelGroupCoordinator"
+                "Please pass argument 'ulysses_group' when calling init func of SequenceParallelGroupCoordinator"
             )
         if ring_group is None:
             raise RuntimeError(
-                f"Please pass argument 'ring_group' when calling init func of SequenceParallelGroupCoordinator"
+                "Please pass argument 'ring_group' when calling init func of SequenceParallelGroupCoordinator"
             )
         self.ulysses_group = ulysses_group
         self.ring_group = ring_group

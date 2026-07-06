@@ -194,7 +194,6 @@ def get_quant_config(
         return quant_cls.from_config(hf_quant_config)
 
     model_name_or_path = model_config["model_path"]
-    is_local = os.path.isdir(model_name_or_path)
     hf_folder = model_name_or_path
 
     possible_config_filenames = quant_cls.get_config_filenames()

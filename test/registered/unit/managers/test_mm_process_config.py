@@ -11,41 +11,43 @@ register_amd_ci(est_time=1, suite="stage-b-test-1-gpu-small-amd")
 class TestMmProcessConfigValidation(unittest.TestCase):
     """Server-args validation for mm_process_config."""
 
+    def _validate_config(self, mm_process_config):
+        args = ServerArgs(model_path="dummy", mm_process_config=mm_process_config)
+        args._handle_multimodal()
+        return args
+
     def test_valid_config_accepted(self):
-        args = ServerArgs(
-            model_path="dummy",
-            mm_process_config={"image": {"max_pixels": 5000000}},
-        )
+        args = self._validate_config({"image": {"max_pixels": 5000000}})
         self.assertEqual(args.mm_process_config, {"image": {"max_pixels": 5000000}})
 
     def test_empty_config_accepted(self):
-        args = ServerArgs(model_path="dummy", mm_process_config={})
+        args = self._validate_config({})
         self.assertEqual(args.mm_process_config, {})
 
     def test_none_config_defaults_to_empty_dict(self):
-        args = ServerArgs(model_path="dummy", mm_process_config=None)
+        args = self._validate_config(None)
         # None is kept as-is for dummy models (default happens after early return)
         # but for real models it would be set to {}
         self.assertIsNone(args.mm_process_config)
 
     def test_top_level_non_dict_rejected(self):
         with self.assertRaises(TypeError) as ctx:
-            ServerArgs(model_path="dummy", mm_process_config="bad")
+            self._validate_config("bad")
         self.assertIn("mm_process_config must be a dict", str(ctx.exception))
 
     def test_modality_non_dict_rejected_image(self):
         with self.assertRaises(TypeError) as ctx:
-            ServerArgs(model_path="dummy", mm_process_config={"image": "bad"})
+            self._validate_config({"image": "bad"})
         self.assertIn("mm_process_config['image'] must be a dict", str(ctx.exception))
 
     def test_modality_non_dict_rejected_video(self):
         with self.assertRaises(TypeError) as ctx:
-            ServerArgs(model_path="dummy", mm_process_config={"video": 123})
+            self._validate_config({"video": 123})
         self.assertIn("mm_process_config['video'] must be a dict", str(ctx.exception))
 
     def test_modality_non_dict_rejected_audio(self):
         with self.assertRaises(TypeError) as ctx:
-            ServerArgs(model_path="dummy", mm_process_config={"audio": [1, 2]})
+            self._validate_config({"audio": [1, 2]})
         self.assertIn("mm_process_config['audio'] must be a dict", str(ctx.exception))
 
     def test_multi_modality_config_accepted(self):
@@ -54,7 +56,7 @@ class TestMmProcessConfigValidation(unittest.TestCase):
             "video": {"max_pixels": 602112},
             "audio": {"sample_rate": 16000},
         }
-        args = ServerArgs(model_path="dummy", mm_process_config=config)
+        args = self._validate_config(config)
         self.assertEqual(args.mm_process_config, config)
 
 

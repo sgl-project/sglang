@@ -150,8 +150,6 @@ else
   docker cp human-eval ci_sglang:/
   install_with_retry docker exec -w /human-eval ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e .
 
-  docker exec -w / ci_sglang mkdir -p /dummy-grok
-  # Create dummy grok config inline (bypasses Azure blob storage which may have auth issues)
   mkdir -p dummy-grok
   cat > dummy-grok/config.json << 'EOF'
   {
@@ -176,9 +174,8 @@ else
     "torch_dtype": "bfloat16"
   }
 EOF
-  # docker exec -w / ci_sglang mkdir -p /dummy-grok
-  # mkdir -p dummy-grok && wget https://sharkpublic.blob.core.windows.net/sharkpublic/sglang/dummy_grok.json -O dummy-grok/config.json
-  # docker cp ./dummy-grok ci_sglang:/
+  docker exec -w / ci_sglang mkdir -p /dummy-grok
+  docker cp ./dummy-grok/config.json ci_sglang:/dummy-grok/config.json
 
   docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache huggingface_hub[hf_xet]
   docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache pytest

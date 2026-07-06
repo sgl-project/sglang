@@ -127,19 +127,77 @@ class _MockReqToTokenPool:
         return req_pool_indices.to(torch.int32)
 
 
+class _MockShortConvBackend:
+    """Stand-in for ``ShortConvHybridAttnBackend`` in the CPU unit tests.
+
+    The CCA module reaches the conv-state plumbing via
+    ``get_attn_backend().conv_state_metadata(...)`` and runs its own conv
+    kernel. This mock exposes that accessor over a ``_MockReqToTokenPool``,
+    mirroring ``ShortConvAttnBackend``: the req -> slot mapping (and, for extend,
+    its host ``.tolist()`` mirror) is resolved once per step and shared across
+    all conv layers, while the decode path stays entirely on-device.
+    """
+
+    def __init__(self, pool: "_MockReqToTokenPool"):
+        self.req_to_token_pool = pool
+        self.token_to_kv_pool = None
+        # Per-forward-step memoization keyed on the ForwardBatch identity,
+        # mirroring ShortConvAttnBackend.init_forward_metadata.
+        self._step_indices = {}  # id(forward_batch) -> device index tensor
+        self._step_slot_ids = {}  # id(forward_batch) -> host list (extend only)
+
+    def _resolve_indices(self, forward_batch):
+        key = id(forward_batch)
+        indices = self._step_indices.get(key)
+        if indices is None:
+            indices = self.req_to_token_pool.get_mamba_indices(
+                forward_batch.req_pool_indices
+            ).to(torch.long)
+            self._step_indices[key] = indices
+        return indices
+
+    def _resolve_slot_ids(self, forward_batch, indices):
+        key = id(forward_batch)
+        slot_ids = self._step_slot_ids.get(key)
+        if slot_ids is None:
+            slot_ids = indices.tolist()
+            self._step_slot_ids[key] = slot_ids
+        return slot_ids
+
+    def conv_state_metadata(self, layer_id, forward_batch):
+        from sglang.srt.layers.attention.linear.short_conv_backend import (
+            ShortConvMetadata,
+        )
+
+        layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer_id)
+        indices = self._resolve_indices(forward_batch)  # already int64
+        if forward_batch.forward_mode.is_decode_or_idle():
+            return ShortConvMetadata(layer_cache=layer_cache, cache_indices=indices)
+
+        slot_ids = self._resolve_slot_ids(forward_batch, indices)
+        has_prefix = [int(p) > 0 for p in forward_batch.extend_prefix_lens_cpu]
+        return ShortConvMetadata(
+            layer_cache=layer_cache,
+            cache_indices=indices,
+            slot_ids_cpu=slot_ids,
+            has_prefix_cpu=has_prefix,
+        )
+
+
 @contextmanager
 def _mock_pool_context(pool: _MockReqToTokenPool):
-    """Install a mock ``ForwardContext`` whose ``req_to_token_pool`` is ``pool``."""
+    """Install a mock ``ForwardContext`` whose ``attn_backend`` exposes both
+    ``req_to_token_pool`` and ``conv_state_metadata`` over ``pool``."""
     from sglang.srt.model_executor.forward_context import (
         ForwardContext,
         set_forward_context,
     )
 
-    backend = SimpleNamespace(req_to_token_pool=pool, token_to_kv_pool=None)
+    backend = _MockShortConvBackend(pool)
     ctx = ForwardContext(attn_backend=backend)
     prev = set_forward_context(ctx)
     try:
-        yield pool
+        yield backend
     finally:
         set_forward_context(prev)
 
@@ -457,17 +515,17 @@ class TestZayaCCA(CustomTestCase):
             )
 
         pool = _CountingPool(pool_size=8, cca_config=config)
-        with _mock_pool_context(pool):
+        with _mock_pool_context(pool) as backend:
             fb = _fresh_fb()
             cca0.forward(hs, fb)
             cca2.forward(hs, fb)
 
             # Two CCA layers, one forward step -> one shared lookup, both the
-            # device tensor and its host mirror memoized on the ForwardBatch.
+            # device tensor and its host mirror memoized once per step on the
+            # backend (ShortConvAttnBackend does this in init_forward_metadata).
             self.assertEqual(pool.get_mamba_indices_calls, 1)
-            self.assertTrue(hasattr(fb, "_zaya_mamba_indices"))
-            self.assertTrue(hasattr(fb, "_zaya_mamba_indices_cpu"))
-            self.assertEqual(fb._zaya_mamba_indices_cpu, [0])
+            self.assertIn(id(fb), backend._step_indices)
+            self.assertEqual(backend._step_slot_ids[id(fb)], [0])
 
             # A new forward step (fresh ForwardBatch) resolves the mapping again.
             cca0.forward(hs, _fresh_fb())
@@ -479,16 +537,20 @@ class TestZayaCCA(CustomTestCase):
         cca, config = _make_tiny_cca(seed=7)
 
         pool = _MockReqToTokenPool(pool_size=8, cca_config=config)
-        with _mock_pool_context(pool):
+        with _mock_pool_context(pool) as backend:
+            # Keep a reference to the extend batch so its id() cannot be recycled
+            # by the later decode batch (the mock keys its per-step memo on
+            # id(forward_batch); a GC'd-then-reused address would false-collide).
+            fb_extend = _make_forward_batch(
+                is_decode=False,
+                extend_seq_lens_cpu=[3],
+                extend_prefix_lens_cpu=[0],
+                req_pool_indices=[0],
+                input_ids=torch.arange(3, dtype=torch.int64),
+            )
             cca.forward(
                 torch.randn(3, config.hidden_size, dtype=torch.float32) * 0.1,
-                _make_forward_batch(
-                    is_decode=False,
-                    extend_seq_lens_cpu=[3],
-                    extend_prefix_lens_cpu=[0],
-                    req_pool_indices=[0],
-                    input_ids=torch.arange(3, dtype=torch.int64),
-                ),
+                fb_extend,
             )
             fb_decode = _make_forward_batch(
                 is_decode=True,
@@ -502,10 +564,11 @@ class TestZayaCCA(CustomTestCase):
                 fb_decode,
             )
 
-        # Device indices are memoized, but the host ``.tolist()`` mirror is only
-        # built by the extend path.
-        self.assertTrue(hasattr(fb_decode, "_zaya_mamba_indices"))
-        self.assertFalse(hasattr(fb_decode, "_zaya_mamba_indices_cpu"))
+            # Decode resolves device indices, but the host ``.tolist()`` mirror
+            # is only built by the extend path -- so the decode step stays
+            # entirely on-device (CUDA-graph friendly).
+            self.assertIn(id(fb_decode), backend._step_indices)
+            self.assertNotIn(id(fb_decode), backend._step_slot_ids)
 
 
 class TestZayaCCATensorParallel(CustomTestCase):

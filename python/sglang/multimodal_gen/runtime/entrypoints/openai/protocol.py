@@ -59,6 +59,10 @@ class ImageGenerationsRequest(BaseModel):
     diffusers_kwargs: Optional[Dict[str, Any]] = None  # kwargs for diffusers backend
     # Performance profiling
     perf_dump_path: Optional[str] = None
+    # Progressive resolution generation
+    progressive_mode: Optional[str] = None
+    progressive_levels: Optional[int] = None
+    progressive_delta: Optional[float] = None
 
 
 # Video API protocol models

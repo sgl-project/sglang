@@ -31,15 +31,9 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.models.deepseek_v2 import _is_hip
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import add_prefix, get_bool_env_var, is_npu, set_weight_attrs
+from sglang.srt.utils import add_prefix, is_npu, set_weight_attrs
 
 _is_npu = is_npu()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
-_tgemm = None
-if _use_aiter:
-    from aiter.tuned_gemm import tgemm
-
-    _tgemm = tgemm
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -287,10 +281,13 @@ def create_paged_compressor_data(
 
     def get_raw_loc(positions: torch.Tensor) -> torch.Tensor:
         positions = positions.masked_fill(positions < 0, 0)
-        loc = req_to_token[req_pool_indices, positions]
-        swa_loc = token_to_kv_pool.translate_loc_from_full_to_swa(loc)
-        swa_pages = swa_loc // swa_page_size
-        state_loc = swa_pages * ring_size + swa_loc % ring_size
+        if compress_ratio == 128:
+            state_loc = req_pool_indices * ring_size + positions % ring_size
+        else:
+            loc = req_to_token[req_pool_indices, positions]
+            swa_loc = token_to_kv_pool.translate_loc_from_full_to_swa(loc)
+            swa_pages = swa_loc // swa_page_size
+            state_loc = swa_pages * ring_size + swa_loc % ring_size
         return (state_loc // compress_ratio).to(torch.int32)
 
     is_overlap = is_overlap_compress(compress_ratio)
@@ -423,12 +420,7 @@ class Compressor(MultiPlatformOp):
         return ret
 
     def compute_kv_score(self, x: torch.Tensor, forward_batch: ForwardBatch):
-        if _tgemm is not None and not envs.SGLANG_OPT_USE_COMPRESSOR_V2.get():
-            # v1 compress goes through fused_compress_triton, which promotes
-            # bf16->fp32 internally, so skip the .float() cast.
-            kv_score = _tgemm.mm(x, self.wkv_gate.weight, otype=x.dtype)
-        else:
-            kv_score = linear_bf16_fp32(x, self.wkv_gate.weight)
+        kv_score = linear_bf16_fp32(x, self.wkv_gate.weight)
 
         # CUDA path: delegate to backend
         if dsa_use_prefill_cp(forward_batch):
@@ -487,9 +479,3 @@ class Compressor(MultiPlatformOp):
             )
 
         return get_attn_backend().forward_compress(self, x, forward_batch)
-
-
-if _is_hip and not envs.SGLANG_OPT_USE_COMPRESSOR_V2.get():
-    from sglang.srt.layers.attention.dsv4.compress_hip import (  # noqa: F811
-        CompressorHip as Compressor,
-    )

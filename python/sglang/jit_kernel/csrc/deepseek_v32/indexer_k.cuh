@@ -1,7 +1,7 @@
 // DeepSeek-V3.2 only.
 //
 // DSA indexer K kernels: single-head LayerNorm (not RMS), ropes the leading
-// kRopeDim dims, and fp8-quantizes the un-rotated activations. V3.2 drops the
+// kRopeDim dims, and fp8-quantizes the rotated activations. V3.2 drops the
 // Hadamard incoherence rotation; it is logit-preserving (see main_norm_rope.cuh).
 //
 // Independent of the wk + weights_proj GEMM fusion (dsa_indexer.py): `k_input`
@@ -33,14 +33,28 @@ constexpr uint32_t kFusedKIndexerNumWarps = kFusedKIndexerBlockSize / device::kW
 
 #define K_INDEXER_KERNEL __global__ __launch_bounds__(kFusedKIndexerBlockSize, 16)
 
+template <int64_t kRopeDim>
+SGL_DEVICE device::AlignedVector<float, 4>
+load_rope_first_cos_sin(const float* __restrict__ cos_sin_cache, int32_t lane_id) {
+  constexpr int64_t kHalfRopeDim = kRopeDim / 2;
+  const int32_t pair0 = lane_id * 2;
+  const int32_t pair1 = pair0 + 1;
+  device::AlignedVector<float, 4> freq;
+  freq[0] = cos_sin_cache[pair0];
+  freq[1] = cos_sin_cache[kHalfRopeDim + pair0];
+  freq[2] = cos_sin_cache[pair1];
+  freq[3] = cos_sin_cache[kHalfRopeDim + pair1];
+  return freq;
+}
+
 // Indexer K: LayerNorm + RoPE -> bf16.
 struct FusedKIndexerNormRopeParams {
-  const void* __restrict__ k_input;     // (B, 128) DType
-  void* __restrict__ k_out;             // (B, 128) DType
-  const float* __restrict__ weight;     // (128,) fp32  -- LayerNorm gamma
-  const float* __restrict__ bias;       // (128,) fp32  -- LayerNorm beta
-  const float* __restrict__ freqs_cis;  // (max_pos, 64) fp32
-  const void* __restrict__ positions;   // (B,) PosT
+  const void* __restrict__ k_input;         // (B, 128) DType
+  void* __restrict__ k_out;                 // (B, 128) DType
+  const float* __restrict__ weight;         // (128,) fp32  -- LayerNorm gamma
+  const float* __restrict__ bias;           // (128,) fp32  -- LayerNorm beta
+  const float* __restrict__ cos_sin_cache;  // (max_pos, 64) fp32 [cos..., sin...]
+  const void* __restrict__ positions;       // (B,) PosT
   // Row stride for `k_input` in elements (caller passes the wk slice directly).
   int64_t k_input_stride_batch;
   uint32_t batch_size;
@@ -71,7 +85,7 @@ K_INDEXER_KERNEL void fused_k_indexer_norm_rope(const __grid_constant__ FusedKIn
 
   const auto input_ptr = static_cast<const DType*>(params.k_input) + work_id * params.k_input_stride_batch;
   const auto position = static_cast<int32_t>(static_cast<const PosT*>(params.positions)[work_id]);
-  const auto freqs_cis = params.freqs_cis + position * kRopeDim;
+  const auto cos_sin_cache = params.cos_sin_cache + position * kRopeDim;
 
   PDLWaitPrimary<kUsePDL>();
   Float4 data, freq, gamma, beta;
@@ -82,7 +96,7 @@ K_INDEXER_KERNEL void fused_k_indexer_norm_rope(const __grid_constant__ FusedKIn
     input_vec.load(input_ptr, lane_id);
     gamma.load(params.weight, lane_id);
     beta.load(params.bias, lane_id);
-    if (is_rope_lane) freq.load(freqs_cis, lane_id);
+    if (is_rope_lane) freq = load_rope_first_cos_sin<kRopeDim>(cos_sin_cache, lane_id);
 
     float sum = 0.0f;
 #pragma unroll
@@ -144,7 +158,7 @@ struct FusedKIndexerNormRopeKernel {
       const tvm::ffi::TensorView k_out,
       const tvm::ffi::TensorView weight,
       const tvm::ffi::TensorView bias,
-      const tvm::ffi::TensorView freqs_cis,
+      const tvm::ffi::TensorView cos_sin_cache,
       const tvm::ffi::TensorView positions,
       double eps) {
     using namespace host;
@@ -176,7 +190,7 @@ struct FusedKIndexerNormRopeKernel {
     TensorMatcher({-1, kRopeDim})  //
         .with_dtype<float>()
         .with_device(device_)
-        .verify(freqs_cis);
+        .verify(cos_sin_cache);
     auto pos_dtype = SymbolicDType{};
     TensorMatcher({B})  //
         .with_dtype<int32_t, int64_t>(pos_dtype)
@@ -191,7 +205,7 @@ struct FusedKIndexerNormRopeKernel {
         .k_out = k_out.data_ptr(),
         .weight = static_cast<const float*>(weight.data_ptr()),
         .bias = static_cast<const float*>(bias.data_ptr()),
-        .freqs_cis = static_cast<const float*>(freqs_cis.data_ptr()),
+        .cos_sin_cache = static_cast<const float*>(cos_sin_cache.data_ptr()),
         .positions = positions.data_ptr(),
         .k_input_stride_batch = k_input.stride(0),
         .batch_size = batch_size,
@@ -210,13 +224,13 @@ struct FusedKIndexerNormRopeKernel {
 // launch. Page layout matches fused_store_index_cache.cuh: each page is
 // 132*page_size bytes (128*page_size fp8 keys, then 4*page_size fp32 scales).
 struct FusedKIndexerNormRopeStoreParams {
-  const void* __restrict__ k_input;     // (B, 128) DType
-  void* __restrict__ cache;             // (num_pages, 132*page_size) uint8
-  const void* __restrict__ indices;     // (B,) int64  -- out_cache_loc
-  const float* __restrict__ weight;     // (128,) fp32  -- LayerNorm gamma
-  const float* __restrict__ bias;       // (128,) fp32  -- LayerNorm beta
-  const float* __restrict__ freqs_cis;  // (max_pos, 64) fp32
-  const void* __restrict__ positions;   // (B,) PosT
+  const void* __restrict__ k_input;         // (B, 128) DType
+  void* __restrict__ cache;                 // (num_pages, 132*page_size) uint8
+  const void* __restrict__ indices;         // (B,) int64  -- out_cache_loc
+  const float* __restrict__ weight;         // (128,) fp32  -- LayerNorm gamma
+  const float* __restrict__ bias;           // (128,) fp32  -- LayerNorm beta
+  const float* __restrict__ cos_sin_cache;  // (max_pos, 64) fp32 [cos..., sin...]
+  const void* __restrict__ positions;       // (B,) PosT
   // Row stride for `k_input` (caller passes the non-contiguous wk slice directly).
   int64_t k_input_stride_batch;
   uint32_t batch_size;
@@ -249,7 +263,7 @@ K_INDEXER_KERNEL void fused_k_indexer_norm_rope_store(const __grid_constant__ Fu
 
   const auto input_ptr = static_cast<const DType*>(params.k_input) + work_id * params.k_input_stride_batch;
   const auto position = static_cast<int32_t>(static_cast<const PosT*>(params.positions)[work_id]);
-  const auto freqs_cis = params.freqs_cis + position * kRopeDim;
+  const auto cos_sin_cache = params.cos_sin_cache + position * kRopeDim;
 
   PDLWaitPrimary<kUsePDL>();
   Float4 data, freq, gamma, beta;
@@ -260,7 +274,7 @@ K_INDEXER_KERNEL void fused_k_indexer_norm_rope_store(const __grid_constant__ Fu
     input_vec.load(input_ptr, lane_id);
     gamma.load(params.weight, lane_id);
     beta.load(params.bias, lane_id);
-    if (is_rope_lane) freq.load(freqs_cis, lane_id);
+    if (is_rope_lane) freq = load_rope_first_cos_sin<kRopeDim>(cos_sin_cache, lane_id);
 
     float sum = 0.0f;
 #pragma unroll
@@ -345,7 +359,7 @@ struct FusedKIndexerNormRopeStoreKernel {
       const tvm::ffi::TensorView indices,
       const tvm::ffi::TensorView weight,
       const tvm::ffi::TensorView bias,
-      const tvm::ffi::TensorView freqs_cis,
+      const tvm::ffi::TensorView cos_sin_cache,
       const tvm::ffi::TensorView positions,
       double eps) {
     using namespace host;
@@ -381,7 +395,7 @@ struct FusedKIndexerNormRopeStoreKernel {
     TensorMatcher({-1, kRopeDim})  //
         .with_dtype<float>()
         .with_device(device_)
-        .verify(freqs_cis);
+        .verify(cos_sin_cache);
     auto pos_dtype = SymbolicDType{};
     TensorMatcher({B})  //
         .with_dtype<int32_t, int64_t>(pos_dtype)
@@ -397,7 +411,7 @@ struct FusedKIndexerNormRopeStoreKernel {
         .indices = indices.data_ptr(),
         .weight = static_cast<const float*>(weight.data_ptr()),
         .bias = static_cast<const float*>(bias.data_ptr()),
-        .freqs_cis = static_cast<const float*>(freqs_cis.data_ptr()),
+        .cos_sin_cache = static_cast<const float*>(cos_sin_cache.data_ptr()),
         .positions = positions.data_ptr(),
         .k_input_stride_batch = k_input.stride(0),
         .batch_size = batch_size,

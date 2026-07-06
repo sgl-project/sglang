@@ -191,7 +191,6 @@ def create_bench_cache(
             head_dim=_HEAD_DIM,
             swa_attention_layer_ids=_non_full_layer_ids(),
             full_attention_layer_ids=_full_attention_layer_ids(),
-            enable_kvcache_transpose=False,
             device=device,
         )
         allocator = SWATokenToKVPoolAllocator(
@@ -211,7 +210,6 @@ def create_bench_cache(
             head_num=_HEAD_NUM,
             head_dim=_HEAD_DIM,
             full_attention_layer_ids=_full_attention_layer_ids(),
-            enable_kvcache_transpose=False,
             device=device,
             enable_memory_saver=False,
             mamba_pool=req_to_token_pool.mamba_pool if has_mamba else None,

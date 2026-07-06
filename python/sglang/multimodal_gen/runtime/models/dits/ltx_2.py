@@ -10,6 +10,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from sglang.jit_kernel.diffusion.ltx2_qknorm_split_rope import (
+    can_use_ltx2_qknorm_split_rope_cuda,
+    ltx2_qknorm_split_rope_cuda,
+)
 from sglang.jit_kernel.diffusion.residual_gate_add import (
     can_use_residual_gate_add_cuda,
     residual_gate_add_cuda,
@@ -53,6 +57,7 @@ logger = init_logger(__name__)
 ADALN_NUM_BASE_PARAMS = 6
 ADALN_NUM_CROSS_ATTN_PARAMS = 3
 _LTX2_RESIDUAL_GATE_CUDA_DISABLED = False
+_LTX2_QKNORM_SPLIT_ROPE_CUDA_DISABLED = False
 
 
 def _ltx2_residual_gate_add(
@@ -74,6 +79,66 @@ def _ltx2_residual_gate_add(
             _LTX2_RESIDUAL_GATE_CUDA_DISABLED = True
 
     return residual + update * gate
+
+
+def _ltx2_try_fused_qknorm_split_rope(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_norm: nn.Module,
+    k_norm: nn.Module,
+    q_cos: torch.Tensor,
+    q_sin: torch.Tensor,
+    k_cos: torch.Tensor,
+    k_sin: torch.Tensor,
+    *,
+    eps: float,
+    num_heads: int,
+    head_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    global _LTX2_QKNORM_SPLIT_ROPE_CUDA_DISABLED
+
+    if (
+        _LTX2_QKNORM_SPLIT_ROPE_CUDA_DISABLED
+        or get_tp_world_size() != 1
+        or not isinstance(q_norm, nn.RMSNorm)
+        or not isinstance(k_norm, nn.RMSNorm)
+        or float(q_norm.eps) != float(eps)
+        or float(k_norm.eps) != float(eps)
+        or not can_use_ltx2_qknorm_split_rope_cuda(
+            q,
+            q_cos,
+            q_sin,
+            q_norm.weight,
+            k,
+            k_cos,
+            k_sin,
+            k_norm.weight,
+            num_heads=num_heads,
+            head_dim=head_dim,
+        )
+    ):
+        return None
+
+    try:
+        return ltx2_qknorm_split_rope_cuda(
+            q,
+            q_cos,
+            q_sin,
+            q_norm.weight,
+            k,
+            k_cos,
+            k_sin,
+            k_norm.weight,
+            eps=eps,
+            num_heads=num_heads,
+            head_dim=head_dim,
+        )
+    except Exception as exc:
+        if torch.compiler.is_compiling():
+            raise
+        logger.warning_once(f"Disabling LTX2 QKNorm split-RoPE CUDA fast path: {exc}")
+        _LTX2_QKNORM_SPLIT_ROPE_CUDA_DISABLED = True
+        return None
 
 
 _LTX2_FUSED_ADA_VALUES_RUNTIME_DISABLED = False
@@ -748,11 +813,7 @@ class LTX2Attention(nn.Module):
             q, _ = self.to_q(x)
             k, _ = self.to_k(context_)
 
-            if self.qk_norm:
-                assert self.q_norm is not None and self.k_norm is not None
-                q = self.q_norm(q)
-                k = self.k_norm(k)
-
+            fused_qk = None
             if pe is not None:
                 cos, sin = pe
                 k_cos, k_sin = pe if k_pe is None else k_pe
@@ -765,10 +826,34 @@ class LTX2Attention(nn.Module):
                     k_cos, k_sin = self._slice_rope_for_tp(
                         k_cos, k_sin, tp_rank=tp_rank, tp_size=tp_size
                     )
-                if cos.dim() == 3:
+                if self.qk_norm and cos.dim() != 3:
+                    assert self.q_norm is not None and self.k_norm is not None
+                    fused_qk = _ltx2_try_fused_qknorm_split_rope(
+                        q,
+                        k,
+                        self.q_norm,
+                        self.k_norm,
+                        cos,
+                        sin,
+                        k_cos,
+                        k_sin,
+                        eps=self.norm_eps,
+                        num_heads=self.local_heads,
+                        head_dim=self.dim_head,
+                    )
+
+            if fused_qk is not None:
+                q, k = fused_qk
+            else:
+                if self.qk_norm:
+                    assert self.q_norm is not None and self.k_norm is not None
+                    q = self.q_norm(q)
+                    k = self.k_norm(k)
+
+                if pe is not None and cos.dim() == 3:
                     q = apply_interleaved_rotary_emb(q, (cos, sin))
                     k = apply_interleaved_rotary_emb(k, (k_cos, k_sin))
-                else:
+                elif pe is not None:
                     q = apply_split_rotary_emb(q, (cos, sin))
                     k = apply_split_rotary_emb(k, (k_cos, k_sin))
 

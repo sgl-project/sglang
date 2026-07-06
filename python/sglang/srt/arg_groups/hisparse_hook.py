@@ -36,30 +36,8 @@ def _hisparse_allowed_backends(kv_cache_dtype: str) -> set[str]:
     )
 
 
-def apply_hisparse_dsa_backend_defaults(
-    server_args: ServerArgs,
-    user_set_prefill: bool,
-    user_set_decode: bool,
-    kv_cache_dtype: str,
-) -> bool:
-    """Pick DSA backends for --enable-hisparse based on KV dtype.
-
-    CUDA uses dtype-specific FlashMLA backends; ROCm uses TileLang. Returns
-    True if hisparse handled backend selection.
-    """
-    if not server_args.enable_hisparse:
-        return False
-
-    backend = _hisparse_default_backend(kv_cache_dtype)
-    if not user_set_prefill:
-        server_args.dsa_prefill_backend = backend
-    if not user_set_decode:
-        server_args.dsa_decode_backend = backend
-    logger.warning(
-        f"HiSparse enabled ({kv_cache_dtype}): using DSA backends "
-        f"prefill={server_args.dsa_prefill_backend}, decode={server_args.dsa_decode_backend}."
-    )
-    return True
+# The hisparse DSA backend defaults moved to the resolution pipeline
+# (arg_groups/overrides.py: _dsa_split_backend_resolution, hisparse arm).
 
 
 def validate_hisparse_dsa_backend(

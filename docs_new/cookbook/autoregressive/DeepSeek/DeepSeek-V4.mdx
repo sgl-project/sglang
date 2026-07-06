@@ -32,7 +32,7 @@ For how to launch the image, see [Install → Method 3: Using Docker](../../../d
 
 **NVIDIA GPUs**
 
-A single image — `lmsysorg/sglang:latest` — covers the **datacenter GPUs** in this cookbook (B200 / B300 / GB200 / GB300 / H100 / H200). For **RTX PRO 6000 (SM120)**, use the nightly `lmsysorg/sglang:dev` instead — SM120 support isn't in `:latest` yet (see the RTX PRO 6000 note below).
+A single image — `lmsysorg/sglang:latest` — covers the **datacenter GPUs** in this cookbook (B200 / B300 / GB200 / GB300 / H100 / H200 / RTX PRO 6000).
 
 ```bash Command
 docker pull lmsysorg/sglang:latest
@@ -296,7 +296,7 @@ TCP, which can lead to garbled KV transfer on large checkpoints.
 RTX PRO 6000 (96 GB) runs **Flash only** — V4-Pro doesn't fit on 8× 96 GB. It uses the
 **low-latency / TP-only** recipe (TP=4, single node) with the **Marlin** W4A16 MoE runner and
 `--mem-fraction-static 0.70`; the Deploy panel greys out the other recipes for this card.
-HiCache and MegaMoE are **not** supported on RTX PRO 6000. For Docker, use the nightly `lmsysorg/sglang:dev` image — SM120 support isn't in `lmsysorg/sglang:latest` yet (the Deploy panel's Docker mode already points this card at `:dev`).
+HiCache and MegaMoE are **not** supported on RTX PRO 6000.
 
 **AMD (MI300X / MI355X) note**
 

@@ -297,7 +297,7 @@ class VocabParallelEmbedding(torch.nn.Module):
         # If we are making an embedding layer, then our quantization linear
         # method must implement the embedding operation. If we are another
         # layer type like ParallelLMHead, this is not important.
-        is_embedding_layer = type(self.__class__) is VocabParallelEmbedding
+        is_embedding_layer = type(self) is VocabParallelEmbedding
         quant_method_implements_embedding = method_has_implemented_embedding(
             type(quant_method)
         )
@@ -459,6 +459,12 @@ class VocabParallelEmbedding(torch.nn.Module):
         # If parameter does not have output dim, then it should
         # be copied onto all gpus (e.g. g_idx for act_order gptq).
         if output_dim is None:
+            if (
+                loaded_weight.ndim == 0
+                and param.data.ndim == 1
+                and param.data.numel() == 1
+            ):
+                loaded_weight = loaded_weight.reshape(1)
             assert param.data.shape == loaded_weight.shape
             param.data.copy_(loaded_weight)
             return

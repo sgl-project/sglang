@@ -78,6 +78,7 @@ from sglang.multimodal_gen.runtime.utils.trace_wrapper import (
     init_diffusion_tracing,
     trace_slice,
 )
+from sglang.multimodal_gen.utils import kill_itself_when_parent_died
 from sglang.srt.utils.network import NetworkAddress
 
 logger = init_logger(__name__)
@@ -999,6 +1000,7 @@ def run_scheduler_process(
     Rank 0 acts as the master, handling ZMQ requests and coordinating slaves.
     Ranks > 0 act as slaves, waiting for tasks from the master.
     """
+    kill_itself_when_parent_died()
     configure_logger(server_args)
     globally_suppress_loggers()
     if current_platform.is_cuda():

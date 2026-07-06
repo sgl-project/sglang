@@ -20,7 +20,9 @@ class TestZImagePipelineConfig(unittest.TestCase):
         neg_seq_len = 45
         batch = SimpleNamespace(
             prompt_embeds=[torch.ones(pos_seq_len, 2560)],
+            prompt_seq_lens=[[pos_seq_len]],
             negative_prompt_embeds=[torch.ones(neg_seq_len, 2560)],
+            negative_prompt_seq_lens=[[neg_seq_len]],
             height=16,
             width=16,
         )

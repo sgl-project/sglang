@@ -7,7 +7,7 @@ import torch
 from sglang.srt.models.utils import fused_qk_gemma_rmsnorm_with_gate
 from sglang.test.ci.ci_register import register_amd_ci
 
-register_amd_ci(est_time=20, suite="jit-kernel-unit-test-amd")
+register_amd_ci(est_time=20, stage="jit-kernel-unit", runner_config="amd")
 
 
 def reference_qk_gemma_rmsnorm_with_gate(

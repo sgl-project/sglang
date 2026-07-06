@@ -109,6 +109,8 @@ def _can_fuse_causal_conv3d_cat_pad(
 ) -> bool:
     if cache_x is None or fused_causal_conv3d_cat_pad is None:
         return False
+    if not current_platform.is_cuda():
+        return False
     if not x.is_cuda or not x.is_contiguous() or not cache_x.is_contiguous():
         return False
     if x.dim() != 5 or cache_x.dim() != 5 or x.dtype != cache_x.dtype:

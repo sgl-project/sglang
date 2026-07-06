@@ -9,7 +9,7 @@ Adapted from Hunyuan3D-2: https://github.com/Tencent/Hunyuan3D-2
 from __future__ import annotations
 
 import os
-from typing import List, Tuple
+from typing import Tuple
 
 import torch
 from sglang.multimodal_gen.csrc.render import load_extension_with_recovery

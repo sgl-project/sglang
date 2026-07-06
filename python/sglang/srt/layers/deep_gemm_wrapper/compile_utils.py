@@ -280,7 +280,7 @@ def _empty_token_fp8(size):
     *dims, k = size
     return (
         torch.empty(size, device="cuda", dtype=torch.float8_e4m3fn),
-        torch.empty(
+        torch.ones(
             (*dims, ceil_div(k, _BLOCK_SIZE)), device="cuda", dtype=torch.float32
         ),
     )
@@ -290,7 +290,7 @@ def _empty_block_fp8(size):
     *dims, n, k = size
     return (
         torch.empty(size, device="cuda", dtype=torch.float8_e4m3fn),
-        torch.empty(
+        torch.ones(
             (*dims, ceil_div(n, _BLOCK_SIZE), ceil_div(k, _BLOCK_SIZE)),
             device="cuda",
             dtype=torch.float32,

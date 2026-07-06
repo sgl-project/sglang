@@ -7,7 +7,7 @@ import torch
 from sglang.jit_kernel.utils import get_ci_test_range
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=45, suite="base-b-kernel-unit-1-gpu-large")
+register_cuda_ci(est_time=45, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_cuda_ci(est_time=240, suite="nightly-kernel-1-gpu", nightly=True)
 
 
@@ -42,16 +42,36 @@ def flashinfer_rmsnorm(
 
 BS_LIST = [2**n for n in range(0, 14)]
 BS_LIST += [x + 1 + i for i, x in enumerate(BS_LIST)]
-BS_LIST = get_ci_test_range(BS_LIST, [1, 9, 256, 4109])
-SUPPORTED_HIDDEN_SIZE_LIST = get_ci_test_range(
-    [64, 128, 256, 512, *range(1024, 8192 + 1, 1024), 2304, 2560, 12288, 16384],
-    [256, 1024, 16384],
+SUPPORTED_HIDDEN_SIZE_LIST = [
+    64,
+    128,
+    256,
+    512,
+    *range(1024, 8192 + 1, 1024),
+    1536,
+    2304,
+    2560,
+    8704,
+    12288,
+    16384,
+]
+RMSNORM_CASES = get_ci_test_range(
+    list(itertools.product(BS_LIST, SUPPORTED_HIDDEN_SIZE_LIST)),
+    [
+        (1, 256),
+        (18, 1024),
+        (38, 4096),
+        (1240, 1536),
+        (2500, 1024),
+        (4109, 1024),
+        (7807, 128),
+    ],
 )
 
 
 @pytest.mark.parametrize(
     "batch_size,hidden_size",
-    list(itertools.product(BS_LIST, SUPPORTED_HIDDEN_SIZE_LIST)),
+    RMSNORM_CASES,
 )
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("specify_out", [True, False])

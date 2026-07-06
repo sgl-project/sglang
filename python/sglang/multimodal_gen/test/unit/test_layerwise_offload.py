@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8Config
 from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
     ModelOptFp8Config,
 )
@@ -294,6 +295,21 @@ def test_modelopt_fp8_adapter_keeps_layerwise_offload_enabled():
 
     assert server_args.dit_cpu_offload is False
     assert server_args.dit_layerwise_offload is True
+
+
+def test_modelopt_fp8_adapter_does_not_change_online_fp8_offload():
+    server_args = SimpleNamespace(
+        dit_cpu_offload=True,
+        dit_layerwise_offload=False,
+        quantization="fp8",
+    )
+
+    _ModelOptFp8OffloadAdapter._maybe_disable_incompatible_dit_offload_modes(
+        server_args=server_args,
+        quant_config=Fp8Config(),
+    )
+
+    assert server_args.dit_cpu_offload is True
 
 
 def test_layerwise_capability_selects_layerwise_strategy_for_any_component():

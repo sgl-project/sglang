@@ -1,6 +1,5 @@
 import logging
 import math
-from copy import deepcopy
 from typing import List, Optional
 
 import torch
@@ -15,11 +14,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     compute_position,
 )
-from sglang.srt.server_args import (
-    ServerArgs,
-    get_global_server_args,
-    set_global_server_args_for_scheduler,
-)
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
@@ -134,52 +129,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._logged_first_verify = False
 
         # Draft runner (separate KV cache + attention backend).
-        draft_server_args = deepcopy(server_args)
-        draft_server_args.skip_tokenizer_init = True
-        draft_backend = draft_server_args.speculative_draft_attention_backend
-        supported_draft_backends = ("flashinfer", "fa3", "fa4", "triton", "ascend")
-        if draft_backend is None:
-            draft_backend, _ = draft_server_args.get_attention_backends()
-        if draft_backend is None:
-            # Use triton on ROCm (no FlashInfer), flashinfer on CUDA
-            import torch as _torch
-
-            draft_backend = "triton" if _torch.version.hip else "flashinfer"
-        elif draft_backend == "trtllm_mha":
-            import torch as _torch
-
-            _fb = "triton" if _torch.version.hip else "flashinfer"
-            logger.warning(
-                "DFLASH draft worker does not support 'trtllm_mha' because the "
-                "draft path requires per-layer DFlash attention. Falling back to "
-                "'%s'.",
-                _fb,
-            )
-            draft_backend = _fb
-        elif draft_backend not in supported_draft_backends:
-            import torch as _torch
-
-            _fb = "triton" if _torch.version.hip else "flashinfer"
-            logger.warning(
-                "DFLASH draft worker only supports attention_backend in %s for now, "
-                "but got %r. Falling back to '%s'.",
-                supported_draft_backends,
-                draft_backend,
-                _fb,
-            )
-            draft_backend = _fb
-        # Make the draft worker backend explicit and self-contained (no further overrides).
-        draft_server_args.speculative_draft_attention_backend = None
-        draft_server_args.prefill_attention_backend = None
-        draft_server_args.decode_attention_backend = None
-        draft_server_args.attention_backend = draft_backend
-        # Keep draft context length aligned with the target.
-        draft_server_args.context_length = (
-            target_worker.model_runner.model_config.context_len
-        )
-        saved_server_args = get_global_server_args()
         self._draft_worker = TpModelWorker(
-            server_args=draft_server_args,
+            server_args=server_args,
             gpu_id=gpu_id,
             tp_rank=tp_rank,
             moe_ep_rank=moe_ep_rank,
@@ -189,8 +140,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             dp_rank=dp_rank,
             nccl_port=nccl_port,
             is_draft_worker=True,
+            context_length=target_worker.model_runner.model_config.context_len,
         )
-        set_global_server_args_for_scheduler(saved_server_args)
         self.draft_model_runner = self._draft_worker.model_runner
         self._draft_sampler = None
         # Keep the same alias that other spec-v2 workers expose.
@@ -226,7 +177,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         if self.tp_rank == 0:
             logger.info(
                 "Initialized DFLASH draft runner. attention_backend=%s, model=%s, block_size=%s, draft_window_size=%s, compact_cache=%s",
-                getattr(draft_server_args, "attention_backend", None),
+                server_args.speculative_draft_attention_backend,
                 self.draft_model.__class__.__name__,
                 self.block_size,
                 self.draft_window_size,
@@ -392,6 +343,18 @@ class DFlashWorkerV2(BaseSpecWorker):
 
             if len(layers) == 0:
                 fused_disable_reason = "no layers found"
+            elif not getattr(self.draft_model, "supports_fused_context_kv", True):
+                fused_disable_reason = "draft model does not support fused context KV"
+
+            if fused_disable_reason is not None:
+                if self.tp_rank == 0:
+                    logger.info(
+                        "DFLASH fused KV materialization disabled: %s",
+                        fused_disable_reason,
+                    )
+                self._use_fused_kv_materialize = False
+                self._fused_kv_helper = None
+                return
 
             for layer_idx, layer in enumerate(layers):
                 attn = layer.self_attn
@@ -1008,7 +971,10 @@ class DFlashWorkerV2(BaseSpecWorker):
 
                 for layer in self.draft_model.layers:
                     attn = layer.self_attn
-                    k, v = attn.kv_proj_only(ctx_hidden)
+                    layer_ctx_hidden = self.draft_model.prepare_context_hidden_for_kv(
+                        layer, ctx_hidden
+                    )
+                    k, v = attn.kv_proj_only(layer_ctx_hidden)
                     k = attn.apply_k_norm(k)
                     k = attn.apply_k_rope(positions, k)
                     k = k.view(-1, attn.num_kv_heads, attn.head_dim)
@@ -1055,10 +1021,13 @@ class DFlashWorkerV2(BaseSpecWorker):
     ) -> None:
         for layer in self.draft_model.layers:
             attn = layer.self_attn
+            layer_ctx_hidden = self.draft_model.prepare_context_hidden_for_kv(
+                layer, ctx_hidden
+            )
             if _is_npu:
-                _, k, v = attn.forward_prepare_npu(ctx_positions, ctx_hidden)
+                _, k, v = attn.forward_prepare_npu(ctx_positions, layer_ctx_hidden)
             else:
-                k, v = attn.kv_proj_only(ctx_hidden)
+                k, v = attn.kv_proj_only(layer_ctx_hidden)
                 k = attn.apply_k_norm(k)
                 k = attn.apply_k_rope(ctx_positions, k)
             k = k.view(-1, attn.num_kv_heads, attn.head_dim)

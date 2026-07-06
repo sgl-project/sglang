@@ -50,6 +50,10 @@ OTHER_ARGS = [
     32,
     "--watchdog-timeout",
     9000,
+    "--reasoning-parser",
+    "glm45",
+    "--tool-call-parser",
+    "glm45",
 ]
 
 

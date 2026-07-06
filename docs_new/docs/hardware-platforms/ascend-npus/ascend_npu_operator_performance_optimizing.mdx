@@ -17,6 +17,7 @@ The msProf tool is used to collect and analyze key performance indicators of ope
 ```bash
 msprof op python3 test_xxxxx.py
 ```
+
 The following is a case of using msprof for data collection.
 
 | Attribute | Value |
@@ -65,7 +66,9 @@ The following is a case of using msprof for data collection.
 | cube_utilization(%) | 0 |
 
 Below is the field-by-field breakdown of the operator performance record, aligned with the official specification.
+
 ### 1. Basic Identification Fields
+
 | Field | Value | Definition (per official docs) |
 |-------|-------|--------------------------------|
 | Name | DequantSwigluQuant_int32_high_performance_100000000 | **Op Name**: Name of the fused operator (dequantization + SwiGLU activation + quantization), with an int32 high-performance implementation suffix. |
@@ -74,6 +77,7 @@ Below is the field-by-field breakdown of the operator performance record, aligne
 | Accelerator Core | AI_VECTOR_CORE | **Task Type**: The operator runs on the AI Vector Core; other common types include AI_CORE (matrix computation core) and AI_CPU. |
 
 ### 2. Timing & Scheduling Fields
+
 | Field | Value | Definition (per official docs) |
 |-------|-------|--------------------------------|
 | Start Time(us) | 1774489226717521.715 | **Task Start Time**: Absolute start timestamp of the operator task on the device side, in microseconds. |
@@ -81,6 +85,7 @@ Below is the field-by-field breakdown of the operator performance record, aligne
 | Wait Time(us) | 0 | **Task Wait Time**: Time interval between the end of the previous task and the start of the current task. A value of 0 means no idle wait between task dispatches. |
 
 ### 3. Core Configuration & Precision Fields
+
 | Field | Value | Definition (per official docs) |
 |-------|-------|--------------------------------|
 | Block Dim | 36 | **Block Num**: Number of parallel thread blocks for the operator task, corresponding to Block Dim in the SIMT programming model. One AI Vector Core executes only one thread block at a time, so this value reflects the scale of occupied parallel compute resources. |
@@ -88,6 +93,7 @@ Below is the field-by-field breakdown of the operator performance record, aligne
 | HF32 Eligible | NO | **HF32 Eligible**: Indicates whether the HF32 high-precision floating-point format is enabled; `NO` means it is not used. This field is reported only at the `--task-time=l1` collection level. |
 
 ### 4. Input & Output Information
+
 | Field | Value | Definition (per official docs) |
 |-------|-------|--------------------------------|
 | Input Shapes | 163840,1024;128,1024;16384;;;;128 | **Input Shapes**: Dimensions of each input tensor, separated by semicolons; empty values represent scalar inputs. Breakdown: 7 inputs with shapes `[163840,1024]`, `[128,1024]`, `[163840]`, 3 scalars, and `[128]`. |
@@ -99,6 +105,7 @@ Below is the field-by-field breakdown of the operator performance record, aligne
 | Context ID | N/A | **Context ID**: Identifier for sub-tasks at Sub Task granularity; N/A means no sub-task splitting for this operator. |
 
 ### 5. AI Core Performance Metrics (aic_* series)
+
 | Field | Value | Definition (per official docs) |
 |-------|-------|--------------------------------|
 | aicore_time(us) | 0 | Theoretical execution time on AI Core, in microseconds. |
@@ -111,6 +118,7 @@ Below is the field-by-field breakdown of the operator performance record, aligne
 | aic_icache_miss_rate | 0 | Instruction cache miss rate of AI Core. |
 
 ### 6. AI Vector Core Performance Metrics (aiv_* series)
+
 | Field | Value | Definition & Interpretation |
 |-------|-------|------------------------------|
 | aiv_time(us) | 59.128 | **aiv_time**: Theoretical execution time on Vector Core under ideal conditions (all blocks scheduled simultaneously with equal duration). In practice, this value is slightly smaller than real execution time due to staggered block startup. |
@@ -122,10 +130,10 @@ Below is the field-by-field breakdown of the operator performance record, aligne
 | aiv_icache_miss_rate | 0.005 | Vector Core instruction cache miss rate of 0.5%, extremely low and indicates efficient instruction fetch. |
 
 ### 7. Utilization Metrics
+
 | Field | Value | Definition (per official docs) |
 |-------|-------|--------------------------------|
 | cube_utilization(%) | 0 | **cube_utilization**: Utilization rate of the matrix multiplication unit. The value is 0 because the operator is purely vector-based. |
-
 
 ## Optimization
 
