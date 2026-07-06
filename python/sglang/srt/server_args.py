@@ -6434,6 +6434,22 @@ class ServerArgs:
             self._mamba_cache_chunk_size = max(chunk_size, self.page_size)
         return self._mamba_cache_chunk_size
 
+    def _check_two_batch_overlap(self):
+        # With no EP a2a backend, two-batch-overlap is only valid on the non-EP
+        # DP TP-MoE path (overlapping the DP all_gatherv / reduce_scatterv with
+        # the other ubatch's compute), which requires DP attention. Enabling it
+        # there needs no extra opt-in env flag.
+        if (
+            self.enable_two_batch_overlap
+            and self.moe_a2a_backend == "none"
+            and not self.enable_dp_attention
+        ):
+            raise ValueError(
+                "When enabling two batch overlap without an EP a2a backend "
+                "(moe_a2a_backend='none'), --enable-dp-attention is required "
+                "(DeepSeek-V4 non-EP DP TBO path)."
+            )
+
     def check_server_args(self):
         # Check parallel size constraints
         assert (
@@ -6581,11 +6597,8 @@ class ServerArgs:
                 "--export-metrics-to-file-dir is required when --export-metrics-to-file is enabled"
             )
 
-        # Check two batch overlap
-        if self.enable_two_batch_overlap and self.moe_a2a_backend == "none":
-            raise ValueError(
-                "When enabling two batch overlap, moe_a2a_backend cannot be 'none'."
-            )
+        # Check two batch overlap backend requirement.
+        self._check_two_batch_overlap()
 
         # Check communications compression
         if self.enable_quant_communications and self.tp_size == 1:
