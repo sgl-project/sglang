@@ -144,5 +144,49 @@ class TestDeepEPv2MaskedSlab(CustomTestCase):
             )
 
 
+class TestDeepEPv2HandleLifecycle(CustomTestCase):
+    """CPU-only guards of the dispatch/combine handle lifecycle.
+
+    The guards are ordered before any DeepEP work, so misuse is testable
+    without deep_ep installed and without a GPU. The positive dispatch ->
+    combine path needs real ElasticBuffer communication and is covered by the
+    GPU accuracy runs instead.
+    """
+
+    @staticmethod
+    def _bare_impl():
+        from sglang.srt.layers.moe.token_dispatcher.deepep_v2 import _DeepEPv2Impl
+
+        impl = object.__new__(_DeepEPv2Impl)
+        impl._handle = None
+        impl._pad_empty_combine = False
+        return impl
+
+    def test_combine_without_dispatch_raises(self):
+        impl = self._bare_impl()
+        with self.assertRaisesRegex(RuntimeError, "without a valid dispatch handle"):
+            impl.combine(None)
+
+    def test_dispatch_with_unconsumed_handle_raises(self):
+        impl = self._bare_impl()
+        impl._handle = object()
+        with self.assertRaisesRegex(RuntimeError, "unconsumed"):
+            impl.dispatch(None, None)
+
+    def test_handle_cleared_when_combine_fails(self):
+        impl = self._bare_impl()
+        impl._handle = object()
+        impl._pad_empty_combine = True
+
+        def _boom():
+            raise RuntimeError("boom")
+
+        impl._get_buffer = _boom
+        with self.assertRaisesRegex(RuntimeError, "boom"):
+            impl.combine(None)
+        self.assertIsNone(impl._handle)
+        self.assertFalse(impl._pad_empty_combine)
+
+
 if __name__ == "__main__":
     unittest.main()

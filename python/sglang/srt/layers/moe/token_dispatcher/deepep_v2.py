@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 import os
-from enum import Enum, auto
 from typing import List, NamedTuple, Optional, Tuple
 
 import torch
@@ -114,18 +113,13 @@ def _ensure_fp8_quant_available() -> None:
 
 
 def _get_allow_hybrid_mode() -> bool:
-    try:
-        from sglang.srt.runtime_context import get_server_args
+    # direct/hybrid is a communication-topology knob resolved from ServerArgs.
+    # Callers without a running server (synthetic/unit tests) must pass
+    # allow_hybrid_mode explicitly instead (get_server_args() raises when the
+    # process-wide ServerArgs is not set).
+    from sglang.srt.runtime_context import get_server_args
 
-        server_args = get_server_args()
-    except ValueError:
-        # Synthetic/unit tests can instantiate the dispatcher without ServerArgs.
-        return envs.SGLANG_DEEPEP_V2_ALLOW_HYBRID_MODE.get()
-
-    deepep_v2_mode = getattr(server_args, "deepep_v2_mode", None)
-    if deepep_v2_mode is None:
-        return envs.SGLANG_DEEPEP_V2_ALLOW_HYBRID_MODE.get()
-    return deepep_v2_mode == "hybrid"
+    return get_server_args().deepep_v2_mode == "hybrid"
 
 
 def _quantize_for_deepep_v2_dispatch(
@@ -153,10 +147,12 @@ class DeepEPv2Buffer:
         router_topk: int,
         num_max_dispatch_tokens_per_rank: int,
         use_fp8_dispatch: bool,
+        allow_hybrid_mode: Optional[bool] = None,
     ) -> ElasticBuffer:
         _ensure_deepep_v2_available()
 
-        allow_hybrid_mode = _get_allow_hybrid_mode()
+        if allow_hybrid_mode is None:
+            allow_hybrid_mode = _get_allow_hybrid_mode()
         key = (
             id(group),
             hidden_size,
@@ -222,6 +218,7 @@ class _DeepEPv2Impl:
         hidden_size: int,
         capability: DeepEPv2RunnerCapability,
         num_max_dispatch_tokens_per_rank: int,
+        allow_hybrid_mode: Optional[bool] = None,
     ):
         self.group = group
         self.router_topk = router_topk
@@ -230,8 +227,10 @@ class _DeepEPv2Impl:
         self.hidden_size = hidden_size
         self.capability = capability
         self.num_max_dispatch_tokens_per_rank = num_max_dispatch_tokens_per_rank
+        self.allow_hybrid_mode = allow_hybrid_mode
         self.rank = dist.get_rank(group)
         self._handle = None
+        self._pad_empty_combine = False
 
     def set_runner_capability(self, capability: DeepEPv2RunnerCapability) -> None:
         if self.capability != capability:
@@ -251,7 +250,23 @@ class _DeepEPv2Impl:
             self.router_topk,
             self.num_max_dispatch_tokens_per_rank,
             self._uses_fp8_dispatch_output(),
+            allow_hybrid_mode=self.allow_hybrid_mode,
         )
+
+    def _resolve_num_sms_qps(self, buffer: ElasticBuffer) -> Tuple[int, int]:
+        # num_sms/num_qps are NOT auto-resolved by ElasticBuffer when left at 0;
+        # 0 means "0 SMs / 0 QPs". Multi-node RDMA dispatch needs real QPs, so
+        # resolve them from the theoretical helpers (matches the DeepEP elastic
+        # test harness). Single-node NVLink works with 0 QPs.
+        # get_theoretical_num_sms is @weak_lru-cached in DeepEP with fixed inputs
+        # here, and its first (modeling) call happens during eager warmup -- so on
+        # the CUDA-graph decode path this is a cache lookup: pure host work, no
+        # device sync, capture-safe.
+        num_sms = envs.SGLANG_DEEPEP_V2_NUM_SMS.get()
+        if num_sms == 0:
+            num_sms = buffer.get_theoretical_num_sms(self.num_experts, self.router_topk)
+        num_qps = buffer.get_theoretical_num_qps(num_sms)
+        return num_sms, num_qps
 
     def _validate_common(
         self, hidden_states: torch.Tensor, topk_ids: torch.Tensor
@@ -281,7 +296,17 @@ class _DeepEPv2Impl:
                 f"got {topk_ids.shape[1]}"
             )
 
-    def dispatch_a(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
+    def dispatch(
+        self, hidden_states: torch.Tensor, topk_output: TopKOutput
+    ) -> DeepEPv2DispatchOutput:
+        # Handle lifecycle: dispatch produces exactly one handle that the next
+        # combine() consumes. Guard-first (before the import check) so misuse is
+        # reportable without DeepEP installed.
+        if self._handle is not None:
+            raise RuntimeError(
+                "DeepEP v2 dispatch called while the previous dispatch handle is "
+                "still unconsumed (missing combine)"
+            )
         _ensure_deepep_v2_available()
         topk_weights = topk_output.topk_weights
         topk_ids = topk_output.topk_ids.to(torch.int64)
@@ -367,18 +392,7 @@ class _DeepEPv2Impl:
             do_cpu_sync_val = False
 
         buffer = self._get_buffer()
-        self._destroy_handle()
-        # num_sms/num_qps are NOT auto-resolved by ElasticBuffer when left at 0;
-        # 0 means "0 SMs / 0 QPs". Multi-node RDMA dispatch needs real QPs, so
-        # resolve them from the theoretical helpers (matches the DeepEP elastic
-        # test harness). Single-node NVLink works with 0 QPs, hence the original
-        # default only ever ran on a single node.
-        _num_sms = envs.SGLANG_DEEPEP_V2_NUM_SMS.get()
-        if _num_sms == 0:
-            _num_sms = buffer.get_theoretical_num_sms(
-                self.num_experts, self.router_topk
-            )
-        _num_qps = buffer.get_theoretical_num_qps(_num_sms)
+        _num_sms, _num_qps = self._resolve_num_sms_qps(buffer)
         recv_x, recv_topk_idx, recv_topk_weights, handle, event = buffer.dispatch(
             dispatch_x,
             topk_idx=topk_ids,
@@ -393,36 +407,10 @@ class _DeepEPv2Impl:
             do_expand=use_expand_layout,
         )
         self._handle = handle
-        # NOTE: do NOT wait here. dispatch_b() does event.current_stream_wait(),
-        # so dispatch() == dispatch_a()+dispatch_b() stays behavior-equivalent to
-        # the old single-shot path, while TBO/SBO can later insert another
-        # micro-batch's compute between dispatch_a and dispatch_b to overlap the
-        # dispatch communication. local_tokens (hidden_states.shape[0]) is carried
-        # so dispatch_b can compute the per-rank-local expected_m hint.
-        return (
-            recv_x,
-            recv_topk_idx,
-            recv_topk_weights,
-            handle,
-            event,
-            use_expand_layout,
-            use_masked,
-            use_tma_aligned_col_major_sf,
-            hidden_states.shape[0],
-        )
-
-    def dispatch_b(
-        self,
-        recv_x,
-        recv_topk_idx,
-        recv_topk_weights,
-        handle,
-        event,
-        use_expand_layout,
-        use_masked,
-        use_tma_aligned_col_major_sf,
-        local_tokens,
-    ):
+        local_tokens = hidden_states.shape[0]
+        # event.current_stream_wait() is a GPU stream dependency (not a CPU
+        # sync); the do_cpu_sync=False masked decode path stays CUDA-graph
+        # capturable.
         if event.event is not None:
             event.current_stream_wait()
 
@@ -500,54 +488,36 @@ class _DeepEPv2Impl:
             self.capability.expert_alignment,
         )
 
-    def dispatch(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
-        # Single-shot = dispatch_a + dispatch_b (behavior-equivalent to the
-        # pre-split path; non-TBO callers use this).
-        return self.dispatch_b(*self.dispatch_a(hidden_states, topk_output))
-
-    def combine_a(self, combine_input: DeepEPv2CombineInput):
+    def combine(self, combine_input: DeepEPv2CombineInput) -> torch.Tensor:
+        # Guard-first (before any DeepEP work) so misuse is reportable without
+        # DeepEP installed.
         if self._handle is None:
             raise RuntimeError(
                 "DeepEP v2 combine called without a valid dispatch handle"
             )
-        buffer = self._get_buffer()
-        # Async: do NOT wait here; combine_b() waits. Lets TBO/SBO overlap the
-        # combine communication with another micro-batch's compute.
-        _num_sms = envs.SGLANG_DEEPEP_V2_NUM_SMS.get()
-        if _num_sms == 0:
-            _num_sms = buffer.get_theoretical_num_sms(
-                self.num_experts, self.router_topk
-            )
-        _num_qps = buffer.get_theoretical_num_qps(_num_sms)
-        combined_x, _, event = buffer.combine(
-            combine_input.hidden_states,
-            handle=self._handle,
-            topk_weights=combine_input.topk_weights,
-            num_sms=_num_sms,
-            num_qps=_num_qps,
-        )
-        return combined_x, event
-
-    def combine_b(self, combined_x, event):
+        # The handle is single-use: release it whether combine succeeds or
+        # raises, so a failed step cannot poison the next dispatch.
         try:
+            buffer = self._get_buffer()
+            _num_sms, _num_qps = self._resolve_num_sms_qps(buffer)
+            combined_x, _, event = buffer.combine(
+                combine_input.hidden_states,
+                handle=self._handle,
+                topk_weights=combine_input.topk_weights,
+                num_sms=_num_sms,
+                num_qps=_num_qps,
+            )
+            # Stream dependency, not a CPU sync (graph-safe).
             if event.event is not None:
                 event.current_stream_wait()
-            if getattr(self, "_pad_empty_combine", False):
+            if self._pad_empty_combine:
                 # Drop the dummy token padded onto an empty local batch in
-                # dispatch_a so this idle rank's combined output is empty again.
+                # dispatch so this idle rank's combined output is empty again.
                 combined_x = combined_x[:0]
             return combined_x
         finally:
             self._pad_empty_combine = False
             self._destroy_handle()
-
-    def combine(self, combine_input: DeepEPv2CombineInput) -> torch.Tensor:
-        return self.combine_b(*self.combine_a(combine_input))
-
-
-class _Stage(Enum):
-    INITIAL = auto()
-    AFTER_DISPATCH = auto()
 
 
 class DeepEPv2Dispatcher(BaseDispatcher):
@@ -559,6 +529,7 @@ class DeepEPv2Dispatcher(BaseDispatcher):
         num_local_experts: int,
         hidden_size: int,
         params_dtype: torch.dtype,
+        allow_hybrid_mode: Optional[bool] = None,
     ):
         super().__init__()
         if params_dtype != torch.bfloat16:
@@ -566,7 +537,6 @@ class DeepEPv2Dispatcher(BaseDispatcher):
                 "DeepEP v2 dispatch adapter currently expects BF16 model activations, "
                 f"got {params_dtype}"
             )
-        self.quant_config = {}
         capability = get_deepep_v2_runner_capability(self)
         self.output_dtype = capability.output_dtype
         self.num_max_dispatch_tokens_per_rank = (
@@ -580,10 +550,8 @@ class DeepEPv2Dispatcher(BaseDispatcher):
             hidden_size=hidden_size,
             capability=capability,
             num_max_dispatch_tokens_per_rank=self.num_max_dispatch_tokens_per_rank,
+            allow_hybrid_mode=allow_hybrid_mode,
         )
-        self._stage = _Stage.INITIAL
-        self._dispatch_state = None
-        self._combine_state = None
 
     def set_quant_config(self, quant_config: dict) -> None:
         self.quant_config = quant_config
@@ -591,54 +559,18 @@ class DeepEPv2Dispatcher(BaseDispatcher):
         self.output_dtype = capability.output_dtype
         self._impl.set_runner_capability(capability)
 
-    def dispatch_a(self, hidden_states: torch.Tensor, topk_output: TopKOutput) -> None:
-        if self._stage != _Stage.INITIAL:
-            raise RuntimeError(
-                f"DeepEP v2 dispatch called in invalid stage: {self._stage}"
-            )
-        self._dispatch_state = self._impl.dispatch_a(hidden_states, topk_output)
-
-    def dispatch_b(self) -> DispatchOutput:
-        if self._dispatch_state is None:
-            raise RuntimeError(
-                "DeepEP v2 dispatch_b() called without a preceding dispatch_a()"
-            )
-        out = self._impl.dispatch_b(*self._dispatch_state)
-        self._dispatch_state = None
-        self._stage = _Stage.AFTER_DISPATCH
-        return out
-
+    # This backend intentionally exposes only single-shot dispatch()/combine():
+    # TBO/SBO are rejected at server start, and our overlap PoC showed the naive
+    # two-phase split cannot overlap anyway (ElasticBuffer.dispatch is
+    # host-blocking); a split API will land together with real TBO support.
     def dispatch(
         self, hidden_states: torch.Tensor, topk_output: TopKOutput
     ) -> DispatchOutput:
-        # Single-shot = dispatch_a + dispatch_b (behavior-equivalent to pre-split;
-        # non-TBO callers use this). TBO/SBO call dispatch_a / dispatch_b
-        # separately and insert another micro-batch's compute in between.
-        self.dispatch_a(hidden_states, topk_output)
-        return self.dispatch_b()
+        return self._impl.dispatch(hidden_states, topk_output)
 
-    def combine_a(self, combine_input: CombineInput) -> None:
-        if self._stage != _Stage.AFTER_DISPATCH:
-            raise RuntimeError(
-                f"DeepEP v2 combine called in invalid stage: {self._stage}"
-            )
+    def combine(self, combine_input: CombineInput) -> torch.Tensor:
         if combine_input.format != CombineInputFormat.DEEPEP_V2:
             raise TypeError(
                 f"Expected DeepEP v2 combine input, got {combine_input.format}"
             )
-        self._combine_state = self._impl.combine_a(combine_input)
-
-    def combine_b(self) -> torch.Tensor:
-        if self._combine_state is None:
-            raise RuntimeError(
-                "DeepEP v2 combine_b() called without a preceding combine_a()"
-            )
-        try:
-            return self._impl.combine_b(*self._combine_state)
-        finally:
-            self._combine_state = None
-            self._stage = _Stage.INITIAL
-
-    def combine(self, combine_input: CombineInput) -> torch.Tensor:
-        self.combine_a(combine_input)
-        return self.combine_b()
+        return self._impl.combine(combine_input)
