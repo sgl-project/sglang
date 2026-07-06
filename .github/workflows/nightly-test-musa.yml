@@ -14,6 +14,7 @@ on:
           - 'all'
           - 'nightly-test-musa-general-kernel'
           - 'nightly-test-musa-general-multimodal-layer'
+          - 'nightly-test-llm-server-1-gpu-musa'
           - 'nightly-test-multimodal-server-1-gpu-musa'
           - 'nightly-test-multimodal-server-2-gpu-musa'
   workflow_call:
@@ -65,7 +66,7 @@ jobs:
 
       - name: Install dependencies
         if: steps.gate.outputs.run_job == 'true'
-        timeout-minutes: 10
+        timeout-minutes: 15
         run: |
           bash scripts/ci/musa/musa_install_dependency.sh
 
@@ -111,7 +112,7 @@ jobs:
           ref: ${{ inputs.ref || github.ref }}
 
       - name: Install dependencies
-        timeout-minutes: 10
+        timeout-minutes: 15
         if: steps.gate.outputs.run_job == 'true'
         run: |
           bash scripts/ci/musa/musa_install_dependency.sh
@@ -120,8 +121,55 @@ jobs:
         if: steps.gate.outputs.run_job == 'true'
         timeout-minutes: 30
         run: |
-          pytest python/sglang/multimodal_gen/test/layers/test_musa_rmsnorm.py
-          pytest python/sglang/multimodal_gen/test/layers/test_musa_silu_and_mul.py
+          pytest python/sglang/multimodal_gen/test/unit/musa/layers/test_musa_rmsnorm.py
+          pytest python/sglang/multimodal_gen/test/unit/musa/layers/test_musa_silu_and_mul.py
+
+  # ==================== LLM server: 1-GPU ====================
+  nightly-test-llm-server-1-gpu-musa:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call'
+    runs-on: s5000-1-gpu-runner
+    timeout-minutes: 240
+    env:
+      SGLANG_USE_MODELSCOPE: false
+      SGLANG_IS_IN_CI: true
+      TORCHADA_ENABLE_CPP_OPS: 1
+      HF_HOME: /hf-cache
+      HF_HUB_CACHE: /hf-cache/hub
+      HF_HUB_OFFLINE: 1
+    steps:
+      - name: Gate by job_filter
+        id: gate
+        run: |
+          filter="${{ inputs.job_filter || 'all' }}"
+          if [[ -z "$filter" || "$filter" == "all" || "$filter" == "nightly-test-llm-server-1-gpu-musa" ]]; then
+            echo "run_job=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run_job=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout code
+        timeout-minutes: 10
+        if: steps.gate.outputs.run_job == 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Install dependencies
+        timeout-minutes: 15
+        if: steps.gate.outputs.run_job == 'true'
+        run: |
+          bash scripts/ci/musa/musa_install_dependency.sh
+
+      - name: Run DeepSeek-V2-Lite-Chat LLM server smoke test
+        if: steps.gate.outputs.run_job == 'true'
+        timeout-minutes: 120
+        run: |
+          cd test
+          python3 run_suite.py \
+            --hw musa \
+            --suite nightly-musa-1-gpu \
+            --nightly \
+            --timeout-per-file 7200
 
   # ==================== Multimodal: 1-GPU (split) ====================
   nightly-test-multimodal-server-1-gpu-musa:
@@ -159,7 +207,7 @@ jobs:
           ref: ${{ inputs.ref || github.ref }}
 
       - name: Install dependencies
-        timeout-minutes: 10
+        timeout-minutes: 15
         if: steps.gate.outputs.run_job == 'true'
         run: |
           bash scripts/ci/musa/musa_install_dependency.sh
@@ -171,7 +219,7 @@ jobs:
           RUNAI_STREAMER_MEMORY_LIMIT: 0
         run: |
           cd python
-          python3 sglang/multimodal_gen/test/run_suite_musa.py \
+          python3 sglang/multimodal_gen/test/server/musa/run_suite.py \
             --suite 1-gpu-musa-nightly \
             --partition-id ${{ matrix.part }} \
             --total-partitions 2 \
@@ -208,7 +256,7 @@ jobs:
           ref: ${{ inputs.ref || github.ref }}
 
       - name: Install dependencies
-        timeout-minutes: 10
+        timeout-minutes: 15
         if: steps.gate.outputs.run_job == 'true'
         run: |
           bash scripts/ci/musa/musa_install_dependency.sh
@@ -220,7 +268,7 @@ jobs:
           RUNAI_STREAMER_MEMORY_LIMIT: 0
         run: |
           cd python
-          python3 sglang/multimodal_gen/test/run_suite_musa.py \
+          python3 sglang/multimodal_gen/test/server/musa/run_suite.py \
             --suite 2-gpu-musa \
             --continue-on-error
 
@@ -230,6 +278,7 @@ jobs:
       [
         nightly-test-musa-general-kernel,
         nightly-test-musa-general-multimodal-layer,
+        nightly-test-llm-server-1-gpu-musa,
         nightly-test-multimodal-server-1-gpu-musa,
         nightly-test-multimodal-server-2-gpu-musa,
       ]

@@ -19,7 +19,7 @@ from typing import Any
 import torch
 from torch import nn
 
-from sglang.srt.layers import dp_attention as _dp_attention
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
 from sglang.srt.layers.attention.dsv4.quant_k_cache import (
     quant_to_nope_fp8_rope_bf16_pack_triton,
@@ -27,17 +27,23 @@ from sglang.srt.layers.attention.dsv4.quant_k_cache import (
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    CudaGraphConfig,
+    PhaseConfig,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import set_global_server_args_for_scheduler
 
 from ..mock_server_args import make_mock_server_args
 
 # DSV4 backend pre-resolves attention TP at construction; pin to single-rank.
-_dp_attention.get_attention_tp_size = lambda: 1
-_dp_attention.get_attention_tp_rank = lambda: 0
-_dp_attention.get_attention_cp_size = lambda: 1
-_dp_attention.get_attention_cp_rank = lambda: 0
+_parallel_override = get_parallel().override(
+    attn_tp_size=1, attn_tp_rank=0, attn_cp_size=1, attn_cp_rank=0
+)
+_parallel_override.__enter__()
 
 # DSV4 hard-coded geometry. Do not change.
 DSV4_PAGE_SIZE = 256
@@ -260,6 +266,7 @@ class TinyDSV4ModelConfig:
         self.is_encoder_decoder = False
         self.is_multimodal = False
         self.is_generation = True
+        self.quantization = None
         self.is_hybrid_swa = False
         self.is_local_attention_model = False
         self.attention_chunk_size = None
@@ -308,8 +315,9 @@ class MockDSV4ModelRunner:
         # case's per-request input length (target_verify uses the draft count
         # directly; draft_extend uses the accepted-token count). Non-spec cases
         # leave it at 0 so the backend skips the speculative branches.
-        if case.forward_mode.is_target_verify() or case.forward_mode.is_draft_extend(
-            include_v2=True
+        if (
+            case.forward_mode.is_target_verify()
+            or case.forward_mode.is_draft_extend_v2()
         ):
             speculative_num_draft_tokens = case.input_lens[0] if case.input_lens else 0
             speculative_eagle_topk = 1
@@ -329,8 +337,18 @@ class MockDSV4ModelRunner:
         self.server_args = make_mock_server_args(
             attention_backend=case.backend,
             chunked_prefill_size=-1,
-            disable_cuda_graph=disable_cuda_graph,
-            disable_piecewise_cuda_graph=disable_piecewise_cuda_graph,
+            cuda_graph_config=CudaGraphConfig(
+                decode=PhaseConfig(
+                    backend=Backend.DISABLED if disable_cuda_graph else Backend.FULL,
+                ),
+                prefill=PhaseConfig(
+                    backend=(
+                        Backend.DISABLED
+                        if (disable_cuda_graph or disable_piecewise_cuda_graph)
+                        else Backend.TC_PIECEWISE
+                    ),
+                ),
+            ),
             disable_radix_cache=False,
             disaggregation_mode=None,
             dp_size=1,
@@ -374,7 +392,8 @@ class MockDSV4ModelRunner:
             page_size=case.page_size,
             swa_page_size=DSV4_SWA_WINDOW,
             dtype=torch.float8_e4m3fn,
-            state_dtype=dtype,
+            c4_state_dtype=dtype,
+            c128_state_dtype=dtype,
             qk_nope_head_dim=DSV4_QK_NOPE_HEAD_DIM,
             qk_rope_head_dim=DSV4_QK_ROPE_HEAD_DIM,
             indexer_head_dim=128,
@@ -395,6 +414,7 @@ class MockDSV4ModelRunner:
         self.sliding_window_size = DSV4_SWA_WINDOW
         self.use_mla_backend = True
         self.is_draft_worker = False
+        self._kernel_warmed_up = True
 
     @property
     def hybrid_gdn_config(self):
@@ -518,9 +538,12 @@ class ProjectedDSV4Attention(nn.Module):
             # `[num_tokens, 1, hidden_dim]`.
             k_flat = k.reshape(k.shape[0], -1).to(torch.bfloat16)
             pack = quant_to_nope_fp8_rope_bf16_pack_triton(k_flat)
-            attn_backend.token_to_kv_pool.set_swa_key_buffer_radix(
+            pool = attn_backend.token_to_kv_pool
+            pool.set_swa_key_buffer_radix(
                 layer_id=self.attn.layer_id,
-                raw_loc=forward_batch.out_cache_loc.to(torch.int64),
+                swa_loc=pool.translate_loc_from_full_to_swa(
+                    forward_batch.out_cache_loc.to(torch.int64)
+                ),
                 cache_nope_fp8_rope_bf16_pack=pack,
             )
         out = attn_backend.forward(
@@ -546,7 +569,9 @@ def _write_swa_cache(
     pack = quant_to_nope_fp8_rope_bf16_pack_triton(k_bf16.to(torch.bfloat16))
     runner.token_to_kv_pool.set_swa_key_buffer_radix(
         layer_id=layer_id,
-        raw_loc=loc.to(torch.int64),
+        swa_loc=runner.token_to_kv_pool.translate_loc_from_full_to_swa(
+            loc.to(torch.int64)
+        ),
         cache_nope_fp8_rope_bf16_pack=pack,
     )
 
@@ -570,6 +595,9 @@ class DSV4AttentionFixture:
     forward_batch: ForwardBatch
     prefix_hidden: list[torch.Tensor]
     input_hidden: torch.Tensor
+    # Selects dense vs sparse-prefill C4 seeding; lives on the fixture because
+    # the reference re-seeds after rebuilding metadata (`_seed_c4_if_needed`).
+    seed_c4_for_sparse_prefill: bool = False
 
 
 @dataclass
@@ -1072,15 +1100,20 @@ def prepare_dsv4_runner_inputs(
         _populate_extra_kv_cache(fixture, layer_id=0, num_entries=_DSV4_EXTRA_ENTRIES)
 
 
-def _seed_c4_if_needed(fixture: DSV4AttentionFixture) -> None:
-    """For compress_ratio=4, seed `c4_sparse_page_indices` to the entries the
-    fixture wrote via `_populate_extra_kv_cache` (the C4Indexer would normally
-    populate this; the smoke fixture skips the indexer). No-op for other
-    compress_ratios.
+def _seed_c4_if_needed(
+    fixture: DSV4AttentionFixture, *, num_entries: int = _DSV4_EXTRA_ENTRIES
+) -> None:
+    """For compress_ratio=4, seed the C4 metadata the exercised path consumes
+    (the C4Indexer would normally populate it; the compact fixture skips the
+    indexer): `c4_sparse_page_indices` for the dense extend path,
+    `c4_sparse_raw_indices` for sparse prefill. No-op for other compress_ratios.
     """
-    if fixture.case.compress_ratio == 4:
-        fixture.backend._maybe_upgrade_forward_metadata()
-        _seed_c4_sparse_indices(fixture, num_entries=_DSV4_EXTRA_ENTRIES)
+    if fixture.case.compress_ratio != 4:
+        return
+    if fixture.seed_c4_for_sparse_prefill:
+        _seed_c4_sparse_prefill_indices(fixture, num_entries=num_entries)
+    else:
+        _seed_c4_sparse_indices(fixture, num_entries=num_entries)
 
 
 def run_dsv4_fixture_eager(fixture: DSV4AttentionFixture) -> torch.Tensor:
@@ -1273,7 +1306,6 @@ def _pure_torch_dsv4_combined_reference(
     # `c4_sparse_page_indices` back to all -1 on the next upgrade) — the
     # reference must observe the same seeded indices the backend forward saw.
     _seed_c4_if_needed(fixture)
-    fixture.backend._maybe_upgrade_forward_metadata()
     md = fixture.backend.forward_metadata.core_metadata
     runner = fixture.runner
     max_context_len = runner.req_to_token_pool.req_to_token.shape[1]
@@ -1351,7 +1383,7 @@ def _seed_c4_sparse_indices(
 ) -> None:
     """For compress_ratio=4 the production `init_flashmla_related` initializes
     `c4_sparse_page_indices` to all `-1` (the C4Indexer fills it in later).
-    Since the smoke fixture does not run the indexer, the C4 path attends to
+    Since the compact fixture does not run the indexer, the C4 path attends to
     zero extra entries unless we seed the indices ourselves. Seed each query
     row to point to `[0, 1, ..., num_entries - 1]` so the backend reads the
     same `num_entries` C4 K's that the reference also reads, exercising the
@@ -1377,6 +1409,47 @@ def _seed_c4_sparse_indices(
         dtype=md.c4_sparse_topk_lengths.dtype,
         device=md.c4_sparse_topk_lengths.device,
     )
+
+
+def _seed_c4_sparse_prefill_indices(
+    fixture: DSV4AttentionFixture,
+    *,
+    num_entries: int,
+) -> None:
+    """Seed C4 metadata for the sparse prefill extend path.
+
+    `_forward_prefill_sparse` reads `c4_sparse_raw_indices` (request-local
+    compressed positions, normally the indexer's output) and derives per-query
+    lengths as `(pos + 1) // 4`. Seed the sequential positions the indexer
+    emits for short sequences and mirror the same causal set into
+    `c4_sparse_page_indices` / `c4_sparse_topk_lengths` so the reference
+    attends identical entries. The mirror relies on raw position `k` mapping
+    to physical extra-cache id `k` (page 0 of a fresh single-request layout);
+    asserted below.
+    """
+    md = fixture.backend.forward_metadata.core_metadata
+    raw_indices = md.c4_sparse_raw_indices
+    assert raw_indices is not None, "requires init_flashmla_related(is_prefill=True)"
+    num_q, width = raw_indices.shape
+    lens = (md.positions_casual + 1) // 4
+    max_len = int(lens.max().item())
+    pool = fixture.runner.token_to_kv_pool
+    c4_page_size = pool.get_extra_key_page_size(layer_id=0)
+    assert max_len <= min(
+        num_entries, c4_page_size
+    ), f"case attends {max_len} c4 entries; only {min(num_entries, c4_page_size)} populated"
+    assert (
+        md.page_table[:, 0] == 0
+    ).all(), "sparse seeding requires the raw==physical identity (first page 0)"
+    seq = (
+        torch.arange(width, dtype=raw_indices.dtype, device=raw_indices.device)
+        .unsqueeze(0)
+        .expand(num_q, -1)
+    )
+    seeded = torch.where(seq < lens.unsqueeze(1), seq, seq.new_full((), -1))
+    md.c4_sparse_raw_indices = seeded
+    md.c4_sparse_page_indices = seeded.clone()
+    md.c4_sparse_topk_lengths = lens.to(md.c4_sparse_topk_lengths.dtype)
 
 
 def run_dsv4_target_verify_attention_case(
@@ -1474,8 +1547,8 @@ def run_dsv4_draft_extend_attention_case(
         "`deepseek_v4_backend.py:636-663` and the 'Production-Unsupported' "
         "section in dsv4/README.md."
     )
-    assert case.forward_mode.is_draft_extend(
-        include_v2=True
+    assert (
+        case.forward_mode.is_draft_extend_v2()
     ), f"run_dsv4_draft_extend_attention_case requires DRAFT_EXTEND; got {case.forward_mode}"
     from sglang.test.kits.attention_unittest.runner_modes.speculative_draft_extend_runner import (
         _make_eagle_draft_extend_input,
@@ -1518,6 +1591,7 @@ def run_dsv4_compress_attention_case(
     case: DSV4AttentionCase,
     *,
     extra_entries: int = 32,
+    sparse_prefill: bool = False,
     dtype: torch.dtype = torch.bfloat16,
     device: str = "cuda",
 ) -> None:
@@ -1527,17 +1601,24 @@ def run_dsv4_compress_attention_case(
     Pre-writes random packed K into both the SWA cache and the extra
     (C4/C128) cache via the production pack+set paths, lets
     `init_forward_metadata` populate the compression metadata, manually seeds
-    `c4_sparse_page_indices` for the C4 case (so the flash_mla `extra_k_cache`
-    path actually attends to entries we wrote rather than the all-`-1` initial
-    value that the un-run indexer would leave), then dispatches `forward(
-    compress_ratio=case.compress_ratio)` and compares against an independent
-    pure-PyTorch SWA + extra reference that reads the SAME cache bytes and
-    metadata indices.
+    the C4 metadata the exercised path consumes (see `_seed_c4_if_needed`; the
+    un-run indexer would otherwise leave it at `-1` / uninitialized), then
+    dispatches `forward(compress_ratio=case.compress_ratio)` and compares
+    against an independent pure-PyTorch SWA + extra reference that reads the
+    SAME cache bytes and metadata indices.
+
+    `sparse_prefill` pins `SGLANG_OPT_FLASHMLA_SPARSE_PREFILL`, selecting the
+    dense `flash_mla_with_kvcache` extend path or `_forward_prefill_sparse`;
+    the C4 seeding dispatches on the same flag.
     """
     assert case.compress_ratio in (
         4,
         128,
-    ), f"smoke runner requires compress_ratio in (4, 128); got {case.compress_ratio}"
+    ), f"DSV4 compact runner requires compress_ratio in (4, 128); got {case.compress_ratio}"
+    if sparse_prefill:
+        assert (
+            case.forward_mode.is_extend_without_speculative()
+        ), f"sparse prefill only serves extend; got {case.forward_mode}"
     fixture = build_dsv4_attention_fixture(
         testcase,
         case,
@@ -1545,6 +1626,7 @@ def run_dsv4_compress_attention_case(
         device=device,
         compression_ratios=[case.compress_ratio],
     )
+    fixture.seed_c4_for_sparse_prefill = sparse_prefill
     runner = fixture.runner
     max_context_len = runner.req_to_token_pool.req_to_token.shape[1]
 
@@ -1552,13 +1634,13 @@ def run_dsv4_compress_attention_case(
     _populate_extra_kv_cache(fixture, layer_id=0, num_entries=extra_entries)
 
     q_input, _ = fixture.actual_module.project(fixture.input_hidden)
-    with torch.no_grad(), forward_context(ForwardContext(attn_backend=fixture.backend)):
+    with (
+        torch.no_grad(),
+        forward_context(ForwardContext(attn_backend=fixture.backend)),
+        envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.override(sparse_prefill),
+    ):
         fixture.backend.init_forward_metadata(fixture.forward_batch)
-        # Trigger lazy upgrade so we can patch the metadata that the smoke
-        # case relies on (specifically c4_sparse_page_indices).
-        fixture.backend._maybe_upgrade_forward_metadata()
-        if case.compress_ratio == 4:
-            _seed_c4_sparse_indices(fixture, num_entries=extra_entries)
+        _seed_c4_if_needed(fixture, num_entries=extra_entries)
         actual = fixture.backend.forward(
             q=q_input,
             k=q_input,
@@ -1569,6 +1651,17 @@ def run_dsv4_compress_attention_case(
             save_kv_cache=False,
             attn_sink=fixture.actual_module.attn_sink,
         )
+        # Only `_forward_prefill_sparse` populates `sparse_prefill_cache`;
+        # verify the intended path ran before the reference rebuilds metadata.
+        sparse_cache = fixture.backend.forward_metadata.sparse_prefill_cache
+        if sparse_prefill:
+            testcase.assertIsNotNone(
+                sparse_cache, f"{case.name} did not take _forward_prefill_sparse"
+            )
+        else:
+            testcase.assertIsNone(
+                sparse_cache, f"{case.name} did not take the dense extend path"
+            )
         expected = _pure_torch_dsv4_combined_reference(fixture, q_input)
 
     torch.testing.assert_close(
