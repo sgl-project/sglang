@@ -251,7 +251,6 @@ void bmm_fp8(
     at::Tensor B_scale,
     at::Tensor workspace_buffer,
     int64_t cublas_handle);
-void dsv3_fused_a_gemm(torch::Tensor& output, torch::Tensor const& mat_a, torch::Tensor const& mat_b);
 
 torch::Tensor gptq_gemm(
     torch::Tensor a,
