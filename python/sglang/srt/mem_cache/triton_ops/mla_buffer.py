@@ -5,6 +5,11 @@ import triton
 import triton.language as tl
 
 from sglang.jit_kernel.utils import is_arch_support_pdl
+from sglang.srt.layers.dcp import (
+    dcp_enabled,
+    get_attention_dcp_rank,
+    get_attention_dcp_world_size,
+)
 
 
 @triton.jit
@@ -19,6 +24,8 @@ def set_mla_kv_buffer_kernel(
     nope_dim: tl.constexpr,
     rope_dim: tl.constexpr,
     BLOCK: tl.constexpr,
+    DCP_RANK: tl.constexpr,
+    DCP_WORLD_SIZE: tl.constexpr,
     USE_GDC: tl.constexpr = False,
 ):
     pid_loc = tl.program_id(0)
@@ -33,7 +40,10 @@ def set_mla_kv_buffer_kernel(
         tl.extra.cuda.gdc_wait()
 
     loc = tl.load(loc_ptr + pid_loc).to(tl.int64)
-    dst_ptr = kv_buffer_ptr + loc * buffer_stride + offs
+    is_valid = loc % DCP_WORLD_SIZE == DCP_RANK
+    safe_loc = tl.where(is_valid, loc, 0)
+    safe_loc = safe_loc // DCP_WORLD_SIZE
+    dst_ptr = kv_buffer_ptr + safe_loc * buffer_stride + offs
 
     # Three-way branch to handle boundary correctly while preserving fast path
     if base + BLOCK <= nope_dim:
@@ -68,7 +78,7 @@ def set_mla_kv_buffer_kernel(
 
         src = tl.where(is_nope, src_nope, src_rope)
 
-    tl.store(dst_ptr, src, mask=mask)
+    tl.store(dst_ptr, src, mask=mask & is_valid)
 
     if USE_GDC:
         tl.extra.cuda.gdc_launch_dependents()
@@ -124,6 +134,7 @@ def set_mla_kv_buffer_triton(
         n_loc >= _TMA_BULK_STORE_MIN_LOCS
         and is_arch_support_pdl()
         and can_use_set_mla_kv_buffer(nope_bytes, rope_bytes)
+        and not dcp_enabled()
     ):
         jit_set_mla_kv_buffer(kv_buffer, loc, cache_k_nope, cache_k_rope)
         return
@@ -150,6 +161,8 @@ def set_mla_kv_buffer_triton(
         nope_dim,
         rope_dim,
         BLOCK=BLOCK,
+        DCP_RANK=get_attention_dcp_rank(),
+        DCP_WORLD_SIZE=get_attention_dcp_world_size(),
         **pdl_kwargs,
     )
 
