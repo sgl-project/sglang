@@ -319,6 +319,38 @@ Backend selection applies to **blockwise FP8**, **MXFP8** (dense linear), and **
 
 On Blackwell, when FlashInfer is unavailable for NVFP4, the SGLang CUTLASS kernel is used as an automatic fallback. On SM80-SM90, `auto` selects Marlin for NVFP4.
 
+## MXFP8 MoE grouped quantization backend
+
+`--mxfp8-grouped-quant-backend` selects the grouped quantization kernel used by
+CUTLASS MXFP8 MoE paths before the grouped GEMM.
+
+<table>
+  <thead>
+    <tr>
+      <th>Backend</th>
+      <th>Hardware</th>
+      <th>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>auto</code> (default)</td>
+      <td>SM100</td>
+      <td>Uses the FlashInfer cuTile backend when available, otherwise uses the native sgl-kernel grouped quantization op</td>
+    </tr>
+    <tr>
+      <td><code>flashinfer</code></td>
+      <td>SM100</td>
+      <td>Requires a FlashInfer build with the cuTile MXFP8 grouped quantization kernel</td>
+    </tr>
+    <tr>
+      <td><code>native</code></td>
+      <td>SM100</td>
+      <td>Uses the native sgl-kernel grouped quantization op</td>
+    </tr>
+  </tbody>
+</table>
+
 ## Offline Quantization
 
 To load already quantized models, simply load the model weights and config. **Again, if the model has been quantized offline,

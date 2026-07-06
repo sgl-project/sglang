@@ -74,6 +74,9 @@ from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
 from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
+from sglang.srt.layers.quantization.mxfp8_grouped_quant import (
+    initialize_mxfp8_grouped_quant_config,
+)
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler_components.dp_attn import prepare_mlp_sync_batch_raw
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams
@@ -844,6 +847,7 @@ def latency_test(
     initialize_moe_config(server_args)
     initialize_fp8_gemm_config(server_args)
     initialize_fp4_gemm_config(server_args)
+    initialize_mxfp8_grouped_quant_config(server_args)
 
     # Set CPU affinity
     if get_bool_env_var("SGLANG_SET_CPU_AFFINITY"):

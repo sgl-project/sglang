@@ -26,9 +26,18 @@ def calc_diff(x, y):
     return 1 - sim
 
 
+def cuda_version_at_least(major: int, minor: int) -> bool:
+    if torch.version.cuda is None:
+        return False
+    version = tuple(int(part) for part in torch.version.cuda.split(".")[:2])
+    return version >= (major, minor)
+
+
 def is_sm100_supported(device=None) -> bool:
-    return (torch.cuda.get_device_capability(device)[0] == 10) and (
-        torch.version.cuda >= "12.8"
+    return (
+        torch.cuda.is_available()
+        and torch.cuda.get_device_capability(device)[0] == 10
+        and cuda_version_at_least(12, 8)
     )
 
 
