@@ -20,12 +20,24 @@ pub enum EgressSink {
     Local(mpsc::Sender<EgressItem>),
 }
 
+/// Why an [`EgressSink::try_send`] failed. `Full` = the client isn't reading fast
+/// enough (backpressure); `Closed` = the client is gone. Both are terminal for a
+/// streaming request (the shard can't buffer unboundedly), but the caller
+/// distinguishes them for logging and reporting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SinkError {
+    Full,
+    Closed,
+}
+
 impl EgressSink {
-    /// Non-blocking send. `Err(())` means the consumer is gone (client
-    /// disconnected); callers treat that as an abort signal.
-    pub fn try_send(&self, item: EgressItem) -> Result<(), ()> {
+    /// Non-blocking send. `Err(Full)` = backpressure, `Err(Closed)` = client gone.
+    pub fn try_send(&self, item: EgressItem) -> Result<(), SinkError> {
         match self {
-            EgressSink::Local(tx) => tx.try_send(item).map_err(|_| ()),
+            EgressSink::Local(tx) => tx.try_send(item).map_err(|e| match e {
+                mpsc::error::TrySendError::Full(_) => SinkError::Full,
+                mpsc::error::TrySendError::Closed(_) => SinkError::Closed,
+            }),
         }
     }
 }
