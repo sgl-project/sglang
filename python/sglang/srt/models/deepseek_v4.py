@@ -2961,7 +2961,9 @@ class DeepseekV4ForCausalLM(nn.Module):
         }
         if unloaded_params:
             logger.warning(
-                f"Some weights are not initialized from checkpoints: {unloaded_params}"
+                "Some weights are not initialized from checkpoints: "
+                f"count={len(unloaded_params)}. "
+                "Ignore this message for RL weight update."
             )
 
         self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)

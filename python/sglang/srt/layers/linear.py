@@ -1493,6 +1493,15 @@ class RowParallelLinear(LinearBase):
             assert loaded_weight.numel() == 1
             loaded_weight = loaded_weight.reshape(1)
 
+        if (
+            isinstance(param, BlockQuantScaleParameter)
+            and getattr(param, "format_ue8m0", False)
+            and loaded_weight.dtype == torch.int32
+            and not self.use_presharded_weights
+        ):
+            self._load_ue8m0_packed_scale(param, loaded_weight)
+            return
+
         if isinstance(param, RowvLLMParameter):
             # This `BasevLLMParameter` is defined in sglang/srt/layers/parameter.py,
             # It supports additional parameters like tp_rank and use_presharded_weights.
@@ -1514,6 +1523,29 @@ class RowParallelLinear(LinearBase):
             except TypeError:
                 # Fallback for parameters that don't accept additional args
                 param.load_row_parallel_weight(loaded_weight)
+
+    def _load_ue8m0_packed_scale(
+        self, param: BlockQuantScaleParameter, loaded_weight: torch.Tensor
+    ):
+        # TODO: This is hacky, better to have a more stable solution
+        # The loaded scale is a full-size DeepGEMM UE8M0 packed tensor (int32,
+        # mn-major, 4 scale columns per word; see transform_scale_ue8m0). The
+        # input-dim shard boundary sits at sub-word granularity whenever
+        # (k_local / block_k) % 4 != 0, so the packed form cannot be narrowed
+        # directly: unpack to fp32, narrow in scale-column units, then repack.
+        from sglang.srt.layers.quantization.fp8_utils import (
+            inverse_transform_scale_ue8m0,
+            transform_scale_ue8m0,
+        )
+
+        block_k = self.quant_method.quant_config.weight_block_size[1]
+        mn = param.data.shape[0]
+        sf_fp32 = inverse_transform_scale_ue8m0(loaded_weight, mn=mn)
+        shard_size = (self.input_size_per_partition + block_k - 1) // block_k
+        sf_local = sf_fp32.narrow(1, self.tp_rank * shard_size, shard_size).contiguous()
+        packed = transform_scale_ue8m0(sf_local, mn=mn)
+        assert param.data.shape == packed.shape, f"{param.data.shape=} {packed.shape=}"
+        param.data.copy_(packed)
 
     def forward(self, input_, skip_all_reduce=False, forward_batch=None):
         if self.input_is_parallel:
