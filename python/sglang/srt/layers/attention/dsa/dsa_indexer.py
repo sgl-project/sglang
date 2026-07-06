@@ -54,7 +54,6 @@ logger = logging.getLogger(__name__)
 
 global _use_multi_stream
 _is_cuda = is_cuda()
-_use_dsa_indexer_fusion = _is_cuda and not envs.SGLANG_DISABLE_DSA_INDEXER_FUSION.get()
 _is_hip = is_hip()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
@@ -365,6 +364,11 @@ class Indexer(MultiPlatformOp):
         self.index_topk = index_topk
         self.q_lora_rank = q_lora_rank
         self.layer_id = layer_id
+        self.use_dsa_indexer_fusion = (
+            _is_cuda
+            and not envs.SGLANG_DISABLE_DSA_INDEXER_FUSION.get()
+            and not is_neox_style
+        )
         self.alt_stream = alt_stream
         self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
         if self.dsa_enable_prefill_cp:
@@ -389,7 +393,7 @@ class Indexer(MultiPlatformOp):
             prefix=add_prefix("wq_b", prefix),
         )
 
-        if _use_dsa_indexer_fusion:
+        if self.use_dsa_indexer_fusion:
             self.wk_weights_proj = ReplicatedLinear(
                 self.hidden_size,
                 self.head_dim + self.n_heads,
@@ -504,7 +508,7 @@ class Indexer(MultiPlatformOp):
     def _maybe_rotate(self, x: torch.Tensor) -> torch.Tensor:
         # Fusion drops the (logit-preserving) Hadamard rotation; without it the
         # index-K cache here matches the fused path that decode reads back.
-        return x if _use_dsa_indexer_fusion else rotate_activation(x)
+        return x if self.use_dsa_indexer_fusion else rotate_activation(x)
 
     def _should_skip_logits_computation(self, forward_batch: ForwardBatch) -> bool:
         if (
@@ -540,7 +544,7 @@ class Indexer(MultiPlatformOp):
                 )
             with torch.cuda.stream(self.alt_stream):
                 # TODO we should also put DeepGEMM half SM here?
-                if _use_dsa_indexer_fusion:
+                if self.use_dsa_indexer_fusion:
                     key, weights_raw = self._fused_k_weights(x)
                 else:
                     key, _ = self.wk(x)
@@ -559,7 +563,7 @@ class Indexer(MultiPlatformOp):
             q_rope, _ = torch.split(
                 query, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
             )
-            if _use_dsa_indexer_fusion:
+            if self.use_dsa_indexer_fusion:
                 key, weights_raw = self._fused_k_weights(x)
             else:
                 key, _ = self.wk(x)
@@ -745,6 +749,13 @@ class Indexer(MultiPlatformOp):
 
         current_stream.wait_stream(self.alt_stream)
         self.alt_stream.wait_stream(current_stream)
+        q_fp8, weights = fused_q_indexer_rope_first_quant(
+            q.contiguous(),
+            weights_raw,
+            q_scale_gate,
+            self._indexer_cos_sin_cache,
+            positions,
+        )
         with torch.cuda.stream(self.alt_stream):
             self._fused_k_prepare_and_store(
                 key,
@@ -754,14 +765,6 @@ class Indexer(MultiPlatformOp):
                 act_quant,
                 out_cache_loc=out_cache_loc,
             )
-
-        q_fp8, weights = fused_q_indexer_rope_first_quant(
-            q.contiguous(),
-            weights_raw,
-            q_scale_gate,
-            self._indexer_cos_sin_cache,
-            positions,
-        )
 
         current_stream.wait_stream(self.alt_stream)
         return q_fp8, weights
@@ -1247,7 +1250,7 @@ class Indexer(MultiPlatformOp):
 
         # Write the same K representation the decode path reads back: fused
         # (no-Hadamard) when fusion is on, else the legacy Hadamard path.
-        if _use_dsa_indexer_fusion:
+        if self.use_dsa_indexer_fusion:
             key_raw, _ = self._fused_k_weights(x)
             if num_tokens is not None:
                 assert num_tokens <= key_raw.shape[0]
@@ -1698,12 +1701,12 @@ class Indexer(MultiPlatformOp):
         # wrapper owns base+delta and no LoRA kernel runs under torch.compile.
         # Fusion folds weights_proj into wk_weights_proj, so weights_proj is
         # absent then; short-circuit before touching it.
-        weights_proj_lora = not _use_dsa_indexer_fusion and getattr(
+        weights_proj_lora = not self.use_dsa_indexer_fusion and getattr(
             self.weights_proj, "set_lora", False
         )
 
         if (
-            _use_dsa_indexer_fusion
+            self.use_dsa_indexer_fusion
             and not in_piecewise_or_breakable_cuda_graph
             and forward_batch.attn_cp_metadata is None
         ):
@@ -1751,7 +1754,7 @@ class Indexer(MultiPlatformOp):
         elif enable_dual_stream and forward_batch.forward_mode.is_decode_or_idle():
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
-            if not _use_dsa_indexer_fusion:
+            if not self.use_dsa_indexer_fusion:
                 if weights_proj_lora:
                     weights = self.weights_proj(x)[0].float() * self.n_heads**-0.5
                 else:
@@ -1768,7 +1771,7 @@ class Indexer(MultiPlatformOp):
                     act_quant=act_quant,
                 )
             current_stream.wait_stream(self.alt_stream)
-            if _use_dsa_indexer_fusion:
+            if self.use_dsa_indexer_fusion:
                 weights = self._scale_head_gates(weights_raw, q_scale)
             else:
                 weights = self._apply_q_scale_and_softmax_scale(weights, q_scale)
@@ -1847,7 +1850,7 @@ class Indexer(MultiPlatformOp):
                 x_for_gate = x
 
             if in_piecewise_or_breakable_cuda_graph:
-                if _use_dsa_indexer_fusion:
+                if self.use_dsa_indexer_fusion:
                     weights = scale_head_gate_graph(
                         weights_raw,
                         self.n_heads**-0.5,
@@ -1864,7 +1867,7 @@ class Indexer(MultiPlatformOp):
                         self.softmax_scale,
                         q_scale,
                     )
-            elif _use_dsa_indexer_fusion:
+            elif self.use_dsa_indexer_fusion:
                 weights = self._scale_head_gates(weights_raw, q_scale)
             elif weights_proj_lora:
                 weights = self.weights_proj(x_for_gate)[0].float() * self.n_heads**-0.5
@@ -1877,8 +1880,7 @@ class Indexer(MultiPlatformOp):
             # creates a Dynamo shape guard. These graph modes never have empty
             # batches.
             if not in_piecewise_or_breakable_cuda_graph:
-                assert forward_batch.seq_lens_cpu is not None
-                if len(forward_batch.seq_lens_cpu) == 0:
+                if forward_batch.seq_lens.numel() == 0:
                     # this seems b/c max-pad, no worries?
                     # if x.shape[0] != 0:
                     #     print(
@@ -2356,7 +2358,7 @@ def pcg_dsa_indexer_prefill_split(
     # Fused path stores K (no-Hadamard) and computes q_fp8 + head gate in the
     # fused kernels, sliced to the unpadded count. Single stream: the split op is
     # captured, so the dual-stream overlap is disabled.
-    if _use_dsa_indexer_fusion:
+    if indexer.use_dsa_indexer_fusion:
         q_fp8, weights = indexer._fused_q_prepare_and_store(
             x,
             q_lora,
