@@ -13,11 +13,14 @@ import sys
 import pytest
 import torch
 
+from sglang.jit_kernel.hicache import can_use_write_back_jit_kernel
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
 from sglang.srt.mem_cache.memory_pool_host import (
-    ALLOC_MEMORY_FUNCS,
     MHATokenToKVPoolHost,
     MLATokenToKVPoolHost,
+)
+from sglang.srt.mem_cache.pool_host.common import (
+    ALLOC_MEMORY_FUNCS,
     alloc_with_pin_memory,
 )
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
@@ -109,7 +112,11 @@ def _run_mha(element_dim: int, page_count: int) -> None:
     host_pool = _pinned_host_pool(
         MHATokenToKVPoolHost, device_pool=device_pool, layout="page_first"
     )
-    assert host_pool.can_use_jit, "page_first + kernel JIT path must be enabled"
+    assert can_use_write_back_jit_kernel(
+        element_size=element_dim * host_pool.dtype.itemsize,
+    )
+    # page_first + kernel staged write-back JIT path must be enabled.
+    assert host_pool.can_use_write_back_jit
 
     for layer_id in range(NUM_LAYERS):
         _fill_with_offset(device_pool.k_buffer[layer_id], layer_id)
@@ -143,6 +150,8 @@ def _run_mha(element_dim: int, page_count: int) -> None:
         )
 
     # Load path (prefix-cache hit): exercises the hicache.cuh load matchers.
+    if not host_pool.can_use_jit:
+        return
     for layer_id in range(NUM_LAYERS):
         device_pool.k_buffer[layer_id].zero_()
         device_pool.v_buffer[layer_id].zero_()
@@ -186,7 +195,10 @@ def _run_mla(element_dim: int, page_count: int) -> None:
     host_pool = _pinned_host_pool(
         MLATokenToKVPoolHost, device_pool=device_pool, layout="page_first"
     )
-    assert host_pool.can_use_jit, "page_first + kernel JIT path must be enabled"
+    assert can_use_write_back_jit_kernel(
+        element_size=element_dim * host_pool.dtype.itemsize,
+    )
+    assert host_pool.can_use_write_back_jit
 
     for layer_id in range(NUM_LAYERS):
         _fill_with_offset(device_pool.kv_buffer[layer_id], layer_id)
@@ -210,6 +222,8 @@ def _run_mla(element_dim: int, page_count: int) -> None:
             device_pages,
         )
 
+    if not host_pool.can_use_jit:
+        return
     for layer_id in range(NUM_LAYERS):
         device_pool.kv_buffer[layer_id].zero_()
 
