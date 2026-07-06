@@ -1047,7 +1047,13 @@ class DeepseekV4AttnBackend(
                 ][bs]
                 return
             assert out_cache_loc is not None
-            num_tokens_v = self.speculative_num_draft_tokens * bs
+            spec_num_draft_tokens = getattr(
+                getattr(forward_batch, "spec_info", None), "draft_token_num", None
+            )
+            if spec_num_draft_tokens is None:
+                spec_num_draft_tokens = self.speculative_num_draft_tokens
+            spec_num_draft_tokens = int(spec_num_draft_tokens)
+            num_tokens_v = spec_num_draft_tokens * bs
             out_cache_loc_padded = torch.nn.functional.pad(
                 out_cache_loc,
                 pad=(0, num_tokens_v - len(out_cache_loc)),
@@ -1066,6 +1072,7 @@ class DeepseekV4AttnBackend(
                 seq_lens=seq_lens,
                 seq_lens_cpu=seq_lens_cpu,
                 out_cache_loc=out_cache_loc_padded,
+                num_draft_tokens=spec_num_draft_tokens,
                 use_prefill_cuda_graph=True,
                 online_c128_state_slot_offset=online_c128_state_slot_offset,
             )

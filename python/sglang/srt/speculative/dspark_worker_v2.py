@@ -156,6 +156,15 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.block_size = int(model_block_size)
         self.verify_stride = int(self.block_size) + 1
         self.speculative_num_draft_tokens = int(self.verify_stride)
+        # DSpark uses different fixed widths for the two graphable paths:
+        # draft-block runs anchor + (block_size - 1) noise query rows, while
+        # target verify consumes anchor + block_size sampled candidates.
+        self._draft_worker.server_args.speculative_num_draft_tokens = int(
+            self.block_size
+        )
+        self.draft_model_runner.server_args.speculative_num_draft_tokens = int(
+            self.block_size
+        )
 
         self.noise_token_id = int(self._draft_inner.noise_token_id)
         self.markov_rank = int(self._draft_inner.markov_rank)
@@ -1072,7 +1081,18 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         return {
             "draft_can_run_graph": can_run_graph,
-            "draft_forward_mode": str(getattr(draft_forward_batch, "forward_mode", None)),
+            "draft_forward_mode": str(
+                getattr(draft_forward_batch, "forward_mode", None)
+            ),
+            "draft_runtime_block_size": int(self.block_size),
+            "target_verify_stride": int(self.verify_stride),
+            "draft_spec_token_num": int(
+                getattr(
+                    getattr(draft_forward_batch, "spec_info", None),
+                    "draft_token_num",
+                    -1,
+                )
+            ),
             "draft_block_ids_first": self._last_draft_block_ids_debug,
             "draft_context_kv_path": getattr(
                 self, "_last_context_kv_path_debug", None

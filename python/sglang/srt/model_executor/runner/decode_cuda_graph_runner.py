@@ -1129,7 +1129,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             spec_info = dspark_spec_input_cls(
                 draft_token=None,
                 positions=None,
-                draft_token_num=self.model_runner.server_args.speculative_num_draft_tokens,
+                draft_token_num=self.speculative_num_draft_tokens,
                 custom_mask=None,
                 capture_hidden_mode=(
                     CaptureHiddenMode.NULL
