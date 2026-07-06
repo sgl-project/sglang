@@ -46,6 +46,61 @@ def get_folding_tp_group(config: EncoderConfig):
     return get_tp_group()
 
 
+# Folding pays off only for wide encoders: measured ~-22% encode latency for
+# T5-XXL (hidden 4096) and larger for Mistral-24B (hidden 5120), but a net loss
+# for narrower ones (Qwen3 hidden 2560, CLIP 512) whose per-layer all_reduce
+# dominates the sharded compute. Decided on the real (post-load) hidden size.
+FOLD_MIN_HIDDEN_SIZE = 4096
+
+
+def _encoder_dims(config: EncoderConfig):
+    """Best-effort (hidden, attention_heads, mlp_intermediate) from a config,
+    spelled differently across families (hidden_size/d_model, num_heads, d_ff)."""
+
+    def first(names):
+        for name in names:
+            value = getattr(config, name, None)
+            if isinstance(value, int) and value > 0:
+                return value
+        return None
+
+    return (
+        first(("hidden_size", "d_model")),
+        first(("num_attention_heads", "num_heads", "n_heads")),
+        first(("intermediate_size", "d_ff", "ffn_dim")),
+    )
+
+
+def encoder_folding_worthwhile(config: EncoderConfig, group_size: int) -> bool:
+    """Fold only encoders wide enough to benefit whose heads and MLP divide the
+    fold group. Size-based (not per-architecture), so the same encoder family at
+    different parameter counts is handled correctly."""
+    hidden, heads, inter = _encoder_dims(config)
+    return (
+        group_size > 1
+        and hidden is not None
+        and hidden >= FOLD_MIN_HIDDEN_SIZE
+        and heads is not None
+        and heads % group_size == 0
+        and inter is not None
+        and inter % group_size == 0
+    )
+
+
+def finalize_encoder_folding(config: EncoderConfig) -> None:
+    """Loader hook: call after the encoder's real dims are populated
+    (update_model_arch) and before construction. adjust_pipeline_config proposes
+    a fold group from the parallelism alone; here we keep it only if the encoder
+    is actually worth folding at its real size, otherwise fall back to
+    replicated by clearing the mode.
+    """
+    if config.parallel_folding_mode is None:
+        return
+    group_size = getattr(get_folding_tp_group(config), "world_size", 1)
+    if not encoder_folding_worthwhile(config, group_size):
+        config.parallel_folding_mode = None
+
+
 class TextEncoder(nn.Module, ABC, LayerwiseOffloadableModuleMixin):
     layerwise_offload_dit_group_enabled = False
     layer_names = [

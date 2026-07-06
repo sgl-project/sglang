@@ -78,8 +78,8 @@ class T5Config(TextEncoderConfig):
     arch_config: TextEncoderArchConfig = field(default_factory=T5ArchConfig)
 
     prefix: str = "t5"
-    # T5-XXL / UMT5-XXL are wide enough that TP-folding is a measured win
-    parallel_folding: bool = True
+    # Folding is decided by real encoder size at load time
+    # (finalize_encoder_folding); T5-XXL / UMT5-XXL clear the bar.
 
     @staticmethod
     def add_cli_args(

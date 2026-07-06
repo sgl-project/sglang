@@ -38,7 +38,10 @@ from sglang.multimodal_gen.runtime.loader.weight_utils import (
     pt_weights_iterator,
     safetensors_weights_iterator,
 )
-from sglang.multimodal_gen.runtime.models.encoders.base import get_folding_tp_group
+from sglang.multimodal_gen.runtime.models.encoders.base import (
+    finalize_encoder_folding,
+    get_folding_tp_group,
+)
 from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -311,6 +314,9 @@ class TextEncoderLoader(ComponentLoader):
         )
         if post_diffusers_config_update is not None:
             post_diffusers_config_update()
+        # Real dims are populated now; keep the proposed fold group only if this
+        # encoder is actually wide enough to benefit at its real size.
+        finalize_encoder_folding(encoder_config)
         encoder_dtype = server_args.pipeline_config.text_encoder_precisions[
             encoder_index
         ]

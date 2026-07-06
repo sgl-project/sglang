@@ -436,34 +436,6 @@ class ServerArgs(DisaggServerArgsMixin):
             self.transformer_weights_path = resolution.transformer_weights_path
         self.nunchaku_config = resolution.nunchaku_config
 
-    # For Parallel Folding: attribute names used across encoder arch configs for the two dims a
-    # TP shard splits: attention heads and MLP intermediate. Read through
-    # ModelConfig.__getattr__ (which delegates to arch_config).
-    _ENCODER_HEAD_ATTRS = ("num_attention_heads", "num_heads", "n_heads")
-    _ENCODER_FFN_ATTRS = ("intermediate_size", "d_ff", "ffn_dim", "ffn_hidden_size")
-
-    @staticmethod
-    def _encoder_shard_dims(encoder_config):
-        """Best-effort (attention_heads, mlp_intermediate) for an encoder config.
-
-        Returns None for either dim we cannot resolve, so the caller skips
-        folding rather than risk a shard that does not divide.
-        """
-
-        def first(attrs):
-            for name in attrs:
-                try:
-                    value = getattr(encoder_config, name)
-                except AttributeError:
-                    continue
-                if isinstance(value, int) and value > 0:
-                    return value
-            return None
-
-        return first(ServerArgs._ENCODER_HEAD_ATTRS), first(
-            ServerArgs._ENCODER_FFN_ATTRS
-        )
-
     def adjust_pipeline_config(self):
         # 1. adjust for encoder parallel folding
         tp_size = self.tp_size or 1
@@ -474,45 +446,35 @@ class ServerArgs(DisaggServerArgsMixin):
         fold_world = dp_size == 1 and not self.disagg_mode and replica_size > tp_size
 
         if fold_world:
-            mode, group_size = "world", replica_size
+            mode = "world"
         elif tp_size == 1 and sp_degree > 1:
             # Preserve prior behavior for dp>1 / disaggregated SP runs.
-            mode, group_size = "sp", sp_degree
+            mode = "sp"
         else:
             return
 
+        # Propose the fold group from the parallelism for every encoder. The
+        # loader keeps it only for encoders wide enough to benefit at their real
+        # (post-load) size and whose dims divide the group -- see
+        # finalize_encoder_folding. Deciding on real size (not architecture)
+        # handles the same encoder family at different parameter counts.
         encoder_configs = list(self.pipeline_config.text_encoder_configs) + list(
             getattr(self.pipeline_config, "image_encoder_configs", ()) or ()
         )
-        enabled = []
         for encoder_config in encoder_configs:
-            # only fold encoders that opt in (measured beneficial); folding a
-            # small encoder is a net loss (per-layer all_reduce > sharded compute).
-            if not encoder_config.parallel_folding:
-                continue
-            # only fold when both the attention heads and the MLP intermediate divide the group
-            heads, inter = ServerArgs._encoder_shard_dims(encoder_config)
-            if heads is None or inter is None:
-                continue
-            if heads % group_size != 0 or inter % group_size != 0:
-                # encoders whose dims we cannot introspect are left unfolded (safe)
-                continue
-            # record the runtime group; mode stays None when not folded.
             encoder_config.parallel_folding_mode = mode
-            enabled.append(type(encoder_config).__name__)
 
-        if enabled:
-            logger.info(
-                "Enabled encoder parallel folding (mode=%s) for %s: %s "
-                "(tp=%s sp=%s cfg=%s replica=%s).",
-                mode,
-                self.__class__.__name__,
-                ", ".join(enabled),
-                tp_size,
-                sp_degree,
-                self.cfg_parallel_degree or 1,
-                replica_size,
-            )
+        logger.info(
+            "Proposed encoder parallel folding (mode=%s) for %s "
+            "(tp=%s sp=%s cfg=%s replica=%s); the loader keeps it for encoders "
+            "wide enough to benefit.",
+            mode,
+            self.__class__.__name__,
+            tp_size,
+            sp_degree,
+            self.cfg_parallel_degree or 1,
+            replica_size,
+        )
 
     def _adjust_offload(self):
         if current_platform.is_cpu():
