@@ -44,6 +44,7 @@ from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.lora.utils import get_default_hidden_dim
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -575,6 +576,32 @@ class LagunaModel(nn.Module):
     def get_input_embeddings(self) -> nn.Embedding:
         return self.embed_tokens
 
+    def get_hidden_dim(self, module_name: str, layer_idx: int) -> Tuple[int, int]:
+        """LoRA input/output dims for a module, honoring Laguna's per-layer
+        attention widths.
+
+        Laguna sizes each layer's attention from
+        ``num_attention_heads_per_layer[layer_idx]`` (see ``LagunaAttention``),
+        so ``config.num_attention_heads`` — a single global value — is wrong for
+        any layer with a different head count. The generic
+        :func:`get_default_hidden_dim` fallback would use that global value and
+        mis-size the ``qkv_proj`` / ``o_proj`` LoRA buffers, crashing at
+        generation with ``sgemm_lora_a.py: assert x.shape[-1] == K``. We
+        override just those two attention projections and delegate every other
+        module (MLP, MoE, embed, lm_head, ...) to the shared helper.
+        """
+        config = self.config
+        head_dim = getattr(
+            config, "head_dim", config.hidden_size // config.num_attention_heads
+        )
+        num_heads = config.num_attention_heads_per_layer[layer_idx]
+        num_kv_heads = config.num_key_value_heads
+        if module_name == "qkv_proj":
+            return config.hidden_size, head_dim * (num_heads + num_kv_heads * 2)
+        elif module_name == "o_proj":
+            return head_dim * num_heads, config.hidden_size
+        return get_default_hidden_dim(module_name, config, layer_idx)
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -704,6 +731,9 @@ class LagunaForCausalLM(nn.Module):
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
+
+    def get_hidden_dim(self, module_name: str, layer_idx: int) -> Tuple[int, int]:
+        return self.model.get_hidden_dim(module_name, layer_idx)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [

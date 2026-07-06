@@ -124,106 +124,115 @@ def get_hidden_dim(
         Please implement the function in the model class if it is not.
         You can reference this function in llama.py.
         """
-        head_dim = getattr(
-            config, "head_dim", config.hidden_size // config.num_attention_heads
+        return get_default_hidden_dim(
+            module_name, config, layer_idx, lora_added_vocab_size
         )
-        if module_name == "qkv_proj":
-            return config.hidden_size, head_dim * (
-                config.num_attention_heads + config.num_key_value_heads * 2
-            )
-        elif module_name == "o_proj":
-            o_head_dim = getattr(config, "v_head_dim", None) or head_dim
-            return (
-                o_head_dim * config.num_attention_heads,
-                config.hidden_size,
-            )
-        elif module_name == "gate_up_proj":
-            inter = config.intermediate_size
-            first_k = getattr(config, "first_k_dense_replace", None)
-            moe_freq = getattr(config, "moe_layer_freq", 1)
-            if (
-                first_k is not None
-                and layer_idx >= first_k
-                and layer_idx % moe_freq == 0
-            ):
-                moe_inter = getattr(config, "moe_intermediate_size", None)
-                n_shared = getattr(config, "n_shared_experts", None)
-                if moe_inter is not None and n_shared is not None:
-                    inter = moe_inter * n_shared
-            return config.hidden_size, inter * 2
-        elif module_name == "down_proj":
-            inter = config.intermediate_size
-            first_k = getattr(config, "first_k_dense_replace", None)
-            moe_freq = getattr(config, "moe_layer_freq", 1)
-            if (
-                first_k is not None
-                and layer_idx >= first_k
-                and layer_idx % moe_freq == 0
-            ):
-                moe_inter = getattr(config, "moe_intermediate_size", None)
-                n_shared = getattr(config, "n_shared_experts", None)
-                if moe_inter is not None and n_shared is not None:
-                    inter = moe_inter * n_shared
-            return inter, config.hidden_size
-        elif module_name == "fused_qkv_a_proj_with_mqa":
-            q_lora_rank = getattr(config, "q_lora_rank", None) or 0
-            kv_lora_rank = config.kv_lora_rank
-            qk_rope_head_dim = config.qk_rope_head_dim
-            return (
-                config.hidden_size,
-                q_lora_rank + kv_lora_rank + qk_rope_head_dim,
-            )
-        elif module_name == "q_b_proj":
+
+
+def get_default_hidden_dim(
+    module_name: str,
+    config: AutoConfig,
+    layer_idx: int,
+    lora_added_vocab_size: int = 0,
+) -> Tuple[int]:
+    """
+    Config-driven LoRA input/output dims for a module, assuming uniform
+    attention geometry across layers.
+
+    This is the fallback used when a model does not define ``get_hidden_dim``.
+    Models with per-layer geometry (e.g. Laguna's per-layer attention head
+    counts) should define ``get_hidden_dim`` on the model class, override the
+    layer-dependent modules there, and delegate the rest back to this helper
+    rather than re-deriving every branch.
+    """
+    head_dim = getattr(
+        config, "head_dim", config.hidden_size // config.num_attention_heads
+    )
+    if module_name == "qkv_proj":
+        return config.hidden_size, head_dim * (
+            config.num_attention_heads + config.num_key_value_heads * 2
+        )
+    elif module_name == "o_proj":
+        o_head_dim = getattr(config, "v_head_dim", None) or head_dim
+        return (
+            o_head_dim * config.num_attention_heads,
+            config.hidden_size,
+        )
+    elif module_name == "gate_up_proj":
+        inter = config.intermediate_size
+        first_k = getattr(config, "first_k_dense_replace", None)
+        moe_freq = getattr(config, "moe_layer_freq", 1)
+        if first_k is not None and layer_idx >= first_k and layer_idx % moe_freq == 0:
+            moe_inter = getattr(config, "moe_intermediate_size", None)
+            n_shared = getattr(config, "n_shared_experts", None)
+            if moe_inter is not None and n_shared is not None:
+                inter = moe_inter * n_shared
+        return config.hidden_size, inter * 2
+    elif module_name == "down_proj":
+        inter = config.intermediate_size
+        first_k = getattr(config, "first_k_dense_replace", None)
+        moe_freq = getattr(config, "moe_layer_freq", 1)
+        if first_k is not None and layer_idx >= first_k and layer_idx % moe_freq == 0:
+            moe_inter = getattr(config, "moe_intermediate_size", None)
+            n_shared = getattr(config, "n_shared_experts", None)
+            if moe_inter is not None and n_shared is not None:
+                inter = moe_inter * n_shared
+        return inter, config.hidden_size
+    elif module_name == "fused_qkv_a_proj_with_mqa":
+        q_lora_rank = getattr(config, "q_lora_rank", None) or 0
+        kv_lora_rank = config.kv_lora_rank
+        qk_rope_head_dim = config.qk_rope_head_dim
+        return (
+            config.hidden_size,
+            q_lora_rank + kv_lora_rank + qk_rope_head_dim,
+        )
+    elif module_name == "q_b_proj":
+        return (
+            config.q_lora_rank,
+            config.num_attention_heads
+            * (config.qk_nope_head_dim + config.qk_rope_head_dim),
+        )
+    elif module_name == "kv_b_proj":
+        return (
+            config.kv_lora_rank,
+            config.num_attention_heads
+            * (config.qk_nope_head_dim + config.v_head_dim),
+        )
+    elif module_name in DSA_INDEXER_LORA_NAMES:
+        from sglang.srt.configs.model_config import (
+            get_dsa_index_head_dim,
+            get_dsa_index_n_heads,
+        )
+
+        if module_name == "indexer.wq_b":
             return (
                 config.q_lora_rank,
-                config.num_attention_heads
-                * (config.qk_nope_head_dim + config.qk_rope_head_dim),
+                get_dsa_index_n_heads(config) * get_dsa_index_head_dim(config),
             )
-        elif module_name == "kv_b_proj":
-            return (
-                config.kv_lora_rank,
-                config.num_attention_heads
-                * (config.qk_nope_head_dim + config.v_head_dim),
-            )
-        elif module_name in DSA_INDEXER_LORA_NAMES:
-            from sglang.srt.configs.model_config import (
-                get_dsa_index_head_dim,
-                get_dsa_index_n_heads,
-            )
-
-            if module_name == "indexer.wq_b":
-                return (
-                    config.q_lora_rank,
-                    get_dsa_index_n_heads(config) * get_dsa_index_head_dim(config),
-                )
-            elif module_name == "indexer.wk":
-                return config.hidden_size, get_dsa_index_head_dim(config)
-            else:  # indexer.weights_proj
-                return config.hidden_size, get_dsa_index_n_heads(config)
-        elif module_name == "gate_up_proj_moe":
-            moe_inter = (
-                getattr(config, "moe_intermediate_size", None)
-                or config.intermediate_size
-            )
-            return config.hidden_size, moe_inter * 2
-        elif module_name == "down_proj_moe":
-            moe_inter = (
-                getattr(config, "moe_intermediate_size", None)
-                or config.intermediate_size
-            )
-            return moe_inter, config.hidden_size
-        elif module_name == "embed_tokens":
-            # For embedding: input is vocab_size (as embedding lookup), output is hidden_size
-            # if contain extra tokens will be added; otherwise is 0.
-            return config.vocab_size + lora_added_vocab_size, config.hidden_size
-        elif module_name == "lm_head":
-            # For lm_head: input is hidden_size, output is vocab_size
-            # if contain extra tokens will be added; otherwise is 0.
-            return config.hidden_size, config.vocab_size + lora_added_vocab_size
-        else:
-            raise NotImplementedError(
-                "get_hidden_dim not implemented for " + module_name
-            )
+        elif module_name == "indexer.wk":
+            return config.hidden_size, get_dsa_index_head_dim(config)
+        else:  # indexer.weights_proj
+            return config.hidden_size, get_dsa_index_n_heads(config)
+    elif module_name == "gate_up_proj_moe":
+        moe_inter = (
+            getattr(config, "moe_intermediate_size", None) or config.intermediate_size
+        )
+        return config.hidden_size, moe_inter * 2
+    elif module_name == "down_proj_moe":
+        moe_inter = (
+            getattr(config, "moe_intermediate_size", None) or config.intermediate_size
+        )
+        return moe_inter, config.hidden_size
+    elif module_name == "embed_tokens":
+        # For embedding: input is vocab_size (as embedding lookup), output is hidden_size
+        # if contain extra tokens will be added; otherwise is 0.
+        return config.vocab_size + lora_added_vocab_size, config.hidden_size
+    elif module_name == "lm_head":
+        # For lm_head: input is hidden_size, output is vocab_size
+        # if contain extra tokens will be added; otherwise is 0.
+        return config.hidden_size, config.vocab_size + lora_added_vocab_size
+    else:
+        raise NotImplementedError("get_hidden_dim not implemented for " + module_name)
 
 
 def get_normalized_target_modules(
