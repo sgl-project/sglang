@@ -38,9 +38,11 @@ def _make_target_verify_batch(bs: int) -> ForwardBatch:
 
 def _filter(batch: ForwardBatch, *, lo: int, hi: int) -> ForwardBatch:
     fake_args = SimpleNamespace(moe_dense_tp_size=None, attention_backend="fa3")
+    from sglang.srt.runtime_context import get_flags
+
     with get_parallel().override(attn_tp_size=1), patch.object(
         tbo, "get_global_server_args", lambda: fake_args
-    ):
+    ), get_flags().attn.override(backend="fa3"):
         return TboForwardBatchPreparer.filter_batch(
             batch,
             start_token_index=lo,
