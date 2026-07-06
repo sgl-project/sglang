@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from sglang.jit_kernel.utils import get_ci_test_range
+from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=45, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -36,15 +37,16 @@ def flashinfer_rmsnorm(
     output: torch.Tensor,
     eps: float = EPS,
 ) -> None:
-    try:
-        from flashinfer.norm import rmsnorm
-    except ImportError:
-        # flashinfer is CUDA-only; on ROCm fall back to a torch reference so
-        # the sglang JIT kernel still gets validated (matches flashinfer math).
+    if is_hip():
+        # flashinfer is CUDA-only; on ROCm use a torch reference so the sglang
+        # JIT kernel still gets validated (matches flashinfer math). The NVIDIA
+        # path below is unchanged.
         x = input.float()
         normed = x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + eps)
         output.copy_((normed * weight.float()).to(output.dtype))
         return
+
+    from flashinfer.norm import rmsnorm
 
     rmsnorm(input, weight, out=output, eps=eps)
 

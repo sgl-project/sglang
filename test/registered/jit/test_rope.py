@@ -5,6 +5,7 @@ import torch
 import triton
 
 from sglang.jit_kernel.utils import get_ci_test_range
+from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=64, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -63,13 +64,13 @@ def flashinfer_rope(
     positions: torch.Tensor,
     is_neox: bool,
 ) -> None:
-    try:
-        from flashinfer.rope import apply_rope_with_cos_sin_cache_inplace
-    except ImportError:
-        # flashinfer is CUDA-only; on ROCm fall back to the torch reference,
-        # which matches its cos/sin-cache application semantics.
+    if is_hip():
+        # flashinfer is CUDA-only; on ROCm use the torch reference, which
+        # matches its cos/sin-cache application semantics. NVIDIA path unchanged.
         torch_impl_rope(q, k, cos_sin_cache, positions, is_neox)
         return
+
+    from flashinfer.rope import apply_rope_with_cos_sin_cache_inplace
 
     head_size = q.shape[-1]
     # flashinfer expects [nnz, num_heads * head_size]
