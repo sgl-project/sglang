@@ -1484,12 +1484,22 @@ class DSparkWorkerV2(BaseSpecWorker):
                 if visible_block_swa_locs
                 else None
             )
+            context_len = max(int(swa_locs.numel()) - int(block_size), 0)
+            context_head_swa = swa_locs[: min(8, context_len)]
+            context_tail_start = max(context_len - 8, 0)
+            context_tail_swa = swa_locs[context_tail_start:context_len]
+            block_swa = swa_locs[-int(block_size) :]
             return {
                 "logical_first_last": [int(start), int(end - 1)],
                 "full_first8": [int(x) for x in full_locs[:8].detach().cpu().tolist()],
                 "full_last8": [int(x) for x in full_locs[-8:].detach().cpu().tolist()],
                 "swa_first8": [int(x) for x in swa_locs[:8].detach().cpu().tolist()],
                 "swa_last8": [int(x) for x in swa_locs[-8:].detach().cpu().tolist()],
+                "context_len": context_len,
+                "context_tail_swa_locs": [
+                    int(x) for x in context_tail_swa.detach().cpu().tolist()
+                ],
+                "block_swa_locs": [int(x) for x in block_swa.detach().cpu().tolist()],
                 "visible_block_swa_locs": visible_block_swa_locs,
                 "boundary_debug": self._boundary_debug_by_req_pool.get(
                     int(req_pool_idx)
@@ -1497,17 +1507,24 @@ class DSparkWorkerV2(BaseSpecWorker):
                 "target_aux_debug": self._target_aux_debug_by_req_pool.get(
                     int(req_pool_idx)
                 ),
-                "context_kv_checksums": [
+                "context_head_kv_checksums": [
                     self._checksum_swa_kv_rows(
                         layer_id=layer_id,
-                        swa_locs=swa_locs[: min(8, max(int(swa_locs.numel()) - int(block_size), 0))],
+                        swa_locs=context_head_swa,
+                    )
+                    for layer_id in layer_ids
+                ],
+                "context_tail_kv_checksums": [
+                    self._checksum_swa_kv_rows(
+                        layer_id=layer_id,
+                        swa_locs=context_tail_swa,
                     )
                     for layer_id in layer_ids
                 ],
                 "block_kv_checksums": [
                     self._checksum_swa_kv_rows(
                         layer_id=layer_id,
-                        swa_locs=swa_locs[-int(block_size) :],
+                        swa_locs=block_swa,
                     )
                     for layer_id in layer_ids
                 ],
