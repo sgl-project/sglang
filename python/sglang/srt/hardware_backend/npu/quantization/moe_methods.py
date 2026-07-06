@@ -322,8 +322,8 @@ class NPUW4A4Mxfp4MoEMethod(_NPUMoEMethodBase):
             "per_token_scale": [pertoken_scale],
             "scale_dtype": torch.float8_e8m0fnu,
             "per_token_scale_dtype": torch.float8_e8m0fnu,
-            "x_dtype" = torch_npu.float4_e2m1fn_x2,
-            "weight_dtype" = torch_npu.float4_e2m1fn_x2,
+            "x_dtype": torch_npu.float4_e2m1fn_x2,
+            "weight_dtype": torch_npu.float4_e2m1fn_x2,
         }
 
         return self.matmul.forward(
