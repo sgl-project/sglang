@@ -28,12 +28,17 @@ from sglang.srt.model_executor.runner import (
     get_batch_sizes_to_capture,
     model_capture_mode,
 )
+from sglang.srt.model_executor.runner.flashinfer_autotune import (
+    maybe_flashinfer_autotune_speculative_draft,
+)
 from sglang.srt.model_executor.runner_backend.utils import resolve_decode_backend
 from sglang.srt.model_executor.runner_backend_utils import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
 )
+from sglang.srt.runtime_context import get_flags
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.speculative.eagle_info import EagleDraftInput
+from sglang.srt.speculative.eagle_utils import get_draft_recurrent_hidden_state_spec
 from sglang.srt.utils import (
     require_attn_tp_gather,
     require_gathered_buffer,
@@ -103,7 +108,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         self.tp_size = model_runner.tp_size
         self.dp_size = model_runner.dp_size
         self.pp_size = model_runner.server_args.pp_size
-        self.enable_torch_compile = model_runner.server_args.enable_torch_compile
+        self.enable_torch_compile = get_flags().capture.enable_torch_compile
         self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
         self.require_gathered_buffer = require_gathered_buffer(model_runner.server_args)
         self.require_mlp_tp_gather = require_mlp_tp_gather(model_runner.server_args)
@@ -187,11 +192,13 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
                 if self.model_runner.server_args.speculative_use_rejection_sampling
                 else None
             )
-            _hidden_size = EagleDraftInput.hidden_size_for(self.eagle_worker)
+            _hidden_size, _hidden_dtype = get_draft_recurrent_hidden_state_spec(
+                model_runner
+            )
             hidden_states = (
                 torch.zeros(
                     (self.max_bs, _hidden_size),
-                    dtype=EagleDraftInput.dtype_for(self.eagle_worker),
+                    dtype=_hidden_dtype,
                 )
                 if _hidden_size is not None
                 else None
@@ -437,13 +444,20 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             forward_batch.mark_forward_metadata_ready()
             self.deepep_adapter.capture(is_extend_in_batch=False)
             shape_key = self._make_graph_key(num_seqs)
+            post_warmup_hook = getattr(
+                self.draft_attn_backend, "on_after_cuda_graph_warmup", None
+            )
+            maybe_flashinfer_autotune_speculative_draft(
+                self,
+                run_once,
+                post_warmup_hook=post_warmup_hook,
+                skip_logits=False,
+            )
             self.backend.capture_one(
                 shape_key,
                 run_once,
                 dummies=None,
-                post_warmup_hook=getattr(
-                    self.draft_attn_backend, "on_after_cuda_graph_warmup", None
-                ),
+                post_warmup_hook=post_warmup_hook,
             )
 
     def _postprocess_output_to_raw_bs(self, out, raw_bs):
