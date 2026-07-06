@@ -907,6 +907,12 @@ def embed_mm_inputs(
     # 4. scatter embeddings into input embedding
     # masked_scatter_ avoids the cudaStreamSynchronize that torch.where triggers.
     def _scatter(dest, mask, src):
+        if _is_npu:
+            src = src.to(dest.device, dest.dtype)
+            row_indices = torch.nonzero(mask.squeeze(-1), as_tuple=False).flatten()
+            if row_indices.numel() == src.shape[0]:
+                dest.index_copy_(0, row_indices, src)
+                return
         dest.masked_scatter_(mask.expand_as(dest), src.to(dest.device, dest.dtype))
 
     for i, modality, embedding, mask in zip(
