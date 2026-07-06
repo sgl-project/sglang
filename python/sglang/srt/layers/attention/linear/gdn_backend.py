@@ -338,11 +338,17 @@ if _HAVE_TRITON:
         if W == CS:
             glast = tl.sum(tl.where(r == (CS - 1), gcum, 0.0), 0)
             kdec = kn * libdevice.exp(glast - gcum)[:, None]
-            # ieee (not SPREC): must bit-match _chunk_scan_kernel's boundary fold, and tf32's MMA
-            # tiling drifts ~1 ULP between the two kernels. See the scan kernel's fold comment.
-            upd = tl.where(bar, tl.dot(tl.trans(kdec), vnew_full, input_precision="ieee"), 0.0)
+            # Fixed token-order rank-1 accumulation (NOT tl.dot): must bit-match _chunk_scan_kernel's
+            # boundary fold. A tl.dot tiles the [Dk,Dv] output differently between the two separately
+            # compiled kernels and drifts ~1 fp32 ULP under any precision; the unrolled outer-product
+            # sum has one accumulation order in both. See the scan kernel's fold comment.
+            upd = tl.zeros([Dk, Dv], tl.float32)
+            for c in range(CS):
+                kc = tl.sum(tl.where(r[:, None] == c, kdec, 0.0), 0)  # [Dk] row c
+                vc = tl.sum(tl.where(r[:, None] == c, vnew_full, 0.0), 0)  # [Dv] row c
+                upd += kc[:, None] * vc[None, :]
             sc = tl.where(bar, S * libdevice.exp(glast), 0.0)  # round before add (matches scan)
-            Snew = sc + upd
+            Snew = sc + tl.where(bar, upd, 0.0)
             tl.store(S_ptr + (ar * HV + h) * Dk * Dv + dk[:, None] * Dv + dv[None, :], Snew)
             tl.store(inext_ptr + ar, 0)
         else:
@@ -414,15 +420,22 @@ if _HAVE_TRITON:
             # state update: S = S*exp(glast) + (k * exp(glast-gcum))^T @ v_new
             glast = tl.sum(tl.where(r == C - 1, gc, 0.0), 0)  # gcum[C-1], single-lane collapse
             kdec = k * libdevice.exp(glast - gc)[:, None]  # [C,Dk]
-            # The boundary fold contracts all C rows into the recurrent state. ieee (fixed FMA
-            # reduction order) is bit-reproducible across the two separately-compiled scan/step
-            # kernels; tf32's tensor-core MMA tiling drifts ~1 fp32 ULP between them under their
-            # different register pressure, which would slowly desync the decode-replay state from
-            # prefill across multi-chunk decode. This is one dot per chunk, not the per-token hot
-            # path, so ieee here costs little. The per-token core dots stay PREC (tf32).
-            upd = tl.where(bar, tl.dot(tl.trans(kdec), vnew, input_precision="ieee"), 0.0)
+            # The boundary fold contracts all C rows into the recurrent state. A tl.dot here drifts
+            # ~1 fp32 ULP between the two separately-compiled scan/step kernels (the [Dk,Dv] output
+            # is MMA-tiled differently under their different register pressure -- true under ieee AND
+            # tf32) which slowly desyncs the decode-replay state from prefill across multi-chunk
+            # decode and compounds over layers. Fold instead as a fixed token-order rank-1
+            # accumulation: a c=0..C-1 unrolled sum of outer products has one accumulation order
+            # baked identically into both kernels (the row-select tl.sum is single-lane, so
+            # num_warps- and tile-invariant), so decode==prefill EXACTLY. One fold per chunk, off the
+            # per-token hot path.
+            upd = tl.zeros([Dk, Dv], tl.float32)
+            for c in range(C):
+                kc = tl.sum(tl.where(r[:, None] == c, kdec, 0.0), 0)  # [Dk] row c
+                vc = tl.sum(tl.where(r[:, None] == c, vnew, 0.0), 0)  # [Dv] row c
+                upd += kc[:, None] * vc[None, :]
             sc = tl.where(bar, S * libdevice.exp(glast), 0.0)  # round before add (else FMA drift)
-            S = sc + upd
+            S = sc + tl.where(bar, upd, 0.0)
             if i == bchunk:  # snapshot state entering the trailing partial chunk (n_seq==1 boundary)
                 tl.store(bnd_ptr + s_off + dk[:, None] * Dv + dv[None, :], S)
         tl.store(last_ptr + s_off + dk[:, None] * Dv + dv[None, :], S)

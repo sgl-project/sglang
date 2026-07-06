@@ -253,18 +253,15 @@ class TestGDNChunkReplayDecode(unittest.TestCase):
                         msg=f"HV={HV} w={w} incremental replay not FP32-identical to torch_chunk",
                     )
                     if commit:
-                        # The commit folded Snew into the arena boundary row. The fold
-                        # (kdec^T @ vnew, a K=64 reduction) runs in _gdn_step_kernel here vs
-                        # _chunk_scan_kernel in prefill; those two separately-compiled kernels
-                        # schedule the SAME reduction ~1 fp32 ULP apart (precision-independent:
-                        # the gap persists under full ieee, so it is a compiled-code artifact, not
-                        # a tf32 issue). It does not accumulate to any bf16 output -- decode over
-                        # 6+ folds stays bf16-identical to full-sequence prefill (guarded by
-                        # test_bit_identical_to_full_sequence). The per-token core above is the
-                        # tight fp32 guard; the boundary state need only match to 1 fp32 ULP.
-                        self.assertLess(
-                            (arena["boundary"][ar] - snew_fp32).abs().max().item(), 1e-7,
-                            msg=f"HV={HV} w={w} incremental boundary Snew off > 1 fp32 ULP",
+                        # The commit folded Snew into the arena boundary row. The fold runs in
+                        # _gdn_step_kernel here vs _chunk_scan_kernel in prefill; both fold as a
+                        # fixed token-order rank-1 accumulation (NOT tl.dot -- a dot MMA-tiles the
+                        # [Dk,Dv] output differently between the two separately-compiled kernels and
+                        # drifted ~1 fp32 ULP per fold, compounding across chunks/layers), so the
+                        # boundary state is now bit-identical to prefill.
+                        self.assertTrue(
+                            torch.equal(arena["boundary"][ar], snew_fp32),
+                            msg=f"HV={HV} w={w} incremental boundary Snew not fp32-identical",
                         )
 
     def _prep_fp32(self, qh, kh, vh, a, b, A_log, dt_bias):
