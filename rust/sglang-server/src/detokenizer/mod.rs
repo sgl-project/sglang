@@ -20,9 +20,9 @@ use std::collections::HashMap;
 use crate::error::Error;
 use crate::fsm::{Event, RequestState};
 use crate::ids::RequestId;
-use crate::message::{ChunkEvent, EgressItem, EgressSink, GenerationOutput};
+use crate::message::{ChunkEvent, EgressItem, EgressSink, GenerationOutput, SinkError};
 use crate::runtime::Runnable;
-use crate::runtime::channels::DetokMsg;
+use crate::runtime::channels::{DetokMsg, TmEvent};
 
 /// Default for `skip_special_tokens` (SGLang's SamplingParams default). The
 /// per-request value isn't available on the egress side yet; see the note in
@@ -128,11 +128,24 @@ pub struct DetokenizerWorker {
     shard: usize,
     rx: flume::Receiver<DetokMsg>,
     backend: DetokenizerBackend,
+    /// TokenizerManager inbox, used to abort a request the shard had to drop
+    /// (client backpressure/disconnect) so the scheduler stops generating for it.
+    tm: flume::Sender<TmEvent>,
 }
 
 impl DetokenizerWorker {
-    pub fn new(shard: usize, rx: flume::Receiver<DetokMsg>, backend: DetokenizerBackend) -> Self {
-        Self { shard, rx, backend }
+    pub fn new(
+        shard: usize,
+        rx: flume::Receiver<DetokMsg>,
+        backend: DetokenizerBackend,
+        tm: flume::Sender<TmEvent>,
+    ) -> Self {
+        Self {
+            shard,
+            rx,
+            backend,
+            tm,
+        }
     }
 }
 
@@ -159,7 +172,7 @@ impl Runnable for DetokenizerWorker {
                         },
                     );
                 }
-                DetokMsg::Chunk(ev) => handle_chunk(&mut table, ev, &self.backend),
+                DetokMsg::Chunk(ev) => handle_chunk(&mut table, ev, &self.backend, &self.tm),
                 DetokMsg::Result { id, payload } => handle_result(&mut table, id, payload),
                 DetokMsg::Fail { id, message } => handle_fail(&mut table, id, message),
                 DetokMsg::Deregister { id } => {
@@ -196,6 +209,7 @@ fn handle_chunk(
     table: &mut HashMap<RequestId, DetokState>,
     mut ev: ChunkEvent,
     backend: &DetokenizerBackend,
+    tm: &flume::Sender<TmEvent>,
 ) {
     let id = match ev.rid.parse::<u64>() {
         Ok(v) => RequestId(v),
@@ -304,13 +318,73 @@ fn handle_chunk(
         });
         table.remove(&id);
     } else {
-        // Every intermediate chunk emits its delta frame (fully-delta egress; the
-        // egress shards exist to carry exactly this per-token fan-out at high
-        // concurrency). A failed send == client gone.
-        if st.sink.try_send(EgressItem::Frame(output)).is_err() {
+        // Every intermediate chunk emits its delta frame. A failed send means the
+        // client can't receive it — `Closed` (gone) or `Full` (backpressure: not
+        // reading fast enough). Either way we can't buffer unboundedly, and
+        // silently dropping the frame would truncate the response and still look
+        // like success at EOS. So treat both as terminal: drop the request AND
+        // abort scheduler work for it.
+        if let Err(e) = st.sink.try_send(EgressItem::Frame(output)) {
+            match e {
+                SinkError::Full => {
+                    tracing::warn!(
+                        rid = id.0,
+                        "detok: sink full; aborting (client backpressure)"
+                    )
+                }
+                SinkError::Closed => {
+                    tracing::debug!(rid = id.0, "detok: sink closed; aborting (client gone)")
+                }
+            }
             let _ = st.fsm.apply(Event::Disconnect);
             table.remove(&id);
-            // TODO(abort): signal the scheduler to abort this rid.
+            // Best-effort: stop the scheduler generating for a request no client
+            // can receive. A full/closed tm inbox just drops it (shutdown).
+            let _ = tm.try_send(TmEvent::Abort(id));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::mpsc;
+
+    /// A non-terminal chunk that can't be delivered (sink full → client
+    /// backpressure) drops the request AND aborts scheduler work — it does not
+    /// silently keep state, which would later read as a clean completion at EOS.
+    #[test]
+    fn full_sink_drops_request_and_aborts_scheduler() {
+        // Capacity-1 sink, pre-filled so the next send hits `Full`.
+        let (tx, _rx) = mpsc::channel::<EgressItem>(1);
+        tx.try_send(EgressItem::Frame(GenerationOutput::default()))
+            .unwrap();
+
+        let mut table = HashMap::new();
+        table.insert(
+            RequestId(1),
+            DetokState {
+                sink: EgressSink::Local(tx),
+                decode_logprob_text: false,
+                decoder: None,
+                fsm: RequestState::Queued,
+            },
+        );
+
+        let (tm_tx, tm_rx) = flume::unbounded::<TmEvent>();
+        let ev = ChunkEvent {
+            rid: "1".into(),
+            token_ids: vec![5],
+            ..Default::default() // finish_reason None → non-terminal
+        };
+        handle_chunk(&mut table, ev, &DetokenizerBackend::Skip, &tm_tx);
+
+        // Request removed (no lingering state to be mistaken for success)...
+        assert!(table.get(&RequestId(1)).is_none());
+        // ...and the scheduler was told to abort it.
+        assert!(matches!(
+            tm_rx.try_recv(),
+            Ok(TmEvent::Abort(id)) if id == RequestId(1)
+        ));
     }
 }
