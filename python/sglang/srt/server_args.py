@@ -319,8 +319,10 @@ def add_load_format_choices(choices):
 def add_quantization_method_choices(choices):
     QUANTIZATION_CHOICES.extend(choices)
 
+
 def add_online_quantization_method_choices(choices):
     ONLINE_QUANTIZATION_CHOICES.extend(choices)
+
 
 def add_attention_backend_choices(choices):
     ATTENTION_BACKEND_CHOICES.extend(choices)

@@ -685,7 +685,9 @@ class NPUUnquantMoEMethod(_NPUMoEMethodBase):
         self._validate_weight_prefix(layer, weight_prefix)
         weight_name = f"{weight_prefix}_weight"
 
-        online_quant = get_global_server_args().online_quantization      # set by server_args
+        online_quant = (
+            get_global_server_args().online_quantization
+        )  # set by server_args
 
         if online_quant == "w8a8_int8":
             self._apply_online_w8a8(layer, weight_prefix, weight_name)
@@ -694,8 +696,9 @@ class NPUUnquantMoEMethod(_NPUMoEMethodBase):
             # Pure BF16
             weight = getattr(layer, weight_name)
             formatted = npu_format_cast(weight.data)
-            layer.__setattr__(weight_name,
-                              torch.nn.Parameter(formatted, requires_grad=False))
+            layer.__setattr__(
+                weight_name, torch.nn.Parameter(formatted, requires_grad=False)
+            )
             setattr(self, weight_name, formatted)
             self._quant_mode = "bf16"
             if weight_prefix == "w13":
@@ -708,8 +711,10 @@ class NPUUnquantMoEMethod(_NPUMoEMethodBase):
         qw_npu = npu_format_cast(qw.transpose(-2, -1))
 
         setattr(layer, weight_name, torch.nn.Parameter(qw_npu, requires_grad=False))
-        layer.register_parameter(f"{weight_name}_scale",
-                                 torch.nn.Parameter(weight_scale, requires_grad=False))
+        layer.register_parameter(
+            f"{weight_name}_scale",
+            torch.nn.Parameter(weight_scale, requires_grad=False),
+        )
         setattr(self, weight_name, qw_npu)
         setattr(self, f"{weight_name}_scale", weight_scale)
         torch.npu.empty_cache()
@@ -732,8 +737,8 @@ class NPUUnquantMoEMethod(_NPUMoEMethodBase):
         weight_prefix: str,
         group_list_type: int,
     ) -> torch.Tensor:
-        
-        scale_args={}
+
+        scale_args = {}
         weight_scale = getattr(self, f"{weight_prefix}_weight_scale", None)
         if weight_scale is None:
             scale_args = {"scale": [weight_scale]}
