@@ -132,12 +132,29 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.draft_model = self.draft_model_runner.model
         self._draft_inner = self.draft_model.model
 
-        self.draft_model.model.embed_tokens.weight = (
-            self.target_worker.model_runner.model.model.embed_tokens.weight
+        has_own_embed_tokens = bool(
+            getattr(self.draft_model, "has_own_embed_tokens", False)
         )
-        self.draft_model.lm_head.weight = (
-            self.target_worker.model_runner.model.lm_head.weight
-        )
+        has_own_lm_head = bool(getattr(self.draft_model, "has_own_lm_head", False))
+        shared_embed_tokens = not has_own_embed_tokens
+        shared_lm_head = not has_own_lm_head
+        if shared_embed_tokens:
+            self.draft_model.model.embed_tokens.weight = (
+                self.target_worker.model_runner.model.model.embed_tokens.weight
+            )
+        if shared_lm_head:
+            self.draft_model.lm_head.weight = (
+                self.target_worker.model_runner.model.lm_head.weight
+            )
+        if self._is_tp0():
+            logger.warning(
+                "DSpark draft embed/head sharing: has_own_embed_tokens=%s "
+                "has_own_lm_head=%s shared_embed_tokens=%s shared_lm_head=%s",
+                has_own_embed_tokens,
+                has_own_lm_head,
+                shared_embed_tokens,
+                shared_lm_head,
+            )
 
         requested_block_size = int(server_args.speculative_num_draft_tokens)
         model_block_size = int(

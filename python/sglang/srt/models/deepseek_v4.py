@@ -2193,6 +2193,10 @@ class DeepseekV4ForCausalLM(nn.Module):
                     return "model." + rest
                 if rest.startswith("head."):
                     return rest.replace("head.", "lm_head.", 1)
+                if rest.startswith("lm_head."):
+                    return rest
+                if rest.startswith("shared_head.head."):
+                    return rest.replace("shared_head.head.", "lm_head.", 1)
                 if rest.startswith(("markov_head", "confidence_head")):
                     return "model." + rest
                 if rest == "norm.weight":

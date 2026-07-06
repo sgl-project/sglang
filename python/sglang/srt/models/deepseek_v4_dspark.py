@@ -268,6 +268,8 @@ class DeepseekV4ForCausalLMDSpark(DeepseekV4ForCausalLM):
             use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
+        self.has_own_embed_tokens = False
+        self.has_own_lm_head = False
 
     @property
     def block_size(self) -> int:
@@ -290,6 +292,24 @@ class DeepseekV4ForCausalLMDSpark(DeepseekV4ForCausalLM):
         return self.model(input_ids, positions, forward_batch)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        weights = list(weights)
+        self.has_own_embed_tokens = any(
+            name.startswith("mtp.")
+            and (
+                ".emb.tok_emb." in name
+                or ".embed_tokens." in name
+            )
+            for name, _ in weights
+        )
+        self.has_own_lm_head = any(
+            name.startswith("mtp.")
+            and (
+                ".head." in name
+                or ".lm_head." in name
+                or ".shared_head.head." in name
+            )
+            for name, _ in weights
+        )
         super().load_weights(weights, is_nextn=False, is_dspark=True)
 
     def post_load_weights(self, is_nextn=False, is_dspark=False, weight_names=None):
