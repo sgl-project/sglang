@@ -255,10 +255,30 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._init_fp8_wqkv_stack()
 
         if self._is_tp0():
+            config = getattr(self._draft_inner, "config", None)
+            target_layer_ids = [
+                int(x) for x in list(getattr(self._draft_inner, "target_layer_ids", []))
+            ]
+            decoder_layer_ids = [x - 1 for x in target_layer_ids]
+            compress_ratios = list(getattr(config, "compress_ratios", []) or [])
+            draft_config_compress_ratios = compress_ratios[
+                int(getattr(config, "num_hidden_layers", 0)) :
+            ]
+            draft_runtime_compress_ratios = [
+                int(getattr(layer.self_attn, "compress_ratio", -1))
+                for layer in self._draft_inner.layers
+            ]
+            markov_head = self._draft_inner.markov_head
+            markov_w1_shape = tuple(markov_head.markov_w1.weight.shape)
+            markov_w2_shape = tuple(markov_head.markov_w2.weight.shape)
             logger.info(
                 "Initialized DSpark draft runner. model=%s, block_size=%s, "
                 "num_dspark_layers=%s, noise_token_id=%s, markov_rank=%s, "
-                "confidence_threshold=%s, use_confidence_gate=%s",
+                "confidence_threshold=%s, use_confidence_gate=%s, "
+                "target_layer_ids=%s, decoder_layer_ids=%s, "
+                "draft_config_compress_ratios=%s, "
+                "draft_runtime_compress_ratios=%s, "
+                "markov_w1_shape=%s, markov_w2_shape=%s",
                 self.draft_model.__class__.__name__,
                 self.block_size,
                 self.num_dspark_layers,
@@ -266,6 +286,12 @@ class DSparkWorkerV2(BaseSpecWorker):
                 self.markov_rank,
                 self.confidence_threshold,
                 self._use_confidence_gate,
+                target_layer_ids,
+                decoder_layer_ids,
+                draft_config_compress_ratios,
+                draft_runtime_compress_ratios,
+                markov_w1_shape,
+                markov_w2_shape,
             )
 
     def _is_tp0(self) -> bool:
