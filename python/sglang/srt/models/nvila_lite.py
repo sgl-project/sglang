@@ -168,6 +168,18 @@ class NVILALiteForConditionalGeneration(nn.Module):
             if name.startswith("llm."):
                 self.llm.load_weights([(name[len("llm.") :], loaded_weight)])
             else:
+                # Newer transformers flattened SiglipVisionModel, dropping the
+                # `vision_model` submodule, so the checkpoint's
+                # `vision_tower.vision_model.*` names no longer match the
+                # module's `vision_tower.*` params. Strip the infix when the
+                # original name is absent but the stripped one exists — a no-op
+                # on transformers versions that still nest `vision_model`.
+                if name not in params_dict:
+                    stripped = name.replace(
+                        "vision_tower.vision_model.", "vision_tower.", 1
+                    )
+                    if stripped in params_dict:
+                        name = stripped
                 param = params_dict[name]
                 weight_loader = getattr(
                     param, "weight_loader", weight_utils.default_weight_loader
