@@ -195,6 +195,27 @@ def capture_prefill_graph(
         logger.warning("Disable prefill CUDA graph because the capture size is not set")
         return None
 
+    prefill_backend = model_runner.server_args.cuda_graph_config.prefill.backend
+    context_length = model_runner.model_config.context_len
+    max_capture_tokens = (
+        model_runner.req_to_token_pool.size * context_length
+        if prefill_backend == Backend.TC_PIECEWISE
+        else context_length
+    )
+    capture_num_tokens = sorted(
+        num_tokens
+        for num_tokens in model_runner.server_args.cuda_graph_config.prefill.bs
+        if num_tokens <= max_capture_tokens
+    )
+    if not capture_num_tokens:
+        logger.warning(
+            "Disable prefill CUDA graph capture because no configured "
+            "capture size fits context_length=%s and request-pool size=%s.",
+            context_length,
+            model_runner.req_to_token_pool.size,
+        )
+        return eager_runner
+
     # Collect attention layers and moe layers from the model. Keep a VLM
     # wrapper that exposes ``language_model`` unchanged: assigning it to
     # ``model`` would register a duplicate module alias and duplicate the
@@ -235,7 +256,6 @@ def capture_prefill_graph(
 
     tic = time.perf_counter()
     before_mem = get_available_gpu_memory(model_runner.device, model_runner.gpu_id)
-    prefill_backend = model_runner.server_args.cuda_graph_config.prefill.backend
     if should_skip_auto_prefill_cuda_graph_for_memory(
         before_mem,
         getattr(model_runner.server_args, "_cuda_graph_config_locked", set()),
@@ -252,7 +272,6 @@ def capture_prefill_graph(
 
     role = "draft" if model_runner.is_draft_worker else "target"
     capture_name = f"{role} prefill"
-    capture_num_tokens = sorted(model_runner.server_args.cuda_graph_config.prefill.bs)
     logger.info(
         f"Capture {capture_name} CUDA graph begin. "
         f"backend={prefill_backend}, num_tokens={capture_num_tokens}, "
