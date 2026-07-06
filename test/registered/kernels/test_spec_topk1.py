@@ -64,7 +64,9 @@ class TestSpecTopk1Triton(CustomTestCase):
                 torch.testing.assert_close(topk_index, expected_index, rtol=0, atol=0)
                 torch.testing.assert_close(
                     topk_p,
-                    torch.ones((batch_size, 1), dtype=torch.float32, device=self.device),
+                    torch.ones(
+                        (batch_size, 1), dtype=torch.float32, device=self.device
+                    ),
                     rtol=0,
                     atol=0,
                 )
@@ -74,7 +76,8 @@ class TestSpecTopk1Triton(CustomTestCase):
 
     def test_draft_topk1_postprocess_can_write_draft_token_column(self):
         batch_size = 17
-        vocab_size = 4097
+        # Multi-split vocab so the fused write composes with the split reduction.
+        vocab_size = 50000
         logits, expected_index = _make_logits_with_unique_argmax(
             batch_size,
             vocab_size,
@@ -83,9 +86,7 @@ class TestSpecTopk1Triton(CustomTestCase):
             seed=0,
         )
         positions = torch.zeros(batch_size, dtype=torch.long, device=self.device)
-        backing = torch.full(
-            (batch_size, 5), -1, dtype=torch.long, device=self.device
-        )
+        backing = torch.full((batch_size, 5), -1, dtype=torch.long, device=self.device)
         draft_tokens = backing[:, 1:4]
 
         topk_p, topk_index = draft_topk1_postprocess(
@@ -94,14 +95,43 @@ class TestSpecTopk1Triton(CustomTestCase):
 
         torch.testing.assert_close(topk_index, expected_index, rtol=0, atol=0)
         torch.testing.assert_close(topk_p, torch.ones_like(topk_p), rtol=0, atol=0)
+        # Exactly one backing column is written; both neighbors stay untouched.
+        expected_backing = torch.full_like(backing, -1)
+        expected_backing[:, 3] = expected_index[:, 0]
+        torch.testing.assert_close(backing, expected_backing, rtol=0, atol=0)
         torch.testing.assert_close(
-            draft_tokens[:, 2], expected_index[:, 0], rtol=0, atol=0
+            positions, torch.ones_like(positions), rtol=0, atol=0
         )
+
+    def test_row_strided_logits_view_matches_argmax(self):
+        batch_size = 5
+        vocab_size = 8193
+        # Poison the padding columns: if the kernel used the dense vocab width
+        # as the row stride it would read them and pick the wrong index.
+        backing = torch.full(
+            (batch_size, vocab_size + 64),
+            2000.0,
+            dtype=torch.float32,
+            device=self.device,
+        )
+        logits, expected_index = _make_logits_with_unique_argmax(
+            batch_size,
+            vocab_size,
+            dtype=torch.float32,
+            device=self.device,
+            seed=1,
+        )
+        backing[:, :vocab_size] = logits
+        strided_logits = backing[:, :vocab_size]
+        self.assertFalse(strided_logits.is_contiguous())
+        positions = torch.zeros(batch_size, dtype=torch.long, device=self.device)
+
+        topk_p, topk_index = draft_topk1_postprocess(strided_logits, positions)
+
+        torch.testing.assert_close(topk_index, expected_index, rtol=0, atol=0)
+        torch.testing.assert_close(topk_p, torch.ones_like(topk_p), rtol=0, atol=0)
         torch.testing.assert_close(
-            draft_tokens[:, :2],
-            torch.full_like(draft_tokens[:, :2], -1),
-            rtol=0,
-            atol=0,
+            positions, torch.ones_like(positions), rtol=0, atol=0
         )
 
     def test_empty_batch(self):
@@ -122,7 +152,9 @@ class TestSpecTopk1Triton(CustomTestCase):
         positions = torch.arange(8, dtype=torch.long, device=self.device)[::2]
 
         with self.assertRaises(AssertionError):
-            draft_topk1_postprocess(logits, torch.empty(4, dtype=torch.long, device=self.device))
+            draft_topk1_postprocess(
+                logits, torch.empty(4, dtype=torch.long, device=self.device)
+            )
         with self.assertRaises(AssertionError):
             draft_topk1_postprocess(torch.empty((4, 16), device=self.device), positions)
 

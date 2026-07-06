@@ -89,6 +89,7 @@ from sglang.srt.speculative.spec_utils import (
     spec_stage_span,
 )
 from sglang.srt.speculative.triton_ops.eagle import fill_bonus_tokens
+from sglang.srt.speculative.triton_ops.topk1 import draft_topk1_postprocess
 from sglang.srt.utils.async_probe import (
     maybe_detect_inf,
     maybe_detect_nan,
@@ -113,9 +114,6 @@ _is_cuda = is_cuda()
 _is_musa = is_musa()
 _is_hip = is_hip()
 _is_xpu = is_xpu()
-
-if _is_cuda:
-    from sglang.srt.speculative.triton_ops.topk1 import draft_topk1_postprocess
 
 logger = logging.getLogger(__name__)
 
@@ -642,6 +640,15 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 device=topk_index.device,
             )
             draft_tokens_topk1[:, :1].copy_(topk_index)
+        # On the CUDA argmax branch the finalize kernel stores the token column
+        # itself; every other branch stores the post-hot-map index with a plain
+        # column copy after sampling.
+        fuse_topk1_token_store = (
+            draft_tokens_topk1 is not None
+            and _is_cuda
+            and self.hot_token_id is None
+            and not self.server_args.speculative_use_rejection_sampling
+        )
 
         # Forward multiple steps
         scores = None
@@ -694,7 +701,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 logits_output = self.draft_runner.forward(forward_batch).logits_output
             maybe_detect_nan(logits_output.next_token_logits, f"draft_forward step {i}")
             maybe_detect_inf(logits_output.next_token_logits, f"draft_forward step {i}")
-            draft_token_stored = False
             if self.server_args.speculative_use_rejection_sampling:
                 probs = renorm_draft_probs(
                     logits_output.next_token_logits,
@@ -706,19 +712,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 forward_batch.positions.add_(1)
             elif self.topk == 1 and not _is_hip:
                 if _is_cuda:
-                    draft_token_output = (
-                        draft_tokens_topk1
-                        if draft_tokens_topk1 is not None
-                        and self.hot_token_id is None
-                        else None
-                    )
+                    # The positions advance is fused into the kernel.
                     topk_p, topk_index = draft_topk1_postprocess(
                         logits_output.next_token_logits,
                         forward_batch.positions,
-                        draft_token_output,
+                        draft_tokens_topk1 if fuse_topk1_token_store else None,
                         i + 1,
                     )
-                    draft_token_stored = draft_token_output is not None
                 else:
                     topk_index = torch.argmax(
                         logits_output.next_token_logits, dim=-1, keepdim=True
@@ -741,7 +741,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             )
             if self.hot_token_id is not None:
                 topk_index = self.hot_token_id[topk_index]
-            if draft_tokens_topk1 is not None and not draft_token_stored:
+            if draft_tokens_topk1 is not None and not fuse_topk1_token_store:
                 draft_tokens_topk1[:, i + 1 : i + 2].copy_(topk_index)
             hidden_states = logits_output.hidden_states
 

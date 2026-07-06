@@ -4,7 +4,6 @@ import torch
 import triton
 import triton.language as tl
 
-
 _DRAFT_TOPK1_BLOCK = 8192
 
 
@@ -13,16 +12,18 @@ def _draft_topk1_partial_argmax_kernel(
     logits,
     partial_vals,
     partial_indices,
+    logits_row_stride,
     vocab_size: tl.constexpr,
     num_splits: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    row = tl.program_id(0)
+    # int64 row base: row * stride overflows int32 once bs * vocab reaches 2^31.
+    row = tl.program_id(0).to(tl.int64)
     split = tl.program_id(1)
     offsets = split * BLOCK + tl.arange(0, BLOCK)
     mask = offsets < vocab_size
     vals = tl.load(
-        logits + row * vocab_size + offsets,
+        logits + row * logits_row_stride + offsets,
         mask=mask,
         other=-float("inf"),
     ).to(tl.float32)
@@ -79,11 +80,18 @@ def draft_topk1_postprocess(
     PyTorch eager argmax reduces each row with too little parallelism for the
     GLM/DSV4 vocab widths in CUDA graph replay. This split reduction exposes
     the vocab dimension across CTAs, then finalizes one token per row.
+
+    If ``draft_tokens`` is given, the finalize kernel also stores the argmax
+    into ``draft_tokens[:, draft_token_column]``, mutating the caller-owned
+    buffer in place. ``topk_p`` is returned as constant 1.0: topk=1 drafting
+    is greedy and the chain probabilities are unused downstream.
     """
     assert next_token_logits.ndim == 2
-    assert next_token_logits.is_contiguous()
+    assert next_token_logits.stride(1) == 1
     assert positions.ndim == 1
     assert positions.is_contiguous()
+    assert positions.shape[0] == next_token_logits.shape[0]
+    assert positions.device == next_token_logits.device
     write_draft_token = draft_tokens is not None
     if write_draft_token:
         assert draft_tokens.ndim == 2
@@ -95,7 +103,9 @@ def draft_topk1_postprocess(
 
     bs, vocab_size = next_token_logits.shape
     topk_p = torch.empty((bs, 1), dtype=torch.float32, device=next_token_logits.device)
-    topk_index = torch.empty((bs, 1), dtype=torch.int64, device=next_token_logits.device)
+    topk_index = torch.empty(
+        (bs, 1), dtype=torch.int64, device=next_token_logits.device
+    )
     if bs == 0:
         return topk_p, topk_index
 
@@ -112,11 +122,15 @@ def draft_topk1_postprocess(
         next_token_logits,
         partial_vals,
         partial_indices,
+        next_token_logits.stride(0),
         vocab_size,
         num_splits,
         BLOCK=block,
         num_warps=8,
     )
+    # Dummy operand for the disabled draft-token slot: the pointer must be
+    # valid even though the kernel never dereferences it (gated off by
+    # WRITE_DRAFT_TOKEN).
     _draft_topk1_finalize_kernel[(bs,)](
         partial_vals,
         partial_indices,
