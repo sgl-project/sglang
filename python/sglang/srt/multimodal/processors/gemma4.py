@@ -143,10 +143,16 @@ class Gemma4SGLangProcessor(SGLangBaseProcessor):
             getattr(request_obj, "mm_processor_kwargs", None),
         ):
             if isinstance(src, dict) and src.get("max_soft_tokens") is not None:
-                mst = src["max_soft_tokens"]
+                try:
+                    mst = int(src["max_soft_tokens"])
+                except (TypeError, ValueError):
+                    raise ValueError(
+                        f"max_soft_tokens must be an integer, got "
+                        f"{src['max_soft_tokens']!r}"
+                    )
                 if mst not in Gemma4SGLangProcessor._SUPPORTED_SOFT_TOKENS:
                     raise ValueError(
-                        f"max_soft_tokens={mst!r} is not supported; expected one of "
+                        f"max_soft_tokens={mst} is not supported; expected one of "
                         f"{Gemma4SGLangProcessor._SUPPORTED_SOFT_TOKENS}"
                     )
                 return {"max_soft_tokens": mst}
@@ -154,22 +160,18 @@ class Gemma4SGLangProcessor(SGLangBaseProcessor):
 
     @staticmethod
     def _mix_config_into_hash(mm_items, processor_kwargs) -> None:
-        """Mix per-request processor kwargs into mm-item hashes so different budgets do
-        not collide in the radix / embedding cache. Mirrors UnlimitedOCRProcessor."""
+        """Mix per-request processor kwargs into the already-computed mm-item hashes so
+        different budgets do not collide in the radix / embedding cache. Reuses each
+        item's existing ``hash`` (populated by ``process_and_combine_mm_data``) instead
+        of re-hashing the full feature tensor."""
         import hashlib
-
-        from sglang.srt.managers.mm_utils import hash_feature
 
         config_bytes = str(sorted(processor_kwargs.items())).encode()
         for item in mm_items:
-            if item.feature is not None:
-                base_hash = hash_feature(item.feature)
-            elif item.precomputed_embeddings is not None:
-                base_hash = hash_feature(item.precomputed_embeddings)
-            else:
+            if item.hash is None:
                 continue
             combined = hashlib.sha256(
-                base_hash.to_bytes(8, byteorder="big") + config_bytes
+                item.hash.to_bytes(8, byteorder="big") + config_bytes
             ).digest()[:8]
             item.hash = int.from_bytes(combined, byteorder="big", signed=False)
 
