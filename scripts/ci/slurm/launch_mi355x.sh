@@ -24,6 +24,12 @@
 #   SLURM_NODELIST     - optional explicit node pin (else scheduler chooses)
 #   SLURM_EXCLUDE      - optional comma-separated nodes to keep the scheduler
 #                        off (e.g. hosts with a broken RDMA driver)
+#   MOONCAKE_COMMIT_OVERRIDE
+#                      - optional debug override. When set, prefill/decode
+#                        containers rebuild and install Mooncake at this commit
+#                        before starting SGLang.
+#   MOONCAKE_REPO      - optional Mooncake repo for the override; defaults to
+#                        docker/rocm.Dockerfile's MOONCAKE_REPO.
 #   RUNNER_NAME        - GitHub runner name (a built-in default env var)
 #   GITHUB_RUN_ID      - GitHub Actions run id (a built-in default env var)
 #                        The allocation is named
@@ -155,6 +161,14 @@ if [[ -n "${IMAGE_OVERRIDE:-}" ]]; then
 fi
 echo "recipe: image=$IMAGE attn=${ATTN:-$PATTN/$DATTN} ib=$IB ptp=$PTP dtp=$DTP concs=$CONCS isl=$ISL osl=$OSL"
 
+MOONCAKE_ENV_STR=""
+if [[ -n "${MOONCAKE_COMMIT_OVERRIDE:-}" ]]; then
+    MOONCAKE_REPO="${MOONCAKE_REPO:-$(grep -E '^[[:space:]]*ARG[[:space:]]+MOONCAKE_REPO=' docker/rocm.Dockerfile | head -n1 | sed 's/.*MOONCAKE_REPO="\([^"]*\)".*/\1/' || true)}"
+    MOONCAKE_REPO="${MOONCAKE_REPO:-https://github.com/kvcache-ai/Mooncake.git}"
+    MOONCAKE_ENV_STR="-e MOONCAKE_COMMIT_OVERRIDE=$MOONCAKE_COMMIT_OVERRIDE -e MOONCAKE_REPO=$MOONCAKE_REPO"
+    echo "Mooncake override enabled: repo=$MOONCAKE_REPO commit=$MOONCAKE_COMMIT_OVERRIDE"
+fi
+
 # ---------------------------------------------------------------------------
 # Shared NFS scratch (visible to login node + compute nodes). Raw bench output
 # lands here; the launcher normalizes it into GITHUB_WORKSPACE afterwards.
@@ -234,6 +248,51 @@ with open(sys.argv[2], "w") as f:
     f.write(f"MODEL_SERVER_ARGS=({q(server_args)})\n")
 PY
 
+cat > "$WORKDIR/install_mooncake.sh" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+
+if [[ -z "${MOONCAKE_COMMIT_OVERRIDE:-}" ]]; then
+  exit 0
+fi
+
+MOONCAKE_REPO="${MOONCAKE_REPO:-https://github.com/kvcache-ai/Mooncake.git}"
+MOONCAKE_DIR="/sgl-workspace/Mooncake"
+MOONCAKE_BUILD_JOBS="${MOONCAKE_BUILD_JOBS:-$(nproc)}"
+MOONCAKE_CMAKE_FLAGS="${MOONCAKE_CMAKE_FLAGS:--DUSE_HIP=ON -DUSE_ETCD=ON -DENABLE_MULTI_PROTOCOL=ON -DWITH_STORE=ON -DBUILD_UNIT_TESTS=OFF}"
+
+echo "[Mooncake] Reinstalling commit ${MOONCAKE_COMMIT_OVERRIDE} from ${MOONCAKE_REPO}"
+
+if [[ ! -d "${MOONCAKE_DIR}/.git" ]]; then
+  rm -rf "${MOONCAKE_DIR}"
+  git clone "${MOONCAKE_REPO}" "${MOONCAKE_DIR}"
+fi
+
+cd "${MOONCAKE_DIR}"
+git fetch --all --tags || git fetch "${MOONCAKE_REPO}" "${MOONCAKE_COMMIT_OVERRIDE}" || true
+if ! git cat-file -e "${MOONCAKE_COMMIT_OVERRIDE}^{commit}" 2>/dev/null; then
+  echo "[Mooncake] ERROR: commit not found after fetch: ${MOONCAKE_COMMIT_OVERRIDE}" >&2
+  exit 1
+fi
+
+git checkout -f "${MOONCAKE_COMMIT_OVERRIDE}"
+git submodule update --init --recursive
+rm -rf build
+mkdir -p build
+cd build
+cmake .. ${MOONCAKE_CMAKE_FLAGS}
+make -j "${MOONCAKE_BUILD_JOBS}"
+make install
+ldconfig
+
+python3 - <<'PY'
+import mooncake
+import os
+
+print("[Mooncake] installed package:", os.path.dirname(mooncake.__file__))
+PY
+EOF
+
 # Optional topology / speculative-decode flags driven by the recipe. Base recipes
 # (EP1/DP1, no mtp) leave EXTRA_FLAGS empty, preserving prior behavior exactly.
 EXTRA_FLAGS=""
@@ -292,16 +351,37 @@ DOCKER_COMMON="--rm --network host --ipc host --shm-size 32g --privileged \
 # `${MODEL_SERVER_ARGS[@]}` refs are backslash-escaped to survive into the script
 # and expand after `source`. For DSV4 those arrays are empty and $DSV4_ENV_STR is
 # set, so the resulting docker argv is byte-identical to the pre-Kimi launcher.
+cat > "$WORKDIR/prefill_entry.sh" <<EOF
+#!/bin/bash
+set -euo pipefail
+CIDIR=/host_home/.mi355x_ci/${MATRIX_CONFIG_NAME}
+source "\$CIDIR/model_flags.sh"
+bash "\$CIDIR/install_mooncake.sh"
+exec python3 -m sglang.launch_server \
+  --model-path $MODEL_PATH --host 0.0.0.0 --port $PPORT \
+  $COMMON_FLAGS "\${MODEL_SERVER_ARGS[@]}" \
+  --disaggregation-mode prefill --disaggregation-bootstrap-port $PBOOT
+EOF
+
+cat > "$WORKDIR/decode_entry.sh" <<EOF
+#!/bin/bash
+set -euo pipefail
+CIDIR=/host_home/.mi355x_ci/${MATRIX_CONFIG_NAME}
+source "\$CIDIR/model_flags.sh"
+bash "\$CIDIR/install_mooncake.sh"
+exec python3 -m sglang.launch_server \
+  --model-path $MODEL_PATH --host 0.0.0.0 --port $DPORT \
+  $COMMON_FLAGS "\${MODEL_SERVER_ARGS[@]}" \
+  --disaggregation-mode decode --disaggregation-bootstrap-port $DBOOT
+EOF
+
 cat > "$WORKDIR/prefill.sh" <<EOF
 #!/bin/bash
 source "$WORKDIR/model_flags.sh"
 docker rm -f mi355x_prefill 2>/dev/null || true
 docker run $DOCKER_COMMON --name mi355x_prefill \
-  -e HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 $MORI_ENV $DSV4_ENV_STR "\${MODEL_ENV_ARGS[@]}" \
-  $IMAGE python3 -m sglang.launch_server \
-  --model-path $MODEL_PATH --host 0.0.0.0 --port $PPORT \
-  $COMMON_FLAGS "\${MODEL_SERVER_ARGS[@]}" \
-  --disaggregation-mode prefill --disaggregation-bootstrap-port $PBOOT
+  -e HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 $MORI_ENV $DSV4_ENV_STR $MOONCAKE_ENV_STR "\${MODEL_ENV_ARGS[@]}" \
+  $IMAGE bash /host_home/.mi355x_ci/${MATRIX_CONFIG_NAME}/prefill_entry.sh
 EOF
 
 cat > "$WORKDIR/decode.sh" <<EOF
@@ -309,11 +389,8 @@ cat > "$WORKDIR/decode.sh" <<EOF
 source "$WORKDIR/model_flags.sh"
 docker rm -f mi355x_decode 2>/dev/null || true
 docker run $DOCKER_COMMON --name mi355x_decode \
-  -e HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 $MORI_ENV $DSV4_ENV_STR "\${MODEL_ENV_ARGS[@]}" \
-  $IMAGE python3 -m sglang.launch_server \
-  --model-path $MODEL_PATH --host 0.0.0.0 --port $DPORT \
-  $COMMON_FLAGS "\${MODEL_SERVER_ARGS[@]}" \
-  --disaggregation-mode decode --disaggregation-bootstrap-port $DBOOT
+  -e HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 $MORI_ENV $DSV4_ENV_STR $MOONCAKE_ENV_STR "\${MODEL_ENV_ARGS[@]}" \
+  $IMAGE bash /host_home/.mi355x_ci/${MATRIX_CONFIG_NAME}/decode_entry.sh
 EOF
 
 # Probe payload + validator (separate files to avoid quoting inside the
