@@ -199,9 +199,7 @@ class TestDPAttentionBreakableCudaGraphKL(CustomTestCase):
         if self.server_info.get("disable_radix_cache"):
             self.skipTest("Radix cache is disabled")
         self._print_test_config()
-        kl_div = test_prefill_cache_hit(
-            self.base_url, self.input_ids, MAX_NEW_TOKENS
-        )
+        kl_div = test_prefill_cache_hit(self.base_url, self.input_ids, MAX_NEW_TOKENS)
         self._assert_kl("test_prefill_cache_hit_kl", kl_div)
 
     def test_decode_cache_hit_kl(self):
