@@ -2,10 +2,10 @@ from typing import List, Tuple, Union
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 
 from sglang.srt.dllm.algorithm.base import DllmAlgorithm
 from sglang.srt.dllm.config import DllmConfig
+from sglang.srt.dllm.tp_local_vocab_state import argmax_max_prob_from_logits_output
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
@@ -65,18 +65,10 @@ class LowConfidence(DllmAlgorithm):
                 block_mask_index = block_input_ids == self.mask_id
                 if torch.sum(block_mask_index).item() == 0:
                     continue
-                curr_logits = logits_output.full_logits[
-                    curr_block_start:curr_block_end,
-                ]
-
-                x = torch.argmax(curr_logits, dim=-1)
-                p = torch.squeeze(
-                    torch.gather(
-                        F.softmax(curr_logits, dim=-1),
-                        dim=-1,
-                        index=torch.unsqueeze(x, -1),
-                    ),
-                    -1,
+                x, p = argmax_max_prob_from_logits_output(
+                    logits_output,
+                    start=curr_block_start,
+                    end=curr_block_end,
                 )
                 x = torch.where(block_mask_index, x, block_input_ids)
                 confidence = torch.where(block_mask_index, p, -np.inf)
