@@ -12,7 +12,7 @@ from sglang.test.ci.ci_register import register_cuda_ci, register_xpu_ci
 from sglang.test.kits.spec_server_kits import SpecParityKit
 from sglang.test.server_fixtures.spec_eagle_fixture import Eagle3Base
 
-register_cuda_ci(est_time=360, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=125, stage="base-b", runner_config="1-gpu-large")
 register_xpu_ci(est_time=360, stage="stage-b", runner_config="1-gpu-xpu")
 
 _is_xpu = is_xpu()

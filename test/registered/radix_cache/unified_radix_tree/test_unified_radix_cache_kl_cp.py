@@ -11,7 +11,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=950, stage="extra-b", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=286, stage="extra-b", runner_config="4-gpu-h100")
 
 QWEN3_32B_MODEL = "Qwen/Qwen3-32B"
 

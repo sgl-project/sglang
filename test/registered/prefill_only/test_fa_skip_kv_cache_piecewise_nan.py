@@ -42,7 +42,7 @@ from sglang.test.test_utils import CustomTestCase
 # RTX 5090 (SM120/Blackwell) where FA3 does not exist. FA3 + the piecewise embedding
 # path this regression covers only runs on Ampere/Ada/Hopper (SM 80-90), so the test
 # must land on the H100 pool to actually execute (on 1-gpu-small it would skip 100%).
-register_cuda_ci(est_time=600, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=138, stage="base-b", runner_config="1-gpu-large")
 
 # Lowest/highest CUDA SM that supports the FA3 + piecewise embedding path. FA3 is
 # unavailable on Blackwell (sm100 B200 / sm120 consumer e.g. RTX 5090); the gate is

@@ -20,7 +20,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST_MXFP4_WITH_MOE
 
-register_cuda_ci(est_time=420, stage="extra-a", runner_config="1-gpu-large")
+register_cuda_ci(est_time=105, stage="extra-a", runner_config="1-gpu-large")
 
 
 class TestPageMajorGptOss(DefaultServerBase):

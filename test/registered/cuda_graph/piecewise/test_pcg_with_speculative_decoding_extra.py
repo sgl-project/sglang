@@ -9,7 +9,7 @@ import unittest
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.server_fixtures.pcg_spec_fixture import PCGSpecBase
 
-register_cuda_ci(est_time=531, stage="extra-a", runner_config="2-gpu-large")
+register_cuda_ci(est_time=391, stage="extra-a", runner_config="2-gpu-large")
 
 
 class TestPCGWithMTP(PCGSpecBase, unittest.TestCase):

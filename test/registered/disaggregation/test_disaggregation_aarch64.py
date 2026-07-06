@@ -14,7 +14,7 @@ from sglang.test.test_utils import (
 
 QWEN3_8B_MODEL_PATH = "Qwen/Qwen3-8B"
 
-register_cuda_ci(est_time=300, stage="base-c", runner_config="4-gpu-gb300")
+register_cuda_ci(est_time=121, stage="base-c", runner_config="4-gpu-gb300")
 
 
 class TestDisaggregationMooncakeAARCH64Accuracy(PDDisaggregationServerBase):

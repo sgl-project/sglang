@@ -51,7 +51,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 _HAS_CUDA = torch.cuda.is_available()
 _DEV = "cuda" if _HAS_CUDA else "cpu"
 
-register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=8, stage="base-b", runner_config="1-gpu-small")
 
 
 def _make_pool(

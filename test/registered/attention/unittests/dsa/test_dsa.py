@@ -35,7 +35,7 @@ from sglang.test.kits.attention_unittest.runner_modes.speculative_draft_runner i
     run_dsa_eagle_draft_cuda_graph_runner_case,
 )
 
-register_cuda_ci(est_time=25, stage="base-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=16, stage="base-b", runner_config="4-gpu-b200")
 register_cuda_ci(est_time=25, stage="base-b", runner_config="1-gpu-large")
 
 

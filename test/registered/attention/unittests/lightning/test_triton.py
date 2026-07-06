@@ -23,8 +23,8 @@ from sglang.test.kits.attention_unittest.runner_modes.speculative_target_verify_
     run_lightning_eagle_verify_cuda_graph_case,
 )
 
-register_cuda_ci(est_time=20, stage="base-b", runner_config="4-gpu-b200")
-register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=10, stage="base-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=20, suite="stage-b-test-1-gpu-large-amd")
 
 

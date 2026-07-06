@@ -30,7 +30,7 @@ _HAS_SHARED_POOL = (
     importlib.util.find_spec("sglang.srt.mem_cache.unified_memory_pool") is not None
 )
 
-register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=8, stage="base-b", runner_config="1-gpu-small")
 
 
 def _legacy_advanced_indexing_write(

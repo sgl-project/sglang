@@ -33,7 +33,7 @@ from sglang.srt.distributed.device_communicators.vmm_utils import (
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=60, stage="base-b", runner_config="2-gpu-large")
+register_cuda_ci(est_time=14, stage="base-b", runner_config="2-gpu-large")
 
 _FABRIC = drv.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
 _POSIX_FD = drv.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
