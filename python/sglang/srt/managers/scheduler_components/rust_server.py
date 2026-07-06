@@ -417,9 +417,12 @@ class RustServer:
             ]
 
         header = msgspec.msgpack.encode(header_cols)
+        # push_batch blocks with backpressure, a false return means the
+        # server is shutting down.
         if not self.server.push_batch(header, b"".join(data_cols)):
             logger.warning(
-                "Rust egress ring full; dropped batch of %d requests", len(rids)
+                "Rust egress closed; dropped batch of %d requests during shutdown",
+                len(rids),
             )
 
     @staticmethod
