@@ -9,7 +9,6 @@
 //! `/server_info` reuses the same submit machinery for a single control result.
 mod openai;
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::{
@@ -68,7 +67,7 @@ fn read_health_endpoint_generation() -> bool {
 }
 
 pub async fn serve(
-    bind: SocketAddr,
+    listener: std::net::TcpListener,
     senders: Senders,
     id_gen: Arc<RequestIdGen>,
     egress_buf: usize,
@@ -104,17 +103,23 @@ pub async fn serve(
         .route("/v1/models", get(openai::available_models))
         .with_state(state);
 
-    match tokio::net::TcpListener::bind(bind).await {
-        Ok(listener) => {
-            tracing::info!(%bind, "sglang-server api listening");
-            let serve = axum::serve(listener, app).with_graceful_shutdown(async move {
-                let _ = shutdown.recv_async().await;
-            });
-            if let Err(e) = serve.await {
-                tracing::error!(error = %e, "axum serve exited");
-            }
+    // The listener was already bound synchronously in `runtime::start` (so a port
+    // conflict fails startup); adopt it into the tokio reactor here.
+    let listener = match tokio::net::TcpListener::from_std(listener) {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::error!(error = %e, "failed to adopt pre-bound listener");
+            return;
         }
-        Err(e) => tracing::error!(error = %e, %bind, "failed to bind api server"),
+    };
+    if let Ok(addr) = listener.local_addr() {
+        tracing::info!(%addr, "sglang-server api listening");
+    }
+    let serve = axum::serve(listener, app).with_graceful_shutdown(async move {
+        let _ = shutdown.recv_async().await;
+    });
+    if let Err(e) = serve.await {
+        tracing::error!(error = %e, "axum serve exited");
     }
 }
 
