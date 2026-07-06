@@ -1741,6 +1741,9 @@ def fp8_per_token_to_per_tensor_quant_triton(
 # instead of the dispatch capacity. All-GPU, static shapes -> cuda-graph safe.
 # Expanded psum semantics (DeepEP v2): psum[e] = align(psum[e-1], ALIGN) + count_e,
 # so expert e occupies recv rows [align(psum[e-1]) : psum[e]); count_e real tokens.
+# Non-expand (contiguous) psum semantics differ: psum[e] is the inclusive prefix
+# sum of alignment-PADDED counts, so every psum[e] is a multiple of ALIGN and
+# psum[e-1] is expert e's aligned group start (consumed by ep_scatter_from_psum).
 # ---------------------------------------------------------------------------
 
 
@@ -1945,10 +1948,11 @@ def masked_slab_to_expand(
 ):
     """[E_local, max_m, hidden] masked-GEMM output -> [total, hidden] expanded order.
 
-    Only real rows are written (padding rows stay zeroed). When topk_weights is
-    given ([total_expanded], per expanded row), the top-k weight is fused into the
-    copy so the weighted-combine multiply happens only on real rows (not the
-    worst-case buffer).
+    Only real rows are written; padding rows are uninitialized (the output is
+    torch.empty) and are never read -- combine consumes only real rows via handle
+    metadata. When topk_weights is given ([total_expanded], per expanded row), the
+    top-k weight is fused into the copy so the weighted-combine multiply happens
+    only on real rows (not the worst-case buffer).
     """
     num_local_experts, max_m, hidden = slab.shape
     # combine reads only real rows via handle metadata, so padding need not be

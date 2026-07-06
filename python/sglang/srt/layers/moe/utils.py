@@ -293,7 +293,7 @@ def get_deepep_v2_output_dtype(self) -> DeepEPv2OutputDtype:
     if server_args and server_args.deepep_v2_dispatcher_output_dtype != "auto":
         return DeepEPv2OutputDtype(server_args.deepep_v2_dispatcher_output_dtype)
 
-    if getattr(self, "quant_config", None) is not None:
+    if self.quant_config is not None:
         dispatcher_output_dtype = self.quant_config.get("dispatcher_output_dtype", None)
         if dispatcher_output_dtype is not None:
             return DeepEPv2OutputDtype(dispatcher_output_dtype)

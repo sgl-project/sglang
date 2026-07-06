@@ -970,21 +970,19 @@ def pre_permute_deepep_v2_to_deep_gemm(
         ep_scatter_from_psum,
     )
 
-    (
-        hidden_states,
-        hidden_states_scale,
-        topk_ids,
-        topk_weights,
-        num_recv_tokens_per_expert,
-        psum_num_recv_tokens_per_expert,
-        is_expanded,
-        hidden_states_scale_tma_aligned,
-        deepep_v2_use_masked,
-        deepep_v2_expected_m,
-        deepep_v2_masked_max_m,
-        deepep_v2_total_expanded,
-        deepep_v2_expert_alignment,
-    ) = dispatch_output
+    hidden_states = dispatch_output.hidden_states
+    hidden_states_scale = dispatch_output.hidden_states_scale
+    topk_ids = dispatch_output.topk_ids
+    topk_weights = dispatch_output.topk_weights
+    num_recv_tokens_per_expert = dispatch_output.num_recv_tokens_per_expert
+    psum_num_recv_tokens_per_expert = dispatch_output.psum_num_recv_tokens_per_expert
+    is_expanded = dispatch_output.is_expanded
+    hidden_states_scale_tma_aligned = dispatch_output.hidden_states_scale_tma_aligned
+    deepep_v2_use_masked = dispatch_output.use_masked_gemm
+    deepep_v2_expected_m = dispatch_output.expected_m
+    deepep_v2_masked_max_m = dispatch_output.masked_max_m
+    deepep_v2_total_expanded = dispatch_output.total_expanded
+    deepep_v2_expert_alignment = dispatch_output.expert_alignment
     if hidden_states_scale is None:
         raise RuntimeError(
             "DeepEP v2 -> DeepGEMM requires FP8 dispatch output with activation scales. "
@@ -1095,6 +1093,14 @@ def pre_permute_deepep_v2_to_deep_gemm(
     m_indices = torch.empty(all_tokens, device=hidden_states.device, dtype=torch.int32)
     output_index = torch.empty_like(topk_ids)
     if psum_num_recv_tokens_per_expert is not None:
+        # Contiguous-path alignment contract: this psum comes from ElasticBuffer
+        # dispatch(do_expand=False, expert_alignment=capability.expert_alignment),
+        # and DeepEP documents the non-expand psum as the inclusive prefix sum of
+        # alignment-PADDED per-expert counts (deep_ep/buffers/elastic.py). The
+        # deep_gemm capability pins expert_alignment=128 ==
+        # get_m_alignment_for_contiguous_layout(), so psum[e-1] is a valid
+        # 128-aligned group start for the contiguous grouped GEMM. Do NOT re-align
+        # here: an align_up would silently mask an upstream contract break.
         expert_start_loc = torch.empty_like(psum_num_recv_tokens_per_expert)
         ep_scatter_from_psum(
             hidden_states,

@@ -1739,8 +1739,11 @@ class ServerArgs:
     ] = "none"
     deepep_v2_mode: A[
         Literal["direct", "hybrid"],
-        "DeepEP v2 ElasticBuffer mode: `direct` (decode-like) or `hybrid` "
-        "(prefill-like). Fixed at server init; not equivalent to DeepEP v1 modes.",
+        "DeepEP v2 ElasticBuffer communication topology, fixed at server init: "
+        "`direct` (single-node NVLink) or `hybrid` (multi-node scale-out). "
+        "Layout/grouped-GEMM and the decode CUDA graph are chosen per batch by "
+        "inference phase, independent of this knob; not equivalent to DeepEP v1 "
+        "normal/low_latency.",
     ] = "direct"
     deepep_v2_dispatcher_output_dtype: A[
         Literal["auto", "bf16", "fp8"],
