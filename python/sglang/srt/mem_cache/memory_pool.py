@@ -25,6 +25,7 @@ from __future__ import annotations
 import abc
 import dataclasses
 import logging
+from collections import deque
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, fields
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
@@ -265,7 +266,7 @@ class ReqToTokenPool:
             self.req_to_token = torch.zeros(
                 (self._alloc_size, max_context_len), dtype=torch.int32, device=device
             )
-        self.free_slots = list(range(1, self._alloc_size))
+        self.free_slots: deque[int] = deque(range(1, self._alloc_size))
 
     def write(self, indices, values):
         self.req_to_token[indices] = values
@@ -291,8 +292,7 @@ class ReqToTokenPool:
         need_size = len(reqs) - len(reusing)
         if need_size > len(self.free_slots):
             return None
-        select_index = self.free_slots[:need_size]
-        self.free_slots = self.free_slots[need_size:]
+        select_index = [self.free_slots.popleft() for _ in range(need_size)]
         offset = 0
         for r in reqs:
             if r.req_pool_idx is None:
@@ -306,7 +306,7 @@ class ReqToTokenPool:
         req.req_pool_idx = None
 
     def clear(self):
-        self.free_slots = list(range(1, self._alloc_size))
+        self.free_slots = deque(range(1, self._alloc_size))
 
 
 class MambaPool:
