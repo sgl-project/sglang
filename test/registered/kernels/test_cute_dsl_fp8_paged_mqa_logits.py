@@ -8,6 +8,8 @@ Ported from TensorRT-LLM PR #13219
 to SGLang.
 """
 
+import sys
+
 import pytest
 import torch
 
@@ -262,3 +264,7 @@ def test_cute_dsl_fp8_paged_mqa_logits(
     elem_atol = 1e-3 if output_dtype == torch.float16 else 5e-5
     elem_rtol = 1e-3 if output_dtype == torch.float16 else 1e-5
     torch.testing.assert_close(dsl_clean, ref_clean, atol=elem_atol, rtol=elem_rtol)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__]))
