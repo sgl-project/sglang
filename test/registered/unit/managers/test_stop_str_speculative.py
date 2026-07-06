@@ -8,7 +8,12 @@ a fake tokenizer; pure CPU. Each test guards a distinct branch of
 import unittest
 from array import array
 
-from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.schedule_batch import (
+    FINISH_LENGTH,
+    FINISH_MATCHED_STR,
+    FINISH_MATCHED_TOKEN,
+    Req,
+)
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -50,8 +55,14 @@ class _MockTokenizerForNormalize:
         return list(range(len(s)))  # One "token" per character
 
 
-def _make_req(output_ids, stop=None, stop_regex=None, eos_token_ids=frozenset()):
-    sp = SamplingParams(max_new_tokens=1000, stop=stop, stop_regex=stop_regex)
+def _make_req(
+    output_ids,
+    stop=None,
+    stop_regex=None,
+    eos_token_ids=frozenset(),
+    max_new_tokens=1000,
+):
+    sp = SamplingParams(max_new_tokens=max_new_tokens, stop=stop, stop_regex=stop_regex)
     sp.normalize(tokenizer=_MockTokenizerForNormalize())  # char-based stop_str_max_len
     req = Req(
         rid="t",
@@ -145,6 +156,80 @@ class TestStopStrSpeculative(unittest.TestCase):
         req.update_finish_state(new_accepted_len=3)
         self.assertTrue(req.finished())
         self.assertIsNone(req.finished_len)
+
+
+class TestFinishLengthVsStopSpeculative(unittest.TestCase):
+    """A stop token/string inside a multi-token accepted run that crosses
+    max_new_tokens must be honored (correct finish_reason + trim at the stop),
+    not masked by the length limit. Guards the ordering/clamping between the
+    length check and the stop checks in `update_finish_state`.
+
+    Setup for all: max_new_tokens=10, output_ids has 11 tokens (an accepted run
+    of 3 crossed the budget), new_accepted_len=3 -> the run is indices 8,9,10.
+    """
+
+    def test_eos_within_budget_beats_length(self):
+        # EOS at index 8 (finished_len 9 <= 10): the stop token wins over length,
+        # and the token leaked after it (index 9) is trimmed.
+        req = _make_req(
+            [10, 11, 12, 13, 14, 15, 16, 17, EOS_ID, 20, 21],
+            eos_token_ids={EOS_ID},
+            max_new_tokens=10,
+        )
+        req.update_finish_state(new_accepted_len=3)
+        self.assertTrue(req.finished())
+        self.assertIsInstance(req.finished_reason, FINISH_MATCHED_TOKEN)
+        self.assertEqual(req.finished_reason.matched, EOS_ID)
+        self.assertEqual(req.finished_len, 9)
+
+    def test_eos_at_budget_boundary_is_stop_not_length(self):
+        # EOS at index 9 -> finished_len 10 == the length cap. finished_len is the
+        # same either way, but the reason must be 'stop', not 'length'.
+        req = _make_req(
+            [10, 11, 12, 13, 14, 15, 16, 17, 20, EOS_ID, 21],
+            eos_token_ids={EOS_ID},
+            max_new_tokens=10,
+        )
+        req.update_finish_state(new_accepted_len=3)
+        self.assertTrue(req.finished())
+        self.assertIsInstance(req.finished_reason, FINISH_MATCHED_TOKEN)
+        self.assertEqual(req.finished_len, 10)
+
+    def test_eos_past_budget_is_length_limited(self):
+        # EOS at index 10, past the budget: no stop within budget, so the request
+        # is length-limited and trimmed to max_new_tokens (no leak).
+        req = _make_req(
+            [10, 11, 12, 13, 14, 15, 16, 17, 18, 20, EOS_ID],
+            eos_token_ids={EOS_ID},
+            max_new_tokens=10,
+        )
+        req.update_finish_state(new_accepted_len=3)
+        self.assertTrue(req.finished())
+        self.assertIsInstance(req.finished_reason, FINISH_LENGTH)
+        self.assertEqual(req.finished_len, 10)
+
+    def test_stop_str_within_budget_beats_length(self):
+        # A stop string inside the over-budget run is honored, not masked by the
+        # length cap. Stop lands within budget so its reason wins.
+        req = _make_req(
+            [10, 11, 12, 13, 14, 15, 16, 17, STOP_ID, 20, 21],
+            stop=["STOP"],
+            max_new_tokens=10,
+        )
+        req.update_finish_state(new_accepted_len=3)
+        self.assertTrue(req.finished())
+        self.assertIsInstance(req.finished_reason, FINISH_MATCHED_STR)
+        self.assertEqual(req.finished_reason.matched, "STOP")
+        self.assertIsNotNone(req.finished_len)
+        self.assertLessEqual(req.finished_len, 10)
+
+    def test_no_stop_over_budget_is_length(self):
+        # Baseline (unchanged): no stop in the run -> FINISH_LENGTH at the cap.
+        req = _make_req(list(range(10, 21)), max_new_tokens=10)
+        req.update_finish_state(new_accepted_len=3)
+        self.assertTrue(req.finished())
+        self.assertIsInstance(req.finished_reason, FINISH_LENGTH)
+        self.assertEqual(req.finished_len, 10)
 
 
 if __name__ == "__main__":

@@ -1482,13 +1482,6 @@ class Req(ReqDllmMixin):
             self.to_finish = None
             return
 
-        if len(self.output_ids) >= self.sampling_params.max_new_tokens:
-            self.finished_reason = FINISH_LENGTH(
-                length=self.sampling_params.max_new_tokens
-            )
-            self.finished_len = self.sampling_params.max_new_tokens
-            return
-
         new_accepted_tokens = self.output_ids[-new_accepted_len:]
 
         # Sanitize out-of-range / NaN token ids before any decode.
@@ -1498,12 +1491,34 @@ class Req(ReqDllmMixin):
         # Stop string beats EOS/stop-token matched in the same step (speculative
         # decoding can accept >1 token): token-based would trim only the last
         # token and leak the stop string.
-        if self._check_str_based_finish(new_accepted_len):
+        stop_matched = self._check_str_based_finish(
+            new_accepted_len
+        ) or self._check_token_based_finish(new_accepted_tokens)
+
+        # The length limit is checked AFTER the stop checks and clamped to the
+        # earlier cut. A single multi-token step (speculative / dllm) can accept
+        # a run that both contains a stop token/string and crosses
+        # max_new_tokens; checking length first (or without clamping) would mask
+        # the stop inside the run -- finish_reason would wrongly be 'length' and
+        # the tokens after the stop would leak to the user. A stop landing within
+        # the token budget wins; a stop past the budget (or no stop at all) means
+        # the request is length-limited.
+        max_new_tokens = self.sampling_params.max_new_tokens
+        if (
+            stop_matched
+            and self.finished_len is not None
+            and self.finished_len <= max_new_tokens
+        ):
             return
 
-        if self._check_token_based_finish(new_accepted_tokens):
+        if len(self.output_ids) >= max_new_tokens:
+            self.finished_reason = FINISH_LENGTH(length=max_new_tokens)
+            self.finished_len = max_new_tokens
             return
 
+        # Grammar termination is checked after the stop scans (#31738: a stop
+        # matched in the same step wins) and after the length limit (an
+        # over-budget run finishes as 'length', matching the pre-existing order).
         if self.grammar is not None and self.grammar.is_terminated():
             self.finished_reason = FINISH_MATCHED_TOKEN(matched=self.output_ids[-1])
             return
