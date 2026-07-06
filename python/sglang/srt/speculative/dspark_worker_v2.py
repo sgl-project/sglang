@@ -1597,8 +1597,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         candidates[:, 0].copy_(first_tokens)
 
         with torch.inference_mode():
-            block_hidden_for_logits = self._draft_inner.shared_head.norm(block_hidden)
-            base_logits = _compute_full_vocab_logits(block_hidden_for_logits, lm_head)
+            base_logits = _compute_full_vocab_logits(block_hidden, lm_head)
             debug_enabled = bool(self._accept_anomaly_enabled)
             if debug_enabled:
                 debug_topk_k = (

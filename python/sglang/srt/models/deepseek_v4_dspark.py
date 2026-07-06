@@ -222,10 +222,9 @@ class DeepseekV4DSparkModel(nn.Module):
         hidden_states = self.hc_head(
             hidden_states, self.hc_head_fn, self.hc_head_scale, self.hc_head_base
         )
-        # Match vLLM DeepSeek-V4 DSpark: draft forward returns the pre-norm
-        # hc_head hidden. The shared output norm is applied only when computing
-        # base LM logits.
-        return hidden_states
+        # DeepSpec applies the final output norm before LM logits, Markov refine,
+        # and confidence features consume the draft block hidden.
+        return self.shared_head.norm(hidden_states)
 
     def forward(
         self,
