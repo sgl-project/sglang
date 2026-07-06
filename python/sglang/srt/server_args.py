@@ -3643,11 +3643,14 @@ class ServerArgs:
         activations: reserved_mem counts the un-divided chunked_prefill_size, but
         _handle_data_parallelism later divides it per-rank. dp_size > 1 is checked
         explicitly because that handler (which forces enable_dp_attention off for
-        dp_size == 1) has not run yet."""
+        dp_size == 1) has not run yet. Disagg-decode nodes size the activation
+        term from the decode batch instead of chunked_prefill_size, so there is
+        no chunked over-reservation to credit."""
         if not (
             self.chunked_prefill_size > 0
             and self.enable_dp_attention
             and self.dp_size > 1
+            and self.disaggregation_mode != "decode"
         ):
             return 0.0
         per_rank = self.chunked_prefill_size // self.dp_size

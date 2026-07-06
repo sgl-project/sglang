@@ -1494,16 +1494,22 @@ class TestAutoMemChunkedSlack(unittest.TestCase):
     deepep_capacity credits this slack against its KV-budget reservation.
     """
 
-    def _slack(self, chunked, dp_size, dp_attention=True):
+    def _slack(self, chunked, dp_size, dp_attention=True, disaggregation_mode="null"):
         ns = SimpleNamespace(
             chunked_prefill_size=chunked,
             enable_dp_attention=dp_attention,
             dp_size=dp_size,
+            disaggregation_mode=disaggregation_mode,
         )
         return ServerArgs._auto_mem_chunked_slack(ns)
 
     def test_zero_without_dp_attention(self):
         self.assertEqual(self._slack(32768, 4, dp_attention=False), 0.0)
+
+    def test_zero_for_disagg_decode(self):
+        # Disagg-decode reserved_mem sizes activations from the decode batch,
+        # not chunked_prefill_size — no over-reservation exists to credit.
+        self.assertEqual(self._slack(32768, 4, disaggregation_mode="decode"), 0.0)
 
     def test_zero_for_single_dp_rank(self):
         self.assertEqual(self._slack(32768, 1), 0.0)
