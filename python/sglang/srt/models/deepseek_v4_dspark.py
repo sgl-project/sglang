@@ -1,4 +1,5 @@
 import logging
+import os
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -6,7 +7,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.srt.distributed import get_pp_group
+from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_rank
 from sglang.srt.layers.dp_attention import (
     _DpGatheredBufferWrapper,
     dp_gather_replicate,
@@ -311,6 +312,42 @@ class DeepseekV4ForCausalLMDSpark(DeepseekV4ForCausalLM):
             for name, _ in weights
         )
         super().load_weights(weights, is_nextn=False, is_dspark=True)
+        self._maybe_use_absolute_moe_layer_ids()
+
+    def _maybe_use_absolute_moe_layer_ids(self) -> None:
+        if os.getenv("SGLANG_DSPARK_USE_ABSOLUTE_MOE_LAYER_ID", "0") != "1":
+            return
+        if get_global_server_args().enable_eplb:
+            if get_tensor_model_parallel_rank() == 0:
+                logger.warning(
+                    "Skip SGLANG_DSPARK_USE_ABSOLUTE_MOE_LAYER_ID because "
+                    "enable_eplb is set; absolute draft MoE ids can index past "
+                    "the target expert-location table."
+                )
+            return
+
+        base_layer_id = int(getattr(self.config, "num_hidden_layers", 0))
+        mapping = []
+        for local_layer_id, layer in enumerate(self.model.layers):
+            absolute_layer_id = base_layer_id + int(local_layer_id)
+            mapping.append((int(local_layer_id), int(absolute_layer_id)))
+            mlp = getattr(layer, "mlp", None)
+            if mlp is None:
+                continue
+            mlp.layer_id = absolute_layer_id
+            topk = getattr(mlp, "topk", None)
+            if topk is not None:
+                topk.layer_id = absolute_layer_id
+            experts = getattr(mlp, "experts", None)
+            if experts is not None:
+                experts.layer_id = absolute_layer_id
+                runner_config = getattr(experts, "moe_runner_config", None)
+                if runner_config is not None:
+                    runner_config.layer_id = absolute_layer_id
+        if get_tensor_model_parallel_rank() == 0:
+            logger.warning(
+                "DSpark absolute MoE layer-id experiment enabled: %s", mapping
+            )
 
     def post_load_weights(self, is_nextn=False, is_dspark=False, weight_names=None):
         super().post_load_weights(is_dspark=True, weight_names=weight_names)
