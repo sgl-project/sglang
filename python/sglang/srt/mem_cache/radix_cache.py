@@ -800,10 +800,19 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         new_node.parent = child.parent
         new_node.lock_ref = child.lock_ref
         new_node.key = child.key[:split_len]
-        new_node.value = child.value[:split_len].clone()
+        # Zero-copy value split: node.value holds int64 KV-cache *indices* (one
+        # per token), not KV data, and is only ever read (torch.cat / free / len)
+        # never mutated in place — so the two halves can be non-owning slice views
+        # of the original tensor instead of clones. This drops a GPU tensor alloc
+        # + copy per split (splits fire on the hot match_prefix path). The views
+        # keep the original index tensor alive until both halves are freed, but
+        # that tensor's total size equals the two halves combined and holds only
+        # indices, so the retention is negligible. new_node.value is sliced from
+        # the original child.value *before* child.value is rebound below.
+        new_node.value = child.value[:split_len]
         child.parent = new_node
         child.key = child.key[split_len:]
-        child.value = child.value[split_len:].clone()
+        child.value = child.value[split_len:]
         new_node.parent.children[key.child_key(self.page_size)] = new_node
 
         # Split hash_value if it was already computed, otherwise leave as None
