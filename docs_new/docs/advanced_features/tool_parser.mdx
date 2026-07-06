@@ -1,7 +1,7 @@
 ---
 title: "Tool Parser"
 metatags:
-    description: "SGLang function calling: tool parsers for DeepSeek, Llama, Qwen, Mistral, GLM, Kimi K2. OpenAI-compatible tool use API."
+    description: "SGLang function calling: tool parsers for DeepSeek, Llama, Qwen, Mistral, GLM, Kimi K2, and Apertus. OpenAI-compatible tool use API."
 ---
 This guide demonstrates how to use SGLang’s [Function calling](https://platform.openai.com/docs/guides/function-calling) functionality.
 
@@ -22,6 +22,11 @@ This guide demonstrates how to use SGLang’s [Function calling](https://platfor
     </tr>
   </thead>
   <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`apertus2509`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Apertus 2509 (e.g., `swiss-ai/Apertus-{8,70}B-Instruct-2509`)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Tool calls are emitted as a JSON list of single-key objects: `<|tools_prefix|>[{"tool": {...}}]<|tools_suffix|>`.</td>
+    </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`deepseekv3`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>DeepSeek-v3 (e.g., `deepseek-ai/DeepSeek-V3-0324`)</td>

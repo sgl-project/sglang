@@ -8,6 +8,7 @@ export const KimiK2Deployment = () => {
       items: [
         { id: 'h200', label: 'H200', default: true },
         { id: 'b200', label: 'B200', default: false },
+        { id: 'b300', label: 'B300', default: false },
         { id: 'mi300x', label: 'MI300X', default: false },
         { id: 'mi325x', label: 'MI325X', default: false },
         { id: 'mi355x', label: 'MI355X', default: false }
@@ -81,6 +82,15 @@ export const KimiK2Deployment = () => {
     }
 
     cmd += ` \\\n  --trust-remote-code`;
+
+    if (hardware === 'b300') {
+      cmd += ` \\\n  --attention-backend flashinfer`;
+      if (strategyArray.includes('dp')) {
+        cmd += ` \\\n  --prefill-attention-backend triton`;
+      }
+      cmd += ` \\\n  --enforce-disable-flashinfer-allreduce-fusion`;
+      cmd += ` \\\n  --mem-fraction-static 0.85`;
+    }
 
     if (toolcall === 'enabled') {
       cmd += ` \\\n  --tool-call-parser kimi_k2`;

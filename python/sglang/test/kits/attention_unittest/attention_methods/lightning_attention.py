@@ -10,7 +10,6 @@ from sglang.srt.configs.mamba_utils import (
     Mamba2StateShape,
 )
 from sglang.srt.configs.model_config import AttentionArch
-from sglang.srt.layers import dp_attention as _dp_attention
 from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
 from sglang.srt.layers.attention.linear.lightning_backend import (
     LightningAttentionBackend,
@@ -21,14 +20,20 @@ from sglang.srt.mem_cache.memory_pool import (
     HybridReqToTokenPool,
     MHATokenToKVPool,
 )
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    CudaGraphConfig,
+    PhaseConfig,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.runtime_context import get_parallel
 
 from ..mock_server_args import make_mock_server_args
 
-_dp_attention.get_attention_tp_size = lambda: 1
-_dp_attention.get_attention_tp_rank = lambda: 0
+_parallel_override = get_parallel().override(attn_tp_size=1, attn_tp_rank=0)
+_parallel_override.__enter__()
 
 # seg_la kernel constraints (see seg_la.py:683-694):
 #   - decode (`seg_la_d_kernel`): K_SPLIT_DIM = 128, so head_dim must be >= 128
@@ -182,6 +187,7 @@ class TinyLightningModelConfig:
         self.is_encoder_decoder = False
         self.is_multimodal = False
         self.is_generation = True
+        self.quantization = None
         self.is_hybrid_swa = False
         self.is_local_attention_model = False
         self.attention_chunk_size = None
@@ -220,19 +226,30 @@ class MockLightningModelRunner(ModelRunner):
         self.dtype = dtype
         self.kv_cache_dtype = dtype
         self.gpu_id = 0
+        self.canary_manager = None
         self.page_size = case.page_size
         self.model_config = model_config
         speculative_num_draft_tokens = (
             case.input_lens[0]
             if case.forward_mode.is_target_verify()
-            or case.forward_mode.is_draft_extend(include_v2=True)
+            or case.forward_mode.is_draft_extend_v2()
             else 0
         )
         self.server_args = make_mock_server_args(
             attention_backend=case.backend,
             chunked_prefill_size=-1,
-            disable_cuda_graph=disable_cuda_graph,
-            disable_piecewise_cuda_graph=disable_piecewise_cuda_graph,
+            cuda_graph_config=CudaGraphConfig(
+                decode=PhaseConfig(
+                    backend=Backend.DISABLED if disable_cuda_graph else Backend.FULL,
+                ),
+                prefill=PhaseConfig(
+                    backend=(
+                        Backend.DISABLED
+                        if (disable_cuda_graph or disable_piecewise_cuda_graph)
+                        else Backend.TC_PIECEWISE
+                    ),
+                ),
+            ),
             dllm_algorithm=None,
             dllm_algorithm_config=None,
             enable_deterministic_inference=False,
@@ -303,6 +320,7 @@ class MockLightningModelRunner(ModelRunner):
         self.sliding_window_size = None
         self.use_mla_backend = False
         self.is_draft_worker = False
+        self._kernel_warmed_up = True
 
     @property
     def hybrid_gdn_config(self):

@@ -15,6 +15,7 @@ from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.layers.modelopt_utils import QUANT_CFG_CHOICES
 from sglang.srt.layers.quantization.modelopt_quant import (
+    ModelOptFp4Config,
     ModelOptMixedPrecisionConfig,
 )
 from sglang.srt.model_loader.loader import ModelOptModelLoader
@@ -646,7 +647,10 @@ class TestModelOptMixedPrecisionConfig(CustomTestCase):
         )
 
     def test_mixed_precision_uses_nvfp4_min_capability(self):
-        self.assertEqual(ModelOptMixedPrecisionConfig.get_min_capability(), 100)
+        self.assertEqual(
+            ModelOptMixedPrecisionConfig.get_min_capability(),
+            ModelOptFp4Config.get_min_capability(),
+        )
 
     def test_mixed_precision_quant_layer_resolution_after_mapping(self):
         quant_config = ModelOptMixedPrecisionConfig.from_config(

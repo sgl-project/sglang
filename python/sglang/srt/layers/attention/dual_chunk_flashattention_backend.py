@@ -19,10 +19,12 @@ from sglang.jit_kernel.flash_attention import (
     flash_attn_varlen_func,
     flash_attn_with_kvcache,
 )
-from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.flashattention_backend import FlashAttentionMetadata
+from sglang.srt.layers.attention.flashattention_backend import (
+    FlashAttentionMetadata,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.runtime_context import get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -168,9 +170,38 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
         layer_sparse_attention_config = {
             int(i): j for i, j in self.sparse_attention_config[layer_idx].items()
         }
-        start_head = self.num_heads * get_tensor_model_parallel_rank()
+        start_head = self.num_heads * get_parallel().tp_rank
         end_head = start_head + self.num_heads
         return [layer_sparse_attention_config[i] for i in range(start_head, end_head)]
+
+    def init_forward_metadata_out_graph(
+        self,
+        forward_batch: ForwardBatch,
+        in_capture: bool = False,
+    ):
+        bs = forward_batch.batch_size
+        req_pool_indices = forward_batch.req_pool_indices
+        seq_lens = forward_batch.seq_lens
+        forward_mode = forward_batch.forward_mode
+
+        if in_capture:
+            self._bind_metadata_buffers(bs, req_pool_indices, forward_mode)
+
+        self._apply_cuda_graph_metadata(
+            bs=bs,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            forward_mode=forward_mode,
+        )
+
+        if in_capture and forward_mode.is_decode_or_idle():
+            # Restore max_seq_len scalars — replay sets actual values but CUDA
+            # graph needs the safe upper bound baked in at capture time.
+            md = self.forward_metadata
+            md.max_seq_len = self.max_context_len
+            md.max_seq_len_intra = self.max_context_len
+            md.max_seq_len_succ = self.max_context_len
+            md.max_seq_len_inter = self.max_context_len
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize forward metadata hence all layers in the forward pass can reuse it."""
@@ -532,16 +563,13 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
             ),
         }
 
-    def init_forward_metadata_capture_cuda_graph(
+    def _bind_metadata_buffers(
         self,
         bs: int,
-        num_tokens: int,
         req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
-        spec_info: Optional[None],
     ):
+        """Allocate persistent metadata buffers for CUDA graph capture."""
         metadata = DualChunkFlashAttentionMetadata()
 
         if forward_mode.is_decode_or_idle():
@@ -580,19 +608,17 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
 
         self.forward_metadata = metadata
 
-    def init_forward_metadata_replay_cuda_graph(
+    def _apply_cuda_graph_metadata(
         self,
         bs: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        seq_lens_sum: int,
-        encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
-        spec_info: Optional[None],
-        seq_lens_cpu: Optional[torch.Tensor],
-        out_cache_loc: torch.Tensor = None,
     ):
-        """Initialize forward metadata for replaying CUDA graph."""
+        """Shared capture+replay body for the cuda-graph init path.
+
+        Public entry: :py:meth:`init_forward_metadata_out_graph`.
+        """
         assert forward_mode.is_decode()
         seq_lens = seq_lens[:bs]
         req_pool_indices = req_pool_indices[:bs]
@@ -1108,22 +1134,21 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
                         - prev_chunk_end_pos
                     )
                     if intra_vertical_indices.nelement() == 0:
-                        intra_vertical_indices = torch.cat(
-                            [
-                                intra_vertical_indices,
-                                torch.arange(
-                                    0,
-                                    k_states_intra.size(0),
-                                    max(1, k_states_intra.size(0) / 5),
-                                    dtype=torch.int32,
-                                    device=intra_vertical_indices.device,
-                                ),
-                            ]
+                        intra_vertical_indices = _sparse_fallback_indices(
+                            k_states_intra.size(0),
+                            heads_vertical_size[head_i],
+                            device=intra_vertical_indices.device,
                         )
                     slash_topk = slash_topk_buffer[head_i, : heads_slash_size[head_i]]
                     intra_slash_indices = (qk.size(-1) - 1) - slash_topk[
                         slash_topk >= prev_chunk_end_pos
                     ]
+                    if intra_slash_indices.nelement() == 0:
+                        intra_slash_indices = _sparse_fallback_indices(
+                            k_states_intra.size(0),
+                            heads_slash_size[head_i],
+                            device=intra_vertical_indices.device,
+                        )
                     # fill buffer
                     v_count = intra_vertical_indices.nelement()
                     s_count = intra_slash_indices.nelement()
@@ -1139,17 +1164,10 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
                         ] - (prev_chunk_end_pos - chunk_len)
                         # TODO: support no vertical
                         if succ_vertical_indices.nelement() == 0:
-                            succ_vertical_indices = torch.cat(
-                                [
-                                    succ_vertical_indices,
-                                    torch.arange(
-                                        0,
-                                        k_states_succ.size(0),
-                                        max(1, k_states_succ.size(0) / 5),
-                                        dtype=torch.int32,
-                                        device=intra_vertical_indices.device,
-                                    ),
-                                ]
+                            succ_vertical_indices = _sparse_fallback_indices(
+                                k_states_succ.size(0),
+                                heads_vertical_size[head_i],
+                                device=intra_vertical_indices.device,
                             )
                         succ_slash_indices = (
                             prev_chunk_end_pos + (qend - qbegin) - 1
@@ -1160,17 +1178,10 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
                             )
                         ]
                         if succ_slash_indices.nelement() == 0:
-                            succ_slash_indices = torch.cat(
-                                [
-                                    succ_slash_indices,
-                                    torch.arange(
-                                        0,
-                                        k_states_succ.size(0),
-                                        max(1, k_states_succ.size(0) / 5),
-                                        dtype=torch.int32,
-                                        device=intra_vertical_indices.device,
-                                    ),
-                                ]
+                            succ_slash_indices = _sparse_fallback_indices(
+                                k_states_succ.size(0),
+                                heads_slash_size[head_i],
+                                device=intra_vertical_indices.device,
                             )
                         # fill buffer
                         v_count = succ_vertical_indices.nelement()
@@ -1188,17 +1199,10 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
                         ]
 
                         if inter_vertical_indices.nelement() == 0:
-                            inter_vertical_indices = torch.cat(
-                                [
-                                    inter_vertical_indices,
-                                    torch.arange(
-                                        0,
-                                        k_states_inter.size(0),
-                                        max(1, k_states_inter.size(0) / 5),
-                                        dtype=torch.int32,
-                                        device=intra_vertical_indices.device,
-                                    ),
-                                ]
+                            inter_vertical_indices = _sparse_fallback_indices(
+                                k_states_inter.size(0),
+                                heads_vertical_size[head_i],
+                                device=intra_vertical_indices.device,
                             )
                         inter_slash_indices = (
                             prev_chunk_end_pos - chunk_len + (qend - qbegin) - 1
@@ -1207,17 +1211,10 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
                             < (prev_chunk_end_pos - chunk_len + (qend - qbegin))
                         ]
                         if inter_slash_indices.nelement() == 0:
-                            inter_slash_indices = torch.cat(
-                                [
-                                    inter_slash_indices,
-                                    torch.arange(
-                                        0,
-                                        k_states_inter.size(0),
-                                        max(1, k_states_inter.size(0) / 5),
-                                        dtype=torch.int32,
-                                        device=intra_vertical_indices.device,
-                                    ),
-                                ]
+                            inter_slash_indices = _sparse_fallback_indices(
+                                k_states_inter.size(0),
+                                heads_slash_size[head_i],
+                                device=intra_vertical_indices.device,
                             )
                         # fill buffer
                         v_count = inter_vertical_indices.nelement()
@@ -1584,6 +1581,16 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
         out[mask] = 0
         softmax_lse[mask] = -float("inf")
         return out, softmax_lse
+
+
+def _sparse_fallback_indices(
+    seq_len: int, max_count: int, device: torch.device
+) -> torch.Tensor:
+    count = min(int(max_count), seq_len)
+    if count <= 0:
+        return torch.empty(0, dtype=torch.int64, device=device)
+    step = max(1, math.ceil(seq_len / count))
+    return torch.arange(0, seq_len, step, dtype=torch.int64, device=device)[:count]
 
 
 def _vertical_slash_sparse_attention(
