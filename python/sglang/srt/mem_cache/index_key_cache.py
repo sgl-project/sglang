@@ -72,11 +72,7 @@ class IndexKeyCache:
         return self.buffer[layer_id - self.pool.start_layer]
 
     def get_k_continuous(self, layer_id: int, seq_len: int, page_indices: torch.Tensor):
-        if self.pool.layer_transfer_counter is not None:
-            self.pool.layer_transfer_counter.wait_until(
-                layer_id - self.pool.start_layer
-            )
-        buf = self.buffer[layer_id - self.pool.start_layer]
+        buf = self.get_buffer(layer_id)
         return index_buf_accessor.GetK.execute(
             self.pool, buf, seq_len=seq_len, page_indices=page_indices
         )
@@ -84,11 +80,7 @@ class IndexKeyCache:
     def get_k_scale_continuous(
         self, layer_id: int, seq_len: int, page_indices: torch.Tensor
     ):
-        if self.pool.layer_transfer_counter is not None:
-            self.pool.layer_transfer_counter.wait_until(
-                layer_id - self.pool.start_layer
-            )
-        buf = self.buffer[layer_id - self.pool.start_layer]
+        buf = self.get_buffer(layer_id)
         return index_buf_accessor.GetS.execute(
             self.pool, buf, seq_len=seq_len, page_indices=page_indices
         )
@@ -103,11 +95,7 @@ class IndexKeyCache:
     ):
         """Fused read of both index K and scale in one Triton call. Returns
         (k_fp8: (seq_len, index_head_dim) uint8, k_scale: (seq_len, 4) uint8)."""
-        if self.pool.layer_transfer_counter is not None:
-            self.pool.layer_transfer_counter.wait_until(
-                layer_id - self.pool.start_layer
-            )
-        buf = self.buffer[layer_id - self.pool.start_layer]
+        buf = self.get_buffer(layer_id)
         return index_buf_accessor.GetKAndS.execute(
             self.pool,
             buf,

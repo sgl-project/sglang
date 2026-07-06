@@ -230,7 +230,7 @@ class DeepseekModelNextN(nn.Module):
                 hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
                 positions = cp_split_and_rebuild_position(forward_batch, positions)
             residual = None
-            index_topk_share = IndexTopKShareState.from_forward_batch(forward_batch)
+            index_topk_share = IndexTopKShareState(forward_batch)
             with get_global_expert_distribution_recorder().disable_this_region():
                 hidden_states, residual, topk_indices = self.decoder(
                     positions,

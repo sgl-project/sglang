@@ -629,15 +629,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         # Forward multiple steps
         scores = None
-        # enable_mtp_iteration guarantees reuse_mtp_topk_indices and the carried
-        # spec_info.mtp_topk_indices are cleared on the way out even if a draft
+        # mtp_iteration clears the shared-topk state on exit even if a draft
         # step raises.
-        index_topk_share_cm = (
-            IndexTopKShareState.enable_mtp_iteration(forward_batch)
-            if self.index_share_for_mtp_iteration
-            else contextlib.nullcontext()
-        )
-        with index_topk_share_cm:
+        with IndexTopKShareState.mtp_iteration(
+            forward_batch, enabled=self.index_share_for_mtp_iteration
+        ):
             for i in range(self.speculative_num_steps):
                 input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
                     i, topk_p, topk_index, hidden_states, scores, self.topk
