@@ -23,6 +23,10 @@ class TestQwen3_5_9BXPU(SimpleEvalGSM8KXPUMixin, CustomTestCase):
     model = "Qwen/Qwen3.5-9B"
     tp_size = 1
     accuracy = 0.55
+    # TP=1 doesn't hit the Level Zero wedge the mixin guards against;
+    # single-thread ran ~21 s/q -> 200q blows the 40-min per-file budget.
+    # 4 concurrent streams keep the eval under the timeout.
+    num_threads = 4
 
     other_args = SimpleEvalGSM8KXPUMixin.other_args + [
         "--page-size",
