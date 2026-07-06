@@ -81,6 +81,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
+from sglang.srt.models.deepseek_nextn import DeepseekV3ForCausalLMNextN
 from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.runtime_context import get_flags, get_parallel
 from sglang.srt.server_args import get_global_server_args
@@ -1482,4 +1483,47 @@ class GlmMoeDsaForCausalLM(DeepseekV2ForCausalLM):
         super().determine_num_fused_shared_experts("GlmMoeDsaForCausalLM")
 
 
-EntryClass = [Glm4MoeForCausalLM, GlmMoeDsaForCausalLM]
+class GlmMoeDsaForCausalLMNextN(DeepseekV3ForCausalLMNextN):
+    def _resolve_nextn_quant_config(self, config, quant_config):
+        if quant_config is None or quant_config.get_name() != "quark":
+            return quant_config
+
+        layer_prefix = f"model.layers.{config.num_hidden_layers}"
+        mtp_excluded = [
+            name
+            for name in quant_config.exclude_layers
+            if name.startswith(layer_prefix + ".")
+        ]
+        if not mtp_excluded:
+            return quant_config
+
+        names = set(quant_config.exclude_layers)
+        nextn_spec_weight_names = (
+            "shared_head.norm",
+            "eh_proj",
+            "enorm",
+            "hnorm",
+        )
+        for name in mtp_excluded:
+            # Keep this mapping in sync with DeepseekV2WeightLoaderMixin's
+            # NextN rule: MTP-specific weights live under model.*, while the
+            # decoder block weights live under model.decoder.*.
+            if any(part in name for part in nextn_spec_weight_names):
+                runtime_name = name.replace(layer_prefix, "model", 1)
+            else:
+                runtime_name = name.replace(layer_prefix, "model.decoder", 1)
+            names.add(runtime_name)
+
+        # Fused routed experts are queried by the coarse module prefix
+        # "model.decoder.mlp.experts". Expanded per-expert leaf excludes do not
+        # match that prefix, so add the coarse prefix when any routed expert in
+        # the MTP layer is excluded. This keeps only that fused MoE module bf16
+        # while allowing the remaining draft modules to use their quant config.
+        if any(".mlp.experts." in name for name in mtp_excluded):
+            names.add("model.decoder.mlp.experts")
+
+        quant_config.exclude_layers = list(names)
+        return quant_config
+
+
+EntryClass = [Glm4MoeForCausalLM, GlmMoeDsaForCausalLM, GlmMoeDsaForCausalLMNextN]
