@@ -41,13 +41,19 @@ from sglang.srt.layers.attention.dsa.utils import (
     compute_dsa_seqlens,
     dsa_cp_round_robin_split_data,
     dsa_cp_round_robin_split_q_seqs,
+    dsa_use_prefill_cp,
     is_dsa_enable_prefill_cp,
+    is_dsa_prefill_cp_in_seq_split,
     pad_dsa_cache_seqlens,
 )
 from sglang.srt.layers.attention.utils import (
     concat_mla_absorb_q_general,
     mla_quantize_and_rope_for_fp8,
     seqlens_expand_triton,
+)
+from sglang.srt.layers.utils.cp_utils import (
+    cp_all_gather_rerange_output,
+    cp_split_and_rebuild_position,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import (
@@ -72,6 +78,24 @@ if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.spec_info import SpecInput
+
+
+def _all_gather_dsa_trtllm_fp8_kv(
+    forward_batch: ForwardBatch,
+    k: torch.Tensor,
+    k_rope: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    kv_lora_rank = k.shape[-1]
+    qk_rope_head_dim = k_rope.shape[-1]
+    kv_dtype = k.dtype
+    kv = torch.cat((k, k_rope), dim=-1).view(torch.uint8)
+    kv = cp_all_gather_rerange_output(
+        kv,
+        get_parallel().attn_cp_size,
+        forward_batch,
+        torch.cuda.current_stream(),
+    ).view(kv_dtype)
+    return kv.split((kv_lora_rank, qk_rope_head_dim), dim=-1)
 
 
 _is_hip = is_hip()
@@ -113,13 +137,6 @@ def _to_2d_context_lens(seqlens_32: torch.Tensor, batch_size: int) -> torch.Tens
 
 # Reuse this workspace buffer across all DSA backend instances
 global_workspace_buffer = None
-
-# Control whether to use fused metadata copy kernel for cuda graph replay (default: enabled)
-# Set SGLANG_USE_FUSED_METADATA_COPY=0 or false to disable
-_USE_FUSED_METADATA_COPY = envs.SGLANG_USE_FUSED_METADATA_COPY.get() and not _is_hip
-_USE_FUSED_METADATA_GENERATION = (
-    envs.SGLANG_DSA_USE_FUSED_METADATA_GENERATION.get() and not _is_hip
-)
 
 
 @dataclass(frozen=True)
@@ -731,6 +748,14 @@ class DeepseekSparseAttnBackend(
                 page_table, repeats=self.speculative_num_draft_tokens, dim=0
             )
         elif forward_batch.forward_mode.is_draft_extend_v2():
+            if forward_batch.extend_prefix_lens_cpu is None:
+                assert forward_batch.extend_prefix_lens is not None
+                forward_batch.extend_prefix_lens_cpu = (
+                    forward_batch.extend_prefix_lens.cpu().tolist()
+                )
+            if forward_batch.seq_lens_cpu is None:
+                forward_batch.seq_lens_cpu = forward_batch.seq_lens.cpu()
+                forward_batch.seq_lens_sum = int(forward_batch.seq_lens_cpu.sum())
             assert (
                 forward_batch.extend_seq_lens_cpu is not None
                 and forward_batch.extend_seq_lens is not None
@@ -1242,7 +1267,7 @@ class DeepseekSparseAttnBackend(
             # Normal Decode
             max_len = metadata.page_table_1.shape[1]
 
-            if _USE_FUSED_METADATA_GENERATION and is_cuda():
+            if is_cuda() and not _is_hip:
                 from sglang.srt.layers.attention.triton_ops.dsa_metadata import (
                     fused_dsa_decode_metadata,
                 )
@@ -1284,7 +1309,7 @@ class DeepseekSparseAttnBackend(
         elif forward_mode.is_target_verify():
             max_seqlen_k = metadata.page_table_1.shape[1]
 
-            if _USE_FUSED_METADATA_GENERATION and is_cuda():
+            if is_cuda() and not _is_hip:
                 from sglang.srt.layers.attention.triton_ops.dsa_metadata import (
                     fused_dsa_target_verify_metadata,
                 )
@@ -1382,7 +1407,7 @@ class DeepseekSparseAttnBackend(
                 device=self.device,
             )
 
-            if _USE_FUSED_METADATA_GENERATION and is_cuda():
+            if is_cuda() and not _is_hip:
                 from sglang.srt.layers.attention.triton_ops.dsa_metadata import (
                     fused_dsa_draft_extend_metadata,
                 )
@@ -1526,7 +1551,7 @@ class DeepseekSparseAttnBackend(
         fused_kernel_succeeded = False
 
         # Use fused CUDA kernel for all copy operations
-        if _USE_FUSED_METADATA_COPY:
+        if not _is_hip:
             try:
                 from sglang.jit_kernel.fused_metadata_copy import (
                     fused_metadata_copy_cuda,
@@ -1599,7 +1624,8 @@ class DeepseekSparseAttnBackend(
                     f"Warning: Fused metadata copy kernel failed with error: {e}, falling back to individual copies."
                 )
 
-        # Fallback to individual copy operations if fused kernel disabled or failed
+        # Fallback to individual copy operations if the fused kernel is unavailable
+        # or fails at runtime.
         if not fused_kernel_succeeded:
             # Copy basic seqlens
             metadata.cache_seqlens_int32.copy_(precomputed.cache_seqlens)
@@ -2488,17 +2514,25 @@ class DeepseekSparseAttnBackend(
                 cos_sin_cache is not None
             ), "For FP8 path cos_sin_cache should not be None."
 
+            rope_positions = forward_batch.positions
+            if dsa_use_prefill_cp(forward_batch):
+                rope_positions = cp_split_and_rebuild_position(
+                    forward_batch, rope_positions
+                )
+
             q, k, k_rope = mla_quantize_and_rope_for_fp8(
                 q,
                 q_rope,
                 k.squeeze(1),
                 k_rope.squeeze(1),
-                forward_batch.positions,
+                rope_positions,
                 cos_sin_cache,
                 is_neox,
                 self.kv_lora_rank,
                 self.qk_rope_head_dim,
             )
+            if save_kv_cache and dsa_use_prefill_cp(forward_batch):
+                k, k_rope = _all_gather_dsa_trtllm_fp8_kv(forward_batch, k, k_rope)
             merge_query = False
 
             # Save KV cache if requested
@@ -2560,6 +2594,15 @@ class DeepseekSparseAttnBackend(
         kv = kv_cache.view(-1, 1, self.real_page_size, self.kv_cache_dim)
         block_tables = page_table_1.unsqueeze(1)
         seq_lens = metadata.cache_seqlens_int32 if seq_lens is None else seq_lens
+
+        if (
+            dsa_use_prefill_cp(forward_batch)
+            and is_dsa_prefill_cp_in_seq_split()
+            and forward_batch.attn_cp_metadata is not None
+        ):
+            cp_meta = forward_batch.attn_cp_metadata
+            seq_chunks = list(torch.split(seq_lens, cp_meta.split_list, dim=0))
+            seq_lens = torch.cat([seq_chunks[i] for i in cp_meta.zigzag_index], dim=0)
 
         out = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
             query=q,
@@ -2773,153 +2816,134 @@ class DeepseekSparseAttnMultiStepBackend:
             return
 
         bs = forward_batch.batch_size
-        if envs.SGLANG_DSA_ENABLE_MTP_PRECOMPUTE_METADATA.get():
-            # Precompute metadata once (shared across all backends)
-            precomputed = self.attn_backends[0]._precompute_replay_metadata(
-                bs=bs,
-                req_pool_indices=forward_batch.req_pool_indices,
-                seq_lens=forward_batch.seq_lens,
-                seq_lens_cpu=forward_batch.seq_lens_cpu,
-                forward_mode=ForwardMode.DECODE,
-            )
+        # Precompute metadata once (shared across all backends)
+        precomputed = self.attn_backends[0]._precompute_replay_metadata(
+            bs=bs,
+            req_pool_indices=forward_batch.req_pool_indices,
+            seq_lens=forward_batch.seq_lens,
+            seq_lens_cpu=forward_batch.seq_lens_cpu,
+            forward_mode=ForwardMode.DECODE,
+        )
 
-            # Use multi-backend fused copy when we have 3 or more backends
-            # This is 3x faster than calling the single-backend copy 3 times
-            if self.speculative_num_steps > 3:
-                try:
-                    from sglang.jit_kernel.fused_metadata_copy import (
-                        fused_metadata_copy_multi_cuda,
+        # Use multi-backend fused copy when we have 3 or more backends
+        # This is 3x faster than calling the single-backend copy 3 times
+        if self.speculative_num_steps > 3:
+            try:
+                from sglang.jit_kernel.fused_metadata_copy import (
+                    fused_metadata_copy_multi_cuda,
+                )
+
+                metadata0 = self.attn_backends[0].decode_cuda_graph_metadata[bs]
+                metadata1 = self.attn_backends[1].decode_cuda_graph_metadata[bs]
+                metadata2 = self.attn_backends[2].decode_cuda_graph_metadata[bs]
+
+                # Set dsa_prefill_impl for first 3 backends (required by the method)
+                for i in range(3):
+                    self.attn_backends[i].set_dsa_prefill_impl(forward_batch=None)
+
+                # Prepare FlashMLA tensors if needed
+                flashmla_num_splits_src = None
+                flashmla_metadata_src = None
+                flashmla_num_splits_dst0 = None
+                flashmla_num_splits_dst1 = None
+                flashmla_num_splits_dst2 = None
+                flashmla_metadata_dst0 = None
+                flashmla_metadata_dst1 = None
+                flashmla_metadata_dst2 = None
+
+                if precomputed.flashmla_metadata is not None:
+                    flashmla_num_splits_src = precomputed.flashmla_metadata.num_splits
+                    flashmla_metadata_src = (
+                        precomputed.flashmla_metadata.flashmla_metadata
+                    )
+                    flashmla_num_splits_dst0 = metadata0.flashmla_metadata.num_splits
+                    flashmla_num_splits_dst1 = metadata1.flashmla_metadata.num_splits
+                    flashmla_num_splits_dst2 = metadata2.flashmla_metadata.num_splits
+                    flashmla_metadata_dst0 = (
+                        metadata0.flashmla_metadata.flashmla_metadata
+                    )
+                    flashmla_metadata_dst1 = (
+                        metadata1.flashmla_metadata.flashmla_metadata
+                    )
+                    flashmla_metadata_dst2 = (
+                        metadata2.flashmla_metadata.flashmla_metadata
                     )
 
-                    metadata0 = self.attn_backends[0].decode_cuda_graph_metadata[bs]
-                    metadata1 = self.attn_backends[1].decode_cuda_graph_metadata[bs]
-                    metadata2 = self.attn_backends[2].decode_cuda_graph_metadata[bs]
+                # Call the multi-backend fused kernel for first 3 backends
+                fused_metadata_copy_multi_cuda(
+                    # Source tensors
+                    precomputed.cache_seqlens,
+                    precomputed.cu_seqlens_k,
+                    precomputed.page_indices,
+                    precomputed.dsa_cache_seqlens,
+                    precomputed.dsa_cu_seqlens_k,
+                    precomputed.real_page_table,
+                    flashmla_num_splits_src,
+                    flashmla_metadata_src,
+                    # Destination tensors for backend 0
+                    metadata0.cache_seqlens_int32,
+                    metadata0.cu_seqlens_k,
+                    metadata0.page_table_1,
+                    metadata0.dsa_cache_seqlens_int32,
+                    metadata0.dsa_cu_seqlens_k,
+                    (
+                        metadata0.real_page_table
+                        if precomputed.real_page_table is not None
+                        else None
+                    ),
+                    flashmla_num_splits_dst0,
+                    flashmla_metadata_dst0,
+                    # Destination tensors for backend 1
+                    metadata1.cache_seqlens_int32,
+                    metadata1.cu_seqlens_k,
+                    metadata1.page_table_1,
+                    metadata1.dsa_cache_seqlens_int32,
+                    metadata1.dsa_cu_seqlens_k,
+                    (
+                        metadata1.real_page_table
+                        if precomputed.real_page_table is not None
+                        else None
+                    ),
+                    flashmla_num_splits_dst1,
+                    flashmla_metadata_dst1,
+                    # Destination tensors for backend 2
+                    metadata2.cache_seqlens_int32,
+                    metadata2.cu_seqlens_k,
+                    metadata2.page_table_1,
+                    metadata2.dsa_cache_seqlens_int32,
+                    metadata2.dsa_cu_seqlens_k,
+                    (
+                        metadata2.real_page_table
+                        if precomputed.real_page_table is not None
+                        else None
+                    ),
+                    flashmla_num_splits_dst2,
+                    flashmla_metadata_dst2,
+                    # Parameters
+                    bs,
+                    precomputed.max_len,
+                    precomputed.seqlens_expanded_size,
+                )
 
-                    # Set dsa_prefill_impl for first 3 backends (required by the method)
-                    for i in range(3):
-                        self.attn_backends[i].set_dsa_prefill_impl(forward_batch=None)
-
-                    # Prepare FlashMLA tensors if needed
-                    flashmla_num_splits_src = None
-                    flashmla_metadata_src = None
-                    flashmla_num_splits_dst0 = None
-                    flashmla_num_splits_dst1 = None
-                    flashmla_num_splits_dst2 = None
-                    flashmla_metadata_dst0 = None
-                    flashmla_metadata_dst1 = None
-                    flashmla_metadata_dst2 = None
-
-                    if precomputed.flashmla_metadata is not None:
-                        flashmla_num_splits_src = (
-                            precomputed.flashmla_metadata.num_splits
-                        )
-                        flashmla_metadata_src = (
-                            precomputed.flashmla_metadata.flashmla_metadata
-                        )
-                        flashmla_num_splits_dst0 = (
-                            metadata0.flashmla_metadata.num_splits
-                        )
-                        flashmla_num_splits_dst1 = (
-                            metadata1.flashmla_metadata.num_splits
-                        )
-                        flashmla_num_splits_dst2 = (
-                            metadata2.flashmla_metadata.num_splits
-                        )
-                        flashmla_metadata_dst0 = (
-                            metadata0.flashmla_metadata.flashmla_metadata
-                        )
-                        flashmla_metadata_dst1 = (
-                            metadata1.flashmla_metadata.flashmla_metadata
-                        )
-                        flashmla_metadata_dst2 = (
-                            metadata2.flashmla_metadata.flashmla_metadata
-                        )
-
-                    # Call the multi-backend fused kernel for first 3 backends
-                    fused_metadata_copy_multi_cuda(
-                        # Source tensors
-                        precomputed.cache_seqlens,
-                        precomputed.cu_seqlens_k,
-                        precomputed.page_indices,
-                        precomputed.dsa_cache_seqlens,
-                        precomputed.dsa_cu_seqlens_k,
-                        precomputed.real_page_table,
-                        flashmla_num_splits_src,
-                        flashmla_metadata_src,
-                        # Destination tensors for backend 0
-                        metadata0.cache_seqlens_int32,
-                        metadata0.cu_seqlens_k,
-                        metadata0.page_table_1,
-                        metadata0.dsa_cache_seqlens_int32,
-                        metadata0.dsa_cu_seqlens_k,
-                        (
-                            metadata0.real_page_table
-                            if precomputed.real_page_table is not None
-                            else None
-                        ),
-                        flashmla_num_splits_dst0,
-                        flashmla_metadata_dst0,
-                        # Destination tensors for backend 1
-                        metadata1.cache_seqlens_int32,
-                        metadata1.cu_seqlens_k,
-                        metadata1.page_table_1,
-                        metadata1.dsa_cache_seqlens_int32,
-                        metadata1.dsa_cu_seqlens_k,
-                        (
-                            metadata1.real_page_table
-                            if precomputed.real_page_table is not None
-                            else None
-                        ),
-                        flashmla_num_splits_dst1,
-                        flashmla_metadata_dst1,
-                        # Destination tensors for backend 2
-                        metadata2.cache_seqlens_int32,
-                        metadata2.cu_seqlens_k,
-                        metadata2.page_table_1,
-                        metadata2.dsa_cache_seqlens_int32,
-                        metadata2.dsa_cu_seqlens_k,
-                        (
-                            metadata2.real_page_table
-                            if precomputed.real_page_table is not None
-                            else None
-                        ),
-                        flashmla_num_splits_dst2,
-                        flashmla_metadata_dst2,
-                        # Parameters
-                        bs,
-                        precomputed.max_len,
-                        precomputed.seqlens_expanded_size,
+                # Copy remaining backends one by one (if > 3 backends)
+                for i in range(3, self.speculative_num_steps - 1):
+                    self.attn_backends[
+                        i
+                    ].init_forward_metadata_replay_cuda_graph_from_precomputed(
+                        bs=bs,
+                        precomputed=precomputed,
+                        forward_mode=ForwardMode.DECODE,
                     )
-
-                    # Copy remaining backends one by one (if > 3 backends)
-                    for i in range(3, self.speculative_num_steps - 1):
-                        self.attn_backends[
-                            i
-                        ].init_forward_metadata_replay_cuda_graph_from_precomputed(
-                            bs=bs,
-                            precomputed=precomputed,
-                            forward_mode=ForwardMode.DECODE,
-                        )
-                except (ImportError, Exception) as e:
-                    # Fallback to loop if multi-backend kernel not available or fails
-                    if isinstance(e, ImportError):
-                        print(
-                            "Warning: Multi-backend fused metadata copy kernel not available, falling back to loop."
-                        )
-                    else:
-                        print(
-                            f"Warning: Multi-backend fused metadata copy kernel failed with error: {e}, falling back to loop."
-                        )
-                    for i in range(self.speculative_num_steps - 1):
-                        self.attn_backends[
-                            i
-                        ].init_forward_metadata_replay_cuda_graph_from_precomputed(
-                            bs=bs,
-                            precomputed=precomputed,
-                            forward_mode=ForwardMode.DECODE,
-                        )
-            else:
-                # Less than 3 backends: copy to each backend individually
+            except (ImportError, Exception) as e:
+                # Fallback to loop if multi-backend kernel not available or fails
+                if isinstance(e, ImportError):
+                    print(
+                        "Warning: Multi-backend fused metadata copy kernel not available, falling back to loop."
+                    )
+                else:
+                    print(
+                        f"Warning: Multi-backend fused metadata copy kernel failed with error: {e}, falling back to loop."
+                    )
                 for i in range(self.speculative_num_steps - 1):
                     self.attn_backends[
                         i
@@ -2929,15 +2953,14 @@ class DeepseekSparseAttnMultiStepBackend:
                         forward_mode=ForwardMode.DECODE,
                     )
         else:
+            # Less than 3 backends: copy to each backend individually
             for i in range(self.speculative_num_steps - 1):
-                self.attn_backends[i]._apply_cuda_graph_metadata(
+                self.attn_backends[
+                    i
+                ].init_forward_metadata_replay_cuda_graph_from_precomputed(
                     bs=bs,
-                    req_pool_indices=forward_batch.req_pool_indices,
-                    seq_lens=forward_batch.seq_lens,
-                    seq_lens_cpu=forward_batch.seq_lens_cpu,
+                    precomputed=precomputed,
                     forward_mode=ForwardMode.DECODE,
-                    spec_info=forward_batch.spec_info,
-                    out_cache_loc=None,
                 )
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
