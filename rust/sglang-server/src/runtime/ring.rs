@@ -137,9 +137,10 @@ impl EgressProducer {
 }
 
 impl EgressConsumer {
-    /// Blocking receive used by the dedicated dispatcher thread.
-    pub fn recv(&self) -> Option<Bytes> {
-        self.rx.recv().ok()
+    /// The underlying receiver, so the dispatcher can drain it via
+    /// [`channels::recv`](crate::runtime::channels::recv) (data + shutdown select).
+    pub fn receiver(&self) -> &flume::Receiver<Bytes> {
+        &self.rx
     }
 }
 

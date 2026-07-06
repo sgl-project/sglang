@@ -26,7 +26,7 @@ use crate::message::{
     control_req_msgpack,
 };
 use crate::runtime::Runnable;
-use crate::runtime::channels::{DetokMsg, Senders, TmEvent};
+use crate::runtime::channels::{DetokMsg, Senders, TmEvent, recv};
 use crate::runtime::ring::IngressProducer;
 use crate::tokenizer_manager::sampling::normalize_sampling_params;
 
@@ -38,6 +38,7 @@ pub struct Ingress {
     senders: Senders,
     ingress: IngressProducer,
     skip_tokenizer_init: bool,
+    shutdown: flume::Receiver<()>,
 }
 
 impl Ingress {
@@ -46,19 +47,21 @@ impl Ingress {
         senders: Senders,
         ingress: IngressProducer,
         skip_tokenizer_init: bool,
+        shutdown: flume::Receiver<()>,
     ) -> Self {
         Self {
             rx,
             senders,
             ingress,
             skip_tokenizer_init,
+            shutdown,
         }
     }
 }
 
 impl Runnable for Ingress {
     fn run(self) {
-        while let Ok(ev) = self.rx.recv() {
+        while let Some(ev) = recv(&self.rx, &self.shutdown) {
             match ev {
                 // A fresh request and one returning from the tokenizer pool.
                 TmEvent::Ingress(req) | TmEvent::Tokenized(req) => self.drive(req),
@@ -353,7 +356,11 @@ mod tests {
         };
         let (ingress_producer, consumer) = ingress_ring(16);
         let (tm_tx, tm_rx) = flume::unbounded();
-        let ingress = Ingress::new(tm_rx, senders, ingress_producer, false);
+        // Keep the shutdown sender alive (leak) so its branch never fires — tests
+        // end `run` by dropping `tm_tx`, not by shutdown.
+        let (sd_tx, sd_rx) = flume::unbounded::<()>();
+        std::mem::forget(sd_tx);
+        let ingress = Ingress::new(tm_rx, senders, ingress_producer, false, sd_rx);
         (ingress, detok_rx, consumer, tm_tx)
     }
 
