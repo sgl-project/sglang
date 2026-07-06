@@ -249,6 +249,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._last_context_kv_path_debug: Optional[str] = None
         self._boundary_debug_by_req_pool: dict[int, dict] = {}
         self._target_aux_debug_by_req_pool: dict[int, dict] = {}
+        self._prefill_tail_replay_debug_by_req_pool: dict[int, dict] = {}
         self._swa_write_source_by_req_pool: dict[int, dict[int, str]] = {}
         self._last_valid_swa_locs_by_req_pool_debug: dict[int, list[int]] = {}
         self._swa_write_source_snapshot_by_req_pool: Optional[
@@ -978,6 +979,15 @@ class DSparkWorkerV2(BaseSpecWorker):
                         ),
                     },
                 )
+                self._record_prefill_tail_replay_executed_debug(
+                    req_pool_idx=int(req_pool_indices[i]),
+                    positions=positions[i, row_valid],
+                    cache_locs=cache_locs[i, row_valid],
+                    hidden_rows=hidden[i, row_valid],
+                    tail_len=int(tail_len),
+                    tail_end_len=int(tail_end_lens[i]),
+                    prefix_len=int(prefix_lens[i]),
+                )
         self._materialize_main_hidden_to_draft_state(
             main_hidden=flat_hidden,
             cache_loc=flat_cache_locs,
@@ -1427,6 +1437,104 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
             debug[stage] = {"error": str(e)}
 
+    def _init_prefill_tail_replay_round_debug(
+        self,
+        *,
+        req_pool_indices: torch.Tensor,
+        draft_input: DSparkDraftInputV2,
+    ) -> None:
+        if not self._accept_anomaly_enabled or not self._is_tp0():
+            return
+        try:
+            req_pool_indices_cpu = [
+                int(x) for x in req_pool_indices.detach().cpu().reshape(-1).tolist()
+            ]
+            hidden = draft_input.prefill_tail_hidden_states
+            mask = draft_input.prefill_tail_valid_mask
+            hidden_shape = (
+                [int(x) for x in hidden.shape]
+                if isinstance(hidden, torch.Tensor)
+                else None
+            )
+            mask_shape = (
+                [int(x) for x in mask.shape] if isinstance(mask, torch.Tensor) else None
+            )
+            has_payload = (
+                isinstance(hidden, torch.Tensor)
+                and hidden.numel() > 0
+                and hidden.dim() == 3
+                and isinstance(mask, torch.Tensor)
+                and mask.shape == hidden.shape[:2]
+                and hidden.shape[0] == len(req_pool_indices_cpu)
+            )
+            mask_counts = None
+            if has_payload:
+                mask_counts = [
+                    int(x)
+                    for x in mask.to(dtype=torch.bool)
+                    .sum(dim=1)
+                    .detach()
+                    .cpu()
+                    .tolist()
+                ]
+            for i, req_pool_idx in enumerate(req_pool_indices_cpu):
+                payload = {
+                    "round_has_payload": bool(has_payload),
+                    "executed": False,
+                    "hidden_shape": hidden_shape,
+                    "mask_shape": mask_shape,
+                }
+                if mask_counts is not None and i < len(mask_counts):
+                    payload["mask_valid_count"] = int(mask_counts[i])
+                    if mask_counts[i] == 0:
+                        payload["skip_reason"] = "empty_mask_row"
+                elif not has_payload:
+                    payload["skip_reason"] = "no_tail_payload"
+                self._prefill_tail_replay_debug_by_req_pool[int(req_pool_idx)] = payload
+        except Exception as e:
+            for req_pool_idx in req_pool_indices.detach().cpu().reshape(-1).tolist():
+                self._prefill_tail_replay_debug_by_req_pool[int(req_pool_idx)] = {
+                    "error": str(e)
+                }
+
+    def _record_prefill_tail_replay_executed_debug(
+        self,
+        *,
+        req_pool_idx: int,
+        positions: torch.Tensor,
+        cache_locs: torch.Tensor,
+        hidden_rows: torch.Tensor,
+        tail_len: int,
+        tail_end_len: int,
+        prefix_len: int,
+    ) -> None:
+        if not self._accept_anomaly_enabled or not self._is_tp0():
+            return
+        try:
+            payload = self._prefill_tail_replay_debug_by_req_pool.setdefault(
+                int(req_pool_idx), {}
+            )
+            loc_payload = self._boundary_loc_payload(
+                positions=positions.to(device=self.device, dtype=torch.int64),
+                cache_locs=cache_locs.to(device=self.device, dtype=torch.int64),
+                hidden_rows=hidden_rows.to(device=self.device),
+            )
+            payload.update(
+                {
+                    "executed": True,
+                    "valid_write_count": int(positions.numel()),
+                    "tail_len": int(tail_len),
+                    "tail_end_len": int(tail_end_len),
+                    "prefix_len": int(prefix_len),
+                    "tail_end_minus_prefix": int(tail_end_len) - int(prefix_len),
+                    "writes": loc_payload,
+                }
+            )
+        except Exception as e:
+            self._prefill_tail_replay_debug_by_req_pool[int(req_pool_idx)] = {
+                "error": str(e)
+            }
+
     def _boundary_loc_payload(
         self,
         *,
@@ -1746,6 +1854,11 @@ class DSparkWorkerV2(BaseSpecWorker):
                 ),
                 "target_aux_debug": self._target_aux_debug_by_req_pool.get(
                     int(req_pool_idx)
+                ),
+                "prefill_tail_replay_debug": (
+                    self._prefill_tail_replay_debug_by_req_pool.get(
+                        int(req_pool_idx)
+                    )
                 ),
                 "context_head_kv_checksums": [
                     self._checksum_swa_kv_rows(
@@ -3385,6 +3498,10 @@ class DSparkWorkerV2(BaseSpecWorker):
         draft_out_cache_loc = verify_out_cache_loc.view(bs, verify_stride)[
             :, :block_size
         ].reshape(-1)
+        self._init_prefill_tail_replay_round_debug(
+            req_pool_indices=req_pool_indices,
+            draft_input=draft_input,
+        )
         self._materialize_disagg_prefill_hidden_to_draft_state(
             draft_input=draft_input,
             batch=model_worker_batch,
