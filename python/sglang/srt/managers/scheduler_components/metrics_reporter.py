@@ -63,6 +63,11 @@ class PrefillStats:
     reprocessed_log_input_tokens: int = 0
     reprocessed_log_hit_tokens: int = 0
     num_pending_tokens: int = 0
+    # Per-tier cache hit breakdown (raw token counts, no page alignment)
+    log_l1_hit_tokens: int = 0
+    log_l2_hit_tokens: int = 0
+    log_l3_hit_tokens: int = 0
+    log_miss_tokens: int = 0
 
     @classmethod
     def from_adder(
@@ -83,6 +88,10 @@ class PrefillStats:
             ),
             num_new_seqs=len(adder.can_run_list),
             num_pending_tokens=num_pending_tokens,
+            log_l1_hit_tokens=adder.log_l1_hit_tokens,
+            log_l2_hit_tokens=adder.log_l2_hit_tokens,
+            log_l3_hit_tokens=adder.log_l3_hit_tokens,
+            log_miss_tokens=adder.log_miss_tokens,
         )
 
 
@@ -651,6 +660,10 @@ class SchedulerMetricsReporter:
             )
             self.stats.num_grammar_queue_reqs = len(self.scheduler.grammar_manager)
             self.stats.cache_hit_rate = cache_hit_rate
+            self.stats.l1_hit_tokens = prefill_stats.log_l1_hit_tokens
+            self.stats.l2_hit_tokens = prefill_stats.log_l2_hit_tokens
+            self.stats.l3_hit_tokens = prefill_stats.log_l3_hit_tokens
+            self.stats.cache_miss_tokens = prefill_stats.log_miss_tokens
 
             # Memory pool usage ratios / Absolute token counts
             pool_stats.update_scheduler_stats(self.stats)
