@@ -1815,6 +1815,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         *,
         req_pool_idx: int,
         prefix_len: int,
+        anchor_len: int,
         block_size: int,
     ) -> Optional[dict]:
         try:
@@ -1823,7 +1824,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             translate_swa = getattr(token_to_kv_pool, "translate_loc_from_full_to_swa", None)
             if translate_swa is None:
                 return None
-            anchor_len = max(int(prefix_len) - 1, 0)
+            anchor_len = max(int(anchor_len), 0)
             start = max(anchor_len - 128, 0)
             end = anchor_len + int(block_size)
             if end <= start:
@@ -1834,7 +1835,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 logical,
             ].view(-1)
             swa_locs = translate_swa(full_locs)
-            verify_start = int(prefix_len)
+            verify_start = int(anchor_len)
             verify_end = verify_start + int(block_size)
             verify_logical = torch.arange(
                 verify_start,
@@ -2949,6 +2950,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 kv_debug = self._build_accept_anomaly_kv_debug(
                     req_pool_idx=int(req_pool_idx),
                     prefix_len=int(seq_lens[i]),
+                    anchor_len=int(anchor_lens_cpu[i]),
                     block_size=int(self.block_size),
                 )
                 markov_debug = self._build_accept_anomaly_markov_debug(
