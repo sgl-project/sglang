@@ -2908,6 +2908,10 @@ class ServerArgs:
             self.chunked_prefill_size = -1
             self.disable_radix_cache = True
             self.disable_cuda_graph = True
+            # cuda_graph_config was already parsed from the legacy boolean, so
+            # flipping the boolean alone would not stop graph capture.
+            self.cuda_graph_config.decode.backend = Backend.DISABLED
+            self.cuda_graph_config.prefill.backend = Backend.DISABLED
             logger.warning(
                 "HRM-Text (prefix_lm) detected: forcing --attention-backend "
                 "triton, --chunked-prefill-size -1, --disable-radix-cache, and "
