@@ -24,6 +24,18 @@ python scripts/release/bump_sglang_version.py 0.5.3rc0
 - `python/pyproject_npu.toml`
 - `python/sglang/version.py`
 
+### `bump_docs_install_version.py`
+Updates the "install from source" release-branch version (the `git clone -b v<version> ...sglang.git` line) in the Mintlify docs. Driven automatically on release-tag push by [`.github/workflows/bot-bump-docs-version.yml`](../../.github/workflows/bot-bump-docs-version.yml), which opens a PR with the change.
+
+**Usage:**
+```bash
+python scripts/release/bump_docs_install_version.py 0.5.13
+```
+
+**Files updated:**
+- `docs_new/docs/get-started/install.mdx` (Method 2: From source)
+- `docs_new/docs/hardware-platforms/amd_gpu.mdx` (Install from Source)
+
 ### `bump_kernel_version.py`
 Updates the `sglang-kernel` release version across all relevant files following the pattern from [PR #10732](https://github.com/sgl-project/sglang/pull/10732).
 
