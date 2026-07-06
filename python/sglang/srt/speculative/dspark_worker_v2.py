@@ -902,10 +902,14 @@ class DSparkWorkerV2(BaseSpecWorker):
         for i, extend_len in enumerate(extend_lens):
             extend_len = int(extend_len)
             next_offset = offset + extend_len
-            copy_len = min(tail_len, extend_len)
+            # Decode draft-block row0 writes the anchor token itself. Replay only
+            # the target-hidden context before that anchor, matching draft SWA
+            # metadata's 128 context rows plus the 5 draft-block rows.
+            copy_len = min(tail_len, max(extend_len - 1, 0))
             if copy_len > 0:
+                src_end = next_offset - 1
                 tail_hidden[i, tail_len - copy_len : tail_len].copy_(
-                    hidden[next_offset - copy_len : next_offset]
+                    hidden[src_end - copy_len : src_end]
                 )
                 tail_mask[i, tail_len - copy_len : tail_len] = True
             offset = next_offset
@@ -936,7 +940,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         tail_end_lens = draft_input.new_seq_lens
         if tail_end_lens.numel() != bs:
             tail_end_lens = prefix_lens
-        tail_end_lens = tail_end_lens.to(device=device, dtype=torch.int64)
+        tail_end_lens = tail_end_lens.to(device=device, dtype=torch.int64) - 1
         positions = (
             tail_end_lens.unsqueeze(1)
             - tail_len
