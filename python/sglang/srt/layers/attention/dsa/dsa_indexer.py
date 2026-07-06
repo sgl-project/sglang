@@ -363,10 +363,9 @@ class Indexer(MultiPlatformOp):
         self.index_topk = index_topk
         self.q_lora_rank = q_lora_rank
         self.layer_id = layer_id
+        self.is_neox_style = is_neox_style
         self.use_dsa_indexer_fusion = (
-            _is_cuda
-            and not envs.SGLANG_DISABLE_DSA_INDEXER_FUSION.get()
-            and not is_neox_style
+            _is_cuda and not envs.SGLANG_DISABLE_DSA_INDEXER_FUSION.get()
         )
         self.alt_stream = alt_stream
         self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
@@ -659,6 +658,7 @@ class Indexer(MultiPlatformOp):
                 self._indexer_cos_sin_cache,
                 positions,
                 page_size,
+                is_neox=self.is_neox_style,
             )
             return
 
@@ -670,6 +670,7 @@ class Indexer(MultiPlatformOp):
             self.k_norm.variance_epsilon,
             self._indexer_cos_sin_cache,
             positions,
+            is_neox=self.is_neox_style,
         )
         self._store_index_k_cache(
             forward_batch=forward_batch,
@@ -722,6 +723,7 @@ class Indexer(MultiPlatformOp):
                 q_scale_gate,
                 self._indexer_cos_sin_cache,
                 positions,
+                is_neox=self.is_neox_style,
             )
 
         # Two overlap stages: wq_b GEMM (alt) || wk_weights_proj GEMM (current),
@@ -749,6 +751,7 @@ class Indexer(MultiPlatformOp):
             q_scale_gate,
             self._indexer_cos_sin_cache,
             positions,
+            is_neox=self.is_neox_style,
         )
         with torch.cuda.stream(self.alt_stream):
             self._fused_k_prepare_and_store(

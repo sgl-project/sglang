@@ -60,6 +60,45 @@ load_rope_first_cos_sin(const float* __restrict__ cos_sin_cache, int32_t lane_id
   return freq;
 }
 
+// NeoX (non-interleaved) freq load. The cache row layout is the same halves
+// layout [cos_0..cos_31, sin_0..sin_31]; only the element pairing differs:
+// NeoX pairs element e with e ^ (kRopeDim/2), both using freq index
+// e & (kRopeDim/2 - 1). Lane L owns elements [4L, 4L+4), so it needs 4
+// contiguous cos and 4 contiguous sin values (one 16B load each).
+template <int64_t kRopeDim>
+SGL_DEVICE void load_rope_first_cos_sin_neox(
+    const float* __restrict__ cos_sin_cache,
+    int32_t lane_id,
+    device::AlignedVector<float, 4>& cos4,
+    device::AlignedVector<float, 4>& sin4) {
+  constexpr int64_t kHalfRopeDim = kRopeDim / 2;
+  const int32_t freq0 = (lane_id * 4) & (kHalfRopeDim - 1);
+  cos4.load(cos_sin_cache + freq0);
+  sin4.load(cos_sin_cache + kHalfRopeDim + freq0);
+}
+
+// NeoX rotation for the rope lanes of a warp where lane L holds the 4-elem
+// pack [4L, 4L+4) of a kRopeDim-wide rope region spanning lanes
+// [0, kRopeSize). Element e pairs with e ^ (kRopeDim/2), i.e. the partner
+// pack lives at lane L ^ (kRopeSize/2) with the same intra-pack index. Must
+// be called by ALL lanes [0, kRopeSize) (they converge on the shuffle).
+template <uint32_t kRopeSize>
+SGL_DEVICE void rope_rotate_neox(
+    device::AlignedVector<float, 4>& data,
+    const device::AlignedVector<float, 4>& cos4,
+    const device::AlignedVector<float, 4>& sin4,
+    int32_t lane_id) {
+  constexpr uint32_t kHalfLaneMask = kRopeSize / 2;
+  constexpr uint32_t kActiveMask = (1u << kRopeSize) - 1;
+  const bool is_first_half = lane_id < kHalfLaneMask;
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    float other = __shfl_xor_sync(kActiveMask, data[i], kHalfLaneMask);
+    other = is_first_half ? -other : other;
+    data[i] = data[i] * cos4[i] + other * sin4[i];
+  }
+}
+
 // ============================================================================
 // Q kernel: warp-per-(token, head) rmsnorm-self + RoPE + write to q_out.
 // ============================================================================
@@ -448,7 +487,13 @@ struct FusedQIndexerRopeHadamardQuantParams {
   uint32_t num_heads;
 };
 
-template <typename DType, typename PosT, bool kUsePDL, bool kRopeFirst = false, bool kHadamard = true>
+template <
+    typename DType,
+    typename PosT,
+    bool kUsePDL,
+    bool kRopeFirst = false,
+    bool kHadamard = true,
+    bool kIsNeox = false>
 Q_KERNEL void fused_q_indexer_rope_hadamard_quant(const __grid_constant__ FusedQIndexerRopeHadamardQuantParams params) {
   using namespace device;
 
@@ -459,6 +504,10 @@ Q_KERNEL void fused_q_indexer_rope_hadamard_quant(const __grid_constant__ FusedQ
   static_assert(kHeadDim == kWarpThreads * kVecSize);
   static_assert(kRopeDim == kWarpThreads * 2);
   static_assert(kRopeSize <= kWarpThreads);
+  // NeoX rotation is only wired for the rope-first (V3.2 indexer) layout,
+  // where the rope lanes are the low lanes [0, kRopeSize) that the
+  // shuffle-based half-swap in rope_rotate_neox assumes.
+  static_assert(!kIsNeox || kRopeFirst, "kIsNeox requires kRopeFirst");
 
   using Storage = AlignedVector<DType, kVecSize>;
   using Float4 = AlignedVector<float, kVecSize>;
@@ -485,7 +534,7 @@ Q_KERNEL void fused_q_indexer_rope_hadamard_quant(const __grid_constant__ FusedQ
   // is known (part 4).
 
   PDLWaitPrimary<kUsePDL>();
-  Float4 data, freq;
+  Float4 data, freq, freq2;
   const uint32_t head_id = work_id - batch_id * params.num_heads;
   const auto weight_val =
       cast<float>(static_cast<const DType*>(params.weight)[batch_id * params.weight_stride_batch + head_id]);
@@ -495,7 +544,9 @@ Q_KERNEL void fused_q_indexer_rope_hadamard_quant(const __grid_constant__ FusedQ
     Storage input_vec;
     input_vec.load(input_ptr, lane_id);
     if (is_rope_lane) {
-      if constexpr (kRopeFirst) {
+      if constexpr (kIsNeox) {
+        load_rope_first_cos_sin_neox<kRopeDim>(rope_cache, lane_id, freq, freq2);
+      } else if constexpr (kRopeFirst) {
         freq = load_rope_first_cos_sin<kRopeDim>(rope_cache, lane_id);
       } else {
         freq.load(rope_cache, lane_id - (kWarpThreads - kRopeSize));
@@ -507,20 +558,25 @@ Q_KERNEL void fused_q_indexer_rope_hadamard_quant(const __grid_constant__ FusedQ
     }
   }
 
-  // part 2: rope on rope lanes only (4 elems / lane = 2 (real, imag) pairs).
+  // part 2: rope on rope lanes only (4 elems / lane; NeoX pairs across lanes,
+  // interleave pairs 2 local (real, imag) pairs).
   if (is_rope_lane) {
-    const auto x_real = data[0];
-    const auto x_imag = data[1];
-    const auto y_real = data[2];
-    const auto y_imag = data[3];
-    const auto fxr = freq[0];
-    const auto fxi = freq[1];
-    const auto fyr = freq[2];
-    const auto fyi = freq[3];
-    data[0] = x_real * fxr - x_imag * fxi;
-    data[1] = x_real * fxi + x_imag * fxr;
-    data[2] = y_real * fyr - y_imag * fyi;
-    data[3] = y_real * fyi + y_imag * fyr;
+    if constexpr (kIsNeox) {
+      rope_rotate_neox<kRopeSize>(data, freq, freq2, lane_id);
+    } else {
+      const auto x_real = data[0];
+      const auto x_imag = data[1];
+      const auto y_real = data[2];
+      const auto y_imag = data[3];
+      const auto fxr = freq[0];
+      const auto fxi = freq[1];
+      const auto fyr = freq[2];
+      const auto fyi = freq[3];
+      data[0] = x_real * fxr - x_imag * fxi;
+      data[1] = x_real * fxi + x_imag * fxr;
+      data[2] = y_real * fyr - y_imag * fyi;
+      data[3] = y_real * fyi + y_imag * fyr;
+    }
   }
 
   PDLTriggerSecondary<kUsePDL>();
@@ -579,10 +635,11 @@ Q_KERNEL void fused_q_indexer_rope_hadamard_quant(const __grid_constant__ FusedQ
   }
 }
 
-template <typename DType, bool kUsePDL, bool kRopeFirst = false, bool kHadamard = true>
+template <typename DType, bool kUsePDL, bool kRopeFirst = false, bool kHadamard = true, bool kIsNeox = false>
 struct FusedQIndexerRopeHadamardQuantKernel {
   template <typename PosT>
-  static constexpr auto kernel = fused_q_indexer_rope_hadamard_quant<DType, PosT, kUsePDL, kRopeFirst, kHadamard>;
+  static constexpr auto kernel =
+      fused_q_indexer_rope_hadamard_quant<DType, PosT, kUsePDL, kRopeFirst, kHadamard, kIsNeox>;
 
   static void forward(
       const tvm::ffi::TensorView q_input,
