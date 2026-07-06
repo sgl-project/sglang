@@ -223,6 +223,15 @@ fn opt_texts(t: &[String]) -> Option<&[String]> {
     (!t.is_empty()).then_some(t)
 }
 
+/// The logprob slot of a tuple: a finite value, or `null` for the `NaN` sentinel.
+fn lp_value(v: f32) -> serde_json::Value {
+    if v.is_nan() {
+        serde_json::Value::Null
+    } else {
+        serde_json::json!(v)
+    }
+}
+
 /// Build the SGLang logprob wire shape: a list of `[logprob, token_id, text]`
 /// tuples. `texts` (flat, parallel to `idxs`) fills the text slot when
 /// `return_text_in_logprobs` is set; otherwise it is `null`.
@@ -231,7 +240,7 @@ fn logprob_tuples(vals: &[f32], idxs: &[i32], texts: Option<&[String]>) -> serde
         .iter()
         .zip(idxs.iter())
         .enumerate()
-        .map(|(j, (&v, &tid))| serde_json::json!([v, tid, text_slot(texts, j)]))
+        .map(|(j, (&v, &tid))| serde_json::json!([lp_value(v), tid, text_slot(texts, j)]))
         .collect();
     serde_json::Value::Array(tuples)
 }
@@ -254,7 +263,7 @@ fn ragged_logprob_tuples(
             positions.push(serde_json::Value::Null);
         } else {
             let tuples: Vec<serde_json::Value> = (off..off + l)
-                .map(|j| serde_json::json!([vals[j], idxs[j], text_slot(texts, j)]))
+                .map(|j| serde_json::json!([lp_value(vals[j]), idxs[j], text_slot(texts, j)]))
                 .collect();
             positions.push(serde_json::Value::Array(tuples));
         }
@@ -833,6 +842,47 @@ mod logprob_shape_tests {
                 serde_json::Value::Null,
                 [[-0.3f32, 9, serde_json::Value::Null]]
             ])
+        );
+    }
+
+    /// The `NaN` sentinel (the Python `None` logprob for the first prompt token)
+    /// becomes a JSON `null` logprob, while its token id in the parallel `idx`
+    /// column is preserved. Guards the scheduler-killing prompt-logprob crash.
+    #[test]
+    fn nan_sentinel_becomes_null_logprob() {
+        // Flat (input/output logprobs): first value absent, second present.
+        let flat = logprob_tuples(&[f32::NAN, -0.5], &[10, 20], None);
+        assert_eq!(
+            flat,
+            serde_json::json!([
+                [serde_json::Value::Null, 10, serde_json::Value::Null],
+                [-0.5f32, 20, serde_json::Value::Null],
+            ])
+        );
+        // Ragged (top-k / token-ids logprobs): a NaN inside a position → null.
+        let ragged = ragged_logprob_tuples(&[f32::NAN], &[7], &[1], None);
+        assert_eq!(
+            ragged,
+            serde_json::json!([[[serde_json::Value::Null, 7, serde_json::Value::Null]]])
+        );
+    }
+
+    /// End-to-end: a `GenerationOutput` carrying a prompt-logprob request (first
+    /// input logprob is the `NaN` sentinel) formats without panicking and emits
+    /// `input_token_logprobs` with a leading `[null, token_id, text]`.
+    #[test]
+    fn prompt_logprob_frame_emits_null_first() {
+        let out = GenerationOutput {
+            rid: "1".into(),
+            in_lp_val: vec![f32::NAN, -0.5],
+            in_lp_idx: vec![10, 20],
+            in_lp_txt: vec!["<s>".into(), "hi".into()],
+            ..Default::default()
+        };
+        let frame: serde_json::Value = serde_json::from_slice(&sglang_frame(&out)).unwrap();
+        assert_eq!(
+            frame["meta_info"]["input_token_logprobs"],
+            serde_json::json!([[serde_json::Value::Null, 10, "<s>"], [-0.5f32, 20, "hi"]])
         );
     }
 
