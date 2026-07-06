@@ -74,6 +74,7 @@ pub async fn serve(
     egress_buf: usize,
     server_args: Arc<ServerArgs>,
     egress_activity: ActivityCounter,
+    shutdown: flume::Receiver<()>,
 ) {
     let state = AppState {
         senders,
@@ -106,7 +107,10 @@ pub async fn serve(
     match tokio::net::TcpListener::bind(bind).await {
         Ok(listener) => {
             tracing::info!(%bind, "sglang-server api listening");
-            if let Err(e) = axum::serve(listener, app).await {
+            let serve = axum::serve(listener, app).with_graceful_shutdown(async move {
+                let _ = shutdown.recv_async().await;
+            });
+            if let Err(e) = serve.await {
                 tracing::error!(error = %e, "axum serve exited");
             }
         }
