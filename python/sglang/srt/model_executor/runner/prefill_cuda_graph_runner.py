@@ -734,19 +734,40 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         Returns ``(forward_batch, attn_backend)`` to mirror decode's
         capture_prepare signature.
         """
-        bs = self._capture_req_slots
-        # Slot 0 carries num_tokens; slots 1..bs-1 are zero-length sentinels.
-        lens_cpu = [num_tokens] + [0] * (bs - 1)
-        start_loc_cpu = [0] + [num_tokens] * (bs - 1)
+        if self.prefill_backend_name == Backend.FULL:
+            bs = self._capture_req_slots
+            # Slot 0 carries num_tokens; slots 1..bs-1 are zero-length sentinels.
+            capture_seq_lens = [num_tokens] + [0] * (bs - 1)
+            capture_start_locs = [0] + [num_tokens] * (bs - 1)
+        else:
+            context_length = self.model_runner.model_config.context_len
+            # Build a dummy prefill batch with num_tokens aggregate tokens while
+            # keeping every synthetic request at or below context_length.
+            capture_seq_lens = [
+                min(context_length, num_tokens - start)
+                for start in range(0, num_tokens, context_length)
+            ]
+            bs = len(capture_seq_lens)
+            assert bs <= self.max_bs, (
+                f"Capture batch needs {bs} request slots for {num_tokens} tokens, "
+                f"but the request pool has only {self.max_bs}."
+            )
+            capture_start_locs = [0]
+            for seq_len in capture_seq_lens[:-1]:
+                capture_start_locs.append(capture_start_locs[-1] + seq_len)
 
         with torch.device(self.device):
             shape_inputs = {
                 "req_pool_indices": torch.arange(bs, device=self.device),
-                "seq_lens": torch.tensor(lens_cpu, device=self.device),
-                "orig_seq_lens": torch.tensor(lens_cpu, device=self.device),
-                "extend_seq_lens": torch.tensor(lens_cpu, device=self.device),
+                "seq_lens": torch.tensor(capture_seq_lens, device=self.device),
+                "orig_seq_lens": torch.tensor(capture_seq_lens, device=self.device),
+                "extend_seq_lens": torch.tensor(
+                    capture_seq_lens, device=self.device
+                ),
                 "extend_prefix_lens": torch.zeros((bs,), dtype=torch.int64),
-                "extend_start_loc": torch.tensor(start_loc_cpu, device=self.device),
+                "extend_start_loc": torch.tensor(
+                    capture_start_locs, device=self.device
+                ),
             }
         if self._prefill_static_buffers is not None:
             s = self._prefill_static_buffers
@@ -797,7 +818,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 seq_lens=shape_inputs["seq_lens"],
                 next_token_logits_buffer=self._next_token_logits_buffer(bs),
                 orig_seq_lens=shape_inputs["orig_seq_lens"],
-                seq_lens_cpu=torch.tensor(lens_cpu, device="cpu"),
+                seq_lens_cpu=torch.tensor(capture_seq_lens, device="cpu"),
                 out_cache_loc=_slot("out_cache_loc"),
                 seq_lens_sum=num_tokens,
                 mamba_track_indices=(
@@ -822,8 +843,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 extend_prefix_lens=shape_inputs["extend_prefix_lens"],
                 extend_start_loc=shape_inputs["extend_start_loc"],
                 extend_prefix_lens_cpu=[0] * bs,
-                extend_seq_lens_cpu=list(lens_cpu),
-                extend_logprob_start_lens_cpu=list(lens_cpu),
+                extend_seq_lens_cpu=list(capture_seq_lens),
+                extend_logprob_start_lens_cpu=list(capture_seq_lens),
                 positions=_slot("positions"),
                 global_num_tokens_gpu=global_num_tokens_gpu,
                 global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
