@@ -399,6 +399,16 @@ def prepare_moe_mxfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
             _permute_bias(w2_bias_data), requires_grad=False
         )
 
+    # Drop the loader-format scale parameters. The marlin path reads only
+    # the repacked e8m0 copies registered above; when the checkpoint
+    # registered its scales under the *_scale_inv names, the float32
+    # loader copies (4x the on-disk e8m0 bytes -- ~16 GB per rank for a
+    # 43-layer, 256-expert model at ep2) would otherwise stay registered
+    # for the server's lifetime and starve the KV pool.
+    for stale in ("w13_weight_scale_inv", "w2_weight_scale_inv"):
+        if hasattr(layer, stale):
+            delattr(layer, stale)
+
 
 def prepare_moe_nvfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
     if layer.quant_config.group_size != 16:
