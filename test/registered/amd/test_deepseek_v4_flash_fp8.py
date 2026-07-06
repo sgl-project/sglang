@@ -35,6 +35,7 @@ DEEPSEEK_V4_FP8_MODEL_PATH = os.environ.get(
 )
 SERVER_LAUNCH_TIMEOUT = 3600
 FLASHMLA_BACKEND = os.environ.get("SGLANG_HACK_FLASHMLA_BACKEND", "unified_kv_triton")
+LOAD_ONLY = os.environ.get("SGLANG_DSV4_LOAD_ONLY") == "1"
 
 COMMON_ENV_VARS = {
     "SGLANG_DEFAULT_THINKING": "1",
@@ -97,6 +98,18 @@ class TestDeepseekV4Fp8(CustomTestCase):
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
 
+    @unittest.skipIf(not LOAD_ONLY, "SGLANG_DSV4_LOAD_ONLY is not set")
+    def test_0_load_only(self):
+        if is_in_ci():
+            write_github_step_summary(
+                f"### test_load_only (deepseek-v4-flash-fp8, {FLASHMLA_BACKEND})\n"
+                "server launched successfully\n"
+            )
+
+    @unittest.skipIf(
+        LOAD_ONLY,
+        "SGLANG_DSV4_LOAD_ONLY=1: load-only run (skipping accuracy)",
+    )
     def test_a_gsm8k(self):
         # `a` prefix to run first (alphabetical) and warm up the server.
         args = SimpleNamespace(
@@ -119,8 +132,8 @@ class TestDeepseekV4Fp8(CustomTestCase):
             self.assertGreater(metrics["accuracy"], 0.91)
 
     @unittest.skipIf(
-        os.environ.get("SGLANG_DSV4_ACCURACY_ONLY") == "1",
-        "SGLANG_DSV4_ACCURACY_ONLY=1: accuracy-only run (skipping perf)",
+        LOAD_ONLY or os.environ.get("SGLANG_DSV4_ACCURACY_ONLY") == "1",
+        "load-only or accuracy-only run (skipping perf)",
     )
     def test_b_perf_8k_1k(self):
         json_output = "/tmp/deepseek_v4_flash_fp8_perf.json"

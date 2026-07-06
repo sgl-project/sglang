@@ -1308,25 +1308,89 @@ jobs:
           bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
           bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
 
-      - name: Accuracy + Performance Test MI35x ROCm 7.2 (8-GPU DeepSeek-V4-Flash FP8 + FP4, unified_kv_triton)
+      - name: Dump ROCm NUMA diagnostics
+        run: |
+          cat > /tmp/sglang_rocm_numa_diag.sh <<'BASH'
+          #!/bin/bash
+          set -euxo pipefail
+          echo SGLANG_NUMA_DIAG_BEGIN
+          env | sort | grep -E '^(SGLANG|CUDA|HIP|ROCR|HSA|GPU_ARCHS)=' || true
+          lscpu | grep -E 'NUMA|Socket|Core|Thread|CPU\(s\)' || true
+          numactl --hardware || true
+          numactl --show || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showtoponuma --showbus || true
+          fi
+          for p in /sys/class/drm/renderD*/device/numa_node /sys/class/drm/card*/device/numa_node; do
+            [ -e "$p" ] && echo "$p=$(cat "$p")"
+          done
+          python3 - <<'PY'
+          import os
+          from types import SimpleNamespace
+
+          import torch
+
+          from sglang.srt.utils.common import is_cuda, is_cuda_alike, is_hip
+          from sglang.srt.utils import numa_utils
+
+          print(f"torch.version.cuda={torch.version.cuda}")
+          print(f"torch.version.hip={torch.version.hip}")
+          print(f"torch.cuda.is_available()={torch.cuda.is_available()}")
+          print(f"torch.cuda.device_count()={torch.cuda.device_count()}")
+          print(f"is_cuda()={is_cuda()}")
+          print(f"is_hip()={is_hip()}")
+          print(f"is_cuda_alike()={is_cuda_alike()}")
+          print(f"numa_utils._is_cuda={numa_utils._is_cuda}")
+          print(f"SGLANG_NUMA_BIND_V2={os.environ.get('SGLANG_NUMA_BIND_V2')}")
+          print(f"SGLANG_SET_CPU_AFFINITY={os.environ.get('SGLANG_SET_CPU_AFFINITY')}")
+          print(f"os.sched_getaffinity(0)={sorted(os.sched_getaffinity(0))}")
+          print(f"numa_utils._is_numa_available()={numa_utils._is_numa_available()}")
+          server_args = SimpleNamespace(numa_node=None)
+          for gpu_id in range(torch.cuda.device_count()):
+              try:
+                  queried = numa_utils._query_numa_node_for_gpu(gpu_id)
+              except Exception as exc:
+                  queried = f"error: {type(exc).__name__}: {exc}"
+              try:
+                  available = numa_utils.get_numa_node_if_available(
+                      server_args, gpu_id
+                  )
+              except Exception as exc:
+                  available = f"error: {type(exc).__name__}: {exc}"
+              print(
+                  f"gpu_id={gpu_id} queried_numa={queried} "
+                  f"available_numa={available}"
+              )
+          PY
+          echo SGLANG_NUMA_DIAG_END
+          BASH
+          chmod +x /tmp/sglang_rocm_numa_diag.sh
+          docker cp /tmp/sglang_rocm_numa_diag.sh ci_sglang:/tmp/sglang_rocm_numa_diag.sh
+          docker exec -w /sglang-checkout/test ci_sglang bash /tmp/sglang_rocm_numa_diag.sh
+
+      - name: Load-only Test MI35x ROCm 7.2 (8-GPU DeepSeek-V4-Flash FP8 + FP4, affinity on)
         timeout-minutes: 300
         run: |
           > github_summary.md  # Clear summary file
-          echo "## SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton" >> github_summary.md
+          echo "## DSV4 Flash load-only, SGLANG_SET_CPU_AFFINITY=1, SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton" >> github_summary.md
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
             -e SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton \
+            -e SGLANG_DSV4_LOAD_ONLY=1 \
+            -e SGLANG_SET_CPU_AFFINITY=1 \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
             python3 run_suite.py --hw amd --suite nightly-amd-8-gpu-mi35x-deepseek-v4-flash --nightly --timeout-per-file 7200 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }}
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
 
-      - name: Accuracy + Performance Test MI35x ROCm 7.2 (8-GPU DeepSeek-V4-Flash FP8 + FP4, triton)
+      - name: Load-only Test MI35x ROCm 7.2 (8-GPU DeepSeek-V4-Flash FP8 + FP4, affinity off)
         if: ${{ !cancelled() }}
         timeout-minutes: 300
         run: |
           > github_summary.md  # Clear summary file
-          echo "## SGLANG_HACK_FLASHMLA_BACKEND=triton" >> github_summary.md
+          echo "## DSV4 Flash load-only, SGLANG_SET_CPU_AFFINITY=0, SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton" >> github_summary.md
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
-            -e SGLANG_HACK_FLASHMLA_BACKEND=triton \
+            -e SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton \
+            -e SGLANG_DSV4_LOAD_ONLY=1 \
+            -e SGLANG_SET_CPU_AFFINITY=0 \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
             python3 run_suite.py --hw amd --suite nightly-amd-8-gpu-mi35x-deepseek-v4-flash --nightly --timeout-per-file 7200 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }}
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
