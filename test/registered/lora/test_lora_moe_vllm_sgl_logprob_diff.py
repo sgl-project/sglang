@@ -16,7 +16,7 @@ import unittest
 
 import torch
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci, register_xpu_ci
 from sglang.test.lora_utils import (
     MOE_BASE_MODEL_PATH,
     MOE_LORA_PATH,
@@ -29,6 +29,7 @@ register_cuda_ci(
     stage="base-b",
     runner_config="1-gpu-large",
 )
+register_xpu_ci(est_time=60, suite="stage-a-test-1-gpu-xpu")
 
 # Format: [{"text": "result string", "lps": [0.1, 0.2, ...]}, ...]
 VLLM_CACHED_RESULTS = [
@@ -287,6 +288,17 @@ class TestMoELoraRegression(unittest.TestCase):
 
     def test_sglang_moe_parity_strict(self):
 
+        # flashinfer is CUDA-only; on other devices (e.g. XPU) use the
+        # platform-appropriate attention backend.
+        from sglang.srt.utils import is_cuda, is_xpu
+
+        if is_cuda():
+            attention_backend = "flashinfer"
+        elif is_xpu():
+            attention_backend = "intel_xpu"
+        else:
+            attention_backend = "triton"
+
         with SRTRunner(
             model_path=MOE_BASE_MODEL_PATH,
             torch_dtype=torch.bfloat16,
@@ -296,7 +308,7 @@ class TestMoELoraRegression(unittest.TestCase):
             tp_size=1,
             trust_remote_code=True,
             disable_radix_cache=True,
-            attention_backend="flashinfer",
+            attention_backend=attention_backend,
             mem_fraction_static=0.80,
         ) as srt_runner:
 
