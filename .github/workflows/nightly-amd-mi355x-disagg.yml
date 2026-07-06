@@ -21,6 +21,10 @@ on:
         description: 'Optional. Rebuild/install Mooncake at this commit inside prefill/decode containers before launching servers.'
         required: false
         default: ''
+      mooncake_cmake_flags:
+        description: 'Optional. CMake flags used with mooncake_commit. Leave empty for current Dockerfile flags.'
+        required: false
+        default: ''
 
 concurrency:
   group: nightly-test-mi355x
@@ -149,6 +153,7 @@ jobs:
           # Debug-only: when set, the launcher rebuilds Mooncake at this commit
           # inside the prefill/decode containers before starting SGLang.
           MOONCAKE_COMMIT_OVERRIDE: ${{ inputs.mooncake_commit }}
+          MOONCAKE_CMAKE_FLAGS: ${{ inputs.mooncake_cmake_flags }}
           # Keep the scheduler off mia1-p01-g20: its ionic RDMA driver ABI
           # mismatches the container, so MORI reports "no active RDMA device"
           # and the disagg server dies on init. Remove once the node is fixed.
