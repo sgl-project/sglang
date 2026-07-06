@@ -973,7 +973,7 @@ jobs:
               ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
   stage-c-test-large-8-gpu-amd:
-    name: ${{ format('stage-c-test-large-8-gpu-amd (linux-{0}-8gpu-sglang, {1})', inputs.runner_arch || 'mi325', matrix.part) }}
+    name: ${{ format('stage-c-test-large-8-gpu-amd (linux-mi300-xgpu-sglang, {0})', matrix.part) }}
     needs: [check-changes, call-gate, wait-for-stage-b-amd]
     if: |
       always() &&
@@ -986,12 +986,12 @@ jobs:
         )
       )
     env:
-      RUNNER_LABELS: ${{ format('linux-{0}-8gpu-sglang', inputs.runner_arch || 'mi325') }}
+      RUNNER_LABELS: linux-mi300-xgpu-sglang
     strategy:
       fail-fast: false
       matrix:
         part: [0, 1, 2, 3]
-    runs-on: ${{ format('linux-{0}-8gpu-sglang', inputs.runner_arch || 'mi325') }}
+    runs-on: linux-mi300-xgpu-sglang
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -1016,7 +1016,7 @@ jobs:
           docker exec ci_sglang bash -c "cd /sglang-checkout && NCCL_DEBUG=INFO RCCL_DEBUG=INFO torchrun --nproc_per_node=8 scripts/ci/amd/test_rccl_multi_gpu.py"
 
       - name: Run test
-        timeout-minutes: 120
+        timeout-minutes: 240
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-c-test-large-8-gpu-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 4 --timeout-per-file 5400 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
