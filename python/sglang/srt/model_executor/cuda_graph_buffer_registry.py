@@ -742,7 +742,10 @@ def build_decode_registry(
             def _pp_source(key):
                 def _fn(_fb, ctx):
                     ppx = ctx.pp_proxy_tensors
-                    return None if ppx is None else ppx.tensors[key]
+                    # .get: a buffer key the running model does not send this step
+                    # (e.g. the default "residual" slot for a model that hands
+                    # "v_first" instead) sources to None and is skipped, not raised.
+                    return None if ppx is None else ppx.tensors.get(key)
 
                 return _fn
 
