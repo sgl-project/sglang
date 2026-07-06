@@ -6,10 +6,11 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     per_token_group_quant_fp8,
     w8a8_block_fp8_matmul,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-large")
+register_amd_ci(est_time=10, stage="stage-b", runner_config="1-gpu-large-amd")
 
 from sglang.srt.utils import get_device, is_cuda, is_xpu
 
