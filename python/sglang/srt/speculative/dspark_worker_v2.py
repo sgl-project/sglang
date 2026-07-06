@@ -230,6 +230,9 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._accept_anomaly_topk_enabled = _env_flag(
             "SGLANG_DSPARK_DEBUG_ACCEPT_TOPK", True
         )
+        self._accept_anomaly_verbose = _env_flag(
+            "SGLANG_DSPARK_DEBUG_ACCEPT_VERBOSE", False
+        )
         self._accept_anomaly_threshold = max(
             1, _env_int("SGLANG_DSPARK_DEBUG_ACCEPT_THRESHOLD", 8)
         )
@@ -1730,7 +1733,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         req_pool_idx: int,
         visible_locs: Optional[list[int]],
         *,
-        max_sources: int = 16,
+        max_sources: int = 4,
     ) -> Optional[dict]:
         if not visible_locs:
             return None
@@ -1866,10 +1869,6 @@ class DSparkWorkerV2(BaseSpecWorker):
                 "prefix_len": int(prefix_len),
                 "anchor_len": int(anchor_len),
                 "logical_first_last": [int(start), int(end - 1)],
-                "full_first8": [int(x) for x in full_locs[:8].detach().cpu().tolist()],
-                "full_last8": [int(x) for x in full_locs[-8:].detach().cpu().tolist()],
-                "swa_first8": [int(x) for x in swa_locs[:8].detach().cpu().tolist()],
-                "swa_last8": [int(x) for x in swa_locs[-8:].detach().cpu().tolist()],
                 "context_len": context_len,
                 "context_tail_swa_locs": [
                     int(x) for x in context_tail_swa.detach().cpu().tolist()
@@ -1890,47 +1889,65 @@ class DSparkWorkerV2(BaseSpecWorker):
                     if visible_block_swa_locs is not None
                     else None
                 ),
-                "boundary_debug": self._boundary_debug_by_req_pool.get(
-                    int(req_pool_idx)
-                ),
-                "target_aux_debug": self._target_aux_debug_by_req_pool.get(
-                    int(req_pool_idx)
-                ),
                 "prefill_tail_replay_debug": (
                     self._prefill_tail_replay_debug_by_req_pool.get(
                         int(req_pool_idx)
                     )
                 ),
-                "context_head_kv_checksums": [
-                    self._checksum_swa_kv_rows(
-                        layer_id=layer_id,
-                        swa_locs=context_head_swa,
-                    )
-                    for layer_id in layer_ids
-                ],
-                "context_tail_kv_checksums": [
-                    self._checksum_swa_kv_rows(
-                        layer_id=layer_id,
-                        swa_locs=context_tail_swa,
-                    )
-                    for layer_id in layer_ids
-                ],
-                "draft_query_kv_checksums": [
-                    self._checksum_swa_kv_rows(
-                        layer_id=layer_id,
-                        swa_locs=draft_query_swa,
-                    )
-                    for layer_id in layer_ids
-                ],
-                "visible_block_kv_checksums": (
-                    [
-                        self._checksum_swa_kv_rows(
-                            layer_id=layer_id,
-                            swa_locs=visible_block_swa,
-                        )
-                        for layer_id in layer_ids
-                    ]
-                    if visible_block_swa is not None
+                "verbose_debug": (
+                    {
+                        "full_first8": [
+                            int(x) for x in full_locs[:8].detach().cpu().tolist()
+                        ],
+                        "full_last8": [
+                            int(x) for x in full_locs[-8:].detach().cpu().tolist()
+                        ],
+                        "swa_first8": [
+                            int(x) for x in swa_locs[:8].detach().cpu().tolist()
+                        ],
+                        "swa_last8": [
+                            int(x) for x in swa_locs[-8:].detach().cpu().tolist()
+                        ],
+                        "boundary_debug": self._boundary_debug_by_req_pool.get(
+                            int(req_pool_idx)
+                        ),
+                        "target_aux_debug": self._target_aux_debug_by_req_pool.get(
+                            int(req_pool_idx)
+                        ),
+                        "context_head_kv_checksums": [
+                            self._checksum_swa_kv_rows(
+                                layer_id=layer_id,
+                                swa_locs=context_head_swa,
+                            )
+                            for layer_id in layer_ids
+                        ],
+                        "context_tail_kv_checksums": [
+                            self._checksum_swa_kv_rows(
+                                layer_id=layer_id,
+                                swa_locs=context_tail_swa,
+                            )
+                            for layer_id in layer_ids
+                        ],
+                        "draft_query_kv_checksums": [
+                            self._checksum_swa_kv_rows(
+                                layer_id=layer_id,
+                                swa_locs=draft_query_swa,
+                            )
+                            for layer_id in layer_ids
+                        ],
+                        "visible_block_kv_checksums": (
+                            [
+                                self._checksum_swa_kv_rows(
+                                    layer_id=layer_id,
+                                    swa_locs=visible_block_swa,
+                                )
+                                for layer_id in layer_ids
+                            ]
+                            if visible_block_swa is not None
+                            else None
+                        ),
+                    }
+                    if self._accept_anomaly_verbose
                     else None
                 ),
             }
@@ -2748,65 +2765,6 @@ class DSparkWorkerV2(BaseSpecWorker):
             and draft_input.future_indices.numel() == bs
             else None
         )
-        sampling_info = getattr(model_worker_batch, "sampling_info", None)
-        sampling_is_all_greedy = (
-            bool(getattr(sampling_info, "is_all_greedy"))
-            if sampling_info is not None
-            and hasattr(sampling_info, "is_all_greedy")
-            else None
-        )
-
-        def _sampling_param_cpu(name: str):
-            value = (
-                getattr(sampling_info, name, None)
-                if sampling_info is not None
-                else None
-            )
-            if value is None:
-                return None
-            try:
-                return value.detach().cpu().view(-1).tolist()
-            except Exception:
-                return None
-
-        temperatures = _sampling_param_cpu("temperatures")
-        top_ks = _sampling_param_cpu("top_ks")
-        top_ps = _sampling_param_cpu("top_ps")
-        verify_cache = verify_out_cache_loc.detach().cpu().view(bs, block_size)
-        position_rows = positions.detach().cpu().view(bs, block_size)
-        req_to_token = self.model_runner.req_to_token_pool.req_to_token
-        max_req_len = int(req_to_token.shape[1])
-        logical_probe = torch.stack(
-            (
-                torch.clamp(prefix_lens.to(torch.int64) - 1, min=0),
-                prefix_lens.to(torch.int64),
-                prefix_lens.to(torch.int64) + block_size - 1,
-            ),
-            dim=1,
-        ).clamp(max=max_req_len - 1)
-        req_pool_indices_gpu = model_worker_batch.req_pool_indices.to(
-            device=req_to_token.device
-        )
-        req_to_token_probe = req_to_token[
-            req_pool_indices_gpu[:, None], logical_probe.to(req_to_token.device)
-        ]
-        token_to_kv_pool = self.draft_model_runner.attn_backend.token_to_kv_pool
-        translate_swa = getattr(token_to_kv_pool, "translate_loc_from_full_to_swa", None)
-        if translate_swa is not None:
-            try:
-                probe_swa = translate_swa(req_to_token_probe).detach().cpu()
-                verify_swa = translate_swa(verify_out_cache_loc).detach().cpu().view(
-                    bs, block_size
-                )
-            except Exception:
-                probe_swa = None
-                verify_swa = None
-        else:
-            probe_swa = None
-            verify_swa = None
-        req_to_token_probe = req_to_token_probe.detach().cpu()
-        logical_probe = logical_probe.detach().cpu()
-
         def _req_token_at(req, pos: int) -> Optional[int]:
             if req is None:
                 return None
@@ -2853,7 +2811,6 @@ class DSparkWorkerV2(BaseSpecWorker):
             candidate_row = candidate_cpu[i]
             target_row = target_cpu[i]
             confidence_row = confidence_cpu[i]
-            cache_row = verify_cache[i]
             commit_len = int(commit_lens_cpu[i])
             req_origin_len = (
                 len(getattr(req, "origin_input_ids", []) or [])
@@ -2872,28 +2829,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             req_latest_token = _req_latest_token(req)
             draft_anchor_i = int(draft_anchor[i]) if draft_anchor is not None else None
             input_bonus_i = int(input_bonus[i]) if input_bonus is not None else None
-            draft_block_metadata = self._last_draft_block_metadata_debug
-            visible_block_sources = None
-            valid_tail_sources = None
             valid_window_sources = None
-            if isinstance(draft_block_metadata, dict):
-                block_locs_by_row = draft_block_metadata.get(
-                    "draft_swa_valid_block_locs_by_row"
-                )
-                if isinstance(block_locs_by_row, list) and block_locs_by_row:
-                    row_idx = min(i, len(block_locs_by_row) - 1)
-                    row_locs = block_locs_by_row[row_idx]
-                    if isinstance(row_locs, list):
-                        visible_block_sources = self._visible_window_source_debug(
-                            int(req_pool_idx), row_locs
-                        )
-                valid_edges = draft_block_metadata.get("draft_swa_valid_edges")
-                if isinstance(valid_edges, dict):
-                    tail_locs = valid_edges.get("first_valid_last8")
-                    if isinstance(tail_locs, list):
-                        valid_tail_sources = self._visible_window_source_debug(
-                            int(req_pool_idx), tail_locs
-                        )
             valid_locs = self._last_valid_swa_locs_by_req_pool_debug.get(
                 int(req_pool_idx)
             )
@@ -2911,35 +2847,6 @@ class DSparkWorkerV2(BaseSpecWorker):
                     ),
                     "seq_len": int(seq_lens[i]),
                     "new_seq_len": int(next_seq_lens[i]),
-                    "is_all_greedy": sampling_is_all_greedy,
-                    "temperature": (
-                        float(temperatures[i])
-                        if temperatures is not None and i < len(temperatures)
-                        else None
-                    ),
-                    "top_k": (
-                        int(top_ks[i])
-                        if top_ks is not None and i < len(top_ks)
-                        else None
-                    ),
-                    "top_p": (
-                        float(top_ps[i])
-                        if top_ps is not None and i < len(top_ps)
-                        else None
-                    ),
-                    "kv_committed": (
-                        int(getattr(req, "kv_committed_len"))
-                        if req is not None and hasattr(req, "kv_committed_len")
-                        else None
-                    ),
-                    "kv_allocated": (
-                        int(getattr(req, "kv_allocated_len"))
-                        if req is not None and hasattr(req, "kv_allocated_len")
-                        else None
-                    ),
-                    "req_origin_len": req_origin_len,
-                    "req_output_len": req_output_len,
-                    "req_seq_len": req_seq_len,
                     "req_seq_len_minus_prefix": (
                         int(req_seq_len) - int(seq_lens[i])
                         if req_seq_len is not None
@@ -2999,40 +2906,10 @@ class DSparkWorkerV2(BaseSpecWorker):
                     ),
                     "next_bonus": int(next_bonus[i]),
                     "accept_len": commit_len,
-                    "verify_cache_first": int(cache_row[0]) if block_size > 0 else None,
-                    "verify_cache_last": (
-                        int(cache_row[-1]) if block_size > 0 else None
-                    ),
-                    "pos_first": int(position_rows[i][0]) if block_size > 0 else None,
-                    "pos_last": int(position_rows[i][-1]) if block_size > 0 else None,
-                    "logical_prev_cur_last": [
-                        int(x) for x in logical_probe[i].tolist()
-                    ],
-                    "full_prev_cur_last": [
-                        int(x) for x in req_to_token_probe[i].tolist()
-                    ],
-                    "swa_prev_cur_last": (
-                        [int(x) for x in probe_swa[i].tolist()]
-                        if probe_swa is not None
-                        else None
-                    ),
-                    "verify_swa_first": (
-                        int(verify_swa[i][0])
-                        if verify_swa is not None and block_size > 0
-                        else None
-                    ),
-                    "verify_swa_last": (
-                        int(verify_swa[i][-1])
-                        if verify_swa is not None and block_size > 0
-                        else None
-                    ),
-                    "visible_block_sources": visible_block_sources,
-                    "valid_tail_sources": valid_tail_sources,
                     "valid_window_sources": valid_window_sources,
                     "prefill_tail_replay_debug": (
                         self._prefill_tail_replay_history_debug(int(req_pool_idx))
                     ),
-                    "draft_block_metadata": draft_block_metadata,
                 }
             )
             if len(history) > self._accept_anomaly_history_size:
