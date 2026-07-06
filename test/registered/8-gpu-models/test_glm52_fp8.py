@@ -51,7 +51,12 @@ class TestGlm52Fp8(unittest.TestCase):
                 tp_size=8,
                 extra_args=COMMON_ARGS
                 + dp_args
-                + ["--moe-a2a-backend", "flashinfer"],
+                + [
+                    "--moe-runner-backend",
+                    "flashinfer_trtllm_routed",
+                    "--moe-a2a-backend",
+                    "flashinfer",
+                ],
                 variant="TP8+DP8+FlashInferA2A",
             ),
             ModelLaunchSettings(
