@@ -4,9 +4,7 @@
 // PDL, NaiveScheduler + MaskedLayoutScheduler, ue8m0/float scales, fp8/int8
 // output, fused silu+mul) so it is a drop-in replacement; the only changes vs the
 // AOT source are the launcher (tvm::ffi::TensorView + TensorMatcher + the JIT
-// LaunchKernel/PDL helpers), the FP8 type alias, and the JIT-only outer-major
-// scale layouts for non-masked 3D row-major inputs (fp32 strided stores and
-// per-outer-slice packed-UE8M0 slabs, selected via the wrapper's stride slots).
+// LaunchKernel/PDL helpers) and the FP8 type alias.
 #include <sgl_kernel/tensor.h>  // TensorMatcher, SymbolicSize/Device
 #include <sgl_kernel/utils.h>   // RuntimeCheck, Panic
 
@@ -280,41 +278,14 @@ __global__ void per_token_group_quant_8bit_v2_kernel(
           constexpr int column_major_scale_token_stride = 1;
           const int hidden_idx_packed = hidden_dim_group_idx / num_elems_per_pack;
           const int pack_idx = hidden_dim_group_idx % num_elems_per_pack;
-          int scale_expert_idx = expert_idx;
-          int scale_token_idx = token_idx;
-          if (masked_m == nullptr && scale_expert_stride > 0) {
-            // Outer-major packed layout (non-masked 3D row-major input
-            // [tokens, OUTER, hidden]): rows arrive interleaved as
-            // token_idx = t * OUTER + outer and num_tokens_per_expert carries
-            // OUTER, so each outer slice writes its own packed slab through
-            // the expert-stride slot.
-            scale_expert_idx = token_idx % num_tokens_per_expert;
-            scale_token_idx = token_idx / num_tokens_per_expert;
-          }
           scale_output =
               reinterpret_cast<scale_element_t*>(output_s) +
-              (static_cast<int64_t>(scale_expert_idx) * scale_expert_stride * num_elems_per_pack +
+              (static_cast<int64_t>(expert_idx) * scale_expert_stride * num_elems_per_pack +
                static_cast<int64_t>(hidden_idx_packed) * scale_hidden_stride * num_elems_per_pack +
-               static_cast<int64_t>(scale_token_idx) * column_major_scale_token_stride * num_elems_per_pack + pack_idx);
+               static_cast<int64_t>(token_idx) * column_major_scale_token_stride * num_elems_per_pack + pack_idx);
         } else {
           static_assert(!SCALE_UE8M0 || std::is_same_v<scale_packed_t, float>);
-          if (scale_expert_stride > 0) {
-            // Non-masked 3D row-major output_s (logical (mn, outer, K)): rows
-            // arrive interleaved as token_idx = t * OUTER + outer with
-            // num_tokens_per_expert carrying OUTER (same decomposition as the
-            // packed branch above); the wrapper passes output_s.stride(-3) /
-            // stride(-2) through the expert/hidden stride slots.
-            const int scale_token_stride = scale_expert_stride;
-            const int scale_outer_stride = scale_hidden_stride;
-            const int scale_token_idx = token_idx / num_tokens_per_expert;
-            const int scale_outer_idx = token_idx % num_tokens_per_expert;
-            const int64_t scale_offset = static_cast<int64_t>(expert_idx + scale_token_idx) * scale_token_stride +
-                                         static_cast<int64_t>(scale_outer_idx) * scale_outer_stride +
-                                         hidden_dim_group_idx;
-            scale_output = reinterpret_cast<scale_element_t*>(output_s) + scale_offset;
-          } else {
-            scale_output = reinterpret_cast<scale_element_t*>(output_s) + offset_num_groups;
-          }
+          scale_output = reinterpret_cast<scale_element_t*>(output_s) + offset_num_groups;
         }
 
         if constexpr (IS_COLUMN_MAJOR and SCALE_UE8M0) {

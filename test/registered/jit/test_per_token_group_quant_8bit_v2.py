@@ -7,22 +7,21 @@ from sglang.jit_kernel.per_token_group_quant_8bit_v2 import (
     per_token_group_quant_8bit_v2,
 )
 from sglang.jit_kernel.utils import get_ci_test_range
-from sglang.srt.utils import ceil_align
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+
+if not torch.cuda.is_available():
+    pytest.skip("CUDA is not available", allow_module_level=True)
 
 try:
     from sgl_kernel import sgl_per_token_group_quant_8bit  # AOT v2 reference op
 except ImportError:
     sgl_per_token_group_quant_8bit = None
 
-if sgl_per_token_group_quant_8bit is None and not torch.cuda.is_available():
-    pytest.skip("sgl_kernel AOT reference op is unavailable", allow_module_level=True)
 if sgl_per_token_group_quant_8bit is None:
     raise ImportError("sgl_kernel AOT reference op is unavailable")
 
-from sglang.srt.layers.quantization import fp8_kernel as fp8_kernel_module
 from sglang.srt.layers.quantization.fp8_kernel import (  # noqa: E402
     create_per_token_group_quant_fp8_output_scale,
     fp8_dtype,
@@ -155,132 +154,6 @@ def test_sglang_per_token_group_quant_fp8_row_major_ue8m0(dtype, num_tokens, hid
     assert (
         rel_err.mean() < 0.05
     ), f"mean relative dequant error too large: {rel_err.mean():.4f}"
-
-
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("num_tokens", [2, 17])
-@pytest.mark.parametrize("num_groups", [8])
-@pytest.mark.parametrize("hidden", [256, 4096])
-def test_sglang_per_token_group_quant_fp8_ue8m0_outer_major_scale_layout(
-    dtype, num_tokens, num_groups, hidden, monkeypatch
-):
-    torch.manual_seed(num_tokens * 1000 + num_groups * 100 + hidden)
-    x = torch.randn(num_tokens, num_groups, hidden, device="cuda", dtype=dtype)
-
-    jit_v2_call_count = 0
-    original_jit_v2 = fp8_kernel_module.sgl_per_token_group_quant_8bit_jit_v2
-
-    def wrapped_jit_v2(*args, **kwargs):
-        nonlocal jit_v2_call_count
-        jit_v2_call_count += 1
-        return original_jit_v2(*args, **kwargs)
-
-    def fail_aot(*args, **kwargs):
-        raise AssertionError("scale_outer_major must not call the AOT quant path")
-
-    monkeypatch.setattr(
-        fp8_kernel_module, "sgl_per_token_group_quant_8bit_jit_v2", wrapped_jit_v2
-    )
-    monkeypatch.setattr(fp8_kernel_module, "sgl_per_token_group_quant_8bit", fail_aot)
-
-    x_q, x_s = fp8_kernel_module.sglang_per_token_group_quant_fp8(
-        x.contiguous(),
-        G,
-        scale_ue8m0=True,
-        scale_outer_major=True,
-    )
-    assert jit_v2_call_count == 1
-
-    q_ref, s_ref = fp8_kernel_module.sglang_per_token_group_quant_fp8(
-        x.reshape(num_tokens * num_groups, hidden).contiguous(),
-        G,
-        scale_ue8m0=True,
-    )
-    assert jit_v2_call_count == 2
-    torch.cuda.synchronize()
-
-    num_scale_groups = hidden // G
-    q_ref = q_ref.view_as(x_q)
-    s_ref = (
-        s_ref.view(num_tokens, num_groups, num_scale_groups)
-        .transpose(0, 1)
-        .contiguous()
-        .transpose(0, 1)
-    )
-
-    assert torch.equal(x_q.view(torch.int8), q_ref.view(torch.int8)), "fp8 codes differ"
-    assert torch.equal(x_s, s_ref), "scales differ"
-    assert x_s.stride() == s_ref.stride()
-    assert x_s[:, 0, :].is_contiguous()
-
-
-OUTER_MAJOR_PACKED_CASES = get_ci_test_range(
-    # hidden covers K-pack tails of 3/2/3/0 pad bytes (K = hidden/128 = 1/2/5/32)
-    # and num_tokens covers TMA-tail rows (T % 4 != 0).
-    list(
-        itertools.product(
-            [torch.bfloat16, torch.float16],
-            [2, 5, 16],
-            [1, 3, 8],
-            [128, 256, 640, 4096],
-        )
-    ),
-    [
-        (torch.bfloat16, 2, 1, 128),
-        (torch.bfloat16, 5, 3, 640),
-        (torch.bfloat16, 16, 8, 4096),
-        (torch.float16, 5, 8, 256),
-    ],
-)
-
-
-@pytest.mark.parametrize("dtype,num_tokens,num_groups,hidden", OUTER_MAJOR_PACKED_CASES)
-def test_sglang_per_token_group_quant_fp8_ue8m0_outer_major_packed_scale_layout(
-    dtype, num_tokens, num_groups, hidden
-):
-    """scale_outer_major + scale_tma_aligned emits DeepGEMM's native SM100 SFA
-    layout (packed int32 UE8M0, per-outer-slice slabs, TMA-aligned token dim)
-    bit-exactly matching the 2D packed column-major path run per outer slice.
-    DSV4 wo_a shapes and the deep_gemm consumer contract are covered in
-    test_deepseek_v4_fp8_wo_a.py."""
-    torch.manual_seed(num_tokens * 1000 + num_groups * 100 + hidden)
-    x = torch.randn(num_tokens, num_groups, hidden, device="cuda", dtype=dtype)
-
-    x_q, x_s = sglang_per_token_group_quant_fp8(
-        x.contiguous(),
-        G,
-        scale_ue8m0=True,
-        scale_outer_major=True,
-        scale_tma_aligned=True,
-    )
-    torch.cuda.synchronize()
-
-    num_k_packs = ceil_align(hidden // G, 4) // 4
-    aligned_t = ceil_align(num_tokens, 4)
-    assert x_s.dtype == torch.int32
-    assert x_s.shape == (num_tokens, num_groups, num_k_packs)
-    assert x_s.stride() == (1, num_k_packs * aligned_t, aligned_t)
-
-    # Reference: the JIT 2D packed column-major path, one outer slice at a
-    # time (in-tree, so immune to AOT wheel drift; this is also the slab
-    # layout DeepGEMM consumes).
-    for g in range(num_groups):
-        q_ref, s_ref = _alloc((num_tokens, hidden), scale_ue8m0=True)
-        per_token_group_quant_8bit_v2(
-            x[:, g].contiguous(),
-            q_ref,
-            s_ref,
-            G,
-            1e-10,
-            float(fp8_min),
-            float(fp8_max),
-            scale_ue8m0=True,
-        )
-        torch.cuda.synchronize()
-        assert torch.equal(
-            x_q[:, g].view(torch.int8), q_ref.view(torch.int8)
-        ), f"fp8 codes differ for outer slice {g}"
-        assert torch.equal(x_s[:, g, :], s_ref), f"scales differ for outer slice {g}"
 
 
 # Masked (EP-MoE) path: the v2 op only has a masked scheduler for the

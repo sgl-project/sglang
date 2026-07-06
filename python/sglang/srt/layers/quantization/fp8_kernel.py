@@ -464,41 +464,15 @@ def create_per_token_group_quant_fp8_output_scale(
     scale_ue8m0: bool,
     scale_outer_major: bool = False,
 ):
-    # TODO: replace the scale layout booleans with a single enum before adding
-    # more mutually exclusive scale layouts. Valid combinations:
-    #   (none)                                  -> row-major float32
-    #   column_major                            -> column-major float32
-    #   column_major + tma_aligned              -> column-major float32, mn 4-aligned
-    #   ue8m0                                   -> row-major float32 (power-of-2 values)
-    #   ue8m0 + column_major + tma_aligned      -> 2D packed int32 UE8M0 (DeepGEMM native)
-    #   ue8m0 + outer_major                     -> float32 (mn, outer, K) view, outer-major storage
-    #   ue8m0 + outer_major + tma_aligned       -> per-outer-slice packed int32 UE8M0 (DeepGEMM native)
-    # scale_tma_aligned in any other combination is rejected below rather than
-    # silently ignored.
     if scale_outer_major:
         assert scale_ue8m0
         assert not column_major_scales
+        assert not scale_tma_aligned
         assert len(x_shape) == 3
         *x_batch, x_s_mn, x_s_outer, x_q_k = x_shape
-        if scale_tma_aligned:
-            # DeepGEMM's native SM100 SFA layout, one packed slab per outer
-            # slice: four UE8M0 exponent bytes per int32 along K, mn (token)
-            # dim TMA-aligned to 4. Same slab layout as the 2D packed branch
-            # below. The returned view keeps the logical (mn, outer, K-packs)
-            # shape; do not make it contiguous.
-            x_s_k_packed = ceil_align(x_q_k // group_size, 4) // 4
-            aligned_mn = ceil_align(x_s_mn, 4)
-            return (
-                torch.empty(
-                    (*x_batch, x_s_outer, x_s_k_packed, aligned_mn),
-                    device=device,
-                    dtype=torch.int,
-                )
-                .transpose(-1, -2)[..., :x_s_mn, :]
-                .transpose(-3, -2)
-            )
-        # Store the outer axis as the leading allocation dim (each outer slice
-        # stays contiguous); the returned view keeps the logical (mn, outer, K) shape.
+        # DSV4 wo_a needs logical [tokens, groups, K/128] scales, but DeepGEMM
+        # consumes each group slice contiguously, so back the view with
+        # [groups, tokens, K/128] storage.
         return torch.empty(
             (*x_batch, x_s_outer, x_s_mn, x_q_k // group_size),
             device=device,
@@ -524,7 +498,7 @@ def create_per_token_group_quant_fp8_output_scale(
             )
             assert not scale_tma_aligned, (
                 "scale_tma_aligned requires column_major_scales=True or "
-                "scale_outer_major=True when scale_ue8m0 is enabled"
+                "the DSV4 wo_a dedicated quant helper"
             )
             # Row-major UE8M0 keeps the scale as float32 power-of-two values,
             # matching deep_gemm.ceil_to_ue8m0 and deep_gemm.fp8_einsum.
@@ -570,7 +544,6 @@ def sglang_per_token_group_quant_fp8(
     fuse_silu_and_mul: bool = False,
     masked_m: Optional[torch.Tensor] = None,
     enable_v2: Optional[bool] = None,
-    scale_outer_major: bool = False,
 ):
     assert (
         x.shape[-1] % group_size == 0
@@ -587,20 +560,12 @@ def sglang_per_token_group_quant_fp8(
         column_major_scales=column_major_scales,
         scale_tma_aligned=scale_tma_aligned,
         scale_ue8m0=scale_ue8m0,
-        scale_outer_major=scale_outer_major,
     )
 
     # Enable v2 kernel by default on supported group sizes
     _V2_KERNEL_SUPPORTED_GROUP_SIZES = [16, 32, 64, 128]
     if enable_v2 is None:
         enable_v2 = group_size in _V2_KERNEL_SUPPORTED_GROUP_SIZES or _is_musa
-
-    if scale_outer_major:
-        assert (
-            _is_cuda and enable_sgl_per_token_group_quant_8bit and enable_v2
-        ), "scale_outer_major is only supported by the CUDA JIT v2 quant kernel"
-        assert not fuse_silu_and_mul
-        assert masked_m is None
 
     if x.shape[0] > 0:
         # Temporary
@@ -634,7 +599,6 @@ def sglang_per_token_group_quant_fp8(
                     scale_ue8m0=scale_ue8m0,
                     fuse_silu_and_mul=fuse_silu_and_mul,
                     masked_m=masked_m,
-                    scale_outer_major=scale_outer_major,
                 )
             else:
                 sgl_per_token_group_quant_8bit_jit(
@@ -652,6 +616,39 @@ def sglang_per_token_group_quant_fp8(
             sgl_per_token_group_quant_fp8(
                 x, x_q, x_s, group_size, eps, fp8_min, fp8_max, scale_ue8m0
             )
+
+    return x_q, x_s
+
+
+def sglang_per_token_group_quant_fp8_dsv4_woa(
+    x: torch.Tensor,
+    group_size: int = 128,
+    eps: float = 1e-10,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    assert x.dim() == 3, "DSV4 wo_a quant expects [tokens, groups, hidden]"
+    assert group_size == 128, "DSV4 wo_a quant uses group_size=128"
+    assert eps == 1e-10, "DSV4 wo_a quant uses eps=1e-10"
+    assert x.shape[-1] % group_size == 0
+    assert x.stride(-1) == 1, "`x` hidden dimension is not contiguous"
+    assert _is_cuda, "DSV4 wo_a quant is only supported on CUDA"
+
+    x_q = torch.empty(x.shape, device=x.device, dtype=fp8_dtype)
+    x_s = create_per_token_group_quant_fp8_output_scale(
+        x_shape=x.shape,
+        device=x.device,
+        group_size=group_size,
+        column_major_scales=False,
+        scale_tma_aligned=False,
+        scale_ue8m0=True,
+        scale_outer_major=True,
+    )
+
+    if x.numel() > 0:
+        from sglang.jit_kernel.dsv4.fp8_wo_a import (
+            fp8_wo_a_group_major_quant_ue8m0,
+        )
+
+        fp8_wo_a_group_major_quant_ue8m0(x, x_q, x_s)
 
     return x_q, x_s
 
@@ -766,7 +763,6 @@ def sglang_per_token_group_quant_8bit(
     fuse_silu_and_mul: bool = False,
     masked_m: Optional[torch.Tensor] = None,
     enable_v2: Optional[bool] = None,
-    scale_outer_major: bool = False,
 ):
     from sglang.srt.layers.quantization.int8_kernel import (
         sglang_per_token_group_quant_int8,
@@ -795,7 +791,6 @@ def sglang_per_token_group_quant_8bit(
         fuse_silu_and_mul=fuse_silu_and_mul,
         masked_m=masked_m,
         enable_v2=enable_v2,
-        scale_outer_major=scale_outer_major,
     )
 
 

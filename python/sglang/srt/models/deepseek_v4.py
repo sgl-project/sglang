@@ -70,7 +70,9 @@ from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import get_moe_a2a_backend, should_use_dp_reduce_scatterv
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
-from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
+from sglang.srt.layers.quantization.fp8_kernel import (
+    sglang_per_token_group_quant_fp8_dsv4_woa,
+)
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.utils.cp_utils import (
@@ -138,7 +140,6 @@ from sglang.srt.utils import (
     get_bool_env_var,
     is_gfx95_supported,
     is_gfx942_supported,
-    is_sm100_supported,
     log_info_on_rank0,
     make_layers,
 )
@@ -173,7 +174,6 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _SHARED_EXPERT_LOCAL = get_bool_env_var("SGLANG_DP_SHARED_EXPERT_LOCAL")
 _is_gfx95_supported = is_gfx95_supported()
 _is_gfx942_supported = is_gfx942_supported()
-_is_sm100_supported = is_sm100_supported()
 
 if _use_aiter:
     if _is_gfx95_supported:
@@ -1086,16 +1086,7 @@ class MQALayer(nn.Module):
 
             T, G, D = o.shape
             R = self.o_lora_rank
-            o_fp8, o_s = sglang_per_token_group_quant_fp8(
-                o.contiguous(),
-                group_size=128,
-                scale_ue8m0=True,
-                scale_outer_major=True,
-                # Packed int32 UE8M0 scales are consumed natively only by
-                # DeepGEMM's SM100 runtime; other archs (e.g. SM90) need the
-                # fp32 power-of-two scales deep_gemm transforms internally.
-                scale_tma_aligned=_is_sm100_supported,
-            )
+            o_fp8, o_s = sglang_per_token_group_quant_fp8_dsv4_woa(o)
             output = torch.empty(T, G, R, device=o.device, dtype=torch.bfloat16)
             deep_gemm.fp8_einsum(
                 "bhr,hdr->bhd",
