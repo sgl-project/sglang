@@ -178,6 +178,27 @@ class DeepseekMLAForwardMixin:
             get_global_server_args().flashinfer_mla_disable_ragged
         )
 
+    def should_run_indexer(
+        self: DeepseekV2AttentionMLA,
+        prev_topk_indices: Optional[torch.Tensor] = None,
+    ) -> bool:
+        """Whether this layer runs its own indexer vs reusing carried topk.
+
+        skip_topk (shared) layers carry no indexer weights in the checkpoint,
+        so they must reuse the carried topk and never run the indexer. Do NOT
+        widen this to `or prev_topk_indices is None` (the upstream gate): that
+        recomputes with an uninitialized indexer whenever cross-layer
+        propagation is unavailable (e.g. the TBO op path drops topk_indices),
+        reintroducing the >index_topk garbling. The is_nextn clause is the
+        sole intentional fallback (the NextN layer has its own weights).
+
+        Eager-MHA prefill calls this with no argument: it needs no topk for
+        the current forward, but producer layers must still fill their indexer
+        K cache for later MLA/decode; shared layers' cache is never read, so
+        filling it is dead work.
+        """
+        return not self.skip_topk or (self.is_nextn and prev_topk_indices is None)
+
     def _can_fuse_bmm_into_attention(
         self: DeepseekV2AttentionMLA, forward_batch: ForwardBatch
     ) -> bool:
@@ -353,15 +374,7 @@ class DeepseekMLAForwardMixin:
                     q = self.q_b_proj(q)[0].view(
                         -1, self.num_local_heads, self.qk_head_dim
                     )
-                # skip_topk (shared) layers carry no indexer weights in the
-                # checkpoint, so they must reuse the carried topk and never run
-                # the indexer. Do NOT widen this to `or prev_topk_indices is
-                # None` (the upstream gate): that recomputes with an
-                # uninitialized indexer whenever cross-layer propagation is
-                # unavailable (e.g. the TBO op path drops topk_indices),
-                # reintroducing the >index_topk garbling. The is_nextn clause is
-                # the sole intentional fallback (layer 78 has its own weights).
-                if not self.skip_topk or (self.is_nextn and prev_topk_indices is None):
+                if self.should_run_indexer(prev_topk_indices):
                     topk_indices = self.indexer(
                         x=hidden_states,
                         q_lora=q_lora,
@@ -387,12 +400,7 @@ class DeepseekMLAForwardMixin:
                     fusion_plan = self._make_mla_bmm_fusion_plan(q, q_nope)
 
                 if q_lora is not None:
-                    # See the skip_topk note above: shared layers have no
-                    # indexer weights, so this gate must not fall back to
-                    # computing when prev_topk_indices is None.
-                    if not self.skip_topk or (
-                        self.is_nextn and prev_topk_indices is None
-                    ):
+                    if self.should_run_indexer(prev_topk_indices):
                         topk_indices = self.indexer(
                             x=hidden_states,
                             q_lora=q_lora,
