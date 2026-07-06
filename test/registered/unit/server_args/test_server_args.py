@@ -1090,7 +1090,7 @@ class TestWaterfillArgs(CustomTestCase):
         server_args = ServerArgs.from_cli_args(args)
         self.assertTrue(server_args.enable_waterfill)
 
-    def test_deepep_waterfill_cli_flag_is_not_supported(self):
+    def test_legacy_waterfill_cli_flag_is_not_supported(self):
         parser = server_args_module.argparse.ArgumentParser()
         ServerArgs.add_cli_args(parser)
 

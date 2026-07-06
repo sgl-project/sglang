@@ -1661,7 +1661,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         "Waterfill requires model config n_routed_experts."
                     )
             if balancer_cls is None:
-                from sglang.srt.layers.moe.deepep_waterfill import WaterfillBalancer
+                from sglang.srt.layers.moe.waterfill import WaterfillBalancer
 
                 balancer_cls = WaterfillBalancer
             # Static EPLB remaps TopK ids to physical expert ids before Waterfill.
