@@ -179,18 +179,6 @@ python3 -m sglang.launch_server \
     --speculative-num-draft-tokens 3
 ```
 
-<Note>
-- `--tp-size 16` is required to fit the 295B model across all 16 logical NPUs. Using fewer NPUs will cause an
-  out-of-memory error when loading weights.
-- `--mem-fraction-static 0.84` controls the fraction of HBM allocated to static memory (model weights + KV cache).
-  Increase it to expand the KV cache pool; decrease it if you observe OOM during graph capture.
-- `--base-gpu-id 0` ensures tensor parallel workers start from NPU 0.
-- `--enable-multimodal` and `--mm-attention-backend ascend_attn` are required for image input support.
-- `--reasoning-parser auto` and `--tool-call-parser auto` enable structured reasoning output and tool call
-  parsing in the OpenAI-compatible API. The `auto` mode resolves to the `hunyuan` parser at runtime by reading
-  the tokenizer vocabulary, ensuring compatibility with both the preview and shipping Hy3 tokenizers.
-</Note>
-
 ## Functional verification
 
 After the server prints `The server is fired up and ready to roll!`, send a test request:
