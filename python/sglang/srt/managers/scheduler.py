@@ -1345,10 +1345,14 @@ class Scheduler(
             # Use self.chunked_req identity (not req.is_chunked) to avoid
             # overlap-scheduling timing issues.
             if self.chunked_req is not None:
-                skip_mask = [req is self.chunked_req for req in batch.reqs]
+                skip_token_table_update = [
+                    req is self.chunked_req for req in batch.reqs
+                ]
                 batch.ne_skip_token_table_update = (
-                    torch.tensor(skip_mask, dtype=torch.bool, device=device)
-                    if any(skip_mask)
+                    torch.tensor(
+                        skip_token_table_update, dtype=torch.bool, device=device
+                    )
+                    if any(skip_token_table_update)
                     else None
                 )
         return batch
