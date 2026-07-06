@@ -270,7 +270,7 @@ class NPUW4A4Mxfp4MoEMethod(_NPUMoEMethodBase):
         self.group_size = group_size
         self.matmul = GroupedMatmul()
         # Activation quantizer for float4
-        self.hidden_states_quantizer = HiddenStatesDynamicQuant(quant_dtype=torch.float4_e2m1fn_x2)
+        self.hidden_states_quantizer = HiddenStatesDynamicQuant(quant_dtype=torch_npu.float4_e2m1fn_x2)
 
     def process_weights_after_loading(
         self, layer: torch.nn.Module, weight_prefix: str
