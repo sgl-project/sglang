@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import threading
@@ -361,7 +362,21 @@ class HiCacheFile(HiCacheStorage):
             tp_rank=tp_rank,
             is_mla_model=is_mla_model,
             extra_config=storage_config.extra_config,
+            shard_dir_fn=self._shard_dir,
         )
+
+    # Two-level hash-prefix sharding (same scheme git/npm/yarn caches use) so a
+    # single HiCacheFile directory never has to hold more than a few thousand
+    # entries even at multi-million-page scale. A flat directory eventually
+    # hits per-directory dentry/size limits on common filesystems, which
+    # surfaces as ENOSPC even though there is plenty of free space/inodes left.
+    @staticmethod
+    def _shard_dir(suffixed_key: str) -> str:
+        digest = hashlib.sha1(suffixed_key.encode("utf-8")).hexdigest()
+        return os.path.join(digest[0:2], digest[2:4])
+
+    def _shard_path(self, suffixed_key: str) -> str:
+        return os.path.join(self.file_path, self._shard_dir(suffixed_key))
 
     def _get_suffixed_key(self, key: str) -> str:
         return key + self.config_suffix
@@ -374,9 +389,8 @@ class HiCacheFile(HiCacheStorage):
     def _get_component_path(
         self, key: str, component_name: Optional[str] = None
     ) -> str:
-        return os.path.join(
-            self.file_path, f"{self._get_component_key(key, component_name)}.bin"
-        )
+        suffixed = self._get_component_key(key, component_name)
+        return os.path.join(self._shard_path(suffixed), f"{suffixed}.bin")
 
     def get(
         self,
@@ -385,7 +399,7 @@ class HiCacheFile(HiCacheStorage):
         target_sizes: Optional[Any] = None,
     ) -> torch.Tensor | None:
         suffixed = self._get_suffixed_key(key)
-        tensor_path = os.path.join(self.file_path, f"{suffixed}.bin")
+        tensor_path = os.path.join(self._shard_path(suffixed), f"{suffixed}.bin")
         try:
             expected = target_location.numel() * target_location.element_size()
             with open(tensor_path, "rb", buffering=0) as f:
@@ -419,7 +433,8 @@ class HiCacheFile(HiCacheStorage):
         target_sizes: Optional[Any] = None,
     ) -> bool:
         suffixed = self._get_suffixed_key(key)
-        tensor_path = os.path.join(self.file_path, f"{suffixed}.bin")
+        shard_dir = self._shard_path(suffixed)
+        tensor_path = os.path.join(shard_dir, f"{suffixed}.bin")
 
         # Fast path: same key already on disk. Refresh recency and skip rewrite.
         if os.path.exists(tensor_path):
@@ -436,6 +451,9 @@ class HiCacheFile(HiCacheStorage):
                 return False
             reserved = True
 
+            # Lazily create the 2-level shard subdir (256*256 buckets) on first
+            # write; cheap no-op once it exists.
+            os.makedirs(shard_dir, exist_ok=True)
             tmp_path = (
                 f"{tensor_path}.tmp."
                 f"{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}"
@@ -469,8 +487,8 @@ class HiCacheFile(HiCacheStorage):
         return True
 
     def exists(self, key: str) -> bool:
-        key = self._get_suffixed_key(key)
-        tensor_path = os.path.join(self.file_path, f"{key}.bin")
+        suffixed = self._get_suffixed_key(key)
+        tensor_path = os.path.join(self._shard_path(suffixed), f"{suffixed}.bin")
         return os.path.exists(tensor_path)
 
     def _collect_existing_component_keys(
@@ -478,17 +496,27 @@ class HiCacheFile(HiCacheStorage):
         keys: List[str],
         pool_transfers: Optional[List[PoolTransfer]] = None,
     ) -> Set[str]:
-        target_files = {f"{self._get_component_key(key)}.bin" for key in keys}
+        # Build the exact set of candidate (filename, full sharded path) pairs
+        # and probe each directly. This is O(keys) regardless of how many
+        # files live in the cache overall -- a full os.scandir(self.file_path)
+        # is a per-request O(total cached files) scan once the directory
+        # holds millions of entries, on top of being unsafe under sharding
+        # (it would only see the top-level shard dirs, not the files inside).
+        candidates: List[tuple[str, str]] = []
+
+        def add(key: str, component_name: Optional[str] = None) -> None:
+            component_key = self._get_component_key(key, component_name)
+            fname = f"{component_key}.bin"
+            fpath = os.path.join(self._shard_path(component_key), fname)
+            candidates.append((fname, fpath))
+
+        for key in keys:
+            add(key)
         for transfer in pool_transfers or []:
             for key in keys:
-                target_files.add(f"{self._get_component_key(key, transfer.name)}.bin")
+                add(key, transfer.name)
 
-        existing_files = set()
-        with os.scandir(self.file_path) as entries:
-            for entry in entries:
-                if entry.is_file() and entry.name in target_files:
-                    existing_files.add(entry.name)
-        return existing_files
+        return {fname for fname, fpath in candidates if os.path.isfile(fpath)}
 
     def batch_exists_v2(
         self,
@@ -602,10 +630,14 @@ class HiCacheFile(HiCacheStorage):
 
     def clear(self) -> bool:
         try:
-            for filename in os.listdir(self.file_path):
-                file_path = os.path.join(self.file_path, filename)
-                if os.path.isfile(file_path):
-                    os.remove(file_path)
+            for dirpath, dirnames, filenames in os.walk(self.file_path, topdown=False):
+                for filename in filenames:
+                    os.remove(os.path.join(dirpath, filename))
+                for dirname in dirnames:
+                    try:
+                        os.rmdir(os.path.join(dirpath, dirname))
+                    except OSError:
+                        pass
             self._evictor.clear()
             logger.info("Cleared all entries in HiCacheFile storage.")
             return True
