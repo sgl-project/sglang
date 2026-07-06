@@ -5,10 +5,11 @@ import pytest
 import torch
 
 from sglang.jit_kernel.utils import get_ci_test_range
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=45, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_cuda_ci(est_time=240, suite="nightly-kernel-1-gpu", nightly=True)
+register_amd_ci(est_time=45, suite="jit-kernel-unit-test-amd")
 
 
 EPS = 1e-6
@@ -35,7 +36,15 @@ def flashinfer_rmsnorm(
     output: torch.Tensor,
     eps: float = EPS,
 ) -> None:
-    from flashinfer.norm import rmsnorm
+    try:
+        from flashinfer.norm import rmsnorm
+    except ImportError:
+        # flashinfer is CUDA-only; on ROCm fall back to a torch reference so
+        # the sglang JIT kernel still gets validated (matches flashinfer math).
+        x = input.float()
+        normed = x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + eps)
+        output.copy_((normed * weight.float()).to(output.dtype))
+        return
 
     rmsnorm(input, weight, out=output, eps=eps)
 
