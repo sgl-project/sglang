@@ -333,6 +333,7 @@ REPLICATED_LINEAR_LORA_NAMES = [
     "fused_qkv_a_proj_with_mqa",
     "fc1_latent_proj",
     "fc2_latent_proj",
+    "gate",
     *DSA_INDEXER_LORA_NAMES,
 ]
 
