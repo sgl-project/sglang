@@ -294,15 +294,16 @@ class WanI2VCrossAttention(WanSelfAttention):
         r"""
         Args:
             x(Tensor): Shape [B, L1, C]
-            context(Tensor): Shape [B, L2, C]
+            context(Tensor): Shape [B, 257 + L2, C] (leading image tokens then text)
             context_lens(Tensor | None): `[B, L2]` bool mask over real
-                (non-padded) tokens in `context`, or None when every request in
-                the batch already fills the full padded length. Only the text
-                portion (after the leading 257 image tokens) can be ragged.
+                (non-padded) tokens in the text portion of `context`; image
+                tokens are never padded and have no corresponding entries.
+                None when every request in the batch already fills the full
+                padded text length.
         """
         context_img = context[:, :257]
         context = context[:, 257:]
-        text_mask = context_lens[:, 257:] if context_lens is not None else None
+        text_mask = context_lens
 
         q, _ = self.to_q(x)
         if self.tp_rmsnorm:

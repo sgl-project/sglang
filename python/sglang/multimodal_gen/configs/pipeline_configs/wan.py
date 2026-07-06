@@ -50,7 +50,7 @@ def t5_postprocess_text(
         dim=0,
     )
     positions = torch.arange(512, device=prompt_embeds_tensor.device).unsqueeze(0)
-    prompt_embeds_mask = positions < seq_lens.unsqueeze(1)
+    prompt_embeds_mask = positions < seq_lens.to(positions.device).unsqueeze(1)
     return TextConditioningOutput(
         prompt_embeds_tensor, prompt_embeds_mask, seq_lens.tolist()
     )
