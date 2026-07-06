@@ -60,13 +60,13 @@ class TimestepPreparationStage(PipelineStage):
     def __init__(
         self,
         scheduler,
-        prepare_extra_set_timesteps_kwargs: list[
-            Callable[[Req, ServerArgs], Tuple[str, Any]]
-        ] = [],
+        prepare_extra_set_timesteps_kwargs: (
+            list[Callable[[Req, ServerArgs], Tuple[str, Any]]] | None
+        ) = None,
     ) -> None:
         super().__init__()
         self.scheduler = scheduler
-        self.prepare_extra_set_timesteps_kwargs = (
+        self.prepare_extra_set_timesteps_kwargs = list(
             prepare_extra_set_timesteps_kwargs or []
         )
 
@@ -191,12 +191,71 @@ class TimestepPreparationStage(PipelineStage):
             and isinstance(batch.timesteps, torch.Tensor)
             and torch.isnan(batch.timesteps).any()
         ):
-            # when num-inference-steps == 1, the last sigma being 1, the 1 / last_sigma could be nan
-            # this a workaround for warmup req only
+            # diffusers flow-match scheduler can emit NaN for one-step warmup
             batch.timesteps = torch.ones(
                 (1,), dtype=torch.float32, device=get_local_torch_device()
             )
 
         result = VerificationResult()
         result.add_check("timesteps", batch.timesteps, [V.is_tensor, V.with_dims(1)])
+        return result
+
+
+class DMDTimestepPreparationStage(PipelineStage):
+    """Prepare distilled DMD timesteps from pipeline config."""
+
+    deduplicated_tensor_tree_output_fields = ("timesteps",)
+    deduplicated_deepcopy_output_fields = ("scheduler",)
+
+    def __init__(self, scheduler) -> None:
+        super().__init__()
+        self.scheduler = scheduler
+
+    @property
+    def parallelism_type(self) -> StageParallelismType:
+        return StageParallelismType.REPLICATED
+
+    def forward(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+    ) -> Req:
+        if batch.scheduler is not None and batch.timesteps is not None:
+            return batch
+
+        scheduler = get_or_create_request_scheduler(batch, self.scheduler)
+        num_train_timesteps = getattr(scheduler, "num_train_timesteps", None)
+        if num_train_timesteps is None:
+            num_train_timesteps = scheduler.config.num_train_timesteps
+        num_train_timesteps = int(num_train_timesteps)
+        scheduler.set_timesteps(num_train_timesteps)
+
+        timesteps = torch.tensor(
+            server_args.pipeline_config.dmd_denoising_steps, dtype=torch.long
+        ).cpu()
+        if server_args.pipeline_config.warp_denoising_step:
+            scheduler_timesteps = torch.cat(
+                (scheduler.timesteps.cpu(), torch.tensor([0], dtype=torch.float32))
+            )
+            timesteps = scheduler_timesteps[num_train_timesteps - timesteps]
+
+        batch.timesteps = timesteps.to(get_local_torch_device())
+        batch.scheduler = scheduler
+        if not batch.is_warmup:
+            self.log_debug("DMD timesteps: %s", batch.timesteps)
+        return batch
+
+    def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
+        result = VerificationResult()
+        result.add_check(
+            "dmd_denoising_steps",
+            server_args.pipeline_config.dmd_denoising_steps,
+            V.list_not_empty,
+        )
+        return result
+
+    def verify_output(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
+        result = VerificationResult()
+        result.add_check("timesteps", batch.timesteps, [V.is_tensor, V.with_dims(1)])
+        result.add_check("scheduler", batch.scheduler, V.not_none)
         return result

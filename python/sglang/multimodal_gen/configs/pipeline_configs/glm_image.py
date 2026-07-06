@@ -11,6 +11,7 @@ from sglang.multimodal_gen.configs.models.vaes.glmimage import GlmImageVAEConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ModelTaskType,
     SpatialImagePipelineConfig,
+    shard_rotary_emb_for_sp,
 )
 
 
@@ -21,7 +22,7 @@ class GlmImagePipelineConfig(SpatialImagePipelineConfig):
     vae_precision: str = "bf16"
 
     should_use_guidance: bool = False
-    task_type: ModelTaskType = ModelTaskType.T2I
+    task_type: ModelTaskType = ModelTaskType.TI2I
 
     vae_tiling: bool = False
 
@@ -51,8 +52,10 @@ class GlmImagePipelineConfig(SpatialImagePipelineConfig):
         height = batch.height // self.vae_scale_factor
         width = batch.width // self.vae_scale_factor
         hidden_states = torch.empty(1, 1, height, width, device=device, dtype=dtype)
-        freqs_cis = rotary_emb(hidden_states)
-        return freqs_cis
+        cos, sin = rotary_emb(hidden_states)
+        cos = shard_rotary_emb_for_sp(cos)
+        sin = shard_rotary_emb_for_sp(sin)
+        return cos, sin
 
     def prepare_pos_cond_kwargs(self, batch, device, rotary_emb, dtype):
         return {

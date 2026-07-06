@@ -59,12 +59,15 @@ def test_mooncake_te_condition(server_args: ServerArgs) -> bool:
             ib_device=ib_device,
         )
 
-    with patch(
-        "sglang.srt.distributed.device_communicators.mooncake_transfer_engine.init_mooncake_transfer_engine",
-        side_effect=_fake_init_mooncake_transfer_engine,
-    ), patch(
-        "sglang.srt.model_executor.model_runner.get_local_ip_auto",
-        return_value="127.0.0.1",
+    with (
+        patch(
+            "sglang.srt.distributed.device_communicators.mooncake_transfer_engine.init_mooncake_transfer_engine",
+            side_effect=_fake_init_mooncake_transfer_engine,
+        ),
+        patch(
+            "sglang.srt.model_executor.model_runner.get_local_ip_auto",
+            return_value="127.0.0.1",
+        ),
     ):
         ModelRunner.init_shared_mooncake_transfer_engine(dummy_runner)
 

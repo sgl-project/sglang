@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/main/benchmarks/kernels/benchmark_moe.py
 import argparse
 import time
@@ -33,6 +35,7 @@ from sglang.srt.server_args import (
     set_global_server_args_for_scheduler,
 )
 from sglang.srt.utils import get_device, is_hip, is_xpu
+from sglang.srt.utils.hf_transformers_utils import get_config
 
 _is_hip = is_hip()
 _is_xpu = is_xpu()
@@ -172,8 +175,12 @@ def benchmark_config(
         topk_output.router_logits.copy_(new_topk_output.router_logits)
 
     def run():
+        model_config = get_config(args.model, trust_remote_code=True)
+        architecture = model_config.architectures[0]
+        is_dsv4 = architecture == "DeepseekV4ForCausalLM"
         moe_runner_config = MoeRunnerConfig(
             inplace=True,
+            swiglu_limit=10.0 if is_dsv4 else None,
         )
 
         with override_config(config):
@@ -241,8 +248,10 @@ class BenchmarkWorker:
         torch.get_device_module().manual_seed_all(0)
         self.seed = seed
         # Get the device ID to allocate tensors and kernels
-        # on the respective GPU.
-        self.device_id = int(ray.get_gpu_ids()[0])
+        # on the respective GPU. Ray isolates each worker to a single visible
+        # GPU via CUDA_VISIBLE_DEVICES, so the local ordinal is always 0. On
+        # ROCm using the global ray gpu id here raises "invalid device ordinal".
+        self.device_id = 0 if is_hip() else int(ray.get_gpu_ids()[0])
         set_global_server_args_for_scheduler(server_args)
 
     def benchmark(

@@ -32,21 +32,28 @@ from sglang.srt.configs import (
     ExaoneConfig,
     FalconH1Config,
     GraniteMoeHybridConfig,
+    InternS2PreviewConfig,
     JetNemotronConfig,
     JetVLMConfig,
     KimiK25Config,
     KimiLinearConfig,
     KimiVLConfig,
+    LagunaConfig,
+    LocateAnythingConfig,
     LongcatFlashConfig,
+    MiniCPMV4_6Config,
+    MiniCPMV4_6VisionConfig,
     MultiModalityConfig,
     NemotronH_Nano_Omni_Reasoning_V3_Config,
     NemotronH_Nano_VL_V2_Config,
     NemotronHConfig,
+    NemotronHPuzzleConfig,
     Olmo3Config,
     Qwen3_5Config,
     Qwen3_5MoeConfig,
     Qwen3NextConfig,
     Step3p5Config,
+    Step3p7Config,
     Step3VLConfig,
 )
 from sglang.srt.configs.deepseek_ocr import DeepseekVLV2Config
@@ -78,7 +85,9 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
         DeepseekVL2Config,
         MultiModalityConfig,
         KimiVLConfig,
+        LocateAnythingConfig,
         InternVLChatConfig,
+        LagunaConfig,
         Step3VLConfig,
         LongcatFlashConfig,
         Olmo3Config,
@@ -91,13 +100,18 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
         NemotronH_Nano_VL_V2_Config,
         NemotronH_Nano_Omni_Reasoning_V3_Config,
         NemotronHConfig,
+        NemotronHPuzzleConfig,
         DeepseekVLV2Config,
         Qwen3_5Config,
         Qwen3_5MoeConfig,
+        InternS2PreviewConfig,
         JetNemotronConfig,
         JetVLMConfig,
         KimiK25Config,
         Step3p5Config,
+        Step3p7Config,
+        MiniCPMV4_6Config,
+        MiniCPMV4_6VisionConfig,
     ]
 }
 
@@ -117,6 +131,12 @@ try:
 
     _CONFIG_REGISTRY["deepseek_v32"] = _DeepseekV32ConfigAlias
     _CONFIG_REGISTRY["deepseek_v4"] = _DeepseekV4ConfigAlias
+
+    # For kimi_k25_eagle3
+    class _KimiK2ConfigAlias(_HFDeepseekV3Config):
+        model_type = "kimi_k2"
+
+    _CONFIG_REGISTRY["kimi_k2"] = _KimiK2ConfigAlias
 except ImportError:
     pass
 

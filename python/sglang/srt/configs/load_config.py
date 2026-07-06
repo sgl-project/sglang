@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/config.py
 import enum
 import logging
@@ -77,15 +79,9 @@ class LoadConfig:
     remote_instance_weight_loader_send_weights_group_ports: Optional[List[int]] = None
     remote_instance_weight_loader_backend: Optional[str] = None
     remote_instance_weight_loader_transfer_engine: Optional[Any] = None
+    remote_instance_weight_loader_transfer_engine_session_id: Optional[str] = None
     modelexpress_url: Optional[str] = None
-    modelexpress_model_name: Optional[str] = None
-    # Fields for building SourceIdentity (needed by both seed and client)
-    modelexpress_tp_size: Optional[int] = None
-    modelexpress_pp_size: Optional[int] = None
-    modelexpress_ep_size: Optional[int] = None
-    modelexpress_dtype: Optional[str] = None
-    modelexpress_quantization: Optional[str] = None
-    modelexpress_transport: str = "transfer_engine"
+    modelexpress_transport: str = "nixl"
 
     # ModelOpt-specific loading options
     modelopt_checkpoint_restore_path: Optional[str] = None
@@ -94,6 +90,11 @@ class LoadConfig:
 
     # ModelOpt configuration object
     modelopt_config: Optional[ModelOptConfig] = None
+
+    # Inc-related loading options
+    inc_save_path: Optional[str] = None
+    inc_tuning_iters: Optional[int] = 0
+    inc_disable_opt_rtn: Optional[bool] = None
 
     # QuantizedRL-specific options (for FlashRL-style quantization)
     rl_quant_profile: Optional[str] = (

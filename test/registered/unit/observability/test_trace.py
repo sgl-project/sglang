@@ -4,7 +4,7 @@ import os
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=6, suite="stage-a-test-cpu")
+register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
 import threading
 import unittest
@@ -38,7 +38,7 @@ except ImportError:
     _has_otel = False
 
 # Access the private module-level function (avoid name mangling inside classes).
-_get_host_id = getattr(mod, "__get_host_id")
+_get_host_id = getattr(mod, "_get_host_id")
 
 
 class TestTraceFunctions(unittest.TestCase):
@@ -55,6 +55,15 @@ class TestTraceFunctions(unittest.TestCase):
         set_global_trace_level(5)
         self.assertEqual(mod.global_trace_level, 5)
         mod.global_trace_level = orig
+
+    def test_global_trace_level_env_var(self):
+        import importlib
+
+        with patch.dict(os.environ, {"SGLANG_TRACE_LEVEL": "2"}):
+            importlib.reload(mod)
+            self.assertEqual(mod.global_trace_level, 2)
+        importlib.reload(mod)  # restore default (SGLANG_TRACE_LEVEL unset → 3)
+        self.assertEqual(mod.global_trace_level, 3)
 
     def test_get_global_tracing_enabled(self):
         self.assertEqual(get_global_tracing_enabled(), mod.opentelemetry_initialized)
@@ -114,32 +123,38 @@ class TestTraceCustomIdGenerator(unittest.TestCase):
 # __get_host_id
 class TestGetHostId(unittest.TestCase):
     def test_from_machine_id_file(self):
-        with patch("os.path.exists", return_value=True), patch(
-            "builtins.open",
-            unittest.mock.mock_open(read_data="abc123\n"),
+        with (
+            patch("os.path.exists", return_value=True),
+            patch(
+                "builtins.open",
+                unittest.mock.mock_open(read_data="abc123\n"),
+            ),
         ):
             self.assertEqual(_get_host_id(), "abc123")
 
     def test_from_machine_id_file_error(self):
         """Falls back to MAC address when file read fails."""
-        with patch("os.path.exists", return_value=True), patch(
-            "builtins.open", side_effect=IOError("read error")
+        with (
+            patch("os.path.exists", return_value=True),
+            patch("builtins.open", side_effect=IOError("read error")),
         ):
             result = _get_host_id()
             self.assertIsInstance(result, str)
             self.assertGreater(len(result), 0)
 
     def test_from_mac_address(self):
-        with patch("os.path.exists", return_value=False), patch(
-            "uuid.getnode", return_value=0x112233445566
+        with (
+            patch("os.path.exists", return_value=False),
+            patch("uuid.getnode", return_value=0x112233445566),
         ):
             result = _get_host_id()
             self.assertIsInstance(result, str)
             self.assertGreater(len(result), 0)
 
     def test_unknown_fallback(self):
-        with patch("os.path.exists", return_value=False), patch(
-            "uuid.getnode", return_value=0
+        with (
+            patch("os.path.exists", return_value=False),
+            patch("uuid.getnode", return_value=0),
         ):
             self.assertEqual(_get_host_id(), "unknown")
 
@@ -212,7 +227,7 @@ class TestTraceReqContextDisabled(unittest.TestCase):
         self.assertEqual(state, {"tracing_enable": False})
 
     def test_setstate_disabled(self):
-        ctx = TraceReqContext.__new__(TraceReqContext)
+        ctx = TraceReqContext(rid="req-1")
         ctx.__setstate__({"tracing_enable": True, "is_copy": False})
         # opentelemetry_initialized is False → tracing forced off
         self.assertFalse(ctx.tracing_enable)
@@ -230,6 +245,10 @@ class TestTraceReqContextEnabled(unittest.TestCase):
         self.orig_tracer = mod.tracer
         self.orig_threads = mod.threads_info.copy()
         self.orig_level = mod.global_trace_level
+
+        # Reset OTel global TracerProvider so set_tracer_provider works each test
+        otel_trace._TRACER_PROVIDER_SET_ONCE._done = False
+        otel_trace._TRACER_PROVIDER = None
 
         self.provider = TracerProvider()
         otel_trace.set_tracer_provider(self.provider)
@@ -255,9 +274,26 @@ class TestTraceReqContextEnabled(unittest.TestCase):
         trace_set_thread_info("different_label")
         self.assertEqual(mod.threads_info[pid].thread_label, "scheduler")
 
+    def test_module_filtering(self):
+        """global_trace_modules gates only explicitly named modules."""
+        orig_modules = mod.global_trace_modules
+        mod.global_trace_modules = ["request"]
+        try:
+            # Default empty module_name is never filtered
+            ctx = TraceReqContext(rid="req-1")
+            self.assertTrue(ctx.tracing_enable)
+            # Listed module is traced
+            ctx = TraceReqContext(rid="req-1", module_name="request")
+            self.assertTrue(ctx.tracing_enable)
+            # Unlisted module is filtered out
+            ctx = TraceReqContext(rid="req-1", module_name="mooncake")
+            self.assertFalse(ctx.tracing_enable)
+        finally:
+            mod.global_trace_modules = orig_modules
+
     def test_full_lifecycle(self):
         """Start → slice_start → slice_end → finish."""
-        ctx = TraceReqContext(rid="req-1", role="unified", module_name="test")
+        ctx = TraceReqContext(rid="req-1", role="unified")
         self.assertTrue(ctx.tracing_enable)
 
         ctx.trace_req_start(ts=1000)
@@ -503,7 +539,7 @@ class TestTraceReqContextEnabled(unittest.TestCase):
         state = ctx.__getstate__()
         ctx.trace_req_finish(ts=2000)
 
-        ctx2 = TraceReqContext.__new__(TraceReqContext)
+        ctx2 = TraceReqContext(rid="req-2")
         ctx2.__setstate__(state)
         self.assertTrue(ctx2.tracing_enable)
         self.assertTrue(ctx2.is_copy)
@@ -531,7 +567,7 @@ class TestTraceReqContextEnabled(unittest.TestCase):
         ctx.trace_req_finish(ts=3000)
 
         self.assertIsNotNone(state.get("last_span_context"))
-        ctx2 = TraceReqContext.__new__(TraceReqContext)
+        ctx2 = TraceReqContext(rid="req-2")
         ctx2.__setstate__(state)
         self.assertIsNotNone(ctx2.last_span_context)
 

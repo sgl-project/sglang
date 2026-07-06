@@ -1,3 +1,7 @@
+[workspace]
+members = ["bindings/python"]
+exclude = ["bindings/golang", "examples"]
+
 [package]
 name = "sgl-model-gateway"
 version = "0.3.2"
@@ -163,6 +167,11 @@ harness = false
 name = "manual_policy_benchmark"
 harness = false
 path = "benches/manual_policy_benchmark.rs"
+
+[[bench]]
+name = "streaming_utils_bench"
+harness = false
+path = "benches/streaming_utils_bench.rs"
 
 [profile.release]
 opt-level = "z"     # Optimize for size

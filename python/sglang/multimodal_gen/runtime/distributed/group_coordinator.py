@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 # Copyright 2024 xDiT team.
@@ -156,6 +158,7 @@ class GroupCoordinator:
         local_rank: int,
         torch_distributed_backend: Union[str, Backend],
         use_device_communicator: bool = True,
+        use_srt_custom_allreduce: bool = False,
         use_message_queue_broadcaster: bool = False,
         group_name: str | None = None,
     ):
@@ -211,10 +214,28 @@ class GroupCoordinator:
                 )
 
         self.mq_broadcaster = None
+        self.srt_custom_allreduce = None
+        if (
+            use_srt_custom_allreduce
+            and current_platform.is_cuda_alike()
+            and self.world_size > 1
+        ):
+            # srt owns topology, dtype, contiguity, and size dispatch for custom ar
+            self._init_srt_custom_allreduce()
 
         # TODO(will): check if this is needed
         # self.use_custom_op_call = current_platform.is_cuda_alike()
         self.use_custom_op_call = False
+
+    def _init_srt_custom_allreduce(self) -> None:
+        from sglang.srt.distributed.device_communicators.custom_all_reduce import (
+            CustomAllreduce,
+        )
+
+        self.srt_custom_allreduce = CustomAllreduce(
+            group=self.cpu_group,
+            device=self.device,
+        )
 
     @property
     def first_rank(self):
@@ -324,6 +345,18 @@ class GroupCoordinator:
         if self.world_size == 1:
             return input_
         else:
+            custom_ar = self.srt_custom_allreduce
+            if (
+                not async_op
+                and custom_ar is not None
+                and op == torch.distributed.ReduceOp.SUM
+                and not input_.is_cpu
+                and not custom_ar.disabled
+                and custom_ar.should_custom_ar(input_)
+            ):
+                if custom_ar._IS_CAPTURING:
+                    return custom_ar.custom_all_reduce(input_)
+                return custom_ar._all_reduce_impl(input_, registered=False)
             if (
                 current_platform.is_cpu()
                 and is_shm_available(input_.dtype, self.world_size, len(self.ranks))
@@ -767,6 +800,9 @@ class GroupCoordinator:
             self.cpu_group = None
         if self.device_communicator is not None:
             self.device_communicator.destroy()
+        if self.srt_custom_allreduce is not None:
+            self.srt_custom_allreduce.close()
+            self.srt_custom_allreduce = None
         if self.mq_broadcaster is not None:
             self.mq_broadcaster = None
 
@@ -1226,11 +1262,11 @@ class SequenceParallelGroupCoordinator(GroupCoordinator):
         ring_group = kwargs.get("ring_group", None)
         if ulysses_group is None:
             raise RuntimeError(
-                f"Please pass argument 'ulysses_group' when calling init func of SequenceParallelGroupCoordinator"
+                "Please pass argument 'ulysses_group' when calling init func of SequenceParallelGroupCoordinator"
             )
         if ring_group is None:
             raise RuntimeError(
-                f"Please pass argument 'ring_group' when calling init func of SequenceParallelGroupCoordinator"
+                "Please pass argument 'ring_group' when calling init func of SequenceParallelGroupCoordinator"
             )
         self.ulysses_group = ulysses_group
         self.ring_group = ring_group

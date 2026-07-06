@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from: https://github.com/vllm-project/vllm/blob/ab3e80042eac24dd362408e6d63ad98768046359/vllm/model_executor/layers/quantization/gguf.py
 from __future__ import annotations
 
@@ -80,7 +81,7 @@ class GGUFConfig(QuantizationConfig):
     def get_scaled_act_names(self) -> List[str]:
         return []
 
-    def get_name(self) -> "str":
+    def get_name(self) -> str:
         return "gguf"
 
     def get_supported_act_dtypes(self) -> list[torch.dtype]:
@@ -95,7 +96,7 @@ class GGUFConfig(QuantizationConfig):
         return []  # no extra configs.
 
     @classmethod
-    def from_config(cls, config: dict[str, Any]) -> "GGUFConfig":
+    def from_config(cls, config: dict[str, Any]) -> GGUFConfig:
         modules_to_not_convert = cls.get_from_keys_or(
             config, ["modules_to_not_convert"], None
         )
@@ -103,7 +104,7 @@ class GGUFConfig(QuantizationConfig):
 
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
-    ) -> Optional["QuantizeMethodBase"]:
+    ) -> Optional[QuantizeMethodBase]:
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
         from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 

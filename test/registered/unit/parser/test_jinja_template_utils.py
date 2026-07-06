@@ -9,7 +9,8 @@ from sglang.srt.parser.jinja_template_utils import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=7, suite="stage-a-test-cpu")
+register_cpu_ci(est_time=7, suite="base-a-test-cpu")
+register_cpu_ci(est_time=7, suite="base-c-test-cpu")
 
 
 class TestTemplateContentFormatDetection(CustomTestCase):
@@ -381,6 +382,37 @@ class TestTemplateContentFormatDetection(CustomTestCase):
         self.assertEqual(result["content"], "Hello World")
         # Image data is still extracted
         self.assertEqual(len(image_data), 1)
+
+    def test_process_content_v32_encoding_accepts_responses_input_text(self):
+        msg_dict = {
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "Hello"},
+                {
+                    "type": "input_image",
+                    "image_url": "http://example.com/img.jpg",
+                    "detail": "auto",
+                },
+                {"type": "input_text", "text": "World"},
+            ],
+        }
+        image_data = []
+        video_data = []
+        audio_data = []
+        modalities = []
+        result = process_content_for_template_format(
+            msg_dict,
+            "openai",
+            image_data,
+            video_data,
+            audio_data,
+            modalities,
+            use_dpsk_v32_encoding=True,
+        )
+
+        self.assertEqual(result["content"], "Hello World")
+        self.assertEqual(len(image_data), 1)
+        self.assertEqual(image_data[0].url, "http://example.com/img.jpg")
 
     def test_process_content_invalid_format_raises(self):
         """Test that invalid content_format raises ValueError."""

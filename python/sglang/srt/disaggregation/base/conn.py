@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import enum
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, List, Optional
 
@@ -13,10 +14,24 @@ if TYPE_CHECKING:
     from sglang.srt.disaggregation.utils import DisaggregationMode
 
 
+class StateType(str, enum.Enum):
+    MAMBA = "mamba"
+    SWA = "swa"
+    DSA = "dsa"
+    MINIMAX_INDEX_K = "minimax_index_k"
+    # DeepSeek-V4 unified_kv SWA ring: addressed per-row by ring slot
+    # (req_pool_idx * ring_stride + pos % ring_stride), needs its own component.
+    SWA_RING = "swa_ring"
+    # DeepSeek-V4 online C128 request-scoped state.
+    C128_STATE = "c128_state"
+
+
 @dataclasses.dataclass
 class KVTransferMetric:
     # Backends that cannot isolate transfer latency can leave this as None.
     transfer_latency_s: Optional[float] = None
+    # Backends that cannot isolate allocation wait latency can leave this as None.
+    alloc_latency_s: Optional[float] = None
     transfer_total_bytes: Optional[int] = None
 
 
@@ -28,23 +43,37 @@ class KVArgs:
     aux_data_ptrs: List[int]
     aux_data_lens: List[int]
     aux_item_lens: List[int]
-    state_data_ptrs: List[int]
-    state_data_lens: List[int]
-    state_item_lens: List[int]
-    state_type: str  # "none", "mamba", "swa", "nsa", "dsv4"
-    # for mamba state different tp slice transfer
-    state_dim_per_tensor: List[int]  # dimension to slice for each state tensor
+    state_types: List[StateType]
+    state_data_ptrs: List[List[int]]
+    state_data_lens: List[List[int]]
+    state_item_lens: List[List[int]]
+    # Per-tensor TP slice dim, used when prefill/decode attn_tp_size differ.
+    state_dim_per_tensor: List[List[int]]
     ib_device: str
     ib_traffic_class: str
     gpu_id: int
     kv_head_num: int
     total_kv_head_num: int
     page_size: int
+    # for system dp
+    system_dp_rank: int
     # for pp prefill
     pp_rank: int
     prefill_start_layer: int
-    # for system dp
-    system_dp_rank: int
+    # Absolute end layer (exclusive) for this prefill PP stage. Needed to
+    # reconstruct PP sub-ranges when kv_data_ptrs does not use a flat
+    # layer-indexed layout (e.g. DeepSeek V4's buffer-type-organized flat
+    # list).
+    prefill_end_layer: Optional[int]
+    # For DeepSeek V4 (and other compressed-MLA) memory pools only.
+    # Full-model compression ratio per layer (entries are 0/4/128). Used by
+    # the connection layer to slice the buffer-type-organized flat list in a
+    # PP-aware manner.
+    mla_compression_ratios: Optional[List[int]]
+    # Only used of npu, for kv buf groups
+    kv_buf_groups: int
+    # Only used of npu, for decode total kv layers
+    total_kv_layers: int
 
 
 class KVPoll:
@@ -74,7 +103,6 @@ class BaseKVManager(ABC):
 
 
 class BaseKVSender(ABC):
-
     @abstractmethod
     def __init__(
         self,
@@ -96,7 +124,7 @@ class BaseKVSender(ABC):
     def send(
         self,
         kv_indices: npt.NDArray[np.int32],
-        state_indices: Optional[List[int]] = None,
+        state_indices: Optional[List] = None,
     ):
         """
         Send the kv cache at the given kv indices and the extra cache/state at the given indices to the decoder server.
@@ -130,7 +158,6 @@ class BaseKVSender(ABC):
 
 
 class BaseKVReceiver(ABC):
-
     @abstractmethod
     def __init__(
         self,
@@ -154,7 +181,7 @@ class BaseKVReceiver(ABC):
         self,
         kv_indices: npt.NDArray[np.int32],
         aux_index: Optional[int] = None,
-        state_indices: Optional[List[int]] = None,
+        state_indices: Optional[List] = None,
         decode_prefix_len: Optional[int] = None,
     ):
         """

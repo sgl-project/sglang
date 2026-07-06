@@ -5,6 +5,7 @@ import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple
 
+from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.dp_attention import get_is_extend_in_batch
 from sglang.srt.layers.moe.token_dispatcher.base import (
     BaseDispatcher,
@@ -19,6 +20,7 @@ from sglang.srt.layers.moe.utils import (
     DeepEPMode,
     is_tbo_enabled,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import (
     get_bool_env_var,
     get_int_env_var,
@@ -34,11 +36,11 @@ from functools import lru_cache
 
 import torch
 
-from sglang.srt.distributed import (
-    get_moe_expert_parallel_rank,
-    get_moe_expert_parallel_world_size,
-)
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
+
+# Blockwise quantization group sizes: number of elements sharing one scale factor
+FP8_BLOCK_SIZE = 128
+MXFP4_BLOCK_SIZE = 32
 
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
@@ -47,6 +49,11 @@ if _use_aiter:
     from aiter import QuantType, get_hip_quant
 
 logger = logging.getLogger(__name__)
+
+
+def _should_record_expert_distribution() -> bool:
+    recorder = get_global_expert_distribution_recorder()
+    return recorder.recording or torch.get_device_module().is_current_stream_capturing()
 
 
 class MoriEPPDispatchHooks(DeepEPPDispatchHooks):
@@ -128,6 +135,18 @@ class EpMode(Enum):
     LOW_LATENCY = "low_latency"
 
 
+class DispatchDtype(Enum):
+    bf16 = "bfloat16"
+    fp8 = "float8_blockwise"
+    fp4 = "mxfp4_blockwise"
+
+
+class CombineDtype(Enum):
+    bf16 = "bfloat16"
+    fp8 = "float8_blockwise"
+    fp8_direct_cast = "float8_direct_cast"
+
+
 @dataclass(frozen=True)
 class EpDispatchConfig:
     kernel_type: mori.ops.EpDispatchCombineKernelType
@@ -188,15 +207,16 @@ def init_mori_op(
     num_max_dispatch_tokens_per_rank,
     deepep_mode,
     instance_id=0,
-    fp8_dispatch=False,
-    fp4_dispatch=False,
+    dispatch_dtype=DispatchDtype.bf16,
+    combine_dtype=CombineDtype.bf16,
     enable_sdma=False,
+    use_external_inp_buf=True,
 ):
 
     import mori
 
-    world_size = get_moe_expert_parallel_world_size()
-    rank = get_moe_expert_parallel_rank()
+    world_size = get_parallel().moe_ep_size
+    rank = get_parallel().moe_ep_rank
 
     gpu_per_node = 8 if world_size >= 8 else world_size
 
@@ -235,15 +255,18 @@ def init_mori_op(
     data_type = fp8_dtype
     scale_type_size = torch.float32.itemsize
 
-    if fp8_dispatch:
-        scale_dim = hidden_size // 128
-    elif fp4_dispatch:
+    if dispatch_dtype == DispatchDtype.bf16:
+        data_type = params_dtype
+        scale_dim = 0
+    elif dispatch_dtype == DispatchDtype.fp8:
+        scale_dim = hidden_size // FP8_BLOCK_SIZE
+    elif dispatch_dtype == DispatchDtype.fp4:
         # FP4 kernel still takes the original hidden size and do quantization
         # internally, so hidden_dim is not reduced. The reason is that for FP4
         # quantization, we need to keep the original hidden size to calculate
         # the quantization scale correctly. Don't use packed hidden size for FP4 kernel.
         hidden_dim = hidden_size
-        scale_dim = hidden_size // 32
+        scale_dim = hidden_size // MXFP4_BLOCK_SIZE
         data_type = torch.float4_e2m1fn_x2
         scale_type_size = torch.float8_e8m0fnu.itemsize
 
@@ -255,15 +278,20 @@ def init_mori_op(
                 block_num = 256
                 warp_num_per_block = 16
 
+    # Fp8 blockwise combine uses its own internal scale_dim driven which can be
+    # overridden by env ``MORI_FP8_COMBINE_SCALE_DIM`` (default 56)
+    # See https://github.com/ROCm/mori/blob/96ffa169710f214e76e07abe5008d686fe54522b/python/mori/ops/dispatch_combine.py#L81-L84
     combine_quant_type = "none"
-    if get_bool_env_var("SGLANG_MORI_FP8_COMB", "False"):
+    if combine_dtype == CombineDtype.fp8:
+        combine_quant_type = "fp8_blockwise"
+    elif combine_dtype == CombineDtype.fp8_direct_cast:
         combine_quant_type = "fp8_direct_cast"
 
     logger.info(
         f"[MORI init] {world_size=} {rank=} {hidden_size=} {params_dtype=} "
         f"{num_max_dispatch_tokens_per_rank=} {num_local_experts=} "
-        f"{router_topk=} {mode=} {fp8_dispatch=} {fp4_dispatch=} "
-        f"{combine_quant_type=}"
+        f"{router_topk=} {mode=} {dispatch_dtype=} {combine_dtype=} "
+        f"{use_external_inp_buf=} "
     )
 
     def check_mori_compatibility(kwargs: dict) -> None:
@@ -295,6 +323,7 @@ def init_mori_op(
         max_total_recv_tokens=get_int_env_var(
             "SGLANG_MORI_PREALLOC_MAX_RECV_TOKENS", 0
         ),
+        use_external_inp_buf=use_external_inp_buf,
         kernel_type=kernel_type,
         gpu_per_node=gpu_per_node,
         rdma_block_num=rdma_block_num,
@@ -363,10 +392,11 @@ class _MoriEPDispatcherImplBase:
         )
 
         self.enable_sdma = get_bool_env_var("MORI_ENABLE_SDMA", "false")
+        self.use_external_inp_buf = True
 
         self._mori_op = None
-        self.fp8_dispatch = False
-        self.fp4_dispatch = False
+        self.dispatch_dtype = DispatchDtype.bf16
+        self.combine_dtype = CombineDtype.bf16
 
         self.quant_config: Optional[dict] = None
 
@@ -389,19 +419,24 @@ class _MoriEPDispatcherImplBase:
                 self.num_max_dispatch_tokens_per_rank,
                 self.deepep_mode,
                 self.instance_id,
-                self.fp8_dispatch,
-                self.fp4_dispatch,
+                self.dispatch_dtype,
+                self.combine_dtype,
                 self.enable_sdma,
+                self.use_external_inp_buf,
             )
         return self._mori_op
 
     def _apply_dispatch_dtype_override(self):
-        """Apply env var override to fp8_dispatch/fp4_dispatch flags."""
+        """Apply env var override to fp8_dispatch/fp4_dispatch/fp8_combine flags."""
         if "SGLANG_MORI_DISPATCH_DTYPE" in os.environ:
             dispatch_dtype = os.environ["SGLANG_MORI_DISPATCH_DTYPE"].lower()
             if dispatch_dtype != "auto":
-                self.fp8_dispatch = dispatch_dtype == "fp8"
-                self.fp4_dispatch = dispatch_dtype == "fp4"
+                if dispatch_dtype == "bf16":
+                    self.dispatch_dtype = DispatchDtype.bf16
+                elif dispatch_dtype == "fp8":
+                    self.dispatch_dtype = DispatchDtype.fp8
+                elif dispatch_dtype == "fp4":
+                    self.dispatch_dtype = DispatchDtype.fp4
         elif (
             "SGLANG_MORI_FP8_DISP" in os.environ or "SGLANG_MORI_FP4_DISP" in os.environ
         ):
@@ -411,8 +446,29 @@ class _MoriEPDispatcherImplBase:
                 "and will be removed in a future release. "
                 "Use SGLANG_MORI_DISPATCH_DTYPE=auto|bf16|fp8|fp4 instead."
             )
-            self.fp8_dispatch = get_bool_env_var("SGLANG_MORI_FP8_DISP", "False")
-            self.fp4_dispatch = get_bool_env_var("SGLANG_MORI_FP4_DISP", "False")
+            if get_bool_env_var("SGLANG_MORI_FP8_DISP", "False"):
+                self.dispatch_dtype = DispatchDtype.fp8
+            if get_bool_env_var("SGLANG_MORI_FP4_DISP", "False"):
+                self.dispatch_dtype = DispatchDtype.fp4
+
+        if "SGLANG_MORI_COMBINE_DTYPE" in os.environ:
+            combine_dtype = os.environ["SGLANG_MORI_COMBINE_DTYPE"].lower()
+            if combine_dtype != "auto":
+                if combine_dtype == "fp8":
+                    self.combine_dtype = CombineDtype.fp8
+                elif combine_dtype == "bf16":
+                    self.combine_dtype = CombineDtype.bf16
+                elif combine_dtype == "fp8_direct_cast":
+                    self.combine_dtype = CombineDtype.fp8_direct_cast
+        elif "SGLANG_MORI_FP8_COMB" in os.environ:
+            # Deprecated: will be removed in a future release
+            logger.warning_once(
+                "SGLANG_MORI_FP8_COMB is deprecated "
+                "and will be removed in a future release. "
+                "Use SGLANG_MORI_COMBINE_DTYPE=auto|bf16|fp8|fp8_direct_cast instead."
+            )
+            if get_bool_env_var("SGLANG_MORI_FP8_COMB", "False"):
+                self.combine_dtype = CombineDtype.fp8
 
     def dispatch_a(
         self,
@@ -440,14 +496,14 @@ class _MoriEPDispatcherImplBase:
         # Auto-detect dispatch quantization from weight dtype
         weight_dtype = quant_config.get("weight_dtype", None)
         if weight_dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
-            self.fp8_dispatch = True
-            self.fp4_dispatch = False
+            self.dispatch_dtype = DispatchDtype.fp8
+            self.combine_dtype = CombineDtype.bf16
         elif weight_dtype == torch.float4_e2m1fn_x2:
-            self.fp8_dispatch = False
-            self.fp4_dispatch = True
+            self.dispatch_dtype = DispatchDtype.fp4
+            self.combine_dtype = CombineDtype.fp8
         else:
-            self.fp8_dispatch = False
-            self.fp4_dispatch = False
+            self.dispatch_dtype = DispatchDtype.bf16
+            self.combine_dtype = CombineDtype.bf16
         # Apply env var override immediately so dispatch_a sees correct flags
         self._apply_dispatch_dtype_override()
 
@@ -460,6 +516,9 @@ class _MoriEPDispatcherImplBase:
     def clear_overlap_args(self) -> None:
         self.overlap_args = None
         self.meta_overlap_args = None
+
+    def _combine_kwargs(self, hidden_states: torch.Tensor) -> dict:
+        return {}
 
 
 class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
@@ -494,9 +553,7 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
         output_dtype = hidden_states.dtype
         scale = None
 
-        fp8_dispatch, fp4_dispatch = self.fp8_dispatch, self.fp4_dispatch
-
-        if fp8_dispatch:
+        if self.dispatch_dtype == DispatchDtype.fp8:
             # FP8 quant
             if num_token > 0:
                 # NOTE: aiter is able to handle token=0 case in UT. But for some
@@ -509,12 +566,12 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
                     hidden_states.shape, dtype=fp8_dtype, device=hidden_states.device
                 )
                 scale = torch.empty(
-                    (0, self.hidden_size // 128),
+                    (0, self.hidden_size // FP8_BLOCK_SIZE),
                     dtype=torch.float32,
                     device=hidden_states.device,
                 )
 
-        elif fp4_dispatch:
+        elif self.dispatch_dtype == DispatchDtype.fp4:
             # FP4 quant
             if num_token > 0:
                 hidden_states, scale = self.fp4_quant_func(hidden_states, shuffle=False)
@@ -525,7 +582,7 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
                     device=hidden_states.device,
                 )
                 scale = torch.empty(
-                    (0, self.hidden_size // 32),
+                    (0, self.hidden_size // MXFP4_BLOCK_SIZE),
                     dtype=torch.float8_e8m0fnu,
                     device=hidden_states.device,
                 )
@@ -590,6 +647,8 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
     ):
         done_event: Optional[torch.cuda.Event] = None
 
+        record = _should_record_expert_distribution()
+
         if self._comm_stream:
             compute_stream = torch.cuda.current_stream()
             comm_stream = self._comm_stream  # comm stream
@@ -619,7 +678,13 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
                     recv_scales,
                     recv_topk_ids,
                     packed_recv_count,
-                ) = dispatch_fn(hidden_states, topk_weights, scale, topk_ids)
+                ) = dispatch_fn(
+                    hidden_states,
+                    topk_weights,
+                    scale,
+                    topk_ids,
+                    call_local_expert_count=record,
+                )
                 if self.enable_sdma:
                     self.mori_op.dispatch_recv()
 
@@ -645,10 +710,20 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
                 recv_scales,
                 recv_topk_ids,
                 packed_recv_count,
-            ) = self.mori_op.dispatch(hidden_states, topk_weights, scale, topk_ids)
+            ) = self.mori_op.dispatch(
+                hidden_states,
+                topk_weights,
+                scale,
+                topk_ids,
+                call_local_expert_count=record,
+            )
 
-        # TODO(billishyahao): EPLB
-        # get_global_expert_distribution_recorder().on_deepep_dispatch_normal(
+        # mori local_expert_count is a GPU tensor; route it through the
+        # low_latency hook only when the recorder is actually active.
+        if record:
+            get_global_expert_distribution_recorder().on_deepep_dispatch_low_latency(
+                self.mori_op.local_expert_count
+            )
 
         return (
             packed_recv_hidden,
@@ -706,7 +781,10 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
                     if self.enable_sdma
                     else self.mori_op.combine
                 )
-                combined_hidden_states = combine_fn(hidden_states, None, topk_ids)[0]
+                combine_kwargs = self._combine_kwargs(hidden_states)
+                combined_hidden_states = combine_fn(
+                    hidden_states, None, topk_ids, **combine_kwargs
+                )[0]
                 if self.enable_sdma:
                     self.mori_op.combine_recv()
 
@@ -719,8 +797,9 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
             combined_hidden_states.record_stream(comm_stream)
 
         else:
+            combine_kwargs = self._combine_kwargs(hidden_states)
             combined_hidden_states = self.mori_op.combine(
-                hidden_states, None, topk_ids
+                hidden_states, None, topk_ids, **combine_kwargs
             )[0]
 
         return combined_hidden_states, done_event
@@ -752,9 +831,7 @@ class _MoriEPDispatcherImplLowLatency(_MoriEPDispatcherImplBase):
         output_dtype = hidden_states.dtype
         scale = None
 
-        fp8_dispatch, fp4_dispatch = self.fp8_dispatch, self.fp4_dispatch
-
-        if fp8_dispatch:
+        if self.dispatch_dtype == DispatchDtype.fp8:
             # FP8 quant
             if num_tokens > 0:
                 # NOTE: aiter is able to handle token=0 case in UT. But for some
@@ -767,12 +844,12 @@ class _MoriEPDispatcherImplLowLatency(_MoriEPDispatcherImplBase):
                     hidden_states.shape, dtype=fp8_dtype, device=hidden_states.device
                 )
                 scale = torch.empty(
-                    (0, self.hidden_size // 128),
+                    (0, self.hidden_size // FP8_BLOCK_SIZE),
                     dtype=torch.float32,
                     device=hidden_states.device,
                 )
 
-        elif fp4_dispatch:
+        elif self.dispatch_dtype == DispatchDtype.fp4:
             # FP4 quant
             if num_tokens > 0:
                 hidden_states, scale = self.fp4_quant_func(hidden_states, shuffle=False)
@@ -783,7 +860,7 @@ class _MoriEPDispatcherImplLowLatency(_MoriEPDispatcherImplBase):
                     device=hidden_states.device,
                 )
                 scale = torch.empty(
-                    (0, self.hidden_size // 32),
+                    (0, self.hidden_size // MXFP4_BLOCK_SIZE),
                     dtype=torch.float8_e8m0fnu,
                     device=hidden_states.device,
                 )
@@ -829,7 +906,13 @@ class _MoriEPDispatcherImplLowLatency(_MoriEPDispatcherImplBase):
             is mori.ops.EpDispatchCombineKernelType.AsyncLL
         ), "mori asyncll mismatch"
 
-        self.mori_op.dispatch_recv()
+        record = _should_record_expert_distribution()
+        self.mori_op.dispatch_recv(call_local_expert_count=record)
+
+        if record:
+            get_global_expert_distribution_recorder().on_deepep_dispatch_low_latency(
+                self.mori_op.local_expert_count
+            )
 
         return MoriEPLLDispatchOutput(
             hidden_states=hidden_states,
@@ -970,11 +1053,26 @@ class MoriEPDispatcher(BaseDispatcher):
         self._stage = _Stage.INITIAL
         self._deepep_dispatch_hooks = MoriEPPDispatchHooks()
 
+        # Mori dispatch produces global topk_ids in [0, num_experts); mask out
+        # experts that are not local to this rank.
+        self.expert_mask_gpu = None
+        if _use_aiter and num_experts is not None and num_local_experts is not None:
+            ep_rank = get_parallel().moe_ep_rank
+            expert_mask = torch.zeros(
+                num_experts,
+                device=torch.cuda.current_device(),
+                dtype=torch.int32,
+            )
+            start = ep_rank * num_local_experts
+            expert_mask[start : start + num_local_experts] = 1
+            self.expert_mask_gpu = expert_mask
+
     def dispatch(
         self,
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
     ) -> DispatchOutput:
+        self._num_tokens = hidden_states.shape[0]
         self.dispatch_a(hidden_states, topk_output)
         if self._deepep_dispatch_hooks is not None:
             self._deepep_dispatch_hooks(self)
@@ -1004,8 +1102,8 @@ class MoriEPDispatcher(BaseDispatcher):
         combine_input: CombineInput,
     ) -> Tuple:
         self.combine_a(combine_input)
-        ret = self.combine_b()
-        return ret
+        hidden_states = self.combine_b()
+        return hidden_states[: self._num_tokens]
 
     def combine_a(
         self,

@@ -33,7 +33,9 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     RowParallelLinear,
 )
 from sglang.multimodal_gen.runtime.layers.quantization import QuantizationConfig
-from sglang.multimodal_gen.runtime.managers.layerwise_offload import OffloadableDiTMixin
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+)
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 
 
@@ -132,10 +134,14 @@ class ErnieImageSelfAttention(nn.Module):
             self.norm_q = RMSNorm(head_dim, eps=eps)
             self.norm_k = RMSNorm(head_dim, eps=eps)
 
+        # The joint [image, text] stream is fully replicated, so the ulysses
+        # all-to-all would wrongly treat it as sharded and duplicate it. Skip
+        # SP until the stream is sharded (sp_shard + num_replicated_suffix).
         self.attn = USPAttention(
             num_heads=self.num_local_heads,
             head_size=head_dim,
             prefix=f"{prefix}.attn",
+            skip_sequence_parallel=True,
         )
 
     def forward(
@@ -172,7 +178,6 @@ class ErnieImageSelfAttention(nn.Module):
 
 
 class ErnieImageMLP(nn.Module):
-
     def __init__(
         self,
         hidden_size: int,
@@ -266,7 +271,7 @@ def _apply_rotary_bshd(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
     return torch.cat((x_rot, x_pass), dim=-1)
 
 
-class ErnieImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
+class ErnieImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     """ErnieImage DiT: Single-stream transformer with Shared AdaLN."""
 
     _supports_gradient_checkpointing = True
@@ -295,8 +300,6 @@ class ErnieImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         self.patch_size = arch.patch_size
         self.out_channels = arch.out_channels
         self.inner_dim = self.hidden_size
-
-        tp_size = get_tp_world_size()
 
         self.x_embedder = nn.ModuleDict(
             {

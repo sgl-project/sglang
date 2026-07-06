@@ -16,7 +16,7 @@ except ImportError:
     CuteDslMoEWrapper = None
     convert_sf_to_mma_layout = None
 
-register_cuda_ci(est_time=590, suite="stage-c-test-4-gpu-b200")
+register_cuda_ci(est_time=24, stage="extra-b", runner_config="4-gpu-b200")
 
 SKIP_TEST = torch.cuda.get_device_capability() < (10, 0)
 SKIP_REASON = "Nvfp4 Requires compute capability of 10 or above."
@@ -780,7 +780,8 @@ class TestCuteDslV2(unittest.TestCase):
 class TestCuteDslV1(unittest.TestCase):
     """Correctness tests for the CuteDSL v1 (deepep) path.
 
-    The v1 path (apply_without_routing_weights -> flashinfer_cutedsl_moe_masked)
+    The v1 path (flashinfer_cutedsl_moe_masked, dispatched via the
+    @register_fused_func("deepep", "flashinfer_cutedsl") MoeRunner entry)
     is used when --moe-runner-backend flashinfer_cutedsl and --moe-a2a-backend
     deepep are combined.  It expects:
       - W13 in default [Gate, Up] order (load_up_proj_weight_first = False)
@@ -899,13 +900,14 @@ class TestCuteDslV1(unittest.TestCase):
                         masked_m.to(hidden_states.device),
                     )
 
+                    a_global_scale = input_global_scale[:1]
                     a_fp4, a_scale_interleaved = fp4_quantize(
-                        hidden_states, input_global_scale
+                        hidden_states, a_global_scale
                     )
                     a_in_dtype = dequantize_nvfp4_to_dtype(
                         a_fp4,
                         a_scale_interleaved,
-                        input_global_scale,
+                        a_global_scale,
                         dtype=hidden_states.dtype,
                         device=hidden_states.device,
                         block_size=16,
@@ -1077,11 +1079,12 @@ class TestCuteDslV1(unittest.TestCase):
                 masked_m.to(device),
             )
 
-            a_fp4, a_scale_interleaved = fp4_quantize(hidden_states, input_global_scale)
+            a_global_scale = input_global_scale[:1]
+            a_fp4, a_scale_interleaved = fp4_quantize(hidden_states, a_global_scale)
             a_in_dtype = dequantize_nvfp4_to_dtype(
                 a_fp4,
                 a_scale_interleaved,
-                input_global_scale,
+                a_global_scale,
                 dtype=hidden_states.dtype,
                 device=device,
                 block_size=16,
@@ -1251,11 +1254,12 @@ class TestCuteDslV1(unittest.TestCase):
             )
 
             # PyTorch reference (same as the bf16 input test)
-            a_fp4, a_scale = fp4_quantize(hidden_states, input_gs)
+            a_gs = input_gs[:1]
+            a_fp4, a_scale = fp4_quantize(hidden_states, a_gs)
             a_deq = dequantize_nvfp4_to_dtype(
                 a_fp4,
                 a_scale,
-                input_gs,
+                a_gs,
                 dtype=torch.bfloat16,
                 device=device,
                 block_size=16,

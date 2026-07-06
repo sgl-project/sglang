@@ -270,9 +270,13 @@ jobs:
     # Self-hosted GPU runners are scarce; serialize per hardware type so
     # 2-gpu-h100 and 4-gpu-h100 each run one job at a time across all
     # in-flight PRs. Queue rather than cancel — different refs shouldn't
-    # interrupt each other.
+    # interrupt each other. Include matrix.name in the group so siblings
+    # within the same run don't collide: GitHub keeps only one pending job
+    # per concurrency group, so matrix entries sharing a group (e.g.
+    # benchmarks + chat-completions-4gpu on 4-gpu-h100) would evict each
+    # other regardless of cancel-in-progress: false.
     concurrency:
-      group: pr-test-rust-${{ matrix.runner }}
+      group: pr-test-rust-${{ matrix.runner }}-${{ matrix.name }}
       cancel-in-progress: false
     steps:
       - name: Checkout code

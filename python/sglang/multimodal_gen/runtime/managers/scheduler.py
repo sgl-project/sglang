@@ -1,16 +1,14 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 # SPDX-License-Identifier: Apache-2.0
-import asyncio
 import dataclasses
-import os
 import pickle
-import tempfile
 import time
 from collections import deque
+from contextlib import contextmanager
 from copy import deepcopy
 from enum import Enum
-from typing import Any, List
+from typing import Any, Iterator, List
 
 import zmq
 
@@ -18,22 +16,26 @@ from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin import (
     SchedulerDisaggMixin,
 )
-from sglang.multimodal_gen.runtime.distributed import get_world_group
-from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
-    _parse_size,
-    save_image_to_path,
-)
 from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
     GetWeightsChecksumReqInput,
+    ReleaseMemoryOccupationReqInput,
+    ResumeMemoryOccupationReqInput,
     UpdateWeightFromDiskReqInput,
+    UpdateWeightFromTensorCheckerReqInput,
+    UpdateWeightFromTensorReqInput,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
     GetDisaggStatsReq,
     ListLorasReq,
     MergeLoraWeightsReq,
+    ReleaseRealtimeSessionReq,
     SetLoraReq,
     ShutdownReq,
     UnmergeLoraWeightsReq,
+)
+from sglang.multimodal_gen.runtime.ipc_array import (
+    is_local_endpoint,
+    spill_large_arrays_to_file_refs,
 )
 from sglang.multimodal_gen.runtime.managers.cpu_worker import CPUWorker
 from sglang.multimodal_gen.runtime.managers.dynamic_batch_admission import (
@@ -45,32 +47,32 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
     BatchMetricsWindow,
     OutputBatch,
 )
+from sglang.multimodal_gen.runtime.post_training.scheduler_post_training_mixin import (
+    SchedulerPostTrainingMixin,
+)
 from sglang.multimodal_gen.runtime.server_args import (
     PortArgs,
     ServerArgs,
     set_global_server_args,
 )
+from sglang.multimodal_gen.runtime.server_warmup import (
+    SchedulerWarmupMixin,
+    get_first_generation_req,
+    is_warmup_req,
+    should_return_warmup_result,
+)
 from sglang.multimodal_gen.runtime.utils.common import get_zmq_socket
 from sglang.multimodal_gen.runtime.utils.distributed import broadcast_pyobj
-from sglang.multimodal_gen.runtime.utils.logging_utils import GREEN, RESET, init_logger
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.trace_wrapper import DiffStage, trace_slice
 
 logger = init_logger(__name__)
-
-MINIMUM_PICTURE_BASE64_FOR_WARMUP = "data:image/jpg;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAACXBIWXMAAA7EAAAOxAGVKw4bAAAAbUlEQVRYhe3VsQ2AMAxE0Y/lIgNQULD/OqyCMgCihCKSG4yRuKuiNH6JLsoEbMACOGBcua9HOR7Y6w6swBwMy0qLTpkeI77qdEBpBFAHBBDAGH8WrwJKI4AAegUCfAKgEgpQDvh3CR3oQCuav58qlAw73kKCSgAAAABJRU5ErkJggg=="
-
-# Placeholder negative_prompt used in synthesized warmup Reqs when
-# --enable-cfg-parallel is on. A non-empty, real word (vs "" or " ") so
-# every tokenizer backend emits a predictable, non-degenerate token
-# sequence — rank 1's uncond branch then produces a valid tensor for
-# _combine_cfg_parallel's all-reduce.
-DEFAULT_PLACEHOLDER_PROMPT = "warmup"
 
 _MAX_RECV_REQS_PER_POLL = 1024
 _BATCH_METRICS_LOG_INTERVAL = 5
 
 
-class Scheduler(SchedulerDisaggMixin):
+class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisaggMixin):
     """
     Runs the main event loop for the rank 0 worker.
     It listens for external requests via ZMQ and coordinates with other workers.
@@ -121,6 +123,7 @@ class Scheduler(SchedulerDisaggMixin):
         self.task_pipes_to_slaves = task_pipes_to_slaves
         self.result_pipes_from_slaves = result_pipes_from_slaves
         self.gpu_id = gpu_id
+        self._show_warmup_progress = gpu_id == 0
         self._running = True
 
         self.request_handlers = {
@@ -130,9 +133,16 @@ class Scheduler(SchedulerDisaggMixin):
             Req: self._handle_generation,
             ListLorasReq: self._handle_list_loras,
             ShutdownReq: self._handle_shutdown,
+            ReleaseRealtimeSessionReq: self._handle_release_realtime_session,
             GetDisaggStatsReq: self._handle_get_disagg_stats,
             UpdateWeightFromDiskReqInput: self._handle_update_weights_from_disk,
+            UpdateWeightFromTensorReqInput: self._handle_update_weights_from_tensor,
+            UpdateWeightFromTensorCheckerReqInput: (
+                self._handle_update_weights_from_tensor_checker
+            ),
             GetWeightsChecksumReqInput: self._handle_get_weights_checksum,
+            ReleaseMemoryOccupationReqInput: self._handle_release_memory_occupation,
+            ResumeMemoryOccupationReqInput: self._handle_resume_memory_occupation,
         }
 
         # FIFO queue entries: (identity, request, enqueue_ts_s)
@@ -146,13 +156,12 @@ class Scheduler(SchedulerDisaggMixin):
         if self.receiver is not None:
             self._poller.register(self.receiver, zmq.POLLIN)
 
-        # whether we've send the necessary warmup reqs
-        self.warmed_up = False
+        self.req_based_warmup_scheduled = False
         # warmup progress tracking
         self._warmup_total = 0
         self._warmup_processed = 0
-
-        self.prepare_server_warmup_reqs()
+        self._warmup_progress_bar: Any | None = None
+        self._logged_server_ready_after_warmup = False
 
         # Maximum consecutive errors before terminating the event loop
         self._max_consecutive_errors = 3
@@ -184,7 +193,11 @@ class Scheduler(SchedulerDisaggMixin):
         # TODO: return with SetLoRAResponse or something more appropriate
         req = reqs[0]
         return self.worker.set_lora(
-            req.lora_nickname, req.lora_path, req.target, req.strength
+            req.lora_nickname,
+            req.lora_path,
+            req.target,
+            req.strength,
+            req.merge_mode,
         )
 
     def _handle_merge_lora(self, reqs: List[Any]):
@@ -202,46 +215,24 @@ class Scheduler(SchedulerDisaggMixin):
         self._running = False
         return OutputBatch()
 
+    def _handle_release_realtime_session(self, reqs: List[Any]) -> OutputBatch:
+        req = reqs[0]
+        return self.worker.release_realtime_session(req.session_id)
+
     def _handle_update_weights_from_disk(self, reqs: List[Any]) -> OutputBatch:
         """Handle update_weights_from_disk request for RL workflows."""
-        req = reqs[0]
-        success, message = self.worker.update_weights_from_disk(
-            model_path=req.model_path,
-            flush_cache=req.flush_cache,
-            target_modules=req.target_modules,
-        )
-        return OutputBatch(
-            output={"success": success, "message": message},
-            error=None if success else message,
-        )
-
-    def _handle_get_weights_checksum(self, reqs: List[Any]) -> OutputBatch:
-        """Handle get_weights_checksum request."""
-        req = reqs[0]
-        checksums = self.worker.get_weights_checksum(module_names=req.module_names)
-        return OutputBatch(output=checksums)
+        if self.worker.is_sleeping():
+            raise RuntimeError(
+                "Cannot update weights while the server is sleeping. "
+                "Call resume_memory_occupation first."
+            )
+        return super()._handle_update_weights_from_disk(reqs)
 
     @staticmethod
     def _normalize_generation_reqs(reqs: list[Any]) -> list[Req]:
         if len(reqs) == 1 and isinstance(reqs[0], list):
             return reqs[0]
         return reqs
-
-    @staticmethod
-    def _first_generation_req(req_or_group: Any) -> Req | None:
-        """Extract the first req"""
-        if isinstance(req_or_group, Req):
-            return req_or_group
-        if isinstance(req_or_group, list) and req_or_group:
-            first_req = req_or_group[0]
-            if isinstance(first_req, Req):
-                return first_req
-        return None
-
-    @classmethod
-    def _is_warmup_item(cls, req_or_group: Any) -> bool:
-        req = cls._first_generation_req(req_or_group)
-        return req.is_warmup if req is not None else False
 
     def _dispatch_single_request(self, req_or_group: Any) -> OutputBatch:
         if isinstance(req_or_group, list):
@@ -267,48 +258,18 @@ class Scheduler(SchedulerDisaggMixin):
             return [self._dispatch_single_request(req) for req in reqs]
         return self._dispatch_single_request(reqs[0])
 
-    def _log_warmup_result(self, output_batch: OutputBatch, is_warmup: bool) -> None:
-        if not is_warmup:
-            return
-
-        if output_batch.error is None:
-            total_duration_s = (
-                output_batch.metrics.total_duration_s
-                if output_batch.metrics is not None
-                else 0.0
-            )
-            if self._warmup_total > 0:
-                logger.info(
-                    f"Warmup req ({self._warmup_processed}/{self._warmup_total}) processed in {GREEN}%.2f{RESET} seconds",
-                    total_duration_s,
-                )
-            else:
-                logger.info(
-                    f"Warmup req processed in {GREEN}%.2f{RESET} seconds",
-                    total_duration_s,
-                )
-        else:
-            if self._warmup_total > 0:
-                logger.info(
-                    f"Warmup req ({self._warmup_processed}/{self._warmup_total}) processing failed"
-                )
-            else:
-                logger.info("Warmup req processing failed")
-
     def _handle_generation(
         self, reqs: list[Any], *, allow_dynamic_batching: bool = True
     ):
         """Dispatch generation requests, merging compatible requests when allowed."""
         reqs = self._normalize_generation_reqs(reqs)
+        if self.worker.is_sleeping():
+            raise RuntimeError(
+                "Server is sleeping. Call resume_memory_occupation first."
+            )
         warmup_reqs = [req for req in reqs if req.is_warmup]
         if warmup_reqs:
-            self._warmup_processed += len(warmup_reqs)
-            if self._warmup_total > 0:
-                logger.info(
-                    f"Processing warmup req... ({self._warmup_processed}/{self._warmup_total})"
-                )
-            else:
-                logger.info("Processing warmup req...")
+            self._ensure_warmup_progress_bar(warmup_reqs[0])
 
         # Use the head request trace context for scheduler-side dispatch work.
         req = reqs[0]
@@ -483,6 +444,10 @@ class Scheduler(SchedulerDisaggMixin):
 
         if base_req.is_warmup or candidate_req.is_warmup:
             return "warmup"
+        if self._has_realtime_session(base_req) or self._has_realtime_session(
+            candidate_req
+        ):
+            return "realtime_session"
         if not isinstance(base_req.prompt, str) or not isinstance(
             candidate_req.prompt, str
         ):
@@ -502,9 +467,18 @@ class Scheduler(SchedulerDisaggMixin):
             or "signature_mismatch"
         )
 
+    @staticmethod
+    def _has_realtime_session(req: Req) -> bool:
+        return bool(req.realtime_session_id) or req.session is not None
+
     def _can_dynamic_batch(self, base_req: Req, candidate_req: Req) -> bool:
         """Return whether `candidate_req` can be merged into a batch with `base_req`."""
         if base_req.is_warmup or candidate_req.is_warmup:
+            return False
+
+        if self._has_realtime_session(base_req) or self._has_realtime_session(
+            candidate_req
+        ):
             return False
 
         if not isinstance(base_req.prompt, str) or not isinstance(
@@ -598,17 +572,53 @@ class Scheduler(SchedulerDisaggMixin):
     ) -> List[OutputBatch]:
         return [OutputBatch(error=error_msg) for _ in reqs]
 
+    def _should_return_lightweight_warmup_result(self, processed_req: Any) -> bool:
+        req = get_first_generation_req(processed_req)
+        return (req is not None and bool(req.extra.get("server_internal_prewarm"))) or (
+            is_warmup_req(processed_req) and should_return_warmup_result(processed_req)
+        )
+
     def return_result(
         self,
         output_batch: OutputBatch,
         identity: bytes | None = None,
-        is_warmup: bool = False,
+        should_not_return: bool = False,
     ):
         """
         replies to client, only on rank 0
         """
-        if not is_warmup and self.receiver is not None and identity is not None:
-            self.receiver.send_multipart([identity, b"", pickle.dumps(output_batch)])
+        if not should_not_return and self.receiver is not None and identity is not None:
+            # if the server is local, use temp file to spill the frame array instead of
+            # leaving it in OutputBatch to be pickled later
+            if is_local_endpoint(self.server_args.scheduler_endpoint):
+                with self._record_return_stage(
+                    output_batch, "Scheduler.return_result.spill_arrays"
+                ):
+                    output_batch.output = spill_large_arrays_to_file_refs(
+                        output_batch.output
+                    )
+
+            with self._record_return_stage(
+                output_batch, "Scheduler.return_result.pickle"
+            ):
+                payload = pickle.dumps(output_batch)
+
+            with self._record_return_stage(
+                output_batch, "Scheduler.return_result.send"
+            ):
+                self.receiver.send_multipart([identity, b"", payload])
+
+    @contextmanager
+    def _record_return_stage(
+        self, output_batch: OutputBatch, stage_name: str
+    ) -> Iterator[None]:
+        """helper function to record a stage metric"""
+        start_time = time.perf_counter()
+        yield
+        if output_batch.metrics is not None:
+            output_batch.metrics.record_stage(
+                stage_name, time.perf_counter() - start_time
+            )
 
     def _try_merge_generation_reqs(self, reqs: List[Req]) -> Req | None:
         """Create a batched generation request from compatible requests.
@@ -870,119 +880,6 @@ class Scheduler(SchedulerDisaggMixin):
         )
         return batch_items
 
-    def prepare_server_warmup_reqs(self):
-        if (
-            self.server_args.warmup
-            and not self.warmed_up
-            and self.server_args.warmup_resolutions is not None
-        ):
-            # insert warmup reqs constructed with each warmup-resolution
-            self._warmup_total = len(self.server_args.warmup_resolutions)
-            self._warmup_processed = 0
-            task_type = self.server_args.pipeline_config.task_type
-
-            requires_warmup_image = task_type.accepts_image_input()
-            warmup_input_path = None
-            if requires_warmup_image:
-                warmup_input_path = self._prepare_shared_warmup_image_path()
-
-            for resolution in self.server_args.warmup_resolutions:
-                width, height = _parse_size(resolution)
-
-                # CFG-parallel splits cond/uncond across ranks, so rank 1
-                # needs a real uncond pass. Force do_classifier_free_guidance
-                # + non-empty negative_prompt when cfg-parallel is on, so the
-                # synthesized warmup Req exercises both ranks' denoising paths.
-                # When cfg-parallel is off, the Req construction is
-                # byte-identical to the pre-fix behavior.
-                req_kwargs = dict(
-                    data_type=task_type.data_type(),
-                    width=width,
-                    height=height,
-                    prompt="",
-                )
-                if requires_warmup_image:
-                    req_kwargs["negative_prompt"] = ""
-                    req_kwargs["image_path"] = [warmup_input_path]
-                if self.server_args.enable_cfg_parallel:
-                    req_kwargs["negative_prompt"] = DEFAULT_PLACEHOLDER_PROMPT
-                    req_kwargs["do_classifier_free_guidance"] = True
-                req = Req(**req_kwargs)
-                req.set_as_warmup(self.server_args.warmup_steps)
-                self.waiting_queue.append((None, req, time.monotonic()))
-            # if server is warmed-up, set this flag to avoid req-based warmup
-            self.warmed_up = True
-
-    def _prepare_shared_warmup_image_path(self) -> str:
-        world_group = get_world_group()
-        src_rank = world_group.ranks[0]
-
-        warmup_sync: dict[str, str | None]
-        if world_group.rank == src_rank:
-            try:
-                if self.server_args.input_save_path is not None:
-                    uploads_dir = self.server_args.input_save_path
-                    os.makedirs(uploads_dir, exist_ok=True)
-                else:
-                    uploads_dir = tempfile.mkdtemp(prefix="sglang_input_")
-                warmup_image_base = os.path.join(uploads_dir, "warmup_image")
-                input_path = asyncio.run(
-                    save_image_to_path(
-                        MINIMUM_PICTURE_BASE64_FOR_WARMUP,
-                        warmup_image_base,
-                    )
-                )
-                warmup_sync = {"input_path": input_path, "error": None}
-            except Exception as e:
-                warmup_sync = {"input_path": None, "error": str(e)}
-        else:
-            warmup_sync = {}
-
-        # Sync rank 0's warmup-image write result (path or error) to all ranks.
-        warmup_sync = broadcast_pyobj(
-            warmup_sync,
-            world_group.rank,
-            world_group.cpu_group,
-            src=src_rank,
-        )
-        if not isinstance(warmup_sync, dict):
-            raise RuntimeError("Invalid warmup sync payload received across ranks")
-
-        error = warmup_sync.get("error")
-        if error is not None:
-            raise RuntimeError(
-                f"Warmup image preparation failed on rank {src_rank}: {error}"
-            )
-
-        input_path = warmup_sync.get("input_path")
-        if not isinstance(input_path, str) or not input_path:
-            raise RuntimeError("Warmup image preparation returned empty input path")
-
-        return input_path
-
-    def process_received_reqs_with_req_based_warmup(
-        self, recv_reqs: List[tuple[bytes, Any]]
-    ) -> List[tuple[bytes, Any]]:
-        if (
-            self.warmed_up
-            or not self.server_args.warmup
-            or not recv_reqs
-            or self.server_args.warmup_resolutions is not None
-        ):
-            return recv_reqs
-
-        # handle server req-based warmup by inserting an identical req to the beginning of the waiting queue
-        # only the very first req through server's lifetime will be warmed up
-        identity, req_or_group = recv_reqs[0]
-        req = self._first_generation_req(req_or_group)
-        if req is not None:
-            warmup_req = req.copy_as_warmup(self.server_args.warmup_steps)
-            recv_reqs.insert(0, (identity, warmup_req))
-            self._warmup_total = 1
-            self._warmup_processed = 0
-            self.warmed_up = True
-        return recv_reqs
-
     @staticmethod
     def _normalize_received_payload(
         identity: bytes, reqs: Any
@@ -1155,10 +1052,22 @@ class Scheduler(SchedulerDisaggMixin):
                 for (identity, processed_req), output_batch in zip(
                     items, output_batches, strict=True
                 ):
-                    is_warmup = self._is_warmup_item(processed_req)
-                    self._log_warmup_result(output_batch, is_warmup)
+                    is_warmup = is_warmup_req(processed_req)
+                    self._log_warmup_result(output_batch, processed_req, is_warmup)
 
-                    self.return_result(output_batch, identity, is_warmup=is_warmup)
+                    should_return_lightweight_warmup_result = (
+                        self._should_return_lightweight_warmup_result(processed_req)
+                    )
+                    if should_return_lightweight_warmup_result:
+                        # internal prewarm is a real-path request; reply but drop payloads
+                        output_batch.drop_payload_for_warmup()
+                        self.return_result(
+                            output_batch, identity, should_not_return=False
+                        )
+                    else:
+                        self.return_result(
+                            output_batch, identity, should_not_return=is_warmup
+                        )
             except zmq.ZMQError as e:
                 # Reply failed; log and keep loop alive to accept future requests
                 logger.error(f"ZMQ error sending reply: {e}")
@@ -1185,3 +1094,11 @@ class Scheduler(SchedulerDisaggMixin):
         for pipe in self.result_pipes_from_slaves:
             results.append(pipe.recv())
         return results
+
+    def _handle_release_memory_occupation(self, _reqs: List[Any]) -> OutputBatch:
+        logger.info(f"[SLEEP] handle_release_memory_occupation on rank={self.gpu_id}")
+        return OutputBatch(output=self.worker.release_memory_occupation())
+
+    def _handle_resume_memory_occupation(self, _reqs: List[Any]) -> OutputBatch:
+        logger.info(f"[WAKE] handle_resume_memory_occupation on rank={self.gpu_id}")
+        return OutputBatch(output=self.worker.resume_memory_occupation())
