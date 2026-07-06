@@ -2348,6 +2348,27 @@ class DeepseekV4ForCausalLM(nn.Module):
                     use_async_loading = should_async_load(loaded_weight)
 
                     orig_name = name
+                    if is_dspark and orig_name.startswith("mtp."):
+                        parts = orig_name.split(".", 2)
+                        if len(parts) >= 3:
+                            stage = int(parts[1])
+                            rest = parts[2]
+                            final_stage = int(getattr(self, "num_dspark_layers", 0)) - 1
+                            if rest.startswith(("main_proj.", "main_norm.")):
+                                if stage != 0:
+                                    continue
+                            elif (
+                                rest == "norm.weight"
+                                or rest.startswith(
+                                    (
+                                        "hc_head_",
+                                        "markov_head.",
+                                        "confidence_head.",
+                                    )
+                                )
+                            ):
+                                if final_stage >= 0 and stage != final_stage:
+                                    continue
                     name = self.remap_weight_name_to_dpsk_hf_format(
                         name,
                         is_nextn=is_nextn,
