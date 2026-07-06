@@ -33,7 +33,7 @@ This section provides deployment configurations optimized for different hardware
 
 The Wan2.2 series offers models in various sizes, architectures and input types, optimized for different hardware platforms. The recommended launch configurations vary by hardware and model size.
 
-**Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform, model size. SGLang supports serving Wan2.2 on NVIDIA B200, H200 and AMD MI300X, MI325X and MI355X GPUs.
+**Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform, model size. SGLang supports serving Wan2.2 on NVIDIA B200, H200, AMD MI300X, MI325X, MI355X GPUs and Ascend A2, A3 NPUs.
 
 <Wan22Deployment />
 
@@ -55,6 +55,45 @@ Currently supported optimizations are listed [here](/docs/sglang-diffusion/compa
 For more API usage and request examples, please refer to:
 [SGLang Diffusion OpenAI API](/docs/sglang-diffusion/api/openai_api)
 
+#### 4.1.1 Launch a server and then send requests
+
+<Tabs>
+  <Tab title="NVIDIA B200">
+    ```shell Command
+    sglang serve --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers --port 3000
+
+    curl http://127.0.0.1:3000/v1/images/generations \
+      -o >(jq -r '.data[0].b64_json' | base64 --decode > example.png) \
+      -H "Content-Type: application/json" \
+      -H "Authorization: Bearer $OPENAI_API_KEY" \
+      -d '{
+        "model": "black-forest-labs/FLUX.1-dev",
+        "prompt": "A cute baby sea otter",
+        "n": 1,
+        "size": "1024x1024",
+        "response_format": "b64_json"
+      }'
+    ```
+  </Tab>
+  <Tab title="Ascend A2 / A3">
+    ```shell Command
+    sglang serve --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers --port 3000 ЗАГЛУШКА
+
+    curl http://127.0.0.1:3000/v1/images/generations \
+      -o >(jq -r '.data[0].b64_json' | base64 --decode > example.png) \
+      -H "Content-Type: application/json" \
+      -H "Authorization: Bearer $OPENAI_API_KEY" \
+      -d '{
+        "model": "black-forest-labs/FLUX.1-dev",
+        "prompt": "A cute baby sea otter",
+        "n": 1,
+        "size": "1024x1024",
+        "response_format": "b64_json"
+      }'
+    ```
+  </Tab>
+</Tabs>
+{/*
 #### 4.1.1 Launch a server and then send requests
 
 ```shell Command
@@ -95,6 +134,68 @@ SAMPLING_ARGS=(
 sglang generate "${SERVER_ARGS[@]}" "${SAMPLING_ARGS[@]}"
 
 ```
+*/}
+
+### 4.1.2 Generate a video without launching a server
+
+<Tabs>
+  <Tab title="NVIDIA B200">
+    ```shell Command
+    SERVER_ARGS=(
+      --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers
+      --text-encoder-cpu-offload
+      --pin-cpu-memory
+      --num-gpus 4
+      --ulysses-degree=2
+      --enable-cfg-parallel
+    )
+
+    SAMPLING_ARGS=(
+      --prompt "A curious raccoon"
+      --save-output
+      --output-path outputs
+      --output-file-name "A curious raccoon.mp4"
+    )
+
+    sglang generate "${SERVER_ARGS[@]}" "${SAMPLING_ARGS[@]}"
+    ```
+  </Tab>
+
+  <Tab title="Ascend A2 / A3">
+    ```shell Command
+    SERVER_ARGS=(
+      --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers
+      --device npu
+      --dit-layerwise-offload false
+      --num-gpus 4
+    )
+
+    SAMPLING_ARGS=(
+      --prompt "A curious raccoon"
+      --save-output
+      --output-path outputs
+      --output-file-name "A curious raccoon.mp4"
+    )
+
+    sglang generate "${SERVER_ARGS[@]}" "${SAMPLING_ARGS[@]}"
+    ```
+  </Tab>
+</Tabs>
+
+**Basic Usage**
+
+<Tabs>
+  <Tab title="NVIDIA B200">
+    ```shell Command
+    SGLANG_CACHE_DIT_ENABLED=true sglang serve --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers
+    ```
+  </Tab>
+  <Tab title="Ascend A2 / A3">
+    ```shell Command
+    SGLANG_CACHE_DIT_ENABLED=true sglang serve --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers ЗАГЛУШКА
+    ```
+  </Tab>
+</Tabs>
 
 ### 4.2 Advanced Usage
 
@@ -195,7 +296,8 @@ SGLANG_CACHE_DIT_ENABLED=true sglang serve --model-path Wan-AI/Wan2.2-T2V-A14B-D
 </table>
 
   Combined Configuration Example:
-
+<Tabs>
+  <Tab title="NVIDIA B200">
 ```shell Command
 SGLANG_CACHE_DIT_ENABLED=true \
 SGLANG_CACHE_DIT_FN=2 \
@@ -207,6 +309,21 @@ SGLANG_CACHE_DIT_TAYLORSEER=true \
 SGLANG_CACHE_DIT_TS_ORDER=2 \
 sglang serve --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers
 ```
+  </Tab>
+  <Tab title="Ascend A2 / A3">
+     ```shell Command
+    SGLANG_CACHE_DIT_ENABLED=true \
+    SGLANG_CACHE_DIT_FN=2 \
+    SGLANG_CACHE_DIT_BN=1 \
+    SGLANG_CACHE_DIT_WARMUP=4 \
+    SGLANG_CACHE_DIT_RDT=0.4 \
+    SGLANG_CACHE_DIT_MC=4 \
+    SGLANG_CACHE_DIT_TAYLORSEER=true \
+    SGLANG_CACHE_DIT_TS_ORDER=2 \
+    sglang serve --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers ЗАГЛУШКА
+    ```
+  </Tab>
+</Tabs>
 
 #### 4.2.2 GPU Optimization
 
@@ -255,6 +372,71 @@ Test Environment:
 
 ### 5.1 Speedup Benchmark
 
+### 5.1.1 Generate a video
+
+<Tabs>
+  <Tab title="NVIDIA B200">
+    **Server Command**:
+    ```shell Command
+    sglang serve --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers
+    ```
+
+    **Benchmark Command**:
+    ```shell Command
+    python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
+        --backend sglang-video --dataset vbench --task t2v --num-prompts 1 --max-concurrency 1
+    ```
+
+    **Result**:
+    ```text Output
+    ================= Serving Benchmark Result =================
+    Backend:                                 sglang-video
+    Model:                                   Wan-AI/Wan2.2-T2V-A14B-Diffusers
+    Dataset:                                 vbench
+    Task:                                    t2v
+    --------------------------------------------------
+    Benchmark duration (s):                  630.43
+    Request rate:                            inf
+    Max request concurrency:                 1
+    Successful requests:                     1/1
+    --------------------------------------------------
+    Request throughput (req/s):              0.00
+    Latency Mean (s):                        630.4277
+    Latency Median (s):                      630.4277
+    Latency P99 (s):                         630.4277
+    --------------------------------------------------
+    Peak Memory Max (MB):                    62627.41
+    Peak Memory Mean (MB):                   62627.41
+    Peak Memory Median (MB):                 62627.41
+
+    ============================================================
+    ```
+  </Tab>
+
+  <Tab title="Ascend A2 / A3">
+    **Server Command**:
+    ```shell Command
+    sglang serve --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers --device npu --dit-layerwise-offload false
+    ```
+
+    **Benchmark Command**:
+    ```shell Command
+    python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
+        --backend sglang-video --dataset vbench --task t2v --num-prompts 1 --max-concurrency 1 --device npu
+    ```
+
+    **Result**:
+    ```text Output
+    ================= Serving Benchmark Result =================
+    Backend:                                 sglang-video
+    Model:                                   Wan-AI/Wan2.2-T2V-A14B-Diffusers
+    ... (здесь вставьте результаты тестов для A3, когда они у вас будут) ...
+    ============================================================
+    ```
+  </Tab>
+</Tabs>
+
+{/*
 #### 5.1.1 Generate a video
 
 **Server Command**:
@@ -295,7 +477,82 @@ Peak Memory Median (MB):                 62627.41
 
 ============================================================
 ```
+*/}
+#### 5.1.2 Generate videos with high concurrency
 
+<Tabs>
+  <Tab title="NVIDIA B200">
+    **Server Command**:
+
+    ```shell Command
+    SGLANG_CACHE_DIT_ENABLED=true \
+    SGLANG_CACHE_DIT_FN=2 \
+    SGLANG_CACHE_DIT_BN=1 \
+    SGLANG_CACHE_DIT_WARMUP=4 \
+    SGLANG_CACHE_DIT_RDT=0.4 \
+    SGLANG_CACHE_DIT_MC=4 \
+    SGLANG_CACHE_DIT_TAYLORSEER=true \
+    SGLANG_CACHE_DIT_TS_ORDER=2 \
+    sglang serve --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers
+    ```
+
+    **Benchmark Command**:
+
+    ```shell Command
+    python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
+        --backend sglang-video --dataset vbench --task t2v --num-prompts 20 --max-concurrency 20
+    ```
+
+    **Result**:
+
+    ```text Output
+    ================= Serving Benchmark Result =================
+    Backend:                                 sglang-video
+    Model:                                   Wan-AI/Wan2.2-T2V-A14B-Diffusers
+    Dataset:                                 vbench
+    Task:                                    t2v
+    --------------------------------------------------
+    Benchmark duration (s):                  5163.21
+    Request rate:                            inf
+    Max request concurrency:                 20
+    Successful requests:                     20/20
+    --------------------------------------------------
+    Request throughput (req/s):              0.00
+    Latency Mean (s):                        2739.7695
+    Latency Median (s):                      2742.0673
+    Latency P99 (s):                         5121.6331
+    --------------------------------------------------
+    Peak Memory Max (MB):                    72523.56
+    Peak Memory Mean (MB):                   70253.34
+    Peak Memory Median (MB):                 70824.46
+
+    ============================================================
+    ```
+  </Tab>
+  
+  <Tab title="Ascend A3">
+    **Server Command**:
+
+    ```shell Command
+    sglang serve --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers ЗАГЛУШКА
+    ```
+
+    **Benchmark Command**:
+
+    ```shell Command
+    python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
+        --backend sglang-video --dataset vbench --task t2v --num-prompts 20 --max-concurrency 20 ЗАГЛУШКА
+    ```
+
+    **Result**:
+
+    ```text Output
+    ЗАГЛУШКА (Здесь будут результаты бенчмарка для A3)
+    ```
+  </Tab>
+</Tabs>
+
+{/*
 #### 5.1.2 Generate videos with high concurrency
 
 **Server Command**:
@@ -343,4 +600,4 @@ Peak Memory Mean (MB):                   70253.34
 Peak Memory Median (MB):                 70824.46
 
 ============================================================
-```
+```*/}
