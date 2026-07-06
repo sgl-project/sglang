@@ -55,16 +55,11 @@ def _wan_rmsnorm_silu_kernel(
     norm = tl.sqrt(tl.sum(x * x, axis=0))
     inv_norm = 1.0 / tl.maximum(norm, eps)
 
-    # Match the eager PyTorch op boundaries more closely: F.normalize returns the
-    # input dtype before the affine and SiLU ops run.
-    y = (x * inv_norm).to(out_ptr.dtype.element_ty)
-    gamma = tl.load(gamma_ptr + offsets, mask=mask, other=1.0)
-    y = y * rms_scale * gamma
+    gamma = tl.load(gamma_ptr + offsets, mask=mask, other=1.0).to(tl.float32)
+    y = x * inv_norm * rms_scale * gamma
     if has_bias:
-        bias = tl.load(bias_ptr + offsets, mask=mask, other=0.0)
+        bias = tl.load(bias_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
         y += bias
-    y = y.to(out_ptr.dtype.element_ty)
-    y = y.to(tl.float32)
     y = y * tl.sigmoid(y)
 
     tl.store(out_ptr + out_base + offsets * out_stride_c, y, mask=mask)
