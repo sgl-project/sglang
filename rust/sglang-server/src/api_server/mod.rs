@@ -549,166 +549,82 @@ fn msgpack_to_json(bytes: &[u8]) -> Result<Vec<u8>, String> {
 /// unary response and the cumulative SGLang `/generate` stream. OpenAI streaming
 /// forwards deltas directly and doesn't use this. Shared with the [`openai`]
 /// submodule (`super::OutputAccumulator`).
-#[derive(Default)]
+/// Wraps a single cumulative [`GenerationOutput`] built up across delta chunks.
+/// Holding it (rather than mirroring its fields) lets `snapshot` hand back a
+/// **borrow** for each streaming frame — no per-frame deep clone of the growing
+/// buffers (that made token-by-token streaming O(T²) *extra* on top of the wire
+/// format's inherent O(T²)).
 struct OutputAccumulator {
-    text: String,
-    output_ids: Vec<i32>,
-    prompt_tokens: u32,
-    completion_tokens: u64,
-    finish_reason: Option<serde_json::Value>,
-    /// Output-token logprobs, concatenated across chunks (parallel val/idx).
-    out_lp_val: Vec<f32>,
-    out_lp_idx: Vec<i32>,
-    /// Input (prefill) token logprobs — set once (only the first chunk carries
-    /// them).
-    in_lp_val: Vec<f32>,
-    in_lp_idx: Vec<i32>,
-    /// Top-k logprobs, concatenated across chunks (2-level ragged: flat val/idx
-    /// + per-position lens). Output concatenates; input is set once.
-    out_top_val: Vec<f32>,
-    out_top_idx: Vec<i32>,
-    out_top_lens: Vec<u32>,
-    in_top_val: Vec<f32>,
-    in_top_idx: Vec<i32>,
-    in_top_lens: Vec<u32>,
-    /// Token-ids logprobs (same layout).
-    out_tid_val: Vec<f32>,
-    out_tid_idx: Vec<i32>,
-    out_tid_lens: Vec<u32>,
-    in_tid_val: Vec<f32>,
-    in_tid_idx: Vec<i32>,
-    in_tid_lens: Vec<u32>,
-    /// Hidden states — last-writer-wins (final chunk carries the full set).
-    hidden_val: Vec<f32>,
-    hidden_lens: Vec<u32>,
-    /// Decoded logprob token text (parallel to each `*_idx`); output concatenates,
-    /// input is set once, same as the val/idx columns.
-    out_lp_txt: Vec<String>,
-    in_lp_txt: Vec<String>,
-    out_top_txt: Vec<String>,
-    in_top_txt: Vec<String>,
-    out_tid_txt: Vec<String>,
-    in_tid_txt: Vec<String>,
+    out: GenerationOutput,
 }
 
 impl OutputAccumulator {
-    /// Fold one delta frame in.
+    /// Empty accumulator for request `rid`.
+    fn new(rid: String) -> Self {
+        Self {
+            out: GenerationOutput {
+                rid,
+                ..Default::default()
+            },
+        }
+    }
+
+    /// Fold one delta frame in. Output families concatenate; input families and
+    /// hidden states are set-once / last-writer-wins (they ride the prefill/final
+    /// chunk), matching the Python `meta_info` assignment.
     fn fold(&mut self, d: &GenerationOutput) {
-        self.text.push_str(&d.text);
-        self.output_ids.extend_from_slice(&d.output_ids);
-        self.completion_tokens += d.completion_tokens;
-        self.prompt_tokens = d.prompt_tokens; // constant across the request
-        self.out_lp_val.extend_from_slice(&d.out_lp_val);
-        self.out_lp_idx.extend_from_slice(&d.out_lp_idx);
-        self.out_top_val.extend_from_slice(&d.out_top_val);
-        self.out_top_idx.extend_from_slice(&d.out_top_idx);
-        self.out_top_lens.extend_from_slice(&d.out_top_lens);
-        self.out_tid_val.extend_from_slice(&d.out_tid_val);
-        self.out_tid_idx.extend_from_slice(&d.out_tid_idx);
-        self.out_tid_lens.extend_from_slice(&d.out_tid_lens);
-        self.out_lp_txt.extend_from_slice(&d.out_lp_txt);
-        self.out_top_txt.extend_from_slice(&d.out_top_txt);
-        self.out_tid_txt.extend_from_slice(&d.out_tid_txt);
+        let o = &mut self.out;
+        o.text.push_str(&d.text);
+        o.output_ids.extend_from_slice(&d.output_ids);
+        o.completion_tokens += d.completion_tokens;
+        o.prompt_tokens = d.prompt_tokens; // constant across the request
+        o.out_lp_val.extend_from_slice(&d.out_lp_val);
+        o.out_lp_idx.extend_from_slice(&d.out_lp_idx);
+        o.out_top_val.extend_from_slice(&d.out_top_val);
+        o.out_top_idx.extend_from_slice(&d.out_top_idx);
+        o.out_top_lens.extend_from_slice(&d.out_top_lens);
+        o.out_tid_val.extend_from_slice(&d.out_tid_val);
+        o.out_tid_idx.extend_from_slice(&d.out_tid_idx);
+        o.out_tid_lens.extend_from_slice(&d.out_tid_lens);
+        o.out_lp_txt.extend_from_slice(&d.out_lp_txt);
+        o.out_top_txt.extend_from_slice(&d.out_top_txt);
+        o.out_tid_txt.extend_from_slice(&d.out_tid_txt);
         if !d.in_lp_val.is_empty() {
-            self.in_lp_val = d.in_lp_val.clone();
-            self.in_lp_idx = d.in_lp_idx.clone();
-            self.in_lp_txt = d.in_lp_txt.clone();
+            o.in_lp_val = d.in_lp_val.clone();
+            o.in_lp_idx = d.in_lp_idx.clone();
+            o.in_lp_txt = d.in_lp_txt.clone();
         }
         // Input families ride once (prefill); `lens` non-empty marks their arrival.
         if !d.in_top_lens.is_empty() {
-            self.in_top_val = d.in_top_val.clone();
-            self.in_top_idx = d.in_top_idx.clone();
-            self.in_top_lens = d.in_top_lens.clone();
-            self.in_top_txt = d.in_top_txt.clone();
+            o.in_top_val = d.in_top_val.clone();
+            o.in_top_idx = d.in_top_idx.clone();
+            o.in_top_lens = d.in_top_lens.clone();
+            o.in_top_txt = d.in_top_txt.clone();
         }
         if !d.in_tid_lens.is_empty() {
-            self.in_tid_val = d.in_tid_val.clone();
-            self.in_tid_idx = d.in_tid_idx.clone();
-            self.in_tid_lens = d.in_tid_lens.clone();
-            self.in_tid_txt = d.in_tid_txt.clone();
+            o.in_tid_val = d.in_tid_val.clone();
+            o.in_tid_idx = d.in_tid_idx.clone();
+            o.in_tid_lens = d.in_tid_lens.clone();
+            o.in_tid_txt = d.in_tid_txt.clone();
         }
         // Hidden states are non-cumulative: the latest non-empty set wins.
         if !d.hidden_lens.is_empty() {
-            self.hidden_val = d.hidden_val.clone();
-            self.hidden_lens = d.hidden_lens.clone();
+            o.hidden_val = d.hidden_val.clone();
+            o.hidden_lens = d.hidden_lens.clone();
         }
         if d.finish_reason.is_some() {
-            self.finish_reason = d.finish_reason.clone();
+            o.finish_reason = d.finish_reason.clone();
         }
     }
 
-    /// Cumulative snapshot for an intermediate streaming frame (clones — a
-    /// cumulative protocol like SGLang `/generate` needs the full text per frame).
-    fn snapshot(&self, rid: &str) -> GenerationOutput {
-        GenerationOutput {
-            rid: rid.to_string(),
-            text: self.text.clone(),
-            output_ids: self.output_ids.clone(),
-            prompt_tokens: self.prompt_tokens,
-            completion_tokens: self.completion_tokens,
-            finish_reason: self.finish_reason.clone(),
-            out_lp_val: self.out_lp_val.clone(),
-            out_lp_idx: self.out_lp_idx.clone(),
-            in_lp_val: self.in_lp_val.clone(),
-            in_lp_idx: self.in_lp_idx.clone(),
-            out_top_val: self.out_top_val.clone(),
-            out_top_idx: self.out_top_idx.clone(),
-            out_top_lens: self.out_top_lens.clone(),
-            in_top_val: self.in_top_val.clone(),
-            in_top_idx: self.in_top_idx.clone(),
-            in_top_lens: self.in_top_lens.clone(),
-            out_tid_val: self.out_tid_val.clone(),
-            out_tid_idx: self.out_tid_idx.clone(),
-            out_tid_lens: self.out_tid_lens.clone(),
-            in_tid_val: self.in_tid_val.clone(),
-            in_tid_idx: self.in_tid_idx.clone(),
-            in_tid_lens: self.in_tid_lens.clone(),
-            hidden_val: self.hidden_val.clone(),
-            hidden_lens: self.hidden_lens.clone(),
-            out_lp_txt: self.out_lp_txt.clone(),
-            in_lp_txt: self.in_lp_txt.clone(),
-            out_top_txt: self.out_top_txt.clone(),
-            in_top_txt: self.in_top_txt.clone(),
-            out_tid_txt: self.out_tid_txt.clone(),
-            in_tid_txt: self.in_tid_txt.clone(),
-        }
+    /// Borrow the cumulative output for an intermediate streaming frame.
+    fn snapshot(&self) -> &GenerationOutput {
+        &self.out
     }
 
-    /// Consume into the final cumulative output (moves; for a unary response or a
-    /// stream's final frame).
-    fn into_output(self, rid: String) -> GenerationOutput {
-        GenerationOutput {
-            rid,
-            text: self.text,
-            output_ids: self.output_ids,
-            prompt_tokens: self.prompt_tokens,
-            completion_tokens: self.completion_tokens,
-            finish_reason: self.finish_reason,
-            out_lp_val: self.out_lp_val,
-            out_lp_idx: self.out_lp_idx,
-            in_lp_val: self.in_lp_val,
-            in_lp_idx: self.in_lp_idx,
-            out_top_val: self.out_top_val,
-            out_top_idx: self.out_top_idx,
-            out_top_lens: self.out_top_lens,
-            in_top_val: self.in_top_val,
-            in_top_idx: self.in_top_idx,
-            in_top_lens: self.in_top_lens,
-            out_tid_val: self.out_tid_val,
-            out_tid_idx: self.out_tid_idx,
-            out_tid_lens: self.out_tid_lens,
-            in_tid_val: self.in_tid_val,
-            in_tid_idx: self.in_tid_idx,
-            in_tid_lens: self.in_tid_lens,
-            hidden_val: self.hidden_val,
-            hidden_lens: self.hidden_lens,
-            out_lp_txt: self.out_lp_txt,
-            in_lp_txt: self.in_lp_txt,
-            out_top_txt: self.out_top_txt,
-            in_top_txt: self.in_top_txt,
-            out_tid_txt: self.out_tid_txt,
-            in_tid_txt: self.in_tid_txt,
-        }
+    /// Consume into the final cumulative output.
+    fn into_output(self) -> GenerationOutput {
+        self.out
     }
 }
 
@@ -738,18 +654,18 @@ async fn generate(State(state): State<AppState>, Json(payload): Json<GeneratePay
         // SSE: the SGLang `/generate` protocol carries **cumulative** text per
         // frame, so fold the detok deltas back up before formatting each frame.
         let s = async_stream::stream! {
-            let mut acc = OutputAccumulator::default();
+            let mut acc = OutputAccumulator::new(rid.0.to_string());
             let mut terminated = false;
             while let Some(item) = rx.recv().await {
                 match item {
                     EgressItem::Frame(out) => {
                         acc.fold(&out);
-                        let f = sglang_frame(&acc.snapshot(&out.rid));
+                        let f = sglang_frame(acc.snapshot());
                         yield Ok::<_, Infallible>(Event::default().data(String::from_utf8_lossy(&f)));
                     }
                     EgressItem::Done(out) => {
                         acc.fold(&out);
-                        let f = sglang_frame(&acc.into_output(out.rid));
+                        let f = sglang_frame(&acc.into_output());
                         yield Ok(Event::default().data(String::from_utf8_lossy(&f)));
                         terminated = true;
                         break;
@@ -782,14 +698,14 @@ async fn generate(State(state): State<AppState>, Json(payload): Json<GeneratePay
         Sse::new(s).into_response()
     } else {
         // Unary: fold every delta, respond once from the cumulative result.
-        let mut acc = OutputAccumulator::default();
+        let mut acc = OutputAccumulator::new(rid.0.to_string());
         while let Some(item) = rx.recv().await {
             match item {
                 EgressItem::Frame(out) => acc.fold(&out),
                 EgressItem::Done(out) => {
                     acc.fold(&out);
                     guard.disarm(rid);
-                    let final_out = acc.into_output(out.rid);
+                    let final_out = acc.into_output();
                     // A validation abort carries its own HTTP status + diagnostic.
                     if let Some(resp) = abort_error_response(&final_out.finish_reason) {
                         return resp;
@@ -905,6 +821,40 @@ mod logprob_shape_tests {
             frame["meta_info"]["input_token_logprobs"],
             serde_json::json!([[serde_json::Value::Null, 10, "<s>"], [-0.5f32, 20, "hi"]])
         );
+    }
+
+    /// The accumulator folds deltas cumulatively and `snapshot` borrows the
+    /// running state (no per-frame clone); `into_output` moves the same state.
+    #[test]
+    fn accumulator_snapshot_is_cumulative() {
+        let mut acc = OutputAccumulator::new("r1".into());
+        acc.fold(&GenerationOutput {
+            text: "he".into(),
+            output_ids: vec![1, 2],
+            completion_tokens: 2,
+            ..Default::default()
+        });
+        {
+            let s = acc.snapshot();
+            assert_eq!(s.rid, "r1"); // set at construction
+            assert_eq!(s.text, "he");
+            assert_eq!(s.output_ids, vec![1, 2]);
+        }
+        acc.fold(&GenerationOutput {
+            text: "llo".into(),
+            output_ids: vec![3],
+            completion_tokens: 1,
+            ..Default::default()
+        });
+        {
+            let s = acc.snapshot();
+            assert_eq!(s.text, "hello"); // cumulative
+            assert_eq!(s.output_ids, vec![1, 2, 3]);
+            assert_eq!(s.completion_tokens, 3);
+        }
+        let out = acc.into_output();
+        assert_eq!(out.text, "hello");
+        assert_eq!(out.rid, "r1");
     }
 
     /// A populated text column (decoded on the detok shard) → `Some`; empty
