@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import logging
 import os
 import time
@@ -239,6 +240,15 @@ class SchedulerProfilerManager:
                 self.torch_profiler = None
                 return ProfileReqOutput(success=False, message=str(e))
             self.profile_in_progress = True
+            # TEMP (local, not for upstream): pin GC off for the profiled window.
+            # The native-mxfp4 FA4 (flash-attn cute / cutlass-DSL / tvm_ffi) path
+            # segfaults if Python's cyclic GC fires mid-dispatch under the extra
+            # object churn the profiler adds. Mirrors the gc.freeze() that CUDA
+            # graph capture already does (base_cuda_graph_runner). Re-enabled in
+            # _stop_profile. gc.disable() (not just freeze) is required: the fault
+            # is GC running on newly-allocated objects during the window.
+            gc.collect()
+            gc.disable()
 
         if "MEM" in activities:
             torch.cuda.memory._record_memory_history(max_entries=100000)
@@ -368,6 +378,10 @@ class SchedulerProfilerManager:
         self.torch_profiler = None
         self.profile_in_progress = False
         self.profiler_start_forward_ct = None
+
+        # TEMP (local): undo the gc.disable() from _start_profile. Kept disabled
+        # through export_chrome_trace / merge above, which also allocate heavily.
+        gc.enable()
 
         return ProfileReqOutput(success=True, message=f"Succeeded.{merge_message}")
 
