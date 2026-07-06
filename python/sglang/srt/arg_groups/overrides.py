@@ -1195,8 +1195,6 @@ def _deepseek_spec_moe_resolution(view: Any) -> dict:
     model_arch = hf_config.architectures[0]
     if model_arch not in _DEEPSEEK_FAMILY_ARCHS:
         return {}
-    if not is_hip():
-        return {}
     if not (
         view.quantization == "modelopt_fp4"
         and view.speculative_algorithm == "EAGLE"
