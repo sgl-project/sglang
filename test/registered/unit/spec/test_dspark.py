@@ -75,6 +75,7 @@ def _make_server_args(**overrides):
         enable_mixed_chunk=False,
         trust_remote_code=False,
         json_model_override_args="{}",
+        disable_overlap_schedule=False,
     )
     base.update(overrides)
     return SimpleNamespace(**base)
