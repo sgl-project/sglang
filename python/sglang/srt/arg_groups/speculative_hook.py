@@ -58,8 +58,14 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
     ):
         server_args.speculative_draft_model_revision = "main"
 
-    if server_args.speculative_moe_runner_backend is None:
-        server_args.speculative_moe_runner_backend = server_args.moe_runner_backend
+    # Moved to the resolution pipeline (arg_groups/overrides.py:
+    # _speculative_moe_runner_default), invoked here at its legacy slot.
+    from sglang.srt.arg_groups.overrides import (
+        _speculative_moe_runner_default,
+        run_post_process_pass,
+    )
+
+    run_post_process_pass(server_args, _speculative_moe_runner_default)
 
     if server_args.speculative_algorithm is not None:
         server_args.speculative_algorithm = server_args.speculative_algorithm.upper()
@@ -229,6 +235,8 @@ def _handle_dflash(server_args: ServerArgs) -> None:
                 f"window_size={server_args.speculative_draft_window_size}, block_size={draft_tokens}."
             )
 
+    _resolve_dflash_draft_attention_backend(server_args)
+
     if server_args.max_running_requests is None:
         server_args.max_running_requests = 48
         logger.warning(
@@ -240,6 +248,45 @@ def _handle_dflash(server_args: ServerArgs) -> None:
         logger.warning(
             "Mixed chunked prefill is disabled because of using dflash speculative decoding."
         )
+
+
+def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
+    """Resolve `speculative_draft_attention_backend` to a final, supported value.
+
+    Consumed by ModelRunner's `is_draft_worker` override (one backend for all
+    draft modes).
+    """
+    from sglang.srt.utils import is_hip
+
+    supported_draft_backends = ("flashinfer", "fa3", "fa4", "triton", "ascend")
+    # Use triton on ROCm (no FlashInfer), flashinfer on CUDA.
+    fallback_backend = "triton" if is_hip() else "flashinfer"
+
+    draft_backend = server_args.speculative_draft_attention_backend
+    if draft_backend is None:
+        draft_backend, _ = server_args.get_attention_backends()
+    if draft_backend is None:
+        draft_backend = fallback_backend
+    elif draft_backend == "trtllm_mha":
+        logger.warning(
+            "DFLASH draft worker does not support 'trtllm_mha' because the "
+            "draft path requires per-layer DFlash attention. Falling back to "
+            "'%s'.",
+            fallback_backend,
+        )
+        draft_backend = fallback_backend
+    elif draft_backend not in supported_draft_backends:
+        logger.warning(
+            "DFLASH draft worker only supports attention_backend in %s for now, "
+            "but got %r. Falling back to '%s'.",
+            supported_draft_backends,
+            draft_backend,
+            fallback_backend,
+        )
+        draft_backend = fallback_backend
+    # FIXME: avoid overriding server args directly; pass the resolved draft
+    # backend to the draft worker explicitly instead.
+    server_args.speculative_draft_attention_backend = draft_backend
 
 
 def _handle_frozen_kv_mtp(server_args: ServerArgs) -> None:
