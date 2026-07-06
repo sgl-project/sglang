@@ -195,6 +195,10 @@ class DSAMetadata:
     # 2D context_lens used to build the schedule above; the indexer reuses it
     # as DG's `context_lens` arg so the broadcast doesn't rebuild per layer.
     paged_mqa_ctx_lens_2d: Optional[torch.Tensor] = None
+    # Precomputed once per forward batch and reused across layers: the
+    # DeepSeek-V4 top-k v2 plan (cluster-threshold metadata) for the folded
+    # decode top-k transform. None unless SGLANG_OPT_USE_TOPK_V2 and decode.
+    topk_v2_plan: Optional[torch.Tensor] = None
     # The sum of sequence lengths for key, prefill only
     seq_lens_sum: Optional[int] = None
     # The flattened 1D page table with shape (seq_lens_sum,), prefill only
@@ -621,6 +625,34 @@ class DeepseekSparseAttnBackend(
         else:
             metadata.paged_mqa_schedule_metadata.copy_(new_schedule)
 
+    def _build_topk_v2_plan(
+        self, seqlens_expanded: torch.Tensor, cache_seqlens_int32: torch.Tensor
+    ) -> Optional[torch.Tensor]:
+        # Plan the folded top-k v2 transform once per forward (shared by all
+        # layers), at metadata-build time. The plan is consumed only by the
+        # decode fold (one score row per batch, the shape
+        # `_try_topk_transform_v2_paged` engages on), so skip other shapes
+        # (prefill / target-verify) and when the fold is disabled.
+        if not envs.SGLANG_OPT_USE_TOPK_V2.get():
+            return None
+        if seqlens_expanded.shape[0] != cache_seqlens_int32.shape[0]:
+            return None
+        from sglang.jit_kernel.dsv4.topk import plan_topk_v2
+
+        return plan_topk_v2(seqlens_expanded)
+
+    def _refresh_topk_v2_plan(self, metadata: DSAMetadata) -> None:
+        # Refresh the plan in-place under CUDA graph replay so the captured
+        # read sees fresh cluster metadata for the replay's decode seq lengths.
+        # `copy_` preserves the buffer's data_ptr captured by the graph. None
+        # means it was not built (fold disabled / non-decode) and the helper
+        # falls back to an inline plan, so there is nothing to refresh.
+        if metadata.topk_v2_plan is None:
+            return
+        from sglang.jit_kernel.dsv4.topk import plan_topk_v2
+
+        metadata.topk_v2_plan.copy_(plan_topk_v2(metadata.dsa_seqlens_expanded))
+
     def _get_fused_topk_page_table(self, topk_indices: torch.Tensor) -> torch.Tensor:
         if (
             self.dsa_topk_backend.is_sgl_kernel()
@@ -957,6 +989,9 @@ class DeepseekSparseAttnBackend(
             indexer_seq_lens_cpu=indexer_seq_lens_cpu,
             indexer_seq_lens=indexer_seq_lens,
             token_to_batch_idx=token_to_batch_idx,
+            topk_v2_plan=self._build_topk_v2_plan(
+                seqlens_expanded, cache_seqlens_int32
+            ),
         )
         self.forward_metadata = metadata
 
@@ -1219,6 +1254,9 @@ class DeepseekSparseAttnBackend(
             dsa_seqlens_expanded=seqlens_expanded,
             real_page_table=real_page_table,
             dsa_extend_seq_lens_list=dsa_extend_seq_lens_list,
+            topk_v2_plan=self._build_topk_v2_plan(
+                seqlens_expanded, cache_seqlens_int32
+            ),
         )
         self.decode_cuda_graph_metadata[bs] = metadata
         self.forward_metadata = metadata
@@ -1486,6 +1524,7 @@ class DeepseekSparseAttnBackend(
                     bs,
                 )
             self._refresh_paged_mqa_schedule_metadata(metadata, seqlens_32_2d)
+            self._refresh_topk_v2_plan(metadata)
             # `copy_` preserves the buffer's data_ptr that the captured graph captured.
             if not target_verify_ctx_lens_written:
                 if metadata.paged_mqa_ctx_lens_2d is None:
@@ -1682,6 +1721,7 @@ class DeepseekSparseAttnBackend(
                     bs,
                 )
             self._refresh_paged_mqa_schedule_metadata(metadata, seqlens_32_2d)
+            self._refresh_topk_v2_plan(metadata)
             if metadata.paged_mqa_ctx_lens_2d is None:
                 object.__setattr__(metadata, "paged_mqa_ctx_lens_2d", seqlens_32_2d)
             else:
