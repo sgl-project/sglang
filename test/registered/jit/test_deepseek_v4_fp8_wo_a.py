@@ -5,12 +5,21 @@ ordinary flat UE8M0 quant values, group-major scale storage, large / DSV4-shaped
 token axes, and the DeepGEMM fp8_einsum consumer contract.
 """
 
-import importlib
 import unittest
 
 import torch
 
-from sglang.jit_kernel.utils import should_run_full_tests
+import sglang.jit_kernel.dsv4.fp8_wo_a as fp8_wo_a_module
+from sglang.jit_kernel.dsv4 import sglang_per_token_group_quant_fp8_dsv4_woa
+from sglang.srt.layers.quantization.fp8_kernel import (
+    fp8_dtype,
+    sglang_per_token_group_quant_fp8,
+)
+from sglang.srt.layers.quantization.fp8_utils import (
+    block_quant_dequant,
+    quant_weight_ue8m0,
+    transform_scale_ue8m0,
+)
 from sglang.srt.utils import get_device_sm
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -29,28 +38,15 @@ class TestDeepSeekV4FP8WoA(CustomTestCase):
             raise unittest.SkipTest("Test requires CUDA SM 100 or higher")
 
         try:
-            cls.deep_gemm = importlib.import_module("deep_gemm")
+            import deep_gemm
         except ImportError as exc:
             raise unittest.SkipTest("deep_gemm is required") from exc
 
-        cls.fp8_kernel = importlib.import_module(
-            "sglang.srt.layers.quantization.fp8_kernel"
-        )
-        cls.fp8_wo_a = importlib.import_module("sglang.jit_kernel.dsv4.fp8_wo_a")
-        fp8_utils = importlib.import_module("sglang.srt.layers.quantization.fp8_utils")
-
-        cls.quant = staticmethod(cls.fp8_kernel.sglang_per_token_group_quant_fp8)
-        cls.quant_dsv4_woa = staticmethod(
-            cls.fp8_wo_a.sglang_per_token_group_quant_fp8_dsv4_woa
-        )
-        cls.fp8_dtype = cls.fp8_kernel.fp8_dtype
-        cls.quant_weight_ue8m0 = staticmethod(fp8_utils.quant_weight_ue8m0)
-        cls.transform_scale_ue8m0 = staticmethod(fp8_utils.transform_scale_ue8m0)
-        cls.block_quant_dequant = staticmethod(fp8_utils.block_quant_dequant)
+        cls.deep_gemm = deep_gemm
 
     def _flat_reference(self, o):
         T, G, D = o.shape
-        q_ref, s_ref = self.quant(
+        q_ref, s_ref = sglang_per_token_group_quant_fp8(
             o.contiguous().view(T * G, D),
             _GROUP_SIZE,
             scale_ue8m0=True,
@@ -72,7 +68,7 @@ class TestDeepSeekV4FP8WoA(CustomTestCase):
         torch.cuda.synchronize()
 
         self.assertEqual(o_fp8.shape, (T, G, D))
-        self.assertEqual(o_fp8.dtype, self.fp8_dtype)
+        self.assertEqual(o_fp8.dtype, fp8_dtype)
         self.assertEqual(o_s.shape, (T, G, D // _GROUP_SIZE))
         self.assertEqual(o_s.dtype, torch.float32)
         self.assertEqual(o_s.stride(), (D // _GROUP_SIZE, T * (D // _GROUP_SIZE), 1))
@@ -96,11 +92,11 @@ class TestDeepSeekV4FP8WoA(CustomTestCase):
                 o = (
                     torch.randn(T, G, D, device=device, dtype=torch.float32) * 0.25
                 ).to(dtype)
-                o_fp8, o_s = self.quant_dsv4_woa(o)
+                o_fp8, o_s = sglang_per_token_group_quant_fp8_dsv4_woa(o)
                 self._assert_matches_flat_reference(o, o_fp8, o_s)
 
                 o = self._strided_tgd(T, G, D, dtype, device)
-                o_fp8, o_s = self.quant_dsv4_woa(o)
+                o_fp8, o_s = sglang_per_token_group_quant_fp8_dsv4_woa(o)
                 self._assert_matches_flat_reference(o, o_fp8, o_s)
 
     def test_dsv4_woa_quant_large_token_dimension(self):
@@ -108,37 +104,43 @@ class TestDeepSeekV4FP8WoA(CustomTestCase):
         torch.cuda.manual_seed_all(2)
 
         cases = [
-            (10_001, 1, 128),
-            (10_001, 8, 4096),
+            (10_001, 1, 128, False),
+            (10_001, 8, 4096, False),
+            (300_000, 1, 128, True),
         ]
-        if should_run_full_tests():
-            cases.append((900_001, 2, 128))
 
         device = torch.device("cuda")
-        for T, G, D in cases:
-            with self.subTest(T=T, G=G, D=D):
-                o = (
-                    torch.randn(T, G, D, device=device, dtype=torch.float32) * 0.25
-                ).to(torch.bfloat16)
-                o_fp8, o_s = self.quant_dsv4_woa(o)
+        for T, G, D, strided in cases:
+            with self.subTest(T=T, G=G, D=D, strided=strided):
+                if strided:
+                    o = self._strided_tgd(T, G, D, torch.bfloat16, device)
+                else:
+                    o = (
+                        torch.randn(T, G, D, device=device, dtype=torch.float32) * 0.25
+                    ).to(torch.bfloat16)
+                o_fp8, o_s = sglang_per_token_group_quant_fp8_dsv4_woa(o)
                 self._assert_matches_flat_reference(o, o_fp8, o_s)
 
     def test_dsv4_woa_quant_uses_dedicated_jit(self):
         torch.manual_seed(3)
         torch.cuda.manual_seed_all(3)
 
-        original_jit_v2 = self.fp8_kernel.sgl_per_token_group_quant_8bit_jit_v2
+        original_jit_module = fp8_wo_a_module._jit_module
+        jit_module_calls = 0
 
-        def fail_generic_jit_v2(*args, **kwargs):
-            raise AssertionError("DSV4 wo_a quant must not call the generic v2 JIT")
+        def wrapped_jit_module(*args, **kwargs):
+            nonlocal jit_module_calls
+            jit_module_calls += 1
+            return original_jit_module(*args, **kwargs)
 
-        self.fp8_kernel.sgl_per_token_group_quant_8bit_jit_v2 = fail_generic_jit_v2
+        fp8_wo_a_module._jit_module = wrapped_jit_module
         try:
             o = self._strided_tgd(3, 2, 256, torch.bfloat16, "cuda")
-            self.quant_dsv4_woa(o)
+            sglang_per_token_group_quant_fp8_dsv4_woa(o)
             torch.cuda.synchronize()
+            self.assertGreater(jit_module_calls, 0)
         finally:
-            self.fp8_kernel.sgl_per_token_group_quant_8bit_jit_v2 = original_jit_v2
+            fp8_wo_a_module._jit_module = original_jit_module
 
     def test_fp8_wo_a_einsum_uses_group_major_activation_scales(self):
         torch.manual_seed(0)
@@ -165,12 +167,12 @@ class TestDeepSeekV4FP8WoA(CustomTestCase):
                     torch.randn(G, R, D, device=device, dtype=torch.float32) * 0.2
                 ).to(torch.bfloat16)
 
-                weight_fp8, weight_s_raw = self.quant_weight_ue8m0(
+                weight_fp8, weight_s_raw = quant_weight_ue8m0(
                     weight, weight_block_size=[_GROUP_SIZE, _GROUP_SIZE]
                 )
-                weight_s = self.transform_scale_ue8m0(weight_s_raw, mn=R)
+                weight_s = transform_scale_ue8m0(weight_s_raw, mn=R)
 
-                q_dsv4, s_dsv4 = self.quant_dsv4_woa(o)
+                q_dsv4, s_dsv4 = sglang_per_token_group_quant_fp8_dsv4_woa(o)
                 out = torch.empty(T, G, R, device=device, dtype=torch.bfloat16)
                 self.deep_gemm.fp8_einsum(
                     "bhr,hdr->bhd",
@@ -184,7 +186,7 @@ class TestDeepSeekV4FP8WoA(CustomTestCase):
                 o_dequant = q_dsv4.float().view(
                     T, G, D // _GROUP_SIZE, _GROUP_SIZE
                 ) * s_dsv4.unsqueeze(-1)
-                weight_dequant = self.block_quant_dequant(
+                weight_dequant = block_quant_dequant(
                     weight_fp8,
                     weight_s_raw,
                     block_size=[_GROUP_SIZE, _GROUP_SIZE],

@@ -24,8 +24,6 @@ from sglang.jit_kernel.dsv4 import (
     fused_norm_rope_inplace,
     fused_q_norm_rope,
     fused_rope_inplace,
-)
-from sglang.jit_kernel.dsv4.fp8_wo_a import (
     sglang_per_token_group_quant_fp8_dsv4_woa,
 )
 from sglang.srt.compilation.compilation_config import register_split_op

@@ -11,11 +11,16 @@
 #include <sgl_kernel/utils.cuh>
 #include <sgl_kernel/warp.cuh>
 
+#include <sgl_kernel/deepseek_v4/fp8_utils.cuh>
+
 #include <cstdint>
 #include <cuda_fp8.h>
-#include <type_traits>
 
 namespace {
+
+using deepseek_v4::fp8::cast_to_ue8m0;
+using deepseek_v4::fp8::inv_scale_ue8m0;
+using deepseek_v4::fp8::pack_fp8;
 
 constexpr float LOCAL_ABSMAX_ABS = 1e-10f;
 constexpr uint32_t GROUP_SIZE = 128;
@@ -29,27 +34,12 @@ SGL_DEVICE float GroupReduceMax(float val) {
   static_assert(
       (THREADS_PER_SUBWARP & (THREADS_PER_SUBWARP - 1)) == 0 && THREADS_PER_SUBWARP <= 16 && THREADS_PER_SUBWARP >= 1,
       "THREADS_PER_SUBWARP must be 1, 2, 4, 8, or 16");
+  // Tail subwarps can be inactive at the bounds check, so reduce with only the
+  // current subgroup's lanes rather than a full-warp mask.
   constexpr device::warp::mask_t kSub = (device::warp::mask_t{1} << THREADS_PER_SUBWARP) - 1;
   const device::warp::mask_t mask = kSub << (THREADS_PER_SUBWARP * ((threadIdx.x % 32) / THREADS_PER_SUBWARP));
   return device::warp::reduce_max<THREADS_PER_SUBWARP>(val, mask);
 }
-
-SGL_DEVICE float fast_pow2(int x) {
-  const uint32_t bits_x = (x + 127) << 23;
-  return __uint_as_float(bits_x);
-}
-
-SGL_DEVICE int fast_log2_ceil(float x) {
-  const uint32_t bits_x = __float_as_uint(x);
-  const int exp_x = (bits_x >> 23) & 0xff;
-  const uint32_t man_bits = bits_x & ((1 << 23) - 1);
-  return exp_x - 127 + (man_bits != 0);
-}
-
-struct FP8E4M3Info {
-  static constexpr float MIN = -448.0f;
-  static constexpr float MAX = 448.0f;
-};
 
 template <typename T, bool kUsePDL>
 __global__ void fp8_wo_a_group_major_quant_ue8m0_kernel(
@@ -57,13 +47,10 @@ __global__ void fp8_wo_a_group_major_quant_ue8m0_kernel(
     fp8_e4m3_t* __restrict__ output_q,
     float* __restrict__ output_s,
     int64_t total_scale_groups,
+    int64_t num_tokens,
     int hidden_dim_groups,
     int num_outer_groups,
-    int hidden_dim,
-    int64_t input_stride_t,
-    int64_t input_stride_g,
-    int scale_stride_t,
-    int scale_stride_g) {
+    int64_t input_stride_t) {
   device::PDLWaitPrimary<kUsePDL>();
 
   const int64_t subwarp_id = threadIdx.x / THREADS_PER_GROUP;
@@ -79,9 +66,8 @@ __global__ void fp8_wo_a_group_major_quant_ue8m0_kernel(
     static_assert(INPUT_VEC_SIZE * THREADS_PER_GROUP == GROUP_SIZE);
 
     const int64_t input_group_start_offset =
-        token_idx * input_stride_t + outer_idx * input_stride_g + hidden_group * GROUP_SIZE;
-    const int64_t output_group_start_offset =
-        (token_idx * num_outer_groups + outer_idx) * static_cast<int64_t>(hidden_dim) + hidden_group * GROUP_SIZE;
+        token_idx * input_stride_t + outer_idx * GROUP_SIZE * hidden_dim_groups + hidden_group * GROUP_SIZE;
+    const int64_t output_group_start_offset = group_id * GROUP_SIZE;
 
     int4 input_int4[INPUT_INT4_SIZE];
     T* input_vec = reinterpret_cast<T*>(input_int4);
@@ -100,32 +86,23 @@ __global__ void fp8_wo_a_group_major_quant_ue8m0_kernel(
 
     local_absmax = GroupReduceMax<THREADS_PER_GROUP>(local_absmax);
 
-    const int exp_scale_inv = fast_log2_ceil(local_absmax / FP8E4M3Info::MAX);
-    const float y_scale = fast_pow2(-exp_scale_inv);
-    const float y_scale_inv = fast_pow2(exp_scale_inv);
+    constexpr float kFp8MaxInv = 1.0f / kFP8E4M3Max;
+    const int32_t scale_ue8m0 = cast_to_ue8m0(local_absmax * kFp8MaxInv);
+    const float y_scale = inv_scale_ue8m0(scale_ue8m0);
+    const float y_scale_inv = __uint_as_float(static_cast<uint32_t>(scale_ue8m0) << 23);
 
     int4 output_buf;
-    auto* output_buf_ptr = reinterpret_cast<__nv_fp8x2_storage_t*>(&output_buf);
-    const float2 y_scale_repeated = {y_scale, y_scale};
+    auto* output_buf_ptr = reinterpret_cast<fp8x2_e4m3_t*>(&output_buf);
 #pragma unroll
     for (uint32_t j = 0; j < INPUT_VEC_SIZE; j += 2) {
-      const float2 inputx2 = {static_cast<float>(input_vec[j]), static_cast<float>(input_vec[j + 1])};
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-      float2 outputx2 = __fmul2_rn(inputx2, y_scale_repeated);
-#else
-      float2 outputx2 = {inputx2.x * y_scale_repeated.x, inputx2.y * y_scale_repeated.y};
-#endif
-      outputx2.x = fminf(fmaxf(outputx2.x, FP8E4M3Info::MIN), FP8E4M3Info::MAX);
-      outputx2.y = fminf(fmaxf(outputx2.y, FP8E4M3Info::MIN), FP8E4M3Info::MAX);
-      output_buf_ptr[j / 2] = __nv_cvt_float2_to_fp8x2(outputx2, __NV_SATFINITE, __NV_E4M3);
+      output_buf_ptr[j / 2] =
+          pack_fp8(static_cast<float>(input_vec[j]) * y_scale, static_cast<float>(input_vec[j + 1]) * y_scale);
     }
 
     *reinterpret_cast<int4*>(output_q + output_group_start_offset + lane_id * INPUT_VEC_SIZE) = output_buf;
 
     if (lane_id == 0) {
-      output_s
-          [token_idx * static_cast<int64_t>(scale_stride_t) + outer_idx * static_cast<int64_t>(scale_stride_g) +
-           hidden_group] = y_scale_inv;
+      output_s[(outer_idx * num_tokens + token_idx) * hidden_dim_groups + hidden_group] = y_scale_inv;
     }
   }
 
@@ -144,22 +121,15 @@ struct FP8WoAGroupMajorQuantUE8M0Kernel {
     auto DSize = SymbolicSize{"hidden_dim"};
     auto SSize = SymbolicSize{"hidden_dim_groups"};
 
-    TensorMatcher({TSize, GSize, DSize}).with_strides({-1, -1, 1}).with_dtype<T>().with_device(device).verify(input);
+    TensorMatcher({TSize, GSize, DSize}).with_strides({-1, DSize, 1}).with_dtype<T>().with_device(device).verify(input);
     TensorMatcher({TSize, GSize, DSize}).with_dtype<fp8_e4m3_t>().with_device(device).verify(output_q);
-    TensorMatcher({TSize, GSize, SSize})
-        .with_strides({-1, -1, 1})
-        .with_dtype<float>()
-        .with_device(device)
-        .verify(output_s);
+    TensorMatcher({GSize, TSize, SSize}).with_dtype<float>().with_device(device).verify(output_s);
 
     const auto num_tokens = TSize.unwrap();
     const auto num_outer_groups = GSize.unwrap();
     const auto hidden_dim = DSize.unwrap();
     const auto hidden_dim_groups = SSize.unwrap();
     const auto input_stride_t = input.stride(0);
-    const auto input_stride_g = input.stride(1);
-    const auto scale_stride_t = output_s.stride(0);
-    const auto scale_stride_g = output_s.stride(1);
     constexpr int64_t kInputAlignElements = sizeof(int4) / sizeof(T);
 
     RuntimeCheck(hidden_dim % GROUP_SIZE == 0, "hidden_dim must be divisible by 128");
@@ -170,11 +140,6 @@ struct FP8WoAGroupMajorQuantUE8M0Kernel {
     RuntimeCheck(
         num_tokens <= 1 || input_stride_t % kInputAlignElements == 0,
         "input token stride must preserve 16-byte vector-load alignment");
-    RuntimeCheck(
-        num_outer_groups <= 1 || input_stride_g % kInputAlignElements == 0,
-        "input group stride must preserve 16-byte vector-load alignment");
-    RuntimeCheck(scale_stride_t == hidden_dim_groups, "output_s must use DSV4 group-major token stride");
-    RuntimeCheck(scale_stride_g == num_tokens * hidden_dim_groups, "output_s must use DSV4 group-major outer stride");
 
     const int64_t total_scale_groups = num_tokens * num_outer_groups * hidden_dim_groups;
     if (total_scale_groups == 0) return;
@@ -188,13 +153,10 @@ struct FP8WoAGroupMajorQuantUE8M0Kernel {
             static_cast<fp8_e4m3_t*>(output_q.data_ptr()),
             static_cast<float*>(output_s.data_ptr()),
             total_scale_groups,
+            static_cast<int64_t>(num_tokens),
             static_cast<int>(hidden_dim_groups),
             static_cast<int>(num_outer_groups),
-            static_cast<int>(hidden_dim),
-            static_cast<int64_t>(input_stride_t),
-            static_cast<int64_t>(input_stride_g),
-            static_cast<int>(scale_stride_t),
-            static_cast<int>(scale_stride_g));
+            static_cast<int64_t>(input_stride_t));
   }
 };
 
