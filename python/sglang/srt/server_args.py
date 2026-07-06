@@ -2845,6 +2845,10 @@ class ServerArgs:
         # Handle any other necessary validations.
         self._handle_other_validations()
 
+        # Model-capability adjustments that legacy code applied at model-load
+        # time; last declarations of the resolution, mirroring that order.
+        self._handle_model_capability_adjustments()
+
         # End of resolution: apply the accumulated declarations onto the
         # fields once (gate order). From here on server_args carries the
         # resolved configuration — post-init readers, in any process, read
@@ -2852,6 +2856,50 @@ class ServerArgs:
         from sglang.srt.arg_groups.overrides import materialize_declarations
 
         materialize_declarations(self)
+
+    def _handle_model_capability_adjustments(self):
+        if parse_connector_type(self.model_path) == ConnectorType.INSTANCE:
+            return
+        from sglang.srt.arg_groups.overrides import (
+            _hrm_text_attention_force,
+            run_post_process_pass,
+        )
+
+        model_config = self.get_model_config()
+        hf_config = model_config.hf_config
+
+        # HRM-Text needs bidirectional prompt attention (prefill), which only
+        # the Triton backend honors at the kernel level. Radix/prefix reuse is
+        # also unsafe: the recurrent forward writes direction-dependent KV
+        # across many slots.
+        is_hrm_text = getattr(
+            hf_config, "model_type", None
+        ) == "hrm_text" or "HrmTextForCausalLM" in getattr(
+            hf_config, "architectures", []
+        )
+        # prefix_lm defaults to True upstream; defaulting False would skip the
+        # bidirectional-attention forcing and silently produce junk output.
+        if is_hrm_text and getattr(hf_config, "prefix_lm", True):
+            run_post_process_pass(self, _hrm_text_attention_force)
+            self.chunked_prefill_size = -1
+            self.disable_radix_cache = True
+            self.disable_cuda_graph = True
+            logger.warning(
+                "HRM-Text (prefix_lm) detected: forcing --attention-backend "
+                "triton, --chunked-prefill-size -1, --disable-radix-cache, and "
+                "--disable-cuda-graph for correctness of the bidirectional "
+                "prompt attention."
+            )
+
+        if (
+            model_config.is_multimodal
+            and not model_config.is_multimodal_chunked_prefill_supported
+        ):
+            self.chunked_prefill_size = -1
+            logger.info(
+                f"Automatically turn off --chunked-prefill-size as it is not supported for "
+                f"{hf_config.model_type}"
+            )
 
     def _handle_model_source_paths(self):
         """Resolve model/tokenizer paths backed by remote object stores."""
@@ -3938,7 +3986,7 @@ class ServerArgs:
 
         run_post_process_pass(self, _dsa_kv_cache_dtype_default)
 
-    def _set_default_dsa_backends(self, kv_cache_dtype: str, major: int) -> None:
+    def _set_default_dsa_backends(self, major: int) -> None:
         # Moved to the resolution pipeline (arg_groups/overrides.py:
         # _dsa_split_backend_resolution), invoked here at its legacy slot.
         from sglang.srt.arg_groups.overrides import (
@@ -4069,7 +4117,7 @@ class ServerArgs:
                     self._set_default_dsa_kv_cache_dtype(
                         major, resolved_view(self).quantization
                     )
-                    self._set_default_dsa_backends(self.kv_cache_dtype, major)
+                    self._set_default_dsa_backends(major)
 
                 if self.enable_prefill_cp:
                     assert (

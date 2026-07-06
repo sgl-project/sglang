@@ -586,15 +586,6 @@ class Scheduler(
                 if self.server_args.dllm_algorithm is not None
                 else None
             )
-            if self.dllm_config:
-                if self.dllm_config.block_size < self.page_size:
-                    logger.warning(
-                        "WARNING: "
-                        f"The page size {self.page_size} should not be larger than dllm block size {self.dllm_config.block_size}."
-                        f"Page size now falls back to {self.dllm_config.block_size}"
-                    )
-                    self.page_size = self.dllm_config.block_size
-                    self.server_args.page_size = self.dllm_config.block_size
 
     def init_metrics_collector(
         self, tp_rank: int, pp_rank: int, dp_rank: Optional[int]

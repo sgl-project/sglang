@@ -2146,25 +2146,19 @@ def validate_declarations(
             )
 
 
-def refresh_declared_fields(server_args: Any, fields: Iterable[str]) -> None:
-    """Helper for legacy code that overwrites a resolved field AFTER
-    materialization (e.g. ``ModelRunner.model_specific_adjustment`` forcing
-    ``attention_backend`` for HRM-Text). Redeclares the live value so the
-    publish parity holds and the flags tier materializes the adjusted end
-    state.
-    """
-    _missing = object()
-    declarations = server_args._resolved_overrides
-    for field in fields:
-        effective = _missing
-        for _source, decl in declarations:
-            if field in decl:
-                effective = decl[field]
-        if effective is _missing:
-            continue
-        live = getattr(server_args, field)
-        if effective != live:
-            declarations.append((f"runtime_adjustment[{field}]", {field: live}))
+def _hrm_text_attention_force(view: Any) -> dict:
+    """HRM-Text's bidirectional prefix attention only works on the Triton
+    backend. Invoked as the last attention declaration of the resolution
+    (mirroring the legacy runner-side force, which ran after the whole
+    pipeline)."""
+    if view.attention_backend not in (None, "triton"):
+        logger.warning(
+            f"Overriding --attention-backend "
+            f"{view.attention_backend!r} -> 'triton': only the "
+            "Triton backend supports HRM-Text's bidirectional prefix "
+            "attention."
+        )
+    return {"attention_backend": "triton"}
 
 
 def assert_flag_parity(
