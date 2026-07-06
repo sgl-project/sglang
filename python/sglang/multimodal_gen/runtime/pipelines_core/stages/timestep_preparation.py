@@ -71,12 +71,10 @@ class TimestepPreparationStage(PipelineStage):
     ) -> None:
         super().__init__()
         self.scheduler = scheduler
-        # Scheduler bound to requests with rollout=True, for pipelines whose
-        # serving scheduler is not the first-order flow-match Euler scheduler
-        # the rollout SDE/log-prob path requires (e.g. Wan serves UniPC).
-        # Downstream stages read batch.scheduler, so binding the template
-        # here is the only switch point. None means rollout requests use the
-        # serving scheduler unchanged.
+        # Bound per request when rollout=True: the rollout SDE/log-prob path
+        # needs a first-order flow-match Euler scheduler, which not every
+        # pipeline serves (e.g. Wan serves UniPC). None keeps the serving
+        # scheduler for rollout requests.
         self.rollout_scheduler = rollout_scheduler
         self.prepare_extra_set_timesteps_kwargs = list(
             prepare_extra_set_timesteps_kwargs or []
