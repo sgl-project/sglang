@@ -1,6 +1,8 @@
 import unittest
 from unittest.mock import MagicMock, patch
 
+import numpy as np
+
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
@@ -284,6 +286,30 @@ class TestOverrideProcessorsConfigInjection(unittest.TestCase):
         audio_kw = call_kwargs.kwargs.get("audio_kwargs", {})
         # User config can override truncation if they explicitly set it
         self.assertTrue(audio_kw.get("truncation"))
+
+    def test_gemma4_video_decoder_injects_frame_metadata(self):
+        from sglang.srt.multimodal.processors.gemma4 import Gemma4SGLangProcessor
+        from sglang.srt.utils.video_decoder import VideoDecoderWrapper
+
+        proc, mock_proc = self._make_override_processor(Gemma4SGLangProcessor, {})
+        proc._processor.video_processor.num_frames = 3
+
+        video = MagicMock(spec=VideoDecoderWrapper)
+        video.__len__.return_value = 10
+        video.avg_fps = 5.0
+        video.get_frames_at.return_value = np.zeros((3, 4, 5, 3), dtype=np.uint8)
+
+        proc.process_mm_data("test", videos=[video])
+
+        call_kwargs = mock_proc.__call__.call_args.kwargs
+        video_metadata = call_kwargs.get("video_metadata")
+        self.assertEqual(call_kwargs.get("do_sample_frames"), False)
+        self.assertEqual(video_metadata[0]["frames_indices"], [0, 3, 6])
+        self.assertEqual(video_metadata[0]["fps"], 5.0)
+        self.assertEqual(video_metadata[0]["duration"], 2.0)
+        self.assertEqual(video_metadata[0]["total_num_frames"], 10)
+        self.assertEqual(video_metadata[0]["video_backend"], "torchcodec")
+        self.assertEqual(call_kwargs["videos"][0].shape, (3, 3, 4, 5))
 
 
 if __name__ == "__main__":
