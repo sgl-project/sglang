@@ -3,10 +3,10 @@
 A spy on ``_get_kernel`` asserts the Metal kernel dispatched on every eligible
 case; negative controls confirm ineligible inputs fall back in ``y.dtype``.
 
-Acceptance is scores-dtype driven. fp16 scores: bit-exact vs an fp32
-reference, since <=11-bit mantissas make every ``y * s`` product exact in
-fp32 (<=22 bits <= 24) and FMA contraction coincides with separate mul+add.
-fp32 scores: the product is inexact, FMA contraction diverges by a
+Acceptance is scores-dtype driven. fp16 and bf16 scores: bit-exact vs an
+fp32 reference, since <=11-bit mantissas make every ``y * s`` product exact
+in fp32 (<=22 bits <= 24) and FMA contraction coincides with separate
+mul+add. fp32 scores: the product is inexact, FMA contraction diverges by a
 sub-fp32-ULP, and the narrowed result is asserted <=2 fp16 / <=1 bf16 ULP.
 
 Hermetic: tensor fixtures only; skips off Darwin/arm64 or without ``mlx``.
@@ -59,6 +59,8 @@ _SHAPES = [
 _STRICT_COMBOS = [
     ("fp16y_fp16s", "float16", "float16"),
     ("bf16y_fp16s", "bfloat16", "float16"),
+    ("fp16y_bf16s", "float16", "bfloat16"),
+    ("bf16y_bf16s", "bfloat16", "bfloat16"),  # bf16 router (Qwen3-30B-A3B regime)
 ]
 _ROUNDED_COMBOS = [
     ("fp16y_fp32s", "float16", "float32"),  # production combo (real routers)
@@ -92,11 +94,15 @@ class TestFusedCombine(unittest.TestCase):
 
     @staticmethod
     def _reference_fp32(y, scores):
-        """fp32 ground truth in the kernel's accumulation order (sequential k)."""
-        _, topk, hidden = y.shape
-        yf = y.astype(mx.float32)
-        sf = scores.astype(mx.float32)
-        acc = mx.zeros((y.shape[0], hidden), dtype=mx.float32)
+        """fp32 ground truth in the kernel's accumulation order (sequential k).
+
+        Rank generic: leading dims flatten exactly like the kernel dispatch,
+        and the result is returned in the flattened [B_flat, H] layout.
+        """
+        topk, hidden = y.shape[-2], y.shape[-1]
+        yf = y.astype(mx.float32).reshape(-1, topk, hidden)
+        sf = scores.astype(mx.float32).reshape(-1, topk)
+        acc = mx.zeros((yf.shape[0], hidden), dtype=mx.float32)
         for k in range(topk):
             acc = acc + yf[:, k, :] * sf[:, k][:, None]
         return acc
@@ -131,10 +137,12 @@ class TestFusedCombine(unittest.TestCase):
         return int(mx.max(mx.abs(ai - bi)).item())
 
     def _make_inputs(self, shape, y_name, s_name, seed):
+        """y with the given shape (rank >= 3), scores shaped y.shape[:-1]."""
         mx.random.seed(seed)
-        B, K, H = shape
-        y = mx.random.uniform(-2.0, 2.0, (B, K, H)).astype(getattr(mx, y_name))
-        scores = mx.random.uniform(0.0, 1.0, (B, K)).astype(getattr(mx, s_name))
+        y = mx.random.uniform(-2.0, 2.0, tuple(shape)).astype(getattr(mx, y_name))
+        scores = mx.random.uniform(0.0, 1.0, tuple(shape[:-1])).astype(
+            getattr(mx, s_name)
+        )
         return y, scores
 
     def test_scores_fp16_bit_exact(self):
@@ -192,6 +200,61 @@ class TestFusedCombine(unittest.TestCase):
                         _ROUNDED_MAX_ULP[y_name],
                         f"{cname} {shape}: max ULP={ulp} > {_ROUNDED_MAX_ULP[y_name]}",
                     )
+
+    def test_leading_dims_match_reference(self):
+        """Rank >= 4 inputs (the mlx-lm combine site) dispatch and match.
+
+        Shapes mirror the serving trace on Qwen1.5-MoE-A2.7B: [1, L, k, H]
+        prefill, [R, 1, k, H] batched decode, plus a rank 5 sweep case.
+        """
+        strict_shapes = [
+            (1, 268, 4, 2048),  # prefill, L=268
+            (2, 1, 4, 2048),  # batched decode, R=2
+            (1, 1, 4, 2048),  # single-request decode
+            (3, 5, 8, 512),
+            (2, 3, 2, 4, 256),  # rank 5
+        ]
+        for si, shape in enumerate(strict_shapes):
+            for cname, y_name, s_name in _STRICT_COMBOS:
+                with self.subTest(combo=cname, shape=shape):
+                    y, scores = self._make_inputs(shape, y_name, s_name, 3000 + si)
+                    self.assertTrue(fc.can_fuse(y, scores))
+                    out, fired = self._run_fused_traced(y, scores)
+                    self.assertTrue(fired, f"{cname} {shape}: fused path did not fire")
+                    self.assertEqual(tuple(out.shape), tuple(shape[:-2]) + shape[-1:])
+                    self.assertEqual(out.dtype, getattr(mx, y_name))
+                    expected = self._reference_fp32(y, scores).astype(
+                        getattr(mx, y_name)
+                    )
+                    self.assertTrue(
+                        bool(
+                            mx.array_equal(out.reshape(-1, shape[-1]), expected).item()
+                        ),
+                        f"{cname} {shape}: not bit-exact vs reference",
+                    )
+        # One fp32-scores rank 4 case under the rounded standard.
+        shape = (1, 268, 4, 2048)
+        y, scores = self._make_inputs(shape, "float16", "float32", 3100)
+        self.assertTrue(fc.can_fuse(y, scores))
+        out, fired = self._run_fused_traced(y, scores)
+        self.assertTrue(fired)
+        expected = self._reference_fp32(y, scores).astype(mx.float16)
+        ulp = self._low_precision_ulp(out.reshape(-1, shape[-1]), expected)
+        self.assertLessEqual(ulp, _ROUNDED_MAX_ULP["float16"])
+
+    def test_leading_dim_guard_negatives(self):
+        """Shape mismatches under the generalized contract fall back."""
+        y, _ = self._make_inputs((2, 3, 4, 256), "float16", "float16", 21)
+        cases = [
+            ("rank_gap_two", mx.zeros((2, 4), dtype=mx.float16)),
+            ("lead_mismatch", mx.zeros((3, 3, 4), dtype=mx.float16)),
+            ("topk_mismatch", mx.zeros((2, 3, 5), dtype=mx.float16)),
+        ]
+        for name, scores in cases:
+            with self.subTest(case=name):
+                self.assertFalse(fc.can_fuse(y, scores))
+        y2d = mx.zeros((4, 256), dtype=mx.float16)
+        self.assertFalse(fc.can_fuse(y2d, mx.zeros((4,), dtype=mx.float16)))
 
     def test_scores_dtype_reaches_kernel_independently(self):
         """The (y, scores) dtype pair reaches the kernel unmerged."""

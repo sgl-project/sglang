@@ -11,10 +11,14 @@ threadgroup, 4 contiguous outputs per thread in the flat [B*H] space, so
 in fp32. No threadgroup memory, no barriers.
 
 Fused when:
-- y is fp16 or bf16, rank 3, shaped [B, TOP_K, H]
-- scores is fp16 or fp32 (independent template dtype TS), rank 2, [B, TOP_K]
-- B, TOP_K, H nonzero
+- y is fp16 or bf16, rank >= 3, shaped [..., TOP_K, H]
+- scores is fp16, bf16, or fp32 (independent template dtype TS), shaped
+  like y's leading dims: scores.shape == y.shape[:-1]
+- every dim nonzero
 - H % 256 == 0, so threadgroups tile rows exactly
+
+Leading dims are flattened into the kernel's row dim B before dispatch, so
+the mlx-lm combine site's [batch, seq, TOP_K, H] passes through unchanged.
 
 Otherwise: ``(y * scores[..., None]).sum(axis=-2).astype(y.dtype)``.
 """
@@ -101,27 +105,26 @@ def _get_kernel(y_dtype: mx.Dtype, scores_dtype: mx.Dtype):
 
 
 _Y_DTYPES = (mx.float16, mx.bfloat16)
-_SCORES_DTYPES = (mx.float16, mx.float32)
+_SCORES_DTYPES = (mx.float16, mx.bfloat16, mx.float32)
 
 
 def can_fuse(y: mx.array, scores: mx.array) -> bool:
     """Cheap structural check: does this combine match the fast-path regime?"""
-    if y.ndim != 3 or scores.ndim != 2:
+    if y.ndim < 3 or scores.ndim != y.ndim - 1:
         return False
-    B, TOPK, H = y.shape
-    if scores.shape != (B, TOPK):
+    if tuple(y.shape[:-1]) != tuple(scores.shape):
         return False
-    if B == 0 or TOPK == 0 or H == 0:
+    if any(d == 0 for d in y.shape):
         return False
     if y.dtype not in _Y_DTYPES or scores.dtype not in _SCORES_DTYPES:
         return False
-    if H % _OUTPUTS_PER_TG != 0:
+    if y.shape[-1] % _OUTPUTS_PER_TG != 0:
         return False
     return True
 
 
 def fused_combine(y: mx.array, scores: mx.array) -> mx.array:
-    """Compute ``out[b, h] = sum_k y[b, k, h] * scores[b, k]`` in one kernel.
+    """Compute ``out[..., h] = sum_k y[..., k, h] * scores[..., k]`` in one kernel.
 
     Numerical contract: this computes the same reduction as the reference::
 
@@ -137,11 +140,19 @@ def fused_combine(y: mx.array, scores: mx.array) -> mx.array:
 
     Falls back to the broadcast/sum reference, narrowed to ``y.dtype``, when
     can_fuse(y, scores) is False; both paths return ``y.dtype``.
+
+    Leading dims (everything before TOP_K) are flattened into the kernel's
+    row dim and restored on the output, so rank 3 [B, TOP_K, H] and the
+    mlx-lm site's rank 4 [batch, seq, TOP_K, H] both dispatch.
     """
     if not can_fuse(y, scores):
         return (y * scores[..., None]).sum(axis=-2).astype(y.dtype)
 
-    B, TOPK, H = y.shape
+    TOPK, H = y.shape[-2], y.shape[-1]
+    lead = tuple(y.shape[:-2])
+    y = y.reshape(-1, TOPK, H)
+    scores = scores.reshape(-1, TOPK)
+    B = y.shape[0]
     kernel = _get_kernel(y.dtype, scores.dtype)
     (out,) = kernel(
         inputs=[y, scores],
@@ -158,4 +169,4 @@ def fused_combine(y: mx.array, scores: mx.array) -> mx.array:
         output_shapes=[(B, H)],
         output_dtypes=[y.dtype],
     )
-    return out
+    return out.reshape(*lead, H)
