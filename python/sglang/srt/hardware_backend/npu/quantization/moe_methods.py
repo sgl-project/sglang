@@ -281,11 +281,11 @@ class NPUW4A4Mxfp4MoEMethod(_NPUMoEMethodBase):
         scale  = getattr(layer, f"{weight_prefix}_weight_scale")  # [E, N, K_groups] uint8
 
         # 1) Weight: transpose to [E, K_packed, N] – no npu_format_cast needed
-        weight.data = weight.data.transpose(1, 2).contiguous()
+        weight.data = weight.data.transpose(1, 2)
 
         # 2) Scale: pack into [E, K_groups//2, N, 2]
         g, n, k = scale.shape                     # k = hidden_size // group_size
-        scale.data = scale.data.reshape(g, n, k // 2, 2).transpose(1, 2).contiguous()
+        scale.data = scale.data.reshape(g, n, k // 2, 2).transpose(1, 2)
 
         # 3) Store on layer and on self (for matmul lookup)
         setattr(layer, f"{weight_prefix}_weight",
@@ -322,8 +322,8 @@ class NPUW4A4Mxfp4MoEMethod(_NPUMoEMethodBase):
             "per_token_scale": [pertoken_scale],
             "scale_dtype": torch.float8_e8m0fnu,
             "per_token_scale_dtype": torch.float8_e8m0fnu,
-            "x_dtype": torch_npu.float4_e2m1fn_x2,
-            "weight_dtype": torch_npu.float4_e2m1fn_x2,
+            "x_dtype" = torch_npu.float4_e2m1fn_x2,
+            "weight_dtype" = torch_npu.float4_e2m1fn_x2,
         }
 
         return self.matmul.forward(
