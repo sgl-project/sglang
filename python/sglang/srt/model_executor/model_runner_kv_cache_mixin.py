@@ -128,7 +128,19 @@ class ModelRunnerKVCacheMixin:
         the KV budget. Both land after the KV pool (the buffer via nvshmem,
         outside the torch allocator), so the budget must make room up front."""
         plan = self.deepep_capacity_plan
-        if plan is None or plan.reserve_mib <= 0:
+        if plan is None or not plan.auto_sized:
+            return rest_memory
+        if plan.reserve_mib <= 0:
+            logger.info(
+                "DeepEP auto mem reserve: num_max<=%d buffer=%.2f GiB "
+                "capture=%.2f GiB fully credited by chunked slack=%.2f GiB; "
+                "KV budget unchanged (%.2f GiB)",
+                plan.ceiling,
+                plan.rdma_mib / 1024,
+                plan.capture_mib / 1024,
+                plan.slack_mib / 1024,
+                rest_memory,
+            )
             return rest_memory
         reserve_gib = plan.reserve_mib / 1024
         if rest_memory - reserve_gib <= 0:
