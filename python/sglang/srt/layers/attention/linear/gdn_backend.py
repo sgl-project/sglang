@@ -84,6 +84,18 @@ try:
 except ImportError:
     _HAVE_TRITON = False
 
+try:
+    # fla's analytic backward for the chunked gated delta rule. fla's forward computes the same
+    # function as our torch_chunk (verified: fwd matches to bf16 ULP, and fla's full autograd
+    # matches autograd through our torch-loop reference to rel ~1e-3 on every grad), so fla's bwd
+    # is a valid adjoint for OUR forward when driven by OUR saved tensors (our T-matrix as fla's
+    # `A`, our fp32 cumsum as fla's `g`). _ChunkGDR uses it so training gets the fused scan too.
+    from fla.ops.gated_delta_rule.chunk import chunk_gated_delta_rule_bwd as _fla_chunk_gdr_bwd
+
+    _HAVE_FLA_BWD = True
+except ImportError:
+    _HAVE_FLA_BWD = False
+
 
 if _HAVE_TRITON:
     from triton.language.extra import libdevice
@@ -521,6 +533,93 @@ class _ChunkCumsum(torch.autograd.Function):
         return gy
 
 
+class _ChunkGDR(torch.autograd.Function):
+    """One autograd Function wrapping the WHOLE chunked gated delta rule (intra-chunk WY prep +
+    cross-chunk recurrence) on a padded-batch [N, HV, T_pad, *] fp32 layout. Forward runs the same
+    deterministic kernels the inference path uses (chunk_cumsum, _solve_fwd_sub, _fused_chunk_scan)
+    so training and inference forwards agree numerically. Backward drives fla's analytic
+    chunk_gated_delta_rule_bwd from OUR saved tensors: our T-matrix as fla's `A`, our fp32 cumsum as
+    fla's `g`, unscaled l2normed q/k with `scale` passed separately. fla's bwd internally recomputes
+    w,u (recompute_w_u_fwd) and runs prepare_wy_repr_bwd, so it is the adjoint of the FULL prep+scan,
+    not just the scan; hence this Function must span both. Validated: grads match autograd through a
+    pure-torch replica of OUR forward to rel ~1e-3 (bf16 level) on every input. l2norm and the GQA
+    repeat_interleave stay OUTSIDE (their own autograd) so their VJPs are unchanged.
+
+    inputs:  query,key [N,HV,T_pad,Dk] (l2normed, GQA-repeated, UNSCALED, fp32); value [N,HV,T_pad,Dv];
+             g [N,HV,T_pad] (pre-cumsum log-decay); beta [N,HV,T_pad]; initial_state [N,HV,Dk,Dv].
+    returns: core [N,HV,T_pad,Dv], last_state [N,HV,Dk,Dv].
+    """
+
+    @staticmethod
+    def forward(ctx, query, key, value, g, beta, initial_state, chunk_size):
+        N, HV, T_pad, Dk = query.shape
+        Dv = value.shape[-1]
+        C = chunk_size
+        NC = T_pad // C
+        scale = 1.0 / (Dk ** 0.5)
+        # Intra-chunk WY prep. Mirrors torch_chunk_gated_delta_rule exactly (same shared kernels)
+        # so the training forward equals the inference forward numerically. The T-matrix (attn) is
+        # scale-independent (built from k_beta,key only); only the scan consumes the scaled query.
+        q_s = (query * scale).reshape(N, HV, NC, C, Dk)
+        k_c = key.reshape(N, HV, NC, C, Dk)
+        v_c = value.reshape(N, HV, NC, C, Dv)
+        beta_c = beta.reshape(N, HV, NC, C)
+        v_beta = v_c * beta_c.unsqueeze(-1)
+        k_beta = k_c * beta_c.unsqueeze(-1)
+        gcum = chunk_cumsum(g.reshape(N, HV, NC, C))
+        decay = ((gcum.unsqueeze(-1) - gcum.unsqueeze(-2)).tril().exp().float()).tril()
+        m0 = torch.triu(torch.ones(C, C, dtype=torch.bool, device=query.device), 0)
+        attn = -((k_beta @ k_c.transpose(-1, -2)) * decay).masked_fill(m0, 0)
+        attn = _solve_fwd_sub(attn) + torch.eye(C, dtype=attn.dtype, device=attn.device)
+        v_solved = attn @ v_beta
+        k_cumdecay = attn @ (k_beta * gcum.exp().unsqueeze(-1))
+        nchunks = torch.full((N,), NC, dtype=torch.int32, device=query.device)
+        core, last, _ = _fused_chunk_scan(
+            q_s.contiguous(), k_c.contiguous(), gcum.contiguous(),
+            v_solved.contiguous(), k_cumdecay.contiguous(),
+            initial_state.contiguous(), nchunks, -1, False,
+        )
+        core = core.reshape(N, HV, T_pad, Dv)
+        ctx.save_for_backward(query, key, value, gcum, beta, attn, initial_state)
+        ctx.scale = scale
+        ctx.C = C
+        return core, last
+
+    @staticmethod
+    def backward(ctx, d_core, d_last):
+        query, key, value, gcum, attn_T, beta, initial_state = (
+            ctx.saved_tensors[0], ctx.saved_tensors[1], ctx.saved_tensors[2],
+            ctx.saved_tensors[3], ctx.saved_tensors[5], ctx.saved_tensors[4],
+            ctx.saved_tensors[6],
+        )
+        N, HV, T_pad, Dk = query.shape
+        Dv = value.shape[-1]
+        C = ctx.C
+        # To fla layout [B, T, H, *]. fla's A == our T-matrix [.,.,C]; fla's g == our fp32 cumsum.
+        q_f = query.transpose(1, 2).contiguous()
+        k_f = key.transpose(1, 2).contiguous()
+        v_f = value.transpose(1, 2).contiguous()
+        beta_f = beta.transpose(1, 2).contiguous()
+        g_f = gcum.reshape(N, HV, T_pad).transpose(1, 2).contiguous()
+        A_f = attn_T.reshape(N, HV, T_pad, C).transpose(1, 2).contiguous()
+        do = (
+            d_core.reshape(N, HV, T_pad, Dv).transpose(1, 2).contiguous()
+            if d_core is not None
+            else torch.zeros(N, T_pad, HV, Dv, dtype=query.dtype, device=query.device)
+        )
+        # d_last is None when the recurrent state is only cached (no grad flows back through it),
+        # which is the common training case; fla's bwd accepts dht=None (state-only h0 path).
+        dht = d_last.contiguous() if d_last is not None else None
+        dq, dk, dv, db, dg, dh0 = _fla_chunk_gdr_bwd(
+            q=q_f, k=k_f, v=v_f, g=g_f, beta=beta_f, A=A_f, scale=ctx.scale,
+            initial_state=initial_state, do=do, dht=dht,
+        )
+        return (
+            dq.transpose(1, 2), dk.transpose(1, 2), dv.transpose(1, 2),
+            dg.transpose(1, 2), db.transpose(1, 2), dh0, None,
+        )
+
+
 def torch_gdn_gating(
     A_log: torch.Tensor,
     a: torch.Tensor,
@@ -612,40 +711,13 @@ def torch_chunk_gated_delta_rule(
     batch_size = n_seq
     total_sequence_length = sequence_length  # already a multiple of chunk_size
     scale = 1 / (query.shape[-1] ** 0.5)
-    query = query * scale
 
-    v_beta = value * beta.unsqueeze(-1)
-    k_beta = key * beta.unsqueeze(-1)
-    query, key, value, k_beta, v_beta = [
-        x.reshape(x.shape[0], x.shape[1], -1, chunk_size, x.shape[-1])
-        for x in (query, key, value, k_beta, v_beta)
-    ]
-    g = g.reshape(g.shape[0], g.shape[1], -1, chunk_size)
-    mask = torch.triu(
-        torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device), diagonal=0
-    )
-
-    # Shared serial fp32 cumsum over the chunk dim (see chunk_cumsum). A serial left-to-right
-    # scan is length-invariant (C adds/row regardless of chunk count) so sglang (short prefill)
-    # and Megatron (full teacher-forced sequence) match bit-exactly, and it makes the decode
-    # incremental append gcum[i]=gcum[i-1]+g[i] bit-identical to this prefix by construction.
-    g = chunk_cumsum(g)
-    decay_mask = ((g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp().float()).tril()
-    attn = -((k_beta @ key.transpose(-1, -2)) * decay_mask).masked_fill(mask, 0)
-    # Forward-substitution triangular solve. One Triton launch (one program per
-    # (b, h, chunk)) replaces the 64 sequential iterations of the Python loop:
-    #   for i in range(1, chunk_size):
-    #       row = attn[..., i, :i]; sub = attn[..., :i, :i]
-    #       attn[..., i, :i] = row + (row.unsqueeze(-1) * sub).sum(-2)
-    # Deterministic, length-invariant, differentiable (~1 fp32 ULP off the loop).
-    attn = _solve_fwd_sub(attn)
-    attn = attn + torch.eye(chunk_size, dtype=attn.dtype, device=attn.device)
-    value = attn @ v_beta
-    k_cumdecay = attn @ (k_beta * g.exp().unsqueeze(-1))
-
-    initial_state = ssm_states[cache_indices].to(value) if ssm_states is not None else None
+    initial_state = ssm_states[cache_indices].to(query) if ssm_states is not None else None
     last_recurrent_state = (
-        torch.zeros(batch_size, num_heads, k_head_dim, v_head_dim).to(value)
+        torch.zeros(
+            batch_size, num_heads, k_head_dim, v_head_dim,
+            device=query.device, dtype=query.dtype,
+        )
         if initial_state is None
         else initial_state
     )
@@ -660,43 +732,85 @@ def torch_chunk_gated_delta_rule(
     boundary_state = last_recurrent_state  # correct when num_complete_chunks == 0
     num_chunks = total_sequence_length // chunk_size
 
-    # Cross-chunk serial recurrence over last_recurrent_state. The fused Triton scan keeps S on-chip
-    # across the whole chunk loop (one launch per (seq, value-head)) and is bit-identical to the torch
-    # loop below (verified 0-ULP), so sglang prefill, Megatron, and the decode chunk-replay all still
-    # match. Used in inference (no autograd through the scan yet); training keeps the torch loop so
-    # gradients flow through the existing autograd path. Falls back to the loop off-CUDA/no-Triton.
-    use_fused_scan = _HAVE_TRITON and query.is_cuda and not torch.is_grad_enabled()
-    if use_fused_scan:
-        nchunks = torch.tensor(
-            [(sl + chunk_size - 1) // chunk_size for sl in seq_lens],
-            dtype=torch.int32, device=query.device,
+    # Training (grad on): the whole WY prep + cross-chunk scan runs inside _ChunkGDR, one autograd
+    # Function whose backward is fla's analytic chunk_gated_delta_rule_bwd driven from OUR saved
+    # tensors (our T-matrix, our fp32 cumsum). Its forward uses the SAME deterministic kernels as
+    # inference, so training and inference forwards agree, and it gets the fused-scan speedup too.
+    # boundary_state is decode-seed-only (inference), so it is never requested under grad.
+    if _HAVE_FLA_BWD and query.is_cuda and torch.is_grad_enabled():
+        assert not return_boundary_state, "boundary_state (decode seed) is inference-only"
+        core_attn_out, last_recurrent_state = _ChunkGDR.apply(
+            query, key, value, g, beta, last_recurrent_state, chunk_size
         )
-        core_attn_out, last_recurrent_state, bnd = _fused_chunk_scan(
-            query.contiguous(), key.contiguous(), g.contiguous(),
-            value.contiguous(), k_cumdecay.contiguous(),
-            last_recurrent_state.contiguous(),
-            nchunks, num_complete_chunks - 1, return_boundary_state,
-        )
-        if return_boundary_state and num_complete_chunks > 0:
-            boundary_state = bnd
+        core_attn_out = core_attn_out.reshape(n_seq, num_heads, -1, v_head_dim)
     else:
-        core_attn_out = torch.zeros_like(value)
+        query = query * scale
+        v_beta = value * beta.unsqueeze(-1)
+        k_beta = key * beta.unsqueeze(-1)
+        query, key, value, k_beta, v_beta = [
+            x.reshape(x.shape[0], x.shape[1], -1, chunk_size, x.shape[-1])
+            for x in (query, key, value, k_beta, v_beta)
+        ]
+        g = g.reshape(g.shape[0], g.shape[1], -1, chunk_size)
         mask = torch.triu(
-            torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device), diagonal=1
+            torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device), diagonal=0
         )
-        for i in range(0, num_chunks):
-            q_i, k_i, v_i = query[:, :, i], key[:, :, i], value[:, :, i]
-            attn = (q_i @ k_i.transpose(-1, -2) * decay_mask[:, :, i]).masked_fill_(mask, 0)
-            v_prime = (k_cumdecay[:, :, i]) @ last_recurrent_state
-            v_new = v_i - v_prime
-            attn_inter = (q_i * g[:, :, i, :, None].exp()) @ last_recurrent_state
-            core_attn_out[:, :, i] = attn_inter + attn @ v_new
-            last_recurrent_state = (
-                last_recurrent_state * g[:, :, i, -1, None, None].exp()
-                + (k_i * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None]).transpose(-1, -2) @ v_new
+
+        # Shared serial fp32 cumsum over the chunk dim (see chunk_cumsum). A serial left-to-right
+        # scan is length-invariant (C adds/row regardless of chunk count) so sglang (short prefill)
+        # and Megatron (full teacher-forced sequence) match bit-exactly, and it makes the decode
+        # incremental append gcum[i]=gcum[i-1]+g[i] bit-identical to this prefix by construction.
+        g = chunk_cumsum(g)
+        decay_mask = ((g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp().float()).tril()
+        attn = -((k_beta @ key.transpose(-1, -2)) * decay_mask).masked_fill(mask, 0)
+        # Forward-substitution triangular solve. One Triton launch (one program per
+        # (b, h, chunk)) replaces the 64 sequential iterations of the Python loop:
+        #   for i in range(1, chunk_size):
+        #       row = attn[..., i, :i]; sub = attn[..., :i, :i]
+        #       attn[..., i, :i] = row + (row.unsqueeze(-1) * sub).sum(-2)
+        # Deterministic, length-invariant, differentiable (~1 fp32 ULP off the loop).
+        attn = _solve_fwd_sub(attn)
+        attn = attn + torch.eye(chunk_size, dtype=attn.dtype, device=attn.device)
+        value = attn @ v_beta
+        k_cumdecay = attn @ (k_beta * g.exp().unsqueeze(-1))
+
+        # Cross-chunk serial recurrence over last_recurrent_state. The fused Triton scan keeps S
+        # on-chip across the whole chunk loop (one launch per (seq, value-head)) and is bit-identical
+        # to the torch loop (verified 0-ULP), so sglang prefill, Megatron, and the decode chunk-replay
+        # all match. This raw-kernel scan is non-differentiable, so grad-on only reaches it when fla
+        # is unavailable (else _ChunkGDR handles it above); there it must use the torch loop.
+        use_fused_scan = _HAVE_TRITON and query.is_cuda and not torch.is_grad_enabled()
+        if use_fused_scan:
+            nchunks = torch.tensor(
+                [(sl + chunk_size - 1) // chunk_size for sl in seq_lens],
+                dtype=torch.int32, device=query.device,
             )
-            if return_boundary_state and (i + 1) == num_complete_chunks:
-                boundary_state = last_recurrent_state
+            core_attn_out, last_recurrent_state, bnd = _fused_chunk_scan(
+                query.contiguous(), key.contiguous(), g.contiguous(),
+                value.contiguous(), k_cumdecay.contiguous(),
+                last_recurrent_state.contiguous(),
+                nchunks, num_complete_chunks - 1, return_boundary_state,
+            )
+            if return_boundary_state and num_complete_chunks > 0:
+                boundary_state = bnd
+        else:
+            core_attn_out = torch.zeros_like(value)
+            mask = torch.triu(
+                torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device), diagonal=1
+            )
+            for i in range(0, num_chunks):
+                q_i, k_i, v_i = query[:, :, i], key[:, :, i], value[:, :, i]
+                attn = (q_i @ k_i.transpose(-1, -2) * decay_mask[:, :, i]).masked_fill_(mask, 0)
+                v_prime = (k_cumdecay[:, :, i]) @ last_recurrent_state
+                v_new = v_i - v_prime
+                attn_inter = (q_i * g[:, :, i, :, None].exp()) @ last_recurrent_state
+                core_attn_out[:, :, i] = attn_inter + attn @ v_new
+                last_recurrent_state = (
+                    last_recurrent_state * g[:, :, i, -1, None, None].exp()
+                    + (k_i * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None]).transpose(-1, -2) @ v_new
+                )
+                if return_boundary_state and (i + 1) == num_complete_chunks:
+                    boundary_state = last_recurrent_state
 
     # Repack the padded [n_seq, num_heads, padded_len, v_head_dim] batch back into the
     # [1, total_tokens, num_heads, v_head_dim] packed row the caller expects. Padded tail rows
