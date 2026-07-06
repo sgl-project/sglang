@@ -1626,6 +1626,25 @@ class DSparkWorkerV2(BaseSpecWorker):
             "write_hidden": payload.get("hidden"),
         }
 
+    def _prefill_anchor_source_history_debug(self, req_pool_idx: int) -> Optional[dict]:
+        debug = self._boundary_debug_by_req_pool.get(int(req_pool_idx))
+        if not isinstance(debug, dict):
+            return None
+        payload = debug.get("prefill_tail_source")
+        if not isinstance(payload, dict):
+            return None
+        return {
+            "post_seq_len": payload.get("post_seq_len"),
+            "extend_len": payload.get("extend_len"),
+            "source_positions_first_last": self._first_last_debug_values(
+                payload.get("positions")
+            ),
+            "source_swa_first_last": self._first_last_debug_values(
+                payload.get("swa_locs")
+            ),
+            "source_hidden": payload.get("hidden"),
+        }
+
     @staticmethod
     def _first_last_debug_values(values) -> Optional[list[int]]:
         if not isinstance(values, list) or len(values) == 0:
@@ -2965,6 +2984,9 @@ class DSparkWorkerV2(BaseSpecWorker):
                     ),
                     "decode_verify_write_debug": (
                         self._decode_verify_write_history_debug(int(req_pool_idx))
+                    ),
+                    "prefill_anchor_source_debug": (
+                        self._prefill_anchor_source_history_debug(int(req_pool_idx))
                     ),
                 }
             )
