@@ -529,6 +529,9 @@ class SiglipAttention(nn.Module):
         tp_size = get_tp_world_size()
         self.head_dim = hidden_size // num_heads
         self.num_heads_per_partition = num_heads // tp_size
+        # Cache the per-rank projection width so forward() does not re-read the
+        # global TP size (which is not patched to the folding group at run time).
+        self.embed_dim_per_partition = self.num_heads_per_partition * self.head_dim
         self.scaling = self.head_dim**-0.5
 
         self.qkv_proj = QKVParallelLinear(
@@ -559,7 +562,7 @@ class SiglipAttention(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.hidden_size // get_tp_world_size()] * 3, dim=-1)
+        q, k, v = qkv.split([self.embed_dim_per_partition] * 3, dim=-1)
 
         batch_size, seq_len, _ = q.shape
         q = q.view(batch_size, seq_len, self.num_heads_per_partition, self.head_dim)
@@ -569,7 +572,7 @@ class SiglipAttention(nn.Module):
         attn_output = self.attn(q, k, v)
 
         attn_output = attn_output.reshape(
-            batch_size, seq_len, self.hidden_size // get_tp_world_size()
+            batch_size, seq_len, self.embed_dim_per_partition
         )
 
         output, _ = self.out_proj(attn_output)
