@@ -8,12 +8,21 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 import torch
 from einops import rearrange
 
+from sglang.jit_kernel.dsa import (
+    aiter_paged_mqa_logits,
+    cutedsl_paged_mqa_logits,
+    deepgemm_paged_mqa_logits_native,
+    deepgemm_paged_mqa_logits_split,
+)
 from sglang.jit_kernel.fused_store_index_cache import (
     can_use_dsa_fused_store,
     fused_store_index_k_cache,
 )
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsa.paged_mqa_logits_backend import (
+    DSAPagedMQALogitsBackend,
+)
 from sglang.srt.layers.attention.dsa.utils import (
     aiter_can_use_preshuffle_paged_mqa,
     is_dsa_enable_prefill_cp,
@@ -46,7 +55,6 @@ from sglang.srt.utils import (
     is_gfx95_supported,
     is_hip,
     is_npu,
-    is_sm100_supported,
 )
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -432,9 +440,8 @@ class Indexer(MultiPlatformOp):
         self.scale_fmt = scale_fmt
         self.softmax_scale = self.head_dim**-0.5
 
-        self.use_cute_dsl_paged_mqa_logits = (
-            get_global_server_args().dsa_use_cute_dsl_paged_mqa_logits
-            and is_sm100_supported()
+        self.paged_mqa_logits_backend = DSAPagedMQALogitsBackend.resolve(
+            get_global_server_args().dsa_paged_mqa_logits_backend
         )
 
     @contextlib.contextmanager
@@ -832,7 +839,7 @@ class Indexer(MultiPlatformOp):
         B = metadata.get_seqlens_int32().shape[0]
         next_n = q_offset // B if B > 0 else 0
         use_cute_dsl = (
-            self.use_cute_dsl_paged_mqa_logits
+            self.paged_mqa_logits_backend.is_cutedsl()
             and not forward_batch.forward_mode.is_draft_extend_v2()
         )
         ctx_2d = getattr(metadata, "paged_mqa_ctx_lens_2d", None)
@@ -867,88 +874,61 @@ class Indexer(MultiPlatformOp):
         assert len(weights.shape) == 3
         weights = weights.squeeze(2)
 
-        if _is_hip:
-            from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
-
-            q_fp8 = q_fp8.unsqueeze(1)
-            batch_size, next_n, heads, _ = q_fp8.shape
-            logits = torch.empty(
-                (batch_size * next_n, max_seq_len),
-                device=q_fp8.device,
-                dtype=torch.float32,
-            )
-            deepgemm_fp8_paged_mqa_logits(
+        if self.paged_mqa_logits_backend.is_aiter():
+            logits = aiter_paged_mqa_logits(
                 q_fp8,
                 kv_cache_fp8,
                 weights,
-                logits,
                 seqlens_32,
                 block_tables,
                 max_seq_len,
-                Preshuffle=_use_aiter_preshuffle,
-                KVBlockSize=block_kv,
+                preshuffle=_use_aiter_preshuffle,
+                kv_block_size=block_kv,
             )
         elif use_cute_dsl:
-            from sglang.srt.layers.attention.dsa.cute_dsl_paged_mqa_logits import (
-                CuteDSLPagedMQALogitsRunner,
-            )
-
-            ctx_lens_1d = metadata.get_seqlens_int32()
-            schedule_metadata_dsl = schedule_metadata
-            factor = getattr(metadata, "dsl_expand_factor", 1)
-            atom = getattr(metadata, "dsl_atom", 1)
-            dsl_atom_split = factor > 1 and next_n == factor * atom
-            if forward_batch.forward_mode.is_target_verify() and dsl_atom_split:
-                exp_B = B * factor
-                q_dsl = q_fp8[:q_offset].view(
-                    exp_B, atom, q_fp8.shape[1], q_fp8.shape[2]
-                )
-                ctx_lens_1d = ctx_lens_1d.repeat_interleave(factor)
-                block_tables_dsl = block_tables[::next_n].repeat_interleave(
-                    factor, dim=0
-                )
-                schedule_metadata_dsl = deep_gemm.get_paged_mqa_logits_metadata(
-                    ctx_lens_1d.unsqueeze(-1), blocksize, self.sm_count
-                )
-            elif forward_batch.forward_mode.is_target_verify() and next_n >= 2:
-                q_dsl = q_fp8[:q_offset].view(B, next_n, q_fp8.shape[1], q_fp8.shape[2])
-                block_tables_dsl = block_tables[::next_n]
-            else:
-                q_dsl = q_fp8[:q_offset].unsqueeze(1)
-                block_tables_dsl = block_tables[:B]
-            logits = CuteDSLPagedMQALogitsRunner.forward(
-                q_dsl,
-                kv_cache_fp8.view(torch.uint8),
-                weights[:q_offset],
-                ctx_lens_1d,
-                block_tables_dsl,
-                schedule_metadata_dsl,
-                max_seq_len,
-            )
-        elif use_dg_native:
-            # block_tables[::next_n] de-expands dsa_backend's repeat_interleave
-            # without a copy (DG only checks `stride(1) == 1`).
-            logits = deep_gemm.fp8_paged_mqa_logits(
-                q_fp8[:q_offset].view(B, next_n, q_fp8.shape[1], q_fp8.shape[2]),
+            logits = cutedsl_paged_mqa_logits(
+                q_fp8,
                 kv_cache_fp8,
-                weights[:q_offset],
-                seqlens_32_2d,
-                block_tables[::next_n],
+                weights,
+                metadata.get_seqlens_int32(),
+                block_tables,
                 schedule_metadata,
                 max_seq_len,
-                clean_logits=False,
+                q_offset=q_offset,
+                B=B,
+                next_n=next_n,
+                is_target_verify=forward_batch.forward_mode.is_target_verify(),
+                dsl_expand_factor=getattr(metadata, "dsl_expand_factor", 1),
+                dsl_atom=getattr(metadata, "dsl_atom", 1),
+                blocksize=blocksize,
+                sm_count=self.sm_count,
+                get_paged_mqa_logits_metadata_fn=deep_gemm.get_paged_mqa_logits_metadata,
             )
-        else:
-            q_fp8 = q_fp8.unsqueeze(1)
-            logits = deep_gemm.fp8_paged_mqa_logits(
-                q_fp8[:q_offset],
+        elif use_dg_native:
+            logits = deepgemm_paged_mqa_logits_native(
+                deep_gemm.fp8_paged_mqa_logits,
+                q_fp8,
                 kv_cache_fp8,
-                weights[:q_offset],
+                weights,
                 seqlens_32_2d,
                 block_tables,
                 schedule_metadata,
                 max_seq_len,
-                clean_logits=False,
+                q_offset=q_offset,
+                B=B,
+                next_n=next_n,
+            )
+        else:
+            logits = deepgemm_paged_mqa_logits_split(
+                deep_gemm.fp8_paged_mqa_logits,
+                q_fp8,
+                kv_cache_fp8,
+                weights,
+                seqlens_32_2d,
+                block_tables,
+                schedule_metadata,
+                max_seq_len,
+                q_offset=q_offset,
             )
 
         # NOTE(dark): logits should be cleaned in topk_transform

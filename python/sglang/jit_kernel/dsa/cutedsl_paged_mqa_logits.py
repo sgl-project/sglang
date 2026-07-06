@@ -11,7 +11,6 @@ and the context is long.
 from __future__ import annotations
 
 import logging
-from typing import Dict, Optional, Tuple
 
 import cutlass
 import cutlass.cute as cute
@@ -24,14 +23,14 @@ from sglang.srt.utils import is_sm100_supported
 logger = logging.getLogger(__name__)
 
 
-def _pick_dsl_expand(
+def pick_dsl_expand(
     next_n: int,
     batch_size: int = 0,
     max_ctx: int = 0,
     num_sms: int = 148,
-    kernel_atoms: Tuple[int, ...] = (1, 2, 3, 4),
+    kernel_atoms: tuple[int, ...] = (1, 2, 3, 4),
     num_heads: int = 0,
-) -> Tuple[int, int]:
+) -> tuple[int, int]:
     """Pick (expand_factor, effective_next_n) for the DSL paged kernel
     using a wave-aware strategy.
 
@@ -124,7 +123,7 @@ def _propose_epi_config(
     batch_split: int,
     max_ctx: int,
     num_sms: int,
-) -> Tuple[int, Dict]:
+) -> tuple[int, dict]:
     """Auto-tune (num_epi_subtiles, pipeline_flags) for the FP8 MQA epilogue.
 
     Tuned on B300 (~148 SMs) for the GLM-5.2 32-head path; ``next_n_k`` and
@@ -177,7 +176,7 @@ class CuteDSLPagedMQALogitsRunner:
     (compute_block_kv, phys_block_kv, num_heads, head_dim, next_n, num_sms).
     """
 
-    kernel_cache: Dict[Tuple, object] = dict()
+    kernel_cache: dict[tuple, object] = dict()
 
     @classmethod
     def _compile(
@@ -304,7 +303,7 @@ class CuteDSLPagedMQALogitsRunner:
         block_table: torch.Tensor,
         schedule_meta: torch.Tensor,
         max_context_len: int,
-        num_epi_subtiles: Optional[int] = None,
+        num_epi_subtiles: int | None = None,
         epi_dtype: torch.dtype = torch.float32,
         acc_dtype: torch.dtype = torch.float32,
         output_dtype: torch.dtype = torch.float32,
@@ -430,7 +429,7 @@ def cute_dsl_fp8_paged_mqa_logits(
     block_table: torch.Tensor,
     schedule_meta: torch.Tensor,
     max_context_len: int,
-    num_epi_subtiles: Optional[int] = None,
+    num_epi_subtiles: int | None = None,
     epi_dtype: torch.dtype = torch.float32,
     acc_dtype: torch.dtype = torch.float32,
     output_dtype: torch.dtype = torch.float32,
@@ -461,7 +460,7 @@ def _(
     block_table: torch.Tensor,
     schedule_meta: torch.Tensor,
     max_context_len: int,
-    num_epi_subtiles: Optional[int] = None,
+    num_epi_subtiles: int | None = None,
     epi_dtype: torch.dtype = torch.float32,
     acc_dtype: torch.dtype = torch.float32,
     output_dtype: torch.dtype = torch.float32,

@@ -35,6 +35,9 @@ from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
     DSATopKBackend,
     TopkTransformMethod,
 )
+from sglang.srt.layers.attention.dsa.paged_mqa_logits_backend import (
+    DSAPagedMQALogitsBackend,
+)
 from sglang.srt.layers.attention.dsa.quant_k_cache import quantize_k_cache
 from sglang.srt.layers.attention.dsa.transform_index import (
     transform_index_page_table_decode,
@@ -392,13 +395,8 @@ class DeepseekSparseAttnBackend(
             model_runner.server_args.dsa_prefill_backend
         )
         self.dsa_decode_impl: _DSA_IMPL_T = model_runner.server_args.dsa_decode_backend
-        self.use_cute_dsl_paged_mqa_logits = bool(
-            is_cuda()
-            and getattr(
-                model_runner.server_args,
-                "dsa_use_cute_dsl_paged_mqa_logits",
-                False,
-            )
+        self.paged_mqa_logits_backend = DSAPagedMQALogitsBackend.resolve(
+            model_runner.server_args.dsa_paged_mqa_logits_backend
         )
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend(
             model_runner.server_args.dsa_topk_backend
@@ -631,7 +629,7 @@ class DeepseekSparseAttnBackend(
         # validated; for now DG-native is SM100+ only.
         next_n = self.speculative_num_draft_tokens
         if forward_mode.is_target_verify():
-            if self.use_cute_dsl_paged_mqa_logits:
+            if self.paged_mqa_logits_backend.is_cutedsl():
                 return _to_2d_context_lens(cache_seqlens_int32, batch_size)
             if next_n is not None and next_n >= 2 and is_sm100_supported():
                 return (
@@ -652,17 +650,15 @@ class DeepseekSparseAttnBackend(
     ) -> Tuple[int, int]:
         next_n = self.speculative_num_draft_tokens
         if (
-            not self.use_cute_dsl_paged_mqa_logits
+            not self.paged_mqa_logits_backend.is_cutedsl()
             or not forward_mode.is_target_verify()
             or next_n is None
             or next_n < 2
         ):
             return 1, 1
-        from sglang.srt.layers.attention.dsa.cute_dsl_paged_mqa_logits import (
-            _pick_dsl_expand,
-        )
+        from sglang.jit_kernel.dsa import pick_dsl_expand
 
-        return _pick_dsl_expand(
+        return pick_dsl_expand(
             next_n,
             batch_size=batch_size,
             max_ctx=max_seq_len_k,

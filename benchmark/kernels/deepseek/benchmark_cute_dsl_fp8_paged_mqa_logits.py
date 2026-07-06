@@ -8,8 +8,8 @@ import sys
 import numpy as np
 import torch
 
-import sglang.srt.layers.attention.dsa.cute_dsl_paged_mqa_logits  # noqa: F401
-from sglang.srt.layers.attention.dsa.cute_dsl_paged_mqa_logits import _pick_dsl_expand
+import sglang.jit_kernel.dsa.cutedsl_paged_mqa_logits  # noqa: F401
+from sglang.jit_kernel.dsa import pick_dsl_expand
 from sglang.srt.layers.attention.dsa.utils import (
     fp8_mqa_logits_ceil_to_ue8m0,
     fp8_mqa_logits_make_fused_kv,
@@ -98,7 +98,7 @@ def benchmark(
     """Benchmark CuTe DSL FP8 paged MQA logits vs DeepGEMM.
 
     The "DSL" column uses the SAME picker SGLang runs at runtime
-    (``_pick_dsl_expand``), so the table reflects the shipped path. For
+    (``pick_dsl_expand``), so the table reflects the shipped path. For
     next_n=6 / num_heads<=42 that picker selects the native single-launch
     expansion (factor=1, atom=next_n, weights-in-SMEM) once there is enough
     work to fill the SMs, and a wave-minimizing split otherwise.
@@ -129,14 +129,14 @@ def benchmark(
         f"{'DG-nat(us)':>11s} {'DG/DSL':>7s}"
     )
     print(hdr)
-    print("  DSL    = production picker (_pick_dsl_expand) — exactly what SGLang runs")
+    print("  DSL    = production picker (pick_dsl_expand) — exactly what SGLang runs")
     print("  pick   = chosen factor/atom (1/6 = native single-launch; 2/3 = split)")
     print("  native = forced native expansion (factor=1, atom=next_n); '-' if N>256")
     print("  DG-nat = deep_gemm native (q=[B,next_n,H,D]) — TRT-LLM's path")
     print("  nat/DSL>1 => native beats the picker; DG/DSL>1 => DSL beats deep_gemm")
     print("-" * len(hdr))
 
-    # See `cute_dsl_paged_mqa_logits.py` for the SPLIT_KV=256 alignment note:
+    # See `cutedsl_paged_mqa_logits.py` for the SPLIT_KV=256 alignment note:
     # DG metadata wrapper computes SPLIT_KV = block_kv_arg * 4 with the
     # multiplier hardcoded to 4 on SM100, and both kernels expect SPLIT_KV=256
     # (DSL: compute_tile=128 × kNumMathWarpGroups=2; DG: hardcoded). Pass 64.
@@ -206,7 +206,7 @@ def benchmark(
 
                 # Production pick — exactly what SGLang's runtime selects. The op
                 # then auto-tunes the epilogue (incl. max_w_in_reg=8 for native).
-                factor, atom = _pick_dsl_expand(
+                factor, atom = pick_dsl_expand(
                     next_n, batch_size, context_len, num_sms, num_heads=num_heads
                 )
                 prod_t = _split(factor, atom)

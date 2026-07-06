@@ -192,7 +192,7 @@ def test_cute_dsl_fp8_paged_mqa_logits(
     import deep_gemm  # noqa: F401
 
     # Force op + runner registration.
-    from sglang.srt.layers.attention.dsa import cute_dsl_paged_mqa_logits  # noqa: F401
+    import sglang.jit_kernel.dsa.cutedsl_paged_mqa_logits  # noqa: F401
 
     head_dim = 128
     block_kv = 128
@@ -212,7 +212,7 @@ def test_cute_dsl_fp8_paged_mqa_logits(
 
     num_sms = torch.cuda.get_device_properties(0).multi_processor_count
 
-    # See sglang/srt/layers/attention/dsa/cute_dsl_paged_mqa_logits.py for the
+    # See sglang/jit_kernel/dsa/cutedsl_paged_mqa_logits.py for the
     # "block_kv = 64 == SPLIT_KV/4" alignment rationale (DG metadata is not
     # SM100-aware on this code path).
     DG_METADATA_BLOCK_KV = 64
