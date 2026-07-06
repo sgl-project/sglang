@@ -299,48 +299,34 @@ def load_model(server_args, port_args, gpu_id, tp_rank):
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
     moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
 
-    spec_algorithm = SpeculativeAlgorithm.from_string(server_args.speculative_algorithm)
+    model_config = ModelConfig.from_server_args(server_args)
+    runner_kwargs = dict(
+        model_config=model_config,
+        mem_fraction_static=server_args.mem_fraction_static,
+        gpu_id=gpu_id,
+        tp_rank=tp_rank,
+        tp_size=server_args.tp_size,
+        moe_ep_rank=moe_ep_rank,
+        moe_ep_size=server_args.ep_size,
+        pp_rank=0,
+        pp_size=1,
+        nccl_port=port_args.nccl_port,
+        server_args=server_args,
+    )
+
     _use_mlx = use_mlx()
-    if spec_algorithm.is_some() and not _use_mlx:
-        # Speculative decoding runs through the target + draft worker stack
-        # instead of a bare ModelRunner; build it like the scheduler does and
-        # drive it directly (see _SpecBenchRunner).
-        model_runner = _build_spec_bench_runner(
-            server_args, port_args, gpu_id, tp_rank, moe_ep_rank, spec_algorithm
+    if _use_mlx:
+        from sglang.srt.hardware_backend.mlx.model_runner_stub import (
+            MlxModelRunnerStub,
         )
-        max_total_num_tokens = model_runner.target_runner.max_total_num_tokens
+
+        model_runner = MlxModelRunnerStub(**runner_kwargs)
     else:
-        model_config = ModelConfig.from_server_args(server_args)
-        runner_kwargs = dict(
-            model_config=model_config,
-            mem_fraction_static=server_args.mem_fraction_static,
-            gpu_id=gpu_id,
-            tp_rank=tp_rank,
-            tp_size=server_args.tp_size,
-            moe_ep_rank=moe_ep_rank,
-            moe_ep_size=server_args.ep_size,
-            pp_rank=0,
-            pp_size=1,
-            nccl_port=port_args.nccl_port,
-            server_args=server_args,
-        )
-
-        if _use_mlx:
-            from sglang.srt.hardware_backend.mlx.model_runner_stub import (
-                MlxModelRunnerStub,
-            )
-
-            raw_runner = MlxModelRunnerStub(**runner_kwargs)
-            model_runner = _MlxBenchRunner(raw_runner, server_args)
-        else:
-            raw_runner = ModelRunner(**runner_kwargs)
-            raw_runner.alloc_memory_pool()
-            raw_runner.init_attention_backends()
-            raw_runner.init_cuda_graphs()
-            model_runner = _TorchBenchRunner(raw_runner)
-        max_total_num_tokens = raw_runner.max_total_num_tokens
-
-    rank_print(f"max_total_num_tokens={max_total_num_tokens}")
+        model_runner = ModelRunner(**runner_kwargs)
+        model_runner.alloc_memory_pool()
+        model_runner.init_attention_backends()
+        model_runner.init_cuda_graphs()
+    rank_print(f"max_total_num_tokens={model_runner.max_total_num_tokens}")
     tokenizer = get_tokenizer(
         server_args.tokenizer_path,
         tokenizer_mode=server_args.tokenizer_mode,
@@ -348,6 +334,11 @@ def load_model(server_args, port_args, gpu_id, tp_rank):
     )
     if server_args.tp_size > 1:
         dist.barrier()
+
+    if _use_mlx:
+        model_runner = _MlxBenchRunner(model_runner, server_args)
+    else:
+        model_runner = _TorchBenchRunner(model_runner)
 
     return model_runner, tokenizer
 
@@ -461,7 +452,8 @@ class TreeCacheNamespace(SimpleNamespace):
         pass
 
 
-def _init_extend_batch(reqs, model_runner, spec_algorithm):
+@torch.no_grad
+def extend(reqs, model_runner):
     # Create dummy tree_cache for benchmarks (no prefix caching, just allocation)
     dummy_tree_cache = TreeCacheNamespace(
         page_size=model_runner.server_args.page_size,
@@ -476,7 +468,7 @@ def _init_extend_batch(reqs, model_runner, spec_algorithm):
         tree_cache=dummy_tree_cache,
         model_config=model_runner.model_config,
         enable_overlap=False,
-        spec_algorithm=spec_algorithm,
+        spec_algorithm=SpeculativeAlgorithm.NONE,
     )
     batch.prepare_for_extend()
     _maybe_prepare_mlp_sync_batch(batch, model_runner)
@@ -488,12 +480,7 @@ def _init_extend_batch(reqs, model_runner, spec_algorithm):
             batch.device, non_blocking=True
         )
         batch.prefill_input_ids_cpu = None
-    return batch
 
-
-@torch.no_grad
-def extend(reqs, model_runner):
-    batch = _init_extend_batch(reqs, model_runner, SpeculativeAlgorithm.NONE)
     forward_batch = ForwardBatch.init_new(batch, model_runner)
     logits_output = model_runner.forward(forward_batch).logits_output
     next_token_ids = model_runner.sample(logits_output, forward_batch)
@@ -530,8 +517,6 @@ def _maybe_prepare_mlp_sync_batch(batch: ScheduleBatch, model_runner):
 class _TorchBenchRunner:
     """Wraps ModelRunner for the standard PyTorch benchmark path."""
 
-    is_spec = False
-
     def __init__(self, model_runner):
         self.torch_runner = model_runner
 
@@ -557,8 +542,6 @@ class _TorchBenchRunner:
 
 class _MlxBenchRunner:
     """Wraps MlxModelRunner for the MLX benchmark path."""
-
-    is_spec = False
 
     def __init__(self, model_runner, server_args):
         from sglang.srt.hardware_backend.mlx.model_runner import MlxModelRunner
@@ -611,149 +594,6 @@ class _MlxBenchRunner:
 
     def max_batch_size(self, input_len, output_len):
         return self.fake_torch_runner.max_total_num_tokens // (input_len + output_len)
-
-
-def _build_spec_bench_runner(
-    server_args, port_args, gpu_id, tp_rank, moe_ep_rank, spec_algorithm
-):
-    """Construct the speculative target + draft worker stack."""
-    from sglang.srt.managers.tp_worker import TpModelWorker
-
-    # Single-process bench: every parallelism rank is 0 except moe_ep_rank.
-    rank_kwargs = dict(
-        gpu_id=gpu_id,
-        tp_rank=tp_rank,
-        moe_ep_rank=moe_ep_rank,
-        attn_cp_rank=0,
-        moe_dp_rank=0,
-        dp_rank=0,
-        nccl_port=port_args.nccl_port,
-    )
-    target_worker = TpModelWorker(server_args=server_args, pp_rank=0, **rank_kwargs)
-
-    # Frozen-KV MTP draft construction needs the target KV pool up front.
-    if spec_algorithm.is_frozen_kv_mtp():
-        target_worker.alloc_memory_pool()
-
-    # Only the draft weights use the override, so apply it after the target
-    # worker has loaded (mirrors the scheduler's ordering).
-    if server_args.speculative_draft_load_format is not None:
-        server_args.load_format = server_args.speculative_draft_load_format
-
-    draft_worker_cls = spec_algorithm.create_worker(server_args)
-    draft_worker = draft_worker_cls(
-        server_args=server_args, target_worker=target_worker, **rank_kwargs
-    )
-
-    # KV pools: the target owns them, the draft shares the same pool.
-    if target_worker.model_runner.token_to_kv_pool_allocator is None:
-        target_worker.alloc_memory_pool()
-    req_to_token_pool, token_to_kv_pool_allocator = target_worker.get_memory_pool()
-    draft_worker.alloc_memory_pool(
-        memory_pool_config=target_worker.model_runner.memory_pool_config,
-        req_to_token_pool=req_to_token_pool,
-        token_to_kv_pool_allocator=token_to_kv_pool_allocator,
-    )
-
-    target_worker.init_attention_backends()
-    draft_worker.init_attention_backends()
-    target_worker.init_cuda_graphs()  # no-op on CPU
-    draft_worker.init_cuda_graphs()
-
-    return _SpecBenchRunner(target_worker, draft_worker, spec_algorithm)
-
-
-class _SpecBenchRunner:
-    """Wraps the speculative target + draft worker stack for the benchmark."""
-
-    is_spec = True
-
-    def __init__(self, target_worker, draft_worker, spec_algorithm):
-        self.target_worker = target_worker
-        # For speculative decoding the draft worker is the model worker that
-        # orchestrates draft -> verify -> draft_extend.
-        self.draft_worker = draft_worker
-        self.target_runner = target_worker.model_runner
-        self.spec_algorithm = spec_algorithm
-        self.device = self.target_runner.device
-        self.num_draft_tokens = (
-            self.target_runner.server_args.speculative_num_draft_tokens or 1
-        )
-        # Acceptance accumulators (accept counts include the bonus token).
-        self.total_num_accept_tokens = 0
-        self.verify_ct = 0
-
-    def clear(self):
-        # Target and draft share one KV pool; clear it once.
-        self.target_runner.req_to_token_pool.clear()
-        self.target_runner.token_to_kv_pool_allocator.clear()
-        self.total_num_accept_tokens = 0
-        self.verify_ct = 0
-
-    def _carry_forward(self, batch, result):
-        # Re-apply the fields the worker advanced so the next iteration sees
-        # them, mirroring the scheduler's non-overlap spec path. Forward
-        # isolation is unnecessary: the bench runs a single greedy static batch.
-        batch.spec_info = result.next_draft_input
-        if result.new_seq_lens is not None:
-            batch.seq_lens = result.new_seq_lens
-            if batch.seq_lens_cpu is not None:
-                batch.seq_lens_cpu = result.new_seq_lens.to("cpu")
-                batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
-        batch.input_ids = None
-
-    @torch.no_grad
-    def extend(self, reqs):
-        batch = _init_extend_batch(reqs, self.target_runner, self.spec_algorithm)
-        result = self.draft_worker.forward_batch_generation(batch)
-        # Record the prefill's sampled token on each request (the scheduler does
-        # this after prefill); ngram drafting reads it as the current token. Its
-        # KV is committed by the next verify, so kv_committed_len is untouched.
-        next_token_ids = result.next_token_ids.tolist()
-        for i, req in enumerate(batch.reqs):
-            req.output_ids.append(next_token_ids[i])
-        self._carry_forward(batch, result)
-        return result.next_token_ids, result.logits_output.next_token_logits, batch
-
-    @torch.no_grad
-    def decode(self, next_token_ids, batch):
-        # The passed token ids are ignored: spec rebuilds input_ids from spec_info.
-        batch.prepare_for_decode()
-        _maybe_prepare_mlp_sync_batch(batch, self.target_runner)
-        result = self.draft_worker.forward_batch_generation(batch)
-
-        accept_lens_cpu = result.accept_lens.to("cpu")
-        accept_lens = accept_lens_cpu.tolist()
-        stride = result.speculative_num_draft_tokens
-        self.num_draft_tokens = stride
-        # Replicate the scheduler's result processor for each request: commit
-        # accepted tokens to KV (eagle_prepare_for_decode reads kv_committed_len
-        # to size the next allocation) and record them on req.output_ids (ngram
-        # drafting reads output_ids to find the current token / build the trie).
-        predict = result.next_token_ids.tolist()
-        for i, req in enumerate(batch.reqs):
-            num_accept_tokens = accept_lens[i]
-            accept_tokens = predict[i * stride : i * stride + num_accept_tokens]
-            req.kv_committed_len += num_accept_tokens
-            req.output_ids.extend(accept_tokens)
-            self.total_num_accept_tokens += num_accept_tokens
-        self.verify_ct += len(batch.reqs)
-
-        self._carry_forward(batch, result)
-        return result.next_token_ids, accept_lens_cpu
-
-    def cleanup(self, batch):
-        pass
-
-    def synchronize(self):
-        synchronize(self.device)
-
-    def max_batch_size(self, input_len, output_len):
-        # The draft model shares the KV pool and consumes extra slots per verify
-        # step (tree width); use a conservative divisor to avoid mid-sweep OOM.
-        return self.target_runner.max_total_num_tokens // (
-            input_len + output_len * self.num_draft_tokens
-        )
 
 
 def _read_prompts_from_file(prompt_file, rank_print):
@@ -820,10 +660,8 @@ def correctness_test(
         next_token_ids, next_token_logits, batch = model_runner.extend(reqs)
         rank_print(f"prefill logits (first half): {next_token_logits} \n")
 
-        # Prepare extend inputs (the spec runner exposes its target ModelRunner)
-        torch_runner = getattr(model_runner, "torch_runner", None) or getattr(
-            model_runner, "target_runner", None
-        )
+        # Prepare extend inputs
+        torch_runner = getattr(model_runner, "torch_runner", None)
         reqs = prepare_extend_inputs_for_correctness_test(
             bench_args, input_ids, reqs, torch_runner
         )
@@ -832,34 +670,16 @@ def correctness_test(
     next_token_ids, next_token_logits, batch = model_runner.extend(reqs)
     rank_print(f"prefill logits (final): {next_token_logits} \n")
 
-    # Decode. For spec each step is one verify emitting up to num_draft_tokens
-    # tokens, so this fixed step count over-generates; acceptable for a
-    # correctness smoke print (the latency path is token-bounded instead).
-    is_spec = model_runner.is_spec
+    # Decode
     output_ids = [input_ids[i] + [next_token_ids[i]] for i in range(len(input_ids))]
     for _ in range(bench_args.output_len[0] - 1):
-        next_token_ids, decode_extra = model_runner.decode(next_token_ids, batch)
-        if is_spec:
-            # Each verify step emits a variable number of accepted tokens.
-            # ``next_token_ids`` is the padded predict tree (stride =
-            # num_draft_tokens); slice the accepted run per request.
-            stride = model_runner.num_draft_tokens
-            predict = next_token_ids.tolist()
-            accept_lens = decode_extra.tolist()
-            for i in range(len(reqs)):
-                base = i * stride
-                output_ids[i].extend(predict[base : base + accept_lens[i]])
-        else:
-            next_token_ids_list = next_token_ids.tolist()
-            for i in range(len(reqs)):
-                output_ids[i].append(next_token_ids_list[i])
+        next_token_ids, _ = model_runner.decode(next_token_ids, batch)
+        next_token_ids_list = next_token_ids.tolist()
+        for i in range(len(reqs)):
+            output_ids[i].append(next_token_ids_list[i])
 
     # Clean up
     model_runner.cleanup(batch)
-
-    if is_spec and model_runner.verify_ct > 0:
-        accept_length = model_runner.total_num_accept_tokens / model_runner.verify_ct
-        rank_print(f"accept length: {accept_length:.3f}\n")
 
     # Print output texts
     for i in range(len(reqs)):
@@ -946,29 +766,15 @@ def latency_test_run_once(
     measurement_results["prefill_throughput"] = throughput
 
     decode_latencies = []
-    is_spec = model_runner.is_spec
     # Determine profiling start step and end step
-    if profile_start_step is not None:
-        profile_start = profile_start_step
-    elif is_spec:
-        # A spec verify step emits up to num_draft_tokens tokens, so the loop
-        # runs fewer steps than output_len; anchor the default at a step the
-        # loop still reaches even at the maximum acceptance rate.
-        profile_start = (output_len // 2) // model_runner.num_draft_tokens
-    else:
-        profile_start = output_len // 2
+    profile_start = (
+        profile_start_step if profile_start_step is not None else (output_len // 2)
+    )
     profile_end = profile_start + (profile_steps if profile_steps is not None else 1)
     enable_profile_decode = profile and profile_stage in ["all", "decode"]
     trace_filename_decode = None
     profiler = None
-    # A non-spec decode step emits exactly one token per request, but a spec
-    # verify step emits a variable number, so loop until every request has
-    # generated output_len tokens (the prefill already emitted one each) rather
-    # than a fixed step count -- otherwise spec would over-generate and the
-    # total latency / throughput would not reflect producing output_len tokens.
-    tokens_generated = np.ones(batch_size, dtype=np.int64)
-    i = 0
-    while tokens_generated.min() < output_len:
+    for i in range(output_len - 1):
         model_runner.synchronize()
         # Start profiler at the specified step
         if enable_profile_decode and i == profile_start:
@@ -983,7 +789,7 @@ def latency_test_run_once(
             )
 
         tic = time.perf_counter()
-        next_token_ids, decode_extra = model_runner.decode(next_token_ids, batch)
+        next_token_ids, _ = model_runner.decode(next_token_ids, batch)
         model_runner.synchronize()
         latency = time.perf_counter() - tic
 
@@ -1006,22 +812,6 @@ def latency_test_run_once(
             rank_print(
                 f"Decode {i}. Batch size: {batch_size}, latency: {latency:6.5f} s, throughput: {throughput:9.2f} token/s"
             )
-        # decode_extra carries per-request accept lengths for spec; ignored otherwise.
-        tokens_generated += decode_extra.numpy() if is_spec else 1
-        i += 1
-
-    # Stop the profiler if it was started but the loop exited before its stop
-    # step (spec early-exit can finish before profile_end).
-    if profiler is not None:
-        stop_profile(
-            profiler,
-            profile_activities,
-            rank_print=rank_print,
-            save_trace=True,
-            trace_filename=trace_filename_decode,
-            stage="decode",
-        )
-        profiler = None
 
     # Record decode timing from 2nd output
     if output_len > 1:
@@ -1032,23 +822,6 @@ def latency_test_run_once(
         )
         measurement_results["median_decode_latency"] = med_decode_latency
         measurement_results["median_decode_throughput"] = med_decode_throughput
-
-    # Speculative decoding: each decode step is one verify step that emits a
-    # variable number of accepted tokens, so report the average accept length
-    # (tokens per verify step, incl. bonus) and the effective decode throughput.
-    if is_spec and model_runner.verify_ct > 0:
-        accept_length = model_runner.total_num_accept_tokens / model_runner.verify_ct
-        eff_decode_throughput = (
-            model_runner.total_num_accept_tokens / sum(decode_latencies)
-            if decode_latencies
-            else 0.0
-        )
-        rank_print(
-            f"Spec.    accept length: {accept_length:6.3f}, "
-            f"effective decode throughput: {eff_decode_throughput:9.2f} token/s"
-        )
-        measurement_results["accept_length"] = accept_length
-        measurement_results["effective_decode_throughput"] = eff_decode_throughput
 
     throughput = (input_len + output_len) * batch_size / tot_latency
     rank_print(
