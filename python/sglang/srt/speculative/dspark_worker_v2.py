@@ -1458,8 +1458,9 @@ class DSparkWorkerV2(BaseSpecWorker):
             translate_swa = getattr(token_to_kv_pool, "translate_loc_from_full_to_swa", None)
             if translate_swa is None:
                 return None
-            start = max(int(prefix_len) - 128, 0)
-            end = int(prefix_len) + int(block_size)
+            anchor_len = max(int(prefix_len) - 1, 0)
+            start = max(anchor_len - 128, 0)
+            end = anchor_len + int(block_size)
             if end <= start:
                 return None
             logical = torch.arange(start, end, device=req_to_token.device, dtype=torch.int64)
@@ -1468,6 +1469,19 @@ class DSparkWorkerV2(BaseSpecWorker):
                 logical,
             ].view(-1)
             swa_locs = translate_swa(full_locs)
+            verify_start = int(prefix_len)
+            verify_end = verify_start + int(block_size)
+            verify_logical = torch.arange(
+                verify_start,
+                verify_end,
+                device=req_to_token.device,
+                dtype=torch.int64,
+            )
+            verify_full_locs = req_to_token[
+                torch.tensor(int(req_pool_idx), device=req_to_token.device).view(1),
+                verify_logical,
+            ].view(-1)
+            verify_swa_locs = translate_swa(verify_full_locs)
             layers = getattr(self._draft_inner, "layers", [])
             layer_ids = []
             if layers:
@@ -1488,8 +1502,10 @@ class DSparkWorkerV2(BaseSpecWorker):
             context_head_swa = swa_locs[: min(8, context_len)]
             context_tail_start = max(context_len - 8, 0)
             context_tail_swa = swa_locs[context_tail_start:context_len]
-            block_swa = swa_locs[-int(block_size) :]
+            draft_query_swa = swa_locs[-int(block_size) :]
             return {
+                "prefix_len": int(prefix_len),
+                "anchor_len": int(anchor_len),
                 "logical_first_last": [int(start), int(end - 1)],
                 "full_first8": [int(x) for x in full_locs[:8].detach().cpu().tolist()],
                 "full_last8": [int(x) for x in full_locs[-8:].detach().cpu().tolist()],
@@ -1499,8 +1515,22 @@ class DSparkWorkerV2(BaseSpecWorker):
                 "context_tail_swa_locs": [
                     int(x) for x in context_tail_swa.detach().cpu().tolist()
                 ],
-                "block_swa_locs": [int(x) for x in block_swa.detach().cpu().tolist()],
+                "draft_query_swa_locs": [
+                    int(x) for x in draft_query_swa.detach().cpu().tolist()
+                ],
+                "verify_token_logical_locs": [
+                    int(x) for x in verify_logical.detach().cpu().tolist()
+                ],
+                "verify_token_swa_locs": [
+                    int(x) for x in verify_swa_locs.detach().cpu().tolist()
+                ],
                 "visible_block_swa_locs": visible_block_swa_locs,
+                "visible_matches_draft_query": (
+                    visible_block_swa_locs
+                    == [int(x) for x in draft_query_swa.detach().cpu().tolist()]
+                    if visible_block_swa_locs is not None
+                    else None
+                ),
                 "boundary_debug": self._boundary_debug_by_req_pool.get(
                     int(req_pool_idx)
                 ),
@@ -1521,10 +1551,10 @@ class DSparkWorkerV2(BaseSpecWorker):
                     )
                     for layer_id in layer_ids
                 ],
-                "block_kv_checksums": [
+                "draft_query_kv_checksums": [
                     self._checksum_swa_kv_rows(
                         layer_id=layer_id,
-                        swa_locs=block_swa,
+                        swa_locs=draft_query_swa,
                     )
                     for layer_id in layer_ids
                 ],
