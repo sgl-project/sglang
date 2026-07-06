@@ -1188,6 +1188,13 @@
                     ]
                   },
                   {
+                    "group": "LongLive",
+                    "tag": "NEW",
+                    "pages": [
+                      "cookbook/diffusion/LongLive/LongLive-2.0"
+                    ]
+                  },
+                  {
                     "group": "LTX",
                     "pages": [
                       "cookbook/diffusion/LTX/LTX2 & LTX2.3"
