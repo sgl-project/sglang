@@ -483,11 +483,10 @@ class BaseMultimodalProcessor(ABC):
                 "resized_height",
                 "resized_width"
             )
-            hf_video_kwargs = {
-                k: v
-                for k, v in kwargs
-                if k not in sglang_video_keys
-            }
+            hf_video_kwargs = {}
+            for k, v in kwargs.items():
+                if k not in sglang_video_keys:
+                    hf_video_kwargs[k] = v
             result = processor.__call__(
                 text=[input_text],
                 padding=True,
