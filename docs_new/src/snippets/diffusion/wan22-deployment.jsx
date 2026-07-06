@@ -11,6 +11,8 @@
             { id: 'mi300x', label: 'MI300X', default: false },
             { id: 'mi325x', label: 'MI325X', default: false },
             { id: 'mi355x', label: 'MI355X', default: false },
+            { id: 'ascend2', label: 'A2', default: false },
+            { id: 'ascend3', label: 'A3', default: false }
           ],
         },
         task: {
@@ -85,6 +87,22 @@
         return modelConfigs[configKey]?.supportedLoras || [];
       })();
 
+      useEffect(() => {
+        const isAscend = values.hardware === 'ascend2' || values.hardware === 'ascend3';
+        
+        const targetTabName = isAscend ? 'Ascend A2 / A3' : 'NVIDIA B200';
+
+        const allTabs = document.querySelectorAll('button, [role="tab"]');
+        
+        allTabs.forEach((tab) => {
+          const text = tab.textContent.trim();
+          
+          if (text === targetTabName && tab.getAttribute('aria-selected') !== 'true') {
+            tab.click();
+          }
+        });
+      }, [values.hardware]);
+
       const handleRadioChange = (optionName, itemId) => {
         setValues((prev) => {
           const next = { ...prev, [optionName]: itemId };
@@ -117,6 +135,20 @@
           return '# Error: Invalid configuration';
         }
 
+    
+        if (hardware === 'ascend3') {
+          if (task === 't2v') {
+            return `sglang generate \\\n  --model-path /home/weights/Wan2.2-T2V-A14B-Diffusers/ \\\n  --prompt "Two anthropomorphic cats in comfy boxing gear and bright gloves fight intensely on a spotlighted stage." \\\n  --height 720 --width 1280 --tp-size 2 --num-gpus 2 --num-frames 81 --num-inference-steps 40`;
+          } 
+          
+          if (task === 'i2v') {
+            return `sglang generate \\\n  --model-path /home/weights/Wan2.2-I2V-A14B-Diffusers/ \\\n  --prompt "Summer beach vacation style, a white cat wearing sunglasses sits on a surfboard. The fluffy-furred feline gazes directly at the camera with a relaxed expression. Blurred beach scenery forms the background featuring crystal-clear waters, distant green hills, and a blue sky dotted with white clouds. The cat assumes a naturally relaxed posture, as if savoring the sea breeze and warm sunlight. A close-up shot highlights the feline's intricate details and the refreshing atmosphere of the seaside." \\\n  --height 720 --width 1280 --tp-size 2 --sp-degree 1 --num-gpus 2 --num-frames 81 --num-inference-steps 40 \\\n  --image-path /home/memelin/projects/mindie/Wan2.2/examples/i2v_input.JPG --warmup true`;
+          } 
+          
+          if (task === 'ti2v') {
+            return `SGLANG_CACHE_DIT_FN=2 \\\nSGLANG_CACHE_DIT_BN=1 \\\nSGLANG_CACHE_DIT_WARMUP=4 \\\nSGLANG_CACHE_DIT_RDT=0.4 \\\nSGLANG_CACHE_DIT_MC=4 \\\nSGLANG_CACHE_DIT_TAYLORSEER=true \\\nSGLANG_CACHE_DIT_TS_ORDER=2 \\\nSGLANG_CACHE_DIT_ENABLED=true \\\nsglang generate \\\n  --model-path /home/weights/Wan2.2-TI2V-5B-Diffusers/ \\\n  --prompt "Summer beach vacation style, a white cat wearing sunglasses sits on a surfboard. The fluffy-furred feline gazes directly at the camera with a relaxed expression. Blurred beach scenery forms the background featuring crystal-clear waters, distant green hills, and a blue sky dotted with white clouds. The cat assumes a naturally relaxed posture, as if savoring the sea breeze and warm sunlight. A close-up shot highlights the feline's intricate details and the refreshing atmosphere of the seaside." \\\n  --image-path /home/memelin/projects/mindie/Wan2.2/examples/i2v_input.JPG \\\n  --sp-degree 2 --num-gpus 2 --warmup true`;
+          }
+        }
         let command = `sglang serve \\\n  --model-path ${config.repoId} \\\n  --dit-layerwise-offload true`;
         if (bestPractice === 'on') {
           if (hardware === 'b300') {
