@@ -40,16 +40,83 @@ const STOP_REGEX_MAX_LEN: i64 = 1 << 30;
 /// `is_normalized=true` so the scheduler skips its own pass. `None`/absent map →
 /// an all-defaults map. Returns `Error::Validation` (HTTP 400) for any param the
 /// Python `verify` would reject.
+///
+/// One pass over the map: the fields we normalize are read into typed locals and
+/// everything else (max_new_tokens, grammars, unknowns) is carried through
+/// untouched. See `TM_CORES` (`runtime::threads`) for the ingress-scaling ceiling
+/// this constant feeds into.
 pub fn normalize_sampling_params(sp: &mut Option<Value>) -> Result<(), Error> {
-    let mut map = match sp.take() {
+    let map = match sp.take() {
         Some(Value::Map(m)) => m,
         None => Vec::new(),
         Some(_) => return Err(Error::Validation("sampling_params must be a map".into())),
     };
 
-    // --- __post_init__: fill defaults, then the greedy / top_k special cases ---
-    let temperature_in = get_f64(&map, "temperature").unwrap_or(1.0);
-    let top_k_in = get_i64(&map, "top_k").unwrap_or(-1);
+    // Defaults match the SamplingParams field defaults; a present-but-null value
+    // reads as absent (keeps the default), matching Python's `x if x is not None`.
+    let mut temperature_in = 1.0;
+    let mut top_k_in = -1i64;
+    let mut top_p = 1.0;
+    let mut min_p = 0.0;
+    let mut frequency_penalty = 0.0;
+    let mut presence_penalty = 0.0;
+    let mut repetition_penalty = 1.0;
+    let mut min_new_tokens = 0i64;
+    let mut max_new_tokens = 128i64; // field default is 128, not None
+    let mut stop_strs: Vec<String> = Vec::new();
+    let mut stop_regex_strs: Vec<String> = Vec::new();
+    let mut grammars = 0usize;
+
+    // Single pass: pull the normalized fields into locals, keep everything else as
+    // passthrough. Fields we re-emit below are dropped here to avoid duplicate keys.
+    let mut out: Vec<(Value, Value)> = Vec::with_capacity(map.len() + 8);
+    for (k, v) in map {
+        match k.as_str() {
+            Some("temperature") => temperature_in = as_f64(&v).unwrap_or(temperature_in),
+            Some("top_k") => top_k_in = as_i64(&v).unwrap_or(top_k_in),
+            Some("top_p") => top_p = as_f64(&v).unwrap_or(top_p),
+            Some("min_p") => min_p = as_f64(&v).unwrap_or(min_p),
+            Some("frequency_penalty") => {
+                frequency_penalty = as_f64(&v).unwrap_or(frequency_penalty)
+            }
+            Some("presence_penalty") => presence_penalty = as_f64(&v).unwrap_or(presence_penalty),
+            Some("repetition_penalty") => {
+                repetition_penalty = as_f64(&v).unwrap_or(repetition_penalty)
+            }
+            Some("min_new_tokens") => min_new_tokens = as_i64(&v).unwrap_or(min_new_tokens),
+            // Read for verify but kept on the wire — the scheduler still needs it.
+            Some("max_new_tokens") => {
+                max_new_tokens = as_i64(&v).unwrap_or(max_new_tokens);
+                out.push((k, v));
+            }
+            // stop / stop_regex → string lists + match-window lengths (below). Kept
+            // on the wire too; the scheduler reads stop_strs, the alias is harmless.
+            Some("stop") => {
+                stop_strs = to_string_list(Some(&v));
+                out.push((k, v));
+            }
+            Some("stop_regex") => {
+                stop_regex_strs = to_string_list(Some(&v));
+                out.push((k, v));
+            }
+            // Grammars are mutually exclusive: count the non-null ones, keep them.
+            Some("regex") | Some("json_schema") | Some("ebnf") => {
+                if !v.is_nil() {
+                    grammars += 1;
+                }
+                out.push((k, v));
+            }
+            // Drop any pre-existing copies of the fields we re-emit below.
+            Some("stop_strs")
+            | Some("stop_str_max_len")
+            | Some("stop_regex_strs")
+            | Some("stop_regex_max_len")
+            | Some("is_normalized") => {}
+            _ => out.push((k, v)),
+        }
+    }
+
+    // --- __post_init__: greedy / top_k special cases ---
     let (temperature, top_k) = if (0.0..SAMPLING_EPS).contains(&temperature_in) {
         // Greedy: temperature ~0 → temperature=1.0, top_k=1.
         (1.0, 1)
@@ -58,20 +125,8 @@ pub fn normalize_sampling_params(sp: &mut Option<Value>) -> Result<(), Error> {
     } else {
         (temperature_in, top_k_in)
     };
-    let top_p = get_f64(&map, "top_p").unwrap_or(1.0);
-    let min_p = get_f64(&map, "min_p").unwrap_or(0.0);
-    let frequency_penalty = get_f64(&map, "frequency_penalty").unwrap_or(0.0);
-    let presence_penalty = get_f64(&map, "presence_penalty").unwrap_or(0.0);
-    let repetition_penalty = get_f64(&map, "repetition_penalty").unwrap_or(1.0);
-    let min_new_tokens = get_i64(&map, "min_new_tokens").unwrap_or(0);
-    // Field default is 128 (not None), so an absent value verifies against 128.
-    let max_new_tokens = get_i64(&map, "max_new_tokens").unwrap_or(128);
-
-    // stop / stop_regex → string lists + match-window lengths. Use the UTF-8 byte
-    // length as a safe upper bound on the token count.
-    let stop_strs = to_string_list(find(&map, "stop"));
+    // Match window: UTF-8 byte length is a safe upper bound on the token count.
     let stop_str_max_len = stop_strs.iter().map(|s| s.len() as i64).max().unwrap_or(0);
-    let stop_regex_strs = to_string_list(find(&map, "stop_regex"));
     let stop_regex_max_len = if stop_regex_strs.is_empty() {
         0
     } else {
@@ -125,42 +180,48 @@ pub fn normalize_sampling_params(sp: &mut Option<Value>) -> Result<(), Error> {
             "min_new_tokens must be in [0, max_new_tokens({max_new_tokens})], got {min_new_tokens}"
         )));
     }
-    // Grammars are mutually exclusive.
-    let grammars = ["regex", "json_schema", "ebnf"]
-        .iter()
-        .filter(|k| present_non_null(&map, k))
-        .count();
+    // Grammars are mutually exclusive (count taken during the pass above).
     if grammars > 1 {
         return Err(bad(
             "Only one of regex, json_schema, or ebnf can be set".into()
         ));
     }
 
-    // --- write the normalized fields back; is_normalized=true tells the
-    // scheduler its __post_init__/normalize/verify are already done ---
-    set(&mut map, "temperature", Value::F64(temperature));
-    set(&mut map, "top_k", Value::from(top_k));
-    set(&mut map, "top_p", Value::F64(top_p));
-    set(&mut map, "min_p", Value::F64(min_p));
-    set(&mut map, "frequency_penalty", Value::F64(frequency_penalty));
-    set(&mut map, "presence_penalty", Value::F64(presence_penalty));
-    set(
-        &mut map,
-        "repetition_penalty",
+    // --- emit the normalized fields; is_normalized=true tells the scheduler its
+    // __post_init__/normalize/verify are already done ---
+    out.push((Value::from("temperature"), Value::F64(temperature)));
+    out.push((Value::from("top_k"), Value::from(top_k)));
+    out.push((Value::from("top_p"), Value::F64(top_p)));
+    out.push((Value::from("min_p"), Value::F64(min_p)));
+    out.push((
+        Value::from("frequency_penalty"),
+        Value::F64(frequency_penalty),
+    ));
+    out.push((
+        Value::from("presence_penalty"),
+        Value::F64(presence_penalty),
+    ));
+    out.push((
+        Value::from("repetition_penalty"),
         Value::F64(repetition_penalty),
-    );
-    set(&mut map, "min_new_tokens", Value::from(min_new_tokens));
-    set(&mut map, "stop_strs", string_array(&stop_strs));
-    set(&mut map, "stop_str_max_len", Value::from(stop_str_max_len));
-    set(&mut map, "stop_regex_strs", string_array(&stop_regex_strs));
-    set(
-        &mut map,
-        "stop_regex_max_len",
+    ));
+    out.push((Value::from("min_new_tokens"), Value::from(min_new_tokens)));
+    out.push((Value::from("stop_strs"), string_array(&stop_strs)));
+    out.push((
+        Value::from("stop_str_max_len"),
+        Value::from(stop_str_max_len),
+    ));
+    out.push((
+        Value::from("stop_regex_strs"),
+        string_array(&stop_regex_strs),
+    ));
+    out.push((
+        Value::from("stop_regex_max_len"),
         Value::from(stop_regex_max_len),
-    );
-    set(&mut map, "is_normalized", Value::Boolean(true));
+    ));
+    out.push((Value::from("is_normalized"), Value::Boolean(true)));
 
-    *sp = Some(Value::Map(map));
+    *sp = Some(Value::Map(out));
     Ok(())
 }
 
@@ -168,16 +229,10 @@ fn bad(msg: String) -> Error {
     Error::Validation(msg)
 }
 
-fn find<'a>(map: &'a [(Value, Value)], key: &str) -> Option<&'a Value> {
-    map.iter()
-        .find(|(k, _)| k.as_str() == Some(key))
-        .map(|(_, v)| v)
-}
-
-/// A present-but-null value reads as absent (→ default), matching Python's
-/// `x if x is not None else default` coercion.
-fn get_f64(map: &[(Value, Value)], key: &str) -> Option<f64> {
-    match find(map, key)? {
+/// Coerce a value to f64 (int or float); non-numeric (incl. null) → None, so the
+/// caller keeps its default — matching Python's `x if x is not None else default`.
+fn as_f64(v: &Value) -> Option<f64> {
+    match v {
         Value::F64(f) => Some(*f),
         Value::F32(f) => Some(*f as f64),
         Value::Integer(i) => i.as_f64(),
@@ -185,17 +240,13 @@ fn get_f64(map: &[(Value, Value)], key: &str) -> Option<f64> {
     }
 }
 
-fn get_i64(map: &[(Value, Value)], key: &str) -> Option<i64> {
-    match find(map, key)? {
+fn as_i64(v: &Value) -> Option<i64> {
+    match v {
         Value::Integer(i) => i.as_i64(),
         Value::F64(f) => Some(*f as i64),
         Value::F32(f) => Some(*f as i64),
         _ => None,
     }
-}
-
-fn present_non_null(map: &[(Value, Value)], key: &str) -> bool {
-    matches!(find(map, key), Some(v) if !v.is_nil())
 }
 
 /// `stop` / `stop_regex` accept a single string or a list of strings; null/absent
@@ -213,14 +264,6 @@ fn to_string_list(v: Option<&Value>) -> Vec<String> {
 
 fn string_array(strs: &[String]) -> Value {
     Value::Array(strs.iter().map(|s| Value::from(s.as_str())).collect())
-}
-
-fn set(map: &mut Vec<(Value, Value)>, key: &str, val: Value) {
-    if let Some(slot) = map.iter_mut().find(|(k, _)| k.as_str() == Some(key)) {
-        slot.1 = val;
-    } else {
-        map.push((Value::from(key), val));
-    }
 }
 
 #[cfg(test)]
@@ -242,7 +285,10 @@ mod tests {
     }
 
     fn get<'a>(m: &'a [(Value, Value)], k: &str) -> &'a Value {
-        find(m, k).unwrap()
+        m.iter()
+            .find(|(kk, _)| kk.as_str() == Some(k))
+            .map(|(_, v)| v)
+            .unwrap()
     }
 
     #[test]
@@ -288,6 +334,28 @@ mod tests {
         let m = norm(&[("temperature", Value::F64(0.0))]);
         assert_eq!(get(&m, "stop_str_max_len").as_i64(), Some(0));
         assert_eq!(get(&m, "stop_strs"), &Value::Array(vec![]));
+    }
+
+    /// The single pass must carry unknown fields through untouched and must not
+    /// duplicate a field it normalizes (client-sent temperature is replaced, not
+    /// appended alongside the original).
+    #[test]
+    fn passthrough_preserved_and_normalized_fields_not_duplicated() {
+        let m = norm(&[
+            ("temperature", Value::F64(0.7)),
+            ("max_new_tokens", Value::from(64i64)),
+            ("ignore_eos", Value::Boolean(true)),
+        ]);
+        // Unknown / read-only fields survive verbatim.
+        assert_eq!(get(&m, "max_new_tokens").as_i64(), Some(64));
+        assert_eq!(get(&m, "ignore_eos"), &Value::Boolean(true));
+        // Exactly one temperature entry, holding the normalized value.
+        let temps: Vec<_> = m
+            .iter()
+            .filter(|(k, _)| k.as_str() == Some("temperature"))
+            .collect();
+        assert_eq!(temps.len(), 1);
+        assert_eq!(temps[0].1, Value::F64(0.7));
     }
 
     #[test]
