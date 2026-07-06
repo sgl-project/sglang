@@ -100,8 +100,6 @@ def _run_kernel(
     seq_lens: torch.Tensor | None = None,
     seq_lens_dtype: torch.dtype = torch.int32,
     req_pool_indices: torch.Tensor | None = None,
-    req_to_token: torch.Tensor | None = None,
-    full_to_hisparse_device_index_mapping: torch.Tensor | None = None,
     num_real_reqs: int | None = None,
 ) -> torch.Tensor:
     batch_size = top_k_tokens.shape[0]
@@ -132,8 +130,6 @@ def _run_kernel(
         page_size=1,
         block_size=256,
         num_real_reqs=torch.tensor([num_real_reqs], dtype=torch.int32, device=DEVICE),
-        req_to_token=req_to_token,
-        full_to_hisparse_device_index_mapping=full_to_hisparse_device_index_mapping,
     )
     torch.cuda.synchronize()
     return out
@@ -369,40 +365,6 @@ def test_load_cache_to_device_buffer_miss_uses_updated_lru_slot() -> None:
         state["lru_slots"].cpu(), torch.tensor([[3, 1, 2, 0]], dtype=torch.int16)
     )
     assert torch.equal(state["device_buffer"][9].cpu(), state["host_cache"][6])
-
-
-def test_load_cache_to_device_buffer_resident_row_translates_logical_locs() -> None:
-    state = _long_case()
-    state["device_buffer_locs"][0, 0] = -1
-    device_buffer_before = state["device_buffer"].clone()
-    device_buffer_tokens_before = state["device_buffer_tokens"].clone()
-    lru_slots_before = state["lru_slots"].clone()
-
-    req_to_token = torch.tensor(
-        [[5, 2, 8, 1, 4, 7, 9, 3]], dtype=torch.int32, device=DEVICE
-    )
-    full_to_hisparse_device_index_mapping = torch.full(
-        (16,), -1, dtype=torch.int64, device=DEVICE
-    )
-    resident_locs = torch.tensor(
-        [40, 41, 42, 43, 44, 45, 46, 47], dtype=torch.int64, device=DEVICE
-    )
-    full_to_hisparse_device_index_mapping[req_to_token[0].long()] = resident_locs
-
-    out = _run_kernel(
-        top_k_tokens=torch.tensor([[6, 2, 0, 7]], dtype=torch.int32, device=DEVICE),
-        seq_len=8,
-        req_to_token=req_to_token,
-        full_to_hisparse_device_index_mapping=full_to_hisparse_device_index_mapping,
-        **state,
-    )
-
-    assert torch.equal(out.cpu(), torch.tensor([[46, 42, 40, 47]], dtype=torch.int32))
-    assert torch.equal(state["device_buffer"].cpu(), device_buffer_before.cpu())
-    assert torch.equal(
-        state["device_buffer_tokens"].cpu(), device_buffer_tokens_before.cpu()
-    )
-    assert torch.equal(state["lru_slots"].cpu(), lru_slots_before.cpu())
 
 
 def test_load_cache_to_device_buffer_multiple_misses_copy_all_slots() -> None:
