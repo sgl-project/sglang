@@ -1,18 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 """Helpers for lowering GPTQ/AWQ int4 weights to the torch XPU int4pack layout.
-
-The native op is ``torch.ops.aten._weight_int4pack_mm(A, B, group_size, qsz)``:
-
-* ``A``    : ``[M, K]`` fp16/bf16 activation (2D, contiguous).
-* ``B``    : ``[N, K // 2]`` uint8 packed weight. Within each byte the low
-             nibble is the *even* ``k`` and the high nibble is the *odd* ``k``;
-             nibble values are the raw quant codes ``q in [0, 15]``.
-* ``qsz``  : ``[K // group_size, N, 2]`` tensor (activation dtype) whose last
-             dim is ``[scale, zero]``.
-
-The kernel dequantizes as ``W = (q - 8) * scale + zero``. Both GPTQ and AWQ use
-``W = (q - zp) * scale``, so we fold the integer zero-point into a float
-``zero = scale * (8 - zp)``.
 """
 
 from __future__ import annotations

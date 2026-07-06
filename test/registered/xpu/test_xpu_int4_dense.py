@@ -1,9 +1,4 @@
 """Numeric unit tests for the XPU int4 *dense* linear kernels (GPTQ / AWQ).
-
-Fast, deterministic, network-free: builds synthetic int4 weights in-memory and
-checks that the XPU int4pack kernels dequantize + matmul correctly against a
-pure-torch ``W = (q - zp) * scale`` reference. Gates every PR via
-``stage-a-test-1-gpu-xpu``.
 """
 
 import unittest

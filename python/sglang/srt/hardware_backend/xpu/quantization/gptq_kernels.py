@@ -1,16 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""GPTQ int4 dense linear for Intel XPU via torch ``_weight_int4pack_mm``.
-
-GPTQ stores ``W = (q - zp) * scale`` with codes packed 8-per-int32 sequentially:
-``qweight`` packs along the K (input) dim, ``qzeros`` along the N (output) dim.
-We deinterleave to the torch int4pack layout at load time. Two GPTQ subtleties:
-
-* ``checkpoint_format`` v1 vs v2: v1 zero-points are stored off-by-one, so the
-  effective zero-point is ``unpacked_qzero + 1`` (v2 uses it as-is).
-* ``desc_act`` (act_order): input channels are permuted by activation order, so
-  groups are non-contiguous in K. ``_weight_int4pack_mm`` requires contiguous
-  grouping, so we sort the weight's K dim by ``g_idx`` at load time and gather
-  the activation by the same permutation at runtime.
+"""GPTQ int4 dense linear for Intel XPU.
 """
 
 from __future__ import annotations

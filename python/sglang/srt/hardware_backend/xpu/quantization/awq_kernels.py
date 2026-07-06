@@ -1,10 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""AWQ int4 dense linear for Intel XPU via torch ``_weight_int4pack_mm``.
-
-AWQ stores (per output-group) ``W = (q - zp) * scale`` with the quant codes
-``q`` and zero-points ``zp`` packed 8-per-int32 in AutoAWQ's interleaved order.
-We deinterleave them into the torch int4pack layout at load time so inference is
-a single fused dequant+GEMM (M=1) / dequant+oneDNN matmul (M>1).
+"""AWQ int4 dense linear for Intel XPU.
 """
 
 from __future__ import annotations
