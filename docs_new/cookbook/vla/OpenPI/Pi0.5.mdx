@@ -256,6 +256,40 @@ async def main():
 asyncio.run(main())
 ```
 
+### 4.4 Native Runtime Internals
+
+Pi0.5 is implemented as a native VLA/action-policy pipeline, not as an SRT LLM serving engine. The main files are:
+
+| Area | File | Main Types / Methods |
+| --- | --- | --- |
+| Pipeline wiring | `python/sglang/multimodal_gen/runtime/pipelines/pi05.py` | `Pi05Pipeline.load_modules`, `Pi05Pipeline.create_pipeline_stages` |
+| Pipeline stages | `python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/pi05.py` | `Pi05PreprocessStage`, `Pi05PrefixStage`, `Pi05ActionDenoisingStage`, `Pi05PostprocessStage` |
+| Preprocessing | `python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/pi05_preprocess.py` | `Pi05Preprocessor` |
+| VLA observation batch | `python/sglang/multimodal_gen/runtime/utils/vla_observation.py` | `VLAObservationBatch`, `collate_vla_observation_batches`, `stable_tensor_sha256` |
+| Prefix cache | `python/sglang/multimodal_gen/runtime/cache/vla_prefix_cache.py` | `PrefixContext`, `VLAPrefixCacheKey`, `VLAPrefixCacheManager` |
+| Denoise CUDA graph | `python/sglang/multimodal_gen/runtime/utils/vla_denoise_graph.py` | `VLADenoiseShapeBucket`, `VLADenoiseGraphRunner.capture_or_run` |
+| Pi0.5 policy model | `python/sglang/multimodal_gen/runtime/models/vlas/pi05_policy.py` | `Pi05PolicyModel.encode_prefix`, `Pi05PolicyModel.sample_actions`, `Pi05PolicyModel.denoise_step` |
+| Pi0.5 core modules | `python/sglang/multimodal_gen/runtime/models/vlas/pi05_core.py` | `Pi05CoreModel`, `PaliGemmaWithExpertModel` |
+| PiGemma layers | `python/sglang/multimodal_gen/runtime/models/vlas/pi05_pigemma.py` | `PiGemmaModel`, `PiGemmaAttention`, `PiGemmaRMSNorm` |
+
+`VLAObservationBatch` is the normalized typed batch that crosses the preprocess, prefix, and action stages. It is not the raw OpenPI websocket observation. For one Pi0.5 request, `Pi05Preprocessor` converts input images, state, task text, optional token overrides, and optional initial noise into:
+
+| Field | Shape / Meaning |
+| --- | --- |
+| `prompt` | `list[str]`, one prompt per batch item. Pi0.5 v1 accepts one prompt per request before grouped execution. |
+| `images` | `dict[camera_name, torch.Tensor]`; each tensor is `BCHW` float32, resized/padded to `image_size`, and normalized to `[-1, 1]`. |
+| `image_masks` | `dict[camera_name, torch.BoolTensor]`; marks whether each camera frame is real or an empty camera placeholder. |
+| `state` | optional `torch.FloatTensor` with shape `[B, state_dim]`. |
+| `noise` | optional `torch.FloatTensor` with shape `[B, action_horizon, action_dim]` for deterministic debugging. |
+| `tokens`, `token_masks` | tokenized task/state prompt and attention mask for the PaliGemma prefix path. |
+| `metadata` | camera order and image hashes. These feed grouped-request fingerprints and exact prefix-cache keys. |
+
+Grouped Python execution uses `collate_vla_observation_batches` to combine compatible single-request `VLAObservationBatch` objects. The prefix stage then runs one batched SigLIP/PaliGemma prefix forward, stores a grouped `PrefixContext`, and slices per-request `PrefixContext` handles for output bookkeeping.
+
+`PrefixContext` is the dense request-local prefix state reused by all denoise steps. It contains prefix `past_key_values`, prefix padding masks, prefix position ids, dtype/device/layout metadata, and an optional cache-key digest. The global prefix cache stores whole `PrefixContext` objects behind an SRT `RadixCache`-style key, but v1 only accepts exact full-prefix matches. Partial prefix hits are rejected because visual/language/state prefix blocks use full-attention semantics rather than causal text-prefix semantics.
+
+The VLA CUDA graph path is based on SRT's piecewise CUDA graph mechanism via `enable_tc_piecewise_cuda_graph`. It does not capture the whole policy pipeline. `VLADenoiseGraphRunner` captures one action-expert denoise step per `VLADenoiseShapeBucket`, where the bucket includes batch size, prefix length, action horizon, action dim, dtype, and parallel layout. During replay, the runner copies the current `x_t`, timestep, and changed `PrefixContext` into static graph buffers, replays the captured step for each flow-matching timestep, and returns the static output tensor. If capture or replay fails for a bucket, that bucket is disabled and the path falls back to eager action-expert execution.
+
 ## 5. Configuration Tips
 
 - Request-local `PrefixContext` is always reused across all denoise steps in one request. The prefix K/V is not cloned per step.
