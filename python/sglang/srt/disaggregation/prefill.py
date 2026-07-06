@@ -44,6 +44,7 @@ from sglang.srt.disaggregation.utils import (
     is_aborted,
     is_dsv4_c128_online_enabled,
     is_mla_backend,
+    log_dsv4_kv_components,
     poll_and_all_reduce_attn_cp_tp_group,
     prepare_abort,
     setup_state_kv_args,
@@ -160,6 +161,11 @@ class PrefillBootstrapQueue:
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
             self.token_to_kv_pool.get_contiguous_buf_infos()
         )
+        kv_data_names = (
+            self.token_to_kv_pool.get_contiguous_buf_names()
+            if hasattr(self.token_to_kv_pool, "get_contiguous_buf_names")
+            else []
+        )
 
         if self.draft_token_to_kv_pool is not None:
             # We should also transfer draft model kv cache. The indices are
@@ -167,13 +173,20 @@ class PrefillBootstrapQueue:
             draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
                 self.draft_token_to_kv_pool.get_contiguous_buf_infos()
             )
+            draft_kv_data_names = (
+                self.draft_token_to_kv_pool.get_contiguous_buf_names()
+                if hasattr(self.draft_token_to_kv_pool, "get_contiguous_buf_names")
+                else [f"draft_idx{i}" for i in range(len(draft_kv_data_ptrs))]
+            )
             kv_data_ptrs += draft_kv_data_ptrs
             kv_data_lens += draft_kv_data_lens
             kv_item_lens += draft_kv_item_lens
+            kv_data_names += [f"draft:{name}" for name in draft_kv_data_names]
 
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
         kv_args.kv_item_lens = kv_item_lens
+        kv_args.kv_data_names = kv_data_names
         if not self.is_mla_backend:
             kv_args.kv_head_num = self.token_to_kv_pool.head_num
             kv_args.total_kv_head_num = (
@@ -202,6 +215,7 @@ class PrefillBootstrapQueue:
             kv_args.mla_compression_ratios = list(
                 self.token_to_kv_pool.compression_ratios
             )
+        log_dsv4_kv_components(kv_args, "[dsv4-kv-pd] prefill ")
 
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
         kv_manager = kv_manager_class(

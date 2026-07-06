@@ -661,8 +661,65 @@ def _is_env_enabled(name: str) -> bool:
     return os.getenv(name, "").lower() in ("1", "true", "yes", "on")
 
 
+def _trace_kv_pd_target_len() -> Optional[int]:
+    raw = os.getenv("SGLANG_DSV4_TRACE_KV_PD_TARGET_LEN", "7345537024")
+    try:
+        value = int(raw)
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
 def _state_type_name(state_type) -> str:
     return getattr(state_type, "value", str(state_type))
+
+
+def log_dsv4_kv_components(kv_args: KVArgs, prefix: str) -> None:
+    if not _is_env_enabled("SGLANG_DSV4_TRACE_KV_PD"):
+        return
+
+    data_lens = list(getattr(kv_args, "kv_data_lens", []) or [])
+    item_lens = list(getattr(kv_args, "kv_item_lens", []) or [])
+    names = list(getattr(kv_args, "kv_data_names", []) or [])
+    if not data_lens:
+        logger.warning("%s[dsv4-kv-pd] KV descriptors <empty>", prefix)
+        return
+
+    target_len = _trace_kv_pd_target_len()
+    max_idx = max(range(len(data_lens)), key=lambda i: data_lens[i])
+    interesting_indices = list(range(min(8, len(data_lens)))) + [max_idx]
+    if target_len is not None:
+        interesting_indices.extend(
+            i for i, length in enumerate(data_lens) if length == target_len
+        )
+    seen = set()
+    interesting_indices = [
+        i for i in interesting_indices if not (i in seen or seen.add(i))
+    ]
+
+    def entry(i: int) -> str:
+        name = names[i] if i < len(names) else f"idx{i}"
+        item_len = item_lens[i] if i < len(item_lens) else None
+        return f"{i}:{name}:len={data_lens[i]}:item={item_len}"
+
+    matches = (
+        [entry(i) for i, length in enumerate(data_lens) if length == target_len]
+        if target_len is not None
+        else []
+    )
+    logger.warning(
+        "%s[dsv4-kv-pd] KV descriptors count=%s names=%s total=%s "
+        "page_size=%s max=%s target_len=%s matches=%s sample=%s",
+        prefix,
+        len(data_lens),
+        len(names),
+        sum(data_lens),
+        getattr(kv_args, "page_size", None),
+        entry(max_idx),
+        target_len,
+        matches or "<none>",
+        [entry(i) for i in interesting_indices],
+    )
 
 
 def _drop_state_component(kv_args: KVArgs, state_type: StateType) -> int:

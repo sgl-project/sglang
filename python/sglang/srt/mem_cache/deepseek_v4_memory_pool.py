@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import nullcontext
 from typing import List, Literal, NamedTuple, Optional, Tuple
 
@@ -29,6 +30,19 @@ logger = logging.getLogger(__name__)
 _is_hip = is_hip()
 
 ONLINE_C128 = not _is_hip and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
+
+
+def _is_env_enabled(name: str) -> bool:
+    return os.getenv(name, "").lower() in ("1", "true", "yes", "on")
+
+
+def _trace_kv_pd_target_len() -> Optional[int]:
+    raw = os.getenv("SGLANG_DSV4_TRACE_KV_PD_TARGET_LEN", "7345537024")
+    try:
+        value = int(raw)
+    except ValueError:
+        return None
+    return value if value > 0 else None
 
 
 def get_compress_state_ring_size(
@@ -520,6 +534,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         self.c4_state_dtype = c4_state_dtype
         self.c128_state_dtype = c128_state_dtype
         self.compression_ratios = compression_ratios
+        self._last_contiguous_buf_names: List[str] = []
         self.online_mtp_max_draft_tokens = online_mtp_max_draft_tokens
         self.online_c128_state_num_req_slots = c128_state_pool_size
         self.online_c128_mtp_pending_seq_lens: Optional[torch.Tensor] = None
@@ -659,10 +674,69 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         assert self.full_to_swa_index_mapping is not None
         return self.full_to_swa_index_mapping[kv_indices]
 
+    def get_contiguous_buf_names(self) -> List[str]:
+        return list(self._last_contiguous_buf_names)
+
+    def _log_contiguous_buf_infos(
+        self,
+        mode: str,
+        names: List[str],
+        data_lens: List[int],
+        item_lens: List[int],
+    ) -> None:
+        if not _is_env_enabled("SGLANG_DSV4_TRACE_KV_PD"):
+            return
+        if not data_lens:
+            logger.warning("[dsv4-kv-pd] contiguous buffers mode=%s <empty>", mode)
+            return
+
+        target_len = _trace_kv_pd_target_len()
+        max_idx = max(range(len(data_lens)), key=lambda i: data_lens[i])
+        interesting_indices = list(range(min(8, len(data_lens)))) + [max_idx]
+        if target_len is not None:
+            interesting_indices.extend(
+                i for i, length in enumerate(data_lens) if length == target_len
+            )
+        seen = set()
+        interesting_indices = [
+            i for i in interesting_indices if not (i in seen or seen.add(i))
+        ]
+
+        def entry(i: int) -> str:
+            name = names[i] if i < len(names) else f"idx{i}"
+            return f"{i}:{name}:len={data_lens[i]}:item={item_lens[i]}"
+
+        matches = (
+            [entry(i) for i, length in enumerate(data_lens) if length == target_len]
+            if target_len is not None
+            else []
+        )
+        logger.warning(
+            "[dsv4-kv-pd] contiguous buffers mode=%s count=%s total=%s "
+            "page_size=%s stage=[%s,%s) max=%s target_len=%s matches=%s sample=%s",
+            mode,
+            len(data_lens),
+            sum(data_lens),
+            self.page_size,
+            self._stage_start,
+            self._stage_end,
+            entry(max_idx),
+            target_len,
+            matches or "<none>",
+            [entry(i) for i in interesting_indices],
+        )
+
     def get_contiguous_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
         data_ptrs: List[int] = []
         data_lens: List[int] = []
         item_lens: List[int] = []
+        names: List[str] = []
+
+        def append_buf(name: str, ptr: int, data_len: int, item_len: int) -> None:
+            data_ptrs.append(ptr)
+            data_lens.append(data_len)
+            item_lens.append(item_len)
+            names.append(name)
 
         if self._unified_kv:
             # Unified buffer per layer: [swa_pages + compress_pages, head_dim].
@@ -680,38 +754,83 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 row_bytes = buf[0].nbytes
                 rows_per_page = self.page_size // ratio
                 compress_rows = buf.shape[0] - swa_pages
-                data_ptrs.append(buf.data_ptr() + swa_pages * row_bytes)
-                data_lens.append(compress_rows * row_bytes)
-                item_lens.append(rows_per_page * row_bytes)
+                append_buf(
+                    (
+                        f"unified_c{ratio}(layer={self._stage_start + local_layer_id},"
+                        f"local={local_layer_id})"
+                    ),
+                    buf.data_ptr() + swa_pages * row_bytes,
+                    compress_rows * row_bytes,
+                    rows_per_page * row_bytes,
+                )
 
             c4_locals = [i for i, r in enumerate(stage_ratios) if r == 4]
             c128_locals = [i for i, r in enumerate(stage_ratios) if r == 128]
 
             for i in c4_locals:
                 _append_compressed_entry(i, 4)
-            for buf in self.c4_indexer_kv_pool.index_k_with_scale_buffer:
+            for local_layer_id, buf in zip(
+                c4_locals, self.c4_indexer_kv_pool.index_k_with_scale_buffer
+            ):
                 assert buf.ndim == 2, f"expected 2D buffer, got {buf.ndim}D"
-                data_ptrs.append(buf.data_ptr())
-                data_lens.append(buf.nbytes)
-                item_lens.append(buf[0].nbytes)
+                append_buf(
+                    (
+                        f"c4_indexer(layer={self._stage_start + local_layer_id},"
+                        f"local={local_layer_id})"
+                    ),
+                    buf.data_ptr(),
+                    buf.nbytes,
+                    buf[0].nbytes,
+                )
             for i in c128_locals:
                 _append_compressed_entry(i, 128)
 
+            self._last_contiguous_buf_names = names
+            self._log_contiguous_buf_infos("unified", names, data_lens, item_lens)
             return data_ptrs, data_lens, item_lens
 
-        buf_groups = [
-            self.c4_kv_pool.kv_buffer,
-            self.c4_indexer_kv_pool.index_k_with_scale_buffer,
-            self.c128_kv_pool.kv_buffer,
-        ]
+        stage_ratios = self.compression_ratios[self._stage_start : self._stage_end]
+        c4_locals = [i for i, r in enumerate(stage_ratios) if r == 4]
+        c128_locals = [i for i, r in enumerate(stage_ratios) if r == 128]
 
-        for bufs in buf_groups:
-            for buf in bufs:
-                assert buf.ndim == 2, f"expected 2D buffer, got {buf.ndim}D"
-                data_ptrs.append(buf.data_ptr())
-                data_lens.append(buf.nbytes)
-                item_lens.append(buf[0].nbytes)
+        for local_layer_id, buf in zip(c4_locals, self.c4_kv_pool.kv_buffer):
+            assert buf.ndim == 2, f"expected 2D buffer, got {buf.ndim}D"
+            append_buf(
+                (
+                    f"c4(layer={self._stage_start + local_layer_id},"
+                    f"local={local_layer_id})"
+                ),
+                buf.data_ptr(),
+                buf.nbytes,
+                buf[0].nbytes,
+            )
+        for local_layer_id, buf in zip(
+            c4_locals, self.c4_indexer_kv_pool.index_k_with_scale_buffer
+        ):
+            assert buf.ndim == 2, f"expected 2D buffer, got {buf.ndim}D"
+            append_buf(
+                (
+                    f"c4_indexer(layer={self._stage_start + local_layer_id},"
+                    f"local={local_layer_id})"
+                ),
+                buf.data_ptr(),
+                buf.nbytes,
+                buf[0].nbytes,
+            )
+        for local_layer_id, buf in zip(c128_locals, self.c128_kv_pool.kv_buffer):
+            assert buf.ndim == 2, f"expected 2D buffer, got {buf.ndim}D"
+            append_buf(
+                (
+                    f"c128(layer={self._stage_start + local_layer_id},"
+                    f"local={local_layer_id})"
+                ),
+                buf.data_ptr(),
+                buf.nbytes,
+                buf[0].nbytes,
+            )
 
+        self._last_contiguous_buf_names = names
+        self._log_contiguous_buf_infos("split", names, data_lens, item_lens)
         return data_ptrs, data_lens, item_lens
 
     def get_unified_swa_ring_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
