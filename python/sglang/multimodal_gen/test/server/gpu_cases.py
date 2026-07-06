@@ -21,6 +21,8 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     DiffusionTestCase,
     IDEOGRAM4_CI_sampling_params,
     JOY_ECHO_T2V_CI_sampling_params,
+    LONGLIVE2_I2V_CI_sampling_params,
+    LONGLIVE2_T2V_CI_sampling_params,
     LINGBOT_WORLD_REALTIME_sampling_params,
     MODELOPT_QWEN_IMAGE_2512_NVFP4_CI_sampling_params,
     MODELOPT_T2I_CI_sampling_params,
@@ -261,6 +263,17 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         run_consistency_check=True,
         run_component_accuracy_check=False,
     ),
+    DiffusionTestCase(
+        "longlive2_t2v",
+        DiffusionServerArgs(
+            model_path="Rabinovich/LongLive-2.0-5B-Diffusers",
+            modality="video",
+        ),
+        LONGLIVE2_T2V_CI_sampling_params,
+        run_perf_check=False,
+        run_consistency_check=True,
+        run_component_accuracy_check=False,
+    ),
     # TeaCache acceleration test for Wan video model
     DiffusionTestCase(
         "wan2_1_t2v_1.3b_teacache_enabled",
@@ -378,6 +391,19 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         ),
         SANA_WM_TI2V_CI_sampling_params,
         run_perf_check=False,
+        run_component_accuracy_check=False,
+        run_models_api_check=False,
+        run_t2v_input_reference_check=False,
+    ),
+    DiffusionTestCase(
+        "longlive2_i2v",
+        DiffusionServerArgs(
+            model_path="Rabinovich/LongLive-2.0-5B-Diffusers",
+            modality="video",
+        ),
+        LONGLIVE2_I2V_CI_sampling_params,
+        run_perf_check=False,
+        run_consistency_check=True,
         run_component_accuracy_check=False,
         run_models_api_check=False,
         run_t2v_input_reference_check=False,
