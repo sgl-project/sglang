@@ -859,6 +859,15 @@ class Req(ReqDllmMixin):
         # time and used to estimate uncached tokens / sort by longest prefix for
         # load reporting.
         self.num_matched_prefix_tokens = 0
+        # Epoch-memoized prefix-match cache (see match_prefix_for_req). Lets
+        # SchedulePolicy.calc_priority skip re-matching this request against the
+        # radix tree while the tree is unchanged since the last match.
+        # _match_epoch is the tree's mutation epoch at that match, _match_token_len
+        # the length of the matched (origin+output) span, and _match_result the
+        # cached MatchResult to re-apply on a hit.
+        self._match_epoch: int = -1
+        self._match_token_len: int = -1
+        self._match_result: Any = None
         # Tokens loaded from storage backend (L3) during prefetch for this request
         self.storage_hit_length = 0
         # The node to lock until for swa radix tree lock ref
@@ -1447,6 +1456,10 @@ class Req(ReqDllmMixin):
         self.last_node = None
         self.cache_protected_len = 0
         self.num_matched_prefix_tokens = 0
+        # Invalidate the epoch-memoized match cache: the retracted request will be
+        # re-matched from scratch on re-admission.
+        self._match_epoch = -1
+        self._match_result = None
         self.swa_uuid_for_lock = None
         self.swa_prefix_lock_released = False
         self.extend_input_len = 0
