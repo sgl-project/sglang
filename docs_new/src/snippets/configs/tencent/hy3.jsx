@@ -246,7 +246,6 @@ sgl-eval run aime26 \\
       verified: true,
       env: [],
       flags: [
-        "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--reasoning-parser auto",
         "--tool-call-parser auto",
@@ -264,7 +263,6 @@ sgl-eval run aime26 \\
       verified: true,
       env: [],
       flags: [
-        "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--reasoning-parser auto",
         "--tool-call-parser auto",
@@ -277,7 +275,6 @@ sgl-eval run aime26 \\
       match: { hw: "h200", variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "single" },
       env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024"],
       flags: [
-        "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--reasoning-parser auto",
         "--tool-call-parser auto",
@@ -297,7 +294,6 @@ sgl-eval run aime26 \\
       match: { hw: "b200", variant: "default", quant: "bf16", strategy: "low-latency", nodes: "single" },
       env: [],
       flags: [
-        "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--reasoning-parser auto",
         "--tool-call-parser auto",
@@ -315,7 +311,6 @@ sgl-eval run aime26 \\
       match: { hw: "b200", variant: "default", quant: "bf16", strategy: "balanced", nodes: "single" },
       env: [],
       flags: [
-        "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--reasoning-parser auto",
         "--tool-call-parser auto",
@@ -329,7 +324,6 @@ sgl-eval run aime26 \\
       match: { hw: "b200", variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "single" },
       env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024"],
       flags: [
-        "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--reasoning-parser auto",
         "--tool-call-parser auto",
@@ -350,7 +344,6 @@ sgl-eval run aime26 \\
       match: { hw: "b300", variant: "default", quant: "bf16", strategy: "low-latency", nodes: "single" },
       env: [],
       flags: [
-        "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--reasoning-parser auto",
         "--tool-call-parser auto",
@@ -368,7 +361,6 @@ sgl-eval run aime26 \\
       match: { hw: "b300", variant: "default", quant: "bf16", strategy: "balanced", nodes: "single" },
       env: [],
       flags: [
-        "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--reasoning-parser auto",
         "--tool-call-parser auto",
@@ -382,7 +374,6 @@ sgl-eval run aime26 \\
       match: { hw: "b300", variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "single" },
       env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024"],
       flags: [
-        "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--reasoning-parser auto",
         "--tool-call-parser auto",
@@ -403,7 +394,6 @@ sgl-eval run aime26 \\
       match: { hw: "gb300", variant: "default", quant: "bf16", strategy: "low-latency", nodes: "single" },
       env: [],
       flags: [
-        "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--reasoning-parser auto",
         "--tool-call-parser auto",
@@ -421,7 +411,6 @@ sgl-eval run aime26 \\
       match: { hw: "gb300", variant: "default", quant: "bf16", strategy: "balanced", nodes: "single" },
       env: [],
       flags: [
-        "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--reasoning-parser auto",
         "--tool-call-parser auto",
@@ -435,7 +424,6 @@ sgl-eval run aime26 \\
       match: { hw: "gb300", variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "single" },
       env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024"],
       flags: [
-        "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--reasoning-parser auto",
         "--tool-call-parser auto",
@@ -456,7 +444,6 @@ sgl-eval run aime26 \\
       match: { hw: "gb200", variant: "default", quant: "bf16", strategy: "low-latency", nodes: "single" },
       env: [],
       flags: [
-        "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--reasoning-parser auto",
         "--tool-call-parser auto",
@@ -474,7 +461,6 @@ sgl-eval run aime26 \\
       match: { hw: "gb200", variant: "default", quant: "bf16", strategy: "balanced", nodes: "single" },
       env: [],
       flags: [
-        "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--reasoning-parser auto",
         "--tool-call-parser auto",
@@ -488,7 +474,6 @@ sgl-eval run aime26 \\
       match: { hw: "gb200", variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "single" },
       env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024"],
       flags: [
-        "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--reasoning-parser auto",
         "--tool-call-parser auto",
@@ -509,7 +494,6 @@ sgl-eval run aime26 \\
       match: { hw: "h200", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
       env: [],
       flags: [
-        "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--reasoning-parser auto",
         "--tool-call-parser auto",
@@ -527,7 +511,6 @@ sgl-eval run aime26 \\
       match: { hw: "h200", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" },
       env: [],
       flags: [
-        "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--reasoning-parser auto",
         "--tool-call-parser auto",
@@ -541,7 +524,6 @@ sgl-eval run aime26 \\
       match: { hw: "h200", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
       env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024"],
       flags: [
-        "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--reasoning-parser auto",
         "--tool-call-parser auto",
@@ -558,7 +540,6 @@ sgl-eval run aime26 \\
       match: { hw: "b200", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
       env: [],
       flags: [
-        "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--reasoning-parser auto",
         "--tool-call-parser auto",
@@ -577,7 +558,6 @@ sgl-eval run aime26 \\
       match: { hw: "b200", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" },
       env: [],
       flags: [
-        "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--reasoning-parser auto",
         "--tool-call-parser auto",
@@ -592,7 +572,6 @@ sgl-eval run aime26 \\
       match: { hw: "b200", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
       env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024"],
       flags: [
-        "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--reasoning-parser auto",
         "--tool-call-parser auto",
@@ -610,7 +589,6 @@ sgl-eval run aime26 \\
       match: { hw: "b300", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
       env: [],
       flags: [
-        "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--reasoning-parser auto",
         "--tool-call-parser auto",
@@ -629,7 +607,6 @@ sgl-eval run aime26 \\
       match: { hw: "b300", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" },
       env: [],
       flags: [
-        "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--reasoning-parser auto",
         "--tool-call-parser auto",
@@ -644,7 +621,6 @@ sgl-eval run aime26 \\
       match: { hw: "b300", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
       env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024"],
       flags: [
-        "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--reasoning-parser auto",
         "--tool-call-parser auto",
@@ -662,7 +638,6 @@ sgl-eval run aime26 \\
       match: { hw: "gb300", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
       env: [],
       flags: [
-        "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--reasoning-parser auto",
         "--tool-call-parser auto",
@@ -681,7 +656,6 @@ sgl-eval run aime26 \\
       match: { hw: "gb300", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" },
       env: [],
       flags: [
-        "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--reasoning-parser auto",
         "--tool-call-parser auto",
@@ -696,7 +670,6 @@ sgl-eval run aime26 \\
       match: { hw: "gb300", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
       env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024"],
       flags: [
-        "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--reasoning-parser auto",
         "--tool-call-parser auto",
@@ -714,7 +687,6 @@ sgl-eval run aime26 \\
       match: { hw: "gb200", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
       env: [],
       flags: [
-        "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--reasoning-parser auto",
         "--tool-call-parser auto",
@@ -733,7 +705,6 @@ sgl-eval run aime26 \\
       match: { hw: "gb200", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" },
       env: [],
       flags: [
-        "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--reasoning-parser auto",
         "--tool-call-parser auto",
@@ -748,7 +719,6 @@ sgl-eval run aime26 \\
       match: { hw: "gb200", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
       env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024"],
       flags: [
-        "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--reasoning-parser auto",
         "--tool-call-parser auto",
