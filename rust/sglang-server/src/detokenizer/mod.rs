@@ -211,13 +211,7 @@ fn handle_chunk(
     backend: &DetokenizerBackend,
     tm: &flume::Sender<TmEvent>,
 ) {
-    let id = match ev.rid.parse::<u64>() {
-        Ok(v) => RequestId(v),
-        Err(_) => {
-            tracing::warn!(rid = %ev.rid, "detok: unparsable rid");
-            return;
-        }
-    };
+    let id = RequestId(ev.rid); // raw u64 from the wire — no parse
 
     let Some(st) = table.get_mut(&id) else {
         // Late chunk after completion/abort — drop.
@@ -276,7 +270,6 @@ fn handle_chunk(
     // it (and accumulates when a cumulative view is required). `text`/`output_ids`
     // are this chunk's delta; `completion_tokens` is this chunk's token count.
     let output = GenerationOutput {
-        rid: ev.rid,
         text: delta_text,
         output_ids: delta_ids,
         prompt_tokens: ev.prompt_tokens,
@@ -373,7 +366,7 @@ mod tests {
 
         let (tm_tx, tm_rx) = flume::unbounded::<TmEvent>();
         let ev = ChunkEvent {
-            rid: "1".into(),
+            rid: 1,
             token_ids: vec![5],
             ..Default::default() // finish_reason None → non-terminal
         };
