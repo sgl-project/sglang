@@ -104,7 +104,7 @@ sgl-eval run aime26 \\
   },
 
   github: {
-    cookbookModel: "tencent/hy3",
+    cookbookModel: "tencent/Hy3",
   },
 
   playgroundFeatures: {
@@ -450,7 +450,7 @@ sgl-eval run aime26 \\
     },
 
     // ====================================================================
-    // GB200 (sm_100 + aarch64) — TP=4 (inferred from B200)
+    // GB200 (sm_100 + aarch64) — TP=4 (single-node 4×192GB = 768GB fits BF16 552GB)
     // ====================================================================
     {
       match: { hw: "gb200", variant: "default", quant: "bf16", strategy: "low-latency", nodes: "single" },

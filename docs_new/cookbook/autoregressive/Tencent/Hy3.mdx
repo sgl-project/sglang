@@ -115,11 +115,28 @@ import { Playground } from "/src/snippets/_playground.jsx";
 
 **Recommended Generation Parameters:**
 
-| Parameter | Value |
-|---|---|
-| `temperature` | 0.7 |
-| `top_p` | 0.9 |
-| `reasoning_effort` | `high` / `low` (thinking) or `no_think` (instant) |
+<table style={{width: "100%", borderCollapse: "collapse"}}>
+  <thead>
+    <tr style={{borderBottom: "2px solid #0052d9"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.02)"}}>Parameter</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.05)"}}>Value</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>temperature</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>0.7</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>top_p</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>0.9</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>reasoning_effort</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>high</code> / <code>low</code> (thinking) or <code>no_think</code> (instant)</td>
+    </tr>
+  </tbody>
+</table>
 
 **Special tokens.** The shipping Hunyuan tokenizer appends a shared suffix to every special token (e.g. `<tool_calls:TAG>` instead of the bare `<tool_calls>`). SGLang's `hunyuan` parsers resolve the real token strings from the tokenizer vocab at runtime ([PR #29920](https://github.com/sgl-project/sglang/pull/29920)), so the same recipe serves both the preview (suffix-less) and the shipping (suffixed) tokenizer — no per-model hard-coding. This is why `--reasoning-parser hunyuan` / `--tool-call-parser hunyuan` work out of the box on the shipping model.
 
@@ -127,12 +144,42 @@ import { Playground } from "/src/snippets/_playground.jsx";
 
 **Hardware requirements (BF16, ~552GB weights):**
 
-| GPU | VRAM | TP | Notes |
-|---|---|---|---|
-| H200 | 141GB | 8 | minimum single-node for BF16 |
-| B200 | 180GB | 8 | pass `--attention-backend trtllm_mha` |
-| B300 / GB300 | 272GB | 4 | pass `--attention-backend trtllm_mha` |
-| H100 / A100 (80GB) | 80GB | 16+ | multi-node only |
+<table style={{width: "100%", borderCollapse: "collapse"}}>
+  <thead>
+    <tr style={{borderBottom: "2px solid #0052d9"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.02)"}}>GPU</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.05)"}}>VRAM</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.02)"}}>TP</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.05)"}}>Notes</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>H200</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>141GB</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>minimum single-node for BF16</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>B200</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>180GB</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>pass <code>--attention-backend trtllm_mha</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>B300 / GB300</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>272GB</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>4</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>pass <code>--attention-backend trtllm_mha</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>GB200</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>192GB</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>4</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>single-node 4×192GB = 768GB fits BF16; pass <code>--attention-backend trtllm_mha</code></td>
+    </tr>
+  </tbody>
+</table>
 
 **Blackwell attention backend.** The auto-selected attention backend can mis-route for HYV3 on Blackwell (B200 / B300 / GB200 / GB300). Always pass `--attention-backend trtllm_mha` explicitly on Blackwell hardware — the config generator above enforces this.
 
@@ -324,94 +371,6 @@ for idx, buf in tool_buffer.items():
 ```text Output
 I'll check the current weather in Beijing for you using Fahrenheit.
 Tool[0] get_weather({"city": "Beijing", "unit": "fahrenheit"})
-```
-
-</Accordion>
-
-## 4. Benchmark
-
-### 4.1 Accuracy
-
-**Test Environment:**
-
-- Hardware: 8× NVIDIA H200 (141GB)
-- Model: `tencent/Hy3` (BF16)
-- Tensor Parallelism: 8
-- SGLang version: `lmsysorg/sglang:dev` (main)
-
-<Accordion title="GSM8K (sgl-eval, 1-shot)">
-
-```bash Command
-# pip install git+https://github.com/sgl-project/sgl-eval
-sgl-eval run gsm8k \
-  --base-url http://localhost:30000/v1 \
-  --num-threads 32
-```
-
-```text Output
-== gsm8k ==
-1319 examples x 1 repeat  |  327s  |  640 tok/s output
-
-* pass@1  =  95.75%   (8× H200, BF16, TP=8, EAGLE MTP 3-1-4, hunyuan parser)
-  stop_rate = 100.0%    error_rate = 0.0%
-```
-
-</Accordion>
-
-<Accordion title="AIME26 (sgl-eval, thinking)">
-
-```bash Command
-# pip install git+https://github.com/sgl-project/sgl-eval
-sgl-eval run aime26 \
-  --base-url http://localhost:30000/v1 \
-  --model tencent/Hy3 \
-  --n-repeats 1 --max-tokens 28672 \
-  --temperature 0.6 --top-p 0.95 --thinking \
-  --out-dir /sgl-workspace/logs
-```
-
-```text Output
-TODO — replace with real AIME26 accuracy after benchmark run on Hy3 (BF16).
-```
-
-</Accordion>
-
-### 4.2 Speed
-
-<Accordion title="Low Concurrency">
-
-```bash Command
-python3 -m sglang.bench_serving \
-  --backend sglang \
-  --model tencent/Hy3 \
-  --dataset-name random \
-  --random-input-len 1000 \
-  --random-output-len 1000 \
-  --num-prompts 10 \
-  --max-concurrency 1
-```
-
-```text Output
-TODO — replace with real low-concurrency output on Hy3 (BF16).
-```
-
-</Accordion>
-
-<Accordion title="High Concurrency">
-
-```bash Command
-python3 -m sglang.bench_serving \
-  --backend sglang \
-  --model tencent/Hy3 \
-  --dataset-name random \
-  --random-input-len 1000 \
-  --random-output-len 1000 \
-  --num-prompts 500 \
-  --max-concurrency 100
-```
-
-```text Output
-TODO — replace with real high-concurrency output on Hy3 (BF16).
 ```
 
 </Accordion>
