@@ -1535,6 +1535,47 @@ class DSparkWorkerV2(BaseSpecWorker):
                 "error": str(e)
             }
 
+    def _prefill_tail_replay_history_debug(
+        self, req_pool_idx: int
+    ) -> Optional[dict]:
+        payload = self._prefill_tail_replay_debug_by_req_pool.get(int(req_pool_idx))
+        if not isinstance(payload, dict):
+            return None
+        out = {
+            key: payload.get(key)
+            for key in (
+                "round_has_payload",
+                "executed",
+                "mask_valid_count",
+                "valid_write_count",
+                "tail_len",
+                "tail_end_len",
+                "prefix_len",
+                "tail_end_minus_prefix",
+                "skip_reason",
+                "hidden_shape",
+                "mask_shape",
+                "error",
+            )
+            if key in payload
+        }
+        writes = payload.get("writes")
+        if isinstance(writes, dict):
+            out["write_positions_first_last"] = self._first_last_debug_values(
+                writes.get("positions")
+            )
+            out["write_swa_first_last"] = self._first_last_debug_values(
+                writes.get("swa_locs")
+            )
+            out["write_hidden"] = writes.get("hidden")
+        return out
+
+    @staticmethod
+    def _first_last_debug_values(values) -> Optional[list[int]]:
+        if not isinstance(values, list) or len(values) == 0:
+            return None
+        return [int(values[0]), int(values[-1])]
+
     def _boundary_loc_payload(
         self,
         *,
@@ -2988,6 +3029,9 @@ class DSparkWorkerV2(BaseSpecWorker):
                     "visible_block_sources": visible_block_sources,
                     "valid_tail_sources": valid_tail_sources,
                     "valid_window_sources": valid_window_sources,
+                    "prefill_tail_replay_debug": (
+                        self._prefill_tail_replay_history_debug(int(req_pool_idx))
+                    ),
                     "draft_block_metadata": draft_block_metadata,
                 }
             )
