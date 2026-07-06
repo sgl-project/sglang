@@ -1223,7 +1223,9 @@ class SchedulerDisaggregationDecodeMixin:
                 # The decode worker never ran prefill for these requests, so the
                 # n-gram embedding token table has no rows for them; rebuild it
                 # from the original prompt tokens before the first forward.
-                self._maybe_prepare_ngram_embedding(new_prebuilt_batch)
+                new_prebuilt_batch = self._maybe_prepare_ngram_embedding(
+                    new_prebuilt_batch
+                )
                 if self.running_batch.is_empty():
                     self.running_batch = new_prebuilt_batch
                     if self.enable_hisparse:
