@@ -83,7 +83,10 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
-from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
+from sglang.srt.distributed.parallel_state import (
+    RankParallelismConfig,
+    monkey_patch_vllm_parallel_state,
+)
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.elastic_ep.elastic_ep import (
     ElasticEPStateManager,
@@ -419,6 +422,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.remote_instance_transfer_engine = None
         self.remote_instance_transfer_engine_session_id = ""
         self.remote_instance_transfer_engine_weight_info = None
+        self.parallelism_config = None
 
         self.msprobe_debugger = None
         if server_args.msprobe_dump_config is not None:
@@ -683,6 +687,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if self.server_args.remote_instance_weight_loader_use_transfer_engine():
             self.remote_instance_init_transfer_engine()
+            self.parallelism_config = RankParallelismConfig.from_parallel_state(
+                self.tp_rank
+            )
 
         if not self.is_draft_worker:
             set_global_expert_location_metadata(
@@ -760,6 +767,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 self.model, self.remote_instance_transfer_engine
             )
             self._register_to_engine_info_bootstrap()
+
+        # Register parallelism config with the bootstrap server
+        if (
+            self.server_args.remote_instance_weight_loader_use_transfer_engine()
+            and self.parallelism_config is not None
+        ):
+            self._register_parallelism_config_to_bootstrap()
 
         # For MTP models like DeepSeek-V3 or GLM-4.5, the MTP layer(s) are used separately as draft
         # models for speculative decoding. In those cases, `num_nextn_predict_layers` is used to
@@ -1115,6 +1129,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 "Please install mooncake for using remote instance transfer engine: pip install mooncake-transfer-engine"
             )
             return
+
         self.remote_instance_transfer_engine = TransferEngine()
         local_ip = get_local_ip_auto()
         self.remote_instance_transfer_engine.initialize(
@@ -1172,6 +1187,111 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             logger.error(
                 f"Failed to register transfer engine info for tp_rank={self.tp_rank}: {e}"
             )
+
+    def _register_parallelism_config_to_bootstrap(self):
+        """Register parallelism config with the EngineInfoBootstrapServer via HTTP PUT."""
+        import requests as http_requests
+
+        bootstrap_url = self._get_bootstrap_url()
+        url = f"{bootstrap_url}/register_parallelism_config"
+
+        payload = {
+            "tp_rank": self.tp_rank,
+            "parallelism_config": self.parallelism_config.to_dict(),
+        }
+
+        try:
+            resp = http_requests.put(url, json=payload, timeout=5)
+            if resp.status_code == 200:
+                logger.info(
+                    f"Registered parallelism config for tp_rank={self.tp_rank} "
+                    f"with bootstrap server at {bootstrap_url}"
+                )
+            else:
+                logger.error(
+                    f"Failed to register parallelism config for tp_rank={self.tp_rank}: "
+                    f"{resp.status_code}, {resp.text}"
+                )
+        except Exception as e:
+            logger.error(
+                f"Failed to register parallelism config for tp_rank={self.tp_rank}: {e}"
+            )
+
+    def _get_bootstrap_url(self):
+        """Get the base URL for the EngineInfoBootstrapServer."""
+        if self.server_args.dist_init_addr:
+            bootstrap_host = (
+                NetworkAddress.parse(self.server_args.dist_init_addr).resolved().host
+            )
+        else:
+            bootstrap_host = "127.0.0.1"
+
+        bootstrap_port = self.server_args.engine_info_bootstrap_port
+        return NetworkAddress(bootstrap_host, bootstrap_port).to_url()
+
+    def model_specific_adjustment(self):
+        if self.is_draft_worker:
+            return
+
+        server_args = self.server_args
+
+        # HRM-Text needs bidirectional prompt attention (prefill), which only the
+        # Triton backend honors and only with cuda graph / chunked prefill off
+        # (TritonAttnBackend.allow_bidirectional_attention_in_extend). Radix cache
+        # is also unsafe: the recurrent forward writes direction-dependent KV
+        # across many slots.
+        hf_config = self.model_config.hf_config
+        is_hrm_text = getattr(
+            hf_config, "model_type", None
+        ) == "hrm_text" or "HrmTextForCausalLM" in getattr(
+            hf_config, "architectures", []
+        )
+        # prefix_lm defaults to True upstream; defaulting False would skip the
+        # bidirectional-attention forcing and silently produce junk output.
+        is_prefix_lm_recurrent = is_hrm_text and getattr(hf_config, "prefix_lm", True)
+        if is_prefix_lm_recurrent:
+            if server_args.attention_backend not in (None, "triton"):
+                logger.warning(
+                    f"Overriding --attention-backend "
+                    f"{server_args.attention_backend!r} -> 'triton': only the "
+                    "Triton backend supports HRM-Text's bidirectional prefix "
+                    "attention."
+                )
+            server_args.attention_backend = "triton"
+            server_args.chunked_prefill_size = -1
+            server_args.disable_radix_cache = True
+            server_args.disable_cuda_graph = True
+            logger.warning(
+                "HRM-Text (prefix_lm) detected: forcing --attention-backend "
+                "triton, --chunked-prefill-size -1, --disable-radix-cache, and "
+                "--disable-cuda-graph for correctness of the bidirectional "
+                "prompt attention."
+            )
+
+        if self.is_multimodal:
+            if not self.is_multimodal_chunked_prefill_supported:
+                server_args.chunked_prefill_size = -1
+                logger.info(
+                    f"Automatically turn off --chunked-prefill-size as it is not supported for "
+                    f"{self.model_config.hf_config.model_type}"
+                )
+
+        if (
+            not self.use_mla_backend
+            or server_args.attention_backend
+            not in CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS
+        ):
+            server_args.disable_chunked_prefix_cache = True
+
+        if not server_args.disable_chunked_prefix_cache:
+            log_info_on_rank0(logger, "Chunked prefix cache is turned on.")
+
+        # The imperative adjustments above may overwrite fields the resolution passes
+        # already declared (HRM-Text forces attention_backend); redeclare the
+        # adjusted values so publish parity holds.
+        from sglang.srt.arg_groups.overrides import refresh_declared_fields
+
+        refresh_declared_fields(server_args, ("attention_backend",))
 
     def check_quantized_moe_compatibility(self):
         if (
