@@ -319,13 +319,43 @@ def _initialize_model(
     return model_class(**kwargs)
 
 
-def _post_load_weights(model: nn.Module) -> None:
+def post_load_weights(model: nn.Module) -> None:
     # Loaders that bypass `model.load_weights()` (dummy / sharded state / remote instance /
     # remote fs) must trigger the model's post-load fixup explicitly; `model.load_weights()`
     # would normally do it internally. NextN subclasses override the method to fill in
     # `is_nextn=True`, so the loader doesn't need to know.
     if hasattr(model, "post_load_weights"):
         model.post_load_weights()
+
+
+def _apply_quant_method_hook(model: nn.Module, target_device, hook_name: str) -> None:
+    """Run a quant_method hook (restore/process) on every quantized module.
+
+    LoRA wrappers forward `quant_method` for forward-path dispatch but don't own
+    the packed params; skip them so the inner base layer (yielded separately by
+    `named_modules`) handles it.
+    """
+    from sglang.srt.lora.layers import BaseLayerWithLoRA
+
+    for _, module in model.named_modules():
+        if isinstance(module, BaseLayerWithLoRA):
+            continue
+        quant_method = getattr(module, "quant_method", None)
+        if quant_method is not None and hasattr(quant_method, hook_name):
+            with device_loading_context(module, target_device):
+                getattr(quant_method, hook_name)(module)
+
+
+def restore_weight(model: nn.Module, target_device) -> None:
+    """Undo in-place quant packing so fresh weights can be loaded
+    (no-op for schemes that don't repack, e.g. plain fp8)."""
+    _apply_quant_method_hook(model, target_device, "restore_weights_before_loading")
+
+
+def postprocess_weight(model: nn.Module, target_device) -> None:
+    """Finalize quantized weights into kernel layout (Marlin repack, UE8M0 requant,
+    transpose, ...)."""
+    _apply_quant_method_hook(model, target_device, "process_weights_after_loading")
 
 
 class BaseModelLoader(ABC):
@@ -1437,7 +1467,7 @@ class DummyModelLoader(BaseModelLoader):
             # random values to the weights.
             initialize_dummy_weights(model)
 
-            _post_load_weights(model)
+            post_load_weights(model)
 
             for _, module in model.named_modules():
                 quant_method = getattr(module, "quant_method", None)
@@ -1589,7 +1619,7 @@ class ShardedStateLoader(BaseModelLoader):
             if state_dict:
                 raise ValueError(f"Missing keys {tuple(state_dict)} in loaded state!")
 
-            _post_load_weights(model)
+            post_load_weights(model)
 
         return model.eval()
 
@@ -2358,7 +2388,7 @@ class RemoteInstanceModelLoader(BaseModelLoader):
                 )
             current_platform.synchronize()
 
-            _post_load_weights(model)
+            post_load_weights(model)
         end_get_weights_tic = time.time()
         logger.debug(
             f"finish getting all weights from remote instance, time used: {(end_get_weights_tic - start_get_weights_tic):.4f}s"
@@ -2421,7 +2451,7 @@ class RemoteInstanceModelLoader(BaseModelLoader):
             logger.error(f"batch transfer failed, error: {ret}")
             return False
 
-        _post_load_weights(model)
+        post_load_weights(model)
 
         return True
 
@@ -2511,7 +2541,7 @@ class RemoteModelLoader(BaseModelLoader):
         if state_dict:
             raise ValueError(f"Missing keys {tuple(state_dict)} in loaded state!")
 
-        _post_load_weights(model)
+        post_load_weights(model)
 
     def _load_model_from_remote_fs(
         self, model, client, model_config: ModelConfig, device_config: DeviceConfig

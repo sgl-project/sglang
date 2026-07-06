@@ -15,6 +15,8 @@ from sglang.srt.managers.io_struct import (
     AddExternalCorpusReqOutput,
     AttachHiCacheStorageReqInput,
     AttachHiCacheStorageReqOutput,
+    BeginWeightUpdateReqInput,
+    BeginWeightUpdateReqOutput,
     CheckWeightsReqInput,
     CheckWeightsReqOutput,
     ClearHiCacheReqInput,
@@ -26,6 +28,8 @@ from sglang.srt.managers.io_struct import (
     DetachHiCacheStorageReqOutput,
     DumperControlReqInput,
     DumperControlReqOutput,
+    EndWeightUpdateReqInput,
+    EndWeightUpdateReqOutput,
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
     ExpertDistributionReqType,
@@ -100,6 +104,8 @@ _COMMUNICATOR_SPECS = [
     ("send_weights_to_remote_instance", SendWeightsToRemoteInstanceReqOutput),
     ("update_weights_from_tensor", UpdateWeightsFromTensorReqOutput),
     ("update_weights_from_ipc", UpdateWeightsFromIPCReqOutput),
+    ("begin_weight_update", BeginWeightUpdateReqOutput),
+    ("end_weight_update", EndWeightUpdateReqOutput),
     ("get_weights_by_name", GetWeightsByNameReqOutput),
     ("release_memory_occupation", ReleaseMemoryOccupationReqOutput),
     ("resume_memory_occupation", ResumeMemoryOccupationReqOutput),
@@ -521,6 +527,44 @@ class TokenizerControlMixin:
             message += f" Weight version updated to {obj.weight_version}."
 
         return success, message
+
+    async def begin_weight_update(
+        self: TokenizerManager,
+        obj: BeginWeightUpdateReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> Tuple[bool, str]:
+        """Begin a new weight update session: restore packed weights to a loadable state."""
+        self.auto_create_handle_loop()
+
+        async with self.is_pause_cond:
+            is_paused = self.is_pause
+            if is_paused:
+                results = await self.begin_weight_update_communicator(obj)
+
+        if not is_paused:
+            async with self.model_update_lock.writer_lock:
+                results = await self.begin_weight_update_communicator(obj)
+
+        return FanOutCommunicator.merge_results(results)
+
+    async def end_weight_update(
+        self: TokenizerManager,
+        obj: EndWeightUpdateReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> Tuple[bool, str]:
+        """End the weight update session: optionally post_load_weights, then quant finalize."""
+        self.auto_create_handle_loop()
+
+        async with self.is_pause_cond:
+            is_paused = self.is_pause
+            if is_paused:
+                results = await self.end_weight_update_communicator(obj)
+
+        if not is_paused:
+            async with self.model_update_lock.writer_lock:
+                results = await self.end_weight_update_communicator(obj)
+
+        return FanOutCommunicator.merge_results(results)
 
     async def _unload_lora_adapter_locked(
         self: TokenizerManager,

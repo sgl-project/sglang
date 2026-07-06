@@ -125,8 +125,9 @@ class NGRAMWorker(BaseSpecWorker):
         self.ngram_corpus.reset()
         self._prev_decode_rids = set()
 
-    def iter_draft_runners(self) -> list[tuple[str, "ModelRunner"]]:
-        # NGRAM shares the target's model_runner — no independent draft.
+    def iter_runners(self) -> list[tuple[str, "ModelRunner"]]:
+        # NGRAM shares the target's model_runner — no independent draft runner of its
+        # own (the target worker contributes its runner).
         return []
 
     def add_external_corpus(self, corpus_id: str, token_chunks: list[list[int]]) -> int:

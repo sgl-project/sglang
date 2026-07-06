@@ -451,10 +451,12 @@ class TpModelWorker(BaseTpWorker):
     def model_runner(self) -> ModelRunner:
         return self._model_runner
 
-    def iter_draft_runners(self) -> List[Tuple[str, ModelRunner]]:
-        # The target worker shares this class (is_draft_worker=False) and returns [].
+    def iter_runners(self) -> List[Tuple[str, ModelRunner]]:
+        # All (role, ModelRunner) pairs this worker contributes to a weight update.
+        # The target (is_draft_worker=False) yields its own runner under the empty
+        # role; a draft worker yields its draft runner(s).
         if not self.is_draft_worker:
-            return []
+            return [("", self.model_runner)]
         if self.model_runner_list:
             return [
                 (f"draft_step_{i}", r) for i, r in enumerate(self.model_runner_list)
