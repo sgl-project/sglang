@@ -24,7 +24,7 @@ from sglang.jit_kernel.dsv4 import (
     fused_norm_rope_inplace,
     fused_q_norm_rope,
     fused_rope_inplace,
-    sglang_per_token_group_quant_fp8_dsv4_woa,
+    sglang_per_token_group_quant_fp8_dsv4_wo_a,
 )
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
@@ -1084,7 +1084,7 @@ class MQALayer(nn.Module):
 
             T, G, D = o.shape
             R = self.o_lora_rank
-            o_fp8, o_s = sglang_per_token_group_quant_fp8_dsv4_woa(o)
+            o_fp8, o_s = sglang_per_token_group_quant_fp8_dsv4_wo_a(o)
             output = torch.empty(T, G, R, device=o.device, dtype=torch.bfloat16)
             deep_gemm.fp8_einsum(
                 "bhr,hdr->bhd",

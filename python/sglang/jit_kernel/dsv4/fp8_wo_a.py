@@ -65,10 +65,18 @@ def fp8_wo_a_group_major_quant_ue8m0(
     _fp8_wo_a_group_major_quant_ue8m0_custom_op(input, output_q, output_s)
 
 
-def sglang_per_token_group_quant_fp8_dsv4_woa(
+def sglang_per_token_group_quant_fp8_dsv4_wo_a(
     x: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Quantize DSV4 wo_a activations with 128-wide groups and eps=1e-10."""
+    """Quantize DSV4 wo_a activations for DeepGEMM fp8_einsum.
+
+    The input is a [T, G, D] bf16/fp16 tensor whose hidden dimension is
+    contiguous. The output codes are contiguous [T, G, D] fp8 values. The scale
+    tensor is returned as logical [T, G, D/128] fp32 UE8M0 values backed by
+    contiguous [G, T, D/128] storage, so each group/head [T, S] panel is
+    contiguous for the DeepGEMM recipe=(1, 1, 128) consumer. Group size is fixed
+    to 128 and the absmax floor is fixed to 1e-10.
+    """
     num_tokens, num_groups, hidden = x.shape
     hidden_groups = hidden // _GROUP_SIZE
     x_q = torch.empty(x.shape, device=x.device, dtype=torch.float8_e4m3fn)

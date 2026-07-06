@@ -5,13 +5,19 @@
 // contiguous [T, G, D], group_size is fixed to 128, scales are fp32 UE8M0
 // power-of-two values, and output_s is a logical [T, G, D/128] view backed by
 // group-major [G, T, D/128] storage.
-#include <sgl_kernel/tensor.h>
-#include <sgl_kernel/utils.h>
+//
+// The generic kernel cannot read the strided DSV4 view while producing
+// contiguous [T, G, D] codes and group-major scales without an extra full-tensor
+// copy.
+#include <sgl_kernel/tensor.h>  // TensorMatcher, SymbolicSize/Device
+#include <sgl_kernel/utils.h>   // RuntimeCheck
 
-#include <sgl_kernel/utils.cuh>
-#include <sgl_kernel/warp.cuh>
+#include <sgl_kernel/utils.cuh>  // fp8 aliases, PDL helpers
+#include <sgl_kernel/warp.cuh>   // warp::reduce_max
 
-#include <sgl_kernel/deepseek_v4/fp8_utils.cuh>
+#include <sgl_kernel/deepseek_v4/fp8_utils.cuh>  // UE8M0 and FP8 helpers
+
+#include <tvm/ffi/container/tensor.h>  // tvm::ffi::TensorView
 
 #include <cstdint>
 #include <cuda_fp8.h>
