@@ -675,7 +675,7 @@ class DeepseekSparseAttnBackend(
             )
         return self._arange_buf[:length]
 
-    def _graph_page_table_width(self, metadata: "DSAMetadata") -> int:
+    def _graph_page_table_width(self, metadata: DSAMetadata) -> int:
         """Column count to scan req_to_token during graph replay. Reads the wide
         page_table_1 width when present, else req_to_token's width (the wide table
         is dropped for fused decode graphs, see `dsa_drop_wide_page_table`)."""

@@ -1,18 +1,11 @@
 from __future__ import annotations
 
-import logging
 from enum import Enum, IntEnum, auto
 from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 
 from sglang.srt.environ import envs
-
-logger = logging.getLogger(__name__)
-
-# One-time observability: confirms the folded top-k v2 path actually routed in a
-# real forward (vs. falling through to the legacy page_size=1 transform).
-_v2_fold_logged = False
 
 _FLASHINFER_TIE_BREAK_VALUES = {
     "small": 1,
@@ -305,16 +298,6 @@ def _try_topk_transform_v2_paged(
         plan = plan_topk_v2(lengths_i32)
     topk_transform_512_v2(scores, lengths_i32, page_table, out, page_size, plan)
 
-    global _v2_fold_logged
-    if not _v2_fold_logged:
-        _v2_fold_logged = True
-        logger.info(
-            "[DSA] top-k v2 page-table fold engaged (page_size=%d, topk=%d, rows=%d, plan=%s)",
-            page_size,
-            topk,
-            num_rows,
-            "precomputed" if attn_metadata.topk_v2_plan is not None else "inline",
-        )
     return out
 
 
