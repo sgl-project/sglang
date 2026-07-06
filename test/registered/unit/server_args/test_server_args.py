@@ -184,47 +184,75 @@ class TestLoadBalanceMethod(unittest.TestCase):
 
 
 class TestHiSparseDsaBackendPolicy(unittest.TestCase):
+    # The backend selection moved to the resolution pipeline; these policy
+    # tests drive the pass through its read-only view.
+    @staticmethod
+    def _resolve(kv_cache_dtype, **kw):
+        from types import SimpleNamespace
+
+        from sglang.srt.arg_groups.overrides import (
+            ResolvedView,
+            _dsa_split_backend_resolution,
+        )
+
+        hf = SimpleNamespace(architectures=["DeepseekV32ForCausalLM"])
+        defaults = dict(
+            kv_cache_dtype=kv_cache_dtype,
+            dsa_prefill_backend=None,
+            dsa_decode_backend=None,
+            enable_hisparse=True,
+        )
+        defaults.update(kw)
+        view = ResolvedView(
+            SimpleNamespace(
+                get_model_config=lambda: SimpleNamespace(hf_config=hf), **defaults
+            )
+        )
+        with (
+            patch("sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True),
+            patch("sglang.srt.arg_groups.overrides.is_npu", return_value=False),
+            patch("sglang.srt.arg_groups.overrides.is_xpu", return_value=False),
+            patch("torch.cuda.get_device_capability", return_value=(9, 0)),
+        ):
+            declared = _dsa_split_backend_resolution(view)
+        return {
+            "dsa_prefill_backend": declared.get(
+                "dsa_prefill_backend", defaults["dsa_prefill_backend"]
+            ),
+            "dsa_decode_backend": declared.get(
+                "dsa_decode_backend", defaults["dsa_decode_backend"]
+            ),
+        }
+
     @patch("sglang.srt.server_args.is_hip", return_value=False)
     def test_hisparse_defaults_to_flashmla_sparse_on_cuda_bfloat16(self, _mock_is_hip):
-        server_args = ServerArgs(model_path="dummy", enable_hisparse=True)
+        resolved = self._resolve("bfloat16")
 
-        server_args._set_default_dsa_backends(kv_cache_dtype="bfloat16", major=9)
-
-        self.assertEqual(server_args.dsa_prefill_backend, "flashmla_sparse")
-        self.assertEqual(server_args.dsa_decode_backend, "flashmla_sparse")
+        self.assertEqual(resolved["dsa_prefill_backend"], "flashmla_sparse")
+        self.assertEqual(resolved["dsa_decode_backend"], "flashmla_sparse")
 
     @patch("sglang.srt.server_args.is_hip", return_value=False)
     def test_hisparse_defaults_to_flashmla_kv_on_cuda_fp8(self, _mock_is_hip):
-        server_args = ServerArgs(model_path="dummy", enable_hisparse=True)
+        resolved = self._resolve("fp8_e4m3")
 
-        server_args._set_default_dsa_backends(kv_cache_dtype="fp8_e4m3", major=9)
-
-        self.assertEqual(server_args.dsa_prefill_backend, "flashmla_kv")
-        self.assertEqual(server_args.dsa_decode_backend, "flashmla_kv")
+        self.assertEqual(resolved["dsa_prefill_backend"], "flashmla_kv")
+        self.assertEqual(resolved["dsa_decode_backend"], "flashmla_kv")
 
     @patch("sglang.srt.server_args.is_hip", return_value=True)
     def test_hisparse_defaults_to_tilelang_on_rocm(self, _mock_is_hip):
-        server_args = ServerArgs(model_path="dummy", enable_hisparse=True)
+        resolved = self._resolve("bfloat16")
 
-        server_args._set_default_dsa_backends(kv_cache_dtype="bfloat16", major=9)
-
-        self.assertEqual(server_args.dsa_prefill_backend, "tilelang")
-        self.assertEqual(server_args.dsa_decode_backend, "tilelang")
+        self.assertEqual(resolved["dsa_prefill_backend"], "tilelang")
+        self.assertEqual(resolved["dsa_decode_backend"], "tilelang")
 
     @patch("sglang.srt.server_args.is_hip", return_value=True)
     def test_hisparse_preserves_rocm_user_backend_and_defaults_missing_side(
         self, _mock_is_hip
     ):
-        server_args = ServerArgs(
-            model_path="dummy",
-            enable_hisparse=True,
-            dsa_prefill_backend="tilelang",
-        )
+        resolved = self._resolve("bfloat16", dsa_prefill_backend="tilelang")
 
-        server_args._set_default_dsa_backends(kv_cache_dtype="bfloat16", major=9)
-
-        self.assertEqual(server_args.dsa_prefill_backend, "tilelang")
-        self.assertEqual(server_args.dsa_decode_backend, "tilelang")
+        self.assertEqual(resolved["dsa_prefill_backend"], "tilelang")
+        self.assertEqual(resolved["dsa_decode_backend"], "tilelang")
 
     @patch("sglang.srt.server_args.is_hip", return_value=True)
     def test_hisparse_accepts_aiter_backend_on_rocm(self, _mock_is_hip):
@@ -311,7 +339,7 @@ class TestFa4PageSizeAutoForce(CustomTestCase):
         args.model_config.hf_config.dual_chunk_attention_config = None
         return args
 
-    @patch("sglang.srt.server_args.is_sm100_supported", return_value=True)
+    @patch("sglang.srt.arg_groups.overrides.is_sm100_supported", return_value=True)
     @patch("sglang.srt.server_args.ServerArgs.use_mla_backend", return_value=False)
     def test_combined_attention_backend_fa4_forces_page_size_128(
         self, _mock_mla, _mock_sm100
@@ -323,7 +351,7 @@ class TestFa4PageSizeAutoForce(CustomTestCase):
 
         self.assertEqual(args.page_size, 128)
 
-    @patch("sglang.srt.server_args.is_sm100_supported", return_value=True)
+    @patch("sglang.srt.arg_groups.overrides.is_sm100_supported", return_value=True)
     @patch("sglang.srt.server_args.ServerArgs.use_mla_backend", return_value=False)
     def test_explicit_prefill_fa4_forces_page_size_128(self, _mock_mla, _mock_sm100):
         # `--prefill-attention-backend fa4`: the previously-covered path.
@@ -1334,6 +1362,49 @@ class TestSamplingBackendTokenOracleEnvGate(CustomTestCase):
             ]
         )
         self.assertEqual(parsed.sampling_backend, "token_oracle")
+
+
+class TestTwoBatchOverlapBackend(CustomTestCase):
+    """Non-EP DP two-batch-overlap backend requirement.
+
+    With no EP a2a backend (moe_a2a_backend='none'), --enable-two-batch-overlap
+    is only valid on the DeepSeek-V4 non-EP DP TP-MoE path (overlapping the DP
+    all_gatherv / reduce_scatterv with the other ubatch's compute), which
+    requires --enable-dp-attention. This replaced the removed opt-in
+    SGLANG_ENABLE_DP_TBO env: enabling DP TBO now needs no extra flag.
+
+    dummy-model short-circuits __post_init__, so the guard handler is invoked
+    directly (same pattern as TestDeepEPWaterfillArgs)."""
+
+    def _args(self, **overrides):
+        args = ServerArgs(model_path="dummy")
+        args.enable_two_batch_overlap = True
+        args.moe_a2a_backend = "none"
+        args.enable_dp_attention = False
+        for key, value in overrides.items():
+            setattr(args, key, value)
+        return args
+
+    def test_no_a2a_without_dp_attention_raises(self):
+        args = self._args(enable_dp_attention=False)
+        with self.assertRaisesRegex(ValueError, "enable-dp-attention"):
+            args._check_two_batch_overlap()
+
+    def test_no_a2a_with_dp_attention_ok(self):
+        # DP TBO path is valid: --enable-dp-attention + --enable-two-batch-overlap
+        # with a2a backend 'none' must NOT raise (no SGLANG_ENABLE_DP_TBO needed).
+        args = self._args(enable_dp_attention=True)
+        args._check_two_batch_overlap()
+
+    def test_ep_a2a_backend_ok_without_dp_attention(self):
+        # EP a2a path (e.g. deepep) overlaps dispatch/combine; the guard does not
+        # require dp-attention there.
+        args = self._args(moe_a2a_backend="deepep", enable_dp_attention=False)
+        args._check_two_batch_overlap()
+
+    def test_tbo_disabled_is_noop(self):
+        args = self._args(enable_two_batch_overlap=False, enable_dp_attention=False)
+        args._check_two_batch_overlap()
 
 
 if __name__ == "__main__":
