@@ -367,6 +367,16 @@ def is_deepep_class_backend() -> bool:
     return b.is_deepep() or b.is_mooncake() or b.is_mori()
 
 
+def uses_per_rank_fused_shared_slots() -> bool:
+    """Check whether fused shared experts use per-rank physical slots."""
+    return is_deepep_class_backend() or get_moe_a2a_backend().is_megamoe()
+
+
+def has_per_rank_fused_shared_slots(num_fused_shared_experts: int) -> bool:
+    """Check whether this layer has fused shared experts in per-rank slots."""
+    return num_fused_shared_experts > 0 and uses_per_rank_fused_shared_slots()
+
+
 def is_flashinfer_cutedsl_v1_path() -> bool:
     """CuteDSL v1 + DeepEP low-latency path (no MoeRunner, no autotune)."""
     return (
