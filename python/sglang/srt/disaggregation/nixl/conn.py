@@ -2319,6 +2319,42 @@ class NixlKVManager(CommonKVManager):
                         handle_staging_rsp(waiting_req_bytes, self.transfer_infos)
                     continue
 
+                # Decode-side abort notification: mark room as failed
+                if waiting_req_bytes[0] == b"ABORT":
+                    try:
+                        room_to_be_aborted = int(waiting_req_bytes[1].decode("ascii"))
+                        decode_ip = waiting_req_bytes[2].decode("ascii")
+                        decode_port = int(waiting_req_bytes[3].decode("ascii"))
+                    except (IndexError, UnicodeDecodeError, ValueError):
+                        logger.warning("Ignoring malformed ABORT notification")
+                        continue
+
+                    status = self.request_status.get(room_to_be_aborted)
+                    if status not in (None, KVPoll.Failed, KVPoll.Success):
+                        self.record_failure(
+                            room_to_be_aborted,
+                            f"Request {room_to_be_aborted} was aborted by decode.",
+                        )
+                        self.update_status(room_to_be_aborted, KVPoll.Failed)
+                        logger.debug(
+                            "Received abort notification for room %s from %s:%s, "
+                            "marked as Failed",
+                            room_to_be_aborted,
+                            decode_ip,
+                            decode_port,
+                        )
+                    else:
+                        logger.debug(
+                            "Received abort notification for room %s from %s:%s, "
+                            "ignoring (already terminal or unknown)",
+                            room_to_be_aborted,
+                            decode_ip,
+                            decode_port,
+                        )
+                    # NIXL has no decode-side ABORT_ACK handler, so abort
+                    # notification remains fire-and-forget.
+                    continue
+
                 assert (
                     waiting_req_bytes[0] == GUARD
                 ), f"First message should be {GUARD}. Foreign traffic?"

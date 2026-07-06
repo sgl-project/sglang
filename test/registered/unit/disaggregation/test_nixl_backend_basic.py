@@ -330,6 +330,72 @@ class TestNixlKVSenderChunkPolicy(CustomTestCase):
         self.assertTrue(sender.should_send_kv_chunk(3, last_chunk=False))
 
 
+class TestNixlBootstrapMessages(CustomTestCase):
+    def _make_manager(self, request_status):
+        mgr = object.__new__(NixlKVManager)
+        mgr.request_status = request_status
+        mgr.record_failure = MagicMock()
+        mgr.update_status = MagicMock()
+        return mgr
+
+    def _run_bootstrap_message(self, mgr, message):
+        mgr.server_socket = MagicMock()
+        mgr.server_socket.recv_multipart.side_effect = [message, StopIteration]
+
+        with patch(
+            "sglang.srt.disaggregation.nixl.conn.threading.Thread"
+        ) as mock_thread:
+            mgr._start_bootstrap_thread()
+
+        bootstrap_target = mock_thread.call_args.kwargs["target"]
+        with self.assertRaises(StopIteration):
+            bootstrap_target()
+
+    def test_abort_marks_active_room_failed(self):
+        for status in (
+            KVPoll.Bootstrapping,
+            KVPoll.WaitingForInput,
+            KVPoll.Transferring,
+        ):
+            with self.subTest(status=status):
+                mgr = self._make_manager({7: status})
+
+                self._run_bootstrap_message(
+                    mgr, [b"ABORT", b"7", b"127.0.0.1", b"12345"]
+                )
+
+                mgr.record_failure.assert_called_once_with(
+                    7, "Request 7 was aborted by decode."
+                )
+                mgr.update_status.assert_called_once_with(7, KVPoll.Failed)
+
+    def test_abort_ignores_terminal_or_unknown_room(self):
+        for request_status in ({7: KVPoll.Failed}, {7: KVPoll.Success}, {}):
+            with self.subTest(request_status=request_status):
+                mgr = self._make_manager(request_status)
+
+                self._run_bootstrap_message(
+                    mgr, [b"ABORT", b"7", b"127.0.0.1", b"12345"]
+                )
+
+                mgr.record_failure.assert_not_called()
+                mgr.update_status.assert_not_called()
+
+    def test_malformed_abort_is_ignored(self):
+        for message in (
+            [b"ABORT"],
+            [b"ABORT", b"not-a-room", b"127.0.0.1", b"12345"],
+            [b"ABORT", b"7", b"127.0.0.1", b"not-a-port"],
+        ):
+            with self.subTest(message=message):
+                mgr = self._make_manager({7: KVPoll.WaitingForInput})
+
+                self._run_bootstrap_message(mgr, message)
+
+                mgr.record_failure.assert_not_called()
+                mgr.update_status.assert_not_called()
+
+
 class TestNixlNotifications(CustomTestCase):
     def _make_manager(self, messages, required=None):
         mgr = object.__new__(NixlKVManager)
