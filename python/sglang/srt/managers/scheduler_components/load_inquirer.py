@@ -51,6 +51,10 @@ class SchedulerLoadInquirer:
     get_disagg_decode_transfer_queue: Callable
     get_spec_total_num_accept_tokens: Callable
     get_spec_total_num_forward_ct: Callable
+    # Lazily cached MemoryMetrics: all fields are set once during init
+    # (weight load / KV pool alloc / cuda graph capture) and never change,
+    # but get_loads is on the per-iteration publish path.
+    memory_metrics_cache: MemoryMetrics = None
 
     def _get_num_pending_tokens(self, chunk_deduct: int = 0) -> int:
         """Get the total number of tokens pending prefill.
@@ -134,19 +138,22 @@ class SchedulerLoadInquirer:
 
         memory = None
         if include_all or "memory" in include:
-            try:
-                memory = MemoryMetrics(
-                    weight_gb=round(
-                        self.tp_worker.model_runner.weight_load_mem_usage, 3
-                    ),
-                    kv_cache_gb=round(
-                        self.token_to_kv_pool_allocator.get_kvcache().mem_usage, 3
-                    ),
-                    graph_gb=round(self.tp_worker.model_runner.graph_mem_usage, 3),
-                    token_capacity=int(self.max_total_num_tokens),
-                )
-            except AttributeError as e:
-                logger.debug(f"Memory metrics not available: {e}")
+            memory = self.memory_metrics_cache
+            if memory is None:
+                try:
+                    memory = MemoryMetrics(
+                        weight_gb=round(
+                            self.tp_worker.model_runner.weight_load_mem_usage, 3
+                        ),
+                        kv_cache_gb=round(
+                            self.token_to_kv_pool_allocator.get_kvcache().mem_usage, 3
+                        ),
+                        graph_gb=round(self.tp_worker.model_runner.graph_mem_usage, 3),
+                        token_capacity=int(self.max_total_num_tokens),
+                    )
+                    object.__setattr__(self, "memory_metrics_cache", memory)
+                except AttributeError as e:
+                    logger.debug(f"Memory metrics not available: {e}")
 
         speculative = None
         if include_all or "spec" in include:

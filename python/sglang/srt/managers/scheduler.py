@@ -281,10 +281,23 @@ else:
 
 logger = logging.getLogger(__name__)
 
+# Minimum seconds between load snapshot publishes, applied even to forced
+# (prefill/idle) publishes. See Scheduler.publish_load_snapshot.
+LOAD_SNAPSHOT_MIN_PUBLISH_INTERVAL_S = 0.02
+
 # Test retract decode for debugging purposes
 TEST_RETRACT = envs.SGLANG_TEST_RETRACT.get()
 TEST_RETRACT_INTERVAL = envs.SGLANG_TEST_RETRACT_INTERVAL.get()
 TEST_RETRACT_NO_PREFILL_BS = envs.SGLANG_TEST_RETRACT_NO_PREFILL_BS.get()
+
+# Hoisted out of the event loop: these are read every scheduler iteration and
+# os.getenv on the hot path is measurable (~2% of scheduler CPU time).
+STRICT_MEM_CHECK_DURING_BUSY = envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get()
+REQ_RUNNING_TIMEOUT = envs.SGLANG_REQ_RUNNING_TIMEOUT.get()
+REQ_WAITING_TIMEOUT = envs.SGLANG_REQ_WAITING_TIMEOUT.get()
+DISABLE_CONSECUTIVE_PREFILL_OVERLAP = (
+    envs.SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP.get()
+)
 
 _is_npu = is_npu()
 
@@ -667,6 +680,15 @@ class Scheduler(
             writer.publish_counter += 1
             if writer.publish_counter < writer.publish_interval:
                 return
+        # Rate-limit forced publishes (every prefill batch and every idle
+        # iteration force-publish): a full get_loads + locked shm write per
+        # scheduler iteration is measurable CPU overhead, while readers only
+        # need snapshots at millisecond freshness.
+        now = time.monotonic()
+        last = getattr(writer, "last_publish_ts", 0.0)
+        if now - last < LOAD_SNAPSHOT_MIN_PUBLISH_INTERVAL_S:
+            return
+        writer.last_publish_ts = now
         writer.publish_counter = 0
         try:
             result = self.load_inquirer.get_loads(GetLoadsReqInput(include=["all"]))
@@ -1428,7 +1450,7 @@ class Scheduler(
 
     def _abort_on_running_timeout(self):
         # NOTE: this should be called before a batch is launched.
-        timeout_s = envs.SGLANG_REQ_RUNNING_TIMEOUT.get()
+        timeout_s = REQ_RUNNING_TIMEOUT
         if timeout_s <= 0:
             return
         if self.running_batch.is_empty():
@@ -1528,7 +1550,7 @@ class Scheduler(
 
             # Update last_batch
             self.last_batch = batch
-            if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
+            if STRICT_MEM_CHECK_DURING_BUSY:
                 self.invariant_checker.self_check_during_busy()
 
     @DynamicGradMode()
@@ -1588,7 +1610,7 @@ class Scheduler(
             # Update last_batch
             self.last_batch = batch
 
-            if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
+            if STRICT_MEM_CHECK_DURING_BUSY:
                 self.invariant_checker.self_check_during_busy()
 
     def is_disable_overlap_for_batch(self, batch: ScheduleBatch) -> bool:
@@ -1606,7 +1628,7 @@ class Scheduler(
         last_batch_is_extend = is_extend(self.last_batch)
 
         disable_overlap_for_batch = (
-            envs.SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP.get()
+            DISABLE_CONSECUTIVE_PREFILL_OVERLAP
             and batch_is_extend
             and last_batch_is_extend
         )
@@ -2354,7 +2376,7 @@ class Scheduler(
         return req_to_abort.rid == recv_req.rid
 
     def _abort_on_waiting_timeout(self):
-        if (timeout_s := envs.SGLANG_REQ_WAITING_TIMEOUT.get()) <= 0:
+        if (timeout_s := REQ_WAITING_TIMEOUT) <= 0:
             return
 
         deleted_reqs = set()

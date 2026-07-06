@@ -277,6 +277,10 @@ class _GenerationStreamAccumulator:
     indexer_topk: Optional[list] = None
     customized_info: dict = field(default_factory=dict)
     time_stats: list = field(default_factory=list)
+    # True iff any collected time_stats carries data. When metrics are
+    # disabled, every TimeStats pickles to an empty dict, so we send None
+    # instead of pickling one stub object per request per stream flush.
+    has_time_stats: bool = False
     input_token_logprobs_val: Optional[list] = None
     input_token_logprobs_idx: Optional[list] = None
     output_token_logprobs_val: Optional[list] = None
@@ -394,6 +398,7 @@ class _GenerationStreamAccumulator:
         self.retraction_counts.append(req.retraction_count)
 
         self.time_stats.append(req.time_stats)
+        self.has_time_stats |= req.time_stats.enable_metrics
 
         if not self.spec_algorithm.is_none():
             self.spec_verify_ct.append(req.spec_verify_ct)
@@ -509,7 +514,7 @@ class _GenerationStreamAccumulator:
             spec_verify_ct=self.spec_verify_ct,
             spec_num_correct_drafts=self.spec_num_correct_drafts,
             spec_correct_drafts_histogram=self.spec_correct_drafts_histogram,
-            time_stats=self.time_stats,
+            time_stats=self.time_stats if self.has_time_stats else None,
             finished_reasons=self.finished_reasons,
             decoded_texts=self.decoded_texts,
             decode_ids=self.decode_ids_list,
