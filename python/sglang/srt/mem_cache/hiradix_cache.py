@@ -617,7 +617,10 @@ class HiRadixCache(RadixCache):
                     # Non-owner ranks can receive a zero-token ack when L3
                     # backup is skipped. Partial writes must not publish the
                     # whole node as externally stored.
-                    publish = operation.completed_tokens >= len(operation.token_ids)
+                    publish = (
+                        operation.token_ids is not None
+                        and operation.completed_tokens >= len(operation.token_ids)
+                    )
                     for publish_node in publish_nodes:
                         if publish_node.backup_pending_id == ack_id:
                             publish_node.backup_pending_id = None
