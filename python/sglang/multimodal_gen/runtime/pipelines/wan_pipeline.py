@@ -20,13 +20,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import 
 from sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline import LoRAPipeline
 from sglang.multimodal_gen.runtime.pipelines_core.stages import (
     InputValidationStage,
+    TimestepPreparationStage,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.wan import (
     WanProgressiveDenoisingStage,
-)
-from sglang.multimodal_gen.runtime.post_training.rollout_scheduler import (
-    RolloutSchedulerSwitch,
-    RolloutTimestepPreparationStage,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -51,19 +48,25 @@ class WanPipeline(LoRAPipeline, ComposedPipelineBase):
 
     def initialize_pipeline(self, server_args: ServerArgs):
         # We use UniPCMScheduler from Wan2.1 official repo, not the one in diffusers.
-        shift = server_args.pipeline_config.flow_shift
-        self.modules["scheduler"] = RolloutSchedulerSwitch(
-            serving_scheduler=FlowUniPCMultistepScheduler(shift=shift),
-            rollout_scheduler=FlowMatchEulerDiscreteScheduler(
-                shift=1.0 if shift is None else shift
-            ),
+        self.modules["scheduler"] = FlowUniPCMultistepScheduler(
+            shift=server_args.pipeline_config.flow_shift
         )
 
     def create_pipeline_stages(self, server_args: ServerArgs) -> None:
+        shift = server_args.pipeline_config.flow_shift
         self.add_stage(InputValidationStage())
         self.add_standard_text_encoding_stage()
         self.add_standard_latent_preparation_stage()
-        self.add_stage(RolloutTimestepPreparationStage(self.get_module("scheduler")))
+        # Serving keeps UniPC; requests with rollout=True bind a first-order
+        # flow-match Euler scheduler, which the RL SDE/log-prob path requires.
+        self.add_stage(
+            TimestepPreparationStage(
+                scheduler=self.get_module("scheduler"),
+                rollout_scheduler=FlowMatchEulerDiscreteScheduler(
+                    shift=1.0 if shift is None else shift
+                ),
+            )
+        )
         self.add_progressive_denoising_stage(WanProgressiveDenoisingStage)
         self.add_standard_decoding_stage()
 

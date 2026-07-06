@@ -57,15 +57,27 @@ class TimestepPreparationStage(PipelineStage):
     deduplicated_deepcopy_output_fields = ("scheduler",)
     deduplicated_extra_tensor_tree_output_keys = ("mu",)
 
+    # Class-level so the rollout info log prints once per process even if
+    # the scheduler is cloned per request (isolate=True paths).
+    _logged_rollout_scheduler_check = False
+
     def __init__(
         self,
         scheduler,
         prepare_extra_set_timesteps_kwargs: (
             list[Callable[[Req, ServerArgs], Tuple[str, Any]]] | None
         ) = None,
+        rollout_scheduler=None,
     ) -> None:
         super().__init__()
         self.scheduler = scheduler
+        # Scheduler bound to requests with rollout=True, for pipelines whose
+        # serving scheduler is not the first-order flow-match Euler scheduler
+        # the rollout SDE/log-prob path requires (e.g. Wan serves UniPC).
+        # Downstream stages read batch.scheduler, so binding the template
+        # here is the only switch point. None means rollout requests use the
+        # serving scheduler unchanged.
+        self.rollout_scheduler = rollout_scheduler
         self.prepare_extra_set_timesteps_kwargs = list(
             prepare_extra_set_timesteps_kwargs or []
         )
@@ -90,7 +102,9 @@ class TimestepPreparationStage(PipelineStage):
         if batch.scheduler is not None and batch.timesteps is not None:
             return batch
 
-        scheduler = get_or_create_request_scheduler(batch, self.scheduler)
+        use_rollout_scheduler = batch.rollout and self.rollout_scheduler is not None
+        template = self.rollout_scheduler if use_rollout_scheduler else self.scheduler
+        scheduler = get_or_create_request_scheduler(batch, template)
         device = get_local_torch_device()
         num_inference_steps = batch.num_inference_steps
         timesteps = batch.timesteps
@@ -153,12 +167,41 @@ class TimestepPreparationStage(PipelineStage):
             )
             timesteps = scheduler.timesteps
 
+        if use_rollout_scheduler:
+            self._check_rollout_timesteps(scheduler)
+
         # Update batch with prepared timesteps
         batch.timesteps = timesteps
         batch.scheduler = scheduler
         if not batch.is_warmup:
             self.log_debug("timesteps: %s", timesteps)
         return batch
+
+    def _check_rollout_timesteps(self, scheduler) -> None:
+        # The rollout SDE/log-prob math assumes the flow-match Euler
+        # convention timesteps == sigmas[:-1] * num_train_timesteps.
+        sigmas = scheduler.sigmas
+        timesteps = scheduler.timesteps
+        if sigmas is None or timesteps is None or sigmas.numel() < 2:
+            return
+        reconstructed = sigmas[:-1].to(device=timesteps.device) * float(
+            scheduler.config.num_train_timesteps
+        )
+        max_abs_diff = (timesteps.float() - reconstructed.float()).abs().max().item()
+        if max_abs_diff > 1e-3:
+            raise ValueError(
+                f"rollout timestep/sigma mismatch: max_abs_diff={max_abs_diff:.6g}"
+            )
+        if not TimestepPreparationStage._logged_rollout_scheduler_check:
+            logger.info(
+                "RL rollout using %s (timesteps dtype=%s, sigmas dtype=%s, "
+                "max_abs_diff=%.6g)",
+                type(scheduler).__name__,
+                timesteps.dtype,
+                sigmas.dtype,
+                max_abs_diff,
+            )
+            TimestepPreparationStage._logged_rollout_scheduler_check = True
 
     def build_dedup_fingerprint(
         self, batch: Req, server_args: ServerArgs
