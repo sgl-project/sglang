@@ -275,10 +275,10 @@ def materialize_waterfill_dispatch_fused(
     allow_all_ranks: bool = False,
     target_total: int = 0,
 ) -> Tuple[Tensor, Tensor]:
-    """Run fused Waterfill rank selection and DeepEP TopK expansion.
+    """Run fused Waterfill rank selection and TopK expansion.
 
     The Triton kernel intentionally selects each token's shared-expert rank and
-    writes the expanded DeepEP TopK layout in one pass.
+    writes the expanded TopK layout in one pass.
     """
     num_tokens = topk_ids.shape[0]
     topk = topk_ids.shape[1]
