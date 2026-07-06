@@ -65,3 +65,38 @@ class MetalJitKernel:
         mx.eval(out)
         self._warmed.add(key)
         return True
+
+
+# Name-keyed registry: kernel modules register their source once at import
+# time and dispatch through get()/warm_once(), instead of each holding its own
+# module-level MetalJitKernel plus a _get_kernel wrapper for test spies.
+_REGISTRY: dict[str, MetalJitKernel] = {}
+
+
+def register(
+    name: str,
+    *,
+    name_template: str,
+    input_names: list[str],
+    output_names: list[str],
+    source: str,
+) -> None:
+    """Register one kernel under `name`, dispatched via get()/warm_once().
+
+    `name` is the registry key (e.g. "fused_moe_combine"); `name_template` is
+    the on-device Metal entry name, kept separate so shader cache keys and
+    profiler labels are unaffected by the registry key chosen.
+    """
+    if name in _REGISTRY:
+        raise ValueError(f"metal_jit: kernel {name!r} already registered")
+    _REGISTRY[name] = MetalJitKernel(name_template, input_names, output_names, source)
+
+
+def get(name: str, *dtypes: mx.Dtype):
+    """Compiled kernel for (name, dtypes). The dispatch seam tests spy on."""
+    return _REGISTRY[name].get(*dtypes)
+
+
+def warm_once(name: str, key: tuple, dispatch: Callable[[], mx.array]) -> bool:
+    """Warm `name`'s kernel for `key`; see MetalJitKernel.warm_once."""
+    return _REGISTRY[name].warm_once(key, dispatch)

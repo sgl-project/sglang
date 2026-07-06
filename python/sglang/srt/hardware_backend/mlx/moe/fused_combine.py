@@ -29,7 +29,7 @@ import logging
 
 import mlx.core as mx
 
-from sglang.srt.hardware_backend.mlx.metal_jit import MetalJitKernel
+from sglang.srt.hardware_backend.mlx import metal_jit
 
 logger = logging.getLogger(__name__)
 
@@ -84,17 +84,13 @@ _KERNEL_SOURCE = r"""
 """
 
 
-_KERNEL = MetalJitKernel(
+metal_jit.register(
+    "fused_moe_combine",
     name_template="fused_moe_combine_y{0}_s{1}",
     input_names=["y", "scores"],
     output_names=["out"],
     source=_KERNEL_SOURCE,
 )
-
-
-def _get_kernel(y_dtype: mx.Dtype, scores_dtype: mx.Dtype):
-    """Seam kept for test spies; caching lives in MetalJitKernel."""
-    return _KERNEL.get(y_dtype, scores_dtype)
 
 
 _Y_DTYPES = (mx.float16, mx.bfloat16)
@@ -146,7 +142,7 @@ def fused_combine(y: mx.array, scores: mx.array) -> mx.array:
     y = y.reshape(-1, TOPK, H)
     scores = scores.reshape(-1, TOPK)
     B = y.shape[0]
-    kernel = _get_kernel(y.dtype, scores.dtype)
+    kernel = metal_jit.get("fused_moe_combine", y.dtype, scores.dtype)
     (out,) = kernel(
         inputs=[y, scores],
         template=[

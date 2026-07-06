@@ -1,8 +1,10 @@
-"""Unit tests for the MetalJitKernel JIT declaration surface.
+"""Unit tests for the MetalJitKernel JIT declaration surface and its
+name-keyed registry.
 
 Covers per-key compile caching, kernel name formatting, dtype_tag output,
-warm_once dedupe and its non-array assertion, and one on-device dispatch
-through a trivial kernel.
+warm_once dedupe and its non-array assertion, one on-device dispatch through
+a trivial kernel, and the registry's register/get/warm_once round trip,
+per-name cache isolation, and duplicate-name rejection.
 
 Hermetic: tiny synthetic kernels only; skips off Darwin/arm64 or without
 ``mlx``.
@@ -95,6 +97,61 @@ class TestMetalJitKernel(unittest.TestCase):
             kern.warm_once(("bad",), lambda: None)
         # The failed warm must not mark the key: a later valid dispatch runs.
         self.assertTrue(kern.warm_once(("bad",), lambda: mx.zeros(1)))
+
+
+@unittest.skipUnless(_IS_APPLE_SILICON and _HAS_MLX, _SKIP_REASON)
+class TestMetalJitRegistry(unittest.TestCase):
+    """Name-keyed registry: register()/get()/warm_once() over MetalJitKernel."""
+
+    def _register(self, name):
+        metal_jit.register(
+            name,
+            name_template=f"{name}_{{0}}",
+            input_names=["x"],
+            output_names=["out"],
+            source=_ADD_ONE_SOURCE,
+        )
+
+    def test_register_get_round_trip(self):
+        self._register("metal_jit_test_registry_round_trip")
+        compiled = metal_jit.get("metal_jit_test_registry_round_trip", mx.float16)
+        x = mx.arange(256).astype(mx.float16)
+        (out,) = compiled(
+            inputs=[x],
+            template=[("T", mx.float16)],
+            grid=(256, 1, 1),
+            threadgroup=(64, 1, 1),
+            output_shapes=[(256,)],
+            output_dtypes=[mx.float16],
+        )
+        self.assertTrue(bool(mx.array_equal(out, x + 1).item()))
+
+    def test_cache_independent_per_name(self):
+        self._register("metal_jit_test_registry_a")
+        self._register("metal_jit_test_registry_b")
+        a1 = metal_jit.get("metal_jit_test_registry_a", mx.float16)
+        b1 = metal_jit.get("metal_jit_test_registry_b", mx.float16)
+        a2 = metal_jit.get("metal_jit_test_registry_a", mx.float16)
+        self.assertIs(a1, a2)
+        self.assertIsNot(a1, b1)
+
+    def test_duplicate_name_raises(self):
+        self._register("metal_jit_test_registry_dup")
+        with self.assertRaises(ValueError):
+            self._register("metal_jit_test_registry_dup")
+
+    def test_warm_once_routes_and_dedupes_by_name(self):
+        self._register("metal_jit_test_registry_warm")
+        calls = []
+
+        def dispatch():
+            calls.append(1)
+            return mx.zeros(1)
+
+        name = "metal_jit_test_registry_warm"
+        self.assertTrue(metal_jit.warm_once(name, ("k1",), dispatch))
+        self.assertFalse(metal_jit.warm_once(name, ("k1",), dispatch))
+        self.assertEqual(len(calls), 1)
 
 
 if __name__ == "__main__":

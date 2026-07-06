@@ -1,7 +1,8 @@
 """Verification for the fused MoE combine kernel (``fused_combine``).
 
-A spy on ``_get_kernel`` asserts the Metal kernel dispatched on every eligible
-case; negative controls confirm ineligible inputs fall back in ``y.dtype``.
+A spy on ``metal_jit.get`` asserts the Metal kernel dispatched on every
+eligible case; negative controls confirm ineligible inputs fall back in
+``y.dtype``.
 
 Acceptance is scores-dtype driven. fp16 and bf16 scores: bit-exact vs an
 fp32 reference, since <=11-bit mantissas make every ``y * s`` product exact
@@ -32,6 +33,7 @@ _SKIP_REASON = "Apple-Silicon-only test (requires Darwin/arm64 + mlx)"
 if _IS_APPLE_SILICON and _HAS_MLX:
     import mlx.core as mx
 
+    from sglang.srt.hardware_backend.mlx import metal_jit
     from sglang.srt.hardware_backend.mlx.moe import fused_combine as fc
 
 # Shapes inside the eligibility envelope (H % 256 == 0), decode and prefill.
@@ -109,20 +111,21 @@ class TestFusedCombine(unittest.TestCase):
 
     @staticmethod
     def _run_fused_traced(y, scores):
-        """Run fused_combine spying on _get_kernel; returns (out, fused_fired)."""
+        """Run fused_combine spying on metal_jit.get; returns (out, fused_fired)."""
         calls = []
-        orig = fc._get_kernel
+        orig = metal_jit.get
 
-        def spy(y_dtype, scores_dtype):
-            calls.append((y_dtype, scores_dtype))
-            return orig(y_dtype, scores_dtype)
+        def spy(name, *dtypes):
+            if name == "fused_moe_combine":
+                calls.append(dtypes)
+            return orig(name, *dtypes)
 
-        fc._get_kernel = spy
+        metal_jit.get = spy
         try:
             out = fc.fused_combine(y, scores)
             mx.eval(out)
         finally:
-            fc._get_kernel = orig
+            metal_jit.get = orig
         return out, (len(calls) > 0)
 
     @staticmethod
@@ -263,12 +266,18 @@ class TestFusedCombine(unittest.TestCase):
             with self.subTest(y=y_name, scores=s_name):
                 y, scores = self._make_inputs(shape, y_name, s_name, 7)
                 seen = []
-                orig = fc._get_kernel
-                fc._get_kernel = lambda yd, sd: seen.append((yd, sd)) or orig(yd, sd)
+                orig = metal_jit.get
+
+                def spy(name, *dtypes):
+                    if name == "fused_moe_combine":
+                        seen.append(dtypes)
+                    return orig(name, *dtypes)
+
+                metal_jit.get = spy
                 try:
                     mx.eval(fc.fused_combine(y, scores))
                 finally:
-                    fc._get_kernel = orig
+                    metal_jit.get = orig
                 self.assertEqual(seen, [(getattr(mx, y_name), getattr(mx, s_name))])
 
     def test_fallback_taken_when_ineligible(self):

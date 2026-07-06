@@ -50,7 +50,7 @@ import weakref
 import mlx.core as mx
 import mlx.nn as nn
 
-from sglang.srt.hardware_backend.mlx.metal_jit import MetalJitKernel
+from sglang.srt.hardware_backend.mlx import metal_jit
 
 logger = logging.getLogger(__name__)
 
@@ -199,17 +199,13 @@ _KERNEL_SOURCE = r"""
 """
 
 
-_KERNEL = MetalJitKernel(
+metal_jit.register(
+    "affine_gather_qmv_silu_mul_4bit_gs64",
     name_template="affine_gather_qmv_silu_mul_4bit_gs64_{0}",
     input_names=["x", "w", "s", "b", "idx", "x_up"],
     output_names=["y"],
     source=_KERNEL_SOURCE,
 )
-
-
-def _get_kernel(dtype: mx.Dtype):
-    """Seam kept for test spies; caching lives in MetalJitKernel."""
-    return _KERNEL.get(dtype)
 
 
 def fused_gate_qmv_silu_mul(
@@ -285,7 +281,7 @@ def fused_gate_qmv_silu_mul(
     ), f"x_up shape {x_up.shape} does not match M_tok({M_tok})*T({T})*N({N})"
     x_up_flat = x_up.reshape(M_tok * T, N)
 
-    kernel = _get_kernel(x.dtype)
+    kernel = metal_jit.get("affine_gather_qmv_silu_mul_4bit_gs64", x.dtype)
     (y_flat,) = kernel(
         inputs=[x_flat, gate_w, gate_s, gate_b, idx_flat, x_up_flat],
         template=[
@@ -339,7 +335,9 @@ def _aot_warm_kernel(switch_mlp, top_k: int) -> None:
                 x_up_dummy,
             )
 
-        if _KERNEL.warm_once((dtype, K, N, T), _dispatch):
+        if metal_jit.warm_once(
+            "affine_gather_qmv_silu_mul_4bit_gs64", (dtype, K, N, T), _dispatch
+        ):
             logger.info(
                 "Path B AOT: warmed fused kernel dtype=%s K=%d N=%d T=%d",
                 dtype,
