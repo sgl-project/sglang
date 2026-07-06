@@ -500,11 +500,8 @@ class CompressorHip(_CompressorBase):
         attn_backend: AttentionBackend,
     ) -> torch.Tensor:
         if self.use_fused_compress and (
-            envs.SGLANG_OPT_DPSK_V4_RADIX.get()
-            and (
-                forward_batch.forward_mode.is_decode()
-                or forward_batch.forward_mode.is_extend_without_speculative()
-            )
+            forward_batch.forward_mode.is_decode()
+            or forward_batch.forward_mode.is_extend_without_speculative()
         ):
             return self.compress_fused(
                 kv_score, forward_batch, attn_backend=attn_backend

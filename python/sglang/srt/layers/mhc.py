@@ -6,7 +6,6 @@ from typing import Tuple
 import torch
 
 from sglang.jit_kernel.utils import is_arch_support_pdl
-from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_round_robin_split
 from sglang.srt.layers.utils.common import strict_contiguous
 
@@ -511,8 +510,6 @@ def prewarm_mhc_pre(
     hc_sinkhorn_eps: float,
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
-    n_splits: int,
-    n_splits_pre: int,
     norm_weight: torch.Tensor | None,
     norm_eps: float | None,
 ):
@@ -542,8 +539,6 @@ def prewarm_mhc_pre(
                 hc_sinkhorn_eps,
                 hc_post_mult_value,
                 sinkhorn_repeat,
-                n_splits,
-                n_splits_pre,
                 norm_weight=norm_weight,
                 norm_eps=norm_eps,
             )
@@ -731,8 +726,6 @@ def mhc_pre(
     hc_sinkhorn_eps: float,
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
-    n_splits: int = 1,
-    n_splits_pre: int = 32,
     *,
     norm_weight: torch.Tensor | None = None,
     norm_eps: float | None = None,
@@ -769,91 +762,26 @@ def mhc_pre(
         num_tokens, hidden_size, dtype=torch.bfloat16, device=residual.device
     )
 
-    if envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
-        n_splits = _compute_num_split_for_mhc_pre(num_tokens, hc_hidden_size)
+    n_splits = _compute_num_split_for_mhc_pre(num_tokens, hc_hidden_size)
 
-        gemm_out_mul = torch.empty(
-            n_splits, num_tokens, hc_mult3, dtype=torch.float32, device=residual.device
-        )
-        gemm_out_sqrsum = torch.empty(
-            n_splits, num_tokens, dtype=torch.float32, device=residual.device
-        )
+    gemm_out_mul = torch.empty(
+        n_splits, num_tokens, hc_mult3, dtype=torch.float32, device=residual.device
+    )
+    gemm_out_sqrsum = torch.empty(
+        n_splits, num_tokens, dtype=torch.float32, device=residual.device
+    )
 
-        from sglang.srt.layers.deep_gemm_wrapper.entrypoint import tf32_hc_prenorm_gemm
+    from sglang.srt.layers.deep_gemm_wrapper.entrypoint import tf32_hc_prenorm_gemm
 
-        tf32_hc_prenorm_gemm(
-            residual_flat.view(num_tokens, hc_hidden_size),
-            fn_flat,
-            gemm_out_mul,
-            gemm_out_sqrsum,
-            n_splits,
-        )
-        gemm_last_dim = hc_mult3
-        big_fuse_n_splits = n_splits
-    else:
-        if num_tokens <= 2048:
-            assert n_splits == 1
-            if hc_hidden_size == 16384:
-                hidden_block = 256
-            elif hc_hidden_size == 28672:
-                hidden_block = 128
-            else:
-                raise NotImplementedError(
-                    f"mhc_pre splitk kernel only supports hc_hidden_size in {{16384, 28672}}, "
-                    f"got {hc_hidden_size}"
-                )
-            kernel_0, _ = mhc_pre_gemm_sqrsum_splitk_kernel(
-                hc_mult3,
-                hc_hidden_size,
-                split_k=n_splits_pre,
-                token_block=32,
-                hidden_block=hidden_block,
-            )
-            partial_out = torch.empty(
-                n_splits_pre,
-                num_tokens,
-                32,
-                dtype=torch.float32,
-                device=residual.device,
-            )
-            partial_sqrsum = torch.empty(
-                n_splits_pre, num_tokens, dtype=torch.float32, device=residual.device
-            )
-            kernel_0(
-                residual_flat.view(num_tokens, hc_hidden_size),
-                fn_flat,
-                partial_out,
-                partial_sqrsum,
-            )
-            # Stage_1 reduction is folded into big_fuse below; skip launching it.
-            gemm_out_mul = partial_out
-            gemm_out_sqrsum = partial_sqrsum
-            gemm_last_dim = 32
-            big_fuse_n_splits = n_splits_pre
-        else:
-            gemm_out_mul = torch.empty(
-                n_splits,
-                num_tokens,
-                hc_mult3,
-                dtype=torch.float32,
-                device=residual.device,
-            )
-            gemm_out_sqrsum = torch.empty(
-                n_splits, num_tokens, dtype=torch.float32, device=residual.device
-            )
-            assert (
-                n_splits == 1
-            ), "The simple TileLang version gemm_sqrsum doesn't support split-k"
-            mhc_pre_gemm_sqrsum_tilelang(
-                residual_flat.view(num_tokens, hc_mult * hidden_size),
-                fn_flat,
-                gemm_out_mul.squeeze(0),
-                gemm_out_sqrsum.squeeze(0),
-                hc_mult3,
-                hc_mult * hidden_size,
-            )
-            gemm_last_dim = hc_mult3
-            big_fuse_n_splits = n_splits
+    tf32_hc_prenorm_gemm(
+        residual_flat.view(num_tokens, hc_hidden_size),
+        fn_flat,
+        gemm_out_mul,
+        gemm_out_sqrsum,
+        n_splits,
+    )
+    gemm_last_dim = hc_mult3
+    big_fuse_n_splits = n_splits
 
     if norm_weight is not None:
         assert norm_eps is not None, "norm_eps required when norm_weight is provided"
@@ -1381,35 +1309,15 @@ def mhc_fused_post_pre(
             hidden_size,
         )
 
-        if envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
-            import deep_gemm
+        import deep_gemm
 
-            deep_gemm.tf32_hc_prenorm_gemm(
-                residual_cur.view(num_tokens, hc_hidden_size),
-                fn,
-                gemm_out_mul,
-                gemm_out_sqrsum,
-                num_splits=n_splits,
-            )
-        else:
-            # Fallback mirrors mhc_pre when DeepGEMM prenorm is disabled.
-            n_splits = 1
-            gemm_out_mul_2d = torch.empty(
-                num_tokens, hc_mult3, dtype=torch.float32, device=residual.device
-            )
-            gemm_out_sqrsum_1d = torch.empty(
-                num_tokens, dtype=torch.float32, device=residual.device
-            )
-            mhc_pre_gemm_sqrsum_tilelang(
-                residual_cur.view(num_tokens, hc_hidden_size),
-                fn,
-                gemm_out_mul_2d,
-                gemm_out_sqrsum_1d,
-                hc_mult3,
-                hc_hidden_size,
-            )
-            gemm_out_mul = gemm_out_mul_2d.unsqueeze(0)
-            gemm_out_sqrsum = gemm_out_sqrsum_1d.unsqueeze(0)
+        deep_gemm.tf32_hc_prenorm_gemm(
+            residual_cur.view(num_tokens, hc_hidden_size),
+            fn,
+            gemm_out_mul,
+            gemm_out_sqrsum,
+            num_splits=n_splits,
+        )
 
     post_mix_cur = torch.empty(
         num_tokens,

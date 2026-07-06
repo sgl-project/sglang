@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 import logging
-from typing import Optional, Tuple
+from typing import Optional
 
 import torch
 from torch import nn
 
-from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import (
     get_global_expert_distribution_recorder,
 )
@@ -133,51 +132,6 @@ class HashTopK(nn.Module):
             return topk_output
         return self.deepep_waterfill_balancer.expand_topk(topk_output, num_tokens)
 
-    def _forward_torch(
-        self, router_logits: torch.Tensor, input_ids: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if self.score_func == "softmax":
-            scores = router_logits.softmax(dim=-1)
-        elif self.score_func == "sigmoid":
-            scores = router_logits.sigmoid()
-        else:
-            scores = torch.nn.functional.softplus(router_logits).sqrt()
-
-        num_token = scores.shape[0]
-
-        topk_ids = torch.zeros(
-            (num_token, self.topk), dtype=torch.int32, device=scores.device
-        )
-        topk_weights = torch.zeros(
-            (num_token, self.topk), dtype=scores.dtype, device=scores.device
-        )
-
-        if self.num_fused_shared_experts == 1:
-            topk_ids[:, :-1] = self.tid2eid[input_ids]
-            topk_weights[:, :-1] = scores.gather(1, topk_ids[:, :-1])
-
-            if self.score_func != "softmax":
-                topk_weights[:, :-1] /= topk_weights[:, :-1].sum(dim=-1, keepdim=True)
-
-            topk_ids[:, -1] = torch.randint(
-                low=self.num_experts,
-                high=self.num_experts + self.num_fused_shared_experts,
-                size=(num_token,),
-                dtype=topk_ids.dtype,
-                device=topk_ids.device,
-            )
-
-            topk_weights[:, -1] = (
-                topk_weights[:, :-1].sum(dim=-1) / self.routed_scaling_factor
-            )
-        else:
-            topk_ids[:, :] = self.tid2eid[input_ids]
-            topk_weights[:, :] = scores.gather(1, topk_ids[:, :])
-            if self.score_func != "softmax":
-                topk_weights[:, :] /= topk_weights[:, :].sum(dim=-1, keepdim=True)
-
-        return topk_weights, topk_ids
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -190,19 +144,16 @@ class HashTopK(nn.Module):
             input_ids.shape[0] == hidden_states.shape[0] == router_logits.shape[0]
         ), f"{input_ids.shape=} {hidden_states.shape=} {router_logits.shape=}"
 
-        if envs.SGLANG_OPT_USE_FUSED_HASH_TOPK.get():
-            from sglang.jit_kernel.dsv4 import hash_topk
+        from sglang.jit_kernel.dsv4 import hash_topk
 
-            topk_weights, topk_ids = hash_topk(
-                router_logits=router_logits,
-                input_ids=input_ids,
-                tid2eid=self.tid2eid,
-                num_fused_shared_experts=self.num_fused_shared_experts,
-                routed_scaling_factor=self.routed_scaling_factor,
-                scoring_func=self.score_func,
-            )
-        else:
-            topk_weights, topk_ids = self._forward_torch(router_logits, input_ids)
+        topk_weights, topk_ids = hash_topk(
+            router_logits=router_logits,
+            input_ids=input_ids,
+            tid2eid=self.tid2eid,
+            num_fused_shared_experts=self.num_fused_shared_experts,
+            routed_scaling_factor=self.routed_scaling_factor,
+            scoring_func=self.score_func,
+        )
         if _is_hip or _is_npu:
             topk_weights = topk_weights.to(torch.float32)
 

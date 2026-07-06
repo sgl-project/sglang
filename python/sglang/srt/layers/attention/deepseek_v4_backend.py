@@ -39,9 +39,6 @@ from sglang.srt.layers.attention.dsv4.metadata import (
 from sglang.srt.layers.attention.dsv4.metadata_kernel import (
     init_compression_metadata as _init_compression_metadata_triton,
 )
-from sglang.srt.layers.attention.dsv4.quant_k_cache import (
-    quant_to_nope_fp8_rope_bf16_pack_triton,
-)
 from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
     SparsePrefillChunkCache,
     SparsePrefillWorkspace,
@@ -1295,19 +1292,11 @@ class DeepseekV4AttnBackend(
         self, layer_id: int, swa_k: torch.Tensor, forward_batch: ForwardBatch
     ) -> None:
         swa_loc = self.get_swa_out_cache_loc(forward_batch)
-        if envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get():
-            self.token_to_kv_pool.set_swa_key_buffer_radix_fused(
-                layer_id=layer_id,
-                swa_loc=swa_loc,
-                cache_k=swa_k,
-            )
-        else:
-            swa_k_pack = quant_to_nope_fp8_rope_bf16_pack_triton(swa_k)
-            self.token_to_kv_pool.set_swa_key_buffer_radix(
-                layer_id=layer_id,
-                swa_loc=swa_loc,
-                cache_nope_fp8_rope_bf16_pack=swa_k_pack,
-            )
+        self.token_to_kv_pool.set_swa_key_buffer_radix_fused(
+            layer_id=layer_id,
+            swa_loc=swa_loc,
+            cache_k=swa_k,
+        )
 
     def forward(
         self,

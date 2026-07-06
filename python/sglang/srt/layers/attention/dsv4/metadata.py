@@ -120,22 +120,12 @@ class PagedIndexerMetadata:
     )
 
     def __post_init__(self):
-        if (
-            envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
-            or envs.SGLANG_OPT_USE_AITER_INDEXER.get()
-        ):
+        if envs.SGLANG_OPT_USE_AITER_INDEXER.get():
             self.deep_gemm_metadata = None
         else:
             import deep_gemm
 
-            use_jit_indexer = (
-                envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.get()
-                or self.c4_seq_lens.numel() > _LARGE_INDEXER_QUERY_THRESHOLD
-            )
-            if use_jit_indexer:
-                from sglang.jit_kernel.dsv4 import get_paged_mqa_logits_metadata
-            else:
-                from deep_gemm import get_paged_mqa_logits_metadata
+            from sglang.jit_kernel.dsv4 import get_paged_mqa_logits_metadata
 
             _c4 = self.c4_seq_lens.to(torch.int32)
             if _c4.dim() == 1:
@@ -150,10 +140,7 @@ class PagedIndexerMetadata:
 
         from sglang.jit_kernel.dsv4 import plan_topk_v2
 
-        if envs.SGLANG_OPT_USE_TOPK_V2.get():
-            self.topk_metadata = plan_topk_v2(self.c4_seq_lens)
-        else:
-            self.topk_metadata = torch.empty((0,))
+        self.topk_metadata = plan_topk_v2(self.c4_seq_lens)
 
         assert self.page_size == 256, "the system hardcodes page_size=256"
 

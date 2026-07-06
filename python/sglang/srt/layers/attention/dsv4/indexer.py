@@ -32,7 +32,6 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
 )
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.utils import add_prefix, is_cuda, is_hip
-from sglang.srt.utils.common import is_sm120_supported
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -52,75 +51,6 @@ else:
     FP8_MAX = torch.finfo(FP8_DTYPE).max
 
 IndexerQuery: TypeAlias = Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
-
-
-_arange_cache = {}
-
-
-def fp8_paged_mqa_logits_torch(
-    q_fp8: torch.Tensor,
-    kvcache_fp8: torch.Tensor,
-    weight: torch.Tensor,
-    seq_lens: torch.Tensor,
-    page_table: torch.Tensor,
-    deep_gemm_metadata: Any,
-    max_seq_len: int,
-    clean_logits: bool = True,
-) -> torch.Tensor:
-    """Vectorized implementation compatible with CUDA graph capture."""
-    _ = deep_gemm_metadata
-    batch_size, _, num_heads, head_dim = q_fp8.shape
-    block_size = kvcache_fp8.shape[1]
-
-    assert head_dim == 128
-    assert block_size == 64
-    assert q_fp8.shape == (batch_size, 1, num_heads, head_dim)
-    assert kvcache_fp8.shape[1:] == (block_size, 1, head_dim + 4)
-    assert weight.shape == (batch_size, num_heads)
-    assert seq_lens.shape == (batch_size,)
-    assert page_table.shape[0] == batch_size
-    assert clean_logits == False
-
-    max_num_pages = page_table.shape[1]
-    SCALE_OFFSET = block_size * head_dim
-    total_dim = block_size * (head_dim + 4)
-
-    kvcache_flat = kvcache_fp8.view(-1, total_dim)
-
-    pages_clamped = page_table.clamp(min=0)
-    kvcache_gathered = kvcache_flat[pages_clamped]
-
-    kv_values_raw = kvcache_gathered[..., :SCALE_OFFSET].contiguous()
-    kv_values_fp8 = kv_values_raw.view(dtype=FP8_DTYPE)
-    kv_values = kv_values_fp8.to(torch.float32)
-    kv_values = kv_values.reshape(batch_size, max_num_pages * block_size, head_dim)
-
-    kv_scales_raw = kvcache_gathered[..., SCALE_OFFSET:].contiguous()
-    kv_scales = kv_scales_raw.view(dtype=torch.float32)
-    kv_scales = kv_scales.reshape(batch_size, max_num_pages * block_size)
-
-    q_float = q_fp8[:, 0].to(torch.float32)
-    scores = torch.bmm(kv_values, q_float.transpose(1, 2))
-    scores = F.relu(scores)
-    scores = scores * weight.unsqueeze(1)
-    scores = scores.sum(dim=2)
-    scores = scores * kv_scales
-
-    padded_seq_len = max_num_pages * block_size
-    cache = _arange_cache
-    arange_key = f"arange_{padded_seq_len}_{scores.device}"
-    if arange_key not in cache:
-        cache[arange_key] = torch.arange(padded_seq_len, device=scores.device)
-    positions = cache[arange_key].unsqueeze(0)
-    valid_mask = positions < seq_lens.unsqueeze(1)
-    scores = scores.masked_fill(~valid_mask, 0.0)
-
-    if padded_seq_len < max_seq_len:
-        scores = F.pad(scores, (0, max_seq_len - padded_seq_len), value=0.0)
-    else:
-        scores = scores[:, :max_seq_len]
-
-    return scores
 
 
 def _aiter_fp8_paged_mqa_logits(
@@ -161,159 +91,6 @@ def _aiter_fp8_paged_mqa_logits(
         Preshuffle=True,
     )
     return logits
-
-
-def fp8_paged_mqa_logits_torch_sm120(
-    q_fp8: torch.Tensor,
-    kvcache_fp8: torch.Tensor,
-    weight: torch.Tensor,
-    seq_lens: torch.Tensor,
-    page_table: torch.Tensor,
-    deep_gemm_metadata: Any,
-    max_seq_len: int,
-    clean_logits: bool = True,
-) -> torch.Tensor:
-    """CUDA-graph-compatible FP8 paged MQA logits for SM120 (vectorized, no .item())."""
-    _ = deep_gemm_metadata
-    batch_size, _, num_heads, head_dim = q_fp8.shape
-    block_size = kvcache_fp8.shape[1]
-    device = q_fp8.device
-
-    assert head_dim == 128, "Vectorized torch impl hardcodes DSV4 indexer head_dim=128"
-    assert (
-        block_size == 64
-    ), "Vectorized torch impl hardcodes block_size=64 cache layout"
-    assert q_fp8.shape == (batch_size, 1, num_heads, head_dim)
-    assert kvcache_fp8.shape[1:] == (block_size, 1, head_dim + 4)
-    assert weight.shape == (batch_size, num_heads)
-    if seq_lens.dim() > 1:
-        seq_lens = seq_lens.squeeze(-1)
-    assert seq_lens.shape == (batch_size,)
-    assert page_table.shape[0] == batch_size
-    assert clean_logits == False
-
-    max_pages = (max_seq_len + block_size - 1) // block_size
-    max_padded_seq = max_pages * block_size
-
-    kvcache_flat = kvcache_fp8.view(-1, block_size * (head_dim + 4))
-    SCALE_OFFSET = block_size * head_dim
-
-    page_ids = page_table[:, :max_pages]
-    kvcache_gathered = kvcache_flat[page_ids]
-
-    kv_value_raw = kvcache_gathered[..., :SCALE_OFFSET]
-    kv_scale_raw = kvcache_gathered[..., SCALE_OFFSET:]
-
-    kv_value = kv_value_raw.contiguous().view(dtype=FP8_DTYPE).to(torch.float32)
-    kv_value = kv_value.view(batch_size, max_padded_seq, head_dim)
-
-    kv_scale = kv_scale_raw.contiguous().view(dtype=torch.float32)
-    kv_scale = kv_scale.view(batch_size, max_padded_seq)
-
-    q = q_fp8[:, 0].to(torch.float32)
-
-    score = torch.bmm(kv_value, q.transpose(1, 2))
-
-    score = F.relu(score)
-    score = score * weight.unsqueeze(1)
-    score = score.sum(dim=2)
-
-    score = score * kv_scale
-
-    out_width = min(max_padded_seq, max_seq_len)
-    logits = score.new_full((batch_size, max_seq_len), float("-inf"))
-    logits[:, :out_width] = score[:, :out_width]
-
-    positions = torch.arange(max_seq_len, device=device)
-    invalid_mask = positions.unsqueeze(0) >= seq_lens.unsqueeze(1)
-    logits.masked_fill_(invalid_mask, float("-inf"))
-
-    return logits
-
-
-def topk_transform_512_pytorch_vectorized(
-    scores: torch.Tensor,
-    seq_lens: torch.Tensor,
-    page_tables: torch.Tensor,
-    out_page_indices: torch.Tensor,
-    page_size: int,
-    out_raw_indices: Optional[torch.Tensor] = None,
-) -> None:
-    """Vectorized PyTorch fallback for topk_transform_512.
-    All helper tensors (arange, zeros) are cached to avoid device-tensor
-    creation during HIP/CUDA graph capture."""
-
-    TOPK = out_page_indices.shape[1]
-    batch_size = scores.shape[0]
-    max_seq_len = scores.shape[1]
-    device = scores.device
-
-    page_bits = (page_size - 1).bit_length() if page_size > 1 else 0
-    page_mask = page_size - 1
-
-    cache = _arange_cache
-    key_seq = f"arange_{max_seq_len}_{device}"
-    key_topk = f"arange_{TOPK}_{device}"
-    key_bs = f"arange_{batch_size}_{device}"
-    if key_seq not in cache:
-        cache[key_seq] = torch.arange(max_seq_len, device=device)
-    if key_topk not in cache:
-        cache[key_topk] = torch.arange(TOPK, device=device, dtype=torch.int32)
-    if key_bs not in cache:
-        cache[key_bs] = torch.arange(batch_size, device=device)
-
-    positions = cache[key_seq].unsqueeze(0).expand(batch_size, -1)
-    valid_mask = positions < seq_lens.unsqueeze(1)
-
-    masked_scores = scores.clone()
-    masked_scores.masked_fill_(~valid_mask, float("-inf"))
-
-    actual_k = min(TOPK, max_seq_len)
-    _, raw_indices = torch.topk(
-        masked_scores, k=actual_k, dim=1, largest=True, sorted=False
-    )
-    raw_indices = raw_indices.to(torch.int32)
-
-    if actual_k < TOPK:
-        raw_indices = F.pad(raw_indices, (0, TOPK - actual_k), value=0)
-
-    batch_indices = cache[key_bs].unsqueeze(1).expand(-1, TOPK)
-    gathered_scores = scores[
-        batch_indices.flatten(), raw_indices.clamp(min=0).flatten()
-    ].view(batch_size, TOPK)
-
-    valid_topk = gathered_scores != float("-inf")
-    if actual_k < TOPK:
-        pad_mask = cache[key_topk].unsqueeze(0) >= actual_k
-        valid_topk = valid_topk & ~pad_mask
-
-    needs_sequential = seq_lens <= TOPK
-    sequential_indices = cache[key_topk].unsqueeze(0).expand(batch_size, -1)
-    sequential_valid = sequential_indices < seq_lens.unsqueeze(1)
-
-    seq_indices_or_neg1 = sequential_indices.clone()
-    seq_indices_or_neg1.masked_fill_(~sequential_valid, -1)
-
-    needs_seq_mask = needs_sequential.unsqueeze(1).expand(-1, TOPK)
-    raw_indices = torch.where(needs_seq_mask, seq_indices_or_neg1, raw_indices)
-    valid_topk = torch.where(needs_seq_mask, sequential_valid, valid_topk)
-
-    page_idx = raw_indices >> page_bits
-    offset_in_page = raw_indices & page_mask
-
-    page_idx_clamped = torch.clamp(page_idx, min=0)
-    physical_pages = torch.gather(page_tables, dim=1, index=page_idx_clamped.long())
-
-    page_indices = (physical_pages << page_bits) | offset_in_page
-    page_indices = page_indices.to(torch.int32)
-    page_indices.masked_fill_(~valid_topk, -1)
-
-    out_page_indices.copy_(page_indices)
-
-    if out_raw_indices is not None:
-        raw_indices = raw_indices.clone()
-        raw_indices.masked_fill_(~valid_topk, -1)
-        out_raw_indices.copy_(raw_indices)
 
 
 @triton.jit
@@ -460,7 +237,6 @@ class C4IndexerBackendMixin:
             c4_indexer.use_fp4_indexer
             or envs.SGLANG_OPT_USE_TILELANG_INDEXER.get()
             or envs.SGLANG_OPT_USE_AITER_INDEXER.get()
-            or envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
         ):
             return False
         if (
@@ -664,11 +440,6 @@ class C4IndexerBackendMixin:
             )
         elif envs.SGLANG_OPT_USE_AITER_INDEXER.get():
             fn = _aiter_fp8_paged_mqa_logits
-        elif envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get():
-            if is_sm120_supported():
-                fn = fp8_paged_mqa_logits_torch_sm120
-            else:
-                fn = fp8_paged_mqa_logits_torch
         else:
             from deep_gemm import fp8_paged_mqa_logits as fn
 
@@ -753,16 +524,7 @@ class C4IndexerBackendMixin:
         elif core_metadata.c4_sparse_raw_indices is not None:
             raw_indices = core_metadata.c4_sparse_raw_indices
 
-        if envs.SGLANG_TOPK_TRANSFORM_512_TORCH.get():
-            topk_transform_512_pytorch_vectorized(
-                logits,
-                c4_seq_lens,
-                page_table,
-                c4_sparse_page_indices,
-                indexer_metadata.c4_page_size,
-                raw_indices,
-            )
-        elif envs.SGLANG_OPT_USE_TOPK_V2.get() and raw_indices is None:
+        if raw_indices is None:
             topk_transform_512_v2(
                 logits,
                 c4_seq_lens,

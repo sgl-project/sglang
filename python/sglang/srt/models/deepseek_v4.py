@@ -99,7 +99,6 @@ from sglang.srt.model_executor.forward_context import (
     get_token_to_kv_pool,
 )
 from sglang.srt.model_executor.runner import (
-    compile_in_capture_mode,
     get_is_capture_mode,
 )
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
@@ -114,9 +113,6 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
 from sglang.srt.model_loader.utils import maybe_executor_submit, should_async_load
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.dbrx import ReplicatedLinear
-from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
-    try_fused_hc_post_pre,
-)
 from sglang.srt.models.deepseek_common.utils import _use_aiter_bpreshuffle_gfx95
 from sglang.srt.models.deepseek_v2 import (
     ParallelLMHead,
@@ -132,10 +128,8 @@ if not _is_hip:
         prepare_context_parallel_metadata,
     )
 
-if _is_xpu:
-    from sgl_kernel import hc_split_sinkhorn
-else:
-    from sglang.srt.layers.mhc import hc_split_sinkhorn, mhc_fused_post_pre, npu_hc_pre
+if not _is_xpu:
+    from sglang.srt.layers.mhc import npu_hc_pre
 
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
@@ -159,16 +153,6 @@ logger = logging.getLogger(__name__)
 
 _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
 _MHC_POST_MULT_VALUE = 2.0
-
-
-def _is_fused_mhc_post_pre_enabled() -> bool:
-    # The fused path directly reuses TileLang mhc_post/mhc_pre kernels and their
-    # tensor layout assumptions, so keep it disabled when either dependency is off.
-    return (
-        envs.SGLANG_OPT_FUSE_MHC_POST_PRE.get()
-        and envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get()
-        and envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get()
-    )
 
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
@@ -415,30 +399,13 @@ class MQALayer(nn.Module):
         self._attn_sink_local: Optional[torch.Tensor] = (
             self.attn_sink if attn_tp_size == 1 else None
         )
-        self.fuse_wqa_wkv = envs.SGLANG_OPT_FUSE_WQA_WKV.get()
-        if self.fuse_wqa_wkv:
-            self.wqkv_a = ReplicatedLinear(
-                self.hidden_size,
-                self.q_lora_rank + self.head_dim,
-                bias=False,
-                quant_config=quant_config,
-                prefix=add_prefix("wqkv_a", prefix),
-            )
-        else:
-            self.wq_a = ReplicatedLinear(
-                self.hidden_size,
-                self.q_lora_rank,
-                bias=False,
-                quant_config=quant_config,
-                prefix=add_prefix("wq_a", prefix),
-            )
-            self.wkv = ReplicatedLinear(
-                self.hidden_size,
-                self.head_dim,
-                bias=False,
-                quant_config=quant_config,
-                prefix=add_prefix("wkv", prefix),
-            )
+        self.wqkv_a = ReplicatedLinear(
+            self.hidden_size,
+            self.q_lora_rank + self.head_dim,
+            bias=False,
+            quant_config=quant_config,
+            prefix=add_prefix("wqkv_a", prefix),
+        )
         self.q_norm = RMSNorm(self.q_lora_rank, eps=self.eps)
         self.wq_b = ColumnParallelLinear(
             self.q_lora_rank,
@@ -487,9 +454,7 @@ class MQALayer(nn.Module):
             prefix=add_prefix("attn_mqa", prefix),
         )
 
-        self.use_fused_qk_norm_rope = (
-            _is_hip and envs.SGLANG_OPT_USE_FUSED_QK_NORM_ROPE.get()
-        )
+        self.use_fused_qk_norm_rope = _is_hip
 
         # KV cache write is always fused into the K kernel
         # (`_compute_kv_to_cache`), so the legacy "overlap store cache" flag
@@ -503,7 +468,8 @@ class MQALayer(nn.Module):
         if qkv_a is not None:
             q = qkv_a[..., : self.q_lora_rank]
         else:
-            q, _ = self.wq_a(x)
+            qkv_a, _ = self.wqkv_a(x)
+            q = qkv_a[..., : self.q_lora_rank]
         return self.q_norm(q)
 
     def _compute_q_b(
@@ -536,7 +502,8 @@ class MQALayer(nn.Module):
         if qkv_a is not None:
             kv = qkv_a[..., self.q_lora_rank :]
         else:
-            kv, _ = self.wkv(x)
+            qkv_a, _ = self.wqkv_a(x)
+            kv = qkv_a[..., self.q_lora_rank :]
         token_to_kv_pool = get_token_to_kv_pool()
         if TYPE_CHECKING:
             assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
@@ -560,7 +527,8 @@ class MQALayer(nn.Module):
         if qkv_a is not None:
             kv = qkv_a[..., self.q_lora_rank :]
         else:
-            kv, _ = self.wkv(x)
+            qkv_a, _ = self.wqkv_a(x)
+            kv = qkv_a[..., self.q_lora_rank :]
         kv = kv.contiguous()
         fused_norm_rope_inplace(
             kv,
@@ -595,9 +563,8 @@ class MQALayer(nn.Module):
         x_linear = x_quant if x_quant is not None else x
         qkv_a: Optional[torch.Tensor] = None
         qkv_a_ready: Optional[torch.cuda.Event] = None
-        if self.fuse_wqa_wkv:
-            qkv_a, _ = self.wqkv_a(x_linear)
-            qkv_a_ready = current_stream.record_event()
+        qkv_a, _ = self.wqkv_a(x_linear)
+        qkv_a_ready = current_stream.record_event()
 
         q_lora = self._compute_q_a(x_linear, qkv_a=qkv_a)
         q_lora_ready = current_stream.record_event()
@@ -673,12 +640,8 @@ class MQALayer(nn.Module):
                 )
 
         x_linear = x_quant if x_quant is not None else x
-        if self.fuse_wqa_wkv:
-            qkv_a, _ = self.wqkv_a(x_linear)
-            q_lora = qkv_a[..., : self.q_lora_rank]
-        else:
-            q_lora, _ = self.wq_a(x_linear)
-            qkv_a = None
+        qkv_a, _ = self.wqkv_a(x_linear)
+        q_lora = qkv_a[..., : self.q_lora_rank]
 
         if self.use_fused_qk_norm_rope:
             if _is_gfx95_supported:
@@ -692,11 +655,7 @@ class MQALayer(nn.Module):
                 q_lora = self.q_norm(q_lora)
                 q, _ = self.wq_b(q_lora)
 
-            kv = (
-                qkv_a[..., self.q_lora_rank :]
-                if qkv_a is not None
-                else self.wkv(x_linear)[0]
-            )
+            kv = qkv_a[..., self.q_lora_rank :]
 
             from sglang.srt.layers.fused_qk_norm_rope_store import (
                 fused_qk_norm_rope_swa_store,
@@ -759,12 +718,8 @@ class MQALayer(nn.Module):
         x_quant=None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         x_linear = x_quant if x_quant is not None else x
-        if self.fuse_wqa_wkv:
-            qkv_a, _ = self.wqkv_a(x_linear)
-            q_lora = qkv_a[..., : self.q_lora_rank]
-        else:
-            q_lora, _ = self.wq_a(x_linear)
-            qkv_a = None
+        qkv_a, _ = self.wqkv_a(x_linear)
+        q_lora = qkv_a[..., : self.q_lora_rank]
 
         use_cp = self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch)
         kv: Optional[torch.Tensor]
@@ -791,11 +746,7 @@ class MQALayer(nn.Module):
                 q_lora = self.q_norm(q_lora)
                 q, _ = self.wq_b(q_lora)
 
-            kv = (
-                qkv_a[..., self.q_lora_rank :]
-                if qkv_a is not None
-                else self.wkv(x_linear)[0]
-            )
+            kv = qkv_a[..., self.q_lora_rank :]
 
             token_to_kv_pool = get_token_to_kv_pool()
             if unified:
@@ -853,10 +804,7 @@ class MQALayer(nn.Module):
             _dummy = q.new_ones(q.shape[-1])
             q = torch_npu.npu_rms_norm(q, _dummy, self.eps)[0]
 
-            if qkv_a is not None:
-                kv = qkv_a[..., self.q_lora_rank :]
-            else:
-                kv, _ = self.wkv(x)
+            kv = qkv_a[..., self.q_lora_rank :]
             kv = self.kv_norm(kv)
 
             v4_rope_inplace_npu(
@@ -1190,18 +1138,6 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.hc_ffn_scale = nn.Parameter(torch.empty(3, dtype=torch.float32))
         self.rms_norm_eps = config.rms_norm_eps
         self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
-        self.use_fused_mhc_post_pre = _is_fused_mhc_post_pre_enabled()
-        self._input_layernorm_weight_bf16 = None
-        self._post_attention_layernorm_weight_bf16 = None
-
-    def refresh_mhc_norm_weight_cache(self):
-        # Cache bf16 norm weights so the fused path does not allocate/cast per forward.
-        self._input_layernorm_weight_bf16 = (
-            self.input_layernorm.weight.data.bfloat16().contiguous()
-        )
-        self._post_attention_layernorm_weight_bf16 = (
-            self.post_attention_layernorm.weight.data.bfloat16().contiguous()
-        )
 
     def hc_pre(
         self,
@@ -1214,15 +1150,6 @@ class DeepseekV4DecoderLayer(nn.Module):
     ):
         """If *norm* is given and the TileLang path is active, the returned
         hidden_states are already post-norm (the norm is fused into the kernel)."""
-
-        @compile_in_capture_mode
-        def hc_pre_torch_impl(x, hc_fn):
-            x_flat = x.flatten(1).float()
-            rsqrt = torch.rsqrt(
-                x_flat.square().mean(-1, keepdim=True) + self.rms_norm_eps
-            )
-            mixes = (F.linear(x_flat, hc_fn) * rsqrt).unsqueeze(1)
-            return x_flat, mixes
 
         shape, dtype = x.size(), x.dtype
 
@@ -1247,73 +1174,26 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
             return y, post, comb, False
 
-        if envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
-            from sglang.srt.layers.mhc import mhc_pre
+        from sglang.srt.layers.mhc import mhc_pre
 
-            norm_kwargs = {}
-            if norm is not None:
-                norm_kwargs["norm_weight"] = norm.weight.data
-                norm_kwargs["norm_eps"] = norm.variance_epsilon
+        norm_kwargs = {}
+        if norm is not None:
+            norm_kwargs["norm_weight"] = norm.weight.data
+            norm_kwargs["norm_eps"] = norm.variance_epsilon
 
-            post, comb, y = mhc_pre(
-                residual=x,
-                fn=hc_fn,
-                hc_scale=hc_scale,
-                hc_base=hc_base,
-                rms_eps=self.rms_norm_eps,
-                hc_pre_eps=self.hc_eps,
-                hc_sinkhorn_eps=self.hc_eps,
-                hc_post_mult_value=_MHC_POST_MULT_VALUE,
-                sinkhorn_repeat=self.hc_sinkhorn_iters,
-                **norm_kwargs,
-            )
-            return y, post.squeeze(-1), comb, norm is not None
-
-        if _is_hip and envs.SGLANG_OPT_USE_AITER_MHC_PRE.get():
-            from aiter.ops.mhc import mhc_pre
-
-            post, comb, y = mhc_pre(
-                residual=x,
-                fn=hc_fn,
-                hc_scale=hc_scale,
-                hc_base=hc_base,
-                rms_eps=self.rms_norm_eps,
-                hc_pre_eps=self.hc_eps,
-                hc_sinkhorn_eps=self.hc_eps,
-                hc_post_mult_value=_MHC_POST_MULT_VALUE,
-                sinkhorn_repeat=self.hc_sinkhorn_iters,
-            )
-            return y, post.squeeze(-1), comb, False
-
-        if envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
-            from sglang.srt.layers.deep_gemm_wrapper.entrypoint import (
-                tf32_hc_prenorm_gemm,
-            )
-
-            x_flat = x.flatten(1).bfloat16()
-
-            m, k = x_flat.shape
-            mix_hc = hc_fn.size(0)
-            d_out = torch.empty((m, mix_hc), dtype=torch.float, device=x.device)
-            s_out = torch.empty((m,), dtype=torch.float, device=x.device)
-            tf32_hc_prenorm_gemm(
-                x_flat, hc_fn.float().contiguous(), d_out, s_out, num_splits=None
-            )
-            rsqrt = torch.rsqrt(s_out / k + self.rms_norm_eps)
-            mixes = (d_out * rsqrt.unsqueeze(1)).unsqueeze(1)
-        else:
-            x_flat, mixes = hc_pre_torch_impl(x, hc_fn)
-
-        pre, post, comb = hc_split_sinkhorn(
-            mixes,
-            hc_scale,
-            hc_base,
-            self.hc_mult,
-            self.hc_sinkhorn_iters,
-            self.hc_eps,
+        post, comb, y = mhc_pre(
+            residual=x,
+            fn=hc_fn,
+            hc_scale=hc_scale,
+            hc_base=hc_base,
+            rms_eps=self.rms_norm_eps,
+            hc_pre_eps=self.hc_eps,
+            hc_sinkhorn_eps=self.hc_eps,
+            hc_post_mult_value=_MHC_POST_MULT_VALUE,
+            sinkhorn_repeat=self.hc_sinkhorn_iters,
+            **norm_kwargs,
         )
-        y = (pre.squeeze(1).unsqueeze(-1) * x_flat.view(shape)).sum(dim=1)
-        return y.to(dtype), post.squeeze(1), comb.squeeze(1), False
+        return y, post.squeeze(-1), comb, norm is not None
 
     def hc_post(
         self,
@@ -1331,30 +1211,9 @@ class DeepseekV4DecoderLayer(nn.Module):
         if _is_npu:
             return torch.ops.custom.npu_hc_post(x, residual, post, comb)
 
-        if envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get():
-            from sglang.srt.layers.mhc import mhc_post
+        from sglang.srt.layers.mhc import mhc_post
 
-            return mhc_post(x, residual, post, comb)
-
-        elif _is_hip and envs.SGLANG_OPT_USE_AITER_MHC_POST.get():
-            from aiter.ops.mhc import mhc_post
-
-            result = torch.empty_like(residual)
-            mhc_post(result, x, residual, post, comb)
-            return result
-
-        assert residual.shape == (x.shape[0], self.hc_mult, x.shape[-1])
-        assert post.shape == (x.shape[0], self.hc_mult)
-        assert comb.shape == (x.shape[0], self.hc_mult, self.hc_mult)
-
-        @compile_in_capture_mode
-        def hc_post_torch_impl(x, residual, post, comb):
-            return (
-                post.unsqueeze(-1) * x.unsqueeze(1)
-                + (comb.unsqueeze(-1) * residual.unsqueeze(2)).sum(dim=1)
-            ).type_as(x)
-
-        return hc_post_torch_impl(x, residual, post, comb)
+        return mhc_post(x, residual, post, comb)
 
     def forward(
         self,
@@ -1363,61 +1222,28 @@ class DeepseekV4DecoderLayer(nn.Module):
         input_ids: torch.Tensor,
         forward_batch: ForwardBatch,
         input_ids_global: torch.Tensor,
-        prev_residual: Optional[torch.Tensor] = None,
-        prev_post: Optional[torch.Tensor] = None,
-        prev_comb: Optional[torch.Tensor] = None,
-    ) -> Tuple[
-        torch.Tensor,
-        Optional[torch.Tensor],
-        Optional[torch.Tensor],
-        Optional[torch.Tensor],
-    ]:
-        use_fused = self.use_fused_mhc_post_pre
-
-        if prev_residual is not None and use_fused:
-            residual, post, comb, hidden_states = mhc_fused_post_pre(
-                hidden_states,
-                prev_residual,
-                prev_post,
-                prev_comb,
-                self.hc_attn_fn,
-                self.hc_attn_scale,
-                self.hc_attn_base,
-                self.rms_norm_eps,
-                self.hc_eps,
-                self.hc_eps,
-                _MHC_POST_MULT_VALUE,
-                self.hc_sinkhorn_iters,
-                norm_weight=(
-                    self._input_layernorm_weight_bf16
-                    if self._input_layernorm_weight_bf16 is not None
-                    else self.input_layernorm.weight.data
-                ),
-                norm_eps=self.input_layernorm.variance_epsilon,
-            )
-            x_quant = None
-        else:
-            residual = hidden_states
-            hidden_states, post, comb, norm_fused = self.hc_pre(
-                hidden_states,
-                self.hc_attn_fn,
-                self.hc_attn_scale,
-                self.hc_attn_base,
-                norm=self.input_layernorm,
-                forward_batch=forward_batch,
-            )
-            if not norm_fused:
-                if _use_aiter and _is_gfx95_supported:
-                    x_quant, hidden_states = _fused_rmsnorm_fp8_quant(
-                        hidden_states,
-                        self.input_layernorm.weight,
-                        self.rms_norm_eps,
-                    )
-                else:
-                    hidden_states = self.input_layernorm(hidden_states)
-                    x_quant = None
+    ) -> torch.Tensor:
+        residual = hidden_states
+        hidden_states, post, comb, norm_fused = self.hc_pre(
+            hidden_states,
+            self.hc_attn_fn,
+            self.hc_attn_scale,
+            self.hc_attn_base,
+            norm=self.input_layernorm,
+            forward_batch=forward_batch,
+        )
+        if not norm_fused:
+            if _use_aiter and _is_gfx95_supported:
+                x_quant, hidden_states = _fused_rmsnorm_fp8_quant(
+                    hidden_states,
+                    self.input_layernorm.weight,
+                    self.rms_norm_eps,
+                )
             else:
+                hidden_states = self.input_layernorm(hidden_states)
                 x_quant = None
+        else:
+            x_quant = None
 
         hidden_states = self.self_attn(
             x=hidden_states,
@@ -1426,59 +1252,18 @@ class DeepseekV4DecoderLayer(nn.Module):
             x_quant=x_quant,
         )
 
-        if use_fused:
-            fused_mhc = try_fused_hc_post_pre(
-                hidden_states,
-                residual,
-                post,
-                comb,
-                self.hc_ffn_fn.T,
-                self.hc_ffn_scale,
-                self.hc_ffn_base,
-                self.hc_mult,
-                self.rms_norm_eps,
-                self.hc_eps,
-                _MHC_POST_MULT_VALUE,
-                self.hc_sinkhorn_iters,
-                _is_gfx95_supported,
-            )
-            if fused_mhc is not None:
-                residual, hidden_states, post, comb, norm_fused = fused_mhc
-            else:
-                residual, post, comb, hidden_states = mhc_fused_post_pre(
-                    hidden_states,
-                    residual,
-                    post.unsqueeze(-1) if post.ndim == 2 else post,
-                    comb,
-                    self.hc_ffn_fn,
-                    self.hc_ffn_scale,
-                    self.hc_ffn_base,
-                    self.rms_norm_eps,
-                    self.hc_eps,
-                    self.hc_eps,
-                    _MHC_POST_MULT_VALUE,
-                    self.hc_sinkhorn_iters,
-                    norm_weight=(
-                        self._post_attention_layernorm_weight_bf16
-                        if self._post_attention_layernorm_weight_bf16 is not None
-                        else self.post_attention_layernorm.weight.data
-                    ),
-                    norm_eps=self.post_attention_layernorm.variance_epsilon,
-                )
-                norm_fused = True
-        else:
-            hidden_states = self.hc_post(hidden_states, residual, post, comb)
-            residual = hidden_states
-            hidden_states, post, comb, norm_fused = self.hc_pre(
-                hidden_states,
-                self.hc_ffn_fn,
-                self.hc_ffn_scale,
-                self.hc_ffn_base,
-                norm=self.post_attention_layernorm,
-                forward_batch=forward_batch,
-            )
-            if not norm_fused:
-                hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.hc_post(hidden_states, residual, post, comb)
+        residual = hidden_states
+        hidden_states, post, comb, norm_fused = self.hc_pre(
+            hidden_states,
+            self.hc_ffn_fn,
+            self.hc_ffn_scale,
+            self.hc_ffn_base,
+            norm=self.post_attention_layernorm,
+            forward_batch=forward_batch,
+        )
+        if not norm_fused:
+            hidden_states = self.post_attention_layernorm(hidden_states)
 
         _use_cp = self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch)
         _use_tp_moe_gather = (
@@ -1488,7 +1273,6 @@ class DeepseekV4DecoderLayer(nn.Module):
         )
         _use_tp_attn_a2a_scatter = (
             not _use_cp
-            and envs.SGLANG_DSV4_FIX_TP_ATTN_A2A_SCATTER.get()
             and get_parallel().attn_tp_size > 1
             and not get_moe_a2a_backend().is_none()
         )
@@ -1613,13 +1397,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             attn_tp_all_gather(gathered, hidden_states.contiguous())
             hidden_states = torch.cat(gathered)
 
-        if not use_fused:
-            hidden_states = self.hc_post(hidden_states, residual, post, comb)
-            return hidden_states, None, None, None
-
-        # Return the deferred FFN hc_post state; the next layer consumes it with
-        # cross-layer fusion, and the final layer is completed in DeepseekV4Model.
-        return hidden_states, residual, post, comb
+        return self.hc_post(hidden_states, residual, post, comb)
 
     # ------------------------------------------------------------------
     # TBO op decomposition (prefill two-batch-overlap, EP / mori path)
@@ -1897,7 +1675,6 @@ class DeepseekV4Model(nn.Module):
             self.hc_head_scale = nn.Parameter(torch.empty(1, dtype=torch.float32))
 
         self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
-        self.use_fused_mhc_post_pre = _is_fused_mhc_post_pre_enabled()
         if self.dsa_enable_prefill_cp:
             self.cp_size = get_parallel().attn_cp_size
 
@@ -2083,40 +1860,28 @@ class DeepseekV4Model(nn.Module):
                 delattr(forward_batch, _attr)
 
         if self._can_run_tbo(forward_batch):
-            # Two-batch-overlap prefill (EP / mori). Cross-layer mHC fusion is
-            # disabled here (each layer self-contained), so no trailing hc_post.
+            # Two-batch-overlap prefill (EP / mori).
             hidden_states = self._forward_layers_tbo(
                 positions=positions,
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
             )
         else:
-            use_fused = self.use_fused_mhc_post_pre
-            prev_residual, prev_post, prev_comb = None, None, None
-            last_layer = None
             for i in range(self.start_layer, self.end_layer):
                 layer = self.layers[i]
-                last_layer = layer
                 ctx = (
                     nullcontext()
                     if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
                     else get_global_expert_distribution_recorder().with_current_layer(i)
                 )
                 with ctx:
-                    hidden_states, prev_residual, prev_post, prev_comb = layer(
+                    hidden_states = layer(
                         positions=positions,
                         hidden_states=hidden_states,
                         forward_batch=forward_batch,
                         input_ids=input_ids,
                         input_ids_global=input_ids_global,
-                        prev_residual=prev_residual,
-                        prev_post=prev_post,
-                        prev_comb=prev_comb,
                     )
-            if use_fused and last_layer is not None:
-                hidden_states = last_layer.hc_post(
-                    hidden_states, prev_residual, prev_post, prev_comb
-                )
 
         # CP all-gather only on the last PP rank; PP IPC carries CP-split tensors.
         if self.pp_group.is_last_rank and dsa_use_prefill_cp(forward_batch):
@@ -2336,7 +2101,6 @@ class DeepseekV4ForCausalLM(nn.Module):
                 and not self_attn.indexer.compressor.ape_converted
             ):
                 self_attn.indexer.compressor.apply_ape_hotfix()
-            layer.refresh_mhc_norm_weight_cache()
 
     @staticmethod
     def remap_weight_name_to_dpsk_hf_format(
@@ -2411,10 +2175,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         if self._mhc_prewarmed_at_load:
             return
         self._mhc_prewarmed_at_load = True
-        if _is_npu or not (
-            envs.SGLANG_DSV4_MHC_PREWARM.get()
-            and envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get()
-        ):
+        if _is_npu:
             return
         layer = next(
             (m for m in self.model.layers if isinstance(m, DeepseekV4DecoderLayer)),
@@ -2441,8 +2202,6 @@ class DeepseekV4ForCausalLM(nn.Module):
             hc_sinkhorn_eps=layer.hc_eps,
             hc_post_mult_value=_MHC_POST_MULT_VALUE,
             sinkhorn_repeat=layer.hc_sinkhorn_iters,
-            n_splits=1,
-            n_splits_pre=32,
             norm_weight=layer.input_layernorm.weight.data,
             norm_eps=layer.input_layernorm.variance_epsilon,
         )
@@ -2502,7 +2261,6 @@ class DeepseekV4ForCausalLM(nn.Module):
         cache_compressor_weight = {}
         COMPRESSOR_PART = ".compressor.w"
 
-        fuse_wqa_wkv = envs.SGLANG_OPT_FUSE_WQA_WKV.get()
         cache_wqkv_a_weight: dict[str, dict[str, torch.Tensor]] = {}
 
         def auto_weight_loader(module):
@@ -2696,7 +2454,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                                     )
                                     loaded_params.add(param_name)
                                     cache_compressor_weight.pop(key)
-                            elif fuse_wqa_wkv and (
+                            elif (
                                 name.endswith(".wq_a.weight")
                                 or name.endswith(".wq_a.weight_scale_inv")
                                 or name.endswith(".wkv.weight")

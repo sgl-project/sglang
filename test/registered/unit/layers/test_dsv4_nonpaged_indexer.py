@@ -36,7 +36,6 @@ class TestDSV4NonPagedIndexer(CustomTestCase):
             ),
             envs.SGLANG_OPT_USE_TILELANG_INDEXER.override(False),
             envs.SGLANG_OPT_USE_AITER_INDEXER.override(False),
-            envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.override(False),
             patch(f"{_INDEXER}.is_cuda", return_value=True),
             patch(f"{_INDEXER}.is_hip", return_value=False),
             patch(f"{_INDEXER}.get_attention_cp_size", return_value=1),

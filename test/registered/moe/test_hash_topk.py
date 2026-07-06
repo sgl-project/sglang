@@ -50,6 +50,21 @@ def test_hash_topk_remaps_per_rank_fused_shared_slots(monkeypatch):
     with torch.no_grad():
         topk.tid2eid.copy_(torch.tensor([[0, 65], [63, 127]], dtype=torch.int32))
 
+    def fake_hash_topk(**kwargs):
+        router_logits = kwargs["router_logits"]
+        device = router_logits.device
+        dtype = router_logits.dtype
+        return (
+            torch.tensor(
+                [[1.0, 1.0, 0.4], [1.0, 1.0, 0.4]], dtype=dtype, device=device
+            ),
+            torch.tensor(
+                [[0, 65, 256], [63, 127, 256]], dtype=torch.int32, device=device
+            ),
+        )
+
+    monkeypatch.setattr("sglang.jit_kernel.dsv4.hash_topk", fake_hash_topk)
+
     info = ExpertLocationDispatchInfo(
         ep_dispatch_algorithm="static",
         partial_logical_to_rank_dispatch_physical_map=torch.arange(
@@ -64,10 +79,7 @@ def test_hash_topk_remaps_per_rank_fused_shared_slots(monkeypatch):
         num_physical_experts=256,
     )
 
-    with (
-        get_parallel().override(moe_ep_size=4, moe_ep_rank=2),
-        hash_topk_module.envs.SGLANG_OPT_USE_FUSED_HASH_TOPK.override(False),
-    ):
+    with get_parallel().override(moe_ep_size=4, moe_ep_rank=2):
         output = topk(
             hidden_states=torch.empty(2, 4),
             router_logits=torch.ones(2, 256),

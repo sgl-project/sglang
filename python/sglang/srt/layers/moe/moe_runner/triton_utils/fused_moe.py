@@ -14,7 +14,6 @@ import torch.nn.functional as F
 import triton.language as tl
 
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
-from sglang.srt.environ import envs
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
 from sglang.srt.layers.moe.utils import get_moe_padding_size
 from sglang.srt.server_args import get_global_server_args
@@ -571,9 +570,6 @@ def _fused_moe_kernel_sequence(
             )
         elif swiglu_limit is not None:
             # DeepSeek V4: swiglu clamp before silu_and_mul.
-            # Two paths gated by SGLANG_OPT_SWIGLU_CLAMP_FUSION:
-            #   fusion=True: clamp fused into act_and_mul_triton or silu_and_mul_clamp
-            #   fusion=False: explicit clamp_ on intermediate_cache1 (path checker)
             assert swiglu_limit == 10
             assert intermediate_cache1.shape == (total_tokens, N)
             assert _is_cuda or _is_hip, "DeepSeek V4 only supports CUDA/HIP downstream"
@@ -581,20 +577,11 @@ def _fused_moe_kernel_sequence(
             swiglu_limit_for_triton: Optional[float] = None
             swiglu_limit_for_silu_and_mul_clamp: Optional[float] = None
 
-            if envs.SGLANG_OPT_SWIGLU_CLAMP_FUSION.get():
-                if filter_expert:
-                    swiglu_limit_for_triton = swiglu_limit
-                else:
-                    assert (
-                        _is_cuda
-                    ), "fused silu_and_mul_clamp kernel is CUDA-only; HIP must disable SWIGLU_CLAMP_FUSION"
-                    swiglu_limit_for_silu_and_mul_clamp = swiglu_limit
+            if filter_expert:
+                swiglu_limit_for_triton = swiglu_limit
             else:
-                half = N // 2
-                intermediate_cache1[:, :half].clamp_(max=swiglu_limit)
-                intermediate_cache1[:, half:].clamp_(
-                    min=-swiglu_limit, max=swiglu_limit
-                )
+                assert _is_cuda, "fused silu_and_mul_clamp kernel is CUDA-only"
+                swiglu_limit_for_silu_and_mul_clamp = swiglu_limit
 
             if not filter_expert:
                 if swiglu_limit_for_silu_and_mul_clamp is not None:

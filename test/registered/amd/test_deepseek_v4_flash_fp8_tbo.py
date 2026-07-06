@@ -43,26 +43,17 @@ DEEPSEEK_V4_FLASH_FP8_MODEL_PATH = os.environ.get(
 SERVER_LAUNCH_TIMEOUT = 3600
 FLASHMLA_BACKEND = os.environ.get("SGLANG_HACK_FLASHMLA_BACKEND", "unified_kv_triton")
 
-# DSV4 fused-kernel optimal set (mirrors the validated dp-tbo launch config).
-# The DP + TBO forward path is sensitive to these; the non-TBO tp8 test can use a
-# leaner set, but DP TBO needs the full DSV4 opt env or the MoE/attn kernels hit
-# shape mismatches at warmup.
+# DSV4 fused-kernel launch set (mirrors the validated dp-tbo config).
 COMMON_ENV_VARS = {
     "SGLANG_DEFAULT_THINKING": "1",
     "SGLANG_DSV4_REASONING_EFFORT": "max",
-    "SGLANG_OPT_DEEPGEMM_HC_PRENORM": "false",
     "SGLANG_USE_AITER": "1",
     "SGLANG_USE_ROCM700A": "0",
     "SGLANG_OPT_USE_FUSED_COMPRESS": "true",
     "SGLANG_HACK_FLASHMLA_BACKEND": FLASHMLA_BACKEND,
     "SGLANG_OPT_FP8_WO_A_GEMM": "false",
-    "SGLANG_OPT_USE_JIT_INDEXER_METADATA": "false",
-    "SGLANG_OPT_USE_TOPK_V2": "false",
     "SGLANG_OPT_USE_AITER_INDEXER": "true",
     "SGLANG_OPT_USE_TILELANG_INDEXER": "false",
-    "SGLANG_OPT_USE_TILELANG_MHC_PRE": "false",
-    "SGLANG_OPT_USE_TILELANG_MHC_POST": "false",
-    "SGLANG_FP8_PAGED_MQA_LOGITS_TORCH": "1",
     "SGLANG_OPT_USE_FUSED_COMPRESS_TRITON": "true",
     "SGLANG_OPT_USE_MULTI_STREAM_OVERLAP": "false",
     "SGLANG_ROCM_USE_MULTI_STREAM": "false",

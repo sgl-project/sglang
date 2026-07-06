@@ -187,7 +187,6 @@ class ToolStrictLevel(IntEnum):
 
 
 class Envs:
-
     # Model & File Download
     SGLANG_USE_MODELSCOPE = EnvBool(False)
     # Controls weight-file ordering for load-time I/O optimization.
@@ -811,17 +810,11 @@ class Envs:
 
     # ====================================================================
     # DeepSeek V4
-    SGLANG_OPT_DPSK_V4_RADIX = EnvBool(True)
-    SGLANG_OPT_USE_OLD_COMPRESSOR = EnvBool(False)
-    SGLANG_OPT_USE_TRITON_SWA_PREPARE = EnvBool(True)
     SGLANG_OPT_USE_AITER_MHC_PRE = EnvBool(True)
     SGLANG_OPT_USE_AITER_MHC_POST = EnvBool(True)
     SGLANG_OPT_USE_AITER_SILU_MUL = EnvBool(False)
     SGLANG_OPT_USE_FUSED_COMPRESS = EnvBool(False)
     SGLANG_OPT_USE_FUSED_COMPRESS_TRITON = EnvBool(False)
-    SGLANG_OPT_USE_FUSED_QK_NORM_ROPE = EnvBool(True)
-    SGLANG_OPT_USE_FUSED_CLAMP_ACT_MUL = EnvBool(True)
-    SGLANG_ENABLE_NVFP4_GEMM_SWIGLU_FUSION = EnvBool(True)
     SGLANG_FIX_MTP_HC_HIDDEN = EnvBool(False)
     # ====================================================================
 
@@ -832,23 +825,12 @@ class Envs:
     SGLANG_DSV4_REASONING_EFFORT = EnvStr("")
 
     # CUDA kernels
-    SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)
-    SGLANG_OPT_USE_TILELANG_MHC_PRE = EnvBool(True)
-    SGLANG_OPT_USE_TILELANG_MHC_POST = EnvBool(True)
-    SGLANG_DSV4_MHC_PREWARM = EnvBool(True)
-    SGLANG_OPT_USE_TRITON_FUSED_MHC = EnvBool(True)
-    SGLANG_OPT_FUSE_MHC_POST_PRE = EnvBool(False)
     SGLANG_OPT_USE_TILELANG_INDEXER = EnvBool(False)
     SGLANG_OPT_USE_AITER_INDEXER = EnvBool(False)
     SGLANG_OPT_DSV4_NONPAGED_INDEXER = EnvBool(False)
-    SGLANG_OPT_USE_JIT_INDEXER_METADATA = EnvBool(True)
     SGLANG_OPT_USE_ONLINE_COMPRESS = EnvBool(False)
     SGLANG_EXPERIMENTAL_ONLINE_C128_MTP = EnvBool(False)
     SGLANG_DSV4_COMPRESS_STATE_DTYPE = EnvStr("float32")
-    # Deprecated: DSV4 compressor V2 is always used.
-    SGLANG_OPT_USE_COMPRESSOR_V2 = EnvBool(True)
-    SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
-    SGLANG_TOPK_TRANSFORM_512_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
 
     # SWA radix cache
@@ -860,8 +842,6 @@ class Envs:
     # Unified radix cache
     SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS = EnvBool(False)
 
-    # DeepGemm Mega MoE
-    SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE = EnvBool(False)
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK = EnvInt(1024)
 
     # When set, the mega-MoE x slot is packed E2M1 (FP4) instead of FP8 E4M3.
@@ -877,15 +857,12 @@ class Envs:
     SGLANG_OPT_FIX_MEGA_MOE_MEMORY = EnvBool(False)
 
     # TopK
-    SGLANG_OPT_USE_FUSED_HASH_TOPK = EnvBool(True)
     SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK = EnvBool(True)
     # Opt-in: route DeepSeek-V3 grouped topk through the unified Triton router
     # instead of the flashinfer/AOT grouped kernels. Off by default (flashinfer is
     # the tuned production path); the Triton path is bit-exact on DeepSeek-V3.2 e2e
     # and benchmarks at parity, so this is a consolidation escape hatch, not a perf flip.
     SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK = EnvBool(False)
-    SGLANG_OPT_USE_TOPK_V2 = EnvBool(True)
-
     # MiniMax-M3 sparse decode indexer: single JIT radix-select kernel replaces the 2-stage split-K Triton topk.
     SGLANG_OPT_USE_MINIMAX_DECODE_TOPK_RADIX = EnvBool(True)
 
@@ -900,13 +877,8 @@ class Envs:
     # GEMM / kernel fusion
     SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(True)
     SGLANG_OPT_BF16_FP32_GEMM_ALGO = EnvStr("cublas")
-    SGLANG_OPT_USE_JIT_EP_ACTIVATION = EnvBool(True)
-    SGLANG_OPT_FUSE_WQA_WKV = EnvBool(True)
-    SGLANG_OPT_SWIGLU_CLAMP_FUSION = EnvBool(True)
 
     # Cache / overlap
-    SGLANG_OPT_USE_FUSED_STORE_CACHE = EnvBool(True)
-    SGLANG_OPT_USE_JIT_NORM = EnvBool(True)
     SGLANG_OPT_USE_MULTI_STREAM_OVERLAP = EnvBool(True)
 
     # CUDA graph
@@ -916,8 +888,6 @@ class Envs:
     # into the CUDA graph buffer registry (no per-iter device-to-device copy).
     SGLANG_EAGER_INPUT_NO_COPY = EnvBool(False)
 
-    # Distributed
-    SGLANG_DSV4_FIX_TP_ATTN_A2A_SCATTER = EnvBool(True)
     SGLANG_SHARED_EXPERT_TP1 = EnvBool(False)
     # Replicate the input embedding across TP ranks instead of sharding it
     # along the vocab dimension (saves an all-reduce/all-gather in the embed

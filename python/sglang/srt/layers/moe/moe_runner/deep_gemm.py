@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
-import einops
 import torch
 
 from sglang.jit_kernel.dsv4 import silu_and_mul_masked_post_quant
@@ -129,8 +128,6 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         self.swiglu_limit = self.config.swiglu_limit
         self.use_swizzle = False
         if envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.get():
-            assert envs.SGLANG_OPT_SWIGLU_CLAMP_FUSION.get()
-            assert envs.SGLANG_OPT_USE_JIT_EP_ACTIVATION.get()
             self.use_swizzle = True
 
     def run(
@@ -422,22 +419,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             assert (
                 not _MASKED_GEMM_FAST_ACT
             ), "DeepSeek V4 does not support SGLANG_MASKED_GEMM_FAST_ACT"
-            assert (
-                envs.SGLANG_OPT_USE_JIT_EP_ACTIVATION.get()
-            ), "DeepSeek V4 requires SGLANG_OPT_USE_JIT_EP_ACTIVATION=True"
-
-            if envs.SGLANG_OPT_SWIGLU_CLAMP_FUSION.get():
-                swiglu_limit_arg = self.swiglu_limit
-            else:
-                gateup_output = einops.rearrange(
-                    gateup_output, "grp tok hidden -> (grp tok) hidden"
-                )
-                gateup_output = _apply_swiglu_limit(
-                    gateup_output, swiglu_limit=self.swiglu_limit
-                )
-                gateup_output = einops.rearrange(
-                    gateup_output, "(grp tok) hidden -> grp tok hidden", grp=num_groups
-                )
+            swiglu_limit_arg = self.swiglu_limit
 
         # Act
         down_input, down_input_scale = _varlen_deep_gemm_silu_mul_quant(
@@ -871,7 +853,7 @@ def _varlen_deep_gemm_silu_mul_quant(
         dtype=torch.float8_e4m3fn,
     )
 
-    use_jit_ep_activation = envs.SGLANG_OPT_USE_JIT_EP_ACTIVATION.get()
+    use_jit_ep_activation = True
     if N % 4 != 0 or G % 4 != 0 or D // 8 < E:
         use_jit_ep_activation = False
 
@@ -899,10 +881,8 @@ def _varlen_deep_gemm_silu_mul_quant(
     else:
         assert (
             swiglu_limit is None
-        ), "swiglu_limit (DeepSeek V4) requires SGLANG_OPT_USE_JIT_EP_ACTIVATION=True"
-        assert (
-            not swizzle
-        ), "SGLANG_OPT_FIX_MEGA_MOE_MEMORY requires SGLANG_OPT_USE_JIT_EP_ACTIVATION=True"
+        ), "swiglu_limit (DeepSeek V4) requires the JIT EP activation kernel"
+        assert not swizzle, "SGLANG_OPT_FIX_MEGA_MOE_MEMORY requires JIT EP activation"
         down_input_scale = torch.empty(
             (E, N, G),
             device=hidden_states_device,
