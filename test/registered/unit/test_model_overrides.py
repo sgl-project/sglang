@@ -587,21 +587,21 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             "LlamaForCausalLM", "llama", enable_deterministic_inference=True
         )
         # two pass writers chain: default fill, then the deterministic force —
-        # last writer wins on the flags leaf; the server_args field stays
+        # last writer wins on the flags leaf; the server_args fields stay
         # pristine (dual-apply retired).
         self.assertIsNone(sa.sampling_backend)
+        self.assertIsNone(sa.attention_backend)
         flags = self._publish(sa)
         self.assertEqual(flags.sampling_backend, "pytorch")
         # the deterministic attention fill declared a compatible backend and
         # the compatibility default-fill then had nothing to do
-        self.assertIn(
-            (
-                "_deterministic_attention_backend",
-                {"attention_backend": sa.attention_backend},
-            ),
-            sa._resolved_overrides,
-        )
-        self.assertEqual(flags.attn.backend, sa.attention_backend)
+        deterministic_fills = [
+            decl["attention_backend"]
+            for source, decl in sa._resolved_overrides
+            if source == "_deterministic_attention_backend"
+        ]
+        self.assertEqual(len(deterministic_fills), 1)
+        self.assertEqual(flags.attn.backend, deterministic_fills[0])
 
     def test_deterministic_incompatible_backend_raises(self):
         from sglang.srt.arg_groups.overrides import (
@@ -638,7 +638,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             dllm_algorithm="LowConfidence",
             disable_radix_cache=True,
         )
-        self.assertEqual(sa.attention_backend, "flashinfer")
+        self.assertIsNone(sa.attention_backend)  # dual-apply retired: pristine
         self.assertIn(
             ("_dllm_attention_backend", {"attention_backend": "flashinfer"}),
             sa._resolved_overrides,
@@ -648,25 +648,35 @@ class TestGoldenModelOverrides(_IsolatedPublish):
 
     def test_attention_backend_leaf_materializes_end_state(self):
         # The default-fill pass declares the platform-selected backend; the
-        # leaf must equal the final server_args value (publish parity).
+        # leaf must equal the last declared value while the server_args field
+        # stays pristine (dual-apply retired).
         sa = self._construct("LlamaForCausalLM", "llama")
-        declared = {f for _s, d in sa._resolved_overrides for f in d}
-        self.assertIn("attention_backend", declared)  # default fill declared
-        self.assertEqual(self._publish(sa).attn.backend, sa.attention_backend)
+        declared_values = [
+            d["attention_backend"]
+            for _s, d in sa._resolved_overrides
+            if "attention_backend" in d
+        ]
+        self.assertTrue(declared_values)  # default fill declared
+        self.assertIsNone(sa.attention_backend)
+        self.assertEqual(self._publish(sa).attn.backend, declared_values[-1])
 
-    def test_runner_side_adjustment_can_refresh_declaration(self):
-        from sglang.srt.arg_groups.overrides import refresh_declared_fields
+    def test_runner_side_adjustment_declares_at_its_slot(self):
+        from sglang.srt.arg_groups.overrides import (
+            _hrm_text_attention_force,
+            run_post_process_pass,
+        )
 
+        # Runner-side adjustment between collection and publish (HRM-Text
+        # forces attention_backend) declares through the pass slot: last
+        # writer on the stash wins the leaf, the field stays pristine.
         sa = self._construct("LlamaForCausalLM", "llama")
-        declared = {f for _s, d in sa._resolved_overrides for f in d}
-        self.assertIn("attention_backend", declared)
-        # Simulate a legacy runner-side overwrite between collection and publish
-        # (model_specific_adjustment forces attention_backend for HRM-Text).
-        sa.attention_backend = "fa3" if sa.attention_backend != "fa3" else "triton"
-        with self.assertRaises(AssertionError):
-            self._publish(sa)  # stale declaration breaks parity
-        refresh_declared_fields(sa, ("attention_backend",))
-        self.assertEqual(self._publish(sa).attn.backend, sa.attention_backend)
+        run_post_process_pass(sa, _hrm_text_attention_force)
+        self.assertIsNone(sa.attention_backend)
+        self.assertIn(
+            ("_hrm_text_attention_force", {"attention_backend": "triton"}),
+            sa._resolved_overrides,
+        )
+        self.assertEqual(self._publish(sa).attn.backend, "triton")
 
     def test_attention_backend_user_choice_declares_nothing_extra(self):
         sa = self._construct("LlamaForCausalLM", "llama", attention_backend="triton")

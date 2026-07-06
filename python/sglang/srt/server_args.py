@@ -3763,6 +3763,7 @@ class ServerArgs:
         from sglang.srt.arg_groups.overrides import (
             apply_declarations_to_server_args,
             collect_model_override_declarations,
+            resolved_view,
         )
 
         self._resolved_overrides = collect_model_override_declarations(
@@ -4032,14 +4033,15 @@ class ServerArgs:
         ):
             # Attention backend auto-select moved to the override registry
             # (arg_groups/overrides.py: _llama4_overrides).
-            assert self.attention_backend in {
+            attention_backend = resolved_view(self).attention_backend
+            assert attention_backend in {
                 "fa3",
                 "aiter",
                 "triton",
                 "ascend",
                 "trtllm_mha",
                 "intel_xpu",
-            }, f"fa3, aiter, triton, ascend, trtllm_mha or intel_xpu is required for Llama4 model but got {self.attention_backend}"
+            }, f"fa3, aiter, triton, ascend, trtllm_mha or intel_xpu is required for Llama4 model but got {attention_backend}"
             # The moe_runner_backend selection moved to the override registry
             # (arg_groups/overrides.py: _llama4_overrides).
         # Gemma2/Gemma3 (disable_hybrid_swa_memory) moved to the override registry
@@ -4073,9 +4075,10 @@ class ServerArgs:
                 # (arg_groups/overrides.py: _exaone_overrides).
                 # https://docs.sglang.ai/advanced_features/attention_backend.html
                 accepted_backends = ["fa3", "triton", "trtllm_mha"]
+                attention_backend = resolved_view(self).attention_backend
                 assert (
-                    self.attention_backend in accepted_backends
-                ), f"One of the attention backends in {accepted_backends} is required for {model_arch}, but got {self.attention_backend}"
+                    attention_backend in accepted_backends
+                ), f"One of the attention backends in {accepted_backends} is required for {model_arch}, but got {attention_backend}"
         elif model_arch in ["Olmo2ForCausalLM"]:
             # disable_hybrid_swa_memory + attention backend selection moved to
             # the override registry (arg_groups/overrides.py: _olmo2_overrides).
@@ -4083,18 +4086,19 @@ class ServerArgs:
             # Flashinfer appears to degrade performance when sliding window attention
             # is used for the Olmo2 architecture. Olmo2 does not use sliding window attention
             # but Olmo3 does.
+            attention_backend = resolved_view(self).attention_backend
             assert (
-                self.attention_backend != "flashinfer"
+                attention_backend != "flashinfer"
             ), "FlashInfer backend can significantly degrade the performance of Olmo3 models."
 
             logger.info(
-                f"Using {self.attention_backend} as attention backend for {model_arch}."
+                f"Using {attention_backend} as attention backend for {model_arch}."
             )
         elif model_arch in ["NemotronHForCausalLM", "NemotronHPuzzleForCausalLM"]:
             # Quantization / MoE runner / attention backend defaults moved to
             # the override registry (arg_groups/overrides.py:
             # _nemotron_h_overrides).
-            assert self.attention_backend != "triton", (
+            assert resolved_view(self).attention_backend != "triton", (
                 "NemotronHForCausalLM does not support triton attention backend,"
                 "as the first layer might not be an attention layer"
             )
@@ -4121,7 +4125,7 @@ class ServerArgs:
         elif model_arch in ["Lfm2ForCausalLM"]:
             # Attention backend selection moved to the override registry
             # (arg_groups/overrides.py: _lfm2_overrides).
-            assert self.attention_backend != "triton", (
+            assert resolved_view(self).attention_backend != "triton", (
                 f"{model_arch} does not support triton attention backend, "
                 "as the first layer might not be an attention layer"
             )
@@ -4305,6 +4309,7 @@ class ServerArgs:
             _fa4_page_constraint,
             _intel_xpu_page_constraint,
             _mla_backend_page_constraints,
+            resolved_view,
             run_post_process_pass,
         )
 
@@ -4312,14 +4317,15 @@ class ServerArgs:
         run_post_process_pass(self, _attention_backend_default)
 
         # Torch native and flex attention backends
-        if self.attention_backend == "torch_native":
+        attention_backend = resolved_view(self).attention_backend
+        if attention_backend == "torch_native":
             logger.warning(
                 "Cuda graph is disabled because of using torch native attention backend"
             )
             self.cuda_graph_config.decode.backend = Backend.DISABLED
             self.cuda_graph_config.prefill.backend = Backend.DISABLED
 
-        if self.attention_backend == "flex_attention":
+        if attention_backend == "flex_attention":
             logger.warning(
                 "Cuda graph is disabled because of using torch Flex Attention backend"
             )
@@ -4378,7 +4384,7 @@ class ServerArgs:
         run_post_process_pass(self, _fa4_page_constraint)
 
         # AMD platforms backends
-        if self.attention_backend == "aiter":
+        if resolved_view(self).attention_backend == "aiter":
             if model_config.context_len > 8192:
                 self.mem_fraction_static *= 0.85
 
@@ -4395,7 +4401,7 @@ class ServerArgs:
 
         # Dual chunk flash attention backend
         run_post_process_pass(self, _attention_backend_dual_chunk)
-        if self.attention_backend == "dual_chunk_flash_attn":
+        if resolved_view(self).attention_backend == "dual_chunk_flash_attn":
             logger.warning(
                 "Mixed chunk and radix cache are disabled when using dual-chunk flash attention backend"
             )
@@ -4404,11 +4410,14 @@ class ServerArgs:
 
     def _handle_kv4_compatibility(self):
         """Check FP4 KV cache compatibility with the attention backend"""
+        from sglang.srt.arg_groups.overrides import resolved_view
+
         if self.kv_cache_dtype != "fp4_e2m1":
             return
 
         use_mla_backend = self.use_mla_backend()
         prefill_backend, decode_backend = self._resolved_attention_backends()
+        attention_backend = resolved_view(self).attention_backend
 
         if is_cuda():
             if (
@@ -4449,11 +4458,9 @@ class ServerArgs:
                             "trtllm_mla",
                             "flashmla",
                         ]
-                        assert (
-                            self.attention_backend in KV4_ATTENTION_MLA_BACKEND_CHOICES
-                        ), (
+                        assert attention_backend in KV4_ATTENTION_MLA_BACKEND_CHOICES, (
                             f"KV4 MLA expects attention_backend to be one of "
-                            f"{KV4_ATTENTION_MLA_BACKEND_CHOICES}, but got {self.attention_backend}"
+                            f"{KV4_ATTENTION_MLA_BACKEND_CHOICES}, but got {attention_backend}"
                         )
                     else:  # !FA4 + MHA
                         KV4_ATTENTION_MHA_BACKEND_CHOICES = [
@@ -4462,11 +4469,9 @@ class ServerArgs:
                             "flex_attention",
                             "trtllm_mha",
                         ]
-                        assert (
-                            self.attention_backend in KV4_ATTENTION_MHA_BACKEND_CHOICES
-                        ), (
+                        assert attention_backend in KV4_ATTENTION_MHA_BACKEND_CHOICES, (
                             f"KV4 MHA expects attention_backend to be one of "
-                            f"{KV4_ATTENTION_MHA_BACKEND_CHOICES}, but got {self.attention_backend}"
+                            f"{KV4_ATTENTION_MHA_BACKEND_CHOICES}, but got {attention_backend}"
                         )
         else:
             raise RuntimeError("KV4 is not tested on non-CUDA platforms.")
@@ -5228,14 +5233,16 @@ class ServerArgs:
         Must run after _handle_attention_backend_compatibility() (which fills
         the default attention_backend if unset) and _handle_multi_item_scoring()
         (which may further mutate it). The assertion below guards against
-        accidental call-site reordering: if attention_backend is still None,
-        backends haven't settled yet and get_attention_backends() would return
-        a stale (None, None).
+        accidental call-site reordering: if the resolved attention_backend is
+        still None, backends haven't settled yet and the resolved (prefill,
+        decode) pair would be a stale (None, None).
         """
+        from sglang.srt.arg_groups.overrides import resolved_view
+
         if not self.prefill_only_disable_kv_cache:
             return
 
-        assert self.attention_backend is not None, (
+        assert resolved_view(self).attention_backend is not None, (
             "_handle_prefill_only_disable_kv_cache must run after "
             "_handle_attention_backend_compatibility() so the prefill backend is resolved."
         )
@@ -5733,6 +5740,7 @@ class ServerArgs:
             from sglang.srt.arg_groups.overrides import (
                 _deterministic_attention_backend,
                 _deterministic_sampling_backend,
+                resolved_view,
                 run_post_process_pass,
             )
 
@@ -5756,20 +5764,18 @@ class ServerArgs:
             # Check attention backend
             run_post_process_pass(self, _deterministic_attention_backend)
 
+            attention_backend = resolved_view(self).attention_backend
             if is_deepseek_model:
-                if self.attention_backend not in ["fa3", "triton"]:
+                if attention_backend not in ["fa3", "triton"]:
                     raise ValueError(
-                        f"Currently only {RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND} attention backends are supported for deterministic inference with DeepSeek models. But you're using {self.attention_backend}."
+                        f"Currently only {RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND} attention backends are supported for deterministic inference with DeepSeek models. But you're using {attention_backend}."
                     )
 
-            if (
-                self.attention_backend
-                not in RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND
-            ):
+            if attention_backend not in RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND:
                 # Currently, only certain backends support radix cache. Support for other backends is in progress
                 self.disable_radix_cache = True
                 logger.warning(
-                    f"Currently radix cache is not compatible with {self.attention_backend} attention backend for deterministic inference. It will be supported in the future."
+                    f"Currently radix cache is not compatible with {attention_backend} attention backend for deterministic inference. It will be supported in the future."
                 )
 
             # Check TP size

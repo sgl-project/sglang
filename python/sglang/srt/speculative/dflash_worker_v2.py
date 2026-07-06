@@ -14,6 +14,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     compute_position,
 )
+from sglang.srt.runtime_context import get_flags
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
@@ -1278,7 +1279,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                     "DFLASH prefill expected out_cache_loc, but got None."
                 )
             positions, _ = compute_position(
-                self.model_runner.server_args.attention_backend,
+                get_flags().attn.backend,
                 draft_seq_lens,
                 ctx_lens,
                 int(sum(batch.extend_lens)),

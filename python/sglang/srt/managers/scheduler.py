@@ -1352,8 +1352,10 @@ class Scheduler(
             "flashinfer": ("SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE", 4096),
             "triton": ("SGLANG_TRITON_PREFILL_TRUNCATION_ALIGN_SIZE", 4096),
         }
+        from sglang.srt.runtime_context import get_flags
+
         env_var, default_size = backend_sizes.get(
-            self.server_args.attention_backend, (None, None)
+            get_flags().attn.backend, (None, None)
         )
         self.truncation_align_size = (
             get_int_env_var(env_var, default_size) if env_var else None

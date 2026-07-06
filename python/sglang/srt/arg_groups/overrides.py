@@ -2102,6 +2102,13 @@ DUAL_APPLY_RETIRED: frozenset = frozenset(
         # reset writes the pristine default.
         "uses_mamba_radix_cache",
         "mamba_radix_cache_strategy",
+        # Runtime readers are on the mapped leaf (flags.attn.backend) or
+        # resolved_attention_backends(); every mid-resolution consumer reads
+        # a pass view; the hpu/cpu/npu early defaults are pre-resolution
+        # input synthesis; the HRM-Text runner force is a load-time
+        # declaration; the engine flashinfer preflight and the registry
+        # dispatch callables read the pristine input by design.
+        "attention_backend",
     }
 )
 
@@ -2141,25 +2148,18 @@ def apply_declarations_to_server_args(
             setattr(server_args, field, value)
 
 
-def refresh_declared_fields(server_args: Any, fields: Iterable[str]) -> None:
-    """Transition helper for legacy code that overwrites a resolved field
-    AFTER the override collection in ``__post_init__`` (e.g.
-    ``ModelRunner.model_specific_adjustment`` forcing ``attention_backend``
-    for HRM-Text). Redeclares the live value so publish parity holds and the
-    flags tier materializes the adjusted end state.
-    """
-    _missing = object()
-    declarations = server_args._resolved_overrides
-    for field in fields:
-        effective = _missing
-        for _source, decl in declarations:
-            if field in decl:
-                effective = decl[field]
-        if effective is _missing:
-            continue
-        live = getattr(server_args, field)
-        if effective != live:
-            declarations.append((f"runtime_adjustment[{field}]", {field: live}))
+def _hrm_text_attention_force(view: Any) -> dict:
+    """HRM-Text's bidirectional prefix attention only works on the Triton
+    backend. Invoked from ModelRunner.model_specific_adjustment (pre-publish,
+    once the architecture is known) at the legacy overwrite's slot."""
+    if view.attention_backend not in (None, "triton"):
+        logger.warning(
+            f"Overriding --attention-backend "
+            f"{view.attention_backend!r} -> 'triton': only the "
+            "Triton backend supports HRM-Text's bidirectional prefix "
+            "attention."
+        )
+    return {"attention_backend": "triton"}
 
 
 def assert_flag_parity(

@@ -330,9 +330,7 @@ class ModelRunnerKVCacheMixin:
             unsupported_pool_family = "DeepSeekV4TokenToKVPool"
         elif current_platform.is_out_of_tree() and not self.mambaish_config:
             unsupported_pool_family = "out-of-tree platform KV pool"
-        elif (
-            self.server_args.attention_backend == "ascend" and not self.mambaish_config
-        ):
+        elif get_flags().attn.backend == "ascend" and not self.mambaish_config:
             unsupported_pool_family = "NPU/Ascend KV pool"
         elif self.use_mla_backend and is_dsa_model:
             unsupported_pool_family = "DSA/MLA KV pool"
@@ -772,9 +770,7 @@ class ModelRunnerKVCacheMixin:
                     start_layer=self.start_layer,
                     end_layer=self.end_layer,
                 )
-        elif (
-            self.server_args.attention_backend == "ascend" and not self.mambaish_config
-        ):
+        elif get_flags().attn.backend == "ascend" and not self.mambaish_config:
             if self.is_hybrid_swa:
                 from sglang.srt.hardware_backend.npu.memory_pool_npu import (
                     NPUMHATokenToKVPool,
@@ -1059,7 +1055,7 @@ class ModelRunnerKVCacheMixin:
                     need_sort=need_sort,
                 )
             elif _is_npu and (
-                self.server_args.attention_backend == "ascend"
+                get_flags().attn.backend == "ascend"
                 or is_dsv4_model
                 or self.hybrid_gdn_config is not None
             ):

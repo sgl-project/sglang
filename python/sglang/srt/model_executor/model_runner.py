@@ -1147,14 +1147,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # bidirectional-attention forcing and silently produce junk output.
         is_prefix_lm_recurrent = is_hrm_text and getattr(hf_config, "prefix_lm", True)
         if is_prefix_lm_recurrent:
-            if server_args.attention_backend not in (None, "triton"):
-                logger.warning(
-                    f"Overriding --attention-backend "
-                    f"{server_args.attention_backend!r} -> 'triton': only the "
-                    "Triton backend supports HRM-Text's bidirectional prefix "
-                    "attention."
-                )
-            server_args.attention_backend = "triton"
+            from sglang.srt.arg_groups.overrides import (
+                _hrm_text_attention_force,
+                run_post_process_pass,
+            )
+
+            run_post_process_pass(server_args, _hrm_text_attention_force)
             server_args.chunked_prefill_size = -1
             server_args.disable_radix_cache = True
             server_args.disable_cuda_graph = True
@@ -1173,22 +1171,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     f"{self.model_config.hf_config.model_type}"
                 )
 
+        from sglang.srt.arg_groups.overrides import resolved_view
+
         if (
             not self.use_mla_backend
-            or server_args.attention_backend
+            or resolved_view(server_args).attention_backend
             not in CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS
         ):
             server_args.disable_chunked_prefix_cache = True
 
         if not server_args.disable_chunked_prefix_cache:
             log_info_on_rank0(logger, "Chunked prefix cache is turned on.")
-
-        # The imperative adjustments above may overwrite fields the resolution passes
-        # already declared (HRM-Text forces attention_backend); redeclare the
-        # adjusted values so publish parity holds.
-        from sglang.srt.arg_groups.overrides import refresh_declared_fields
-
-        refresh_declared_fields(server_args, ("attention_backend",))
 
     def check_quantized_moe_compatibility(self):
         if (
@@ -2571,7 +2564,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
         else:
             attn_backend = self._get_attention_backend_from_str(
-                self.server_args.attention_backend,
+                get_flags().attn.backend,
                 init_new_workspace=init_new_workspace,
             )
 
