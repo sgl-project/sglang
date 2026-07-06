@@ -120,7 +120,7 @@ void fill_bonus_tokens_cpu(
     const at::Tensor& accept_tokens, const at::Tensor& accept_lens, at::Tensor bonus_tokens, int64_t accept_stride);
 
 void fill_accept_out_cache_loc_cpu(
-    const at::Tensor& accept_index, const at::Tensor& out_cache_loc, at::Tensor accept_out_cache_loc, int64_t size);
+    const at::Tensor& accept_index, const at::Tensor& out_cache_loc, at::Tensor accept_out_cache_loc);
 
 void assign_draft_cache_locs_contiguous_cpu(
     const at::Tensor& req_pool_indices,
@@ -140,8 +140,8 @@ void assign_extend_cache_locs_cpu(
     int64_t pool_len);
 
 void reconstruct_indices_from_tree_mask_cpu(
-    at::Tensor tree_mask,
-    at::Tensor verified_seq_len,
+    const at::Tensor& tree_mask,
+    const at::Tensor& verified_seq_len,
     at::Tensor positions,
     at::Tensor retrive_index,
     at::Tensor retrive_next_token,
@@ -154,7 +154,7 @@ void rotate_input_ids_cpu(
     const at::Tensor& extend_start_loc,
     const at::Tensor& extend_seq_lens,
     const at::Tensor& topk_index,
-    const c10::optional<at::Tensor>& select_index_opt);
+    const std::optional<at::Tensor>& select_index_opt);
 
 // topk
 std::tuple<at::Tensor, at::Tensor>
@@ -610,7 +610,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   m.def(
       "fill_accept_out_cache_loc_cpu(Tensor accept_index, Tensor out_cache_loc, "
-      "Tensor(a!) accept_out_cache_loc, int size) -> ()");
+      "Tensor(a!) accept_out_cache_loc) -> ()");
   m.impl("fill_accept_out_cache_loc_cpu", torch::kCPU, &fill_accept_out_cache_loc_cpu);
 
   m.def(
@@ -625,7 +625,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   m.def(
       "rotate_input_ids_cpu(Tensor(a!) input_ids, Tensor extend_start_loc, "
-      "Tensor extend_seq_lens, Tensor topk_index, Tensor? select_index) -> ()");
+      "Tensor extend_seq_lens, Tensor topk_index, Tensor? select_index=None) -> ()");
   m.impl("rotate_input_ids_cpu", torch::kCPU, &rotate_input_ids_cpu);
 
   m.def(

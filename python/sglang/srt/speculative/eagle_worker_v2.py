@@ -66,7 +66,6 @@ from sglang.srt.speculative.eagle_info import (
     EagleVerifyInput,
 )
 from sglang.srt.speculative.eagle_utils import (
-    TreeMaskMode,
     _eagle_prefill_tail_tokens,
     build_tree_kernel_efficient,
     default_tree_mask_mode,
@@ -91,7 +90,7 @@ from sglang.srt.speculative.spec_utils import (
     select_top_k_tokens,
     spec_stage_span,
 )
-from sglang.srt.speculative.triton_ops.eagle import fill_bonus_tokens
+from sglang.srt.speculative.triton_ops.eagle import fill_bonus_tokens_func
 from sglang.srt.utils.async_probe import (
     maybe_detect_inf,
     maybe_detect_nan,
@@ -119,8 +118,6 @@ _is_musa = is_musa()
 _is_hip = is_hip()
 _is_xpu = is_xpu()
 
-if _is_cpu:
-    from sgl_kernel import fill_bonus_tokens_cpu
 
 logger = logging.getLogger(__name__)
 
@@ -558,6 +555,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 self.topk,
                 self.speculative_num_steps,
                 self.speculative_num_draft_tokens,
+                self.device,
             )
 
         # Build tree mask
@@ -1281,7 +1279,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         """
         if batch.forward_mode.is_idle():
             return EagleVerifyInput.create_idle_input(
-                topk=self.topk, spec_steps=0, num_verify_tokens=1
+                topk=self.topk, spec_steps=0, num_verify_tokens=1, device=self.device
             )
 
         draft_input: EagleDraftInput = batch.spec_info
@@ -1679,20 +1677,13 @@ class EAGLEWorkerV2(BaseSpecWorker):
             bonus_tokens = torch.empty_like(accept_lens, dtype=torch.int32)
             # stride = accept_tokens per-req width = accept_index.shape[1]
             # (spec_steps + 1); NOT num_draft_tokens, wrong for topk > 1 trees.
-            if _is_cpu:
-                fill_bonus_tokens_cpu(
-                    accept_tokens,
-                    accept_lens,
-                    bonus_tokens,
-                    accept_index.shape[1],
-                )
-            else:
-                fill_bonus_tokens[(bs,)](
-                    accept_tokens,
-                    accept_lens,
-                    bonus_tokens,
-                    accept_index.shape[1],
-                )
+            fill_bonus_tokens_func(
+                accept_tokens,
+                accept_lens,
+                bonus_tokens,
+                accept_index.shape[1],
+                bs,
+            )
         else:
             bonus_tokens = torch.empty((0,), device=self.device, dtype=torch.int32)
 

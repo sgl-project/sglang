@@ -49,9 +49,18 @@ class TestSpecCPUOverlapConstraint(CustomTestCase):
     def test_cpu_explicit_disable_overlap_is_preserved(self):
         args = _make_spec_args(device="cpu", disable_overlap_schedule=True)
 
-        handle_speculative_decoding(args)
+        # Already disabled: the hook must not flip the flag, and (unlike the
+        # forced-disable cases) must not warn about overriding it.
+        with self.assertLogs(
+            "sglang.srt.arg_groups.speculative_hook", "WARNING"
+        ) as logs:
+            handle_speculative_decoding(args)
 
         self.assertTrue(args.disable_overlap_schedule)
+        self.assertFalse(
+            any("Overlap schedule" in message for message in logs.output),
+            f"hook warned about overriding an already-disabled overlap: {logs.output}",
+        )
 
     def test_cuda_eagle_keeps_overlap_schedule(self):
         # Guard the constraint's scope: the hook must not touch non-CPU devices.

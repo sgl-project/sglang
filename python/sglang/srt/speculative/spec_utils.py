@@ -41,7 +41,7 @@ from sglang.srt.speculative.triton_ops.cache_locs import (
     get_target_cache_loc as get_target_cache_loc,
 )
 from sglang.srt.speculative.triton_ops.eagle import (
-    fill_accept_out_cache_loc as fill_accept_out_cache_loc,
+    fill_accept_out_cache_loc_func as fill_accept_out_cache_loc_func,
 )
 from sglang.srt.utils import (
     is_cpu,
@@ -75,15 +75,11 @@ if _is_cuda:
     from sgl_kernel import fast_topk
 elif _is_hip:
     from sgl_kernel import fast_topk
-elif _is_cpu:
-    from sgl_kernel import (
-        assign_extend_cache_locs_cpu,
-        fill_accept_out_cache_loc_cpu,
-    )
-
-    from sglang.srt.utils.common import fast_topk
 else:
     from sglang.srt.utils.common import fast_topk
+
+if _is_cpu:
+    from sgl_kernel import assign_extend_cache_locs_cpu
 
 
 logger = logging.getLogger(__name__)
@@ -596,12 +592,6 @@ def move_accept_tokens_to_target_kvcache(
             tgt_cache_loc,
             batch.req_to_token_pool.req_to_token.shape[1],
         )
-        fill_accept_out_cache_loc_cpu(
-            accept_index,
-            batch.out_cache_loc,
-            accept_out_cache_loc,
-            size,
-        )
     else:
         assign_extend_cache_locs[(bs,)](
             batch.req_pool_indices,
@@ -612,12 +602,12 @@ def move_accept_tokens_to_target_kvcache(
             batch.req_to_token_pool.req_to_token.shape[1],
             next_power_of_2(bs),
         )
-        fill_accept_out_cache_loc[(size,)](
-            accept_index,
-            batch.out_cache_loc,
-            accept_out_cache_loc,
-            next_power_of_2(size),
-        )
+    fill_accept_out_cache_loc_func(
+        accept_index,
+        batch.out_cache_loc,
+        accept_out_cache_loc,
+        size,
+    )
     token_to_kv_pool_allocator.get_kvcache().move_kv_cache(
         tgt_cache_loc, accept_out_cache_loc
     )

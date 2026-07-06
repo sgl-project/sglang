@@ -410,6 +410,8 @@ def verify_tree_greedy_func(
             accept_index=accept_index,  # mutable
             accept_token_num=accept_token_num,  # mutable
             candidates=candidates,
+            # kwarg LHS retained as `retrive_*` to match the CUDA op schema, so
+            # the CPU/CUDA call sites stay grep-symmetric.
             retrive_index=retrieve_index,
             retrive_next_token=retrieve_next_token,
             retrive_next_sibling=retrieve_next_sibling,

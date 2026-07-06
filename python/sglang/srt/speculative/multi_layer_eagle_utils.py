@@ -21,19 +21,11 @@ _is_cpu = is_cpu()
 # at import time. Both mutate input_ids in place; callers ignore the return.
 if _is_cpu:
     from sgl_kernel import rotate_input_ids_cpu as rotate_input_ids
-
-    rotate_input_ids_kernel = None
-    rotate_input_ids_triton = None
 else:
     from sglang.srt.speculative.triton_ops.multi_layer_eagle import (
-        rotate_input_ids_kernel,
-        rotate_input_ids_triton,
+        rotate_input_ids_triton as rotate_input_ids,
     )
 
-    rotate_input_ids = rotate_input_ids_triton
-
 __all__ = [
-    "rotate_input_ids_kernel",
-    "rotate_input_ids_triton",
     "rotate_input_ids",
 ]

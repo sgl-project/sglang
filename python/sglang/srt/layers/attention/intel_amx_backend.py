@@ -67,9 +67,8 @@ class IntelAMXAttnBackend(AttentionBackend):
 
         In TARGET_VERIFY mode the batch carries no extend_* fields, so they are
         derived from spec_info (mirrors the CUDA unified path in
-        triton_backend.py); each request extends by exactly draft_token_num
-        tokens. Outside spec decoding the fields are passed through, computing
-        extend_start_loc only if the batch did not provide it.
+        triton_backend.py); each request extends by exactly num_draft_tokens
+        tokens. Outside spec decoding the fields are passed through.
         """
         bs = forward_batch.batch_size
         seq_lens = forward_batch.seq_lens
@@ -79,22 +78,22 @@ class IntelAMXAttnBackend(AttentionBackend):
             spec_info = forward_batch.spec_info
             if spec_info is None:
                 raise RuntimeError(
-                    "extend_seq_lens is None but cannot infer from spec_info. "
-                    "This should not happen in TARGET_VERIFY mode."
+                    "extend_seq_lens is unset outside TARGET_VERIFY; it can only "
+                    "be derived from spec_info for speculative verify batches."
                 )
-            draft_token_num = spec_info.draft_token_num
+            num_draft_tokens = spec_info.draft_token_num
             extend_seq_lens = torch.full(
-                (bs,), draft_token_num, dtype=torch.int32, device=self.device
+                (bs,), num_draft_tokens, dtype=torch.int32, device=self.device
             )
             # Uniform extend lengths: start locations form a plain range.
             extend_start_loc = torch.arange(
                 0,
-                bs * draft_token_num,
-                draft_token_num,
+                bs * num_draft_tokens,
+                num_draft_tokens,
                 dtype=torch.int32,
                 device=self.device,
             )
-            seq_lens = forward_batch.seq_lens + draft_token_num
+            seq_lens = forward_batch.seq_lens + num_draft_tokens
             # Speculative verify with a token tree: each draft token may only
             # attend to its ancestors among the draft tokens (the committed
             # prefix stays fully visible).
@@ -109,14 +108,7 @@ class IntelAMXAttnBackend(AttentionBackend):
                     tree_mask = custom_mask
         else:
             extend_seq_lens = forward_batch.extend_seq_lens
-            if forward_batch.extend_start_loc is None:
-                extend_start_loc = torch.zeros(
-                    bs, dtype=torch.int32, device=self.device
-                )
-                if bs > 1:
-                    extend_start_loc[1:] = torch.cumsum(extend_seq_lens[:-1], dim=0)
-            else:
-                extend_start_loc = forward_batch.extend_start_loc
+            extend_start_loc = forward_batch.extend_start_loc
 
         return seq_lens, extend_seq_lens, extend_start_loc, tree_mask
 
@@ -252,11 +244,7 @@ class IntelAMXAttnBackend(AttentionBackend):
         attn_logits, _ = self.forward_metadata
 
         if self.draft_decode_metadata is not None:
-            draft_meta = self.draft_decode_metadata
-            attn_logits = draft_meta["attn_logits"]
-            req_to_token = draft_meta["req_to_token"]
-            req_pool_indices = draft_meta["req_pool_indices"]
-            seq_lens = draft_meta["seq_lens"]
+            req_to_token, seq_lens, req_pool_indices = self.draft_decode_metadata
         else:
             req_to_token = self.req_to_token_pool.req_to_token
             req_pool_indices = forward_batch.req_pool_indices
@@ -310,17 +298,18 @@ class IntelAMXMultiStepDraftBackend:
         topk: int,
         speculative_num_steps: int,
     ):
+        from sgl_kernel import build_draft_decode_metadata_cpu
+
+        self.build_draft_decode_metadata = build_draft_decode_metadata_cpu
         self.topk = topk
         self.speculative_num_steps = speculative_num_steps
         self.attn_backends: List[IntelAMXAttnBackend] = []
-        for i in range(self.speculative_num_steps - 1):
+        for _ in range(self.speculative_num_steps - 1):
             self.attn_backends.append(IntelAMXAttnBackend(model_runner))
         self.device = model_runner.device
         self.pool_len = model_runner.req_to_token_pool.req_to_token.shape[1]
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        from sgl_kernel import build_draft_decode_metadata_cpu
-
         num_seqs = forward_batch.batch_size
         topk = self.topk
         bs = num_seqs * topk
@@ -333,7 +322,7 @@ class IntelAMXMultiStepDraftBackend:
         device = self.device
 
         # Build expanded req_to_token via C++ kernel
-        req_to_token_draft = build_draft_decode_metadata_cpu(
+        req_to_token_draft = self.build_draft_decode_metadata(
             req_to_token,
             forward_batch.req_pool_indices,
             seq_lens,
@@ -354,9 +343,8 @@ class IntelAMXMultiStepDraftBackend:
                 device=device,
             )
             self.attn_backends[step].forward_metadata = (attn_logits, None)
-            self.attn_backends[step].draft_decode_metadata = {
-                "attn_logits": attn_logits,
-                "req_to_token": req_to_token_draft,
-                "seq_lens": seq_lens_expanded,
-                "req_pool_indices": req_pool_indices_expanded,
-            }
+            self.attn_backends[step].draft_decode_metadata = (
+                req_to_token_draft,
+                seq_lens_expanded,
+                req_pool_indices_expanded,
+            )

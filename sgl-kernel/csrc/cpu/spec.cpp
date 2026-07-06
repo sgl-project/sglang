@@ -10,28 +10,35 @@ namespace {
 
 template <typename rpi_t, typename off_t>
 void assign_req_to_token_pool_kernel_impl(
-    const rpi_t* __restrict__ rpi_ptr,
-    int32_t* __restrict__ rtt_ptr,
-    const off_t* __restrict__ so_ptr,
-    const off_t* __restrict__ eo_ptr,
-    const int64_t* __restrict__ ocl_ptr,
+    const rpi_t* __restrict__ req_pool_indices,
+    int32_t* __restrict__ req_to_token,
+    const off_t* __restrict__ start_offset,
+    const off_t* __restrict__ end_offset,
+    const int64_t* __restrict__ out_cache_loc,
+    int64_t num_cache_locs,
     int64_t batch_size,
     int64_t pool_len) {
   // Pre-compute exclusive prefix sum of (end - start) to avoid O(N^2) work.
   std::vector<int64_t> prefix(batch_size + 1, 0);
   for (int64_t i = 0; i < batch_size; ++i) {
-    prefix[i + 1] = prefix[i] + (eo_ptr[i] - so_ptr[i]);
+    prefix[i + 1] = prefix[i] + (end_offset[i] - start_offset[i]);
   }
+  TORCH_CHECK(
+      prefix[batch_size] <= num_cache_locs,
+      "assign_req_to_token_pool: out_cache_loc has ",
+      num_cache_locs,
+      " entries but offsets require ",
+      prefix[batch_size]);
 
   at::parallel_for(0, batch_size, 0, [&](int64_t begin, int64_t end) {
     for (int64_t pid = begin; pid < end; ++pid) {
-      int64_t kv_start = so_ptr[pid];
-      int64_t kv_end = eo_ptr[pid];
-      int32_t* token_pool = rtt_ptr + rpi_ptr[pid] * pool_len;
+      int64_t kv_start = start_offset[pid];
+      int64_t kv_end = end_offset[pid];
+      int32_t* token_pool = req_to_token + req_pool_indices[pid] * pool_len;
       int64_t out_offset = prefix[pid];
 
       for (int64_t j = kv_start; j < kv_end; ++j) {
-        token_pool[j] = static_cast<int32_t>(ocl_ptr[out_offset + (j - kv_start)]);
+        token_pool[j] = static_cast<int32_t>(out_cache_loc[out_offset + (j - kv_start)]);
       }
     }
   });
@@ -39,14 +46,14 @@ void assign_req_to_token_pool_kernel_impl(
 
 template <typename index_t>
 void verify_tree_greedy_kernel_impl(
-    int32_t* __restrict__ predicts_ptr,
-    int32_t* __restrict__ accept_idx_ptr,
-    int32_t* __restrict__ accept_num_ptr,
-    const index_t* __restrict__ cand_ptr,
-    const index_t* __restrict__ ri_ptr,
-    const index_t* __restrict__ rnt_ptr,
-    const index_t* __restrict__ rns_ptr,
-    const index_t* __restrict__ tp_ptr,
+    int32_t* __restrict__ predicts,
+    int32_t* __restrict__ accept_index,
+    int32_t* __restrict__ accept_token_num,
+    const index_t* __restrict__ candidates,
+    const index_t* __restrict__ retrive_index,
+    const index_t* __restrict__ retrive_next_token,
+    const index_t* __restrict__ retrive_next_sibling,
+    const index_t* __restrict__ target_predict,
     int64_t batch_size,
     int64_t num_spec_step,
     int64_t num_draft_tokens) {
@@ -55,45 +62,59 @@ void verify_tree_greedy_kernel_impl(
       int64_t off = bx * num_draft_tokens;
       int64_t ai_off = bx * num_spec_step;
 
-      int64_t last_accept_index = ri_ptr[off];  // retrive_index[bx, 0]
-      accept_idx_ptr[ai_off] = static_cast<int32_t>(last_accept_index);
+      int64_t last_accept_index = retrive_index[off];  // retrive_index[bx, 0]
+      accept_index[ai_off] = static_cast<int32_t>(last_accept_index);
 
       int32_t num_correct_drafts = 0;
       int64_t cur = 0;
 
       for (int64_t j = 1; j < num_spec_step; ++j) {
-        cur = rnt_ptr[off + cur];  // move to next token
+        cur = retrive_next_token[off + cur];  // move to next token
         while (cur != -1) {
-          int64_t draft_idx = ri_ptr[off + cur];
-          int64_t draft_tok = cand_ptr[off + cur];
-          int64_t target_tok = tp_ptr[last_accept_index];
+          int64_t draft_idx = retrive_index[off + cur];
+          int64_t draft_tok = candidates[off + cur];
+          int64_t target_tok = target_predict[last_accept_index];
           if (draft_tok == target_tok) {
-            predicts_ptr[last_accept_index] = static_cast<int32_t>(target_tok);
+            predicts[last_accept_index] = static_cast<int32_t>(target_tok);
             ++num_correct_drafts;
-            accept_idx_ptr[ai_off + num_correct_drafts] = static_cast<int32_t>(draft_idx);
+            accept_index[ai_off + num_correct_drafts] = static_cast<int32_t>(draft_idx);
             last_accept_index = draft_idx;
             break;
           }
-          cur = rns_ptr[off + cur];  // try sibling
+          cur = retrive_next_sibling[off + cur];  // try sibling
         }
         if (cur == -1) break;
       }
-      accept_num_ptr[bx] = num_correct_drafts;
-      predicts_ptr[last_accept_index] = static_cast<int32_t>(tp_ptr[last_accept_index]);
+      accept_token_num[bx] = num_correct_drafts;
+      predicts[last_accept_index] = static_cast<int32_t>(target_predict[last_accept_index]);
     }
   });
 }
 
+// Find the node index in `selected_index[bid]` holding `token_idx`; -1 when the
+// tree is malformed and the parent is absent (callers warn and stop the walk,
+// mirroring the CUDA kernel's "invalid eagle tree" printf).
+template <typename index_t>
+int64_t
+find_parent_node(const index_t* __restrict__ selected_index, int64_t row_off, int64_t sel_stride, int64_t token_idx) {
+  for (int64_t i = 0; i < sel_stride; ++i) {
+    if (selected_index[row_off + i] == token_idx) {
+      return i;
+    }
+  }
+  return -1;
+}
+
 template <typename index_t>
 void build_tree_kernel_efficient_impl(
-    const index_t* __restrict__ parent_ptr,
-    const index_t* __restrict__ sel_ptr,
-    const index_t* __restrict__ seqlen_ptr,
-    bool* __restrict__ mask_ptr,
-    index_t* __restrict__ pos_ptr,
-    index_t* __restrict__ ri_ptr,
-    index_t* __restrict__ rnt_ptr,
-    index_t* __restrict__ rns_ptr,
+    const index_t* __restrict__ parent_list,
+    const index_t* __restrict__ selected_index,
+    const index_t* __restrict__ verified_seq_len,
+    bool* __restrict__ tree_mask,
+    index_t* __restrict__ positions,
+    index_t* __restrict__ retrive_index,
+    index_t* __restrict__ retrive_next_token,
+    index_t* __restrict__ retrive_next_sibling,
     int64_t bs,
     int64_t topk,
     int64_t depth,
@@ -109,41 +130,39 @@ void build_tree_kernel_efficient_impl(
     int64_t acc = 0;
     for (int64_t i = 0; i < bs; ++i) {
       mask_offsets[i] = i * draft_token_num * draft_token_num + acc;
-      acc += static_cast<int64_t>(seqlen_ptr[i]) * draft_token_num;
+      acc += static_cast<int64_t>(verified_seq_len[i]) * draft_token_num;
     }
   }
 
   at::parallel_for(0, bs, 0, [&](int64_t begin, int64_t end) {
     for (int64_t bid = begin; bid < end; ++bid) {
       int64_t off = bid * draft_token_num;
-      int64_t seq_len = seqlen_ptr[bid];
+      int64_t sel_off = bid * sel_stride;
+      int64_t seq_len = verified_seq_len[bid];
 
       // tid == 0 logic: build retrive_index, retrive_next_token, retrive_next_sibling
-      pos_ptr[off] = seq_len;
-      ri_ptr[off] = off;  // retrive_index[bid, 0] = bid * draft_token_num
+      positions[off] = seq_len;
+      retrive_index[off] = off;  // retrive_index[bid, 0] = bid * draft_token_num
 
       for (int64_t i = draft_token_num - 1; i > 0; --i) {
-        ri_ptr[off + i] = off + i;
-        int64_t parent_tb_idx = sel_ptr[bid * sel_stride + i - 1] / topk;
+        retrive_index[off + i] = off + i;
+        int64_t parent_tb_idx = selected_index[sel_off + i - 1] / topk;
         int64_t parent_position = 0;
         if (parent_tb_idx > 0) {
-          int64_t parent_token_idx = parent_ptr[bid * parent_stride + parent_tb_idx];
-          for (; parent_position < draft_token_num; ++parent_position) {
-            if (sel_ptr[bid * sel_stride + parent_position] == parent_token_idx) {
-              ++parent_position;
-              break;
-            }
+          int64_t parent_token_idx = parent_list[bid * parent_stride + parent_tb_idx];
+          int64_t found = find_parent_node(selected_index, sel_off, sel_stride, parent_token_idx);
+          if (found < 0) {
+            TORCH_WARN("build_tree_kernel_efficient_cpu: invalid eagle tree, parent of node ", i, " not found");
+            continue;  // skip invalid
           }
+          parent_position = found + 1;
         }
-        if (parent_position == draft_token_num) {
-          continue;  // skip invalid
-        }
-        if (rnt_ptr[off + parent_position] == -1) {
-          rnt_ptr[off + parent_position] = i;
+        if (retrive_next_token[off + parent_position] == -1) {
+          retrive_next_token[off + parent_position] = i;
         } else {
-          int64_t origin = rnt_ptr[off + parent_position];
-          rnt_ptr[off + parent_position] = i;
-          rns_ptr[off + i] = origin;
+          int64_t origin = retrive_next_token[off + parent_position];
+          retrive_next_token[off + parent_position] = i;
+          retrive_next_sibling[off + i] = origin;
         }
       }
 
@@ -152,56 +171,61 @@ void build_tree_kernel_efficient_impl(
         int64_t mask_stride = draft_token_num;
         for (int64_t tid = 0; tid < draft_token_num; ++tid) {
           int64_t row_start = (off + tid) * mask_stride;
-          mask_ptr[row_start] = true;  // attend to the root token (column 0)
+          tree_mask[row_start] = true;  // attend to the root token (column 0)
           for (int64_t j = 1; j < draft_token_num; ++j) {
-            mask_ptr[row_start + j] = false;
+            tree_mask[row_start + j] = false;
           }
           if (tid == 0) {
             continue;
           }
           int64_t position = 0;
           int64_t cur = tid - 1;
-          while (true) {
+          // A valid root-ward walk has at most `depth` steps; the bound turns a
+          // malformed (cyclic) tree into a warning instead of a scheduler hang.
+          while (position < depth) {
             position++;
-            mask_ptr[row_start + cur + 1] = true;
-            int64_t ptb = sel_ptr[bid * sel_stride + cur] / topk;
+            tree_mask[row_start + cur + 1] = true;
+            int64_t ptb = selected_index[sel_off + cur] / topk;
             if (ptb == 0) break;
-            int64_t tok_idx = parent_ptr[bid * parent_stride + ptb];
-            for (cur = 0; cur < draft_token_num; ++cur) {
-              if (sel_ptr[bid * sel_stride + cur] == tok_idx) break;
+            int64_t tok_idx = parent_list[bid * parent_stride + ptb];
+            cur = find_parent_node(selected_index, sel_off, sel_stride, tok_idx);
+            if (cur < 0) {
+              TORCH_WARN("build_tree_kernel_efficient_cpu: invalid eagle tree, ancestor of node ", tid, " not found");
+              break;  // stop the walk on a malformed tree
             }
           }
-          pos_ptr[off + tid] = position + seq_len;
+          positions[off + tid] = position + seq_len;
         }
       } else {  // FULL_MASK (mode 0)
         // Full mask includes the seq_len prefix
         int64_t seq_tree_idx = mask_offsets[bid];
         for (int64_t tid = 0; tid < draft_token_num; ++tid) {
           int64_t row_start = seq_tree_idx + (seq_len + draft_token_num) * tid + seq_len;
-          mask_ptr[row_start] = true;  // attend to the root token (column 0)
+          tree_mask[row_start] = true;  // attend to the root token (column 0)
           for (int64_t j = 1; j < draft_token_num; ++j) {
-            mask_ptr[row_start + j] = false;
+            tree_mask[row_start + j] = false;
           }
           if (tid == 0) {
             continue;
           }
           int64_t position = 0;
           int64_t cur = tid - 1;
-          while (true) {
+          // Same depth bound as the QLEN_ONLY branch above.
+          while (position < depth) {
             position++;
-            mask_ptr[row_start + cur + 1] = true;
-            int64_t ptb = sel_ptr[bid * sel_stride + cur] / topk;
+            tree_mask[row_start + cur + 1] = true;
+            int64_t ptb = selected_index[sel_off + cur] / topk;
             if (ptb == 0) {
               break;
             }
-            int64_t tok_idx = parent_ptr[bid * parent_stride + ptb];
-            for (cur = 0; cur < draft_token_num; ++cur) {
-              if (sel_ptr[bid * sel_stride + cur] == tok_idx) {
-                break;
-              }
+            int64_t tok_idx = parent_list[bid * parent_stride + ptb];
+            cur = find_parent_node(selected_index, sel_off, sel_stride, tok_idx);
+            if (cur < 0) {
+              TORCH_WARN("build_tree_kernel_efficient_cpu: invalid eagle tree, ancestor of node ", tid, " not found");
+              break;  // stop the walk on a malformed tree
             }
           }
-          pos_ptr[off + tid] = position + seq_len;
+          positions[off + tid] = position + seq_len;
         }
       }
     }
@@ -214,7 +238,8 @@ void build_tree_kernel_efficient_impl(
 // longest root path whose draft tokens match the target model's argmax.
 //
 // predicts:            [bs * num_draft_tokens] int32; out, verified tokens by flat draft index
-// accept_index:        [bs, num_spec_step] int32; out, flat indices of accepted tokens, -1 padded
+// accept_index:        [bs, num_spec_step] int32; out, flat indices of accepted
+//                      tokens; caller pre-fills with -1 (rejected slots keep it)
 // accept_token_num:    [bs] int32; out, accepted drafts per request (bonus excluded)
 // candidates:          [bs, num_draft_tokens] int32 or int64; draft tokens
 // retrive_index:       [bs, num_draft_tokens] int32 or int64; flat index of each tree node
@@ -241,8 +266,14 @@ void verify_tree_greedy_cpu(
   CHECK_EQ(predicts.scalar_type(), at::kInt);
   CHECK_EQ(accept_index.scalar_type(), at::kInt);
   CHECK_EQ(accept_token_num.scalar_type(), at::kInt);
+  CHECK_DIM(1, predicts);
+  CHECK_DIM(1, accept_token_num);
   CHECK_DIM(2, candidates);
   CHECK_DIM(2, accept_index);
+  CHECK_DIM(2, retrive_index);
+  CHECK_DIM(2, retrive_next_token);
+  CHECK_DIM(2, retrive_next_sibling);
+  CHECK_DIM(2, target_predict);
   const auto index_dtype = retrive_index.scalar_type();
   CHECK_EQ(candidates.scalar_type(), index_dtype);
   CHECK_EQ(retrive_next_token.scalar_type(), index_dtype);
@@ -252,6 +283,17 @@ void verify_tree_greedy_cpu(
   int64_t batch_size = candidates.size(0);
   int64_t num_spec_step = accept_index.size(1);
   int64_t num_draft_tokens = candidates.size(1);
+  CHECK_EQ(accept_index.size(0), batch_size);
+  CHECK_EQ(accept_token_num.size(0), batch_size);
+  CHECK_EQ(retrive_index.size(0), batch_size);
+  CHECK_EQ(retrive_index.size(1), num_draft_tokens);
+  CHECK_EQ(retrive_next_token.size(0), batch_size);
+  CHECK_EQ(retrive_next_token.size(1), num_draft_tokens);
+  CHECK_EQ(retrive_next_sibling.size(0), batch_size);
+  CHECK_EQ(retrive_next_sibling.size(1), num_draft_tokens);
+  CHECK_EQ(target_predict.size(0), batch_size);
+  CHECK_EQ(target_predict.size(1), num_draft_tokens);
+  CHECK_EQ(predicts.numel(), batch_size * num_draft_tokens);
 
   AT_DISPATCH_INDEX_TYPES(index_dtype, "verify_tree_greedy_indices", [&] {
     verify_tree_greedy_kernel_impl<index_t>(
@@ -277,8 +319,11 @@ void verify_tree_greedy_cpu(
 // selected_index:      [bs, draft_token_num - 1] int32 or int64
 // verified_seq_len:    [bs] int32 or int64; committed prefix length per request
 // tree_mask:           out, bool.
-//                      QLEN_ONLY: [bs * draft_token_num * draft_token_num]
-//                      FULL_MASK: [sum_i(seq_len_i * draft_token_num) + bs * draft_token_num^2]
+//                      QLEN_ONLY: [bs * draft_token_num * draft_token_num]; rows
+//                      are fully overwritten here.
+//                      FULL_MASK: [sum_i(seq_len_i * draft_token_num) + bs * draft_token_num^2];
+//                      only each row's qlen block is written -- the caller must
+//                      pre-fill the seq_len prefix columns with true.
 // positions:           [bs * draft_token_num]; out, same dtype as parent_list
 // retrive_index:       [bs, draft_token_num]; out
 // retrive_next_token:  [bs, draft_token_num]; out, pre-filled with -1
@@ -314,11 +359,30 @@ void build_tree_kernel_efficient_cpu(
   CHECK_EQ(retrive_next_token.scalar_type(), index_dtype);
   CHECK_EQ(retrive_next_sibling.scalar_type(), index_dtype);
 
-  // CPU workers always use FULL_MASK or QLEN_ONLY; QLEN_ONLY_BITPACKING has no
-  // CPU producer and is untested here.
-  TORCH_CHECK(tree_mask_mode != 2, "build_tree_kernel_efficient_cpu: QLEN_ONLY_BITPACKING is not supported on CPU");
+  // CPU workers always use FULL_MASK (0) or QLEN_ONLY (1); QLEN_ONLY_BITPACKING
+  // (2) has no CPU producer and any other value is a caller bug.
+  TORCH_CHECK(
+      tree_mask_mode == 0 || tree_mask_mode == 1,
+      "build_tree_kernel_efficient_cpu: only FULL_MASK (0) and QLEN_ONLY (1) are supported, got ",
+      tree_mask_mode);
 
   int64_t bs = parent_list.size(0);
+  CHECK_DIM(2, parent_list);
+  CHECK_DIM(2, selected_index);
+  CHECK_EQ(parent_list.size(1), topk * (depth - 1) + 1);
+  CHECK_EQ(selected_index.size(0), bs);
+  CHECK_EQ(selected_index.size(1), draft_token_num - 1);
+  CHECK_EQ(verified_seq_len.numel(), bs);
+  CHECK_EQ(positions.numel(), bs * draft_token_num);
+  CHECK_EQ(retrive_index.numel(), bs * draft_token_num);
+  CHECK_EQ(retrive_next_token.numel(), bs * draft_token_num);
+  CHECK_EQ(retrive_next_sibling.numel(), bs * draft_token_num);
+  if (tree_mask_mode == 1) {
+    CHECK_EQ(tree_mask.numel(), bs * draft_token_num * draft_token_num);
+  } else {
+    int64_t seq_len_sum = verified_seq_len.sum().item<int64_t>();
+    CHECK_EQ(tree_mask.numel(), (seq_len_sum + bs * draft_token_num) * draft_token_num);
+  }
 
   AT_DISPATCH_INDEX_TYPES(index_dtype, "build_tree_kernel_efficient_indices", [&] {
     build_tree_kernel_efficient_impl<index_t>(
@@ -360,13 +424,15 @@ void assign_req_to_token_pool_cpu(
   CHECK_INPUT(start_offset);
   CHECK_INPUT(end_offset);
   CHECK_INPUT(out_cache_loc);
+  CHECK_DIM(2, req_to_token);
   CHECK_EQ(req_to_token.scalar_type(), at::kInt);
   CHECK_EQ(out_cache_loc.scalar_type(), at::kLong);
   CHECK_EQ(end_offset.scalar_type(), start_offset.scalar_type());
+  CHECK_EQ(req_to_token.size(1), pool_len);
 
   int64_t batch_size = req_pool_indices.size(0);
-  auto* rtt_ptr = req_to_token.data_ptr<int32_t>();
-  auto* ocl_ptr = out_cache_loc.data_ptr<int64_t>();
+  CHECK_EQ(start_offset.numel(), batch_size);
+  CHECK_EQ(end_offset.numel(), batch_size);
 
   AT_DISPATCH_INDEX_TYPES(req_pool_indices.scalar_type(), "assign_req_to_token_pool_rpi", [&] {
     using rpi_t = index_t;
@@ -374,10 +440,11 @@ void assign_req_to_token_pool_cpu(
     AT_DISPATCH_INDEX_TYPES(start_offset.scalar_type(), "assign_req_to_token_pool_offsets", [&] {
       assign_req_to_token_pool_kernel_impl<rpi_t, index_t>(
           rpi_ptr,
-          rtt_ptr,
+          req_to_token.data_ptr<int32_t>(),
           start_offset.data_ptr<index_t>(),
           end_offset.data_ptr<index_t>(),
-          ocl_ptr,
+          out_cache_loc.data_ptr<int64_t>(),
+          out_cache_loc.numel(),
           batch_size,
           pool_len);
     });
@@ -403,10 +470,13 @@ at::Tensor build_draft_decode_metadata_cpu(
   CHECK_INPUT(req_to_token);
   CHECK_INPUT(req_pool_indices);
   CHECK_INPUT(seq_lens);
+  CHECK_DIM(2, req_to_token);
   CHECK_EQ(req_to_token.scalar_type(), at::kInt);
+  CHECK_EQ(req_to_token.size(1), pool_len);
 
   int64_t num_seqs = req_pool_indices.size(0);
   int64_t bs = num_seqs * topk;
+  CHECK_EQ(seq_lens.numel(), num_seqs);
 
   auto req_to_token_draft = at::empty({bs, pool_len}, req_to_token.options());
 
@@ -461,6 +531,8 @@ void fill_bonus_tokens_cpu(
   CHECK_EQ(bonus_tokens.scalar_type(), at::kInt);
 
   int64_t bs = accept_lens.size(0);
+  CHECK_EQ(accept_tokens.numel(), bs * accept_stride);
+  CHECK_EQ(bonus_tokens.numel(), bs);
   auto* accept_ptr = accept_tokens.data_ptr<int32_t>();
   auto* al_ptr = accept_lens.data_ptr<int32_t>();
   auto* out_ptr = bonus_tokens.data_ptr<int32_t>();
@@ -477,26 +549,32 @@ void fill_bonus_tokens_cpu(
 // indices, skipping -1 (rejected) entries. Sequential by design: the output
 // write position depends on how many prior entries were accepted.
 //
-// accept_index:         [size] int32 or int64; flat (bs * num_spec_step), -1 = rejected
+// accept_index:         [bs * num_spec_step] int32 or int64; flat, -1 = rejected
 // out_cache_loc:        [bs * num_draft_tokens] int64
-// accept_out_cache_loc: [num_accept] int64; out
+// accept_out_cache_loc: [>= num_accept] int64; out, only the first num_accept
+//                       entries are written
 void fill_accept_out_cache_loc_cpu(
-    const at::Tensor& accept_index, const at::Tensor& out_cache_loc, at::Tensor accept_out_cache_loc, int64_t size) {
+    const at::Tensor& accept_index, const at::Tensor& out_cache_loc, at::Tensor accept_out_cache_loc) {
   CHECK_INPUT(accept_index);
   CHECK_INPUT(out_cache_loc);
   CHECK_INPUT(accept_out_cache_loc);
   CHECK_EQ(out_cache_loc.scalar_type(), at::kLong);
   CHECK_EQ(accept_out_cache_loc.scalar_type(), at::kLong);
+  // num_accept <= accept_index.numel(), so this bounds every write below.
+  CHECK_GE(accept_out_cache_loc.numel(), accept_index.numel());
 
+  int64_t num_indices = accept_index.numel();
+  int64_t num_cache_locs = out_cache_loc.numel();
   auto* ocl_ptr = out_cache_loc.data_ptr<int64_t>();
   auto* out_ptr = accept_out_cache_loc.data_ptr<int64_t>();
 
   AT_DISPATCH_INDEX_TYPES(accept_index.scalar_type(), "fill_accept_out_cache_loc_indices", [&] {
     const index_t* ai_ptr = accept_index.data_ptr<index_t>();
     int64_t dst = 0;
-    for (int64_t i = 0; i < size; ++i) {
+    for (int64_t i = 0; i < num_indices; ++i) {
       int64_t src = static_cast<int64_t>(ai_ptr[i]);
       if (src > -1) {
+        TORCH_CHECK(src < num_cache_locs, "fill_accept_out_cache_loc: accept_index ", src, " out of range");
         out_ptr[dst++] = ocl_ptr[src];
       }
     }
@@ -523,12 +601,15 @@ void assign_draft_cache_locs_contiguous_cpu(
   CHECK_INPUT(req_to_token);
   CHECK_INPUT(seq_lens);
   CHECK_INPUT(out_cache_loc);
+  CHECK_DIM(2, req_to_token);
   CHECK_EQ(req_to_token.scalar_type(), at::kInt);
   CHECK_EQ(out_cache_loc.scalar_type(), at::kLong);
+  CHECK_EQ(req_to_token.size(1), pool_len);
   CHECK_EQ(out_cache_loc.numel(), req_pool_indices.numel() * topk * num_steps);
 
   int64_t bs = req_pool_indices.size(0);
   int64_t copy_len = topk * num_steps;
+  CHECK_EQ(seq_lens.numel(), bs);
 
   auto* rtt_ptr = req_to_token.data_ptr<int32_t>();
   auto* out_ptr = out_cache_loc.data_ptr<int64_t>();
@@ -574,11 +655,15 @@ void assign_extend_cache_locs_cpu(
   CHECK_INPUT(start_offset);
   CHECK_INPUT(end_offset);
   CHECK_INPUT(out_cache_loc);
+  CHECK_DIM(2, req_to_token);
   CHECK_EQ(req_to_token.scalar_type(), at::kInt);
   CHECK_EQ(out_cache_loc.scalar_type(), at::kLong);
   CHECK_EQ(end_offset.scalar_type(), start_offset.scalar_type());
+  CHECK_EQ(req_to_token.size(1), pool_len);
 
   int64_t bs = req_pool_indices.size(0);
+  CHECK_EQ(start_offset.numel(), bs);
+  CHECK_EQ(end_offset.numel(), bs);
   auto* rtt_ptr = req_to_token.data_ptr<int32_t>();
   auto* out_ptr = out_cache_loc.data_ptr<int64_t>();
 
@@ -594,6 +679,14 @@ void assign_extend_cache_locs_cpu(
       for (int64_t i = 0; i < bs; ++i) {
         out_offsets[i + 1] = out_offsets[i] + (end_ptr[i] - start_ptr[i]);
       }
+      // Callers may size out_cache_loc at max capacity (e.g. bs * num_spec_step
+      // in move_accept_tokens) and leave the tail untouched, hence <= not ==.
+      TORCH_CHECK(
+          out_offsets[bs] <= out_cache_loc.numel(),
+          "assign_extend_cache_locs: out_cache_loc has ",
+          out_cache_loc.numel(),
+          " entries but offsets require ",
+          out_offsets[bs]);
 
       at::parallel_for(0, bs, 0, [&](int64_t begin, int64_t end) {
         for (int64_t pid = begin; pid < end; ++pid) {
@@ -622,8 +715,8 @@ void assign_extend_cache_locs_cpu(
 // retrive_next_token:  [bs, draft_token_num]; out
 // retrive_next_sibling:[bs, draft_token_num]; out
 void reconstruct_indices_from_tree_mask_cpu(
-    at::Tensor tree_mask,
-    at::Tensor verified_seq_len,
+    const at::Tensor& tree_mask,
+    const at::Tensor& verified_seq_len,
     at::Tensor positions,
     at::Tensor retrive_index,
     at::Tensor retrive_next_token,
@@ -637,13 +730,19 @@ void reconstruct_indices_from_tree_mask_cpu(
   CHECK_INPUT(retrive_next_token);
   CHECK_INPUT(retrive_next_sibling);
   CHECK_EQ(tree_mask.scalar_type(), at::kBool);
+  CHECK_EQ(tree_mask.numel(), batch_size * draft_token_num * draft_token_num);
+  CHECK_EQ(verified_seq_len.numel(), batch_size);
+  CHECK_EQ(positions.numel(), batch_size * draft_token_num);
+  CHECK_EQ(retrive_index.numel(), batch_size * draft_token_num);
+  CHECK_EQ(retrive_next_token.numel(), batch_size * draft_token_num);
+  CHECK_EQ(retrive_next_sibling.numel(), batch_size * draft_token_num);
   const auto index_dtype = verified_seq_len.scalar_type();
   CHECK_EQ(positions.scalar_type(), index_dtype);
   CHECK_EQ(retrive_index.scalar_type(), index_dtype);
   CHECK_EQ(retrive_next_token.scalar_type(), index_dtype);
   CHECK_EQ(retrive_next_sibling.scalar_type(), index_dtype);
 
-  auto* mask_ptr = tree_mask.data_ptr<bool>();
+  const bool* mask_ptr = tree_mask.data_ptr<bool>();
   int64_t base_offset = draft_token_num * draft_token_num;
 
   AT_DISPATCH_INDEX_TYPES(index_dtype, "reconstruct_indices_from_tree_mask_indices", [&] {
@@ -731,22 +830,26 @@ void rotate_input_ids_cpu(
     const at::Tensor& extend_start_loc,
     const at::Tensor& extend_seq_lens,
     const at::Tensor& topk_index,
-    const c10::optional<at::Tensor>& select_index_opt) {
+    const std::optional<at::Tensor>& select_index_opt) {
   CHECK_INPUT(input_ids);
   CHECK_INPUT(extend_start_loc);
   CHECK_INPUT(extend_seq_lens);
   CHECK_INPUT(topk_index);
   CHECK_EQ(input_ids.scalar_type(), at::kLong);
   CHECK_EQ(topk_index.scalar_type(), at::kLong);
+
+  int64_t bs = extend_seq_lens.size(0);
+  CHECK_EQ(extend_start_loc.numel(), bs);
+  CHECK_EQ(topk_index.numel(), bs);
   if (select_index_opt.has_value()) {
     CHECK_INPUT(select_index_opt.value());
     CHECK_EQ(select_index_opt.value().scalar_type(), at::kLong);
+    CHECK_EQ(select_index_opt.value().numel(), bs);
   }
 
-  int64_t bs = extend_seq_lens.size(0);
   auto* ids_ptr = input_ids.data_ptr<int64_t>();
   auto* topk_ptr = topk_index.data_ptr<int64_t>();
-  const int64_t* select_ptr = select_index_opt.has_value() ? select_index_opt.value().data_ptr<int64_t>() : nullptr;
+  const int64_t* select_ptr = conditional_data_ptr<int64_t>(select_index_opt);
 
   AT_DISPATCH_INDEX_TYPES(extend_start_loc.scalar_type(), "rotate_input_ids_start", [&] {
     using start_t = index_t;

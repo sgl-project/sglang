@@ -151,9 +151,9 @@ def segment_packbits(
 
 
 def verify_tree_greedy_cpu(
-    predicts: torch.Tensor,
-    accept_index: torch.Tensor,
-    accept_token_num: torch.Tensor,
+    predicts: torch.Tensor,  # mutable
+    accept_index: torch.Tensor,  # mutable
+    accept_token_num: torch.Tensor,  # mutable
     candidates: torch.Tensor,
     retrive_index: torch.Tensor,
     retrive_next_token: torch.Tensor,
@@ -255,14 +255,12 @@ def fill_bonus_tokens_cpu(
 def fill_accept_out_cache_loc_cpu(
     accept_index: torch.Tensor,
     out_cache_loc: torch.Tensor,
-    accept_out_cache_loc: torch.Tensor,
-    size: int,
+    accept_out_cache_loc: torch.Tensor,  # mutable
 ) -> None:
     torch.ops.sgl_kernel.fill_accept_out_cache_loc_cpu(
         accept_index,
         out_cache_loc,
         accept_out_cache_loc,
-        size,
     )
 
 

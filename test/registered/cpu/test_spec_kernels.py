@@ -11,8 +11,6 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=20, suite="base-b-test-cpu")
 
-torch.manual_seed(1234)
-
 
 def _topk1_chain_inputs(bs, num_steps):
     parent_width = num_steps if num_steps > 1 else 0
@@ -772,7 +770,7 @@ class TestFillKernels(CustomTestCase):
         size = bs * num_spec_step
         accept_out_cache_loc = torch.zeros(size, dtype=torch.int64)
         torch.ops.sgl_kernel.fill_accept_out_cache_loc_cpu(
-            accept_indices, out_cache_loc, accept_out_cache_loc, size
+            accept_indices, out_cache_loc, accept_out_cache_loc
         )
         valid = accept_indices.flatten()[accept_indices.flatten() > -1].to(torch.int64)
         ref = torch.zeros(size, dtype=torch.int64)
@@ -844,11 +842,12 @@ class TestAssignCacheLocKernels(CustomTestCase):
             )
 
     def test_assign_extend_cache_locs(self):
-        bs, pool_len, num_reqs = 3, 32, 5
-        req_pool_indices = torch.tensor([1, 3, 0], dtype=torch.int64)
+        bs, pool_len, num_reqs = 4, 32, 5
+        req_pool_indices = torch.tensor([1, 3, 0, 2], dtype=torch.int64)
         req_to_token = torch.randint(0, 10000, (num_reqs, pool_len), dtype=torch.int32)
-        start_offset = torch.tensor([4, 0, 11], dtype=torch.int64)
-        end_offset = torch.tensor([9, 7, 12], dtype=torch.int64)
+        # Last request has start == end (zero-length range, nothing copied).
+        start_offset = torch.tensor([4, 0, 11, 6], dtype=torch.int64)
+        end_offset = torch.tensor([9, 7, 12, 6], dtype=torch.int64)
         total = int((end_offset - start_offset).sum())
         out_cache_loc = torch.empty((total,), dtype=torch.int64)
         torch.ops.sgl_kernel.assign_extend_cache_locs_cpu(

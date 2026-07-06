@@ -540,6 +540,10 @@ void extend_attention_cpu(
         ", got ",
         tree_mask_t.numel());
     TORCH_CHECK(!is_cross_attn, "extend: tree_mask is not supported for cross attention");
+    // The window mask derives query positions from the row index
+    // (seq_len_prefix + m + row), but tree-mask rows sit at their tree depth,
+    // which is <= the row index; combining the two would over-mask the prefix.
+    TORCH_CHECK(sliding_window_size <= 0, "extend: tree_mask is not supported with sliding window attention");
     tree_mask_ptr = tree_mask_t.data_ptr<bool>();
   }
 

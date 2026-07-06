@@ -220,6 +220,7 @@ class EagleDraftWorkerBase(ABC):
                         num_steps,
                     )
                 else:
+                    # FIXME(lsyin): align with the default code path
                     assign_draft_cache_locs_contiguous[(bs,)](
                         batch.req_pool_indices,
                         req_to_token_pool.req_to_token,

@@ -10,9 +10,6 @@ from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_trito
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
-from sglang.srt.utils import is_cpu
-
-_is_cpu = is_cpu()
 
 logger = logging.getLogger(__name__)
 
@@ -62,8 +59,9 @@ class EagleVerifyInput(SpecInput):
         return self.draft_token_num, self.draft_token_num
 
     @classmethod
-    def create_idle_input(cls, topk: int, spec_steps: int, num_verify_tokens: int):
-        device = "cpu" if _is_cpu else "cuda"
+    def create_idle_input(
+        cls, topk: int, spec_steps: int, num_verify_tokens: int, device: str
+    ):
         return cls(
             draft_token=torch.empty((0,), dtype=torch.long, device=device),
             custom_mask=torch.full((0,), True, dtype=torch.bool, device=device),

@@ -11,7 +11,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def disable_overlap_schedule_for_cpu(server_args: ServerArgs) -> None:
+def _disable_overlap_schedule_for_cpu(server_args: ServerArgs) -> None:
     if server_args.device != "cpu":
         return
 
@@ -343,7 +343,7 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
             "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
         )
 
-    disable_overlap_schedule_for_cpu(server_args)
+    _disable_overlap_schedule_for_cpu(server_args)
 
     if resolved_view(server_args).disable_overlap_schedule:
         logger.warning(
@@ -487,7 +487,7 @@ def _handle_ngram(server_args: ServerArgs) -> None:
             "Ngram speculative decoding only supports CUDA or CPU devices."
         )
 
-    disable_overlap_schedule_for_cpu(server_args)
+    _disable_overlap_schedule_for_cpu(server_args)
 
     if server_args.max_running_requests is None:
         server_args.max_running_requests = 48

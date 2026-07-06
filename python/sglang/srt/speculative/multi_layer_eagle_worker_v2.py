@@ -49,7 +49,6 @@ from sglang.srt.speculative.eagle_info import (
     EagleVerifyInput,
 )
 from sglang.srt.speculative.eagle_utils import (
-    TreeMaskMode,
     build_tree_kernel_efficient,
     default_tree_mask_mode,
     eagle_prepare_for_verify,
@@ -59,10 +58,7 @@ from sglang.srt.speculative.eagle_utils import (
 from sglang.srt.speculative.multi_layer_eagle_draft_extend_cuda_graph_runner import (
     MultiLayerEagleMultiStepDraftExtendCudaGraphRunner,
 )
-from sglang.srt.speculative.multi_layer_eagle_utils import (
-    rotate_input_ids,
-    rotate_input_ids_triton,
-)
+from sglang.srt.speculative.multi_layer_eagle_utils import rotate_input_ids
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     draft_tp_context,
@@ -71,7 +67,7 @@ from sglang.srt.speculative.spec_utils import (
     sample_draft_proposal,
     select_top_k_tokens,
 )
-from sglang.srt.speculative.triton_ops.eagle import fill_bonus_tokens
+from sglang.srt.speculative.triton_ops.eagle import fill_bonus_tokens_func
 from sglang.srt.utils import is_cpu, is_npu
 from sglang.srt.utils.async_probe import (
     maybe_detect_inf,
@@ -83,8 +79,6 @@ from sglang.srt.utils.common import empty_context, fast_topk
 _is_npu = is_npu()
 _is_cpu = is_cpu()
 
-if _is_cpu:
-    from sgl_kernel import fill_bonus_tokens_cpu
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner, ModelRunnerOutput
@@ -272,6 +266,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                 self.topk,
                 self.speculative_num_steps,
                 self.speculative_num_draft_tokens,
+                self.device,
             )
 
         # Build tree mask
@@ -510,6 +505,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             if self.use_rejection_sampling and draft_probs_list
             else None
         )
+
         return next_draft_input
 
     def _draft_extend_for_decode(
@@ -575,7 +571,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                 # Advance the draft chain by rotating the shared input_ids window
                 # in place; step N+1's graph then reads the rotated values.
                 if step < self.speculative_num_steps - 1:
-                    rotate_input_ids_triton(
+                    rotate_input_ids(
                         cgr.buffers.input_ids[: cgr.raw_num_tokens],
                         cgr.buffers.extend_start_loc[: cgr.raw_bs],
                         cgr.buffers.extend_seq_lens[: cgr.raw_bs],
@@ -876,20 +872,13 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             accept_tokens = predict[accept_index]
             bonus_tokens = torch.empty_like(accept_lens, dtype=torch.int32)
             # stride = accept_tokens per-req width = accept_index.shape[1].
-            if _is_cpu:
-                fill_bonus_tokens_cpu(
-                    accept_tokens,
-                    accept_lens,
-                    bonus_tokens,
-                    accept_index.shape[1],
-                )
-            else:
-                fill_bonus_tokens[(bs,)](
-                    accept_tokens,
-                    accept_lens,
-                    bonus_tokens,
-                    accept_index.shape[1],
-                )
+            fill_bonus_tokens_func(
+                accept_tokens,
+                accept_lens,
+                bonus_tokens,
+                accept_index.shape[1],
+                bs,
+            )
         else:
             bonus_tokens = torch.empty((0,), device=self.device, dtype=torch.int32)
 

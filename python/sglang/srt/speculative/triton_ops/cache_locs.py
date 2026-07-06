@@ -402,7 +402,9 @@ def assign_extend_cache_locs_func(
 
     elif _is_cpu:
         out_cache_loc = torch.empty(
-            batch_size * draft_token_num, dtype=torch.int64, device="cpu"
+            (batch_size * draft_token_num,),
+            dtype=torch.int64,
+            device=device,
         )
         assign_extend_cache_locs_cpu(
             req_pool_indices,
@@ -412,4 +414,5 @@ def assign_extend_cache_locs_func(
             out_cache_loc,
             req_to_token.shape[1],
         )
+
         return out_cache_loc
