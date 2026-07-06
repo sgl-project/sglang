@@ -23,6 +23,7 @@ mod tokenizer_manager;
 use std::net::SocketAddr;
 
 use pyo3::prelude::*;
+use pyo3::pybacked::PyBackedBytes;
 use pyo3::types::PyBytes;
 
 use crate::runtime::{Runtime, RuntimeConfig};
@@ -160,26 +161,37 @@ impl Server {
         })
     }
 
-    /// Push a whole decode batch as ONE frame: a columnar msgpack `header`
-    /// plus one concatenated raw `data` buffer.
-    /// Blocks for backpressure; `False` only on shutdown.
-    fn push_batch(&self, py: Python<'_>, header: &[u8], data: &[u8]) -> bool {
-        let bytes = crate::message::frame_egress_batch(header, data);
-        py.detach(|| self.rt.egress.push(bytes))
+    /// Push a whole decode batch as ONE frame: a columnar msgpack `header` plus
+    /// the raw `data_cols` (per-column `bytes`), concatenated here. Blocks for
+    /// backpressure; `False` only on shutdown.
+    fn push_batch(&self, py: Python<'_>, header: &[u8], data_cols: Vec<PyBackedBytes>) -> bool {
+        let cols: Vec<&[u8]> = data_cols.iter().map(|d| d.as_ref()).collect();
+        py.detach(|| {
+            let bytes = crate::message::frame_egress_batch_cols(header, &cols);
+            self.rt.egress.push(bytes)
+        })
     }
 
-    /// Push a control-request result.
-    /// Blocks for backpressure; `False` only on shutdown.
+    /// Push a control-request result. Blocks for backpressure; `False` only on
+    /// shutdown. Frames inside `detach` like `push_batch` — the payload is small
+    /// here so the copy is cheap either way, but kept uniform so no push holds the
+    /// GIL across framing.
     fn push_result(&self, py: Python<'_>, rid: &str, payload: &[u8]) -> bool {
-        let bytes = crate::message::frame_egress_result(rid, payload);
-        py.detach(|| self.rt.egress.push(bytes))
+        py.detach(|| {
+            self.rt
+                .egress
+                .push(crate::message::frame_egress_result(rid, payload))
+        })
     }
 
-    /// Route a terminal failure back to request `rid`.
-    /// Blocks for backpressure; `False` only on shutdown.
+    /// Route a terminal failure back to request `rid`. Blocks for backpressure;
+    /// `False` only on shutdown.
     fn push_error(&self, py: Python<'_>, rid: &str, message: &str) -> bool {
-        let bytes = crate::message::frame_egress_error(rid, message);
-        py.detach(|| self.rt.egress.push(bytes))
+        py.detach(|| {
+            self.rt
+                .egress
+                .push(crate::message::frame_egress_error(rid, message))
+        })
     }
 
     /// Signal all threads to stop (best effort).
