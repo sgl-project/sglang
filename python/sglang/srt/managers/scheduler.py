@@ -2730,9 +2730,16 @@ class Scheduler(
 
         return ret
 
-    def get_num_allocatable_reqs(self, running_bs):
+    def get_num_allocatable_reqs(self, running_bs, chunked_req_in_flight=False):
         res = get_global_server_args().pp_max_micro_batch_size - running_bs
-        res = min(res, self.req_to_token_pool.available_size())
+        # An in-flight chunked prefill already holds a req_to_token_pool slot
+        # (deducted from available_size()) and is re-counted in the adder's
+        # can_run_list by add_chunked_req, so add that held slot back here to
+        # avoid declaring the batch full one request early.
+        res = min(
+            res,
+            self.req_to_token_pool.available_size() + int(chunked_req_in_flight),
+        )
         return res
 
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
@@ -2837,6 +2844,10 @@ class Scheduler(
             waiting_queue_len=len(self.waiting_queue),
         )
 
+        # add_chunked_req returns None on the final chunk, so capture whether a
+        # chunk is in flight (holding a req_to_token_pool slot) before the call;
+        # the batch-full check below compensates for that already-held slot.
+        chunked_req_holds_slot = self.chunked_req is not None
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
@@ -2863,7 +2874,9 @@ class Scheduler(
                 continue
 
             running_bs = len(self.running_batch.reqs)
-            if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
+            if len(adder.can_run_list) >= self.get_num_allocatable_reqs(
+                running_bs, chunked_req_in_flight=chunked_req_holds_slot
+            ):
                 self.running_batch.batch_is_full = True
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 # In prefill mode, prealloc queue and transfer queue can also take memory,
