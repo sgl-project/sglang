@@ -2,7 +2,6 @@ import os
 
 from sglang.multimodal_gen.test.server.testcase_configs import (
     T2V_PROMPT,
-    COSMOS3_NANO_CI_sampling_params,
     DiffusionSamplingParams,
     DiffusionServerArgs,
     DiffusionTestCase,
