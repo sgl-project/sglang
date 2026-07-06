@@ -32,7 +32,10 @@ import torch
 import torch.distributed as dist
 from torch import nn
 
-from sglang.jit_kernel.ngram_embedding import update_token_table_decode
+from sglang.jit_kernel.ngram_embedding import (
+    update_token_table,
+    update_token_table_decode,
+)
 from sglang.srt.configs import (
     BailingHybridConfig,
     FalconH1Config,
