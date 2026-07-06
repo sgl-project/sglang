@@ -11,14 +11,13 @@ from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
-if not torch.cuda.is_available():
-    pytest.skip("CUDA is not available", allow_module_level=True)
-
 try:
     from sgl_kernel import sgl_per_token_group_quant_8bit  # AOT v2 reference op
 except ImportError:
     sgl_per_token_group_quant_8bit = None
 
+if sgl_per_token_group_quant_8bit is None and not torch.cuda.is_available():
+    pytest.skip("sgl_kernel AOT reference op is unavailable", allow_module_level=True)
 if sgl_per_token_group_quant_8bit is None:
     raise ImportError("sgl_kernel AOT reference op is unavailable")
 

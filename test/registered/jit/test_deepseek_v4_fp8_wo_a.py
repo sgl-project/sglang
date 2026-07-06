@@ -36,11 +36,12 @@ class TestDeepSeekV4FP8WoA(CustomTestCase):
         cls.fp8_kernel = importlib.import_module(
             "sglang.srt.layers.quantization.fp8_kernel"
         )
+        cls.fp8_wo_a = importlib.import_module("sglang.jit_kernel.dsv4.fp8_wo_a")
         fp8_utils = importlib.import_module("sglang.srt.layers.quantization.fp8_utils")
 
         cls.quant = staticmethod(cls.fp8_kernel.sglang_per_token_group_quant_fp8)
         cls.quant_dsv4_woa = staticmethod(
-            cls.fp8_kernel.sglang_per_token_group_quant_fp8_dsv4_woa
+            cls.fp8_wo_a.sglang_per_token_group_quant_fp8_dsv4_woa
         )
         cls.fp8_dtype = cls.fp8_kernel.fp8_dtype
         cls.quant_weight_ue8m0 = staticmethod(fp8_utils.quant_weight_ue8m0)

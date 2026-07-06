@@ -462,23 +462,7 @@ def create_per_token_group_quant_fp8_output_scale(
     column_major_scales: bool,
     scale_tma_aligned: bool,
     scale_ue8m0: bool,
-    scale_outer_major: bool = False,
 ):
-    if scale_outer_major:
-        assert scale_ue8m0
-        assert not column_major_scales
-        assert not scale_tma_aligned
-        assert len(x_shape) == 3
-        *x_batch, x_s_mn, x_s_outer, x_q_k = x_shape
-        # DSV4 wo_a needs logical [tokens, groups, K/128] scales, but DeepGEMM
-        # consumes each group slice contiguously, so back the view with
-        # [groups, tokens, K/128] storage.
-        return torch.empty(
-            (*x_batch, x_s_outer, x_s_mn, x_q_k // group_size),
-            device=device,
-            dtype=torch.float32,
-        ).transpose(-3, -2)
-
     if scale_ue8m0:
         if column_major_scales and scale_tma_aligned:
             *x_batch, x_q_mn, x_q_k = x_shape
@@ -495,10 +479,6 @@ def create_per_token_group_quant_fp8_output_scale(
             assert not column_major_scales, (
                 "column_major_scales requires scale_tma_aligned=True "
                 "when scale_ue8m0 is enabled"
-            )
-            assert not scale_tma_aligned, (
-                "scale_tma_aligned requires column_major_scales=True or "
-                "the DSV4 wo_a dedicated quant helper"
             )
             # Row-major UE8M0 keeps the scale as float32 power-of-two values,
             # matching deep_gemm.ceil_to_ue8m0 and deep_gemm.fp8_einsum.
@@ -524,9 +504,6 @@ def create_per_token_group_quant_fp8_output_scale(
                 dtype=torch.float32,
             ).permute(-1, -2)
     else:
-        assert (
-            not scale_tma_aligned
-        ), "scale_tma_aligned requires column_major_scales=True"
         return torch.empty(
             x_shape[:-1] + (x_shape[-1] // group_size,),
             device=device,
@@ -616,39 +593,6 @@ def sglang_per_token_group_quant_fp8(
             sgl_per_token_group_quant_fp8(
                 x, x_q, x_s, group_size, eps, fp8_min, fp8_max, scale_ue8m0
             )
-
-    return x_q, x_s
-
-
-def sglang_per_token_group_quant_fp8_dsv4_woa(
-    x: torch.Tensor,
-    group_size: int = 128,
-    eps: float = 1e-10,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    assert x.dim() == 3, "DSV4 wo_a quant expects [tokens, groups, hidden]"
-    assert group_size == 128, "DSV4 wo_a quant uses group_size=128"
-    assert eps == 1e-10, "DSV4 wo_a quant uses eps=1e-10"
-    assert x.shape[-1] % group_size == 0
-    assert x.stride(-1) == 1, "`x` hidden dimension is not contiguous"
-    assert _is_cuda, "DSV4 wo_a quant is only supported on CUDA"
-
-    x_q = torch.empty(x.shape, device=x.device, dtype=fp8_dtype)
-    x_s = create_per_token_group_quant_fp8_output_scale(
-        x_shape=x.shape,
-        device=x.device,
-        group_size=group_size,
-        column_major_scales=False,
-        scale_tma_aligned=False,
-        scale_ue8m0=True,
-        scale_outer_major=True,
-    )
-
-    if x.numel() > 0:
-        from sglang.jit_kernel.dsv4.fp8_wo_a import (
-            fp8_wo_a_group_major_quant_ue8m0,
-        )
-
-        fp8_wo_a_group_major_quant_ue8m0(x, x_q, x_s)
 
     return x_q, x_s
 

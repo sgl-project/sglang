@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Tuple
 
 import torch
 
@@ -87,3 +87,30 @@ def fp8_wo_a_group_major_quant_ue8m0(
     output_s: torch.Tensor,
 ) -> None:
     _fp8_wo_a_group_major_quant_ue8m0_custom_op(input, output_q, output_s)
+
+
+def sglang_per_token_group_quant_fp8_dsv4_woa(
+    x: torch.Tensor,
+    group_size: int = _GROUP_SIZE,
+    eps: float = 1e-10,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    assert x.dim() == 3, "DSV4 wo_a quant expects [tokens, groups, hidden]"
+    assert group_size == _GROUP_SIZE, "DSV4 wo_a quant uses group_size=128"
+    assert eps == 1e-10, "DSV4 wo_a quant uses eps=1e-10"
+    assert x.shape[-1] % group_size == 0
+    assert x.stride(-1) == 1, "`x` hidden dimension is not contiguous"
+    assert x.is_cuda, "DSV4 wo_a quant is only supported on CUDA"
+
+    num_tokens, num_groups, hidden = x.shape
+    hidden_groups = hidden // group_size
+    x_q = torch.empty(x.shape, device=x.device, dtype=torch.float8_e4m3fn)
+    x_s = torch.empty(
+        (num_groups, num_tokens, hidden_groups),
+        device=x.device,
+        dtype=torch.float32,
+    ).transpose(0, 1)
+
+    if x.numel() > 0:
+        fp8_wo_a_group_major_quant_ue8m0(x, x_q, x_s)
+
+    return x_q, x_s

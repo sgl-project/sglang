@@ -109,18 +109,15 @@ SGL_DEVICE OUT_DTYPE_T extract_required_scale_format(float value) {
 }
 
 template <bool FUSE_SILU_AND_MUL>
-SGL_DEVICE int64_t compute_input_group_start_offset(
+SGL_DEVICE int compute_input_group_start_offset(
     int expert_idx,
     int token_idx,
     int hidden_dim_group_idx,
     int hidden_size,
     int num_tokens_per_expert,
     int group_size) {
-  // 64-bit: the flattened element offset exceeds 2^31 on large inputs
-  // (e.g. many-token prefill quant), where 32-bit products wrap negative.
-  return static_cast<int64_t>(expert_idx) * num_tokens_per_expert * hidden_size * (FUSE_SILU_AND_MUL ? 2 : 1) +
-         static_cast<int64_t>(token_idx) * hidden_size * (FUSE_SILU_AND_MUL ? 2 : 1) +
-         hidden_dim_group_idx * group_size;
+  return expert_idx * num_tokens_per_expert * hidden_size * (FUSE_SILU_AND_MUL ? 2 : 1) +
+         token_idx * hidden_size * (FUSE_SILU_AND_MUL ? 2 : 1) + hidden_dim_group_idx * group_size;
 }
 
 struct NaiveScheduler {
@@ -243,13 +240,12 @@ __global__ void per_token_group_quant_8bit_v2_kernel(
           const int token_idx,
           const int hidden_dim_group_idx,
           const int lane_id,
-          const int64_t input_group_start_offset) {
+          const int input_group_start_offset) {
         constexpr uint32_t INPUT_PRIMARY_VEC_SIZE = INPUT_PRIMARY_VEC_NUM_BYTES / sizeof(T);
         constexpr uint32_t INPUT_PRIMARY_INT4_SIZE = INPUT_PRIMARY_VEC_NUM_BYTES / sizeof(int4);
 
-        const int64_t offset_num_groups =
-            static_cast<int64_t>(expert_idx) * num_tokens_per_expert * hidden_dim_num_groups +
-            static_cast<int64_t>(token_idx) * hidden_dim_num_groups + hidden_dim_group_idx;
+        const int offset_num_groups = expert_idx * num_tokens_per_expert * hidden_dim_num_groups +
+                                      token_idx * hidden_dim_num_groups + hidden_dim_group_idx;
 
         int4 input_primary_int4[INPUT_PRIMARY_INT4_SIZE];
         T* input_primary_vec = reinterpret_cast<T*>(input_primary_int4);
@@ -275,14 +271,13 @@ __global__ void per_token_group_quant_8bit_v2_kernel(
         constexpr int num_elems_per_pack = static_cast<int>(sizeof(scale_packed_t) / sizeof(scale_element_t));
         scale_element_t* scale_output;
         if constexpr (IS_COLUMN_MAJOR) {
-          constexpr int column_major_scale_token_stride = 1;
+          constexpr int scale_token_stride = 1;
           const int hidden_idx_packed = hidden_dim_group_idx / num_elems_per_pack;
           const int pack_idx = hidden_dim_group_idx % num_elems_per_pack;
-          scale_output =
-              reinterpret_cast<scale_element_t*>(output_s) +
-              (static_cast<int64_t>(expert_idx) * scale_expert_stride * num_elems_per_pack +
-               static_cast<int64_t>(hidden_idx_packed) * scale_hidden_stride * num_elems_per_pack +
-               static_cast<int64_t>(token_idx) * column_major_scale_token_stride * num_elems_per_pack + pack_idx);
+          scale_output = reinterpret_cast<scale_element_t*>(output_s) +
+                         (expert_idx * scale_expert_stride * num_elems_per_pack +
+                          hidden_idx_packed * scale_hidden_stride * num_elems_per_pack +
+                          token_idx * scale_token_stride * num_elems_per_pack + pack_idx);
         } else {
           static_assert(!SCALE_UE8M0 || std::is_same_v<scale_packed_t, float>);
           scale_output = reinterpret_cast<scale_element_t*>(output_s) + offset_num_groups;
@@ -290,14 +285,10 @@ __global__ void per_token_group_quant_8bit_v2_kernel(
 
         if constexpr (IS_COLUMN_MAJOR and SCALE_UE8M0) {
           const int remainder_num_groups = hidden_dim_num_groups % num_elems_per_pack;
-          if ((remainder_num_groups != 0) and (hidden_dim_group_idx == hidden_dim_num_groups - 1)) {
-            // Zero the tail bytes of the last packed word. Stride by the
-            // subwarp width: THREADS_PER_SUBWARP can be < the pad count
-            // (group_size 16/32), where a single pass would leave garbage.
-            const int num_pad_bytes = num_elems_per_pack - remainder_num_groups;
-            for (int shift = 1 + lane_id; shift <= num_pad_bytes; shift += THREADS_PER_SUBWARP) {
-              *(scale_output + shift) = 0;
-            }
+          if ((remainder_num_groups != 0) and (hidden_dim_group_idx == hidden_dim_num_groups - 1) and
+              (lane_id < num_elems_per_pack - remainder_num_groups)) {
+            const int shift = 1 + lane_id;
+            *(scale_output + shift) = 0;
           }
         }
 
