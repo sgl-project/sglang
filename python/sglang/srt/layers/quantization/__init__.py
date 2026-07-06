@@ -44,7 +44,7 @@ from sglang.srt.layers.quantization.modelopt_quant import (
 from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
 from sglang.srt.layers.quantization.moe_wna16 import MoeWNA16Config
 from sglang.srt.layers.quantization.mxfp4 import Mxfp4Config
-from sglang.srt.layers.quantization.npu_mxfp4 import NPUMxfp4Config
+from sglang.srt.layers.quantization.npu_mxfp4 import Mxfp4W4A8Config
 from sglang.srt.layers.quantization.nvfp4_online import NvFp4OnlineConfig
 from sglang.srt.layers.quantization.petit import PetitNvFp4Config
 from sglang.srt.layers.quantization.qoq import QoQConfig
@@ -98,7 +98,7 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "auto-round": AutoRoundConfig,
     "modelslim": ModelSlimConfig,
     "quark_int4fp8_moe": QuarkInt4Fp8Config,
-    "mxfp4_w4a8_npu": NPUMxfp4Config,
+    "mxfp_w4a8": Mxfp4W4A8Config,
 }
 
 
