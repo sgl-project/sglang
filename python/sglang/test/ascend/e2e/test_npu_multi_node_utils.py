@@ -779,7 +779,7 @@ def wait_server_ready(url, timeout=LOCAL_TIMEOUT):
                 logger.info(
                     f"Server {url} returned status code: {response.status_code}"
                 )
-        except Exception as e:
+        except Exception:
             # logger.error(f"Server {url} request error: {e}, retrying...")
             pass
 
