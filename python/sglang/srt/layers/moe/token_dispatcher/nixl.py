@@ -206,7 +206,6 @@ class _NixlEPDispatcherImplBase:
             elastic_state.active_ranks if elastic_state is not None else None
         )
         self._active_world_size = dist.get_world_size(group)
-        self._active_rank_offset = ElasticEPStateManager.get_ep_join_rank_offset()
         from sglang.srt.runtime_context import get_server_args
 
         _max_ep = get_server_args().max_ep_size or self._active_world_size
@@ -391,12 +390,8 @@ class _NixlEPDispatcherImpl(_NixlEPDispatcherImplBase):
         if self._mask_buffer is not None:
             buffer.query_mask_buffer(self._mask_buffer)
 
-            # Reserved mask slots are outside this process' live world.
-            n = self._active_world_size
-            off = self._active_rank_offset
-            self.active_ranks[off : off + n].copy_(
-                1 - self._mask_buffer[off : off + n]
-            )
+            n = ElasticEPStateManager.get_effective_ep_size()
+            self.active_ranks[:n].copy_(1 - self._mask_buffer[:n])
             elastic_state = ElasticEPStateManager.instance()
             if elastic_state is not None:
                 elastic_state.sync_active_to_cpu()

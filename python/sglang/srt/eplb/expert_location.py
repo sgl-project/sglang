@@ -393,6 +393,7 @@ def append_trivial_expert_slots(
     new_slots = torch.arange(
         start,
         start + count,
+        dtype=physical_to_logical_map.dtype,
         device=physical_to_logical_map.device,
     ).unsqueeze(0)
     new_slots = new_slots.expand(physical_to_logical_map.shape[0], -1)

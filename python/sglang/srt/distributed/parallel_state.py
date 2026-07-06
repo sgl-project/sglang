@@ -1877,7 +1877,6 @@ def _create_global_tcp_store(
     rank: int,
     world_size: int,
     dist_init_addr: Optional[str] = None,
-    recovered_rank: bool = False,
     allow_dynamic_membership: bool = False,
 ) -> None:
     """Create a global TCPStore for coordination across ranks.
@@ -1910,7 +1909,7 @@ def _create_global_tcp_store(
 
     try:
         if allow_dynamic_membership:
-            is_master = rank == 0 and not recovered_rank
+            is_master = rank == 0
             tcp_store = TCPStore(
                 host_name=master_ip,
                 port=base_store_port,
@@ -2016,7 +2015,6 @@ def init_distributed_environment(
                 rank,
                 world_size,
                 dist_init_addr=distributed_init_method,
-                recovered_rank=recovered_rank,
                 allow_dynamic_membership=(
                     recovered_rank
                     or (max_world_size is not None and max_world_size > world_size)

@@ -3444,12 +3444,11 @@ class Scheduler(
             logger.debug("[Elastic EP] active rank state is unavailable")
             return
 
-        pending = getattr(
-            self.model_worker._model_runner, "_pending_elastic_scale_update", None
-        )
+        model_runner = self.tp_worker.model_runner
+        pending = getattr(model_runner, "_pending_elastic_scale_update", None)
         if pending is not None:
             self.ipc_channels.send_to_tokenizer.send_output(pending)
-            self.model_worker._model_runner._pending_elastic_scale_update = None
+            model_runner._pending_elastic_scale_update = None
 
     def _relay_forward_payload(
         self, future_indices: torch.Tensor, batch_result: GenerationBatchResult
