@@ -129,6 +129,7 @@ LOAD_FORMAT_CHOICES = [
 QUANTIZATION_CHOICES = [
     "awq",
     "fp8",  # MOE + linear online quantization.
+    "blockwise_fp8",  # 128x128 per-block FP8 online quantization (MoE + linear).
     "mxfp8",  # MOE + linear online quantization.
     "gptq",
     "marlin",
