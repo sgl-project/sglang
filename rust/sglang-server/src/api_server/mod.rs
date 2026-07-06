@@ -308,12 +308,14 @@ fn abort_error_response(finish_reason: &Option<serde_json::Value>) -> Option<Res
     Some((status, Json(body)).into_response())
 }
 
-/// Format a neutral [`GenerationOutput`] as one SGLang `/generate` frame.
-fn sglang_frame(out: &GenerationOutput) -> Vec<u8> {
+/// Format a neutral [`GenerationOutput`] as one SGLang `/generate` frame. `rid`
+/// (the response `meta_info.id`) is passed in — the api-server owns it, so it's
+/// not carried on the per-chunk output.
+fn sglang_frame(out: &GenerationOutput, rid: &str) -> Vec<u8> {
     let mut v = serde_json::json!({
         "text": out.text,
         "meta_info": {
-            "id": out.rid,
+            "id": rid,
             "prompt_tokens": out.prompt_tokens,
             "completion_tokens": out.completion_tokens,
             // Full dict (type + matched + message + status_code + …), or null.
@@ -554,21 +556,12 @@ fn msgpack_to_json(bytes: &[u8]) -> Result<Vec<u8>, String> {
 /// **borrow** for each streaming frame — no per-frame deep clone of the growing
 /// buffers (that made token-by-token streaming O(T²) *extra* on top of the wire
 /// format's inherent O(T²)).
+#[derive(Default)]
 struct OutputAccumulator {
     out: GenerationOutput,
 }
 
 impl OutputAccumulator {
-    /// Empty accumulator for request `rid`.
-    fn new(rid: String) -> Self {
-        Self {
-            out: GenerationOutput {
-                rid,
-                ..Default::default()
-            },
-        }
-    }
-
     /// Fold one delta frame in. Output families concatenate; input families and
     /// hidden states are set-once / last-writer-wins (they ride the prefill/final
     /// chunk), matching the Python `meta_info` assignment.
@@ -649,23 +642,25 @@ async fn generate(State(state): State<AppState>, Json(payload): Json<GeneratePay
     // when dropped before the request finishes — i.e. axum drops this handler /
     // SSE stream because the connection closed. Disarmed on a natural terminal.
     let mut guard = AbortGuard::new(state.senders.clone(), rid);
+    // Response `meta_info.id`, stringified once and reused for every frame.
+    let rid_str = rid.0.to_string();
 
     if stream {
         // SSE: the SGLang `/generate` protocol carries **cumulative** text per
         // frame, so fold the detok deltas back up before formatting each frame.
         let s = async_stream::stream! {
-            let mut acc = OutputAccumulator::new(rid.0.to_string());
+            let mut acc = OutputAccumulator::default();
             let mut terminated = false;
             while let Some(item) = rx.recv().await {
                 match item {
                     EgressItem::Frame(out) => {
                         acc.fold(&out);
-                        let f = sglang_frame(acc.snapshot());
+                        let f = sglang_frame(acc.snapshot(), &rid_str);
                         yield Ok::<_, Infallible>(Event::default().data(String::from_utf8_lossy(&f)));
                     }
                     EgressItem::Done(out) => {
                         acc.fold(&out);
-                        let f = sglang_frame(&acc.into_output());
+                        let f = sglang_frame(&acc.into_output(), &rid_str);
                         yield Ok(Event::default().data(String::from_utf8_lossy(&f)));
                         terminated = true;
                         break;
@@ -698,7 +693,7 @@ async fn generate(State(state): State<AppState>, Json(payload): Json<GeneratePay
         Sse::new(s).into_response()
     } else {
         // Unary: fold every delta, respond once from the cumulative result.
-        let mut acc = OutputAccumulator::new(rid.0.to_string());
+        let mut acc = OutputAccumulator::default();
         while let Some(item) = rx.recv().await {
             match item {
                 EgressItem::Frame(out) => acc.fold(&out),
@@ -713,7 +708,7 @@ async fn generate(State(state): State<AppState>, Json(payload): Json<GeneratePay
                     return (
                         StatusCode::OK,
                         [("content-type", "application/json")],
-                        sglang_frame(&final_out),
+                        sglang_frame(&final_out, &rid_str),
                     )
                         .into_response();
                 }
@@ -810,13 +805,12 @@ mod logprob_shape_tests {
     #[test]
     fn prompt_logprob_frame_emits_null_first() {
         let out = GenerationOutput {
-            rid: "1".into(),
             in_lp_val: vec![f32::NAN, -0.5],
             in_lp_idx: vec![10, 20],
             in_lp_txt: vec!["<s>".into(), "hi".into()],
             ..Default::default()
         };
-        let frame: serde_json::Value = serde_json::from_slice(&sglang_frame(&out)).unwrap();
+        let frame: serde_json::Value = serde_json::from_slice(&sglang_frame(&out, "1")).unwrap();
         assert_eq!(
             frame["meta_info"]["input_token_logprobs"],
             serde_json::json!([[serde_json::Value::Null, 10, "<s>"], [-0.5f32, 20, "hi"]])
@@ -827,7 +821,7 @@ mod logprob_shape_tests {
     /// running state (no per-frame clone); `into_output` moves the same state.
     #[test]
     fn accumulator_snapshot_is_cumulative() {
-        let mut acc = OutputAccumulator::new("r1".into());
+        let mut acc = OutputAccumulator::default();
         acc.fold(&GenerationOutput {
             text: "he".into(),
             output_ids: vec![1, 2],
@@ -836,7 +830,6 @@ mod logprob_shape_tests {
         });
         {
             let s = acc.snapshot();
-            assert_eq!(s.rid, "r1"); // set at construction
             assert_eq!(s.text, "he");
             assert_eq!(s.output_ids, vec![1, 2]);
         }
@@ -854,7 +847,6 @@ mod logprob_shape_tests {
         }
         let out = acc.into_output();
         assert_eq!(out.text, "hello");
-        assert_eq!(out.rid, "r1");
     }
 
     /// A populated text column (decoded on the detok shard) → `Some`; empty

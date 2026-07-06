@@ -52,7 +52,6 @@ pub type EgressSource = mpsc::Receiver<EgressItem>;
 /// `/generate` handler formats the result into the SGLang wire shape.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GenerationOutput {
-    pub rid: String,
     /// Decoded text **delta** for this chunk (empty in `skip_tokenizer_init`
     /// mode, or when the step only produced a partial multi-byte sequence).
     pub text: String,
@@ -444,7 +443,10 @@ pub fn frame_egress_batch_cols(header: &[u8], data_cols: &[&[u8]]) -> Bytes {
 /// `#[serde(default)]`, the hot path (no extras) emits just the first four.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct BatchHeader {
-    pub rids: Vec<String>,
+    /// Request ids as raw `u64` (a numeric column like `prompt_tokens`) — the
+    /// rids originate from `RequestIdGen` (a u64 counter), so carrying them
+    /// numerically avoids a per-request string encode/decode + parse.
+    pub rids: Vec<u64>,
     pub finish_reasons: Vec<Option<serde_json::Value>>,
     pub prompt_tokens: Vec<u32>,
     pub tok_lens: Vec<u32>,
@@ -613,7 +615,7 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> bool {
         );
 
         route(ChunkEvent {
-            rid: h.rids[i].clone(),
+            rid: h.rids[i],
             token_ids,
             finish_reason: h.finish_reasons.get(i).cloned().flatten(),
             prompt_tokens: h.prompt_tokens.get(i).copied().unwrap_or(0),
@@ -666,7 +668,8 @@ pub fn frame_egress_error(rid: &str, message: &str) -> Bytes {
 /// `push_chunk` into the egress ring. Decoded on a Rust detok shard.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct ChunkEvent {
-    pub rid: String,
+    /// Request id as raw `u64` — the shard routing key; no parse, no clone.
+    pub rid: u64,
     pub seq: u64,
     /// New token ids for this step. Empty allowed (e.g. metadata-only frames).
     pub token_ids: Vec<i32>,
@@ -765,7 +768,11 @@ mod chunk_event_tests {
             (Value::from("matched"), Value::from(5)),
         ]);
         let header_arr = Value::Array(vec![
-            Value::Array(vec![Value::from("1"), Value::from("2"), Value::from("3")]),
+            Value::Array(vec![
+                Value::from(1u64),
+                Value::from(2u64),
+                Value::from(3u64),
+            ]),
             Value::Array(vec![Value::Nil, stop, Value::Nil]),
             Value::Array(vec![
                 Value::from(4u32),
@@ -790,18 +797,18 @@ mod chunk_event_tests {
         let mut events = Vec::new();
         assert!(for_each_chunk(&framed[1..], |ev| events.push(ev)));
         assert_eq!(events.len(), 3);
-        assert_eq!(events[0].rid, "1");
+        assert_eq!(events[0].rid, 1);
         assert_eq!(events[0].token_ids, vec![10, 11]);
         assert_eq!(events[0].prompt_tokens, 4);
         assert!(events[0].finish_reason.is_none());
-        assert_eq!(events[1].rid, "2");
+        assert_eq!(events[1].rid, 2);
         assert!(events[1].token_ids.is_empty());
         // The whole dict survives (type + matched), not just the type.
         assert_eq!(
             events[1].finish_reason,
             Some(serde_json::json!({ "type": "stop", "matched": 5 }))
         );
-        assert_eq!(events[2].rid, "3");
+        assert_eq!(events[2].rid, 3);
         assert_eq!(events[2].token_ids, vec![12]);
         assert_eq!(events[2].prompt_tokens, 6);
     }
@@ -819,13 +826,13 @@ mod chunk_event_tests {
         //   out_top_reqlens, out_top_poslens, in_top_*, out_tid_*, in_tid_*,
         //   hidden_reqlens, hidden_poslens
         let header_arr = Value::Array(vec![
-            Value::Array(vec![Value::from("1"), Value::from("2")]), // rids
-            Value::Array(vec![Value::Nil, Value::Nil]),             // finish
-            arr_u(&[3, 4]),                                         // prompt
-            arr_u(&[1, 1]),                                         // tok_lens
-            arr_u(&[2, 0]),                                         // out_lp_lens
-            arr_u(&[0, 0]),                                         // in_lp_lens
-            arr_u(&[1, 0]),                                         // out_top_reqlens (req0: 1 pos)
+            Value::Array(vec![Value::from(1u64), Value::from(2u64)]), // rids
+            Value::Array(vec![Value::Nil, Value::Nil]),               // finish
+            arr_u(&[3, 4]),                                           // prompt
+            arr_u(&[1, 1]),                                           // tok_lens
+            arr_u(&[2, 0]),                                           // out_lp_lens
+            arr_u(&[0, 0]),                                           // in_lp_lens
+            arr_u(&[1, 0]), // out_top_reqlens (req0: 1 pos)
             arr_u(&[2]),    // out_top_poslens (that pos: k=2)
             arr_u(&[0, 0]), // in_top_reqlens
             arr_u(&[]),     // in_top_poslens
