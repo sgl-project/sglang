@@ -14,7 +14,7 @@ import sys
 import tempfile
 from dataclasses import field
 from enum import Enum
-from typing import Any, Literal, Optional
+from typing import Any, List, Literal, Optional
 
 import addict
 import yaml
@@ -343,6 +343,10 @@ class ServerArgs(DisaggServerArgsMixin):
 
     # Logging
     log_level: str = "info"
+    log_requests: bool = False
+    log_requests_level: int = 2
+    log_requests_format: str = "text"
+    log_requests_target: Optional[List[str]] = None
     uvicorn_access_log_exclude_prefixes: list[str] = field(default_factory=list)
 
     # Tracing
@@ -733,6 +737,20 @@ class ServerArgs(DisaggServerArgsMixin):
         # Explicit resolutions imply warmup is on (request-based).
         if self.warmup_resolutions is not None:
             self.warmup = True
+
+        if (
+            self.enable_torch_compile
+            and self.warmup_mode is None
+            and not mode_explicit
+            and not legacy_explicit
+        ):
+            self.warmup = True
+            self.server_warmup = True
+            logger.info(
+                "Automatically enabled server warmup for torch.compile so first "
+                "real requests do not pay compile latency. Set --warmup-mode off "
+                "to disable this behavior."
+            )
 
         if self.disagg_role != RoleType.MONOLITHIC:
             self.server_warmup = False
@@ -1295,7 +1313,9 @@ class ServerArgs(DisaggServerArgsMixin):
             "--enable-torch-compile",
             action=StoreBoolean,
             default=ServerArgs.enable_torch_compile,
-            help="Use torch.compile to speed up DiT inference."
+            help="Use torch.compile to speed up diffusion hot paths. "
+            + "When no warmup mode is configured, this enables server warmup "
+            + "so first real requests do not pay compile latency. "
             + "However, will likely cause precision drifts. See (https://github.com/pytorch/pytorch/issues/145213)",
         )
         parser.add_argument(
@@ -1635,6 +1655,38 @@ class ServerArgs(DisaggServerArgsMixin):
             type=str,
             default=ServerArgs.otlp_traces_endpoint,
             help="OTLP collector endpoint when --enable-trace is set. Format: <host>:<port>",
+        )
+        parser.add_argument(
+            "--log-requests",
+            action="store_true",
+            help="Log user-facing fields of all requests (default: False). "
+            "Verbosity is controlled by --log-requests-level.",
+        )
+        parser.add_argument(
+            "--log-requests-level",
+            type=int,
+            default=ServerArgs.log_requests_level,
+            choices=[0, 1, 2, 3],
+            help="Verbosity level for request logging. "
+            "0: Log request metadata only (request_id). "
+            "1: Log metadata + sampling config (seed, steps, guidance, resolution, frames, fps, ...). "
+            "2: Log metadata + sampling config + prompt/negative prompt (truncated to 2 KiB). "
+            "3: Log metadata + sampling config + full prompt/negative prompt.",
+        )
+        parser.add_argument(
+            "--log-requests-format",
+            type=str,
+            default=ServerArgs.log_requests_format,
+            choices=["text", "json"],
+            help="Format for request logging: 'text' (human-readable) or 'json' (structured)",
+        )
+        parser.add_argument(
+            "--log-requests-target",
+            type=str,
+            nargs="+",
+            default=ServerArgs.log_requests_target,
+            help="Target(s) for request logging: 'stdout' and/or directory path(s) for file output. "
+            "Can specify multiple targets, e.g., '--log-requests-target stdout /my/path'. ",
         )
         parser.add_argument(
             "--uvicorn-access-log-exclude-prefixes",
