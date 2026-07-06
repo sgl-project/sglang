@@ -7,6 +7,7 @@ from typing import List, Optional, Tuple, Union
 
 import numpy as np
 import numpy.typing as npt
+import torch
 
 from sglang.srt.observability.trace import (
     TraceNullContext,
@@ -28,6 +29,11 @@ class TransferKVChunk:
     trace_ctx: Union[TraceReqContext, TraceNullContext] = dataclasses.field(
         default_factory=TraceNullContext
     )
+    # CUDA event that fires when the forward kernels writing this KV chunk
+    # have finished on the compute stream. The transfer worker synchronizes
+    # on it before issuing RDMA, since the NIC uses PCIe DMA and does not
+    # participate in CUDA stream ordering.
+    kv_ready_event: Optional["torch.cuda.Event"] = None
 
 
 def pack_list_of_buffers(buffers: List[bytes]) -> bytes:

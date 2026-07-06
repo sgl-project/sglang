@@ -12,6 +12,7 @@ from typing import List, Optional, Tuple, Union
 
 import numpy as np
 import numpy.typing as npt
+import torch
 from prometheus_client import Counter
 
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
@@ -1227,6 +1228,13 @@ class MooncakeKVManager(CommonKVManager):
         while True:
             try:
                 kv_chunk: TransferKVChunk = queue.get()
+                # Wait until the forward kernels that wrote this KV chunk have
+                # finished on the compute stream. The RDMA NIC issues PCIe
+                # DMA reads that do not participate in CUDA stream ordering,
+                # so we must synchronize here or risk transmitting bytes that
+                # are still being written by the compute stream.
+                if kv_chunk.kv_ready_event is not None:
+                    kv_chunk.kv_ready_event.synchronize()
                 if self.enable_trace:
                     kv_chunk.trace_ctx.rebuild_thread_context()
                     kv_chunk.trace_ctx.trace_slice_start(
@@ -1652,6 +1660,16 @@ class MooncakeKVManager(CommonKVManager):
         if trace_ctx is None:
             trace_ctx = TraceNullContext()
 
+        # Record a CUDA event on the current compute stream so the transfer
+        # worker can wait until the forward kernels writing this KV chunk are
+        # complete before issuing RDMA. The RDMA NIC performs PCIe DMA and
+        # bypasses CUDA stream ordering, so without this event RDMA may race
+        # with in-flight KV writes and transmit stale/zero bytes.
+        kv_ready_event: Optional[torch.cuda.Event] = None
+        if torch.cuda.is_available():
+            kv_ready_event = torch.cuda.Event()
+            kv_ready_event.record()
+
         self.transfer_queues[shard_idx].put(
             TransferKVChunk(
                 room=bootstrap_room,
@@ -1661,6 +1679,7 @@ class MooncakeKVManager(CommonKVManager):
                 prefill_aux_index=aux_index,
                 state_indices=state_indices,
                 trace_ctx=trace_ctx,
+                kv_ready_event=kv_ready_event,
             )
         )
 
