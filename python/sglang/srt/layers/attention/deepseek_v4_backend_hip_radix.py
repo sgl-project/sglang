@@ -415,6 +415,8 @@ class _GraphBucket(enum.Enum):
 class DeepseekV4HipRadixBackend(
     AttentionBackend, C4IndexerBackendMixin, CompressorBackendMixin
 ):
+    supports_ragged_verify_graph: bool = True
+
     def __init__(
         self,
         model_runner: ModelRunner,
@@ -653,7 +655,10 @@ class DeepseekV4HipRadixBackend(
 
         seq_lens_casual, req_pool_indices_repeated = (
             self.expand_extend_with_same_length(
-                bs, num_draft_tokens, seq_lens, req_pool_indices
+                bs=bs,
+                qo_len=num_draft_tokens,
+                seq_lens=seq_lens,
+                req_pool_indices=req_pool_indices,
             )
         )
         core_attn_metadata = self.make_core_attn_metadata(
@@ -862,6 +867,19 @@ class DeepseekV4HipRadixBackend(
                 out_cache_loc=out_cache_loc_padded,
             )
         elif bucket == _GraphBucket.TARGET_VERIFY:
+            if (
+                getattr(
+                    getattr(forward_batch, "spec_info", None),
+                    "ragged_verify_layout",
+                    None,
+                )
+                is not None
+            ):
+                raise NotImplementedError(
+                    "DSV4 ragged verify is not supported on the HIP backend "
+                    "(DeepseekV4HipRadixBackend) cuda-graph path; disable "
+                    "SGLANG_RAGGED_VERIFY_MODE or use a CUDA device."
+                )
             assert out_cache_loc is not None
             num_tokens_v = self.speculative_num_draft_tokens * bs
             out_cache_loc_padded = torch.nn.functional.pad(
@@ -946,6 +964,19 @@ class DeepseekV4HipRadixBackend(
                 out_cache_loc=out_cache_loc,
             )
         elif forward_batch.forward_mode.is_target_verify():
+            if (
+                getattr(
+                    getattr(forward_batch, "spec_info", None),
+                    "ragged_verify_layout",
+                    None,
+                )
+                is not None
+            ):
+                raise NotImplementedError(
+                    "DSV4 ragged verify is not supported on the HIP backend "
+                    "(DeepseekV4HipRadixBackend); disable SGLANG_RAGGED_VERIFY_MODE "
+                    "or use a CUDA device."
+                )
             metadata = self.init_forward_metadata_target_verify(
                 max_seq_len=max_seq_len,
                 req_pool_indices=req_pool_indices,
@@ -1537,6 +1568,7 @@ class DeepseekV4HipRadixBackend(
 
     def expand_extend_with_same_length(
         self,
+        *,
         bs: int,
         qo_len: int,
         seq_lens: torch.Tensor,

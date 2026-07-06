@@ -26,6 +26,7 @@ from sglang.srt.layers.attention.utils import canonicalize_stride
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.speculative.ragged_verify import build_ragged_target_verify_geometry
 from sglang.srt.utils import is_flashinfer_available
 from sglang.srt.utils.common import is_sm90_supported, is_sm120_supported
 
@@ -37,6 +38,7 @@ if is_flashinfer_available():
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
+    from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
     from sglang.srt.speculative.spec_info import SpecInput
 
 # Constants
@@ -64,6 +66,14 @@ class TRTLLMMHAMetadata:
     swa_page_table: torch.Tensor = None
     # full->SWA translated out_cache_loc (SWA KV-store write target)
     swa_out_cache_loc: torch.Tensor = None
+    is_ragged_verify: bool = False
+
+
+def _resolve_ragged_verify_layout(forward_batch) -> Optional[RaggedVerifyLayout]:
+    spec_info = getattr(forward_batch, "spec_info", None)
+    if spec_info is None:
+        return None
+    return getattr(spec_info, "ragged_verify_layout", None)
 
 
 class TRTLLMHAAttnBackend(FlashInferAttnBackend):
@@ -73,6 +83,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
     # via the full->SWA lookup; see _fill_page_table_device), so we never need the
     # seq_lens_cpu D2H sync; opt out of it, matching trtllm_mla / triton.
     needs_cpu_seq_lens: bool = False
+
+    supports_ragged_verify_graph: bool = True
 
     def __init__(
         self,
@@ -339,12 +351,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 "cache_seqlens": torch.zeros(
                     max_bs, dtype=torch.int32, device=self.device
                 ),
-                "cu_seqlens_q": torch.arange(
-                    0,
-                    max_bs * self.speculative_num_draft_tokens + 1,
-                    step=self.speculative_num_draft_tokens,
-                    dtype=torch.int32,
-                    device=self.device,
+                "cu_seqlens_q": torch.zeros(
+                    max_bs + 1, dtype=torch.int32, device=self.device
                 ),
                 "cu_seqlens_k": torch.zeros(
                     max_bs + 1, dtype=torch.int32, device=self.device
@@ -435,7 +443,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 self.decode_cuda_graph_metadata[bs] = metadata
         elif forward_mode.is_target_verify():
             # Target Verify (topk = 1)
-            tokens_per_req = num_tokens // bs
             metadata.cache_seqlens_int32 = self.target_verify_metadata["cache_seqlens"][
                 :bs
             ]
@@ -445,7 +452,14 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             metadata.cu_seqlens_k = self.target_verify_metadata["cu_seqlens_k"][
                 : bs + 1
             ]
-            metadata.max_seq_len_q = tokens_per_req
+            metadata.is_ragged_verify = (
+                getattr(spec_info, "ragged_verify_layout", None) is not None
+            )
+            metadata.max_seq_len_q = (
+                self.speculative_num_draft_tokens
+                if metadata.is_ragged_verify
+                else num_tokens // bs
+            )
             metadata.page_table = self.target_verify_metadata["page_table"][:bs, :]
             self._bind_swa_page_table(
                 metadata,
@@ -520,7 +534,16 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         elif forward_mode.is_target_verify():
             # Here we only support topk = 1 for now.
             metadata = self.target_verify_metadata[bs]
-            metadata.cache_seqlens_int32.copy_(seq_lens + metadata.max_seq_len_q)
+            ragged_layout = getattr(spec_info, "ragged_verify_layout", None)
+            if ragged_layout is not None:
+                padded_layout = ragged_layout.padded_to_bucket(padded_bs=bs)
+                geometry = build_ragged_target_verify_geometry(
+                    seq_lens=seq_lens, layout=padded_layout
+                )
+                metadata.cache_seqlens_int32.copy_(geometry.cache_seqlens_int32)
+                metadata.cu_seqlens_q.copy_(geometry.cu_seqlens_q)
+            else:
+                metadata.cache_seqlens_int32.copy_(seq_lens + metadata.max_seq_len_q)
             metadata.cu_seqlens_k[1:].copy_(
                 torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
             )
@@ -604,6 +627,12 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         forward_mode = forward_batch.forward_mode
         spec_info = forward_batch.spec_info
 
+        if (
+            forward_mode.is_target_verify()
+            and _resolve_ragged_verify_layout(forward_batch) is not None
+        ):
+            self._assert_ragged_verify_supported()
+
         if in_capture:
             num_tokens = forward_batch.positions.numel()
             self._build_cuda_graph_metadata(
@@ -634,6 +663,14 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 self.token_to_kv_pool.translate_loc_from_full_to_swa(
                     forward_batch.out_cache_loc
                 )
+            )
+
+    def _assert_ragged_verify_supported(self) -> None:
+        if self.is_xqa_impl:
+            raise NotImplementedError(
+                "DSpark compact ragged verify (variable-length cum_seq_lens_q) "
+                "requires the trtllm-gen decode kernel; the xqa impl (sm90 / sm120) "
+                "rejects it. Disable SGLANG_RAGGED_VERIFY_MODE for this configuration."
             )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -670,23 +707,36 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
                 )
         elif forward_batch.forward_mode.is_target_verify():
-            # Only support topk = 1 for now.
-            tokens_per_req = forward_batch.input_ids.shape[0] // batch_size
-            metadata.cache_seqlens_int32 = (forward_batch.seq_lens + tokens_per_req).to(
-                torch.int32
-            )
-            metadata.max_seq_len_q = tokens_per_req
-            metadata.cu_seqlens_q = torch.arange(
-                0,
-                batch_size * tokens_per_req + 1,
-                tokens_per_req,
-                dtype=torch.int32,
-                device=device,
-            )
-            metadata.cu_seqlens_k = torch.nn.functional.pad(
-                torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32),
-                (1, 0),
-            )
+            ragged_layout = _resolve_ragged_verify_layout(forward_batch)
+            if ragged_layout is not None:
+                self._assert_ragged_verify_supported()
+                geometry = build_ragged_target_verify_geometry(
+                    seq_lens=seqlens_in_batch, layout=ragged_layout
+                )
+                metadata.cache_seqlens_int32 = geometry.cache_seqlens_int32
+                metadata.max_seq_len_q = geometry.max_seq_len_q
+                metadata.cu_seqlens_q = geometry.cu_seqlens_q
+                metadata.cu_seqlens_k = geometry.cu_seqlens_k
+                metadata.is_ragged_verify = True
+            else:
+                tokens_per_req = forward_batch.input_ids.shape[0] // batch_size
+                metadata.cache_seqlens_int32 = (
+                    forward_batch.seq_lens + tokens_per_req
+                ).to(torch.int32)
+                metadata.max_seq_len_q = tokens_per_req
+                metadata.cu_seqlens_q = torch.arange(
+                    0,
+                    batch_size * tokens_per_req + 1,
+                    tokens_per_req,
+                    dtype=torch.int32,
+                    device=device,
+                )
+                metadata.cu_seqlens_k = torch.nn.functional.pad(
+                    torch.cumsum(
+                        metadata.cache_seqlens_int32, dim=0, dtype=torch.int32
+                    ),
+                    (1, 0),
+                )
 
         else:
             metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
@@ -892,21 +942,40 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             forward_batch.forward_mode.is_target_verify()
             or forward_batch.forward_mode.is_draft_extend_v2()
         ):
-            o = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
-                query=q,
-                kv_cache=kv_cache,
-                workspace_buffer=self.workspace_buffer,
-                block_tables=page_table,
-                seq_lens=self.forward_metadata.cache_seqlens_int32,
-                max_seq_len=self.max_context_len,
-                bmm1_scale=bmm1_scale,
-                bmm2_scale=bmm2_scale,
-                window_left=layer.sliding_window_size,
-                sinks=attention_sink,
-                skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
-                out_dtype=self.q_data_type,  # model_runner.dtype
-                q_len_per_req=self.forward_metadata.max_seq_len_q,
-            )
+            if self.forward_metadata.is_ragged_verify:
+                o = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
+                    query=q,
+                    kv_cache=kv_cache,
+                    workspace_buffer=self.workspace_buffer,
+                    block_tables=page_table,
+                    seq_lens=self.forward_metadata.cache_seqlens_int32,
+                    max_seq_len=self.max_context_len,
+                    bmm1_scale=bmm1_scale,
+                    bmm2_scale=bmm2_scale,
+                    window_left=layer.sliding_window_size,
+                    sinks=attention_sink,
+                    skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
+                    out_dtype=self.q_data_type,
+                    q_len_per_req=None,
+                    max_q_len=self.forward_metadata.max_seq_len_q,
+                    cum_seq_lens_q=self.forward_metadata.cu_seqlens_q,
+                )
+            else:
+                o = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
+                    query=q,
+                    kv_cache=kv_cache,
+                    workspace_buffer=self.workspace_buffer,
+                    block_tables=page_table,
+                    seq_lens=self.forward_metadata.cache_seqlens_int32,
+                    max_seq_len=self.max_context_len,
+                    bmm1_scale=bmm1_scale,
+                    bmm2_scale=bmm2_scale,
+                    window_left=layer.sliding_window_size,
+                    sinks=attention_sink,
+                    skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
+                    out_dtype=self.q_data_type,
+                    q_len_per_req=self.forward_metadata.max_seq_len_q,
+                )
         else:
             o = flashinfer.prefill.trtllm_batch_context_with_kv_cache(
                 query=q,

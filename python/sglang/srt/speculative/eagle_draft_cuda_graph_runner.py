@@ -375,6 +375,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             top_ks=torch.full((num_seqs,), -1, dtype=torch.int32),
             min_ps=torch.zeros((num_seqs,), dtype=torch.float),
             is_all_greedy=False,
+            is_any_greedy=False,
             need_top_p_sampling=False,
             need_top_k_sampling=False,
             need_min_p_sampling=False,

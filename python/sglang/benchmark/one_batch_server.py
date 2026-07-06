@@ -121,6 +121,8 @@ class BenchArgs:
     profile_output_dir: Optional[str] = None
     dataset_path: str = ""
     dataset_name: str = "random"
+    fixed_prompt_file: str = ""
+    fixed_prompt_apply_chat_template: bool = False
     gsp_num_groups: int = 1
     gsp_system_prompt_len: int = 2048
     gsp_question_len: int = 128
@@ -217,6 +219,22 @@ class BenchArgs:
             default=BenchArgs.dataset_name,
             choices=["mmmu", "random", "random-ids", "generated-shared-prefix"],
             help="Name of the dataset to benchmark on.",
+        )
+        parser.add_argument(
+            "--fixed-prompt-file",
+            type=str,
+            default=BenchArgs.fixed_prompt_file,
+            help="If set, every request in the batch uses this file's prompt "
+            "(tokenized, replicated batch_size times) instead of --dataset-name, "
+            "so the accept length is a controlled constant across bs and arms.",
+        )
+        parser.add_argument(
+            "--fixed-prompt-apply-chat-template",
+            action="store_true",
+            help="Encode --fixed-prompt-file through the DeepSeek-V4 chat encoder "
+            "(encoding_dsv4) as a single user message, instead of raw tokenization, "
+            "so the accept length matches the /v1/chat/completions serving "
+            "distribution. Only DeepseekV4 models are supported (asserted at start).",
         )
         parser.add_argument(
             "--gsp-num-groups",
@@ -360,6 +378,8 @@ class BenchOneCaseResult(BaseModel):
     last_ttft: float
     last_gen_throughput: float
     acc_length: float
+    iter_time: float = -1.0
+    n_decode_steps: int = 0
     cache_hit_rate: Optional[float] = None
     profile_link: Optional[str] = None
 
@@ -377,6 +397,8 @@ class BenchOneCaseResult(BaseModel):
                 "last_ttft": round(self.last_ttft, 4),
                 "last_gen_throughput": round(self.last_gen_throughput, 2),
                 "acc_length": round(self.acc_length, 2),
+                "iter_time": round(self.iter_time, 6),
+                "n_decode_steps": self.n_decode_steps,
                 "cache_hit_rate": (
                     round(self.cache_hit_rate, 4)
                     if self.cache_hit_rate is not None
@@ -467,6 +489,31 @@ def _flush_cache_with_retry(url: str, endpoint: str, max_retries: int = 3):
         time.sleep(2)
 
 
+def _assert_fixed_prompt_chat_template_supported(tokenizer_source: str) -> None:
+    from transformers import AutoConfig
+
+    hf_config = AutoConfig.from_pretrained(tokenizer_source, trust_remote_code=True)
+    architectures = hf_config.architectures or []
+    arch = architectures[0] if architectures else ""
+    assert "DeepseekV4" in arch, (
+        f"--fixed-prompt-apply-chat-template only supports DeepseekV4 models, "
+        f"got architecture {arch!r}"
+    )
+
+
+def _encode_fixed_prompt(
+    tok_inner, prompt_text: str, apply_chat_template: bool
+) -> List[int]:
+    if not apply_chat_template:
+        return tok_inner.encode(prompt_text)
+
+    from sglang.srt.entrypoints.openai import encoding_dsv4
+
+    messages = [{"role": "user", "content": prompt_text}]
+    real_input = encoding_dsv4.encode_messages(messages, thinking_mode="chat")
+    return tok_inner.encode(real_input)
+
+
 def run_one_case(
     url: str,
     batch_size: int,
@@ -500,6 +547,8 @@ def run_one_case(
     lora_name: Optional[List[str]] = None,
     lora_request_distribution: str = BenchArgs.lora_request_distribution,
     lora_zipf_alpha: float = BenchArgs.lora_zipf_alpha,
+    fixed_prompt_file: str = "",
+    apply_chat_template: bool = False,
 ):
     if backend == "vllm":
         # You need to have export VLLM_SERVER_DEV_MODE=1 in your environment to use this endpoint.
@@ -507,51 +556,57 @@ def run_one_case(
     else:
         _flush_cache_with_retry(url, "/flush_cache")
 
-    # Load input token ids via benchmark.datasets.get_dataset
-    supported_datasets = ("random", "random-ids", "mmmu", "generated-shared-prefix")
-    if dataset_name not in supported_datasets:
-        raise ValueError(
-            f"Unsupported dataset for batch benchmark: {dataset_name}. "
-            f"Supported: {supported_datasets}"
-        )
-
-    actual_gsp_groups = min(gsp_num_groups, batch_size)
-    dataset_args = SimpleNamespace(
-        dataset_name=dataset_name,
-        num_prompts=batch_size,
-        random_input_len=input_len,
-        random_output_len=output_len,
-        random_range_ratio=1.0,
-        dataset_path=dataset_path,
-        tokenize_prompt=dataset_name not in ("mmmu", "generated-shared-prefix"),
-        backend=backend,
-        seed=BenchArgs.seed,
-        gsp_num_groups=actual_gsp_groups,
-        gsp_prompts_per_group=(batch_size + actual_gsp_groups - 1) // actual_gsp_groups,
-        gsp_system_prompt_len=gsp_system_prompt_len,
-        gsp_question_len=gsp_question_len,
-        gsp_output_len=gsp_output_len,
-        # The generated-shared-prefix dataset's from_args requires these; the
-        # batch-bench path only ever uses the uniform group distribution.
-        gsp_group_distribution="uniform",
-        gsp_zipf_alpha=None,
-    )
-    tok_inner = getattr(tokenizer, "tokenizer", tokenizer)
-    dataset_model_id = model_name or getattr(tok_inner, "name_or_path", None)
-    input_requests = get_dataset(dataset_args, tokenizer, model_id=dataset_model_id)
-
-    if dataset_name == "generated-shared-prefix":
-        input_requests = input_requests[:batch_size]
-        input_ids = [tokenizer.encode(req.prompt) for req in input_requests]
-        input_len = sum(len(ids) for ids in input_ids) // len(input_ids)
-        output_len = gsp_output_len
+    if fixed_prompt_file:
+        tok_inner = getattr(tokenizer, "tokenizer", tokenizer)
+        with open(fixed_prompt_file) as f:
+            prompt_ids = _encode_fixed_prompt(tok_inner, f.read(), apply_chat_template)
+        input_ids = [list(prompt_ids) for _ in range(batch_size)]
+        input_len = len(prompt_ids)
         image_data = None
-    elif dataset_name == "mmmu":
-        input_ids = [tok_inner.encode(req.prompt) for req in input_requests]
-        image_data = [req.image_data for req in input_requests]
     else:
-        input_ids = [req.prompt for req in input_requests]
-        image_data = None
+        supported_datasets = ("random", "random-ids", "mmmu", "generated-shared-prefix")
+        if dataset_name not in supported_datasets:
+            raise ValueError(
+                f"Unsupported dataset for batch benchmark: {dataset_name}. "
+                f"Supported: {supported_datasets}"
+            )
+
+        actual_gsp_groups = min(gsp_num_groups, batch_size)
+        dataset_args = SimpleNamespace(
+            dataset_name=dataset_name,
+            num_prompts=batch_size,
+            random_input_len=input_len,
+            random_output_len=output_len,
+            random_range_ratio=1.0,
+            dataset_path=dataset_path,
+            tokenize_prompt=dataset_name not in ("mmmu", "generated-shared-prefix"),
+            backend=backend,
+            seed=BenchArgs.seed,
+            gsp_num_groups=actual_gsp_groups,
+            gsp_prompts_per_group=(batch_size + actual_gsp_groups - 1)
+            // actual_gsp_groups,
+            gsp_system_prompt_len=gsp_system_prompt_len,
+            gsp_question_len=gsp_question_len,
+            gsp_output_len=gsp_output_len,
+            gsp_group_distribution="uniform",
+            gsp_zipf_alpha=None,
+        )
+        tok_inner = getattr(tokenizer, "tokenizer", tokenizer)
+        dataset_model_id = model_name or getattr(tok_inner, "name_or_path", None)
+        input_requests = get_dataset(dataset_args, tokenizer, model_id=dataset_model_id)
+
+        if dataset_name == "generated-shared-prefix":
+            input_requests = input_requests[:batch_size]
+            input_ids = [tokenizer.encode(req.prompt) for req in input_requests]
+            input_len = sum(len(ids) for ids in input_ids) // len(input_ids)
+            output_len = gsp_output_len
+            image_data = None
+        elif dataset_name == "mmmu":
+            input_ids = [tok_inner.encode(req.prompt) for req in input_requests]
+            image_data = [req.image_data for req in input_requests]
+        else:
+            input_ids = [req.prompt for req in input_requests]
+            image_data = None
 
     # Build payload based on backend
     if backend == "vllm":
@@ -717,9 +772,23 @@ def run_one_case(
         response.raise_for_status()
         server_info = response.json()
         internal_states = server_info.get("internal_states", [])
-        internal_state = internal_states[0] if internal_states else {}
-        last_gen_throughput = internal_state.get("last_gen_throughput", None) or -1
-        acc_length = internal_state.get("avg_spec_accept_length", None) or -1
+        acc_length = -1
+        last_gen_throughput = -1
+        for internal_state in internal_states:
+            acc_length = (
+                internal_state.get("avg_spec_accept_length", None) or acc_length
+            )
+            last_gen_throughput = (
+                internal_state.get("last_gen_throughput", None) or last_gen_throughput
+            )
+
+    n_decode_steps = 0
+    iter_time = -1.0
+    decode_wall = latency - last_ttft
+    if acc_length > 0 and output_len > 1 and decode_wall > 0:
+        steps = output_len / acc_length
+        iter_time = decode_wall / steps
+        n_decode_steps = round(steps)
 
     # Calculate cache hit rate from before/after metrics delta
     metrics_after = get_cache_tokens_from_metrics(url)
@@ -753,9 +822,13 @@ def run_one_case(
         last_ttft=last_ttft,
         last_gen_throughput=last_gen_throughput,
         acc_length=acc_length,
+        iter_time=iter_time,
+        n_decode_steps=n_decode_steps,
         cache_hit_rate=metrics_cache_hit_rate,
         profile_link=profile_link,
     )
+    if iter_time > 0:
+        print(f"iter_time: {iter_time*1e3:.3f} ms/step ({n_decode_steps} steps)")
 
     # Save and return the results
     if result_filename:
@@ -979,6 +1052,12 @@ def run_benchmark_internal(
         bench_args.lora_zipf_alpha > 1
     ), f"--lora-zipf-alpha must be > 1, got {bench_args.lora_zipf_alpha}"
 
+    if bench_args.fixed_prompt_apply_chat_template:
+        tokenizer_source = (
+            model_name if bench_args.backend == "vllm" else tokenizer_path
+        )
+        _assert_fixed_prompt_chat_template_supported(tokenizer_source)
+
     gsp_kwargs = dict(
         gsp_num_groups=bench_args.gsp_num_groups,
         gsp_system_prompt_len=bench_args.gsp_system_prompt_len,
@@ -1013,6 +1092,8 @@ def run_benchmark_internal(
                 lora_name=bench_args.lora_name,
                 lora_request_distribution=bench_args.lora_request_distribution,
                 lora_zipf_alpha=bench_args.lora_zipf_alpha,
+                fixed_prompt_file=bench_args.fixed_prompt_file,
+                apply_chat_template=bench_args.fixed_prompt_apply_chat_template,
                 **gsp_kwargs,
             )
         print("=" * 8 + " Warmup End   " + "=" * 8 + "\n")
@@ -1056,6 +1137,8 @@ def run_benchmark_internal(
                     lora_name=bench_args.lora_name,
                     lora_request_distribution=bench_args.lora_request_distribution,
                     lora_zipf_alpha=bench_args.lora_zipf_alpha,
+                    fixed_prompt_file=bench_args.fixed_prompt_file,
+                    apply_chat_template=bench_args.fixed_prompt_apply_chat_template,
                     **gsp_kwargs,
                 )
             )

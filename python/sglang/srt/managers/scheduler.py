@@ -156,6 +156,7 @@ from sglang.srt.managers.min_free_slots_delayer import (
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.overlap_utils import (
     RelayPayload,
+    decide_needs_confidence_relay,
     decide_needs_cpu_seq_lens,
     resolve_forward_inputs,
 )
@@ -889,7 +890,7 @@ class Scheduler(
         min_free_slots = resolve_min_free_slots(
             self.server_args.min_free_slots_delay,
             self.max_running_requests,
-            is_dflash=self.spec_algorithm.is_dflash(),
+            is_dflash_or_dspark=self.spec_algorithm.is_dflash_or_dspark(),
         )
         if min_free_slots is not None:
             self.min_free_slots_delayer = MinFreeSlotsDelayer(
@@ -1253,11 +1254,23 @@ class Scheduler(
         else:
             attn_backends = (self.tp_worker.model_runner.attn_backend,)
         needs_cpu_seq_lens = decide_needs_cpu_seq_lens(self.server_args, attn_backends)
+        needs_confidence_relay = decide_needs_confidence_relay(self.server_args)
         self.future_map = self.spec_algorithm.create_future_map(
             self.device,
             self.req_to_token_pool,
             needs_cpu_seq_lens=needs_cpu_seq_lens,
+            needs_confidence_relay=needs_confidence_relay,
         )
+
+        self._confidence_budget_prepare = None
+        if (
+            needs_confidence_relay
+            and self.enable_overlap
+            and self.draft_worker is not None
+        ):
+            self._confidence_budget_prepare = (
+                self.draft_worker.get_confidence_budget_prepare()
+            )
 
         if use_mlx():
             # MLX uses its own overlap loop and does not create CUDA streams,
@@ -2140,7 +2153,7 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
-        if self.spec_algorithm.is_dflash():
+        if self.spec_algorithm.is_dflash_or_dspark():
             error_msg = validate_dflash_request(req, self.enable_overlap)
             if error_msg is not None:
                 req.set_finish_with_abort(error_msg)
@@ -3200,6 +3213,8 @@ class Scheduler(
                 # Self-gates on batch.spec_info.future_indices; non-spec_v2
                 # no-ops (ForwardBatch.init_new lazily computes the sum).
                 self.future_map.resolve_seq_lens_cpu(batch)
+                if self._confidence_budget_prepare is not None:
+                    self._confidence_budget_prepare(batch, self.future_map)
 
                 with self.forward_stream_ctx:
                     self.forward_stream.wait_stream(self.schedule_stream)
@@ -3731,6 +3746,14 @@ class Scheduler(
         if RECORD_STEP_TIME:
             ret["step_time_dict"] = self.metrics_reporter.step_time_dict
 
+        if self.spec_algorithm.is_dspark() and self.draft_worker is not None:
+            sps_record = self.draft_worker.dump_sps_records()
+            if sps_record is not None:
+                ret["dspark_sps_record"] = sps_record
+            info_record = self.draft_worker.dump_info_records()
+            if info_record is not None:
+                ret["dspark_info_record"] = info_record
+
         # This field is not serializable.
         ret.pop("model_config", None)
 
@@ -3738,11 +3761,14 @@ class Scheduler(
 
     def set_internal_state(self, recv_req: SetInternalStateReq):
         server_args_dict = recv_req.server_args
+        logging.info(f"set_internal_state received server_args={server_args_dict}")
         args_allow_update = set(
             [
                 "pp_max_micro_batch_size",
                 "speculative_accept_threshold_single",
                 "speculative_accept_threshold_acc",
+                "dspark_force_budget_frac",
+                "dspark_clear_info_records",
             ]
         )
 
@@ -3760,6 +3786,30 @@ class Scheduler(
                 )
                 if_success = False
                 break
+            elif k == "dspark_force_budget_frac":
+                if not self.spec_algorithm.is_dspark() or not hasattr(
+                    self.draft_worker, "set_dspark_forced_budget_frac"
+                ):
+                    logging.warning(
+                        "dspark_force_budget_frac requires a DSpark draft worker."
+                    )
+                    if_success = False
+                    break
+                if v is not None and not (0.0 < float(v) <= 1.0):
+                    logging.warning(
+                        f"dspark_force_budget_frac must be in (0, 1] or null, got {v}."
+                    )
+                    if_success = False
+                    break
+            elif k == "dspark_clear_info_records":
+                if not self.spec_algorithm.is_dspark() or not hasattr(
+                    self.draft_worker, "clear_info_records"
+                ):
+                    logging.warning(
+                        "dspark_clear_info_records requires a DSpark draft worker."
+                    )
+                    if_success = False
+                    break
 
         if if_success:
             if (
@@ -3775,6 +3825,15 @@ class Scheduler(
                 self.metrics_reporter.spec_total_num_forward_ct
             ) = 0
             for k, v in server_args_dict.items():
+                if k == "dspark_force_budget_frac":
+                    self.draft_worker.set_dspark_forced_budget_frac(
+                        None if v is None else float(v)
+                    )
+                    continue
+                if k == "dspark_clear_info_records":
+                    if v:
+                        self.draft_worker.clear_info_records()
+                    continue
                 setattr(get_global_server_args(), k, v)
             logger.info(f"Global server args updated! {get_global_server_args()=}")
 

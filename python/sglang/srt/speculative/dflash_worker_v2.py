@@ -1,6 +1,5 @@
 import logging
 import math
-from copy import deepcopy
 from typing import List, Optional
 
 import torch
@@ -15,11 +14,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     compute_position,
 )
-from sglang.srt.server_args import (
-    ServerArgs,
-    get_global_server_args,
-    set_global_server_args_for_scheduler,
-)
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
@@ -30,6 +25,13 @@ from sglang.srt.speculative.dflash_utils import (
     compute_dflash_sampling_correct_drafts_and_bonus,
     is_dflash_sampling_verify_available,
     parse_dflash_draft_config,
+)
+from sglang.srt.speculative.draft_worker_common import (
+    build_block_pos_offsets,
+    build_draft_tp_worker,
+    make_draft_block_spec_info,
+    make_draft_input_v2,
+    make_draft_sampler_capture_hook,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
@@ -78,7 +80,7 @@ class _DflashDraftSampler:
             device=weight.device,
         )
 
-    def __call__(self, hidden_states):
+    def __call__(self, hidden_states, input_ids=None):
         # draft tokens are block positions 1: (pos 0 is the seeded bonus token)
         bs = hidden_states.shape[0] // self.block_size
         hs = hidden_states.view(bs, self.block_size, -1)[:, 1:, :].reshape(
@@ -133,69 +135,22 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._warned_sampling_fallback = False
         self._logged_first_verify = False
 
-        # Draft runner (separate KV cache + attention backend).
-        draft_server_args = deepcopy(server_args)
-        draft_server_args.skip_tokenizer_init = True
-        draft_backend = draft_server_args.speculative_draft_attention_backend
-        supported_draft_backends = ("flashinfer", "fa3", "fa4", "triton", "ascend")
-        if draft_backend is None:
-            draft_backend, _ = draft_server_args.get_attention_backends()
-        if draft_backend is None:
-            # Use triton on ROCm (no FlashInfer), flashinfer on CUDA
-            import torch as _torch
-
-            draft_backend = "triton" if _torch.version.hip else "flashinfer"
-        elif draft_backend == "trtllm_mha":
-            import torch as _torch
-
-            _fb = "triton" if _torch.version.hip else "flashinfer"
-            logger.warning(
-                "DFLASH draft worker does not support 'trtllm_mha' because the "
-                "draft path requires per-layer DFlash attention. Falling back to "
-                "'%s'.",
-                _fb,
-            )
-            draft_backend = _fb
-        elif draft_backend not in supported_draft_backends:
-            import torch as _torch
-
-            _fb = "triton" if _torch.version.hip else "flashinfer"
-            logger.warning(
-                "DFLASH draft worker only supports attention_backend in %s for now, "
-                "but got %r. Falling back to '%s'.",
-                supported_draft_backends,
-                draft_backend,
-                _fb,
-            )
-            draft_backend = _fb
-        # Make the draft worker backend explicit and self-contained (no further overrides).
-        draft_server_args.speculative_draft_attention_backend = None
-        draft_server_args.prefill_attention_backend = None
-        draft_server_args.decode_attention_backend = None
-        draft_server_args.attention_backend = draft_backend
-        # Keep draft context length aligned with the target.
-        draft_server_args.context_length = (
-            target_worker.model_runner.model_config.context_len
-        )
-        saved_server_args = get_global_server_args()
-        self._draft_worker = TpModelWorker(
-            server_args=draft_server_args,
+        bundle = build_draft_tp_worker(
+            server_args=server_args,
             gpu_id=gpu_id,
             tp_rank=tp_rank,
+            dp_rank=dp_rank,
             moe_ep_rank=moe_ep_rank,
-            pp_rank=0,
             attn_cp_rank=attn_cp_rank,
             moe_dp_rank=moe_dp_rank,
-            dp_rank=dp_rank,
             nccl_port=nccl_port,
-            is_draft_worker=True,
+            target_model_config=target_worker.model_runner.model_config,
+            algo_label="DFLASH",
         )
-        set_global_server_args_for_scheduler(saved_server_args)
-        self.draft_model_runner = self._draft_worker.model_runner
+        self._draft_worker = bundle.draft_worker
+        self.draft_model_runner = bundle.draft_model_runner
         self._draft_sampler = None
-        # Keep the same alias that other spec-v2 workers expose.
-        self._draft_worker.draft_runner = self.draft_model_runner
-        self.draft_model = self.draft_model_runner.model
+        self.draft_model = bundle.draft_model
         draft_config = parse_dflash_draft_config(
             draft_hf_config=self.draft_model_runner.model_config.hf_config
         )
@@ -226,7 +181,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         if self.tp_rank == 0:
             logger.info(
                 "Initialized DFLASH draft runner. attention_backend=%s, model=%s, block_size=%s, draft_window_size=%s, compact_cache=%s",
-                getattr(draft_server_args, "attention_backend", None),
+                bundle.resolved_attention_backend,
                 self.draft_model.__class__.__name__,
                 self.block_size,
                 self.draft_window_size,
@@ -239,8 +194,8 @@ class DFlashWorkerV2(BaseSpecWorker):
                 self._mask_token_id_override,
             )
 
-        self._block_pos_offsets = torch.arange(
-            self.block_size, device=self.device, dtype=torch.int64
+        self._block_pos_offsets = build_block_pos_offsets(
+            length=self.block_size, device=self.device
         )
         self._draft_block_ids_buf: Optional[torch.Tensor] = None  # [cap_bs, block_size]
         self._draft_block_positions_buf: Optional[torch.Tensor] = (
@@ -254,12 +209,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         self._draft_block_end_buf: Optional[torch.Tensor] = None  # [cap_bs]
         self._draft_seq_lens_cpu_buf: Optional[torch.Tensor] = None  # [cap_bs] on CPU
-        self._draft_block_spec_info = DFlashVerifyInput(
-            draft_token=torch.empty((0,), dtype=torch.long, device=self.device),
-            positions=torch.empty((0,), dtype=torch.int64, device=self.device),
-            draft_token_num=int(self.block_size),
-            custom_mask=None,
-            capture_hidden_mode=CaptureHiddenMode.NULL,
+        self._draft_block_spec_info = make_draft_block_spec_info(
+            draft_token_num=int(self.block_size), device=self.device
         )
         self._draft_greedy_gathered_max_buf: Optional[torch.Tensor] = None
         self._draft_greedy_gathered_ids_buf: Optional[torch.Tensor] = None
@@ -343,7 +294,10 @@ class DFlashWorkerV2(BaseSpecWorker):
         if capture_decode_cuda_graph:
             # Must run before capture so the draft graph folds the head in.
             self._draft_sampler = self._maybe_build_draft_sampler()
-            self.draft_model_runner.dflash_draft_sampler = self._draft_sampler
+            if self._draft_sampler is not None:
+                self.draft_model_runner.capture_tail_hooks.append(
+                    make_draft_sampler_capture_hook(self._draft_sampler)
+                )
         self._draft_worker.init_cuda_graphs(
             capture_decode_cuda_graph=capture_decode_cuda_graph
         )
@@ -1234,15 +1188,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         bonus_tokens: torch.Tensor,
         seq_lens: torch.Tensor,
     ) -> DFlashDraftInputV2:
-        bs = int(seq_lens.numel())
-        device = bonus_tokens.device
-        return DFlashDraftInputV2(
-            topk_p=torch.empty((bs, 0), device=device, dtype=torch.float32),
-            topk_index=torch.empty((bs, 0), device=device, dtype=torch.int64),
-            bonus_tokens=bonus_tokens.to(dtype=torch.int64),
-            new_seq_lens=seq_lens.to(dtype=torch.int64),
-            hidden_states=torch.empty((bs, 0), device=device, dtype=torch.float16),
-        )
+        return make_draft_input_v2(bonus_tokens=bonus_tokens, new_seq_lens=seq_lens)
 
     def _make_next_draft_input_decode(
         self,
@@ -1250,15 +1196,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         bonus_tokens: torch.Tensor,
         new_seq_lens: torch.Tensor,
     ) -> DFlashDraftInputV2:
-        bs = int(new_seq_lens.numel())
-        device = bonus_tokens.device
-        return DFlashDraftInputV2(
-            topk_p=torch.empty((bs, 0), device=device, dtype=torch.float32),
-            topk_index=torch.empty((bs, 0), device=device, dtype=torch.int64),
-            bonus_tokens=bonus_tokens.to(dtype=torch.int64),
-            new_seq_lens=new_seq_lens.to(dtype=torch.int64),
-            hidden_states=torch.empty((bs, 0), device=device, dtype=torch.float16),
-        )
+        return make_draft_input_v2(bonus_tokens=bonus_tokens, new_seq_lens=new_seq_lens)
 
     def forward_batch_generation(
         self,

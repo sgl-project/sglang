@@ -1,0 +1,339 @@
+import tempfile
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+
+from sglang.srt.speculative.dspark_components.dspark_sps_table import (
+    SpsAdditiveCostTable,
+    SpsCostTable,
+    build_batch_size_sweep,
+    build_uninitialized_sps_table,
+    is_uninitialized_sps_table,
+    load_sps_table_from_path,
+    profile_sps_table,
+)
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
+
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
+
+def _make_table() -> SpsCostTable:
+    return SpsCostTable(
+        sample_batch_tokens=[8, 16, 32, 64],
+        sample_steps_per_sec=[1000.0, 950.0, 500.0, 480.0],
+        max_batch_tokens=128,
+    )
+
+
+class TestSpsCostTableInvariants(CustomTestCase):
+    def test_rejects_non_increasing_batch_tokens(self):
+        with self.assertRaises(ValueError):
+            SpsCostTable(
+                sample_batch_tokens=[8, 8, 16],
+                sample_steps_per_sec=[1.0, 2.0, 3.0],
+                max_batch_tokens=16,
+            )
+
+    def test_rejects_unsorted_batch_tokens(self):
+        with self.assertRaises(ValueError):
+            SpsCostTable(
+                sample_batch_tokens=[16, 8],
+                sample_steps_per_sec=[1.0, 2.0],
+                max_batch_tokens=16,
+            )
+
+    def test_rejects_length_mismatch(self):
+        with self.assertRaises(ValueError):
+            SpsCostTable(
+                sample_batch_tokens=[8, 16],
+                sample_steps_per_sec=[1.0],
+                max_batch_tokens=16,
+            )
+
+    def test_rejects_empty_table(self):
+        with self.assertRaises(ValueError):
+            SpsCostTable(
+                sample_batch_tokens=[],
+                sample_steps_per_sec=[],
+                max_batch_tokens=0,
+            )
+
+    def test_rejects_max_below_largest_probe(self):
+        with self.assertRaises(ValueError):
+            SpsCostTable(
+                sample_batch_tokens=[8, 16],
+                sample_steps_per_sec=[1.0, 2.0],
+                max_batch_tokens=15,
+            )
+
+
+class TestSpsCostTableLookup(CustomTestCase):
+    def test_lookup_exact_probe_returns_that_sps(self):
+        table = _make_table()
+        self.assertEqual(table.lookup(8), 1000.0)
+        self.assertEqual(table.lookup(16), 950.0)
+        self.assertEqual(table.lookup(32), 500.0)
+        self.assertEqual(table.lookup(64), 480.0)
+
+    def test_lookup_floors_to_lower_captured_probe(self):
+        table = _make_table()
+        self.assertEqual(table.lookup(31), 950.0)
+        self.assertEqual(table.lookup(63), 500.0)
+
+    def test_lookup_does_not_interpolate_across_cliff(self):
+        table = _make_table()
+        midpoint = table.lookup((16 + 32) // 2)
+        self.assertEqual(midpoint, 950.0)
+        self.assertNotEqual(midpoint, (950.0 + 500.0) / 2)
+
+    def test_lookup_below_first_probe_clamps_to_first(self):
+        table = _make_table()
+        self.assertEqual(table.lookup(1), 1000.0)
+        self.assertEqual(table.lookup(7), 1000.0)
+
+    def test_lookup_above_last_probe_clamps_to_last(self):
+        table = _make_table()
+        self.assertEqual(table.lookup(65), 480.0)
+        self.assertEqual(table.lookup(10_000), 480.0)
+
+
+class TestSpsCostTableJsonRoundTrip(CustomTestCase):
+    def test_json_round_trip_preserves_table(self):
+        table = _make_table()
+        restored = SpsCostTable.from_json(table.to_json())
+        self.assertEqual(restored.sample_batch_tokens, table.sample_batch_tokens)
+        self.assertEqual(restored.sample_steps_per_sec, table.sample_steps_per_sec)
+        self.assertEqual(restored.max_batch_tokens, table.max_batch_tokens)
+
+    def test_json_round_trip_preserves_lookup_behavior(self):
+        table = _make_table()
+        restored = SpsCostTable.from_json(table.to_json())
+        for batch_tokens in (1, 8, 31, 64, 200):
+            self.assertEqual(restored.lookup(batch_tokens), table.lookup(batch_tokens))
+
+
+class TestLoadSpsTableFromPath(CustomTestCase):
+    def test_load_from_path_round_trips_table_and_lookup(self):
+        table = _make_table()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "sps.json"
+            path.write_text(table.to_json(), encoding="utf-8")
+            loaded = load_sps_table_from_path(str(path))
+        self.assertEqual(loaded.sample_batch_tokens, table.sample_batch_tokens)
+        self.assertEqual(loaded.sample_steps_per_sec, table.sample_steps_per_sec)
+        self.assertEqual(loaded.max_batch_tokens, table.max_batch_tokens)
+        for batch_tokens in (1, 8, 31, 64, 200):
+            self.assertEqual(loaded.lookup(batch_tokens), table.lookup(batch_tokens))
+
+
+class TestFlatTableLookupIsConstant(CustomTestCase):
+    def test_flat_table_lookup_is_one_for_any_batch(self):
+        flat = SpsCostTable(
+            sample_batch_tokens=[1],
+            sample_steps_per_sec=[1.0],
+            max_batch_tokens=4096,
+        )
+        for batch_tokens in (0, 1, 2, 17, 256, 100_000):
+            self.assertEqual(flat.lookup(batch_tokens), 1.0)
+
+
+class TestProfileSpsTable(CustomTestCase):
+    def test_profile_sorts_out_of_order_probes(self):
+        table = profile_sps_table(
+            probes=[(32, 500.0), (8, 1000.0), (16, 950.0)],
+        )
+        self.assertEqual(table.sample_batch_tokens, [8, 16, 32])
+        self.assertEqual(table.sample_steps_per_sec, [1000.0, 950.0, 500.0])
+
+    def test_profile_passes_steps_per_sec_through_unchanged(self):
+        table = profile_sps_table(probes=[(4, 1234.5), (8, 678.25)])
+        self.assertEqual(table.sample_steps_per_sec, [1234.5, 678.25])
+
+    def test_profile_rejects_duplicate_batch_tokens(self):
+        with self.assertRaises(ValueError):
+            profile_sps_table(probes=[(8, 1000.0), (8, 900.0)])
+
+    def test_profile_rejects_empty_probes(self):
+        with self.assertRaises(ValueError):
+            profile_sps_table(probes=[])
+
+    def test_profile_max_batch_tokens_defaults_to_largest_probe(self):
+        table = profile_sps_table(probes=[(8, 1000.0), (64, 480.0), (16, 950.0)])
+        self.assertEqual(table.max_batch_tokens, 64)
+
+    def test_profile_honors_explicit_max_batch_tokens(self):
+        table = profile_sps_table(
+            probes=[(8, 1000.0), (16, 950.0)], max_batch_tokens=256
+        )
+        self.assertEqual(table.max_batch_tokens, 256)
+
+
+def _make_bench_result(*, batch_size: int, output_throughput: float):
+    from sglang.benchmark.one_batch_server import BenchOneCaseResult
+
+    output_len = 1024
+    return BenchOneCaseResult(
+        run_name="test",
+        batch_size=batch_size,
+        input_len=512,
+        output_len=output_len,
+        latency=1.0,
+        input_throughput=1.0,
+        output_throughput=output_throughput,
+        overall_throughput=1.0,
+        last_ttft=0.1,
+        last_gen_throughput=output_throughput,
+        acc_length=-1.0,
+    )
+
+
+class TestProfilerConversion(CustomTestCase):
+    def _table_from_results(self, results):
+        from sglang.benchmark import dspark_sps_profiler
+
+        outcome = dspark_sps_profiler.build_sps_table(
+            results=results, max_batch_tokens=None
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            out_path = Path(tmp) / "sps.json"
+            out_path.write_text(outcome.table.to_json(), encoding="utf-8")
+            dspark_sps_profiler.run_self_check(out_path=out_path)
+            return load_sps_table_from_path(str(out_path))
+
+    def test_conversion_sets_batch_tokens_and_steps_per_sec(self):
+        table = self._table_from_results(
+            [
+                _make_bench_result(batch_size=2, output_throughput=1000.0),
+                _make_bench_result(batch_size=4, output_throughput=1600.0),
+                _make_bench_result(batch_size=8, output_throughput=2400.0),
+            ]
+        )
+        self.assertEqual(table.sample_batch_tokens, [2, 4, 8])
+        self.assertAlmostEqual(table.sample_steps_per_sec[0], 500.0, places=6)
+        self.assertAlmostEqual(table.sample_steps_per_sec[1], 400.0, places=6)
+        self.assertAlmostEqual(table.sample_steps_per_sec[2], 300.0, places=6)
+
+    def test_conversion_medians_across_repeats(self):
+        table = self._table_from_results(
+            [
+                _make_bench_result(batch_size=4, output_throughput=1000.0),
+                _make_bench_result(batch_size=4, output_throughput=800.0),
+                _make_bench_result(batch_size=4, output_throughput=1200.0),
+            ]
+        )
+        self.assertEqual(table.sample_batch_tokens, [4])
+        self.assertAlmostEqual(table.sample_steps_per_sec[0], 250.0, places=6)
+
+    def test_conversion_keeps_non_monotone_samples_without_crashing(self):
+        table = self._table_from_results(
+            [
+                _make_bench_result(batch_size=4, output_throughput=1000.0),
+                _make_bench_result(batch_size=8, output_throughput=8000.0),
+            ]
+        )
+        self.assertEqual(table.sample_batch_tokens, [4, 8])
+        self.assertAlmostEqual(table.sample_steps_per_sec[0], 250.0, places=6)
+        self.assertAlmostEqual(table.sample_steps_per_sec[1], 1000.0, places=6)
+
+    def test_conversion_skips_degenerate_output_throughput(self):
+        table = self._table_from_results(
+            [
+                _make_bench_result(batch_size=4, output_throughput=0.0),
+                _make_bench_result(batch_size=8, output_throughput=2400.0),
+            ]
+        )
+        self.assertEqual(table.sample_batch_tokens, [8])
+        self.assertAlmostEqual(table.sample_steps_per_sec[0], 300.0, places=6)
+
+
+def _build_sps_cost_table_for(*, sps_table_path):
+    from sglang.srt.speculative.dspark_components.dspark_scheduler import (
+        build_sps_cost_table,
+    )
+
+    server_args = SimpleNamespace(
+        speculative_dspark_sps_table_path=sps_table_path,
+        max_running_requests=4,
+    )
+    return build_sps_cost_table(server_args=server_args, verify_num_draft_tokens=5)
+
+
+class TestBuildSpsCostTableContract(CustomTestCase):
+    def test_unset_table_path_returns_flat_table(self):
+        for sps_table_path in (None, ""):
+            table = _build_sps_cost_table_for(sps_table_path=sps_table_path)
+            self.assertEqual(table.sample_batch_tokens, [1])
+            self.assertEqual(table.sample_steps_per_sec, [1.0])
+            self.assertEqual(table.max_batch_tokens, 20)
+
+    def test_real_path_loads_table(self):
+        table = _make_table()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "sps.json"
+            path.write_text(table.to_json(), encoding="utf-8")
+            loaded = _build_sps_cost_table_for(sps_table_path=str(path))
+        self.assertEqual(loaded.sample_batch_tokens, table.sample_batch_tokens)
+        self.assertEqual(loaded.sample_steps_per_sec, table.sample_steps_per_sec)
+        self.assertEqual(loaded.max_batch_tokens, table.max_batch_tokens)
+
+
+class TestBuildBatchSizeSweep(CustomTestCase):
+    def _sweep(self, max_num_tokens):
+        return build_batch_size_sweep(max_num_tokens)
+
+    def test_sweep_is_strictly_increasing_deduped_and_ends_at_max(self):
+        for max_num_tokens in (8, 100, 1024, 4096, 8192):
+            sweep = self._sweep(max_num_tokens)
+            self.assertEqual(sweep, sorted(set(sweep)))
+            self.assertTrue(all(1 <= value <= max_num_tokens for value in sweep))
+            self.assertEqual(sweep[-1], max_num_tokens)
+
+    def test_sweep_head_is_the_fixed_taper(self):
+        sweep = self._sweep(1024)
+        self.assertEqual(sweep[:6], [1, 2, 4, 8, 12, 16])
+
+    def test_default_max_matches_legacy_endpoints(self):
+        sweep = self._sweep(1024)
+        self.assertEqual(sweep[-4:], [928, 960, 992, 1024])
+
+    def test_large_max_extends_sparsely_past_1024(self):
+        sweep = self._sweep(8192)
+        beyond = [value for value in sweep if value > 1024]
+        self.assertEqual(beyond[:4], [1152, 1280, 1408, 1536])
+        self.assertIn(2048, sweep)
+        self.assertIn(2304, sweep)
+        self.assertEqual(sweep[-1], 8192)
+
+    def test_tiny_max_truncates_the_taper(self):
+        self.assertEqual(self._sweep(8), [1, 2, 4, 8])
+
+    def test_non_positive_max_raises(self):
+        with self.assertRaises(ValueError):
+            self._sweep(0)
+
+
+class TestIsUninitializedSpsTable(CustomTestCase):
+    def test_additive_table_is_never_uninitialized(self):
+        table = SpsAdditiveCostTable(
+            bias_seconds=0.1,
+            bs_probes=[128, 192, 256],
+            alpha_seconds=[0.0, 0.008, 0.016],
+            m_probes=[384, 512, 1024],
+            theta_seconds=[0.0, 0.02, 0.1],
+        )
+        self.assertFalse(is_uninitialized_sps_table(table))
+
+    def test_placeholder_diagonal_table_is_uninitialized(self):
+        self.assertTrue(
+            is_uninitialized_sps_table(
+                build_uninitialized_sps_table(max_batch_tokens=128)
+            )
+        )
+
+    def test_real_diagonal_table_is_initialized(self):
+        self.assertFalse(is_uninitialized_sps_table(_make_table()))
+
+
+if __name__ == "__main__":
+    unittest.main()

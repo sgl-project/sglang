@@ -6,7 +6,10 @@ python3 -m sglang.test.run_eval --port 30000 --eval-name mmlu --num-examples 10
 import argparse
 import json
 import os
+import random
+import statistics
 import time
+import traceback
 
 from sglang.test.simple_eval_common import (
     ChatCompletionSampler,
@@ -76,12 +79,14 @@ def run_eval_once(args, base_url: str, eval_obj: Eval) -> dict:
         sampler = CompletionSampler(
             **common_kwargs,
             stop=stop,
+            record_meta_info=True,
         )
     else:
         sampler = ChatCompletionSampler(
             **common_kwargs,
             reasoning_effort=getattr(args, "reasoning_effort", None),
             extra_body=extra_body if extra_body else None,
+            record_meta_info=True,
         )
 
     # Run eval
@@ -90,6 +95,63 @@ def run_eval_once(args, base_url: str, eval_obj: Eval) -> dict:
     latency = time.perf_counter() - tic
 
     return result, latency, sampler
+
+
+def _extract_choice_meta_info(response: dict) -> dict:
+    if not isinstance(response, dict):
+        return {}
+    choices = response.get("choices") or []
+    if not choices or not isinstance(choices[0], dict):
+        return {}
+    return choices[0].get("meta_info") or {}
+
+
+def dump_and_analyze_records(args, samplers: list) -> None:
+    records = []
+    for sampler in samplers:
+        records.extend(getattr(sampler, "_records", []))
+    if not records:
+        return
+
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    rand = f"{random.randint(0, 1 << 32):08x}"
+    dump_path = os.path.expanduser(f"~/{stamp}-{rand}-run_eval-{args.eval_name}.json")
+    try:
+        with open(dump_path, "w") as f:
+            json.dump(records, f, indent=2, default=str)
+        print(f"Wrote {len(records)} raw request/response records to {dump_path}")
+    except OSError:
+        traceback.print_exc()
+
+    accept_lengths = [
+        m["spec_accept_length"]
+        for r in records
+        if (m := _extract_choice_meta_info(r.get("response")))
+        and m.get("spec_accept_length") is not None
+    ]
+    accept_rates = [
+        m["spec_accept_rate"]
+        for r in records
+        if (m := _extract_choice_meta_info(r.get("response")))
+        and m.get("spec_accept_rate") is not None
+    ]
+    print("=" * 20)
+    if not accept_lengths:
+        print(
+            "Speculative decoding: no per-request spec_accept_length in responses "
+            "(non-speculative server, or --api completion which lacks return_meta_info)."
+        )
+    else:
+        print(
+            f"Speculative accept length (per-request, from meta_info): "
+            f"n={len(accept_lengths)} "
+            f"mean={statistics.fmean(accept_lengths):.4f} "
+            f"min={min(accept_lengths):.4f} "
+            f"max={max(accept_lengths):.4f}"
+        )
+        if accept_rates:
+            print(f"Speculative accept rate: mean={statistics.fmean(accept_rates):.4f}")
+    print("=" * 20)
 
 
 def run_eval(args):
@@ -194,6 +256,7 @@ def run_eval(args):
 
     if getattr(args, "repeat", 1) == 1:
         result, latency, sampler = run_eval_once(args, base_url, eval_obj)
+        samplers = [sampler]
         metrics = result.metrics | {"score": result.score}
         metrics["latency"] = latency
         print(f"Total latency: {latency:.3f} s")
@@ -229,9 +292,11 @@ def run_eval(args):
         scores_repeat = []
         latencies = []
         total_completion_tokens = 0
+        samplers = []
 
         for f in futures:
             result, latency, sampler = f.result()
+            samplers.append(sampler)
             scores_repeat.append(result.score)
             latencies.append(latency)
             total_completion_tokens += sum(sampler._completion_tokens)
@@ -265,6 +330,8 @@ def run_eval(args):
         )
 
         executor.shutdown()
+
+    dump_and_analyze_records(args, samplers)
 
     # Dump reports
     file_stem = f"{args.eval_name}_{sampler.model.replace('/', '_')}"

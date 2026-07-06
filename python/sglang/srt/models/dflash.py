@@ -225,6 +225,9 @@ class DFlashAttention(nn.Module):
         _, k = self.rotary_emb(positions, dummy_q, k)
         return k
 
+    def apply_v_norm(self, v: torch.Tensor) -> torch.Tensor:
+        return v
+
 
 class DFlashMLP(nn.Module):
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:
@@ -364,7 +367,8 @@ class DFlashDraftModel(nn.Module):
                 "This usually means the target model is capturing a different number of layer features than "
                 "the draft checkpoint/config expects."
             )
-        return self.hidden_norm(self.fc(target_hidden))
+        out = self.hidden_norm(self.fc(target_hidden))
+        return out
 
     @torch.no_grad()
     def forward(
@@ -383,7 +387,7 @@ class DFlashDraftModel(nn.Module):
         hidden_states = input_embeds
         residual: Optional[torch.Tensor] = None
 
-        for layer in self.layers:
+        for layer_id, layer in enumerate(self.layers):
             hidden_states, residual = layer(
                 positions, hidden_states, forward_batch, residual
             )

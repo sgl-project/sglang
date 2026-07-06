@@ -645,6 +645,15 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_mode = forward_batch.forward_mode
         spec_info = forward_batch.spec_info
 
+        if (
+            getattr(spec_info, "ragged_verify_layout", None) is not None
+            and forward_mode.is_target_verify()
+        ):
+            raise NotImplementedError(
+                "FlashInfer does not support DSV4 ragged verify in cuda graph; "
+                "disable SGLANG_RAGGED_VERIFY_MODE for this configuration."
+            )
+
         if in_capture:
             num_tokens = forward_batch.positions.numel()
             self._prepare_cuda_graph_metadata(bs, num_tokens, forward_mode, spec_info)

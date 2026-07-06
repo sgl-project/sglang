@@ -129,6 +129,9 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
 
 
 def _handle_dflash(server_args: ServerArgs) -> None:
+    if not server_args.device.startswith("cuda"):
+        raise ValueError("DFLASH speculative decoding only supports CUDA device.")
+
     if server_args.enable_dp_attention:
         raise ValueError(
             "Currently DFLASH speculative decoding does not support dp attention."
@@ -239,6 +242,200 @@ def _handle_dflash(server_args: ServerArgs) -> None:
         server_args.enable_mixed_chunk = False
         logger.warning(
             "Mixed chunked prefill is disabled because of using dflash speculative decoding."
+        )
+
+
+def _target_checkpoint_bundles_dspark_draft(server_args: ServerArgs) -> bool:
+    hf_config = server_args.get_model_config().hf_config
+    return any(
+        getattr(hf_config, key, None) is not None
+        for key in (
+            "dspark_block_size",
+            "dspark_markov_rank",
+            "dspark_noise_token_id",
+            "dspark_target_layer_ids",
+        )
+    )
+
+
+def _handle_dspark(server_args: ServerArgs) -> None:
+    if not server_args.device.startswith("cuda"):
+        raise ValueError("DSpark speculative decoding only supports CUDA device.")
+
+    if server_args.enable_dp_attention:
+        if not server_args.enable_dp_lm_head:
+            raise ValueError("DSpark with dp attention requires --enable-dp-lm-head.")
+        if server_args.moe_a2a_backend != "none":
+            raise ValueError(
+                "DSpark with dp attention only supports the built-in TP MoE "
+                f"(moe_a2a_backend='none'), got {server_args.moe_a2a_backend!r}."
+            )
+        if server_args.attn_cp_size > 1:
+            raise ValueError(
+                "DSpark with dp attention does not support context parallel "
+                f"(attn_cp_size={server_args.attn_cp_size})."
+            )
+        if (
+            server_args.speculative_moe_a2a_backend is not None
+            and server_args.speculative_moe_a2a_backend != server_args.moe_a2a_backend
+        ):
+            raise ValueError(
+                "DSpark ignores --speculative-moe-a2a-backend; with dp attention it "
+                f"must match the target moe_a2a_backend={server_args.moe_a2a_backend!r} "
+                f"(got {server_args.speculative_moe_a2a_backend!r})."
+            )
+
+    if server_args.pp_size != 1:
+        raise ValueError(
+            "Currently DSpark speculative decoding only supports pp_size == 1."
+        )
+
+    if server_args.speculative_draft_model_path is None:
+        if _target_checkpoint_bundles_dspark_draft(server_args):
+            server_args.speculative_draft_model_path = server_args.model_path
+            server_args.speculative_draft_model_revision = server_args.revision
+            logger.info(
+                "DSpark draft weights are bundled in the target checkpoint; "
+                "defaulting --speculative-draft-model-path to --model-path (%s).",
+                server_args.model_path,
+            )
+        else:
+            raise ValueError(
+                "DSpark dense speculative decoding requires setting "
+                "--speculative-draft-model-path."
+            )
+
+    if server_args.speculative_num_steps is None:
+        server_args.speculative_num_steps = 1
+    elif int(server_args.speculative_num_steps) != 1:
+        logger.warning(
+            "DSpark only supports speculative_num_steps == 1; overriding speculative_num_steps=%s to 1.",
+            server_args.speculative_num_steps,
+        )
+        server_args.speculative_num_steps = 1
+
+    if server_args.speculative_eagle_topk is None:
+        server_args.speculative_eagle_topk = 1
+    elif int(server_args.speculative_eagle_topk) != 1:
+        logger.warning(
+            "DSpark only supports speculative_eagle_topk == 1; overriding speculative_eagle_topk=%s to 1.",
+            server_args.speculative_eagle_topk,
+        )
+        server_args.speculative_eagle_topk = 1
+
+    gamma: Optional[int] = None
+    if server_args.speculative_dspark_block_size is not None:
+        if int(server_args.speculative_dspark_block_size) <= 0:
+            raise ValueError(
+                "DSpark requires --speculative-dspark-block-size to be positive, "
+                f"got {server_args.speculative_dspark_block_size}."
+            )
+        gamma = int(server_args.speculative_dspark_block_size)
+
+    if gamma is None and server_args.speculative_num_draft_tokens is None:
+        from sglang.srt.speculative.dspark_components.dspark_utils import (
+            DEFAULT_DSPARK_GAMMA,
+            parse_dspark_draft_config,
+        )
+
+        model_override_args = json.loads(server_args.json_model_override_args)
+        try:
+            from sglang.srt.utils.hf_transformers_utils import get_config
+
+            draft_hf_config = get_config(
+                server_args.speculative_draft_model_path,
+                trust_remote_code=server_args.trust_remote_code,
+                revision=server_args.speculative_draft_model_revision,
+                model_override_args=model_override_args,
+            )
+            gamma = parse_dspark_draft_config(
+                draft_hf_config=draft_hf_config
+            ).resolve_gamma(default=None)
+        except Exception as e:
+            logger.warning(
+                "Failed to infer DSpark gamma from draft model config; "
+                "defaulting to %d. Error: %s",
+                DEFAULT_DSPARK_GAMMA,
+                e,
+            )
+        if gamma is None:
+            gamma = DEFAULT_DSPARK_GAMMA
+            logger.warning(
+                "DSpark gamma is not set; defaulting to %d.",
+                gamma,
+            )
+
+    elif gamma is None and server_args.speculative_num_draft_tokens is not None:
+        from sglang.srt.speculative.dspark_components.dspark_utils import (
+            parse_dspark_draft_config,
+        )
+
+        model_override_args = json.loads(server_args.json_model_override_args)
+        config_gamma: Optional[int] = None
+        try:
+            from sglang.srt.utils.hf_transformers_utils import get_config
+
+            draft_hf_config = get_config(
+                server_args.speculative_draft_model_path,
+                trust_remote_code=server_args.trust_remote_code,
+                revision=server_args.speculative_draft_model_revision,
+                model_override_args=model_override_args,
+            )
+            config_gamma = parse_dspark_draft_config(
+                draft_hf_config=draft_hf_config
+            ).resolve_gamma(default=None)
+        except Exception as e:
+            logger.warning(
+                "Failed to read DSpark gamma from draft model config; "
+                "skipping speculative_num_draft_tokens consistency check. Error: %s",
+                e,
+            )
+
+        if config_gamma is not None:
+            config_verify_window = int(config_gamma) + 1
+            if int(server_args.speculative_num_draft_tokens) != config_verify_window:
+                raise ValueError(
+                    "DSpark speculative_num_draft_tokens must equal the draft "
+                    "checkpoint block_size + 1 "
+                    f"(= {config_verify_window} for block_size={config_gamma}), "
+                    "but got speculative_num_draft_tokens="
+                    f"{server_args.speculative_num_draft_tokens}."
+                )
+
+    if gamma is not None:
+        verify_window = int(gamma) + 1
+        if (
+            server_args.speculative_num_draft_tokens is not None
+            and int(server_args.speculative_num_draft_tokens) != verify_window
+        ):
+            raise ValueError(
+                "DSpark speculative_num_draft_tokens must equal gamma + 1 "
+                f"(= {verify_window} for gamma={gamma}), but got "
+                f"speculative_num_draft_tokens={server_args.speculative_num_draft_tokens}."
+            )
+        server_args.speculative_num_draft_tokens = verify_window
+
+    if server_args.speculative_num_draft_tokens is None:
+        raise ValueError(
+            "DSpark could not resolve speculative_num_draft_tokens; set "
+            "--speculative-dspark-block-size (= gamma)."
+        )
+    if int(server_args.speculative_num_draft_tokens) < 2:
+        raise ValueError(
+            "DSpark speculative_num_draft_tokens must be >= 2 (= gamma + 1), "
+            f"got {server_args.speculative_num_draft_tokens}."
+        )
+
+    if server_args.max_running_requests is None:
+        server_args.max_running_requests = 48
+        logger.warning(
+            "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
+        )
+
+    if server_args.enable_mixed_chunk:
+        server_args.enable_mixed_chunk = False
+        logger.warning(
+            "Mixed chunked prefill is disabled because of using dspark speculative decoding."
         )
 
 

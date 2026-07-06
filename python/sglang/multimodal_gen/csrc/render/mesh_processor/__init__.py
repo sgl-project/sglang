@@ -55,7 +55,9 @@ def meshVerticeInpaint(
     pos_idx = np.ascontiguousarray(pos_idx, dtype=np.int32)
     uv_idx = np.ascontiguousarray(uv_idx, dtype=np.int32)
 
-    return kernel.meshVerticeInpaint(texture, mask, vtx_pos, vtx_uv, pos_idx, uv_idx, method)
+    return kernel.meshVerticeInpaint(
+        texture, mask, vtx_pos, vtx_uv, pos_idx, uv_idx, method
+    )
 
 
 __all__ = ["meshVerticeInpaint"]
