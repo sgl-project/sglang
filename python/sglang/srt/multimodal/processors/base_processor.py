@@ -463,13 +463,37 @@ class BaseMultimodalProcessor(ABC):
 
                 npu_apply_glm46v_image_preprocess_patch()
                 kwargs["device"] = "npu"
+        try:
+            result = processor.__call__(
+                text=[input_text],
+                padding=True,
+                return_tensors="pt",
+                **kwargs,
+            )
+        except (TypeError, ValueError) as e:
+            logger.warning(f"Processor call failed with video kwargs, retrying without video-specific params: {e}")
 
-        result = processor.__call__(
-            text=[input_text],
-            padding=True,
-            return_tensors="pt",
-            **kwargs,
-        )
+            sglang_video_keys = (
+                "fps",
+                "max_pixels",
+                "min_pixels",
+                "total_pixels",
+                "max_frames",
+                "min_frames",
+                "resized_height",
+                "resized_width"
+            )
+            hf_video_kwargs = {
+                k: v
+                for k, v in kwargs
+                if k not in sglang_video_keys
+            }
+            result = processor.__call__(
+                text=[input_text],
+                padding=True,
+                return_tensors="pt",
+                **hf_video_kwargs,
+            )
         if not self.server_args.keep_mm_feature_on_device:
             # move feature tensors to cpu
             for feature_name in self.FEATURE_NAMES:
