@@ -680,7 +680,7 @@ mod tests {
         let _ = manager_handle.await;
     }
 
-    /// End-to-end wiring smoke test: spin up a fake worker, run the
+    /// End-to-end wiring check: spin up a fake worker, run the
     /// manager with a real `KvEventIndex` against that worker URL, and
     /// verify both `Added` and `Removed` propagate through to the
     /// index's internal worker map.

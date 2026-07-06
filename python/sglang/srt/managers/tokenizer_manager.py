@@ -1165,6 +1165,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 lora_id=obj.lora_id,
                 input_embeds=input_embeds,
                 positional_embed_overrides=obj.positional_embed_overrides,
+                session_id=obj.session_id,
                 session_params=session_params,
                 custom_logit_processor=obj.custom_logit_processor,
                 require_reasoning=obj.require_reasoning,
@@ -3152,5 +3153,10 @@ class SignalHandler:
 def stamp_http_worker_ipc(obj: Any, ipc_name: str) -> None:
     if isinstance(obj, BaseReq):
         obj.http_worker_ipc = ipc_name
+    elif isinstance(
+        obj, (BatchTokenizedGenerateReqInput, BatchTokenizedEmbeddingReqInput)
+    ):
+        for req in obj:
+            req.http_worker_ipc = ipc_name
     elif isinstance(obj, BaseBatchReq):
         obj.http_worker_ipcs = [ipc_name] * len(obj.rids)

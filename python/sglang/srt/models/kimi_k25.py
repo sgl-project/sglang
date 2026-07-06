@@ -6,29 +6,20 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
-from transformers import activations
+from transformers.activations import PytorchGELUTanh
 
 from sglang.srt.configs.kimi_k25 import KimiK25Config, KimiK25VisionConfig
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.conv import Conv2dLayer
+from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
+from sglang.srt.layers.quantization.quark.quark import QuarkConfig
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
 )
-
-try:
-    from transformers.activations import PytorchGELUTanh
-except ImportError:
-    from transformers.activations import GELUTanh
-
-    activations.PytorchGELUTanh = GELUTanh
-    PytorchGELUTanh = GELUTanh
-
-from sglang.srt.layers.attention.vision import VisionAttention
-from sglang.srt.layers.linear import ReplicatedLinear
-from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
-from sglang.srt.layers.quantization.quark.quark import QuarkConfig
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
