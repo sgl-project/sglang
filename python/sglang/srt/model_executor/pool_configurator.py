@@ -29,9 +29,10 @@ from sglang.srt.configs.model_config import (
     is_minimax_sparse,
 )
 from sglang.srt.environ import envs
-from sglang.srt.layers.dp_attention import get_attention_tp_size
+from sglang.srt.layers.dp_attention import get_attention_cp_size, get_attention_tp_size
 from sglang.srt.mem_cache.common import get_alloc_len_per_decode
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import get_compress_state_ring_size
+from sglang.srt.mem_cache.dsa_cp_shared import should_enable_dsa_cp_shared_kvcache
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 from sglang.srt.utils.common import (
     ceil_align,
@@ -201,6 +202,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
             # Add indexer KV cache overhead for DSA models (DeepSeek V3.2)
             if is_deepseek_dsa(model_config.hf_config):
+                main_cell_size = cell_size
                 index_head_dim = get_dsa_index_head_dim(model_config.hf_config)
                 indexer_size_per_token = (
                     index_head_dim
@@ -209,7 +211,25 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 element_size = torch._utils._element_size(
                     DSATokenToKVPool.index_k_with_scale_buffer_dtype
                 )
-                cell_size += indexer_size_per_token * num_layers * element_size
+                indexer_cell_size = indexer_size_per_token * num_layers * element_size
+                if should_enable_dsa_cp_shared_kvcache(
+                    enable_hisparse=mr.enable_hisparse,
+                    enabled=getattr(mr.server_args, "enable_dsa_cp_shared_kv_cache", False),
+                ):
+                    cp_size = max(get_attention_cp_size(), 1)
+                    local_main_cell_size = (main_cell_size + cp_size - 1) // cp_size
+                    cell_size = local_main_cell_size + indexer_cell_size
+                    logger.info(
+                        "Use DSA CP shared KV capacity sizing. "
+                        "main_cell_size=%s local_main_cell_size=%s "
+                        "indexer_cell_size=%s cp_size=%s",
+                        main_cell_size,
+                        local_main_cell_size,
+                        indexer_cell_size,
+                        cp_size,
+                    )
+                else:
+                    cell_size += indexer_cell_size
         elif is_minimax_sparse(model_config.hf_config):
             # Mirrors MiniMaxSparseKVPool: main pool (K+V all layers) + indexer pool
             # (sparse-only, single-head; kv layers store K+V, k-only layers store K).

@@ -892,6 +892,10 @@ class ServerArgs:
     dsa_prefill_cp_mode: A[str, Arg(no_cli=True)] = "round-robin-split"
     enable_prefill_context_parallel: A[bool, Arg(no_cli=True)] = False
     prefill_cp_mode: A[str, Arg(no_cli=True)] = "in-seq-split"
+    enable_dsa_cp_shared_kv_cache: A[
+        bool,
+        "Enable DSA CP shared KV cache for L1 HBM and L2 HiCache host memory. Requires DSA context parallelism.",
+    ] = False
     # DP attention
     enable_dp_attention: A[
         bool,

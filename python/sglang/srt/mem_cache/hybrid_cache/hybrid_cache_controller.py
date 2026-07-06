@@ -365,6 +365,38 @@ class HybridCacheController(BaseHiCacheController):
         node_id: int = -1,
         extra_pools: Optional[list[PoolTransfer]] = None,
     ) -> Optional[torch.Tensor]:
+        if self._cp_shared_hicache_enabled():
+            host_indices = self.mem_pool_host.alloc(len(device_indices))
+            if host_indices is None:
+                return None
+            pool_transfers = None
+            if extra_pools:
+                pool_transfers = self._resolve_pool_transfers_allocation(
+                    extra_pools,
+                    alloc_host=True,
+                    kv_device_indices=device_indices,
+                    kv_host_indices=host_indices,
+                )
+                if pool_transfers is None:
+                    self.mem_pool_host.free(host_indices)
+                    return None
+            if extra_pools:
+                pool_transfers = self._sync_cp_shared_pool_transfers(
+                    pool_transfers, host_indices, device_indices
+                )
+
+            self.write_queue.append(
+                CacheOperation(
+                    host_indices,
+                    device_indices,
+                    node_id,
+                    priority,
+                    pool_transfers=pool_transfers or None,
+                )
+            )
+            self.start_writing()
+            return host_indices
+
         host_indices = self.mem_pool_host.alloc(len(device_indices))
         if host_indices is None:
             return None
@@ -389,6 +421,47 @@ class HybridCacheController(BaseHiCacheController):
         )
         self.start_writing()
         return host_indices
+
+    def _sync_cp_shared_pool_transfers(
+        self,
+        pool_transfers: list[PoolTransfer],
+        kv_host_indices: torch.Tensor,
+        kv_device_indices: torch.Tensor,
+    ) -> Optional[list[PoolTransfer]]:
+        for pool in pool_transfers:
+            if pool.indices_from_pool == PoolName.KV:
+                pool.host_indices = kv_host_indices
+                pool.device_indices = kv_device_indices
+
+        for pool in pool_transfers:
+            if pool.indices_from_pool in (None, PoolName.KV):
+                continue
+            source = next(
+                (
+                    transfer
+                    for transfer in pool_transfers
+                    if transfer.name == pool.indices_from_pool
+                    and transfer.indices_from_pool is None
+                ),
+                None,
+            )
+            if source is None or source.host_indices is None:
+                return None
+            pool.host_indices = source.host_indices
+            pool.device_indices = source.device_indices
+        return pool_transfers
+
+    def _free_pool_transfer_host_indices(
+        self, pool_transfers: Optional[list[PoolTransfer]]
+    ) -> None:
+        for transfer in pool_transfers or []:
+            if transfer.indices_from_pool is not None or transfer.host_indices is None:
+                continue
+            entry = self.mem_pool_host.entry_map.get(transfer.name)
+            if entry is None:
+                continue
+            entry.host_pool.free(transfer.host_indices)
+            transfer.host_indices = None
 
     def start_writing(self) -> None:
         if not self.write_queue:
@@ -592,7 +665,16 @@ class HybridCacheController(BaseHiCacheController):
         extra_info = HiCacheStorageExtraInfo(
             prefix_keys=operation.prefix_keys.copy() if operation.prefix_keys else None
         )
-        if operation.pool_transfers:
+        if self._cp_shared_hicache_skip_io():
+            extra_pool_hit_pages = {
+                transfer.name: len(hash_value)
+                for transfer in operation.pool_transfers or []
+            }
+            hit_result = PoolTransferResult(
+                kv_hit_pages=len(hash_value),
+                extra_pool_hit_pages=extra_pool_hit_pages,
+            )
+        elif operation.pool_transfers:
             hit_result = self.storage_backend.batch_exists_v2(
                 hash_value, operation.pool_transfers, extra_info
             )
@@ -604,11 +686,23 @@ class HybridCacheController(BaseHiCacheController):
 
         kv_hit_pages = hit_result.kv_hit_pages
         operation.pool_storage_result.update_kv_hit_pages(kv_hit_pages)
+        operation.pool_storage_result.extra_pool_hit_pages.update(
+            hit_result.extra_pool_hit_pages
+        )
 
         return (
             hash_value[:kv_hit_pages],
             kv_hit_pages * self.page_size,
         )
+
+    def _cp_shared_follower_pool_result_counts(
+        self,
+        pool_transfers: Optional[list[PoolTransfer]],
+        page_count: int,
+    ) -> dict[str, int]:
+        if not self._cp_shared_hicache_skip_io():
+            return {}
+        return {transfer.name: page_count for transfer in pool_transfers or []}
 
     def move_hybrid_indices(
         self, operation: CacheOperation
@@ -651,16 +745,32 @@ class HybridCacheController(BaseHiCacheController):
                 operation.pool_transfers, operation.hash_value, kv_completed_pages
             )
             self._resolve_sidecar_derived_pool_transfers(operation)
-            results = self.storage_backend.batch_get_v2(operation.pool_transfers)
-            operation.pool_storage_result.update_extra_pool_hit_pages(results)
+            if self._cp_shared_hicache_skip_io():
+                result_counts = self._cp_shared_follower_pool_result_counts(
+                    operation.pool_transfers, kv_completed_pages
+                )
+            else:
+                results = self.storage_backend.batch_get_v2(operation.pool_transfers)
+                result_counts = {name: sum(rs) for name, rs in results.items()}
+            operation.pool_storage_result.extra_pool_hit_pages.update(
+                result_counts
+            )
         operation.pool_transfers_done = True
 
     def _page_backup(self, operation):
         # Backup extra pools
         if operation.pool_transfers:
             self._resolve_sidecar_derived_pool_transfers(operation)
-            results = self.storage_backend.batch_set_v2(operation.pool_transfers)
-            operation.pool_storage_result.update_extra_pool_hit_pages(results)
+            if self._cp_shared_hicache_skip_io():
+                result_counts = self._cp_shared_follower_pool_result_counts(
+                    operation.pool_transfers, len(operation.hash_value)
+                )
+            else:
+                results = self.storage_backend.batch_set_v2(operation.pool_transfers)
+                result_counts = {name: sum(rs) for name, rs in results.items()}
+            operation.pool_storage_result.extra_pool_hit_pages.update(
+                result_counts
+            )
 
         # Backup kv pools
         super()._page_backup(operation)

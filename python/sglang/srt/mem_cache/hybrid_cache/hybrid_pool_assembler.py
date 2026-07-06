@@ -9,6 +9,9 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     SidecarPoolSpec,
 )
+from sglang.srt.mem_cache.dsa_cp_shared import (
+    maybe_create_dsa_cp_shared_l2_allocator,
+)
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
@@ -57,6 +60,7 @@ def build_kv_host_pool(
     server_args: ServerArgs,
     use_mla: bool,
     override_kv_cache_dim: Optional[int] = None,
+    allocator=None,
 ):
     kv_host_pool_cls = (
         MLATokenToKVPoolHost if use_mla else get_mha_host_pool_cls(kv_pool)
@@ -64,6 +68,8 @@ def build_kv_host_pool(
     kwargs = {}
     if override_kv_cache_dim is not None:
         kwargs["override_kv_cache_dim"] = override_kv_cache_dim
+    if allocator is not None:
+        kwargs["allocator"] = allocator
     return kv_host_pool_cls(
         kv_pool,
         server_args.hicache_ratio,
@@ -583,6 +589,7 @@ def build_anchor_sidecar_stack(
     model_name: Optional[str] = None,
     storage_backend_extra_config: Optional[dict] = None,
     enable_storage_metrics: bool = False,
+    allocator=None,
 ) -> tuple[HostPoolGroup, HybridCacheController]:
     transfer_layer_num = len(full_layer_mapping)
     kv_host_pool = build_kv_host_pool(
@@ -591,6 +598,7 @@ def build_anchor_sidecar_stack(
         server_args=server_args,
         use_mla=use_mla,
         override_kv_cache_dim=override_kv_cache_dim,
+        allocator=allocator,
     )
     sidecar_host_pool = sidecar_host_pool_factory(kv_host_pool)
     entries = [
@@ -610,7 +618,12 @@ def build_anchor_sidecar_stack(
             transfer_layer_num=transfer_layer_num,
         ),
     ]
-    host_pool_group = HostPoolGroup(entries)
+    host_pool_group = HostPoolGroup(
+        entries,
+        enable_cp_shared_dsa_l2=allocator is not None,
+        owner_rank=0,
+        cp_rank=getattr(kv_pool, "cp_shared_cp_rank", 0),
+    )
     cache_controller = HybridCacheController(
         params.token_to_kv_pool_allocator,
         host_pool_group,
@@ -922,6 +935,18 @@ class _DsaStrategy(StackStrategy):
         full_kv_pool = kvcache
         use_mla = isinstance(kvcache, MLATokenToKVPool)
         full_layer_mapping = {i: i for i in range(full_kv_pool.layer_num)}
+        shared_allocator = maybe_create_dsa_cp_shared_l2_allocator(
+            params=params,
+            server_args=server_args,
+            kv_pool=full_kv_pool,
+            kind="dsa_l2_kv",
+        )
+        shared_indexer_allocator = maybe_create_dsa_cp_shared_l2_allocator(
+            params=params,
+            server_args=server_args,
+            kv_pool=full_kv_pool,
+            kind="dsa_l2_indexer",
+        )
         host_pool_group, cache_controller = build_anchor_sidecar_stack(
             params=params,
             server_args=server_args,
@@ -941,11 +966,13 @@ class _DsaStrategy(StackStrategy):
                 kv_host_pool,
                 server_args.hicache_mem_layout,
                 allocator_type=server_args.hicache_storage_backend,
+                allocator=shared_indexer_allocator,
             ),
             prefetch_threshold=prefetch_threshold,
             model_name=model_name,
             storage_backend_extra_config=storage_backend_extra_config,
             enable_storage_metrics=enable_storage_metrics,
+            allocator=shared_allocator,
         )
         return StackBuildResult(
             host_pool_group=host_pool_group,
@@ -1403,6 +1430,18 @@ def attach_hybrid_dsa_pool_to_hiradix_cache(
     try:
         kv = radix_cache.kv_cache
         layer_mapping = {layer_id: layer_id for layer_id in range(kv.layer_num)}
+        shared_allocator = maybe_create_dsa_cp_shared_l2_allocator(
+            params=params,
+            server_args=server_args,
+            kv_pool=kv,
+            kind="dsa_l2_kv",
+        )
+        shared_indexer_allocator = maybe_create_dsa_cp_shared_l2_allocator(
+            params=params,
+            server_args=server_args,
+            kv_pool=kv,
+            kind="dsa_l2_indexer",
+        )
         host_pool_group, cache_controller = build_anchor_sidecar_stack(
             params=params,
             server_args=server_args,
@@ -1424,10 +1463,12 @@ def attach_hybrid_dsa_pool_to_hiradix_cache(
                 kv_host_pool,
                 server_args.hicache_mem_layout,
                 allocator_type=server_args.hicache_storage_backend,
+                allocator=shared_indexer_allocator,
             ),
             model_name=server_args.served_model_name,
             storage_backend_extra_config=extra_config,
             enable_storage_metrics=enable_storage_metrics,
+            allocator=shared_allocator,
         )
         radix_cache.full_kv_pool_host = host_pool_group.get_pool(PoolName.KV)
         radix_cache.token_to_kv_pool_host = host_pool_group

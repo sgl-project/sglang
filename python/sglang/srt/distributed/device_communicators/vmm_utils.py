@@ -1,8 +1,11 @@
+import ctypes
 import logging
+import math
 import os
 import struct
 import time
-from typing import Any, List, Optional
+from dataclasses import dataclass
+from typing import Any, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -15,6 +18,16 @@ logger = logging.getLogger(__name__)
 _drv = None
 _FD_HEADER_BYTES = 24
 _FD_SEND_TIMEOUT_S = 120.0
+
+
+@dataclass
+class RankMajorSharedTensor:
+    global_view: torch.Tensor
+    local_view: torch.Tensor
+    local_pages: int
+    aligned_bytes_per_rank: int
+    handles: List[object]
+    refs: list
 
 
 def _get_cuda_driver():
@@ -375,6 +388,266 @@ def map_chunk_into_span(
         "cuMemSetAccess(span)",
     )
     check_drv(drv.cuMemRelease(imp_h), "cuMemRelease(span)")
+
+
+def _ceil_align(value: int, alignment: int) -> int:
+    return ((value + alignment - 1) // alignment) * alignment
+
+
+def _get_padded_first_dim_for_vmm(
+    local_shape: Tuple[int, ...],
+    *,
+    dtype: torch.dtype,
+    granularity: int,
+) -> Tuple[int, int]:
+    if not local_shape:
+        raise ValueError("local_shape must have at least one dimension")
+    row_elements = 1
+    for dim in local_shape[1:]:
+        row_elements *= int(dim)
+    row_bytes = row_elements * int(torch.empty((), dtype=dtype).element_size())
+    if row_bytes <= 0:
+        raise ValueError(f"invalid row bytes for local_shape={local_shape}")
+    rows_per_alignment = int(granularity) // math.gcd(int(granularity), row_bytes)
+    padded_first_dim = _ceil_align(int(local_shape[0]), rows_per_alignment)
+    aligned_bytes = padded_first_dim * row_bytes
+    return padded_first_dim, aligned_bytes
+
+
+def _dtype_to_dlpack(dtype: torch.dtype) -> Tuple[int, int]:
+    mapping = {
+        torch.uint8: (1, 8),
+        torch.int8: (0, 8),
+        torch.int32: (0, 32),
+        torch.float16: (2, 16),
+        torch.bfloat16: (4, 16),
+        torch.float32: (2, 32),
+    }
+    if hasattr(torch, "float8_e4m3fn"):
+        mapping[torch.float8_e4m3fn] = (2, 8)
+    try:
+        return mapping[dtype]
+    except KeyError as exc:
+        raise TypeError(f"unsupported VMM tensor dtype: {dtype}") from exc
+
+
+class _DLDevice(ctypes.Structure):
+    _fields_ = [("device_type", ctypes.c_int), ("device_id", ctypes.c_int)]
+
+
+class _DLDataType(ctypes.Structure):
+    _fields_ = [
+        ("code", ctypes.c_uint8),
+        ("bits", ctypes.c_uint8),
+        ("lanes", ctypes.c_uint16),
+    ]
+
+
+class _DLTensor(ctypes.Structure):
+    _fields_ = [
+        ("data", ctypes.c_void_p),
+        ("device", _DLDevice),
+        ("ndim", ctypes.c_int),
+        ("dtype", _DLDataType),
+        ("shape", ctypes.POINTER(ctypes.c_int64)),
+        ("strides", ctypes.POINTER(ctypes.c_int64)),
+        ("byte_offset", ctypes.c_uint64),
+    ]
+
+
+class _DLManagedTensor(ctypes.Structure):
+    pass
+
+
+_DELETER_FN = ctypes.CFUNCTYPE(None, ctypes.POINTER(_DLManagedTensor))
+_DLManagedTensor._fields_ = [
+    ("dl_tensor", _DLTensor),
+    ("manager_ctx", ctypes.c_void_p),
+    ("deleter", _DELETER_FN),
+]
+
+
+def _tensor_from_cuda_ptr(
+    ptr: int,
+    shape: Tuple[int, ...],
+    dtype: torch.dtype,
+    device_id: int,
+    refs: list,
+) -> torch.Tensor:
+    dl_code, dl_bits = _dtype_to_dlpack(dtype)
+    ndim = len(shape)
+    shape_arr = (ctypes.c_int64 * ndim)(*shape)
+
+    managed = _DLManagedTensor()
+    managed.dl_tensor.data = ctypes.c_void_p(ptr)
+    managed.dl_tensor.device = _DLDevice(2, device_id)
+    managed.dl_tensor.ndim = ndim
+    managed.dl_tensor.dtype = _DLDataType(dl_code, dl_bits, 1)
+    managed.dl_tensor.shape = shape_arr
+    managed.dl_tensor.strides = None
+    managed.dl_tensor.byte_offset = 0
+    managed.manager_ctx = None
+
+    @_DELETER_FN
+    def _deleter(_):
+        return None
+
+    managed.deleter = _deleter
+    refs.extend([managed, shape_arr, _deleter])
+
+    ctypes.pythonapi.PyCapsule_New.restype = ctypes.py_object
+    ctypes.pythonapi.PyCapsule_New.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_char_p,
+        ctypes.c_void_p,
+    ]
+    capsule = ctypes.pythonapi.PyCapsule_New(ctypes.byref(managed), b"dltensor", None)
+    tensor = torch.from_dlpack(capsule)
+    try:
+        tensor._sglang_vmm_refs = refs
+    except Exception:
+        pass
+    return tensor
+
+
+def create_rank_major_shared_tensor(
+    local_shape: Tuple[int, ...],
+    *,
+    dtype: torch.dtype,
+    cpu_group: ProcessGroup,
+) -> RankMajorSharedTensor:
+    """Create a rank-major shared VMM tensor across a process group."""
+    if not local_shape:
+        raise ValueError("local_shape must have at least one dimension")
+
+    drv = _get_cuda_driver()
+    rank = dist.get_rank(group=cpu_group)
+    world_size = dist.get_world_size(group=cpu_group)
+    device_id = torch.cuda.current_device()
+
+    FABRIC = drv.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
+    POSIX_FD = drv.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
+
+    prop = drv.CUmemAllocationProp()
+    prop.requestedHandleTypes = FABRIC
+    prop.type = drv.CUmemAllocationType.CU_MEM_ALLOCATION_TYPE_PINNED
+    prop.location = drv.CUmemLocation()
+    prop.location.type = drv.CUmemLocationType.CU_MEM_LOCATION_TYPE_DEVICE
+    prop.location.id = device_id
+    if hasattr(prop, "allocFlags") and hasattr(prop.allocFlags, "gpuDirectRDMACapable"):
+        prop.allocFlags.gpuDirectRDMACapable = 1
+
+    granularity = check_drv(
+        drv.cuMemGetAllocationGranularity(
+            prop,
+            drv.CUmemAllocationGranularity_flags.CU_MEM_ALLOC_GRANULARITY_RECOMMENDED,
+        ),
+        "cuMemGetAllocationGranularity",
+    )
+    padded_first_dim, aligned_bytes = _get_padded_first_dim_for_vmm(
+        local_shape, dtype=dtype, granularity=int(granularity)
+    )
+
+    err, local_handle = drv.cuMemCreate(aligned_bytes, prop, 0)
+    if not all_ranks_ok(cpu_group, err == drv.CUresult.CUDA_SUCCESS):
+        if err == drv.CUresult.CUDA_SUCCESS:
+            drv.cuMemRelease(local_handle)
+        prop.requestedHandleTypes = POSIX_FD
+        granularity = check_drv(
+            drv.cuMemGetAllocationGranularity(
+                prop,
+                drv.CUmemAllocationGranularity_flags.CU_MEM_ALLOC_GRANULARITY_RECOMMENDED,
+            ),
+            "cuMemGetAllocationGranularity(POSIX_FD)",
+        )
+        padded_first_dim, aligned_bytes = _get_padded_first_dim_for_vmm(
+            local_shape, dtype=dtype, granularity=int(granularity)
+        )
+        local_handle = check_drv(
+            drv.cuMemCreate(aligned_bytes, prop, 0),
+            "cuMemCreate(POSIX_FD)",
+        )
+    elif err != drv.CUresult.CUDA_SUCCESS:
+        raise RuntimeError(f"cuMemCreate(FABRIC): {err}")
+
+    posix_peer_fds = {}
+    local_posix_fds: List[int] = []
+    imported_handles: List[object] = []
+    mapped_handles: List[object] = []
+    try:
+        local_fabric_handles, local_posix_fds, use_fabric = export_shareable_handles(
+            [local_handle], cpu_group, rank
+        )
+        gathered_fabric_handles = [None for _ in range(world_size)]
+        if use_fabric:
+            dist.all_gather_object(
+                gathered_fabric_handles, local_fabric_handles[0], group=cpu_group
+            )
+        else:
+            posix_peer_fds = exchange_posix_fds(
+                cpu_group, rank, world_size, local_posix_fds, [1] * world_size
+            )
+
+        total_bytes = aligned_bytes * world_size
+        base_va = check_drv(
+            drv.cuMemAddressReserve(total_bytes, int(granularity), 0, 0),
+            "cuMemAddressReserve",
+        )
+        try:
+            for peer_rank in range(world_size):
+                offset = peer_rank * aligned_bytes
+                if peer_rank == rank:
+                    handle = local_handle
+                else:
+                    fd = None if use_fabric else posix_peer_fds[(peer_rank, 0)]
+                    handle = import_peer_handle(
+                        gathered_fabric_handles[peer_rank],
+                        fd,
+                        use_fabric=use_fabric,
+                        peer_rank=peer_rank,
+                    )
+                    imported_handles.append(handle)
+                check_drv(
+                    drv.cuMemMap(int(base_va) + offset, aligned_bytes, 0, handle, 0),
+                    f"cuMemMap(rank={peer_rank})",
+                )
+                mapped_handles.append(handle)
+                access = make_rw_access_desc(device_id)
+                check_drv(
+                    drv.cuMemSetAccess(
+                        int(base_va) + offset, aligned_bytes, [access], 1
+                    ),
+                    f"cuMemSetAccess(rank={peer_rank})",
+                )
+
+            global_shape = (world_size * padded_first_dim, *local_shape[1:])
+            refs: list = [local_handle, imported_handles, base_va]
+            global_view = _tensor_from_cuda_ptr(
+                int(base_va), global_shape, dtype, device_id, refs
+            )
+            local_view = global_view.narrow(
+                0, rank * padded_first_dim, padded_first_dim
+            )
+            return RankMajorSharedTensor(
+                global_view=global_view,
+                local_view=local_view,
+                local_pages=padded_first_dim,
+                aligned_bytes_per_rank=aligned_bytes,
+                handles=mapped_handles,
+                refs=refs,
+            )
+        except Exception:
+            for handle in imported_handles:
+                drv.cuMemRelease(handle)
+            raise
+    except Exception:
+        drv.cuMemRelease(local_handle)
+        raise
+    finally:
+        for fd in local_posix_fds:
+            os.close(fd)
+        for fd in posix_peer_fds.values():
+            os.close(fd)
 
 
 class VmmGraphInputManager:

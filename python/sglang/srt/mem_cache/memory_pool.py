@@ -58,10 +58,14 @@ from sglang.srt.mem_cache.layout.page_major import (
     mamba_entry_bytes,
     mha_entry_bytes,
 )
+from sglang.srt.mem_cache.shared_kv import SharedKVLayout
 from sglang.srt.mem_cache.triton_ops.cache_move import (
     copy_all_layer_kv_cache_tiled,
     set_kv_buffer_prefix_valid_tiled,
     store_cache_4d,
+)
+from sglang.srt.mem_cache.triton_ops.dsa_cp_shared import (
+    set_mla_kv_buffer_triton_cp_shared,
 )
 from sglang.srt.mem_cache.utils import (
     get_mla_kv_buffer_triton,
@@ -72,6 +76,7 @@ from sglang.srt.mem_cache.utils import (
 )
 from sglang.srt.platforms import current_platform
 from sglang.srt.utils import (
+    ceil_div,
     cpu_has_amx_support,
     is_cpu,
     is_cuda,
@@ -2618,6 +2623,7 @@ class MLATokenToKVPool(KVCache):
         end_layer: Optional[int] = None,
         use_dsa: bool = False,
         override_kv_cache_dim: Optional[int] = None,
+        enable_cp_shared_kvcache: bool = False,
     ):
         super().__init__(
             size,
@@ -2633,6 +2639,14 @@ class MLATokenToKVPool(KVCache):
         self.kv_lora_rank = kv_lora_rank
         self.qk_rope_head_dim = qk_rope_head_dim
         self.use_dsa = use_dsa
+        self.enable_cp_shared_kvcache = enable_cp_shared_kvcache
+        self.cp_shared_kv_buffer = []
+        self.cp_shared_kv_allocations = []
+        self.cp_shared_write_fence = None
+        self.cp_shared_pages_per_rank = 0
+        self.cp_shared_cp_rank = 0
+        self.cp_shared_cp_size = 1
+        self.cp_shared_layout: Optional[SharedKVLayout] = None
         self.dsa_kv_cache_store_fp8 = (
             use_dsa
             and dtype == torch.float8_e4m3fn
@@ -2665,22 +2679,97 @@ class MLATokenToKVPool(KVCache):
                 else nullcontext()
             ):
                 # The padded slot 0 is used for writing dummy outputs from padded tokens.
-                self.kv_buffer = [
-                    torch.zeros(
-                        (self.size + self.page_size, 1, self.kv_cache_dim),
-                        dtype=self.store_dtype,
-                        device=self.device,
-                    )
-                    for _ in range(self.layer_num)
-                ]
+                if self.enable_cp_shared_kvcache:
+                    self._create_cp_shared_buffers()
+                else:
+                    self.kv_buffer = [
+                        torch.zeros(
+                            (self.size + self.page_size, 1, self.kv_cache_dim),
+                            dtype=self.store_dtype,
+                            device=self.device,
+                        )
+                        for _ in range(self.layer_num)
+                    ]
+
+    def _create_cp_shared_buffers(self) -> None:
+        from sglang.srt.distributed.device_communicators.vmm_utils import (
+            create_rank_major_shared_tensor,
+        )
+        from sglang.srt.layers.dp_attention import (
+            get_attention_cp_group,
+            get_attention_cp_rank,
+            get_attention_cp_size,
+        )
+
+        self.cp_shared_cp_size = get_attention_cp_size()
+        assert self.cp_shared_cp_size > 1
+        self.cp_shared_cp_rank = get_attention_cp_rank()
+
+        num_slots = self.size + self.page_size
+        num_pages = ceil_div(num_slots, self.page_size)
+        self.cp_shared_pages_per_rank = ceil_div(num_pages, self.cp_shared_cp_size)
+        local_shape = (
+            self.cp_shared_pages_per_rank * self.page_size,
+            1,
+            self.kv_cache_dim,
+        )
+        cp_group = get_attention_cp_group()
+
+        self.kv_buffer = []
+        self.cp_shared_kv_buffer = []
+        self.cp_shared_kv_allocations = []
+        for _ in range(self.layer_num):
+            allocation = create_rank_major_shared_tensor(
+                local_shape,
+                dtype=self.store_dtype,
+                cpu_group=cp_group.cpu_group,
+            )
+            self.cp_shared_pages_per_rank = allocation.local_pages // self.page_size
+            self.kv_buffer.append(allocation.global_view)
+            self.cp_shared_kv_buffer.append(allocation.local_view)
+            self.cp_shared_kv_allocations.append(allocation)
+        self.cp_shared_layout = SharedKVLayout(
+            cp_size=self.cp_shared_cp_size,
+            slots_per_page=self.page_size,
+            pages_per_rank=self.cp_shared_pages_per_rank,
+        )
+        self.cp_shared_write_fence = torch.ones(
+            (1,), dtype=torch.int32, device=self.device
+        )
+
+        logger.info(
+            "DSA CP shared KV enabled: cp_rank=%s cp_size=%s pages_per_rank=%s "
+            "rank_major_padded=True",
+            self.cp_shared_cp_rank,
+            self.cp_shared_cp_size,
+            self.cp_shared_pages_per_rank,
+        )
 
     def _clear_buffers(self):
         del self.kv_buffer
+        if self.cp_shared_kv_buffer:
+            del self.cp_shared_kv_buffer
+        if self.cp_shared_write_fence is not None:
+            del self.cp_shared_write_fence
+
+    def _synchronize_cp_shared_kv_write(self) -> None:
+        if not self.enable_cp_shared_kvcache or self.cp_shared_write_fence is None:
+            return
+        from sglang.srt.layers.dp_attention import get_attention_cp_group
+
+        cp_group = get_attention_cp_group()
+        self.cp_shared_write_fence.fill_(1)
+        cp_group._all_reduce_in_place(self.cp_shared_write_fence)
 
     def get_kv_size_bytes(self):
         assert hasattr(self, "kv_buffer")
         kv_size_bytes = 0
-        for kv_cache in self.kv_buffer:
+        buffers = (
+            self.cp_shared_kv_buffer
+            if self.enable_cp_shared_kvcache and self.cp_shared_kv_buffer
+            else self.kv_buffer
+        )
+        for kv_cache in buffers:
             kv_size_bytes += get_tensor_size_bytes(kv_cache)
         return kv_size_bytes
 
@@ -2715,6 +2804,53 @@ class MLATokenToKVPool(KVCache):
 
     def get_kv_buffer(self, layer_id: int):
         return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
+
+    def _get_mla_write_buffer(self, layer_id: int) -> torch.Tensor:
+        if self.enable_cp_shared_kvcache:
+            return self.cp_shared_kv_buffer[layer_id - self.start_layer]
+        return self.kv_buffer[layer_id - self.start_layer]
+
+    def get_cp_shared_hicache_transfer_indices(
+        self,
+        host_indices: torch.Tensor,
+        device_indices: torch.Tensor,
+        *,
+        load_shared_l2: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if not self.enable_cp_shared_kvcache:
+            return host_indices, device_indices
+
+        assert self.cp_shared_layout is not None
+        if load_shared_l2:
+            return self.cp_shared_layout.select_host_to_device_indices(
+                host_indices,
+                device_indices,
+                owner_rank=self.cp_shared_cp_rank,
+            )
+
+        return self.cp_shared_layout.select_device_to_host_indices(
+            host_indices,
+            device_indices,
+            current_rank=self.cp_shared_cp_rank,
+        )
+
+    def synchronize_cp_shared_kv_write(self) -> None:
+        self._synchronize_cp_shared_kv_write()
+
+    def synchronize_cp_shared_hicache_transfer(self) -> None:
+        self._synchronize_cp_shared_kv_write()
+
+    def translate_loc_to_cp_shared_device(self, loc: torch.Tensor) -> torch.Tensor:
+        if not self.enable_cp_shared_kvcache:
+            return loc
+        assert self.cp_shared_layout is not None
+        return self.cp_shared_layout.translate_read_slots(loc).to(loc.dtype)
+
+    def translate_loc_to_cp_shared_device_int32(self, loc: torch.Tensor) -> torch.Tensor:
+        if not self.enable_cp_shared_kvcache:
+            return loc.to(torch.int32)
+        assert self.cp_shared_layout is not None
+        return self.cp_shared_layout.translate_read_slots(loc, output_dtype=torch.int32)
 
     def set_kv_buffer(
         self,
@@ -2754,12 +2890,14 @@ class MLATokenToKVPool(KVCache):
     ):
         maybe_detect_oob(loc, 0, self.size + self.page_size, "set_mla_kv_buffer (MLA)")
         layer_id = layer.layer_id
+        kv_buffer = self._get_mla_write_buffer(layer_id)
 
         if _is_hip and self.use_dsa and self.dtype == fp8_dtype:
             # HIP FP8 path uses raw MLA KV layout (nope + rope) without per-block scales.
             # Fuse BF16/FP16 -> FP8 cast with paged KV write.
+            assert not self.enable_cp_shared_kvcache
             set_mla_kv_buffer_triton_fp8_quant(
-                self.kv_buffer[layer_id - self.start_layer],
+                kv_buffer,
                 loc,
                 cache_k_nope,
                 cache_k_rope,
@@ -2776,12 +2914,23 @@ class MLATokenToKVPool(KVCache):
             # Reuse existing two-tensor write kernel (works with FP8 byte layout)
             # cache_k_nope_fp8: (num_tokens, 1, 528) uint8 [nope_fp8(512) | scales(16)]
             # cache_k_rope_fp8: (num_tokens, 1, 128) uint8 [rope_bf16_bytes(128)]
-            set_mla_kv_buffer_triton(
-                self.kv_buffer[layer_id - self.start_layer],
-                loc,
-                cache_k_nope_fp8,
-                cache_k_rope_fp8,
-            )
+            if self.enable_cp_shared_kvcache:
+                set_mla_kv_buffer_triton_cp_shared(
+                    kv_buffer,
+                    loc,
+                    cache_k_nope_fp8,
+                    cache_k_rope_fp8,
+                    cp_rank=self.cp_shared_cp_rank,
+                    cp_size=self.cp_shared_cp_size,
+                    slots_per_page=self.page_size,
+                )
+            else:
+                set_mla_kv_buffer_triton(
+                    kv_buffer,
+                    loc,
+                    cache_k_nope_fp8,
+                    cache_k_rope_fp8,
+                )
         else:
             if cache_k_nope.dtype != self.dtype:
                 cache_k_nope = cache_k_nope.to(self.dtype)
@@ -2790,12 +2939,23 @@ class MLATokenToKVPool(KVCache):
                 cache_k_nope = cache_k_nope.view(self.store_dtype)
                 cache_k_rope = cache_k_rope.view(self.store_dtype)
 
-            set_mla_kv_buffer_triton(
-                self.kv_buffer[layer_id - self.start_layer],
-                loc,
-                cache_k_nope,
-                cache_k_rope,
-            )
+            if self.enable_cp_shared_kvcache:
+                set_mla_kv_buffer_triton_cp_shared(
+                    kv_buffer,
+                    loc,
+                    cache_k_nope,
+                    cache_k_rope,
+                    cp_rank=self.cp_shared_cp_rank,
+                    cp_size=self.cp_shared_cp_size,
+                    slots_per_page=self.page_size,
+                )
+            else:
+                set_mla_kv_buffer_triton(
+                    kv_buffer,
+                    loc,
+                    cache_k_nope,
+                    cache_k_rope,
+                )
 
     def get_mla_kv_buffer(
         self,
@@ -2806,6 +2966,8 @@ class MLATokenToKVPool(KVCache):
         # get k nope and k rope from the kv buffer, and optionally cast them to dst_dtype.
         layer_id = layer.layer_id
         kv_buffer = self.get_key_buffer(layer_id)
+        if self.enable_cp_shared_kvcache:
+            loc = self.translate_loc_to_cp_shared_device(loc)
         dst_dtype = dst_dtype or self.dtype
         cache_k_nope = torch.empty(
             (loc.shape[0], 1, self.kv_lora_rank),
@@ -2831,6 +2993,23 @@ class MLATokenToKVPool(KVCache):
 
         tgt_loc_flat = tgt_loc.view(-1).long()
         src_loc_flat = src_loc.view(-1).long()
+        if self.enable_cp_shared_kvcache:
+            assert self.cp_shared_layout is not None
+            mask = self.cp_shared_layout.owned_slot_mask(
+                tgt_loc_flat, owner_rank=self.cp_shared_cp_rank
+            )
+            if not torch.any(mask):
+                return
+            local_tgt = self.cp_shared_layout.translate_write_slots(
+                tgt_loc_flat[mask]
+            ).to(tgt_loc_flat.dtype)
+            src = src_loc_flat[mask]
+            shared_src = self.translate_loc_to_cp_shared_device(src)
+            for local_kv_cache, global_kv_cache in zip(
+                self.cp_shared_kv_buffer, self.kv_buffer
+            ):
+                local_kv_cache[local_tgt] = global_kv_cache[shared_src]
+            return
         for kv_cache in self.kv_buffer:
             kv_cache[tgt_loc_flat] = kv_cache[src_loc_flat]
 
@@ -3022,6 +3201,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
         index_buf_size: Optional[int] = None,
+        enable_cp_shared_kvcache: bool = False,
     ):
         override_dim = (
             kv_cache_dim if kv_cache_dim != kv_lora_rank + qk_rope_head_dim else None
@@ -3040,6 +3220,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
             end_layer,
             use_dsa=True,
             override_kv_cache_dim=override_dim,
+            enable_cp_shared_kvcache=enable_cp_shared_kvcache,
         )
         # self.index_k_dtype = torch.float8_e4m3fn
         # self.index_k_scale_dtype = torch.float32
@@ -3088,7 +3269,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
         self._finalize_allocation_log(size)
 
     def _clear_buffers(self):
-        del self.kv_buffer
+        super()._clear_buffers()
         del self.index_k_with_scale_buffer
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):

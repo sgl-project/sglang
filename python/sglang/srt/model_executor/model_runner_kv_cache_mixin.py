@@ -35,6 +35,7 @@ from sglang.srt.mem_cache.allocator.swa import (
 from sglang.srt.mem_cache.common import get_req_to_token_extra_context_len
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
+from sglang.srt.mem_cache.dsa_cp_shared import should_enable_dsa_cp_shared_kvcache
 from sglang.srt.mem_cache.memory_pool import (
     DSATokenToKVPool,
     HybridLinearKVPool,
@@ -852,6 +853,13 @@ class ModelRunnerKVCacheMixin:
                 pool_kwargs["host_to_device_ratio"] = parse_hisparse_config(
                     self.server_args
                 ).host_to_device_ratio
+            else:
+                pool_kwargs["enable_cp_shared_kvcache"] = (
+                    should_enable_dsa_cp_shared_kvcache(
+                        enable_hisparse=self.enable_hisparse,
+                        enabled=self.server_args.enable_dsa_cp_shared_kv_cache,
+                    )
+                )
             self.token_to_kv_pool = PoolCls(
                 self.max_total_num_tokens,
                 page_size=self.page_size,
