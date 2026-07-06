@@ -1991,6 +1991,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         prefix_lens: torch.Tensor,
         new_seq_lens: torch.Tensor,
         positions: torch.Tensor,
+        target_logits: Optional[torch.Tensor] = None,
         ignore_mask: Optional[torch.Tensor] = None,
     ) -> None:
         if not self._accept_anomaly_enabled or commit_lens.numel() == 0:
@@ -2235,6 +2236,39 @@ class DSparkWorkerV2(BaseSpecWorker):
                     target_predict=target_cpu,
                     confidence=confidence_cpu,
                 )
+                if (
+                    markov_debug is not None
+                    and target_logits is not None
+                    and self._accept_anomaly_topk_enabled
+                ):
+                    try:
+                        draft_width = int(self.block_size)
+                        row_logits = target_logits.detach().view(
+                            bs, int(self.verify_stride), -1
+                        )[i, :draft_width]
+                        topk_k = min(5, int(row_logits.shape[-1]))
+                        topk_values, topk_ids = torch.topk(
+                            row_logits, k=topk_k, dim=-1
+                        )
+                        target_row = target_predict[i, :draft_width]
+                        candidate_row = candidates[i, 1 : 1 + draft_width]
+                        markov_debug["target_logits_topk_first"] = [
+                            {
+                                "step": int(step),
+                                "candidate": int(candidate_row[step]),
+                                "target": int(target_row[step]),
+                                "target_top_ids": [
+                                    int(x) for x in topk_ids[step].detach().cpu().tolist()
+                                ],
+                                "target_top_logits": [
+                                    float(x)
+                                    for x in topk_values[step].detach().cpu().tolist()
+                                ],
+                            }
+                            for step in range(draft_width)
+                        ]
+                    except Exception as e:
+                        markov_debug["target_logits_topk_error"] = str(e)
                 logger.warning(
                     "DSpark accept anomaly detected: dp_rank=%s tp_rank=%s "
                     "ep_rank=%s req_pool_idx=%s rid=%s zero_draft_streak=%s "
@@ -2789,6 +2823,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             prefix_lens=prefix_lens,
             new_seq_lens=new_seq_lens,
             positions=verify_positions,
+            target_logits=logits_output.next_token_logits,
             ignore_mask=transfer_warmup_mask,
         )
         if on_publish is not None:
