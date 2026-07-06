@@ -242,7 +242,7 @@ if [[ "$MODEL_PREFIX" == "dsv4flash" ]]; then
     echo "Enabling DSV4 Flash PD KV transfer-window diagnostics"
     DSV4_DEBUG_PROBE_ONLY=1
     DSV4_ENV+=(
-      -e SGLANG_DSV4_DISABLE_C128_STATE_PD=1
+      -e SGLANG_DSV4_DISABLE_C128_STATE_PD=0
       -e SGLANG_DSV4_TRACE_STATE_PD=1
       -e SGLANG_DSV4_TRACE_KV_PD=1
       -e SGLANG_DSV4_TRACE_KV_PD_TARGET_LEN=7345537024
