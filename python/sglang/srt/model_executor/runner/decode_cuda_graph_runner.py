@@ -420,15 +420,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         else:
             cuda_graph_bs = forward_batch.batch_size
 
-        graph_key = cuda_graph_bs
-        if self.enable_pdmux:
-            graph_key = f"{get_current_stream_idx()}_{cuda_graph_bs}"
-
-        is_bs_supported = (
-            self.backend.can_run(forward_batch, graph_key)
-            if self.disable_padding
-            else cuda_graph_bs <= self.max_bs
-        )
+        if self.disable_padding:
+            stream_idx = get_current_stream_idx() if self.enable_pdmux else None
+            variant_label = self._resolve_lora_variant(forward_batch)
+            graph_key = self._make_graph_key(cuda_graph_bs, stream_idx, variant_label)
+            is_bs_supported = self.backend.can_run(forward_batch, graph_key)
+        else:
+            is_bs_supported = cuda_graph_bs <= self.max_bs
 
         if self.require_mlp_sync:
             is_bs_supported = is_bs_supported and forward_batch.can_run_dp_cuda_graph

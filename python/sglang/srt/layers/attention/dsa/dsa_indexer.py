@@ -6,6 +6,7 @@ from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import torch
+import torch.nn.functional as F
 from einops import rearrange
 
 from sglang.jit_kernel.fused_store_index_cache import (
@@ -106,6 +107,7 @@ if TYPE_CHECKING:
 
 
 DUAL_STREAM_TOKEN_THRESHOLD = 1024 if _is_cuda else 0
+_arange_cache: Dict[Tuple[int, torch.device], torch.Tensor] = {}
 GRAPH_WEIGHTS_PROJ_LORA_ERROR = (
     "DSA indexer weights_proj LoRA is incompatible with "
     "piecewise/breakable CUDA graph; remove the explicit "
@@ -144,6 +146,93 @@ def _uses_dsa_attention_backend(forward_batch: ForwardBatch) -> bool:
         backend_name = prefill_backend
 
     return backend_name in ("dsa", "nsa")
+
+
+def _fp8_paged_mqa_logits_torch(
+    q_fp8: torch.Tensor,
+    kv_cache_fp8: torch.Tensor,
+    weights: torch.Tensor,
+    seqlens: torch.Tensor,
+    block_tables: torch.Tensor,
+    max_seq_len: int,
+) -> torch.Tensor:
+    """Graph-capturable FP8 paged-MQA logits reference for CUDA graph fallback."""
+    batch_size, _, num_heads, head_dim = q_fp8.shape
+    block_size = kv_cache_fp8.shape[1]
+    assert head_dim == 128
+    assert block_size == 64
+    assert q_fp8.shape == (batch_size, 1, num_heads, head_dim)
+    assert kv_cache_fp8.shape[1:] == (block_size, 1, head_dim + 4)
+    assert weights.shape == (batch_size, num_heads)
+    assert seqlens.shape == (batch_size,)
+
+    max_num_pages = block_tables.shape[1]
+    scale_offset = block_size * head_dim
+    total_dim = block_size * (head_dim + 4)
+
+    kv_cache_flat = kv_cache_fp8.view(-1, total_dim)
+    kv_gathered = kv_cache_flat[block_tables.clamp(min=0)]
+
+    kv_values_raw = kv_gathered[..., :scale_offset].contiguous()
+    kv_values = kv_values_raw.view(dtype=fp8_dtype).to(torch.float32)
+    kv_values = kv_values.reshape(batch_size, max_num_pages * block_size, head_dim)
+
+    kv_scales_raw = kv_gathered[..., scale_offset:].contiguous()
+    kv_scales = kv_scales_raw.view(dtype=torch.float32)
+    kv_scales = kv_scales.reshape(batch_size, max_num_pages * block_size)
+
+    q_float = q_fp8[:, 0].to(torch.float32)
+    scores = torch.bmm(kv_values, q_float.transpose(1, 2))
+    scores = F.relu(scores)
+    scores = scores * weights.unsqueeze(1)
+    scores = scores.sum(dim=2)
+    scores = scores * kv_scales
+
+    padded_seq_len = max_num_pages * block_size
+    arange_key = (padded_seq_len, scores.device)
+    if arange_key not in _arange_cache:
+        _arange_cache[arange_key] = torch.arange(padded_seq_len, device=scores.device)
+    positions = _arange_cache[arange_key].unsqueeze(0)
+    scores = scores.masked_fill(positions >= seqlens.unsqueeze(1), 0.0)
+
+    if padded_seq_len < max_seq_len:
+        return F.pad(scores, (0, max_seq_len - padded_seq_len), value=0.0)
+    return scores[:, :max_seq_len]
+
+
+def _fp8_paged_mqa_logits_for_cuda_graph(
+    q_fp8: torch.Tensor,
+    kv_cache_fp8: torch.Tensor,
+    weights: torch.Tensor,
+    seqlens: torch.Tensor,
+    block_tables: torch.Tensor,
+    schedule_metadata: torch.Tensor,
+    max_seq_len: int,
+) -> torch.Tensor:
+    try:
+        from sglang.srt.layers.attention.dsa.tilelang_kernel import (
+            tilelang_fp8_paged_mqa_logits,
+        )
+    except ImportError:
+        return _fp8_paged_mqa_logits_torch(
+            q_fp8,
+            kv_cache_fp8,
+            weights,
+            seqlens,
+            block_tables,
+            max_seq_len,
+        )
+
+    return tilelang_fp8_paged_mqa_logits(
+        q_fp8,
+        kv_cache_fp8,
+        weights,
+        seqlens,
+        block_tables,
+        schedule_metadata,
+        max_seq_len,
+        clean_logits=False,
+    )
 
 
 if _is_cuda:
@@ -882,6 +971,16 @@ class Indexer(MultiPlatformOp):
                 max_seq_len,
                 Preshuffle=_use_aiter_preshuffle,
                 KVBlockSize=block_kv,
+            )
+        elif get_is_capture_mode():
+            logits = _fp8_paged_mqa_logits_for_cuda_graph(
+                q_fp8[:q_offset].unsqueeze(1),
+                kv_cache_fp8,
+                weights[:q_offset],
+                seqlens_32_2d.reshape(-1),
+                block_tables,
+                schedule_metadata,
+                max_seq_len,
             )
         elif use_dg_native:
             # block_tables[::next_n] de-expands dsa_backend's repeat_interleave
