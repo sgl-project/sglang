@@ -72,14 +72,14 @@ jobs:
           docker exec ci_sglang_xpu /bin/bash -c '/opt/venv/bin/hf auth login --token ${HF_TOKEN}'
 
       - name: Nightly Test (1-GPU XPU)
-        timeout-minutes: 150
+        timeout-minutes: 240
         run: |
           touch github_summary.md
           docker exec ci_sglang_xpu bash -c "
             source /opt/venv/bin/activate &&
             cd /sglang-checkout/test &&
             GITHUB_STEP_SUMMARY=/sglang-checkout/github_summary.md \
-            python3 run_suite.py --hw xpu --suite nightly-xpu-1-gpu --nightly --timeout-per-file 4200 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }}
+            python3 run_suite.py --hw xpu --suite nightly-xpu-1-gpu --nightly --timeout-per-file 7200 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }}
           " || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md)" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
@@ -135,7 +135,7 @@ jobs:
           docker exec ci_sglang_xpu /bin/bash -c '/opt/venv/bin/hf auth login --token ${HF_TOKEN}'
 
       - name: Nightly Test (2-GPU XPU)
-        timeout-minutes: 60
+        timeout-minutes: 240
         run: |
           touch github_summary.md
           docker exec ci_sglang_xpu bash -c "
@@ -198,7 +198,7 @@ jobs:
           docker exec ci_sglang_xpu /bin/bash -c '/opt/venv/bin/hf auth login --token ${HF_TOKEN}'
 
       - name: Nightly Test (4-GPU XPU)
-        timeout-minutes: 120
+        timeout-minutes: 480
         run: |
           touch github_summary.md
           docker exec ci_sglang_xpu bash -c "

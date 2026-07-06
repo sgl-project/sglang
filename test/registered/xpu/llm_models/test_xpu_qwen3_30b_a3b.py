@@ -30,6 +30,8 @@ class TestQwen3_30BA3BXPU(SimpleEvalGSM8KXPUMixin, CustomTestCase):
     # Intel XPU nightly runbook).
     env = {"SGLANG_USE_SGL_XPU": "1"}
 
+    # Server args mirror /data/pgirijal/scripts/run_upstream_key_models.sh
+    # accuracy_commands["Qwen/Qwen3-30B-A3B"].
     other_args = SimpleEvalGSM8KXPUMixin.other_args + [
         "--max-total-tokens",
         "65536",

@@ -26,9 +26,10 @@ class TestNemotron3Nano30BA3BXPU(SimpleEvalGSM8KXPUMixin, CustomTestCase):
     timeout_for_server_launch = 3600
     env = {"SGLANG_USE_SGL_XPU": "1"}
 
-    # Match the Intel XPU nightly runbook for this model:
-    # hybrid-mamba layout requires --model-impl sglang, a fixed page size,
-    # and the nemotron_3 reasoning / qwen3_coder tool-call parsers.
+    # Server args mirror /data/pgirijal/scripts/run_upstream_key_models.sh
+    # accuracy_commands["nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"].
+    # Hybrid-mamba layout requires --model-impl sglang, a fixed page size, and
+    # the nemotron_3 reasoning / qwen3_coder tool-call parsers.
     other_args = SimpleEvalGSM8KXPUMixin.other_args + [
         "--max-total-tokens",
         "65536",

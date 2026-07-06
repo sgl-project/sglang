@@ -29,9 +29,15 @@ class TestQwen3_5_9BXPU(SimpleEvalGSM8KXPUMixin, CustomTestCase):
     # wall clock but hurt GSM8K CoT accuracy (0.245 vs 0.60 baseline);
     # single-thread is required to match the reference score.
 
+    # Server args mirror /data/pgirijal/scripts/run_upstream_key_models.sh
+    # accuracy_commands["Qwen/Qwen3.5-9B"]. --disable-radix-cache /
+    # --disable-overlap-schedule / --dtype bfloat16 / --trust-remote-code /
+    # --attention-backend intel_xpu / --device xpu come from the mixin base.
     other_args = SimpleEvalGSM8KXPUMixin.other_args + [
         "--page-size",
         "128",
+        "--max-total-tokens",
+        "65536",
         "--mem-fraction-static",
         "0.85",
     ]

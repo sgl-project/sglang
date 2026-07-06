@@ -28,6 +28,8 @@ class TestQwen3_32BXPU(SimpleEvalGSM8KXPUMixin, CustomTestCase):
     # XPU 70B test's 1-hour budget.
     timeout_for_server_launch = 3600
 
+    # Server args mirror /data/pgirijal/scripts/run_upstream_key_models.sh
+    # accuracy_commands["Qwen/Qwen3-32B"].
     other_args = SimpleEvalGSM8KXPUMixin.other_args + [
         "--max-total-tokens",
         "65536",

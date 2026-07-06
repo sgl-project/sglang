@@ -26,12 +26,14 @@ class TestGemma4_26BA4BXPU(SimpleEvalGSM8KXPUMixin, CustomTestCase):
     timeout_for_server_launch = 3600
     env = {"SGLANG_USE_SGL_XPU": "1"}
 
-    # gemma-4 hybrid-attention kernels crash under chunked prefill on Intel
-    # XPU; disable it and set the page/mem-fraction combo validated by the
-    # Intel nightly runbook.
+    # Server args mirror /data/pgirijal/scripts/run_upstream_key_models.sh
+    # accuracy_commands["google/gemma-4-26B-A4B-it"]. Gemma-4 hybrid-attention
+    # kernels crash under chunked prefill on Intel XPU; keep --chunked-prefill-size -1.
     other_args = SimpleEvalGSM8KXPUMixin.other_args + [
         "--page-size",
         "64",
+        "--max-total-tokens",
+        "65536",
         "--mem-fraction-static",
         "0.9",
         "--chunked-prefill-size",
