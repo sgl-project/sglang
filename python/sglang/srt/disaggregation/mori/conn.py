@@ -1412,6 +1412,7 @@ class MoriKVSender(CommonKVSender):
         self._notify_lock = threading.Lock()
         self._notified_status: Optional[KVPoll] = None
         self._notified_reason: Optional[str] = None
+        self._transfer_start_time: Optional[float] = None
 
     def send(
         self,
@@ -1423,6 +1424,11 @@ class MoriKVSender(CommonKVSender):
         )
         if should_skip:
             return
+
+        if self._transfer_start_time is None and (
+            len(kv_indices) > 0 or state_indices is not None
+        ):
+            self._transfer_start_time = time.perf_counter()
 
         normalized_state = (
             _normalize_state_indices_per_component(state_indices)
@@ -1486,6 +1492,13 @@ class MoriKVSender(CommonKVSender):
             self._finalize_failure(self._collect_failure_reason())
             return
         if task.is_last_chunk:
+            if (
+                self._transfer_start_time is not None
+                and self._transfer_metric.transfer_latency_s is None
+            ):
+                self._transfer_metric.transfer_latency_s = (
+                    time.perf_counter() - self._transfer_start_time
+                )
             self._notify_decode(KVPoll.Success)
             with self._notify_lock:
                 if self.conclude_state is None:
@@ -1549,6 +1562,13 @@ class MoriKVSender(CommonKVSender):
             return sent_status
 
         if status == KVPoll.Success:
+            if (
+                self._transfer_start_time is not None
+                and self._transfer_metric.transfer_latency_s is None
+            ):
+                self._transfer_metric.transfer_latency_s = (
+                    time.perf_counter() - self._transfer_start_time
+                )
             self.conclude_state = KVPoll.Success
             return KVPoll.Success
 
