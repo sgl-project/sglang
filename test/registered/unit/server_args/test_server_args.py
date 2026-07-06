@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 
 import sglang.srt.server_args as server_args_module
 from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
+from sglang.srt.environ import envs
 from sglang.srt.layers.cp.base import is_cp_enabled, is_interleave
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -1410,6 +1411,61 @@ class TestTwoBatchOverlapBackend(CustomTestCase):
     def test_tbo_disabled_is_noop(self):
         args = self._args(enable_two_batch_overlap=False, enable_dp_attention=False)
         args._check_two_batch_overlap()
+
+
+class TestGrpcPortDerivation(CustomTestCase):
+    """gRPC port handling in _handle_deprecated_args (issue #29416)."""
+
+    def test_auto_derived_grpc_port(self):
+        # (port, expected grpc_port) — auto-derived branch (no SGLANG_GRPC_PORT).
+        # port <= 55535 -> port + 10000; higher ports fall back to port - 10000
+        # so the result stays in range and always differs from --port.
+        cases = [
+            (30000, 40000),  # normal: port + 10000
+            (55535, 65535),  # boundary: exactly 65535 via +10000
+            (60000, 50000),  # high port falls back to port - 10000
+            (65438, 55438),  # reporter's repro (was 75438 -> ValueError)
+            (65535, 55535),  # max port, no crash, differs from --port
+        ]
+        for port, expected in cases:
+            with self.subTest(port=port):
+                # Pin SGLANG_ENABLE_GRPC too so the test is hermetic: a runner
+                # with SGLANG_ENABLE_GRPC=1 must not change port derivation.
+                with envs.SGLANG_GRPC_PORT.override(
+                    None
+                ), envs.SGLANG_ENABLE_GRPC.override(False):
+                    server_args = ServerArgs(model_path="dummy", port=port)
+                    # __post_init__ returns early for dummy models before
+                    # _handle_deprecated_args() runs, so invoke it explicitly.
+                    server_args._handle_deprecated_args()
+                self.assertEqual(server_args.grpc_port, expected)
+                self.assertTrue(1 <= server_args.grpc_port <= 65535)
+                # Derived port must never collide with --port (see the
+                # grpc_port == port validation elsewhere in ServerArgs).
+                self.assertNotEqual(server_args.grpc_port, server_args.port)
+
+    def test_explicit_grpc_port_in_range_is_used(self):
+        with envs.SGLANG_GRPC_PORT.override(50000), envs.SGLANG_ENABLE_GRPC.override(
+            False
+        ):
+            server_args = ServerArgs(model_path="dummy", port=60000)
+            server_args._handle_deprecated_args()
+        # Explicit value wins; not derived from port.
+        self.assertEqual(server_args.grpc_port, 50000)
+
+    def test_explicit_grpc_port_out_of_range_still_raises(self):
+        # An explicit user-provided out-of-range port must NOT be silently
+        # clamped — it stays a loud error.
+        for bad_port in (70000, 0):
+            with self.subTest(grpc_port=bad_port):
+                with envs.SGLANG_GRPC_PORT.override(
+                    bad_port
+                ), envs.SGLANG_ENABLE_GRPC.override(False):
+                    server_args = ServerArgs(model_path="dummy", port=30000)
+                    # The out-of-range check lives in _handle_deprecated_args(),
+                    # which __post_init__ skips for dummy models.
+                    with self.assertRaises(ValueError):
+                        server_args._handle_deprecated_args()
 
 
 if __name__ == "__main__":
