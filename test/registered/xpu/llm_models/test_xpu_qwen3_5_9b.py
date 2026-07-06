@@ -12,7 +12,7 @@ from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.xpu.simple_eval_gsm8k_xpu_mixin import SimpleEvalGSM8KXPUMixin
 
-register_xpu_ci(est_time=1200, suite="nightly-xpu-1-gpu", nightly=True)
+register_xpu_ci(est_time=4000, suite="nightly-xpu-1-gpu", nightly=True)
 
 
 @unittest.skipUnless(
@@ -23,10 +23,11 @@ class TestQwen3_5_9BXPU(SimpleEvalGSM8KXPUMixin, CustomTestCase):
     model = "Qwen/Qwen3.5-9B"
     tp_size = 1
     accuracy = 0.55
-    # TP=1 doesn't hit the Level Zero wedge the mixin guards against;
-    # single-thread ran ~21 s/q -> 200q blows the 40-min per-file budget.
-    # 4 concurrent streams keep the eval under the timeout.
-    num_threads = 4
+    # 200 questions @ ~21 s/q single-thread = ~70 min; the runner's
+    # per-file budget must cover this (see the 4200s --timeout-per-file
+    # in .github/workflows/nightly-test-intel.yml). num_threads=4 halved
+    # wall clock but hurt GSM8K CoT accuracy (0.245 vs 0.60 baseline);
+    # single-thread is required to match the reference score.
 
     other_args = SimpleEvalGSM8KXPUMixin.other_args + [
         "--page-size",

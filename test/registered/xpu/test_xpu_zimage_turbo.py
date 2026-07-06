@@ -47,6 +47,12 @@ XPU_ZIMAGE_CASES = [
             prompt="Doraemon is eating dorayaki",
             output_size="1024x1024",
         ),
+        # XPU has no perf/consistency baseline in
+        # multimodal_gen/test/server/perf_baselines/. CLIP-score guard below
+        # is the accuracy check; skip the CUDA-only latency/consistency ones.
+        run_perf_check=False,
+        run_consistency_check=False,
+        run_component_accuracy_check=False,
     ),
 ]
 
