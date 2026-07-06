@@ -581,15 +581,9 @@ export const Deployment = ({ config, benchmarks }) => {
     const SPEED_LABELS = [
       ["ttft_ms",                `TTFT (${pct})`,      "ms"],
       ["tpot_ms",                `TPOT (${pct})`,      "ms"],
-      // SemiAnalysis throughput/GPU = total(input+output)/elapsed/GPU. Stored
-      // `tokens_per_sec_per_gpu` is output-only/GPU, so × (isl+osl)/osl gives total.
-      ["tokens_per_sec_per_gpu", "throughput per gpu", "tok/s",
-        (m) => {
-          const v = m.tokens_per_sec_per_gpu;
-          const w = m.workload || {};
-          if (v == null || w.isl == null || w.osl == null || w.osl === 0) return null;
-          return Math.round(v * (w.isl + w.osl) / w.osl);
-        }],
+      // throughput per gpu = total(input+output)/elapsed/GPU (SemiAnalysis convention);
+      // stored directly in the benchmarks file (= output tok/s/GPU × (isl+osl)/osl).
+      ["tokens_per_sec_per_gpu", "throughput per gpu", "tok/s"],
       ["interactivity",          "interactivity",   "tokens/s/user",
         (m) => (m.tpot_ms != null && m.tpot_ms !== 0)
           ? Math.round((1000 / m.tpot_ms) * 10) / 10

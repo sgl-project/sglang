@@ -121,8 +121,8 @@ than restating.
 - **Latency percentile**: `config.latencyPercentile` (default `"P50"`, or `"Mean"`) matches the
   percentile the TTFT/TPOT values actually are — the card renders `TTFT (<pct>)`. (`"Mean"` is
   temporary — legacy data is being re-measured to P50.)
-- **Throughput convention**: stored `tokens_per_sec_per_gpu` is **output-only/GPU**; the engine
-  multiplies by `(isl+osl)/osl` to display the SemiAnalysis total/GPU. Flag values stored as total.
+- **Throughput convention**: `tokens_per_sec_per_gpu` is stored as **total (in+out)/GPU**
+  (SemiAnalysis) = `output tok/s/GPU × (isl+osl)/osl`, shown by the card as-is. Flag output-only values.
 - **Consistent accuracy harness across entries**: every value under one `accuracyLabels`
   column must be produced by the SAME harness — flag a page that, say, measures one
   platform's GSM8K with `few_shot_gsm8k --num-questions 200` and another's with
