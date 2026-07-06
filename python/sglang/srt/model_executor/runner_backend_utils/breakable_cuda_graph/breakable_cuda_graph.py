@@ -37,9 +37,12 @@ except ImportError:
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.cuda_utils import (
     checkCudaErrors,
 )
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import get_device_module, is_hip, is_xpu
 
 logger = logging.getLogger(__name__)
+
+_is_xpu = is_xpu()
+
 
 __all__ = [
     "eager_on_graph",
@@ -63,18 +66,18 @@ def _check_cuda_bindings():
 _current_capture_var: ContextVar["BreakableCUDAGraphCapture | None"] = ContextVar(
     "current_capture", default=None
 )
-_current_stream_var: ContextVar[torch.cuda.Stream | None] = ContextVar(
+_current_stream_var: ContextVar[torch.Stream | None] = ContextVar(
     "current_stream", default=None
 )
-_forked_streams_var: ContextVar[set[torch.cuda.Stream] | None] = ContextVar(
+_forked_streams_var: ContextVar[set[torch.Stream] | None] = ContextVar(
     "forked_streams", default=None
 )
 
 
-def get_current_stream(device: torch.device | None = None) -> torch.cuda.Stream:
+def get_current_stream(device: torch.device | None = None) -> torch.Stream:
     stream = _current_stream_var.get()
     if stream is None:
-        return torch.cuda.current_stream(device)
+        return get_device_module().current_stream(device)
     return stream
 
 
@@ -84,14 +87,14 @@ def _capture_status(stream_ptr: int) -> "rt.cudaStreamCaptureStatus":
     return status
 
 
-def _is_stream_capturing(stream: torch.cuda.Stream) -> bool:
-    # On ROCm/HIP, cuda-python is unavailable, so use the portable torch API
-    # (which maps to the HIP runtime). On NVIDIA, keep querying the CUDA runtime
-    # directly via cuda-python: torch.cuda.is_current_stream_capturing() has
-    # proven unreliable there, so we preserve the original behavior.
-    if is_hip():
-        with torch.cuda.stream(stream):
-            return torch.cuda.is_current_stream_capturing()
+def _is_stream_capturing(stream: torch.Stream) -> bool:
+    # On ROCm/HIP and XPU, cuda-python is unavailable, so use the portable torch
+    # API (which maps to the HIP / XPU runtime). On NVIDIA, keep querying the
+    # CUDA runtime directly via cuda-python: torch.cuda.is_current_stream_capturing()
+    # has proven unreliable there, so we preserve the original behavior.
+    if is_hip() or _is_xpu:
+        with get_device_module().stream(stream):
+            return get_device_module().is_current_stream_capturing()
     return (
         _capture_status(stream.cuda_stream)
         == rt.cudaStreamCaptureStatus.cudaStreamCaptureStatusActive
@@ -107,7 +110,7 @@ _hook_lock = threading.Lock()
 _hook_refcount = 0
 
 
-def _hooked_wait_stream(self: torch.cuda.Stream, other: torch.cuda.Stream):
+def _hooked_wait_stream(self: torch.Stream, other: torch.Stream):
     assert _original_wait_stream is not None
     forked = _forked_streams_var.get()
     if forked is None:
@@ -118,9 +121,9 @@ def _hooked_wait_stream(self: torch.cuda.Stream, other: torch.cuda.Stream):
         _original_wait_stream(self, other)
         return
 
-    cap_ptr = capturing.cuda_stream
-    is_self_cap = self is capturing or self.cuda_stream == cap_ptr
-    is_other_cap = other is capturing or other.cuda_stream == cap_ptr
+    cap_id = capturing.stream_id
+    is_self_cap = self is capturing or self.stream_id == cap_id
+    is_other_cap = other is capturing or other.stream_id == cap_id
 
     if is_self_cap and not is_other_cap:
         if not _is_stream_capturing(other):
@@ -138,8 +141,8 @@ def _install_wait_stream_hook():
     global _original_wait_stream, _hook_refcount
     with _hook_lock:
         if _hook_refcount == 0:
-            _original_wait_stream = torch.cuda.Stream.wait_stream
-            torch.cuda.Stream.wait_stream = _hooked_wait_stream  # type: ignore[assignment]
+            _original_wait_stream = get_device_module().Stream.wait_stream
+            get_device_module().Stream.wait_stream = _hooked_wait_stream  # type: ignore[assignment]
         _hook_refcount += 1
 
 
@@ -149,7 +152,7 @@ def _uninstall_wait_stream_hook():
         _hook_refcount -= 1
         if _hook_refcount == 0:
             assert _original_wait_stream is not None, "wait_stream hook not installed"
-            torch.cuda.Stream.wait_stream = _original_wait_stream  # type: ignore[assignment]
+            get_device_module().Stream.wait_stream = _original_wait_stream  # type: ignore[assignment]
             _original_wait_stream = None
 
 
@@ -270,7 +273,7 @@ class BreakableCUDAGraph:
         self._deduped_cuda_graph = deduped_cuda_graph
 
     def replay(self) -> None:
-        stream = torch.cuda.current_stream()
+        stream = get_device_module().current_stream()
         token = _current_stream_var.set(stream)
         try:
             for i, seg in enumerate(self._segments):
@@ -280,9 +283,7 @@ class BreakableCUDAGraph:
         finally:
             _current_stream_var.reset(token)
 
-    def _append_segment(
-        self, graph: torch.cuda.CUDAGraph, needs_instantiate: bool
-    ) -> None:
+    def _append_segment(self, graph, needs_instantiate: bool) -> None:
         if self._deduped_cuda_graph is not None:
             self._segments.append(self._deduped_cuda_graph.register(graph))
             return
@@ -306,7 +307,7 @@ class BreakableCUDAGraphCapture:
         self,
         cuda_graph: BreakableCUDAGraph,
         pool=None,
-        stream: torch.cuda.Stream | None = None,
+        stream: torch.Stream | None = None,
         capture_error_mode: str = "global",
     ):
         assert isinstance(
@@ -320,17 +321,17 @@ class BreakableCUDAGraphCapture:
         self._capture_token = None
         self._stream_token = None
         self._forked_token = None
-        self._current_graph: torch.cuda.CUDAGraph | None = None
+        self._current_graph = None
         self._current_graph_needs_instantiate = False
 
     def __enter__(self):
         _install_wait_stream_hook()
         if self._stream is not None:
-            self._stream_ctx = torch.cuda.stream(self._stream)
+            self._stream_ctx = get_device_module().stream(self._stream)
             self._stream_ctx.__enter__()
         self._capture_token = _current_capture_var.set(self)
         self._stream_token = _current_stream_var.set(
-            self._stream or torch.cuda.current_stream()
+            self._stream or get_device_module().current_stream()
         )
         self._forked_token = _forked_streams_var.set(set())
         self._begin_new_segment()
@@ -350,20 +351,27 @@ class BreakableCUDAGraphCapture:
         return False
 
     def _begin_new_segment(self) -> None:
+        graph_cls = torch.xpu.XPUGraph if _is_xpu else torch.cuda.CUDAGraph
         # keep_graph retains the raw graph for dedup; skip it on the plain path.
+        # Dedup is CUDA-only (it introspects the raw graph via cuda-python), so
+        # XPU always takes the plain path below.
         if self.cuda_graph._deduped_cuda_graph is not None:
             try:
-                graph = torch.cuda.CUDAGraph(keep_graph=True)
+                graph = graph_cls(keep_graph=True)
                 self._current_graph_needs_instantiate = True
             except TypeError:
-                graph = torch.cuda.CUDAGraph()
+                graph = graph_cls()
                 self._current_graph_needs_instantiate = False
         else:
-            graph = torch.cuda.CUDAGraph()
+            graph = graph_cls()
             self._current_graph_needs_instantiate = False
-        graph.capture_begin(
-            pool=self._pool, capture_error_mode=self._capture_error_mode
-        )
+        if _is_xpu:
+            # torch.xpu.XPUGraph.capture_begin takes only an optional pool.
+            graph.capture_begin(pool=self._pool)
+        else:
+            graph.capture_begin(
+                pool=self._pool, capture_error_mode=self._capture_error_mode
+            )
         self._current_graph = graph
 
     def _end_current_segment(self) -> None:

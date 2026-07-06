@@ -11,8 +11,12 @@ import unittest
 
 import torch
 
-from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.srt.utils import get_device, get_device_module, kill_process_tree
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_xpu_ci,
+)
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -25,6 +29,7 @@ from sglang.test.test_utils import (
 # CI Registration — large suite to fit the integration test's server startup.
 register_cuda_ci(est_time=79, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=200, suite="stage-c-test-large-8-gpu-amd-mi35x")
+register_xpu_ci(est_time=79, suite="stage-a-test-1-gpu-xpu")
 
 
 class TestBreakableCUDAGraphBasic(CustomTestCase):
@@ -32,8 +37,8 @@ class TestBreakableCUDAGraphBasic(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        if not torch.cuda.is_available():
-            raise unittest.SkipTest("CUDA not available")
+        if not get_device_module().is_available():
+            raise unittest.SkipTest(f"{get_device()} not available")
 
         from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
             BreakableCUDAGraph,
@@ -44,7 +49,7 @@ class TestBreakableCUDAGraphBasic(CustomTestCase):
         cls.BreakableCUDAGraph = BreakableCUDAGraph
         cls.BreakableCUDAGraphCapture = BreakableCUDAGraphCapture
         cls.eager_on_graph = staticmethod(eager_on_graph)
-        cls.device = torch.device("cuda:0")
+        cls.device = torch.device(f"{get_device()}:0")
 
     def test_no_break_capture_replay(self):
         """Capture and replay without any graph breaks should work like normal CUDA graph."""
@@ -52,14 +57,14 @@ class TestBreakableCUDAGraphBasic(CustomTestCase):
         y = torch.zeros(4, device=self.device)
 
         graph = self.BreakableCUDAGraph()
-        stream = torch.cuda.Stream(self.device)
+        stream = get_device_module().Stream(self.device)
         with self.BreakableCUDAGraphCapture(graph, stream=stream):
             y.copy_(x + 1.0)
 
         # Replay with new input
         x.fill_(5.0)
         graph.replay()
-        torch.cuda.synchronize()
+        get_device_module().synchronize()
         self.assertTrue(torch.allclose(y, torch.full((4,), 6.0, device=self.device)))
 
     def test_single_break(self):
@@ -73,7 +78,7 @@ class TestBreakableCUDAGraphBasic(CustomTestCase):
             return src * 2.0
 
         graph = self.BreakableCUDAGraph()
-        stream = torch.cuda.Stream(self.device)
+        stream = get_device_module().Stream(self.device)
         with self.BreakableCUDAGraphCapture(graph, stream=stream):
             intermediate.copy_(x + 1.0)
             broken = eager_op(intermediate)
@@ -82,7 +87,7 @@ class TestBreakableCUDAGraphBasic(CustomTestCase):
         # Replay with new input
         x.fill_(10.0)
         graph.replay()
-        torch.cuda.synchronize()
+        get_device_module().synchronize()
         # x=10 -> intermediate=11 -> eager: 11*2=22 -> y=22+3=25
         self.assertTrue(torch.allclose(y, torch.full((4,), 25.0, device=self.device)))
 
@@ -100,7 +105,7 @@ class TestBreakableCUDAGraphBasic(CustomTestCase):
             return src * 2.0
 
         graph = self.BreakableCUDAGraph()
-        stream = torch.cuda.Stream(self.device)
+        stream = get_device_module().Stream(self.device)
         with self.BreakableCUDAGraphCapture(graph, stream=stream):
             t1 = x + 1.0  # graph segment 1
             t2 = add_one(t1)  # break 1: eager
@@ -111,7 +116,7 @@ class TestBreakableCUDAGraphBasic(CustomTestCase):
         # Replay: x=5 -> +1=6 -> add_one=7 -> +1=8 -> double=16
         x.fill_(5.0)
         graph.replay()
-        torch.cuda.synchronize()
+        get_device_module().synchronize()
         self.assertTrue(torch.allclose(y, torch.full((4,), 16.0, device=self.device)))
 
     def test_eager_on_graph_disabled(self):
@@ -151,7 +156,7 @@ class TestBreakableCUDAGraphBasic(CustomTestCase):
             return src * 3.0
 
         graph = self.BreakableCUDAGraph()
-        stream = torch.cuda.Stream(self.device)
+        stream = get_device_module().Stream(self.device)
         with self.BreakableCUDAGraphCapture(graph, stream=stream):
             t = x + 1.0
             t2 = scale(t)
@@ -159,13 +164,13 @@ class TestBreakableCUDAGraphBasic(CustomTestCase):
 
         # First replay: x=0 -> 0+1=1 -> 1*3=3
         graph.replay()
-        torch.cuda.synchronize()
+        get_device_module().synchronize()
         self.assertTrue(torch.allclose(y, torch.full((4,), 3.0, device=self.device)))
 
         # Second replay: x=10 -> 10+1=11 -> 11*3=33
         x.fill_(10.0)
         graph.replay()
-        torch.cuda.synchronize()
+        get_device_module().synchronize()
         self.assertTrue(torch.allclose(y, torch.full((4,), 33.0, device=self.device)))
 
     def test_eager_output_is_held_strongly_for_replay_bridge(self):
@@ -196,15 +201,15 @@ class TestCopyOutput(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        if not torch.cuda.is_available():
-            raise unittest.SkipTest("CUDA not available")
+        if not get_device_module().is_available():
+            raise unittest.SkipTest(f"{get_device()} not available")
 
         from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
             _copy_output,
         )
 
         cls._copy_output = staticmethod(_copy_output)
-        cls.device = torch.device("cuda:0")
+        cls.device = torch.device(f"{get_device()}:0")
 
     def test_tensor_copy(self):
         dst = torch.zeros(4, device=self.device)
@@ -254,8 +259,8 @@ class TestBreakGraphHelper(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        if not torch.cuda.is_available():
-            raise unittest.SkipTest("CUDA not available")
+        if not get_device_module().is_available():
+            raise unittest.SkipTest(f"{get_device()} not available")
 
         from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
             BreakableCUDAGraph,
@@ -266,7 +271,7 @@ class TestBreakGraphHelper(CustomTestCase):
         cls.BreakableCUDAGraph = BreakableCUDAGraph
         cls.BreakableCUDAGraphCapture = BreakableCUDAGraphCapture
         cls.break_graph = staticmethod(break_graph)
-        cls.device = torch.device("cuda:0")
+        cls.device = torch.device(f"{get_device()}:0")
 
     def test_break_graph_inserts_segment(self):
         """break_graph() should insert a graph break even though it does nothing."""
@@ -274,7 +279,7 @@ class TestBreakGraphHelper(CustomTestCase):
         y = torch.zeros(4, device=self.device)
 
         graph = self.BreakableCUDAGraph()
-        stream = torch.cuda.Stream(self.device)
+        stream = get_device_module().Stream(self.device)
         with self.BreakableCUDAGraphCapture(graph, stream=stream):
             t = x + 1.0
             self.break_graph()
@@ -282,7 +287,7 @@ class TestBreakGraphHelper(CustomTestCase):
 
         x.fill_(10.0)
         graph.replay()
-        torch.cuda.synchronize()
+        get_device_module().synchronize()
         # x=10 -> +1=11 -> break -> +2=13
         self.assertTrue(torch.allclose(y, torch.full((4,), 13.0, device=self.device)))
 
