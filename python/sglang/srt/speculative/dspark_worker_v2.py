@@ -2158,9 +2158,8 @@ class DSparkWorkerV2(BaseSpecWorker):
                 torch.inference_mode(),
             ):
                 row_hidden = block_hidden[row_idx : row_idx + 1]
-                row_hidden_for_logits = self._draft_inner.shared_head.norm(row_hidden)
                 base_logits = _compute_full_vocab_logits(
-                    row_hidden_for_logits, self.draft_model.lm_head
+                    row_hidden, self.draft_model.lm_head
                 )
                 markov_head = self._draft_inner.markov_head
                 candidate_row = candidates[row_idx]
