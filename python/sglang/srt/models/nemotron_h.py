@@ -260,11 +260,9 @@ class NemotronHMoE(nn.Module):
         )
 
     def _apply_fc1_latent_proj(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return linear_with_fused_a_gemm(
-            self.fc1_latent_proj,
-            hidden_states,
-            enabled=self.use_min_latency_fc1_gemm,
-        )
+        if self.use_min_latency_fc1_gemm:
+            return linear_with_fused_a_gemm(self.fc1_latent_proj, hidden_states)
+        return self.fc1_latent_proj(hidden_states)[0]
 
     def _forward_core(
         self,

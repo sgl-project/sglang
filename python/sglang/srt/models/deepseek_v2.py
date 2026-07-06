@@ -1977,11 +1977,11 @@ class DeepseekV2AttentionMLA(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ):
         assert self.q_lora_rank is not None
-        return linear_with_fused_a_gemm(
-            self.fused_qkv_a_proj_with_mqa,
-            hidden_states,
-            enabled=self.use_min_latency_fused_a_gemm,
-        )
+        if self.use_min_latency_fused_a_gemm:
+            return linear_with_fused_a_gemm(
+                self.fused_qkv_a_proj_with_mqa, hidden_states
+            )
+        return self.fused_qkv_a_proj_with_mqa(hidden_states)[0]
 
     def rebuild_cp_kv_cache(self, latent_cache, forward_batch, k_nope, k_pe):
         # support allgather+rerrange
