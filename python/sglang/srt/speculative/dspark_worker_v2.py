@@ -230,6 +230,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._last_draft_block_ids_debug: Optional[list[int]] = None
         self._last_context_kv_path_debug: Optional[str] = None
         self._boundary_debug_by_req_pool: dict[int, dict] = {}
+        self._target_aux_debug_by_req_pool: dict[int, dict] = {}
         self._stacked_wqkv_fp8_proj = None
         self._stacked_wqkv_kv_offsets: list[tuple[int, int]] = []
         self._stacked_wqkv_out_sizes: list[int] = []
@@ -1179,6 +1180,69 @@ class DSparkWorkerV2(BaseSpecWorker):
             ],
         }
 
+    def _target_aux_payload(
+        self,
+        *,
+        raw_hidden_rows: torch.Tensor,
+        projected_rows: torch.Tensor,
+    ) -> Optional[dict]:
+        if (
+            raw_hidden_rows is None
+            or projected_rows is None
+            or raw_hidden_rows.numel() == 0
+            or projected_rows.numel() == 0
+        ):
+            return None
+        target_layer_ids = list(getattr(self._draft_inner, "target_layer_ids", []) or [])
+        hidden_size = int(getattr(self._draft_inner, "hidden_size", 0))
+        raw = raw_hidden_rows.detach()
+        payload = {
+            "target_layer_ids": [int(x) for x in target_layer_ids],
+            "raw": self._summarize_hidden_rows(raw),
+            "projected": self._summarize_hidden_rows(projected_rows.detach()),
+        }
+        if target_layer_ids and hidden_size > 0 and raw.shape[-1] == (
+            len(target_layer_ids) * hidden_size
+        ):
+            raw_layers = raw.reshape(raw.shape[0], len(target_layer_ids), hidden_size)
+            payload["raw_layers"] = [
+                {
+                    "layer_id": int(layer_id),
+                    "hidden": self._summarize_hidden_rows(raw_layers[:, i, :]),
+                }
+                for i, layer_id in enumerate(target_layer_ids)
+            ]
+        else:
+            payload["expected_raw_width"] = int(len(target_layer_ids) * hidden_size)
+        return payload
+
+    def _record_target_aux_debug(
+        self,
+        *,
+        req_pool_idx: int,
+        stage: str,
+        raw_hidden_rows: torch.Tensor,
+        projected_rows: torch.Tensor,
+    ) -> None:
+        if not self._accept_anomaly_enabled or not self._is_tp0():
+            return
+        try:
+            payload = self._target_aux_payload(
+                raw_hidden_rows=raw_hidden_rows.to(device=self.device),
+                projected_rows=projected_rows.to(device=self.device),
+            )
+            if payload is None:
+                return
+            debug = self._target_aux_debug_by_req_pool.setdefault(
+                int(req_pool_idx), {}
+            )
+            debug[stage] = payload
+        except Exception as e:
+            debug = self._target_aux_debug_by_req_pool.setdefault(
+                int(req_pool_idx), {}
+            )
+            debug[stage] = {"error": str(e)}
+
     def _boundary_loc_payload(
         self,
         *,
@@ -1322,6 +1386,9 @@ class DSparkWorkerV2(BaseSpecWorker):
                 "swa_first8": [int(x) for x in swa_locs[:8].detach().cpu().tolist()],
                 "swa_last8": [int(x) for x in swa_locs[-8:].detach().cpu().tolist()],
                 "boundary_debug": self._boundary_debug_by_req_pool.get(
+                    int(req_pool_idx)
+                ),
+                "target_aux_debug": self._target_aux_debug_by_req_pool.get(
                     int(req_pool_idx)
                 ),
                 "context_kv_checksums": [
@@ -2380,6 +2447,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                     take_start = max(offset, next_offset - 8)
                     req_pool_idx = int(model_worker_batch.req_pool_indices[i])
                     self._boundary_debug_by_req_pool[req_pool_idx] = {}
+                    self._target_aux_debug_by_req_pool[req_pool_idx] = {}
                     self._record_boundary_debug(
                         req_pool_idx=req_pool_idx,
                         stage="prefill_tail_source",
@@ -2392,6 +2460,14 @@ class DSparkWorkerV2(BaseSpecWorker):
                             "extend_len": int(extend_len),
                             "post_seq_len": int(model_worker_batch.seq_lens[i]),
                         },
+                    )
+                    self._record_target_aux_debug(
+                        req_pool_idx=req_pool_idx,
+                        stage="prefill_tail_aux",
+                        raw_hidden_rows=logits_output.hidden_states[
+                            take_start:next_offset
+                        ],
+                        projected_rows=main_x[take_start:next_offset],
                     )
                 offset = next_offset
         self._materialize_main_hidden_to_draft_state(
@@ -2659,6 +2735,12 @@ class DSparkWorkerV2(BaseSpecWorker):
                             "prefix_len": int(prefix_lens[i]),
                             "new_seq_len": int(new_seq_lens[i]),
                         },
+                    )
+                    self._record_target_aux_debug(
+                        req_pool_idx=int(req_pool_indices[i]),
+                        stage="decode_verify_aux",
+                        raw_hidden_rows=hidden[i, take],
+                        projected_rows=main_x_2d[i, take],
                     )
         self._maybe_log_accept_anomaly(
             model_worker_batch=model_worker_batch,
