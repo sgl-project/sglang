@@ -97,7 +97,10 @@ class HiSparseTokenToKVPoolAllocator(HiSparseDemotionMixin, BaseTokenToKVPoolAll
         return self._size_full
 
     def available_size(self) -> int:
-        return self.logical_attn_allocator.available_size()
+        return min(
+            self.logical_attn_allocator.available_size(),
+            self.hisparse_attn_allocator.available_size(),
+        )
 
     def get_kvcache(self):
         return self._kvcache
@@ -108,8 +111,6 @@ class HiSparseTokenToKVPoolAllocator(HiSparseDemotionMixin, BaseTokenToKVPoolAll
                 "HiSparse generic allocation is only supported for page_size=1. "
                 "Use alloc_extend for paged allocation."
             )
-        if need_size > self.logical_attn_allocator.available_size():
-            return None
         if not self._ensure_hisparse_available(need_size):
             return None
 
@@ -384,7 +385,10 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(
         return self.logical_attn_allocator.translate_loc_from_full_to_swa(kv_indices)
 
     def full_available_size(self):
-        return self.logical_attn_allocator.full_available_size()
+        return min(
+            self.logical_attn_allocator.full_available_size(),
+            self.hisparse_attn_allocator.available_size() * self.compress_ratio,
+        )
 
     def swa_available_size(self):
         return self.logical_attn_allocator.swa_available_size()
@@ -393,7 +397,10 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(
         self.logical_attn_allocator.free_swa(free_indices)
 
     def available_size(self) -> int:
-        return self.logical_attn_allocator.available_size()
+        return min(
+            self.logical_attn_allocator.available_size(),
+            self.hisparse_attn_allocator.available_size() * self.compress_ratio,
+        )
 
     def alloc(self, need_size: int):
         raise NotImplementedError(
