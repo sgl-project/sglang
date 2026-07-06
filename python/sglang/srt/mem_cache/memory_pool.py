@@ -381,6 +381,34 @@ class MambaPool:
         intermediate_ssm: Optional[torch.Tensor]
         intermediate_conv_window: List[torch.Tensor]
 
+    def _detect_conv_window_axis(
+        self, conv_state_shape: List[Tuple[int, int]], win_len: int
+    ) -> int:
+        """Prefer GDN's trailing axis when both match; mixed layer layouts cannot
+        share one overlapping conv-window buffer.
+        """
+        axis = None
+        for conv_shape in conv_state_shape:
+            if conv_shape[-1] == win_len:
+                shape_axis = len(conv_shape) - 1
+            elif conv_shape[0] == win_len:
+                shape_axis = 0
+            else:
+                raise ValueError(
+                    f"conv_state shape {conv_shape} has no axis of length "
+                    f"conv_kernel-1={win_len}; cannot build the deduplicated "
+                    "sliding-window conv-intermediate view."
+                )
+            if axis is None:
+                axis = shape_axis
+            elif axis != shape_axis:
+                raise ValueError(
+                    "inconsistent conv-window axis across conv shapes "
+                    f"{conv_state_shape}; a single conv_window_axis cannot serve "
+                    "mixed layouts."
+                )
+        return axis
+
     def _allocate_deduplicated_conv_window(
         self,
         *,
@@ -676,6 +704,22 @@ class MambaPool:
                 )
                 self._intermediate_conv_window_phys = []
                 if dedup_conv_window:
+                    # The sliding window is the (K-1)-wide axis; the other conv
+                    # axis is the independent channel axis. Different backends
+                    # order these two axes differently in their conv_state:
+                    #   GDN  -> (channel, K-1)  (channel-major)
+                    #   KDA  -> (K-1, channel)  (window-major, axes swapped in
+                    #           KimiLinearStateShape.create)
+                    # Detect the window axis by its length (conv_kernel - 1)
+                    # rather than assuming a fixed position, so the dedup view's
+                    # last two dims keep the SAME order as conv_state. That keeps
+                    # the shared sliding buffer built over the true K-1 window
+                    # axis (not the channel axis) for both layouts, and lets the
+                    # layout-agnostic scatter/commit read it through strides.
+                    win_len = cache_params.shape.conv_kernel - 1
+                    self.conv_window_axis = self._detect_conv_window_axis(
+                        conv_state_shape, win_len
+                    )
                     intermediate_conv_window_cache = []
                     for conv_shape in conv_state_shape:
                         phys, view = self._allocate_deduplicated_conv_window(

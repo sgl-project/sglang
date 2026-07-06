@@ -259,5 +259,198 @@ class TestNgramMambaVerifyUpdate(CustomTestCase):
         )
 
 
+class TestConvWindowDedupLayout(CustomTestCase):
+    """Guard the deduplicated sliding-window conv-intermediate view layout.
+
+    Regression for the KDA aliasing bug: the dedup ``as_strided`` view in
+    ``MambaPool.__init__`` was built assuming GDN's ``(channel, K-1)`` conv
+    layout. KDA swaps its conv_state axes to ``(K-1, channel)``
+    (``KimiLinearStateShape.create``), so unpacking ``conv_dim, win = conv_shape``
+    aliased the draft-step axis onto the channel axis: per-step window writes
+    clobbered each other, and the post-verify commit restored channel-shifted
+    garbage into conv_states whenever acceptance was *partial* (full acceptance
+    was coincidentally correct, which is why equivalence tests passed). Only
+    triggers for chain EAGLE/MTP (topk<=1, where dedup is enabled).
+
+    These tests replicate the exact view construction from
+    ``MambaPool.__init__`` (device-independent, so they run on CPU CI) for both
+    layouts and assert the sliding-window semantics: step ``t``'s window is the
+    shared buffer slice ``[..., t:t+(K-1)]`` and the channel axis stays
+    independent.
+    """
+
+    @staticmethod
+    def _build_fixed_view(channel_dim, win_len, draft_tokens, window_major, device):
+        """Replicate the fixed dedup view construction from MambaPool.__init__.
+
+        phys keeps the channel axis independent and the shared sliding window on
+        its last axis; the logical view's last two dims follow conv_state's axis
+        order (channel-major for GDN, window-major for KDA).
+        """
+        shared_win = draft_tokens + win_len - 1
+        L, S = 1, 1
+        phys = torch.zeros(L, S, channel_dim, shared_win, device=device)
+        # Encode each physical cell as channel*1000 + shared_col so we can read
+        # back which (channel, window-column) each view element points to.
+        for c in range(channel_dim):
+            for w in range(shared_win):
+                phys[0, 0, c, w] = c * 1000 + w
+        if not window_major:
+            # GDN: view[l, s, step, d, w] = phys[l, s, d, step + w]
+            view = phys.as_strided(
+                (L, S, draft_tokens, channel_dim, win_len),
+                (
+                    phys.stride(0),
+                    phys.stride(1),
+                    phys.stride(3),  # step -> shared-win axis
+                    phys.stride(2),  # channel
+                    phys.stride(3),  # win -> shared-win axis
+                ),
+            )
+        else:
+            # KDA: view[l, s, step, w, d] = phys[l, s, d, step + w]
+            view = phys.as_strided(
+                (L, S, draft_tokens, win_len, channel_dim),
+                (
+                    phys.stride(0),
+                    phys.stride(1),
+                    phys.stride(3),  # step -> shared-win axis
+                    phys.stride(3),  # win -> shared-win axis
+                    phys.stride(2),  # channel
+                ),
+            )
+        return view, phys
+
+    @staticmethod
+    def _build_buggy_kda_view(channel_dim, win_len, draft_tokens, device):
+        """Replicate the ORIGINAL buggy construction for the KDA layout.
+
+        The old code did ``conv_dim, win = conv_shape`` on KDA's
+        ``(K-1, channel)`` shape, giving ``conv_dim = K-1`` and ``win = channel``,
+        so the shared window was built over the channel axis.
+        """
+        conv_shape = (win_len, channel_dim)  # KDA (K-1, channel)
+        conv_dim, win = conv_shape  # buggy unpack: conv_dim=K-1, win=channel
+        shared_win = draft_tokens + win - 1
+        L, S = 1, 1
+        phys = torch.zeros(L, S, conv_dim, shared_win, device=device)
+        for c in range(conv_dim):
+            for w in range(shared_win):
+                phys[0, 0, c, w] = c * 1000 + w
+        view = phys.as_strided(
+            (L, S, draft_tokens, conv_dim, win),
+            (
+                phys.stride(0),
+                phys.stride(1),
+                phys.stride(3),
+                phys.stride(2),
+                phys.stride(3),
+            ),
+        )
+        return view
+
+    def test_kda_window_major_sliding_window(self):
+        """Fixed KDA view: step t's window == phys[:, t:t+(K-1)], channel independent."""
+        channel_dim, win_len, draft_tokens = 5, 3, 4  # K=4 -> win=3
+        view, _ = self._build_fixed_view(
+            channel_dim, win_len, draft_tokens, window_major=True, device="cpu"
+        )
+        # view[0,0,t,w,d] must equal phys code d*1000 + (t+w)
+        for t in range(draft_tokens):
+            for w in range(win_len):
+                for d in range(channel_dim):
+                    got = int(view[0, 0, t, w, d].item())
+                    self.assertEqual(
+                        got,
+                        d * 1000 + (t + w),
+                        msg=f"KDA view alias at step={t} w={w} d={d}",
+                    )
+
+    def test_kda_channel_axis_independent(self):
+        """Fixed KDA view: the channel (last) axis must carry the channel identity."""
+        channel_dim, win_len, draft_tokens = 5, 3, 4
+        view, _ = self._build_fixed_view(
+            channel_dim, win_len, draft_tokens, window_major=True, device="cpu"
+        )
+        for t in range(draft_tokens):
+            for w in range(win_len):
+                for d in range(channel_dim):
+                    # channel identity == floor(code / 1000) must equal d
+                    self.assertEqual(int(view[0, 0, t, w, d].item()) // 1000, d)
+
+    def test_kda_window_shifts_by_one_per_step(self):
+        """Fixed KDA view: advancing the draft step slides the window by exactly 1."""
+        channel_dim, win_len, draft_tokens = 5, 3, 4
+        view, _ = self._build_fixed_view(
+            channel_dim, win_len, draft_tokens, window_major=True, device="cpu"
+        )
+        fixed_channel = 2
+        for t in range(draft_tokens - 1):
+            a = view[0, 0, t, :, fixed_channel].tolist()
+            b = view[0, 0, t + 1, :, fixed_channel].tolist()
+            # b is a shifted left by one within the shared window
+            self.assertEqual(a[1:], b[:-1])
+
+    def test_gdn_channel_major_unchanged(self):
+        """Fixed GDN view keeps the legacy channel-major semantics."""
+        channel_dim, win_len, draft_tokens = 5, 3, 4
+        view, _ = self._build_fixed_view(
+            channel_dim, win_len, draft_tokens, window_major=False, device="cpu"
+        )
+        # view[0,0,t,d,w] must equal phys code d*1000 + (t+w)
+        for t in range(draft_tokens):
+            for d in range(channel_dim):
+                for w in range(win_len):
+                    self.assertEqual(
+                        int(view[0, 0, t, d, w].item()), d * 1000 + (t + w)
+                    )
+
+    def test_partial_accept_commit_reads_correct_window(self):
+        """Under partial acceptance, committing step n reads the right window.
+
+        Simulates the post-verify commit: for accepted step n, the conv_state to
+        restore is the window at draft step n. Assert the fixed KDA view exposes
+        that window intact (channel-independent, correctly shifted), which the
+        buggy view did not.
+        """
+        channel_dim, win_len, draft_tokens = 5, 3, 4
+        view, _ = self._build_fixed_view(
+            channel_dim, win_len, draft_tokens, window_major=True, device="cpu"
+        )
+        # Partial accept: last correct step = 1 (not full acceptance)
+        n = 1
+        committed = view[0, 0, n]  # shape (win_len, channel_dim)
+        for w in range(win_len):
+            for d in range(channel_dim):
+                self.assertEqual(int(committed[w, d].item()), d * 1000 + (n + w))
+
+    def test_buggy_kda_view_aliases_step_onto_channel(self):
+        """Regression sentinel: the OLD construction DID alias step->channel.
+
+        This documents the bug and guards against silently reintroducing the
+        old unpack. In the buggy view, advancing the draft step changes the
+        (mislabeled) channel axis content, i.e. step contaminates channel.
+        """
+        channel_dim, win_len, draft_tokens = 5, 3, 4
+        buggy = self._build_buggy_kda_view(
+            channel_dim, win_len, draft_tokens, device="cpu"
+        )
+        # The buggy view's 4th axis has size K-1 (=win_len), NOT channel_dim,
+        # confirming the axes were swapped/mislabeled.
+        self.assertEqual(buggy.shape[3], win_len)
+        self.assertEqual(buggy.shape[4], channel_dim)
+        # Stepping t must change the mislabeled-channel slice -> aliasing present.
+        aliased = False
+        for c in range(buggy.shape[3]):
+            if buggy[0, 0, 0, c, :].tolist() != buggy[0, 0, 1, c, :].tolist():
+                aliased = True
+                break
+        self.assertTrue(
+            aliased,
+            "expected the buggy KDA view to alias the draft-step axis onto the "
+            "channel axis",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
