@@ -16,7 +16,7 @@ SGLang provides several speculative decoding options, including EAGLE-2/EAGLE-3,
   - [EAGLE-3 Decoding](#eagle-3-decoding)
 - [Multi Token Prediction](#multi-token-prediction)
 - [DFlash Decoding](#dflash-decoding)
-- [DSpark Decoding (DeepSeek-V4)](#dspark-decoding-deepseek-v4)
+- [DSpark Decoding (DeepSeek-V4 and Qwen3)](#dspark-decoding-deepseek-v4-and-qwen3)
 - [Standalone Speculative Decoding (Small Draft Model)](#standalone-speculative-decoding-small-draft-model)
 - [Speculative Decoding V2 (Overlap Scheduler)](#speculative-decoding-v2-overlap-scheduler)
 - [Ngram Speculative Decoding](#ngram-speculative-decoding)
@@ -32,7 +32,7 @@ SGLang provides several speculative decoding options, including EAGLE-2/EAGLE-3,
 - **Lower `lm_head` overhead for EAGLE-2**: Enable **FR-Spec** with `--speculative-token-map`.
 - **Model is MTP-enabled**: Use **MTP via speculative decoding** (often with small `speculative_num_steps/topk/num_draft_tokens`, see the example section).
 - **You have a DFlash draft checkpoint**: Use **DFLASH** with `--speculative-algorithm DFLASH` and `--speculative-draft-model-path ...`.
-- **Serving DeepSeek-V4 DSpark checkpoints**: Use **DSpark** with `--speculative-algorithm DSPARK` (block drafting, greedy, lossless).
+- **Serving DSpark checkpoints (DeepSeek-V4 or Qwen3-family)**: Use **DSpark** with `--speculative-algorithm DSPARK` (block drafting, greedy, lossless).
 - **You have a smaller draft LLM**: Use **STANDALONE** (`--speculative-algorithm STANDALONE`).
 - **No extra model available**: Use **NGRAM** (`--speculative-algorithm NGRAM`, CUDA-only).
 
@@ -97,10 +97,10 @@ SGLang provides several speculative decoding options, including EAGLE-2/EAGLE-3,
     </tr>
 <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>DSpark</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>DeepSeek-V4 block drafter (3-stage MTP + Markov/confidence heads) in the checkpoint</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>No</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>--speculative-algorithm DSPARK</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Greedy (lossless); DeepSeek-V4 DSpark checkpoints only; no <code>--enable-dp-attention</code>; <code>pp_size == 1</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>DeepSeek-V4 (3-stage MTP + Markov/confidence heads in the checkpoint) or Qwen3-family (separate block-drafter checkpoint)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>No (DeepSeek-V4) / Yes (Qwen3-family)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>--speculative-algorithm DSPARK</code> (+ <code>--speculative-draft-model-path ...</code> for Qwen3-family checkpoints)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Greedy (lossless); no <code>--enable-dp-attention</code>; <code>pp_size == 1</code></td>
     </tr>
 <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>STANDALONE</td>
@@ -507,9 +507,9 @@ print(response.choices[0].message.content)
 
 ---
 
-## DSpark Decoding (DeepSeek-V4)
+## DSpark Decoding (DeepSeek-V4 and Qwen3)
 
-**DSpark** is a block drafter for DeepSeek-V4. The DSpark checkpoints (`deepseek-ai/DeepSeek-V4-Flash-DSpark`, `deepseek-ai/DeepSeek-V4-Pro-DSpark`) ship the speculative module inside the model under the `mtp.*` namespace, so there is no separate draft model to download. Each decode step DSpark proposes a block of `block_size` tokens (inferred from the checkpoint, 5 by default) in one draft forward and the target verifies the whole block in one pass. The drafter is a three-stage MTP stack with a Markov head that refines the block autoregressively and a confidence head that scores each position; it runs off the target's fused hidden states rather than its own token KV. At `temperature 0`, verification is greedy and lossless: the accepted output matches the target's greedy decoding for any block size or confidence threshold. At `temperature > 0`, the block is verified with target-only speculative sampling, which preserves the target's sampling distribution without needing the draft's probabilities.
+**DSpark** is a block drafter, available for both DeepSeek-V4 and Qwen3-family targets through the same `DSparkWorkerV2`. The DeepSeek-V4 DSpark checkpoints (`deepseek-ai/DeepSeek-V4-Flash-DSpark`, `deepseek-ai/DeepSeek-V4-Pro-DSpark`) ship the speculative module inside the model under the `mtp.*` namespace, so there is no separate draft model to download; the Qwen3-family DSpark checkpoints are the opposite — a genuinely separate checkpoint passed via `--speculative-draft-model-path`, see [Qwen3-family checkpoints](#qwen3-family-dspark-checkpoints) below. Each decode step DSpark proposes a block of `block_size` tokens (inferred from the draft checkpoint, 5 by default on DeepSeek-V4) in one draft forward and the target verifies the whole block in one pass. The drafter is a three-stage MTP stack with a Markov head that refines the block autoregressively and a confidence head that scores each position; it runs off the target's fused hidden states rather than its own token KV. At `temperature 0`, verification is greedy and lossless: the accepted output matches the target's greedy decoding for any block size or confidence threshold. At `temperature > 0`, the block is verified with target-only speculative sampling, which preserves the target's sampling distribution without needing the draft's probabilities.
 
 `--speculative-algorithm DSPARK` is enough; the draft path defaults to the target checkpoint, and `--speculative-eagle-topk 1` / `--speculative-num-steps 1` are pinned automatically.
 
@@ -573,7 +573,7 @@ print(response.choices[0].message.content)
 
 **Notes**
 
-- DeepSeek-V4 DSpark checkpoints only. Requires `pp_size == 1` and does not support `--enable-dp-attention`; mixed chunked prefill is disabled automatically.
+- Requires `pp_size == 1` and does not support `--enable-dp-attention` on any DSpark target (DeepSeek-V4 or Qwen3-family); mixed chunked prefill is disabled automatically.
 - `temperature > 0` is verified with the same target-only speculative-sampling primitive as DFLASH, so sampled requests are not downgraded to greedy. Greedy (`temperature 0`) is the benchmark-validated path. If the sampling kernel is unavailable on a build, `temperature > 0` falls back to greedy with a one-time warning.
 - On `DeepSeek-V4-Flash-DSpark` (284B, 8x B200, tp8 ep8, greedy), acceptance length is roughly 3.2 to 3.6 tokens per target forward across math, code, and chat; single-stream throughput improves about 1.5x to 1.8x over no speculation; and GSM8K / MMLU match the no-speculation target within noise. See [sgl-project/sglang#29538](https://github.com/sgl-project/sglang/pull/29538) for full sweeps and raw logs.
 
@@ -588,6 +588,53 @@ The confidence threshold (`--speculative-dspark-confidence-threshold`) only shor
 On builds without the required `sgl_kernel` sampling ops (for example non-CUDA backends), `temperature > 0` falls back to greedy verification and the server logs a one-time warning. Per-request features that DSpark cannot verify are rejected up front rather than silently degraded: `return_logprob`, grammar-constrained decoding (JSON schema, regex, EBNF, or structural tags), and `return_hidden_states`.
 
 The DeepSpec reference implementation verifies with draft-probability rejection sampling driven by a sampled drafter; this integration instead uses SGLang's shared target-only scheme with a deterministic (greedy) drafter. Both are distribution-preserving and differ only in which probabilities drive the accept-or-reject test.
+
+### Qwen3-family DSpark checkpoints
+
+DSpark also serves Qwen3-family targets, through a plain GQA/RoPE block drafter (architecturally DFlash's non-causal block drafter, not DeepSeek-V4's MLA-specific one) rather than the MTP stack described above. Unlike the DeepSeek-V4 checkpoints, the Qwen3-family DSpark checkpoints are a genuinely separate draft checkpoint passed via `--speculative-draft-model-path`, and both `embed_tokens` and `lm_head` are trained in the draft checkpoint (`tie_word_embeddings: false`) rather than tied to the target's.
+
+One model class (`Qwen3DSparkModel`) serves two released checkpoints, config-gated purely by the checkpoint's own `markov_rank` / `enable_confidence_head` fields — no separate registration or flag needed to pick between them:
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "35%"}} />
+    <col style={{width: "40%"}} />
+    <col style={{width: "25%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Checkpoint</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Markov / confidence heads</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Use with</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>deepseek-ai/dspark_qwen3_4b_block7</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Both (<code>markov_rank=256</code>, confidence head enabled)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>--speculative-algorithm DSPARK</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>deepseek-ai/dflash_qwen3_4b_block7</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Neither (<code>markov_rank=0</code>)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>--speculative-algorithm DFLASH</code></td>
+    </tr>
+  </tbody>
+</table>
+
+```bash Command
+python3 -m sglang.launch_server \
+    --model-path Qwen/Qwen3-4B \
+    --speculative-algorithm DSPARK \
+    --speculative-draft-model-path deepseek-ai/dspark_qwen3_4b_block7 \
+    --speculative-dspark-block-size 7 \
+    --attention-backend triton --mem-fraction-static 0.85
+```
+
+**Notes**
+
+- Measured on a single RTX A6000 (48GB, SM86/Ampere, bf16, `--attention-backend triton`): GSM8K 5-shot/200q/greedy accuracy holds at parity with the non-speculative target (0.875-0.885 vs. a 0.880 baseline), with 3.9-4.8 accepted tokens per verify round during GSM8K and roughly a 1.9x single-stream decode speedup.
+- `deepseek-ai/dflash_qwen3_4b_block7` is architecturally servable by the same `Qwen3DSparkModel` class but is meant to run under plain `DFLASH`, not `DSPARK` — see the table above.
 
 ---
 
