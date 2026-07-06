@@ -1,5 +1,5 @@
 import logging
-from typing import List, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 import numpy as np
 import torch
@@ -27,6 +27,9 @@ from sglang.srt.speculative.triton_ops.cache_locs import (
     assign_extend_cache_locs_func as assign_extend_cache_locs_func,
 )
 from sglang.srt.utils.async_probe import maybe_detect_inf, maybe_detect_nan
+
+if TYPE_CHECKING:
+    from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
 
@@ -119,14 +122,9 @@ class NGRAMWorker(BaseSpecWorker):
         self.ngram_corpus.reset()
         self._prev_decode_rids = set()
 
-    def update_weights_from_tensor(self, recv_req):
-        # NGRAM has no draft weights of its own — the n-gram corpus is a CPU
-        # lookup structure built from request token streams — and its
-        # `model_runner` is shared with the target worker. The scheduler
-        # mixin dispatches via `self.draft_worker or self.tp_worker`, so
-        # without this method any caller of `update_weights_from_tensor`
-        # under `--speculative-algorithm NGRAM` raises AttributeError.
-        return self.target_worker.update_weights_from_tensor(recv_req)
+    def iter_draft_runners(self) -> list[tuple[str, "ModelRunner"]]:
+        # NGRAM shares the target's model_runner — no independent draft.
+        return []
 
     def add_external_corpus(self, corpus_id: str, token_chunks: list[list[int]]) -> int:
         return self.ngram_corpus.load_external_corpus_named(corpus_id, token_chunks)
