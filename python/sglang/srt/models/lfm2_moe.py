@@ -47,6 +47,7 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     sharded_weight_loader,
 )
+from sglang.srt.models.lfm2 import lfm2_lora_hidden_dim, lfm2_lora_stacked_multiply
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix, make_layers, set_weight_attrs
 
@@ -542,29 +543,15 @@ class Lfm2MoeForCausalLM(nn.Module):
     def get_hidden_dim(self, module_name: str, layer_idx: int) -> Tuple[int, int]:
         """Return (input_dim, output_dim) of the module for LoRA buffer sizing."""
         config = self.config
-        head_dim = getattr(
-            config, "head_dim", config.hidden_size // config.num_attention_heads
-        )
-        if module_name == "qkv_proj":
-            return config.hidden_size, head_dim * (
-                config.num_attention_heads + config.num_key_value_heads * 2
-            )
-        elif module_name == "out_proj":
-            # Attention out_proj is (head_dim * num_heads -> hidden); ShortConv
-            # out_proj is (hidden -> hidden). The two differ when head_dim is
-            # set explicitly, so dispatch on the layer type.
-            if config.layer_types[layer_idx] == "full_attention":
-                return head_dim * config.num_attention_heads, config.hidden_size
-            return config.hidden_size, config.hidden_size
-        elif module_name == "gate_up_proj":
+        if module_name in ("gate_up_proj", "down_proj"):
             # Dense MLP exists only on layers 0..num_dense_layers-1; report
-            # zero dims for MoE layers so their buffers cost no memory.
+            # zero dims for MoE layers so their buffers cost no memory. Unlike
+            # dense LFM2, there is no ff-dim auto-adjustment here, so
+            # intermediate_size is used raw.
             if layer_idx >= config.num_dense_layers:
                 return 0, 0
-            return config.hidden_size, config.intermediate_size * 2
-        elif module_name == "down_proj":
-            if layer_idx >= config.num_dense_layers:
-                return 0, 0
+            if module_name == "gate_up_proj":
+                return config.hidden_size, config.intermediate_size * 2
             return config.intermediate_size, config.hidden_size
         elif module_name == "gate_up_proj_moe":
             return config.hidden_size, config.moe_intermediate_size * 2
@@ -573,26 +560,10 @@ class Lfm2MoeForCausalLM(nn.Module):
         elif module_name == "gate":
             # MoE router
             return config.hidden_size, config.num_experts
-        elif module_name == "in_proj":
-            # ShortConv in_proj: hidden -> 3*hidden (B, C, x gates stacked)
-            return config.hidden_size, 3 * config.hidden_size
-        elif module_name == "embed_tokens":
-            return config.vocab_size, config.hidden_size
-        elif module_name == "lm_head":
-            return config.hidden_size, config.vocab_size
-        else:
-            raise NotImplementedError(
-                f"get_hidden_dim not implemented for {module_name}"
-            )
+        return lfm2_lora_hidden_dim(config, module_name, layer_idx)
 
     def get_stacked_multiply(self, module_name: str) -> int:
-        if module_name == "in_proj":
-            # ShortConv in_proj packs 3 sub-projections (B, C, x); the
-            # adapter's single shared A is replicated 3x at load time.
-            return 3
-        from sglang.srt.lora.utils import get_stacked_multiply
-
-        return get_stacked_multiply(module_name)
+        return lfm2_lora_stacked_multiply(module_name)
 
     @torch.no_grad()
     def forward(

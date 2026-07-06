@@ -422,6 +422,48 @@ class Lfm2Model(nn.Module):
         return self.embedding_norm(hidden_states)
 
 
+def lfm2_lora_hidden_dim(config, module_name: str, layer_idx: int) -> Tuple[int, int]:
+    """Return (input_dim, output_dim) of the LoRA modules common to the LFM2
+    family (attention, ShortConv, embeddings), for LoRA buffer sizing.
+
+    Shared by ``Lfm2ForCausalLM`` and ``Lfm2MoeForCausalLM``; MLP/MoE dims are
+    model-specific and handled by each caller before delegating here.
+    """
+    head_dim = getattr(
+        config, "head_dim", config.hidden_size // config.num_attention_heads
+    )
+    if module_name == "qkv_proj":
+        return config.hidden_size, head_dim * (
+            config.num_attention_heads + config.num_key_value_heads * 2
+        )
+    elif module_name == "out_proj":
+        # Attention out_proj is (head_dim * num_heads -> hidden); ShortConv
+        # out_proj is (hidden -> hidden). The two differ when head_dim is
+        # set explicitly, so dispatch on the layer type.
+        if config.layer_types[layer_idx] == "full_attention":
+            return head_dim * config.num_attention_heads, config.hidden_size
+        return config.hidden_size, config.hidden_size
+    elif module_name == "in_proj":
+        # ShortConv in_proj: hidden -> 3*hidden (B, C, x gates stacked)
+        return config.hidden_size, 3 * config.hidden_size
+    elif module_name == "embed_tokens":
+        return config.vocab_size, config.hidden_size
+    elif module_name == "lm_head":
+        return config.hidden_size, config.vocab_size
+    else:
+        raise NotImplementedError(f"get_hidden_dim not implemented for {module_name}")
+
+
+def lfm2_lora_stacked_multiply(module_name: str) -> int:
+    if module_name == "in_proj":
+        # ShortConv in_proj packs 3 sub-projections (B, C, x); the
+        # adapter's single shared A is replicated 3x at load time.
+        return 3
+    from sglang.srt.lora.utils import get_stacked_multiply
+
+    return get_stacked_multiply(module_name)
+
+
 class Lfm2ForCausalLM(nn.Module):
     """LFM2 for causal language modeling with hybrid attention/conv architecture."""
 
@@ -459,45 +501,15 @@ class Lfm2ForCausalLM(nn.Module):
     def get_hidden_dim(self, module_name: str, layer_idx: int) -> Tuple[int, int]:
         """Return (input_dim, output_dim) of the module for LoRA buffer sizing."""
         config = self.config
-        head_dim = getattr(
-            config, "head_dim", config.hidden_size // config.num_attention_heads
-        )
-        if module_name == "qkv_proj":
-            return config.hidden_size, head_dim * (
-                config.num_attention_heads + config.num_key_value_heads * 2
-            )
-        elif module_name == "out_proj":
-            # Attention out_proj is (head_dim * num_heads -> hidden); ShortConv
-            # out_proj is (hidden -> hidden). The two differ when head_dim is
-            # set explicitly, so dispatch on the layer type.
-            if config.layer_types[layer_idx] == "full_attention":
-                return head_dim * config.num_attention_heads, config.hidden_size
-            return config.hidden_size, config.hidden_size
-        elif module_name == "gate_up_proj":
+        if module_name == "gate_up_proj":
             # config.intermediate_size may be auto-adjusted at module creation
             return config.hidden_size, _mlp_intermediate_size(config) * 2
         elif module_name == "down_proj":
             return _mlp_intermediate_size(config), config.hidden_size
-        elif module_name == "in_proj":
-            # ShortConv in_proj: hidden -> 3*hidden (B, C, x gates stacked)
-            return config.hidden_size, 3 * config.hidden_size
-        elif module_name == "embed_tokens":
-            return config.vocab_size, config.hidden_size
-        elif module_name == "lm_head":
-            return config.hidden_size, config.vocab_size
-        else:
-            raise NotImplementedError(
-                f"get_hidden_dim not implemented for {module_name}"
-            )
+        return lfm2_lora_hidden_dim(config, module_name, layer_idx)
 
     def get_stacked_multiply(self, module_name: str) -> int:
-        if module_name == "in_proj":
-            # ShortConv in_proj packs 3 sub-projections (B, C, x); the
-            # adapter's single shared A is replicated 3x at load time.
-            return 3
-        from sglang.srt.lora.utils import get_stacked_multiply
-
-        return get_stacked_multiply(module_name)
+        return lfm2_lora_stacked_multiply(module_name)
 
     @torch.no_grad()
     def forward(
