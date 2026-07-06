@@ -1206,8 +1206,10 @@ class DSparkWorkerV2(BaseSpecWorker):
         target_layer_ids = list(getattr(self._draft_inner, "target_layer_ids", []) or [])
         hidden_size = int(getattr(self._draft_inner, "hidden_size", 0))
         raw = raw_hidden_rows.detach()
+        decoder_layer_ids = [int(layer_id) - 1 for layer_id in target_layer_ids]
         payload = {
             "target_layer_ids": [int(x) for x in target_layer_ids],
+            "decoder_layer_ids": decoder_layer_ids,
             "raw": self._summarize_hidden_rows(raw),
             "projected": self._summarize_hidden_rows(projected_rows.detach()),
         }
@@ -1217,7 +1219,8 @@ class DSparkWorkerV2(BaseSpecWorker):
             raw_layers = raw.reshape(raw.shape[0], len(target_layer_ids), hidden_size)
             payload["raw_layers"] = [
                 {
-                    "layer_id": int(layer_id),
+                    "target_layer_id": int(layer_id),
+                    "decoder_layer_id": int(decoder_layer_ids[i]),
                     "hidden": self._summarize_hidden_rows(raw_layers[:, i, :]),
                 }
                 for i, layer_id in enumerate(target_layer_ids)

@@ -2099,8 +2099,21 @@ class DeepseekV4ForCausalLM(nn.Module):
             raise ValueError(
                 "DSpark requires explicit layer_ids for aux hidden capture."
             )
+        # DSpark configs use HuggingFace hidden-state slot ids:
+        # hidden_states[0] is embeddings, hidden_states[i] is the output after
+        # decoder layer i - 1. Convert to zero-based decoder layer indices for
+        # this model's internal loop.
+        capture_layer_ids = [int(layer_id) - 1 for layer_id in layer_ids]
+        if min(capture_layer_ids) < 0 or max(capture_layer_ids) >= len(
+            self.model.layers
+        ):
+            raise ValueError(
+                "Invalid DSpark target layer ids "
+                f"{layer_ids}; expected hidden-state slots in "
+                f"[1, {len(self.model.layers)}]."
+            )
         self.capture_aux_hidden_states = True
-        self.model.layers_to_capture = list(layer_ids)
+        self.model.layers_to_capture = capture_layer_ids
 
     def _setup_fp8_wo_a_scales(self, is_nextn: bool, is_dspark: bool = False) -> None:
         from deep_gemm import transform_sf_into_required_layout
