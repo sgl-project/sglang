@@ -2483,12 +2483,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 f"Unsupported kv_cache_dtype: {self.server_args.kv_cache_dtype}."
             )
 
-        # DFLASH draft-KV decouple: the fp8 target records its kv_cache_dtype into the shared
-        # server_args, but the bf16 draft's fa4 attention needs K.dtype == Q.dtype. Give the
-        # draft its own KV in the draft compute dtype (set directly, not the shared args).
+        # DFLASH: fa4 draft attention can't read the target's fp8 KV (needs K.dtype == Q.dtype),
+        # so give the fa4 draft its own compute-dtype KV. fp8-capable backends keep the target dtype.
         if (
             self.is_draft_worker
             and self.spec_algorithm.is_dflash()
+            and self.server_args.speculative_draft_attention_backend == "fa4"
             and self.kv_cache_dtype != self.dtype
         ):
             self.kv_cache_dtype = self.dtype
