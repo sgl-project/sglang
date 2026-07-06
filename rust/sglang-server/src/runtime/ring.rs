@@ -129,10 +129,14 @@ pub struct EgressConsumer {
 }
 
 impl EgressProducer {
-    /// Non-blocking push from the Python scheduler. `false` = ring full.
-    #[inline]
-    pub fn try_push(&self, msg: Bytes) -> bool {
-        self.tx.try_send(msg).is_ok()
+    /// Blocking push: parks until the ring has space, so a full ring applies
+    /// backpressure to the scheduler instead of dropping output the scheduler has
+    /// already committed (advanced `send_token_offset` for). The GIL is released
+    /// around the call, so parking here doesn't stall other Python threads.
+    /// `false` only when the consumer is gone (runtime shutdown), where the frame
+    /// is unavoidably lost.
+    pub fn push(&self, msg: Bytes) -> bool {
+        self.tx.send(msg).is_ok()
     }
 }
 
@@ -201,5 +205,29 @@ mod tests {
         // push lands.
         assert!(rx.wait(Duration::from_secs(5)));
         assert_eq!(rx.drain(16).headers.len(), 1);
+    }
+
+    /// A full egress ring parks the producer until the consumer drains — the
+    /// committed frame is delivered in order, never dropped.
+    #[test]
+    fn egress_push_blocks_until_drained() {
+        let (tx, rx) = egress_ring(1);
+        assert!(tx.push(Bytes::from_static(b"a"))); // fits; ring now full
+        let t = std::thread::spawn(move || tx.push(Bytes::from_static(b"b")));
+        // The parked push can't have completed while the ring is full.
+        std::thread::sleep(Duration::from_millis(20));
+        // Drain one → frees a slot → the parked push lands.
+        assert_eq!(rx.receiver().recv().unwrap(), Bytes::from_static(b"a"));
+        assert!(t.join().unwrap(), "push should succeed once space frees");
+        assert_eq!(rx.receiver().recv().unwrap(), Bytes::from_static(b"b"));
+    }
+
+    /// A closed ring (consumer gone → shutdown) returns `false` instead of
+    /// parking forever, so a scheduler blocked in `push` unblocks on teardown.
+    #[test]
+    fn egress_push_returns_false_when_closed() {
+        let (tx, rx) = egress_ring(1);
+        drop(rx);
+        assert!(!tx.push(Bytes::from_static(b"x")));
     }
 }
