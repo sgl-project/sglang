@@ -91,7 +91,9 @@ def _mesh_job_from_sampling(
     }
 
 
-async def _dispatch_job_async(job_id: str, batch: Req) -> None:
+async def _dispatch_job_async(
+    job_id: str, batch: Req, *, output_presigned_urls: list[str] | None = None
+) -> None:
     from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 
     try:
@@ -104,7 +106,12 @@ async def _dispatch_job_async(job_id: str, batch: Req) -> None:
         if os.path.exists(save_file_path):
             file_size = os.path.getsize(save_file_path)
 
-        cloud_url = await cloud_storage.upload_and_cleanup(save_file_path)
+        output_presigned_url = (
+            output_presigned_urls[0] if output_presigned_urls else None
+        )
+        cloud_url = await cloud_storage.upload_and_cleanup(
+            save_file_path, presigned_url=output_presigned_url
+        )
 
         update_fields: Dict[str, Any] = {
             "status": "completed",
@@ -219,7 +226,11 @@ async def create_mesh(
         sampling_params=sampling_params,
     )
 
-    asyncio.create_task(_dispatch_job_async(request_id, batch))
+    asyncio.create_task(
+        _dispatch_job_async(
+            request_id, batch, output_presigned_urls=req.output_presigned_urls
+        )
+    )
     return MeshResponse(**job)
 
 
