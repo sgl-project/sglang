@@ -47,6 +47,7 @@ from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.platforms import current_platform
 from sglang.srt.utils.common import (
     get_available_gpu_memory,
@@ -116,7 +117,7 @@ class ModelRunnerKVCacheMixin:
             # Mamba state is a fixed pre-capture allocation, so it can't ride the ~0 post-capture slack.
             slack_gb = max(
                 slack_gb,
-                self.server_args.pre_capture_activation_reserve_mb(
+                self.server_args.mamba_pre_capture_reserve_mb(
                     get_device_memory_capacity(self.device)
                 )
                 / 1024,
@@ -374,16 +375,30 @@ class ModelRunnerKVCacheMixin:
             distributed=get_world_group().world_size > 1,
             cpu_group=get_world_group().cpu_group,
         )
-        # Floor the headroom to the activation working set: eager decode above the
-        # captured graph max_bs and transient prefill/logits allocations are not held
-        # by the captured graphs, so they are not reflected in measured free memory.
-        headroom_gb = max(
-            self.pre_model_load_memory * (1 - self.mem_fraction_static),
-            self.server_args.pre_capture_activation_reserve_mb(
-                get_device_memory_capacity(self.device)
-            )
-            / 1024,
+        headroom_gb = self.pre_model_load_memory * (1 - self.mem_fraction_static)
+        decode_cuda_graph_config = self.server_args.cuda_graph_config.decode
+        decode_max_bs = int(decode_cuda_graph_config.max_bs or 0)
+        running_requests = int(self.max_running_requests or decode_max_bs or 1)
+        eager_decode_gap = (
+            self.server_args.disaggregation_mode != "prefill"
+            and decode_cuda_graph_config.backend != Backend.DISABLED
+            and decode_max_bs < running_requests
         )
+        if eager_decode_gap:
+            logger.warning(
+                "Post-capture KV sizing: decode CUDA graph max_bs=%d < "
+                "max_running_requests=%d; reserving activation headroom",
+                decode_max_bs,
+                running_requests,
+            )
+        if eager_decode_gap or self.mambaish_config is not None:
+            headroom_gb = max(
+                headroom_gb,
+                self.server_args.mamba_pre_capture_reserve_mb(
+                    get_device_memory_capacity(self.device)
+                )
+                / 1024,
+            )
         budget_bytes = (
             int(max(0.0, free_gb - headroom_gb) * (1 << 30))
             + pool.post_capture_backed_bytes

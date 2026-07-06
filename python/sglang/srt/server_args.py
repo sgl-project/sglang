@@ -3625,11 +3625,9 @@ class ServerArgs:
             )
         )
 
-    def pre_capture_activation_reserve_mb(self, gpu_mem: Optional[float]) -> float:
-        # Runtime activation working set that post-capture sizing cannot see from
-        # measured free memory: eager decode above the captured graph max_bs and
-        # transient prefill/logits allocations. Also covers the fixed (non-resizable)
-        # mamba state cache. Mirrors the OFF-path activation reserve.
+    def mamba_pre_capture_reserve_mb(self, gpu_mem: Optional[float]) -> float:
+        # Realistic runtime reserve for the fixed (non-resizable) mamba state cache,
+        # which post-capture can't size from measured free memory.
         if self.disaggregation_mode == "decode":
             running_requests = (
                 self.max_running_requests or self.cuda_graph_config.decode.max_bs or 1
