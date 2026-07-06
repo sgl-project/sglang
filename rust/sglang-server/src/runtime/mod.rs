@@ -303,7 +303,12 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
         let count = detok_rx.len();
         let mut rxs = detok_rx.into_iter();
         spawn_pool("detokenizer", detok_cores, count, &mut threads, |i| {
-            detokenizer::DetokenizerWorker::new(i, rxs.next().unwrap(), backend.clone())
+            detokenizer::DetokenizerWorker::new(
+                i,
+                rxs.next().unwrap(),
+                backend.clone(),
+                tm_tx.clone(),
+            )
         });
     }
 
