@@ -344,7 +344,7 @@ export const MiMoV25Deployment = () => {
         flags.push("  --mem-fraction-static 0.7");
         flags.push("  --max-running-requests 128");
         flags.push("  --chunked-prefill-size 32768");
-        flags.push("  --cuda-graph-max-bs 64");
+        flags.push("  --cuda-graph-max-bs-decode 64");
         flags.push("  --page-size 64");
         flags.push("  --swa-full-tokens-ratio 0.3");
         flags.push(`  --model-loader-extra-config '{"enable_multithread_load": true, "num_threads": 64}'`);

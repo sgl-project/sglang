@@ -5,22 +5,27 @@ import sys
 import pytest
 import torch
 
-from sglang.jit_kernel.cutedsl_dsv3_fused_a_gemm import dsv3_fused_a_gemm
-from sglang.jit_kernel.utils import get_jit_cuda_arch, is_hip_runtime
+from sglang.jit_kernel.utils import get_ci_test_range, get_jit_cuda_arch, is_hip_runtime
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=30, suite="base-b-kernel-unit-1-gpu-large")
+register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+
+if not torch.cuda.is_available():
+    pytest.skip("CUDA required", allow_module_level=True)
+
+from sglang.jit_kernel.cutedsl_dsv3_fused_a_gemm import dsv3_fused_a_gemm  # noqa: E402
 
 # hd_in must be a multiple of 256; 6144/7168 cover the real fused-A shapes.
 HD_INS = [6144, 7168]
 # hd_out must be a multiple of 16; 2112 and 2624 cover real fused-A variants.
 HD_OUTS = [2112, 2624]
+NUM_TOKENS = get_ci_test_range(list(range(1, 17)), [1, 8, 16])
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("hd_out", HD_OUTS)
 @pytest.mark.parametrize("hd_in", HD_INS)
-@pytest.mark.parametrize("num_tokens", list(range(1, 17)))
+@pytest.mark.parametrize("num_tokens", NUM_TOKENS)
 def test_dsv3_fused_a_gemm(num_tokens, hd_in, hd_out):
     if is_hip_runtime() or get_jit_cuda_arch().major < 9:
         pytest.skip("SM90+ required")
