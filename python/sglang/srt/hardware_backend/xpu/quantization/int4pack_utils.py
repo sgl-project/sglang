@@ -50,7 +50,7 @@ def xpu_int4pack_mm(
 ) -> torch.Tensor:
     """Run ``_weight_int4pack_mm`` with leading-dim flatten / restore + bias."""
     out_shape = x.shape[:-1] + (out_features,)
-    reshaped_x = x.reshape(-1, x.shape[-1])
+    reshaped_x = x.reshape(-1, x.shape[-1]).contiguous()
     out = torch.ops.aten._weight_int4pack_mm(
         reshaped_x, qweight_packed, group_size, qscale_and_zeros
     )
