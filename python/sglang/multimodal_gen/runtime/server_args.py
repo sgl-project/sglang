@@ -442,14 +442,24 @@ class ServerArgs(DisaggServerArgsMixin):
         self.nunchaku_config = resolution.nunchaku_config
 
     def adjust_pipeline_config(self):
-        # 1. adjust for encoder parallel folding (dp/replicate never fold)
-        if getattr(self, "encoder_parallel", "auto") in ("dp", "replicate"):
-            return
         tp_size = self.tp_size or 1
         dp_size = self.dp_size or 1
         sp_degree = self.sp_degree or 1
         # one replica = all its GPUs
         replica_size = (self.num_gpus or tp_size) // dp_size
+
+        # dp needs batch > 1 to ever engage; raise the ceiling to the replica
+        # size so it isn't a silent no-op, unless the user set it themselves.
+        if (
+            self.encoder_parallel == "dp"
+            and replica_size > 1
+            and not self.is_arg_explicitly_set("batching_max_size")
+        ):
+            self.batching_max_size = max(self.batching_max_size, replica_size)
+
+        # 1. adjust for encoder parallel folding (dp/replicate never fold)
+        if getattr(self, "encoder_parallel", "auto") in ("dp", "replicate"):
+            return
         fold_world = dp_size == 1 and not self.disagg_mode and replica_size > tp_size
 
         if fold_world:
@@ -1278,8 +1288,10 @@ class ServerArgs(DisaggServerArgsMixin):
                 "single-request latency) and data-parallels the rest at "
                 "batch>1; `fold` always tensor-parallels the encoder weights; "
                 "`dp` never folds and splits the batch across ranks (best "
-                "batched throughput); `replicate` disables both. "
-                "`sglang serve` defaults to `dp`; other entrypoints to `auto`."
+                "batched throughput; also raises --batching-max-size to the "
+                "replica size unless set explicitly); `replicate` disables "
+                "both. `sglang serve` defaults to `dp`; other entrypoints to "
+                "`auto`."
             ),
         )
         parser.add_argument(
