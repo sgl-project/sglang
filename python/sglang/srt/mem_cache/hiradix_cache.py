@@ -15,6 +15,7 @@ import torch
 from sglang.srt.disaggregation.kv_events import StorageMedium
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.managers.cache_controller import HiCacheController, PrefetchOperation
+from sglang.srt.mem_cache.pool_host.common import get_allocator_type
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     DecLockRefResult,
@@ -80,11 +81,8 @@ class HiRadixCache(RadixCache):
         self.page_size = params.page_size
         self.kv_cache = params.token_to_kv_pool_allocator.get_kvcache()
 
-        allocator_type = (
-            "shm"
-            if getattr(server_args, "host_kvcache_allocator", "default") == "shm"
-            else (server_args.hicache_storage_backend or "default")
-        )
+        
+        allocator_type = get_allocator_type(server_args)
 
         if isinstance(self.kv_cache, MHATokenToKVPool):
             self.token_to_kv_pool_host = get_mha_host_pool_cls(self.kv_cache)(

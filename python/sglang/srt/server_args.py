@@ -2148,6 +2148,7 @@ class ServerArgs:
                 "eic",
                 "simm",
                 "mori",
+                "shm",
             ],
         ),
     ] = None

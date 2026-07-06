@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 from collections import defaultdict
@@ -87,6 +88,23 @@ def get_allocator_from_storage(allocator_type):
         return ShmHostTensorAllocator()
     else:
         return HostTensorAllocator()
+
+
+def get_allocator_type(server_args) -> str:
+    backend = getattr(server_args, "hicache_storage_backend", None)
+    if backend == "shm":
+        return "shm"
+    if backend == "dynamic":
+        extra_config_str = getattr(server_args, "hicache_storage_backend_extra_config", None)
+        if extra_config_str:
+            try:
+                config = json.loads(extra_config_str)
+                if config.get("allocator") == "shm":
+                    return "shm"
+            except Exception:
+                pass
+    return backend or "default"
+
 
 
 def _cuda_host_register(buffer: torch.Tensor) -> None:
