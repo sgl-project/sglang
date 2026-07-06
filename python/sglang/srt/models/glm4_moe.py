@@ -1213,6 +1213,18 @@ class Glm4MoeForCausalLM(nn.Module):
             disable_reason = "GLM-4.5 cannot use shared experts fusion optimization under deepep expert parallelism."
         elif self.quant_config and self.quant_config.get_name() == "w4afp8":
             disable_reason = "GLM-4.5 W4AFP8 model uses different quant method for routed experts and shared experts."
+        elif (
+            self.quant_config
+            and self.quant_config.get_name() == "modelopt_fp4"
+            and any(
+                "shared_experts" in e
+                for e in (getattr(self.quant_config, "exclude_modules", None) or [])
+            )
+        ):
+            disable_reason = (
+                "ModelOpt/NVFP4 checkpoint excludes shared experts from quantization; "
+                "fusing the unquantized shared expert into the NVFP4 MoE loader is unsafe."
+            )
 
         if disable_reason is not None:
             from sglang.srt.arg_groups.overrides import declare_load_time_override
