@@ -30,6 +30,9 @@ class _FakeSpecAlgorithm:
     def is_none(self):
         return self._is_none
 
+    def is_some(self):
+        return not self._is_none
+
 
 class _FakeBatch:
     def __init__(

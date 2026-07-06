@@ -1607,8 +1607,7 @@ class Scheduler(
         return (
             self.last_batch is not None
             and len(self.result_queue) > 0
-            and self.last_batch.spec_algorithm is not None
-            and not self.last_batch.spec_algorithm.is_none()
+            and self.last_batch.spec_algorithm.is_some()
             and self.last_batch.has_grammar
             and self.last_batch.forward_mode.is_decode()
         )
