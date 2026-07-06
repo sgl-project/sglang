@@ -1,6 +1,6 @@
 ---
-title: Hunyuan 3
-description: "Deploy Tencent Hunyuan 3 with SGLang — verified launch commands and tuning for the BF16 Mixture-of-Experts model with hybrid thinking, native tool calling, 256K context, and MTP speculative decoding."
+title: Hy3
+description: "Deploy Tencent Hy3 with SGLang — verified launch commands and tuning for the BF16 Mixture-of-Experts model with hybrid thinking, native tool calling, 256K context, and MTP speculative decoding."
 tag: NEW
 ---
 
@@ -42,7 +42,7 @@ docker pull lmsysorg/sglang:dev
 For how to launch the image, see [Install → Method 3: Using Docker](../../../docs/get-started/install#method-3-using-docker), substituting the inner `sglang serve ...` with what the command generator below produces.
 
 <Note>
-The `dev` image bundles the HYV3 model code, the suffix-aware `hunyuan` reasoning/tool-call parsers, and the MTP draft-module runtime. The same parsers serve both the preview (suffix-less) and the shipping (suffixed) Hunyuan tokenizer — no per-model hard-coding.
+The `dev` image bundles the HYV3 model code, the suffix-aware `hunyuan` reasoning/tool-call parsers, and the MTP draft-module runtime. The same parsers serve both the preview (suffix-less) and the shipping (suffixed) Hy3 tokenizer — no per-model hard-coding.
 </Note>
 
 </Tab>
@@ -80,7 +80,7 @@ The Playground lets you turn on additional knobs on top of whichever Deploy cell
 The knobs come in two flavors:
 
 - **Built-in SGLang features** — parallelism overrides (TP / CP / DP-Attention), MoE backend + EP, reasoning / tool-call parsers, speculative-decoding presets, prefill/decode disaggregation, and HiCache tiers.
-- **Hunyuan 3 specific** — `--tool-call-parser hunyuan` / `--reasoning-parser hunyuan` (suffix-aware, resolve the real special tokens from the tokenizer vocab at runtime).
+- **Hy3 specific** — `--tool-call-parser hunyuan` / `--reasoning-parser hunyuan` (suffix-aware, resolve the real special tokens from the tokenizer vocab at runtime).
 
 Lines highlighted **green** are added by your overrides; lines with **red strikethrough** were in the verified base but stripped by an override. When no override differs from the base cell, the playground inherits the base's **Verified** badge; any actual change flips it to **Not Verified** until the new configuration is run end-to-end and submitted back.
 
@@ -97,7 +97,7 @@ import { Playground } from "/src/snippets/_playground.jsx";
 
 ## 1. Model Introduction
 
-**Hunyuan 3** is Tencent's third-generation flagship Mixture-of-Experts language model, featuring hybrid thinking, native tool calling, long-context reasoning, and Multi-Token Prediction (MTP) for low-latency serving.
+**Hy3** is Tencent's third-generation flagship Mixture-of-Experts language model, featuring hybrid thinking, native tool calling, long-context reasoning, and Multi-Token Prediction (MTP) for low-latency serving.
 
 **Key Features:**
 
@@ -137,7 +137,7 @@ import { Playground } from "/src/snippets/_playground.jsx";
   </tbody>
 </table>
 
-**Special tokens.** The shipping Hunyuan tokenizer appends a shared suffix to every special token (e.g. `<tool_calls:TAG>` instead of the bare `<tool_calls>`). SGLang's `hunyuan` parsers resolve the real token strings from the tokenizer vocab at runtime ([PR #29920](https://github.com/sgl-project/sglang/pull/29920)), so the same recipe serves both the preview (suffix-less) and the shipping (suffixed) tokenizer — no per-model hard-coding. This is why `--reasoning-parser hunyuan` / `--tool-call-parser hunyuan` work out of the box on the shipping model.
+**Special tokens.** The shipping Hy3 tokenizer appends a shared suffix to every special token (e.g. `<tool_calls:TAG>` instead of the bare `<tool_calls>`). SGLang's `hunyuan` parsers resolve the real token strings from the tokenizer vocab at runtime ([PR #29920](https://github.com/sgl-project/sglang/pull/29920)), so the same recipe serves both the preview (suffix-less) and the shipping (suffixed) tokenizer — no per-model hard-coding. This is why `--reasoning-parser hunyuan` / `--tool-call-parser hunyuan` work out of the box on the shipping model.
 
 ## 2. Configuration Tips
 
@@ -187,13 +187,13 @@ import { Playground } from "/src/snippets/_playground.jsx";
 - `low-latency`: steps=3, draft-tokens=4 → largest win at bs=1.
 - `balanced`: MTP disabled — keep the prefill batch moderate so chunked-prefill stays efficient.
 
-**`reasoning_effort` vs `thinking`.** The Hunyuan chat template is driven by `reasoning_effort` (`high` / `low` / `no_think`), NOT by the `thinking` flag that some other families use. The default is `no_think` (instant). To opt into thinking, pass `reasoning_effort="high"` on the request (the OpenAI-standard field; sglang forwards it to the template). `reasoning_effort: max` is rejected by sglang — use `high`.
+**`reasoning_effort` vs `thinking`.** The Hy3 chat template is driven by `reasoning_effort` (`high` / `low` / `no_think`), NOT by the `thinking` flag that some other families use. The default is `no_think` (instant). To opt into thinking, pass `reasoning_effort="high"` on the request (the OpenAI-standard field; sglang forwards it to the template). `reasoning_effort: max` is rejected by sglang — use `high`.
 
 ## 3. Advanced Usage
 
 ### 3.1 Reasoning (Hybrid Thinking)
 
-Hunyuan 3 is a hybrid-thinking model. Control the thinking budget via `reasoning_effort`:
+Hy3 is a hybrid-thinking model. Control the thinking budget via `reasoning_effort`:
 
 - `high` / `low` — increasing amounts of chain-of-thought in `reasoning_content`
 - `no_think` — skip thinking entirely (instant responses, content-only)
@@ -271,7 +271,7 @@ Content: Relativity is Einstein's theory that space, time, mass, and gravity are
 
 ### 3.2 Tool Calling
 
-Hunyuan 3 supports streaming OpenAI-compatible tool calls. Enable both parsers together — the reasoning parser strips any thinking tokens before the tool-call parser runs:
+Hy3 supports streaming OpenAI-compatible tool calls. Enable both parsers together — the reasoning parser strips any thinking tokens before the tool-call parser runs:
 
 <Accordion title="Deploy with tool-call parser">
 
