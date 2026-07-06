@@ -640,8 +640,15 @@ class LlamaForCausalLM(nn.Module):
         for name, loaded_weight in weights:
             if name.endswith(".activation_scale"):
                 name = name.replace(".activation_scale", ".input_scale")
-            if name.endswith(".weight_scale_inv"):
-                name = name.replace(".weight_scale_inv", ".weight_scale")
+            # Per-tensor FP8 checkpoints may use weight_scale_inv while the
+            # model param is weight_scale. Block FP8 keeps weight_scale_inv.
+            if name.endswith(".weight_scale_inv") and self.quant_config is not None:
+                use_mxfp8 = bool(getattr(self.quant_config, "use_mxfp8", False))
+                weight_block_size = getattr(
+                    self.quant_config, "weight_block_size", None
+                )
+                if not use_mxfp8 and weight_block_size is None:
+                    name = name.replace(".weight_scale_inv", ".weight_scale")
 
             layer_id = get_layer_id(name)
             if (
