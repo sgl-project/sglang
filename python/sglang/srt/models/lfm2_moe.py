@@ -557,9 +557,14 @@ class Lfm2MoeForCausalLM(nn.Module):
                 return head_dim * config.num_attention_heads, config.hidden_size
             return config.hidden_size, config.hidden_size
         elif module_name == "gate_up_proj":
-            # Dense MLP layers (0..num_dense_layers-1)
+            # Dense MLP exists only on layers 0..num_dense_layers-1; report
+            # zero dims for MoE layers so their buffers cost no memory.
+            if layer_idx >= config.num_dense_layers:
+                return 0, 0
             return config.hidden_size, config.intermediate_size * 2
         elif module_name == "down_proj":
+            if layer_idx >= config.num_dense_layers:
+                return 0, 0
             return config.intermediate_size, config.hidden_size
         elif module_name == "gate_up_proj_moe":
             return config.hidden_size, config.moe_intermediate_size * 2
