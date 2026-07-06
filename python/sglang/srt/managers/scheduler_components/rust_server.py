@@ -304,9 +304,10 @@ class RustServer:
         # here). Collapsing N per-request encodes + N FFI crossings to one is what
         # keeps 4k-16k-request PD decode steps off the scheduler's critical path.
         rids = payload.rids
-        finish_types = [
-            (fr.get("type") if isinstance(fr, dict) else None)
-            for fr in payload.finished_reasons
+        # Ship the WHOLE finish-reason dict per request (type + matched + message
+        # + status_code + err_type + length).
+        finish_reasons = [
+            (fr if isinstance(fr, dict) else None) for fr in payload.finished_reasons
         ]
         # `chain.from_iterable` flattens the per-request id arrays in C (no
         # Python-level per-token loop); `tok_lens` splits them back out in Rust.
@@ -315,7 +316,7 @@ class RustServer:
 
         # Column order here MUST match BatchHeader (header_cols) and
         # decode_batch_frame's read order (data_cols).
-        header_cols = [rids, finish_types, list(prompt_tokens), tok_lens]
+        header_cols = [rids, finish_reasons, list(prompt_tokens), tok_lens]
         data_cols = [flat_ids.tobytes()]
 
         if has_extra:
