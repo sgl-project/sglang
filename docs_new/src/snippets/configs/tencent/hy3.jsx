@@ -7,8 +7,8 @@
 // same recipe serves both the preview (suffix-less) and the shipping (suffixed)
 // tokenizer — no per-model hard-coding.
 //
-// BF16 weights are ~552GB, so single-node serving requires 8 GPUs (H200/B200)
-// or 4 GPUs on B300/GB300 (272GB). H100/A100 80GB need multi-node TP=16+.
+// BF16 weights are ~590GB, so single-node serving requires 8 GPUs (H200/B200)
+// or 4 GPUs on B300/GB300 (272GB, TP4) or B200 (180GB, TP4 = 148GB/GPU).
 
 export const config = {
   modelName: "Hy3",
@@ -238,7 +238,7 @@ sgl-eval run aime26 \\
 
   cells: [
     // ====================================================================
-    // H200 (141GB) — TP=8 for BF16 (~552GB)
+    // H200 (141GB) — TP=8 for BF16 (~590GB)
     // ====================================================================
     {
       match: { hw: "h200", variant: "default", quant: "bf16", strategy: "low-latency", nodes: "single" },
@@ -272,7 +272,7 @@ sgl-eval run aime26 \\
     },
 
     // ====================================================================
-    // B200 (180GB) — TP=8 for BF16
+    // B200 (180GB) — TP=4 (BF16 590GB → 148GB/GPU, fits with KV headroom)
     // ====================================================================
     {
       match: { hw: "b200", variant: "default", quant: "bf16", strategy: "low-latency", nodes: "single" },
@@ -281,7 +281,7 @@ sgl-eval run aime26 \\
         "--model-path {{MODEL_NAME}}",
         "--reasoning-parser auto",
         "--tool-call-parser auto",
-        "--tp 8",
+        "--tp 4",
         "--attention-backend trtllm_mha",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
@@ -298,7 +298,7 @@ sgl-eval run aime26 \\
         "--model-path {{MODEL_NAME}}",
         "--reasoning-parser auto",
         "--tool-call-parser auto",
-        "--tp 8",
+        "--tp 4",
         "--attention-backend trtllm_mha",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -374,7 +374,7 @@ sgl-eval run aime26 \\
     },
 
     // ====================================================================
-    // GB200 (sm_100 + aarch64) — TP=4 (single-node 4×192GB = 768GB fits BF16 552GB)
+    // GB200 (sm_100 + aarch64) — TP=4 (single-node 4×192GB = 768GB fits BF16 590GB)
     // ====================================================================
     {
       match: { hw: "gb200", variant: "default", quant: "bf16", strategy: "low-latency", nodes: "single" },

@@ -101,7 +101,7 @@ import { Playground } from "/src/snippets/_playground.jsx";
 
 **Key Features:**
 
-- **MoE Architecture**: 192 routed experts + 1 shared expert, 8 experts activated per token. ~276B total parameters with ~20B active, delivering dense-model quality at MoE inference cost.
+- **MoE Architecture**: 192 routed experts + 1 shared expert, top-8 activated per token. 295B total parameters with 21B active (+3.8B MTP layer), delivering dense-model quality at MoE inference cost.
 - **Hybrid Thinking**: Reasoning modes (`high`, `low`, `no_think`) controllable via OpenAI-standard `reasoning_effort`, allowing the same weights to trade off latency and depth of reasoning.
 - **Native Tool Calling**: Trained on a structured grammar. Pairs with SGLang's `hunyuan` tool-call parser for streaming OpenAI-compatible function-calling output.
 - **Long Context**: 256K token context window (262,144 positions) for repository-scale code and document reasoning.
@@ -124,11 +124,11 @@ import { Playground } from "/src/snippets/_playground.jsx";
   <tbody>
     <tr>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>temperature</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>0.7</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>0.9</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>top_p</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>0.9</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1.0</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>reasoning_effort</code></td>
@@ -141,7 +141,7 @@ import { Playground } from "/src/snippets/_playground.jsx";
 
 ## 2. Configuration Tips
 
-**Hardware requirements (BF16, ~552GB weights):**
+**Hardware requirements (BF16, ~590GB weights):**
 
 <table style={{width: "100%", borderCollapse: "collapse"}}>
   <thead>
@@ -162,8 +162,8 @@ import { Playground } from "/src/snippets/_playground.jsx";
     <tr>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>B200</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>180GB</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>8</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>pass <code>--attention-backend trtllm_mha</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>4</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>BF16 590GB → 148GB/GPU; pass <code>--attention-backend trtllm_mha</code></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>B300 / GB300</td>
