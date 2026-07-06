@@ -2822,26 +2822,38 @@ class DSparkWorkerV2(BaseSpecWorker):
                 prefix_lens_list = [int(x) for x in prefix_lens.detach().cpu().tolist()]
         except Exception:
             prefix_lens_list = []
+        fallback_list = (
+            fallback_tokens.detach().cpu().tolist()
+            if fallback_tokens.numel() == bs
+            else None
+        )
         anchors = []
         for i in range(bs):
             token = None
             req = reqs[i] if i < len(reqs) else None
+            prefix_len_i = (
+                int(prefix_lens_list[i]) if i < len(prefix_lens_list) else None
+            )
             if req is not None:
                 try:
-                    pos = (
-                        int(prefix_lens_list[i]) - 1
-                        if i < len(prefix_lens_list)
-                        else -1
-                    )
                     origin = getattr(req, "origin_input_ids", []) or []
                     output = getattr(req, "output_ids", []) or []
                     origin_len = len(origin)
-                    if 0 <= pos < origin_len:
-                        token = int(origin[pos])
+                    req_seq_len = origin_len + len(output)
+                    if (
+                        prefix_len_i is not None
+                        and req_seq_len < prefix_len_i
+                        and fallback_list is not None
+                    ):
+                        token = int(fallback_list[i])
                     else:
-                        out_pos = pos - origin_len
-                        if 0 <= out_pos < len(output):
-                            token = int(output[out_pos])
+                        pos = int(prefix_len_i) - 1 if prefix_len_i is not None else -1
+                        if 0 <= pos < origin_len:
+                            token = int(origin[pos])
+                        else:
+                            out_pos = pos - origin_len
+                            if 0 <= out_pos < len(output):
+                                token = int(output[out_pos])
                 except Exception:
                     token = None
                 if token is None:
@@ -2855,8 +2867,8 @@ class DSparkWorkerV2(BaseSpecWorker):
                                 token = int(origin[-1])
                     except Exception:
                         token = None
-            if token is None and fallback_tokens.numel() == bs:
-                token = int(fallback_tokens[i].detach().cpu())
+            if token is None and fallback_list is not None:
+                token = int(fallback_list[i])
             if token is None:
                 token = int(self.noise_token_id)
             anchors.append(token)
