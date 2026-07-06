@@ -4409,11 +4409,6 @@ class ServerArgs:
 
         run_post_process_pass(self, _fa4_page_constraint)
 
-        # AMD platforms backends
-        if self.attention_backend == "aiter":
-            if model_config.context_len > 8192:
-                self.mem_fraction_static *= 0.85
-
         # Other platforms backends
         run_post_process_pass(self, _attention_backend_platform_fallbacks)
 
