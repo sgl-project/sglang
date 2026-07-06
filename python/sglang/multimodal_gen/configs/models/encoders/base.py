@@ -76,12 +76,9 @@ class EncoderConfig(ModelConfig):
     quant_config: QuantizationConfig | None = None
     lora_config: Any | None = None
 
-    # Parallel folding runtime state: None = not folded; otherwise the group to
-    # TP-fold this encoder over during the encoding stage (the DiT replica is
-    # idle then), "sp" | "ulysses" | "ring" | "world" ("world" = the full
-    # single-replica DiT, for any tp/sp/cfg combo). adjust_pipeline_config
-    # proposes it from the parallelism; the loader keeps it only for encoders
-    # wide enough to benefit at their real size (finalize_encoder_folding).
+    # Parallel folding: during the encoding stage the whole DiT replica is idle,
+    # so TP-shard the encoder across those otherwise-unused GPUs instead of
+    # running it on a single rank
     parallel_folding_mode: str | None = None
 
 
