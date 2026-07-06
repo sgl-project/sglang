@@ -66,6 +66,7 @@ Select with `--dataset-name`:
 - `generated-shared-prefix`: synthetic dataset with shared long system prompts and short questions
 - `mmmu`: samples from MMMU (Math split) and includes images
 - `speed-bench`: [SPEED-Bench](https://huggingface.co/datasets/nvidia/SPEED-Bench) (**SPEculative Evaluation Dataset**) — a unified benchmark for evaluating [Speculative Decoding (SD)](https://arxiv.org/abs/2604.09557) algorithms. Uses the Throughput split, which provides fixed-length input sequences (1K–32K tokens) grouped into three output-entropy categories (`low_entropy`, `mixed`, `high_entropy`). Requires a pre-downloaded JSONL file passed via `--dataset-path`.
+- `agentic`: multi-turn agentic conversations replayed from real SWE-agent trajectories (OpenHands by default, SWE-smith selectable), padded to exact per-turn token shapes for reproducible KV-cache behavior. Requires a multi-turn chat backend (`sglang-oai-chat`, `vllm-chat`, `lmdeploy-chat`).
 - `agentic-trace`: replays pre-built multi-turn agentic traces (e.g. OpenHands / SWE-smith). Each conversation is replayed round by round, feeding the server's real assistant reply back into the next round's history. Requires a chat backend (`--backend sglang-oai-chat`) and a trace JSON passed via `--dataset-path`.
 
 Common dataset flags:
@@ -106,6 +107,16 @@ SPEED-Bench flags (for `speed-bench`):
 - `--dataset-path PATH`: path to the pre-downloaded SPEED-Bench Throughput JSONL (e.g., `throughput_1k.jsonl`). Use the [SPEED-Bench measurement framework](https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/specdec_bench) to generate it.
 - `--speed-bench-category`: filter to one entropy category: `low_entropy`, `mixed`, or `high_entropy` (default: all)
 - `--speed-bench-output-len`: fixed number of output tokens per request (default: 512)
+
+Agentic dataset flags (for `agentic`):
+
+- `--agentic-source-dataset`, `--agentic-source-split`, `--agentic-source-field`: HF trajectory source (default `nebius/SWE-rebench-openhands-trajectories` / `train` / `trajectory`; SWE-smith uses `SWE-bench/SWE-smith-trajectories` / `tool` / `messages`)
+- `--agentic-first-turn-len`, `--agentic-subsequent-turn-len`, `--agentic-num-turns`: exact per-turn bare-token shape (defaults 74160 / 753 / 13)
+- `--agentic-num-conversations`: built dataset size (default 128), decoupled from `--num-prompts`
+- `--agentic-pad-source {openscience,random}`: pad filler source; both produce bit-identical shapes
+- `--agentic-offset`: first conversation to consume — advance it across sweep steps so each step replays fresh conversations
+- `--agentic-output-len`: per-turn output length (default 220)
+- `--agentic-cache-path`, `--agentic-rebuild`: built-dataset JSON cache control; prebuilt files load via `--dataset-path`
 
 ### Examples
 

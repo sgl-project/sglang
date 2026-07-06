@@ -7,6 +7,9 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 
+# Chat backends whose request function supports multi-turn conversation replay.
+MULTI_TURN_BACKENDS = {"sglang-oai-chat", "vllm-chat", "lmdeploy-chat"}
+
 ASSISTANT_SUFFIX = "Assistant:"
 SHAREGPT_REPO_ID = "anon8231489123/ShareGPT_Vicuna_unfiltered"
 SHAREGPT_FILENAME = "ShareGPT_V3_unfiltered_cleaned_split.json"
@@ -29,6 +32,9 @@ class DatasetRow:
     timestamp: Optional[float] = None
     routing_key: Optional[str] = None
     extra_request_body: Optional[Dict[str, Any]] = None  # Per-request API parameters
+    # Per-round prompt lengths for multi-turn rows; when set, the multi-turn
+    # wrapper records one entry per round instead of repeating prompt_len.
+    prompt_lens: Optional[List[int]] = None
 
     def __post_init__(self):
         if self.text_prompt_len is None:

@@ -40,6 +40,7 @@ from tqdm.asyncio import tqdm
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 from sglang.benchmark.datasets import DatasetRow, get_dataset
+from sglang.benchmark.datasets.common import MULTI_TURN_BACKENDS
 from sglang.benchmark.datasets.mooncake import get_mooncake_request_over_time
 from sglang.benchmark.utils import (
     get_tokenizer,
@@ -92,6 +93,8 @@ class RequestFuncInput:
     extra_request_body: Dict[str, Any]
     timestamp: Optional[float] = None
     routing_key: Optional[str] = None
+    # Per-round prompt lengths for multi-turn conversations (one per round).
+    prompt_lens: Optional[List[int]] = None
 
 
 @dataclass
@@ -108,6 +111,14 @@ class RequestFuncOutput:
     start_time: float = 0.0
     cached_tokens: int = 0
     cached_tokens_details: Optional[Dict[str, Any]] = None
+    # Server-reported `usage.prompt_tokens`, when present.
+    server_prompt_len: Optional[int] = None
+
+    def effective_prompt_len(self) -> int:
+        """Server-reported prompt tokens, else the client-side length."""
+        if self.server_prompt_len is not None:
+            return self.server_prompt_len
+        return self.prompt_len
 
     @staticmethod
     def init_new(request_func_input: RequestFuncInput):
@@ -242,6 +253,42 @@ def _extract_cache_from_sglext(data, output):
             + (details.get("storage") or 0)
         )
         output.cached_tokens_details = details
+
+
+def aggregate_cache_report(outputs: List["RequestFuncOutput"]) -> Dict[str, Any]:
+    """Sum cache-report counters over successful outputs; the prompt-token
+    denominator uses ``effective_prompt_len``."""
+    total_prompt_tokens = 0
+    total_cached = 0
+    total_device = total_host = total_storage = 0
+    storage_backend_name = None
+    has_details = False
+    for o in outputs:
+        if not o.success:
+            continue
+        total_prompt_tokens += o.effective_prompt_len()
+        total_cached += o.cached_tokens
+        if o.cached_tokens_details:
+            has_details = True
+            total_device += o.cached_tokens_details.get("device") or 0
+            total_host += o.cached_tokens_details.get("host") or 0
+            s = o.cached_tokens_details.get("storage") or 0
+            if s:
+                total_storage += s
+                storage_backend_name = o.cached_tokens_details.get("storage_backend")
+    hit_rate = (
+        total_cached / total_prompt_tokens * 100 if total_prompt_tokens > 0 else 0.0
+    )
+    return {
+        "total_prompt_tokens": total_prompt_tokens,
+        "total_cached": total_cached,
+        "total_device": total_device,
+        "total_host": total_host,
+        "total_storage": total_storage,
+        "storage_backend_name": storage_backend_name,
+        "has_details": has_details,
+        "hit_rate": hit_rate,
+    }
 
 
 # set ignore_eos True by default
@@ -434,6 +481,14 @@ async def async_request_openai_chat_completions(
         if "ignore_eos" not in request_func_input.extra_request_body:
             payload["ignore_eos"] = not args.disable_ignore_eos
 
+        # Ask for a final usage chunk so server-reported prompt/completion
+        # token counts are available on the streaming path.
+        if (
+            not args.disable_stream
+            and "stream_options" not in request_func_input.extra_request_body
+        ):
+            payload["stream_options"] = {"include_usage": True}
+
         # Merge in extra parameters (tools, temperature, top_p, etc.)
         # These will override defaults if present
         payload.update(request_func_input.extra_request_body)
@@ -470,9 +525,10 @@ async def async_request_openai_chat_completions(
                         output.ttft = (
                             output.latency
                         )  # For non-streaming, TTFT = total latency
-                        output.output_len = response_json.get("usage", {}).get(
-                            "completion_tokens", output_len
-                        )
+                        usage = response_json.get("usage") or {}
+                        output.output_len = usage.get("completion_tokens", output_len)
+                        if usage.get("prompt_tokens") is not None:
+                            output.server_prompt_len = usage["prompt_tokens"]
                         if getattr(args, "cache_report", False):
                             _extract_cache_from_sglext(response_json, output)
                     else:
@@ -490,9 +546,10 @@ async def async_request_openai_chat_completions(
                                 data = json.loads(chunk)
                                 # Check for usage info in final chunks. OpenAI-compatible
                                 # servers may emit usage-only chunks with choices=[].
-                                output_len = (data.get("usage") or {}).get(
-                                    "completion_tokens", output_len
-                                )
+                                usage = data.get("usage") or {}
+                                output_len = usage.get("completion_tokens", output_len)
+                                if usage.get("prompt_tokens") is not None:
+                                    output.server_prompt_len = usage["prompt_tokens"]
 
                                 if getattr(args, "cache_report", False):
                                     _extract_cache_from_sglext(data, output)
@@ -1069,6 +1126,12 @@ def calculate_metrics(
                 total_input += input_requests[i].prompt_len
                 total_input_text += input_requests[i].text_prompt_len
                 total_input_vision += input_requests[i].vision_prompt_len
+            else:
+                # Multi-turn runs flatten per-round outputs, so there is no
+                # 1:1 mapping to input_requests; account from the outputs.
+                round_input = outputs[i].effective_prompt_len()
+                total_input += round_input
+                total_input_text += round_input
             if output_len > 1:
                 tpots.append((outputs[i].latency - outputs[i].ttft) / (output_len - 1))
             if use_retokenized_itl:
@@ -1211,9 +1274,6 @@ def calculate_metrics(
     return metrics, output_lens
 
 
-MULTI_TURN_BACKENDS = {"sglang-oai-chat", "vllm-chat", "lmdeploy-chat"}
-
-
 def _normalize_round_messages(turn: Any) -> Optional[List[Dict[str, str]]]:
     """Normalize a multi-turn round to a list of message dicts.
 
@@ -1242,6 +1302,13 @@ def wrap_multi_turn_request_func(request_func: Callable, backend: str) -> Callab
         pbar: Optional[tqdm] = None,
     ) -> List[RequestFuncOutput]:
         prompts = request_func_input.prompt
+        round_prompt_lens = request_func_input.prompt_lens
+        if round_prompt_lens is not None and len(round_prompt_lens) != len(prompts):
+            raise ValueError(
+                f"prompt_lens has {len(round_prompt_lens)} entries but the "
+                f"conversation has {len(prompts)} rounds; provide exactly one "
+                "prompt length per round"
+            )
         prev_messages: List[Dict[str, str]] = []
         outputs = []
 
@@ -1258,6 +1325,8 @@ def wrap_multi_turn_request_func(request_func: Callable, backend: str) -> Callab
             inner_input = replace(
                 copy.deepcopy(request_func_input), prompt=copy.deepcopy(prev_messages)
             )
+            if round_prompt_lens is not None:
+                inner_input.prompt_len = round_prompt_lens[round_index]
             output = await request_func(
                 inner_input, pbar=pbar if round_index == len(prompts) - 1 else None
             )
@@ -1367,6 +1436,7 @@ async def benchmark(
         lora_name=lora_name,
         image_data=test_request.image_data,
         extra_request_body=extra_request_body,
+        prompt_lens=test_request.prompt_lens,
     )
 
     # Run warmup requests
@@ -1480,6 +1550,7 @@ async def benchmark(
             extra_request_body=merged_extra_body,
             timestamp=request.timestamp,
             routing_key=request.routing_key,
+            prompt_lens=request.prompt_lens,
         )
 
         tasks.append(
@@ -1488,7 +1559,14 @@ async def benchmark(
             )
         )
     outputs: List[RequestFuncOutput] = await asyncio.gather(*tasks)
+    total_conversations = None
+    completed_conversations = None
     if is_multi_turn:
+        # Each task returns one conversation (a list of per-round outputs).
+        total_conversations = len(outputs)
+        completed_conversations = sum(
+            1 for conversation in outputs if all(o.success for o in conversation)
+        )
         outputs = [x for output in outputs for x in output]
 
     # Stop profiler (only if profile_steps was not provided, as it auto-stops)
@@ -1558,6 +1636,12 @@ async def benchmark(
         )
     )
     print("{:<40} {:<10}".format("Successful requests:", metrics.completed))
+    if is_multi_turn:
+        # Multi-turn: each request above is one conversation round (turn).
+        print(
+            "{:<40} {:<10}".format("Successful conversations:", completed_conversations)
+        )
+        print("{:<40} {:<10}".format("Total conversations:", total_conversations))
     print("{:<40} {:<10.2f}".format("Benchmark duration (s):", benchmark_duration))
     print("{:<40} {:<10}".format("Total input tokens:", metrics.total_input))
     print("{:<40} {:<10}".format("Total input text tokens:", metrics.total_input_text))
@@ -1655,29 +1739,15 @@ async def benchmark(
         print("{:<40} {:<10.2f}".format("P99 ITL (ms):", metrics.p99_itl_ms))
         print("{:<40} {:<10.2f}".format("Max ITL (ms):", metrics.max_itl_ms))
     if args.cache_report:
-        total_prompt_tokens = 0
-        total_cached = 0
-        total_device = total_host = total_storage = 0
-        storage_backend_name = None
-        has_details = False
-        for o in outputs:
-            if not o.success:
-                continue
-            total_prompt_tokens += o.prompt_len
-            total_cached += o.cached_tokens
-            if o.cached_tokens_details:
-                has_details = True
-                total_device += o.cached_tokens_details.get("device") or 0
-                total_host += o.cached_tokens_details.get("host") or 0
-                s = o.cached_tokens_details.get("storage") or 0
-                if s:
-                    total_storage += s
-                    storage_backend_name = o.cached_tokens_details.get(
-                        "storage_backend"
-                    )
-        hit_rate = (
-            total_cached / total_prompt_tokens * 100 if total_prompt_tokens > 0 else 0.0
-        )
+        cache_agg = aggregate_cache_report(outputs)
+        total_prompt_tokens = cache_agg["total_prompt_tokens"]
+        total_cached = cache_agg["total_cached"]
+        total_device = cache_agg["total_device"]
+        total_host = cache_agg["total_host"]
+        total_storage = cache_agg["total_storage"]
+        storage_backend_name = cache_agg["storage_backend_name"]
+        has_details = cache_agg["has_details"]
+        hit_rate = cache_agg["hit_rate"]
 
         print("{s:{c}^{n}}".format(s="Cache Hit Details", n=50, c="-"))
         print("{:<40} {:<10}".format("Total prompt tokens:", total_prompt_tokens))
@@ -1732,6 +1802,8 @@ async def benchmark(
             # Results
             "duration": benchmark_duration,
             "completed": metrics.completed,
+            "completed_conversations": completed_conversations,
+            "total_conversations": total_conversations,
             "total_input_tokens": metrics.total_input,
             "total_input_text_tokens": metrics.total_input_text,
             "total_input_vision_tokens": metrics.total_input_vision,
@@ -2092,6 +2164,23 @@ def _finite_positive_float(value) -> float:
     return parsed
 
 
+def _validate_parsed_agentic_args(
+    parser: argparse.ArgumentParser, args: argparse.Namespace
+) -> None:
+    """Reject invalid agentic configurations at parse time, before server
+    readiness checks or a multi-minute dataset build."""
+    if args.dataset_name != "agentic":
+        return
+    if args.backend not in MULTI_TURN_BACKENDS:
+        parser.error(
+            f"--dataset-name agentic requires a multi-turn chat backend "
+            f"({', '.join(sorted(MULTI_TURN_BACKENDS))}); got --backend "
+            f"{args.backend}"
+        )
+    if args.agentic_offset < 0:
+        parser.error(f"--agentic-offset must be >= 0, got {args.agentic_offset}")
+
+
 def _validate_parsed_gsp_args(
     parser: argparse.ArgumentParser, args: argparse.Namespace
 ) -> None:
@@ -2158,6 +2247,7 @@ def cli_main():
         type=str,
         default="sharegpt",
         choices=[
+            "agentic",
             "agentic-trace",
             "autobench",
             "sharegpt",
@@ -2646,6 +2736,120 @@ def cli_main():
         ],
         help="Underlying workload for the mooncake dataset.",
     )
+
+    agentic_group = parser.add_argument_group("agentic dataset arguments")
+    agentic_group.add_argument(
+        "--agentic-source-dataset",
+        type=str,
+        default="nebius/SWE-rebench-openhands-trajectories",
+        help="HF dataset providing the agentic trajectories.",
+    )
+    agentic_group.add_argument(
+        "--agentic-source-split",
+        type=str,
+        default="train",
+        help="Split of the source dataset (SWE-smith uses 'tool').",
+    )
+    agentic_group.add_argument(
+        "--agentic-source-field",
+        type=str,
+        default="trajectory",
+        help="Column of the source dataset holding the trajectory message "
+        "list (SWE-smith uses 'messages').",
+    )
+    agentic_group.add_argument(
+        "--agentic-only-resolved",
+        action="store_true",
+        help="Keep only trajectories with resolved == 1 (OpenHands sources).",
+    )
+    agentic_group.add_argument(
+        "--agentic-first-turn-len",
+        type=int,
+        default=74160,
+        help="Target bare-token size of turn 1 (synthetic system prompt "
+        "plus real first user message).",
+    )
+    agentic_group.add_argument(
+        "--agentic-subsequent-turn-len",
+        type=int,
+        default=753,
+        help="Target bare-token size of each subsequent turn's user content "
+        "(real + synthetic pad).",
+    )
+    agentic_group.add_argument(
+        "--agentic-num-turns",
+        type=int,
+        default=13,
+        help="Number of turns per conversation.",
+    )
+    agentic_group.add_argument(
+        "--agentic-num-conversations",
+        type=int,
+        default=128,
+        help="Number of conversations to build into the cached dataset; "
+        "decoupled from --num-prompts so one build covers a whole sweep.",
+    )
+    agentic_group.add_argument(
+        "--agentic-pad-source",
+        type=str,
+        choices=["openscience", "random"],
+        default="openscience",
+        help="Pad filler: real reasoning traces ('openscience') or seeded "
+        "random text ('random'); both are sized to identical shapes.",
+    )
+    agentic_group.add_argument(
+        "--agentic-pad-dataset",
+        type=str,
+        default="nvidia/OpenScienceReasoning-2",
+        help="HF dataset providing pad text when --agentic-pad-source=openscience.",
+    )
+    agentic_group.add_argument(
+        "--agentic-pad-split",
+        type=str,
+        default="train",
+        help="Split of --agentic-pad-dataset to stream pad text from.",
+    )
+    agentic_group.add_argument(
+        "--agentic-pad-text-field",
+        type=str,
+        default="output",
+        help="Field of the pad dataset whose text is used as filler.",
+    )
+    agentic_group.add_argument(
+        "--agentic-max-real-first-turn-frac",
+        type=float,
+        default=0.5,
+        help="Upper bound on the fraction of the turn-1 budget that real "
+        "user content can occupy; the rest is the unique synthetic system "
+        "prompt.",
+    )
+    agentic_group.add_argument(
+        "--agentic-offset",
+        type=int,
+        default=0,
+        help="First conversation to consume; a run uses the slice "
+        "[offset, offset + num-prompts) with no recycling, so advancing the "
+        "offset across sweep steps replays fresh conversations.",
+    )
+    agentic_group.add_argument(
+        "--agentic-output-len",
+        type=int,
+        default=220,
+        help="Per-turn output length (max_completion_tokens) for agentic "
+        "conversations.",
+    )
+    agentic_group.add_argument(
+        "--agentic-cache-path",
+        type=str,
+        default="",
+        help="Where the built dataset JSON is cached. Defaults to a "
+        "configuration-keyed file under ~/.cache/sglang/benchmark/.",
+    )
+    agentic_group.add_argument(
+        "--agentic-rebuild",
+        action="store_true",
+        help="Force a rebuild of the agentic dataset, ignoring any cache.",
+    )
     parser.add_argument(
         "--fake-prefill",
         action="store_true",
@@ -2666,6 +2870,7 @@ def cli_main():
     )
     args = parser.parse_args()
     _validate_parsed_gsp_args(parser, args)
+    _validate_parsed_agentic_args(parser, args)
     run_benchmark(args)
 
 
