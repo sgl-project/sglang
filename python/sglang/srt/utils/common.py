@@ -1466,6 +1466,65 @@ def broadcast_pyobj(
         return data
 
 
+def broadcast_pyobj_frames(
+    frames: List[bytes],
+    rank: int,
+    dist_group: Optional[torch.distributed.ProcessGroup] = None,
+    src: int = 0,
+):
+    """Broadcast a list of already-serialized pickle frames from src to all
+    other ranks, avoiding a re-serialization pass.
+
+    Unlike ``broadcast_pyobj`` (which re-``pickle.dumps`` the whole list on the
+    source rank), this reuses byte buffers that were produced upstream (e.g. the
+    raw ZMQ frames sent by the tokenizer via ``send_pyobj``).  Each frame is one
+    ``pickle.dumps(obj)`` blob; callers ``pickle.loads`` each returned frame
+    exactly once per rank.
+
+    Wire layout (single self-describing blob, so exactly two collectives per
+    call like ``broadcast_pyobj``; one collective when empty):
+
+        [ num_frames : int32 ][ len_0 : int32 ] ... [ len_{n-1} : int32 ]
+        [ frame_0 bytes ] ... [ frame_{n-1} bytes ]
+
+    The leading int32 array is fixed-width per its own count, so the receiver
+    can parse the header from the front of the blob without a prior collective.
+    """
+    device = torch.device("cpu")
+
+    if rank == src:
+        num = len(frames)
+        if num == 0:
+            tensor_size = torch.tensor([0], dtype=torch.long, device=device)
+            dist.broadcast(tensor_size, src=src, group=dist_group)
+            return frames
+        lengths = np.array([num, *[len(f) for f in frames]], dtype=np.int32)
+        blob = lengths.tobytes() + b"".join(frames)
+        size = len(blob)
+        tensor_size = torch.tensor([size], dtype=torch.long, device=device)
+        tensor_data = torch.frombuffer(bytearray(blob), dtype=torch.uint8)
+        dist.broadcast(tensor_size, src=src, group=dist_group)
+        dist.broadcast(tensor_data, src=src, group=dist_group)
+        return frames
+    else:
+        tensor_size = torch.tensor([0], dtype=torch.long, device=device)
+        dist.broadcast(tensor_size, src=src, group=dist_group)
+        size = int(tensor_size.item())
+        if size == 0:
+            return []
+        tensor_data = torch.empty(size, dtype=torch.uint8, device=device)
+        dist.broadcast(tensor_data, src=src, group=dist_group)
+        blob = tensor_data.numpy().tobytes()
+        num = int(np.frombuffer(blob, dtype=np.int32, count=1)[0])
+        lengths = np.frombuffer(blob, dtype=np.int32, count=num + 1)[1:]
+        off = (num + 1) * 4
+        out = []
+        for ln in lengths:
+            out.append(blob[off : off + int(ln)])
+            off += int(ln)
+        return out
+
+
 def point_to_point_pyobj(
     data: List[Any],
     rank: int,
