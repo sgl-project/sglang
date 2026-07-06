@@ -241,6 +241,14 @@ impl Drop for Runtime {
 /// so the Python caller regains control of the GIL immediately. `Err` on a
 /// startup misconfiguration (e.g. no tokenizer for a non-skip server).
 pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
+    // Bind the API server port before spawning any thread, so an unavailable
+    // port (EADDRINUSE) is a hard startup error.
+    let listener = std::net::TcpListener::bind(cfg.bind)
+        .map_err(|e| format!("bind {} failed: {e}", cfg.bind))?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|e| format!("listener set_nonblocking failed: {e}"))?;
+
     let (shutdown_tx, shutdown_rx) = flume::unbounded::<()>();
     let mut threads = Vec::new();
     let plan = plan_cores(&cfg);
@@ -390,7 +398,7 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
                 }
                 let rt = builder.build().expect("build api runtime");
                 rt.block_on(api_server::serve(
-                    cfg.bind,
+                    listener,
                     senders,
                     id_gen,
                     cfg.channel_cap,
@@ -437,18 +445,12 @@ mod tests {
             server_args: Arc::new(server_args),
             ..Default::default()
         };
+        // Bind is synchronous in `start`, so the port is already accepting.
         let rt = start(cfg).expect("start runtime");
-
-        // The listener binds asynchronously on the api thread; wait for it.
-        let mut up = false;
-        for _ in 0..100 {
-            if std::net::TcpStream::connect(addr).is_ok() {
-                up = true;
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-        assert!(up, "server never started listening on {addr}");
+        assert!(
+            std::net::TcpStream::connect(addr).is_ok(),
+            "server not listening on {addr} after start returned",
+        );
 
         // Joins the api thread; the listener is closed by the time it returns.
         rt.request_shutdown();
@@ -457,5 +459,30 @@ mod tests {
             std::net::TcpStream::connect(addr).is_err(),
             "port still accepting connections after shutdown",
         );
+    }
+
+    /// Regression: a port conflict must fail `start` (so the scheduler doesn't
+    /// advertise ready), not return an `Ok` runtime whose listener never binds.
+    #[test]
+    fn start_fails_on_port_conflict() {
+        // Hold the port so the runtime's bind conflicts (EADDRINUSE).
+        let hog = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = hog.local_addr().unwrap();
+
+        let server_args = ServerArgs::from_json(r#"{"skip_tokenizer_init": true}"#).unwrap();
+        let cfg = RuntimeConfig {
+            bind: addr,
+            pin_cores: false,
+            api_worker_num: 1,
+            tokenizer_worker_num: 1,
+            detokenizer_worker_num: 1,
+            server_args: Arc::new(server_args),
+            ..Default::default()
+        };
+        let err = match start(cfg) {
+            Ok(_) => panic!("bind conflict must fail startup, got Ok"),
+            Err(e) => e,
+        };
+        assert!(err.contains("bind"), "error should mention bind: {err}");
     }
 }
