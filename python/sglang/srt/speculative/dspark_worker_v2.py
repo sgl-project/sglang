@@ -253,6 +253,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._boundary_debug_by_req_pool: dict[int, dict] = {}
         self._target_aux_debug_by_req_pool: dict[int, dict] = {}
         self._prefill_tail_replay_debug_by_req_pool: dict[int, dict] = {}
+        self._last_prefill_tail_replay_executed_debug_by_req_pool: dict[int, dict] = {}
         self._swa_write_source_by_req_pool: dict[int, dict[int, str]] = {}
         self._last_valid_swa_locs_by_req_pool_debug: dict[int, list[int]] = {}
         self._swa_write_source_snapshot_by_req_pool: Optional[
@@ -1537,6 +1538,9 @@ class DSparkWorkerV2(BaseSpecWorker):
                     "writes": loc_payload,
                 }
             )
+            self._last_prefill_tail_replay_executed_debug_by_req_pool[
+                int(req_pool_idx)
+            ] = dict(payload)
         except Exception as e:
             self._prefill_tail_replay_debug_by_req_pool[int(req_pool_idx)] = {
                 "error": str(e)
@@ -1575,7 +1579,52 @@ class DSparkWorkerV2(BaseSpecWorker):
                 writes.get("swa_locs")
             )
             out["write_hidden"] = writes.get("hidden")
+        last_executed = self._last_prefill_tail_replay_executed_debug_by_req_pool.get(
+            int(req_pool_idx)
+        )
+        if isinstance(last_executed, dict) and not isinstance(writes, dict):
+            last_writes = last_executed.get("writes")
+            compact = {
+                key: last_executed.get(key)
+                for key in (
+                    "valid_write_count",
+                    "tail_len",
+                    "tail_end_len",
+                    "prefix_len",
+                    "tail_end_minus_prefix",
+                )
+                if key in last_executed
+            }
+            if isinstance(last_writes, dict):
+                compact["write_positions_first_last"] = self._first_last_debug_values(
+                    last_writes.get("positions")
+                )
+                compact["write_swa_first_last"] = self._first_last_debug_values(
+                    last_writes.get("swa_locs")
+                )
+                compact["write_hidden"] = last_writes.get("hidden")
+            out["last_executed"] = compact
         return out
+
+    def _decode_verify_write_history_debug(self, req_pool_idx: int) -> Optional[dict]:
+        debug = self._boundary_debug_by_req_pool.get(int(req_pool_idx))
+        if not isinstance(debug, dict):
+            return None
+        payload = debug.get("decode_verify_write")
+        if not isinstance(payload, dict):
+            return None
+        return {
+            "commit_len": payload.get("commit_len"),
+            "prefix_len": payload.get("prefix_len"),
+            "new_seq_len": payload.get("new_seq_len"),
+            "write_positions_first_last": self._first_last_debug_values(
+                payload.get("positions")
+            ),
+            "write_swa_first_last": self._first_last_debug_values(
+                payload.get("swa_locs")
+            ),
+            "write_hidden": payload.get("hidden"),
+        }
 
     @staticmethod
     def _first_last_debug_values(values) -> Optional[list[int]]:
@@ -2913,6 +2962,9 @@ class DSparkWorkerV2(BaseSpecWorker):
                     "valid_window_sources": valid_window_sources,
                     "prefill_tail_replay_debug": (
                         self._prefill_tail_replay_history_debug(int(req_pool_idx))
+                    ),
+                    "decode_verify_write_debug": (
+                        self._decode_verify_write_history_debug(int(req_pool_idx))
                     ),
                 }
             )
