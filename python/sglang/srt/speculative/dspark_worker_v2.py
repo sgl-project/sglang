@@ -1272,6 +1272,19 @@ class DSparkWorkerV2(BaseSpecWorker):
             ],
         }
 
+    @staticmethod
+    def _summarize_weight_vector(weight: Optional[torch.Tensor]) -> Optional[dict]:
+        if weight is None or weight.numel() == 0:
+            return None
+        weight_f = weight.detach().float()
+        return {
+            "shape": [int(x) for x in weight.shape],
+            "l2": float(torch.linalg.vector_norm(weight_f).detach().cpu()),
+            "abs_mean": float(weight_f.abs().mean().detach().cpu()),
+            "min": float(weight_f.min().detach().cpu()),
+            "max": float(weight_f.max().detach().cpu()),
+        }
+
     def _target_aux_payload(
         self,
         *,
@@ -1288,12 +1301,30 @@ class DSparkWorkerV2(BaseSpecWorker):
         target_layer_ids = list(getattr(self._draft_inner, "target_layer_ids", []) or [])
         hidden_size = int(getattr(self._draft_inner, "hidden_size", 0))
         raw = raw_hidden_rows.detach()
+        projected = projected_rows.detach()
+        raw_norm = torch.linalg.vector_norm(raw.float(), dim=-1)
+        projected_norm = torch.linalg.vector_norm(projected.float(), dim=-1)
+        norm_ratio = projected_norm / raw_norm.clamp_min(1e-6)
         decoder_layer_ids = [int(layer_id) for layer_id in target_layer_ids]
         payload = {
             "target_layer_ids": [int(x) for x in target_layer_ids],
             "decoder_layer_ids": decoder_layer_ids,
             "raw": self._summarize_hidden_rows(raw),
-            "projected": self._summarize_hidden_rows(projected_rows.detach()),
+            "projected": self._summarize_hidden_rows(projected),
+            "projected_to_raw_norm_ratio_first_last": [
+                float(norm_ratio[0].detach().cpu()),
+                float(norm_ratio[-1].detach().cpu()),
+            ],
+            "main_norm_weight": self._summarize_weight_vector(
+                getattr(getattr(self._draft_inner, "main_norm", None), "weight", None)
+            ),
+            "shared_norm_weight": self._summarize_weight_vector(
+                getattr(
+                    getattr(getattr(self._draft_inner, "shared_head", None), "norm", None),
+                    "weight",
+                    None,
+                )
+            ),
         }
         if target_layer_ids and hidden_size > 0 and raw.shape[-1] == (
             len(target_layer_ids) * hidden_size
