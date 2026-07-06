@@ -502,10 +502,35 @@ class ServerArgs:
                 'Which model-config parser to use. "auto" picks "mistral" '
                 'via the is_mistral_model name heuristic, else "hf" '
                 "(AutoConfig over config.json). Plugins can register additional "
-                "parsers via @register_model_config_parser."
+                "parsers via @register_model_config_parser. See also "
+                "--config-format (vLLM-style alias)."
             )
         ),
     ] = "auto"
+    # Implemented as a separate field (rather than an
+    # Arg(aliases=["--config-format"]) on model_config_parser) so that
+    # passing both flags with conflicting values raises an error instead of
+    # silently letting whichever flag appears last on the command line win;
+    # see _handle_config_format().
+    config_format: A[
+        Optional[str],
+        Arg(
+            help=(
+                "vLLM-style alias for --model-config-parser. Accepts the same "
+                'values ("auto", "hf", "mistral", or any plugin-registered '
+                "parser name; matching is case- and whitespace-insensitive). "
+                "If --model-config-parser is also explicitly set to a "
+                "different value, this raises an error rather than silently "
+                'picking one -- "auto" is compared like any other explicit '
+                "value, so e.g. --config-format=auto together with an "
+                "explicit --model-config-parser=hf also raises. If "
+                "--config-format=mistral and --load-format is left at its "
+                'default, --load-format is also set to "mistral" so '
+                "vLLM-style Mistral invocations (--config-format mistral "
+                "--load-format mistral) work verbatim on SGLang."
+            )
+        ),
+    ] = None
     json_model_override_args: A[
         str,
         "A dictionary in JSON string format used to override default model configurations.",
@@ -2650,6 +2675,11 @@ class ServerArgs:
         self._handle_legacy_cp_arguments()
         self._validate_prefill_only_disable_kv_cache_args()
         self._handle_dcp_validation()
+
+        # Reconcile the vLLM-style --config-format alias with
+        # --model-config-parser before the dummy-model short-circuit below,
+        # so a conflicting-flags mistake is caught even for dummy/none models.
+        self._handle_config_format()
 
         if self.model_path.lower() in ["none", "dummy"]:
             # Skip for dummy models
@@ -5362,6 +5392,34 @@ class ServerArgs:
             f"Mooncake storage backend does not support layer_first layout, "
             f"switching to {new_layout} layout for {self.hicache_io_backend} io backend"
         )
+
+    def _handle_config_format(self):
+        # --config-format is the vLLM-style alias for --model-config-parser.
+        # If the user passed the alias, it takes precedence. Erroring on
+        # simultaneous conflicting values is more useful than silently
+        # picking a winner.
+        if self.config_format is None:
+            return
+        self.config_format = self.config_format.strip().lower()
+        if not self.config_format:
+            # "" / whitespace-only is treated the same as not passing the flag.
+            return
+        if (
+            self.model_config_parser.lower() != "auto"
+            and self.model_config_parser.lower() != self.config_format
+        ):
+            raise ValueError(
+                f"--config-format={self.config_format!r} conflicts with "
+                f"--model-config-parser={self.model_config_parser!r}. "
+                "Pass only one."
+            )
+        self.model_config_parser = self.config_format
+        # vLLM-style invocations often pass --load-format mistral explicitly,
+        # but when they don't, the alias's "mistral" choice should still
+        # drive weight loading -- unless the user already picked a different
+        # load format explicitly.
+        if self.config_format == "mistral" and self.load_format == "auto":
+            self.load_format = "mistral"
 
     def _handle_load_format(self):
         # The quantization side of the gguf coupling moved to the pipeline
