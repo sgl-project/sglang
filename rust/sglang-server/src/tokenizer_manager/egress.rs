@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use bytes::Bytes;
 
 use crate::ids::RequestId;
-use crate::message::{EGRESS_TAG_BATCH, EGRESS_TAG_ERROR, EGRESS_TAG_RESULT, decode_batch_frame};
+use crate::message::{EGRESS_TAG_BATCH, EGRESS_TAG_ERROR, EGRESS_TAG_RESULT, for_each_chunk};
 use crate::runtime::Runnable;
 use crate::runtime::channels::{DetokMsg, Senders, recv};
 use crate::runtime::ring::EgressConsumer;
@@ -57,22 +57,21 @@ impl Runnable for Egress {
                 continue;
             };
             match tag {
-                // A whole decode batch: fan out into per-request chunks here,
-                // routing each by rid (the seq/load-balance the Python side used
-                // to track is now implicit in this rid-based routing).
+                // A whole decode batch: decode each request and route it by rid in
+                // one pass (no intermediate `Vec<ChunkEvent>`; routing overlaps
+                // decode, peak memory is one request). The seq/load-balance the
+                // Python side used to track is now implicit in rid-based routing.
                 EGRESS_TAG_BATCH => {
-                    let Some(events) = decode_batch_frame(body) else {
+                    let ok = for_each_chunk(body, |ev| {
+                        if let Some(rid) = parse_rid(&ev.rid) {
+                            self.route(rid, DetokMsg::Chunk(ev));
+                        }
+                    });
+                    if !ok {
                         tracing::warn!("egress: bad batch frame");
-                        continue;
-                    };
-                    for ev in events {
-                        let Some(rid) = parse_rid(&ev.rid) else {
-                            continue;
-                        };
-                        self.route(rid, DetokMsg::Chunk(ev));
                     }
                     // Any frame off the ring = the scheduler produced output → the
-                    // pipeline is alive. Bump the heartbeat before routing.
+                    // pipeline is alive.
                     self.activity.fetch_add(1, Ordering::Relaxed);
                 }
                 EGRESS_TAG_RESULT => {
