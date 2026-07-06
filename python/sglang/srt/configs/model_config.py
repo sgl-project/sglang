@@ -777,8 +777,11 @@ class ModelConfig:
             or "DeepseekV4ForCausalLMNextN" in self.hf_config.architectures
         ):
             self.qk_rope_head_dim = self.hf_config.qk_rope_head_dim
-            self.qk_nope_head_dim = self.hf_config.head_dim - self.qk_rope_head_dim
-            self.window_size = self.hf_config.sliding_window
+            if hasattr(self.hf_config, 'head_dim'):
+                self.qk_nope_head_dim = self.hf_config.head_dim - self.qk_rope_head_dim
+            else:
+                self.qk_nope_head_dim = self.hf_config.qk_nope_head_dim
+            self.window_size = getattr(self.hf_config, "sliding_window", getattr(self.hf_config, "window_size", None))
             self.head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
             self.v_head_dim = self.head_dim
             self.index_head_dim = self.hf_config.index_head_dim
