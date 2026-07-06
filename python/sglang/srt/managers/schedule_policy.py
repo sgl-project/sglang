@@ -1030,6 +1030,12 @@ class PrefillAdder:
             # - if the can_run_list is empty, always accept the first prefill request
             return AddReqResult.OTHER
 
+        # Normalize both the current device node and any deeper host node before
+        # admission/load-back locks make structural splits unsafe.
+        self.tree_cache.prepare_swa_compute_lock(req.last_node)
+        if req.needs_host_load_back():
+            self.tree_cache.prepare_swa_compute_lock(req.best_match_node)
+
         with self._lock_node(req.last_node):
             # self.rem_total_tokens may decrease after the lock acquisition
             if total_tokens >= self.rem_total_tokens:

@@ -297,13 +297,19 @@ class SWAComponent(TreeComponent):
 
         self._maybe_split_leaf_for_swa_lock(node)
 
-    def _maybe_split_leaf_for_swa_lock(self, leaf: UnifiedTreeNode) -> None:
-        """Cap a fresh SWA leaf at one page-aligned window so locking it pins
-        only one window of SWA pool, not the whole (long chunked-prefill) leaf.
+    def _maybe_split_leaf_for_swa_lock(
+        self, leaf: UnifiedTreeNode, *, preserve_lru_position: bool = False
+    ) -> None:
+        """Cap an SWA node at a page-aligned suffix so locking it pins
+        only the needed window, not the whole long chunked-prefill node.
         """
         ct = self.component_type
         cd = leaf.component_data[ct]
-        if leaf is self.cache.root_node or cd.value is None or cd.lock_ref > 0:
+        if (
+            leaf is self.cache.root_node
+            or (cd.value is None and cd.host_value is None)
+            or cd.lock_ref > 0
+        ):
             return
 
         page_size = self.cache.page_size
@@ -316,7 +322,12 @@ class SWAComponent(TreeComponent):
         if page_size > 1 and (split_at % page_size != 0 or leaf_len % page_size != 0):
             return
 
-        self.cache._split_node(leaf.key, leaf, split_at)
+        self.cache._split_node(
+            leaf.key,
+            leaf,
+            split_at,
+            preserve_lru_position=preserve_lru_position,
+        )
 
     def redistribute_on_node_split(
         self, new_parent: UnifiedTreeNode, child: UnifiedTreeNode
