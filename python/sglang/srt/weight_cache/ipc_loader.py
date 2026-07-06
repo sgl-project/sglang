@@ -405,9 +405,9 @@ class IpcModelLoader(BaseModelLoader):
 
             ep_size = get_moe_expert_parallel_world_size()
 
-            from sglang.srt.server_args import get_global_server_args
+            from sglang.srt.runtime_context import get_server_args
 
-            dp_size = get_global_server_args().dp_size
+            dp_size = get_server_args().dp_size
 
             quant_config = getattr(model_config, "hf_config", None)
             if quant_config is not None:
