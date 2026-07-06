@@ -97,6 +97,16 @@ class XGrammarGrammar(BaseGrammarObject):
     def is_terminated(self):
         return self.matcher.is_terminated()
 
+    # Opt in to the persistent double-buffered vocab-mask pool: xgrammar uses a
+    # host int32 token bitmask that is copied to device each step, which the
+    # pool can reuse instead of re-allocating + re-copying every step.
+    supports_vocab_mask_pool = True
+
+    def get_vocab_mask_pool(self, vocab_size: int, max_bs: int, device):
+        from sglang.srt.constrained.vocab_mask_pool import get_vocab_mask_pool
+
+        return get_vocab_mask_pool(vocab_size, max_bs, device)
+
     def allocate_vocab_mask(
         self, vocab_size: int, batch_size: int, device
     ) -> torch.Tensor:

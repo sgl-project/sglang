@@ -228,23 +228,41 @@ class SamplingBatchInfo:
         # Find a grammar from the list
         first_grammar = next(grammar for grammar in self.grammars if grammar)
 
-        # TODO(lianmin): Maybe we can reuse the existing mask?
-        self.vocab_mask = first_grammar.allocate_vocab_mask(
-            vocab_size=self.vocab_size,
-            batch_size=len(self.temperatures),
-            device=self.device,
-        )
+        bs = len(self.temperatures)
         self.apply_mask_func = (
             first_grammar.apply_vocab_mask
         )  # force to use static method
 
-        # Apply the mask
-        for i, grammar in enumerate(self.grammars):
-            if grammar and not grammar.finished and not grammar.is_terminated():
-                grammar.fill_vocab_mask(self.vocab_mask, i)
+        # Reuse persistent, double-buffered host+device bitmask buffers when the
+        # backend supports it (see constrained/vocab_mask_pool.py). This avoids
+        # allocating a fresh host bitmask and issuing a fresh H2D copy each step.
+        pool = (
+            first_grammar.get_vocab_mask_pool(self.vocab_size, bs, self.device)
+            if getattr(first_grammar, "supports_vocab_mask_pool", False)
+            else None
+        )
 
-        # Move the mask to the device if needed
-        self.vocab_mask = first_grammar.move_vocab_mask(self.vocab_mask, self.device)
+        if pool is not None:
+            # host_view() resets the used rows to "all allowed"; fill in place.
+            host_mask = pool.host_view(bs)
+            for i, grammar in enumerate(self.grammars):
+                if grammar and not grammar.finished and not grammar.is_terminated():
+                    grammar.fill_vocab_mask(host_mask, i)
+            # Single async host->device copy into the current double-buffer slot.
+            self.vocab_mask = pool.commit_to_device(bs)
+        else:
+            # Legacy path: fresh allocation + fill + move each step.
+            self.vocab_mask = first_grammar.allocate_vocab_mask(
+                vocab_size=self.vocab_size,
+                batch_size=bs,
+                device=self.device,
+            )
+            for i, grammar in enumerate(self.grammars):
+                if grammar and not grammar.finished and not grammar.is_terminated():
+                    grammar.fill_vocab_mask(self.vocab_mask, i)
+            self.vocab_mask = first_grammar.move_vocab_mask(
+                self.vocab_mask, self.device
+            )
 
     def update_penalties(self):
         if self.penalizer_orchestrator.is_required:
