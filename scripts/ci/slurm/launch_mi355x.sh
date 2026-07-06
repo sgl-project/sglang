@@ -167,6 +167,7 @@ if [[ -n "${MOONCAKE_COMMIT_OVERRIDE:-}" ]]; then
     MOONCAKE_REPO="${MOONCAKE_REPO:-https://github.com/kvcache-ai/Mooncake.git}"
     MOONCAKE_ENV_STR="-e MOONCAKE_COMMIT_OVERRIDE=$MOONCAKE_COMMIT_OVERRIDE -e MOONCAKE_REPO=$MOONCAKE_REPO"
     echo "Mooncake override enabled: repo=$MOONCAKE_REPO commit=$MOONCAKE_COMMIT_OVERRIDE"
+    [[ -n "${MOONCAKE_CMAKE_FLAGS:-}" ]] && echo "Mooncake CMake flags override: $MOONCAKE_CMAKE_FLAGS"
 fi
 
 # ---------------------------------------------------------------------------
@@ -248,9 +249,23 @@ with open(sys.argv[2], "w") as f:
     f.write(f"MODEL_SERVER_ARGS=({q(server_args)})\n")
 PY
 
+MOONCAKE_COMMIT_Q="$(printf '%q' "${MOONCAKE_COMMIT_OVERRIDE:-}")"
+MOONCAKE_REPO_Q="$(printf '%q' "${MOONCAKE_REPO:-}")"
+MOONCAKE_CMAKE_FLAGS_Q="$(printf '%q' "${MOONCAKE_CMAKE_FLAGS:-}")"
+cat > "$WORKDIR/mooncake_env.sh" <<EOF
+export MOONCAKE_COMMIT_OVERRIDE=$MOONCAKE_COMMIT_Q
+export MOONCAKE_REPO=$MOONCAKE_REPO_Q
+export MOONCAKE_CMAKE_FLAGS=$MOONCAKE_CMAKE_FLAGS_Q
+EOF
+
 cat > "$WORKDIR/install_mooncake.sh" <<'EOF'
 #!/bin/bash
 set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -f "${SCRIPT_DIR}/mooncake_env.sh" ]]; then
+  source "${SCRIPT_DIR}/mooncake_env.sh"
+fi
 
 if [[ -z "${MOONCAKE_COMMIT_OVERRIDE:-}" ]]; then
   exit 0
@@ -262,6 +277,7 @@ MOONCAKE_BUILD_JOBS="${MOONCAKE_BUILD_JOBS:-$(nproc)}"
 MOONCAKE_CMAKE_FLAGS="${MOONCAKE_CMAKE_FLAGS:--DUSE_HIP=ON -DUSE_ETCD=ON -DENABLE_MULTI_PROTOCOL=ON -DWITH_STORE=ON -DBUILD_UNIT_TESTS=OFF}"
 
 echo "[Mooncake] Reinstalling commit ${MOONCAKE_COMMIT_OVERRIDE} from ${MOONCAKE_REPO}"
+echo "[Mooncake] CMake flags: ${MOONCAKE_CMAKE_FLAGS}"
 
 if [[ ! -d "${MOONCAKE_DIR}/.git" ]]; then
   rm -rf "${MOONCAKE_DIR}"
