@@ -471,8 +471,9 @@ class BaseMultimodalProcessor(ABC):
                 **kwargs,
             )
         except (TypeError, ValueError) as e:
-            logger.warning(f"Processor call failed with video kwargs, retrying without video-specific params: {e}")
-
+            logger.warning(
+                f"Processor call failed with video kwargs, retrying without video-specific params: {e}"
+            )
             sglang_video_keys = (
                 "fps",
                 "max_pixels",
@@ -481,7 +482,7 @@ class BaseMultimodalProcessor(ABC):
                 "max_frames",
                 "min_frames",
                 "resized_height",
-                "resized_width"
+                "resized_width",
             )
             for k in sglang_video_keys:
                 kwargs["videos_kwargs"].pop(k, None)
