@@ -6,6 +6,7 @@ import torch
 
 from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+from sglang.srt.runtime_context import get_flags
 from sglang.srt.speculative.eagle_info import EagleDraftInput
 
 if TYPE_CHECKING:
@@ -21,7 +22,7 @@ def build_eagle_disagg_draft_input(
     future_map: FutureMap,
 ) -> EagleDraftInput:
     num_states = server_args.speculative_eagle_topk
-    if server_args.enable_multi_layer_eagle:
+    if get_flags().enable_multi_layer_eagle:
         num_states *= server_args.speculative_num_steps
 
     topk_p = torch.stack(

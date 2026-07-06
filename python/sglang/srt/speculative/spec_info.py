@@ -215,7 +215,9 @@ class SpeculativeAlgorithm(Enum):
 
         # EAGLE / EAGLE3 / STANDALONE / MULTI_LAYER always use the V2 worker,
         # even with overlap disabled (scheduler drives it synchronously).
-        if self.is_eagle() and server_args.enable_multi_layer_eagle:
+        from sglang.srt.arg_groups.overrides import resolved_view
+
+        if self.is_eagle() and resolved_view(server_args).enable_multi_layer_eagle:
             from sglang.srt.speculative.multi_layer_eagle_worker_v2 import (
                 MultiLayerEagleWorkerV2,
             )

@@ -424,7 +424,9 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
                 "--enable-deterministic-inference; the sampling kernel draws "
                 "coins from the global RNG and is not batch-invariant."
             )
-        if server_args.enable_multi_layer_eagle:
+        from sglang.srt.arg_groups.overrides import resolved_view
+
+        if resolved_view(server_args).enable_multi_layer_eagle:
             raise NotImplementedError(
                 "--speculative-use-rejection-sampling is not supported with "
                 "multi-layer EAGLE (--enable-multi-layer-eagle)."

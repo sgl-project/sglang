@@ -188,7 +188,9 @@ def spec_need_hidden_states(server_args: Optional[ServerArgs] = None) -> bool:
     # TODO(lsyin): also skip when step == 1.
     if server_args.speculative_algorithm in ("STANDALONE", "DFLASH"):
         return False
-    return not server_args.enable_multi_layer_eagle
+    from sglang.srt.arg_groups.overrides import resolved_view
+
+    return not resolved_view(server_args).enable_multi_layer_eagle
 
 
 @torch.compile(dynamic=True, disable=_is_npu or _is_xpu)

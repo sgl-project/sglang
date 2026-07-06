@@ -60,7 +60,9 @@ def get_draft_kv_pool(
         return None
 
     # V2 workers nest the draft runner under `.draft_worker`.
-    if server_args.enable_multi_layer_eagle:
+    from sglang.srt.arg_groups.overrides import resolved_view
+
+    if resolved_view(server_args).enable_multi_layer_eagle:
         draft_runner = draft_worker.draft_worker.draft_runner_list[0]
     else:
         draft_runner = draft_worker.draft_worker.draft_runner

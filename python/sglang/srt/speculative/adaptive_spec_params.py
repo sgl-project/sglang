@@ -67,7 +67,9 @@ def adaptive_unsupported_reason(server_args: ServerArgs) -> str | None:
             "enable_dp_attention=True is not supported "
             "(adaptive tier decisions are not synchronized across DP ranks)"
         )
-    if server_args.enable_multi_layer_eagle:
+    from sglang.srt.arg_groups.overrides import resolved_view
+
+    if resolved_view(server_args).enable_multi_layer_eagle:
         return (
             "enable_multi_layer_eagle=True is not supported "
             "(MultiLayerEagleWorkerV2 does not implement adaptive)"

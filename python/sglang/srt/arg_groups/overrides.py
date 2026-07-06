@@ -2193,6 +2193,11 @@ DUAL_APPLY_RETIRED: frozenset = frozenset(
         "dtype",
         "quantization",
         "disable_hybrid_swa_memory",
+        # ModelConfig captures through the view; the spec hook / adaptive
+        # gates and the worker-shape helpers read views; the disagg draft
+        # builder and the eager runner read the leaf; the two dispatch
+        # declarers (MiMoV2, Step3p5/3p7) read the pristine input.
+        "enable_multi_layer_eagle",
     }
 )
 

@@ -49,7 +49,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     enable_tc_piecewise_cuda_graph,
     set_tc_piecewise_forward_context,
 )
-from sglang.srt.runtime_context import mamba_extra_buffer_enabled
+from sglang.srt.runtime_context import get_flags, mamba_extra_buffer_enabled
 from sglang.srt.utils import is_hip
 from sglang.srt.utils.common import ceil_align, require_mlp_sync
 
@@ -79,7 +79,7 @@ class EagerRunner(BaseRunner):
                     num_draft_tokens,
                     (
                         2 * (sa.speculative_num_steps or 0)
-                        if sa.enable_multi_layer_eagle
+                        if get_flags().enable_multi_layer_eagle
                         else 0
                     ),
                 )
