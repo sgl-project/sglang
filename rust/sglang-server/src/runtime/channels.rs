@@ -9,45 +9,47 @@
 use crate::ids::RequestId;
 use crate::message::{ChunkEvent, EgressSink, Request};
 
-/// Events delivered to the TokenizerManager ingress loop. Both the API server
-/// (fresh requests) and the Tokenizer pool (returned requests) feed this one
-/// inbox, which keeps the loop a single consumer with no `select`.
+/// Events into the TokenizerManager ingress loop. API server + tokenizer pool
+/// share this one inbox, keeping the loop a single consumer (no `select`).
 pub enum TmEvent {
     /// A freshly received request from the API server.
     Ingress(Request),
-    /// A request returned from the Tokenizer pool with `input_ids` filled in.
+    /// A request back from the tokenizer pool: `Queued` (ids filled) on success,
+    /// or `Failed` on a tokenize error. `drive` handles both.
     Tokenized(Request),
-    /// Abort an in-flight request (the HTTP client disconnected). The ingress
-    /// loop forwards it to the scheduler as an `AbortReq` so generation stops
-    /// instead of running to EOS for a client that's gone.
+    /// Client disconnected: forwarded to the scheduler as an `AbortReq` so
+    /// generation stops instead of running to EOS.
     Abort(RequestId),
 }
 
-/// Messages to a Detokenizer shard. Registration carries the per-request sink
-/// so the shard owns a local `id -> sink` map (no shared, no lock); chunks are
-/// routed to the same shard purely by `RequestId::shard`.
+/// Messages to a Detokenizer shard. `Register` carries the per-request sink for
+/// the shard's local `id -> sink` map; everything routes by `RequestId::shard`.
 pub enum DetokMsg {
     Register {
         id: RequestId,
         sink: EgressSink,
-        /// `return_text_in_logprobs`: decode logprob token ids to text in this
-        /// shard (CPU-bound pool) rather than on the api-server I/O threads.
+        /// Decode logprob token ids to text on this (CPU-bound) shard rather than
+        /// the api-server I/O threads.
         decode_logprob_text: bool,
     },
     Chunk(ChunkEvent),
-    /// Control-request result: a single already-serialized JSON payload to
-    /// deliver to the request's sink verbatim (no detokenization, no
-    /// streaming). Used by `/server_info` and other control endpoints.
+    /// Control result: one already-serialized payload delivered to the sink
+    /// verbatim (e.g. `/server_info`).
     Result {
         id: RequestId,
         payload: bytes::Bytes,
     },
-    /// Terminal per-request failure (e.g. the scheduler ingress couldn't decode a
-    /// malformed request header): deliver an `Error` to the sink and drop the
-    /// request, so the client gets a 400 instead of the scheduler crashing.
+    /// Terminal per-request failure (e.g. an undecodable header): deliver an
+    /// `Error` to the sink and drop it, so the client gets a 400, not a crash.
     Fail {
         id: RequestId,
         message: String,
+    },
+    /// Drop a registration for a request rejected before the scheduler. The
+    /// rejecting stage already notified the client, so this only removes the
+    /// `id -> sink` entry (else `Register` leaks one entry per rejected request).
+    Deregister {
+        id: RequestId,
     },
 }
 
