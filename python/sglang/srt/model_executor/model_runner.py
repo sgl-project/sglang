@@ -2483,6 +2483,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 f"Unsupported kv_cache_dtype: {self.server_args.kv_cache_dtype}."
             )
 
+        # DFLASH draft-KV decouple: the fp8 target records its kv_cache_dtype into the shared
+        # server_args, but the bf16 draft's fa4 attention needs K.dtype == Q.dtype. Give the
+        # draft its own KV in the draft compute dtype (set directly, not the shared args).
+        if (
+            self.is_draft_worker
+            and self.spec_algorithm.is_dflash()
+            and self.kv_cache_dtype != self.dtype
+        ):
+            self.kv_cache_dtype = self.dtype
+
     def init_cublas(self):
         """We need to run a small matmul to init cublas. Otherwise, it will raise some errors later."""
         dtype = torch.float16
