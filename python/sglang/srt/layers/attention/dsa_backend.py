@@ -172,8 +172,12 @@ class DSAMetadata:
     # Cumulative sequence lengths for key
     cu_seqlens_k: torch.Tensor
     # Page table, the index of KV Cache Tables/Blocks
-    # this table is always with page_size = 1
-    page_table_1: torch.Tensor
+    # this table is always with page_size = 1.
+    # None for fused-decode CUDA graphs where the wide [bs, max_ctx_len] table is
+    # never read (attention uses topk_indices, indexer uses real_page_table); the
+    # graph then only materializes the compact real_page_table. See
+    # `dsa_drop_wide_page_table`.
+    page_table_1: Optional[torch.Tensor]
 
     # NOTE(dark): This will property be used in:
     # 1. dense decode/prefill, we use paged flash attention, need real_page_table
@@ -671,6 +675,14 @@ class DeepseekSparseAttnBackend(
             )
         return self._arange_buf[:length]
 
+    def _graph_page_table_width(self, metadata: "DSAMetadata") -> int:
+        """Column count to scan req_to_token during graph replay. Reads the wide
+        page_table_1 width when present, else req_to_token's width (the wide table
+        is dropped for fused decode graphs, see `dsa_drop_wide_page_table`)."""
+        if metadata.page_table_1 is not None:
+            return metadata.page_table_1.shape[1]
+        return self.req_to_token.shape[1]
+
     def _transform_table_1_to_real(self, page_table: torch.Tensor) -> torch.Tensor:
         page_size = self.real_page_size
         if page_size == 1:
@@ -1080,6 +1092,24 @@ class DeepseekSparseAttnBackend(
         This creates fixed-size tensors that will be reused during CUDA graph replay
         to avoid memory allocations.
         """
+        # Whether we can skip the wide [max_num_tokens, max_ctx_len] page_size=1
+        # page table in the decode CUDA graph. It is dead weight there when top-k is
+        # fused (attention reads topk_indices, the indexer reads the compact
+        # real_page_table) and page_size>1. Excludes HIP (its indexer reads
+        # page_table_1), hisparse (needs page_size=1 loc translation), and spec
+        # decoding (the MTP precompute fast-path + target-verify/draft-extend graphs
+        # still consume the wide table). Computed once here from stable config; the
+        # graph is captured once per process.
+        self.dsa_drop_wide_page_table = (
+            is_cuda()
+            and not _is_hip
+            and self.real_page_size > 1
+            and self.hisparse_coordinator is None
+            and not self.speculative_num_draft_tokens
+            and envs.SGLANG_DSA_FUSE_TOPK.get()
+        )
+
+        max_ctx_len = self.req_to_token.shape[1]
         self.decode_cuda_graph_metadata: Dict = {
             "cache_seqlens": torch.ones(
                 max_num_tokens, dtype=torch.int32, device=self.device
@@ -1093,11 +1123,28 @@ class DeepseekSparseAttnBackend(
             # fake page_table for sparse_prefill
             # Match req_to_token's width exactly. It is over-allocated beyond
             # context_len because spec decoding lets seq_len transiently overshoot.
-            "page_table": torch.zeros(
-                max_num_tokens,
-                self.req_to_token.shape[1],
-                dtype=torch.int32,
-                device=self.device,
+            # When dropping the wide table (fused decode), allocate only the compact
+            # page_size=64 real table; else allocate the wide page_size=1 table and
+            # derive real from it per batch size.
+            "real_page_table": (
+                torch.zeros(
+                    max_num_tokens,
+                    (max_ctx_len + self.real_page_size - 1) // self.real_page_size,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+                if self.dsa_drop_wide_page_table
+                else None
+            ),
+            "page_table": (
+                None
+                if self.dsa_drop_wide_page_table
+                else torch.zeros(
+                    max_num_tokens,
+                    max_ctx_len,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
             ),
             "flashmla_metadata": (
                 self._compute_flashmla_metadata(
@@ -1133,9 +1180,14 @@ class DeepseekSparseAttnBackend(
             cu_seqlens_k = compute_cu_seqlens(cache_seqlens_int32)
 
             # Use max context length for seq_len_k
-            page_table_1 = self.decode_cuda_graph_metadata["page_table"][:bs, :]
+            real_rows = bs
+            if self.dsa_drop_wide_page_table:
+                page_table_1 = None
+                max_seqlen_k = self.req_to_token.shape[1]
+            else:
+                page_table_1 = self.decode_cuda_graph_metadata["page_table"][:bs, :]
+                max_seqlen_k = page_table_1.shape[1]
             max_seqlen_q = 1
-            max_seqlen_k = page_table_1.shape[1]
 
             # Precompute page table
             # Precompute cumulative sequence lengths
@@ -1166,10 +1218,15 @@ class DeepseekSparseAttnBackend(
             )
             cu_seqlens_k = compute_cu_seqlens(cache_seqlens_int32)
             max_seqlen_q = 1
-            page_table_1 = self.decode_cuda_graph_metadata["page_table"][
-                : bs * self.speculative_num_draft_tokens, :
-            ]
-            max_seqlen_k = page_table_1.shape[1]
+            real_rows = bs * self.speculative_num_draft_tokens
+            if self.dsa_drop_wide_page_table:
+                page_table_1 = None
+                max_seqlen_k = self.req_to_token.shape[1]
+            else:
+                page_table_1 = self.decode_cuda_graph_metadata["page_table"][
+                    :real_rows, :
+                ]
+                max_seqlen_k = page_table_1.shape[1]
 
             cu_seqlens_q = torch.arange(
                 0,
@@ -1221,7 +1278,14 @@ class DeepseekSparseAttnBackend(
 
         dsa_cu_seqlens_k = compute_cu_seqlens(dsa_cache_seqlens_int32)
         dsa_cu_seqlens_q = self.get_device_int32_arange(len(dsa_cu_seqlens_k))
-        real_page_table = self._transform_table_1_to_real(page_table_1)
+        if self.dsa_drop_wide_page_table:
+            # Compact page_size=64 static buffer; filled per-replay by the fused
+            # metadata kernel straight from req_to_token (no wide table needed).
+            real_page_table = self.decode_cuda_graph_metadata["real_page_table"][
+                :real_rows, :
+            ]
+        else:
+            real_page_table = self._transform_table_1_to_real(page_table_1)
 
         paged_mqa_schedule_metadata = None
         paged_mqa_ctx_lens_2d = None
@@ -1303,7 +1367,7 @@ class DeepseekSparseAttnBackend(
         target_verify_ctx_lens_written = False
         if forward_mode.is_decode_or_idle():
             # Normal Decode
-            max_len = metadata.page_table_1.shape[1]
+            max_len = self._graph_page_table_width(metadata)
 
             if is_cuda() and not _is_hip:
                 from sglang.srt.layers.attention.triton_ops.dsa_metadata import (
@@ -1345,7 +1409,7 @@ class DeepseekSparseAttnBackend(
                 metadata.dsa_cache_seqlens_int32.copy_(dsa_cache_seqlens)
                 seqlens_expanded = cache_seqlens
         elif forward_mode.is_target_verify():
-            max_seqlen_k = metadata.page_table_1.shape[1]
+            max_seqlen_k = self._graph_page_table_width(metadata)
 
             if is_cuda() and not _is_hip:
                 from sglang.srt.layers.attention.triton_ops.dsa_metadata import (
@@ -1433,7 +1497,7 @@ class DeepseekSparseAttnBackend(
             # already includes the draft KV written by prepare_for_draft_extend;
             # the per-req accept length is handled downstream by output
             # selection, not by reshaping the page table here.
-            max_seqlen_k = metadata.page_table_1.shape[1]
+            max_seqlen_k = self._graph_page_table_width(metadata)
             total_extend_len = self.speculative_num_draft_tokens * bs
 
             # See target-verify note: fill on-device to avoid the blocking
