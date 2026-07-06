@@ -2437,6 +2437,38 @@ class DSparkWorkerV2(BaseSpecWorker):
         req_to_token_probe = req_to_token_probe.detach().cpu()
         logical_probe = logical_probe.detach().cpu()
 
+        def _req_token_at(req, pos: int) -> Optional[int]:
+            if req is None:
+                return None
+            try:
+                origin = getattr(req, "origin_input_ids", []) or []
+                output = getattr(req, "output_ids", []) or []
+                origin_len = len(origin)
+                if pos < 0:
+                    return None
+                if pos < origin_len:
+                    return int(origin[pos])
+                out_pos = pos - origin_len
+                if out_pos < len(output):
+                    return int(output[out_pos])
+            except Exception:
+                return None
+            return None
+
+        def _req_latest_token(req) -> Optional[int]:
+            if req is None:
+                return None
+            try:
+                output = getattr(req, "output_ids", []) or []
+                if len(output) > 0:
+                    return int(output[-1])
+                origin = getattr(req, "origin_input_ids", []) or []
+                if len(origin) > 0:
+                    return int(origin[-1])
+            except Exception:
+                return None
+            return None
+
         active_keys = set()
         for i, req_pool_idx in enumerate(req_pool_indices):
             req = reqs[i] if i < len(reqs) else None
@@ -2453,6 +2485,22 @@ class DSparkWorkerV2(BaseSpecWorker):
             confidence_row = confidence_cpu[i]
             cache_row = verify_cache[i]
             commit_len = int(commit_lens_cpu[i])
+            req_origin_len = (
+                len(getattr(req, "origin_input_ids", []) or [])
+                if req is not None
+                else None
+            )
+            req_output_len = (
+                len(getattr(req, "output_ids", []) or []) if req is not None else None
+            )
+            req_seq_len = (
+                req_origin_len + req_output_len
+                if req_origin_len is not None and req_output_len is not None
+                else None
+            )
+            req_anchor_token = _req_token_at(req, int(seq_lens[i]) - 1)
+            req_latest_token = _req_latest_token(req)
+            input_bonus_i = int(input_bonus[i]) if input_bonus is not None else None
             history = self._accept_anomaly_histories.setdefault(key, [])
             history.append(
                 {
@@ -2489,11 +2537,34 @@ class DSparkWorkerV2(BaseSpecWorker):
                         if req is not None and hasattr(req, "kv_allocated_len")
                         else None
                     ),
-                    "input_bonus": (
-                        int(input_bonus[i]) if input_bonus is not None else None
+                    "req_origin_len": req_origin_len,
+                    "req_output_len": req_output_len,
+                    "req_seq_len": req_seq_len,
+                    "req_seq_len_minus_prefix": (
+                        int(req_seq_len) - int(seq_lens[i])
+                        if req_seq_len is not None
+                        else None
+                    ),
+                    "req_anchor_token_at_prefix_minus_1": req_anchor_token,
+                    "req_latest_token": req_latest_token,
+                    "input_bonus": input_bonus_i,
+                    "input_bonus_matches_req_anchor": (
+                        input_bonus_i == req_anchor_token
+                        if input_bonus_i is not None and req_anchor_token is not None
+                        else None
+                    ),
+                    "input_bonus_matches_req_latest": (
+                        input_bonus_i == req_latest_token
+                        if input_bonus_i is not None and req_latest_token is not None
+                        else None
                     ),
                     "candidate0": (
                         int(candidate_row[0]) if block_size > 0 else None
+                    ),
+                    "candidate0_matches_req_anchor": (
+                        int(candidate_row[0]) == req_anchor_token
+                        if block_size > 0 and req_anchor_token is not None
+                        else None
                     ),
                     "candidate1": (
                         int(candidate_row[1]) if block_size > 1 else None
