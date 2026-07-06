@@ -31,6 +31,9 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+_NAN = float("nan")
+
+
 def _flatten_ragged(per_pos_val, per_pos_idx):
     """Flatten a per-position ``list[Optional[list]]`` (top-k / token-ids
     logprobs) into flat ``val``/``idx`` buffers plus a per-position ``lens``
@@ -47,6 +50,8 @@ def _flatten_ragged(per_pos_val, per_pos_idx):
     for p, pv in enumerate(per_pos_val):
         if pv:
             pi = per_pos_idx[p] if p < len(per_pos_idx) else []
+            # A truthy position holds only real logprobs; a `None`/empty position
+            # is the falsy branch below (len 0), so no per-value None check here.
             flat_val.extend(pv)
             flat_idx.extend(pi or [])
             lens.append(len(pv))
@@ -341,12 +346,19 @@ class RustServer:
             # (`tensor.contiguous().numpy().tobytes()`) + a shape descriptor and
             # skip this flatten entirely, making the extras path loop-free too.
             for i in range(len(rids)):
+                # Output logprobs are always real, no None check.
                 olv = at(out_lp_val, i) or []
                 olp_v.extend(olv)
                 olp_i.extend(at(out_lp_idx, i) or [])
                 out_lp_lens.append(len(olv))
+                # Input logprobs: only the first prompt token's logprob is the
+                # `None` sentinel.
                 ilv = at(in_lp_val, i) or []
-                ilp_v.extend(ilv)
+                if ilv and ilv[0] is None:
+                    ilp_v.append(_NAN)
+                    ilp_v.extend(ilv[1:])
+                else:
+                    ilp_v.extend(ilv)
                 ilp_i.extend(at(in_lp_idx, i) or [])
                 in_lp_lens.append(len(ilv))
                 otv, oti, otl = _flatten_ragged(at(out_top_val, i), at(out_top_idx, i))
