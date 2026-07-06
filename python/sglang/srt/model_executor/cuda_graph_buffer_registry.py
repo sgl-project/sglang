@@ -34,11 +34,130 @@ import torch
 
 from sglang.srt.model_executor.input_buffers import share_input_buffer
 
+try:
+    import triton
+    import triton.language as tl
+except ImportError:
+    triton = None
+    tl = None
+
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
 _has_foreach_copy = hasattr(torch, "_foreach_copy_")
+_has_triton = triton is not None
+
+if _has_triton:
+
+    @triton.jit
+    def _fused_copy_8_kernel(
+        dst0,
+        src0,
+        n0,
+        dst1,
+        src1,
+        n1,
+        dst2,
+        src2,
+        n2,
+        dst3,
+        src3,
+        n3,
+        dst4,
+        src4,
+        n4,
+        dst5,
+        src5,
+        n5,
+        dst6,
+        src6,
+        n6,
+        dst7,
+        src7,
+        n7,
+        BLOCK: tl.constexpr,
+    ):
+        slot = tl.program_id(0)
+        block = tl.program_id(1)
+        offs = block * BLOCK + tl.arange(0, BLOCK)
+        if slot == 0:
+            mask = offs < n0
+            tl.store(dst0 + offs, tl.load(src0 + offs, mask=mask), mask=mask)
+        elif slot == 1:
+            mask = offs < n1
+            tl.store(dst1 + offs, tl.load(src1 + offs, mask=mask), mask=mask)
+        elif slot == 2:
+            mask = offs < n2
+            tl.store(dst2 + offs, tl.load(src2 + offs, mask=mask), mask=mask)
+        elif slot == 3:
+            mask = offs < n3
+            tl.store(dst3 + offs, tl.load(src3 + offs, mask=mask), mask=mask)
+        elif slot == 4:
+            mask = offs < n4
+            tl.store(dst4 + offs, tl.load(src4 + offs, mask=mask), mask=mask)
+        elif slot == 5:
+            mask = offs < n5
+            tl.store(dst5 + offs, tl.load(src5 + offs, mask=mask), mask=mask)
+        elif slot == 6:
+            mask = offs < n6
+            tl.store(dst6 + offs, tl.load(src6 + offs, mask=mask), mask=mask)
+        elif slot == 7:
+            mask = offs < n7
+            tl.store(dst7 + offs, tl.load(src7 + offs, mask=mask), mask=mask)
+
+
+def _can_fuse_copy(dst: torch.Tensor, src: torch.Tensor) -> bool:
+    return (
+        _has_triton
+        and dst.device.type == "cuda"
+        and src.device.type == "cuda"
+        and dst.device == src.device
+        and dst.dtype == src.dtype
+        and dst.numel() == src.numel()
+        and dst.is_contiguous()
+        and src.is_contiguous()
+        and not torch.cuda.is_current_stream_capturing()
+    )
+
+
+def _fused_copy_chunks_(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -> None:
+    block = 256
+    for start in range(0, len(dsts), 8):
+        chunk_dsts = dsts[start : start + 8]
+        chunk_srcs = srcs[start : start + 8]
+        num_slots = len(chunk_dsts)
+        max_n = max(dst.numel() for dst in chunk_dsts)
+        padded_dsts = chunk_dsts + [chunk_dsts[0]] * (8 - num_slots)
+        padded_srcs = chunk_srcs + [chunk_srcs[0]] * (8 - num_slots)
+        ns = [dst.numel() for dst in chunk_dsts] + [0] * (8 - num_slots)
+        _fused_copy_8_kernel[(num_slots, triton.cdiv(max_n, block))](
+            padded_dsts[0],
+            padded_srcs[0],
+            ns[0],
+            padded_dsts[1],
+            padded_srcs[1],
+            ns[1],
+            padded_dsts[2],
+            padded_srcs[2],
+            ns[2],
+            padded_dsts[3],
+            padded_srcs[3],
+            ns[3],
+            padded_dsts[4],
+            padded_srcs[4],
+            ns[4],
+            padded_dsts[5],
+            padded_srcs[5],
+            ns[5],
+            padded_dsts[6],
+            padded_srcs[6],
+            ns[6],
+            padded_dsts[7],
+            padded_srcs[7],
+            ns[7],
+            BLOCK=block,
+        )
 
 
 def _grouped_foreach_copy_(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -> None:
@@ -48,10 +167,30 @@ def _grouped_foreach_copy_(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -
     def _foreach_copy(
         group_dsts: List[torch.Tensor], group_srcs: List[torch.Tensor]
     ) -> None:
+        fused_dsts: List[torch.Tensor] = []
+        fused_srcs: List[torch.Tensor] = []
+        fallback_dsts: List[torch.Tensor] = []
+        fallback_srcs: List[torch.Tensor] = []
+        for dst, src in zip(group_dsts, group_srcs):
+            if _can_fuse_copy(dst, src):
+                fused_dsts.append(dst)
+                fused_srcs.append(src)
+            else:
+                fallback_dsts.append(dst)
+                fallback_srcs.append(src)
+
+        if len(fused_dsts) >= 2:
+            _fused_copy_chunks_(fused_dsts, fused_srcs)
+        elif len(fused_dsts) == 1:
+            fallback_dsts.extend(fused_dsts)
+            fallback_srcs.extend(fused_srcs)
+
+        if not fallback_dsts:
+            return
         if _has_foreach_copy:
-            torch._foreach_copy_(group_dsts, group_srcs)
+            torch._foreach_copy_(fallback_dsts, fallback_srcs)
         else:
-            for dst, src in zip(group_dsts, group_srcs):
+            for dst, src in zip(fallback_dsts, fallback_srcs):
                 dst.copy_(src)
 
     groups: Dict[Tuple[torch.dtype, torch.dtype], Tuple[List, List]] = {}

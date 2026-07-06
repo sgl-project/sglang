@@ -539,6 +539,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # (runtime refs were removed from this dataclass on purpose).
     forward_metadata_planned_bs: Optional[int] = None
     forward_metadata_planned_num_tokens: Optional[int] = None
+    cuda_graph_batch_loaded_runner_id: Optional[int] = None
+    cuda_graph_batch_loaded_raw_bs: Optional[int] = None
+    cuda_graph_batch_loaded_padded_bs: Optional[int] = None
+    cuda_graph_batch_loaded_raw_num_tokens: Optional[int] = None
+    cuda_graph_batch_loaded_padded_num_tokens: Optional[int] = None
     # Whether the forward path may re-plan this batch when its shapes no
     # longer match the plan record. Only mark sites where the forward
     # path's own init_forward_metadata is equivalent to the pre-plan
@@ -563,6 +568,36 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             self.input_ids.shape[0] if self.input_ids is not None else 0
         )
         self.forward_metadata_replan_equivalent = replan_equivalent
+
+    def mark_cuda_graph_batch_loaded(
+        self,
+        *,
+        runner_id: int,
+        raw_bs: int,
+        padded_bs: int,
+        raw_num_tokens: int,
+        padded_num_tokens: int,
+    ) -> None:
+        self.cuda_graph_batch_loaded_runner_id = runner_id
+        self.cuda_graph_batch_loaded_raw_bs = raw_bs
+        self.cuda_graph_batch_loaded_padded_bs = padded_bs
+        self.cuda_graph_batch_loaded_raw_num_tokens = raw_num_tokens
+        self.cuda_graph_batch_loaded_padded_num_tokens = padded_num_tokens
+
+    def is_cuda_graph_batch_loaded(
+        self,
+        *,
+        runner_id: int,
+        raw_bs: int,
+        raw_num_tokens: int,
+    ) -> bool:
+        return (
+            self.cuda_graph_batch_loaded_runner_id == runner_id
+            and self.cuda_graph_batch_loaded_raw_bs == raw_bs
+            and self.cuda_graph_batch_loaded_raw_num_tokens == raw_num_tokens
+            and self.cuda_graph_batch_loaded_padded_bs is not None
+            and self.cuda_graph_batch_loaded_padded_num_tokens is not None
+        )
 
     def needs_forward_metadata_init(self) -> bool:
         """Single judgment point for whether the forward path must plan.

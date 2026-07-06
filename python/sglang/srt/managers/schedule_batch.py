@@ -1570,20 +1570,10 @@ class _MambaRadixCacheV2TrackEntry(NamedTuple):
 def set_mamba_track_indices_from_reqs(batch):
     """Build mamba_track_indices from req objects (authoritative source)."""
     req_to_token_pool = batch.req_to_token_pool
-    all_buffers = req_to_token_pool.req_index_to_mamba_ping_pong_track_buffer_mapping[
-        batch.req_pool_indices
-    ]  # (bs, ping_pong_size), int64, on device
-    idx = (
-        torch.tensor(
-            [req.mamba_next_track_idx for req in batch.reqs],
-            dtype=torch.int64,
-            pin_memory=True,
-        )
-        .unsqueeze(1)
-        .to(device=all_buffers.device, non_blocking=True)
-    )
     batch.mamba_track_indices = (
-        torch.gather(all_buffers, 1, idx).squeeze(1).to(torch.int64)
+        req_to_token_pool.req_index_to_active_mamba_track_slot_mapping[
+            batch.req_pool_indices
+        ]
     )
 
 
@@ -2334,10 +2324,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # allocated yet; it will be allocated on demand at the track boundary
             # in mamba_lazy_prealloc_at_boundary during prepare_for_decode.
             if not get_global_server_args().enable_mamba_extra_buffer_lazy():
-                req.mamba_next_track_idx = (
+                self.req_to_token_pool.set_mamba_next_track_idx(
+                    req,
                     self.req_to_token_pool.get_mamba_ping_pong_other_idx(
                         req.mamba_next_track_idx
-                    )
+                    ),
                 )
             if req.mamba_branching_seqlen is not None:
                 # track branching point in this forward if the branching point
@@ -2592,7 +2583,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     new_slot = pool.mamba_allocator.alloc(1)
             if new_slot is not None:
                 pool.set_mamba_ping_pong_slot(req, other_idx, new_slot[0])
-                req.mamba_next_track_idx = other_idx
+                pool.set_mamba_next_track_idx(req, other_idx)
 
     def cumulate_penalty_output_tokens(self):
         # Under overlap batch.input_ids is just a placeholder here -- the
