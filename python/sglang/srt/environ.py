@@ -539,6 +539,9 @@ class Envs:
     # Quantize x to int8 in the dispatch operator
     DEEP_NORMAL_MODE_USE_INT8_QUANT = EnvBool(False)  # This argument is deprecated
     SGLANG_NPU_FUSED_MOE_MODE = EnvInt(1)
+    # Replace mlp matmul with torch kernel for better performance for Qwen-vl
+    USE_MATMUL_REPLACE_LINEAR = EnvBool(False)
+
 
     # MTHREADS & MUSA
     SGLANG_MUSA_FA3_FORCE_UPDATE_METADATA = EnvBool(False)

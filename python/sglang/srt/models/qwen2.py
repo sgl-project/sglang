@@ -26,6 +26,7 @@ from sglang.srt.distributed import (
     get_pp_group,
     get_pp_indices,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
@@ -56,7 +57,7 @@ from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 Qwen2Config = None
 
-
+_use_matmul_replace_linear = envs.USE_MATMUL_REPLACE_LINEAR.get()
 logger = logging.getLogger(__name__)
 
 
@@ -84,6 +85,10 @@ class Qwen2MLP(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("down_proj", prefix),
         )
+        # For NPU, replacing the linear layer with matmul + bias to achieve better performance. The "layout_KN"
+        # attribute is used to indicate that the weight layout is transposed (K, N) for the matmul operation.
+        if _use_matmul_replace_linear:
+            setattr(self.down_proj, "layout_matmul_replace_linear", True)
         if hidden_act != "silu":
             raise ValueError(
                 f"Unsupported activation: {hidden_act}. "
