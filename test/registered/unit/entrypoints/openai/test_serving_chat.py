@@ -1320,6 +1320,32 @@ class ServingChatTestCase(unittest.TestCase):
         error = self.chat._validate_request(req)
         self.assertIsNone(error)
 
+    def test_validate_rejects_null_assistant_content_without_tool_calls(self):
+        """Null assistant content without tool_calls is rejected."""
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[
+                {"role": "user", "content": "Hi"},
+                {"role": "assistant", "content": None},
+            ],
+        )
+        error = self.chat._validate_request(req)
+        self.assertIsNotNone(error)
+        self.assertIn("cannot be empty", error)
+
+    def test_validate_rejects_empty_list_assistant_content(self):
+        """Empty list assistant content without tool_calls is rejected."""
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[
+                {"role": "user", "content": "Hi"},
+                {"role": "assistant", "content": []},
+            ],
+        )
+        error = self.chat._validate_request(req)
+        self.assertIsNotNone(error)
+        self.assertIn("cannot be empty", error)
+
     def test_attach_task_to_last_user_message(self):
         """Helper attaches task to the nearest user/developer message."""
         from sglang.srt.entrypoints.openai import encoding_dsv4
