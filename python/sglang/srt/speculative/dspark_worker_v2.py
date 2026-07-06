@@ -1604,6 +1604,16 @@ class DSparkWorkerV2(BaseSpecWorker):
                     (bs, block_size), dtype=torch.int64, device=block_hidden.device
                 )
                 if debug_topk_k > 0:
+                    bias_topk_ids = torch.empty(
+                        (bs, block_size, debug_topk_k),
+                        dtype=torch.int64,
+                        device=block_hidden.device,
+                    )
+                    bias_topk_values = torch.empty(
+                        (bs, block_size, debug_topk_k),
+                        dtype=base_logits.dtype,
+                        device=block_hidden.device,
+                    )
                     final_topk_ids = torch.empty(
                         (bs, block_size, debug_topk_k),
                         dtype=torch.int64,
@@ -1615,6 +1625,8 @@ class DSparkWorkerV2(BaseSpecWorker):
                         device=block_hidden.device,
                     )
                 else:
+                    bias_topk_ids = None
+                    bias_topk_values = None
                     final_topk_ids = None
                     final_topk_values = None
                 prev_token_debug = torch.empty_like(markov_top1)
@@ -1628,6 +1640,8 @@ class DSparkWorkerV2(BaseSpecWorker):
                 hidden_abs_mean = None
                 hidden_cos_adjacent = None
                 markov_top1 = None
+                bias_topk_ids = None
+                bias_topk_values = None
                 final_topk_ids = None
                 final_topk_values = None
                 prev_token_debug = None
@@ -1639,6 +1653,14 @@ class DSparkWorkerV2(BaseSpecWorker):
                 prev_embed = markov_head.get_prev_embeddings(prev_tokens)
                 markov_embeds[:, i].copy_(prev_embed)
                 bias = _compute_full_vocab_logits(prev_embed, markov_head.markov_w2)
+                if debug_enabled and debug_topk_k > 0:
+                    assert bias_topk_ids is not None
+                    assert bias_topk_values is not None
+                    step_bias_topk_values, step_bias_topk_ids = torch.topk(
+                        bias, k=debug_topk_k, dim=-1
+                    )
+                    bias_topk_ids[:, i].copy_(step_bias_topk_ids)
+                    bias_topk_values[:, i].copy_(step_bias_topk_values)
                 bias.add_(base_logits[:, i])
                 next_tokens = torch.argmax(bias, dim=-1)
                 if debug_enabled:
@@ -1681,6 +1703,16 @@ class DSparkWorkerV2(BaseSpecWorker):
                     "hidden_abs_mean": hidden_abs_mean[:output_bs].detach(),
                     "hidden_cos_adjacent": hidden_cos_adjacent[:output_bs].detach(),
                     "markov_top1": markov_top1[:output_bs].detach(),
+                    "bias_topk_ids": (
+                        bias_topk_ids[:output_bs].detach()
+                        if bias_topk_ids is not None
+                        else None
+                    ),
+                    "bias_topk_values": (
+                        bias_topk_values[:output_bs].detach()
+                        if bias_topk_values is not None
+                        else None
+                    ),
                     "final_topk_ids": (
                         final_topk_ids[:output_bs].detach()
                         if final_topk_ids is not None
@@ -1820,6 +1852,8 @@ class DSparkWorkerV2(BaseSpecWorker):
             hidden_abs_mean = debug.get("hidden_abs_mean")
             hidden_cos_adjacent = debug.get("hidden_cos_adjacent")
             markov_top1 = debug.get("markov_top1")
+            bias_topk_ids = debug.get("bias_topk_ids")
+            bias_topk_values = debug.get("bias_topk_values")
             final_topk_ids = debug.get("final_topk_ids")
             final_topk_values = debug.get("final_topk_values")
             prev_tokens = debug.get("prev_tokens")
@@ -1845,6 +1879,8 @@ class DSparkWorkerV2(BaseSpecWorker):
             has_topk_debug = (
                 base_topk_ids is not None
                 and base_topk_values is not None
+                and bias_topk_ids is not None
+                and bias_topk_values is not None
                 and final_topk_ids is not None
                 and final_topk_values is not None
             )
@@ -1855,6 +1891,12 @@ class DSparkWorkerV2(BaseSpecWorker):
                 row_base_topk_values = (
                     base_topk_values[row_idx, :draft_limit].detach().cpu()
                 )
+                row_bias_topk_ids = (
+                    bias_topk_ids[row_idx, :draft_limit].detach().cpu()
+                )
+                row_bias_topk_values = (
+                    bias_topk_values[row_idx, :draft_limit].detach().cpu()
+                )
                 row_final_topk_ids = (
                     final_topk_ids[row_idx, :draft_limit].detach().cpu()
                 )
@@ -1864,6 +1906,8 @@ class DSparkWorkerV2(BaseSpecWorker):
             else:
                 row_base_topk_ids = None
                 row_base_topk_values = None
+                row_bias_topk_ids = None
+                row_bias_topk_values = None
                 row_final_topk_ids = None
                 row_final_topk_values = None
             row_base = base_top1[row_idx, :draft_limit].detach().cpu()
@@ -1901,6 +1945,8 @@ class DSparkWorkerV2(BaseSpecWorker):
             if has_topk_debug:
                 assert row_base_topk_ids is not None
                 assert row_base_topk_values is not None
+                assert row_bias_topk_ids is not None
+                assert row_bias_topk_values is not None
                 assert row_final_topk_ids is not None
                 assert row_final_topk_values is not None
                 for step in range(draft_limit):
@@ -1918,6 +1964,10 @@ class DSparkWorkerV2(BaseSpecWorker):
                     base_values = [
                         float(x) for x in row_base_topk_values[step].tolist()
                     ]
+                    bias_ids = [int(x) for x in row_bias_topk_ids[step].tolist()]
+                    bias_values = [
+                        float(x) for x in row_bias_topk_values[step].tolist()
+                    ]
                     final_ids = [int(x) for x in row_final_topk_ids[step].tolist()]
                     final_values = [
                         float(x) for x in row_final_topk_values[step].tolist()
@@ -1933,6 +1983,18 @@ class DSparkWorkerV2(BaseSpecWorker):
                             "base_target_rank_in_top": (
                                 base_ids.index(target_token)
                                 if target_token in base_ids
+                                else None
+                            ),
+                            "bias_top_ids": bias_ids,
+                            "bias_top_logits": bias_values,
+                            "bias_candidate_rank_in_top": (
+                                bias_ids.index(candidate_token)
+                                if candidate_token in bias_ids
+                                else None
+                            ),
+                            "bias_target_rank_in_top": (
+                                bias_ids.index(target_token)
+                                if target_token in bias_ids
                                 else None
                             ),
                             "final_top_ids": final_ids,
