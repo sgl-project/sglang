@@ -185,7 +185,7 @@ if _HAVE_TRITON:
         qn_ptr, kn_ptr, kb_ptr, vb_ptr, g_ptr, gcum_ptr, A_ptr, T_ptr,
         vnew_ptr, S_ptr, out_ptr, i_ptr, inext_ptr, row_ptr,
         scale, HV: tl.constexpr, HK: tl.constexpr, Dk: tl.constexpr, Dv: tl.constexpr,
-        CS: tl.constexpr, QR: tl.constexpr, PAD_ROW: tl.constexpr,
+        CS: tl.constexpr, PAD_ROW: tl.constexpr, SPREC: tl.constexpr,
     ):
         """Whole GDN decode step for the new token in ONE launch (was 5 kernels): prep + gcum append
         + A row + T-row append + core/v_new + boundary fold. One program per (slot, value-head).
@@ -206,8 +206,12 @@ if _HAVE_TRITON:
             _fwd_sub_kernel's per-i step, so it is bit-identical to prefill AND num_warps-invariant.
         (3) This kernel launches at num_warps=8 (for the incr matmuls). Every reduction that must match
             another engine is num_warps-invariant: the l2norm tl.sum (verified 0-ULP across nw), the
-            tl.dot solve/A/attn matmuls (fixed accumulation order), and the qr/row-selecting tl.sum
-            collapses (a single nonzero lane). So nw=8 is safe. QR-tile broadcasts row i so tl.dot M>=16."""
+            tl.dot solve/A/attn matmuls (fixed accumulation order), and the row-selecting tl.sum
+            collapses (a single nonzero lane). So nw=8 is safe.
+        (4) The scan (SPREC) dots -- vprime, attn2, attn_inter, intra, and the boundary fold -- place
+            the new token at row i of a full CS=64 tile, the SAME geometry _chunk_scan_kernel uses, so
+            tf32 tensor-core accumulation matches the batched scan bit-for-bit (a smaller QR<CS tile
+            would put the token at a different row of a different-height MMA and diverge ~6e-4)."""
         pid = tl.program_id(0)
         bt = pid // HV  # batch row (indexes the per-step IO tensors q/k/v/a/b/out)
         h = pid % HV
@@ -219,8 +223,8 @@ if _HAVE_TRITON:
         r = tl.arange(0, CS)
         dk = tl.arange(0, Dk)
         dv = tl.arange(0, Dv)
-        qr = tl.arange(0, QR)
         valid = r < W
+        lower = r[:, None] >= r[None, :]  # lower-tri incl diag (matches _chunk_scan_kernel)
         base = (ar * HV + h) * CS
         row_i = r[:, None] == i  # [CS,1] mask selecting row i
         # --- prep row i (shared l2norm reduction, GQA repeat, scale, gating) ---
@@ -257,13 +261,28 @@ if _HAVE_TRITON:
         kb = tl.load(kb_ptr + ((ar * CS + r[:, None]) * HV + h) * Dk + dk[None, :], mask=valid[:, None], other=0.0)
         vb = tl.load(vb_ptr + ((ar * CS + r[:, None]) * HV + h) * Dv + dv[None, :], mask=valid[:, None], other=0.0)
         gcum = tl.load(gcum_ptr + base + r, mask=valid, other=0.0)
+        # Everything below places the new token at ROW i of a full CS=64 tile (row_i mask), matching
+        # _chunk_scan_kernel's tile geometry so the tf32 (SPREC) dots accumulate bit-identically to the
+        # scan (tf32 tensor-core reductions are only tile-shape reproducible; the old QR=16 tiles put
+        # the token at row 0 of a 16-high tile and diverged ~6e-4). The ieee WY-prep dots (A, T-append,
+        # val, kcd) are M-tile invariant so they stay bit-identical to prefill's aten bmm regardless.
         # --- A row i = -(kb[i] @ kn^T) * exp(gcum[i]-gcum[j]) for j<i (strictly-lower) ---
-        kbr = kb_i[None, :] + qr[:, None] * 0.0  # [QR,Dk] all rows kb[i]
+        # Use the RELOADED kb[i] (kb_ri), NOT the kb_i register (= kn_i*beta): feeding the register
+        # into the dot lets the compiler carry kn_i's pre-bf16-cast precision into the matmul, so the
+        # A entries land ~4e-5 off prefill's aten bmm (which consumes the stored, bf16-rounded kb).
+        # Build the decay as the full 2D exp(gcum[a]-gcum[b]) from the reloaded gcum tile, the exact
+        # expression prefill's decay_mask (and the core `decay` below) uses. Both mismatches are
+        # invisible under ieee (the solve/scan absorb them) but tf32 truncates each dot input, so they
+        # amplify through T -> v_solved -> intra (~1e-3 decode-vs-prefill) unless matched here.
+        decay_full = libdevice.exp(gcum[:, None] - gcum[None, :])  # [CS,CS]
+        kb_ri = tl.sum(tl.where(row_i, kb, 0.0), 0)  # reloaded kb[i], single-lane collapse
+        kb_tile = tl.where(row_i, kb_ri[None, :], 0.0)  # [CS,Dk], row i = kb[i]
+        kept2 = (r[:, None] > r[None, :]) & valid[None, :]  # strictly-lower, cols valid
+        decay_a = tl.where(kept2, decay_full, 0.0)  # [CS,CS]
+        A = -tl.dot(kb_tile, tl.trans(kn), input_precision="ieee") * decay_a
         kept = (i > r) & valid
-        decay = tl.where(kept[None, :], libdevice.exp(gi - gcum[None, :]), 0.0)  # [QR,CS]
-        A = -tl.dot(kbr, tl.trans(kn), input_precision="ieee") * decay
         A = tl.where(kept[None, :], A, 0.0)
-        Arow = tl.sum(tl.where(qr[:, None] == 0, A, 0.0), 0)  # [CS] tile row 0
+        Arow = tl.sum(tl.where(row_i, A, 0.0), 0)  # [CS] tile row i
         tl.store(A_ptr + base + r, Arow)
         # --- append forward-substitution row: T[i,j<i] = A[i,j] + sum_{m<i} A[i,m]*T[m,j] ---
         # Same tl.dot formulation as _fwd_sub_kernel (bit-identical to prefill, num_warps-invariant).
@@ -280,24 +299,29 @@ if _HAVE_TRITON:
         S = tl.load(S_ptr + (ar * HV + h) * Dk * Dv + dk[:, None] * Dv + dv[None, :])
         Trow = tl.load(T_ptr + (base + i) * CS + r)
         Trow = Trow + tl.where(r == i, 1.0, 0.0)  # + eye row i
-        Ttile = tl.where(qr[:, None] == 0, Trow[None, :], 0.0)  # [QR,CS]
-        val = tl.dot(Ttile, vb, input_precision="ieee")  # [QR,Dv]
-        kg = kb * libdevice.exp(gcum)[:, None]
-        kcd = tl.dot(Ttile, kg, input_precision="ieee")  # [QR,Dk]
-        vprime = tl.where(qr[:, None] >= 0, tl.dot(kcd, S, input_precision="ieee"), 0.0)
-        vnew_tile = val - vprime
-        vnew_row = tl.sum(tl.where(qr[:, None] == 0, vnew_tile, 0.0), 0)  # [Dv]
+        Ttile = tl.where(row_i, Trow[None, :], 0.0)  # [CS,CS], row i = Trow
+        val = tl.dot(Ttile, vb, input_precision="ieee")  # [CS,Dv], row i = T[i,:]@vb
+        kg = kb * libdevice.exp(gcum)[:, None]  # [CS,Dk]
+        kcd = tl.dot(Ttile, kg, input_precision="ieee")  # [CS,Dk], row i = T[i,:]@(kb*exp g)
+        # Mirror _chunk_scan_kernel's core exactly, incl the `bar` rounding barrier (data-dependent so
+        # the compiler cannot fold the following add/sub into an accumulator-form FMA). The scan and
+        # this step must fold in the identical order for tf32 decode==prefill.
+        bar = tl.sum(tl.where(r == 0, gcum, 0.0), 0) < 1e30  # always true, not provably so
+        vprime = tl.where(bar, tl.dot(kcd, S, input_precision=SPREC), 0.0)  # [CS,Dv] k_cumdecay@S
+        vnew_tile = val - vprime  # [CS,Dv]
+        vnew_row = tl.sum(tl.where(row_i, vnew_tile, 0.0), 0)  # [Dv] v_new[i]
         vn_cached = tl.load(vnew_ptr + (base + r[:, None]) * Dv + dv[None, :], mask=(r < i)[:, None], other=0.0)
-        vnew_full = tl.where(row_i, vnew_row[None, :], vn_cached)  # [CS,Dv]
-        qn = tl.load(qn_ptr + ((ar * CS + i) * HV + h) * Dk + dk[None, :] + qr[:, None] * 0, mask=(qr[:, None] == 0), other=0.0)
-        ge = tl.where(qr == 0, gi, 0.0)
-        dlast = tl.where((i >= r) & valid, libdevice.exp(gi - gcum), 0.0)  # decay[i,:] incl diag
-        attn2 = tl.dot(qn, tl.trans(kn), input_precision="ieee") * dlast[None, :]
-        attn2 = tl.where((qr[:, None] == 0) & ((i >= r) & valid)[None, :], attn2, 0.0)
-        attn_inter = tl.where(qr[:, None] == 0, tl.dot(qn * libdevice.exp(ge)[:, None], S, input_precision="ieee"), 0.0)
-        intra = tl.where(qr[:, None] == 0, tl.dot(attn2, vnew_full, input_precision="ieee"), 0.0)
-        core = attn_inter + intra
-        core_row = tl.sum(tl.where(qr[:, None] == 0, core, 0.0), 0)
+        vnew_full = tl.where(row_i, vnew_row[None, :], vn_cached)  # [CS,Dv] rows 0..i
+        qn = tl.load(qn_ptr + ((ar * CS + i) * HV + h) * Dk + dk)  # [Dk] row-i query
+        qn_tile = tl.where(row_i, qn[None, :], 0.0)  # [CS,Dk], row i = qn_i
+        decay = tl.where(lower, libdevice.exp(gcum[:, None] - gcum[None, :]), 0.0)  # [CS,CS]
+        attn2 = tl.dot(qn_tile, tl.trans(kn), input_precision=SPREC) * decay
+        attn2 = tl.where(lower, attn2, 0.0)
+        qg = qn_tile * libdevice.exp(gcum)[:, None]  # [CS,Dk], row i = qn_i*exp(gcum[i])
+        attn_inter = tl.where(bar, tl.dot(qg, S, input_precision=SPREC), 0.0)  # (q*exp g)@S
+        intra = tl.where(bar, tl.dot(attn2, vnew_full, input_precision=SPREC), 0.0)
+        core = attn_inter + intra  # [CS,Dv]
+        core_row = tl.sum(tl.where(row_i, core, 0.0), 0)  # [Dv]
         # Store the core row (PAD rows -> zeros) directly into out; tl.store casts fp32 core_row to
         # the out buffer's dtype. Prod out is bf16 (was fp32 + a python .to(bf16)/valid-multiply);
         # the bf16 store is bit-identical to the old python cast (same fp32 core_row). A test may
@@ -314,8 +338,11 @@ if _HAVE_TRITON:
         if W == CS:
             glast = tl.sum(tl.where(r == (CS - 1), gcum, 0.0), 0)
             kdec = kn * libdevice.exp(glast - gcum)[:, None]
-            upd = tl.where(dk[:, None] >= 0, tl.dot(tl.trans(kdec), vnew_full, input_precision="ieee"), 0.0)
-            Snew = S * libdevice.exp(glast) + upd
+            # ieee (not SPREC): must bit-match _chunk_scan_kernel's boundary fold, and tf32's MMA
+            # tiling drifts ~1 ULP between the two kernels. See the scan kernel's fold comment.
+            upd = tl.where(bar, tl.dot(tl.trans(kdec), vnew_full, input_precision="ieee"), 0.0)
+            sc = tl.where(bar, S * libdevice.exp(glast), 0.0)  # round before add (matches scan)
+            Snew = sc + upd
             tl.store(S_ptr + (ar * HV + h) * Dk * Dv + dk[:, None] * Dv + dv[None, :], Snew)
             tl.store(inext_ptr + ar, 0)
         else:
@@ -327,100 +354,109 @@ if _HAVE_TRITON:
         Sinit_ptr, core_ptr, last_ptr, bnd_ptr,        # recurrent state in / out
         nchunks_ptr, bchunk,                           # per-seq real chunk count [N], boundary chunk
         HV: tl.constexpr, NC: tl.constexpr, C: tl.constexpr, Dk: tl.constexpr, Dv: tl.constexpr,
-        DVT: tl.constexpr, NVT: tl.constexpr,
+        PREC: tl.constexpr,
     ):
         """Fused cross-chunk GDN recurrence: the SERIAL scan over `last_recurrent_state` (the torch
         loop at torch_chunk_gated_delta_rule lines 563-573 / Megatron 1348-1358) in ONE launch per
-        (sequence, value-head, V-tile). The state column-slice S[Dk,DVT] stays resident in registers
-        across the whole chunk loop, so it never round-trips through HBM (the torch loop pushed the
-        full [128,128] state 32x). The intra-chunk WY work (l2norm, cumsum, T-solve, v_solved=T@v_beta,
-        k_cumdecay=T@(k_beta*exp g)) stays on the existing parallel torch path and is streamed in per
-        chunk; attn2/qg (which need no S) are recomputed per V-tile to avoid materializing
-        [N,HV,NC,C,C] in HBM.
+        (sequence, value-head). The full [Dk,Dv] state stays resident in registers across the whole
+        chunk loop, so it never round-trips through HBM (the torch loop pushed the state 32x). The
+        intra-chunk WY work (l2norm, cumsum, T-solve, v_solved=T@v_beta, k_cumdecay=T@(k_beta*exp g))
+        stays on the existing parallel torch path and is streamed in per chunk.
 
-        V-tiling (grid (N,HV,NVT), Dv split into NVT tiles of DVT) is EXACT: the recurrence is
-        independent across V-columns (decay is a per-row scalar; v_new/v_prime/S-update all index V
-        freely), so a column slice computes the same values it would in the full [Dk,Dv] state. It is
-        also essential for speed: holding the full [128,128] fp32 S plus the [64,128] chunk tiles
-        spills the register file (~5.7KB/thread) and runs ~16x slower; DVT=32 keeps S on-chip and
-        raises occupancy (grid n_seq*HV*4 vs n_seq*HV).
+        Under tf32 (see GDN_SCAN_PREC) the dots run on tensor cores, which do NOT spill the full
+        [Dk,Dv] fp32 state, so there is no V-tiling: grid is (N,HV) and each program holds the whole
+        [Dk,Dv] S. (fp32-IEEE FMA units DO spill the full slab ~16x, but tf32 is the shipping path.)
 
-        Bit-identical to the torch loop (so sglang prefill == Megatron == decode chunk-replay, which
-        reproduces the same loop per row): every tl.dot uses input_precision="ieee" matching the
-        batch-invariant aten mm; the K-reductions are single-dot (K=Dk=128 or C=64, num_warps-
-        invariant, V-tile-invariant since V is the N dim not the K dim); exp is libdevice.exp on
-        rounded-fp32 gcum. Maps op-for-op to _gdn_step_kernel's decode fold (lines 281-306), over all
-        C rows and all chunks. Multi-seq: each program loops only its seq's real chunks; zero-pad
-        chunks are exact recurrent no-ops (g=0 -> decay 1, k=v=0 -> zero update).
+        Cross-engine identity is by construction: sglang prefill, Megatron's forward, and the decode
+        chunk-replay all run THIS kernel at this same PREC, so the dots need not match aten's fp32 bmm.
+        The one hard requirement is decode==prefill: the decode _gdn_step_kernel maps op-for-op to this
+        fold and, crucially, uses the SAME C=64 tile geometry (tf32 tensor-core accumulation is only
+        tile-shape reproducible; the old QR=16 decode tiles diverged ~6e-4). exp is libdevice.exp on
+        rounded-fp32 gcum. Multi-seq: each program loops only its seq's real chunks; zero-pad chunks
+        are exact recurrent no-ops (g=0 -> decay 1, k=v=0 -> zero update).
         """
         pid = tl.program_id(0)
-        vt = pid % NVT
-        h = (pid // NVT) % HV
-        n = pid // (NVT * HV)
+        h = pid % HV
+        n = pid // HV
         nchunks = tl.load(nchunks_ptr + n)
         r = tl.arange(0, C)
         dk = tl.arange(0, Dk)
-        dvt = vt * DVT + tl.arange(0, DVT)  # this program's V-column slice
+        dv = tl.arange(0, Dv)
         lower = r[:, None] >= r[None, :]  # keep lower incl diag (matches tril + masked_fill(triu(1)))
         s_off = (n * HV + h) * Dk * Dv
-        S = tl.load(Sinit_ptr + s_off + dk[:, None] * Dv + dvt[None, :])  # [Dk,DVT] resident in regs
+        S = tl.load(Sinit_ptr + s_off + dk[:, None] * Dv + dv[None, :])  # [Dk,Dv] resident in regs
         for i in range(0, nchunks):
             cbase = ((n * HV + h) * NC + i) * C
             q = tl.load(q_ptr + cbase * Dk + r[:, None] * Dk + dk[None, :])  # [C,Dk] scaled+l2normed
             k = tl.load(k_ptr + cbase * Dk + r[:, None] * Dk + dk[None, :])  # [C,Dk] l2normed
-            vs = tl.load(vsolved_ptr + cbase * Dv + r[:, None] * Dv + dvt[None, :])  # [C,DVT] T@v_beta
+            vs = tl.load(vsolved_ptr + cbase * Dv + r[:, None] * Dv + dv[None, :])  # [C,Dv] T@v_beta
             kcd = tl.load(kcd_ptr + cbase * Dk + r[:, None] * Dk + dk[None, :])  # [C,Dk] T@(kb*exp g)
             gc = tl.load(gcum_ptr + cbase + r)  # [C] rounded-fp32 cumulative decay
-            # Every matmul result feeding an add/sub must round to a register FIRST, matching torch's
-            # separate mm then add/sub. A bare `x +/- tl.dot` (or `S*e + dot`) lets the compiler fold
-            # into an accumulator-form dot / FMA (one fused rounding) and drift ~2e-4 through the scan.
-            # A tautological mask (`r>=0`) is const-folded away, restoring the FMA; `bar` is a
-            # data-dependent predicate the compiler cannot prove, so the round survives. This is
-            # decode's _gdn_step_kernel trick (lines 275/285/286/305), made fold-proof.
+            # Each matmul result feeding an add/sub is rounded to a register FIRST (via the `bar`
+            # tl.where) so the scan and the decode _gdn_step_kernel fold in exactly the same order --
+            # decode must reproduce prefill, and a bare `x +/- tl.dot` lets the compiler fold into an
+            # accumulator-form dot / FMA (one fused rounding) and drift ~2e-4 through the scan. `bar`
+            # is a data-dependent predicate the compiler cannot prove (unlike a tautological `r>=0`
+            # which const-folds away), so the round survives identically in both kernels.
             bar = tl.sum(tl.where(r == 0, gc, 0.0), 0) < 1e30  # always true, not provably so
             # decay[a,b] = exp(gcum[a]-gcum[b]) for a>=b else 0 (== torch decay_mask[:,:,i]).
             decay = tl.where(lower, libdevice.exp(gc[:, None] - gc[None, :]), 0.0)
-            # attn2 = (q@k^T)*decay, strict-upper zeroed, diagonal kept. Recomputed per V-tile.
-            attn2 = tl.dot(q, tl.trans(k), input_precision="ieee") * decay
+            # attn2 = (q@k^T)*decay, strict-upper zeroed, diagonal kept.
+            attn2 = tl.dot(q, tl.trans(k), input_precision=PREC) * decay
             attn2 = tl.where(lower, attn2, 0.0)
             qg = q * libdevice.exp(gc)[:, None]  # [C,Dk]
-            attn_inter = tl.where(bar, tl.dot(qg, S, input_precision="ieee"), 0.0)  # (q*exp g)@S
-            vprime = tl.where(bar, tl.dot(kcd, S, input_precision="ieee"), 0.0)  # k_cumdecay@S
-            vnew = vs - vprime  # [C,DVT] == v_i - v_prime
-            intra = tl.where(bar, tl.dot(attn2, vnew, input_precision="ieee"), 0.0)
-            core = attn_inter + intra  # [C,DVT]
-            tl.store(core_ptr + cbase * Dv + r[:, None] * Dv + dvt[None, :], core)
+            attn_inter = tl.where(bar, tl.dot(qg, S, input_precision=PREC), 0.0)  # (q*exp g)@S
+            vprime = tl.where(bar, tl.dot(kcd, S, input_precision=PREC), 0.0)  # k_cumdecay@S
+            vnew = vs - vprime  # [C,Dv] == v_i - v_prime
+            intra = tl.where(bar, tl.dot(attn2, vnew, input_precision=PREC), 0.0)
+            core = attn_inter + intra  # [C,Dv]
+            tl.store(core_ptr + cbase * Dv + r[:, None] * Dv + dv[None, :], core)
             # state update: S = S*exp(glast) + (k * exp(glast-gcum))^T @ v_new
             glast = tl.sum(tl.where(r == C - 1, gc, 0.0), 0)  # gcum[C-1], single-lane collapse
             kdec = k * libdevice.exp(glast - gc)[:, None]  # [C,Dk]
+            # The boundary fold contracts all C rows into the recurrent state. ieee (fixed FMA
+            # reduction order) is bit-reproducible across the two separately-compiled scan/step
+            # kernels; tf32's tensor-core MMA tiling drifts ~1 fp32 ULP between them under their
+            # different register pressure, which would slowly desync the decode-replay state from
+            # prefill across multi-chunk decode. This is one dot per chunk, not the per-token hot
+            # path, so ieee here costs little. The per-token core dots stay PREC (tf32).
             upd = tl.where(bar, tl.dot(tl.trans(kdec), vnew, input_precision="ieee"), 0.0)
             sc = tl.where(bar, S * libdevice.exp(glast), 0.0)  # round before add (else FMA drift)
             S = sc + upd
             if i == bchunk:  # snapshot state entering the trailing partial chunk (n_seq==1 boundary)
-                tl.store(bnd_ptr + s_off + dk[:, None] * Dv + dvt[None, :], S)
-        tl.store(last_ptr + s_off + dk[:, None] * Dv + dvt[None, :], S)
+                tl.store(bnd_ptr + s_off + dk[:, None] * Dv + dv[None, :], S)
+        tl.store(last_ptr + s_off + dk[:, None] * Dv + dv[None, :], S)
+
+
+# Matmul precision for the GDN cross-chunk scan / decode-replay dots. "tf32" runs the dots on TF32
+# tensor cores (~5x faster than "ieee", which has no tensor-core path on B200 and additionally spills
+# the full-Dv state), is deterministic, and is num_warps- / V-tile-invariant (the K-reductions are
+# single-dot, K=Dk=128 or C=64; V is the N dim not K). Cross-engine identity is by construction: the
+# sglang prefill scan, Megatron's forward, AND the decode chunk-replay all run these SAME kernels at
+# this SAME precision, so tf32 need not match aten's fp32 bmm. The one hard requirement is that the
+# decode _gdn_step_kernel reproduce the scan bit-for-bit: tf32 tensor-core accumulation is only
+# tile-shape reproducible, so decode's fold dots use the SAME C=64 tile geometry as the scan (NOT the
+# old QR=16 tiles, which diverged ~6e-4 under tf32). Verified 0.0 batched-vs-C64-incremental (all
+# precisions) and decode==prefill replay tests. ieee is still bit-identical but ~5x slower here.
+GDN_SCAN_PREC = "tf32"
 
 
 def _fused_chunk_scan(query, key, gcum, v_solved, k_cumdecay, s_init, nchunks, bchunk, want_boundary):
     """Launch _chunk_scan_kernel: the cross-chunk recurrence over the precomputed intra-chunk WY
     tensors. All inputs are fp32 contiguous [N,HV,NC,C,*] (gcum [N,HV,NC,C]); s_init [N,HV,Dk,Dv].
-    Returns (core_attn_out [N,HV,NC,C,Dv], last_state [N,HV,Dk,Dv], boundary_state or None).
-    Bit-identical to the torch chunk loop it replaces (verified 0-ULP)."""
+    Returns (core_attn_out [N,HV,NC,C,Dv], last_state [N,HV,Dk,Dv], boundary_state or None)."""
     N, HV, NC, C, Dk = query.shape
     Dv = v_solved.shape[-1]
     core = torch.zeros(N, HV, NC, C, Dv, device=query.device, dtype=torch.float32)
     last = torch.empty(N, HV, Dk, Dv, device=query.device, dtype=torch.float32)
     bnd = torch.empty(1, HV, Dk, Dv, device=query.device, dtype=torch.float32) if want_boundary else last
-    # V-tile the state: DVT=32 keeps the resident S[Dk,DVT] slice on-chip (the full [128,128] spills
-    # ~5.7KB/thread -> ~16x slower) and raises the grid to N*HV*NVT for better occupancy. Exact:
-    # V-columns are independent in the recurrence. DVT must divide Dv.
-    DVT = 32 if Dv % 32 == 0 else Dv
-    NVT = Dv // DVT
-    _chunk_scan_kernel[(N * HV * NVT,)](
+    # tf32 tensor cores hold the full [Dk,Dv] state resident (no V-tiling): grid is (N,HV).
+    _chunk_scan_kernel[(N * HV,)](
         query, key, gcum, v_solved, k_cumdecay,
         s_init, core, last, bnd,
         nchunks, bchunk if want_boundary else -1,
-        HV=HV, NC=NC, C=C, Dk=Dk, Dv=Dv, DVT=DVT, NVT=NVT, num_warps=8, num_stages=1,
+        HV=HV, NC=NC, C=C, Dk=Dk, Dv=Dv, PREC=GDN_SCAN_PREC,
+        num_warps=8, num_stages=1,
     )
     return core, last, (bnd if want_boundary else None)
 
@@ -1225,8 +1261,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
             arena["qn"], arena["kn"], arena["kb"], arena["vb"], arena["g"], arena["gcum"],
             arena["A_row"], arena["T"], arena["vnew"], arena["boundary"], out,
             arena["i_buf"], arena["inext_buf"], row_map,
-            scale, HV=HV, HK=HK, Dk=Dk, Dv=Dv, CS=C, QR=16, PAD_ROW=self.gdn_pad_row,
-            num_warps=8,
+            scale, HV=HV, HK=HK, Dk=Dk, Dv=Dv, CS=C, PAD_ROW=self.gdn_pad_row,
+            SPREC=GDN_SCAN_PREC, num_warps=8,
         )
         # Roll width forward for the next step: i_buf <- inext_buf (in-place, capturable). Whole-arena
         # copy is safe: an inactive row already has i_buf == inext_buf (its last active step's roll
