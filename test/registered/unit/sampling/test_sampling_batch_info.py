@@ -12,6 +12,8 @@ import torch
 
 from sglang.srt.sampling.sampling_batch_info import (
     SamplingBatchInfo,
+    get_fused_sampler_top_k,
+    is_fused_sampler_batch_shape_supported,
     merge_bias_tensor,
 )
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
@@ -42,7 +44,6 @@ def _make_info(batch_size=2, **overrides):
 
 
 class TestMergeBiasTensor(CustomTestCase):
-
     def test_both_none_returns_none(self):
         """Test that merging two None tensors returns None."""
         result = merge_bias_tensor(None, None, 2, 3, DEVICE, 0.0)
@@ -87,15 +88,49 @@ class TestMergeBiasTensor(CustomTestCase):
 
 # SamplingBatchInfo.__len__
 class TestSamplingBatchInfoLen(CustomTestCase):
-
     def test_len_matches_batch_size(self):
         """Test that __len__ returns batch size (number of temperature rows)."""
         info = _make_info(batch_size=5)
         self.assertEqual(len(info), 5)
 
 
-class TestMergeCustomLogitProcessor(CustomTestCase):
+class TestFusedSamplerTopK(CustomTestCase):
+    def test_requires_homogeneous_small_non_greedy_top_k(self):
+        """Test the fused sampler gate for sampler top-k values."""
+        self.assertEqual(get_fused_sampler_top_k([2, 2]), 2)
+        self.assertEqual(get_fused_sampler_top_k([8, 8, 8]), 8)
+        self.assertIsNone(get_fused_sampler_top_k([]))
+        self.assertIsNone(get_fused_sampler_top_k([1, 1]))
+        self.assertIsNone(get_fused_sampler_top_k([9, 9]))
+        self.assertIsNone(get_fused_sampler_top_k([2, 3]))
+        self.assertIsNone(get_fused_sampler_top_k([TOP_K_ALL, TOP_K_ALL]))
 
+    def test_batch_shape_supports_k8_only_for_small_batches(self):
+        """Test the fused sampler batch guard for larger top-k values."""
+        self.assertTrue(is_fused_sampler_batch_shape_supported(4, 1024))
+        self.assertTrue(is_fused_sampler_batch_shape_supported(8, 16))
+        self.assertFalse(is_fused_sampler_batch_shape_supported(8, 17))
+
+    def test_merge_preserves_matching_fused_top_k(self):
+        """Test that merging same small top-k batches keeps the fast path enabled."""
+        lhs = _make_info(batch_size=2, fused_top_k=4)
+        rhs = _make_info(batch_size=3, fused_top_k=4)
+
+        lhs.merge_batch(rhs)
+
+        self.assertEqual(lhs.fused_top_k, 4)
+
+    def test_merge_clears_mismatched_fused_top_k(self):
+        """Test that merging different top-k batches disables the fast path."""
+        lhs = _make_info(batch_size=2, fused_top_k=4)
+        rhs = _make_info(batch_size=3, fused_top_k=8)
+
+        lhs.merge_batch(rhs)
+
+        self.assertIsNone(lhs.fused_top_k)
+
+
+class TestMergeCustomLogitProcessor(CustomTestCase):
     def test_both_none_returns_none(self):
         """Test that merging two None processor dicts returns None."""
         result = SamplingBatchInfo.merge_custom_logit_processor(
@@ -142,7 +177,6 @@ class TestMergeCustomLogitProcessor(CustomTestCase):
 
 # apply_logits_bias
 class TestApplyLogitsBias(CustomTestCase):
-
     def test_applies_additive_penalties(self):
         """Test that pre-accumulated additive penalties are added to logits."""
         info = _make_info(batch_size=1)
@@ -193,7 +227,6 @@ class TestApplyLogitsBias(CustomTestCase):
 
 # update_penalties
 class TestUpdatePenalties(CustomTestCase):
-
     def test_required_creates_penalties_tensor(self):
         """Test that update_penalties allocates a zero tensor and calls orchestrator methods."""
         orch = MagicMock(is_required=True)
@@ -217,7 +250,6 @@ class TestUpdatePenalties(CustomTestCase):
 
 # update_regex_vocab_mask
 class TestUpdateRegexVocabMask(CustomTestCase):
-
     def test_no_grammars_clears_mask(self):
         """Test that None grammars clears both vocab_mask and apply_mask_func."""
         info = _make_info(batch_size=1)
@@ -273,7 +305,6 @@ class TestUpdateRegexVocabMask(CustomTestCase):
 
 # filter_batch
 class TestFilterBatch(CustomTestCase):
-
     def test_filter_keeps_correct_indices(self):
         """Test that filter retains rows at indices 0 and 2, dropping index 1."""
         info = _make_info(batch_size=3)
@@ -328,7 +359,6 @@ class TestFilterBatch(CustomTestCase):
 
 # merge_batch
 class TestMergeBatch(CustomTestCase):
-
     def test_merge_concatenates_tensors(self):
         """Test that merge concatenates temperature tensors from both batches."""
         info1 = _make_info(batch_size=2)
@@ -407,7 +437,6 @@ class TestMergeBatch(CustomTestCase):
 
 # copy_for_forward
 class TestCopyForForward(CustomTestCase):
-
     def test_returns_copy_without_orchestrator(self):
         """Test that copy_for_forward returns a copy with orchestrator set to None."""
         orch = MagicMock(is_required=False)
@@ -420,7 +449,6 @@ class TestCopyForForward(CustomTestCase):
 
 # from_schedule_batch
 class TestFromScheduleBatch(CustomTestCase):
-
     def _make_req(
         self,
         temp=1.0,

@@ -31,6 +31,7 @@ if is_cuda():
         min_p_sampling_from_probs,
         top_k_top_p_sampling_from_probs,
     )
+    from sglang.jit_kernel.fused_sampler import fused_topk_sample
     from sgl_kernel import (
         top_k_renorm_prob,
         top_p_renorm_prob,
@@ -90,6 +91,37 @@ class Sampler(nn.Module):
             apply_custom_logit_processor(logits, sampling_info)
         sanitize_nan_logits(logits, "sampler: next_token_logits")
         return logits
+
+    def _try_fused_topk_sample_from_logits(
+        self,
+        logits: torch.Tensor,
+        sampling_info: SamplingBatchInfo,
+        return_logprob: bool,
+    ) -> Optional[torch.Tensor]:
+        """Sample directly from logits for homogeneous small-top-k batches."""
+        top_k = sampling_info.fused_top_k
+        if top_k is None:
+            return None
+        if (
+            return_logprob
+            or self.use_ascend_backend
+            or self.use_log_softmax_logprob
+            or sampling_info.need_min_p_sampling
+            or sampling_info.sampling_seed is not None
+            or get_flags().sampling_backend != "flashinfer"
+            or not is_cuda()
+            or not logits.is_cuda
+            or logits.dtype not in (torch.float32, torch.float16, torch.bfloat16)
+        ):
+            return None
+
+        return fused_topk_sample(
+            logits,
+            sampling_info.temperatures,
+            sampling_info.top_ps,
+            top_k,
+            needs_top_p=sampling_info.need_top_p_sampling,
+        )
 
     def forward(
         self,
@@ -177,23 +209,27 @@ class Sampler(nn.Module):
                 if return_logprob and not SGLANG_RETURN_ORIGINAL_LOGPROB:
                     logprobs = logprobs_via_logsoftmax_kernel
             else:
-                # Standard path: do softmax and sample from probs.
-                logits.div_(sampling_info.temperatures)
-
-                # In-place op to save memory
-                logits[:] = torch.softmax(logits, dim=-1)
-                probs = logits
-
-                batch_next_token_ids = self._sample_from_probs(
-                    probs, sampling_info, positions, simple_sampling_case
+                batch_next_token_ids = self._try_fused_topk_sample_from_logits(
+                    logits, sampling_info, return_logprob
                 )
-                if return_logprob and not SGLANG_RETURN_ORIGINAL_LOGPROB:
-                    logprobs = (
-                        logprobs_via_logsoftmax_kernel
-                        if logprobs_via_logsoftmax_kernel is not None
-                        else torch.log(probs)
+                if batch_next_token_ids is None:
+                    # Standard path: do softmax and sample from probs.
+                    logits.div_(sampling_info.temperatures)
+
+                    # In-place op to save memory
+                    logits[:] = torch.softmax(logits, dim=-1)
+                    probs = logits
+
+                    batch_next_token_ids = self._sample_from_probs(
+                        probs, sampling_info, positions, simple_sampling_case
                     )
-                del probs
+                    if return_logprob and not SGLANG_RETURN_ORIGINAL_LOGPROB:
+                        logprobs = (
+                            logprobs_via_logsoftmax_kernel
+                            if logprobs_via_logsoftmax_kernel is not None
+                            else torch.log(probs)
+                        )
+                    del probs
 
         # Attach logprobs to logits_output (in-place modification)
         if return_logprob:

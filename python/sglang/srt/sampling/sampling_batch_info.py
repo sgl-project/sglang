@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
 
@@ -18,6 +18,21 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+FUSED_SAMPLER_MAX_TOP_K = 8
+
+
+def get_fused_sampler_top_k(top_ks: Sequence[int]) -> Optional[int]:
+    """Return the homogeneous small sampler top-k supported by fused sampler."""
+    if not top_ks:
+        return None
+
+    top_k = int(top_ks[0])
+    if top_k <= 1 or top_k > FUSED_SAMPLER_MAX_TOP_K:
+        return None
+    if any(int(value) != top_k for value in top_ks):
+        return None
+    return top_k
 
 
 @dataclasses.dataclass
@@ -73,6 +88,9 @@ class SamplingBatchInfo:
     # Handle logit bias
     logit_bias: Optional[torch.Tensor] = None
 
+    # Homogeneous sampler top-k for the fused small-top-k sampler fast path.
+    fused_top_k: Optional[int] = None
+
     @classmethod
     def from_schedule_batch(cls, batch: ScheduleBatch, vocab_size: int):
         global_server_args = get_global_server_args()
@@ -81,6 +99,8 @@ class SamplingBatchInfo:
         reqs = batch.reqs
         device = batch.device
         _pin = is_pin_memory_available(device)
+        top_p_values = [r.sampling_params.top_p for r in reqs]
+        top_k_values = [r.sampling_params.top_k for r in reqs]
         temperatures = (
             torch.tensor(
                 [r.sampling_params.temperature for r in reqs],
@@ -91,12 +111,12 @@ class SamplingBatchInfo:
             .view(-1, 1)
         )
         top_ps = torch.tensor(
-            [r.sampling_params.top_p for r in reqs],
+            top_p_values,
             dtype=torch.float,
             pin_memory=_pin,
         ).to(device, non_blocking=True)
         top_ks = torch.tensor(
-            [r.sampling_params.top_k for r in reqs],
+            top_k_values,
             dtype=torch.int32,
             pin_memory=_pin,
         ).to(device, non_blocking=True)
@@ -198,6 +218,7 @@ class SamplingBatchInfo:
             custom_logit_processor=merged_custom_logit_processor,
             device=device,
             logit_bias=logit_bias,
+            fused_top_k=get_fused_sampler_top_k(top_k_values),
         )
         ret.adjusted_from_schedule_batch(batch, vocab_size)
         return ret
@@ -412,6 +433,8 @@ class SamplingBatchInfo:
         self.need_top_p_sampling |= other.need_top_p_sampling
         self.need_top_k_sampling |= other.need_top_k_sampling
         self.need_min_p_sampling |= other.need_min_p_sampling
+        if self.fused_top_k != other.fused_top_k:
+            self.fused_top_k = None
 
         self.adjusted_merge_batch(other)
 
