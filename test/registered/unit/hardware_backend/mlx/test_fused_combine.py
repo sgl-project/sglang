@@ -323,5 +323,93 @@ class TestFusedCombine(unittest.TestCase):
         )
 
 
+@unittest.skipUnless(_IS_APPLE_SILICON and _HAS_MLX, _SKIP_REASON)
+class TestPatchMoeCombine(unittest.TestCase):
+    """patch_moe_combine_with_fused: subclass swap with no-op idempotency."""
+
+    def _tiny_model(self):
+        """Real mlx-lm MoE blocks at toy dims, random init, no downloads."""
+        import mlx.nn as nn
+        from mlx_lm.models import qwen2_moe, qwen3_moe
+
+        q2 = qwen2_moe.Qwen2MoeSparseMoeBlock(
+            qwen2_moe.ModelArgs(
+                model_type="qwen2_moe",
+                hidden_size=64,
+                num_hidden_layers=1,
+                intermediate_size=128,
+                num_attention_heads=4,
+                num_experts_per_tok=2,
+                num_experts=4,
+                moe_intermediate_size=32,
+                shared_expert_intermediate_size=64,
+                rms_norm_eps=1e-6,
+                vocab_size=128,
+            )
+        )
+        q3 = qwen3_moe.Qwen3MoeSparseMoeBlock(
+            qwen3_moe.ModelArgs(
+                model_type="qwen3_moe",
+                hidden_size=64,
+                num_hidden_layers=1,
+                intermediate_size=128,
+                num_attention_heads=4,
+                num_experts=4,
+                num_experts_per_tok=2,
+                decoder_sparse_step=1,
+                mlp_only_layers=[],
+                moe_intermediate_size=32,
+                rms_norm_eps=1e-6,
+                vocab_size=128,
+                num_key_value_heads=2,
+                head_dim=16,
+                rope_theta=10000.0,
+                tie_word_embeddings=False,
+                max_position_embeddings=2048,
+                norm_topk_prob=True,
+            )
+        )
+
+        class _Layer(nn.Module):
+            def __init__(self, mlp):
+                super().__init__()
+                self.mlp = mlp
+
+        class _Inner(nn.Module):
+            def __init__(self, layers):
+                super().__init__()
+                self.layers = layers
+
+        class _Model(nn.Module):
+            def __init__(self, layers):
+                super().__init__()
+                self.model = _Inner(layers)
+
+        return _Model([_Layer(q2), _Layer(q3)]), q2, q3
+
+    def test_patch_is_idempotent_no_op(self):
+        model, q2, q3 = self._tiny_model()
+        x = mx.random.normal((1, 3, 64))
+        stock_q2, stock_q3 = q2(x), q3(x)
+        mx.eval(stock_q2, stock_q3)
+
+        self.assertEqual(fc.patch_moe_combine_with_fused(model), 2)
+        self.assertTrue(type(q2).__name__.endswith("_FusedCombine"))
+        self.assertTrue(type(q3).__name__.endswith("_FusedCombine"))
+        once_q2, once_q3 = q2(x), q3(x)
+
+        cls2, cls3 = type(q2), type(q3)
+        self.assertEqual(fc.patch_moe_combine_with_fused(model), 0)
+        self.assertIs(type(q2), cls2)
+        self.assertIs(type(q3), cls3)
+        twice_q2, twice_q3 = q2(x), q3(x)
+        self.assertTrue(bool(mx.array_equal(once_q2, twice_q2).item()))
+        self.assertTrue(bool(mx.array_equal(once_q3, twice_q3).item()))
+        # H=64 fails the H % 256 gate, so the patched forward takes the inline
+        # fallback: bit-identical to the stock forward.
+        self.assertTrue(bool(mx.array_equal(stock_q2, once_q2).item()))
+        self.assertTrue(bool(mx.array_equal(stock_q3, once_q3).item()))
+
+
 if __name__ == "__main__":
     unittest.main()

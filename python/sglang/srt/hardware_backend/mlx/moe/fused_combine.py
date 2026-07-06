@@ -29,6 +29,8 @@ import logging
 
 import mlx.core as mx
 
+from sglang.srt.hardware_backend.mlx.metal_jit import MetalJitKernel
+
 logger = logging.getLogger(__name__)
 
 _THREADS_PER_TG = 64
@@ -82,26 +84,17 @@ _KERNEL_SOURCE = r"""
 """
 
 
-_kernel_cache: dict[tuple[mx.Dtype, mx.Dtype], object] = {}
-
-
-def _dtype_tag(dtype: mx.Dtype) -> str:
-    # Metal's host_name attribute rejects '.', so strip the mlx.core prefix.
-    return str(dtype).replace("mlx.core.", "").replace(".", "_")
+_KERNEL = MetalJitKernel(
+    name_template="fused_moe_combine_y{0}_s{1}",
+    input_names=["y", "scores"],
+    output_names=["out"],
+    source=_KERNEL_SOURCE,
+)
 
 
 def _get_kernel(y_dtype: mx.Dtype, scores_dtype: mx.Dtype):
-    """Return a compiled mx.fast.metal_kernel for the (y, scores) dtype pair."""
-    key = (y_dtype, scores_dtype)
-    if key not in _kernel_cache:
-        name = f"fused_moe_combine_y{_dtype_tag(y_dtype)}_s{_dtype_tag(scores_dtype)}"
-        _kernel_cache[key] = mx.fast.metal_kernel(
-            name=name,
-            input_names=["y", "scores"],
-            output_names=["out"],
-            source=_KERNEL_SOURCE,
-        )
-    return _kernel_cache[key]
+    """Seam kept for test spies; caching lives in MetalJitKernel."""
+    return _KERNEL.get(y_dtype, scores_dtype)
 
 
 _Y_DTYPES = (mx.float16, mx.bfloat16)

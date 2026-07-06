@@ -50,6 +50,8 @@ import weakref
 import mlx.core as mx
 import mlx.nn as nn
 
+from sglang.srt.hardware_backend.mlx.metal_jit import MetalJitKernel
+
 logger = logging.getLogger(__name__)
 
 # Constants matching MLX's affine_qmv_fast for bits=4, group_size=64.
@@ -197,34 +199,17 @@ _KERNEL_SOURCE = r"""
 """
 
 
-# Build kernel lazily so import-time on non-MLX systems doesn't fail.
-_kernel_cache: dict = {}
-
-# AOT pre-compile cache: tracks which (dtype, K, N, T) tuples have been warmed.
-# MLX specializes the Metal kernel on template args at first dispatch, so the
-# first call per unique tuple pays a ~3ms compile cost. Pre-warming at patch
-# time moves that cost out of the first forward pass.
-_aot_warmed: set = set()
+_KERNEL = MetalJitKernel(
+    name_template="affine_gather_qmv_silu_mul_4bit_gs64_{0}",
+    input_names=["x", "w", "s", "b", "idx", "x_up"],
+    output_names=["y"],
+    source=_KERNEL_SOURCE,
+)
 
 
 def _get_kernel(dtype: mx.Dtype):
-    """Return a compiled mx.fast.metal_kernel for the given input dtype.
-
-    Kept per-dtype because mx.fast.metal_kernel specializes on template args
-    at first call, and we want clean separation between fp16 / bf16 variants.
-    """
-    if dtype not in _kernel_cache:
-        # Strip the `mlx.core.` prefix and any dots from the dtype repr so the
-        # kernel name is a valid C identifier (Metal's host_name attribute and
-        # function-name slot don't accept '.').
-        dtype_tag = str(dtype).replace("mlx.core.", "").replace(".", "_")
-        _kernel_cache[dtype] = mx.fast.metal_kernel(
-            name=f"affine_gather_qmv_silu_mul_4bit_gs64_{dtype_tag}",
-            input_names=["x", "w", "s", "b", "idx", "x_up"],
-            output_names=["y"],
-            source=_KERNEL_SOURCE,
-        )
-    return _kernel_cache[dtype]
+    """Seam kept for test spies; caching lives in MetalJitKernel."""
+    return _KERNEL.get(dtype)
 
 
 def fused_gate_qmv_silu_mul(
@@ -327,12 +312,10 @@ def _aot_warm_kernel(switch_mlp, top_k: int) -> None:
     """Pre-compile the fused kernel for the (dtype, K, N, T) tuples this
     layer will dispatch at runtime.
 
-    MLX's mx.fast.metal_kernel specializes Metal source on template args
-    at first dispatch (one Metal compile per unique tuple, ~3ms each).
-    Issuing one dummy dispatch per shape moves that compile out of the
-    first forward pass and into model init. The module-level _aot_warmed
-    set means only the first layer per shape actually compiles; the
-    remaining 47 hit the cache and no-op.
+    MLX specializes Metal source on template args at first dispatch (~3ms
+    per unique tuple). One dummy dispatch per shape moves that compile into
+    model init; MetalJitKernel.warm_once dedupes across layers, so only the
+    first layer per shape actually compiles.
 
     Warms both the unsorted decode shape (T=top_k) and the sorted
     large-batch shape (T=1) used by the gather-sort path.
@@ -342,30 +325,28 @@ def _aot_warm_kernel(switch_mlp, top_k: int) -> None:
     N = gate.weight.shape[-2]
     dtype = gate.scales.dtype
     for T in (top_k, 1):
-        key = (dtype, K, N, T)
-        if key in _aot_warmed:
-            continue
-        M_tok = 1
-        x_dummy = mx.zeros((M_tok, 1, 1, K), dtype=dtype)
-        idx_dummy = mx.zeros((M_tok, T), dtype=mx.uint32)
-        x_up_dummy = mx.zeros((M_tok, T, 1, N), dtype=dtype)
-        out = fused_gate_qmv_silu_mul(
-            x_dummy,
-            gate["weight"],
-            gate["scales"],
-            gate.get("biases"),
-            idx_dummy,
-            x_up_dummy,
-        )
-        mx.eval(out)
-        _aot_warmed.add(key)
-        logger.info(
-            "Path B AOT: warmed fused kernel dtype=%s K=%d N=%d T=%d",
-            dtype,
-            K,
-            N,
-            T,
-        )
+
+        def _dispatch(T=T):
+            x_dummy = mx.zeros((1, 1, 1, K), dtype=dtype)
+            idx_dummy = mx.zeros((1, T), dtype=mx.uint32)
+            x_up_dummy = mx.zeros((1, T, 1, N), dtype=dtype)
+            return fused_gate_qmv_silu_mul(
+                x_dummy,
+                gate["weight"],
+                gate["scales"],
+                gate.get("biases"),
+                idx_dummy,
+                x_up_dummy,
+            )
+
+        if _KERNEL.warm_once((dtype, K, N, T), _dispatch):
+            logger.info(
+                "Path B AOT: warmed fused kernel dtype=%s K=%d N=%d T=%d",
+                dtype,
+                K,
+                N,
+                T,
+            )
 
 
 def can_fuse(switch_mlp) -> bool:
