@@ -446,6 +446,7 @@ class Envs:
     MOONCAKE_STANDALONE_STORAGE = EnvBool(False)
     MOONCAKE_ENABLE_SSD_OFFLOAD = EnvBool(False)
     MOONCAKE_OFFLOAD_FILE_STORAGE_PATH = EnvStr(None)
+    MOONCAKE_TENANT_ID = EnvStr("default")
 
     # MoRI KV Transfer
     # Send CPU-resident AUX data via RDMA instead of ZMQ TCP (default: TCP).

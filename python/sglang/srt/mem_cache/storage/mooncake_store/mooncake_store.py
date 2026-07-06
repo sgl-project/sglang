@@ -27,6 +27,7 @@ from sglang.srt.observability.metrics_collector import StorageMetrics
 
 DEFAULT_LOCAL_BUFFER_SIZE = 16 * 1024 * 1024  # 16 MB
 SETUP_TIMEOUT = 600  # 10min
+DEFAULT_TENANT_ID = "default"
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +83,13 @@ def _parse_global_segment_size(value) -> int:
     return int(value)
 
 
+def _normalize_tenant_id(value) -> str:
+    if value is None:
+        return DEFAULT_TENANT_ID
+    tenant_id = str(value)
+    return tenant_id if tenant_id else DEFAULT_TENANT_ID
+
+
 @dataclass
 class MooncakeStoreConfig:
     local_hostname: str
@@ -96,6 +104,7 @@ class MooncakeStoreConfig:
     client_server_address: str
     enable_ssd_offload: bool = False
     ssd_offload_path: Optional[str] = None
+    tenant_id: str = DEFAULT_TENANT_ID
 
     @staticmethod
     def from_file() -> "MooncakeStoreConfig":
@@ -152,6 +161,9 @@ class MooncakeStoreConfig:
             ssd_offload_path=config.get(
                 "ssd_offload_path", envs.MOONCAKE_OFFLOAD_FILE_STORAGE_PATH.default
             ),
+            tenant_id=_normalize_tenant_id(
+                config.get("tenant_id", envs.MOONCAKE_TENANT_ID.default)
+            ),
         )
 
     @staticmethod
@@ -193,6 +205,7 @@ class MooncakeStoreConfig:
             client_server_address=envs.MOONCAKE_CLIENT.get(),
             enable_ssd_offload=envs.MOONCAKE_ENABLE_SSD_OFFLOAD.get(),
             ssd_offload_path=envs.MOONCAKE_OFFLOAD_FILE_STORAGE_PATH.get(),
+            tenant_id=_normalize_tenant_id(envs.MOONCAKE_TENANT_ID.get()),
         )
 
     @staticmethod
@@ -240,6 +253,9 @@ class MooncakeStoreConfig:
             ),
             ssd_offload_path=extra_config.get(
                 "ssd_offload_path", envs.MOONCAKE_OFFLOAD_FILE_STORAGE_PATH.default
+            ),
+            tenant_id=_normalize_tenant_id(
+                extra_config.get("tenant_id", envs.MOONCAKE_TENANT_ID.default)
             ),
         )
 
@@ -476,6 +492,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     setup_kwargs["enable_ssd_offload"] = True
                 if self.config.ssd_offload_path is not None:
                     setup_kwargs["ssd_offload_path"] = self.config.ssd_offload_path
+                if self.config.tenant_id != DEFAULT_TENANT_ID:
+                    setup_kwargs["tenant_id"] = self.config.tenant_id
 
                 while True:
                     try:
@@ -497,6 +515,13 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                         ]
                         if not unsupported_kwargs:
                             raise
+                        if "tenant_id" in unsupported_kwargs:
+                            raise RuntimeError(
+                                "The installed Mooncake version does not support "
+                                "tenant_id in MooncakeDistributedStore.setup(). "
+                                "Please upgrade Mooncake to use non-default "
+                                "Mooncake tenants with SGLang."
+                            ) from e
                         logger.warning(
                             "The installed Mooncake version does not support the "
                             f"{', '.join(unsupported_kwargs)} parameter(s) in setup(). "
