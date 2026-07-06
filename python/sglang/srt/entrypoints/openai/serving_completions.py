@@ -316,10 +316,9 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 # Generate delta
                 if self.tokenizer_manager.server_args.incremental_streaming_output:
                     delta = text
-                    stream_offsets[index] = len(content["text"])
                 else:
                     delta = text[offset:]
-                    stream_offsets[index] = len(content["text"])
+                stream_offsets[index] = len(content["text"])
                 finish_reason = content["meta_info"].get("finish_reason", None)
                 finish_reason_type = finish_reason["type"] if finish_reason else None
 
