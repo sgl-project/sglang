@@ -262,6 +262,11 @@ class DeepseekMHAForwardMixin:
         q[..., self.qk_nope_head_dim :] = q_pe
 
         self._set_mla_kv_buffer(latent_cache, kv_a, k_pe, forward_batch)
+        # When MHA_ONE_SHOT reloads the full (prefix+current) KV from the cache,
+        # the pre-quantized ``kv_a_quanted`` computed above only covers the
+        # current extend tokens and becomes stale. Track that so the gfx95 fp8
+        # fast path below falls back to quantizing the reloaded bf16 ``kv_a``.
+        kv_a_reloaded_from_cache = False
         if (
             forward_batch.mha_one_shot
             and sum(forward_batch.extend_prefix_lens_cpu) != 0
@@ -296,6 +301,7 @@ class DeepseekMHAForwardMixin:
                         q.dtype,
                         forward_batch,
                     )
+            kv_a_reloaded_from_cache = True
         if _use_fp8_prefill_attn and self.kv_b_proj.weight.dtype == torch.uint8:
             # MXFP4 weights + FP8 prefill: fuse GEMM, nope/v split, and k_pe cat
             # into a single kernel (fused_gemm_afp4wfp4_split_cat) that writes k and v
@@ -310,9 +316,15 @@ class DeepseekMHAForwardMixin:
                 )
             )[0]
         else:
-            if _use_aiter_gfx95 and self.kv_b_proj.weight.dtype == torch.float8_e4m3fn:
+            if (
+                _use_aiter_gfx95
+                and self.kv_b_proj.weight.dtype == torch.float8_e4m3fn
+                and not kv_a_reloaded_from_cache
+            ):
                 kv = self.kv_b_proj(kv_a_quanted)[0]
             else:
+                # bf16 kv_a (incl. the MHA_ONE_SHOT reload-from-cache case): the
+                # quantized linear handles activation quantization internally.
                 kv = self.kv_b_proj(kv_a)[0]
             kv = kv.view(
                 -1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim

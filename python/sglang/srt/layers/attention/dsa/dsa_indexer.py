@@ -1640,8 +1640,14 @@ class Indexer(MultiPlatformOp):
                 forward_batch
             )
 
-        # Optimization: fast path when skipping topk computation
-        if skip_logits_computation and (not self.dsa_enable_prefill_cp):
+        # Optimization: fast path when skipping topk computation.
+        # `return_indices=False` is set by the model when this prefill will run dense
+        # MHA (backend use_mha): MHA ignores top-k, so skip the logits GEMM + top-k at
+        # ANY context. The indexer K-cache is still written (so a later sparse step
+        # stays correct); only the discarded, per-step logits/top-k are skipped.
+        if (skip_logits_computation or not return_indices) and (
+            not self.dsa_enable_prefill_cp
+        ):
             topk_result = self._forward_cuda_k_only(
                 x,
                 positions,
