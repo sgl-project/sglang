@@ -41,6 +41,7 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     PerformanceSummary,
     ScenarioConfig,
     get_model_task_type_for_server_args,
+    get_perf_baseline_path,
 )
 from sglang.multimodal_gen.test.test_utils import (
     SGL_TEST_FILES_CI_DATA_REVISION,
@@ -50,6 +51,7 @@ from sglang.multimodal_gen.test.test_utils import (
     extract_key_frames_from_video,
     get_consistency_gt_candidates,
     get_consistency_gt_remote_files,
+    get_consistency_threshold_path,
     get_consistency_thresholds,
     get_dynamic_server_port,
     gt_exists,
@@ -79,6 +81,16 @@ _SERVER_FATAL_LOG_PATTERNS = (
     "Segmentation fault",
     "Aborted (core dumped)",
 )
+_CASE_LOG_SEPARATOR = "=" * 88
+
+
+def _print_case_log_separator(case_id: str, state: str) -> None:
+    print(
+        f"\n{_CASE_LOG_SEPARATOR}\n"
+        f"[server-test] {state}: {case_id}\n"
+        f"{_CASE_LOG_SEPARATOR}",
+        flush=True,
+    )
 
 
 @pytest.fixture
@@ -86,6 +98,7 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
     """Start a diffusion server for a single case and tear it down afterwards."""
     _fixture_start_time = time.perf_counter()
     server_args = case.server_args
+    _print_case_log_separator(case.id, "BEGIN diffusion testcase")
 
     # Skip ring attention tests on AMD/ROCm - Ring Attention requires Flash Attention
     # which is not available on AMD. Use Ulysses parallelism instead.
@@ -201,6 +214,7 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
                 f"is not available in the installed version. "
                 f"Upgrade diffusers to enable this test."
             )
+        _print_case_log_separator(case.id, "FAILED during server startup")
         raise
 
     try:
@@ -232,13 +246,14 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
             logger.error(
                 f'\n{"=" * 60}\n'
                 f'Add "estimated_full_test_time_s" to scenario "{case.id}":\n\n'
-                f"File: python/sglang/multimodal_gen/test/server/perf_baselines.json\n\n"
+                f"File: {get_perf_baseline_path()}\n\n"
                 f'    "{case.id}": {{\n'
                 f"        ...\n"
                 f'        "estimated_full_test_time_s": {_measured_full_time:.1f}\n'
                 f"    }}\n"
                 f'{"=" * 60}\n'
             )
+        _print_case_log_separator(case.id, "END diffusion testcase")
 
 
 class DiffusionServerBase:
@@ -441,7 +456,7 @@ class DiffusionServerBase:
                 self._dump_baseline_for_testcase(case, summary, missing_scenario)
                 if missing_scenario:
                     pytest.fail(
-                        f"Testcase '{case.id}' not found in perf_baselines.json"
+                        f"Testcase '{case.id}' not found in {get_perf_baseline_path()}"
                     )
                 return
 
@@ -552,7 +567,7 @@ class DiffusionServerBase:
                 )
         action = "add" if missing_scenario else "update"
         output = f"""
-{action} this baseline in the "scenarios" section of perf_baselines.json:
+{action} this baseline in the "scenarios" section of {get_perf_baseline_path()}:
 
 "{case.id}": {json.dumps(baseline, indent=4)}
 
@@ -607,10 +622,10 @@ Add the expected file(s) to sgl-project/ci-data in diffusion-ci/consistency_gt/s
 
 For this case, expected file(s): {names}
 
-Repository: https://github.com/sgl-project/ci-data (path: diffusion-ci/consistency_gt/sglang_generated/)
+Repository: https://github.com/sgl-project/ci-data (path: diffusion-ci/consistency_gt/sglang_generated/, with optional platform subdirectories such as 5090/)
 Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
 
-(Optional) Per-case override in consistency_threshold.json:
+(Optional) Per-case override in {get_consistency_threshold_path()}:
   "cases": {{
     "{case.id}": {{
       "clip_threshold": 0.92,
@@ -1197,6 +1212,24 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
         - test_diffusion_generation[qwen_image_edit]
         - etc.
         """
+        try:
+            self._test_diffusion_generation_impl(case, diffusion_server)
+        except pytest.skip.Exception:
+            _print_case_log_separator(case.id, "SKIPPED diffusion testcase")
+            raise
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException:
+            _print_case_log_separator(case.id, "FAILED diffusion testcase")
+            raise
+        else:
+            _print_case_log_separator(case.id, "PASSED diffusion testcase")
+
+    def _test_diffusion_generation_impl(
+        self,
+        case: DiffusionTestCase,
+        diffusion_server: ServerContext,
+    ):
         # Check if we're in GT generation mode
         is_gt_gen_mode = os.environ.get("SGLANG_GEN_GT", "0") == "1"
 

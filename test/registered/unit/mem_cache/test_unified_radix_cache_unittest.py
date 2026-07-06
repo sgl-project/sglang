@@ -1977,7 +1977,7 @@ class UnifiedRadixCacheSuite:
         with envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.override(True):
             tree.cache_unfinished_req(req)
 
-        cushion = self.cfg.sliding_window_size + self.cfg.page_size
+        cushion = max(self.cfg.sliding_window_size, self.cfg.page_size)
         expected_evicted = (pre_len - 1) - cushion
         self.assertEqual(
             req.swa_evicted_seqlen,

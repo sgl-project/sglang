@@ -94,11 +94,7 @@ def hash_tiles32_kernel_blocked(
     h1 ^= nbytes
     h2 ^= nbytes
     h1 = _fmix32(h1, C1=FM_C1, C2=FM_C2)
-    h2 = (
-        _fmix32(h2, C1=FMIX32_C1, C2=FMIX32_C2)
-        if False
-        else _fmix32(h2, C1=FM_C1, C2=FM_C2)
-    )
+    h2 = _fmix32(h2, C1=FM_C1, C2=FM_C2)
 
     out = (h1.to(tl.uint64) << 32) | h2.to(tl.uint64)
     tl.store(out_ptr + pid, out)

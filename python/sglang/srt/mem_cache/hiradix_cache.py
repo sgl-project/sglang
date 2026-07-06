@@ -8,7 +8,7 @@ import os
 import threading
 import time
 from queue import Empty
-from typing import TYPE_CHECKING, Dict, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
 
@@ -1087,7 +1087,7 @@ class HiRadixCache(RadixCache):
         heap = self._make_eviction_heap()
         num_evicted = 0
         while num_evicted < num_tokens and heap:
-            _priority, x = heapq.heappop(heap)
+            _, x = heapq.heappop(heap)
             if x.lock_ref > 0:
                 continue
             if x.backuped:
@@ -1103,18 +1103,32 @@ class HiRadixCache(RadixCache):
         """
         heap = self._make_eviction_heap()
         num_evicted = 0
+        staged: List[Tuple[TreeNode, torch.Tensor]] = []
+
+        def flush_staged() -> None:
+            if not staged:
+                return
+            self.writing_check(write_back=True)
+            for node, device_indices in staged:
+                self.cache_controller.evict_device(device_indices)
+                node.release_host()
+            staged.clear()
+
         while num_evicted < num_tokens and heap:
-            _priority, x = heapq.heappop(heap)
+            _, x = heapq.heappop(heap)
             if x.lock_ref > 0:
                 continue
             if x.backuped:
                 num_evicted += self._evict_backuped(x)
             elif self.write_backup(x, write_back=True) > 0:
-                self.writing_check(write_back=True)
-                num_evicted += self._evict_backuped(x)
+                x.protect_host()
+                staged.append((x, x.value))
+                num_evicted += self._detach_backuped(x)
             else:
+                flush_staged()
                 num_evicted += self._drop_subtree_no_host(x)
             self._promote_parent(x, heap)
+        flush_staged()
         return num_evicted
 
     def _observe_l1_eviction_age(self, node: TreeNode) -> None:
@@ -1128,12 +1142,10 @@ class HiRadixCache(RadixCache):
             hit_count=node.hit_count,
         )
 
-    def _evict_backuped(self, node: TreeNode):
-        # GPU -> CPU demotion: block moves from device to host.
-        # Emit remove(GPU) so downstream indexers stop scoring it as device-local.
-        # The matching store(CPU) was emitted when write_backup() copied to host.
+    def _detach_backuped(self, node: TreeNode) -> int:
+        # detach nodes from tree while keeping device slots, for write-back eviction
         self._record_remove_event(node, medium=StorageMedium.GPU)
-        num_evicted = self.cache_controller.evict_device(node.value)
+        num_evicted = len(node.value)
         assert num_evicted > 0
         self.evictable_size_ -= num_evicted
         node.value = None
@@ -1142,6 +1154,12 @@ class HiRadixCache(RadixCache):
         # update leaf status for the parent because the node is evicted
         self._update_leaf_status(node.parent)
         self._observe_l1_eviction_age(node)
+        return num_evicted
+
+    def _evict_backuped(self, node: TreeNode):
+        device_indices = node.value
+        num_evicted = self._detach_backuped(node)
+        self.cache_controller.evict_device(device_indices)
         return num_evicted
 
     def _evict_regular(self, node: TreeNode):
@@ -1207,7 +1225,7 @@ class HiRadixCache(RadixCache):
 
         num_evicted = 0
         while num_evicted < num_tokens and len(eviction_heap):
-            _priority, x = heapq.heappop(eviction_heap)
+            _, x = heapq.heappop(eviction_heap)
             if x == self.root_node:
                 break
             # only evict the host value of evicted nodes
