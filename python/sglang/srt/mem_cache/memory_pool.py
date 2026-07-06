@@ -2790,22 +2790,8 @@ class HybridLinearKVPool(KVCache):
         layer_id = self._transfer_full_attention_id(layer.layer_id)
         if not self.use_mla:
             write_loc = full_loc if full_loc is not None else loc
-            if self.full_kv_pool.is_quantized_kv_cache:
-                if dcp_kv_mask is not None:
-                    raise RuntimeError("dcp_kv_mask is not supported for FP4 KV cache.")
-                self.full_kv_pool._set_quantized_kv_buffer(
-                    layer_id,
-                    layer.layer_id,
-                    write_loc,
-                    cache_k,
-                    cache_v,
-                    k_scale,
-                    v_scale,
-                )
-                return
-
             self.full_kv_pool.set_kv_buffer(
-                None,
+                layer,
                 write_loc,
                 cache_k,
                 cache_v,
