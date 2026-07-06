@@ -518,20 +518,6 @@
             "expected_avg_denoise_ms": 35.7,
             "expected_median_denoise_ms": 35.34
          },
-        "cosmos3_nano_t2i_1npu": {
-            "stages_ms": {
-                "Cosmos3ImagePreprocessStage": 0.01,
-                "Cosmos3TokenizationStage": 1144.71,
-                "Cosmos3LatentPreparationStage": 0.49,
-                "Cosmos3TimestepPreparationStage": 0.83,
-                "Cosmos3DenoisingStage": 3233.0,
-                "Cosmos3DecodingStage": 12.94
-            },
-            "denoise_step_ms": {},
-            "expected_e2e_ms": 4399.49,
-            "expected_avg_denoise_ms": 0.0,
-            "expected_median_denoise_ms": 0.0
-         },
         "joyai_image_edit_ti2i_1npu": {
             "stages_ms": {
                 "InputValidationStage": 20.04,
@@ -652,7 +638,8 @@
            },
            "expected_e2e_ms": 92840.23,
            "expected_avg_denoise_ms": 1818.63,
-           "expected_median_denoise_ms": 1817.77
+           "expected_median_denoise_ms": 1817.77,
+           "estimated_full_test_time_s": 175.6
         },
        "ltx_2_ti2va_2npu": {
             "stages_ms": {
