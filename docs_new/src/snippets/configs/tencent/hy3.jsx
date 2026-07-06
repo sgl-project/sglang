@@ -25,7 +25,6 @@ export const config = {
   strategies: [
     { id: "low-latency",     label: "Low-Latency"     },
     { id: "balanced",        label: "Balanced"        },
-    { id: "high-throughput", label: "High-Throughput" },
   ],
   nodesOptions: [
     { id: "single",  label: "Single Node" },
@@ -271,21 +270,6 @@ sgl-eval run aime26 \\
         "--port {{PORT}}",
       ],
     },
-    {
-      match: { hw: "h200", variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "single" },
-      env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024"],
-      flags: [
-        "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser auto",
-        "--tool-call-parser auto",
-        "--tp 8",
-        "--dp 8",
-        "--enable-dp-attention",
-        "--moe-a2a-backend deepep",
-        "--host {{HOST_IP}}",
-        "--port {{PORT}}",
-      ],
-    },
 
     // ====================================================================
     // B200 (180GB) — TP=8 for BF16
@@ -315,22 +299,6 @@ sgl-eval run aime26 \\
         "--reasoning-parser auto",
         "--tool-call-parser auto",
         "--tp 8",
-        "--attention-backend trtllm_mha",
-        "--host {{HOST_IP}}",
-        "--port {{PORT}}",
-      ],
-    },
-    {
-      match: { hw: "b200", variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "single" },
-      env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024"],
-      flags: [
-        "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser auto",
-        "--tool-call-parser auto",
-        "--tp 8",
-        "--dp 8",
-        "--enable-dp-attention",
-        "--moe-a2a-backend deepep",
         "--attention-backend trtllm_mha",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -370,22 +338,6 @@ sgl-eval run aime26 \\
         "--port {{PORT}}",
       ],
     },
-    {
-      match: { hw: "b300", variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "single" },
-      env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024"],
-      flags: [
-        "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser auto",
-        "--tool-call-parser auto",
-        "--tp 4",
-        "--dp 4",
-        "--enable-dp-attention",
-        "--moe-a2a-backend deepep",
-        "--attention-backend trtllm_mha",
-        "--host {{HOST_IP}}",
-        "--port {{PORT}}",
-      ],
-    },
 
     // ====================================================================
     // GB300 — TP=4 (inferred from B300, same sm_103 + aarch64)
@@ -420,22 +372,6 @@ sgl-eval run aime26 \\
         "--port {{PORT}}",
       ],
     },
-    {
-      match: { hw: "gb300", variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "single" },
-      env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024"],
-      flags: [
-        "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser auto",
-        "--tool-call-parser auto",
-        "--tp 4",
-        "--dp 4",
-        "--enable-dp-attention",
-        "--moe-a2a-backend deepep",
-        "--attention-backend trtllm_mha",
-        "--host {{HOST_IP}}",
-        "--port {{PORT}}",
-      ],
-    },
 
     // ====================================================================
     // GB200 (sm_100 + aarch64) — TP=4 (single-node 4×192GB = 768GB fits BF16 552GB)
@@ -465,22 +401,6 @@ sgl-eval run aime26 \\
         "--reasoning-parser auto",
         "--tool-call-parser auto",
         "--tp 4",
-        "--attention-backend trtllm_mha",
-        "--host {{HOST_IP}}",
-        "--port {{PORT}}",
-      ],
-    },
-    {
-      match: { hw: "gb200", variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "single" },
-      env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024"],
-      flags: [
-        "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser auto",
-        "--tool-call-parser auto",
-        "--tp 4",
-        "--dp 4",
-        "--enable-dp-attention",
-        "--moe-a2a-backend deepep",
         "--attention-backend trtllm_mha",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -521,22 +441,6 @@ sgl-eval run aime26 \\
       ],
     },
     {
-      match: { hw: "h200", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
-      env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024"],
-      flags: [
-        "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser auto",
-        "--tool-call-parser auto",
-        "--tp 4",
-        "--dp 4",
-        "--enable-dp-attention",
-        "--moe-a2a-backend deepep",
-        "--kv-cache-dtype fp8_e4m3",
-        "--host {{HOST_IP}}",
-        "--port {{PORT}}",
-      ],
-    },
-    {
       match: { hw: "b200", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
       env: [],
       flags: [
@@ -562,23 +466,6 @@ sgl-eval run aime26 \\
         "--reasoning-parser auto",
         "--tool-call-parser auto",
         "--tp 4",
-        "--attention-backend trtllm_mha",
-        "--kv-cache-dtype fp8_e4m3",
-        "--host {{HOST_IP}}",
-        "--port {{PORT}}",
-      ],
-    },
-    {
-      match: { hw: "b200", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
-      env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024"],
-      flags: [
-        "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser auto",
-        "--tool-call-parser auto",
-        "--tp 4",
-        "--dp 4",
-        "--enable-dp-attention",
-        "--moe-a2a-backend deepep",
         "--attention-backend trtllm_mha",
         "--kv-cache-dtype fp8_e4m3",
         "--host {{HOST_IP}}",
@@ -618,23 +505,6 @@ sgl-eval run aime26 \\
       ],
     },
     {
-      match: { hw: "b300", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
-      env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024"],
-      flags: [
-        "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser auto",
-        "--tool-call-parser auto",
-        "--tp 2",
-        "--dp 2",
-        "--enable-dp-attention",
-        "--moe-a2a-backend deepep",
-        "--attention-backend trtllm_mha",
-        "--kv-cache-dtype fp8_e4m3",
-        "--host {{HOST_IP}}",
-        "--port {{PORT}}",
-      ],
-    },
-    {
       match: { hw: "gb300", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
       env: [],
       flags: [
@@ -667,23 +537,6 @@ sgl-eval run aime26 \\
       ],
     },
     {
-      match: { hw: "gb300", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
-      env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024"],
-      flags: [
-        "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser auto",
-        "--tool-call-parser auto",
-        "--tp 2",
-        "--dp 2",
-        "--enable-dp-attention",
-        "--moe-a2a-backend deepep",
-        "--attention-backend trtllm_mha",
-        "--kv-cache-dtype fp8_e4m3",
-        "--host {{HOST_IP}}",
-        "--port {{PORT}}",
-      ],
-    },
-    {
       match: { hw: "gb200", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
       env: [],
       flags: [
@@ -709,23 +562,6 @@ sgl-eval run aime26 \\
         "--reasoning-parser auto",
         "--tool-call-parser auto",
         "--tp 2",
-        "--attention-backend trtllm_mha",
-        "--kv-cache-dtype fp8_e4m3",
-        "--host {{HOST_IP}}",
-        "--port {{PORT}}",
-      ],
-    },
-    {
-      match: { hw: "gb200", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
-      env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024"],
-      flags: [
-        "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser auto",
-        "--tool-call-parser auto",
-        "--tp 2",
-        "--dp 2",
-        "--enable-dp-attention",
-        "--moe-a2a-backend deepep",
         "--attention-backend trtllm_mha",
         "--kv-cache-dtype fp8_e4m3",
         "--host {{HOST_IP}}",

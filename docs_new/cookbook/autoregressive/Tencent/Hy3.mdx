@@ -55,7 +55,6 @@ Pick your hardware + recipe to generate the launch command.
 
 - **Low-Latency** — fastest reply for a single user. Pick for chat.
 - **Balanced** — good speed with several users at once. Use for typical multi-user serving.
-- **High-Throughput** — most tokens per second across many users. Best for batch jobs.
 
 import { Deployment } from "/src/snippets/_deployment.jsx";
 import { config }     from "/src/snippets/configs/tencent/hy3.jsx";
@@ -187,7 +186,6 @@ import { Playground } from "/src/snippets/_playground.jsx";
 
 - `low-latency`: steps=3, draft-tokens=4 → largest win at bs=1.
 - `balanced`: MTP disabled — keep the prefill batch moderate so chunked-prefill stays efficient.
-- `high-throughput`: MTP disabled — at saturation the verify step costs more than it saves. Use `--moe-a2a-backend deepep` + DP-Attention to scale.
 
 **`reasoning_effort` vs `thinking`.** The Hunyuan chat template is driven by `reasoning_effort` (`high` / `low` / `no_think`), NOT by the `thinking` flag that some other families use. The default is `no_think` (instant). To opt into thinking, pass `reasoning_effort="high"` on the request (the OpenAI-standard field; sglang forwards it to the template). `reasoning_effort: max` is rejected by sglang — use `high`.
 
