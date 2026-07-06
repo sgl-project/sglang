@@ -423,12 +423,20 @@ fn take_i32(data: &[u8], off: &mut usize, n: usize) -> Vec<i32> {
 /// Frame a whole decode batch: `[EGRESS_TAG_BATCH][u32 header_len][header][data]`.
 /// `header` is the msgpack [`BatchHeader`] (columnar scalars + lens); `data` is
 /// the concatenated raw little-endian numeric buffer.
-pub fn frame_egress_batch(header: &[u8], data: &[u8]) -> Bytes {
-    let mut buf = Vec::with_capacity(1 + 4 + header.len() + data.len());
+/// Frame a decode batch: `[BATCH tag][u32 header len][header][data...]`, where
+/// `data` is the data *columns* (the caller's `data_cols`) concatenated directly
+/// into the frame — one copy, instead of the caller first `b"".join`-ing them
+/// into a single `bytes`. Run off the GIL (the big memcpy of the whole decode
+/// batch doesn't need it).
+pub fn frame_egress_batch_cols(header: &[u8], data_cols: &[&[u8]]) -> Bytes {
+    let data_len: usize = data_cols.iter().map(|c| c.len()).sum();
+    let mut buf = Vec::with_capacity(1 + 4 + header.len() + data_len);
     buf.push(EGRESS_TAG_BATCH);
     buf.extend_from_slice(&(header.len() as u32).to_le_bytes());
     buf.extend_from_slice(header);
-    buf.extend_from_slice(data);
+    for col in data_cols {
+        buf.extend_from_slice(col);
+    }
     Bytes::from(buf)
 }
 
@@ -750,6 +758,27 @@ pub struct ChunkEvent {
 mod chunk_event_tests {
     use super::*;
 
+    /// Concatenating N data columns produces the exact same frame as one joined
+    /// buffer (the `b"".join` the Python side used to do), with the layout
+    /// `[tag][u32 header len][header][col0 col1 …]`.
+    #[test]
+    fn batch_cols_match_single_joined_buffer() {
+        let header = [1u8, 2, 3];
+        let a = [10u8, 11];
+        let b = [12u8, 13, 14];
+        let multi = frame_egress_batch_cols(&header, &[&a[..], &b[..]]);
+        let joined: Vec<u8> = a.iter().chain(&b).copied().collect();
+        let single = frame_egress_batch_cols(&header, &[joined.as_slice()]);
+        assert_eq!(multi, single);
+        assert_eq!(multi[0], EGRESS_TAG_BATCH);
+        assert_eq!(
+            u32::from_le_bytes([multi[1], multi[2], multi[3], multi[4]]),
+            3
+        );
+        assert_eq!(&multi[5..8], &header); // header
+        assert_eq!(&multi[8..], &[10, 11, 12, 13, 14]); // columns end-to-end
+    }
+
     /// A batch frame (the fast path) decodes into per-request ChunkEvents, with
     /// token ids sliced from the single concatenated buffer by `tok_lens`. The
     /// header is a msgspec-style positional array (what Python emits).
@@ -783,7 +812,7 @@ mod chunk_event_tests {
             .flat_map(|x| x.to_le_bytes())
             .collect();
 
-        let framed = frame_egress_batch(&header, &data);
+        let framed = frame_egress_batch_cols(&header, &[&data]);
         assert_eq!(framed[0], EGRESS_TAG_BATCH);
         let events = decode_batch_frame(&framed[1..]).unwrap();
         assert_eq!(events.len(), 3);
@@ -843,7 +872,7 @@ mod chunk_event_tests {
         data.extend(i(&[10, 11])); // out_top_idx
         data.extend(f(&[0.1, 0.2, 0.3])); // hidden_val (1 row, dim 3)
 
-        let framed = frame_egress_batch(&header, &data);
+        let framed = frame_egress_batch_cols(&header, &[&data]);
         let events = decode_batch_frame(&framed[1..]).unwrap();
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].token_ids, vec![10]);
