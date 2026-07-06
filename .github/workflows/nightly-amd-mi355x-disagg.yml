@@ -217,6 +217,16 @@ jobs:
             scancel $ACTIVE_JOBS
           fi
 
+      - name: Clean up MI355X scratch
+        if: always()
+        continue-on-error: true
+        run: |
+          LOG_DIR="$HOME/.mi355x_ci/${MATRIX_CONFIG_NAME}"
+          if [ -d "$LOG_DIR" ]; then
+            echo "Removing MI355X scratch directory: $LOG_DIR"
+            rm -rf "$LOG_DIR"
+          fi
+
   collect-results:
     needs: nightly-mi355x-benchmark
     if: github.repository == 'sgl-project/sglang' && always()
