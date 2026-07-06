@@ -180,6 +180,76 @@ sys.exit(0 if acc > thr else 1)
 PY
 fi
 
+# Diagnostic A/B for MI355X dsv4flash PD failures: run the image code unchanged
+# except for dropping the DSV4 C128 state component from MORI state transfer.
+# This is intentionally launcher-scoped so a workflow_dispatch against this
+# branch actually affects the runtime image without rebuilding Docker.
+DSV4_C128_AB_PYTHONPATH=""
+if [[ "$MODEL_PREFIX" == "dsv4flash" ]]; then
+    DSV4_C128_AB_DIR="$WORKDIR/dsv4_c128_ab"
+    mkdir -p "$DSV4_C128_AB_DIR"
+    cat > "$DSV4_C128_AB_DIR/sitecustomize.py" <<'PY'
+import sys
+
+
+def _install_dsv4_c128_pd_ab():
+    from sglang.srt.disaggregation.base.conn import StateType
+    from sglang.srt.disaggregation import utils as disagg_utils
+
+    original = disagg_utils.setup_state_kv_args
+
+    def setup_state_kv_args_without_c128(*args, **kwargs):
+        original(*args, **kwargs)
+        kv_args = args[0] if args else kwargs.get("kv_args")
+        if kv_args is None:
+            return
+
+        state_types = list(getattr(kv_args, "state_types", []) or [])
+        keep = [
+            i
+            for i, st in enumerate(state_types)
+            if st != StateType.C128_STATE and st != "c128_state"
+        ]
+        if len(keep) == len(state_types):
+            return
+
+        kv_args.state_types = [state_types[i] for i in keep]
+        for attr in (
+            "state_data_ptrs",
+            "state_data_lens",
+            "state_item_lens",
+            "state_dim_per_tensor",
+        ):
+            values = list(getattr(kv_args, attr, []) or [])
+            if len(values) == len(state_types):
+                setattr(kv_args, attr, [values[i] for i in keep])
+            else:
+                print(
+                    f"[dsv4-c128-ab] skip {attr}: len={len(values)} "
+                    f"state_types={len(state_types)}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+
+        print(
+            "[dsv4-c128-ab] removed StateType.C128_STATE from PD state transfer",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    disagg_utils.setup_state_kv_args = setup_state_kv_args_without_c128
+    print(
+        "[dsv4-c128-ab] installed setup_state_kv_args runtime patch",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+_install_dsv4_c128_pd_ab()
+PY
+    DSV4_C128_AB_PYTHONPATH="/host_home/.mi355x_ci/${MATRIX_CONFIG_NAME}/dsv4_c128_ab:/sgl-workspace/sglang/python"
+fi
+
 # DSV4 load-bearing env (see test/registered/amd/test_deepseek_v4_flash_fp8.py).
 # SGLANG_DSV4_FP4_EXPERTS is precision-driven: true for fp4 weights, false for fp8.
 if [[ "$PRECISION" == "fp4" ]]; then
@@ -200,6 +270,9 @@ DSV4_ENV=(
   -e SGLANG_OPT_USE_MULTI_STREAM_OVERLAP=false -e SGLANG_ROCM_USE_MULTI_STREAM=false
   -e AITER_BF16_FP8_MOE_BOUND=0 -e SGLANG_DSV4_FP4_EXPERTS=$FP4_EXPERTS
 )
+if [[ -n "$DSV4_C128_AB_PYTHONPATH" ]]; then
+    DSV4_ENV+=(-e PYTHONPATH=$DSV4_C128_AB_PYTHONPATH)
+fi
 DSV4_ENV_STR="${DSV4_ENV[*]}"
 # A recipe carrying a `model:` block supplies its OWN docker env (below), so the
 # DSV4 env must not leak into it; the DSV4 recipes keep the string above.
