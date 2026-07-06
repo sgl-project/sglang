@@ -503,6 +503,24 @@ class TestBuildTreeKernelEfficient(CustomTestCase):
                 [int(seq_lens[bid]) + i for i in range(draft_token_num)],
             )
 
+    def test_build_tree_chain_mtp_step1(self):
+        # MTP steps=1: topk=1, draft_token_num=2, depth=1. parent_list is the
+        # empty (bs, 0) tensor organize_draft_results emits when there are no
+        # non-root parents; the kernel must accept it (regression guard).
+        num_steps, draft_token_num = 1, 2
+        bs = 2
+        seq_lens = torch.tensor([7, 12], dtype=torch.int64)
+        parent_list, selected_index = _topk1_chain_inputs(bs, num_steps)
+        self.assertEqual(parent_list.shape, (bs, 0))
+        tree_mask_ref, positions_ref = self._check_against_reference(
+            parent_list, selected_index, seq_lens, 1, num_steps, draft_token_num
+        )
+        tril = torch.tril(
+            torch.ones(draft_token_num, draft_token_num, dtype=torch.bool)
+        )
+        for bid in range(bs):
+            torch.testing.assert_close(tree_mask_ref[bid], tril, atol=0, rtol=0)
+
     def test_build_tree_topk2_hand_case(self):
         # topk=2, steps=2, draft_token_num=4. Nodes: 1 and 2 are children of the
         # root; node 3 is a child of node 1.

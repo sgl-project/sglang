@@ -316,6 +316,7 @@ void verify_tree_greedy_cpu(
 // next sibling) used by verify_tree_greedy.
 //
 // parent_list:         [bs, topk * (depth - 1) + 1] int32 or int64
+//                      (empty [bs, 0] when depth == 1, e.g. MTP steps=1)
 // selected_index:      [bs, draft_token_num - 1] int32 or int64
 // verified_seq_len:    [bs] int32 or int64; committed prefix length per request
 // tree_mask:           out, bool.
@@ -369,7 +370,12 @@ void build_tree_kernel_efficient_cpu(
   int64_t bs = parent_list.size(0);
   CHECK_DIM(2, parent_list);
   CHECK_DIM(2, selected_index);
-  CHECK_EQ(parent_list.size(1), topk * (depth - 1) + 1);
+  // depth == 1 (e.g. MTP steps=1) has no non-root parents, so
+  // organize_draft_results emits an empty (bs, 0) parent_list that the kernel
+  // never indexes; only the multi-step layout is width topk*(depth-1)+1.
+  if (depth > 1) {
+    CHECK_EQ(parent_list.size(1), topk * (depth - 1) + 1);
+  }
   CHECK_EQ(selected_index.size(0), bs);
   CHECK_EQ(selected_index.size(1), draft_token_num - 1);
   CHECK_EQ(verified_seq_len.numel(), bs);
