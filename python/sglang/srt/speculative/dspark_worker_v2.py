@@ -996,6 +996,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         block_ids: torch.Tensor,
         positions: torch.Tensor,
         verify_out_cache_loc: torch.Tensor,
+        seq_lens_for_metadata: torch.Tensor,
         dp_decode_global_num_tokens: Optional[list[int]] = None,
     ) -> tuple[torch.Tensor, object]:
         draft_block_spec_info = DSparkDraftBlockInput(
@@ -1005,12 +1006,23 @@ class DSparkWorkerV2(BaseSpecWorker):
             custom_mask=None,
             capture_hidden_mode=CaptureHiddenMode.NULL,
         )
-        draft_forward_batch = draft_block_spec_info.prepare_for_draft_block(
-            batch=batch,
-            draft_model_runner=self.draft_model_runner,
-            out_cache_loc=verify_out_cache_loc,
-            dp_decode_global_num_tokens=dp_decode_global_num_tokens,
-        )
+        old_seq_lens = batch.seq_lens
+        old_seq_lens_cpu = batch.seq_lens_cpu
+        old_seq_lens_sum = batch.seq_lens_sum
+        try:
+            batch.seq_lens = seq_lens_for_metadata.to(dtype=old_seq_lens.dtype)
+            batch.seq_lens_cpu = batch.seq_lens.detach().cpu()
+            batch.seq_lens_sum = int(batch.seq_lens_cpu.sum().item())
+            draft_forward_batch = draft_block_spec_info.prepare_for_draft_block(
+                batch=batch,
+                draft_model_runner=self.draft_model_runner,
+                out_cache_loc=verify_out_cache_loc,
+                dp_decode_global_num_tokens=dp_decode_global_num_tokens,
+            )
+        finally:
+            batch.seq_lens = old_seq_lens
+            batch.seq_lens_cpu = old_seq_lens_cpu
+            batch.seq_lens_sum = old_seq_lens_sum
 
         from sglang.srt.layers.attention import deepseek_v4_backend as _dsv4_be
 
@@ -2851,6 +2863,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         block_size = int(self.block_size)
         verify_stride = int(self.verify_stride)
         prefix_lens = model_worker_batch.seq_lens
+        anchor_lens = (prefix_lens.to(torch.int64) - 1).clamp_min(0)
         req_pool_indices = model_worker_batch.req_pool_indices
 
         block_ids = torch.full(
@@ -2859,16 +2872,16 @@ class DSparkWorkerV2(BaseSpecWorker):
         if draft_input.bonus_tokens.numel() == bs:
             block_ids[:, 0].copy_(draft_input.bonus_tokens.view(-1))
 
-        positions_2d = prefix_lens.unsqueeze(1) + self._block_pos_offsets
+        positions_2d = anchor_lens.unsqueeze(1) + self._block_pos_offsets
         positions = positions_2d.reshape(-1).to(torch.int64)
-        verify_positions_2d = prefix_lens.unsqueeze(1) + self._verify_pos_offsets
+        verify_positions_2d = anchor_lens.unsqueeze(1) + self._verify_pos_offsets
         verify_positions = verify_positions_2d.reshape(-1).to(torch.int64)
 
-        end_offset = prefix_lens + verify_stride
+        end_offset = anchor_lens + verify_stride
         verify_out_cache_loc = assign_extend_cache_locs_func(
             req_pool_indices=req_pool_indices,
             req_to_token=self.model_runner.req_to_token_pool.req_to_token,
-            start_offset=prefix_lens,
+            start_offset=anchor_lens,
             end_offset=end_offset,
             batch_size=bs,
             draft_token_num=verify_stride,
@@ -2899,6 +2912,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 block_ids=block_ids,
                 positions=positions,
                 verify_out_cache_loc=draft_out_cache_loc,
+                seq_lens_for_metadata=anchor_lens,
                 dp_decode_global_num_tokens=dp_decode_global_num_tokens,
             )
 
@@ -2922,6 +2936,9 @@ class DSparkWorkerV2(BaseSpecWorker):
         original_global_num_tokens_for_logprob = (
             model_worker_batch.global_num_tokens_for_logprob
         )
+        original_seq_lens = model_worker_batch.seq_lens
+        original_seq_lens_cpu = model_worker_batch.seq_lens_cpu
+        original_seq_lens_sum = model_worker_batch.seq_lens_sum
         if dp_decode_global_num_tokens is not None:
             model_worker_batch.global_num_tokens = dp_decode_global_num_tokens
             if original_global_num_tokens_for_logprob is not None:
@@ -2929,6 +2946,11 @@ class DSparkWorkerV2(BaseSpecWorker):
                     dp_decode_global_num_tokens
                 )
         try:
+            model_worker_batch.seq_lens = anchor_lens.to(dtype=original_seq_lens.dtype)
+            model_worker_batch.seq_lens_cpu = model_worker_batch.seq_lens.detach().cpu()
+            model_worker_batch.seq_lens_sum = int(
+                model_worker_batch.seq_lens_cpu.sum().item()
+            )
             verify_forward_batch, _ = verify_input.prepare_for_verify(
                 model_worker_batch, self.target_worker
             )
@@ -2937,6 +2959,9 @@ class DSparkWorkerV2(BaseSpecWorker):
             model_worker_batch.global_num_tokens_for_logprob = (
                 original_global_num_tokens_for_logprob
             )
+            model_worker_batch.seq_lens = original_seq_lens
+            model_worker_batch.seq_lens_cpu = original_seq_lens_cpu
+            model_worker_batch.seq_lens_sum = original_seq_lens_sum
         target_out = self.target_worker.forward_batch_generation(
             batch=None,
             forward_batch=verify_forward_batch,
