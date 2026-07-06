@@ -17,7 +17,7 @@ register_xpu_ci(
     est_time=360,
     stage="stage-b",
     runner_config="1-gpu-xpu",
-    disabled="EAGLE3 numerical parity mismatchs on XPU",
+    disabled="EAGLE3 numerical parity mismatches on XPU",
 )
 
 _is_xpu = is_xpu()
