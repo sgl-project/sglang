@@ -37,7 +37,6 @@ from sglang.srt.distributed.parallel_state import (
 from sglang.srt.layers.dcp.kernels import (
     CPTritonContext,
     _lse_pack_dim,
-    _lse_weighted_combine_cpu,
     correct_attn_out,
     dcp_lse_combine_triton,
 )
@@ -404,6 +403,9 @@ def init_fi_a2a_workspace(cp_group: "GroupCoordinator") -> None:
             "flashinfer.comm.dcp_alltoall."
         ) from e
 
+    # Reuse the MoE adapter: its Split() returns a CommBackend (what FlashInfer's
+    # Mapping expects); the flashinfer_comm_fusion copy has drifted to return a
+    # raw ProcessGroup, so don't swap without re-checking the Split() contract.
     from sglang.srt.layers.moe.token_dispatcher.flashinfer_utils import (
         TorchDistributedCommBackend,
     )
@@ -438,10 +440,10 @@ def init_fi_a2a_workspace(cp_group: "GroupCoordinator") -> None:
     # dcp_alltoall docstring): every rank must finish init first, else a rank
     # may write a peer's FIFO before that peer is ready -> deadlock.
     dist.barrier(group=cp_group.device_group)
+    # cp_size not stored: dcp_a2a_lse_reduce recomputes N from cp_group at call time.
     _FI_A2A_STATE = {
         "workspace": workspace,
         "cp_rank": cp_rank,
-        "cp_size": cp_size,
     }
 
 

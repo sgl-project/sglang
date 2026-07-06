@@ -2,7 +2,7 @@
 # Benchmark DCP (Decode Context Parallelism) serving performance.
 #
 # Runs accuracy (GSM8K) + throughput (bench_serving) across multiple DCP
-# configurations: TP8 baseline, DCP8 AG+RS, DCP8 A2A, with FlashInfer and FA3.
+# configurations: TP8 baseline, DCP8 AG+RS, DCP8 A2A (FlashInfer-MLA backend).
 #
 # Usage:
 #   bash benchmark/dcp/bench_dcp_serving.sh
@@ -28,7 +28,7 @@ HASH=$(git rev-parse --short=7 HEAD)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BASE_OUTPUT="${SCRIPT_DIR}/results/${BRANCH}_${HASH}"
 
-COMMON_ENV="SGLANG_DCP_SYMM_ONLY=true NCCL_DEBUG=WARN PYTHONUNBUFFERED=1 \
+COMMON_ENV="NCCL_DEBUG=WARN PYTHONUNBUFFERED=1 \
 TORCHINDUCTOR_FX_GRAPH_CACHE=1 TORCHINDUCTOR_AUTOGRAD_CACHE=1 \
 SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK=1"
 
@@ -40,13 +40,11 @@ COMMON_ARGS="--model-path $MODEL --host 0.0.0.0 --port $PORT \
 CONCURRENCIES=(1 2 4 8 16 32 64 128 256 512)
 
 # Config format: NAME|BACKEND|MEM_FRAC|DCP_SIZE|DCP_COMM
+# DCP supports FlashInfer-MLA / FlashMLA only (base-2 LSE); FA3 is out of scope.
 CONFIGS=(
     "tp8_flashinfer|flashinfer|0.85|0|"
-    "tp8_fa3|fa3|0.85|0|"
     "tp8_dcp8_agrs_flashinfer|flashinfer|0.85|8|ag_rs"
-    "tp8_dcp8_agrs_fa3|fa3|0.83|8|ag_rs"
     "tp8_dcp8_a2a_flashinfer|flashinfer|0.85|8|a2a"
-    "tp8_dcp8_a2a_fa3|fa3|0.83|8|a2a"
 )
 
 wait_for_server() {

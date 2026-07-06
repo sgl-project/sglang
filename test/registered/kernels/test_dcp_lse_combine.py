@@ -31,10 +31,8 @@ class TestLSECombineTritonVsCPU(CustomTestCase):
     def _run_combine_test(
         self, N, B, H_local, D, is_base_e, dtype=torch.bfloat16, atol=1e-2
     ):
-        from sglang.srt.layers.dcp import (
-            _lse_weighted_combine_cpu,
-            dcp_lse_combine_triton,
-        )
+        from sglang.srt.layers.dcp import dcp_lse_combine_triton
+        from sglang.srt.layers.dcp.kernels import _lse_weighted_combine_cpu
 
         torch.manual_seed(42)
 
@@ -166,10 +164,8 @@ class TestLSECombineEdgeCases(CustomTestCase):
 
     def test_one_shard_dominant(self):
         """One shard has much larger LSE -- output should be close to that shard."""
-        from sglang.srt.layers.dcp import (
-            _lse_weighted_combine_cpu,
-            dcp_lse_combine_triton,
-        )
+        from sglang.srt.layers.dcp import dcp_lse_combine_triton
+        from sglang.srt.layers.dcp.kernels import _lse_weighted_combine_cpu
 
         N, B, H_local, D = 2, 1, 1, 64
         partial_outputs = torch.randn(
@@ -222,7 +218,7 @@ class TestCPUReference(CustomTestCase):
     """Test the CPU reference implementation independently."""
 
     def test_basic_combine(self):
-        from sglang.srt.layers.dcp import _lse_weighted_combine_cpu
+        from sglang.srt.layers.dcp.kernels import _lse_weighted_combine_cpu
 
         N, B, H, D = 2, 2, 4, 8
         outputs = torch.randn(N, B, H, D)
@@ -233,7 +229,7 @@ class TestCPUReference(CustomTestCase):
         self.assertFalse(torch.isnan(result).any())
 
     def test_base2_vs_base_e(self):
-        from sglang.srt.layers.dcp import _lse_weighted_combine_cpu
+        from sglang.srt.layers.dcp.kernels import _lse_weighted_combine_cpu
 
         N, B, H, D = 2, 2, 4, 8
         outputs = torch.randn(N, B, H, D)
@@ -245,7 +241,7 @@ class TestCPUReference(CustomTestCase):
         self.assertFalse(torch.allclose(result_e, result_2, atol=1e-3))
 
     def test_nan_lse_handled(self):
-        from sglang.srt.layers.dcp import _lse_weighted_combine_cpu
+        from sglang.srt.layers.dcp.kernels import _lse_weighted_combine_cpu
 
         N, B, H, D = 2, 1, 1, 8
         outputs = torch.randn(N, B, H, D)
@@ -255,7 +251,7 @@ class TestCPUReference(CustomTestCase):
         self.assertFalse(torch.isnan(result).any())
 
     def test_inf_lse_handled(self):
-        from sglang.srt.layers.dcp import _lse_weighted_combine_cpu
+        from sglang.srt.layers.dcp.kernels import _lse_weighted_combine_cpu
 
         N, B, H, D = 2, 1, 1, 8
         outputs = torch.randn(N, B, H, D)

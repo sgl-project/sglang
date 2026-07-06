@@ -40,7 +40,6 @@ from sglang.srt.layers.dcp.comm import (
     get_attention_dcp_world_size,
 )
 from sglang.srt.layers.dcp.kernels import (
-    _lse_weighted_combine_cpu,
     create_triton_kv_indices_for_dcp_triton,
     dcp_lse_combine_triton,
 )

@@ -11,6 +11,7 @@ Usage:
 """
 
 import argparse
+import os
 from typing import Dict, List
 
 import torch
@@ -156,10 +157,15 @@ def main():
 
     rank = dist.get_rank()
     world_size = dist.get_world_size()
-    torch.cuda.set_device(rank % 8)
+    # Node-local rank for GPU binding (LOCAL_RANK if set, else rank % visible GPUs);
+    # `rank % 8` was wrong on non-8-GPU / multi-node runs.
+    local_rank = int(os.environ.get("LOCAL_RANK", rank % torch.cuda.device_count()))
+    torch.cuda.set_device(local_rank)
     device = torch.cuda.current_device()
 
-    init_distributed_environment(world_size=world_size, rank=rank, local_rank=rank % 8)
+    init_distributed_environment(
+        world_size=world_size, rank=rank, local_rank=local_rank
+    )
     initialize_model_parallel(tensor_model_parallel_size=world_size)
 
     tp_group = get_tensor_model_parallel_group()

@@ -351,6 +351,15 @@ class PyNcclCommunicator:
             f"but the output tensor is on {output_tensor.device}"
         )
         stream = self._resolve_stream()
+        # Equal-split all-to-all: fail loudly instead of silently truncating the tail.
+        assert input_tensor.numel() == output_tensor.numel(), (
+            f"all_to_all_single: input numel ({input_tensor.numel()}) != output "
+            f"numel ({output_tensor.numel()})"
+        )
+        assert input_tensor.numel() % self.world_size == 0, (
+            f"all_to_all_single: input numel ({input_tensor.numel()}) not "
+            f"divisible by world_size ({self.world_size})"
+        )
         chunk_size = input_tensor.numel() // self.world_size
         dtype = ncclDataTypeEnum.from_torch(input_tensor.dtype)
         self.nccl.ncclGroupStart()
