@@ -138,7 +138,15 @@ def _all_gather_dcp_kv_cache(kv_a: torch.Tensor):
     gathered_kv_a = kv_a.new_empty(
         (kv_a.shape[0] * dcp_world_size, *kv_a.shape[1:]),
     )
-    get_dcp_group().all_gather_into_tensor(gathered_kv_a, kv_a)
+    # pynccl's ncclDataTypeEnum has no fp8 entry, but all-gather is a pure byte
+    # copy — transport an fp8 KV cache (fp8_e4m3 / fp8_e5m2) as raw bytes via a
+    # uint8 view (shared storage) so DCP works with --kv-cache-dtype fp8_*.
+    if kv_a.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+        get_dcp_group().all_gather_into_tensor(
+            gathered_kv_a.view(torch.uint8), kv_a.contiguous().view(torch.uint8)
+        )
+    else:
+        get_dcp_group().all_gather_into_tensor(gathered_kv_a, kv_a)
     gathered_kv_a = (
         gathered_kv_a.reshape((dcp_world_size,) + kv_a.shape)
         .transpose(0, 1)
