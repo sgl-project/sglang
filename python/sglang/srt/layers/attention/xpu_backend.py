@@ -1075,12 +1075,33 @@ class XPUAttentionBackend(AttentionBackend):
         forward_mode = forward_batch.forward_mode
         spec_info = forward_batch.spec_info
 
-        assert (
-            spec_info is None
-        ), "XPUAttentionBackend does not support speculative decoding in XPU graph"
-        assert (
-            forward_mode.is_decode_or_idle()
-        ), "XPUAttentionBackend XPU graph only supports decode mode"
+        # Spec-decode graph support is limited to topk <= 1 (chain drafts). The
+        # topk > 1 tree path needs the expand/custom-mask metadata that the graph
+        # buffers here don't carry, so reject it explicitly.
+        is_verify = forward_mode.is_target_verify()
+        is_draft_decode = forward_mode.is_decode_or_idle() and spec_info is not None
+        assert forward_mode.is_decode_or_idle() or is_verify, (
+            "XPUAttentionBackend XPU graph only supports decode / target-verify modes"
+        )
+        assert not (
+            (is_verify or is_draft_decode) and self.topk > 1
+        ), "XPUAttentionBackend XPU graph spec decoding supports topk <= 1 only"
+
+        # Per-sequence query rows and the extra KV length beyond seq_lens:
+        #  * target-verify packs `speculative_num_draft_tokens` query rows per req
+        #    and attends over those draft positions (KV offset = num_draft_tokens);
+        #  * draft-decode emits one query row and attends one step further
+        #    (KV offset = speculative_step_id + 1);
+        #  * plain decode is the identity (1 row, no offset).
+        if is_verify:
+            q_len_per_req = self.speculative_num_draft_tokens
+            kv_len_offset = self.speculative_num_draft_tokens
+        elif is_draft_decode:
+            q_len_per_req = 1
+            kv_len_offset = self.speculative_step_id + 1
+        else:
+            q_len_per_req = 1
+            kv_len_offset = 0
 
         if in_capture:
             # Bind static-shape slices of the pre-allocated buffers so the
@@ -1125,14 +1146,32 @@ class XPUAttentionBackend(AttentionBackend):
             if seq_lens_cpu is not None
             else seq_lens.max().item()
         )
-        metadata.max_seq_len_k = max_len
+        # For spec modes the effective KV length includes the extra draft tokens
+        # (verify) or the current draft step (draft-decode); plain decode adds 0.
+        metadata.max_seq_len_k = max_len + kv_len_offset
 
-        metadata.cache_seqlens_int32.copy_(seq_lens.to(torch.int32))
+        kv_seqlens = (seq_lens + kv_len_offset).to(torch.int32)
+        metadata.cache_seqlens_int32.copy_(kv_seqlens)
 
         metadata.cu_seqlens_k[0] = 0
-        metadata.cu_seqlens_k[1 : bs + 1].copy_(
-            torch.cumsum(seq_lens.to(torch.int32), dim=0)
-        )
+        metadata.cu_seqlens_k[1 : bs + 1].copy_(torch.cumsum(kv_seqlens, dim=0))
+
+        # target-verify packs multiple query rows per request; rebuild cu_seqlens_q
+        # as a strided ramp (0, q, 2q, ...). Plain/draft decode keep the identity
+        # ramp already stored in the pre-allocated buffer.
+        if q_len_per_req > 1:
+            metadata.max_seq_len_q = q_len_per_req
+            metadata.cu_seqlens_q[: bs + 1].copy_(
+                torch.arange(
+                    0,
+                    (bs + 1) * q_len_per_req,
+                    q_len_per_req,
+                    dtype=torch.int32,
+                    device=metadata.cu_seqlens_q.device,
+                )
+            )
+        else:
+            metadata.max_seq_len_q = 1
 
         if self.is_encoder_decoder and forward_batch.encoder_lens is not None:
             encoder_lens = forward_batch.encoder_lens[:bs].to(torch.int32)

@@ -76,14 +76,17 @@ class TestEagle3IntelXPU(
     max_running_requests = 24
     gsm8k_num_examples = 1000
     gsm8k_check_accept_len = False
-    # Two XPU-specific constraints, both handled via extra_args:
+    # Two XPU-specific constraints, both via extra_args:
     #  * --max-total-tokens: the B60 level-zero driver's mem_get_info() always
     #    reports the full 24GB as free (resident weights are invisible to it), so
     #    the KV-pool profiler over-allocates and trips UR_RESULT_ERROR_DEVICE_LOST.
     #    Hard-cap the pool (128KB/token for 8B bf16 => 16384 tokens ~= 2GB, well
     #    inside the ~8GB free after weights) instead of relying on mem-fraction.
-    #  * --disable-decode-cuda-graph: XPUAttentionBackend / XPUGraphRunner reject
-    #    speculative decoding during decode-graph capture, so run decode eagerly.
+    #  * --disable-decode-cuda-graph: XPUAttentionBackend implements spec-decode
+    #    graph capture (target-verify / draft-decode, topk<=1), but the oneAPI
+    #    SYCL Graph extension can't yet record the flash-attn kernel's
+    #    work_group_scratch_memory, so capture fails on the current stack. Run
+    #    decode eagerly until the driver supports it; drop this flag then.
     extra_args = ("--max-total-tokens", "16384", "--disable-decode-cuda-graph")
     env_overrides = ((envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 1),)
 
