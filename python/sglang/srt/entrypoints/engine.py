@@ -58,9 +58,11 @@ from sglang.srt.managers.data_parallel_controller import (
 )
 from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
 from sglang.srt.managers.io_struct import (
+    BeginWeightUpdateReqInput,
     CloseSessionReqInput,
     DestroyWeightsUpdateGroupReqInput,
     EmbeddingReqInput,
+    EndWeightUpdateReqInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
     InitWeightsUpdateGroupReqInput,
@@ -1106,6 +1108,22 @@ class Engine(EngineScoreMixin, EngineBase):
         )
         return self.loop.run_until_complete(
             self.tokenizer_manager.update_weights_from_ipc(obj, None)
+        )
+
+    def begin_weight_update(self):
+        """Open a weight-update session.
+        Must be called before update_weights_from_*; pair with end_weight_update.
+        """
+        obj = BeginWeightUpdateReqInput()
+        return self.loop.run_until_complete(
+            self.tokenizer_manager.begin_weight_update(obj, None)
+        )
+
+    def end_weight_update(self):
+        """Close the weight-update session."""
+        obj = EndWeightUpdateReqInput()
+        return self.loop.run_until_complete(
+            self.tokenizer_manager.end_weight_update(obj, None)
         )
 
     def get_weights_by_name(self, name: str, truncate_size: int = 100):

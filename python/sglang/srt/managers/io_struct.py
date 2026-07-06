@@ -1601,6 +1601,31 @@ class InitWeightsSendGroupForRemoteInstanceReqOutput(BaseReq):
 
 
 @dataclass
+class BeginWeightUpdateReqInput(BaseReq):
+    # Which model runners this update session covers: "target" (main model only),
+    # "draft" (draft worker(s) only), or "all" (default). The selector is fixed for
+    # the whole begin -> update -> end session; end finalizes the same set.
+    selector: Literal["target", "draft", "all"] = "all"
+
+
+@dataclass
+class BeginWeightUpdateReqOutput(BaseReq):
+    success: bool
+    message: str
+
+
+@dataclass
+class EndWeightUpdateReqInput(BaseReq):
+    pass
+
+
+@dataclass
+class EndWeightUpdateReqOutput(BaseReq):
+    success: bool
+    message: str
+
+
+@dataclass
 class SendWeightsToRemoteInstanceReqInput(BaseReq):
     # The master address
     master_address: str
@@ -1708,6 +1733,7 @@ class ResumeMemoryOccupationReqOutput(BaseReq):
 @dataclass
 class CheckWeightsReqInput(BaseReq):
     action: str = "checksum"
+    allow_quant_error: bool = False
 
 
 @dataclass

@@ -108,6 +108,7 @@ from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.managers.io_struct import (
     AbortReq,
     AttachHiCacheStorageReqInput,
+    BeginWeightUpdateReqInput,
     CheckWeightsReqInput,
     CloseSessionReqInput,
     ConfigureLoggingReq,
@@ -115,6 +116,7 @@ from sglang.srt.managers.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
     DumperControlReqInput,
     EmbeddingReqInput,
+    EndWeightUpdateReqInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
@@ -1331,6 +1333,32 @@ async def update_weights_from_ipc(obj: UpdateWeightsFromIPCReqInput, request: Re
         return ORJSONResponse(content)
     else:
         return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
+
+
+@app.post("/begin_weight_update")
+async def begin_weight_update(req: BeginWeightUpdateReqInput, request: Request):
+    """Open a weight-update session on all rollout engines (restore packed weights)."""
+    success, message = await _global_state.tokenizer_manager.begin_weight_update(
+        req, request
+    )
+
+    content = {"success": success, "message": message}
+    return ORJSONResponse(
+        content, status_code=200 if success else HTTPStatus.BAD_REQUEST
+    )
+
+
+@app.post("/end_weight_update")
+async def end_weight_update(req: EndWeightUpdateReqInput, request: Request):
+    """End the weight update session: optionally post_load_weights, then quant finalize."""
+    success, message = await _global_state.tokenizer_manager.end_weight_update(
+        req, request
+    )
+
+    content = {"success": success, "message": message}
+    return ORJSONResponse(
+        content, status_code=200 if success else HTTPStatus.BAD_REQUEST
+    )
 
 
 @app.post("/update_weight_version")
