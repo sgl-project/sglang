@@ -327,5 +327,106 @@ class TestSchedulePolicy(CustomTestCase):
         self.assertEqual(waiting_queue[2].rid, "w3")
 
 
+class TestEpochMemoizedMatch(CustomTestCase):
+    """Correctness of epoch-memoized prefix matching in match_prefix_for_req."""
+
+    def _tree_with_prefix(self):
+        import torch
+
+        from sglang.srt.mem_cache.base_prefix_cache import InsertParams
+        from sglang.srt.mem_cache.radix_cache import RadixKey
+
+        tree = RadixCache.create_simulated()
+        toks = array("q", list(range(1, 33)))
+        tree.insert(
+            InsertParams(
+                key=RadixKey(token_ids=toks),
+                value=torch.arange(1, len(toks) + 1, dtype=torch.int64),
+            )
+        )
+        return tree
+
+    def test_memo_hit_matches_fresh_result(self):
+        from sglang.srt.managers.schedule_policy import match_prefix_for_req
+
+        tree = self._tree_with_prefix()
+        req = _make_req("m1", "x", list(range(1, 20)))
+
+        r1 = match_prefix_for_req(tree, req)
+        len1 = len(req.prefix_indices)
+        node1 = req.last_node
+        num1 = req.num_matched_prefix_tokens
+        self.assertGreater(len1, 0)
+        self.assertEqual(req._match_epoch, tree.match_epoch())
+
+        # Second call on an unchanged tree must be a memo hit with identical state.
+        r2 = match_prefix_for_req(tree, req)
+        self.assertIs(r2, r1)
+        self.assertEqual(len(req.prefix_indices), len1)
+        self.assertIs(req.last_node, node1)
+        self.assertEqual(req.num_matched_prefix_tokens, num1)
+
+    def test_memo_invalidated_after_mutation(self):
+        import torch
+
+        from sglang.srt.managers.schedule_policy import match_prefix_for_req
+        from sglang.srt.mem_cache.base_prefix_cache import InsertParams
+        from sglang.srt.mem_cache.radix_cache import RadixKey
+
+        tree = self._tree_with_prefix()
+        req = _make_req("m2", "x", list(range(1, 20)))
+        match_prefix_for_req(tree, req)
+        epoch_before = req._match_epoch
+
+        # Insert a longer overlapping key: epoch bumps, memo must be invalidated.
+        toks = array("q", list(range(1, 40)))
+        tree.insert(
+            InsertParams(
+                key=RadixKey(token_ids=toks),
+                value=torch.arange(1, len(toks) + 1, dtype=torch.int64),
+            )
+        )
+        self.assertNotEqual(tree.match_epoch(), epoch_before)
+        match_prefix_for_req(tree, req)
+        self.assertEqual(req._match_epoch, tree.match_epoch())
+
+    def test_calc_priority_identical_on_unchanged_tree(self):
+        """LPM ordering with memoization must equal ordering across rounds."""
+        import torch
+
+        from sglang.srt.mem_cache.base_prefix_cache import InsertParams
+        from sglang.srt.mem_cache.radix_cache import RadixKey
+
+        tree = RadixCache.create_simulated()
+        for base in range(0, 5):
+            toks = array("q", [base] + list(range(100, 100 + 20 * (base + 1))))
+            tree.insert(
+                InsertParams(
+                    key=RadixKey(token_ids=toks),
+                    value=torch.arange(1, len(toks) + 1, dtype=torch.int64),
+                )
+            )
+        policy = SchedulePolicy(
+            policy="lpm",
+            tree_cache=tree,
+            enable_hierarchical_cache=False,
+            enable_priority_scheduling=False,
+            schedule_low_priority_values_first=False,
+        )
+        q = [
+            _make_req(f"w{b}", "x", [b] + list(range(100, 100 + 20 * (b + 1))))
+            for b in range(5)
+        ]
+        policy.calc_priority(q)
+        order_round1 = [r.rid for r in q]
+        matched_round1 = {r.rid: r.num_matched_prefix_tokens for r in q}
+        # Second round, unchanged tree -> memo hits -> identical order & lengths.
+        policy.calc_priority(q)
+        order_round2 = [r.rid for r in q]
+        matched_round2 = {r.rid: r.num_matched_prefix_tokens for r in q}
+        self.assertEqual(order_round1, order_round2)
+        self.assertEqual(matched_round1, matched_round2)
+
+
 if __name__ == "__main__":
     unittest.main()

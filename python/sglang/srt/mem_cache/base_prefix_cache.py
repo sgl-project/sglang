@@ -247,6 +247,17 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def supports_fast_match_prefix(self) -> bool:
         return False
 
+    def match_epoch(self) -> Optional[int]:
+        """Monotonic mutation counter for match-result memoization.
+
+        A cache that implements this returns an int that strictly increases on
+        every mutation which can change ``match_prefix`` results (insert / evict /
+        reset). Callers may cache a request's match result and reuse it while the
+        epoch is unchanged. Returning ``None`` (the default) disables memoization
+        for caches that do not track mutations, forcing a fresh match every time.
+        """
+        return None
+
     @abstractmethod
     def cache_finished_req(self, req: Req, is_insert: bool = True, **kwargs):
         pass

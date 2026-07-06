@@ -329,6 +329,13 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
     ##### Public API #####
 
     def reset(self):
+        # Monotonic mutation epoch. Bumped on every structural mutation that can
+        # change match_prefix results (insert / evict / reset). Consumers (e.g.
+        # SchedulePolicy.calc_priority) memoize per-request match results keyed by
+        # this epoch and skip re-matching while the tree is unchanged. Any code
+        # path that adds, removes, or shrinks stored KV segments MUST bump it.
+        # (reset() itself starts a fresh epoch by advancing the counter below.)
+        self.epoch = getattr(self, "epoch", 0) + 1
         # Initialize root with minimum priority so any real priority overrides it
         self.root_node = TreeNode(priority=-sys.maxsize)
         self.root_node.key = RadixKey(token_ids=array("q"), extra_key=None)
@@ -351,6 +358,9 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
             best_match_node=self.root_node,
         )
         self._record_all_cleared_event()
+
+    def match_epoch(self) -> int:
+        return self.epoch
 
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         """Find the longest cached prefix of ``key`` in the radix tree.
@@ -432,6 +442,9 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         prefix_len, last_node = self._insert_helper(
             self.root_node, key, value, priority, chunked
         )
+        # An insert can add a new node or split an existing one, both of which can
+        # change subsequent match_prefix results. Bump the memoization epoch.
+        self.epoch += 1
         return InsertResult(prefix_len=prefix_len, last_device_node=last_node)
 
     def cache_finished_req(self, req: Req, is_insert: bool = True):
@@ -585,6 +598,12 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
                 heapq.heappush(eviction_heap, (new_priority, x.parent))
 
             self._record_remove_event(x)
+
+        # Eviction removes leaf nodes and can shorten previously matchable
+        # prefixes (a match that once returned length N may now return < N).
+        # Bump the memoization epoch so cached match results are invalidated.
+        if num_evicted > 0:
+            self.epoch += 1
 
         self.update_eviction_metrics(num_evicted, start_time)
         return EvictResult(num_tokens_evicted=num_evicted)

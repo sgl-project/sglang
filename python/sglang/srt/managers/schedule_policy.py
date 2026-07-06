@@ -50,6 +50,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InitLoadBackParams,
     InsertParams,
     MatchPrefixParams,
+    MatchResult,
     zero_match_result,
 )
 from sglang.srt.mem_cache.multi_ended_allocator import (
@@ -89,33 +90,10 @@ IN_BATCH_PREFIX_CACHING_DEPRIORITIZE_THRESHOLD = int(
 IGNORE_EOS_RESERVE_TOKENS = 1
 
 
-def match_prefix_for_req(
-    tree_cache: BasePrefixCache,
-    req: Req,
-    token_ids: Optional[array[int]] = None,
-    *,
-    cow_mamba: bool = False,
-    include_req: bool = False,
-):
-    if token_ids is None:
-        token_ids = req.origin_input_ids + req.output_ids
-
-    # unified_kv SWA lives in a per-request ring that's not content-stable and is
-    # never stored in the radix tree, so a reused prefix carries stale SWA. Cap
-    # the match by the trailing sliding window so it gets re-prefilled, rewriting
-    # this request's SWA ring. No-op for other layouts.
-    reprefill_tail = tree_cache.swa_reprefill_tail_tokens()
-    key_limit = max(0, len(token_ids) - reprefill_tail) if reprefill_tail else None
-
-    match_result = tree_cache.match_prefix(
-        MatchPrefixParams(
-            key=RadixKey(token_ids=token_ids, extra_key=req.extra_key, limit=key_limit),
-            cow_mamba=cow_mamba,
-            req=req if include_req else None,
-        )
-    )
-    if envs.SGLANG_RADIX_FORCE_MISS.get():
-        match_result = zero_match_result(tree_cache, match_result)
+def _apply_match_result_to_req(req: Req, match_result: MatchResult, token_len: int):
+    """Copy the fields of ``match_result`` onto ``req`` and recompute the derived
+    prefix-length stats. Shared by the fresh-match and memoized-hit paths so both
+    leave the request in an identical state."""
     (
         req.prefix_indices,
         req.last_node,
@@ -133,7 +111,7 @@ def match_prefix_for_req(
         match_result.swa_host_hit_length,
         match_result.mamba_host_hit_length,
     )
-    max_len = req._compute_max_prefix_len(len(token_ids))
+    max_len = req._compute_max_prefix_len(token_len)
     req.num_matched_prefix_tokens = min(
         len(req.prefix_indices) + req.host_hit_length, max_len
     )
@@ -141,6 +119,65 @@ def match_prefix_for_req(
         req.mamba_branching_seqlen = match_result.mamba_branching_seqlen
     if match_result.cache_protected_len is not None:
         req.cache_protected_len = match_result.cache_protected_len
+
+
+def match_prefix_for_req(
+    tree_cache: BasePrefixCache,
+    req: Req,
+    token_ids: Optional[array[int]] = None,
+    *,
+    cow_mamba: bool = False,
+    include_req: bool = False,
+):
+    if token_ids is None:
+        token_ids = req.origin_input_ids + req.output_ids
+
+    # Epoch-memoized fast path: if the tree has not mutated since this request was
+    # last matched (same epoch) and the matched token span is unchanged, reuse the
+    # cached MatchResult instead of walking the tree again. This is the dominant
+    # cost of LPM calc_priority, which re-matches every waiting request every
+    # scheduling round even when nothing changed. Only safe when nothing that can
+    # alter the result is in play: no cow_mamba / include_req side effects and no
+    # SGLANG_RADIX_FORCE_MISS override. `token_len` keys the memo so that a grown
+    # (origin+output) span (e.g. across decode steps) forces a re-match.
+    token_len = len(token_ids)
+    can_memoize = not cow_mamba and not include_req
+    if can_memoize:
+        epoch = tree_cache.match_epoch()
+        if (
+            epoch is not None
+            and req._match_epoch == epoch
+            and req._match_token_len == token_len
+            and req._match_result is not None
+        ):
+            _apply_match_result_to_req(req, req._match_result, token_len)
+            return req._match_result
+
+    # unified_kv SWA lives in a per-request ring that's not content-stable and is
+    # never stored in the radix tree, so a reused prefix carries stale SWA. Cap
+    # the match by the trailing sliding window so it gets re-prefilled, rewriting
+    # this request's SWA ring. No-op for other layouts. key_limit is a pure
+    # function of token_len and the (static) window, so reusing a memoized result
+    # keyed by (epoch, token_len) stays correct.
+    reprefill_tail = tree_cache.swa_reprefill_tail_tokens()
+    key_limit = max(0, len(token_ids) - reprefill_tail) if reprefill_tail else None
+
+    match_result = tree_cache.match_prefix(
+        MatchPrefixParams(
+            key=RadixKey(token_ids=token_ids, extra_key=req.extra_key, limit=key_limit),
+            cow_mamba=cow_mamba,
+            req=req if include_req else None,
+        )
+    )
+    if envs.SGLANG_RADIX_FORCE_MISS.get():
+        match_result = zero_match_result(tree_cache, match_result)
+    if can_memoize and not envs.SGLANG_RADIX_FORCE_MISS.get():
+        epoch = tree_cache.match_epoch()
+        if epoch is not None:
+            req._match_epoch = epoch
+            req._match_token_len = token_len
+            req._match_result = match_result
+    _apply_match_result_to_req(req, match_result, token_len)
     return match_result
 
 
