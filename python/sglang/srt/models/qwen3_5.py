@@ -586,9 +586,17 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         self.config = config
         self.layer_id = layer_id
 
+        _ignores_linear_attn = quant_config is not None and any(
+            "linear_attn" in entry
+            for entry in getattr(quant_config, "ignore", None) or []
+        )
         linear_attn_quant_config = (
             None
-            if quant_config and quant_config.get_name() == "modelopt_fp4"
+            if quant_config
+            and (
+                quant_config.get_name() == "modelopt_fp4"
+                or _ignores_linear_attn
+            )
             else quant_config
         )
         self.linear_attn = Qwen3_5GatedDeltaNet(
@@ -763,9 +771,17 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             dtype=torch.get_default_dtype(),
         )
 
+        _ignores_self_attn = quant_config is not None and any(
+            "self_attn" in entry
+            for entry in getattr(quant_config, "ignore", None) or []
+        )
         attn_quant_config = (
             None
-            if quant_config and quant_config.get_name() == "modelopt_fp4"
+            if quant_config
+            and (
+                quant_config.get_name() == "modelopt_fp4"
+                or _ignores_self_attn
+            )
             else quant_config
         )
 
