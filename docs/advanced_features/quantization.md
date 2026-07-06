@@ -43,7 +43,6 @@ The following table summarizes quantization method support across NVIDIA and AMD
 | `bitsandbytes` | Yes | Experimental | No | Depends on bitsandbytes ROCm support |
 | `torchao` (`int4wo`, etc.) | Yes | Partial | No | `int4wo` not supported on AMD; other methods may work |
 | `modelslim` | No | No | Yes | Ascend quantization; Uses CANN kernels |
-| `mxfp_w4a8` | No | No | Yes (A5) | Ascend NPU only; online W4A8 for Qwen3 dense LLM (MXFP4 weights + MXFP8 activations); requires Ascend 950 (A5). Offline `W4A8_MXFP` checkpoints are auto-detected via `modelslim` |
 | `mxfp8` (diffusion) | No | No | Yes (A2/A3) | Ascend NPU only; online MXFP8 quantization for diffusion models (e.g., Wan2.2); requires CANN ≥ 8.0.RC3 |
 
 On AMD, several of these methods use [Aiter](https://github.com/ROCm/aiter) for acceleration -- set `SGLANG_USE_AITER=1` where noted. See [AMD GPU setup](../platforms/amd_gpu.md) for installation and configuration details.
