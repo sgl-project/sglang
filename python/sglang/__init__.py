@@ -3,35 +3,59 @@
 # Install stubs early for platforms where certain dependencies are unavailable
 # (e.g. macOS/MPS has no triton, and torch.mps lacks Stream / set_device /
 # get_device_properties).  This must run before any downstream imports.
+import importlib.abc as _importlib_abc
+import importlib.machinery as _importlib_machinery
 import platform as _platform
 import sys as _sys
 
+
+def _install_mps_stub_if_available(_torch):
+    if _torch.backends.mps.is_available():
+        from sglang._mps_stub import install as _install_mps_stub
+
+        _install_mps_stub()
+
+
+class _TorchMpsStubLoader(_importlib_abc.Loader):
+    def __init__(self, loader):
+        self.loader = loader
+
+    def create_module(self, spec):
+        if hasattr(self.loader, "create_module"):
+            return self.loader.create_module(spec)
+        return None
+
+    def exec_module(self, module):
+        self.loader.exec_module(module)
+        _install_mps_stub_if_available(module)
+
+
+class _TorchMpsStubFinder(_importlib_abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname != "torch":
+            return None
+        spec = _importlib_machinery.PathFinder.find_spec(fullname, path)
+        if spec is None or spec.loader is None:
+            return None
+        spec.loader = _TorchMpsStubLoader(spec.loader)
+        return spec
+
+
 if _sys.platform == "darwin" and _platform.machine() == "arm64":
-    try:
-        import torch as _torch
+    from sglang._triton_stub import install as _install_triton_stub
 
-        if _torch.backends.mps.is_available():
-            from sglang._triton_stub import install as _install_triton_stub
+    _install_triton_stub()
+    del _install_triton_stub
 
-            _install_triton_stub()
-            del _install_triton_stub
-
-            from sglang._mps_stub import install as _install_mps_stub
-
-            _install_mps_stub()
-            del _install_mps_stub
-        del _torch
-    except ImportError:
-        pass
+    if "torch" in _sys.modules:
+        _install_mps_stub_if_available(_sys.modules["torch"])
+    else:
+        _sys.meta_path.insert(0, _TorchMpsStubFinder())
 del _platform
 del _sys
 
-from sglang.srt.utils.hf_transformers_patches import apply_all as _apply_hf_patches
-
-_apply_hf_patches()
-del _apply_hf_patches
-
 # Frontend Language APIs
+from sglang._lazy_import import LazyImport
 from sglang.global_config import global_config
 from sglang.lang.api import (
     Engine,
@@ -57,15 +81,15 @@ from sglang.lang.api import (
     user_end,
     video,
 )
-from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
 from sglang.lang.choices import (
     greedy_token_selection,
     token_length_normalized,
     unconditional_likelihood_normalized,
 )
 
+RuntimeEndpoint = LazyImport("sglang.lang.backend.runtime_endpoint", "RuntimeEndpoint")
+
 # Lazy import some libraries
-from sglang.utils import LazyImport
 from sglang.version import __version__
 
 Anthropic = LazyImport("sglang.lang.backend.anthropic", "Anthropic")
