@@ -6,7 +6,9 @@ run-name: ${{ (inputs.target_stage || inputs.target_stage_select) && (inputs.pr_
 on:
   schedule:
     - cron: '30 17 * * *'
-    - cron: '0 */6 * * *' # Every 6 hours (UTC): target dsv4 accuracy jobs only
+    # Temporarily disabled: every-6-hours dsv4 accuracy run. Daily '30 17 * * *'
+    # cron still runs the full suite (including dsv4). Re-enable to restore it.
+    # - cron: '0 */6 * * *' # Every 6 hours (UTC): target dsv4 accuracy jobs only
   # push:
   #   branches: [ main ]
   #   paths:
