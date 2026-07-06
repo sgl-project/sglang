@@ -26,6 +26,14 @@ CLONE_RE = re.compile(
     r"( https://github\.com/sgl-project/sglang\.git)"
 )
 
+# Matches a version-pinned docker image such as `lmsysorg/sglang:v0.5.12`
+# (leaving any suffix like `-cu130`/`-runtime` untouched), capturing the
+# version in group 2. Mutable tags (`latest`, `dev`, ...) are not matched.
+DOCKER_RE = re.compile(r"(lmsysorg/sglang:)v(\d+\.\d+\.\d+(?:rc\d+|\.post\d+)?)\b")
+
+# All version references the bump keeps in sync, each with the version in group 2.
+VERSION_PATTERNS = [CLONE_RE, DOCKER_RE]
+
 
 def read_current_version(file_path: Path) -> str:
     """Read the pinned source-install version from a docs page."""
@@ -37,13 +45,25 @@ def read_current_version(file_path: Path) -> str:
     return match.group(2)
 
 
-def replace_clone_version(file_path: Path, new_version: str) -> bool:
+def stale_versions(file_path: Path, new_version: str) -> list:
+    """Return any pinned versions in the file that differ from new_version."""
+    content = file_path.read_text()
+    return [
+        m.group(2)
+        for pattern in VERSION_PATTERNS
+        for m in pattern.finditer(content)
+        if m.group(2) != new_version
+    ]
+
+
+def replace_version(file_path: Path, new_version: str) -> bool:
     if not file_path.exists():
         print(f"Warning: {file_path} does not exist, skipping")
         return False
 
     content = file_path.read_text()
     new_content = CLONE_RE.sub(rf"\g<1>v{new_version}\g<3>", content)
+    new_content = DOCKER_RE.sub(rf"\g<1>v{new_version}", new_content)
 
     if content == new_content:
         print(f"No changes needed in {file_path}")
@@ -94,7 +114,7 @@ def main():
     updated_count = 0
     for file_rel in FILES_TO_UPDATE:
         file_abs = repo_root / file_rel
-        if replace_clone_version(file_abs, new_version):
+        if replace_version(file_abs, new_version):
             updated_count += 1
 
     print()
@@ -109,10 +129,10 @@ def main():
             print(f"Warning: File {file_rel} does not exist, skipping validation.")
             continue
 
-        found = read_current_version(file_abs)
-        if found != new_version:
+        stale = stale_versions(file_abs, new_version)
+        if stale:
             failed_files.append(file_rel)
-            print(f"✗ {file_rel} still pins v{found}")
+            print(f"✗ {file_rel} still pins v{', v'.join(sorted(set(stale)))}")
         else:
             print(f"✓ {file_rel} validated")
 

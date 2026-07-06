@@ -78,6 +78,10 @@ pip install -e "python"
 The docker images are available on Docker Hub at [lmsysorg/sglang](https://hub.docker.com/r/lmsysorg/sglang/tags), built from [Dockerfile](https://github.com/sgl-project/sglang/tree/main/docker).
 Replace `<secret>` below with your huggingface hub [token](https://huggingface.co/docs/hub/en/security-tokens).
 
+<Note>
+`latest` and `dev` are **mutable** tags: `latest` always points at the newest stable release, while `dev` is rebuilt daily from the latest `main` and includes build/development tools. Because they are overwritten over time, pin an immutable version tag for reproducible deployments — e.g. `lmsysorg/sglang:v0.5.12`. Browse all released versions on [Docker Hub](https://hub.docker.com/r/lmsysorg/sglang/tags).
+</Note>
+
 ```bash Command
 docker run --gpus all \
     --shm-size 32g \
