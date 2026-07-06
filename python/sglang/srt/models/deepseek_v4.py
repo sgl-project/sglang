@@ -2308,6 +2308,15 @@ class DeepseekV4ForCausalLM(nn.Module):
 
         fuse_wqa_wkv = envs.SGLANG_OPT_FUSE_WQA_WKV.get()
         cache_wqkv_a_weight: dict[str, dict[str, torch.Tensor]] = {}
+        dspark_source_stages: dict[str, set[int]] = {
+            "main_proj": set(),
+            "main_norm": set(),
+            "shared_norm": set(),
+            "hc_head": set(),
+            "markov_head": set(),
+            "confidence_head": set(),
+            "draft_layers": set(),
+        }
 
         def auto_weight_loader(module):
             return getattr(module, "weight_loader", default_weight_loader)
@@ -2345,6 +2354,25 @@ class DeepseekV4ForCausalLM(nn.Module):
                         is_dspark=is_dspark,
                         num_hidden_layers=self.config.num_hidden_layers,
                     )
+                    if is_dspark and orig_name.startswith("mtp."):
+                        parts = orig_name.split(".", 2)
+                        if len(parts) >= 3:
+                            stage = int(parts[1])
+                            rest = parts[2]
+                            if rest.startswith("main_proj."):
+                                dspark_source_stages["main_proj"].add(stage)
+                            elif rest.startswith("main_norm."):
+                                dspark_source_stages["main_norm"].add(stage)
+                            elif rest == "norm.weight":
+                                dspark_source_stages["shared_norm"].add(stage)
+                            elif rest.startswith("hc_head_"):
+                                dspark_source_stages["hc_head"].add(stage)
+                            elif rest.startswith("markov_head."):
+                                dspark_source_stages["markov_head"].add(stage)
+                            elif rest.startswith("confidence_head."):
+                                dspark_source_stages["confidence_head"].add(stage)
+                            else:
+                                dspark_source_stages["draft_layers"].add(stage)
 
                     layer_id = get_layer_id(name)
                     if (
@@ -2640,11 +2668,15 @@ class DeepseekV4ForCausalLM(nn.Module):
                 or name.startswith("model.layers.")
                 or name.startswith("lm_head.")
             )
+            dspark_source_stage_summary = {
+                key: sorted(value) for key, value in dspark_source_stages.items()
+            }
             log_info_on_rank0(
                 logger,
                 "DSpark loaded parameter summary after skip filtering: "
                 f"loaded={dspark_loaded_summary} missing={dspark_missing_summary} "
-                f"missing_names={dspark_missing_names}",
+                f"missing_names={dspark_missing_names} "
+                f"source_stages={dspark_source_stage_summary}",
             )
         if unloaded_params:
             logger.warning(
