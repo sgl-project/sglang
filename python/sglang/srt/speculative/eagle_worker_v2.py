@@ -114,6 +114,9 @@ _is_musa = is_musa()
 _is_hip = is_hip()
 _is_xpu = is_xpu()
 
+if _is_cuda:
+    from sglang.srt.speculative.triton_ops.topk1 import draft_topk1_postprocess
+
 logger = logging.getLogger(__name__)
 
 
@@ -674,6 +677,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 logits_output = self.draft_runner.forward(forward_batch).logits_output
             maybe_detect_nan(logits_output.next_token_logits, f"draft_forward step {i}")
             maybe_detect_inf(logits_output.next_token_logits, f"draft_forward step {i}")
+            positions_advanced = False
             if self.server_args.speculative_use_rejection_sampling:
                 probs = renorm_draft_probs(
                     logits_output.next_token_logits,
@@ -683,10 +687,16 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 topk_p, topk_index = fast_sample(probs, num_samples=1)
                 draft_probs_list.append(probs)
             elif self.topk == 1 and not _is_hip:
-                topk_index = torch.argmax(
-                    logits_output.next_token_logits, dim=-1, keepdim=True
-                )
-                topk_p = torch.ones_like(topk_index, dtype=torch.float32)
+                if _is_cuda:
+                    topk_p, topk_index = draft_topk1_postprocess(
+                        logits_output.next_token_logits, forward_batch.positions
+                    )
+                    positions_advanced = True
+                else:
+                    topk_index = torch.argmax(
+                        logits_output.next_token_logits, dim=-1, keepdim=True
+                    )
+                    topk_p = torch.ones_like(topk_index, dtype=torch.float32)
             else:
                 probs = renorm_draft_probs(
                     logits_output.next_token_logits,
@@ -703,7 +713,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             if self.hot_token_id is not None:
                 topk_index = self.hot_token_id[topk_index]
             hidden_states = logits_output.hidden_states
-            forward_batch.positions.add_(1)
+            if not positions_advanced:
+                forward_batch.positions.add_(1)
 
         if self.index_share_for_mtp_iteration:
             spec_info.mtp_topk_indices = None
