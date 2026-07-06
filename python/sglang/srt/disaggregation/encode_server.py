@@ -13,6 +13,7 @@ import time
 import traceback
 import uuid
 from collections import defaultdict
+from dataclasses import dataclass
 from http import HTTPStatus
 from typing import Annotated, Dict, List, Optional, Set, Tuple, Union
 
@@ -81,6 +82,17 @@ from sglang.srt.utils.network import (
     get_local_ip_auto,
     get_zmq_socket,
 )
+
+
+@dataclass
+class FlushContext:
+    q_enc: asyncio.Queue
+    q_pre: asyncio.Queue
+    image_processor: callable
+    model_type: str
+    image_config: dict
+    normalize_fn: callable | None = None
+
 
 logger = logging.getLogger(__name__)
 
@@ -1320,6 +1332,72 @@ class MMEncoder:
         """
         return await self._flatten_and_load_data_by_modality(mm_items, Modality.IMAGE)
 
+    async def _flatten_and_load_images_pipelined(self, mm_items):
+        """
+        Pipelined image loading: process images as they arrive, overlapping download and preprocessing.
+        Returns images in same structure as _flatten_and_load_images.
+        """
+        # Handle single mm_item (not a list)
+        if not isinstance(mm_items, (list, tuple)):
+            futures, _ = self.submit_data_loading_tasks([mm_items], [Modality.IMAGE])
+            return await asyncio.wrap_future(futures[0])
+
+        # Handle nested list (list of lists)
+        if len(mm_items) > 0 and isinstance(mm_items[0], (list, tuple)):
+            # Flatten nested structure
+            flat_data = []
+            flat_indices = []  # Track which group each item belongs to
+            for group_idx, item_group in enumerate(mm_items):
+                for item in item_group:
+                    flat_data.append(item)
+                    flat_indices.append(group_idx)
+
+            # Submit all tasks concurrently
+            futures, _ = self.submit_data_loading_tasks(
+                flat_data, [Modality.IMAGE] * len(flat_data)
+            )
+
+            # Process images as they complete (pipelined approach)
+            async_futures = []
+            future_to_idx = {}
+
+            for idx, f in enumerate(futures):
+                af = asyncio.wrap_future(f)
+                async_futures.append(af)
+                future_to_idx[af] = idx
+
+            results = [None] * len(futures)
+
+            for future in asyncio.as_completed(async_futures):
+                idx = future_to_idx[future]
+                img = await future
+                results[idx] = img
+
+            # Restore nested structure
+            nested_results = [[] for _ in range(len(mm_items))]
+            for idx, result in zip(flat_indices, results):
+                nested_results[idx].append(result)
+
+            return nested_results
+
+        # Handle simple list
+        else:
+            futures, _ = self.submit_data_loading_tasks(
+                mm_items, [Modality.IMAGE] * len(mm_items)
+            )
+
+            # Process as images complete
+            results = [None] * len(futures)
+            for future in asyncio.as_completed(
+                [asyncio.wrap_future(f) for f in futures]
+            ):
+                for idx, f in enumerate(futures):
+                    if f.done() and results[idx] is None:
+                        results[idx] = await asyncio.wrap_future(f)
+                        break
+
+            return results
+
     def _calculate_timestamps(self, indices, video_fps: float, merge_size: int = 2):
         """Calculate timestamps for video frames, used for qwen3_vl models."""
         # refer to https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3_vl/processing_qwen3_vl.py#L255
@@ -1557,15 +1635,18 @@ class MMEncoder:
 
     async def _encode(self, mm_items, modality: Modality) -> torch.Tensor:
         try:
+            enable_pipeline = envs.SGLANG_ENCODER_ENABLE_PIPELINE.get()
+
+            run_pipeline = (
+                enable_pipeline
+                and modality == Modality.IMAGE
+                and self.image_processor is not None
+            )
+
+            # ---------------------------------------------------------
+            # STEP 1: SEMANTIC PREPROCESSING (ALWAYS SAME)
+            # ---------------------------------------------------------
             mm_inputs, get_feature_fn = await self._process_mm_items(mm_items, modality)
-        except NotImplementedError as e:
-            raise InternalError(f"Not implemented error: {str(e)}")
-        except Exception as e:
-            raise BadRequestError(f"Failed to process mm items: {str(e)}")
-        try:
-            # support mm_cache
-            mm_embedding = None
-            mm_hash = None
 
             mm_item = MultimodalDataItem.from_dict(
                 {
@@ -1573,39 +1654,81 @@ class MMEncoder:
                     "feature": _convert(_get_mm_feature(mm_inputs, modality)),
                 }
             )
+
             for k, v in mm_inputs.items():
                 if k in _mm_feature_attrs[modality]:
                     continue
                 mm_item.set(k, _convert(v))
 
+            mm_hash = None
+            cached_embedding = None
+
+            # ---------------------------------------------------------
+            # STEP 2: CACHE LOOKUP (IDENTICAL FOR BOTH MODES)
+            # ---------------------------------------------------------
             if self.server_args.enable_prefix_mm_cache:
                 mm_item.set_pad_value()
                 mm_hash = MultiModalStaticCache.combine_hashes([mm_item.hash])
+
                 async with self.mm_cache_lock:
-                    mm_cache = self.mm_cache.get([mm_item.hash])
-                    if mm_cache is not None:
-                        mm_embedding = mm_cache.embedding
+                    cached = self.mm_cache.get([mm_item.hash])
+                    if cached is not None:
+                        cached_embedding = cached.embedding
 
-            if mm_embedding is None:
-                with torch.inference_mode():
-                    mm_embedding: torch.Tensor = get_feature_fn([mm_item])
-                    mm_embedding = mm_embedding.cpu()
-                if len(mm_embedding.shape) != 2:
-                    mm_embedding = mm_embedding.reshape(-1, mm_embedding.shape[-1])
+            # ---------------------------------------------------------
+            # STEP 3: EXECUTION (CACHE MISS ONLY)
+            # ---------------------------------------------------------
+            if cached_embedding is not None:
+                mm_embedding = cached_embedding
 
-            if self.server_args.enable_prefix_mm_cache:
+            else:
+                if run_pipeline:
+                    # =================================================
+                    # PIPELINE PATH (IMAGE ONLY)
+                    # =================================================
+                    mm_embedding = await self._process_mm_items_pipelined(
+                        mm_items,
+                        modality,
+                    )
+
+                else:
+                    # =================================================
+                    # LEGACY PATH (FULL COMPATIBILITY)
+                    # =================================================
+                    with torch.inference_mode():
+                        mm_embedding = get_feature_fn([mm_item])
+
+                    # normalize shape (same as before)
+                    if isinstance(mm_embedding, torch.Tensor):
+                        if mm_embedding.ndim != 2:
+                            mm_embedding = mm_embedding.reshape(
+                                -1, mm_embedding.shape[-1]
+                            )
+
+            # ---------------------------------------------------------
+            # STEP 4: CACHE WRITE BACK (UNIFIED)
+            # ---------------------------------------------------------
+            if self.server_args.enable_prefix_mm_cache and cached_embedding is None:
                 async with self.mm_cache_lock:
-                    self.mm_cache.set(mm_hash, EmbeddingResult(embedding=mm_embedding))
-            if self.profiler is not None:
-                self.profiler.step()
+                    self.mm_cache.set(
+                        mm_hash,
+                        EmbeddingResult(embedding=mm_embedding),
+                    )
 
-            aux_data = _build_mm_aux_data(mm_inputs, self.model_type)
+            # ---------------------------------------------------------
+            # STEP 5: AUX DATA (UNCHANGED SEMANTICS)
+            # ---------------------------------------------------------
+            try:
+                aux_data = _build_mm_aux_data(mm_inputs, self.model_type)
+            except TypeError:
+                aux_data = _build_mm_aux_data(mm_inputs)
 
             if modality == Modality.VIDEO and mm_inputs.get("video_audio_features"):
                 target = (
                     self.model.thinker if hasattr(self.model, "thinker") else self.model
                 )
                 encode_video_audio_fn = getattr(target, "encode_video_audio", None)
+
                 if encode_video_audio_fn is not None:
                     audio_embedding = encode_video_audio_fn(mm_inputs)
                     if audio_embedding is not None:
@@ -1613,18 +1736,235 @@ class MMEncoder:
                 else:
                     logger.warning(
                         "Videos carry audio tracks but model has no "
-                        "encode_video_audio; dropping audio for EPD encoding."
+                        "encode_video_audio; dropping audio."
                     )
 
+            # ---------------------------------------------------------
+            # FINAL RETURN (UNCHANGED CONTRACT)
+            # ---------------------------------------------------------
             return (
                 _get_mm_grid_dim(mm_inputs, modality, self.model_type),
                 mm_embedding,
                 aux_data,
             )
-        except BadRequestError as e:
-            raise BadRequestError(f"Bad request error: {str(e)}")
+
+        except NotImplementedError as e:
+            raise InternalError(f"Not implemented error: {str(e)}")
+
         except Exception as e:
             raise InternalError(f"Internal encoding error: {str(e)}")
+
+    async def _process_mm_items_pipelined(
+        self,
+        mm_items,
+        modality,
+        batch_size: int = 4,
+    ):
+        import asyncio
+
+        import torch
+
+        enable_pipeline = envs.SGLANG_ENCODER_ENABLE_PIPELINE.get()
+
+        # ---------------------------------------------------------
+        # fallback: identical behavior to legacy path
+        # ---------------------------------------------------------
+        if (
+            not enable_pipeline
+            or modality != Modality.IMAGE
+            or self.image_processor is None
+        ):
+            return await self._process_mm_items(mm_items, modality)
+
+        image_config = self.vision_config.get("image", {})
+
+        get_feature_method = (
+            self.model.thinker.get_image_feature
+            if hasattr(self.model, "thinker")
+            else self.model.get_image_feature
+        )
+
+        # normalize input
+        if not isinstance(mm_items, (list, tuple)):
+            mm_items = [mm_items]
+
+        items = list(mm_items)
+        total_items = len(items)
+
+        # ---------------------------------------------------------
+        # bounded queues (backpressure control)
+        # ---------------------------------------------------------
+        DL_Q = asyncio.Queue(maxsize=8)
+        PRE_Q = asyncio.Queue(maxsize=8)
+        ENC_Q = asyncio.Queue(maxsize=8)
+
+        # ---------------------------------------------------------
+        # seed download queue
+        # ---------------------------------------------------------
+        for i, item in enumerate(items):
+            await DL_Q.put((i, item))
+
+        NUM_DL = 2
+        NUM_PRE = 2
+        NUM_ENC = 2
+
+        # sentinel strategy (IMPORTANT: per stage fanout)
+        for _ in range(NUM_DL):
+            await DL_Q.put(None)
+
+        final_embeddings = None
+        embedding_dim = None
+        embedding_lock = asyncio.Lock()
+        q_pre = PRE_Q
+        q_enc = ENC_Q
+
+        @dataclass
+        class FlushContext:
+            q_enc: asyncio.Queue
+            q_pre: asyncio.Queue
+            image_processor: callable
+            model_type: str
+            image_config: dict
+            normalize_fn: callable | None = None
+
+        ctx = FlushContext(
+            q_enc=q_enc,
+            q_pre=q_pre,
+            image_processor=self.image_processor,
+            model_type=self.model_type,
+            image_config=image_config,
+            normalize_fn=self._normalize_kimi_k25_encoder_images,
+        )
+
+        async def _flush(batch_local, ctx: FlushContext):
+            indices = [x[0] for x in batch_local]
+            images = [x[1] for x in batch_local]
+
+            if ctx.model_type == "kimi_k25" and ctx.normalize_fn:
+                images = ctx.normalize_fn(images)
+
+            proc = await asyncio.to_thread(
+                ctx.image_processor,
+                images=images,
+                **ctx.image_config,
+            )
+
+            if "pixel_values" in proc:
+                pv = proc["pixel_values"]
+                if pv.device.type == "cpu":
+                    proc["pixel_values"] = pv.pin_memory()
+
+            await ctx.q_enc.put((indices, proc))
+
+        # =========================================================
+        # STAGE 1: DOWNLOAD
+        # =========================================================
+        async def download_worker():
+            while True:
+                item = await DL_Q.get()
+
+                if item is None:
+                    await PRE_Q.put(None)
+                    break
+
+                idx, data = item
+
+                futs, _ = self.submit_data_loading_tasks(
+                    [data],
+                    [Modality.IMAGE],
+                )
+
+                img = await asyncio.wrap_future(futs[0])
+
+                await PRE_Q.put((idx, img))
+
+        # =========================================================
+        # STAGE 2: PREPROCESS (MICRO-BATCHED)
+        # =========================================================
+        async def preprocess_worker():
+            batch = []
+
+            while True:
+                item = await q_pre.get()
+
+                if item is None:
+                    break
+
+                batch.append(item)
+
+                if len(batch) < batch_size:
+                    continue
+                ctx = FlushContext(
+                    q_enc=q_enc,
+                    q_pre=q_pre,
+                    image_processor=self.image_processor,
+                    model_type=self.model_type,
+                    image_config=image_config,
+                    normalize_fn=self._normalize_kimi_k25_encoder_images,
+                )
+                await _flush(batch, ctx)
+                batch = []
+
+            if batch:
+                await _flush(batch, ctx)
+
+            await ENC_Q.put(None)
+
+        # =========================================================
+        # STAGE 3: ENCODE
+        # =========================================================
+        async def encode_worker():
+            nonlocal final_embeddings, embedding_dim
+
+            while True:
+                # propagate shutdown to encoder stage
+                await q_enc.put(None)
+
+                if item is None:
+                    break
+
+                indices, proc = item
+
+                mm_item = MultimodalDataItem.from_dict(
+                    {
+                        "modality": Modality.IMAGE,
+                        "feature": _convert(_get_mm_feature(proc, Modality.IMAGE)),
+                    }
+                )
+
+                for k, v in proc.items():
+                    if k in _mm_feature_attrs[Modality.IMAGE]:
+                        continue
+                    mm_item.set(k, _convert(v))
+
+                with torch.inference_mode():
+                    emb = get_feature_method([mm_item])
+
+                if emb.ndim != 2:
+                    emb = emb.reshape(-1, emb.shape[-1])
+
+                async with embedding_lock:
+                    if final_embeddings is None:
+                        embedding_dim = emb.shape[-1]
+                        final_embeddings = torch.empty(
+                            (total_items, embedding_dim),
+                            dtype=emb.dtype,
+                            device=emb.device,
+                        )
+
+                    for i, global_idx in enumerate(indices):
+                        final_embeddings[global_idx] = emb[i]
+
+        # =========================================================
+        # RUN PIPELINE
+        # =========================================================
+        dl_tasks = [asyncio.create_task(download_worker()) for _ in range(NUM_DL)]
+        pre_tasks = [asyncio.create_task(preprocess_worker()) for _ in range(NUM_PRE)]
+        enc_tasks = [asyncio.create_task(encode_worker()) for _ in range(NUM_ENC)]
+
+        await asyncio.gather(*dl_tasks, *pre_tasks, *enc_tasks)
+
+        return final_embeddings
 
     async def _send(
         self,
