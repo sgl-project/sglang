@@ -286,6 +286,10 @@ else:
 
 logger = logging.getLogger(__name__)
 
+# Minimum seconds between load snapshot publishes, applied even to forced
+# (prefill/idle) publishes. See Scheduler.publish_load_snapshot.
+LOAD_SNAPSHOT_MIN_PUBLISH_INTERVAL_S = 0.02
+
 # Test retract decode for debugging purposes
 TEST_RETRACT = envs.SGLANG_TEST_RETRACT.get()
 TEST_RETRACT_INTERVAL = envs.SGLANG_TEST_RETRACT_INTERVAL.get()
@@ -653,6 +657,15 @@ class Scheduler(
             writer.publish_counter += 1
             if writer.publish_counter < writer.publish_interval:
                 return
+        # Rate-limit forced publishes (every prefill batch and every idle
+        # iteration force-publish): a full get_loads + locked shm write per
+        # scheduler iteration is measurable CPU overhead, while readers only
+        # need snapshots at millisecond freshness.
+        now = time.monotonic()
+        last = getattr(writer, "last_publish_ts", 0.0)
+        if now - last < LOAD_SNAPSHOT_MIN_PUBLISH_INTERVAL_S:
+            return
+        writer.last_publish_ts = now
         writer.publish_counter = 0
         try:
             writer.write(self.load_inquirer.get_loads())
