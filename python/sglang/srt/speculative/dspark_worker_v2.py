@@ -250,6 +250,10 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._boundary_debug_by_req_pool: dict[int, dict] = {}
         self._target_aux_debug_by_req_pool: dict[int, dict] = {}
         self._swa_write_source_by_req_pool: dict[int, dict[int, str]] = {}
+        self._last_valid_swa_locs_by_req_pool_debug: dict[int, list[int]] = {}
+        self._swa_write_source_snapshot_by_req_pool: Optional[
+            dict[int, dict[int, str]]
+        ] = None
         self._stacked_wqkv_fp8_proj = None
         self._stacked_wqkv_kv_offsets: list[tuple[int, int]] = []
         self._stacked_wqkv_out_sizes: list[int] = []
@@ -1196,10 +1200,47 @@ class DSparkWorkerV2(BaseSpecWorker):
                 out.append([int(x) for x in block_locs.tolist()])
             return out
 
+        def valid_locs_by_request(indices, lengths):
+            if (
+                indices is None
+                or lengths is None
+                or not isinstance(indices, torch.Tensor)
+                or not isinstance(lengths, torch.Tensor)
+                or indices.numel() == 0
+                or lengths.numel() == 0
+            ):
+                return {}
+            rows = indices.detach().cpu()
+            lens = lengths.detach().cpu().reshape(-1)
+            if rows.ndim == 1:
+                return {}
+            out = {}
+            num_reqs = max(0, int(rows.shape[0]) // int(self.block_size))
+            for req_idx in range(num_reqs):
+                row_idx = req_idx * int(self.block_size)
+                row = rows[row_idx].reshape(-1)
+                valid_len = int(lens[min(row_idx, lens.numel() - 1)])
+                valid_len = max(0, min(valid_len, int(row.numel())))
+                valid = row[:valid_len]
+                out[req_idx] = [int(x) for x in valid.tolist()]
+            return out
+
         swa_page_indices = getattr(core, "swa_page_indices", None)
         swa_topk_lengths = getattr(core, "swa_topk_lengths", None)
         valid_edges = valid_first_last_row_edges(swa_page_indices, swa_topk_lengths)
         valid_block_locs = valid_block_locs_by_row(swa_page_indices, swa_topk_lengths)
+        valid_locs_by_req = valid_locs_by_request(swa_page_indices, swa_topk_lengths)
+        self._last_valid_swa_locs_by_req_pool_debug = {}
+        if valid_locs_by_req:
+            req_pool_indices = getattr(draft_forward_batch, "req_pool_indices", None)
+            if isinstance(req_pool_indices, torch.Tensor):
+                req_pool_indices_cpu = req_pool_indices.detach().cpu().reshape(-1)
+                for req_idx, locs in valid_locs_by_req.items():
+                    row_idx = req_idx * int(self.block_size)
+                    if row_idx < int(req_pool_indices_cpu.numel()):
+                        self._last_valid_swa_locs_by_req_pool_debug[
+                            int(req_pool_indices_cpu[row_idx])
+                        ] = locs
         self._last_draft_visible_block_swa_locs_debug = (
             None
             if valid_edges is None
@@ -1495,18 +1536,32 @@ class DSparkWorkerV2(BaseSpecWorker):
             return
 
     def _visible_window_source_debug(
-        self, req_pool_idx: int, visible_locs: Optional[list[int]]
+        self,
+        req_pool_idx: int,
+        visible_locs: Optional[list[int]],
+        *,
+        max_sources: int = 16,
     ) -> Optional[dict]:
         if not visible_locs:
             return None
-        source_by_loc = self._swa_write_source_by_req_pool.get(int(req_pool_idx), {})
+        source_snapshot = self._swa_write_source_snapshot_by_req_pool
+        source_by_req = (
+            source_snapshot
+            if source_snapshot is not None
+            else self._swa_write_source_by_req_pool
+        )
+        source_by_loc = source_by_req.get(int(req_pool_idx), {})
         sources = [source_by_loc.get(int(loc), "unknown") for loc in visible_locs]
         counts: dict[str, int] = {}
         for source in sources:
             counts[source] = counts.get(source, 0) + 1
+        visible_locs_int = [int(x) for x in visible_locs]
         return {
-            "visible_locs": [int(x) for x in visible_locs],
-            "sources": sources,
+            "visible_len": len(visible_locs_int),
+            "visible_first8": visible_locs_int[:8],
+            "visible_last8": visible_locs_int[-8:],
+            "sources_first": sources[:max_sources],
+            "sources_last": sources[-max_sources:],
             "counts": counts,
         }
 
@@ -2625,6 +2680,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             draft_block_metadata = self._last_draft_block_metadata_debug
             visible_block_sources = None
             valid_tail_sources = None
+            valid_window_sources = None
             if isinstance(draft_block_metadata, dict):
                 block_locs_by_row = draft_block_metadata.get(
                     "draft_swa_valid_block_locs_by_row"
@@ -2643,6 +2699,13 @@ class DSparkWorkerV2(BaseSpecWorker):
                         valid_tail_sources = self._visible_window_source_debug(
                             int(req_pool_idx), tail_locs
                         )
+            valid_locs = self._last_valid_swa_locs_by_req_pool_debug.get(
+                int(req_pool_idx)
+            )
+            if valid_locs is not None:
+                valid_window_sources = self._visible_window_source_debug(
+                    int(req_pool_idx), valid_locs
+                )
             history = self._accept_anomaly_histories.setdefault(key, [])
             history.append(
                 {
@@ -2770,6 +2833,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                     ),
                     "visible_block_sources": visible_block_sources,
                     "valid_tail_sources": valid_tail_sources,
+                    "valid_window_sources": valid_window_sources,
                     "draft_block_metadata": draft_block_metadata,
                 }
             )
@@ -3456,6 +3520,12 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
             commit_mask = commit_mask_2d.reshape(-1)
             if self._accept_anomaly_enabled:
+                self._swa_write_source_snapshot_by_req_pool = {
+                    int(req_idx): dict(
+                        self._swa_write_source_by_req_pool.get(int(req_idx), {})
+                    )
+                    for req_idx in req_pool_indices.detach().cpu().tolist()
+                }
                 cache_locs_2d = verify_out_cache_loc.view(bs, verify_stride)
                 positions_2d = verify_positions.view(bs, verify_stride)
                 main_x_2d = main_x_flat.view(bs, verify_stride, -1)
@@ -3499,6 +3569,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             target_logits=logits_output.next_token_logits,
             ignore_mask=transfer_warmup_mask,
         )
+        self._swa_write_source_snapshot_by_req_pool = None
         if on_publish is not None:
             on_publish(new_seq_lens)
 
