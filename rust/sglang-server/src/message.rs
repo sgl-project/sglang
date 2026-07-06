@@ -474,172 +474,145 @@ pub struct BatchHeader {
     pub hidden_poslens: Vec<u32>,
 }
 
-/// Slice request `i`'s flat logprob column (parallel val/idx) out of the global
-/// buffers, advancing `cur` by this request's element count.
-fn take_flat(
-    val_all: &[f32],
-    idx_all: &[i32],
-    lens: &[u32],
-    i: usize,
-    cur: &mut usize,
-) -> (Vec<f32>, Vec<i32>) {
-    let l = lens.get(i).copied().unwrap_or(0) as usize;
-    let end = (*cur + l).min(val_all.len()).min(idx_all.len());
-    let start = (*cur).min(end);
-    let out = (val_all[start..end].to_vec(), idx_all[start..end].to_vec());
-    *cur = end;
-    out
+/// Read request `i`'s flat logprob column (`l` parallel val/idx elements)
+/// directly from the frame `data` at the per-column byte cursors `cv`/`ci`,
+/// advancing them. No whole-column intermediate — only this request is copied.
+fn take_flat(data: &[u8], cv: &mut usize, ci: &mut usize, l: usize) -> (Vec<f32>, Vec<i32>) {
+    (take_f32(data, cv, l), take_i32(data, ci, l))
 }
 
-/// Slice request `i`'s ragged logprob column (per-position val/idx + poslens) out
-/// of the global buffers, advancing both the position cursor (`pcur`, into
-/// `poslens`) and the value cursor (`vcur`, into val/idx).
+/// Read a request's ragged logprob column (`np` positions) from `data`: pull its
+/// per-position `lens` from the header's `poslens` (advancing `pcur`), then the
+/// summed val/idx count from the val/idx byte cursors `cv`/`ci`.
 fn take_ragged(
-    val_all: &[f32],
-    idx_all: &[i32],
+    data: &[u8],
+    cv: &mut usize,
+    ci: &mut usize,
     poslens: &[u32],
-    reqlens: &[u32],
-    i: usize,
     pcur: &mut usize,
-    vcur: &mut usize,
+    np: usize,
 ) -> (Vec<f32>, Vec<i32>, Vec<u32>) {
-    let np = reqlens.get(i).copied().unwrap_or(0) as usize;
     let pe = (*pcur + np).min(poslens.len());
     let lens = poslens[(*pcur).min(pe)..pe].to_vec();
     *pcur = pe;
     let nv: usize = lens.iter().map(|&x| x as usize).sum();
-    let ve = (*vcur + nv).min(val_all.len()).min(idx_all.len());
-    let vs = (*vcur).min(ve);
-    let out = (val_all[vs..ve].to_vec(), idx_all[vs..ve].to_vec(), lens);
-    *vcur = ve;
-    out
+    (take_f32(data, cv, nv), take_i32(data, ci, nv), lens)
 }
 
-/// Like [`take_ragged`] but for hidden states — a val column + row `poslens`,
-/// no idx column.
+/// Like [`take_ragged`] but for hidden states — a val column + row `poslens`, no
+/// idx column.
 fn take_hidden(
-    val_all: &[f32],
+    data: &[u8],
+    cv: &mut usize,
     poslens: &[u32],
-    reqlens: &[u32],
-    i: usize,
     pcur: &mut usize,
-    vcur: &mut usize,
+    nr: usize,
 ) -> (Vec<f32>, Vec<u32>) {
-    let nr = reqlens.get(i).copied().unwrap_or(0) as usize;
     let pe = (*pcur + nr).min(poslens.len());
     let lens = poslens[(*pcur).min(pe)..pe].to_vec();
     *pcur = pe;
     let nv: usize = lens.iter().map(|&x| x as usize).sum();
-    let ve = (*vcur + nv).min(val_all.len());
-    let vs = (*vcur).min(ve);
-    let out = (val_all[vs..ve].to_vec(), lens);
-    *vcur = ve;
-    out
+    (take_f32(data, cv, nv), lens)
 }
 
-/// Decode a batch egress frame (tag stripped) into per-request [`ChunkEvent`]s.
-/// Reads each global column fully from `data` (order must match Python's
-/// `push_generation`), then distributes it per request using the header's length
-/// vectors.
-pub fn decode_batch_frame(body: &[u8]) -> Option<Vec<ChunkEvent>> {
+/// Decode a batch egress frame (tag stripped), invoking `route` with each
+/// request's [`ChunkEvent`] **as it is decoded** — one pass, no intermediate
+/// `Vec<ChunkEvent>` and no whole-column buffers. Each request reads its own
+/// slice straight from `data` via per-column byte cursors, so peak extra memory
+/// is one request (routing overlaps decode). Returns `false` on a malformed
+/// frame (nothing routed). Column order must match Python's `push_generation`.
+pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> bool {
     if body.len() < 4 {
-        return None;
+        return false;
     }
     let hlen = u32::from_le_bytes([body[0], body[1], body[2], body[3]]) as usize;
-    let header = body.get(4..4 + hlen)?;
+    let Some(header) = body.get(4..4 + hlen) else {
+        return false;
+    };
     let data = &body[4 + hlen..];
-    let h: BatchHeader = rmp_serde::from_slice(header).ok()?;
+    let Ok(h) = rmp_serde::from_slice::<BatchHeader>(header) else {
+        return false;
+    };
 
     let n = h.rids.len();
     let sum = |v: &[u32]| v.iter().map(|&x| x as usize).sum::<usize>();
-    let mut off = 0usize;
-    // Global columns, in the exact order Python concatenates them.
-    let ids_all = take_i32(data, &mut off, sum(&h.tok_lens));
-    let out_lp_val_all = take_f32(data, &mut off, sum(&h.out_lp_lens));
-    let out_lp_idx_all = take_i32(data, &mut off, sum(&h.out_lp_lens));
-    let in_lp_val_all = take_f32(data, &mut off, sum(&h.in_lp_lens));
-    let in_lp_idx_all = take_i32(data, &mut off, sum(&h.in_lp_lens));
-    let out_top_val_all = take_f32(data, &mut off, sum(&h.out_top_poslens));
-    let out_top_idx_all = take_i32(data, &mut off, sum(&h.out_top_poslens));
-    let in_top_val_all = take_f32(data, &mut off, sum(&h.in_top_poslens));
-    let in_top_idx_all = take_i32(data, &mut off, sum(&h.in_top_poslens));
-    let out_tid_val_all = take_f32(data, &mut off, sum(&h.out_tid_poslens));
-    let out_tid_idx_all = take_i32(data, &mut off, sum(&h.out_tid_poslens));
-    let in_tid_val_all = take_f32(data, &mut off, sum(&h.in_tid_poslens));
-    let in_tid_idx_all = take_i32(data, &mut off, sum(&h.in_tid_poslens));
-    let hidden_val_all = take_f32(data, &mut off, sum(&h.hidden_poslens));
 
-    // Per-column cursors advanced inside the per-request loop.
-    let (mut c_tok, mut c_olp, mut c_ilp) = (0usize, 0usize, 0usize);
-    let (mut p_ot, mut v_ot) = (0usize, 0usize);
-    let (mut p_it, mut v_it) = (0usize, 0usize);
-    let (mut p_od, mut v_od) = (0usize, 0usize);
-    let (mut p_id, mut v_id) = (0usize, 0usize);
-    let (mut p_h, mut v_h) = (0usize, 0usize);
+    // Per-column byte cursors: each starts at that column's base offset in `data`
+    // (columns are concatenated in this exact order, every element 4 bytes) and
+    // advances per request. No whole-column read.
+    let mut base = 0usize;
+    let mut col = |count: usize| -> usize {
+        let start = base;
+        base += count * 4;
+        start
+    };
+    let mut c_ids = col(sum(&h.tok_lens));
+    let mut c_olp_v = col(sum(&h.out_lp_lens));
+    let mut c_olp_i = col(sum(&h.out_lp_lens));
+    let mut c_ilp_v = col(sum(&h.in_lp_lens));
+    let mut c_ilp_i = col(sum(&h.in_lp_lens));
+    let mut c_ot_v = col(sum(&h.out_top_poslens));
+    let mut c_ot_i = col(sum(&h.out_top_poslens));
+    let mut c_it_v = col(sum(&h.in_top_poslens));
+    let mut c_it_i = col(sum(&h.in_top_poslens));
+    let mut c_od_v = col(sum(&h.out_tid_poslens));
+    let mut c_od_i = col(sum(&h.out_tid_poslens));
+    let mut c_id_v = col(sum(&h.in_tid_poslens));
+    let mut c_id_i = col(sum(&h.in_tid_poslens));
+    let mut c_h_v = col(sum(&h.hidden_poslens));
 
-    let mut events = Vec::with_capacity(n);
+    // Position cursors into the header's per-request `poslens` (ragged + hidden).
+    let (mut p_ot, mut p_it, mut p_od, mut p_id, mut p_h) =
+        (0usize, 0usize, 0usize, 0usize, 0usize);
+    let lens_i = |v: &[u32], i: usize| v.get(i).copied().unwrap_or(0) as usize;
+
     for i in 0..n {
-        let tl = h.tok_lens.get(i).copied().unwrap_or(0) as usize;
-        let te = (c_tok + tl).min(ids_all.len());
-        let token_ids = ids_all[c_tok.min(te)..te].to_vec();
-        c_tok = te;
-
-        let (out_lp_val, out_lp_idx) = take_flat(
-            &out_lp_val_all,
-            &out_lp_idx_all,
-            &h.out_lp_lens,
-            i,
-            &mut c_olp,
-        );
+        let token_ids = take_i32(data, &mut c_ids, lens_i(&h.tok_lens, i));
+        let (out_lp_val, out_lp_idx) =
+            take_flat(data, &mut c_olp_v, &mut c_olp_i, lens_i(&h.out_lp_lens, i));
         let (in_lp_val, in_lp_idx) =
-            take_flat(&in_lp_val_all, &in_lp_idx_all, &h.in_lp_lens, i, &mut c_ilp);
+            take_flat(data, &mut c_ilp_v, &mut c_ilp_i, lens_i(&h.in_lp_lens, i));
         let (out_top_val, out_top_idx, out_top_lens) = take_ragged(
-            &out_top_val_all,
-            &out_top_idx_all,
+            data,
+            &mut c_ot_v,
+            &mut c_ot_i,
             &h.out_top_poslens,
-            &h.out_top_reqlens,
-            i,
             &mut p_ot,
-            &mut v_ot,
+            lens_i(&h.out_top_reqlens, i),
         );
         let (in_top_val, in_top_idx, in_top_lens) = take_ragged(
-            &in_top_val_all,
-            &in_top_idx_all,
+            data,
+            &mut c_it_v,
+            &mut c_it_i,
             &h.in_top_poslens,
-            &h.in_top_reqlens,
-            i,
             &mut p_it,
-            &mut v_it,
+            lens_i(&h.in_top_reqlens, i),
         );
         let (out_tid_val, out_tid_idx, out_tid_lens) = take_ragged(
-            &out_tid_val_all,
-            &out_tid_idx_all,
+            data,
+            &mut c_od_v,
+            &mut c_od_i,
             &h.out_tid_poslens,
-            &h.out_tid_reqlens,
-            i,
             &mut p_od,
-            &mut v_od,
+            lens_i(&h.out_tid_reqlens, i),
         );
         let (in_tid_val, in_tid_idx, in_tid_lens) = take_ragged(
-            &in_tid_val_all,
-            &in_tid_idx_all,
+            data,
+            &mut c_id_v,
+            &mut c_id_i,
             &h.in_tid_poslens,
-            &h.in_tid_reqlens,
-            i,
             &mut p_id,
-            &mut v_id,
+            lens_i(&h.in_tid_reqlens, i),
         );
-        // Hidden: ragged val + row lens, no idx column.
         let (hidden_val, hidden_lens) = take_hidden(
-            &hidden_val_all,
+            data,
+            &mut c_h_v,
             &h.hidden_poslens,
-            &h.hidden_reqlens,
-            i,
             &mut p_h,
-            &mut v_h,
+            lens_i(&h.hidden_reqlens, i),
         );
 
-        events.push(ChunkEvent {
+        route(ChunkEvent {
             rid: h.rids[i].clone(),
             token_ids,
             finish_reason: h.finish_reasons.get(i).cloned().flatten(),
@@ -665,7 +638,7 @@ pub fn decode_batch_frame(body: &[u8]) -> Option<Vec<ChunkEvent>> {
             ..Default::default()
         });
     }
-    Some(events)
+    true
 }
 
 /// Frame a control result `[rid, payload]` for the egress ring (tag prepended).
@@ -814,7 +787,8 @@ mod chunk_event_tests {
 
         let framed = frame_egress_batch_cols(&header, &[&data]);
         assert_eq!(framed[0], EGRESS_TAG_BATCH);
-        let events = decode_batch_frame(&framed[1..]).unwrap();
+        let mut events = Vec::new();
+        assert!(for_each_chunk(&framed[1..], |ev| events.push(ev)));
         assert_eq!(events.len(), 3);
         assert_eq!(events[0].rid, "1");
         assert_eq!(events[0].token_ids, vec![10, 11]);
@@ -873,7 +847,8 @@ mod chunk_event_tests {
         data.extend(f(&[0.1, 0.2, 0.3])); // hidden_val (1 row, dim 3)
 
         let framed = frame_egress_batch_cols(&header, &[&data]);
-        let events = decode_batch_frame(&framed[1..]).unwrap();
+        let mut events = Vec::new();
+        assert!(for_each_chunk(&framed[1..], |ev| events.push(ev)));
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].token_ids, vec![10]);
         assert_eq!(events[0].out_lp_val, vec![-0.5, -0.6]);
