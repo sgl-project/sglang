@@ -33,7 +33,7 @@ jobs:
         id: filter
         uses: dorny/paths-filter@v3
         with:
-          # Ignored on pull_request; required on workflow_dispatch, which has no PR base to diff against.
+          # Ignored on pull_request; workflow_dispatch has no PR base without it.
           base: main
           filters: |
             main_package:
@@ -51,12 +51,10 @@ jobs:
     uses: ./.github/workflows/pr-gate.yml
     secrets: inherit
 
-  # ==================== Stage A ==================== #
   stage-a-unit-test-mlx:
     needs: [check-changes, pr-gate]
-    # !cancelled() lets workflow_dispatch reach this job even when pr-gate
-    # skips on the non-PR event; the pull_request path still requires pr-gate
-    # success, so the run-ci label gate stays intact.
+    # !cancelled() lets dispatch past a skipped pr-gate; the pull_request
+    # path still requires pr-gate success, keeping the run-ci gate intact.
     if: |
       !cancelled() && (
         (needs.pr-gate.result == 'success' &&
@@ -112,19 +110,18 @@ jobs:
       - name: Run model-free MLX unit tests
         timeout-minutes: 15
         run: |
-          # Intentionally explicit file list; do not replace with a directory glob.
+          # Explicit file list, intentional. Do not glob: skip guarded tests in
+          # this directory would fake green.
           uv run python -m pytest -v \
             test/registered/unit/hardware_backend/mlx/test_runner_init_contract.py \
             test/registered/unit/hardware_backend/mlx/test_metal_profiler.py \
             test/registered/unit/hardware_backend/mlx/test_attention_patching.py \
             "test/registered/unit/hardware_backend/mlx/test_quantization.py::TestMlxQuantizationOverride"
 
-  # ==================== Stage B ==================== #
   stage-b-e2e-test-mlx:
     needs: [check-changes, pr-gate]
-    # Inert until the self-hosted Apple Silicon runner registers and #29440
-    # merges; until then only a workflow_dispatch target_stage selects it.
-    # Activation later adds the change-detection terms used by stage a.
+    # Inert until a self hosted Apple Silicon runner registers and #29440
+    # merges. Activate by adding the change detection terms back to if.
     if: |
       !cancelled() && inputs.target_stage == 'stage-b-e2e-test-mlx'
     runs-on: [self-hosted, macOS, ARM64]
@@ -157,8 +154,7 @@ jobs:
           uv pip install -e "python[srt_mps]"
           uv pip install pytest
 
-      # Models: mlx-community Qwen1.5-MoE-A2.7B-Chat-4bit and Qwen3-30B-A3B-4bit;
-      # needs a warm HF cache or network, and roughly 24 GB of unified memory.
+      # Needs a warm HF cache or network and roughly 24 GB of unified memory.
       - name: Run MLX e2e smoke tests
         timeout-minutes: 90
         run: |
