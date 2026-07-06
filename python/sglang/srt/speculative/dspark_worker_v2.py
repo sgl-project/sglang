@@ -259,7 +259,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             target_layer_ids = [
                 int(x) for x in list(getattr(self._draft_inner, "target_layer_ids", []))
             ]
-            decoder_layer_ids = [x - 1 for x in target_layer_ids]
+            decoder_layer_ids = list(target_layer_ids)
             compress_ratios = list(getattr(config, "compress_ratios", []) or [])
             draft_config_compress_ratios = compress_ratios[
                 int(getattr(config, "num_hidden_layers", 0)) :
@@ -1249,7 +1249,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         target_layer_ids = list(getattr(self._draft_inner, "target_layer_ids", []) or [])
         hidden_size = int(getattr(self._draft_inner, "hidden_size", 0))
         raw = raw_hidden_rows.detach()
-        decoder_layer_ids = [int(layer_id) - 1 for layer_id in target_layer_ids]
+        decoder_layer_ids = [int(layer_id) for layer_id in target_layer_ids]
         payload = {
             "target_layer_ids": [int(x) for x in target_layer_ids],
             "decoder_layer_ids": decoder_layer_ids,
