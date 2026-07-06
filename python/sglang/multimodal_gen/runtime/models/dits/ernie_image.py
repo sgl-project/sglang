@@ -19,6 +19,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 
+from sglang.jit_kernel.diffusion.residual_gate_add import (
+    can_use_residual_gate_add_cuda,
+    residual_gate_add_cuda,
+)
 from sglang.multimodal_gen.configs.models.dits.ernie_image import (
     ErnieImageDitConfig,
 )
@@ -149,15 +153,11 @@ def _ernie_residual_gate_add(
 ) -> torch.Tensor:
     global _ERNIE_RESIDUAL_GATE_ADD_DISABLED
 
-    if not _ERNIE_RESIDUAL_GATE_ADD_DISABLED:
+    if not _ERNIE_RESIDUAL_GATE_ADD_DISABLED and can_use_residual_gate_add_cuda(
+        residual, update, gate
+    ):
         try:
-            from sglang.jit_kernel.diffusion.residual_gate_add import (
-                can_use_residual_gate_add_cuda,
-                residual_gate_add_cuda,
-            )
-
-            if can_use_residual_gate_add_cuda(residual, update, gate):
-                return residual_gate_add_cuda(residual, update, gate)
+            return residual_gate_add_cuda(residual, update, gate)
         except Exception as exc:
             if torch.compiler.is_compiling():
                 raise
