@@ -1982,8 +1982,10 @@ class DSparkWorkerV2(BaseSpecWorker):
             row_hidden_abs_mean = hidden_abs_mean[
                 row_idx, :draft_limit
             ].detach().cpu()
-            expected_hidden_l2 = float(int(self._draft_inner.hidden_size) ** 0.5)
-            row_hidden_l2_ratio = row_hidden_norm / expected_hidden_l2
+            norm_weight = self._draft_inner.shared_head.norm.weight.detach().float()
+            norm_weight_l2 = float(norm_weight.norm().detach().cpu())
+            norm_weight_abs_mean = float(norm_weight.abs().mean().detach().cpu())
+            row_hidden_l2_ratio = row_hidden_norm / max(norm_weight_l2, 1e-6)
             row_hidden_cos_adjacent = (
                 hidden_cos_adjacent[row_idx, : max(draft_limit - 1, 0)]
                 .detach()
@@ -2088,13 +2090,14 @@ class DSparkWorkerV2(BaseSpecWorker):
                     "vanilla_markov_bias_depends_only_on_prev_token; hidden only "
                     "affects Markov refine through base logits"
                 ),
-                "expected_post_norm_hidden_l2": expected_hidden_l2,
+                "post_norm_weight_l2": norm_weight_l2,
+                "post_norm_weight_abs_mean": norm_weight_abs_mean,
                 "base_top1_first": [int(x) for x in row_base.tolist()],
                 "base_top1_logit_first": [
                     float(x) for x in row_base_top1_logit.tolist()
                 ],
                 "hidden_norm_first": [float(x) for x in row_hidden_norm.tolist()],
-                "hidden_l2_ratio_to_expected_first": [
+                "hidden_l2_ratio_to_norm_weight_first": [
                     float(x) for x in row_hidden_l2_ratio.tolist()
                 ],
                 "hidden_abs_mean_first": [
