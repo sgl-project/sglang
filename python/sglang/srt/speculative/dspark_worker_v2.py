@@ -1982,6 +1982,8 @@ class DSparkWorkerV2(BaseSpecWorker):
             row_hidden_abs_mean = hidden_abs_mean[
                 row_idx, :draft_limit
             ].detach().cpu()
+            expected_hidden_l2 = float(int(self._draft_inner.hidden_size) ** 0.5)
+            row_hidden_l2_ratio = row_hidden_norm / expected_hidden_l2
             row_hidden_cos_adjacent = (
                 hidden_cos_adjacent[row_idx, : max(draft_limit - 1, 0)]
                 .detach()
@@ -2076,11 +2078,25 @@ class DSparkWorkerV2(BaseSpecWorker):
                     "block_hidden[i] and maps to candidate[i+1]; DeepSpec verify "
                     "stride is anchor + draft_width"
                 ),
+                "hidden_semantics": (
+                    "post_norm_head_hidden; DeepSpec returns norm(hidden), while "
+                    "vLLM DSV4 returns pre-norm hc_head hidden but computes base "
+                    "logits as lm_head(norm(hidden))"
+                ),
+                "base_logits_semantics": "lm_head(post_norm_head_hidden)",
+                "markov_semantics": (
+                    "vanilla_markov_bias_depends_only_on_prev_token; hidden only "
+                    "affects Markov refine through base logits"
+                ),
+                "expected_post_norm_hidden_l2": expected_hidden_l2,
                 "base_top1_first": [int(x) for x in row_base.tolist()],
                 "base_top1_logit_first": [
                     float(x) for x in row_base_top1_logit.tolist()
                 ],
                 "hidden_norm_first": [float(x) for x in row_hidden_norm.tolist()],
+                "hidden_l2_ratio_to_expected_first": [
+                    float(x) for x in row_hidden_l2_ratio.tolist()
+                ],
                 "hidden_abs_mean_first": [
                     float(x) for x in row_hidden_abs_mean.tolist()
                 ],
