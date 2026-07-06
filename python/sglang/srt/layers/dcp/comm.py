@@ -198,6 +198,13 @@ def all_gather_kv_cache_for_mha_extend(
         [kv_a.shape[-1], k_pe.shape[-1]], dim=-1
     )
     prefix_kv_a = prefix_kv_a.squeeze(1)
+    # fp8 KV cache: the gathered prefix is fp8 (from the pool) while the current
+    # extend kv_a/k_pe are bf16 — torch.cat below cannot promote fp8+bf16, so
+    # align dtypes (dequantize the fp8 prefix; exact for the scale=1.0 default).
+    if prefix_kv_a.dtype != kv_a.dtype:
+        prefix_kv_a = prefix_kv_a.to(kv_a.dtype)
+    if prefix_k_pe.dtype != k_pe.dtype:
+        prefix_k_pe = prefix_k_pe.to(k_pe.dtype)
     # re-organize kv with query orders
     prefix_lens_cu = torch.zeros(
         len(seq_lens) + 1,
