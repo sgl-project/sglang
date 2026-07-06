@@ -1,18 +1,36 @@
 from __future__ import annotations
 
+import logging
 import math
+from collections import defaultdict
 from enum import IntEnum
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
+from sglang.srt.hardware_backend.npu.dsv4.dsv4_allocator import (
+    alloc_paged_token_slots_extend_npu,
+)
+from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
+    maybe_build_dsv4_verify_bundle,
+)
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
     alloc_token_slots,
     get_alloc_reserve_per_decode,
     get_last_loc,
 )
-from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu
+from sglang.srt.speculative.triton_ops.spec_tree import (
+    sgl_build_tree_kernel_efficient_triton,
+    verify_tree_greedy_kernel_triton,
+)
+from sglang.srt.utils import (
+    is_cuda,
+    is_hip,
+    is_musa,
+    is_npu,
+    is_xpu,
+)
 from sglang.srt.utils.async_probe import maybe_detect_oob
 
 if TYPE_CHECKING:
@@ -27,11 +45,22 @@ _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_musa = is_musa()
+_is_xpu = is_xpu()
+
+logger = logging.getLogger(__name__)
 
 if _is_cuda or _is_hip or _is_musa:
     from sgl_kernel import (
         build_tree_kernel_efficient as sgl_build_tree_kernel_efficient,
     )
+
+
+ALLOC_EXTEND_FUNCS = defaultdict(
+    lambda: alloc_paged_token_slots_extend,
+    {
+        "npu": alloc_paged_token_slots_extend_npu,
+    },
+)
 
 
 def per_step_draft_out_cache_loc(
@@ -199,6 +228,21 @@ def build_tree_kernel_efficient(
             num_verify_tokens,
             tree_mask_mode,
         )
+    elif _is_xpu:
+        sgl_build_tree_kernel_triton(
+            parent_list,
+            top_scores_index,
+            seq_lens,
+            tree_mask,
+            positions,
+            retrieve_index,
+            retrieve_next_token,
+            retrieve_next_sibling,
+            topk,
+            spec_steps,
+            num_verify_tokens,
+            tree_mask_mode,
+        )
     else:
         sgl_build_tree_kernel_efficient(
             parent_list,
@@ -221,6 +265,88 @@ def build_tree_kernel_efficient(
         retrieve_next_token,
         retrieve_next_sibling,
         draft_tokens,
+    )
+
+
+def sgl_build_tree_kernel_triton(
+    parent_list: torch.Tensor,
+    selected_index: torch.Tensor,
+    verified_seq_len: torch.Tensor,
+    tree_mask: torch.Tensor,
+    positions: torch.Tensor,
+    retrieve_index: torch.Tensor,
+    retrieve_next_token: torch.Tensor,
+    retrieve_next_sibling: torch.Tensor,
+    topk: int,
+    depth: int,
+    draft_token_num: int,
+    tree_mask_mode: TreeMaskMode = TreeMaskMode.FULL_MASK,
+):
+    """Triton-based implementation."""
+    # TODO: Add support for QLEN_ONLY_BITPACKING mode
+    if tree_mask_mode == TreeMaskMode.QLEN_ONLY_BITPACKING:
+        raise NotImplementedError(
+            "QLEN_ONLY_BITPACKING is not supported in Triton implementation"
+        )
+
+    batch_size = verified_seq_len.shape[0]
+    seq_len_prefix_sum = torch.cumsum(verified_seq_len, dim=0) - verified_seq_len
+
+    # Launch kernel with one program per batch item
+    grid = (batch_size,)
+
+    sgl_build_tree_kernel_efficient_triton[grid](
+        parent_list,
+        selected_index,
+        verified_seq_len,
+        seq_len_prefix_sum,
+        tree_mask,
+        positions,
+        retrieve_index,
+        retrieve_next_token,
+        retrieve_next_sibling,
+        topk=topk,
+        depth=depth,
+        draft_token_num=draft_token_num,
+        tree_mask_mode=int(tree_mask_mode),
+        batch_size=batch_size,
+        parent_list_stride=(
+            parent_list.stride(0) if parent_list.dim() > 1 else parent_list.shape[0]
+        ),
+        selected_index_stride=selected_index.stride(0),
+    )
+
+
+def verify_tree_greedy_triton(
+    predicts: torch.Tensor,
+    accept_index: torch.Tensor,
+    accept_token_num: torch.Tensor,
+    candidates: torch.Tensor,
+    retrieve_index: torch.Tensor,
+    retrieve_next_token: torch.Tensor,
+    retrieve_next_sibling: torch.Tensor,
+    target_predict: torch.Tensor,
+):
+    """Triton-based implementation."""
+    batch_size = candidates.shape[0]
+    num_speculative_tokens = accept_index.shape[1]
+    num_draft_tokens = candidates.shape[1]
+
+    # Launch kernel with one program per batch item
+    grid = (batch_size,)
+
+    verify_tree_greedy_kernel_triton[grid](
+        predicts,
+        accept_index,
+        accept_token_num,
+        candidates,
+        retrieve_index,
+        retrieve_next_token,
+        retrieve_next_sibling,
+        target_predict,
+        batch_size=batch_size,
+        num_speculative_tokens=num_speculative_tokens,
+        num_draft_tokens=num_draft_tokens,
     )
 
 
@@ -262,6 +388,17 @@ def verify_tree_greedy_func(
             retrive_index=retrieve_index,
             retrive_next_token=retrieve_next_token,
             retrive_next_sibling=retrieve_next_sibling,
+            target_predict=target_predict,
+        )
+    elif _is_xpu:
+        verify_tree_greedy_triton(
+            predicts=predicts,
+            accept_index=accept_index,
+            accept_token_num=accept_token_num,
+            candidates=candidates,
+            retrieve_index=retrieve_index,
+            retrieve_next_token=retrieve_next_token,
+            retrieve_next_sibling=retrieve_next_sibling,
             target_predict=target_predict,
         )
     return predicts, accept_index, accept_token_num
@@ -355,6 +492,10 @@ def eagle_prepare_for_verify(
             device=device,
         )
 
+        batch.out_cache_loc_dsv4 = maybe_build_dsv4_verify_bundle(
+            batch, verify_input.draft_token_num
+        )
+
         prepare_mamba_track_for_verify(batch)
 
         # TBO's split_spec_info reads these; no-verify-sync leaves both None.
@@ -417,6 +558,7 @@ def eagle_sample(
     from sglang.srt.server_args import get_global_server_args
     from sglang.srt.speculative.spec_utils import (
         SIMULATE_ACC_LEN,
+        SIMULATE_ACC_TOKEN_MODE,
         generate_simulated_accept_index,
     )
     from sglang.srt.utils.async_probe import maybe_detect_nan, sanitize_nan_logits
@@ -474,7 +616,8 @@ def eagle_sample(
     num_correct_drafts = torch.empty((bs,), dtype=torch.int32, device=device)
 
     # Sample tokens
-    if sampling_info.is_all_greedy or _is_npu or _is_hip:
+    target_predict = None
+    if sampling_info.is_all_greedy or _is_npu or _is_hip or _is_xpu:
         target_predict = torch.argmax(next_token_logits, dim=-1)
         target_predict = target_predict.reshape(bs, verify_input.draft_token_num)
         predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
@@ -588,11 +731,33 @@ def eagle_sample(
         # Do simulation. The helper builds (and returns) a replacement
         # accept_index of width spec_steps + 1, so pass max_tree_depth - 1
         # to keep the simulated width identical to the real one.
+        if SIMULATE_ACC_TOKEN_MODE not in ("fixed", "real-draft-token"):
+            raise ValueError(
+                "Invalid SGLANG_SIMULATE_ACC_TOKEN_MODE "
+                f"{SIMULATE_ACC_TOKEN_MODE!r}; expected 'fixed' or "
+                "'real-draft-token'."
+            )
+
+        if SIMULATE_ACC_TOKEN_MODE == "real-draft-token":
+            if verify_input.tree_topk != 1:
+                raise ValueError(
+                    "SGLANG_SIMULATE_ACC_LEN with real draft tokens currently "
+                    "requires speculative_eagle_topk=1."
+                )
+
+            # Use target argmax as the synthetic bonus for non-greedy requests.
+            if target_predict is None:
+                target_predict = torch.argmax(next_token_logits, dim=-1).reshape(
+                    bs, verify_input.draft_token_num
+                )
         accept_index = generate_simulated_accept_index(
             accept_index=accept_index,
             predict=predict,  # mutable
             num_correct_drafts=num_correct_drafts,  # mutable
+            candidates=candidates,
+            target_predict=target_predict,
             simulate_acc_len=SIMULATE_ACC_LEN,
+            simulate_acc_token_mode=SIMULATE_ACC_TOKEN_MODE,
             bs=bs,
             spec_steps=verify_input.max_tree_depth - 1,
         )
@@ -663,7 +828,8 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
             batch.req_pool_indices,
             cur_kv_lens_device,
         )
-        out_cache_loc = alloc_paged_token_slots_extend(
+        device_type = getattr(batch.device, "type", str(batch.device).split(":", 1)[0])
+        out_cache_loc = ALLOC_EXTEND_FUNCS[device_type](
             batch.tree_cache,
             cur_kv_lens_device,
             cur_kv_lens_cpu,
@@ -671,8 +837,9 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
             nxt_kv_lens_cpu,
             last_loc,
             num_needed_tokens,
+            req_pool_indices=batch.req_pool_indices,
+            batch=batch,
         )
-
     assign_req_to_token_pool_func(
         batch.req_pool_indices,
         batch.req_to_token_pool.req_to_token,

@@ -71,6 +71,42 @@ class TestPrepareServerArgs(CustomTestCase):
             os.unlink(config_file)
 
 
+class TestMambaCacheStochasticRounding(unittest.TestCase):
+    def test_rejects_fp32_ssm_cache(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            mamba_ssm_dtype="float32",
+            enable_mamba_cache_stochastic_rounding=True,
+        )
+
+        with self.assertRaisesRegex(ValueError, "--mamba-ssm-dtype float16"):
+            server_args._handle_mamba_backend()
+
+    @patch("sglang.srt.server_args.is_cuda", return_value=False)
+    def test_rejects_non_cuda(self, _mock_is_cuda):
+        server_args = ServerArgs(
+            model_path="dummy",
+            mamba_ssm_dtype="float16",
+            enable_mamba_cache_stochastic_rounding=True,
+        )
+
+        with self.assertRaisesRegex(ValueError, "NVIDIA CUDA"):
+            server_args._handle_mamba_backend()
+
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    @patch("sglang.srt.server_args.is_sm100_supported", return_value=False)
+    def test_rejects_triton_without_sm100(self, _mock_sm100, _mock_is_cuda):
+        server_args = ServerArgs(
+            model_path="dummy",
+            mamba_ssm_dtype="float16",
+            mamba_backend="triton",
+            enable_mamba_cache_stochastic_rounding=True,
+        )
+
+        with self.assertRaisesRegex(ValueError, "requires SM100"):
+            server_args._handle_mamba_backend()
+
+
 class TestLoadBalanceMethod(unittest.TestCase):
     def test_non_pd_defaults_to_round_robin(self):
         server_args = ServerArgs(model_path="dummy", disaggregation_mode="null")
@@ -148,47 +184,75 @@ class TestLoadBalanceMethod(unittest.TestCase):
 
 
 class TestHiSparseDsaBackendPolicy(unittest.TestCase):
+    # The backend selection moved to the resolution pipeline; these policy
+    # tests drive the pass through its read-only view.
+    @staticmethod
+    def _resolve(kv_cache_dtype, **kw):
+        from types import SimpleNamespace
+
+        from sglang.srt.arg_groups.overrides import (
+            ResolvedView,
+            _dsa_split_backend_resolution,
+        )
+
+        hf = SimpleNamespace(architectures=["DeepseekV32ForCausalLM"])
+        defaults = dict(
+            kv_cache_dtype=kv_cache_dtype,
+            dsa_prefill_backend=None,
+            dsa_decode_backend=None,
+            enable_hisparse=True,
+        )
+        defaults.update(kw)
+        view = ResolvedView(
+            SimpleNamespace(
+                get_model_config=lambda: SimpleNamespace(hf_config=hf), **defaults
+            )
+        )
+        with (
+            patch("sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True),
+            patch("sglang.srt.arg_groups.overrides.is_npu", return_value=False),
+            patch("sglang.srt.arg_groups.overrides.is_xpu", return_value=False),
+            patch("torch.cuda.get_device_capability", return_value=(9, 0)),
+        ):
+            declared = _dsa_split_backend_resolution(view)
+        return {
+            "dsa_prefill_backend": declared.get(
+                "dsa_prefill_backend", defaults["dsa_prefill_backend"]
+            ),
+            "dsa_decode_backend": declared.get(
+                "dsa_decode_backend", defaults["dsa_decode_backend"]
+            ),
+        }
+
     @patch("sglang.srt.server_args.is_hip", return_value=False)
     def test_hisparse_defaults_to_flashmla_sparse_on_cuda_bfloat16(self, _mock_is_hip):
-        server_args = ServerArgs(model_path="dummy", enable_hisparse=True)
+        resolved = self._resolve("bfloat16")
 
-        server_args._set_default_dsa_backends(kv_cache_dtype="bfloat16", major=9)
-
-        self.assertEqual(server_args.dsa_prefill_backend, "flashmla_sparse")
-        self.assertEqual(server_args.dsa_decode_backend, "flashmla_sparse")
+        self.assertEqual(resolved["dsa_prefill_backend"], "flashmla_sparse")
+        self.assertEqual(resolved["dsa_decode_backend"], "flashmla_sparse")
 
     @patch("sglang.srt.server_args.is_hip", return_value=False)
     def test_hisparse_defaults_to_flashmla_kv_on_cuda_fp8(self, _mock_is_hip):
-        server_args = ServerArgs(model_path="dummy", enable_hisparse=True)
+        resolved = self._resolve("fp8_e4m3")
 
-        server_args._set_default_dsa_backends(kv_cache_dtype="fp8_e4m3", major=9)
-
-        self.assertEqual(server_args.dsa_prefill_backend, "flashmla_kv")
-        self.assertEqual(server_args.dsa_decode_backend, "flashmla_kv")
+        self.assertEqual(resolved["dsa_prefill_backend"], "flashmla_kv")
+        self.assertEqual(resolved["dsa_decode_backend"], "flashmla_kv")
 
     @patch("sglang.srt.server_args.is_hip", return_value=True)
     def test_hisparse_defaults_to_tilelang_on_rocm(self, _mock_is_hip):
-        server_args = ServerArgs(model_path="dummy", enable_hisparse=True)
+        resolved = self._resolve("bfloat16")
 
-        server_args._set_default_dsa_backends(kv_cache_dtype="bfloat16", major=9)
-
-        self.assertEqual(server_args.dsa_prefill_backend, "tilelang")
-        self.assertEqual(server_args.dsa_decode_backend, "tilelang")
+        self.assertEqual(resolved["dsa_prefill_backend"], "tilelang")
+        self.assertEqual(resolved["dsa_decode_backend"], "tilelang")
 
     @patch("sglang.srt.server_args.is_hip", return_value=True)
     def test_hisparse_preserves_rocm_user_backend_and_defaults_missing_side(
         self, _mock_is_hip
     ):
-        server_args = ServerArgs(
-            model_path="dummy",
-            enable_hisparse=True,
-            dsa_prefill_backend="tilelang",
-        )
+        resolved = self._resolve("bfloat16", dsa_prefill_backend="tilelang")
 
-        server_args._set_default_dsa_backends(kv_cache_dtype="bfloat16", major=9)
-
-        self.assertEqual(server_args.dsa_prefill_backend, "tilelang")
-        self.assertEqual(server_args.dsa_decode_backend, "tilelang")
+        self.assertEqual(resolved["dsa_prefill_backend"], "tilelang")
+        self.assertEqual(resolved["dsa_decode_backend"], "tilelang")
 
     @patch("sglang.srt.server_args.is_hip", return_value=True)
     def test_hisparse_accepts_aiter_backend_on_rocm(self, _mock_is_hip):
@@ -275,7 +339,7 @@ class TestFa4PageSizeAutoForce(CustomTestCase):
         args.model_config.hf_config.dual_chunk_attention_config = None
         return args
 
-    @patch("sglang.srt.server_args.is_sm100_supported", return_value=True)
+    @patch("sglang.srt.arg_groups.overrides.is_sm100_supported", return_value=True)
     @patch("sglang.srt.server_args.ServerArgs.use_mla_backend", return_value=False)
     def test_combined_attention_backend_fa4_forces_page_size_128(
         self, _mock_mla, _mock_sm100
@@ -287,7 +351,7 @@ class TestFa4PageSizeAutoForce(CustomTestCase):
 
         self.assertEqual(args.page_size, 128)
 
-    @patch("sglang.srt.server_args.is_sm100_supported", return_value=True)
+    @patch("sglang.srt.arg_groups.overrides.is_sm100_supported", return_value=True)
     @patch("sglang.srt.server_args.ServerArgs.use_mla_backend", return_value=False)
     def test_explicit_prefill_fa4_forces_page_size_128(self, _mock_mla, _mock_sm100):
         # `--prefill-attention-backend fa4`: the previously-covered path.

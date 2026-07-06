@@ -125,6 +125,8 @@ do
         --speculative-num-steps 1 \
         --speculative-eagle-topk 1 \
         --speculative-num-draft-tokens 2 \
+        --reasoning-parser deepseek-v3 \
+        --tool-call-parser deepseekv32 \
         --trust-remote-code \
         --attention-backend ascend \
         --device npu
@@ -168,7 +170,7 @@ do
         --chunked-prefill-size -1 \
         --max-prefill-tokens 68000 \
         --max-running-requests 32 \
-        --cuda-graph-max-bs 4 \
+        --cuda-graph-max-bs-decode 4 \
         --moe-a2a-backend deepep \
         --deepep-mode low_latency \
         --quantization modelslim \
@@ -177,6 +179,8 @@ do
         --speculative-eagle-topk 1 \
         --speculative-num-draft-tokens 4 \
         --disaggregation-transfer-backend ascend \
+        --reasoning-parser deepseek-v3 \
+        --tool-call-parser deepseekv32 \
         --trust-remote-code \
         --attention-backend ascend \
         --device npu
@@ -320,6 +324,8 @@ do
         --speculative-num-steps 1 \
         --speculative-eagle-topk 1 \
         --speculative-num-draft-tokens 2 \
+        --reasoning-parser deepseek-v3 \
+        --tool-call-parser deepseekv32 \
         --trust-remote-code \
         --attention-backend ascend \
         --device npu
@@ -363,7 +369,7 @@ do
         --chunked-prefill-size -1 \
         --max-prefill-tokens 68000 \
         --max-running-requests 32 \
-        --cuda-graph-max-bs 4 \
+        --cuda-graph-max-bs-decode 4 \
         --moe-a2a-backend deepep \
         --deepep-mode low_latency \
         --quantization modelslim \
@@ -372,6 +378,8 @@ do
         --speculative-eagle-topk 1 \
         --speculative-num-draft-tokens 4 \
         --disaggregation-transfer-backend ascend \
+        --reasoning-parser deepseek-v3 \
+        --tool-call-parser deepseekv32 \
         --trust-remote-code \
         --attention-backend ascend \
         --device npu
@@ -515,6 +523,8 @@ do
         --speculative-num-steps 1 \
         --speculative-eagle-topk 1 \
         --speculative-num-draft-tokens 2 \
+        --reasoning-parser deepseek-v3 \
+        --tool-call-parser deepseekv32 \
         --trust-remote-code \
         --attention-backend ascend \
         --device npu
@@ -558,7 +568,7 @@ do
         --chunked-prefill-size -1 \
         --max-prefill-tokens 68000 \
         --max-running-requests 32 \
-        --cuda-graph-max-bs 4 \
+        --cuda-graph-max-bs-decode 4 \
         --moe-a2a-backend deepep \
         --deepep-mode low_latency \
         --quantization modelslim \
@@ -567,6 +577,8 @@ do
         --speculative-eagle-topk 1 \
         --speculative-num-draft-tokens 4 \
         --disaggregation-transfer-backend ascend \
+        --reasoning-parser deepseek-v3 \
+        --tool-call-parser deepseekv32 \
         --trust-remote-code \
         --attention-backend ascend \
         --device npu
