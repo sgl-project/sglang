@@ -1,5 +1,5 @@
 import os
-from typing import List
+from typing import List, Optional
 
 import torch
 
@@ -241,9 +241,11 @@ def transfer_kv_per_layer_mla(
     src_indices: torch.Tensor,
     dst_indices: torch.Tensor,
     item_size: int,
-    block_quota: int = _default_mla_block_quota(),
+    block_quota: Optional[int] = None,
     num_warps_per_block: int = 16 if _is_hip else 32,
 ):
+    if block_quota is None:
+        block_quota = _default_mla_block_quota()
     torch.ops.sgl_kernel.transfer_kv_per_layer_mla.default(
         src,
         dst,
@@ -263,9 +265,11 @@ def transfer_kv_per_layer_mla_pf_lf(
     layer_id: int,
     item_size: int,
     src_layout_dim: int,
-    block_quota: int = _default_mla_block_quota(),
+    block_quota: Optional[int] = None,
     num_warps_per_block: int = 16 if _is_hip else 32,
 ):
+    if block_quota is None:
+        block_quota = _default_mla_block_quota()
     torch.ops.sgl_kernel.transfer_kv_per_layer_mla_pf_lf.default(
         src,
         dst,
