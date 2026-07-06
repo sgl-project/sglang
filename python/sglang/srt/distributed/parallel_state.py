@@ -2129,11 +2129,6 @@ def initialize_model_parallel(
             logger.info(
                 f"DCP enabled, dcp_size={decode_context_parallel_size}, tp_size={tensor_model_parallel_size}"
             )
-    else:
-        if get_tensor_model_parallel_rank() == 0:
-            logger.info(
-                f"DCP disabled, dcp_size={decode_context_parallel_size}, tp_size={tensor_model_parallel_size}"
-            )
 
     attn_dp_size = attention_data_parallel_size
     attn_cp_size = attention_context_model_parallel_size
