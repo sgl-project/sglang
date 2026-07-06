@@ -105,6 +105,11 @@ class CuteDSLKDAKernel(LinearAttnKernelBase):
         lower_bound: Optional[float] = None,
         **kwargs,
     ) -> torch.Tensor:
+        assert not kwargs.get("output_intermediate_states"), (
+            "KDA extra_buffer prefix-cache tracking requires the Triton prefill "
+            "backend (only chunk_kda exposes the intermediate SSM state); "
+            "the cutedsl fused kernel does not. Use --linear-attn-backend triton."
+        )
         head_k_dim = k.shape[-1]
         self._ensure_extend_loaded(head_k_dim)
 

@@ -991,6 +991,11 @@ _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
         "GraniteMoeHybridForCausalLM",
         "NemotronHForCausalLM",
         "NemotronHPuzzleForCausalLM",
+        # KDA (Kimi Delta Attention) exposes the per-chunk-boundary intermediate
+        # SSM state via the Triton chunk_kda prefill path, so the KDA attention
+        # backend can track it for extra_buffer prefix caching. The fused
+        # cutedsl / FlashKDA kernels do not, hence the triton-backend guard below.
+        "KimiLinearForCausalLM",
     }
 )
 

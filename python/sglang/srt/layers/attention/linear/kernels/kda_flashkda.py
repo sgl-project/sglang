@@ -113,6 +113,11 @@ class FlashKDAKernel(LinearAttnKernelBase):
         is_spec_decode: bool = False,
         **kwargs,
     ) -> torch.Tensor:
+        assert not kwargs.get("output_intermediate_states"), (
+            "KDA extra_buffer prefix-cache tracking requires the Triton prefill "
+            "backend (only chunk_kda exposes the intermediate SSM state); "
+            "the FlashKDA fused kernel does not. Use --linear-attn-backend triton."
+        )
         if self._should_fall_back(
             lower_bound, is_spec_decode, query_start_loc, extend_seq_lens_cpu
         ):
