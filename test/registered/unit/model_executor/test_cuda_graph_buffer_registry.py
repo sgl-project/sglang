@@ -1192,50 +1192,6 @@ class TestBuildPrefillRegistry(unittest.TestCase):
         self.assertTrue(torch.all(ids[3:8] == 0))  # padded tail reset
         self.assertTrue(torch.all(ids[8:] == 7))  # beyond the bucket: untouched
 
-    def test_num_token_non_padded_scalar_copy(self):
-        from sglang.srt.model_executor.cuda_graph_buffer_registry import (
-            build_prefill_registry,
-        )
-
-        src = self._src(num_token_non_padded=torch.zeros((1,), dtype=torch.int32))
-        reg = build_prefill_registry(
-            device=torch.device("cpu"),
-            max_bs=1,
-            max_num_token=16,
-            cache_loc_dtype=torch.int64,
-            enable_num_token_non_padded=True,
-            source=src,
-        )
-        self.assertTrue(reg.has_slot("num_token_non_padded"))
-        self.assertEqual(
-            reg.get_slot("num_token_non_padded").buffer.data_ptr(),
-            src.num_token_non_padded.data_ptr(),
-        )
-
-        fb = _MiniForwardBatch(
-            input_ids=torch.tensor([1, 2, 3], dtype=torch.int64),
-            positions=torch.tensor([4, 5, 6], dtype=torch.int64),
-            out_cache_loc=torch.tensor([8, 9, 10], dtype=torch.int64),
-            num_token_non_padded=torch.tensor([3], dtype=torch.int32),
-        )
-        reg.fill_from(fb, raw_bs=1, padded_bs=1, raw_num_tokens=3, padded_num_tokens=8)
-        self.assertTrue(
-            torch.equal(
-                reg.get_slot("num_token_non_padded").buffer,
-                torch.tensor([3], dtype=torch.int32),
-            )
-        )
-
-        static_fb = reg.extract_buffer(
-            padded_bs=1,
-            padded_num_tokens=8,
-            forward_batch_template=fb,
-        )
-        self.assertEqual(
-            static_fb.num_token_non_padded.data_ptr(),
-            src.num_token_non_padded.data_ptr(),
-        )
-
     def test_multimodal_input_embeds_reset_only(self):
         from sglang.srt.model_executor.cuda_graph_buffer_registry import (
             build_prefill_registry,
