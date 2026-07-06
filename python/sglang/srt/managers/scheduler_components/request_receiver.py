@@ -33,6 +33,7 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 
+import os
 import pickle
 
 from sglang.srt.environ import envs
@@ -86,6 +87,12 @@ class SchedulerRequestReceiver:
         if self.recv_skipper is not None:
             if not self.recv_skipper.handle(self.get_last_forward_mode()):
                 return []
+
+        if self._shm_ring_enabled():
+            recv_reqs = self._recv_requests_shm_ring()
+            recv_reqs = self._apply_mm_receiver(recv_reqs)
+            self._finalize_shm_features(recv_reqs)
+            return recv_reqs
 
         if self._raw_frame_fast_path_enabled():
             recv_reqs = self._recv_requests_raw_frames()
@@ -148,22 +155,7 @@ class SchedulerRequestReceiver:
         src = self.tp_group.ranks[0]
 
         if self.tp_group.rank == src:
-            frames: List[bytes] = []
-            while True:
-                try:
-                    if self.recv_limit_reached(len(frames)):
-                        break
-                    frames.append(self.recv_from_tokenizer.recv(zmq.NOBLOCK))
-                except zmq.ZMQError:
-                    break
-            if self.recv_from_rpc is not None:
-                while True:
-                    try:
-                        if self.recv_limit_reached(len(frames)):
-                            break
-                        frames.append(self.recv_from_rpc.recv(zmq.NOBLOCK))
-                    except zmq.ZMQError:
-                        break
+            frames = self._pull_raw_frames()
             broadcast_pyobj_frames(
                 frames, self.tp_group.rank, self.tp_cpu_group, src=src
             )
@@ -172,6 +164,123 @@ class SchedulerRequestReceiver:
                 [], self.tp_group.rank, self.tp_cpu_group, src=src
             )
         return [pickle.loads(f) for f in frames]
+
+    def _pull_raw_frames(self) -> List[bytes]:
+        """Pull raw (still-pickled) ZMQ frames from the tokenizer + rpc sockets."""
+        frames: List[bytes] = []
+        while True:
+            try:
+                if self.recv_limit_reached(len(frames)):
+                    break
+                frames.append(self.recv_from_tokenizer.recv(zmq.NOBLOCK))
+            except zmq.ZMQError:
+                break
+        if self.recv_from_rpc is not None:
+            while True:
+                try:
+                    if self.recv_limit_reached(len(frames)):
+                        break
+                    frames.append(self.recv_from_rpc.recv(zmq.NOBLOCK))
+                except zmq.ZMQError:
+                    break
+        return frames
+
+    # ------------------------------------------------------------------
+    # Experiment C (PROTOTYPE): /dev/shm ring instead of gloo broadcast.
+    # ------------------------------------------------------------------
+    def _shm_ring_enabled(self) -> bool:
+        # PROTOTYPE / UNSAFE for live serving.  Unlike the gloo broadcast, the
+        # shm ring does NOT keep request admission lock-step across TP ranks:
+        # rank 0 writes and continues while peers poll independently, so a peer
+        # may observe a request one iteration later than rank 0.  That breaks the
+        # invariant that every TP rank builds the same batch each step, which can
+        # desync the NCCL forward collectives and hang.  Enabling it requires an
+        # explicit acknowledgement so it can be used only for offline
+        # single-batch micro-timing, never real traffic.
+        if envs.SGLANG_TP_REQ_SHM_RING.get() and not envs.SGLANG_TP_REQ_SHM_RING_ACK_UNSAFE.get():
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "SGLANG_TP_REQ_SHM_RING is set but the ring is unsafe for live "
+                "TP serving (breaks per-iteration request lock-step). Ignoring; "
+                "set SGLANG_TP_REQ_SHM_RING_ACK_UNSAFE=1 to force."
+            )
+            return False
+        return (
+            envs.SGLANG_TP_REQ_SHM_RING.get()
+            and envs.SGLANG_TP_REQ_SHM_RING_ACK_UNSAFE.get()
+            and not self.server_args.enable_dp_attention
+            and self.ps.tp_size != 1
+            and self.input_blocker is None
+            and not (
+                self.ps.pp_rank == 0
+                and self.server_args.language_only
+                and self.server_args.encoder_transfer_backend
+                in ["zmq_to_scheduler", "mooncake"]
+            )
+        )
+
+    def _shm_ring(self):
+        """Lazily create the per-rank ring endpoint, cached module-side (the
+        receiver is a frozen dataclass so it cannot hold mutable state)."""
+        from sglang.srt.managers import tp_req_shm_ring as ring_mod
+
+        src = self.tp_group.ranks[0]
+        # nccl_port is shared by all TP ranks of this server -> stable key.
+        key = f"tpreq-{getattr(self.server_args, 'port', 0)}-{self.ps.tp_size}"
+        cache = getattr(ring_mod, "_ENDPOINT_CACHE", None)
+        if cache is None:
+            cache = ring_mod._ENDPOINT_CACHE = {}
+        if key in cache:
+            return cache[key]
+
+        path = ring_mod.shm_path_for(key)
+        slots = envs.SGLANG_TP_REQ_SHM_RING_SLOTS.get()
+        slot_size = envs.SGLANG_TP_REQ_SHM_RING_SLOT_KB.get() * 1024
+        if self.tp_group.rank == src:
+            ep = ring_mod.TpReqShmRingWriter(path, slots, slot_size)
+        else:
+            # Wait for the writer to create the file.
+            import time
+
+            for _ in range(2000):
+                if os.path.exists(path):
+                    break
+                time.sleep(0.005)
+            ep = ring_mod.TpReqShmRingReader(path)
+        cache[key] = ep
+        return ep
+
+    def _recv_requests_shm_ring(self) -> List:
+        ep = self._shm_ring()
+        src = self.tp_group.ranks[0]
+        if self.tp_group.rank == src:
+            frames = self._pull_raw_frames()
+            if frames:
+                if not ep.write_batch(frames):
+                    # Batch too large for a slot: fall back to gloo for this one.
+                    broadcast_pyobj_frames(
+                        frames, self.tp_group.rank, self.tp_cpu_group, src=src
+                    )
+                    return [pickle.loads(f) for f in frames]
+            return [pickle.loads(f) for f in frames]
+        else:
+            out = ep.poll()
+            if out is None:
+                # Ring overrun: this peer stalled longer than the ring capacity.
+                # Re-snapshot to the current head and log; data for the skipped
+                # window is unrecoverable via shm, so surface it loudly.
+                import logging
+
+                logging.getLogger(__name__).error(
+                    "TP req shm ring overrun on rank %s; re-syncing (some "
+                    "requests may have been missed -- increase "
+                    "SGLANG_TP_REQ_SHM_RING_SLOTS)",
+                    self.tp_group.rank,
+                )
+                ep.last_seq = ep.current_seq()
+                return []
+            return [pickle.loads(f) for f in out]
 
     def _pull_raw_reqs(self) -> Optional[List]:
         if self.ps.pp_rank == 0:
