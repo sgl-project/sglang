@@ -19,11 +19,11 @@
 use bytes::Bytes;
 
 use crate::error::Error;
-use crate::fsm::{Event, ValidationOutcome};
+use crate::fsm::{Event, RequestState, ValidationOutcome};
 use crate::ids::RequestId;
 use crate::message::{
-    EgressItem, GenerateRequest, IngressMsg, Request, RequestKind, TokenizedReqPayload,
-    abort_req_msgpack, control_req_msgpack,
+    EgressItem, IngressMsg, Request, RequestKind, TokenizedReqPayload, abort_req_msgpack,
+    control_req_msgpack,
 };
 use crate::runtime::Runnable;
 use crate::runtime::channels::{DetokMsg, Senders, TmEvent};
@@ -60,8 +60,8 @@ impl Runnable for Ingress {
     fn run(self) {
         while let Ok(ev) = self.rx.recv() {
             match ev {
-                TmEvent::Ingress(req) => self.on_ingress(req),
-                TmEvent::Tokenized(req) => self.on_tokenized(req),
+                // A fresh request and one returning from the tokenizer pool.
+                TmEvent::Ingress(req) | TmEvent::Tokenized(req) => self.drive(req),
                 TmEvent::Abort(id) => self.on_abort(id),
             }
         }
@@ -69,101 +69,141 @@ impl Runnable for Ingress {
 }
 
 impl Ingress {
-    /// Validate a fresh request and route it onto the correct ingress branch.
-    fn on_ingress(&self, mut req: Request) {
-        // Received → Validating, plus payload validation; reject invalid requests.
-        if let Err(e) = validate(&mut req, self.skip_tokenizer_init) {
-            fail(&mut req, e);
-            return;
+    /// Reject a request: → `Failed`, notify the client, deregister (unconditional
+    /// — a no-op when nothing was registered).
+    fn fail(&self, req: &mut Request, err: Error) {
+        let id = req.id;
+        // Log only server faults (500); 4xx/499/503 are expected and would spam.
+        if err.http_status() == 500 {
+            tracing::error!(rid = id.0, error = %err, "ingress rejected request");
         }
+        let _ = req.state.apply(Event::Error(err.clone()));
+        let _ = req.sink.try_send(EgressItem::Error(err)); // client may be gone
+        let _ = self.senders.detok_for(id).send(DetokMsg::Deregister { id });
+    }
 
-        // Register the egress sink with the owning detok shard *before* the
-        // request leaves Rust, so the response (generate chunks or a control
-        // result) has a home. Routing is by id only. Carry
-        // `return_text_in_logprobs` so the shard (CPU-bound) does the logprob
-        // token-text decode rather than the api-server I/O threads.
+    /// Drive a request through its ingress states until it terminates (failed or
+    /// pushed to the ring) or is handed to the tokenizer pool (re-entering as a
+    /// `Tokenized` event). Each arm acts and advances the FSM; the loop
+    /// re-dispatches. The arms are the design table's states, `Failed` the single
+    /// reject path.
+    fn drive(&self, mut req: Request) {
+        loop {
+            match req.state.clone() {
+                // Validate, then register the sink before the request leaves Rust.
+                // Failures move to `Failed` and fall through to the reject arm.
+                RequestState::Received => {
+                    if let Err(e) = validate(&mut req, self.skip_tokenizer_init) {
+                        let _ = req.state.apply(Event::Error(e)); // → Failed
+                        continue;
+                    }
+                    if !self.register_detok(&req) {
+                        let _ = req
+                            .state
+                            .apply(Event::Error(Error::Internal("detok shard gone".into())));
+                        continue;
+                    }
+                    // `validate` advanced Received → Validating; keep driving.
+                }
+                // Control skips straight to Queued; generate goes to Normalizing.
+                RequestState::Validating => match &req.kind {
+                    RequestKind::Control(_) => {
+                        let _ = req
+                            .state
+                            .apply(Event::Validated(ValidationOutcome::AlreadyTokenized));
+                    }
+                    RequestKind::Generate(_) => {
+                        let _ = req.state.apply(Event::NeedsNormalize);
+                    }
+                },
+                // Normalize + verify sampling params (off the scheduler loop), then
+                // pick the branch; a bad param becomes `Failed`.
+                RequestState::Normalizing => {
+                    let outcome = {
+                        let RequestKind::Generate(g) = &mut req.kind else {
+                            // Unreachable (control never reaches here); reject so a
+                            // bug can't leak/hang a registered request.
+                            self.fail(
+                                &mut req,
+                                Error::Internal("non-generate request in Normalizing".into()),
+                            );
+                            return;
+                        };
+                        match normalize_sampling_params(&mut g.payload.sampling_params) {
+                            Err(e) => Err(e),
+                            // Client ids skip the pool (→ Queued); text is tokenized.
+                            Ok(()) if g.payload.already_tokenized() => {
+                                g.input_ids = g.payload.input_ids.clone();
+                                Ok(ValidationOutcome::AlreadyTokenized)
+                            }
+                            Ok(()) => Ok(ValidationOutcome::NeedsTokenize),
+                        }
+                    };
+                    match outcome {
+                        Err(e) => {
+                            let _ = req.state.apply(Event::Error(e)); // → Failed
+                        }
+                        Ok(o) => {
+                            // AlreadyTokenized → Queued, NeedsTokenize → Tokenizing.
+                            let _ = req.state.apply(Event::Validated(o));
+                        }
+                    }
+                }
+                // Hand off to the tokenizer pool; it returns the request as a
+                // `Tokenized` event (Queued, or Failed on error). Doesn't loop.
+                RequestState::Tokenizing => {
+                    if let Err(err) = self.senders.tok.send(req) {
+                        // Pool gone (workers exited); flume hands the request back.
+                        let mut req = err.into_inner();
+                        self.fail(&mut req, Error::Internal("tokenizer pool gone".into()));
+                    }
+                    return;
+                }
+                // Push the wire message (control frame or generate payload) to the ring.
+                RequestState::Queued => {
+                    match &req.kind {
+                        RequestKind::Control(c) => {
+                            let tag = c.tag;
+                            self.push_control_to_ring(req, tag);
+                        }
+                        RequestKind::Generate(_) => self.push_to_ring(req),
+                    }
+                    return;
+                }
+                // The single reject path for every post-register failure.
+                RequestState::Failed(e) => {
+                    self.fail(&mut req, e);
+                    return;
+                }
+                // Unreachable (egress states never reach here). Reject via `fail`/
+                // return (not apply + continue, which would spin on a terminal state).
+                other => {
+                    self.fail(
+                        &mut req,
+                        Error::Internal(format!("unexpected ingress state: {other:?}")),
+                    );
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Register the egress sink with the owning detok shard (by id) so the response
+    /// has a home. Carries `return_text_in_logprobs` so the shard, not the I/O
+    /// threads, decodes logprob token text. Returns `false` if the shard is gone.
+    fn register_detok(&self, req: &Request) -> bool {
         let decode_logprob_text = match &req.kind {
             RequestKind::Generate(g) => g.payload.return_text_in_logprobs.unwrap_or(false),
             RequestKind::Control(_) => false,
         };
-        let shard = self.senders.detok_for(req.id);
-        if shard
+        self.senders
+            .detok_for(req.id)
             .send(DetokMsg::Register {
                 id: req.id,
                 sink: req.sink.clone(),
                 decode_logprob_text,
             })
-            .is_err()
-        {
-            fail(&mut req, Error::Internal("detok shard gone".into()));
-            return;
-        }
-
-        // Branch by kind. Copy the control tag out so the borrow of `req.kind`
-        // ends before we move `req` downstream.
-        let control_tag = match &req.kind {
-            RequestKind::Control(c) => Some(c.tag),
-            RequestKind::Generate(_) => None,
-        };
-        if let Some(tag) = control_tag {
-            // Control requests skip tokenization entirely: validate straight to
-            // Queued and push the bare `[tag, rid, nil]` control message.
-            let _ = req
-                .state
-                .apply(Event::Validated(ValidationOutcome::AlreadyTokenized)); // → Queued
-            self.push_control_to_ring(req, tag);
-            return;
-        }
-
-        // Validating → Normalizing: normalize + verify the sampling params here
-        // (the Rust server replaces the Python TokenizerManager, where this runs)
-        // so the work stays off the scheduler's latency-critical loop. Sets
-        // `is_normalized=true` on the wire; the scheduler then skips its pass.
-        let _ = req.state.apply(Event::Normalized);
-        if let RequestKind::Generate(g) = &mut req.kind
-            && let Err(e) = normalize_sampling_params(&mut g.payload.sampling_params)
-        {
-            fail(&mut req, e);
-            return;
-        }
-
-        self.route_generate(req);
-    }
-
-    /// Route a validated generate request: queue directly when it already carries
-    /// token ids, else hand it to the tokenizer pool.
-    fn route_generate(&self, mut req: Request) {
-        let RequestKind::Generate(g) = &req.kind else {
-            return; // unreachable: control is handled by the caller
-        };
-        match classify(g) {
-            ValidationOutcome::AlreadyTokenized => {
-                if let RequestKind::Generate(g) = &mut req.kind {
-                    g.input_ids = g.payload.input_ids.clone();
-                }
-                let _ = req
-                    .state
-                    .apply(Event::Validated(ValidationOutcome::AlreadyTokenized)); // → Queued
-                self.push_to_ring(req); // no tokenize hop
-            }
-            ValidationOutcome::NeedsTokenize => {
-                let _ = req
-                    .state
-                    .apply(Event::Validated(ValidationOutcome::NeedsTokenize)); // → Tokenizing
-                if self.senders.tok.send(req).is_err() {
-                    tracing::error!("tokenizer pool gone");
-                }
-            }
-            ValidationOutcome::HasMultimodal => {
-                // Encoder deferred this iteration: treat as a plain tokenize.
-                let _ = req
-                    .state
-                    .apply(Event::Validated(ValidationOutcome::NeedsTokenize));
-                if self.senders.tok.send(req).is_err() {
-                    tracing::error!("tokenizer pool gone");
-                }
-            }
-        }
+            .is_ok()
     }
 
     /// Push a bare control request (`[tag, rid, nil]`) onto the ingress ring. The
@@ -173,7 +213,7 @@ impl Ingress {
         let header = match control_req_msgpack(tag, &req.id.0.to_string()) {
             Ok(b) => b,
             Err(e) => {
-                fail(&mut req, e);
+                self.fail(&mut req, e);
                 return;
             }
         };
@@ -182,15 +222,16 @@ impl Ingress {
             header,
             ids: Bytes::new(),
         }) {
-            fail(&mut req, Error::QueueFull);
+            self.fail(&mut req, Error::QueueFull);
         }
     }
 
-    /// Client disconnected: push an `AbortReq(rid)` onto the ingress ring so the
-    /// scheduler stops generating. Fire-and-forget — there's no sink left (the
-    /// client is gone); a full ring just drops the abort (the request will still
-    /// finish at EOS, only later).
+    /// Client disconnected: deregister, then push an `AbortReq(rid)` so the
+    /// scheduler stops generating. Fire-and-forget (a full ring drops the abort;
+    /// the request then finishes at EOS).
     fn on_abort(&self, id: RequestId) {
+        let _ = self.senders.detok_for(id).send(DetokMsg::Deregister { id });
+
         match abort_req_msgpack(&id.0.to_string()) {
             Ok(header) => {
                 if !self.ingress.try_push(IngressMsg {
@@ -204,32 +245,24 @@ impl Ingress {
         }
     }
 
-    /// A request returned from the Tokenizer pool with `input_ids` filled in.
-    fn on_tokenized(&self, mut req: Request) {
-        // Tokenizing → Queued
-        let _ = req.state.apply(Event::TokenizeDone);
-        self.push_to_ring(req);
-    }
-
     /// Build the msgpack `TokenizedGenerateReqInput` and push it onto the ingress
     /// ring for the scheduler. On backpressure, fail the request.
     fn push_to_ring(&self, mut req: Request) {
         // Only generate requests reach here (control uses `push_control_to_ring`).
         let RequestKind::Generate(g) = &mut req.kind else {
-            fail(
+            self.fail(
                 &mut req,
                 Error::Internal("non-generate request reached push_to_ring".into()),
             );
             return;
         };
-        // Move (not clone) the generate fields out; `take` leaves valid empties so
-        // the borrow of `req.kind` ends and `req` is free for the `fail` path.
+        // Move the fields out (`take` frees the `req.kind` borrow for `fail`).
         let input_ids = g.input_ids.take();
         let input_text = g.payload.text.take();
         let sampling_params = g.payload.sampling_params.take();
         let stream = g.stream;
-        // Replicate TokenizerManager's scalar normalization of the logprob
-        // options (this path bypasses it): absent → the scheduler defaults.
+        // Scalar logprob normalization the TokenizerManager would do: absent →
+        // scheduler defaults.
         let return_logprob = g.payload.return_logprob.unwrap_or(false);
         let logprob_start_len = g.payload.logprob_start_len.unwrap_or(-1);
         let top_logprobs_num = g.payload.top_logprobs_num.unwrap_or(0);
@@ -240,7 +273,7 @@ impl Ingress {
         let input_ids = match input_ids {
             Some(ids) if !ids.is_empty() => ids,
             _ => {
-                fail(&mut req, Error::Tokenize("empty input_ids".into()));
+                self.fail(&mut req, Error::Tokenize("empty input_ids".into()));
                 return;
             }
         };
@@ -259,40 +292,31 @@ impl Ingress {
             stream,
         };
 
-        // Columnar split: scalar header through msgpack, the ids tensor as a raw
-        // int64 buffer alongside (concatenated across the batch in `recv_requests`).
+        // Columnar split: scalar header via msgpack, ids as a raw int64 buffer.
         let header: Bytes = match payload.to_header_msgpack() {
             Ok(b) => b,
             Err(e) => {
-                fail(&mut req, e);
+                self.fail(&mut req, e);
                 return;
             }
         };
         let ids = payload.input_ids_i64_le();
 
         if !self.ingress.try_push(IngressMsg { header, ids }) {
-            fail(&mut req, Error::QueueFull);
+            self.fail(&mut req, Error::QueueFull);
         }
-        // On success the request is now owned by the scheduler; egress will
-        // arrive by rid. We intentionally drop our `Request` here (state ==
-        // Queued); the detok shard holds the sink.
+        // On success the scheduler owns the request (egress arrives by rid); we
+        // drop our `Request` here — the detok shard holds the sink.
     }
 }
 
-/// Validating phase: drive `Received → Validating` and check the payload is
-/// admissible. `Err` rejects the request (it never reaches a branch).
-///
-/// `skip_tokenizer_init` means no tokenizer is loaded, so a generate request
-/// *must* already carry token ids; a text-only request is rejected here rather
-/// than being silently byte-encoded by the stub tokenizer. Control requests
-/// carry no token ids and are exempt.
+/// `Received → Validating` + admissibility check. Under `skip_tokenizer_init` a
+/// generate request must already carry token ids (no tokenizer to byte-encode
+/// text); control requests carry none and are exempt.
 fn validate(req: &mut Request, skip_tokenizer_init: bool) -> Result<(), Error> {
-    // Received → Validating
     let _ = req
         .state
         .apply(Event::Validated(ValidationOutcome::NeedsTokenize));
-    // The skip check is generate-only: control requests carry no token ids, so
-    // matching `Generate` naturally exempts them.
     if skip_tokenizer_init
         && matches!(&req.kind, RequestKind::Generate(g) if !g.payload.already_tokenized())
     {
@@ -304,19 +328,174 @@ fn validate(req: &mut Request, skip_tokenizer_init: bool) -> Result<(), Error> {
     Ok(())
 }
 
-/// Pick the ingress branch for a validated generate request.
-fn classify(g: &GenerateRequest) -> ValidationOutcome {
-    if g.payload.has_multimodal() {
-        ValidationOutcome::HasMultimodal
-    } else if g.payload.already_tokenized() {
-        ValidationOutcome::AlreadyTokenized
-    } else {
-        ValidationOutcome::NeedsTokenize
-    }
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fsm::RequestState;
+    use crate::message::{EgressSink, GeneratePayload, GenerateRequest};
+    use crate::runtime::ring::{IngressConsumer, ingress_ring};
+    use tokio::sync::mpsc;
 
-fn fail(req: &mut Request, err: Error) {
-    let _ = req.state.apply(Event::Error(err.clone()));
-    // Best-effort notify the client; sink may already be closed.
-    let _ = req.sink.try_send(EgressItem::Error(err));
+    /// An `Ingress` plus its detok-shard receiver, ring consumer (keep alive —
+    /// dropping it closes the ring → false QueueFull), and tm inbox sender.
+    fn make_ingress() -> (
+        Ingress,
+        flume::Receiver<DetokMsg>,
+        IngressConsumer,
+        flume::Sender<TmEvent>,
+    ) {
+        let (tok_tx, _tok_rx) = flume::unbounded();
+        let (detok_tx, detok_rx) = flume::unbounded();
+        let senders = Senders {
+            tm: flume::unbounded().0,
+            tok: tok_tx,
+            detok: vec![detok_tx],
+        };
+        let (ingress_producer, consumer) = ingress_ring(16);
+        let (tm_tx, tm_rx) = flume::unbounded();
+        let ingress = Ingress::new(tm_rx, senders, ingress_producer, false);
+        (ingress, detok_rx, consumer, tm_tx)
+    }
+
+    fn generate_req(id: u64, sampling_params: rmpv::Value) -> Request {
+        let payload = GeneratePayload {
+            input_ids: Some(vec![1, 2, 3]),
+            sampling_params: Some(sampling_params),
+            ..Default::default()
+        };
+        let (tx, _rx) = mpsc::channel(8);
+        Request {
+            id: RequestId(id),
+            state: RequestState::Received,
+            sink: EgressSink::Local(tx),
+            kind: RequestKind::Generate(GenerateRequest {
+                payload,
+                ..Default::default()
+            }),
+        }
+    }
+
+    /// A request rejected at normalization (post-register) must not leak: the shard
+    /// sees `Register` then `Deregister`. Regression for RSS growth on bad input.
+    #[test]
+    fn rejected_request_deregisters_from_shard() {
+        let (ingress, detok_rx, _consumer, _tm_tx) = make_ingress();
+        // top_p = 2.0 is outside (0, 1], so `normalize_sampling_params` rejects it.
+        let bad = rmpv::Value::Map(vec![(rmpv::Value::from("top_p"), rmpv::Value::F64(2.0))]);
+        ingress.drive(generate_req(7, bad));
+
+        assert!(
+            matches!(detok_rx.try_recv(), Ok(DetokMsg::Register { id, .. }) if id == RequestId(7)),
+            "expected Register for rid 7",
+        );
+        assert!(
+            matches!(detok_rx.try_recv(), Ok(DetokMsg::Deregister { id }) if id == RequestId(7)),
+            "expected Deregister for rid 7 (leak fix)",
+        );
+        assert!(
+            detok_rx.try_recv().is_err(),
+            "no further shard messages — registration fully cleaned up",
+        );
+    }
+
+    /// A valid request is registered and handed onward — never deregistered.
+    #[test]
+    fn admitted_request_keeps_registration() {
+        let (ingress, detok_rx, _consumer, _tm_tx) = make_ingress();
+        // Empty map → all sampling defaults, passes normalization.
+        ingress.drive(generate_req(9, rmpv::Value::Map(vec![])));
+
+        assert!(
+            matches!(detok_rx.try_recv(), Ok(DetokMsg::Register { id, .. }) if id == RequestId(9)),
+            "expected Register for rid 9",
+        );
+        assert!(
+            detok_rx.try_recv().is_err(),
+            "admitted request must not be deregistered",
+        );
+    }
+
+    /// A pool return in `Failed` state (failed encode) is rejected via the same
+    /// path and deregistered, not leaked.
+    #[test]
+    fn tokenize_failure_deregisters_via_ingress() {
+        let (ingress, detok_rx, _consumer, tm_tx) = make_ingress();
+        // The pool marks a failed encode as `Failed(err)` before returning it.
+        let mut req = generate_req(11, rmpv::Value::Map(vec![]));
+        let _ = req
+            .state
+            .apply(Event::Error(Error::Tokenize("boom".into())));
+        tm_tx.send(TmEvent::Tokenized(req)).unwrap();
+        // Close the inbox so the run loop returns after draining the one event.
+        drop(tm_tx);
+        ingress.run();
+
+        assert!(
+            matches!(detok_rx.try_recv(), Ok(DetokMsg::Deregister { id }) if id == RequestId(11)),
+            "tokenize failure must deregister rid 11",
+        );
+        assert!(detok_rx.try_recv().is_err(), "no further shard messages");
+    }
+
+    /// An abort deregisters, so a request aborted before any terminal chunk
+    /// can't leak.
+    #[test]
+    fn abort_deregisters_from_shard() {
+        let (ingress, detok_rx, _consumer, tm_tx) = make_ingress();
+        tm_tx.send(TmEvent::Abort(RequestId(13))).unwrap();
+        drop(tm_tx);
+        ingress.run();
+
+        assert!(
+            matches!(detok_rx.try_recv(), Ok(DetokMsg::Deregister { id }) if id == RequestId(13)),
+            "abort must deregister rid 13",
+        );
+        assert!(detok_rx.try_recv().is_err(), "no further shard messages");
+    }
+
+    /// A successful pool return (Queued, ids filled) is pushed to the ring, not
+    /// rejected; its registration is untouched.
+    #[test]
+    fn tokenized_return_pushes_without_deregister() {
+        let (ingress, detok_rx, _consumer, tm_tx) = make_ingress();
+        let mut req = generate_req(15, rmpv::Value::Map(vec![]));
+        // Simulate a successful pool return: ids filled, Queued.
+        if let RequestKind::Generate(g) = &mut req.kind {
+            g.input_ids = Some(vec![1, 2, 3]);
+        }
+        req.state = RequestState::Queued;
+        tm_tx.send(TmEvent::Tokenized(req)).unwrap();
+        drop(tm_tx);
+        ingress.run();
+
+        // Pushed to the ring; the shard sees nothing.
+        assert!(
+            detok_rx.try_recv().is_err(),
+            "a queued pool-return must be pushed, not touch the shard",
+        );
+    }
+
+    /// If the pool is gone, a request needing tokenization is rejected +
+    /// deregistered, not silently dropped.
+    #[test]
+    fn tokenize_pool_gone_deregisters() {
+        // `make_ingress` drops the tok receiver, so `tok.send` fails.
+        let (ingress, detok_rx, _consumer, _tm_tx) = make_ingress();
+        // No ids → NeedsTokenize → Tokenizing branch.
+        let mut req = generate_req(21, rmpv::Value::Map(vec![]));
+        if let RequestKind::Generate(g) = &mut req.kind {
+            g.payload.input_ids = None;
+        }
+        ingress.drive(req);
+
+        assert!(
+            matches!(detok_rx.try_recv(), Ok(DetokMsg::Register { id, .. }) if id == RequestId(21)),
+            "expected Register for rid 21",
+        );
+        assert!(
+            matches!(detok_rx.try_recv(), Ok(DetokMsg::Deregister { id }) if id == RequestId(21)),
+            "pool-gone hand-off must deregister rid 21",
+        );
+        assert!(detok_rx.try_recv().is_err(), "no further shard messages");
+    }
 }
