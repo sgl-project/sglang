@@ -342,6 +342,10 @@ class FlashInferAttnBackend(AttentionBackend):
             self.num_wrappers = 1
             self.dispatch_reason = None
 
+        flashinfer_workspace_size_user_set = (
+            envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.is_set()
+        )
+
         # Qwen2/Qwen3 models require higher flashinfer workspace size
         if (
             "Qwen2ForCausalLM" in model_runner.model_config.hf_config.architectures
@@ -352,7 +356,8 @@ class FlashInferAttnBackend(AttentionBackend):
             or "Qwen3VLMoeForConditionalGeneration"
             in model_runner.model_config.hf_config.architectures
         ):
-            envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.set(512 * 1024 * 1024)
+            if not flashinfer_workspace_size_user_set:
+                envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.set(512 * 1024 * 1024)
 
         # When deterministic inference is enabled, tensor cores should be used for decode
         # Also set split tile sizes for prefill and decode from environment variables, and disable kv split for cuda graph
@@ -372,7 +377,8 @@ class FlashInferAttnBackend(AttentionBackend):
                 "SGLANG_FLASHINFER_DECODE_SPLIT_TILE_SIZE", 2048
             )
             self.disable_cuda_graph_kv_split = True
-            envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.set(2048 * 1024 * 1024)
+            if not flashinfer_workspace_size_user_set:
+                envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.set(2048 * 1024 * 1024)
 
         self.use_paged = envs.SGLANG_FLASHINFER_USE_PAGED.get()
 
