@@ -739,6 +739,7 @@ async fn generate(State(state): State<AppState>, Json(payload): Json<GeneratePay
         // frame, so fold the detok deltas back up before formatting each frame.
         let s = async_stream::stream! {
             let mut acc = OutputAccumulator::default();
+            let mut terminated = false;
             while let Some(item) = rx.recv().await {
                 match item {
                     EgressItem::Frame(out) => {
@@ -750,6 +751,7 @@ async fn generate(State(state): State<AppState>, Json(payload): Json<GeneratePay
                         acc.fold(&out);
                         let f = sglang_frame(&acc.into_output(out.rid));
                         yield Ok(Event::default().data(String::from_utf8_lossy(&f)));
+                        terminated = true;
                         break;
                     }
                     EgressItem::Error(e) => {
@@ -757,15 +759,24 @@ async fn generate(State(state): State<AppState>, Json(payload): Json<GeneratePay
                             "error": { "message": e.to_string(), "code": e.http_status() }
                         });
                         yield Ok(Event::default().data(body.to_string()));
+                        terminated = true;
                         break;
                     }
                     // Control results never arrive on a `/generate` request.
                     EgressItem::Control(_) => break,
                 }
             }
-            // Reached only on a terminal / closed channel (not a disconnect, which
-            // drops the suspended generator before here) — so the request is done.
-            guard.disarm(rid);
+            if terminated {
+                // Saw a real terminal — don't abort a finished request.
+                guard.disarm(rid);
+            } else {
+                // The channel closed with no terminal frame, emit an explicit
+                // error rather than a clean completion.
+                let body = serde_json::json!({
+                    "error": { "message": "stream truncated before completion", "code": 500 }
+                });
+                yield Ok(Event::default().data(body.to_string()));
+            }
             yield Ok(Event::default().data("[DONE]"));
         };
         Sse::new(s).into_response()
@@ -802,9 +813,14 @@ async fn generate(State(state): State<AppState>, Json(payload): Json<GeneratePay
                 EgressItem::Control(_) => continue, // never on `/generate`
             }
         }
-        // Sender dropped without a terminal item → request already gone.
-        guard.disarm(rid);
-        (StatusCode::from_u16(499).unwrap(), "request aborted").into_response()
+        // Sender dropped without a terminal item: the shard dropped this request
+        // (a truncation — a client disconnect would have dropped this handler
+        // future instead). Report a server error and leave the guard armed so the
+        // scheduler work is aborted.
+        let body = serde_json::json!({
+            "error": { "message": "response truncated before completion", "code": 500 }
+        });
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(body)).into_response()
     }
 }
 
