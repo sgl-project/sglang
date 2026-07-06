@@ -1443,11 +1443,17 @@ def fp8_paged_mqa_logits_kernel(
             for j in T.Pipelined(n_iters, num_stages=2):
                 i = i_start + j
                 page = page_table[bx, i]
-                k_smem_u8 = T.alloc_shared((B * D,), UINT8)
-                T.copy(kvcache_u8[page, 0:SCALE_OFFSET], k_smem_u8)
+                # 2-D staging: the gemm's swizzle layout is remapped onto
+                # the base buffer of the k_smem view, and LowerTileOp's
+                # access-pointer rewrite requires a >=2-D base shape there.
+                k_smem_u8 = T.alloc_shared((1, B * D), UINT8)
+                T.copy(kvcache_u8[page : page + 1, 0:SCALE_OFFSET], k_smem_u8)
                 k_smem = T.view(k_smem_u8, (B, D), FP8)
-                k_s_smem_u8 = T.alloc_shared((B * 4,), UINT8)
-                T.copy(kvcache_u8[page, SCALE_OFFSET:BLOCK_BYTES], k_s_smem_u8)
+                k_s_smem_u8 = T.alloc_shared((1, B * 4), UINT8)
+                T.copy(
+                    kvcache_u8[page : page + 1, SCALE_OFFSET:BLOCK_BYTES],
+                    k_s_smem_u8,
+                )
                 k_s_smem = T.view(k_s_smem_u8, (B,), FP32)
                 k_s_frag = T.alloc_fragment((B,), FP32)
                 T.copy(k_s_smem, k_s_frag)
