@@ -29,9 +29,11 @@ def add_multimodal_gen_serve_args(parser: argparse.ArgumentParser):
 
 def execute_serve_cmd(args: argparse.Namespace, unknown_args: list[str] | None = None):
     """The entry point for the serve command."""
-    # use server-based warmup for production
+    # serving defaults: server-based warmup, throughput-oriented encoders
     server_args = ServerArgs.from_cli_args(
-        args, unknown_args, default_args={"warmup_mode": "server"}
+        args,
+        unknown_args,
+        default_args={"warmup_mode": "server", "encoder_parallel": "dp"},
     )
 
     dispatch_launch(server_args)
