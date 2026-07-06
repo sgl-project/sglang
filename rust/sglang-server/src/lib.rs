@@ -161,32 +161,25 @@ impl Server {
     }
 
     /// Push a whole decode batch as ONE frame: a columnar msgpack `header`
-    /// (per-request scalars + numeric-column length metadata) plus one
-    /// concatenated raw `data` buffer (token ids, and — when any request wants
-    /// them — logprob/hidden columns, kept out of msgpack like the ingress
-    /// `input_ids` split). The tm-egress dispatcher fans it out into per-request
-    /// chunks and routes each by rid, collapsing N per-request msgpack encodes +
-    /// N FFI crossings into one. Returns `False` on backpressure.
+    /// plus one concatenated raw `data` buffer.
+    /// Blocks for backpressure; `False` only on shutdown.
     fn push_batch(&self, py: Python<'_>, header: &[u8], data: &[u8]) -> bool {
         let bytes = crate::message::frame_egress_batch(header, data);
-        py.detach(|| self.rt.egress.try_push(bytes))
+        py.detach(|| self.rt.egress.push(bytes))
     }
 
-    /// Push a control-request result (e.g. the `/server_info` JSON) into the
-    /// egress ring, routed by `rid` to the waiting request's sink as a single
-    /// non-streamed response. Returns `False` on backpressure.
+    /// Push a control-request result.
+    /// Blocks for backpressure; `False` only on shutdown.
     fn push_result(&self, py: Python<'_>, rid: &str, payload: &[u8]) -> bool {
         let bytes = crate::message::frame_egress_result(rid, payload);
-        py.detach(|| self.rt.egress.try_push(bytes))
+        py.detach(|| self.rt.egress.push(bytes))
     }
 
-    /// Route a terminal failure back to request `rid` (→ HTTP 400) instead of
-    /// letting a decode error escape the scheduler loop. The scheduler's ingress
-    /// drain calls this when a request's header can't be decoded (e.g. a
-    /// malformed field). Returns `False` on backpressure.
+    /// Route a terminal failure back to request `rid`.
+    /// Blocks for backpressure; `False` only on shutdown.
     fn push_error(&self, py: Python<'_>, rid: &str, message: &str) -> bool {
         let bytes = crate::message::frame_egress_error(rid, message);
-        py.detach(|| self.rt.egress.try_push(bytes))
+        py.detach(|| self.rt.egress.push(bytes))
     }
 
     /// Signal all threads to stop (best effort).
