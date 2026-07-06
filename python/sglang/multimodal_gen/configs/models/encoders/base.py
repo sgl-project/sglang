@@ -76,15 +76,15 @@ class EncoderConfig(ModelConfig):
     quant_config: QuantizationConfig | None = None
     lora_config: Any | None = None
 
+    # group to TP-fold this encoder over during the encoding stage (the DiT
+    # replica is idle then): None = replicated, or "sp"|"ulysses"|"ring"|"world";
+    # proposed by adjust_pipeline_config, resolved by finalize_encoder_folding
+    parallel_folding_mode: str | None = None
+
 
 @dataclass
 class TextEncoderConfig(EncoderConfig):
     arch_config: ArchConfig = field(default_factory=TextEncoderArchConfig)
-
-    # Use the SP Group of the transformer as the TP Group of T5.
-    parallel_folding: bool = False
-    # "sp" or "ulysses" or "ring"
-    parallel_folding_mode: str = "sp"
 
 
 @dataclass

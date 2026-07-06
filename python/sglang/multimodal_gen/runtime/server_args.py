@@ -20,7 +20,6 @@ import addict
 import yaml
 
 from sglang.multimodal_gen import envs
-from sglang.multimodal_gen.configs.models.encoders import T5Config
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
     LTX2PipelineConfig,
@@ -170,6 +169,11 @@ class ServerArgs(DisaggServerArgsMixin):
     enable_cfg_parallel: Optional[bool] = None
     # number of GPUs in each CFG parallel group (None = auto, 1 = disabled, N > 1 = enabled)
     cfg_parallel_degree: Optional[int] = None
+
+    # encoder layout across a multi-rank replica: auto | fold | dp | replicate
+    # (see --encoder-parallel); fold shards the weights at load time, so it is
+    # mutually exclusive with dp/replicate for the lifetime of the model
+    encoder_parallel: str = "auto"
 
     hsdp_replicate_dim: int = 1
     hsdp_shard_dim: Optional[int] = None
@@ -442,24 +446,44 @@ class ServerArgs(DisaggServerArgsMixin):
         self.nunchaku_config = resolution.nunchaku_config
 
     def adjust_pipeline_config(self):
-        # enable parallel folding when SP is enabled
-        if self.tp_size != 1 or self.sp_degree <= 1:
+        # 1. adjust for encoder parallel folding (dp/replicate never fold)
+        if getattr(self, "encoder_parallel", "auto") in ("dp", "replicate"):
+            return
+        tp_size = self.tp_size or 1
+        dp_size = self.dp_size or 1
+        sp_degree = self.sp_degree or 1
+        # one replica = all its GPUs
+        replica_size = (self.num_gpus or tp_size) // dp_size
+        fold_world = dp_size == 1 and not self.disagg_mode and replica_size > tp_size
+
+        if fold_world:
+            mode = "world"
+        elif tp_size == 1 and sp_degree > 1:
+            # Preserve prior behavior for dp>1 / disaggregated SP runs.
+            mode = "sp"
+        else:
             return
 
-        enabled = False
-        for text_encoder_config in self.pipeline_config.text_encoder_configs:
-            if isinstance(text_encoder_config, T5Config):
-                text_encoder_config.parallel_folding = True
-                enabled = True
-                text_encoder_config.parallel_folding_mode = "sp"
+        # propose the fold group from the parallelism alone; the loader keeps it
+        # only for encoders worth folding at their real post-load size
+        # (finalize_encoder_folding)
+        encoder_configs = list(self.pipeline_config.text_encoder_configs) + list(
+            getattr(self.pipeline_config, "image_encoder_configs", ()) or ()
+        )
+        for encoder_config in encoder_configs:
+            encoder_config.parallel_folding_mode = mode
 
-        if enabled:
-            logger.info(
-                "Enabled T5 text encoder parallel folding (mode=sp) for %s (tp_size=%s, sp_degree=%s).",
-                self.__class__.__name__,
-                self.tp_size,
-                self.sp_degree,
-            )
+        logger.info(
+            "Proposed encoder parallel folding (mode=%s) for %s "
+            "(tp=%s sp=%s cfg=%s replica=%s); the loader keeps it for encoders "
+            "wide enough to benefit.",
+            mode,
+            self.__class__.__name__,
+            tp_size,
+            sp_degree,
+            self.cfg_parallel_degree or 1,
+            replica_size,
+        )
 
     def _adjust_offload(self):
         if current_platform.is_cpu():
@@ -1246,6 +1270,21 @@ class ServerArgs(DisaggServerArgsMixin):
             type=int,
             default=ServerArgs.ring_degree,
             help="Ring sequence parallel degree. Used in attention layer.",
+        )
+        parser.add_argument(
+            "--encoder-parallel",
+            type=str,
+            choices=["auto", "fold", "dp", "replicate"],
+            default=ServerArgs.encoder_parallel,
+            help=(
+                "Text/image encoder parallelism across a multi-rank replica. "
+                "`auto` folds encoders wide enough to benefit (best "
+                "single-request latency) and data-parallels the rest at "
+                "batch>1; `fold` always tensor-parallels the encoder weights; "
+                "`dp` never folds and splits the batch across ranks (best "
+                "batched throughput); `replicate` disables both. "
+                "`sglang serve` defaults to `dp`; other entrypoints to `auto`."
+            ),
         )
         parser.add_argument(
             "--enable-cfg-parallel",

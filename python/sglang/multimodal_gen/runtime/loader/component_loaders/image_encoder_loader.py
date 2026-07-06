@@ -2,6 +2,7 @@ from sglang.multimodal_gen.configs.models import ModelConfig
 from sglang.multimodal_gen.runtime.loader.component_loaders.text_encoder_loader import (
     TextEncoderLoader,
 )
+from sglang.multimodal_gen.runtime.models.encoders.base import finalize_encoder_folding
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     get_diffusers_component_config,
@@ -49,6 +50,8 @@ class ImageEncoderLoader(TextEncoderLoader):
 
         encoder_config = server_args.pipeline_config.image_encoder_config
         encoder_config.update_model_arch(model_config)
+        # real dims are populated now; resolve fold vs replicate
+        finalize_encoder_folding(encoder_config, server_args.encoder_parallel)
 
         # Always start with local device; load_model will adjust for offload if needed
         # TODO(will): add support for other dtypes
