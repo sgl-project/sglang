@@ -16,8 +16,7 @@ export const config = {
   supportedHardware: ["h200", "b200", "b300", "gb200", "gb300"],
 
   variants: [
-    { id: "bf16", label: "BF16" },
-    { id: "fp8",  label: "FP8"  },
+    { id: "default", label: "Default" },
   ],
   quantizations: [
     { id: "bf16", label: "BF16" },
@@ -34,8 +33,8 @@ export const config = {
   ],
 
   modelNames: {
-    "bf16|bf16": "tencent/Hy3",
-    "bf16|fp8":  "tencent/Hy3-FP8",
+    "default|bf16": "tencent/Hy3",
+    "default|fp8":  "tencent/Hy3-FP8",
   },
 
   placeholders: {
@@ -243,7 +242,7 @@ sgl-eval run aime26 \\
     // H200 (141GB) — TP=8 for BF16 (~552GB)
     // ====================================================================
     {
-      match: { hw: "h200", variant: "bf16", quant: "bf16", strategy: "low-latency", nodes: "single" },
+      match: { hw: "h200", variant: "default", quant: "bf16", strategy: "low-latency", nodes: "single" },
       verified: true,
       env: [],
       flags: [
@@ -262,7 +261,7 @@ sgl-eval run aime26 \\
       ],
     },
     {
-      match: { hw: "h200", variant: "bf16", quant: "bf16", strategy: "balanced", nodes: "single" },
+      match: { hw: "h200", variant: "default", quant: "bf16", strategy: "balanced", nodes: "single" },
       verified: true,
       env: [],
       flags: [
@@ -277,7 +276,7 @@ sgl-eval run aime26 \\
       ],
     },
     {
-      match: { hw: "h200", variant: "bf16", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      match: { hw: "h200", variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "single" },
       env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024"],
       flags: [
         "--trust-remote-code",
@@ -297,7 +296,7 @@ sgl-eval run aime26 \\
     // B200 (180GB) — TP=8 for BF16
     // ====================================================================
     {
-      match: { hw: "b200", variant: "bf16", quant: "bf16", strategy: "low-latency", nodes: "single" },
+      match: { hw: "b200", variant: "default", quant: "bf16", strategy: "low-latency", nodes: "single" },
       env: [],
       flags: [
         "--trust-remote-code",
@@ -316,7 +315,7 @@ sgl-eval run aime26 \\
       ],
     },
     {
-      match: { hw: "b200", variant: "bf16", quant: "bf16", strategy: "balanced", nodes: "single" },
+      match: { hw: "b200", variant: "default", quant: "bf16", strategy: "balanced", nodes: "single" },
       env: [],
       flags: [
         "--trust-remote-code",
@@ -331,7 +330,7 @@ sgl-eval run aime26 \\
       ],
     },
     {
-      match: { hw: "b200", variant: "bf16", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      match: { hw: "b200", variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "single" },
       env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024"],
       flags: [
         "--trust-remote-code",
@@ -352,7 +351,7 @@ sgl-eval run aime26 \\
     // B300 (272GB) — TP=4
     // ====================================================================
     {
-      match: { hw: "b300", variant: "bf16", quant: "bf16", strategy: "low-latency", nodes: "single" },
+      match: { hw: "b300", variant: "default", quant: "bf16", strategy: "low-latency", nodes: "single" },
       env: [],
       flags: [
         "--trust-remote-code",
@@ -371,7 +370,7 @@ sgl-eval run aime26 \\
       ],
     },
     {
-      match: { hw: "b300", variant: "bf16", quant: "bf16", strategy: "balanced", nodes: "single" },
+      match: { hw: "b300", variant: "default", quant: "bf16", strategy: "balanced", nodes: "single" },
       env: [],
       flags: [
         "--trust-remote-code",
@@ -386,7 +385,7 @@ sgl-eval run aime26 \\
       ],
     },
     {
-      match: { hw: "b300", variant: "bf16", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      match: { hw: "b300", variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "single" },
       env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024"],
       flags: [
         "--trust-remote-code",
@@ -407,7 +406,7 @@ sgl-eval run aime26 \\
     // GB300 — TP=4 (inferred from B300, same sm_103 + aarch64)
     // ====================================================================
     {
-      match: { hw: "gb300", variant: "bf16", quant: "bf16", strategy: "low-latency", nodes: "single" },
+      match: { hw: "gb300", variant: "default", quant: "bf16", strategy: "low-latency", nodes: "single" },
       env: [],
       flags: [
         "--trust-remote-code",
@@ -426,7 +425,7 @@ sgl-eval run aime26 \\
       ],
     },
     {
-      match: { hw: "gb300", variant: "bf16", quant: "bf16", strategy: "balanced", nodes: "single" },
+      match: { hw: "gb300", variant: "default", quant: "bf16", strategy: "balanced", nodes: "single" },
       env: [],
       flags: [
         "--trust-remote-code",
@@ -441,7 +440,7 @@ sgl-eval run aime26 \\
       ],
     },
     {
-      match: { hw: "gb300", variant: "bf16", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      match: { hw: "gb300", variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "single" },
       env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024"],
       flags: [
         "--trust-remote-code",
@@ -462,7 +461,7 @@ sgl-eval run aime26 \\
     // GB200 (sm_100 + aarch64) — TP=4 (inferred from B200)
     // ====================================================================
     {
-      match: { hw: "gb200", variant: "bf16", quant: "bf16", strategy: "low-latency", nodes: "single" },
+      match: { hw: "gb200", variant: "default", quant: "bf16", strategy: "low-latency", nodes: "single" },
       env: [],
       flags: [
         "--trust-remote-code",
@@ -481,7 +480,7 @@ sgl-eval run aime26 \\
       ],
     },
     {
-      match: { hw: "gb200", variant: "bf16", quant: "bf16", strategy: "balanced", nodes: "single" },
+      match: { hw: "gb200", variant: "default", quant: "bf16", strategy: "balanced", nodes: "single" },
       env: [],
       flags: [
         "--trust-remote-code",
@@ -496,7 +495,7 @@ sgl-eval run aime26 \\
       ],
     },
     {
-      match: { hw: "gb200", variant: "bf16", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      match: { hw: "gb200", variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "single" },
       env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024"],
       flags: [
         "--trust-remote-code",
@@ -517,7 +516,7 @@ sgl-eval run aime26 \\
     // FP8 (~300GB) — TP=4 on H200/B200, TP=2 on B300/GB300/GB200
     // ====================================================================
     {
-      match: { hw: "h200", variant: "fp8", quant: "fp8", strategy: "low-latency", nodes: "single" },
+      match: { hw: "h200", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
       env: [],
       flags: [
         "--trust-remote-code",
@@ -536,7 +535,7 @@ sgl-eval run aime26 \\
       ],
     },
     {
-      match: { hw: "h200", variant: "fp8", quant: "fp8", strategy: "balanced", nodes: "single" },
+      match: { hw: "h200", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" },
       env: [],
       flags: [
         "--trust-remote-code",
@@ -551,7 +550,7 @@ sgl-eval run aime26 \\
       ],
     },
     {
-      match: { hw: "h200", variant: "fp8", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+      match: { hw: "h200", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
       env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024"],
       flags: [
         "--trust-remote-code",
@@ -568,7 +567,7 @@ sgl-eval run aime26 \\
       ],
     },
     {
-      match: { hw: "b200", variant: "fp8", quant: "fp8", strategy: "low-latency", nodes: "single" },
+      match: { hw: "b200", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
       env: [],
       flags: [
         "--trust-remote-code",
@@ -588,7 +587,7 @@ sgl-eval run aime26 \\
       ],
     },
     {
-      match: { hw: "b200", variant: "fp8", quant: "fp8", strategy: "balanced", nodes: "single" },
+      match: { hw: "b200", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" },
       env: [],
       flags: [
         "--trust-remote-code",
@@ -604,7 +603,7 @@ sgl-eval run aime26 \\
       ],
     },
     {
-      match: { hw: "b200", variant: "fp8", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+      match: { hw: "b200", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
       env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024"],
       flags: [
         "--trust-remote-code",
@@ -622,7 +621,7 @@ sgl-eval run aime26 \\
       ],
     },
     {
-      match: { hw: "b300", variant: "fp8", quant: "fp8", strategy: "low-latency", nodes: "single" },
+      match: { hw: "b300", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
       env: [],
       flags: [
         "--trust-remote-code",
@@ -642,7 +641,7 @@ sgl-eval run aime26 \\
       ],
     },
     {
-      match: { hw: "b300", variant: "fp8", quant: "fp8", strategy: "balanced", nodes: "single" },
+      match: { hw: "b300", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" },
       env: [],
       flags: [
         "--trust-remote-code",
@@ -658,7 +657,7 @@ sgl-eval run aime26 \\
       ],
     },
     {
-      match: { hw: "b300", variant: "fp8", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+      match: { hw: "b300", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
       env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024"],
       flags: [
         "--trust-remote-code",
@@ -676,7 +675,7 @@ sgl-eval run aime26 \\
       ],
     },
     {
-      match: { hw: "gb300", variant: "fp8", quant: "fp8", strategy: "low-latency", nodes: "single" },
+      match: { hw: "gb300", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
       env: [],
       flags: [
         "--trust-remote-code",
@@ -696,7 +695,7 @@ sgl-eval run aime26 \\
       ],
     },
     {
-      match: { hw: "gb300", variant: "fp8", quant: "fp8", strategy: "balanced", nodes: "single" },
+      match: { hw: "gb300", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" },
       env: [],
       flags: [
         "--trust-remote-code",
@@ -712,7 +711,7 @@ sgl-eval run aime26 \\
       ],
     },
     {
-      match: { hw: "gb300", variant: "fp8", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+      match: { hw: "gb300", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
       env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024"],
       flags: [
         "--trust-remote-code",
@@ -730,7 +729,7 @@ sgl-eval run aime26 \\
       ],
     },
     {
-      match: { hw: "gb200", variant: "fp8", quant: "fp8", strategy: "low-latency", nodes: "single" },
+      match: { hw: "gb200", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
       env: [],
       flags: [
         "--trust-remote-code",
@@ -750,7 +749,7 @@ sgl-eval run aime26 \\
       ],
     },
     {
-      match: { hw: "gb200", variant: "fp8", quant: "fp8", strategy: "balanced", nodes: "single" },
+      match: { hw: "gb200", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" },
       env: [],
       flags: [
         "--trust-remote-code",
@@ -766,7 +765,7 @@ sgl-eval run aime26 \\
       ],
     },
     {
-      match: { hw: "gb200", variant: "fp8", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+      match: { hw: "gb200", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
       env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024"],
       flags: [
         "--trust-remote-code",
