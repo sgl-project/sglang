@@ -1450,9 +1450,18 @@ class DSparkWorkerV2(BaseSpecWorker):
             source = "prefill_source"
         elif stage == "decode_verify_write":
             source = "decode_verify_write"
-        source_by_loc = self._swa_write_source_by_req_pool.setdefault(
-            int(req_pool_idx), {}
+        self._record_swa_locs_source(
+            req_pool_idx=int(req_pool_idx), swa_locs=swa_locs, source=source
         )
+
+    def _record_swa_locs_source(
+        self,
+        *,
+        req_pool_idx: int,
+        swa_locs: list[int],
+        source: str,
+    ) -> None:
+        source_by_loc = self._swa_write_source_by_req_pool.setdefault(req_pool_idx, {})
         for loc in swa_locs:
             if loc is None:
                 continue
@@ -1461,6 +1470,29 @@ class DSparkWorkerV2(BaseSpecWorker):
             # Keep only the tail of the sliding-window history.
             for loc in sorted(source_by_loc)[:-256]:
                 source_by_loc.pop(loc, None)
+
+    def _record_draft_block_write_sources(
+        self, req_pool_indices: torch.Tensor, draft_out_cache_loc: torch.Tensor
+    ) -> None:
+        if not self._accept_anomaly_enabled or not self._is_tp0():
+            return
+        if req_pool_indices.numel() == 0 or draft_out_cache_loc.numel() == 0:
+            return
+        try:
+            locs = draft_out_cache_loc.to(device=self.device, dtype=torch.int64)
+            token_to_kv_pool = self.draft_model_runner.attn_backend.token_to_kv_pool
+            translate_swa = getattr(token_to_kv_pool, "translate_loc_from_full_to_swa", None)
+            if translate_swa is not None:
+                locs = translate_swa(locs)
+            locs_2d = locs.view(req_pool_indices.numel(), int(self.block_size))
+            for i, req_pool_idx in enumerate(req_pool_indices.detach().cpu().tolist()):
+                self._record_swa_locs_source(
+                    req_pool_idx=int(req_pool_idx),
+                    swa_locs=[int(x) for x in locs_2d[i].detach().cpu().tolist()],
+                    source="draft_block_write",
+                )
+        except Exception:
+            return
 
     def _visible_window_source_debug(
         self, req_pool_idx: int, visible_locs: Optional[list[int]]
@@ -2591,7 +2623,8 @@ class DSparkWorkerV2(BaseSpecWorker):
             draft_anchor_i = int(draft_anchor[i]) if draft_anchor is not None else None
             input_bonus_i = int(input_bonus[i]) if input_bonus is not None else None
             draft_block_metadata = self._last_draft_block_metadata_debug
-            visible_sources = None
+            visible_block_sources = None
+            valid_tail_sources = None
             if isinstance(draft_block_metadata, dict):
                 block_locs_by_row = draft_block_metadata.get(
                     "draft_swa_valid_block_locs_by_row"
@@ -2600,8 +2633,15 @@ class DSparkWorkerV2(BaseSpecWorker):
                     row_idx = min(i, len(block_locs_by_row) - 1)
                     row_locs = block_locs_by_row[row_idx]
                     if isinstance(row_locs, list):
-                        visible_sources = self._visible_window_source_debug(
+                        visible_block_sources = self._visible_window_source_debug(
                             int(req_pool_idx), row_locs
+                        )
+                valid_edges = draft_block_metadata.get("draft_swa_valid_edges")
+                if isinstance(valid_edges, dict):
+                    tail_locs = valid_edges.get("first_valid_last8")
+                    if isinstance(tail_locs, list):
+                        valid_tail_sources = self._visible_window_source_debug(
+                            int(req_pool_idx), tail_locs
                         )
             history = self._accept_anomaly_histories.setdefault(key, [])
             history.append(
@@ -2728,7 +2768,8 @@ class DSparkWorkerV2(BaseSpecWorker):
                         if verify_swa is not None and block_size > 0
                         else None
                     ),
-                    "visible_window_sources": visible_sources,
+                    "visible_block_sources": visible_block_sources,
+                    "valid_tail_sources": valid_tail_sources,
                     "draft_block_metadata": draft_block_metadata,
                 }
             )
@@ -3263,6 +3304,10 @@ class DSparkWorkerV2(BaseSpecWorker):
                 verify_out_cache_loc=draft_out_cache_loc,
                 seq_lens_for_metadata=anchor_lens,
                 dp_decode_global_num_tokens=dp_decode_global_num_tokens,
+            )
+            self._record_draft_block_write_sources(
+                req_pool_indices=req_pool_indices,
+                draft_out_cache_loc=draft_out_cache_loc,
             )
 
             candidates, confidence = self._refine_block_markov(
