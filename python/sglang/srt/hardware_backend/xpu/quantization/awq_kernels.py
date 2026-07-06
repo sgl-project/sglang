@@ -26,7 +26,7 @@ def _unpack_awq_to_codes(packed: torch.Tensor, rows: int) -> torch.Tensor:
 
     Codes are in ``[0, 15]`` and restored to natural (non-interleaved) order.
     """
-    t = packed.view(torch.uint8)  # [rows, cols * 4]
+    t = packed.contiguous().view(torch.uint8)  # [rows, cols * 4]
     shifter = torch.tensor([0, 4], dtype=torch.uint8, device=t.device)
     t = (t[:, :, None] >> shifter) & 0xF  # [rows, cols * 4, 2]
     t = t.view(-1, 8)[:, AWQ_REVERSE_PACK_ORDER]  # undo interleave
