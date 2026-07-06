@@ -224,7 +224,7 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
             (num_tokens_per_bs + MIN_CHUNK_SIZE - 1) // MIN_CHUNK_SIZE
         ) * max_bs_in_cuda_graph
         max_num_tokens = max_bs_in_cuda_graph * num_tokens_per_bs
-        with torch.device("cuda"):
+        with torch.device(self.device):
             self.cuda_graph_batch_info = LoRABatchInfo(
                 bs=max_bs_in_cuda_graph,
                 use_cuda_graph=True,

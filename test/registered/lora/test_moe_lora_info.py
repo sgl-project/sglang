@@ -4,9 +4,13 @@ import pytest
 import torch
 
 from sglang.srt.lora.backend.base_backend import _compute_moe_lora_info
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.srt.utils import get_device
+from sglang.test.ci.ci_register import register_cuda_ci, register_xpu_ci
 
 register_cuda_ci(est_time=5, stage="base-b", runner_config="1-gpu-small")
+register_xpu_ci(est_time=5, suite="stage-a-test-1-gpu-xpu")
+
+DEVICE = get_device()
 
 
 def _expected_adapter_enabled(
@@ -24,7 +28,7 @@ def _expected_adapter_enabled(
 
 @pytest.mark.parametrize("use_preallocated_buffers", [False, True])
 def test_compute_moe_lora_info_expands_segments(use_preallocated_buffers: bool):
-    device = "cuda"
+    device = DEVICE
     seg_lens = torch.tensor([5, 1, 7, 3, 9, 2], dtype=torch.int32, device=device)
     seg_indptr = torch.zeros((seg_lens.numel() + 1,), dtype=torch.int32, device=device)
     seg_indptr[1:] = torch.cumsum(seg_lens, dim=0)
@@ -53,7 +57,7 @@ def test_compute_moe_lora_info_expands_segments(use_preallocated_buffers: bool):
         token_lora_mapping,
         max_len=int(seg_lens.max().item()),
     )
-    torch.cuda.synchronize()
+    torch.get_device_module(device).synchronize()
 
     expected_mapping = torch.repeat_interleave(weight_indices, seg_lens)
     expected_enabled = _expected_adapter_enabled(lora_ranks, weight_indices)
@@ -65,8 +69,13 @@ def test_compute_moe_lora_info_expands_segments(use_preallocated_buffers: bool):
         assert actual_mapping.data_ptr() == token_lora_mapping.data_ptr()
 
 
+@pytest.mark.skipif(
+    not (hasattr(torch, "cuda") and torch.cuda.is_available()),
+    reason="The launch-coverage assertion guards the CUDA triton kernel path only; "
+    "non-CUDA devices (e.g. XPU) use the pure-torch fallback which has no such launch.",
+)
 def test_compute_moe_lora_info_rejects_undercovered_launch():
-    device = "cuda"
+    device = DEVICE
     seg_indptr = torch.tensor([0, 300], dtype=torch.int32, device=device)
     weight_indices = torch.tensor([0], dtype=torch.int32, device=device)
     lora_ranks = torch.tensor([16], dtype=torch.int32, device=device)

@@ -146,7 +146,7 @@ class TritonLoRABackend(BaseLoRABackend):
     ):
         max_tokens = max_bs_in_cuda_graph * num_tokens_per_bs
         mlpb = self.max_loras_per_batch
-        with torch.device("cuda"):
+        with torch.device(self.device):
             self.cuda_graph_batch_info = LoRABatchInfo(
                 bs=max_bs_in_cuda_graph,
                 use_cuda_graph=True,

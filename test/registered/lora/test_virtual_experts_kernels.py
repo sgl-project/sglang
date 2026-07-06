@@ -23,14 +23,28 @@ Usage:
     python -m pytest test/registered/lora/test_virtual_experts_kernels.py -v
 """
 
+import importlib.util
 import unittest
 
 import torch
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.srt.utils import get_device, is_cuda, is_xpu
+from sglang.test.ci.ci_register import register_cuda_ci, register_xpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-small")
+register_xpu_ci(est_time=15, suite="stage-a-test-1-gpu-xpu")
+
+
+def _require_accelerator_device():
+    """Return the active GPU device string, or skip if no GPU is available.
+
+    The virtual-experts kernels are triton kernels that run on CUDA or XPU
+    (Intel triton). They have no CPU implementation.
+    """
+    if not (is_cuda() or is_xpu()):
+        raise unittest.SkipTest("CUDA or XPU required")
+    return get_device(0)
 
 from sglang.srt.lora.triton_ops.virtual_experts import (
     _align_block_size_jit,
@@ -45,9 +59,7 @@ class TestFusedVirtualTopkIdsPreservesSentinels(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        if not torch.cuda.is_available():
-            raise unittest.SkipTest("CUDA required")
-        cls.device = "cuda:0"
+        cls.device = _require_accelerator_device()
 
     def test_negative_sentinels_preserved(self):
         # Mix of valid topk_ids in [0, num_experts), -1 sentinels (typical
@@ -139,11 +151,9 @@ class _AlignBlockSizeSentinelBucketBase(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        if not torch.cuda.is_available():
-            raise unittest.SkipTest("CUDA required")
         if cls is _AlignBlockSizeSentinelBucketBase:
             raise unittest.SkipTest("Base class")
-        cls.device = "cuda:0"
+        cls.device = _require_accelerator_device()
 
     def _align(self, topk_ids, block_size, num_experts):
         raise NotImplementedError
@@ -264,6 +274,13 @@ class TestAlignBlockSizeTorchSentinelBucket(_AlignBlockSizeSentinelBucketBase):
         return _align_block_size_torch(topk_ids, block_size, num_experts)
 
 
+@unittest.skipUnless(
+    is_cuda() and importlib.util.find_spec("tvm_ffi") is not None,
+    "_align_block_size_jit builds a CUDA JIT kernel via tvm_ffi.load_inline "
+    "(requires a CUDA/nvcc install); it cannot run on non-CUDA platforms such "
+    "as XPU. The torch variant (TestAlignBlockSizeTorchSentinelBucket) covers "
+    "the same alignment logic on those platforms.",
+)
 class TestAlignBlockSizeJitSentinelBucket(_AlignBlockSizeSentinelBucketBase):
     """Test the CUDA JIT kernel path (with fused_sanitize_expert_ids, as in
     production)."""

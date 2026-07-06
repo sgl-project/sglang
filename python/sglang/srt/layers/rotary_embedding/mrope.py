@@ -40,7 +40,14 @@ if _is_npu:
     import torch_npu
 
 if _is_xpu:
-    from sgl_kernel import multimodal_rotary_embedding
+    try:
+        from sgl_kernel import multimodal_rotary_embedding
+    except ImportError:
+        # Older/CUDA sgl_kernel builds don't ship this XPU kernel. Avoid a hard
+        # import failure (it would deregister every model importing get_rope and
+        # silently fall back to the generic Transformers backbone). forward_xpu()
+        # falls back to forward_native when the kernel is None.
+        multimodal_rotary_embedding = None
 
 import triton
 import triton.language as tl
@@ -386,7 +393,11 @@ class MRotaryEmbedding(RotaryEmbedding):
         fused_set_kv_buffer_arg=None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         assert positions.ndim in (1, 2)
-        if positions.ndim == 2 and self.mrope_section:
+        if (
+            multimodal_rotary_embedding is not None
+            and positions.ndim == 2
+            and self.mrope_section
+        ):
             multimodal_rotary_embedding(
                 query,
                 key,

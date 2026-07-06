@@ -9,13 +9,15 @@ import torch
 # IMPORT PREBUILT KERNEL
 # ==============================================================================
 from sglang.jit_kernel.moe_lora_align import moe_lora_align_block_size
+from sglang.srt.lora.lora_moe_runners import _naive_moe_lora_align_block_size
 from sglang.srt.lora.triton_ops import fused_moe_lora
-from sglang.srt.utils import set_random_seed
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.srt.utils import get_device, is_xpu, set_random_seed
+from sglang.test.ci.ci_register import register_cuda_ci, register_xpu_ci
 
 # ==============================================================================
 
 register_cuda_ci(est_time=28, stage="base-b", runner_config="1-gpu-large")
+register_xpu_ci(est_time=28, suite="stage-a-test-1-gpu-xpu")
 
 
 def round_up(x, base):
@@ -159,23 +161,40 @@ def use_fused_moe_lora_kernel(
     adapter_enabled = torch.ones(max_loras + 1, dtype=torch.int32, device=device)
     lora_ids = torch.arange(max_loras, dtype=torch.int32, device=device)
 
-    # call kernel
-    moe_lora_align_block_size(
-        topk_ids,
-        seg_indptr,
-        req_to_lora,
-        num_experts,
-        block_size,
-        max_loras,
-        max_num_tokens_padded,
-        max_num_m_blocks,
-        sorted_token_ids,
-        expert_ids,
-        num_tokens_post_padded,
-        adapter_enabled,
-        lora_ids,
-        None,  # maybe_expert_map
-    )
+    # call kernel — the fused CUDA align kernel exists only for CUDA; on XPU
+    # use the pure-torch native alignment.
+    if is_xpu():
+        sorted_token_ids, expert_ids, num_tokens_post_padded = (
+            _naive_moe_lora_align_block_size(
+                topk_ids,
+                seg_indptr,
+                req_to_lora,
+                num_experts,
+                block_size,
+                max_loras,
+                max_num_tokens_padded,
+                max_num_m_blocks,
+                adapter_enabled,
+                device,
+            )
+        )
+    else:
+        moe_lora_align_block_size(
+            topk_ids,
+            seg_indptr,
+            req_to_lora,
+            num_experts,
+            block_size,
+            max_loras,
+            max_num_tokens_padded,
+            max_num_m_blocks,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            adapter_enabled,
+            lora_ids,
+            None,  # maybe_expert_map
+        )
 
     config = {
         "BLOCK_SIZE_M": 16,
@@ -263,7 +282,7 @@ def use_torch(
 
 
 DTYPES = [torch.float32, torch.float16, torch.bfloat16]
-DEVICES = [f"cuda:{0}"]
+DEVICES = [get_device(0)]
 SEED = [42]
 
 

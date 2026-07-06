@@ -72,7 +72,7 @@ class LoRAOverlapLoader:
             if event.query()
         ]
         for lora_id, event in completed_loads:
-            torch.cuda.current_stream().wait_event(event)
+            self.device_module.current_stream().wait_event(event)
             del self.lora_to_overlap_load_event[lora_id]
 
     def _try_start_overlap_load(

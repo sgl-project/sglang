@@ -20,7 +20,8 @@ from sglang.srt.lora.triton_ops.chunked_sgmv_expand import _chunked_lora_expand_
 from sglang.srt.lora.triton_ops.chunked_sgmv_shrink import _chunked_lora_shrink_kernel
 from sglang.srt.lora.utils import LoRABatchInfo, get_lm_head_pruned_lens
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.srt.utils import get_device
+from sglang.test.ci.ci_register import register_cuda_ci, register_xpu_ci
 from sglang.test.lora_utils import (
     reference_embedding_lora_a_shrink,
     reference_sgmv_expand,
@@ -30,11 +31,27 @@ from sglang.test.lora_utils import (
 CHUNK_SIZE = 16
 
 register_cuda_ci(est_time=60, suite="nightly-1-gpu", nightly=True)
+register_xpu_ci(est_time=60, suite="stage-a-test-1-gpu-xpu")
+
+
+def _clear_jit_cache(kernel):
+    """Clear a triton JITFunction's compiled-kernel cache across triton versions.
+
+    Older triton exposes ``_clear_cache()``; newer builds (e.g. Intel triton on
+    XPU) keep per-device caches in ``device_caches`` instead.
+    """
+    clear = getattr(kernel, "_clear_cache", None)
+    if callable(clear):
+        clear()
+        return
+    device_caches = getattr(kernel, "device_caches", None)
+    if isinstance(device_caches, dict):
+        device_caches.clear()
 
 
 def reset_kernel_cache():
-    _chunked_lora_shrink_kernel._clear_cache()
-    _chunked_lora_expand_kernel._clear_cache()
+    _clear_jit_cache(_chunked_lora_shrink_kernel)
+    _clear_jit_cache(_chunked_lora_expand_kernel)
 
 
 class BatchComposition(Enum):
@@ -110,7 +127,7 @@ class TestChunkedSGMV(unittest.TestCase):
         torch.manual_seed(42)
         random.seed(42)
 
-        self.device = torch.device("cuda")
+        self.device = torch.device(get_device())
         self.dtype = torch.float16
         self.input_dim = 2560  # Hidden dimension
         self.max_seq_len = 1024
