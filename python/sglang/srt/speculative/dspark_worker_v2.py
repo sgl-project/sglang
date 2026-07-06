@@ -220,6 +220,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._last_draft_block_metadata_debug: Optional[dict] = None
         self._last_draft_block_ids_debug: Optional[list[int]] = None
         self._last_context_kv_path_debug: Optional[str] = None
+        self._boundary_debug_by_req_pool: dict[int, dict] = {}
         self._stacked_wqkv_fp8_proj = None
         self._stacked_wqkv_kv_offsets: list[tuple[int, int]] = []
         self._stacked_wqkv_out_sizes: list[int] = []
@@ -888,6 +889,20 @@ class DSparkWorkerV2(BaseSpecWorker):
         flat_hidden = hidden.to(device=device, non_blocking=True)[valid]
         flat_cache_locs = cache_locs[valid].to(torch.int64)
         flat_positions = positions[valid].to(torch.int64)
+        if self._accept_anomaly_enabled:
+            for i in range(bs):
+                row_valid = valid[i]
+                if not row_valid.any():
+                    continue
+                take = torch.nonzero(row_valid, as_tuple=False).view(-1)[-8:]
+                self._record_boundary_debug(
+                    req_pool_idx=int(req_pool_indices[i]),
+                    stage="decode_tail_replay",
+                    positions=positions[i, take],
+                    cache_locs=cache_locs[i, take],
+                    hidden_rows=hidden[i, take],
+                    extra={"tail_len": int(tail_len)},
+                )
         self._materialize_main_hidden_to_draft_state(
             main_hidden=flat_hidden,
             cache_loc=flat_cache_locs,
@@ -1036,6 +1051,25 @@ class DSparkWorkerV2(BaseSpecWorker):
                 [int(x) for x in rows[-1].reshape(-1)[:8].tolist()],
             ]
 
+        def first_last_row_edges(tensor):
+            if (
+                tensor is None
+                or not isinstance(tensor, torch.Tensor)
+                or tensor.numel() == 0
+            ):
+                return None
+            rows = tensor.detach().cpu()
+            if rows.ndim == 1:
+                return None
+            first = rows[0].reshape(-1)
+            last = rows[-1].reshape(-1)
+            return {
+                "first_row_first8": [int(x) for x in first[:8].tolist()],
+                "first_row_last8": [int(x) for x in first[-8:].tolist()],
+                "last_row_first8": [int(x) for x in last[:8].tolist()],
+                "last_row_last8": [int(x) for x in last[-8:].tolist()],
+            }
+
         return {
             "draft_can_run_graph": can_run_graph,
             "draft_forward_mode": str(getattr(draft_forward_batch, "forward_mode", None)),
@@ -1066,7 +1100,83 @@ class DSparkWorkerV2(BaseSpecWorker):
             "draft_swa_indices_first_last": first_last_rows(
                 getattr(core, "swa_page_indices", None)
             ),
+            "draft_swa_indices_edges": first_last_row_edges(
+                getattr(core, "swa_page_indices", None)
+            ),
         }
+
+    def _summarize_hidden_rows(self, rows: torch.Tensor) -> Optional[dict]:
+        if rows is None or rows.numel() == 0:
+            return None
+        rows_f = rows.detach().float()
+        row_norm = torch.linalg.vector_norm(rows_f, dim=-1)
+        return {
+            "shape": [int(x) for x in rows.shape],
+            "sum": float(rows_f.sum().detach().cpu()),
+            "abs_sum": float(rows_f.abs().sum().detach().cpu()),
+            "max_abs": float(rows_f.abs().max().detach().cpu()),
+            "row_norm_first_last": [
+                float(row_norm[0].detach().cpu()),
+                float(row_norm[-1].detach().cpu()),
+            ],
+            "row_sum_first_last": [
+                float(rows_f[0].sum().detach().cpu()),
+                float(rows_f[-1].sum().detach().cpu()),
+            ],
+        }
+
+    def _boundary_loc_payload(
+        self,
+        *,
+        positions: torch.Tensor,
+        cache_locs: torch.Tensor,
+        hidden_rows: torch.Tensor,
+    ) -> dict:
+        token_to_kv_pool = self.draft_model_runner.attn_backend.token_to_kv_pool
+        translate_swa = getattr(token_to_kv_pool, "translate_loc_from_full_to_swa", None)
+        swa_locs = None
+        if translate_swa is not None and cache_locs.numel() > 0:
+            swa_locs = translate_swa(cache_locs.to(device=self.device, dtype=torch.int64))
+        return {
+            "positions": [int(x) for x in positions.detach().cpu().tolist()],
+            "full_locs": [int(x) for x in cache_locs.detach().cpu().tolist()],
+            "swa_locs": (
+                [int(x) for x in swa_locs.detach().cpu().tolist()]
+                if swa_locs is not None
+                else None
+            ),
+            "hidden": self._summarize_hidden_rows(hidden_rows),
+        }
+
+    def _record_boundary_debug(
+        self,
+        *,
+        req_pool_idx: int,
+        stage: str,
+        positions: torch.Tensor,
+        cache_locs: torch.Tensor,
+        hidden_rows: torch.Tensor,
+        extra: Optional[dict] = None,
+    ) -> None:
+        if not self._accept_anomaly_enabled:
+            return
+        if not self._is_tp0():
+            return
+        if positions.numel() == 0 or cache_locs.numel() == 0 or hidden_rows.numel() == 0:
+            return
+        try:
+            payload = self._boundary_loc_payload(
+                positions=positions.to(device=self.device, dtype=torch.int64),
+                cache_locs=cache_locs.to(device=self.device, dtype=torch.int64),
+                hidden_rows=hidden_rows.to(device=self.device),
+            )
+            if extra:
+                payload.update(extra)
+            debug = self._boundary_debug_by_req_pool.setdefault(int(req_pool_idx), {})
+            debug[stage] = payload
+        except Exception as e:
+            debug = self._boundary_debug_by_req_pool.setdefault(int(req_pool_idx), {})
+            debug[stage] = {"error": str(e)}
 
     def _checksum_swa_kv_rows(
         self,
@@ -1152,6 +1262,9 @@ class DSparkWorkerV2(BaseSpecWorker):
                 "full_last8": [int(x) for x in full_locs[-8:].detach().cpu().tolist()],
                 "swa_first8": [int(x) for x in swa_locs[:8].detach().cpu().tolist()],
                 "swa_last8": [int(x) for x in swa_locs[-8:].detach().cpu().tolist()],
+                "boundary_debug": self._boundary_debug_by_req_pool.get(
+                    int(req_pool_idx)
+                ),
                 "context_kv_checksums": [
                     self._checksum_swa_kv_rows(
                         layer_id=layer_id,
@@ -2200,6 +2313,28 @@ class DSparkWorkerV2(BaseSpecWorker):
             model_worker_batch
         )
         main_x = self.draft_model.project_main_hidden(logits_output.hidden_states)
+        if self._accept_anomaly_enabled:
+            offset = 0
+            for i, extend_len in enumerate(extend_lens_list):
+                next_offset = offset + int(extend_len)
+                if extend_len > 0:
+                    take_start = max(offset, next_offset - 8)
+                    req_pool_idx = int(model_worker_batch.req_pool_indices[i])
+                    self._boundary_debug_by_req_pool[req_pool_idx] = {}
+                    self._record_boundary_debug(
+                        req_pool_idx=req_pool_idx,
+                        stage="prefill_tail_source",
+                        positions=positions[take_start:next_offset],
+                        cache_locs=model_worker_batch.out_cache_loc[
+                            take_start:next_offset
+                        ],
+                        hidden_rows=main_x[take_start:next_offset],
+                        extra={
+                            "extend_len": int(extend_len),
+                            "post_seq_len": int(model_worker_batch.seq_lens[i]),
+                        },
+                    )
+                offset = next_offset
         self._materialize_main_hidden_to_draft_state(
             main_hidden=main_x,
             cache_loc=model_worker_batch.out_cache_loc,
@@ -2428,6 +2563,44 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
             out_tokens[transfer_warmup_mask] = 0
             out_tokens[transfer_warmup_mask, 0] = target0[transfer_warmup_mask]
+
+        hidden = logits_output.hidden_states
+        main_x_flat = None
+        commit_mask = None
+        if hidden is None and bs > 0:
+            raise RuntimeError(
+                "DSpark verify requires target main_hidden states, but got None."
+            )
+        if bs > 0:
+            hidden = hidden.view(bs, verify_stride, -1)
+            hidden_flat = hidden.reshape(-1, hidden.shape[-1])
+            main_x_flat = self.draft_model.project_main_hidden(hidden_flat)
+            commit_mask_2d = (
+                self._verify_pos_offsets.unsqueeze(0)
+                < commit_lens.unsqueeze(1).to(torch.int64)
+            )
+            commit_mask = commit_mask_2d.reshape(-1)
+            if self._accept_anomaly_enabled:
+                cache_locs_2d = verify_out_cache_loc.view(bs, verify_stride)
+                positions_2d = verify_positions.view(bs, verify_stride)
+                main_x_2d = main_x_flat.view(bs, verify_stride, -1)
+                for i in range(bs):
+                    row_valid = commit_mask_2d[i]
+                    if not row_valid.any():
+                        continue
+                    take = torch.nonzero(row_valid, as_tuple=False).view(-1)[-8:]
+                    self._record_boundary_debug(
+                        req_pool_idx=int(req_pool_indices[i]),
+                        stage="decode_verify_write",
+                        positions=positions_2d[i, take],
+                        cache_locs=cache_locs_2d[i, take],
+                        hidden_rows=main_x_2d[i, take],
+                        extra={
+                            "commit_len": int(commit_lens[i]),
+                            "prefix_len": int(prefix_lens[i]),
+                            "new_seq_len": int(new_seq_lens[i]),
+                        },
+                    )
         self._maybe_log_accept_anomaly(
             model_worker_batch=model_worker_batch,
             draft_input=draft_input,
@@ -2445,20 +2618,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         if on_publish is not None:
             on_publish(new_seq_lens)
 
-        hidden = logits_output.hidden_states
-        if hidden is None and bs > 0:
-            raise RuntimeError(
-                "DSpark verify requires target main_hidden states, but got None."
-            )
         if bs > 0:
-            hidden = hidden.view(bs, verify_stride, -1)
-            hidden_flat = hidden.reshape(-1, hidden.shape[-1])
-            main_x_flat = self.draft_model.project_main_hidden(hidden_flat)
-            commit_mask_2d = (
-                self._verify_pos_offsets.unsqueeze(0)
-                < commit_lens.unsqueeze(1).to(torch.int64)
-            )
-            commit_mask = commit_mask_2d.reshape(-1)
             self._materialize_main_hidden_to_draft_state(
                 main_hidden=main_x_flat,
                 cache_loc=verify_out_cache_loc[commit_mask],
