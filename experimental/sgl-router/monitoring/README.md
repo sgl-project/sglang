@@ -26,6 +26,7 @@ The dashboard graphs every family the router emits:
 | `sgl_router_stream_outcome_total` | Counter | **End-of-stream truth** for 2xx streaming responses by `worker_url`, `model_id`, `outcome` (`ok` / `inband_error` / `upstream_error` / `client_disconnect`). Headers-time counters record a committed 200 as success even when the engine later fails in-band; this is where that failure shows up |
 | `sgl_router_request_duration_seconds` | Histogram | End-to-end request latency by `model_id` |
 | `sgl_router_ttft_seconds` | Histogram | Time to first token (streaming) by `model_id` |
+| `sgl_router_itl_seconds` | Histogram | Inter-token latency (gap between successive upstream chunks, 2xx streaming) by `model_id`; bucket edges match the engine's `sglang:inter_token_latency_seconds` |
 | `sgl_router_overlap_blocks` | Histogram | Cache-aware-zmq overlap blocks by `model_id` |
 | `sgl_router_active_load` | Gauge | Per-worker prefill-token / decode-block load |
 | `sgl_router_workers` | Gauge | Registered worker count by `mode` |

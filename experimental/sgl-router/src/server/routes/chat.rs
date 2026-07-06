@@ -394,6 +394,18 @@ async fn chat_completions_inner(
         })
     };
 
+    // Builds the inter-token-latency hook the SSE pump fires with the gap
+    // between successive upstream chunks. Installed only on the streaming
+    // arms below, and only armed by the proxy for 2xx responses — the same
+    // gate as TTFT.
+    let make_itl_hook = || -> Box<dyn Fn(f64) + Send + 'static> {
+        let metrics = Arc::clone(&ctx.metrics);
+        let model = metrics_model.clone();
+        Box::new(move |gap_seconds: f64| {
+            metrics.observe_itl(&model, gap_seconds);
+        })
+    };
+
     // Builds the end-to-end-latency guard for streaming requests. Packed into
     // `stream_guards` so it records when the SSE pump finishes (stream end or
     // client disconnect), not at response-headers time. Non-streaming records
@@ -627,6 +639,7 @@ async fn chat_completions_inner(
                 // of scope here — see the request_id comment above.
                 request_id.as_deref(),
                 Some(make_stream_end_hook(&decode_worker.url)),
+                Some(make_itl_hook()),
             );
             tokio::select! {
                 biased;
@@ -683,6 +696,7 @@ async fn chat_completions_inner(
             // it; here we only supply the rid the engine knows this request by.
             request_id.as_deref(),
             Some(make_stream_end_hook(&metrics_worker_url)),
+            Some(make_itl_hook()),
         );
         // Bias `fetch` over the cancellation branch: a successful
         // response that completes in the same poll as the token firing

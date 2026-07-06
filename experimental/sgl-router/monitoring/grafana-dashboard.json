@@ -1004,12 +1004,222 @@
       ]
     },
     {
+      "type": "timeseries",
+      "title": "ITL quantiles (streaming)",
+      "description": "Inter-token latency (gap between successive upstream chunks) for 2xx streaming requests. Bucket edges match the engine's sglang:inter_token_latency_seconds for direct quantile comparison.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 31,
+        "w": 8,
+        "h": 8
+      },
+      "id": 28,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "11.6.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(sgl_router_itl_seconds_bucket{model_id=~\"$model_id\"}[$__rate_interval])))",
+          "range": true,
+          "refId": "A",
+          "legendFormat": "p50",
+          "format": "time_series"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.9, sum by (le) (rate(sgl_router_itl_seconds_bucket{model_id=~\"$model_id\"}[$__rate_interval])))",
+          "range": true,
+          "refId": "B",
+          "legendFormat": "p90",
+          "format": "time_series"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(sgl_router_itl_seconds_bucket{model_id=~\"$model_id\"}[$__rate_interval])))",
+          "range": true,
+          "refId": "C",
+          "legendFormat": "p99",
+          "format": "time_series"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Stream outcomes (end-of-stream truth)",
+      "description": "End-of-stream classification for 2xx streaming responses: ok / inband_error / upstream_error / client_disconnect. inband_error is an engine that committed 200 OK then failed in-band \u2014 invisible to every headers-time metric.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 8,
+        "y": 31,
+        "w": 8,
+        "h": 8
+      },
+      "id": 29,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "11.6.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (outcome) (rate(sgl_router_stream_outcome_total{model_id=~\"$model_id\",worker_url=~\"$worker_url\"}[$__rate_interval]))",
+          "range": true,
+          "refId": "A",
+          "legendFormat": "{{outcome}}",
+          "format": "time_series"
+        }
+      ]
+    },
+    {
       "type": "row",
       "title": "Workers & Health",
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 31,
+        "y": 39,
         "w": 24,
         "h": 1
       },
@@ -1026,7 +1236,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 32,
+        "y": 40,
         "w": 6,
         "h": 8
       },
@@ -1119,7 +1329,7 @@
       },
       "gridPos": {
         "x": 6,
-        "y": 32,
+        "y": 40,
         "w": 6,
         "h": 8
       },
@@ -1212,7 +1422,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 32,
+        "y": 40,
         "w": 6,
         "h": 8
       },
@@ -1323,7 +1533,7 @@
       },
       "gridPos": {
         "x": 18,
-        "y": 32,
+        "y": 40,
         "w": 6,
         "h": 8
       },
@@ -1412,7 +1622,7 @@
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 40,
+        "y": 48,
         "w": 24,
         "h": 1
       },
@@ -1429,7 +1639,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 41,
+        "y": 49,
         "w": 8,
         "h": 8
       },
@@ -1522,7 +1732,7 @@
       },
       "gridPos": {
         "x": 8,
-        "y": 41,
+        "y": 49,
         "w": 8,
         "h": 8
       },
@@ -1615,7 +1825,7 @@
       },
       "gridPos": {
         "x": 16,
-        "y": 41,
+        "y": 49,
         "w": 8,
         "h": 8
       },
@@ -1716,7 +1926,7 @@
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 49,
+        "y": 57,
         "w": 24,
         "h": 1
       },
@@ -1733,7 +1943,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 50,
+        "y": 58,
         "w": 8,
         "h": 8
       },
@@ -1826,7 +2036,7 @@
       },
       "gridPos": {
         "x": 8,
-        "y": 50,
+        "y": 58,
         "w": 8,
         "h": 8
       },
@@ -1919,7 +2129,7 @@
       },
       "gridPos": {
         "x": 16,
-        "y": 50,
+        "y": 58,
         "w": 8,
         "h": 8
       },

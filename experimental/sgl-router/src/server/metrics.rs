@@ -23,6 +23,7 @@
 //! | `sgl_router_stream_outcome_total` | Counter | `worker_url`, `model_id`, `outcome` |
 //! | `sgl_router_request_duration_seconds` | Histogram | `model_id` |
 //! | `sgl_router_ttft_seconds` | Histogram | `model_id` |
+//! | `sgl_router_itl_seconds` | Histogram | `model_id` |
 //! | `sgl_router_responses_total` | Counter | `route`, `method`, `status_code` |
 //! | `sgl_router_overlap_blocks` | Histogram | `model_id` |
 //! | `sgl_router_active_load` | Gauge | `worker_url`, `kind` |
@@ -92,6 +93,22 @@ const TTFT_BUCKETS: &[f64] = &[
     0.005, 0.01, 0.025, 0.05, // router-only sub-100 ms head
     0.1, 0.2, 0.4, 0.6, 0.8, 1.0, 2.0, 4.0, 6.0, 8.0, 10.0, 20.0, 40.0, 60.0, 80.0, 100.0, 200.0,
     400.0,
+];
+
+/// Histogram bucket upper bounds (seconds) for `sgl_router_itl_seconds` —
+/// inter-token latency, measured as the gap between successive SSE chunks
+/// arriving from the upstream worker.
+///
+/// These edges are IDENTICAL to the SGLang engine's
+/// `sglang:inter_token_latency_seconds` histogram (defined in
+/// `python/sglang/srt/observability/metrics_collector.py`), for the same
+/// reason [`TTFT_BUCKETS`] aligns with the engine's TTFT grid: matching edges
+/// make `histogram_quantile(router) - histogram_quantile(engine)` reflect
+/// real router-side delay rather than interpolation skew between mismatched
+/// bucket widths.
+const ITL_BUCKETS: &[f64] = &[
+    0.002, 0.004, 0.006, 0.008, 0.010, 0.015, 0.020, 0.025, 0.030, 0.035, 0.040, 0.060, 0.080,
+    0.100, 0.200, 0.400, 0.600, 0.800, 1.0, 2.0, 4.0, 6.0, 8.0,
 ];
 
 /// Histogram bucket upper bounds (seconds) for
@@ -300,6 +317,7 @@ pub struct MetricsRegistry {
     // on `worker_requests_total` / the worker gauges instead.
     request_duration: Mutex<HashMap<String, Histogram>>,
     ttft_seconds: Mutex<HashMap<String, Histogram>>,
+    itl_seconds: Mutex<HashMap<String, Histogram>>,
     // Edge responses by route/method/status (incl. early-exit 400/413/503 and the
     // CatchPanicLayer-synthesized 500).
     responses_total: Mutex<HashMap<EdgeResponseKey, Arc<AtomicU64>>>,
@@ -349,6 +367,7 @@ impl Default for MetricsRegistry {
             stream_outcome_total: Default::default(),
             request_duration: Default::default(),
             ttft_seconds: Default::default(),
+            itl_seconds: Default::default(),
             responses_total: Default::default(),
             overlap_blocks: Default::default(),
             active_load: Default::default(),
@@ -562,6 +581,28 @@ impl MetricsRegistry {
         let hist = guard
             .entry(model_id.to_owned())
             .or_insert_with(|| Histogram::new(TTFT_BUCKETS));
+        hist.observe(seconds);
+    }
+
+    /// Observe one inter-token gap (seconds) for `sgl_router_itl_seconds` —
+    /// the interval between two successive response chunks arriving from the
+    /// upstream worker on a 2xx streaming response. The router does not
+    /// tokenize the output stream, so this is strictly inter-CHUNK latency;
+    /// with the engine's default one-event-per-token streaming the two
+    /// coincide, and when the engine batches tokens into one chunk the
+    /// router-side reading is the client-visible pacing — the quantity a
+    /// user experiences. Uses [`ITL_BUCKETS`], whose edges match the engine's
+    /// ITL histogram so the two are directly comparable in
+    /// `histogram_quantile`.
+    pub fn observe_itl(&self, model_id: &str, seconds: f64) {
+        // See `observe_request_duration` — drop non-finite before the map.
+        if !seconds.is_finite() {
+            return;
+        }
+        let mut guard = self.itl_seconds.lock();
+        let hist = guard
+            .entry(model_id.to_owned())
+            .or_insert_with(|| Histogram::new(ITL_BUCKETS));
         hist.observe(seconds);
     }
 
@@ -874,6 +915,21 @@ impl MetricsRegistry {
             let hist = guard.get(model_id).unwrap();
             let label_body = format!("model_id=\"{}\"", escape_label(model_id));
             render_histogram(&mut out, "sgl_router_ttft_seconds", &label_body, hist);
+        }
+        drop(guard);
+
+        // itl histogram
+        out.push_str(
+            "# HELP sgl_router_itl_seconds Inter-token latency (gap between successive upstream response chunks) for 2xx streaming requests, in seconds.\n",
+        );
+        out.push_str("# TYPE sgl_router_itl_seconds histogram\n");
+        let guard = self.itl_seconds.lock();
+        let mut models: Vec<&String> = guard.keys().collect();
+        models.sort();
+        for model_id in models {
+            let hist = guard.get(model_id).unwrap();
+            let label_body = format!("model_id=\"{}\"", escape_label(model_id));
+            render_histogram(&mut out, "sgl_router_itl_seconds", &label_body, hist);
         }
         drop(guard);
 
@@ -1410,6 +1466,46 @@ mod tests {
                     r#"sgl_router_ttft_seconds_bucket{{model_id="m",le="{le}"}}"#
                 )),
                 "missing engine-aligned TTFT bucket le={le}; got:\n{out}",
+            );
+        }
+    }
+
+    #[test]
+    fn observe_itl_writes_buckets_sum_and_count() {
+        let reg = MetricsRegistry::new();
+        reg.observe_itl("tiny", 0.009);
+        reg.observe_itl("tiny", 0.05);
+        let out = reg.render();
+        assert!(
+            out.contains(r#"sgl_router_itl_seconds_count{model_id="tiny"} 2"#),
+            "expected itl count=2; got:\n{out}",
+        );
+        // 0.009 <= 0.01, so the le=0.01 bucket is 1 (cumulative).
+        assert!(
+            out.contains(r#"sgl_router_itl_seconds_bucket{model_id="tiny",le="0.01"} 1"#),
+            "expected le=0.01 bucket = 1; got:\n{out}",
+        );
+        assert!(out.contains(r#"sgl_router_itl_seconds_bucket{model_id="tiny",le="0.06"} 2"#));
+    }
+
+    #[test]
+    fn itl_buckets_align_with_engine_grid() {
+        // The engine's `sglang:inter_token_latency_seconds` edges. These MUST
+        // all appear verbatim in the router's ITL histogram, else a
+        // `histogram_quantile` comparison silently interpolates on mismatched
+        // grids (see the matching TTFT test above).
+        let reg = MetricsRegistry::new();
+        reg.observe_itl("m", 0.01);
+        let out = reg.render();
+        for le in [
+            "0.002", "0.004", "0.006", "0.008", "0.01", "0.015", "0.02", "0.025", "0.03", "0.035",
+            "0.04", "0.06", "0.08", "0.1", "0.2", "0.4", "0.6", "0.8", "1", "2", "4", "6", "8",
+        ] {
+            assert!(
+                out.contains(&format!(
+                    r#"sgl_router_itl_seconds_bucket{{model_id="m",le="{le}"}}"#
+                )),
+                "missing engine-aligned ITL bucket le={le}; got:\n{out}",
             );
         }
     }

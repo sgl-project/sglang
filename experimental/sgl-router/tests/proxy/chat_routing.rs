@@ -287,6 +287,62 @@ async fn streaming_2xx_request_records_ttft_and_duration() {
     );
 }
 
+/// A 2xx streaming response with N chunks records exactly N-1 inter-token
+/// gaps in `sgl_router_itl_seconds` — the first chunk is TTFT, every later
+/// chunk contributes one gap. End-to-end coverage of the chat handler
+/// installing the ITL hook; the sse-level unit tests cover the pump
+/// primitive in isolation.
+#[tokio::test]
+async fn streaming_2xx_request_records_itl_per_chunk_gap() {
+    // start_slow_stream paces the chunks so they arrive as distinct reads —
+    // back-to-back writes from the plain mock can coalesce into one TCP
+    // segment and undercount the gaps.
+    let chunks: Vec<&'static str> = vec![
+        "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"content\":\"b\"}}]}\n\n",
+        "data: [DONE]\n\n",
+    ];
+    let worker = crate::common::mock_worker::MockWorker::start_slow_stream(
+        chunks,
+        Duration::from_millis(20),
+    )
+    .await;
+    let ctx = build_ctx_with_worker(&worker.url);
+    let app = build_router(ctx.clone());
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "tiny",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": true
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let _ = res.into_body().collect().await.unwrap().to_bytes();
+
+    // The ITL hook records from the SSE pump's spawned task — poll briefly.
+    let expected = r#"sgl_router_itl_seconds_count{model_id="tiny"} 2"#;
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let m = loop {
+        let m = ctx.metrics.render();
+        if m.contains(expected) || std::time::Instant::now() > deadline {
+            break m;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    assert!(
+        m.contains(expected),
+        "3 upstream chunks must record exactly 2 inter-token gaps; got:\n{m}",
+    );
+}
+
 /// End-of-stream truth: an engine that commits `200 OK`, streams a
 /// well-formed in-band `data: {"error"...}` event, and closes cleanly is
 /// byte-level indistinguishable from success to every headers-time metric.
@@ -477,6 +533,11 @@ async fn streaming_5xx_request_records_duration_and_status_but_not_ttft() {
     assert!(
         !m.contains("sgl_router_ttft_seconds_count{"),
         "TTFT must NOT be recorded for a non-2xx streaming response; got:\n{m}",
+    );
+    assert!(
+        !m.contains("sgl_router_itl_seconds_count{"),
+        "ITL must NOT be recorded for a non-2xx streaming response (error-body \
+         chunk pacing is not a token cadence); got:\n{m}",
     );
     assert!(
         m.contains(
@@ -1170,6 +1231,7 @@ async fn forward_streaming_to_records_failure_on_mid_stream_drop() {
             "/v1/chat/completions",
             &headers,
             body,
+            None,
             None,
             None,
             None,

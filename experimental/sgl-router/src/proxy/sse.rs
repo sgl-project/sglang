@@ -230,12 +230,25 @@ impl InbandErrorScanner {
 /// token. It does NOT fire if the stream ends or errors before any `Ok` chunk
 /// arrives. `forward_streaming_to` passes a closure that records
 /// `sgl_router_ttft_seconds` for successful streaming responses.
+///
+/// # Inter-chunk hook
+/// When `on_inter_chunk` is `Some`, the closure runs once per non-empty `Ok`
+/// chunk AFTER the first, receiving the gap (seconds) since the previous
+/// non-empty `Ok` chunk arrived — i.e. inter-token latency as seen at the
+/// router. Gaps are measured between upstream ARRIVALS: while the read-ahead
+/// buffer has budget the pump polls at the engine's pace, so the reading is
+/// engine pacing, not client drain speed. (A stream that exceeds the
+/// read-ahead cap with a slow client blocks the pump on permits, and that
+/// wait leaks into the next gap — unavoidable in a pull model, and rare with
+/// the 1 MiB budget.) `forward_streaming_to` passes a closure that records
+/// `sgl_router_itl_seconds` for successful streaming responses.
 pub fn bytes_stream_to_body<S, E>(
     stream: S,
     stream_guards: Option<Box<dyn Send + 'static>>,
     on_complete: Option<Box<dyn FnOnce(StreamEnd) + Send + 'static>>,
     on_first_byte: Option<Box<dyn FnOnce() + Send + 'static>>,
     abort_reason: Option<Arc<AtomicU8>>,
+    on_inter_chunk: Option<Box<dyn Fn(f64) + Send + 'static>>,
 ) -> Body
 where
     S: futures::Stream<Item = Result<Bytes, E>> + Send + Unpin + 'static,
@@ -319,6 +332,7 @@ where
             // because the engine streams slowly or the task isn't being polled.
             let task_start = Instant::now();
             let mut first_byte_at: Option<Instant> = None;
+            let mut prev_chunk_at: Option<Instant> = None;
             let mut n_chunks: u64 = 0;
             let mut n_bytes: u64 = 0;
             let mut exit_reason = "upstream_end";
@@ -355,6 +369,17 @@ where
                 if !is_err_chunk {
                     if let Some(hook) = on_first_byte.take() {
                         hook();
+                    }
+                    // Inter-token latency: gap between successive non-empty
+                    // Ok-chunk ARRIVALS. The first chunk seeds the clock (its
+                    // latency is TTFT, not ITL); every later chunk reports the
+                    // gap since its predecessor.
+                    if let Some(hook) = on_inter_chunk.as_ref() {
+                        let now = Instant::now();
+                        if let Some(prev) = prev_chunk_at {
+                            hook(now.duration_since(prev).as_secs_f64());
+                        }
+                        prev_chunk_at = Some(now);
                     }
                     if let (Some(scan), Ok(bytes)) = (scanner.as_mut(), &item) {
                         scan.feed(bytes);
@@ -661,7 +686,7 @@ mod tests {
             Ok(Bytes::from_static(b"world")),
         ];
         let s = stream::iter(chunks);
-        let body = bytes_stream_to_body(s, None, None, None, None);
+        let body = bytes_stream_to_body(s, None, None, None, None, None);
         let bytes = body.collect().await.unwrap().to_bytes();
         assert_eq!(&bytes[..], b"hello world");
     }
@@ -685,6 +710,7 @@ mod tests {
             Some(Box::new(move || {
                 fired_c.fetch_add(1, Ordering::SeqCst);
             })),
+            None,
             None,
         );
         let _ = body.collect().await.unwrap();
@@ -714,12 +740,84 @@ mod tests {
                 fired_c.fetch_add(1, Ordering::SeqCst);
             })),
             None,
+            None,
         );
         let _ = body.collect().await;
         assert_eq!(
             fired.load(Ordering::SeqCst),
             0,
             "first-byte hook must not fire when no Ok chunk is ever produced",
+        );
+    }
+
+    /// The inter-chunk hook reports one gap per non-empty Ok chunk AFTER the
+    /// first: N chunks → N-1 gaps (the first chunk's latency is TTFT, not
+    /// ITL). Empty chunks are skipped by the pump before the hook, so they
+    /// contribute no gap and don't reset the clock.
+    #[tokio::test]
+    async fn on_inter_chunk_reports_one_gap_per_chunk_after_first() {
+        use std::sync::Mutex;
+
+        let gaps = Arc::new(Mutex::new(Vec::<f64>::new()));
+        let gaps_c = Arc::clone(&gaps);
+        let chunks = vec![
+            Ok::<Bytes, std::io::Error>(Bytes::from_static(b"a")),
+            Ok(Bytes::new()), // empty: skipped, no gap, no clock reset
+            Ok(Bytes::from_static(b"b")),
+            Ok(Bytes::from_static(b"c")),
+        ];
+        let s = stream::iter(chunks);
+        let body = bytes_stream_to_body(
+            s,
+            None,
+            None,
+            None,
+            None,
+            Some(Box::new(move |gap| {
+                gaps_c.lock().unwrap().push(gap);
+            })),
+        );
+        let _ = body.collect().await.unwrap();
+        let gaps = gaps.lock().unwrap();
+        assert_eq!(
+            gaps.len(),
+            2,
+            "3 non-empty chunks must produce exactly 2 inter-chunk gaps; got {gaps:?}",
+        );
+        assert!(
+            gaps.iter().all(|g| g.is_finite() && *g >= 0.0),
+            "gaps must be finite and non-negative; got {gaps:?}",
+        );
+    }
+
+    /// A single-chunk stream has no inter-chunk gap, and an error chunk is
+    /// not a token — neither may fire the hook.
+    #[tokio::test]
+    async fn on_inter_chunk_not_fired_for_single_chunk_or_error() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let fired = Arc::new(AtomicUsize::new(0));
+        let fired_c = Arc::clone(&fired);
+        let chunks: Vec<Result<Bytes, std::io::Error>> = vec![
+            Ok(Bytes::from_static(b"only")),
+            Err(std::io::Error::other("upstream died mid-stream")),
+        ];
+        let s = stream::iter(chunks);
+        let body = bytes_stream_to_body(
+            s,
+            None,
+            None,
+            None,
+            None,
+            Some(Box::new(move |_gap| {
+                fired_c.fetch_add(1, Ordering::SeqCst);
+            })),
+        );
+        let _ = body.collect().await;
+        assert_eq!(
+            fired.load(Ordering::SeqCst),
+            0,
+            "one Ok chunk followed by an error chunk has no token-to-token gap",
         );
     }
 
@@ -805,6 +903,7 @@ mod tests {
             })),
             None,
             None,
+            None,
         );
         let _ = body.collect().await.unwrap();
         // The hook fires from the spawned pump task; wait for it briefly.
@@ -839,6 +938,7 @@ mod tests {
             })),
             None,
             None,
+            None,
         );
         let _ = body.collect().await.unwrap();
         for _ in 0..50 {
@@ -869,6 +969,7 @@ mod tests {
             Some(Box::new(move |end| {
                 *seen_c.lock().unwrap() = Some(end);
             })),
+            None,
             None,
             None,
         );
@@ -931,6 +1032,8 @@ mod tests {
                 *seen_c.lock().unwrap() = Some(end);
             })),
             None,
+            None,
+            None,
         );
         let _ = body.collect().await;
         for _ in 0..50 {
@@ -961,6 +1064,7 @@ mod tests {
             })),
             None,
             None,
+            None,
         );
         let _ = body.collect().await;
         for _ in 0..50 {
@@ -981,7 +1085,7 @@ mod tests {
             Err(std::io::Error::other("upstream blew up mid-stream")),
         ];
         let s = stream::iter(chunks);
-        let body = bytes_stream_to_body(s, None, None, None, None);
+        let body = bytes_stream_to_body(s, None, None, None, None, None);
         // Collecting a body that terminates with an error must return Err.
         let result = body.collect().await;
         assert!(
@@ -1043,7 +1147,7 @@ mod tests {
         // that arm, the closure unwrap-or-elses would panic itself or
         // produce an empty message, which this test catches.
         let s = PanicAnyOnSecondPoll { polls: 0 };
-        let body = bytes_stream_to_body(s, None, None, None, None);
+        let body = bytes_stream_to_body(s, None, None, None, None, None);
         let result = body.collect().await;
         assert!(
             result.is_err(),
@@ -1066,7 +1170,7 @@ mod tests {
         // The pump task panics mid-stream. The client must see a loud Err,
         // NOT a silently-truncated success.
         let s = PanicOnSecondPoll { polls: 0 };
-        let body = bytes_stream_to_body(s, None, None, None, None);
+        let body = bytes_stream_to_body(s, None, None, None, None, None);
         let result = body.collect().await;
         assert!(
             result.is_err(),
@@ -1101,7 +1205,7 @@ mod tests {
         // panic path actively overwrites it (a no-op wouldn't).
         let reason = Arc::new(AtomicU8::new(AbortReason::StreamClientGone as u8));
         let s = PanicOnSecondPoll { polls: 0 };
-        let body = bytes_stream_to_body(s, None, None, None, Some(Arc::clone(&reason)));
+        let body = bytes_stream_to_body(s, None, None, None, Some(Arc::clone(&reason)), None);
         // Drain the body so the pump task runs to completion (panics, gets
         // caught by `catch_unwind`, and the panic marker's Drop has fired).
         let _ = body.collect().await;
@@ -1173,7 +1277,7 @@ mod tests {
             yielded: 0,
             max: 1000, // way more than we'll let it consume
         };
-        let body = bytes_stream_to_body(stream, None, None, None, None);
+        let body = bytes_stream_to_body(stream, None, None, None, None, None);
 
         // Read exactly one frame, then drop the body to simulate client disconnect.
         let mut data_stream = body.into_data_stream();
@@ -1225,7 +1329,7 @@ mod tests {
             stream::pending::<Result<Bytes, std::io::Error>>(),
             std::time::Duration::from_millis(50),
         );
-        let body = bytes_stream_to_body(stalled, Some(guard), None, None, None);
+        let body = bytes_stream_to_body(stalled, Some(guard), None, None, None, None);
         tokio::spawn(async move {
             let _ = body.collect().await;
         });
@@ -1274,7 +1378,7 @@ mod tests {
         let s = stream::iter(chunks);
 
         // Build the Body but DO NOT read it: the client never drains a byte.
-        let _body = bytes_stream_to_body(s, Some(guard), None, None, None);
+        let _body = bytes_stream_to_body(s, Some(guard), None, None, None, None);
 
         // Let the pump run. It should race ahead of the (absent) client, reach
         // upstream-`None`, and drop the guards — all well within STREAM_SEND_STALL.
@@ -1333,7 +1437,7 @@ mod tests {
         // Hold the Body WITHOUT reading it: the receiver stays open (no clean
         // disconnect) but undrained, so the pump parks acquiring read-ahead
         // permits once the buffer is full.
-        let _body = bytes_stream_to_body(s, Some(guard), None, None, None);
+        let _body = bytes_stream_to_body(s, Some(guard), None, None, None, None);
 
         // Advance past the send-stall timeout. The pump must give up on the
         // non-draining client and drop its guards.
@@ -1369,7 +1473,7 @@ mod tests {
             .map(|_| Ok(Bytes::from(vec![b'x'; 64 * 1024])))
             .collect();
         let s = stream::iter(chunks);
-        let _body = bytes_stream_to_body(s, None, None, None, Some(Arc::clone(&reason)));
+        let _body = bytes_stream_to_body(s, None, None, None, Some(Arc::clone(&reason)), None);
         // Advance past send-stall so the pump gives up on the non-draining
         // client. `_body` is held to keep the receiver alive during the wait
         // — a Drop here would masquerade as a client_gone.
@@ -1422,6 +1526,7 @@ mod tests {
             })),
             None,
             None,
+            None,
         );
 
         // Advance past the send-stall timeout, then let the on_complete hook run.
@@ -1468,7 +1573,7 @@ mod tests {
         // guards — even though the client never read a byte.
         let big = Bytes::from(vec![b'x'; 2 * STREAM_READAHEAD_MAX_BYTES]);
         let s = stream::iter(vec![Ok::<Bytes, std::io::Error>(big)]);
-        let _body = bytes_stream_to_body(s, Some(guard), None, None, None);
+        let _body = bytes_stream_to_body(s, Some(guard), None, None, None, None);
 
         for _ in 0..1000 {
             if dropped.load(Ordering::SeqCst) {
@@ -1491,7 +1596,7 @@ mod tests {
     async fn oversized_single_chunk_streams_through_intact() {
         let big = vec![b'x'; 2 * STREAM_READAHEAD_MAX_BYTES];
         let s = stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from(big.clone()))]);
-        let body = bytes_stream_to_body(s, None, None, None, None);
+        let body = bytes_stream_to_body(s, None, None, None, None, None);
         let bytes = body.collect().await.unwrap().to_bytes();
         assert_eq!(
             bytes.len(),

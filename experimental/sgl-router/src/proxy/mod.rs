@@ -719,6 +719,12 @@ impl Proxy {
     /// completed generation from an engine that committed `200 OK` and then
     /// reported failure via an in-band `data: {"error"...}` event — the two
     /// are identical to every headers-time metric.
+    ///
+    /// `on_inter_chunk` — when `Some`, fires once per upstream chunk after
+    /// the first with the gap (seconds) since the previous chunk arrived.
+    /// Installed ONLY for 2xx upstream responses (an error body's chunk
+    /// pacing is not inter-token latency). Callers use this to record
+    /// `sgl_router_itl_seconds`.
     // Each parameter is a distinct, required input to a single upstream
     // forward (target, protocol, breaker, path, headers, body, plus the
     // streaming-lifetime callbacks). Bundling them into a struct purely to
@@ -736,6 +742,7 @@ impl Proxy {
         on_first_byte: Option<Box<dyn FnOnce() + Send + 'static>>,
         abort_rid: Option<&str>,
         on_stream_end: Option<Box<dyn FnOnce(sse::StreamEnd) + Send + 'static>>,
+        on_inter_chunk: Option<Box<dyn Fn(f64) + Send + 'static>>,
     ) -> Result<Response<Body>, ApiError> {
         if !breaker.allow() {
             return Err(ApiError::BreakerOpen {
@@ -861,6 +868,13 @@ impl Proxy {
         } else {
             None
         };
+        // Same gate for inter-token latency: an error body's chunk pacing is
+        // not a token cadence.
+        let inter_chunk_hook = if status.is_success() {
+            on_inter_chunk
+        } else {
+            None
+        };
         // Diagnostic: count this stream as an active SSE pump for its whole
         // lifetime by packing a pump-phase guard into the stream guards (created
         // post-headers, dropped when the pump task ends).
@@ -913,6 +927,7 @@ impl Proxy {
             on_complete,
             first_byte_hook,
             abort_reason_handle,
+            inter_chunk_hook,
         );
         let mut out = Response::new(body);
         *out.status_mut() = status;
@@ -1196,6 +1211,7 @@ mod tests {
                     "/v1/chat/completions",
                     &headers,
                     Bytes::from_static(b"{}"),
+                    None,
                     None,
                     None,
                     None,
@@ -1662,6 +1678,7 @@ mod tests {
                 None,
                 Some("stream-rid-1"),
                 None,
+                None,
             )
             .await
             .expect("streaming dispatch should reach the worker");
@@ -1711,6 +1728,7 @@ mod tests {
                 None,
                 Some("stream-rid-2"),
                 None,
+                None,
             )
             .await
             .expect("streaming dispatch should reach the worker");
@@ -1744,6 +1762,7 @@ mod tests {
                 None,
                 None,
                 Some("stream-rid-3"),
+                None,
                 None,
             )
             .await
@@ -1797,6 +1816,7 @@ mod tests {
                 None,
                 None,
                 Some("headers-timeout-rid"),
+                None,
                 None,
             )
             .await;
@@ -1898,6 +1918,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .expect("headers arrive well within the timeout");
@@ -1966,6 +1987,7 @@ mod tests {
                     None,
                     None,
                     Some(&format!("breaker-test-rid-{i}")),
+                    None,
                     None,
                 )
                 .await
