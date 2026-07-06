@@ -23,6 +23,9 @@
 //   accuracyLabels     [key, label, unit][] — the eval set shown in the
 //                      benchmark card + "⚡ Reproduce". NO engine default:
 //                      required whenever benchmarks carry accuracy data
+//   latencyPercentile  optional, TEMPORARY — "Mean" | "P50" (default "P50"); the
+//                      percentile the TTFT/TPOT values are, shown as "TTFT (<pct>)".
+//                      Legacy "Mean" data is being re-measured to P50; drop once done
 //   multiNodeHints     optional — {[hwId]: string[]} prepended as `# ...` lines
 //   dockerImages       optional — `docker run` image, keyed by `hw|quant`
 //                      then `hw`; falls back to `lmsysorg/sglang:dev`
@@ -574,11 +577,20 @@ export const Deployment = ({ config, benchmarks }) => {
   const renderBenchmarkCard = (entry) => {
     // [key, label, unit, compute?]. Optional compute(measurement) supplies
     // derived metrics (preferred over measurement[key] when present).
+    const pct = config.latencyPercentile || "P50";
     const SPEED_LABELS = [
-      ["ttft_ms",                "TTFT",            "ms"],
-      ["tpot_ms",                "TPOT",            "ms"],
-      ["tokens_per_sec_per_gpu", "tokens/sec/GPU",  ""],
-      ["interactivity",          "interactivity",   "tok/s",
+      ["ttft_ms",                `TTFT (${pct})`,      "ms"],
+      ["tpot_ms",                `TPOT (${pct})`,      "ms"],
+      // SemiAnalysis throughput/GPU = total(input+output)/elapsed/GPU. Stored
+      // `tokens_per_sec_per_gpu` is output-only/GPU, so × (isl+osl)/osl gives total.
+      ["tokens_per_sec_per_gpu", "throughput per gpu", "tok/s",
+        (m) => {
+          const v = m.tokens_per_sec_per_gpu;
+          const w = m.workload || {};
+          if (v == null || w.isl == null || w.osl == null || w.osl === 0) return null;
+          return Math.round(v * (w.isl + w.osl) / w.osl);
+        }],
+      ["interactivity",          "interactivity",   "tokens/s/user",
         (m) => (m.tpot_ms != null && m.tpot_ms !== 0)
           ? Math.round((1000 / m.tpot_ms) * 10) / 10
           : null],
@@ -668,7 +680,11 @@ export const Deployment = ({ config, benchmarks }) => {
             ])}
           </div>
           {legend && (
-            <div style={s.benchLegend}>{legend}</div>
+            <div style={s.benchLegend}>
+              {(Array.isArray(legend) ? legend : [legend]).map((line, i) => (
+                <div key={`legend-${i}`}>{line}</div>
+              ))}
+            </div>
           )}
         </div>
       );
@@ -693,7 +709,10 @@ export const Deployment = ({ config, benchmarks }) => {
       });
       return { title: "Speed", sharedText, colHeaders, rows,
                colCount: measurements.length,
-               legend: "interactivity = 1000 / TPOT(ms)" };
+               legend: [
+                 `throughput per gpu = (input+output tokens)/elapsed/GPU`,
+                 `interactivity = 1000/TPOT(ms) (tokens/s/user)`,
+               ] };
     };
 
     // One row per ACCURACY_LABELS entry with a non-null value; single value column.

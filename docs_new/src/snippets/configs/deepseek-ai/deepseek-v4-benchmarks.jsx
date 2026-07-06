@@ -1,6 +1,7 @@
 // DeepSeek-V4 per-cell benchmark numbers, keyed by the same `match` tuple as
 // deepseek-v4.jsx cells. See _deployment.jsx for the speed/accuracy schema.
 // Measured on sglang v0.5.12.post1.
+// tokens_per_sec_per_gpu is output-only/GPU (nvfp4 rows back-derived from measured total ÷ GPUs).
 export const benchmarks = [
   // ====================================================================
   // B200 + FP4
@@ -143,9 +144,9 @@ export const benchmarks = [
     sglang_version: "PR #25820",
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
-        ttft_ms: 323.85, tpot_ms: 3.62, tokens_per_sec_per_gpu: 496 },
+        ttft_ms: 323.85, tpot_ms: 3.62, tokens_per_sec_per_gpu: 55.1 },
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 16 },
-        ttft_ms: 397.31, tpot_ms: 8.11, tokens_per_sec_per_gpu: 3663 },
+        ttft_ms: 397.31, tpot_ms: 8.11, tokens_per_sec_per_gpu: 407 },
     ],
     accuracy: { gsm8k_pct: 96.66 },
   },
@@ -154,9 +155,9 @@ export const benchmarks = [
     sglang_version: "PR #25820",
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
-        ttft_ms: 338.20, tpot_ms: 6.25, tokens_per_sec_per_gpu: 161 },
+        ttft_ms: 338.20, tpot_ms: 6.25, tokens_per_sec_per_gpu: 17.9 },
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 16 },
-        ttft_ms: 524.85, tpot_ms: 14.45, tokens_per_sec_per_gpu: 1015 },
+        ttft_ms: 524.85, tpot_ms: 14.45, tokens_per_sec_per_gpu: 112.8 },
     ],
     accuracy: { gsm8k_pct: 95.98 },
   },
@@ -210,9 +211,9 @@ export const benchmarks = [
     sglang_version: "PR #25820",
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
-        ttft_ms: 361.72 , tpot_ms: 3.62, tokens_per_sec_per_gpu: 480 },
+        ttft_ms: 361.72 , tpot_ms: 3.62, tokens_per_sec_per_gpu: 53.3 },
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 16 },
-        ttft_ms: 422.96, tpot_ms: 8.19, tokens_per_sec_per_gpu: 3733 },
+        ttft_ms: 422.96, tpot_ms: 8.19, tokens_per_sec_per_gpu: 414.8 },
     ],
     accuracy: { gsm8k_pct: 96.44 },
   },
@@ -221,9 +222,9 @@ export const benchmarks = [
     sglang_version: "PR #25820",
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
-        ttft_ms: 364.33, tpot_ms: 5.33, tokens_per_sec_per_gpu: 381 },
+        ttft_ms: 364.33, tpot_ms: 5.33, tokens_per_sec_per_gpu: 42.3 },
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 16 },
-        ttft_ms: 694.58, tpot_ms: 16.03, tokens_per_sec_per_gpu: 1654 },
+        ttft_ms: 694.58, tpot_ms: 16.03, tokens_per_sec_per_gpu: 183.8 },
     ],
     accuracy: { gsm8k_pct: 96.36 },
   },
