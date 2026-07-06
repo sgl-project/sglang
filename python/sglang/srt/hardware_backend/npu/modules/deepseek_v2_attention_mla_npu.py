@@ -370,7 +370,11 @@ def forward_mla_core_npu(
         )
         if (
             m.kv_cache_dtype == "fp8_e4m3"
-            and forward_batch.forward_mode.is_decode_or_idle()
+            and (
+                forward_batch.forward_mode.is_decode_or_idle()
+                or forward_batch.forward_mode.is_target_verify()
+                or forward_batch.forward_mode.is_draft_extend_v2()
+            )
         ):
             extra_kwargs["save_kv_cache"] = False
 
