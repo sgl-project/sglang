@@ -3734,7 +3734,9 @@ def spec_decode_alloc_len_per_request(server_args) -> int:
     """Per-request KV tokens a (spec-v1) decode step allocates: the draft-decode
     topk*num_steps peak vs. the verify num_draft_tokens, page-aligned.
     """
-    page_size = server_args.page_size
+    from sglang.srt.arg_groups.overrides import resolved_view
+
+    page_size = resolved_view(server_args).page_size
     len_per_topk = server_args.speculative_num_steps or 1
     spec_topk = server_args.speculative_eagle_topk or 1
     spec_tokens = server_args.speculative_num_draft_tokens or 1

@@ -340,11 +340,15 @@ class TestRuntimeResolutionStages(_IsolatedServerArgs):
         self.assertEqual(get_flags().page_size, 64)  # earlier stage survives
 
     def test_record_parity_failure_rolls_back(self):
+        import sglang.srt.arg_groups.overrides as overrides_module
+
         self._publish(page_size=1)
         flags_before = get_flags()
-        with self.assertRaises(AssertionError):
-            # declared value diverges from the live server_args (no dual-apply)
-            get_context().record_runtime_overrides([("bad", {"page_size": 64})])
+        # pin an empty retired set so parity still compares page_size
+        with patch.object(overrides_module, "DUAL_APPLY_RETIRED", frozenset()):
+            with self.assertRaises(AssertionError):
+                # declared value diverges from the live server_args (no dual-apply)
+                get_context().record_runtime_overrides([("bad", {"page_size": 64})])
         self.assertIs(get_flags(), flags_before)  # previous flags intact
         self.assertEqual(get_context()._runtime_overrides, [])  # rolled back
 
@@ -366,12 +370,14 @@ class TestRuntimeResolutionStages(_IsolatedServerArgs):
         finally:
             reset_context()
 
-    def test_declare_load_time_override_dual_applies_and_records(self):
+    def test_declare_load_time_override_records_and_resolves(self):
         from sglang.srt.arg_groups.overrides import declare_load_time_override
 
         args = self._publish(page_size=1)
         declare_load_time_override("model.load_time", {"page_size": 64})
-        self.assertEqual(args.page_size, 64)  # dual-applied onto server_args
+        # dual-apply is retired for page_size: the field stays pristine and
+        # the leaf alone carries the load-time value
+        self.assertEqual(args.page_size, 1)
         self.assertEqual(get_flags().page_size, 64)  # resolved into the leaf
         self.assertEqual(
             get_context()._runtime_overrides,

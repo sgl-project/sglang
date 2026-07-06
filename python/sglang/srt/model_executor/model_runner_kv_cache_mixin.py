@@ -1302,7 +1302,7 @@ class ModelRunnerKVCacheMixin:
         )
 
         available_bytes = self._profile_available_bytes(pre_model_load_memory)
-        page_size = self.server_args.page_size
+        page_size = get_flags().page_size
 
         configurator = create_memory_pool_configurator(self)
         config = configurator.calculate_pool_sizes(available_bytes, page_size)

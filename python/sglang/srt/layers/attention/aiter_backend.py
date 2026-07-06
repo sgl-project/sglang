@@ -72,6 +72,7 @@ from sglang.srt.layers.attention.utils import (
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.runtime_context import get_flags
 from sglang.srt.utils import get_bool_env_var
 
 logger = logging.getLogger(__name__)
@@ -145,7 +146,7 @@ class AiterAttnBackend(AttentionBackend):
 
         self.input_dtype = model_runner.model_config.dtype
 
-        self.page_size = model_runner.server_args.page_size
+        self.page_size = get_flags().page_size
 
         self.extend_attention_fwd = torch.compiler.disable(extend_attention_fwd)
 
@@ -2795,7 +2796,7 @@ class AiterMultiStepDraftBackend:
         # Cached variables for generate_draft_decode_kv_indices
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.pool_len = model_runner.req_to_token_pool.req_to_token.shape[1]
-        self.page_size = model_runner.server_args.page_size
+        self.page_size = get_flags().page_size
 
     def common_template(
         self, forward_batch: ForwardBatch, kv_indices_buffer: torch.Tensor, call_fn: int

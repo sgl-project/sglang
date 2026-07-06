@@ -354,7 +354,10 @@ class TestFa4PageSizeAutoForce(CustomTestCase):
 
         args._handle_attention_backend_compatibility()
 
-        self.assertEqual(args.page_size, 128)
+        from sglang.srt.arg_groups.overrides import resolved_view
+
+        self.assertEqual(args.page_size, 1)  # dual-apply retired: pristine
+        self.assertEqual(resolved_view(args).page_size, 128)
 
     @patch("sglang.srt.arg_groups.overrides.is_sm100_supported", return_value=True)
     @patch("sglang.srt.server_args.ServerArgs.use_mla_backend", return_value=False)
@@ -364,7 +367,10 @@ class TestFa4PageSizeAutoForce(CustomTestCase):
 
         args._handle_attention_backend_compatibility()
 
-        self.assertEqual(args.page_size, 128)
+        from sglang.srt.arg_groups.overrides import resolved_view
+
+        self.assertEqual(args.page_size, 1)  # dual-apply retired: pristine
+        self.assertEqual(resolved_view(args).page_size, 128)
 
 
 class TestContextParallelServerArgs(CustomTestCase):

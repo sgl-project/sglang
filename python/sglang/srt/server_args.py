@@ -4254,14 +4254,18 @@ class ServerArgs:
 
         if not use_mla_backend:
             # MHA architecture
-            if is_hopper_with_cuda_12_3() and is_no_spec_infer_or_topk_one(self):
+            from sglang.srt.arg_groups.overrides import resolved_view
+
+            if is_hopper_with_cuda_12_3() and is_no_spec_infer_or_topk_one(
+                resolved_view(self)
+            ):
                 # Note: flashinfer 0.6.1 caused performance regression on Hopper attention kernel
                 # Before the kernel is fixed, we choose fa3 as the default backend on Hopper MHA
                 # ref: https://github.com/sgl-project/sglang/issues/17411
                 return "fa3"
             elif (
                 is_sm100_supported()
-                and is_no_spec_infer_or_topk_one(self)
+                and is_no_spec_infer_or_topk_one(resolved_view(self))
                 and (
                     self.speculative_algorithm is None
                     or self.speculative_eagle_topk is not None
@@ -5890,12 +5894,16 @@ class ServerArgs:
         run_post_process_pass(self, _dllm_attention_backend)
         run_post_process_pass(self, _dllm_overlap_disable)
 
-        if not self.disable_radix_cache:
-            # The page_size adjustment moved to the resolution pipeline
-            # (arg_groups/overrides.py: _dllm_page_size).
-            from sglang.srt.arg_groups.overrides import _dllm_page_size
+        # The page-size alignment + block-size cap for dllm moved to the
+        # resolution pipeline (arg_groups/overrides.py: _dllm_page_size).
+        # Invoked outside the radix gate: the alignment fill keeps its radix
+        # gate inside the pass, the block-size cap applies regardless (it
+        # replaces the unconditional scheduler-init fallback).
+        from sglang.srt.arg_groups.overrides import _dllm_page_size
 
-            run_post_process_pass(self, _dllm_page_size)
+        run_post_process_pass(self, _dllm_page_size)
+
+        if not self.disable_radix_cache:
             if self.enable_hierarchical_cache:
                 logger.warning(
                     "Hierarchical cache is disabled because of using diffusion LLM inference"
@@ -6425,12 +6433,15 @@ class ServerArgs:
         # (or mamba_chunk_size if it is defined in the model's config) and page_size.
         # It is used to determine the caching point in a sequence during prefill.
         if not hasattr(self, "_mamba_cache_chunk_size"):
+            from sglang.srt.arg_groups.overrides import resolved_view
+
             hf_config = self.get_model_config().hf_config
             chunk_size = getattr(hf_config, "mamba_chunk_size", FLA_CHUNK_SIZE)
+            page_size = resolved_view(self).page_size
             assert (
-                max(chunk_size, self.page_size) % min(chunk_size, self.page_size) == 0
-            ), f"For SSM models, either chunk_size or page_size must be divisible by the other, got {chunk_size=}, {self.page_size=}"
-            self._mamba_cache_chunk_size = max(chunk_size, self.page_size)
+                max(chunk_size, page_size) % min(chunk_size, page_size) == 0
+            ), f"For SSM models, either chunk_size or page_size must be divisible by the other, got {chunk_size=}, {page_size=}"
+            self._mamba_cache_chunk_size = max(chunk_size, page_size)
         return self._mamba_cache_chunk_size
 
     def _check_two_batch_overlap(self):
@@ -6509,8 +6520,10 @@ class ServerArgs:
         # Skip validation if chunked prefill is disabled (i.e., size <= 0).
         # Skip validation if disaggregation mode is decode.
         if self.chunked_prefill_size > 0 and self.disaggregation_mode != "decode":
+            from sglang.srt.arg_groups.overrides import resolved_view
+
             assert (
-                self.chunked_prefill_size % self.page_size == 0
+                self.chunked_prefill_size % resolved_view(self).page_size == 0
             ), "chunked_prefill_size must be divisible by page_size"
 
         # Check pdmux
@@ -6962,10 +6975,11 @@ class ServerArgs:
         """
         # Lazy import so loading server_args doesn't pull in
         # disaggregation / msgspec / zmq at module top level.
+        from sglang.srt.arg_groups.overrides import resolved_view
         from sglang.srt.disaggregation.kv_events import KVEventsConfig
 
         raw = self.kv_events_config
-        page_size = self.page_size
+        page_size = resolved_view(self).page_size
         if not raw or page_size is None or page_size <= 0:
             return None
         try:

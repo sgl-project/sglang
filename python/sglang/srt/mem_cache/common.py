@@ -222,8 +222,10 @@ def get_alloc_len_per_decode(server_args: Optional[ServerArgs] = None) -> int:
     # Spec decoding allocates max(topk * num_steps, num_draft_tokens) per decode step.
     spec_steps = server_args.speculative_num_steps or 1
     spec_topk = server_args.speculative_eagle_topk or 1
+    from sglang.srt.arg_groups.overrides import resolved_view
+
     spec_tokens = server_args.max_speculative_num_draft_tokens
-    page_size = server_args.page_size
+    page_size = resolved_view(server_args).page_size
 
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
@@ -255,11 +257,13 @@ def get_req_to_token_extra_context_len(server_args: ServerArgs) -> int:
     Sized to hold the decode over-allocation; the spec v2 page>1 topk>1 holey
     draft footprint can outgrow the default num_draft_tokens headroom.
     """
+    from sglang.srt.arg_groups.overrides import resolved_view
+
     # FIXME(lsyin): temporary fix for the context length issue under spec decoding
     extra = 4 + (server_args.max_speculative_num_draft_tokens or 0)
     if (
         server_args.speculative_algorithm is not None
-        and server_args.page_size > 1
+        and (resolved_view(server_args).page_size or 1) > 1
         and (server_args.speculative_eagle_topk or 1) > 1
     ):
         extra = max(extra, get_alloc_reserve_per_decode(server_args))
@@ -659,7 +663,7 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     start_p, end_p = req.pop_overallocated_kv_cache()
 
     global_server_args = get_global_server_args()
-    page_size = global_server_args.page_size
+    page_size = get_flags().page_size
     spec_algo = global_server_args.speculative_algorithm
 
     # strip_thinking_cache intentionally reports output tokens as overallocated

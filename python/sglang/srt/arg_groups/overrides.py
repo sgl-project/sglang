@@ -1956,14 +1956,23 @@ def _dllm_overlap_disable(view: Any) -> dict:
 
 @register_post_process
 def _dllm_page_size(view: Any) -> dict:
-    if view.dllm_algorithm is None or view.disable_radix_cache:
+    if view.dllm_algorithm is None:
         return {}
     from sglang.srt.dllm.config import DllmConfig
 
     config = DllmConfig.from_server_args(view)
-    if view.page_size % config.block_size != 0:
+    if not view.disable_radix_cache and view.page_size % config.block_size != 0:
         logger.warning(
             f"Setting page size to {config.block_size} for diffusion LLM inference"
+        )
+        return {"page_size": config.block_size}
+    if view.page_size > config.block_size:
+        # Legacy scheduler-init fallback, folded into the pass: the page
+        # size must not exceed the dllm block size.
+        logger.warning(
+            "WARNING: "
+            f"The page size {view.page_size} should not be larger than dllm block size {config.block_size}."
+            f"Page size now falls back to {config.block_size}"
         )
         return {"page_size": config.block_size}
     return {}
@@ -2109,6 +2118,14 @@ DUAL_APPLY_RETIRED: frozenset = frozenset(
         # declaration; the engine flashinfer preflight and the registry
         # dispatch callables read the pristine input by design.
         "attention_backend",
+        # KV sizing, workers and attention backends read the leaf; the
+        # scheduler / ModelRunner pre-publish captures, the
+        # mamba_cache_chunk_size property, the chunked-prefill divisibility
+        # check, the kv-events describe (launcher-side) and the
+        # default-backend spec gate read the view; the dllm scheduler-init
+        # page fallback is folded into the _dllm_page_size pass; the npu
+        # early default is pre-resolution input synthesis.
+        "page_size",
     }
 )
 

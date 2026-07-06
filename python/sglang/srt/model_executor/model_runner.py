@@ -404,7 +404,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.spec_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
-        self.page_size = server_args.page_size
+        from sglang.srt.arg_groups.overrides import resolved_view
+
+        self.page_size = resolved_view(server_args).page_size
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.is_hybrid_swa = model_config.is_hybrid_swa

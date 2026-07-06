@@ -40,7 +40,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
-from sglang.srt.runtime_context import resolved_attention_backends
+from sglang.srt.runtime_context import get_flags, resolved_attention_backends
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import EagleDraftWorkerBase
 from sglang.srt.speculative.eagle_utils import (
@@ -105,7 +105,7 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
         self.gpu_id = gpu_id
         self.device = server_args.device
         self.target_worker = target_worker
-        self.page_size = server_args.page_size
+        self.page_size = get_flags().page_size
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
@@ -667,7 +667,7 @@ class FrozenKVMTPWorkerV2(EAGLEWorkerV2):
         self.gpu_id = gpu_id
         self.device = server_args.device
         self._target_worker = target_worker
-        self.page_size = server_args.page_size
+        self.page_size = get_flags().page_size
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )

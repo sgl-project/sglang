@@ -632,8 +632,10 @@ class TestGoldenModelOverrides(_IsolatedPublish):
 
     def test_dllm_forces_flashinfer_with_cuda_graph(self):
         # CUDA path: cuda graph enabled by default -> dllm forces flashinfer.
+        # A real dllm arch: the page pass now runs regardless of the radix
+        # switch and builds DllmConfig for it.
         sa = self._construct(
-            "LlamaForCausalLM",
+            "SDARForCausalLM",
             "llama",
             dllm_algorithm="LowConfidence",
             disable_radix_cache=True,
@@ -809,9 +811,17 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             return_value=SimpleNamespace(block_size=32),
         ):
             self.assertEqual(_view() and _dllm_page_size(_view()), {"page_size": 32})
-            self.assertEqual(_dllm_page_size(_view(page_size=64)), {})  # aligned
+            # aligned but larger than the block: the scheduler-init fallback
+            # (folded into this pass) still caps the page at the block size
+            self.assertEqual(_dllm_page_size(_view(page_size=64)), {"page_size": 32})
+            self.assertEqual(_dllm_page_size(_view(page_size=32)), {})  # equal
+            # radix disabled skips the alignment fill but keeps the cap
+            self.assertEqual(_dllm_page_size(_view(disable_radix_cache=True)), {})
+            self.assertEqual(
+                _dllm_page_size(_view(disable_radix_cache=True, page_size=64)),
+                {"page_size": 32},
+            )
         self.assertEqual(_dllm_page_size(_view(dllm_algorithm=None)), {})
-        self.assertEqual(_dllm_page_size(_view(disable_radix_cache=True)), {})
 
     def test_dual_apply_retired_field_mechanics(self):
         from sglang.srt.arg_groups.overrides import run_post_process_pass
@@ -846,8 +856,9 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             overrides_module, "DUAL_APPLY_RETIRED", frozenset({"page_size"})
         ):
             assert_flag_parity(flags, args, {"page_size"})  # no raise
-        with self.assertRaises(AssertionError):
-            assert_flag_parity(flags, args, {"page_size"})
+        with patch.object(overrides_module, "DUAL_APPLY_RETIRED", frozenset()):
+            with self.assertRaises(AssertionError):
+                assert_flag_parity(flags, args, {"page_size"})
 
     def test_initialize_moe_config_reads_resolving_state_prepublish(self):
         # Scheduler.init_moe_gemm_config runs before the model worker
@@ -1604,9 +1615,12 @@ class TestGoldenModelOverrides(_IsolatedPublish):
 
     def test_page_size_leaf_materializes_end_state(self):
         sa = self._construct("LlamaForCausalLM", "llama")
-        declared = {f for _s, d in sa._resolved_overrides for f in d}
-        self.assertIn("page_size", declared)  # default fill declared
-        self.assertEqual(self._publish(sa).page_size, sa.page_size)
+        declared_values = [
+            d["page_size"] for _s, d in sa._resolved_overrides if "page_size" in d
+        ]
+        self.assertTrue(declared_values)  # default fill declared
+        self.assertIsNone(sa.page_size)  # pristine default
+        self.assertEqual(self._publish(sa).page_size, declared_values[-1])
 
     def test_qwen3_5_hybrid_coupled_declaration(self):
         from sglang.srt.arg_groups.overrides import _qwen3_5_hybrid_overrides
