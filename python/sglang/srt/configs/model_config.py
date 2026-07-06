@@ -486,10 +486,17 @@ class ModelConfig:
         context_length: Optional[int] = None,
         **kwargs,
     ):
+        from sglang.srt.arg_groups.overrides import resolved_view
+
+        # dtype / quantization / disable_hybrid_swa_memory are pipeline-
+        # resolved: read them through the view so every construction —
+        # mid-resolution, scheduler-process post-publish, or launcher-side —
+        # captures the declared values (dual-apply retired).
+        view = resolved_view(server_args)
         quantization = (
             server_args.speculative_draft_model_quantization
             if is_draft_model
-            else server_args.quantization
+            else view.quantization
         )
         override_config_file = (
             server_args.decrypted_draft_config_file
@@ -508,7 +515,7 @@ class ModelConfig:
             model_override_args=server_args.json_model_override_args,
             is_embedding=server_args.is_embedding,
             enable_multimodal=server_args.enable_multimodal,
-            dtype=server_args.dtype,
+            dtype=view.dtype,
             quantization=quantization,
             model_impl=server_args.model_impl,
             sampling_defaults=server_args.sampling_defaults,
@@ -518,7 +525,7 @@ class ModelConfig:
             language_only=server_args.language_only,
             encoder_only=server_args.encoder_only,
             is_draft_model=is_draft_model,
-            disable_hybrid_swa_memory=server_args.disable_hybrid_swa_memory,
+            disable_hybrid_swa_memory=view.disable_hybrid_swa_memory,
             model_config_parser=server_args.model_config_parser,
             **kwargs,
         )

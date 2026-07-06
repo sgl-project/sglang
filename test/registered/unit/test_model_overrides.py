@@ -415,7 +415,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
 
     def test_mistral_large3_forces_bfloat16(self):
         sa = self._construct("MistralLarge3ForCausalLM", "mistral")
-        self.assertEqual(sa.dtype, "bfloat16")  # dual-apply == legacy write
+        self.assertEqual(sa.dtype, "auto")  # dual-apply retired: pristine
         self.assertIn(
             ("MODEL_OVERRIDES['MistralLarge3ForCausalLM']", {"dtype": "bfloat16"}),
             sa._resolved_overrides,
@@ -424,15 +424,15 @@ class TestGoldenModelOverrides(_IsolatedPublish):
 
     def test_pixtral_forces_bfloat16(self):
         sa = self._construct("PixtralForConditionalGeneration", "pixtral")
-        self.assertEqual(sa.dtype, "bfloat16")
+        self.assertEqual(sa.dtype, "auto")  # pristine
         self.assertEqual(self._publish(sa).dtype, "bfloat16")
 
     def test_user_requested_dtype_is_still_overridden(self):
         # Legacy fidelity: the arch branch overwrote dtype unconditionally,
-        # so the declaration must too. The pristine request survives only on
-        # provenance (and, post-V3, as the un-overridden server_args field).
+        # so the declaration must too. The pristine request survives on the
+        # field; the leaf carries the override.
         sa = self._construct("MistralLarge3ForCausalLM", "mistral", dtype="float16")
-        self.assertEqual(sa.dtype, "bfloat16")
+        self.assertEqual(sa.dtype, "float16")  # pristine user request
         self.assertEqual(self._publish(sa).dtype, "bfloat16")
 
     def test_control_arch_keeps_pristine_dtype(self):
@@ -491,16 +491,16 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             config_extra=config_extra,
             enable_hierarchical_cache=True,
         )
-        # dual-apply retired: the field stays pristine
+        # dual-apply retired: the fields stay pristine
         self.assertEqual(sa.swa_full_tokens_ratio, 0.8)
-        self.assertTrue(sa.disable_hybrid_swa_memory)
+        self.assertFalse(sa.disable_hybrid_swa_memory)
         flags = self._publish(sa)
         self.assertEqual(flags.swa_full_tokens_ratio, 1.0)
         self.assertTrue(flags.disable_hybrid_swa_memory)
 
     def test_gemma2_disables_hybrid_swa_memory(self):
         sa = self._construct("Gemma2ForCausalLM", "llama")
-        self.assertTrue(sa.disable_hybrid_swa_memory)  # dual-apply == legacy
+        self.assertFalse(sa.disable_hybrid_swa_memory)  # pristine
         self.assertIn(
             ("_gemma2_gemma3_overrides", {"disable_hybrid_swa_memory": True}),
             sa._resolved_overrides,
@@ -509,7 +509,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
 
     def test_olmo2_disables_hybrid_swa_memory(self):
         sa = self._construct("Olmo2ForCausalLM", "llama")
-        self.assertTrue(sa.disable_hybrid_swa_memory)
+        self.assertFalse(sa.disable_hybrid_swa_memory)  # pristine
         self.assertTrue(self._publish(sa).disable_hybrid_swa_memory)
 
     def test_exaone_conditional_on_sliding_window_pattern(self):
@@ -520,7 +520,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             config_extra={"sliding_window_pattern": "LLLG"},
             attention_backend="fa3",
         )
-        self.assertTrue(sa.disable_hybrid_swa_memory)
+        self.assertFalse(sa.disable_hybrid_swa_memory)  # pristine
         self.assertTrue(self._publish(sa).disable_hybrid_swa_memory)
 
     def test_exaone_without_pattern_declares_nothing(self):
@@ -543,7 +543,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             "llama",
             config_extra={"quantization_config": {"quant_method": "mxfp4"}},
         )
-        self.assertEqual(sa.dtype, "bfloat16")  # dual-apply == legacy
+        self.assertEqual(sa.dtype, "auto")  # dual-apply retired: pristine
         self.assertEqual(self._publish(sa).dtype, "bfloat16")
 
     def test_gpt_oss_without_mxfp4_keeps_pristine_dtype(self):

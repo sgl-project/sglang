@@ -2182,6 +2182,17 @@ DUAL_APPLY_RETIRED: frozenset = frozenset(
         # the spec registry read the leaf; the pp / pdmux asserts read
         # views; the mps early disable is pre-resolution input synthesis.
         "disable_overlap_schedule",
+        # Every ModelConfig construction (mid-resolution cached, scheduler
+        # post-publish, launcher-side) captures these through the view in
+        # from_server_args — which also removes the timing skew between the
+        # pre- and post-declaration constructions; the sm<80 float16 force
+        # is a load-time declaration; MoE / DSA / gguf mid-resolution reads
+        # go through views; the runtime quantization readers are on the
+        # tier; the unquant normalization and the draft-quantization copy
+        # run pre-declaration on pristine input.
+        "dtype",
+        "quantization",
+        "disable_hybrid_swa_memory",
     }
 )
 

@@ -19,6 +19,7 @@ from sglang.srt.utils.common import torch_release
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
+from sglang.srt.arg_groups.overrides import resolved_view
 from sglang.srt.layers.quantization.fp8_kernel import (
     fp8_dtype,
     fp8_max,
@@ -535,7 +536,7 @@ def initialize_fp8_gemm_config(server_args: ServerArgs) -> None:
 
     if (
         backend.is_auto()
-        and server_args.quantization == "mxfp8"
+        and resolved_view(server_args).quantization == "mxfp8"
         and _is_sm100_supported
         and is_flashinfer_available()
     ):

@@ -124,7 +124,7 @@ def flashinfer_autotune_cache_path(model_runner: ModelRunner) -> Path:
     model_key_parts = [
         str(server_args.model_path),
         str(mr.dtype),
-        str(server_args.quantization),
+        str(get_flags().quantization),
         str(get_flags().moe.runner_backend),
         str(mr.tp_size),
         str(mr.pp_size),

@@ -1429,7 +1429,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 logger.info(
                     "Compute capability below sm80. Use float16 due to lack of bfloat16 support."
                 )
-                self.server_args.dtype = "float16"
+                from sglang.srt.arg_groups.overrides import (
+                    declare_load_time_override,
+                )
+
+                declare_load_time_override(
+                    "ModelRunner._sm80_dtype_fallback", {"dtype": "float16"}
+                )
                 self.model_config.dtype = torch.float16
                 if torch.cuda.get_device_capability()[1] < 5:
                     raise RuntimeError("SGLang only supports sm75 and above.")
@@ -1597,13 +1603,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             getattr(self.model, "quant_config", None), "quantized_layers", None
         )
         if (
-            self.server_args.quantization is not None
+            get_flags().quantization is not None
             and isinstance(quantized_layers, tuple)
             and len(quantized_layers) == 2
         ):
             layer_types, quantized_layers_count = quantized_layers
             logger.info(
-                f"Online {self.server_args.quantization} quantization: quantized {quantized_layers_count} layers of types: {layer_types}"
+                f"Online {get_flags().quantization} quantization: quantized {quantized_layers_count} layers of types: {layer_types}"
             )
 
         if self.server_args.debug_tensor_dump_output_folder is not None:

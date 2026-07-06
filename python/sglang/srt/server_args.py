@@ -3267,7 +3267,7 @@ class ServerArgs:
             (
                 "GGUF quantization",
                 lambda: self.load_format == "gguf"
-                or self.quantization == "gguf"
+                or _resolved_view(self).quantization == "gguf"
                 or check_gguf_file(self.model_path),
             ),
             ("DLLM (diffusion LLM)", lambda: self.dllm_algorithm is not None),
@@ -3853,7 +3853,9 @@ class ServerArgs:
                     import torch
 
                     major, _ = torch.cuda.get_device_capability()
-                    self._set_default_dsa_kv_cache_dtype(major, self.quantization)
+                    self._set_default_dsa_kv_cache_dtype(
+                        major, resolved_view(self).quantization
+                    )
                     self._set_default_dsa_backends(self.kv_cache_dtype, major)
 
                 if self.enable_prefill_cp:
@@ -4860,12 +4862,12 @@ class ServerArgs:
 
         view = resolved_view(self)
         if view.moe_runner_backend == "flashinfer_cutlass":
-            assert self.quantization in [
+            assert view.quantization in [
                 "modelopt_fp4",
                 "modelopt_fp8",
                 "modelopt_mixed",
                 None,
-            ], f"Invalid quantization '{self.quantization}'. \nFlashInfer Cutlass MOE supports only: 'modelopt_fp4', 'modelopt_fp8', 'modelopt_mixed', or bfloat16 (None)."
+            ], f"Invalid quantization '{view.quantization}'. \nFlashInfer Cutlass MOE supports only: 'modelopt_fp4', 'modelopt_fp8', 'modelopt_mixed', or bfloat16 (None)."
             assert self.ep_size in [
                 1,
                 self.tp_size,
@@ -4873,9 +4875,9 @@ class ServerArgs:
 
         if view.moe_runner_backend == "flashinfer_cutedsl":
             assert (
-                self.quantization in ["modelopt_fp4"]
+                view.quantization in ["modelopt_fp4"]
                 or self.get_model_config().nvfp4_moe_meta is not None
-            ), f"Invalid quantization '{self.quantization}'. \nFlashInfer CuteDSL MOE currently supports only: 'modelopt_fp4' or hybrid NVFP4 models."
+            ), f"Invalid quantization '{view.quantization}'. \nFlashInfer CuteDSL MOE currently supports only: 'modelopt_fp4' or hybrid NVFP4 models."
             assert self.ep_size in [
                 1,
                 self.tp_size,
@@ -4890,7 +4892,7 @@ class ServerArgs:
             )
 
         if view.moe_runner_backend in ["flashinfer_trtllm", "experimental_sgl_trtllm"]:
-            assert self.quantization in [
+            assert view.quantization in [
                 "modelopt_fp4",
                 "nvfp4_online",
                 "fp8",
@@ -4899,16 +4901,16 @@ class ServerArgs:
                 "modelopt_mixed",
                 "compressed-tensors",
                 None,
-            ], f"Invalid quantization '{self.quantization}'. \nFlashInfer TRTLLM MOE supports only: 'modelopt_fp4', 'nvfp4_online', 'fp8', 'modelopt_fp8', 'modelopt_mixed', 'compressed-tensors', or bfloat16 (None)."
+            ], f"Invalid quantization '{view.quantization}'. \nFlashInfer TRTLLM MOE supports only: 'modelopt_fp4', 'nvfp4_online', 'fp8', 'modelopt_fp8', 'modelopt_mixed', 'compressed-tensors', or bfloat16 (None)."
 
         if view.moe_runner_backend == "flashinfer_trtllm_routed":
-            assert self.quantization in [
+            assert view.quantization in [
                 "fp8",
                 "mxfp8",
                 "modelopt_fp4",
                 "nvfp4_online",
                 None,
-            ], f"Invalid quantization '{self.quantization}'. \nFlashInfer TRTLLM routed MOE supports only: 'fp8', 'mxfp8', 'modelopt_fp4', 'nvfp4_online', or bfloat16 (None)."
+            ], f"Invalid quantization '{view.quantization}'. \nFlashInfer TRTLLM routed MOE supports only: 'fp8', 'mxfp8', 'modelopt_fp4', 'nvfp4_online', or bfloat16 (None)."
 
         # The runner-driven shared-experts fusion disables moved to the
         # pipeline (arg_groups/overrides.py: _moe_runner_fusion_disable),
@@ -4920,9 +4922,9 @@ class ServerArgs:
         # the fusion blocks above on purpose: they must observe the
         # pre-override runner value, exactly as they did imperatively.
         run_post_process_pass(self, _cutlass_moe_env_override)
-        if resolved_view(
+        if resolved_view(self).moe_runner_backend == "cutlass" and resolved_view(
             self
-        ).moe_runner_backend == "cutlass" and self.quantization in [
+        ).quantization in [
             "fp8",
             "mxfp8",
         ]:
@@ -5068,7 +5070,7 @@ class ServerArgs:
                 )
             elif fuse_mode == 2:
                 assert (
-                    self.quantization == "modelslim"
+                    resolved_view(self).quantization == "modelslim"
                 ), "When fuse_mode is set to 2, the NPU supports only ModelSlim quantization."
         if a2a_backend == "flashinfer":
             assert (
@@ -5080,7 +5082,7 @@ class ServerArgs:
             if self.deepep_mode != "auto":
                 logger.warning("--deepep-mode is ignored for Flashinfer MoE A2A")
             if not envs.SGLANG_MOE_NVFP4_DISPATCH.is_set() and (
-                self.quantization == "modelopt_fp4"
+                resolved_view(self).quantization == "modelopt_fp4"
                 or self.get_model_config().nvfp4_moe_meta is not None
             ):
                 envs.SGLANG_MOE_NVFP4_DISPATCH.set(True)
