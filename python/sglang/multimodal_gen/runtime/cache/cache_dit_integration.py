@@ -415,7 +415,8 @@ def enable_cache_on_dual_transformer(
         tp_group: Tensor parallel process group.
     """
     _supported_dual_transformer_models = [
-        "wan2.2",  # Currently, only Wan2.2 will run into dual-transformer case
+        "wan2.2",
+        "ideogram4",
     ]
     if model_name not in _supported_dual_transformer_models:
         raise ValueError(
@@ -494,7 +495,7 @@ def enable_cache_on_dual_transformer(
         primary_config.enable_taylorseer,
     )
     logger.info(
-        "  Secondary (transformer_2): Fn=%d, Bn=%d, W=%d, R=%.2f, MC=%d, TaylorSeer=%s",
+        "  Secondary transformer: Fn=%d, Bn=%d, W=%d, R=%.2f, MC=%d, TaylorSeer=%s",
         secondary_config.Fn_compute_blocks,
         secondary_config.Bn_compute_blocks,
         secondary_config.max_warmup_steps,
@@ -532,37 +533,49 @@ def enable_cache_on_dual_transformer(
         transformer_2, parallelism_config, sp_group, tp_group
     )
 
-    # Get blocks attribute - Wan transformers use 'blocks' attribute
-    transformer_blocks = getattr(transformer, "blocks", None)
-    transformer_2_blocks = getattr(transformer_2, "blocks", None)
-
-    if transformer_blocks is None or transformer_2_blocks is None:
-        raise ValueError(
-            "Dual transformers must have 'blocks' attribute for cache-dit. "
-            f"transformer has blocks: {transformer_blocks is not None}, "
-            f"transformer_2 has blocks: {transformer_2_blocks is not None}"
-        )
-
-    # Enable cache-dit using BlockAdapter for both transformers simultaneously
-    # This is required for Wan2.2 and similar dual-transformer architectures
     if model_name == "wan2.2":
-        # Use Pattern_2 for Wan2.2 dual-transformer. We should check `model_name`
-        # to ensure we only apply this for supported models. Different models
-        # may require different ForwardPattern.
-        cache_dit.enable_cache(
-            BlockAdapter(
-                transformer=[transformer, transformer_2],
-                blocks=[transformer_blocks, transformer_2_blocks],
-                forward_pattern=[ForwardPattern.Pattern_2, ForwardPattern.Pattern_2],
-                params_modifiers=[primary_modifier, secondary_modifier],
-                has_separate_cfg=True,
-            ),
-            parallelism_config=None,
-        )
+        transformer_blocks = getattr(transformer, "blocks", None)
+        transformer_2_blocks = getattr(transformer_2, "blocks", None)
+        blocks_name = None
+        forward_pattern = [ForwardPattern.Pattern_2, ForwardPattern.Pattern_2]
+        check_forward_pattern = True
+        check_num_outputs = False
+        has_separate_cfg = True
+    elif model_name == "ideogram4":
+        transformer_blocks = getattr(transformer, "layers", None)
+        transformer_2_blocks = getattr(transformer_2, "layers", None)
+        blocks_name = ["layers", "layers"]
+        forward_pattern = [ForwardPattern.Pattern_3, ForwardPattern.Pattern_3]
+        check_forward_pattern = False
+        check_num_outputs = False
+        has_separate_cfg = False
     else:
         raise ValueError(
             f"Dual-transformer is not implemented for model {model_name} yet."
         )
+
+    if transformer_blocks is None or transformer_2_blocks is None:
+        expected_attr = "layers" if model_name == "ideogram4" else "blocks"
+        raise ValueError(
+            f"Dual transformers for {model_name} must have '{expected_attr}' "
+            "attribute for cache-dit. "
+            f"transformer has {expected_attr}: {transformer_blocks is not None}, "
+            f"secondary transformer has {expected_attr}: {transformer_2_blocks is not None}"
+        )
+
+    cache_dit.enable_cache(
+        BlockAdapter(
+            transformer=[transformer, transformer_2],
+            blocks=[transformer_blocks, transformer_2_blocks],
+            blocks_name=blocks_name,
+            forward_pattern=forward_pattern,
+            params_modifiers=[primary_modifier, secondary_modifier],
+            check_forward_pattern=check_forward_pattern,
+            check_num_outputs=check_num_outputs,
+            has_separate_cfg=has_separate_cfg,
+        ),
+        parallelism_config=None,
+    )
 
     if parallelism_config is not None:
         for t in [transformer, transformer_2]:
@@ -612,23 +625,30 @@ def refresh_context_on_dual_transformer(
     num_low_noise_steps: int,
     scm_preset: str | None = None,
     verbose: bool = False,
+    steps_computation_mask: Optional[List[int]] = None,
+    steps_computation_mask_2: Optional[List[int]] = None,
+    steps_computation_policy: str | None = None,
 ) -> None:
     """Refresh cache-dit context for dual transformers."""
-    high_noise_steps_computation_mask = None
-    low_noise_steps_computation_mask = None
-    if scm_preset is not None:
+    high_noise_steps_computation_mask = steps_computation_mask
+    low_noise_steps_computation_mask = steps_computation_mask_2
+    if high_noise_steps_computation_mask is None and scm_preset is not None:
         high_noise_steps_computation_mask = cache_dit.steps_mask(
             mask_policy=scm_preset, total_steps=num_high_noise_steps
         )
+    if low_noise_steps_computation_mask is None and scm_preset is not None:
         low_noise_steps_computation_mask = cache_dit.steps_mask(
             mask_policy=scm_preset, total_steps=num_low_noise_steps
         )
+    policy = (
+        steps_computation_policy if steps_computation_policy is not None else scm_preset
+    )
     cache_dit.refresh_context(
         transformer,
         cache_config=DBCacheConfig().reset(
             num_inference_steps=num_high_noise_steps,
             steps_computation_mask=high_noise_steps_computation_mask,
-            steps_computation_policy=scm_preset,
+            steps_computation_policy=policy,
         ),
         verbose=verbose,
     )
@@ -637,7 +657,7 @@ def refresh_context_on_dual_transformer(
         cache_config=DBCacheConfig().reset(
             num_inference_steps=num_low_noise_steps,
             steps_computation_mask=low_noise_steps_computation_mask,
-            steps_computation_policy=scm_preset,
+            steps_computation_policy=policy,
         ),
         verbose=verbose,
     )
