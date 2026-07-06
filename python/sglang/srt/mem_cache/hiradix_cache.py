@@ -8,7 +8,7 @@ import os
 import threading
 import time
 from queue import Empty
-from typing import TYPE_CHECKING, Dict, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
 
@@ -44,6 +44,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
 from sglang.srt.mem_cache.memory_pool import (
     DSATokenToKVPool,
     MHATokenToKVPool,
+    MiniMaxSparseKVPool,
     MLATokenToKVPool,
 )
 from sglang.srt.mem_cache.memory_pool_host import (
@@ -92,6 +93,9 @@ class HiRadixCache(RadixCache):
         elif isinstance(self.kv_cache, DSATokenToKVPool):
             # Filled by attach_hybrid_dsa_pool_to_hiradix_cache after storage extra_config is parsed.
             self.token_to_kv_pool_host = None
+        elif isinstance(self.kv_cache, MiniMaxSparseKVPool):
+            # Filled by attach_hybrid_minimax_sparse_pool_to_hiradix_cache.
+            self.token_to_kv_pool_host = None
         elif isinstance(self.kv_cache, MLATokenToKVPool):
             self.token_to_kv_pool_host = MLATokenToKVPoolHost(
                 self.kv_cache,
@@ -102,7 +106,7 @@ class HiRadixCache(RadixCache):
                 allocator_type=server_args.hicache_storage_backend,
             )
         else:
-            raise ValueError("HiRadixCache only supports MHA, MLA, and DSA models")
+            raise ValueError("HiRadixCache only supports MHA, MLA, DSA, and MSA models")
 
         self.tp_group = params.tp_cache_group
         self.attn_cp_group = params.attn_cp_cache_group
@@ -130,6 +134,22 @@ class HiRadixCache(RadixCache):
         self.load_cache_event = threading.Event()
         if isinstance(self.kv_cache, DSATokenToKVPool):
             attach_hybrid_dsa_pool_to_hiradix_cache(
+                self,
+                params,
+                server_args,
+                extra_config=extra_config,
+                prefetch_threshold=prefetch_threshold,
+                enable_storage_metrics=self.enable_storage_metrics,
+                load_cache_event=self.load_cache_event,
+                attn_cp_group=self.attn_cp_group,
+                attn_tp_group=self.attn_tp_group,
+            )
+        elif isinstance(self.kv_cache, MiniMaxSparseKVPool):
+            from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+                attach_hybrid_minimax_sparse_pool_to_hiradix_cache,
+            )
+
+            attach_hybrid_minimax_sparse_pool_to_hiradix_cache(
                 self,
                 params,
                 server_args,
@@ -720,7 +740,10 @@ class HiRadixCache(RadixCache):
     def _get_extra_pools(self) -> dict:
         if not isinstance(self.cache_controller, HybridCacheController):
             return {}
-        if isinstance(self.kv_cache, DSATokenToKVPool):
+        if isinstance(self.kv_cache, DSATokenToKVPool) or (
+            isinstance(self.kv_cache, MiniMaxSparseKVPool)
+            and self.kv_cache.index_k_pool is not None
+        ):
             pool = PoolTransfer(
                 name=PoolName.INDEXER,
                 hit_policy=PoolHitPolicy.ALL_PAGES,
@@ -1064,7 +1087,7 @@ class HiRadixCache(RadixCache):
         heap = self._make_eviction_heap()
         num_evicted = 0
         while num_evicted < num_tokens and heap:
-            _priority, x = heapq.heappop(heap)
+            _, x = heapq.heappop(heap)
             if x.lock_ref > 0:
                 continue
             if x.backuped:
@@ -1080,26 +1103,38 @@ class HiRadixCache(RadixCache):
         """
         heap = self._make_eviction_heap()
         num_evicted = 0
+        staged: List[Tuple[TreeNode, torch.Tensor]] = []
+
+        def flush_staged() -> None:
+            if not staged:
+                return
+            self.writing_check(write_back=True)
+            for node, device_indices in staged:
+                self.cache_controller.evict_device(device_indices)
+                node.release_host()
+            staged.clear()
+
         while num_evicted < num_tokens and heap:
-            _priority, x = heapq.heappop(heap)
+            _, x = heapq.heappop(heap)
             if x.lock_ref > 0:
                 continue
             if x.backuped:
                 num_evicted += self._evict_backuped(x)
             elif self.write_backup(x, write_back=True) > 0:
-                self.writing_check(write_back=True)
-                num_evicted += self._evict_backuped(x)
+                x.protect_host()
+                staged.append((x, x.value))
+                num_evicted += self._detach_backuped(x)
             else:
+                flush_staged()
                 num_evicted += self._drop_subtree_no_host(x)
             self._promote_parent(x, heap)
+        flush_staged()
         return num_evicted
 
-    def _evict_backuped(self, node: TreeNode):
-        # GPU -> CPU demotion: block moves from device to host.
-        # Emit remove(GPU) so downstream indexers stop scoring it as device-local.
-        # The matching store(CPU) was emitted when write_backup() copied to host.
+    def _detach_backuped(self, node: TreeNode) -> int:
+        # detach nodes from tree while keeping device slots, for write-back eviction
         self._record_remove_event(node, medium=StorageMedium.GPU)
-        num_evicted = self.cache_controller.evict_device(node.value)
+        num_evicted = len(node.value)
         assert num_evicted > 0
         self.evictable_size_ -= num_evicted
         node.value = None
@@ -1107,6 +1142,12 @@ class HiRadixCache(RadixCache):
         self._update_host_leaf_status(node)
         # update leaf status for the parent because the node is evicted
         self._update_leaf_status(node.parent)
+        return num_evicted
+
+    def _evict_backuped(self, node: TreeNode):
+        device_indices = node.value
+        num_evicted = self._detach_backuped(node)
+        self.cache_controller.evict_device(device_indices)
         return num_evicted
 
     def _evict_regular(self, node: TreeNode):
@@ -1167,7 +1208,7 @@ class HiRadixCache(RadixCache):
 
         num_evicted = 0
         while num_evicted < num_tokens and len(eviction_heap):
-            _priority, x = heapq.heappop(eviction_heap)
+            _, x = heapq.heappop(eviction_heap)
             if x == self.root_node:
                 break
             # only evict the host value of evicted nodes

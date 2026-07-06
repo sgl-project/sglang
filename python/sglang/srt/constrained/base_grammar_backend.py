@@ -300,7 +300,9 @@ def create_grammar_backend(
         )
 
         reasoning_parser = ReasoningParser(
-            model_type=server_args.reasoning_parser, stream_reasoning=False
+            model_type=server_args.reasoning_parser,
+            stream_reasoning=False,
+            tokenizer=tokenizer,
         )
 
         grammar_backend = ReasonerGrammarBackend(

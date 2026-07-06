@@ -155,15 +155,23 @@ def update_intermediate_size(model_config, attr_name, intermediate_padding_size)
     if attr_value % intermediate_padding_size != 0:
         from sglang.srt.layers.vocab_parallel_embedding import pad_vocab_size
 
+        origin_value = attr_value
+        origin_name = "original_" + attr_name
         attr_value = pad_vocab_size(attr_value, intermediate_padding_size)
         if hasattr(model_config, "hf_config"):
             update_config(model_config.hf_config, attr_name, attr_value)
+            update_config(model_config.hf_config, origin_name, origin_value)
             if hasattr(model_config, "hf_text_config"):
                 update_config(model_config.hf_text_config, attr_name, attr_value)
+                update_config(model_config.hf_text_config, origin_name, origin_value)
             if hasattr(model_config.hf_config, "text_config"):
                 update_config(model_config.hf_config.text_config, attr_name, attr_value)
+                update_config(
+                    model_config.hf_config.text_config, origin_name, origin_value
+                )
         else:
             update_config(model_config, attr_name, attr_value)
+            update_config(model_config, origin_name, origin_value)
 
     return model_config
 
@@ -261,10 +269,18 @@ def adjust_config_with_unaligned_cpu_tp(
             "siglip_vision_model",
             "num_attention_heads",
         ],
+        [model_config.hf_config, "vision_config", "qwen2_5_vl", "num_heads"],
         [model_config.hf_config, "vision_config", "qwen3_vl_moe", "num_heads"],
         [model_config.hf_config, "vision_config", "qwen3_vl", "num_heads"],
         [model_config.hf_config, "vision_config", "qwen3_5_moe", "num_heads"],
         [model_config.hf_config, "vision_config", "qwen3_5", "num_heads"],
+        [model_config.hf_config, "vision_config", "mllama", "attention_heads"],
+        [
+            model_config.hf_config,
+            "vision_config",
+            "llama4_vision_model",
+            "num_attention_heads",
+        ],
     ]
     if hasattr(model_config.hf_config, "thinker_config"):
         multimodal_config.append(
@@ -285,11 +301,12 @@ def adjust_config_with_unaligned_cpu_tp(
         )
 
     for m_config, config_name, model_type, num_head_str in multimodal_config:
-        if (
-            hasattr(m_config, config_name)
-            and getattr(m_config, config_name).model_type == model_type
+        if hasattr(m_config, config_name) and (
+            m_config.model_type == model_type
+            or getattr(m_config, config_name).model_type == model_type
         ):
             num_heads = getattr(getattr(m_config, config_name), num_head_str)
+
             update_config(
                 getattr(m_config, config_name), "original_" + num_head_str, num_heads
             )
@@ -315,5 +332,19 @@ def adjust_config_with_unaligned_cpu_tp(
                     intermediate_padding_size,
                 ),
             )
+
+            # Pad projector_input_dim for Llama4 vision if needed
+            if model_type == "llama4_vision_model":
+                proj_inp_dim = getattr(m_config, config_name).projector_input_dim
+                if proj_inp_dim % tp_size != 0:
+                    from sglang.srt.layers.vocab_parallel_embedding import (
+                        pad_vocab_size,
+                    )
+
+                    update_config(
+                        getattr(m_config, config_name),
+                        "projector_input_dim",
+                        pad_vocab_size(proj_inp_dim, tp_size),
+                    )
 
     return model_config

@@ -14,7 +14,7 @@ import sys
 import tempfile
 from dataclasses import field
 from enum import Enum
-from typing import Any, Literal, Optional
+from typing import Any, List, Literal, Optional
 
 import addict
 import yaml
@@ -216,6 +216,7 @@ class ServerArgs(DisaggServerArgsMixin):
     dit_layerwise_offload: bool | None = None
     layerwise_offload_components: list[str] | None = None
     dit_offload_prefetch_size: float = 0.0
+    offload_during_compile: bool = True
     text_encoder_cpu_offload: bool | None = None
     image_encoder_cpu_offload: bool | None = None
     vae_cpu_offload: bool | None = False
@@ -342,6 +343,10 @@ class ServerArgs(DisaggServerArgsMixin):
 
     # Logging
     log_level: str = "info"
+    log_requests: bool = False
+    log_requests_level: int = 2
+    log_requests_format: str = "text"
+    log_requests_target: Optional[List[str]] = None
     uvicorn_access_log_exclude_prefixes: list[str] = field(default_factory=list)
 
     # Tracing
@@ -726,10 +731,26 @@ class ServerArgs(DisaggServerArgsMixin):
             if mode_explicit or not legacy_explicit:
                 self.warmup = self.warmup_mode != "off"
                 self.server_warmup = self.warmup_mode == "server"
+            elif self.warmup:
+                self.server_warmup = self.server_warmup or self.warmup_mode == "server"
 
         # Explicit resolutions imply warmup is on (request-based).
         if self.warmup_resolutions is not None:
             self.warmup = True
+
+        if (
+            self.enable_torch_compile
+            and self.warmup_mode is None
+            and not mode_explicit
+            and not legacy_explicit
+        ):
+            self.warmup = True
+            self.server_warmup = True
+            logger.info(
+                "Automatically enabled server warmup for torch.compile so first "
+                "real requests do not pay compile latency. Set --warmup-mode off "
+                "to disable this behavior."
+            )
 
         if self.disagg_role != RoleType.MONOLITHIC:
             self.server_warmup = False
@@ -821,26 +842,40 @@ class ServerArgs(DisaggServerArgsMixin):
         # because non-CFG models (e.g. FLUX) crash when CFG parallel splits ranks.
         if cfg_unspecified:
             deployment_config = self.pipeline_config.get_model_deployment_config()
-            cfg_group_size = self.dp_size * self.tp_size * 2
-            if (
-                self.performance_mode != "manual"
-                and deployment_config.auto_enable_cfg_parallel
-                and self.num_gpus >= 2
-                and self.num_gpus % cfg_group_size == 0
-                and sp_unspecified
-                and ulysses_unspecified
-                and ring_unspecified
-                and self._model_default_uses_cfg()
-            ):
-                self.enable_cfg_parallel = True
-                logger.info(
-                    "Automatically enabled CFG parallel for %d GPUs. "
-                    "Use --sp-degree / --ulysses-degree to use sequence "
-                    "parallelism instead.",
-                    self.num_gpus,
-                )
-            else:
+            auto_cfg_parallel_degree = deployment_config.get_auto_cfg_parallel_degree(
+                self.num_gpus
+            )
+            if auto_cfg_parallel_degree < 1:
                 self.enable_cfg_parallel = False
+            else:
+                cfg_group_size = self.dp_size * self.tp_size * auto_cfg_parallel_degree
+                if (
+                    self.performance_mode != "manual"
+                    and deployment_config.auto_enable_cfg_parallel
+                    and self.num_gpus >= 2
+                    and self.num_gpus % cfg_group_size == 0
+                    and sp_unspecified
+                    and ulysses_unspecified
+                    and ring_unspecified
+                    and self._model_default_uses_cfg()
+                ):
+                    self.cfg_parallel_degree = auto_cfg_parallel_degree
+                    self.enable_cfg_parallel = auto_cfg_parallel_degree > 1
+                    if self.enable_cfg_parallel:
+                        logger.info(
+                            "Automatically enabled CFG parallel at degree %d for %d GPUs. "
+                            "Use --sp-degree / --ulysses-degree to use sequence "
+                            "parallelism instead.",
+                            self.cfg_parallel_degree,
+                            self.num_gpus,
+                        )
+                    else:
+                        logger.info(
+                            "Automatically disabled CFG parallel for %d GPUs based on model deployment config.",
+                            self.num_gpus,
+                        )
+                else:
+                    self.enable_cfg_parallel = False
 
         # Resolve cfg_parallel_degree to a concrete int now that enable_cfg_parallel is settled.
         if self.cfg_parallel_degree is None:
@@ -1278,8 +1313,16 @@ class ServerArgs(DisaggServerArgsMixin):
             "--enable-torch-compile",
             action=StoreBoolean,
             default=ServerArgs.enable_torch_compile,
-            help="Use torch.compile to speed up DiT inference."
+            help="Use torch.compile to speed up diffusion hot paths. "
+            + "When no warmup mode is configured, this enables server warmup "
+            + "so first real requests do not pay compile latency. "
             + "However, will likely cause precision drifts. See (https://github.com/pytorch/pytorch/issues/145213)",
+        )
+        parser.add_argument(
+            "--offload-during-compile",
+            action=StoreBoolean,
+            default=ServerArgs.offload_during_compile,
+            help="Offload components during the torch.compile warmup (the DiT layerwise) so max-autotune fits on tighter-memory GPUs, then restore the configured residency for serving. Skipped when the DiT is already layerwise-offloaded, or under cache-dit / FSDP.",
         )
 
         parser.add_argument(
@@ -1612,6 +1655,38 @@ class ServerArgs(DisaggServerArgsMixin):
             type=str,
             default=ServerArgs.otlp_traces_endpoint,
             help="OTLP collector endpoint when --enable-trace is set. Format: <host>:<port>",
+        )
+        parser.add_argument(
+            "--log-requests",
+            action="store_true",
+            help="Log user-facing fields of all requests (default: False). "
+            "Verbosity is controlled by --log-requests-level.",
+        )
+        parser.add_argument(
+            "--log-requests-level",
+            type=int,
+            default=ServerArgs.log_requests_level,
+            choices=[0, 1, 2, 3],
+            help="Verbosity level for request logging. "
+            "0: Log request metadata only (request_id). "
+            "1: Log metadata + sampling config (seed, steps, guidance, resolution, frames, fps, ...). "
+            "2: Log metadata + sampling config + prompt/negative prompt (truncated to 2 KiB). "
+            "3: Log metadata + sampling config + full prompt/negative prompt.",
+        )
+        parser.add_argument(
+            "--log-requests-format",
+            type=str,
+            default=ServerArgs.log_requests_format,
+            choices=["text", "json"],
+            help="Format for request logging: 'text' (human-readable) or 'json' (structured)",
+        )
+        parser.add_argument(
+            "--log-requests-target",
+            type=str,
+            nargs="+",
+            default=ServerArgs.log_requests_target,
+            help="Target(s) for request logging: 'stdout' and/or directory path(s) for file output. "
+            "Can specify multiple targets, e.g., '--log-requests-target stdout /my/path'. ",
         )
         parser.add_argument(
             "--uvicorn-access-log-exclude-prefixes",
