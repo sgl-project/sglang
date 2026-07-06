@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -100,14 +100,6 @@ def _get_dsv4_compress_state_dtypes() -> tuple[torch.dtype, torch.dtype]:
 
 _is_npu = is_npu()
 _is_hip = is_hip()
-
-
-def _get_glm_dsa_cp_layer_shard_info(
-    model_runner: ModelRunner,
-) -> tuple[Optional[int], int]:
-    from sglang.srt.layers.cp.utils import get_glm_dsa_cp_layer_shard_info
-
-    return get_glm_dsa_cp_layer_shard_info(model_runner)
 
 
 class ModelRunnerKVCacheMixin:
@@ -635,10 +627,6 @@ class ModelRunnerKVCacheMixin:
         # Initialize token_to_kv_pool
         is_dsa_model = is_deepseek_dsa(self.model_config.hf_config)
         is_dsv4_model = is_deepseek_v4(self.model_config.hf_config)
-        (
-            dsa_cp_layer_shard_rank,
-            dsa_cp_layer_shard_size,
-        ) = _get_glm_dsa_cp_layer_shard_info(self)
 
         self._validate_prefill_only_disable_kv_cache_pool_family(
             is_dsa_model, is_dsv4_model, current_platform
@@ -856,6 +844,12 @@ class ModelRunnerKVCacheMixin:
                     end_layer=self.end_layer,
                 )
         elif self.use_mla_backend and is_dsa_model:
+            from sglang.srt.layers.cp.utils import get_glm_dsa_cp_layer_shard_info
+
+            (
+                dsa_cp_layer_shard_rank,
+                dsa_cp_layer_shard_size,
+            ) = get_glm_dsa_cp_layer_shard_info(self)
             pool_kwargs = {}
             if self.enable_hisparse:
                 PoolCls = HiSparseDSATokenToKVPool

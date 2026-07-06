@@ -425,7 +425,9 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
 
     # ---- DSA indexer buffer: owned-only writes, owner-broadcast reads -----
 
-    def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
+    def get_broadcastable_index_k_with_scale_buffer(
+        self, layer_id: int
+    ) -> torch.Tensor:
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
         return self._get_broadcastable_index_buffer(layer_id)

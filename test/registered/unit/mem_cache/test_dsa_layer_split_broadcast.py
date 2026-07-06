@@ -1,28 +1,36 @@
 """Multi-GPU integration test for LayerSplitDSATokenToKVPool owner-broadcast.
 
-Spawns ``attn_cp_size`` processes forming a single attention-CP group, builds a
-tiny ``LayerSplitDSATokenToKVPool`` on each rank, writes a rank-distinct value
-into every owned layer, then verifies that reading ANY layer (owned or not)
-returns the *owning* rank's bytes — i.e. the owner-broadcast in
+Spawns ``world`` processes forming a single attention-CP group, builds a tiny
+``LayerSplitDSATokenToKVPool`` on each rank, writes a rank-distinct value into
+every owned layer, then verifies that reading ANY layer (owned or not) returns
+the *owning* rank's bytes -- i.e. the owner-broadcast in
 ``_get_broadcastable_kv_buffer`` / ``prefetch_kv_buffer`` surfaces correct
-contents.
+contents. Also exercises the DSA indexer broadcast and the async prefetch path.
 
-Run directly on 2 GPUs:
-    CUDA_VISIBLE_DEVICES=0,1 python test/manual/test_dsa_layer_split_broadcast.py
+Registered as a base-c 4-gpu-b200 unit test; uses up to 4 GPUs and skips when
+fewer than 2 are visible. Run directly on 2+ GPUs:
+    CUDA_VISIBLE_DEVICES=0,1 python -m pytest \
+        test/registered/unit/mem_cache/test_dsa_layer_split_broadcast.py
 """
 
 import os
+import unittest
 
 import torch
 import torch.multiprocessing as mp
 
-WORLD = 2
+from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.test_utils import CustomTestCase
+
+register_cuda_ci(est_time=120, stage="base-c", runner_config="4-gpu-b200")
+
 LAYER_NUM = 4
 PAGE_SIZE = 64
 KV_LORA_RANK = 512
 QK_ROPE = 64
 INDEX_HEAD_DIM = 128
 SIZE = PAGE_SIZE * 3  # a few pages
+PORT = 29711
 
 
 def _run(rank: int, world: int, port: int):
@@ -129,11 +137,13 @@ def _run(rank: int, world: int, port: int):
     torch.distributed.barrier()
 
 
-def main():
-    port = 29711
-    mp.spawn(_run, args=(WORLD, port), nprocs=WORLD, join=True)
-    print("PASS: LayerSplitDSATokenToKVPool owner-broadcast integration test")
+class TestLayerSplitDSABroadcast(CustomTestCase):
+    def test_owner_broadcast(self):
+        world = min(4, torch.cuda.device_count())
+        if world < 2:
+            self.skipTest("LayerSplitDSATokenToKVPool broadcast test needs >= 2 GPUs")
+        mp.spawn(_run, args=(world, PORT), nprocs=world, join=True)
 
 
 if __name__ == "__main__":
-    main()
+    unittest.main()

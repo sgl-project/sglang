@@ -1311,7 +1311,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
     def get_size_per_token(self):
         self.kv_lora_rank = self.device_pool.kv_lora_rank
         self.qk_rope_head_dim = self.device_pool.qk_rope_head_dim
-        self.layer_num = self.device_pool.layer_num
+        self.layer_num = self._effective_host_layer_num()
         self.kv_cache_dim = self.override_kv_cache_dim or (
             self.kv_lora_rank + self.qk_rope_head_dim
         )
@@ -1426,20 +1426,21 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
     ):
         if not self._is_device_layer_owned(device_pool, layer_id):
             return
+        host_layer = self._host_layer_index(layer_id)
 
         if io_backend == "kernel":
             if self.layout == "layer_first":
                 if self.can_use_jit:
                     jit_transfer_hicache_one_layer_mla(
                         cache_dst=device_pool.kv_buffer[layer_id],
-                        cache_src=self.kv_buffer[layer_id],
+                        cache_src=self.kv_buffer[host_layer],
                         indices_dst=device_indices,
                         indices_src=host_indices,
                         element_dim=self.kv_cache_dim,
                     )
                 else:
                     transfer_kv_per_layer_mla(
-                        src=self.kv_buffer[layer_id],
+                        src=self.kv_buffer[host_layer],
                         dst=device_pool.kv_buffer[layer_id],
                         src_indices=host_indices,
                         dst_indices=device_indices,
@@ -1449,7 +1450,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 if self.can_use_jit:
                     jit_transfer_hicache_one_layer_mla(
                         cache_dst=device_pool.kv_buffer[layer_id],
-                        cache_src=self.data_refs[layer_id],
+                        cache_src=self.data_refs[host_layer],
                         indices_dst=device_indices,
                         indices_src=host_indices,
                         element_dim=self.kv_cache_dim,
@@ -1460,7 +1461,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                         dst=device_pool.kv_buffer[layer_id],
                         src_indices=host_indices,
                         dst_indices=device_indices,
-                        layer_id=layer_id,
+                        layer_id=host_layer,
                         item_size=self.token_stride_size,
                         src_layout_dim=self.layout_dim,
                     )
@@ -1469,7 +1470,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         elif io_backend == "direct":
             if self.layout == "layer_first":
                 transfer_kv_direct(
-                    src_layers=[self.kv_buffer[layer_id]],
+                    src_layers=[self.kv_buffer[host_layer]],
                     dst_layers=[device_pool.kv_buffer[layer_id]],
                     src_indices=host_indices,
                     dst_indices=device_indices,
@@ -1481,7 +1482,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                     dst_ptrs=[device_pool.kv_buffer[layer_id]],
                     src_indices=host_indices,
                     dst_indices=device_indices,
-                    layer_id=layer_id,
+                    layer_id=host_layer,
                     page_size=self.page_size,
                 )
             else:
@@ -1510,11 +1511,12 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
     def _backup_from_device_per_layer(
         self, device_pool, host_indices, device_indices, layer_id, io_backend
     ):
+        host_layer = self._host_layer_index(layer_id)
         if io_backend == "kernel":
             if self.layout == "layer_first":
                 if self.can_use_jit:
                     jit_transfer_hicache_one_layer_mla(
-                        cache_dst=self.kv_buffer[layer_id],
+                        cache_dst=self.kv_buffer[host_layer],
                         cache_src=device_pool.kv_buffer[layer_id],
                         indices_dst=host_indices,
                         indices_src=device_indices,
@@ -1523,7 +1525,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 else:
                     transfer_kv_per_layer_mla(
                         src=device_pool.kv_buffer[layer_id],
-                        dst=self.kv_buffer[layer_id],
+                        dst=self.kv_buffer[host_layer],
                         src_indices=device_indices,
                         dst_indices=host_indices,
                         item_size=self.token_stride_size,
@@ -1531,7 +1533,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             elif self.layout == "page_first":
                 if self.can_use_jit:
                     jit_transfer_hicache_one_layer_mla(
-                        cache_dst=self.data_refs[layer_id],
+                        cache_dst=self.data_refs[host_layer],
                         cache_src=device_pool.kv_buffer[layer_id],
                         indices_dst=host_indices,
                         indices_src=device_indices,
@@ -1550,7 +1552,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             if self.layout == "layer_first":
                 transfer_kv_direct(
                     src_layers=[device_pool.kv_buffer[layer_id]],
-                    dst_layers=[self.kv_buffer[layer_id]],
+                    dst_layers=[self.kv_buffer[host_layer]],
                     src_indices=device_indices,
                     dst_indices=host_indices,
                     page_size=self.page_size,
@@ -3357,7 +3359,7 @@ class DSAIndexerPoolHost(HostKVCache):
         self.dtype = device_pool.store_dtype
         self.start_layer = device_pool.start_layer
         self.end_layer = device_pool.end_layer
-        self.layer_num = device_pool.layer_num
+        self.layer_num = self._effective_host_layer_num()
 
         self.index_head_dim = device_pool.index_head_dim
         self.indexer_quant_block_size = device_pool.quant_block_size
@@ -3492,6 +3494,7 @@ class DSAIndexerPoolHost(HostKVCache):
     ):
         if not self._is_device_layer_owned(device_pool, layer_id):
             return
+        host_layer = self._host_layer_index(layer_id)
 
         host_page_indices, device_page_indices = self._get_indexer_page_indices(
             host_indices, device_indices
@@ -3500,7 +3503,7 @@ class DSAIndexerPoolHost(HostKVCache):
         if use_kernel:
             if self.layout == "layer_first":
                 transfer_kv_per_layer_mla(
-                    src=self.index_k_with_scale_buffer[layer_id],
+                    src=self.index_k_with_scale_buffer[host_layer],
                     dst=device_pool.index_k_with_scale_buffer[layer_id],
                     src_indices=host_page_indices,
                     dst_indices=device_page_indices,
@@ -3512,7 +3515,7 @@ class DSAIndexerPoolHost(HostKVCache):
                     dst=device_pool.index_k_with_scale_buffer[layer_id],
                     src_indices=host_page_indices,
                     dst_indices=device_page_indices,
-                    layer_id=layer_id,
+                    layer_id=host_layer,
                     item_size=self.indexer_page_stride_size,
                     src_layout_dim=self.indexer_layout_dim,
                 )
@@ -3521,7 +3524,7 @@ class DSAIndexerPoolHost(HostKVCache):
         elif io_backend == "direct":
             if self.layout == "layer_first":
                 transfer_kv_direct(
-                    src_layers=[self.index_k_with_scale_buffer[layer_id]],
+                    src_layers=[self.index_k_with_scale_buffer[host_layer]],
                     dst_layers=[device_pool.index_k_with_scale_buffer[layer_id]],
                     src_indices=host_page_indices,
                     dst_indices=device_page_indices,
@@ -3533,7 +3536,7 @@ class DSAIndexerPoolHost(HostKVCache):
                     dst_ptrs=[device_pool.index_k_with_scale_buffer[layer_id]],
                     src_indices=host_page_indices,
                     dst_indices=device_page_indices,
-                    layer_id=layer_id,
+                    layer_id=host_layer,
                     page_size=1,
                 )
             else:
@@ -3544,6 +3547,7 @@ class DSAIndexerPoolHost(HostKVCache):
     def _backup_from_device_per_layer(
         self, device_pool, host_indices, device_indices, layer_id, io_backend
     ):
+        host_layer = self._host_layer_index(layer_id)
         host_page_indices, device_page_indices = self._get_indexer_page_indices(
             host_indices, device_indices
         )
@@ -3552,7 +3556,7 @@ class DSAIndexerPoolHost(HostKVCache):
             if self.layout == "layer_first":
                 transfer_kv_per_layer_mla(
                     src=device_pool.index_k_with_scale_buffer[layer_id],
-                    dst=self.index_k_with_scale_buffer[layer_id],
+                    dst=self.index_k_with_scale_buffer[host_layer],
                     src_indices=device_page_indices,
                     dst_indices=host_page_indices,
                     item_size=self.indexer_page_stride_size,
@@ -3568,7 +3572,7 @@ class DSAIndexerPoolHost(HostKVCache):
             if self.layout == "layer_first":
                 transfer_kv_direct(
                     src_layers=[device_pool.index_k_with_scale_buffer[layer_id]],
-                    dst_layers=[self.index_k_with_scale_buffer[layer_id]],
+                    dst_layers=[self.index_k_with_scale_buffer[host_layer]],
                     src_indices=device_page_indices,
                     dst_indices=host_page_indices,
                     page_size=1,

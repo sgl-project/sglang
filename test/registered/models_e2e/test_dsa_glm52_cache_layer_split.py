@@ -3,12 +3,14 @@
 Layer split shards the DSA GPU KV/indexer cache layers across prefill CP ranks
 (``--enable-dsa-cache-layer-split``); non-owner ranks read a layer via an
 owner-broadcast into a small remote scratch buffer. It only applies to PD
-prefill workers running DSA prefill-CP, so this test drives a PD-disaggregated
-GLM-5.2 deployment (layer-split prefill + ordinary decode) and asserts GSM8K
-accuracy stays intact.
+prefill workers running DSA prefill-CP (a unified server would decode on the
+same worker, where non-owner ranks lack the full cache), so this test drives a
+PD-disaggregated GLM-5.2 deployment: a layer-split prefill worker running
+interleave prefill-CP + layer split, and an ordinary decode worker that receives
+full cache shards via PD transfer.
 
-Modeled on ``test/registered/models_e2e/test_dsa_glm52_tp_mtp.py`` but using the
-PD-disaggregation fixture because layer split is a PD-prefill-only feature.
+Sized for the 4-GPU B200 runner (prefill TP=2 + decode TP=2) rather than an
+8-GPU deployment, since the 8-gpu-b200 runner is nightly-only.
 """
 
 import unittest
@@ -20,32 +22,34 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
 )
 
 register_cuda_ci(
-    est_time=600,
-    stage="base-c",
-    runner_config="8-gpu-h200",
+    est_time=1200,
+    stage="extra-b",
+    runner_config="4-gpu-b200",
 )
 
 
 class TestGLM52DSACacheLayerSplit(PDDisaggregationServerBase, GSM8KMixin):
-    model = "zai-org/GLM-5.2-FP8"
+    model = "nvidia/GLM-5.2-NVFP4"
 
-    gsm8k_accuracy_thres = 0.90
-    gsm8k_num_questions = 200
+    # Full GSM8K test set (1319 questions) with a tight accuracy floor.
+    gsm8k_accuracy_thres = 0.935
+    gsm8k_num_questions = 1319
     gsm8k_num_threads = 200
     gsm8k_num_shots = 0
 
-    # Prefill worker: DSA prefill-CP (round-robin / interleave) + layer split.
+    # Prefill worker: interleave prefill-CP + DSA cache layer split on 2 GPUs
+    # (TP=2 -> attn_cp_size=2, so KV/indexer layers shard 2-way across CP ranks).
     extra_prefill_args = [
         "--tp",
-        "4",
+        "2",
         "--dsa-prefill-backend",
         "trtllm",
         "--kv-cache-dtype",
         "fp8_e4m3",
         "--enable-dsa-cache-layer-split",
-        "--enable-dsa-prefill-context-parallel",
-        "--dsa-prefill-cp-mode",
-        "round-robin-split",
+        "--enable-prefill-cp",
+        "--cp-strategy",
+        "interleave",
         "--mem-fraction-static",
         "0.85",
         "--chunked-prefill-size",
@@ -53,10 +57,11 @@ class TestGLM52DSACacheLayerSplit(PDDisaggregationServerBase, GSM8KMixin):
         "--max-prefill-tokens",
         "4096",
     ]
-    # Decode worker: ordinary local decode cache, receives full shards via PD.
+    # Decode worker: ordinary local decode cache on the other 2 GPUs, receives
+    # full shards via PD transfer.
     extra_decode_args = [
         "--tp",
-        "4",
+        "2",
         "--dsa-decode-backend",
         "trtllm",
         "--kv-cache-dtype",
@@ -64,7 +69,7 @@ class TestGLM52DSACacheLayerSplit(PDDisaggregationServerBase, GSM8KMixin):
         "--mem-fraction-static",
         "0.85",
         "--base-gpu-id",
-        "4",
+        "2",
     ]
 
     @classmethod

@@ -1189,6 +1189,8 @@ def unwrap_write_loc(loc_info):
 
 
 class KVCache(abc.ABC):
+    layer_shard_enabled: bool = False
+
     @abc.abstractmethod
     def __init__(
         self,

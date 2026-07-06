@@ -3899,6 +3899,13 @@ class ServerArgs:
                         f"{self.disaggregation_transfer_backend!r}. mori/nixl "
                         "support will be added later by the community."
                     )
+                if self.enable_dsa_cache_layer_split and self.pp_size > 1:
+                    raise ValueError(
+                        "--enable-dsa-cache-layer-split is not supported with "
+                        "pipeline parallelism (pp_size > 1) yet. It requires "
+                        "prefill context parallelism, and CP + PP has not been "
+                        "validated for this feature."
+                    )
 
             else:
                 # DeepSeek V3/R1/V3.1

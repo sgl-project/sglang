@@ -640,6 +640,10 @@ class Indexer(MultiPlatformOp):
             out_cache_loc = forward_batch.out_cache_loc
         pool = get_token_to_kv_pool()
         page_size = pool.page_size
+        if hasattr(pool, "invalidate_index_buffer_for_layer"):
+            pool.invalidate_index_buffer_for_layer(layer_id)
+        if hasattr(pool, "_is_layer_owned") and not pool._is_layer_owned(layer_id):
+            return
         if (
             not _is_fp8_fnuz
             and out_cache_loc is not None
@@ -768,6 +772,15 @@ class Indexer(MultiPlatformOp):
             return
         dst.copy_(src)
 
+    @staticmethod
+    def _get_index_k_read_buffer(pool, layer_id: int) -> torch.Tensor:
+        # Read path: prefer the owner-broadcast scratch buffer under DSA cache
+        # layer split; fall back to the owned buffer for plain pools. Stores go
+        # through get_index_k_with_scale_buffer() (owned buffer) instead.
+        if hasattr(pool, "get_broadcastable_index_k_with_scale_buffer"):
+            return pool.get_broadcastable_index_k_with_scale_buffer(layer_id)
+        return pool.get_index_k_with_scale_buffer(layer_id=layer_id)
+
     def _get_topk_paged(
         self,
         forward_batch: ForwardBatch,
@@ -799,9 +812,7 @@ class Indexer(MultiPlatformOp):
             block_tables = metadata.get_page_table_64()
 
         max_seq_len = block_tables.shape[1] * page_size
-        kv_cache_fp8 = get_token_to_kv_pool().get_index_k_with_scale_buffer(
-            layer_id=layer_id
-        )
+        kv_cache_fp8 = self._get_index_k_read_buffer(get_token_to_kv_pool(), layer_id)
 
         blocksize = page_size
         if (

@@ -2212,10 +2212,9 @@ class DeepseekV2DecoderLayer(nn.Module):
             topk_indices = None
         get_attn_tp_context().clear_attn_inputs()
 
-        if self.dsa_enable_prefill_cp:
-            maybe_prefetch_next_full_attention_kv(
-                forward_batch, next_full_attention_layer_id
-            )
+        maybe_prefetch_next_full_attention_kv(
+            forward_batch, next_full_attention_layer_id
+        )
 
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch

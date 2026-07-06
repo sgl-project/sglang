@@ -72,14 +72,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _get_layer_split_effective_num_layers(mr: ModelRunner, num_layers: int) -> int:
-    from sglang.srt.layers.cp.utils import (
-        get_glm_dsa_layer_split_effective_num_layers,
-    )
-
-    return get_glm_dsa_layer_split_effective_num_layers(mr, num_layers)
-
-
 def _get_dsv4_compress_state_dtype_sizes() -> tuple[int, int]:
     dtype_name = envs.SGLANG_DSV4_COMPRESS_STATE_DTYPE.get().strip().lower()
     if dtype_name in ("float32", "fp32"):
@@ -185,7 +177,13 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         # args to config cell size
         model_config = mr.model_config
         kv_cache_dtype = mr.kv_cache_dtype
-        effective_num_layers = _get_layer_split_effective_num_layers(mr, num_layers)
+        from sglang.srt.layers.cp.utils import (
+            get_glm_dsa_layer_split_effective_num_layers,
+        )
+
+        effective_num_layers = get_glm_dsa_layer_split_effective_num_layers(
+            mr, num_layers
+        )
 
         kv_size = torch._utils._element_size(kv_cache_dtype)
         tp_size = get_attention_tp_size()
