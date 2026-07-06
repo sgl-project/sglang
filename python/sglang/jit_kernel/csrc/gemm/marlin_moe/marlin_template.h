@@ -376,13 +376,18 @@ __global__ void Marlin(
   const int b_bias_expert_stride = prob_n / 8;
 
   // parallel: num valid moe blocks
+  // moe_align_block_size emits expert_id == -1 blocks whenever topk_ids
+  // contain masked entries, which EP token dispatchers produce by mapping
+  // non-local experts to -1 before this kernel runs -- independently of
+  // whether the caller passed an expert_map (is_ep). Count invalid blocks
+  // unconditionally so a masked block is never dereferenced as an expert
+  // index (a -1 expert id turns into negative B/scale offsets and reads
+  // far out of bounds).
   int num_tokens_past_padded = num_tokens_past_padded_ptr[0];
   int parallel = num_tokens_past_padded / moe_block_size;
   int num_valid_blocks = parallel;
-  if (is_ep) {
-    for (int i = 0; i < parallel; i++) {
-      if (expert_ids_ptr[i] == -1) num_valid_blocks--;
-    }
+  for (int i = 0; i < parallel; i++) {
+    if (expert_ids_ptr[i] == -1) num_valid_blocks--;
   }
   int num_invalid_blocks = parallel - num_valid_blocks;
   parallel = num_valid_blocks;

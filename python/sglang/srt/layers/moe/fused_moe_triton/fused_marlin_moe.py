@@ -204,7 +204,12 @@ def fused_marlin_moe(
         device=hidden_states.device,
         dtype=hidden_states.dtype,
     )
-    intermediate_cache13 = torch.empty(
+    # Zero-initialized: the marlin gemm skips blocks whose expert id is -1
+    # (masked topk entries from EP token dispatchers), leaving those rows of
+    # cache1/cache3 unwritten. The final weighted sum still reads every
+    # (token, slot) row, so unwritten rows must be zero, not allocator
+    # garbage, for masked pairs to contribute nothing.
+    intermediate_cache13 = torch.zeros(
         (M * topk_ids.shape[1] * max(gemm1_n, K),),
         device=hidden_states.device,
         dtype=hidden_states.dtype,
