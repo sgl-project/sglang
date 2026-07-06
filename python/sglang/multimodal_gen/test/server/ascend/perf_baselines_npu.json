@@ -574,7 +574,7 @@
             "expected_avg_denoise_ms": 2636.6,
             "expected_median_denoise_ms": 2705.05
          },
-       "mova_360p_t2va_2npu": {
+       "mova_360p_ti2va_2npu": {
            "stages_ms": {
                "InputValidationStage": 19.09,
                "TextEncodingStage": 512.61,
