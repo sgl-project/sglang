@@ -301,6 +301,11 @@ class MiMoVisionTransformer(nn.Module):
         self.merger = Qwen2_5_VisionPatchMerger(
             dim=vision_config.out_hidden_size,
             context_dim=hidden_size,
+            # MiMo-VL's merger MLP is square (intermediate == context_dim * merge**2),
+            # so no dim padding is needed. The Qwen2.5-VL formula num_heads * head_dim
+            # over-sizes it here because MiMo uses qk_channels (64) for head_dim rather
+            # than hidden_size // num_heads, which would mismatch the checkpoint.
+            padded_context_dim=hidden_size,
             spatial_merge_size=spatial_merge_size,
             quant_config=quant_config,
             prefix=add_prefix("merger", prefix),

@@ -60,6 +60,12 @@ class KDAKernelDispatcher:
 
         if prefill_backend.is_triton():
             self.extend_kernel = triton_kernel
+        elif prefill_backend.is_flashkda():
+            from sglang.srt.layers.attention.linear.kernels.kda_flashkda import (
+                FlashKDAKernel,
+            )
+
+            self.extend_kernel = FlashKDAKernel()
         elif prefill_backend.is_cutedsl():
             if not is_cuda():
                 raise ValueError("KDA CuTe DSL backend requires CUDA")
@@ -81,7 +87,8 @@ class KDAKernelDispatcher:
         else:
             raise ValueError(
                 f"Unsupported KDA prefill backend: {prefill_backend}. "
-                "KDA supports 'triton' or 'cutedsl' (cutedsl prefill needs SM100)."
+                "KDA supports 'triton', 'flashkda', or 'cutedsl' "
+                "(cutedsl prefill needs SM100)."
             )
 
         self.supports_packed_decode = getattr(
@@ -367,6 +374,14 @@ class KDAAttnBackend(MambaAttnBackendBase):
             A_log=layer.A_log,
             dt_bias=layer.dt_bias,
             lower_bound=getattr(layer, "lower_bound", None),
+            extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+            # target_verify / draft_extend_v2 also reach forward_extend; they must
+            # stay rollback-able, so a kernel that commits state in place (e.g.
+            # FlashKDA) must not run for them.
+            is_spec_decode=(
+                forward_batch.forward_mode.is_target_verify()
+                or forward_batch.forward_mode.is_draft_extend_v2()
+            ),
         )
 
         return core_attn_out
