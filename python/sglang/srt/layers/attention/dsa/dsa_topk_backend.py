@@ -264,14 +264,16 @@ def _topk_transform_v2_paged(
 
     num_rows = logits.shape[0]
 
-    # The indexer (DeepGEMM) emits contiguous fp32 scores whose rows are 16B
-    # aligned, i.e. a width that is already a multiple of 4 -- exactly the kernel's
-    # vectorized-load ABI. Assert it instead of padding to it.
+    # The indexer (DeepGEMM) emits fp32 scores with unit row stride and a 16B-aligned
+    # row stride (a multiple of 4), which is exactly the kernel's ABI (it checks
+    # score_stride % 4 == 0 with strides {S, 1}). This holds even though the scores
+    # may be a padded view (stride(0) > width, so not `is_contiguous()`); assert the
+    # real requirement rather than force a contiguous copy of the wide score buffer.
     assert (
         logits.dtype == torch.float32
-        and logits.is_contiguous()
-        and logits.shape[1] % 4 == 0
-    ), f"v2 top-k expects contiguous fp32 scores with 16B-aligned rows, got {logits.dtype=} {logits.shape=} contiguous={logits.is_contiguous()}"
+        and logits.stride(1) == 1
+        and logits.stride(0) % 4 == 0
+    ), f"v2 top-k expects fp32 scores with unit row stride and 16B-aligned score_stride, got {logits.dtype=} {logits.stride()=}"
     assert 0 < topk <= 2048, f"v2 top-k supports 0 < topk <= 2048, got {topk=}"
 
     page_table = attn_metadata.real_page_table
