@@ -953,6 +953,11 @@ class DSparkWorkerV2(BaseSpecWorker):
                 row_valid = valid[i]
                 if not row_valid.any():
                     continue
+                self._record_full_cache_locs_source(
+                    req_pool_idx=int(req_pool_indices[i]),
+                    cache_locs=cache_locs[i, row_valid],
+                    source="prefill_tail_replay_full",
+                )
                 take = torch.nonzero(row_valid, as_tuple=False).view(-1)[-8:]
                 self._record_boundary_debug(
                     req_pool_idx=int(req_pool_indices[i]),
@@ -1511,6 +1516,31 @@ class DSparkWorkerV2(BaseSpecWorker):
             # Keep only the tail of the sliding-window history.
             for loc in sorted(source_by_loc)[:-256]:
                 source_by_loc.pop(loc, None)
+
+    def _record_full_cache_locs_source(
+        self,
+        *,
+        req_pool_idx: int,
+        cache_locs: torch.Tensor,
+        source: str,
+    ) -> None:
+        if not self._accept_anomaly_enabled or not self._is_tp0():
+            return
+        if cache_locs.numel() == 0:
+            return
+        try:
+            locs = cache_locs.to(device=self.device, dtype=torch.int64)
+            token_to_kv_pool = self.draft_model_runner.attn_backend.token_to_kv_pool
+            translate_swa = getattr(token_to_kv_pool, "translate_loc_from_full_to_swa", None)
+            if translate_swa is not None:
+                locs = translate_swa(locs)
+            self._record_swa_locs_source(
+                req_pool_idx=int(req_pool_idx),
+                swa_locs=[int(x) for x in locs.detach().cpu().reshape(-1).tolist()],
+                source=source,
+            )
+        except Exception:
+            return
 
     def _record_draft_block_write_sources(
         self, req_pool_indices: torch.Tensor, draft_out_cache_loc: torch.Tensor
