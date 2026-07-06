@@ -467,8 +467,12 @@ class Lfm2ForCausalLM(nn.Module):
                 config.num_attention_heads + config.num_key_value_heads * 2
             )
         elif module_name == "out_proj":
-            # Both attention and ShortConv out_proj project back to hidden_size.
-            return head_dim * config.num_attention_heads, config.hidden_size
+            # Attention out_proj is (head_dim * num_heads -> hidden); ShortConv
+            # out_proj is (hidden -> hidden). The two differ when head_dim is
+            # set explicitly, so dispatch on the layer type.
+            if config.layer_types[layer_idx] == "full_attention":
+                return head_dim * config.num_attention_heads, config.hidden_size
+            return config.hidden_size, config.hidden_size
         elif module_name == "gate_up_proj":
             # config.intermediate_size may be auto-adjusted at module creation
             return config.hidden_size, _mlp_intermediate_size(config) * 2
