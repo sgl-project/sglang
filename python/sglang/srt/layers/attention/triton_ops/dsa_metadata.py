@@ -76,6 +76,8 @@ def _fused_dsa_decode_metadata_kernel(
         mask=mask,
         other=0,
     ).to(tl.int32)
+    # Write the wide page_size=1 table only when the caller provides it; the
+    # fused decode CUDA graph drops it and consumes real_page_table alone.
     if HAS_PAGE_TABLE_1:
         tl.store(
             page_table_1 + row * page_table_stride_0 + offs_n * page_table_stride_1,
@@ -110,6 +112,15 @@ def fused_dsa_decode_metadata(
     dsa_index_topk: int,
     real_page_size: int,
 ) -> None:
+    """Fill decode-graph DSA metadata (seqlens + page tables) from req_to_token.
+
+    ``page_table_1`` (the wide page_size=1 table) is optional: pass ``None`` to
+    skip materializing it and write only the compact ``real_page_table``
+    (page_size=``real_page_size``). This is used by the fused decode CUDA graph,
+    where the wide table is never read (attention uses topk_indices, the indexer
+    uses real_page_table); ``real_page_size`` must be >1 in that case. When a
+    tensor is passed, behavior is unchanged (both tables are written).
+    """
     assert seq_lens.is_cuda
     assert req_pool_indices.is_cuda
     assert req_to_token.is_cuda
@@ -277,6 +288,8 @@ def _fused_dsa_target_verify_metadata_kernel(
         mask=mask,
         other=0,
     ).to(tl.int32)
+    # Write the wide page_size=1 table only when the caller provides it (see
+    # fused_dsa_decode_metadata for the optional-page_table_1 contract).
     if HAS_PAGE_TABLE_1:
         tl.store(
             page_table_1 + out_row * page_table_stride_0 + offs_n * page_table_stride_1,
@@ -530,6 +543,8 @@ def _fused_dsa_draft_extend_metadata_kernel(
         mask=col_mask & has_rows,
         other=0,
     ).to(tl.int32)
+    # Write the wide page_size=1 table only when the caller provides it (see
+    # fused_dsa_decode_metadata for the optional-page_table_1 contract).
     if HAS_PAGE_TABLE_1:
         tl.store(
             page_table_1
