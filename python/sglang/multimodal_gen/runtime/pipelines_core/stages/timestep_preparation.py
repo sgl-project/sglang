@@ -57,8 +57,8 @@ class TimestepPreparationStage(PipelineStage):
     deduplicated_deepcopy_output_fields = ("scheduler",)
     deduplicated_extra_tensor_tree_output_keys = ("mu",)
 
-    # Class-level so the rollout info log prints once per process even if
-    # the scheduler is cloned per request (isolate=True paths).
+    # Class-level so the rollout info log prints once per process, not once
+    # per stage instance.
     _logged_rollout_scheduler_check = False
 
     def __init__(
