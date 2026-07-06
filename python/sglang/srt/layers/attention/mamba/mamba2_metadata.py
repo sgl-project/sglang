@@ -30,6 +30,11 @@ class ForwardMetadata:
     query_start_loc: torch.Tensor
     mamba_cache_indices: torch.Tensor
     mamba_cache_indices_gdn: Optional[torch.Tensor] = None
+    # Mamba track DESTINATION slots (PHYSICAL, length == batch). Like
+    # mamba_cache_indices: a backend-owned static buffer under cuda-graph (translated
+    # in-place each replay), eager sets the translated decode tensor. The decode
+    # track-save reads THIS, never forward_batch.mamba_track_indices.
+    mamba_track_indices: Optional[torch.Tensor] = None
     # GDN ReplaySSM (slice 1a): per-decode-row snapshot of the ring write
     # cursor for THIS decode step (gathered from the persistent per-slot
     # buffer, then advanced once for the next step). int32, length == batch.
@@ -182,6 +187,7 @@ class Mamba2Metadata(ForwardMetadata):
         return Mamba2Metadata(
             query_start_loc=forward_metadata.query_start_loc,
             mamba_cache_indices=forward_metadata.mamba_cache_indices,
+            mamba_track_indices=forward_metadata.mamba_track_indices,
             retrieve_next_token=forward_metadata.retrieve_next_token,
             retrieve_next_sibling=forward_metadata.retrieve_next_sibling,
             retrieve_parent_token=forward_metadata.retrieve_parent_token,
@@ -277,6 +283,7 @@ class Mamba2Metadata(ForwardMetadata):
         return Mamba2Metadata(
             query_start_loc=query_start_loc,
             mamba_cache_indices=forward_metadata.mamba_cache_indices,
+            mamba_track_indices=forward_metadata.mamba_track_indices,
             retrieve_next_token=forward_metadata.retrieve_next_token,
             retrieve_next_sibling=forward_metadata.retrieve_next_sibling,
             retrieve_parent_token=forward_metadata.retrieve_parent_token,
