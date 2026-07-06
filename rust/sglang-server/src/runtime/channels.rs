@@ -9,6 +9,15 @@
 use crate::ids::RequestId;
 use crate::message::{ChunkEvent, EgressSink, Request};
 
+/// Blocking receive that also wakes on shutdown: returns `None` when `rx` closes
+/// *or* the `shutdown` sender is dropped.
+pub fn recv<T>(rx: &flume::Receiver<T>, shutdown: &flume::Receiver<()>) -> Option<T> {
+    flume::Selector::new()
+        .recv(rx, |r| r.ok())
+        .recv(shutdown, |_| None)
+        .wait()
+}
+
 /// Events into the TokenizerManager ingress loop. API server + tokenizer pool
 /// share this one inbox, keeping the loop a single consumer (no `select`).
 pub enum TmEvent {

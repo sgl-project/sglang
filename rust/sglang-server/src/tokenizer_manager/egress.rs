@@ -16,7 +16,7 @@ use bytes::Bytes;
 use crate::ids::RequestId;
 use crate::message::{EGRESS_TAG_BATCH, EGRESS_TAG_ERROR, EGRESS_TAG_RESULT, decode_batch_frame};
 use crate::runtime::Runnable;
-use crate::runtime::channels::{DetokMsg, Senders};
+use crate::runtime::channels::{DetokMsg, Senders, recv};
 use crate::runtime::ring::EgressConsumer;
 
 /// A monotonic counter bumped once per egress-ring frame the dispatcher drains.
@@ -31,21 +31,28 @@ pub struct Egress {
     egress: EgressConsumer,
     senders: Senders,
     activity: ActivityCounter,
+    shutdown: flume::Receiver<()>,
 }
 
 impl Egress {
-    pub fn new(egress: EgressConsumer, senders: Senders, activity: ActivityCounter) -> Self {
+    pub fn new(
+        egress: EgressConsumer,
+        senders: Senders,
+        activity: ActivityCounter,
+        shutdown: flume::Receiver<()>,
+    ) -> Self {
         Self {
             egress,
             senders,
             activity,
+            shutdown,
         }
     }
 }
 
 impl Runnable for Egress {
     fn run(self) {
-        while let Some(bytes) = self.egress.recv() {
+        while let Some(bytes) = recv(self.egress.receiver(), &self.shutdown) {
             let Some((&tag, body)) = bytes.split_first() else {
                 continue;
             };
