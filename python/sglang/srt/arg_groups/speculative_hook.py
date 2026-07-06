@@ -438,17 +438,37 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
 
     # topk > 1 + page_size > 1 needs the two-pass cascade draft-decode (shared prefix
     # pass + per-branch expand pass with prefix-tail dup). Only these backends implement
-    # it; flashmla / trtllm_mla / cutlass_mla can't express the per-branch tree, so reject.
-    _PAGE_TREE_SPEC_BACKENDS = ("flashinfer", "fa3", "triton")
+    # it; flashmla / cutlass_mla can't express the per-branch tree, so reject.
+    #
+    # trtllm_mla / cutedsl_mla run the cascade on the cuteDSL MLA decode kernel
+    # (TRTLLMMLABackend, both verify and draft sides). The global
+    # attention_backend may be unset when the routing is split into
+    # --prefill-attention-backend / --decode-attention-backend, so the guard
+    # checks any of the three slots (mirrors the trtllm_mha guard above).
+    _PAGE_TREE_SPEC_BACKENDS = (
+        "flashinfer",
+        "fa3",
+        "triton",
+        "trtllm_mla",
+        "cutedsl_mla",
+    )
+    routed_backends = (
+        server_args.attention_backend,
+        server_args.decode_attention_backend,
+        server_args.prefill_attention_backend,
+    )
     if (
         server_args.speculative_eagle_topk > 1
         and server_args.page_size > 1
-        and server_args.attention_backend not in _PAGE_TREE_SPEC_BACKENDS
+        and not any(b in _PAGE_TREE_SPEC_BACKENDS for b in routed_backends)
     ):
         raise ValueError(
             f"speculative_eagle_topk > 1 with page_size > 1 is only supported on "
             f"{_PAGE_TREE_SPEC_BACKENDS}; got attention_backend="
-            f"{server_args.attention_backend!r}. Use page_size == 1 or one of those backends."
+            f"{server_args.attention_backend!r} (decode="
+            f"{server_args.decode_attention_backend!r}, prefill="
+            f"{server_args.prefill_attention_backend!r}). "
+            f"Use page_size == 1 or one of those backends."
         )
 
 

@@ -9,9 +9,14 @@ from sglang.test.test_utils import CustomTestCase
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from sglang.srt.utils import is_sm100_supported, is_sm120_supported
 from sglang.test.kits.attention_unittest.attention_methods.mla_attention import (
     MLAAttentionCase,
     run_mla_attention_case,
+)
+from sglang.test.kits.attention_unittest.runner_modes.speculative_target_verify_runner import (
+    run_mla_eagle_verify_case,
+    run_mla_eagle_verify_cuda_graph_case,
 )
 
 # trtllm_mla goes through FlashInfer's XQA MLA path. Per PLAN.md and the
@@ -43,6 +48,51 @@ def _supported() -> tuple[bool, str]:
 
 
 _SUPPORTED, _SKIP_REASON = _supported()
+
+
+def _cutedsl_supported() -> tuple[bool, str]:
+    # The cuteDSL MLA decode kernel (cutedsl_mla backend) runs on SM100 (B200)
+    # and SM120/SM121 (Blackwell variants). The topk>1 tree-verify cascade also
+    # needs the flashinfer non-causal toggle (flashinfer-ai/flashinfer #3771);
+    # that dependency is probed separately by _causal_toggle_supported() so the
+    # topk>1 cases SKIP (not error) on an older flashinfer, while the topk==1
+    # chain case -- which does not use causal= -- still runs.
+    if not torch.cuda.is_available():
+        return False, "CUDA is required"
+    if not (is_sm100_supported() or is_sm120_supported()):
+        major, minor = torch.cuda.get_device_capability()
+        return (
+            False,
+            f"cutedsl_mla requires SM 10.0 (B200) / 12.0a / 12.1a, "
+            f"got SM {major}.{minor}",
+        )
+    return True, ""
+
+
+_CUTEDSL_SUPPORTED, _CUTEDSL_SKIP_REASON = _cutedsl_supported()
+
+
+def _causal_toggle_supported() -> bool:
+    """True iff the installed flashinfer exposes the cuteDSL non-causal toggle
+    (``cute_dsl_mla_decode(causal=...)``, flashinfer-ai/flashinfer #3771), which
+    the topk>1 tree-verify cascade requires. Lets the topk>1 cases SKIP instead
+    of erroring on an older flashinfer."""
+    try:
+        import inspect
+
+        # The public flashinfer.cute_dsl.attention.cute_dsl_mla_decode is a
+        # ``*args, **kwargs`` dispatcher (mla_dispatch.py), so its signature does
+        # NOT list ``causal``; the toggle lives on the monolithic implementation.
+        from flashinfer.cute_dsl.attention.monolithic.mla_decode import (
+            cute_dsl_mla_decode as _mono_mla_decode,
+        )
+
+        return "causal" in inspect.signature(_mono_mla_decode).parameters
+    except Exception:
+        return False
+
+
+_CAUSAL_TOGGLE_OK = _causal_toggle_supported()
 
 
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -160,6 +210,103 @@ class TestTRTLLMMLAAttentionBackendCorrectness(CustomTestCase):
         for case in self.CASES:
             with self.subTest(case=case.name, backend=case.backend):
                 run_mla_attention_case(self, case, **MLA_SHAPE_KWARGS)
+
+
+@unittest.skipIf(not _CUTEDSL_SUPPORTED, _CUTEDSL_SKIP_REASON)
+class TestCuteDSLMLAEagleVerifyTreeCorrectness(CustomTestCase):
+    """EAGLE target-verify on the cuteDSL MLA backend (cutedsl_mla).
+
+    The topk>1 (tree) verify runs the 2-pass cascade in
+    ``TRTLLMMLABackend._forward_tree_verify`` (the cuteDSL fold decode kernel
+    returns LSE, which trtllm-gen does not). The topk==1 (chain) case is a
+    regression-equivalence guard that exercises the unchanged single-pass path
+    through the same fixture. Mirrors the Triton tree case in
+    ``test_triton.py`` (parent_indices == (-1, 0, 0), draft_token_num == 3).
+    """
+
+    # The cuteDSL decode kernel needs paged KV with page_size in {32, 64}
+    # (it rejects page_size == 1), and the prefix/draft dims must be the
+    # production MLA shape (kv_lora_rank=512, qk_rope_head_dim=64).
+    EAGLE_VERIFY_CASES = (
+        (
+            MLAAttentionCase(
+                name="runner_eagle_verify_cutedsl_mla_chain",
+                backend="cutedsl_mla",
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                num_heads=4,
+                page_size=64,
+                prefix_lens=(64, 70),
+                extend_lens=(3, 3),
+            ),
+            1,
+            "eagle",
+        ),
+        (
+            MLAAttentionCase(
+                name="runner_eagle_verify_cutedsl_mla_tree",
+                backend="cutedsl_mla",
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                num_heads=4,
+                page_size=64,
+                prefix_lens=(64, 70),
+                extend_lens=(3, 3),
+            ),
+            2,
+            "eagle",
+        ),
+    )
+    EAGLE_VERIFY_CUDA_GRAPH_CASES = (
+        (
+            MLAAttentionCase(
+                name="runner_cuda_graph_eagle_verify_cutedsl_mla_chain",
+                backend="cutedsl_mla",
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                num_heads=4,
+                page_size=64,
+                prefix_lens=(64, 70),
+                extend_lens=(3, 3),
+            ),
+            1,
+            "eagle",
+        ),
+        (
+            MLAAttentionCase(
+                name="runner_cuda_graph_eagle_verify_cutedsl_mla_tree",
+                backend="cutedsl_mla",
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                num_heads=4,
+                page_size=64,
+                prefix_lens=(64, 70),
+                extend_lens=(3, 3),
+            ),
+            2,
+            "eagle",
+        ),
+    )
+
+    def test_eagle_verify_cases(self):
+        for case, topk, spec_kind in self.EAGLE_VERIFY_CASES:
+            with self.subTest(case=case.name, topk=topk, spec_kind=spec_kind):
+                if topk > 1 and not _CAUSAL_TOGGLE_OK:
+                    self.skipTest(
+                        "topk>1 tree-verify needs flashinfer cute_dsl_mla_decode "
+                        "causal= toggle (flashinfer-ai/flashinfer #3771)"
+                    )
+                run_mla_eagle_verify_case(
+                    self, case, topk=topk, spec_kind=spec_kind, **MLA_SHAPE_KWARGS
+                )
+
+    def test_eagle_verify_cuda_graph_cases(self):
+        for case, topk, spec_kind in self.EAGLE_VERIFY_CUDA_GRAPH_CASES:
+            with self.subTest(case=case.name, topk=topk, spec_kind=spec_kind):
+                if topk > 1 and not _CAUSAL_TOGGLE_OK:
+                    self.skipTest(
+                        "topk>1 tree-verify needs flashinfer cute_dsl_mla_decode "
+                        "causal= toggle (flashinfer-ai/flashinfer #3771)"
+                    )
+                run_mla_eagle_verify_cuda_graph_case(
+                    self, case, topk=topk, spec_kind=spec_kind, **MLA_SHAPE_KWARGS
+                )
 
 
 if __name__ == "__main__":

@@ -219,6 +219,7 @@ class MockMLAModelRunner(ModelRunner):
         disable_piecewise_cuda_graph: bool = True,
         runner_batch_size: int | None = None,
         fp8_kv_cache: bool = False,
+        speculative_eagle_topk: int = 0,
     ):
         pool_batch_size = runner_batch_size or case.batch_size
         self.device = device
@@ -274,7 +275,7 @@ class MockMLAModelRunner(ModelRunner):
             pp_size=1,
             revision=None,
             speculative_algorithm=None,
-            speculative_eagle_topk=0,
+            speculative_eagle_topk=speculative_eagle_topk,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
             speculative_num_steps=max(0, speculative_num_draft_tokens - 1),
             tp_size=1,
@@ -868,6 +869,7 @@ def build_mla_attention_fixture(
     runner_batch_size: int | None = None,
     fp8_kv_cache: bool = False,
     loc_layout: str = "shuffled_pages",
+    speculative_eagle_topk: int = 0,
 ) -> MLAAttentionFixture:
     seed = 3090 + len(case.name)
     torch.manual_seed(seed)
@@ -892,6 +894,7 @@ def build_mla_attention_fixture(
         disable_piecewise_cuda_graph=disable_piecewise_cuda_graph,
         runner_batch_size=runner_batch_size,
         fp8_kv_cache=fp8_kv_cache,
+        speculative_eagle_topk=speculative_eagle_topk,
     )
     try:
         backend = ATTENTION_BACKENDS[case.backend](runner)

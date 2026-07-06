@@ -186,6 +186,19 @@ from .speculative_cuda_graph_runner import (
 
 SpecVerifyKind = Literal["eagle", "frozen_kv_mtp", "dflash", "ngram"]
 
+# MLA backends whose verify path keys off server_args.speculative_eagle_topk at
+# construction (the cuteDSL / trtllm_mla 2-pass tree-verify cascade). Other MLA
+# backends derive the tree shape from spec_info and ignore the server arg, so we
+# only thread the real topk for these to avoid perturbing their behavior.
+_TOPK_AWARE_MLA_BACKENDS = ("trtllm_mla", "cutedsl_mla")
+
+
+def _mla_fixture_topk(case, topk: int) -> int:
+    """Topk to pass to build_mla_attention_fixture for `case`. Non-zero only for
+    the cuteDSL / trtllm_mla cascade backends (preserves the historical 0 for
+    triton / flashinfer / flashmla)."""
+    return topk if case.backend in _TOPK_AWARE_MLA_BACKENDS else 0
+
 
 def _check_target_verify_case(case) -> int:
     if not case.forward_mode.is_target_verify():
@@ -809,6 +822,10 @@ def run_mla_eagle_verify_case(
         max_context_len=max_context_len,
         dtype=dtype,
         device=device,
+        # The cuteDSL / trtllm_mla backend reads speculative_eagle_topk at
+        # construction to enable its topk>1 tree-verify cascade. Other MLA
+        # backends ignore it (they read the tree shape from spec_info).
+        speculative_eagle_topk=_mla_fixture_topk(case, topk),
     )
     _prepare_target_verify_batch(fixture.forward_batch, case, device)
     masks_by_req, _ = _make_custom_masks(case, topk=topk, device=device)
@@ -870,6 +887,9 @@ def run_mla_eagle_verify_cuda_graph_case(
             max_context_len=max_context_len,
             dtype=dtype,
             device=device,
+            # cuteDSL / trtllm_mla reads this at construction to enable the
+            # topk>1 tree-verify cascade; other MLA backends ignore it.
+            speculative_eagle_topk=_mla_fixture_topk(case, topk),
         ),
         max_context_len=max_context_len,
         dtype=dtype,
