@@ -18,6 +18,7 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.jit_kernel.dsv4 import linear_bf16_fp32
 from sglang.srt.distributed import (
     moe_expert_parallel_all_reduce,
     moe_tensor_model_parallel_all_reduce,
@@ -177,7 +178,7 @@ class HYV3MoEFused(nn.Module):
         hidden_dim = hidden_states.shape[-1]
         hidden_states = hidden_states.view(-1, hidden_dim)
 
-        router_logits, _ = self.gate(hidden_states.to(dtype=torch.float32))
+        router_logits = linear_bf16_fp32(hidden_states, self.gate.weight)
         topk_output = self.topk(hidden_states, router_logits)
         if self.shared_mlp is not None:
             shared_output = self.shared_mlp(hidden_states)
@@ -216,7 +217,7 @@ class HYV3MoEFused(nn.Module):
         shared_output = self.shared_mlp(hidden_states)
 
         with torch.cuda.stream(self.alt_stream):
-            router_logits, _ = self.gate(hidden_states.to(dtype=torch.float32))
+            router_logits = linear_bf16_fp32(hidden_states, self.gate.weight)
             topk_output = self.topk(hidden_states, router_logits)
             final_hidden_states = self.experts(
                 hidden_states=hidden_states, topk_output=topk_output
