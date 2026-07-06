@@ -183,9 +183,7 @@ class Qwen3DSparkConfidenceHead(nn.Module):
         super().__init__()
         self.proj = nn.Linear(int(input_dim), 1, bias=True, dtype=torch.float32)
 
-    def forward(
-        self, hidden: torch.Tensor, markov_embed: torch.Tensor
-    ) -> torch.Tensor:
+    def forward(self, hidden: torch.Tensor, markov_embed: torch.Tensor) -> torch.Tensor:
         features = torch.cat([hidden, markov_embed], dim=-1)
         return self.proj(features.float()).squeeze(-1)
 
@@ -435,7 +433,9 @@ def resolve_qwen3_dspark_weight(
     if name.startswith("layers."):
         # Direct 1:1 renames under the backbone: input_layernorm,
         # post_attention_layernorm, self_attn.{q,k}_norm, self_attn.o_proj.
-        return Qwen3DSparkWeightMapping(checkpoint_name=name, dest_param="model." + name)
+        return Qwen3DSparkWeightMapping(
+            checkpoint_name=name, dest_param="model." + name
+        )
 
     if name in _TOP_LEVEL_PARAM_MAP:
         return Qwen3DSparkWeightMapping(

@@ -554,9 +554,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     draft_model_config.hf_config
                 )
                 self.dspark_target_layer_ids = list(
-                    getattr(
-                        draft_model_config.hf_config, "dspark_target_layer_ids", []
-                    )
+                    getattr(draft_model_config.hf_config, "dspark_target_layer_ids", [])
                 )
             else:
                 # Generic (Qwen3-family) DSpark checkpoints use plain HF field

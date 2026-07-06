@@ -54,10 +54,9 @@ sys.path.insert(0, str(DEEPSPEC_ROOT))
 
 import torch  # noqa: E402
 import torch.nn.functional as F  # noqa: E402
-from safetensors.torch import load_file  # noqa: E402
-
 from deepspec.modeling.dspark.common import AcceptRatePredictor  # noqa: E402
 from deepspec.modeling.dspark.markov_head import VanillaMarkov  # noqa: E402
+from safetensors.torch import load_file  # noqa: E402
 from transformers.models.qwen3.modeling_qwen3 import Qwen3RMSNorm  # noqa: E402
 
 from sglang.srt.models.qwen3_dspark import (  # noqa: E402
@@ -257,7 +256,11 @@ def main() -> int:
     rows, unmapped = run_weight_mapping_audit(names)
     for mapping in rows:
         if mapping.dest_param is not None:
-            shard = f"  (shard_id={mapping.shard_id!r})" if mapping.shard_id is not None else ""
+            shard = (
+                f"  (shard_id={mapping.shard_id!r})"
+                if mapping.shard_id is not None
+                else ""
+            )
             print(f"  {mapping.checkpoint_name:45s} -> {mapping.dest_param}{shard}")
         else:
             print(f"  {mapping.checkpoint_name:45s} -> DROPPED: {mapping.drop_reason}")
@@ -274,8 +277,7 @@ def main() -> int:
     names_set = set(names)
     if checkpoint_names != names_set:
         print(
-            "NOTE: tensor_names.txt and the live safetensors file's key set "
-            "differ:",
+            "NOTE: tensor_names.txt and the live safetensors file's key set " "differ:",
             "extra in checkpoint:",
             sorted(checkpoint_names - names_set),
             "extra in tensor_names.txt:",
