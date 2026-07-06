@@ -109,10 +109,9 @@ def sgl_per_token_group_quant_8bit(
     masked_m: Optional[torch.Tensor] = None,
     enable_v2: Optional[bool] = None,
 ) -> None:
+    _V2_KERNEL_SUPPORTED_GROUP_SIZES = [16, 32, 64, 128]
     if enable_v2 is None:
-        from sglang.srt.utils import get_bool_env_var
-
-        enable_v2 = get_bool_env_var("SGLANG_PER_TOKEN_GROUP_QUANT_8BIT_V2")
+        enable_v2 = group_size in _V2_KERNEL_SUPPORTED_GROUP_SIZES
 
     if enable_v2:
         return torch.ops.sgl_kernel.sgl_per_token_group_quant_8bit_v2.default(
@@ -190,25 +189,6 @@ def qserve_w4a8_per_group_gemm(
         in_feats, kernel, zeros, scales_i8, wscales, ascales, out_feats
     )
     return out_feats
-
-
-def dsv3_router_gemm(
-    hidden_states: torch.Tensor,
-    router_weights: torch.Tensor,
-    out_dtype: torch.dtype = torch.bfloat16,
-) -> torch.Tensor:
-    output = torch.empty(
-        hidden_states.shape[0],
-        router_weights.shape[0],
-        device=hidden_states.device,
-        dtype=out_dtype,
-    )
-    torch.ops.sgl_kernel.dsv3_router_gemm(
-        output,
-        hidden_states,
-        router_weights,
-    )
-    return output
 
 
 def shuffle_rows(input_tensor, dst2src_map, output_tensor_shape):

@@ -7,7 +7,7 @@
 #include <limits>
 #include <vector>
 
-#ifndef USE_ROCM
+#if !defined(USE_ROCM) && !defined(USE_MUSA)
 #include <dlfcn.h>
 #define WARP_SIZE 32
 #include "pytorch_extension_utils.h"
@@ -24,7 +24,7 @@ transfer_item_warp(int32_t lane_id, const void* src_addr, void* dst_addr, int64_
 
 #pragma unroll
   for (int j = lane_id; j < total_chunks; j += WARP_SIZE) {
-#ifndef USE_ROCM
+#if !defined(USE_ROCM) && !defined(USE_MUSA)
     uint64_t tmp;
     asm volatile("ld.global.nc.b64 %0,[%1];" : "=l"(tmp) : "l"(src + j) : "memory");
     asm volatile("st.global.cg.b64 [%0],%1;" ::"l"(dst + j), "l"(tmp) : "memory");
@@ -806,16 +806,28 @@ inline void transfer_kv_page_first_direct_impl(
   }
 
   // Symbol gate: runtime may not expose cudaMemcpyBatchAsync in some environments.
-  using CudaMemcpyBatchAsyncFn =
-      cudaError_t (*)(void**, void**, size_t*, size_t, cudaMemcpyAttributes*, size_t*, size_t, size_t*, cudaStream_t);
-  static CudaMemcpyBatchAsyncFn cuda_memcpy_batch_async = []() {
-    void* symbol = dlsym(RTLD_DEFAULT, "cudaMemcpyBatchAsync");
-    return reinterpret_cast<CudaMemcpyBatchAsyncFn>(symbol);
-  }();
-  if (cuda_memcpy_batch_async == nullptr) {
+  static void* cuda_memcpy_batch_async_sym = dlsym(RTLD_DEFAULT, "cudaMemcpyBatchAsync");
+  if (cuda_memcpy_batch_async_sym == nullptr) {
     fallback_to_page_copy();
     return;
   }
+
+  // CUDA 13.0 removed the failIdx parameter from cudaMemcpyBatchAsync. The ABI
+  // of the dlsym'd symbol is determined by the libcudart loaded in this process,
+  // not the host driver — a cu12 runtime on a cu13 driver host (common in
+  // containers) still exposes the 9-param v12 signature. Dispatching on the
+  // driver version here would segfault in that case (verified empirically).
+  // Use cudaRuntimeGetVersion so the signature follows the runtime. The
+  // runtime version is process-constant, so cache the query (static init is
+  // thread-safe in C++11+) to keep the KV-transfer hot path free of a redundant
+  // runtime API call per invocation.
+  static int runtime_version = 0;
+  static cudaError_t runtime_version_err = cudaRuntimeGetVersion(&runtime_version);
+  if (runtime_version_err != cudaSuccess) {
+    fallback_to_page_copy();
+    return;
+  }
+  static const bool use_v13_signature = runtime_version >= 13000;
 
   size_t num_copies = 0;
   std::vector<void*> batch_srcs;
@@ -916,17 +928,36 @@ inline void transfer_kv_page_first_direct_impl(
 
   TORCH_CHECK(batch_srcs.size() == num_copies, "Batch memcpy count mismatch");
   if (num_copies > 0) {
+    cudaError_t err;
     size_t fail_idx = std::numeric_limits<size_t>::max();
-    cudaError_t err = cuda_memcpy_batch_async(
-        batch_dsts.data(),
-        batch_srcs.data(),
-        batch_sizes.data(),
-        num_copies,
-        &attrs,
-        attrs_idxs.data(),
-        1,
-        &fail_idx,
-        stream);
+    if (use_v13_signature) {
+      using FnV13 = cudaError_t (*)(
+          void* const*,
+          const void* const*,
+          const size_t*,
+          size_t,
+          cudaMemcpyAttributes*,
+          size_t*,
+          size_t,
+          cudaStream_t);
+      auto fn = reinterpret_cast<FnV13>(cuda_memcpy_batch_async_sym);
+      err = fn(
+          batch_dsts.data(), batch_srcs.data(), batch_sizes.data(), num_copies, &attrs, attrs_idxs.data(), 1, stream);
+    } else {
+      using FnV12 = cudaError_t (*)(
+          void**, void**, size_t*, size_t, cudaMemcpyAttributes*, size_t*, size_t, size_t*, cudaStream_t);
+      auto fn = reinterpret_cast<FnV12>(cuda_memcpy_batch_async_sym);
+      err =
+          fn(batch_dsts.data(),
+             batch_srcs.data(),
+             batch_sizes.data(),
+             num_copies,
+             &attrs,
+             attrs_idxs.data(),
+             1,
+             &fail_idx,
+             stream);
+    }
     if (err == cudaErrorNotSupported || err == cudaErrorCallRequiresNewerDriver) {
       fallback_to_page_copy();
       return;

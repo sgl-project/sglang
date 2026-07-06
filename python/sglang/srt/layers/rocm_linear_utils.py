@@ -11,7 +11,7 @@ def aiter_dsv3_router_gemm(
     weight: torch.Tensor,
 ):
     """Use aiter tuned GEMM dispatcher (tgemm.mm) to automatically select the GEMM kernel."""
-    return tgemm.mm(hidden_states, weight, otype=hidden_states.dtype)
+    return tgemm.mm(hidden_states, weight.detach(), otype=hidden_states.dtype)
 
 
 def get_dsv3_gemm_output_zero_allocator_size(

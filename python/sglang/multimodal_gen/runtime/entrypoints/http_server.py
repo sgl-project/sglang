@@ -3,26 +3,42 @@
 import asyncio
 import base64
 import os
+import signal
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from typing import TYPE_CHECKING
 
+import httpx
 import torch
 from fastapi import APIRouter, FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
-from sglang.multimodal_gen.runtime.entrypoints.openai import image_api, video_api
+from sglang.multimodal_gen.runtime.entrypoints.openai import (
+    image_api,
+    video_api,
+)
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     VertexGenerateReqInput,
 )
+from sglang.multimodal_gen.runtime.entrypoints.openai.realtime import (
+    realtime_video_api,
+)
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import build_sampling_params
-from sglang.multimodal_gen.runtime.entrypoints.post_training import weights_api
+from sglang.multimodal_gen.runtime.entrypoints.post_training import (
+    rollout_api,
+    weights_api,
+)
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
     prepare_request,
     save_outputs,
 )
 from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 from sglang.multimodal_gen.runtime.server_args import ServerArgs, get_global_server_args
+from sglang.multimodal_gen.runtime.server_warmup import (
+    run_async_client_warmup,
+    should_run_synthetic_server_warmup,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.utils.json_response import orjson_response
 from sglang.version import __version__
@@ -32,8 +48,56 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-DEFAULT_SEED = 1024
 VERTEX_ROUTE = os.environ.get("AIP_PREDICT_ROUTE", "/vertex_generate")
+SERVER_WARMUP_BYPASS_PATHS = (
+    "/health",
+    "/health_generate",
+    "/model_info",
+    "/server_info",
+)
+
+
+async def _wait_until_http_ready(server_args: ServerArgs) -> None:
+    """for server warmup"""
+    health_url = f"{server_args.url()}/health"
+    # Probe the local server directly: a loopback readiness check must never be
+    # routed through an HTTP proxy. trust_env=False also avoids crashing startup
+    # on a malformed proxy env var, since httpx parses *_PROXY/NO_PROXY when the
+    # client is constructed (raising httpx.InvalidURL before any request). See #28493.
+    async with httpx.AsyncClient(trust_env=False) as client:
+        for _ in range(120):
+            try:
+                response = await client.get(health_url, timeout=5.0)
+                if response.status_code == 200:
+                    return
+            except httpx.HTTPError:
+                pass
+            await asyncio.sleep(1.0)
+    raise RuntimeError(f"HTTP server did not become ready at {health_url}")
+
+
+async def _run_server_warmup_after_http_ready(
+    server_args: ServerArgs, warmup_done: asyncio.Event
+) -> None:
+    try:
+        if not should_run_synthetic_server_warmup(server_args):
+            warmup_done.set()
+            return
+
+        await _wait_until_http_ready(server_args)
+
+        await run_async_client_warmup(
+            server_args,
+            async_scheduler_client.forward,
+            fail_open=server_args.warmup_resolutions is None,
+        )
+        logger.info("The server is fired up and ready to roll!")
+        warmup_done.set()
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        logger.error("Server warmup failed; aborting startup: %s", e, exc_info=True)
+        os.kill(os.getpid(), signal.SIGTERM)
 
 
 @asynccontextmanager
@@ -46,16 +110,31 @@ async def lifespan(app: FastAPI):
     # 1. Initialize the singleton client that connects to the backend Scheduler
     server_args = app.state.server_args
     async_scheduler_client.initialize(server_args)
+    warmup_done = asyncio.Event()
+    app.state.server_warmup_done = warmup_done
 
     # 2. Start the ZMQ Broker in the background to handle offline requests
     broker_task = asyncio.create_task(run_zeromq_broker(server_args))
+    warmup_task = None
+    if server_args.server_warmup:
+        warmup_task = asyncio.create_task(
+            _run_server_warmup_after_http_ready(server_args, warmup_done)
+        )
+    else:
+        warmup_done.set()
 
-    yield
+    try:
+        yield
+    finally:
+        if warmup_task is not None and not warmup_task.done():
+            warmup_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await warmup_task
 
-    # On shutdown
-    logger.info("FastAPI app is shutting down...")
-    broker_task.cancel()
-    async_scheduler_client.close()
+        # On shutdown
+        logger.info("FastAPI app is shutting down...")
+        broker_task.cancel()
+        async_scheduler_client.close()
 
 
 # Health router
@@ -159,6 +238,32 @@ async def health_generate():
     return {"status": "ok"}
 
 
+@health_router.get("/stats")
+async def stats_endpoint(request: Request):
+    """Get runtime statistics including disagg pipeline metrics.
+
+    Returns queue depth, request counts, latency, throughput, etc.
+    Sends a GetDisaggStatsReq to the scheduler via ZMQ and returns the result.
+    """
+    from sglang.multimodal_gen.runtime.entrypoints.utils import GetDisaggStatsReq
+
+    server_args: ServerArgs = request.app.state.server_args
+    response: dict = {
+        "status": "ok",
+        "model_path": server_args.model_path,
+    }
+
+    # Query the scheduler for disagg metrics
+    try:
+        stats_response = await async_scheduler_client.forward(GetDisaggStatsReq())
+        if hasattr(stats_response, "output") and stats_response.output is not None:
+            response["disagg"] = stats_response.output
+    except Exception as e:
+        response["disagg"] = {"error": str(e)}
+
+    return response
+
+
 def make_serializable(obj):
     """Recursively converts Tensors to None for JSON serialization."""
     if isinstance(obj, torch.Tensor):
@@ -249,7 +354,6 @@ async def vertex_generate(vertex_req: VertexGenerateReqInput):
             rid,
             prompt=inst.get("prompt") or inst.get("text"),
             image_path=inst.get("image") or inst.get("image_url"),
-            seed=params.get("seed", DEFAULT_SEED),
             num_frames=params.get("num_frames"),
             fps=params.get("fps"),
             width=params.get("width"),
@@ -271,6 +375,24 @@ def create_app(server_args: ServerArgs):
     Create and configure the FastAPI application instance.
     """
     app = FastAPI(lifespan=lifespan)
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    @app.middleware("http")
+    async def wait_for_server_warmup(request: Request, call_next):
+        warmup_done = getattr(request.app.state, "server_warmup_done", None)
+        if (
+            warmup_done is not None
+            and not warmup_done.is_set()
+            and request.url.path not in SERVER_WARMUP_BYPASS_PATHS
+        ):
+            await warmup_done.wait()
+        return await call_next(request)
 
     app.include_router(health_router)
     app.include_router(vertex_router)
@@ -280,8 +402,10 @@ def create_app(server_args: ServerArgs):
     app.include_router(common_api.router)
     app.include_router(image_api.router)
     app.include_router(video_api.router)
+    app.include_router(realtime_video_api.router)
     app.include_router(mesh_api.router)
     app.include_router(weights_api.router)
+    app.include_router(rollout_api.router)
 
     app.state.server_args = server_args
     return app

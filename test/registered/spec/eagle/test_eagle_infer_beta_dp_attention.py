@@ -3,7 +3,6 @@ from types import SimpleNamespace
 
 import requests
 
-from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_eval import run_eval
@@ -17,7 +16,7 @@ from sglang.test.test_utils import (
 )
 
 # EAGLE with DP attention on B200 (tp=2, dp=2, requires 4 B200 GPUs)
-register_cuda_ci(est_time=100, suite="stage-c-test-4-gpu-b200")
+register_cuda_ci(est_time=90, stage="base-c", runner_config="4-gpu-b200")
 
 
 def test_gsm8k(base_url: str, model: str):
@@ -65,19 +64,12 @@ class TestEagleDPAttnServerSmall(CustomTestCase):
             "--speculative-num-draft-tokens",
             "4",
         ]
-        with envs.SGLANG_ENABLE_SPEC_V2.override(
-            True
-        ), envs.SGLANG_SPEC_NAN_DETECTION.override(
-            True
-        ), envs.SGLANG_SPEC_OOB_DETECTION.override(
-            True
-        ):
-            cls.process = popen_launch_server(
-                cls.model,
-                cls.base_url,
-                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-                other_args=other_args,
-            )
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=other_args,
+        )
 
     @classmethod
     def tearDownClass(cls):

@@ -1,20 +1,16 @@
 # SGLang CI failure monitoring
 
-Scripts used by [.github/workflows/ci-failure-monitor.yml](../../.github/workflows/ci-failure-monitor.yml): scheduled failure analysis and optional Slack notifications.
+Scripts used by [.github/workflows/ci-failure-monitor.yml](../../.github/workflows/ci-failure-monitor.yml): scheduled failure analysis.
 
 ## Tools
 
 1. **Failures Analyzer** (`ci_failures_analysis.py`): Tracks consecutive failures, identifies flaky jobs, and monitors runner health across PR Test / Nightly workflows (Nvidia, AMD, Intel, XPU, NPU).
 
-2. **Slack poster** (`post_ci_failures_to_slack.py`): Sends a condensed summary from a failure-analysis JSON to Slack (invoked by the workflow when `SGLANG_DIFFUSION_SLACK_TOKEN` is set).
-
 ## Installation
 
 ```bash
-pip install requests slack_sdk
+pip install requests
 ```
-
-(`slack_sdk` is only required for `post_ci_failures_to_slack.py`.)
 
 ## Usage
 
@@ -26,15 +22,6 @@ export GITHUB_TOKEN="your_token_here"
 python ci_failures_analysis.py --token $GITHUB_TOKEN --limit 50 --threshold 2
 python ci_failures_analysis.py --token $GITHUB_TOKEN --limit 300 --threshold 2
 python ci_failures_analysis.py --token $GITHUB_TOKEN --limit 500 --threshold 3
-```
-
-### Slack notifications
-
-From the `scripts/ci_monitor` directory, after generating a report:
-
-```bash
-export SGLANG_DIFFUSION_SLACK_TOKEN="xoxb-..."
-python post_ci_failures_to_slack.py --report-file ci_failure_analysis_YYYYMMDD_HHMMSS.json
 ```
 
 ## Token permissions

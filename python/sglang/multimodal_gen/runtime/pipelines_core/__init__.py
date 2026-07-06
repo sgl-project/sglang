@@ -17,8 +17,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline import LoRAPipel
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
-    maybe_download_model,
-    verify_model_config_and_directory,
+    maybe_download_model as maybe_download_model,
+)
+from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
+    verify_model_config_and_directory as verify_model_config_and_directory,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -66,6 +68,7 @@ def build_pipeline(
         )
     else:
         logger.info("No pipeline_class_name specified, using model_index.json")
+
         model_info = get_model_info(
             model_path,
             backend=server_args.backend,

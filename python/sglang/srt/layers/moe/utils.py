@@ -1,18 +1,26 @@
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import contextmanager
 from enum import Enum, IntEnum
 from typing import TYPE_CHECKING, Optional
 
-from sglang.srt.distributed.parallel_state import get_moe_expert_parallel_world_size
+import torch
+
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
-    get_attention_dp_size,
     is_dp_attention_enabled,
 )
+from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils import is_cuda, is_npu
+
+_is_npu = is_npu()
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
+
+from sglang.srt.server_args import get_global_server_args
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +34,7 @@ class MoeA2ABackend(Enum):
     MORI = "mori"
     ASCEND_FUSEEP = "ascend_fuseep"
     FLASHINFER = "flashinfer"
+    MEGAMOE = "megamoe"
     CUSTOMIZED = "customized"
 
     @classmethod
@@ -58,8 +67,20 @@ class MoeA2ABackend(Enum):
     def is_mori(self):
         return self == MoeA2ABackend.MORI
 
+    def is_megamoe(self):
+        return self == MoeA2ABackend.MEGAMOE
+
     def is_customized(self):
         return self == MoeA2ABackend.CUSTOMIZED
+
+    def supports_aiter(self) -> bool:
+        return self in (
+            MoeA2ABackend.NONE,
+            MoeA2ABackend.DEEPEP,
+            MoeA2ABackend.MOONCAKE,
+            MoeA2ABackend.NIXL,
+            MoeA2ABackend.MORI,
+        )
 
 
 class MoeRunnerBackend(Enum):
@@ -69,12 +90,14 @@ class MoeRunnerBackend(Enum):
     TRITON = "triton"
     TRITON_KERNELS = "triton_kernel"
     FLASHINFER_TRTLLM = "flashinfer_trtllm"
+    EXPERIMENTAL_SGL_TRTLLM = "experimental_sgl_trtllm"
     FLASHINFER_TRTLLM_ROUTED = "flashinfer_trtllm_routed"
     FLASHINFER_CUTLASS = "flashinfer_cutlass"
     FLASHINFER_MXFP4 = "flashinfer_mxfp4"
     FLASHINFER_CUTEDSL = "flashinfer_cutedsl"
     CUTLASS = "cutlass"
     MARLIN = "marlin"
+    AITER = "aiter"
 
     def is_auto(self):
         return self == MoeRunnerBackend.AUTO
@@ -89,7 +112,15 @@ class MoeRunnerBackend(Enum):
         return self == MoeRunnerBackend.TRITON_KERNELS
 
     def is_flashinfer_trtllm(self):
-        return self == MoeRunnerBackend.FLASHINFER_TRTLLM
+        # experimental_sgl_trtllm shares the TRT-LLM FP8 kernels + layout, so it inherits
+        # trtllm weight-prep here; divergent sites check is_experimental_sgl_trtllm() first.
+        return self in (
+            MoeRunnerBackend.FLASHINFER_TRTLLM,
+            MoeRunnerBackend.EXPERIMENTAL_SGL_TRTLLM,
+        )
+
+    def is_experimental_sgl_trtllm(self):
+        return self == MoeRunnerBackend.EXPERIMENTAL_SGL_TRTLLM
 
     def is_flashinfer_trtllm_routed(self):
         return self == MoeRunnerBackend.FLASHINFER_TRTLLM_ROUTED
@@ -108,6 +139,9 @@ class MoeRunnerBackend(Enum):
 
     def is_marlin(self):
         return self == MoeRunnerBackend.MARLIN
+
+    def is_aiter(self):
+        return self == MoeRunnerBackend.AITER
 
 
 class DeepEPMode(Enum):
@@ -139,6 +173,76 @@ class DeepEPMode(Enum):
 
     def is_auto(self) -> bool:
         return self == DeepEPMode.AUTO
+
+
+class DeepEPOutputDtype(Enum):
+    """
+    Describes the dispatch output data type for DeepEP.
+
+    - BF16: dispatch hidden states in bf16
+    - FP8: dispatch hidden states in fp8
+    - INT8: dispatch hidden states in int8
+    - NVFP4: dispatch hidden states in nvfp4
+    """
+
+    BF16 = "bf16"
+    FP8 = "fp8"
+    INT8 = "int8"
+    NVFP4 = "nvfp4"
+
+
+def get_deepep_output_dtype(self) -> DeepEPOutputDtype:
+    """
+    Automatically choose the dispatch output dtype for DeepEP.
+
+    The decision follows several checks in priority order:
+    0. Parse server argument.
+    1. Parse deprecated environment variables.
+    2. If quant_config contains input_global_scale → NVFP4 path.
+    3. Parse quant config
+    4. If flashinfer_cutedsl or is_cutlass backend is active → BF16 (it quantizes hidden_states internally).
+    5. Otherwise default for NPU → BF16 (the default for NPU).
+    6. Otherwise → FP8 (the default for most models like DeepSeek-V3).
+    """
+
+    # 0. Parse server argument.
+    server_args = get_global_server_args()
+    if server_args and server_args.deepep_dispatcher_output_dtype != "auto":
+        return DeepEPOutputDtype(server_args.deepep_dispatcher_output_dtype)
+
+    # 1. Parse deprecated environment variables.
+    if envs.SGLANG_DEEPEP_BF16_DISPATCH.get():
+        logger.warning_once(
+            "Warning: The env variable SGLANG_DEEPEP_BF16_DISPATCH deprecated "
+            "and will be removed in future releases. Please use a new "
+            "`--deepep-dispatcher-output-dtype bf16` argument instead."
+        )
+        return DeepEPOutputDtype.BF16
+
+    # 2. NVFP4 is detected inside dispatch_a / _dispatch_core via quant_config; no need to infer here.
+    if self.quant_config is not None:
+        input_global_scale = self.quant_config.get("input_global_scale", None)
+        if input_global_scale is not None:
+            return DeepEPOutputDtype.NVFP4
+
+        # 3. Parse quant config to determine the output dtype of dispatcher
+        dispatcher_output_dtype = self.quant_config.get("dispatcher_output_dtype", None)
+        if dispatcher_output_dtype is not None:
+            return DeepEPOutputDtype(dispatcher_output_dtype)
+
+    # 4. flashinfer_cutedsl and is_cutlass expects BF16 dispatch
+    if (
+        get_moe_runner_backend().is_flashinfer_cutedsl()
+        or get_moe_runner_backend().is_cutlass()
+    ):
+        return DeepEPOutputDtype.BF16
+
+    # 5. Default on NPU → BF16
+    if _is_npu:
+        return DeepEPOutputDtype.BF16
+
+    # 6. Default → FP8
+    return DeepEPOutputDtype.FP8
 
 
 MOE_A2A_BACKEND: Optional[MoeA2ABackend] = None
@@ -183,6 +287,11 @@ def initialize_moe_config(server_args: ServerArgs):
     DEEPEP_CONFIG = server_args.deepep_config or ""
     IS_TBO_ENABLED = server_args.enable_two_batch_overlap
     IS_SBO_ENABLED = server_args.enable_single_batch_overlap
+    if IS_SBO_ENABLED and is_cuda():
+        if torch.cuda.get_device_capability()[0] == 9:
+            raise ValueError(
+                "SBO (single batch overlap) is not supported on SM90 GPUs with latest sgl-deep-gemm wheel. Please try removing --enable-single-batch-overlap argument."
+            )
     TBO_TOKEN_DISTRIBUTION_THRESHOLD = server_args.tbo_token_distribution_threshold
     DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER = (
         server_args.disable_flashinfer_cutlass_moe_fp4_allgather
@@ -254,6 +363,30 @@ def is_sbo_enabled() -> bool:
     return IS_SBO_ENABLED
 
 
+def is_deepep_class_backend() -> bool:
+    """Check if the MoE backend is DeepEP-family (DeepEP, Mooncake, or Mori)."""
+    b = get_moe_a2a_backend()
+    return b.is_deepep() or b.is_mooncake() or b.is_mori()
+
+
+def uses_per_rank_fused_shared_slots() -> bool:
+    """Check whether fused shared experts use per-rank physical slots."""
+    return is_deepep_class_backend() or get_moe_a2a_backend().is_megamoe()
+
+
+def has_per_rank_fused_shared_slots(num_fused_shared_experts: int) -> bool:
+    """Check whether this layer has fused shared experts in per-rank slots."""
+    return num_fused_shared_experts > 0 and uses_per_rank_fused_shared_slots()
+
+
+def is_flashinfer_cutedsl_v1_path() -> bool:
+    """CuteDSL v1 + DeepEP low-latency path (no MoeRunner, no autotune)."""
+    return (
+        get_moe_runner_backend().is_flashinfer_cutedsl()
+        and get_moe_a2a_backend().is_deepep()
+    )
+
+
 def get_tbo_token_distribution_threshold() -> float:
     global TBO_TOKEN_DISTRIBUTION_THRESHOLD
     if TBO_TOKEN_DISTRIBUTION_THRESHOLD is None:
@@ -285,8 +418,64 @@ def should_use_flashinfer_cutlass_moe_fp4_allgather():
         and get_moe_runner_backend().is_flashinfer_cutlass()
         and is_dp_attention_enabled()
         and MOE_QUANTIZATION == "modelopt_fp4"
-        and get_moe_expert_parallel_world_size() == get_attention_dp_size()
+        and get_parallel().moe_ep_size == get_parallel().attn_dp_size
     )
+
+
+def should_use_dp_reduce_scatterv():
+    """
+    Use reduce_scatterv in the standard dispatcher's combine() for DP attention
+    with EP, replacing the default all-reduce + dp_scatter path.
+    Only changes the combine (post-kernel) communication; dispatch is unchanged.
+    """
+    return (
+        not should_use_flashinfer_cutlass_moe_fp4_allgather()
+        and get_moe_a2a_backend().is_none()
+        and is_dp_attention_enabled()
+        and get_parallel().attn_dp_size > 1
+        and get_parallel().moe_ep_size == get_parallel().attn_dp_size
+    )
+
+
+def should_skip_post_experts_all_reduce(
+    *,
+    is_tp_path: bool,
+    use_reduce_scatter: bool = False,
+    should_allreduce_fusion: bool = False,
+) -> bool:
+    """Whether to skip the post-experts all-reduce (EP or TP) because a
+    downstream component will fuse, replace, or absorb it.
+
+    Skip reasons, in order:
+      - ``should_allreduce_fusion``: LayerCommunicator will fuse the all-reduce
+        with the next layer's residual all-reduce.
+      - ``use_reduce_scatter``: LayerCommunicator's post-attention scatter will
+        do reduce-scatter, which would double-reduce on top of an all-reduce.
+      - ``should_use_dp_reduce_scatterv()``: the standard dispatcher's combine
+        path replaces the all-reduce with a reduce-scatterv.
+      - ``should_use_flashinfer_cutlass_moe_fp4_allgather()`` (TP path only):
+        the flashinfer cutlass FP4 kernel performs an all-gather that absorbs
+        the post-experts TP all-reduce. Not relevant to the EP all-reduce.
+      - ``get_moe_a2a_backend().is_flashinfer()``: the flashinfer A2A
+        dispatcher's ``MoeAlltoAll.combine`` already alltoall-reduces partial
+        MoE outputs back to the source rank, so any further EP/TP all-reduce
+        would double-count and overflow BF16. Mirrors TRTLLM's
+        ``not enable_alltoall`` gate
+        (``tensorrt_llm/_torch/modules/fused_moe/interface.py:879``).
+
+    The first two args are layer-context flags from ``LayerCommunicator`` and
+    default to ``False`` for models that don't use it. Pass ``is_tp_path=True``
+    for the post-experts TP all-reduce, ``False`` for the EP all-reduce.
+    """
+    if should_allreduce_fusion or use_reduce_scatter:
+        return True
+    if should_use_dp_reduce_scatterv():
+        return True
+    if is_tp_path and should_use_flashinfer_cutlass_moe_fp4_allgather():
+        return True
+    if get_moe_a2a_backend().is_flashinfer():
+        return True
+    return False
 
 
 @contextmanager
@@ -343,5 +532,59 @@ class RoutingMethodType(IntEnum):
     RenormalizeNaive = (4,)
     # TopK only (no softmax)
     TopK = (5,)
+    # SigmoidRenorm: Sigmoid -> TopK -> Renormalize
+    SigmoidRenorm = (6,)
+    # MiniMax2
+    MiniMax2 = (7,)
+    # Sigmoid: Sigmoid -> TopK (no renormalize)
+    Sigmoid = (8,)
     # Unspecified
-    Unspecified = 6
+    Unspecified = 9
+
+
+AITER_PADDING_SIZE = 128
+TRITON_PADDING_SIZE = 128
+
+
+# Unit of padding - context dependent
+def get_moe_padding_size(is_aiter_moe):
+    if is_aiter_moe:
+        return AITER_PADDING_SIZE
+    else:
+        return (
+            TRITON_PADDING_SIZE
+            if bool(int(os.getenv("SGLANG_MOE_PADDING", "0")))
+            else 0
+        )
+
+
+def get_moe_weight_sizes(inter_dim, is_concat, is_packed, is_aiter_moe):
+    """
+    Calculate dimensions for MoE weight tensors.
+
+    Args:
+        inter_dim: Base intermediate dimension.
+        is_concat: If True, fusions W1 (gate) and W3 (up) projections.
+        is_packed: If True, uses 4-bit quantization (two FP4 elements per byte).
+        is_aiter_moe: If True, applies Aiter-specific kernel padding alignment.
+    """
+    # w2_down_dim is the packing rank, but w13_up_dim not (of matrix to matmul)
+    w13_up_dim = 2 * inter_dim if is_concat else inter_dim
+    w2_down_dim = inter_dim // 2 if is_packed else inter_dim
+
+    if is_aiter_moe:
+        padding_size = get_moe_padding_size(True)
+        align_aiter = lambda n: ((n + padding_size - 1) // padding_size) * padding_size
+        is_padded = (w2_down_dim % padding_size) > 0
+        if is_padded:
+            # w2_down_dim, padding & aligned, unit: parameter dtype
+            w2_down_dim = align_aiter(w2_down_dim)
+        # up proj + gate fusion : 2x
+        if is_concat:
+            w13_up_dim = w2_down_dim * 2
+        # packed
+        if hasattr(torch, "float4_e2m1fn_x2") and is_packed:
+            # w13_up_dim (row rank of matmul matrix) is not packing dim, *2 to recover
+            w13_up_dim *= 2
+
+    return (w13_up_dim, w2_down_dim, False if not is_aiter_moe else is_padded)

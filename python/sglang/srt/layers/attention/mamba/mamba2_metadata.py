@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Copyright 2025 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -27,6 +29,22 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 class ForwardMetadata:
     query_start_loc: torch.Tensor
     mamba_cache_indices: torch.Tensor
+    mamba_cache_indices_gdn: Optional[torch.Tensor] = None
+    # Mamba track DESTINATION slots (PHYSICAL, length == batch). Like
+    # mamba_cache_indices: a backend-owned static buffer under cuda-graph (translated
+    # in-place each replay), eager sets the translated decode tensor. The decode
+    # track-save reads THIS, never forward_batch.mamba_track_indices.
+    mamba_track_indices: Optional[torch.Tensor] = None
+    # GDN ReplaySSM (slice 1a): per-decode-row snapshot of the ring write
+    # cursor for THIS decode step (gathered from the persistent per-slot
+    # buffer, then advanced once for the next step). int32, length == batch.
+    replayssm_write_pos: Optional[torch.Tensor] = None
+    # GDN ReplaySSM (slice 2b): per-decode-row int32 flush flag for THIS decode
+    # step. !=0 forces the kernel to fold the partial ring + current token into
+    # the checkpoint (temporal[slot]) so the radix cache reads an up-to-date
+    # state. Fires on EXACTLY the rows the radix track snapshots, i.e. the same
+    # condition the track uses: seq_lens_cpu % mamba_track_interval == 0.
+    replayssm_force_flush: Optional[torch.Tensor] = None
     # For topk > 1 eagle
     retrieve_next_token: Optional[torch.Tensor] = None
     retrieve_next_sibling: Optional[torch.Tensor] = None
@@ -40,6 +58,10 @@ class ForwardMetadata:
 
     is_target_verify: bool = False
     draft_token_num: int = 1
+
+    has_mamba_track_mask: bool = False
+    mamba_track_mask_indices: Optional[torch.Tensor] = None
+    conv_states_mask_indices: Optional[torch.Tensor] = None
 
 
 @dataclass(kw_only=True)
@@ -156,15 +178,23 @@ class Mamba2Metadata(ForwardMetadata):
         *,
         is_target_verify: bool,
         draft_token_num: int,
+        num_decodes: Optional[int] = None,
     ) -> "Mamba2Metadata":
         """This path is run during CUDA graph capture, i.e. decode only, so `num_prefills` is 0"""
         return Mamba2Metadata(
             query_start_loc=forward_metadata.query_start_loc,
             mamba_cache_indices=forward_metadata.mamba_cache_indices,
+            mamba_track_indices=forward_metadata.mamba_track_indices,
             retrieve_next_token=forward_metadata.retrieve_next_token,
             retrieve_next_sibling=forward_metadata.retrieve_next_sibling,
             retrieve_parent_token=forward_metadata.retrieve_parent_token,
-            num_decodes=len(seq_lens),
+            track_conv_indices=forward_metadata.track_conv_indices,
+            track_ssm_h_src=forward_metadata.track_ssm_h_src,
+            track_ssm_h_dst=forward_metadata.track_ssm_h_dst,
+            track_ssm_final_src=forward_metadata.track_ssm_final_src,
+            track_ssm_final_dst=forward_metadata.track_ssm_final_dst,
+            has_mamba_track_mask=forward_metadata.has_mamba_track_mask,
+            num_decodes=len(seq_lens) if num_decodes is None else num_decodes,
             num_prefills=0,
             num_prefill_tokens=0,
             is_target_verify=is_target_verify,
@@ -185,28 +215,49 @@ class Mamba2Metadata(ForwardMetadata):
                 if forward_batch.spec_info is not None
                 else 1
             )
+            num_decodes = getattr(forward_batch, "_original_batch_size", None)
+            if num_decodes is None:
+                num_decodes = len(forward_batch.seq_lens)
             return cls.prepare_decode(
                 forward_metadata,
                 forward_batch.seq_lens,
                 is_target_verify=forward_batch.forward_mode.is_target_verify(),
                 draft_token_num=draft_token_num,
+                num_decodes=num_decodes,
             )
-        num_prefills = len(forward_batch.extend_seq_lens)
-        num_prefill_tokens = forward_batch.extend_num_tokens
-        num_decodes = len(forward_batch.seq_lens) - num_prefills
+        extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
+        if extend_seq_lens_cpu is None:
+            num_prefills = len(forward_batch.extend_seq_lens)
+        else:
+            num_prefills = len(extend_seq_lens_cpu)
+        if extend_seq_lens_cpu is not None:
+            num_prefill_tokens = int(sum(extend_seq_lens_cpu))
+        else:
+            num_prefill_tokens = int(forward_batch.extend_num_tokens)
+        batch_size = getattr(forward_batch, "_original_batch_size", None)
+        if batch_size is None:
+            batch_size = len(forward_batch.seq_lens)
+        num_decodes = batch_size - num_prefills
         context_lens_tensor = forward_batch.extend_prefix_lens
         assert context_lens_tensor is not None
-        # precompute flag to avoid device syncs later
         has_initial_states = context_lens_tensor > 0
+        mamba_track_mask = getattr(forward_batch, "mamba_track_mask", None)
+        if mamba_track_mask is not None:
+            has_initial_states = (
+                has_initial_states & mamba_track_mask[: has_initial_states.shape[0]]
+            )
         prep_initial_states = torch.any(has_initial_states[:num_prefills]).item()
 
         query_start_loc = forward_metadata.query_start_loc[: num_prefills + 1]
+        _seq_idx_output_size = (
+            num_prefill_tokens if extend_seq_lens_cpu is not None else None
+        )
         seq_idx = torch.repeat_interleave(
             torch.arange(
                 num_prefills, dtype=torch.int32, device=query_start_loc.device
             ),
             query_start_loc.diff(),
-            output_size=num_prefill_tokens,
+            output_size=_seq_idx_output_size,
         )
         seq_idx.unsqueeze_(0)
 
@@ -229,9 +280,16 @@ class Mamba2Metadata(ForwardMetadata):
         return Mamba2Metadata(
             query_start_loc=query_start_loc,
             mamba_cache_indices=forward_metadata.mamba_cache_indices,
+            mamba_track_indices=forward_metadata.mamba_track_indices,
             retrieve_next_token=forward_metadata.retrieve_next_token,
             retrieve_next_sibling=forward_metadata.retrieve_next_sibling,
             retrieve_parent_token=forward_metadata.retrieve_parent_token,
+            track_conv_indices=forward_metadata.track_conv_indices,
+            track_ssm_h_src=forward_metadata.track_ssm_h_src,
+            track_ssm_h_dst=forward_metadata.track_ssm_h_dst,
+            track_ssm_final_src=forward_metadata.track_ssm_final_src,
+            track_ssm_final_dst=forward_metadata.track_ssm_final_dst,
+            has_mamba_track_mask=forward_metadata.has_mamba_track_mask,
             num_prefills=num_prefills,
             num_prefill_tokens=num_prefill_tokens,
             num_decodes=num_decodes,
@@ -244,6 +302,6 @@ class Mamba2Metadata(ForwardMetadata):
                 seq_idx=seq_idx,
                 chunk_indices=chunk_indices,
                 chunk_offsets=chunk_offsets,
-                extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+                extend_seq_lens_cpu=extend_seq_lens_cpu,
             ),
         )

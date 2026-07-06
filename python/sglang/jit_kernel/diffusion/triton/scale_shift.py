@@ -224,7 +224,6 @@ def _fused_scale_shift_4d_kernel(
     scale_ptr,
     shift_ptr,
     scale_constant: tl.constexpr,  # scale_constant is either 0 or 1.
-    rows,
     inner_dim,
     seq_len,
     num_frames,
@@ -338,11 +337,13 @@ def fuse_scale_shift_kernel(
     block_l: int = 128,
     block_c: int = 128,
 ):
-    assert x.is_cuda and scale.is_cuda
+    assert (x.is_cuda and scale.is_cuda) or (x.is_xpu and scale.is_xpu)
     assert x.is_contiguous()
 
     B, L, C = x.shape
     output = torch.empty_like(x)
+    if x.numel() == 0:
+        return output
 
     if scale.dim() == 4:
         # scale/shift: [B, F, 1, C]
@@ -361,8 +362,22 @@ def fuse_scale_shift_kernel(
 
         # Compact scale [B, F, 1, C] -> [B*F, C] (per-frame)
         scale_reshaped = scale.squeeze(2).reshape(-1, C).contiguous()
-        # shift is per-token [B, L, C] -> [B*L, C]
-        shift_reshaped = shift.reshape(rows, C).contiguous()
+        if shift.dim() == 4 and current_platform.is_hip():
+            # ROCm has no fused CUTLASS scale-shift kernel, so this native path
+            # handles the causal Wan / LingBot output AdaLN, which passes a
+            # per-frame shift [B, F, 1, C]. Broadcast it across each frame's
+            # tokens to per-token [B, L, C] before flattening to [B*L, C],
+            # matching the per-token indexing in _fused_scale_shift_4d_kernel
+            # (the CUDA fused path accepts [B, F, 1, C] shift and broadcasts it
+            # per-frame).
+            shift_reshaped = (
+                shift.expand(B, num_frames, frame_seqlen, C)
+                .reshape(rows, C)
+                .contiguous()
+            )
+        else:
+            # shift is per-token [B, L, C] -> [B*L, C]
+            shift_reshaped = shift.reshape(rows, C).contiguous()
 
         _fused_scale_shift_4d_kernel[grid](
             output_2d,
@@ -370,7 +385,6 @@ def fuse_scale_shift_kernel(
             scale_reshaped,
             shift_reshaped,
             scale_constant,
-            rows,
             C,
             L,
             num_frames,
@@ -661,5 +675,17 @@ if current_platform.is_npu():
 
 if current_platform.is_mps():
     from .mps_fallback import fuse_scale_shift_kernel_native
+
+    fuse_scale_shift_kernel = fuse_scale_shift_kernel_native
+
+if current_platform.is_musa():
+    from .torch_fallback import fuse_scale_shift_kernel_native
+
+    fuse_scale_shift_kernel = fuse_scale_shift_kernel_native
+
+if current_platform.is_cpu():
+    from .torch_fallback import (
+        fuse_scale_shift_kernel_native,
+    )
 
     fuse_scale_shift_kernel = fuse_scale_shift_kernel_native

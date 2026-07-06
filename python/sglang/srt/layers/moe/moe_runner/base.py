@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import contextvars
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable, Optional, Tuple, TypeGuard
+from typing import TYPE_CHECKING, Any, Callable, Generator, Optional, Tuple, TypeGuard
 
 import torch
 
@@ -24,6 +26,20 @@ if TYPE_CHECKING:
         DispatchOutput,
         DispatchOutputFormat,
     )
+
+
+_moe_output_buf: contextvars.ContextVar[Optional[torch.Tensor]] = (
+    contextvars.ContextVar("moe_output_buf", default=None)
+)
+
+
+@contextmanager
+def moe_output_buffer_ctx(buf: torch.Tensor) -> Generator[None, None, None]:
+    token = _moe_output_buf.set(buf)
+    try:
+        yield
+    finally:
+        _moe_output_buf.reset(token)
 
 
 @dataclass
@@ -48,6 +64,11 @@ class MoeRunnerConfig:
     routed_scaling_factor: Optional[float] = None
     gemm1_alpha: Optional[float] = None
     gemm1_clamp_limit: Optional[float] = None
+    swiglu_limit: Optional[float] = None
+    # Whether gate/up weights are stored interleaved (vs split). Only the
+    # silu+is_gated swiglu path consumes it (interleaved -> swiglu_gpt_oss_*,
+    # otherwise chunk gate/up then apply alpha/limit).
+    gate_up_interleaved: bool = True
 
 
 @dataclass
@@ -82,7 +103,11 @@ class MoeRunnerCore(ABC):
 
     @abstractmethod
     def run(
-        self, runner_input: RunnerInput, quant_info: MoeQuantInfo, running_state: dict
+        self,
+        runner_input: RunnerInput,
+        quant_info: MoeQuantInfo,
+        running_state: dict,
+        hooks: Optional[Any] = None,
     ) -> RunnerOutput:
         pass
 

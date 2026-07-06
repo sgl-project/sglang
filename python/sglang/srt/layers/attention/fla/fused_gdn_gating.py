@@ -16,6 +16,8 @@ def fused_gdn_gating_kernel(
     b,
     dt_bias,
     seq_len,
+    stride_a,
+    stride_b,
     NUM_HEADS: tl.constexpr,
     beta: tl.constexpr,
     threshold: tl.constexpr,
@@ -26,8 +28,8 @@ def fused_gdn_gating_kernel(
     off = i_b * seq_len * NUM_HEADS + i_s * NUM_HEADS + head_off
     mask = head_off < NUM_HEADS
     blk_A_log = tl.load(A_log + head_off, mask=mask)
-    blk_a = tl.load(a + off, mask=mask)
-    blk_b = tl.load(b + off, mask=mask)
+    blk_a = tl.load(a + i_b * stride_a + head_off, mask=mask)
+    blk_b = tl.load(b + i_b * stride_b + head_off, mask=mask)
     blk_bias = tl.load(dt_bias + head_off, mask=mask)
     x = blk_a.to(tl.float32) + blk_bias.to(tl.float32)
     softplus_x = tl.where(
@@ -49,6 +51,8 @@ def fused_gdn_gating(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     batch, num_heads = a.shape
     seq_len = 1
+    stride_a = a.stride(0)
+    stride_b = b.stride(0)
     grid = (batch, seq_len, triton.cdiv(num_heads, 8))
     g = torch.empty(1, batch, num_heads, dtype=torch.float32, device=a.device)
     beta_output = torch.empty(1, batch, num_heads, dtype=torch.float32, device=b.device)
@@ -60,6 +64,8 @@ def fused_gdn_gating(
         b,
         dt_bias,
         seq_len,
+        stride_a,
+        stride_b,
         num_heads,
         beta,
         threshold,

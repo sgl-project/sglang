@@ -1,7 +1,9 @@
-"""Cross-framework comparison benchmark for diffusion serving.
+"""Diffusion serving benchmark for SGLang-Diffusion nightly CI.
 
-Launches servers (SGLang, vLLM-Omni, LightX2V) for each test case, sends a
-single request, measures end-to-end latency, and writes comparison-results.json.
+Launches an SGLang-Diffusion server for each test case, sends a single
+request, measures end-to-end latency, and writes comparison-results.json.
+The runner still supports extra frameworks via --frameworks, but the nightly
+config tracks SGLang-Diffusion only.
 
 Usage:
     # Full run (requires GPU)
@@ -23,6 +25,7 @@ import io
 import json
 import os
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -40,11 +43,15 @@ CONFIGS_PATH = Path(__file__).parent / "comparison_configs.json"
 INSTALL_SCRIPT = Path(__file__).parents[1] / "install_comparison_frameworks.sh"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 30000
-HEALTH_TIMEOUT = (
-    2400  # seconds (40 min — FLUX.2-dev needs ~10 min download + torch.compile)
-)
+SGLANG_MASTER_PORT_OFFSET = 5
+SGLANG_SCHEDULER_PORT_OFFSET = 55
+HEALTH_TIMEOUT = 2400  # seconds (40 min — keep large model download/warmup headroom)
 REQUEST_TIMEOUT = 1200  # seconds
 GPU_CLEAR_WAIT = 15  # seconds between framework runs
+SERVER_FATAL_ERROR_PATTERNS = (
+    "CUDA out of memory",
+    "torch.OutOfMemoryError",
+)
 
 # Frameworks that need separate installation (conflict with sglang's deps)
 INSTALLABLE_FRAMEWORKS = {"vllm-omni", "lightx2v"}
@@ -69,11 +76,20 @@ def _build_sglang_cmd(case: dict, fw_cfg: dict, port: int) -> list[str]:
         str(port),
         "--host",
         DEFAULT_HOST,
+        "--strict-ports",
+        "--master-port",
+        str(port + SGLANG_MASTER_PORT_OFFSET),
+        "--scheduler-port",
+        str(port + SGLANG_SCHEDULER_PORT_OFFSET),
     ]
     if case["num_gpus"] > 1:
         cmd += ["--num-gpus", str(case["num_gpus"])]
     if fw_cfg.get("serve_args", "").strip():
         cmd += fw_cfg["serve_args"].strip().split()
+    # No explicit --warmup-resolutions: server-based warmup now defaults to the
+    # model's sampling-default resolution (see warmup_request_builder), which
+    # already matches these single-resolution cases — the default warmup is
+    # sufficient, so we don't pin a resolution here.
     return cmd
 
 
@@ -240,29 +256,48 @@ def wait_for_health(
 KILLALL_SCRIPT = Path(__file__).parents[3] / "killall_sglang.sh"
 
 
-def kill_server(proc: subprocess.Popen) -> None:
-    """Kill server process tree and clean up GPU processes."""
-    if proc.poll() is not None:
-        return
-    try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-    except (ProcessLookupError, PermissionError):
-        pass
-    try:
-        proc.wait(timeout=30)
-    except subprocess.TimeoutExpired:
+def _is_port_available(port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            pass
-        proc.wait(timeout=10)
-    # Use killall_sglang.sh for thorough cleanup (esp. multi-GPU workers)
+            sock.bind((DEFAULT_HOST, port))
+        except OSError:
+            return False
+    return True
+
+
+def _require_ports_available(ports: list[int]) -> None:
+    unavailable = [port for port in ports if not _is_port_available(port)]
+    if unavailable:
+        raise RuntimeError(f"Required port(s) unavailable before launch: {unavailable}")
+
+
+def _cleanup_sglang_processes() -> None:
     if KILLALL_SCRIPT.exists():
         subprocess.run(
             ["bash", str(KILLALL_SCRIPT)],
             timeout=30,
             capture_output=True,
         )
+
+
+def kill_server(proc: subprocess.Popen) -> None:
+    """Kill server process tree and clean up GPU processes."""
+    if proc.poll() is None:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            pass
+        try:
+            proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+            proc.wait(timeout=10)
+    # Use killall_sglang.sh for thorough cleanup (esp. multi-GPU workers)
+    _cleanup_sglang_processes()
 
 
 # ---------------------------------------------------------------------------
@@ -317,7 +352,14 @@ def _build_sglang_payload(case: dict) -> dict:
         "n": 1,
         "response_format": "b64_json",
     }
-    for key in ("num_inference_steps", "guidance_scale", "seed", "num_frames"):
+    for key in (
+        "num_inference_steps",
+        "guidance_scale",
+        "seed",
+        "num_frames",
+        "fps",
+        "negative_prompt",
+    ):
         if key in case:
             payload[key] = case[key]
     return payload
@@ -363,14 +405,16 @@ def send_image_request_sglang(
     if "data" not in data or len(data["data"]) == 0:
         raise RuntimeError(f"Image request returned no data: {data}")
 
+    # Report client-side e2e latency to match vllm-omni / lightx2v (fair
+    # cross-framework comparison); server-side perf_dump is diagnostic only.
     if perf_dump_path:
         server_latency = _read_perf_dump(perf_dump_path)
         if server_latency is not None:
             print(
-                f"  Image generated in {server_latency:.2f}s (server-side), "
-                f"client={client_latency:.2f}s"
+                f"  Image generated in {client_latency:.2f}s (client e2e; "
+                f"server-side {server_latency:.2f}s, diagnostic)"
             )
-            return server_latency
+            return client_latency
     print(f"  Image generated in {client_latency:.2f}s")
     return client_latency
 
@@ -414,14 +458,16 @@ def send_video_request_sglang(
 
     client_latency = time.time() - start
 
+    # Report client-side e2e latency to match vllm-omni / lightx2v (fair
+    # cross-framework comparison); server-side perf_dump is diagnostic only.
     if perf_dump_path:
         server_latency = _read_perf_dump(perf_dump_path)
         if server_latency is not None:
             print(
-                f"  Video generated in {server_latency:.2f}s (server-side), "
-                f"client={client_latency:.2f}s"
+                f"  Video generated in {client_latency:.2f}s (client e2e; "
+                f"server-side {server_latency:.2f}s, diagnostic)"
             )
-            return server_latency
+            return client_latency
     print(f"  Video generated in {client_latency:.2f}s")
     return client_latency
 
@@ -447,7 +493,14 @@ def send_image_conditioned_request_sglang(
         "n": "1",
         "response_format": "b64_json",
     }
-    for key in ("num_inference_steps", "guidance_scale", "seed", "num_frames"):
+    for key in (
+        "num_inference_steps",
+        "guidance_scale",
+        "seed",
+        "num_frames",
+        "fps",
+        "negative_prompt",
+    ):
         if key in case:
             data[key] = str(case[key])
     if perf_dump_path:
@@ -493,14 +546,16 @@ def send_image_conditioned_request_sglang(
 
     client_latency = time.time() - start
 
+    # Report client-side e2e latency to match vllm-omni / lightx2v (fair
+    # cross-framework comparison); server-side perf_dump is diagnostic only.
     if perf_dump_path:
         server_latency = _read_perf_dump(perf_dump_path)
         if server_latency is not None:
             print(
-                f"  Generated in {server_latency:.2f}s (server-side), "
-                f"client={client_latency:.2f}s"
+                f"  Generated in {client_latency:.2f}s (client e2e; "
+                f"server-side {server_latency:.2f}s, diagnostic)"
             )
-            return server_latency
+            return client_latency
     print(f"  Generated in {client_latency:.2f}s (sglang, image-conditioned)")
     return client_latency
 
@@ -521,6 +576,10 @@ def send_request_vllm_omni(base_url: str, case: dict, config: dict) -> float:
     }
     if "num_frames" in case:
         extra_body["num_frames"] = case["num_frames"]
+    if "fps" in case:
+        extra_body["fps"] = case["fps"]
+    if "negative_prompt" in case:
+        extra_body["negative_prompt"] = case["negative_prompt"]
 
     # Build message content (text or text+image)
     content: list[dict] | str = case["prompt"]
@@ -583,6 +642,10 @@ def send_request_lightx2v(base_url: str, case: dict, config: dict) -> float:
         payload["width"] = case["width"]
     if "guidance_scale" in case:
         payload["guidance_scale"] = case["guidance_scale"]
+    if "fps" in case:
+        payload["fps"] = case["fps"]
+    if "negative_prompt" in case:
+        payload["negative_prompt"] = case["negative_prompt"]
     # Image-conditioned: LightX2V accepts image_path (URL or local path)
     if case.get("reference_image"):
         payload["image_path"] = config.get("test_image_url", "")
@@ -689,9 +752,20 @@ def run_single(
     log_file = log_dir / f"{case['id']}_{framework}.log"
     log_fh = open(log_file, "w", encoding="utf-8", buffering=1)
     log_thread = None
+    server_error = {}
 
     proc = None
     try:
+        if framework == "sglang":
+            _cleanup_sglang_processes()
+            _require_ports_available(
+                [
+                    port,
+                    port + SGLANG_MASTER_PORT_OFFSET,
+                    port + SGLANG_SCHEDULER_PORT_OFFSET,
+                ]
+            )
+
         proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
@@ -709,6 +783,14 @@ def run_single(
                     sys.stdout.write(f"  [server] {line}")
                     sys.stdout.flush()
                     fh.write(line)
+                    if not server_error and any(
+                        pattern in line for pattern in SERVER_FATAL_ERROR_PATTERNS
+                    ):
+                        server_error["message"] = line.strip()
+                        try:
+                            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                        except (ProcessLookupError, PermissionError):
+                            pass
             except ValueError:
                 pass  # pipe closed
 
@@ -719,18 +801,17 @@ def run_single(
         base_url = f"http://{DEFAULT_HOST}:{port}"
         wait_for_health(base_url, framework)
 
-        # Warmup requests (not measured, no perf dump)
-        # Use few steps to be fast — server's own warmup (warmup_steps=3) handles
-        # torch.compile compilation; these external warmups just stabilize triton
-        # kernel specializations across requests.
-        WARMUP_STEPS = 3
-        warmup_case = {**case, "num_inference_steps": WARMUP_STEPS}
-        for wi in range(1, 3):
-            print(f"  Sending warmup request ({wi}/2, {WARMUP_STEPS} steps)...")
-            try:
-                send_request(base_url, warmup_case, framework, config)
-            except Exception as e:
-                print(f"  Warmup request {wi} failed (non-fatal): {e}")
+        # No client-side warmup: each framework relies on its own server-side
+        # warmup before traffic. sglang's serve_args pass --warmup, which `serve`
+        # resolves to server-based (synthetic) warmup that primes kernels at
+        # startup, before the health check passes. This goes through the internal
+        # warmup path that bypasses sampling-param preset validation (e.g.
+        # Ideogram-4's preset-locked num_inference_steps), so no per-case warmup
+        # special-casing is needed here.
+        # NOTE: vllm-omni / lightx2v configure no server-side warmup; if
+        # cross-framework comparison is restored, they must add their own warmup
+        # to stay on equal footing — otherwise their measured request pays the
+        # full cold-start.
 
         # Measured request — pass perf_dump_path for SGLang server-side timing
         if perf_dump_path and os.path.exists(perf_dump_path):
@@ -742,8 +823,8 @@ def run_single(
         result["latency_s"] = round(latency, 3)
 
     except Exception as e:
-        result["error"] = str(e)
-        print(f"  ERROR: {e}")
+        result["error"] = server_error.get("message", str(e))
+        print(f"  ERROR: {result['error']}")
     finally:
         if proc:
             kill_server(proc)
@@ -894,7 +975,7 @@ def run_comparison(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Cross-framework diffusion serving comparison benchmark"
+        description="SGLang-Diffusion serving benchmark (nightly CI)"
     )
     parser.add_argument(
         "--config",
@@ -937,7 +1018,7 @@ def main():
 
     print(f"Loaded {len(config['cases'])} comparison case(s) from {args.config}")
 
-    run_comparison(
+    output_data = run_comparison(
         config=config,
         case_ids=args.case_ids,
         frameworks=args.frameworks,
@@ -945,6 +1026,14 @@ def main():
         output=args.output,
         dry_run=args.dry_run,
     )
+
+    # Exit with non-zero if any case had an error
+    errors = [r for r in output_data.get("results", []) if r.get("error")]
+    if errors and not args.dry_run:
+        print(f"\n{len(errors)} case(s) had errors:")
+        for e in errors:
+            print(f"  {e['case_id']} ({e['framework']}): {e['error']}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

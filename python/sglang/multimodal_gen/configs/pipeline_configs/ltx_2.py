@@ -16,11 +16,18 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ModelTaskType,
     PipelineConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
+    ModelDeploymentConfig,
+)
 from sglang.multimodal_gen.runtime.distributed import (
     get_sp_parallel_rank,
     get_sp_world_size,
-    sequence_model_parallel_all_gather,
 )
+
+# Distilled 3-step stage-2 sigma schedule. Single source of truth shared by
+# LTX2TwoStagePipeline and the SANA-WM refiner stages (matches NVlabs
+# `inference_sana_wm.py` / the LTX-2 distilled refiner).
+STAGE_2_DISTILLED_SIGMA_VALUES: tuple[float, ...] = (0.909375, 0.725, 0.421875, 0.0)
 
 
 def pack_text_embeds(
@@ -93,20 +100,68 @@ def pack_text_embeds(
     return normalized_hidden_states
 
 
+def pack_text_embeds_v2(
+    text_hidden_states: torch.Tensor,
+    attention_mask: torch.Tensor,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """
+    LTX-2.3 feature extractor pre-processing.
+
+    Upstream `FeatureExtractorV2` applies per-token RMS normalization on each
+    Gemma layer and then flattens `[hidden_dim, num_layers]` into the channel
+    dimension, zeroing out padded positions afterwards.
+    """
+
+    variance = torch.mean(text_hidden_states**2, dim=2, keepdim=True)
+    normalized_hidden_states = text_hidden_states * torch.rsqrt(variance + eps)
+    normalized_hidden_states = normalized_hidden_states.flatten(2)
+    mask = attention_mask.bool().unsqueeze(-1)
+    return torch.where(
+        mask, normalized_hidden_states, torch.zeros_like(normalized_hidden_states)
+    )
+
+
+def is_ltx23_native_variant(arch_config: object) -> bool:
+    return str(getattr(arch_config, "ltx_variant", "ltx_2")) == "ltx_2_3"
+
+
+def sync_ltx23_runtime_vae_markers(
+    arch_config: object,
+    loaded_vae_config: object | None,
+) -> None:
+    if loaded_vae_config is None:
+        return
+    source = getattr(loaded_vae_config, "arch_config", loaded_vae_config)
+    for key in (
+        "ltx_variant",
+        "condition_encoder_subdir",
+        "video_encoder_variant",
+        "video_encoder_config",
+        "video_decoder_variant",
+        "video_decoder_config",
+    ):
+        value = getattr(source, key, None)
+        if value is not None:
+            setattr(arch_config, key, value)
+
+
 def _gemma_postprocess_func(
     outputs: BaseEncoderOutput,
     text_inputs: dict,
     pipeline_config: Optional["LTX2PipelineConfig"] = None,
 ) -> torch.Tensor:
-    _ = pipeline_config
     # LTX-2 requires all hidden states concatenated for the connector
     if hasattr(outputs, "hidden_states") and outputs.hidden_states is not None:
-        # outputs.hidden_states is a tuple of tensors
-        # We need to stack them along the last dimension and pack them
         hidden_states = torch.stack(outputs.hidden_states, dim=-1)
         attention_mask = text_inputs["attention_mask"]
+        if (
+            pipeline_config is not None
+            and pipeline_config.dit_config.arch_config.caption_proj_before_connector
+        ):
+            return pack_text_embeds_v2(hidden_states, attention_mask)
+
         sequence_lengths = attention_mask.sum(dim=-1)
-        # Assuming left padding for Gemma as per Diffusers
         return pack_text_embeds(hidden_states, sequence_lengths, padding_side="left")
     else:
         raise AttributeError(
@@ -131,8 +186,9 @@ class LTX2PipelineConfig(PipelineConfig):
 
     # Audio VAE configuration
     vae_config: LTXVideoVAEConfig = field(default_factory=LTXVideoVAEConfig)
+    vae_precision: str = "bf16"
     audio_vae_config: LTXAudioVAEConfig = field(default_factory=LTXAudioVAEConfig)
-    audio_vae_precision: str = "fp32"
+    audio_vae_precision: str = "bf16"
 
     @property
     def vae_scale_factor(self):
@@ -141,6 +197,13 @@ class LTX2PipelineConfig(PipelineConfig):
     @property
     def vae_temporal_compression(self):
         return self.vae_config.arch_config.temporal_compression_ratio
+
+    def get_model_deployment_config(self) -> ModelDeploymentConfig:
+        return ModelDeploymentConfig(
+            keep_resident_min_available_gb=70,
+            keep_resident_components=("dit",),
+            auto_cfg_parallel_degree_by_num_gpus=((4, 1), (8, 1)),
+        )
 
     def prepare_latent_shape(self, batch, batch_size, num_frames):
         """Return unpacked latent shape [B, C, F, H, W]."""
@@ -199,6 +262,9 @@ class LTX2PipelineConfig(PipelineConfig):
     def tokenize_prompt(self, prompt: list[str], tokenizer, tok_kwargs) -> dict:
         # Adapted from diffusers_pipeline.py _get_gemma_prompt_embeds
         # But we only need tokenization here, the embedding happens in TextEncodingStage
+        # Official LTX Gemma tokenizer trims surrounding whitespace before
+        # tokenization.
+        prompt = [text.strip() for text in prompt]
 
         # Gemma expects left padding for chat-style prompts
         tokenizer.padding_side = "left"
@@ -317,6 +383,7 @@ class LTX2PipelineConfig(PipelineConfig):
         latent_frames, tokens_per_frame = (
             self._infer_video_latent_frames_and_tokens_per_frame(batch, seq_len)
         )
+        orig_latent_frames = int(latent_frames)
 
         # Pad whole frames so `latent_frames` is divisible by `sp_world_size`.
         pad_frames = (sp_world_size - (latent_frames % sp_world_size)) % sp_world_size
@@ -332,6 +399,9 @@ class LTX2PipelineConfig(PipelineConfig):
 
         local_frames = int(latent_frames) // int(sp_world_size)
         start_frame = int(sp_rank) * int(local_frames)
+        valid_local_frames = max(
+            min(int(orig_latent_frames) - int(start_frame), int(local_frames)), 0
+        )
         start = int(start_frame) * int(tokens_per_frame)
         end = int(start) + int(local_frames) * int(tokens_per_frame)
         latents = latents[:, start:end, :]
@@ -340,6 +410,9 @@ class LTX2PipelineConfig(PipelineConfig):
         batch.sp_video_latent_num_frames = int(local_frames)
         batch.sp_video_start_frame = int(start_frame)
         batch.sp_video_tokens_per_frame = int(tokens_per_frame)
+        batch.sp_video_valid_token_count = int(valid_local_frames) * int(
+            tokens_per_frame
+        )
 
         return latents, True
 
@@ -348,8 +421,109 @@ class LTX2PipelineConfig(PipelineConfig):
         if get_sp_world_size() <= 1:
             return latents
         if isinstance(latents, torch.Tensor) and latents.ndim == 3:
-            return sequence_model_parallel_all_gather(latents.contiguous(), dim=1)
+            return self._gather_sp_tensor(latents, dim=1)
         return super().gather_latents_for_sp(latents, batch=batch)
+
+    def shard_audio_latents_for_sp(self, batch, audio_latents):
+        sp_world_size = get_sp_world_size()
+        if sp_world_size <= 1:
+            return audio_latents, False
+        if not (isinstance(audio_latents, torch.Tensor) and audio_latents.ndim == 3):
+            return audio_latents, False
+
+        sp_rank = get_sp_parallel_rank()
+        seq_len = int(audio_latents.shape[1])
+        batch.sp_audio_orig_num_frames = int(seq_len)
+
+        pad_frames = (sp_world_size - (seq_len % sp_world_size)) % sp_world_size
+        if pad_frames:
+            pad = torch.zeros(
+                (audio_latents.shape[0], pad_frames, audio_latents.shape[2]),
+                device=audio_latents.device,
+                dtype=audio_latents.dtype,
+            )
+            audio_latents = torch.cat([audio_latents, pad], dim=1)
+            seq_len += int(pad_frames)
+
+        local_frames = seq_len // sp_world_size
+        start_frame = sp_rank * local_frames
+        end_frame = start_frame + local_frames
+        valid_local_frames = max(
+            min(
+                int(batch.sp_audio_orig_num_frames) - int(start_frame),
+                int(local_frames),
+            ),
+            0,
+        )
+        audio_latents = audio_latents[:, start_frame:end_frame, :]
+
+        batch.sp_audio_latent_num_frames = int(local_frames)
+        batch.sp_audio_start_frame = int(start_frame)
+        batch.sp_audio_valid_token_count = int(valid_local_frames)
+        return audio_latents, True
+
+    def can_shard_audio_latents_for_sp(self, audio_latents) -> bool:
+        return (
+            get_sp_world_size() > 1
+            and isinstance(audio_latents, torch.Tensor)
+            and audio_latents.ndim == 3
+        )
+
+    def gather_audio_latents_for_sp(self, audio_latents, batch):
+        """Gather packed audio latents after SP and trim any pad-only tail tokens."""
+        if get_sp_world_size() <= 1:
+            return audio_latents
+        if not (isinstance(audio_latents, torch.Tensor) and audio_latents.ndim == 3):
+            return audio_latents
+
+        audio_latents = self._gather_sp_tensor(
+            audio_latents,
+            dim=1,
+        )
+        return self._trim_sp_gather_padding(
+            audio_latents,
+            orig_len=getattr(batch, "sp_audio_orig_num_frames", None),
+            dim=1,
+        )
+
+    def prepare_video_rope_coords_for_sp(
+        self,
+        model,
+        batch,
+        latent_model_input,
+        *,
+        num_frames,
+        height,
+        width,
+    ):
+        if not batch.did_sp_shard_latents:
+            return None
+        return model.rope.prepare_video_coords(
+            batch_size=int(latent_model_input.shape[0]),
+            num_frames=num_frames,
+            height=height,
+            width=width,
+            device=latent_model_input.device,
+            fps=batch.fps,
+            start_frame=int(batch.sp_video_start_frame),
+        )
+
+    def prepare_audio_rope_coords_for_sp(
+        self,
+        model,
+        batch,
+        audio_latent_model_input,
+        *,
+        num_frames,
+    ):
+        if not batch.did_sp_shard_audio_latents:
+            return None
+        return model.audio_rope.prepare_audio_coords(
+            batch_size=int(audio_latent_model_input.shape[0]),
+            num_frames=num_frames,
+            device=audio_latent_model_input.device,
+            start_frame=int(batch.sp_audio_start_frame),
+        )
 
     def maybe_pack_audio_latents(self, latents, batch_size, batch):
         # If already packed (3D shape [B, T, C*F]), skip packing
@@ -537,6 +711,11 @@ class LTX2PipelineConfig(PipelineConfig):
         )
 
         return latents, audio_latents
+
+
+@dataclasses.dataclass
+class LTX23PipelineConfig(LTX2PipelineConfig):
+    """Configuration overrides for LTX-2.3."""
 
 
 @dataclasses.dataclass

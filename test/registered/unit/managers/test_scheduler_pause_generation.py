@@ -9,8 +9,10 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.managers.io_struct import PauseGenerationReqInput
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.pool_stats_observer import PoolStats
 
-register_cpu_ci(est_time=2, suite="stage-a-test-cpu")
+register_cpu_ci(est_time=15, suite="base-a-test-cpu")
+register_cpu_ci(est_time=9, suite="base-c-test-cpu")
 
 
 class TestSchedulerPauseGeneration(unittest.TestCase):
@@ -33,7 +35,18 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
         scheduler.token_to_kv_pool_allocator = MagicMock()
         scheduler.token_to_kv_pool_allocator.available_size.return_value = 1000
         scheduler.max_total_num_tokens = 1000
-        scheduler._get_token_info = MagicMock(return_value=(0, 0, 1000, 0))
+        scheduler._get_token_info = MagicMock(
+            return_value=PoolStats(
+                full_num_used=0,
+                full_token_usage=0,
+                full_available_size=1000,
+                full_evictable_size=0,
+            )
+        )
+        # pause_generation zeros gen_throughput and flushes KV events.
+        scheduler.metrics_reporter = MagicMock()
+        scheduler.metrics_reporter.current_scheduler_metrics_enabled = False
+        scheduler.kv_events_publisher = MagicMock()
         return scheduler
 
     def test_inplace_only_sets_flag(self):

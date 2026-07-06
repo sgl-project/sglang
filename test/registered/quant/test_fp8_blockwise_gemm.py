@@ -12,7 +12,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=420, suite="stage-c-test-4-gpu-b200")
+register_cuda_ci(est_time=430, stage="extra-b", runner_config="4-gpu-b200")
 
 MODEL_PATH = "Qwen/Qwen3-4B-Instruct-2507-FP8"
 MXFP8_MODEL_PATH = "zianglih/Qwen3-4B-Instruct-2507-MXFP8"
@@ -74,6 +74,9 @@ class MXFP8GemmBase:
             "--trust-remote-code",
             "--fp8-gemm-backend",
             cls.backend,
+            # TODO: pin tc_piecewise — default `breakable` prefill runs MXFP8 RMSNorm in bf16, hurting accuracy; unrelated to BCG-default change.
+            "--cuda-graph-backend-prefill",
+            "tc_piecewise",
         ]
         cls.process = popen_launch_server(
             cls.model,

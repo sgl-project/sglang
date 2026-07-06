@@ -140,7 +140,7 @@ class StagingBuffer:
             alloc_method = "custom_mem_pool (cuMemCreate)"
         else:
             self.buffer = torch.empty(size_bytes, dtype=torch.uint8, device=device)
-            alloc_method = "cudaMalloc (NVLink incompatible!)"
+            alloc_method = "cudaMalloc"
         self.data_ptr = self.buffer.data_ptr()
 
         logger.info(

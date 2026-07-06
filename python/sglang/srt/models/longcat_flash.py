@@ -39,7 +39,6 @@ from torch import nn
 
 from sglang.srt.configs import LongcatFlashConfig
 from sglang.srt.distributed import (
-    get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -48,8 +47,6 @@ from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.dp_attention import (
-    get_attention_tp_rank,
-    get_attention_tp_size,
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layernorm import RMSNorm
@@ -89,7 +86,7 @@ from sglang.srt.model_loader.utils import (
 )
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_flags, get_parallel
 from sglang.srt.utils import (
     BumpAllocator,
     add_prefix,
@@ -117,7 +114,7 @@ if _is_cuda:
 elif _is_cpu and _is_cpu_amx_available:
     pass
 elif _is_hip:
-    from sglang.srt.layers.quantization.awq_triton import (
+    from sglang.srt.layers.quantization.awq.awq_triton import (
         awq_dequantize_triton as awq_dequantize,
     )
 else:
@@ -221,7 +218,7 @@ class LongcatFlashMoE(nn.Module):
         else:
             self.rounter_params_dtype = torch.bfloat16
 
-        self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_size = get_parallel().tp_size
 
         if self.tp_size > config.n_routed_experts:
             raise ValueError(
@@ -329,8 +326,8 @@ class LongcatFlashDecoderLayer(nn.Module):
                     v_head_dim=config.v_head_dim,
                     q_lora_rank=config.q_lora_rank,
                     kv_lora_rank=config.kv_lora_rank,
-                    rope_theta=config.rope_theta,
-                    rope_scaling=getattr(config, "rope_scaling", None),
+                    rope_theta=config.rope_parameters["rope_theta"],
+                    rope_scaling=None,
                     max_position_embeddings=config.max_position_embeddings,
                     quant_config=(
                         None
@@ -377,8 +374,8 @@ class LongcatFlashDecoderLayer(nn.Module):
             prefix=add_prefix("mlp", prefix),
         )
 
-        self.attn_tp_size = get_attention_tp_size()
-        self.attn_tp_rank = get_attention_tp_rank()
+        self.attn_tp_size = get_parallel().attn_tp_size
+        self.attn_tp_rank = get_parallel().attn_tp_rank
 
         self.mlp_layer_scatter_modes = [
             LayerScatterModes.init_new(
@@ -620,7 +617,7 @@ class LongcatFlashForCausalLM(nn.Module):
             ]
 
         self.config = config
-        self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
         self.model = LongcatFlashModel(
             config, quant_config, prefix=add_prefix("model", prefix)
@@ -631,7 +628,7 @@ class LongcatFlashForCausalLM(nn.Module):
             config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("lm_head", prefix),
-            use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+            use_attn_tp_group=get_flags().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
         self.capture_aux_hidden_states = False
@@ -902,19 +899,6 @@ class LongcatFlashForCausalLM(nn.Module):
                 if self.use_ngram_embedding:
                     if ".embed_tokens." in name:
                         name = "model.embed_tokens.word_embeder.weight"
-                    # if "oe_embed_tokens" in name or "oe_embed_proj" in name:
-                    #     import re
-                    #     m = re.match(
-                    #         r"model\.(oe_embed_tokens|oe_embed_proj)(\d+)\.weight",
-                    #         name,
-                    #     )
-                    #     if m:
-                    #         kind = m.group(1)
-                    #         idx = m.group(2)
-                    #         if kind == "oe_embed_tokens":
-                    #             name = f"model.ngram_embeddings.embedders.{idx}.weight"
-                    #         else:
-                    #             name = f"model.ngram_embeddings.post_projs.{idx}.weight"
                     if ".ngram_embeddings" in name:
                         self.model.embed_tokens.load_weight(None, name, loaded_weight)
                         continue

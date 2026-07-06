@@ -31,11 +31,11 @@ def parse_version_tuple(tag: str) -> tuple:
     - Pre-release suffix gets a lower sort key than bare version:
       v0.5.10rc0  -> (0, 5, 10, 0, 0)   # pre-release
       v0.5.10     -> (0, 5, 10, 1, 0)   # stable (sorts higher)
-      v0.5.10post1 -> (0, 5, 10, 2, 1)  # post-release (sorts highest)
+      v0.5.10.post1 -> (0, 5, 10, 2, 1)  # post-release (sorts highest)
     """
     v = tag.lstrip("v")
     # Split base version from suffix
-    m = re.match(r"^(\d+)\.(\d+)\.(\d+)(?:(rc|post)(\d+))?$", v)
+    m = re.match(r"^(\d+)\.(\d+)\.(\d+)(?:\.?(rc|post)(\d+))?$", v)
     if not m:
         return (0, 0, 0, 0, 0)
     major, minor, patch = int(m.group(1)), int(m.group(2)), int(m.group(3))

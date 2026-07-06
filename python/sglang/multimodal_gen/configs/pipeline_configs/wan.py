@@ -18,6 +18,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ModelTaskType,
     PipelineConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
+    ModelDeploymentConfig,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -85,11 +88,14 @@ class WanT2V480PConfig(PipelineConfig):
     vae_precision: str = "fp32"
     text_encoder_precisions: tuple[str, ...] = field(default_factory=lambda: ("fp32",))
 
-    # WanConfig-specific added parameters
-
     def __post_init__(self):
         self.vae_config.load_encoder = False
         self.vae_config.load_decoder = True
+
+    def get_model_deployment_config(self) -> ModelDeploymentConfig:
+        return ModelDeploymentConfig(
+            auto_dit_layerwise_offload=True,
+        )
 
 
 @dataclass
@@ -100,6 +106,22 @@ class TurboWanT2V480PConfig(WanT2V480PConfig):
     dmd_denoising_steps: list[int] | None = field(
         default_factory=lambda: [988, 932, 852, 608]
     )
+
+
+@dataclass
+class TurboWanT2V1_3B480PConfig(TurboWanT2V480PConfig):
+    """Configuration for TurboWan T2V 1.3B DMD pipeline."""
+
+    def get_model_deployment_config(self) -> ModelDeploymentConfig:
+        return ModelDeploymentConfig(
+            auto_dit_layerwise_offload=True,
+            keep_resident_min_available_gb=60,
+            keep_resident_components=(
+                "text_encoder",
+                "image_encoder",
+                "vae",
+            ),
+        )
 
 
 @dataclass
@@ -136,6 +158,11 @@ class WanI2V480PConfig(WanT2V480PConfig, WanI2VCommonConfig):
         self.vae_config.load_encoder = True
         self.vae_config.load_decoder = True
 
+    def get_model_deployment_config(self) -> ModelDeploymentConfig:
+        return ModelDeploymentConfig(
+            auto_dit_layerwise_offload=True,
+        )
+
 
 @dataclass
 class WanI2V720PConfig(WanI2V480PConfig):
@@ -171,6 +198,17 @@ class FastWan2_1_T2V_480P_Config(WanT2V480PConfig):
     dmd_denoising_steps: list[int] | None = field(
         default_factory=lambda: [1000, 757, 522]
     )
+
+    def get_model_deployment_config(self) -> ModelDeploymentConfig:
+        return ModelDeploymentConfig(
+            auto_dit_layerwise_offload=True,
+            keep_resident_min_available_gb=60,
+            keep_resident_components=(
+                "text_encoder",
+                "image_encoder",
+                "vae",
+            ),
+        )
 
 
 @dataclass
@@ -211,6 +249,7 @@ class Wan2_2_T2V_A14B_Config(WanT2V480PConfig):
 
     def __post_init__(self) -> None:
         self.dit_config.boundary_ratio = self.boundary_ratio
+        self.dit_config.torch_compile_mode = "default"
 
 
 @dataclass

@@ -26,10 +26,8 @@ from transformers import PretrainedConfig
 from sglang.srt.batch_overlap.single_batch_overlap import SboFlags
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.distributed import (
-    get_moe_expert_parallel_world_size,
     get_pp_group,
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
+    get_pp_indices,
     parallel_state,
     tensor_model_parallel_all_reduce,
 )
@@ -47,8 +45,6 @@ from sglang.srt.layers.communicator import (
     enable_moe_dense_fully_dp,
 )
 from sglang.srt.layers.dp_attention import (
-    get_attention_tp_rank,
-    get_attention_tp_size,
     is_allocation_symmetric,
     is_dp_attention_enabled,
 )
@@ -61,6 +57,7 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
+    should_skip_post_experts_all_reduce,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
@@ -80,11 +77,12 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
 from sglang.srt.models.utils import apply_qk_norm
+from sglang.srt.runtime_context import get_flags, get_parallel
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     add_prefix,
@@ -186,6 +184,7 @@ class Glm4MoeAttention(nn.Module):
         num_heads: int,
         num_kv_heads: int,
         layer_id: int = 0,
+        start_layer: int = 0,
         rope_theta: float = 1000000,
         partial_rotary_factor: float = 0.5,
         rope_scaling: Optional[Dict[str, Any]] = None,
@@ -200,9 +199,10 @@ class Glm4MoeAttention(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
+        self.start_layer = start_layer
 
-        attn_tp_rank = get_attention_tp_rank()
-        attn_tp_size = get_attention_tp_size()
+        attn_tp_rank = get_parallel().attn_tp_rank
+        attn_tp_size = get_parallel().attn_tp_size
 
         self.total_num_heads = num_heads
         assert self.total_num_heads % attn_tp_size == 0
@@ -224,7 +224,7 @@ class Glm4MoeAttention(nn.Module):
         self.rope_theta = rope_theta
         self.use_qk_norm = use_qk_norm
         self.max_position_embeddings = max_position_embeddings
-        self.tp_rank = get_tensor_model_parallel_rank()
+        self.tp_rank = get_parallel().tp_rank
 
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
@@ -289,7 +289,9 @@ class Glm4MoeAttention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
-        if hidden_states.shape[0] == 0:
+        # hidden_states can be a (fp8_tensor, scale) tuple from fused RMSNorm+Quant
+        hs = hidden_states[0] if isinstance(hidden_states, tuple) else hidden_states
+        if hs.shape[0] == 0:
             return hidden_states, forward_batch, None
         qkv, _ = self.qkv_proj(hidden_states)
 
@@ -309,8 +311,20 @@ class Glm4MoeAttention(nn.Module):
                 )
             q, k = self.rotary_emb(positions, q, k)
         else:
-            if self.attn.layer_id == forward_batch.token_to_kv_pool.start_layer:
+            if self.attn.layer_id == self.start_layer:
                 self.rotary_emb.get_cos_sin_with_position(positions)
+            if self.use_qk_norm:
+                eps = self.q_norm.variance_epsilon
+                q_weight = self.q_norm.weight
+                k_weight = self.k_norm.weight
+                q_bias = getattr(self.q_norm, "bias", None)
+                k_bias = getattr(self.k_norm, "bias", None)
+            else:
+                eps = None
+                q_weight = None
+                k_weight = None
+                q_bias = None
+                k_bias = None
             q, k, v = split_qkv_rmsnorm_rope(
                 qkv,
                 self.rotary_emb.position_sin,
@@ -318,11 +332,11 @@ class Glm4MoeAttention(nn.Module):
                 self.q_size,
                 self.kv_size,
                 self.head_dim,
-                eps=self.q_norm.variance_epsilon,
-                q_weight=self.q_norm.weight,
-                k_weight=self.k_norm.weight,
-                q_bias=getattr(self.q_norm, "bias", None),
-                k_bias=getattr(self.k_norm, "bias", None),
+                eps=eps,
+                q_weight=q_weight,
+                k_weight=k_weight,
+                q_bias=q_bias,
+                k_bias=k_bias,
             )
 
         inner_state = q, k, v, forward_batch
@@ -385,14 +399,12 @@ class Glm4MoeSparseMoeBlock(nn.Module):
     ):
         nn.Module.__init__(self)
         self.top_k = config.num_experts_per_tok
-        self.tp_size = get_tensor_model_parallel_world_size()
-        self.moe_ep_size = get_moe_expert_parallel_world_size()
+        self.tp_size = get_parallel().tp_size
+        self.moe_ep_size = get_parallel().moe_ep_size
         self.routed_scaling_factor = config.routed_scaling_factor
         self.n_shared_experts = config.n_shared_experts
         self.num_fused_shared_experts = (
-            0
-            if get_global_server_args().disable_shared_experts_fusion
-            else config.n_shared_experts
+            0 if get_flags().disable_shared_experts_fusion else config.n_shared_experts
         )
 
         self.config = config
@@ -509,7 +521,7 @@ class Glm4MoeSparseMoeBlock(nn.Module):
             or get_moe_a2a_backend().is_ascend_fuseep()
         ):
             # TODO: we will support tp < ep in the future
-            self.ep_size = get_moe_expert_parallel_world_size()
+            self.ep_size = get_parallel().moe_ep_size
             self.num_experts = (
                 config.n_routed_experts
                 + get_global_server_args().ep_num_redundant_experts
@@ -591,11 +603,10 @@ class Glm4MoeSparseMoeBlock(nn.Module):
 
         current_stream.wait_stream(self.alt_stream)
         final_hidden_states += shared_output
-        if (
-            self.tp_size > 1
-            and not should_allreduce_fusion
-            and not use_reduce_scatter
-            and not should_use_flashinfer_cutlass_moe_fp4_allgather()
+        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
+            is_tp_path=True,
+            use_reduce_scatter=use_reduce_scatter,
+            should_allreduce_fusion=should_allreduce_fusion,
         ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states
@@ -625,11 +636,10 @@ class Glm4MoeSparseMoeBlock(nn.Module):
                 final_hidden_states_out = torch.empty_like(final_hidden_states)
             torch.add(final_hidden_states, shared_output, out=final_hidden_states_out)
             final_hidden_states = final_hidden_states_out
-        if (
-            self.tp_size > 1
-            and not should_allreduce_fusion
-            and not use_reduce_scatter
-            and not should_use_flashinfer_cutlass_moe_fp4_allgather()
+        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
+            is_tp_path=True,
+            use_reduce_scatter=use_reduce_scatter,
+            should_allreduce_fusion=should_allreduce_fusion,
         ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states
@@ -775,6 +785,7 @@ class Glm4MoeDecoderLayer(nn.Module):
         self,
         config: PretrainedConfig,
         layer_id: int,
+        start_layer: int = 0,
         quant_config: Optional[QuantizationConfig] = None,
         is_nextn: bool = False,
         prefix: str = "",
@@ -802,6 +813,7 @@ class Glm4MoeDecoderLayer(nn.Module):
             num_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
             layer_id=layer_id,
+            start_layer=start_layer,
             rope_theta=rope_theta,
             rope_scaling=rope_scaling,
             partial_rotary_factor=partial_rotary_factor,
@@ -865,6 +877,51 @@ class Glm4MoeDecoderLayer(nn.Module):
             ),
         )
 
+        # Detect if QKV uses aiter FP8 per-token quant so we can fuse
+        # RMSNorm + FP8 quant into a single kernel in prepare_attn
+        self.attn_quant_format = ""
+        self._detect_attn_quant_format()
+
+    def _detect_fp8_per_token_quant(self, linear_layer, label: str) -> str:
+        """Check if a linear layer uses aiter FP8 per-token quantization."""
+        from sglang.srt.utils import get_bool_env_var, is_hip
+
+        if not (get_bool_env_var("SGLANG_USE_AITER") and is_hip()):
+            return ""
+        if not hasattr(linear_layer, "quant_method"):
+            return ""
+        scheme = getattr(linear_layer, "scheme", None) or getattr(
+            linear_layer.quant_method, "scheme", None
+        )
+        if scheme is not None:
+            from compressed_tensors.quantization import QuantizationStrategy
+
+            from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a8_fp8 import (
+                CompressedTensorsW8A8Fp8,
+            )
+
+            if (
+                isinstance(scheme, CompressedTensorsW8A8Fp8)
+                and scheme.strategy == QuantizationStrategy.CHANNEL
+            ):
+                logger.info(
+                    "layer_%d Fused RMSNorm+Quant %s: ENABLED (fp8_per_token)",
+                    self.layer_id,
+                    label,
+                )
+                return "fp8_per_token"
+        logger.info(
+            "layer_%d Fused RMSNorm+Quant %s: skipped",
+            self.layer_id,
+            label,
+        )
+        return ""
+
+    def _detect_attn_quant_format(self):
+        self.attn_quant_format = self._detect_fp8_per_token_quant(
+            self.self_attn.qkv_proj, "attn"
+        )
+
     def _is_layer_sparse(self, layer_id: int, is_nextn: bool) -> bool:
         return is_nextn or (
             self.config.n_routed_experts is not None
@@ -880,7 +937,10 @@ class Glm4MoeDecoderLayer(nn.Module):
     ) -> torch.Tensor:
 
         hidden_states, residual = self.layer_communicator.prepare_attn(
-            hidden_states, residual, forward_batch
+            hidden_states,
+            residual,
+            forward_batch,
+            quant_format=self.attn_quant_format,
         )
 
         hidden_states = self.self_attn(
@@ -927,7 +987,12 @@ class Glm4MoeDecoderLayer(nn.Module):
         tbo_subbatch_index: Optional[int] = None,
     ):
         state.hidden_states_after_comm_pre_attn, state.residual_after_input_ln = (
-            self.layer_communicator.prepare_attn(hidden_states, residual, forward_batch)
+            self.layer_communicator.prepare_attn(
+                hidden_states,
+                residual,
+                forward_batch,
+                quant_format=self.attn_quant_format,
+            )
         )
         state.update(
             dict(
@@ -945,19 +1010,6 @@ class Glm4MoeDecoderLayer(nn.Module):
                 state.forward_batch,
             )
         )
-
-    def op_mlp(self, state):
-        hidden_states = state.pop("hidden_states_mlp_input")
-        if not (
-            enable_moe_dense_fully_dp()
-            and (not self.is_layer_sparse)
-            and hidden_states.shape[0] == 0
-        ):
-            state.hidden_states_mlp_output = self.mlp(
-                hidden_states, state.forward_batch
-            )
-        else:
-            state.hidden_states_mlp_output = hidden_states
 
     def op_comm_postprocess_layer(self, state):
         hidden_states, residual = self.layer_communicator.postprocess_layer(
@@ -1007,10 +1059,16 @@ class Glm4MoeModel(nn.Module):
             self.embed_tokens = PPMissingLayer()
 
         self.alt_stream = torch.cuda.Stream() if _is_cuda else None
+        pp_start_layer, _ = get_pp_indices(
+            config.num_hidden_layers,
+            self.pp_group.rank_in_group,
+            self.pp_group.world_size,
+        )
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
             lambda idx, prefix: Glm4MoeDecoderLayer(
                 layer_id=idx,
+                start_layer=pp_start_layer,
                 config=config,
                 quant_config=quant_config,
                 prefix=prefix,
@@ -1114,7 +1172,7 @@ class Glm4MoeForCausalLM(nn.Module):
         nn.Module.__init__(self)
         self.pp_group = get_pp_group()
         self.config = config
-        self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
         self.num_fused_shared_experts = 0
         self.determine_num_fused_shared_experts()
@@ -1126,7 +1184,7 @@ class Glm4MoeForCausalLM(nn.Module):
             config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("lm_head", prefix),
-            use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+            use_attn_tp_group=get_flags().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
 
@@ -1134,7 +1192,7 @@ class Glm4MoeForCausalLM(nn.Module):
         self.capture_aux_hidden_states = False
 
     def determine_num_fused_shared_experts(self):
-        if get_global_server_args().disable_shared_experts_fusion:
+        if get_flags().disable_shared_experts_fusion:
             return
 
         disable_reason = None
@@ -1145,7 +1203,7 @@ class Glm4MoeForCausalLM(nn.Module):
                 "Only GLM-4.5 on NV-platform with capability >= 80 "
                 "or AMD-platform with capability >= gfx942(MI30x) can use shared experts fusion optimization."
             )
-        elif get_moe_expert_parallel_world_size() > 1 and (
+        elif get_parallel().moe_ep_size > 1 and (
             not _is_hip or torch.cuda.get_device_capability("cuda") < (9, 4)
         ):
             disable_reason = "Only GLM-4.5 on AMD-platform with capability >= gfx942(MI30x) can use shared experts fusion optimization under expert parallelism."
@@ -1157,7 +1215,12 @@ class Glm4MoeForCausalLM(nn.Module):
             disable_reason = "GLM-4.5 W4AFP8 model uses different quant method for routed experts and shared experts."
 
         if disable_reason is not None:
-            get_global_server_args().disable_shared_experts_fusion = True
+            from sglang.srt.arg_groups.overrides import declare_load_time_override
+
+            declare_load_time_override(
+                "Glm4MoeForCausalLM.determine_num_fused_shared_experts",
+                {"disable_shared_experts_fusion": True},
+            )
             self.num_fused_shared_experts = 0
             log_info_on_rank0(
                 logger,

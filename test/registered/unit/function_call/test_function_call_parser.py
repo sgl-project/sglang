@@ -1,14 +1,27 @@
 import json
 import unittest
 
-from sglang.srt.entrypoints.openai.protocol import Function, Tool
+from sglang.srt.entrypoints.openai.protocol import (
+    Function,
+    Tool,
+    ToolChoice,
+    ToolChoiceFuncName,
+)
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import StreamingParseResult
 from sglang.srt.function_call.deepseekv3_detector import DeepSeekV3Detector
+from sglang.srt.function_call.deepseekv4_detector import DeepSeekV4Detector
 from sglang.srt.function_call.deepseekv32_detector import DeepSeekV32Detector
+from sglang.srt.function_call.gemma4_detector import (
+    Gemma4Detector,
+    _parse_gemma4_args,
+    _parse_gemma4_array,
+    _parse_gemma4_value,
+)
 from sglang.srt.function_call.gigachat3_detector import GigaChat3Detector
 from sglang.srt.function_call.glm4_moe_detector import Glm4MoeDetector
 from sglang.srt.function_call.glm47_moe_detector import Glm47MoeDetector
+from sglang.srt.function_call.gpt_oss_detector import GptOssDetector
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.function_call.kimik2_detector import KimiK2Detector
 from sglang.srt.function_call.lfm2_detector import Lfm2Detector
@@ -18,7 +31,8 @@ from sglang.srt.function_call.pythonic_detector import PythonicDetector
 from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(15, "stage-a-test-cpu")
+register_cpu_ci(est_time=15, suite="base-a-test-cpu")
+register_cpu_ci(est_time=61, suite="base-c-test-cpu")
 
 
 class TestPythonicDetector(unittest.TestCase):
@@ -1626,6 +1640,598 @@ class TestDeepSeekV32Detector(unittest.TestCase):
         params = json.loads(tool_calls_by_index[0]["parameters"])
         self.assertEqual(params, {})
 
+    def test_get_model_structural_tag(self):
+        import xgrammar as xgr
+
+        self.assertEqual(self.detector.get_structural_tag_name(), "deepseek_v3_2")
+
+        structural_tag = self.detector.get_structural_tag(
+            self.tools, thinking_mode=True
+        )
+        self.assertIsInstance(structural_tag, xgr.StructuralTag)
+        grammar = xgr.Grammar.from_structural_tag(structural_tag)
+        self.assertIsInstance(grammar, xgr.Grammar)
+        serialized = structural_tag.model_dump_json()
+        self.assertIn("</｜DSML｜invoke>\\n", serialized)
+        self.assertNotIn("</｜DSML｜invoke>\\n\\n", serialized)
+
+        structural_tag = self.detector.get_structural_tag(
+            self.tools, thinking_mode=False
+        )
+        self.assertIsInstance(structural_tag, xgr.StructuralTag)
+        grammar = xgr.Grammar.from_structural_tag(structural_tag)
+        self.assertIsInstance(grammar, xgr.Grammar)
+
+        structural_tag = self.detector.get_structural_tag(
+            self.tools, thinking_mode=True, tool_choice="required"
+        )
+        self.assertIsInstance(structural_tag, xgr.StructuralTag)
+        grammar = xgr.Grammar.from_structural_tag(structural_tag)
+        self.assertIsInstance(grammar, xgr.Grammar)
+
+        structural_tag = self.detector.get_structural_tag(
+            self.tools, thinking_mode=False, tool_choice="required"
+        )
+        self.assertIsInstance(structural_tag, xgr.StructuralTag)
+        grammar = xgr.Grammar.from_structural_tag(structural_tag)
+        self.assertIsInstance(grammar, xgr.Grammar)
+
+        tool_choice_name = ToolChoiceFuncName(name="search")
+        tool_choice = ToolChoice(function=tool_choice_name)
+        structural_tag = self.detector.get_structural_tag(
+            self.tools, thinking_mode=True, tool_choice=tool_choice
+        )
+        self.assertIsInstance(structural_tag, xgr.StructuralTag)
+        grammar = xgr.Grammar.from_structural_tag(structural_tag)
+        self.assertIsInstance(grammar, xgr.Grammar)
+
+        structural_tag = self.detector.get_structural_tag(
+            self.tools, thinking_mode=False, tool_choice=tool_choice
+        )
+        self.assertIsInstance(structural_tag, xgr.StructuralTag)
+        grammar = xgr.Grammar.from_structural_tag(structural_tag)
+        self.assertIsInstance(grammar, xgr.Grammar)
+
+    def test_self_closing_zero_arg_invoke(self):
+        """V32 inherits the same regex; verify self-closing parses to empty
+        params here too (V32 model rarely emits this shape, but the parser
+        must agree with V4 since V4 inherits from V32)."""
+        submit_tool = Tool(
+            type="function",
+            function=Function(
+                name="submit",
+                parameters={"type": "object", "properties": {}},
+            ),
+        )
+        text = (
+            '<｜DSML｜function_calls>\n<｜DSML｜invoke name="submit"/>\n'
+            "</｜DSML｜function_calls>"
+        )
+        result = self.detector.detect_and_parse(text, [submit_tool])
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "submit")
+        self.assertEqual(json.loads(result.calls[0].parameters), {})
+
+
+class TestDeepSeekV4Detector(unittest.TestCase):
+    def setUp(self):
+        """Set up test tools and detector for DeepSeekV4 format testing."""
+        self.tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="search",
+                    description="Searches for information related to query and displays topn results.",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "description": "The search query string",
+                            },
+                            "topn": {
+                                "type": "integer",
+                                "description": "Number of top results to display",
+                                "default": 10,
+                            },
+                            "source": {
+                                "type": "string",
+                                "description": "Source to search within",
+                                "enum": ["web", "news"],
+                                "default": "web",
+                            },
+                        },
+                        "required": ["query"],
+                    },
+                ),
+            ),
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_favorite_tourist_spot",
+                    description="Return the favorite tourist spot for a given city.",
+                    parameters={
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                        "required": ["city"],
+                    },
+                ),
+            ),
+        ]
+        self.detector = DeepSeekV4Detector()
+        from sglang.srt.utils.hf_transformers_utils import get_tokenizer
+
+        self.tokenizer = get_tokenizer("deepseek-ai/DeepSeek-V3.2")
+        self.interval = 1
+
+    def test_detect_and_parse_xml_format(self):
+        """Test parsing standard XML format (DSML)"""
+        text = """I'll help you with information about San Francisco and get its favorite tourist spot for you.\n\n
+        <｜DSML｜tool_calls>\n
+            <｜DSML｜invoke name="get_favorite_tourist_spot">\n
+                <｜DSML｜parameter name="city" string="true">San Francisco</｜DSML｜parameter>\n
+            </｜DSML｜invoke>\n
+            <｜DSML｜invoke name="search">
+                <｜DSML｜parameter name="query" string="true">WebNav benchmark</｜DSML｜parameter>
+                <｜DSML｜parameter name="topn" string="false">10</｜DSML｜parameter>
+                <｜DSML｜parameter name="source" string="true">web</｜DSML｜parameter>
+            </｜DSML｜invoke>
+        </｜DSML｜tool_calls>
+        """
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertIn("I'll help you with information", result.normal_text)
+        self.assertEqual(len(result.calls), 2)
+
+        # Check first call
+        call1 = result.calls[0]
+        self.assertEqual(call1.name, "get_favorite_tourist_spot")
+        params1 = json.loads(call1.parameters)
+        self.assertEqual(params1["city"], "San Francisco")
+
+        # Check second call
+        call2 = result.calls[1]
+        self.assertEqual(call2.name, "search")
+        params2 = json.loads(call2.parameters)
+        self.assertEqual(params2["query"], "WebNav benchmark")
+        self.assertEqual(params2["topn"], 10)
+        self.assertEqual(params2["source"], "web")
+
+    def test_detect_and_parse_json_format(self):
+        """Test parsing JSON format inside invoke tags"""
+        text = """I'll help you with information about San Francisco and get its favorite tourist spot for you.
+
+        <｜DSML｜tool_calls>
+            <｜DSML｜invoke name="get_favorite_tourist_spot">
+            {
+                "city": "San Francisco"
+            }
+        </｜DSML｜invoke>
+            <｜DSML｜invoke name="search">
+            {
+                "query": "WebNav benchmark",
+                "topn": 10,
+                "source": "web"
+            }
+        </｜DSML｜invoke>
+        </｜DSML｜tool_calls>
+        """
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertIn("I'll help you with information", result.normal_text)
+        self.assertEqual(len(result.calls), 2)
+
+        # Check first call
+        call1 = result.calls[0]
+        self.assertEqual(call1.name, "get_favorite_tourist_spot")
+        params1 = json.loads(call1.parameters)
+        self.assertEqual(params1["city"], "San Francisco")
+
+        # Check second call
+        call2 = result.calls[1]
+        self.assertEqual(call2.name, "search")
+        params2 = json.loads(call2.parameters)
+        self.assertEqual(params2["query"], "WebNav benchmark")
+        self.assertEqual(params2["topn"], 10)
+        self.assertEqual(params2["source"], "web")
+
+    def test_streaming_xml_format(self):
+        """Test streaming parsing of XML format"""
+        text = """<｜DSML｜tool_calls>
+            <｜DSML｜invoke name="get_favorite_tourist_spot">
+                <｜DSML｜parameter name="city" string="true">San Francisco</｜DSML｜parameter>
+                <｜DSML｜parameter name="another_city" string="true">London</｜DSML｜parameter>
+                <｜DSML｜parameter name="topn" string="false">10</｜DSML｜parameter>
+                <｜DSML｜parameter name="obj" string="false">{"name": "John", "age": 30}</｜DSML｜parameter>
+            </｜DSML｜invoke>
+        </｜DSML｜tool_calls>"""
+
+        input_ids = self.tokenizer.encode(text, add_special_tokens=False)
+        chunk_ids = [
+            input_ids[i : i + self.interval]
+            for i in range(0, len(input_ids), self.interval)
+        ]
+        chunks = [self.tokenizer.decode(chunk_id) for chunk_id in chunk_ids]
+
+        tool_calls_by_index = {}
+
+        num_tool_call_chunks = 0
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            for call in result.calls:
+                num_tool_call_chunks += 1
+                if call.tool_index is not None:
+                    if call.tool_index not in tool_calls_by_index:
+                        tool_calls_by_index[call.tool_index] = {
+                            "name": "",
+                            "parameters": "",
+                        }
+
+                    if call.name:
+                        tool_calls_by_index[call.tool_index]["name"] = call.name
+                    if call.parameters:
+                        tool_calls_by_index[call.tool_index][
+                            "parameters"
+                        ] += call.parameters
+
+        self.assertGreater(num_tool_call_chunks, 8)
+
+        self.assertEqual(len(tool_calls_by_index), 1)
+        self.assertEqual(tool_calls_by_index[0]["name"], "get_favorite_tourist_spot")
+        params = json.loads(tool_calls_by_index[0]["parameters"])
+        self.assertEqual(params["city"], "San Francisco")
+        self.assertEqual(params["another_city"], "London")
+        self.assertEqual(params["topn"], 10)
+        self.assertEqual(params["obj"]["name"], "John")
+        self.assertEqual(params["obj"]["age"], 30)
+
+    def test_streaming_json_format(self):
+        """Test streaming parsing of JSON format"""
+        text = """<｜DSML｜tool_calls>
+            <｜DSML｜invoke name="get_favorite_tourist_spot">
+            {
+                "city": "San Francisco",
+                "another_city": "London",
+                "topn": 10,
+                "obj": {
+                    "name": "John",
+                    "age": 30
+                }
+            }
+            </｜DSML｜invoke>
+        </｜DSML｜tool_calls>"""
+
+        input_ids = self.tokenizer.encode(text, add_special_tokens=False)
+        chunk_ids = [
+            input_ids[i : i + self.interval]
+            for i in range(0, len(input_ids), self.interval)
+        ]
+        chunks = [self.tokenizer.decode(chunk_id) for chunk_id in chunk_ids]
+
+        tool_calls_by_index = {}
+
+        num_tool_call_chunks = 0
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            for call in result.calls:
+                num_tool_call_chunks += 1
+                if call.tool_index is not None:
+                    if call.tool_index not in tool_calls_by_index:
+                        tool_calls_by_index[call.tool_index] = {
+                            "name": "",
+                            "parameters": "",
+                        }
+
+                    if call.name:
+                        tool_calls_by_index[call.tool_index]["name"] = call.name
+                    if call.parameters:
+                        tool_calls_by_index[call.tool_index][
+                            "parameters"
+                        ] += call.parameters
+
+        self.assertGreater(num_tool_call_chunks, 8)
+        self.assertEqual(len(tool_calls_by_index), 1)
+        self.assertEqual(tool_calls_by_index[0]["name"], "get_favorite_tourist_spot")
+
+        # Clean up parameters string if needed (trim whitespace)
+        params_str = tool_calls_by_index[0]["parameters"].strip()
+        params = json.loads(params_str)
+        self.assertEqual(params["city"], "San Francisco")
+
+    def test_detect_and_parse_no_parameters(self):
+        """Test parsing function calls with no parameters (non-streaming)"""
+        # Add a no-parameter tool
+        tools_with_no_param = self.tools + [
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_date",
+                    description="Get the current date.",
+                    parameters={"type": "object", "properties": {}},
+                ),
+            ),
+        ]
+
+        text = """Let me get the current date for you.
+
+<｜DSML｜tool_calls>
+<｜DSML｜invoke name="get_date">
+</｜DSML｜invoke>
+</｜DSML｜tool_calls>"""
+
+        result = self.detector.detect_and_parse(text, tools_with_no_param)
+
+        self.assertIn("Let me get the current date", result.normal_text)
+        self.assertEqual(len(result.calls), 1)
+
+        call = result.calls[0]
+        self.assertEqual(call.name, "get_date")
+        params = json.loads(call.parameters)
+        self.assertEqual(params, {})
+
+    def test_streaming_no_parameters(self):
+        """Test streaming parsing of function calls with no parameters.
+
+        This test verifies the fix for the bug where functions with no parameters
+        were being silently skipped in streaming mode.
+        """
+        # Add a no-parameter tool
+        tools_with_no_param = self.tools + [
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_date",
+                    description="Get the current date.",
+                    parameters={"type": "object", "properties": {}},
+                ),
+            ),
+        ]
+
+        text = """<｜DSML｜tool_calls>
+<｜DSML｜invoke name="get_date">
+</｜DSML｜invoke>
+</｜DSML｜tool_calls>"""
+
+        # Reset detector state
+        self.detector = DeepSeekV4Detector()
+
+        # Simulate streaming by splitting into small chunks
+        input_ids = self.tokenizer.encode(text, add_special_tokens=False)
+        chunk_ids = [
+            input_ids[i : i + self.interval]
+            for i in range(0, len(input_ids), self.interval)
+        ]
+        chunks = [self.tokenizer.decode(chunk_id) for chunk_id in chunk_ids]
+
+        tool_calls_by_index = {}
+
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, tools_with_no_param)
+            for call in result.calls:
+                if call.tool_index is not None:
+                    if call.tool_index not in tool_calls_by_index:
+                        tool_calls_by_index[call.tool_index] = {
+                            "name": "",
+                            "parameters": "",
+                        }
+
+                    if call.name:
+                        tool_calls_by_index[call.tool_index]["name"] = call.name
+                    if call.parameters:
+                        tool_calls_by_index[call.tool_index][
+                            "parameters"
+                        ] += call.parameters
+
+        # Verify that the no-parameter function was correctly parsed
+        self.assertEqual(
+            len(tool_calls_by_index), 1, "Should have exactly one tool call"
+        )
+        self.assertEqual(tool_calls_by_index[0]["name"], "get_date")
+
+        # Parameters should be empty JSON object
+        params_str = tool_calls_by_index[0]["parameters"].strip()
+        params = json.loads(params_str)
+        self.assertEqual(params, {})
+
+    def test_streaming_no_parameters_with_whitespace(self):
+        """Test streaming parsing when invoke content has only whitespace (newlines)."""
+        tools_with_no_param = self.tools + [
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_date",
+                    description="Get the current date.",
+                    parameters={"type": "object", "properties": {}},
+                ),
+            ),
+        ]
+
+        # This format has newlines inside the invoke tag (common model output)
+        text = """<｜DSML｜tool_calls>
+<｜DSML｜invoke name="get_date">
+
+</｜DSML｜invoke>
+</｜DSML｜tool_calls>"""
+
+        # Reset detector state
+        self.detector = DeepSeekV4Detector()
+
+        input_ids = self.tokenizer.encode(text, add_special_tokens=False)
+        chunk_ids = [
+            input_ids[i : i + self.interval]
+            for i in range(0, len(input_ids), self.interval)
+        ]
+        chunks = [self.tokenizer.decode(chunk_id) for chunk_id in chunk_ids]
+
+        tool_calls_by_index = {}
+
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, tools_with_no_param)
+            for call in result.calls:
+                if call.tool_index is not None:
+                    if call.tool_index not in tool_calls_by_index:
+                        tool_calls_by_index[call.tool_index] = {
+                            "name": "",
+                            "parameters": "",
+                        }
+
+                    if call.name:
+                        tool_calls_by_index[call.tool_index]["name"] = call.name
+                    if call.parameters:
+                        tool_calls_by_index[call.tool_index][
+                            "parameters"
+                        ] += call.parameters
+
+        # Should still parse correctly even with whitespace-only content
+        self.assertEqual(
+            len(tool_calls_by_index), 1, "Should have exactly one tool call"
+        )
+        self.assertEqual(tool_calls_by_index[0]["name"], "get_date")
+        params = json.loads(tool_calls_by_index[0]["parameters"])
+        self.assertEqual(params, {})
+
+    def test_get_model_structural_tag(self):
+        import xgrammar as xgr
+
+        self.assertEqual(self.detector.get_structural_tag_name(), "deepseek_v4")
+
+        structural_tag = self.detector.get_structural_tag(
+            self.tools, thinking_mode=True
+        )
+        self.assertIsInstance(structural_tag, xgr.StructuralTag)
+        grammar = xgr.Grammar.from_structural_tag(structural_tag)
+        self.assertIsInstance(grammar, xgr.Grammar)
+        serialized = structural_tag.model_dump_json()
+        self.assertIn("</｜DSML｜invoke>\\n", serialized)
+        self.assertNotIn("</｜DSML｜invoke>\\n\\n", serialized)
+
+        structural_tag = self.detector.get_structural_tag(
+            self.tools, thinking_mode=False
+        )
+        self.assertIsInstance(structural_tag, xgr.StructuralTag)
+        grammar = xgr.Grammar.from_structural_tag(structural_tag)
+        self.assertIsInstance(grammar, xgr.Grammar)
+
+        structural_tag = self.detector.get_structural_tag(
+            self.tools, thinking_mode=True, tool_choice="required"
+        )
+        self.assertIsInstance(structural_tag, xgr.StructuralTag)
+        grammar = xgr.Grammar.from_structural_tag(structural_tag)
+        self.assertIsInstance(grammar, xgr.Grammar)
+
+        structural_tag = self.detector.get_structural_tag(
+            self.tools, thinking_mode=False, tool_choice="required"
+        )
+        self.assertIsInstance(structural_tag, xgr.StructuralTag)
+        grammar = xgr.Grammar.from_structural_tag(structural_tag)
+        self.assertIsInstance(grammar, xgr.Grammar)
+
+        tool_choice_name = ToolChoiceFuncName(name="search")
+        tool_choice = ToolChoice(function=tool_choice_name)
+        structural_tag = self.detector.get_structural_tag(
+            self.tools, thinking_mode=True, tool_choice=tool_choice
+        )
+        self.assertIsInstance(structural_tag, xgr.StructuralTag)
+        grammar = xgr.Grammar.from_structural_tag(structural_tag)
+        self.assertIsInstance(grammar, xgr.Grammar)
+
+        structural_tag = self.detector.get_structural_tag(
+            self.tools, thinking_mode=False, tool_choice=tool_choice
+        )
+        self.assertIsInstance(structural_tag, xgr.StructuralTag)
+        grammar = xgr.Grammar.from_structural_tag(structural_tag)
+        self.assertIsInstance(grammar, xgr.Grammar)
+
+    def test_self_closing_zero_arg_invoke(self):
+        """V4 emits `<｜DSML｜invoke name="x"/>` for zero-arg tools; the
+        detector must parse it as a complete tool call with empty params
+        instead of leaking the raw markup back into normal_text."""
+        submit_tool = Tool(
+            type="function",
+            function=Function(
+                name="submit",
+                description="Submit the final answer.",
+                parameters={"type": "object", "properties": {}},
+            ),
+        )
+
+        text = (
+            "Final answer.\n"
+            '<｜DSML｜tool_calls>\n<｜DSML｜invoke name="submit"/>\n'
+            "</｜DSML｜tool_calls>"
+        )
+        result = self.detector.detect_and_parse(text, [submit_tool])
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "submit")
+        self.assertEqual(json.loads(result.calls[0].parameters), {})
+        self.assertNotIn("DSML", result.normal_text)
+
+    def test_self_closing_mixed_with_long_form(self):
+        """Mix of long-form (with params) and self-closing tags in one block."""
+        submit_tool = Tool(
+            type="function",
+            function=Function(
+                name="submit",
+                parameters={"type": "object", "properties": {}},
+            ),
+        )
+        text = (
+            "<｜DSML｜tool_calls>\n"
+            '<｜DSML｜invoke name="get_favorite_tourist_spot">\n'
+            '<｜DSML｜parameter name="city" string="true">SF</｜DSML｜parameter>\n'
+            "</｜DSML｜invoke>\n"
+            '<｜DSML｜invoke name="submit"/>\n'
+            "</｜DSML｜tool_calls>"
+        )
+        result = self.detector.detect_and_parse(text, self.tools + [submit_tool])
+        self.assertEqual(len(result.calls), 2)
+        self.assertEqual(result.calls[0].name, "get_favorite_tourist_spot")
+        self.assertEqual(json.loads(result.calls[0].parameters), {"city": "SF"})
+        self.assertEqual(result.calls[1].name, "submit")
+        self.assertEqual(json.loads(result.calls[1].parameters), {})
+
+    def test_streaming_self_closing_invoke(self):
+        """Self-closing invoke must terminate cleanly even when `/>` arrives
+        after the `name=` attribute crosses chunk boundaries."""
+        submit_tool = Tool(
+            type="function",
+            function=Function(
+                name="submit",
+                parameters={"type": "object", "properties": {}},
+            ),
+        )
+        # Build the prompt and feed it through the tokenizer to exercise the
+        # same chunk shapes the runtime sees.
+        text = (
+            "<｜DSML｜tool_calls>\n"
+            '<｜DSML｜invoke name="submit"/>\n'
+            "</｜DSML｜tool_calls>"
+        )
+        self.detector = DeepSeekV4Detector()
+        input_ids = self.tokenizer.encode(text, add_special_tokens=False)
+        chunks = [
+            self.tokenizer.decode(input_ids[i : i + self.interval])
+            for i in range(0, len(input_ids), self.interval)
+        ]
+
+        tool_calls_by_index = {}
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, [submit_tool])
+            for call in result.calls:
+                if call.tool_index is None:
+                    continue
+                slot = tool_calls_by_index.setdefault(
+                    call.tool_index, {"name": "", "parameters": ""}
+                )
+                if call.name:
+                    slot["name"] = call.name
+                if call.parameters:
+                    slot["parameters"] += call.parameters
+
+        self.assertEqual(len(tool_calls_by_index), 1)
+        self.assertEqual(tool_calls_by_index[0]["name"], "submit")
+        self.assertEqual(json.loads(tool_calls_by_index[0]["parameters"]), {})
+
 
 class TestQwen3CoderDetector(unittest.TestCase):
     """Test suite for Qwen3CoderDetector."""
@@ -1979,6 +2585,148 @@ class TestQwen3CoderDetector(unittest.TestCase):
         self.assertFalse(self.detector.has_tool_call("plain text only"))
         self.assertFalse(self.detector.has_tool_call(""))
 
+    # ==================== Structural tag (xgrammar builtin) ====================
+    # Qwen3 Coder uses the new builtin structural tag path. supports_structural_tag()
+    # is True so required/named tool_choice routes through FunctionCallParser
+    # instead of JsonArrayParser.
+
+    def test_supports_structural_tag(self):
+        self.assertTrue(self.detector.supports_structural_tag())
+
+    def test_get_model_structural_tag(self):
+        import xgrammar as xgr
+
+        structural_tag = self.detector.get_structural_tag(
+            self.tools, thinking_mode=True
+        )
+        self.assertIsInstance(structural_tag, xgr.StructuralTag)
+        grammar = xgr.Grammar.from_structural_tag(structural_tag)
+        self.assertIsInstance(grammar, xgr.Grammar)
+
+        structural_tag = self.detector.get_structural_tag(
+            self.tools, thinking_mode=False
+        )
+        self.assertIsInstance(structural_tag, xgr.StructuralTag)
+        grammar = xgr.Grammar.from_structural_tag(structural_tag)
+        self.assertIsInstance(grammar, xgr.Grammar)
+
+        structural_tag = self.detector.get_structural_tag(
+            self.tools, thinking_mode=True, tool_choice="required"
+        )
+        self.assertIsInstance(structural_tag, xgr.StructuralTag)
+        grammar = xgr.Grammar.from_structural_tag(structural_tag)
+        self.assertIsInstance(grammar, xgr.Grammar)
+
+        structural_tag = self.detector.get_structural_tag(
+            self.tools, thinking_mode=False, tool_choice="required"
+        )
+        self.assertIsInstance(structural_tag, xgr.StructuralTag)
+        grammar = xgr.Grammar.from_structural_tag(structural_tag)
+        self.assertIsInstance(grammar, xgr.Grammar)
+
+        tool_choice_name = ToolChoiceFuncName(name="get_current_weather")
+        tool_choice = ToolChoice(function=tool_choice_name)
+        structural_tag = self.detector.get_structural_tag(
+            self.tools, thinking_mode=True, tool_choice=tool_choice
+        )
+        self.assertIsInstance(structural_tag, xgr.StructuralTag)
+        grammar = xgr.Grammar.from_structural_tag(structural_tag)
+        self.assertIsInstance(grammar, xgr.Grammar)
+
+        structural_tag = self.detector.get_structural_tag(
+            self.tools, thinking_mode=False, tool_choice=tool_choice
+        )
+        self.assertIsInstance(structural_tag, xgr.StructuralTag)
+        grammar = xgr.Grammar.from_structural_tag(structural_tag)
+        self.assertIsInstance(grammar, xgr.Grammar)
+
+
+class TestGptOssDetector(unittest.TestCase):
+    def setUp(self):
+        self.tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="search",
+                    description="Searches for information.",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string"},
+                            "topn": {"type": "integer"},
+                        },
+                        "required": ["query"],
+                    },
+                ),
+            ),
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_weather",
+                    description="Get weather information for a city.",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "city": {"type": "string"},
+                            "unit": {
+                                "type": "string",
+                                "enum": ["celsius", "fahrenheit"],
+                            },
+                        },
+                        "required": ["city"],
+                    },
+                ),
+            ),
+        ]
+        self.detector = GptOssDetector()
+
+    def test_get_model_structural_tag(self):
+        import xgrammar as xgr
+
+        structural_tag = self.detector.get_structural_tag(
+            self.tools, thinking_mode=True
+        )
+        self.assertIsInstance(structural_tag, xgr.StructuralTag)
+        grammar = xgr.Grammar.from_structural_tag(structural_tag)
+        self.assertIsInstance(grammar, xgr.Grammar)
+
+        structural_tag = self.detector.get_structural_tag(
+            self.tools, thinking_mode=False
+        )
+        self.assertIsInstance(structural_tag, xgr.StructuralTag)
+        grammar = xgr.Grammar.from_structural_tag(structural_tag)
+        self.assertIsInstance(grammar, xgr.Grammar)
+
+        structural_tag = self.detector.get_structural_tag(
+            self.tools, thinking_mode=True, tool_choice="required"
+        )
+        self.assertIsInstance(structural_tag, xgr.StructuralTag)
+        grammar = xgr.Grammar.from_structural_tag(structural_tag)
+        self.assertIsInstance(grammar, xgr.Grammar)
+
+        structural_tag = self.detector.get_structural_tag(
+            self.tools, thinking_mode=False, tool_choice="required"
+        )
+        self.assertIsInstance(structural_tag, xgr.StructuralTag)
+        grammar = xgr.Grammar.from_structural_tag(structural_tag)
+        self.assertIsInstance(grammar, xgr.Grammar)
+
+        tool_choice_name = ToolChoiceFuncName(name="search")
+        tool_choice = ToolChoice(function=tool_choice_name)
+        structural_tag = self.detector.get_structural_tag(
+            self.tools, thinking_mode=True, tool_choice=tool_choice
+        )
+        self.assertIsInstance(structural_tag, xgr.StructuralTag)
+        grammar = xgr.Grammar.from_structural_tag(structural_tag)
+        self.assertIsInstance(grammar, xgr.Grammar)
+
+        structural_tag = self.detector.get_structural_tag(
+            self.tools, thinking_mode=False, tool_choice=tool_choice
+        )
+        self.assertIsInstance(structural_tag, xgr.StructuralTag)
+        grammar = xgr.Grammar.from_structural_tag(structural_tag)
+        self.assertIsInstance(grammar, xgr.Grammar)
+
 
 class TestGlm4MoeDetector(unittest.TestCase):
     def setUp(self):
@@ -2270,6 +3018,39 @@ class TestGlm4MoeDetector(unittest.TestCase):
             self.assertIsInstance(result, StreamingParseResult)
             self.assertEqual(result.calls, [])
 
+    def test_whitespace_preserved_in_arg_values(self):
+        """Test that leading/trailing whitespace in arg values is not stripped."""
+        tools_with_string = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="apply_diff",
+                    description="Apply a diff",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "old_string": {"type": "string"},
+                            "new_string": {"type": "string"},
+                        },
+                        "required": ["old_string", "new_string"],
+                    },
+                ),
+            )
+        ]
+        text = (
+            "<tool_call>apply_diff\n"
+            "<arg_key>old_string</arg_key>\n"
+            "<arg_value>    indented code</arg_value>\n"
+            "<arg_key>new_string</arg_key>\n"
+            "<arg_value>        also indented</arg_value>\n"
+            "</tool_call>"
+        )
+        result = self.detector.detect_and_parse(text, tools_with_string)
+        self.assertEqual(len(result.calls), 1)
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params["old_string"], "    indented code")
+        self.assertEqual(params["new_string"], "        also indented")
+
 
 class TestGlm47MoeDetector(unittest.TestCase):
     def setUp(self):
@@ -2545,6 +3326,102 @@ class TestGlm47MoeDetector(unittest.TestCase):
             tools_with_array,
         )
         check_single_todos(result, expected_output)
+
+    def test_whitespace_preserved_in_arg_values(self):
+        """Test that leading/trailing whitespace in arg values is not stripped."""
+        tools_with_string = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="apply_diff",
+                    description="Apply a diff",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "old_string": {"type": "string"},
+                            "new_string": {"type": "string"},
+                        },
+                        "required": ["old_string", "new_string"],
+                    },
+                ),
+            )
+        ]
+        text = (
+            "<tool_call>apply_diff"
+            "<arg_key>old_string</arg_key>"
+            "<arg_value>    indented code</arg_value>"
+            "<arg_key>new_string</arg_key>"
+            "<arg_value>        also indented</arg_value>"
+            "</tool_call>"
+        )
+        result = self.detector.detect_and_parse(text, tools_with_string)
+        self.assertEqual(len(result.calls), 1)
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params["old_string"], "    indented code")
+        self.assertEqual(params["new_string"], "        also indented")
+
+    def test_get_model_structural_tag(self):
+        """GLM-4.7/GLM-5 use xgrammar's native "glm_4_7" structural tag."""
+        import xgrammar as xgr
+
+        self.assertTrue(self.detector.supports_structural_tag())
+        self.assertEqual(self.detector.get_structural_tag_name(), "glm_4_7")
+
+        # thinking_mode=True keeps the </think> reasoning prefix.
+        structural_tag = self.detector.get_structural_tag(
+            self.tools, thinking_mode=True
+        )
+        self.assertIsInstance(structural_tag, xgr.StructuralTag)
+        self.assertIsInstance(
+            xgr.Grammar.from_structural_tag(structural_tag), xgr.Grammar
+        )
+        serialized = structural_tag.model_dump_json()
+        self.assertIn("glm_xml", serialized)
+        self.assertIn("<tool_call>", serialized)
+        self.assertIn("</think>", serialized)
+
+        # thinking_mode=False drops the reasoning prefix (ReasonerGrammarBackend
+        # owns </think> when --reasoning-parser is configured).
+        structural_tag = self.detector.get_structural_tag(
+            self.tools, thinking_mode=False
+        )
+        self.assertIsInstance(structural_tag, xgr.StructuralTag)
+        self.assertIsInstance(
+            xgr.Grammar.from_structural_tag(structural_tag), xgr.Grammar
+        )
+        self.assertNotEqual("sequence", structural_tag.model_dump()["format"]["type"])
+
+        # tool_choice="required" must still compile to a grammar.
+        structural_tag = self.detector.get_structural_tag(
+            self.tools, thinking_mode=True, tool_choice="required"
+        )
+        self.assertIsInstance(structural_tag, xgr.StructuralTag)
+        self.assertIsInstance(
+            xgr.Grammar.from_structural_tag(structural_tag), xgr.Grammar
+        )
+
+    def test_required_tool_choice_falls_back_when_native_tag_is_unavailable(self):
+        from unittest.mock import patch
+
+        from sglang.srt.function_call.function_call_parser import FunctionCallParser
+        from sglang.srt.function_call.glm47_moe_detector import (
+            _glm47_native_structural_tag_available,
+        )
+
+        with patch(
+            "sglang.srt.function_call.glm47_moe_detector.get_model_structural_tag",
+            None,
+        ):
+            _glm47_native_structural_tag_available.cache_clear()
+            self.assertFalse(self.detector.supports_structural_tag())
+            self.assertIsNone(self.detector.get_structural_tag(self.tools))
+
+            parser = FunctionCallParser(self.tools, "glm47")
+            constraint = parser.get_structure_constraint("required")
+
+            self.assertIsNotNone(constraint)
+            self.assertEqual("json_schema", constraint[0])
+            _glm47_native_structural_tag_available.cache_clear()
 
 
 class TestJsonArrayParser(unittest.TestCase):
@@ -3853,6 +4730,158 @@ function call<|role_sep|>
         self.assertEqual(params["city"], "Rome")
 
 
+class TestGetStructureConstraint(unittest.TestCase):
+    """Tests for FunctionCallParser.get_structure_constraint() logic.
+
+    Verifies that detectors supporting structural_tag use it for required/named
+    tool_choice, and that the generic json_schema fallback is used otherwise.
+    """
+
+    def _make_tools(self, strict=False):
+        return [
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_weather",
+                    description="Get weather",
+                    parameters={
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                        "required": ["city"],
+                    },
+                    strict=strict,
+                ),
+            ),
+        ]
+
+    def _make_parser(self, parser_name, strict=False):
+        from sglang.srt.function_call.function_call_parser import FunctionCallParser
+
+        return FunctionCallParser(self._make_tools(strict=strict), parser_name)
+
+    def _constraint_json(self, result):
+        return result[1].model_dump_json()
+
+    # --- structural_tag detectors (kimi_k2, deepseekv3, qwen25, etc.) ---
+
+    def test_kimi_required_strict_returns_structural_tag(self):
+        import xgrammar as xgr
+
+        parser = self._make_parser("kimi_k2", strict=True)
+        result = parser.get_structure_constraint("required")
+        self.assertIsNotNone(result)
+        self.assertEqual(result[0], "structural_tag")
+        self.assertIsInstance(result[1], xgr.StructuralTag)
+        self.assertIn("<|tool_calls_section_begin|>", self._constraint_json(result))
+
+    def test_kimi_required_no_strict_returns_structural_tag(self):
+        """required should use structural_tag even without strict, to preserve native format."""
+        import xgrammar as xgr
+
+        parser = self._make_parser("kimi_k2", strict=False)
+        result = parser.get_structure_constraint("required")
+        self.assertIsNotNone(result)
+        self.assertEqual(result[0], "structural_tag")
+        self.assertIsInstance(result[1], xgr.StructuralTag)
+        self.assertIn("<|tool_calls_section_begin|>", self._constraint_json(result))
+
+    def test_kimi_auto_strict_returns_structural_tag(self):
+        import xgrammar as xgr
+
+        parser = self._make_parser("kimi_k2", strict=True)
+        result = parser.get_structure_constraint("auto")
+        self.assertIsNotNone(result)
+        self.assertEqual(result[0], "structural_tag")
+        self.assertIsInstance(result[1], xgr.StructuralTag)
+        serialized = self._constraint_json(result)
+        self.assertIn('"type":"triggered_tags"', serialized)
+        self.assertIn("<|tool_calls_section_begin|>", serialized)
+
+    def test_kimi_routes_through_native_with_section_markers(self):
+        """xgrammar 0.2.1's Kimi builtin keeps auto tool calls section-wrapped."""
+        import xgrammar as xgr
+
+        parser = self._make_parser("kimi_k2", strict=True)
+        result = parser.get_structure_constraint("auto")
+        self.assertIsInstance(result[1], xgr.StructuralTag)
+        serialized = self._constraint_json(result)
+        self.assertIn("<|tool_calls_section_begin|>", serialized)
+        self.assertIn("<|tool_calls_section_end|>", serialized)
+
+    def test_kimi_auto_no_strict_returns_none(self):
+        """auto without strict should not constrain."""
+        parser = self._make_parser("kimi_k2", strict=False)
+        result = parser.get_structure_constraint("auto")
+        self.assertIsNone(result)
+
+    def test_kimi_named_tool_choice_returns_structural_tag(self):
+        from sglang.srt.entrypoints.openai.protocol import (
+            ToolChoice,
+            ToolChoiceFuncName,
+        )
+
+        parser = self._make_parser("kimi_k2", strict=False)
+        tool_choice = ToolChoice(function=ToolChoiceFuncName(name="get_weather"))
+        result = parser.get_structure_constraint(tool_choice)
+        self.assertIsNotNone(result)
+        self.assertEqual(result[0], "structural_tag")
+
+    def test_deepseekv3_required_no_strict_returns_structural_tag(self):
+        parser = self._make_parser("deepseekv3", strict=False)
+        result = parser.get_structure_constraint("required")
+        self.assertIsNotNone(result)
+        self.assertEqual(result[0], "structural_tag")
+
+    def test_qwen25_required_no_strict_returns_structural_tag(self):
+        parser = self._make_parser("qwen25", strict=False)
+        result = parser.get_structure_constraint("required")
+        self.assertIsNotNone(result)
+        self.assertEqual(result[0], "structural_tag")
+
+    # --- structural_tag content verification ---
+
+    def test_kimi_structural_tag_has_kimi_tokens(self):
+        """Verify structural_tag contains kimi-specific special tokens."""
+        parser = self._make_parser("kimi_k2", strict=True)
+        result = parser.get_structure_constraint("required")
+        serialized = self._constraint_json(result)
+        self.assertIn("<|tool_calls_section_begin|>", serialized)
+        self.assertIn("functions.get_weather:", serialized)
+        self.assertIn('"pattern":"\\\\d+"', serialized)
+        self.assertIn("<|tool_call_end|>", serialized)
+        self.assertIn("<|tool_calls_section_end|>", serialized)
+
+    def test_kimi_required_no_strict_uses_loose_object_schema(self):
+        """Kimi required calls keep non-strict arguments object-shaped but loose."""
+        parser = self._make_parser("kimi_k2", strict=False)
+        result = parser.get_structure_constraint("required")
+        serialized = self._constraint_json(result)
+        self.assertIn('"json_schema":{"type":"object"}', serialized)
+        self.assertNotIn('"additionalProperties":false', serialized)
+        self.assertNotIn('"properties"', serialized)
+
+    def test_kimi_required_strict_uses_tool_schema(self):
+        """With strict, native xgrammar should include the tool's parameter schema."""
+        parser = self._make_parser("kimi_k2", strict=True)
+        result = parser.get_structure_constraint("required")
+        serialized = self._constraint_json(result)
+        self.assertIn('"properties"', serialized)
+        self.assertIn('"city"', serialized)
+
+    # --- reasoning-prefix ownership ---
+
+    def test_default_thinking_mode_is_false(self):
+        """Default must be False so callers don't silently get a reasoning
+        prefix added to their grammar (only relevant for detectors routed
+        through the xgrammar builtin)."""
+        import inspect
+
+        from sglang.srt.function_call.function_call_parser import FunctionCallParser
+
+        sig = inspect.signature(FunctionCallParser.get_structure_constraint)
+        self.assertIs(sig.parameters["thinking_mode"].default, False)
+
+
 class TestQwen25Detector(unittest.TestCase):
     """Test Qwen25Detector streaming and non-streaming multi-tool-call parsing."""
 
@@ -4006,6 +5035,341 @@ class TestQwen25Detector(unittest.TestCase):
         self.assertEqual(len(result), 2, f"Expected 2 tool calls, got {len(result)}")
         cities = [json.loads(result[i]["parameters"])["city"] for i in sorted(result)]
         self.assertEqual(cities, ["NYC", "LA"])
+
+
+class TestGemma4Detector(unittest.TestCase):
+    def setUp(self):
+        self.tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_weather",
+                    description="Get weather information",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "location": {"type": "string"},
+                            "unit": {
+                                "type": "string",
+                                "enum": ["celsius", "fahrenheit"],
+                            },
+                        },
+                        "required": ["location"],
+                    },
+                ),
+            )
+        ]
+        self.detector = Gemma4Detector()
+
+    def test_detect_and_parse(self):
+        text = 'Some text before <|tool_call>call:get_weather{location:<|"|>Tokyo<|"|>}<tool_call|>'
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(result.normal_text, "Some text before ")
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "get_weather")
+
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params["location"], "Tokyo")
+
+    def test_parse_streaming_increment(self):
+        chunks = [
+            "Some text ",
+            "before <|tool",
+            "_call>call:get_we",
+            "ather{location:<|",  # codespell:ignore
+            '"|>Tokyo<|"|>}<tool_',
+            "call|> after",
+        ]
+
+        all_results = []
+        for chunk in chunks:
+            res = self.detector.parse_streaming_increment(chunk, self.tools)
+            all_results.append(res)
+
+        combined_normal_text = "".join(r.normal_text for r in all_results)
+        self.assertEqual(combined_normal_text, "Some text before  after")
+
+        found_name = False
+        found_params = False
+        for res in all_results:
+            for call in res.calls:
+                if call.name == "get_weather":
+                    found_name = True
+                if call.parameters:
+                    params = json.loads(call.parameters)
+                    if params == {"location": "Tokyo"}:
+                        found_params = True
+
+        self.assertTrue(found_name)
+        self.assertTrue(found_params)
+
+    def test_nested_array_streaming(self):
+        # Additional coverage for complex structure
+        chunks = [
+            '<|tool_call>call:get_weather{location:<|"',
+            '|>New York<|"|>,nested:[1, 2, {inner:<|"|>',
+            'val<|"|>}]}<tool_call|>',
+        ]
+
+        all_results = []
+        for chunk in chunks:
+            res = self.detector.parse_streaming_increment(chunk, self.tools)
+            all_results.append(res)
+
+        found_params = False
+        for res in all_results:
+            for call in res.calls:
+                if call.parameters:
+                    params = json.loads(call.parameters)
+                    if "location" in params and params["location"] == "New York":
+                        if "nested" in params and params["nested"] == [
+                            1,
+                            2,
+                            {"inner": "val"},
+                        ]:
+                            found_params = True
+
+        self.assertTrue(found_params)
+
+    def test_has_tool_call(self):
+        self.assertTrue(
+            self.detector.has_tool_call(
+                '<|tool_call>call:get_weather{location:<|"|>Tokyo<|"|>}<tool_call|>'
+            )
+        )
+        self.assertFalse(self.detector.has_tool_call("no tool call here"))
+
+    def test_detect_and_parse_no_tool_call(self):
+        text = "This is plain text without any tool calls."
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(result.normal_text, text)
+        self.assertEqual(len(result.calls), 0)
+
+    def test_detect_and_parse_tool_index(self):
+        text = '<|tool_call>call:get_weather{location:<|"|>Tokyo<|"|>}<tool_call|>'
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].tool_index, 0)
+        self.assertEqual(result.calls[0].name, "get_weather")
+
+    def test_detect_and_parse_unknown_tool_index(self):
+        text = '<|tool_call>call:unknown_func{arg:<|"|>val<|"|>}<tool_call|>'
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].tool_index, -1)
+
+    def test_detect_and_parse_nested_object(self):
+        text = '<|tool_call>call:get_weather{location:<|"|>Tokyo<|"|>,details:{temp:25,unit:<|"|>celsius<|"|>}}<tool_call|>'
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 1)
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params["location"], "Tokyo")
+        self.assertIsInstance(params["details"], dict)
+        self.assertEqual(params["details"]["temp"], 25)
+        self.assertEqual(params["details"]["unit"], "celsius")
+
+    def test_detect_and_parse_multiple_calls(self):
+        extra_tools = self.tools + [
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_time",
+                    description="Get current time",
+                    parameters={
+                        "type": "object",
+                        "properties": {"timezone": {"type": "string"}},
+                    },
+                ),
+            )
+        ]
+        text = (
+            'Some text <|tool_call>call:get_weather{location:<|"|>Tokyo<|"|>}<tool_call|>'
+            ' more text <|tool_call>call:get_time{timezone:<|"|>UTC<|"|>}<tool_call|>'
+        )
+        result = self.detector.detect_and_parse(text, extra_tools)
+        self.assertEqual(len(result.calls), 2)
+        self.assertEqual(result.calls[0].name, "get_weather")
+        self.assertEqual(result.calls[1].name, "get_time")
+        self.assertEqual(result.normal_text, "Some text ")
+
+    def test_parse_gemma4_args_empty(self):
+        self.assertEqual(_parse_gemma4_args(""), {})
+        self.assertEqual(_parse_gemma4_args("   "), {})
+
+    def test_parse_gemma4_args_booleans(self):
+        result = _parse_gemma4_args("flag:true,other:false")
+        self.assertIs(result["flag"], True)
+        self.assertIs(result["other"], False)
+
+    def test_parse_gemma4_args_numbers(self):
+        result = _parse_gemma4_args("count:42,ratio:3.14")
+        self.assertEqual(result["count"], 42)
+        self.assertAlmostEqual(result["ratio"], 3.14)
+
+    def test_parse_gemma4_args_string_with_colon(self):
+        result = _parse_gemma4_args('url:<|"|>http://example.com<|"|>')
+        self.assertEqual(result["url"], "http://example.com")
+
+    def test_parse_gemma4_args_nested_object(self):
+        result = _parse_gemma4_args('outer:{inner:<|"|>val<|"|>,num:5}')
+        self.assertIsInstance(result["outer"], dict)
+        self.assertEqual(result["outer"]["inner"], "val")
+        self.assertEqual(result["outer"]["num"], 5)
+
+    def test_parse_gemma4_array_mixed_types(self):
+        result = _parse_gemma4_array('<|"|>hello<|"|>, 42, true, {key:<|"|>val<|"|>}')
+        self.assertEqual(result[0], "hello")
+        self.assertEqual(result[1], 42)
+        self.assertIs(result[2], True)
+        self.assertIsInstance(result[3], dict)
+        self.assertEqual(result[3]["key"], "val")
+
+    def test_parse_gemma4_value_types(self):
+        self.assertIs(_parse_gemma4_value("true"), True)
+        self.assertIs(_parse_gemma4_value("false"), False)
+        self.assertEqual(_parse_gemma4_value("42"), 42)
+        self.assertAlmostEqual(_parse_gemma4_value("3.14"), 3.14)
+        self.assertEqual(_parse_gemma4_value("hello"), "hello")
+        self.assertEqual(_parse_gemma4_value(""), "")
+
+    def _collect_streaming(self, chunks):
+        """Helper: feed chunks and collect normal text + tool calls by index."""
+        normal_text = ""
+        tool_calls_by_index = {}
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            normal_text += result.normal_text
+            for call in result.calls:
+                if call.tool_index is not None:
+                    if call.tool_index not in tool_calls_by_index:
+                        tool_calls_by_index[call.tool_index] = {
+                            "name": "",
+                            "parameters": "",
+                        }
+                    if call.name:
+                        tool_calls_by_index[call.tool_index]["name"] = call.name
+                    if call.parameters:
+                        tool_calls_by_index[call.tool_index][
+                            "parameters"
+                        ] += call.parameters
+        return normal_text, tool_calls_by_index
+
+    def test_streaming_multiple_tool_calls(self):
+        """Test streaming with two consecutive tool calls."""
+        extra_tools = self.tools + [
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_time",
+                    description="Get current time",
+                    parameters={
+                        "type": "object",
+                        "properties": {"timezone": {"type": "string"}},
+                    },
+                ),
+            )
+        ]
+        chunks = [
+            '<|tool_call>call:get_weather{location:<|"|>',
+            'Tokyo<|"|>}<tool_call|>',
+            ' <|tool_call>call:get_time{timezone:<|"|>',
+            'UTC<|"|>}<tool_call|>',
+        ]
+        normal_text = ""
+        tool_calls_by_index = {}
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, extra_tools)
+            normal_text += result.normal_text
+            for call in result.calls:
+                if call.tool_index is not None:
+                    if call.tool_index not in tool_calls_by_index:
+                        tool_calls_by_index[call.tool_index] = {
+                            "name": "",
+                            "parameters": "",
+                        }
+                    if call.name:
+                        tool_calls_by_index[call.tool_index]["name"] = call.name
+                    if call.parameters:
+                        tool_calls_by_index[call.tool_index][
+                            "parameters"
+                        ] += call.parameters
+
+        self.assertEqual(len(tool_calls_by_index), 2)
+        self.assertEqual(tool_calls_by_index[0]["name"], "get_weather")
+        self.assertEqual(tool_calls_by_index[1]["name"], "get_time")
+        params0 = json.loads(tool_calls_by_index[0]["parameters"])
+        params1 = json.loads(tool_calls_by_index[1]["parameters"])
+        self.assertEqual(params0["location"], "Tokyo")
+        self.assertEqual(params1["timezone"], "UTC")
+
+    def test_streaming_very_small_chunks(self):
+        """Test streaming with character-by-character chunks."""
+        full_text = '<|tool_call>call:get_weather{location:<|"|>Rome<|"|>}<tool_call|>'
+        chunks = list(full_text)
+
+        normal_text, tool_calls = self._collect_streaming(chunks)
+
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0]["name"], "get_weather")
+        params = json.loads(tool_calls[0]["parameters"])
+        self.assertEqual(params["location"], "Rome")
+
+    def test_streaming_empty_args(self):
+        """Test streaming a tool call with no arguments."""
+        chunks = ["<|tool_call>call:get_weather{}", "<tool_call|>"]
+        normal_text, tool_calls = self._collect_streaming(chunks)
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0]["name"], "get_weather")
+
+    def test_streaming_text_between_tool_calls(self):
+        """Test streaming with normal text interleaved between two different tool calls."""
+        extra_tools = self.tools + [
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_time",
+                    description="Get current time",
+                    parameters={
+                        "type": "object",
+                        "properties": {"timezone": {"type": "string"}},
+                    },
+                ),
+            )
+        ]
+        chunks = [
+            "Hello! ",
+            '<|tool_call>call:get_weather{location:<|"|>Paris<|"|>}<tool_call|>',
+            " Let me also check ",
+            '<|tool_call>call:get_time{timezone:<|"|>UTC<|"|>}<tool_call|>',
+        ]
+        normal_text = ""
+        tool_calls_by_index = {}
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, extra_tools)
+            normal_text += result.normal_text
+            for call in result.calls:
+                if call.tool_index is not None:
+                    if call.tool_index not in tool_calls_by_index:
+                        tool_calls_by_index[call.tool_index] = {
+                            "name": "",
+                            "parameters": "",
+                        }
+                    if call.name:
+                        tool_calls_by_index[call.tool_index]["name"] = call.name
+                    if call.parameters:
+                        tool_calls_by_index[call.tool_index][
+                            "parameters"
+                        ] += call.parameters
+        self.assertIn("Hello!", normal_text)
+        self.assertIn("Let me also check", normal_text)
+        self.assertEqual(len(tool_calls_by_index), 2)
+        self.assertEqual(tool_calls_by_index[0]["name"], "get_weather")
+        self.assertEqual(tool_calls_by_index[1]["name"], "get_time")
+        params0 = json.loads(tool_calls_by_index[0]["parameters"])
+        params1 = json.loads(tool_calls_by_index[1]["parameters"])
+        self.assertEqual(params0["location"], "Paris")
+        self.assertEqual(params1["timezone"], "UTC")
 
 
 if __name__ == "__main__":

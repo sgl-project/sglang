@@ -1,0 +1,60 @@
+name: Sync LMSYS SGLang blogs
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 */12 * * *"
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    if: github.repository == 'sgl-project/sglang' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Sync blog cards
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python docs_new/scripts/update_lmsys_sglang_blogs.py
+
+      - name: Open or update pull request
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_PULL_REQUEST }}
+        run: |
+          set -euo pipefail
+
+          if git diff --quiet -- docs_new/index.mdx; then
+            echo "No blog card changes; nothing to do."
+            exit 0
+          fi
+
+          BRANCH="bot/lmsys-blog-cards"
+          git config user.name "sglang-bot"
+          git config user.email "sglang-bot@users.noreply.github.com"
+
+          # Recreate the bot branch as "current main + card diff" and overwrite
+          # any previous state, so the PR always shows a clean single-commit diff.
+          git checkout -B "$BRANCH"
+          git add docs_new/index.mdx
+          git commit -m "docs: sync LMSYS SGLang blog cards"
+          git push --force origin "$BRANCH"
+
+          # Open a PR only if one is not already open for this branch; otherwise
+          # the force-push above has already updated the existing PR in place.
+          if [ -z "$(gh pr list --head "$BRANCH" --base main --state open --json number --jq '.[].number')" ]; then
+            gh pr create \
+              --base main \
+              --head "$BRANCH" \
+              --title "docs: sync LMSYS SGLang blog cards" \
+              --body $'Automated sync of the LMSYS SGLang blog cards in `docs_new/index.mdx`.\n\n🤖 Generated with GitHub Actions'
+          fi

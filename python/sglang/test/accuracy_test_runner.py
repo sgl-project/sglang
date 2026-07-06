@@ -8,6 +8,7 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     ModelLaunchSettings,
+    dump_metric,
     popen_launch_server,
     write_github_step_summary,
 )
@@ -29,6 +30,7 @@ class AccuracyTestParams:
     top_p: Optional[float] = None
     top_k: Optional[int] = None
     repeat: Optional[int] = None
+    api: Optional[str] = None  # "chat" or "completion"; defaults to "chat" in run_eval
 
 
 @dataclass
@@ -86,6 +88,7 @@ def _run_simple_eval(
     top_p: Optional[float] = None,
     top_k: Optional[int] = None,
     repeat: Optional[int] = None,
+    api: Optional[str] = None,
 ) -> Tuple[bool, Optional[str], Optional[dict]]:
     """Run evaluation using simple_eval backend (run_eval.py).
 
@@ -109,6 +112,9 @@ def _run_simple_eval(
             num_examples=num_examples,
             num_threads=num_threads or 1024,
         )
+
+        if api is not None:
+            args.api = api
 
         if max_tokens is not None:
             args.max_tokens = max_tokens
@@ -193,8 +199,11 @@ def _get_nemo_venv() -> Tuple[str, dict]:
             text=True,
         )
 
-    # Install nemo_skills
-    print("Installing nemo_skills...")
+    # Install nemo_skills.
+    # Pinned: NeMo-Skills main after PR #1433 pins litellm==1.83.14 (httpx==0.28.1),
+    # which is unsatisfiable against nemo-run's transitive leptonai dep.
+    nemo_skills_ref = "589294c"
+    print(f"Installing nemo_skills (pinned to {nemo_skills_ref})...")
     pip_result = subprocess.run(
         [
             "uv",
@@ -202,7 +211,7 @@ def _get_nemo_venv() -> Tuple[str, dict]:
             "install",
             "--python",
             f"{_nemo_venv_dir}/venv/bin/python",
-            "git+https://github.com/NVIDIA/NeMo-Skills.git",
+            f"git+https://github.com/NVIDIA/NeMo-Skills.git@{nemo_skills_ref}",
         ],
         capture_output=True,
         text=True,
@@ -421,6 +430,12 @@ def _run_nemo_skills_eval(
         if score is None:
             return False, "Could not parse accuracy from ns eval output", None
 
+        dump_metric(
+            f"{dataset}_score",
+            score,
+            labels={"model": model.model_path, "eval": dataset, "api": "nemo-skills"},
+        )
+
         return True, None, {"score": score}
 
     except subprocess.TimeoutExpired:
@@ -482,6 +497,7 @@ def run_accuracy_test(
             top_p=params.top_p,
             top_k=params.top_k,
             repeat=params.repeat,
+            api=params.api,
         )
 
     if not success:

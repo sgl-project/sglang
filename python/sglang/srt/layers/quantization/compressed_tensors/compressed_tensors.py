@@ -1,5 +1,6 @@
 # Adapted from https://github.com/vllm-project/vllm/tree/main/vllm/model_executor/layers/quantization/compressed_tensors
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from __future__ import annotations
 
 import logging
@@ -144,7 +145,7 @@ class CompressedTensorsConfig(QuantizationConfig):
     def get_scaled_act_names(self) -> List[str]:
         return []
 
-    def apply_weight_name_mapper(self, hf_to_sglang_mapper: "WeightsMapper"):
+    def apply_weight_name_mapper(self, hf_to_sglang_mapper: WeightsMapper):
         self.target_scheme_map = hf_to_sglang_mapper.apply_dict(self.target_scheme_map)
         self.ignore = hf_to_sglang_mapper.apply_list(self.ignore)
         self.sparsity_scheme_map = hf_to_sglang_mapper.apply_dict(
@@ -182,8 +183,9 @@ class CompressedTensorsConfig(QuantizationConfig):
                 use_flashinfer_trtllm_moe = (
                     get_moe_runner_backend().is_flashinfer_trtllm()
                 )
+                use_deep_gemm = get_moe_runner_backend().is_deep_gemm()
                 return UnquantizedFusedMoEMethod(
-                    use_triton_kernels, use_flashinfer_trtllm_moe
+                    use_triton_kernels, use_flashinfer_trtllm_moe, use_deep_gemm
                 )
             return CompressedTensorsFusedMoEMethod(self)
         return None
@@ -493,14 +495,16 @@ class CompressedTensorsConfig(QuantizationConfig):
         self, weight_quant: BaseModel, input_quant: BaseModel
     ) -> bool:
         input_quant_none = input_quant is None
-        is_symmetric = weight_quant.symmetric
         is_channel_group = (
             weight_quant.strategy == QuantizationStrategy.CHANNEL.value
             or weight_quant.strategy == QuantizationStrategy.GROUP.value
         )
         is_static = not weight_quant.dynamic
 
-        return is_channel_group and input_quant_none and is_symmetric and is_static
+        # Both symmetric and asymmetric weight quant are handled by
+        # CompressedTensorsWNA16 via the Marlin kernel path; asymmetric
+        # checkpoints carry a weight zero-point.
+        return is_channel_group and input_quant_none and is_static
 
     def _is_mxint4a16(self, weight_quant: BaseModel, input_quant: BaseModel) -> bool:
         input_quant_none = input_quant is None
@@ -552,6 +556,7 @@ class CompressedTensorsConfig(QuantizationConfig):
                     num_bits=weight_quant.num_bits,
                     strategy=weight_quant.strategy,
                     group_size=weight_quant.group_size,
+                    symmetric=weight_quant.symmetric,
                     actorder=weight_quant.actorder,
                 )
             else:
@@ -677,13 +682,24 @@ class CompressedTensorsConfig(QuantizationConfig):
                     logger.info_once(
                         "Using CompressedTensorsMxInt4MoE with flashinfer_trtllm backend"
                     )
-                    return CompressedTensorsMxInt4MoE(self)
+                    return CompressedTensorsMxInt4MoE(self, weight_quant=weight_quant)
                 elif _is_hip:
                     logger.info_once("Using CompressedTensorsWNA16TritonMoE (ROCm)")
-                    return CompressedTensorsWNA16TritonMoE(self)
+                    return CompressedTensorsWNA16TritonMoE(
+                        self, weight_quant=weight_quant
+                    )
                 else:
+                    moe_backend = get_moe_runner_backend()
+                    if moe_backend.is_triton():
+                        logger.info_once(
+                            "Using CompressedTensorsWNA16TritonMoE "
+                            "(moe_runner_backend=triton)"
+                        )
+                        return CompressedTensorsWNA16TritonMoE(
+                            self, weight_quant=weight_quant
+                        )
                     logger.info_once("Using CompressedTensorsWNA16MarlinMoEMethod")
-                    return CompressedTensorsWNA16MoE(self)
+                    return CompressedTensorsWNA16MoE(self, weight_quant=weight_quant)
             else:
                 if (
                     self._is_dynamic_token_w4(weight_quant, input_quant)
@@ -997,6 +1013,12 @@ class CompressedTensorsFusedMoEMethod(FusedMoEMethodBase):
     ):
         return layer.scheme.create_moe_runner(layer, moe_runner_config)
 
+    def get_triton_quant_info(self, layer: torch.nn.Module):
+        return layer.scheme.get_triton_quant_info(layer)
+
+    def get_marlin_quant_info(self, layer: torch.nn.Module):
+        return layer.scheme.get_marlin_quant_info(layer)
+
     def apply(
         self,
         layer: torch.nn.Module,
@@ -1008,7 +1030,6 @@ class CompressedTensorsFusedMoEMethod(FusedMoEMethodBase):
         layer input.  See LinearMethodBase for param details
 
         """
-
         scheme = layer.scheme
         if scheme is None:
             raise ValueError("A scheme must be defined for each layer")

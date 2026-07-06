@@ -1,16 +1,11 @@
 """Pytest configuration for E2E tests.
 
-Parallel Execution
-------------------
-Tests can run in parallel using pytest-parallel with shared worker processes.
-Use --workers 1 --tests-per-worker N for N concurrent test threads:
-
-    pytest --workers 1 --tests-per-worker 4 e2e_test/router/
-
-This leverages the thread-safe ModelPool and GPUAllocator classes to enable
-true shared-worker parallelism where all threads share the same session-scoped
-model_pool fixture. Tests marked with @pytest.mark.thread_unsafe will be
-automatically skipped in parallel mode.
+Tests run serially under plain pytest. ModelPool / GPUAllocator stay
+thread-safe so re-introducing parallelism (e.g. via pytest-xdist) is
+still a tractable option; pytest-parallel was previously used but its
+thread dispatch leaked fixture references and caused model_pool
+deadlocks. Tests marked ``@pytest.mark.thread_unsafe`` would be
+auto-skipped in any future parallel mode.
 
 Markers
 -------
@@ -130,8 +125,13 @@ _SRC = _ROOT / "bindings" / "python"
 if str(_E2E_TEST) not in sys.path:
     sys.path.insert(0, str(_E2E_TEST))
 
-# Add bindings/python to path if the wheel is not installed (for local development)
-_wheel_installed = find_spec("sglang_router.sglang_router_rs") is not None
+# Add bindings/python to path if the wheel is not installed (for local development).
+# find_spec raises ModuleNotFoundError when the parent package itself is absent,
+# which is the case in CI jobs that don't install the sglang_router wheel.
+try:
+    _wheel_installed = find_spec("sglang_router.sglang_router_rs") is not None
+except ModuleNotFoundError:
+    _wheel_installed = False
 
 if not _wheel_installed and str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))

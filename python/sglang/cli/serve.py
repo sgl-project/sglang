@@ -86,6 +86,10 @@ def serve(args, extra_argv):
             )
         return
 
+    from sglang.srt.plugins import load_plugins
+
+    load_plugins()
+
     model_type, dispatch_argv = _extract_model_type_override(extra_argv)
     model_path = get_model_path(dispatch_argv)
     try:

@@ -1,9 +1,13 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/model_executor/model_loader/runai_utils.py
 
 import hashlib
 import logging
 import os
 from pathlib import Path
+
+from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
 
@@ -24,12 +28,6 @@ SUPPORTED_SCHEMES = ["s3://", "gs://", "az://"]
 #     - Streams weights lazily during model loading
 
 #   This avoids file locks, race conditions, and duplicate downloads
-
-
-def get_cache_dir() -> str:
-    # Expand user path (~) to ensure absolute paths for locking
-    path = os.getenv("SGLANG_CACHE_DIR", "~/.cache/sglang/")
-    return os.path.expanduser(path)
 
 
 def list_safetensors(path: str = "") -> list[str]:
@@ -122,7 +120,7 @@ class ObjectStorageModel:
         Returns the local directory path.
         """
         model_hash = hashlib.sha256(str(model_path).encode()).hexdigest()[:16]
-        base_dir = get_cache_dir()
+        base_dir = envs.SGLANG_CACHE_DIR.get()
 
         # Ensure base cache dir exists
         os.makedirs(os.path.join(base_dir, "model_streamer"), exist_ok=True)

@@ -1,6 +1,7 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/mamba/ops/causal_conv1d.py
 # SPDX-License-Identifier: Apache-2.0
 
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Copyright (c) 2024, Tri Dao.
 # Adapted from https://github.com/Dao-AILab/causal-conv1d/blob/main/causal_conv1d/causal_conv1d_interface.py
 
@@ -95,6 +96,8 @@ def causal_conv1d_fn(
         x = x.contiguous()
     bias = bias.contiguous() if bias is not None else None
 
+    if cache_indices is not None and cache_indices.dtype != torch.int32:
+        cache_indices = cache_indices.to(torch.int32)
     causal_conv1d_fwd(
         x,
         weight,
@@ -161,6 +164,8 @@ def causal_conv1d_update(
     unsqueeze = x.dim() == 2
     if unsqueeze:
         x = x.unsqueeze(-1)
+    if conv_state_indices is not None and conv_state_indices.dtype != torch.int32:
+        conv_state_indices = conv_state_indices.to(torch.int32)
     causal_conv1d_update_kernel(
         x,
         conv_state,

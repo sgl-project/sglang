@@ -21,6 +21,7 @@ from typing import Dict, Iterable, List, Optional
 import torch
 
 from sglang.srt.configs.load_config import LoadConfig
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -35,6 +36,8 @@ from sglang.srt.lora.lora_config import LoRAConfig
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.lora.mem_pool import LoRAMemoryPool
 from sglang.srt.lora.utils import (
+    DSA_INDEXER_LORA_NAMES,
+    EMBEDDING_NAMES,
     LoRAType,
     auto_detect_lora_target_modules,
     get_normalized_target_modules,
@@ -45,6 +48,8 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import replace_submodule
 from sglang.srt.utils.hf_transformers_utils import AutoConfig
+
+_SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 
 logger = logging.getLogger(__name__)
 
@@ -66,7 +71,10 @@ class LoRAManager:
         lora_paths: Optional[List[LoRARef]] = None,
     ):
         self.base_model: torch.nn.Module = base_model
-        self.base_hf_config: AutoConfig = base_hf_config
+        if hasattr(base_hf_config, "get_text_config"):
+            self.base_hf_config: AutoConfig = base_hf_config.get_text_config()
+        else:
+            self.base_hf_config: AutoConfig = base_hf_config
         self.max_loras_per_batch: int = max_loras_per_batch
         self.load_config: LoadConfig = load_config
         self.dtype: torch.dtype = dtype
@@ -81,6 +89,10 @@ class LoRAManager:
         self.eviction_policy = server_args.lora_eviction_policy
         self._experts_shared_outer_override: Optional[bool] = (
             server_args.experts_shared_outer_loras
+        )
+        self.lora_use_virtual_experts: bool = server_args.lora_use_virtual_experts
+        self.lora_strict_loading: bool = getattr(
+            server_args, "lora_strict_loading", False
         )
 
         # LoRA backend for running sgemm kernels
@@ -112,6 +124,17 @@ class LoRAManager:
             max_bs_in_cuda_graph=max_bs_in_cuda_graph,
             num_tokens_per_bs=num_tokens_per_bs,
         )
+
+        # ===== TO BE REFACTORED ====
+        # Pre-create the experimental LoRA two-stream side stream now (gated) so the
+        # torch.cuda.Stream() call never lands inside a cuda-graph capture region.
+        if _SGLANG_EXPERIMENTAL_LORA_OPTI:
+            from sglang.srt.lora.trtllm_lora_temp import (
+                init_lora_two_stream_resources,
+            )
+
+            init_lora_two_stream_resources(self.device)
+        # ===== END TO BE REFACTORED ====
 
     def init_cuda_graph_moe_buffers(
         self, max_bs: int, max_loras: int, compute_dtype, moe_layer
@@ -183,7 +206,12 @@ class LoRAManager:
         """
         if lora_config.lora_added_tokens_size > 0:
             raise ValueError(
-                f"LoRA serving currently doesn't support adapters that add tokens to the vocabulary"
+                f"Failed to load {lora_ref.lora_name} because LoRA serving currently doesn't support adapters that add tokens to the vocabulary"
+            )
+
+        if lora_config.use_dora:
+            raise ValueError(
+                f"Failed to load {lora_ref.lora_name} because LoRA serving currently doesn't support DoRA adapters"
             )
 
         # Check if this LoRA adapter is already loaded
@@ -303,6 +331,8 @@ class LoRAManager:
         lora_ranks = [0] * self.max_loras_per_batch
         scalings = [0] * self.max_loras_per_batch
         for i, uid in enumerate(forward_batch.lora_ids):
+            if uid not in self.memory_pool.uid_to_buffer_id:
+                continue
             weight_indices[i] = self.memory_pool.get_buffer_id(uid)
             if uid is not None:
                 lora = self.loras[uid]
@@ -504,9 +534,19 @@ class LoRAManager:
     ):
         """Infer LoRA target modules and max_lora_rank from loaded adapters if not provided."""
 
-        self.target_modules = (
-            get_normalized_target_modules(target_modules) if target_modules else set()
-        )
+        if target_modules and target_modules == {"all"}:
+            self.target_modules = auto_detect_lora_target_modules(self.base_model)
+            self.target_modules.update(EMBEDDING_NAMES)
+            logger.info(
+                "CLI --lora-target-modules='all' resolved to %s "
+                "by inspecting the base model.",
+                sorted(self.target_modules),
+            )
+            target_modules = self.target_modules
+        elif target_modules:
+            self.target_modules = get_normalized_target_modules(target_modules)
+        else:
+            self.target_modules = set()
 
         for lora_id, config in self.configs.items():
             # Handle PEFT shorthand strings like "all-linear" or "all".
@@ -566,6 +606,21 @@ class LoRAManager:
                 # Otherwise, infer target_modules from adapter configs.
                 self.target_modules.update(adapter_target_modules)
 
+        # Fusion folds wk + weights_proj into wk_weights_proj, so the modules
+        # LoRA wraps are absent and an indexer-targeted adapter is silently dropped.
+        indexer_targets = self.target_modules & DSA_INDEXER_LORA_NAMES
+        if indexer_targets:
+            from sglang.srt.layers.attention.dsa.dsa_indexer import (
+                _use_dsa_indexer_fusion,
+            )
+
+            if _use_dsa_indexer_fusion:
+                raise ValueError(
+                    f"LoRA targets the DSA indexer ({sorted(indexer_targets)}), which is "
+                    "incompatible with DSA indexer Q/K fusion. Set "
+                    "SGLANG_DISABLE_DSA_INDEXER_FUSION=1 to disable fusion and use indexer LoRA."
+                )
+
         if max_lora_rank is not None:
             self.max_lora_rank = max_lora_rank
         else:
@@ -602,12 +657,9 @@ class LoRAManager:
             self.base_hf_config,
             self.load_config,
             self.lora_backend,
+            base_model=self.base_model,
         )
         lora_adapter.initialize_weights()
-
-        # If we want to overlap loading LoRA adapters with compute, they must be pinned in CPU memory
-        if self.enable_lora_overlap_loading:
-            lora_adapter.pin_weights_in_cpu()
 
         self.loras[lora_ref.lora_id] = lora_adapter
 
@@ -623,6 +675,7 @@ class LoRAManager:
             self.base_hf_config,
             self.load_config,
             self.lora_backend,
+            base_model=self.base_model,
         )
         lora_adapter.initialize_weights_from_tensors(tensors)
         self.loras[lora_ref.lora_id] = lora_adapter
@@ -679,6 +732,8 @@ class LoRAManager:
             eviction_policy=self.eviction_policy,
             lora_added_tokens_size=self.lora_added_tokens_size,
             experts_shared_outer_loras=self.experts_shared_outer_loras,
+            strict_loading=self.lora_strict_loading,
+            enable_lora_overlap_loading=self.enable_lora_overlap_loading,
         )
 
         # Initializing memory pool with base model
@@ -734,17 +789,9 @@ class LoRAManager:
                 self.base_model.lm_head = untied_lm_head
 
         for module_name, module in self.base_model.named_modules():
-            # TODO (lifuhuang): in the future, we should consider generalizing the
-            # should_apply_lora function to support mapping by full module name instead
-            # of just the last part (e.g., "qkv_proj") to support scenarios with multiple
-            # attention stacks (e.g., multimodal models).
-            # See: https://github.com/sgl-project/sglang/issues/6608
-            if getattr(
-                self.base_model, "should_apply_lora", None
-            ) and not self.base_model.should_apply_lora(module_name):
-                continue
-
-            # Check if module should be wrapped with LoRA
+            # Handle embed_tokens and lm_head before the should_apply_lora gate,
+            # since VL models' should_apply_lora patterns only match language
+            # model layers and would incorrectly skip these.
             # Handle embed_tokens
             if "embed_tokens" in module_name and "embed_tokens" in self.target_modules:
                 if isinstance(module, VocabParallelEmbedding) and not isinstance(
@@ -753,7 +800,6 @@ class LoRAManager:
                     lora_module = self.set_lora_module(module_name, module)
                     self.embed_tokens_module = lora_module
                     continue
-
             # Handle lm_head
             if "lm_head" in module_name and "lm_head" in self.target_modules:
                 if isinstance(module, ParallelLMHead) and not isinstance(
@@ -763,8 +809,31 @@ class LoRAManager:
                     self.lm_head_module = lora_module
                     continue
 
+            # Handle DeepSeek MLA fused projection: set the boundary
+            # between q_a and kv_a output partitions so the LoRA layer
+            # can apply separate B projections for each.
+            if (
+                "fused_qkv_a_proj_with_mqa" in self.target_modules
+                and module_name.endswith("fused_qkv_a_proj_with_mqa")
+            ):
+                from sglang.srt.lora.layers import ReplicatedLinearWithLoRA
+
+                layer_id = get_layer_id(module_name)
+                if layer_id is None:
+                    continue
+                lora_module = self.set_lora_module(module_name, module)
+                if isinstance(lora_module, ReplicatedLinearWithLoRA):
+                    q_lora_rank = getattr(self.base_hf_config, "q_lora_rank", None) or 0
+                    lora_module.first_output_dim = q_lora_rank
+                self.lora_modules[layer_id][module_name] = lora_module
+                continue
+
             # The module should be converted if it is included in target_names
-            if module_name.split(".")[-1] in self.target_modules:
+            parts = module_name.split(".")
+            if (
+                parts[-1] in self.target_modules
+                or ".".join(parts[-2:]) in self.target_modules
+            ):
                 layer_id = get_layer_id(module_name)
                 if layer_id is None:
                     continue
@@ -777,6 +846,13 @@ class LoRAManager:
                 x in self.target_modules for x in ["gate_up_proj", "down_proj"]
             ):
                 layer_id = get_layer_id(module_name)
+                if layer_id is None:
+                    # FusedMoE submodules outside the decoder layer hierarchy
+                    # (e.g. nested helpers under non-".layers." prefixes) have
+                    # no resolvable layer id; skip them so we don't index
+                    # `self.lora_modules` with `None`.
+                    continue
                 lora_module = self.set_lora_module(module_name, module)
                 lora_module.experts_shared_outer_loras = self.experts_shared_outer_loras
+                lora_module.lora_use_virtual_experts = self.lora_use_virtual_experts
                 self.lora_modules[layer_id][module_name] = lora_module
