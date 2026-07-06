@@ -103,6 +103,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_hip,
     is_npu,
+    is_xpu,
     make_layers,
     use_intel_amx_backend,
 )
@@ -124,6 +125,7 @@ _is_cuda = is_cuda()
 _is_cpu = is_cpu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_hip = is_hip()
+_is_xpu = is_xpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 
@@ -249,7 +251,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
 
         self.enable_shared_expert_fusion = False  # default to False
         if support_shared_expert_fusion and (
-            _use_aiter or (_is_cuda and enable_cuda_shared_expert_fusion)
+            _use_aiter or _is_xpu or (_is_cuda and enable_cuda_shared_expert_fusion)
         ):
             self.enable_shared_expert_fusion = (
                 self.num_shared_experts > 0
