@@ -1913,7 +1913,9 @@ class DeepseekV4Model(nn.Module):
                     )
                 else:
                     captured = hidden_states
-                captured = captured.mean(dim=1)
+                captured = self.hc_head(
+                    captured, self.hc_head_fn, self.hc_head_scale, self.hc_head_base
+                )
                 aux_hidden_states.append(captured)
         if use_fused and last_layer is not None:
             hidden_states = last_layer.hc_post(
