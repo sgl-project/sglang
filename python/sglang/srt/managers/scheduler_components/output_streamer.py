@@ -123,15 +123,23 @@ class SchedulerOutputStreamer:
         skip_req: Optional[Req] = None,
         is_idle_batch: bool = False,
     ):
-        return_hidden_states = any(
-            req.return_hidden_states for req in reqs if req is not skip_req
-        )
-        return_routed_experts = any(
-            req.return_routed_experts for req in reqs if req is not skip_req
-        )
-        return_indexer_topk = any(
-            req.return_indexer_topk for req in reqs if req is not skip_req
-        )
+        # Single pass to detect the three optional return flags. These are
+        # almost always all-False in steady-state decode, so three separate
+        # any() scans over the batch would each walk all reqs; fuse to one.
+        return_hidden_states = False
+        return_routed_experts = False
+        return_indexer_topk = False
+        for req in reqs:
+            if req is skip_req:
+                continue
+            if req.return_hidden_states:
+                return_hidden_states = True
+            if req.return_routed_experts:
+                return_routed_experts = True
+            if req.return_indexer_topk:
+                return_indexer_topk = True
+            if return_hidden_states and return_routed_experts and return_indexer_topk:
+                break
 
         acc = _GenerationStreamAccumulator(
             return_logprob=return_logprob,
@@ -144,6 +152,12 @@ class SchedulerOutputStreamer:
             default_force_stream_interval=DEFAULT_FORCE_STREAM_INTERVAL,
             get_cached_tokens_details=self.get_cached_tokens_details,
         )
+        # Hoist the time-stats logging predicate out of the per-req loop; when
+        # disabled (the common case) this avoids two attribute reads per req.
+        log_time_stats = (
+            self.ps.attn_tp_rank == 0
+            and self.server_args.enable_request_time_stats_logging
+        )
         for req in reqs:
             if req is skip_req:
                 continue
@@ -153,7 +167,8 @@ class SchedulerOutputStreamer:
                 continue
 
             acc.accept(req=req)
-            self._maybe_log_time_stats(req=req)
+            if log_time_stats and req.finished():
+                req.log_time_stats()
 
         # Send to detokenizer
         payload = acc.to_payload(
