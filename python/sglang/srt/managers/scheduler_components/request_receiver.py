@@ -28,9 +28,14 @@ from sglang.srt.managers.mm_utils import (
 )
 from sglang.srt.utils import (
     broadcast_pyobj,
+    broadcast_pyobj_frames,
     point_to_point_pyobj,
 )
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
+
+import pickle
+
+from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -82,6 +87,12 @@ class SchedulerRequestReceiver:
             if not self.recv_skipper.handle(self.get_last_forward_mode()):
                 return []
 
+        if self._raw_frame_fast_path_enabled():
+            recv_reqs = self._recv_requests_raw_frames()
+            recv_reqs = self._apply_mm_receiver(recv_reqs)
+            self._finalize_shm_features(recv_reqs)
+            return recv_reqs
+
         recv_reqs = self._pull_raw_reqs()
 
         if self.input_blocker is not None:
@@ -97,6 +108,70 @@ class SchedulerRequestReceiver:
         self._finalize_shm_features(recv_reqs)
 
         return recv_reqs
+
+    def _raw_frame_fast_path_enabled(self) -> bool:
+        # Opt-in, and only for the plain intra-node TP broadcast: no DP-attention,
+        # tp_size>1, no input_blocker (which needs deserialized objects on rank0),
+        # and not the EPD/mm-receiver rewrite path.  Under these conditions the
+        # only work done between recv and broadcast is None, so we can defer
+        # deserialization to after the broadcast and reuse the tokenizer's frames.
+        return (
+            envs.SGLANG_TP_RAW_FRAME_BROADCAST.get()
+            and not self.server_args.enable_dp_attention
+            and self.ps.tp_size != 1
+            and self.input_blocker is None
+            and not (
+                self.ps.pp_rank == 0
+                and self.server_args.language_only
+                and self.server_args.encoder_transfer_backend
+                in ["zmq_to_scheduler", "mooncake"]
+            )
+        )
+
+    def _recv_requests_raw_frames(self) -> List:
+        """Fast path for the plain intra-node TP broadcast.
+
+        Rank 0 pulls the raw pickle frames off the tokenizer (and rpc) sockets
+        without unpickling them, broadcasts the bytes to peer ranks with a
+        single serialization, and every rank ``pickle.loads`` each frame exactly
+        once.  This replaces the recv_pyobj (unpickle) + broadcast_pyobj
+        (re-pickle) round-trip on the source rank.
+
+        Safe because the fast path is only enabled when nothing between recv and
+        broadcast needs the deserialized objects on rank 0 (no input_blocker, no
+        DP-attention, not the EPD/mm-receiver rewrite path -- see
+        ``_raw_frame_fast_path_enabled``).  Control / rpc objects flow through
+        identically: they are picklable and are processed the same way after a
+        single ``pickle.loads`` on every rank.  Empty iterations cost exactly one
+        collective, matching the original ``broadcast_pyobj([])``.
+        """
+        src = self.tp_group.ranks[0]
+
+        if self.tp_group.rank == src:
+            frames: List[bytes] = []
+            while True:
+                try:
+                    if self.recv_limit_reached(len(frames)):
+                        break
+                    frames.append(self.recv_from_tokenizer.recv(zmq.NOBLOCK))
+                except zmq.ZMQError:
+                    break
+            if self.recv_from_rpc is not None:
+                while True:
+                    try:
+                        if self.recv_limit_reached(len(frames)):
+                            break
+                        frames.append(self.recv_from_rpc.recv(zmq.NOBLOCK))
+                    except zmq.ZMQError:
+                        break
+            broadcast_pyobj_frames(
+                frames, self.tp_group.rank, self.tp_cpu_group, src=src
+            )
+        else:
+            frames = broadcast_pyobj_frames(
+                [], self.tp_group.rank, self.tp_cpu_group, src=src
+            )
+        return [pickle.loads(f) for f in frames]
 
     def _pull_raw_reqs(self) -> Optional[List]:
         if self.ps.pp_rank == 0:

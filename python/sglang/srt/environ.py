@@ -317,6 +317,13 @@ class Envs:
     SGLANG_RETRACT_DECODE_STEPS = EnvInt(20)
     SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION = EnvInt(4096)
 
+    # Scheduler: TP request broadcast fast path.  When enabled, rank-0 pulls
+    # raw pickle frames off the tokenizer socket and broadcasts those bytes to
+    # peer TP ranks (single serialization), instead of unpickling then
+    # re-pickling in broadcast_pyobj.  Only fast-paths the common
+    # TokenizedGenerateReqInput work-request stream; falls back otherwise.
+    SGLANG_TP_RAW_FRAME_BROADCAST = EnvBool(False)
+
     # Scheduler: recv interval
     SGLANG_SCHEDULER_RECV_SKIPPER_WEIGHT_DEFAULT = EnvInt(1000)
     SGLANG_SCHEDULER_RECV_SKIPPER_WEIGHT_DECODE = EnvInt(1)
