@@ -180,6 +180,7 @@ from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.platforms import current_platform
+from sglang.srt.runtime_context import get_flags
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import (
     ServerArgs,
@@ -532,15 +533,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # only, so a draft init cannot clobber target-derived global state).
         if not self.is_draft_worker:
             set_global_server_args_for_scheduler(server_args)
-            # FIXME: hacky set `use_mla_backend`
-            get_global_server_args().use_mla_backend = self.use_mla_backend
 
         # Init OpenMP threads binding for CPU
         if self.device == "cpu":
             self.init_threads_binding()
 
         # Set float32 matmul precision
-        if server_args.enable_tf32_matmul:
+        if get_flags().enable_tf32_matmul:
             torch.set_float32_matmul_precision("high")
 
         # Get available memory before model loading.
@@ -2427,6 +2426,23 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         result = self._get_linear_attn_registry_result()
         return result[1] if result else None
 
+    def _record_kv_cache_dtype(self, resolved: str) -> None:
+        # Load-time resolution transition: the weight-resolved kv-cache dtype
+        # is declared into the flags tier; the dual-apply inside the helper
+        # replaces the legacy in-place write. Mock runners whose server_args
+        # is not the published object keep the plain write.
+        from sglang.srt.runtime_context import get_context
+
+        if get_context()._server_args is self.server_args:
+            from sglang.srt.arg_groups.overrides import declare_load_time_override
+
+            declare_load_time_override(
+                "ModelRunner.configure_kv_cache_dtype",
+                {"kv_cache_dtype": resolved},
+            )
+        else:
+            self.server_args.kv_cache_dtype = resolved
+
     def configure_kv_cache_dtype(self):
         if self.server_args.kv_cache_dtype == "auto":
             quant_config = getattr(self.model, "quant_config", None)
@@ -2435,16 +2451,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 isinstance(kv_cache_quant_algo, str)
                 and kv_cache_quant_algo.upper() == "FP8"
             ):
-                if _is_hip:
-                    self.kv_cache_dtype = fp8_dtype
-                    self.server_args.kv_cache_dtype = TORCH_DTYPE_TO_KV_CACHE_STR[
-                        self.kv_cache_dtype
-                    ]
-                else:
-                    self.kv_cache_dtype = torch.float8_e4m3fn
-                    self.server_args.kv_cache_dtype = TORCH_DTYPE_TO_KV_CACHE_STR[
-                        self.kv_cache_dtype
-                    ]
+                self.kv_cache_dtype = fp8_dtype if _is_hip else torch.float8_e4m3fn
+                self._record_kv_cache_dtype(
+                    TORCH_DTYPE_TO_KV_CACHE_STR[self.kv_cache_dtype]
+                )
             else:
                 self.kv_cache_dtype = self.dtype
         elif self.server_args.kv_cache_dtype == "fp8_e5m2":
@@ -2624,7 +2634,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         ):
             return
 
-        if self.device == "cpu" and not self.server_args.enable_torch_compile:
+        if self.device == "cpu" and not get_flags().capture.enable_torch_compile:
             return
 
         tic = time.perf_counter()
