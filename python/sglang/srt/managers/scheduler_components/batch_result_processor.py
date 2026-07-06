@@ -672,19 +672,26 @@ class SchedulerBatchResultProcessor:
 
         self.token_to_kv_pool_allocator.free_group_begin()
 
+        # Hoist per-batch invariants out of the per-req loop. At bs=256 these
+        # otherwise re-dispatch once per request per decode step.
+        is_spec = not batch.spec_algorithm.is_none()
+        enable_overlap = self.enable_overlap or self.enable_overlap_mlx
+        # think_end_id is None when the model has no reasoning parser; skip the
+        # per-req reasoning update entirely in that (common) case.
+        think_end_id = self.model_config.think_end_id
+        hidden_states = logits_output.hidden_states
+        spec_stride = result.speculative_num_draft_tokens if is_spec else None
+
         for i, req in enumerate(batch.reqs):
             req: Req
 
-            if (self.enable_overlap or self.enable_overlap_mlx) and (
-                req.finished() or req.is_retracted
-            ):
+            if enable_overlap and (req.finished() or req.is_retracted):
                 # NOTE: This (req.finished() or req.is_retracted) should only happen when overlap scheduling is enabled.
                 # And all the over-allocated tokens will be freed in `release_kv_cache`.
                 continue
 
             # Non-spec and Spec V2: full post-processing.
             next_token_id = next_token_ids[i]
-            is_spec = not batch.spec_algorithm.is_none()
 
             if not is_spec:
                 # Normal decode: a single sampled token.
@@ -697,7 +704,8 @@ class SchedulerBatchResultProcessor:
                 req.output_ids.extend(next_token_id)
                 new_accept_len = len(next_token_id)
 
-            self._maybe_update_reasoning_tokens(req, next_token_id)
+            if think_end_id is not None and req.require_reasoning:
+                req.update_reasoning_tokens(next_token_id, think_end_id)
             req.time_stats.set_last_decode_finish_time()
             req.update_finish_state(new_accept_len)
 
@@ -713,20 +721,19 @@ class SchedulerBatchResultProcessor:
                     logits_output=logits_output,
                 )
 
-            if req.return_hidden_states and logits_output.hidden_states is not None:
+            if req.return_hidden_states and hidden_states is not None:
                 if not is_spec:
                     req.hidden_states.append(
-                        logits_output.hidden_states[i].cpu().clone().tolist()
+                        hidden_states[i].cpu().clone().tolist()
                     )
                 else:
                     # Spec V2: hidden_states is [bs * speculative_num_draft_tokens, hidden_dim].
                     # One row per emitted token; next_token_id is already truncated
                     # at grammar termination, so this stays aligned with output_ids.
-                    stride = result.speculative_num_draft_tokens
                     accept_len = len(next_token_id)
-                    start = i * stride
+                    start = i * spec_stride
                     req.hidden_states.extend(
-                        logits_output.hidden_states[start : start + accept_len]
+                        hidden_states[start : start + accept_len]
                         .cpu()
                         .clone()
                         .tolist()

@@ -819,6 +819,12 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
                 )
 
     def set_last_decode_finish_time(self, ts=None):
+        # Fast path: with metrics and tracing both disabled, last_decode_finish_time
+        # is write-only (its sole reader is the guarded block below), so skip the
+        # perf_counter() call and the attribute write entirely. This runs once per
+        # request per decode step at bs=256, so avoiding the syscall matters.
+        if not (self.enable_metrics or self.trace_ctx.tracing_enable):
+            return
         ts = ts or time.perf_counter()
         last_time = self.last_decode_finish_time
         self.last_decode_finish_time = ts
