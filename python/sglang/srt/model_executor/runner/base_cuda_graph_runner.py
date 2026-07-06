@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING, Any, List, Sequence, Tuple
 
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.runner.base_runner import BaseRunner
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_flags, get_parallel
 from sglang.srt.utils import require_gathered_buffer
 
 if TYPE_CHECKING:
@@ -108,7 +108,7 @@ def get_batch_sizes_to_capture(
     assert len(capture_bs) > 0 and capture_bs[0] > 0, f"{capture_bs=}"
     compile_bs = (
         [bs for bs in capture_bs if bs <= server_args.torch_compile_max_bs]
-        if server_args.enable_torch_compile
+        if get_flags().capture.enable_torch_compile
         else []
     )
     return capture_bs, compile_bs

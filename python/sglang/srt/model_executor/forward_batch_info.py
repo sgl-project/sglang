@@ -45,7 +45,6 @@ from sglang.srt.layers.dp_attention import (
     set_dp_buffer_len,
     set_is_extend_in_batch,
 )
-from sglang.srt.layers.utils.dcp_utils import DecodeContextParallelMetadata
 from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
     ForwardBatchDeepSeekMHAMixin,
 )
@@ -61,6 +60,7 @@ from sglang.srt.utils import (
 from sglang.srt.utils.common import ceil_align, is_pin_memory_available
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
     from sglang.srt.layers.utils.cp_utils import ContextParallelMetadata
     from sglang.srt.managers.schedule_batch import MultimodalInputs, ScheduleBatch
@@ -430,8 +430,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For hidden states before normal
     return_hidden_states_before_norm: bool = False
 
-    # For NSA/DSA topk_indices reuse across forward calls (e.g., EAGLE draft)
-    topk_indices: Optional[torch.Tensor] = None
+    # Gate for reusing the first MTP draft step's indexer topk across steps;
+    # the carried topk lives on spec_info (see EagleDraftInput.mtp_topk_indices).
     reuse_mtp_topk_indices: Optional[bool] = False
 
     # === Forward-derived (built in init_new on the forward stream; FB-owned) ===
@@ -504,7 +504,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     attn_cp_metadata: Optional[ContextParallelMetadata] = None
 
-    # For decode context parallel
+    # For decode context parallel.
+    # NOTE: DecodeContextParallelMetadata is imported under TYPE_CHECKING only (see the
+    # import block above) — available for annotations but NOT bound at runtime in this
+    # module. Import it from sglang.srt.layers.dcp.metadata if a runtime use is added.
     attn_dcp_metadata: Optional[DecodeContextParallelMetadata] = None
 
     # Decode context parallel KV write mask.
@@ -1475,6 +1478,7 @@ def build_inner_fb_view(
         seq_lens_cpu=forward_batch.seq_lens_cpu,
         encoder_lens=encoder_lens,
         out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
+        out_cache_loc_dsv4=getattr(forward_batch, "out_cache_loc_dsv4", None),
         spec_info=forward_batch.spec_info,
     )
 
