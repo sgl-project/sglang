@@ -72,14 +72,6 @@ class MLXRMSNormWrapper(nn.Module):
         )
 
     def __call__(self, x: mx.array) -> mx.array:
-        # TODO(human): the dispatch.
-        #   1. If not self._supported(x): return self._inner(x)   # fallback path
-        #      (this is mx.fast.rms_norm via the original module).
-        #   2. Otherwise the kernel wants 2-D [rows, hidden]. Flatten the leading
-        #      dims: rows = x.reshape(-1, x.shape[-1]).
-        #   3. Call the kernel:
-        #        y = self._kernel(rows, self._inner.weight, eps=float(self._inner.eps))
-        #   4. Restore the original shape: return y.reshape(x.shape).
         if not self._supported(x):
             return self._inner(x)
         rows = x.reshape(-1, x.shape[-1])
