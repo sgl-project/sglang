@@ -244,6 +244,7 @@ if docker exec ci_sglang test -d /sgl-workspace/mori; then
     else
       # MORI's setup.py defaults BUILD_UMBP=ON, which requires gRPC headers not
       # shipped by the base image. Install them before cmake runs.
+      apt-get update
       apt-get install -y --no-install-recommends libgrpc++-dev 2>/dev/null || true
       # Fix for ROCm SDK: add find_package(NUMA) before hsakmt
       sed -i '/find_package(hsa-runtime64 REQUIRED)/i find_package(NUMA REQUIRED)' src/application/CMakeLists.txt; \
