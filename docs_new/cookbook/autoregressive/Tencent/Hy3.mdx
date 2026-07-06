@@ -163,24 +163,24 @@ import { Playground } from "/src/snippets/_playground.jsx";
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>B200</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>180GB</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>4</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>BF16 590GB → 148GB/GPU; pass <code>--attention-backend trtllm_mha</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>BF16 590GB → 148GB/GPU</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>B300 / GB300</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>272GB</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>4</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>pass <code>--attention-backend trtllm_mha</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>BF16 590GB → 148GB/GPU; ample KV headroom</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>GB200</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>192GB</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>4</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>single-node 4×192GB = 768GB fits BF16; pass <code>--attention-backend trtllm_mha</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>single-node 4×192GB = 768GB fits BF16 590GB</td>
     </tr>
   </tbody>
 </table>
 
-**Blackwell attention backend.** The auto-selected attention backend can mis-route for HYV3 on Blackwell (B200 / B300 / GB200 / GB300). Always pass `--attention-backend trtllm_mha` explicitly on Blackwell hardware — the config generator above enforces this.
+**Blackwell attention backend.** On SM100/SM103 (B200 / B300 / GB200 / GB300), SGLang auto-selects the `trtllm_mha` attention backend for HYV3's MHA architecture (no flag needed) — the launch commands above omit it for that reason. Override only if you have a specific kernel reason.
 
 **MTP (Multi-Token Prediction, EAGLE).**
 
