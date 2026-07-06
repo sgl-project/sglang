@@ -7,22 +7,29 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang.srt.configs.model_config import AttentionArch
-from sglang.srt.layers import dp_attention as _dp_attention
 from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool, ReqToTokenPool
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    CudaGraphConfig,
+    PhaseConfig,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.forward_context import (
     ForwardContext,
     forward_context,
     get_token_to_kv_pool,
 )
+from sglang.srt.model_executor.graph_shared_output import GraphSharedOutput
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import set_global_server_args_for_scheduler
 
 from ..mock_server_args import make_mock_server_args
 
-_dp_attention.get_attention_tp_size = lambda: 1
+_parallel_override = get_parallel().override(attn_tp_size=1)
+_parallel_override.__enter__()
 
 DEFAULT_HIDDEN_SIZE = 64
 DEFAULT_KV_LORA_RANK = 32
@@ -172,6 +179,7 @@ class TinyMLAModelConfig:
         self.is_encoder_decoder = False
         self.is_multimodal = False
         self.is_generation = True
+        self.quantization = None
         self.is_hybrid_swa = False
         self.is_local_attention_model = False
         self.attention_chunk_size = None
@@ -231,15 +239,25 @@ class MockMLAModelRunner(ModelRunner):
         speculative_num_draft_tokens = (
             max(case.input_lens)
             if case.forward_mode.is_target_verify()
-            or case.forward_mode.is_draft_extend(include_v2=True)
+            or case.forward_mode.is_draft_extend_v2()
             else 0
         )
         self.server_args = make_mock_server_args(
             attention_backend=case.backend,
             chunked_prefill_size=-1,
-            disable_cuda_graph=disable_cuda_graph,
+            cuda_graph_config=CudaGraphConfig(
+                decode=PhaseConfig(
+                    backend=Backend.DISABLED if disable_cuda_graph else Backend.FULL,
+                ),
+                prefill=PhaseConfig(
+                    backend=(
+                        Backend.DISABLED
+                        if (disable_cuda_graph or disable_piecewise_cuda_graph)
+                        else Backend.TC_PIECEWISE
+                    ),
+                ),
+            ),
             disable_chunked_prefix_cache=True,
-            disable_piecewise_cuda_graph=disable_piecewise_cuda_graph,
             disable_radix_cache=False,
             disaggregation_mode=None,
             dllm_algorithm=None,
@@ -290,6 +308,12 @@ class MockMLAModelRunner(ModelRunner):
         self.sliding_window_size = None
         self.use_mla_backend = True
         self.is_draft_worker = False
+        self._kernel_warmed_up = True
+        # Runner-mode helpers mutate speculative graph sizes after construction.
+        self.graph_shared_output = GraphSharedOutput(
+            device=self.device,
+            max_rows=pool_batch_size * max_context_len,
+        )
 
     @property
     def hybrid_gdn_config(self):

@@ -11,8 +11,6 @@ from transformers import PretrainedConfig
 
 from sglang.srt.distributed import (
     get_pp_group,
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -22,8 +20,6 @@ from sglang.srt.layers.attention.fla.layernorm_gated import RMSNorm as RMSNormGa
 from sglang.srt.layers.attention.fla.layernorm_gated import layernorm_fn
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.dp_attention import (
-    get_attention_tp_rank,
-    get_attention_tp_size,
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layernorm import RMSNorm
@@ -57,11 +53,12 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA, DeepseekV2MLP, _is_hip
 from sglang.srt.models.utils import WeightsMapper
+from sglang.srt.runtime_context import get_flags, get_parallel
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     BumpAllocator,
@@ -251,8 +248,8 @@ class BailingMoE(nn.Module):
         self.alt_stream = alt_stream
         self.layer_id = layer_id
 
-        self.tp_size = get_tensor_model_parallel_world_size()
-        self.tp_rank = get_tensor_model_parallel_rank()
+        self.tp_size = get_parallel().tp_size
+        self.tp_rank = get_parallel().tp_rank
 
         self.top_k = config.num_experts_per_tok
         self.norm_expert_prob = getattr(config, "norm_topk_prob", False)
@@ -406,8 +403,8 @@ class BailingGroupRMSNormGate(RMSNormGated):
         param: torch.nn.Parameter,
         loaded_weight: torch.Tensor,
     ) -> None:
-        tp_size = get_attention_tp_size()
-        tp_rank = get_attention_tp_rank()
+        tp_size = get_parallel().attn_tp_size
+        tp_rank = get_parallel().attn_tp_rank
         shard_size = loaded_weight.shape[0] // tp_size
         shard = slice(tp_rank * shard_size, (tp_rank + 1) * shard_size)
         param.data.copy_(loaded_weight[shard].contiguous())
@@ -437,8 +434,8 @@ class BailingMoELinearAttention(nn.Module):
 
         self.hidden_inner_size = self.head_dim * self.total_num_heads
         self.scaling = self.head_dim**-0.5
-        self.tp_size = get_attention_tp_size()
-        self.tp_rank = get_attention_tp_rank()
+        self.tp_size = get_parallel().attn_tp_size
+        self.tp_rank = get_parallel().attn_tp_rank
 
         assert self.total_num_heads % self.tp_size == 0
         self.tp_heads = self.total_num_heads // self.tp_size
@@ -642,7 +639,7 @@ class BailingMoEAttention(nn.Module):
         self.layer_id = layer_id
 
         self.hidden_size = config.hidden_size
-        tp_size = get_attention_tp_size()
+        tp_size = get_parallel().attn_tp_size
         self.total_num_heads = config.num_attention_heads
         assert self.total_num_heads % tp_size == 0
         self.num_heads = self.total_num_heads // tp_size
@@ -1092,7 +1089,7 @@ class BailingMoELinearForCausalLM(nn.Module):
                     config.hidden_size,
                     params_dtype=torch.float32,
                     quant_config=quant_config,
-                    use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+                    use_attn_tp_group=get_flags().enable_dp_lm_head,
                 )
             )
             self.logits_processor = LogitsProcessor(config)

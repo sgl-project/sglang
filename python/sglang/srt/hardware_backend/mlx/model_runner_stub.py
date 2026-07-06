@@ -77,6 +77,22 @@ class MlxModelRunnerStub(ModelRunner):
     the minimal bookkeeping pools needed by the scheduler are created.
     """
 
+    # No KV canary on the MLX path. The base ModelRunner installs it via
+    # install_canary() in its full initialize(), which this lightweight override
+    # skips. Downstream consumers (scheduler, cuda graph runner, speculative
+    # workers) all guard with `canary_manager is not None`, so default to None
+    # as a class attribute to keep those checks working instead of raising
+    # AttributeError.
+    canary_manager = None
+
+    # No prefill-aware SWA on the MLX path. The base ModelRunner derives this in
+    # its full initialize() from `model.is_prefill_aware_swa()`, which this
+    # lightweight override skips (and `_DummyModel` does not implement). The
+    # scheduler reads `model_runner.prefill_aware_swa` unconditionally when
+    # admitting a prefill batch, so default to False as a class attribute to keep
+    # that path working instead of raising AttributeError.
+    prefill_aware_swa = False
+
     def __init__(self, *args, mlx_pool_size: int | None = None, **kwargs):
         self._mlx_pool_size = mlx_pool_size
         super().__init__(*args, **kwargs)
@@ -103,7 +119,7 @@ class MlxModelRunnerStub(ModelRunner):
         self.dtype = self.model_config.dtype
         self.weight_load_mem_usage = 0
 
-    def initialize(self, pre_model_load_memory: float):
+    def initialize(self):
         """Lightweight initialize that skips heavy PyTorch setup.
 
         Creates minimal req_to_token_pool and token_to_kv_pool_allocator
@@ -178,7 +194,7 @@ class MlxModelRunnerStub(ModelRunner):
         )
 
         # No CUDA graphs, no attention backend
-        self.graph_runner = None
+        self.decode_cuda_graph_runner = None
         self.graph_mem_usage = 0
         self.attn_backend = None
 
@@ -188,3 +204,7 @@ class MlxModelRunnerStub(ModelRunner):
             f"max_running_requests={self.max_running_requests}, "
             f"zero GPU KV cache allocation)"
         )
+
+    def alloc_memory_pool(self, memory_pool_config=None):
+        """No-op: MLX manages its own KV cache."""
+        pass
