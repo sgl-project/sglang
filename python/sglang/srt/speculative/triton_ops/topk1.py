@@ -66,11 +66,19 @@ def _draft_topk1_finalize_kernel(
 @triton.jit
 def _select_top_k_tokens_topk1_later_kernel(
     topk_p,
+    topk_index,
+    first_topk_index,
     scores,
     out_scores,
     parents,
+    draft_tokens,
     parent_id: tl.constexpr,
     n_elements: tl.constexpr,
+    topk_index_stride: tl.constexpr,
+    first_topk_index_stride: tl.constexpr,
+    draft_tokens_stride: tl.constexpr,
+    WRITE_DRAFT_TOKENS: tl.constexpr,
+    WRITE_FIRST_DRAFT_TOKEN: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
@@ -80,6 +88,23 @@ def _select_top_k_tokens_topk1_later_kernel(
     )
     tl.store(out_scores + offsets, next_scores, mask=mask)
     tl.store(parents + offsets, parent_id, mask=mask)
+    if WRITE_DRAFT_TOKENS:
+        tokens = tl.load(topk_index + offsets * topk_index_stride, mask=mask)
+        tl.store(
+            draft_tokens + offsets * draft_tokens_stride + parent_id,
+            tokens,
+            mask=mask,
+        )
+        if WRITE_FIRST_DRAFT_TOKEN:
+            first_tokens = tl.load(
+                first_topk_index + offsets * first_topk_index_stride,
+                mask=mask,
+            )
+            tl.store(
+                draft_tokens + offsets * draft_tokens_stride,
+                first_tokens,
+                mask=mask,
+            )
 
 
 def select_top_k_tokens_topk1_later(
@@ -88,11 +113,15 @@ def select_top_k_tokens_topk1_later(
     topk_index: torch.Tensor,
     hidden_states: torch.Tensor,
     scores: torch.Tensor,
+    draft_tokens: torch.Tensor | None = None,
+    first_topk_index: torch.Tensor | None = None,
 ):
     input_ids = topk_index.flatten()
     n_elements = topk_index.numel()
     next_scores = torch.empty_like(scores)
     parents = torch.empty_like(topk_index)
+    write_draft_tokens = draft_tokens is not None
+    write_first_draft_token = write_draft_tokens and first_topk_index is not None
     if n_elements == 0:
         return input_ids, hidden_states, next_scores, (
             next_scores.unsqueeze(1),
@@ -103,11 +132,19 @@ def select_top_k_tokens_topk1_later(
     grid = (triton.cdiv(n_elements, _SELECT_TOPK1_BLOCK),)
     _select_top_k_tokens_topk1_later_kernel[grid](
         topk_p,
+        topk_index,
+        first_topk_index if write_first_draft_token else topk_index,
         scores,
         next_scores,
         parents,
+        draft_tokens if write_draft_tokens else topk_index,
         i,
         n_elements,
+        topk_index.stride(0),
+        first_topk_index.stride(0) if write_first_draft_token else 0,
+        draft_tokens.stride(0) if write_draft_tokens else 0,
+        write_draft_tokens,
+        write_first_draft_token,
         BLOCK=_SELECT_TOPK1_BLOCK,
     )
     tree_info = (

@@ -601,6 +601,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         if self.hot_token_id is not None:
             topk_index = self.hot_token_id[topk_index]
+        # Old topk=1 materialized all token columns with one post-loop cat.
+        # The fast path saves the seed token so the i=1 selector can write
+        # columns 0 and 1, avoiding a separate i=0 store launch.
+        first_topk_index = topk_index
 
         out_cache_loc = per_step_draft_out_cache_loc(
             out_cache_loc,
@@ -616,6 +620,22 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         if self.server_args.speculative_use_rejection_sampling:
             draft_probs_list: List[torch.Tensor] = [spec_info.draft_probs]
 
+        # CUDA topk=1 writes draft token columns inside later selection kernels.
+        # None keeps the generic path, which still uses token_list + cat.
+        draft_tokens_topk1 = None
+        if (
+            self.topk == 1
+            and _is_cuda
+            and self.speculative_num_steps > 1
+            and self._topk1_parents_prealloc is not None
+            and topk_index.shape[0] <= self._topk1_parents_prealloc.shape[0]
+        ):
+            draft_tokens_topk1 = torch.empty(
+                (topk_index.shape[0], self.speculative_num_steps),
+                dtype=topk_index.dtype,
+                device=topk_index.device,
+            )
+
         # Forward multiple steps
         scores = None
         if self.index_share_for_mtp_iteration:
@@ -623,11 +643,20 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             spec_info.mtp_topk_indices = None
         for i in range(self.speculative_num_steps):
             input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
-                i, topk_p, topk_index, hidden_states, scores, self.topk
+                i,
+                topk_p,
+                topk_index,
+                hidden_states,
+                scores,
+                self.topk,
+                draft_tokens_topk1,
+                first_topk_index if i == 1 else None,
             )
-            score_list.append(tree_info[0])
-            token_list.append(tree_info[1])
-            parents_list.append(tree_info[2])
+            if draft_tokens_topk1 is None:
+                # Generic topk still accumulates lists for organize_draft_results.
+                score_list.append(tree_info[0])
+                token_list.append(tree_info[1])
+                parents_list.append(tree_info[2])
 
             # We don't need to run the last forward. we get 1 token from draft prefill and (#spec steps - 1) tokens here
             if i == self.speculative_num_steps - 1:
@@ -708,6 +737,17 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             forward_batch.reuse_mtp_topk_indices = False
 
         # Organize the results
+        if draft_tokens_topk1 is not None:
+            bs = draft_tokens_topk1.shape[0]
+            top_scores_index = self._topk1_score_indices_prealloc[:bs]
+            parent_list = self._topk1_parents_prealloc[:bs]
+            draft_probs = (
+                torch.stack(draft_probs_list, dim=1)
+                if self.server_args.speculative_use_rejection_sampling
+                else None
+            )
+            return parent_list, top_scores_index, draft_tokens_topk1, draft_probs
+
         if (
             self.topk == 1
             and token_list[0].shape[0] <= self._topk1_parents_prealloc.shape[0]
