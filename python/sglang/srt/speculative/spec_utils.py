@@ -64,9 +64,6 @@ if TYPE_CHECKING:
 
 if _is_cuda:
     from sgl_kernel import fast_topk
-    from sglang.srt.speculative.triton_ops.topk1 import (
-        select_top_k_tokens_topk1_later as _select_top_k_tokens_topk1_later_triton,
-    )
 elif _is_hip:
     from sgl_kernel import fast_topk
 else:
@@ -271,21 +268,9 @@ def select_top_k_tokens(
     hidden_states: torch.Tensor,
     scores: torch.Tensor,
     topk: int,
-    draft_tokens: Optional[torch.Tensor] = None,
-    first_topk_index: Optional[torch.Tensor] = None,
 ):
     if i == 0:
         return _select_top_k_tokens_first(topk_p, topk_index, hidden_states, topk)
-    if topk == 1 and _is_cuda:
-        return _select_top_k_tokens_topk1_later_triton(
-            i,
-            topk_p,
-            topk_index,
-            hidden_states,
-            scores,
-            draft_tokens,
-            first_topk_index,
-        )
     return _select_top_k_tokens_later(
         i, topk_p, topk_index, hidden_states, scores, topk
     )
