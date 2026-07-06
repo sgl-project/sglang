@@ -10,6 +10,7 @@ import logging
 import os
 import socket
 import threading
+import time
 from typing import Any, List, Optional
 
 import torch
@@ -20,6 +21,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageExtraInfo,
 )
 from sglang.srt.mem_cache.memory_pool_host import HostKVCache
+from sglang.srt.observability.metrics_collector import StorageMetrics
 
 logger = logging.getLogger(__name__)
 
@@ -250,12 +252,14 @@ class UMBPStore(HiCacheStorage):
             self.pp_rank = storage_config.pp_rank
             self.pp_size = storage_config.pp_size
             self.tp_size = storage_config.tp_size
+            self.enable_storage_metrics = storage_config.enable_storage_metrics
         else:
             self.is_mla_backend = False
             self.local_rank = 0
             self.pp_rank = 0
             self.pp_size = 1
             self.tp_size = 1
+            self.enable_storage_metrics = False
 
         cfg = UMBPConfig.from_environment()
         # UMBPStore owns role selection explicitly. Do not inherit LOCAL_RANK /
@@ -809,6 +813,15 @@ class UMBPStore(HiCacheStorage):
             else:
                 self.mha_suffix = [f"{rank}" for rank in target_ranks]
 
+        # Storage bandwidth metrics (mirrors MooncakeStore / HiCacheHF3FS):
+        # one GB/s sample is appended per batch_get_v1 (L3->L2 prefetch) and
+        # batch_set_v1 (L2->L3 backup); get_stats() drains them into the
+        # sglang:prefetch_bandwidth / sglang:backup_bandwidth histograms.
+        self.prefetch_pgs: List[int] = []
+        self.backup_pgs: List[int] = []
+        self.prefetch_bandwidth: List[float] = []
+        self.backup_bandwidth: List[float] = []
+
         logger.info(
             "UMBPStore initialized: dram=%d MB, ssd=%s, mla=%s, rank=%d, ssd_backend=%s",
             cfg.dram.capacity_bytes // (1024 * 1024),
@@ -1025,13 +1038,28 @@ class UMBPStore(HiCacheStorage):
             len(key_strs),
             total_bytes,
         )
+        start_time = time.perf_counter()
         get_results = self.client.batch_get_into_ptr(key_strs, list(buffer_ptrs), sizes)
+        end_time = time.perf_counter()
         success_count = sum(1 for r in get_results if r)
         logger.debug(
             "[UMBPStore] batch_get_v1: UMBP BatchGet done: success=%d/%d",
             success_count,
             len(get_results),
         )
+
+        if self.enable_storage_metrics:
+            elapsed = end_time - start_time
+            if elapsed > 0:
+                # Effective L3-get bandwidth: in distributed mode a BatchGet may
+                # resolve to local DRAM or an RDMA hop to a peer, so this is the
+                # blended delivered GB/s, not pure wire speed. total_bytes is the
+                # exact summed transfer size (layout-aware), which UMBP already
+                # computes; we deliberately do not reuse get_ksize_per_token()
+                # (over-counts for NSA, see dram_page_size note above).
+                self.prefetch_pgs.append(len(keys))
+                self.prefetch_bandwidth.append(total_bytes / (1 << 30) / elapsed)
+
         return self._batch_postprocess(get_results)
 
     def _compute_expanded_depths(
@@ -1097,6 +1125,7 @@ class UMBPStore(HiCacheStorage):
             bool(expanded_depths),
         )
 
+        start_time = time.perf_counter()
         if expanded_depths:
             put_results = self.client.batch_put_from_ptr_with_depth(
                 key_strs, list(buffer_ptrs), sizes, expanded_depths
@@ -1105,6 +1134,7 @@ class UMBPStore(HiCacheStorage):
             put_results = self.client.batch_put_from_ptr(
                 key_strs, list(buffer_ptrs), sizes
             )
+        end_time = time.perf_counter()
 
         success_count = sum(1 for r in put_results if r)
         logger.debug(
@@ -1112,6 +1142,15 @@ class UMBPStore(HiCacheStorage):
             success_count,
             len(put_results),
         )
+
+        if self.enable_storage_metrics:
+            elapsed = end_time - start_time
+            if elapsed > 0:
+                # Effective L3-put bandwidth (blended local DRAM / peer RDMA),
+                # from the exact summed transfer size. See batch_get_v1 note.
+                self.backup_pgs.append(len(keys))
+                self.backup_bandwidth.append(total_bytes / (1 << 30) / elapsed)
+
         return self._batch_postprocess(put_results, is_set_operate=True)
 
     def batch_exists(
@@ -1213,6 +1252,18 @@ class UMBPStore(HiCacheStorage):
         if self.client is None or not hasattr(self.client, "flush"):
             return True
         return bool(self.client.flush())
+
+    def get_stats(self):
+        storage_metrics = StorageMetrics()
+        storage_metrics.prefetch_pgs.extend(self.prefetch_pgs)
+        storage_metrics.backup_pgs.extend(self.backup_pgs)
+        storage_metrics.prefetch_bandwidth.extend(self.prefetch_bandwidth)
+        storage_metrics.backup_bandwidth.extend(self.backup_bandwidth)
+        self.prefetch_pgs.clear()
+        self.backup_pgs.clear()
+        self.prefetch_bandwidth.clear()
+        self.backup_bandwidth.clear()
+        return storage_metrics
 
     def close(self) -> None:
         if getattr(self, "_kv_events_subscriber", None) is not None:
