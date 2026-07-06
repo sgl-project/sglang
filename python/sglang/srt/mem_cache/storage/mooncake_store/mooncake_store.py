@@ -86,7 +86,7 @@ def _parse_global_segment_size(value) -> int:
 def _normalize_tenant_id(value) -> str:
     if value is None:
         return DEFAULT_TENANT_ID
-    tenant_id = str(value)
+    tenant_id = str(value).strip()
     return tenant_id if tenant_id else DEFAULT_TENANT_ID
 
 

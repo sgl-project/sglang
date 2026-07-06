@@ -96,10 +96,18 @@ class TestMooncakeTenantConfig(unittest.TestCase):
         cfg = MooncakeStoreConfig.load_from_extra_config(
             {
                 "master_server_address": "127.0.0.1:50051",
-                "tenant_id": "tenant-extra",
+                "tenant_id": "  tenant-extra  ",
             }
         )
         self.assertEqual(cfg.tenant_id, "tenant-extra")
+
+        cfg = MooncakeStoreConfig.load_from_extra_config(
+            {
+                "master_server_address": "127.0.0.1:50051",
+                "tenant_id": "   ",
+            }
+        )
+        self.assertEqual(cfg.tenant_id, DEFAULT_TENANT_ID)
 
         cfg = MooncakeStoreConfig.load_from_extra_config(
             {
