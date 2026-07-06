@@ -100,7 +100,6 @@ tracing = [
 test = [
   "accelerate",
   "bitsandbytes",
-  "pymupdf",
   "expecttest",
   "jsonlines",
   "lm-eval[api]>=0.4.9.2",
