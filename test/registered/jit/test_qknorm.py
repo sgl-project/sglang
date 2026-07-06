@@ -6,10 +6,13 @@ import torch
 import triton
 
 from sglang.jit_kernel.utils import get_ci_test_range
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=37, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_cuda_ci(est_time=148, suite="nightly-kernel-1-gpu", nightly=True)
+# test_qknorm compares the sgl_kernel AOT rmsnorm against the JIT kernel (both
+# available on ROCm); the flashinfer_qknorm helper below is unused by the test.
+register_amd_ci(est_time=37, suite="jit-kernel-unit-test-amd")
 
 
 def sglang_aot_qknorm(

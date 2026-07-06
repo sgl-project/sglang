@@ -5,10 +5,11 @@ import torch
 import triton
 
 from sglang.jit_kernel.utils import get_ci_test_range
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=64, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_cuda_ci(est_time=256, suite="nightly-kernel-1-gpu", nightly=True)
+register_amd_ci(est_time=64, suite="jit-kernel-unit-test-amd")
 
 DEVICE = "cuda"
 DTYPE = torch.bfloat16
@@ -62,7 +63,13 @@ def flashinfer_rope(
     positions: torch.Tensor,
     is_neox: bool,
 ) -> None:
-    from flashinfer.rope import apply_rope_with_cos_sin_cache_inplace
+    try:
+        from flashinfer.rope import apply_rope_with_cos_sin_cache_inplace
+    except ImportError:
+        # flashinfer is CUDA-only; on ROCm fall back to the torch reference,
+        # which matches its cos/sin-cache application semantics.
+        torch_impl_rope(q, k, cos_sin_cache, positions, is_neox)
+        return
 
     head_size = q.shape[-1]
     # flashinfer expects [nnz, num_heads * head_size]
@@ -78,6 +85,31 @@ def flashinfer_rope(
     )
 
 
+def _rope_rotate(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, is_neox: bool):
+    """Rotate the first ``rotary_dim`` channels of ``x`` in place.
+
+    ``x``: [nnz, num_heads, head_size]; ``cos``/``sin``: [nnz, rotary_dim // 2].
+    Matches flashinfer's ``apply_rope_with_cos_sin_cache_inplace`` convention:
+    NeoX splits the rotary block into halves; non-NeoX (GPT-J) uses interleaved
+    even/odd pairs. Channels beyond ``rotary_dim`` are left untouched.
+    """
+    rotary_dim = cos.shape[-1] * 2
+    xf = x[..., :rotary_dim].to(torch.float32)
+    cos = cos[:, None, :]  # [nnz, 1, rotary_dim // 2]
+    sin = sin[:, None, :]
+    if is_neox:
+        x1, x2 = xf[..., : rotary_dim // 2], xf[..., rotary_dim // 2 :]
+        out1 = x1 * cos - x2 * sin
+        out2 = x2 * cos + x1 * sin
+        rotated = torch.cat((out1, out2), dim=-1)
+    else:
+        x1, x2 = xf[..., 0::2], xf[..., 1::2]
+        out1 = x1 * cos - x2 * sin
+        out2 = x2 * cos + x1 * sin
+        rotated = torch.stack((out1, out2), dim=-1).flatten(-2)
+    x[..., :rotary_dim] = rotated.to(x.dtype)
+
+
 def torch_impl_rope(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -85,8 +117,13 @@ def torch_impl_rope(
     positions: torch.Tensor,
     is_neox: bool,
 ) -> None:
-    # TODO: implement a pure-PyTorch reference for extra coverage
-    pass
+    """Pure-PyTorch RoPE reference (in place), used as the ROCm fallback."""
+    rotary_dim = cos_sin_cache.shape[-1]
+    half = rotary_dim // 2
+    gathered = cos_sin_cache[positions.long()]
+    cos, sin = gathered[:, :half], gathered[:, half:]
+    _rope_rotate(q, cos, sin, is_neox)
+    _rope_rotate(k, cos, sin, is_neox)
 
 
 # ---------------------------------------------------------------------------

@@ -5,10 +5,11 @@ import pytest
 import torch
 
 from sglang.jit_kernel.utils import get_ci_test_range
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
+register_amd_ci(est_time=10, suite="jit-kernel-unit-test-amd")
 
 
 def sglang_jit_fused_add_rmsnorm(
@@ -29,7 +30,17 @@ def sglang_jit_fused_add_rmsnorm(
 def flashinfer_fused_add_rmsnorm(
     input: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float
 ) -> None:
-    from flashinfer.norm import fused_add_rmsnorm
+    try:
+        from flashinfer.norm import fused_add_rmsnorm
+    except ImportError:
+        # flashinfer is CUDA-only; on ROCm fall back to a torch reference that
+        # matches its semantics (weight multiplied in fp32, i.e. no pre-cast).
+        sum_fp32 = input.to(torch.float32) + residual.to(torch.float32)
+        residual.copy_(sum_fp32.to(input.dtype))
+        variance = sum_fp32.pow(2).mean(-1, keepdim=True)
+        normed = sum_fp32 * torch.rsqrt(variance + eps)
+        input.copy_((weight.to(torch.float32) * normed).to(input.dtype))
+        return
 
     fused_add_rmsnorm(input, residual, weight, eps=eps)
 
