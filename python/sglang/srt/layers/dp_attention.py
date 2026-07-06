@@ -69,6 +69,8 @@ class DpPaddingMode(IntEnum):
         cls, is_extend_in_batch, global_num_tokens: List[int]
     ) -> DpPaddingMode:
         dp_size = get_attention_dp_size()
+        sum_len = sum(global_num_tokens)
+        max_len = max(global_num_tokens)
 
         # When is_extend_in_batch and dp_size > 1, use SUM_LEN to avoid padding
         # overhead from uneven token distribution.
@@ -76,15 +78,20 @@ class DpPaddingMode(IntEnum):
         # to enable symmetric memory optimization (needed for DSA CP, etc.).
         if is_extend_in_batch and dp_size > 1:
             # Hybrid-SSM models materialize idle ranks via the MAX_LEN
-            # fabricated-row conversion; other models keep mainline SUM_LEN.
+            # fabricated-row conversion.
             if _DP_MAX_LEN_WITH_IDLE and min(global_num_tokens) == 0:
                 return DpPaddingMode.MAX_LEN
-            return DpPaddingMode.SUM_LEN
+
+            # Only use SUM_LEN when token distribution is genuinely unbalanced
+            # (some rank has < 80% of the average). When balanced, fall through
+            # to the cost-based selection to allow MAX_LEN and symmetric memory.
+            avg_len = sum_len / len(global_num_tokens)
+            unbalanced_threshold = 0.8
+            if any(gt < avg_len * unbalanced_threshold for gt in global_num_tokens):
+                return DpPaddingMode.SUM_LEN
 
         # we choose the mode that minimizes the communication cost
         # prefer MAX_LEN when communication cost is equal to enable symmetric memory
-        max_len = max(global_num_tokens)
-        sum_len = sum(global_num_tokens)
         if sum_len * 2 >= max_len * dp_size:
             return cls.MAX_LEN
         else:
