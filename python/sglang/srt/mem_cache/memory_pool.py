@@ -534,39 +534,90 @@ class MambaPool:
                 )
                 self._intermediate_conv_window_phys = []
                 if dedup_conv_window:
+                    # The sliding window is the (K-1)-wide axis; the other conv
+                    # axis is the independent channel axis. Different backends
+                    # order these two axes differently in their conv_state:
+                    #   GDN  -> (channel, K-1)  (channel-major)
+                    #   KDA  -> (K-1, channel)  (window-major, axes swapped in
+                    #           KimiLinearStateShape.create)
+                    # Detect the window axis by its length (conv_kernel - 1)
+                    # rather than assuming a fixed position, so the dedup view's
+                    # last two dims keep the SAME order as conv_state. That keeps
+                    # the shared sliding buffer built over the true K-1 window
+                    # axis (not the channel axis) for both layouts, and lets the
+                    # layout-agnostic scatter/commit read it through strides.
+                    win_len = cache_params.shape.conv_kernel - 1
                     intermediate_conv_window_cache = []
                     for conv_shape in conv_state_shape:
-                        conv_dim, win = conv_shape  # win == conv_kernel - 1 == K-1
+                        axis0, axis1 = conv_shape
+                        if axis1 == win_len:
+                            # channel-major (GDN/dense default): (channel, K-1)
+                            channel_dim = axis0
+                            window_major = False
+                        elif axis0 == win_len:
+                            # window-major (KDA): (K-1, channel)
+                            channel_dim = axis1
+                            window_major = True
+                        else:
+                            raise ValueError(
+                                "conv_state shape "
+                                f"{conv_shape} has no axis of length "
+                                f"conv_kernel-1={win_len}; cannot build the "
+                                "deduplicated sliding-window conv-intermediate "
+                                "view."
+                            )
                         shared_win = (
-                            speculative_num_draft_tokens + win - 1
+                            speculative_num_draft_tokens + win_len - 1
                         )  # D + (K-1) - 1
+                        # phys keeps the channel axis independent and the shared
+                        # sliding window on the last axis, regardless of the
+                        # logical view ordering below.
                         phys = torch.zeros(
                             size=(
                                 num_mamba_layers,
                                 spec_state_size + 1,
-                                conv_dim,
+                                channel_dim,
                                 shared_win,
                             ),
                             dtype=conv_dtype,
                             device="cuda",
                         )
-                        # view[l, s, step, d, w] = phys[l, s, d, step + w]
-                        view = phys.as_strided(
-                            (
-                                phys.shape[0],
-                                phys.shape[1],
-                                speculative_num_draft_tokens,
-                                conv_dim,
-                                win,
-                            ),
-                            (
-                                phys.stride(0),
-                                phys.stride(1),
-                                phys.stride(3),  # step -> shared-win axis (stride 1)
-                                phys.stride(2),  # dim
-                                phys.stride(3),  # win -> shared-win axis (stride 1)
-                            ),
-                        )
+                        if not window_major:
+                            # view[l, s, step, d, w] = phys[l, s, d, step + w]
+                            view = phys.as_strided(
+                                (
+                                    phys.shape[0],
+                                    phys.shape[1],
+                                    speculative_num_draft_tokens,
+                                    channel_dim,
+                                    win_len,
+                                ),
+                                (
+                                    phys.stride(0),
+                                    phys.stride(1),
+                                    phys.stride(3),  # step -> shared-win axis
+                                    phys.stride(2),  # channel
+                                    phys.stride(3),  # win -> shared-win axis
+                                ),
+                            )
+                        else:
+                            # view[l, s, step, w, d] = phys[l, s, d, step + w]
+                            view = phys.as_strided(
+                                (
+                                    phys.shape[0],
+                                    phys.shape[1],
+                                    speculative_num_draft_tokens,
+                                    win_len,
+                                    channel_dim,
+                                ),
+                                (
+                                    phys.stride(0),
+                                    phys.stride(1),
+                                    phys.stride(3),  # step -> shared-win axis
+                                    phys.stride(3),  # win -> shared-win axis
+                                    phys.stride(2),  # channel
+                                ),
+                            )
                         self._intermediate_conv_window_phys.append(phys)
                         intermediate_conv_window_cache.append(view)
                 else:
