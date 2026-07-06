@@ -99,6 +99,8 @@ class DecodeKVCacheOffloadManager:
             storage_backend=server_args.hicache_storage_backend,
             model_name=server_args.served_model_name,
             storage_backend_extra_config=hicache_storage_backend_extra_config,
+            enable_metrics=server_args.enable_metrics,
+            extra_metric_labels=server_args.extra_metric_labels,
         )
 
         self.ongoing_offload = {}
@@ -219,17 +221,15 @@ class DecodeKVCacheOffloadManager:
     def _check_offload_progress(self, finish_count):
         """Check the progress of offload from device to host."""
         while finish_count > 0:
-            _, finish_event, ack_list = self.cache_controller.ack_write_queue.pop(0)
-            finish_event.synchronize()
-            for ack_id in ack_list:
-                (
-                    req,
-                    host_indices,
-                    incremental_tokens,
-                    start_time,
-                    start,
-                    end,
-                ) = self.ongoing_offload.pop(ack_id)
+            ack = self.cache_controller.ack_write_queue.pop(0)
+            ack.finish_event.synchronize()
+            matched = False
+            for ack_id in ack.node_ids:
+                entry = self.ongoing_offload.pop(ack_id, None)
+                if entry is None:
+                    continue
+                matched = True
+                req, host_indices, incremental_tokens, start_time, start, end = entry
 
                 self._mark_offload_finished(req.rid)
                 prior_hash = (
@@ -247,6 +247,11 @@ class DecodeKVCacheOffloadManager:
                     state = self.offloaded_state.get(req.rid)
                     start_offset = state.prefill_len if state is not None else start
                     self._release_finished_req(req, start_offset)
+            if matched:
+                self.cache_controller.record_l1_l2_transfer_complete(
+                    direction="offload",
+                    ack=ack,
+                )
             finish_count -= 1
 
     def _release_finished_req(self, req: Req, start_offset: int):
