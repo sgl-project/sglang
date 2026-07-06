@@ -68,6 +68,28 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _use_aiter_gfx95 = _use_aiter and _is_gfx95_supported
 # ROCm 7.0 hipcc miscompiles gemm_a8w8_blockscale_bpreshuffle on gfx95 (#23319).
 _use_aiter_bpreshuffle_gfx95 = _use_aiter_gfx95 and get_hip_version() >= (7, 2, 0)
+# gfx95 + ROCm < 7.2: bpreshuffle CK is disabled (above), and the non-bpreshuffle
+# fallback ck_gemm_a8w8_blockscale returns NaN above a per-shape M for some shapes
+# (measured NaN onset: (2560,4096)@M>=4096, (4096,1024)@M>=8192), corrupting prefill.
+# Map each affected (n, k) to the largest M for which CK is confirmed correct
+# (conservative = last verified-safe M). Keep the faster CK path at/below that M and
+# fall back to the numerically-correct Triton FP8 GEMM above it. Fixed in ROCm 7.2.
+_AITER_GFX95_CK_W8A8_MAX_SAFE_M = {
+    (2560, 4096): 2048,
+    (4096, 1024): 4096,
+}
+
+
+class _MXFP4QuantizedData(MXFP4QuantizeUtil):
+    def __init__(
+        self,
+        original_shape: torch.Size,
+        original_dtype: torch.dtype,
+        quantized_data: torch.Tensor,
+    ):
+        self.original_shape = original_shape
+        self.original_dtype = original_dtype
+        self.quantized_data = quantized_data
 
 
 # Force CK bpreshuffle (not Triton) for the dense w8a8-block GEMMs (MLA q/kv/o
@@ -270,7 +292,7 @@ if is_blackwell_supported() and is_flashinfer_available():
             x_scale.reshape(1),
             weight_scale.reshape(1),
             out_dtype,
-            backend="auto",
+            backend="cublas",
         ).view(m, n)
 
     @lru_cache(maxsize=1)
@@ -410,15 +432,8 @@ def dispatch_w8a8_block_fp8_linear() -> Callable:
 
 
 def dispatch_w8a8_mxfp8_linear() -> Callable:
-    """Dispatch MXFP8 linear kernel by --fp8-gemm-backend.
-
-    For MXFP8, Triton remains the default path. We only route to FlashInfer
-    when backend is explicitly set to flashinfer_cutlass or flashinfer_trtllm.
-    """
     backend = get_fp8_gemm_runner_backend()
-    if backend.is_flashinfer_trtllm():
-        return flashinfer_mxfp8_blockscaled_linear
-    elif backend.is_flashinfer_cutlass():
+    if backend.is_flashinfer_cutlass() or backend.is_flashinfer_trtllm():
         return flashinfer_mxfp8_blockscaled_linear
     return triton_mxfp8_blockscaled_linear
 
@@ -516,7 +531,17 @@ def initialize_fp8_gemm_config(server_args: ServerArgs) -> None:
         # TODO(brayden): Verify if CUTLASS can be set by default once SwapAB is supported
         backend = "triton"
 
-    FP8_GEMM_RUNNER_BACKEND = Fp8GemmRunnerBackend(backend)
+    backend = Fp8GemmRunnerBackend(backend)
+
+    if (
+        backend.is_auto()
+        and server_args.quantization == "mxfp8"
+        and _is_sm100_supported
+        and is_flashinfer_available()
+    ):
+        backend = Fp8GemmRunnerBackend.FLASHINFER_CUTLASS
+
+    FP8_GEMM_RUNNER_BACKEND = backend
 
 
 def get_fp8_gemm_runner_backend() -> Fp8GemmRunnerBackend:
@@ -828,7 +853,13 @@ def aiter_w8a8_block_fp8_linear(
     if _use_aiter_bpreshuffle_gfx95:
         use_triton = use_aiter_triton_gemm_w8a8_tuned_gfx950(n, k)
     elif _use_aiter_gfx95:
-        use_triton = use_aiter_triton_gemm_w8a8_tuned_gfx950(n, k)
+        # gfx95 on ROCm < 7.2: keep the (faster) CK path at/below the per-shape
+        # CK-safe M bound; above it, ck_gemm_a8w8_blockscale returns NaN, so use
+        # Triton. Unlisted shapes keep their original decision. Fixed in ROCm 7.2.
+        _ck_safe_m = _AITER_GFX95_CK_W8A8_MAX_SAFE_M.get((n, k))
+        use_triton = use_aiter_triton_gemm_w8a8_tuned_gfx950(n, k) or (
+            _ck_safe_m is not None and input_2d.shape[0] > _ck_safe_m
+        )
     else:
         use_triton = True
 
@@ -1121,7 +1152,6 @@ def flashinfer_mxfp8_blockscaled_linear(
     weight_t = weight.contiguous().t()
 
     if get_fp8_gemm_runner_backend().is_flashinfer_trtllm():
-
         weight_scale_t = weight_scale.contiguous().view(-1)
         output = flashinfer_mm_mxfp8(
             q_input,
@@ -1265,6 +1295,30 @@ def block_quant_dequant(
     return (x_q_block.to(torch.float32) * x_scale_repeat).to(dtype)
 
 
+def quantize_block_fp8_weight_to_mxfp4(
+    fp8_weight: torch.Tensor,
+    fp8_scale: torch.Tensor,
+    weight_block_size: List[int],
+    mxfp4_block_size: int = 32,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    fp8_weight_dequant = block_quant_dequant(
+        fp8_weight,
+        fp8_scale.to(torch.float32),
+        weight_block_size,
+        torch.bfloat16,
+    )
+    fp4_weight, fp4_scale = _MXFP4QuantizedData.quantize(
+        fp8_weight_dequant, block_size=mxfp4_block_size
+    )
+    fp4_weight = fp4_weight.quantized_data
+    fp4_weight = fp4_weight.contiguous().view(torch.int8)
+    fp4_scale = fp4_scale.view(
+        *fp8_weight_dequant.shape[:-1],
+        fp8_weight_dequant.shape[-1] // mxfp4_block_size,
+    )
+    return fp4_weight, fp4_scale.contiguous().view(torch.float8_e8m0fnu)
+
+
 def requant_weight_ue8m0_inplace(weight, weight_scale_inv, weight_block_size):
     assert isinstance(weight, torch.nn.Parameter)
     assert isinstance(weight_scale_inv, torch.nn.Parameter)
@@ -1275,6 +1329,42 @@ def requant_weight_ue8m0_inplace(weight, weight_scale_inv, weight_block_size):
 
     offloader.update_param(weight, new_weight)
     weight_scale_inv.data = new_weight_scale_inv
+
+
+def requant_block_scale_ue8m0_for_deepgemm(
+    weight: torch.nn.Parameter,
+    weight_scale: torch.nn.Parameter,
+    weight_block_size: Optional[List[int]],
+    use_deepgemm_runner: bool,
+    output_dtype: Optional[torch.dtype] = None,
+    weight_shape=None,
+) -> bool:
+    """Requantize block-FP8 weight scales to UE8M0 in place for DeepGEMM.
+
+    No-op (returns False) unless the caller selected the DeepGEMM runner, the
+    block size is 128x128 (the only layout the requant kernel supports), the
+    scales are not already UE8M0, and DeepGEMM can run the layer (bf16 output,
+    aligned shape). Returns True when it requantizes.
+    """
+    from sglang.srt.model_loader.utils import (
+        should_deepgemm_weight_requant_ue8m0,
+    )
+
+    if (
+        not use_deepgemm_runner
+        or weight_block_size != [128, 128]
+        or getattr(weight_scale, "format_ue8m0", False)
+        or not should_deepgemm_weight_requant_ue8m0(
+            weight_block_size=weight_block_size,
+            output_dtype=output_dtype,
+            weight_shape=weight_shape,
+        )
+    ):
+        return False
+
+    requant_weight_ue8m0_inplace(weight, weight_scale, weight_block_size)
+    weight_scale.format_ue8m0 = True
+    return True
 
 
 def requant_weight_ue8m0(
@@ -1461,7 +1551,12 @@ def per_block_cast_to_fp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
 
 # COPIED FROM DeepGEMM
 def ceil_to_ue8m0(x: torch.Tensor):
-    return torch.pow(2.0, torch.ceil(torch.log2(x.abs())))
+    bits = x.abs().float().view(torch.int32)
+    exp = (bits >> 23) & 0xFF
+    mantissa = bits & 0x7FFFFF
+    exp = exp + (mantissa != 0).to(torch.int32)
+    exp = exp.clamp(1, 254)
+    return (exp << 23).view(torch.float32)
 
 
 def channel_quant_to_tensor_quant(

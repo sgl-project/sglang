@@ -1,12 +1,36 @@
 from __future__ import annotations
 
+import logging
 import math
+from collections import defaultdict
 from enum import IntEnum
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
-from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu
+from sglang.srt.hardware_backend.npu.dsv4.dsv4_allocator import (
+    alloc_paged_token_slots_extend_npu,
+)
+from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
+    maybe_build_dsv4_verify_bundle,
+)
+from sglang.srt.mem_cache.common import (
+    alloc_paged_token_slots_extend,
+    alloc_token_slots,
+    get_alloc_reserve_per_decode,
+    get_last_loc,
+)
+from sglang.srt.speculative.triton_ops.spec_tree import (
+    sgl_build_tree_kernel_efficient_triton,
+    verify_tree_greedy_kernel_triton,
+)
+from sglang.srt.utils import (
+    is_cuda,
+    is_hip,
+    is_musa,
+    is_npu,
+    is_xpu,
+)
 from sglang.srt.utils.async_probe import maybe_detect_oob
 
 if TYPE_CHECKING:
@@ -21,11 +45,22 @@ _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_musa = is_musa()
+_is_xpu = is_xpu()
+
+logger = logging.getLogger(__name__)
 
 if _is_cuda or _is_hip or _is_musa:
     from sgl_kernel import (
         build_tree_kernel_efficient as sgl_build_tree_kernel_efficient,
     )
+
+
+ALLOC_EXTEND_FUNCS = defaultdict(
+    lambda: alloc_paged_token_slots_extend,
+    {
+        "npu": alloc_paged_token_slots_extend_npu,
+    },
+)
 
 
 def per_step_draft_out_cache_loc(
@@ -193,6 +228,21 @@ def build_tree_kernel_efficient(
             num_verify_tokens,
             tree_mask_mode,
         )
+    elif _is_xpu:
+        sgl_build_tree_kernel_triton(
+            parent_list,
+            top_scores_index,
+            seq_lens,
+            tree_mask,
+            positions,
+            retrieve_index,
+            retrieve_next_token,
+            retrieve_next_sibling,
+            topk,
+            spec_steps,
+            num_verify_tokens,
+            tree_mask_mode,
+        )
     else:
         sgl_build_tree_kernel_efficient(
             parent_list,
@@ -215,6 +265,88 @@ def build_tree_kernel_efficient(
         retrieve_next_token,
         retrieve_next_sibling,
         draft_tokens,
+    )
+
+
+def sgl_build_tree_kernel_triton(
+    parent_list: torch.Tensor,
+    selected_index: torch.Tensor,
+    verified_seq_len: torch.Tensor,
+    tree_mask: torch.Tensor,
+    positions: torch.Tensor,
+    retrieve_index: torch.Tensor,
+    retrieve_next_token: torch.Tensor,
+    retrieve_next_sibling: torch.Tensor,
+    topk: int,
+    depth: int,
+    draft_token_num: int,
+    tree_mask_mode: TreeMaskMode = TreeMaskMode.FULL_MASK,
+):
+    """Triton-based implementation."""
+    # TODO: Add support for QLEN_ONLY_BITPACKING mode
+    if tree_mask_mode == TreeMaskMode.QLEN_ONLY_BITPACKING:
+        raise NotImplementedError(
+            "QLEN_ONLY_BITPACKING is not supported in Triton implementation"
+        )
+
+    batch_size = verified_seq_len.shape[0]
+    seq_len_prefix_sum = torch.cumsum(verified_seq_len, dim=0) - verified_seq_len
+
+    # Launch kernel with one program per batch item
+    grid = (batch_size,)
+
+    sgl_build_tree_kernel_efficient_triton[grid](
+        parent_list,
+        selected_index,
+        verified_seq_len,
+        seq_len_prefix_sum,
+        tree_mask,
+        positions,
+        retrieve_index,
+        retrieve_next_token,
+        retrieve_next_sibling,
+        topk=topk,
+        depth=depth,
+        draft_token_num=draft_token_num,
+        tree_mask_mode=int(tree_mask_mode),
+        batch_size=batch_size,
+        parent_list_stride=(
+            parent_list.stride(0) if parent_list.dim() > 1 else parent_list.shape[0]
+        ),
+        selected_index_stride=selected_index.stride(0),
+    )
+
+
+def verify_tree_greedy_triton(
+    predicts: torch.Tensor,
+    accept_index: torch.Tensor,
+    accept_token_num: torch.Tensor,
+    candidates: torch.Tensor,
+    retrieve_index: torch.Tensor,
+    retrieve_next_token: torch.Tensor,
+    retrieve_next_sibling: torch.Tensor,
+    target_predict: torch.Tensor,
+):
+    """Triton-based implementation."""
+    batch_size = candidates.shape[0]
+    num_speculative_tokens = accept_index.shape[1]
+    num_draft_tokens = candidates.shape[1]
+
+    # Launch kernel with one program per batch item
+    grid = (batch_size,)
+
+    verify_tree_greedy_kernel_triton[grid](
+        predicts,
+        accept_index,
+        accept_token_num,
+        candidates,
+        retrieve_index,
+        retrieve_next_token,
+        retrieve_next_sibling,
+        target_predict,
+        batch_size=batch_size,
+        num_speculative_tokens=num_speculative_tokens,
+        num_draft_tokens=num_draft_tokens,
     )
 
 
@@ -258,24 +390,69 @@ def verify_tree_greedy_func(
             retrive_next_sibling=retrieve_next_sibling,
             target_predict=target_predict,
         )
+    elif _is_xpu:
+        verify_tree_greedy_triton(
+            predicts=predicts,
+            accept_index=accept_index,
+            accept_token_num=accept_token_num,
+            candidates=candidates,
+            retrieve_index=retrieve_index,
+            retrieve_next_token=retrieve_next_token,
+            retrieve_next_sibling=retrieve_next_sibling,
+            target_predict=target_predict,
+        )
     return predicts, accept_index, accept_token_num
 
 
-def get_draft_hidden_dim(model_runner: ModelRunner) -> int:
-    """Derive the hidden dimension of target hidden states fed to the draft model."""
-    hf_config = model_runner.model_config.hf_config
-    eagle_config = getattr(hf_config, "eagle_config", {})
-    use_aux = eagle_config.get("use_aux_hidden_state", False)
+def get_draft_input_from_target_hidden_dim(model_runner: ModelRunner) -> int:
+    """Width of the target hidden states fed into the draft model.
+
+    This is the single source of truth and is derived entirely from config: for
+    EAGLE3 aux mode the draft consumes `num_aux` concatenated target layers
+    (each `target_hidden_size` wide); every other arch consumes the per-layer
+    `spec_hidden_size`.
+
+    Do NOT read this off a draft projection's `in_features` (e.g. an `fc`
+    layer): that width is arch-specific.
+
+    Note: read entirely from the *draft* `model_runner`'s config. The non-aux
+    branch assumes the draft's `spec_hidden_size` equals the target hidden width
+    fed to the draft (true for standard EAGLE, where the draft mirrors the
+    target hidden size); aux mode reads the explicit `target_hidden_size`.
+    """
+    model_config = model_runner.model_config
+    hf_config = model_config.hf_config
+    eagle_config = getattr(hf_config, "eagle_config", None) or {}
+    get_eagle_config = (
+        eagle_config.get
+        if isinstance(eagle_config, dict)
+        else lambda key, default=None: getattr(eagle_config, key, default)
+    )
+    use_aux = get_eagle_config("use_aux_hidden_state", True)
     spec_algorithm = model_runner.spec_algorithm
 
-    if spec_algorithm is not None and spec_algorithm.is_eagle3() and use_aux:
-        base = getattr(hf_config, "target_hidden_size", None)
-        if base is None:
-            base = model_runner.model_config.hidden_size
-        layer_ids = eagle_config.get("eagle_aux_hidden_state_layer_ids", [])
-        num_aux = max(len(layer_ids), 1)
-        return base * num_aux
-    return model_runner.model_config.spec_hidden_size
+    if not (spec_algorithm is not None and spec_algorithm.is_eagle3() and use_aux):
+        return model_config.spec_hidden_size
+
+    target_hidden = getattr(hf_config, "target_hidden_size", None)
+    if target_hidden is None:
+        target_hidden = model_config.hidden_size
+    num_aux = getattr(hf_config, "num_aux_hidden_states", None)
+    if num_aux is None:
+        layer_ids = get_eagle_config("eagle_aux_hidden_state_layer_ids", None)
+        if layer_ids is None:
+            layer_ids = getattr(hf_config, "eagle_aux_hidden_state_layer_ids", None)
+        num_aux = len(layer_ids) if layer_ids else 3
+    return target_hidden * num_aux
+
+
+def get_draft_recurrent_hidden_state_spec(
+    model_runner: ModelRunner,
+) -> tuple[Optional[int], Optional[torch.dtype]]:
+    """Return hidden_states width/dtype carried between draft decode steps."""
+    if model_runner.spec_algorithm.is_standalone():
+        return None, None
+    return model_runner.model_config.spec_hidden_size, model_runner.model_config.dtype
 
 
 def eagle_prepare_for_verify(
@@ -313,6 +490,10 @@ def eagle_prepare_for_verify(
             batch_size=bs,
             draft_token_num=verify_input.draft_token_num,
             device=device,
+        )
+
+        batch.out_cache_loc_dsv4 = maybe_build_dsv4_verify_bundle(
+            batch, verify_input.draft_token_num
         )
 
         prepare_mamba_track_for_verify(batch)
@@ -377,6 +558,7 @@ def eagle_sample(
     from sglang.srt.server_args import get_global_server_args
     from sglang.srt.speculative.spec_utils import (
         SIMULATE_ACC_LEN,
+        SIMULATE_ACC_TOKEN_MODE,
         generate_simulated_accept_index,
     )
     from sglang.srt.utils.async_probe import maybe_detect_nan, sanitize_nan_logits
@@ -434,7 +616,8 @@ def eagle_sample(
     num_correct_drafts = torch.empty((bs,), dtype=torch.int32, device=device)
 
     # Sample tokens
-    if sampling_info.is_all_greedy or _is_npu or _is_hip:
+    target_predict = None
+    if sampling_info.is_all_greedy or _is_npu or _is_hip or _is_xpu:
         target_predict = torch.argmax(next_token_logits, dim=-1)
         target_predict = target_predict.reshape(bs, verify_input.draft_token_num)
         predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
@@ -548,11 +731,33 @@ def eagle_sample(
         # Do simulation. The helper builds (and returns) a replacement
         # accept_index of width spec_steps + 1, so pass max_tree_depth - 1
         # to keep the simulated width identical to the real one.
+        if SIMULATE_ACC_TOKEN_MODE not in ("fixed", "real-draft-token"):
+            raise ValueError(
+                "Invalid SGLANG_SIMULATE_ACC_TOKEN_MODE "
+                f"{SIMULATE_ACC_TOKEN_MODE!r}; expected 'fixed' or "
+                "'real-draft-token'."
+            )
+
+        if SIMULATE_ACC_TOKEN_MODE == "real-draft-token":
+            if verify_input.tree_topk != 1:
+                raise ValueError(
+                    "SGLANG_SIMULATE_ACC_LEN with real draft tokens currently "
+                    "requires speculative_eagle_topk=1."
+                )
+
+            # Use target argmax as the synthetic bonus for non-greedy requests.
+            if target_predict is None:
+                target_predict = torch.argmax(next_token_logits, dim=-1).reshape(
+                    bs, verify_input.draft_token_num
+                )
         accept_index = generate_simulated_accept_index(
             accept_index=accept_index,
             predict=predict,  # mutable
             num_correct_drafts=num_correct_drafts,  # mutable
+            candidates=candidates,
+            target_predict=target_predict,
             simulate_acc_len=SIMULATE_ACC_LEN,
+            simulate_acc_token_mode=SIMULATE_ACC_TOKEN_MODE,
             bs=bs,
             spec_steps=verify_input.max_tree_depth - 1,
         )
@@ -561,3 +766,85 @@ def eagle_sample(
     # tensor includes the trailing/bonus token via out-of-place +1 so the
     # name no longer flips semantics mid-function (naming doc C2).
     return predict, num_correct_drafts + 1, accept_index
+
+
+def eagle_prepare_for_decode(batch: ScheduleBatch):
+    batch.maybe_evict_swa()
+
+    from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
+
+    bs = batch.batch_size()
+
+    # Accumulate penalty
+    # This is a relaxed version of penalties for speculative decoding.
+    if batch.sampling_info.penalizer_orchestrator.is_required:
+        batch.cumulate_penalty_output_tokens()
+
+    page_size = batch.token_to_kv_pool_allocator.page_size
+    double_alloc = get_alloc_reserve_per_decode()
+
+    cur_kv_lens = [0] * bs
+    nxt_kv_lens = [0] * bs
+    num_needed_tokens = 0
+    for i, r in enumerate(batch.reqs):
+        cur = r.kv_allocated_len
+        # max(cur, ...) clamps so adaptive downswitch cannot make nxt < cur.
+        # kv_committed_len is honest (bonus committed in resolve, not here),
+        # so it lags batch.seq_lens by ~1 verify in overlap; 2*alloc absorbs.
+        nxt = max(cur, r.kv_committed_len + double_alloc)
+        cur_kv_lens[i] = cur
+        nxt_kv_lens[i] = nxt
+        num_needed_tokens += nxt - cur
+        r.kv_allocated_len = nxt
+        r.decode_batch_idx += 1
+
+    cur_kv_lens_cpu = torch.tensor(cur_kv_lens, dtype=torch.int32, device="cpu")
+    nxt_kv_lens_cpu = torch.tensor(nxt_kv_lens, dtype=torch.int32, device="cpu")
+
+    # Fail fast if the page>1 + topk>1 draft over-allocation
+    # (get_alloc_reserve_per_decode) outgrows the req_to_token row: the write below
+    # would OOB and free would leak KV. The row is widened to hold it in _init_pools
+    # (PR #26972); fail here with a clear error, not on a later cryptic CUDA assert.
+    from sglang.srt.server_args import get_global_server_args
+
+    if page_size > 1 and (get_global_server_args().speculative_eagle_topk or 1) > 1:
+        max_alloc_len = int(nxt_kv_lens_cpu.max())
+        row_width = batch.req_to_token_pool.req_to_token.shape[1]
+        assert max_alloc_len <= row_width, (
+            f"spec v2 page>1 topk>1 draft over-allocation ({max_alloc_len}) exceeds "
+            f"req_to_token row width ({row_width}); page_size={page_size}. Widen the "
+            f"row to hold committed + get_alloc_reserve_per_decode (PR #26972)."
+        )
+
+    # non_blocking H2D: a blocking .to() syncs the schedule stream, which the WAR
+    # barrier has chained to the prev forward -> host stalls a full forward.
+    cur_kv_lens_device = cur_kv_lens_cpu.to(device=batch.device, non_blocking=True)
+    nxt_kv_lens_device = nxt_kv_lens_cpu.to(device=batch.device, non_blocking=True)
+    if page_size == 1:
+        out_cache_loc = alloc_token_slots(batch.tree_cache, num_needed_tokens)
+    else:
+        last_loc = get_last_loc(
+            batch.req_to_token_pool.req_to_token,
+            batch.req_pool_indices,
+            cur_kv_lens_device,
+        )
+        device_type = getattr(batch.device, "type", str(batch.device).split(":", 1)[0])
+        out_cache_loc = ALLOC_EXTEND_FUNCS[device_type](
+            batch.tree_cache,
+            cur_kv_lens_device,
+            cur_kv_lens_cpu,
+            nxt_kv_lens_device,
+            nxt_kv_lens_cpu,
+            last_loc,
+            num_needed_tokens,
+            req_pool_indices=batch.req_pool_indices,
+            batch=batch,
+        )
+    assign_req_to_token_pool_func(
+        batch.req_pool_indices,
+        batch.req_to_token_pool.req_to_token,
+        cur_kv_lens_device,
+        nxt_kv_lens_device,
+        out_cache_loc,
+        bs,
+    )
