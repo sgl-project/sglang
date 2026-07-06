@@ -272,6 +272,21 @@ class DeepseekMLAForwardMixin:
             self.q_lora_rank is not None
             and self._can_fuse_bmm_into_attention(forward_batch)
         )
+        # --dcp-replicate-q-proj: each DCP rank holds the full-head q_b_proj / w_kc
+        # (gathered pre-capture in model_runner), so it projects the full-head Q
+        # locally and skips the per-layer head-dim Q all-gather. Supported on the
+        # standard bf16 decode absorb path only; otherwise fall back to all-gather.
+        q_replicate_active = (
+            get_global_server_args().dcp_replicate_q_proj
+            and dcp_enabled()
+            and forward_batch.forward_mode.is_decode()
+            and not getattr(self, "use_deep_gemm_bmm", False)
+            and getattr(self, "w_kc_qrep", None) is not None
+            and getattr(self, "q_b_proj_qrep_weight", None) is not None
+        )
+        if q_replicate_active:
+            # force the standard (non-fused) absorb so the full-head w_kc bmm runs
+            fuse_bmm_attention = False
         q_lora = None
         topk_indices = None
         q_nope = None
@@ -367,6 +382,7 @@ class DeepseekMLAForwardMixin:
                 and get_is_capture_mode()
                 and forward_batch.forward_mode.is_decode_or_idle()
                 and q_lora is not None
+                and not q_replicate_active
             ):
                 current_stream = torch.cuda.current_stream()
                 self.alt_stream.wait_stream(current_stream)
@@ -392,7 +408,19 @@ class DeepseekMLAForwardMixin:
                 current_stream.wait_stream(self.alt_stream)
             else:
                 k_nope = k_nope.unsqueeze(1)
-                q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+                if q_replicate_active:
+                    # full-head Q from the gathered weight (skips Q all-gather)
+                    q = torch.nn.functional.linear(
+                        q, self.q_b_proj_qrep_weight
+                    ).view(
+                        -1,
+                        self.num_local_heads * get_attention_dcp_world_size(),
+                        self.qk_head_dim,
+                    )
+                else:
+                    q = self.q_b_proj(q)[0].view(
+                        -1, self.num_local_heads, self.qk_head_dim
+                    )
 
                 # Hoist these above the DSA indexer split op so the indexer
                 # and the composite bmm+attention split op are adjacent in FX.
@@ -414,9 +442,18 @@ class DeepseekMLAForwardMixin:
                             self.layer_id, prev_topk_indices
                         )
         else:
-            q = self.q_proj(hidden_states)[0].view(
-                -1, self.num_local_heads, self.qk_head_dim
-            )
+            if q_replicate_active:
+                q = torch.nn.functional.linear(
+                    hidden_states, self.q_b_proj_qrep_weight
+                ).view(
+                    -1,
+                    self.num_local_heads * get_attention_dcp_world_size(),
+                    self.qk_head_dim,
+                )
+            else:
+                q = self.q_proj(hidden_states)[0].view(
+                    -1, self.num_local_heads, self.qk_head_dim
+                )
             latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
             k_nope = latent_cache[..., : self.kv_lora_rank]
             k_nope = self.kv_a_layernorm(k_nope).unsqueeze(1)
@@ -425,7 +462,15 @@ class DeepseekMLAForwardMixin:
             q_nope, q_pe, k_pe = self._split_q_nope_pe(q, latent_cache)
 
         _kvb_q = None
-        if fusion_plan is not None:
+        if q_replicate_active:
+            # full-head absorb with the pre-gathered w_kc (standard bf16 bmm);
+            # q_nope is already full-head, so the Q all-gather below is skipped.
+            q_nope_out = (
+                torch.bmm(q_nope.transpose(0, 1), self.w_kc_qrep)
+                .transpose(0, 1)
+                .contiguous()
+            )
+        elif fusion_plan is not None:
             # The composite split op fills q_nope_out_buf and attention reads
             # this transposed alias directly.
             q_nope_out = fusion_plan.q_nope_out_view
@@ -565,8 +610,9 @@ class DeepseekMLAForwardMixin:
 
         # all_gather q_pe, q_nope_out,take tp8 as an example， q_pe [B, H, ROPE_DIM], q_nope_out [B, H, NOPE_DIM] gathered to [B, H * dcp_world_size, ROPE_DIM] [B, H * dcp_world_size, NOPE_DIM] for decode batch, and all gather k_pe, k_nope for extend batch.
         if dcp_enabled():
-            if forward_batch.forward_mode.is_decode():
+            if forward_batch.forward_mode.is_decode() and not q_replicate_active:
                 # if forward_batch.forward_mode is decode, gather q
+                # (skipped when --dcp-replicate-q-proj already produced full-head Q)
                 q_nope_out, q_pe = all_gather_q_for_mla_decode(
                     q_nope_out=q_nope_out,
                     q_pe=q_pe,

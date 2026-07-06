@@ -335,7 +335,15 @@ def dcp_a2a_lse_reduce(
         )
 
         # Single fused all_to_all
-        cp_group.all_to_all_single(recv_combined.view(-1), send_combined.view(-1))
+        # Transport the packed buffer as raw bytes (uint8) so the NCCL exchange
+        # is dtype-agnostic — the attention output can be fp8 (e.g. fp8 KV cache),
+        # which pynccl's ncclDataTypeEnum.from_torch does not support. Byte-level
+        # all-to-all is exact for the equal-sized chunks; the combine reads the
+        # recv buffer back in its native dtype (shared storage).
+        cp_group.all_to_all_single(
+            recv_combined.reshape(-1).view(torch.uint8),
+            send_combined.reshape(-1).view(torch.uint8),
+        )
 
         # Unpack output (non-contiguous view — Triton handles strides)
         recv_output = recv_combined[:, :B, :, :D]
@@ -362,7 +370,15 @@ def dcp_a2a_lse_reduce(
             send_lse_contig.view(out_dtype).view(N, B, H_per_rank, lpd)
         )
 
-        cp_group.all_to_all_single(recv_combined.view(-1), send_combined.view(-1))
+        # Transport the packed buffer as raw bytes (uint8) so the NCCL exchange
+        # is dtype-agnostic — the attention output can be fp8 (e.g. fp8 KV cache),
+        # which pynccl's ncclDataTypeEnum.from_torch does not support. Byte-level
+        # all-to-all is exact for the equal-sized chunks; the combine reads the
+        # recv buffer back in its native dtype (shared storage).
+        cp_group.all_to_all_single(
+            recv_combined.reshape(-1).view(torch.uint8),
+            send_combined.reshape(-1).view(torch.uint8),
+        )
 
         recv_output = recv_combined[:, :, :, :D]
         recv_lse_stg = torch.empty(

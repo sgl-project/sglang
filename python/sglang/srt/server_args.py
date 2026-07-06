@@ -888,6 +888,16 @@ class ServerArgs:
             choices=["ag_rs", "a2a", "fi_a2a"],
         ),
     ] = "ag_rs"
+    dcp_replicate_q_proj: A[
+        bool,
+        Arg(
+            help="For MLA decode context parallelism with the a2a/fi_a2a "
+            "backend: replicate the Q projection so each DCP rank computes the "
+            "full-head query locally (redundant projection compute), eliminating "
+            "the per-layer head-dim all-gather of Q. Trades a small amount of "
+            "extra GEMM for one fewer collective per layer.",
+        ),
+    ] = False
     enable_prefill_cp: A[
         bool,
         "Enable context parallelism for the prefill phase. Select the layout with --cp-strategy.",
@@ -2839,6 +2849,17 @@ class ServerArgs:
                 "authoritative fabric probe runs at model-runner init; use 'a2a' "
                 "or 'ag_rs' on clusters without MNNVL."
             )
+        if self.dcp_replicate_q_proj:
+            if self.dcp_size <= 1:
+                raise ValueError(
+                    "--dcp-replicate-q-proj requires --dcp-size > 1."
+                )
+            if self.dcp_comm_backend not in ("a2a", "fi_a2a"):
+                raise ValueError(
+                    "--dcp-replicate-q-proj only applies to the a2a/fi_a2a DCP "
+                    "communication backend (it removes the head-dim Q all-gather); "
+                    f"got --dcp-comm-backend={self.dcp_comm_backend}."
+                )
         if not self.dcp_size > 1:
             return
         if is_hip():

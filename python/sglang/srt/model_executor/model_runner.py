@@ -932,6 +932,43 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
             init_fi_a2a_workspace(get_dcp_group())
 
+        # Prepare full-head Q-projection weights for --dcp-replicate-q-proj: all
+        # DCP ranks hold only their attn_tp head-shard of q_b_proj / w_kc, so
+        # gather the shards once here (pre-capture) into full-head buffers used by
+        # the MLA decode replicate path (which then skips the per-layer Q
+        # all-gather). bf16/fp16 only; quantized q-proj falls back to all-gather.
+        if self.server_args.dcp_size > 1 and self.server_args.dcp_replicate_q_proj:
+            from sglang.srt.distributed.parallel_state import get_dcp_group
+
+            g = get_dcp_group()
+            if g.world_size > 1:
+                n_prepared = 0
+                for m in self.model.modules():
+                    w_kc = getattr(m, "w_kc", None)
+                    qp = getattr(m, "q_b_proj", None) or getattr(m, "q_proj", None)
+                    if w_kc is None or qp is None or not hasattr(qp, "weight"):
+                        continue
+                    if (
+                        w_kc.dtype not in (torch.bfloat16, torch.float16)
+                        or qp.weight.dtype not in (torch.bfloat16, torch.float16)
+                    ):
+                        logger.warning(
+                            "dcp_replicate_q_proj: skipping quantized q-proj/w_kc "
+                            "(bf16/fp16 only); this layer keeps the Q all-gather."
+                        )
+                        continue
+                    # all-gather along the head dim across the DCP group
+                    m.w_kc_qrep = g.all_gather(w_kc.contiguous(), dim=0)
+                    m.q_b_proj_qrep_weight = g.all_gather(
+                        qp.weight.data.contiguous(), dim=0
+                    )
+                    n_prepared += 1
+                logger.info(
+                    "dcp_replicate_q_proj: prepared full-head Q weights for %d "
+                    "MLA layers",
+                    n_prepared,
+                )
+
     def init_cuda_graphs(self, capture_decode_cuda_graph: bool = True):
         """Capture cuda graphs. Requires init_attention_backends() to have run.
 
