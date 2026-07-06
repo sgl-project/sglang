@@ -3264,3 +3264,281 @@ class DSAIndexerPoolHost(HostKVCache):
             page_index = int(indices[i]) // self.page_size
             ptr_list.append(base_ptr + page_index * page_stride_bytes)
         return ptr_list, [page_stride_bytes] * len(ptr_list)
+
+class NPUMHATokenToKVPoolHybrid:
+    """
+    The hybird pool uses two pools internaly:
+    - MHATokenToKVPoolHost for the sink tokens (not compressed)
+    - NPUMLATokenToKVPool for the rest of the tokens (compressed)
+
+    The requests are routed to the pools based on `host_indices` values
+    Host indices from range <0, compressed_pool_size) belong to the compressed pool
+    Host indices from range <compressed_pool_size, MAX) belong to the uncompressed pool
+    Internally, the uncompressed pool uses indices starting at 0, so before routing,
+    the indices must be shifted
+    """
+    def __init__(
+        self,
+        device_pool: MHATokenToKVPool,
+        host_to_device_ratio: float,
+        host_size: int,
+        page_size: int,
+        layout: str,
+        kvtc_params_path: str = "",
+        kvtc_k_compression_ratio: float = 0,
+        kvtc_v_compression_ratio: float = 0,
+        enable_memory_saver: bool = False,
+        rotary_emb = None,
+        tp_rank: int = 0,
+        tp_size: int = 1,
+        pp_rank: int = 0,
+        pp_size: int = 1,
+        allocator_type: str = "default",
+    ):
+
+        self.page_size = page_size
+        self.tp_rank = tp_rank
+
+        if host_size == 0:
+            host_size = int(device_pool.size * host_to_device_ratio)
+
+        compressed_pool_size = int(host_size * 0.90)
+        sink_pool_size = int(host_size * 0.1)
+
+        self.compressed_pool = NPUMHATokenToKVPoolCompressed(
+                device_pool=device_pool,
+                host_size=compressed_pool_size,
+                page_size=page_size,
+                kvtc_params_path=kvtc_params_path,
+                kvtc_k_compression_ratio=kvtc_k_compression_ratio,
+                kvtc_v_compression_ratio=kvtc_v_compression_ratio,
+                rotary_emb=rotary_emb,
+                tp_rank=tp_rank,
+                tp_size=tp_size,
+                pp_rank=pp_rank,
+                pp_size=pp_size,
+                host_to_device_ratio=-1,
+                skip_size_check=False,
+                )
+        self.sink_pool = MHATokenToKVPoolHost(
+                device_pool=device_pool,
+                host_size=sink_pool_size,
+                page_size=page_size,
+                layout=layout,
+                allocator_type=allocator_type,
+                host_to_device_ratio=-1,
+                skip_size_check=True,
+                )
+
+        self.init_kv_buffer()
+
+        self.sink_token_shift = self.compressed_pool.size
+
+        self.lock = threading.RLock()
+        self.clear()
+        self.size = self.compressed_pool.size
+
+    def init_kv_buffer(self):
+        self.compressed_pool.init_kv_buffer()
+        self.sink_pool.init_kv_buffer()
+
+
+    def _load_sink_to_device_per_layer(
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        layer_id,
+        io_backend,
+    ):
+        assert torch.all(host_indices >= self.sink_token_shift), f"{host_indices=}"
+
+        host_indices_shifted = host_indices - self.sink_token_shift
+
+        self.sink_pool.load_to_device_per_layer(
+                device_pool,
+                host_indices_shifted,
+                device_indices,
+                layer_id,
+                io_backend,
+                )
+
+    def _load_compressed_to_device_per_layer(
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        token_indices,
+        layer_id,
+        io_backend,
+    ):
+
+        assert torch.all(host_indices < self.sink_token_shift), f"{host_indices=}"
+
+        self.compressed_pool.load_to_device_per_layer(
+                device_pool,
+                host_indices,
+                device_indices,
+                layer_id,
+                token_indices,
+                io_backend,
+                )
+
+    def load_to_device_per_layer(self, req: KVTCHostMemoryRequest):
+        device_pool = req.device_memory_pool
+        host_idx_compressed = req.host_indices_compressed
+        device_idx_compressed = req.device_indices_compressed
+        token_idx_compressed = req.token_indices_compressed
+        host_idx_sink = req.host_indices_sink
+        device_idx_sink = req.device_indices_sink
+        layer_id = req.layer_id
+        io_backend = req.io_backend
+
+        if host_idx_compressed.numel() != 0:
+            self._load_compressed_to_device_per_layer(
+                    device_pool,
+                    host_idx_compressed,
+                    device_idx_compressed,
+                    token_idx_compressed,
+                    layer_id,
+                    io_backend,
+                    )
+
+        if host_idx_sink.numel() != 0:
+            self._load_sink_to_device_per_layer(
+                    device_pool,
+                    host_idx_sink,
+                    device_idx_sink,
+                    layer_id,
+                    io_backend,
+                    )
+
+    def _backup_sink_from_device_all_layer(
+            self,
+            device_pool: KVCache,
+            host_indices: torch.Tensor,
+            device_indices: torch.Tensor,
+            io_backend: str,
+    ):
+        assert torch.all(host_indices >= self.sink_token_shift), f"{host_indices=}"
+
+        host_indices_shifted = host_indices - self.sink_token_shift
+
+        self.sink_pool.backup_from_device_all_layer(
+                device_pool,
+                host_indices_shifted,
+                device_indices,
+                io_backend,
+                )
+
+    def _backup_compressed_from_device_all_layer(
+            self,
+            device_pool: KVCache,
+            host_indices: torch.Tensor,
+            device_indices: torch.Tensor,
+            token_indices: torch.Tensor,
+            io_backend: str,
+    ):
+
+        self.compressed_pool.backup_from_device_all_layer(
+                device_pool,
+                host_indices,
+                device_indices,
+                token_indices,
+                io_backend,
+                )
+
+    def backup_from_device_all_layer(self, req: KVTCHostMemoryRequest):
+        device_pool = req.device_memory_pool
+        host_idx_compressed = req.host_indices_compressed
+        device_idx_compressed = req.device_indices_compressed
+        token_idx_compressed = req.token_indices_compressed
+        host_idx_sink = req.host_indices_sink
+        device_idx_sink = req.device_indices_sink
+        io_backend = req.io_backend
+
+        if host_idx_compressed.numel() != 0:
+            self._backup_compressed_from_device_all_layer(
+                    device_pool,
+                    host_idx_compressed,
+                    device_idx_compressed,
+                    token_idx_compressed,
+                    io_backend,
+                    )
+        if host_idx_sink.numel() != 0:
+            self._backup_sink_from_device_all_layer(
+                    device_pool,
+                    host_idx_sink,
+                    device_idx_sink,
+                    io_backend,
+                    )
+
+    @synchronized
+    def clear(self):
+        self.compressed_pool.clear()
+        self.sink_pool.clear()
+
+    def available_size(self):
+        return self.compressed_pool.available_size()
+
+    @synchronized
+    def alloc(
+            self,
+            need_sink: int,
+            need_compressed: int
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+
+        if need_sink != 0:
+            sink_tokens = self.sink_pool.alloc(need_sink)
+            if sink_tokens == None:
+                return None, None
+            sink_tokens += self.sink_token_shift
+        else:
+            sink_tokens = torch.empty(0, dtype=torch.int64)
+
+        if need_compressed != 0:
+            compressed_tokens = self.compressed_pool.alloc(need_compressed)
+            if compressed_tokens == None:
+                if sink_tokens.numel() > 0:
+                    self.free(sink_tokens)
+                return None, None
+        else:
+            compressed_tokens = torch.empty(0, dtype=torch.int64)
+
+        return sink_tokens, compressed_tokens
+
+    @synchronized
+    def free(self, indices: torch.Tensor) -> tuple[int, int]:
+        sink_indices = indices[indices >= self.sink_token_shift]
+        compressed_tokens = indices[indices < self.sink_token_shift]
+        freed_sink = 0
+        freed_compressed = 0
+
+        if sink_indices.numel() > 0:
+            sink_indices -= self.sink_token_shift
+            freed_sink = self.sink_pool.free(sink_indices)
+
+        if compressed_tokens.numel() > 0:
+            freed_compressed = self.compressed_pool.free(compressed_tokens)
+
+        return freed_sink, freed_compressed
+
+    def get_size_per_token(self):
+        raise NotImplementedError()
+
+    def get_data_page(self, index, flat: bool = True) -> torch.Tensor:
+        raise NotImplementedError()
+
+    def get_dummy_flat_data_page(self) -> torch.Tensor:
+        raise NotImplementedError()
+
+    def set_from_flat_data_page(self, index: int, data_page: torch.Tensor) -> None:
+        raise NotImplementedError()
+
+    def get_split_heads_page_buffer_meta(
+        self, indices: torch.Tensor, split_factor: int
+    ):
+        raise NotImplementedError()
+
+    def get_page_buffer_meta(self, indices):
+        raise NotImplementedError()
