@@ -39,7 +39,7 @@ from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPool,
 )
 from sglang.srt.mem_cache.mmap_allocator import alloc_mmap
-from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
+from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu, get_available_gpu_memory
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -64,6 +64,8 @@ if _is_cuda or _is_hip:
     )
 if _is_npu:
     from sgl_kernel_npu.kvcacheio import TransferDirection, transfer_kv_dim_exchange
+    import torch
+    import torch_npu
 
 logger = logging.getLogger(__name__)
 
@@ -3264,6 +3266,340 @@ class DSAIndexerPoolHost(HostKVCache):
             page_index = int(indices[i]) // self.page_size
             ptr_list.append(base_ptr + page_index * page_stride_bytes)
         return ptr_list, [page_stride_bytes] * len(ptr_list)
+
+class NPUMHATokenToKVPoolCompressed(HostKVCache):
+    def __init__(
+        self,
+        device_pool: MHATokenToKVPool,
+        host_to_device_ratio: float,
+        host_size: int,
+        page_size: int,
+        kvtc_params_path: str = "",
+        kvtc_k_compression_ratio: float = 0,
+        kvtc_v_compression_ratio: float = 0,
+        rotary_emb = None,
+        tp_rank: int = 0,
+        tp_size: int = 1,
+        pp_rank: int = 0,
+        pp_size: int = 1,
+        skip_size_check: bool = False,
+    ):
+        self.device_pool = device_pool
+        self.page_size = page_size
+        self.device = "cpu"
+        self.dtype = device_pool.store_dtype
+        self.compressed_dtype = torch.float32
+        self.rotary_emb = rotary_emb
+        self.tp_rank = tp_rank
+        self.pp_rank = pp_rank
+
+        formatter = logging.Formatter(f"[%(asctime)s TP{tp_rank} PP{pp_rank}] %(message)s")
+        for handler in logger.handlers:
+            handler.setFormatter(formatter)
+
+        self.head_num = self.device_pool.head_num
+        self.head_dim = self.device_pool.head_dim
+        self.layer_num = self.device_pool.layer_num
+        self.token_stride_size = self.head_num * self.head_dim * self.dtype.itemsize
+        self.layout_dim = self.token_stride_size * self.layer_num
+
+        self.device_page_shape = (self.layer_num, page_size, self.head_num, self.head_dim)
+
+        self.k_kvtc = False
+        self.v_kvtc = False
+
+        p = self.layer_num * self.head_num * self.head_dim
+
+        if kvtc_params_path:
+            logger.info("Using KVTC compression")
+
+            logger.info(
+                f"KVTC calibration data loading. avail mem={get_available_gpu_memory('npu', torch.npu.current_device()):.4f} GB"
+            )
+
+            kvtc_params = torch.load(kvtc_params_path, map_location="cpu")
+            self.k_kvtc = "keys" in kvtc_params and kvtc_k_compression_ratio > 0
+            self.v_kvtc = "values" in kvtc_params and kvtc_v_compression_ratio > 0
+
+            worker_key = f"tp_{self.tp_rank}_pp_{self.pp_rank}"
+
+            if self.k_kvtc:
+                logger.info(
+                    f"NPU compressed K basis loading begin. avail mem={get_available_gpu_memory('npu', torch.npu.current_device()):.4f} GB"
+                )
+                keys_params = kvtc_params["keys"].get(worker_key)
+                if keys_params is None:
+                    raise Exception(f"Wrong K KVTC config - missing {worker_key}")
+
+                k_dim_limit = p // int(kvtc_k_compression_ratio)
+
+                self.kvtc_k_mu = self._copy_with_trim(keys_params["mu"])
+
+                if self.kvtc_k_mu.shape[0] != p:
+                    logger.error(f"K mu mismatch {self.kvtc_k_mu.shape} vs {p}")
+
+                self.kvtc_k_V = self._copy_with_trim(keys_params["basis"], (p, k_dim_limit))
+                if self.kvtc_k_V.shape[0] != p:
+                    logger.error(f"K V mismatch {self.kvtc_k_V.shape} vs {p}")
+
+                self.offload_page_shape_k = (self.page_size, self.kvtc_k_V.shape[1])
+
+                logger.info(
+                    f"NPU compressed K basis loading end. avail mem={get_available_gpu_memory('npu', torch.npu.current_device()):.4f} GB"
+                )
+                logger.debug(
+                    f"K basis final shape {self.kvtc_k_V.shape}, offload page shape {self.offload_page_shape_k}"
+                )
+
+            if self.v_kvtc:
+                logger.info(
+                    f"NPU compressed V basis loading begin. avail mem={get_available_gpu_memory('npu', torch.npu.current_device()):.4f} GB"
+                )
+                values_params = kvtc_params["values"].get(worker_key)
+                if values_params is None:
+                    raise Exception(f"Wrong V KVTC config - missing {worker_key}")
+
+                v_dim_limit = p // int(kvtc_v_compression_ratio)
+
+                self.kvtc_v_mu = self._copy_with_trim(values_params["mu"])
+
+                if self.kvtc_v_mu.shape[0] != p:
+                    logger.error(f"V mu mismatch {self.kvtc_v_mu.shape} vs {p}")
+
+                self.kvtc_v_V = self._copy_with_trim(values_params["basis"], (p, v_dim_limit))
+                if self.kvtc_v_V.shape[0] != p:
+                    logger.error(f"V V mismatch {self.kvtc_v_V.shape} vs {p}")
+
+                self.offload_page_shape_v = (self.page_size, self.kvtc_v_V.shape[1])
+
+                logger.info(
+                    f"NPU compressed V basis loading end. avail mem={get_available_gpu_memory('npu', torch.npu.current_device()):.4f} GB"
+                )
+                logger.debug(
+                    f"V basis final shape {self.kvtc_v_V.shape}, offload page shape {self.offload_page_shape_v}"
+                )
+
+            torch_npu.npu.synchronize()
+
+
+        self.size_per_token = self.get_size_per_token()
+        if host_size > 0:
+            self.size = int(host_size * 1e9 // self.size_per_token)
+        else:
+            self.size = int(device_pool.size * host_to_device_ratio)
+
+        # Align up the host memory pool size to the page size
+        self.page_num = self.size // self.page_size + 1
+        self.size = self.page_num * self.page_size
+        if skip_size_check == False:
+            assert (
+                self.size > device_pool.size
+            ), f"The host memory should be larger than the device memory with the current protocol ({self.size} vs {device_pool.size})"
+
+        self.init_kv_buffer()
+
+        # A lock for synchronized operations on memory allocation and state transitions.
+        self.lock = threading.RLock()
+        self.clear()
+
+    def _copy_with_trim(self, in_tensor: torch.Tensor, out_shape=None) -> torch.Tensor:
+        out_shape = out_shape or in_tensor.shape
+        out_slices = tuple(slice(0, x) for x in out_shape)
+
+        return in_tensor[out_slices].to(self.device_pool.device)
+
+    def init_kv_buffer(self):
+        logger.info(f"NPU compressed pool alloc begin. avail mem={get_available_gpu_memory('npu', torch.npu.current_device()):.2f} GB")
+        # [size, head_num, head_dim] for each layer
+        # The padded slot 0 is used for writing dummy outputs from padded tokens.
+        # Continuous memory improves the efficiency of Ascend`s transmission backend,
+        # while other backends remain unchanged.
+        if self.k_kvtc:
+            self.k_buffer = torch.zeros(
+                (
+                    self.page_num,
+                    *self.offload_page_shape_k
+                ),
+                dtype=self.compressed_dtype,
+                device=self.device,
+                pin_memory=True,
+            )
+        else:
+            self.k_buffer = torch.zeros(
+                (
+                    self.layer_num,
+                    self.page_num,
+                    self.page_size,
+                    self.head_num,
+                    self.head_dim,
+                ),
+                dtype=self.dtype,
+                device=self.device,
+                pin_memory=True,
+            )
+
+        if self.v_kvtc:
+            self.v_buffer = torch.zeros(
+                (
+                    self.page_num,
+                    *self.offload_page_shape_v
+                ),
+                dtype=self.compressed_dtype,
+                device=self.device,
+                pin_memory=True,
+            )
+        else:
+            self.v_buffer = torch.zeros(
+                (
+                    self.layer_num,
+                    self.page_num,
+                    self.page_size,
+                    self.head_num,
+                    self.head_dim,
+                ),
+                dtype=self.dtype,
+                device=self.device,
+                pin_memory=True,
+            )
+
+        logger.info(f"NPU compressed pool alloc end(pages={self.page_num}. avail mem={get_available_gpu_memory('npu', torch.npu.current_device()):.2f} GB")
+
+    def get_size_per_token(self):
+        size = 0
+        if self.k_kvtc:
+            size += self.offload_page_shape_k[1] * self.compressed_dtype.itemsize
+        else:
+            size += self.head_dim * self.head_num * self.layer_num * self.dtype.itemsize
+
+        if self.v_kvtc:
+            size += self.offload_page_shape_v[1] * self.compressed_dtype.itemsize
+        else:
+            size += self.head_dim * self.head_num * self.layer_num * self.dtype.itemsize
+
+        return size
+
+    def get_ksize_per_token(self):
+        return self.get_size_per_token() // 2
+
+    def load_to_device_per_layer(
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        layer_id,
+        token_indices,
+        io_backend,
+    ):
+        if layer_id != 0:
+            return
+
+        assert len(token_indices) == host_indices.size(0)
+        assert(device_indices.size(0) % self.page_size == 0)
+        num_pages = device_indices.size(0) // self.page_size
+        token_indices = torch.Tensor(token_indices).to(device_pool.device, dtype=torch.int64)
+
+        for page in range(num_pages):
+            host_page = host_indices[page * self.page_size] // self.page_size
+            device_page = device_indices[page * self.page_size] // self.page_size
+            page_token_indices = token_indices[page * self.page_size : page * self.page_size + self.page_size]
+
+            if self.k_kvtc:
+                X_k = (
+                    torch.matmul(
+                        self.k_buffer[host_page].to(device=self.device_pool.device), self.kvtc_k_V.T
+                    )
+                    + self.kvtc_k_mu
+                )
+                device_pool.k_buffer[:, device_page, ...] = (
+                    self.rotary_emb.forward_native_keys_batch(
+                        page_token_indices,
+                        X_k.reshape(
+                            self.device_page_shape[1],
+                            self.device_page_shape[0],
+                            *self.device_page_shape[2:]
+                        ),
+                    ).transpose(1, 0)
+                )
+            else:
+                device_pool.k_buffer[:, device_page, ...] = self.k_buffer[:, host_page, ...].to(
+                    device=self.device_pool.device
+                )
+
+            if self.v_kvtc:
+                X_v = (
+                    (
+                        torch.matmul(
+                            self.v_buffer[host_page].to(device=self.device_pool.device),
+                            self.kvtc_v_V.T,
+                        )
+                        + self.kvtc_v_mu
+                    )
+                    .reshape(self.page_size, self.layer_num, -1)
+                    .transpose(1, 0)
+                )
+                device_pool.v_buffer[:, device_page, ...] = X_v.reshape(*self.device_page_shape).to(
+                    dtype=self.dtype
+                )
+            else:
+                device_pool.v_buffer[:, device_page, ...] = self.v_buffer[:, host_page, ...].to(
+                    device=self.device_pool.device
+                )
+
+    def backup_from_device_all_layer(
+        self, device_pool, host_indices, device_indices, token_indices, token_io_backend
+    ):
+        assert len(token_indices) == host_indices.size(0), f"{len(token_indices)=} {host_indices.size(0)}"
+        assert (device_indices.size(0) % self.page_size == 0)
+        num_pages = device_indices.size(0) // self.page_size
+        token_indices = torch.Tensor(token_indices).to(device_pool.device, dtype=torch.int64)
+
+        for page in range(num_pages):
+            host_page = host_indices[page * self.page_size] // self.page_size
+            device_page = device_indices[page * self.page_size] // self.page_size
+            page_token_indices = token_indices[page * self.page_size : page * self.page_size + self.page_size]
+
+            if self.k_kvtc:
+                X_k = device_pool.k_buffer[:, device_page, ...].transpose(1, 0)
+                X_k_unrotated = self.rotary_emb.invert_native_keys_batch(page_token_indices, X_k)
+                self.k_buffer[host_page] = torch.matmul(
+                    (X_k_unrotated.reshape(self.page_size, -1) - self.kvtc_k_mu), self.kvtc_k_V
+                ).to(device=self.device)
+            else:
+                self.k_buffer[:, host_page, ...] = device_pool.k_buffer[:, device_page, ...].to(
+                    device=self.device
+                )
+
+            if self.v_kvtc:
+                X_v = (
+                    device_pool.v_buffer[:, device_page, ...]
+                    .transpose(1, 0)
+                    .reshape(self.page_size, -1)
+                )
+                self.v_buffer[host_page] = torch.matmul((X_v - self.kvtc_v_mu), self.kvtc_v_V).to(
+                    device=self.device
+                )
+            else:
+                self.v_buffer[:, host_page, ...] = device_pool.v_buffer[:, device_page, ...].to(
+                    device=self.device
+                )
+
+    def get_data_page(self, index, flat: bool = True) -> torch.Tensor:
+        raise NotImplementedError()
+
+    def get_dummy_flat_data_page(self) -> torch.Tensor:
+        raise NotImplementedError()
+
+    def set_from_flat_data_page(self, index: int, data_page: torch.Tensor) -> None:
+        raise NotImplementedError()
+
+    def get_split_heads_page_buffer_meta(
+        self, indices: torch.Tensor, split_factor: int
+    ):
+        raise NotImplementedError()
+
+    def get_page_buffer_meta(self, indices):
+        raise NotImplementedError()
+
 
 class NPUMHATokenToKVPoolHybrid:
     """
