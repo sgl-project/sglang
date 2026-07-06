@@ -564,6 +564,21 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     termplotlib \
     "runai-model-streamer[s3,gcs,azure]>=0.15.7"
 
+# Runtime deps satisfied only by the base image's apt Python (distro is a
+# declared sglang dep; cryptography/pyjwt/pyparsing are transitive). pip sees
+# the system copies under /usr/lib/python3/dist-packages as already-satisfied
+# and skips them, so they never land in /usr/local/lib/.../dist-packages — the
+# only tree the slim runtime stage COPYs. That leaves them missing at launch
+# (ModuleNotFoundError: distro). --ignore-installed forces a pip copy into
+# /usr/local so the runtime COPY carries them; -c constraints.txt keeps builds
+# reproducible. See https://github.com/sgl-project/sglang/issues/29650
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python3 -m pip install --ignore-installed -c /sgl-workspace/constraints.txt \
+    cryptography \
+    distro \
+    pyjwt \
+    pyparsing
+
 # Optional ai-dynamo nightly for Dynamo + SGLang integration testing. Gated by
 # INSTALL_DYNAMO so it lands only in the dev image (release-docker-dev.yml sets
 # it), not the version-tagged release/runtime images. Empty DYNAMO_VERSION
