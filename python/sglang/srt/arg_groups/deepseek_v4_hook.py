@@ -26,13 +26,13 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
 
     # FlashMLA sparse prefill (SGLANG_OPT_FLASHMLA_SPARSE_PREFILL, default on)
     # currently returns incorrect output for DeepSeek-V4-Flash on ROCm/HIP
-    # (MI355X), which breaks the disaggregation nightly. Keep the previous
-    # (dense prefill) behavior on ROCm until the sparse kernel is validated
-    # there;
+    # (MI355X), which breaks the disaggregation nightly. Force the previous
+    # (dense prefill) behavior on ROCm until the sparse prefill kernel is
+    # validated there.
     if is_hip():
         logger.warning(
-            "Disabling SGLANG_OPT_FLASHMLA_SPARSE_PREFILL by default on ROCm/HIP "
-            f"for {model_arch}; set it explicitly to override."
+            "Disabling SGLANG_OPT_FLASHMLA_SPARSE_PREFILL on ROCm/HIP "
+            f"for {model_arch} until the sparse prefill kernel is validated there."
         )
         envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.set(False)
 
