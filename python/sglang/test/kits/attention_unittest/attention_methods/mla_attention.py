@@ -21,6 +21,7 @@ from sglang.srt.model_executor.forward_context import (
     forward_context,
     get_token_to_kv_pool,
 )
+from sglang.srt.model_executor.graph_shared_output import GraphSharedOutput
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import set_global_server_args_for_scheduler
@@ -308,6 +309,11 @@ class MockMLAModelRunner(ModelRunner):
         self.use_mla_backend = True
         self.is_draft_worker = False
         self._kernel_warmed_up = True
+        # Runner-mode helpers mutate speculative graph sizes after construction.
+        self.graph_shared_output = GraphSharedOutput(
+            device=self.device,
+            max_rows=pool_batch_size * max_context_len,
+        )
 
     @property
     def hybrid_gdn_config(self):
