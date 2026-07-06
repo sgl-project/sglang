@@ -125,6 +125,30 @@ LOAD_FORMAT_CHOICES = [
 
 # TODO: this list should likely contain only methods that support online quantization, or that support using custom quantization classes compatible with a given `quant_method` in config.json.
 # Some of the choices here do NOT support online quantization.
+# Attention backends whose kernels read the chunked prefix-cache layout.
+# Out-of-tree platforms may extend this list (via
+# add_chunked_prefix_cache_attention_backend) before ServerArgs construction;
+# the chunked-prefix gate is evaluated during resolution.
+CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS = [
+    "flashinfer",
+    "fa3",
+    "fa4",
+    "flashmla",
+    "cutedsl_mla",
+    "cutlass_mla",
+    "trtllm_mla",
+    "tokenspeed_mla",
+]
+
+
+def add_chunked_prefix_cache_attention_backend(backend_name):
+    if backend_name not in CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS:
+        CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS.append(backend_name)
+        logger.info(
+            f"Added {backend_name} to CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS."
+        )
+
+
 QUANTIZATION_CHOICES = [
     "awq",
     "fp8",  # MOE + linear online quantization.
@@ -2900,6 +2924,17 @@ class ServerArgs:
                 f"Automatically turn off --chunked-prefill-size as it is not supported for "
                 f"{hf_config.model_type}"
             )
+
+        # Chunked prefix caching requires an MLA model on a backend whose
+        # kernels read that layout.
+        if (
+            not self.use_mla_backend()
+            or self._resolved().attention_backend
+            not in CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS
+        ):
+            self.disable_chunked_prefix_cache = True
+        if not self.disable_chunked_prefix_cache:
+            logger.info("Chunked prefix cache is turned on.")
 
     def _handle_model_source_paths(self):
         """Resolve model/tokenizer paths backed by remote object stores."""
@@ -6654,6 +6689,58 @@ class ServerArgs:
         from sglang.srt.arg_groups.overrides import resolved_view
 
         return resolved_view(self)
+
+    def override(self, source: str, **fields) -> None:
+        """The single post-resolution mutation point.
+
+        After ``__post_init__`` the configuration is resolved; the audited
+        runtime adjustments (load-resolved values, control-plane
+        reconfiguration, deployment wiring) go through here instead of
+        assigning fields. Whitelisted resolvable fields also join the
+        declaration stash, so a republish resolves the same values;
+        everything is recorded with its ``source`` for provenance.
+        """
+        from sglang.srt.arg_groups.arg_utils import resolvable_fields
+
+        whitelist = resolvable_fields(type(self))
+        declared = {k: v for k, v in fields.items() if k in whitelist}
+        rest = {k: v for k, v in fields.items() if k not in whitelist}
+        if declared:
+            stash = getattr(self, "_resolved_overrides", None)
+            if stash is None:
+                stash = []
+                object.__setattr__(self, "_resolved_overrides", stash)
+            stash.append((source, dict(declared)))
+        if rest:
+            log = getattr(self, "_runtime_mutations", None)
+            if log is None:
+                log = []
+                object.__setattr__(self, "_runtime_mutations", log)
+            log.append((source, dict(rest)))
+        object.__setattr__(self, "_in_override", True)
+        try:
+            for field, value in fields.items():
+                setattr(self, field, value)
+        finally:
+            object.__setattr__(self, "_in_override", False)
+
+    def __setattr__(self, name, value):
+        # After materialization the fields are the resolved configuration:
+        # under the strict test harness, a bare assignment outside
+        # ServerArgs.override() (and the resolution pipeline itself) raises.
+        if (
+            not name.startswith("_")
+            and getattr(self, "_declarations_materialized", False)
+            and not getattr(self, "_in_override", False)
+        ):
+            from sglang.srt.environ import envs
+
+            if envs.SGLANG_STRICT_CONFIG_MUTATION.get():
+                raise AttributeError(
+                    f"server_args.{name} assigned after resolution; use "
+                    "server_args.override(source, ...) instead."
+                )
+        object.__setattr__(self, name, value)
 
     def _resolved_attention_backends(self):
         """Mid-resolution (prefill, decode) backends: reads through the pass

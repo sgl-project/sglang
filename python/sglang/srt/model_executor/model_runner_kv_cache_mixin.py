@@ -159,8 +159,10 @@ class ModelRunnerKVCacheMixin:
 
         if server_args.max_mamba_cache_size is not None:
             # Use explicitly set max_mamba_cache_size
-            server_args.max_mamba_cache_size = server_args.max_mamba_cache_size // (
-                server_args.dp_size if server_args.enable_dp_attention else 1
+            server_args.override(
+                "mamba_pool.per_dp_shard",
+                max_mamba_cache_size=server_args.max_mamba_cache_size
+                // (server_args.dp_size if server_args.enable_dp_attention else 1),
             )
             # Reserve intermediate memory based on capped max_num_reqs
             if has_spec_dec:
@@ -181,8 +183,10 @@ class ModelRunnerKVCacheMixin:
             and server_args.max_running_requests is not None
         ):
             # Use explicitly set max_running_requests when radix cache is disabled
-            server_args.max_mamba_cache_size = server_args.max_running_requests // (
-                server_args.dp_size if server_args.enable_dp_attention else 1
+            server_args.override(
+                "mamba_pool.from_max_running_requests",
+                max_mamba_cache_size=server_args.max_running_requests
+                // (server_args.dp_size if server_args.enable_dp_attention else 1),
             )
             # Reserve intermediate memory based on capped max_num_reqs
             if has_spec_dec:
@@ -213,8 +217,11 @@ class ModelRunnerKVCacheMixin:
                 ratio = self._calculate_mamba_ratio()
                 D = server_args.speculative_num_draft_tokens
                 # Joint solve: main_state + intermediate = mamba_budget
-                server_args.max_mamba_cache_size = int(
-                    mamba_budget_bytes // (per_req * (1 + D / ratio))
+                server_args.override(
+                    "mamba_pool.memory_budget_spec",
+                    max_mamba_cache_size=int(
+                        mamba_budget_bytes // (per_req * (1 + D / ratio))
+                    ),
                 )
                 # Intermediate memory is included in mamba_budget, subtract it
                 # so the return value only has main_state subtracted from total
@@ -226,7 +233,10 @@ class ModelRunnerKVCacheMixin:
                 intermediate_size = per_req * capped_reqs * D
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
             else:
-                server_args.max_mamba_cache_size = int(mamba_budget_bytes // per_req)
+                server_args.override(
+                    "mamba_pool.memory_budget",
+                    max_mamba_cache_size=int(mamba_budget_bytes // per_req),
+                )
 
         # Validate: max_mamba_cache_size must be positive after memory allocation.
         # A non-positive value means GPU memory is insufficient for the requested

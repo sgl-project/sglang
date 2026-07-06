@@ -320,8 +320,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.hot_token_id = None
         elif self.server_args.speculative_token_map is not None:
             self.hot_token_id = load_token_map(self.server_args.speculative_token_map)
-            self.server_args.json_model_override_args = (
-                f'{{"hot_vocab_size": {len(self.hot_token_id)}}}'
+            self.server_args.override(
+                "eagle_worker.hot_token_map",
+                json_model_override_args=(
+                    f'{{"hot_vocab_size": {len(self.hot_token_id)}}}'
+                ),
             )
         else:
             self.hot_token_id = None
@@ -1060,7 +1063,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
         )
 
         # Override the context length of the draft model to be the same as the target model.
-        server_args.context_length = target_worker.model_runner.model_config.context_len
+        server_args.override(
+            "spec_worker.match_target_context_length",
+            context_length=target_worker.model_runner.model_config.context_len,
+        )
 
         self._draft_worker = EagleDraftWorker(
             server_args,
@@ -1462,9 +1468,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
         )
 
         # Sync server_args
-        self.server_args.speculative_num_steps = state.speculative_num_steps
-        self.server_args.speculative_num_draft_tokens = (
-            state.speculative_num_draft_tokens
+        self.server_args.override(
+            "adaptive_spec.restore",
+            speculative_num_steps=state.speculative_num_steps,
+            speculative_num_draft_tokens=state.speculative_num_draft_tokens,
         )
 
     @contextlib.contextmanager
@@ -1498,16 +1505,21 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self.speculative_num_draft_tokens = speculative_num_draft_tokens
         dw.speculative_num_steps = speculative_num_steps
         dw.speculative_num_draft_tokens = speculative_num_draft_tokens
-        sa.speculative_num_steps = speculative_num_steps
-        sa.speculative_num_draft_tokens = speculative_num_draft_tokens
+        sa.override(
+            "adaptive_spec.capture_override",
+            speculative_num_steps=speculative_num_steps,
+            speculative_num_draft_tokens=speculative_num_draft_tokens,
+        )
         if cuda_graph_bs is not None:
-            sa.cuda_graph_bs_decode = cuda_graph_bs
             # BS-aware adaptive spec may prune cuda_graph_bs to an empty list
             # for steps that no BS range uses (e.g. step=1). Disable graph
             # capture for those steps; restore in finally so subsequent steps
             # are not affected.
-            if not cuda_graph_bs:
-                sa.disable_cuda_graph = True
+            sa.override(
+                "adaptive_spec.capture_override",
+                cuda_graph_bs_decode=cuda_graph_bs,
+                **({"disable_cuda_graph": True} if not cuda_graph_bs else {}),
+            )
         dw._rebuild_topk1_chain_buffers()
 
         try:
@@ -1524,11 +1536,14 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 dw.draft_runner.attn_backend,
                 dw.cuda_graph_runner,
                 dw.cuda_graph_runner_for_draft_extend,
-                sa.speculative_num_steps,
-                sa.speculative_num_draft_tokens,
-                sa.cuda_graph_bs_decode,
-                sa.disable_cuda_graph,
-            ) = backup
+            ) = backup[:10]
+            sa.override(
+                "adaptive_spec.capture_restore",
+                speculative_num_steps=backup[10],
+                speculative_num_draft_tokens=backup[11],
+                cuda_graph_bs_decode=backup[12],
+                disable_cuda_graph=backup[13],
+            )
             dw._rebuild_topk1_chain_buffers()
 
     def verify(self, batch: ScheduleBatch):

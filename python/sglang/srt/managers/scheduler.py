@@ -797,8 +797,9 @@ class Scheduler(
         )
 
         if self.server_args.speculative_draft_load_format is not None:
-            self.server_args.load_format = (
-                self.server_args.speculative_draft_load_format
+            self.server_args.override(
+                "scheduler.draft_load_format",
+                load_format=self.server_args.speculative_draft_load_format,
             )
             logger.info(
                 f"Using draft model load_format: '{self.server_args.speculative_draft_load_format}'"
@@ -901,8 +902,11 @@ class Scheduler(
                 min_free_slots=min_free_slots
             )
         if not get_global_server_args().pp_max_micro_batch_size:
-            get_global_server_args().pp_max_micro_batch_size = max(
-                self.max_running_requests // self.ps.pp_size, 1
+            get_global_server_args().override(
+                "scheduler.pp_max_micro_batch_size_default",
+                pp_max_micro_batch_size=max(
+                    self.max_running_requests // self.ps.pp_size, 1
+                ),
             )
 
         self.tp_group = get_tp_group()
@@ -3674,17 +3678,20 @@ class Scheduler(
             return AttachHiCacheStorageReqOutput(success=False, message=str(e))
         if ok:
             self.enable_hicache_storage = True
-            self.server_args.hicache_storage_backend = recv_req.hicache_storage_backend
+            hicache_fields = {
+                "hicache_storage_backend": recv_req.hicache_storage_backend
+            }
             if recv_req.hicache_storage_backend_extra_config_json is not None:
-                self.server_args.hicache_storage_backend_extra_config = (
+                hicache_fields["hicache_storage_backend_extra_config"] = (
                     recv_req.hicache_storage_backend_extra_config_json
                 )
             if recv_req.hicache_storage_prefetch_policy is not None:
-                self.server_args.hicache_storage_prefetch_policy = (
+                hicache_fields["hicache_storage_prefetch_policy"] = (
                     recv_req.hicache_storage_prefetch_policy
                 )
             if recv_req.hicache_write_policy is not None:
-                self.server_args.hicache_write_policy = recv_req.hicache_write_policy
+                hicache_fields["hicache_write_policy"] = recv_req.hicache_write_policy
+            self.server_args.override("scheduler.attach_hicache", **hicache_fields)
             logger.info(
                 f"Attached HiCache storage backend: {recv_req.hicache_storage_backend}"
             )
@@ -3725,8 +3732,11 @@ class Scheduler(
         if ok or (not self.enable_hicache_storage):
             # Treat "already disabled / nothing to do" as success for idempotence.
             self.enable_hicache_storage = False
-            self.server_args.hicache_storage_backend = None
-            self.server_args.hicache_storage_backend_extra_config = None
+            self.server_args.override(
+                "scheduler.detach_hicache",
+                hicache_storage_backend=None,
+                hicache_storage_backend_extra_config=None,
+            )
             logger.info("Detached HiCache storage backend.")
             return DetachHiCacheStorageReqOutput(
                 success=True, message=msg or "HiCache storage backend is detached."

@@ -271,16 +271,6 @@ MLA_ATTENTION_BACKENDS = [
     "intel_xpu",
 ]
 
-CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS = [
-    "flashinfer",
-    "fa3",
-    "fa4",
-    "flashmla",
-    "cutedsl_mla",
-    "cutlass_mla",
-    "trtllm_mla",
-    "tokenspeed_mla",
-]
 
 TORCH_DTYPE_TO_KV_CACHE_STR = {
     torch.float8_e4m3fn: "fp8_e4m3",
@@ -296,13 +286,8 @@ def add_mla_attention_backend(backend_name):
         logger.info(f"Added {backend_name} to MLA_ATTENTION_BACKENDS.")
 
 
-def add_chunked_prefix_cache_attention_backend(backend_name):
-    if backend_name not in CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS:
-        CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS.append(backend_name)
-        logger.info(
-            f"Added {backend_name} to CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS."
-        )
-
+# Moved to server_args (evaluated during resolution); re-exported here for
+# out-of-tree platform compatibility.
 
 # Detect stragger ranks in model loading
 UNBALANCED_MODEL_LOADING_TIMEOUT_S = 480  # leave more time for post data processing
@@ -527,9 +512,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Apply the rank zero filter to logger
         if server_args.show_time_cost:
             enable_show_time_cost()
-
-        # Model-specific adjustment
-        self.model_specific_adjustment()
 
         # Set the global server_args in the scheduler process (target worker
         # only, so a draft init cannot clobber target-derived global state).
@@ -1127,25 +1109,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             logger.error(
                 f"Failed to register transfer engine info for tp_rank={self.tp_rank}: {e}"
             )
-
-    def model_specific_adjustment(self):
-        if self.is_draft_worker:
-            return
-
-        server_args = self.server_args
-
-        # HRM-Text and multimodal chunked-prefill adjustments moved to the
-        # resolution pipeline (server_args._handle_model_capability_adjustments).
-
-        if (
-            not self.use_mla_backend
-            or server_args.attention_backend
-            not in CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS
-        ):
-            server_args.disable_chunked_prefix_cache = True
-
-        if not server_args.disable_chunked_prefix_cache:
-            log_info_on_rank0(logger, "Chunked prefix cache is turned on.")
 
     def check_quantized_moe_compatibility(self):
         if (
@@ -1855,8 +1818,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 return False, message
 
         self.model = model
-        self.server_args.model_path = model_path
-        self.server_args.load_format = load_format
+        self.server_args.override(
+            "model_runner.update_weights",
+            model_path=model_path,
+            load_format=load_format,
+        )
         self.load_config = load_config
 
         if recapture_cuda_graph and (
@@ -2404,7 +2370,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 {"kv_cache_dtype": resolved},
             )
         else:
-            self.server_args.kv_cache_dtype = resolved
+            self.server_args.override(
+                "ModelRunner.configure_kv_cache_dtype", kv_cache_dtype=resolved
+            )
 
     def configure_kv_cache_dtype(self):
         if self.server_args.kv_cache_dtype == "auto":

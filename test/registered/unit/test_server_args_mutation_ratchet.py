@@ -8,21 +8,13 @@ configuration; the resolution pipeline (``server_args.py`` and
 an exact pin: new mutations must not appear, and removals must lower the
 baseline to lock in the progress.
 
-The remaining call-sites fall into three audited families:
-
-- **Load-/runtime-resolved values** that cannot be decided at
-  ``__post_init__`` (weight-resolved kv-cache dtype for unpublished mock
-  runners, memory-budget mamba cache sizing, draft-worker copies deriving
-  ``context_length`` from the loaded model, grammar-backend import fallback).
-  Whitelisted resolvable fields must go through
-  ``declare_load_time_override`` / ``record_runtime_overrides`` instead of a
-  bare assignment.
-- **Control-plane reconfiguration** at runtime (hicache attach/detach,
-  weight updates rewriting ``model_path`` / ``load_format`` /
-  ``weight_version``, adaptive speculative-decoding retuning).
-- **Deployment wiring** computed per process or per rank (ray placement
-  groups, metrics IPC endpoints, the multi-tokenizer disaggregation-mode
-  shuffle).
+Every audited runtime adjustment goes through ``ServerArgs.override(source,
+**fields)`` — the single mutation entry point, which records provenance and
+keeps whitelisted fields consistent with the declaration stash. The baseline
+is therefore zero. The registered test harness additionally runs with
+``SGLANG_STRICT_CONFIG_MUTATION=1``, under which a bare assignment after
+resolution raises at runtime; this ratchet catches sites the tests never
+execute.
 """
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -42,14 +34,16 @@ _SRT_ROOT = Path(next(iter(sglang.srt.__path__)))
 # ``self.server_args.x = ...``, and the ``sa`` alias used by a few helpers).
 # ``==`` comparisons are excluded by the negative lookahead.
 _MUTATION_PATTERNS = [
-    re.compile(r"\bserver_args\.[a-z0-9_]+\s*=(?!=)"),
-    re.compile(r"\bsa\.[a-z0-9_]+\s*=(?!=)"),
+    # (?![=}]) skips ``==`` comparisons and f-string ``{x=}`` debug specs.
+    re.compile(r"\bserver_args\.[a-z0-9_]+\s*=(?![=}])"),
+    re.compile(r"\bsa\.[a-z0-9_]+\s*=(?![=}])"),
+    re.compile(r"get_(?:global_)?server_args\(\)\.[a-z0-9_]+\s*=(?![=}])"),
 ]
 
 # The resolution pipeline itself: mutation is its job.
 _PIPELINE = ("server_args.py", "arg_groups")
 
-_BASELINE = 45
+_BASELINE = 0
 
 
 class TestServerArgsMutationRatchet(CustomTestCase):
