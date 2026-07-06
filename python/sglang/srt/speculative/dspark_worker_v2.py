@@ -249,6 +249,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._last_context_kv_path_debug: Optional[str] = None
         self._boundary_debug_by_req_pool: dict[int, dict] = {}
         self._target_aux_debug_by_req_pool: dict[int, dict] = {}
+        self._swa_write_source_by_req_pool: dict[int, dict[int, str]] = {}
         self._stacked_wqkv_fp8_proj = None
         self._stacked_wqkv_kv_offsets: list[tuple[int, int]] = []
         self._stacked_wqkv_out_sizes: list[int] = []
@@ -1423,9 +1424,59 @@ class DSparkWorkerV2(BaseSpecWorker):
                 history.append(payload)
                 if len(history) > 16:
                     del history[:-16]
+            self._record_swa_write_source(
+                req_pool_idx=int(req_pool_idx),
+                stage=stage,
+                payload=payload,
+            )
         except Exception as e:
             debug = self._boundary_debug_by_req_pool.setdefault(int(req_pool_idx), {})
             debug[stage] = {"error": str(e)}
+
+    def _record_swa_write_source(
+        self,
+        *,
+        req_pool_idx: int,
+        stage: str,
+        payload: dict,
+    ) -> None:
+        swa_locs = payload.get("swa_locs")
+        if not isinstance(swa_locs, list):
+            return
+        source = stage
+        if stage == "decode_tail_replay":
+            source = "prefill_tail_replay"
+        elif stage == "prefill_tail_source":
+            source = "prefill_source"
+        elif stage == "decode_verify_write":
+            source = "decode_verify_write"
+        source_by_loc = self._swa_write_source_by_req_pool.setdefault(
+            int(req_pool_idx), {}
+        )
+        for loc in swa_locs:
+            if loc is None:
+                continue
+            source_by_loc[int(loc)] = source
+        if len(source_by_loc) > 512:
+            # Keep only the tail of the sliding-window history.
+            for loc in sorted(source_by_loc)[:-256]:
+                source_by_loc.pop(loc, None)
+
+    def _visible_window_source_debug(
+        self, req_pool_idx: int, visible_locs: Optional[list[int]]
+    ) -> Optional[dict]:
+        if not visible_locs:
+            return None
+        source_by_loc = self._swa_write_source_by_req_pool.get(int(req_pool_idx), {})
+        sources = [source_by_loc.get(int(loc), "unknown") for loc in visible_locs]
+        counts: dict[str, int] = {}
+        for source in sources:
+            counts[source] = counts.get(source, 0) + 1
+        return {
+            "visible_locs": [int(x) for x in visible_locs],
+            "sources": sources,
+            "counts": counts,
+        }
 
     def _checksum_swa_kv_rows(
         self,
@@ -2539,6 +2590,19 @@ class DSparkWorkerV2(BaseSpecWorker):
             req_latest_token = _req_latest_token(req)
             draft_anchor_i = int(draft_anchor[i]) if draft_anchor is not None else None
             input_bonus_i = int(input_bonus[i]) if input_bonus is not None else None
+            draft_block_metadata = self._last_draft_block_metadata_debug
+            visible_sources = None
+            if isinstance(draft_block_metadata, dict):
+                block_locs_by_row = draft_block_metadata.get(
+                    "draft_swa_valid_block_locs_by_row"
+                )
+                if isinstance(block_locs_by_row, list) and block_locs_by_row:
+                    row_idx = min(i, len(block_locs_by_row) - 1)
+                    row_locs = block_locs_by_row[row_idx]
+                    if isinstance(row_locs, list):
+                        visible_sources = self._visible_window_source_debug(
+                            int(req_pool_idx), row_locs
+                        )
             history = self._accept_anomaly_histories.setdefault(key, [])
             history.append(
                 {
@@ -2664,7 +2728,8 @@ class DSparkWorkerV2(BaseSpecWorker):
                         if verify_swa is not None and block_size > 0
                         else None
                     ),
-                    "draft_block_metadata": self._last_draft_block_metadata_debug,
+                    "visible_window_sources": visible_sources,
+                    "draft_block_metadata": draft_block_metadata,
                 }
             )
             if len(history) > self._accept_anomaly_history_size:
