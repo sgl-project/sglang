@@ -929,8 +929,12 @@ class DSparkWorkerV2(BaseSpecWorker):
         tail_len = hidden.shape[1]
         device = self.device
         req_to_token = self.model_runner.req_to_token_pool.req_to_token
+        tail_end_lens = draft_input.new_seq_lens
+        if tail_end_lens.numel() != bs:
+            tail_end_lens = prefix_lens
+        tail_end_lens = tail_end_lens.to(device=device, dtype=torch.int64)
         positions = (
-            prefix_lens.to(device=device, dtype=torch.int64).unsqueeze(1)
+            tail_end_lens.unsqueeze(1)
             - tail_len
             + torch.arange(tail_len, device=device, dtype=torch.int64).unsqueeze(0)
         )
@@ -965,7 +969,14 @@ class DSparkWorkerV2(BaseSpecWorker):
                     positions=positions[i, take],
                     cache_locs=cache_locs[i, take],
                     hidden_rows=hidden[i, take],
-                    extra={"tail_len": int(tail_len)},
+                    extra={
+                        "tail_len": int(tail_len),
+                        "tail_end_len": int(tail_end_lens[i]),
+                        "prefix_len": int(prefix_lens[i]),
+                        "tail_end_minus_prefix": int(
+                            tail_end_lens[i] - prefix_lens[i]
+                        ),
+                    },
                 )
         self._materialize_main_hidden_to_draft_state(
             main_hidden=flat_hidden,
