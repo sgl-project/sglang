@@ -80,7 +80,7 @@ The Playground lets you turn on additional knobs on top of whichever Deploy cell
 The knobs come in two flavors:
 
 - **Built-in SGLang features** — parallelism overrides (TP / CP / DP-Attention), MoE backend + EP, reasoning / tool-call parsers, speculative-decoding presets, prefill/decode disaggregation, and HiCache tiers.
-- **Hy3 specific** — `--tool-call-parser hunyuan` / `--reasoning-parser hunyuan` (suffix-aware, resolve the real special tokens from the tokenizer vocab at runtime).
+- **Hy3 specific** — `--tool-call-parser auto` / `--reasoning-parser auto` (auto-detect Hy3's suffix-aware `hunyuan` parsers from the chat template; resolve the real special tokens from the tokenizer vocab at runtime).
 
 Lines highlighted **green** are added by your overrides; lines with **red strikethrough** were in the verified base but stripped by an override. When no override differs from the base cell, the playground inherits the base's **Verified** badge; any actual change flips it to **Not Verified** until the new configuration is run end-to-end and submitted back.
 
@@ -161,13 +161,13 @@ import { Playground } from "/src/snippets/_playground.jsx";
     </tr>
     <tr>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>B200</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>180GB</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>192GB</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>4</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>BF16 590GB → 148GB/GPU</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>B300 / GB300</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>272GB</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>288GB</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>4</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>BF16 590GB → 148GB/GPU; ample KV headroom</td>
     </tr>
@@ -187,7 +187,7 @@ import { Playground } from "/src/snippets/_playground.jsx";
 - `low-latency`: steps=3, draft-tokens=4 → largest win at bs=1.
 - `balanced`: MTP disabled — keep the prefill batch moderate so chunked-prefill stays efficient.
 
-**`reasoning_effort` vs `thinking`.** The Hy3 chat template is driven by `reasoning_effort` (`high` / `low` / `no_think`), NOT by the `thinking` flag that some other families use. The default is `no_think` (instant). To opt into thinking, pass `reasoning_effort="high"` on the request (the OpenAI-standard field; sglang forwards it to the template). `reasoning_effort: max` is rejected by sglang — use `high`.
+**`reasoning_effort` vs `thinking`.** The Hy3 chat template is driven by `reasoning_effort` (`high` / `low` / `no_think`), NOT by the `thinking` flag that some other families use. The default is `no_think` (instant). To opt into thinking, pass `reasoning_effort="high"` on the request (the OpenAI-standard field; sglang forwards it to the template). `reasoning_effort: max` is rejected by sglang — use `high`. For eval, sgl-eval's `--thinking` flag translates to `reasoning_effort="high"` for Hy3, so the benchmark commands below use it as-is.
 
 ## 3. Advanced Usage
 
@@ -206,9 +206,8 @@ Enable the reasoning parser during deployment so the thinking section is separat
 sglang serve \
   --model-path tencent/Hy3 \
   --tp 8 \
-  --reasoning-parser hunyuan \
-  --tool-call-parser hunyuan \
-  --mem-fraction-static 0.9
+  --reasoning-parser auto \
+  --tool-call-parser auto
 ```
 
 </Accordion>
@@ -279,9 +278,8 @@ Hy3 supports streaming OpenAI-compatible tool calls. Enable both parsers togethe
 sglang serve \
   --model-path tencent/Hy3 \
   --tp 8 \
-  --reasoning-parser hunyuan \
-  --tool-call-parser hunyuan \
-  --mem-fraction-static 0.9
+  --reasoning-parser auto \
+  --tool-call-parser auto
 ```
 
 </Accordion>

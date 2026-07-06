@@ -7,8 +7,8 @@
 // same recipe serves both the preview (suffix-less) and the shipping (suffixed)
 // tokenizer — no per-model hard-coding.
 //
-// BF16 weights are ~590GB, so single-node serving requires 8 GPUs (H200/B200)
-// or 4 GPUs on B300/GB300 (272GB, TP4) or B200 (180GB, TP4 = 148GB/GPU).
+// BF16 weights are ~590GB. Single-node TP fits: H200 (141GB, TP8 = 74GB/GPU),
+// B200 (180GB, TP4 = 148GB/GPU), B300/GB300 (272GB, TP4), GB200 (192GB, TP4).
 
 export const config = {
   modelName: "Hy3",
