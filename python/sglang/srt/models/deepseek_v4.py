@@ -2574,6 +2574,47 @@ class DeepseekV4ForCausalLM(nn.Module):
         assert len(cache_wqkv_a_weight) == 0, cache_wqkv_a_weight.keys()
         unloaded_params = params_dict.keys() - loaded_params
 
+        if is_dspark:
+
+            def _count_with_prefix(names, prefix):
+                return sum(1 for name in names if name.startswith(prefix))
+
+            dspark_loaded_summary = {
+                "main_proj": _count_with_prefix(loaded_params, "model.main_proj."),
+                "main_norm": _count_with_prefix(loaded_params, "model.main_norm."),
+                "shared_norm": _count_with_prefix(
+                    loaded_params, "model.shared_head.norm."
+                ),
+                "hc_head": sum(
+                    1 for name in loaded_params if name.startswith("model.hc_head_")
+                ),
+                "markov_head": _count_with_prefix(
+                    loaded_params, "model.markov_head."
+                ),
+                "draft_layers": _count_with_prefix(loaded_params, "model.layers."),
+                "lm_head": _count_with_prefix(loaded_params, "lm_head."),
+            }
+            dspark_missing_summary = {
+                "main_proj": _count_with_prefix(unloaded_params, "model.main_proj."),
+                "main_norm": _count_with_prefix(unloaded_params, "model.main_norm."),
+                "shared_norm": _count_with_prefix(
+                    unloaded_params, "model.shared_head.norm."
+                ),
+                "hc_head": sum(
+                    1 for name in unloaded_params if name.startswith("model.hc_head_")
+                ),
+                "markov_head": _count_with_prefix(
+                    unloaded_params, "model.markov_head."
+                ),
+                "draft_layers": _count_with_prefix(unloaded_params, "model.layers."),
+                "lm_head": _count_with_prefix(unloaded_params, "lm_head."),
+            }
+            log_info_on_rank0(
+                logger,
+                "DSpark loaded parameter summary: "
+                f"loaded={dspark_loaded_summary} missing={dspark_missing_summary}",
+            )
+
         skipped_checking_patterns = [
             "attn_mqa.k_scale",
             "attn_mqa.v_scale",
