@@ -28,69 +28,27 @@ def _get_float8_e8m0fnu_dtype():
 
 
 def _get_float4_e2m1fn_x2_dtype():
-    # Same lazy pattern as _get_float8_e8m0fnu_dtype: the packed-FP4 dtype is a
-    # torch core dtype on recent builds, so it needs no torch_npu. Resolved at
-    # call time on the NPU-only W4A8 paths.
+    # The packed-FP4 dtype MUST come from torch_npu (an int enum, e.g. 296), not
+    # from torch. The NPU ops that consume it -- npu_dynamic_mx_quant(dst_type=),
+    # npu_quant_matmul(x2_dtype=), npu_format_cast(input_dtype=) -- REJECT the
+    # torch dtype object torch.float4_e2m1fn_x2 in op-plugin on recent torch_npu
+    # builds (it raises, or with None gives "output y must be same shape as input
+    # x"), even though torch.float4_e2m1fn_x2 exists. This is fp4-specific: fp8 /
+    # float8_e8m0fnu is accepted from torch either way. Verified on A5 /
+    # torch_npu 2.10.0.post2.dev20260704 (see llm/probe_fp4_w4a8_chain.py: dst=296
+    # passes the full quant->format_cast->matmul chain, dst=torch dtype fails).
+    #
+    # Lazy import so this NPU-only path keeps the module importable on
+    # CUDA/CPU/AMD/XPU CI (no top-level torch_npu; see AGENTS.md known pitfalls).
+    from sglang.srt.utils import is_npu
+
+    if is_npu():
+        import torch_npu
+
+        npu_dtype = getattr(torch_npu, "float4_e2m1fn_x2", None)
+        if npu_dtype is not None:
+            return npu_dtype
     return getattr(torch, "float4_e2m1fn_x2", None)
-
-
-def _mxfp4_quantize_weight(weight_fp: torch.Tensor):
-    """BF16/FP16 weight ``[out, in]`` -> msmodelslim ``W4A8_MXFP`` layout, pure torch.
-
-    Returns ``(weight_packed, weight_scale)``:
-
-      * ``weight_packed``: uint8 ``[out, in // 2]`` -- packed FP4
-        (``float4_e2m1fn_x2``), two e2m1 nibbles per byte, low nibble first.
-      * ``weight_scale``:  uint8 ``[out, in // 32]`` -- UE8M0 per-block shared
-        exponent, ``+127`` biased.
-
-    The output is byte-identical in *format* to what msmodelslim emits
-    (``pack_fp4_to_uint8`` + ``on_w4a8_mx_dynamic_per_block``), so the tensors feed
-    straight into the offline W4A8 kernel path (FRACTAL_NZ cast + transpose +
-    ``npu_quant_matmul(x2_dtype=fp4)``) that is already verified on the A5. Online
-    vs offline then differ only in the weight *source* (RTN here vs msmodelslim
-    calibration), not the layout.
-
-    Deliberately avoids ``npu_dynamic_mx_quant(dst=float4_e2m1fn_x2)``: on current
-    CANN builds its arch35 tiling rejects the shape-halving packed-FP4 output
-    ("output y must be same shape as input x"). The offline path never calls that
-    op (weights come pre-quantised in the checkpoint) -- which is exactly why the
-    offline script keeps running while this online one broke.
-
-    MXFP4 constants mirror msmodelslim (``ir/qal/qbase.py``,
-    ``core/quantizer/mse_round.py``): ebits=2 -> ``emax = 2**(ebits-1) = 2``, the
-    e2m1 grid is ``[0, .5, 1, 1.5, 2, 3, 4, 6]`` (max_norm 6.0), and the per-block
-    shared exponent is ``floor(log2(amax)) - emax``.
-    """
-    block = MXFP4_BLOCK_SIZE
-    out_features, in_features = weight_fp.shape
-    w_blocks = weight_fp.to(torch.float32).reshape(out_features, -1, block)
-
-    # Per-block shared exponent (UE8M0): floor(log2(amax)) - emax. All-zero blocks
-    # get exponent 0 (scale 1); clamp keeps it inside the int8 (+127) storage range.
-    amax = w_blocks.abs().amax(dim=-1, keepdim=True)
-    nonzero = amax > 0
-    exp = torch.floor(torch.log2(torch.where(nonzero, amax, torch.ones_like(amax)))) - 2
-    exp = torch.where(nonzero, exp, torch.zeros_like(exp)).clamp_(-127, 127)
-
-    # Normalise into the e2m1 range, then round-to-nearest onto the non-uniform
-    # e2m1 grid via midpoint thresholds. Counting how many midpoints each value
-    # exceeds is equivalent to argmin|x - grid| but uses only elementwise compares
-    # (NPU-friendly; no torch.bucketize and no [out, in, 8] broadcast). Values above
-    # 6.0 saturate to the top grid index (7), matching the reference packer.
-    w_norm = (w_blocks / torch.exp2(exp)).reshape(out_features, in_features)
-    w_abs = w_norm.abs()
-    mag = torch.zeros_like(w_abs, dtype=torch.int32)
-    for boundary in (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0):
-        mag += (w_abs > boundary).to(torch.int32)
-    # 4-bit code = sign bit (bit 3) | magnitude index (bits 0-2).
-    codes = mag + (w_norm < 0).to(torch.int32) * 8
-
-    # Pack consecutive pairs low-nibble-first: byte = code[2j] | (code[2j+1] << 4).
-    codes = codes.reshape(out_features, in_features // 2, 2)
-    weight_packed = (codes[..., 0] | (codes[..., 1] << 4)).to(torch.uint8)
-    weight_scale = (exp.reshape(out_features, in_features // block) + 127).to(torch.uint8)
-    return weight_packed, weight_scale
 
 
 class _NPULinearMethodBase(LinearMethodBase):
@@ -461,29 +419,29 @@ class NPUMXFP4W4A8LinearMethod(_NPULinearMethodBase):
         if not weight_fp.is_npu:
             weight_fp = weight_fp.to(f"npu:{torch.npu.current_device()}")
 
-        # BF16/FP16 -> packed FP4 [out, in//2] + UE8M0 block scale [out, in//32],
-        # byte-identical to the msmodelslim W4A8_MXFP checkpoint. Pure torch (see
-        # _mxfp4_quantize_weight): deliberately NOT npu_dynamic_mx_quant(dst=fp4),
-        # whose arch35 tiling rejects the shape-halving packed-FP4 output on current
-        # CANN builds ("output y must be same shape as input x"). Offline never
-        # calls that op, which is why offline keeps running and online broke.
-        qw, w_scale = _mxfp4_quantize_weight(weight_fp)
+        # BF16 -> packed FP4 (float4_e2m1fn_x2, [out, in//2]) + UE8M0 block scale.
+        # npu_dynamic_mx_quant returns the scale as [out, in//64, 2] (3D); older
+        # builds may return [out, in//32] (2D) — handle both before the transpose.
+        qw, w_scale = torch.ops.npu.npu_dynamic_mx_quant(
+            weight_fp, dst_type=fp4_dtype, round_mode="round"
+        )
 
         # weight: packed FP4 -> FRACTAL_NZ (float8_e4m3fn view) -> transpose
-        # [in//2, out]; weight_scale [out, in//32] -> [in//64, out, 2]. Identical to
-        # NPUMXFP4W4A8OfflineLinearMethod.process_weights_after_loading below.
+        # [in//2, out]. Mirror the offline path (no .contiguous() on the NZ view);
+        # view as uint8 first because npu_format_cast only accepts int-dtype tensors.
         qw_nz = npu_format_cast(
-            qw,
+            qw.view(torch.uint8),
             NPUACLFormat.ACL_FORMAT_FRACTAL_NZ,
             customize_dtype=torch.float8_e4m3fn,
             input_dtype=fp4_dtype,
         )
         layer.weight = Parameter(qw_nz.transpose(-1, -2), requires_grad=False)
 
-        n, k = w_scale.shape
-        layer.weight_scale = Parameter(
-            w_scale.reshape(n, k // 2, 2).transpose(-3, -2), requires_grad=False
-        )
+        # weight_scale -> [in//64, out, 2] to match npu_quant_matmul.
+        if w_scale.dim() == 2:
+            n, k = w_scale.shape
+            w_scale = w_scale.reshape(n, k // 2, 2)
+        layer.weight_scale = Parameter(w_scale.transpose(-3, -2), requires_grad=False)
 
         # Cache FP32 bias once to avoid a per-forward dtype conversion + alloc.
         if (
