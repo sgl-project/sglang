@@ -31,12 +31,48 @@ if [ "$ARCH" != "x86_64" ] && [ "$ARCH" != "aarch64" ]; then
     exit 1
 fi
 
+# deep_ep is installed via `python3 setup.py install`, i.e. as a setuptools *egg*.
+# `uv pip uninstall` / `pip uninstall` cannot remove eggs (they report "not installed"),
+# so old eggs pile up in easy-install.pth. On shared CI runners a different DeepEP version
+# left behind by another PR (e.g. a 2.0.0 build) then shadows the freshly-built pinned egg
+# and fails to import ("undefined symbol: ncclCommQueryProperties"), which sglang masks as
+# "DeepEP is not installed". Purge every deep_ep egg + its .pth entry so each (re)install
+# starts from a clean slate; the build below re-adds exactly the pinned version.
+purge_deep_ep_eggs() {
+    python3 - <<'PYCLEAN'
+import glob, os, shutil, sysconfig
+
+for base in {sysconfig.get_paths()["purelib"], sysconfig.get_paths()["platlib"]}:
+    for egg in glob.glob(os.path.join(base, "deep_ep-*.egg")):
+        shutil.rmtree(egg, ignore_errors=True)
+        print(f"purged stale deep_ep egg: {egg}")
+    pth = os.path.join(base, "easy-install.pth")
+    if os.path.exists(pth):
+        lines = open(pth).read().splitlines()
+        kept, seen = [], set()
+        for line in lines:
+            if "deep_ep" in line:  # drop every deep_ep egg entry; reinstall re-adds the right one
+                continue
+            if line not in seen:
+                seen.add(line)
+                kept.append(line)
+        if kept != lines:
+            open(pth, "w").write("\n".join(kept) + ("\n" if kept else ""))
+            print(f"cleaned deep_ep entries from {pth}")
+PYCLEAN
+}
+
 if [ "${FORCE_REBUILD_DEEPEP:-0}" = "1" ]; then
     echo "FORCE_REBUILD_DEEPEP=1; uninstalling any cached deep_ep before rebuild."
     ${PIP_UNINSTALL_CMD:-pip uninstall -y} deep_ep ${PIP_UNINSTALL_SUFFIX:-} || true
+    purge_deep_ep_eggs
 elif python3 -c "import deep_ep" >/dev/null 2>&1; then
     echo "deep_ep is already installed or importable. Skipping installation."
     exit 0
+else
+    # deep_ep is present but not importable (a stale/incompatible egg from another PR on a
+    # shared runner is shadowing a good build) — purge eggs so the reinstall below is clean.
+    purge_deep_ep_eggs
 fi
 
 # Install system dependencies
