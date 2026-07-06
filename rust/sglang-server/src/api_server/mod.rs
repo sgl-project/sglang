@@ -277,10 +277,24 @@ fn hidden_states_rows(vals: &[f32], lens: &[u32]) -> serde_json::Value {
     serde_json::Value::Array(rows)
 }
 
-/// Format a neutral [`GenerationOutput`] as one SGLang `/generate` frame. Lives
-/// in the handler now that the detok shard is protocol-neutral. `output_ids`
-/// (the cumulative generated token ids) is returned by default, matching the
-/// Python server.
+/// Map a terminal `abort` finish reason that carries a `status_code` (a request
+/// error the scheduler produced.
+fn abort_error_response(finish_reason: &Option<serde_json::Value>) -> Option<Response> {
+    let fr = finish_reason.as_ref()?;
+    if fr.get("type").and_then(|t| t.as_str()) != Some("abort") {
+        return None;
+    }
+    let code = fr.get("status_code").and_then(|s| s.as_u64())? as u16;
+    let message = fr
+        .get("message")
+        .and_then(|m| m.as_str())
+        .unwrap_or("request aborted");
+    let status = StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let body = serde_json::json!({ "error": { "message": message, "code": code } });
+    Some((status, Json(body)).into_response())
+}
+
+/// Format a neutral [`GenerationOutput`] as one SGLang `/generate` frame.
 fn sglang_frame(out: &GenerationOutput) -> Vec<u8> {
     let mut v = serde_json::json!({
         "text": out.text,
@@ -288,7 +302,8 @@ fn sglang_frame(out: &GenerationOutput) -> Vec<u8> {
             "id": out.rid,
             "prompt_tokens": out.prompt_tokens,
             "completion_tokens": out.completion_tokens,
-            "finish_reason": out.finish_reason.as_deref().map(|r| serde_json::json!({ "type": r })),
+            // Full dict (type + matched + message + status_code + …), or null.
+            "finish_reason": out.finish_reason,
         },
     });
     // Logprobs: SGLang shape is a list of `[logprob, token_id, token_text|null]`
@@ -526,7 +541,7 @@ struct OutputAccumulator {
     output_ids: Vec<i32>,
     prompt_tokens: u32,
     completion_tokens: u64,
-    finish_reason: Option<String>,
+    finish_reason: Option<serde_json::Value>,
     /// Output-token logprobs, concatenated across chunks (parallel val/idx).
     out_lp_val: Vec<f32>,
     out_lp_idx: Vec<i32>,
@@ -749,10 +764,15 @@ async fn generate(State(state): State<AppState>, Json(payload): Json<GeneratePay
                 EgressItem::Done(out) => {
                     acc.fold(&out);
                     guard.disarm(rid);
+                    let final_out = acc.into_output(out.rid);
+                    // A validation abort carries its own HTTP status + diagnostic.
+                    if let Some(resp) = abort_error_response(&final_out.finish_reason) {
+                        return resp;
+                    }
                     return (
                         StatusCode::OK,
                         [("content-type", "application/json")],
-                        sglang_frame(&acc.into_output(out.rid)),
+                        sglang_frame(&final_out),
                     )
                         .into_response();
                 }
@@ -823,5 +843,36 @@ mod logprob_shape_tests {
         assert!(opt_texts(&[]).is_none());
         let t = vec!["x".to_string()];
         assert_eq!(opt_texts(&t), Some(t.as_slice()));
+    }
+
+    /// A validation abort (`status_code` set) maps to that HTTP status — the
+    /// over-context request must not come back as a 200.
+    #[test]
+    fn validation_abort_maps_to_its_status() {
+        let fr = Some(serde_json::json!({
+            "type": "abort", "message": "over the 40954-token limit", "status_code": 400
+        }));
+        let resp = abort_error_response(&fr).expect("abort with status → error response");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// A normal finish, a bare abort (no status), and no finish all stay 200.
+    #[test]
+    fn non_error_finishes_stay_ok() {
+        assert!(
+            abort_error_response(&Some(serde_json::json!({"type": "stop", "matched": 5})))
+                .is_none()
+        );
+        assert!(
+            abort_error_response(&Some(serde_json::json!({"type": "length", "length": 8})))
+                .is_none()
+        );
+        assert!(
+            abort_error_response(&Some(
+                serde_json::json!({"type": "abort", "message": "Aborted"})
+            ))
+            .is_none()
+        );
+        assert!(abort_error_response(&None).is_none());
     }
 }
