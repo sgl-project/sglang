@@ -3496,9 +3496,16 @@ class Scheduler(
         running_bs: int,
         beam_width: Optional[int] = None,
         running_batch: Optional[ScheduleBatch] = None,
+        chunked_req_in_flight: bool = False,
     ) -> int:
         pp_budget = get_parallel().pp_max_micro_batch_size - running_bs
-        available = self.req_to_token_pool.available_size()
+        # An in-flight chunked prefill already holds a req_to_token_pool slot
+        # (deducted from available_size()) and is re-counted in the adder's
+        # can_run_list by add_chunked_req, so add that held slot back here to
+        # avoid declaring the batch full one request early.
+        available = self.req_to_token_pool.available_size() + int(
+            chunked_req_in_flight
+        )
 
         active_batch = running_batch or self.running_batch
         available = max(
@@ -3508,7 +3515,6 @@ class Scheduler(
         if beam_width is not None:
             # A beam candidate owns beam_width rows once decoding.
             res = min(res, available // beam_width)
-
         return res
 
     def get_new_batch_prefill(self, running_batch: ScheduleBatch) -> NextBatchPlan:
@@ -3634,6 +3640,10 @@ class Scheduler(
             prefill_tile_block_m=prefill_tile_block_m,
         )
 
+        # add_chunked_req returns None on the final chunk, so capture whether a
+        # chunk is in flight (holding a req_to_token_pool slot) before the call;
+        # the batch-full check below compensates for that already-held slot.
+        chunked_req_holds_slot = self.chunked_req is not None
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
@@ -3667,6 +3677,7 @@ class Scheduler(
                 running_bs,
                 candidate_beam_width,
                 running_batch=running_batch,
+                chunked_req_in_flight=chunked_req_holds_slot,
             ):
                 running_batch.batch_is_full = True
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
