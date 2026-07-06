@@ -84,6 +84,7 @@ class DSATopKBackend(Enum):
         row_starts: Optional[torch.Tensor] = None,
         batch_idx_list: Optional[List[int]] = None,
         force_unfused_topk: bool = False,
+        allow_topk_v2: bool = True,
     ) -> torch.Tensor:
         if not envs.SGLANG_DSA_FUSE_TOPK.get() or force_unfused_topk:
             return self.topk_func(logits, lengths, topk, row_starts=row_starts)
@@ -97,7 +98,8 @@ class DSATopKBackend(Enum):
         # (see dsa_drop_wide_page_table), so once the shape matches we commit to v2
         # and never silently fall back to the legacy page_size=1 path from here.
         if (
-            envs.SGLANG_OPT_USE_TOPK_V2.get()
+            allow_topk_v2
+            and envs.SGLANG_OPT_USE_TOPK_V2.get()
             and topk_transform_method == TopkTransformMethod.PAGED
             and row_starts is None
             and batch_idx_list is None
