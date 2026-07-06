@@ -2574,6 +2574,26 @@ class DeepseekV4ForCausalLM(nn.Module):
         assert len(cache_wqkv_a_weight) == 0, cache_wqkv_a_weight.keys()
         unloaded_params = params_dict.keys() - loaded_params
 
+        skipped_checking_patterns = [
+            "attn_mqa.k_scale",
+            "attn_mqa.v_scale",
+            "blockscale_swizzled",
+        ]
+        if not self.pp_group.is_first_rank:
+            skipped_checking_patterns.append("embed_tokens")
+        if not self.pp_group.is_last_rank:
+            skipped_checking_patterns.append("model.norm.")
+            skipped_checking_patterns.extend(["lm_head", "hc_head_"])
+        if is_nextn or is_dspark:
+            skipped_checking_patterns.extend(["lm_head", "embed_tokens"])
+        unloaded_params = {
+            p
+            for p in unloaded_params
+            if all(
+                skipped_checking_pattern not in p
+                for skipped_checking_pattern in skipped_checking_patterns
+            )
+        }
         if is_dspark:
 
             def _count_with_prefix(names, prefix):
@@ -2609,32 +2629,23 @@ class DeepseekV4ForCausalLM(nn.Module):
                 "draft_layers": _count_with_prefix(unloaded_params, "model.layers."),
                 "lm_head": _count_with_prefix(unloaded_params, "lm_head."),
             }
+            dspark_missing_names = sorted(
+                name
+                for name in unloaded_params
+                if name.startswith("model.main_proj.")
+                or name.startswith("model.main_norm.")
+                or name.startswith("model.shared_head.")
+                or name.startswith("model.hc_head_")
+                or name.startswith("model.markov_head.")
+                or name.startswith("model.layers.")
+                or name.startswith("lm_head.")
+            )
             log_info_on_rank0(
                 logger,
-                "DSpark loaded parameter summary: "
-                f"loaded={dspark_loaded_summary} missing={dspark_missing_summary}",
+                "DSpark loaded parameter summary after skip filtering: "
+                f"loaded={dspark_loaded_summary} missing={dspark_missing_summary} "
+                f"missing_names={dspark_missing_names}",
             )
-
-        skipped_checking_patterns = [
-            "attn_mqa.k_scale",
-            "attn_mqa.v_scale",
-            "blockscale_swizzled",
-        ]
-        if not self.pp_group.is_first_rank:
-            skipped_checking_patterns.append("embed_tokens")
-        if not self.pp_group.is_last_rank:
-            skipped_checking_patterns.append("model.norm.")
-            skipped_checking_patterns.extend(["lm_head", "hc_head_"])
-        if is_nextn or is_dspark:
-            skipped_checking_patterns.extend(["lm_head", "embed_tokens"])
-        unloaded_params = {
-            p
-            for p in unloaded_params
-            if all(
-                skipped_checking_pattern not in p
-                for skipped_checking_pattern in skipped_checking_patterns
-            )
-        }
         if unloaded_params:
             logger.warning(
                 f"Some weights are not initialized from checkpoints: {unloaded_params}"
