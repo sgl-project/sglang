@@ -56,7 +56,7 @@ if TYPE_CHECKING:
 class RadixKey:
     """is_bigram=True: token_ids holds raw tokens (N+1 for N bigrams); slices share one boundary token."""
 
-    __slots__ = ("token_ids", "extra_key", "is_bigram", "limit")
+    __slots__ = ("token_ids", "extra_key", "is_bigram", "limit", "offset")
 
     def __init__(
         self,
@@ -64,6 +64,7 @@ class RadixKey:
         extra_key: Optional[str] = None,
         is_bigram: bool = False,
         limit: Optional[int] = None,
+        offset: int = 0,
     ):
         # token ids sequence (raw ints in both modes)
         self.token_ids = token_ids
@@ -74,18 +75,32 @@ class RadixKey:
         # Optional cap on raw tokens: behave as if token_ids were sliced to
         # token_ids[:limit], without the O(n) copy. None = use all tokens.
         self.limit = limit
+        # Left-side raw-token offset, symmetric to `limit`. The logical raw-token
+        # window is token_ids[offset : limit-or-end]. `suffix()` produces a
+        # zero-copy suffix view (advance offset) instead of copying the tail, used
+        # only in the transient match-descent key. Consumers that read `token_ids`
+        # directly do NOT honor the offset, so offset views must never be stored
+        # as node keys; __getitem__ keeps copy semantics for that reason.
+        self.offset = offset
+
+    def _raw_bounds(self) -> Tuple[int, int]:
+        """(start, end) raw-token indices of the logical window into token_ids."""
+        n = len(self.token_ids)
+        end = n if self.limit is None or self.limit > n else self.limit
+        start = self.offset
+        if start > end:
+            start = end
+        return start, end
 
     def _raw_len(self) -> int:
-        n = len(self.token_ids)
-        if self.limit is not None and self.limit < n:
-            return self.limit
-        return n
+        start, end = self._raw_bounds()
+        return end - start
 
     def raw_token_ids(self) -> array:
-        """token_ids honoring `limit` (copies only when capped)."""
-        n = self._raw_len()
+        """Logical raw token_ids honoring `offset`/`limit` (copies only when windowed)."""
+        start, end = self._raw_bounds()
         t = self.token_ids
-        return t if n == len(t) else t[:n]
+        return t if (start == 0 and end == len(t)) else t[start:end]
 
     def __len__(self) -> int:
         n = self._raw_len()
@@ -96,17 +111,24 @@ class RadixKey:
     # TODO(Jialin): vectorize with numpy without PyLong boxing
     def __iter__(self) -> Iterator:
         t = self.token_ids
-        n = self._raw_len()
+        start, end = self._raw_bounds()
+        n = end - start
         if self.is_bigram:
-            for i in range(n - 1 if n > 0 else 0):
+            for i in range(start, start + (n - 1 if n > 0 else 0)):
                 yield (t[i], t[i + 1])
-        elif n == len(t):
+        elif start == 0 and end == len(t):
             yield from t
         else:
-            for i in range(n):
+            for i in range(start, end):
                 yield t[i]
 
     def __getitem__(self, idx: Union[int, slice]) -> RadixKey:
+        # Copy semantics: the returned key owns a compact token_ids array. This
+        # keeps every consumer that reads `.token_ids` directly correct, including
+        # keys stored as node.key. For the hot zero-copy descent suffix, use
+        # `suffix()` instead. Indices are logical-unit indices; add `offset` to
+        # reach the raw backing array.
+        o = self.offset
         # Normalize int -> 1-element slice so the rest handles one shape.
         if isinstance(idx, int):
             if idx < 0:
@@ -121,13 +143,54 @@ class RadixKey:
         if self.is_bigram:
             # bigrams [start, stop) span raw tokens [start, stop + 1);
             # empty slice -> empty raw tokens (not a dangling boundary token).
-            raw = self.token_ids[start : stop + 1] if stop > start else array("q")
+            raw = (
+                self.token_ids[o + start : o + stop + 1]
+                if stop > start
+                else array("q")
+            )
             return RadixKey(raw, self.extra_key, is_bigram=True)
-        return RadixKey(self.token_ids[start:stop], self.extra_key)
+        return RadixKey(self.token_ids[o + start : o + stop], self.extra_key)
+
+    def suffix(self, start: int) -> RadixKey:
+        """Zero-copy suffix view ``self[start:]`` used in the match-descent hot loop.
+
+        Advances the raw-token ``offset`` instead of copying the tail. The result
+        shares ``token_ids`` with ``self`` and MUST NOT be stored as a node key
+        (call ``materialize()`` first) since consumers that read ``token_ids``
+        directly do not honor the offset.
+        """
+        if start <= 0:
+            return self
+        n = len(self)
+        if start >= n:
+            start = n
+        o = self.offset
+        if self.is_bigram:
+            # bigram suffix spans raw tokens [o+start, current_end]; keep the
+            # existing right bound (limit or full length) — dropping leading
+            # bigrams never extends the right edge.
+            _, end = self._raw_bounds()
+            if start >= n:
+                return RadixKey(array("q"), self.extra_key, is_bigram=True)
+            return RadixKey(
+                self.token_ids,
+                self.extra_key,
+                is_bigram=True,
+                offset=o + start,
+                limit=end,
+            )
+        _, end = self._raw_bounds()
+        return RadixKey(
+            self.token_ids,
+            self.extra_key,
+            offset=o + start,
+            limit=end,
+        )
 
     def __repr__(self) -> str:
-        preview = self.token_ids[:10]
-        return f"RadixKey(extra_key={self.extra_key!r}, token_ids={preview}{'...' if len(self.token_ids) > 10 else ''}, is_bigram={self.is_bigram})"
+        start, end = self._raw_bounds()
+        preview = self.token_ids[start : min(start + 10, end)]
+        return f"RadixKey(extra_key={self.extra_key!r}, token_ids={preview}{'...' if end - start > 10 else ''}, is_bigram={self.is_bigram})"
 
     def page_aligned(self, page_size: int) -> RadixKey:
         if page_size == 1:
@@ -160,20 +223,24 @@ class RadixKey:
         self._check_compatible(other)
         t0, t1 = self.token_ids, other.token_ids
         assert type(t0) is type(t1), (type(t0), type(t1))
-        n = min(len(t0), len(t1))
+        # Compare within each key's own raw window (honoring offset/limit).
+        o0, e0 = self._raw_bounds()
+        o1, e1 = other._raw_bounds()
+        n = min(e0 - o0, e1 - o1)
 
         # Exponential search for the first diverging token: gallop in doubling
         # windows (one C-level slice compare each), then binary-search the window
         # holding the divergence -- no per-token Python loop on long shared prefixes.
+        # `lo`/`hi` are window-relative; add o0/o1 to index into each raw array.
         matched_tokens = n
         lo = 0
         step = 1
         while lo < n:
             hi = lo + step if lo + step < n else n
-            if t0[lo:hi] != t1[lo:hi]:
+            if t0[o0 + lo : o0 + hi] != t1[o1 + lo : o1 + hi]:
                 while hi - lo > 1:
                     mid = (lo + hi) // 2
-                    if t0[lo:mid] == t1[lo:mid]:
+                    if t0[o0 + lo : o0 + mid] == t1[o1 + lo : o1 + mid]:
                         lo = mid
                     else:
                         hi = mid
@@ -194,13 +261,15 @@ class RadixKey:
     def child_key(self, page_size: int = 1):
         """Hashable dict-key for the first ``page_size`` logical units, namespaced by ``extra_key``."""
         t = self.token_ids
+        # Index relative to the logical window start (offset).
+        o = self.offset
         if self.is_bigram:
             if page_size == 1:
-                plain = (t[0], t[1])
+                plain = (t[o], t[o + 1])
             else:
-                plain = tuple((t[j], t[j + 1]) for j in range(page_size))
+                plain = tuple((t[o + j], t[o + j + 1]) for j in range(page_size))
         else:
-            plain = t[0] if page_size == 1 else tuple(t[:page_size])
+            plain = t[o] if page_size == 1 else tuple(t[o : o + page_size])
         return plain if self.extra_key is None else (self.extra_key, plain)
 
     def hash_page(self, start: int, end: int, prior_hash: Optional[str] = None) -> str:
@@ -209,12 +278,14 @@ class RadixKey:
         if prior_hash:
             hasher.update(bytes.fromhex(prior_hash))
         t = self.token_ids
+        # [start, end) are logical-unit indices; shift by offset to index raw tokens.
+        o = self.offset
         if self.is_bigram:
-            for j in range(start, end):
+            for j in range(start + o, end + o):
                 hasher.update(t[j].to_bytes(4, byteorder="little", signed=False))
                 hasher.update(t[j + 1].to_bytes(4, byteorder="little", signed=False))
         else:
-            for j in range(start, end):
+            for j in range(start + o, end + o):
                 hasher.update(t[j].to_bytes(4, byteorder="little", signed=False))
         return hasher.hexdigest()
 
@@ -440,7 +511,8 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             value = value[: len(key)]
         else:
             # Debug/test fallback: use token ids themselves as values.
-            value = torch.tensor(key.token_ids[: len(key)], dtype=torch.int64)
+            # raw_token_ids() honors any offset/limit view from page_aligned.
+            value = torch.tensor(key.raw_token_ids()[: len(key)], dtype=torch.int64)
 
         prefix_len = self._insert_helper(self.root_node, key, value, priority, chunked)
         # An insert can add a new node or split an existing one, both of which can
@@ -678,7 +750,9 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             else:
                 value.append(child.value)
                 node = child
-                key = key[prefix_len:]
+                # Zero-copy suffix view: the descent key is transient (never
+                # stored), so advancing offset avoids copying the tail each step.
+                key = key.suffix(prefix_len)
 
                 if len(key):
                     child_key = key.child_key(self.page_size)
