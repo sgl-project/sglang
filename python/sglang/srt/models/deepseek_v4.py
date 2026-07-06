@@ -2157,8 +2157,9 @@ class DeepseekV4ForCausalLM(nn.Module):
             self._setup_fp8_wo_a_scales(is_nextn, is_dspark)
 
         if is_nextn or is_dspark:
-            for layer_id in range(self.model.start_layer, self.model.end_layer):
-                self.model.layers[layer_id].refresh_mhc_norm_weight_cache()
+            layers = [self.model.decoder] if is_nextn else list(self.model.layers)
+            for layer in layers:
+                layer.refresh_mhc_norm_weight_cache()
             return
         for layer_id in range(self.model.start_layer, self.model.end_layer):
             layer = self.model.layers[layer_id]
