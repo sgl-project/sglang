@@ -56,7 +56,6 @@ from sglang.srt.utils.common import (
     is_xpu,
     xpu_has_xmx_support,
 )
-from sglang.srt.utils.tensor_bridge import use_mlx
 
 logger = logging.getLogger(__name__)
 
@@ -417,12 +416,8 @@ def _exaone_overrides(server_args: Any, hf_config: Any) -> dict:
 @_register_for("GptOssForCausalLM")
 def _gpt_oss_overrides(server_args: Any, hf_config: Any) -> dict:
     overrides: Dict[str, Any] = {}
-    # Set attention backend for GPT-OSS. When serving through MLX on Apple
-    # Silicon none of the backends below exist (no triton); keep the platform
-    # default (torch_native), which attention never runs through: inference
-    # goes through the MLX runner.
-    _mlx_serving = is_mps() and use_mlx()
-    if server_args.is_attention_backend_not_set() and not _mlx_serving:
+    # Set attention backend for GPT-OSS
+    if server_args.is_attention_backend_not_set():
         if is_sm100_supported():
             overrides["attention_backend"] = "trtllm_mha"
         elif is_sm90_supported():
@@ -433,7 +428,8 @@ def _gpt_oss_overrides(server_args: Any, hf_config: Any) -> dict:
             overrides["attention_backend"] = "intel_xpu"
         elif is_hip():
             overrides["attention_backend"] = "aiter"
-        else:
+        elif not is_mps():
+            # No triton on macOS; MPS keeps the platform default.
             overrides["attention_backend"] = "triton"
     if is_xpu():
         # Check for bf16 dtype on Intel XPU. Reads the pristine dtype request,

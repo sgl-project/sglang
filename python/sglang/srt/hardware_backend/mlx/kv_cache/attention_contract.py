@@ -19,6 +19,9 @@ SLIDING_ATTENTION_ATTRS = (
     "use_sliding_window",
     "is_swa",
 )
+# mlx-lm containers name their scalar sliding window either ``window_size``
+# (gpt_oss, gemma4) or ``sliding_window`` (olmo3, llama SWA variants, ...).
+WINDOW_SIZE_ATTRS = ("window_size", "sliding_window")
 
 
 def first_present_attr(module: Any, names: Iterable[str]) -> Any | None:
@@ -63,11 +66,6 @@ def is_attention_module(module: Any) -> bool:
         and get_num_heads(module) is not None
         and get_num_kv_heads(module) is not None
     )
-
-
-# mlx-lm containers name their scalar sliding window either ``window_size``
-# (gpt_oss, gemma4) or ``sliding_window`` (olmo3, llama SWA variants, ...).
-WINDOW_SIZE_ATTRS = ("window_size", "sliding_window")
 
 
 def get_container_window_size(model: Any) -> int | None:

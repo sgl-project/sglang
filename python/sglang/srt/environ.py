@@ -551,13 +551,6 @@ class Envs:
     # Number of decode steps between periodic mx.clear_cache() calls.
     # Set to 0 to disable cache clearing entirely.
     SGLANG_MLX_CLEAR_CACHE_STEPS = EnvInt(256)
-    # Test hooks for the MLX correctness tests (Apple Silicon only): model
-    # override (each test file provides its own default repo), mem-fraction
-    # for the launched server, and the free-memory pre-flight threshold in
-    # GB below which the tests skip instead of risking a Metal OOM.
-    SGLANG_MLX_TEST_MODEL = EnvStr(None)
-    SGLANG_MLX_TEST_MEM_FRACTION = EnvFloat(None)
-    SGLANG_MLX_TEST_MIN_FREE_GB = EnvFloat(None)
 
     # NPU
     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)

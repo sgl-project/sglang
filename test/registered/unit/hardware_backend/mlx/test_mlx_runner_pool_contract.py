@@ -8,9 +8,8 @@ MLX startup crashes inside ``Scheduler.init_target_memory_pool``.
 
 Similarly, the base ``init_attention_backends`` constructs the torch
 attention backend named by ``server_args.attention_backend``; MLX never
-uses one, and model-specific defaults can force a backend whose
-``__init__`` reads real KV buffers (gpt-oss forces ``triton``, which
-crashes on ``_DummyKVCache``).
+uses one, and some backends read real KV buffers in ``__init__``, which
+crashes on ``_DummyKVCache``.
 
 The checks are signature/identity-only and MLX-gated because importing
 the stub pulls in ``mlx.core``.
@@ -87,10 +86,9 @@ class TestMlxRunnerPoolContract(unittest.TestCase):
             msg=(
                 "MlxModelRunnerStub lost its init_attention_backends "
                 "override. The base implementation constructs the backend "
-                "named by server_args.attention_backend; model-specific "
-                "defaults can force one whose __init__ reads real KV "
-                "buffers (gpt-oss forces triton, which crashes on "
-                "_DummyKVCache). MLX never uses a torch attention backend "
+                "named by server_args.attention_backend; some backends "
+                "read real KV buffers in __init__, which crashes on "
+                "_DummyKVCache. MLX never uses a torch attention backend "
                 "— re-add the override that keeps attn_backend = None."
             ),
         )

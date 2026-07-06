@@ -3927,12 +3927,9 @@ class ServerArgs:
         elif model_arch in ["GptOssForCausalLM"]:
             # Attention backend selection + XPU dtype validation moved to the
             # override registry (arg_groups/overrides.py: _gpt_oss_overrides).
-            # When serving through MLX on Apple Silicon the backend stays at
-            # the platform default, which attention never runs through, so
-            # the CUDA-oriented backend assertion below does not apply.
-            _mlx_serving = is_mps() and use_mlx()
-
-            if not _mlx_serving:
+            # None of these backends exist on MPS; attention_backend is still
+            # unset there at this point (the torch_native default fills later).
+            if not is_mps():
                 supported_backends = [
                     "triton",
                     "trtllm_mha",
