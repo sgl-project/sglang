@@ -183,12 +183,16 @@ class DeepEPOutputDtype(Enum):
     - FP8: dispatch hidden states in fp8
     - INT8: dispatch hidden states in int8
     - NVFP4: dispatch hidden states in nvfp4
+    - MXFP8: dispatch hidden states in Ascend mxfp8
+    - MXFP4: dispatch hidden states in Ascend mxfp4
     """
 
     BF16 = "bf16"
     FP8 = "fp8"
     INT8 = "int8"
     NVFP4 = "nvfp4"
+    MXFP8 = "mxfp8"
+    MXFP4 = "mxfp4"
 
 
 def get_deepep_output_dtype(self) -> DeepEPOutputDtype:

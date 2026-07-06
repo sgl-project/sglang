@@ -34,10 +34,12 @@ from sglang.srt.utils import (
     is_flashinfer_available,
     is_hip,
     is_npu,
+    is_npu_before_atlas_a5,
     load_json_config,
 )
 
 _is_npu = is_npu()
+_is_npu_before_atlas_a5 = is_npu_before_atlas_a5()
 
 if TYPE_CHECKING:
     from sglang.srt.batch_overlap.single_batch_overlap import CombineOverlapArgs
@@ -422,6 +424,14 @@ class _DeepEPDispatcherImplBase:
                 "use_fp8": False,
                 "use_nvfp4": True,
             },
+            DeepEPOutputDtype.MXFP8: {
+                "use_fp8": True,
+                "use_nvfp4": False,
+            },
+            DeepEPOutputDtype.MXFP4: {
+                "use_fp8": True,
+                "use_nvfp4": False,
+            },
         }
 
         # Validate and apply hardware-specific adjustments
@@ -449,6 +459,18 @@ class _DeepEPDispatcherImplBase:
                 raise RuntimeError(
                     "Ascend A2/A3 NPU does not support nvfp4 deepep_dispatcher_output_dtype."
                 )
+            elif self.deepep_output_dtype == DeepEPOutputDtype.MXFP8:
+                if _is_npu_before_atlas_a5:
+                    raise RuntimeError(
+                        "Ascend NPU before Atlas A5 does not support "
+                        "mxfp8 deepep_dispatcher_output_dtype."
+                    )
+            elif self.deepep_output_dtype == DeepEPOutputDtype.MXFP4:
+                if _is_npu_before_atlas_a5:
+                    raise RuntimeError(
+                        "Ascend NPU before Atlas A5 does not support "
+                        "mxfp4 deepep_dispatcher_output_dtype."
+                    )
         else:
             if self.deepep_output_dtype == DeepEPOutputDtype.INT8:
                 logger.warning_once(
@@ -488,7 +510,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
     ):
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
         topk_ids = topk_ids.to(torch.int64)
-        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8:
+        if (not _is_npu) and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8:
             # TODO hard code 128 block quant,use fp8 communication
             hidden_states = sglang_per_token_group_quant_fp8(
                 hidden_states,
@@ -497,6 +519,30 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
                 scale_tma_aligned=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
                 scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
             )
+        elif _is_npu:
+            if self.deepep_output_dtype == DeepEPOutputDtype.BF16:
+                quant_type_tensor = None
+            elif self.deepep_output_dtype == DeepEPOutputDtype.INT8:
+                quant_type_tensor = torch.empty(
+                    0, dtype=torch.int8, device=hidden_states.device
+                )
+            elif self.deepep_output_dtype == DeepEPOutputDtype.MXFP8:
+                quant_type_tensor = torch.empty(
+                    0, dtype=torch.float8_e4m3fn, device=hidden_states.device
+                )
+            elif self.deepep_output_dtype == DeepEPOutputDtype.MXFP4:
+                quant_type_tensor = torch.empty(
+                    0,
+                    dtype=torch.float4_e2m1fn_x2,
+                    device=hidden_states.device,
+                )
+            else:
+                raise ValueError(
+                    f"Unsupported NPU DeepEP output dtype: {self.deepep_output_dtype}"
+                )
+
+            if quant_type_tensor is not None:
+                hidden_states = (hidden_states, quant_type_tensor)
         previous_event = Buffer.capture() if self.async_finish else None
         return hidden_states, topk_ids, topk_weights, previous_event
 
@@ -708,20 +754,43 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         topk_ids: torch.Tensor,
     ):
         input_global_scale = self.quant_config.get("input_global_scale", None)
+        use_fp8 = False
+        use_ue8m0 = False
+        use_mxfp4 = False
 
         # round_scale / use_ue8m0 are FP8-DeepGEMM specific; they cause DeepEP
         # to return int32-packed UE8M0 scales that don't feed the flashinfer
         # cutedsl kernel.
-        fp8_deepgemm_scale_opts = (
-            dict(
-                round_scale=deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-                and deep_gemm_wrapper.DEEPGEMM_BLACKWELL,
-                use_ue8m0=deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-                and deep_gemm_wrapper.DEEPGEMM_BLACKWELL,
-            )
-            if self.use_fp8
-            else dict()
+        round_scale = (
+            deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+            and deep_gemm_wrapper.DEEPGEMM_BLACKWELL
         )
+
+        if input_global_scale is not None:
+            pass
+        elif not _is_npu:
+            use_fp8 = self.use_fp8
+            use_ue8m0 = (
+                deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+                and deep_gemm_wrapper.DEEPGEMM_BLACKWELL
+                and self.use_fp8
+            )
+        else:
+            if self.deepep_output_dtype == DeepEPOutputDtype.BF16:
+                pass
+            elif self.deepep_output_dtype == DeepEPOutputDtype.INT8:
+                use_fp8 = True
+            elif self.deepep_output_dtype == DeepEPOutputDtype.MXFP8:
+                use_fp8 = True
+                use_ue8m0 = True
+            elif self.deepep_output_dtype == DeepEPOutputDtype.MXFP4:
+                use_fp8 = True
+                use_ue8m0 = True
+                use_mxfp4 = True
+            else:
+                raise ValueError(
+                    f"Unsupported NPU DeepEP output dtype: {self.deepep_output_dtype}"
+                )
 
         buffer = self._get_buffer()
         _deepep_precompile_tp_barrier()
@@ -731,7 +800,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 topk_ids,
                 self.num_max_dispatch_tokens_per_rank,
                 self.num_experts,
-                use_fp8=self.use_fp8,
+                use_fp8=use_fp8,
                 **(dict(use_nvfp4=True) if self.use_nvfp4 else dict()),
                 **(
                     dict(x_global_scale=input_global_scale)
@@ -740,7 +809,9 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 ),
                 async_finish=not self.return_recv_hook,
                 return_recv_hook=self.return_recv_hook,
-                **fp8_deepgemm_scale_opts,
+                round_scale=round_scale,
+                use_ue8m0=use_ue8m0,
+                use_mxfp4=use_mxfp4,
             )
         )
         return packed_recv_hidden, self.packed_recv_count, event, hook
