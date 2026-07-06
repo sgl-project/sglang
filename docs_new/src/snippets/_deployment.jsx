@@ -581,7 +581,7 @@ export const Deployment = ({ config, benchmarks }) => {
     const SPEED_LABELS = [
       ["ttft_ms",                `TTFT (${pct})`,      "ms"],
       ["tpot_ms",                `TPOT (${pct})`,      "ms"],
-      // throughput per gpu = total(input+output)/elapsed/GPU (SemiAnalysis convention);
+      // throughput per gpu = total(input+output)/elapsed/GPU;
       // stored directly in the benchmarks file (= output tok/s/GPU × (isl+osl)/osl).
       ["tokens_per_sec_per_gpu", "throughput per gpu", "tok/s"],
       ["interactivity",          "interactivity",   "tokens/s/user",

@@ -174,7 +174,7 @@ hardware owners sign off on at review.
 ### 4. Benchmarks file
 One entry per measured block only (cells without entries already render
 "pending" — bare `{match}` stubs are unnecessary). `tokens_per_sec_per_gpu` =
-total (in+out) tok/s/GPU (SemiAnalysis) = `output tok/s ÷ (tp × nnodes) ×
+total (in+out) tok/s/GPU = `output tok/s ÷ (tp × nnodes) ×
 (isl+osl)/osl` — stored directly (the card shows it as-is). TTFT/TPOT
 take the P50 (median) rows; set `config.latencyPercentile` (default `"P50"`; use
 `"Mean"` only for legacy Mean-recorded data — temporary, being migrated to P50).
