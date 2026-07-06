@@ -2173,6 +2173,14 @@ class ServerArgs:
         float,
         "The ratio of the size of host KV cache memory pool to the size of device pool.",
     ] = 2.0
+    kv_hicache_ratio: A[
+        Optional[float],
+        "The ratio of the size of the host KV cache memory pool to the size of the KV device pool. Defaults to --hicache-ratio if not set.",
+    ] = None
+    mamba_hicache_ratio: A[
+        Optional[float],
+        "The ratio of the size of the host Mamba cache memory pool to the size of the Mamba device pool. Defaults to --hicache-ratio if not set.",
+    ] = None
     hicache_size: A[
         int,
         "The size of host KV cache memory pool in gigabytes, which will override the hicache_ratio if set.",
@@ -6085,11 +6093,35 @@ class ServerArgs:
         ):
             return
 
+        self._handle_hicache_ratio_defaults()
+
         # Step 1: Initial layout-io compatibility normalization.
         self._resolve_layout_io_compatibility()
 
         # Step 2: Storage-layout normalization without changing io backend.
         self._resolve_storage_layout_compatibility()
+
+    def _handle_hicache_ratio_defaults(self):
+        split_ratio_set = (
+            self.kv_hicache_ratio is not None or self.mamba_hicache_ratio is not None
+        )
+        if self.kv_hicache_ratio is None:
+            self.kv_hicache_ratio = self.hicache_ratio
+        if self.mamba_hicache_ratio is None:
+            self.mamba_hicache_ratio = self.hicache_ratio
+
+        if self.hicache_ratio <= 0:
+            raise ValueError("--hicache-ratio must be greater than 0")
+        if self.kv_hicache_ratio <= 0:
+            raise ValueError("--kv-hicache-ratio must be greater than 0")
+        if self.mamba_hicache_ratio <= 0:
+            raise ValueError("--mamba-hicache-ratio must be greater than 0")
+        if split_ratio_set and self.hicache_size > 0:
+            logger.warning(
+                "--hicache-size overrides ratio-based host pool sizing; "
+                "--kv-hicache-ratio/--mamba-hicache-ratio will not affect "
+                "the size of host pools that receive --hicache-size."
+            )
 
     def _resolve_layout_io_compatibility(self):
         if (
@@ -7361,6 +7393,22 @@ class ServerArgs:
         return (
             self.disable_radix_cache is False
             and self.mamba_radix_cache_strategy == "extra_buffer_lazy"
+        )
+
+    @property
+    def resolved_kv_hicache_ratio(self) -> float:
+        return (
+            self.kv_hicache_ratio
+            if self.kv_hicache_ratio is not None
+            else self.hicache_ratio
+        )
+
+    @property
+    def resolved_mamba_hicache_ratio(self) -> float:
+        return (
+            self.mamba_hicache_ratio
+            if self.mamba_hicache_ratio is not None
+            else self.hicache_ratio
         )
 
     @cached_property

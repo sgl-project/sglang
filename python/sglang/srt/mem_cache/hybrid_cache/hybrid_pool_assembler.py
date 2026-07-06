@@ -68,7 +68,7 @@ def build_kv_host_pool(
         kwargs["override_kv_cache_dim"] = override_kv_cache_dim
     return kv_host_pool_cls(
         kv_pool,
-        server_args.hicache_ratio,
+        server_args.resolved_kv_hicache_ratio,
         server_args.hicache_size,
         page_size,
         server_args.hicache_mem_layout,
@@ -264,7 +264,7 @@ def _deepseek_v4_num_host_pages(
             "DeepSeek V4 HiCache currently does not support --hicache-size; "
             "use --hicache-ratio instead."
         )
-    ratio = server_args.hicache_ratio
+    ratio = server_args.resolved_kv_hicache_ratio
     full_host_pages = int(device_full_pages * ratio)
     swa_host_pages = int(device_swa_pages * ratio)
     return full_host_pages, swa_host_pages
@@ -550,7 +550,7 @@ def build_hybrid_mamba_stack(
     )
     mamba_host_pool = MambaPoolHost(
         mamba_pool,
-        server_args.hicache_ratio,
+        server_args.resolved_mamba_hicache_ratio,
         server_args.hicache_size,
         allocator_type=server_args.hicache_storage_backend,
         layout=server_args.hicache_mem_layout,

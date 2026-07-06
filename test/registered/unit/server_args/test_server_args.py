@@ -958,6 +958,62 @@ class TestHiCacheArgs(unittest.TestCase):
         self.assertEqual(args.hicache_mem_layout, "page_first")
         self.assertIsNone(args.decode_attention_backend)
 
+    def test_hicache_split_ratios_default_to_hicache_ratio(self):
+        args = self._make_args(enable_hierarchical_cache=True, hicache_ratio=3.0)
+
+        args._handle_hicache()
+
+        self.assertEqual(args.resolved_kv_hicache_ratio, 3.0)
+        self.assertEqual(args.resolved_mamba_hicache_ratio, 3.0)
+
+    def test_hicache_resolved_ratios_fallback_without_normalization(self):
+        args = self._make_args(hicache_ratio=3.0)
+
+        self.assertEqual(args.resolved_kv_hicache_ratio, 3.0)
+        self.assertEqual(args.resolved_mamba_hicache_ratio, 3.0)
+
+    def test_hicache_split_ratios_can_override_defaults(self):
+        args = self._make_args(
+            enable_hierarchical_cache=True,
+            hicache_ratio=3.0,
+            kv_hicache_ratio=4.0,
+            mamba_hicache_ratio=1.5,
+        )
+
+        args._handle_hicache()
+
+        self.assertEqual(args.resolved_kv_hicache_ratio, 4.0)
+        self.assertEqual(args.resolved_mamba_hicache_ratio, 1.5)
+
+    def test_hicache_split_ratios_reject_non_positive_values(self):
+        cases = [
+            ("hicache_ratio", "--hicache-ratio must be greater than 0"),
+            ("kv_hicache_ratio", "--kv-hicache-ratio must be greater than 0"),
+            ("mamba_hicache_ratio", "--mamba-hicache-ratio must be greater than 0"),
+        ]
+
+        for field, message in cases:
+            with self.subTest(field=field):
+                args = self._make_args(enable_hierarchical_cache=True)
+                setattr(args, field, 0.0)
+                with self.assertRaisesRegex(ValueError, message):
+                    args._handle_hicache()
+
+    def test_hicache_size_warns_when_split_ratio_is_set(self):
+        args = self._make_args(
+            enable_hierarchical_cache=True,
+            hicache_size=1,
+            kv_hicache_ratio=4.0,
+        )
+
+        with self.assertLogs("sglang.srt.server_args", level="WARNING") as logs:
+            args._handle_hicache()
+
+        self.assertEqual(args.resolved_kv_hicache_ratio, 4.0)
+        self.assertIn(
+            "--hicache-size overrides ratio-based host pool sizing", logs.output[0]
+        )
+
 
 class TestNgramExternalSamArgs(CustomTestCase):
     def _make_dummy_ngram_args(self, **overrides):
