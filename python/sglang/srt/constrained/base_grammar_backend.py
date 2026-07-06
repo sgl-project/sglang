@@ -61,6 +61,16 @@ class BaseGrammarObject:
     def is_terminated(self):
         return False
 
+    # Whether this grammar object supports the persistent double-buffered
+    # vocab-mask pool (see constrained/vocab_mask_pool.py). Backends that use
+    # xgrammar's token bitmask can opt in to avoid per-step host allocation and
+    # extra host->device copies.
+    supports_vocab_mask_pool: bool = False
+
+    def get_vocab_mask_pool(self, vocab_size: int, max_bs: int, device):
+        """Return a persistent VocabMaskPool for pooled backends, else None."""
+        return None
+
     def allocate_vocab_mask(
         self, vocab_size: int, batch_size: int, device
     ) -> torch.Tensor:

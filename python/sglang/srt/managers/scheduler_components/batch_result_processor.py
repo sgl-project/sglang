@@ -602,8 +602,18 @@ class SchedulerBatchResultProcessor:
         nor emitted. Advances the grammar FSM only -- ``grammar.finished`` is
         synced by the caller once the finish state is updated.
         """
+        # Fast path: normal decode advances the grammar by a single token and
+        # the caller discards the return value. Avoid the per-step list churn.
         if isinstance(tokens, int):
-            tokens = [tokens]
+            try:
+                req.grammar.accept_token(tokens)
+            except ValueError as e:
+                logger.error(
+                    f"Grammar accept_token failed for req {req.rid} with token "
+                    f"{tokens}: {e}"
+                )
+                self.abort_request(AbortReq(rid=req.rid))
+            return [tokens]
         retained = []
         try:
             for token_id in tokens:
