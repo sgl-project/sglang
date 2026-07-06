@@ -711,6 +711,19 @@ class ModelRunner:
             start_layer=self.layer_info.start_layer,
         )
 
+    def get_pp_proxy_v_first_size(self) -> Optional[int]:
+        # RWKV-7 carries layer-0's value projection (v_first) across the PP stage
+        # boundary in PPProxyTensors; the decode cuda-graph buffer needs a stable
+        # slot for it (same mechanism as get_pp_proxy_topk_size). Full hidden width
+        # (the receiver slices to its tp head range inside forward).
+        hf_config = self.model_config.hf_text_config
+        if self.ps.pp_size <= 1 or self.ps.pp_rank == 0:
+            return None
+        archs = getattr(hf_config, "architectures", None) or []
+        if not any(a in ("RWKV7ForCausalLM", "Rwkv7ForCausalLM") for a in archs):
+            return None
+        return getattr(hf_config, "hidden_size", None)
+
     def decode_num_tokens_per_req(
         self, *, num_draft_tokens: Optional[int] = None
     ) -> int:
