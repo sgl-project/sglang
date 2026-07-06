@@ -103,6 +103,7 @@ from sglang.srt.utils.common import (
     is_hip,
     is_musa,
     is_npu,
+    is_xpu,
     log_info_on_rank0,
 )
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
@@ -111,6 +112,7 @@ _is_npu = is_npu()
 _is_cuda = is_cuda()
 _is_musa = is_musa()
 _is_hip = is_hip()
+_is_xpu = is_xpu()
 
 logger = logging.getLogger(__name__)
 
@@ -314,6 +316,17 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
     def init_lm_head(self):
         embed, head = self.target_worker.model_runner.model.get_embed_and_head()
+        target_lm_head = getattr(self.target_worker.model_runner.model, "lm_head", None)
+
+        def maybe_share_target_lm_head():
+            if (
+                target_lm_head is not None
+                and self.hot_token_id is None
+                and getattr(self.draft_runner.model, "hot_token_id", None) is None
+                and hasattr(self.draft_runner.model, "set_lm_head_from_target")
+            ):
+                self.draft_runner.model.set_lm_head_from_target(target_lm_head)
+
         if self.speculative_algorithm.is_eagle3():
             # most cases EAGLE3 models don't share lm_head
             # but some models (e.g. nvidia/gpt-oss-120b-Eagle3) shares
@@ -322,6 +335,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 and self.draft_runner.model.load_lm_head_from_target
             ):
                 self.draft_runner.model.set_embed_and_head(embed, head)
+                maybe_share_target_lm_head()
             else:
                 self.draft_runner.model.set_embed(embed)
 
@@ -339,6 +353,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
             # Share the embedding and lm_head
             self.draft_runner.model.set_embed_and_head(embed, head)
+            maybe_share_target_lm_head()
 
     def init_attention_backend(self):
         # Create multi-step attn backends and cuda graph runners
@@ -377,6 +392,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             return
 
         Device2DraftCudaGraphRunner = {
+            "xpu": EAGLEDraftCudaGraphRunner,
             "npu": EAGLEDraftNpuGraphRunner,
             "cuda": EAGLEDraftCudaGraphRunner,
             "musa": EAGLEDraftCudaGraphRunner,
@@ -406,6 +422,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             )
 
         Device2ExtendCudaGraphRunner = {
+            "xpu": EAGLEDraftExtendCudaGraphRunner,
             "npu": EAGLEDraftExtendNpuGraphRunner,
             "cuda": EAGLEDraftExtendCudaGraphRunner,
             "musa": EAGLEDraftCudaGraphRunner,
@@ -448,6 +465,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         # TODO: support draft extend cuda graph for more attention backends
         if self.draft_extend_attn_backend and (
             _is_npu
+            or _is_xpu
             or supports_cuda_draft_extend_graph
             or supports_hip_aiter_draft_extend_graph
         ):
@@ -612,7 +630,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         scores = None
         if self.index_share_for_mtp_iteration:
             forward_batch.reuse_mtp_topk_indices = True
-            forward_batch.topk_indices = None
+            spec_info.mtp_topk_indices = None
         for i in range(self.speculative_num_steps):
             input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
                 i, topk_p, topk_index, hidden_states, scores, self.topk
@@ -688,7 +706,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             forward_batch.positions.add_(1)
 
         if self.index_share_for_mtp_iteration:
-            forward_batch.topk_indices = None
+            spec_info.mtp_topk_indices = None
             forward_batch.reuse_mtp_topk_indices = False
 
         # Organize the results
@@ -1544,6 +1562,18 @@ class EAGLEWorkerV2(BaseSpecWorker):
             accept_index,
         ) = eagle_sample(verify_input, batch, logits_output, vocab_mask)
         new_seq_lens = batch.seq_lens + accept_lens
+        clear_unaccepted_c128 = getattr(
+            self.token_to_kv_pool_allocator.get_kvcache(),
+            "clear_unaccepted_c128_draft_states",
+            None,
+        )
+        if clear_unaccepted_c128 is not None and not batch.forward_mode.is_idle():
+            clear_unaccepted_c128(
+                batch.req_pool_indices,
+                batch.seq_lens,
+                accept_lens,
+                self.speculative_num_draft_tokens,
+            )
 
         # Update mamba state for hybrid GDN models after verification
         commit_mamba_states_after_verify(
