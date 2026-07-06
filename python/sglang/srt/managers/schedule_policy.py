@@ -141,7 +141,15 @@ def match_prefix_for_req(
     # SGLANG_RADIX_FORCE_MISS override. `token_len` keys the memo so that a grown
     # (origin+output) span (e.g. across decode steps) forces a re-match.
     token_len = len(token_ids)
-    can_memoize = not cow_mamba and not include_req
+    force_miss = envs.SGLANG_RADIX_FORCE_MISS.get()
+    # getattr defaults keep this safe for stub/legacy Req objects that lack the
+    # memo attributes (e.g. in tests).
+    can_memoize = (
+        not cow_mamba
+        and not include_req
+        and not force_miss
+        and hasattr(req, "_match_epoch")
+    )
     if can_memoize:
         epoch = tree_cache.match_epoch()
         if (
@@ -169,9 +177,9 @@ def match_prefix_for_req(
             req=req if include_req else None,
         )
     )
-    if envs.SGLANG_RADIX_FORCE_MISS.get():
+    if force_miss:
         match_result = zero_match_result(tree_cache, match_result)
-    if can_memoize and not envs.SGLANG_RADIX_FORCE_MISS.get():
+    if can_memoize:
         epoch = tree_cache.match_epoch()
         if epoch is not None:
             req._match_epoch = epoch

@@ -104,6 +104,40 @@ class TestRadixKey(unittest.TestCase):
         with self.assertRaises(IndexError):
             _ = key[10]  # Out of bounds
 
+    def test_suffix_zero_copy_view(self):
+        """suffix() is a zero-copy view equivalent to a copying [start:] slice."""
+        key = RadixKey(array("q", list(range(20))), "extra")
+        for start in (0, 1, 5, 19, 20, 25):
+            view = key.suffix(start)
+            ref = key[min(start, len(key)) :]
+            self.assertEqual(len(view), len(ref))
+            self.assertEqual(list(view), list(ref))
+            if len(view) > 0:
+                self.assertEqual(view.child_key(1), ref.child_key(1))
+                self.assertEqual(view.child_key(2), ref.child_key(2))
+            self.assertEqual(view.extra_key, "extra")
+        # suffix shares the backing array (zero copy) but not the copying slice.
+        self.assertIs(key.suffix(3).token_ids, key.token_ids)
+
+    def test_suffix_match_and_hash_offset_aware(self):
+        """match()/hash_page() agree between an offset view and a compact copy."""
+        base = RadixKey(array("q", list(range(30))))
+        view = base.suffix(7)  # logical tokens 7..29
+        compact = RadixKey(array("q", list(range(7, 30))))
+        other = RadixKey(array("q", [7, 8, 9, 10, 999]))
+        self.assertEqual(view.match(other), compact.match(other))
+        self.assertEqual(view.match(other, page_size=2), compact.match(other, 2))
+        self.assertEqual(view.hash_page(0, 4), compact.hash_page(0, 4))
+
+    def test_suffix_bigram_view(self):
+        """suffix() honors offset in bigram mode."""
+        key = RadixKey(array("q", list(range(10))), is_bigram=True)
+        view = key.suffix(3)
+        ref = RadixKey(array("q", list(range(3, 10))), is_bigram=True)
+        self.assertEqual(list(view), list(ref))
+        self.assertEqual(view.child_key(1), ref.child_key(1))
+        self.assertEqual(view.match(ref), len(ref))
+
     def _assert_match(self, a, b, page_size, expected, is_bigram=False):
         key_a = RadixKey(array("q", a), is_bigram=is_bigram)
         key_b = RadixKey(array("q", b), is_bigram=is_bigram)
