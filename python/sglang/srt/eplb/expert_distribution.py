@@ -35,6 +35,7 @@ from sglang.srt.observability.metrics_collector import (
     ExpertDispatchCollector,
     resolve_collector_class,
 )
+from sglang.srt.runtime_context import get_flags
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import Withable, get_device, get_int_env_var
 
@@ -313,18 +314,18 @@ class _SinglePassGatherer(ABC):
                 server_args, expert_location_metadata, rank
             )
 
-        if server_args.moe_a2a_backend == "mori":
+        if get_flags().moe_a2a_backend == "mori":
             return _DeepepLowLatencySinglePassGatherer(expert_location_metadata, rank)
 
         if server_args.expert_distribution_recorder_mode == "stat_approx":
-            if server_args.moe_a2a_backend != "none" and (
+            if get_flags().moe_a2a_backend != "none" and (
                 server_args.deepep_mode == "normal"
             ):
                 return _DeepepNormalSinglePassGatherer(expert_location_metadata, rank)
             else:
                 raise NotImplementedError
 
-        if server_args.moe_a2a_backend != "none":
+        if get_flags().moe_a2a_backend != "none":
             if server_args.deepep_mode == "normal":
                 return _SelectExpertsSinglePassGatherer(expert_location_metadata, rank)
             elif server_args.deepep_mode == "low_latency":

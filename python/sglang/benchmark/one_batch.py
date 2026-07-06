@@ -80,6 +80,7 @@ from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 from sglang.srt.model_executor.cuda_graph_config import Phase
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.runtime_context import get_flags
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -509,7 +510,7 @@ def _maybe_prepare_mlp_sync_batch(batch: ScheduleBatch, model_runner):
             get_idle_batch=None,
             disable_cuda_graph=model_runner.server_args.disable_cuda_graph,
             require_mlp_tp_gather=require_mlp_tp_gather(model_runner.server_args),
-            disable_overlap_schedule=model_runner.server_args.disable_overlap_schedule,
+            disable_overlap_schedule=get_flags().disable_overlap_schedule,
             offload_tags=set(),
         )
 

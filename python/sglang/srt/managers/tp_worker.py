@@ -315,7 +315,9 @@ class TpModelWorker(BaseTpWorker):
         )[0]
         set_random_seed(self.random_seed)
 
-        self.enable_overlap = not server_args.disable_overlap_schedule
+        from sglang.srt.arg_groups.overrides import resolved_view
+
+        self.enable_overlap = not resolved_view(server_args).disable_overlap_schedule
         self.enable_spec = server_args.speculative_algorithm is not None
         self.hicache_layer_transfer_counter = None
 

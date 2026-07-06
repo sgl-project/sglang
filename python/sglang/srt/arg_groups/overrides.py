@@ -1838,6 +1838,49 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
 
 
 @register_post_process
+def _moe_runner_fusion_disable(view: Any) -> dict:
+    """FlashInfer CuteDSL / TRT-LLM / TRT-LLM-routed MoE runners require the
+    shared-experts fusion disabled; declared at the legacy write slots in
+    _handle_moe_kernel_config (before the deprecated cutlass env override, so
+    the runner value observed is the pre-override one)."""
+    runner = view.moe_runner_backend
+    if runner == "flashinfer_cutedsl":
+        logger.warning(
+            "FlashInfer CuteDSL MoE is enabled. --disable-shared-experts-fusion is automatically set."
+        )
+        return {"disable_shared_experts_fusion": True}
+    if runner in ("flashinfer_trtllm", "experimental_sgl_trtllm"):
+        logger.warning(
+            "FlashInfer TRTLLM MoE is enabled. --disable-shared-experts-fusion is automatically set."
+        )
+        return {"disable_shared_experts_fusion": True}
+    if runner == "flashinfer_trtllm_routed":
+        logger.warning(
+            "FlashInfer TRTLLM routed MoE is enabled. --disable-shared-experts-fusion is automatically set."
+        )
+        return {"disable_shared_experts_fusion": True}
+    return {}
+
+
+def _a2a_fusion_adjustments(view: Any) -> dict:
+    """A2A-backend-driven shared-experts fusion adjustments, declared at the
+    legacy write slots in _handle_a2a_moe: DeepEP Waterfill requires the
+    fusion enabled; FlashInfer A2A requires it disabled."""
+    if view.moe_a2a_backend == "deepep" and view.enable_deepep_waterfill:
+        if view.disable_shared_experts_fusion:
+            logger.warning(
+                "disable_shared_experts_fusion is overridden to False because DeepEP Waterfill requires shared expert fusion."
+            )
+            return {"disable_shared_experts_fusion": False}
+        return {}
+    if view.moe_a2a_backend == "flashinfer":
+        logger.warning(
+            "Flashinfer MoE A2A is enabled. --disable-shared-experts-fusion is automatically set."
+        )
+        return {"disable_shared_experts_fusion": True}
+    return {}
+
+
 def _cutlass_moe_env_override(view: Any) -> dict:
     from sglang.srt.environ import envs
 
@@ -2126,6 +2169,19 @@ DUAL_APPLY_RETIRED: frozenset = frozenset(
         # page fallback is folded into the _dllm_page_size pass; the npu
         # early default is pre-resolution input synthesis.
         "page_size",
+        # initialize_moe_config, the eplb recorder, the autotune runner and
+        # init-MoE wiring read the leaves; the kernel-config and a2a chains
+        # read views, with their fusion writes converted to the
+        # _moe_runner_fusion_disable / _a2a_fusion_adjustments passes; the
+        # cuda-graph compat lambdas and the TBO / budget validators read
+        # views; the registry dispatch callables read the pristine input.
+        "moe_runner_backend",
+        "moe_a2a_backend",
+        # Scheduler / TpWorker pre-publish captures read views; workers,
+        # pool sizing, the kv mixin, dp-attn wiring, the prefill delayer and
+        # the spec registry read the leaf; the pp / pdmux asserts read
+        # views; the mps early disable is pre-resolution input synthesis.
+        "disable_overlap_schedule",
     }
 )
 

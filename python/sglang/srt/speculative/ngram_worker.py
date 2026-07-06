@@ -57,7 +57,7 @@ class NGRAMWorker(BaseSpecWorker):
         target_worker: TpModelWorker,
     ):
         self.server_args = server_args
-        self.enable_overlap = not server_args.disable_overlap_schedule
+        self.enable_overlap = not get_flags().disable_overlap_schedule
         self._target_worker = target_worker
         self.model_runner = target_worker.model_runner
         self.tp_rank = tp_rank

@@ -423,9 +423,11 @@ class SWAChunkCapPoolConfigurator(HybridSWAPoolConfigurator):
         Padding to make sure eviction point is page-aligned.
         """
         trailing_tokens = window + eviction_interval * draft_tokens + page_size
+        from sglang.srt.arg_groups.overrides import resolved_view
+
         if sa.speculative_algorithm is None:
             decode_alloc = page_size
-        elif sa.disable_overlap_schedule:
+        elif resolved_view(sa).disable_overlap_schedule:
             # spec-v1: new_tokens_required_next_decode per request.
             decode_alloc = spec_decode_alloc_len_per_request(sa)
         else:
@@ -441,7 +443,7 @@ class SWAChunkCapPoolConfigurator(HybridSWAPoolConfigurator):
                 + (window + page_size) * sa.disaggregation_decode_extra_slots
             )
         else:
-            chunks_in_flight = 1 if sa.disable_overlap_schedule else 2
+            chunks_in_flight = 1 if resolved_view(sa).disable_overlap_schedule else 2
             self._swa_cap = (
                 per_request * num_reqs
                 + chunks_in_flight * sa.chunked_prefill_size

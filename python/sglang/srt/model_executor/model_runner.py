@@ -1301,7 +1301,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 local_rank=self.gpu_id,
                 distributed_init_method=dist_init_method,
                 timeout=self.server_args.dist_timeout,
-                moe_a2a_backend=self.server_args.moe_a2a_backend,
+                moe_a2a_backend=get_flags().moe_a2a_backend,
                 recovered_rank=self.server_args.elastic_ep_rejoin,
             )
             initialize_model_parallel(
@@ -3063,7 +3063,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
         output.expert_distribution_metrics = recorder_outputs.get("metrics")
 
-        no_copy_to_cpu = not self.server_args.disable_overlap_schedule
+        no_copy_to_cpu = not get_flags().disable_overlap_schedule
         if (
             not self.is_draft_worker
             and (experts_capturer := get_global_experts_capturer()) is not None

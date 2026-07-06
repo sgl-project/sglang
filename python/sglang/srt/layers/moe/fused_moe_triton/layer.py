@@ -66,7 +66,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     is_in_tc_piecewise_cuda_graph,
 )
 from sglang.srt.model_loader.weight_utils import narrow_padded_param_and_loaded_weight
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_flags, get_parallel
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
@@ -301,7 +301,7 @@ class FusedMoE(torch.nn.Module):
         print_info_once(
             "FlashInfer TRTLLM MoE deferred finalize is "
             f"{'enabled' if self.supports_deferred_finalize else 'disabled'} "
-            f"(moe_runner_backend={server_args.moe_runner_backend}, "
+            f"(moe_runner_backend={get_flags().moe.runner_backend}, "
             f"quant_method={type(self.quant_method).__name__})."
         )
 

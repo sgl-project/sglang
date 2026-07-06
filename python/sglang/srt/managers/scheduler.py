@@ -340,16 +340,17 @@ class Scheduler(
         self.enable_lora = server_args.enable_lora
         self.enable_lora_overlap_loading = server_args.enable_lora_overlap_loading
         self.max_loras_per_batch = server_args.max_loras_per_batch
-        self.enable_overlap = not server_args.disable_overlap_schedule and not use_mlx()
-        self.enable_overlap_mlx = not server_args.disable_overlap_schedule and use_mlx()
+        from sglang.srt.arg_groups.overrides import resolved_view
+
+        _overlap_disabled = resolved_view(server_args).disable_overlap_schedule
+        self.enable_overlap = not _overlap_disabled and not use_mlx()
+        self.enable_overlap_mlx = not _overlap_disabled and use_mlx()
         self.enable_pdmux = server_args.enable_pdmux
         self.skip_tokenizer_init = server_args.skip_tokenizer_init
         self.stream_interval = server_args.stream_interval
         self.spec_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
-        from sglang.srt.arg_groups.overrides import resolved_view
-
         self.page_size = resolved_view(server_args).page_size
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
         self.enable_hicache_storage = server_args.hicache_storage_backend is not None

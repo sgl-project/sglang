@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Callable, Optional
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.runtime_context import get_flags
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -47,12 +48,12 @@ def should_run_flashinfer_autotune(
     # Read server_args directly to avoid depending on initialize_moe_config()
     # having already populated the MoE backend globals.
     if (
-        mr.server_args.moe_runner_backend == "flashinfer_cutedsl"
-        and mr.server_args.moe_a2a_backend == "deepep"
+        get_flags().moe.runner_backend == "flashinfer_cutedsl"
+        and get_flags().moe_a2a_backend == "deepep"
     ):
         return False
 
-    backend_str = mr.server_args.moe_runner_backend
+    backend_str = get_flags().moe.runner_backend
 
     # TODO smor- support other cases for flashinfer autotune, such as, mamba backend
 
@@ -124,7 +125,7 @@ def flashinfer_autotune_cache_path(model_runner: ModelRunner) -> Path:
         str(server_args.model_path),
         str(mr.dtype),
         str(server_args.quantization),
-        str(server_args.moe_runner_backend),
+        str(get_flags().moe.runner_backend),
         str(mr.tp_size),
         str(mr.pp_size),
         str(mr.dp_size),

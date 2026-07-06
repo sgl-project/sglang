@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, NamedTuple, Optional
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.runtime_context import get_flags
 from sglang.srt.utils import get_bool_env_var
 
 if TYPE_CHECKING:
@@ -80,7 +81,7 @@ class PrefillDelayer:
         # env flag is on (or overlap scheduling is disabled), ride the NCCL
         # device group on `device` instead of gloo on CPU.
         use_nccl = (
-            server_args.disable_overlap_schedule
+            get_flags().disable_overlap_schedule
             or envs.SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH.get()
         )
         if use_nccl:
@@ -108,7 +109,7 @@ class PrefillDelayer:
         self.skip_first_delayer = True
 
         assert (
-            not server_args.disable_overlap_schedule
+            not get_flags().disable_overlap_schedule
         ), "To use PrefillDelayer, disable_overlap_schedule must be False."
 
     def _negotiate_should_allow_prefill(

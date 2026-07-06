@@ -1125,7 +1125,11 @@ class TestDeepEPWaterfillArgs(CustomTestCase):
         # dummy-model path short-circuits __post_init__; invoke the handler directly.
         server_args._handle_a2a_moe()
 
-        self.assertFalse(server_args.disable_shared_experts_fusion)
+        from sglang.srt.arg_groups.overrides import resolved_view
+
+        # dual-apply retired: the fields stay pristine, the declarations win
+        self.assertTrue(server_args.disable_shared_experts_fusion)
+        self.assertFalse(resolved_view(server_args).disable_shared_experts_fusion)
         self.assertTrue(server_args.enforce_shared_experts_fusion)
 
     def test_waterfill_overrides_moe_a2a_backend_to_deepep(self):
@@ -1137,7 +1141,10 @@ class TestDeepEPWaterfillArgs(CustomTestCase):
         # dummy-model path short-circuits __post_init__; invoke the handler directly.
         server_args._handle_a2a_moe()
 
-        self.assertEqual(server_args.moe_a2a_backend, "deepep")
+        from sglang.srt.arg_groups.overrides import resolved_view
+
+        self.assertEqual(server_args.moe_a2a_backend, "none")  # pristine
+        self.assertEqual(resolved_view(server_args).moe_a2a_backend, "deepep")
         self.assertTrue(server_args.enforce_shared_experts_fusion)
 
     def test_waterfill_supports_deepep_low_latency_mode(self):

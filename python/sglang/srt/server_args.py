@@ -3231,6 +3231,8 @@ class ServerArgs:
             self._disable_breakable_cudagraph_if_incompatible()
 
     def _disable_tc_piecewise_cudagraph_if_incompatible(self):
+        from sglang.srt.arg_groups.overrides import resolved_view as _resolved_view
+
         """TcPiecewise (torch.compile + piecewise) is incompatible with
         these configurations. Most are torch.compile / dynamo limitations.
         """
@@ -3252,7 +3254,10 @@ class ServerArgs:
                 lambda: current_platform.is_out_of_tree()
                 and not current_platform.support_piecewise_cuda_graph(),
             ),
-            ("MoE A2A backend", lambda: self.moe_a2a_backend != "none"),
+            (
+                "MoE A2A backend",
+                lambda: _resolved_view(self).moe_a2a_backend != "none",
+            ),
             ("LoRA", lambda: bool(self.lora_paths) or self.enable_lora),
             (
                 "multimodal model",
@@ -3293,6 +3298,8 @@ class ServerArgs:
                 self.cuda_graph_config.prefill.backend = Backend.DISABLED
 
     def _disable_breakable_cudagraph_if_incompatible(self):
+        from sglang.srt.arg_groups.overrides import resolved_view as _resolved_view
+
         """Breakable (segmented capture, no torch.compile). Breakable enforces
         memory-saver rejection in its own __init__; config-time rules can be
         added here as they're discovered.
@@ -3313,7 +3320,10 @@ class ServerArgs:
             # BCG capture + LoRA adapter weights exceed host RAM headroom.
             ("LoRA", lambda: bool(self.lora_paths) or bool(self.enable_lora)),
             # BCG bucket sizes exceed FlashInfer MoE A2A's dispatch cap.
-            ("MoE A2A backend", lambda: self.moe_a2a_backend != "none"),
+            (
+                "MoE A2A backend",
+                lambda: _resolved_view(self).moe_a2a_backend != "none",
+            ),
             # DP-attn × BCG capture/replay not yet validated.
             ("DP attention", lambda: self.enable_dp_attention),
             # Multimodal prefill replay faults under BCG.
@@ -3604,10 +3614,12 @@ class ServerArgs:
 
             # DeepEP all-to-all buffers captured in the decode graph are real
             # extra allocations, so reserve them on top of the floor.
+            from sglang.srt.arg_groups.overrides import resolved_view
+
             if (
                 self.disaggregation_mode != "prefill"
                 and decode_cuda_graph_config.backend != Backend.DISABLED
-                and self.moe_a2a_backend == "deepep"
+                and resolved_view(self).moe_a2a_backend == "deepep"
             ):
                 reserved_mem += 2 * 1024
 
@@ -3973,7 +3985,7 @@ class ServerArgs:
             # The moe_runner_backend selection moved to the override registry
             # (arg_groups/overrides.py: _gpt_oss_overrides).
 
-            if self.moe_runner_backend == "triton_kernel":
+            if resolved_view(self).moe_runner_backend == "triton_kernel":
                 assert (
                     self.ep_size == 1
                 ), "Triton kernel MoE is only supported when ep_size == 1"
@@ -4839,12 +4851,15 @@ class ServerArgs:
         from sglang.srt.arg_groups.overrides import (
             _cutlass_moe_env_override,
             _moe_runner_backend_quant_constraints,
+            _moe_runner_fusion_disable,
+            resolved_view,
             run_post_process_pass,
         )
 
         run_post_process_pass(self, _moe_runner_backend_quant_constraints)
 
-        if self.moe_runner_backend == "flashinfer_cutlass":
+        view = resolved_view(self)
+        if view.moe_runner_backend == "flashinfer_cutlass":
             assert self.quantization in [
                 "modelopt_fp4",
                 "modelopt_fp8",
@@ -4856,7 +4871,7 @@ class ServerArgs:
                 self.tp_size,
             ], "The expert parallel size must be 1 or the same as the tensor parallel size"
 
-        if self.moe_runner_backend == "flashinfer_cutedsl":
+        if view.moe_runner_backend == "flashinfer_cutedsl":
             assert (
                 self.quantization in ["modelopt_fp4"]
                 or self.get_model_config().nvfp4_moe_meta is not None
@@ -4865,20 +4880,16 @@ class ServerArgs:
                 1,
                 self.tp_size,
             ], "The expert parallel size must be 1 or the same as the tensor parallel size"
-            assert self.moe_a2a_backend in [
+            assert view.moe_a2a_backend in [
                 "none",
                 "deepep",
                 "flashinfer",
             ], (
                 f"flashinfer_cutedsl supports moe_a2a_backend='none', 'deepep', or 'flashinfer', "
-                f"got '{self.moe_a2a_backend}'."
-            )
-            self.disable_shared_experts_fusion = True
-            logger.warning(
-                "FlashInfer CuteDSL MoE is enabled. --disable-shared-experts-fusion is automatically set."
+                f"got '{view.moe_a2a_backend}'."
             )
 
-        if self.moe_runner_backend in ["flashinfer_trtllm", "experimental_sgl_trtllm"]:
+        if view.moe_runner_backend in ["flashinfer_trtllm", "experimental_sgl_trtllm"]:
             assert self.quantization in [
                 "modelopt_fp4",
                 "nvfp4_online",
@@ -4889,12 +4900,8 @@ class ServerArgs:
                 "compressed-tensors",
                 None,
             ], f"Invalid quantization '{self.quantization}'. \nFlashInfer TRTLLM MOE supports only: 'modelopt_fp4', 'nvfp4_online', 'fp8', 'modelopt_fp8', 'modelopt_mixed', 'compressed-tensors', or bfloat16 (None)."
-            self.disable_shared_experts_fusion = True
-            logger.warning(
-                "FlashInfer TRTLLM MoE is enabled. --disable-shared-experts-fusion is automatically set."
-            )
 
-        if self.moe_runner_backend == "flashinfer_trtllm_routed":
+        if view.moe_runner_backend == "flashinfer_trtllm_routed":
             assert self.quantization in [
                 "fp8",
                 "mxfp8",
@@ -4902,17 +4909,20 @@ class ServerArgs:
                 "nvfp4_online",
                 None,
             ], f"Invalid quantization '{self.quantization}'. \nFlashInfer TRTLLM routed MOE supports only: 'fp8', 'mxfp8', 'modelopt_fp4', 'nvfp4_online', or bfloat16 (None)."
-            self.disable_shared_experts_fusion = True
-            logger.warning(
-                "FlashInfer TRTLLM routed MoE is enabled. --disable-shared-experts-fusion is automatically set."
-            )
+
+        # The runner-driven shared-experts fusion disables moved to the
+        # pipeline (arg_groups/overrides.py: _moe_runner_fusion_disable),
+        # invoked here at the legacy write slots.
+        run_post_process_pass(self, _moe_runner_fusion_disable)
 
         # The deprecated SGLANG_CUTLASS_MOE override moved to the pipeline
         # (arg_groups/overrides.py: _cutlass_moe_env_override). It sits after
         # the fusion blocks above on purpose: they must observe the
         # pre-override runner value, exactly as they did imperatively.
         run_post_process_pass(self, _cutlass_moe_env_override)
-        if self.moe_runner_backend == "cutlass" and self.quantization in [
+        if resolved_view(
+            self
+        ).moe_runner_backend == "cutlass" and self.quantization in [
             "fp8",
             "mxfp8",
         ]:
@@ -4959,9 +4969,12 @@ class ServerArgs:
         """Fail fast if the FlashInfer A2A dispatcher workspace cannot cover the
         largest CuteDSL MoE forward. Runs after speculative decoding is resolved
         so cutedsl_moe_max_num_tokens() sees the final num_tokens_per_bs."""
+        from sglang.srt.arg_groups.overrides import resolved_view
+
+        view = resolved_view(self)
         if not (
-            self.moe_a2a_backend == "flashinfer"
-            and self.moe_runner_backend == "flashinfer_cutedsl"
+            view.moe_a2a_backend == "flashinfer"
+            and view.moe_runner_backend == "flashinfer_cutedsl"
             and self.max_prefill_tokens > 0
             and self.disaggregation_mode != "decode"
         ):
@@ -4998,13 +5011,21 @@ class ServerArgs:
         from sglang.srt.arg_groups.overrides import (
             _a2a_backend_overrides,
             _a2a_ep_size,
+            _a2a_fusion_adjustments,
+            resolved_view,
             run_post_process_pass,
         )
 
         run_post_process_pass(self, _a2a_backend_overrides)
         run_post_process_pass(self, _a2a_ep_size)
 
-        if self.moe_a2a_backend == "megamoe":
+        # The a2a-driven shared-experts fusion adjustments moved to the
+        # pipeline (arg_groups/overrides.py: _a2a_fusion_adjustments),
+        # invoked here at the legacy write slots.
+        run_post_process_pass(self, _a2a_fusion_adjustments)
+
+        a2a_backend = resolved_view(self).moe_a2a_backend
+        if a2a_backend == "megamoe":
             if not envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.is_set():
                 envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.set(True)
             logger.info(
@@ -5012,7 +5033,7 @@ class ServerArgs:
                 f"to be the same as the tensor parallel size[{self.tp_size}]."
             )
 
-        if self.moe_a2a_backend == "deepep":
+        if a2a_backend == "deepep":
             if self.deepep_mode == "normal":
                 logger.warning("Cuda graph is disabled because deepep_mode=`normal`")
                 self.cuda_graph_config.decode.backend = Backend.DISABLED
@@ -5021,27 +5042,22 @@ class ServerArgs:
                 f"DeepEP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
             if self.enable_deepep_waterfill:
-                if self.disable_shared_experts_fusion:
-                    logger.warning(
-                        "disable_shared_experts_fusion is overridden to False because DeepEP Waterfill requires shared expert fusion."
-                    )
-                    self.disable_shared_experts_fusion = False
                 self.enforce_shared_experts_fusion = True
                 logger.info(
                     "DeepEP Waterfill is enabled. Shared expert will be dispatched through DeepEP for load balancing."
                 )
 
-        if self.moe_a2a_backend == "mooncake":
+        if a2a_backend == "mooncake":
             logger.warning(
                 f"Mooncake MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
 
-        if self.moe_a2a_backend == "nixl":
+        if a2a_backend == "nixl":
             logger.warning(
                 f"Nixl MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
 
-        if self.moe_a2a_backend == "ascend_fuseep":
+        if a2a_backend == "ascend_fuseep":
             logger.warning(
                 f"Ascend fused EP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
@@ -5054,16 +5070,12 @@ class ServerArgs:
                 assert (
                     self.quantization == "modelslim"
                 ), "When fuse_mode is set to 2, the NPU supports only ModelSlim quantization."
-        if self.moe_a2a_backend == "flashinfer":
+        if a2a_backend == "flashinfer":
             assert (
                 self.enable_dp_attention and self.dp_size == self.tp_size
             ), "Flashinfer MoE A2A is only supported with dp_size == tp_size and --enable-dp-attention"
             logger.warning(
                 f"Flashinfer MoE A2A is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
-            )
-            self.disable_shared_experts_fusion = True
-            logger.warning(
-                "Flashinfer MoE A2A is enabled. --disable-shared-experts-fusion is automatically set."
             )
             if self.deepep_mode != "auto":
                 logger.warning("--deepep-mode is ignored for Flashinfer MoE A2A")
@@ -5075,13 +5087,13 @@ class ServerArgs:
                 logger.warning(
                     "SGLANG_MOE_NVFP4_DISPATCH is set to True for Flashinfer MoE A2A"
                 )
-            assert self.moe_runner_backend in [
+            assert resolved_view(self).moe_runner_backend in [
                 "flashinfer_cutlass",
                 "flashinfer_cutedsl",
                 "flashinfer_trtllm_routed",
             ], "Flashinfer MoE A2A is only supported with flashinfer_cutlass, flashinfer_cutedsl or flashinfer_trtllm_routed moe runner backend"
 
-        if self.moe_a2a_backend == "mori":
+        if a2a_backend == "mori":
             if self.deepep_mode == "auto":
                 self.deepep_mode = "normal"
                 logger.warning("auto set deepep_mode=`normal` for MORI EP")
@@ -6449,9 +6461,11 @@ class ServerArgs:
         # DP TP-MoE path (overlapping the DP all_gatherv / reduce_scatterv with
         # the other ubatch's compute), which requires DP attention. Enabling it
         # there needs no extra opt-in env flag.
+        from sglang.srt.arg_groups.overrides import resolved_view
+
         if (
             self.enable_two_batch_overlap
-            and self.moe_a2a_backend == "none"
+            and resolved_view(self).moe_a2a_backend == "none"
             and not self.enable_dp_attention
         ):
             raise ValueError(
@@ -6482,8 +6496,11 @@ class ServerArgs:
         )
 
         if self.pp_size > 1:
+            from sglang.srt.arg_groups.overrides import resolved_view
+
             assert (
-                self.disable_overlap_schedule and self.speculative_algorithm is None
+                resolved_view(self).disable_overlap_schedule
+                and self.speculative_algorithm is None
             ), "Pipeline parallelism is not compatible with overlap schedule, speculative decoding"
 
         assert not (
@@ -6537,9 +6554,13 @@ class ServerArgs:
             assert (
                 self.disaggregation_mode == "null"
             ), "PD-Multiplexing is not compatible with disaggregation mode."
-            assert (
-                self.disable_overlap_schedule
-            ), "PD-Multiplexing is not compatible with overlap schedule."
+            from sglang.srt.arg_groups.overrides import resolved_view
+
+            assert resolved_view(
+                self
+            ).disable_overlap_schedule, (
+                "PD-Multiplexing is not compatible with overlap schedule."
+            )
 
             # NOTE: CUDA Green Context may encounter potential issues with CudaGraph on torch 2.7.x – 2.8.x, leading to performance degradation.
             import torch

@@ -271,13 +271,13 @@ def initialize_moe_config(server_args: ServerArgs):
     global DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER
     global MOE_QUANTIZATION
 
-    MOE_A2A_BACKEND = MoeA2ABackend(server_args.moe_a2a_backend)
-    MOE_RUNNER_BACKEND = MoeRunnerBackend(server_args.moe_runner_backend)
     from sglang.srt.arg_groups.overrides import resolved_view
 
     # Scheduler.init_moe_gemm_config calls this before init_model_worker
     # publishes the flags tier: read the resolved values through the view.
     view = resolved_view(server_args)
+    MOE_A2A_BACKEND = MoeA2ABackend(view.moe_a2a_backend)
+    MOE_RUNNER_BACKEND = MoeRunnerBackend(view.moe_runner_backend)
     SPECULATIVE_MOE_RUNNER_BACKEND = (
         MoeRunnerBackend(view.speculative_moe_runner_backend)
         if view.speculative_moe_runner_backend is not None

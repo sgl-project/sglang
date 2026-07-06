@@ -303,7 +303,7 @@ class ModelRunnerKVCacheMixin:
         if mamba_extra_buffer_enabled():
             # ping-pong buffer size is 2 when overlap schedule is on, 1 otherwise.
             # Lazy mode saves 1 slot (2 → 1) for overlap; non-overlap already uses 1.
-            if not self.server_args.disable_overlap_schedule:
+            if not get_flags().disable_overlap_schedule:
                 if mamba_extra_buffer_lazy_enabled():
                     additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP_LAZY
                 else:
@@ -404,7 +404,7 @@ class ModelRunnerKVCacheMixin:
             enable_memory_saver=self.server_args.enable_memory_saver,
             enable_mamba_extra_buffer=mamba_extra_buffer_enabled(),
             speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
-            disable_overlap_schedule=self.server_args.disable_overlap_schedule,
+            disable_overlap_schedule=get_flags().disable_overlap_schedule,
             need_sort=self.server_args.disaggregation_mode in ("decode", "prefill"),
             mamba_full_memory_ratio=self.server_args.mamba_full_memory_ratio,
             # Overlap mode: the allocator's `free` drops a wait_stream(forward_stream)
@@ -563,7 +563,7 @@ class ModelRunnerKVCacheMixin:
                         speculative_eagle_topk=self.server_args.speculative_eagle_topk,
                         enable_mamba_extra_buffer=mamba_extra_buffer_enabled(),
                         pre_alloc_size=pre_alloc_size,
-                        enable_overlap_schedule=not self.server_args.disable_overlap_schedule,
+                        enable_overlap_schedule=not get_flags().disable_overlap_schedule,
                         mamba_size=self.server_args.max_mamba_cache_size,
                         start_layer=self.start_layer,
                     )
@@ -597,7 +597,7 @@ class ModelRunnerKVCacheMixin:
                     enable_mamba_extra_buffer_lazy=mamba_extra_buffer_lazy_enabled(),
                     speculative_num_draft_tokens=max_spec_draft_tokens,
                     speculative_eagle_topk=self.server_args.speculative_eagle_topk,
-                    enable_overlap_schedule=not self.server_args.disable_overlap_schedule,
+                    enable_overlap_schedule=not get_flags().disable_overlap_schedule,
                     start_layer=self.start_layer,
                     enable_linear_replayssm=self.server_args.enable_linear_replayssm,
                     linear_replayssm_cache_len=self.server_args.linear_replayssm_cache_len,
