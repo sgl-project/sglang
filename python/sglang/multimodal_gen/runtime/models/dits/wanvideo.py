@@ -21,6 +21,7 @@ from sglang.multimodal_gen.runtime.layers.attention import (
     MinimalA2AAttnOp,
     UlyssesAttention_VSA,
     USPAttention,
+    build_varlen_mask_meta,
 )
 from sglang.multimodal_gen.runtime.layers.elementwise import MulAdd
 from sglang.multimodal_gen.runtime.layers.layernorm import (
@@ -217,7 +218,9 @@ class WanT2VCrossAttention(WanSelfAttention):
         Args:
             x(Tensor): Shape [B, L1, C]
             context(Tensor): Shape [B, L2, C]
-            context_lens(Tensor): Shape [B]
+            context_lens(Tensor | None): `[B, L2]` bool mask over real
+                (non-padded) tokens in `context`, or None when every request in
+                the batch already fills the full padded length.
         """
         q, _ = self.to_q(x)
         if self.tp_rmsnorm:
@@ -236,8 +239,11 @@ class WanT2VCrossAttention(WanSelfAttention):
         v, _ = self.to_v(context)
         v = v.unflatten(2, (self.local_num_heads, self.head_dim))
 
+        attn_mask_meta = (
+            build_varlen_mask_meta(context_lens) if context_lens is not None else None
+        )
         # compute attention
-        x = self.attn(q, k, v)
+        x = self.attn(q, k, v, attn_mask=context_lens, attn_mask_meta=attn_mask_meta)
 
         # output
         x = x.flatten(2)
@@ -289,10 +295,14 @@ class WanI2VCrossAttention(WanSelfAttention):
         Args:
             x(Tensor): Shape [B, L1, C]
             context(Tensor): Shape [B, L2, C]
-            context_lens(Tensor): Shape [B]
+            context_lens(Tensor | None): `[B, L2]` bool mask over real
+                (non-padded) tokens in `context`, or None when every request in
+                the batch already fills the full padded length. Only the text
+                portion (after the leading 257 image tokens) can be ragged.
         """
         context_img = context[:, :257]
         context = context[:, 257:]
+        text_mask = context_lens[:, 257:] if context_lens is not None else None
 
         q, _ = self.to_q(x)
         if self.tp_rmsnorm:
@@ -321,8 +331,11 @@ class WanI2VCrossAttention(WanSelfAttention):
         v_img, _ = self.add_v_proj(context_img)
         v_img = v_img.unflatten(2, (self.local_num_heads, self.head_dim))
 
+        text_attn_mask_meta = (
+            build_varlen_mask_meta(text_mask) if text_mask is not None else None
+        )
         img_x = self.attn(q, k_img, v_img)
-        x = self.attn(q, k, v)
+        x = self.attn(q, k, v, attn_mask=text_mask, attn_mask_meta=text_attn_mask_meta)
 
         # output
         x = x.flatten(2)
@@ -491,6 +504,7 @@ class WanTransformerBlock(nn.Module):
         encoder_hidden_states: torch.Tensor,
         temb: torch.Tensor,
         freqs_cis: tuple[torch.Tensor, torch.Tensor],
+        encoder_hidden_states_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if hidden_states.dim() == 4:
             hidden_states = hidden_states.squeeze(1)
@@ -595,7 +609,9 @@ class WanTransformerBlock(nn.Module):
 
         # 2. Cross-attention
         attn_output = self.attn2(
-            norm_hidden_states, context=encoder_hidden_states, context_lens=None
+            norm_hidden_states,
+            context=encoder_hidden_states,
+            context_lens=encoder_hidden_states_mask,
         )
         norm_hidden_states, hidden_states = self.cross_attn_residual_norm(
             hidden_states, attn_output, 1, c_shift_msa, c_scale_msa
@@ -758,6 +774,7 @@ class WanTransformerBlock_VSA(nn.Module):
         encoder_hidden_states: torch.Tensor,
         temb: torch.Tensor,
         freqs_cis: tuple[torch.Tensor, torch.Tensor],
+        encoder_hidden_states_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if hidden_states.dim() == 4:
             hidden_states = hidden_states.squeeze(1)
@@ -841,7 +858,9 @@ class WanTransformerBlock_VSA(nn.Module):
 
         # 2. Cross-attention
         attn_output = self.attn2(
-            norm_hidden_states, context=encoder_hidden_states, context_lens=None
+            norm_hidden_states,
+            context=encoder_hidden_states,
+            context_lens=encoder_hidden_states_mask,
         )
         norm_hidden_states, hidden_states = self.cross_attn_residual_norm(
             hidden_states, attn_output, 1, c_shift_msa, c_scale_msa
@@ -1000,6 +1019,7 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         timestep: torch.LongTensor,
         encoder_hidden_states_image: torch.Tensor | list[torch.Tensor] | None = None,
         guidance=None,
+        encoder_hidden_states_mask: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
         forward_batch = get_forward_context().forward_batch
@@ -1159,7 +1179,11 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
 
             for block in self.blocks:
                 hidden_states = block(
-                    hidden_states, encoder_hidden_states, timestep_proj, freqs_cis
+                    hidden_states,
+                    encoder_hidden_states,
+                    timestep_proj,
+                    freqs_cis,
+                    encoder_hidden_states_mask=encoder_hidden_states_mask,
                 )
             # if teacache is enabled, we need to cache the original hidden states
             if self.enable_teacache:

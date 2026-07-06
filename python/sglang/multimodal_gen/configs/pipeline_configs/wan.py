@@ -17,6 +17,7 @@ from sglang.multimodal_gen.configs.models.vaes import WanVAEConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ModelTaskType,
     PipelineConfig,
+    TextConditioningOutput,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
     ModelDeploymentConfig,
@@ -26,7 +27,16 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 
 
-def t5_postprocess_text(outputs: BaseEncoderOutput, _text_inputs) -> torch.Tensor:
+def t5_postprocess_text(
+    outputs: BaseEncoderOutput, _text_inputs
+) -> TextConditioningOutput:
+    """Return T5 text embeddings padded to 512, with real per-request lengths.
+
+    Dynamic batches can merge requests with different real caption lengths;
+    returning TextConditioningOutput (instead of the bare padded tensor)
+    preserves `seq_lens` so DiTs can mask out the padding instead of silently
+    attending to it.
+    """
     mask: torch.Tensor = outputs.attention_mask
     hidden_state: torch.Tensor = outputs.last_hidden_state
     seq_lens = mask.gt(0).sum(dim=1).long()
@@ -39,7 +49,11 @@ def t5_postprocess_text(outputs: BaseEncoderOutput, _text_inputs) -> torch.Tenso
         ],
         dim=0,
     )
-    return prompt_embeds_tensor
+    positions = torch.arange(512, device=prompt_embeds_tensor.device).unsqueeze(0)
+    prompt_embeds_mask = positions < seq_lens.unsqueeze(1)
+    return TextConditioningOutput(
+        prompt_embeds_tensor, prompt_embeds_mask, seq_lens.tolist()
+    )
 
 
 @dataclass
@@ -96,6 +110,41 @@ class WanT2V480PConfig(PipelineConfig):
         return ModelDeploymentConfig(
             auto_dit_layerwise_offload=True,
         )
+
+    def _prepare_encoder_hidden_states_mask(self, batch, prompt_embeds, negative: bool):
+        """Return a `[batch, text_seq_len]` mask over real (non-padded) text tokens.
+
+        Dynamic batches can merge requests whose captions have different real
+        lengths after tokenization; the DiT still sees one padded T5
+        `encoder_hidden_states` tensor, so a mask is needed to keep
+        cross-attention off the padding. Returns None when every request
+        already fills the full padded length (no mask needed).
+        """
+        batch_size, text_seq_len = prompt_embeds[0].shape[:2]
+        txt_seq_lens = self.require_text_seq_lens(
+            batch, 0, negative=negative, expected_batch_size=batch_size
+        )
+        if all(seq_len == text_seq_len for seq_len in txt_seq_lens):
+            return None
+
+        device = prompt_embeds[0].device
+        positions = torch.arange(text_seq_len, device=device)
+        seq_lens = torch.tensor(txt_seq_lens, device=device, dtype=torch.long)
+        return positions.unsqueeze(0) < seq_lens.unsqueeze(1)
+
+    def prepare_pos_cond_kwargs(self, batch, device, rotary_emb, dtype):
+        return {
+            "encoder_hidden_states_mask": self._prepare_encoder_hidden_states_mask(
+                batch, batch.prompt_embeds, negative=False
+            )
+        }
+
+    def prepare_neg_cond_kwargs(self, batch, device, rotary_emb, dtype):
+        return {
+            "encoder_hidden_states_mask": self._prepare_encoder_hidden_states_mask(
+                batch, batch.negative_prompt_embeds, negative=True
+            )
+        }
 
 
 @dataclass
