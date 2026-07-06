@@ -1173,12 +1173,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     f"{self.model_config.hf_config.model_type}"
                 )
 
-        if (
-            not self.use_mla_backend
-            or server_args.attention_backend
-            not in CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS
-        ):
-            server_args.disable_chunked_prefix_cache = True
+        if not self.is_draft_worker:
+            prefill_backend, _ = server_args.get_attention_backends()
+            if (
+                not self.use_mla_backend
+                or prefill_backend
+                not in CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS
+            ):
+                server_args.disable_chunked_prefix_cache = True
 
         if not server_args.disable_chunked_prefix_cache:
             log_info_on_rank0(logger, "Chunked prefix cache is turned on.")
