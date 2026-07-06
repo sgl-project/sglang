@@ -16,6 +16,7 @@
 #include "utils.h"  // WARP_SIZE
 #endif
 
+#if !defined(USE_ROCM) && !defined(USE_MUSA)
 __device__ __forceinline__ void
 transfer_item_warp(int32_t lane_id, const void* src_addr, void* dst_addr, int64_t item_size_bytes) {
   const uint64_t* __restrict__ src = static_cast<const uint64_t*>(src_addr);
@@ -24,17 +25,50 @@ transfer_item_warp(int32_t lane_id, const void* src_addr, void* dst_addr, int64_
 
 #pragma unroll
   for (int j = lane_id; j < total_chunks; j += WARP_SIZE) {
-#if !defined(USE_ROCM) && !defined(USE_MUSA)
     uint64_t tmp;
     asm volatile("ld.global.nc.b64 %0,[%1];" : "=l"(tmp) : "l"(src + j) : "memory");
     asm volatile("st.global.cg.b64 [%0],%1;" ::"l"(dst + j), "l"(tmp) : "memory");
-
-#else
-    uint64_t tmp = __builtin_nontemporal_load(src + j);
-    __builtin_nontemporal_store(tmp, dst + j);
-#endif
   }
 }
+#else
+// ROCm: use 128-bit streaming load/store when 16B-aligned, so fewer CUs are
+// needed to saturate the host fabric; falls back to 64-bit otherwise.
+typedef uint32_t sgl_u32x4 __attribute__((ext_vector_type(4)));
+__device__ __forceinline__ void
+transfer_item_warp(int32_t lane_id, const void* src_addr, void* dst_addr, int64_t item_size_bytes) {
+  const uintptr_t addr_or = reinterpret_cast<uintptr_t>(src_addr) | reinterpret_cast<uintptr_t>(dst_addr);
+  if ((addr_or & 0xF) == 0) {
+    const sgl_u32x4* __restrict__ src = static_cast<const sgl_u32x4*>(src_addr);
+    sgl_u32x4* __restrict__ dst = static_cast<sgl_u32x4*>(dst_addr);
+    const int chunks16 = item_size_bytes / 16;
+    for (int j = lane_id; j < chunks16; j += WARP_SIZE) {
+      sgl_u32x4 tmp = __builtin_nontemporal_load(src + j);
+      __builtin_nontemporal_store(tmp, dst + j);
+    }
+    // Trailing bytes: item_size_bytes % 8 == 0 is guaranteed by the launcher,
+    // so the remainder is at most one 8B word.
+    const int done_bytes = chunks16 * 16;
+    const int rem8 = static_cast<int>(item_size_bytes - done_bytes) / 8;
+    if (rem8) {
+      const uint64_t* __restrict__ src8 =
+          reinterpret_cast<const uint64_t*>(static_cast<const char*>(src_addr) + done_bytes);
+      uint64_t* __restrict__ dst8 = reinterpret_cast<uint64_t*>(static_cast<char*>(dst_addr) + done_bytes);
+      for (int j = lane_id; j < rem8; j += WARP_SIZE) {
+        uint64_t tmp = __builtin_nontemporal_load(src8 + j);
+        __builtin_nontemporal_store(tmp, dst8 + j);
+      }
+    }
+  } else {
+    const uint64_t* __restrict__ src = static_cast<const uint64_t*>(src_addr);
+    uint64_t* __restrict__ dst = static_cast<uint64_t*>(dst_addr);
+    const int total_chunks = item_size_bytes / sizeof(uint64_t);
+    for (int j = lane_id; j < total_chunks; j += WARP_SIZE) {
+      uint64_t tmp = __builtin_nontemporal_load(src + j);
+      __builtin_nontemporal_store(tmp, dst + j);
+    }
+  }
+}
+#endif
 
 template <typename T>
 __device__ __forceinline__ T* get_global_offset_lf(
