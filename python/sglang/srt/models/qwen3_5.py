@@ -119,11 +119,18 @@ _is_hip = is_hip()
 _is_xpu = is_xpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _hip_use_alt_stream = get_bool_env_var("SGLANG_ALT_STREAM") and _is_hip
-_gdn_use_alt_stream = _is_cuda or (
-    get_bool_env_var("SGLANG_GDN_QKVZ_BA_ALT_STREAM", "False") and _hip_use_alt_stream
+_gdn_use_alt_stream = (
+    _is_cuda
+    or _is_xpu
+    or (
+        get_bool_env_var("SGLANG_GDN_QKVZ_BA_ALT_STREAM", "False")
+        and _hip_use_alt_stream
+    )
 )
-_qknorm_use_alt_stream = _is_cuda or (
-    get_bool_env_var("SGLANG_QK_NORM_ALT_STREAM", "False") and _hip_use_alt_stream
+_qknorm_use_alt_stream = (
+    _is_cuda
+    or _is_xpu
+    or (get_bool_env_var("SGLANG_QK_NORM_ALT_STREAM", "False") and _hip_use_alt_stream)
 )
 _is_amx_available = cpu_has_amx_support()
 
@@ -466,11 +473,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         return query, key, value, z, b, a
 
     def _forward_input_proj(self, hidden_states: torch.Tensor):
-        if (
-            _is_cpu
-            or _is_npu
-            or check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
-        ):
+        if _is_npu or check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE):
             DUAL_STREAM_TOKEN_THRESHOLD = 0
         else:
             DUAL_STREAM_TOKEN_THRESHOLD = 1024
@@ -482,10 +485,15 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             and seq_len < DUAL_STREAM_TOKEN_THRESHOLD
             and _gdn_use_alt_stream
         ):
-            current_stream = torch.cuda.current_stream()
+            if _is_xpu:
+                current_stream = torch.xpu.current_stream()
+                stream_ctx = torch.xpu.stream
+            else:
+                current_stream = torch.cuda.current_stream()
+                stream_ctx = torch.cuda.stream
             self.alt_stream.wait_stream(current_stream)
             projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
-            with torch.cuda.stream(self.alt_stream):
+            with stream_ctx(self.alt_stream):
                 projected_states_ba, _ = self.in_proj_ba(hidden_states)
             current_stream.wait_stream(self.alt_stream)
         else:
@@ -604,7 +612,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                 quant_config=quant_config,
                 alt_stream=(
                     alt_stream
-                    if (_is_cuda or _disable_shared_experts_fusion())
+                    if (_is_cuda or _is_xpu or _disable_shared_experts_fusion())
                     else None
                 ),
                 prefix=add_prefix("mlp", prefix.replace(".linear_attn", "")),
@@ -820,7 +828,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 quant_config=quant_config,
                 alt_stream=(
                     alt_stream
-                    if (_is_cuda or _disable_shared_experts_fusion())
+                    if (_is_cuda or _is_xpu or _disable_shared_experts_fusion())
                     else None
                 ),
                 prefix=add_prefix("mlp", prefix.replace(".self_attn", "")),
@@ -868,11 +876,16 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             and get_is_capture_mode()
             and _qknorm_use_alt_stream
         ):
-            current_stream = torch.cuda.current_stream()
+            if _is_xpu:
+                current_stream = torch.xpu.current_stream()
+                stream_ctx = torch.xpu.stream
+            else:
+                current_stream = torch.cuda.current_stream()
+                stream_ctx = torch.cuda.stream
             self.alt_stream.wait_stream(current_stream)
             q_by_head = q.reshape(-1, self.head_dim)
             q_by_head = self.q_norm(q_by_head)
-            with torch.cuda.stream(self.alt_stream):
+            with stream_ctx(self.alt_stream):
                 k_by_head = k.reshape(-1, self.head_dim)
                 k_by_head = self.k_norm(k_by_head)
             current_stream.wait_stream(self.alt_stream)
@@ -1001,7 +1014,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 positions=positions,
                 hidden_states=hidden_states,
             )
-        elif (_is_hip or _is_xpu) and self.attn_output_gate:
+        elif _is_hip and self.attn_output_gate:
             q, k, v, gate = self.forward_prepare_fused_gate(
                 positions=positions,
                 hidden_states=hidden_states,
@@ -1202,7 +1215,12 @@ class Qwen3_5ForCausalLM(nn.Module):
         if _is_hip:
             self._maybe_autodisable_shared_experts_fusion(config, quant_config)
 
-        alt_stream = torch.cuda.Stream() if _is_cuda or _hip_use_alt_stream else None
+        if _is_cuda or _hip_use_alt_stream:
+            alt_stream = torch.cuda.Stream()
+        elif _is_xpu:
+            alt_stream = torch.xpu.Stream()
+        else:
+            alt_stream = None
 
         # Embedding layer
         if self.pp_group.is_first_rank:
