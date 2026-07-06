@@ -170,3 +170,81 @@ def fused_combine(y: mx.array, scores: mx.array) -> mx.array:
         output_dtypes=[y.dtype],
     )
     return out.reshape(*lead, H)
+
+
+def _fused_qwen2_moe_call(self, x):
+    """Stock ``Qwen2MoeSparseMoeBlock.__call__`` with the combine fused."""
+    gates = self.gate(x)
+    gates = mx.softmax(gates, axis=-1, precise=True)
+    k = self.top_k
+    inds = mx.stop_gradient(mx.argpartition(-gates, kth=k - 1, axis=-1)[..., :k])
+    scores = mx.take_along_axis(gates, inds, axis=-1)
+    y = self.switch_mlp(x, inds)
+    y = fused_combine(y, scores)
+    shared_expert_output = self.shared_expert(x)
+    shared_expert_output = mx.sigmoid(self.shared_expert_gate(x)) * shared_expert_output
+    return y + shared_expert_output
+
+
+def _fused_qwen3_moe_call(self, x):
+    """Stock ``Qwen3MoeSparseMoeBlock.__call__`` with the combine fused."""
+    gates = self.gate(x)
+    gates = mx.softmax(gates, axis=-1, precise=True)
+    k = self.top_k
+    inds = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
+    scores = mx.take_along_axis(gates, inds, axis=-1)
+    if self.norm_topk_prob:
+        scores /= mx.sum(scores, axis=-1, keepdims=True)
+    y = self.switch_mlp(x, inds)
+    return fused_combine(y, scores)
+
+
+def patch_moe_combine_with_fused(model) -> int:
+    """Swap eligible MoE blocks onto a fused-combine forward.
+
+    The combine lives inline in each architecture's block ``__call__``, so the
+    patch reimplements the stock forward with only the combine line changed
+    and installs it via a per-class subclass swap (the Path B mechanism from
+    fused_swiglu.py). Exact type match only: a user subclass may have changed
+    the forward the fused body reimplements. Per-call eligibility stays inside
+    fused_combine, which falls back inline, so patching never changes results.
+
+    Returns the number of blocks patched.
+    """
+    targets = []
+    try:
+        from mlx_lm.models.qwen2_moe import Qwen2MoeSparseMoeBlock
+
+        targets.append((Qwen2MoeSparseMoeBlock, _fused_qwen2_moe_call))
+    except ImportError:
+        pass
+    try:
+        from mlx_lm.models.qwen3_moe import Qwen3MoeSparseMoeBlock
+
+        targets.append((Qwen3MoeSparseMoeBlock, _fused_qwen3_moe_call))
+    except ImportError:
+        pass
+
+    patched = 0
+    for layer in model.model.layers:
+        mlp = layer.get("mlp")
+        if mlp is None:
+            continue
+        for cls, fused_call in targets:
+            # Exact type also makes the patch idempotent: a swapped block's
+            # type is the subclass, not cls.
+            if type(mlp) is not cls:
+                continue
+            if "_FusedCombineSubclass" not in cls.__dict__:
+                cls._FusedCombineSubclass = type(
+                    f"{cls.__name__}_FusedCombine", (cls,), {"__call__": fused_call}
+                )
+            mlp.__class__ = cls._FusedCombineSubclass
+            patched += 1
+            break
+
+    if patched == 0:
+        logger.warning("patch_moe_combine_with_fused: no eligible MoE block found")
+    else:
+        logger.info(f"patch_moe_combine_with_fused: patched {patched} blocks")
+    return patched
