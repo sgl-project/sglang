@@ -111,6 +111,15 @@ class SamplingParams(msgspec.Struct, kw_only=True, omit_defaults=True):
     stream_interval: Optional[int] = None
     logit_bias: Optional[Dict[str, float]] = None
     sampling_seed: Optional[int] = None
+    # Request-level opt-out of speculative decoding (RFC #30263). When True,
+    # this request asks the server to skip the draft/verify path and produce
+    # its output with the target model alone. This field is currently plumbed
+    # end-to-end (API -> SamplingParams -> IPC -> Req) but NOT yet enforced by
+    # the speculative workers: correct enforcement requires switching to a
+    # num_steps=0 runtime state (CUDA graph runner + attention backend), which
+    # is being designed in RFC #30263. Always a no-op when the server has no
+    # speculative decoding configured.
+    disable_speculative_decoding: bool = False
 
     # --- Internal fields (populated by __post_init__ or normalize(), not API-facing) ---
     stop_strs: Optional[Union[str, List[str]]] = None  # from stop
@@ -163,6 +172,11 @@ class SamplingParams(msgspec.Struct, kw_only=True, omit_defaults=True):
         )
         self.no_stop_trim = (
             self.no_stop_trim if self.no_stop_trim is not None else False
+        )
+        self.disable_speculative_decoding = (
+            self.disable_speculative_decoding
+            if self.disable_speculative_decoding is not None
+            else False
         )
 
         # Process some special cases

@@ -354,6 +354,10 @@ class CompletionRequest(BaseModel):
     stop_regex: Optional[Union[str, List[str]]] = None
     no_stop_trim: bool = False
     ignore_eos: bool = False
+    # SGLang extension (RFC #30263): request-level opt-out of speculative
+    # decoding. Currently plumbed but not yet enforced by the speculative
+    # workers. Always a no-op when the server runs no speculative decoding.
+    disable_speculative_decoding: bool = False
     skip_special_tokens: bool = True
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
     session_id: Optional[str] = None
@@ -726,6 +730,10 @@ class ChatCompletionRequest(BaseModel):
     stop_regex: Optional[Union[str, List[str]]] = None
     no_stop_trim: bool = False
     ignore_eos: bool = False
+    # SGLang extension (RFC #30263): request-level opt-out of speculative
+    # decoding. Currently plumbed but not yet enforced by the speculative
+    # workers. Always a no-op when the server runs no speculative decoding.
+    disable_speculative_decoding: bool = False
     continue_final_message: bool = False
     skip_special_tokens: bool = True
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
@@ -913,6 +921,7 @@ class ChatCompletionRequest(BaseModel):
             "n": self.n,
             "no_stop_trim": self.no_stop_trim,
             "ignore_eos": self.ignore_eos,
+            "disable_speculative_decoding": self.disable_speculative_decoding,
             "skip_special_tokens": self.skip_special_tokens,
             "logit_bias": self.logit_bias,
             "custom_params": self.custom_params,

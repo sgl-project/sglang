@@ -520,5 +520,51 @@ class TestRegexMaxLength(CustomTestCase):
         self.assertGreaterEqual(result, MAX_LEN)
 
 
+class TestSamplingParamsDisableSpeculativeDecoding(CustomTestCase):
+    """Covers the per-request speculative-decoding opt-out flag (API plumbing)."""
+
+    def test_default_is_false(self):
+        """By default a request does not opt out of speculative decoding."""
+        self.assertFalse(SamplingParams().disable_speculative_decoding)
+
+    def test_explicit_true_preserved(self):
+        """An explicit opt-out is kept as-is."""
+        sp = SamplingParams(disable_speculative_decoding=True)
+        self.assertTrue(sp.disable_speculative_decoding)
+
+    def test_none_falls_back_to_false(self):
+        """/generate callers may send an explicit null; __post_init__ normalizes it."""
+        sp = SamplingParams(disable_speculative_decoding=None)
+        self.assertFalse(sp.disable_speculative_decoding)
+
+    def test_default_omitted_from_wire(self):
+        """omit_defaults=True: the default False must not bloat the msgpack IPC payload."""
+        encoded = msgspec.msgpack.encode(SamplingParams())
+        self.assertNotIn(
+            "disable_speculative_decoding", msgspec.msgpack.decode(encoded)
+        )
+
+    def test_msgpack_round_trip_preserves_opt_out(self):
+        """The flag must survive msgpack encode/decode of a bare struct."""
+        decoder = msgspec.msgpack.Decoder(SamplingParams)
+        rebuilt = decoder.decode(
+            msgspec.msgpack.Encoder().encode(
+                SamplingParams(disable_speculative_decoding=True)
+            )
+        )
+        self.assertTrue(rebuilt.disable_speculative_decoding)
+
+    def test_normalized_round_trip_preserves_opt_out(self):
+        """Mirror the real tokenizer -> scheduler IPC: normalize() first, then
+        encode/decode. The decode-side __post_init__ early-returns for normalized
+        structs, so this covers the path the bare round-trip above does not."""
+        sp = SamplingParams(disable_speculative_decoding=True)
+        sp.normalize(tokenizer=None)
+        decoder = msgspec.msgpack.Decoder(SamplingParams)
+        rebuilt = decoder.decode(msgspec.msgpack.Encoder().encode(sp))
+        self.assertTrue(rebuilt.is_normalized)
+        self.assertTrue(rebuilt.disable_speculative_decoding)
+
+
 if __name__ == "__main__":
     unittest.main()
