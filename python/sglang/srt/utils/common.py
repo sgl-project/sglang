@@ -3448,15 +3448,14 @@ def require_mlp_tp_gather(server_args: ServerArgs):
     """
     Check if the input of MLP is obtained by all-gather rather than all-reduce. This only happens when each MLP TP group contains multiple attention DP groups.
     """
+    from sglang.srt.arg_groups.overrides import resolved_view
     from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 
-    if server_args.enable_dp_attention:
-        from sglang.srt.arg_groups.overrides import resolved_view
-
-        # Callable pre-publish (Scheduler.init_moe_gemm_config computes
-        # require_mlp_sync before the model worker publishes the flags
-        # tier): read the resolved value through the view.
-        view = resolved_view(server_args)
+    # Callable pre-publish (Scheduler.init_moe_gemm_config computes
+    # require_mlp_sync before the model worker publishes the flags
+    # tier): read the resolved values through the view.
+    view = resolved_view(server_args)
+    if view.enable_dp_attention:
         assert server_args.dp_size > 1, "dp_size must be greater than 1"
         if (
             view.moe_dense_tp_size is None
@@ -3490,7 +3489,7 @@ def require_attn_tp_gather(server_args: ServerArgs):
         not get_moe_a2a_backend().is_none()
         or resolved_view(server_args).moe_dense_tp_size is not None
     ):
-        if server_args.enable_dp_attention:
+        if resolved_view(server_args).enable_dp_attention:
             return server_args.dp_size < server_args.tp_size
         else:
             return True
@@ -3503,7 +3502,11 @@ def require_gathered_buffer(server_args: ServerArgs):
 
 
 def require_mlp_sync(server_args: ServerArgs):
-    return server_args.enable_dp_attention or require_gathered_buffer(server_args)
+    from sglang.srt.arg_groups.overrides import resolved_view
+
+    return resolved_view(server_args).enable_dp_attention or require_gathered_buffer(
+        server_args
+    )
 
 
 def find_local_repo_dir(repo_id: str, revision: Optional[str] = None) -> Optional[str]:

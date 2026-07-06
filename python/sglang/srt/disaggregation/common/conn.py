@@ -15,6 +15,7 @@ import torch.distributed as dist
 import zmq
 from aiohttp import web
 
+from sglang.srt.arg_groups.overrides import resolved_view
 from sglang.srt.disaggregation.base.conn import (
     BaseKVBootstrapServer,
     BaseKVManager,
@@ -132,7 +133,7 @@ class CommonKVManager(BaseKVManager):
         self.attn_dp_size = get_attention_dp_size()
         self.attn_dp_rank = get_attention_dp_rank()
         self.system_dp_size = (
-            1 if server_args.enable_dp_attention else server_args.dp_size
+            1 if resolved_view(server_args).enable_dp_attention else server_args.dp_size
         )
         self.system_dp_rank = (
             self.kv_args.system_dp_rank if self.kv_args.system_dp_rank else 0

@@ -155,7 +155,7 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
         self.kv_context: Optional[FrozenKVMTPContext] = None
 
         self.draft_tp_context = (
-            draft_tp_context if server_args.enable_dp_attention else empty_context
+            draft_tp_context if get_flags().enable_dp_attention else empty_context
         )
 
         self.draft_attn_backend = None

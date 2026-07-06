@@ -384,11 +384,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.moe_ep_rank = moe_ep_rank
         self.moe_ep_size = moe_ep_size
         self.dp_rank = dp_rank
-        self.dp_size = server_args.dp_size if server_args.enable_dp_attention else 1
+        from sglang.srt.arg_groups.overrides import resolved_view
+
+        _view = resolved_view(server_args)
+        self.dp_size = server_args.dp_size if _view.enable_dp_attention else 1
         self.pp_rank = pp_rank
         self.pp_size = pp_size
         self.attn_cp_rank = attn_cp_rank
-        self.attn_cp_size = server_args.attn_cp_size
+        self.attn_cp_size = _view.attn_cp_size
         self.moe_dp_rank = moe_dp_rank
         self.moe_dp_size = server_args.moe_dp_size
         self.model_config = model_config
@@ -875,7 +878,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 device=self.device,
                 tp_group=(
                     self.attention_tp_group.cpu_group
-                    if self.server_args.enable_dp_attention
+                    if get_flags().enable_dp_attention
                     else self.tp_group.cpu_group
                 ),
                 host_to_device_ratio=hisparse_cfg.host_to_device_ratio,

@@ -243,10 +243,12 @@ class TpModelWorker(BaseTpWorker):
         is_multi_layer_eagle: bool = False,
         context_length: Optional[int] = None,
     ):
+        from sglang.srt.arg_groups.overrides import resolved_view
+
         # Parse args
         self.server_args = server_args
         self.tp_size = server_args.tp_size
-        self.ep_size = server_args.ep_size
+        self.ep_size = resolved_view(server_args).ep_size
         self.pp_size = server_args.pp_size
         self.tp_rank = tp_rank
         self.moe_ep_rank = moe_ep_rank
@@ -314,8 +316,6 @@ class TpModelWorker(BaseTpWorker):
             src=self.world_group.ranks[0],
         )[0]
         set_random_seed(self.random_seed)
-
-        from sglang.srt.arg_groups.overrides import resolved_view
 
         self.enable_overlap = not resolved_view(server_args).disable_overlap_schedule
         self.enable_spec = server_args.speculative_algorithm is not None

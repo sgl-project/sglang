@@ -298,7 +298,12 @@ class BenchArgs:
 def load_model(server_args, port_args, gpu_id, tp_rank):
     suppress_other_loggers()
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
-    moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
+    from sglang.srt.arg_groups.overrides import resolved_view
+
+    # Pre-publish (the ModelRunner below performs the publish): read the
+    # resolved ep_size through the view.
+    ep_size = resolved_view(server_args).ep_size
+    moe_ep_rank = tp_rank // (server_args.tp_size // ep_size)
 
     model_config = ModelConfig.from_server_args(server_args)
     runner_kwargs = dict(
@@ -308,7 +313,7 @@ def load_model(server_args, port_args, gpu_id, tp_rank):
         tp_rank=tp_rank,
         tp_size=server_args.tp_size,
         moe_ep_rank=moe_ep_rank,
-        moe_ep_size=server_args.ep_size,
+        moe_ep_size=ep_size,
         pp_rank=0,
         pp_size=1,
         nccl_port=port_args.nccl_port,

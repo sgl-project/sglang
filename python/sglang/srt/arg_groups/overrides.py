@@ -2198,6 +2198,14 @@ DUAL_APPLY_RETIRED: frozenset = frozenset(
         # builder and the eager runner read the leaf; the two dispatch
         # declarers (MiMoV2, Step3p5/3p7) read the pristine input.
         "enable_multi_layer_eagle",
+        # The launcher / tokenizer / ray-controller processes (where no
+        # publish exists) and the pre-publish scheduler/runner captures read
+        # views over the instance-carried declaration stash; scheduler-
+        # process runtime readers are on the leaves; the __post_init__
+        # validation chains read views at their slots.
+        "enable_dp_attention",
+        "ep_size",
+        "attn_cp_size",
     }
 )
 

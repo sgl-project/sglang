@@ -238,6 +238,7 @@ from sglang.srt.observability.trace import process_tracing_init, trace_set_threa
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.platforms import current_platform
 from sglang.srt.plugins import load_plugins
+from sglang.srt.runtime_context import get_flags
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import PortArgs, ServerArgs, get_global_server_args
 from sglang.srt.session.session_controller import SessionController
@@ -361,14 +362,16 @@ class Scheduler(
         self.max_recv_per_poll = envs.SGLANG_SCHEDULER_MAX_RECV_PER_POLL.get()
         self.enable_hisparse = server_args.enable_hisparse
 
-        # Distributed rank info
+        # Distributed rank info (pre-publish: read the resolved parallel
+        # shape through the view)
+        _view = resolved_view(server_args)
         attn_tp_rank, attn_tp_size, attn_dp_rank, attn_dp_size = (
             compute_dp_attention_world_info(
-                server_args.enable_dp_attention,
+                _view.enable_dp_attention,
                 tp_rank,
                 server_args.tp_size,
                 server_args.dp_size,
-                server_args.attn_cp_size,
+                _view.attn_cp_size,
             )
         )
         self.ps = ParallelState(
@@ -381,11 +384,11 @@ class Scheduler(
             attn_tp_rank=attn_tp_rank,
             attn_tp_size=attn_tp_size,
             attn_cp_rank=attn_cp_rank,
-            attn_cp_size=server_args.attn_cp_size,
+            attn_cp_size=_view.attn_cp_size,
             attn_dp_rank=attn_dp_rank,
             attn_dp_size=attn_dp_size,
             moe_ep_rank=moe_ep_rank,
-            moe_ep_size=server_args.ep_size,
+            moe_ep_size=_view.ep_size,
             moe_dp_rank=moe_dp_rank,
             moe_dp_size=server_args.moe_dp_size,
             gpu_id=gpu_id,
@@ -473,7 +476,7 @@ class Scheduler(
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                 tp_group=(
                     self.attn_tp_cpu_group
-                    if self.server_args.enable_dp_attention
+                    if get_flags().enable_dp_attention
                     else self.tp_cpu_group
                 ),
                 tree_cache=self.tree_cache,
@@ -918,9 +921,7 @@ class Scheduler(
         # Use the CPU (gloo) group to broadcast VLM Python objects and avoid CUDA
         # stream/device coupling (#11910).
         self.dp_tp_group = (
-            self.attn_tp_group
-            if self.server_args.enable_dp_attention
-            else self.tp_group
+            self.attn_tp_group if get_flags().enable_dp_attention else self.tp_group
         )
         self.dp_tp_cpu_group = self.dp_tp_group.cpu_group
 
@@ -1346,8 +1347,6 @@ class Scheduler(
             "flashinfer": ("SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE", 4096),
             "triton": ("SGLANG_TRITON_PREFILL_TRUNCATION_ALIGN_SIZE", 4096),
         }
-        from sglang.srt.runtime_context import get_flags
-
         env_var, default_size = backend_sizes.get(
             get_flags().attn.backend, (None, None)
         )
@@ -3382,7 +3381,7 @@ class Scheduler(
 
     def _maybe_report_active_ranks(self) -> None:
         if not (
-            self.server_args.enable_dp_attention
+            get_flags().enable_dp_attention
             and self.server_args.elastic_ep_backend is not None
         ):
             return
@@ -4231,13 +4230,16 @@ def configure_scheduler_process(
         prefix += f" DP{dp_rank}"
     if server_args.pp_size > 1:
         prefix += f" PP{pp_rank}"
-    if server_args.attn_cp_size > 1:
+    from sglang.srt.arg_groups.overrides import resolved_view
+
+    _view = resolved_view(server_args)
+    if _view.attn_cp_size > 1:
         prefix += f" ATTN_CP{attn_cp_rank}"
     if server_args.moe_dp_size > 1:
         prefix += f" MOE_DP{moe_dp_rank}"
     if server_args.tp_size > 1:
         prefix += f" TP{tp_rank}"
-    if server_args.ep_size > 1:
+    if _view.ep_size > 1:
         prefix += f" EP{moe_ep_rank}"
 
     # Config the process

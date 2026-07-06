@@ -12,7 +12,9 @@ class SchedulerRecvSkipper:
 
     def __init__(self, server_args: ServerArgs):
         # Can be supported if needed, but may need e.g. `global_forward_mode`
-        assert not server_args.enable_dp_attention
+        from sglang.srt.arg_groups.overrides import resolved_view
+
+        assert not resolved_view(server_args).enable_dp_attention
         self._counter = 0
         self._threshold = server_args.scheduler_recv_interval
         # All can be tuned if needed

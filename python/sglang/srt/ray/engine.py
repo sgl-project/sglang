@@ -107,7 +107,9 @@ def _compute_world_size(server_args: ServerArgs) -> int:
 
     Normal: dp_size * tp_size * pp_size; DP attention: tp_size * pp_size.
     """
-    if server_args.enable_dp_attention:
+    from sglang.srt.arg_groups.overrides import resolved_view
+
+    if resolved_view(server_args).enable_dp_attention:
         return server_args.tp_size * server_args.pp_size
     return server_args.dp_size * server_args.tp_size * server_args.pp_size
 
@@ -265,7 +267,9 @@ class RayEngine(Engine):
                 placement_group as create_placement_group,
             )
 
-            if server_args.enable_dp_attention:
+            from sglang.srt.arg_groups.overrides import resolved_view
+
+            if resolved_view(server_args).enable_dp_attention:
                 total_gpus = server_args.tp_size * server_args.pp_size
             else:
                 total_gpus = (
@@ -438,11 +442,13 @@ class RayEngine(Engine):
         rank0_node_ip: str,
     ) -> RaySchedulerInitResult:
         """Launch DP schedulers via RayDataParallelController."""
+        from sglang.srt.arg_groups.overrides import resolved_view
         from sglang.srt.ray.data_parallel_controller import (
             RayDataParallelController,
         )
 
-        if server_args.enable_dp_attention:
+        enable_dp_attention = resolved_view(server_args).enable_dp_attention
+        if enable_dp_attention:
             # DP attention folds DP into TP — total GPUs = tp_size * pp_size
             total_gpus = server_args.tp_size * server_args.pp_size
         else:
@@ -452,7 +458,7 @@ class RayEngine(Engine):
             f"Ray DP cluster: {server_args.nnodes} nodes, "
             f"{gpus_per_node} GPUs/node, dp_size={server_args.dp_size}, "
             f"tp_size={server_args.tp_size}, pp_size={server_args.pp_size}, "
-            f"enable_dp_attention={server_args.enable_dp_attention}"
+            f"enable_dp_attention={enable_dp_attention}"
         )
 
         # Set dist_init_addr on server_args so PortArgs.init_new() can compute

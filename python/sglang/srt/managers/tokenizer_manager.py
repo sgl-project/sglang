@@ -1320,10 +1320,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         - Or, if no request has text or multimodal input (all use pre-tokenized input_ids or input_embeds), batch the requests without tokenization.
         - Batch tokenization does not support DP attention yet, and it will make everything goes to the first rank currently
         """
+        from sglang.srt.arg_groups.overrides import resolved_view
+
         return batch_size > 0 and (
             self.server_args.enable_tokenizer_batch_encode
             or (
-                (not self.server_args.enable_dp_attention)
+                (not resolved_view(self.server_args).enable_dp_attention)
                 and (not self._batch_has_text(batch_size, requests))
             )
         )

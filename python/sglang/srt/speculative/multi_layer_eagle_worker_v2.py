@@ -165,7 +165,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         draft_arch = self.draft_worker.model_config.hf_config.architectures[0]
         self.chain_mtp_hidden_states = draft_arch in ["Step3p5MTP"]
         self.draft_tp_context = (
-            draft_tp_context if server_args.enable_dp_attention else empty_context
+            draft_tp_context if get_flags().enable_dp_attention else empty_context
         )
         self.tree_mask_mode = TreeMaskMode.FULL_MASK
         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)

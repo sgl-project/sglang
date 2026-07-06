@@ -156,14 +156,14 @@ class ModelRunnerKVCacheMixin:
         if server_args.max_mamba_cache_size is not None:
             # Use explicitly set max_mamba_cache_size
             server_args.max_mamba_cache_size = server_args.max_mamba_cache_size // (
-                server_args.dp_size if server_args.enable_dp_attention else 1
+                server_args.dp_size if get_flags().enable_dp_attention else 1
             )
             # Reserve intermediate memory based on capped max_num_reqs
             if has_spec_dec:
                 ratio = self._calculate_mamba_ratio()
                 capped_reqs = min(
                     server_args.max_running_requests
-                    // (self.dp_size if server_args.enable_dp_attention else 1),
+                    // (self.dp_size if get_flags().enable_dp_attention else 1),
                     server_args.max_mamba_cache_size // ratio,
                 )
                 intermediate_size = (
@@ -178,7 +178,7 @@ class ModelRunnerKVCacheMixin:
         ):
             # Use explicitly set max_running_requests when radix cache is disabled
             server_args.max_mamba_cache_size = server_args.max_running_requests // (
-                server_args.dp_size if server_args.enable_dp_attention else 1
+                server_args.dp_size if get_flags().enable_dp_attention else 1
             )
             # Reserve intermediate memory based on capped max_num_reqs
             if has_spec_dec:
@@ -216,7 +216,7 @@ class ModelRunnerKVCacheMixin:
                 # so the return value only has main_state subtracted from total
                 capped_reqs = min(
                     server_args.max_running_requests
-                    // (self.dp_size if server_args.enable_dp_attention else 1),
+                    // (self.dp_size if get_flags().enable_dp_attention else 1),
                     server_args.max_mamba_cache_size // ratio,
                 )
                 intermediate_size = per_req * capped_reqs * D

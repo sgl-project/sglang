@@ -170,7 +170,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self._rebuild_topk1_chain_buffers()
 
         # Load draft model weights only.
-        if server_args.enable_dp_attention and self.speculative_algorithm.is_eagle3():
+        if get_flags().enable_dp_attention and self.speculative_algorithm.is_eagle3():
             ctx = draft_tp_context(get_attention_tp_group())
         else:
             ctx = empty_context()
@@ -203,7 +203,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             and self.topk == 1
         )
         self.draft_tp_context = (
-            draft_tp_context if server_args.enable_dp_attention else empty_context
+            draft_tp_context if get_flags().enable_dp_attention else empty_context
         )
         self.tree_mask_mode = TreeMaskMode.FULL_MASK
 

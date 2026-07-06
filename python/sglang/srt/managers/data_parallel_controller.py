@@ -181,7 +181,9 @@ class DataParallelController:
         self.workers: List[zmq.Socket] = [None] * server_args.dp_size
         self.status: List[bool] = [True] * server_args.dp_size
 
-        if server_args.enable_dp_attention:
+        from sglang.srt.arg_groups.overrides import resolved_view
+
+        if resolved_view(server_args).enable_dp_attention:
             self.launch_dp_attention_schedulers(server_args, port_args)
             # When local control broadcast is enabled, send control messages to
             # every DP group leader (attn_tp_rank=0) so each leader broadcasts
@@ -492,7 +494,9 @@ class DataParallelController:
         dp_rank: Optional[int],
         worker_ports: Optional[List[int]] = None,
     ):
-        if not server_args.enable_dp_attention:
+        from sglang.srt.arg_groups.overrides import resolved_view
+
+        if not resolved_view(server_args).enable_dp_attention:
             logger.info(f"Launch DP{dp_rank} starting at GPU #{base_gpu_id}.")
 
         memory_saver_adapter = TorchMemorySaverAdapter.create(
@@ -517,18 +521,21 @@ class DataParallelController:
 
         attn_cp_rank = 0
         moe_dp_rank = 0
+        from sglang.srt.arg_groups.overrides import resolved_view
+
+        view = resolved_view(server_args)
         for pp_rank in pp_rank_range:
             for tp_rank in tp_rank_range:
                 rank_port_args = port_args
 
-                if server_args.enable_dp_attention:
+                if view.enable_dp_attention:
                     # dp attention has different sharding logic
                     _, _, dp_rank, _ = compute_dp_attention_world_info(
-                        server_args.enable_dp_attention,
+                        view.enable_dp_attention,
                         tp_rank,
                         server_args.tp_size,
                         server_args.dp_size,
-                        server_args.attn_cp_size,
+                        view.attn_cp_size,
                     )
                     # compute zmq ports for this dp rank
                     rank_port_args = PortArgs.init_new(
@@ -546,28 +553,20 @@ class DataParallelController:
                     + ((pp_rank % pp_size_per_node) * tp_size_per_node)
                     + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
                 )
-                attn_dp_size = (
-                    server_args.dp_size if server_args.enable_dp_attention else 1
-                )
+                attn_dp_size = server_args.dp_size if view.enable_dp_attention else 1
 
                 # Parallelism hierarchy (outermost to innermost):
                 # - Attention: Global(TP) -> DP -> ATTN_CP -> ATTN_TP (innermost)
                 # - MoE: Global(TP) -> MOE_DP -> EP -> MOE_TP (innermost)
-                attn_tp_size = (
-                    server_args.tp_size // attn_dp_size // server_args.attn_cp_size
-                )
-                attn_cp_rank = (tp_rank // attn_tp_size) % server_args.attn_cp_size
+                attn_tp_size = server_args.tp_size // attn_dp_size // view.attn_cp_size
+                attn_cp_rank = (tp_rank // attn_tp_size) % view.attn_cp_size
                 moe_dp_rank = tp_rank // (
                     server_args.tp_size // server_args.moe_dp_size
                 )
                 moe_ep_rank = (
                     tp_rank
                     % (server_args.tp_size // server_args.moe_dp_size)
-                    // (
-                        server_args.tp_size
-                        // server_args.moe_dp_size
-                        // server_args.ep_size
-                    )
+                    // (server_args.tp_size // server_args.moe_dp_size // view.ep_size)
                 )
 
                 with self.env_lock, maybe_reindex_device_id(gpu_id) as gpu_id:

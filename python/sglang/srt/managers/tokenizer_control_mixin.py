@@ -127,6 +127,13 @@ class TokenizerControlMixin:
     FanOutCommunicator, as opposed to data-plane inference requests multiplexed by rid.
     """
 
+    def _dp_attention_enabled(self) -> bool:
+        # Tokenizer process: no publish here; read the resolved value from
+        # the declaration stash carried by the instance.
+        from sglang.srt.arg_groups.overrides import resolved_view
+
+        return resolved_view(self.server_args).enable_dp_attention
+
     def init_communicators(self: TokenizerManager, server_args: ServerArgs):
         dispatch_pairs = []
         for spec in _COMMUNICATOR_SPECS:
@@ -373,7 +380,7 @@ class TokenizerControlMixin:
     ) -> Tuple[bool, str]:
         self.auto_create_handle_loop()
         assert (
-            self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
+            self.server_args.dp_size == 1 or self._dp_attention_enabled()
         ), "dp_size must be 1 or dp attention must be enabled for update weights from distributed"
 
         results = await self.init_weights_update_group_communicator(obj)
@@ -386,7 +393,7 @@ class TokenizerControlMixin:
     ) -> Tuple[bool, str]:
         self.auto_create_handle_loop()
         assert (
-            self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
+            self.server_args.dp_size == 1 or self._dp_attention_enabled()
         ), "dp_size must be 1 or dp attention must be enabled for destroy parameter update group"
 
         results = await self.destroy_weights_update_group_communicator(obj)
@@ -399,7 +406,7 @@ class TokenizerControlMixin:
     ) -> Tuple[bool, str]:
         self.auto_create_handle_loop()
         assert (
-            self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
+            self.server_args.dp_size == 1 or self._dp_attention_enabled()
         ), "dp_size must be 1 or dp attention must be enabled for update weights from distributed"
 
         if obj.abort_all_requests:
@@ -457,7 +464,7 @@ class TokenizerControlMixin:
     ) -> Tuple[bool, str]:
         self.auto_create_handle_loop()
         assert (
-            self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
+            self.server_args.dp_size == 1 or self._dp_attention_enabled()
         ), "dp_size must be 1 or dp attention must be enabled for update weights from tensor"
 
         if obj.abort_all_requests:
@@ -493,7 +500,7 @@ class TokenizerControlMixin:
         try:
             # For now, we only support single data parallel instance
             assert (
-                self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
+                self.server_args.dp_size == 1 or self._dp_attention_enabled()
             ), "dp_size must be 1 or dp attention must be enabled for update weights from IPC"
             logger.info("Starting IPC weight update")
 

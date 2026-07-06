@@ -150,13 +150,16 @@ class RayDataParallelController(DataParallelController):
                             tp_rank % tp_per_node
                         )
 
-                        if server_args.enable_dp_attention:
+                        from sglang.srt.arg_groups.overrides import resolved_view
+
+                        view = resolved_view(server_args)
+                        if view.enable_dp_attention:
                             _, _, actual_dp_rank, _ = compute_dp_attention_world_info(
-                                server_args.enable_dp_attention,
+                                view.enable_dp_attention,
                                 tp_rank,
                                 server_args.tp_size,
                                 server_args.dp_size,
-                                server_args.attn_cp_size,
+                                view.attn_cp_size,
                             )
                             rank_port_args = PortArgs.init_new(
                                 server_args, actual_dp_rank, worker_ports
@@ -221,13 +224,16 @@ class RayDataParallelController(DataParallelController):
 
                 bundle_idx = bundle_indices[global_rank]
 
-                if server_args.enable_dp_attention:
+                from sglang.srt.arg_groups.overrides import resolved_view
+
+                view = resolved_view(server_args)
+                if view.enable_dp_attention:
                     _, _, actual_dp_rank, _ = compute_dp_attention_world_info(
-                        server_args.enable_dp_attention,
+                        view.enable_dp_attention,
                         tp_rank,
                         server_args.tp_size,
                         server_args.dp_size,
-                        server_args.attn_cp_size,
+                        view.attn_cp_size,
                     )
                     rank_port_args = PortArgs.init_new(
                         server_args, actual_dp_rank, worker_ports

@@ -128,6 +128,12 @@ def maybe_register_hicache_draft(
     tree_cache.cache_controller.set_draft_kv_pool(pool, draft_host_pool)
 
 
+def _resolved_view(server_args):
+    from sglang.srt.arg_groups.overrides import resolved_view
+
+    return resolved_view(server_args)
+
+
 def build_kv_cache(
     *,
     server_args: ServerArgs,
@@ -216,7 +222,9 @@ def build_kv_cache(
         ),
         is_eagle=spec_algorithm.is_eagle(),
         tp_cache_group=(
-            attn_tp_cpu_group if server_args.enable_dp_attention else tp_cpu_group
+            attn_tp_cpu_group
+            if _resolved_view(server_args).enable_dp_attention
+            else tp_cpu_group
         ),
         attn_cp_cache_group=attn_cp_cpu_group,
         attn_tp_cache_group=attn_tp_cpu_group,

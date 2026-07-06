@@ -199,7 +199,9 @@ class ExpertLocationMetadata:
             model_config_for_expert_location.num_logical_experts
             + server_args.ep_num_redundant_experts
         )
-        ep_size = server_args.ep_size
+        from sglang.srt.arg_groups.overrides import resolved_view
+
+        ep_size = resolved_view(server_args).ep_size
         assert num_physical_experts % ep_size == 0
         num_local_physical_experts = num_physical_experts // ep_size
 
@@ -391,7 +393,9 @@ def _compute_logical_to_all_physical_map(
 
     # Replace by the physical expert on local GPU or node if possible
     if moe_ep_rank is not None:
-        num_gpus_per_node = server_args.ep_size // server_args.nnodes
+        from sglang.srt.arg_groups.overrides import resolved_view
+
+        num_gpus_per_node = resolved_view(server_args).ep_size // server_args.nnodes
         num_local_gpu_physical_experts = num_physical_experts // ep_size
         num_local_node_physical_experts = (
             num_local_gpu_physical_experts * num_gpus_per_node
@@ -448,7 +452,9 @@ def compute_logical_to_rank_dispatch_physical_map(
     logical_to_all_physical_map = logical_to_all_physical_map.cpu()
 
     num_local_gpu_physical_experts = num_physical_experts // ep_size
-    num_gpus_per_node = server_args.ep_size // server_args.nnodes
+    from sglang.srt.arg_groups.overrides import resolved_view
+
+    num_gpus_per_node = resolved_view(server_args).ep_size // server_args.nnodes
     num_local_node_physical_experts = num_local_gpu_physical_experts * num_gpus_per_node
     num_layers, num_logical_experts, _ = logical_to_all_physical_map.shape
     dtype = logical_to_all_physical_map.dtype

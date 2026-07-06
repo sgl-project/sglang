@@ -287,10 +287,10 @@ def initialize_dp_attention(
     _DP_MAX_LEN_WITH_IDLE = (
         getattr(model_config.hf_config, "hybrid_override_pattern", None) is not None
     )
-    enable_dp_attention = server_args.enable_dp_attention
+    enable_dp_attention = get_flags().enable_dp_attention
     dp_size = server_args.dp_size
     moe_dense_tp_size = get_flags().moe_dense_tp_size
-    attn_cp_size = server_args.attn_cp_size
+    attn_cp_size = get_flags().attn_cp_size
 
     _ENABLE_DP_ATTENTION_FLAG = enable_dp_attention
 
@@ -836,7 +836,9 @@ def is_enable_moe_cp_allgather() -> bool:
     from sglang.srt.server_args import get_global_server_args
 
     sa = get_global_server_args()
-    return sa.attn_cp_size > sa.moe_dp_size
+    from sglang.srt.arg_groups.overrides import resolved_view
+
+    return resolved_view(sa).attn_cp_size > sa.moe_dp_size
 
 
 def moe_cp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):

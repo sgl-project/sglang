@@ -3242,7 +3242,7 @@ class ServerArgs:
                 "model-arch blacklist",
                 lambda: self.get_model_config().is_piecewise_cuda_graph_disabled_model,
             ),
-            ("DP attention", lambda: self.enable_dp_attention),
+            ("DP attention", lambda: self._resolved().enable_dp_attention),
             ("full torch.compile mode", lambda: self.enable_torch_compile),
             ("pipeline parallelism (pp_size > 1)", lambda: self.pp_size > 1),
             (
@@ -3286,7 +3286,10 @@ class ServerArgs:
                 lambda: self.enable_eplb
                 or self.expert_distribution_recorder_mode is not None,
             ),
-            ("context parallel (attn_cp_size > 1)", lambda: self.attn_cp_size > 1),
+            (
+                "context parallel (attn_cp_size > 1)",
+                lambda: self._resolved().attn_cp_size > 1,
+            ),
             ("CUDA graph debug mode", lambda: self.debug_cuda_graph),
             (
                 "DSA prefill context parallelism",
@@ -3316,7 +3319,10 @@ class ServerArgs:
                 lambda: is_deepseek_v4(self.get_model_config().hf_config),
             ),
             # CP all_gather replay size mismatch under BCG.
-            ("context parallel (attn_cp_size > 1)", lambda: self.attn_cp_size > 1),
+            (
+                "context parallel (attn_cp_size > 1)",
+                lambda: self._resolved().attn_cp_size > 1,
+            ),
             # BCG capture + LoRA adapter weights exceed host RAM headroom.
             ("LoRA", lambda: bool(self.lora_paths) or bool(self.enable_lora)),
             # BCG bucket sizes exceed FlashInfer MoE A2A's dispatch cap.
@@ -3325,7 +3331,7 @@ class ServerArgs:
                 lambda: _resolved_view(self).moe_a2a_backend != "none",
             ),
             # DP-attn × BCG capture/replay not yet validated.
-            ("DP attention", lambda: self.enable_dp_attention),
+            ("DP attention", lambda: self._resolved().enable_dp_attention),
             # Multimodal prefill replay faults under BCG.
             ("multimodal model", lambda: self.get_model_config().is_multimodal),
         ]
@@ -3587,7 +3593,10 @@ class ServerArgs:
             # Some adjustments for large parallel size
             reserved_mem += self.tp_size * self.pp_size / 8 * 1024
 
-            if self.enable_dp_attention and self.disaggregation_mode != "prefill":
+            if (
+                self._resolved().enable_dp_attention
+                and self.disaggregation_mode != "prefill"
+            ):
                 # DP attention needs more padding for some operations
                 reserved_mem += decode_cuda_graph_config.max_bs * self.dp_size * 3
 
@@ -3890,7 +3899,7 @@ class ServerArgs:
 
             run_post_process_pass(self, _deepseek_moe_quant_resolution)
             if is_hip():
-                if not self.enable_dp_attention and self.nnodes == 1:
+                if not self._resolved().enable_dp_attention and self.nnodes == 1:
                     # TODO (Hubert): Put this back later
                     # self.enable_aiter_allreduce_fusion = True
                     logger.info(
@@ -3972,7 +3981,11 @@ class ServerArgs:
 
             quant_method = get_quantization_config(hf_config)
             is_mxfp4_quant_format = quant_method == "mxfp4"
-            if not self.enable_dp_attention and self.nnodes == 1 and is_hip():
+            if (
+                not self._resolved().enable_dp_attention
+                and self.nnodes == 1
+                and is_hip()
+            ):
                 # TODO (Hubert): Put this back later
                 # self.enable_aiter_allreduce_fusion = True
                 logger.info("Enable Aiter AllReduce Fusion for GptOssForCausalLM")
@@ -3989,7 +4002,7 @@ class ServerArgs:
 
             if resolved_view(self).moe_runner_backend == "triton_kernel":
                 assert (
-                    self.ep_size == 1
+                    self._resolved().ep_size == 1
                 ), "Triton kernel MoE is only supported when ep_size == 1"
 
         elif model_arch in ("MiMoV2ForCausalLM", "MiMoV2FlashForCausalLM"):
@@ -3997,9 +4010,10 @@ class ServerArgs:
                 expected_attn_tp_size = get_mimo_v2_fused_qkv_expected_tp_size(
                     hf_config
                 )
-                attn_dp_size = self.dp_size if self.enable_dp_attention else 1
+                view = self._resolved()
+                attn_dp_size = self.dp_size if view.enable_dp_attention else 1
                 effective_attn_tp_size = (
-                    self.tp_size // attn_dp_size // self.attn_cp_size
+                    self.tp_size // attn_dp_size // view.attn_cp_size
                 )
                 if (
                     expected_attn_tp_size is not None
@@ -4012,8 +4026,8 @@ class ServerArgs:
                         f"TP={expected_attn_tp_size}-interleaved; got "
                         f"{effective_attn_tp_size} "
                         f"(tp_size={self.tp_size}, dp_size={self.dp_size}, "
-                        f"enable_dp_attention={self.enable_dp_attention}, "
-                        f"attn_cp_size={self.attn_cp_size}). "
+                        f"enable_dp_attention={view.enable_dp_attention}, "
+                        f"attn_cp_size={view.attn_cp_size}). "
                         "Set --tp, --dp, --enable-dp-attention, and "
                         "--attention-context-parallel-size so the effective "
                         f"attention TP size is {expected_attn_tp_size}."
@@ -4780,13 +4794,14 @@ class ServerArgs:
                 "(DeepSeek V3/R1, Kimi K2.5) or MHA/GQA-based models."
             )
 
-        if self.attn_cp_size > 1:
+        view = self._resolved()
+        if view.attn_cp_size > 1:
             # The tp_size is the world size, not the real tensor parallel size
             assert (
-                self.tp_size % self.attn_cp_size == 0
+                self.tp_size % view.attn_cp_size == 0
             ), "tp_size must be divisible by attn_cp_size"
             assert (
-                self.tp_size % (self.dp_size * self.attn_cp_size) == 0
+                self.tp_size % (self.dp_size * view.attn_cp_size) == 0
             ), "tp_size must be divisible by dp_size * attn_cp_size"
 
             assert (
@@ -4799,20 +4814,20 @@ class ServerArgs:
                 self.tp_size % self.moe_dp_size == 0
             ), "tp_size must be divisible by moe_dp_size"
             assert (
-                self.ep_size * self.moe_dp_size <= self.tp_size
+                view.ep_size * self.moe_dp_size <= self.tp_size
             ), "ep_size * moe_dp_size must be less than or equal to tp_size"
             assert self.pp_size == 1, "PP is not supported with context parallelism"
 
-            if self.ep_size > 1:
+            if view.ep_size > 1:
                 assert (
-                    self.ep_size * self.moe_dp_size == self.tp_size
+                    view.ep_size * self.moe_dp_size == self.tp_size
                 ), "ep_size * moe_dp_size must be equal to tp_size"
 
             assert (
                 not self.enable_aiter_allreduce_fusion
             ), "Aiter allreduce fusion is not supported with context parallelism"
 
-        if self.attn_cp_size != self.moe_dp_size:
+        if view.attn_cp_size != self.moe_dp_size:
             assert (
                 self.moe_dp_size == 1
             ), "attn_cp_size != moe_dp_size is only supported when moe_dp_size == 1"
@@ -4831,7 +4846,7 @@ class ServerArgs:
 
         run_post_process_pass(self, _data_parallelism_defaults)
 
-        if self.enable_dp_attention:
+        if self._resolved().enable_dp_attention:
             self.schedule_conservativeness = self.schedule_conservativeness * 0.3
             assert self.tp_size % self.dp_size == 0
             self.chunked_prefill_size = self.chunked_prefill_size // self.dp_size
@@ -4868,7 +4883,7 @@ class ServerArgs:
                 "modelopt_mixed",
                 None,
             ], f"Invalid quantization '{view.quantization}'. \nFlashInfer Cutlass MOE supports only: 'modelopt_fp4', 'modelopt_fp8', 'modelopt_mixed', or bfloat16 (None)."
-            assert self.ep_size in [
+            assert view.ep_size in [
                 1,
                 self.tp_size,
             ], "The expert parallel size must be 1 or the same as the tensor parallel size"
@@ -4878,7 +4893,7 @@ class ServerArgs:
                 view.quantization in ["modelopt_fp4"]
                 or self.get_model_config().nvfp4_moe_meta is not None
             ), f"Invalid quantization '{view.quantization}'. \nFlashInfer CuteDSL MOE currently supports only: 'modelopt_fp4' or hybrid NVFP4 models."
-            assert self.ep_size in [
+            assert view.ep_size in [
                 1,
                 self.tp_size,
             ], "The expert parallel size must be 1 or the same as the tensor parallel size"
@@ -4929,7 +4944,7 @@ class ServerArgs:
             "mxfp8",
         ]:
             assert (
-                self.ep_size == 1
+                resolved_view(self).ep_size == 1
             ), "FP8/MXFP8 Cutlass MoE is only supported with ep_size == 1"
 
     def cutedsl_moe_max_num_tokens(self) -> int:
@@ -4985,9 +5000,9 @@ class ServerArgs:
         max_dispatch_tokens_per_rank = get_int_env_var(
             "SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 1024
         )
-        max_cutedsl_tokens = max_dispatch_tokens_per_rank * self.ep_size
+        max_cutedsl_tokens = max_dispatch_tokens_per_rank * view.ep_size
         if max_cutedsl_tokens < required_tokens:
-            required_per_rank = (required_tokens + self.ep_size - 1) // self.ep_size
+            required_per_rank = (required_tokens + view.ep_size - 1) // view.ep_size
             raise ValueError(
                 "FlashInfer MoE A2A with flashinfer_cutedsl requires "
                 "SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK * "
@@ -4997,7 +5012,7 @@ class ServerArgs:
                 "`ValueError: num_tokens (...) exceeds max_num_tokens (...)`. "
                 "Current values: "
                 f"SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK="
-                f"{max_dispatch_tokens_per_rank}, ep_size={self.ep_size}, "
+                f"{max_dispatch_tokens_per_rank}, ep_size={view.ep_size}, "
                 f"capacity={max_cutedsl_tokens}, required={required_tokens}. "
                 f"Set `export "
                 f"SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK="
@@ -5074,7 +5089,7 @@ class ServerArgs:
                 ), "When fuse_mode is set to 2, the NPU supports only ModelSlim quantization."
         if a2a_backend == "flashinfer":
             assert (
-                self.enable_dp_attention and self.dp_size == self.tp_size
+                resolved_view(self).enable_dp_attention and self.dp_size == self.tp_size
             ), "Flashinfer MoE A2A is only supported with dp_size == tp_size and --enable-dp-attention"
             logger.warning(
                 f"Flashinfer MoE A2A is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
@@ -5132,7 +5147,7 @@ class ServerArgs:
             self.ep_dispatch_algorithm = "static"
 
         if self.enable_eplb:
-            assert self.ep_size > 1
+            assert self._resolved().ep_size > 1
 
     def _handle_elastic_ep(self):
         if self.elastic_ep_backend is not None:
@@ -5224,7 +5239,7 @@ class ServerArgs:
         # Context-parallel prefill stages K/V through cp_allgather_and_save_kv_cache,
         # which writes to the pool via set_kv_buffer. NoOpMHATokenToKVPool intentionally
         # raises on writes, so the engine would boot fine but fail on the first request.
-        if self.attn_cp_size > 1:
+        if self._resolved().attn_cp_size > 1:
             raise ValueError(
                 "--prefill-only-disable-kv-cache is incompatible with --attn-cp-size > 1: "
                 "the context-parallel attention path writes K/V to the pool via set_kv_buffer, "
@@ -6373,6 +6388,13 @@ class ServerArgs:
         self.model_config = ModelConfig.from_server_args(self)
         return self.model_config
 
+    def _resolved(self):
+        """Read-only view of the resolving configuration: dual-apply-retired
+        fields resolve from the declaration stash."""
+        from sglang.srt.arg_groups.overrides import resolved_view
+
+        return resolved_view(self)
+
     def _resolved_attention_backends(self):
         """Mid-resolution (prefill, decode) backends: reads through the pass
         view so dual-apply-retired fields resolve from the declaration
@@ -6465,10 +6487,11 @@ class ServerArgs:
         # there needs no extra opt-in env flag.
         from sglang.srt.arg_groups.overrides import resolved_view
 
+        view = resolved_view(self)
         if (
             self.enable_two_batch_overlap
-            and resolved_view(self).moe_a2a_backend == "none"
-            and not self.enable_dp_attention
+            and view.moe_a2a_backend == "none"
+            and not view.enable_dp_attention
         ):
             raise ValueError(
                 "When enabling two batch overlap without an EP a2a backend "
@@ -6506,7 +6529,9 @@ class ServerArgs:
             ), "Pipeline parallelism is not compatible with overlap schedule, speculative decoding"
 
         assert not (
-            self.dp_size > 1 and self.nnodes != 1 and not self.enable_dp_attention
+            self.dp_size > 1
+            and self.nnodes != 1
+            and not self._resolved().enable_dp_attention
         ), "multi-node data parallel is not supported unless dp attention!"
 
         assert self.base_gpu_id >= 0, "base_gpu_id must be non-negative"
@@ -7173,7 +7198,9 @@ class PortArgs:
                 rank=int(server_args.decoupled_spec_rank),
             )
 
-        if not server_args.enable_dp_attention:
+        from sglang.srt.arg_groups.overrides import resolved_view
+
+        if not resolved_view(server_args).enable_dp_attention:
             # Normal case, use IPC within a single node
             return PortArgs(
                 tokenizer_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",

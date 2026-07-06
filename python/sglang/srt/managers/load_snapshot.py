@@ -82,8 +82,10 @@ def should_use_zmq(server_args) -> bool:
     the SHM file on node 0, so we fall back to zmq transport.  The env var
     ``SGLANG_LOAD_SNAPSHOT_USE_ZMQ`` forces zmq mode for testing.
     """
+    from sglang.srt.arg_groups.overrides import resolved_view
+
     return (
-        server_args.enable_dp_attention and server_args.nnodes > 1
+        resolved_view(server_args).enable_dp_attention and server_args.nnodes > 1
     ) or envs.SGLANG_LOAD_SNAPSHOT_USE_ZMQ.get()
 
 
