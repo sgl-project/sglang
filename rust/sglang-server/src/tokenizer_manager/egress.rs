@@ -90,6 +90,11 @@ impl Runnable for Egress {
 }
 
 impl Egress {
+    /// Route one message to the shard owning `rid`.
+    ///
+    /// HEAD-OF-LINE CEILING: if the HOL blocking is proved to be bottleneck
+    /// during extreme concurrency, we can align the egress dispatch workers
+    /// to detok workers.
     #[inline]
     fn route(&self, rid: RequestId, msg: DetokMsg) {
         if self.senders.detok_for(rid).send(msg).is_err() {
