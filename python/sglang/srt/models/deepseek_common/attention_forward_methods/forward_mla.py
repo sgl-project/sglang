@@ -15,6 +15,7 @@ from sglang.srt.layers.attention.dsa.utils import (
     is_graph_dsa_split_op_surface,
 )
 from sglang.srt.layers.communicator import get_attn_tp_context
+from sglang.srt.layers.attention.dcp_a2a import dcp_a2a_lse_reduce
 from sglang.srt.layers.dcp import (
     all_gather_kv_cache_for_mla_extend,
     all_gather_q_for_mla_decode,
@@ -797,8 +798,23 @@ class DeepseekMLAForwardMixin:
                 self.num_local_heads * get_attention_dcp_world_size(),
                 self.kv_lora_rank,
             )
-            attn_output = cp_lse_ag_out_rs_mla(attn_output, lse, get_dcp_group())
-            attn_output = attn_output.transpose(0, 1)
+            dcp_comm_backend = get_global_server_args().dcp_comm_backend
+            if dcp_comm_backend in ("a2a", "fi_a2a"):
+                # A2A exchange of per-rank head partials + LSE followed by a
+                # local Triton LSE-weighted combine. MLA decode LSE is base-2
+                # (FlashInfer-MLA / FlashMLA), matching cp_lse_ag_out_rs_mla's
+                # log2/exp2 convention, so is_lse_base_on_e=False. Returns
+                # [B, H_local, D] directly (no reduce-scatter transpose).
+                attn_output = dcp_a2a_lse_reduce(
+                    attn_output.contiguous(),
+                    lse.contiguous(),
+                    get_dcp_group(),
+                    is_lse_base_on_e=False,
+                    comm_backend=dcp_comm_backend,
+                )
+            else:
+                attn_output = cp_lse_ag_out_rs_mla(attn_output, lse, get_dcp_group())
+                attn_output = attn_output.transpose(0, 1)
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 
         _kvb_v = None

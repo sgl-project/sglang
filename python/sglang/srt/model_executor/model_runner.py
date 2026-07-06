@@ -919,6 +919,19 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         else:
             self.init_attention_backend()
 
+        # Initialize the FlashInfer MNNVL all-to-all workspace for the fi_a2a
+        # DCP comm backend here — BEFORE cuda-graph capture — because workspace
+        # init synchronizes the stream and issues a cross-rank barrier (neither
+        # is capturable). It also raises early if the platform lacks MNNVL.
+        if (
+            self.server_args.dcp_size > 1
+            and self.server_args.dcp_comm_backend == "fi_a2a"
+        ):
+            from sglang.srt.distributed.parallel_state import get_dcp_group
+            from sglang.srt.layers.attention.dcp_a2a import init_fi_a2a_workspace
+
+            init_fi_a2a_workspace(get_dcp_group())
+
     def init_cuda_graphs(self, capture_decode_cuda_graph: bool = True):
         """Capture cuda graphs. Requires init_attention_backends() to have run.
 
