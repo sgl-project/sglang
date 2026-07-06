@@ -2688,15 +2688,21 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     ):
         if keep_indices is None:
             if isinstance(chunked_req_to_exclude, Req):
-                chunked_req_to_exclude = [chunked_req_to_exclude]
-            elif chunked_req_to_exclude is None:
-                chunked_req_to_exclude = []
-            keep_indices = [
-                i
-                for i in range(len(self.reqs))
-                if not self.reqs[i].finished()
-                and self.reqs[i] not in chunked_req_to_exclude
-            ]
+                exclude_ids = {id(chunked_req_to_exclude)}
+            elif chunked_req_to_exclude:
+                # O(1) membership by identity; `req in list` was O(k) per req.
+                exclude_ids = {id(r) for r in chunked_req_to_exclude}
+            else:
+                exclude_ids = None
+            reqs = self.reqs
+            if exclude_ids is None:
+                keep_indices = [i for i in range(len(reqs)) if not reqs[i].finished()]
+            else:
+                keep_indices = [
+                    i
+                    for i in range(len(reqs))
+                    if not reqs[i].finished() and id(reqs[i]) not in exclude_ids
+                ]
 
         if keep_indices is None or len(keep_indices) == 0:
             # Filter out all requests. Stale tensors are left as-is: is_empty()
@@ -2708,11 +2714,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # No need to filter
             return
 
-        keep_indices_device = torch.tensor(
+        # Build the index tensor ONCE on CPU and reuse it for every gather:
+        # the device gather (H2D via pinned copy) and the CPU-tensor gathers
+        # (req_pool_indices_cpu, seq_lens_cpu). Indexing a tensor with a Python
+        # list re-converts the list to a tensor each time; sharing one int64
+        # index tensor removes those repeated conversions.
+        keep_indices_cpu = torch.tensor(
             keep_indices,
             dtype=torch.int64,
             pin_memory=is_pin_memory_available(self.device),
-        ).to(self.device, non_blocking=True)
+        )
+        keep_indices_device = keep_indices_cpu.to(self.device, non_blocking=True)
 
         if self.model_config.is_encoder_decoder:
             self.encoder_lens = self.encoder_lens[keep_indices_device]
@@ -2722,7 +2734,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.multimodal_inputs is not None:
             self.multimodal_inputs = [self.multimodal_inputs[i] for i in keep_indices]
         self.req_pool_indices = self.req_pool_indices[keep_indices_device]
-        self.req_pool_indices_cpu = self.req_pool_indices_cpu[keep_indices]
+        self.req_pool_indices_cpu = self.req_pool_indices_cpu[keep_indices_cpu]
         self.seq_lens = self.seq_lens[keep_indices_device]
         self.orig_seq_lens = self.orig_seq_lens[keep_indices_device]
         self.out_cache_loc = None
@@ -2733,7 +2745,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.input_ids = self.input_ids[keep_indices_device]
         # Optional under no-verify-sync; resolve_seq_lens repopulates before forward.
         if self.seq_lens_cpu is not None:
-            self.seq_lens_cpu = self.seq_lens_cpu[keep_indices]
+            self.seq_lens_cpu = self.seq_lens_cpu[keep_indices_cpu]
 
         self.mamba_track_indices = None
         self.mamba_track_mask = None
