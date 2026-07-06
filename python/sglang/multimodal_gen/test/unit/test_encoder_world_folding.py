@@ -1,14 +1,19 @@
-"""Unit test for the encoder parallel-folding decision (two stages).
+"""Unit test for the encoder_parallel decision (three stages).
 
 Stage 1 - ServerArgs.adjust_pipeline_config proposes a fold group from the
-parallelism alone (mode = "world"/"sp"/None), the same for every encoder.
+parallelism alone (mode = "world"/"sp"/None), the same for every encoder;
+the "dp"/"replicate" policies short-circuit it (never fold).
 
-Stage 2 - encoder_folding_worthwhile (applied by the loader once real dims are
-known) keeps the fold only for encoders wide enough to benefit and whose heads
-and MLP divide the group. Being size-based (not per-architecture) it handles the
-same encoder family at different parameter counts.
+Stage 2 - encoder_folding_worthwhile / _encoder_dims_divide (applied by the
+loader once real dims are known) decide whether an encoder is wide enough to
+benefit and whether its heads/MLP divide the group. Size-based (not
+per-architecture), so the same family at different parameter counts is handled.
 
-Pure logic, no GPU / distributed init.
+Stage 3 - finalize_encoder_folding dispatches on the encoder_parallel policy:
+"auto" keeps only worthwhile folds, "fold" keeps any divisible fold, and
+"dp"/"replicate" clear the fold (load replicated).
+
+Pure logic, no GPU / distributed init (the fold group is monkeypatched).
 """
 
 from types import SimpleNamespace
@@ -19,20 +24,26 @@ from sglang.multimodal_gen.configs.models.encoders import (
     TextEncoderConfig,
 )
 from sglang.multimodal_gen.configs.models.encoders.t5 import T5Config
+from sglang.multimodal_gen.runtime.models.encoders import base as _base_mod
 from sglang.multimodal_gen.runtime.models.encoders.base import (
     FOLD_MIN_HIDDEN_SIZE,
+    _encoder_dims_divide,
     encoder_folding_worthwhile,
+    finalize_encoder_folding,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 
-def _run(encoders, tp, sp, cfg, dp=1, disagg=False, num_gpus=None, image=()):
+def _run(
+    encoders, tp, sp, cfg, dp=1, disagg=False, num_gpus=None, image=(), policy="auto"
+):
     self = SimpleNamespace(
         tp_size=tp,
         sp_degree=sp,
         cfg_parallel_degree=cfg,
         dp_size=dp,
         disagg_mode=disagg,
+        encoder_parallel=policy,
         num_gpus=num_gpus if num_gpus is not None else tp * sp * cfg * dp,
         pipeline_config=SimpleNamespace(
             text_encoder_configs=tuple(encoders),
@@ -42,10 +53,10 @@ def _run(encoders, tp, sp, cfg, dp=1, disagg=False, num_gpus=None, image=()):
     ServerArgs.adjust_pipeline_config(self)
 
 
-def _proposed_mode(tp, sp, cfg, dp=1, disagg=False, num_gpus=None):
+def _proposed_mode(tp, sp, cfg, dp=1, disagg=False, num_gpus=None, policy="auto"):
     enc = T5Config()
     enc.parallel_folding_mode = None
-    _run([enc], tp, sp, cfg, dp=dp, disagg=disagg, num_gpus=num_gpus)
+    _run([enc], tp, sp, cfg, dp=dp, disagg=disagg, num_gpus=num_gpus, policy=policy)
     return enc.parallel_folding_mode
 
 
@@ -106,6 +117,17 @@ def test_all_encoders_get_the_same_proposed_mode():
     assert img.parallel_folding_mode == "world"
 
 
+def test_dp_replicate_policy_proposes_nothing():
+    # dp/replicate never fold: adjust short-circuits so encoders stay replicated.
+    assert _proposed_mode(tp=1, sp=2, cfg=1, policy="dp") is None
+    assert _proposed_mode(tp=1, sp=2, cfg=1, policy="replicate") is None
+
+
+def test_fold_and_auto_policy_still_propose():
+    assert _proposed_mode(tp=1, sp=2, cfg=1, policy="fold") == "world"
+    assert _proposed_mode(tp=1, sp=2, cfg=1, policy="auto") == "world"
+
+
 # --- stage 2: size + divisibility gate (loader, on real dims) ----------------
 
 
@@ -154,6 +176,52 @@ def test_threshold_is_the_boundary():
         encoder_folding_worthwhile(_enc(FOLD_MIN_HIDDEN_SIZE - 128, 8, 8192), 2)
         is False
     )
+
+
+def test_dims_divide():
+    # divisibility only (size-agnostic): the hard constraint to shard at all.
+    assert _encoder_dims_divide(_enc(2560, 32, 9728), 2) is True
+    assert _encoder_dims_divide(_enc(4096, 6, 10240), 4) is False  # heads
+    assert _encoder_dims_divide(_enc(4096, 64, 10250), 4) is False  # intermediate
+    assert _encoder_dims_divide(_enc(4096, 64, 10240), 1) is False  # group of 1
+
+
+# --- stage 3: finalize dispatches on the encoder_parallel policy --------------
+
+
+def _finalize(monkeypatch, hidden, heads, inter, policy, mode="world", group_size=2):
+    monkeypatch.setattr(
+        _base_mod,
+        "get_folding_tp_group",
+        lambda config: SimpleNamespace(world_size=group_size),
+    )
+    enc = _enc(hidden, heads, inter)
+    enc.parallel_folding_mode = mode
+    finalize_encoder_folding(enc, policy)
+    return enc.parallel_folding_mode
+
+
+def test_finalize_dp_replicate_never_fold(monkeypatch):
+    # policy alone clears the proposed fold, even for a huge encoder.
+    assert _finalize(monkeypatch, 5120, 32, 32768, "dp") is None
+    assert _finalize(monkeypatch, 5120, 32, 32768, "replicate") is None
+
+
+def test_finalize_auto_keeps_wide_clears_narrow(monkeypatch):
+    assert _finalize(monkeypatch, 4096, 64, 10240, "auto") == "world"
+    assert _finalize(monkeypatch, 2560, 32, 9728, "auto") is None  # below threshold
+
+
+def test_finalize_fold_ignores_size_but_needs_divisible(monkeypatch):
+    # "fold" folds a narrow encoder that "auto" would reject...
+    assert _finalize(monkeypatch, 2560, 32, 9728, "fold") == "world"
+    # ...but it still must divide the group.
+    assert _finalize(monkeypatch, 2560, 6, 9728, "fold", group_size=4) is None
+
+
+def test_finalize_mode_none_is_noop(monkeypatch):
+    # nothing proposed -> stays replicated regardless of policy.
+    assert _finalize(monkeypatch, 5120, 32, 32768, "auto", mode=None) is None
 
 
 # --- config defaults ---------------------------------------------------------

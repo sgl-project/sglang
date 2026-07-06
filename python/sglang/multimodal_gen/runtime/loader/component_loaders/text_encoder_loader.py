@@ -314,9 +314,10 @@ class TextEncoderLoader(ComponentLoader):
         )
         if post_diffusers_config_update is not None:
             post_diffusers_config_update()
-        # Real dims are populated now; keep the proposed fold group only if this
-        # encoder is actually wide enough to benefit at its real size.
-        finalize_encoder_folding(encoder_config)
+        # Real dims are populated now; resolve fold vs replicate for the
+        # encoder_parallel policy (keeps the proposed fold group only if the
+        # policy folds and this encoder is worth/able to at its real size).
+        finalize_encoder_folding(encoder_config, server_args.encoder_parallel)
         encoder_dtype = server_args.pipeline_config.text_encoder_precisions[
             encoder_index
         ]

@@ -71,15 +71,12 @@ def _encoder_dims(config: EncoderConfig):
     )
 
 
-def encoder_folding_worthwhile(config: EncoderConfig, group_size: int) -> bool:
-    """Fold only encoders wide enough to benefit whose heads and MLP divide the
-    fold group. Size-based (not per-architecture), so the same encoder family at
-    different parameter counts is handled correctly."""
-    hidden, heads, inter = _encoder_dims(config)
+def _encoder_dims_divide(config: EncoderConfig, group_size: int) -> bool:
+    """Whether the encoder's heads and MLP evenly divide the fold group -- a hard
+    requirement to shard (fold) it at all, regardless of whether it is worth it."""
+    _, heads, inter = _encoder_dims(config)
     return (
         group_size > 1
-        and hidden is not None
-        and hidden >= FOLD_MIN_HIDDEN_SIZE
         and heads is not None
         and heads % group_size == 0
         and inter is not None
@@ -87,17 +84,48 @@ def encoder_folding_worthwhile(config: EncoderConfig, group_size: int) -> bool:
     )
 
 
-def finalize_encoder_folding(config: EncoderConfig) -> None:
-    """Loader hook: call after the encoder's real dims are populated
-    (update_model_arch) and before construction. adjust_pipeline_config proposes
-    a fold group from the parallelism alone; here we keep it only if the encoder
-    is actually worth folding at its real size, otherwise fall back to
-    replicated by clearing the mode.
+def encoder_folding_worthwhile(config: EncoderConfig, group_size: int) -> bool:
+    """Fold only encoders wide enough to benefit whose heads and MLP divide the
+    fold group. Size-based (not per-architecture), so the same encoder family at
+    different parameter counts is handled correctly."""
+    hidden, _, _ = _encoder_dims(config)
+    return (
+        _encoder_dims_divide(config, group_size)
+        and hidden is not None
+        and hidden >= FOLD_MIN_HIDDEN_SIZE
+    )
+
+
+def finalize_encoder_folding(config: EncoderConfig, policy: str = "auto") -> None:
+    """Loader hook: resolve the load-time encoder layout (fold vs replicate) for
+    the ``encoder_parallel`` policy, after the real dims are populated
+    (update_model_arch) and before construction.
+
+    adjust_pipeline_config proposes a fold group from the parallelism alone; here
+    we keep it only when the policy asks to fold AND the encoder can (dims divide
+    the group), otherwise clear the mode so the encoder loads replicated -- a full
+    copy per rank, which the encode stage can data-parallel at batch > 1.
+
+      - "auto": fold only encoders wide enough to benefit at their real size;
+      - "fold": fold wherever the dims divide the group (size-agnostic override);
+      - "dp" / "replicate": never fold -> always replicated.
+
+    fold and dp/replicate are mutually exclusive here: folding shards the weights
+    (model-parallel), dp/replicate keep a full copy per rank; a loaded model is
+    one or the other.
     """
     if config.parallel_folding_mode is None:
         return
+    if policy in ("dp", "replicate"):
+        config.parallel_folding_mode = None
+        return
     group_size = getattr(get_folding_tp_group(config), "world_size", 1)
-    if not encoder_folding_worthwhile(config, group_size):
+    keep = (
+        _encoder_dims_divide(config, group_size)
+        if policy == "fold"
+        else encoder_folding_worthwhile(config, group_size)
+    )
+    if not keep:
         config.parallel_folding_mode = None
 
 

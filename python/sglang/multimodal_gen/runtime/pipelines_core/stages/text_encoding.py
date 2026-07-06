@@ -525,15 +525,22 @@ class TextEncodingStage(ConditionEncodingStage):
 
         Only worth it when the encoder is *replicated* across a multi-rank
         single replica (tp==1, dp==1, not folded), so every rank would
-        otherwise redundantly encode the whole batch. A folded encoder is
-        already model-parallel, and tp>1 already shards it; dp>1 would need the
-        per-replica group instead of the world group, so skip those here.
+        otherwise redundantly encode the whole batch -- each rank encodes a
+        shard of the batch instead, then all-gathers. A folded encoder is
+        already model-parallel (not replicated), and tp>1 already shards it;
+        dp>1 would need the per-replica group instead of the world group, so
+        skip those here.
+
+        Gated by the ``encoder_parallel`` policy: only "auto" and "dp" data-
+        parallel; "fold" folds instead and "replicate" keeps the redundant
+        per-rank encode.
         """
         if (
-            batch_size <= 1
+            getattr(server_args, "encoder_parallel", "auto") not in ("auto", "dp")
+            or batch_size <= 1
             or (server_args.tp_size or 1) != 1
             or (server_args.dp_size or 1) != 1
-            or getattr(encoder_config, "parallel_folding", False)
+            or encoder_config.parallel_folding_mode is not None
         ):
             return None
         group = get_world_group()
