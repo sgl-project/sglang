@@ -323,7 +323,7 @@ class DeepseekV4ForCausalLMDSpark(DeepseekV4ForCausalLM):
         self._maybe_use_absolute_moe_layer_ids()
 
     def _maybe_use_absolute_moe_layer_ids(self) -> None:
-        if os.getenv("SGLANG_DSPARK_USE_ABSOLUTE_MOE_LAYER_ID", "0") != "1":
+        if os.getenv("SGLANG_DSPARK_USE_ABSOLUTE_MOE_LAYER_ID", "1") != "1":
             return
         if get_global_server_args().enable_eplb:
             if get_tensor_model_parallel_rank() == 0:
@@ -339,6 +339,7 @@ class DeepseekV4ForCausalLMDSpark(DeepseekV4ForCausalLM):
         for local_layer_id, layer in enumerate(self.model.layers):
             absolute_layer_id = base_layer_id + int(local_layer_id)
             mapping.append((int(local_layer_id), int(absolute_layer_id)))
+            layer.layer_id = absolute_layer_id
             mlp = getattr(layer, "mlp", None)
             if mlp is None:
                 continue
@@ -354,7 +355,9 @@ class DeepseekV4ForCausalLMDSpark(DeepseekV4ForCausalLM):
                     runner_config.layer_id = absolute_layer_id
         if get_tensor_model_parallel_rank() == 0:
             logger.warning(
-                "DSpark absolute MoE layer-id experiment enabled: %s", mapping
+                "DSpark absolute draft layer ids enabled "
+                "(KV/cache layer ids remain local): %s",
+                mapping,
             )
 
     def post_load_weights(self, is_nextn=False, is_dspark=False, weight_names=None):
