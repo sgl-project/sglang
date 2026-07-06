@@ -195,8 +195,7 @@ def get_default_hidden_dim(
     elif module_name == "kv_b_proj":
         return (
             config.kv_lora_rank,
-            config.num_attention_heads
-            * (config.qk_nope_head_dim + config.v_head_dim),
+            config.num_attention_heads * (config.qk_nope_head_dim + config.v_head_dim),
         )
     elif module_name in DSA_INDEXER_LORA_NAMES:
         from sglang.srt.configs.model_config import (
