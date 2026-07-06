@@ -35,6 +35,16 @@ _MIB = 1024**2
 _NUM_MAX_TIERS = (1024, 512, 256, 128)
 # Headroom for the transient deep_gemm warmup that runs right after capture.
 _SAFETY_MIB = 2 * 1024
+# deep_ep's low_latency fp8 recv-scale layout views tokens in blocks of
+# num_max * num_ranks // 128; a non-multiple num_max truncates that view to
+# zero blocks and silently corrupts the scales (garbage logits, no assert).
+# Multiples of 128 are safe for any EP world size.
+_NUM_MAX_ALIGN = 128
+
+
+def _align_num_max(value: int) -> int:
+    aligned = ((max(1, value) + _NUM_MAX_ALIGN - 1) // _NUM_MAX_ALIGN) * _NUM_MAX_ALIGN
+    return min(aligned, DEEPEP_LOW_LATENCY_MAX_DISPATCH_TOKENS)
 
 
 class DeepEPCapacityPlan(msgspec.Struct):
@@ -170,7 +180,7 @@ def plan_deepep_capacity(
         # Largest tier whose buffer + capture fits under the cap. A clamped
         # reservation starves capture (the V3.2 tp8/dp8/TBO OOM), so tier the
         # bound down instead — the concurrency clamp only trims decode batch.
-        ceiling = min(user_cap, env.get())
+        ceiling = _align_num_max(min(user_cap, env.get()))
         for candidate in _NUM_MAX_TIERS:
             if candidate > user_cap:
                 continue
@@ -217,8 +227,7 @@ def resolve_deepep_num_max(plan: DeepEPCapacityPlan, req_pool_size: int) -> int:
         return plan.num_max
     num_max = min(
         plan.ceiling,
-        max(1, req_pool_size * plan.tokens_per_req),
-        DEEPEP_LOW_LATENCY_MAX_DISPATCH_TOKENS,
+        _align_num_max(req_pool_size * plan.tokens_per_req),
     )
     env.set(num_max)
     plan.num_max = num_max

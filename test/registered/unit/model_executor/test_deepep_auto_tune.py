@@ -230,6 +230,14 @@ class TestDeepEPCapacityPlanning(unittest.TestCase):
             plan = self._plan_for(max_running=2048, dp_size=8)
             self.assertEqual(plan.ceiling, 256)
 
+    def test_small_user_cap_aligns_ceiling_up(self):
+        # A tiny per-rank cap (48 reqs / dp 4 x 2 draft tokens = 24) still gets
+        # a 128-aligned ceiling: deep_ep's fp8 recv-scale layout corrupts
+        # silently on non-multiples, and 128 is the static default footprint.
+        with _env_unset():
+            plan = self._plan_for(max_running=48, dp_size=4, num_draft=2)
+            self.assertEqual(plan.ceiling, 128)
+
     def test_kill_switch_returns_static_plan(self):
         with _env_unset(), envs.SGLANG_ENABLE_DEEPEP_AUTO_MEM_RESERVE.override(False):
             plan = self._plan_for()
@@ -348,20 +356,21 @@ class TestDeepEPResolveNumMax(unittest.TestCase):
             self._run(_runner(_plan(ceiling=128), pool_size=4096))
             self.assertEqual(_ENV.get(), 128)
 
-    def test_ceiling_below_default_is_written(self):
-        # A ceiling below the env default must still be written verbatim (the
-        # buffer was reserved for exactly that num_max).
+    def test_low_concurrency_aligns_up_to_128(self):
+        # deep_ep's fp8 recv-scale layout needs num_max * num_ranks % 128 == 0;
+        # a 24-token bound (12 reqs x 2 draft tokens) silently corrupts scales,
+        # so the resolved bound rounds up to the 128 alignment (= the static
+        # default buffer size, so no extra footprint vs main).
         with _env_unset():
-            self._run(_runner(_plan(ceiling=64), pool_size=4096))
-            self.assertTrue(_ENV.is_set())
-            self.assertEqual(_ENV.get(), 64)
+            self._run(_runner(_plan(ceiling=1024, tokens_per_req=2), pool_size=12))
+            self.assertEqual(_ENV.get(), 128)
 
     def test_spec_scales_num_max_by_draft_tokens(self):
         # Spec verify dispatches tokens_per_req per request, so num_max tracks
-        # concurrency * tokens_per_req, still clamped to the 1024 ceiling.
+        # concurrency * tokens_per_req (128-aligned), clamped to the ceiling.
         with _env_unset():
             self._run(_runner(_plan(ceiling=1024, tokens_per_req=4), pool_size=100))
-            self.assertEqual(_ENV.get(), 400)
+            self.assertEqual(_ENV.get(), 512)
         with _env_unset():
             self._run(_runner(_plan(ceiling=1024, tokens_per_req=4), pool_size=512))
             self.assertEqual(_ENV.get(), 1024)
