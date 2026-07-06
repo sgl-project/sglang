@@ -314,7 +314,12 @@ def _handle_dspark(server_args: ServerArgs) -> None:
                 revision=server_args.speculative_draft_model_revision,
                 model_override_args=model_override_args,
             )
+            # V4 DSpark checkpoints spell this `dspark_block_size`; Qwen3-family
+            # DSpark checkpoints (e.g. Qwen3DSparkModel) spell it plainly as
+            # `block_size` with no dspark_ prefix.
             block_size = getattr(draft_hf_config, "dspark_block_size", None)
+            if not block_size:
+                block_size = getattr(draft_hf_config, "block_size", None)
             if block_size:
                 inferred_block_size = int(block_size)
         except Exception as e:

@@ -526,8 +526,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
 
         if self.spec_algorithm.is_dspark() and not self.is_draft_worker:
-            from sglang.srt.models.deepseek_v4_dspark import get_dspark_num_layers
-
             draft_model_config = self._build_model_config(
                 server_args,
                 model_path=server_args.speculative_draft_model_path,
@@ -535,15 +533,45 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 is_draft_model=True,
             )
             self.dspark_use_aux_hidden_state = True
-            self.dspark_draft_num_layers = get_dspark_num_layers(
-                draft_model_config.hf_config
+
+            # DeepSeek-V4's DSpark draft config spells these fields with a
+            # dspark_ prefix; only import deepseek_v4_dspark (which
+            # transitively imports DeepSeek-V4/V2's CUDA-kernel-heavy modules)
+            # when the TARGET actually is DeepSeek-V4 family, so a non-V4
+            # target (e.g. a Qwen3-family DSpark deployment) never pays that
+            # import cost -- an unconditional import here previously crashed
+            # non-V4 targets whenever those V4-only dependencies were
+            # unavailable/incompatible on the host.
+            target_is_deepseek_v4 = self.model_config.hf_config.architectures[0] in (
+                "DeepseekV4ForCausalLM",
+                "DeepseekV4ForCausalLMNextN",
+                "DeepseekV4ForCausalLMDSpark",
             )
-            self.dspark_target_layer_ids = list(
-                getattr(draft_model_config.hf_config, "dspark_target_layer_ids", [])
-            )
+            if target_is_deepseek_v4:
+                from sglang.srt.models.deepseek_v4_dspark import get_dspark_num_layers
+
+                self.dspark_draft_num_layers = get_dspark_num_layers(
+                    draft_model_config.hf_config
+                )
+                self.dspark_target_layer_ids = list(
+                    getattr(
+                        draft_model_config.hf_config, "dspark_target_layer_ids", []
+                    )
+                )
+            else:
+                # Generic (Qwen3-family) DSpark checkpoints use plain HF field
+                # names on the draft config: num_hidden_layers, target_layer_ids.
+                self.dspark_draft_num_layers = int(
+                    draft_model_config.hf_config.num_hidden_layers
+                )
+                self.dspark_target_layer_ids = list(
+                    getattr(draft_model_config.hf_config, "target_layer_ids", [])
+                )
+
             if not self.dspark_target_layer_ids:
                 raise ValueError(
-                    "DSpark requires dspark_target_layer_ids in the draft model config."
+                    "DSpark requires dspark_target_layer_ids (DeepSeek-V4 family) "
+                    "or target_layer_ids (Qwen3 family) in the draft model config."
                 )
 
         # Apply the rank zero filter to logger

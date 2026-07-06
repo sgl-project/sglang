@@ -237,12 +237,18 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.draft_model = self.draft_model_runner.model
         self._draft_inner = self.draft_model.model
 
-        self.draft_model.model.embed_tokens.weight = (
-            self.target_worker.model_runner.model.model.embed_tokens.weight
-        )
-        self.draft_model.lm_head.weight = (
-            self.target_worker.model_runner.model.lm_head.weight
-        )
+        # DeepSeek-V4's DSpark draft ties embed_tokens/lm_head to the target
+        # (owns_vocab_weights=False); some draft families (e.g. Qwen3DSpark)
+        # instead ship their own trained embed_tokens/lm_head and must keep
+        # them (owns_vocab_weights=True). Every DSpark draft model sets this
+        # flag explicitly, so read it directly rather than defaulting it away.
+        if not self.draft_model.owns_vocab_weights:
+            self.draft_model.model.embed_tokens.weight = (
+                self.target_worker.model_runner.model.model.embed_tokens.weight
+            )
+            self.draft_model.lm_head.weight = (
+                self.target_worker.model_runner.model.lm_head.weight
+            )
 
         self.block_size = int(server_args.speculative_num_draft_tokens)
         model_block_size = int(getattr(self.draft_model, "block_size", self.block_size))

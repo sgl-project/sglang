@@ -240,6 +240,11 @@ class DeepseekV4ForCausalLMDSpark(DeepseekV4ForCausalLM):
         self.pp_group = get_pp_group()
         self.quant_config = quant_config
         self.determine_num_fused_shared_experts()
+        # DSparkWorkerV2 ties embed_tokens/lm_head to the target for this
+        # family (see DSparkWorkerV2.__init__); this preserves that existing
+        # behavior explicitly rather than by attribute absence. Contrast
+        # Qwen3DSparkModel, which ships its own trained vocab weights.
+        self.owns_vocab_weights = False
 
         self.model = DeepseekV4DSparkModel(
             config, quant_config, prefix=add_prefix("model", prefix)
