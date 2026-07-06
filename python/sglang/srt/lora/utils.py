@@ -406,6 +406,12 @@ def auto_detect_lora_target_modules(model: "torch.nn.Module") -> set:
     normalized = get_normalized_target_modules(raw_names)
     result = normalized & _KNOWN_LORA_TARGET_MODULES
 
+    # Most MoE models name their router `gate` (a ReplicatedLinear the walk
+    # above picks up), but sizing its buffers requires a get_hidden_dim
+    # implementation that handles "gate". Require an explicit opt-in via
+    # supported_lora_modules instead of auto-detecting it.
+    result.discard("gate")
+
     # Allow models to declare additional LoRA-compatible modules that
     # cannot be auto-discovered or need to bypass normalization
     # (e.g. Mamba in_proj, non-gated up_proj).

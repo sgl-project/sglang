@@ -507,6 +507,10 @@ class Lfm2MoeForCausalLM(nn.Module):
 
     fall_back_to_pt_during_load = False
 
+    # Router `gate` is excluded from generic auto-detection; opt in here
+    # (get_hidden_dim below knows how to size it).
+    supported_lora_modules = ["gate"]
+
     def __init__(
         self,
         config: Lfm2MoeConfig,
