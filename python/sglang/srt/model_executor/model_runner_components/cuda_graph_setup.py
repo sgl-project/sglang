@@ -199,7 +199,7 @@ def capture_prefill_graph(
     context_length = model_runner.model_config.context_len
     max_capture_tokens = (
         model_runner.req_to_token_pool.size * context_length
-        if prefill_backend == Backend.TC_PIECEWISE
+        if prefill_backend in (Backend.TC_PIECEWISE, Backend.BREAKABLE)
         else context_length
     )
     capture_num_tokens = sorted(
