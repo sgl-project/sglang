@@ -58,7 +58,7 @@ class XPUPiecewiseBackend(CUDAPiecewiseBackend):
                 entry.num_finished_warmup += 1
                 return entry.runnable(*args)
 
-            # During normal capture (PrefillCudaGraphRunner.capture()),
+            # During normal capture (PiecewiseCudaGraphRunner.capture()),
             # set_pcg_capture_stream() guarantees a valid stream. However,
             # Dynamo may silently recompile on serving batches whose token
             # count exceeds the captured range (e.g. chunked prefill running
