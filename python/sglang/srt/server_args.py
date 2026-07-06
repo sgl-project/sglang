@@ -1599,6 +1599,14 @@ class ServerArgs:
         Optional[int],
         "DFLASH only. Block size (verify window length). Alias of --speculative-num-draft-tokens for DFLASH.",
     ] = None
+    speculative_dspark_block_size: A[
+        Optional[int],
+        "DSpark only. Block size (draft block length). Alias of --speculative-num-draft-tokens for DSpark.",
+    ] = None
+    speculative_dspark_confidence_threshold: A[
+        float,
+        "DSpark only. Truncate the draft block at the first position whose confidence-head probability falls below this threshold. 0 disables truncation (verify the full block).",
+    ] = 0.0
     speculative_accept_threshold_single: A[
         float,
         "Accept a draft token if its probability in the target model is greater than this threshold.",
