@@ -89,8 +89,10 @@ using fp32x4_t = float4;
 // DLPack device type for the current platform
 #ifndef USE_ROCM
 inline constexpr auto kDLGPU = kDLCUDA;
+inline constexpr auto kDLGPUHost = kDLCUDAHost;
 #else
 inline constexpr auto kDLGPU = kDLROCM;
+inline constexpr auto kDLGPUHost = kDLROCMHost;
 #endif
 
 namespace device {
