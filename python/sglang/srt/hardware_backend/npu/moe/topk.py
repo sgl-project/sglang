@@ -99,12 +99,13 @@ def fused_topk_npu(
             # 1 for sigmoid, 0 for softmax
             norm_type=1,
             routed_scaling_factor=(
-                1 if renormalize else topk_config.routed_scaling_factor
+                topk_config.routed_scaling_factor
+                if topk_config.apply_routed_scaling_factor_on_output
+                else 1
             ),
             eps=float(1e-20),
         )
         topk_weights = topk_weights.to(torch.float32)
-        topk_weights = _apply_routed_scaling_after_renorm(topk_weights, topk_config)
 
     # torch native is not yet supported num_token_non_padded
     # Fallback to torch native implementation
