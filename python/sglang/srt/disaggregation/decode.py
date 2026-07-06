@@ -54,6 +54,7 @@ from sglang.srt.disaggregation.utils import (
     get_kv_class,
     is_dsv4_c128_online_enabled,
     is_mla_backend,
+    log_dsv4_kv_components,
     poll_and_all_reduce,
     poll_and_all_reduce_with_staging,
     prepare_abort,
@@ -405,6 +406,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
             transfer_kv_pool.get_contiguous_buf_infos()
         )
+        kv_data_names = (
+            transfer_kv_pool.get_contiguous_buf_names()
+            if hasattr(transfer_kv_pool, "get_contiguous_buf_names")
+            else []
+        )
         kv_data_mem_kinds = (
             ["DRAM"] * len(kv_data_ptrs)
             if self.scheduler.enable_hisparse
@@ -416,10 +422,18 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             device_kv_data_ptrs, device_kv_data_lens, device_kv_item_lens = (
                 self.token_to_kv_pool.get_contiguous_buf_infos()
             )
+            device_kv_data_names = (
+                self.token_to_kv_pool.get_contiguous_buf_names()
+                if hasattr(self.token_to_kv_pool, "get_contiguous_buf_names")
+                else []
+            )
             c4_layer_num = self.scheduler.hisparse_coordinator.mem_pool_host.layer_num
             kv_data_ptrs += device_kv_data_ptrs[c4_layer_num:]
             kv_data_lens += device_kv_data_lens[c4_layer_num:]
             kv_item_lens += device_kv_item_lens[c4_layer_num:]
+            kv_data_names += [
+                f"device:{name}" for name in device_kv_data_names[c4_layer_num:]
+            ]
             kv_data_mem_kinds += ["VRAM"] * len(device_kv_data_ptrs[c4_layer_num:])
         if self.draft_token_to_kv_pool is not None:
             # We should also transfer draft model kv cache. The indices are
@@ -427,14 +441,21 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
                 self.draft_token_to_kv_pool.get_contiguous_buf_infos()
             )
+            draft_kv_data_names = (
+                self.draft_token_to_kv_pool.get_contiguous_buf_names()
+                if hasattr(self.draft_token_to_kv_pool, "get_contiguous_buf_names")
+                else [f"draft_idx{i}" for i in range(len(draft_kv_data_ptrs))]
+            )
             kv_data_ptrs += draft_kv_data_ptrs
             kv_data_lens += draft_kv_data_lens
             kv_item_lens += draft_kv_item_lens
+            kv_data_names += [f"draft:{name}" for name in draft_kv_data_names]
             kv_data_mem_kinds += ["VRAM"] * len(draft_kv_data_ptrs)
 
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
         kv_args.kv_item_lens = kv_item_lens
+        kv_args.kv_data_names = kv_data_names
         if self.transfer_backend == TransferBackend.NIXL:
             kv_args.kv_data_mem_kinds = kv_data_mem_kinds
         kv_args.page_size = self.token_to_kv_pool.page_size
@@ -453,6 +474,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         kv_args.ib_device = self.scheduler.server_args.disaggregation_ib_device
         kv_args.gpu_id = self.scheduler.ps.gpu_id
+        log_dsv4_kv_components(kv_args, "[dsv4-kv-pd] decode ")
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
         kv_manager = kv_manager_class(
             kv_args,

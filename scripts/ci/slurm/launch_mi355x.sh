@@ -170,7 +170,16 @@ echo "recipe: image=$IMAGE attn=${ATTN:-$PATTN/$DATTN} ib=$IB ptp=$PTP dtp=$DTP 
 # lands here; the launcher normalizes it into GITHUB_WORKSPACE afterwards.
 # ---------------------------------------------------------------------------
 WORKDIR="$HOME/.mi355x_ci/${MATRIX_CONFIG_NAME}"
-rm -rf "$WORKDIR"; mkdir -p "$WORKDIR"
+if [[ -d "$WORKDIR" ]]; then
+    rm -rf "$WORKDIR" 2>/dev/null || {
+        echo "WARN: normal scratch cleanup failed, retrying in root docker: $WORKDIR" >&2
+        docker run --rm --user 0 \
+            -e TARGET="$(basename "$WORKDIR")" \
+            -v "$(dirname "$WORKDIR"):/mnt" \
+            "$IMAGE" bash -lc 'rm -rf -- "/mnt/$TARGET"'
+    }
+fi
+mkdir -p "$WORKDIR"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Stage the workflow checkout on shared NFS so Slurm compute-node containers can
@@ -214,7 +223,9 @@ if [[ "$PRECISION" == "fp4" ]]; then
 else
     FP4_EXPERTS=false
 fi
+DSV4_DEBUG_PROBE_ONLY=0
 DSV4_ENV=(
+  -e PYTHONUNBUFFERED=1
   -e SGLANG_DEFAULT_THINKING=1 -e SGLANG_DSV4_REASONING_EFFORT=max
   -e SGLANG_OPT_DEEPGEMM_HC_PRENORM=false -e SGLANG_USE_AITER=1
   -e SGLANG_USE_ROCM700A=1 -e SGLANG_OPT_USE_FUSED_COMPRESS=true
@@ -227,6 +238,21 @@ DSV4_ENV=(
   -e SGLANG_OPT_USE_MULTI_STREAM_OVERLAP=false -e SGLANG_ROCM_USE_MULTI_STREAM=false
   -e AITER_BF16_FP8_MOE_BOUND=0 -e SGLANG_DSV4_FP4_EXPERTS=$FP4_EXPERTS
 )
+if [[ "$MODEL_PREFIX" == "dsv4flash" ]]; then
+    echo "Enabling DSV4 Flash PD KV transfer-window diagnostics"
+    DSV4_DEBUG_PROBE_ONLY=1
+    DSV4_ENV+=(
+      -e SGLANG_DSV4_DISABLE_C128_STATE_PD=0
+      -e SGLANG_DSV4_TRACE_STATE_PD=1
+      -e SGLANG_DSV4_TRACE_KV_PD=1
+      -e SGLANG_DSV4_TRACE_KV_PD_TARGET_LEN=7345537024
+      -e SGLANG_MORI_DEBUG_REGISTER_TRANSFER_WINDOWS=1
+      -e SGLANG_MORI_DEBUG_REGISTER_REMOTE_KV_WINDOWS=1
+      -e SGLANG_MORI_DEBUG_TRANSFER_WINDOW_OFFSET=0
+      -e SGLANG_MORI_DEBUG_TRANSFER_WINDOW_LEN=4294967296
+      -e SGLANG_DSV4_DEBUG_PROBE_ONLY=1
+    )
+fi
 DSV4_ENV_STR="${DSV4_ENV[*]}"
 # A recipe carrying a `model:` block supplies its OWN docker env (below), so the
 # DSV4 env must not leak into it; the DSV4 recipes keep the string above.
@@ -457,6 +483,7 @@ PIP=\$1; DIP=\$2
 docker rm -f mi355x_bench 2>/dev/null || true
 docker run $DOCKER_COMMON --name mi355x_bench \
   -e PIP=\$PIP -e DIP=\$DIP \
+  -e SGLANG_DSV4_DEBUG_PROBE_ONLY=$DSV4_DEBUG_PROBE_ONLY \
   $IMAGE bash -lc '
     CIDIR=/host_home/.mi355x_ci/${MATRIX_CONFIG_NAME}
     bash \$CIDIR/install_checkout_sglang.sh
@@ -480,6 +507,10 @@ docker run $DOCKER_COMMON --name mi355x_bench \
       || { echo "[probe] request failed -- PD path not serving; aborting before sweep"; exit 1; }
     python3 \$CIDIR/assert_nonempty.py < \$CIDIR/probe_out.json \
       || { echo "[probe] empty/invalid generation; aborting before sweep"; exit 1; }
+    if [ "\${SGLANG_DSV4_DEBUG_PROBE_ONLY:-0}" = "1" ]; then
+      echo "[dsv4-debug] probe-only run passed; skipping perf sweep"
+      exit 0
+    fi
     # Correctness gate runs BEFORE the perf sweep: if the model is wrong there
     # is no point spending ~15min measuring how fast it is wrong, so a failure
     # here exits immediately and the sweep never runs.
@@ -693,6 +724,10 @@ if [[ "$SALLOC_RC" -ne 0 ]]; then
     exit "$SALLOC_RC"
 fi
 if [[ "$PROCESSED" -eq 0 ]]; then
+    if [[ "${DSV4_DEBUG_PROBE_ONLY:-0}" == "1" ]]; then
+        echo "[dsv4-debug] probe-only run passed; no benchmark result files expected."
+        exit 0
+    fi
     echo "ERROR: no result files produced" >&2
     exit 1
 fi

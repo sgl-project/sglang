@@ -50,6 +50,10 @@ logger = logging.getLogger(__name__)
 MORI_GUARD = b"MoriMsgGuard"
 
 
+def _is_env_enabled(name: str) -> bool:
+    return os.getenv(name, "").lower() in ("1", "true", "yes", "on")
+
+
 def _normalize_state_indices_per_component(
     state_indices: Optional[List],
 ) -> Optional[List[Optional[npt.NDArray[np.int32]]]]:
@@ -318,6 +322,19 @@ class MoriKVManager(CommonKVManager):
         self._zmq_ctx = zmq.Context()
         self._socket_local = threading.local()
         self._send_aux_rdma = envs.SGLANG_MORI_SEND_AUX_RDMA.get()
+        self._debug_register_transfer_windows = _is_env_enabled(
+            "SGLANG_MORI_DEBUG_REGISTER_TRANSFER_WINDOWS"
+        )
+        self._debug_register_remote_kv_windows = _is_env_enabled(
+            "SGLANG_MORI_DEBUG_REGISTER_REMOTE_KV_WINDOWS"
+        )
+        self._debug_transfer_window_offset = int(
+            os.getenv("SGLANG_MORI_DEBUG_TRANSFER_WINDOW_OFFSET", "262144")
+        )
+        self._debug_transfer_window_len = int(
+            os.getenv("SGLANG_MORI_DEBUG_TRANSFER_WINDOW_LEN", "65536")
+        )
+        self._debug_transfer_window_descs: List[MemoryDesc] = []
         self._register_local_buffers()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self._num_shards = max(1, envs.SGLANG_MORI_TRANSFER_SHARDS.get())
@@ -384,10 +401,42 @@ class MoriKVManager(CommonKVManager):
         return engine
 
     def _register_local_buffers(self) -> None:
-        for ptr, length in zip(self.kv_args.kv_data_ptrs, self.kv_args.kv_data_lens):
+        trace_kv_pd = _is_env_enabled("SGLANG_DSV4_TRACE_KV_PD")
+        kv_names = list(getattr(self.kv_args, "kv_data_names", []) or [])
+        kv_item_lens = list(getattr(self.kv_args, "kv_item_lens", []) or [])
+        for i, (ptr, length) in enumerate(
+            zip(self.kv_args.kv_data_ptrs, self.kv_args.kv_data_lens)
+        ):
+            register_ptr = ptr
+            register_len = length
+            if (
+                self._debug_register_remote_kv_windows
+                and self.disaggregation_mode == DisaggregationMode.DECODE
+                and self._debug_transfer_window_offset < length
+            ):
+                register_ptr = ptr + self._debug_transfer_window_offset
+                register_len = min(
+                    self._debug_transfer_window_len,
+                    length - self._debug_transfer_window_offset,
+                )
+            if trace_kv_pd:
+                logger.warning(
+                    "[dsv4-kv-pd] mori register local kv mode=%s idx=%s "
+                    "name=%s ptr=0x%x len=%s item=%s gpu=%s "
+                    "registered_ptr=0x%x registered_len=%s",
+                    self.disaggregation_mode.value,
+                    i,
+                    kv_names[i] if i < len(kv_names) else f"idx{i}",
+                    ptr,
+                    length,
+                    kv_item_lens[i] if i < len(kv_item_lens) else None,
+                    self.kv_args.gpu_id,
+                    register_ptr,
+                    register_len,
+                )
             mem_desc = self.engine.register_memory(
-                ptr,
-                length,
+                register_ptr,
+                register_len,
                 self.kv_args.gpu_id,
                 MemoryLocationType.GPU,
             )
@@ -414,6 +463,102 @@ class MoriKVManager(CommonKVManager):
                 )
                 component_descs.append(desc)
             self.state_mem_descs.append(component_descs)
+
+    def _local_kv_desc_index(self, desc: MemoryDesc) -> Optional[int]:
+        for i, mem_desc in enumerate(self.kv_mem_descs):
+            if mem_desc is desc:
+                return i
+        return None
+
+    def _kv_desc_name(self, idx: Optional[int]) -> str:
+        if idx is None:
+            return "<unknown>"
+        names = list(getattr(self.kv_args, "kv_data_names", []) or [])
+        if idx < len(names):
+            return names[idx]
+        return f"idx{idx}"
+
+    def _maybe_register_debug_transfer_window(
+        self, src_desc: MemoryDesc, plan: BatchTransferPlan
+    ) -> tuple[MemoryDesc, List[int], List[int]]:
+        if not self._debug_register_transfer_windows:
+            return src_desc, plan.local_offsets, plan.remote_offsets
+
+        src_idx = self._local_kv_desc_index(src_desc)
+        if src_idx is None or not plan.local_offsets:
+            return src_desc, plan.local_offsets, plan.remote_offsets
+
+        data_ptrs = list(getattr(self.kv_args, "kv_data_ptrs", []) or [])
+        data_lens = list(getattr(self.kv_args, "kv_data_lens", []) or [])
+        if src_idx >= len(data_ptrs) or src_idx >= len(data_lens):
+            return src_desc, plan.local_offsets, plan.remote_offsets
+
+        window_start = min(plan.local_offsets)
+        window_end = max(
+            local_offset + size
+            for local_offset, size in zip(plan.local_offsets, plan.sizes)
+        )
+        align = 4096
+        aligned_start = (window_start // align) * align
+        aligned_end = ((window_end + align - 1) // align) * align
+        aligned_end = min(aligned_end, data_lens[src_idx])
+        window_len = aligned_end - aligned_start
+        if window_len <= 0:
+            return src_desc, plan.local_offsets, plan.remote_offsets
+
+        window_desc = self.engine.register_memory(
+            data_ptrs[src_idx] + aligned_start,
+            window_len,
+            self.kv_args.gpu_id,
+            MemoryLocationType.GPU,
+        )
+        self._debug_transfer_window_descs.append(window_desc)
+
+        local_offsets = [
+            local_offset - aligned_start for local_offset in plan.local_offsets
+        ]
+        if self._debug_register_remote_kv_windows:
+            remote_base = self._debug_transfer_window_offset
+            remote_offsets = [
+                remote_offset - remote_base for remote_offset in plan.remote_offsets
+            ]
+            min_remote = min(remote_offsets) if remote_offsets else None
+            max_remote_end = (
+                max(
+                    remote_offset + size
+                    for remote_offset, size in zip(remote_offsets, plan.sizes)
+                )
+                if remote_offsets
+                else None
+            )
+        else:
+            remote_base = None
+            remote_offsets = plan.remote_offsets
+            min_remote = None
+            max_remote_end = None
+        logger.warning(
+            "[dsv4-kv-pd] mori debug transfer window mode=%s src_idx=%s "
+            "src_name=%s base=0x%x len=%s original_len=%s "
+            "window_start=%s window_end=%s aligned_start=%s aligned_end=%s "
+            "remote_base=%s remote_min=%s remote_max_end=%s "
+            "chunks=%s transfer_bytes=%s",
+            self.disaggregation_mode.value,
+            src_idx,
+            self._kv_desc_name(src_idx),
+            data_ptrs[src_idx] + aligned_start,
+            window_len,
+            data_lens[src_idx],
+            window_start,
+            window_end,
+            aligned_start,
+            aligned_end,
+            remote_base,
+            min_remote,
+            max_remote_end,
+            len(plan.sizes),
+            sum(plan.sizes),
+        )
+        return window_desc, local_offsets, remote_offsets
 
     def update_status(self, bootstrap_room: int, status: KVPoll):
         current = self.request_status.get(bootstrap_room)
@@ -737,11 +882,46 @@ class MoriKVManager(CommonKVManager):
 
         transfer_uid = self.engine.allocate_transfer_uid()
 
+        if _is_env_enabled("SGLANG_DSV4_TRACE_KV_PD"):
+            src_idx = self._local_kv_desc_index(src_desc)
+            item_lens = list(getattr(self.kv_args, "kv_item_lens", []) or [])
+            data_lens = list(getattr(self.kv_args, "kv_data_lens", []) or [])
+            src_len = (
+                data_lens[src_idx]
+                if src_idx is not None and src_idx < len(data_lens)
+                else None
+            )
+            src_item_len = (
+                item_lens[src_idx]
+                if src_idx is not None and src_idx < len(item_lens)
+                else None
+            )
+            logger.warning(
+                "[dsv4-kv-pd] mori batch_write mode=%s src_idx=%s src_name=%s "
+                "src_len=%s src_item=%s chunks=%s transfer_bytes=%s "
+                "first_local=%s first_remote=%s first_size=%s max_size=%s uid=%s",
+                self.disaggregation_mode.value,
+                src_idx,
+                self._kv_desc_name(src_idx),
+                src_len,
+                src_item_len,
+                len(plan.sizes),
+                sum(plan.sizes),
+                plan.local_offsets[0] if plan.local_offsets else None,
+                plan.remote_offsets[0] if plan.remote_offsets else None,
+                plan.sizes[0] if plan.sizes else None,
+                max(plan.sizes) if plan.sizes else None,
+                transfer_uid,
+            )
+
+        batch_src_desc, batch_local_offsets, batch_remote_offsets = (
+            self._maybe_register_debug_transfer_window(src_desc, plan)
+        )
         statuses = self.engine.batch_write(
-            [src_desc],
-            [plan.local_offsets],
+            [batch_src_desc],
+            [batch_local_offsets],
             [dst_desc],
-            [plan.remote_offsets],
+            [batch_remote_offsets],
             [plan.sizes],
             [transfer_uid],
         )
