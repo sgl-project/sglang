@@ -66,6 +66,14 @@ std::tuple<at::Tensor, at::Tensor> fused_qk_gemma_rmsnorm_cpu(
     const at::Tensor& k_weight,
     double eps,
     int64_t head_dim);
+std::tuple<at::Tensor, at::Tensor, at::Tensor> fused_qk_gemma_rmsnorm_with_gate_cpu(
+    const at::Tensor& q_gate,
+    const at::Tensor& k,
+    const at::Tensor& q_weight,
+    const at::Tensor& k_weight,
+    double eps,
+    int64_t head_dim,
+    int64_t num_head);
 
 // topk
 std::tuple<at::Tensor, at::Tensor>
@@ -481,6 +489,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "fused_qk_gemma_rmsnorm_cpu(Tensor q, Tensor k, Tensor q_weight, Tensor k_weight, float eps, int head_dim) -> "
       "(Tensor, Tensor)");
   m.impl("fused_qk_gemma_rmsnorm_cpu", torch::kCPU, &fused_qk_gemma_rmsnorm_cpu);
+  m.def(
+      "fused_qk_gemma_rmsnorm_with_gate_cpu(Tensor q_gate, Tensor k, Tensor q_weight, Tensor k_weight, float eps, int "
+      "head_dim, int num_head) -> "
+      "(Tensor, Tensor, Tensor)");
+  m.impl("fused_qk_gemma_rmsnorm_with_gate_cpu", torch::kCPU, &fused_qk_gemma_rmsnorm_with_gate_cpu);
 
   // topk
   m.def("topk_sigmoid_cpu(Tensor hidden_states, Tensor gating_output, int topk, bool renormalize) -> (Tensor, Tensor)");

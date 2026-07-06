@@ -324,7 +324,7 @@ class TestFusedQKGemmaRMSNorm:
             (5, 3, 1, 96),
         ],
     )
-    def test_fused_qk_gemma_rmsnorm_cpu(
+    def test_fused_qk_gemma_rmsnorm(
         self, batch_size: int, num_head: int, num_head_kv: int, head_dim: int, dtype
     ):
         q = torch.randn([batch_size, num_head * head_dim], dtype=dtype)
@@ -347,6 +347,51 @@ class TestFusedQKGemmaRMSNorm:
         atol = rtol = precision[ref_q_out.dtype]
         torch.testing.assert_close(q_out, ref_q_out, atol=atol, rtol=rtol)
         torch.testing.assert_close(k_out, ref_k_out, atol=atol, rtol=rtol)
+
+    @pytest.mark.parametrize("dtype", [torch.bfloat16], ids=["bfloat16"])
+    @pytest.mark.parametrize(
+        "batch_size,num_head,num_head_kv,head_dim",
+        [
+            (8, 4, 2, 128),
+            (17, 8, 2, 64),
+            (5, 3, 1, 96),
+        ],
+    )
+    def test_fused_qk_gemma_rmsnorm_with_gate(
+        self, batch_size: int, num_head: int, num_head_kv: int, head_dim: int, dtype
+    ):
+        q = torch.randn([batch_size, num_head, head_dim], dtype=dtype)
+        gate = torch.randn([batch_size, num_head, head_dim], dtype=dtype)
+        q_gate = torch.cat((q, gate), dim=-1).reshape(
+            batch_size, num_head * head_dim * 2
+        )
+        k = torch.randn([batch_size, num_head_kv * head_dim], dtype=dtype)
+
+        q_gate = make_non_contiguous(q_gate)
+        k = make_non_contiguous(k)
+
+        q_weight = torch.randn(head_dim, dtype=dtype)
+        k_weight = torch.randn(head_dim, dtype=dtype)
+
+        q_out, k_out, gate_out = (
+            torch.ops.sgl_kernel.fused_qk_gemma_rmsnorm_with_gate_cpu(
+                q_gate, k, q_weight, k_weight, eps, head_dim, num_head
+            )
+        )
+
+        ref_q_out = self._gemma_rmsnorm_per_head_native(q, q_weight, head_dim, eps)
+        ref_k_out = self._gemma_rmsnorm_per_head_native(k, k_weight, head_dim, eps)
+
+        atol = rtol = precision[ref_q_out.dtype]
+        torch.testing.assert_close(
+            q_out, ref_q_out.reshape(-1, head_dim), atol=atol, rtol=rtol
+        )
+        torch.testing.assert_close(
+            k_out, ref_k_out.reshape(-1, head_dim), atol=atol, rtol=rtol
+        )
+        torch.testing.assert_close(
+            gate_out, gate.reshape(-1, head_dim), atol=atol, rtol=rtol
+        )
 
 
 if __name__ == "__main__":

@@ -432,10 +432,11 @@ void fused_add_norm4d_kernel_impl(
           out + out_offset, input + p.input_offset(b, h, t), nullptr, residual_ptr, p, p.D));
 }
 
-template <NormMode M, typename scalar_t>
+template <NormMode M, typename scalar_t, bool copy_gate = false>
 void fused_qk_norm4d_kernel_impl(
     scalar_t* __restrict__ q_out,
     scalar_t* __restrict__ k_out,
+    scalar_t* __restrict__ gate_out,
     const scalar_t* __restrict__ q,
     const scalar_t* __restrict__ k,
     const NormParams& params_q,
@@ -443,13 +444,13 @@ void fused_qk_norm4d_kernel_impl(
   at::parallel_for(0, params_q.B, 0, [&](int64_t begin, int64_t end) {
     for (int64_t b = begin; b < end; ++b) {
       for (int64_t h = 0; h < params_q.H /*num_head*/; ++h) {
+        const int64_t q_offset = params_q.input_offset(b, h, /*t*/ 0);
+        const int64_t out_offset = params_q.output_offset(b, h, /*t*/ 0);
         NormReduceGeneric<M, scalar_t, false>::apply(
-            q_out + params_q.output_offset(b, h, /*t*/ 0),
-            q + params_q.input_offset(b, h, /*t*/ 0),
-            nullptr,
-            nullptr,
-            params_q,
-            params_q.D);
+            q_out + out_offset, q + q_offset, nullptr, nullptr, params_q, params_q.D);
+        if constexpr (copy_gate) {
+          std::memcpy(gate_out + out_offset, q + q_offset + params_q.D, params_q.D * sizeof(scalar_t));
+        }
       }
       for (int64_t h = 0; h < params_k.H /*num_head_kv*/; ++h) {
         NormReduceGeneric<M, scalar_t, false>::apply(
@@ -729,13 +730,66 @@ std::tuple<at::Tensor, at::Tensor> fused_qk_gemma_rmsnorm_cpu(
   at::Tensor q_out = at::empty_like(q);
   at::Tensor k_out = at::empty_like(k);
   AT_DISPATCH_REDUCED_FLOATING_TYPES(st, "fused_qk_gemma_rmsnorm_kernel", [&] {
-    fused_qk_norm4d_kernel_impl<NormMode::GemmaNorm, scalar_t>(
+    fused_qk_norm4d_kernel_impl<NormMode::GemmaNorm, scalar_t, false>(
         q_out.data_ptr<scalar_t>(),
         k_out.data_ptr<scalar_t>(),
+        nullptr,
         q.data_ptr<scalar_t>(),
         k.data_ptr<scalar_t>(),
         q_params,
         k_params);
   });
   return std::make_tuple(q_out, k_out);
+}
+
+// q_gate : {batch_size, num_head * head_dim * 2} 2D, interleaved per head as [q_h, gate_h]
+// k      : {batch_size, num_head_kv * head_dim} 2D
+std::tuple<at::Tensor, at::Tensor, at::Tensor> fused_qk_gemma_rmsnorm_with_gate_cpu(
+    const at::Tensor& q_gate,
+    const at::Tensor& k,
+    const at::Tensor& q_weight,
+    const at::Tensor& k_weight,
+    double eps,
+    int64_t head_dim,
+    int64_t num_head) {
+  const auto st = q_gate.scalar_type();
+  CHECK_INPUT_ND<2>(q_gate);
+  CHECK_INPUT_ND<2>(k);
+
+  int64_t batch_size = q_gate.size(0);
+  int64_t num_head_kv = k.size(1) / head_dim;
+  CHECK_EQ(q_gate.size(1), num_head * head_dim * 2);
+  CHECK_EQ(k.size(0), batch_size);
+  CHECK_EQ(k.scalar_type(), st);
+  CHECK_INPUT_SHAPE_DTYPE<false>(q_weight, {head_dim}, st);
+  CHECK_INPUT_SHAPE_DTYPE<false>(k_weight, {head_dim}, st);
+
+  NormParams q_params{q_gate, static_cast<float>(eps)};
+  q_params.H = num_head;
+  q_params.D = head_dim;
+  q_params.i_strideH = head_dim * 2;
+  q_params.weight = q_weight.data_ptr();
+  q_params.shift = 1.f;
+
+  NormParams k_params{k, static_cast<float>(eps)};
+  k_params.H = num_head_kv;
+  k_params.D = head_dim;
+  k_params.i_strideH = head_dim;
+  k_params.weight = k_weight.data_ptr();
+  k_params.shift = 1.f;
+
+  at::Tensor q_out = at::empty({batch_size * num_head, head_dim}, q_gate.options());
+  at::Tensor k_out = at::empty({batch_size * num_head_kv, head_dim}, k.options());
+  at::Tensor gate_out = at::empty_like(q_out);
+  AT_DISPATCH_REDUCED_FLOATING_TYPES(st, "fused_qk_gemma_rmsnorm_with_gate_kernel", [&] {
+    fused_qk_norm4d_kernel_impl<NormMode::GemmaNorm, scalar_t, true>(
+        q_out.data_ptr<scalar_t>(),
+        k_out.data_ptr<scalar_t>(),
+        gate_out.data_ptr<scalar_t>(),
+        q_gate.data_ptr<scalar_t>(),
+        k.data_ptr<scalar_t>(),
+        q_params,
+        k_params);
+  });
+  return std::make_tuple(q_out, k_out, gate_out);
 }
