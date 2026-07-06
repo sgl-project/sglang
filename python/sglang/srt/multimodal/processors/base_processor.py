@@ -484,8 +484,10 @@ class BaseMultimodalProcessor(ABC):
                 "resized_height",
                 "resized_width",
             )
-            for k in sglang_video_keys:
-                kwargs["videos_kwargs"].pop(k, None)
+            # Guard: only strip if videos_kwargs exists and is a dict
+            if "videos_kwargs" in kwargs and isinstance(kwargs["videos_kwargs"], dict):
+                for k in sglang_video_keys:
+                    kwargs["videos_kwargs"].pop(k, None)
             result = processor.__call__(
                 text=[input_text],
                 padding=True,
