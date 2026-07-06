@@ -1746,6 +1746,8 @@ def fp8_per_token_to_per_tensor_quant_triton(
 # psum[e-1] is expert e's aligned group start (consumed by ep_scatter_from_psum).
 # ---------------------------------------------------------------------------
 
+_EPV2_REPACK_WORKERS_PER_EXPERT = 64
+
 
 @triton.jit
 def _fwd_kernel_expand_to_masked_slab(
@@ -1767,50 +1769,50 @@ def _fwd_kernel_expand_to_masked_slab(
     SCALE_HIDDEN: tl.constexpr,
     SCALE_HIDDEN_PAD: tl.constexpr,
     IS_FP8: tl.constexpr,
-    BLOCK_M: tl.constexpr,
+    CHECK_OVERFLOW: tl.constexpr,
+    NUM_WORKERS: tl.constexpr,
 ):
-    # 2D grid (num_local_experts, cdiv(MAX_M, BLOCK_M)): each program copies a
-    # BLOCK_M-row block, cutting program count BLOCK_M x vs one-row-per-program
-    # (less launch/scheduling overhead) while still saturating SMs. The range loop
-    # is unrolled (BLOCK_M constexpr); the per-row j<count guard handles the tail.
-    # Static grid -> cuda-graph safe.
+    # Keep a fixed worker pool per expert and let each worker walk only real rows.
+    # This avoids launching cdiv(MAX_M, BLOCK_M) programs for a conservative
+    # max_m when decode traffic contains only a few rows per expert. The grid is
+    # still static and therefore cuda-graph safe.
     e = tl.program_id(0)
-    jb = tl.program_id(1)
+    worker = tl.program_id(1)
     prev_end = tl.load(psum_ptr + e - 1, mask=e > 0, other=0)
     start = ((prev_end + ALIGN - 1) // ALIGN) * ALIGN
     end = tl.load(psum_ptr + e)
     raw_count = end - start
     count = tl.minimum(raw_count, MAX_M)
-    if jb == 0:
+    if worker == 0:
         tl.store(masked_m_ptr + e, count)
-        # Flag (instead of silently truncating) when an expert receives more
-        # tokens than the masked slab can hold. Host reads it outside capture.
-        ovf = tl.arange(0, 1)
-        tl.store(overflow_ptr + ovf, 1, mask=raw_count > MAX_M)
+        if CHECK_OVERFLOW:
+            # Eager execution reports an invalid bound instead of truncating.
+            # Graph replay uses the proven cap * ep_size upper bound and omits
+            # this host-observable flag and its per-layer reset kernel.
+            ovf = tl.arange(0, 1)
+            tl.store(overflow_ptr + ovf, 1, mask=raw_count > MAX_M)
     off = tl.arange(0, HIDDEN_PAD)
     mask = off < HIDDEN
     off_s = tl.arange(0, SCALE_HIDDEN_PAD)
     mask_s = off_s < SCALE_HIDDEN
-    for k in range(BLOCK_M):
-        j = jb * BLOCK_M + k
-        if j < count:
-            src = (start + j).to(tl.int64)
-            dst = (e * MAX_M + j).to(tl.int64)
-            v = tl.load(recv_x_ptr + src * recv_x_stride0 + off, mask=mask)
-            tl.store(slab_ptr + dst * slab_stride0 + off, v, mask=mask)
-            if IS_FP8:
-                vs = tl.load(
-                    recv_x_scale_ptr + src * recv_x_scale_stride0 + off_s, mask=mask_s
-                )
-                # mn-major write: physical layout [E, SCALE_HIDDEN, MAX_M], element
-                # (e, s, j). Viewed as [E, MAX_M, SCALE_HIDDEN] this is the mn-major
-                # TMA-aligned layout deep_gemm wants, so the GEMM-side transpose
-                # (get_mn_major_tma_aligned_tensor) becomes a no-op.
-                tl.store(
-                    slab_scale_ptr + e * SCALE_HIDDEN * MAX_M + off_s * MAX_M + j,
-                    vs,
-                    mask=mask_s,
-                )
+    for j in tl.range(worker, count, NUM_WORKERS):
+        src = (start + j).to(tl.int64)
+        dst = (e * MAX_M + j).to(tl.int64)
+        v = tl.load(recv_x_ptr + src * recv_x_stride0 + off, mask=mask)
+        tl.store(slab_ptr + dst * slab_stride0 + off, v, mask=mask)
+        if IS_FP8:
+            vs = tl.load(
+                recv_x_scale_ptr + src * recv_x_scale_stride0 + off_s, mask=mask_s
+            )
+            # mn-major write: physical layout [E, SCALE_HIDDEN, MAX_M], element
+            # (e, s, j). Viewed as [E, MAX_M, SCALE_HIDDEN] this is the mn-major
+            # TMA-aligned layout deep_gemm wants, so the GEMM-side transpose
+            # (get_mn_major_tma_aligned_tensor) becomes a no-op.
+            tl.store(
+                slab_scale_ptr + e * SCALE_HIDDEN * MAX_M + off_s * MAX_M + j,
+                vs,
+                mask=mask_s,
+            )
 
 
 @torch.no_grad()
@@ -1831,7 +1833,12 @@ def expand_to_masked_slab(
     masked_m = torch.empty(
         (num_local_experts,), device=recv_x.device, dtype=torch.int32
     )
-    overflow = torch.zeros((1,), device=recv_x.device, dtype=torch.int32)
+    check_overflow = not torch.cuda.is_current_stream_capturing()
+    overflow = (
+        torch.zeros((1,), device=recv_x.device, dtype=torch.int32)
+        if check_overflow
+        else masked_m
+    )
     if is_fp8:
         sh = recv_x_scale.shape[1]
         # mn-major slab_scale: store physically as [E, sh, max_m] (contiguous),
@@ -1854,10 +1861,8 @@ def expand_to_masked_slab(
         scale_arg = recv_x
         scale_s0 = 0
         slab_scale_s0 = 0
-    _REPACK_BLOCK_M = 8
-    _fwd_kernel_expand_to_masked_slab[
-        (num_local_experts, triton.cdiv(max_m, _REPACK_BLOCK_M))
-    ](
+    num_workers = min(max_m, _EPV2_REPACK_WORKERS_PER_EXPERT)
+    _fwd_kernel_expand_to_masked_slab[(num_local_experts, num_workers)](
         psum_num_recv_tokens_per_expert,
         recv_x,
         recv_x.stride(0),
@@ -1876,7 +1881,8 @@ def expand_to_masked_slab(
         SCALE_HIDDEN=sh,
         SCALE_HIDDEN_PAD=triton.next_power_of_2(sh),
         IS_FP8=is_fp8,
-        BLOCK_M=_REPACK_BLOCK_M,
+        CHECK_OVERFLOW=check_overflow,
+        NUM_WORKERS=num_workers,
         num_warps=4,
     )
     # Outside cuda graph capture, fail fast on slab overflow rather than return a
@@ -1887,7 +1893,7 @@ def expand_to_masked_slab(
     # (enforced by the dispatch-entry assert) and a token contributes at most once
     # per local expert, so no expert can exceed max_m. If those invariants change,
     # graph replay would NOT fail-fast on overflow — re-validate before relying on it.
-    if not torch.cuda.is_current_stream_capturing() and int(overflow.item()) != 0:
+    if check_overflow and int(overflow.item()) != 0:
         raise RuntimeError(
             f"DeepEP v2 masked slab overflow: an expert received more than max_m="
             f"{max_m} tokens; increase "
@@ -1913,12 +1919,11 @@ def _fwd_kernel_masked_slab_to_expand(
     HIDDEN: tl.constexpr,
     HIDDEN_PAD: tl.constexpr,
     HAS_W: tl.constexpr,
-    BLOCK_M: tl.constexpr,
+    NUM_WORKERS: tl.constexpr,
 ):
-    # 2D grid (num_local_experts, cdiv(MAX_M, BLOCK_M)): each program copies a
-    # BLOCK_M-row block. See _fwd_kernel_expand_to_masked_slab. cuda-graph safe.
+    # Fixed worker pool; see _fwd_kernel_expand_to_masked_slab. cuda-graph safe.
     e = tl.program_id(0)
-    jb = tl.program_id(1)
+    worker = tl.program_id(1)
     prev_end = tl.load(psum_ptr + e - 1, mask=e > 0, other=0)
     start = ((prev_end + ALIGN - 1) // ALIGN) * ALIGN
     end = tl.load(psum_ptr + e)
@@ -1926,16 +1931,14 @@ def _fwd_kernel_masked_slab_to_expand(
     count = tl.minimum(count, MAX_M)
     off = tl.arange(0, HIDDEN_PAD)
     mask = off < HIDDEN
-    for k in range(BLOCK_M):
-        j = jb * BLOCK_M + k
-        if j < count:
-            src = (e * MAX_M + j).to(tl.int64)
-            dst = (start + j).to(tl.int64)
-            v = tl.load(slab_ptr + src * slab_stride0 + off, mask=mask)
-            if HAS_W:
-                w = tl.load(weight_ptr + dst)
-                v = (v.to(tl.float32) * w).to(v.dtype)
-            tl.store(out_ptr + dst * out_stride0 + off, v, mask=mask)
+    for j in tl.range(worker, count, NUM_WORKERS):
+        src = (e * MAX_M + j).to(tl.int64)
+        dst = (start + j).to(tl.int64)
+        v = tl.load(slab_ptr + src * slab_stride0 + off, mask=mask)
+        if HAS_W:
+            w = tl.load(weight_ptr + dst)
+            v = (v.to(tl.float32) * w).to(v.dtype)
+        tl.store(out_ptr + dst * out_stride0 + off, v, mask=mask)
 
 
 @torch.no_grad()
@@ -1966,10 +1969,8 @@ def masked_slab_to_expand(
         weight_arg = topk_weights.reshape(-1).to(torch.float32).contiguous()
     else:
         weight_arg = slab2d  # dummy, unused
-    _REPACK_BLOCK_M = 8
-    _fwd_kernel_masked_slab_to_expand[
-        (num_local_experts, triton.cdiv(max_m, _REPACK_BLOCK_M))
-    ](
+    num_workers = min(max_m, _EPV2_REPACK_WORKERS_PER_EXPERT)
+    _fwd_kernel_masked_slab_to_expand[(num_local_experts, num_workers)](
         psum_num_recv_tokens_per_expert,
         slab2d,
         slab2d.stride(0),
@@ -1981,7 +1982,7 @@ def masked_slab_to_expand(
         HIDDEN=hidden,
         HIDDEN_PAD=triton.next_power_of_2(hidden),
         HAS_W=has_w,
-        BLOCK_M=_REPACK_BLOCK_M,
+        NUM_WORKERS=num_workers,
         num_warps=4,
     )
     return out
