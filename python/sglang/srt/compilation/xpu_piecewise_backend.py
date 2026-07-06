@@ -13,6 +13,7 @@ from sglang.srt.compilation.cuda_piecewise_backend import (
     CUDAPiecewiseBackend,
     weak_ref_tensors,
 )
+from sglang.srt.utils.common import print_warning_once
 
 
 class XPUPiecewiseBackend(CUDAPiecewiseBackend):
@@ -57,10 +58,22 @@ class XPUPiecewiseBackend(CUDAPiecewiseBackend):
                 entry.num_finished_warmup += 1
                 return entry.runnable(*args)
 
+            # During normal capture (PrefillCudaGraphRunner.capture()),
+            # set_pcg_capture_stream() guarantees a valid stream. However,
+            # Dynamo may silently recompile on serving batches whose token
+            # count exceeds the captured range (e.g. chunked prefill running
+            # at 8192 tokens when the capture grid tops out at 512). The
+            # recompiled backend instance has no capture stream; fall back to
+            # eager for that sub-graph instead of crashing the scheduler.
+            # Mirrors the HIP fallback in CUDAPiecewiseBackend.__call__.
             stream = get_pcg_capture_stream()
-            assert (
-                stream is not None
-            ), "PCG capture stream is not set, please check if runtime recompilation happened"
+            if stream is None:
+                print_warning_once(
+                    "PCG capture stream is not set; likely a Dynamo runtime "
+                    "recompilation. Falling back to eager execution for this "
+                    "subgraph."
+                )
+                return entry.runnable(*args)
 
             if self.compile_config.get_enable_debug_mode():
                 entry.input_addresses = [
