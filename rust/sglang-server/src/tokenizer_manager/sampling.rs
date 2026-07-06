@@ -10,9 +10,13 @@
 //! `normalize` early-return; its `verify` is likewise skipped (we did it here).
 //!
 //! KEEP IN SYNC with `sampling_params.py`: the constants and ranges below mirror
-//! that file. `stop_str_max_len` uses the character length of each stop string —
-//! a safe over-estimate of its token length (Python's `tokenizer=None` fallback),
-//! which avoids needing the tokenizer here and only widens the detok match window.
+//! that file. `stop_str_max_len` is the stop string's **UTF-8 byte length** — a
+//! provably safe over-estimate of its token length (a token spans ≥ 1 byte, so
+//! `bytes ≥ tokens`; `chars` is *not* a bound — one char can be several tokens,
+//! e.g. `𓀀` → 3). The scheduler uses this only as a match-window *size* (capped at
+//! the output length), so any over-estimate matches the same stops — only an
+//! under-estimate misses. Python encodes each stop with the tokenizer for the
+//! exact token count; the byte-length bound avoids needing the tokenizer here.
 //!
 //! Not ported (the Rust OpenAI/`/generate` handlers don't populate them): the
 //! vocab-bounded `logit_bias` range check, and `stop_token_ids` filtering. Add
@@ -63,13 +67,10 @@ pub fn normalize_sampling_params(sp: &mut Option<Value>) -> Result<(), Error> {
     // Field default is 128 (not None), so an absent value verifies against 128.
     let max_new_tokens = get_i64(&map, "max_new_tokens").unwrap_or(128);
 
-    // stop / stop_regex → string lists + match-window lengths.
+    // stop / stop_regex → string lists + match-window lengths. Use the UTF-8 byte
+    // length as a safe upper bound on the token count.
     let stop_strs = to_string_list(find(&map, "stop"));
-    let stop_str_max_len = stop_strs
-        .iter()
-        .map(|s| s.chars().count() as i64)
-        .max()
-        .unwrap_or(0);
+    let stop_str_max_len = stop_strs.iter().map(|s| s.len() as i64).max().unwrap_or(0);
     let stop_regex_strs = to_string_list(find(&map, "stop_regex"));
     let stop_regex_max_len = if stop_regex_strs.is_empty() {
         0
@@ -259,16 +260,27 @@ mod tests {
     }
 
     #[test]
-    fn stop_list_and_max_len_by_chars() {
+    fn stop_list_and_max_len_by_bytes() {
         let m = norm(&[(
             "stop",
             Value::Array(vec![Value::from("Question:"), Value::from("\n\n")]),
         )]);
-        assert_eq!(get(&m, "stop_str_max_len").as_i64(), Some(9)); // "Question:"
+        assert_eq!(get(&m, "stop_str_max_len").as_i64(), Some(9)); // "Question:" (ASCII)
         let Value::Array(a) = get(&m, "stop_strs") else {
             panic!("stop_strs not array")
         };
         assert_eq!(a.len(), 2);
+    }
+
+    /// A multi-byte stop char must use its byte length as the window bound: `𓀀`
+    /// is 1 char but 4 UTF-8 bytes (and 3 tokens on Qwen3). Char count (1) would
+    /// under-size the tail and miss the stop; byte count (4) ≥ the token span.
+    #[test]
+    fn stop_str_max_len_uses_bytes_not_chars() {
+        let m = norm(&[("stop", Value::from("𓀀"))]);
+        assert_eq!("𓀀".chars().count(), 1);
+        assert_eq!("𓀀".len(), 4);
+        assert_eq!(get(&m, "stop_str_max_len").as_i64(), Some(4));
     }
 
     #[test]
