@@ -56,20 +56,29 @@ class GSM8KEval(Eval):
         else:
             filename = download_and_cache_file(GSM8K_URL)
 
-        self._lines = list(read_jsonl(filename))
-        self._few_shot_prompt = get_few_shot_examples(self._lines, num_shots)
-
+        all_lines = list(read_jsonl(filename))
+        pool_size = self._setup_prefix_pool(all_lines, num_shots)
         # The evaluation data should not include the few-shot examples to prevent data leakage.
-        self._lines = self._lines[num_shots:]
+        self._lines = all_lines[pool_size:]
         if num_examples is not None:
+            # Slice caps silently when num_examples exceeds the available lines,
+            # matching upstream: callers like test_basic_sanity_eagle3 pass a
+            # num_examples larger than the dataset on purpose.
             self._lines = self._lines[:num_examples]
+
+    def _setup_prefix_pool(self, all_lines: list, num_shots: int) -> int:
+        self._few_shot_prompt = get_few_shot_examples(all_lines, num_shots)
+        return num_shots
+
+    def _build_prefix(self, idx: int) -> str:
+        return self._few_shot_prompt
 
     def __call__(self, sampler: SamplerBase) -> EvalResult:
         def fn(idx: int) -> SingleEvalResult:
             question = get_one_example(self._lines, idx, include_answer=False)
             correct_answer = get_answer_value(self._lines[idx]["answer"])
 
-            prompt_content = self._few_shot_prompt + question
+            prompt_content = self._build_prefix(idx) + question
             prompt_messages = [
                 sampler._pack_message(content=prompt_content, role="user")
             ]

@@ -9,14 +9,19 @@ composed to create complete diffusion pipelines.
 """
 
 from abc import ABC, abstractmethod
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import replace
 from enum import Enum, auto
 
 import torch
+from tqdm.auto import tqdm
 
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_world_rank,
+    world_group_is_initialized,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
 )
@@ -62,6 +67,7 @@ class PipelineStage(StageDedupMixin, ABC):
     # Class-level default so subclasses that override __init__ without
     # calling super().__init__() still see a consistent explicit-range gate.
     _current_use_nvtx: bool = False
+    _current_batch_is_warmup: bool = False
 
     def __init__(self):
         self.server_args = get_global_server_args()
@@ -71,7 +77,7 @@ class PipelineStage(StageDedupMixin, ABC):
 
     def log_info(self, msg, *args):
         """Logs an informational message with the stage name as a prefix."""
-        if self.server_args.comfyui_mode:
+        if self.server_args.comfyui_mode or self._current_batch_is_warmup:
             return
         logger.info(f"[{self.__class__.__name__}] {msg}", *args)
 
@@ -86,6 +92,24 @@ class PipelineStage(StageDedupMixin, ABC):
     def log_debug(self, msg, *args):
         """Logs a debug message with the stage name as a prefix."""
         logger.debug(f"[{self.__class__.__name__}] {msg}", *args)
+
+    def progress_bar(
+        self,
+        iterable: Iterable | None = None,
+        total: int | None = None,
+        *,
+        disable: bool = False,
+        batch: Req | None = None,
+        **kwargs,
+    ) -> tqdm:
+        is_main_rank = not world_group_is_initialized() or get_world_rank() == 0
+        disable = disable or (batch is not None and batch.is_warmup)
+        return tqdm(
+            iterable=iterable,
+            total=total,
+            disable=disable or not is_main_rank,
+            **kwargs,
+        )
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         """
@@ -248,6 +272,12 @@ class PipelineStage(StageDedupMixin, ABC):
         #     return StageParallelismType.MAIN_RANK_ONLY
         return StageParallelismType.REPLICATED
 
+    def cfg_parallel_local_batch_fields(
+        self, batch: Req, server_args: ServerArgs
+    ) -> tuple[str, ...]:
+        """the name of fields which already have a local version on each GPU in CFG-Parallel, no need to broadcast"""
+        return ()
+
     def verify_output(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         """
         Verify the output for the stage.
@@ -332,6 +362,8 @@ class PipelineStage(StageDedupMixin, ABC):
         self._apply_nvtx_gate(batch.is_warmup)
 
         # Execute the actual stage logic with unified profiling.
+        previous_batch_is_warmup = self._current_batch_is_warmup
+        self._current_batch_is_warmup = batch.is_warmup
         try:
             with StageProfiler(
                 stage_name,
@@ -343,6 +375,7 @@ class PipelineStage(StageDedupMixin, ABC):
             ):
                 result = self.forward(batch, server_args)
         finally:
+            self._current_batch_is_warmup = previous_batch_is_warmup
             self._current_use_nvtx = False
 
         # Post-execution output verification

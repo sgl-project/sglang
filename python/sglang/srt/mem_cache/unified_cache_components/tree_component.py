@@ -3,7 +3,7 @@ from __future__ import annotations
 import dataclasses
 from abc import ABC, abstractmethod
 from enum import Enum, IntFlag
-from typing import TYPE_CHECKING, Any, Callable, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional, Sequence
 
 import torch
 from numpy import float64
@@ -17,7 +17,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
-from sglang.srt.mem_cache.hicache_storage import PoolTransfer
+from sglang.srt.mem_cache.hicache_storage import PoolTransfer, PoolTransferResult
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -83,6 +83,13 @@ class CacheTransferPhase(str, Enum):
     PREFETCH = "prefetch"  # Storage→H
 
 
+class LRURefreshPhase(str, Enum):
+
+    WALKDOWN = "walkdown"  # touching a node while walking through the tree
+    MATCH_END = "match_end"  # end of a successful prefix match
+    INSERT_END = "insert_end"  # after a new/updated leaf is committed
+
+
 def get_and_increase_time_counter() -> float64:
     global _LAST_ACCESS_TIME_COUNTER_FLOAT
     ret = _LAST_ACCESS_TIME_COUNTER_FLOAT
@@ -114,6 +121,29 @@ class TreeComponent(ABC):
     def value_len(self, node: UnifiedTreeNode) -> int:
         value = node.component_data[self.component_type].value
         return len(value) if value is not None else 0
+
+    def refresh_lru(
+        self,
+        phase: LRURefreshPhase,
+        node: UnifiedTreeNode,
+        root_node: UnifiedTreeNode,
+    ) -> None:
+        ct = self.component_type
+        match phase:
+            case LRURefreshPhase.WALKDOWN:
+                if node.component_data[ct].value is None:
+                    return
+                self.cache.lru_lists[ct].reset_node_mru(node)
+            case LRURefreshPhase.MATCH_END:
+                self.cache.lru_lists[ct].reset_node_and_parents_mru(
+                    node, root_node, self.node_has_component_data
+                )
+            case LRURefreshPhase.INSERT_END:
+                # WALKDOWN already refreshed every node on the insert path
+                # (including the new leaf), so there is nothing more to do.
+                return
+            case _:
+                raise ValueError(f"Unknown LRURefreshPhase: {phase}")
 
     @abstractmethod
     def create_match_validator(
@@ -159,13 +189,6 @@ class TreeComponent(ABC):
         _insert_helper uses this to free only the non-consumed duplicate
         portion: value_slice[dup_start:consumed_from]."""
         return prefix_len
-
-    def should_skip_leaf_creation(
-        self, total_prefix_len: int, key_len: int, params: InsertParams
-    ) -> bool:
-        """Return True to veto leaf creation when the entire new leaf would
-        be a tombstone for this component."""
-        return False
 
     def recover_after_unevict(
         self,
@@ -350,10 +373,22 @@ class TreeComponent(ABC):
         paths it is still provided so components can free their resources."""
         pass
 
+    def free_out_of_window_slots(
+        self, req: Req, pre_len: int, insert_params: InsertParams
+    ) -> None:
+        pass
+
     # ---- HiCache Hooks ----
 
     def build_hicache_transfers(
-        self, node: UnifiedTreeNode, phase: CacheTransferPhase, **kw
+        self,
+        node: UnifiedTreeNode,
+        phase: CacheTransferPhase,
+        *,
+        req: Optional[Req] = None,
+        token_ids: Optional[Sequence[int]] = None,
+        prefetch_tokens: int = 0,
+        last_hash: Optional[str] = None,
     ) -> Optional[list[PoolTransfer]]:
         """Build transfer descriptors for this component in the given phase.
         Returns None if the component has nothing to transfer."""
@@ -364,7 +399,9 @@ class TreeComponent(ABC):
         node: UnifiedTreeNode,
         phase: CacheTransferPhase,
         transfers: list[PoolTransfer] = (),
-        **kw,
+        *,
+        insert_result: Optional[InsertResult] = None,
+        pool_storage_result: Optional[PoolTransferResult] = None,
     ) -> None:
         """Post-transfer bookkeeping: store host indices, update LRU, etc."""
         pass
