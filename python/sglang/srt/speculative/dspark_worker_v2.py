@@ -1174,6 +1174,11 @@ class DSparkWorkerV2(BaseSpecWorker):
                 payload.update(extra)
             debug = self._boundary_debug_by_req_pool.setdefault(int(req_pool_idx), {})
             debug[stage] = payload
+            if stage == "decode_verify_write":
+                history = debug.setdefault("decode_verify_write_history", [])
+                history.append(payload)
+                if len(history) > 16:
+                    del history[:-16]
         except Exception as e:
             debug = self._boundary_debug_by_req_pool.setdefault(int(req_pool_idx), {})
             debug[stage] = {"error": str(e)}
