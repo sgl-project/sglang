@@ -1605,7 +1605,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         self,
         *,
         block_hidden: torch.Tensor,
-        bonus_tokens: torch.Tensor,
+        anchor_tokens: torch.Tensor,
         output_bs: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         bs = int(block_hidden.shape[0])
@@ -1674,8 +1674,8 @@ class DSparkWorkerV2(BaseSpecWorker):
             logits_shard = logits_processor._compute_lm_head(hidden_states, head)
             return _gather_full_vocab(logits_shard, head)
 
-        if bonus_tokens.numel() == bs:
-            first_tokens = bonus_tokens.view(-1).to(torch.int64)
+        if anchor_tokens.numel() == bs:
+            first_tokens = anchor_tokens.view(-1).to(torch.int64)
         else:
             first_tokens = torch.full(
                 (bs,), self.noise_token_id, dtype=torch.int64, device=block_hidden.device
@@ -2327,6 +2327,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         *,
         model_worker_batch: ScheduleBatch,
         draft_input: DSparkDraftInputV2,
+        anchor_tokens: torch.Tensor,
         candidates: torch.Tensor,
         target_predict: torch.Tensor,
         commit_lens: torch.Tensor,
@@ -2367,6 +2368,11 @@ class DSparkWorkerV2(BaseSpecWorker):
         target_cpu = target_predict.detach().cpu()
         confidence_cpu = confidence.detach().cpu()
         next_bonus = bonus_tokens.detach().cpu().tolist()
+        draft_anchor = (
+            anchor_tokens.detach().cpu().tolist()
+            if anchor_tokens.numel() == bs
+            else None
+        )
         input_bonus = (
             draft_input.bonus_tokens.detach().cpu().tolist()
             if draft_input.bonus_tokens.numel() == bs
@@ -2500,6 +2506,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
             req_anchor_token = _req_token_at(req, int(seq_lens[i]) - 1)
             req_latest_token = _req_latest_token(req)
+            draft_anchor_i = int(draft_anchor[i]) if draft_anchor is not None else None
             input_bonus_i = int(input_bonus[i]) if input_bonus is not None else None
             history = self._accept_anomaly_histories.setdefault(key, [])
             history.append(
@@ -2547,6 +2554,12 @@ class DSparkWorkerV2(BaseSpecWorker):
                     ),
                     "req_anchor_token_at_prefix_minus_1": req_anchor_token,
                     "req_latest_token": req_latest_token,
+                    "draft_anchor_token": draft_anchor_i,
+                    "draft_anchor_matches_req_anchor": (
+                        draft_anchor_i == req_anchor_token
+                        if draft_anchor_i is not None and req_anchor_token is not None
+                        else None
+                    ),
                     "input_bonus": input_bonus_i,
                     "input_bonus_matches_req_anchor": (
                         input_bonus_i == req_anchor_token
@@ -2791,6 +2804,64 @@ class DSparkWorkerV2(BaseSpecWorker):
             return rounds.to(device=device, dtype=torch.int32)
         return torch.zeros((bs,), dtype=torch.int32, device=device)
 
+    def _get_decode_anchor_tokens(
+        self,
+        *,
+        batch: ScheduleBatch,
+        prefix_lens: torch.Tensor,
+        fallback_tokens: torch.Tensor,
+        bs: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        reqs = getattr(batch, "reqs", None) or []
+        seq_lens_cpu = getattr(batch, "seq_lens_cpu", None)
+        try:
+            if seq_lens_cpu is not None and len(seq_lens_cpu) == bs:
+                prefix_lens_list = [int(x) for x in seq_lens_cpu]
+            else:
+                prefix_lens_list = [int(x) for x in prefix_lens.detach().cpu().tolist()]
+        except Exception:
+            prefix_lens_list = []
+        anchors = []
+        for i in range(bs):
+            token = None
+            req = reqs[i] if i < len(reqs) else None
+            if req is not None:
+                try:
+                    pos = (
+                        int(prefix_lens_list[i]) - 1
+                        if i < len(prefix_lens_list)
+                        else -1
+                    )
+                    origin = getattr(req, "origin_input_ids", []) or []
+                    output = getattr(req, "output_ids", []) or []
+                    origin_len = len(origin)
+                    if 0 <= pos < origin_len:
+                        token = int(origin[pos])
+                    else:
+                        out_pos = pos - origin_len
+                        if 0 <= out_pos < len(output):
+                            token = int(output[out_pos])
+                except Exception:
+                    token = None
+                if token is None:
+                    try:
+                        output = getattr(req, "output_ids", []) or []
+                        if len(output) > 0:
+                            token = int(output[-1])
+                        else:
+                            origin = getattr(req, "origin_input_ids", []) or []
+                            if len(origin) > 0:
+                                token = int(origin[-1])
+                    except Exception:
+                        token = None
+            if token is None and fallback_tokens.numel() == bs:
+                token = int(fallback_tokens[i].detach().cpu())
+            if token is None:
+                token = int(self.noise_token_id)
+            anchors.append(token)
+        return torch.tensor(anchors, dtype=torch.int64, device=device)
+
     def _make_next_draft_input_decode(
         self,
         *,
@@ -3029,11 +3100,18 @@ class DSparkWorkerV2(BaseSpecWorker):
         anchor_lens = (prefix_lens.to(torch.int64) - 1).clamp_min(0)
         req_pool_indices = model_worker_batch.req_pool_indices
 
+        anchor_tokens = self._get_decode_anchor_tokens(
+            batch=model_worker_batch,
+            prefix_lens=prefix_lens,
+            fallback_tokens=draft_input.bonus_tokens,
+            bs=bs,
+            device=device,
+        )
         block_ids = torch.full(
             (bs, block_size), self.noise_token_id, dtype=torch.int64, device=device
         )
-        if draft_input.bonus_tokens.numel() == bs:
-            block_ids[:, 0].copy_(draft_input.bonus_tokens.view(-1))
+        if anchor_tokens.numel() == bs:
+            block_ids[:, 0].copy_(anchor_tokens.view(-1))
 
         positions_2d = anchor_lens.unsqueeze(1) + self._block_pos_offsets
         positions = positions_2d.reshape(-1).to(torch.int64)
@@ -3081,7 +3159,7 @@ class DSparkWorkerV2(BaseSpecWorker):
 
             candidates, confidence = self._refine_block_markov(
                 block_hidden=block_hidden,
-                bonus_tokens=draft_input.bonus_tokens,
+                anchor_tokens=anchor_tokens,
                 output_bs=bs,
             )
 
@@ -3254,6 +3332,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._maybe_log_accept_anomaly(
             model_worker_batch=model_worker_batch,
             draft_input=draft_input,
+            anchor_tokens=anchor_tokens,
             candidates=candidates,
             target_predict=target_predict,
             commit_lens=commit_lens,
