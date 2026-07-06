@@ -1079,6 +1079,37 @@ class DSparkWorkerV2(BaseSpecWorker):
                 "last_row_last8": [int(x) for x in last[-8:].tolist()],
             }
 
+        def valid_first_last_row_edges(indices, lengths):
+            if (
+                indices is None
+                or lengths is None
+                or not isinstance(indices, torch.Tensor)
+                or not isinstance(lengths, torch.Tensor)
+                or indices.numel() == 0
+                or lengths.numel() == 0
+            ):
+                return None
+            rows = indices.detach().cpu()
+            lens = lengths.detach().cpu().reshape(-1)
+            if rows.ndim == 1:
+                return None
+            out = {}
+            for label, row_idx in (("first", 0), ("last", rows.shape[0] - 1)):
+                row = rows[row_idx].reshape(-1)
+                valid_len = int(lens[min(row_idx, lens.numel() - 1)])
+                valid_len = max(0, min(valid_len, int(row.numel())))
+                valid = row[:valid_len]
+                out[f"{label}_valid_len"] = valid_len
+                out[f"{label}_valid_first8"] = [
+                    int(x) for x in valid[:8].tolist()
+                ]
+                out[f"{label}_valid_last8"] = [
+                    int(x) for x in valid[-8:].tolist()
+                ]
+            return out
+
+        swa_page_indices = getattr(core, "swa_page_indices", None)
+        swa_topk_lengths = getattr(core, "swa_topk_lengths", None)
         return {
             "draft_can_run_graph": can_run_graph,
             "draft_forward_mode": str(
@@ -1115,13 +1146,16 @@ class DSparkWorkerV2(BaseSpecWorker):
                 getattr(core, "positions_casual", None)
             ),
             "draft_swa_topk_first_last": first_last_rows(
-                getattr(core, "swa_topk_lengths", None)
+                swa_topk_lengths
             ),
             "draft_swa_indices_first_last": first_last_rows(
-                getattr(core, "swa_page_indices", None)
+                swa_page_indices
             ),
             "draft_swa_indices_edges": first_last_row_edges(
-                getattr(core, "swa_page_indices", None)
+                swa_page_indices
+            ),
+            "draft_swa_valid_edges": valid_first_last_row_edges(
+                swa_page_indices, swa_topk_lengths
             ),
         }
 
