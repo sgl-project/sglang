@@ -49,6 +49,7 @@ class TestZImagePipelineConfig(unittest.TestCase):
         config.vae_config.post_init()
         batch = SimpleNamespace(
             prompt_embeds=[torch.ones(113, 2560)],
+            prompt_seq_lens=[[113]],
             negative_prompt_embeds=None,
             height=480,
             width=640,
