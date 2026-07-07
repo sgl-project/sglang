@@ -1373,8 +1373,8 @@ class TestDSparkDeepSpecSemanticReference(CustomTestCase):
             t.cat([k_context, k_block], dim=1),
             t.cat([v_context, v_block], dim=1),
         )
-        wrong_k_context = k_context[:, [1, 0, 2, 3, 4], :]
-        wrong_v_context = v_context[:, [1, 0, 2, 3, 4], :]
+        wrong_k_context = k_context[:, [1, 0, 2], :]
+        wrong_v_context = v_context[:, [1, 0, 2], :]
         wrong = attention(
             q_block,
             t.cat([wrong_k_context, k_block], dim=1),
