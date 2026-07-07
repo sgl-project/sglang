@@ -266,6 +266,7 @@ class MiMoV2MoE(nn.Module):
         self.topk = TopK(
             top_k=config.num_experts_per_tok,
             renormalize=config.norm_topk_prob,
+            layer_id=self.layer_id,
             use_grouped_topk=True,
             num_expert_group=config.n_group,
             topk_group=config.topk_group,
