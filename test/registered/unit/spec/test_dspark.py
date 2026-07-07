@@ -1053,6 +1053,250 @@ class TestDSparkRuntimeDebugEvidence(CustomTestCase):
         self.assertEqual(second["mask_valid_count"], 0)
         self.assertEqual(second["skip_reason"], "empty_mask_row")
 
+    def test_compressor_materialization_rebuilds_and_restores_backend_metadata(self):
+        import contextlib
+
+        t = self.torch
+        worker = self._worker()
+        calls = []
+        old_metadata = {"old": True}
+
+        class _DraftModel:
+            def project_main_hidden(self, hidden):
+                calls.append(("project", hidden.clone()))
+                return hidden + 10.0
+
+        class _AttnBackend:
+            def __init__(self):
+                self.forward_metadata = old_metadata
+
+            def init_forward_metadata(self, forward_batch):
+                calls.append(("init_metadata", forward_batch.name))
+                self.forward_metadata = {"batch": forward_batch.name}
+
+            def forward_core_compressor(
+                self,
+                main_x,
+                forward_batch,
+                layer_id,
+                compressor,
+            ):
+                calls.append(
+                    (
+                        "compressor",
+                        layer_id,
+                        compressor,
+                        main_x.clone(),
+                        forward_batch.name,
+                        self.forward_metadata,
+                    )
+                )
+
+        attn_backend = _AttnBackend()
+        worker.draft_model = _DraftModel()
+        worker.draft_model_runner = SimpleNamespace(
+            tp_group="tp0",
+            attn_backend=attn_backend,
+        )
+        worker.draft_tp_context = lambda tp_group: contextlib.nullcontext(tp_group)
+        worker._draft_inner = SimpleNamespace(
+            layers=[
+                SimpleNamespace(
+                    self_attn=SimpleNamespace(layer_id=0, compressor="c0")
+                ),
+                SimpleNamespace(
+                    self_attn=SimpleNamespace(layer_id=1, compressor=None)
+                ),
+                SimpleNamespace(
+                    self_attn=SimpleNamespace(layer_id=2, compressor="c2")
+                ),
+            ]
+        )
+        hidden = t.arange(6, dtype=t.float32).view(2, 3)
+        forward_batch = SimpleNamespace(name="materialize_batch")
+
+        self.worker_cls._materialize_main_hidden_to_draft_compressors(
+            worker,
+            main_hidden=hidden,
+            draft_forward_batch=forward_batch,
+            projected=False,
+        )
+
+        self.assertIs(attn_backend.forward_metadata, old_metadata)
+        self.assertEqual(calls[0][0], "init_metadata")
+        self.assertEqual(calls[1][0], "project")
+        compressor_calls = [call for call in calls if call[0] == "compressor"]
+        self.assertEqual([call[1] for call in compressor_calls], [0, 2])
+        self.assertTrue(t.equal(compressor_calls[0][3], hidden + 10.0))
+        self.assertEqual(compressor_calls[0][5], {"batch": "materialize_batch"})
+
+    def test_compressor_materialization_projected_hidden_skips_projection(self):
+        import contextlib
+
+        t = self.torch
+        worker = self._worker()
+        calls = []
+
+        class _DraftModel:
+            def project_main_hidden(self, _hidden):
+                raise AssertionError("project_main_hidden should not be called")
+
+        class _AttnBackend:
+            forward_metadata = None
+
+            def init_forward_metadata(self, forward_batch):
+                calls.append(("init_metadata", forward_batch.name))
+
+            def forward_core_compressor(
+                self,
+                main_x,
+                _forward_batch,
+                layer_id,
+                _compressor,
+            ):
+                calls.append(("compressor", layer_id, main_x.clone()))
+
+        worker.draft_model = _DraftModel()
+        worker.draft_model_runner = SimpleNamespace(
+            tp_group=None,
+            attn_backend=_AttnBackend(),
+        )
+        worker.draft_tp_context = lambda tp_group: contextlib.nullcontext()
+        worker._draft_inner = SimpleNamespace(
+            layers=[
+                SimpleNamespace(
+                    self_attn=SimpleNamespace(layer_id=7, compressor="compressor")
+                )
+            ]
+        )
+        projected_hidden = t.ones((2, 3), dtype=t.float32)
+
+        self.worker_cls._materialize_main_hidden_to_draft_compressors(
+            worker,
+            main_hidden=projected_hidden,
+            draft_forward_batch=SimpleNamespace(name="projected_batch"),
+            projected=True,
+        )
+
+        self.assertEqual(calls[0], ("init_metadata", "projected_batch"))
+        self.assertEqual(calls[1][0], "compressor")
+        self.assertEqual(calls[1][1], 7)
+        self.assertTrue(t.equal(calls[1][2], projected_hidden))
+
+    def test_materialize_state_continues_kv_when_compressor_replay_fails(self):
+        t = self.torch
+        worker = self._worker()
+        calls = []
+
+        def fail_compressors(**kwargs):
+            calls.append(("compressor_failed", kwargs["main_hidden"].clone()))
+            raise RuntimeError("compressor boom")
+
+        def record_kv(**kwargs):
+            calls.append(
+                (
+                    "kv",
+                    kwargs["main_hidden"].clone(),
+                    kwargs["cache_loc"].clone(),
+                    kwargs["positions"].clone(),
+                    kwargs["projected"],
+                )
+            )
+
+        worker._materialize_main_hidden_to_draft_compressors = fail_compressors
+        worker._materialize_main_hidden_to_draft_kv = record_kv
+        main_hidden = t.ones((2, 3))
+        kv_hidden = t.full((2, 3), 5.0)
+        cache_loc = t.tensor([11, 12], dtype=t.int32)
+        positions = t.tensor([101, 102], dtype=t.int32)
+
+        self.worker_cls._materialize_main_hidden_to_draft_state(
+            worker,
+            main_hidden=main_hidden,
+            cache_loc=cache_loc,
+            positions=positions,
+            draft_forward_batch=SimpleNamespace(name="batch"),
+            kv_main_hidden=kv_hidden,
+            projected=True,
+        )
+
+        self.assertEqual(calls[0][0], "compressor_failed")
+        self.assertEqual(calls[1][0], "kv")
+        self.assertTrue(t.equal(calls[1][1], kv_hidden))
+        self.assertTrue(t.equal(calls[1][2], cache_loc))
+        self.assertTrue(t.equal(calls[1][3], positions))
+        self.assertTrue(calls[1][4])
+
+    def test_prefill_tail_replay_flattens_valid_rows_for_projected_materialization(self):
+        t = self.torch
+        worker = self._worker()
+        worker._accept_anomaly_enabled = False
+        worker._parity_dump_enabled = False
+        materialize_calls = []
+
+        def record_materialize(**kwargs):
+            materialize_calls.append(
+                {
+                    "main_hidden": kwargs["main_hidden"].clone(),
+                    "cache_loc": kwargs["cache_loc"].clone(),
+                    "positions": kwargs["positions"].clone(),
+                    "draft_forward_batch": kwargs["draft_forward_batch"],
+                    "projected": kwargs["projected"],
+                }
+            )
+
+        worker._materialize_main_hidden_to_draft_state = record_materialize
+        req_to_token = t.full((4, 16), -1, dtype=t.int64)
+        req_to_token[1, 2] = 102
+        req_to_token[1, 4] = 104
+        req_to_token[1, 5] = 105
+        req_to_token[2, 1] = 201
+        req_to_token[2, 2] = -1
+        req_to_token[2, 4] = 204
+        worker.model_runner = SimpleNamespace(
+            req_to_token_pool=SimpleNamespace(req_to_token=req_to_token)
+        )
+        hidden = t.arange(2 * 4 * 3, dtype=t.float32).view(2, 4, 3)
+        mask = t.tensor(
+            [
+                [True, False, True, True],
+                [True, True, False, True],
+            ],
+            dtype=t.bool,
+        )
+        draft_input = self.draft_input_cls(
+            bonus_tokens=t.tensor([0, 0], dtype=t.int64),
+            new_seq_lens=t.tensor([6, 5], dtype=t.int64),
+            prefill_tail_hidden_states=hidden,
+            prefill_tail_valid_mask=mask,
+        )
+        batch = SimpleNamespace(req_pool_indices=t.tensor([1, 2], dtype=t.int64))
+
+        self.worker_cls._materialize_prefill_tail_hidden_to_draft_state(
+            worker,
+            draft_input=draft_input,
+            batch=batch,
+            prefix_lens=t.tensor([6, 5], dtype=t.int64),
+        )
+
+        self.assertEqual(len(materialize_calls), 1)
+        call = materialize_calls[0]
+        self.assertIsNone(call["draft_forward_batch"])
+        self.assertTrue(call["projected"])
+        self.assertEqual(call["positions"].tolist(), [2, 4, 5, 1, 4])
+        self.assertEqual(call["cache_loc"].tolist(), [102, 104, 105, 201, 204])
+        expected_hidden = t.stack(
+            [
+                hidden[0, 0],
+                hidden[0, 2],
+                hidden[0, 3],
+                hidden[1, 0],
+                hidden[1, 3],
+            ],
+            dim=0,
+        )
+        self.assertTrue(t.equal(call["main_hidden"], expected_hidden))
+
     def test_markov_debug_payload_maps_candidate_indices_to_markov_steps(self):
         t = self.torch
         worker = self._worker()
