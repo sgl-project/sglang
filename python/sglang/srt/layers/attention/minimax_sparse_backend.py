@@ -1037,6 +1037,13 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             :, blk_cols
         ]  # [bs*ndt, max_blocks]
         block_table = (token_slots // page_size).to(torch.int32)
+        # Sanitize block_table: short-prefix verify queries read req_to_token slots beyond
+        # their real KV length, which may hold stale/garbage page ids from pool reuse. Clamp
+        # every page id into [0, num_pages) so the indexer/main kernels can never OOB on
+        # k_cache / idx_k_cache via a garbage block_table entry. Capture uses benign dummy
+        # data so it passes; replay uses real routing — this guards the replay path. Real
+        # page ids are already in-range, so correctness is unchanged.
+        block_table = block_table.clamp(min=0, max=num_pages - 1)
 
         disable_index_value = idx_v_cache is None
 
@@ -1076,6 +1083,12 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         query_positions = (per_query_seq_lens.to(torch.long) - 1).clamp(min=0)
         topk_merged = self._merge_sparse_blocks(topk_2d, query_positions, max_blocks)
         topk_idx = topk_merged.permute(1, 0, 2).contiguous()
+        # Guard the merged top-k: clamp into valid logical-block range [-1, max_blocks-1].
+        # -1 is the skip sentinel; real blocks are >= 0. Prevents the main kernel from
+        # indexing block_table past dim-1 if _merge_sparse_blocks appended a local/init block
+        # beyond the query's real KV extent (combined with the block_table clamp above, no
+        # kernel can OOB on replay).
+        topk_idx = topk_idx.clamp(min=-1, max=max_blocks - 1).to(torch.int32)
 
         # 4) main sparse attention over the selected blocks
         o = flash_decode_bnsd_with_gqa_share_sparse(
