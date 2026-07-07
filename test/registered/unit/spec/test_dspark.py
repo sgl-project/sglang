@@ -1552,6 +1552,166 @@ class TestDSparkDeepSpecSemanticReference(CustomTestCase):
         )
         self.assertLess(max_abs, 1e-5)
 
+    def test_toy_decoder_block_hidden_feeds_identical_markov_candidates(self):
+        repo_root = Path(__file__).resolve().parents[5]
+        deepspec_root = repo_root / "DeepSpec"
+        if not deepspec_root.exists():
+            self.skipTest(f"DeepSpec checkout not found: {deepspec_root}")
+        sys.path.insert(0, str(deepspec_root))
+        try:
+            from deepspec.modeling.dspark.markov_head import VanillaMarkov
+            from sglang.srt.speculative.dspark_worker_v2 import DSparkWorkerV2
+        except Exception as e:
+            self.skipTest(f"DeepSpec/SGLang DSpark imports unavailable: {e}")
+
+        t = self.torch
+        t.manual_seed(5)
+        batch_size = 2
+        context_len = 4
+        block_size = 3
+        hidden_size = 8
+        mlp_size = 16
+        vocab_size = 31
+        markov_rank = 6
+        context_x = t.randn(batch_size, context_len, hidden_size)
+        block_x = t.randn(batch_size, block_size, hidden_size)
+        context_valid = t.tensor(
+            [
+                [True, True, False, True],
+                [True, False, True, True],
+            ],
+            dtype=t.bool,
+        )
+        context_positions = t.tensor([[30, 31, 32, 33], [70, 71, 72, 73]])
+        block_positions = t.tensor([[34, 35, 36], [74, 75, 76]])
+        full_positions = t.cat([context_positions, block_positions], dim=1)
+        full_valid = t.cat(
+            [
+                context_valid,
+                t.ones((batch_size, block_size), dtype=t.bool),
+            ],
+            dim=1,
+        )
+        layer1 = self._make_toy_decoder_layer_weights(hidden_size, mlp_size, seed=30)
+        layer2 = self._make_toy_decoder_layer_weights(hidden_size, mlp_size, seed=40)
+
+        full_l1 = self._toy_decoder_layer_full(
+            t.cat([context_x, block_x], dim=1),
+            full_positions,
+            full_valid,
+            layer1,
+        )
+        full_l2 = self._toy_decoder_layer_full(
+            full_l1,
+            full_positions,
+            full_valid,
+            layer2,
+        )
+        concat_block_hidden = full_l2[:, context_len:, :]
+
+        context_l1 = self._toy_decoder_layer_full(
+            context_x, context_positions, context_valid, layer1
+        )
+        block_l1 = self._toy_decoder_layer_incremental(
+            context_x,
+            block_x,
+            context_positions,
+            block_positions,
+            context_valid,
+            layer1,
+        )
+        incremental_block_hidden = self._toy_decoder_layer_incremental(
+            context_l1,
+            block_l1,
+            context_positions,
+            block_positions,
+            context_valid,
+            layer2,
+        )
+
+        class _LogitsProcessor:
+            def _compute_lm_head(self, hidden_states, head):
+                return head(hidden_states)
+
+        class _ConfidenceHead:
+            def __call__(self, hidden_states, markov_embeds):
+                return hidden_states.new_zeros(hidden_states.shape[:2])
+
+        lm_head = t.nn.Linear(hidden_size, vocab_size, bias=False)
+        markov_head = VanillaMarkov(vocab_size=vocab_size, markov_rank=markov_rank)
+        worker = DSparkWorkerV2.__new__(DSparkWorkerV2)
+        worker.block_size = block_size
+        worker.verify_stride = block_size + 1
+        worker.markov_rank = markov_rank
+        worker.noise_token_id = 0
+        worker._markov_refine_buffer_cap = 0
+        worker._markov_candidates_buf = None
+        worker._markov_embeds_buf = None
+        worker._vocab_shard_mapping_cache = {}
+        worker._accept_anomaly_enabled = False
+        worker._parity_dump_enabled = False
+        worker._last_markov_refine_debug = None
+        worker._draft_inner = SimpleNamespace(
+            vocab_size=vocab_size,
+            markov_head=markov_head,
+            confidence_head=_ConfidenceHead(),
+        )
+        worker.draft_model = SimpleNamespace(
+            lm_head=lm_head,
+            logits_processor=_LogitsProcessor(),
+        )
+        anchor_tokens = t.tensor([3, 17], dtype=t.int64)
+
+        concat_candidates, concat_confidence = DSparkWorkerV2._refine_block_markov(
+            worker,
+            block_hidden=concat_block_hidden,
+            anchor_tokens=anchor_tokens,
+        )
+        incremental_candidates, incremental_confidence = (
+            DSparkWorkerV2._refine_block_markov(
+                worker,
+                block_hidden=incremental_block_hidden,
+                anchor_tokens=anchor_tokens,
+            )
+        )
+
+        hidden_max_abs = float(
+            (concat_block_hidden - incremental_block_hidden).abs().max().item()
+        )
+        base_logits_max_abs = float(
+            (lm_head(concat_block_hidden) - lm_head(incremental_block_hidden))
+            .abs()
+            .max()
+            .item()
+        )
+        if os.getenv("SGLANG_DSPARK_TEST_VERBOSE", "0") == "1":
+            print(
+                "DSpark toy end-to-end parity debug: "
+                + json.dumps(
+                    {
+                        "case": "toy_decoder_block_hidden_to_markov_candidates",
+                        "candidate_match": bool(
+                            t.equal(concat_candidates, incremental_candidates)
+                        ),
+                        "confidence_match": bool(
+                            t.equal(concat_confidence, incremental_confidence)
+                        ),
+                        "hidden_max_abs_diff": hidden_max_abs,
+                        "base_logits_max_abs_diff": base_logits_max_abs,
+                        "concat_candidates": concat_candidates.tolist(),
+                        "incremental_candidates": incremental_candidates.tolist(),
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+
+        self.assertTrue(t.allclose(concat_block_hidden, incremental_block_hidden))
+        self.assertLess(hidden_max_abs, 1e-5)
+        self.assertLess(base_logits_max_abs, 1e-5)
+        self.assertEqual(concat_candidates.tolist(), incremental_candidates.tolist())
+        self.assertTrue(t.equal(concat_confidence, incremental_confidence))
+
     def test_markov_refine_matches_deepspec_across_shape_grid(self):
         repo_root = Path(__file__).resolve().parents[5]
         deepspec_root = repo_root / "DeepSpec"
