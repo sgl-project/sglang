@@ -35,6 +35,9 @@ from sglang.multimodal_gen.runtime.realtime.states import (
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.precision import (
+    autocast_enabled as precision_autocast_enabled,
+)
 
 logger = init_logger(__name__)
 
@@ -114,7 +117,9 @@ class CausalDMDDenoisingStage(DenoisingStage):
         target_dtype: torch.dtype,
         server_args: ServerArgs,
     ) -> bool:
-        return (target_dtype != torch.float32) and not server_args.disable_autocast
+        # precision-constraint: Causal denoising kernels are validated on bf16;
+        # do not replace this with user precision policy without auditing kernel support.
+        return precision_autocast_enabled(target_dtype, server_args.disable_autocast)
 
     def _prepare_frame_seq_length(self, h: int, w: int) -> int:
         patch_ratio = (
@@ -784,6 +789,7 @@ class CausalDMDDenoisingStage(DenoisingStage):
             prepare_model_input=prepare_model_input,
             progress_bar=progress_bar,
         )
+        # after clean latent is generated, fill the causal kv cache with a forward with clean latent as input
         self._update_causal_context_cache(
             batch,
             server_args,
@@ -1088,6 +1094,7 @@ class CausalDMDDenoisingStage(DenoisingStage):
         device,
         *,
         sequence_shard_enabled: bool = False,
+        kv_cache_size: int | None = None,
     ) -> None:
         """
         Initialize (but not fill) a Per-GPU KV cache aligned with the model assumptions.
@@ -1096,9 +1103,10 @@ class CausalDMDDenoisingStage(DenoisingStage):
             sequence_shard_enabled=sequence_shard_enabled
         )
         attention_head_dim = self.transformer.attention_head_dim
-        kv_cache_size = self._get_causal_kv_cache_size(
-            sequence_shard_enabled=sequence_shard_enabled
-        )
+        if kv_cache_size is None:
+            kv_cache_size = self._get_causal_kv_cache_size(
+                sequence_shard_enabled=sequence_shard_enabled
+            )
         self.causal_kv_cache = self._allocate_causal_kv_cache(
             batch_size=batch_size,
             kv_cache_size=kv_cache_size,

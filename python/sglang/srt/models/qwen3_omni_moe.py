@@ -31,9 +31,6 @@ from sglang.srt.configs.qwen3_omni import (
     Qwen3OmniMoeVisionEncoderConfig,
 )
 from sglang.srt.configs.qwen3_vl import Qwen3VLMoeConfig
-from sglang.srt.distributed import (
-    get_tensor_model_parallel_world_size,
-)
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -50,6 +47,7 @@ from sglang.srt.models.qwen3_vl_moe import (
     Qwen3VLMoeForConditionalGeneration,
     load_fused_expert_weights,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix, is_cpu, is_npu, logger
 
 _is_cpu = is_cpu()
@@ -104,7 +102,7 @@ class Qwen3OmniMoeAudioEncoderLayer(nn.Module):
         self.dropout = config.dropout
         self.activation_fn = ACT2FN[config.activation_function]
         self.activation_dropout = config.activation_dropout
-        tp_size = get_tensor_model_parallel_world_size()
+        tp_size = get_parallel().tp_size
         use_replicated = config.encoder_ffn_dim % tp_size != 0
         fc1_cls = ReplicatedLinear if use_replicated else ColumnParallelLinear
         fc2_cls = ReplicatedLinear if use_replicated else RowParallelLinear

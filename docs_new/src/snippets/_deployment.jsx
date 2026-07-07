@@ -23,8 +23,12 @@
 //   accuracyLabels     [key, label, unit][] — the eval set shown in the
 //                      benchmark card + "⚡ Reproduce". NO engine default:
 //                      required whenever benchmarks carry accuracy data
+//   latencyPercentile  optional, TEMPORARY — "Mean" | "P50" (default "P50"); the
+//                      percentile the TTFT/TPOT values are, shown as "TTFT (<pct>)".
+//                      Legacy "Mean" data is being re-measured to P50; drop once done
 //   multiNodeHints     optional — {[hwId]: string[]} prepended as `# ...` lines
-//   dockerImages       optional — per-hw image for `docker run` mode
+//   dockerImages       optional — `docker run` image, keyed by `hw|quant`
+//                      then `hw`; falls back to `lmsysorg/sglang:dev`
 //   github             optional — "Submit verified cell" issue-template overrides
 //   playgroundFeatures optional — consumed by _playground.jsx (see its header)
 //
@@ -127,6 +131,15 @@ export const Deployment = ({ config, benchmarks }) => {
       fontSize: "12px", lineHeight: "1.5",
       color: isDark ? "#e5e7eb" : "#374151",
       whiteSpace: "pre-wrap", overflowX: "auto", margin: 0,
+    },
+    // Amber callout under the command when speculative decoding (MTP) is on
+    // but --max-running-requests isn't set (SGLang then caps it at 48).
+    mtpWarn: {
+      margin: "8px 0 0", padding: "8px 12px", borderRadius: "8px",
+      fontSize: "12px", lineHeight: "1.45",
+      background: isDark ? "#78350f" : "#fef3c7",
+      color: isDark ? "#fde68a" : "#92400e",
+      border: `1px solid ${isDark ? "#92400e" : "#fcd34d"}`,
     },
     badge: (verified) => ({
       display: "inline-flex", alignItems: "center", gap: "6px",
@@ -491,19 +504,40 @@ export const Deployment = ({ config, benchmarks }) => {
 
     let cmd;
     if (mode === "docker") {
-      // Image picked by hardware; falls back to `:dev` if unmapped.
-      const image = (config.dockerImages && config.dockerImages[sel.hw]) || "lmsysorg/sglang:dev";
+      // Image keyed by `hw|quant` (most specific) then `hw`; `:dev` if unmapped.
+      const di = config.dockerImages || {};
+      const image = di[`${sel.hw}|${sel.quant}`] || di[sel.hw] || "lmsysorg/sglang:dev";
       const portFlag = flags.find((x) => x.split(/[\s=]/)[0] === "--port");
       const servePort = portFlag ? portFlag.slice("--port".length).trim() : "{{PORT}}";
+      const vendorOf = (hwId) => {
+        for (const [vendor, list] of Object.entries(HARDWARE_CATALOG)) {
+          if (list.some((h) => h.id === hwId)) return vendor;
+        }
+        const extra = (config.hardware || []).find((h) => h.id === hwId);
+        return (extra && extra.vendor) || "nvidia";
+      };
+      const gpuAccessLines = vendorOf(sel.hw) === "amd"
+        ? [
+            "docker run",
+            "  --device=/dev/kfd --device=/dev/dri",
+            "  --group-add video",
+            "  --cap-add=SYS_PTRACE --security-opt seccomp=unconfined",
+            "  --shm-size 32g",
+          ]
+        : [
+            "docker run --gpus all",
+            "  --shm-size 32g",
+          ];
       const dockerLines = [
-        "docker run --gpus all",
-        "  --shm-size 32g",
+        ...gpuAccessLines,
         // Multi-node needs host networking so the cross-node rendezvous port
         // (--dist-init-addr) and NCCL/GLOO traffic are reachable; single-node
         // just maps the serve port.
         multinode ? "  --network host" : `  -p ${servePort}:${servePort}`,
         "  -v ~/.cache/huggingface:/root/.cache/huggingface",
-        `  --env "HF_TOKEN={{HF_TOKEN}}"`,
+        // HF token only for gated checkpoints — configs that declare an HF_TOKEN placeholder.
+        ...(config.placeholders && config.placeholders.HF_TOKEN
+          ? [`  --env "HF_TOKEN={{HF_TOKEN}}"`] : []),
         ...cellEnv.map((e) => `  --env ${e}`),
         "  --ipc=host",
         `  ${image}`,
@@ -543,11 +577,14 @@ export const Deployment = ({ config, benchmarks }) => {
   const renderBenchmarkCard = (entry) => {
     // [key, label, unit, compute?]. Optional compute(measurement) supplies
     // derived metrics (preferred over measurement[key] when present).
+    const pct = config.latencyPercentile || "P50";
     const SPEED_LABELS = [
-      ["ttft_ms",                "TTFT",            "ms"],
-      ["tpot_ms",                "TPOT",            "ms"],
-      ["tokens_per_sec_per_gpu", "tokens/sec/GPU",  ""],
-      ["interactivity",          "interactivity",   "tok/s",
+      ["ttft_ms",                `TTFT (${pct})`,      "ms"],
+      ["tpot_ms",                `TPOT (${pct})`,      "ms"],
+      // throughput per gpu = total(input+output)/elapsed/GPU;
+      // stored directly in the benchmarks file (= output tok/s/GPU × (isl+osl)/osl).
+      ["tokens_per_sec_per_gpu", "throughput per gpu", "tok/s"],
+      ["interactivity",          "interactivity",   "tokens/s/user",
         (m) => (m.tpot_ms != null && m.tpot_ms !== 0)
           ? Math.round((1000 / m.tpot_ms) * 10) / 10
           : null],
@@ -637,7 +674,11 @@ export const Deployment = ({ config, benchmarks }) => {
             ])}
           </div>
           {legend && (
-            <div style={s.benchLegend}>{legend}</div>
+            <div style={s.benchLegend}>
+              {(Array.isArray(legend) ? legend : [legend]).map((line, i) => (
+                <div key={`legend-${i}`}>{line}</div>
+              ))}
+            </div>
           )}
         </div>
       );
@@ -662,7 +703,10 @@ export const Deployment = ({ config, benchmarks }) => {
       });
       return { title: "Speed", sharedText, colHeaders, rows,
                colCount: measurements.length,
-               legend: "interactivity = 1000 / TPOT(ms)" };
+               legend: [
+                 `throughput per gpu = (input+output tokens)/elapsed/GPU`,
+                 `interactivity = 1000/TPOT(ms) (tokens/s/user)`,
+               ] };
     };
 
     // One row per ACCURACY_LABELS entry with a non-null value; single value column.
@@ -904,6 +948,13 @@ export const Deployment = ({ config, benchmarks }) => {
   const s = makeStyles(isDark);
   const cell = findCell(config.cells, sel);
   const command = renderCommand(cell, sel, env, runMode);
+  // MTP hint: fire on the actual command (speculative decoding ON) — NOT on
+  // strategy=low-latency, since a low-latency cell may not enable MTP. SGLang
+  // resets --max-running-requests to 48 when spec is on and it's unset.
+  const mtpHint =
+    !!cell &&
+    (cell.flags || []).some((f) => f.split(/[\s=]/)[0] === "--speculative-algorithm") &&
+    !(cell.flags || []).some((f) => f.split(/[\s=]/)[0] === "--max-running-requests");
   const modelName = resolveModelName(sel);
   const curlText = interpolate(config.curl || "", env, modelName);
   const hwGroups = buildHardwareGroups();
@@ -1042,6 +1093,11 @@ export const Deployment = ({ config, benchmarks }) => {
             </div>
           </div>
           <pre style={s.commandPre}>{command}</pre>
+          {mtpHint && (
+            <div style={s.mtpWarn}>
+              ⚠️ Speculative decoding (MTP) is on — SGLang resets <code>--max-running-requests</code> to <strong>48</strong> when it isn't set. Add <code>--max-running-requests &lt;N&gt;</code> sized for your target concurrency.
+            </div>
+          )}
         </div>
       </div>
 

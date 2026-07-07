@@ -13,7 +13,7 @@ import torch.distributed as dist
 
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.environ import envs
-from sglang.srt.utils import is_npu
+from sglang.srt.utils import is_hip, is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.base.conn import KVArgs, StateType
@@ -30,6 +30,31 @@ if TYPE_CHECKING:
 # Constants & Enums
 #########################
 FAKE_BOOTSTRAP_HOST = "2.2.2.2"
+_IS_HIP = is_hip()
+
+
+def is_dsv4_c128_online_enabled() -> bool:
+    """Return whether DSV4 C128 uses request-scoped online state."""
+    return not _IS_HIP and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
+
+
+def get_dsv4_c128_state_indices(
+    req_pool_idx: int,
+    seq_len: int,
+    *,
+    online: bool,
+    ring_size: int,
+) -> np.ndarray:
+    """Return the PD transfer row/page indices for DSV4 C128 state."""
+    if seq_len == 0 or seq_len % 128 == 0:
+        return np.empty((0,), dtype=np.int32)
+    if online:
+        return np.array([int(req_pool_idx)], dtype=np.int32)
+
+    assert ring_size % 128 == 0, f"C128 ring_size must be 128-aligned, got {ring_size}"
+    pages_per_req = ring_size // 128
+    page = int(req_pool_idx) * pages_per_req + ((seq_len - 1) % ring_size) // 128
+    return np.array([page], dtype=np.int32)
 
 
 class DisaggregationMode(Enum):
@@ -312,10 +337,24 @@ class MetadataBuffers:
     def set_buf(self, req: Req):
 
         self.output_ids[req.metadata_buffer_index][0] = req.output_ids[0]
+        # The cached_tokens buffer is (size, 16); slots 0-3 hold cached token
+        # counts and slots 4-6 are reused for multimodal prompt token counts
+        # (slots 7-15 remain spare). This avoids adding new RDMA buffers.
+        # Slot map: 0=cached 1=device 2=host 3=storage 4=image 5=audio 6=video.
         self.cached_tokens[req.metadata_buffer_index][0] = req.cached_tokens
         self.cached_tokens[req.metadata_buffer_index][1] = req.cached_tokens_device
         self.cached_tokens[req.metadata_buffer_index][2] = req.cached_tokens_host
         self.cached_tokens[req.metadata_buffer_index][3] = req.cached_tokens_storage
+
+        # Compute multimodal prompt token counts on the prefill node so decode
+        # can report them in usage.
+        if req.multimodal_inputs:
+            image_t, audio_t, video_t = req.multimodal_inputs.compute_mm_token_counts()
+        else:
+            image_t = audio_t = video_t = 0
+        self.cached_tokens[req.metadata_buffer_index][4] = image_t
+        self.cached_tokens[req.metadata_buffer_index][5] = audio_t
+        self.cached_tokens[req.metadata_buffer_index][6] = video_t
         if req.return_logprob:
             if req.logprob.output_token_logprobs_val:  # not none or empty list
                 self.output_token_logprobs_val[req.metadata_buffer_index][0] = (
@@ -497,6 +536,16 @@ def get_kv_class(
     raise ValueError(f"Unsupported transfer backend: {transfer_backend}")
 
 
+def _get_cp_rank_page_bounds(
+    total_pages: int, cp_rank: int, cp_size: int
+) -> Tuple[int, int]:
+    base = total_pages // cp_size
+    rem = total_pages % cp_size
+    local_start = cp_rank * base + min(cp_rank, rem)
+    n_pages = base + (1 if cp_rank < rem else 0)
+    return local_start, local_start + n_pages
+
+
 def page_indices_to_cp_rank_page_indices(
     page_indices: np.ndarray,
     total_pages: int,
@@ -544,37 +593,35 @@ def page_indices_to_cp_rank_page_indices(
 
 
 def filter_kv_indices_for_cp_rank(
-    kv_mgr: CommonKVManager, kv_indices: np.ndarray, index_slice: slice
+    kv_mgr: CommonKVManager,
+    kv_indices: np.ndarray,
+    index_slice: slice,
+    total_pages: Optional[int] = None,
 ) -> Tuple[np.ndarray, slice]:
     """Filters kv_indices and index_slice for the current CP rank."""
-    total_pages = len(kv_indices)
+    if total_pages is None:
+        total_pages = len(kv_indices)
     cp_rank = kv_mgr.attn_cp_rank
     cp_size = kv_mgr.attn_cp_size
 
-    rank_page_indices = page_indices_to_cp_rank_page_indices(
-        page_indices=kv_indices,
-        total_pages=total_pages,
-        cp_rank=cp_rank,
-        cp_size=cp_size,
-    )
+    if cp_size <= 1:
+        return kv_indices, index_slice
 
-    if rank_page_indices.size == 0:
+    rank_start, rank_end = _get_cp_rank_page_bounds(total_pages, cp_rank, cp_size)
+    chunk_start = index_slice.start if index_slice.start is not None else 0
+    chunk_end = index_slice.stop if index_slice.stop is not None else total_pages
+    first_pos = max(rank_start, chunk_start) - chunk_start
+    last_pos = min(rank_end, chunk_end) - chunk_start
+
+    if last_pos <= first_pos:
         new_kv_indices = kv_indices[:0]
-        new_index_slice = slice(index_slice.start, index_slice.start)
+        new_index_slice = slice(chunk_start, chunk_start)
     else:
-        mask = np.isin(kv_indices, rank_page_indices)
-        if not mask.any():
-            new_kv_indices = kv_indices[:0]
-            new_index_slice = slice(index_slice.start, index_slice.start)
-        else:
-            first_pos = int(mask.argmax())
-            last_pos = len(mask) - int(mask[::-1].argmax())
-
-            new_kv_indices = kv_indices[first_pos:last_pos]
-            new_index_slice = slice(
-                index_slice.start + first_pos,
-                index_slice.start + last_pos,
-            )
+        new_kv_indices = kv_indices[first_pos:last_pos]
+        new_index_slice = slice(
+            chunk_start + first_pos,
+            chunk_start + last_pos,
+        )
     return new_kv_indices, new_index_slice
 
 
@@ -621,7 +668,11 @@ def setup_state_kv_args(
     from sglang.srt.disaggregation.base.conn import StateType
     from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
     from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
-    from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, HybridLinearKVPool
+    from sglang.srt.mem_cache.memory_pool import (
+        DSATokenToKVPool,
+        HybridLinearKVPool,
+        MiniMaxSparseKVPool,
+    )
 
     kv_args.state_types = []
     kv_args.state_data_ptrs = []
@@ -629,7 +680,16 @@ def setup_state_kv_args(
     kv_args.state_item_lens = []
     kv_args.state_dim_per_tensor = []
 
-    if hasattr(token_to_kv_pool, "get_state_buf_infos"):
+    if isinstance(token_to_kv_pool, MiniMaxSparseKVPool):
+        if token_to_kv_pool.index_kv_pool is not None:
+            raise NotImplementedError(
+                "PD disaggregation for MiniMax sparse layers with index value "
+                "(index_kv_pool) is not yet supported; only K-only sparse layers are."
+            )
+        if token_to_kv_pool.index_k_pool is not None:
+            dp, dl, il = token_to_kv_pool.get_index_k_state_buf_infos()
+            append_state_component(kv_args, StateType.MINIMAX_INDEX_K, dp, dl, il)
+    elif hasattr(token_to_kv_pool, "get_state_buf_infos"):
         data_ptrs, data_lens, item_lens = token_to_kv_pool.get_state_buf_infos()
 
         # DeepSeekV4TokenToKVPool inherits BaseSWAKVPool; its heterogeneous
@@ -653,6 +713,18 @@ def setup_state_kv_args(
                         ring_ptrs,
                         ring_lens,
                         ring_item_lens,
+                    )
+            if hasattr(token_to_kv_pool, "get_c128_state_buf_infos"):
+                c128_ptrs, c128_lens, c128_item_lens = (
+                    token_to_kv_pool.get_c128_state_buf_infos()
+                )
+                if c128_ptrs:
+                    append_state_component(
+                        kv_args,
+                        StateType.C128_STATE,
+                        c128_ptrs,
+                        c128_lens,
+                        c128_item_lens,
                     )
         elif isinstance(token_to_kv_pool, HybridLinearKVPool):
             dim = (

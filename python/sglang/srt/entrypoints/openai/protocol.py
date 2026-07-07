@@ -177,6 +177,20 @@ class PromptTokensDetails(BaseModel):
     """Details about prompt tokens."""
 
     cached_tokens: int = 0
+    # Multimodal prompt token counts (only populated when present in the prompt)
+    image_tokens: Optional[int] = None
+    audio_tokens: Optional[int] = None
+    video_tokens: Optional[int] = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        # Drop multimodal fields when absent so text-only/cache-only responses
+        # keep the original {"cached_tokens": N} shape.
+        for key in ("image_tokens", "audio_tokens", "video_tokens"):
+            if data.get(key) is None:
+                data.pop(key, None)
+        return data
 
 
 class UsageInfo(BaseModel):
@@ -342,10 +356,13 @@ class CompletionRequest(BaseModel):
     ignore_eos: bool = False
     skip_special_tokens: bool = True
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
+    session_id: Optional[str] = None
     session_params: Optional[Dict] = None
     response_format: Optional[Union[ResponseFormat, StructuralTagResponseFormat]] = None
     custom_params: Optional[Dict] = None
     custom_logit_processor: Optional[str] = None
+
+    images_config: Optional[Dict] = None
 
     # For PD disaggregation
     bootstrap_host: Optional[Union[List[str], str]] = None
@@ -712,6 +729,7 @@ class ChatCompletionRequest(BaseModel):
     continue_final_message: bool = False
     skip_special_tokens: bool = True
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
+    session_id: Optional[str] = None
     session_params: Optional[Dict] = None
     separate_reasoning: bool = True
     stream_reasoning: bool = True
@@ -721,6 +739,8 @@ class ChatCompletionRequest(BaseModel):
     max_dynamic_patch: Optional[int] = None
     min_dynamic_patch: Optional[int] = None
     use_audio_in_video: bool = False
+
+    images_config: Optional[Dict] = None
 
     # Custom logit processor for advanced sampling control
     custom_logit_processor: Optional[Union[List[Optional[str]], str]] = None
@@ -1377,6 +1397,7 @@ class ResponsesRequest(BaseModel):
         default_factory=lambda: f"resp_{uuid.uuid4().hex}",
         description="The request_id related to this request. If the caller does not set it, a random uuid will be generated.",
     )
+    session_id: Optional[str] = None
     priority: int = Field(default=0, description="Request priority")
     extra_key: Optional[str] = Field(
         default=None,

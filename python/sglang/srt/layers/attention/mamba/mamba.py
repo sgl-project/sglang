@@ -10,8 +10,6 @@ from sglang.srt.configs.mamba_utils import (
 )
 from sglang.srt.distributed import (
     divide,
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
 )
 from sglang.srt.layers.attention.mamba.mamba2_metadata import Mamba2Metadata
 from sglang.srt.layers.attention.mamba.mixer2_rms_norm_gated import Mixer2RMSNormGated
@@ -20,8 +18,6 @@ from sglang.srt.layers.attention.mamba.ops import (
     selective_state_update,
 )
 from sglang.srt.layers.dp_attention import (
-    get_attention_tp_rank,
-    get_attention_tp_size,
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.linear import (
@@ -36,6 +32,7 @@ from sglang.srt.model_loader.weight_utils import (
     composed_weight_loader,
     sharded_weight_loader,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import (
     is_cpu,
     is_cuda,
@@ -232,11 +229,11 @@ class MambaMixer2(torch.nn.Module):
         # - NOTE: currently for the world size DOES NOT divide groups
         #   case, we only support the case when n_groups == 1
         if is_dp_attention_enabled():
-            self.tp_size = get_attention_tp_size()
-            self.tp_rank = get_attention_tp_rank()
+            self.tp_size = get_parallel().attn_tp_size
+            self.tp_rank = get_parallel().attn_tp_rank
         else:
-            self.tp_size = get_tensor_model_parallel_world_size()
-            self.tp_rank = get_tensor_model_parallel_rank()
+            self.tp_size = get_parallel().tp_size
+            self.tp_rank = get_parallel().tp_rank
 
         self.num_heads = num_heads = cache_params.shape.num_heads
         self.head_dim = cache_params.shape.head_dim
@@ -451,6 +448,7 @@ class MambaMixer2(torch.nn.Module):
         forward_batch: ForwardBatch,
         mup_vector: Optional[torch.Tensor] = None,
         use_triton_causal_conv: bool = False,
+        should_allreduce_fusion: bool = False,
     ):
         # Returns the projected result. When `output` is given it is also
         # written into that buffer (required by the cuda-graph split ops, which
@@ -763,7 +761,9 @@ class MambaMixer2(torch.nn.Module):
         # norm usage
         hidden_states = self.norm(preallocated_ssm_out, gate)
 
-        mixer_out, _ = self.out_proj(hidden_states)
+        mixer_out, _ = self.out_proj(
+            hidden_states, skip_all_reduce=should_allreduce_fusion
+        )
         if output is not None:
             output[:padded_num_tokens].copy_(mixer_out)
 

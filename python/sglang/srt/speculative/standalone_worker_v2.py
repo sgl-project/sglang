@@ -104,6 +104,15 @@ class StandaloneDraftWorker(EagleDraftWorker):
         )
         self.tree_mask_mode = TreeMaskMode.FULL_MASK
         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
+        # draft_forward reads this (set in EagleDraftWorker.__init__, skipped here).
+        self.index_share_for_mtp_iteration = (
+            getattr(
+                self.draft_runner.model_config.hf_config,
+                "index_share_for_mtp_iteration",
+                False,
+            )
+            and self.topk == 1
+        )
 
     def alloc_memory_pool(
         self,
@@ -122,11 +131,17 @@ class StandaloneDraftWorker(EagleDraftWorker):
         self.init_token_map()
         self.init_lm_head()
 
-    def init_backends(self):
+    def init_attention_backends(self):
         with self.draft_tp_context(
             self.draft_runner.tp_group
         ), speculative_moe_backend_context():
-            super().init_backends()
+            super().init_attention_backends()
+
+    def init_cuda_graphs(self):
+        with self.draft_tp_context(
+            self.draft_runner.tp_group
+        ), speculative_moe_backend_context():
+            super().init_cuda_graphs()
 
     def init_lm_head(self):
         """Override to prevent sharing embeddings and lm_head with target model."""
@@ -178,6 +193,11 @@ class StandaloneWorkerV2(EAGLEWorkerV2):
             target_worker,
         )
 
+        self._validate_vocab_compatibility(
+            target_vocab_size=target_worker.model_runner.model_config.vocab_size,
+            target_tokenizer=target_worker.tokenizer,
+        )
+
         # Some dummy tensors
         self.num_new_pages_per_topk = torch.empty(
             (), dtype=torch.int64, device=self.device
@@ -188,3 +208,35 @@ class StandaloneWorkerV2(EAGLEWorkerV2):
 
         # TODO: Adaptive speculative
         self.adaptive_controller: Optional[AdaptiveController] = None
+
+    def _validate_vocab_compatibility(
+        self,
+        target_vocab_size: int,
+        target_tokenizer,
+    ) -> None:
+        """Raise ValueError if the draft and target vocabularies are incompatible."""
+        draft_vocab_size = self._draft_worker.draft_runner.model_config.vocab_size
+        draft_tokenizer = self._draft_worker.draft_worker.tokenizer
+        if target_vocab_size != draft_vocab_size:
+            raise ValueError(
+                f"STANDALONE speculative decoding requires the draft model to share the "
+                f"same vocabulary as the target model, but got "
+                f"target vocab_size={target_vocab_size} and "
+                f"draft vocab_size={draft_vocab_size}. "
+                f"Use a draft model with a matching vocabulary, or a speculative "
+                f"algorithm that supports heterogeneous vocabularies."
+            )
+        if (
+            target_tokenizer is not None
+            and draft_tokenizer is not None
+            and hasattr(target_tokenizer, "get_vocab")
+            and hasattr(draft_tokenizer, "get_vocab")
+            and target_tokenizer.get_vocab() != draft_tokenizer.get_vocab()
+        ):
+            raise ValueError(
+                "STANDALONE speculative decoding requires the draft model to share the "
+                "same vocabulary as the target model, but the two tokenizers have "
+                "different token-to-id mappings even though their vocab sizes match. "
+                "Use a draft model with a matching vocabulary, or a speculative "
+                "algorithm that supports heterogeneous vocabularies."
+            )
