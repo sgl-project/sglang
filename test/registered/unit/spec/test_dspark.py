@@ -326,6 +326,75 @@ class TestDSparkDraftInputBatch(CustomTestCase):
         self.assertEqual(a.hidden_valid_mask.tolist(), [[True], [True]])
         self.assertEqual(a.prefill_tail_hidden_states.tolist(), [[[3.0]], [[1.0]]])
 
+    def test_merge_preserves_existing_hidden_payload_when_peer_payload_empty(self):
+        t = self.torch
+        a = self.cls(
+            bonus_tokens=t.tensor([10], dtype=t.int64),
+            new_seq_lens=t.tensor([100], dtype=t.int64),
+            hidden_states=t.tensor([[1.0, 2.0]]),
+            hidden_valid_mask=t.tensor([[True, False]]),
+            prefill_tail_hidden_states=t.tensor([[[3.0, 4.0]]]),
+            prefill_tail_valid_mask=t.tensor([[True]]),
+            transfer_warmup_rounds=t.tensor([1], dtype=t.int32),
+        )
+        b = self.cls(
+            bonus_tokens=t.tensor([11], dtype=t.int64),
+            new_seq_lens=t.tensor([101], dtype=t.int64),
+            transfer_warmup_rounds=t.tensor([0], dtype=t.int32),
+        )
+
+        a.merge_batch(b)
+
+        self.assertEqual(a.bonus_tokens.tolist(), [10, 11])
+        self.assertEqual(a.hidden_states.tolist(), [[1.0, 2.0]])
+        self.assertEqual(a.hidden_valid_mask.tolist(), [[True, False]])
+        self.assertEqual(a.prefill_tail_hidden_states.tolist(), [[[3.0, 4.0]]])
+        self.assertEqual(a.prefill_tail_valid_mask.tolist(), [[True]])
+        self.assertEqual(a.transfer_warmup_rounds.tolist(), [1, 0])
+
+    def test_merge_adopts_peer_hidden_payload_when_self_payload_empty(self):
+        t = self.torch
+        a = self.cls(
+            bonus_tokens=t.tensor([10], dtype=t.int64),
+            new_seq_lens=t.tensor([100], dtype=t.int64),
+            transfer_warmup_rounds=t.tensor([1], dtype=t.int32),
+        )
+        b = self.cls(
+            bonus_tokens=t.tensor([11], dtype=t.int64),
+            new_seq_lens=t.tensor([101], dtype=t.int64),
+            hidden_states=t.tensor([[5.0, 6.0]]),
+            hidden_valid_mask=t.tensor([[False, True]]),
+            prefill_tail_hidden_states=t.tensor([[[7.0, 8.0]]]),
+            prefill_tail_valid_mask=t.tensor([[True]]),
+            transfer_warmup_rounds=t.tensor([0], dtype=t.int32),
+        )
+
+        a.merge_batch(b)
+
+        self.assertEqual(a.bonus_tokens.tolist(), [10, 11])
+        self.assertEqual(a.hidden_states.tolist(), [[5.0, 6.0]])
+        self.assertEqual(a.hidden_valid_mask.tolist(), [[False, True]])
+        self.assertEqual(a.prefill_tail_hidden_states.tolist(), [[[7.0, 8.0]]])
+        self.assertEqual(a.prefill_tail_valid_mask.tolist(), [[True]])
+        self.assertEqual(a.transfer_warmup_rounds.tolist(), [1, 0])
+
+    def test_merge_drops_reserved_lengths_when_peer_missing_reserved_lengths(self):
+        a = self.cls(
+            bonus_tokens=self.torch.tensor([10], dtype=self.torch.int64),
+            new_seq_lens=self.torch.tensor([100], dtype=self.torch.int64),
+            reserved_seq_lens_cpu=self.torch.tensor([120], dtype=self.torch.int32),
+            reserved_seq_lens_sum=120,
+        )
+        b = self.cls(
+            bonus_tokens=self.torch.tensor([11], dtype=self.torch.int64),
+            new_seq_lens=self.torch.tensor([101], dtype=self.torch.int64),
+        )
+
+        a.merge_batch(b)
+
+        self.assertIsNone(a.reserved_seq_lens_cpu)
+        self.assertIsNone(a.reserved_seq_lens_sum)
+
     def test_future_indices_merge_requires_peer_future_indices(self):
         a = self.cls(
             bonus_tokens=self.torch.tensor([10], dtype=self.torch.int64),
@@ -631,6 +700,57 @@ class TestDSparkPrefillHandoff(CustomTestCase):
 
         self.assertEqual(anchors.tolist(), [11, 20, 300, 999])
 
+    def test_decode_anchor_tokens_handles_malformed_reqs_and_missing_fallbacks(self):
+        t = self.torch
+        worker = self._worker(0)
+        worker.noise_token_id = 777
+
+        class _BadReq:
+            @property
+            def origin_input_ids(self):
+                raise RuntimeError("bad origin")
+
+            @property
+            def output_ids(self):
+                raise RuntimeError("bad output")
+
+        batch = SimpleNamespace(
+            reqs=[
+                _BadReq(),
+                SimpleNamespace(origin_input_ids=[], output_ids=[]),
+                SimpleNamespace(origin_input_ids=[5], output_ids=[6]),
+            ],
+            seq_lens_cpu=[1, 0, 99],
+        )
+
+        anchors = self.worker_cls._get_decode_anchor_tokens(
+            worker,
+            batch=batch,
+            prefix_lens=t.tensor([1, 0, 99], dtype=t.int64),
+            fallback_tokens=t.tensor([1000, 1001], dtype=t.int64),
+            prefer_fallback_tokens=t.tensor([False, False], dtype=t.bool),
+            bs=3,
+            device=t.device("cpu"),
+        )
+
+        self.assertEqual(anchors.tolist(), [777, 777, 6])
+
+    def test_prefill_next_input_defaults_empty_tail_payloads(self):
+        t = self.torch
+        worker = self._worker(2)
+
+        draft_input = self.worker_cls._make_next_draft_input_prefill(
+            worker,
+            bonus_tokens=t.tensor([1, 2], dtype=t.int32),
+            seq_lens=t.tensor([10, 11], dtype=t.int32),
+        )
+
+        self.assertEqual(draft_input.bonus_tokens.dtype, t.int64)
+        self.assertEqual(draft_input.new_seq_lens.dtype, t.int64)
+        self.assertEqual(tuple(draft_input.prefill_tail_hidden_states.shape), (0, 0, 0))
+        self.assertEqual(tuple(draft_input.prefill_tail_valid_mask.shape), (0, 0))
+        self.assertEqual(draft_input.transfer_warmup_rounds.tolist(), [2, 2])
+
     def test_decode_next_input_carries_warmup_rounds(self):
         t = self.torch
         draft_input = self.worker_cls._make_next_draft_input_decode(
@@ -892,6 +1012,7 @@ class TestDSparkRuntimeDebugEvidence(CustomTestCase):
         worker._swa_write_source_snapshot_by_req_pool = None
         worker._prefill_tail_replay_debug_by_req_pool = {}
         worker._target_aux_debug_by_req_pool = {}
+        worker._boundary_debug_by_req_pool = {}
         worker._is_tp0 = lambda: True
         return worker
 
@@ -999,6 +1120,29 @@ class TestDSparkRuntimeDebugEvidence(CustomTestCase):
         self.assertEqual(source_debug["counts"]["decode_verify_write"], 3)
         self.assertEqual(source_debug["counts"]["unknown"], 1)
 
+    def test_visible_window_source_debug_prefers_snapshot_and_handles_empty(self):
+        worker = self._worker()
+        worker._swa_write_source_by_req_pool = {
+            1: {10: "live_source", 11: "live_source"}
+        }
+        worker._swa_write_source_snapshot_by_req_pool = {
+            1: {10: "snapshot_source", 12: "snapshot_source"}
+        }
+
+        self.assertIsNone(self.worker_cls._visible_window_source_debug(worker, 1, []))
+        source_debug = self.worker_cls._visible_window_source_debug(
+            worker,
+            1,
+            [10, 11, 12],
+            max_sources=2,
+        )
+
+        self.assertEqual(source_debug["visible_len"], 3)
+        self.assertEqual(source_debug["sources_first"], ["snapshot_source", "unknown"])
+        self.assertEqual(source_debug["sources_last"], ["unknown", "snapshot_source"])
+        self.assertEqual(source_debug["counts"]["snapshot_source"], 2)
+        self.assertEqual(source_debug["counts"]["unknown"], 1)
+
     def test_record_full_cache_locs_source_uses_swa_translation(self):
         t = self.torch
         worker = self._worker()
@@ -1026,6 +1170,83 @@ class TestDSparkRuntimeDebugEvidence(CustomTestCase):
                 13: "decode_verify_write",
             },
         )
+
+    def test_boundary_debug_records_history_and_write_sources(self):
+        t = self.torch
+        worker = self._worker()
+
+        class _TokenToKVPool:
+            def translate_loc_from_full_to_swa(self, locs):
+                return locs + 100
+
+        worker.draft_model_runner = SimpleNamespace(
+            attn_backend=SimpleNamespace(token_to_kv_pool=_TokenToKVPool())
+        )
+        for i in range(18):
+            self.worker_cls._record_boundary_debug(
+                worker,
+                req_pool_idx=4,
+                stage="decode_verify_write",
+                positions=t.tensor([i], dtype=t.int64),
+                cache_locs=t.tensor([i + 10], dtype=t.int64),
+                hidden_rows=t.tensor([[float(i), 1.0]]),
+                extra={"round": i},
+            )
+
+        debug = worker._boundary_debug_by_req_pool[4]
+        history = debug["decode_verify_write_history"]
+        self.assertEqual(len(history), 16)
+        self.assertEqual(history[0]["round"], 2)
+        self.assertEqual(history[-1]["round"], 17)
+        self.assertEqual(
+            worker._swa_write_source_by_req_pool[4][127],
+            "decode_verify_write",
+        )
+
+        self.worker_cls._record_boundary_debug(
+            worker,
+            req_pool_idx=5,
+            stage="decode_tail_replay",
+            positions=t.tensor([1], dtype=t.int64),
+            cache_locs=t.tensor([2], dtype=t.int64),
+            hidden_rows=t.tensor([[1.0, 2.0]]),
+        )
+        self.assertEqual(
+            worker._swa_write_source_by_req_pool[5][102],
+            "prefill_tail_replay",
+        )
+
+    def test_record_target_aux_debug_respects_gate_and_records_errors(self):
+        t = self.torch
+        worker = self._worker()
+        worker._accept_anomaly_enabled = False
+        worker._draft_inner = SimpleNamespace(
+            target_layer_ids=[0],
+            hidden_size=2,
+            main_norm=None,
+            shared_head=None,
+        )
+
+        self.worker_cls._record_target_aux_debug(
+            worker,
+            req_pool_idx=1,
+            stage="gated",
+            raw_hidden_rows=t.ones((1, 2)),
+            projected_rows=t.ones((1, 2)),
+        )
+        self.assertEqual(worker._target_aux_debug_by_req_pool, {})
+
+        worker._accept_anomaly_enabled = True
+        worker.device = "not-a-device"
+        self.worker_cls._record_target_aux_debug(
+            worker,
+            req_pool_idx=1,
+            stage="error_stage",
+            raw_hidden_rows=t.ones((1, 2)),
+            projected_rows=t.ones((1, 2)),
+        )
+
+        self.assertIn("error", worker._target_aux_debug_by_req_pool[1]["error_stage"])
 
     def test_prefill_tail_replay_debug_records_payload_shape_and_mask_counts(self):
         t = self.torch
