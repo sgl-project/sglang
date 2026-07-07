@@ -101,6 +101,10 @@ pub async fn serve(
         .route("/get_model_info", get(model_info))
         .route("/model_info", get(model_info))
         .route("/v1/models", get(openai::available_models))
+        // TODO(auth): no API-key boundary yet. The Python server gates every route
+        // (except /health*, /metrics*, OPTIONS) with `add_api_key_middleware`
+        // (`api_key` / `admin_api_key`); until that is ported here, a configured
+        // `api_key` does NOT protect these routes.
         .with_state(state);
 
     // The listener was already bound synchronously in `runtime::start` (so a port
@@ -492,21 +496,18 @@ async fn model_info(State(state): State<AppState>) -> Response {
         .into_response()
 }
 
-/// `GET /server_info` — shapes the scheduler's `GetInternalStateReqOutput` the
-/// way `tokenizer_control_mixin.get_internal_state` does: lift `server_args` to
-/// the top, drop null fields, merge (internal-state fields win on collision).
+/// `GET /server_info` — surface only an allowlist ([`INTERNAL_STATE_ALLOWLIST`] +
+/// curated [`ServerArgs`] accessors), never the scheduler's raw server-args dump,
+/// which embeds `api_key`/`admin_api_key` (see [`shape_server_info`]).
 ///
-/// TODO(server_info): the original Python endpoint also includes `version`,
-/// `kv_events`, and scheduler init info (`max_total_num_tokens`,
-/// `max_req_input_len`). Those are dropped for now — add them here once the
-/// values are plumbed through (e.g. captured at `Server.start` / a richer
-/// scheduler response).
+/// TODO(server_info): the Python endpoint also includes `version` and `kv_events`;
+/// add them once plumbed through (captured at `Server.start` / a richer response).
 async fn server_info(State(state): State<AppState>) -> Response {
     let bytes = match await_control_result(&state, "GetInternalStateReq").await {
         Ok(b) => b,
         Err(resp) => return resp,
     };
-    match shape_server_info(&bytes) {
+    match shape_server_info(&bytes, &state.server_args) {
         Ok(json) => (StatusCode::OK, [("content-type", "application/json")], json).into_response(),
         Err(e) => {
             tracing::error!(error = %e, "server_info: shaping failed");
@@ -519,24 +520,48 @@ async fn server_info(State(state): State<AppState>) -> Response {
     }
 }
 
-fn shape_server_info(msgpack: &[u8]) -> Result<Vec<u8>, String> {
-    // Decode the msgpack named map directly into a JSON object.
+/// Runtime-metric keys the scheduler's `get_internal_state` adds on top of the
+/// server-args dump. We copy ONLY these out of `internal_state` — an allowlist, so
+/// the co-mingled `api_key`/`admin_api_key` (and any secret added later) can never
+/// reach the response.
+const INTERNAL_STATE_ALLOWLIST: &[&str] = &[
+    "last_gen_throughput",
+    "memory_usage",
+    "effective_max_running_requests_per_dp",
+    "avg_spec_accept_length",
+    "step_time_dict",
+];
+
+fn shape_server_info(msgpack: &[u8], server_args: &ServerArgs) -> Result<Vec<u8>, String> {
+    // GetInternalStateReqOutput asdict → `{ "internal_state": { server-args dump +
+    // metrics }, ... }`. Pull that inner map out (it is NOT safe to expose whole).
     let mut obj: serde_json::Map<String, serde_json::Value> =
         rmp_serde::from_slice(msgpack).map_err(|e| e.to_string())?;
-
-    // server_args = res.pop("server_args", {})
-    let mut merged = match obj.remove("server_args") {
+    let internal = match obj.remove("internal_state") {
         Some(serde_json::Value::Object(m)) => m,
         _ => serde_json::Map::new(),
     };
-    // res = {k: v for k, v in res.items() if v is not None}; merged = server_args | res
-    for (k, v) in obj {
-        if !v.is_null() {
-            merged.insert(k, v);
+
+    // Copy only the allowlisted runtime metrics — never the raw server-args dump.
+    let mut state_out = serde_json::Map::new();
+    for &k in INTERNAL_STATE_ALLOWLIST {
+        match internal.get(k) {
+            Some(v) if !v.is_null() => {
+                state_out.insert(k.to_string(), v.clone());
+            }
+            _ => {}
         }
     }
 
-    let response = serde_json::json!({ "internal_states": [serde_json::Value::Object(merged)] });
+    // Top-level non-secret config from typed accessors — these structurally cannot
+    // surface a key field, unlike the raw dump.
+    let response = serde_json::json!({
+        "model_path": server_args.model_path(),
+        "served_model_name": server_args.served_model_name(),
+        "tokenizer_path": server_args.tokenizer_path(),
+        "max_context_length": server_args.context_len(),
+        "internal_states": [serde_json::Value::Object(state_out)],
+    });
     serde_json::to_vec(&response).map_err(|e| e.to_string())
 }
 
@@ -889,6 +914,66 @@ mod logprob_shape_tests {
             .is_none()
         );
         assert!(abort_error_response(&None).is_none());
+    }
+}
+
+#[cfg(test)]
+mod server_info_tests {
+    use super::*;
+
+    /// The scheduler's `internal_state` embeds the full server-args dump (incl.
+    /// `api_key`/`admin_api_key`). `/server_info` must surface only the allowlisted
+    /// runtime metrics + curated config — never the secrets — and must not re-nest
+    /// the dump under `internal_states[].internal_state`.
+    #[test]
+    fn shape_server_info_excludes_secrets_and_dump() {
+        // GetInternalStateReqOutput.asdict → { "internal_state": { …dump+metrics… } }.
+        let internal = rmpv::Value::Map(vec![
+            (
+                rmpv::Value::from("api_key"),
+                rmpv::Value::from("secret-token"),
+            ),
+            (
+                rmpv::Value::from("admin_api_key"),
+                rmpv::Value::from("admin-token"),
+            ),
+            (rmpv::Value::from("model_path"), rmpv::Value::from("/m")),
+            (
+                rmpv::Value::from("last_gen_throughput"),
+                rmpv::Value::from(1.5),
+            ),
+            (
+                rmpv::Value::from("effective_max_running_requests_per_dp"),
+                rmpv::Value::from(32),
+            ),
+        ]);
+        let outer = rmpv::Value::Map(vec![(rmpv::Value::from("internal_state"), internal)]);
+        let mut msgpack = Vec::new();
+        rmpv::encode::write_value(&mut msgpack, &outer).unwrap();
+
+        let sa =
+            ServerArgs::from_json(r#"{"model_path": "/m", "api_key": "secret-token"}"#).unwrap();
+        let out = shape_server_info(&msgpack, &sa).unwrap();
+        let text = String::from_utf8(out.clone()).unwrap();
+        // No secret leaks anywhere in the serialized response.
+        assert!(!text.contains("secret-token"), "api_key leaked: {text}");
+        assert!(
+            !text.contains("admin-token"),
+            "admin_api_key leaked: {text}"
+        );
+
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        // Allowlisted metric surfaced; the whole dump did not.
+        let state0 = &v["internal_states"][0];
+        assert_eq!(state0["last_gen_throughput"], 1.5);
+        assert_eq!(state0["effective_max_running_requests_per_dp"], 32);
+        assert!(
+            state0.get("internal_state").is_none(),
+            "must not re-nest the dump under internal_state"
+        );
+        assert!(state0.get("api_key").is_none());
+        // Curated top-level config comes from typed accessors, not the dump.
+        assert_eq!(v["model_path"], "/m");
     }
 }
 
