@@ -3200,7 +3200,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
         page_chunk_size = max(1, chunk_size // self.page_size)
         for layer_id in range(self.layer_num):
             if self.skip_topk_layers[layer_id]:
-                index_k_cpu.append(None)
+                index_k_cpu.append([])
                 continue
             index_k_cpu.append([])
             for i in range(0, len(page_indices), page_chunk_size):

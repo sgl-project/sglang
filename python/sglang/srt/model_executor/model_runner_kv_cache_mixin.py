@@ -853,7 +853,7 @@ class ModelRunnerKVCacheMixin:
                 pool_kwargs["host_to_device_ratio"] = parse_hisparse_config(
                     self.server_args
                 ).host_to_device_ratio
-            else:
+            elif not self.is_draft_worker:
                 pool_kwargs["skip_topk_layers"] = [
                     dsa_layer_skips_topk(self.model_config.hf_config, layer_id)
                     for layer_id in range(self.start_layer, self.end_layer)

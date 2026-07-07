@@ -210,7 +210,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 element_size = torch._utils._element_size(
                     DSATokenToKVPool.index_k_with_scale_buffer_dtype
                 )
-                if mr.enable_hisparse:
+                if mr.enable_hisparse or mr.is_draft_worker:
                     num_indexer_layers = num_layers
                 else:
                     num_indexer_layers = sum(
