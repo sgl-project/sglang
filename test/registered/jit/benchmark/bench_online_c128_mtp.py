@@ -43,7 +43,6 @@ class BenchmarkCase:
     seq_lens: torch.Tensor
     req_pool_indices: torch.Tensor
     req_to_token: torch.Tensor
-    full_to_swa: torch.Tensor
     ape: torch.Tensor
     state: torch.Tensor
     layer_bs: int
@@ -86,10 +85,6 @@ def make_case(batch_size: int, num_verify_tokens: int) -> BenchmarkCase:
     req_to_token = make_req_to_token(batch_size, max_seq_len, num_chunks)
 
     num_full_locs = batch_size * num_chunks
-    full_to_swa = (
-        torch.arange(num_full_locs, dtype=torch.int64, device=DEFAULT_DEVICE)
-        * SWA_PAGE_SIZE
-    )
 
     state_slot_stride = num_full_locs
     state = torch.empty(
@@ -112,7 +107,6 @@ def make_case(batch_size: int, num_verify_tokens: int) -> BenchmarkCase:
         seq_lens=seq_lens,
         req_pool_indices=req_pool_indices,
         req_to_token=req_to_token,
-        full_to_swa=full_to_swa,
         ape=ape,
         state=state,
         layer_bs=batch_size,
@@ -127,11 +121,9 @@ def call_write_prefix(module, case: BenchmarkCase) -> None:
         case.seq_lens,
         case.req_pool_indices,
         case.req_to_token,
-        case.full_to_swa,
         case.ape,
         case.state,
         case.layer_bs,
-        SWA_PAGE_SIZE,
         case.num_verify_tokens,
         case.state_slot_stride,
     )
@@ -153,8 +145,10 @@ def call_write_prefix(module, case: BenchmarkCase) -> None:
 def benchmark(
     batch_size: int, num_verify_tokens: int, launch_mode: str
 ) -> tuple[float, float, float]:
-    module = _jit_online_c128_mtp_module(HEAD_DIM)
     case = make_case(batch_size, num_verify_tokens)
+    module = _jit_online_c128_mtp_module(
+        HEAD_DIM, case.seq_lens.dtype, case.req_pool_indices.dtype
+    )
     fn = lambda: call_write_prefix(module, case)
 
     if launch_mode == "cuda_graph":
