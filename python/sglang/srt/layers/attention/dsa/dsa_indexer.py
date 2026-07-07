@@ -78,7 +78,13 @@ if _use_aiter and not _use_aiter_preshuffle:
         "falling back to legacy page_size=1 / KVBlockSize=1 path."
     )
 if not is_npu():
-    from sglang.srt.layers.attention.dsa.utils import cutedsl_paged_mqa_logits
+    from sglang.srt.layers.attention.dsa.utils import (
+        aiter_can_use_preshuffle_paged_mqa,
+        cutedsl_paged_mqa_logits,
+        is_dsa_enable_prefill_cp,
+        is_dsa_prefill_cp_in_seq_split,
+        is_graph_dsa_split_op_surface,
+    )
 if _is_cuda:
     try:
         import deep_gemm
