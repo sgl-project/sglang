@@ -58,8 +58,10 @@ QWEN3_6_27B_3K5_1K5_OTHER_ARGS = [
     8,
     16,
     32,
-    48,
-    64,
+    40,
+    45,
+    50,
+    54,
     "--enable-multimodal",
     "--quantization",
     "modelslim",
@@ -77,6 +79,10 @@ QWEN3_6_27B_3K5_1K5_OTHER_ARGS = [
     1,
     "--speculative-num-draft-tokens",
     4,
+    "--reasoning-parser",
+    "qwen3",
+    "--tool-call-parser",
+    "qwen3_coder",
 ]
 
 
@@ -107,11 +113,17 @@ class TestNPUQwen3_6_27B_1P_In3k5_Out1k5_gpqa(TestNpuAccuracyTestCaseBase):
     model = QWEN3_6_27B_W8A8_MODEL_PATH
     envs = QWEN3_6_27B_3K5_1K5_ENVS
     other_args = QWEN3_6_27B_3K5_1K5_OTHER_ARGS
-    accuracy = 0.855
+    accuracy = 0.878
     datasets = ["gpqa_diamond"]
     few_shot_num = 0
     eval_batch_size = 8
-    generation_config = {"max_tokens": 81920, "temperature": 1.0}
+    generation_config = {
+        "max_tokens": 81920,
+        "temperature": 1.0,
+        "extra_body": {
+            "chat_template_kwargs": {"enable_thinking": True},
+        },
+    }
 
     def test_accuracy(self):
         self.run_accuracy()
