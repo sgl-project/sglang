@@ -450,8 +450,8 @@ class HiSparseCoordinator:
 
     def alloc_device_buffer(self, req: Req) -> None:
         if self.is_dsv4_hisparse:
-            allocated_len = req.extend_range.end
-            alloc_size = self.padded_buffer_size
+            allocated_len = req.kv_allocated_len
+            alloc_size = self._device_buffer_alloc_size(allocated_len)
         else:
             allocated_len = req.kv_allocated_len
             page_size = self.mem_pool_device.page_size
