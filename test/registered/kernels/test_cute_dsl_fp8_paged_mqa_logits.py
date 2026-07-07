@@ -164,22 +164,27 @@ def _run_cutedsl_paged_mqa_logits(
         dsl_expand_factor, dsl_atom = 1, 1
 
     context_lens = data["context_lens"]
-    expanded_ctx = (
-        context_lens.unsqueeze(-1)
-        - next_n
-        + torch.arange(1, next_n + 1, device=context_lens.device, dtype=torch.int32)
-    ).flatten()
-    schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-        expanded_ctx.unsqueeze(-1), BLOCK_KV, num_sms
+    dsl_atom_split = dsl_expand_factor > 1 and next_n == dsl_expand_factor * dsl_atom
+    ctx_lens_1d = (
+        context_lens.repeat_interleave(dsl_expand_factor)
+        if dsl_atom_split
+        else context_lens
     )
-    block_tables_expanded = data["block_table"].repeat_interleave(next_n, dim=0)
+    schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
+        ctx_lens_1d.unsqueeze(-1), BLOCK_KV, num_sms
+    )
+    block_tables_dsl = (
+        data["block_table"].repeat_interleave(dsl_expand_factor, dim=0)
+        if dsl_atom_split
+        else data["block_table"].repeat_interleave(next_n, dim=0)
+    )
 
     return cutedsl_paged_mqa_logits(
         data["q_fp8"].view(batch_size * next_n, num_heads, HEAD_DIM),
         data["kv_fused"],
         data["weights"],
-        context_lens,
-        block_tables_expanded,
+        ctx_lens_1d,
+        block_tables_dsl,
         schedule_metadata,
         max_model_len,
         q_offset=batch_size * next_n,
@@ -188,9 +193,6 @@ def _run_cutedsl_paged_mqa_logits(
         is_target_verify=is_target_verify,
         dsl_expand_factor=dsl_expand_factor,
         dsl_atom=dsl_atom,
-        blocksize=BLOCK_KV,
-        sm_count=num_sms,
-        get_paged_mqa_logits_metadata_fn=deep_gemm.get_paged_mqa_logits_metadata,
     )
 
 
