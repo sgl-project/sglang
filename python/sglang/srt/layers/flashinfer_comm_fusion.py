@@ -580,14 +580,22 @@ class FlashInferWorkspaceManager:
                 self._logged_init = False
 
 
-_attn_tp_workspace_manager = FlashInferWorkspaceManager()
-_moe_tp_workspace_manager = FlashInferWorkspaceManager()
-
-
 def _get_workspace_manager(use_attn_tp_group: bool) -> FlashInferWorkspaceManager:
-    return (
-        _attn_tp_workspace_manager if use_attn_tp_group else _moe_tp_workspace_manager
+    """The per-group fusion workspace manager; the instances live on
+    ``ctx.resources`` (one per comm group, created lazily)."""
+    from sglang.srt.runtime_context import get_resources
+
+    buffers = get_resources().buffers
+    name = (
+        "flashinfer_fusion_attn_tp_workspace"
+        if use_attn_tp_group
+        else "flashinfer_fusion_moe_tp_workspace"
     )
+    manager = buffers.get(name)
+    if manager is None:
+        manager = FlashInferWorkspaceManager()
+        buffers[name] = manager
+    return manager
 
 
 def _sync_allreduce_unavailable_across_tp():
@@ -853,11 +861,13 @@ def pre_initialize_workspaces(
 
 
 def cleanup_flashinfer_workspace():
-    global _attn_tp_workspace_manager, _moe_tp_workspace_manager
-    if _attn_tp_workspace_manager is not None:
-        _attn_tp_workspace_manager.cleanup()
-    if (
-        _moe_tp_workspace_manager is not None
-        and _moe_tp_workspace_manager is not _attn_tp_workspace_manager
+    from sglang.srt.runtime_context import get_resources
+
+    buffers = get_resources().buffers
+    for name in (
+        "flashinfer_fusion_attn_tp_workspace",
+        "flashinfer_fusion_moe_tp_workspace",
     ):
-        _moe_tp_workspace_manager.cleanup()
+        manager = buffers.get(name)
+        if manager is not None:
+            manager.cleanup()
