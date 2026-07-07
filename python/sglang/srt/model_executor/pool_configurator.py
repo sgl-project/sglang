@@ -576,7 +576,10 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
 
     Splits available memory across full / swa / c4 / c128 + c4_state / c128_state
     pools. coeff is bytes_per_full_token (inflated by (T+D)/T when speculative
-    decode reserves a draft worker, mirroring dflash's cell_size scaling); bias = 0.
+    decode reserves a draft worker, mirroring dflash's cell_size scaling). The
+    bias is the sum of request-scoped fixed pools that do not scale with
+    full_token: the c128 state pool and, on the unified_kv path, the fixed SWA
+    per-request ring (bf16, see _fixed_swa_bytes).
     """
 
     def __init__(self, kvc: KVCacheConfigurator):
@@ -629,6 +632,27 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.num_layers_ca4 = sum(1 for r in self.compression_ratios if r == 4)
         self.num_layers_ca128 = sum(1 for r in self.compression_ratios if r == 128)
 
+        # Unified-KV uses a different physical layout than the fp8 path:
+        #  * KV is stored bf16 over the full latent (attn_head_dim * 2 bytes),
+        #    not the fp8(nope) + bf16(rope) + scales 584-byte cell.
+        #  * SWA is a fixed per-request ring (num_req_slots * ring_size),
+        #    independent of full_token, so it is a fixed *bias* rather than a
+        #    per-token term. Gate on the same switch the pool itself uses so the
+        #    sizing and the allocation never drift apart.
+        from sglang.srt.layers.attention.dsv4.unified_kv_kernels.env_gate import (
+            is_unified_kv_triton,
+        )
+
+        self._unified = is_unified_kv_triton()
+        self.attn_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+        # Mirror DeepSeekV4TokenToKVPool: swa_ring_size = sliding_window +
+        # (speculative_num_draft_tokens - 1).
+        spec_num_draft = mr.server_args.speculative_num_draft_tokens or 1
+        self._swa_ring_size = self.swa_page_size + (
+            (spec_num_draft - 1) if self.is_speculative else 0
+        )
+        self._spec_infl = 1.0
+
         self.bytes_per_full_token = self._get_bytes_per_full_token()
         if self.is_speculative:
             # Reserve memory for the speculative draft worker by inflating
@@ -637,7 +661,8 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             # bytes_per_full_token: tokens = avail / (bpft * (T+D)/T).
             draft_layers = 1
             target_layers = self.num_layers_total
-            self.bytes_per_full_token *= (target_layers + draft_layers) / target_layers
+            self._spec_infl = (target_layers + draft_layers) / target_layers
+            self.bytes_per_full_token *= self._spec_infl
 
         # Online c128 keeps a single in-progress (max, sum, kv) state per index
         # and assumes a strict forward-only schedule. Speculative decode (MTP)
@@ -670,7 +695,11 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 )
 
     def _get_bytes_per_full_token(self) -> float:
-        kv_bytes = self.qk_nope_head_dim + self.qk_rope_head_dim * 2 + 8
+        if self._unified:
+            # Unified_kv stores the whole latent in bf16.
+            kv_bytes = self.attn_head_dim * 2
+        else:
+            kv_bytes = self.qk_nope_head_dim + self.qk_rope_head_dim * 2 + 8
 
         quant_block_size = 128
         indexer_bytes = (
@@ -699,7 +728,13 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
 
         c4_frac = 1 / (4 * self.c4_shrink_factor)
         return (
-            self.swa_ratio * kv_bytes * self.num_layers_total
+            # Unified_kv: SWA is a fixed per-request ring (see _fixed_swa_bytes),
+            # not a per-token pool, so it is excluded from the per-token coeff.
+            (
+                0.0
+                if self._unified
+                else self.swa_ratio * kv_bytes * self.num_layers_total
+            )
             + c4_frac * kv_bytes * self.num_layers_ca4
             + 1 / 128 * kv_bytes * self.num_layers_ca128
             + 1 / 4 * indexer_bytes * self.num_layers_ca4
@@ -750,18 +785,35 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             state_rows * state_last_dim * c128_state_dtype_size * self.num_layers_ca128
         )
 
-    def _get_c128_state_fixed_bytes_for_token_capacity(
-        self, token_capacity: int
-    ) -> int:
+    def _resolve_max_running_requests_per_worker(self, available_bytes: int) -> int:
+        """Approximate ModelRunner._resolve_max_num_reqs closely enough to size
+        the request-scoped fixed pools (c128 state, unified SWA ring). Over-
+        estimating is safe: a larger fixed bias yields a smaller full_token."""
         if self.requested_max_running_requests_per_worker is not None:
-            return self._get_c128_state_fixed_bytes(
-                self.requested_max_running_requests_per_worker
-            )
+            return self.requested_max_running_requests_per_worker
 
-        estimated = int(token_capacity / self.context_len * 512)
+        full_token = int(available_bytes / self.bytes_per_full_token)
+        estimated = int(full_token / self.context_len * 512)
         estimated = max(min(estimated, 4096), 2048)
-        max_running_requests = min(estimated, token_capacity // 2)
-        return self._get_c128_state_fixed_bytes(max_running_requests)
+        return min(estimated, full_token // 2)
+
+    def _fixed_swa_bytes(self, max_running_requests: int) -> int:
+        """Unified_kv SWA is a fixed per-request ring, sized by concurrency
+        (num_req_slots) rather than by full_token. Return its bf16 byte
+        footprint across all full layers, inflated for the draft worker the same
+        way as the per-token coeff. Returns 0 on the non-unified path (where SWA
+        is already accounted per-token)."""
+        if not self._unified:
+            return 0
+        num_req_slots = self._get_num_req_slots(max_running_requests)
+        ring_bytes = (
+            num_req_slots
+            * self._swa_ring_size
+            * self.attn_head_dim
+            * 2  # bf16
+            * self.num_layers_total
+        )
+        return int(ring_bytes * self._spec_infl)
 
     def _to_config(self, sizes: _DSV4PoolSizes) -> MemoryPoolConfig:
         full = sizes.full_max_total_num_tokens
@@ -801,25 +853,26 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             page_size % 128 == 0
         ), "page_size must be multiple of 128 for compressed attention"
 
-        if self.requested_max_running_requests_per_worker is not None:
-            c128_state_fixed_bytes = self._get_c128_state_fixed_bytes(
-                self.requested_max_running_requests_per_worker
-            )
-        else:
-            full_token = int(available_bytes / self.bytes_per_full_token)
-            c128_state_fixed_bytes = (
-                self._get_c128_state_fixed_bytes_for_token_capacity(full_token)
-            )
+        max_running_requests_per_worker = self._resolve_max_running_requests_per_worker(
+            available_bytes
+        )
+        c128_state_fixed_bytes = self._get_c128_state_fixed_bytes(
+            max_running_requests_per_worker
+        )
+        swa_ring_fixed_bytes = self._fixed_swa_bytes(max_running_requests_per_worker)
 
-        available_bytes_for_tokens = max(available_bytes - c128_state_fixed_bytes, 0)
+        available_bytes_for_tokens = max(
+            available_bytes - c128_state_fixed_bytes - swa_ring_fixed_bytes, 0
+        )
         full_token = int(available_bytes_for_tokens / self.bytes_per_full_token)
 
         sizes = self._compute_dsv4_sizes(full_token, page_size)
         logger.info(
-            f"DSV4 memory calculation: "
+            f"DSV4 memory calculation: unified={self._unified}, "
             f"bytes_per_full_token={self.bytes_per_full_token:.2f}, "
             f"available_bytes={available_bytes / (1 << 30):.2f} GB, "
             f"c128_state_fixed={c128_state_fixed_bytes / (1 << 30):.2f} GB, "
+            f"swa_ring_fixed={swa_ring_fixed_bytes / (1 << 30):.2f} GB, "
             f"full_token={sizes.full_max_total_num_tokens}"
         )
         return self._to_config(sizes)
