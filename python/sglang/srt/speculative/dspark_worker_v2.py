@@ -2822,6 +2822,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
         if model_worker_batch.forward_mode.is_idle() and not participates_in_dp_decode:
             return self._forward_idle(on_publish)
+        if participates_in_dp_decode and model_worker_batch.batch_size() == 0:
+            return self._forward_dp_idle_sync(model_worker_batch, on_publish)
         dp_decode_global_num_tokens = self._get_dp_decode_global_num_tokens(
             model_worker_batch
         )
@@ -3172,3 +3174,35 @@ class DSparkWorkerV2(BaseSpecWorker):
             speculative_num_draft_tokens=int(self.verify_stride),
             new_seq_lens=next_draft_input.new_seq_lens,
         )
+
+    def _forward_dp_idle_sync(
+        self, model_worker_batch: ScheduleBatch, on_publish
+    ) -> GenerationBatchResult:
+        """Run target idle forward for DP sync without DSpark verify planning.
+
+        DP-attention can schedule an idle local rank while other DP ranks have
+        tokens. The rank still has to participate in the target model's MLP
+        synchronization, but it must not fabricate a DSpark target-verify batch:
+        DSV4 target verify would try to build compressor prefill plans from
+        req_pool row 0 padding, which is not a valid request state.
+        """
+
+        original_spec_info = model_worker_batch.spec_info
+        original_capture_hidden_mode = model_worker_batch.capture_hidden_mode
+        try:
+            model_worker_batch.spec_info = None
+            model_worker_batch.capture_hidden_mode = CaptureHiddenMode.NULL
+            sync_result = self.target_worker.forward_batch_generation(
+                model_worker_batch,
+                is_verify=True,
+            )
+        finally:
+            model_worker_batch.spec_info = original_spec_info
+            model_worker_batch.capture_hidden_mode = original_capture_hidden_mode
+
+        result = self._forward_idle(on_publish)
+        result.can_run_cuda_graph = sync_result.can_run_cuda_graph
+        result.expert_distribution_metrics = sync_result.expert_distribution_metrics
+        result.routed_experts_output = sync_result.routed_experts_output
+        result.indexer_topk_output = sync_result.indexer_topk_output
+        return result

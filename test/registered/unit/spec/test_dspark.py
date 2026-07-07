@@ -761,6 +761,46 @@ class TestDSparkPrefillHandoff(CustomTestCase):
         self.assertEqual(recovered.dtype, t.int32)
         self.assertEqual(recovered.tolist(), [3, 0])
 
+    def test_dp_idle_sync_uses_target_idle_without_spec_info(self):
+        from sglang.srt.managers.utils import GenerationBatchResult
+        from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+
+        calls = []
+
+        def forward_batch_generation(batch, is_verify=False):
+            calls.append(
+                {
+                    "spec_info": batch.spec_info,
+                    "capture_hidden_mode": batch.capture_hidden_mode,
+                    "is_verify": is_verify,
+                }
+            )
+            return GenerationBatchResult(can_run_cuda_graph=True)
+
+        worker = self._worker(0)
+        worker.target_worker = SimpleNamespace(
+            forward_batch_generation=forward_batch_generation
+        )
+        idle_result = GenerationBatchResult(can_run_cuda_graph=False)
+        worker._forward_idle = lambda on_publish: idle_result
+
+        spec_info = object()
+        batch = SimpleNamespace(
+            spec_info=spec_info,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
+        )
+
+        result = self.worker_cls._forward_dp_idle_sync(worker, batch, on_publish=None)
+
+        self.assertIs(result, idle_result)
+        self.assertTrue(result.can_run_cuda_graph)
+        self.assertEqual(len(calls), 1)
+        self.assertIsNone(calls[0]["spec_info"])
+        self.assertEqual(calls[0]["capture_hidden_mode"], CaptureHiddenMode.NULL)
+        self.assertTrue(calls[0]["is_verify"])
+        self.assertIs(batch.spec_info, spec_info)
+        self.assertEqual(batch.capture_hidden_mode, CaptureHiddenMode.FULL)
+
     def test_prefill_tail_hidden_packs_variable_length_batch(self):
         t = self.torch
         hidden = t.arange(10 * 2, dtype=t.float32).view(10, 2)
