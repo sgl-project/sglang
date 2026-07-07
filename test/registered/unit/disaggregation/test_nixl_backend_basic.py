@@ -6,16 +6,19 @@ import threading
 import types
 import unittest
 from collections import defaultdict
+from queue import Queue
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import numpy as np
+import zmq
 
 from sglang.srt.disaggregation.base.conn import KVPoll
-from sglang.srt.disaggregation.common.conn import CommonKVManager
+from sglang.srt.disaggregation.common.conn import CommonKVManager, KVTransferError
 from sglang.srt.disaggregation.common.staging_handler import PrefillStagingContext
 from sglang.srt.disaggregation.common.utils import pack_int_lists
 from sglang.srt.disaggregation.nixl.conn import (
+    PREFILL_TRANSFER_FAILED,
     KVArgsRegisterInfo,
     NixlKVManager,
     NixlKVReceiver,
@@ -386,6 +389,132 @@ class TestNixlNotifications(CustomTestCase):
         mgr.update_transfer_status()
 
         self.assertTrue(mgr.transfer_statuses[8].is_done())
+
+
+class TestNixlFailurePropagation(CustomTestCase):
+    def _make_decode_manager(self, status):
+        mgr = object.__new__(NixlKVManager)
+        mgr.request_status = {7: status} if status is not None else {}
+        mgr.failure_records = {}
+        mgr.failure_lock = threading.Lock()
+        mgr.propagated_failure_rooms = set()
+        mgr.transfer_statuses = {7: TransferStatus()}
+        return mgr
+
+    def _make_prefill_manager(self):
+        mgr = object.__new__(NixlKVManager)
+        mgr.transfer_infos = {
+            7: {"decode": SimpleNamespace(endpoint="127.0.0.1", dst_port=12345)}
+        }
+        mgr._failure_notification_queue = Queue()
+        return mgr
+
+    def test_prefill_failure_marks_active_decode_room_failed(self):
+        for status in (
+            KVPoll.Bootstrapping,
+            KVPoll.WaitingForInput,
+            KVPoll.Transferring,
+        ):
+            with self.subTest(status=status):
+                mgr = self._make_decode_manager(status)
+
+                mgr._handle_prefill_transfer_failed(
+                    [PREFILL_TRANSFER_FAILED, b"7", b"state page mismatch"]
+                )
+
+                self.assertEqual(mgr.request_status[7], KVPoll.Failed)
+                self.assertEqual(mgr.failure_records[7], "state page mismatch")
+                self.assertEqual(mgr.propagated_failure_rooms, {7})
+                self.assertNotIn(7, mgr.transfer_statuses)
+
+    def test_prefill_failure_ignores_terminal_or_unknown_room(self):
+        for status in (None, KVPoll.Success, KVPoll.Failed):
+            with self.subTest(status=status):
+                mgr = self._make_decode_manager(status)
+
+                mgr._handle_prefill_transfer_failed(
+                    [PREFILL_TRANSFER_FAILED, b"7", b"late failure"]
+                )
+
+                self.assertEqual(mgr.failure_records, {})
+                self.assertEqual(mgr.propagated_failure_rooms, set())
+
+    def test_malformed_prefill_failure_is_ignored(self):
+        mgr = self._make_decode_manager(KVPoll.WaitingForInput)
+
+        for message in (
+            [PREFILL_TRANSFER_FAILED],
+            [PREFILL_TRANSFER_FAILED, b"not-a-room", b"failure"],
+        ):
+            with self.subTest(message=message):
+                mgr._handle_prefill_transfer_failed(message)
+
+        self.assertEqual(mgr.request_status[7], KVPoll.WaitingForInput)
+        self.assertEqual(mgr.failure_records, {})
+
+    def test_prefill_failure_is_queued_without_sending(self):
+        mgr = self._make_prefill_manager()
+
+        mgr._notify_decode_transfer_failed(7, "state page mismatch")
+
+        payload, endpoints = mgr._failure_notification_queue.get_nowait()
+        self.assertEqual(
+            payload, [PREFILL_TRANSFER_FAILED, b"7", b"state page mismatch"]
+        )
+        self.assertEqual(
+            endpoints,
+            [("tcp://127.0.0.1:12345", False, "127.0.0.1", 12345)],
+        )
+
+    def test_failure_dispatch_uses_nonblocking_send(self):
+        mgr = self._make_prefill_manager()
+        socket = MagicMock()
+        mgr._connect = MagicMock(return_value=socket)
+        payload = [PREFILL_TRANSFER_FAILED, b"7", b"state page mismatch"]
+        endpoints = [("tcp://127.0.0.1:12345", False, "127.0.0.1", 12345)]
+
+        mgr._send_decode_transfer_failed(payload, endpoints)
+
+        mgr._connect.assert_called_once_with("tcp://127.0.0.1:12345", is_ipv6=False)
+        socket.send_multipart.assert_called_once_with(payload, flags=zmq.NOBLOCK)
+
+    def test_receiver_preserves_propagated_failure_reason(self):
+        mgr = self._make_decode_manager(KVPoll.Failed)
+        mgr.failure_records[7] = "state page mismatch"
+        mgr.propagated_failure_rooms.add(7)
+        receiver = object.__new__(NixlKVReceiver)
+        receiver.kv_mgr = mgr
+        receiver.bootstrap_room = 7
+
+        with self.assertRaises(KVTransferError) as cm:
+            receiver.failure_exception()
+
+        self.assertEqual(cm.exception.failure_reason, "state page mismatch")
+        self.assertTrue(cm.exception.is_from_another_rank)
+        self.assertNotIn(7, mgr.failure_records)
+        self.assertNotIn(7, mgr.propagated_failure_rooms)
+
+    def test_receiver_clear_removes_decode_tracking(self):
+        mgr = self._make_decode_manager(KVPoll.Failed)
+        mgr.required_prefill_response_num_table = {7: 1}
+        mgr.prefill_response_tracker = {7: {0}}
+        mgr.addr_to_rooms_tracker = {"prefill:8998": {7}}
+        mgr.failure_records[7] = "stale failure"
+        mgr.propagated_failure_rooms.add(7)
+        receiver = object.__new__(NixlKVReceiver)
+        receiver.kv_mgr = mgr
+        receiver.bootstrap_room = 7
+        receiver.bootstrap_addr = "prefill:8998"
+
+        receiver.clear()
+
+        self.assertNotIn(7, mgr.request_status)
+        self.assertNotIn(7, mgr.transfer_statuses)
+        self.assertNotIn(7, mgr.required_prefill_response_num_table)
+        self.assertNotIn(7, mgr.prefill_response_tracker)
+        self.assertNotIn(7, mgr.failure_records)
+        self.assertNotIn(7, mgr.propagated_failure_rooms)
+        self.assertNotIn("prefill:8998", mgr.addr_to_rooms_tracker)
 
 
 class TestNixlReceiverPoll(CustomTestCase):
