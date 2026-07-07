@@ -56,7 +56,10 @@ runtime:
   decode_bootstrap_port: 9001
   lb_port: 8000
   mem_fraction_static: 0.90
-  page_size: 256
+  # Experiment: single-node default is page_size=1 (GSM8K 0.944 PASS); disagg
+  # uses 256 and only reaches ~0.89. Testing page_size=1 here to check whether
+  # the large page (on the triton decode / MLA path) is what degrades accuracy.
+  page_size: 1
   max_running_requests: 256
   chunked_prefill_size: 8192
 
