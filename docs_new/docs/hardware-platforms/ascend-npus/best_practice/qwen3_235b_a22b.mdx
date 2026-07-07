@@ -99,7 +99,9 @@ python3 -m sglang.launch_server \
     --enable-dp-lm-head \
     --tp 16 \
     --mem-fraction-static 0.78 \
-    --cuda-graph-bs 1
+    --cuda-graph-bs 1 \
+    --reasoning-parser qwen3 \
+    --tool-call-parser qwen25
 ```
 
 #### Benchmark
@@ -173,8 +175,6 @@ export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
 export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_NPU_FUSED_MOE_MODE=2
-export SGLANG_NPU_PROFILING=0
-export SGLANG_NPU_PROFILING_BS=27
 export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=100
 export SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1
 
@@ -207,7 +207,9 @@ python3 -m sglang.launch_server \
     --enable-dp-attention \
     --enable-dp-lm-head \
     --mem-fraction-static 0.8 \
-    --cuda-graph-bs 1 2 4 8 16 20 24 26 27
+    --cuda-graph-bs 1 2 4 8 16 20 24 26 27 \
+    --reasoning-parser qwen3 \
+    --tool-call-parser qwen25
 ```
 
 #### Benchmark

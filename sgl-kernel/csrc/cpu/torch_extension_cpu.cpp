@@ -27,6 +27,9 @@ at::Tensor silu_and_mul_cpu(at::Tensor& input);
 at::Tensor gelu_tanh_and_mul_cpu(const at::Tensor& input);
 at::Tensor gelu_and_mul_cpu(const at::Tensor& input);
 
+// fused_sigmoid_mul
+at::Tensor fused_sigmoid_mul_cpu(at::Tensor& input, const at::Tensor& gate, bool inplace);
+
 // l2norm
 at::Tensor l2norm_cpu(at::Tensor& input, double eps);
 
@@ -54,6 +57,23 @@ at::Tensor fused_add_layernorm_cpu(
     const at::Tensor& weight,
     const std::optional<at::Tensor>& bias,
     double eps);
+
+// fused_qk_gemma_rmsnorm
+std::tuple<at::Tensor, at::Tensor> fused_qk_gemma_rmsnorm_cpu(
+    const at::Tensor& q,
+    const at::Tensor& k,
+    const at::Tensor& q_weight,
+    const at::Tensor& k_weight,
+    double eps,
+    int64_t head_dim);
+std::tuple<at::Tensor, at::Tensor, at::Tensor> fused_qk_gemma_rmsnorm_with_gate_cpu(
+    const at::Tensor& q_gate,
+    const at::Tensor& k,
+    const at::Tensor& q_weight,
+    const at::Tensor& k_weight,
+    double eps,
+    int64_t head_dim,
+    int64_t num_head);
 
 // topk
 std::tuple<at::Tensor, at::Tensor>
@@ -439,6 +459,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("gelu_tanh_and_mul_cpu", torch::kCPU, &gelu_tanh_and_mul_cpu);
   m.def("gelu_and_mul_cpu(Tensor input) -> Tensor");
   m.impl("gelu_and_mul_cpu", torch::kCPU, &gelu_and_mul_cpu);
+  m.def("fused_sigmoid_mul_cpu(Tensor(a!) input, Tensor gate, bool inplace) -> Tensor(a!)");
+  m.impl("fused_sigmoid_mul_cpu", torch::kCPU, &fused_sigmoid_mul_cpu);
 
   // norm
   m.def("rmsnorm_cpu(Tensor input, Tensor weight, float eps) -> Tensor");
@@ -463,6 +485,15 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "fused_add_layernorm_cpu(Tensor input, Tensor residual, Tensor weight, Tensor? bias, float eps) -> "
       "Tensor");
   m.impl("fused_add_layernorm_cpu", torch::kCPU, &fused_add_layernorm_cpu);
+  m.def(
+      "fused_qk_gemma_rmsnorm_cpu(Tensor q, Tensor k, Tensor q_weight, Tensor k_weight, float eps, int head_dim) -> "
+      "(Tensor, Tensor)");
+  m.impl("fused_qk_gemma_rmsnorm_cpu", torch::kCPU, &fused_qk_gemma_rmsnorm_cpu);
+  m.def(
+      "fused_qk_gemma_rmsnorm_with_gate_cpu(Tensor q_gate, Tensor k, Tensor q_weight, Tensor k_weight, float eps, int "
+      "head_dim, int num_head) -> "
+      "(Tensor, Tensor, Tensor)");
+  m.impl("fused_qk_gemma_rmsnorm_with_gate_cpu", torch::kCPU, &fused_qk_gemma_rmsnorm_with_gate_cpu);
 
   // topk
   m.def("topk_sigmoid_cpu(Tensor hidden_states, Tensor gating_output, int topk, bool renormalize) -> (Tensor, Tensor)");
