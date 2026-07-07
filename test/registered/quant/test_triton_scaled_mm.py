@@ -9,7 +9,7 @@ from sglang.srt.utils.common import get_device
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=11, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=11, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=12, suite="stage-b-test-1-gpu-small-amd")
 
 
@@ -58,12 +58,14 @@ class TestScaledMM(CustomTestCase):
         """Test core functionality with reduced precision requirements"""
         test_configs = [
             (32, 32, 32, torch.int8, torch.float16, False),
+            (17, 64, 96, torch.int8, torch.float16, False),
             (64, 64, 64, torch.int8, torch.float16, True),
         ]
 
         try:
             torch.tensor([1.0], dtype=torch.float8_e4m3fn, device=self._device)
             test_configs.append((32, 32, 32, torch.float8_e4m3fn, torch.float16, False))
+            test_configs.append((17, 64, 96, torch.float8_e4m3fn, torch.float16, False))
         except:
             print("FP8 not supported, skipping")
 
@@ -97,6 +99,14 @@ class TestScaledMM(CustomTestCase):
                 atol = 0.1 if in_dtype == torch.int8 else 0.15
 
                 torch.testing.assert_close(triton_out, ref_out, rtol=rtol, atol=atol)
+
+                scale_b_row = scale_b.t().contiguous()
+                triton_out_row_scale = triton_scaled_mm(
+                    input, weight, scale_a, scale_b_row, out_dtype, bias
+                )
+                torch.testing.assert_close(
+                    triton_out_row_scale, ref_out, rtol=rtol, atol=atol
+                )
 
 
 if __name__ == "__main__":

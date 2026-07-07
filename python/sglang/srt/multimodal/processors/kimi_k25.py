@@ -82,6 +82,32 @@ def _pil_to_cuda_chw(image: Image.Image) -> torch.Tensor:
     return torch.from_numpy(arr).permute(2, 0, 1).cuda()
 
 
+def _ensure_chw_rgb(image: torch.Tensor) -> torch.Tensor:
+    """Coerce an already-decoded (C, H, W) image tensor to 3-channel RGB.
+
+    PIL inputs are RGB-normalized by _pil_to_cuda_chw, but pre-decoded
+    tensor inputs (e.g. nvJPEG / cached CUDA tensors) keep their native
+    channel count. Grayscale (1ch) or RGBA (4ch) images then break the
+    downstream torch.cat over a batch of images, which requires a
+    consistent channel dimension. Normalize every tensor to 3 channels.
+
+    Also move the tensor to the GPU (matching _pil_to_cuda_chw) so a CPU
+    input does not trip a device mismatch against the CUDA image_mean /
+    image_std_inv normalization constants downstream. No-op if already on
+    the device.
+    """
+    image = image.cuda()
+    if image.dim() == 2:  # (H, W) grayscale -> (1, H, W)
+        image = image.unsqueeze(0)
+    c = image.shape[0]
+    if c == 3:
+        return image
+    if c == 1:
+        return image.repeat(3, 1, 1)
+    # RGBA or other multi-channel layouts: keep the first 3 channels.
+    return image[:3]
+
+
 def _process_single_image(
     image: Union[torch.Tensor, Image.Image],
     config: dict,
@@ -92,6 +118,8 @@ def _process_single_image(
     """Process a single image on GPU: resize -> pad -> normalize -> patchify."""
     if isinstance(image, Image.Image):
         image = _pil_to_cuda_chw(image)
+    else:
+        image = _ensure_chw_rgb(image)
 
     new_h, new_w = config["new_height"], config["new_width"]
     pad_h, pad_w = config["pad_height"], config["pad_width"]
@@ -158,6 +186,8 @@ def _gpu_preprocess_images(
             for _, image, _ in group:
                 if isinstance(image, Image.Image):
                     image = _pil_to_cuda_chw(image)
+                else:
+                    image = _ensure_chw_rgb(image)
                 tensors.append(image.unsqueeze(0).float())
 
             resized = []
@@ -373,7 +403,7 @@ class KimiK2_5VLImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
         *args,
         **kwargs,
     ):
-        base_output = self.load_mm_data(
+        base_output = await self.load_mm_data(
             prompt=input_text,
             image_data=image_data,
             multimodal_tokens=self.mm_tokens,

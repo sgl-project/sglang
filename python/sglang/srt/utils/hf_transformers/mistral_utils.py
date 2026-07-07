@@ -1,5 +1,6 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/transformers_utils/configs/mistral.py
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import json
 import tempfile
 from functools import lru_cache
@@ -463,6 +464,17 @@ def patch_mistral_common_tokenizer(tokenizer):
     if not hasattr(tokenizer, "get_added_vocab"):
         tokenizer.get_added_vocab = lambda: {}
 
+    # Keep the old no-op pad add working on transformers 5.12 MistralCommon.
+    _orig_add_special_tokens = tokenizer.add_special_tokens
+
+    def _safe_add_special_tokens(special_tokens_dict, *args, **kwargs):
+        if set(special_tokens_dict) == {"pad_token"}:
+            tokenizer.pad_token = special_tokens_dict["pad_token"]
+            return 0
+        return _orig_add_special_tokens(special_tokens_dict, *args, **kwargs)
+
+    tokenizer.add_special_tokens = _safe_add_special_tokens
+
     # Set a chat_template containing "audio" so that sglang's content format
     # detector returns "openai" (which preserves audio_url extraction).
     if not hasattr(tokenizer, "chat_template") or tokenizer.chat_template is None:
@@ -494,24 +506,99 @@ def patch_mistral_common_tokenizer(tokenizer):
         tokenizer.batch_decode, ["spaces_between_special_tokens"]
     )
 
+    if hasattr(tokenizer, "_text_to_ids"):
+        _orig_text_to_ids = tokenizer._text_to_ids
+        marker_to_id = {
+            "[IMG]": tokenizer.convert_tokens_to_ids("[IMG]"),
+            "[IMG_BREAK]": tokenizer.convert_tokens_to_ids("[IMG_BREAK]"),
+            "[IMG_END]": tokenizer.convert_tokens_to_ids("[IMG_END]"),
+        }
+
+        def _text_to_ids_with_pixtral_markers(text, add_special_tokens):
+            if not isinstance(text, str) or not any(
+                marker in text for marker in marker_to_id
+            ):
+                return _orig_text_to_ids(text, add_special_tokens)
+
+            ids = []
+            pos = 0
+            while pos < len(text):
+                next_marker = None
+                next_idx = len(text)
+                for marker in marker_to_id:
+                    marker_idx = text.find(marker, pos)
+                    if marker_idx != -1 and marker_idx < next_idx:
+                        next_marker = marker
+                        next_idx = marker_idx
+
+                if next_marker is None:
+                    ids.extend(_orig_text_to_ids(text[pos:], False))
+                    break
+                if next_idx > pos:
+                    ids.extend(_orig_text_to_ids(text[pos:next_idx], False))
+                ids.append(marker_to_id[next_marker])
+                pos = next_idx + len(next_marker)
+
+            if add_special_tokens:
+                return tokenizer.build_inputs_with_special_tokens(ids)
+            return ids
+
+        tokenizer._text_to_ids = _text_to_ids_with_pixtral_markers
+
     tokenizer._orig_apply_chat_template = tokenizer.apply_chat_template
+
+    def _adapt_placeholder_content_for_mistral_common(content):
+        if not isinstance(content, list):
+            return content
+
+        rendered_parts = []
+        has_placeholder = False
+        for part in content:
+            if not isinstance(part, dict):
+                return content
+            part_type = part.get("type")
+            if part_type in ("text", "input_text"):
+                rendered_parts.append(part.get("text", ""))
+            elif part_type == "image" and not any(
+                key in part for key in ("url", "path", "base64")
+            ):
+                has_placeholder = True
+                rendered_parts.append("[IMG]")
+            elif part_type in ("audio", "video") and not any(
+                key in part for key in ("url", "path", "base64")
+            ):
+                has_placeholder = True
+                continue
+            else:
+                return content
+
+        return "".join(rendered_parts) if has_placeholder else content
+
+    def _adapt_placeholder_messages_for_mistral_common(messages):
+        if not isinstance(messages, (list, tuple)):
+            return messages
+
+        adapted = []
+        for msg in messages:
+            if isinstance(msg, (list, tuple)):
+                adapted.append(_adapt_placeholder_messages_for_mistral_common(msg))
+            elif isinstance(msg, dict):
+                adapted.append(
+                    {
+                        **msg,
+                        "content": _adapt_placeholder_content_for_mistral_common(
+                            msg.get("content", "")
+                        ),
+                    }
+                )
+            else:
+                adapted.append(msg)
+        return adapted
 
     def _safe_apply_chat_template(messages, **kwargs):
         kwargs.pop("add_generation_prompt", None)
-        cleaned = []
-        for msg in messages:
-            if isinstance(msg, dict):
-                content = msg.get("content", "")
-                if isinstance(content, list):
-                    text_parts = [
-                        p.get("text", "")
-                        for p in content
-                        if isinstance(p, dict) and p.get("type") == "text"
-                    ]
-                    msg = {**msg, "content": " ".join(text_parts) if text_parts else ""}
-                cleaned.append(msg)
-            else:
-                cleaned.append(msg)
-        return tokenizer._orig_apply_chat_template(cleaned, **kwargs)
+        messages = _adapt_placeholder_messages_for_mistral_common(messages)
+        return tokenizer._orig_apply_chat_template(messages, **kwargs)
 
     tokenizer.apply_chat_template = _safe_apply_chat_template
+    return tokenizer

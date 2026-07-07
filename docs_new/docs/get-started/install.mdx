@@ -9,7 +9,7 @@ keywords:
 ---
 You can install SGLang using one of the methods below.
 This page primarily applies to common NVIDIA GPU platforms.
-For other or newer platforms, please refer to the dedicated pages for [AMD GPUs](../hardware-platforms/amd_gpu), [Intel Xeon CPUs](../hardware-platforms/cpu_server), [Google TPU](../hardware-platforms/tpu), [NVIDIA DGX Spark](https://lmsys.org/blog/2025-11-03-gpt-oss-on-nvidia-dgx-spark/), [NVIDIA Jetson](../hardware-platforms/nvidia_jetson), [Ascend NPUs](../hardware-platforms/ascend-npus/ascend_npu), and [Intel XPU](../hardware-platforms/xpu).
+For other or newer platforms, please refer to the dedicated pages for [AMD GPUs](../hardware-platforms/amd_gpu), [Apple Metal](../hardware-platforms/apple_metal), [Intel Xeon CPUs](../hardware-platforms/cpu_server), [Google TPU](../hardware-platforms/tpu), [NVIDIA DGX Spark](https://lmsys.org/blog/2025-11-03-gpt-oss-on-nvidia-dgx-spark/), [NVIDIA Jetson](../hardware-platforms/nvidia_jetson), [Ascend NPUs](../hardware-platforms/ascend-npus/ascend_npu), and [Intel XPU](../hardware-platforms/xpu).
 
 <Note>
 Prerequisites: Python 3.10 or higher.
@@ -22,7 +22,34 @@ It is recommended to use uv for faster installation:
 ```bash Command
 pip install --upgrade pip
 pip install uv
-uv pip install sglang
+uv pip install --prerelease=allow sglang
+```
+
+The major version of Cuda is 13 by default. To install sglang under Cuda 12 with pip or uv, please try the following commands:
+```bash Command
+pip install --upgrade pip
+pip install uv
+uv pip install --prerelease=allow sglang
+uv pip install --force-reinstall  torch==2.11.0 torchaudio==2.11.0 torchvision --index-url https://download.pytorch.org/whl/cu129
+uv pip install --force-reinstall sglang-kernel --index-url https://docs.sglang.ai/whl/cu129/
+uv pip install --force-reinstall sgl-deep-gemm --index-url https://docs.sglang.ai/whl/cu129/ --no-deps
+```
+
+### Nightly builds
+
+To pick up the latest features and fixes before the next stable release, install a nightly build. Nightly wheels are built from the latest `main` and published to the SGLang wheel index. Add that index with `--extra-index-url`, and combine `--prerelease=allow` with `--index-strategy unsafe-best-match` so uv considers the nightly (pre-release) version alongside PyPI:
+
+```bash Command
+pip install --upgrade pip
+pip install uv
+uv pip install --prerelease=allow --index-strategy unsafe-best-match --extra-index-url https://docs.sglang.ai/whl/cu130/ sglang
+```
+
+To install a nightly build under Cuda 12, swap the index to `cu129`:
+```bash Command
+pip install --upgrade pip
+pip install uv
+uv pip install --prerelease=allow --index-strategy unsafe-best-match --extra-index-url https://docs.sglang.ai/whl/cu129/ sglang
 ```
 
 ### Quick fixes to common problems
@@ -34,7 +61,7 @@ uv pip install sglang
 
 ```bash Command
 # Use the last release branch
-git clone -b v0.5.9 https://github.com/sgl-project/sglang.git
+git clone -b v0.5.12 https://github.com/sgl-project/sglang.git
 cd sglang
 
 # Install the python packages
@@ -50,6 +77,10 @@ pip install -e "python"
 
 The docker images are available on Docker Hub at [lmsysorg/sglang](https://hub.docker.com/r/lmsysorg/sglang/tags), built from [Dockerfile](https://github.com/sgl-project/sglang/tree/main/docker).
 Replace `<secret>` below with your huggingface hub [token](https://huggingface.co/docs/hub/en/security-tokens).
+
+<Note>
+`latest` and `dev` are **mutable** tags: `latest` always points at the newest stable release, while `dev` is rebuilt daily from the latest `main` and includes build/development tools. Because they are overwritten over time, pin an immutable version tag for reproducible deployments — e.g. `lmsysorg/sglang:v0.5.12`. Browse all released versions on [Docker Hub](https://hub.docker.com/r/lmsysorg/sglang/tags).
+</Note>
 
 ```bash Command
 docker run --gpus all \
@@ -157,7 +188,9 @@ sky status --endpoint 30000 sglang
 
 To deploy on SGLang on AWS SageMaker, check out [AWS SageMaker Inference](https://aws.amazon.com/sagemaker/ai/deploy)
 
-Amazon Web Services provide supports for SGLang containers along with routine security patching. For available SGLang containers, check out [AWS SGLang DLCs](https://github.com/aws/deep-learning-containers/blob/master/available_images.md#sglang-containers)
+Amazon Web Services provide supports for SGLang containers along with routine security patching. For available SGLang containers, check out [AWS SGLang DLCs](https://aws.github.io/deep-learning-containers/reference/available_images/#sglang).
+
+To deploy a pre-built SGLang Deep Learning Container without building your own image, see [Amazon SageMaker AI](/docs/basic_usage/aws_sagemaker).
 
 To host a model with your own container, follow the following steps:
 

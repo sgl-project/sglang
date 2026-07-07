@@ -25,7 +25,10 @@ from sglang.multimodal_gen.configs.models.dits.ernie_image import (
 from sglang.multimodal_gen.runtime.distributed import (
     get_tp_world_size,
 )
-from sglang.multimodal_gen.runtime.layers.attention.layer import USPAttention
+from sglang.multimodal_gen.runtime.layers.attention.layer import (
+    USPAttention,
+    build_varlen_mask_meta,
+)
 from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm, apply_qk_norm
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
@@ -33,7 +36,9 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     RowParallelLinear,
 )
 from sglang.multimodal_gen.runtime.layers.quantization import QuantizationConfig
-from sglang.multimodal_gen.runtime.managers.layerwise_offload import OffloadableDiTMixin
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+)
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 
 
@@ -132,16 +137,22 @@ class ErnieImageSelfAttention(nn.Module):
             self.norm_q = RMSNorm(head_dim, eps=eps)
             self.norm_k = RMSNorm(head_dim, eps=eps)
 
+        # The joint [image, text] stream is fully replicated, so the ulysses
+        # all-to-all would wrongly treat it as sharded and duplicate it. Skip
+        # SP until the stream is sharded (sp_shard + num_replicated_suffix).
         self.attn = USPAttention(
             num_heads=self.num_local_heads,
             head_size=head_dim,
             prefix=f"{prefix}.attn",
+            skip_sequence_parallel=True,
         )
 
     def forward(
         self,
         x: torch.Tensor,
         rotary_pos_emb: torch.Tensor,
+        attn_mask: torch.Tensor | None = None,
+        attn_mask_meta: dict | None = None,
     ) -> torch.Tensor:
         B, S, H = x.shape
 
@@ -165,14 +176,15 @@ class ErnieImageSelfAttention(nn.Module):
         q = _apply_rotary_bshd(q, rotary_pos_emb)
         k = _apply_rotary_bshd(k, rotary_pos_emb)
 
-        attn_out = self.attn(q, k, v)
+        attn_out = self.attn(
+            q, k, v, attn_mask=attn_mask, attn_mask_meta=attn_mask_meta
+        )
         attn_out = attn_out.reshape(B, S, self.num_local_heads * self.head_dim)
         out, _ = self.to_out[0](attn_out)
         return out
 
 
 class ErnieImageMLP(nn.Module):
-
     def __init__(
         self,
         hidden_size: int,
@@ -239,10 +251,14 @@ class ErnieImageSharedAdaLNBlock(nn.Module):
         shift_mlp: torch.Tensor,
         scale_mlp: torch.Tensor,
         gate_mlp: torch.Tensor,
+        attn_mask: torch.Tensor | None = None,
+        attn_mask_meta: dict | None = None,
     ) -> torch.Tensor:
         residual = x
         x = self.adaLN_sa_ln(x) * (1 + scale_msa) + shift_msa
-        x = residual + gate_msa * self.self_attention(x, rotary_pos_emb)
+        x = residual + gate_msa * self.self_attention(
+            x, rotary_pos_emb, attn_mask=attn_mask, attn_mask_meta=attn_mask_meta
+        )
 
         residual = x
         x = self.adaLN_mlp_ln(x) * (1 + scale_mlp) + shift_mlp
@@ -266,7 +282,7 @@ def _apply_rotary_bshd(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
     return torch.cat((x_rot, x_pass), dim=-1)
 
 
-class ErnieImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
+class ErnieImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     """ErnieImage DiT: Single-stream transformer with Shared AdaLN."""
 
     _supports_gradient_checkpointing = True
@@ -295,8 +311,6 @@ class ErnieImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         self.patch_size = arch.patch_size
         self.out_channels = arch.out_channels
         self.inner_dim = self.hidden_size
-
-        tp_size = get_tp_world_size()
 
         self.x_embedder = nn.ModuleDict(
             {
@@ -379,6 +393,7 @@ class ErnieImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         timestep: torch.LongTensor,
         encoder_hidden_states_image: torch.Tensor | list[torch.Tensor] | None = None,
         guidance=None,
+        encoder_hidden_states_mask: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
         """
@@ -442,6 +457,18 @@ class ErnieImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         all_ids = torch.cat([image_ids, text_ids], dim=1)
         rotary_pos_emb = self.pos_embed(all_ids)
 
+        attn_mask = attn_mask_meta = None
+        if encoder_hidden_states_mask is not None:
+            image_mask = torch.ones((B, N_img), dtype=torch.bool, device=device)
+            attn_mask = torch.cat(
+                [
+                    image_mask,
+                    encoder_hidden_states_mask.to(device=device, dtype=torch.bool),
+                ],
+                dim=1,
+            )
+            attn_mask_meta = build_varlen_mask_meta(attn_mask)
+
         t_emb = self.time_proj(timestep.to(dtype))
         c = self.time_embedding(t_emb.to(dtype=dtype))
 
@@ -460,6 +487,8 @@ class ErnieImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
                 shift_mlp,
                 scale_mlp,
                 gate_mlp,
+                attn_mask=attn_mask,
+                attn_mask_meta=attn_mask_meta,
             )
 
         scale, shift = self.final_norm["linear"](c).chunk(2, dim=-1)

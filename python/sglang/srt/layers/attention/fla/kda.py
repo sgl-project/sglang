@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/0384aa7150c4c9778efca041ffd1beb3ad2bd694/vllm/model_executor/layers/fla/ops/kda.py
 # This file contains code copied from the flash-linear-attention project.
 # The original source code was licensed under the MIT license and included
@@ -24,7 +26,14 @@ from sglang.srt.layers.attention.fla.l2norm import l2norm_fwd
 from sglang.srt.layers.attention.fla.op import exp, log
 from sglang.srt.layers.attention.fla.utils import (
     check_shared_mem,
+    is_intel,
 )
+
+if is_intel:
+    from sglang.srt.hardware_backend.xpu.kernels.fla.chunk_delta_h import (
+        chunk_gated_delta_rule_fwd_h,
+    )
+
 
 BS_LIST = [32, 64] if check_shared_mem() else [16, 32]
 

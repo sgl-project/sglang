@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://raw.githubusercontent.com/vllm-project/vllm/v0.5.5/vllm/model_executor/layers/quantization/base_config.py
 from __future__ import annotations
 
@@ -107,7 +109,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
     ) -> CombineInput:
         raise NotImplementedError
 
-    def get_triton_quant_info(self, layer: torch.nn.Module) -> "TritonMoeQuantInfo":
+    def get_triton_quant_info(self, layer: torch.nn.Module) -> TritonMoeQuantInfo:
         """Return a ``TritonMoeQuantInfo`` describing the quantisation state
         stored on *layer*.
 
@@ -128,6 +130,9 @@ class QuantizationConfig(ABC):
         super().__init__()
         # mapping is updated by models as they initialize
         self.packed_modules_mapping: Dict[str, List[str]] = dict()
+
+    def update_packed_modules_mapping(self, mapping: Dict[str, List[str]]) -> None:
+        self.packed_modules_mapping = mapping
 
     @abstractmethod
     def get_name(self) -> str:
@@ -158,7 +163,7 @@ class QuantizationConfig(ABC):
 
     @classmethod
     @abstractmethod
-    def from_config(cls, config: Dict[str, Any]) -> "QuantizationConfig":
+    def from_config(cls, config: Dict[str, Any]) -> QuantizationConfig:
         """Create a config class from the model's quantization config."""
         raise NotImplementedError()
 
@@ -241,7 +246,7 @@ class QuantizationConfig(ABC):
         raise NotImplementedError()
 
     def apply_weight_name_mapper(
-        self, hf_to_sglang_mapper: "WeightsMapper"
+        self, hf_to_sglang_mapper: WeightsMapper
     ):  # noqa: B027
         """
         Interface for models to update module names referenced in

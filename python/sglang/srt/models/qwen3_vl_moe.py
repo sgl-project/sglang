@@ -235,6 +235,7 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             if (
                 "visual" not in name
                 and layer_id is not None
+                and hasattr(self, "model")
                 and hasattr(self.model, "start_layer")
                 and (
                     layer_id < self.model.start_layer

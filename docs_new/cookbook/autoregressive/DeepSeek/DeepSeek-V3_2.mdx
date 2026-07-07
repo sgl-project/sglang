@@ -24,6 +24,27 @@ SGLang offers multiple installation methods. You can choose the most suitable in
 
 Please refer to the [official SGLang installation guide](../../../docs/get-started/install) for installation instructions.
 
+### 2.1 Docker Images
+
+Pre-built Docker images are available for different hardware platforms:
+
+```bash Command
+# NVIDIA H200 / B200
+docker pull lmsysorg/sglang:latest
+
+# AMD MI350 / MI355X
+docker pull lmsysorg/sglang:v0.5.8-rocm700-mi35x
+
+# AMD MI300X
+# Note: v0.5.8-rocm700-mi30x does not include PR #17504.
+# Prefer the newest MI30x ROCm image tag from Docker Hub when available, or build from source.
+docker pull lmsysorg/sglang:v0.5.8-rocm700-mi30x
+
+# Ascend NPU (Atlas 800I A2 / A3)
+docker pull lmsysorg/sglang:dsv32-a2
+docker pull lmsysorg/sglang:dsv32-a3
+```
+
 ## 3. Model Deployment
 
 This section provides a progressive guide from quick deployment to performance optimization, suitable for users at different levels.
@@ -37,7 +58,18 @@ import { DeepSeekV32Deployment } from "/src/snippets/autoregressive/deepseek-v32
 <DeepSeekV32Deployment />
 
 ### 3.2 Configuration Tips
-For more detailed configuration tips, please refer to [DeepSeek-V3.2 Usage](../../../docs/basic_usage/deepseek_v32).
+
+- **Short-sequence MHA prefill (adaptive):** For prefill sequences shorter than 2048 tokens (default threshold), the DSA backend automatically switches to standard MHA (using FlashAttention variable-length on SM90, TRT-LLM ragged MHA on SM100). To extend this to longer sequences set env var `SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD` to a larger value (potential minor accuracy trade-off).
+- **DSA prefill/decode attention kernels (`--dsa-prefill-backend`, `--dsa-decode-backend`):** The `dsa` backend is automatically selected for DeepSeek-V3.2. Available kernels: `flashmla_sparse`, `flashmla_kv`, `flashmla_auto`, `fa3` (Hopper only), `tilelang` (GPU/HPU/NPU), `aiter` (AMD, decode only), `trtllm` (Blackwell only). Defaults: Hopper BF16 KV → `flashmla_sparse` prefill / `fa3` decode; Hopper FP8 KV → `flashmla_kv` both; Blackwell BF16 → `flashmla_sparse` / `trtllm`; Blackwell FP8 → `trtllm` both.
+- **Index Cache:** Reuses indexer results across layers for efficiency at negligible accuracy cost. For **GLM-5** specifically, append `--json-model-override-args '{"index_topk_pattern": "FFSFSSSFSSFFFSSSFFFSFSSSSSSFFSFFSFFSSFFFFFFSFFFFFSFFSSSSSSFSFFFSFSSSFSFFSFFSSS"}'` for a better speed/accuracy tradeoff.
+- **HiSparse (experimental):** Reduces per-request GPU memory during long-context decode by offloading KV data to CPU pinned memory. Requires PD disaggregation mode (decode instance only). See [HiSparse Guide](../../../docs/advanced_features/hisparse_guide).
+- **NVFP4 on Blackwell:** Specify `--quantization modelopt_fp4` and `--moe-runner-backend flashinfer_trtllm` (recommended) / `flashinfer_cutlass` / `flashinfer_cutedsl`. Full example:
+  ```bash
+  python -m sglang.launch_server --model nvidia/DeepSeek-V3.2-NVFP4 --tp 4 \
+    --quantization modelopt_fp4 --moe-runner-backend flashinfer_trtllm \
+    --tool-call-parser deepseekv32 --reasoning-parser deepseek-v3
+  ```
+- **NCCL timeout:** Slow model loading → add `--dist-timeout 3600`.
 
 ## 4. Model Invocation
 
@@ -131,7 +163,15 @@ The answer is 36. To find 15% of 240, we multiply 240 by 0.15, which equals 36.
 
 DeepSeek-V3.2 and DeepSeek-V3.2-Exp support tool calling capabilities. But they use different parameters. Enable the tool call parser:
 
-**Note:** DeepSeek-V3.2-Speciale does **NOT** support tool calling. It is designed exclusively for deep reasoning tasks.
+**Note:** DeepSeek-V3.2-Speciale does **NOT** support tool calling. Launch it with reasoning parser only:
+
+```shell Command
+python3 -m sglang.launch_server \
+  --model-path deepseek-ai/DeepSeek-V3.2-Speciale \
+  --trust-remote-code \
+  --tp-size 8 --dp-size 8 --enable-dp-attention \
+  --reasoning-parser deepseek-v3
+```
 
 **Deployment Command:**
 
@@ -306,7 +346,110 @@ print(final_response.choices[0].message.content)
 # Output: "The weather in Beijing is currently 22°C and sunny."
 ```
 
-#### 4.2.3 Enabling PP, CP and TP with FP8 KV cache
+#### 4.2.3 Multi-Token Prediction (EAGLE Speculative Decoding)
+
+SGLang implements Multi-Token Prediction (MTP) for DeepSeek V3.2 based on [EAGLE speculative decoding](../../../docs/advanced_features/speculative_decoding#EAGLE-Decoding). This optimization significantly improves decoding speed for small batch sizes.
+
+**With DP Attention:**
+
+```bash Command
+python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp --tp 8 --dp 8 \
+  --enable-dp-attention \
+  --speculative-algorithm EAGLE \
+  --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4
+```
+
+**With Pure TP:**
+
+```bash Command
+python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp --tp 8 \
+  --speculative-algorithm EAGLE \
+  --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4
+```
+
+Find optimal values for your workload with [bench_speculative.py](https://github.com/sgl-project/sglang/blob/main/scripts/playground/bench_speculative.py). The minimum viable config is `--speculative-num-steps 1 --speculative-eagle-topk 1 --speculative-num-draft-tokens 2`.
+
+<Note>
+`--max-running-requests` defaults to 48 for MTP. Increase it for larger batch sizes.
+</Note>
+
+<Tip>
+The spec-v2 overlap scheduler is enabled by default. Pass `--disable-overlap-schedule` to disable.
+</Tip>
+
+#### 4.2.4 PD Disaggregation
+
+Prefill-Decode (PD) disaggregation separates prefill and decode stages onto different instances, improving GPU utilization for mixed workloads.
+
+**Prefill command:**
+
+```bash Command
+python -m sglang.launch_server \
+  --model-path deepseek-ai/DeepSeek-V3.2-Exp \
+  --disaggregation-mode prefill \
+  --host $LOCAL_IP \
+  --port $PORT \
+  --tp 8 \
+  --dp 8 \
+  --enable-dp-attention \
+  --dist-init-addr ${HOST}:${DIST_PORT} \
+  --trust-remote-code \
+  --disaggregation-bootstrap-port 8998 \
+  --mem-fraction-static 0.9
+```
+
+**Decode command:**
+
+```bash Command
+python -m sglang.launch_server \
+  --model-path deepseek-ai/DeepSeek-V3.2-Exp \
+  --disaggregation-mode decode \
+  --host $LOCAL_IP \
+  --port $PORT \
+  --tp 8 \
+  --dp 8 \
+  --enable-dp-attention \
+  --dist-init-addr ${HOST}:${DIST_PORT} \
+  --trust-remote-code \
+  --mem-fraction-static 0.9
+```
+
+**Router command:**
+
+```bash Command
+python -m sglang_router.launch_router --pd-disaggregation \
+  --prefill $PREFILL_ADDR 8998 \
+  --decode $DECODE_ADDR \
+  --host 127.0.0.1 \
+  --port 30000
+```
+
+For production deployments (RBG / LWS-based, DeepEP EP parallelism), see [multi_node_deployment docs](../../../docs/references/multi_node_deployment/rbg_pd/deepseekv32_pd).
+
+#### 4.2.5 DSA Long-Sequence Context Parallel and PP/CP
+
+SGLang provides two context parallel (CP) modes for long-sequence workloads, controlled with `--dsa-prefill-cp-mode`.
+
+**In-sequence splitting** (`--dsa-prefill-cp-mode in-seq-split`): Each CP rank handles a uniform shard of the sequence; KV cache is gathered via all-gather. Batch size is restricted to 1 during prefill. See [PR #12065](https://github.com/sgl-project/sglang/pull/12065).
+
+```bash Command
+# In-seq splitting mode — EP + DP, batch size 1
+python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp \
+  --tp 8 --ep 8 --dp 2 --enable-dp-attention \
+  --enable-dsa-prefill-context-parallel --attn-cp-size 4 \
+  --dsa-prefill-cp-mode in-seq-split --max-running-requests 32
+```
+
+**Round-robin splitting** (`--dsa-prefill-cp-mode round-robin-split`, default): Distributes tokens by `token_idx % cp_size`. Supports fused MoE, FP8 KV cache, and multi-batch prefill. Cannot be combined with DP attention. See [PR #13959](https://github.com/sgl-project/sglang/pull/13959).
+
+```bash Command
+# Round-robin splitting — FusedMoE + CP8
+python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp \
+  --tp 8 --enable-dsa-prefill-context-parallel --attn-cp-size 8 \
+  --dsa-prefill-cp-mode round-robin-split --max-running-requests 32
+```
+
+**PP + CP (multi-node):** Combines Pipeline Parallelism and Context Parallelism for cross-node scaling. The production-optimized configurations below have been verified on Hopper:
 
 We suggested `DP2` + `MTP` for local deployment of agentic workflow with DeepSeek V3.2 on Hopper platform:
 
@@ -349,19 +492,19 @@ sglang_args=$(echo serve \
   --moe-a2a-backend deepep --ep-size 16  \
   --page-size 128 \
   --chunked-prefill-size 16384 \
-  --attention-backend nsa \
-  --nsa-prefill-backend flashmla_sparse \
-  --nsa-decode-backend flashmla_sparse \
-  --enable-nsa-prefill-context-parallel \
-  --nsa-prefill-cp-mode round-robin-split \
-  --cuda-graph-max-bs 128 \
+  --attention-backend dsa \
+  --dsa-prefill-backend flashmla_sparse \
+  --dsa-decode-backend flashmla_sparse \
+  --enable-dsa-prefill-context-parallel \
+  --dsa-prefill-cp-mode round-robin-split \
+  --cuda-graph-max-bs-decode 128 \
   --max-running-requests 128 \
   --trust-remote-code --host "0.0.0.0" --port 30000 \
   --log-requests \
   --context-length 65536 \
   --allow-auto-truncate --enable-metrics \
   --tool-call-parser deepseekv32 --reasoning-parser deepseek-v3 \
-  --served-model-name DeepSeek-V3.2-nsa-pp-cp-ep-dp
+  --served-model-name DeepSeek-V3.2-dsa-pp-cp-ep-dp
 )
 
 sglang_args=($sglang_args)
@@ -382,20 +525,20 @@ dp_config=" \
 "
 
 cp_config=" \
-  --enable-nsa-prefill-context-parallel \
+  --enable-dsa-prefill-context-parallel \
 "
 
 if [ "$dp" -eq 1 ]; then
 
 cp_config=" \
   $cp_config \
-  --nsa-prefill-cp-mode round-robin-split \
+  --dsa-prefill-cp-mode round-robin-split \
 "
 
 else
 cp_config=" \
   $cp_config \
-  --nsa-prefill-cp-mode in-seq-split \
+  --dsa-prefill-cp-mode in-seq-split \
 "
 fi
 
@@ -595,6 +738,27 @@ python3 -m sglang.test.few_shot_gsm8k --num-questions 200 --port 30000
     Output throughput: 965.919 token/s
     ```
 
+- **Full GSM8K (1319 questions)** — for a stricter accuracy check, run the full set 8-shot:
+
+```shell Command
+python3 benchmark/gsm8k/bench_sglang.py --num-shots 8 --num-questions 1319 --parallel 1319
+```
+
+  - 8-shot:
+    ```
+    Accuracy: 0.956
+    Invalid: 0.000
+    Latency: 25.109 s
+    Output throughput: 5226.235 token/s
+    ```
+  - 20-shot (long-context; stays close to the 8-shot result):
+    ```
+    Accuracy: 0.956
+    Invalid: 0.000
+    Latency: 29.545 s
+    Output throughput: 4418.617 token/s
+    ```
+
 #### 5.2.2 MMLU Benchmark
 
 - **Benchmark Command:**
@@ -621,6 +785,83 @@ python3 benchmark/mmlu/bench_sglang.py --nsub 10 --port 30000
     Total latency: 7.961
     Average accuracy: 0.879
     ```
+
+#### 5.2.3 GPQA-Diamond Benchmark
+
+- **Benchmark Command:**
+
+```shell Command
+python3 -m sglang.test.run_eval --port 30000 --eval-name gpqa --num-examples 198 --max-tokens 128000 --repeat 8 --thinking-mode deepseek-v3
+```
+
+- **Test Results** (model: `deepseek-ai/DeepSeek-V3.2-Exp`, 8×B200):
+  - Default (`temperature=0`): mean **0.797** over 8 runs — closely matches the official GPQA-Diamond score of **79.9** for DeepSeek-V3.2-Exp reported in its [model card](https://huggingface.co/deepseek-ai/DeepSeek-V3.2-Exp)
+  - With `temperature=1.0, top_p=0.95` (as recommended by DeepSeek):
+
+```shell Command
+python3 -m sglang.test.run_eval --port 30000 --eval-name gpqa --num-examples 198 --max-tokens 128000 --repeat 8 --top-p 0.95 --temperature 1.0 --thinking-mode deepseek-v3
+```
+
+  ```
+  Repeat: 8, mean: 0.840
+  Scores: ['0.848', '0.808', '0.848', '0.838', '0.879', '0.813', '0.838', '0.848']
+  ```
+
+#### 5.2.4 AIME 2025 Benchmark
+
+Results on AIME 2025 (8×B200), evaluated with [NeMo-Skills](https://github.com/NVIDIA/NeMo-Skills.git):
+
+<table style={{width: "100%", borderCollapse: "collapse"}}>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.02)"}}>Model</th>
+      <th style={{textAlign: "right", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.05)"}}>pass@1 avg-of-4</th>
+      <th style={{textAlign: "right", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.02)"}}>majority@4</th>
+      <th style={{textAlign: "right", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.05)"}}>pass@4</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>DeepSeek-V3.2-Exp</td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.05)"}}>87.50% ± 1.67%</td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.02)"}}>90.00%</td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.05)"}}>90.00%</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>DeepSeek-V3.2</td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.05)"}}>92.50% ± 1.67%</td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.02)"}}>94.71%</td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.05)"}}>96.67%</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>DeepSeek-V3.2-Speciale</td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.05)"}}>95.00% ± 1.92%</td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.02)"}}>95.83%</td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.05)"}}>100.00%</td>
+    </tr>
+  </tbody>
+</table>
+
+**Reproduction.** Install [NeMo-Skills](https://github.com/NVIDIA/NeMo-Skills), launch the server with the tool-call and reasoning parsers, then run `ns eval`:
+
+```bash Command
+pip install git+https://github.com/NVIDIA/NeMo-Skills.git --ignore-installed blinker
+
+export NEMO_SKILLS_DISABLE_UNCOMMITTED_CHANGES_CHECK=1
+ns prepare_data aime25
+
+ns eval \
+  --benchmarks=aime25:4 \
+  --server_type=sglang \
+  --model=deepseek-ai/DeepSeek-V3.2-Exp \
+  --server_address=http://localhost:30000/v1 \
+  --output_dir=nemo_skills_aime25_output \
+  ++chat_template_kwargs.thinking=true \
+  ++inference.temperature=1.0 \
+  ++inference.top_p=0.95 \
+  ++inference.tokens_to_generate=64000
+  # Use ++inference.tokens_to_generate=120000 for the DeepSeek-V3.2-Speciale model
+```
 
 ### 5.3 Speed Benchmark on Hopper
 

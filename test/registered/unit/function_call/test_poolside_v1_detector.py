@@ -8,7 +8,7 @@ from sglang.srt.function_call.poolside_v1_detector import PoolsideV1Detector
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(1.0, "stage-a-test-cpu")
+register_cpu_ci(1.0, "base-a-test-cpu")
 
 
 class TestPoolsideV1Detector(CustomTestCase):

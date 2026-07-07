@@ -14,29 +14,30 @@ import sys
 import tempfile
 from dataclasses import field
 from enum import Enum
-from typing import Any, Optional
+from typing import Any, List, Literal, Optional
 
 import addict
 import yaml
 
 from sglang.multimodal_gen import envs
-from sglang.multimodal_gen.configs.models.encoders import T5Config
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
     LTX2PipelineConfig,
     is_ltx23_native_variant,
 )
 from sglang.multimodal_gen.configs.quantization.nunchaku import NunchakuSVDQuantArgs
-from sglang.multimodal_gen.runtime.disaggregation.disagg_args import (
-    DisaggArgsMixin,
-    add_disagg_cli_args,
-    convert_disagg_role_string,
-)
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config import (
     NunchakuConfig,
 )
 from sglang.multimodal_gen.runtime.loader.utils import BYTES_PER_GB
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_components import (
+    LAYERWISE_OFFLOAD_ALL_COMPONENTS,
+    LAYERWISE_OFFLOAD_DIT_GROUP,
+    cpu_offload_flags_for_layerwise_components,
+    layerwise_component_matches_any_selection,
+    normalize_layerwise_offload_components,
+)
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
@@ -45,15 +46,13 @@ from sglang.multimodal_gen.runtime.server_args_auto_tune import (
     PERFORMANCE_MODES,
     ServerArgsAutoTuner,
 )
+from sglang.multimodal_gen.runtime.server_args_disagg import DisaggServerArgsMixin
 from sglang.multimodal_gen.runtime.utils.common import (
     is_port_available,
     is_valid_ipv6_address,
+    normalize_gpu_ids,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
-    CYAN,
-    GREEN,
-    RED,
-    RESET,
     _sanitize_for_logging,
     configure_logger,
     init_logger,
@@ -66,7 +65,8 @@ from sglang.multimodal_gen.utils import (
 
 logger = init_logger(__name__)
 
-LTX2_TWO_STAGE_DEVICE_MODES = ("original", "snapshot", "resident")
+LTX2_TWO_STAGE_DEVICE_MODES = ("original", "resident")
+LTX2_TWO_STAGE_DEVICE_MODE_CHOICES = (*LTX2_TWO_STAGE_DEVICE_MODES, "snapshot")
 LTX2_TWO_STAGE_PIPELINE_NAMES = ("LTX2TwoStagePipeline", "LTX2TwoStageHQPipeline")
 # H200-class GPUs (>=130 GiB total) can usually keep both LTX2 DiTs resident.
 LTX2_RESIDENT_AUTO_ENABLE_MEM_GB = 130
@@ -77,6 +77,13 @@ def _normalize_ltx2_two_stage_device_mode(mode: str | None) -> str | None:
     if mode is None:
         return None
     mode = mode.lower()
+    if mode == "snapshot":
+        logger.warning(
+            "ltx2_two_stage_device_mode=snapshot is deprecated and is treated "
+            "as original. Please use ltx2_two_stage_device_mode=original or "
+            "resident instead. This alias may be removed after two release cycles."
+        )
+        return "original"
     return mode
 
 
@@ -112,8 +119,11 @@ class Backend(str, Enum):
         return [backend.value for backend in cls]
 
 
+WARMUP_MODES = ("off", "request", "server")
+
+
 @dataclasses.dataclass
-class ServerArgs(DisaggArgsMixin):
+class ServerArgs(DisaggServerArgsMixin):
     # Model and path configuration (for convenience)
     model_path: str
 
@@ -143,6 +153,8 @@ class ServerArgs(DisaggArgsMixin):
     # Parallelism
     num_gpus: int = 1
     performance_mode: str = "auto"
+    base_gpu_id: int = 0
+    gpu_ids: list[int] | None = None
     tp_size: Optional[int] = None
     sp_degree: Optional[int] = None
     # sequence parallelism
@@ -182,20 +194,35 @@ class ServerArgs(DisaggArgsMixin):
 
     # path to pre-quantized transformer weights (single .safetensors or directory).
     transformer_weights_path: str | None = None
+    # Per-component transformer weight overrides (key = model_index.json component name).
+    # Pipelines use this when a checkpoint ships separate quantized weights for
+    # secondary DiT components; the generic loader consumes it without model-specific
+    # filename logic.
+    component_transformer_weights_paths: dict[str, str] = field(default_factory=dict)
+
+    # Quantization method for online quantization
+    quantization: str | None = None
+    # Layer name patterns to skip during online quantization
+    quantization_ignored_layers: list[str] | None = None
+
     # can restrict layers to adapt, e.g. ["q_proj"]
     # Will adapt only q, k, v, o by default.
     lora_target_modules: list[str] | None = None
 
     # CPU offload parameters
     dit_cpu_offload: bool | None = None
+    # if true, select the DiT layerwise group
     dit_layerwise_offload: bool | None = None
+    layerwise_offload_components: list[str] | None = None
     dit_offload_prefetch_size: float = 0.0
+    offload_during_compile: bool = True
     text_encoder_cpu_offload: bool | None = None
     image_encoder_cpu_offload: bool | None = None
     vae_cpu_offload: bool | None = False
     use_fsdp_inference: bool | None = None
     pin_cpu_memory: bool = True
     ltx2_two_stage_device_mode: str | None = None
+    _explicit_arg_names: set[str] = field(default_factory=set, repr=False)
 
     # ComfyUI integration
     comfyui_mode: bool = False
@@ -203,8 +230,24 @@ class ServerArgs(DisaggArgsMixin):
     # Compilation
     enable_torch_compile: bool = False
 
+    # NVTX profiling
+    enable_layerwise_nvtx_marker: bool = False
+
     # warmup
+    # `warmup_mode` is the canonical knob: one of WARMUP_MODES
+    #   - "off":     no warmup.
+    #   - "server":  server-based warmup — a synthetic request right after the
+    #                server is ready, before real traffic
+    #   - "request": request-based warmup — warm on the first real request(s).
+    #                This is a BENCHMARK aid
+    # existing consumers keep working) and as deprecated CLI aliases. None means
+    # "derive the mode from the legacy booleans"; _adjust_warmup resolves it.
+    warmup_mode: str | None = None
+
+    # deprecated: warmup and server_warmup
     warmup: bool = False
+    server_warmup: bool = False
+
     warmup_resolutions: list[str] = None
     warmup_steps: int = 1
 
@@ -266,13 +309,21 @@ class ServerArgs(DisaggArgsMixin):
     # MoE parameters used by Wan2.2
     boundary_ratio: float | None = None
 
-    # Disaggregation — fields defined here, methods in DisaggArgsMixin,
-    # CLI registration in disagg_args.add_disagg_cli_args().
-    base_gpu_id: int = 0
+    # Disaggregation (pool mode only — launched via launch_pool_disagg_server())
     disagg_role: RoleType = RoleType.MONOLITHIC
-    disagg_timeout: int = 600
+    disagg_timeout: int = 3600
+    disagg_downstream_wait_timeout: int = 1800
     disagg_dispatch_policy: str = "round_robin"
     disagg_mode: bool = False
+    disagg_instance_id: int = 0
+    disagg_max_slots_per_instance: int = 8
+    disagg_transfer_redundancy: float = 1.25
+    disagg_role_device: Literal["auto", "cpu", "cuda"] = "auto"
+    disagg_transfer_backend: Literal["auto", "mock", "mooncake"] = "auto"
+    disagg_transfer_pool_size: int = 256 * 1024 * 1024
+    disagg_transfer_pin_memory: Literal["auto", "off", "required"] = "auto"
+    disagg_p2p_hostname: str = "127.0.0.1"
+    disagg_ib_device: str | None = None
     disagg_server_addr: str | None = None
     encoder_urls: str | None = None
     denoiser_urls: str | None = None
@@ -282,22 +333,24 @@ class ServerArgs(DisaggArgsMixin):
     denoiser_sp: int | None = None
     denoiser_ulysses: int | None = None
     denoiser_ring: int | None = None
+    decoder_sp: int | None = None
     decoder_tp: int | None = None
-    disagg_transfer_pool_size: int = 256 * 1024 * 1024
-    disagg_p2p_hostname: str = "127.0.0.1"
-    disagg_ib_device: str | None = None
     pool_work_endpoint: str | None = None
     pool_result_endpoint: str | None = None
+    pool_control_endpoint: str | None = None
+    pool_control_advertised_endpoint: str | None = None
 
     # Logging
     log_level: str = "info"
+    log_requests: bool = False
+    log_requests_level: int = 2
+    log_requests_format: str = "text"
+    log_requests_target: Optional[List[str]] = None
     uvicorn_access_log_exclude_prefixes: list[str] = field(default_factory=list)
 
     # Tracing
     enable_trace: bool = False
     otlp_traces_endpoint: str = "localhost:4317"
-
-    # get_role_parallelism, derive_pool_*_endpoint — from DisaggArgsMixin
 
     @property
     def broker_port(self) -> int:
@@ -317,14 +370,16 @@ class ServerArgs(DisaggArgsMixin):
     def _adjust_parameters(self):
         """set defaults and normalize values."""
         auto_tuner = ServerArgsAutoTuner(self)
-        auto_tuner.adjust()
+        auto_tuner.adjust_based_on_performance_mode()
+        self._adjust_disagg_parallelism_aliases()
         if auto_tuner.could_override_server_args():
             self._adjust_offload()
-            auto_tuner.maybe_adjust_auto_dit_layerwise_offload()
+            auto_tuner.maybe_adjust_auto_default_layerwise_offload()
         self._adjust_ltx2_two_stage_device_mode()
         if auto_tuner.could_override_server_args():
             auto_tuner.maybe_adjust_auto_component_residency_after_offload()
             auto_tuner.maybe_adjust_auto_fsdp_with_offload_enabled()
+            auto_tuner.maybe_replace_cpu_offloaded_components_with_layerwise()
         self._adjust_path()
         self._adjust_quant_config()
         self._adjust_warmup()
@@ -333,9 +388,25 @@ class ServerArgs(DisaggArgsMixin):
         self._adjust_parallelism()
         self._adjust_attention_backend()
         self._adjust_platform_specific()
+        self._adjust_layerwise_offload_components()
         self._adjust_autocast()
         auto_tuner.finalize_auto_flags()
         self.adjust_pipeline_config()
+
+    def _adjust_disagg_parallelism_aliases(self):
+        if self.decoder_tp is None:
+            return
+        if self.decoder_sp is not None and self.decoder_sp != self.decoder_tp:
+            raise ValueError(
+                "decoder_tp is deprecated in favor of decoder_sp; "
+                "please set only one of them or keep the same value."
+            )
+        if self.decoder_sp is None:
+            logger.warning(
+                "decoder_tp is deprecated and is treated as decoder_sp for "
+                "decoder/VAE parallel decode. Please use decoder_sp instead."
+            )
+            self.decoder_sp = self.decoder_tp
 
     def _validate_parameters(self):
         """check consistency and raise errors for invalid configs"""
@@ -370,24 +441,44 @@ class ServerArgs(DisaggArgsMixin):
         self.nunchaku_config = resolution.nunchaku_config
 
     def adjust_pipeline_config(self):
-        # enable parallel folding when SP is enabled
-        if self.tp_size != 1 or self.sp_degree <= 1:
+        # 1. adjust for encoder parallel folding
+        tp_size = self.tp_size or 1
+        dp_size = self.dp_size or 1
+        sp_degree = self.sp_degree or 1
+        # one replica = all its GPUs
+        replica_size = (self.num_gpus or tp_size) // dp_size
+        fold_world = dp_size == 1 and not self.disagg_mode and replica_size > tp_size
+
+        if fold_world:
+            mode = "world"
+        elif tp_size == 1 and sp_degree > 1:
+            # Preserve prior behavior for dp>1 / disaggregated SP runs.
+            mode = "sp"
+        else:
             return
 
-        enabled = False
-        for text_encoder_config in self.pipeline_config.text_encoder_configs:
-            if isinstance(text_encoder_config, T5Config):
-                text_encoder_config.parallel_folding = True
-                enabled = True
-                text_encoder_config.parallel_folding_mode = "sp"
+        # Propose the fold group from the parallelism for every encoder. The
+        # loader keeps it only for encoders wide enough to benefit at their real
+        # (post-load) size and whose dims divide the group -- see
+        # finalize_encoder_folding. Deciding on real size (not architecture)
+        # handles the same encoder family at different parameter counts.
+        encoder_configs = list(self.pipeline_config.text_encoder_configs) + list(
+            getattr(self.pipeline_config, "image_encoder_configs", ()) or ()
+        )
+        for encoder_config in encoder_configs:
+            encoder_config.parallel_folding_mode = mode
 
-        if enabled:
-            logger.info(
-                "Enabled T5 text encoder parallel folding (mode=sp) for %s (tp_size=%s, sp_degree=%s).",
-                self.__class__.__name__,
-                self.tp_size,
-                self.sp_degree,
-            )
+        logger.info(
+            "Proposed encoder parallel folding (mode=%s) for %s "
+            "(tp=%s sp=%s cfg=%s replica=%s); the loader keeps it for encoders "
+            "wide enough to benefit.",
+            mode,
+            self.__class__.__name__,
+            tp_size,
+            sp_degree,
+            self.cfg_parallel_degree or 1,
+            replica_size,
+        )
 
     def _adjust_offload(self):
         if current_platform.is_cpu():
@@ -406,9 +497,6 @@ class ServerArgs(DisaggArgsMixin):
             if self.image_encoder_cpu_offload is None:
                 self.image_encoder_cpu_offload = True
         elif self.pipeline_config.task_type.is_image_gen():
-            logger.info(
-                "Disabling some offloading (except dit, text_encoder) for image generation model"
-            )
             if self.dit_cpu_offload is None:
                 self.dit_cpu_offload = True
             if self.text_encoder_cpu_offload is None:
@@ -441,7 +529,7 @@ class ServerArgs(DisaggArgsMixin):
         if mode not in LTX2_TWO_STAGE_DEVICE_MODES:
             raise ValueError(
                 f"Invalid ltx2_two_stage_device_mode={mode!r}. "
-                f"Expected one of {LTX2_TWO_STAGE_DEVICE_MODES}."
+                f"Expected one of {LTX2_TWO_STAGE_DEVICE_MODE_CHOICES}."
             )
 
         self.ltx2_two_stage_device_mode = mode
@@ -449,9 +537,9 @@ class ServerArgs(DisaggArgsMixin):
     def _resolve_default_ltx2_two_stage_device_mode(self) -> str:
         if not current_platform.is_cuda():
             logger.info(
-                "Automatically set ltx2_two_stage_device_mode=snapshot on non-CUDA platform"
+                "Automatically set ltx2_two_stage_device_mode=original on non-CUDA platform"
             )
-            return "snapshot"
+            return "original"
 
         device_name = str(current_platform.get_device_name(0)).upper()
         device_total_memory_gb = (
@@ -469,11 +557,11 @@ class ServerArgs(DisaggArgsMixin):
             return "resident"
 
         logger.info(
-            "Automatically set ltx2_two_stage_device_mode=snapshot for CUDA GPU (%s, %.2f GiB total)",
+            "Automatically set ltx2_two_stage_device_mode=original for CUDA GPU (%s, %.2f GiB total)",
             device_name,
             device_total_memory_gb,
         )
-        return "snapshot"
+        return "original"
 
     def _is_ltx23_two_stage_pipeline(self) -> bool:
         return is_ltx2_two_stage_pipeline_name(self.pipeline_class_name) and (
@@ -481,10 +569,16 @@ class ServerArgs(DisaggArgsMixin):
             or is_ltx23_native_variant(self.pipeline_config.vae_config.arch_config)
         )
 
-    def _uses_ltx23_snapshot_two_stage_residency(self) -> bool:
+    def _uses_ltx23_high_memory_resident_two_stage_mode(self) -> bool:
+        if (
+            self.ltx2_two_stage_device_mode != "resident"
+            or not self._is_ltx23_two_stage_pipeline()
+            or not current_platform.is_cuda()
+        ):
+            return False
         return (
-            self.ltx2_two_stage_device_mode == "snapshot"
-            and self._is_ltx23_two_stage_pipeline()
+            current_platform.get_device_total_memory() / BYTES_PER_GB
+            >= LTX2_RESIDENT_AUTO_ENABLE_MEM_GB
         )
 
     def _adjust_attention_backend(self):
@@ -636,13 +730,56 @@ class ServerArgs(DisaggArgsMixin):
         return None, None
 
     def _adjust_warmup(self):
+        #   --warmup-mode > --warmup/--server-warmup
+        mode_explicit = self.is_arg_explicitly_set("warmup_mode")
+        legacy_explicit = self.is_arg_explicitly_set(
+            "warmup"
+        ) or self.is_arg_explicitly_set("server_warmup")
+        if self.warmup_mode is not None:
+            if self.warmup_mode not in WARMUP_MODES:
+                raise ValueError(
+                    f"Invalid --warmup-mode {self.warmup_mode!r}; "
+                    f"expected one of {WARMUP_MODES}."
+                )
+            if mode_explicit and legacy_explicit:
+                logger.warning(
+                    "Both --warmup-mode and the deprecated --warmup/--server-warmup "
+                    "were set; --warmup-mode=%s takes precedence.",
+                    self.warmup_mode,
+                )
+            if mode_explicit or not legacy_explicit:
+                self.warmup = self.warmup_mode != "off"
+                self.server_warmup = self.warmup_mode == "server"
+            elif self.warmup:
+                self.server_warmup = self.server_warmup or self.warmup_mode == "server"
+
+        # Explicit resolutions imply warmup is on (request-based).
         if self.warmup_resolutions is not None:
             self.warmup = True
 
-        if self.warmup:
+        if (
+            self.enable_torch_compile
+            and self.warmup_mode is None
+            and not mode_explicit
+            and not legacy_explicit
+        ):
+            self.warmup = True
+            self.server_warmup = True
             logger.info(
-                "Warmup enabled, the launch time is expected to be longer than usual"
+                "Automatically enabled server warmup for torch.compile so first "
+                "real requests do not pay compile latency. Set --warmup-mode off "
+                "to disable this behavior."
             )
+
+        if self.disagg_role != RoleType.MONOLITHIC:
+            self.server_warmup = False
+
+        if not self.warmup:
+            self.server_warmup = False
+
+        self.warmup_mode = (
+            "off" if not self.warmup else "server" if self.server_warmup else "request"
+        )
 
     @staticmethod
     def _require_port(port: int, name: str) -> None:
@@ -662,19 +799,37 @@ class ServerArgs(DisaggArgsMixin):
         )
 
         if self.strict_ports:
+            requested_ports = []
             if needs_http:
-                self._require_port(self.port, "HTTP")
-            self._require_port(self.scheduler_port, "Scheduler")
+                requested_ports.append((self.port, "HTTP"))
+            requested_ports.append((self.scheduler_port, "Scheduler"))
             if self.master_port is not None:
-                self._require_port(self.master_port, "Master")
+                requested_ports.append((self.master_port, "Master"))
+            seen_ports: dict[int, str] = {}
+            for port, name in requested_ports:
+                if port in seen_ports:
+                    raise RuntimeError(
+                        f"{name} port {port} duplicates {seen_ports[port]} port and "
+                        "--strict-ports is enabled."
+                    )
+                seen_ports[port] = name
+                self._require_port(port, name)
         else:
+            settled_ports: set[int] = set()
             if needs_http:
                 self.port = self.settle_port(self.port)
+                settled_ports.add(self.port)
             initial_scheduler_port = self.scheduler_port + (
                 random.randint(0, 100) if self.scheduler_port == 5555 else 0
             )
-            self.scheduler_port = self.settle_port(initial_scheduler_port)
-            self.master_port = self.settle_port(self.master_port, 37)
+            self.scheduler_port = self.settle_port(
+                initial_scheduler_port, avoid=settled_ports
+            )
+            settled_ports.add(self.scheduler_port)
+            if self.master_port is not None:
+                self.master_port = self.settle_port(
+                    self.master_port, 37, avoid=settled_ports
+                )
 
     def _adjust_parallelism(self):
         sp_unspecified = self.sp_degree is None
@@ -682,15 +837,15 @@ class ServerArgs(DisaggArgsMixin):
         ring_unspecified = self.ring_degree is None
         cfg_unspecified = self.enable_cfg_parallel is None
 
-        if current_platform.is_cpu() and (self.tp_size or 1) > 1:
+        if self.tp_size is None:
+            self.tp_size = 1
+
+        if current_platform.is_cpu() and self.tp_size > 1:
             # CPU platform reuse num_gpus to represent num cpu numa nodes as devices
             self.num_gpus = self.tp_size
 
         if self.hsdp_shard_dim is None:
             self.hsdp_shard_dim = self.num_gpus
-
-        if self.tp_size is None:
-            self.tp_size = 1
 
         # --cfg-parallel-size takes precedence over --enable-cfg-parallel bool.
         if self.cfg_parallel_degree is not None:
@@ -705,25 +860,41 @@ class ServerArgs(DisaggArgsMixin):
         # SamplingParams use classifier-free guidance (negative_prompt is not None),
         # because non-CFG models (e.g. FLUX) crash when CFG parallel splits ranks.
         if cfg_unspecified:
-            cfg_group_size = self.dp_size * self.tp_size * 2
-            if (
-                self.performance_mode != "manual"
-                and self.num_gpus >= 2
-                and self.num_gpus % cfg_group_size == 0
-                and sp_unspecified
-                and ulysses_unspecified
-                and ring_unspecified
-                and self._model_default_uses_cfg()
-            ):
-                self.enable_cfg_parallel = True
-                logger.info(
-                    "Automatically enabled CFG parallel for %d GPUs. "
-                    "Use --sp-degree / --ulysses-degree to use sequence "
-                    "parallelism instead.",
-                    self.num_gpus,
-                )
-            else:
+            deployment_config = self.pipeline_config.get_model_deployment_config()
+            auto_cfg_parallel_degree = deployment_config.get_auto_cfg_parallel_degree(
+                self.num_gpus
+            )
+            if auto_cfg_parallel_degree < 1:
                 self.enable_cfg_parallel = False
+            else:
+                cfg_group_size = self.dp_size * self.tp_size * auto_cfg_parallel_degree
+                if (
+                    self.performance_mode != "manual"
+                    and deployment_config.auto_enable_cfg_parallel
+                    and self.num_gpus >= 2
+                    and self.num_gpus % cfg_group_size == 0
+                    and sp_unspecified
+                    and ulysses_unspecified
+                    and ring_unspecified
+                    and self._model_default_uses_cfg()
+                ):
+                    self.cfg_parallel_degree = auto_cfg_parallel_degree
+                    self.enable_cfg_parallel = auto_cfg_parallel_degree > 1
+                    if self.enable_cfg_parallel:
+                        logger.info(
+                            "Automatically enabled CFG parallel at degree %d for %d GPUs. "
+                            "Use --sp-degree / --ulysses-degree to use sequence "
+                            "parallelism instead.",
+                            self.cfg_parallel_degree,
+                            self.num_gpus,
+                        )
+                    else:
+                        logger.info(
+                            "Automatically disabled CFG parallel for %d GPUs based on model deployment config.",
+                            self.num_gpus,
+                        )
+                else:
+                    self.enable_cfg_parallel = False
 
         # Resolve cfg_parallel_degree to a concrete int now that enable_cfg_parallel is settled.
         if self.cfg_parallel_degree is None:
@@ -796,6 +967,97 @@ class ServerArgs(DisaggArgsMixin):
         if current_platform.is_mps():
             self.use_fsdp_inference = False
             self.dit_layerwise_offload = False
+            self.layerwise_offload_components = None
+
+    def is_arg_explicitly_set(self, arg_name: str) -> bool:
+        return arg_name in self._explicit_arg_names
+
+    def should_configure_layerwise_offload_for_lazy_component(
+        self, component_name: str
+    ) -> bool:
+        """Return whether a lazy-loaded component should try layerwise offload.
+
+        Lazy components are loaded after the normal pipeline-wide configuration
+        pass, so they should only attempt layerwise configuration when their
+        component name is covered by the selected layerwise scope.
+        """
+        component_names = normalize_layerwise_offload_components(
+            self.layerwise_offload_components
+        )
+        if not component_names:
+            return False
+        if LAYERWISE_OFFLOAD_ALL_COMPONENTS in component_names:
+            return True
+        return layerwise_component_matches_any_selection(
+            component_name, component_names
+        )
+
+    @property
+    def is_dit_layerwise_offload_selected(self) -> bool:
+        """returns if dit is selected to be layerwise-offload"""
+        component_names = self.layerwise_offload_components
+        return bool(
+            component_names
+            and "dit_cpu_offload"
+            in cpu_offload_flags_for_layerwise_components(component_names)
+        )
+
+    def _adjust_layerwise_offload_components(self):
+        explicitly_set_component_names = normalize_layerwise_offload_components(
+            self.layerwise_offload_components
+        )
+        if self.dit_layerwise_offload:
+            if explicitly_set_component_names is None:
+                explicitly_set_component_names = [LAYERWISE_OFFLOAD_DIT_GROUP]
+            elif LAYERWISE_OFFLOAD_DIT_GROUP not in explicitly_set_component_names:
+                explicitly_set_component_names = [
+                    LAYERWISE_OFFLOAD_DIT_GROUP,
+                    *explicitly_set_component_names,
+                ]
+
+        if explicitly_set_component_names is not None:
+            self.layerwise_offload_components = explicitly_set_component_names
+            self._disable_non_dit_cpu_offload_for_layerwise_components(
+                explicitly_set_component_names
+            )
+            return
+
+    def _disable_non_dit_cpu_offload_for_layerwise_components(
+        self, component_names: list[str]
+    ) -> None:
+        # non-DiT layerwise offload replaces the corresponding component-level CPU offload
+        flag_names = cpu_offload_flags_for_layerwise_components(component_names)
+        disabled_flag_names: list[str] = []
+
+        if (
+            "text_encoder_cpu_offload" in flag_names
+            and self.text_encoder_cpu_offload is not False
+        ):
+            self.text_encoder_cpu_offload = False
+            disabled_flag_names.append("text_encoder_cpu_offload")
+        if (
+            "image_encoder_cpu_offload" in flag_names
+            and self.image_encoder_cpu_offload is not False
+        ):
+            self.image_encoder_cpu_offload = False
+            disabled_flag_names.append("image_encoder_cpu_offload")
+        if "vae_cpu_offload" in flag_names and self.vae_cpu_offload is not False:
+            self.vae_cpu_offload = False
+            disabled_flag_names.append("vae_cpu_offload")
+
+        explicit_disabled_flag_names = [
+            flag_name
+            for flag_name in disabled_flag_names
+            if self.is_arg_explicitly_set(flag_name)
+        ]
+        if explicit_disabled_flag_names:
+            logger.info(
+                "Ignoring explicit CPU-offload flags because layerwise offload "
+                "manages the same component weights: %s",
+                ", ".join(
+                    f"{flag_name}=False" for flag_name in explicit_disabled_flag_names
+                ),
+            )
 
     def _adjust_autocast(self):
         if self.disable_autocast is None:
@@ -845,7 +1107,9 @@ class ServerArgs(DisaggArgsMixin):
         configure_logger(server_args=self)
 
         # Convert string disagg_role to enum (from CLI/config)
-        convert_disagg_role_string(self.__dict__)
+        if isinstance(self.disagg_role, str):
+            self.disagg_role = RoleType.from_string(self.disagg_role)
+        self.gpu_ids = normalize_gpu_ids(self.gpu_ids)
 
         # 1. adjust parameters
         self._adjust_parameters()
@@ -938,13 +1202,6 @@ class ServerArgs(DisaggArgsMixin):
             help="The specific model version to use (can be a branch name, tag name, or commit id)",
         )
 
-        # Parallelism
-        parser.add_argument(
-            "--num-gpus",
-            type=int,
-            default=ServerArgs.num_gpus,
-            help="The number of GPUs to use.",
-        )
         parser.add_argument(
             "--performance-mode",
             "--mode",
@@ -953,7 +1210,7 @@ class ServerArgs(DisaggArgsMixin):
             default=ServerArgs.performance_mode,
             help=(
                 "Preset for performance and memory defaults. "
-                "'manual' keeps performance-related server args under explicit user control; "
+                "'manual' keeps performance-related server args under explicit user control, no adjustment is made; "
                 "'auto' keeps safe defaults and applies high-confidence FSDP/CFG improvements; "
                 "'speed' favors GPU-resident execution for lower latency and higher throughput, and may OOM; "
                 "'memory' favors lower GPU memory usage; "
@@ -961,6 +1218,30 @@ class ServerArgs(DisaggArgsMixin):
             ),
         )
 
+        # Parallelism
+        parser.add_argument(
+            "--num-gpus",
+            type=int,
+            default=ServerArgs.num_gpus,
+            help="The number of GPUs to use.",
+        )
+        parser.add_argument(
+            "--base-gpu-id",
+            type=int,
+            default=ServerArgs.base_gpu_id,
+            help="The starting GPU ID for this instance. Used with --disagg-role "
+            "to place role instances on specific GPUs without CUDA_VISIBLE_DEVICES.",
+        )
+        parser.add_argument(
+            "--gpu-ids",
+            nargs="+",
+            default=None,
+            help=(
+                "Physical GPU IDs for this instance, e.g. --gpu-ids 0 1 6 7 "
+                "or --gpu-ids 0,1,6,7. Overrides --base-gpu-id for standalone "
+                "disagg roles."
+            ),
+        )
         parser.add_argument(
             "--tp-size",
             type=int,
@@ -1006,6 +1287,7 @@ class ServerArgs(DisaggArgsMixin):
             "--data-parallel-size",
             "--dp-size",
             "--dp",
+            dest="dp_size",
             type=int,
             default=ServerArgs.dp_size,
             help="The data parallelism size.",
@@ -1031,8 +1313,7 @@ class ServerArgs(DisaggArgsMixin):
             "Increase this value if you encounter 'Connection closed by peer' errors after the service is idle. ",
         )
 
-        # Disaggregated diffusion args (defined in disagg_args.py)
-        add_disagg_cli_args(parser)
+        ServerArgs.add_disagg_cli_args(parser)
 
         # Prompt text file for batch processing
         parser.add_argument(
@@ -1051,25 +1332,64 @@ class ServerArgs(DisaggArgsMixin):
             "--enable-torch-compile",
             action=StoreBoolean,
             default=ServerArgs.enable_torch_compile,
-            help="Use torch.compile to speed up DiT inference."
+            help="Use torch.compile to speed up diffusion hot paths. "
+            + "When no warmup mode is configured, this enables server warmup "
+            + "so first real requests do not pay compile latency. "
             + "However, will likely cause precision drifts. See (https://github.com/pytorch/pytorch/issues/145213)",
+        )
+        parser.add_argument(
+            "--offload-during-compile",
+            action=StoreBoolean,
+            default=ServerArgs.offload_during_compile,
+            help="Offload components during the torch.compile warmup (the DiT layerwise) so max-autotune fits on tighter-memory GPUs, then restore the configured residency for serving. Skipped when the DiT is already layerwise-offloaded, or under cache-dit / FSDP.",
+        )
+
+        parser.add_argument(
+            "--enable-layerwise-nvtx-marker",
+            action=StoreBoolean,
+            default=ServerArgs.enable_layerwise_nvtx_marker,
+            help="Enable layerwise NVTX markers for profiling with Nsight Systems. "
+            "Adds NVTX ranges around each pipeline stage, the denoising loop, "
+            "every denoising step, the predict_noise / scheduler_step "
+            "sub-operations, and every transformer submodule forward (recursive). "
+            "Warmup steps are excluded to keep captured traces clean.",
         )
 
         # warmup
         parser.add_argument(
+            "--warmup-mode",
+            type=str,
+            choices=list(WARMUP_MODES),
+            default=ServerArgs.warmup_mode,
+            help=(
+                "Warmup mode (canonical knob). One of: "
+                "`off` (no warmup); `request` (request-based: warm on real "
+                "incoming requests); `server` (server-based: a synthetic warmup "
+                "request right after the server is ready, before traffic). "
+                "Takes precedence over the deprecated --warmup/--server-warmup. "
+                "`sglang serve` defaults to `server`; other entrypoints default "
+                "to request-based when warmup is enabled. When enabled, look for "
+                "the line ending with `(with warmup excluded)` for actual "
+                "processing time."
+            ),
+        )
+        parser.add_argument(
             "--warmup",
             action=StoreBoolean,
             default=ServerArgs.warmup,
-            help="Perform some warmup after server starts (if `--warmup-resolutions` is specified) or before processing the first request (if `--warmup-resolutions` is not specified)."
-            "Recommended to enable when benchmarking to ensure fair comparison and best performance."
-            "When enabled with `--warmup-resolutions` unspecified, look for the line ending with `(with warmup excluded)` for actual processing time.",
+            help=(
+                "[DEPRECATED: use --warmup-mode] Perform warmup before normal "
+                "traffic. Maps to --warmup-mode request (or server, combined "
+                "with --server-warmup). Recommended when benchmarking for fair "
+                "comparison and best performance."
+            ),
         )
         parser.add_argument(
             "--warmup-resolutions",
             type=str,
             nargs="+",
             default=ServerArgs.warmup_resolutions,
-            help="Specify resolutions for server to warmup. e.g., `--warmup-resolutions 256x256, 720x720`",
+            help="Specify explicit warmup resolutions. e.g., `--warmup-resolutions 256x256 720x720`",
         )
         parser.add_argument(
             "--warmup-steps",
@@ -1077,7 +1397,17 @@ class ServerArgs(DisaggArgsMixin):
             default=ServerArgs.warmup_steps,
             help="The number of warmup steps to perform for each resolution.",
         )
+        parser.add_argument(
+            "--server-warmup",
+            action=StoreBoolean,
+            default=ServerArgs.server_warmup,
+            help=(
+                "[DEPRECATED: use --warmup-mode server] Send a synthetic warmup "
+                "request after the server is ready (server-based warmup)."
+            ),
+        )
 
+        # layerwise offload
         parser.add_argument(
             "--dit-cpu-offload",
             action=StoreBoolean,
@@ -1087,8 +1417,24 @@ class ServerArgs(DisaggArgsMixin):
             "--dit-layerwise-offload",
             action=StoreBoolean,
             default=ServerArgs.dit_layerwise_offload,
-            help="Enable layerwise CPU offload with async H2D prefetch overlap for supported DiT models (e.g., Wan, MOVA). "
-            "Cannot be used together with cache-dit (SGLANG_CACHE_DIT_ENABLED), dit_cpu_offload, or use_fsdp_inference.",
+            help="Enable layerwise CPU offload with async H2D prefetch overlap for DiTs. "
+            "It selects only the DiT layerwise group. Cannot be used together with cache-dit "
+            "(SGLANG_CACHE_DIT_ENABLED) or use_fsdp_inference. May be combined with "
+            "--dit-cpu-offload, in which case DiT weights stay on host memory and only the "
+            "layers needed for the current step are brought on-device (lowest peak GPU memory).",
+        )
+        parser.add_argument(
+            "--layerwise-offload-components",
+            "--layerwise-offload-modules",
+            type=str,
+            nargs="+",
+            default=ServerArgs.layerwise_offload_components,
+            help="Select pipeline components for layerwise offload. "
+            "Use dit to select the DiT layerwise group, default for the default group "
+            "(currently text_encoder, image_encoder, and vae), "
+            "or all to select every layerwise-offloadable component. "
+            "This option does not imply --dit-layerwise-offload. Example: "
+            "--layerwise-offload-components text_encoder image_encoder vae.",
         )
         parser.add_argument(
             "--dit-offload-prefetch-size",
@@ -1096,11 +1442,8 @@ class ServerArgs(DisaggArgsMixin):
             default=ServerArgs.dit_offload_prefetch_size,
             help="The size of prefetch for dit-layerwise-offload. If the value is between 0.0 and 1.0, it is treated as a ratio of the total number of layers. If the value is >= 1, it is treated as the absolute number of layers. 0.0 means prefetch 1 layer (lowest memory). Values above 0.5 might have peak memory close to no offload but worse performance.",
         )
-        parser.add_argument(
-            "--use-fsdp-inference",
-            action=StoreBoolean,
-            help="Use FSDP inference to shard DiT weights across GPUs. For single-GPU memory pressure, prefer CPU or layerwise offload.",
-        )
+
+        # offload flags
         parser.add_argument(
             "--text-encoder-cpu-offload",
             action=StoreBoolean,
@@ -1116,6 +1459,12 @@ class ServerArgs(DisaggArgsMixin):
             action=StoreBoolean,
             help="Use CPU offload for VAE. Enable if run out of memory.",
         )
+
+        parser.add_argument(
+            "--use-fsdp-inference",
+            action=StoreBoolean,
+            help="Use FSDP inference to shard DiT weights across GPUs. For single-GPU memory pressure, prefer CPU or layerwise offload.",
+        )
         parser.add_argument(
             "--pin-cpu-memory",
             action=StoreBoolean,
@@ -1125,14 +1474,15 @@ class ServerArgs(DisaggArgsMixin):
         parser.add_argument(
             "--ltx2-two-stage-device-mode",
             type=str,
-            choices=LTX2_TWO_STAGE_DEVICE_MODES,
+            choices=LTX2_TWO_STAGE_DEVICE_MODE_CHOICES,
             default=ServerArgs.ltx2_two_stage_device_mode,
             help=(
                 "LTX-2.3 two-stage device residency mode: "
                 "'original' keeps official two-stage semantics without premerged stage2, "
-                "'snapshot' keeps premerged stage2 with snapshot-based release, "
                 "'resident' keeps both transformers resident on GPU. "
-                "Default is auto: resident on H200/high-memory CUDA GPUs, otherwise snapshot."
+                "'snapshot' is deprecated, treated as 'original', and may be "
+                "removed after two release cycles. "
+                "Default is auto: resident on H200/high-memory CUDA GPUs, otherwise original."
             ),
         )
         parser.add_argument(
@@ -1141,12 +1491,33 @@ class ServerArgs(DisaggArgsMixin):
             help="Disable autocast for denoising loop and vae decoding in pipeline sampling",
         )
 
+        # quantization
         parser.add_argument(
             "--quantization",
             type=str,
-            default=None,
-            help='Quantization method override (e.g. "mxfp8", "fp8", "modelslim"). '
-            "When set, the transformer loader will use this instead of auto-detection.",
+            default=ServerArgs.quantization,
+            help=(
+                "Quantization method for the transformer. If omitted, the method is "
+                "auto-detected from the checkpoint config or safetensors metadata when "
+                "possible. Use this flag to override auto-detection. "
+                "Online (post-load) quantization from a BF16/FP16 checkpoint "
+                "is supported for 'fp8' and 'mxfp4'. Other methods "
+                "('modelopt', 'modelopt_fp8', 'modelopt_fp4', 'mxfp8', "
+                "'mxfp4_npu', 'modelslim') require a pre-quantized checkpoint. "
+                "Note: 'mxfp4' targets ROCm + MI350+ (gfx95x); "
+                "'mxfp4_npu' / 'mxfp8' target Ascend NPU (A5 series for mxfp4_npu)."
+            ),
+        )
+        parser.add_argument(
+            "--quantization-ignored-layers",
+            type=str,
+            nargs="+",
+            default=ServerArgs.quantization_ignored_layers,
+            help=(
+                "Layer name patterns to keep unquantized during online quantization "
+                "(fp8/mxfp4). Each pattern is matched against the layer prefix. "
+                "Example: --quantization-ignored-layers img_mod txt_mod to_out"
+            ),
         )
 
         # Nunchaku SVDQuant quantization parameters
@@ -1305,6 +1676,38 @@ class ServerArgs(DisaggArgsMixin):
             help="OTLP collector endpoint when --enable-trace is set. Format: <host>:<port>",
         )
         parser.add_argument(
+            "--log-requests",
+            action="store_true",
+            help="Log user-facing fields of all requests (default: False). "
+            "Verbosity is controlled by --log-requests-level.",
+        )
+        parser.add_argument(
+            "--log-requests-level",
+            type=int,
+            default=ServerArgs.log_requests_level,
+            choices=[0, 1, 2, 3],
+            help="Verbosity level for request logging. "
+            "0: Log request metadata only (request_id). "
+            "1: Log metadata + sampling config (seed, steps, guidance, resolution, frames, fps, ...). "
+            "2: Log metadata + sampling config + prompt/negative prompt (truncated to 2 KiB). "
+            "3: Log metadata + sampling config + full prompt/negative prompt.",
+        )
+        parser.add_argument(
+            "--log-requests-format",
+            type=str,
+            default=ServerArgs.log_requests_format,
+            choices=["text", "json"],
+            help="Format for request logging: 'text' (human-readable) or 'json' (structured)",
+        )
+        parser.add_argument(
+            "--log-requests-target",
+            type=str,
+            nargs="+",
+            default=ServerArgs.log_requests_target,
+            help="Target(s) for request logging: 'stdout' and/or directory path(s) for file output. "
+            "Can specify multiple targets, e.g., '--log-requests-target stdout /my/path'. ",
+        )
+        parser.add_argument(
             "--uvicorn-access-log-exclude-prefixes",
             type=str,
             nargs="*",
@@ -1346,16 +1749,21 @@ class ServerArgs(DisaggArgsMixin):
         return f"tcp://{scheduler_host}:{self.scheduler_port}"
 
     def settle_port(
-        self, port: int, port_inc: int = 42, max_attempts: int = 100
+        self,
+        port: int,
+        port_inc: int = 42,
+        max_attempts: int = 100,
+        avoid: set[int] | None = None,
     ) -> int:
         """
         Find an available port with retry logic.
         """
         attempts = 0
         original_port = port
+        avoid = avoid or set()
 
         while attempts < max_attempts:
-            if is_port_available(port):
+            if port not in avoid and is_port_available(port):
                 if attempts > 0:
                     logger.info(
                         f"Port {original_port} was unavailable, using port {port} instead"
@@ -1460,7 +1868,10 @@ class ServerArgs(DisaggArgsMixin):
 
     @classmethod
     def from_cli_args(
-        cls, args: argparse.Namespace, unknown_args: list[str] | None = None
+        cls,
+        args: argparse.Namespace,
+        unknown_args: list[str] | None = None,
+        default_args: dict[str, Any] | None = None,
     ) -> "ServerArgs":
         if unknown_args is None:
             unknown_args = []
@@ -1474,38 +1885,53 @@ class ServerArgs(DisaggArgsMixin):
             raise SystemExit(f"error: unrecognized arguments: {' '.join(remaining)}")
 
         provided_args = cls.get_provided_args(args, unknown_args)
+        explicit_arg_names = set(provided_args)
 
         # Handle config file
         config_file = provided_args.get("config")
         if config_file:
             config_args = cls.load_config_file(config_file)
+            explicit_arg_names.update(config_args)
             provided_args = {**config_args, **provided_args}
+
+        if default_args:
+            for key, value in default_args.items():
+                provided_args.setdefault(key, value)
 
         if dynamic_paths:
             existing = dict(provided_args.get("component_paths") or {})
             existing.update(dynamic_paths)
             provided_args["component_paths"] = existing
+            explicit_arg_names.add("component_paths")
         if dynamic_attention_backends:
             existing = cls._parse_component_attention_backend_map(
                 provided_args.get("component_attention_backends")
             )
             existing.update(dynamic_attention_backends)
             provided_args["component_attention_backends"] = existing
+            explicit_arg_names.add("component_attention_backends")
 
+        provided_args["_explicit_arg_names"] = explicit_arg_names
         return cls.from_dict(provided_args)
 
     @classmethod
     def from_dict(cls, kwargs: dict[str, Any]) -> "ServerArgs":
         """Create a ServerArgs object from a dictionary."""
-        attrs = [attr.name for attr in dataclasses.fields(cls)]
+        attrs = [attr.name for attr in dataclasses.fields(cls) if attr.init]
         server_args_kwargs: dict[str, Any] = {}
+        explicit_arg_names = kwargs.get("_explicit_arg_names")
+        if explicit_arg_names is None:
+            explicit_arg_names = set(kwargs)
 
         component_paths = dict(kwargs.get("component_paths") or {})
         if component_paths:
             server_args_kwargs["component_paths"] = component_paths
+        server_args_kwargs["_explicit_arg_names"] = set(explicit_arg_names)
 
         for attr in attrs:
-            if attr == "pipeline_config":
+            if attr == "_explicit_arg_names":
+                continue
+            elif attr == "pipeline_config":
                 pipeline_config = PipelineConfig.from_kwargs(kwargs)
                 logger.debug(f"Using PipelineConfig: {type(pipeline_config)}")
                 server_args_kwargs["pipeline_config"] = pipeline_config
@@ -1538,14 +1964,18 @@ class ServerArgs(DisaggArgsMixin):
 
     @classmethod
     def from_kwargs(cls, **kwargs: Any) -> "ServerArgs":
+        explicit_arg_names = set(kwargs)
+
         # Convert backend string to enum if necessary
         if "backend" in kwargs and isinstance(kwargs["backend"], str):
             kwargs["backend"] = Backend.from_string(kwargs["backend"])
 
         # Convert disagg_role string to enum if necessary
-        convert_disagg_role_string(kwargs)
+        if "disagg_role" in kwargs and isinstance(kwargs["disagg_role"], str):
+            kwargs["disagg_role"] = RoleType.from_string(kwargs["disagg_role"])
 
         kwargs["pipeline_config"] = PipelineConfig.from_kwargs(kwargs)
+        kwargs["_explicit_arg_names"] = explicit_arg_names
         return cls(**kwargs)
 
     @staticmethod
@@ -1566,8 +1996,16 @@ class ServerArgs(DisaggArgsMixin):
                 # For '--arg=value', this gets 'arg'; for '--arg', this also gets 'arg'.
                 arg_name = arg.split("=", 1)[0].replace("-", "_").lstrip("_")
                 provided_arg_names.add(arg_name)
-        if "mode" in provided_arg_names:
-            provided_arg_names.add("performance_mode")
+        cli_aliases = {
+            "cfg_parallel_size": "cfg_parallel_degree",
+            "data_parallel_size": "dp_size",
+            "dp": "dp_size",
+            "layerwise_offload_modules": "layerwise_offload_components",
+            "mode": "performance_mode",
+        }
+        for alias_name, dest_name in cli_aliases.items():
+            if alias_name in provided_arg_names:
+                provided_arg_names.add(dest_name)
 
         # Populate provided_args if the argument from the namespace was on the command line.
         for k, v in vars(args).items():
@@ -1600,42 +2038,52 @@ class ServerArgs(DisaggArgsMixin):
                 "We do not recommend --dit-offload-prefetch-size to be between 0.5 and 1.0"
             )
 
-        # validate dit_layerwise_offload conflicts
-        if self.dit_layerwise_offload:
+        # validate layerwise offload conflicts
+        if envs.SGLANG_CACHE_DIT_ENABLED and self.use_fsdp_inference:
+            if self.is_arg_explicitly_set("use_fsdp_inference"):
+                raise ValueError(
+                    "FSDP inference cannot be enabled together with cache-dit. "
+                    "cache-dit wraps known DiT block structures, while FSDP wraps "
+                    "and shards modules before cache-dit can inspect them. "
+                    "Please disable --use-fsdp-inference or disable "
+                    "SGLANG_CACHE_DIT_ENABLED."
+                )
+            logger.warning(
+                "cache-dit is enabled, automatically disabling use_fsdp_inference."
+            )
+            self.use_fsdp_inference = False
+
+        if self.layerwise_offload_components:
             if self.dit_offload_prefetch_size < 0.0:
                 raise ValueError("dit_offload_prefetch_size must be non-negative")
 
-            if self.use_fsdp_inference:
+            is_dit_layerwise_offload_selected = self.is_dit_layerwise_offload_selected
+            if self.use_fsdp_inference and is_dit_layerwise_offload_selected:
                 logger.warning(
-                    "dit_layerwise_offload is enabled, automatically disabling use_fsdp_inference."
+                    "layerwise offload is selected for DiT components, automatically disabling use_fsdp_inference."
                 )
                 self.use_fsdp_inference = False
 
-            if self.dit_cpu_offload is None:
-                logger.warning(
-                    "dit_layerwise_offload is enabled, automatically disabling dit_cpu_offload."
-                )
-                self.dit_cpu_offload = False
-
-            if envs.SGLANG_CACHE_DIT_ENABLED:
+            if envs.SGLANG_CACHE_DIT_ENABLED and is_dit_layerwise_offload_selected:
                 raise ValueError(
-                    "dit_layerwise_offload cannot be enabled together with cache-dit. "
+                    "DiT layerwise offload cannot be enabled together with cache-dit. "
                     "cache-dit may reuse skipped blocks whose weights have been released by layerwise offload, "
                     "causing shape mismatch errors. "
-                    "Please disable either --dit-layerwise-offload or SGLANG_CACHE_DIT_ENABLED."
+                    "Please disable --dit-layerwise-offload, remove DiT from --layerwise-offload-components, "
+                    "or disable SGLANG_CACHE_DIT_ENABLED."
                 )
 
-            logger.warning(
-                "dit_layerwise_offload is enabled: %slower GPU memory usage%s, but %smay reduce throughput or increase latency%s. "
-                "%sIf you are using multi-GPU deployment and already have enough memory headroom, prefer keeping dit_layerwise_offload disabled.%s "
-                "Please tune this based on your memory headroom and performance target.",
-                GREEN,
-                RESET,
-                RED,
-                RESET,
-                CYAN,
-                RESET,
-            )
+            if (
+                self.performance_mode == "memory"
+                or self.is_arg_explicitly_set("layerwise_offload_components")
+                or self.dit_layerwise_offload
+            ):
+                logger.info_once(
+                    "Using layerwise offload components: "
+                    f"{', '.join(self.layerwise_offload_components)}. "
+                    "This reduces peak GPU memory and can increase latency; use "
+                    "--performance-mode speed for GPU-resident defaults when memory allows."
+                )
 
     def _validate_parallelism(self):
         if self.sp_degree > self.num_gpus or self.num_gpus % self.sp_degree != 0:

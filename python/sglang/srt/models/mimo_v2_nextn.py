@@ -20,7 +20,6 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.configs.model_config import get_mimo_v2_fused_qkv_expected_tp_size
-from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
@@ -28,7 +27,6 @@ from sglang.srt.layers.communicator import (
     enable_moe_dense_fully_dp,
 )
 from sglang.srt.layers.dp_attention import (
-    get_attention_tp_rank,
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layernorm import RMSNorm
@@ -46,7 +44,7 @@ from sglang.srt.models.mimo_v2 import (
     MiMoV2MLP,
     load_mimo_v2_qkv_proj_weight,
 )
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_flags, get_parallel
 from sglang.srt.utils import add_prefix
 
 MiMoV2Config = None
@@ -201,7 +199,12 @@ class MiMoV2ModelNextN(nn.Module):
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
         if input_embeds is None:
-            hidden_states = self.embed_tokens(input_ids)
+            # Multimodal pad sentinels (MM_PAD_SHIFT_VALUE + hash) sit out of vocab;
+            # clamp to avoid an OOB gather. The draft gets visual semantics from target
+            # hidden_states, so the embedding at these positions is unused anyway.
+            hidden_states = self.embed_tokens(
+                input_ids.clamp(min=0, max=self.vocab_size - 1)
+            )
         else:
             hidden_states = input_embeds
         if hidden_states.shape[0] > 0:
@@ -245,7 +248,7 @@ class MiMoV2MTP(MiMoV2ForCausalLM):
     ) -> None:
         nn.Module.__init__(self)
         self.config = config
-        self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
 
         self.model = MiMoV2ModelNextN(
@@ -256,7 +259,7 @@ class MiMoV2MTP(MiMoV2ForCausalLM):
             config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("lm_head", prefix),
-            use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+            use_attn_tp_group=get_flags().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
 
@@ -347,7 +350,7 @@ class MiMoV2MTP(MiMoV2ForCausalLM):
                 if name in params_dict.keys():
                     param = params_dict[name]
                     if "attention_sink_bias" in name:
-                        start = get_attention_tp_rank() * param.numel()
+                        start = get_parallel().attn_tp_rank * param.numel()
                         param.data.copy_(loaded_weight[start : start + param.numel()])
                     else:
                         weight_loader = getattr(

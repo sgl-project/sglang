@@ -1,75 +1,185 @@
-"""Unit tests for /v1/loads _compute_aggregate.
+"""Unit tests for /v1/loads load snapshot response behavior."""
 
-Narrow scope: lock in the semantic of new aggregate keys added by this PR
-(total_used_tokens vs total_tokens). Trivial helpers (dict filtering,
-zero-init branch) are not covered — they would just restate Python.
-"""
-
+import asyncio
+import os
+import tempfile
 import unittest
+from types import SimpleNamespace
 
-from sglang.srt.entrypoints.v1_loads import _compute_aggregate
+import msgspec.msgpack
+
+from sglang.srt.entrypoints.v1_loads import get_loads
+from sglang.srt.managers.load_snapshot import (
+    HEADER_STRUCT,
+    MAGIC,
+    SLOT_LEN_STRUCT,
+    SLOT_SIZE,
+    VERSION,
+    LoadSnapshot,
+    ShmLoadSnapshotReader,
+    ShmLoadSnapshotWriter,
+    slot_offset,
+)
+from sglang.srt.managers.tokenizer_control_mixin import TokenizerControlMixin
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
-register_cpu_ci(est_time=10, suite="stage-a-test-cpu")
-
-
-def _load(
-    *,
-    dp_rank=0,
-    running=0,
-    waiting=0,
-    used=0,
-    total=0,
-    token_usage=0.0,
-    throughput=0.0,
-    utilization=0.0,
-):
-    return {
-        "dp_rank": dp_rank,
-        "num_running_reqs": running,
-        "num_waiting_reqs": waiting,
-        "num_used_tokens": used,
-        "num_total_tokens": total,
-        "token_usage": token_usage,
-        "gen_throughput": throughput,
-        "utilization": utilization,
-    }
+maybe_stub_sgl_kernel()
 
 
-class TestComputeAggregate(CustomTestCase):
-    def test_multi_dp_rank_sums(self):
-        agg = _compute_aggregate(
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
+
+def _temp_path() -> str:
+    fd, path = tempfile.mkstemp()
+    os.close(fd)
+    os.unlink(path)
+    return path
+
+
+class _FakeTokenizerManager(TokenizerControlMixin):
+    def __init__(self, reader, dp_size: int):
+        self.load_snapshot_reader = reader
+        self.server_args = SimpleNamespace(
+            dp_size=dp_size,
+            enable_dp_attention=False,
+            nnodes=1,
+        )
+
+    def auto_create_handle_loop(self):
+        pass
+
+
+class _FakeHttpTokenizerManager:
+    metrics_collector = None
+
+    def __init__(self, loads):
+        self.loads = loads
+
+    async def get_loads(self, include=None, dp_rank=None):
+        results = []
+        for load in self.loads:
+            if dp_rank is not None and load.dp_rank != dp_rank:
+                continue
+            results.append(load)
+        return results
+
+
+class TestLoadsResponse(CustomTestCase):
+    def test_response_omits_server_side_aggregate_and_redundant_fields(self):
+        manager = _FakeHttpTokenizerManager(
             [
-                _load(dp_rank=0, running=3, waiting=1, used=50, total=70),
-                _load(dp_rank=1, running=5, waiting=2, used=80, total=100),
-                _load(dp_rank=2, running=0, waiting=4, used=0, total=40),
+                LoadSnapshot(
+                    dp_rank=0,
+                    num_running_reqs=3,
+                    num_waiting_reqs=2,
+                    num_total_tokens=256,
+                )
             ]
         )
-        self.assertEqual(agg["total_running_reqs"], 8)
-        self.assertEqual(agg["total_waiting_reqs"], 7)
-        self.assertEqual(agg["total_reqs"], 15)
-        self.assertEqual(agg["total_used_tokens"], 130)
-        self.assertEqual(agg["total_tokens"], 210)
 
-    def test_averages_over_dp_count(self):
-        agg = _compute_aggregate(
-            [
-                _load(token_usage=0.6, throughput=100.0, utilization=0.5),
-                _load(token_usage=0.8, throughput=200.0, utilization=0.7),
-            ]
-        )
-        self.assertAlmostEqual(agg["avg_token_usage"], 0.7)
-        self.assertAlmostEqual(agg["avg_throughput"], 150.0)
-        self.assertAlmostEqual(agg["avg_utilization"], 0.6)
+        response = asyncio.run(get_loads(tokenizer_manager=manager))
 
-    def test_total_tokens_differs_from_total_used_tokens(self):
-        # Regression: total_tokens sums num_total_tokens, NOT num_used_tokens.
-        # Gateway reads aggregate.total_tokens for DP load estimation, so a
-        # silent swap would under-report load.
-        agg = _compute_aggregate([_load(used=10, total=30), _load(used=20, total=45)])
-        self.assertEqual(agg["total_used_tokens"], 30)
-        self.assertEqual(agg["total_tokens"], 75)
+        self.assertNotIn("dp_rank_count", response)
+        self.assertNotIn("aggregate", response)
+        self.assertEqual(len(response["loads"]), 1)
+        self.assertNotIn("num_total_reqs", response["loads"][0])
+        self.assertEqual(response["loads"][0]["num_running_reqs"], 3)
+        self.assertEqual(response["loads"][0]["num_waiting_reqs"], 2)
+
+
+class TestGetLoads(CustomTestCase):
+    def test_load_snapshot_wire_format_is_msgpack_slots(self):
+        path = _temp_path()
+        writer = ShmLoadSnapshotWriter(path, dp_size=2, dp_rank=1)
+        try:
+            writer.write(
+                LoadSnapshot(
+                    dp_rank=1,
+                    num_running_reqs=3,
+                    num_waiting_reqs=2,
+                    token_usage=0.25,
+                )
+            )
+
+            with open(path, "rb") as f:
+                data = f.read()
+
+            self.assertEqual(len(data), HEADER_STRUCT.size + 2 * SLOT_SIZE)
+            magic, version, dp_size, slot_size = HEADER_STRUCT.unpack_from(data, 0)
+            self.assertEqual(magic, MAGIC)
+            self.assertEqual(version, VERSION)
+            self.assertEqual(dp_size, 2)
+            self.assertEqual(slot_size, SLOT_SIZE)
+
+            offset = slot_offset(1, slot_size)
+            (payload_len,) = SLOT_LEN_STRUCT.unpack_from(data, offset)
+            payload_start = offset + SLOT_LEN_STRUCT.size
+            payload = data[payload_start : payload_start + payload_len]
+            decoded = msgspec.msgpack.decode(payload)
+
+            self.assertEqual(decoded["dp_rank"], 1)
+            self.assertEqual(decoded["num_running_reqs"], 3)
+            self.assertEqual(decoded["num_waiting_reqs"], 2)
+            self.assertEqual(decoded["token_usage"], 0.25)
+        finally:
+            writer.close()
+            if os.path.exists(path):
+                os.unlink(path)
+
+    def test_reads_snapshot_and_filters_sections(self):
+        path = _temp_path()
+        writer = ShmLoadSnapshotWriter(path, dp_size=1, dp_rank=0)
+        reader = ShmLoadSnapshotReader(path, dp_size=1)
+        try:
+            initial_load = reader.read(0)
+            self.assertIsNotNone(initial_load)
+            self.assertEqual(initial_load.num_total_tokens, 0)
+
+            writer.write(
+                LoadSnapshot(
+                    dp_rank=0,
+                    timestamp=1.25,
+                    num_running_reqs=3,
+                    num_waiting_reqs=2,
+                    num_used_tokens=128,
+                    num_total_tokens=256,
+                    max_total_num_tokens=4096,
+                    token_usage=0.125,
+                    gen_throughput=99.5,
+                    cache_hit_rate=0.75,
+                    utilization=0.5,
+                    max_running_requests=128,
+                    has_disaggregation=1,
+                    disagg_mode=2,
+                    decode_transfer_queue_reqs=4,
+                    has_queues=1,
+                    queue_waiting=2,
+                    queue_grammar=1,
+                    queue_paused=0,
+                    queue_retracted=3,
+                )
+            )
+
+            manager = _FakeTokenizerManager(reader, dp_size=1)
+            loads = asyncio.run(manager.get_loads(include=["core"], dp_rank=0))
+
+            self.assertEqual(len(loads), 1)
+            self.assertEqual(loads[0].num_total_tokens, 256)
+
+            d = loads[0].to_dict({"core"})
+            self.assertNotIn("disaggregation", d)
+            self.assertNotIn("queues", d)
+
+            loads_all = asyncio.run(manager.get_loads(include=["all"], dp_rank=0))
+            d_all = loads_all[0].to_dict()
+            self.assertIn("disaggregation", d_all)
+            self.assertIn("queues", d_all)
+        finally:
+            reader.close()
+            writer.close()
+            if os.path.exists(path):
+                os.unlink(path)
 
 
 if __name__ == "__main__":

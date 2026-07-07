@@ -26,6 +26,12 @@ from sglang.srt.batch_invariant_ops import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.utils import MultiPlatformOp
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    Phase,
+    check_cuda_graph_backend,
+)
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
@@ -53,7 +59,26 @@ _flashinfer_layernorm_available = False
 if _is_cuda or _is_xpu or _is_musa:
     if _is_flashinfer_available:
         try:
-            from flashinfer.norm import layernorm
+            import flashinfer.norm
+
+            from sglang.srt.utils.custom_op import register_custom_op
+
+            def _layernorm_fake_impl(
+                input: torch.Tensor,
+                gamma: torch.Tensor,
+                beta: torch.Tensor,
+                eps: float = 1e-6,
+            ) -> torch.Tensor:
+                return torch.empty_like(input)
+
+            @register_custom_op(fake_impl=_layernorm_fake_impl)
+            def layernorm(
+                input: torch.Tensor,
+                gamma: torch.Tensor,
+                beta: torch.Tensor,
+                eps: float = 1e-6,
+            ) -> torch.Tensor:
+                return flashinfer.norm.layernorm(input, gamma, beta, eps)
 
             _flashinfer_layernorm_available = True
         except (ImportError, AttributeError):
@@ -105,6 +130,11 @@ if _is_cuda:
 
         _jit_rmsnorm_hf = None
 
+    from sglang.jit_kernel.norm import fused_add_rmsnorm as _jit_fused_add_rmsnorm
+    from sglang.jit_kernel.norm import (
+        is_supported_jit_fused_add_rmsnorm_hidden_size,
+    )
+
 
 logger = logging.getLogger(__name__)
 
@@ -124,9 +154,6 @@ def _forward_with_allreduce_fusion(
     """Shared allreduce-fused RMSNorm logic usable by any norm."""
     if residual is not None:
         from sglang.srt.distributed import (
-            get_attn_tensor_model_parallel_world_size,
-            get_moe_expert_parallel_world_size,
-            get_moe_tensor_parallel_world_size,
             tensor_model_parallel_all_reduce,
             tensor_model_parallel_fused_allreduce_rmsnorm,
         )
@@ -135,12 +162,12 @@ def _forward_with_allreduce_fusion(
         )
 
         if use_attn_tp_group:
-            world_size = get_attn_tensor_model_parallel_world_size()
+            world_size = get_parallel().attn_tp_size
         else:
-            if get_moe_expert_parallel_world_size() > 1:
-                world_size = get_moe_expert_parallel_world_size()
+            if get_parallel().moe_ep_size > 1:
+                world_size = get_parallel().moe_ep_size
             else:
-                world_size = get_moe_tensor_parallel_world_size()
+                world_size = get_parallel().moe_tp_size
 
         if world_size > 1:
             if post_residual_addition is not None:
@@ -159,6 +186,7 @@ def _forward_with_allreduce_fusion(
                     residual=residual,
                     weight=weight,
                     eps=norm_module.variance_epsilon,
+                    max_token_num=max(x.shape[0], 2048),
                     use_attn_tp_group=use_attn_tp_group,
                 )
                 if fused_result[0] is not None:
@@ -183,6 +211,7 @@ class RMSNorm(MultiPlatformOp):
         has_weight: bool = True,
         weight_dtype: Optional = None,
         override_orig_dtype: Optional = None,
+        x_pad_to_multiple: int = 0,
     ) -> None:
         super().__init__()
         self.has_weight = has_weight
@@ -198,7 +227,25 @@ class RMSNorm(MultiPlatformOp):
         self.variance_size_override = (
             None if var_hidden_size == hidden_size else var_hidden_size
         )
+        # When > 0, fuse a zero-pad of the last dim out to a multiple of
+        # this value into the rmsnorm kernel via aiter's
+        # `fused_add_rmsnorm_pad` Triton kernel. The padded output has
+        # shape (M, ceil(N/x_pad_to_multiple)*x_pad_to_multiple); the
+        # residual_out stays at the original (M, N) shape.
+
         if _use_aiter:
+            self.x_pad_to_multiple = x_pad_to_multiple
+            self._fused_pad_kernel = None
+
+            if x_pad_to_multiple > 0:
+                try:
+                    from aiter.ops.triton.fused_add_rmsnorm_pad import (
+                        fused_add_rmsnorm_pad as _fused_add_rmsnorm_pad,
+                    )
+
+                    self._fused_pad_kernel = _fused_add_rmsnorm_pad
+                except ImportError:
+                    self._fused_pad_kernel = None
             self._forward_method = self.forward_aiter
 
     def forward_cuda(
@@ -250,6 +297,27 @@ class RMSNorm(MultiPlatformOp):
                 out = out.reshape(original_shape)
             return out
         if residual is not None:
+            if self.cast_x_before_out_mul:
+                if (
+                    x.dtype in (torch.float16, torch.bfloat16)
+                    and self.weight.data.dtype == x.dtype
+                    and (
+                        post_residual_addition is None
+                        or post_residual_addition.dtype == x.dtype
+                    )
+                    and is_supported_jit_fused_add_rmsnorm_hidden_size(x.shape[-1])
+                ):
+                    if post_residual_addition is not None:
+                        residual = residual + post_residual_addition
+                    _jit_fused_add_rmsnorm(
+                        x,
+                        residual,
+                        self.weight.data,
+                        self.variance_epsilon,
+                        cast_x_before_out_mul=self.cast_x_before_out_mul,
+                    )
+                    return x, residual
+                return self.forward_native(x, residual, post_residual_addition)
             # TODO: Ideally we want to have (hidden_states+residual)+post_residual_addition.
             # but right now we can only have hidden_states+(residual+post_residual_addition).
             # (hidden_states+residual)+post_residual_addition != hidden_states+(residual+post_residual_addition),
@@ -284,6 +352,12 @@ class RMSNorm(MultiPlatformOp):
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        # Fix dsv4 dp attenton issue
+        # the symptom is torch.AcceleratorError: HIP error: invalid configuration argument
+        if x.shape[0] == 0:
+            if residual is not None:
+                return x, residual
+            return x
         # Aiter's RMSNorm kernels expect 2D contiguous inputs. Keep the
         # already-safe layout as a zero-copy path, and only normalize strided or
         # higher-rank views such as Q/K slices from packed QKV projections.
@@ -293,6 +367,38 @@ class RMSNorm(MultiPlatformOp):
             x = x.contiguous().reshape(-1, original_shape[-1])
         elif not x.is_contiguous():
             x = x.contiguous()
+        if is_batch_invariant_mode_enabled():
+            if (
+                residual is not None
+                or self.cast_x_before_out_mul
+                or get_global_server_args().rl_on_policy_target == "fsdp"
+                or (self._fused_pad_kernel is not None and self.x_pad_to_multiple > 0)
+            ):
+                return self.forward_native(x, residual, post_residual_addition)
+            out = rms_norm_batch_invariant(
+                x,
+                self.weight.data,
+                self.variance_epsilon,
+            )
+            if needs_reshape:
+                out = out.reshape(original_shape)
+            return out
+        # Fused (add +) rmsnorm + zero-pad path. Triggered when caller
+        # constructed RMSNorm with x_pad_to_multiple > 0. Output last
+        # dim is padded up; residual_out stays at original width. Used
+        # by callers (e.g. GPT-OSS MXFP4 MoE) whose immediate consumer
+        # needs a padded hidden_size — folding the pad in here removes a
+        # separate launch.
+        if self._fused_pad_kernel is not None and self.x_pad_to_multiple > 0:
+            if post_residual_addition is not None and residual is not None:
+                residual = residual + post_residual_addition
+            return self._fused_pad_kernel(
+                x,
+                self.weight.data,
+                self.variance_epsilon,
+                residual,
+                self.x_pad_to_multiple,
+            )
         if residual is not None:
             residual_out = torch.empty_like(x)
             output = torch.empty_like(x)
@@ -322,6 +428,19 @@ class RMSNorm(MultiPlatformOp):
         if not _has_vllm_rms_norm:
             return self.forward_native(x, residual, post_residual_addition)
 
+        if is_batch_invariant_mode_enabled():
+            if (
+                residual is not None
+                or self.cast_x_before_out_mul
+                or get_global_server_args().rl_on_policy_target == "fsdp"
+            ):
+                return self.forward_native(x, residual, post_residual_addition)
+            return rms_norm_batch_invariant(
+                x,
+                self.weight.data,
+                self.variance_epsilon,
+            )
+
         if not x.is_contiguous():
             # NOTE: Remove this if aiter kernel supports discontinuous input
             x = x.contiguous()
@@ -344,6 +463,9 @@ class RMSNorm(MultiPlatformOp):
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE):
+            return self.forward_native(x, residual, post_residual_addition)
+
         if not x.is_contiguous():
             x = x.contiguous()
 
@@ -561,7 +683,9 @@ class GemmaRMSNorm(MultiPlatformOp):
         super().__init__()
         self.weight = nn.Parameter(torch.zeros(hidden_size))
         self.variance_epsilon = eps
-        self.register_buffer("gemma_weight", self.weight.data + 1.0, persistent=False)
+        self.register_buffer(
+            "gemma_weight", torch.ones_like(self.weight), persistent=False
+        )
         # (Chen-0210) Gemma weight = standard_weight + 1. Precompute once.
         # If TRTLLM allreduce fusion ever provides gemma-style norm
         # natively, this can be removed.
@@ -570,7 +694,8 @@ class GemmaRMSNorm(MultiPlatformOp):
     def _weight_loader(self, param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
         assert param.size() == loaded_weight.size()
         param.data.copy_(loaded_weight)
-        self.gemma_weight = param.data + 1.0
+        # Keep storage stable for CUDA graphs or fused paths that capture this buffer.
+        torch.add(param.data, 1.0, out=self.gemma_weight)
 
     def _forward_impl(
         self,
@@ -821,6 +946,15 @@ class Gemma4RMSNorm(MultiPlatformOp):
 
         if needs_reshape:
             out = out.reshape(original_shape)
+        return out
+
+    def forward_xpu(self, x: torch.Tensor) -> torch.Tensor:
+        if x.numel() == 0:
+            return x
+        if self.with_scale and self.scale_shift == 1.0:
+            out = gemma_rmsnorm(x, self.weight.data, self.eps)
+        else:
+            out = rmsnorm(x, self.weight.data, self.eps)
         return out
 
     def forward_hip(self, x: torch.Tensor) -> torch.Tensor:

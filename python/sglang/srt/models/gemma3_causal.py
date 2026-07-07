@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Copyright 2025 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -24,10 +26,6 @@ from transformers import (
     PreTrainedModel,
 )
 
-from sglang.srt.distributed import (
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-)
 from sglang.srt.layers.activation import GeluAndMul
 from sglang.srt.layers.layernorm import Gemma3RMSNorm
 from sglang.srt.layers.linear import (
@@ -45,6 +43,7 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix, cpu_has_amx_support, is_cpu, make_layers
 
 _is_cpu = is_cpu()
@@ -124,7 +123,7 @@ class Gemma3Attention(nn.Module):
         super().__init__()
         self.layer_id = layer_id
         self.config = config
-        tp_size = get_tensor_model_parallel_world_size()
+        tp_size = get_parallel().tp_size
 
         self.total_num_heads = config.num_attention_heads
         assert self.total_num_heads % tp_size == 0
@@ -578,9 +577,8 @@ class Gemma3TextModel(PreTrainedModel):
 
         global_config = copy.deepcopy(config)
         global_config.rope_parameters = {
+            **rope_params["full_attention"],
             "rope_theta": global_theta,
-            "factor": config.rope_parameters["full_attention"]["factor"],
-            "rope_type": "linear",
         }
         self.rotary_emb = Gemma3RotaryEmbedding(config=global_config)
         self.gradient_checkpointing = False
@@ -855,6 +853,16 @@ class Gemma3ForCausalLM(PreTrainedModel):
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
         for name, loaded_weight in weights:
+            remapped_name = maybe_remap_kv_scale_name(name, params_dict)
+            if remapped_name is None:
+                continue
+            if remapped_name != name:
+                param = params_dict[remapped_name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
+                loaded_params.add(remapped_name)
+                continue
+
             for param_name, shard_name, shard_id in stacked_params_mapping:
                 # if param_name in name:
                 # print(f"{param_name} is already in {name}")
@@ -910,10 +918,10 @@ class Gemma3ForCausalLM(PreTrainedModel):
         VocabParallelEmbedding (sharded). This method extracts the correct
         shard so the weights can be shared.
         """
-        tp_size = get_tensor_model_parallel_world_size()
+        tp_size = get_parallel().tp_size
         if tp_size <= 1:
             return weight
-        tp_rank = get_tensor_model_parallel_rank()
+        tp_rank = get_parallel().tp_rank
         shard_size = (weight.shape[0] + tp_size - 1) // tp_size
         return weight[tp_rank * shard_size : (tp_rank + 1) * shard_size]
 
