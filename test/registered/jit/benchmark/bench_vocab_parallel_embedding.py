@@ -3,99 +3,64 @@ import torch.nn.functional as F
 import triton
 import triton.testing
 
-from sglang.jit_kernel.benchmark.utils import run_benchmark
+from sglang.jit_kernel.benchmark.utils import get_benchmark_range, run_benchmark
 from sglang.srt.layers.triton_ops.vocab_parallel_embedding import (
     vocab_parallel_embedding,
 )
 from sglang.srt.layers.vocab_parallel_embedding import get_masked_input_and_mask
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.utils import is_in_ci
 
 register_cuda_ci(
     est_time=10, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
 )
 
-DEFAULT_HIDDEN_SIZE = 6144
-DEFAULT_VOCAB_SIZE = 128256
-DEFAULT_TP_SIZE = 8
-DEFAULT_TOKEN_PATTERN = "uniform"
-DEFAULT_DTYPE = "bf16"
+# Key order must match the perf_report x_names.
+DEFAULTS = dict(
+    batch_size=120,
+    hidden_size=6144,
+    vocab_size=128256,
+    tp_size=8,
+    token_pattern="uniform",
+    dtype="bf16",
+)
 
-BATCH_SIZE_SWEEP = [1, 2, 4, 8, 16, 32, 64, 120, 256, 512, 1024, 2048, 4096]
-HIDDEN_SIZE_SWEEP = [4096, 6144, 7168]
-VOCAB_TP_SWEEP = [(32000, 4), (32000, 8), (128256, 4), (128256, 8), (154880, 8)]
-TOKEN_PATTERN_SWEEP = ["uniform", "all_local", "all_remote"]
-DTYPE_SWEEP = ["bf16", "fp16"]
-
-
-def _dedupe_configs(configs):
-    seen = set()
-    out = []
-    for config in configs:
-        if config not in seen:
-            seen.add(config)
-            out.append(config)
-    return out
+# One-at-a-time star sweep around DEFAULTS (the full product would be 1170
+# configs). Each entry overrides one field (or one coupled field group).
+SWEEPS = [
+    (
+        "batch_size",
+        get_benchmark_range(
+            [1, 2, 4, 8, 16, 32, 64, 120, 256, 512, 1024, 2048, 4096],
+            ci_range=[1, 120],
+        ),
+    ),
+    ("hidden_size", get_benchmark_range([4096, 6144, 7168], ci_range=[])),
+    (
+        ("vocab_size", "tp_size"),
+        get_benchmark_range(
+            [(32000, 4), (32000, 8), (128256, 4), (128256, 8), (154880, 8)],
+            ci_range=[],
+        ),
+    ),
+    (
+        "token_pattern",
+        get_benchmark_range(["uniform", "all_local", "all_remote"], ci_range=[]),
+    ),
+    ("dtype", get_benchmark_range(["bf16", "fp16"], ci_range=[])),
+]
 
 
 def _make_benchmark_configs():
-    default_tail = (
-        DEFAULT_HIDDEN_SIZE,
-        DEFAULT_VOCAB_SIZE,
-        DEFAULT_TP_SIZE,
-        DEFAULT_TOKEN_PATTERN,
-        DEFAULT_DTYPE,
-    )
-    if is_in_ci():
-        return [(batch_size, *default_tail) for batch_size in [1, 120]]
-
-    configs = []
-    configs.extend((batch_size, *default_tail) for batch_size in BATCH_SIZE_SWEEP)
-    configs.extend(
-        (
-            120,
-            hidden_size,
-            DEFAULT_VOCAB_SIZE,
-            DEFAULT_TP_SIZE,
-            DEFAULT_TOKEN_PATTERN,
-            DEFAULT_DTYPE,
-        )
-        for hidden_size in HIDDEN_SIZE_SWEEP
-    )
-    configs.extend(
-        (
-            120,
-            DEFAULT_HIDDEN_SIZE,
-            vocab_size,
-            tp_size,
-            DEFAULT_TOKEN_PATTERN,
-            DEFAULT_DTYPE,
-        )
-        for vocab_size, tp_size in VOCAB_TP_SWEEP
-    )
-    configs.extend(
-        (
-            120,
-            DEFAULT_HIDDEN_SIZE,
-            DEFAULT_VOCAB_SIZE,
-            DEFAULT_TP_SIZE,
-            token_pattern,
-            DEFAULT_DTYPE,
-        )
-        for token_pattern in TOKEN_PATTERN_SWEEP
-    )
-    configs.extend(
-        (
-            120,
-            DEFAULT_HIDDEN_SIZE,
-            DEFAULT_VOCAB_SIZE,
-            DEFAULT_TP_SIZE,
-            DEFAULT_TOKEN_PATTERN,
-            dtype,
-        )
-        for dtype in DTYPE_SWEEP
-    )
-    return _dedupe_configs(configs)
+    # Dict keying dedupes the all-defaults config each sweep re-produces.
+    configs = {}
+    for keys, values in SWEEPS:
+        for value in values:
+            override = (
+                dict(zip(keys, value)) if isinstance(keys, tuple) else {keys: value}
+            )
+            config = {**DEFAULTS, **override}
+            configs[tuple(config.values())] = None
+    return list(configs)
 
 
 BENCHMARK_CONFIGS = _make_benchmark_configs()

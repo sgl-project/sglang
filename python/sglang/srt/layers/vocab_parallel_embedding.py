@@ -32,6 +32,9 @@ from sglang.srt.layers.quantization.base_config import (
     method_has_implemented_embedding,
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
+from sglang.srt.layers.triton_ops.vocab_parallel_embedding import (
+    vocab_parallel_embedding as fused_vocab_parallel_embedding,
+)
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import (
     cpu_has_amx_support,
@@ -180,25 +183,6 @@ def get_embedding_tp_kwargs() -> dict:
     # local tokens, so reduce within the attention-TP group, not the full TP
     # group.
     return {"enable_tp": True, "use_attn_tp_group": is_dp_attention_enabled()}
-
-
-def _can_use_triton_vocab_parallel_embedding(
-    layer: torch.nn.Module, input_: torch.Tensor
-) -> bool:
-    if not envs.SGLANG_OPT_USE_TRITON_VOCAB_PARALLEL_EMBEDDING.get():
-        return False
-    if not input_.is_cuda or not input_.is_contiguous():
-        return False
-    if input_.dtype not in (torch.int32, torch.int64):
-        return False
-    if not isinstance(layer.quant_method, UnquantizedEmbeddingMethod):
-        return False
-    weight = getattr(layer, "weight", None)
-    if weight is None or not weight.is_cuda:
-        return False
-    if weight.ndim != 2 or weight.stride(1) != 1:
-        return False
-    return weight.dtype in (torch.float16, torch.bfloat16, torch.float32)
 
 
 class VocabParallelEmbedding(torch.nn.Module):
@@ -517,38 +501,37 @@ class VocabParallelEmbedding(torch.nn.Module):
         param[: loaded_weight.shape[0]].data.copy_(loaded_weight)
         param[loaded_weight.shape[0] :].data.fill_(0)
 
-    def forward(self, input_):
-        # Surface a bad token id (>= vocab_size, or a negative / unmasked sentinel) as a
-        # located async assert instead of a silent OOB embedding gather (tp=1 does not mask).
-        maybe_detect_oob(
-            input_, 0, self.num_embeddings, "VocabParallelEmbedding input id"
-        )
-        use_triton_embedding = (
-            self.tp_size > 1 and _can_use_triton_vocab_parallel_embedding(self, input_)
-        )
-        if self.tp_size > 1 and not use_triton_embedding:
-            # Build the mask.
-            masked_input, input_mask = get_masked_input_and_mask(
-                input_,
-                self.shard_indices.org_vocab_start_index,
-                self.shard_indices.org_vocab_end_index,
-                self.shard_indices.num_org_vocab_padding,
-                self.shard_indices.added_vocab_start_index,
-                self.shard_indices.added_vocab_end_index,
-            )
-        else:
-            masked_input = input_
+    def _use_triton_embedding(self, input_: torch.Tensor) -> bool:
+        """Whether the fused Triton kernel can replace the mask+gather+fill unit."""
+        if self.tp_size == 1:
+            return False
+        if not envs.SGLANG_OPT_USE_TRITON_VOCAB_PARALLEL_EMBEDDING.get():
+            return False
+        if not isinstance(self.quant_method, UnquantizedEmbeddingMethod):
+            return False
+        if not input_.is_cuda or not input_.is_contiguous():
+            return False
+        if input_.dtype not in (torch.int32, torch.int64):
+            return False
+        return self.weight.dtype in (torch.float16, torch.bfloat16, torch.float32)
 
-        # Get the embeddings.
-        with use_symmetric_memory(
+    def _embed_local_shard(self, input_: torch.Tensor) -> torch.Tensor:
+        """Embed against the local vocab shard; out-of-shard rows are zero
+        (identity when tp_size == 1).
+
+        The output must be allocated inside the symmetric-memory context so
+        the caller's all-reduce can use it; the mask temporaries and the
+        in-place fill deliberately stay outside the pool.
+        """
+        symm_alloc = use_symmetric_memory(
             get_tp_group(), disabled=not is_allocation_symmetric()
-        ):
-            if use_triton_embedding:
-                from sglang.srt.layers.triton_ops.vocab_parallel_embedding import (
-                    vocab_parallel_embedding,
-                )
-
-                output_parallel = vocab_parallel_embedding(
+        )
+        if self.tp_size == 1:
+            with symm_alloc:
+                return self.quant_method.embedding(self, input_.long())
+        if self._use_triton_embedding(input_):
+            with symm_alloc:
+                return fused_vocab_parallel_embedding(
                     input_,
                     self.weight,
                     self.shard_indices.org_vocab_start_index,
@@ -557,19 +540,33 @@ class VocabParallelEmbedding(torch.nn.Module):
                     self.shard_indices.added_vocab_start_index,
                     self.shard_indices.added_vocab_end_index,
                 )
-            else:
-                output_parallel = self.quant_method.embedding(self, masked_input.long())
+        # Map out-of-shard ids to index 0, gather, then zero those rows.
+        masked_input, input_mask = get_masked_input_and_mask(
+            input_,
+            self.shard_indices.org_vocab_start_index,
+            self.shard_indices.org_vocab_end_index,
+            self.shard_indices.num_org_vocab_padding,
+            self.shard_indices.added_vocab_start_index,
+            self.shard_indices.added_vocab_end_index,
+        )
+        with symm_alloc:
+            output_parallel = self.quant_method.embedding(self, masked_input.long())
+        output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
+        return output_parallel
 
-        if self.tp_size > 1:
-            # Mask the output embedding.
-            if not use_triton_embedding:
-                output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
-            if not get_attn_tp_context().input_scattered:
-                if self.use_attn_tp_group:
-                    output_parallel = attn_tp_all_reduce(output_parallel)
-                else:
-                    # Reduce across all the model parallel GPUs.
-                    output_parallel = tensor_model_parallel_all_reduce(output_parallel)
+    def forward(self, input_):
+        # Surface a bad token id (>= vocab_size, or a negative / unmasked sentinel) as a
+        # located async assert instead of a silent OOB embedding gather (tp=1 does not mask).
+        maybe_detect_oob(
+            input_, 0, self.num_embeddings, "VocabParallelEmbedding input id"
+        )
+        output_parallel = self._embed_local_shard(input_)
+        if self.tp_size > 1 and not get_attn_tp_context().input_scattered:
+            if self.use_attn_tp_group:
+                output_parallel = attn_tp_all_reduce(output_parallel)
+            else:
+                # Reduce across all the model parallel GPUs.
+                output_parallel = tensor_model_parallel_all_reduce(output_parallel)
         return output_parallel
 
     def extra_repr(self) -> str:

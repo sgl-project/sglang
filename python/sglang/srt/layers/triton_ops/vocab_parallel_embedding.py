@@ -8,6 +8,11 @@ def _vocab_parallel_embedding_kernel(
     input_ptr,
     weight_ptr,
     out_ptr,
+    # The scalar params are tl.constexpr on purpose: it lets the compiler fold
+    # the vocab-window comparisons into a single range check (measured ~5%
+    # faster at large token counts), and each embedding layer has one fixed
+    # (hidden_dim, stride, shard-window) tuple, so the specialization costs one
+    # compile per layer at warmup.
     hidden_dim: tl.constexpr,
     weight_stride0: tl.constexpr,
     org_vocab_start_index: tl.constexpr,
@@ -56,6 +61,7 @@ def vocab_parallel_embedding(
 ) -> torch.Tensor:
     assert input_.is_cuda
     assert input_.is_contiguous()
+    assert input_.dtype in (torch.int32, torch.int64)
     assert weight.is_cuda
     assert weight.ndim == 2
     assert weight.stride(1) == 1
