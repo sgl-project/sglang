@@ -538,7 +538,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         # and CompressStatePool.translate_from_swa_loc_to_state_loc, which both
         # divide swa_loc by page_size. Sizing the c4 state pool by window_size
         # (128) instead over-allocates it ~2x and inflates bytes_per_full_token.
-        self.swa_storage_page_size = mr.server_args.page_size
+        self.swa_storage_page_size = mr.page_size
         self.swa_ratio = mr.server_args.swa_full_tokens_ratio
         self.is_speculative = mr.server_args.speculative_algorithm is not None
         self.online_c128_mtp_max_draft_tokens = (
