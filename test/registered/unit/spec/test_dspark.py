@@ -778,7 +778,7 @@ class TestDSparkPrefillHandoff(CustomTestCase):
             return GenerationBatchResult(can_run_cuda_graph=True)
 
         worker = self._worker(0)
-        worker.target_worker = SimpleNamespace(
+        worker._target_worker = SimpleNamespace(
             forward_batch_generation=forward_batch_generation
         )
         idle_result = GenerationBatchResult(can_run_cuda_graph=False)
