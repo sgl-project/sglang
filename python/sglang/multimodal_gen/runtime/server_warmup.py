@@ -17,6 +17,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.warmup_request_builder import (
     build_warmup_reqs,
     should_include_warmup_image,
+    should_run_visual_warmup,
 )
 
 logger = init_logger(__name__)
@@ -85,13 +86,19 @@ def is_realtime_serving(server_args: ServerArgs) -> bool:
 
 
 def should_run_synthetic_server_warmup(server_args: ServerArgs) -> bool:
-    return should_run_server_warmup(server_args) and not is_realtime_serving(
-        server_args
+    return (
+        should_run_server_warmup(server_args)
+        and should_run_visual_warmup(server_args)
+        and not is_realtime_serving(server_args)
     )
 
 
 def should_run_explicit_client_warmup(server_args: ServerArgs) -> bool:
-    return server_args.warmup and server_args.warmup_resolutions is not None
+    return (
+        server_args.warmup
+        and server_args.warmup_resolutions is not None
+        and should_run_visual_warmup(server_args)
+    )
 
 
 def format_warmup_req(req_or_group: Any) -> str:
