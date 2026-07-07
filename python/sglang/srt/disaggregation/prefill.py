@@ -117,7 +117,7 @@ class PrefillBootstrapQueue:
         gpu_id: int,
         bootstrap_port: int,
         gloo_group: ProcessGroup,
-        max_total_num_tokens: int,
+        max_req_input_len: int,
         scheduler: Scheduler,
         pp_rank: int,
         pp_size: int,
@@ -137,9 +137,7 @@ class PrefillBootstrapQueue:
         self.queue: List[Req] = []
         self.gloo_group = gloo_group
         self.scheduler = scheduler
-        self.max_total_num_tokens = (
-            self.scheduler.tp_worker.model_runner.max_token_pool_size
-        )
+        self.max_req_input_len = max_req_input_len
         self.transfer_backend = transfer_backend
         if envs.SGLANG_DISAGG_STAGING_BUFFER.get() and self.is_mla_backend:
             raise RuntimeError(
@@ -283,6 +281,18 @@ class PrefillBootstrapQueue:
         return True
 
     def add(self, req: Req, num_kv_heads: int) -> None:
+        if is_aborted(req):
+            abort_reason = (
+                req.to_finish
+                if isinstance(req.to_finish, FINISH_ABORT)
+                else req.finished_reason
+            )
+            req.time_stats.trace_ctx.abort(abort_info={"reason": abort_reason.message})
+            req.finished_reason = abort_reason
+            req.to_finish = None
+            self.scheduler.output_streamer.stream_output([req], req.return_logprob)
+            return
+
         if not self.create_sender(req, num_kv_heads):
             return
         self.queue.append(req)
@@ -292,8 +302,8 @@ class PrefillBootstrapQueue:
             self.add(req, num_kv_heads)
 
     def _check_if_req_exceed_kv_capacity(self, req: Req) -> bool:
-        if len(req.origin_input_ids) > self.max_total_num_tokens:
-            message = f"Request {req.rid} exceeds the maximum number of tokens: {len(req.origin_input_ids)} > {self.max_total_num_tokens}"
+        if len(req.origin_input_ids) >= self.max_req_input_len:
+            message = f"Request {req.rid} exceeds the maximum number of tokens: {len(req.origin_input_ids)} >= {self.max_req_input_len}"
             logger.error(message)
             req.time_stats.trace_ctx.abort(abort_info={"reason": message})
             prepare_abort(req, message, status_code=HTTPStatus.BAD_REQUEST)

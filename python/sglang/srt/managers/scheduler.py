@@ -1221,7 +1221,7 @@ class Scheduler(
                 gpu_id=self.ps.gpu_id,
                 bootstrap_port=self.server_args.disaggregation_bootstrap_port,
                 gloo_group=self.attn_tp_cpu_group,
-                max_total_num_tokens=self.max_total_num_tokens,
+                max_req_input_len=self.max_req_input_len,
                 scheduler=self,
                 pp_rank=self.ps.pp_rank,
                 pp_size=self.ps.pp_size,
