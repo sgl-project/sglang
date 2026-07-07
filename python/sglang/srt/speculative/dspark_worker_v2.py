@@ -233,7 +233,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.draft_attn_backend = None
         self.draft_extend_attn_backend = None
         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
-        self._accept_anomaly_enabled = _env_flag("SGLANG_DSPARK_DEBUG_ACCEPT", True)
+        self._accept_anomaly_enabled = _env_flag("SGLANG_DSPARK_DEBUG_ACCEPT", False)
         self._accept_anomaly_verbose = _env_flag(
             "SGLANG_DSPARK_DEBUG_ACCEPT_VERBOSE", False
         )
@@ -2837,26 +2837,21 @@ class DSparkWorkerV2(BaseSpecWorker):
         prefix_lens = model_worker_batch.seq_lens
         req_pool_indices = model_worker_batch.req_pool_indices
 
-        if draft_input.bonus_tokens.numel() == bs:
-            prefer_fallback_anchor = torch.ones((bs,), dtype=torch.bool, device=device)
-        else:
-            prefer_fallback_anchor = torch.zeros(
-                (bs,), dtype=torch.bool, device=device
-            )
+        has_fallback_anchor = draft_input.bonus_tokens.numel() == bs
         prefix_lens_i64 = prefix_lens.to(device=device, dtype=torch.int64)
-        anchor_lens = torch.where(
-            prefer_fallback_anchor,
-            prefix_lens_i64,
-            (prefix_lens_i64 - 1).clamp_min(0),
-        )
-        anchor_tokens = self._get_decode_anchor_tokens(
-            batch=model_worker_batch,
-            prefix_lens=prefix_lens,
-            fallback_tokens=draft_input.bonus_tokens,
-            prefer_fallback_tokens=prefer_fallback_anchor,
-            bs=bs,
-            device=device,
-        )
+        if has_fallback_anchor:
+            anchor_lens = prefix_lens_i64
+            anchor_tokens = draft_input.bonus_tokens.to(device=device, dtype=torch.int64)
+        else:
+            anchor_lens = (prefix_lens_i64 - 1).clamp_min(0)
+            anchor_tokens = self._get_decode_anchor_tokens(
+                batch=model_worker_batch,
+                prefix_lens=prefix_lens,
+                fallback_tokens=draft_input.bonus_tokens,
+                prefer_fallback_tokens=None,
+                bs=bs,
+                device=device,
+            )
         block_ids = torch.full(
             (bs, block_size), self.noise_token_id, dtype=torch.int64, device=device
         )
