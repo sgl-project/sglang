@@ -416,7 +416,10 @@ class Indexer(MultiPlatformOp):
                 params_dtype=torch.bfloat16,
                 prefix=add_prefix("weights_proj", prefix),
             )
-        if config is not None and getattr(config, "index_k_norm_type", "layer") == "rms":
+        if (
+            config is not None
+            and getattr(config, "index_k_norm_type", "layer") == "rms"
+        ):
             self.k_norm = RMSNorm(self.head_dim)
         else:
             self.k_norm = LayerNorm(
@@ -805,14 +808,19 @@ class Indexer(MultiPlatformOp):
         num_init_tokens = self.num_init_tokens
         num_local_tokens = self.num_local_tokens
         if num_init_tokens > 0:
-            init_idxs = torch.arange(
-                num_init_tokens, dtype=lengths.dtype, device=lengths.device
-            )[None, :] + row_starts[:, None]
+            init_idxs = (
+                torch.arange(
+                    num_init_tokens, dtype=lengths.dtype, device=lengths.device
+                )[None, :]
+                + row_starts[:, None]
+            )
             init_idxs.clamp_max_(logits.shape[-1] - 1)
             logits.scatter_(dim=1, index=init_idxs, value=float("inf"))
         if num_local_tokens > 0:
             local_idxs = (
-                lengths[:, None] - 1 + row_starts[:, None]
+                lengths[:, None]
+                - 1
+                + row_starts[:, None]
                 - torch.arange(
                     num_local_tokens, dtype=lengths.dtype, device=lengths.device
                 )[None, :]
@@ -1203,9 +1211,7 @@ class Indexer(MultiPlatformOp):
                     )
 
             lengths_chunk = seq_lens_expanded[start:end]
-            self._mask_init_and_local_tokens(
-                logits_chunk, lengths_chunk, ks[start:end]
-            )
+            self._mask_init_and_local_tokens(logits_chunk, lengths_chunk, ks[start:end])
 
             # RAGGED: use global offset; PAGED: construct local cu_seqlens_q per chunk
             if global_topk_offset is not None:

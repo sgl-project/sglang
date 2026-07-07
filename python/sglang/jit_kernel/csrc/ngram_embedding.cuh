@@ -106,7 +106,7 @@ __global__ void ComputeNGramIdsDecodeKernel(
     const int64_t* __restrict__ row_indices,                 // [batch_size]
     const int* __restrict__ column_starts,                   // [batch_size]
     int* __restrict__ n_gram_ids,                            // [batch_size, (ne_n-1)*ne_k]
-    int eos_token_id                                         // tokens before an eos are excluded from the n-gram context
+    int eos_token_id  // tokens before an eos are excluded from the n-gram context
 ) {
   const int num_configs = (ne_n - 1) * ne_k;
   const int total_outputs = batch_size * num_configs;
