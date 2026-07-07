@@ -979,7 +979,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.canary_manager.mark_init_finished()
 
     def _maybe_auto_tune_deepep_num_max_dispatch_tokens(self):
-        """Resolve the DeepEP low_latency dispatch cap from the capacity plan."""
         plan = self.deepep_capacity_plan
         if plan is None or self.is_draft_worker:
             return
@@ -2722,10 +2721,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self._validate_deepep_capture_reservation(after_mem)
 
     def _validate_deepep_capture_reservation(self, after_mem_gb: float):
-        """Warn if the capacity reservation left too little post-capture headroom
-        for DeepEP. ERROR (not raise) so the diagnostic surfaces without killing
-        the serve.
-        """
+        """ERROR, not raise: the diagnostic must surface without killing the serve."""
         if self.deepep_capacity_plan is None:
             return
         safety_floor_gib = 2.0

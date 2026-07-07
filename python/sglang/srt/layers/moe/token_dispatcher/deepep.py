@@ -74,9 +74,8 @@ DEEPEP_LOW_LATENCY_MAX_DISPATCH_TOKENS = 1024
 def estimate_low_latency_rdma_size_bytes(
     num_max_dispatch_tokens_per_rank: int, hidden: int, num_experts: int
 ) -> int:
-    """Replica of DeepEP's C++ LowLatencyLayout.total_bytes, for the auto
-    mem_fraction heuristic to size the buffer before deep_ep is importable.
-    """
+    """Replica of DeepEP's C++ LowLatencyLayout.total_bytes, for sizing the
+    buffer without deep_ep installed; checked against the native hint in CI."""
     num_scales = hidden // 128
     bytes_per_dispatch = 16 + max(hidden * 2, hidden + num_scales * 4)
     bytes_per_combine = num_scales * 4 + hidden * 2

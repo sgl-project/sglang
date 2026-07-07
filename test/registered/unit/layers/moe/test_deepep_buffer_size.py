@@ -1,11 +1,7 @@
-"""Unit tests for the DeepEP low_latency RDMA buffer-size replica.
-
-estimate_low_latency_rdma_size_bytes is a pure-Python replica of DeepEP's C++
-LowLatencyLayout.total_bytes, used by the auto mem_fraction reservation before
-deep_ep is importable. These tests pin its closed form and, when deep_ep is
-available, assert it matches the native Buffer.get_low_latency_rdma_size_hint
-across a grid including ep_size (which the native hint must ignore).
-"""
+"""Pin the closed form of estimate_low_latency_rdma_size_bytes (the no-deep_ep
+fallback) and, when deep_ep is available, assert it matches the native
+Buffer.get_low_latency_rdma_size_hint across a grid including ep_size (which
+the native hint must ignore)."""
 
 from __future__ import annotations
 

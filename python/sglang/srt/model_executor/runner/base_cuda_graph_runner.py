@@ -97,8 +97,8 @@ def get_batch_sizes_to_capture(
 
     if is_deepep_low_latency(server_args):
         deepep_cap = envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
-        # Clamp on the max draft tokens, not the startup value: adaptive spec can
-        # grow it at runtime, and each request dispatches num_tokens_per_bs tokens.
+        # Adaptive spec can grow draft tokens at runtime, so clamp on the max,
+        # not the startup value.
         spec_mult = max(
             num_tokens_per_bs, server_args.max_speculative_num_draft_tokens or 0
         )

@@ -76,9 +76,8 @@ MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP = 2
 MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP_LAZY = 1
 MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_OVERLAP = 1
 
-# KV budget kept when the DeepEP reservation exceeds it (partial-reserve floor).
-# 2 GiB clears the fixed pool overhead of multi-pool models (DSV4 c4/c128/state
-# pools consume ~1.5 GiB before the first KV token).
+# 2 GiB clears the fixed pool overhead of multi-pool models (DSV4's c4/c128/
+# state pools consume ~1.5 GiB before the first KV token).
 _DEEPEP_MIN_KV_BUDGET_GIB = 2.0
 
 logger = logging.getLogger(__name__)
@@ -146,9 +145,8 @@ class ModelRunnerKVCacheMixin:
         return int(rest_memory * (1 << 30))  # return in bytes
 
     def _reserve_deepep_capacity(self: ModelRunner, rest_memory: float) -> float:
-        """Set aside the DeepEP low_latency RDMA buffer + capture footprint from
-        the KV budget. Both land after the KV pool (the buffer via nvshmem,
-        outside the torch allocator), so the budget must make room up front."""
+        """The RDMA buffer (nvshmem, outside the torch allocator) and the capture
+        footprint both land after the KV pool, so the budget makes room up front."""
         plan = self.deepep_capacity_plan
         if plan is None or not plan.auto_sized:
             return rest_memory
@@ -176,10 +174,8 @@ class ModelRunnerKVCacheMixin:
                 f"--max-running-requests."
             )
         if reserve_gib > affordable_gib:
-            # The capture estimate is deliberately conservative; a partial
-            # reserve usually still captures fine, so degrade instead of
-            # refusing to serve. The post-capture headroom check reports if it
-            # was genuinely short.
+            # The estimate is deliberately conservative — degrade rather than
+            # refuse; the post-capture headroom check reports a genuine shortfall.
             logger.warning(
                 "DeepEP auto mem reserve %.2f GiB exceeds the available KV "
                 "budget (%.2f GiB); reserving %.2f GiB and keeping %.1f GiB of "
@@ -1330,12 +1326,9 @@ class ModelRunnerKVCacheMixin:
     def _clamp_deepep_low_latency_concurrency(
         self: ModelRunner, max_num_reqs: int
     ) -> int:
-        """Cap per-rank decode concurrency for the DeepEP low_latency path.
-
-        The all-to-all buffer is collective, so after bounding each rank by the
-        buffer's num_max we take the EP-group MIN: the result is uniform and <=
-        every rank's concurrency, so the buffer fits and no rank overruns it.
-        """
+        """The all-to-all buffer is collective: bound each rank by the plan
+        ceiling, then take the EP-group MIN so the bound is uniform and no rank
+        dispatches past the buffer."""
         from sglang.srt.layers.moe.token_dispatcher.deepep import (
             DEEPEP_LOW_LATENCY_MAX_DISPATCH_TOKENS,
         )
@@ -1344,9 +1337,6 @@ class ModelRunnerKVCacheMixin:
         if plan is None:
             return max_num_reqs
 
-        # Bound concurrency by the ceiling the buffer reservation covers, else
-        # the decode batch dispatches past the buffer and trips the deep_ep
-        # assert.
         capped = min(
             max_num_reqs,
             DEEPEP_LOW_LATENCY_MAX_DISPATCH_TOKENS // plan.tokens_per_req,

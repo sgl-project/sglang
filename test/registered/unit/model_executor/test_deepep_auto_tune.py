@@ -1,20 +1,4 @@
-"""Unit tests for DeepEP low_latency capacity planning and resolution.
-
-All CPU-only and fully mocked:
-  - The dispatcher resolves SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK
-    lazily (honoring a value resolved after construction) and caches it.
-  - plan_deepep_capacity builds the single capacity plan: it tiers the num_max
-    ceiling down until the buffer + capture reservation fits under the cap, and
-    only auto-sizes when the auto mem_fraction path is active (slack recorded);
-    with a user-set mem_fraction it stays at the static bound so no un-budgeted
-    buffer is allocated.
-  - resolve_deepep_num_max sizes the dispatch bound to decode concurrency
-    (request-pool size * tokens per request, capped at the ceiling and 1024)
-    and exports it through the env; a non-auto-sized plan never raises it.
-  - _clamp_deepep_low_latency_concurrency caps per-rank decode concurrency to
-    the plan ceiling and takes the EP-group minimum so the collective dispatch
-    buffer is uniform and no rank overruns it.
-"""
+"""Unit tests for DeepEP low_latency capacity planning — CPU-only, fully mocked."""
 
 from __future__ import annotations
 
@@ -58,7 +42,6 @@ except Exception:
 
 @contextlib.contextmanager
 def _env_unset():
-    """Run with the env cleared, restoring whatever was there afterward."""
     was_set = _ENV.is_set()
     old = _ENV.get() if was_set else None
     _ENV.clear()

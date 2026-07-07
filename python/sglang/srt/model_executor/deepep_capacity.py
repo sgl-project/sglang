@@ -1,15 +1,9 @@
-"""Capacity planning for the DeepEP low_latency path.
-
-Single source of truth for the dispatch bound (num_max_dispatch_tokens_per_rank)
-and for the GPU memory that must be set aside for allocations landing after the
-KV pool: the nvshmem RDMA buffer (outside the torch allocator) and the decode
-cuda-graph capture + deep_gemm grouped-GEMM warmup footprint.
-
-The plan is built once per target ModelRunner right before KV-pool sizing —
-where the loaded model config and deep_ep itself are available — and its
-reservation is subtracted from the KV budget in bytes. mem_fraction_static is
-never modified, so an auto-memory serve keeps exactly the runtime headroom main
-ships (the invariant whose violation got #28884 reverted).
+"""Capacity planning for the DeepEP low_latency path: one plan per target
+ModelRunner sizes the dispatch bound (num_max_dispatch_tokens_per_rank) and the
+allocations landing after the KV pool (nvshmem RDMA buffer + decode capture /
+deep_gemm warmup). Built right before KV-pool sizing, where every input is
+final, and paid for by subtracting from the KV budget — mem_fraction_static is
+never modified, preserving main's runtime headroom (the #28884 invariant).
 """
 
 from __future__ import annotations
@@ -35,18 +29,14 @@ _MIB = 1024**2
 _NUM_MAX_TIERS = (1024, 512, 256, 128)
 # Headroom for the transient deep_gemm warmup that runs right after capture.
 _SAFETY_MIB = 2 * 1024
-# Capture-estimate multiplier on the grouped-GEMM size (num_experts *
-# moe_intermediate * hidden). Calibrated GB300: ~32 GiB DeepSeek-V4, ~12 GiB
-# GLM-5.2. Deliberately conservative — over-estimates degrade to a partial
-# reserve against the real KV budget, they never refuse to serve.
+# Capture + warmup footprint scales with the grouped-GEMM size — NOT with
+# num_layers * hidden, which inverts the GLM-5.2 vs DSV4 ordering. Calibrated
+# GB300: ~32 GiB DSV4, ~12 GiB GLM-5.2; over-estimates degrade, never refuse.
 _CAPTURE_COEF = 4.0
-# Cap on the reservation as a fraction of total GPU memory, so a large
-# estimate can't squeeze the KV pool out.
+# A large estimate must not squeeze the KV pool out of the budget.
 _MAX_RESERVE_FRACTION = 0.12
-# deep_ep's low_latency fp8 recv-scale layout views tokens in blocks of
-# num_max * num_ranks // 128; a non-multiple num_max truncates that view to
-# zero blocks and silently corrupts the scales (garbage logits, no assert).
-# Multiples of 128 are safe for any EP world size.
+# deep_ep's fp8 recv-scale layout blocks tokens by num_max * num_ranks // 128;
+# a non-multiple truncates the view and silently corrupts the scales (no assert).
 _NUM_MAX_ALIGN = 128
 
 
@@ -56,21 +46,19 @@ def _align_num_max(value: int) -> int:
 
 
 class DeepEPCapacityPlan(msgspec.Struct):
-    # Upper bound on the dispatch bound; the memory reservation is sized for it
-    # and the decode-concurrency clamp keeps runtime dispatches within it.
+    # The reservation is sized for this bound; the concurrency clamp keeps
+    # runtime dispatches within it.
     ceiling: int
-    # num_max counts tokens, not requests: spec/MTP verify packs
-    # num_tokens_per_bs tokens per request.
+    # num_max counts tokens, not requests: spec verify packs several per request.
     tokens_per_req: int
-    # True when the auto reservation sized the ceiling. False (user-set
-    # mem_fraction / unreadable geometry) keeps num_max at the static value so
-    # no buffer is allocated that nobody budgeted for.
+    # False (user mem_fraction / unreadable geometry) keeps num_max at the
+    # static value so no buffer is allocated that nobody budgeted for.
     auto_sized: bool = False
     rdma_mib: float = 0.0
     capture_mib: float = 0.0
     slack_mib: float = 0.0
     reserve_mib: float = 0.0
-    # Final dispatch bound, resolved once decode concurrency is known.
+    # Resolved once decode concurrency is known.
     num_max: Optional[int] = None
 
 
@@ -158,9 +146,6 @@ def plan_deepep_capacity(
         or getattr(hf_config, "intermediate_size", None)
         or hidden
     )
-    # Capture + deep_gemm warmup footprint scales with the grouped-GEMM size
-    # (num_experts * moe_intermediate * hidden), NOT num_layers * hidden — a
-    # layer-based estimate inverts the GLM-5.2 vs DeepSeek-V4 ordering.
     capture_mib = _CAPTURE_COEF * num_experts * moe_intermediate * hidden / _MIB
     cap_mib = _MAX_RESERVE_FRACTION * gpu_total_mib
 
@@ -177,9 +162,8 @@ def plan_deepep_capacity(
         # User pinned the dispatch bound; reserve for exactly that buffer.
         ceiling = env.get()
     else:
-        # Largest tier whose buffer + capture fits under the cap. A clamped
-        # reservation starves capture (the V3.2 tp8/dp8/TBO OOM), so tier the
-        # bound down instead — the concurrency clamp only trims decode batch.
+        # A clamped reservation starves capture (the V3.2 tp8/dp8/TBO OOM), so
+        # tier the bound down instead — the clamp only trims the decode batch.
         ceiling = _align_num_max(min(user_cap, env.get()))
         for candidate in _NUM_MAX_TIERS:
             if candidate > user_cap:
@@ -218,8 +202,8 @@ def plan_deepep_capacity(
 
 
 def resolve_deepep_num_max(plan: DeepEPCapacityPlan, req_pool_size: int) -> int:
-    """Resolve the final dispatch bound and export it through the env var (the
-    read point for the dispatcher and NPU fuseep)."""
+    """Export the resolved bound through the env var — the read point for the
+    dispatcher and NPU fuseep."""
     env = envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK
     if env.is_set() or not plan.auto_sized:
         plan.num_max = env.get()
