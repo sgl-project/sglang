@@ -111,8 +111,9 @@ __global__ void per_token_quant_fp8_kernel(
     }
     if constexpr (kVecSize == 16) {
       *(uint4*)(token_output + i * kVecSize) = *(uint4*)output_arr;
+    } else if constexpr (kVecSize == 8) {
+      *(uint64_t*)(token_output + i * kVecSize) = *(uint64_t*)output_arr;
     } else {
-      // Use element-wise copy for vector size 8 to ensure correctness
       for (int k = 0; k < kVecSize; ++k) {
         token_output[i * kVecSize + k] = output_arr[k];
       }
@@ -188,8 +189,9 @@ __global__ void per_token_quant_fp8_small_batch_kernel(
 
     if constexpr (kVecSize == 16) {
       *(uint4*)(token_output + i * kVecSize) = *(uint4*)output_arr;
+    } else if constexpr (kVecSize == 8) {
+      *(uint64_t*)(token_output + i * kVecSize) = *(uint64_t*)output_arr;
     } else {
-      // Use element-wise copy for vector size 8 to ensure correctness
       for (int k = 0; k < kVecSize; ++k) {
         token_output[i * kVecSize + k] = output_arr[k];
       }
