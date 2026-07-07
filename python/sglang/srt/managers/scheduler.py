@@ -1308,7 +1308,10 @@ class Scheduler(
         if batch is None or not self.use_ngram_embedding:
             return batch
         batch.ne_token_table = self.token_table
-        if batch.forward_mode == ForwardMode.EXTEND:
+        # PREBUILT batches (PD disaggregation, decode side) land with KV already
+        # transferred but the local token table has no rows for them; rebuild the
+        # table from the original prompt tokens just like EXTEND.
+        if batch.forward_mode in (ForwardMode.EXTEND, ForwardMode.PREBUILT):
             all_tokens = []
             column_starts = []
             request_lengths = []
@@ -1342,6 +1345,17 @@ class Scheduler(
                 ),
                 ignore_tokens=None,
             )
+            # Mark the chunked (not-yet-finished) prefill request so sample()
+            # skips writing its pseudo next-token into the ngram token table.
+            # Use self.chunked_req identity (not req.is_chunked) to avoid
+            # overlap-scheduling timing issues.
+            if self.chunked_req is not None:
+                skip_mask = [req is self.chunked_req for req in batch.reqs]
+                batch.ne_skip_token_table_update = (
+                    torch.tensor(skip_mask, dtype=torch.bool, device=device)
+                    if any(skip_mask)
+                    else None
+                )
         return batch
 
     def init_deterministic_inference_config(self):

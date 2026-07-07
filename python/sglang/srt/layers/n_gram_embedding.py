@@ -20,6 +20,7 @@ class NgramEmbedding(torch.nn.Module):
         over_embedding_m: int,
         over_embedding_k: int,
         over_embedding_n: int,
+        eos_token_id: int,
     ):
         super().__init__()
         assert (
@@ -30,6 +31,7 @@ class NgramEmbedding(torch.nn.Module):
         self.over_embedding_m = over_embedding_m
         self.over_embedding_k = over_embedding_k
         self.over_embedding_n = over_embedding_n
+        self.eos_token_id = eos_token_id
 
         self.word_embeder = VocabParallelEmbedding(
             num_embeddings,
@@ -51,7 +53,7 @@ class NgramEmbedding(torch.nn.Module):
         self.oe_embeder = VocabParallelEmbedding(
             num_embeddings=self.exclusive_oe_embedder_size_sums[-1],
             embedding_dim=oe_hidden_dim,
-            enable_tp=is_dp_attention_enabled(),
+            enable_tp=True,
         )
 
         self.oe_projection = nn.Parameter(
@@ -171,6 +173,7 @@ class NgramEmbedding(torch.nn.Module):
                     row_indices=forward_batch.req_pool_indices,
                     column_starts=ngram_embedding_info.column_starts,
                     n_gram_ids=self.oe_n_gram_ids[: len(input_ids)],
+                    eos_token_id=self.eos_token_id,
                 )
 
         # [13, seq_len, hidden_dim]

@@ -89,6 +89,10 @@ class ForwardInputBuffers:
 
             if isinstance(buffer, dict):
                 for sub_name, sub_buffer in buffer.items():
+                    # Optional dataclass fields (e.g. NgramEmbeddingInfo.skip_mask)
+                    # may legitimately be None; skip them like top-level fields.
+                    if sub_buffer is None:
+                        continue
                     assert isinstance(
                         sub_buffer, torch.Tensor
                     ), f"Field {name}.{sub_name} is expected to be a torch.Tensor, but got {type(sub_buffer)}."
