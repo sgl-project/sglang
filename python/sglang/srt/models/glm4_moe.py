@@ -1544,6 +1544,8 @@ class GlmMoeDsaForCausalLMNextN(DeepseekV3ForCausalLMNextN):
         if any(".mlp.experts." in name for name in mtp_excluded):
             names.add("model.decoder.mlp.experts")
 
+        import copy
+        quant_config = copy.copy(quant_config)
         quant_config.exclude_layers = list(names)
         return quant_config
 
