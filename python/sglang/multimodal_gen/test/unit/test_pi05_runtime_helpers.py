@@ -10,7 +10,7 @@ import sglang.multimodal_gen.runtime.models.vlas.pi05_policy as pi05_policy_modu
 from sglang.multimodal_gen.configs.pipeline_configs.pi05 import Pi05PipelineConfig
 from sglang.multimodal_gen.runtime.cache.vla_prefix_cache import PrefixContext
 from sglang.multimodal_gen.runtime.distributed.vla import VLASplitGroup
-from sglang.multimodal_gen.runtime.models.vlas.pi05_pigemma import (
+from sglang.multimodal_gen.runtime.models.vlas.pi05_core import (
     Pi05SiglipAttention,
     patch_siglip_vision_attention_to_native,
 )
