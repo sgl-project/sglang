@@ -314,6 +314,8 @@ def _register_for(*architectures: str):
     "MistralLarge3ForCausalLM",
     "PixtralForConditionalGeneration",
     "GlmMoeDsaForCausalLM",
+    "LongcatFlashForCausalLM",
+    "LongcatFlashForCausalLMNextN",
 )
 def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
     """Order-safe declarations of the DeepSeek/DSA branch. The CP parallel
@@ -1171,6 +1173,8 @@ _DEEPSEEK_FAMILY_ARCHS = frozenset(
         "MistralLarge3ForCausalLM",
         "PixtralForConditionalGeneration",
         "GlmMoeDsaForCausalLM",
+        "LongcatFlashForCausalLM",
+        "LongcatFlashForCausalLMNextN",
     }
 )
 
@@ -1244,6 +1248,17 @@ def _deepseek_moe_quant_resolution(view: Any) -> dict:
                 logger.info(
                     "Use flashinfer_trtllm as MoE runner backend on sm100 for DeepseekV3ForCausalLM"
                 )
+        if (
+            model_arch in ["LongcatFlashForCausalLM", "LongcatFlashForCausalLMNextN"]
+            and view.fp8_gemm_runner_backend == "auto"
+            and quantization in ["fp8", "modelopt_fp8"]
+            and quant_cfg.get("scale_fmt", None) != "ue8m0"
+        ):
+            overrides["fp8_gemm_runner_backend"] = "flashinfer_trtllm"
+            logger.info(
+                "Use flashinfer_trtllm as FP8 GEMM backend on Blackwell for LongCat FP8 "
+                "checkpoint with non-ue8m0 scales"
+            )
     return overrides
 
 

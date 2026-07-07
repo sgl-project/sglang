@@ -1345,6 +1345,21 @@ class Scheduler(
                 ),
                 ignore_tokens=None,
             )
+            # Mark the chunked (not-yet-finished) prefill request so sample()
+            # skips writing its pseudo next-token into the ngram token table.
+            # Use self.chunked_req identity (not req.is_chunked) to avoid
+            # overlap-scheduling timing issues.
+            if self.chunked_req is not None:
+                skip_token_table_update = [
+                    req is self.chunked_req for req in batch.reqs
+                ]
+                batch.ne_skip_token_table_update = (
+                    torch.tensor(
+                        skip_token_table_update, dtype=torch.bool, device=device
+                    )
+                    if any(skip_token_table_update)
+                    else None
+                )
         return batch
 
     def init_deterministic_inference_config(self):
@@ -2762,7 +2777,7 @@ class Scheduler(
             for req in ready_grammar_requests:
                 self._add_request_to_queue(req)
 
-        if self.enable_hierarchical_cache:
+        if self.enable_hierarchical_cache or self.server_args.enable_flexkv:
             self.tree_cache.check_hicache_events()
 
         if self.enable_priority_preemption or self.is_hybrid_swa:
