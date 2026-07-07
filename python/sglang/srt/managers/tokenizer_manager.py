@@ -133,6 +133,7 @@ from sglang.srt.utils.hf_transformers_utils import (
 )
 from sglang.srt.utils.network import get_zmq_socket
 from sglang.srt.utils.request_logger import RequestLogger
+from sglang.srt.utils.tensor_bridge import use_mlx
 from sglang.srt.utils.watchdog import Watchdog
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
@@ -1026,6 +1027,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 raise ValueError(
                     "The server is not configured to enable custom logit processor. "
                     "Please set `--enable-custom-logit-processor` to enable this feature."
+                )
+
+            # The MLX backend does not compute logprobs; the runner returns a
+            # LogitsProcessorOutput with no logprob tensors, so the shared result
+            # processor would dereference None and crash the scheduler process.
+            # Reject the request cleanly instead of taking down the server.
+            if obj.return_logprob and use_mlx():
+                raise ValueError(
+                    "return_logprob (including OpenAI `logprobs` / `top_logprobs`) "
+                    "is not supported on the MLX backend. Retry without logprobs, "
+                    "or run the server without SGLANG_USE_MLX=1."
                 )
 
     def _validate_mm_limits(
