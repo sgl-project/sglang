@@ -1269,6 +1269,8 @@ class ModelRunnerKVCacheMixin:
             self.full_max_total_num_tokens = config.full_max_total_num_tokens
             self.swa_max_total_num_tokens = config.swa_max_total_num_tokens
 
+        self._validate_kv_cache_capacity()
+
         # DSV4 compressed-attention pool sizes. Draft worker reuses target's
         # full/swa sizes but does NOT own c4/c128/state pools (those live on
         # the target rank only); zero them out regardless of what config holds.
@@ -1291,6 +1293,31 @@ class ModelRunnerKVCacheMixin:
             )
 
         self._init_pools()
+
+    def _validate_kv_cache_capacity(self: ModelRunner):
+        """Fail fast if the target KV pool cannot serve one full-length request."""
+        if self.is_draft_worker or self.server_args.prefill_only_disable_kv_cache:
+            return
+
+        context_len = self.model_config.context_len
+        token_capacity = self.max_token_pool_size * self.dcp_size
+        required_capacity = context_len
+        if (
+            self.is_hybrid_swa
+            and self.full_max_total_num_tokens == 0
+            and self.sliding_window_size is not None
+        ):
+            required_capacity = min(context_len, self.sliding_window_size)
+
+        if token_capacity < required_capacity:
+            raise ValueError(
+                "To serve at least one request at the model's context length "
+                f"({context_len}), the KV cache must hold at least "
+                f"{required_capacity} tokens, "
+                f"but only {token_capacity} tokens are available. "
+                "Try: (1) decreasing --context-length, (2) increasing "
+                "--mem-fraction-static, or (3) revising --max-total-tokens."
+            )
 
     def _resolve_memory_pool_config(
         self: ModelRunner, pre_model_load_memory: int
