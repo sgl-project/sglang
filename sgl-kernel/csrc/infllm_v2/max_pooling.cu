@@ -54,6 +54,7 @@ __global__ void max_pooling_1d_varlen_kernel(
     }
   }
   const int batch_idx = lo;
+  if (batch_idx == batch_size) return;
 
   const int q_start = cu_seqlens_q[batch_idx];
   const int bidq_local = bidq_global - q_start;
