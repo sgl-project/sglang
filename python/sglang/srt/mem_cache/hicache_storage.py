@@ -349,19 +349,36 @@ class HiCacheFile(HiCacheStorage):
             os.makedirs(self.file_path)
             logger.info(f"Created HiCacheFile storage directory at {self.file_path}")
 
-        # All LRU / size accounting and disk eviction lives in the evictor so
-        # this backend stays a thin raw-bytes store. Imported lazily: the storage
-        # package __init__ pulls in the backend factory, which imports this
-        # module, so a top-level import here would be circular.
+        # Lazy import: storage/__init__ pulls in the backend factory which imports
+        # this module, so a top-level import would be circular.
         from sglang.srt.mem_cache.storage.file.lru_file_evictor import LRUFileEvictor
 
+        # Inject _shard_subdir so the evictor resolves the same sharded paths.
         self._evictor = LRUFileEvictor(
             self.file_path,
             self.config_suffix,
             tp_rank=tp_rank,
             is_mla_model=is_mla_model,
+            shard_dir_fn=self._shard_subdir,
             extra_config=storage_config.extra_config,
         )
+
+    @staticmethod
+    def _shard_subdir(filename: str) -> str:
+        """Map a ``.bin`` filename to its 2-level hash-prefix subdir ``<ab>/<cd>``.
+
+        A flat layout exhausts the ext4 directory index ("htree") at scale
+        (~7.5M files) and writes start failing with ENOSPC despite free
+        bytes/inodes. Sharding by the filename's content-hash prefix caps
+        per-directory entries; ``>= 4`` chars give 256x256 buckets, shorter
+        names fall back to a flat bucket.
+        """
+        if len(filename) >= 4:
+            return os.path.join(filename[:2], filename[2:4])
+        return ""
+
+    def _sharded_path(self, filename: str) -> str:
+        return os.path.join(self.file_path, self._shard_subdir(filename), filename)
 
     def _get_suffixed_key(self, key: str) -> str:
         return key + self.config_suffix
@@ -374,9 +391,7 @@ class HiCacheFile(HiCacheStorage):
     def _get_component_path(
         self, key: str, component_name: Optional[str] = None
     ) -> str:
-        return os.path.join(
-            self.file_path, f"{self._get_component_key(key, component_name)}.bin"
-        )
+        return self._sharded_path(f"{self._get_component_key(key, component_name)}.bin")
 
     def get(
         self,
@@ -385,7 +400,7 @@ class HiCacheFile(HiCacheStorage):
         target_sizes: Optional[Any] = None,
     ) -> torch.Tensor | None:
         suffixed = self._get_suffixed_key(key)
-        tensor_path = os.path.join(self.file_path, f"{suffixed}.bin")
+        tensor_path = self._sharded_path(f"{suffixed}.bin")
         try:
             expected = target_location.numel() * target_location.element_size()
             with open(tensor_path, "rb", buffering=0) as f:
@@ -419,7 +434,7 @@ class HiCacheFile(HiCacheStorage):
         target_sizes: Optional[Any] = None,
     ) -> bool:
         suffixed = self._get_suffixed_key(key)
-        tensor_path = os.path.join(self.file_path, f"{suffixed}.bin")
+        tensor_path = self._sharded_path(f"{suffixed}.bin")
 
         # Fast path: same key already on disk. Refresh recency and skip rewrite.
         if os.path.exists(tensor_path):
@@ -436,6 +451,9 @@ class HiCacheFile(HiCacheStorage):
                 return False
             reserved = True
 
+            # tmp and final live in the same shard dir, so os.replace stays an
+            # atomic same-filesystem rename.
+            os.makedirs(os.path.dirname(tensor_path), exist_ok=True)
             tmp_path = (
                 f"{tensor_path}.tmp."
                 f"{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}"
@@ -470,7 +488,7 @@ class HiCacheFile(HiCacheStorage):
 
     def exists(self, key: str) -> bool:
         key = self._get_suffixed_key(key)
-        tensor_path = os.path.join(self.file_path, f"{key}.bin")
+        tensor_path = self._sharded_path(f"{key}.bin")
         return os.path.exists(tensor_path)
 
     def _collect_existing_component_keys(
@@ -483,11 +501,12 @@ class HiCacheFile(HiCacheStorage):
             for key in keys:
                 target_files.add(f"{self._get_component_key(key, transfer.name)}.bin")
 
+        # Per-target os.path.exists in the shard is O(keys), versus an os.scandir
+        # of the whole flat dir (O(total files)) on every call.
         existing_files = set()
-        with os.scandir(self.file_path) as entries:
-            for entry in entries:
-                if entry.is_file() and entry.name in target_files:
-                    existing_files.add(entry.name)
+        for fname in target_files:
+            if os.path.exists(self._sharded_path(fname)):
+                existing_files.add(fname)
         return existing_files
 
     def batch_exists_v2(
@@ -602,10 +621,21 @@ class HiCacheFile(HiCacheStorage):
 
     def clear(self) -> bool:
         try:
-            for filename in os.listdir(self.file_path):
-                file_path = os.path.join(self.file_path, filename)
-                if os.path.isfile(file_path):
-                    os.remove(file_path)
+            # Walk shard subdirs bottom-up so emptied dirs can be reaped right
+            # after their pages are unlinked. Only *.bin is removed; a shard
+            # holding non-.bin files fails rmdir and is kept, as is file_path.
+            for root, _dirs, files in os.walk(self.file_path, topdown=False):
+                for filename in files:
+                    if not filename.endswith(".bin"):
+                        continue
+                    fp = os.path.join(root, filename)
+                    if os.path.isfile(fp):
+                        os.remove(fp)
+                if root != self.file_path:
+                    try:
+                        os.rmdir(root)
+                    except OSError:
+                        pass  # not empty (other pages / sentinel) -> keep it
             self._evictor.clear()
             logger.info("Cleared all entries in HiCacheFile storage.")
             return True
