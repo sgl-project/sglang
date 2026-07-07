@@ -435,6 +435,32 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
         )
 
 
+class TestDSV4RawVerifyMetadata(CustomTestCase):
+    def test_copy_preserves_prefill_cuda_graph_flag(self):
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            DSV4RawVerifyMetadata,
+        )
+
+        dst = DSV4RawVerifyMetadata(
+            req_pool_indices=torch.tensor([0], dtype=torch.int64),
+            seq_lens=torch.tensor([4], dtype=torch.int32),
+            out_cache_loc=torch.tensor([1, 2], dtype=torch.int32),
+            num_draft_tokens=2,
+            use_prefill_cuda_graph=False,
+        )
+        src = DSV4RawVerifyMetadata(
+            req_pool_indices=torch.tensor([1], dtype=torch.int64),
+            seq_lens=torch.tensor([8], dtype=torch.int32),
+            out_cache_loc=torch.tensor([3, 4], dtype=torch.int32),
+            num_draft_tokens=2,
+            use_prefill_cuda_graph=True,
+        )
+
+        dst.copy_(src)
+
+        self.assertTrue(dst.use_prefill_cuda_graph)
+
+
 class TestDSV4SwaOutCacheLocResolution(CustomTestCase):
     """`get_swa_out_cache_loc`: cached fast path vs store-time fallback.
 
