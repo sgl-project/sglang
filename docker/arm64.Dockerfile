@@ -41,7 +41,7 @@ RUN source $HOME/.local/bin/env && \
     git checkout ${VER_SGLANG} && \
     cd python && \
     cp pyproject_cpu.toml pyproject.toml && \
-    uv pip install . pytest && \
+    uv pip install . && \
     cd ../sgl-kernel && \
     cp pyproject_cpu.toml pyproject.toml && \
     uv pip install .
