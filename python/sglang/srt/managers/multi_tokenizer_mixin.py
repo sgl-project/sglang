@@ -592,6 +592,19 @@ class TokenizerWorker(TokenizerManager):
             self.server_args.disaggregation_transfer_backend
         )
 
+        # The base __init__ built the tokenizer metric labels while
+        # disaggregation_mode was temporarily forced to "null" (to avoid
+        # re-starting the bootstrap server above), so engine_type was
+        # mislabeled as "unified". Now that the real mode is restored,
+        # re-derive engine_type so PD tokenizer metrics are labeled with the
+        # correct role ("prefill" / "decode").
+        if self.enable_metrics:
+            self.metrics_collector.labels["engine_type"] = (
+                DisaggregationMode.to_engine_type(
+                    self.server_args.disaggregation_mode
+                )
+            )
+
         # Register this worker with the router for pause/continue broadcasting
         reg = TokenizerWorkerRegistration(worker_ipc_name=self.tokenizer_ipc_name)
         self.send_to_scheduler.send_pyobj(reg)
