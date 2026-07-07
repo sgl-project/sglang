@@ -4528,10 +4528,10 @@ class ServerArgs:
             self.triton_attention_num_kv_splits = 16
 
     def _handle_nccl_pre_warm(self):
-        # pre_warm_nccl is only used with CUDA or HIP hardware or Ascend hardware
+        # pre_warm_nccl is only used with CUDA or HIP hardware or NPU hardware
         if self.pre_warm_nccl and not (is_cuda() or is_hip() or is_npu()):
             logger.warning(
-                "pre_warm_nccl is only applicable for CUDA or HIP hardware or Ascend hardware. "
+                "pre_warm_nccl is only applicable for CUDA or HIP hardware or NPU hardware. "
                 "Ignoring pre_warm_nccl setting on current hardware."
             )
             self.pre_warm_nccl = False
