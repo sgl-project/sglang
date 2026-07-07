@@ -32,6 +32,10 @@ rmpv = { version = "1", features = ["with-serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+# --- regex AST parsing: finite max-length bound for `stop_regex` (mirrors the
+# Python `sampling_params.get_max_seq_length`) ---
+regex-syntax = "0.8"
+
 # --- CPU core binding for the runtime pools ---
 core_affinity = "0.8"
 
