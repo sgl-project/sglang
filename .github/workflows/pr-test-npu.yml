@@ -4,7 +4,6 @@ on:
   push:
     branches: [ main ]
   pull_request:
-    branches: [ main ]
   workflow_dispatch:
   workflow_call:
     inputs:
@@ -409,6 +408,32 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+  pr-single-node-tests:
+    name: single-node-poc
+    needs: [check-changes, pr-gate, set-image-config]
+    if: needs.check-changes.outputs.main_package == 'true'
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        test_config:
+          # qwen3_6_27b performance tests
+          - name: qwen3_6_27b_w8a8_1p_in64k_out1k_50ms
+            runner: linux-aarch64-a3-2
+            test_case: test/registered/ascend/performance/qwen3_6_27b/test_npu_qwen3_6_27b_w8a8_1p_in64k_out1k_50ms.py
+            test_type: 'perf'
+    uses: ./.github/workflows/nightly-test-npu-e2e-single-node.yml
+    with:
+      runner: ${{ matrix.test_config.runner }}
+      test_type: ${{ matrix.test_config.test_type }}
+      test_config_name: ${{ matrix.test_config.name }}
+      test_case: ${{ matrix.test_config.test_case }}
+      image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
+      install_sglang_from_source: false
+      install_sglang_deps: true
+      device_type_for_deps: 'a3'
+      transformers_version: ''
+
   pr-test-npu-finish:
     needs:
       [
@@ -421,6 +446,8 @@ jobs:
 
         multimodal-gen-test-1-npu-a3,
         multimodal-gen-test-2-npu-a3,
+
+        pr-single-node-tests,
       ]
     if: always()
     runs-on: ubuntu-latest

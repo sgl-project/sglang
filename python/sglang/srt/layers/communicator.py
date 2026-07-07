@@ -23,8 +23,6 @@ import torch
 from sglang.srt.distributed import (
     attention_tensor_model_parallel_all_reduce,
     attention_tensor_model_parallel_quant_all_reduce,
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
     get_tp_group,
     moe_tensor_model_parallel_all_reduce,
     tensor_model_parallel_all_reduce,
@@ -41,14 +39,10 @@ from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather_into_tensor,
     attn_tp_reduce_scatter_tensor,
     dp_gather_partial,
+    dp_gather_replicate,
     dp_reduce_scatter_tensor,
     dp_scatter,
-    get_attention_cp_rank,
-    get_attention_cp_size,
-    get_attention_dp_size,
     get_attention_tp_group,
-    get_attention_tp_rank,
-    get_attention_tp_size,
     get_dp_global_num_tokens,
     get_global_dp_buffer,
     get_local_dp_buffer,
@@ -70,7 +64,13 @@ from sglang.srt.layers.utils.cp_utils import (
     is_mla_prefill_cp_enabled,
     mla_use_prefill_cp,
 )
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    Phase,
+    check_cuda_graph_backend,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
@@ -169,7 +169,7 @@ def apply_flashinfer_allreduce_fusion(batch_size: int):
         and batch_size > 0
         and batch_size <= FUSE_ALLREDUCE_MAX_BATCH_SIZE
         and not is_dp_attention_enabled()
-        and get_global_server_args().enable_flashinfer_allreduce_fusion
+        and get_global_server_args().flashinfer_allreduce_fusion_backend is not None
         and not is_flashinfer_allreduce_unavailable()
     )
 
@@ -183,7 +183,7 @@ def apply_aiter_all_reduce_fusion(input_tensor: torch.Tensor):
         and total_bytes > 0
         and n <= 16384
         and total_bytes <= 8 * 1024 * 8192
-        and get_tensor_model_parallel_world_size() != 6
+        and get_parallel().tp_size != 6
         and not is_dp_attention_enabled()
         and get_global_server_args().enable_aiter_allreduce_fusion
     )
@@ -270,11 +270,11 @@ class AttnTpContext:
             and (_is_cuda or _is_npu)
             and q_lora_rank is not None
             and not is_dsa
-            and get_tensor_model_parallel_world_size() > 1
+            and get_parallel().tp_size > 1
             and not is_dp_attention_enabled()
             and get_moe_a2a_backend().is_none()
             and not enable_moe_dense_fully_dp()
-            and get_global_server_args().disable_piecewise_cuda_graph
+            and not check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
             and get_global_server_args().speculative_algorithm != "EAGLE3"
         )
         if get_global_server_args().enable_attn_tp_input_scattered:
@@ -290,7 +290,6 @@ class AttnTpContext:
             self.allow_input_scattered
             and forward_batch.forward_mode.is_extend()
             and not forward_batch.forward_mode.is_target_verify()
-            and not forward_batch.forward_mode.is_draft_extend()
             and forward_batch.input_ids is not None
             and not forward_batch.can_run_tbo
         )
@@ -443,6 +442,7 @@ class LayerCommunicator:
         allow_reduce_scatter: bool = False,
         is_last_layer: bool = False,
         qkv_latent_func: Optional[Callable] = None,
+        force_layernorm_before_dp_gather: bool = False,
     ):
         self.layer_scatter_modes = layer_scatter_modes
         self.input_layernorm = input_layernorm
@@ -450,8 +450,12 @@ class LayerCommunicator:
         self.allow_reduce_scatter = allow_reduce_scatter
         self.is_last_layer = is_last_layer
         self.qkv_latent_func = qkv_latent_func
+        self.force_layernorm_before_dp_gather = force_layernorm_before_dp_gather
 
         self._context = CommunicateContext.init_new()
+        self._context.force_layernorm_before_dp_gather = (
+            force_layernorm_before_dp_gather
+        )
         self._post_init_communicate()
         self._speculative_algo = SpeculativeAlgorithm.from_string(
             get_global_server_args().speculative_algorithm
@@ -488,11 +492,13 @@ class LayerCommunicator:
         forward_batch: ForwardBatch,
         captured_last_layer_outputs: Optional[List[torch.Tensor]] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
+        quant_format: str = "",
     ):
         hidden_states, residual = self.prepare_attn(
             hidden_states,
             residual,
             forward_batch,
+            quant_format=quant_format,
             post_residual_addition=post_residual_addition,
         )
         if captured_last_layer_outputs is not None:
@@ -501,11 +507,38 @@ class LayerCommunicator:
                 forward_batch=forward_batch,
                 context=self._context,
             )
-            if gathered_last_layer_output is residual:
-                # Clone to avoid modifying the original residual by Custom RMSNorm inplace operation
+            if (
+                gathered_last_layer_output is residual
+                and not self._post_attn_residual_is_read_only(residual)
+            ):
                 gathered_last_layer_output = residual.clone()
             captured_last_layer_outputs.append(gathered_last_layer_output)
         return hidden_states, residual
+
+    def _post_attn_residual_is_read_only(self, residual: torch.Tensor) -> bool:
+        """True if ``prepare_mlp``'s post-attention RMSNorm leaves ``residual``
+        untouched, so Eagle3 aux capture can keep its reference and skip the clone.
+
+        Only the flashinfer all-reduce-fusion path writes a fresh ``residual_out``
+        (see ``flashinfer_allreduce_residual_rmsnorm``); the aiter fused kernel and
+        every plain norm fold into ``residual`` in place. That path is reachable
+        only from the ``_gather_*`` communicate-fns, and only when they fall past
+        their input-scattered branch.
+        """
+        norm_fn = getattr(
+            self._communicate_with_all_reduce_and_layer_norm_fn,
+            "func",
+            self._communicate_with_all_reduce_and_layer_norm_fn,
+        )
+        uses_gather_norm = norm_fn in (
+            CommunicateWithAllReduceAndLayerNormFn._gather_hidden_states_and_residual,
+            CommunicateWithAllReduceAndLayerNormFn._gather_hidden_states_and_residual_moe,
+        )
+        return (
+            uses_gather_norm
+            and not get_attn_tp_context().input_scattered
+            and apply_flashinfer_allreduce_fusion(residual.shape[0])
+        )
 
     def prepare_attn(
         self,
@@ -762,7 +795,9 @@ class LayerCommunicator:
                 or (
                     _use_aiter
                     and batch_size > 0
-                    and get_tensor_model_parallel_world_size() != 6
+                    and get_parallel().tp_size != 6
+                    and not is_dp_attention_enabled()
+                    and get_moe_a2a_backend().is_none()
                     and get_global_server_args().enable_aiter_allreduce_fusion
                 )
             )
@@ -782,19 +817,20 @@ class CommunicateContext:
     tp_size: int
     cache = None
     tp_rank: int
+    force_layernorm_before_dp_gather: bool = False
 
     def is_same_group_size(self, a: ScatterMode, b: ScatterMode):
         return self.process_group_sizes[a] == self.process_group_sizes[b]
 
     @classmethod
     def init_new(cls):
-        attn_tp_rank = get_attention_tp_rank()
-        attn_tp_size = get_attention_tp_size()
-        attn_dp_size = get_attention_dp_size()
-        attn_cp_size = get_attention_cp_size()
-        attn_cp_rank = get_attention_cp_rank()
-        tp_size = get_tensor_model_parallel_world_size()
-        tp_rank = get_tensor_model_parallel_rank()
+        attn_tp_rank = get_parallel().attn_tp_rank
+        attn_tp_size = get_parallel().attn_tp_size
+        attn_dp_size = get_parallel().attn_dp_size
+        attn_cp_size = get_parallel().attn_cp_size
+        attn_cp_rank = get_parallel().attn_cp_rank
+        tp_size = get_parallel().tp_size
+        tp_rank = get_parallel().tp_rank
         moe_cp_size = get_moe_cp_size()
         process_group_sizes = {
             ScatterMode.SCATTERED: 1,
@@ -1024,9 +1060,14 @@ class CommunicateWithAllReduceAndLayerNormFn:
             )
             attn_tp_all_gather_into_tensor(residual, local_residual)
         if context.attn_dp_size != 1:
-            # Perform layernorm on smaller data before comm. Only valid when attn_tp_size is 1 (tp_size == dp_size)
-            use_layer_norm_before_gather = context.attn_tp_size == 1
+            use_layer_norm_before_gather = (
+                context.force_layernorm_before_dp_gather or context.attn_tp_size == 1
+            )
             if use_layer_norm_before_gather and hidden_states.shape[0] != 0:
+                if context.attn_tp_size > 1:
+                    hidden_states = attention_tensor_model_parallel_all_reduce(
+                        hidden_states
+                    )
                 with use_symmetric_memory(
                     get_tp_group(),
                     disabled=not is_allocation_symmetric(),
@@ -1039,7 +1080,10 @@ class CommunicateWithAllReduceAndLayerNormFn:
                 get_global_dp_buffer(get_tp_group()),
                 hidden_states,
             )
-            dp_gather_partial(hidden_states, local_hidden_states, forward_batch)
+            if use_layer_norm_before_gather:
+                dp_gather_replicate(hidden_states, local_hidden_states, forward_batch)
+            else:
+                dp_gather_partial(hidden_states, local_hidden_states, forward_batch)
 
             if not use_layer_norm_before_gather:
                 dp_scatter(residual, hidden_states, forward_batch)
@@ -1264,7 +1308,7 @@ class CommunicateSummableTensorPairFn:
         context: CommunicateContext,
         allow_reduce_scatter: bool = False,
     ):
-        if get_tensor_model_parallel_world_size() == get_attention_dp_size():
+        if get_parallel().tp_size == get_parallel().attn_dp_size:
             group = get_tp_group()
         else:
             group = get_attention_tp_group()
@@ -1354,7 +1398,7 @@ class CommunicateSummableTensorPairFn:
 
         # DP scatter (if DP attention is enabled)
         if context.attn_dp_size > 1:
-            if get_tensor_model_parallel_world_size() == get_attention_dp_size():
+            if get_parallel().tp_size == get_parallel().attn_dp_size:
                 group = get_tp_group()
             else:
                 group = get_attention_tp_group()

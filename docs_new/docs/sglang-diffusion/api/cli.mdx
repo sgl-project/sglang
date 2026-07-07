@@ -83,7 +83,8 @@ Use `sglang generate --help` and `sglang serve --help` for the full argument lis
 - `--sp-degree &#123;N&#125;`: sequence parallelism size
 - `--ulysses-degree &#123;N&#125;` and `--ring-degree &#123;N&#125;`: USP parallelism controls
 - `--enable-cfg-parallel &#123;true|false&#125;`: enable or explicitly disable CFG parallelism
-- `--attention-backend &#123;BACKEND&#125;`: attention backend for native SGLang pipelines
+- `--warmup-mode &#123;off|request|server&#125;`: control startup warmup for `sglang serve`; `off` skips warmup, `request` primes the request path, and `server` runs a full synthetic server warmup before serving traffic
+- `--attention-backend &#123;BACKEND&#125;`: attention backend for native SGLang and diffusers pipelines
 - `--component-attention-backends &#123;MAP&#125;`: per-component attention backend overrides, for example `text_encoder=torch_sdpa,transformer=fa`
 - `--attention-backend-config &#123;CONFIG&#125;`: attention backend configuration
 
@@ -109,6 +110,13 @@ For quantized transformer checkpoints, prefer:
 
 See [Quantization](../quantization) for supported quantization families and examples.
 
+### Request logging
+
+- `--log-requests`: Log user-facing fields of all requests (default: `False`). The verbosity is decided by `--log-requests-level`.
+- `--log-requests-level &#123;0|1|2|3&#125;`: Verbosity level for request logging (default: `2`). 0: Log metadata (request id). 1: Log metadata and sampling config (seed, steps, guidance, resolution, frames, fps, ...). 2: Log metadata, sampling config and prompt (truncated to 2 KiB). 3: Log metadata, sampling config and full prompt.
+- `--log-requests-format &#123;text|json&#125;`: Format for request logging (default: `text`). `text` is human-readable; `json` outputs structured JSON lines.
+- `--log-requests-target &#123;TARGET...&#125;`: Target(s) for request logging. Use `stdout` for console output and/or directory path(s) for file output. Can specify multiple targets, e.g., `--log-requests-target stdout /my/log/dir`.
+
 ## Configuration Files
 
 Use `--config` to load JSON or YAML configuration. Command-line flags override values from the config file.
@@ -124,7 +132,7 @@ model_path: FastVideo/FastHunyuan-diffusers
 prompt: A beautiful woman in a red dress walking down a street
 output_path: outputs/
 num_gpus: 2
-sp_size: 2
+sp_degree: 2
 tp_size: 1
 num_frames: 45
 height: 720
@@ -262,7 +270,7 @@ Use `--backend diffusers` to force vanilla diffusers pipelines when no native SG
       <td>Choose native SGLang, force native, or force diffusers</td>
     </tr>
     <tr>
-      <td><code>--diffusers-attention-backend</code></td>
+      <td><code>--attention-backend</code></td>
       <td><code>flash</code>, <code>_flash_3_hub</code>, <code>sage</code>, <code>xformers</code>, <code>native</code></td>
       <td>Attention backend for diffusers pipelines</td>
     </tr>
@@ -301,7 +309,7 @@ sglang generate \
   --model-path AIDC-AI/Ovis-Image-7B \
   --backend diffusers \
   --trust-remote-code \
-  --diffusers-attention-backend flash \
+  --attention-backend flash \
   --prompt "A serene Japanese garden with cherry blossoms" \
   --height 1024 \
   --width 1024 \

@@ -464,7 +464,7 @@ class Cosmos3DenoisingStage(PipelineStage):
             compile_kwargs = {
                 "mode": "default",
                 "fullgraph": False,
-                "dynamic": True,
+                "dynamic": False,
             }
 
         gen_layers = getattr(transformer, "gen_layers", None)
@@ -616,7 +616,7 @@ class Cosmos3DenoisingStage(PipelineStage):
             enumerate(timesteps),
             total=len(timesteps),
             desc="Denoising",
-            disable=batch.is_warmup,
+            batch=batch,
         )
 
         for i, t in progress_bar:

@@ -14,6 +14,7 @@ from torch import nn
 from sglang.srt.layers.moe import topk as topk_module
 from sglang.srt.layers.moe.topk import TopKConfig
 from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -55,7 +56,7 @@ class TestDeepEPWaterfillEPLB(CustomTestCase):
         self.assertEqual(len(weights), 1)
         self.assertEqual(weights[0].shape, (experts.num_local_experts, 2))
 
-    def test_topk_recorder_ids_exclude_deepep_fused_shared_slots(self):
+    def test_topk_recorder_ids_exclude_per_rank_fused_shared_slots(self):
         topk_ids = torch.tensor([[0, 33, 263, 256]], dtype=torch.int32)
         topk_weights = torch.ones_like(topk_ids, dtype=torch.float32)
         topk_config = TopKConfig(
@@ -73,11 +74,10 @@ class TestDeepEPWaterfillEPLB(CustomTestCase):
         with (
             patch.object(topk_module, "_is_cuda", True),
             patch.object(topk_module, "_use_aiter", False),
-            patch.object(topk_module, "is_deepep_class_backend", return_value=True),
             patch.object(
-                topk_module, "get_moe_expert_parallel_world_size", return_value=8
+                topk_module, "has_per_rank_fused_shared_slots", return_value=True
             ),
-            patch.object(topk_module, "get_moe_expert_parallel_rank", return_value=7),
+            get_parallel().override(moe_ep_size=8, moe_ep_rank=7),
             patch.object(
                 topk_module,
                 "_biased_grouped_topk_postprocess",
@@ -96,7 +96,7 @@ class TestDeepEPWaterfillEPLB(CustomTestCase):
         self.assertTrue(torch.equal(processed_ids, torch.tensor([[0, 34, 270, 271]])))
         self.assertTrue(torch.equal(recorder_ids, torch.tensor([[0, 33, 263]])))
 
-    def test_topk_recorder_ids_match_dispatch_ids_for_non_deepep_fusion(self):
+    def test_topk_recorder_ids_match_dispatch_ids_without_per_rank_shared_slots(self):
         topk_ids = torch.tensor([[0, 33, 263, 256]], dtype=torch.int32)
         topk_weights = torch.ones_like(topk_ids, dtype=torch.float32)
         topk_config = TopKConfig(
@@ -114,7 +114,9 @@ class TestDeepEPWaterfillEPLB(CustomTestCase):
         with (
             patch.object(topk_module, "_is_cuda", True),
             patch.object(topk_module, "_use_aiter", False),
-            patch.object(topk_module, "is_deepep_class_backend", return_value=False),
+            patch.object(
+                topk_module, "has_per_rank_fused_shared_slots", return_value=False
+            ),
             patch.object(
                 topk_module,
                 "_biased_grouped_topk_postprocess",

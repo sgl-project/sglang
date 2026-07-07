@@ -13,9 +13,11 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.utils.hash import murmur_hash32
 from sglang.srt.layers.utils.logprob import get_token_ids_logprobs, get_top_logprobs
+from sglang.srt.runtime_context import get_flags
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.utils.async_probe import sanitize_nan_logits
 from sglang.srt.utils.common import (
     get_bool_env_var,
     is_cuda,
@@ -78,14 +80,15 @@ class Sampler(nn.Module):
         )
         # In RL on-policy mode, we use log_softmax to compute logprobs to match the trainer.
         self.use_log_softmax_logprob = self.rl_on_policy_target is not None
-        self.use_ascend_backend = get_global_server_args().sampling_backend == "ascend"
+        self.use_ascend_backend = get_flags().sampling_backend == "ascend"
 
     def _preprocess_logits(
         self, logits: torch.Tensor, sampling_info: SamplingBatchInfo
     ) -> torch.Tensor:
-        """Apply custom logit processors."""
+        """Apply custom logit processors and sanitize non-finite logits."""
         if sampling_info.has_custom_logit_processor:
             apply_custom_logit_processor(logits, sampling_info)
+        sanitize_nan_logits(logits, "sampler: next_token_logits")
         return logits
 
     def forward(
@@ -228,7 +231,7 @@ class Sampler(nn.Module):
                 positions=positions,
             )
         else:
-            backend = get_global_server_args().sampling_backend
+            backend = get_flags().sampling_backend
             if backend == "flashinfer":
                 assert (
                     sampling_info.sampling_seed is None

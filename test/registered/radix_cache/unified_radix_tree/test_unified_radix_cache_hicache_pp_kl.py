@@ -13,9 +13,9 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=400, stage="base-c", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=900, stage="base-c", runner_config="4-gpu-h100")
 
-QWEN3_30B_MODEL = "Qwen/Qwen3-30B-A3B-FP8"
+QWEN3_32B_MODEL = "Qwen/Qwen3-32B"
 
 
 def _assert_pp_decode_cached_tokens(result, history_len, output_len, label):
@@ -28,12 +28,12 @@ def _assert_pp_decode_cached_tokens(result, history_len, output_len, label):
 
 
 class TestUnifiedQwen3HiCachePP(UnifiedRadixTreeTestMixin, CustomTestCase):
-    """Qwen3-30B-A3B-FP8 + HiCache + PP + UnifiedRadixCache."""
+    """Qwen3-32B + HiCache + PP + UnifiedRadixCache."""
 
-    hicache_io_backend = "direct"
-    hicache_mem_layout = "page_first_direct"
+    hicache_io_backend = "kernel"
+    hicache_mem_layout = "page_first"
     max_running_requests = 2
-    kl_threshold = 0.012
+    kl_threshold = 0.005
     gsm8k_threshold = 0.7
     num_gsm8k_questions = 50
     mmlu_threshold = 0.7
@@ -61,7 +61,7 @@ class TestUnifiedQwen3HiCachePP(UnifiedRadixTreeTestMixin, CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.model = QWEN3_30B_MODEL
+        cls.model = QWEN3_32B_MODEL
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -75,7 +75,7 @@ class TestUnifiedQwen3HiCachePP(UnifiedRadixTreeTestMixin, CustomTestCase):
                 "2",
                 "--mem-fraction-static",
                 "0.8",
-                "--cuda-graph-max-bs",
+                "--cuda-graph-max-bs-decode",
                 "32",
                 "--max-running-requests",
                 str(cls.max_running_requests),

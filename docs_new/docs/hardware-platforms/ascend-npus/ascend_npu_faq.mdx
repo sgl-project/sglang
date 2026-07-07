@@ -43,16 +43,16 @@ Thread 0x0000fff873f6f120 (most recent call first):
 (SGLangEngine pid=3872176) [Error]: An internal error occurs in the runtime module on the host.
 (SGLangEngine pid=3872176) Rectify the fault based on the error information in the ascend log.
 (SGLangEngine pid=3872176) [PID: 3874122] 2026-04-14-12:14:41.897.548 AclNN_Runtime_Error(EZ9903): aclrtLaunchKerneWithHostArgs failed, return: 507000
-(SGLangEngine pid=3872176)	Solution: In this scenario, collect the plog when the fault occurs and locate the fault based on the plog.
-(SGLangEngine pid=3872176)	TraceBack (most recent call last):
-(SGLangEngine pid=3872176)	Check kernel task failed, stream_id=2028, task_id=48, retCode=0x7080005.[FUNC:LaunchKernel][FILE:context.cc][LINE:1585]
-(SGLangEngine pid=3872176)	rtsLaunchKernelWithHostArgs execution failed, reason=kernel type error[FUNC:FuncErrorReason][FILE:error_message_manage.cc][LINE:61]
-(SGLangEngine pid=3872176)	rtsLaunchKernelWithHostArgs failed, runtime result = 507000.[FUNC:ReportCallError][FILE:Log_inner.cpp][LINE:148]
-(SGLangEngine pid=3872176)	aclrtLaunchKerneWWithHostArgs failed, return: 507000
-(SGLangEngine pid=3872176) 	Launch kernel failed.
-(SGLangEngine pid=3872176)	#### KernelLaunch failed: /home/850b160/cann-8.5.8/opp/built-in/op_impl/ai_core/tbe//kernel/ascend910_93/ops_legacy/fill/Fill_41dadce325bOf810d03359af2a38990b_high_performance.o
-(SGLangEngine pid=3872176)	Kernel Run failed. opType: 18, Fill
-(SGLangEngine pid=3872176)	launch failed for Fill, errno:361001.
+(SGLangEngine pid=3872176)  Solution: In this scenario, collect the plog when the fault occurs and locate the fault based on the plog.
+(SGLangEngine pid=3872176)  TraceBack (most recent call last):
+(SGLangEngine pid=3872176)  Check kernel task failed, stream_id=2028, task_id=48, retCode=0x7080005.[FUNC:LaunchKernel][FILE:context.cc][LINE:1585]
+(SGLangEngine pid=3872176)  rtsLaunchKernelWithHostArgs execution failed, reason=kernel type error[FUNC:FuncErrorReason][FILE:error_message_manage.cc][LINE:61]
+(SGLangEngine pid=3872176)  rtsLaunchKernelWithHostArgs failed, runtime result = 507000.[FUNC:ReportCallError][FILE:Log_inner.cpp][LINE:148]
+(SGLangEngine pid=3872176)  aclrtLaunchKerneWWithHostArgs failed, return: 507000
+(SGLangEngine pid=3872176)  Launch kernel failed.
+(SGLangEngine pid=3872176)  #### KernelLaunch failed: /home/850b160/cann-8.5.8/opp/built-in/op_impl/ai_core/tbe//kernel/ascend910_93/ops_legacy/fill/Fill_41dadce325bOf810d03359af2a38990b_high_performance.o
+(SGLangEngine pid=3872176)  Kernel Run failed. opType: 18, Fill
+(SGLangEngine pid=3872176)  launch failed for Fill, errno:361001.
 (SGLangEngine pid=3872176)
 (SGLangEngine pid=3872176) Exception raised from operator() at build/CMakeFiles/torch_npu.dir/compiler depend.ts:26 (most recent call first):
 (SGLangEngine pid=3872176) frame #0: c10::Error::Error(c10::SourceLocation, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >)+ 0xb0 (0xffff806848c0 in /root/anaconda3/envs/slime_re/Lib/python3.11/site-packages/torch/lib/libc10.so)
@@ -76,7 +76,7 @@ Too many captured graphs cause a conflict in the graph mode update stream. Each 
 
 ### Error message
 
-```
+```text
 [root@os-node-created-6z9tp pd_7p1d_tp2_20260414_030537]# grep -nR -E "aivec error|ACL" *,log
 prefill 1.log:5739:EZ9999[PID: 164243] 2026-04-14-06:40:35.033.745 (EZ9999): The error from device(chipId:0, dieId:1), serial number is 1, there is an exception of aivec error, core id is 23, error code = 0, dump info: pc start: 0x12420156a000, current: 0x12420156ad74, vec error info: 0xdb1751f50e, mte error info: 0x98f6388707, ifu error info: 0x212c93fc00000, ccu error info: 0x998e981c00000000, cube error info: 0, biu error info: 0, aic error mask: 0x6500020bd00028c, para base: 0x12c100dccc00.[FUNC:PrintCoreInfo][FILE:device error core proc.cc][LINE:347]
 prefill_1.log:5747:EZ9999[PID: 164242] 2026-04-14-06:40:35.034.456 (EZ9999):  The error from device(chipId:0, dieId:0), serial number is 1, there is an exception of aivec error, core id is 45, error code = O, dump info: pc start: 0x12400156a000, current: 0x12400156ad74, vec error info: 0x7304583407, mte error info: 0x27e2b1c765, ifu error info: 0x212c93fc00000, ccu error info: 0x6e0836f300000000, cube error info: 0, biu error info: 0O, aic error mask: 0x6500020bd00028c, para base: 0x12c100dccc0O.[FUNC:PrintCoreInfo][FILE:device_error_core_proc.cc][LINE:347]
@@ -138,7 +138,7 @@ The `alloc_extend_kernel` operator appears to have a memory allocation issue. Pe
 
 Modify `sglang/srt/hardware_backend/npu/allocator_npu.py` to comment out the affected branch and use the else branch instead.
 
-```text highlight=15-36
+```python highlight=15-36
     def alloc_extend(
         self,
         prefix_lens: torch.Tensor,
@@ -175,11 +175,11 @@ Modify `sglang/srt/hardware_backend/npu/allocator_npu.py` to comment out the aff
         #     )
 
         # else:
-            out_indices = torch.empty(
-                (extend_num_tokens,),
-                dtype=torch.int32,
-                device=self.device,
-            )
+        out_indices = torch.empty(
+            (extend_num_tokens,),
+            dtype=torch.int32,
+            device=self.device,
+        )
         ...
 ```
 
@@ -206,7 +206,8 @@ If the NPUs are not occupied, you can use `--tp` to deploy across multiple devic
 ## 5. How to update sgl-kernel-npu
 
 ### Solution
-```
+
+```bash
 git clone https://github.com/sgl-project/sgl-kernel-npu.git
 
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
@@ -281,10 +282,24 @@ The machine cannot directly access the HuggingFace server due to network restric
     --dataset-path /path/to/ShareGPT_V3_unfiltered_cleaned_split.json \
     ...
   ```
+
 ## 7. Unexpected type fp8
 
 ### Cause
+
 FP8 model is not supported
 
 ### Solution
+
 Replace model weights, e.g., switch Qwen/Qwen3.5-27B-FP8 to Eco-Tech/Qwen3.5-27B-w8a8-mtp.
+
+## 8. Docker image versions: stable release vs. daily build
+
+Docker images for Ascend NPU are available in two types:
+
+- **Stable release** — validated version with a specific tag, e.g., `quay.io/ascend/sglang:v0.5.13.post1-cann9.0.0-a3`.
+  Recommended for production deployments.
+- **Daily build** — includes the latest development changes, e.g., `quay.io/ascend/sglang:main-cann8.5.0-a3`. Use this
+  if you need the latest features or bug fixes that have not yet been included in a stable release.
+
+If you encounter issues with a stable release, try switching to a daily build to see if the issue has been resolved in the latest development version.

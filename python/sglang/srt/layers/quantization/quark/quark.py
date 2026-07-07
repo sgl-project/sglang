@@ -20,6 +20,7 @@ from sglang.srt.layers.quantization.quark.schemes import (
     QuarkMoEScheme,
     QuarkW4A4MXFP4,
     QuarkW4A4MXFp4MoE,
+    QuarkW4A8MXFp4MoE,
     QuarkW8A8Fp8,
     QuarkW8A8FP8MoE,
 )
@@ -36,6 +37,18 @@ if TYPE_CHECKING:
 __all__ = ["QuarkLinearMethod", "QuarkFusedMoEMethod"]
 
 logger = logging.getLogger(__name__)
+
+_MOE_SHARED_EXPERT_QUANT_LAYER0_BASES: tuple[str, ...] = (
+    "model.layers.0",
+    "model.language_model.layers.0",
+)
+
+_SHARED_EXPERT_BODY_PROJ_SUFFIXES: tuple[str, ...] = (
+    "gate_proj",
+    "up_proj",
+    "gate_up_proj",
+    "down_proj",
+)
 
 
 class QuarkConfig(QuantizationConfig):
@@ -373,6 +386,28 @@ class QuarkConfig(QuantizationConfig):
 
         return True
 
+    def _is_mx_w4a8(
+        self,
+        weight_quant: Optional[dict[str, Any]],
+        input_quant: Optional[dict[str, Any]],
+    ) -> bool:
+        if weight_quant is None or input_quant is None:
+            return False
+
+        is_mx_fp4_weight = (
+            weight_quant.get("dtype") == "fp4"
+            and weight_quant.get("qscheme") == "per_group"
+            and weight_quant.get("group_size") == 32
+            and not weight_quant.get("is_dynamic")
+            and weight_quant.get("scale_format") == "e8m0"
+        )
+        is_static_fp8_activation = (
+            input_quant.get("dtype") in ("fp8_e4m3", "fp8_e4m3fn")
+            and input_quant.get("qscheme") == "per_tensor"
+            and not input_quant.get("is_dynamic")
+        )
+        return is_mx_fp4_weight and is_static_fp8_activation
+
     def _find_matched_config(
         self, layer_name: str, module: torch.nn.Module
     ) -> dict[str, Any]:
@@ -484,6 +519,9 @@ class QuarkConfig(QuantizationConfig):
                 input_config,
                 is_checkpoint_mxfp4_serialized=self.is_prequantized,
             )
+        elif self._is_mx_w4a8(weight_config, input_config):
+            logger.info_once("Using Quark MXFP4-W/FP8-A MoE scheme")
+            return QuarkW4A8MXFp4MoE(weight_config, input_config)
         elif self._is_fp8_w8a8(weight_config, input_config):
             return QuarkW8A8FP8MoE(weight_config, input_config)
         else:
@@ -491,6 +529,38 @@ class QuarkConfig(QuantizationConfig):
 
     def get_scaled_act_names(self) -> List[str]:
         return []
+
+    def can_fuse_shared_expert(self) -> bool:
+        # Shared-expert body excluded from quant; the gate must not veto fusion.
+        if any(
+            "shared_expert" in layer
+            and "shared_expert_gate" not in layer
+            and not layer.startswith("mtp.")
+            for layer in self.exclude_layers
+        ):
+            return False
+
+        # No per-layer config -> uniform spec, nothing to compare.
+        layer_quant_config = self.quant_config.get("layer_quant_config") or {}
+        if not layer_quant_config:
+            return True
+
+        # Compare routed vs shared specs at layer 0 (stub module needed by
+        # _find_matched_config; an unmatched name -> ValueError -> cannot fuse).
+        lookup_stub = torch.nn.Module()
+        try:
+            for base in _MOE_SHARED_EXPERT_QUANT_LAYER0_BASES:
+                moe_name = f"{base}.mlp.experts"
+                moe_cfg = self._find_matched_config(moe_name, lookup_stub)
+                for suffix in _SHARED_EXPERT_BODY_PROJ_SUFFIXES:
+                    shared_name = f"{base}.mlp.shared_expert.{suffix}"
+                    shared_cfg = self._find_matched_config(shared_name, lookup_stub)
+                    if not deep_compare(moe_cfg, shared_cfg):
+                        return False
+        except ValueError:
+            return False
+
+        return True
 
 
 class QuarkLinearMethod(LinearMethodBase):
