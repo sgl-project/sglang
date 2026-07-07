@@ -295,7 +295,7 @@ class TestDSparkDraftInputBatch(CustomTestCase):
         self.assertEqual(req.kv_allocated_len, 22)
         self.assertEqual(batch.seq_lens.tolist(), [10])
 
-    def test_prepare_for_decode_paged_last_loc_uses_committed_len(self):
+    def test_prepare_for_decode_paged_last_loc_uses_allocated_len(self):
         t = self.torch
         spec = self.cls(
             bonus_tokens=t.tensor([1], dtype=t.int64),
@@ -339,7 +339,7 @@ class TestDSparkDraftInputBatch(CustomTestCase):
         ):
             spec.prepare_for_decode(batch)
 
-        self.assertEqual(paged_calls[0]["last_loc"].tolist(), [109])
+        self.assertEqual(paged_calls[0]["last_loc"].tolist(), [111])
         self.assertEqual(batch.seq_lens.tolist(), [10])
 
     def test_overlap_placeholders_inert_without_future_indices(self):

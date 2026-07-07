@@ -374,17 +374,6 @@ class DSparkDraftInputV2(SpecInput):
             num_needed_tokens += reserved_len - cur_alloc_len
 
         if num_needed_tokens > 0:
-            last_loc = None
-            if page_size != 1:
-                if int(committed_cpu.min()) <= 0:
-                    raise RuntimeError(
-                        "DSpark paged decode prepare requires positive committed "
-                        f"lengths, got min={int(committed_cpu.min())}."
-                    )
-                last_loc = batch.req_to_token_pool.req_to_token[
-                    batch.req_pool_indices, batch.seq_lens[:bs] - 1
-                ]
-
             # Reuse existing per-batch GPU buffers instead of allocating
             # DSpark-owned scratch tensors. Under high concurrency, even tiny
             # extra CUDA allocations can fail when the KV pool nearly fills memory.
@@ -400,7 +389,18 @@ class DSparkDraftInputV2(SpecInput):
             if page_size == 1:
                 out_cache_loc = alloc_token_slots(batch.tree_cache, num_needed_tokens)
             else:
-                assert last_loc is not None
+                if int(cur_kv_lens_cpu.min()) <= 0:
+                    raise RuntimeError(
+                        "DSpark paged decode prepare requires positive allocated "
+                        f"lengths, got min={int(cur_kv_lens_cpu.min())}."
+                    )
+                # Paged alloc_extend extends from prefix_lens=cur_kv_lens, so
+                # last_loc must point at cur_kv_lens - 1. Using committed_len - 1
+                # violates the allocator page-offset invariant once slots have
+                # already been reserved ahead of the committed prefix.
+                last_loc = batch.req_to_token_pool.req_to_token[
+                    batch.req_pool_indices, cur_kv_lens - 1
+                ]
                 out_cache_loc = alloc_paged_token_slots_extend(
                     batch.tree_cache,
                     cur_kv_lens,
