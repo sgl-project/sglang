@@ -57,6 +57,13 @@ The following table summarizes quantization method support across NVIDIA and AMD
       <td>Ascend NPU only; online MXFP8 quantization for Diffusion models (e.g., Wan2.2) and LLM Dense Linear on A5 series; uses CANN <code>npu_dynamic_mx_quant</code> / <code>npu_quant_matmul</code> kernels</td>
     </tr>
     <tr>
+      <td><code>mxfp_w4a8</code></td>
+      <td>No</td>
+      <td>No</td>
+      <td>Yes (A5)</td>
+      <td>Ascend NPU only; online W4A8 for Qwen3 dense LLM (MXFP4 weights + MXFP8 activations) on A5 series; offline <code>W4A8_MXFP</code> checkpoints are auto-detected via <code>modelslim</code></td>
+    </tr>
+    <tr>
       <td><code>blockwise_int8</code></td>
       <td>Yes</td>
       <td>Yes</td>
@@ -159,7 +166,7 @@ The following table summarizes quantization method support across NVIDIA and AMD
       <td>Yes (SM80-SM90 via FP4 fallback for NVFP4; SM100+ for MXFP8 linears)</td>
       <td>No</td>
       <td>No</td>
-      <td><a href="https://github.com/NVIDIA/Model-Optimizer">NVIDIA ModelOpt</a> mixed-precision checkpoints with per-layer FP8, NVFP4, and MXFP8; auto-selected from compatible <code>hf_quant_config.json</code> metadata</td>
+      <td><a href="https://github.com/NVIDIA/Model-Optimizer">NVIDIA ModelOpt</a> mixed-precision checkpoints with per-layer FP8, NVFP4/W4A16_NVFP4, and MXFP8; auto-selected from compatible <code>hf_quant_config.json</code> metadata</td>
     </tr>
     <tr>
       <td><code>nvfp4_online</code></td>
@@ -566,7 +573,7 @@ If a model is already quantized (e.g., from Hugging Face), you can load it direc
     ```
 
 * **Mixed Precision Models:**
-    ModelOpt `MIXED_PRECISION` checkpoints that combine FP8, NVFP4, or MXFP8 layers are auto-detected as `modelopt_mixed` when their `hf_quant_config.json` records microscaling or NVFP4 layers. NVFP4 layers use the ModelOpt FP4 capability path; MXFP8 linear layers use FlashInfer CUTLASS and require Blackwell.
+    ModelOpt `MIXED_PRECISION` checkpoints that combine FP8, NVFP4/W4A16_NVFP4, or MXFP8 layers are auto-detected as `modelopt_mixed` when their `hf_quant_config.json` records a supported NVFP4 or microscaling layer. NVFP4 layers use the ModelOpt FP4 capability path; MXFP8 linear layers use FlashInfer CUTLASS and require Blackwell.
     ```bash Command
     python3 -m sglang.launch_server \
         --model-path /path/to/modelopt-mixed-checkpoint \
@@ -632,7 +639,7 @@ python examples/usage/modelopt_quantize_and_export.py quantize \
 
 - `modelopt_fp8`: FP8 quantization with optimal performance on NVIDIA Hopper and Blackwell GPUs
 - `modelopt_fp4`: FP4 quantization with optimal performance on Nvidia Blackwell GPUs
-- `modelopt_mixed`: ModelOpt mixed-precision checkpoint loading for per-layer FP8, NVFP4, and MXFP8 on NVIDIA Blackwell GPUs
+- `modelopt_mixed`: ModelOpt mixed-precision checkpoint loading for per-layer FP8, NVFP4/W4A16_NVFP4, and MXFP8 on NVIDIA GPUs (MXFP8 requires Blackwell)
 
 ##### Python API Usage
 
