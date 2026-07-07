@@ -2491,6 +2491,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             and self.server_args.speculative_draft_attention_backend == "fa4"
             and self.kv_cache_dtype != self.dtype
         ):
+            logger.info(
+                "DFLASH fa4 draft: overriding KV cache dtype %s -> %s "
+                "(fa4 needs K.dtype == Q.dtype; cannot read the target's quantized KV).",
+                self.kv_cache_dtype,
+                self.dtype,
+            )
             self.kv_cache_dtype = self.dtype
 
     def init_cublas(self):
