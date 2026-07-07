@@ -1488,6 +1488,7 @@ def run_dsv4_target_verify_attention_case(
     fixture = build_dsv4_attention_fixture(testcase, case, dtype=dtype, device=device)
     runner = fixture.runner
     max_context_len = runner.req_to_token_pool.req_to_token.shape[1]
+    testcase.assertEqual(fixture.backend.max_context_len, max_context_len)
 
     _populate_swa_kv_cache(fixture, max_context_len=max_context_len, device=device)
     if case.compress_ratio in (4, 128):
@@ -1528,6 +1529,7 @@ def run_dsv4_draft_extend_attention_case(
     *,
     dtype: torch.dtype = torch.bfloat16,
     device: str = "cuda",
+    force_gpu_only_seq_lens: bool = False,
 ) -> None:
     """Math-faithful EAGLE `DRAFT_EXTEND` test for DSV4.
 
@@ -1565,6 +1567,10 @@ def run_dsv4_draft_extend_attention_case(
         fixture.forward_batch,
         device=device,
     )
+    if force_gpu_only_seq_lens:
+        fixture.forward_batch.seq_lens_cpu = None
+        fixture.forward_batch.seq_lens_sum = None
+        fixture.forward_batch.spec_info.seq_lens_cpu = None
 
     q_input, _ = fixture.actual_module.project(fixture.input_hidden)
     with torch.no_grad(), forward_context(ForwardContext(attn_backend=fixture.backend)):

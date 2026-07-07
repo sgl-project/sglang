@@ -50,7 +50,7 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc
-from sglang.srt.utils import ceil_align, is_xpu
+from sglang.srt.utils import ceil_align, is_cuda, is_xpu
 from sglang.srt.utils.common import is_sm120_supported
 
 if TYPE_CHECKING:
@@ -60,6 +60,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 _is_sm120 = is_sm120_supported()
+_is_cuda = is_cuda()
 _is_xpu = is_xpu()
 
 logger = logging.getLogger(__name__)
@@ -468,6 +469,7 @@ class DeepseekV4AttnBackend(
         super().__init__()
         self.model_runner = model_runner
         self.device = torch.device(model_runner.device)
+        self.max_context_len = model_runner.model_config.context_len
         head_dim = model_runner.model_config.head_dim
         assert (
             head_dim == 512
@@ -510,6 +512,11 @@ class DeepseekV4AttnBackend(
         ] = None
         self.online_c128_mtp = OnlineC128MTPController(self)
         self.sparse_prefill_workspace = SparsePrefillWorkspace(self.device)
+        self.needs_cpu_seq_lens = (
+            not _is_cuda
+            or not envs.SGLANG_PREP_IN_CUDA_GRAPH.get()
+            or self.online_c128_mtp.enabled()
+        )
 
     def _move_to_device(self, x: List[int]) -> torch.Tensor:
         pin_tensor = torch.tensor(x, dtype=torch.int32, pin_memory=True)
@@ -519,7 +526,7 @@ class DeepseekV4AttnBackend(
         self,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        seq_lens_cpu: List[int],
+        seq_lens_cpu: Optional[List[int]],
         extend_seq_lens: torch.Tensor,
         use_prefill_cuda_graph: bool,
         online_c128_state_slot_offset: int,
@@ -527,6 +534,7 @@ class DeepseekV4AttnBackend(
         if not self.online_c128_mtp.enabled():
             return None
 
+        assert seq_lens_cpu is not None
         num_draft_tokens = self.speculative_num_draft_tokens
         seq_lens_cpu = [int(x) + num_draft_tokens for x in seq_lens_cpu]
         extend_lens_cpu = [num_draft_tokens] * len(seq_lens_cpu)
@@ -705,11 +713,11 @@ class DeepseekV4AttnBackend(
     ) -> Union[DSV4Metadata, DSV4RawVerifyMetadata]:
         if envs.SGLANG_PREP_IN_CUDA_GRAPH.get():
             assert out_cache_loc is not None
-            seq_lens_cpu_list = (
-                seq_lens.detach().cpu().tolist()
-                if seq_lens_cpu is None
-                else seq_lens_cpu.tolist()
-            )
+            if self.needs_cpu_seq_lens:
+                assert seq_lens_cpu is not None
+                seq_lens_cpu_list = seq_lens_cpu.tolist()
+            else:
+                seq_lens_cpu_list = None
             if not hasattr(self, "extend_seq_lens_buffer"):
                 self.extend_seq_lens_buffer = torch.tensor(
                     [self.speculative_num_draft_tokens] * 1025, device=self.device
@@ -732,12 +740,12 @@ class DeepseekV4AttnBackend(
                 ),
             )
         else:
-            seq_lens_cpu = seq_lens.tolist()
+            assert seq_lens_cpu is not None
             return self.init_forward_metadata_target_verify_old(
                 max_seq_len=max_seq_len,
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
-                seq_lens_cpu=seq_lens_cpu,
+                seq_lens_cpu=seq_lens_cpu.tolist(),
                 out_cache_loc=out_cache_loc,
                 use_prefill_cuda_graph=use_prefill_cuda_graph,
                 online_c128_state_slot_offset=online_c128_state_slot_offset,
@@ -864,32 +872,38 @@ class DeepseekV4AttnBackend(
 
     def init_forward_metadata_draft_extend(
         self,
-        max_seq_len: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        seq_lens_cpu: List[int],
         num_tokens_per_bs: int,
         out_cache_loc: Optional[torch.Tensor] = None,
-        use_prefill_cuda_graph: bool = False,
     ) -> DSV4Metadata:
         batch_size = len(seq_lens)
-        extend_seq_lens_cpu = [num_tokens_per_bs] * batch_size
-        extend_seq_lens = self._move_to_device(extend_seq_lens_cpu)
         num_tokens = num_tokens_per_bs * batch_size
         if out_cache_loc is None:
             out_cache_loc = seq_lens.new_zeros(num_tokens)
-        return self.init_forward_metadata_prefill(
-            seq_lens=seq_lens,
-            max_seq_len=max_seq_len,
-            req_pool_indices=req_pool_indices,
-            seq_lens_cpu=seq_lens_cpu,
-            out_cache_loc=out_cache_loc,
-            num_tokens=num_tokens,
-            extend_seq_lens=extend_seq_lens,
-            extend_seq_lens_cpu=extend_seq_lens_cpu,
-            extend_start_loc=None,
+
+        seq_lens_casual, req_pool_indices_repeated = (
+            self.expand_extend_with_same_length(
+                batch_size,
+                num_tokens_per_bs,
+                seq_lens,
+                req_pool_indices,
+            )
+        )
+        core_attn_metadata = self.make_core_attn_metadata(
+            req_to_token=self.req_to_token,
+            req_pool_indices_repeated=req_pool_indices_repeated,
+            seq_lens_casual=seq_lens_casual,
+            # Draft extend is SWA-only. Keep the required 2-D page-table
+            # placeholder narrow instead of materializing the full context.
+            max_seq_len=self.page_size,
+            out_loc=out_cache_loc,
             need_compress=False,
-            use_prefill_cuda_graph=use_prefill_cuda_graph,
+            is_prefill=True,
+        )
+        return DSV4Metadata(
+            core_attn_metadata=core_attn_metadata,
+            indexer_metadata=None,
         )
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
@@ -960,14 +974,16 @@ class DeepseekV4AttnBackend(
                 out_cache_loc = None
             actual_forward_mode = forward_batch.forward_mode
             seq_lens_sum = int(seq_lens.sum().item())
-            seq_lens_cpu = seq_lens.cpu()
+            seq_lens_cpu = seq_lens.cpu() if self.needs_cpu_seq_lens else None
         else:
             out_cache_loc = forward_batch.out_cache_loc
             actual_forward_mode = getattr(
                 forward_batch, "actual_forward_mode", forward_batch.forward_mode
             )
             seq_lens_sum = forward_batch.seq_lens_sum
-            seq_lens_cpu = forward_batch.seq_lens_cpu
+            seq_lens_cpu = (
+                forward_batch.seq_lens_cpu if self.needs_cpu_seq_lens else None
+            )
 
         if actual_forward_mode == ForwardMode.IDLE:
             logger.debug(
@@ -977,21 +993,23 @@ class DeepseekV4AttnBackend(
             )
             device = seq_lens.device
             seq_lens = torch.ones(bs, dtype=seq_lens.dtype, device=device)
-            seq_lens_cpu = torch.ones(bs, dtype=torch.int64)
+            if self.needs_cpu_seq_lens:
+                seq_lens_cpu = torch.ones(bs, dtype=torch.int64)
             seq_lens_sum = bs
             req_pool_indices = torch.zeros(
                 bs, dtype=req_pool_indices.dtype, device=device
             )
             out_cache_loc = torch.zeros(bs, dtype=torch.int64, device=device)
 
-        assert seq_lens_cpu is not None
         seq_lens = seq_lens[:bs]
-        seq_lens_cpu = seq_lens_cpu[:bs]
+        if seq_lens_cpu is not None:
+            seq_lens_cpu = seq_lens_cpu[:bs]
         req_pool_indices = req_pool_indices[:bs]
 
-        actual_max_seq_len = seq_lens_cpu.max().item()
         chosen_max_seq_len = self.MAX_SEQ_LEN_FOR_CAPTURE
-        assert actual_max_seq_len <= chosen_max_seq_len
+        if seq_lens_cpu is not None:
+            actual_max_seq_len = seq_lens_cpu.max().item()
+            assert actual_max_seq_len <= chosen_max_seq_len
 
         if bucket == _GraphBucket.DECODE_OR_IDLE:
             assert out_cache_loc is not None
@@ -1061,13 +1079,10 @@ class DeepseekV4AttnBackend(
                     value=0,
                 )
             temp_metadata = self.init_forward_metadata_draft_extend(
-                max_seq_len=chosen_max_seq_len,
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
-                seq_lens_cpu=seq_lens_cpu.tolist(),
                 num_tokens_per_bs=num_tokens_per_bs,
                 out_cache_loc=out_cache_loc,
-                use_prefill_cuda_graph=True,
             )
         else:
             self.online_c128_mtp.clear()
@@ -1108,18 +1123,21 @@ class DeepseekV4AttnBackend(
         logical_forward_mode = _get_logical_forward_mode(forward_batch)
         req_pool_indices = forward_batch.req_pool_indices
         seq_lens = forward_batch.seq_lens.to(torch.int32)
+        # Regular prefill batches already carry scheduler-maintained CPU lengths.
+        # Keep using those when present; needs_cpu_seq_lens only controls whether
+        # speculative overlap must publish a new GPU-to-CPU mirror each step.
         seq_lens_cpu = forward_batch.seq_lens_cpu
         assert self.req_to_token_pool.req_to_token is self.req_to_token
 
         assert self.swa_page_size % SWA_WINDOW == 0 and self.page_size % 128 == 0
-        assert seq_lens_cpu is not None
         if max_seq_len_override is None:
             max_seq_len_override = getattr(forward_batch, "max_seq_len_override", None)
-        max_seq_len = (
-            int(seq_lens_cpu.max().item())
-            if max_seq_len_override is None
-            else max_seq_len_override
-        )
+        if max_seq_len_override is not None:
+            max_seq_len = max_seq_len_override
+        elif seq_lens_cpu is not None:
+            max_seq_len = int(seq_lens_cpu.max().item())
+        else:
+            max_seq_len = self.MAX_SEQ_LEN_FOR_CAPTURE
         verify_bs = _get_target_verify_bs(forward_batch)
         online_c128_state_slot_offset = self.online_c128_mtp.prepare_forward(
             logical_forward_mode,
@@ -1154,7 +1172,16 @@ class DeepseekV4AttnBackend(
                 out_cache_loc=forward_batch.out_cache_loc,
                 online_c128_state_slot_offset=online_c128_state_slot_offset,
             )
-        elif logical_forward_mode.is_prefill(include_draft_extend_v2=True):
+        elif logical_forward_mode.is_draft_extend_v2():
+            num_tokens_per_bs = self.speculative_num_draft_tokens
+            assert num_tokens_per_bs > 0
+            metadata = self.init_forward_metadata_draft_extend(
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                num_tokens_per_bs=num_tokens_per_bs,
+                out_cache_loc=forward_batch.out_cache_loc,
+            )
+        elif logical_forward_mode.is_prefill():
             extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
             extend_seq_lens = forward_batch.extend_seq_lens
             assert (
@@ -1163,7 +1190,6 @@ class DeepseekV4AttnBackend(
                 and extend_seq_lens is not None
                 and extend_seq_lens_cpu is not None
             )
-            is_draft = forward_batch.forward_mode.is_draft_extend_v2()
             metadata = self.init_forward_metadata_prefill(
                 max_seq_len=max_seq_len,
                 req_pool_indices=req_pool_indices,
@@ -1174,7 +1200,7 @@ class DeepseekV4AttnBackend(
                 extend_seq_lens=extend_seq_lens,
                 extend_seq_lens_cpu=extend_seq_lens_cpu,
                 extend_start_loc=forward_batch.extend_start_loc,
-                need_compress=not is_draft,
+                need_compress=True,
                 use_prefill_cuda_graph=use_prefill_cuda_graph,
             )
         else:

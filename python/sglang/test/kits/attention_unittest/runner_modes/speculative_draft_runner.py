@@ -1493,6 +1493,7 @@ def run_dsv4_eagle_draft_cuda_graph_runner_case(
     vocab_size: int = 64,
     dtype: torch.dtype = torch.bfloat16,
     device: str = "cuda",
+    force_gpu_only_seq_lens: bool = False,
 ):
     settings = EagleDraftRunnerSettings(
         topk=topk,
@@ -1507,12 +1508,20 @@ def run_dsv4_eagle_draft_cuda_graph_runner_case(
         atol=DSV4_ATOL,
         rtol=DSV4_RTOL,
     )
+
+    def _make_forward_batch(case, draft_inputs, settings):
+        batch = _make_dsv4_eagle_draft_forward_batch(case, draft_inputs, settings)
+        if force_gpu_only_seq_lens:
+            batch.seq_lens_cpu = None
+            batch.seq_lens_sum = None
+        return batch
+
     adapter = EagleDraftCudaGraphRunnerAdapter(
         build_fixture=build_dsv4_attention_fixture,
         make_model_forward=_make_dsv4_model_forward,
         make_draft_inputs=_make_dsv4_draft_inputs,
         prepare_replay_state=_prepare_dsv4_draft_replay_state,
-        make_forward_batch=_make_dsv4_eagle_draft_forward_batch,
+        make_forward_batch=_make_forward_batch,
         check_case=_check_dsv4_draft_cache_layout,
         init_eager_metadata=_init_dsv4_eager_metadata,
     )
