@@ -10,7 +10,7 @@ tag: NEW
 
 <Accordion title="Install SGLang">
 
-Ornith-1.0 model cards recommend SGLang `>=0.5.9`. The launch commands below use the reasoning and tool-call parsers from the model-card quickstarts: `--reasoning-parser qwen3` separates `<think>...</think>` traces into `reasoning_content`, and `--tool-call-parser qwen3_coder` surfaces Qwen-style XML tool calls as OpenAI-compatible `tool_calls`.
+Ornith-1.0 model cards recommend SGLang `>=0.5.9`. The Deploy panel below emits the base serve command; the reasoning and tool-call parsers from the model-card quickstarts (`--reasoning-parser qwen3` for `<think>...</think>` traces, `--tool-call-parser qwen3_coder` for Qwen-style XML tool calls) are added on top via the [Playground](#playground).
 
 <Tabs>
 
@@ -47,6 +47,19 @@ import { config }     from "/src/snippets/configs/deepreinforce-ai/ornith-1.0.js
 
 <Deployment config={config} />
 
+## Playground
+
+The Playground layers SGLang features on top of whichever cell the Deploy panel is showing — only your overrides change, and any change flips the badge to **Not Verified** until the new configuration is run end-to-end.
+
+For Ornith-1.0 the knobs are the reasoning and tool-call parsers:
+
+- **Reasoning Parser** appends `--reasoning-parser qwen3`. Ornith emits `<think>...</think>` traces; with this on, SGLang surfaces them as `message.reasoning_content` instead of leaving the tags inline in `content`.
+- **Tool Call Parser** appends `--tool-call-parser qwen3_coder`, so Qwen-style XML tool calls are returned as OpenAI-compatible `tool_calls`.
+
+import { Playground } from "/src/snippets/_playground.jsx";
+
+<Playground config={config} />
+
 ## 1. Model Introduction
 
 [Ornith-1.0](https://huggingface.co/collections/deepreinforce-ai/ornith-10) is DeepReinforce's self-improving open-source model family for agentic coding. The model cards describe the family as post-trained on top of Gemma 4 and Qwen 3.5, and the collection currently includes 397B, 35B, and 9B repos plus FP8 and GGUF variants. The model cards report results on Terminal-Bench 2.1, SWE-Bench, NL2Repo, ClawEval, and SWE Atlas benchmarks.
@@ -55,8 +68,8 @@ import { config }     from "/src/snippets/configs/deepreinforce-ai/ornith-1.0.js
 
 - **Agentic coding specialization**: the model cards describe Ornith-1.0 as specialized for agentic coding and report coding-agent benchmark results.
 - **Self-improving training**: the model cards state that Ornith-1.0 uses reinforcement learning to optimize both solution rollouts and the scaffold that drives those rollouts.
-- **Reasoning model behavior**: assistant responses begin with a `<think>...</think>` reasoning block before the final answer unless you split it with `--reasoning-parser qwen3`.
-- **Tool calling**: emits Qwen-style XML tool calls; serve with `--tool-call-parser qwen3_coder`.
+- **Reasoning model behavior**: assistant responses begin with a `<think>...</think>` reasoning block before the final answer; enable the `--reasoning-parser qwen3` toggle in the [Playground](#playground) to split it into `reasoning_content`.
+- **Tool calling**: emits Qwen-style XML tool calls; enable the `--tool-call-parser qwen3_coder` toggle in the [Playground](#playground).
 - **Long context**: model-card recipes use `--context-length 262144`.
 - **MIT license**: the Hugging Face repos are released under MIT.
 
@@ -129,8 +142,8 @@ import { config }     from "/src/snippets/configs/deepreinforce-ai/ornith-1.0.js
 
 ## 2. Configuration Tips
 
-- **Reasoning parser**: Ornith responses include `<think>...</think>`. The deployment command uses `--reasoning-parser qwen3` so OpenAI-compatible responses expose the reasoning trace as `message.reasoning_content`.
-- **Tool-call parser**: use `--tool-call-parser qwen3_coder` so `<tool_call>` blocks are returned as OpenAI-compatible tool calls.
+- **Reasoning parser**: Ornith responses include `<think>...</think>`. Enable the `--reasoning-parser qwen3` toggle in the [Playground](#playground) so OpenAI-compatible responses expose the reasoning trace as `message.reasoning_content`.
+- **Tool-call parser**: enable the `--tool-call-parser qwen3_coder` toggle in the [Playground](#playground) so `<tool_call>` blocks are returned as OpenAI-compatible tool calls.
 - **Context length**: the model-card SGLang recipes use `--context-length 262144`. Lower it if you need more memory headroom.
 - **Tensor parallelism**: the 397B model-card recipes use `--tp 8`; in this single-node matrix, non-FP8 397B is H200-only, while 397B-FP8 is available on both H100 and H200. The 35B deploy commands use `--tp 2`. The 9B model-card recipe is single-GPU by default; the command panel makes that explicit with `--tp 1`. Adjust TP to match your node and memory budget.
 - **Sampling**: model cards recommend `temperature=0.6`, `top_p=0.95`, and `top_k=20` for normal use. Their reported benchmark setup may use different task-specific sampling parameters.
@@ -139,6 +152,8 @@ import { config }     from "/src/snippets/configs/deepreinforce-ai/ornith-1.0.js
 ## 3. Usage Examples
 
 ### 3.1 Basic Chat Completion
+
+`message.reasoning_content` is only populated when the server was launched with the `--reasoning-parser qwen3` toggle (see the [Playground](#playground)); otherwise the `<think>...</think>` trace stays inline in `message.content`.
 
 <Accordion title="Python client">
 
@@ -169,7 +184,7 @@ print(message.content)
 
 ### 3.2 Tool Calling
 
-Launch with `--tool-call-parser qwen3_coder` (included in the Deploy panel). Then use the standard OpenAI-compatible `tools` field:
+Enable the `--tool-call-parser qwen3_coder` toggle in the [Playground](#playground) and launch with the resulting command. Then use the standard OpenAI-compatible `tools` field:
 
 <Accordion title="Tool-call request">
 

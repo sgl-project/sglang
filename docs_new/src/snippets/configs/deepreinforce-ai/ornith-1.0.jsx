@@ -1,14 +1,13 @@
 // Ornith-1.0 (DeepReinforce) — config-driven cookbook page.
 // The launch flags follow the SGLang quickstarts published on the model cards; the 9B recipe makes the single-GPU default explicit with --tp 1.
 // FP8 quantization cells use their FP8 repo ids from the collection with the same flags; their README quickstarts currently point to the non-FP8 repos.
+// Reasoning / tool-call parsers are exposed as a Playground toggle (qwen3 / qwen3_coder), not baked into the deploy cells.
 // Cells remain unverified until exact recipes are run and signed off.
 
 export const config = {
   modelName: "Ornith-1.0",
 
   supportedHardware: ["h100", "h200"],
-
-  showVerificationBadge: false,
 
   variants: [
     { id: "397b", label: "397B", subtitle: "MoE" },
@@ -22,7 +21,7 @@ export const config = {
   ],
 
   strategies: [
-    { id: "default", label: "Default" },
+    { id: "balanced", label: "Balanced" },
   ],
 
   nodesOptions: [
@@ -69,9 +68,21 @@ export const config = {
     cookbookModel: "deepreinforce-ai/Ornith-1.0",
   },
 
+  // Parsers are added on top of the base deploy command via the Playground,
+  // not baked into the cells. Both ids are registered in the SGLang parser
+  // registries and match the model's Qwen3.5 chat template.
+  playgroundFeatures: {
+    parsers: {
+      items: [
+        { id: "reasoning", label: "Reasoning Parser", flag: "--reasoning-parser qwen3" },
+        { id: "toolCall",  label: "Tool Call Parser", flag: "--tool-call-parser qwen3_coder" },
+      ],
+    },
+  },
+
   cells: [
     {
-      match: { hw: "h200", variant: "397b", quant: "bf16", strategy: "default", nodes: "single" },
+      match: { hw: "h200", variant: "397b", quant: "bf16", strategy: "balanced", nodes: "single" },
       env: [],
       flags: [
         "--model-path deepreinforce-ai/Ornith-1.0-397B",
@@ -79,14 +90,12 @@ export const config = {
         "--tp 8",
         "--context-length 262144",
         "--mem-fraction-static 0.8",
-        "--tool-call-parser qwen3_coder",
-        "--reasoning-parser qwen3",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
     },
     {
-      match: { hw: "h200", variant: "397b", quant: "fp8", strategy: "default", nodes: "single" },
+      match: { hw: "h200", variant: "397b", quant: "fp8", strategy: "balanced", nodes: "single" },
       env: [],
       flags: [
         "--model-path deepreinforce-ai/Ornith-1.0-397B-FP8",
@@ -94,14 +103,12 @@ export const config = {
         "--tp 8",
         "--context-length 262144",
         "--mem-fraction-static 0.8",
-        "--tool-call-parser qwen3_coder",
-        "--reasoning-parser qwen3",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
     },
     {
-      match: { hw: "h200", variant: "35b", quant: "bf16", strategy: "default", nodes: "single" },
+      match: { hw: "h200", variant: "35b", quant: "bf16", strategy: "balanced", nodes: "single" },
       env: [],
       flags: [
         "--model-path deepreinforce-ai/Ornith-1.0-35B",
@@ -109,14 +116,12 @@ export const config = {
         "--tp 2",
         "--context-length 262144",
         "--mem-fraction-static 0.85",
-        "--tool-call-parser qwen3_coder",
-        "--reasoning-parser qwen3",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
     },
     {
-      match: { hw: "h200", variant: "35b", quant: "fp8", strategy: "default", nodes: "single" },
+      match: { hw: "h200", variant: "35b", quant: "fp8", strategy: "balanced", nodes: "single" },
       env: [],
       flags: [
         "--model-path deepreinforce-ai/Ornith-1.0-35B-FP8",
@@ -124,14 +129,12 @@ export const config = {
         "--tp 2",
         "--context-length 262144",
         "--mem-fraction-static 0.85",
-        "--tool-call-parser qwen3_coder",
-        "--reasoning-parser qwen3",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
     },
     {
-      match: { hw: "h200", variant: "9b", quant: "bf16", strategy: "default", nodes: "single" },
+      match: { hw: "h200", variant: "9b", quant: "bf16", strategy: "balanced", nodes: "single" },
       env: [],
       flags: [
         "--model-path deepreinforce-ai/Ornith-1.0-9B",
@@ -139,14 +142,12 @@ export const config = {
         "--tp 1",
         "--context-length 262144",
         "--mem-fraction-static 0.85",
-        "--tool-call-parser qwen3_coder",
-        "--reasoning-parser qwen3",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
     },
     {
-      match: { hw: "h100", variant: "397b", quant: "fp8", strategy: "default", nodes: "single" },
+      match: { hw: "h100", variant: "397b", quant: "fp8", strategy: "balanced", nodes: "single" },
       env: [],
       flags: [
         "--model-path deepreinforce-ai/Ornith-1.0-397B-FP8",
@@ -154,14 +155,12 @@ export const config = {
         "--tp 8",
         "--context-length 262144",
         "--mem-fraction-static 0.8",
-        "--tool-call-parser qwen3_coder",
-        "--reasoning-parser qwen3",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
     },
     {
-      match: { hw: "h100", variant: "35b", quant: "bf16", strategy: "default", nodes: "single" },
+      match: { hw: "h100", variant: "35b", quant: "bf16", strategy: "balanced", nodes: "single" },
       env: [],
       flags: [
         "--model-path deepreinforce-ai/Ornith-1.0-35B",
@@ -169,14 +168,12 @@ export const config = {
         "--tp 2",
         "--context-length 262144",
         "--mem-fraction-static 0.85",
-        "--tool-call-parser qwen3_coder",
-        "--reasoning-parser qwen3",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
     },
     {
-      match: { hw: "h100", variant: "35b", quant: "fp8", strategy: "default", nodes: "single" },
+      match: { hw: "h100", variant: "35b", quant: "fp8", strategy: "balanced", nodes: "single" },
       env: [],
       flags: [
         "--model-path deepreinforce-ai/Ornith-1.0-35B-FP8",
@@ -184,14 +181,12 @@ export const config = {
         "--tp 2",
         "--context-length 262144",
         "--mem-fraction-static 0.85",
-        "--tool-call-parser qwen3_coder",
-        "--reasoning-parser qwen3",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
     },
     {
-      match: { hw: "h100", variant: "9b", quant: "bf16", strategy: "default", nodes: "single" },
+      match: { hw: "h100", variant: "9b", quant: "bf16", strategy: "balanced", nodes: "single" },
       env: [],
       flags: [
         "--model-path deepreinforce-ai/Ornith-1.0-9B",
@@ -199,8 +194,6 @@ export const config = {
         "--tp 1",
         "--context-length 262144",
         "--mem-fraction-static 0.85",
-        "--tool-call-parser qwen3_coder",
-        "--reasoning-parser qwen3",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
