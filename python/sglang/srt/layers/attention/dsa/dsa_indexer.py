@@ -10,7 +10,6 @@ from einops import rearrange
 
 from sglang.jit_kernel.dsa import (
     aiter_paged_mqa_logits,
-    cutedsl_paged_mqa_logits,
     deepgemm_paged_mqa_logits_native,
     deepgemm_paged_mqa_logits_split,
     pick_dsl_expand,
@@ -78,6 +77,8 @@ if _use_aiter and not _use_aiter_preshuffle:
         "(needs Triton>=3.5.0 or AITER_ENABLE_AOT_GLUON_PA_MQA_LOGITS=1); "
         "falling back to legacy page_size=1 / KVBlockSize=1 path."
     )
+if not is_npu():
+    from sglang.srt.layers.attention.dsa.utils import cutedsl_paged_mqa_logits
 if _is_cuda:
     try:
         import deep_gemm
