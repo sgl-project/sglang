@@ -266,6 +266,81 @@ class TestDSparkPrefillHandoff(CustomTestCase):
         )
         self.assertEqual(recovered.tolist(), [0, 0])
 
+    def test_prefill_tail_hidden_packs_variable_length_batch(self):
+        t = self.torch
+        hidden = t.arange(10 * 2, dtype=t.float32).view(10, 2)
+        tail_hidden, tail_mask = self.worker_cls._pack_prefill_tail_hidden(
+            self._worker(0),
+            hidden=hidden,
+            extend_lens=[3, 0, 7],
+        )
+
+        self.assertEqual(tuple(tail_hidden.shape), (3, 7, 2))
+        self.assertEqual(tuple(tail_mask.shape), (3, 7))
+        self.assertEqual(
+            tail_mask[0].tolist(), [False, False, False, False, True, True, True]
+        )
+        self.assertEqual(tail_mask[1].tolist(), [False] * 7)
+        self.assertEqual(tail_mask[2].tolist(), [True] * 7)
+        self.assertTrue(t.equal(tail_hidden[0, 4:], hidden[:3]))
+        self.assertTrue(t.equal(tail_hidden[1], t.zeros_like(tail_hidden[1])))
+        self.assertTrue(t.equal(tail_hidden[2], hidden[3:10]))
+
+    def test_prefill_tail_hidden_caps_to_last_128_tokens(self):
+        t = self.torch
+        hidden = t.arange(130, dtype=t.float32).view(130, 1)
+        tail_hidden, tail_mask = self.worker_cls._pack_prefill_tail_hidden(
+            self._worker(0),
+            hidden=hidden,
+            extend_lens=[130],
+        )
+
+        self.assertEqual(tuple(tail_hidden.shape), (1, 128, 1))
+        self.assertTrue(tail_mask.all())
+        self.assertEqual(tail_hidden[:, 0, 0].item(), 2.0)
+        self.assertEqual(tail_hidden[:, -1, 0].item(), 129.0)
+
+    def test_decode_anchor_tokens_mix_prompt_output_and_fallback(self):
+        t = self.torch
+        worker = self._worker(0)
+        worker.noise_token_id = 999
+        batch = SimpleNamespace(
+            reqs=[
+                SimpleNamespace(origin_input_ids=[10, 11, 12], output_ids=[]),
+                SimpleNamespace(origin_input_ids=[20, 21], output_ids=[200, 201]),
+                SimpleNamespace(origin_input_ids=[30, 31], output_ids=[]),
+                SimpleNamespace(origin_input_ids=[], output_ids=[]),
+            ],
+            seq_lens_cpu=None,
+        )
+        anchors = self.worker_cls._get_decode_anchor_tokens(
+            worker,
+            batch=batch,
+            prefix_lens=t.tensor([3, 4, 5, 0], dtype=t.int64),
+            fallback_tokens=t.tensor([1000, 1001, 1002, 1003], dtype=t.int64),
+            prefer_fallback_tokens=t.tensor([False, False, False, True]),
+            bs=4,
+            device=t.device("cpu"),
+        )
+
+        self.assertEqual(anchors.tolist(), [12, 201, 1002, 1003])
+
+    def test_decode_next_input_carries_warmup_rounds(self):
+        t = self.torch
+        draft_input = self.worker_cls._make_next_draft_input_decode(
+            self._worker(0),
+            bonus_tokens=t.tensor([301, 302], dtype=t.int32),
+            new_seq_lens=t.tensor([3681, 9], dtype=t.int32),
+            transfer_warmup_rounds=t.tensor([1, 0], dtype=t.int64),
+        )
+
+        self.assertEqual(draft_input.bonus_tokens.dtype, t.int64)
+        self.assertEqual(draft_input.new_seq_lens.dtype, t.int64)
+        self.assertEqual(draft_input.transfer_warmup_rounds.dtype, t.int32)
+        self.assertEqual(draft_input.bonus_tokens.tolist(), [301, 302])
+        self.assertEqual(draft_input.new_seq_lens.tolist(), [3681, 9])
+        self.assertEqual(draft_input.transfer_warmup_rounds.tolist(), [1, 0])
+
 
 class TestDSparkDeepSpecSemanticReference(CustomTestCase):
     def setUp(self):
