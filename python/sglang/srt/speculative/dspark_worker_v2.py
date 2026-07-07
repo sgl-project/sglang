@@ -250,6 +250,17 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._accept_anomaly_max_dumps = max(
             1, _env_int("SGLANG_DSPARK_DEBUG_ACCEPT_MAX_DUMPS", 64)
         )
+        self._parity_dump_enabled = _env_flag("SGLANG_DSPARK_PARITY_DUMP", False)
+        self._parity_dump_max_rounds = max(
+            1, _env_int("SGLANG_DSPARK_PARITY_DUMP_MAX_ROUNDS", 8)
+        )
+        self._parity_dump_max_rows = max(
+            1, _env_int("SGLANG_DSPARK_PARITY_DUMP_MAX_ROWS", 1)
+        )
+        self._parity_dump_topk_enabled = _env_flag(
+            "SGLANG_DSPARK_PARITY_DUMP_TOPK", True
+        )
+        self._parity_dump_counts: dict[tuple[int, object], int] = {}
         self._accept_anomaly_histories: dict[tuple[int, object], list[dict]] = {}
         self._accept_anomaly_streaks: dict[tuple[int, object], int] = {}
         self._accept_anomaly_dumped: set[tuple[int, object]] = set()
@@ -971,7 +982,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         flat_hidden = hidden.to(device=device, non_blocking=True)[valid]
         flat_cache_locs = cache_locs[valid].to(torch.int64)
         flat_positions = positions[valid].to(torch.int64)
-        if self._accept_anomaly_enabled:
+        if self._accept_anomaly_enabled or self._parity_dump_enabled:
             for i in range(bs):
                 row_valid = valid[i]
                 if not row_valid.any():
@@ -2080,11 +2091,16 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         with torch.inference_mode():
             base_logits = _compute_full_vocab_logits(block_hidden, lm_head)
-            debug_enabled = bool(self._accept_anomaly_enabled)
+            debug_enabled = bool(
+                self._accept_anomaly_enabled or self._parity_dump_enabled
+            )
             if debug_enabled:
                 debug_topk_k = (
                     min(5, int(base_logits.shape[-1]))
-                    if self._accept_anomaly_topk_enabled
+                    if (
+                        self._accept_anomaly_topk_enabled
+                        or self._parity_dump_topk_enabled
+                    )
                     else 0
                 )
                 if debug_topk_k > 0:
@@ -2718,6 +2734,176 @@ class DSparkWorkerV2(BaseSpecWorker):
         except Exception as e:
             return [{"error": str(e)}]
 
+    def _maybe_log_parity_dump(
+        self,
+        *,
+        model_worker_batch: ScheduleBatch,
+        draft_input: DSparkDraftInputV2,
+        anchor_tokens: torch.Tensor,
+        candidates: torch.Tensor,
+        target_predict: torch.Tensor,
+        commit_lens: torch.Tensor,
+        bonus_tokens: torch.Tensor,
+        confidence: torch.Tensor,
+        prefix_lens: torch.Tensor,
+        anchor_lens: torch.Tensor,
+        new_seq_lens: torch.Tensor,
+        block_hidden: Optional[torch.Tensor],
+        target_logits: Optional[torch.Tensor],
+        ignore_mask: Optional[torch.Tensor] = None,
+    ) -> None:
+        if (
+            not self._parity_dump_enabled
+            or commit_lens.numel() == 0
+            or not self._is_tp0()
+        ):
+            return
+
+        bs = int(candidates.shape[0])
+        reqs = getattr(model_worker_batch, "reqs", None) or []
+        req_pool_indices = model_worker_batch.req_pool_indices.detach().cpu().tolist()
+        seq_lens = prefix_lens.detach().cpu().tolist()
+        anchor_lens_cpu = anchor_lens.detach().cpu().tolist()
+        next_seq_lens = new_seq_lens.detach().cpu().tolist()
+        candidate_cpu = candidates.detach().cpu()
+        target_cpu = target_predict.detach().cpu()
+        confidence_cpu = confidence.detach().cpu()
+        commit_lens_cpu = commit_lens.detach().cpu().tolist()
+        next_bonus = bonus_tokens.detach().cpu().tolist()
+        draft_anchor = (
+            anchor_tokens.detach().cpu().tolist()
+            if anchor_tokens.numel() == bs
+            else None
+        )
+        input_bonus = (
+            draft_input.bonus_tokens.detach().cpu().tolist()
+            if draft_input.bonus_tokens.numel() == bs
+            else None
+        )
+        ignore_cpu = (
+            ignore_mask.detach().cpu().tolist()
+            if ignore_mask is not None and ignore_mask.numel() == bs
+            else [False] * bs
+        )
+
+        active_keys = set()
+        rows_logged = 0
+        for i, req_pool_idx in enumerate(req_pool_indices):
+            req = reqs[i] if i < len(reqs) else None
+            rid = getattr(req, "rid", None)
+            key = (int(req_pool_idx), rid)
+            active_keys.add(key)
+            round_idx = self._parity_dump_counts.get(key, 0)
+            if round_idx >= self._parity_dump_max_rounds:
+                continue
+            if rows_logged >= self._parity_dump_max_rows:
+                continue
+            self._parity_dump_counts[key] = round_idx + 1
+            rows_logged += 1
+
+            draft_width = int(self.block_size)
+            candidate_row = candidate_cpu[i]
+            target_row = target_cpu[i]
+            confidence_row = confidence_cpu[i]
+            valid_window_sources = None
+            valid_locs = self._last_valid_swa_locs_by_req_pool_debug.get(
+                int(req_pool_idx)
+            )
+            if valid_locs is not None:
+                valid_window_sources = self._visible_window_source_debug(
+                    int(req_pool_idx), valid_locs
+                )
+            markov_debug = self._build_accept_anomaly_markov_debug(
+                row_idx=i,
+                candidates=candidate_cpu,
+                target_predict=target_cpu,
+                confidence=confidence_cpu,
+            )
+            score_debug = None
+            if block_hidden is not None:
+                score_debug = self._build_accept_anomaly_logit_score_debug(
+                    row_idx=i,
+                    block_hidden=block_hidden,
+                    candidates=candidates,
+                    target_predict=target_predict,
+                )
+            if markov_debug is not None and score_debug is not None:
+                markov_debug["logit_score_debug"] = score_debug
+            if (
+                markov_debug is not None
+                and target_logits is not None
+                and self._parity_dump_topk_enabled
+            ):
+                try:
+                    row_logits = target_logits.detach().view(
+                        bs, int(self.verify_stride), -1
+                    )[i, :draft_width]
+                    topk_k = min(5, int(row_logits.shape[-1]))
+                    topk_values, topk_ids = torch.topk(row_logits, k=topk_k, dim=-1)
+                    markov_debug["target_logits_topk_first"] = [
+                        {
+                            "step": int(step),
+                            "candidate": int(candidate_row[step + 1]),
+                            "target": int(target_row[step]),
+                            "target_top_ids": [
+                                int(x) for x in topk_ids[step].detach().cpu().tolist()
+                            ],
+                            "target_top_logits": [
+                                float(x)
+                                for x in topk_values[step].detach().cpu().tolist()
+                            ],
+                        }
+                        for step in range(min(draft_width, int(row_logits.shape[0])))
+                    ]
+                except Exception as e:
+                    markov_debug["target_logits_topk_error"] = str(e)
+            kv_debug = self._build_accept_anomaly_kv_debug(
+                req_pool_idx=int(req_pool_idx),
+                prefix_len=int(seq_lens[i]),
+                anchor_len=int(anchor_lens_cpu[i]),
+                block_size=int(self.block_size),
+            )
+            payload = {
+                "rid": rid,
+                "req_pool_idx": int(req_pool_idx),
+                "round_idx": int(round_idx),
+                "seq_len": int(seq_lens[i]),
+                "new_seq_len": int(next_seq_lens[i]),
+                "anchor_pos": int(anchor_lens_cpu[i]),
+                "draft_anchor_token": (
+                    int(draft_anchor[i]) if draft_anchor is not None else None
+                ),
+                "input_bonus": int(input_bonus[i]) if input_bonus is not None else None,
+                "candidate_first": [
+                    int(x) for x in candidate_row[: min(8, candidate_row.numel())]
+                ],
+                "target_first": [
+                    int(x) for x in target_row[: min(8, target_row.numel())]
+                ],
+                "confidence_first": [
+                    float(x)
+                    for x in confidence_row[: min(8, confidence_row.numel())]
+                ],
+                "commit_len": int(commit_lens_cpu[i]),
+                "next_bonus": int(next_bonus[i]),
+                "is_transfer_warmup": bool(ignore_cpu[i]),
+                "valid_window_sources": valid_window_sources,
+                "kv_debug": kv_debug,
+                "markov_debug": markov_debug,
+                "draft_block_metadata": self._last_draft_block_metadata_debug,
+            }
+            logger.warning(
+                "DSpark parity dump: dp_rank=%s tp_rank=%s ep_rank=%s payload=%s",
+                self.dp_rank,
+                self.tp_rank,
+                self.moe_ep_rank,
+                payload,
+            )
+
+        stale_keys = set(self._parity_dump_counts) - active_keys
+        for key in stale_keys:
+            self._parity_dump_counts.pop(key, None)
+
     def _maybe_log_accept_anomaly(
         self,
         *,
@@ -3301,9 +3487,9 @@ class DSparkWorkerV2(BaseSpecWorker):
         draft_seq_lens = (
             model_worker_batch.seq_lens.to(device=device, dtype=torch.int32) - ctx_lens
         ).clamp_min_(0)
-        if self._accept_anomaly_enabled and not torch.equal(
-            draft_seq_lens, prefix_lens_tensor
-        ):
+        if (
+            self._accept_anomaly_enabled or self._parity_dump_enabled
+        ) and not torch.equal(draft_seq_lens, prefix_lens_tensor):
             if self._is_tp0():
                 logger.warning(
                     "DSpark prefill materialize prefix mismatch: prefix_lens=%s "
@@ -3331,7 +3517,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             model_worker_batch
         )
         main_x = self.draft_model.project_main_hidden(logits_output.hidden_states)
-        if self._accept_anomaly_enabled:
+        if self._accept_anomaly_enabled or self._parity_dump_enabled:
             offset = 0
             for i, extend_len in enumerate(extend_lens_list):
                 next_offset = offset + int(extend_len)
@@ -3647,7 +3833,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 < commit_lens.unsqueeze(1).to(torch.int64)
             )
             commit_mask = commit_mask_2d.reshape(-1)
-            if self._accept_anomaly_enabled:
+            if self._accept_anomaly_enabled or self._parity_dump_enabled:
                 self._swa_write_source_snapshot_by_req_pool = {
                     int(req_idx): dict(
                         self._swa_write_source_by_req_pool.get(int(req_idx), {})
@@ -3680,6 +3866,22 @@ class DSparkWorkerV2(BaseSpecWorker):
                         raw_hidden_rows=hidden[i, take],
                         projected_rows=main_x_2d[i, take],
                     )
+        self._maybe_log_parity_dump(
+            model_worker_batch=model_worker_batch,
+            draft_input=draft_input,
+            anchor_tokens=anchor_tokens,
+            candidates=candidates,
+            target_predict=target_predict,
+            commit_lens=commit_lens,
+            bonus_tokens=bonus_tokens,
+            confidence=confidence,
+            prefix_lens=prefix_lens,
+            anchor_lens=anchor_lens,
+            new_seq_lens=new_seq_lens,
+            block_hidden=block_hidden,
+            target_logits=logits_output.next_token_logits,
+            ignore_mask=transfer_warmup_mask,
+        )
         self._maybe_log_accept_anomaly(
             model_worker_batch=model_worker_batch,
             draft_input=draft_input,
