@@ -535,6 +535,8 @@ class DeepseekV4AttnBackend(
         num_draft_tokens = self.speculative_num_draft_tokens
         if verify_bs is not None:
             verify_bs = int(verify_bs)
+            if verify_bs == 0:
+                return None
             req_pool_indices = req_pool_indices[:verify_bs]
             seq_lens = seq_lens[:verify_bs]
             seq_lens_cpu = seq_lens_cpu[:verify_bs]
@@ -850,6 +852,8 @@ class DeepseekV4AttnBackend(
             if need_compress
             else None
         )
+        if bs == 0:
+            return DSV4Metadata(core_attn_metadata, indexer_metadata)
         if not need_compress:
             return DSV4Metadata(core_attn_metadata, indexer_metadata)
         use_graph_plan = raw_metadata.use_prefill_cuda_graph

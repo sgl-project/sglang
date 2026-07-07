@@ -503,6 +503,80 @@ class TestDSV4RawVerifyMetadata(CustomTestCase):
         self.assertEqual(captured["extend_lens"].tolist(), [2, 2])
         self.assertEqual(captured["extend_lens_cpu"], [2, 2])
 
+    def test_online_c128_verify_metadata_skips_empty_dp_rank(self):
+        from sglang.srt.layers.attention import deepseek_v4_backend as backend_mod
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            DeepseekV4AttnBackend,
+        )
+
+        backend = object.__new__(DeepseekV4AttnBackend)
+        backend.speculative_num_draft_tokens = 2
+        backend.token_to_kv_pool = SimpleNamespace(name="pool")
+        backend.req_to_token = torch.zeros((4, 16), dtype=torch.int32)
+        backend.online_c128_mtp = SimpleNamespace(enabled=lambda: True)
+
+        with patch.object(
+            backend_mod,
+            "create_paged_compressor_data",
+            side_effect=AssertionError("empty verify rank must not plan compressor"),
+        ):
+            ret = backend._make_target_verify_c128_metadata(
+                req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
+                seq_lens=torch.tensor([10, 20], dtype=torch.int32),
+                seq_lens_cpu=[10, 20],
+                extend_seq_lens=torch.tensor([2, 2], dtype=torch.int32),
+                use_prefill_cuda_graph=False,
+                online_c128_state_slot_offset=7,
+                verify_bs=0,
+            )
+
+        self.assertIsNone(ret)
+
+    def test_raw_verify_metadata_skips_compressor_for_empty_dp_rank(self):
+        from sglang.srt.layers.attention import deepseek_v4_backend as backend_mod
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            DeepseekV4AttnBackend,
+            DSV4RawVerifyMetadata,
+        )
+
+        backend = object.__new__(DeepseekV4AttnBackend)
+        backend.model_runner = SimpleNamespace(
+            spec_algorithm=SimpleNamespace(is_dspark=lambda: False),
+            is_draft_worker=False,
+        )
+        backend.req_to_token = torch.zeros((2, 16), dtype=torch.int32)
+        backend.MAX_SEQ_LEN_FOR_CAPTURE = 4096
+        backend.expand_extend_with_same_length = lambda *args: (
+            torch.empty((0,), dtype=torch.int32),
+            torch.empty((0,), dtype=torch.int64),
+        )
+        backend.make_core_attn_metadata = lambda **kwargs: SimpleNamespace(
+            page_table=torch.empty((0, 0), dtype=torch.int32),
+            c4_topk_lengths_raw=torch.empty((0,), dtype=torch.int32),
+        )
+        backend.init_forward_metadata_indexer = lambda core: SimpleNamespace(
+            name="indexer"
+        )
+        raw = DSV4RawVerifyMetadata(
+            req_pool_indices=torch.tensor([0], dtype=torch.int64),
+            seq_lens=torch.tensor([10], dtype=torch.int32),
+            out_cache_loc=torch.tensor([1, 2], dtype=torch.int32),
+            num_draft_tokens=2,
+            verify_bs=0,
+            extend_seq_lens=torch.tensor([2], dtype=torch.int32),
+            seq_lens_cpu=[10],
+        )
+
+        with patch.object(
+            backend_mod,
+            "create_paged_compressor_data",
+            side_effect=AssertionError("empty verify rank must not plan compressor"),
+        ):
+            metadata = backend.make_forward_metadata_from_raw_verify(raw)
+
+        self.assertIsNone(metadata.c4_compress_metadata)
+        self.assertIsNone(metadata.c128_compress_metadata)
+
 
 class TestDSV4SwaOutCacheLocResolution(CustomTestCase):
     """`get_swa_out_cache_loc`: cached fast path vs store-time fallback.
