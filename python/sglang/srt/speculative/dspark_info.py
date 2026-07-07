@@ -340,7 +340,6 @@ class DSparkDraftInputV2(SpecInput):
 
         device = batch.device
         page_size = batch.token_to_kv_pool_allocator.page_size
-        cur_alloc = self.cur_allocated_seq_lens_cpu
 
         self._ensure_prepare_length_buffers(bs, device)
         assert self._prepare_batch_seq_lens_cpu_buf is not None
@@ -352,13 +351,22 @@ class DSparkDraftInputV2(SpecInput):
         committed_sum = 0
         reserved_sum = 0
         num_needed_tokens = 0
+        row_width = int(batch.req_to_token_pool.req_to_token.shape[1])
         for i, req in enumerate(batch.reqs):
             committed_len = int(req.kv_committed_len)
-            if cur_alloc is not None and i < len(cur_alloc):
-                cur_alloc_len = int(cur_alloc[i])
-            else:
-                cur_alloc_len = int(req.kv_allocated_len)
+            # Use the request-owned allocation watermark. A carried
+            # cur_allocated_seq_lens_cpu tensor can become stale across
+            # scheduler filter/merge operations and would make get_last_loc
+            # index req_to_token at the wrong logical position.
+            cur_alloc_len = int(req.kv_allocated_len)
             reserved_len = max(cur_alloc_len, committed_len + 2 * block_size)
+            if reserved_len > row_width:
+                raise RuntimeError(
+                    "DSpark decode KV reservation exceeds req_to_token row width: "
+                    f"rid={getattr(req, 'rid', None)} committed_len={committed_len} "
+                    f"cur_alloc_len={cur_alloc_len} reserved_len={reserved_len} "
+                    f"row_width={row_width} block_size={block_size}."
+                )
             cur_kv_lens_cpu[i] = cur_alloc_len
             nxt_kv_lens_cpu[i] = reserved_len
             committed_cpu[i] = committed_len
