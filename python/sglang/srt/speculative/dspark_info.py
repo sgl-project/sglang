@@ -432,6 +432,20 @@ class DSparkDraftInputV2(SpecInput):
 
     def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
         cpu_indices = new_indices.cpu()
+        batch_rows = int(self.bonus_tokens.shape[0])
+
+        def filter_optional_rows(tensor: Optional[torch.Tensor], expected_rows: int):
+            if tensor is None or tensor.numel() == 0:
+                return tensor
+            if int(tensor.shape[0]) == expected_rows:
+                return tensor[new_indices]
+            # Some payloads are sparse/subset carries (for example prefill tail
+            # hidden only exists for newly transferred requests). Scheduler
+            # filter indices are batch-row indices, so applying them to a subset
+            # tensor is invalid and can trip CUDA gather OOB. Drop the stale
+            # optional payload; the committed request state remains authoritative.
+            return tensor.new_empty((0, *tensor.shape[1:]))
+
         if self.cur_allocated_seq_lens_cpu is not None:
             self.cur_allocated_seq_lens_cpu = self.cur_allocated_seq_lens_cpu[
                 cpu_indices
@@ -441,24 +455,23 @@ class DSparkDraftInputV2(SpecInput):
             self.reserved_seq_lens_sum = int(self.reserved_seq_lens_cpu.sum().item())
 
         if self.future_indices is not None:
+            future_rows = int(self.future_indices.shape[0])
             self.future_indices = self.future_indices[new_indices]
-            if self.hidden_states.numel() > 0:
-                self.hidden_states = self.hidden_states[new_indices]
-            if self.hidden_valid_mask is not None and self.hidden_valid_mask.numel() > 0:
-                self.hidden_valid_mask = self.hidden_valid_mask[new_indices]
-            if self.prefill_tail_hidden_states.numel() > 0:
-                self.prefill_tail_hidden_states = self.prefill_tail_hidden_states[
-                    new_indices
-                ]
-            if (
-                self.prefill_tail_valid_mask is not None
-                and self.prefill_tail_valid_mask.numel() > 0
-            ):
-                self.prefill_tail_valid_mask = self.prefill_tail_valid_mask[
-                    new_indices
-                ]
-            if self.transfer_warmup_rounds.numel() > 0:
-                self.transfer_warmup_rounds = self.transfer_warmup_rounds[new_indices]
+            self.hidden_states = filter_optional_rows(
+                self.hidden_states, future_rows
+            )
+            self.hidden_valid_mask = filter_optional_rows(
+                self.hidden_valid_mask, future_rows
+            )
+            self.prefill_tail_hidden_states = filter_optional_rows(
+                self.prefill_tail_hidden_states, future_rows
+            )
+            self.prefill_tail_valid_mask = filter_optional_rows(
+                self.prefill_tail_valid_mask, future_rows
+            )
+            self.transfer_warmup_rounds = filter_optional_rows(
+                self.transfer_warmup_rounds, future_rows
+            )
             self.direct_carry_valid = False
             return
 
@@ -472,21 +485,19 @@ class DSparkDraftInputV2(SpecInput):
             self.topk_p = self.topk_p[new_indices]
         if self.topk_index.numel() > 0:
             self.topk_index = self.topk_index[new_indices]
-        if self.hidden_states.numel() > 0:
-            self.hidden_states = self.hidden_states[new_indices]
-        if self.hidden_valid_mask is not None and self.hidden_valid_mask.numel() > 0:
-            self.hidden_valid_mask = self.hidden_valid_mask[new_indices]
-        if self.prefill_tail_hidden_states.numel() > 0:
-            self.prefill_tail_hidden_states = self.prefill_tail_hidden_states[
-                new_indices
-            ]
-        if (
-            self.prefill_tail_valid_mask is not None
-            and self.prefill_tail_valid_mask.numel() > 0
-        ):
-            self.prefill_tail_valid_mask = self.prefill_tail_valid_mask[new_indices]
-        if self.transfer_warmup_rounds.numel() > 0:
-            self.transfer_warmup_rounds = self.transfer_warmup_rounds[new_indices]
+        self.hidden_states = filter_optional_rows(self.hidden_states, batch_rows)
+        self.hidden_valid_mask = filter_optional_rows(
+            self.hidden_valid_mask, batch_rows
+        )
+        self.prefill_tail_hidden_states = filter_optional_rows(
+            self.prefill_tail_hidden_states, batch_rows
+        )
+        self.prefill_tail_valid_mask = filter_optional_rows(
+            self.prefill_tail_valid_mask, batch_rows
+        )
+        self.transfer_warmup_rounds = filter_optional_rows(
+            self.transfer_warmup_rounds, batch_rows
+        )
 
     def merge_batch(self, spec_info: DSparkDraftInputV2):
         if (

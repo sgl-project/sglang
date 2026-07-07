@@ -241,6 +241,41 @@ class TestDSparkDraftInputBatch(CustomTestCase):
         self.assertEqual(a.bonus_tokens.tolist(), [1, 3])
         self.assertEqual(len(a.cur_allocated_seq_lens_cpu), 2)
 
+    def test_filter_batch_drops_subset_prefill_tail_payload(self):
+        t = self.torch
+        a = self.cls(
+            bonus_tokens=t.tensor([10, 11, 12], dtype=t.int64),
+            new_seq_lens=t.tensor([100, 101, 102], dtype=t.int64),
+            prefill_tail_hidden_states=t.tensor([[[1.0, 2.0]]]),
+            prefill_tail_valid_mask=t.tensor([[True]]),
+            transfer_warmup_rounds=t.tensor([2, 1, 0], dtype=t.int32),
+        )
+
+        a.filter_batch(t.tensor([2, 0], dtype=t.int64))
+
+        self.assertEqual(a.bonus_tokens.tolist(), [12, 10])
+        self.assertEqual(tuple(a.prefill_tail_hidden_states.shape), (0, 1, 2))
+        self.assertEqual(tuple(a.prefill_tail_valid_mask.shape), (0, 1))
+        self.assertEqual(a.transfer_warmup_rounds.tolist(), [0, 2])
+
+    def test_filter_batch_drops_subset_prefill_tail_payload_with_future_indices(self):
+        t = self.torch
+        a = self.cls(
+            bonus_tokens=t.tensor([10, 11, 12], dtype=t.int64),
+            new_seq_lens=t.tensor([100, 101, 102], dtype=t.int64),
+            prefill_tail_hidden_states=t.tensor([[[1.0, 2.0]]]),
+            prefill_tail_valid_mask=t.tensor([[True]]),
+            transfer_warmup_rounds=t.tensor([2, 1, 0], dtype=t.int32),
+            future_indices=t.tensor([5, 6, 7], dtype=t.int64),
+        )
+
+        a.filter_batch(t.tensor([2, 0], dtype=t.int64))
+
+        self.assertEqual(a.future_indices.tolist(), [7, 5])
+        self.assertEqual(tuple(a.prefill_tail_hidden_states.shape), (0, 1, 2))
+        self.assertEqual(tuple(a.prefill_tail_valid_mask.shape), (0, 1))
+        self.assertEqual(a.transfer_warmup_rounds.tolist(), [0, 2])
+
     def test_prepare_for_decode_uses_req_allocated_len_over_stale_carried_len(self):
         t = self.torch
         spec = self.cls(
