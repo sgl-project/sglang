@@ -1452,7 +1452,6 @@ class TestDSparkRuntimeDebugEvidence(CustomTestCase):
         t = self.torch
         worker = self._worker()
         worker._accept_anomaly_enabled = False
-        worker._parity_dump_enabled = False
         materialize_calls = []
 
         def record_materialize(**kwargs):
@@ -2545,7 +2544,6 @@ class TestDSparkDeepSpecSemanticReference(CustomTestCase):
         worker._markov_embeds_buf = None
         worker._vocab_shard_mapping_cache = {}
         worker._accept_anomaly_enabled = False
-        worker._parity_dump_enabled = False
         worker._last_markov_refine_debug = None
         worker._draft_inner = SimpleNamespace(
             vocab_size=vocab_size,
@@ -2661,7 +2659,6 @@ class TestDSparkDeepSpecSemanticReference(CustomTestCase):
                 worker._markov_embeds_buf = None
                 worker._vocab_shard_mapping_cache = {}
                 worker._accept_anomaly_enabled = False
-                worker._parity_dump_enabled = False
                 worker._last_markov_refine_debug = None
                 worker._draft_inner = SimpleNamespace(
                     vocab_size=vocab_size,
@@ -2739,7 +2736,6 @@ class TestDSparkDeepSpecSemanticReference(CustomTestCase):
         worker._markov_embeds_buf = None
         worker._vocab_shard_mapping_cache = {}
         worker._accept_anomaly_enabled = False
-        worker._parity_dump_enabled = False
         worker._last_markov_refine_debug = None
         worker._draft_inner = SimpleNamespace(
             vocab_size=vocab_size,
