@@ -777,9 +777,12 @@ class Envs:
     # Encoder receiver selection: http|grpc (used by EPD paths).
     SGLANG_ENCODER_MM_RECEIVER_MODE = EnvStr("http")
 
-    # Native gRPC server (internal, not yet user-facing)
+    # Native gRPC server. SGLANG_GRPC_PORT is the env fallback for the
+    # --grpc-port CLI flag; setting either enables the native server alongside
+    # HTTP. The worker-threads knob stays env-only (internal tuning, no CLI
+    # surface).
     SGLANG_GRPC_PORT = EnvInt(None)
-    SGLANG_ENABLE_GRPC = EnvBool(False)
+    SGLANG_GRPC_WORKER_THREADS = EnvInt(4)
 
     # External models
     SGLANG_EXTERNAL_MODEL_PACKAGE = EnvStr("")
@@ -839,7 +842,10 @@ class Envs:
     SGLANG_OPT_FUSE_MHC_POST_PRE = EnvBool(False)
     SGLANG_OPT_USE_TILELANG_INDEXER = EnvBool(False)
     SGLANG_OPT_USE_AITER_INDEXER = EnvBool(False)
-    SGLANG_OPT_DSV4_NONPAGED_INDEXER = EnvBool(False)
+    SGLANG_OPT_DSV4_NONPAGED_INDEXER = EnvBool(True)
+    # Per-rank local query rows (after DP-attention sharding when enabled),
+    # not request ISL.
+    SGLANG_OPT_DSV4_NONPAGED_INDEXER_MIN_QUERY_TOKENS = EnvInt(8192)
     SGLANG_OPT_USE_JIT_INDEXER_METADATA = EnvBool(True)
     SGLANG_OPT_USE_ONLINE_COMPRESS = EnvBool(False)
     SGLANG_EXPERIMENTAL_ONLINE_C128_MTP = EnvBool(False)
@@ -1043,6 +1049,10 @@ def _convert_SGL_to_SGLANG():
 
 
 _convert_SGL_to_SGLANG()
+_warn_deprecated_env_to_cli_flag(
+    "SGLANG_ENABLE_GRPC",
+    "Please use '--grpc-port' to enable the native gRPC server.",
+)
 _warn_deprecated_env_to_cli_flag(
     "SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE",
     "Please use '--enable-prefill-delayer' instead.",

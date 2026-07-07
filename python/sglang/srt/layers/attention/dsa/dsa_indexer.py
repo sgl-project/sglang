@@ -13,7 +13,6 @@ from sglang.jit_kernel.dsa import (
     cutedsl_paged_mqa_logits,
     deepgemm_paged_mqa_logits_native,
     deepgemm_paged_mqa_logits_split,
-    pick_dsl_expand,
 )
 from sglang.jit_kernel.fused_store_index_cache import (
     can_use_dsa_fused_store,
@@ -65,6 +64,11 @@ global _use_multi_stream
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
+if not _is_hip:
+    # Preserve the original eager import behavior on non-ROCm platforms.
+    from sglang.jit_kernel.dsa import pick_dsl_expand
+else:
+    pick_dsl_expand = None
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_fp8_fnuz = is_fp8_fnuz()
 _is_gfx95_supported = is_gfx95_supported()
@@ -906,6 +910,7 @@ class Indexer(MultiPlatformOp):
             and forward_batch.forward_mode.is_target_verify()
             and next_n >= 2
         ):
+            assert pick_dsl_expand is not None, "Not supported on AMD/ROCm. "
             dsl_expand_factor, dsl_atom = pick_dsl_expand(
                 next_n,
                 batch_size=B,
