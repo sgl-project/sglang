@@ -138,10 +138,16 @@ def _torch_topk_from_score(
     topk_idx[:, :, :k_eff] = idx_eff.to(torch.int32)
 
     rank = torch.arange(topk, device=device, dtype=torch.int64)
-    valid_topk_mask = rank[None, None, :] < torch.minimum(
-        num_blocks[None, :, None],
-        torch.tensor(topk, device=device, dtype=torch.int64),
-    )
+    # Clamp `num_blocks` against `topk` via `.clamp(max=topk)` rather than
+    # `torch.minimum(..., torch.tensor(topk, device=...))`. Building a device
+    # tensor from a host int with `torch.tensor` triggers a synchronized
+    # aclrtMemcpy (host->device), which is illegal inside a captured stream and
+    # aborts CUDA-graph capture with NPU error 107030 ("the current capture mode
+    # does not support this operation"). `clamp` takes the scalar as a kernel
+    # arg with no host->device copy, so this path stays capture-safe. This
+    # fallback is exactly the path hit during decode-graph capture when
+    # max_seqblock > 256 (see the `use_triton_topk` gate).
+    valid_topk_mask = rank[None, None, :] < num_blocks[None, :, None].clamp(max=topk)
 
     topk_idx = torch.where(
         valid_topk_mask,
