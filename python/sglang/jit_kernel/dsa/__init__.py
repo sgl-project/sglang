@@ -19,18 +19,3 @@ __all__ = [
     "deepgemm_paged_mqa_logits_native",
     "deepgemm_paged_mqa_logits_split",
 ]
-
-
-if is_hip():
-
-    def __getattr__(name):
-        if name in ("CuteDSLPagedMQALogitsRunner", "pick_dsl_expand"):
-            from .cutedsl_paged_mqa_logits import (
-                CuteDSLPagedMQALogitsRunner,
-                pick_dsl_expand,
-            )
-
-            globals()["CuteDSLPagedMQALogitsRunner"] = CuteDSLPagedMQALogitsRunner
-            globals()["pick_dsl_expand"] = pick_dsl_expand
-            return globals()[name]
-        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
