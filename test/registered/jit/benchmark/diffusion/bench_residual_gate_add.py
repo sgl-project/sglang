@@ -9,7 +9,9 @@ from sglang.jit_kernel.diffusion.triton.scale_shift import fuse_scale_shift_kern
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.utils import is_in_ci
 
-register_cuda_ci(est_time=30, suite="base-b-kernel-benchmark-1-gpu-large")
+register_cuda_ci(
+    est_time=30, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
+)
 
 
 @dataclass(frozen=True)

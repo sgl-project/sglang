@@ -12,7 +12,7 @@ from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.layers.quantization.fp8_utils import (
     materialize_bpreshuffle_fp8_scale_tuple,
 )
-from sglang.srt.layers.utils.dcp_utils import (
+from sglang.srt.layers.dcp import (
     all_gather_kv_cache_for_mha_chunk_extend,
     all_gather_kv_cache_for_mha_extend,
     dcp_enabled,
@@ -174,14 +174,15 @@ class DeepseekMHAForwardMixin:
                     q = self.q_b_proj(q_lora)[0].view(
                         -1, self.num_local_heads, self.qk_head_dim
                     )
-                _ = self.indexer(
-                    x=hidden_states,
-                    q_lora=q_lora,
-                    positions=positions,
-                    forward_batch=forward_batch,
-                    layer_id=self.layer_id,
-                    return_indices=False,
-                )
+                if self.should_run_indexer():
+                    _ = self.indexer(
+                        x=hidden_states,
+                        q_lora=q_lora,
+                        positions=positions,
+                        forward_batch=forward_batch,
+                        layer_id=self.layer_id,
+                        return_indices=False,
+                    )
             elif _use_aiter_gfx95 and self.q_b_proj.weight.dtype == torch.uint8:
                 # MXFP4: fused RMSNorm + quant
                 q, _, _, _ = fused_rms_mxfp4_quant(
