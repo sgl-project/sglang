@@ -68,8 +68,8 @@ class TestServerArgsMutationRatchet(CustomTestCase):
                 f"server_args mutations outside the resolution pipeline grew: "
                 f"{count} > baseline {_BASELINE}. Configuration is resolved in "
                 "ServerArgs.__post_init__; declare through the pipeline "
-                "(passes / declare_load_time_override / "
-                "record_runtime_overrides) instead of assigning fields."
+                "(passes / declare_load_time_override) or go through "
+                "ServerArgs.override(source, ...) instead of assigning fields."
             )
         if count < _BASELINE:
             self.fail(

@@ -15,13 +15,11 @@ from sglang.srt.runtime_context import (
     ParallelContext,
     RuntimeContext,
     _FlagGroupBase,
-    _StaticFlags,
     get_context,
     get_flags,
     get_parallel,
     get_server_args,
     reset_context,
-    resolve_flag_leaf,
 )
 from sglang.test.test_utils import CustomTestCase
 
@@ -216,90 +214,46 @@ class TestServerArgsOwnership(_IsolatedServerArgs):
 
 
 @dataclasses.dataclass
-class _FakeStaticGroup(_StaticFlags):
-    alpha: int = 1
-    beta: str = "b"
-
-
-@dataclasses.dataclass
 class _FakeCaptureGroup(_FlagGroupBase):
     gamma: int = 0
 
 
 class TestFlagsTier(_IsolatedServerArgs):
-    """V3a skeleton: typed dataclass groups, freeze guard, override primitive."""
+    """Runtime-flags tier: typed groups, typo-safe writes, override primitive.
+
+    Resolved configuration lives on server_args fields (materialized at the
+    end of __post_init__); the flags tier only carries runtime state
+    (today: the capture lifecycle)."""
 
     def test_wiring_and_groups(self):
         flags = get_flags()
         self.assertIs(flags, get_context().flags)
         self.assertIsInstance(flags, Flags)
-        for group in ("attn", "moe", "capture"):
-            self.assertTrue(hasattr(flags, group))
-        self.assertFalse(flags.frozen)
+        self.assertTrue(hasattr(flags, "capture"))
 
     def test_typo_safety(self):
-        group = _FakeStaticGroup()
+        group = _FakeCaptureGroup()
         with self.assertRaises(AttributeError):
-            group.alpha_misspelled = 2  # undeclared leaf
+            group.gamma_misspelled = 2  # undeclared leaf
         with self.assertRaises(AttributeError):
             get_flags().not_a_flag = 1
 
-    def test_static_group_writable_until_freeze(self):
-        group = _FakeStaticGroup()
-        group.alpha = 5
-        self.assertEqual(group.alpha, 5)
-        group.freeze()
-        with self.assertRaises(RuntimeError):
-            group.alpha = 6
-        self.assertEqual(group.alpha, 5)
-
-    def test_override_is_transactional_and_works_on_frozen(self):
-        group = _FakeStaticGroup()
-        group.freeze()
-        with group.override(alpha=99, beta="x"):
-            self.assertEqual(group.alpha, 99)
-            self.assertEqual(group.beta, "x")
-        self.assertEqual(group.alpha, 1)
-        self.assertEqual(group.beta, "b")
-        with self.assertRaises(ValueError):
-            with group.override(alpha=2, gamma=3):  # gamma undeclared
-                pass
-        self.assertEqual(group.alpha, 1)  # validated before any write
-
-    def test_non_static_group_has_no_freeze(self):
+    def test_override_is_transactional(self):
         group = _FakeCaptureGroup()
-        group.gamma = 42
-        self.assertEqual(group.gamma, 42)
-        self.assertFalse(hasattr(group, "freeze"))
+        with group.override(gamma=99):
+            self.assertEqual(group.gamma, 99)
+        self.assertEqual(group.gamma, 0)
+        with self.assertRaises(ValueError):
+            with group.override(gamma=2, delta=3):  # delta undeclared
+                pass
+        self.assertEqual(group.gamma, 0)  # validated before any write
 
-    def test_container_freeze_cascades_except_capture(self):
-        flags = Flags()  # fresh container, not the process singleton
-        flags.freeze()
-        self.assertTrue(flags.frozen)
-        self.assertTrue(flags.attn.frozen)
-        self.assertTrue(flags.moe.frozen)
-        with self.assertRaises(RuntimeError):
-            flags.attn = flags.attn  # container leaves lock too
-        self.assertFalse(getattr(flags.capture, "_frozen", False))
-
-    def test_resolve_flag_leaf_flat_default_and_mapped(self):
-        flags = Flags()
-        owner, leaf = resolve_flag_leaf(flags, "some_field")
-        self.assertIs(owner, flags)
-        self.assertEqual(leaf, "some_field")
-        owner, leaf = resolve_flag_leaf(flags, "x", leaf_map={"x": "attn.x"})
-        self.assertIs(owner, flags.attn)
-        self.assertEqual(leaf, "x")
-
-    def test_reset_context_installs_fresh_unfrozen_flags(self):
-        try:
-            old = get_flags()
-            old.freeze()
-            reset_context()
-            self.assertIsNot(get_flags(), old)
-            self.assertFalse(get_flags().frozen)
-        finally:
-            reset_context()  # never leave the singleton frozen for other tests
+    def test_reset_context_installs_fresh_flags(self):
+        old = get_flags()
+        old.capture.enable_torch_compile = True
+        reset_context()
+        self.assertIsNot(get_flags(), old)
+        self.assertFalse(get_flags().capture.enable_torch_compile)
 
 
 @dataclasses.dataclass
@@ -311,84 +265,15 @@ class _FakeResolvedArgs:
     _resolved_overrides: list = dataclasses.field(default_factory=list)
 
 
-class TestRuntimeResolutionStages(_IsolatedServerArgs):
-    """Runtime stages: post-publish declarations re-resolve the flags tier
-    atomically; freeze_flags() ends the resolution lifecycle."""
+class TestPublishLifecycle(_IsolatedServerArgs):
+    """Publish installs the resolved server_args and seeds the capture tier."""
 
     def _publish(self, **kw):
         args = _FakeResolvedArgs(**kw)
         get_context().set_server_args(args)
         return args
 
-    def test_record_before_publish_raises(self):
-        reset_context()
-        with self.assertRaises(ValueError):
-            get_context().record_runtime_overrides([("stage", {"page_size": 64})])
-
-    def test_record_updates_leaves_and_accumulates_stages(self):
-        args = self._publish(page_size=1, sampling_backend="flashinfer")
-        self.assertEqual(get_flags().page_size, 1)  # publish-time materialize
-        # dual-apply transition: the call site keeps its imperative write
-        args.page_size = 64
-        get_context().record_runtime_overrides([("stage.runner", {"page_size": 64})])
-        self.assertEqual(get_flags().page_size, 64)
-        args.sampling_backend = "pytorch"
-        get_context().record_runtime_overrides(
-            [("stage.load", {"sampling_backend": "pytorch"})]
-        )
-        self.assertEqual(get_flags().sampling_backend, "pytorch")
-        self.assertEqual(get_flags().page_size, 64)  # earlier stage survives
-
-    def test_record_whitelist_violation_rolls_back(self):
-        self._publish()
-        with self.assertRaises(ValueError):
-            get_context().record_runtime_overrides([("bad", {"nope": 1})])
-        self.assertEqual(get_context()._runtime_overrides, [])
-
-    def test_freeze_ends_the_resolution_lifecycle(self):
-        args = self._publish(page_size=1)
-        try:
-            get_context().freeze_flags()
-            self.assertTrue(get_flags().frozen)
-            with self.assertRaises(RuntimeError):
-                get_context().record_runtime_overrides([("late", {"page_size": 64})])
-            with self.assertRaises(RuntimeError):
-                get_context().set_server_args(args)
-        finally:
-            reset_context()
-
-    def test_declare_load_time_override_applies_and_records(self):
-        from sglang.srt.arg_groups.overrides import declare_load_time_override
-
-        args = self._publish(page_size=1)
-        declare_load_time_override("model.load_time", {"page_size": 64})
-        # post-init declaration: written through to the field and resolved
-        # into the leaf
-        self.assertEqual(args.page_size, 64)
-        self.assertEqual(get_flags().page_size, 64)
-        self.assertEqual(
-            get_context()._runtime_overrides,
-            [("model.load_time", {"page_size": 64})],
-        )
-
-    def test_failed_republish_keeps_previous_lifecycle(self):
-        args = self._publish(page_size=1)
-        args.page_size = 64
-        get_context().record_runtime_overrides([("stage", {"page_size": 64})])
-        flags_before = get_flags()
-        bad = _FakeResolvedArgs(page_size=1)
-        bad._resolved_overrides = [("bad", {"nope": 1})]  # gate rejects
-        with self.assertRaises(ValueError):
-            get_context().set_server_args(bad)
-        # previous publish fully intact: slot, flags, and the recorded stages
-        self.assertIs(get_context()._server_args, args)
-        self.assertIs(get_flags(), flags_before)
-        self.assertEqual(
-            get_context()._runtime_overrides, [("stage", {"page_size": 64})]
-        )
-
-    def test_capture_tier_seeded_at_publish_and_survives_stages(self):
-        # seeded from the published config
+    def test_capture_tier_seeded_at_publish(self):
         args = self._publish(page_size=1)
         args.enable_torch_compile = True
         get_context().set_server_args(args)  # re-publish picks up the value
@@ -396,59 +281,38 @@ class TestRuntimeResolutionStages(_IsolatedServerArgs):
         # capture-time write (B4) targets the capture leaf
         get_flags().capture.enable_torch_compile = False
         self.assertFalse(get_flags().capture.enable_torch_compile)
-        # a runtime-stage re-resolve must not clobber the capture write
-        args.page_size = 64
-        get_context().record_runtime_overrides([("stage", {"page_size": 64})])
-        self.assertFalse(get_flags().capture.enable_torch_compile)
-        # capture stays writable after freeze
-        try:
-            get_context().freeze_flags()
-            get_flags().capture.enable_torch_compile = True
-            self.assertTrue(get_flags().capture.enable_torch_compile)
-        finally:
-            reset_context()
-
-    def test_declared_leaf_wins_over_stale_field(self):
-        # A stash entry always drives the leaf at publish, even if the field
-        # value diverged (e.g. a fixture that skipped materialization).
-        @dataclasses.dataclass
-        class _Args:
-            enable_dp_lm_head: A[bool, Arg(help="d", resolvable=True)] = True
-            _resolved_overrides: list = dataclasses.field(default_factory=list)
-
-        args = _Args()
-        args._resolved_overrides = [("dp", {"enable_dp_lm_head": False})]
-        args._declarations_materialized = True
-        args.enable_dp_lm_head = False
-        get_context().set_server_args(args)
-        self.assertFalse(get_flags().enable_dp_lm_head)
-
-    def test_bare_dataclass_publish_skips_materialization(self):
-        # object.__new__(ServerArgs) fixtures (no __init__, no field values)
-        # must publish without touching the flags tier — dataclass defaults
-        # live on the class, so materializing from them would clobber
-        # previously resolved flags with defaults.
-        from sglang.srt.server_args import ServerArgs
-
-        self._publish(page_size=64)
-        self.assertEqual(get_flags().page_size, 64)
-        bare = object.__new__(ServerArgs)
-        get_context().set_server_args(bare)
-        self.assertIs(get_server_args(), bare)
-        self.assertEqual(get_flags().page_size, 64)  # not clobbered
 
     def test_capture_tier_defaults_for_sentinel_publish(self):
         get_context().set_server_args(object())
         self.assertFalse(get_flags().capture.enable_torch_compile)
 
-    def test_republish_clears_runtime_overrides(self):
+    def test_declare_load_time_override_writes_through(self):
+        from sglang.srt.arg_groups.overrides import declare_load_time_override
+
         args = self._publish(page_size=1)
-        args.page_size = 64
-        get_context().record_runtime_overrides([("stage", {"page_size": 64})])
-        self.assertEqual(get_flags().page_size, 64)
-        self._publish(page_size=1)  # fresh lifecycle
-        self.assertEqual(get_flags().page_size, 1)
-        self.assertEqual(get_context()._runtime_overrides, [])
+        declare_load_time_override("model.load_time", {"page_size": 64})
+        self.assertEqual(args.page_size, 64)
+
+    def test_declare_load_time_override_validates_whitelist(self):
+        from sglang.srt.arg_groups.overrides import declare_load_time_override
+
+        args = self._publish(page_size=1)
+        with self.assertRaises(ValueError):
+            declare_load_time_override("bad", {"nope": 1})
+        self.assertEqual(args.page_size, 1)
+
+    def test_declare_load_time_override_records_provenance(self):
+        from sglang.srt.arg_groups.overrides import declare_load_time_override
+        from sglang.srt.server_args import ServerArgs
+
+        class _Args(_FakeResolvedArgs):
+            override = ServerArgs.override
+
+        args = _Args(page_size=1)
+        get_context().set_server_args(args)
+        declare_load_time_override("model.load_time", {"page_size": 64})
+        self.assertEqual(args.page_size, 64)
+        self.assertIn(("model.load_time", {"page_size": 64}), args._resolved_overrides)
 
 
 if __name__ == "__main__":
