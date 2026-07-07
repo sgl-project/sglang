@@ -295,6 +295,53 @@ class TestDSparkDraftInputBatch(CustomTestCase):
         self.assertEqual(req.kv_allocated_len, 22)
         self.assertEqual(batch.seq_lens.tolist(), [10])
 
+    def test_prepare_for_decode_paged_last_loc_uses_committed_len(self):
+        t = self.torch
+        spec = self.cls(
+            bonus_tokens=t.tensor([1], dtype=t.int64),
+            new_seq_lens=t.tensor([10], dtype=t.int64),
+        )
+        req_to_token = t.zeros((2, 64), dtype=t.int32)
+        req_to_token[1, 9] = 109
+        req_to_token[1, 11] = 111
+        req = SimpleNamespace(rid="r0", kv_committed_len=10, kv_allocated_len=12)
+        batch = SimpleNamespace(
+            batch_size=lambda: 1,
+            device=t.device("cpu"),
+            reqs=[req],
+            token_to_kv_pool_allocator=SimpleNamespace(page_size=16),
+            tree_cache=SimpleNamespace(),
+            req_pool_indices=t.tensor([1], dtype=t.int64),
+            req_to_token_pool=SimpleNamespace(req_to_token=req_to_token),
+            seq_lens=t.tensor([10], dtype=t.int64),
+            orig_seq_lens=t.tensor([10], dtype=t.int32),
+            seq_lens_cpu=t.tensor([10], dtype=t.int32),
+            seq_lens_sum=10,
+        )
+        paged_calls = []
+
+        def _record_paged_alloc(*args, **_kwargs):
+            paged_calls.append({"last_loc": args[5].clone()})
+            return t.arange(10, dtype=t.int64)
+
+        with (
+            patch(
+                "sglang.srt.speculative.dspark_info.get_global_server_args",
+                return_value=SimpleNamespace(speculative_num_draft_tokens=6),
+            ),
+            patch(
+                "sglang.srt.speculative.dspark_info.alloc_paged_token_slots_extend",
+                side_effect=_record_paged_alloc,
+            ),
+            patch(
+                "sglang.srt.speculative.dspark_info.assign_req_to_token_pool_func",
+            ),
+        ):
+            spec.prepare_for_decode(batch)
+
+        self.assertEqual(paged_calls[0]["last_loc"].tolist(), [109])
+        self.assertEqual(batch.seq_lens.tolist(), [10])
+
     def test_overlap_placeholders_inert_without_future_indices(self):
         a = self._make(2)
         self.assertTrue(a.direct_carry_valid)

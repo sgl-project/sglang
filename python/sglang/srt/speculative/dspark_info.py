@@ -10,7 +10,6 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
     alloc_token_slots,
-    get_last_loc,
 )
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -375,6 +374,17 @@ class DSparkDraftInputV2(SpecInput):
             num_needed_tokens += reserved_len - cur_alloc_len
 
         if num_needed_tokens > 0:
+            last_loc = None
+            if page_size != 1:
+                if int(committed_cpu.min()) <= 0:
+                    raise RuntimeError(
+                        "DSpark paged decode prepare requires positive committed "
+                        f"lengths, got min={int(committed_cpu.min())}."
+                    )
+                last_loc = batch.req_to_token_pool.req_to_token[
+                    batch.req_pool_indices, batch.seq_lens[:bs] - 1
+                ]
+
             # Reuse existing per-batch GPU buffers instead of allocating
             # DSpark-owned scratch tensors. Under high concurrency, even tiny
             # extra CUDA allocations can fail when the KV pool nearly fills memory.
@@ -390,11 +400,7 @@ class DSparkDraftInputV2(SpecInput):
             if page_size == 1:
                 out_cache_loc = alloc_token_slots(batch.tree_cache, num_needed_tokens)
             else:
-                last_loc = get_last_loc(
-                    batch.req_to_token_pool.req_to_token,
-                    batch.req_pool_indices,
-                    cur_kv_lens,
-                )
+                assert last_loc is not None
                 out_cache_loc = alloc_paged_token_slots_extend(
                     batch.tree_cache,
                     cur_kv_lens,
