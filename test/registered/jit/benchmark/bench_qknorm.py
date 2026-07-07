@@ -4,12 +4,11 @@ from sglang.jit_kernel.benchmark import marker
 from sglang.jit_kernel.benchmark.utils import create_random
 from sglang.jit_kernel.norm import fused_inplace_qknorm
 from sglang.srt.utils import get_current_device_stream_fast
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(
     est_time=10, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
 )
-register_amd_ci(est_time=10, stage="jit-kernel-benchmark", runner_config="amd")
 
 alt_stream = torch.cuda.Stream()
 
