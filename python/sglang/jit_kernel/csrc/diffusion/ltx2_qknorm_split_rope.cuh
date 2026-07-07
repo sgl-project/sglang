@@ -3,9 +3,8 @@
 // Developed with MIT HAN Lab Kernel Design Agents:
 // https://github.com/mit-han-lab/kernel-design-agents
 //
-// This mirrors the LTX2 eager oracle:
-//   torch.nn.RMSNorm(input) returns fp32 under bf16 autocast, then split RoPE
-//   runs in fp32 and rounds once to bf16 at the final attention input.
+// This mirrors the LTX2 eager oracle: RMSNorm and split RoPE both run in
+// fp32, rounding to bf16 only once at the final attention input.
 
 #pragma once
 
