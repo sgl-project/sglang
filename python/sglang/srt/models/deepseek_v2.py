@@ -441,13 +441,18 @@ class MoEGate(nn.Module):
         super().__init__()
         self.is_nextn = is_nextn
         self.is_deepseek_v4 = is_deepseek_v4
+        self.use_flashinfer_trtllm_bf16_moe = (
+            quant_config is None and get_moe_runner_backend().is_flashinfer_trtllm()
+        )
         self.weight = nn.Parameter(
             torch.empty((config.n_routed_experts, config.hidden_size))
         )
 
         if config.topk_method == "noaux_tc" and not is_hash_moe:
             correction_bias_dtype = torch.float32
-            if quant_config is not None:
+            if self.use_flashinfer_trtllm_bf16_moe:
+                correction_bias_dtype = torch.bfloat16
+            elif quant_config is not None:
                 if _use_aiter and quant_config.get_name() in (
                     "fp8",
                     "compressed_tensors",
@@ -480,6 +485,12 @@ class MoEGate(nn.Module):
             )
 
         if get_global_server_args().enable_deterministic_inference:
+            if self.use_flashinfer_trtllm_bf16_moe:
+                return F.linear(hidden_states, self.weight, None)
+            if _is_cuda:
+                from sglang.jit_kernel.dsv4 import linear_bf16_fp32
+
+                return linear_bf16_fp32(hidden_states, self.weight)
             return F.linear(hidden_states, self.weight, None)
 
         if (
@@ -490,8 +501,18 @@ class MoEGate(nn.Module):
                 or mla_use_prefill_cp(forward_batch, self.mla_enable_prefill_cp)
             )
         ):
-            logits = F.linear(hidden_states, self.weight, None)
+            if self.use_flashinfer_trtllm_bf16_moe:
+                logits = F.linear(hidden_states, self.weight, None)
+            elif _is_cuda:
+                from sglang.jit_kernel.dsv4 import linear_bf16_fp32
+
+                logits = linear_bf16_fp32(hidden_states, self.weight)
+            else:
+                logits = F.linear(hidden_states, self.weight, None)
         else:
+            if self.use_flashinfer_trtllm_bf16_moe:
+                return F.linear(hidden_states, self.weight, None)
+
             # NOTE(b8zhong): this threshold has been empirically verified
             max_router_gemm_tokens = 4 if _device_sm in (100, 103) else 16
             if (
