@@ -513,12 +513,7 @@ class VocabParallelEmbedding(torch.nn.Module):
             return False
         if input_.dtype not in (torch.int32, torch.int64):
             return False
-        weight = getattr(self, "weight", None)
-        if weight is None or not weight.is_cuda:
-            return False
-        if weight.ndim != 2 or weight.stride(1) != 1:
-            return False
-        return weight.dtype in (torch.float16, torch.bfloat16, torch.float32)
+        return self.weight.dtype in (torch.float16, torch.bfloat16, torch.float32)
 
     def _embed_local_shard(self, input_: torch.Tensor) -> torch.Tensor:
         """Embed against the local vocab shard; out-of-shard rows are zero
