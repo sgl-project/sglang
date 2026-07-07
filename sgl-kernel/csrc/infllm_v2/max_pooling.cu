@@ -9,8 +9,8 @@
 //   * `TypeTraits<T>::inf()` is replaced by `static_cast<T>(INFINITY)`, and the
 //     pooling max is accumulated in fp32 so we don't rely on half/bf16
 //     comparison operators.
-//   * Outputs are pre-allocated on the Python side and passed in. The kernel
-//     writes every element for packed varlen inputs, so no pre-zeroing is needed.
+//   * Outputs are pre-allocated on the Python side and passed in (the original
+//     wrappers also allocated a zero-filled output before launching).
 
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_bf16.h>
