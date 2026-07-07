@@ -115,6 +115,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
 from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
     maybe_fuse_routed_scale_and_shared_add,
 )
+from sglang.srt.layers.quantization.unquant import get_bf16_gemm_backend
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer
@@ -447,12 +448,7 @@ class MoEGate(nn.Module):
         if config.topk_method == "noaux_tc" and not is_hash_moe:
             correction_bias_dtype = torch.float32
             if quant_config is not None:
-                if (
-                    quant_config.get_name() == "modelopt_fp4"
-                    and get_moe_runner_backend().is_flashinfer_trtllm()
-                ):
-                    correction_bias_dtype = torch.bfloat16
-                elif _use_aiter and quant_config.get_name() in (
+                if _use_aiter and quant_config.get_name() in (
                     "fp8",
                     "compressed_tensors",
                     "quark",
@@ -511,16 +507,13 @@ class MoEGate(nn.Module):
 
             elif _use_aiter:
                 logits = aiter_dsv3_router_gemm(hidden_states, self.weight)
-            elif _is_npu:
+            elif not _is_cuda:
                 logits = F.linear(hidden_states, self.weight, None)
             else:
-                if self.is_deepseek_v4:
-                    from sglang.jit_kernel.dsv4 import linear_bf16_fp32
+                # cuBLAS bf16 x bf16 -> fp32 GEMM (torch.mm's out_dtype kwarg is CUDA-only)
+                from sglang.jit_kernel.dsv4 import linear_bf16_fp32
 
-                    logits = linear_bf16_fp32(hidden_states, self.weight)
-                else:
-                    # After testing, we may use the faster code in `if deepseek v4` branch
-                    logits = F.linear(hidden_states, self.weight, None)
+                logits = linear_bf16_fp32(hidden_states, self.weight)
 
         return logits
 
@@ -1452,6 +1445,14 @@ class DeepseekV2MoE(nn.Module):
         router_logits = state.pop("router_logits")
         hidden_states = state.hidden_states_mlp_input
 
+        # Hash MoE layers (e.g. DeepSeek-V4) route on input_ids; forward_deepep
+        # passes them as a topk kwarg. The per-ubatch forward_batch.input_ids is
+        # already sliced+padded to match hidden_states rows (and equals the
+        # global ids under EP dp-attention). No-op for non-hash models.
+        topk_kwargs = {}
+        if getattr(self, "is_hash", False):
+            topk_kwargs["input_ids"] = state.forward_batch.input_ids
+
         if router_logits is not None:
             with get_global_expert_distribution_recorder().with_current_layer(
                 self.layer_id
@@ -1463,6 +1464,7 @@ class DeepseekV2MoE(nn.Module):
                     expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
                         layer_id=self.layer_id,
                     ),
+                    **topk_kwargs,
                 )
         else:
             state.topk_output = self.topk.empty_topk_output(
@@ -1974,12 +1976,23 @@ class DeepseekV2AttentionMLA(
         # When the module is wrapped with LoRA, the fused GEMM fast-path would
         # bypass the adapter because it reads weight.T directly.
         lora_active = getattr(self.fused_qkv_a_proj_with_mqa, "set_lora", False)
+        cutedsl_backend = get_bf16_gemm_backend().is_cutedsl()
+        if cutedsl_backend:
+            from sglang.jit_kernel.cutedsl_bf16_gemm import use_cutedsl_bf16_gemm
         if (
             (not isinstance(hidden_states, tuple))
             and hidden_states.shape[0] >= 1
             and hidden_states.shape[0] <= 16
             and self.use_min_latency_fused_a_gemm
             and not lora_active
+            and not (
+                cutedsl_backend
+                and use_cutedsl_bf16_gemm(
+                    hidden_states.shape[0],
+                    self.fused_qkv_a_proj_with_mqa.weight.shape[0],
+                    self.fused_qkv_a_proj_with_mqa.weight.shape[1],
+                )
+            )
         ):
             qkv_latent = dsv3_fused_a_gemm(
                 hidden_states,
