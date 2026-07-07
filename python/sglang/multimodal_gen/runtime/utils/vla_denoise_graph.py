@@ -34,6 +34,7 @@ class _CapturedDenoiseGraph:
     static_timestep: torch.Tensor
     static_output: torch.Tensor
     current_context_id: int | None = None
+    current_context_digest: str | None = None
 
 
 def _clone_past_key_values(past_key_values: Any) -> Any:
@@ -96,10 +97,18 @@ class VLADenoiseGraphRunner:
         prefix_context: PrefixContext,
     ) -> None:
         context_id = id(prefix_context.past_key_values)
+        context_digest = prefix_context.cache_key_digest
+        if (
+            context_digest is not None
+            and captured.current_context_digest == context_digest
+        ):
+            captured.current_context_id = context_id
+            return
         if captured.current_context_id == context_id:
             return
         _copy_prefix_context_(captured.static_prefix_context, prefix_context)
         captured.current_context_id = context_id
+        captured.current_context_digest = context_digest
 
     def _capture(
         self,
@@ -142,6 +151,7 @@ class VLADenoiseGraphRunner:
             static_timestep=static_timestep,
             static_output=static_output,
             current_context_id=id(prefix_context.past_key_values),
+            current_context_digest=prefix_context.cache_key_digest,
         )
         self._captured[bucket] = captured
         return captured

@@ -19,6 +19,19 @@ from sglang.multimodal_gen.runtime.cache.vla_prefix_cache import (
     VLAPrefixCacheKey,
     VLAPrefixCacheManager,
 )
+from sglang.multimodal_gen.runtime.distributed.broadcast import (
+    broadcast_optional_tensor,
+)
+from sglang.multimodal_gen.runtime.distributed.communication_op import (
+    sequence_model_parallel_all_gather,
+)
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_ring_parallel_world_size,
+    get_sequence_parallel_world_size,
+    get_sp_parallel_rank,
+    get_ulysses_parallel_world_size,
+    model_parallel_is_initialized,
+)
 from sglang.multimodal_gen.runtime.distributed.vla import get_vla_split_group
 from sglang.multimodal_gen.runtime.loader.utils import (
     set_default_torch_dtype,
@@ -64,6 +77,8 @@ class Pi05ActionExpert(nn.Module):
         prefix_context: PrefixContext,
         x_t: torch.Tensor,
         timestep: torch.Tensor,
+        *,
+        action_position_offset: int = 0,
     ) -> torch.Tensor:
         return self.core_model.denoise_step(
             prefix_context.prefix_pad_masks,
@@ -71,6 +86,7 @@ class Pi05ActionExpert(nn.Module):
             x_t,
             timestep,
             bool(prefix_context.layout.get("full_attention", False)),
+            action_position_offset=action_position_offset,
         )
 
 
@@ -337,6 +353,8 @@ class Pi05PolicyModel(nn.Module):
         split = get_vla_split_group()
         if split is None:
             return "all"
+        if split.is_prefix_rank and split.is_action_rank:
+            return "all"
         if split.is_prefix_rank:
             return "prefix"
         if split.is_action_rank:
@@ -568,14 +586,7 @@ class Pi05PolicyModel(nn.Module):
         self,
         target_state: dict[str, torch.Tensor],
     ) -> bool:
-        if self.device.type != "cuda" or self.runtime_role in ("action", "idle"):
-            return False
-        # Split prefix/action ranks need a distributed streamer protocol; the
-        # direct GPU path is only safe for a single local loading process.
-        if (
-            torch.distributed.is_initialized()
-            and torch.distributed.get_world_size() > 1
-        ):
+        if self.device.type != "cuda" or self.runtime_role == "idle":
             return False
 
         has_weight = False
@@ -766,26 +777,126 @@ class Pi05PolicyModel(nn.Module):
         timestep: torch.Tensor,
         *,
         use_cuda_graph: bool = True,
+        action_position_offset: int = 0,
+        action_sp_enabled: bool = False,
     ) -> torch.Tensor:
         if not bool(prefix_context.layout.get("full_attention", False)):
             use_cuda_graph = False
         if not use_cuda_graph:
-            return self.action_expert(prefix_context, x_t, timestep)
+            return self.action_expert(
+                prefix_context,
+                x_t,
+                timestep,
+                action_position_offset=action_position_offset,
+            )
+        parallel_layout = self.config.parallel_layout_version
+        if action_sp_enabled:
+            parallel_layout = (
+                f"{parallel_layout}:action_sp"
+                f":rank{get_sp_parallel_rank()}:offset{action_position_offset}"
+            )
         bucket = VLADenoiseShapeBucket(
             batch_size=x_t.shape[0],
             prefix_len=prefix_context.prefix_len,
             action_horizon=x_t.shape[1],
             action_dim=x_t.shape[2],
             dtype=str(x_t.dtype).replace("torch.", ""),
-            parallel_layout=self.config.parallel_layout_version,
+            parallel_layout=parallel_layout,
         )
+
+        def step_fn(
+            current_prefix_context: PrefixContext,
+            current_x_t: torch.Tensor,
+            current_timestep: torch.Tensor,
+        ) -> torch.Tensor:
+            return self.action_expert(
+                current_prefix_context,
+                current_x_t,
+                current_timestep,
+                action_position_offset=action_position_offset,
+            )
+
         return self.graph_runner.capture_or_run(
             bucket,
-            self.action_expert,
+            step_fn,
             prefix_context,
             x_t,
             timestep,
         )
+
+    def _can_use_action_sequence_parallel(
+        self,
+        prefix_context: PrefixContext | None,
+        action_horizon: int,
+    ) -> bool:
+        split = get_vla_split_group()
+        if split is None or not split.uses_action_sp:
+            return False
+        if self.runtime_role not in ("all", "action"):
+            return False
+        if self._offload_action_expert_between_requests():
+            return False
+        if prefix_context is None or not bool(
+            prefix_context.layout.get("full_attention", False)
+        ):
+            return False
+        if not model_parallel_is_initialized():
+            return False
+        try:
+            sp_world_size = get_sequence_parallel_world_size()
+            ulysses_world_size = get_ulysses_parallel_world_size()
+            ring_world_size = get_ring_parallel_world_size()
+        except AssertionError:
+            return False
+        if sp_world_size <= 1 or ulysses_world_size <= 1 or ring_world_size != 1:
+            return False
+        action_expert = self.core_model.paligemma_with_expert.gemma_expert
+        if action_expert is None:
+            return False
+        num_heads = action_expert.model.config.num_attention_heads
+        return action_horizon % sp_world_size == 0 and num_heads % sp_world_size == 0
+
+    def should_run_action_denoise(
+        self,
+        prefix_context: PrefixContext | None,
+    ) -> bool:
+        split = get_vla_split_group()
+        if split is None:
+            return True
+        if self._can_use_action_sequence_parallel(
+            prefix_context,
+            self.config.action_horizon,
+        ):
+            return split.is_action_rank
+        return split.rank == split.action_root
+
+    def _broadcast_initial_action_state(
+        self,
+        x_t: torch.Tensor | None,
+    ) -> torch.Tensor:
+        split = get_vla_split_group()
+        if split is None:
+            if x_t is None:
+                raise RuntimeError("Pi05 action state is missing on single-rank run")
+            return x_t
+        x_t = broadcast_optional_tensor(
+            x_t if split.rank == split.action_root else None,
+            group=split.group,
+            rank=split.rank,
+            src=split.action_root,
+            device=self.device,
+        )
+        if x_t is None:
+            raise RuntimeError("Pi05 action state broadcast returned None")
+        return x_t
+
+    def _shard_action_sequence(self, x_t: torch.Tensor) -> tuple[torch.Tensor, int]:
+        sp_world_size = get_sequence_parallel_world_size()
+        sp_rank = get_sp_parallel_rank()
+        local_len = x_t.shape[1] // sp_world_size
+        start = sp_rank * local_len
+        end = start + local_len
+        return x_t[:, start:end].contiguous(), start
 
     def sample_actions(
         self,
@@ -802,11 +913,26 @@ class Pi05PolicyModel(nn.Module):
             self._move_action_modules_to_device(self.device)
             use_cuda_graph = False
 
-        x_t = noise
-        if x_t is None:
-            x_t = self.sample_noise(observation.batch_size, generator=generator)
+        split = get_vla_split_group()
+        action_sp_enabled = self._can_use_action_sequence_parallel(
+            prefix_context,
+            self.config.action_horizon,
+        )
+        if split is None or split.rank == split.action_root:
+            x_t = noise
+            if x_t is None:
+                x_t = self.sample_noise(observation.batch_size, generator=generator)
+            else:
+                x_t = x_t.to(device=self.device, dtype=torch.float32).clone()
         else:
-            x_t = x_t.to(device=self.device, dtype=torch.float32).clone()
+            x_t = None
+        if action_sp_enabled:
+            x_t = self._broadcast_initial_action_state(x_t)
+        elif x_t is None:
+            raise RuntimeError("Pi05 action fallback must run on the action root")
+        action_position_offset = 0
+        if action_sp_enabled:
+            x_t, action_position_offset = self._shard_action_sequence(x_t)
 
         dt = -1.0 / num_steps
         timesteps = torch.linspace(
@@ -823,8 +949,12 @@ class Pi05PolicyModel(nn.Module):
                 x_t,
                 timestep,
                 use_cuda_graph=use_cuda_graph,
+                action_position_offset=action_position_offset,
+                action_sp_enabled=action_sp_enabled,
             )
             x_t.add_(velocity, alpha=dt)
+        if action_sp_enabled:
+            x_t = sequence_model_parallel_all_gather(x_t.contiguous(), dim=1)
         if offload_action:
             self._move_action_modules_to_device(torch.device("cpu"))
             torch.cuda.empty_cache()

@@ -333,6 +333,7 @@ class VLAPrefixEncodingStage(PipelineStage):
 
         prefix_start = time.perf_counter()
         prefix_context = self.policy_model.encode_prefix(observation)
+        prefix_context.cache_key_digest = cache_key.digest
         vla_timings(batch, self.keys)["prefix_ms"] = (
             time.perf_counter() - prefix_start
         ) * 1000
@@ -454,7 +455,10 @@ class VLAActionDenoisingStage(PipelineStage):
         start = time.perf_counter()
         observation = batch.extra.get(self.keys.observation_batch)
         split = get_vla_split_group()
-        should_run_action = split is None or split.is_action_rank
+        prefix_context = batch.extra.get(self.keys.prefix_context)
+        should_run_action = (
+            split is None or self.policy_model.should_run_action_denoise(prefix_context)
+        )
         if batch.is_warmup:
             actions = (
                 self.policy_model.warmup_actions(batch_size=1)
@@ -463,7 +467,6 @@ class VLAActionDenoisingStage(PipelineStage):
             )
         elif should_run_action:
             options = vla_options(batch, self.keys)
-            prefix_context = batch.extra[self.keys.prefix_context]
             noise = observation.noise if observation is not None else None
             actions = self.policy_model.sample_actions(
                 observation,

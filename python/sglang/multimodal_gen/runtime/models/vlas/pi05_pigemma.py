@@ -20,7 +20,13 @@ from transformers.models.paligemma.modeling_paligemma import (
     PaliGemmaModel,
 )
 
-from sglang.multimodal_gen.runtime.layers.attention import LocalAttention
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_ring_parallel_world_size,
+    get_sequence_parallel_world_size,
+    get_ulysses_parallel_world_size,
+    model_parallel_is_initialized,
+)
+from sglang.multimodal_gen.runtime.layers.attention import LocalAttention, USPAttention
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.srt.layers.rotary_embedding import (
     apply_rotary_pos_emb as native_apply_rotary_pos_emb,
@@ -63,6 +69,90 @@ def layernorm_forward(
     if cond is not None:
         return layernorm(x, cond=cond)
     return layernorm(x)
+
+
+def _use_ulysses_action_attention(num_heads: int) -> bool:
+    if not model_parallel_is_initialized():
+        return False
+    try:
+        sp_world_size = get_sequence_parallel_world_size()
+        ulysses_world_size = get_ulysses_parallel_world_size()
+        ring_world_size = get_ring_parallel_world_size()
+    except AssertionError:
+        return False
+    return (
+        sp_world_size > 1
+        and ulysses_world_size > 1
+        and ring_world_size == 1
+        and num_heads % sp_world_size == 0
+    )
+
+
+class Pi05SiglipAttention(nn.Module):
+    def __init__(self, attention: nn.Module):
+        super().__init__()
+        self.embed_dim = attention.embed_dim
+        self.num_heads = attention.num_heads
+        self.head_dim = attention.head_dim
+        self.scale = getattr(attention, "scale", self.head_dim**-0.5)
+        self.dropout = getattr(attention, "dropout", 0.0)
+        self.q_proj = attention.q_proj
+        self.k_proj = attention.k_proj
+        self.v_proj = attention.v_proj
+        self.out_proj = attention.out_proj
+        self.attn = LocalAttention(
+            num_heads=self.num_heads,
+            head_size=self.head_dim,
+            num_kv_heads=self.num_heads,
+            softmax_scale=self.scale,
+            causal=False,
+            supported_attention_backends={
+                AttentionBackendEnum.FA,
+                AttentionBackendEnum.FA2,
+                AttentionBackendEnum.TORCH_SDPA,
+            },
+            compute_dtype=self.q_proj.weight.dtype,
+            allow_cudnn_sdp=True,
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        output_attentions: bool = False,
+        **kwargs,
+    ) -> tuple[torch.Tensor, None]:
+        input_shape = hidden_states.shape[:-1]
+        query_states = self.q_proj(hidden_states).view(
+            *input_shape,
+            self.num_heads,
+            self.head_dim,
+        )
+        key_states = self.k_proj(hidden_states).view(
+            *input_shape,
+            self.num_heads,
+            self.head_dim,
+        )
+        value_states = self.v_proj(hidden_states).view(
+            *input_shape,
+            self.num_heads,
+            self.head_dim,
+        )
+        attn_output = self.attn(
+            query_states,
+            key_states,
+            value_states,
+            attn_mask=attention_mask,
+        )
+        attn_output = attn_output.reshape(*input_shape, self.embed_dim).contiguous()
+        return self.out_proj(attn_output), None
+
+
+def patch_siglip_vision_attention_to_native(vision_model: nn.Module) -> None:
+    for layer in vision_model.encoder.layers:
+        if isinstance(layer.self_attn, Pi05SiglipAttention):
+            continue
+        layer.self_attn = Pi05SiglipAttention(layer.self_attn)
 
 
 class PiGemmaRMSNorm(nn.Module):
@@ -149,6 +239,31 @@ class PiGemmaAttention(nn.Module):
             compute_dtype=config_compute_dtype(config),
             allow_cudnn_sdp=True,
         )
+        self.sp_attn = (
+            USPAttention(
+                num_heads=config.num_attention_heads,
+                head_size=self.head_dim,
+                num_kv_heads=config.num_attention_heads,
+                softmax_scale=self.scaling,
+                causal=self.is_causal,
+                supported_attention_backends={
+                    AttentionBackendEnum.FA,
+                    AttentionBackendEnum.FA2,
+                    AttentionBackendEnum.TORCH_SDPA,
+                },
+                allow_cudnn_sdp=True,
+            )
+            if _use_ulysses_action_attention(config.num_attention_heads)
+            else None
+        )
+
+    def _repeat_kv_for_sequence_parallel(
+        self,
+        states: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.num_key_value_groups == 1:
+            return states
+        return states.repeat_interleave(self.num_key_value_groups, dim=2)
 
     def forward(
         self,
@@ -176,6 +291,28 @@ class PiGemmaAttention(nn.Module):
         )
 
         if past_key_values is not None:
+            if (
+                self.sp_attn is not None
+                and hasattr(past_key_values, "get_prefix")
+                and attention_mask is None
+            ):
+                prefix_key_states, prefix_value_states = past_key_values.get_prefix(
+                    self.layer_idx
+                )
+                attn_output = self.sp_attn.forward_with_replicated_kv_prefix(
+                    query_states.transpose(1, 2),
+                    self._repeat_kv_for_sequence_parallel(
+                        prefix_key_states.transpose(1, 2)
+                    ),
+                    self._repeat_kv_for_sequence_parallel(
+                        prefix_value_states.transpose(1, 2)
+                    ),
+                    self._repeat_kv_for_sequence_parallel(key_states.transpose(1, 2)),
+                    self._repeat_kv_for_sequence_parallel(value_states.transpose(1, 2)),
+                )
+                attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+                return self.o_proj(attn_output), None
+
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             key_states, value_states = past_key_values.update(
                 key_states,

@@ -21,6 +21,7 @@ from sglang.multimodal_gen.runtime.models.vlas.pi05_pigemma import (
     gated_residual,
     layernorm_forward,
     native_apply_rotary_pos_emb,
+    patch_siglip_vision_attention_to_native,
 )
 
 OPENPI_ATTENTION_MASK_VALUE = -2.3819763e38
@@ -174,6 +175,10 @@ class ReadOnlyPrefixCache:
             torch.cat([prefix_values, value_states], dim=-2),
         )
 
+    def get_prefix(self, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        prefix_keys, prefix_values, _ = self.layers[layer_idx]
+        return prefix_keys, prefix_values
+
 
 def compute_layer_complete(
     inputs_embeds,
@@ -326,6 +331,14 @@ class PaliGemmaWithExpertModel(nn.Module):
             self.gemma_expert.lm_head = None
             self.gemma_expert.model.embed_tokens = None
         self.to_selected_dtype(precision)
+        self.patch_native_attention_after_dtype_finalize()
+
+    def patch_native_attention_after_dtype_finalize(self) -> None:
+        if self.paligemma is None:
+            return
+        vision_tower = self.paligemma.model.vision_tower
+        vision_model = getattr(vision_tower, "vision_model", vision_tower)
+        patch_siglip_vision_attention_to_native(vision_model)
 
     def to_selected_dtype(
         self, precision: Literal["bfloat16", "float32"] = "bfloat16"
@@ -712,6 +725,8 @@ class Pi05CoreModel(nn.Module):
         x_t: torch.Tensor,
         timestep: torch.Tensor,
         prefix_full_attention: bool = False,
+        *,
+        action_position_offset: int = 0,
     ) -> torch.Tensor:
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = (
             self.embed_suffix(x_t, timestep)
@@ -732,7 +747,12 @@ class Pi05CoreModel(nn.Module):
             )
             attention_mask = self.prepare_attention_masks_4d(full_att_2d_masks)
         prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
-        position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
+        position_ids = (
+            prefix_offsets
+            + action_position_offset
+            + torch.cumsum(suffix_pad_masks, dim=1)
+            - 1
+        )
         with set_forward_context(current_timestep=0, attn_metadata=None):
             outputs_embeds, _ = self.paligemma_with_expert.forward(
                 attention_mask=attention_mask,
@@ -742,7 +762,7 @@ class Pi05CoreModel(nn.Module):
                 use_cache=False,
                 adarms_cond=[None, adarms_cond],
             )
-        suffix_out = outputs_embeds[1][:, -self.config.action_horizon :]
+        suffix_out = outputs_embeds[1][:, -x_t.shape[1] :]
         return self.action_out_proj(
             suffix_out.to(dtype=self.action_out_proj.weight.dtype)
         ).to(dtype=torch.float32)

@@ -29,6 +29,7 @@ class VLASplitGroup:
     group: GroupCoordinator
     prefix_root: int
     action_root: int
+    action_ranks: tuple[int, ...]
     rank: int
 
     @property
@@ -41,7 +42,11 @@ class VLASplitGroup:
 
     @property
     def is_action_rank(self) -> bool:
-        return self.rank == self.action_root
+        return self.rank in self.action_ranks
+
+    @property
+    def uses_action_sp(self) -> bool:
+        return len(self.action_ranks) > 1
 
 
 def get_vla_split_group() -> VLASplitGroup | None:
@@ -56,6 +61,7 @@ def get_vla_split_group() -> VLASplitGroup | None:
         group=group,
         prefix_root=group.ranks[0],
         action_root=group.ranks[-1],
+        action_ranks=tuple(group.ranks),
         rank=get_world_rank(),
     )
 
