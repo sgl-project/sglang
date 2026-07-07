@@ -346,6 +346,27 @@ class TestMoeFlagsGroup(_IsolatedServerArgs):
         self.assertEqual(get_moe_runner_backend().name, "TRITON")
 
 
+class TestDpFlagsGroup(_IsolatedServerArgs):
+    """flags.dp: the DP-attention runtime flags; is_dp_attention_enabled is a
+    thin shim over the group leaf."""
+
+    def test_shim_reads_the_leaf(self):
+        from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+
+        reset_context()
+        self.assertFalse(is_dp_attention_enabled())
+        get_flags().dp.enabled = True
+        self.assertTrue(is_dp_attention_enabled())
+
+    def test_scoped_override_forces_the_predicate(self):
+        from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+
+        reset_context()
+        with get_flags().dp.override(enabled=True):
+            self.assertTrue(is_dp_attention_enabled())
+        self.assertFalse(is_dp_attention_enabled())
+
+
 class TestPublishLifecycle(_IsolatedServerArgs):
     """Publish installs the resolved server_args and seeds the capture tier."""
 
