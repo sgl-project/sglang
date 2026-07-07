@@ -538,14 +538,6 @@ void quant_impl(
   }
 }
 
-inline int getSMVersion(int device_id) {
-  int sm_major = 0;
-  int sm_minor = 0;
-  RuntimeDeviceCheck(cudaDeviceGetAttribute(&sm_major, cudaDevAttrComputeCapabilityMajor, device_id));
-  RuntimeDeviceCheck(cudaDeviceGetAttribute(&sm_minor, cudaDevAttrComputeCapabilityMinor, device_id));
-  return sm_major * 10 + sm_minor;
-}
-
 void scaled_fp4_experts_quant_sm100a(
     tvm::ffi::TensorView output,
     tvm::ffi::TensorView output_scale,
