@@ -13,7 +13,9 @@ from sglang.jit_kernel.dsv4.gemm import _linear_bf16_fp32_hpc_ops
 from sglang.jit_kernel.utils import get_jit_cuda_arch, is_hip_runtime
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=5, suite="base-b-kernel-benchmark-1-gpu-large")
+register_cuda_ci(
+    est_time=5, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
+)
 
 
 def _cublas_fp32(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
