@@ -445,7 +445,7 @@ class SingleStreamBlock(nn.Module):
 
     def forward(
         self,
-        x: Tensor,
+        hidden_states: Tensor,
         vec: Tensor,
         freqs: Tensor,
         key_mask: Tensor | None = None,
@@ -455,20 +455,28 @@ class SingleStreamBlock(nn.Module):
         prescale, preshift, pregate, postscale, postshift, postgate = mod.chunk(
             6, dim=-1
         )
-        x = x + pregate * self.attn(
+        hidden_states = hidden_states + pregate * self.attn(
             norm_scale_shift(
-                x, self.norm1.weight + 1, prescale, preshift, self.norm1.eps
+                hidden_states,
+                self.norm1.weight + 1,
+                prescale,
+                preshift,
+                self.norm1.eps,
             ),
             freqs,
             key_mask,
             mask_meta,
         )
-        x = x + postgate * self.ff(
+        hidden_states = hidden_states + postgate * self.ff(
             norm_scale_shift(
-                x, self.norm2.weight + 1, postscale, postshift, self.norm2.eps
+                hidden_states,
+                self.norm2.weight + 1,
+                postscale,
+                postshift,
+                self.norm2.eps,
             )
         )
-        return x
+        return hidden_states
 
 
 # --------------------------------------------------------------------------- #

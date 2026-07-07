@@ -907,6 +907,19 @@ class NixlKVManager(CommonKVManager):
     def _prepare_payload_xfer(self, peer_info: KVArgsRegisterInfo):
         assert self.src_mem_kind is not None
         src_mem_kind = self.src_mem_kind
+
+        # If prefill does not run speculative decoding (the usual case),
+        # decode with speculative decoding will have more kv items.
+        # Prefill having more kv items is impossible.
+        n_src = len(self.kv_args.kv_item_lens)
+        n_dst = len(peer_info.dst_kv_item_lens)
+        if n_dst < n_src:
+            raise ValueError(
+                "NIXL PD transfer: decode registered fewer KV regions "
+                f"({n_dst}) than prefill ({n_src}); unexpected geometry"
+            )
+        decode_only_spec_dec = n_dst > n_src
+
         if self.is_mla_backend or peer_info.decode_tp_size == self.attn_tp_size:
             dst_mem_kind = None
             try:
@@ -914,6 +927,11 @@ class NixlKVManager(CommonKVManager):
                     peer_info.dst_kv_mem_kinds, "destination"
                 )
             except NotImplementedError:
+                if decode_only_spec_dec:
+                    raise NotImplementedError(
+                        "NIXL PD transfer does not support HiSparse combined with "
+                        "decode-only speculative decoding."
+                    )
                 mem_segments = _kv_xfer_mem_segments(
                     self.kv_args.kv_data_mem_kinds, peer_info.dst_kv_mem_kinds
                 )
@@ -921,6 +939,12 @@ class NixlKVManager(CommonKVManager):
                     raise ValueError("NIXL KV transfer has no KV memory segments")
                 self._init_mixed_equal_tp_prep_handles(peer_info, mem_segments)
                 return
+
+            if decode_only_spec_dec and dst_mem_kind != "VRAM":
+                raise NotImplementedError(
+                    "NIXL PD transfer does not support HiSparse combined with "
+                    "decode-only speculative decoding."
+                )
 
             peer_info.dst_homogeneous_mem_kind = dst_mem_kind
             # Build the shared src dlist on the first equal-TP/MLA peer; later
@@ -937,13 +961,15 @@ class NixlKVManager(CommonKVManager):
                 if peer_info.dst_num_slots is not None
                 else self._num_slots_src
             )
-            dst_kv_item_lens = peer_info.dst_kv_item_lens
+
+            dst_kv_ptrs = peer_info.dst_kv_ptrs[:n_src]
+            dst_kv_item_lens = peer_info.dst_kv_item_lens[:n_src]
             dst_kv_data_lens = [
                 item_len * dst_num_slots for item_len in dst_kv_item_lens
             ]
             self._init_equal_tp_prep_handle(
                 peer_info.agent_name,
-                peer_info.dst_kv_ptrs,
+                dst_kv_ptrs,
                 peer_info.gpu_id,
                 num_slots=peer_info.dst_num_slots,
                 mem_kind=dst_mem_kind,
@@ -1277,6 +1303,7 @@ class NixlKVManager(CommonKVManager):
         dst_data_indices: npt.NDArray[np.int32],
         dst_gpu_id: int,
         notif: str,
+        state_type: Optional[StateType] = None,
         src_mem_kind: str = "VRAM",
         dst_mem_kind: str = "VRAM",
         force_flat: bool = False,
@@ -1341,7 +1368,7 @@ class NixlKVManager(CommonKVManager):
         # Make descs
         if self.is_mla_backend or force_flat:
             src_kv_ptrs, dst_kv_ptrs, layers_current_pp_stage = (
-                self.get_mla_kv_ptrs_with_pp(src_data_ptrs, dst_data_ptrs)
+                self.get_mla_kv_ptrs_with_pp(src_data_ptrs, dst_data_ptrs, state_type)
             )
             layers_params = [
                 (
@@ -1994,11 +2021,22 @@ class NixlKVManager(CommonKVManager):
                         dst_gpu_id,
                         comp_notif,
                     )
-            elif st in (StateType.SWA, StateType.DSA, StateType.SWA_RING):
+            elif st in (
+                StateType.SWA,
+                StateType.DSA,
+                StateType.SWA_RING,
+                StateType.C128_STATE,
+            ):
                 if not self.is_mla_backend and self.attn_tp_size != decode_tp_size:
                     raise RuntimeError(
                         f"PD Disaggregation does NOT support PD different TP sizes for non-MLA {st.upper()} hybrid models yet."
                     )
+                if (
+                    st == StateType.C128_STATE
+                    and len(src_indices) == 0
+                    and len(dst_indices) == 0
+                ):
+                    continue
                 if len(src_indices) != len(dst_indices):
                     raise RuntimeError(
                         f"State index length mismatch at component {i}: "
@@ -2013,6 +2051,7 @@ class NixlKVManager(CommonKVManager):
                     dst_data_indices=np.array(dst_indices, dtype=np.int32),
                     dst_gpu_id=dst_gpu_id,
                     notif=comp_notif,
+                    state_type=st,
                 )
             elif st == StateType.MINIMAX_INDEX_K:
                 # Equal-TP / PP=1 only. Sub-pools are compacted sparse-layer

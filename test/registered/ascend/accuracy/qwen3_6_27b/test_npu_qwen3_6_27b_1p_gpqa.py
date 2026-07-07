@@ -80,7 +80,7 @@ QWEN3_6_27B_64K_PREFIX_OTHER_ARGS = [
 ]
 
 
-class TestNPUQwen3_6_27B_2P_In64k_Out1k_Prefix90_gpqa(TestNpuAccuracyTestCaseBase):
+class TestNPUQwen3_6_27B_1P_In64k_Out1k_Prefix90_gpqa(TestNpuAccuracyTestCaseBase):
     model = QWEN3_6_27B_MODEL_PATH
     envs = QWEN3_6_27B_64K_PREFIX_ENVS
     other_args = QWEN3_6_27B_64K_PREFIX_OTHER_ARGS
@@ -88,7 +88,13 @@ class TestNPUQwen3_6_27B_2P_In64k_Out1k_Prefix90_gpqa(TestNpuAccuracyTestCaseBas
     datasets = ["gpqa_diamond"]
     few_shot_num = 0
     eval_batch_size = 64
-    generation_config = {"max_tokens": 81920, "temperature": 1.0}
+    generation_config = {
+        "max_tokens": 81920,
+        "temperature": 1.0,
+        "extra_body": {
+            "chat_template_kwargs": {"enable_thinking": True},
+        },
+    }
 
     def test_gpqa(self):
         self.run_accuracy()

@@ -30,7 +30,6 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput, T5Config
-from sglang.multimodal_gen.runtime.distributed import get_sp_group, get_tp_group
 from sglang.multimodal_gen.runtime.layers.activation import get_act_fn
 from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
 from sglang.multimodal_gen.runtime.layers.linear import (
@@ -44,21 +43,11 @@ from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.multimodal_gen.runtime.loader.weight_utils import default_weight_loader
-from sglang.multimodal_gen.runtime.models.encoders.base import TextEncoder
+from sglang.multimodal_gen.runtime.models.encoders.base import (
+    TextEncoder,
+    get_folding_tp_group,
+)
 from sglang.multimodal_gen.runtime.platforms import current_platform
-
-
-def _get_folding_tp_group(
-    config: T5Config,
-) -> torch.distributed.ProcessGroup | None:
-    if config.parallel_folding:
-        if config.parallel_folding_mode == "sp":
-            return get_sp_group()
-        elif config.parallel_folding_mode == "ulysses":
-            return get_sp_group().ulysses_group
-        elif config.parallel_folding_mode == "ring":
-            return get_sp_group().ring_group
-    return get_tp_group()
 
 
 class AttentionType:
@@ -88,7 +77,7 @@ class T5DenseActDense(nn.Module):
         self, config: T5Config, quant_config: QuantizationConfig | None = None
     ):
         super().__init__()
-        tp_group = _get_folding_tp_group(config)
+        tp_group = get_folding_tp_group(config)
         self.wi = MergedColumnParallelLinear(
             config.d_model, [config.d_ff], bias=False, tp_group=tp_group
         )
@@ -114,7 +103,7 @@ class T5DenseGatedActDense(nn.Module):
         self, config: T5Config, quant_config: QuantizationConfig | None = None
     ):
         super().__init__()
-        tp_group = _get_folding_tp_group(config)
+        tp_group = get_folding_tp_group(config)
         self.wi_0 = MergedColumnParallelLinear(
             config.d_model,
             [config.d_ff],
@@ -210,7 +199,7 @@ class T5Attention(nn.Module):
         self.total_num_heads = self.total_num_kv_heads = config.num_heads
 
         # Partition heads across multiple tensor parallel GPUs.
-        self.tp_group = _get_folding_tp_group(config)
+        self.tp_group = get_folding_tp_group(config)
         self.tp_world_size = get_group_size(self.tp_group)
         assert config.num_heads % self.tp_world_size == 0
         self.n_heads = config.num_heads // self.tp_world_size
@@ -584,7 +573,7 @@ class T5EncoderModel(TextEncoder):
         super().__init__(config)
 
         quant_config = None
-        tp_group = _get_folding_tp_group(config)
+        tp_group = get_folding_tp_group(config)
         self.shared = VocabParallelEmbedding(
             config.vocab_size,
             config.d_model,
@@ -673,7 +662,7 @@ class UMT5EncoderModel(TextEncoder):
         super().__init__(config)
 
         quant_config = None
-        tp_group = _get_folding_tp_group(config)
+        tp_group = get_folding_tp_group(config)
         self.shared = VocabParallelEmbedding(
             config.vocab_size,
             config.d_model,

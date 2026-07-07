@@ -421,7 +421,7 @@ class JoyTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             self.hidden_size,
             self.out_channels * math.prod(self.patch_size),
             quant_config=quant_config,
-            prefix=f"proj_out",
+            prefix="proj_out",
         )
         self.__post_init__()
 

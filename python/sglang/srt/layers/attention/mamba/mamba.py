@@ -448,6 +448,7 @@ class MambaMixer2(torch.nn.Module):
         forward_batch: ForwardBatch,
         mup_vector: Optional[torch.Tensor] = None,
         use_triton_causal_conv: bool = False,
+        should_allreduce_fusion: bool = False,
     ):
         # Returns the projected result. When `output` is given it is also
         # written into that buffer (required by the cuda-graph split ops, which
@@ -760,7 +761,9 @@ class MambaMixer2(torch.nn.Module):
         # norm usage
         hidden_states = self.norm(preallocated_ssm_out, gate)
 
-        mixer_out, _ = self.out_proj(hidden_states)
+        mixer_out, _ = self.out_proj(
+            hidden_states, skip_all_reduce=should_allreduce_fusion
+        )
         if output is not None:
             output[:padded_num_tokens].copy_(mixer_out)
 

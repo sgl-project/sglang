@@ -14,6 +14,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
 )
 from sglang.srt.layers.quantization.modelslim.schemes import (
+    ModelSlimMXFP4W4A8Scheme,
     ModelSlimMXFP8Scheme,
     ModelSlimW4A4Int4,
     ModelSlimW4A4Int4MoE,
@@ -198,6 +199,7 @@ class ModelSlimConfig(QuantizationConfig):
             ("W8A8", ModelSlimW8A8Int8),
             ("W8A8_DYNAMIC", ModelSlimW8A8Int8),
             ("W8A8_MXFP8", ModelSlimMXFP8Scheme),
+            ("W4A8_MXFP", ModelSlimMXFP4W4A8Scheme),
         ]
 
         quant_schemes = [self.quant_description.get(prefix + ".weight", "")]

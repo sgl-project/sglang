@@ -47,7 +47,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 
 # The NVFP4 expert-quant kernels are Blackwell-only (sm100a), so this runs on
 # the B200 unit suite.
-register_cuda_ci(est_time=20, suite="base-b-kernel-unit-1-gpu-b200")
+register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 FLOAT8_E4M3_MAX = 448.0
 FLOAT4_E2M1_MAX = 6.0

@@ -265,7 +265,7 @@ def _image_item(feature, grid_hws):
 
 
 class TestGetImageFeatureWiring(CustomTestCase):
-    """Forward-shape smoke test for get_image_feature.
+    """Forward-shape coverage for get_image_feature.
 
     Guards the production path (pixel concat -> vision tower -> projector) and
     the precomputed-embedding passthrough so a future change to the wiring or

@@ -113,6 +113,14 @@ _flashinfer_trtllm_shuffle_row_indices_cache_mxfp8: dict[
 ] = {}
 
 
+def clear_mxfp8_shuffle_index_cache() -> None:
+    """Drop the cached MXFP8 MoE row-index permutations.
+    The cached index tensors are GPU-resident; sglang reuses the weights-region
+    memory across weight-update cycles
+    """
+    _flashinfer_trtllm_shuffle_row_indices_cache_mxfp8.clear()
+
+
 def _is_gated(layer: Module) -> bool:
     """Return whether the MoE layer uses a gated activation (default True)."""
     is_gated = (

@@ -99,6 +99,7 @@ fi
 
 echo "Launching container: ${CONTAINER_NAME} from ${IMAGE}"
 docker run -dt \
+  --shm-size 8g \
   --group-add 992 \
   ${VIDEO_GID:+--group-add "${VIDEO_GID}"} \
   ${RENDER_GID:+--group-add "${RENDER_GID}"} \

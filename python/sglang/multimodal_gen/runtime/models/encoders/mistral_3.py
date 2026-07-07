@@ -416,7 +416,6 @@ class MistralModel(MistralPreTrainedModel):
                 "config": self.config,
                 _CREATE_CAUSAL_MASK_ARG: inputs_embeds,
                 "attention_mask": attention_mask,
-                "cache_position": cache_position,
                 "past_key_values": past_key_values,
                 "position_ids": position_ids,
             }

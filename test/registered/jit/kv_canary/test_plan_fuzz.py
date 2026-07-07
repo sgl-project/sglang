@@ -22,8 +22,8 @@ from sglang.jit_kernel.tests.kv_canary._fuzz_driver import (
 from sglang.jit_kernel.tests.kv_canary._invariants import PlanInvariants
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=30, suite="base-b-kernel-unit-1-gpu-large")
-register_amd_ci(est_time=30, suite="jit-kernel-unit-test-amd")
+register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_amd_ci(est_time=30, stage="jit-kernel-unit", runner_config="amd")
 
 
 _DEVICE = torch.device("cuda")

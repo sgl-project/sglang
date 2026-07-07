@@ -866,3 +866,53 @@ def run_native_component_accuracy_case(
 
 def run_text_encoder_accuracy_case(engine_cls: Any, case: Any, num_gpus: int) -> None:
     _run_staged_text_encoder_accuracy_case(engine_cls, case, num_gpus)
+
+
+def _find_split_shard_parts(lookup, cand):
+    """(shard_id, tensor) pairs when a fused target param ships split in the
+    source state dict (q/k/v or gate/up)."""
+    if "qkv_proj" in cand:
+        for repl in ("q_proj", "q"):
+            q_name = cand.replace("qkv_proj", repl)
+            k_name = q_name.replace(".q_proj", ".k_proj").replace(".q", ".k")
+            v_name = q_name.replace(".q_proj", ".v_proj").replace(".q", ".v")
+            if q_name in lookup and k_name in lookup and v_name in lookup:
+                return [
+                    ("q", lookup[q_name]),
+                    ("k", lookup[k_name]),
+                    ("v", lookup[v_name]),
+                ]
+    if "gate_up_proj" in cand:
+        for gate_token, up_token in (("gate_proj", "up_proj"), ("wi_0", "wi_1")):
+            gate_name = cand.replace("gate_up_proj", gate_token)
+            up_name = cand.replace("gate_up_proj", up_token)
+            if gate_name in lookup and up_name in lookup:
+                return [(0, lookup[gate_name]), (1, lookup[up_name])]
+    return None
+
+
+def load_param_with_weight_loader(param, name, lookup, reverse_mapping) -> bool:
+    """Route the source tensor through the parameter's own ``weight_loader`` so
+    TP sharding matches production checkpoint loading. The generic narrow in
+    ``copy_tensor`` mis-slices fused QKV/gate_up weights (it splits the fused
+    dim evenly instead of per-projection), which corrupts any TP/folded module.
+    Any failure falls back to the legacy path."""
+    loader = getattr(param, "weight_loader", None)
+    if loader is None or getattr(param, "device_mesh", None) is not None:
+        return False
+    try:
+        candidates = generate_name_candidates(name, reverse_mapping)
+        for cand in candidates:
+            parts = _find_split_shard_parts(lookup, cand)
+            if parts is not None:
+                for shard_id, tensor in parts:
+                    loader(param, tensor.to(dtype=param.dtype), shard_id)
+                return True
+        for cand in candidates:
+            src = lookup.get(cand)
+            if src is not None:
+                loader(param, src.to(dtype=param.dtype))
+                return True
+    except Exception:
+        return False
+    return False

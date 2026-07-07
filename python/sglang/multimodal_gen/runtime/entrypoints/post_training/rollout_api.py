@@ -33,21 +33,33 @@ logger = init_logger(__name__)
 router = APIRouter(prefix="/rollout", tags=["rollout"])
 
 
-def _extract_single_sample_tensor(obj: Any, sample_idx: int, batch_size: int) -> Any:
+def _extract_single_sample_tensor(
+    obj: Any, sample_idx: int, batch_size: int, *, current_key: str | None = None
+) -> Any:
     if isinstance(obj, torch.Tensor):
         if obj.dim() >= 1 and obj.shape[0] == batch_size:
             return obj[sample_idx].contiguous()
         return obj
     if isinstance(obj, dict):
         return {
-            k: _extract_single_sample_tensor(v, sample_idx, batch_size)
+            k: _extract_single_sample_tensor(v, sample_idx, batch_size, current_key=k)
             for k, v in obj.items()
         }
     if isinstance(obj, list):
-        return [_extract_single_sample_tensor(v, sample_idx, batch_size) for v in obj]
+        if current_key == "img_shapes" and len(obj) == batch_size:
+            return [obj[sample_idx]]
+        return [
+            _extract_single_sample_tensor(
+                v, sample_idx, batch_size, current_key=current_key
+            )
+            for v in obj
+        ]
     if isinstance(obj, tuple):
         return tuple(
-            _extract_single_sample_tensor(v, sample_idx, batch_size) for v in obj
+            _extract_single_sample_tensor(
+                v, sample_idx, batch_size, current_key=current_key
+            )
+            for v in obj
         )
     return obj
 

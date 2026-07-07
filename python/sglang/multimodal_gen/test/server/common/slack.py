@@ -110,11 +110,11 @@ def upload_file_to_slack(
 
         token = os.environ.get("SGLANG_DIFFUSION_SLACK_TOKEN")
         if not token:
-            logger.info(f"Slack upload failed: no token")
+            logger.info("Slack upload failed: no token")
             return False
 
         if not file_path or not os.path.exists(file_path):
-            logger.info(f"Slack upload failed: no file path")
+            logger.info("Slack upload failed: no file path")
             return False
 
         origin_paths = []

@@ -280,14 +280,8 @@ class XIELU(MultiPlatformOp):
                 )
                 self._xielu_cuda_fn = self._xielu_cuda
             logger.warning_once(msg)
-        except Exception as err:
+        except Exception:
             pass
-            # logger.warning_once(
-            #     "CUDA-fused xIELU not available (%s) –"
-            #     " falling back to a Python version.\n"
-            #     "For CUDA xIELU (experimental), `pip install git+https://github.com/nickjbrowning/XIELU`",
-            #     str(err),
-            # )
 
     def _xielu_python(self, x: torch.Tensor) -> torch.Tensor:
         alpha_p = nn.functional.softplus(self.alpha_p)

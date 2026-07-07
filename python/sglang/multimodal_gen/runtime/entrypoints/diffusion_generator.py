@@ -54,7 +54,6 @@ from sglang.multimodal_gen.runtime.utils.trace_wrapper import (
 
 logger = init_logger(__name__)
 
-# TODO: move to somewhere appropriate
 try:
     # Set the start method to 'spawn' to avoid CUDA errors in forked processes.
     # This must be done at the top level of the module, before any CUDA context

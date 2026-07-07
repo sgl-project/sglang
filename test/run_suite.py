@@ -70,10 +70,10 @@ PER_COMMIT_SUITES = {
         "base-b-test-1-gpu-large",
         "base-b-test-2-gpu-large",
         "base-b-test-4-gpu-b200",
-        "base-b-kernel-unit-1-gpu-large",
-        "base-b-kernel-unit-1-gpu-b200",
-        "base-b-kernel-unit-8-gpu-h200",
-        "base-b-kernel-benchmark-1-gpu-large",
+        "base-b-kernel-unit-test-1-gpu-large",
+        "base-b-kernel-unit-test-4-gpu-b200",
+        "base-b-kernel-unit-test-8-gpu-h200",
+        "base-b-kernel-benchmark-test-1-gpu-large",
         "base-c-test-4-gpu-h100",
         "base-c-test-4-gpu-b200",
         "base-c-test-4-gpu-gb300",
@@ -131,7 +131,6 @@ NIGHTLY_SUITES = {
         # GB300 (4x GB300 NVL4) nightly suites
         "nightly-4-gpu-gb300",
         "nightly-4-gpu-gb300-deepseek-v4-pro-fp4",
-        "nightly-4-gpu-gb300-glm5-fp8",
         "nightly-4-gpu-gb300-glm5-nvfp4",
         "nightly-4-gpu-gb300-kimi-k25",
         "nightly-4-gpu-gb300-kimi-k25-nvfp4",
@@ -170,7 +169,11 @@ NIGHTLY_SUITES = {
         "full-8-npu-a3",
         "full-16-npu-a3",
     ],
-    HWBackend.XPU: [],
+    HWBackend.XPU: [
+        "nightly-xpu-1-gpu",
+        "nightly-xpu-2-gpu",
+        "nightly-xpu-4-gpu",
+    ],
 }
 
 

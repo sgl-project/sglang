@@ -88,6 +88,129 @@ sglang generate --model-path krea/Krea-2-Turbo \
 
 ### 4.2 Advanced Usage
 
+#### 4.2.1 Cache-DiT Acceleration
+
+SGLang integrates [Cache-DiT](https://github.com/vipshop/cache-dit), a caching acceleration engine for Diffusion Transformers (DiT), to speed up inference with minimal quality loss. Enable it by setting `SGLANG_CACHE_DIT_ENABLED=true`. For more details, see the SGLang Cache-DiT [documentation](/docs/sglang-diffusion/cache_dit).
+
+Cache-DiT works for **both** Krea-2 variants with no extra configuration: SGLang tracks each request's classifier-free-guidance mode, so Krea-2-Turbo (no CFG, `guidance_scale = 1.0`) and Krea-2-Raw (CFG, `guidance_scale ≈ 4.5`) both cache correctly and automatically.
+
+**Basic Usage**
+
+```bash Command
+SGLANG_CACHE_DIT_ENABLED=true sglang serve \
+  --model-path krea/Krea-2-Turbo \
+  --num-gpus 1 \
+  --port 30000
+```
+
+Measured per-image denoise speedup with the default cache settings (NVIDIA H200, 1024x1024, seed 0):
+
+| Variant | Inference steps | Denoise (no cache → cache) | Speedup |
+| :--- | :--- | :--- | :--- |
+| Krea-2-Turbo (no CFG) | 8 | 1.27s → 0.92s | ~1.4x |
+| Krea-2-Raw (CFG 4.5) | 50 | 18.0s → 6.3s | ~2.9x |
+
+Caching has the most headroom on Raw's longer schedule; the 8-step distilled Turbo has only a few cacheable steps after warmup.
+
+**Advanced Usage**
+
+- DBCache Parameters: DBCache controls block-level caching behavior:
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "25.0%"}} />
+    <col style={{width: "25.0%"}} />
+    <col style={{width: "25.0%"}} />
+    <col style={{width: "25.0%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Parameter</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Env Variable</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Default</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Fn</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`SGLANG_CACHE_DIT_FN`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>1</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Number of first blocks to always compute</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Bn</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`SGLANG_CACHE_DIT_BN`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>0</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Number of last blocks to always compute</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>W</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`SGLANG_CACHE_DIT_WARMUP`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>4</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Warmup steps before caching starts</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>R</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`SGLANG_CACHE_DIT_RDT`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>0.24</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Residual difference threshold</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>MC</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`SGLANG_CACHE_DIT_MC`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>3</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Maximum continuous cached steps</td>
+    </tr>
+  </tbody>
+</table>
+- TaylorSeer Configuration: TaylorSeer improves caching accuracy using Taylor expansion (best suited to the longer Raw schedule; not recommended for the 8-step Turbo):
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "25.0%"}} />
+    <col style={{width: "25.0%"}} />
+    <col style={{width: "25.0%"}} />
+    <col style={{width: "25.0%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Parameter</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Env Variable</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Default</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Enable</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`SGLANG_CACHE_DIT_TAYLORSEER`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>false</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable TaylorSeer calibrator</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Order</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`SGLANG_CACHE_DIT_TS_ORDER`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>1</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Taylor expansion order (1 or 2)</td>
+    </tr>
+  </tbody>
+</table>
+
+  Combined Configuration Example (Krea-2-Raw, default cache settings shown explicitly):
+
+```bash Command
+SGLANG_CACHE_DIT_ENABLED=true \
+SGLANG_CACHE_DIT_FN=1 \
+SGLANG_CACHE_DIT_BN=0 \
+SGLANG_CACHE_DIT_WARMUP=4 \
+SGLANG_CACHE_DIT_RDT=0.24 \
+SGLANG_CACHE_DIT_MC=3 \
+sglang serve --model-path krea/Krea-2-Raw
+```
+
+#### 4.2.2 Memory & CPU Offload
+
 Krea-2's DiT is ~24 GB in bf16 (the bulk of the model). On memory-constrained GPUs you can keep less of it resident:
 
 - `--dit-layerwise-offload`: stream the DiT's transformer blocks layer-by-layer with async host-to-device prefetch overlap, so only a small working set stays on the GPU. This is the primary way to fit Krea-2 on a single consumer / 32 GB-class card, at a modest latency cost. Tune the memory/latency trade-off with `--dit-offload-prefetch-size` (`0.0` prefetches one layer for the lowest memory; larger values prefetch more layers -- faster but more memory).

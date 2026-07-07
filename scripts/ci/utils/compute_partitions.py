@@ -35,7 +35,7 @@ HWBackend = _ci_register.HWBackend
 # pr-test-amd.yml / pr-test-npu.yml have their own dispatch.
 _TARGET_BACKENDS = {HWBackend.CUDA, HWBackend.CPU}
 
-# base-a is the critical-path entry gate; pin its fanout to smoke-coverage
+# base-a is the critical-path entry gate; pin its fanout to sanity-coverage
 # defaults instead of est_time. max_parallel = size (no throttle).
 _BASE_A_OVERRIDES = {
     "base-a-test-cpu": 8,

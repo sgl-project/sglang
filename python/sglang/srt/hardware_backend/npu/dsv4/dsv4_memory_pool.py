@@ -356,6 +356,15 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             page_size=self.swa_page_size,
         )
 
+    def clear_unaccepted_c128_draft_states(
+        self,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        accept_lens: torch.Tensor,
+        num_draft_tokens: int,
+    ) -> None:
+        pass
+
     def _make_indexer_pool(
         self,
         size: int,

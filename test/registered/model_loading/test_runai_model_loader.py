@@ -1,7 +1,7 @@
 import unittest
 
 import sglang as sgl
-from sglang.srt.environ import temp_set_env
+from sglang.srt.utils.common import temp_set_env
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 

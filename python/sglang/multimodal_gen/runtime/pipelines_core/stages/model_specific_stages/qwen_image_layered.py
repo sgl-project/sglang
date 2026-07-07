@@ -579,7 +579,6 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
         # 5. Prepare timesteps
         scheduler = self.scheduler
         sigmas = np.linspace(1.0, 0, num_inference_steps + 1)[:-1]
-        image_seq_len = latents.shape[1]
         base_seqlen = 256 * 256 / 16 / 16
         mu = (image_latents.shape[1] / base_seqlen) ** 0.5
         timesteps, num_inference_steps = retrieve_timesteps(
@@ -594,8 +593,6 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
         negative_txt_seq_lens = _seq_lens_from_optional_mask(
             negative_prompt_embeds, negative_prompt_embeds_mask
         )
-        is_rgb = torch.tensor([0]).to(device=device, dtype=torch.long)
-
         batch.prompt_embeds = [prompt_embeds]
         batch.prompt_embeds_mask = [prompt_embeds_mask]
         batch.prompt_seq_lens = [txt_seq_lens]

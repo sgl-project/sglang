@@ -73,8 +73,8 @@ Parameters: `est_time` (seconds), `stage` + `runner_config` (target stage and ru
 Keep `est_time`, `stage`, `runner_config` as **literal values** — `run_suite.py` collects them by AST parsing.
 
 JIT kernel correctness tests and benchmarks live under `test/registered/jit/`, same as other registered tests (their helpers stay alongside the kernel source under `python/sglang/jit_kernel/` and are imported by absolute path):
-- Correctness tests: `test/registered/jit/test_*.py` → `base-b-kernel-unit-1-gpu-large`
-- Benchmarks: `test/registered/jit/benchmark/bench_*.py` → `base-b-kernel-benchmark-1-gpu-large`
+- Correctness tests: `test/registered/jit/test_*.py` → `base-b-kernel-unit-test-1-gpu-large`
+- Benchmarks: `test/registered/jit/benchmark/bench_*.py` → `base-b-kernel-benchmark-test-1-gpu-large`
 
 ## Choosing a Suite
 
@@ -85,8 +85,8 @@ Use the lightest suite that meets your test's needs. Full suite tables are in th
 | No GPU required | `base-a-test-cpu` |
 | Small GPU (fits 5090, 32GB) | `base-b-test-1-gpu-small` (most tests go here) |
 | Large GPU memory or Hopper features | `base-b-test-1-gpu-large` |
-| JIT kernel correctness | `base-b-kernel-unit-1-gpu-large` |
-| JIT kernel benchmarks | `base-b-kernel-benchmark-1-gpu-large` |
+| JIT kernel correctness | `base-b-kernel-unit-test-1-gpu-large` |
+| JIT kernel benchmarks | `base-b-kernel-benchmark-test-1-gpu-large` |
 | Multi-GPU (2/4/8) | `base-b-test-2-gpu-large`, `base-c-test-*` |
 | Long-running or experimental | `nightly-*` suites |
 

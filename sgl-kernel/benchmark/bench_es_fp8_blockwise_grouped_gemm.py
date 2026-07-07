@@ -79,9 +79,6 @@ def bench_es(
     b_tensors = []
     a_scales_tensors = []
     b_scales_tensors = []
-    if False:
-        print("Token Distributtion: ", group_ms[0:num_groups])
-        print("Token Count: ", sum(group_ms[0:num_groups]))
     for g in range(num_groups):
         m_g = group_ms[g]
         expert_offsets[g + 1] = expert_offsets[g] + m_g

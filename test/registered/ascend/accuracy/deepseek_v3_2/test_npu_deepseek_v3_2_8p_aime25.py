@@ -25,6 +25,10 @@ OTHER_ARGS = [
     "--quantization",
     "modelslim",
     "--disable-radix-cache",
+    "--reasoning-parser",
+    "deepseek-v3",
+    "--tool-call-parser",
+    "deepseekv32",
 ]
 
 

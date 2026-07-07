@@ -42,8 +42,7 @@ RUN source /opt/.venv/bin/activate && \
     uv pip install . && \
     cd ../sgl-kernel && \
     cp pyproject_cpu.toml pyproject.toml && \
-    uv pip install . && \
-    uv pip install pytest
+    uv pip install .
 
 ENV SGLANG_USE_CPU_ENGINE=1
 ENV LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc.so.4:/usr/lib/x86_64-linux-gnu/libtbbmalloc.so:/opt/.venv/lib/libiomp5.so

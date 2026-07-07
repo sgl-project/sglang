@@ -801,13 +801,9 @@ class _DetailAccumulator(_UtilizationRateAccumulatorMixin):
         self._records = []
 
     def get_single_pass_gatherer_keys(self):
-        if False:  # TODO `server_args.enable_two_batch_overlap`
-            return [_SINGLE_PASS_GATHERER_KEY_PRIMARY, "child_a", "child_b"]
         return super().get_single_pass_gatherer_keys()
 
     def get_single_pass_gatherer_key(self, debug_name: Optional[str]):
-        if False:  # TODO `server_args.enable_two_batch_overlap`
-            return debug_name or _SINGLE_PASS_GATHERER_KEY_PRIMARY
         return super().get_single_pass_gatherer_key(debug_name)
 
     def append(

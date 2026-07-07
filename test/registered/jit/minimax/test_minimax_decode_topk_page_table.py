@@ -25,7 +25,7 @@ from sglang.srt.layers.attention.minimax_sparse_ops.decode.topk_sparse import (
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=25, suite="base-b-kernel-unit-1-gpu-b200")
+register_cuda_ci(est_time=25, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 dev = "cuda"
 

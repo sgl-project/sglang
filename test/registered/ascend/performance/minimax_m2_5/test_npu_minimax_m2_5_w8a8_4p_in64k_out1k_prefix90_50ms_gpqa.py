@@ -86,6 +86,10 @@ MINIMAX_M2_5_W8A8_4P_IN64K_OUT1K_PREFIX90_OTHER_ARGS = [
     "--dtype",
     "bfloat16",
     "--trust-remote-code",
+    "--reasoning-parser",
+    "minimax-append-think",
+    "--tool-call-parser",
+    "minimax-m2",
 ]
 
 
@@ -106,7 +110,7 @@ class TestNPUMiniMaxM2_5W8A8_4P_In64k_Out1k_Prefix90_50ms(
     random_range_ratio = 1
     repeat_rate = 0.9
     tpot = 50
-    output_token_throughput = 390.5839
+    output_token_throughput = 390.5859
     request_rate = float("inf")
 
     def test_npu_minimax_m2_5_w8a8_4p_in64k_out1k_prefix90_50ms(self):
@@ -122,7 +126,7 @@ class TestNPUMiniMaxM2_5_W8A8_4P_In3k5_Out1k5_GPQA(TestNpuAccuracyTestCaseBase):
     datasets = ["gpqa_diamond"]
     few_shot_num = 0
     generation_config = {"max_tokens": 65536, "temperature": 1.0}
-    max_concurrency = 64
+    eval_batch_size = 64
 
     def test_accuracy(self):
         self.run_accuracy()
