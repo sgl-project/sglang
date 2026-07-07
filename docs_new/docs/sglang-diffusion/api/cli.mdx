@@ -110,6 +110,13 @@ For quantized transformer checkpoints, prefer:
 
 See [Quantization](../quantization) for supported quantization families and examples.
 
+### Request logging
+
+- `--log-requests`: Log user-facing fields of all requests (default: `False`). The verbosity is decided by `--log-requests-level`.
+- `--log-requests-level &#123;0|1|2|3&#125;`: Verbosity level for request logging (default: `2`). 0: Log metadata (request id). 1: Log metadata and sampling config (seed, steps, guidance, resolution, frames, fps, ...). 2: Log metadata, sampling config and prompt (truncated to 2 KiB). 3: Log metadata, sampling config and full prompt.
+- `--log-requests-format &#123;text|json&#125;`: Format for request logging (default: `text`). `text` is human-readable; `json` outputs structured JSON lines.
+- `--log-requests-target &#123;TARGET...&#125;`: Target(s) for request logging. Use `stdout` for console output and/or directory path(s) for file output. Can specify multiple targets, e.g., `--log-requests-target stdout /my/log/dir`.
+
 ## Configuration Files
 
 Use `--config` to load JSON or YAML configuration. Command-line flags override values from the config file.
