@@ -46,5 +46,6 @@ class TestAscendW4A4(GSM8KAscendMixin, CustomTestCase):
     output_throughput = 1000  # GSM8K output throughput ≥1000 tokens/s
     gsm8k_parallel = 64
 
+
 if __name__ == "__main__":
     unittest.main()
