@@ -552,11 +552,46 @@ class MoriKVManager(CommonKVManager):
             return None
         return payload
 
+    def _handle_abort_message(self, msg: List[bytes]) -> None:
+        """Decode-side abort notification (CommonKVReceiver._send_abort_notification):
+        mark the room as failed and ACK, mirroring MooncakeKVManager's handling."""
+        room_to_be_aborted = int(msg[1].decode("ascii"))
+        decode_ip = msg[2].decode("ascii")
+        decode_port = int(msg[3].decode("ascii"))
+        if (
+            room_to_be_aborted in self.request_status
+            and self.check_status(room_to_be_aborted) != KVPoll.Success
+        ):
+            self.update_status(room_to_be_aborted, KVPoll.Failed)
+            logger.debug(
+                "Received abort notification for room %s, marked as Failed",
+                room_to_be_aborted,
+            )
+        else:
+            logger.debug(
+                "Received abort notification for room %s, "
+                "ignoring (already completed or unknown)",
+                room_to_be_aborted,
+            )
+        try:
+            na = NetworkAddress(decode_ip, decode_port)
+            sock = self._connect_threadsafe(na.to_tcp(), is_ipv6=na.is_ipv6)
+            sock.send_multipart(
+                [b"ABORT_ACK", str(room_to_be_aborted).encode("ascii")]
+            )
+        except Exception:
+            logger.debug(
+                "Failed to send ABORT_ACK for room %s", room_to_be_aborted
+            )
+
     def _start_bootstrap_thread(self) -> None:
         def bootstrap_worker():
             while True:
                 try:
                     msg = self.server_socket.recv_multipart()
+                    if msg and msg[0] == b"ABORT":
+                        self._handle_abort_message(msg)
+                        continue
                     payload = self._validate_message(msg)
                     if payload is None:
                         continue
@@ -587,6 +622,14 @@ class MoriKVManager(CommonKVManager):
                     msg = self.server_socket.recv_multipart()
                     if msg and msg[0] == MoriKVManager.AUX_DATA_HEADER:
                         self._handle_aux_data(msg)
+                        continue
+
+                    if msg and msg[0] == b"ABORT_ACK":
+                        # Prefill acknowledges abort notification.
+                        logger.debug(
+                            "Received ABORT_ACK for room %s",
+                            msg[1].decode("ascii"),
+                        )
                         continue
 
                     if not msg or msg[0] != MORI_GUARD:
