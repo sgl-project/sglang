@@ -76,6 +76,9 @@ MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP = 2
 MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP_LAZY = 1
 MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_OVERLAP = 1
 
+# KV budget kept when the DeepEP reservation exceeds it (partial-reserve floor).
+_DEEPEP_MIN_KV_BUDGET_GIB = 1.0
+
 logger = logging.getLogger(__name__)
 
 
@@ -160,15 +163,32 @@ class ModelRunnerKVCacheMixin:
             )
             return rest_memory
         reserve_gib = plan.reserve_mib / 1024
-        if rest_memory - reserve_gib <= 0:
+        affordable_gib = rest_memory - _DEEPEP_MIN_KV_BUDGET_GIB
+        if affordable_gib <= 0:
             raise ValueError(
-                f"DeepEP auto mem reserve ({reserve_gib:.2f} GiB for "
-                f"num_max<={plan.ceiling}: buffer {plan.rdma_mib / 1024:.2f} GiB "
-                f"+ capture {plan.capture_mib / 1024:.2f} GiB) leaves no GPU "
-                f"memory for the KV cache ({rest_memory:.2f} GiB before the "
-                f"reservation). Set --mem-fraction-static, or lower "
-                f"SGLANG_DEEPEP_MAX_RESERVE_FRACTION / --max-running-requests."
+                f"DeepEP auto mem reserve: the KV budget is only "
+                f"{rest_memory:.2f} GiB before reserving anything for the "
+                f"low_latency buffer + capture "
+                f"({plan.rdma_mib / 1024:.2f} + {plan.capture_mib / 1024:.2f} GiB "
+                f"estimated). Set --mem-fraction-static higher, or lower "
+                f"--max-running-requests."
             )
+        if reserve_gib > affordable_gib:
+            # The capture estimate is deliberately conservative; a partial
+            # reserve usually still captures fine, so degrade instead of
+            # refusing to serve. The post-capture headroom check reports if it
+            # was genuinely short.
+            logger.warning(
+                "DeepEP auto mem reserve %.2f GiB exceeds the available KV "
+                "budget (%.2f GiB); reserving %.2f GiB and keeping %.1f GiB of "
+                "KV cache. Capture may run close to the limit — set "
+                "--mem-fraction-static if it OOMs.",
+                reserve_gib,
+                rest_memory,
+                affordable_gib,
+                _DEEPEP_MIN_KV_BUDGET_GIB,
+            )
+            reserve_gib = affordable_gib
         logger.info(
             "DeepEP auto mem reserve: num_max<=%d buffer=%.2f GiB "
             "capture=%.2f GiB slack=%.2f GiB; KV budget %.2f -> %.2f GiB",

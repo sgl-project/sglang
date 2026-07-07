@@ -377,6 +377,46 @@ class TestDeepEPResolveNumMax(unittest.TestCase):
 
 
 @unittest.skipUnless(_HAS_MODEL_RUNNER, "model_runner not importable")
+class TestDeepEPKvBudgetReserve(unittest.TestCase):
+    """_reserve_deepep_capacity subtracts the plan from the KV budget in GiB."""
+
+    def _reserve(self, plan, rest_gib):
+        runner = SimpleNamespace(deepep_capacity_plan=plan)
+        return ModelRunnerKVCacheMixin._reserve_deepep_capacity(runner, rest_gib)
+
+    def test_passthrough_without_plan(self):
+        self.assertEqual(self._reserve(None, 40.0), 40.0)
+
+    def test_passthrough_for_static_plan(self):
+        plan = _plan(ceiling=128, auto_sized=False)
+        self.assertEqual(self._reserve(plan, 40.0), 40.0)
+
+    def test_zero_reserve_keeps_budget(self):
+        plan = _plan(ceiling=1024)
+        plan.reserve_mib = 0.0
+        self.assertEqual(self._reserve(plan, 40.0), 40.0)
+
+    def test_reserve_subtracted(self):
+        plan = _plan(ceiling=1024)
+        plan.reserve_mib = 8 * 1024
+        self.assertAlmostEqual(self._reserve(plan, 40.0), 32.0)
+
+    def test_oversized_reserve_degrades_to_kv_floor(self):
+        # The capture estimate is conservative; when it exceeds the budget the
+        # reserve degrades to what is affordable (keeping the KV floor) instead
+        # of refusing to serve a config that would in fact capture fine.
+        plan = _plan(ceiling=128)
+        plan.reserve_mib = 18 * 1024
+        self.assertAlmostEqual(self._reserve(plan, 16.5), 1.0)
+
+    def test_exhausted_budget_raises(self):
+        plan = _plan(ceiling=128)
+        plan.reserve_mib = 18 * 1024
+        with self.assertRaisesRegex(ValueError, "KV budget"):
+            self._reserve(plan, 0.8)
+
+
+@unittest.skipUnless(_HAS_MODEL_RUNNER, "model_runner not importable")
 class TestDeepEPConcurrencyClamp(unittest.TestCase):
     """_clamp_deepep_low_latency_concurrency caps + EP-group-syncs concurrency."""
 
