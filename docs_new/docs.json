@@ -1019,6 +1019,12 @@
                     ]
                   },
                   {
+                    "group": "Meituan",
+                    "pages": [
+                      "cookbook/autoregressive/Meituan/LongCat-2.0"
+                    ]
+                  },
+                  {
                     "group": "Google",
                     "pages": [
                       "cookbook/autoregressive/Google/Gemma4",

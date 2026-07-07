@@ -287,6 +287,9 @@ class Envs:
     # page tables (DP attn); paged backends like trtllm_mha consume it directly.
     SGLANG_USE_HND_KVCACHE = EnvBool(False)
 
+    # size the KV pool after CUDA-graph capture
+    SGLANG_ENABLE_POST_CAPTURE_KV_SIZING = EnvBool(False)
+
     # Scheduler: memory leak test
     SGLANG_TEST_RETRACT = EnvBool(False)
     SGLANG_TEST_RETRACT_INTERVAL = EnvInt(3)
@@ -822,6 +825,7 @@ class Envs:
 
     # Set False when using FP4-to-FP8 converted DeepSeek V4 checkpoint.
     SGLANG_DSV4_FP4_EXPERTS = EnvBool(True)
+    SGLANG_DSV4_FP4_DEQUANT = EnvBool(False)
     # Default reasoning_effort for dsv4 chat encoder when request doesn't set it.
     # Accepts "", "max", "high" (empty string means unset); other values filtered to None.
     SGLANG_DSV4_REASONING_EFFORT = EnvStr("")
