@@ -871,6 +871,223 @@ class TestDSparkPrefillHandoff(CustomTestCase):
             )
 
 
+class TestDSparkRuntimeDebugEvidence(CustomTestCase):
+    def setUp(self):
+        try:
+            import torch
+
+            from sglang.srt.speculative.dspark_info import DSparkDraftInputV2
+            from sglang.srt.speculative.dspark_worker_v2 import DSparkWorkerV2
+        except Exception as e:  # pragma: no cover - GPU-only deps on some runners
+            self.skipTest(f"dspark worker unavailable on this runner: {e}")
+        self.torch = torch
+        self.worker_cls = DSparkWorkerV2
+        self.draft_input_cls = DSparkDraftInputV2
+
+    def _worker(self):
+        worker = self.worker_cls.__new__(self.worker_cls)
+        worker.device = self.torch.device("cpu")
+        worker._accept_anomaly_enabled = True
+        worker._swa_write_source_by_req_pool = {}
+        worker._swa_write_source_snapshot_by_req_pool = None
+        worker._prefill_tail_replay_debug_by_req_pool = {}
+        worker._target_aux_debug_by_req_pool = {}
+        worker._is_tp0 = lambda: True
+        return worker
+
+    def test_target_aux_payload_splits_raw_target_layers_and_norm_summaries(self):
+        t = self.torch
+        worker = self._worker()
+        worker._draft_inner = SimpleNamespace(
+            target_layer_ids=[2, 5],
+            hidden_size=3,
+            main_norm=SimpleNamespace(weight=t.tensor([1.0, 2.0, 3.0])),
+            shared_head=SimpleNamespace(
+                norm=SimpleNamespace(weight=t.tensor([4.0, 5.0, 6.0]))
+            ),
+        )
+        raw = t.arange(12, dtype=t.float32).view(2, 6)
+        projected = raw[:, :3] + 1.0
+
+        payload = self.worker_cls._target_aux_payload(
+            worker,
+            raw_hidden_rows=raw,
+            projected_rows=projected,
+        )
+
+        self.assertEqual(payload["target_layer_ids"], [2, 5])
+        self.assertEqual(payload["decoder_layer_ids"], [2, 5])
+        self.assertEqual(payload["raw"]["shape"], [2, 6])
+        self.assertEqual(payload["projected"]["shape"], [2, 3])
+        self.assertEqual([x["target_layer_id"] for x in payload["raw_layers"]], [2, 5])
+        self.assertEqual(payload["raw_layers"][0]["hidden"]["shape"], [2, 3])
+        self.assertEqual(payload["main_norm_weight"]["shape"], [3])
+        self.assertEqual(payload["shared_norm_weight"]["shape"], [3])
+        self.assertGreater(payload["projected_to_raw_norm_ratio_first_last"][0], 0.0)
+
+    def test_target_aux_payload_reports_expected_width_on_shape_mismatch(self):
+        t = self.torch
+        worker = self._worker()
+        worker._draft_inner = SimpleNamespace(
+            target_layer_ids=[1, 3],
+            hidden_size=4,
+            main_norm=None,
+            shared_head=None,
+        )
+
+        payload = self.worker_cls._target_aux_payload(
+            worker,
+            raw_hidden_rows=t.ones((2, 7)),
+            projected_rows=t.ones((2, 4)),
+        )
+
+        self.assertEqual(payload["expected_raw_width"], 8)
+        self.assertNotIn("raw_layers", payload)
+        self.assertIsNone(payload["main_norm_weight"])
+        self.assertIsNone(payload["shared_norm_weight"])
+
+    def test_boundary_loc_payload_translates_full_cache_locs_to_swa_locs(self):
+        t = self.torch
+        worker = self._worker()
+
+        class _TokenToKVPool:
+            def translate_loc_from_full_to_swa(self, locs):
+                return locs + 100
+
+        worker.draft_model_runner = SimpleNamespace(
+            attn_backend=SimpleNamespace(token_to_kv_pool=_TokenToKVPool())
+        )
+
+        payload = self.worker_cls._boundary_loc_payload(
+            worker,
+            positions=t.tensor([10, 11], dtype=t.int32),
+            cache_locs=t.tensor([3, 4], dtype=t.int32),
+            hidden_rows=t.tensor([[1.0, -2.0], [3.0, 4.0]]),
+        )
+
+        self.assertEqual(payload["positions"], [10, 11])
+        self.assertEqual(payload["full_locs"], [3, 4])
+        self.assertEqual(payload["swa_locs"], [103, 104])
+        self.assertEqual(payload["hidden"]["shape"], [2, 2])
+        self.assertEqual(payload["hidden"]["max_abs"], 4.0)
+
+    def test_swa_write_source_tracks_tail_window_and_visible_counts(self):
+        worker = self._worker()
+
+        self.worker_cls._record_swa_locs_source(
+            worker,
+            req_pool_idx=7,
+            swa_locs=list(range(600)),
+            source="prefill_source",
+        )
+        self.assertLessEqual(len(worker._swa_write_source_by_req_pool[7]), 256)
+
+        self.worker_cls._record_swa_locs_source(
+            worker,
+            req_pool_idx=7,
+            swa_locs=[590, 591, 700],
+            source="decode_verify_write",
+        )
+        source_debug = self.worker_cls._visible_window_source_debug(
+            worker,
+            7,
+            [588, 589, 590, 591, 700, 701],
+        )
+
+        self.assertEqual(source_debug["visible_len"], 6)
+        self.assertEqual(source_debug["counts"]["prefill_source"], 2)
+        self.assertEqual(source_debug["counts"]["decode_verify_write"], 3)
+        self.assertEqual(source_debug["counts"]["unknown"], 1)
+
+    def test_record_full_cache_locs_source_uses_swa_translation(self):
+        t = self.torch
+        worker = self._worker()
+
+        class _TokenToKVPool:
+            def translate_loc_from_full_to_swa(self, locs):
+                return locs + 10
+
+        worker.draft_model_runner = SimpleNamespace(
+            attn_backend=SimpleNamespace(token_to_kv_pool=_TokenToKVPool())
+        )
+
+        self.worker_cls._record_full_cache_locs_source(
+            worker,
+            req_pool_idx=3,
+            cache_locs=t.tensor([1, 2, 3], dtype=t.int32),
+            source="decode_verify_write",
+        )
+
+        self.assertEqual(
+            worker._swa_write_source_by_req_pool[3],
+            {
+                11: "decode_verify_write",
+                12: "decode_verify_write",
+                13: "decode_verify_write",
+            },
+        )
+
+    def test_prefill_tail_replay_debug_records_payload_shape_and_mask_counts(self):
+        t = self.torch
+        worker = self._worker()
+        draft_input = self.draft_input_cls(
+            bonus_tokens=t.tensor([10, 11], dtype=t.int64),
+            new_seq_lens=t.tensor([100, 101], dtype=t.int64),
+            prefill_tail_hidden_states=t.zeros((2, 3, 4)),
+            prefill_tail_valid_mask=t.tensor(
+                [[True, False, True], [False, False, False]]
+            ),
+        )
+
+        self.worker_cls._init_prefill_tail_replay_round_debug(
+            worker,
+            req_pool_indices=t.tensor([5, 6], dtype=t.int64),
+            draft_input=draft_input,
+        )
+
+        first = worker._prefill_tail_replay_debug_by_req_pool[5]
+        second = worker._prefill_tail_replay_debug_by_req_pool[6]
+        self.assertTrue(first["round_has_payload"])
+        self.assertEqual(first["mask_valid_count"], 2)
+        self.assertEqual(first["hidden_shape"], [2, 3, 4])
+        self.assertEqual(second["mask_valid_count"], 0)
+        self.assertEqual(second["skip_reason"], "empty_mask_row")
+
+    def test_markov_debug_payload_maps_candidate_indices_to_markov_steps(self):
+        t = self.torch
+        worker = self._worker()
+        worker._draft_inner = SimpleNamespace(
+            shared_head=SimpleNamespace(norm=SimpleNamespace(weight=t.ones(4)))
+        )
+        worker._last_markov_refine_debug = {
+            "base_top1": t.tensor([[10, 11, 12]]),
+            "base_top1_logit": t.tensor([[1.0, 2.0, 3.0]]),
+            "hidden_norm": t.tensor([[2.0, 2.0, 2.0]]),
+            "hidden_abs_mean": t.tensor([[0.5, 0.5, 0.5]]),
+            "hidden_cos_adjacent": t.tensor([[0.1, 0.2]]),
+            "markov_top1": t.tensor([[20, 30, 40]]),
+            "prev_tokens": t.tensor([[9, 20, 30]]),
+        }
+        candidates = t.tensor([[9, 20, 30, 40]], dtype=t.int64)
+        target_predict = t.tensor([[20, 99, 40, 77]], dtype=t.int64)
+        confidence = t.tensor([[1.0, 2.0, 3.0]])
+
+        payload = self.worker_cls._build_accept_anomaly_markov_debug(
+            worker,
+            row_idx=0,
+            candidates=candidates,
+            target_predict=target_predict,
+            confidence=confidence,
+        )
+
+        self.assertIn("candidate0 is verify anchor", payload["layout"])
+        self.assertEqual(payload["markov_top1_first"], [20, 30, 40])
+        self.assertEqual(payload["candidates_first"], [9, 20, 30, 40])
+        self.assertTrue(payload["markov0_eq_target0"])
+        self.assertTrue(payload["candidate1_eq_markov0"])
+        self.assertEqual(payload["candidate_target_hits"][0]["target_hit_indices"], [0])
+
+
 class TestDSparkDeepSpecSemanticReference(CustomTestCase):
     def setUp(self):
         try:
@@ -919,6 +1136,63 @@ class TestDSparkDeepSpecSemanticReference(CustomTestCase):
         sglang_k = t.cat([materialized_k_cache, k_block], dim=1)
         sglang_v = t.cat([materialized_v_cache, v_block], dim=1)
         sglang_out = attention(q_block, sglang_k, sglang_v)
+
+        self.assertTrue(t.equal(deepspec_out, sglang_out))
+
+    def test_materialized_context_matches_concat_with_batch_masked_windows(self):
+        # A stronger local proxy for the runtime invariant: each request may
+        # expose a different context window, but materialized K/V rows must be
+        # exactly the same rows that DeepSpec would concatenate before block
+        # attention.
+        t = self.torch
+        t.manual_seed(1)
+        batch_size = 2
+        context_len = 5
+        block_size = 4
+        hidden_size = 6
+        head_dim = 6
+
+        context_hidden = t.randn(batch_size, context_len, hidden_size)
+        block_hidden = t.randn(batch_size, block_size, hidden_size)
+        wq = t.randn(hidden_size, head_dim)
+        wk = t.randn(hidden_size, head_dim)
+        wv = t.randn(hidden_size, head_dim)
+        visible_context = t.tensor(
+            [
+                [False, True, True, True, True],
+                [False, False, True, True, True],
+            ],
+            dtype=t.bool,
+        )
+        causal = t.tril(t.ones((block_size, block_size), dtype=t.bool))
+
+        def masked_attention(q, k, v, mask):
+            scores = q @ k.transpose(-1, -2) / (head_dim**0.5)
+            scores = scores.masked_fill(~mask, float("-inf"))
+            return t.softmax(scores, dim=-1) @ v
+
+        q_block = block_hidden @ wq
+        k_context = context_hidden @ wk
+        v_context = context_hidden @ wv
+        k_block = block_hidden @ wk
+        v_block = block_hidden @ wv
+
+        deepspec_k = t.cat([k_context, k_block], dim=1)
+        deepspec_v = t.cat([v_context, v_block], dim=1)
+        full_mask = t.cat(
+            [
+                visible_context[:, None, :].expand(-1, block_size, -1),
+                causal[None, :, :].expand(batch_size, -1, -1),
+            ],
+            dim=-1,
+        )
+        deepspec_out = masked_attention(q_block, deepspec_k, deepspec_v, full_mask)
+
+        materialized_k_cache = k_context.clone()
+        materialized_v_cache = v_context.clone()
+        sglang_k = t.cat([materialized_k_cache, k_block], dim=1)
+        sglang_v = t.cat([materialized_v_cache, v_block], dim=1)
+        sglang_out = masked_attention(q_block, sglang_k, sglang_v, full_mask)
 
         self.assertTrue(t.equal(deepspec_out, sglang_out))
 
