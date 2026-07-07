@@ -3085,10 +3085,6 @@ class DSATokenToKVPool(MLATokenToKVPool):
                     #     data: for page i,
                     #         * buf[i, :page_size * head_dim] for fp8 data
                     #         * buf[i, page_size * head_dim:].view(float32) for scale
-                    # skip_topk (index-share) layers never run the indexer
-                    # (should_run_indexer gates both store and read), so their
-                    # index-K is allocated with 0 pages -- kept in the list so
-                    # every `[layer_id]` access still resolves.
                     (0 if self.skip_topk_layers[i] else num_pages, cols),
                     dtype=self.index_k_with_scale_buffer_dtype,
                     device=device,

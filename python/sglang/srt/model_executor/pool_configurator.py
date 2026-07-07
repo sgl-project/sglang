@@ -210,11 +210,6 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 element_size = torch._utils._element_size(
                     DSATokenToKVPool.index_k_with_scale_buffer_dtype
                 )
-                # skip_topk (index-share) layers get a 0-page index-K buffer
-                # (see DSATokenToKVPool), so only non-skip layers cost bytes
-                # here. HiSparse keeps a full-size indexer buffer per layer
-                # regardless of skip_topk (its own device/host ratio sizing),
-                # so it still charges every layer.
                 if mr.enable_hisparse:
                     num_indexer_layers = num_layers
                 else:
