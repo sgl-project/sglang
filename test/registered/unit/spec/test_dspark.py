@@ -1297,6 +1297,134 @@ class TestDSparkRuntimeDebugEvidence(CustomTestCase):
         )
         self.assertTrue(t.equal(call["main_hidden"], expected_hidden))
 
+    def test_prefill_tail_replay_skips_when_positions_are_negative(self):
+        t = self.torch
+        worker = self._worker()
+        materialize_calls = []
+        worker._materialize_main_hidden_to_draft_state = lambda **kwargs: (
+            materialize_calls.append(kwargs)
+        )
+        worker.model_runner = SimpleNamespace(
+            req_to_token_pool=SimpleNamespace(
+                req_to_token=t.arange(16, dtype=t.int64).view(1, 16)
+            )
+        )
+        draft_input = self.draft_input_cls(
+            bonus_tokens=t.tensor([0], dtype=t.int64),
+            new_seq_lens=t.tensor([1], dtype=t.int64),
+            prefill_tail_hidden_states=t.ones((1, 4, 3)),
+            prefill_tail_valid_mask=t.ones((1, 4), dtype=t.bool),
+        )
+
+        self.worker_cls._materialize_prefill_tail_hidden_to_draft_state(
+            worker,
+            draft_input=draft_input,
+            batch=SimpleNamespace(req_pool_indices=t.tensor([0], dtype=t.int64)),
+            prefix_lens=t.tensor([1], dtype=t.int64),
+        )
+
+        self.assertEqual(materialize_calls, [])
+
+    def test_prefill_tail_replay_skips_when_cache_locs_are_invalid(self):
+        t = self.torch
+        worker = self._worker()
+        materialize_calls = []
+        worker._materialize_main_hidden_to_draft_state = lambda **kwargs: (
+            materialize_calls.append(kwargs)
+        )
+        worker.model_runner = SimpleNamespace(
+            req_to_token_pool=SimpleNamespace(
+                req_to_token=t.full((1, 8), -1, dtype=t.int64)
+            )
+        )
+        draft_input = self.draft_input_cls(
+            bonus_tokens=t.tensor([0], dtype=t.int64),
+            new_seq_lens=t.tensor([4], dtype=t.int64),
+            prefill_tail_hidden_states=t.ones((1, 4, 3)),
+            prefill_tail_valid_mask=t.ones((1, 4), dtype=t.bool),
+        )
+
+        self.worker_cls._materialize_prefill_tail_hidden_to_draft_state(
+            worker,
+            draft_input=draft_input,
+            batch=SimpleNamespace(req_pool_indices=t.tensor([0], dtype=t.int64)),
+            prefix_lens=t.tensor([4], dtype=t.int64),
+        )
+
+        self.assertEqual(materialize_calls, [])
+
+    def test_prefill_tail_replay_debug_records_executed_payload_and_history(self):
+        t = self.torch
+        worker = self._worker()
+        worker.draft_model_runner = SimpleNamespace(
+            attn_backend=SimpleNamespace(
+                token_to_kv_pool=SimpleNamespace(
+                    translate_loc_from_full_to_swa=lambda locs: locs + 100
+                )
+            )
+        )
+        positions = t.tensor([3, 4], dtype=t.int64)
+        cache_locs = t.tensor([13, 14], dtype=t.int64)
+        hidden_rows = t.tensor([[1.0, 2.0], [3.0, 4.0]])
+
+        self.worker_cls._record_prefill_tail_replay_executed_debug(
+            worker,
+            req_pool_idx=9,
+            positions=positions,
+            cache_locs=cache_locs,
+            hidden_rows=hidden_rows,
+            tail_len=4,
+            tail_end_len=5,
+            prefix_len=4,
+        )
+
+        payload = worker._prefill_tail_replay_debug_by_req_pool[9]
+        self.assertTrue(payload["executed"])
+        self.assertEqual(payload["valid_write_count"], 2)
+        self.assertEqual(payload["tail_end_minus_prefix"], 1)
+        self.assertEqual(payload["writes"]["positions"], [3, 4])
+        self.assertEqual(payload["writes"]["full_locs"], [13, 14])
+        self.assertEqual(payload["writes"]["swa_locs"], [113, 114])
+        history = self.worker_cls._prefill_tail_replay_history_debug(worker, 9)
+        self.assertEqual(history["valid_write_count"], 2)
+        self.assertEqual(history["writes"]["hidden"]["shape"], [2, 2])
+
+    def test_materialize_state_uses_main_hidden_for_kv_by_default(self):
+        t = self.torch
+        worker = self._worker()
+        calls = []
+        worker._materialize_main_hidden_to_draft_compressors = lambda **kwargs: (
+            calls.append(("compressor", kwargs["main_hidden"].clone()))
+        )
+        worker._materialize_main_hidden_to_draft_kv = lambda **kwargs: calls.append(
+            (
+                "kv",
+                kwargs["main_hidden"].clone(),
+                kwargs["cache_loc"].clone(),
+                kwargs["positions"].clone(),
+                kwargs["projected"],
+            )
+        )
+        main_hidden = t.arange(6, dtype=t.float32).view(2, 3)
+        cache_loc = t.tensor([31, 32], dtype=t.int64)
+        positions = t.tensor([41, 42], dtype=t.int64)
+
+        self.worker_cls._materialize_main_hidden_to_draft_state(
+            worker,
+            main_hidden=main_hidden,
+            cache_loc=cache_loc,
+            positions=positions,
+            draft_forward_batch=SimpleNamespace(name="batch"),
+            projected=False,
+        )
+
+        self.assertEqual(calls[0][0], "compressor")
+        self.assertEqual(calls[1][0], "kv")
+        self.assertTrue(t.equal(calls[1][1], main_hidden))
+        self.assertTrue(t.equal(calls[1][2], cache_loc))
+        self.assertTrue(t.equal(calls[1][3], positions))
+        self.assertFalse(calls[1][4])
+
     def test_kv_materialization_per_layer_projects_and_casts_locs_and_positions(self):
         import contextlib
 
