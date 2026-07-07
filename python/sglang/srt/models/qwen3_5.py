@@ -522,7 +522,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             ok = (
                 weight is not None
                 and weight_scale is not None
-                and weight.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+                # AttnFP8 weights are always e4m3fn; fused kernels don't handle fnuz.
+                and weight.dtype == torch.float8_e4m3fn
                 and uses_per_token_a8w8
                 and self.head_v_dim == 128
                 and (self.num_v_heads // self.attn_tp_size) <= 128
@@ -541,7 +542,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             gated_rmsnorm_fp8_per_token_quant,
         )
 
-        from sglang.srt.layers.quantization.fp8_utils import apply_fp8_linear
+        from sglang.srt.layers.quantization.fp8_utils import (
+            apply_fp8_linear_aiter_prequant,
+        )
 
         num_tokens, num_heads, head_dim = z_shape_og
         x3 = core_attn_out.reshape(z_shape_og)
@@ -556,13 +559,12 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         gated_rmsnorm_fp8_per_token_quant(
             q_fp8, q_scale, x3, z3, self.norm.weight, self.layer_norm_epsilon
         )
-        return apply_fp8_linear(
-            (q_fp8, q_scale.view(-1, 1)),
+        return apply_fp8_linear_aiter_prequant(
+            q_fp8,
+            q_scale.view(-1, 1),
             self.out_proj.weight,
             self.out_proj.weight_scale,
-            input_scale=None,
             bias=None,
-            use_per_token_if_dynamic=True,
         )
 
     def forward(
