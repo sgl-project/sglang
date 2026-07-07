@@ -9,7 +9,7 @@ from sglang.srt.layers.attention.dsa.dequant_k_cache import dequantize_k_cache_p
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.attention.utils import concat_and_cast_mha_k_triton
 from sglang.srt.layers.communicator import get_attn_tp_context
-from sglang.srt.layers.utils.dcp_utils import (
+from sglang.srt.layers.dcp import (
     all_gather_kv_cache_for_mha_chunk_extend,
     all_gather_kv_cache_for_mha_extend,
     dcp_enabled,
@@ -169,14 +169,9 @@ class DeepseekMHAForwardMixin:
                     q = self.q_b_proj(q_lora)[0].view(
                         -1, self.num_local_heads, self.qk_head_dim
                     )
-                # The indexer call here only STORES quantized keys into the index-k
-                # cache (return_indices=False, result discarded); the native DSA
-                # decode indexer later reads them for its top-k. Under Double Sparsity
-                # the decode selection comes from query-signature scoring (the indexer
-                # is skipped — see deepseek_v2.py `_select_topk_indices`), so this
-                # prefill store is dead work and its index-k sidecar is gated off in
-                # the pool. Skip the store under DS to match the gated buffer.
-                if not self.use_double_sparsity:
+                # Skip the indexer prefill K-store under DS (DS selects via
+                # query-signature scoring; the index-k sidecar is pool-gated off).
+                if self.should_run_indexer() and not self.use_double_sparsity:
                     _ = self.indexer(
                         x=hidden_states,
                         q_lora=q_lora,

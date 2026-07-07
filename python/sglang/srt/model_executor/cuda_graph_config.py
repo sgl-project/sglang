@@ -52,10 +52,15 @@ ALLOWED_BACKENDS_PER_PHASE = {
         Backend.TC_PIECEWISE,
         Backend.DISABLED,
     ),
-    # full is rejected for prefill — full CUDA graph capture only
-    # fits fixed-shape and prefill is variable-shape. Use breakable
-    # or tc_piecewise for prefill.
-    Phase.PREFILL: (Backend.BREAKABLE, Backend.TC_PIECEWISE, Backend.DISABLED),
+    # full for prefill captures one whole-forward graph per num_tokens
+    # bucket (bs=1 only); replay pads num_tokens up to the nearest
+    # captured bucket. Opt-in: the padding waste is the operator's call.
+    Phase.PREFILL: (
+        Backend.FULL,
+        Backend.BREAKABLE,
+        Backend.TC_PIECEWISE,
+        Backend.DISABLED,
+    ),
 }
 
 # Per-phase settings schema. Keys other than backend are runner-level
@@ -63,9 +68,10 @@ ALLOWED_BACKENDS_PER_PHASE = {
 # backend-specific knob (only meaningful when backend == tc_piecewise).
 # For prefill, bs carries the captured shape size (token count for
 # tc_piecewise, request count for breakable) — one shape knob per phase.
+# full_prefill_max_req is prefill-only and only meaningful when backend == full.
 ALLOWED_KEYS_PER_PHASE = {
     Phase.DECODE: ("backend", "max_bs", "bs", "tc_compiler"),
-    Phase.PREFILL: ("backend", "max_bs", "bs", "tc_compiler"),
+    Phase.PREFILL: ("backend", "max_bs", "bs", "tc_compiler", "full_prefill_max_req"),
 }
 
 
@@ -78,6 +84,21 @@ class PhaseConfig:
     bs: Optional[List[int]] = None
     # Only meaningful when backend == tc_piecewise; ignored otherwise.
     tc_compiler: str = "eager"
+    # Only meaningful for the prefill phase with backend == full: max number of
+    # request slots baked into each captured graph. Real bs <= full_prefill_max_req
+    # reuses the graph (unused slots become zero-length sentinels); larger
+    # batches fall back to eager. Ignored by BCG (bs=1 only) and TC_PIECEWISE
+    # (bs-invariant via torch.compile). None auto-derives chunked_prefill_size // 512.
+    full_prefill_max_req: Optional[int] = None
+
+
+def default_prefill_backend() -> str:
+    """BCG (breakable) is the prefill default on CUDA only; other platforms
+    (HIP/NPU/...) keep tc_piecewise until BCG is validated there. Lazy import
+    keeps this module's stdlib-only import invariant (see module docstring)."""
+    from sglang.srt.utils import is_cuda
+
+    return Backend.BREAKABLE if is_cuda() else Backend.TC_PIECEWISE
 
 
 @dataclass
@@ -88,7 +109,7 @@ class CudaGraphConfig:
         default_factory=lambda: PhaseConfig(backend=Backend.FULL)
     )
     prefill: PhaseConfig = field(
-        default_factory=lambda: PhaseConfig(backend=Backend.TC_PIECEWISE)
+        default_factory=lambda: PhaseConfig(backend=default_prefill_backend())
     )
 
     def __getitem__(self, phase: str) -> PhaseConfig:

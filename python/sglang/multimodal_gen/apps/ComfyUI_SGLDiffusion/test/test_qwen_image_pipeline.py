@@ -107,7 +107,7 @@ def test_comfyui_qwen_image_pipeline_direct() -> None:
         noise_pred.dtype == torch.bfloat16
     ), f"noise_pred should be bfloat16, got {noise_pred.dtype}"
 
-    print(f"✓ Successfully retrieved noise_pred from OutputBatch!")
+    print("✓ Successfully retrieved noise_pred from OutputBatch!")
     print(f"  noise_pred shape: {noise_pred.shape}")
     print(f"  noise_pred dtype: {noise_pred.dtype}")
     print(f"  noise_pred device: {noise_pred.device}")
