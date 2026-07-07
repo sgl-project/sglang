@@ -1,6 +1,8 @@
 """Unit tests for DSpark speculative-decoding registration and arg handling."""
 
+import sys
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 
 from sglang.srt.arg_groups.speculative_hook import _handle_dspark
@@ -392,6 +394,82 @@ class TestDSparkDeepSpecSemanticReference(CustomTestCase):
         sglang_out = attention(q_block, sglang_k, sglang_v)
 
         self.assertTrue(t.equal(deepspec_out, sglang_out))
+
+    def test_markov_refine_matches_deepspec_vanilla_markov_reference(self):
+        repo_root = Path(__file__).resolve().parents[5]
+        deepspec_root = repo_root / "DeepSpec"
+        if not deepspec_root.exists():
+            self.skipTest(f"DeepSpec checkout not found: {deepspec_root}")
+        sys.path.insert(0, str(deepspec_root))
+        try:
+            from deepspec.modeling.dspark.markov_head import VanillaMarkov
+            from sglang.srt.speculative.dspark_worker_v2 import DSparkWorkerV2
+        except Exception as e:
+            self.skipTest(f"DeepSpec/SGLang DSpark imports unavailable: {e}")
+
+        t = self.torch
+        t.manual_seed(0)
+        bs = 2
+        block_size = 4
+        verify_stride = block_size + 1
+        hidden_size = 6
+        vocab_size = 19
+        markov_rank = 5
+
+        block_hidden = t.randn(bs, block_size, hidden_size)
+        anchor_tokens = t.tensor([3, 7], dtype=t.int64)
+        lm_head = t.nn.Linear(hidden_size, vocab_size, bias=False)
+        markov_head = VanillaMarkov(vocab_size=vocab_size, markov_rank=markov_rank)
+
+        class _LogitsProcessor:
+            def _compute_lm_head(self, hidden_states, head):
+                return head(hidden_states)
+
+        class _ConfidenceHead:
+            def __call__(self, hidden_states, markov_embeds):
+                return hidden_states.new_zeros(hidden_states.shape[:2])
+
+        worker = DSparkWorkerV2.__new__(DSparkWorkerV2)
+        worker.block_size = block_size
+        worker.verify_stride = verify_stride
+        worker.markov_rank = markov_rank
+        worker.noise_token_id = 0
+        worker._markov_refine_buffer_cap = 0
+        worker._markov_candidates_buf = None
+        worker._markov_embeds_buf = None
+        worker._vocab_shard_mapping_cache = {}
+        worker._accept_anomaly_enabled = False
+        worker._parity_dump_enabled = False
+        worker._last_markov_refine_debug = None
+        worker._draft_inner = SimpleNamespace(
+            vocab_size=vocab_size,
+            markov_head=markov_head,
+            confidence_head=_ConfidenceHead(),
+        )
+        worker.draft_model = SimpleNamespace(
+            lm_head=lm_head,
+            logits_processor=_LogitsProcessor(),
+        )
+
+        candidates, confidence = DSparkWorkerV2._refine_block_markov(
+            worker,
+            block_hidden=block_hidden,
+            anchor_tokens=anchor_tokens,
+        )
+
+        base_logits = lm_head(block_hidden)
+        ref_candidates = t.empty(bs, verify_stride, dtype=t.int64)
+        ref_candidates[:, 0] = anchor_tokens
+        prev_tokens = anchor_tokens
+        for step in range(block_size):
+            bias = markov_head.markov_w2(markov_head.get_prev_embeddings(prev_tokens))
+            next_tokens = t.argmax(base_logits[:, step, :] + bias, dim=-1)
+            ref_candidates[:, step + 1] = next_tokens
+            prev_tokens = next_tokens
+
+        self.assertEqual(candidates.tolist(), ref_candidates.tolist())
+        self.assertEqual(tuple(confidence.shape), (bs, block_size))
+        self.assertTrue(t.equal(confidence, t.zeros_like(confidence)))
 
 
 if __name__ == "__main__":
