@@ -81,7 +81,7 @@ if amdgpu_target_env == default_target and torch.cuda.is_available():
         print(f"Using default target: {default_target}")
 
 # Validate all target architectures
-supported_archs = ["gfx942", "gfx950"]
+supported_archs = ["gfx942", "gfx950", "gfx1100", "gfx1201"]
 for arch in amdgpu_targets:
     if arch not in supported_archs:
         print(
