@@ -24,6 +24,7 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_group,
     is_allocation_symmetric,
@@ -666,6 +667,14 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             if use_bitsandbytes_4bit:
                 shard_size = loaded_weight.shape[output_dim]
                 shard_offset = loaded_weight.shape[output_dim] * loaded_shard_id
+
+            # Needed for experimental ModelSlim W4A4 int4x2 packing support
+            # TODO: remove env variable once new packing is fully released
+            if envs.SGLANG_NPU_W4A4_NEW_PACKING.get():
+                pack_factor = getattr(param, "pack_factor", None)
+                if pack_factor is not None:
+                    shard_size = shard_size // pack_factor
+                    shard_offset = shard_offset // pack_factor
 
             param_data = param_data.narrow(output_dim, shard_offset, shard_size)
             start_idx = self.tp_rank * shard_size

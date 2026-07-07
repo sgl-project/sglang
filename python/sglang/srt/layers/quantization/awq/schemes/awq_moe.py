@@ -16,7 +16,10 @@ from sglang.srt.layers.moe import (
 from .awq_scheme import AWQMoESchemeBase
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.moe.token_dispatcher import StandardDispatchOutput
+    from sglang.srt.layers.moe.token_dispatcher import (
+        CombineInput,
+        StandardDispatchOutput,
+    )
     from sglang.srt.layers.quantization.awq.awq import AWQConfig, AWQMarlinConfig
 
 __all__ = ["AWQMoEScheme", "AWQAscendMoEScheme"]
@@ -151,6 +154,39 @@ class AWQAscendMoEScheme(AWQMoEScheme):
         return AWQAscendMoEKernel(quant_config)
 
     def create_moe_runner(
-        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
+        self,
+        layer: torch.nn.Module,
+        moe_runner_config: MoeRunnerConfig,
+        **extra_weight_attrs,
     ):
+        from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
+            NPUWNA16Int4MoEMethod,
+        )
+
         self.moe_runner_config = moe_runner_config
+        layer.w13_kernel = NPUWNA16Int4MoEMethod()
+        layer.w2_kernel = NPUWNA16Int4MoEMethod()
+        moe_runner_config.layer = layer
+        backend = get_moe_runner_backend()
+        if backend.is_auto():
+            backend = MoeRunnerBackend.ASCEND
+        self.runner = MoeRunner(backend, moe_runner_config)
+
+    def apply_weights(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output: StandardDispatchOutput,
+    ) -> CombineInput:
+        from sglang.srt.layers.moe.moe_runner.ascend import (
+            AscendQuantInfo,
+        )
+
+        quant_info = AscendQuantInfo(
+            w13_weight=layer.w13_qweight,
+            w2_weight=layer.w2_qweight,
+            w13_weight_scale=layer.w13_scales,
+            w2_weight_scale=layer.w2_scales,
+            w13_weight_offset=layer.w13_qzeros,
+            w2_weight_offset=layer.w2_qzeros,
+        )
+        return self.runner.run(dispatch_output, quant_info)
