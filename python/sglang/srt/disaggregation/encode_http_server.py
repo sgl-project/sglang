@@ -18,7 +18,7 @@ import time
 import traceback
 import uuid
 from http import HTTPStatus
-from typing import Annotated, Any, Dict, List, Optional, Set, Tuple
+from typing import Annotated, Dict, List, Optional, Set, Tuple
 
 import requests as http_requests
 import uvicorn
@@ -30,13 +30,13 @@ from fastapi.responses import ORJSONResponse, Response
 import sglang.srt.disaggregation.encode_server as encode_server_module
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.encode_server import (
+    _BATCHABLE_MODALITIES,
     ENCODER_MAX_BATCH_SIZE,
     ENCODER_REQ_TIMEOUT,
     EncoderProfiler,
     EncoderScheduler,
     MMEncoder,
     MMError,
-    _BATCHABLE_MODALITIES,
 )
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
@@ -669,7 +669,9 @@ async def _dp_worker_handle_request(
         "send",
     )
     if is_encode and encode_server_module.encoder_metrics_collector is not None:
-        encode_server_module.encoder_metrics_collector.inc_requests_received(modality=modality_str)
+        encode_server_module.encoder_metrics_collector.inc_requests_received(
+            modality=modality_str
+        )
     try:
         if dp_type in ("start_profile", "stop_profile"):
             content = await _dp_worker_handle_profile(enc, dp_rank, dp_type, request)
@@ -1310,10 +1312,14 @@ async def handle_encode_request(request: dict):
 
             modality_str = modality.name.lower()
             time_stats.modality = modality_str
-            time_stats.set_metrics_collector(encode_server_module.encoder_metrics_collector)
+            time_stats.set_metrics_collector(
+                encode_server_module.encoder_metrics_collector
+            )
             time_stats.set_mm_encode_start_time()
             if encode_server_module.encoder_metrics_collector is not None:
-                encode_server_module.encoder_metrics_collector.inc_requests_received(modality=modality_str)
+                encode_server_module.encoder_metrics_collector.inc_requests_received(
+                    modality=modality_str
+                )
             if encoder_scheduler is not None and modality in _BATCHABLE_MODALITIES:
                 try:
                     nbytes, embedding_len, embedding_dim, error_msg, error_code = (
@@ -1506,7 +1512,9 @@ async def handle_scheduler_receive_url_request(request: dict):
         if rid not in encode_server_module.rid_to_receive_endpoint:
             encode_server_module.rid_to_receive_endpoint[rid] = set()
             encode_server_module.rid_to_receive_count[rid] = request["receive_count"]
-        assert encode_server_module.rid_to_receive_count[rid] == request["receive_count"]
+        assert (
+            encode_server_module.rid_to_receive_count[rid] == request["receive_count"]
+        )
         encode_server_module.rid_to_receive_endpoint[rid].add(request["receive_url"])
     cond = await get_condition(rid)
     async with cond:

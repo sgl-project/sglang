@@ -5,9 +5,7 @@ import ctypes
 import logging
 import os
 import pickle
-import threading
 import time
-import uuid
 from collections import defaultdict
 from dataclasses import dataclass
 from http import HTTPStatus
@@ -22,12 +20,12 @@ import zmq.asyncio
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.disaggregation.encoder_preprocessor import EncoderPreprocessor
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.encode_receiver import (
     EmbeddingData,
     video_meta_attrs_for,
 )
+from sglang.srt.disaggregation.encoder_preprocessor import EncoderPreprocessor
 from sglang.srt.distributed.parallel_state import (
     get_default_distributed_backend,
     get_mooncake_transfer_engine,
@@ -1598,7 +1596,9 @@ class MMEncoder:
         for req in requests:
             leaves = EncoderPreprocessor._flatten_nested_items(req["mm_items"])
             flat_items.extend(leaves)
-            items_per_req.append(sum(self.preprocessor._grid_count_per_leaf(leaves, modality)))
+            items_per_req.append(
+                sum(self.preprocessor._grid_count_per_leaf(leaves, modality))
+            )
         total = sum(items_per_req)
 
         if encoder_metrics_collector is not None:
@@ -2082,8 +2082,12 @@ class EncoderScheduler:
                     # Count like batch_encode: flatten nested items and expand
                     # per-leaf grids so {"type": "image", "image": [p1, p2, ...]}
                     # counts as N, not 1.
-                    leaves = EncoderPreprocessor._flatten_nested_items(req.get("mm_items", []))
-                    mm_count = sum(self.encoder.preprocessor._grid_count_per_leaf(leaves, modality))
+                    leaves = EncoderPreprocessor._flatten_nested_items(
+                        req.get("mm_items", [])
+                    )
+                    mm_count = sum(
+                        self.encoder.preprocessor._grid_count_per_leaf(leaves, modality)
+                    )
                     encoder_metrics_collector.observe_mm_items_per_request(
                         mm_count, modality=modality_str
                     )
@@ -2107,4 +2111,3 @@ class EncoderScheduler:
 # launch_server (non-DP) and run_dp_worker (DP mode). None when metrics
 # disabled. Kept here because MMEncoder GPU methods reference it directly.
 encoder_metrics_collector: Optional[EncoderMetricsCollector] = None
-
