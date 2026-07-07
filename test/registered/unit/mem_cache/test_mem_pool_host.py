@@ -91,7 +91,7 @@ class TestHostKVCache(CustomTestCase):
         )
         self.assertIsNotNone(shm_host_pool.fd)
         self.assertGreaterEqual(shm_host_pool.fd, 0)
-        
+
         indices = shm_host_pool.alloc(4)
         self.assertEqual(len(indices), 4)
         shm_host_pool.free(indices)
