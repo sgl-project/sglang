@@ -107,6 +107,46 @@ class ScheduleBatchDisaggregationDecodeMixin:
             self.model_config.vocab_size,
         )
 
+    def _maybe_setup_mamba_prebuilt_checkpoint(self: ScheduleBatch, req):
+        """Decode PD + mamba extra_buffer: seed the ping-pong track slot at PREBUILT
+        admission so the normal cache_unfinished_req insert path runs.
+
+        The prefill-transferred end-of-prompt SSM state lands in the request's main mamba
+        slot (get_mamba_indices(req_pool_idx)). Under extra_buffer, cache_unfinished_req
+        reads the ping-pong track slot get_mamba_ping_pong_other_idx(mamba_next_track_idx)
+        and forks it; at admission that slot is still unwritten and mamba_last_track_seqlen
+        is None, so the insert is skipped (prefix_len stays 0). We mirror the main slot into
+        exactly that ping-pong slot and set the tracked seqlen to the page-aligned prompt
+        length so cache_unfinished_req inserts a matchable node.
+
+        The planted mamba state is at prompt_len (end-of-prompt), while the node depth is
+        aligned_len (≤ prompt_len). In PD decode this is safe: every request's working mamba
+        slot is overwritten by its own prefill transfer, so the cached mamba_value is only
+        used as a "node has valid checkpoint" flag for prefix matching, never for computation.
+        """
+        tree_cache = self.tree_cache
+        if tree_cache is None or not hasattr(tree_cache, "supports_mamba"):
+            return
+        if not tree_cache.supports_mamba():
+            return
+        if not getattr(tree_cache, "enable_mamba_extra_buffer", False):
+            return
+        pool = self.req_to_token_pool
+        if req.mamba_ping_pong_track_buffer is None or req.mamba_next_track_idx is None:
+            return
+        page_size = tree_cache.page_size
+        prompt_len = len(req.origin_input_ids)
+        aligned_len = (
+            (prompt_len // page_size * page_size) if page_size > 1 else prompt_len
+        )
+        if aligned_len == 0:
+            return
+        keep_idx = pool.get_mamba_ping_pong_other_idx(req.mamba_next_track_idx)
+        dst_slot = req.mamba_ping_pong_track_buffer[keep_idx].unsqueeze(-1)
+        main_slot = pool.get_mamba_indices(req.req_pool_idx).unsqueeze(-1)
+        pool.mamba_pool.copy_from(main_slot, dst_slot)
+        req.mamba_last_track_seqlen = aligned_len
+
     def process_prebuilt(
         self: ScheduleBatch,
         server_args: ServerArgs,
@@ -116,6 +156,7 @@ class ScheduleBatchDisaggregationDecodeMixin:
         last_tokens: List[int] = []
         for req in self.reqs:
             last_tokens.append(req.output_ids[-1])
+            self._maybe_setup_mamba_prebuilt_checkpoint(req)
             maybe_cache_unfinished_req(req, self.tree_cache)
             if req.grammar is not None:
                 # FIXME: this try-except block is for handling unexpected xgrammar issue.

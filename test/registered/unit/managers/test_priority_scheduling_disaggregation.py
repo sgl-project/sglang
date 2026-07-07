@@ -132,6 +132,7 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
         queue.transfer_queue = SimpleNamespace(queue=[], enable_staging=False)
         queue.kv_manager = SimpleNamespace(kv_args=SimpleNamespace(state_types=[]))
         queue.tree_cache = MagicMock()
+        queue.tree_cache.supports_mamba.return_value = False
 
         scheduler = MagicMock()
         scheduler.enable_priority_scheduling = True
