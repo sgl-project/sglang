@@ -440,7 +440,8 @@ class ModelRunner:
         )
         if self.eplb_manager is not None:
             self.eplb_manager.disable_rebalance(
-                "EPLB rebalance is disabled after elastic EP scale-up"
+                "EPLB rebalance is disabled while elastic EP scale-up "
+                "is being finalized"
             )
 
         state = ElasticEPStateManager.instance()
@@ -456,6 +457,7 @@ class ModelRunner:
         )
         if state is not None:
             state.scale_phase = "serving_expanded"
+        self._rearm_eplb_after_elastic_scale()
 
     def init_msprobe(self):
         self.msprobe_debugger = misc_utils.create_msprobe_debugger(self.server_args)
@@ -1585,6 +1587,26 @@ class ModelRunner:
     def _elastic_global_rank(self) -> int:
         return self.ps.tp_rank + self.server_args.ep_join_rank_offset
 
+    def _rearm_eplb_after_elastic_scale(self) -> None:
+        if self.eplb_manager is None:
+            return
+        recorder = get_global_expert_distribution_recorder()
+        if not recorder.recording:
+            recorder.start_record()
+        self.eplb_manager.enable_rebalance()
+
+    def _reset_eplb_after_elastic_scale_failure(self) -> None:
+        if self.eplb_manager is None:
+            return
+        set_global_expert_distribution_recorder(
+            ExpertDistributionRecorder.init_new(
+                self.server_args,
+                get_global_expert_location_metadata(),
+                rank=self._elastic_global_rank(),
+            )
+        )
+        self._rearm_eplb_after_elastic_scale()
+
     def _report_elastic_scale_failure(self, error: str, effective_size: int) -> None:
         if self.ps.tp_rank != 0 or self.server_args.is_ep_scale_joiner:
             return
@@ -1651,7 +1673,8 @@ class ModelRunner:
 
         if self.eplb_manager is not None:
             self.eplb_manager.disable_rebalance(
-                "EPLB rebalance is disabled after elastic EP scale-up"
+                "EPLB rebalance is disabled while elastic EP scale-up "
+                "is being finalized"
             )
 
         from sglang.srt.layers.dp_attention import update_dp_attention_post_scale
@@ -1668,6 +1691,7 @@ class ModelRunner:
             log_tag="JOINER" if self.server_args.is_ep_scale_joiner else "PRIMARY",
         )
         ElasticEPStateManager.commit_scale()
+        self._rearm_eplb_after_elastic_scale()
 
         if self.ps.tp_rank == 0 and not self.server_args.is_ep_scale_joiner:
             from sglang.srt.managers.io_struct import ElasticScaleUpdateReq
@@ -1725,6 +1749,7 @@ class ModelRunner:
         if timeout.item():
             error = f"Timed out waiting for ranks to join target EP size {pending_size}"
             ElasticEPStateManager.fail_scale(error)
+            self._reset_eplb_after_elastic_scale_failure()
             self._report_elastic_scale_failure(error, effective_size)
             if self.ps.tp_rank == 0 and not self.server_args.is_ep_scale_joiner:
                 logger.error("[Elastic EP] %s", error)
@@ -1740,6 +1765,7 @@ class ModelRunner:
                     f"joining cohort target {cohort_target}"
                 )
                 ElasticEPStateManager.fail_scale(error)
+                self._reset_eplb_after_elastic_scale_failure()
                 self._report_elastic_scale_failure(error, effective_size)
                 if self.ps.tp_rank == 0 and not self.server_args.is_ep_scale_joiner:
                     logger.error("[Elastic EP] %s", error)
