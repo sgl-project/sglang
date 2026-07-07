@@ -56,6 +56,7 @@ from sglang.srt.layers.moe.utils import (
     should_skip_post_experts_all_reduce,
 )
 from sglang.srt.layers.quantization import QuantizationConfig
+from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -246,6 +247,14 @@ class NemotronHMoE(nn.Module):
             self.fc1_latent_proj = None
             self.fc2_latent_proj = None
 
+        self._fuse_latent_projection_shared_add = (
+            _is_cuda
+            and self.fc2_latent_proj is not None
+            and self.shared_experts is not None
+            and isinstance(self.fc2_latent_proj.quant_method, UnquantizedLinearMethod)
+            and self.fc2_latent_proj.bias is None
+        )
+
     def _forward_core(
         self,
         hidden_states: torch.Tensor,
@@ -304,6 +313,26 @@ class NemotronHMoE(nn.Module):
 
         return final_hidden_states, shared_output
 
+    def _apply_latent_projection(
+        self,
+        final_hidden_states: torch.Tensor,
+        shared_output: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if self._fuse_latent_projection_shared_add:
+            assert shared_output is not None
+            return (
+                torch.addmm(
+                    shared_output,
+                    final_hidden_states,
+                    self.fc2_latent_proj.weight.t(),
+                    out=shared_output,
+                ),
+                None,
+            )
+        if self.use_latent_moe:
+            final_hidden_states, _ = self.fc2_latent_proj(final_hidden_states)
+        return final_hidden_states, shared_output
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -315,8 +344,9 @@ class NemotronHMoE(nn.Module):
         # MoE runner / topk), so final_hidden_states is already scaled.
         final_hidden_states, shared_output = self._forward_core(hidden_states)
 
-        if self.use_latent_moe:
-            final_hidden_states, _ = self.fc2_latent_proj(final_hidden_states)
+        final_hidden_states, shared_output = self._apply_latent_projection(
+            final_hidden_states, shared_output
+        )
 
         if shared_output is not None:
             final_hidden_states += shared_output
