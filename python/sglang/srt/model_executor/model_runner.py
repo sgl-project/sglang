@@ -2733,7 +2733,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             logger.error(
                 "DeepEP capture left only %.2f GiB free (< %.1f GiB safety floor); "
                 "the capacity reservation is too small for this config — "
-                "set --mem-fraction-static lower or raise SGLANG_DEEPEP_CAPTURE_COEF.",
+                "set --mem-fraction-static lower.",
                 after_mem_gb,
                 safety_floor_gib,
             )

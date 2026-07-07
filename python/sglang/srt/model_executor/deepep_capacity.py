@@ -35,6 +35,14 @@ _MIB = 1024**2
 _NUM_MAX_TIERS = (1024, 512, 256, 128)
 # Headroom for the transient deep_gemm warmup that runs right after capture.
 _SAFETY_MIB = 2 * 1024
+# Capture-estimate multiplier on the grouped-GEMM size (num_experts *
+# moe_intermediate * hidden). Calibrated GB300: ~32 GiB DeepSeek-V4, ~12 GiB
+# GLM-5.2. Deliberately conservative — over-estimates degrade to a partial
+# reserve against the real KV budget, they never refuse to serve.
+_CAPTURE_COEF = 4.0
+# Cap on the reservation as a fraction of total GPU memory, so a large
+# estimate can't squeeze the KV pool out.
+_MAX_RESERVE_FRACTION = 0.12
 # deep_ep's low_latency fp8 recv-scale layout views tokens in blocks of
 # num_max * num_ranks // 128; a non-multiple num_max truncates that view to
 # zero blocks and silently corrupts the scales (garbage logits, no assert).
@@ -54,9 +62,9 @@ class DeepEPCapacityPlan(msgspec.Struct):
     # num_max counts tokens, not requests: spec/MTP verify packs
     # num_tokens_per_bs tokens per request.
     tokens_per_req: int
-    # True when the auto reservation sized the ceiling. False (user-set env /
-    # kill switch / user mem_fraction) keeps num_max at the static value so no
-    # buffer is allocated that nobody budgeted for.
+    # True when the auto reservation sized the ceiling. False (user-set
+    # mem_fraction / unreadable geometry) keeps num_max at the static value so
+    # no buffer is allocated that nobody budgeted for.
     auto_sized: bool = False
     rdma_mib: float = 0.0
     capture_mib: float = 0.0
@@ -129,8 +137,6 @@ def plan_deepep_capacity(
     env = envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK
     static_plan = DeepEPCapacityPlan(ceiling=env.get(), tokens_per_req=tokens_per_req)
 
-    if not envs.SGLANG_ENABLE_DEEPEP_AUTO_MEM_RESERVE.get():
-        return static_plan
     slack_mib = server_args.auto_mem_chunked_slack_mib
     if slack_mib is None or gpu_total_mib is None:
         # mem_fraction_static was user-set (or capacity unknown): the auto
@@ -155,14 +161,8 @@ def plan_deepep_capacity(
     # Capture + deep_gemm warmup footprint scales with the grouped-GEMM size
     # (num_experts * moe_intermediate * hidden), NOT num_layers * hidden — a
     # layer-based estimate inverts the GLM-5.2 vs DeepSeek-V4 ordering.
-    capture_mib = (
-        envs.SGLANG_DEEPEP_CAPTURE_COEF.get()
-        * num_experts
-        * moe_intermediate
-        * hidden
-        / _MIB
-    )
-    cap_mib = envs.SGLANG_DEEPEP_MAX_RESERVE_FRACTION.get() * gpu_total_mib
+    capture_mib = _CAPTURE_COEF * num_experts * moe_intermediate * hidden / _MIB
+    cap_mib = _MAX_RESERVE_FRACTION * gpu_total_mib
 
     if server_args.max_running_requests is not None:
         user_cap = max(
@@ -200,10 +200,9 @@ def plan_deepep_capacity(
     if reserve_mib > cap_mib:
         logger.warning(
             "DeepEP auto mem reserve %.1f GiB exceeds the %.0f%% cap (%.1f GiB); "
-            "clamping. Raise SGLANG_DEEPEP_MAX_RESERVE_FRACTION or set "
-            "--mem-fraction-static if capture OOMs.",
+            "clamping. Set --mem-fraction-static if capture OOMs.",
             reserve_mib / 1024,
-            envs.SGLANG_DEEPEP_MAX_RESERVE_FRACTION.get() * 100,
+            _MAX_RESERVE_FRACTION * 100,
             cap_mib / 1024,
         )
         reserve_mib = cap_mib

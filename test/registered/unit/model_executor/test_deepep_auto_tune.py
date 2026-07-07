@@ -6,8 +6,8 @@ All CPU-only and fully mocked:
   - plan_deepep_capacity builds the single capacity plan: it tiers the num_max
     ceiling down until the buffer + capture reservation fits under the cap, and
     only auto-sizes when the auto mem_fraction path is active (slack recorded);
-    with the kill switch off, a user-set mem_fraction, or a user-set env it
-    stays at the static bound so no un-budgeted buffer is allocated.
+    with a user-set mem_fraction it stays at the static bound so no un-budgeted
+    buffer is allocated.
   - resolve_deepep_num_max sizes the dispatch bound to decode concurrency
     (request-pool size * tokens per request, capped at the ceiling and 1024)
     and exports it through the env; a non-auto-sized plan never raises it.
@@ -41,6 +41,7 @@ except Exception:
 
 try:
     from sglang.srt.model_executor.deepep_capacity import (
+        _MAX_RESERVE_FRACTION,
         DeepEPCapacityPlan,
         deepep_tokens_per_req,
         plan_deepep_capacity,
@@ -238,13 +239,6 @@ class TestDeepEPCapacityPlanning(unittest.TestCase):
             plan = self._plan_for(max_running=48, dp_size=4, num_draft=2)
             self.assertEqual(plan.ceiling, 128)
 
-    def test_kill_switch_returns_static_plan(self):
-        with _env_unset(), envs.SGLANG_ENABLE_DEEPEP_AUTO_MEM_RESERVE.override(False):
-            plan = self._plan_for()
-            self.assertEqual(plan.ceiling, 128)
-            self.assertFalse(plan.auto_sized)
-            self.assertEqual(plan.reserve_mib, 0.0)
-
     def test_user_mem_fraction_returns_static_plan(self):
         # slack None means mem_fraction_static was user-set: the auto formula
         # budgeted nothing, so the plan must not size a larger buffer.
@@ -252,6 +246,7 @@ class TestDeepEPCapacityPlanning(unittest.TestCase):
             plan = self._plan_for(slack_gib=None)
             self.assertEqual(plan.ceiling, 128)
             self.assertFalse(plan.auto_sized)
+            self.assertEqual(plan.reserve_mib, 0.0)
 
     def test_user_env_pins_ceiling_and_reserves_for_it(self):
         # A user-set env skips the tier-down but still reserves for the pinned
@@ -295,7 +290,7 @@ class TestDeepEPCapacityPlanning(unittest.TestCase):
                 num_experts=384,
                 moe_intermediate=3072,
             )
-            cap_mib = envs.SGLANG_DEEPEP_MAX_RESERVE_FRACTION.get() * 139.8 * 1024
+            cap_mib = _MAX_RESERVE_FRACTION * 139.8 * 1024
             self.assertLessEqual(plan.reserve_mib, cap_mib)
 
 
@@ -340,9 +335,9 @@ class TestDeepEPResolveNumMax(unittest.TestCase):
             self.assertEqual(_ENV.get(), 1024)
 
     def test_static_plan_keeps_default(self):
-        # No reservation (kill-switch off / user-set mem_fraction): the buffer
-        # for a larger num_max was never budgeted, so the bound must NOT be
-        # raised — stay at the static default instead of OOMing at capture.
+        # No reservation (user-set mem_fraction): the buffer for a larger
+        # num_max was never budgeted, so the bound must NOT be raised — stay
+        # at the static default instead of OOMing at capture.
         with _env_unset():
             self._run(_runner(_plan(ceiling=128, auto_sized=False), pool_size=4096))
             self.assertFalse(_ENV.is_set())
@@ -438,10 +433,10 @@ class TestDeepEPConcurrencyClamp(unittest.TestCase):
             self.assertEqual(self._clamp(_plan(ceiling=1024), 2048), 1024)
 
     def test_static_plan_caps_to_default_buffer(self):
-        # No reservation (kill-switch off / user mem_fraction): the buffer is
-        # the static default, so concurrency caps to it — NOT the loose
-        # FINISHED_SUM_TAG bound, which would let the decode batch overrun the
-        # small default buffer.
+        # No reservation (user mem_fraction): the buffer is the static
+        # default, so concurrency caps to it — NOT the loose FINISHED_SUM_TAG
+        # bound, which would let the decode batch overrun the small default
+        # buffer.
         with patch(
             f"{_MIXIN_MODULE}.get_moe_ep_group",
             return_value=SimpleNamespace(world_size=1, cpu_group=None),

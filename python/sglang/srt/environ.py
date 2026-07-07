@@ -612,15 +612,6 @@ class Envs:
     SGLANG_DEEPEP_BF16_DISPATCH = EnvBool(False)  # This argument is deprecated
     SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS = EnvInt(32)
-    # Auto-reserve the DeepEP low_latency buffer + capture footprint from the KV
-    # budget so deepep+DP serves without hand-set mem/concurrency flags.
-    SGLANG_ENABLE_DEEPEP_AUTO_MEM_RESERVE = EnvBool(True)
-    # Multiplier on grouped-GEMM size (num_experts * moe_intermediate * hidden) for
-    # the capture estimate. Calibrated GB300: ~32 GiB DeepSeek-V4, ~12 GiB GLM-5.2.
-    SGLANG_DEEPEP_CAPTURE_COEF = EnvFloat(4.0)
-    # Cap on the auto reservation as a fraction of total GPU memory, so a large
-    # estimate can't squeeze the KV pool out.
-    SGLANG_DEEPEP_MAX_RESERVE_FRACTION = EnvFloat(0.12)
     SGLANG_BLACKWELL_OVERLAP_SHARED_EXPERTS_OUTSIDE_SBO = EnvBool(False)
     # Force dynamic DeepEP Waterfill with runtime EP all-reduce instead of the
     # default static local-batch path.
