@@ -13,16 +13,6 @@ namespace {
 
 static constexpr int kWarpSize = 32;
 
-__host__ __forceinline__ uint32_t next_pow2(uint32_t x) noexcept {
-  --x;
-  x |= x >> 1;
-  x |= x >> 2;
-  x |= x >> 4;
-  x |= x >> 8;
-  x |= x >> 16;
-  return ++x;
-}
-
 __device__ __forceinline__ int warp_exclusive_scan(int v) {
   int original = v;
 #pragma unroll
