@@ -45,95 +45,16 @@ impl EgressSink {
 #[allow(dead_code)] // the receiver half is created inline in api_server::submit.
 pub type EgressSource = mpsc::Receiver<EgressItem>;
 
-/// Protocol-neutral output for one generation step — a **per-chunk delta**. The
-/// detok shard emits one per decode step (it keeps no cumulative buffer); a
-/// consumer that needs the cumulative view folds them with `OutputAccumulator`
-/// (every unary response and the cumulative SGLang `/generate` stream). The
-/// `/generate` handler formats the result into the SGLang wire shape.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct GenerationOutput {
-    /// Decoded text **delta** for this chunk (empty in `skip_tokenizer_init`
-    /// mode, or when the step only produced a partial multi-byte sequence).
-    pub text: String,
-    /// Output token ids for this chunk. Surfaced as the `/generate` response's
-    /// `output_ids` (returned by default, like the Python server) — populated in
-    /// both normal and `skip_tokenizer_init` mode.
-    pub output_ids: Vec<i32>,
-    /// Prompt token count (from the scheduler; constant across the request).
-    pub prompt_tokens: u32,
-    /// Output token count for this chunk (the accumulator sums them).
-    pub completion_tokens: u64,
-    /// Full finish-reason dict on the final step; `None` while streaming.
-    pub finish_reason: Option<serde_json::Value>,
-    /// Output-token logprobs (delta for this chunk; the accumulator concatenates
-    /// them). Parallel `val`/`idx` buffers. Empty unless `return_logprob`.
-    #[serde(default)]
-    pub out_lp_val: Vec<f32>,
-    #[serde(default)]
-    pub out_lp_idx: Vec<i32>,
-    /// Input (prefill) token logprobs — set once, on the first chunk.
-    #[serde(default)]
-    pub in_lp_val: Vec<f32>,
-    #[serde(default)]
-    pub in_lp_idx: Vec<i32>,
-    /// Top-k logprobs (2-level ragged): flat `val`/`idx` + per-position `lens`.
-    #[serde(default)]
-    pub out_top_val: Vec<f32>,
-    #[serde(default)]
-    pub out_top_idx: Vec<i32>,
-    #[serde(default)]
-    pub out_top_lens: Vec<u32>,
-    #[serde(default)]
-    pub in_top_val: Vec<f32>,
-    #[serde(default)]
-    pub in_top_idx: Vec<i32>,
-    #[serde(default)]
-    pub in_top_lens: Vec<u32>,
-    /// Token-ids logprobs (same 2-level ragged layout).
-    #[serde(default)]
-    pub out_tid_val: Vec<f32>,
-    #[serde(default)]
-    pub out_tid_idx: Vec<i32>,
-    #[serde(default)]
-    pub out_tid_lens: Vec<u32>,
-    #[serde(default)]
-    pub in_tid_val: Vec<f32>,
-    #[serde(default)]
-    pub in_tid_idx: Vec<i32>,
-    #[serde(default)]
-    pub in_tid_lens: Vec<u32>,
-    /// Hidden states (dense f32): flat buffer + per-row lengths. Last-writer-wins
-    /// across chunks (mirrors Python's non-cumulative `meta_info` assignment).
-    #[serde(default)]
-    pub hidden_val: Vec<f32>,
-    #[serde(default)]
-    pub hidden_lens: Vec<u32>,
-    /// Decoded logprob token text (`return_text_in_logprobs`), flat and parallel
-    /// to the matching `*_idx` buffers. Decoded on the detok shard; empty when
-    /// the request didn't ask for text (the tuple's text slot stays null).
-    #[serde(default)]
-    pub out_lp_txt: Vec<String>,
-    #[serde(default)]
-    pub in_lp_txt: Vec<String>,
-    #[serde(default)]
-    pub out_top_txt: Vec<String>,
-    #[serde(default)]
-    pub in_top_txt: Vec<String>,
-    #[serde(default)]
-    pub out_tid_txt: Vec<String>,
-    #[serde(default)]
-    pub in_tid_txt: Vec<String>,
-}
-
 /// What the connection handler receives on the egress stream. Generation output
 /// is protocol-neutral (the handler formats it); control results are a single
-/// verbatim payload.
+/// verbatim payload. The generation variants carry a [`ChunkEvent`] the detok
+/// shard has decoded in place (its `text`/`*_txt` filled).
 #[derive(Debug)]
 pub enum EgressItem {
     /// An intermediate streamed generation step (only sent for streaming reqs).
-    Frame(GenerationOutput),
+    Frame(ChunkEvent),
     /// The final generation step.
-    Done(GenerationOutput),
+    Done(ChunkEvent),
     /// A control-request result: one verbatim payload (e.g. `/server_info`),
     /// delivered as-is with no per-protocol formatting.
     Control(Bytes),
@@ -664,9 +585,14 @@ pub fn frame_egress_error(rid: &str, message: &str) -> Bytes {
     Bytes::from(buf)
 }
 
-/// One scheduler output increment for a request, pushed from Python via
-/// `push_chunk` into the egress ring. Decoded on a Rust detok shard.
-#[derive(Debug, Default, Serialize, Deserialize)]
+/// One scheduler output increment for a request. It carries the request through
+/// both sides of the detok decode boundary: the fields above `text` arrive from
+/// Python via `push_chunk` on the egress ring (a **pre-decode** frame); the detok
+/// shard then fills `text` + the `*_txt` columns **in place** and forwards the
+/// same struct as the protocol-neutral result the API handler formats/accumulates.
+/// A consumer that needs the cumulative view folds these deltas with
+/// `OutputAccumulator`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ChunkEvent {
     /// Request id as raw `u64` — the shard routing key; no parse, no clone.
     pub rid: u64,
@@ -728,6 +654,32 @@ pub struct ChunkEvent {
     pub hidden_val: Vec<f32>,
     #[serde(default)]
     pub hidden_lens: Vec<u32>,
+
+    // --- Detok-stage outputs: empty on the wire (a pre-decode frame), filled in
+    // place by the detok shard so the same struct carries the decoded result. ---
+    /// Decoded text **delta** for this chunk (empty in `skip_tokenizer_init` mode,
+    /// or when the step only produced a partial multi-byte sequence). `token_ids`
+    /// doubles as the response's `output_ids`; `completion_tokens` is this chunk's
+    /// token count (the accumulator sums it).
+    #[serde(default)]
+    pub text: String,
+    #[serde(default)]
+    pub completion_tokens: u64,
+    /// Decoded logprob token text (`return_text_in_logprobs`), flat and parallel to
+    /// the matching `*_idx` buffers. Decoded on the detok shard; empty when the
+    /// request didn't ask for text (the tuple's text slot stays null).
+    #[serde(default)]
+    pub out_lp_txt: Vec<String>,
+    #[serde(default)]
+    pub in_lp_txt: Vec<String>,
+    #[serde(default)]
+    pub out_top_txt: Vec<String>,
+    #[serde(default)]
+    pub in_top_txt: Vec<String>,
+    #[serde(default)]
+    pub out_tid_txt: Vec<String>,
+    #[serde(default)]
+    pub in_tid_txt: Vec<String>,
 }
 
 #[cfg(test)]
