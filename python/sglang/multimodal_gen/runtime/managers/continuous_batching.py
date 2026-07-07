@@ -48,6 +48,9 @@ class DenoisingBatchKey:
     attention_backend: str | None
     attention_metadata_type: str | None
     attention_metadata_signature: Any
+    enable_sequence_shard: bool | None
+    did_sp_shard_latents: bool
+    sp_video_start_frame: int
     tp_size: int
     sp_degree: int
     ulysses_degree: int
@@ -334,6 +337,9 @@ def build_denoising_batch_key(
             type(attn_metadata).__name__ if attn_metadata is not None else None
         ),
         attention_metadata_signature=_to_hashable_signature(attn_metadata),
+        enable_sequence_shard=getattr(req, "enable_sequence_shard", None),
+        did_sp_shard_latents=bool(getattr(req, "did_sp_shard_latents", False)),
+        sp_video_start_frame=int(getattr(req, "sp_video_start_frame", 0) or 0),
         tp_size=int(getattr(server_args, "tp_size", 1) or 1),
         sp_degree=int(getattr(server_args, "sp_degree", 1) or 1),
         ulysses_degree=int(getattr(server_args, "ulysses_degree", 1) or 1),

@@ -69,6 +69,46 @@ if USE_AITER:
     from aiter.ops.rope import rope_cached_2c_fwd_inplace
 
 
+def _pad_and_cat_sequence_tensors(values: list[torch.Tensor]) -> torch.Tensor:
+    if not values:
+        raise ValueError("expected at least one sequence tensor")
+    if any(not isinstance(value, torch.Tensor) for value in values):
+        raise TypeError("expected a list of sequence tensors")
+    first = values[0]
+    if first.ndim < 2:
+        raise ValueError("sequence tensors must have at least 2 dimensions")
+    if len(values) == 1:
+        return first
+
+    if all(
+        value.ndim >= 3
+        and tuple(value.shape[2:]) == tuple(first.shape[2:])
+        and value.dtype == first.dtype
+        and value.device == first.device
+        for value in values
+    ):
+        max_seq_len = max(int(value.shape[1]) for value in values)
+        padded_values = []
+        for value in values:
+            seq_len = int(value.shape[1])
+            if seq_len < max_seq_len:
+                pad_shape = list(value.shape)
+                pad_shape[1] = max_seq_len - seq_len
+                value = torch.cat([value, value.new_zeros(pad_shape)], dim=1)
+            padded_values.append(value)
+        return torch.cat(padded_values, dim=0)
+
+    if all(
+        tuple(value.shape[1:]) == tuple(first.shape[1:])
+        and value.dtype == first.dtype
+        and value.device == first.device
+        for value in values
+    ):
+        return torch.cat(values, dim=0)
+
+    raise ValueError("sequence tensors cannot be merged for batched Wan forward")
+
+
 class WanImageEmbedding(torch.nn.Module):
     def __init__(self, in_features: int, out_features: int):
         super().__init__()
@@ -1013,7 +1053,7 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
 
         orig_dtype = hidden_states.dtype
         if not isinstance(encoder_hidden_states, torch.Tensor):
-            encoder_hidden_states = encoder_hidden_states[0]
+            encoder_hidden_states = _pad_and_cat_sequence_tensors(encoder_hidden_states)
         if (
             isinstance(encoder_hidden_states_image, list)
             and len(encoder_hidden_states_image) > 0

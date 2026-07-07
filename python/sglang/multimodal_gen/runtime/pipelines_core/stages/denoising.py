@@ -1859,6 +1859,8 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 return False
             if state.req.image_latent is not None:
                 return False
+            if not self._can_share_packed_forward_batch_context(first.req, state.req):
+                return False
             if (ctx.extra.get("cfg_gate_state") or {}).get("active"):
                 return False
             branches = getattr(ctx.cfg_policy, "branches", ())
@@ -1879,6 +1881,17 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             if ctx.latents.device != first_ctx.latents.device:
                 return False
         return True
+
+    @staticmethod
+    def _can_share_packed_forward_batch_context(first: Req, current: Req) -> bool:
+        attrs = (
+            "enable_sequence_shard",
+            "did_sp_shard_latents",
+            "sp_video_start_frame",
+        )
+        return all(
+            getattr(first, attr, None) == getattr(current, attr, None) for attr in attrs
+        )
 
     @staticmethod
     def _can_share_packed_attn_metadata(first: Any, current: Any) -> bool:
