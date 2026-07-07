@@ -117,14 +117,10 @@ def _invoke_provider(
 
 class ResolvedView:
     """Read-only view of the resolving configuration handed to post-process
-    passes.
-
-    During the dual-apply transition the view forwards every read to the live
-    ``server_args`` — the pristine input plus the declarations replayed so far
-    plus any residual imperative writes — which is exactly the state the
-    legacy handler at the same slot observed. In the end state (dual-apply
-    retired) the same type overlays the accumulated declarations on the
-    pristine object. Writes are rejected: passes return declarations.
+    passes: the accumulated declarations overlaid on the pristine
+    ``server_args`` (residual imperative writes of non-resolved fields show
+    through the fallthrough) — exactly the state the legacy handler at the
+    same slot observed. Writes are rejected: passes return declarations.
     """
 
     __slots__ = ("_server_args", "_overlay")
@@ -162,14 +158,27 @@ def register_post_process(fn: Callable[..., dict]) -> Callable[..., dict]:
     return fn
 
 
-def run_post_process_pass(server_args: Any, fn: Callable[..., dict]) -> None:
-    """Transition-period invocation of one pass at its legacy handler slot.
+def _declaration_overlay(server_args: Any) -> Dict[str, Any]:
+    """Accumulated declared values: declarations never mutate
+    ``server_args``, so mid-resolution readers overlay them from the
+    declaration stash (last writer wins, like the gate)."""
+    overlay: Dict[str, Any] = {}
+    for _source, declared in getattr(server_args, "_resolved_overrides", None) or ():
+        overlay.update(declared)
+    return overlay
 
-    Evaluates the pass on the live state (through a read-only view), appends
-    its declaration to the declaration stash, and dual-applies it in place —
-    byte-identical to the imperative handler write this replaces.
+
+def run_post_process_pass(server_args: Any, fn: Callable[..., dict]) -> None:
+    """Invoke one pass at its legacy handler slot.
+
+    Evaluates the pass on the resolving state (a read-only view with the
+    accumulated declarations overlaid from the stash) and appends its
+    declaration to the stash. During ``__post_init__`` the fields stay
+    untouched — ``materialize_declarations`` applies the whole stash once at
+    the end of resolution; a pass invoked after materialization (a post-init
+    slot) writes through immediately.
     """
-    declared = fn(ResolvedView(server_args))
+    declared = fn(ResolvedView(server_args, overlay=_declaration_overlay(server_args)))
     if not isinstance(declared, dict):
         raise TypeError(
             f"post-process pass {fn.__qualname__} must return a dict, "
@@ -186,19 +195,70 @@ def run_post_process_pass(server_args: Any, fn: Callable[..., dict]) -> None:
             # must sit at or after it in __post_init__ order.
             stash = server_args._resolved_overrides = []
         stash.append(entry)
-        apply_declarations_to_server_args(server_args, [entry])
+        validate_declarations(server_args, [entry])
+        if getattr(server_args, "_declarations_materialized", False):
+            for field, value in declared.items():
+                setattr(server_args, field, value)
+
+
+def materialize_declarations(server_args: Any) -> None:
+    """Apply the accumulated declarations onto ``server_args`` once, at the
+    end of ``__post_init__`` (gate order: last writer wins). After this the
+    fields carry the resolved configuration — every post-init reader, in any
+    process, reads them directly; ``resolved_view`` remains an internal
+    helper for mid-resolution code only."""
+    for _source, declared in getattr(server_args, "_resolved_overrides", None) or ():
+        for field, value in declared.items():
+            setattr(server_args, field, value)
+    server_args._declarations_materialized = True
+
+
+def resolved_view(server_args: Any) -> ResolvedView:
+    """Read-only view of the resolving configuration for mid-resolution code
+    that is not a pass (``__post_init__`` handlers and hooks). Internal to
+    the resolution pipeline: after ``materialize_declarations`` runs, the
+    fields themselves carry the resolved values — read them directly."""
+    return ResolvedView(server_args, overlay=_declaration_overlay(server_args))
+
+
+def attention_backends_of(cfg: Any) -> tuple:
+    """(prefill, decode) attention backends of a config-shaped object (a
+    ResolvedView mid-resolution, or pristine server_args at dispatch time):
+    split fields fall back to the base backend."""
+    prefill = (
+        cfg.prefill_attention_backend
+        if cfg.prefill_attention_backend
+        else cfg.attention_backend
+    )
+    decode = (
+        cfg.decode_attention_backend
+        if cfg.decode_attention_backend
+        else cfg.attention_backend
+    )
+    return prefill, decode
+
+
+def mamba_extra_buffer_of(cfg: Any) -> bool:
+    """Mid-resolution equivalent of runtime_context.mamba_extra_buffer_enabled:
+    reads the (possibly overlaid) strategy from a config-shaped object."""
+    return cfg.disable_radix_cache is False and cfg.mamba_radix_cache_strategy in (
+        "extra_buffer",
+        "extra_buffer_lazy",
+    )
 
 
 def declare_load_time_override(source: str, declared: Dict[str, Any]) -> None:
-    """Transition helper for load-time resolved fields (model-file config
-    overrides, weight-resolved dtypes): dual-apply the declaration onto the
-    published ``server_args`` — byte-identical to the imperative write this
-    replaces — and record it into the flags tier through the runtime gate."""
+    """Declare a load-time resolved field (model-file config overrides,
+    weight-resolved dtypes): apply it onto the published ``server_args`` —
+    resolution has already materialized, so post-init declarations write
+    through — and record it into the flags tier through the runtime gate."""
     from sglang.srt.runtime_context import get_context
 
     ctx = get_context()
     entry = (source, dict(declared))
-    apply_declarations_to_server_args(ctx.server_args, [entry])
+    validate_declarations(ctx.server_args, [entry])
+    for field, value in declared.items():
+        setattr(ctx.server_args, field, value)
     ctx.record_runtime_overrides([entry])
 
 
@@ -741,8 +801,11 @@ def _qwen3_5_hybrid_overrides(server_args: Any, hf_config: Any) -> dict:
         use_mla_backend=server_args.use_mla_backend(),
         model_config=server_args.get_model_config(),
     )
+    # The mamba radix-cache pass runs before this dispatch: read the
+    # declared strategy through the view (the legacy branch observed the
+    # already-written field here).
     if default_attn_backend == "trtllm_mha" and not (
-        not server_args.enable_mamba_extra_buffer()
+        not mamba_extra_buffer_of(resolved_view(server_args))
         and not server_args.disable_radix_cache
         and server_args.speculative_algorithm is None
     ):
@@ -1520,11 +1583,56 @@ def _mla_backend_page_constraints(view: Any) -> dict:
 
 
 @register_post_process
+def _mla_kv_cache_dtype_checks(view: Any) -> dict:
+    """Read-only validation pass in the attention-backend compatibility
+    handler: the TRT-LLM and tokenspeed MLA backends constrain the resolved
+    kv-cache dtype (declarations never reach the field, so the checks read
+    the view)."""
+    if (
+        view.attention_backend == "trtllm_mla"
+        or view.decode_attention_backend == "trtllm_mla"
+    ):
+        if not is_blackwell_supported():
+            raise ValueError(
+                "TRTLLM MLA backend is only supported on Blackwell GPUs (SM100/SM12x). Please use a different backend."
+            )
+        if view.kv_cache_dtype not in ["fp8_e4m3", "fp4_e2m1", "bf16", "auto"]:
+            raise ValueError(
+                "TensorRT-LLM MLA backend only supports kv-cache-dtype of fp8_e4m3, fp4_e2m1, bf16, or auto."
+            )
+    if (
+        view.attention_backend == "tokenspeed_mla"
+        or view.decode_attention_backend == "tokenspeed_mla"
+    ):
+        if not is_blackwell_supported():
+            raise ValueError(
+                "tokenspeed_mla backend is only supported on Blackwell GPUs (SM100/SM12x)."
+            )
+        if view.kv_cache_dtype not in ["fp8_e4m3"]:
+            raise ValueError(
+                "tokenspeed_mla backend requires kv-cache-dtype=fp8_e4m3, "
+                f"got {view.kv_cache_dtype}."
+            )
+    return {}
+
+
+@register_post_process
+def _hisparse_validation(view: Any) -> dict:
+    """Read-only validation pass: --enable-hisparse constraints (model class,
+    radix cache, kv dtype, DSA backends) read the resolved values through the
+    view."""
+    from sglang.srt.arg_groups.hisparse_hook import validate_hisparse
+
+    validate_hisparse(view)
+    return {}
+
+
+@register_post_process
 def _cutedsl_prefill_backend_fill(view: Any) -> dict:
     """Slot pass in the attention-backend compatibility handler: CuteDSL MLA
     is decode-only, so validate the combination and default the prefill side
     to trtllm_mla. The trtllm_mha check that follows at the legacy slot reads
-    the dual-applied value."""
+    the resolved value through the view."""
     if not (
         view.attention_backend == "cutedsl_mla"
         or view.decode_attention_backend == "cutedsl_mla"
@@ -1610,7 +1718,7 @@ def _attention_backend_platform_fallbacks(view: Any) -> dict:
 
 @register_post_process
 def _intel_xpu_page_constraint(view: Any) -> dict:
-    _, decode_backend = view.get_attention_backends()
+    _, decode_backend = attention_backends_of(view)
     if decode_backend == "intel_xpu":
         if view.use_mla_backend():
             supported_page_sizes = [16, 32, 64, 128]
@@ -1675,6 +1783,17 @@ def _data_parallelism_defaults(view: Any) -> dict:
 
 
 @register_post_process
+def _dp_lm_head_validation(view: Any) -> dict:
+    """Read-only validation pass: dp-attention is a prerequisite for the
+    dp LM head. Reads the mid-resolution values through the view."""
+    if view.enable_dp_lm_head:
+        assert (
+            view.enable_dp_attention
+        ), "Please enable dp attention when setting enable_dp_lm_head. "
+    return {}
+
+
+@register_post_process
 def _moe_runner_backend_quant_constraints(view: Any) -> dict:
     """The quantization-driven moe_runner_backend resolutions at the head of
     _handle_moe_kernel_config. The backend-compatibility asserts and the
@@ -1729,6 +1848,49 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
 
 
 @register_post_process
+def _moe_runner_fusion_disable(view: Any) -> dict:
+    """FlashInfer CuteDSL / TRT-LLM / TRT-LLM-routed MoE runners require the
+    shared-experts fusion disabled; declared at the legacy write slots in
+    _handle_moe_kernel_config (before the deprecated cutlass env override, so
+    the runner value observed is the pre-override one)."""
+    runner = view.moe_runner_backend
+    if runner == "flashinfer_cutedsl":
+        logger.warning(
+            "FlashInfer CuteDSL MoE is enabled. --disable-shared-experts-fusion is automatically set."
+        )
+        return {"disable_shared_experts_fusion": True}
+    if runner in ("flashinfer_trtllm", "experimental_sgl_trtllm"):
+        logger.warning(
+            "FlashInfer TRTLLM MoE is enabled. --disable-shared-experts-fusion is automatically set."
+        )
+        return {"disable_shared_experts_fusion": True}
+    if runner == "flashinfer_trtllm_routed":
+        logger.warning(
+            "FlashInfer TRTLLM routed MoE is enabled. --disable-shared-experts-fusion is automatically set."
+        )
+        return {"disable_shared_experts_fusion": True}
+    return {}
+
+
+def _a2a_fusion_adjustments(view: Any) -> dict:
+    """A2A-backend-driven shared-experts fusion adjustments, declared at the
+    legacy write slots in _handle_a2a_moe: DeepEP Waterfill requires the
+    fusion enabled; FlashInfer A2A requires it disabled."""
+    if view.moe_a2a_backend == "deepep" and view.enable_deepep_waterfill:
+        if view.disable_shared_experts_fusion:
+            logger.warning(
+                "disable_shared_experts_fusion is overridden to False because DeepEP Waterfill requires shared expert fusion."
+            )
+            return {"disable_shared_experts_fusion": False}
+        return {}
+    if view.moe_a2a_backend == "flashinfer":
+        logger.warning(
+            "Flashinfer MoE A2A is enabled. --disable-shared-experts-fusion is automatically set."
+        )
+        return {"disable_shared_experts_fusion": True}
+    return {}
+
+
 def _cutlass_moe_env_override(view: Any) -> dict:
     from sglang.srt.environ import envs
 
@@ -1847,14 +2009,23 @@ def _dllm_overlap_disable(view: Any) -> dict:
 
 @register_post_process
 def _dllm_page_size(view: Any) -> dict:
-    if view.dllm_algorithm is None or view.disable_radix_cache:
+    if view.dllm_algorithm is None:
         return {}
     from sglang.srt.dllm.config import DllmConfig
 
     config = DllmConfig.from_server_args(view)
-    if view.page_size % config.block_size != 0:
+    if not view.disable_radix_cache and view.page_size % config.block_size != 0:
         logger.warning(
             f"Setting page size to {config.block_size} for diffusion LLM inference"
+        )
+        return {"page_size": config.block_size}
+    if view.page_size > config.block_size:
+        # Legacy scheduler-init fallback, folded into the pass: the page
+        # size must not exceed the dllm block size.
+        logger.warning(
+            "WARNING: "
+            f"The page size {view.page_size} should not be larger than dllm block size {config.block_size}."
+            f"Page size now falls back to {config.block_size}"
         )
         return {"page_size": config.block_size}
     return {}
@@ -1938,45 +2109,35 @@ def apply_model_overrides(
     return records
 
 
-def apply_declarations_to_server_args(
+def validate_declarations(
     server_args: Any,
     declarations: Sequence[Tuple[str, Dict[str, Any]]],
-    *,
-    terminal: Sequence[Tuple[str, Dict[str, Any]]] = (),
 ) -> None:
-    """Transition-period dual-apply: replay declarations onto ``server_args``
-    in gate order, byte-identical to the legacy imperative writes.
-
-    Retired per field once that field's readers have all flipped to the flags
-    tier (at which point the server_args field returns to pristine).
-
-    Validates against the same whitelist as the publish gate BEFORE any write:
-    a registry typo or a not-yet-resolvable field must fail fast here, not
-    mutate ``server_args`` and only be rejected at publish time.
+    """Fail-fast whitelist check at declaration time: a registry typo or a
+    not-yet-resolvable field must be rejected at its slot, not only at
+    publish time. Declarations never mutate ``server_args``.
     """
     # Non-dataclass fixtures carry no Arg metadata (mirrors the
     # resolvable_fields escape); only real ServerArgs is validated.
-    if dataclasses.is_dataclass(type(server_args)):
-        whitelist = resolvable_fields(type(server_args))
-        for source, decl in list(declarations) + list(terminal):
-            unknown = set(decl) - whitelist
-            if unknown:
-                raise ValueError(
-                    f"{source}: {sorted(unknown)} not model-overridable; the "
-                    "transition dual-apply refuses fields the publish gate "
-                    "would reject."
-                )
-    for _source, decl in list(declarations) + list(terminal):
-        for field, value in decl.items():
-            setattr(server_args, field, value)
+    if not dataclasses.is_dataclass(type(server_args)):
+        return
+    whitelist = resolvable_fields(type(server_args))
+    for source, decl in declarations:
+        unknown = set(decl) - whitelist
+        if unknown:
+            raise ValueError(
+                f"{source}: {sorted(unknown)} not model-overridable; "
+                "declarations are limited to the fields the publish gate "
+                "accepts."
+            )
 
 
 def refresh_declared_fields(server_args: Any, fields: Iterable[str]) -> None:
-    """Transition helper for legacy code that overwrites a resolved field
-    AFTER the override collection in ``__post_init__`` (e.g.
-    ``ModelRunner.model_specific_adjustment`` forcing ``attention_backend``
-    for HRM-Text). Redeclares the live value so publish parity holds and the
-    flags tier materializes the adjusted end state.
+    """Helper for legacy code that overwrites a resolved field AFTER
+    materialization (e.g. ``ModelRunner.model_specific_adjustment`` forcing
+    ``attention_backend`` for HRM-Text). Redeclares the live value so the
+    publish parity holds and the flags tier materializes the adjusted end
+    state.
     """
     _missing = object()
     declarations = server_args._resolved_overrides
@@ -1999,8 +2160,8 @@ def assert_flag_parity(
     *,
     leaf_map: Optional[Dict[str, str]] = None,
 ) -> None:
-    """Dual-apply drift guard: each migrated field's flag leaf must equal the
-    (dual-applied) ``server_args`` value."""
+    """Drift guard: each declared field's flag leaf must equal the
+    (materialized) ``server_args`` value."""
     mismatches = []
     for field in fields:
         owner, leaf = resolve_flag_leaf(flags, field, leaf_map=leaf_map)

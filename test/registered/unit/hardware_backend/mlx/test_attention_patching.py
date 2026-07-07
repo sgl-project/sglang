@@ -1538,6 +1538,13 @@ if _HAS_MLX:
             self.last_batch = None
             self.processed_batch = None
             self.processed_result = None
+            # _finalize_mlx_pending_job now advances forward_ct and runs the
+            # profiler batch predicate (mirroring run_batch); stub both so the
+            # overlap accounting added in #29217 has something to call.
+            self.forward_ct = 0
+            self.profiler_manager = SimpleNamespace(
+                _profile_batch_predicate=lambda batch: None
+            )
 
         def process_batch_result(self, batch, result):
             self.processed_batch = batch
