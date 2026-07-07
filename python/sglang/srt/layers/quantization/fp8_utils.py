@@ -517,8 +517,7 @@ def initialize_fp8_gemm_config(server_args: ServerArgs) -> None:
 
     backend = server_args.fp8_gemm_runner_backend
     if backend == "auto" and is_sm120_supported():
-        # TODO(brayden): Verify if CUTLASS can be set by default once SwapAB is supported
-        backend = "triton"
+        backend = "cutlass"
 
     backend = Fp8GemmRunnerBackend(backend)
 
