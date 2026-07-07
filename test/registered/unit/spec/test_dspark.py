@@ -1196,6 +1196,270 @@ class TestDSparkDeepSpecSemanticReference(CustomTestCase):
 
         self.assertTrue(t.equal(deepspec_out, sglang_out))
 
+    def _apply_rope(self, x, positions):
+        t = self.torch
+        dim = x.shape[-1]
+        self.assertEqual(dim % 2, 0)
+        inv_freq = 1.0 / (
+            10000
+            ** (t.arange(0, dim, 2, dtype=x.dtype, device=x.device) / dim)
+        )
+        freqs = positions.to(dtype=x.dtype, device=x.device)[..., None] * inv_freq
+        cos = freqs.cos()
+        sin = freqs.sin()
+        x_even = x[..., 0::2]
+        x_odd = x[..., 1::2]
+        out = t.empty_like(x)
+        out[..., 0::2] = x_even * cos - x_odd * sin
+        out[..., 1::2] = x_even * sin + x_odd * cos
+        return out
+
+    def test_materialized_context_matches_concat_with_rope_absolute_positions(self):
+        # This covers the main precision risk that plain concat tests miss:
+        # Q/K must be rotated with the same absolute positions before the
+        # context K/V rows are materialized into the draft cache.
+        t = self.torch
+        t.manual_seed(2)
+        batch_size = 2
+        context_len = 6
+        block_size = 3
+        hidden_size = 8
+        head_dim = 8
+
+        context_hidden = t.randn(batch_size, context_len, hidden_size)
+        block_hidden = t.randn(batch_size, block_size, hidden_size)
+        wq = t.randn(hidden_size, head_dim)
+        wk = t.randn(hidden_size, head_dim)
+        wv = t.randn(hidden_size, head_dim)
+        context_positions = t.tensor(
+            [[101, 102, 103, 104, 105, 106], [205, 206, 207, 208, 209, 210]]
+        )
+        block_positions = t.tensor([[107, 108, 109], [211, 212, 213]])
+        visible_context = t.tensor(
+            [
+                [False, True, True, True, True, True],
+                [True, True, False, True, True, True],
+            ],
+            dtype=t.bool,
+        )
+        causal = t.tril(t.ones((block_size, block_size), dtype=t.bool))
+
+        def masked_attention(q, k, v, mask):
+            scores = q @ k.transpose(-1, -2) / (head_dim**0.5)
+            scores = scores.masked_fill(~mask, float("-inf"))
+            return t.softmax(scores, dim=-1) @ v
+
+        q_block = self._apply_rope(block_hidden @ wq, block_positions)
+        k_context = self._apply_rope(context_hidden @ wk, context_positions)
+        k_block = self._apply_rope(block_hidden @ wk, block_positions)
+        v_context = context_hidden @ wv
+        v_block = block_hidden @ wv
+        full_mask = t.cat(
+            [
+                visible_context[:, None, :].expand(-1, block_size, -1),
+                causal[None, :, :].expand(batch_size, -1, -1),
+            ],
+            dim=-1,
+        )
+
+        deepspec_out = masked_attention(
+            q_block,
+            t.cat([k_context, k_block], dim=1),
+            t.cat([v_context, v_block], dim=1),
+            full_mask,
+        )
+        materialized_k_cache = k_context.clone()
+        materialized_v_cache = v_context.clone()
+        sglang_out = masked_attention(
+            q_block,
+            t.cat([materialized_k_cache, k_block], dim=1),
+            t.cat([materialized_v_cache, v_block], dim=1),
+            full_mask,
+        )
+
+        self.assertTrue(t.allclose(deepspec_out, sglang_out, atol=0.0, rtol=0.0))
+
+    def test_materialized_context_precision_grid_matches_concat(self):
+        t = self.torch
+        configs = [
+            (t.float32, 1, 2, 2, 4),
+            (t.float32, 3, 5, 4, 8),
+            (t.float64, 2, 7, 3, 10),
+        ]
+        for dtype, batch_size, context_len, block_size, hidden_size in configs:
+            with self.subTest(
+                dtype=str(dtype),
+                batch_size=batch_size,
+                context_len=context_len,
+                block_size=block_size,
+                hidden_size=hidden_size,
+            ):
+                t.manual_seed(100 + batch_size + context_len + block_size)
+                context_hidden = t.randn(
+                    batch_size, context_len, hidden_size, dtype=dtype
+                )
+                block_hidden = t.randn(
+                    batch_size, block_size, hidden_size, dtype=dtype
+                )
+                wq = t.randn(hidden_size, hidden_size, dtype=dtype)
+                wk = t.randn(hidden_size, hidden_size, dtype=dtype)
+                wv = t.randn(hidden_size, hidden_size, dtype=dtype)
+                q_block = block_hidden @ wq
+                k_context = context_hidden @ wk
+                v_context = context_hidden @ wv
+                k_block = block_hidden @ wk
+                v_block = block_hidden @ wv
+                mask = t.ones(
+                    (batch_size, block_size, context_len + block_size),
+                    dtype=t.bool,
+                )
+                block_causal = t.tril(t.ones((block_size, block_size), dtype=t.bool))
+                mask[:, :, context_len:] = block_causal
+
+                def attention(q, k, v):
+                    scores = q @ k.transpose(-1, -2) / (hidden_size**0.5)
+                    scores = scores.masked_fill(~mask, float("-inf"))
+                    return t.softmax(scores, dim=-1) @ v
+
+                deepspec_out = attention(
+                    q_block,
+                    t.cat([k_context, k_block], dim=1),
+                    t.cat([v_context, v_block], dim=1),
+                )
+                materialized_out = attention(
+                    q_block,
+                    t.cat([k_context.clone(), k_block], dim=1),
+                    t.cat([v_context.clone(), v_block], dim=1),
+                )
+                self.assertTrue(
+                    t.allclose(deepspec_out, materialized_out, atol=0.0, rtol=0.0)
+                )
+
+    def test_materialized_context_precision_test_detects_wrong_kv_order(self):
+        t = self.torch
+        t.manual_seed(3)
+        batch_size = 1
+        context_len = 5
+        block_size = 3
+        hidden_size = 8
+        context_hidden = t.randn(batch_size, context_len, hidden_size)
+        block_hidden = t.randn(batch_size, block_size, hidden_size)
+        wq = t.randn(hidden_size, hidden_size)
+        wk = t.randn(hidden_size, hidden_size)
+        wv = t.randn(hidden_size, hidden_size)
+        q_block = block_hidden @ wq
+        k_context = context_hidden @ wk
+        v_context = context_hidden @ wv
+        k_block = block_hidden @ wk
+        v_block = block_hidden @ wv
+
+        def attention(q, k, v):
+            scores = q @ k.transpose(-1, -2) / (hidden_size**0.5)
+            return t.softmax(scores, dim=-1) @ v
+
+        expected = attention(
+            q_block,
+            t.cat([k_context, k_block], dim=1),
+            t.cat([v_context, v_block], dim=1),
+        )
+        wrong_k_context = k_context[:, [1, 0, 2, 3, 4], :]
+        wrong_v_context = v_context[:, [1, 0, 2, 3, 4], :]
+        wrong = attention(
+            q_block,
+            t.cat([wrong_k_context, k_block], dim=1),
+            t.cat([wrong_v_context, v_block], dim=1),
+        )
+
+        self.assertFalse(t.allclose(expected, wrong, atol=1e-5, rtol=1e-5))
+        self.assertGreater(float((expected - wrong).abs().max().item()), 1e-4)
+
+    def test_markov_refine_matches_deepspec_across_shape_grid(self):
+        repo_root = Path(__file__).resolve().parents[5]
+        deepspec_root = repo_root / "DeepSpec"
+        if not deepspec_root.exists():
+            self.skipTest(f"DeepSpec checkout not found: {deepspec_root}")
+        sys.path.insert(0, str(deepspec_root))
+        try:
+            from deepspec.modeling.dspark.markov_head import VanillaMarkov
+            from sglang.srt.speculative.dspark_worker_v2 import DSparkWorkerV2
+        except Exception as e:
+            self.skipTest(f"DeepSpec/SGLang DSpark imports unavailable: {e}")
+
+        t = self.torch
+
+        class _LogitsProcessor:
+            def _compute_lm_head(self, hidden_states, head):
+                return head(hidden_states)
+
+        class _ConfidenceHead:
+            def __call__(self, hidden_states, markov_embeds):
+                return hidden_states.new_zeros(hidden_states.shape[:2])
+
+        configs = [
+            (1, 1, 4, 11, 3, 11),
+            (2, 4, 6, 19, 5, 0),
+            (3, 5, 8, 23, 7, 17),
+        ]
+        for bs, block_size, hidden_size, vocab_size, markov_rank, seed in configs:
+            with self.subTest(
+                bs=bs,
+                block_size=block_size,
+                hidden_size=hidden_size,
+                vocab_size=vocab_size,
+                markov_rank=markov_rank,
+            ):
+                t.manual_seed(seed)
+                block_hidden = t.randn(bs, block_size, hidden_size)
+                anchor_tokens = t.randint(0, vocab_size, (bs,), dtype=t.int64)
+                lm_head = t.nn.Linear(hidden_size, vocab_size, bias=False)
+                markov_head = VanillaMarkov(
+                    vocab_size=vocab_size,
+                    markov_rank=markov_rank,
+                )
+                worker = DSparkWorkerV2.__new__(DSparkWorkerV2)
+                worker.block_size = block_size
+                worker.verify_stride = block_size + 1
+                worker.markov_rank = markov_rank
+                worker.noise_token_id = 0
+                worker._markov_refine_buffer_cap = 0
+                worker._markov_candidates_buf = None
+                worker._markov_embeds_buf = None
+                worker._vocab_shard_mapping_cache = {}
+                worker._accept_anomaly_enabled = False
+                worker._parity_dump_enabled = False
+                worker._last_markov_refine_debug = None
+                worker._draft_inner = SimpleNamespace(
+                    vocab_size=vocab_size,
+                    markov_head=markov_head,
+                    confidence_head=_ConfidenceHead(),
+                )
+                worker.draft_model = SimpleNamespace(
+                    lm_head=lm_head,
+                    logits_processor=_LogitsProcessor(),
+                )
+
+                candidates, confidence = DSparkWorkerV2._refine_block_markov(
+                    worker,
+                    block_hidden=block_hidden,
+                    anchor_tokens=anchor_tokens,
+                )
+
+                base_logits = lm_head(block_hidden)
+                ref_candidates = t.empty(bs, block_size + 1, dtype=t.int64)
+                ref_candidates[:, 0] = anchor_tokens
+                prev_tokens = anchor_tokens
+                for step in range(block_size):
+                    bias = markov_head.markov_w2(
+                        markov_head.get_prev_embeddings(prev_tokens)
+                    )
+                    next_tokens = t.argmax(base_logits[:, step, :] + bias, dim=-1)
+                    ref_candidates[:, step + 1] = next_tokens
+                    prev_tokens = next_tokens
+
+                self.assertEqual(candidates.tolist(), ref_candidates.tolist())
+                self.assertEqual(tuple(confidence.shape), (bs, block_size))
+                self.assertTrue(t.equal(confidence, t.zeros_like(confidence)))
+
     def test_markov_refine_matches_deepspec_vanilla_markov_reference(self):
         repo_root = Path(__file__).resolve().parents[5]
         deepspec_root = repo_root / "DeepSpec"
