@@ -7040,7 +7040,7 @@ class ServerArgs:
         # Enable LoRA if any LoRA paths are provided for backward compatibility.
         if self.lora_paths:
             if self.enable_lora is None:
-                self.enable_lora = True
+                self.override("check_lora_server_args", enable_lora=True)
                 logger.warning(
                     "--enable-lora is set to True because --lora-paths is provided."
                 )
@@ -7051,7 +7051,9 @@ class ServerArgs:
 
         if self.enable_lora:
             if self.enable_lora_overlap_loading is None:
-                self.enable_lora_overlap_loading = False
+                self.override(
+                    "check_lora_server_args", enable_lora_overlap_loading=False
+                )
 
             if self.enable_lora_overlap_loading:
                 # TODO (glenliu21): use some sort of buffer with eviction instead of enforcing a limit
@@ -7072,9 +7074,8 @@ class ServerArgs:
 
             # Parse lora_paths
             if isinstance(self.lora_paths, list):
-                lora_paths = self.lora_paths
-                self.lora_paths = []
-                for lora_path in lora_paths:
+                parsed_lora_paths = []
+                for lora_path in self.lora_paths:
                     if isinstance(lora_path, str):
                         if "=" in lora_path:
                             name, path = lora_path.split("=", 1)
@@ -7108,19 +7109,23 @@ class ServerArgs:
                             f"Invalid type for item in --lora-paths list: {type(lora_path)}. "
                             "Expected a string or a dictionary."
                         )
-                    self.lora_paths.append(lora_ref)
+                    parsed_lora_paths.append(lora_ref)
+                self.override("check_lora_server_args", lora_paths=parsed_lora_paths)
             elif isinstance(self.lora_paths, dict):
-                self.lora_paths = [
-                    LoRARef(
-                        lora_id=LoRARef.deterministic_id(k, v),
-                        lora_name=k,
-                        lora_path=v,
-                        pinned=False,
-                    )
-                    for k, v in self.lora_paths.items()
-                ]
+                self.override(
+                    "check_lora_server_args",
+                    lora_paths=[
+                        LoRARef(
+                            lora_id=LoRARef.deterministic_id(k, v),
+                            lora_name=k,
+                            lora_path=v,
+                            pinned=False,
+                        )
+                        for k, v in self.lora_paths.items()
+                    ],
+                )
             elif self.lora_paths is None:
-                self.lora_paths = []
+                self.override("check_lora_server_args", lora_paths=[])
             else:
                 raise ValueError(
                     f"Invalid type for --lora-paths: {type(self.lora_paths)}. "
@@ -7130,7 +7135,10 @@ class ServerArgs:
             # Normalize target modules to a set; keep {"all"} as a sentinel
             # that gets resolved model-awarely in lora_manager.init_lora_shapes().
             if self.lora_target_modules:
-                self.lora_target_modules = set(self.lora_target_modules)
+                self.override(
+                    "check_lora_server_args",
+                    lora_target_modules=set(self.lora_target_modules),
+                )
                 if "all" in self.lora_target_modules:
                     assert (
                         len(self.lora_target_modules) == 1
