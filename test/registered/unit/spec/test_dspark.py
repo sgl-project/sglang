@@ -314,6 +314,21 @@ class TestDSparkPrefillHandoff(CustomTestCase):
         )
         self.assertEqual(recovered.tolist(), [0, 0])
 
+    def test_transfer_warmup_rounds_casts_dtype_without_changing_values(self):
+        t = self.torch
+        draft_input = self._make_prefill_input(rounds=1)
+        draft_input.transfer_warmup_rounds = t.tensor([3, 0], dtype=t.int64)
+
+        recovered = self.worker_cls._get_transfer_warmup_rounds(
+            self._worker(0),
+            draft_input,
+            bs=2,
+            device=t.device("cpu"),
+        )
+
+        self.assertEqual(recovered.dtype, t.int32)
+        self.assertEqual(recovered.tolist(), [3, 0])
+
     def test_prefill_tail_hidden_packs_variable_length_batch(self):
         t = self.torch
         hidden = t.arange(10 * 2, dtype=t.float32).view(10, 2)
@@ -396,6 +411,32 @@ class TestDSparkPrefillHandoff(CustomTestCase):
 
         self.assertEqual(anchors.tolist(), [12, 201, 1002, 1003])
 
+    def test_decode_anchor_tokens_prefers_seq_lens_cpu_and_safe_fallbacks(self):
+        t = self.torch
+        worker = self._worker(0)
+        worker.noise_token_id = 999
+        batch = SimpleNamespace(
+            reqs=[
+                SimpleNamespace(origin_input_ids=[10, 11], output_ids=[200]),
+                SimpleNamespace(origin_input_ids=[20], output_ids=[]),
+                SimpleNamespace(origin_input_ids=None, output_ids=[300]),
+                SimpleNamespace(origin_input_ids=[], output_ids=[]),
+            ],
+            seq_lens_cpu=[2, 99, 1, 0],
+        )
+
+        anchors = self.worker_cls._get_decode_anchor_tokens(
+            worker,
+            batch=batch,
+            prefix_lens=t.tensor([99, 1, 99, 99], dtype=t.int64),
+            fallback_tokens=t.tensor([1000, 1001, 1002], dtype=t.int64),
+            prefer_fallback_tokens=t.tensor([False, True, False, False]),
+            bs=4,
+            device=t.device("cpu"),
+        )
+
+        self.assertEqual(anchors.tolist(), [11, 20, 300, 999])
+
     def test_decode_next_input_carries_warmup_rounds(self):
         t = self.torch
         draft_input = self.worker_cls._make_next_draft_input_decode(
@@ -459,6 +500,25 @@ class TestDSparkPrefillHandoff(CustomTestCase):
                 flush=True,
             )
 
+    def test_accept_bonus_zero_draft_match_commits_target_first_token(self):
+        t = self.torch
+        candidates = t.tensor([[10, 20, 30, 40]], dtype=t.int64)
+        target_predict = t.tensor([[99, 30, 40, 77]], dtype=t.int64)
+        confidence = t.zeros((1, 3), dtype=t.float32)
+
+        commit_lens, bonus_tokens, out_tokens = (
+            self.worker_cls._compute_accept_bonus_eager(
+                self._accept_worker(),
+                candidates=candidates,
+                target_predict=target_predict,
+                confidence=confidence,
+            )
+        )
+
+        self.assertEqual(commit_lens.tolist(), [1])
+        self.assertEqual(bonus_tokens.tolist(), [99])
+        self.assertEqual(out_tokens.tolist(), [[99, 30, 40, 0]])
+
     def test_accept_bonus_confidence_gate_truncates_match_prefix(self):
         t = self.torch
         candidates = t.tensor([[10, 20, 30, 40]], dtype=t.int64)
@@ -477,6 +537,27 @@ class TestDSparkPrefillHandoff(CustomTestCase):
         self.assertEqual(commit_lens.tolist(), [2])
         self.assertEqual(bonus_tokens.tolist(), [30])
         self.assertEqual(out_tokens.tolist(), [[20, 30, 40, 0]])
+
+    def test_confident_prefix_handles_disabled_gate_and_threshold_boundary(self):
+        t = self.torch
+        confidence = t.tensor(
+            [
+                [0.0, 10.0, -10.0],
+                [10.0, -10.0, 10.0],
+                [-10.0, 10.0, 10.0],
+            ],
+            dtype=t.float32,
+        )
+
+        worker = self._accept_worker()
+        self.assertEqual(
+            self.worker_cls._confident_prefix(worker, confidence).tolist(), [3, 3, 3]
+        )
+
+        worker = self._accept_worker(use_confidence_gate=True, threshold=0.5)
+        self.assertEqual(
+            self.worker_cls._confident_prefix(worker, confidence).tolist(), [2, 1, 0]
+        )
 
     def test_accept_bonus_confidence_gate_is_applied_per_batch_row(self):
         t = self.torch
