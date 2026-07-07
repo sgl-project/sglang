@@ -3,28 +3,14 @@
 from dataclasses import dataclass, field
 from typing import Any
 
-from sglang.multimodal_gen.configs.sample.sampling_params import (
-    DataType,
-    SamplingParams,
-    _sanitize_filename,
-)
+from sglang.multimodal_gen.configs.sample.vla import VLASamplingParams
 
 
 @dataclass
-class Pi05SamplingParams(SamplingParams):
+class Pi05SamplingParams(VLASamplingParams):
     """Sampling parameters for Pi0.5 flow-matching action inference."""
 
-    data_type: DataType = DataType.ACTION
-    prompt: str | list[str] | None = field(
-        default="", metadata={"batch_sig_exclude": True}
-    )
-    negative_prompt: str | None = None
     num_inference_steps: int = 10
-    guidance_scale: float = 1.0
-    num_frames: int = 1
-    fps: int = 1
-    save_output: bool = False
-    return_file_paths_only: bool = False
 
     action_horizon: int = 50
     action_dim: int = 32
@@ -98,5 +84,4 @@ class Pi05SamplingParams(SamplingParams):
     def _set_output_file_name(self):
         if self.output_file_name is None:
             self.output_file_name = "pi05_action"
-        self.output_file_name = _sanitize_filename(self.output_file_name)
-        self._set_output_file_ext()
+        super()._set_output_file_name()

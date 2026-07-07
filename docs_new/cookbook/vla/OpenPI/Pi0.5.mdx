@@ -261,6 +261,7 @@ Pi0.5 is implemented as a native VLA/action-policy pipeline, not as an SRT LLM s
 | Area | File | Main Types / Methods |
 | --- | --- | --- |
 | Pipeline wiring | `python/sglang/multimodal_gen/runtime/pipelines/pi05.py` | `Pi05Pipeline.load_modules`, `Pi05Pipeline.create_pipeline_stages` |
+| VLA sampling params | `python/sglang/multimodal_gen/configs/sample/vla.py`, `python/sglang/multimodal_gen/configs/sample/pi05.py` | `VLASamplingParams`, `Pi05SamplingParams` |
 | Pipeline stages | `python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/pi05.py` | `Pi05PreprocessStage`, `Pi05PrefixStage`, `Pi05ActionDenoisingStage`, `Pi05PostprocessStage` |
 | Preprocessing | `python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/pi05_preprocess.py` | `Pi05Preprocessor` |
 | VLA observation batch | `python/sglang/multimodal_gen/runtime/utils/vla_observation.py` | `VLAObservationBatch`, `collate_vla_observation_batches`, `stable_tensor_sha256` |
@@ -269,6 +270,8 @@ Pi0.5 is implemented as a native VLA/action-policy pipeline, not as an SRT LLM s
 | Pi0.5 policy model | `python/sglang/multimodal_gen/runtime/models/vlas/pi05_policy.py` | `Pi05PolicyModel.encode_prefix`, `Pi05PolicyModel.sample_actions`, `Pi05PolicyModel.denoise_step` |
 | Pi0.5 core modules | `python/sglang/multimodal_gen/runtime/models/vlas/pi05_core.py` | `Pi05CoreModel`, `PaliGemmaWithExpertModel` |
 | PiGemma layers | `python/sglang/multimodal_gen/runtime/models/vlas/pi05_pigemma.py` | `PiGemmaModel`, `PiGemmaAttention`, `PiGemmaRMSNorm` |
+
+`Pi05SamplingParams` inherits from the VLA/action-specific `VLASamplingParams`, not the image/video visual `SamplingParams`. The action params surface keeps robot-policy fields such as action horizon, action dimension, prefix cache, CUDA graph, observation, state, images, and optional action noise. Visual-generation fields such as height, width, fps, frame return, and negative prompt are intentionally absent.
 
 `VLAObservationBatch` is the normalized typed batch that crosses the preprocess, prefix, and action stages. It is not the raw OpenPI websocket observation. For one Pi0.5 request, `Pi05Preprocessor` converts input images, state, task text, optional token overrides, and optional initial noise into:
 

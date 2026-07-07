@@ -102,9 +102,12 @@ def format_warmup_req(req_or_group: Any) -> str:
     if req is None:
         return prefix
 
-    shape = f"{req.width}x{req.height}"
-    if req.num_frames is not None and req.num_frames > 1:
-        shape += f"x{req.num_frames}f"
+    width = getattr(req, "width", None)
+    height = getattr(req, "height", None)
+    shape = "action" if width is None or height is None else f"{width}x{height}"
+    num_frames = getattr(req, "num_frames", None)
+    if num_frames is not None and num_frames > 1:
+        shape += f"x{num_frames}f"
 
     default_steps = req.extra.get("cache_dit_num_inference_steps")
     if default_steps is not None and default_steps != req.num_inference_steps:

@@ -446,11 +446,13 @@ def prepare_request(
     if not isinstance(req.prompt, str):
         raise TypeError(f"`prompt` must be a string, but got {type(req.prompt)}")
 
-    if (req.width is not None and req.width <= 0) or (
-        req.height is not None and req.height <= 0
+    req_width = getattr(req, "width", None)
+    req_height = getattr(req, "height", None)
+    if (req_width is not None and req_width <= 0) or (
+        req_height is not None and req_height <= 0
     ):
         raise ValueError(
-            f"Height and width must be positive, got height={req.height}, width={req.width}"
+            f"Height and width must be positive, got height={req_height}, width={req_width}"
         )
 
     if server_args.enable_trace:

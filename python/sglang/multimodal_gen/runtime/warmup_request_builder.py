@@ -76,6 +76,9 @@ def _resolve_default_warmup_resolution(
     cold-start when the real request is larger (e.g. 1024x1024 paid ~0.1s of
     first-shape kernel autotuning, measured on H100).
     """
+    if server_args.pipeline_config.task_type.data_type() == DataType.ACTION:
+        return DEFAULT_LIGHTWEIGHT_IMAGE_RESOLUTION
+
     width = sampling_defaults.width
     height = sampling_defaults.height
     is_image_gen = server_args.pipeline_config.task_type.is_image_gen()
@@ -234,7 +237,7 @@ def _resolve_warmup_num_frames(
     *,
     server_based_warmup: bool,
 ) -> int:
-    num_frames = sampling_defaults.num_frames
+    num_frames = getattr(sampling_defaults, "num_frames", 1)
     if (
         not server_based_warmup
         or not _is_video_warmup_task(server_args)
@@ -247,9 +250,9 @@ def _resolve_warmup_num_frames(
 
 
 def _effective_cfg_scale(sampling_defaults: SamplingParams) -> float | None:
-    if sampling_defaults.true_cfg_scale is not None:
+    if getattr(sampling_defaults, "true_cfg_scale", None) is not None:
         return sampling_defaults.true_cfg_scale
-    return sampling_defaults.guidance_scale
+    return getattr(sampling_defaults, "guidance_scale", None)
 
 
 def _resolve_warmup_steps(
@@ -316,6 +319,9 @@ def build_warmup_reqs(
 ) -> list[Req]:
     task_type = server_args.pipeline_config.task_type
     sampling_defaults = get_model_sampling_defaults(server_args)
+    if task_type.data_type() == DataType.ACTION:
+        logger.info("Skipping synthetic visual warmup for ACTION pipeline")
+        return []
 
     if warmup_resolutions is None:
         width, height = _resolve_default_warmup_resolution(
@@ -327,7 +333,7 @@ def build_warmup_reqs(
     else:
         resolutions = [parse_size(resolution) for resolution in warmup_resolutions]
 
-    negative_prompt: Any = sampling_defaults.negative_prompt
+    negative_prompt: Any = getattr(sampling_defaults, "negative_prompt", None)
     cfg_scale = _effective_cfg_scale(sampling_defaults)
     warmup_steps = _resolve_warmup_steps(
         server_args,

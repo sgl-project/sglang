@@ -430,9 +430,13 @@ class DiffGenerator:
             and output_index < len(output_batch.metrics_list)
         ):
             metrics = output_batch.metrics_list[output_index]
+        if req.data_type == DataType.ACTION:
+            size = ("action",)
+        else:
+            size = (req.height, req.width, req.num_frames)
         return dict(
             prompt=req.prompt,
-            size=(req.height, req.width, req.num_frames),
+            size=size,
             generation_time=generation_time,
             peak_memory_mb=output_batch.peak_memory_mb,
             metrics=metrics.to_dict() if metrics else {},

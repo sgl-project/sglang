@@ -1,10 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import dataclasses
 from types import SimpleNamespace
 
 import numpy as np
 
 from sglang.multimodal_gen.configs.pipeline_configs.pi05 import Pi05PipelineConfig
+from sglang.multimodal_gen.configs.sample.pi05 import Pi05SamplingParams
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.configs.sample.vla import VLASamplingParams
 from sglang.multimodal_gen.runtime.entrypoints.action_utils import (
     action_generation_response,
     action_metadata,
@@ -23,6 +27,22 @@ def _server_args(config: Pi05PipelineConfig | None = None) -> SimpleNamespace:
         comfyui_mode=False,
         pipeline_config=config or Pi05PipelineConfig(),
     )
+
+
+def test_pi05_uses_vla_sampling_params_not_visual_sampling_params():
+    params = Pi05SamplingParams()
+    field_names = {field.name for field in dataclasses.fields(params)}
+
+    assert isinstance(params, VLASamplingParams)
+    assert not isinstance(params, SamplingParams)
+    assert "action_horizon" in field_names
+    assert "action_dim" in field_names
+    assert "height" not in field_names
+    assert "width" not in field_names
+    assert "fps" not in field_names
+    assert "negative_prompt" not in field_names
+    assert "return_frames" not in field_names
+    assert "diffusers_kwargs" not in field_names
 
 
 def test_action_request_schema_builds_pi05_sampling_params():

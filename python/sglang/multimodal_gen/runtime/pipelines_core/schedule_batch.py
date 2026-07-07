@@ -22,7 +22,10 @@ from typing import Any, Optional, Sequence, Union
 import PIL.Image
 import torch
 
-from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.configs.sample.sampling_params import (
+    DataType,
+    SamplingParams,
+)
 from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
     RolloutTrajectoryData,
 )
@@ -320,9 +323,11 @@ class Req:
     @property
     def resolution_key(self) -> str | None:
         """Return the batching config resolution key, e.g. "1024x1024"."""
-        if self.width is None or self.height is None:
+        width = getattr(self, "width", None)
+        height = getattr(self, "height", None)
+        if width is None or height is None:
             return None
-        return f"{int(self.width)}x{int(self.height)}"
+        return f"{int(width)}x{int(height)}"
 
     def set_as_warmup(self, warmup_steps: int = 1):
         self.is_warmup = True
@@ -339,6 +344,13 @@ class Req:
 
     def validate(self):
         """Initialize dependent fields after dataclass initialization."""
+        if getattr(self.sampling_params, "data_type", None) == DataType.ACTION:
+            self.do_classifier_free_guidance = False
+            if self.negative_prompt_embeds is None:
+                self.negative_prompt_embeds = []
+            self.metrics = RequestMetrics(request_id=self.request_id)
+            return
+
         # Prefer true_cfg_scale when it is explicitly provided.
         cfg_scale = (
             self.true_cfg_scale
@@ -360,6 +372,25 @@ class Req:
     def log(self, server_args: ServerArgs):
         if self.is_warmup or self.suppress_logs:
             return
+        if getattr(self.sampling_params, "data_type", None) == DataType.ACTION:
+            display_prompt = (
+                self.prompt
+                if logger.isEnabledFor(logging.DEBUG)
+                else _sanitize_for_logging(self.prompt, key_hint="prompt")
+            )
+            debug_str = f"""VLA sampling params:
+                      prompt: {display_prompt}
+                        seed: {self.seed}
+                 infer_steps: {self.num_inference_steps}
+      num_outputs_per_prompt: {self.num_outputs_per_prompt}
+              action_horizon: {getattr(self, "action_horizon", None)}
+                  action_dim: {getattr(self, "action_dim", None)}
+                 save_output: {self.save_output}
+            output_file_path: {self.output_file_path()}
+        """  # type: ignore[attr-defined]
+            logger.info(debug_str)
+            return
+
         # TODO: in some cases (e.g., TI2I), height and weight might be undecided at this moment
         if self.height:
             target_height = align_to(self.height, 16)
