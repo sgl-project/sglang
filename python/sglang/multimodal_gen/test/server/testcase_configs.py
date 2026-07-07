@@ -12,7 +12,7 @@ pytest python/sglang/multimodal_gen/test/server/test_server_1_gpu.py -k qwen_ima
 To add a new testcase:
 1. add your testcase with case-id: `my_new_test_case_id` to `ONE_GPU_CASES`, `ONE_GPU_MODELOPT_FP8_CASES`, `ONE_GPU_B200_CASES`, or `TWO_GPU_CASES`
 2. run `SGLANG_GEN_BASELINE=1 pytest -s python/sglang/multimodal_gen/test/server/ -k my_new_test_case_id`
-3. insert or override the corresponding scenario in `scenarios` section of perf_baselines.json with the output baseline of step-2
+3. insert or override the corresponding scenario in the platform JSON under `perf_baselines/`
 
 
 """
@@ -33,6 +33,7 @@ from sglang.multimodal_gen.registry import (
     get_model_info,
     get_pipeline_config_classes,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
 
 
@@ -474,6 +475,22 @@ IDEOGRAM4_CI_PROMPT = json.dumps(
     ensure_ascii=False,
 )
 
+COSMOS3_NANO_CI_sampling_params = DiffusionSamplingParams(
+    prompt="A red cube on a white table, product photo.",
+    output_size="832x480",
+    output_format="png",
+    extras={
+        "num_inference_steps": 35,
+        "seed": 0,
+        "max_sequence_length": 128,
+        "flow_shift": 10.0,
+        "extra_args": {
+            "guardrails": False,
+            "use_resolution_template": False,
+        },
+    },
+)
+
 IDEOGRAM4_CI_sampling_params = replace(
     T2I_sampling_params,
     prompt=IDEOGRAM4_CI_PROMPT,
@@ -657,6 +674,57 @@ MODELOPT_WAN22_NVFP4_MODEL = "nvidia/Wan2.2-T2V-A14B-Diffusers-NVFP4"
 MODELOPT_NVFP4_B200_ENV_VARS = {}
 MODELOPT_WAN22_NVFP4_B200_ENV_VARS = {}
 
+PERF_BASELINE_PLATFORM_ENV = "SGLANG_DIFFUSION_PERF_BASELINE_PLATFORM"
+PERF_BASELINE_DIR = Path(__file__).with_name("perf_baselines")
+PERF_BASELINE_FILE_BY_PLATFORM = {
+    "h100": "h100.json",
+    "b200": "b200.json",
+    "5090": "5090.json",
+}
+PERF_BASELINE_PLATFORM_ALIASES = {
+    "sm90": "h100",
+    "hopper": "h100",
+    "h100": "h100",
+    "sm100": "b200",
+    "blackwell": "b200",
+    "b200": "b200",
+    "sm120": "5090",
+    "rtx5090": "5090",
+    "5090": "5090",
+}
+
+
+def _normalize_perf_baseline_platform(platform: str) -> str:
+    normalized = platform.strip().lower().replace("_", "-")
+    normalized = normalized.replace("-", "")
+    if normalized not in PERF_BASELINE_PLATFORM_ALIASES:
+        valid = ", ".join(sorted(PERF_BASELINE_FILE_BY_PLATFORM))
+        raise ValueError(
+            f"Invalid diffusion perf baseline platform {platform!r}. "
+            f"Expected one of: {valid}"
+        )
+    return PERF_BASELINE_PLATFORM_ALIASES[normalized]
+
+
+def get_perf_baseline_platform() -> str:
+    override = os.getenv(PERF_BASELINE_PLATFORM_ENV)
+    if override:
+        return _normalize_perf_baseline_platform(override)
+    if current_platform.is_sm120():
+        return "5090"
+    if current_platform.is_blackwell():
+        return "b200"
+    return "h100"
+
+
+def get_perf_baseline_path(platform: str | None = None) -> Path:
+    baseline_platform = (
+        _normalize_perf_baseline_platform(platform)
+        if platform is not None
+        else get_perf_baseline_platform()
+    )
+    return PERF_BASELINE_DIR / PERF_BASELINE_FILE_BY_PLATFORM[baseline_platform]
+
 
 def _make_modelopt_ci_case(
     case_id: str,
@@ -694,7 +762,7 @@ def _with_default_num_gpus(
 
 # Load global configuration
 BASELINE_CONFIG = (
-    BaselineConfig.load(Path(__file__).with_name("perf_baselines.json"))
+    BaselineConfig.load(get_perf_baseline_path())
     .update(Path(__file__).parent / "ascend" / "perf_baselines_npu.json")
     .update(Path(__file__).parent / "musa" / "perf_baselines_musa.json")
 )
