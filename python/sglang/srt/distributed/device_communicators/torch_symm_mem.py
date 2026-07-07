@@ -61,6 +61,7 @@ class TorchSymmMemCommunicator:
         self.disabled = True
         self.buffer = None
         self.max_size = 0
+        self.use_multimem = False
 
         if not torch_symm_mem_available:
             return
@@ -99,14 +100,26 @@ class TorchSymmMemCommunicator:
             dtype=self.dtype,
         )
         handle = torch_symm_mem.rendezvous(self.buffer, self.group.group_name)
-        if handle.multicast_ptr == 0:
+        # Multicast (NVLS) is only required by the multimem kernel. The
+        # two-shot kernel only needs P2P peer mappings, which are available
+        # on systems without multicast support — e.g. NVIDIA Confidential
+        # Computing / TEE deployments (where the driver disables NVLS) or
+        # topologies without NVLink SHARP. Fall back instead of disabling.
+        self.use_multimem = self.world_size in self._WORLD_SIZES_MULTIMEM.get(
+            self.device_capability, ()
+        )
+        if self.use_multimem and handle.multicast_ptr == 0:
             logger.warning(
                 "TorchSymmMemCommunicator: torch symmetric memory "
-                "multicast operations are not supported."
+                "multicast operations are not supported; falling back to "
+                "the two-shot all-reduce kernel."
             )
-            self.buffer = None
-            self.disabled = True
-            return
+            self.use_multimem = False
+        logger.info(
+            "TorchSymmMemCommunicator: enabled (kernel=%s, max_size=%d)",
+            "multimem" if self.use_multimem else "two_shot",
+            self.max_size,
+        )
         self.disabled = False
 
     def should_torch_symm_mem_allreduce(self, inp: torch.Tensor):
@@ -157,9 +170,7 @@ class TorchSymmMemCommunicator:
         if out is None:
             out = torch.empty_like(inp)
         self.buffer[: inp.numel()].copy_(inp.view(-1))
-        if self.world_size in self._WORLD_SIZES_MULTIMEM.get(
-            self.device_capability, ()
-        ):
+        if self.use_multimem:
             torch.ops.symm_mem.multimem_all_reduce_(
                 self.buffer[: inp.numel()], "sum", self.group.group_name
             )
