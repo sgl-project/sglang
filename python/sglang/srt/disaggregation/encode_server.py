@@ -350,14 +350,19 @@ class MMEncoder:
         ).element_size()
 
         if self.server_args.enable_mm_global_cache:
-            from sglang.srt.mem_cache.storage.mooncake_store.embedding_cache_controller import (
+            from sglang.srt.mem_cache.embedding_cache_controller import (
                 EmbeddingCacheController,
             )
+            from sglang.srt.mem_cache.embedding_store import EmbeddingStoreFactory
 
+            embedding_store = EmbeddingStoreFactory.create_backend(
+                self.server_args.mm_global_cache_backend,
+            )
             hidden_dims = self._infer_embedding_dims()
             self.mm_global_cache = EmbeddingCacheController(
                 rank,
                 server_args.tp_size,
+                embedding_store=embedding_store,
                 hidden_dims=hidden_dims,
                 tp_group=get_tp_group().cpu_group,
                 all_rank_get=False,

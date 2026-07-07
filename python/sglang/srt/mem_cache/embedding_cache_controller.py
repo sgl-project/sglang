@@ -12,9 +12,7 @@ from typing import List, Optional, Tuple
 import torch
 
 from sglang.srt.managers.schedule_batch import Modality
-from sglang.srt.mem_cache.storage.mooncake_store.mooncake_embedding_store import (
-    MooncakeEmbeddingStore,
-)
+from sglang.srt.mem_cache.embedding_store import EmbeddingStore
 
 logger = logging.getLogger(__name__)
 
@@ -308,6 +306,7 @@ class EmbeddingCacheController:
         self,
         tp_rank,
         tp_size,
+        embedding_store: EmbeddingStore,
         max_pool_size_gb=4.0,
         hidden_dims: dict = None,
         tp_group=None,
@@ -329,7 +328,7 @@ class EmbeddingCacheController:
         self.enable_eviction = enable_eviction
         self.max_eviction_batch = max_eviction_batch
 
-        self.mooncake_store = MooncakeEmbeddingStore()
+        self.embedding_store = embedding_store
         self.total_pool_size_bytes = int(max_pool_size_gb * 1024**3)
         self.vision_pool, self.audio_pool = self._create_pools(pin_memory=True)
         self.pools = {
@@ -401,7 +400,7 @@ class EmbeddingCacheController:
                 f"dim={pool.dim}, budget={pool.pool_size_bytes} bytes"
             )
             return
-        self.mooncake_store.register_buffer(pool.tensor)
+        self.embedding_store.register_buffer(pool.tensor)
         logger.info(
             f"[Rank {self.tp_rank}] Registered {pool.modality} embedding pool: "
             f"dim={pool.dim}, pages={pool.num_pages}, "
@@ -660,7 +659,7 @@ class EmbeddingCacheController:
             try:
                 op = self.prefetch_queue.get_nowait()
                 try:
-                    results = self.mooncake_store.batch_get_into_multi_buffers(
+                    results = self.embedding_store.batch_get_into_multi_buffers(
                         op.keys, op.ptrs, op.sizes
                     )
                 except Exception:
@@ -680,7 +679,7 @@ class EmbeddingCacheController:
             try:
                 op = self.insert_queue.get_nowait()
                 try:
-                    results = self.mooncake_store.batch_put_from_multi_buffers(
+                    results = self.embedding_store.batch_put_from_multi_buffers(
                         op.keys, op.ptrs, op.sizes
                     )
                 except Exception:
@@ -1008,7 +1007,7 @@ class EmbeddingCacheController:
             missing_hashes = [mm_hashes[i] for i in missing_indices]
 
             global_exists = await asyncio.to_thread(
-                self.mooncake_store.batch_is_exist, missing_hashes
+                self.embedding_store.batch_is_exist, missing_hashes
             )
             global_hit_count = sum(global_exists)
 
