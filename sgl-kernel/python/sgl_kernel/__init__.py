@@ -71,6 +71,10 @@ else:
         shuffle_rows,
     )
     from sgl_kernel.grammar import apply_token_bitmask_inplace_cuda
+    from sgl_kernel.infllm_v2 import (
+        infllmv2_attn_stage1,
+        max_pooling_1d_varlen,
+    )
     from sgl_kernel.kvcacheio import (
         transfer_kv_all_layer,
         transfer_kv_all_layer_mla,
@@ -89,9 +93,7 @@ else:
         apply_shuffle_mul_sum,
         fp8_blockwise_scaled_grouped_mm,
         fused_qk_norm_rope,
-        kimi_k2_moe_fused_gate,
         moe_align_block_size,
-        moe_fused_gate,
         moe_sum,
         moe_sum_reduce,
         prepare_moe_input,
@@ -177,10 +179,8 @@ else:
         "gptq_gemm",
         "gptq_shuffle",
         "int8_scaled_mm",
-        "kimi_k2_moe_fused_gate",
         "merge_state_v2",
         "moe_align_block_size",
-        "moe_fused_gate",
         "moe_sum",
         "moe_sum_reduce",
         "prepare_moe_input",

@@ -49,6 +49,7 @@ dependencies = [
   "pybase64",
   "pydantic",
   "python-multipart",
+  "pytest",
   "pyzmq>=25.1.2",
   "requests",
   "scipy",
@@ -69,6 +70,7 @@ dependencies = [
   "uvicorn",
   "uvloop",
   "xgrammar==0.2.1",
+  "zstandard",
 ]
 
 [project.optional-dependencies]
@@ -100,12 +102,12 @@ tracing = [
 ]
 test = [
   "accelerate",
+  "pymupdf",
   "expecttest",
   "jsonlines",
   "matplotlib",
   "pandas",
   "peft>=0.18.0",
-  "pytest",
   "sentence_transformers",
 ]
 all = []
