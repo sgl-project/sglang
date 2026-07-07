@@ -2369,6 +2369,7 @@ class NixlKVManager(CommonKVManager):
                 ].required_dst_info_num
                 logger.debug(f"got info {room=} {agent_name=} {required_dst_info_num=}")
                 if len(self.transfer_infos[room]) == required_dst_info_num:
+                    self.resolve_kv_replica_factor(self.transfer_infos[room])
                     self.req_to_decode_prefix_len[room] = next(
                         (
                             info.decode_prefix_len
