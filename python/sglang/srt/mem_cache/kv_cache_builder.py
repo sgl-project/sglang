@@ -25,9 +25,7 @@ from typing import TYPE_CHECKING
 
 from sglang.srt.configs.model_config import ModelImpl
 from sglang.srt.environ import envs
-from sglang.srt.layers.utils.dcp_utils import (
-    dcp_enabled,
-)
+from sglang.srt.layers.dcp import dcp_enabled
 from sglang.srt.managers.mm_utils import init_mm_embedding_cache
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.registry import TreeCacheBuildContext, create_tree_cache
@@ -108,6 +106,7 @@ def maybe_register_hicache_draft(
         host_size=0,
         page_size=page_size,
         layout=server_args.hicache_mem_layout,
+        allocator_type=server_args.hicache_storage_backend,
     )
     if isinstance(pool, MHATokenToKVPool):
         draft_host_pool = get_mha_host_pool_cls(pool)(pool, **kw)

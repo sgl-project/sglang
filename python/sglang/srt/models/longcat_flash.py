@@ -87,8 +87,7 @@ from sglang.srt.model_loader.utils import (
 )
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
-from sglang.srt.runtime_context import get_parallel
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_flags, get_parallel
 from sglang.srt.utils import (
     BumpAllocator,
     add_prefix,
@@ -446,18 +445,24 @@ class LongcatFlashDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
         zero_allocator: BumpAllocator,
+        prev_topk_indices: Optional[torch.Tensor],
     ) -> torch.Tensor:
         # first_attn
         hidden_states, residual = self.moe_layer_communicator.prepare_attn(
             hidden_states, residual, forward_batch
         )
         if hidden_states.shape[0] != 0:
-            hidden_states = self.self_attn[0](
+            attn_out = self.self_attn[0](
                 positions=positions,
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
                 zero_allocator=zero_allocator,
+                prev_topk_indices=prev_topk_indices,
             )
+            if isinstance(attn_out, tuple):
+                hidden_states, prev_topk_indices = attn_out
+            else:
+                hidden_states = attn_out
 
         # moe
         hidden_states, residual = self.moe_layer_communicator.prepare_mlp(
@@ -470,15 +475,26 @@ class LongcatFlashDecoderLayer(nn.Module):
             moe_hidden_states, moe_residual, forward_batch
         )
 
-        hidden_states, residual = self.forward_mlp(
-            hidden_states, positions, residual, forward_batch, zero_allocator
+        hidden_states, residual, prev_topk_indices = self.forward_mlp(
+            hidden_states,
+            positions,
+            residual,
+            forward_batch,
+            zero_allocator,
+            prev_topk_indices,
         )
 
         hidden_states = moe_hidden_states + hidden_states
-        return hidden_states, residual
+        return hidden_states, residual, prev_topk_indices
 
     def forward_mlp(
-        self, hidden_states, positions, residual, forward_batch, zero_allocator
+        self,
+        hidden_states,
+        positions,
+        residual,
+        forward_batch,
+        zero_allocator,
+        prev_topk_indices,
     ):
         # first_mlp
         hidden_states = self.mlps[0](hidden_states)
@@ -490,12 +506,17 @@ class LongcatFlashDecoderLayer(nn.Module):
             hidden_states, residual, forward_batch
         )
         if hidden_states.shape[0] != 0:
-            hidden_states = self.self_attn[1](
+            attn_out = self.self_attn[1](
                 positions=positions,
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
                 zero_allocator=zero_allocator,
+                prev_topk_indices=prev_topk_indices,
             )
+            if isinstance(attn_out, tuple):
+                hidden_states, prev_topk_indices = attn_out
+            else:
+                hidden_states = attn_out
 
         # second_mlp
         hidden_states, residual = self.mlp_layer_communicator[1].prepare_mlp(
@@ -509,7 +530,7 @@ class LongcatFlashDecoderLayer(nn.Module):
             hidden_states, residual, forward_batch
         )
 
-        return hidden_states, residual
+        return hidden_states, residual, prev_topk_indices
 
 
 class LongcatFlashModel(nn.Module):
@@ -532,6 +553,7 @@ class LongcatFlashModel(nn.Module):
                 over_embedding_m=config.ngram_embedding_m,
                 over_embedding_k=config.ngram_embedding_k,
                 over_embedding_n=config.ngram_embedding_n,
+                eos_token_id=config.eos_token_id,
             )
         else:
             self.use_ngram_embedding = False
@@ -585,13 +607,19 @@ class LongcatFlashModel(nn.Module):
         residual = None
 
         aux_hidden_states = []
+        topk_indices = None
         for i in range(total_num_layers):
             if i in self.layers_to_capture:
                 aux_hidden_states.append(hidden_states + residual)
             with get_global_expert_distribution_recorder().with_current_layer(i):
                 layer = self.layers[i]
-                hidden_states, residual = layer(
-                    positions, hidden_states, forward_batch, residual, zero_allocator
+                hidden_states, residual, topk_indices = layer(
+                    positions,
+                    hidden_states,
+                    forward_batch,
+                    residual,
+                    zero_allocator,
+                    topk_indices,
                 )
 
         if hidden_states.shape[0] != 0:
@@ -641,7 +669,7 @@ class LongcatFlashForCausalLM(nn.Module):
             config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("lm_head", prefix),
-            use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+            use_attn_tp_group=get_flags().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
         self.capture_aux_hidden_states = False

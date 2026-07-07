@@ -80,6 +80,7 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
 from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
+from sglang.srt.layers.quantization.unquant import initialize_bf16_gemm_config
 from sglang.srt.lora.lora_drainer import LoRADrainer
 from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
@@ -253,6 +254,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_int_env_var,
     is_cuda,
+    is_hip,
     is_mps,
     kill_itself_when_parent_died,
     require_mlp_sync,
@@ -291,6 +293,7 @@ TEST_RETRACT_INTERVAL = envs.SGLANG_TEST_RETRACT_INTERVAL.get()
 TEST_RETRACT_NO_PREFILL_BS = envs.SGLANG_TEST_RETRACT_NO_PREFILL_BS.get()
 
 _is_npu = is_npu()
+_is_hip = is_hip()
 
 
 class Scheduler(
@@ -551,6 +554,14 @@ class Scheduler(
 
         self.init_batch_result_processor()
 
+        # The config-resolution lifecycle of this scheduler process ends
+        # here: every load-time stage has run (target and draft model init,
+        # weight-resolved kv-cache dtype), so lock the static flag groups.
+        # flags.capture stays writable; late resolution writes now raise.
+        from sglang.srt.runtime_context import get_context
+
+        get_context().freeze_flags()
+
         self.is_initializing = False
 
     def init_zbal_on_npu(self):
@@ -716,7 +727,9 @@ class Scheduler(
         # Set reasoning_parser and think_end_id if --reasoning_parser is enabled
         if self.server_args.reasoning_parser and self.tokenizer:
             reasoning_parser = ReasoningParser(
-                model_type=self.server_args.reasoning_parser, stream_reasoning=False
+                model_type=self.server_args.reasoning_parser,
+                stream_reasoning=False,
+                tokenizer=self.tokenizer,
             )
             self.model_config.think_end_id = self.tokenizer.encode(
                 reasoning_parser.detector.think_end_token, add_special_tokens=False
@@ -745,6 +758,7 @@ class Scheduler(
         # Initialize GEMM-related configuration for FP8 and FP4 backends.
         initialize_fp8_gemm_config(self.server_args)
         initialize_fp4_gemm_config(self.server_args)
+        initialize_bf16_gemm_config(self.server_args)
 
         # This must be called after initialize_moe_config
         self.require_mlp_sync = require_mlp_sync(self.server_args)
@@ -850,9 +864,6 @@ class Scheduler(
     def init_model_worker(self):
         # Load model weights.
         self.init_tp_model_worker()
-        if self.spec_algorithm.is_frozen_kv_mtp():
-            # Frozen-KV MTP draft construction needs the target KV pool.
-            self.init_target_memory_pool()
         self.maybe_init_draft_worker()
 
         # Allocate KV cache pools for all workers.
@@ -1331,6 +1342,21 @@ class Scheduler(
                 ),
                 ignore_tokens=None,
             )
+            # Mark the chunked (not-yet-finished) prefill request so sample()
+            # skips writing its pseudo next-token into the ngram token table.
+            # Use self.chunked_req identity (not req.is_chunked) to avoid
+            # overlap-scheduling timing issues.
+            if self.chunked_req is not None:
+                skip_token_table_update = [
+                    req is self.chunked_req for req in batch.reqs
+                ]
+                batch.ne_skip_token_table_update = (
+                    torch.tensor(
+                        skip_token_table_update, dtype=torch.bool, device=device
+                    )
+                    if any(skip_token_table_update)
+                    else None
+                )
         return batch
 
     def init_deterministic_inference_config(self):
@@ -1497,7 +1523,7 @@ class Scheduler(
         if self.device == "cpu":
             self.schedule_stream.synchronize = lambda: None  # No-op for CPU
         # The global WAR barrier fences the scheduler's next shared-buffer write
-        # on the previous forward's read of the shared pool.
+        # on the previous forward's read of the unified memory pool.
         self._war_barrier_enabled = is_cuda() or envs.SGLANG_ENABLE_WAR_BARRIER.get()
         with self.device_module.StreamContext(self.schedule_stream):
             dispatch_event_loop(self)
@@ -1581,6 +1607,14 @@ class Scheduler(
             # we can process the last batch immediately.
             if disable_overlap_for_batch:
                 pop_and_process()
+                # Opportunistic flush at the disable_overlap sync boundary:
+                # forward_stream is idle (prev forward drained, next not launched),
+                # so `_flush`'s non-urgent guard compacts freely. Sync-free, best-effort.
+                if self.server_args.enable_unified_memory:
+                    try:
+                        self.token_to_kv_pool_allocator.flush_opportunistic()
+                    except Exception:
+                        pass
 
             # Launch the current batch
             if batch:
@@ -2528,7 +2562,6 @@ class Scheduler(
             release_kv_cache(req, self.tree_cache, is_insert=False)
 
         self.chunked_req = None
-        self._chunked_req_scheduled_last_iter = False
         self._pending_chunked_abort_req = None
         self.ipc_channels.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
         logger.debug(f"Abort chunked prefill request. {req.rid=}")
@@ -2741,7 +2774,7 @@ class Scheduler(
             for req in ready_grammar_requests:
                 self._add_request_to_queue(req)
 
-        if self.enable_hierarchical_cache:
+        if self.enable_hierarchical_cache or self.server_args.enable_flexkv:
             self.tree_cache.check_hicache_events()
 
         if self.enable_priority_preemption or self.is_hybrid_swa:
@@ -2889,15 +2922,18 @@ class Scheduler(
                 # pre-existing from a session). Session-held slots have their own
                 # lifecycle and freeing them here causes double-free.
                 added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
-                if (
-                    not added
-                    and req.mamba_pool_idx is not None
-                    and not getattr(req, "session", None)
-                ):
-                    self.tree_cache.req_to_token_pool.mamba_allocator.free(
-                        req.mamba_pool_idx.unsqueeze(-1)
-                    )
-                    req.mamba_pool_idx = None
+                if not added:
+                    # init_next_round_input() may stage deferred Mamba COW/clear
+                    # metadata before add_one_req() rejects the request.
+                    req.mamba_cow_src_index = None
+                    req.mamba_needs_clear = False
+                    if req.mamba_pool_idx is not None and not getattr(
+                        req, "session", None
+                    ):
+                        self.tree_cache.req_to_token_pool.mamba_allocator.free(
+                            req.mamba_pool_idx.unsqueeze(-1)
+                        )
+                        req.mamba_pool_idx = None
                 break
 
         if mamba_allocator is not None:
@@ -3238,19 +3274,41 @@ class Scheduler(
                             self.batch_record_buf[self.batch_record_ct].extend(
                                 batch_result.extra_keep_alive_refs
                             )
+                        if self.server_args.enable_unified_memory:
+                            # Record a `forward_done` event after the forward (before
+                            # copy_to_cpu); lazy-compaction `_flush` gates src reuse on
+                            # it. Only the unified pool's allocator exposes these hooks.
+                            allocator = self.token_to_kv_pool_allocator
+                            forward_done = self.device_module.Event()
+                            forward_done.record(stream=self.forward_stream)
+                            allocator.set_latest_forward_done_event(forward_done)
+                            # Write-set classification: hand the allocator this
+                            # forward's virtual out_cache_loc as a tensor ref (no GPU work).
+                            allocator.set_inflight_forward(
+                                forward_done,
+                                batch.out_cache_loc,
+                            )
                         # FIXME(lsyin): maybe move this to forward_batch_generation
                         batch_result.copy_done = self.device_module.Event()
                         if batch_result.delay_sample_func is None:
                             self._relay_forward_payload(future_indices, batch_result)
-                            # Result D2H on copy_stream overlaps the next forward
-                            # instead of serializing on forward_stream; it's a leaf
-                            # gated by copy_done, so nothing on forward_stream waits.
-                            self.copy_stream.wait_stream(self.forward_stream)
-                            with self.copy_stream_ctx:
+                            if _is_hip:
+                                # Cross-stream sync costs more than the tiny D2H it
+                                # overlaps.
                                 batch_result.copy_to_cpu(
                                     return_logprob=batch.return_logprob,
                                     return_hidden_states=batch.return_hidden_states,
                                 )
+                            else:
+                                # Result D2H on copy_stream overlaps the next forward
+                                # instead of serializing on forward_stream; it's a leaf
+                                # gated by copy_done, so nothing on forward_stream waits.
+                                self.copy_stream.wait_stream(self.forward_stream)
+                                with self.copy_stream_ctx:
+                                    batch_result.copy_to_cpu(
+                                        return_logprob=batch.return_logprob,
+                                        return_hidden_states=batch.return_hidden_states,
+                                    )
                         else:
                             batch_result.future_indices = future_indices
 
@@ -3489,6 +3547,12 @@ class Scheduler(
         """Idle housekeeping: guard, check, metrics, reset, sleep."""
         if not self.is_fully_idle():
             return
+
+        if self.server_args.enable_unified_memory:
+            try:
+                self.token_to_kv_pool_allocator.flush_opportunistic()
+            except Exception:
+                pass
 
         # memory leak check (skipped for hisparse — pool counters intentionally
         # diverge during host-backup, see _get_swa_token_info clamp).
@@ -3873,6 +3937,9 @@ class Scheduler(
             for req in self.disagg_prefill_bootstrap_queue.queue:
                 if recv_req.abort_all or req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort bootstrap queue request. {req.rid=}")
+                    if self.enable_hicache_storage:
+                        self.tree_cache.release_aborted_request(req.rid)
+
                     if hasattr(req.disagg_kv_sender, "abort"):
                         req.disagg_kv_sender.abort()
 

@@ -24,6 +24,10 @@ from typing import Optional
 
 import torch
 
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
+    is_in_breakable_cuda_graph,
+)
+
 # Detect whether the current forward pass is in capture mode.
 is_capture_mode = False
 
@@ -33,7 +37,7 @@ _capture_lora_variant: Optional[str] = None
 
 
 def get_is_capture_mode() -> bool:
-    return is_capture_mode
+    return is_capture_mode or is_in_breakable_cuda_graph()
 
 
 def compile_in_capture_mode(func):
