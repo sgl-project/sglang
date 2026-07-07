@@ -64,9 +64,9 @@ class GrammarManager:
     def has_waiting_grammars(self) -> bool:
         return len(self.grammar_queue) > 0
 
-    def abort_requests(self, recv_req: AbortReq):
+    def abort_requests(self, recv_req: AbortReq, exact: bool = False):
         for req in self.grammar_queue:
-            if recv_req.abort_all or req.rid.startswith(recv_req.rid):
+            if recv_req.matches(req.rid, exact=exact):
                 logger.debug(f"Abort grammar queue request. {req.rid=}")
                 if isinstance(req.grammar, futures.Future) and req.grammar:
                     req.grammar.cancel()

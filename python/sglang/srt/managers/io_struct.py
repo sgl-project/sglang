@@ -1749,6 +1749,13 @@ class AbortReq(BaseReq, kw_only=True):
         if self.rid is None:
             self.rid = ""
 
+    def matches(self, rid: str, *, exact: bool = False) -> bool:
+        # Prefix match by default (Python batch `<uuid>_<idx>` rids); `exact` for the
+        # Rust server's exact-unique u64 rids, where a prefix would abort unrelated ids.
+        if self.abort_all:
+            return True
+        return rid == self.rid if exact else rid.startswith(self.rid)
+
 
 class ActiveRanksOutput(BaseReq, kw_only=True):
     status: List[bool]
