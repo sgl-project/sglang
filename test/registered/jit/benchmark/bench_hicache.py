@@ -31,11 +31,12 @@ from sglang.jit_kernel.hicache import (
     transfer_hicache_all_layer,
     transfer_hicache_one_layer,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(
     est_time=29, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
 )
+register_amd_ci(est_time=56, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 DISABLE_TORCH = os.environ.get("DISABLE_TORCH", "0") == "1"
 PAGE_SIZE = 1

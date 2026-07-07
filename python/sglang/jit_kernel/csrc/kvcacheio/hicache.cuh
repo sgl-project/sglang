@@ -37,6 +37,50 @@ inline constexpr auto get_mem_package() {
 template <int kUnit>
 using PackageType = decltype(get_mem_package<kUnit>());
 
+// ROCm/HIP compatible implementations
+#ifdef USE_ROCM
+// For AMD GPUs, use direct memory operations with volatile to prevent caching
+SGL_DEVICE uint1 load_nc(const uint1* __restrict__ src) {
+  uint1 result;
+  // Use flat_load_dword for non-cached loads on AMD
+  result.x = __builtin_nontemporal_load(&src->x);
+  return result;
+}
+
+SGL_DEVICE uint2 load_nc(const uint2* __restrict__ src) {
+  uint2 result;
+  result.x = __builtin_nontemporal_load(&src->x);
+  result.y = __builtin_nontemporal_load(&src->y);
+  return result;
+}
+
+SGL_DEVICE uint4 load_nc(const uint4* __restrict__ src) {
+  uint4 result;
+  result.x = __builtin_nontemporal_load(&src->x);
+  result.y = __builtin_nontemporal_load(&src->y);
+  result.z = __builtin_nontemporal_load(&src->z);
+  result.w = __builtin_nontemporal_load(&src->w);
+  return result;
+}
+
+SGL_DEVICE void store_nc(uint1* __restrict__ dst, const uint1& value) {
+  __builtin_nontemporal_store(value.x, &dst->x);
+}
+
+SGL_DEVICE void store_nc(uint2* __restrict__ dst, const uint2& value) {
+  __builtin_nontemporal_store(value.x, &dst->x);
+  __builtin_nontemporal_store(value.y, &dst->y);
+}
+
+SGL_DEVICE void store_nc(uint4* __restrict__ dst, const uint4& value) {
+  __builtin_nontemporal_store(value.x, &dst->x);
+  __builtin_nontemporal_store(value.y, &dst->y);
+  __builtin_nontemporal_store(value.z, &dst->z);
+  __builtin_nontemporal_store(value.w, &dst->w);
+}
+
+#else
+// NVIDIA CUDA PTX inline assembly (original code)
 SGL_DEVICE uint1 load_nc(const uint1* __restrict__ src) {
   uint32_t tmp;
   asm volatile("ld.global.L1::no_allocate.b32 %0,[%1];" : "=r"(tmp) : "l"(src));
@@ -76,6 +120,7 @@ SGL_DEVICE void store_nc(uint4* __restrict__ dst, const uint4& value) {
   asm volatile(
       "st.global.L1::no_allocate.v4.b32 [%0],{%1,%2,%3,%4};" ::"l"(dst), "r"(tmp0), "r"(tmp1), "r"(tmp2), "r"(tmp3));
 }
+#endif  // USE_ROCM
 
 }  // namespace details
 
@@ -256,18 +301,18 @@ struct HiCacheKernel {
     TensorMatcher({-1, D})  //
         .with_strides({N, 1})
         .with_dtype(cache_dtype)
-        .with_device<kDLCUDA, kDLCUDAHost, kDLCPU>()
+        .with_device<kDLCUDA, kDLCUDAHost, kDLCPU, kDLROCM, kDLROCMHost>()
         .verify(k_cache_src)
         .verify(v_cache_src);
     TensorMatcher({-1, D})  //
         .with_strides({M, 1})
         .with_dtype(cache_dtype)
-        .with_device<kDLCUDA, kDLCUDAHost, kDLCPU>()
+        .with_device<kDLCUDA, kDLCUDAHost, kDLCPU, kDLROCM, kDLROCMHost>()
         .verify(k_cache_dst)
         .verify(v_cache_dst);
     TensorMatcher({L})  //
         .with_dtype<int32_t, int64_t>(indices_dtype)
-        .with_device<kDLCUDA>(indices_device)
+        .with_device<kDLCUDA, kDLROCM>(indices_device)
         .verify(indices_src)
         .verify(indices_dst);
 
@@ -323,14 +368,14 @@ struct HiCacheKernel {
 
     TensorMatcher({N})  //
         .with_dtype<uint64_t>()
-        .with_device<kDLCUDA>(device_)
+        .with_device<kDLCUDA, kDLROCM>(device_)
         .verify(k_ptr_src)
         .verify(v_ptr_src)
         .verify(k_ptr_dst)
         .verify(v_ptr_dst);
     TensorMatcher({L})  //
         .with_dtype<int32_t, int64_t>(dtype_)
-        .with_device<kDLCUDA>(device_)
+        .with_device<kDLCUDA, kDLROCM>(device_)
         .verify(indices_src)
         .verify(indices_dst);
 
@@ -381,16 +426,16 @@ struct HiCacheKernel {
     TensorMatcher({-1, D})  //
         .with_strides({N, 1})
         .with_dtype(cache_dtype)
-        .with_device<kDLCUDA, kDLCUDAHost, kDLCPU>()
+        .with_device<kDLCUDA, kDLCUDAHost, kDLCPU, kDLROCM, kDLROCMHost>()
         .verify(cache_src);
     TensorMatcher({-1, D})  //
         .with_strides({M, 1})
         .with_dtype(cache_dtype)
-        .with_device<kDLCUDA, kDLCUDAHost, kDLCPU>()
+        .with_device<kDLCUDA, kDLCUDAHost, kDLCPU, kDLROCM, kDLROCMHost>()
         .verify(cache_dst);
     TensorMatcher({L})  //
         .with_dtype<int32_t, int64_t>(indices_dtype)
-        .with_device<kDLCUDA>(indices_device)
+        .with_device<kDLCUDA, kDLROCM>(indices_device)
         .verify(indices_src)
         .verify(indices_dst);
 
@@ -441,12 +486,12 @@ struct HiCacheKernel {
 
     TensorMatcher({N})  //
         .with_dtype<uint64_t>()
-        .with_device<kDLCUDA>(device_)
+        .with_device<kDLCUDA, kDLROCM>(device_)
         .verify(ptr_src)
         .verify(ptr_dst);
     TensorMatcher({L})  //
         .with_dtype<int32_t, int64_t>(dtype_)
-        .with_device<kDLCUDA>(device_)
+        .with_device<kDLCUDA, kDLROCM>(device_)
         .verify(indices_src)
         .verify(indices_dst);
 

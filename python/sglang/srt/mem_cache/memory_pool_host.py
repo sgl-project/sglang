@@ -46,6 +46,7 @@ from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+_is_cuda_alike = _is_cuda or _is_hip
 _is_npu = is_npu()
 _is_xpu = is_xpu()
 _is_mps = is_mps()
@@ -111,7 +112,7 @@ class MHATokenToKVPoolHost(HostKVCache):
             allocator_type,
         )
         self.element_dim = self.device_pool.head_num * self.device_pool.head_dim
-        self.can_use_jit = _is_cuda and can_use_hicache_jit_kernel(
+        self.can_use_jit = _is_cuda_alike and can_use_hicache_jit_kernel(
             element_size=self.element_dim * self.dtype.itemsize
         )
 
@@ -193,7 +194,7 @@ class MHATokenToKVPoolHost(HostKVCache):
         if self.layout != "page_first" or (_is_npu or _is_xpu or _is_mps):
             return
 
-        self.can_use_write_back_jit = _is_cuda and can_use_write_back_jit_kernel(
+        self.can_use_write_back_jit = _is_cuda_alike and can_use_write_back_jit_kernel(
             element_size=self.element_dim * self.dtype.itemsize,
         )
         if not self.can_use_write_back_jit:
@@ -386,7 +387,7 @@ class MHATokenToKVPoolHost(HostKVCache):
                         src_v_layers=device_pool.v_data_ptrs,
                         dst_v=self.v_buffer,
                         src_indices=device_indices,
-                        dst_indices=host_indices,
+                        dst_indices=host_indices.to(device_pool.device),
                         item_size=self.token_stride_size,
                         dst_layout_dim=self.layout_dim,
                         num_layers=self.layer_num,
@@ -688,7 +689,7 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
         self.lock = threading.RLock()
         self.clear()
 
-        self.can_use_jit = _is_cuda and can_use_hicache_jit_kernel(
+        self.can_use_jit = _is_cuda_alike and can_use_hicache_jit_kernel(
             element_size=self.token_stride_size
         )
         self.k_device_ptrs = torch.tensor(
@@ -1282,7 +1283,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             device,
             allocator_type,
         )
-        self.can_use_jit = _is_cuda and can_use_hicache_jit_kernel(
+        self.can_use_jit = _is_cuda_alike and can_use_hicache_jit_kernel(
             element_size=self.kv_cache_dim * self.dtype.itemsize
         )
 
@@ -1402,7 +1403,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         if self.layout != "page_first" or (_is_npu or _is_xpu or _is_mps):
             return
 
-        self.can_use_write_back_jit = _is_cuda and can_use_write_back_jit_kernel(
+        self.can_use_write_back_jit = _is_cuda_alike and can_use_write_back_jit_kernel(
             element_size=self.kv_cache_dim * self.dtype.itemsize,
         )
         if not self.can_use_write_back_jit:
@@ -1543,7 +1544,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                         src_layers=device_pool.data_ptrs,
                         dst=self.kv_buffer,
                         src_indices=device_indices,
-                        dst_indices=host_indices,
+                        dst_indices=host_indices.to(device_pool.device),
                         item_size=self.token_stride_size,
                         dst_layout_dim=self.layout_dim,
                         num_layers=self.layer_num,
@@ -1867,11 +1868,11 @@ class MambaPoolHost(HostKVCache):
         if self.layout != "page_first" or (_is_npu or _is_xpu or _is_mps):
             return
 
-        self._temporal_can_use_jit = _is_cuda and can_use_write_back_jit_kernel(
+        self._temporal_can_use_jit = _is_cuda_alike and can_use_write_back_jit_kernel(
             element_size=self._item_size_per_index(self.temporal_buffer[0]),
         )
         self._conv_can_use_jit = [
-            _is_cuda
+            _is_cuda_alike
             and can_use_write_back_jit_kernel(
                 element_size=self._item_size_per_index(buf[0]),
             )
@@ -2475,7 +2476,7 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         if self.layout != "page_first" or (_is_npu or _is_xpu or _is_mps):
             return
 
-        self.can_use_write_back_jit = _is_cuda and can_use_write_back_jit_kernel(
+        self.can_use_write_back_jit = _is_cuda_alike and can_use_write_back_jit_kernel(
             element_size=self.item_bytes * self.dtype.itemsize,
         )
         staging_page_capacity = min(self.num_host_pages, _WRITE_BACK_STAGING_PAGE_CHUNK)
@@ -2884,7 +2885,7 @@ class DeepSeekV4StateHostPool(HostKVCache):
         if self.layout != "page_first" or (_is_npu or _is_xpu or _is_mps):
             return
 
-        self.can_use_write_back_jit = _is_cuda and can_use_write_back_jit_kernel(
+        self.can_use_write_back_jit = _is_cuda_alike and can_use_write_back_jit_kernel(
             element_size=self.state_page_bytes * self.dtype.itemsize,
         )
         staging_page_capacity = min(self.num_host_pages, _WRITE_BACK_STAGING_PAGE_CHUNK)
@@ -3384,7 +3385,7 @@ class DSAIndexerPoolHost(HostKVCache):
         if self.layout != "page_first" or (_is_npu or _is_xpu or _is_mps):
             return
 
-        self.can_use_write_back_jit = _is_cuda and can_use_write_back_jit_kernel(
+        self.can_use_write_back_jit = _is_cuda_alike and can_use_write_back_jit_kernel(
             element_size=self.indexer_page_stride_size * self.indexer_dtype.itemsize,
         )
         staging_page_capacity = min(
