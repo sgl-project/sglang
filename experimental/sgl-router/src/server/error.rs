@@ -225,6 +225,61 @@ impl ApiError {
         self.class().status()
     }
 
+    /// Whether this is a transient *dispatch* failure the router may recover by
+    /// re-dispatching the SAME request to a DIFFERENT worker — the failover the
+    /// plain-mode retry loop performs (see [`crate::config::RetryConfig`]).
+    ///
+    /// Retryable exactly when the selected worker never returned a usable
+    /// response AND no bytes reached the client, so a re-dispatch neither
+    /// double-serves the client nor is known to double-execute on the engine:
+    ///
+    /// * [`UpstreamUnreachable`](Self::UpstreamUnreachable) — connect refused /
+    ///   DNS / TLS: the request never landed on a working engine.
+    /// * [`UpstreamTimeout`](Self::UpstreamTimeout) — no response within the
+    ///   per-request budget; the failed attempt's abort guard tells that engine
+    ///   to stop before we try elsewhere.
+    /// * [`BreakerOpen`](Self::BreakerOpen) — the worker's breaker was open at
+    ///   dispatch (a race with `healthy_workers_for`); a different worker is
+    ///   almost certainly eligible.
+    /// * [`WorkerMisconfigured`](Self::WorkerMisconfigured) — the worker URL
+    ///   failed to parse; its breaker was tripped, so reselection skips it.
+    ///
+    /// Deliberately NOT retryable:
+    /// * [`UpstreamStatus`](Self::UpstreamStatus) — a mid-body drop means
+    ///   headers (and, for streaming, bytes) already went out; re-dispatch could
+    ///   double-serve the client.
+    /// * The `NoTarget` selection errors ([`NoHealthyWorkers`](Self::NoHealthyWorkers),
+    ///   [`PolicySelectionFailed`](Self::PolicySelectionFailed),
+    ///   [`ServiceOverloaded`](Self::ServiceOverloaded), the PD-pool variants) —
+    ///   these come from admission, not from a worker; there is nothing better
+    ///   to retry onto in the same instant.
+    /// * [`StaleRequestExpired`](Self::StaleRequestExpired) — the request budget
+    ///   is already spent; retrying would only exceed it further.
+    /// * [`BadRequest`](Self::BadRequest) / [`ModelNotFound`](Self::ModelNotFound)
+    ///   / [`Internal`](Self::Internal) — terminal; a retry cannot change the
+    ///   outcome.
+    ///
+    /// Exhaustive (wildcard-free) so a future variant is forced to decide its
+    /// retryability rather than silently defaulting to "not retryable".
+    pub fn is_retryable_upstream(&self) -> bool {
+        match self {
+            ApiError::UpstreamUnreachable { .. }
+            | ApiError::UpstreamTimeout { .. }
+            | ApiError::BreakerOpen { .. }
+            | ApiError::WorkerMisconfigured { .. } => true,
+            ApiError::UpstreamStatus { .. }
+            | ApiError::BadRequest(_)
+            | ApiError::ModelNotFound(_)
+            | ApiError::NoHealthyWorkers { .. }
+            | ApiError::NoPrefillWorkersAvailable { .. }
+            | ApiError::NoDecodeWorkersAvailable { .. }
+            | ApiError::StaleRequestExpired { .. }
+            | ApiError::PolicySelectionFailed { .. }
+            | ApiError::ServiceOverloaded { .. }
+            | ApiError::Internal(_) => false,
+        }
+    }
+
     /// The worker's *own* status to echo in `x-router-upstream-status`, for the
     /// case where the router synthesized its own status over a worker that did
     /// respond. Today only the mid-body-drop (`UpstreamStatus`) carries one. This
@@ -414,6 +469,42 @@ mod tests {
         let env: ErrEnv = serde_json::from_str(&body_str)
             .unwrap_or_else(|e| panic!("envelope did not match expected shape: {e}: {body_str}"));
         (status, code_header, env)
+    }
+
+    #[test]
+    fn is_retryable_upstream_covers_transient_dispatch_failures_only() {
+        let worker = reqwest::Url::parse("http://w:1/").unwrap();
+        // Retryable: no usable response, nothing sent to the client.
+        assert!(ApiError::UpstreamUnreachable {
+            worker: worker.clone(),
+            source: anyhow::anyhow!("connect refused"),
+        }
+        .is_retryable_upstream());
+        assert!(ApiError::UpstreamTimeout {
+            worker: worker.clone()
+        }
+        .is_retryable_upstream());
+        assert!(ApiError::BreakerOpen {
+            worker: "http://w:1".into()
+        }
+        .is_retryable_upstream());
+        assert!(ApiError::WorkerMisconfigured {
+            worker: "http://w:1".into(),
+            source: anyhow::anyhow!("bad url"),
+        }
+        .is_retryable_upstream());
+
+        // Not retryable: bytes may have gone out, terminal, or nothing to retry onto.
+        assert!(!ApiError::UpstreamStatus {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+        }
+        .is_retryable_upstream());
+        assert!(!ApiError::ServiceOverloaded { model: "m".into() }.is_retryable_upstream());
+        assert!(!ApiError::NoHealthyWorkers { model: "m".into() }.is_retryable_upstream());
+        assert!(!ApiError::StaleRequestExpired { model: "m".into() }.is_retryable_upstream());
+        assert!(!ApiError::BadRequest("x".into()).is_retryable_upstream());
+        assert!(!ApiError::ModelNotFound("x".into()).is_retryable_upstream());
+        assert!(!ApiError::Internal(anyhow::anyhow!("boom")).is_retryable_upstream());
     }
 
     #[test]

@@ -149,6 +149,45 @@ impl AdmissionQueue {
         self.park(candidates, policy, ctx, cap, model).await
     }
 
+    /// Non-parking, load-gated variant of [`acquire`](Self::acquire): claim a
+    /// slot on a candidate that currently has one, or return `Ok(None)` if
+    /// every candidate is already at its in-flight cap. Never parks and never
+    /// sheds — the caller decides what to do when no slot is free.
+    ///
+    /// The retry path uses this so a re-dispatch only ever lands on a worker
+    /// whose load is below capacity (never onto a full one) and never waits for
+    /// a slot to free: if the whole remaining fleet is saturated, the retry is
+    /// skipped and the original error surfaces.
+    ///
+    /// With admission disabled there is no cap, so — like [`acquire`]'s disabled
+    /// path — this always returns `Ok(Some(..))` with an unconditional guard.
+    /// `Err` only when the policy declines a non-empty candidate set.
+    pub fn try_acquire(
+        self: &Arc<Self>,
+        candidates: &[Arc<Worker>],
+        policy: &dyn Policy,
+        ctx: &SelectionContext<'_>,
+        model: &str,
+    ) -> Result<Option<(Arc<Worker>, AdmissionGuard)>, ApiError> {
+        let Some(cap) = self.max_concurrent_per_worker else {
+            let worker =
+                policy
+                    .select(candidates, ctx)
+                    .ok_or_else(|| ApiError::PolicySelectionFailed {
+                        model: model.to_string(),
+                    })?;
+            let guard = AdmissionGuard::pass_through(worker.load_guard());
+            return Ok(Some((worker, guard)));
+        };
+        match self.try_claim(candidates, policy, ctx, cap, model)? {
+            Some((worker, load_guard)) => Ok(Some((
+                worker.clone(),
+                self.handed_off_guard(worker, load_guard),
+            ))),
+            None => Ok(None),
+        }
+    }
+
     /// Slow path: every candidate was full on the lock-free attempt. Re-check
     /// under the lock (a slot may have freed), then either claim it, shed with
     /// 503, or park in FIFO order until a slot is handed to us.
@@ -630,6 +669,54 @@ mod tests {
         );
         // A shed request never enters the queue, so the gauge stays at 0.
         assert!(out.contains("sgl_router_queued_requests 0\n"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn try_acquire_returns_none_when_all_candidates_full() {
+        // cap=1, the one candidate already at cap → try_acquire must NOT park
+        // and must return None (the retry path reads this as "no not-full
+        // worker to fail over to").
+        let q = queue(enabled(1, None));
+        let w = worker("w");
+        let _hold = w.load_guard(); // w at cap=1
+        let model = ModelId("m".into());
+        let ctx = SelectionContext::new(&model, None);
+        let got = q
+            .try_acquire(&[Arc::clone(&w)], &PickFirst, &ctx, "m")
+            .expect("try_acquire must not error when a worker is merely full");
+        assert!(
+            got.is_none(),
+            "a full candidate must yield None, not a slot"
+        );
+    }
+
+    #[tokio::test]
+    async fn try_acquire_claims_a_free_slot() {
+        let q = queue(enabled(2, None));
+        let w = worker("w");
+        let model = ModelId("m".into());
+        let ctx = SelectionContext::new(&model, None);
+        let (chosen, _g) = q
+            .try_acquire(&[Arc::clone(&w)], &PickFirst, &ctx, "m")
+            .expect("under cap must not error")
+            .expect("under cap must claim a slot");
+        assert_eq!(chosen.id, w.id);
+        assert_eq!(w.active_load(), 1);
+    }
+
+    #[tokio::test]
+    async fn try_acquire_disabled_gate_always_claims() {
+        // No cap → "full" is undefined, so try_acquire always dispatches.
+        let q = queue(AdmissionConfig::Disabled);
+        let w = worker("w");
+        let _h1 = w.load_guard();
+        let _h2 = w.load_guard(); // piled on; disabled gate ignores load
+        let model = ModelId("m".into());
+        let ctx = SelectionContext::new(&model, None);
+        let got = q
+            .try_acquire(&[Arc::clone(&w)], &PickFirst, &ctx, "m")
+            .unwrap();
+        assert!(got.is_some(), "disabled gate must always admit");
     }
 
     #[tokio::test]

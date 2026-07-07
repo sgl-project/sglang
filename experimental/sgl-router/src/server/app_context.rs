@@ -141,6 +141,7 @@ impl AppContext {
                 proxy: crate::config::ProxyConfig::default(),
                 active_load: crate::config::ActiveLoadConfig::default(),
                 admission: crate::config::AdmissionConfig::default(),
+                retry: crate::config::RetryConfig::default(),
             },
             tokenizers: Arc::new(TokenizerRegistry::default()),
             proxy: Arc::new(Proxy::new(std::time::Duration::from_secs(60)).expect("stub proxy")),

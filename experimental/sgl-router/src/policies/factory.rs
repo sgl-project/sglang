@@ -188,6 +188,7 @@ mod tests {
             proxy: ProxyConfig::default(),
             active_load: ActiveLoadConfig::default(),
             admission: crate::config::AdmissionConfig::default(),
+            retry: crate::config::RetryConfig::default(),
         }
     }
 

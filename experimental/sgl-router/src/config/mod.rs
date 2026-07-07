@@ -119,6 +119,7 @@ mod tests {
             proxy: ProxyConfig::default(),
             active_load: ActiveLoadConfig::default(),
             admission: AdmissionConfig::default(),
+            retry: RetryConfig::default(),
         }
     }
 
@@ -185,6 +186,11 @@ mod tests {
         assert!(shutdown_drain_advisory(default_shutdown_drain_secs()).is_none());
         assert!(shutdown_drain_advisory(30).is_none());
         assert!(shutdown_drain_advisory(0).is_none());
+    }
+
+    #[test]
+    fn retry_disabled_by_default() {
+        assert!(!RetryConfig::default().enabled);
     }
 
     #[test]
