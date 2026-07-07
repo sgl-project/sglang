@@ -3335,8 +3335,6 @@ class ServerArgs:
     # ------------------------------------------------------------------
     # CUDA graph configuration resolution
     # ------------------------------------------------------------------
-    # TODO: add unit tests in test/srt/test_server_args.py covering the
-    # precedence cascade + auto-disable matrix (follow-up PR).
     def _handle_cuda_graph_config(self):
         self._parse_cuda_graph_config()
         self._apply_cuda_graph_compatibility()
@@ -3431,7 +3429,6 @@ class ServerArgs:
             self._disable_full_prefill_cudagraph_if_incompatible()
 
     def _apply_cuda_graph_disaggregation_roles(self):
-        """Auto-disable CUDA graph for the unused disaggregation phase."""
         if self.disaggregation_mode == "prefill":
             if (Phase.DECODE, "backend") not in self._cuda_graph_config_locked:
                 self.cuda_graph_config.decode.backend = Backend.DISABLED

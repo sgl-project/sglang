@@ -1154,7 +1154,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 self.adaptive_controller.init_states(
                     cuda_graph_bs=(
                         None
-                        if self.server_args.disable_cuda_graph
+                        if check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED)
                         else self.server_args.cuda_graph_bs_decode
                     ),
                 )

@@ -1289,6 +1289,7 @@ class TestCudaGraphDisaggregationRoles(CustomTestCase):
     def test_cuda_graph_prefill_role_defaults_disable_decode_graph(self):
         args = self._handled_args(disaggregation_mode="prefill")
 
+        self.assertFalse(args.disable_cuda_graph)
         self.assertEqual(args.cuda_graph_config.decode.backend, Backend.DISABLED)
         self.assertEqual(args.cuda_graph_config.prefill.backend, Backend.BREAKABLE)
 
@@ -1298,22 +1299,20 @@ class TestCudaGraphDisaggregationRoles(CustomTestCase):
         self.assertEqual(args.cuda_graph_config.prefill.backend, Backend.DISABLED)
         self.assertNotEqual(args.cuda_graph_config.decode.backend, Backend.DISABLED)
 
-    def test_cuda_graph_null_role_defaults_keep_both_graphs_available(self):
-        args = self._handled_args(disaggregation_mode="null")
+    def test_cuda_graph_global_disable_still_disables_both_phases_for_all_roles(self):
+        for disaggregation_mode in ("prefill", "decode", "null"):
+            with self.subTest(disaggregation_mode=disaggregation_mode):
+                args = self._handled_args(
+                    disaggregation_mode=disaggregation_mode,
+                    disable_cuda_graph=True,
+                )
 
-        self.assertNotEqual(args.cuda_graph_config.decode.backend, Backend.DISABLED)
-        self.assertNotEqual(args.cuda_graph_config.prefill.backend, Backend.DISABLED)
-
-    def test_cuda_graph_global_disable_still_disables_both_phases_for_prefill_role(
-        self,
-    ):
-        args = self._handled_args(
-            disaggregation_mode="prefill",
-            disable_cuda_graph=True,
-        )
-
-        self.assertEqual(args.cuda_graph_config.decode.backend, Backend.DISABLED)
-        self.assertEqual(args.cuda_graph_config.prefill.backend, Backend.DISABLED)
+                self.assertEqual(
+                    args.cuda_graph_config.decode.backend, Backend.DISABLED
+                )
+                self.assertEqual(
+                    args.cuda_graph_config.prefill.backend, Backend.DISABLED
+                )
 
     def test_cuda_graph_explicit_decode_backend_survives_prefill_role(self):
         args = self._handled_args(
