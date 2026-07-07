@@ -44,7 +44,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     get_tc_piecewise_forward_context,
     is_in_tc_piecewise_cuda_graph,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.state_capturer.indexer_topk import (
     maybe_capture_indexer_topk,
 )
@@ -442,7 +442,7 @@ class Indexer(MultiPlatformOp):
         self.softmax_scale = self.head_dim**-0.5
 
         self.paged_mqa_logits_backend = DSAPagedMQALogitsBackend.resolve(
-            get_global_server_args().dsa_paged_mqa_logits_backend
+            get_server_args().dsa_paged_mqa_logits_backend
         )
 
     @contextlib.contextmanager
