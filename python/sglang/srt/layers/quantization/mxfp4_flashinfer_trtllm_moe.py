@@ -25,16 +25,33 @@ from sglang.srt.utils.common import is_sm100_supported, next_power_of_2
 
 _MXFP8_QUANTIZE_BACKEND = "cute-dsl" if is_sm100_supported() else "cuda"
 
-if is_flashinfer_available():
-    from flashinfer import mxfp8_quantize, shuffle_matrix_a, shuffle_matrix_sf_a
-    from flashinfer.fp4_quantization import block_scale_interleave
-    from flashinfer.fused_moe import trtllm_fp4_block_scale_routed_moe
-    from flashinfer.fused_moe.core import (
-        _maybe_get_cached_w3_w1_permute_indices,
-        get_w2_permute_indices_with_cache,
-    )
-
 logger = logging.getLogger(__name__)
+
+_FLASHINFER_MXFP4_IMPORT_ERROR = None
+_FLASHINFER_MXFP4_AVAILABLE = False
+
+if is_flashinfer_available():
+    try:
+        from flashinfer import mxfp8_quantize, shuffle_matrix_a, shuffle_matrix_sf_a
+        from flashinfer.fp4_quantization import block_scale_interleave
+        from flashinfer.fused_moe import trtllm_fp4_block_scale_routed_moe
+        from flashinfer.fused_moe.core import (
+            _maybe_get_cached_w3_w1_permute_indices,
+            get_w2_permute_indices_with_cache,
+        )
+
+        _FLASHINFER_MXFP4_AVAILABLE = True
+    except ImportError as e:
+        _FLASHINFER_MXFP4_IMPORT_ERROR = e
+
+
+def _require_flashinfer_mxfp4() -> None:
+    if _FLASHINFER_MXFP4_AVAILABLE:
+        return
+    raise ImportError(
+        "FlashInfer TRTLLM MXFP4 MoE backend requires FlashInfer and its optional "
+        "dependencies to import successfully."
+    ) from _FLASHINFER_MXFP4_IMPORT_ERROR
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
@@ -215,6 +232,7 @@ class Mxfp4FlashinferTrtllmMoEMethod:
     def process_weights_after_loading(self, layer: Module) -> None:
         from sglang.srt.layers.quantization.utils import reorder_w1w3_to_w3w1
 
+        _require_flashinfer_mxfp4()
         self._fp8.process_weights_after_loading(layer)
 
         if getattr(layer, "_mega_moe_weights_built", False):
@@ -337,6 +355,7 @@ class Mxfp4FlashinferTrtllmMoEMethod:
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
         from sglang.srt.layers.moe.topk import TopKOutputChecker
 
+        _require_flashinfer_mxfp4()
         hidden_states = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
 
