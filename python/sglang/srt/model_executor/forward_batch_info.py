@@ -1084,17 +1084,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     or get_global_server_args().rl_on_policy_target is not None
                 ):
                     # text only
-                    mrope_positions = torch.tensor(
-                        [
-                            [
-                                pos
-                                for pos in range(
-                                    extend_prefix_len,
-                                    extend_prefix_len + extend_seq_len,
-                                )
-                            ]
-                        ]
-                        * 3
+                    mrope_positions = (
+                        torch.arange(
+                            extend_prefix_len,
+                            extend_prefix_len + extend_seq_len,
+                            dtype=torch.int64,
+                        )
+                        .unsqueeze(0)
+                        .expand(3, -1)
                     )
                 else:
                     mrope_positions = mm_input.mrope_positions[
