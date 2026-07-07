@@ -104,6 +104,19 @@ class TestHandleDspark(CustomTestCase):
         _handle_dspark(args)
         self.assertEqual(args.speculative_num_draft_tokens, 6)
 
+    def test_req_to_token_headroom_covers_dspark_decode_reserve_topk_one(self):
+        from sglang.srt.mem_cache.common import get_req_to_token_extra_context_len
+
+        args = SimpleNamespace(
+            speculative_algorithm="DSPARK",
+            speculative_num_steps=1,
+            speculative_eagle_topk=1,
+            max_speculative_num_draft_tokens=6,
+            page_size=1,
+        )
+
+        self.assertEqual(get_req_to_token_extra_context_len(args), 12)
+
     def test_overrides_steps_and_topk_but_preserves_explicit_max_requests(self):
         args = _make_server_args(
             speculative_num_steps=3,
@@ -1948,41 +1961,6 @@ class TestDSparkRuntimeDebugEvidence(CustomTestCase):
                 draft_forward_batch=SimpleNamespace(name="batch"),
             )
 
-    def test_markov_debug_payload_maps_candidate_indices_to_markov_steps(self):
-        t = self.torch
-        worker = self._worker()
-        worker._draft_inner = SimpleNamespace(
-            shared_head=SimpleNamespace(norm=SimpleNamespace(weight=t.ones(4)))
-        )
-        worker._last_markov_refine_debug = {
-            "base_top1": t.tensor([[10, 11, 12]]),
-            "base_top1_logit": t.tensor([[1.0, 2.0, 3.0]]),
-            "hidden_norm": t.tensor([[2.0, 2.0, 2.0]]),
-            "hidden_abs_mean": t.tensor([[0.5, 0.5, 0.5]]),
-            "hidden_cos_adjacent": t.tensor([[0.1, 0.2]]),
-            "markov_top1": t.tensor([[20, 30, 40]]),
-            "prev_tokens": t.tensor([[9, 20, 30]]),
-        }
-        candidates = t.tensor([[9, 20, 30, 40]], dtype=t.int64)
-        target_predict = t.tensor([[20, 99, 40, 77]], dtype=t.int64)
-        confidence = t.tensor([[1.0, 2.0, 3.0]])
-
-        payload = self.worker_cls._build_accept_anomaly_markov_debug(
-            worker,
-            row_idx=0,
-            candidates=candidates,
-            target_predict=target_predict,
-            confidence=confidence,
-        )
-
-        self.assertIn("candidate0 is verify anchor", payload["layout"])
-        self.assertEqual(payload["markov_top1_first"], [20, 30, 40])
-        self.assertEqual(payload["candidates_first"], [9, 20, 30, 40])
-        self.assertTrue(payload["markov0_eq_target0"])
-        self.assertTrue(payload["candidate1_eq_markov0"])
-        self.assertEqual(payload["candidate_target_hits"][0]["target_hit_indices"], [0])
-
-
 class TestDSparkDeepSpecSemanticReference(CustomTestCase):
     def setUp(self):
         try:
@@ -2544,7 +2522,6 @@ class TestDSparkDeepSpecSemanticReference(CustomTestCase):
         worker._markov_embeds_buf = None
         worker._vocab_shard_mapping_cache = {}
         worker._accept_anomaly_enabled = False
-        worker._last_markov_refine_debug = None
         worker._draft_inner = SimpleNamespace(
             vocab_size=vocab_size,
             markov_head=markov_head,
@@ -2659,7 +2636,6 @@ class TestDSparkDeepSpecSemanticReference(CustomTestCase):
                 worker._markov_embeds_buf = None
                 worker._vocab_shard_mapping_cache = {}
                 worker._accept_anomaly_enabled = False
-                worker._last_markov_refine_debug = None
                 worker._draft_inner = SimpleNamespace(
                     vocab_size=vocab_size,
                     markov_head=markov_head,
@@ -2736,7 +2712,6 @@ class TestDSparkDeepSpecSemanticReference(CustomTestCase):
         worker._markov_embeds_buf = None
         worker._vocab_shard_mapping_cache = {}
         worker._accept_anomaly_enabled = False
-        worker._last_markov_refine_debug = None
         worker._draft_inner = SimpleNamespace(
             vocab_size=vocab_size,
             markov_head=markov_head,

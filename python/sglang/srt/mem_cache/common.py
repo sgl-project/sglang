@@ -257,17 +257,13 @@ def get_req_to_token_extra_context_len(server_args: ServerArgs) -> int:
     """req_to_token row headroom beyond the model context length.
 
     Sized to hold the decode over-allocation (kv_committed_len +
-    get_alloc_reserve_per_decode). The spec v2 page>1 topk>1 holey draft footprint
-    can outgrow the default num_draft_tokens headroom (PR #26972).
+    get_alloc_reserve_per_decode). Spec v2 reserves a double buffer for decode,
+    so the default num_draft_tokens headroom can be too small even when topk=1.
     """
     # FIXME(lsyin): this is the temporary fix for the context length issue when
     # using speculative decoding
     extra = 4 + (server_args.max_speculative_num_draft_tokens or 0)
-    if (
-        server_args.speculative_algorithm is not None
-        and server_args.page_size > 1
-        and (server_args.speculative_eagle_topk or 1) > 1
-    ):
+    if server_args.speculative_algorithm is not None:
         extra = max(extra, get_alloc_reserve_per_decode(server_args))
     return extra
 

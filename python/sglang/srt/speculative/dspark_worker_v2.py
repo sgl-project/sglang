@@ -230,14 +230,10 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._vocab_shard_mapping_cache: dict[
             tuple[int, int, torch.device], torch.Tensor
         ] = {}
-        self._last_markov_refine_debug: Optional[dict] = None
         self.draft_attn_backend = None
         self.draft_extend_attn_backend = None
         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
         self._accept_anomaly_enabled = _env_flag("SGLANG_DSPARK_DEBUG_ACCEPT", True)
-        self._accept_anomaly_topk_enabled = _env_flag(
-            "SGLANG_DSPARK_DEBUG_ACCEPT_TOPK", True
-        )
         self._accept_anomaly_verbose = _env_flag(
             "SGLANG_DSPARK_DEBUG_ACCEPT_VERBOSE", False
         )
@@ -2080,160 +2076,17 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         with torch.inference_mode():
             base_logits = _compute_full_vocab_logits(block_hidden, lm_head)
-            debug_enabled = bool(self._accept_anomaly_enabled)
-            if debug_enabled:
-                debug_topk_k = (
-                    min(5, int(base_logits.shape[-1]))
-                    if self._accept_anomaly_topk_enabled
-                    else 0
-                )
-                if debug_topk_k > 0:
-                    base_topk_values, base_topk_ids = torch.topk(
-                        base_logits, k=debug_topk_k, dim=-1
-                    )
-                else:
-                    base_topk_ids = None
-                    base_topk_values = None
-                base_top1 = torch.argmax(base_logits, dim=-1)
-                base_top1_logit = torch.gather(
-                    base_logits, dim=-1, index=base_top1.unsqueeze(-1)
-                ).squeeze(-1)
-                hidden_f = block_hidden.float()
-                hidden_norm = hidden_f.norm(dim=-1)
-                hidden_abs_mean = hidden_f.abs().mean(dim=-1)
-                if block_size > 1:
-                    hidden_cos_adjacent = torch.nn.functional.cosine_similarity(
-                        hidden_f[:, :-1, :], hidden_f[:, 1:, :], dim=-1
-                    )
-                else:
-                    hidden_cos_adjacent = hidden_f.new_empty((bs, 0))
-                markov_top1 = torch.empty(
-                    (bs, block_size), dtype=torch.int64, device=block_hidden.device
-                )
-                if debug_topk_k > 0:
-                    bias_topk_ids = torch.empty(
-                        (bs, block_size, debug_topk_k),
-                        dtype=torch.int64,
-                        device=block_hidden.device,
-                    )
-                    bias_topk_values = torch.empty(
-                        (bs, block_size, debug_topk_k),
-                        dtype=base_logits.dtype,
-                        device=block_hidden.device,
-                    )
-                    final_topk_ids = torch.empty(
-                        (bs, block_size, debug_topk_k),
-                        dtype=torch.int64,
-                        device=block_hidden.device,
-                    )
-                    final_topk_values = torch.empty(
-                        (bs, block_size, debug_topk_k),
-                        dtype=base_logits.dtype,
-                        device=block_hidden.device,
-                    )
-                else:
-                    bias_topk_ids = None
-                    bias_topk_values = None
-                    final_topk_ids = None
-                    final_topk_values = None
-                prev_token_debug = torch.empty_like(markov_top1)
-            else:
-                debug_topk_k = 0
-                base_topk_ids = None
-                base_topk_values = None
-                base_top1 = None
-                base_top1_logit = None
-                hidden_norm = None
-                hidden_abs_mean = None
-                hidden_cos_adjacent = None
-                markov_top1 = None
-                bias_topk_ids = None
-                bias_topk_values = None
-                final_topk_ids = None
-                final_topk_values = None
-                prev_token_debug = None
             prev_tokens = candidates[:, 0]
             for i in range(block_size):
-                if debug_enabled:
-                    assert prev_token_debug is not None
-                    prev_token_debug[:, i].copy_(prev_tokens)
                 prev_embed = markov_head.get_prev_embeddings(prev_tokens)
                 markov_embeds[:, i].copy_(prev_embed)
                 bias = _compute_full_vocab_logits(prev_embed, markov_head.markov_w2)
-                if debug_enabled and debug_topk_k > 0:
-                    assert bias_topk_ids is not None
-                    assert bias_topk_values is not None
-                    step_bias_topk_values, step_bias_topk_ids = torch.topk(
-                        bias, k=debug_topk_k, dim=-1
-                    )
-                    bias_topk_ids[:, i].copy_(step_bias_topk_ids)
-                    bias_topk_values[:, i].copy_(step_bias_topk_values)
                 bias.add_(base_logits[:, i])
                 next_tokens = torch.argmax(bias, dim=-1)
-                if debug_enabled:
-                    assert markov_top1 is not None
-                    if debug_topk_k > 0:
-                        assert final_topk_ids is not None
-                        assert final_topk_values is not None
-                        step_topk_values, step_topk_ids = torch.topk(
-                            bias, k=debug_topk_k, dim=-1
-                        )
-                        final_topk_ids[:, i].copy_(step_topk_ids)
-                        final_topk_values[:, i].copy_(step_topk_values)
-                    markov_top1[:, i].copy_(next_tokens)
                 candidates[:, i + 1].copy_(next_tokens)
                 prev_tokens = next_tokens
 
             confidence = confidence_head(block_hidden, markov_embeds)
-            if debug_enabled:
-                assert base_top1 is not None
-                assert base_top1_logit is not None
-                assert hidden_norm is not None
-                assert hidden_abs_mean is not None
-                assert hidden_cos_adjacent is not None
-                assert markov_top1 is not None
-                assert prev_token_debug is not None
-                self._last_markov_refine_debug = {
-                    "base_topk_ids": (
-                        base_topk_ids[:output_bs].detach()
-                        if base_topk_ids is not None
-                        else None
-                    ),
-                    "base_topk_values": (
-                        base_topk_values[:output_bs].detach()
-                        if base_topk_values is not None
-                        else None
-                    ),
-                    "base_top1": base_top1[:output_bs].detach(),
-                    "base_top1_logit": base_top1_logit[:output_bs].detach(),
-                    "hidden_norm": hidden_norm[:output_bs].detach(),
-                    "hidden_abs_mean": hidden_abs_mean[:output_bs].detach(),
-                    "hidden_cos_adjacent": hidden_cos_adjacent[:output_bs].detach(),
-                    "markov_top1": markov_top1[:output_bs].detach(),
-                    "bias_topk_ids": (
-                        bias_topk_ids[:output_bs].detach()
-                        if bias_topk_ids is not None
-                        else None
-                    ),
-                    "bias_topk_values": (
-                        bias_topk_values[:output_bs].detach()
-                        if bias_topk_values is not None
-                        else None
-                    ),
-                    "final_topk_ids": (
-                        final_topk_ids[:output_bs].detach()
-                        if final_topk_ids is not None
-                        else None
-                    ),
-                    "final_topk_values": (
-                        final_topk_values[:output_bs].detach()
-                        if final_topk_values is not None
-                        else None
-                    ),
-                    "prev_tokens": prev_token_debug[:output_bs].detach(),
-                }
-            else:
-                self._last_markov_refine_debug = None
 
         return candidates[:output_bs], confidence[:output_bs]
 
@@ -2339,385 +2192,6 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
         return commit_lens, bonus_tokens, out_tokens
 
-    def _build_accept_anomaly_markov_debug(
-        self,
-        *,
-        row_idx: int,
-        candidates: torch.Tensor,
-        target_predict: torch.Tensor,
-        confidence: torch.Tensor,
-    ) -> Optional[dict]:
-        try:
-            debug = self._last_markov_refine_debug
-            if not debug:
-                return None
-            base_topk_ids = debug.get("base_topk_ids")
-            base_topk_values = debug.get("base_topk_values")
-            base_top1 = debug.get("base_top1")
-            base_top1_logit = debug.get("base_top1_logit")
-            hidden_norm = debug.get("hidden_norm")
-            hidden_abs_mean = debug.get("hidden_abs_mean")
-            hidden_cos_adjacent = debug.get("hidden_cos_adjacent")
-            markov_top1 = debug.get("markov_top1")
-            bias_topk_ids = debug.get("bias_topk_ids")
-            bias_topk_values = debug.get("bias_topk_values")
-            final_topk_ids = debug.get("final_topk_ids")
-            final_topk_values = debug.get("final_topk_values")
-            prev_tokens = debug.get("prev_tokens")
-            if (
-                base_top1 is None
-                or base_top1_logit is None
-                or hidden_norm is None
-                or hidden_abs_mean is None
-                or hidden_cos_adjacent is None
-                or markov_top1 is None
-                or prev_tokens is None
-            ):
-                return None
-            if int(row_idx) >= int(markov_top1.shape[0]):
-                return None
-            verify_stride = int(candidates.shape[1])
-            draft_width = int(markov_top1.shape[1])
-            candidate_limit = min(verify_stride, 8)
-            draft_limit = min(draft_width, 8)
-            candidate_row = candidates[row_idx]
-            target_row = target_predict[row_idx]
-            confidence_row = confidence[row_idx]
-            has_topk_debug = (
-                base_topk_ids is not None
-                and base_topk_values is not None
-                and bias_topk_ids is not None
-                and bias_topk_values is not None
-                and final_topk_ids is not None
-                and final_topk_values is not None
-            )
-            if has_topk_debug:
-                row_base_topk_ids = (
-                    base_topk_ids[row_idx, :draft_limit].detach().cpu()
-                )
-                row_base_topk_values = (
-                    base_topk_values[row_idx, :draft_limit].detach().cpu()
-                )
-                row_bias_topk_ids = (
-                    bias_topk_ids[row_idx, :draft_limit].detach().cpu()
-                )
-                row_bias_topk_values = (
-                    bias_topk_values[row_idx, :draft_limit].detach().cpu()
-                )
-                row_final_topk_ids = (
-                    final_topk_ids[row_idx, :draft_limit].detach().cpu()
-                )
-                row_final_topk_values = (
-                    final_topk_values[row_idx, :draft_limit].detach().cpu()
-                )
-            else:
-                row_base_topk_ids = None
-                row_base_topk_values = None
-                row_bias_topk_ids = None
-                row_bias_topk_values = None
-                row_final_topk_ids = None
-                row_final_topk_values = None
-            row_base = base_top1[row_idx, :draft_limit].detach().cpu()
-            row_base_top1_logit = base_top1_logit[
-                row_idx, :draft_limit
-            ].detach().cpu()
-            row_hidden_norm = hidden_norm[row_idx, :draft_limit].detach().cpu()
-            row_hidden_abs_mean = hidden_abs_mean[
-                row_idx, :draft_limit
-            ].detach().cpu()
-            norm_weight = self._draft_inner.shared_head.norm.weight.detach().float()
-            norm_weight_l2 = float(norm_weight.norm().detach().cpu())
-            norm_weight_abs_mean = float(norm_weight.abs().mean().detach().cpu())
-            row_hidden_l2_ratio = row_hidden_norm / max(norm_weight_l2, 1e-6)
-            row_hidden_cos_adjacent = (
-                hidden_cos_adjacent[row_idx, : max(draft_limit - 1, 0)]
-                .detach()
-                .cpu()
-            )
-            row_markov = markov_top1[row_idx].detach().cpu()
-            row_prev = prev_tokens[row_idx, :draft_limit].detach().cpu()
-            candidate_target_hits = []
-            for cand_idx in range(1, min(verify_stride, 7)):
-                hits = torch.nonzero(
-                    target_row[:candidate_limit] == candidate_row[cand_idx],
-                    as_tuple=False,
-                ).view(-1)
-                candidate_target_hits.append(
-                    {
-                        "candidate_idx": int(cand_idx),
-                        "candidate": int(candidate_row[cand_idx]),
-                        "target_hit_indices": [
-                            int(x) for x in hits[:4].tolist()
-                        ],
-                    }
-                )
-
-            topk_debug = []
-            if has_topk_debug:
-                assert row_base_topk_ids is not None
-                assert row_base_topk_values is not None
-                assert row_bias_topk_ids is not None
-                assert row_bias_topk_values is not None
-                assert row_final_topk_ids is not None
-                assert row_final_topk_values is not None
-                for step in range(draft_limit):
-                    target_token = (
-                        int(target_row[step])
-                        if step < int(target_row.numel())
-                        else None
-                    )
-                    candidate_token = (
-                        int(candidate_row[step + 1])
-                        if step + 1 < int(candidate_row.numel())
-                        else None
-                    )
-                    base_ids = [int(x) for x in row_base_topk_ids[step].tolist()]
-                    base_values = [
-                        float(x) for x in row_base_topk_values[step].tolist()
-                    ]
-                    bias_ids = [int(x) for x in row_bias_topk_ids[step].tolist()]
-                    bias_values = [
-                        float(x) for x in row_bias_topk_values[step].tolist()
-                    ]
-                    final_ids = [int(x) for x in row_final_topk_ids[step].tolist()]
-                    final_values = [
-                        float(x) for x in row_final_topk_values[step].tolist()
-                    ]
-                    topk_debug.append(
-                        {
-                            "step": int(step),
-                            "prev_token": int(row_prev[step]),
-                            "candidate": candidate_token,
-                            "target": target_token,
-                            "base_top_ids": base_ids,
-                            "base_top_logits": base_values,
-                            "base_target_rank_in_top": (
-                                base_ids.index(target_token)
-                                if target_token in base_ids
-                                else None
-                            ),
-                            "bias_top_ids": bias_ids,
-                            "bias_top_logits": bias_values,
-                            "bias_candidate_rank_in_top": (
-                                bias_ids.index(candidate_token)
-                                if candidate_token in bias_ids
-                                else None
-                            ),
-                            "bias_target_rank_in_top": (
-                                bias_ids.index(target_token)
-                                if target_token in bias_ids
-                                else None
-                            ),
-                            "final_top_ids": final_ids,
-                            "final_top_logits": final_values,
-                            "final_target_rank_in_top": (
-                                final_ids.index(target_token)
-                                if target_token in final_ids
-                                else None
-                            ),
-                        }
-                    )
-            payload = {
-                "layout": (
-                    "candidate0 is verify anchor; markov_top1[i] is sampled from "
-                    "block_hidden[i] and maps to candidate[i+1]; DeepSpec verify "
-                    "stride is anchor + draft_width"
-                ),
-                "hidden_semantics": (
-                    "post_norm_head_hidden; DeepSpec returns norm(hidden), while "
-                    "vLLM DSV4 returns pre-norm hc_head hidden but computes base "
-                    "logits as lm_head(norm(hidden))"
-                ),
-                "base_logits_semantics": "lm_head(post_norm_head_hidden)",
-                "markov_semantics": (
-                    "vanilla_markov_bias_depends_only_on_prev_token; hidden only "
-                    "affects Markov refine through base logits"
-                ),
-                "post_norm_weight_l2": norm_weight_l2,
-                "post_norm_weight_abs_mean": norm_weight_abs_mean,
-                "base_top1_first": [int(x) for x in row_base.tolist()],
-                "base_top1_logit_first": [
-                    float(x) for x in row_base_top1_logit.tolist()
-                ],
-                "hidden_norm_first": [float(x) for x in row_hidden_norm.tolist()],
-                "hidden_l2_ratio_to_norm_weight_first": [
-                    float(x) for x in row_hidden_l2_ratio.tolist()
-                ],
-                "hidden_abs_mean_first": [
-                    float(x) for x in row_hidden_abs_mean.tolist()
-                ],
-                "hidden_cos_adjacent_first": [
-                    float(x) for x in row_hidden_cos_adjacent.tolist()
-                ],
-                "markov_top1_first": [
-                    int(x) for x in row_markov[:draft_limit].tolist()
-                ],
-                "prev_tokens_first": [int(x) for x in row_prev.tolist()],
-                "candidates_first": [
-                    int(x) for x in candidate_row[:candidate_limit].tolist()
-                ],
-                "target_first": [int(x) for x in target_row[:candidate_limit].tolist()],
-                "candidate_target_hits": candidate_target_hits,
-                "logits_topk_first": topk_debug,
-                "confidence_first": [
-                    float(x) for x in confidence_row[:draft_limit].tolist()
-                ],
-            }
-            if draft_width > 0:
-                payload["markov0_eq_target0"] = bool(row_markov[0] == target_row[0])
-                payload["candidate1_eq_markov0"] = (
-                    bool(candidate_row[1] == row_markov[0])
-                    if verify_stride > 1
-                    else None
-                )
-            if draft_width > 1:
-                payload["markov1_eq_target0"] = bool(row_markov[1] == target_row[0])
-                payload["markov1_eq_target1"] = bool(row_markov[1] == target_row[1])
-                payload["candidate2_eq_markov1"] = (
-                    bool(candidate_row[2] == row_markov[1])
-                    if verify_stride > 2
-                    else None
-                )
-            return payload
-        except Exception as e:
-            return {"error": str(e)}
-
-    def _build_accept_anomaly_logit_score_debug(
-        self,
-        *,
-        row_idx: int,
-        block_hidden: torch.Tensor,
-        candidates: torch.Tensor,
-        target_predict: torch.Tensor,
-    ) -> Optional[list[dict]]:
-        try:
-            if (
-                block_hidden is None
-                or block_hidden.numel() == 0
-                or candidates.numel() == 0
-                or target_predict.numel() == 0
-            ):
-                return None
-            row_idx = int(row_idx)
-            if row_idx >= int(block_hidden.shape[0]):
-                return None
-
-            vocab_size = int(self._draft_inner.vocab_size)
-            logits_processor = self.draft_model.logits_processor
-
-            def _gather_full_vocab(logits_shard: torch.Tensor, head) -> torch.Tensor:
-                def _reindex_sharded_vocab(logits: torch.Tensor) -> torch.Tensor:
-                    mapping_fn = getattr(head, "get_sharded_to_full_mapping", None)
-                    if mapping_fn is None:
-                        return logits[..., :vocab_size]
-                    mapping = mapping_fn()
-                    if mapping is None:
-                        return logits[..., :vocab_size]
-                    cache_key = (id(head), int(logits.shape[-1]), logits.device)
-                    mapping_tensor = self._vocab_shard_mapping_cache.get(cache_key)
-                    if mapping_tensor is None or mapping_tensor.numel() != len(mapping):
-                        mapping_tensor = torch.tensor(
-                            mapping, dtype=torch.long, device=logits.device
-                        )
-                        self._vocab_shard_mapping_cache[cache_key] = mapping_tensor
-                    return logits.index_select(-1, mapping_tensor)[..., :vocab_size]
-
-                if logits_shard.shape[-1] >= vocab_size:
-                    return _reindex_sharded_vocab(logits_shard)
-                if getattr(head, "use_attn_tp_group", False):
-                    group = get_attn_tp_group()
-                    if group.world_size == 1:
-                        return logits_shard[..., :vocab_size]
-                    logits = group.all_gather(logits_shard, dim=-1)
-                    return _reindex_sharded_vocab(logits)
-                tp_size = get_tensor_model_parallel_world_size()
-                if tp_size == 1:
-                    return logits_shard[..., :vocab_size]
-                logits = tensor_model_parallel_all_gather(logits_shard, dim=-1)
-                return _reindex_sharded_vocab(logits)
-
-            def _compute_full_vocab_logits(hidden_states: torch.Tensor, head):
-                logits_shard = logits_processor._compute_lm_head(hidden_states, head)
-                return _gather_full_vocab(logits_shard, head)
-
-            with (
-                self.draft_tp_context(self.draft_model_runner.tp_group),
-                speculative_moe_backend_context(),
-                speculative_moe_a2a_backend_context(),
-                torch.inference_mode(),
-            ):
-                row_hidden = block_hidden[row_idx : row_idx + 1]
-                base_logits = _compute_full_vocab_logits(
-                    row_hidden, self.draft_model.lm_head
-                )
-                markov_head = self._draft_inner.markov_head
-                candidate_row = candidates[row_idx]
-                target_row = target_predict[row_idx]
-                draft_width = min(
-                    int(self.block_size),
-                    int(base_logits.shape[1]),
-                    int(target_row.numel()),
-                    max(int(candidate_row.numel()) - 1, 0),
-                )
-                out = []
-                prev_tokens = candidate_row[:draft_width].to(
-                    device=block_hidden.device, dtype=torch.int64
-                )
-                for step in range(draft_width):
-                    prev_token = prev_tokens[step].view(1)
-                    candidate_token = int(candidate_row[step + 1].detach().cpu())
-                    target_token = int(target_row[step].detach().cpu())
-                    prev_embed = markov_head.get_prev_embeddings(prev_token)
-                    bias_logits = _compute_full_vocab_logits(
-                        prev_embed, markov_head.markov_w2
-                    )[0]
-                    base_step = base_logits[0, step]
-                    final_step = base_step + bias_logits
-
-                    def _score(logits: torch.Tensor, token: int) -> tuple[float, int]:
-                        value = logits[int(token)]
-                        rank = int((logits > value).sum().detach().cpu())
-                        return float(value.detach().cpu()), rank
-
-                    base_candidate, base_candidate_rank = _score(
-                        base_step, candidate_token
-                    )
-                    base_target, base_target_rank = _score(base_step, target_token)
-                    bias_candidate, bias_candidate_rank = _score(
-                        bias_logits, candidate_token
-                    )
-                    bias_target, bias_target_rank = _score(bias_logits, target_token)
-                    final_candidate, final_candidate_rank = _score(
-                        final_step, candidate_token
-                    )
-                    final_target, final_target_rank = _score(final_step, target_token)
-                    out.append(
-                        {
-                            "step": int(step),
-                            "prev_token": int(prev_token.detach().cpu()[0]),
-                            "candidate": candidate_token,
-                            "target": target_token,
-                            "base_candidate_logit": base_candidate,
-                            "base_target_logit": base_target,
-                            "base_candidate_rank": base_candidate_rank,
-                            "base_target_rank": base_target_rank,
-                            "bias_candidate_logit": bias_candidate,
-                            "bias_target_logit": bias_target,
-                            "bias_candidate_rank": bias_candidate_rank,
-                            "bias_target_rank": bias_target_rank,
-                            "final_candidate_logit": final_candidate,
-                            "final_target_logit": final_target,
-                            "final_candidate_rank": final_candidate_rank,
-                            "final_target_rank": final_target_rank,
-                            "final_margin_candidate_minus_target": (
-                                final_candidate - final_target
-                            ),
-                        }
-                    )
-                return out
-        except Exception as e:
-            return [{"error": str(e)}]
-
     def _maybe_log_accept_anomaly(
         self,
         *,
@@ -2734,8 +2208,6 @@ class DSparkWorkerV2(BaseSpecWorker):
         anchor_lens: torch.Tensor,
         new_seq_lens: torch.Tensor,
         positions: torch.Tensor,
-        block_hidden: Optional[torch.Tensor] = None,
-        target_logits: Optional[torch.Tensor] = None,
         ignore_mask: Optional[torch.Tensor] = None,
     ) -> None:
         if not self._accept_anomaly_enabled or commit_lens.numel() == 0:
@@ -2948,14 +2420,6 @@ class DSparkWorkerV2(BaseSpecWorker):
             ):
                 self._accept_anomaly_dumped.add(key)
                 self._accept_anomaly_dump_count += 1
-                score_debug = None
-                if block_hidden is not None:
-                    score_debug = self._build_accept_anomaly_logit_score_debug(
-                        row_idx=i,
-                        block_hidden=block_hidden,
-                        candidates=candidates,
-                        target_predict=target_predict,
-                    )
                 if not self._is_tp0():
                     continue
                 kv_debug = self._build_accept_anomaly_kv_debug(
@@ -2964,47 +2428,6 @@ class DSparkWorkerV2(BaseSpecWorker):
                     anchor_len=int(anchor_lens_cpu[i]),
                     block_size=int(self.block_size),
                 )
-                markov_debug = self._build_accept_anomaly_markov_debug(
-                    row_idx=i,
-                    candidates=candidate_cpu,
-                    target_predict=target_cpu,
-                    confidence=confidence_cpu,
-                )
-                if markov_debug is not None and score_debug is not None:
-                    markov_debug["logit_score_debug"] = score_debug
-                if (
-                    markov_debug is not None
-                    and target_logits is not None
-                    and self._accept_anomaly_topk_enabled
-                ):
-                    try:
-                        draft_width = int(self.block_size)
-                        row_logits = target_logits.detach().view(
-                            bs, int(self.verify_stride), -1
-                        )[i, :draft_width]
-                        topk_k = min(5, int(row_logits.shape[-1]))
-                        topk_values, topk_ids = torch.topk(
-                            row_logits, k=topk_k, dim=-1
-                        )
-                        target_row = target_predict[i, :draft_width]
-                        candidate_row = candidates[i, 1 : 1 + draft_width]
-                        markov_debug["target_logits_topk_first"] = [
-                            {
-                                "step": int(step),
-                                "candidate": int(candidate_row[step]),
-                                "target": int(target_row[step]),
-                                "target_top_ids": [
-                                    int(x) for x in topk_ids[step].detach().cpu().tolist()
-                                ],
-                                "target_top_logits": [
-                                    float(x)
-                                    for x in topk_values[step].detach().cpu().tolist()
-                                ],
-                            }
-                            for step in range(draft_width)
-                        ]
-                    except Exception as e:
-                        markov_debug["target_logits_topk_error"] = str(e)
                 logger.warning(
                     "DSpark accept anomaly detected: dp_rank=%s tp_rank=%s "
                     "ep_rank=%s req_pool_idx=%s rid=%s zero_draft_streak=%s "
@@ -3026,16 +2449,6 @@ class DSparkWorkerV2(BaseSpecWorker):
                     int(req_pool_idx),
                     rid,
                     kv_debug,
-                )
-                logger.warning(
-                    "DSpark accept anomaly Markov debug: dp_rank=%s tp_rank=%s "
-                    "ep_rank=%s req_pool_idx=%s rid=%s markov_debug=%s",
-                    self.dp_rank,
-                    self.tp_rank,
-                    self.moe_ep_rank,
-                    int(req_pool_idx),
-                    rid,
-                    markov_debug,
                 )
 
         stale_keys = set(self._accept_anomaly_histories) - active_keys
@@ -3694,8 +3107,6 @@ class DSparkWorkerV2(BaseSpecWorker):
             anchor_lens=anchor_lens,
             new_seq_lens=new_seq_lens,
             positions=verify_positions,
-            block_hidden=block_hidden,
-            target_logits=logits_output.next_token_logits,
             ignore_mask=transfer_warmup_mask,
         )
         self._swa_write_source_snapshot_by_req_pool = None
