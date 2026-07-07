@@ -27,8 +27,9 @@ def _bytes(t: torch.Tensor) -> torch.Tensor:
 @pytest.mark.parametrize("scale", [None, 0.5, 2.0])
 @pytest.mark.parametrize("idx_dtype", [torch.int64, torch.int32])
 @pytest.mark.parametrize("fused_qkv", [False, True])
+@pytest.mark.parametrize("quantize_q", [True, False])
 def test_fused_fp8_qkv_kv_cache(
-    dtype, hq, hkv, head_dim, num_tokens, scale, idx_dtype, fused_qkv
+    dtype, hq, hkv, head_dim, num_tokens, scale, idx_dtype, fused_qkv, quantize_q
 ):
     torch.manual_seed(0)
     device = "cuda"
@@ -62,11 +63,14 @@ def test_fused_fp8_qkv_kv_cache(
         inv_v = 1.0 / float(v_scale)
 
     q_out = fused_fp8_qkv_kv_cache(
-        q, k, v, k_cache, v_cache, cache_loc, k_scale, v_scale
+        q if quantize_q else None, k, v, k_cache, v_cache, cache_loc, k_scale, v_scale
     )
 
-    q_ref = q.to(FP8)
-    torch.testing.assert_close(_bytes(q_out), _bytes(q_ref), rtol=0, atol=0)
+    if quantize_q:
+        q_ref = q.to(FP8)
+        torch.testing.assert_close(_bytes(q_out), _bytes(q_ref), rtol=0, atol=0)
+    else:
+        assert q_out is None
 
     k_ref = _ref_quant(k.reshape(num_tokens, kv_dim).float(), inv_k)
     v_ref = _ref_quant(v.reshape(num_tokens, kv_dim).float(), inv_v)

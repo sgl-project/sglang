@@ -12,10 +12,10 @@
 namespace {
 
 struct FusedQkvParams {
-  const void* __restrict__ q;
+  const void* __restrict__ q;  // nullptr when this call only writes K/V
   const void* __restrict__ k;
   const void* __restrict__ v;
-  void* __restrict__ q_out;
+  void* __restrict__ q_out;  // nullptr when this call only writes K/V
   void* __restrict__ k_cache;
   void* __restrict__ v_cache;
   const void* __restrict__ cache_loc;
@@ -55,7 +55,14 @@ SGL_DEVICE void quant_row(const T* __restrict__ src, fp8_e4m3_t* __restrict__ ds
   }
 }
 
-template <typename T, typename IdxT, int kVecN, bool kUsePDL>
+// kQuantizeQ selects, at compile time, whether this instantiation also
+// quantizes Q. Some attention backends (e.g. XQA) want Q left alone —
+// sometimes in bf16, sometimes cast to FP8 later in eager torch depending on
+// the decode mode — so we can't just always quantize Q here. Baking the
+// choice into the template means the Q-handling instructions disappear
+// entirely from the compiled kernel when they're not needed, rather than
+// costing a runtime branch.
+template <typename T, typename IdxT, int kVecN, bool kUsePDL, bool kQuantizeQ>
 __global__ void fused_fp8_qkv_kv_cache_kernel(const __grid_constant__ FusedQkvParams params) {
   using namespace device;
   const uint32_t token = blockIdx.x;
@@ -67,11 +74,13 @@ __global__ void fused_fp8_qkv_kv_cache_kernel(const __grid_constant__ FusedQkvPa
   const float inv_k = 1.0f / (*params.k_scale);
   const float inv_v = 1.0f / (*params.v_scale);
 
-  quant_row<T, kVecN>(
-      static_cast<const T*>(params.q) + static_cast<size_t>(token) * params.q_stride,
-      static_cast<fp8_e4m3_t*>(params.q_out) + static_cast<size_t>(token) * params.q_dim,
-      params.q_dim,
-      1.0f);
+  if constexpr (kQuantizeQ) {
+    quant_row<T, kVecN>(
+        static_cast<const T*>(params.q) + static_cast<size_t>(token) * params.q_stride,
+        static_cast<fp8_e4m3_t*>(params.q_out) + static_cast<size_t>(token) * params.q_dim,
+        params.q_dim,
+        1.0f);
+  }
   quant_row<T, kVecN>(
       static_cast<const T*>(params.k) + static_cast<size_t>(token) * params.k_stride,
       static_cast<fp8_e4m3_t*>(params.k_cache) + static_cast<size_t>(slot) * params.kv_dim,
@@ -91,71 +100,89 @@ struct FusedFp8QkvKvCache {
   static constexpr int kVecWide = device::kMaxVecBytes / sizeof(T);
   static constexpr int kVec128 = 16 / sizeof(T);
 
-  template <typename IdxT, int kVecN>
-  static constexpr auto kernel = fused_fp8_qkv_kv_cache_kernel<T, IdxT, kVecN, kUsePDL>;
+  template <typename IdxT, int kVecN, bool kQuantizeQ>
+  static constexpr auto kernel = fused_fp8_qkv_kv_cache_kernel<T, IdxT, kVecN, kUsePDL, kQuantizeQ>;
 
-  template <typename IdxT>
+  template <typename IdxT, bool kQuantizeQ>
   static auto get_kernel(int vec_n) {
-    if (vec_n == kVecWide) return kernel<IdxT, kVecWide>;
-    if (vec_n == kVec128) return kernel<IdxT, kVec128>;
-    return kernel<IdxT, 1>;
+    if (vec_n == kVecWide) return kernel<IdxT, kVecWide, kQuantizeQ>;
+    if (vec_n == kVec128) return kernel<IdxT, kVec128, kQuantizeQ>;
+    return kernel<IdxT, 1, kQuantizeQ>;
   }
 
   static bool aligned(const void* p, int bytes) {
     return reinterpret_cast<uintptr_t>(p) % bytes == 0;
   }
 
+  // `q`/`q_out` are optional: pass both to also quantize Q into `q_out`
+  // (dividing by q_scale, same as K/V), or omit both to only quantize and
+  // write K/V, leaving Q for the caller to handle itself.
   static void
-  run(const tvm::ffi::TensorView q,
+  run(const tvm::ffi::Optional<tvm::ffi::TensorView> q,
       const tvm::ffi::TensorView k,
       const tvm::ffi::TensorView v,
-      const tvm::ffi::TensorView q_out,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> q_out,
       const tvm::ffi::TensorView k_cache,
       const tvm::ffi::TensorView v_cache,
       const tvm::ffi::TensorView cache_loc,
       const tvm::ffi::TensorView k_scale,
       const tvm::ffi::TensorView v_scale) {
     using namespace host;
+    const bool quantize_q = q.has_value();
+    RuntimeCheck(quantize_q == q_out.has_value(), "fused_fp8_qkv_kv_cache: q and q_out must both be given or both omitted");
+
     auto N = SymbolicSize{"num_tokens"};
-    auto Dq = SymbolicSize{"q_dim"};
     auto Dkv = SymbolicSize{"kv_dim"};
     auto S = SymbolicSize{"num_slots"};
-    auto SQ = SymbolicSize{"q_stride"};
     auto SK = SymbolicSize{"k_stride"};
     auto SV = SymbolicSize{"v_stride"};
     auto device = SymbolicDevice{};
     auto idx_dtype = SymbolicDType{};
     device.set_options<kDLCUDA>();
 
-    TensorMatcher({N, Dq}).with_strides({SQ, 1}).with_dtype<T>().with_device(device).verify(q);
-    TensorMatcher({N, Dq}).with_dtype<fp8_e4m3_t>().with_device(device).verify(q_out);
     TensorMatcher({N, Dkv}).with_strides({SK, 1}).with_dtype<T>().with_device(device).verify(k);
     TensorMatcher({N, Dkv}).with_strides({SV, 1}).with_dtype<T>().with_device(device).verify(v);
     TensorMatcher({S, Dkv}).with_dtype<fp8_e4m3_t>().with_device(device).verify(k_cache).verify(v_cache);
     TensorMatcher({N}).with_dtype<int32_t, int64_t>(idx_dtype).with_device(device).verify(cache_loc);
     TensorMatcher({1}).with_dtype<fp32_t>().with_device(device).verify(k_scale).verify(v_scale);
 
+    uint32_t q_dim = 0;
+    int64_t q_stride = 0;
+    const void* q_ptr = nullptr;
+    void* q_out_ptr = nullptr;
+    if (quantize_q) {
+      auto Dq = SymbolicSize{"q_dim"};
+      auto SQ = SymbolicSize{"q_stride"};
+      TensorMatcher({N, Dq}).with_strides({SQ, 1}).with_dtype<T>().with_device(device).verify(q.value());
+      TensorMatcher({N, Dq}).with_dtype<fp8_e4m3_t>().with_device(device).verify(q_out.value());
+      q_dim = static_cast<uint32_t>(Dq.unwrap());
+      q_stride = SQ.unwrap();
+      q_ptr = q.value().data_ptr();
+      q_out_ptr = q_out.value().data_ptr();
+    }
+
     const uint32_t num_tokens = static_cast<uint32_t>(N.unwrap());
-    const uint32_t q_dim = static_cast<uint32_t>(Dq.unwrap());
     const uint32_t kv_dim = static_cast<uint32_t>(Dkv.unwrap());
-    const int64_t q_stride = SQ.unwrap();
     const int64_t k_stride = SK.unwrap();
     const int64_t v_stride = SV.unwrap();
     RuntimeCheck(num_tokens > 0, "fused_fp8_qkv_kv_cache: num_tokens must be > 0, got ", num_tokens);
 
     auto fits = [&](int vec) {
       const int in_bytes = vec * static_cast<int>(sizeof(T));
-      return q_dim % vec == 0 && kv_dim % vec == 0 && q_stride % vec == 0 && k_stride % vec == 0 &&
-             v_stride % vec == 0 && aligned(q.data_ptr(), in_bytes) && aligned(k.data_ptr(), in_bytes) &&
-             aligned(v.data_ptr(), in_bytes);
+      bool ok = kv_dim % vec == 0 && k_stride % vec == 0 && v_stride % vec == 0 &&
+                aligned(k.data_ptr(), in_bytes) && aligned(v.data_ptr(), in_bytes);
+      if (quantize_q) {
+        ok = ok && q_dim % vec == 0 && q_stride % vec == 0 && aligned(q_ptr, in_bytes);
+      }
+      return ok;
     };
     const int vec_n = fits(kVecWide) ? kVecWide : (fits(kVec128) ? kVec128 : 1);
 
     const auto params = FusedQkvParams{
-        .q = q.data_ptr(),
+        .q = q_ptr,
         .k = k.data_ptr(),
         .v = v.data_ptr(),
-        .q_out = q_out.data_ptr(),
+        .q_out = q_out_ptr,
         .k_cache = k_cache.data_ptr(),
         .v_cache = v_cache.data_ptr(),
         .cache_loc = cache_loc.data_ptr(),
@@ -169,9 +196,15 @@ struct FusedFp8QkvKvCache {
         .kv_dim = kv_dim,
     };
 
-    const auto kernel = idx_dtype.is_type<int32_t>() ? get_kernel<int32_t>(vec_n) : get_kernel<int64_t>(vec_n);
-    LaunchKernel(num_tokens, kBlockSize, device.unwrap())  //
-        .enable_pdl(kUsePDL)(kernel, params);
+    auto launch = [&](auto kernel) {
+      LaunchKernel(num_tokens, kBlockSize, device.unwrap())  //
+          .enable_pdl(kUsePDL)(kernel, params);
+    };
+    if (quantize_q) {
+      launch(idx_dtype.is_type<int32_t>() ? get_kernel<int32_t, true>(vec_n) : get_kernel<int64_t, true>(vec_n));
+    } else {
+      launch(idx_dtype.is_type<int32_t>() ? get_kernel<int32_t, false>(vec_n) : get_kernel<int64_t, false>(vec_n));
+    }
   }
 };
 
