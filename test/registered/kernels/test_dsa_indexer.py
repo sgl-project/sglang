@@ -640,6 +640,17 @@ class TestDSAIndexer(CustomTestCase):
             )
         ).contiguous()
 
+        topk_v2_plan = None
+        if (
+            topk_transform_method == TopkTransformMethod.PAGED
+            and row_starts is None
+            and batch_idx_list is None
+            and envs.SGLANG_OPT_USE_TOPK_V2.get()
+        ):
+            from sglang.jit_kernel.dsv4.topk import plan_topk_v2
+
+            topk_v2_plan = plan_topk_v2(seq_lens_expanded)
+
         attn_metadata = DSAMetadata(
             page_size=1,
             cache_seqlens_int32=seq_lens_expanded.clone(),
@@ -659,6 +670,7 @@ class TestDSAIndexer(CustomTestCase):
                 if topk_transform_method == TopkTransformMethod.RAGGED
                 else None
             ),
+            topk_v2_plan=topk_v2_plan,
         )
 
         metadata_sgl = DSAIndexerMetadata(
