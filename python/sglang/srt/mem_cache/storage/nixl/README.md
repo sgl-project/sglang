@@ -562,7 +562,7 @@ Configures the 3FS (third-party filesystem) backend.
 
 #### Description
 
-Configures an object storage backend compatible with S3 APIs (e.g., AWS S3, MinIO, Ceph).
+Configures an object storage backend compatible with S3 APIs (e.g., AWS S3, MinIO, Ceph). See the [NIXL OBJ plugin documentation](https://github.com/ai-dynamo/nixl/blob/main/src/plugins/obj/README.md) for backend-specific options and behavior.
 
 
 #### Configuration Keys
@@ -571,6 +571,8 @@ Configures an object storage backend compatible with S3 APIs (e.g., AWS S3, MinI
 | ------------------------ | ------- | ------------ | ---------------------------------------------- |
 | `num_threads`            | integer | `4`          | Number of client worker threads.               |
 | `endpoint_override`      | string  | `""`         | Custom endpoint URL (for non-AWS S3 services). |
+| `crtMinLimit`            | integer | disabled      | Minimum object size in bytes for S3 CRT.       |
+| `throughput_target_gbps` | integer | `10`          | Whole-Gbps target for S3 CRT.                  |
 | `scheme`                 | string  | `"http"`     | Connection scheme (`http` or `https`).         |
 | `region`                 | string  | `""`         | Cloud region (if applicable).                  |
 | `req_checksum`           | string  | `"required"` | Request checksum behavior.                     |
@@ -581,6 +583,16 @@ Configures an object storage backend compatible with S3 APIs (e.g., AWS S3, MinI
 | `use_virtual_addressing` | string  | `"true"`     | Enables virtual-hosted-style addressing.       |
 | `bucket`                 | string  | `""`         | Default bucket name.                           |
 | `active`                 | boolean |      N/A     | Controls whether this plugin is eligible for backend selection.                                          |
+
+`throughput_target_gbps` only affects transfers routed through the S3 CRT client. Set `crtMinLimit` to enable the CRT path for objects at or above the chosen size. The throughput target must be a whole number. Values below the 5 MiB AWS S3 minimum multipart part size are accepted for `crtMinLimit`, but the AWS CRT SDK clamps the part size to 5 MiB.
+
+To saturate a high-bandwidth link with low tensor parallelism, set `SGLANG_AUTO_NUMA_BIND=false`. Disabling automatic NUMA pinning allows the CRT thread pool to use all available CPU cores for workers.
+
+For example, the following inline configuration uses the CRT client for objects of at least 5 MiB and targets 25 Gbps:
+
+```bash
+--hicache-storage-backend-extra-config '{"plugin":{"obj":{"active":true,"crtMinLimit":"5242880","throughput_target_gbps":"25"}}}'
+```
 
 ##### `req_checksum` Valid Values
 
