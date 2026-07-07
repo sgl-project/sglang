@@ -295,6 +295,8 @@ NSA_CHOICES = DSA_CHOICES  # deprecated alias
 
 DSA_TOPK_BACKEND_CHOICES = ["sgl-kernel", "torch", "flashinfer"]
 
+DSA_PAGED_MQA_LOGITS_BACKEND_CHOICES = ["auto", "deepgemm", "cutedsl", "aiter"]
+
 MAMBA_RADIX_CACHE_STRATEGY_CHOICES = [
     "auto",
     "no_buffer",
@@ -1372,6 +1374,13 @@ class ServerArgs:
             resolvable=True,
         ),
     ] = None
+    dsa_paged_mqa_logits_backend: A[
+        str,
+        Arg(
+            help="DSA indexer paged MQA logits kernel backend. Options: 'auto' (default; DeepGEMM on CUDA, aiter on ROCm), 'deepgemm', 'cutedsl' (CuTe DSL kernel, SM 100 (Blackwell) only; wins at low batch size and long context), 'aiter' (ROCm only).",
+            choices=DSA_PAGED_MQA_LOGITS_BACKEND_CHOICES,
+        ),
+    ] = "auto"
     dsa_topk_backend: A[
         str,
         Arg(
@@ -2216,6 +2225,27 @@ class ServerArgs:
     lmcache_config_file: A[
         Optional[str],
         "Path to the LMCache YAML configuration file",
+    ] = None
+
+    # -------------------------------------------------------------------------
+    # FlexKV
+    # -------------------------------------------------------------------------
+    enable_flexkv: A[
+        bool,
+        (
+            "Route the default RadixCache through FlexKV's KVManager for "
+            "host-tier (CPU / SSD / Remote) KV cache offload. Equivalent "
+            "to --radix-cache-backend=flexkv but also participates in the "
+            "auto-selection chain alongside --enable-lmcache."
+        ),
+    ] = False
+    flexkv_config_file: A[
+        Optional[str],
+        (
+            "Path to the FlexKV YAML / JSON configuration file. "
+            "Equivalent to setting the FLEXKV_CONFIG_PATH environment "
+            "variable."
+        ),
     ] = None
 
     # -------------------------------------------------------------------------
@@ -5987,6 +6017,11 @@ class ServerArgs:
                     "LMCache is disabled because of using diffusion LLM inference"
                 )
                 self.enable_lmcache = False
+            if self.enable_flexkv:
+                logger.warning(
+                    "FlexKV is disabled because of using diffusion LLM inference"
+                )
+                self.enable_flexkv = False
 
         if self.pp_size > 1:
             logger.warning(
