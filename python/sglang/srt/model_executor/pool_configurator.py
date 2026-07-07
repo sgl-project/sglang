@@ -664,13 +664,16 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         # DeepSeekV4TokenToKVPool.get_contiguous_buf_infos). The largest is a
         # C4 layer: with the unified bf16 layout each compressed row is
         # head_dim*2 bytes over ~max_total_num_tokens/ratio rows, i.e.
-        # (head_dim*2 / ratio) * max_total_num_tokens. The smallest (densest)
-        # compress ratio dominates. This also upper-bounds the packed-FP8
-        # non-unified layout (< head_dim*2 bytes per compressed token).
-        if not self.compression_ratios:
+        # (head_dim*2 / ratio) * max_total_num_tokens. The smallest positive
+        # (densest) compress ratio dominates. This also upper-bounds the
+        # packed-FP8 non-unified layout (< head_dim*2 bytes per compressed
+        # token). Dense layers carry compress ratio 0 (no compressed region is
+        # registered for them); exclude them so they don't zero the divisor.
+        compressed_ratios = [r for r in self.compression_ratios if r > 0]
+        if not compressed_ratios:
             return 0
         head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
-        min_ratio = min(self.compression_ratios)
+        min_ratio = min(compressed_ratios)
         bf16_bytes = 2
         return (head_dim * bf16_bytes + min_ratio - 1) // min_ratio
 
