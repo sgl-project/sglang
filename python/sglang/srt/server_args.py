@@ -265,6 +265,8 @@ FP4_GEMM_RUNNER_BACKEND_CHOICES = [
     "marlin",
 ]
 
+BF16_GEMM_BACKEND_CHOICES = ["auto", "cutedsl"]
+
 RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru", "priority"]
 
 RL_ON_POLICY_TARGET_CHOICES = ["fsdp"]
@@ -292,6 +294,8 @@ DSA_CHOICES = [
 NSA_CHOICES = DSA_CHOICES  # deprecated alias
 
 DSA_TOPK_BACKEND_CHOICES = ["sgl-kernel", "torch", "flashinfer"]
+
+DSA_PAGED_MQA_LOGITS_BACKEND_CHOICES = ["auto", "deepgemm", "cutedsl", "aiter"]
 
 MAMBA_RADIX_CACHE_STRATEGY_CHOICES = [
     "auto",
@@ -1336,6 +1340,7 @@ class ServerArgs:
             help="Choose the runner backend for Blockwise FP8 GEMM operations. Options: 'auto' (default, auto-selects based on hardware), 'deep_gemm' (JIT-compiled; enabled by default on NVIDIA Hopper (SM90) and Blackwell (SM100) when DeepGEMM is installed), 'flashinfer_trtllm' (optimal for Blackwell and low-latency), 'flashinfer_cutlass' (FlashInfer CUTLASS groupwise FP8 GEMM), 'flashinfer_deepgemm' (Hopper SM90 only; uses swapAB optimization for small M dimensions in decoding), 'cutlass' (optimal for Hopper/Blackwell GPUs and high-throughput), 'triton' (fallback, widely compatible), 'aiter' (ROCm only). ",
             cli_name="--fp8-gemm-backend",
             choices=FP8_GEMM_RUNNER_BACKEND_CHOICES,
+            resolvable=True,
         ),
     ] = "auto"
     fp4_gemm_runner_backend: A[
@@ -1344,6 +1349,14 @@ class ServerArgs:
             help="Choose the runner backend for NVFP4 GEMM operations. Options: 'auto' (default; selects flashinfer_cutedsl on SM100, marlin on SM80-SM90, flashinfer_cutlass otherwise (including SM120)), 'cutlass' (SGLang CUTLASS kernel), 'flashinfer_cutlass' (FlashInfer CUTLASS backend), 'flashinfer_cudnn' (FlashInfer cuDNN backend, optimal on CUDA 13+ with cuDNN 9.15+), 'flashinfer_cutedsl' (FlashInfer CuTe DSL backend), 'flashinfer_trtllm' (FlashInfer TensorRT-LLM backend, requires different weight preparation with shuffling), 'marlin' (weight-only W4A16 fallback for SM80+). ",
             cli_name="--fp4-gemm-backend",
             choices=FP4_GEMM_RUNNER_BACKEND_CHOICES,
+        ),
+    ] = "auto"
+    bf16_gemm_backend: A[
+        str,
+        Arg(
+            help="Choose the backend for unquantized BF16 GEMM operations. Options: 'auto' (default; uses cuBLAS via torch.nn.functional.linear), 'cutedsl' (SGLang JIT CuTe DSL TGV BF16 GEMM on SM10X; dispatches between the CuTe DSL kernel and cuBLAS).",
+            cli_name="--bf16-gemm-backend",
+            choices=BF16_GEMM_BACKEND_CHOICES,
         ),
     ] = "auto"
     dsa_prefill_backend: A[
@@ -1362,6 +1375,13 @@ class ServerArgs:
             resolvable=True,
         ),
     ] = None
+    dsa_paged_mqa_logits_backend: A[
+        str,
+        Arg(
+            help="DSA indexer paged MQA logits kernel backend. Options: 'auto' (default; DeepGEMM on CUDA, aiter on ROCm), 'deepgemm', 'cutedsl' (CuTe DSL kernel, SM 100 (Blackwell) only; wins at low batch size and long context), 'aiter' (ROCm only).",
+            choices=DSA_PAGED_MQA_LOGITS_BACKEND_CHOICES,
+        ),
+    ] = "auto"
     dsa_topk_backend: A[
         str,
         Arg(
@@ -2206,6 +2226,27 @@ class ServerArgs:
     lmcache_config_file: A[
         Optional[str],
         "Path to the LMCache YAML configuration file",
+    ] = None
+
+    # -------------------------------------------------------------------------
+    # FlexKV
+    # -------------------------------------------------------------------------
+    enable_flexkv: A[
+        bool,
+        (
+            "Route the default RadixCache through FlexKV's KVManager for "
+            "host-tier (CPU / SSD / Remote) KV cache offload. Equivalent "
+            "to --radix-cache-backend=flexkv but also participates in the "
+            "auto-selection chain alongside --enable-lmcache."
+        ),
+    ] = False
+    flexkv_config_file: A[
+        Optional[str],
+        (
+            "Path to the FlexKV YAML / JSON configuration file. "
+            "Equivalent to setting the FLEXKV_CONFIG_PATH environment "
+            "variable."
+        ),
     ] = None
 
     # -------------------------------------------------------------------------
@@ -3602,67 +3643,35 @@ class ServerArgs:
             )
 
         if self.mem_fraction_static is None:
-            # Constant meta data (e.g., from attention backend)
-            reserved_mem = 512
-            # For activation slack
-            if self.disaggregation_mode == "decode":
-                # Decode nodes do no prefill; size activation to the decode batch.
-                running_requests = (
-                    self.max_running_requests or decode_cuda_graph_config.max_bs or 1
-                )
-                draft_tokens = self.speculative_num_draft_tokens or 1
-                reserved_mem += max(running_requests * draft_tokens, 2048) * 1.5
-            elif self.chunked_prefill_size > 0:
-                reserved_mem += max(self.chunked_prefill_size, 2048) * 1.5
+            if self.post_capture_kv_sizing_planned():
+                # Post-capture sizing measures free memory after graph capture, so
+                # skip the graph/activation reserve; keep only the floor + parallel slack.
+                reserved_mem = 512
+                reserved_mem += self.tp_size * self.pp_size / 8 * 1024
             else:
-                reserved_mem += max(self.max_prefill_tokens, 2048) * 1.5
-            # For decode cuda graphs (skip on prefill-only nodes)
-            if (
-                self.disaggregation_mode != "prefill"
-                and decode_cuda_graph_config.backend != Backend.DISABLED
-            ):
-                reserved_mem += decode_cuda_graph_config.max_bs * 2
-            # Some adjustments for large parallel size
-            reserved_mem += self.tp_size * self.pp_size / 8 * 1024
-
-            if (
-                self._resolved().enable_dp_attention
-                and self.disaggregation_mode != "prefill"
-            ):
-                # DP attention needs more padding for some operations
-                reserved_mem += decode_cuda_graph_config.max_bs * self.dp_size * 3
-
-                # DP attention uses much more memory for large cuda graph max bs,
-                # likely due to some inefficiencies in torch allocator or our implementation.
-                # So we need to reserve more memory.
-                if decode_cuda_graph_config.max_bs > 300:
-                    reserved_mem += decode_cuda_graph_config.max_bs * self.dp_size * 1.5
-
-            # For prefill piecewise cuda graphs (skip on decode-only nodes)
-            if (
-                self.disaggregation_mode != "decode"
-                and prefill_cuda_graph_config.backend != Backend.DISABLED
-            ):
-                if not self.use_mla_backend():
-                    # Only calculate the memory overhead for Non-Torch Memory use since the Torch Memory can be reused with Cuda Graph Capture
-                    reserved_mem += len(prefill_cuda_graph_config.bs) * 8
+                # Tokens the activation working set scales with (per serving mode).
+                if self.disaggregation_mode == "decode":
+                    running_requests = (
+                        self.max_running_requests
+                        or decode_cuda_graph_config.max_bs
+                        or 1
+                    )
+                    draft_tokens = self.speculative_num_draft_tokens or 1
+                    activation_tokens = max(running_requests * draft_tokens, 2048)
+                elif self.chunked_prefill_size > 0:
+                    activation_tokens = max(self.chunked_prefill_size, 2048)
                 else:
-                    # For MLA backend the memory overhead is much higher than expected with fa3
-                    reserved_mem += 1.5 * 1024
-
-            if gpu_mem is not None and gpu_mem > 60 * 1024:
-                reserved_mem = max(reserved_mem, 10 * 1024)
-
-            # DeepEP all-to-all buffers captured in the decode graph are real
-            # extra allocations, so reserve them on top of the floor.
-            from sglang.srt.arg_groups.overrides import resolved_view
-
-            if (
-                self.disaggregation_mode != "prefill"
-                and decode_cuda_graph_config.backend != Backend.DISABLED
-                and resolved_view(self).moe_a2a_backend == "deepep"
-            ):
-                reserved_mem += 2 * 1024
+                    activation_tokens = max(self.max_prefill_tokens, 2048)
+                # Constant meta data (e.g., from attention backend) + activation slack.
+                reserved_mem = 512
+                reserved_mem += activation_tokens * 1.5
+                # Some adjustments for large parallel size
+                reserved_mem += self.tp_size * self.pp_size / 8 * 1024
+                reserved_mem += self.reserve_for_graph_mb()
+                if gpu_mem is not None and gpu_mem > 60 * 1024:
+                    reserved_mem = max(reserved_mem, 10 * 1024)
+                # Reserve headroom for DeepEP all-to-all buffers on top of the floor.
+                reserved_mem += self.reserve_for_deepep_a2a_mb()
 
             self.mem_fraction_static = (
                 round((gpu_mem - reserved_mem) / gpu_mem, 3)
@@ -3683,6 +3692,106 @@ class ServerArgs:
                 "Symmetric memory is enabled, setting symmetric memory prealloc size to 4GB as default."
                 "Use environment variable SGLANG_SYMM_MEM_PREALLOC_GB_SIZE to change the prealloc size."
             )
+
+    def post_capture_kv_sizing_planned(self) -> bool:
+        """Whether the mem_fraction heuristic may skip the graph reserve; must be
+        False for any config the runtime won't post-capture-size, else it gets an
+        under-reserved fraction (still-unsupported: MiniMax sparse)."""
+        # use_mla_backend is a method at args time but ModelRunner overwrites it
+        # with a bool on global_server_args (see the FIXME there) -- handle both.
+        use_mla = self.use_mla_backend
+        return (
+            envs.SGLANG_ENABLE_POST_CAPTURE_KV_SIZING.get()
+            and self.device == "cuda"
+            and self.dcp_size == 1
+            and not (use_mla() if callable(use_mla) else use_mla)
+            and not self.prefill_only_disable_kv_cache
+            and not self.enable_memory_saver
+            and envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get() is None
+            # Accurate sizing assumes graph-covered execution (graphs retain the
+            # activation workspace, so it is measured post-capture). An eager
+            # phase would pay activations outside the measurement: DP attention
+            # runs prefill eager internally, and an explicitly disabled phase
+            # backend runs eager -- keep those on the heuristic reserve.
+            and not self.enable_dp_attention
+            and (
+                self.disaggregation_mode == "decode"
+                or self.cuda_graph_config.prefill.backend != Backend.DISABLED
+            )
+            and (
+                self.disaggregation_mode == "prefill"
+                or self.cuda_graph_config.decode.backend != Backend.DISABLED
+            )
+        )
+
+    def mamba_pre_capture_reserve_mb(self, gpu_mem: Optional[float]) -> float:
+        # Realistic runtime reserve for the fixed (non-resizable) mamba state cache,
+        # which post-capture can't size from measured free memory.
+        if self.disaggregation_mode == "decode":
+            running_requests = (
+                self.max_running_requests or self.cuda_graph_config.decode.max_bs or 1
+            )
+            activation_tokens = max(
+                running_requests * (self.speculative_num_draft_tokens or 1), 2048
+            )
+        elif self.chunked_prefill_size > 0:
+            activation_tokens = max(self.chunked_prefill_size, 2048)
+        else:
+            activation_tokens = max(self.max_prefill_tokens, 2048)
+        reserved_mem = (
+            512 + activation_tokens * 1.5 + self.tp_size * self.pp_size / 8 * 1024
+        )
+        if gpu_mem is not None and gpu_mem > 60 * 1024:
+            reserved_mem = max(reserved_mem, 10 * 1024)
+        return reserved_mem
+
+    def reserve_for_graph_mb(self) -> float:
+        decode_cuda_graph_config = self.cuda_graph_config.decode
+        prefill_cuda_graph_config = self.cuda_graph_config.prefill
+
+        reserved_mem = 0.0
+        if (
+            self.disaggregation_mode != "prefill"
+            and decode_cuda_graph_config.backend != Backend.DISABLED
+        ):
+            reserved_mem += decode_cuda_graph_config.max_bs * 2
+
+        if (
+            self._resolved().enable_dp_attention
+            and self.disaggregation_mode != "prefill"
+        ):
+            # DP attention needs more padding for some operations, and much more for large
+            # cuda graph max bs (torch allocator / implementation inefficiencies).
+            reserved_mem += decode_cuda_graph_config.max_bs * self.dp_size * 3
+            if decode_cuda_graph_config.max_bs > 300:
+                reserved_mem += decode_cuda_graph_config.max_bs * self.dp_size * 1.5
+
+        if (
+            self.disaggregation_mode != "decode"
+            and prefill_cuda_graph_config.backend != Backend.DISABLED
+        ):
+            if not self.use_mla_backend():
+                # Only non-torch memory is counted; torch memory is reused by cuda graph capture.
+                reserved_mem += len(prefill_cuda_graph_config.bs) * 8
+            else:
+                # MLA backend overhead is much higher than expected with fa3.
+                reserved_mem += 1.5 * 1024
+
+        return reserved_mem
+
+    def reserve_for_deepep_a2a_mb(self) -> float:
+        # DeepEP all-to-all buffers captured in the decode graph are real extra
+        # allocations, reserved on top of the floor.
+        from sglang.srt.arg_groups.overrides import resolved_view
+
+        decode_cuda_graph_config = self.cuda_graph_config.decode
+        if (
+            self.disaggregation_mode != "prefill"
+            and decode_cuda_graph_config.backend != Backend.DISABLED
+            and resolved_view(self).moe_a2a_backend == "deepep"
+        ):
+            return 2 * 1024
+        return 0.0
 
     def _generate_decode_cuda_graph_batch_sizes(self, max_bs: int):
         """
@@ -3839,6 +3948,7 @@ class ServerArgs:
             "MistralLarge3ForCausalLM",
             "PixtralForConditionalGeneration",
             "GlmMoeDsaForCausalLM",
+            "LongcatFlashForCausalLM",
         ]:
             # Set attention backend for DeepSeek
             if is_deepseek_dsa(hf_config):  # DeepSeek 3.2/GLM 5
@@ -4554,10 +4664,10 @@ class ServerArgs:
             self.triton_attention_num_kv_splits = 16
 
     def _handle_nccl_pre_warm(self):
-        # pre_warm_nccl is only used with CUDA or HIP hardware
-        if self.pre_warm_nccl and not (is_cuda() or is_hip()):
+        # pre_warm_nccl is only used with CUDA or HIP hardware or NPU hardware
+        if self.pre_warm_nccl and not (is_cuda() or is_hip() or is_npu()):
             logger.warning(
-                "pre_warm_nccl is only applicable for CUDA or HIP hardware. "
+                "pre_warm_nccl is only applicable for CUDA or HIP hardware or NPU hardware. "
                 "Ignoring pre_warm_nccl setting on current hardware."
             )
             self.pre_warm_nccl = False
@@ -5977,6 +6087,11 @@ class ServerArgs:
                     "LMCache is disabled because of using diffusion LLM inference"
                 )
                 self.enable_lmcache = False
+            if self.enable_flexkv:
+                logger.warning(
+                    "FlexKV is disabled because of using diffusion LLM inference"
+                )
+                self.enable_flexkv = False
 
         if self.pp_size > 1:
             logger.warning(
