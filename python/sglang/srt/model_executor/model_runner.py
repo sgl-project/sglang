@@ -1328,7 +1328,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if is_npu():
                 register_sgl_tp_rank(self.gpu_id)
 
-            # Pre-warm NCCL/RCCL to eliminate cold-start latency in first request
+            # Pre-warm NCCL/RCCL/HCCL to eliminate cold-start latency in first request
             # Controlled by --pre-warm-nccl flag (default: enabled on AMD GPUs)
             if self.server_args.pre_warm_nccl and (
                 self.tp_size > 1 or self.pp_size > 1 or self.moe_ep_size > 1
@@ -1336,14 +1336,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 warmup_start = time.perf_counter()
                 tp_group_handle = get_tp_group().device_group
 
-                # Single warmup all_reduce to initialize NCCL/RCCL communicator
+                # Single warmup all_reduce to initialize NCCL/RCCL/HCCL communicator
                 warmup_tensor = torch.zeros(1, device=torch.cuda.current_device())
                 dist.all_reduce(warmup_tensor, group=tp_group_handle)
                 current_platform.synchronize()
 
                 warmup_elapsed = time.perf_counter() - warmup_start
                 logger.info(
-                    f"NCCL/RCCL warmup completed in {warmup_elapsed:.3f}s "
+                    f"NCCL/RCCL/HCCL warmup completed in {warmup_elapsed:.3f}s "
                     f"(tp_size={self.tp_size}, pp_size={self.pp_size}, ep_size={self.moe_ep_size})"
                 )
 
