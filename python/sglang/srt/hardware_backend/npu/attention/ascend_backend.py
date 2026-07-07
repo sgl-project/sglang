@@ -27,6 +27,7 @@ from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_kv_cache
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.runtime_context import get_flags
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import get_bool_env_var, get_current_device_stream_fast
 
@@ -319,7 +320,7 @@ class AscendAttnBackend(AttentionBackend):
         self.graph_mode = False
         self.use_fa = get_bool_env_var("ASCEND_USE_FA", "False")
         self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
-        self.enable_torch_compile = model_runner.server_args.enable_torch_compile
+        self.enable_torch_compile = get_flags().capture.enable_torch_compile
         self.speculative_num_draft_tokens = (
             model_runner.server_args.speculative_num_draft_tokens
         )
@@ -2044,6 +2045,16 @@ class AscendAttnBackend(AttentionBackend):
                 self.speculative_num_draft_tokens,
             )
 
+            # When not in graph_mode, query is sliced to num_token_non_padded
+            # which may drop finished requests. The FIA TND kernel requires
+            # block_table.shape[0] == len(actual_seq_lengths); slice to match.
+            if not self.graph_mode:
+                actual_bs = len(actual_seq_lengths)
+                block_table = self.forward_metadata.block_tables[:actual_bs]
+                actual_seq_lengths_kv = actual_seq_lengths_kv[:actual_bs]
+            else:
+                block_table = self.forward_metadata.block_tables
+
             if (
                 self.q_head_num_padding is not None
                 and self.q_head_num_padding > self.tp_q_head_num
@@ -2089,7 +2100,7 @@ class AscendAttnBackend(AttentionBackend):
                 scale=layer.scaling,
                 antiquant_mode=0,
                 antiquant_scale=None,
-                block_table=self.forward_metadata.block_tables,
+                block_table=block_table,
                 block_size=self.page_size,
                 sparse_mode=3,
                 atten_mask=self.mtp_mask,
@@ -2110,7 +2121,7 @@ class AscendAttnBackend(AttentionBackend):
                 scale=layer.scaling,
                 antiquant_mode=0,
                 antiquant_scale=None,
-                block_table=self.forward_metadata.block_tables,
+                block_table=block_table,
                 block_size=self.page_size,
                 sparse_mode=3,
                 atten_mask=self.mtp_mask,

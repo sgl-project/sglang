@@ -202,6 +202,12 @@ class ZImagePipelineConfig(ZImageRolloutPipelineMixin, ImagePipelineConfig):
             plan = self._build_zimage_sp_plan(batch)
         return plan
 
+    def _pad_text_embed_for_dit(self, embed: torch.Tensor) -> torch.Tensor:
+        target_len = self._ceil_to_multiple(embed.shape[0], self.SEQ_LEN_MULTIPLE)
+        if target_len == embed.shape[0]:
+            return embed
+        return torch.cat([embed, embed[-1:].repeat(target_len - embed.shape[0], 1)])
+
     def _split_text_embeds_for_dit(self, batch, *, negative: bool = False):
         """Return per-request text tensors, trimming padded batched embeddings."""
         embeds = batch.negative_prompt_embeds if negative else batch.prompt_embeds
@@ -217,7 +223,7 @@ class ZImagePipelineConfig(ZImageRolloutPipelineMixin, ImagePipelineConfig):
             return embeds
 
         if embeds.ndim == 2:
-            return [embeds]
+            return [self._pad_text_embed_for_dit(embeds)]
 
         if embeds.ndim != 3:
             raise ValueError(
@@ -231,7 +237,8 @@ class ZImagePipelineConfig(ZImageRolloutPipelineMixin, ImagePipelineConfig):
             expected_batch_size=int(embeds.shape[0]),
         )
         return [
-            embeds[idx, :seq_len].contiguous() for idx, seq_len in enumerate(seq_lens)
+            self._pad_text_embed_for_dit(embeds[idx, :seq_len].contiguous())
+            for idx, seq_len in enumerate(seq_lens)
         ]
 
     def _caption_rope_length(self, prompt_embeds, batch, *, negative: bool = False):
@@ -357,6 +364,11 @@ class ZImagePipelineConfig(ZImageRolloutPipelineMixin, ImagePipelineConfig):
         Batched prompts use stored text lengths. SP mode builds image caches for
         the local spatial shard.
         """
+        if rotary_emb is None:
+            raise ValueError(
+                "Z-Image transformer has no `rotary_emb`. It likely loaded via the "
+                "native diffusers fallback; check the load logs for the real error."
+            )
 
         def create_coordinate_grid(size, start=None, device=None):
             if start is None:
@@ -465,6 +477,11 @@ class ZImagePipelineConfig(ZImageRolloutPipelineMixin, ImagePipelineConfig):
                 if get_sp_world_size() > 1
                 else None
             ),
+            "caption_valid_lens": torch.tensor(
+                self.require_text_seq_lens(batch, 0),
+                device=device,
+                dtype=torch.long,
+            ),
         }
 
     def prepare_neg_cond_kwargs(self, batch, device, rotary_emb, dtype):
@@ -488,5 +505,10 @@ class ZImagePipelineConfig(ZImageRolloutPipelineMixin, ImagePipelineConfig):
                 self._get_zimage_sp_plan(batch)["img_seq_target"]
                 if get_sp_world_size() > 1
                 else None
+            ),
+            "caption_valid_lens": torch.tensor(
+                self.require_text_seq_lens(batch, 0, negative=use_negative_embeds),
+                device=device,
+                dtype=torch.long,
             ),
         }
