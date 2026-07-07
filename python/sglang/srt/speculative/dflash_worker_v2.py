@@ -117,8 +117,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         self.nccl_port = nccl_port
         self._target_worker = target_worker
         self.model_runner = target_worker.model_runner
-        # Mamba verify-commit eligibility (model-static; resolve once). Gate on mambaish_config
-        # too, not bare hasattr: HybridAttnBackend delegates into an inner MLA backend lacking it.
         self._need_mamba_verify_commit = (
             self.model_runner.mambaish_config is not None
             and hasattr(
