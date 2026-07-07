@@ -1,10 +1,8 @@
 """Unit tests for EmbeddingStore, FileEmbeddingStore, and EmbeddingStoreFactory."""
 
 import ctypes
-import os
 import shutil
 import tempfile
-import threading
 import unittest
 
 import torch
@@ -64,9 +62,7 @@ class TestFileEmbeddingStore(unittest.TestCase):
         self.assertEqual(results, [True, True, True])
 
         read_bufs = [torch.empty(256, dtype=torch.uint8) for _ in hashes]
-        results = self.store.batch_get(
-            hashes, [b.data_ptr() for b in read_bufs], sizes
-        )
+        results = self.store.batch_get(hashes, [b.data_ptr() for b in read_bufs], sizes)
         self.assertEqual(results, [True, True, True])
 
         for i, rb in enumerate(read_bufs):
@@ -143,9 +139,7 @@ class TestEmbeddingStoreFactory(unittest.TestCase):
     def test_create_file_backend(self):
         test_dir = tempfile.mkdtemp()
         try:
-            store = EmbeddingStoreFactory.create_backend(
-                "file", storage_dir=test_dir
-            )
+            store = EmbeddingStoreFactory.create_backend("file", storage_dir=test_dir)
             self.assertIsInstance(store, FileEmbeddingStore)
             self.assertEqual(store.storage_dir, test_dir)
         finally:

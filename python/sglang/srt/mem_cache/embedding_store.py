@@ -165,9 +165,7 @@ class FileEmbeddingStore(EmbeddingStore):
         return results
 
     def batch_is_exist(self, hashes: List[str]) -> List[bool]:
-        return [
-            os.path.exists(self._path_for_key(self.get_key(h))) for h in hashes
-        ]
+        return [os.path.exists(self._path_for_key(self.get_key(h))) for h in hashes]
 
 
 class EmbeddingStoreFactory:
