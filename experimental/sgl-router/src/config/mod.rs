@@ -24,6 +24,23 @@ pub fn shutdown_drain_advisory(shutdown_drain_secs: u64) -> Option<String> {
     })
 }
 
+/// Advisory (not a hard error: an ungated retry is functional, just not what
+/// the `--enable-retry` help text promises) for retry enabled without an
+/// admission cap: the retry's load gate has no capacity to check, so the
+/// single re-dispatch proceeds even onto a busy worker. Returns
+/// `Some(message)` to warn, `None` if safe.
+pub fn retry_without_cap_advisory(
+    retry: &RetryConfig,
+    admission: &AdmissionConfig,
+) -> Option<String> {
+    (retry.enabled && matches!(admission, AdmissionConfig::Disabled)).then(|| {
+        "retry is enabled without --max-concurrent-requests-per-worker; the retry's \
+         load gate is a no-op, so a re-dispatch can land on a worker regardless of \
+         its in-flight load. Set an admission cap to make retries load-gated."
+            .to_string()
+    })
+}
+
 impl Config {
     /// Check invariants the type system and `clap` don't already enforce.
     /// Called by [`cli::Cli::into_config`] after assembling the `Config`
@@ -35,6 +52,9 @@ impl Config {
             return Err(anyhow!("model id must be non-empty"));
         }
         if let Some(msg) = shutdown_drain_advisory(self.server.shutdown_drain_secs) {
+            tracing::warn!("{msg}");
+        }
+        if let Some(msg) = retry_without_cap_advisory(&self.retry, &self.admission) {
             tracing::warn!("{msg}");
         }
         match &self.discovery {
@@ -191,6 +211,23 @@ mod tests {
     #[test]
     fn retry_disabled_by_default() {
         assert!(!RetryConfig::default().enabled);
+    }
+
+    #[test]
+    fn retry_without_cap_advisory_warns_only_for_enabled_retry_without_admission() {
+        let enabled = RetryConfig { enabled: true };
+        let disabled = RetryConfig { enabled: false };
+        let cap = AdmissionConfig::Enabled {
+            max_concurrent_per_worker: std::num::NonZeroUsize::new(4).unwrap(),
+            max_queued_requests: None,
+        };
+        assert!(
+            retry_without_cap_advisory(&enabled, &AdmissionConfig::Disabled).is_some(),
+            "retry without a cap must produce the ungated-retry advisory"
+        );
+        assert!(retry_without_cap_advisory(&enabled, &cap).is_none());
+        assert!(retry_without_cap_advisory(&disabled, &AdmissionConfig::Disabled).is_none());
+        assert!(retry_without_cap_advisory(&disabled, &cap).is_none());
     }
 
     #[test]

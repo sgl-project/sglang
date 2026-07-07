@@ -157,10 +157,12 @@ pub struct Cli {
     /// Retry a plain-mode request ONCE, on a *different* worker, when it hits a
     /// transient upstream failure (connection refused, request-headers timeout,
     /// breaker-open, malformed worker URL) before any bytes reach the client.
-    /// The retry only goes to a worker whose in-flight load is below the
-    /// admission cap (`--max-concurrent-requests-per-worker`) — never onto a
-    /// full one, and it never waits for a slot. Off by default;
-    /// PD-disaggregated requests are always single-attempt.
+    /// When an admission cap (`--max-concurrent-requests-per-worker`) is
+    /// configured, the retry only goes to a worker whose in-flight load is
+    /// below it — never onto a full one, and it never waits for a slot;
+    /// without a cap the retry is ungated (a startup advisory warns about
+    /// this combination). Off by default; PD-disaggregated requests are
+    /// always single-attempt.
     #[arg(long)]
     pub enable_retry: bool,
 

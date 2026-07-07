@@ -245,9 +245,13 @@ impl ApiError {
     ///   failed to parse; its breaker was tripped, so reselection skips it.
     ///
     /// Deliberately NOT retryable:
-    /// * [`UpstreamStatus`](Self::UpstreamStatus) — a mid-body drop means
-    ///   headers (and, for streaming, bytes) already went out; re-dispatch could
-    ///   double-serve the client.
+    /// * [`UpstreamStatus`](Self::UpstreamStatus) — produced only by the
+    ///   buffered (non-streaming) forward when the worker returned headers and
+    ///   then dropped mid-body. Nothing reached the client, but the engine
+    ///   received and by then has likely fully executed the request —
+    ///   re-dispatch would double-execute work an abort can no longer stop.
+    ///   (Streaming mid-body drops never reach this predicate: they occur
+    ///   after `Ok`, inside the SSE pump.)
     /// * The `NoTarget` selection errors ([`NoHealthyWorkers`](Self::NoHealthyWorkers),
     ///   [`PolicySelectionFailed`](Self::PolicySelectionFailed),
     ///   [`ServiceOverloaded`](Self::ServiceOverloaded), the PD-pool variants) —

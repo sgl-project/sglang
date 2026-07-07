@@ -122,13 +122,21 @@ impl Default for AdmissionConfig {
 /// free slot, so retry never dogpiles a saturated fleet (and never waits for a
 /// slot: if every other worker is full, the request fails instead of parking).
 /// Without an admission cap configured there is no capacity to check, so the
-/// gate is a no-op and the single retry always proceeds.
+/// gate is a no-op and the single retry proceeds ungated (an advisory is
+/// logged at startup for this combination; see [`Config::validate`]).
 ///
 /// Opt-in: [`enabled`](Self::enabled) defaults to `false` (no retry — a single
 /// dispatch attempt, exactly the pre-retry behaviour). Scope: plain-mode
 /// requests only. PD-disaggregated requests are deliberately single-attempt —
 /// their prefill is detached and outlives the client, so a retry would double
 /// the KV-transfer work; see the PD dispatch comment in the chat handler.
+///
+/// If multi-retry ever lands, grow this the way [`AdmissionConfig`] did —
+/// an `Enabled { max_attempts, .. } / Disabled` enum — NOT by adding a
+/// `max_retries` field beside `enabled` (which would admit the illegal
+/// `enabled: false, max_retries: 5` state). The at-most-once invariant is
+/// currently structural in the chat handler (a `retried` bool and a
+/// single-worker URL exclusion), so multi-retry is a redesign, not a knob.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RetryConfig {
     /// Whether the router retries a failed plain-mode dispatch once, onto a

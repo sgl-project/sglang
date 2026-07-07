@@ -418,10 +418,13 @@ async fn chat_completions_inner(
         })
     };
 
-    // Builds the end-to-end-latency guard for streaming requests. Packed into
-    // `stream_guards` so it records when the SSE pump finishes (stream end or
-    // client disconnect), not at response-headers time. Non-streaming records
-    // at the dispatch site instead (see below).
+    // Builds the end-to-end-latency guard for streaming requests. Shared (via
+    // `Arc`) across the plain-mode retry attempts and packed into each
+    // attempt's `stream_guards`, so it records exactly once — when the SSE
+    // pump finishes (stream end or client disconnect), not at
+    // response-headers time, and not once per retry attempt. Non-streaming
+    // records at the dispatch site instead (see below). The PD arm packs its
+    // own instance directly (PD is single-attempt).
     let make_duration_guard = || RecordDurationOnDrop {
         metrics: Arc::clone(&ctx.metrics),
         model: metrics_model.clone(),
@@ -696,16 +699,34 @@ async fn chat_completions_inner(
         // slot (never onto one already at capacity) and never waits for a slot —
         // if the rest of the fleet is saturated the retry is skipped and the
         // original error surfaces. Dropping a failed attempt's guards releases
-        // its admission slot and (for a timeout) fires the abort guard, telling
-        // that engine to stop before we try elsewhere.
+        // its admission slot and fires its abort guard (a no-op for a worker
+        // that never received the request), telling that engine to stop before
+        // we try elsewhere. The retry re-registers active load on the new
+        // worker, which re-snapshots the stale-request token — so a retried
+        // request gets a fresh stale budget and can live up to roughly
+        // (first-attempt elapsed + stale timeout) before the janitor fires.
+        //
+        // Exactly-once end-to-end duration for streaming requests, shared
+        // across attempts: each attempt's `stream_guards` box holds a clone of
+        // this Arc, and `RecordDurationOnDrop` fires when the LAST clone drops —
+        // the successful attempt's SSE-pump end (the pump outlives both this
+        // scope and any failed attempt's box), or this scope's handle when
+        // every attempt failed. A failed attempt's box dropping early is never
+        // last, so a retried request records ONE duration sample, not one per
+        // attempt. Streaming-only: the non-streaming arm records once at the
+        // dispatch site below.
+        let stream_duration = streaming.then(|| Arc::new(make_duration_guard()));
         let mut retried = false;
         loop {
             let attempt_result = if streaming {
                 // Plain mode, streaming. Both guards ride the SSE pump until
                 // the body completes — see the matching comment in the
                 // non-streaming arm.
-                let stream_guards: Box<dyn Send + 'static> =
-                    Box::new((guard, active_guard, make_duration_guard()));
+                let stream_guards: Box<dyn Send + 'static> = Box::new((
+                    guard,
+                    active_guard,
+                    stream_duration.as_ref().map(Arc::clone),
+                ));
                 // Pre-headers abort guard: `forward_streaming_to` only constructs its
                 // own (reached_end-tracking) guard AFTER a response is received, so
                 // it can't protect the window before that — if the stale-request
@@ -828,16 +849,20 @@ async fn chat_completions_inner(
             match attempt_result {
                 Ok(resp) => break Ok(resp),
                 Err(e) => {
+                    // At most one retry: a request that already used its single
+                    // re-dispatch and still failed is the un-recovered tail.
+                    // Checked BEFORE the retryability test so the second failure
+                    // counts as exhausted even when it is itself non-retryable
+                    // (e.g. the stale deadline firing mid-retry) — otherwise
+                    // retries_total − retries_exhausted over-reports recoveries.
+                    if retried {
+                        ctx.metrics.record_retries_exhausted(&metrics_model);
+                        break Err(e);
+                    }
                     // Retry only transient dispatch failures, and only while
                     // retry is enabled. A non-retryable error (bad request,
                     // mid-body drop, stale-deadline cancel, …) surfaces as-is.
                     if !ctx.config.retry.enabled || !e.is_retryable_upstream() {
-                        break Err(e);
-                    }
-                    // At most one retry: if the single re-dispatch we allowed
-                    // also failed, surface it and record the un-recovered tail.
-                    if retried {
-                        ctx.metrics.record_retries_exhausted(&metrics_model);
                         break Err(e);
                     }
                     // Fail over to a DIFFERENT worker (exclude the one we just
@@ -850,6 +875,12 @@ async fn chat_completions_inner(
                         .collect();
                     if remaining.is_empty() {
                         // No other worker to fail over to.
+                        tracing::debug!(
+                            model = %model_str,
+                            failed_worker = %worker.url,
+                            error = %e,
+                            "retry skipped: no other worker to fail over to",
+                        );
                         ctx.metrics.record_retries_exhausted(&metrics_model);
                         break Err(e);
                     }
@@ -894,9 +925,31 @@ async fn chat_completions_inner(
                             worker = next_worker;
                             continue;
                         }
-                        Ok(None) | Err(_) => {
-                            // Every other worker is at capacity, or the policy
-                            // declined: don't retry.
+                        Ok(None) => {
+                            // Every other worker is at capacity: don't retry.
+                            // Expected under load — debug, not warn.
+                            tracing::debug!(
+                                model = %model_str,
+                                failed_worker = %worker.url,
+                                error = %e,
+                                "retry skipped: every other worker is at its in-flight cap",
+                            );
+                            ctx.metrics.record_retries_exhausted(&metrics_model);
+                            break Err(e);
+                        }
+                        Err(sel_err) => {
+                            // The policy declined a NON-EMPTY set of under-cap
+                            // workers — `try_acquire` only errors after the
+                            // all-full check, so this is abnormal (a policy bug
+                            // or a cache-aware/sticky edge case), not ordinary
+                            // saturation: warn where saturation only debugs.
+                            tracing::warn!(
+                                model = %model_str,
+                                failed_worker = %worker.url,
+                                error = %e,
+                                selection_error = %sel_err,
+                                "retry skipped: policy declined the remaining candidates",
+                            );
                             ctx.metrics.record_retries_exhausted(&metrics_model);
                             break Err(e);
                         }

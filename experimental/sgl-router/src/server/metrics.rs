@@ -347,11 +347,14 @@ pub struct MetricsRegistry {
     engine_aborts_total: [AtomicU64; ABORT_REASON_COUNT],
     /// Plain-mode re-dispatch attempts (each retry onto a different worker after
     /// a transient upstream failure), per model. One increment per retry
-    /// performed, so the count is (upstream attempts − requests that retried).
+    /// performed, so the count is (upstream dispatch attempts − requests).
     retries_total: Mutex<HashMap<String, Arc<AtomicU64>>>,
-    /// Requests whose retry budget was used up (or whose candidate pool ran
-    /// out) and still failed, per model — the tail the failover could not
-    /// recover.
+    /// Requests the retry could not recover, per model: the single retry also
+    /// failed, or the retry was skipped outright (no other worker, every
+    /// alternative at capacity, or the policy declined). NOT just
+    /// "retried-and-failed" — in a capacity incident most increments are skips
+    /// where zero retries were performed; `retries_total` says how many actual
+    /// re-dispatches happened.
     retries_exhausted_total: Mutex<HashMap<String, Arc<AtomicU64>>>,
     /// Current admission wait-queue depth (parked requests). A single
     /// router-wide gauge — the queue is shared across the router, so this is a
@@ -788,8 +791,10 @@ impl MetricsRegistry {
         counter.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Bump `sgl_router_retries_exhausted_total{model_id}` — a request exhausted
-    /// its retry budget (or ran out of untried workers) and still failed.
+    /// Bump `sgl_router_retries_exhausted_total{model_id}` — a request the
+    /// retry could not recover: the single retry also failed, or the retry was
+    /// skipped (no other worker / every alternative at capacity / policy
+    /// declined). Fires even when zero retries were performed.
     pub fn record_retries_exhausted(&self, model_id: &str) {
         let mut guard = self.retries_exhausted_total.lock();
         let counter = guard
@@ -1241,7 +1246,7 @@ impl MetricsRegistry {
 
         // retries_exhausted_total
         out.push_str(
-            "# HELP sgl_router_retries_exhausted_total Requests that used up their retry budget (or ran out of untried workers) and still failed.\n",
+            "# HELP sgl_router_retries_exhausted_total Requests the retry could not recover: the single retry also failed, or the retry was skipped (no other worker, alternatives at capacity, or policy declined).\n",
         );
         out.push_str("# TYPE sgl_router_retries_exhausted_total counter\n");
         let guard = self.retries_exhausted_total.lock();
