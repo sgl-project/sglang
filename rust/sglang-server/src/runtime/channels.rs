@@ -40,6 +40,9 @@ pub enum DetokMsg {
         /// Decode logprob token ids to text on this (CPU-bound) shard rather than
         /// the api-server I/O threads.
         decode_logprob_text: bool,
+        /// `SamplingParams.no_stop_trim`: keep the matched stop string/token in the
+        /// output. Default (`false`) trims it, matching the Python detokenizer.
+        no_stop_trim: bool,
     },
     Chunk(ChunkEvent),
     /// Control result: one already-serialized payload delivered to the sink

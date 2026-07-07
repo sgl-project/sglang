@@ -192,12 +192,17 @@ impl Ingress {
     }
 
     /// Register the egress sink with the owning detok shard (by id) so the response
-    /// has a home. Carries `return_text_in_logprobs` so the shard, not the I/O
-    /// threads, decodes logprob token text. Returns `false` if the shard is gone.
+    /// has a home. Carries the per-request detok flags — `return_text_in_logprobs`
+    /// (decode logprob text on this shard) and `no_stop_trim` (keep the matched
+    /// stop in the output) — so the shard needs no back-reference to the request.
+    /// Returns `false` if the shard is gone.
     fn register_detok(&self, req: &Request) -> bool {
-        let decode_logprob_text = match &req.kind {
-            RequestKind::Generate(g) => g.payload.return_text_in_logprobs.unwrap_or(false),
-            RequestKind::Control(_) => false,
+        let (decode_logprob_text, no_stop_trim) = match &req.kind {
+            RequestKind::Generate(g) => (
+                g.payload.return_text_in_logprobs.unwrap_or(false),
+                sampling_flag(&g.payload.sampling_params, "no_stop_trim"),
+            ),
+            RequestKind::Control(_) => (false, false),
         };
         self.senders
             .detok_for(req.id)
@@ -205,6 +210,7 @@ impl Ingress {
                 id: req.id,
                 sink: req.sink.clone(),
                 decode_logprob_text,
+                no_stop_trim,
             })
             .is_ok()
     }
@@ -311,6 +317,19 @@ impl Ingress {
         // On success the scheduler owns the request (egress arrives by rid); we
         // drop our `Request` here — the detok shard holds the sink.
     }
+}
+
+/// Read a boolean flag from the (opaque) sampling-params map; absent/non-bool →
+/// `false`. Used to lift per-request detok flags (e.g. `no_stop_trim`) out of the
+/// sampling params the client sends untyped.
+fn sampling_flag(sampling_params: &Option<rmpv::Value>, key: &str) -> bool {
+    let Some(rmpv::Value::Map(m)) = sampling_params else {
+        return false;
+    };
+    m.iter()
+        .find(|(k, _)| k.as_str() == Some(key))
+        .and_then(|(_, v)| v.as_bool())
+        .unwrap_or(false)
 }
 
 /// `Received → Validating` + admissibility check. Under `skip_tokenizer_init` a
