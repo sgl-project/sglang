@@ -26,7 +26,11 @@
 #include <tvm/ffi/container/tensor.h>
 
 #include <algorithm>
+#ifndef USE_ROCM
 #include <cuda_bf16.h>
+#else
+#include <hip/hip_bf16.h>
+#endif
 #include <utility>
 
 namespace {

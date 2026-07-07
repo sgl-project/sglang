@@ -1,11 +1,19 @@
 // Adapted from
 // https://github.com/vllm-project/vllm/blob/eb59b5a6cba6727d3727c0372258db9002f687c1/csrc/quantization/awq/gemm_kernels.cu#L350
 #include <c10/cuda/CUDAGuard.h>
+#ifndef USE_ROCM
 #include <cuda.h>
 #include <cuda_fp16.h>
+#else
+#include <hip/hip_fp16.h>
+#endif
 #include <torch/all.h>
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+#ifndef USE_ROCM
 #include <cuda_bf16.h>
+#else
+#include <hip/hip_bf16.h>
+#endif
 #endif
 
 template <int lut>

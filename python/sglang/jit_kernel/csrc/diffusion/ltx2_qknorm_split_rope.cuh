@@ -15,7 +15,11 @@
 #include <sgl_kernel/utils.cuh>  // For LaunchKernel and CUDA dtype aliases
 
 #include <cstdint>
+#ifndef USE_ROCM
 #include <cuda_bf16.h>
+#else
+#include <hip/hip_bf16.h>
+#endif
 
 namespace sglang_ltx2_qknorm_split_rope {
 

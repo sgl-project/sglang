@@ -17,7 +17,11 @@ limitations under the License.
 
 #include "cutlass/bfloat16.h"
 #include <cstdint>
+#ifndef USE_ROCM
 #include <cuda_runtime.h>
+#else
+#include <hip/hip_runtime.h>
+#endif
 
 struct SparseMlaQ8Kv8PrefillParams {
   int s_q, s_kv, h_q, h_kv, d_qk, d_v, topk;

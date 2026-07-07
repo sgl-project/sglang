@@ -19,7 +19,11 @@
 
 #include "nv_internal/tensorrt_llm/kernels/quantization_utils.cuh"
 #include <cstdint>
+#ifndef USE_ROCM
 #include <cuda_bf16.h>
+#else
+#include <hip/hip_bf16.h>
+#endif
 #include <optional>
 
 namespace flashinfer {

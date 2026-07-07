@@ -1,6 +1,10 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/cuda/CUDADataType.h>
+#ifndef USE_ROCM
 #include <cuda_runtime.h>
+#else
+#include <hip/hip_runtime.h>
+#endif
 
 #include "pytorch_extension_utils.h"
 #include "utils.cuh"

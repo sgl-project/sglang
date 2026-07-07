@@ -13,7 +13,11 @@
 // Adapted from https://github.com/mit-han-lab/omniserve/blob/main/kernels/csrc/qgemm/w4a8_per_group/gemm_cuda.cu
 
 #include <ATen/cuda/CUDAContext.h>
+#ifndef USE_ROCM
 #include <cuda_fp16.h>
+#else
+#include <hip/hip_fp16.h>
+#endif
 #include <cuda_pipeline_primitives.h>
 #include <torch/all.h>
 

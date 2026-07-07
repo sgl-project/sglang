@@ -18,8 +18,13 @@ limitations under the License.
 
 #include <cutlass/arch/config.h>
 
+#ifndef USE_ROCM
 #include <cuda.h>
 #include <cuda_fp8.h>
+#else
+#include <hip/hip_fp8.h>
+#include <hip/hip_runtime.h>
+#endif
 
 #define ELTS_PER_THREAD 8
 

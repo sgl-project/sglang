@@ -5,8 +5,13 @@
 // adapted from https://github.com/Dao-AILab/causal-conv1d/blob/main/csrc/causal_conv1d.h
 #pragma once
 
+#ifndef USE_ROCM
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#else
+#include <hip/hip_bf16.h>
+#include <hip/hip_fp16.h>
+#endif
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 struct ConvParamsBase {

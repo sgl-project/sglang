@@ -2,8 +2,13 @@
 
 #pragma once
 
+#ifndef USE_ROCM
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
+#else
+#include <hip/hip_bf16.h>
+#include <hip/hip_runtime.h>
+#endif
 
 #include <cstdint>
 

@@ -29,7 +29,11 @@ limitations under the License.
 
 #include "config.h"
 #include "helpers.h"
+#ifndef USE_ROCM
 #include <cuda_fp8.h>
+#else
+#include <hip/hip_fp8.h>
+#endif
 
 // using namespace cute must be at global scope BEFORE including dense_fp8 headers
 // (they use bare Tensor, make_tensor etc. from cute namespace)

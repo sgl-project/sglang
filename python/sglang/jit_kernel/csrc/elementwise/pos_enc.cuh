@@ -8,8 +8,12 @@
 
 #include <tvm/ffi/container/tensor.h>
 
+#ifndef USE_ROCM
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#else
+#include <hip/hip_fp16.h>
+#endif
 
 namespace {
 

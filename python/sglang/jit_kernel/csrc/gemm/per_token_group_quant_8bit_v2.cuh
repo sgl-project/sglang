@@ -14,7 +14,11 @@
 #include <tvm/ffi/container/tensor.h>
 
 #include <cstdint>
+#ifndef USE_ROCM
 #include <cuda_fp8.h>
+#else
+#include <hip/hip_fp8.h>
+#endif
 #include <type_traits>
 
 namespace {

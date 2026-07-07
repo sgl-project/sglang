@@ -22,7 +22,11 @@ limitations under the License.
 #include "kernel.cuh"
 #include <cmath>
 #include <cstdint>
+#ifndef USE_ROCM
 #include <cuda_runtime.h>
+#else
+#include <hip/hip_runtime.h>
+#endif
 
 namespace {
 

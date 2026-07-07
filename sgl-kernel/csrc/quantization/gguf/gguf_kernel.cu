@@ -1,8 +1,13 @@
 // Adatped from
 // https://github.com/vllm-project/vllm/blob/755ed7b05be4743237d3339c4ff8c22bcaae04f4/csrc/quantization/gguf/gguf_kernel.cu
 #include <c10/cuda/CUDAGuard.h>
+#ifndef USE_ROCM
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#else
+#include <hip/hip_fp16.h>
+#include <hip/hip_runtime.h>
+#endif
 #include <torch/all.h>
 
 // dont use clang-format here, it breaks the include order

@@ -1,5 +1,9 @@
 #include <ATen/cuda/CUDAContext.h>
+#ifndef USE_ROCM
 #include <cuda_fp8.h>
+#else
+#include <hip/hip_fp8.h>
+#endif
 
 #include <cmath>
 #include <flashinfer/vec_dtypes.cuh>

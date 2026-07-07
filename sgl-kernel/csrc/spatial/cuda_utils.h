@@ -1,5 +1,9 @@
+#ifndef USE_ROCM
 #include <cuda.h>
 #include <cuda_runtime.h>
+#else
+#include <hip/hip_runtime.h>
+#endif
 
 #include <iostream>
 

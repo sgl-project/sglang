@@ -1,5 +1,9 @@
 #include <ATen/cuda/CUDAContext.h>
+#ifndef USE_ROCM
 #include <cuda_runtime.h>
+#else
+#include <hip/hip_runtime.h>
+#endif
 #include <torch/all.h>
 
 #include <cfloat>

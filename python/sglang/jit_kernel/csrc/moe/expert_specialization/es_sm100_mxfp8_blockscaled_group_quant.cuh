@@ -9,9 +9,15 @@
 #include <tvm/ffi/container/tensor.h>
 
 #include "cute/tensor.hpp"
+#ifndef USE_ROCM
 #include <cuda.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#else
+#include <hip/hip_bf16.h>
+#include <hip/hip_fp16.h>
+#include <hip/hip_runtime.h>
+#endif
 
 namespace expert_specialization {
 

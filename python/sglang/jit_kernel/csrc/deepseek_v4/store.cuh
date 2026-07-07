@@ -14,7 +14,11 @@
 
 #include <bit>
 #include <cstdint>
+#ifndef USE_ROCM
 #include <cuda_fp8.h>
+#else
+#include <hip/hip_fp8.h>
+#endif
 
 namespace {
 

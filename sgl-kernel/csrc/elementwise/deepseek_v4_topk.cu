@@ -18,8 +18,12 @@ limitations under the License.
 #include <c10/cuda/CUDAStream.h>
 #include <c10/macros/Macros.h>
 #include <c10/util/Exception.h>
+#ifndef USE_ROCM
 #include <cuda.h>
 #include <cuda_fp16.h>
+#else
+#include <hip/hip_fp16.h>
+#endif
 
 #include <cstddef>
 #include <cstdint>

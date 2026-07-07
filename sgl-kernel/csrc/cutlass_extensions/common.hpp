@@ -1,6 +1,10 @@
 #pragma once
 
-#include "cuda_runtime.h"
+#ifndef USE_ROCM
+#include <cuda_runtime.h>
+#else
+#include <hip/hip_runtime.h>
+#endif
 #include "cutlass/cutlass.h"
 
 /**

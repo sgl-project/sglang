@@ -1,9 +1,13 @@
 #include <ATen/OpMathType.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
+#ifndef USE_ROCM
 #include <cuda.h>
 #include <cudaTypedefs.h>
 #include <cuda_runtime.h>
+#else
+#include <hip/hip_runtime.h>
+#endif
 #include <torch/all.h>
 
 #include <iostream>

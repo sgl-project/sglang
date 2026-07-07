@@ -16,12 +16,12 @@ limitations under the License.
 #pragma once
 
 #include <ATen/Tensor.h>
+#ifndef USE_ROCM
 #include <cuda_runtime.h>
-#include <torch/all.h>
-
-#ifdef USE_ROCM
+#else
 #include <hip/hip_runtime.h>
 #endif
+#include <torch/all.h>
 
 #ifdef USE_ROCM
 // Adapted from flashinfer-rocm [PR#491](https://github.com/flashinfer-ai/flashinfer/pull/491)

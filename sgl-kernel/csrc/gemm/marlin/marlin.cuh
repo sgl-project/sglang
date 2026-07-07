@@ -2,9 +2,13 @@
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
+#ifndef USE_ROCM
 #include <cuda.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#else
+#include <hip/hip_fp16.h>
+#endif
 #include <torch/all.h>
 
 #include <iostream>
