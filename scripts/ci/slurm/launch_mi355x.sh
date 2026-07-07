@@ -26,9 +26,10 @@
 #                        off (e.g. hosts with a broken RDMA driver)
 #   SGLANG_USE_CHECKOUT_RUNTIME
 #                      - default 1. Reinstall this workflow checkout's Python
-#                        sglang package inside each runtime container before
-#                        launching servers/bench. Set 0 to use the image's
-#                        baked-in sglang package.
+#                        sglang package inside each runtime container, and the
+#                        checkout sglang-router package inside the bench
+#                        container, before launching servers/bench. Set 0 to
+#                        use the image's baked-in packages.
 #   RUNNER_NAME        - GitHub runner name (a built-in default env var)
 #   GITHUB_RUN_ID      - GitHub Actions run id (a built-in default env var)
 #                        The allocation is named
@@ -184,7 +185,7 @@ if [[ "$SGLANG_USE_CHECKOUT_RUNTIME" == "1" ]]; then
     echo "Staging checkout runtime: sha=$CHECKOUT_SHA -> $CHECKOUT_STAGE"
     rm -rf "$CHECKOUT_STAGE"
     mkdir -p "$CHECKOUT_STAGE"
-    tar --exclude='__pycache__' --exclude='*.pyc' \
+    tar --exclude='__pycache__' --exclude='*.pyc' --exclude='.git/config' \
         -C "$GITHUB_WORKSPACE" -cf - . | tar -C "$CHECKOUT_STAGE" -xf -
     CHECKOUT_DOCKER_ARGS="$CHECKOUT_DOCKER_ARGS -e SGLANG_CHECKOUT_SHA=$CHECKOUT_SHA -v $CHECKOUT_STAGE:/sglang-checkout:ro"
 else
@@ -387,6 +388,80 @@ if not actual.startswith(expected):
 PY
 EOF
 
+cat > "$WORKDIR/install_checkout_router.sh" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+
+case "${SGLANG_USE_CHECKOUT_RUNTIME:-1}" in
+  0|false|False|FALSE|no|No|NO|off|Off|OFF)
+    echo "[checkout-router] disabled; using image-baked sglang-router"
+    python3 - <<'PY' || true
+import importlib.metadata
+import sglang_router
+
+print(f"[checkout-router] sglang_router_file={sglang_router.__file__}")
+print(
+    "[checkout-router] sglang_router_version="
+    f"{importlib.metadata.version('sglang-router')}"
+)
+try:
+    import sglang_router.sglang_router_rs as rs
+
+    print(f"[checkout-router] sglang_router_rs_file={rs.__file__}")
+except Exception as exc:
+    print(f"[checkout-router] sglang_router_rs_import_error={exc}")
+PY
+    exit 0
+    ;;
+esac
+
+RUNTIME_CHECKOUT="${RUNTIME_CHECKOUT:-/tmp/sglang-checkout-runtime}"
+ROUTER_SRC="$RUNTIME_CHECKOUT/sgl-model-gateway/bindings/python"
+WHEEL_DIR="${SGLANG_ROUTER_WHEEL_DIR:-/tmp/sglang-router-wheels}"
+
+if [[ ! -f "$ROUTER_SRC/pyproject.toml" ]]; then
+  echo "[checkout-router] ERROR: invalid router checkout: $ROUTER_SRC" >&2
+  exit 1
+fi
+
+echo "[checkout-router] building sglang-router from $ROUTER_SRC"
+export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}"
+python3 -m maturin --version >/dev/null 2>&1 \
+  || python3 -m pip install --no-cache-dir "maturin<1.14"
+
+# Match the ROCm image build recipe when compiling from the checkout copy.
+if [[ -f "$RUNTIME_CHECKOUT/sgl-model-gateway/Cargo.toml" ]]; then
+  sed -i -E 's|^(smg-[a-zA-Z-]+)\s*=\s*"~1\.0\.0"|\1 = "=1.0.0"|' \
+    "$RUNTIME_CHECKOUT/sgl-model-gateway/Cargo.toml"
+fi
+
+rm -rf "$WHEEL_DIR"
+mkdir -p "$WHEEL_DIR"
+(
+  cd "$ROUTER_SRC"
+  ulimit -n 65536 || true
+  python3 -m maturin build --release --features vendored-openssl --out "$WHEEL_DIR"
+)
+
+python3 -m pip uninstall -y sglang-router || true
+python3 -m pip install --force-reinstall --no-deps "$WHEEL_DIR"/*.whl
+
+python3 - <<'PY'
+import importlib.metadata
+import sglang_router
+import sglang_router.sglang_router_rs as rs
+from sglang_router.sglang_router_rs import Router
+
+print(f"[checkout-router] sglang_router_file={sglang_router.__file__}")
+print(
+    "[checkout-router] sglang_router_version="
+    f"{importlib.metadata.version('sglang-router')}"
+)
+print(f"[checkout-router] sglang_router_rs_file={rs.__file__}")
+print(f"[checkout-router] Router={Router}")
+PY
+EOF
+
 cat > "$WORKDIR/prefill_entry.sh" <<EOF
 #!/bin/bash
 set -euo pipefail
@@ -467,6 +542,7 @@ docker run $DOCKER_COMMON --name mi355x_bench \
     else
       export PYTHONPATH=/sgl-workspace/sglang/python:\${PYTHONPATH:-}
     fi
+    bash \$CIDIR/install_checkout_router.sh
     echo "[wait] prefill"; for i in \$(seq 1 600); do curl -sf http://\$PIP:$PPORT/health >/dev/null && break; sleep 5; done
     echo "[wait] decode";  for i in \$(seq 1 600); do curl -sf http://\$DIP:$DPORT/health >/dev/null && break; sleep 5; done
     python3 -m sglang_router.launch_router \

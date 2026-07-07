@@ -120,6 +120,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Clean up prior Slurm jobs from this runner
         continue-on-error: true
