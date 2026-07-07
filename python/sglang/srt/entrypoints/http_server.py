@@ -715,7 +715,7 @@ async def server_info():
     # server_args.model_config is not serializable but should be excluded by asdict.
     return msgspec_to_builtins(
         {
-            **dataclasses.asdict(server_args),
+            **server_args.redacted_asdict(),
             **_global_state.scheduler_info,
             "internal_states": internal_states,
             "version": __version__,

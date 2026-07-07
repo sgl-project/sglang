@@ -7,7 +7,6 @@ TokenizerManager's event loop.
 """
 
 import asyncio
-import dataclasses
 import json
 import logging
 from types import SimpleNamespace
@@ -385,7 +384,7 @@ class RuntimeHandle:
         return json.dumps(result, default=str)
 
     def get_server_info(self) -> str:
-        result: Dict[str, Any] = dataclasses.asdict(self.server_args)
+        result: Dict[str, Any] = self.server_args.redacted_asdict()
         result.update(self.scheduler_info)
         return json.dumps(msgspec_to_builtins(result), default=str)
 
