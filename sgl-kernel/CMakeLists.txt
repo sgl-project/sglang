@@ -275,6 +275,8 @@ set(SOURCES
     "csrc/gemm/gptq/gptq_kernel.cu"
     "csrc/grammar/apply_token_bitmask_inplace_cuda.cu"
 
+    "csrc/infllm_v2/max_pooling.cu"
+
     "csrc/kvcacheio/transfer.cu"
     "csrc/mamba/causal_conv1d.cu"
     "csrc/memory/weak_ref_tensor.cpp"
@@ -283,9 +285,7 @@ set(SOURCES
     "csrc/moe/cutlass_moe/w4a8/w4a8_moe_data.cu"
     "csrc/moe/cutlass_moe/w4a8/w4a8_grouped_mm_c3x.cu"
     "csrc/moe/moe_align_kernel.cu"
-    "csrc/moe/moe_fused_gate.cu"
     "csrc/moe/fused_qknorm_rope_kernel.cu"
-    "csrc/moe/kimi_k2_moe_fused_gate.cu"
     "csrc/moe/moe_sum.cu"
     "csrc/moe/moe_sum_reduce.cu"
     "csrc/moe/moe_topk_softmax_kernels.cu"
@@ -474,6 +474,68 @@ if (SGL_KERNEL_ENABLE_FA3)
     endif()
     target_compile_definitions(flash_ops PRIVATE ${FLASH_OPS_COMPILE_DEFS})
 endif()
+
+# ===================== InfLLM-V2 FlashAttention backend ===================== #
+# Standalone pybind extension `infllm_ops`, vendored from
+# 3rdparty/infllmv2_cuda_impl. Kept as its own module so its `flash::` symbols
+# stay isolated from sgl-kernel's own flash attention. Mirrors the original
+# setup.py: only hdim 64/128 bf16 forward instantiations are compiled (the
+# vendored static_switch.h forces bf16 and dispatches headdim to {64, 128}
+# only). Backward kernels are intentionally omitted because SGLang only uses
+# these ops for inference.
+set(INFLLM_FLASH_CUDA_FLAGS
+    "-DNDEBUG"
+    "-O3"
+    "-std=c++17"
+    "-Xcompiler"
+    "-fPIC"
+    "-U__CUDA_NO_HALF_OPERATORS__"
+    "-U__CUDA_NO_HALF_CONVERSIONS__"
+    "-U__CUDA_NO_HALF2_OPERATORS__"
+    "-U__CUDA_NO_BFLOAT16_CONVERSIONS__"
+    "--expt-relaxed-constexpr"
+    "--expt-extended-lambda"
+    "--use_fast_math"
+    "-DFLASHATTENTION_DISABLE_DROPOUT"
+    "-DFLASHATTENTION_DISABLE_ALIBI"
+    "-DFLASHATTENTION_DISABLE_SOFTCAP"
+    "-DFLASHATTENTION_DISABLE_UNEVEN_K"
+    "-DFLASHATTENTION_DISABLE_LOCAL"
+    "--threads=${SGL_KERNEL_COMPILE_THREADS}"
+)
+
+# Arch gencodes: match the original setup.py auto-detection
+# (80 always; 90 for CUDA>=11.8; 120 for CUDA>=12.8).
+if (ENABLE_BELOW_SM90)
+    list(APPEND INFLLM_FLASH_CUDA_FLAGS "-gencode=arch=compute_80,code=sm_80")
+endif()
+list(APPEND INFLLM_FLASH_CUDA_FLAGS "-gencode=arch=compute_90,code=sm_90")
+if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
+    list(APPEND INFLLM_FLASH_CUDA_FLAGS "-gencode=arch=compute_120a,code=sm_120a")
+endif()
+
+set(INFLLM_FLASH_SOURCES
+    "csrc/infllm_v2/flash_extension.cc"
+    "csrc/infllm_v2/flash_attn/flash_api.cpp"
+    "csrc/infllm_v2/flash_attn/src/flash_fwd_split_hdim64_bf16_sm80.cu"
+    "csrc/infllm_v2/flash_attn/src/flash_fwd_split_hdim128_bf16_sm80.cu"
+    "csrc/infllm_v2/flash_attn/src/flash_fwd_split_hdim64_bf16_causal_sm80.cu"
+    "csrc/infllm_v2/flash_attn/src/flash_fwd_split_hdim128_bf16_causal_sm80.cu"
+)
+
+Python_add_library(infllm_ops MODULE WITH_SOABI ${INFLLM_FLASH_SOURCES})
+target_compile_options(infllm_ops PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${INFLLM_FLASH_CUDA_FLAGS}>)
+target_include_directories(infllm_ops PRIVATE
+    ${repo-cutlass_SOURCE_DIR}/include
+    ${repo-cutlass_SOURCE_DIR}/tools/util/include
+    ${CMAKE_CURRENT_LIST_DIR}/csrc/infllm_v2/flash_attn
+    ${CMAKE_CURRENT_LIST_DIR}/csrc/infllm_v2/flash_attn/src
+)
+# The pybind module binds functions taking at::Generator, which pulls in
+# THPGeneratorClass from libtorch_python (not part of TORCH_LIBRARIES).
+find_library(TORCH_PYTHON_LIBRARY torch_python PATHS "${TORCH_INSTALL_PREFIX}/lib" REQUIRED)
+target_link_libraries(infllm_ops PRIVATE ${TORCH_LIBRARIES} ${TORCH_PYTHON_LIBRARY} c10 cuda)
+install(TARGETS infllm_ops LIBRARY DESTINATION "sgl_kernel")
 
 # Build spatial_ops as a separate, optional extension for green contexts
 set(SPATIAL_SOURCES
