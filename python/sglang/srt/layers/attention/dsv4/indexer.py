@@ -457,12 +457,7 @@ class C4IndexerBackendMixin:
             or indexer_metadata.use_prefill_cuda_graph
         ):
             return False
-        if (
-            c4_indexer.use_fp4_indexer
-            or envs.SGLANG_OPT_USE_TILELANG_INDEXER.get()
-            or envs.SGLANG_OPT_USE_AITER_INDEXER.get()
-            or envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
-        ):
+        if c4_indexer.use_fp4_indexer or not use_deep_gemm_fp8_indexer():
             return False
         if (
             get_attention_cp_size() != 1
@@ -646,7 +641,7 @@ class C4IndexerBackendMixin:
         use_fp4_indexer = c4_indexer.use_fp4_indexer
 
         query_rows = q_indexer[0].shape[0] if use_fp4_indexer else q_indexer.shape[0]
-        c4_seq_lens_native = getattr(indexer_metadata, "c4_seq_lens_native", None)
+        c4_seq_lens_native = indexer_metadata.c4_seq_lens_native
         use_native_deep_gemm_indexer = (
             (use_fp4_indexer or use_deep_gemm_fp8_indexer())
             and c4_seq_lens_native is not None
@@ -713,7 +708,7 @@ class C4IndexerBackendMixin:
             assert c4_seq_lens_native is not None
             next_n = c4_seq_lens_native.shape[1]
             _c4sl = c4_seq_lens_native
-            page_table_native = getattr(indexer_metadata, "c4_page_table_native", None)
+            page_table_native = indexer_metadata.c4_page_table_native
             logits_page_table = (
                 page_table_native
                 if page_table_native is not None

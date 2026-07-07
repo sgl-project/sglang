@@ -195,6 +195,8 @@ class PagedIndexerMetadata:
             ]
             assign_fields = ["deep_gemm_metadata", "nonpaged_plan"]
         else:
+            # c4_seq_lens_native may alias c4_seq_lens storage; copy_metadata
+            # still requires every dataclass field to be accounted for.
             copy_fields = [
                 "page_table",
                 "c4_seq_lens",

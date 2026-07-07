@@ -7,7 +7,10 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsv4.indexer import FP8_DTYPE, C4IndexerBackendMixin
-from sglang.srt.layers.attention.dsv4.metadata import NonPagedIndexerPlan
+from sglang.srt.layers.attention.dsv4.metadata import (
+    NonPagedIndexerPlan,
+    PagedIndexerMetadata,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -258,6 +261,88 @@ class TestDSV4NonPagedIndexer(CustomTestCase):
         torch.testing.assert_close(call.args[3], plan.ks)
         torch.testing.assert_close(call.args[4], plan.ke)
         self.assertEqual(call.kwargs, {"clean_logits": False, "max_seqlen_k": 128})
+
+    def test_native_nextn_paged_dispatch_keeps_topk_flat(self):
+        batch_size = 2
+        next_n = 4
+        query_rows = batch_size * next_n
+        num_heads = 2
+        head_dim = 128
+        page_table = torch.arange(query_rows * 3, dtype=torch.int32).view(query_rows, 3)
+        page_table_native = page_table[::next_n].contiguous()
+        c4_seq_lens = torch.arange(10, 10 + query_rows, dtype=torch.int32)
+        c4_seq_lens_native = c4_seq_lens.view(batch_size, next_n)
+
+        indexer_metadata = object.__new__(PagedIndexerMetadata)
+        indexer_metadata.page_size = 256
+        indexer_metadata.page_table = page_table
+        indexer_metadata.c4_seq_lens = c4_seq_lens
+        indexer_metadata.use_prefill_cuda_graph = False
+        indexer_metadata.c4_seq_lens_native = c4_seq_lens_native
+        indexer_metadata.c4_page_table_native = page_table_native
+        indexer_metadata.deep_gemm_metadata = torch.tensor([], dtype=torch.int32)
+        indexer_metadata.topk_metadata = torch.empty((0,))
+        indexer_metadata.nonpaged_plan = None
+
+        c4_sparse_page_indices = torch.full((query_rows, 512), -1, dtype=torch.int32)
+        core_metadata = SimpleNamespace(
+            positions=torch.arange(query_rows, dtype=torch.int32),
+            page_table=page_table,
+            c4_sparse_page_indices=c4_sparse_page_indices,
+            c4_sparse_raw_indices=None,
+        )
+        backend = SimpleNamespace(
+            token_to_kv_pool=MagicMock(),
+            forward_metadata=SimpleNamespace(
+                indexer_metadata=indexer_metadata,
+                core_metadata=core_metadata,
+            ),
+            debug_use_external_c4_sparse_indices=False,
+            hisparse_coordinator=None,
+            _forward_prepare_normal=MagicMock(
+                return_value=(
+                    torch.zeros((query_rows, num_heads, head_dim), dtype=torch.float32),
+                    torch.ones((query_rows, num_heads, 1), dtype=torch.float32),
+                )
+            ),
+            _get_nonpaged_indexer_plan=MagicMock(return_value=None),
+        )
+        backend.token_to_kv_pool.get_index_k_with_scale_buffer.return_value = (
+            torch.zeros((5, 64 * 132), dtype=torch.uint8)
+        )
+        c4_indexer = SimpleNamespace(use_fp4_indexer=False, layer_id=17)
+        forward_batch = SimpleNamespace(forward_mode=ForwardMode.EXTEND)
+        logits = torch.zeros((query_rows, 32), dtype=torch.float32)
+        deep_gemm = SimpleNamespace(fp8_paged_mqa_logits=MagicMock(return_value=logits))
+
+        with (
+            patch.dict(sys.modules, {"deep_gemm": deep_gemm}),
+            patch(f"{_INDEXER}.topk_transform_512") as topk_transform,
+            patch(f"{_INDEXER}.get_global_indexer_capturer", return_value=None),
+            envs.SGLANG_OPT_USE_TILELANG_INDEXER.override(False),
+            envs.SGLANG_OPT_USE_AITER_INDEXER.override(False),
+            envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.override(False),
+            envs.SGLANG_TOPK_TRANSFORM_512_TORCH.override(False),
+            envs.SGLANG_OPT_USE_TOPK_V2.override(False),
+        ):
+            C4IndexerBackendMixin.forward_c4_indexer(
+                backend,
+                x=torch.empty((query_rows, 1)),
+                q_lora=torch.empty((query_rows, 1)),
+                c4_indexer=c4_indexer,
+                forward_batch=forward_batch,
+            )
+
+        call = deep_gemm.fp8_paged_mqa_logits.call_args
+        self.assertEqual(call.args[0].shape, (batch_size, next_n, num_heads, head_dim))
+        torch.testing.assert_close(call.args[2], torch.ones((query_rows, num_heads)))
+        self.assertIs(call.args[3], c4_seq_lens_native)
+        self.assertIs(call.args[4], page_table_native)
+
+        topk_call = topk_transform.call_args
+        self.assertIs(topk_call.args[1], c4_seq_lens)
+        self.assertIs(topk_call.args[2], page_table)
+        self.assertIs(topk_call.args[3], c4_sparse_page_indices)
 
 
 if __name__ == "__main__":
