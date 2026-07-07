@@ -428,7 +428,9 @@ async fn health_generate_inner(state: &AppState) -> Response {
         .load(std::sync::atomic::Ordering::Relaxed);
 
     // Fire the probe (we do not await its own response; the heartbeat is the
-    // signal). One decode step, so it self-completes with nothing to abort.
+    // signal). We must NOT assume it self-completes: a busy scheduler skips the
+    // health request without emitting any terminal frame, so its detok
+    // registration is cleaned up only by the `AbortGuard` below.
     let sampling_params = rmpv::Value::Map(vec![
         (rmpv::Value::from("max_new_tokens"), rmpv::Value::from(1)),
         (rmpv::Value::from("temperature"), rmpv::Value::F64(0.0)),
@@ -445,11 +447,14 @@ async fn health_generate_inner(state: &AppState) -> Response {
         // The scheduler skips this when busy so it never occupies a queue slot.
         is_health_check: true,
     });
-    let _keepalive = match submit(state, kind).await {
+    let (rid, _keepalive) = match submit(state, kind).await {
         // Hold the receiver so the probe's sink stays open until it completes.
-        Ok((_rid, rx)) => rx,
+        Ok((rid, rx)) => (rid, rx),
         Err(()) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
+    // Deregister on drop (never disarmed): a busy-skipped probe has no terminal
+    // frame, so without this abort it leaks one detok entry per call.
+    let _abort_guard = AbortGuard::new(state.senders.clone(), rid);
 
     // Watch the heartbeat advance. `SGLANG_HEALTH_CHECK_TIMEOUT` defaults to 20s.
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
@@ -468,12 +473,8 @@ async fn health_generate_inner(state: &AppState) -> Response {
     }
 }
 
-/// `GET /get_model_info` (+ `/model_info` alias) — static model metadata read
-/// from `server_args`; no scheduler round-trip, mirroring `/v1/models`. The
-/// SGLang lang backend (`RuntimeEndpoint`) calls this at startup and only reads
-/// `model_path` (for chat-template detection); the gsm8k/eval benchmark scripts
-/// go through it. `is_generation` is always true — this server is generation
-/// only.
+/// `GET /get_model_info` (+ `/model_info` alias) — static model metadata from
+/// `server_args` (no scheduler round-trip); `is_generation` always true.
 async fn model_info(State(state): State<AppState>) -> Response {
     let sa = &state.server_args;
     let body = serde_json::json!({
@@ -888,5 +889,43 @@ mod logprob_shape_tests {
             .is_none()
         );
         assert!(abort_error_response(&None).is_none());
+    }
+}
+
+#[cfg(test)]
+mod abort_guard_tests {
+    use super::*;
+
+    fn senders(tm: flume::Sender<TmEvent>) -> Senders {
+        Senders {
+            tm,
+            tok: flume::unbounded().0,
+            detok: vec![],
+        }
+    }
+
+    /// An armed guard aborts its rid on drop — exactly the cleanup a busy-skipped
+    /// `/health_generate` probe relies on. It never sees a terminal frame here, so
+    /// dropping the guard is the only path that deregisters its detok sink (via the
+    /// ingress `on_abort`). Regression for the detok-entry leak per health probe.
+    #[test]
+    fn armed_guard_aborts_on_drop() {
+        let (tm_tx, tm_rx) = flume::unbounded();
+        drop(AbortGuard::new(senders(tm_tx), RequestId(7)));
+        assert!(
+            matches!(tm_rx.try_recv(), Ok(TmEvent::Abort(id)) if id == RequestId(7)),
+            "armed guard must abort its rid on drop",
+        );
+        assert!(tm_rx.try_recv().is_err(), "exactly one abort");
+    }
+
+    /// A disarmed rid (finished naturally) is not aborted on drop.
+    #[test]
+    fn disarmed_guard_does_not_abort() {
+        let (tm_tx, tm_rx) = flume::unbounded();
+        let mut guard = AbortGuard::new(senders(tm_tx), RequestId(9));
+        guard.disarm(RequestId(9));
+        drop(guard);
+        assert!(tm_rx.try_recv().is_err(), "disarmed rid must not abort");
     }
 }
