@@ -255,45 +255,23 @@ void verify_tree_greedy_cpu(
     const at::Tensor& retrive_next_token,
     const at::Tensor& retrive_next_sibling,
     const at::Tensor& target_predict) {
-  CHECK_INPUT(predicts);
-  CHECK_INPUT(accept_index);
-  CHECK_INPUT(accept_token_num);
   CHECK_INPUT(candidates);
-  CHECK_INPUT(retrive_index);
-  CHECK_INPUT(retrive_next_token);
-  CHECK_INPUT(retrive_next_sibling);
-  CHECK_INPUT(target_predict);
-  CHECK_EQ(predicts.scalar_type(), at::kInt);
-  CHECK_EQ(accept_index.scalar_type(), at::kInt);
-  CHECK_EQ(accept_token_num.scalar_type(), at::kInt);
-  CHECK_DIM(1, predicts);
-  CHECK_DIM(1, accept_token_num);
   CHECK_DIM(2, candidates);
   CHECK_DIM(2, accept_index);
-  CHECK_DIM(2, retrive_index);
-  CHECK_DIM(2, retrive_next_token);
-  CHECK_DIM(2, retrive_next_sibling);
-  CHECK_DIM(2, target_predict);
-  const auto index_dtype = retrive_index.scalar_type();
-  CHECK_EQ(candidates.scalar_type(), index_dtype);
-  CHECK_EQ(retrive_next_token.scalar_type(), index_dtype);
-  CHECK_EQ(retrive_next_sibling.scalar_type(), index_dtype);
-  CHECK_EQ(target_predict.scalar_type(), index_dtype);
 
+  const auto index_dtype = retrive_index.scalar_type();
   int64_t batch_size = candidates.size(0);
-  int64_t num_spec_step = accept_index.size(1);
   int64_t num_draft_tokens = candidates.size(1);
-  CHECK_EQ(accept_index.size(0), batch_size);
-  CHECK_EQ(accept_token_num.size(0), batch_size);
-  CHECK_EQ(retrive_index.size(0), batch_size);
-  CHECK_EQ(retrive_index.size(1), num_draft_tokens);
-  CHECK_EQ(retrive_next_token.size(0), batch_size);
-  CHECK_EQ(retrive_next_token.size(1), num_draft_tokens);
-  CHECK_EQ(retrive_next_sibling.size(0), batch_size);
-  CHECK_EQ(retrive_next_sibling.size(1), num_draft_tokens);
-  CHECK_EQ(target_predict.size(0), batch_size);
-  CHECK_EQ(target_predict.size(1), num_draft_tokens);
-  CHECK_EQ(predicts.numel(), batch_size * num_draft_tokens);
+  int64_t num_spec_step = accept_index.size(1);
+
+  CHECK_EQ(candidates.scalar_type(), index_dtype);
+  CHECK_INPUT_SHAPE_DTYPE<false>(predicts, {batch_size * num_draft_tokens}, at::kInt);
+  CHECK_INPUT_SHAPE_DTYPE<false>(accept_index, {batch_size, num_spec_step}, at::kInt);
+  CHECK_INPUT_SHAPE_DTYPE<false>(accept_token_num, {batch_size}, at::kInt);
+  CHECK_INPUT_SHAPE_DTYPE<false>(retrive_index, {batch_size, num_draft_tokens}, index_dtype);
+  CHECK_INPUT_SHAPE_DTYPE<false>(retrive_next_token, {batch_size, num_draft_tokens}, index_dtype);
+  CHECK_INPUT_SHAPE_DTYPE<false>(retrive_next_sibling, {batch_size, num_draft_tokens}, index_dtype);
+  CHECK_INPUT_SHAPE_DTYPE<false>(target_predict, {batch_size, num_draft_tokens}, index_dtype);
 
   AT_DISPATCH_INDEX_TYPES(index_dtype, "verify_tree_greedy_indices", [&] {
     verify_tree_greedy_kernel_impl<index_t>(
@@ -344,21 +322,7 @@ void build_tree_kernel_efficient_cpu(
     int64_t draft_token_num,
     int64_t tree_mask_mode) {
   CHECK_INPUT(parent_list);
-  CHECK_INPUT(selected_index);
-  CHECK_INPUT(verified_seq_len);
-  CHECK_INPUT(tree_mask);
-  CHECK_INPUT(positions);
-  CHECK_INPUT(retrive_index);
-  CHECK_INPUT(retrive_next_token);
-  CHECK_INPUT(retrive_next_sibling);
-  CHECK_EQ(tree_mask.scalar_type(), at::kBool);
-  const auto index_dtype = parent_list.scalar_type();
-  CHECK_EQ(selected_index.scalar_type(), index_dtype);
-  CHECK_EQ(verified_seq_len.scalar_type(), index_dtype);
-  CHECK_EQ(positions.scalar_type(), index_dtype);
-  CHECK_EQ(retrive_index.scalar_type(), index_dtype);
-  CHECK_EQ(retrive_next_token.scalar_type(), index_dtype);
-  CHECK_EQ(retrive_next_sibling.scalar_type(), index_dtype);
+  CHECK_DIM(2, parent_list);
 
   // CPU workers always use FULL_MASK (0) or QLEN_ONLY (1); QLEN_ONLY_BITPACKING
   // (2) has no CPU producer and any other value is a caller bug.
@@ -367,22 +331,24 @@ void build_tree_kernel_efficient_cpu(
       "build_tree_kernel_efficient_cpu: only FULL_MASK (0) and QLEN_ONLY (1) are supported, got ",
       tree_mask_mode);
 
+  const auto index_dtype = parent_list.scalar_type();
   int64_t bs = parent_list.size(0);
-  CHECK_DIM(2, parent_list);
-  CHECK_DIM(2, selected_index);
+
   // depth == 1 (e.g. MTP steps=1) has no non-root parents, so
   // organize_draft_results emits an empty (bs, 0) parent_list that the kernel
   // never indexes; only the multi-step layout is width topk*(depth-1)+1.
   if (depth > 1) {
     CHECK_EQ(parent_list.size(1), topk * (depth - 1) + 1);
   }
-  CHECK_EQ(selected_index.size(0), bs);
-  CHECK_EQ(selected_index.size(1), draft_token_num - 1);
-  CHECK_EQ(verified_seq_len.numel(), bs);
-  CHECK_EQ(positions.numel(), bs * draft_token_num);
-  CHECK_EQ(retrive_index.numel(), bs * draft_token_num);
-  CHECK_EQ(retrive_next_token.numel(), bs * draft_token_num);
-  CHECK_EQ(retrive_next_sibling.numel(), bs * draft_token_num);
+  CHECK_INPUT_SHAPE_DTYPE<false>(selected_index, {bs, draft_token_num - 1}, index_dtype);
+  CHECK_INPUT_SHAPE_DTYPE<false>(verified_seq_len, {bs}, index_dtype);
+  CHECK_INPUT_SHAPE_DTYPE<false>(positions, {bs * draft_token_num}, index_dtype);
+  CHECK_INPUT_SHAPE_DTYPE<false>(retrive_index, {bs, draft_token_num}, index_dtype);
+  CHECK_INPUT_SHAPE_DTYPE<false>(retrive_next_token, {bs, draft_token_num}, index_dtype);
+  CHECK_INPUT_SHAPE_DTYPE<false>(retrive_next_sibling, {bs, draft_token_num}, index_dtype);
+
+  CHECK_INPUT(tree_mask);
+  CHECK_EQ(tree_mask.scalar_type(), at::kBool);
   if (tree_mask_mode == 1) {
     CHECK_EQ(tree_mask.numel(), bs * draft_token_num * draft_token_num);
   } else {

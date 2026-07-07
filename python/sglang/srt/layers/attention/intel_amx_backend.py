@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -74,12 +74,13 @@ class IntelAMXAttnBackend(AttentionBackend):
         seq_lens = forward_batch.seq_lens
         tree_mask = None
 
-        if forward_batch.extend_seq_lens is None:
+        if forward_batch.forward_mode.is_target_verify():
             spec_info = forward_batch.spec_info
             if spec_info is None:
                 raise RuntimeError(
-                    "extend_seq_lens is unset outside TARGET_VERIFY; it can only "
-                    "be derived from spec_info for speculative verify batches."
+                    "spec_info is unset in TARGET_VERIFY mode; the extend_* "
+                    "metadata can only be derived from spec_info for "
+                    "speculative verify batches."
                 )
             num_draft_tokens = spec_info.draft_token_num
             extend_seq_lens = torch.full(
@@ -303,7 +304,7 @@ class IntelAMXMultiStepDraftBackend:
         self.build_draft_decode_metadata = build_draft_decode_metadata_cpu
         self.topk = topk
         self.speculative_num_steps = speculative_num_steps
-        self.attn_backends: List[IntelAMXAttnBackend] = []
+        self.attn_backends: list[IntelAMXAttnBackend] = []
         for _ in range(self.speculative_num_steps - 1):
             self.attn_backends.append(IntelAMXAttnBackend(model_runner))
         self.device = model_runner.device

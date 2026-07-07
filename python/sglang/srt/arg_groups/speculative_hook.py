@@ -12,14 +12,13 @@ logger = logging.getLogger(__name__)
 
 
 def _disable_overlap_schedule_for_cpu(server_args: ServerArgs) -> None:
-    if server_args.device != "cpu":
+    if server_args.device != "cpu" or server_args.disable_overlap_schedule:
         return
 
-    if not server_args.disable_overlap_schedule:
-        server_args.disable_overlap_schedule = True
-        logger.warning(
-            "Overlap schedule is not implemented for speculative decoding on CPU."
-        )
+    server_args.disable_overlap_schedule = True
+    logger.warning(
+        "Overlap schedule is not implemented for speculative decoding on CPU."
+    )
 
 
 def _resolve_speculative_algorithm_alias(
@@ -482,7 +481,7 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
 
 
 def _handle_ngram(server_args: ServerArgs) -> None:
-    if not server_args.device.startswith("cuda") and server_args.device != "cpu":
+    if server_args.device not in ("cuda", "cpu"):
         raise ValueError(
             "Ngram speculative decoding only supports CUDA or CPU devices."
         )
