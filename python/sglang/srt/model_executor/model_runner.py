@@ -182,7 +182,7 @@ from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_flags
+from sglang.srt.runtime_context import get_flags, get_server_args
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import (  # noqa: F401  (re-export)
     CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS,
@@ -541,7 +541,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.init_threads_binding()
 
         # Set float32 matmul precision
-        if get_flags().enable_tf32_matmul:
+        if get_server_args().enable_tf32_matmul:
             torch.set_float32_matmul_precision("high")
 
         # Get available memory before model loading.
