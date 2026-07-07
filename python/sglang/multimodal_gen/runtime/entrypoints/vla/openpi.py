@@ -15,7 +15,7 @@ from sglang.multimodal_gen.runtime.entrypoints.action_utils import (
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
-router = APIRouter(tags=["openpi"])
+router = APIRouter()
 
 
 @router.websocket("/openpi/policy")

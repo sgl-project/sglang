@@ -14,11 +14,7 @@ from fastapi import APIRouter, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
-from sglang.multimodal_gen.runtime.entrypoints.openai import (
-    action_api,
-    image_api,
-    video_api,
-)
+from sglang.multimodal_gen.runtime.entrypoints.openai import image_api, video_api
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     VertexGenerateReqInput,
 )
@@ -26,9 +22,6 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.realtime import (
     realtime_video_api,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import build_sampling_params
-from sglang.multimodal_gen.runtime.entrypoints.openpi import (
-    policy_api as openpi_policy_api,
-)
 from sglang.multimodal_gen.runtime.entrypoints.post_training import (
     rollout_api,
     weights_api,
@@ -37,6 +30,7 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
     prepare_request,
     save_outputs,
 )
+from sglang.multimodal_gen.runtime.entrypoints.vla import action_api, openpi
 from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 from sglang.multimodal_gen.runtime.server_args import ServerArgs, get_global_server_args
 from sglang.multimodal_gen.runtime.server_warmup import (
@@ -409,7 +403,7 @@ def create_app(server_args: ServerArgs):
     app.include_router(realtime_video_api.router)
     if server_args.pipeline_config.task_type.is_action_gen():
         app.include_router(action_api.router)
-        app.include_router(openpi_policy_api.router)
+        app.include_router(openpi.router)
     app.include_router(mesh_api.router)
     app.include_router(weights_api.router)
     app.include_router(rollout_api.router)

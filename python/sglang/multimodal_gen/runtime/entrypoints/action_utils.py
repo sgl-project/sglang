@@ -287,8 +287,12 @@ def build_action_sampling_params(
     prompt = observation.get("prompt") or observation.get("task") or ""
     prefix_cache = runtime.get("prefix_cache")
     if prefix_cache is None:
+        prefix_cache = observation.get("enable_prefix_cache")
+    if prefix_cache is None:
         prefix_cache = observation.get("enable_pi_prefix_cache")
     cuda_graph = runtime.get("cuda_graph")
+    if cuda_graph is None:
+        cuda_graph = observation.get("enable_cuda_graph")
     if cuda_graph is None:
         cuda_graph = observation.get("enable_pi_cuda_graph")
     output_format = str(
