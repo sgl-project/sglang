@@ -350,11 +350,6 @@ def npu_fused_experts_mxfp8(
     )
     expert_tokens = expert_tokens.to(torch.int64)
 
-    row_ids = torch.arange(
-        hidden_states.shape[0], device=hidden_states.device, dtype=torch.int64
-    )
-    valid_mask = row_ids < expert_tokens[-1]
-
     hidden_states = mxfp8_gmm_npu(
         input=hidden_states,
         input_scale=None,
@@ -374,7 +369,6 @@ def npu_fused_experts_mxfp8(
         group_list=expert_tokens,
         output_dtype=original_dtype,
     )
-    hidden_states = hidden_states * valid_mask.unsqueeze(1).to(hidden_states.dtype)
 
     final_hidden_states = torch.ops.npu.npu_moe_finalize_routing(
         hidden_states,
