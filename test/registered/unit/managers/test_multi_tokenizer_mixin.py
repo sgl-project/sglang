@@ -1,12 +1,21 @@
 import unittest
+from contextlib import ExitStack
+from types import SimpleNamespace
+from unittest import mock
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.io_struct import BatchStrOutput
-from sglang.srt.managers.multi_tokenizer_mixin import _handle_output_by_index
+from sglang.srt.managers.multi_tokenizer_mixin import (
+    TokenizerWorker,
+    _handle_output_by_index,
+)
+from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.utils import TypeBasedDispatcher
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -62,6 +71,81 @@ class TestMultiTokenizerMixin(unittest.TestCase):
             single_output.cached_tokens_details,
             [{"device": 1, "host": 3}],
         )
+
+    def test_tokenizer_worker_metrics_use_real_disaggregation_mode(self):
+        observed = {}
+
+        server_args = SimpleNamespace(
+            bucket_e2e_request_latency=None,
+            bucket_inter_token_latency=None,
+            bucket_time_to_first_token=None,
+            crash_dump_folder=None,
+            disaggregation_mode="decode",
+            disaggregation_transfer_backend="mooncake",
+            enable_metrics=True,
+            encoder_urls=[],
+            extra_metric_labels=None,
+            language_only=False,
+            preferred_sampling_params=None,
+            served_model_name="test-model",
+            tokenizer_metrics_allowed_custom_labels=None,
+        )
+        port_args = SimpleNamespace(tokenizer_ipc_name="ipc://test-tokenizer")
+
+        def init_model_config(manager):
+            manager.enable_priority_scheduling = False
+
+        def init_request_dispatcher(manager):
+            manager._result_dispatcher = TypeBasedDispatcher([])
+
+        def noop(*args, **kwargs):
+            pass
+
+        def capture_metric_labels(manager):
+            observed["mode_at_metrics_init"] = manager.server_args.disaggregation_mode
+            observed["engine_type"] = DisaggregationMode.to_engine_type(
+                manager.server_args.disaggregation_mode
+            )
+            observed["disaggregation_mode"] = manager.disaggregation_mode
+
+        noop_methods = [
+            "init_tokenizer_and_processor",
+            "init_ipc_channels",
+            "init_running_status",
+            "init_request_logging_and_dumping",
+            "init_weight_update",
+            "init_lora",
+        ]
+        patches = [
+            mock.patch.object(TokenizerManager, "init_model_config", init_model_config),
+            mock.patch.object(
+                TokenizerManager, "init_request_dispatcher", init_request_dispatcher
+            ),
+            mock.patch.object(
+                TokenizerManager,
+                "init_metric_collector_watchdog",
+                capture_metric_labels,
+            ),
+            mock.patch.object(TokenizerManager, "_dispatch_to_scheduler"),
+            mock.patch(
+                "sglang.srt.managers.tokenizer_manager.start_disagg_service",
+                side_effect=AssertionError(
+                    "TokenizerWorker must not start a duplicate bootstrap service"
+                ),
+            ),
+        ]
+        patches.extend(
+            mock.patch.object(TokenizerManager, method, noop) for method in noop_methods
+        )
+
+        with ExitStack() as stack:
+            for patch in patches:
+                stack.enter_context(patch)
+            TokenizerWorker(server_args, port_args)
+
+        self.assertEqual(observed["mode_at_metrics_init"], "decode")
+        self.assertEqual(observed["engine_type"], "decode")
+        self.assertEqual(observed["disaggregation_mode"], DisaggregationMode.DECODE)
 
 
 if __name__ == "__main__":
