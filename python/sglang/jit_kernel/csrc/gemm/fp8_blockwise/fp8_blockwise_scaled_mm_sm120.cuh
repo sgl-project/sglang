@@ -385,8 +385,8 @@ void launch_sm120_fp8_blockwise_scaled_mm_swapab(
       StageCount,
       cutlass::gemm::KernelScheduleSm120Blockwise>::CollectiveOp;
 
-  using GemmKernel = cutlass::gemm::kernel::
-      GemmUniversal<Shape<int, int, int, int>, CollectiveMainloop, CollectiveEpilogue, void>;
+  using GemmKernel =
+      cutlass::gemm::kernel::GemmUniversal<Shape<int, int, int, int>, CollectiveMainloop, CollectiveEpilogue, void>;
 
   CUTLASS_CHECK(run_gemm(GemmKernel{}));
 }
@@ -417,15 +417,15 @@ void sm120_fp8_blockwise_dispatch_shape(
   // needs N >= 32), so 32 is the floor.
   using EpilogueTileShape = Shape<_128, _64>;  // vestigial on SM120 (epilogue tile is auto)
   if constexpr (!kForceNoSwap) {
-  if (m <= 64 || (m % 4 != 0)) {
-    launch_sm120_fp8_blockwise_scaled_mm_swapab<
-        OutType,
-        Shape<_128, _32, _128>,
-        Shape<_128, _32, _128>,
-        EpilogueTileShape,
-        Shape<_1, _32, _1>>(out, a, b, scales_a, scales_b, stream);
-    return;
-  }
+    if (m <= 64 || (m % 4 != 0)) {
+      launch_sm120_fp8_blockwise_scaled_mm_swapab<
+          OutType,
+          Shape<_128, _32, _128>,
+          Shape<_128, _32, _128>,
+          EpilogueTileShape,
+          Shape<_1, _32, _1>>(out, a, b, scales_a, scales_b, stream);
+      return;
+    }
   }  // if constexpr (!kForceNoSwap)
 
   // 4-aligned larger M (or forced): standard (non-swapped) path, 128x128 MMA tile.
@@ -454,11 +454,9 @@ inline void fp8_blockwise_scaled_mm_sm120(
   RuntimeCheck(mat_a.size(1) == mat_b.size(0), "mat_a and mat_b shapes cannot be multiplied");
 
   RuntimeCheck(
-      (mat_a.size(1) * (mat_a.dtype().bits / 8)) % 16 == 0,
-      "mat_a must be multiple of 16 bytes for memory alignment");
+      (mat_a.size(1) * (mat_a.dtype().bits / 8)) % 16 == 0, "mat_a must be multiple of 16 bytes for memory alignment");
   RuntimeCheck(
-      (mat_b.size(0) * (mat_b.dtype().bits / 8)) % 16 == 0,
-      "mat_b must be multiple of 16 bytes for memory alignment");
+      (mat_b.size(0) * (mat_b.dtype().bits / 8)) % 16 == 0, "mat_b must be multiple of 16 bytes for memory alignment");
   RuntimeCheck(host::is_type<fp8_e4m3_t>(mat_a.dtype()), "mat_a must be Float8_e4m3fn");
   RuntimeCheck(host::is_type<fp8_e4m3_t>(mat_b.dtype()), "mat_b must be Float8_e4m3fn");
 
@@ -470,8 +468,7 @@ inline void fp8_blockwise_scaled_mm_sm120(
   RuntimeCheck(host::is_type<float>(scales_b.dtype()), "scales_b must be Float32");
 
   RuntimeCheck(
-      (out.size(1) * (out.dtype().bits / 8)) % 16 == 0,
-      "out must be multiple of 16 bytes for memory alignment");
+      (out.size(1) * (out.dtype().bits / 8)) % 16 == 0, "out must be multiple of 16 bytes for memory alignment");
 
   const cudaStream_t stream = LaunchKernel::resolve_device(mat_a.device());
 

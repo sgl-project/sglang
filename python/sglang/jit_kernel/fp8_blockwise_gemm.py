@@ -53,8 +53,14 @@ def _jit_fp8_blockwise_module() -> Module:
             cuda_wrappers=[
                 ("fp8_blockwise_scaled_mm", "fp8_blockwise_scaled_mm"),
                 ("fp8_blockwise_scaled_mm_noswap", "fp8_blockwise_scaled_mm_noswap"),
-                ("fp8_blockwise_scaled_mm_swapab32", "fp8_blockwise_scaled_mm_swapab32"),
-                ("fp8_blockwise_scaled_mm_swapab64", "fp8_blockwise_scaled_mm_swapab64"),
+                (
+                    "fp8_blockwise_scaled_mm_swapab32",
+                    "fp8_blockwise_scaled_mm_swapab32",
+                ),
+                (
+                    "fp8_blockwise_scaled_mm_swapab64",
+                    "fp8_blockwise_scaled_mm_swapab64",
+                ),
             ],
             extra_dependencies=["cutlass"],
             extra_cuda_cflags=_fp8_blockwise_cuda_flags(),
@@ -94,9 +100,10 @@ def fp8_blockwise_scaled_mm(
     No M padding is done here: the kernel routes small or non-4-aligned M through
     the swapAB path (tokens on the N tile), which has no M-alignment requirement.
     """
-    assert out_dtype in (torch.float16, torch.bfloat16), (
-        f"out_dtype must be Half or BFloat16, got {out_dtype}"
-    )
+    assert out_dtype in (
+        torch.float16,
+        torch.bfloat16,
+    ), f"out_dtype must be Half or BFloat16, got {out_dtype}"
 
     out = torch.empty(
         (mat_a.shape[0], mat_b.shape[1]),

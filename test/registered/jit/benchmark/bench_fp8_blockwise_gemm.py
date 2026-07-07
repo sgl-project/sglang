@@ -29,9 +29,7 @@ def _make_inputs(m: int, n: int, k: int, device: str = "cuda"):
     b_fp32 = (torch.rand(n, k, dtype=torch.float32, device=device) - 0.5) * 2 * fp8_max
     b_fp8 = b_fp32.clamp(min=fp8_min, max=fp8_max).to(torch.float8_e4m3fn).t()
 
-    scale_a = (
-        torch.randn((m, k // 128), device=device, dtype=torch.float32) * 0.001
-    )
+    scale_a = torch.randn((m, k // 128), device=device, dtype=torch.float32) * 0.001
     scale_b = (
         torch.randn((k // 128, n // 128), device=device, dtype=torch.float32) * 0.001
     )
@@ -102,6 +100,8 @@ def benchmark(m, n, k, provider):
 
 if __name__ == "__main__":
     if not _SM120_SUPPORTED:
-        print("[skip] fp8_blockwise_scaled_mm benchmark requires SM120 with CUDA 12.8+.")
+        print(
+            "[skip] fp8_blockwise_scaled_mm benchmark requires SM120 with CUDA 12.8+."
+        )
         sys.exit(0)
     benchmark.run(print_data=True)

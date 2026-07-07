@@ -15,9 +15,9 @@ limitations under the License.
 
 #pragma once
 
-#include <sgl_kernel/ffi.h>      // For ffi::empty
-#include <sgl_kernel/tensor.h>   // For TensorView, RuntimeCheck, Panic
-#include <sgl_kernel/utils.h>    // For host utilities
+#include <sgl_kernel/ffi.h>     // For ffi::empty
+#include <sgl_kernel/tensor.h>  // For TensorView, RuntimeCheck, Panic
+#include <sgl_kernel/utils.h>   // For host utilities
 
 #include <sgl_kernel/runtime.cuh>  // For device/runtime helpers
 #include <sgl_kernel/utils.cuh>    // For LaunchKernel, RuntimeDeviceCheck
