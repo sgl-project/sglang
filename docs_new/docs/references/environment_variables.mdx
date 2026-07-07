@@ -2123,13 +2123,13 @@ SGLang supports various environment variables that can be used to configure its 
   <tbody>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_NUMA_BIND_V2</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Use the v2 NUMA binding implementation.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Select the NUMA binding implementation. <code>true</code> uses a pre-launch <code>numactl</code> wrapper; <code>false</code> binds in the worker process. This variable does not enable or disable NUMA binding.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_AUTO_NUMA_BIND</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Automatically bind processes to NUMA nodes.</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Automatically detect each NVIDIA GPU's local NUMA node and bind its worker when <code>--numa-node</code> is not specified. Set to <code>false</code> to leave workers unbound; an explicit <code>--numa-node</code> takes precedence.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_CRASH_ON_NUMA_BIND_FAILURE</code></td>
