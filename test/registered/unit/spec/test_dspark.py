@@ -266,6 +266,14 @@ class TestDSparkDraftInputBatch(CustomTestCase):
         )
         calls = []
 
+        def _record_assign_call(*args):
+            calls.append(
+                {
+                    "start_offset": args[2].clone(),
+                    "end_offset": args[3].clone(),
+                }
+            )
+
         with (
             patch(
                 "sglang.srt.speculative.dspark_info.get_global_server_args",
@@ -277,13 +285,13 @@ class TestDSparkDraftInputBatch(CustomTestCase):
             ),
             patch(
                 "sglang.srt.speculative.dspark_info.assign_req_to_token_pool_func",
-                side_effect=lambda *args: calls.append(args),
+                side_effect=_record_assign_call,
             ),
         ):
             spec.prepare_for_decode(batch)
 
-        self.assertEqual(calls[0][2].tolist(), [12])
-        self.assertEqual(calls[0][3].tolist(), [22])
+        self.assertEqual(calls[0]["start_offset"].tolist(), [12])
+        self.assertEqual(calls[0]["end_offset"].tolist(), [22])
         self.assertEqual(req.kv_allocated_len, 22)
         self.assertEqual(batch.seq_lens.tolist(), [10])
 
