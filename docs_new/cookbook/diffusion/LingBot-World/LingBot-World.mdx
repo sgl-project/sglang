@@ -26,7 +26,10 @@ sglang serve \
   --num-gpus 4 \
   --ulysses-degree 4 \
   --dit-cpu-offload false \
-  --text-encoder-cpu-offload false
+  --text-encoder-cpu-offload false \
+  --vae-config.use-parallel-decode true \
+  --vae-config.parallel-decode-mode spatial \
+  --enable-torch-compile false
 ```
 
 ## 3. Realtime WebUI
