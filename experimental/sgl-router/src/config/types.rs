@@ -17,6 +17,7 @@ pub struct Config {
     pub proxy: ProxyConfig,
     pub active_load: ActiveLoadConfig,
     pub admission: AdmissionConfig,
+    pub retry: RetryConfig,
 }
 
 /// Outbound proxy tuning. Default mirrors SGLang's typical prefill /
@@ -100,6 +101,39 @@ impl Default for AdmissionConfig {
     fn default() -> Self {
         Self::Disabled
     }
+}
+
+/// Single-retry failover for transient upstream *dispatch* failures.
+///
+/// When a selected worker fails to return a usable response before any bytes
+/// reach the client — connection refused, request-headers timeout, a breaker
+/// that was open at dispatch, or a malformed worker URL — the chat handler
+/// re-dispatches the SAME request ONCE, to a *different* worker whose in-flight
+/// load is below the admission cap (never onto a worker already at capacity).
+/// Because nothing has been streamed to the client yet and the request is not
+/// known to have executed, the re-dispatch is safe (see
+/// [`crate::server::error::ApiError::is_retryable_upstream`] for the exact
+/// retryable set). This is the router-side failover the circuit breaker alone
+/// cannot provide: the breaker ejects a bad worker from *future* selections,
+/// but only retry recovers the in-flight request that hit it.
+///
+/// At most ONE retry: a second failure surfaces to the client. The load gate is
+/// the admission per-worker cap — a retry only proceeds onto a worker with a
+/// free slot, so retry never dogpiles a saturated fleet (and never waits for a
+/// slot: if every other worker is full, the request fails instead of parking).
+/// Without an admission cap configured there is no capacity to check, so the
+/// gate is a no-op and the single retry always proceeds.
+///
+/// Opt-in: [`enabled`](Self::enabled) defaults to `false` (no retry — a single
+/// dispatch attempt, exactly the pre-retry behaviour). Scope: plain-mode
+/// requests only. PD-disaggregated requests are deliberately single-attempt —
+/// their prefill is detached and outlives the client, so a retry would double
+/// the KV-transfer work; see the PD dispatch comment in the chat handler.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RetryConfig {
+    /// Whether the router retries a failed plain-mode dispatch once, onto a
+    /// different not-full worker. `false` (default) disables retry.
+    pub enabled: bool,
 }
 
 /// Routing policy selector — the enum form lets `clap` reject unknown

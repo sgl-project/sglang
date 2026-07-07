@@ -84,6 +84,7 @@ async fn zmq_indexer_routes_to_publishing_worker_e2e() {
         proxy: ProxyConfig::default(),
         active_load: ActiveLoadConfig::default(),
         admission: sgl_router::config::AdmissionConfig::default(),
+        retry: sgl_router::config::RetryConfig::default(),
     };
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
 

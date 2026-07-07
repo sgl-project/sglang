@@ -14,7 +14,7 @@ use crate::config::{
     default_stale_request_timeout_secs, default_tokenizer_shards, resolve_mode, ActiveLoadConfig,
     AdmissionConfig, CacheAwareConfig, CircuitBreakerConfig, Config, DiscoveryBackend,
     K8sDiscoveryConfig, LogFormat, ModelConfig, ObservabilityConfig, PolicyKind, ProxyConfig,
-    ServerConfig, StaticUrlsDiscoveryConfig, StickyConfig,
+    RetryConfig, ServerConfig, StaticUrlsDiscoveryConfig, StickyConfig,
 };
 
 /// `sgl-router` — slim KV-aware OpenAI-compatible router for SGLang workers.
@@ -152,6 +152,17 @@ pub struct Cli {
     /// Unset leaves the wait queue unbounded (park, never shed).
     #[arg(long)]
     pub max_queued_requests: Option<usize>,
+
+    // ---- retry (plain-mode failover on transient dispatch failures) ----
+    /// Retry a plain-mode request ONCE, on a *different* worker, when it hits a
+    /// transient upstream failure (connection refused, request-headers timeout,
+    /// breaker-open, malformed worker URL) before any bytes reach the client.
+    /// The retry only goes to a worker whose in-flight load is below the
+    /// admission cap (`--max-concurrent-requests-per-worker`) — never onto a
+    /// full one, and it never waits for a slot. Off by default;
+    /// PD-disaggregated requests are always single-attempt.
+    #[arg(long)]
+    pub enable_retry: bool,
 
     // ---- observability ----
     /// Default tracing level (overridden by `RUST_LOG`).
@@ -325,6 +336,9 @@ impl Cli {
                 },
                 None => AdmissionConfig::Disabled,
             },
+            retry: RetryConfig {
+                enabled: self.enable_retry,
+            },
         };
         config.validate()?;
         Ok(config)
@@ -442,6 +456,23 @@ mod tests {
         assert_eq!(c.proxy.request_timeout_secs, 300);
         assert_eq!(c.active_load.stale_request_timeout_secs, 600);
         assert_eq!(c.server.shutdown_drain_secs, 5);
+    }
+
+    #[test]
+    fn retry_disabled_by_default_in_cli() {
+        let c = into_config_owned(with_model(&["--worker-urls", "http://10.0.0.1:30000"])).unwrap();
+        assert!(!c.retry.enabled, "retry must be opt-in");
+    }
+
+    #[test]
+    fn enable_retry_flag_maps_into_config() {
+        let c = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://10.0.0.1:30000",
+            "--enable-retry",
+        ]))
+        .unwrap();
+        assert!(c.retry.enabled);
     }
 
     #[test]

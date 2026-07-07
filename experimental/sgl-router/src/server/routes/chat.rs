@@ -253,21 +253,32 @@ async fn chat_completions_inner(
     // read the routing key from the operator-chosen header into the
     // selection context; the policy pins it to a worker. Other policies
     // leave `routing_key` `None` and ignore it.
-    let routing_key = ctx
+    //
+    // Held as an owned `String` (not a `&str` borrowed from `headers`) so the
+    // `selection_ctx` that carries it does not keep `headers` borrowed: the
+    // handler moves `headers` below (decode-hint injection), and the retry loop
+    // re-reads `selection_ctx` after that move, so a borrow of `headers` here
+    // would outlive the move.
+    let routing_key_owned: Option<String> = ctx
         .config
         .model
         .sticky
         .as_ref()
         .and_then(|s| headers.get(s.header_name.as_str()))
         .and_then(|v| v.to_str().ok())
-        .filter(|s| !s.is_empty());
-    let selection_ctx = SelectionContext::with_routing_key(&model_id, Some(&body), routing_key)
-        .with_request_tokens(request_tokens.as_ref().map(|t| t.ids.as_slice()));
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+    let selection_ctx =
+        SelectionContext::with_routing_key(&model_id, Some(&body), routing_key_owned.as_deref())
+            .with_request_tokens(request_tokens.as_ref().map(|t| t.ids.as_slice()));
     // Admission gate: pick a worker and claim an in-flight slot, parking until
     // one frees if every candidate is at its cap. A pass-through (immediate
     // dispatch, unconditional guard) when no per-worker cap is configured.
     // Yields 503 `service_overloaded` when the wait queue is full.
-    let (worker, guard) = ctx
+    // `worker` / `guard` are `mut` so the plain-mode retry loop below can
+    // reselect a different worker and claim a fresh slot on a retryable
+    // dispatch failure. The PD branch never reassigns them.
+    let (mut worker, mut guard) = ctx
         .admission
         .acquire(&workers, policy.as_ref(), &selection_ctx, &model_str)
         .await?;
@@ -359,7 +370,9 @@ async fn chat_completions_inner(
         .as_ref()
         .map(|t| t.ids.len().max(1))
         .unwrap_or_else(|| estimate_prefill_tokens(&body));
-    let active_guard =
+    // `mut` for the same reason as `worker`/`guard`: a plain-mode retry
+    // re-registers active load on the newly-selected worker.
+    let mut active_guard =
         ctx.active_load
             .register(worker.id.clone(), worker.url.clone(), prefill_load, 0);
     // Snapshot the stale-request cancel token BEFORE moving the guard
@@ -367,17 +380,16 @@ async fn chat_completions_inner(
     // The token is cheap to clone (it's an `Arc<...>` internally) and
     // the chat handler races the client-facing fetch against
     // `token.cancelled()` to surface a 504 `stale_request_expired` if
-    // the janitor expires the request mid-flight.
-    let stale_token = active_guard.cancel_token().clone();
+    // the janitor expires the request mid-flight. `mut` so a retry can
+    // re-snapshot the token of the new attempt's active-load entry.
+    let mut stale_token = active_guard.cancel_token().clone();
 
     // Snapshot the labels we need for metrics BEFORE moving the worker
-    // / model_str values into the per-branch fetch futures.
-    let metrics_worker_url = worker.url.clone();
-    let metrics_mode = match worker.mode() {
-        WorkerMode::Prefill => WorkerModeLabel::Prefill,
-        WorkerMode::Decode => WorkerModeLabel::Decode,
-        WorkerMode::Plain => WorkerModeLabel::Plain,
-    };
+    // / model_str values into the per-branch fetch futures. `mut` so a
+    // plain-mode retry updates them to the worker that actually served, so
+    // the access log / `worker_requests_total` reflect the final worker.
+    let mut metrics_worker_url = worker.url.clone();
+    let mut metrics_mode = mode_label(worker.mode());
     let metrics_model = model_str.clone();
 
     // Builds the time-to-first-token hook the SSE pump fires when the first
@@ -662,127 +674,236 @@ async fn chat_completions_inner(
                 _ = stale_token.cancelled() => Err(ApiError::StaleRequestExpired { model: model_str }),
             }
         }
-    } else if streaming {
-        // Plain mode, streaming. Both guards ride the SSE pump until
-        // the body completes — see the matching comment in the
-        // non-streaming arm.
-        let stream_guards: Box<dyn Send + 'static> =
-            Box::new((guard, active_guard, make_duration_guard()));
-        // Pre-headers abort guard: `forward_streaming_to` only constructs its
-        // own (reached_end-tracking) guard AFTER a response is received, so
-        // it can't protect the window before that — if the stale-request
-        // janitor fires while `fetch` is still awaiting headers, `fetch` (and
-        // the not-yet-existing internal guard) is dropped with no abort sent,
-        // even though the engine may already be working on the request. This
-        // guard covers exactly that window: armed until `fetch` resolves to
-        // any received response (disarmed below), at which point the
-        // internal guard (for a 2xx) or nothing (non-2xx, same as today)
-        // takes over — same disarm-on-`Ok` pattern as the non-streaming arm.
-        let mut pre_headers_abort_guard = request_id.as_deref().and_then(|rid| {
-            ctx.proxy
-                .abort_guard_for(&worker.url, worker.protocol(), rid)
-        });
-        let fetch = ctx.proxy.forward_streaming_to(
-            &worker.url,
-            worker.protocol(),
-            &worker.breaker,
-            "/v1/chat/completions",
-            &headers,
-            outgoing_body,
-            Some(stream_guards),
-            Some(make_ttft_hook()),
-            // Abort the engine if the client disconnects before the engine
-            // finishes streaming. The SSE pump (which owns the guard) fires
-            // it; here we only supply the rid the engine knows this request by.
-            request_id.as_deref(),
-            Some(make_stream_end_hook(&metrics_worker_url)),
-            Some(make_itl_hook()),
-        );
-        // Bias `fetch` over the cancellation branch: a successful
-        // response that completes in the same poll as the token firing
-        // MUST win (returning 504 for a request that already has
-        // headers is a correctness regression). The cancellation
-        // branch only matters when fetch is still pending — at that
-        // point biasing the order is a wash.
-        let r = tokio::select! {
-            biased;
-            r = fetch => r,
-            _ = stale_token.cancelled() => Err(ApiError::StaleRequestExpired { model: model_str }),
-        };
-        // A received response (any status) means responsibility has passed
-        // to `forward_streaming_to`'s own guard (or nothing, for non-2xx) —
-        // disarm so this one doesn't also fire. Left armed only when `fetch`
-        // never resolved (stale-timeout) or a transport-level dispatch error
-        // occurred before any response.
-        match &r {
-            Ok(_) => {
-                if let Some(g) = pre_headers_abort_guard.as_mut() {
-                    g.disarm();
-                }
-            }
-            Err(err) => {
-                // Narrow the abort reason before the guard drops so the
-                // WARN log + POST body identify the *specific* trigger
-                // (stale timeout / upstream timeout / transport) rather
-                // than the constructor default `HandlerCancelled`.
-                if let Some(g) = pre_headers_abort_guard.as_ref() {
-                    g.set_reason(abort_reason_from_api_error(err));
-                }
-            }
-        }
-        r
     } else {
-        // Plain mode, non-streaming. The handler awaits the full
-        // buffered response, so both guards live correctly in this
-        // scope. The tuple binding exists only to extend the guards'
-        // lifetime to the end of the function — the `forward_json_to`
-        // future does not need them (it does not return until the
-        // body is buffered).
-        let _holds = (guard, active_guard);
-        // Abort-on-disconnect: armed for the whole forward, disarmed once a
-        // complete response is in hand. If the client disconnects first the
-        // handler future is dropped mid-await and this guard, still armed,
-        // tells the engine to stop. A stale-request timeout (the cancel arm
-        // below) also leaves it armed — we've given up, so the engine should
-        // too. `None` only in PD mode / on a worker-URL parse failure.
-        let mut abort_guard = request_id.as_deref().and_then(|rid| {
-            ctx.proxy
-                .abort_guard_for(&worker.url, worker.protocol(), rid)
-        });
-        let fetch = ctx.proxy.forward_json_to(
-            &worker.url,
-            worker.protocol(),
-            &worker.breaker,
-            "/v1/chat/completions",
-            &headers,
-            outgoing_body,
-        );
-        // Same `biased` order as the streaming arm.
-        let r = tokio::select! {
-            biased;
-            r = fetch => r,
-            _ = stale_token.cancelled() => Err(ApiError::StaleRequestExpired { model: model_str }),
-        };
-        // A complete response (any status) means the engine is done with this
-        // request — don't abort it. Only an early drop (client disconnect) or
-        // stale-timeout leaves the guard armed.
-        match &r {
-            Ok(_) => {
-                if let Some(g) = abort_guard.as_mut() {
-                    g.disarm();
+        // Plain mode. Single-retry failover: on a transient dispatch failure
+        // that occurs before any bytes reach the client, re-dispatch the SAME
+        // request ONCE, to a DIFFERENT worker whose in-flight load is below the
+        // admission cap. This is the router-side failover the circuit breaker
+        // alone can't provide — the breaker ejects a bad worker from *future*
+        // selections, but only retry recovers the in-flight request that hit it.
+        //
+        // Retry is opt-in (`retry.enabled`, default false ⇒ exactly one
+        // attempt). The retryable failures (see `ApiError::is_retryable_upstream`)
+        // all return `Err` from the forward BEFORE the response headers
+        // (streaming) or full body (non-streaming) arrive, so nothing has been
+        // streamed to the client and the request is safe to re-dispatch. A
+        // worker that returns a well-formed non-2xx (e.g. an engine 503) is
+        // `Ok(response)` here, not `Err` — the proxy forwards it verbatim, so it
+        // reaches the client and is never retried.
+        //
+        // The re-dispatch uses the non-parking, load-gated
+        // `AdmissionQueue::try_acquire`: it lands only on a worker with a free
+        // slot (never onto one already at capacity) and never waits for a slot —
+        // if the rest of the fleet is saturated the retry is skipped and the
+        // original error surfaces. Dropping a failed attempt's guards releases
+        // its admission slot and (for a timeout) fires the abort guard, telling
+        // that engine to stop before we try elsewhere.
+        let mut retried = false;
+        loop {
+            let attempt_result = if streaming {
+                // Plain mode, streaming. Both guards ride the SSE pump until
+                // the body completes — see the matching comment in the
+                // non-streaming arm.
+                let stream_guards: Box<dyn Send + 'static> =
+                    Box::new((guard, active_guard, make_duration_guard()));
+                // Pre-headers abort guard: `forward_streaming_to` only constructs its
+                // own (reached_end-tracking) guard AFTER a response is received, so
+                // it can't protect the window before that — if the stale-request
+                // janitor fires while `fetch` is still awaiting headers, `fetch` (and
+                // the not-yet-existing internal guard) is dropped with no abort sent,
+                // even though the engine may already be working on the request. This
+                // guard covers exactly that window: armed until `fetch` resolves to
+                // any received response (disarmed below), at which point the
+                // internal guard (for a 2xx) or nothing (non-2xx, same as today)
+                // takes over — same disarm-on-`Ok` pattern as the non-streaming arm.
+                let mut pre_headers_abort_guard = request_id.as_deref().and_then(|rid| {
+                    ctx.proxy
+                        .abort_guard_for(&worker.url, worker.protocol(), rid)
+                });
+                let fetch = ctx.proxy.forward_streaming_to(
+                    &worker.url,
+                    worker.protocol(),
+                    &worker.breaker,
+                    "/v1/chat/completions",
+                    &headers,
+                    // Cloned so the body survives for a possible re-dispatch;
+                    // `Bytes` clone is a cheap refcount bump.
+                    outgoing_body.clone(),
+                    Some(stream_guards),
+                    Some(make_ttft_hook()),
+                    // Abort the engine if the client disconnects before the engine
+                    // finishes streaming. The SSE pump (which owns the guard) fires
+                    // it; here we only supply the rid the engine knows this request by.
+                    request_id.as_deref(),
+                    Some(make_stream_end_hook(&metrics_worker_url)),
+                    Some(make_itl_hook()),
+                );
+                // Bias `fetch` over the cancellation branch: a successful
+                // response that completes in the same poll as the token firing
+                // MUST win (returning 504 for a request that already has
+                // headers is a correctness regression). The cancellation
+                // branch only matters when fetch is still pending — at that
+                // point biasing the order is a wash.
+                let r = tokio::select! {
+                    biased;
+                    r = fetch => r,
+                    _ = stale_token.cancelled() => Err(ApiError::StaleRequestExpired { model: model_str.clone() }),
+                };
+                // A received response (any status) means responsibility has passed
+                // to `forward_streaming_to`'s own guard (or nothing, for non-2xx) —
+                // disarm so this one doesn't also fire. Left armed only when `fetch`
+                // never resolved (stale-timeout) or a transport-level dispatch error
+                // occurred before any response.
+                match &r {
+                    Ok(_) => {
+                        if let Some(g) = pre_headers_abort_guard.as_mut() {
+                            g.disarm();
+                        }
+                    }
+                    Err(err) => {
+                        // Narrow the abort reason before the guard drops so the
+                        // WARN log + POST body identify the *specific* trigger
+                        // (stale timeout / upstream timeout / transport) rather
+                        // than the constructor default `HandlerCancelled`.
+                        if let Some(g) = pre_headers_abort_guard.as_ref() {
+                            g.set_reason(abort_reason_from_api_error(err));
+                        }
+                    }
                 }
-            }
-            Err(err) => {
-                // Same reason-narrowing as the streaming arm above — see there
-                // for the rationale. Handler-cancellation (client disconnect
-                // during the buffered await) still hits the constructor
-                // default because that path returns no `Err`, it just drops.
-                if let Some(g) = abort_guard.as_ref() {
-                    g.set_reason(abort_reason_from_api_error(err));
+                r
+            } else {
+                // Plain mode, non-streaming. The handler awaits the full
+                // buffered response, so both guards live correctly in this
+                // scope. The tuple binding exists only to extend the guards'
+                // lifetime to the end of the attempt — the `forward_json_to`
+                // future does not need them (it does not return until the
+                // body is buffered).
+                let _holds = (guard, active_guard);
+                // Abort-on-disconnect: armed for the whole forward, disarmed once a
+                // complete response is in hand. If the client disconnects first the
+                // handler future is dropped mid-await and this guard, still armed,
+                // tells the engine to stop. A stale-request timeout (the cancel arm
+                // below) also leaves it armed — we've given up, so the engine should
+                // too. `None` only in PD mode / on a worker-URL parse failure.
+                let mut abort_guard = request_id.as_deref().and_then(|rid| {
+                    ctx.proxy
+                        .abort_guard_for(&worker.url, worker.protocol(), rid)
+                });
+                let fetch = ctx.proxy.forward_json_to(
+                    &worker.url,
+                    worker.protocol(),
+                    &worker.breaker,
+                    "/v1/chat/completions",
+                    &headers,
+                    outgoing_body.clone(),
+                );
+                // Same `biased` order as the streaming arm.
+                let r = tokio::select! {
+                    biased;
+                    r = fetch => r,
+                    _ = stale_token.cancelled() => Err(ApiError::StaleRequestExpired { model: model_str.clone() }),
+                };
+                // A complete response (any status) means the engine is done with this
+                // request — don't abort it. Only an early drop (client disconnect) or
+                // stale-timeout leaves the guard armed.
+                match &r {
+                    Ok(_) => {
+                        if let Some(g) = abort_guard.as_mut() {
+                            g.disarm();
+                        }
+                    }
+                    Err(err) => {
+                        // Same reason-narrowing as the streaming arm above — see there
+                        // for the rationale. Handler-cancellation (client disconnect
+                        // during the buffered await) still hits the constructor
+                        // default because that path returns no `Err`, it just drops.
+                        if let Some(g) = abort_guard.as_ref() {
+                            g.set_reason(abort_reason_from_api_error(err));
+                        }
+                    }
+                }
+                r
+            };
+
+            match attempt_result {
+                Ok(resp) => break Ok(resp),
+                Err(e) => {
+                    // Retry only transient dispatch failures, and only while
+                    // retry is enabled. A non-retryable error (bad request,
+                    // mid-body drop, stale-deadline cancel, …) surfaces as-is.
+                    if !ctx.config.retry.enabled || !e.is_retryable_upstream() {
+                        break Err(e);
+                    }
+                    // At most one retry: if the single re-dispatch we allowed
+                    // also failed, surface it and record the un-recovered tail.
+                    if retried {
+                        ctx.metrics.record_retries_exhausted(&metrics_model);
+                        break Err(e);
+                    }
+                    // Fail over to a DIFFERENT worker (exclude the one we just
+                    // tried). With only one retry, excluding the current worker
+                    // by URL is enough.
+                    let remaining: Vec<Arc<Worker>> = workers
+                        .iter()
+                        .filter(|w| w.url != worker.url)
+                        .cloned()
+                        .collect();
+                    if remaining.is_empty() {
+                        // No other worker to fail over to.
+                        ctx.metrics.record_retries_exhausted(&metrics_model);
+                        break Err(e);
+                    }
+                    // Load gate: claim a slot on a different worker ONLY if one
+                    // is below its in-flight cap — never onto a full worker, and
+                    // never by waiting for a slot. `try_acquire` returns `None`
+                    // when the whole remaining fleet is saturated; in that case
+                    // (and when the policy declines) we skip the retry and
+                    // surface the ORIGINAL upstream error — the request did
+                    // reach a worker — not an admission error.
+                    match ctx.admission.try_acquire(
+                        &remaining,
+                        policy.as_ref(),
+                        &selection_ctx,
+                        &model_str,
+                    ) {
+                        Ok(Some((next_worker, next_guard))) => {
+                            retried = true;
+                            ctx.metrics.record_retry(&metrics_model);
+                            tracing::info!(
+                                model = %model_str,
+                                from = %worker.url,
+                                to = %next_worker.url,
+                                error = %e,
+                                "retry: re-dispatching to a different not-full worker after transient dispatch failure",
+                            );
+                            // Update the per-attempt state: metrics labels (so
+                            // the access log reflects the final worker), a fresh
+                            // active-load registration + its stale token.
+                            // `guard`/`active_guard` were consumed by the attempt
+                            // above; reassign them for the retry pass.
+                            metrics_worker_url = next_worker.url.clone();
+                            metrics_mode = mode_label(next_worker.mode());
+                            active_guard = ctx.active_load.register(
+                                next_worker.id.clone(),
+                                next_worker.url.clone(),
+                                prefill_load,
+                                0,
+                            );
+                            stale_token = active_guard.cancel_token().clone();
+                            guard = next_guard;
+                            worker = next_worker;
+                            continue;
+                        }
+                        Ok(None) | Err(_) => {
+                            // Every other worker is at capacity, or the policy
+                            // declined: don't retry.
+                            ctx.metrics.record_retries_exhausted(&metrics_model);
+                            break Err(e);
+                        }
+                    }
                 }
             }
         }
-        r
     };
 
     // Diagnostic: phase breakdown up to response headers, for ADMITTED requests
@@ -878,6 +999,17 @@ async fn chat_completions_inner(
     // and logs it with the worker/model it was dispatched to.
     response.extensions_mut().insert(log_ctx);
     Ok(response)
+}
+
+/// Map a worker's [`WorkerMode`] to the metrics [`WorkerModeLabel`]. Used at
+/// the initial dispatch and again after a plain-mode retry reselects a worker,
+/// so both sites agree on the mapping.
+fn mode_label(mode: WorkerMode) -> WorkerModeLabel {
+    match mode {
+        WorkerMode::Prefill => WorkerModeLabel::Prefill,
+        WorkerMode::Decode => WorkerModeLabel::Decode,
+        WorkerMode::Plain => WorkerModeLabel::Plain,
+    }
 }
 
 /// Estimate prefill-token count from the raw request body for use as

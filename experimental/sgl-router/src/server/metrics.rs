@@ -37,6 +37,8 @@
 //! | `sgl_router_ingress_tokenize_errors_total` | Counter | `model_id` |
 //! | `sgl_router_backpressure_rejected_total` | Counter | `model_id` |
 //! | `sgl_router_engine_aborts_total` | Counter | `reason` |
+//! | `sgl_router_retries_total` | Counter | `model_id` |
+//! | `sgl_router_retries_exhausted_total` | Counter | `model_id` |
 //! | `sgl_router_queued_requests` | Gauge | (none) |
 //! | `sgl_router_admission_wait_seconds` | Histogram | `model_id` |
 //!
@@ -343,6 +345,14 @@ pub struct MetricsRegistry {
     /// variant without bumping the constant fails compilation on the array
     /// size).
     engine_aborts_total: [AtomicU64; ABORT_REASON_COUNT],
+    /// Plain-mode re-dispatch attempts (each retry onto a different worker after
+    /// a transient upstream failure), per model. One increment per retry
+    /// performed, so the count is (upstream attempts − requests that retried).
+    retries_total: Mutex<HashMap<String, Arc<AtomicU64>>>,
+    /// Requests whose retry budget was used up (or whose candidate pool ran
+    /// out) and still failed, per model — the tail the failover could not
+    /// recover.
+    retries_exhausted_total: Mutex<HashMap<String, Arc<AtomicU64>>>,
     /// Current admission wait-queue depth (parked requests). A single
     /// router-wide gauge — the queue is shared across the router, so this is a
     /// global count, not per-model.
@@ -377,6 +387,8 @@ impl Default for MetricsRegistry {
             ingress_tokenize_errors_total: Default::default(),
             backpressure_rejected_total: Default::default(),
             engine_aborts_total: std::array::from_fn(|_| AtomicU64::new(0)),
+            retries_total: Default::default(),
+            retries_exhausted_total: Default::default(),
             queued_requests: Default::default(),
             admission_wait_seconds: Default::default(),
         }
@@ -762,6 +774,30 @@ impl MetricsRegistry {
         // consumers observe engine aborts through the `/metrics` scrape,
         // not through this method.
         self.engine_aborts_total[reason.as_index()].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Bump `sgl_router_retries_total{model_id}` — one plain-mode request was
+    /// re-dispatched to a different worker after a transient upstream failure.
+    pub fn record_retry(&self, model_id: &str) {
+        let mut guard = self.retries_total.lock();
+        let counter = guard
+            .entry(model_id.to_owned())
+            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+            .clone();
+        drop(guard);
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Bump `sgl_router_retries_exhausted_total{model_id}` — a request exhausted
+    /// its retry budget (or ran out of untried workers) and still failed.
+    pub fn record_retries_exhausted(&self, model_id: &str) {
+        let mut guard = self.retries_exhausted_total.lock();
+        let counter = guard
+            .entry(model_id.to_owned())
+            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+            .clone();
+        drop(guard);
+        counter.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Adjust `sgl_router_queued_requests` by `delta` (+1 when a request parks,
@@ -1182,6 +1218,46 @@ impl MetricsRegistry {
                 reason, value,
             ));
         }
+
+        // retries_total
+        out.push_str(
+            "# HELP sgl_router_retries_total Plain-mode requests re-dispatched to a different worker after a transient upstream failure.\n",
+        );
+        out.push_str("# TYPE sgl_router_retries_total counter\n");
+        let guard = self.retries_total.lock();
+        let mut entries: Vec<(&String, u64)> = guard
+            .iter()
+            .map(|(k, v)| (k, v.load(Ordering::Relaxed)))
+            .collect();
+        entries.sort_by(|a, b| a.0.cmp(b.0));
+        for (model_id, value) in entries {
+            out.push_str(&format!(
+                "sgl_router_retries_total{{model_id=\"{}\"}} {}\n",
+                escape_label(model_id),
+                value,
+            ));
+        }
+        drop(guard);
+
+        // retries_exhausted_total
+        out.push_str(
+            "# HELP sgl_router_retries_exhausted_total Requests that used up their retry budget (or ran out of untried workers) and still failed.\n",
+        );
+        out.push_str("# TYPE sgl_router_retries_exhausted_total counter\n");
+        let guard = self.retries_exhausted_total.lock();
+        let mut entries: Vec<(&String, u64)> = guard
+            .iter()
+            .map(|(k, v)| (k, v.load(Ordering::Relaxed)))
+            .collect();
+        entries.sort_by(|a, b| a.0.cmp(b.0));
+        for (model_id, value) in entries {
+            out.push_str(&format!(
+                "sgl_router_retries_exhausted_total{{model_id=\"{}\"}} {}\n",
+                escape_label(model_id),
+                value,
+            ));
+        }
+        drop(guard);
 
         // queued_requests (router-wide gauge, no labels)
         out.push_str(
@@ -1722,6 +1798,28 @@ mod tests {
         assert!(out.contains(r#"sgl_router_sticky_total{outcome="assigned"} 1"#));
         assert!(out.contains(r#"sgl_router_sticky_total{outcome="remap"} 1"#));
         assert!(out.contains(r#"sgl_router_sticky_total{outcome="no_routing_key"} 1"#));
+    }
+
+    #[test]
+    fn retry_counters_increment_per_model() {
+        let reg = MetricsRegistry::new();
+        reg.record_retry("tiny");
+        reg.record_retry("tiny");
+        reg.record_retry("other");
+        reg.record_retries_exhausted("tiny");
+        let out = reg.render();
+        assert!(
+            out.contains(r#"sgl_router_retries_total{model_id="tiny"} 2"#),
+            "{out}"
+        );
+        assert!(
+            out.contains(r#"sgl_router_retries_total{model_id="other"} 1"#),
+            "{out}"
+        );
+        assert!(
+            out.contains(r#"sgl_router_retries_exhausted_total{model_id="tiny"} 1"#),
+            "{out}"
+        );
     }
 
     #[test]
