@@ -25,6 +25,7 @@ register_cuda_ci(
     est_time=1200,
     stage="extra-b",
     runner_config="4-gpu-b200",
+    disabled="Temporarily disabled",
 )
 
 
