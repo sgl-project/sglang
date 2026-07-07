@@ -19,6 +19,7 @@ import torch
 import torch.nn.functional as F
 
 from sglang.jit_kernel.dsv4.online_c128_mtp import OnlineC128MTPController
+from sglang.jit_kernel.dsv4.compress import CompressorPrefillPlan
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.dsv4.compressor_v2 import (
@@ -121,6 +122,21 @@ def _create_flashmla_metadata():
 
 def _create_dummy_paged_compress_data(compress_ratio: int):
     return None
+
+
+def _create_dummy_prefill_compress_data(
+    compress_ratio: Literal[4, 128],
+    num_q_tokens: int,
+    device: torch.device,
+    *,
+    online: bool = False,
+):
+    plan_w_width = 16 if online else 8
+    return CompressorPrefillPlan(
+        compress_ratio,
+        torch.zeros((num_q_tokens, 16), dtype=torch.uint8, device=device),
+        torch.zeros((num_q_tokens, plan_w_width), dtype=torch.uint8, device=device),
+    )
 
 
 def _copy_or_replace(dst, src):
@@ -532,11 +548,15 @@ class DeepseekV4AttnBackend(
         if not self.online_c128_mtp.enabled():
             return None
 
-        # `verify_bs` is the number of real verify rows. DP padding can still
-        # execute fake rows on this rank, so the compressor plan must be built
-        # from the padded tensors passed here rather than slicing to verify_bs.
-        _ = verify_bs
         num_draft_tokens = self.speculative_num_draft_tokens
+        if verify_bs == 0:
+            return _create_dummy_prefill_compress_data(
+                128,
+                int(num_draft_tokens) * int(req_pool_indices.shape[0]),
+                req_pool_indices.device,
+                online=True,
+            )
+
         seq_lens_cpu = [int(x) + num_draft_tokens for x in seq_lens_cpu]
         extend_lens_cpu = [num_draft_tokens] * len(seq_lens_cpu)
         return create_paged_compressor_data(
@@ -758,6 +778,7 @@ class DeepseekV4AttnBackend(
                 seq_lens_cpu=seq_lens_cpu,
                 out_cache_loc=out_cache_loc,
                 num_draft_tokens=num_draft_tokens,
+                verify_bs=verify_bs,
                 use_prefill_cuda_graph=use_prefill_cuda_graph,
                 online_c128_state_slot_offset=online_c128_state_slot_offset,
             )
@@ -770,6 +791,7 @@ class DeepseekV4AttnBackend(
         seq_lens_cpu: Optional[List[int]] = None,
         out_cache_loc: Optional[torch.Tensor] = None,
         num_draft_tokens: Optional[int] = None,
+        verify_bs: Optional[int] = None,
         use_prefill_cuda_graph: bool = False,
         online_c128_state_slot_offset: int = 0,
     ) -> DSV4Metadata:
@@ -788,6 +810,34 @@ class DeepseekV4AttnBackend(
         num_tokens = num_draft_tokens * batch_size
         if out_cache_loc is None:
             out_cache_loc = seq_lens.new_zeros(num_tokens)
+        if verify_bs == 0 and not is_dspark_draft_worker:
+            metadata = self.init_forward_metadata_prefill(
+                max_seq_len=max_seq_len,
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                seq_lens_cpu=seq_lens_cpu,
+                out_cache_loc=out_cache_loc,
+                num_tokens=num_tokens,
+                extend_seq_lens=extend_seq_lens,
+                extend_seq_lens_cpu=extend_seq_lens_cpu,
+                extend_start_loc=None,
+                need_compress=False,
+                use_prefill_cuda_graph=use_prefill_cuda_graph,
+                online_c128_state_slot_offset=online_c128_state_slot_offset,
+            )
+            return DSV4Metadata(
+                metadata.core_attn_metadata,
+                metadata.indexer_metadata,
+                c4_compress_metadata=_create_dummy_prefill_compress_data(
+                    4, num_tokens, req_pool_indices.device
+                ),
+                c128_compress_metadata=_create_dummy_prefill_compress_data(
+                    128,
+                    num_tokens,
+                    req_pool_indices.device,
+                    online=envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get(),
+                ),
+            )
         return self.init_forward_metadata_prefill(
             max_seq_len=max_seq_len,
             req_pool_indices=req_pool_indices,
@@ -842,6 +892,24 @@ class DeepseekV4AttnBackend(
         )
         if not need_compress:
             return DSV4Metadata(core_attn_metadata, indexer_metadata)
+        if raw_metadata.verify_bs == 0:
+            num_q_tokens = int(num_draft_tokens) * int(bs)
+            return DSV4Metadata(
+                core_attn_metadata,
+                indexer_metadata,
+                c4_compress_metadata=_create_dummy_prefill_compress_data(
+                    4, num_q_tokens, req_pool_indices.device
+                ),
+                c128_compress_metadata=(
+                    raw_metadata.c128_compress_metadata
+                    or _create_dummy_prefill_compress_data(
+                        128,
+                        num_q_tokens,
+                        req_pool_indices.device,
+                        online=envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get(),
+                    )
+                ),
+            )
         use_graph_plan = raw_metadata.use_prefill_cuda_graph
         if use_graph_plan:
             seq_lens_cpu = None

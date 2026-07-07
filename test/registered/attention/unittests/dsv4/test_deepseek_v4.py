@@ -515,11 +515,8 @@ class TestDSV4RawVerifyMetadata(CustomTestCase):
         backend.req_to_token = torch.zeros((4, 16), dtype=torch.int32)
         backend.online_c128_mtp = SimpleNamespace(enabled=lambda: True)
 
-        captured = {}
-
-        def fake_create_paged_compressor_data(**kwargs):
-            captured.update(kwargs)
-            return SimpleNamespace(name="metadata")
+        def fake_create_paged_compressor_data(**_kwargs):
+            raise AssertionError("empty verify rank must not call real planner")
 
         with patch.object(
             backend_mod,
@@ -536,10 +533,9 @@ class TestDSV4RawVerifyMetadata(CustomTestCase):
                 verify_bs=0,
             )
 
-        self.assertEqual(ret.name, "metadata")
-        self.assertEqual(captured["req_pool_indices"].tolist(), [0, 1])
-        self.assertEqual(captured["seq_lens"].tolist(), [12, 22])
-        self.assertEqual(captured["seq_lens_cpu"], [12, 22])
+        self.assertEqual(ret.compress_ratio, 128)
+        self.assertEqual(tuple(ret.plan_c.shape), (4, 16))
+        self.assertEqual(tuple(ret.plan_w.shape), (4, 16))
 
     def test_raw_verify_metadata_plans_padded_empty_dp_rank(self):
         from sglang.srt.layers.attention import deepseek_v4_backend as backend_mod
@@ -589,11 +585,12 @@ class TestDSV4RawVerifyMetadata(CustomTestCase):
         ):
             metadata = backend.make_forward_metadata_from_raw_verify(raw)
 
-        self.assertEqual(len(calls), 2)
-        self.assertEqual(calls[0]["seq_lens_cpu"], [12])
-        self.assertEqual(calls[0]["extend_lens_cpu"], [2])
+        self.assertEqual(len(calls), 0)
         self.assertEqual(metadata.c4_compress_metadata.compress_ratio, 4)
         self.assertEqual(metadata.c128_compress_metadata.compress_ratio, 128)
+        self.assertEqual(tuple(metadata.c4_compress_metadata.plan_c.shape), (2, 16))
+        self.assertEqual(tuple(metadata.c4_compress_metadata.plan_w.shape), (2, 8))
+        self.assertEqual(tuple(metadata.c128_compress_metadata.plan_c.shape), (2, 16))
 
 
 class TestDSV4SwaOutCacheLocResolution(CustomTestCase):
