@@ -1425,5 +1425,60 @@ class TestTwoBatchOverlapBackend(CustomTestCase):
         args._check_two_batch_overlap()
 
 
+class TestLogLevelNormalization(unittest.TestCase):
+    """ServerArgs normalizes log levels so uppercase/alias values do not reach
+    uvicorn unnormalized (which would KeyError before the HTTP socket binds)."""
+
+    def test_uppercase_is_lowercased(self):
+        self.assertEqual(
+            ServerArgs(model_path="dummy", log_level="INFO").log_level, "info"
+        )
+        self.assertEqual(
+            ServerArgs(model_path="dummy", log_level="Debug").log_level, "debug"
+        )
+
+    def test_warn_alias_maps_to_warning(self):
+        self.assertEqual(
+            ServerArgs(model_path="dummy", log_level="WARN").log_level, "warning"
+        )
+        self.assertEqual(
+            ServerArgs(model_path="dummy", log_level="warn").log_level, "warning"
+        )
+
+    def test_fatal_alias_maps_to_critical(self):
+        self.assertEqual(
+            ServerArgs(model_path="dummy", log_level="FATAL").log_level, "critical"
+        )
+
+    def test_valid_lowercase_unchanged(self):
+        for level in ("critical", "error", "warning", "info", "debug"):
+            self.assertEqual(
+                ServerArgs(model_path="dummy", log_level=level).log_level, level
+            )
+
+    def test_log_level_http_is_normalized(self):
+        args = ServerArgs(model_path="dummy", log_level="info", log_level_http="WARN")
+        self.assertEqual(args.log_level_http, "warning")
+
+    def test_log_level_http_none_is_preserved(self):
+        # None means "reuse --log-level", so it must not be coerced to a string.
+        self.assertIsNone(
+            ServerArgs(model_path="dummy", log_level="info").log_level_http
+        )
+
+    def test_unknown_level_raises(self):
+        # A genuinely unknown level fails fast instead of silently hanging the
+        # HTTP server later inside uvicorn.
+        for bad in ("verbose", "notset", "bogus"):
+            with self.assertRaises(ValueError):
+                ServerArgs(model_path="dummy", log_level=bad)
+
+    def test_trace_is_rejected(self):
+        # 'trace' is uvicorn-only; stdlib logging and granian have no TRACE, so it
+        # is not in the accepted intersection and must be rejected, not blessed.
+        with self.assertRaises(ValueError):
+            ServerArgs(model_path="dummy", log_level="trace")
+
+
 if __name__ == "__main__":
     unittest.main()

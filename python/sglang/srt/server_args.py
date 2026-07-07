@@ -2630,6 +2630,33 @@ class ServerArgs:
         "The path of the JSON configuration file for msProbe. If specified, enables msProbe dump.",
     ] = None
 
+    # Levels every consumer accepts (stdlib logging, uvicorn, granian); their
+    # intersection, so uvicorn-only "trace" is excluded. Aliases cover names
+    # stdlib logging accepts but uvicorn/granian do not.
+    _VALID_LOG_LEVELS = ("critical", "error", "warning", "info", "debug")
+    _LOG_LEVEL_ALIASES = {"warn": "warning", "fatal": "critical"}
+
+    @classmethod
+    def _normalize_log_level(cls, level: Optional[str]) -> Optional[str]:
+        """Lowercase and alias-map a log level, rejecting unknown values.
+
+        Uppercase/alias values (e.g. WARN) otherwise reach uvicorn unnormalized
+        and raise KeyError before the HTTP socket binds.
+        """
+        if level is None:
+            return None
+        normalized = cls._LOG_LEVEL_ALIASES.get(level.lower(), level.lower())
+        if normalized not in cls._VALID_LOG_LEVELS:
+            raise ValueError(
+                f"Unsupported log level {level!r}. "
+                f"Valid levels are {', '.join(cls._VALID_LOG_LEVELS)}."
+            )
+        return normalized
+
+    def _handle_log_level_normalization(self):
+        self.log_level = self._normalize_log_level(self.log_level)
+        self.log_level_http = self._normalize_log_level(self.log_level_http)
+
     def __post_init__(self):
         """
         Orchestrates the handling of various server arguments, ensuring proper configuration and validation.
@@ -2659,6 +2686,9 @@ class ServerArgs:
         # direct handler invocations can rely on it even when
         # _handle_model_specific_adjustments never runs.
         self._resolved_overrides = []
+
+        # Normalize log levels before any consumer reads them.
+        self._handle_log_level_normalization()
 
         if self.model_path.lower() in ["none", "dummy"]:
             return
