@@ -13,12 +13,7 @@ from sglang.test.kits.spec_server_kits import SpecParityKit
 from sglang.test.server_fixtures.spec_eagle_fixture import Eagle3Base
 
 register_cuda_ci(est_time=360, stage="base-b", runner_config="1-gpu-large")
-register_xpu_ci(
-    est_time=360,
-    stage="stage-b",
-    runner_config="1-gpu-xpu",
-    disabled="EAGLE3 numerical parity mismatches on XPU",
-)
+register_xpu_ci(est_time=360, stage="stage-b", runner_config="1-gpu-xpu")
 
 _is_xpu = is_xpu()
 
