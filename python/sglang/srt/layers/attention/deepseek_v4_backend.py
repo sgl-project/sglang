@@ -408,6 +408,7 @@ class DSV4RawVerifyMetadata:
     out_cache_loc: torch.Tensor
 
     num_draft_tokens: int
+    verify_bs: Optional[int] = None
     extend_seq_lens: Optional[torch.Tensor] = None
     seq_lens_cpu: Optional[List[int]] = None
     c128_compress_metadata: Optional[FusedCompressMetadata] = None
@@ -419,6 +420,7 @@ class DSV4RawVerifyMetadata:
         self.out_cache_loc.copy_(other.out_cache_loc)
 
         self.num_draft_tokens = other.num_draft_tokens
+        self.verify_bs = other.verify_bs
         self.extend_seq_lens = other.extend_seq_lens
         self.seq_lens_cpu = other.seq_lens_cpu
         self.c128_compress_metadata = _copy_or_replace(
@@ -525,11 +527,18 @@ class DeepseekV4AttnBackend(
         extend_seq_lens: torch.Tensor,
         use_prefill_cuda_graph: bool,
         online_c128_state_slot_offset: int,
+        verify_bs: Optional[int] = None,
     ) -> Optional[FusedCompressMetadata]:
         if not self.online_c128_mtp.enabled():
             return None
 
         num_draft_tokens = self.speculative_num_draft_tokens
+        if verify_bs is not None:
+            verify_bs = int(verify_bs)
+            req_pool_indices = req_pool_indices[:verify_bs]
+            seq_lens = seq_lens[:verify_bs]
+            seq_lens_cpu = seq_lens_cpu[:verify_bs]
+            extend_seq_lens = extend_seq_lens[:verify_bs]
         seq_lens_cpu = [int(x) + num_draft_tokens for x in seq_lens_cpu]
         extend_lens_cpu = [num_draft_tokens] * len(seq_lens_cpu)
         return create_paged_compressor_data(
@@ -694,6 +703,7 @@ class DeepseekV4AttnBackend(
         seq_lens_cpu: Optional[torch.Tensor] = None,
         out_cache_loc: Optional[torch.Tensor] = None,
         num_draft_tokens: Optional[int] = None,
+        verify_bs: Optional[int] = None,
         use_prefill_cuda_graph: bool = False,
         online_c128_state_slot_offset: int = 0,
     ) -> Union[DSV4Metadata, DSV4RawVerifyMetadata]:
@@ -723,6 +733,7 @@ class DeepseekV4AttnBackend(
                 seq_lens=seq_lens,
                 out_cache_loc=out_cache_loc,
                 num_draft_tokens=num_draft_tokens,
+                verify_bs=verify_bs,
                 extend_seq_lens=extend_seq_lens,
                 seq_lens_cpu=seq_lens_cpu_list,
                 use_prefill_cuda_graph=use_prefill_cuda_graph,
@@ -736,6 +747,7 @@ class DeepseekV4AttnBackend(
                         extend_seq_lens,
                         use_prefill_cuda_graph,
                         online_c128_state_slot_offset,
+                        verify_bs=verify_bs,
                     )
                 ),
             )
@@ -802,10 +814,18 @@ class DeepseekV4AttnBackend(
         seq_lens = raw_metadata.seq_lens
         out_cache_loc = raw_metadata.out_cache_loc
 
-        bs = len(seq_lens)
+        bs = (
+            int(raw_metadata.verify_bs)
+            if raw_metadata.verify_bs is not None
+            else len(seq_lens)
+        )
+        req_pool_indices = req_pool_indices[:bs]
+        seq_lens = seq_lens[:bs]
         extend_seq_lens = raw_metadata.extend_seq_lens
         assert extend_seq_lens is not None
+        extend_seq_lens = extend_seq_lens[:bs]
         num_draft_tokens = int(raw_metadata.num_draft_tokens)
+        out_cache_loc = out_cache_loc[: bs * num_draft_tokens]
         seq_lens = seq_lens + num_draft_tokens
 
         seq_lens_casual, req_pool_indices_repeated = (
@@ -840,7 +860,7 @@ class DeepseekV4AttnBackend(
         else:
             assert raw_metadata.seq_lens_cpu is not None
             seq_lens_cpu = [
-                int(x) + num_draft_tokens for x in raw_metadata.seq_lens_cpu
+                int(x) + num_draft_tokens for x in raw_metadata.seq_lens_cpu[:bs]
             ]
             extend_lens_cpu = [num_draft_tokens] * bs
             num_q_tokens = None
@@ -1204,6 +1224,7 @@ class DeepseekV4AttnBackend(
                 seq_lens_cpu=seq_lens_cpu,
                 out_cache_loc=forward_batch.out_cache_loc,
                 num_draft_tokens=spec_num_draft_tokens,
+                verify_bs=verify_bs,
                 use_prefill_cuda_graph=use_prefill_cuda_graph,
                 online_c128_state_slot_offset=online_c128_state_slot_offset,
             )

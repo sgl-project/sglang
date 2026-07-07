@@ -17,6 +17,7 @@ import sys
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -436,7 +437,7 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
 
 
 class TestDSV4RawVerifyMetadata(CustomTestCase):
-    def test_copy_preserves_prefill_cuda_graph_flag(self):
+    def test_copy_preserves_verify_bs_and_prefill_cuda_graph_flag(self):
         from sglang.srt.layers.attention.deepseek_v4_backend import (
             DSV4RawVerifyMetadata,
         )
@@ -446,6 +447,7 @@ class TestDSV4RawVerifyMetadata(CustomTestCase):
             seq_lens=torch.tensor([4], dtype=torch.int32),
             out_cache_loc=torch.tensor([1, 2], dtype=torch.int32),
             num_draft_tokens=2,
+            verify_bs=1,
             use_prefill_cuda_graph=False,
         )
         src = DSV4RawVerifyMetadata(
@@ -453,12 +455,53 @@ class TestDSV4RawVerifyMetadata(CustomTestCase):
             seq_lens=torch.tensor([8], dtype=torch.int32),
             out_cache_loc=torch.tensor([3, 4], dtype=torch.int32),
             num_draft_tokens=2,
+            verify_bs=3,
             use_prefill_cuda_graph=True,
         )
 
         dst.copy_(src)
 
+        self.assertEqual(dst.verify_bs, 3)
         self.assertTrue(dst.use_prefill_cuda_graph)
+
+    def test_online_c128_verify_metadata_slices_dp_padding_rows(self):
+        from sglang.srt.layers.attention import deepseek_v4_backend as backend_mod
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            DeepseekV4AttnBackend,
+        )
+
+        backend = object.__new__(DeepseekV4AttnBackend)
+        backend.speculative_num_draft_tokens = 2
+        backend.token_to_kv_pool = SimpleNamespace(name="pool")
+        backend.req_to_token = torch.zeros((4, 16), dtype=torch.int32)
+        backend.online_c128_mtp = SimpleNamespace(enabled=lambda: True)
+        captured = {}
+
+        def fake_create_paged_compressor_data(**kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(name="metadata")
+
+        with patch.object(
+            backend_mod,
+            "create_paged_compressor_data",
+            side_effect=fake_create_paged_compressor_data,
+        ):
+            ret = backend._make_target_verify_c128_metadata(
+                req_pool_indices=torch.tensor([0, 1, 2], dtype=torch.int64),
+                seq_lens=torch.tensor([10, 20, 30], dtype=torch.int32),
+                seq_lens_cpu=[10, 20, 30],
+                extend_seq_lens=torch.tensor([2, 2, 2], dtype=torch.int32),
+                use_prefill_cuda_graph=False,
+                online_c128_state_slot_offset=7,
+                verify_bs=2,
+            )
+
+        self.assertEqual(ret.name, "metadata")
+        self.assertEqual(captured["req_pool_indices"].tolist(), [0, 1])
+        self.assertEqual(captured["seq_lens"].tolist(), [12, 22])
+        self.assertEqual(captured["seq_lens_cpu"], [12, 22])
+        self.assertEqual(captured["extend_lens"].tolist(), [2, 2])
+        self.assertEqual(captured["extend_lens_cpu"], [2, 2])
 
 
 class TestDSV4SwaOutCacheLocResolution(CustomTestCase):
