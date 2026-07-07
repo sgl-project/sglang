@@ -223,6 +223,12 @@ class TestDSparkPrefillHandoff(CustomTestCase):
         worker._prefill_transfer_warmup_rounds = prefill_transfer_warmup_rounds
         return worker
 
+    def _accept_worker(self, *, use_confidence_gate=False, threshold=0.5):
+        worker = self._worker(0)
+        worker._use_confidence_gate = use_confidence_gate
+        worker.confidence_threshold = threshold
+        return worker
+
     def _make_prefill_input(self, rounds):
         t = self.torch
         worker = self._worker(rounds)
@@ -344,6 +350,95 @@ class TestDSparkPrefillHandoff(CustomTestCase):
         self.assertEqual(draft_input.bonus_tokens.tolist(), [301, 302])
         self.assertEqual(draft_input.new_seq_lens.tolist(), [3681, 9])
         self.assertEqual(draft_input.transfer_warmup_rounds.tolist(), [1, 0])
+
+    def test_accept_bonus_uses_longest_contiguous_draft_match(self):
+        t = self.torch
+        candidates = t.tensor(
+            [
+                [10, 20, 30, 40],
+                [11, 21, 31, 41],
+            ],
+            dtype=t.int64,
+        )
+        target_predict = t.tensor(
+            [
+                [20, 30, 99, 77],
+                [21, 99, 31, 88],
+            ],
+            dtype=t.int64,
+        )
+        confidence = t.zeros((2, 3), dtype=t.float32)
+
+        commit_lens, bonus_tokens, out_tokens = (
+            self.worker_cls._compute_accept_bonus_eager(
+                self._accept_worker(),
+                candidates=candidates,
+                target_predict=target_predict,
+                confidence=confidence,
+            )
+        )
+
+        self.assertEqual(commit_lens.tolist(), [3, 2])
+        self.assertEqual(bonus_tokens.tolist(), [99, 99])
+        self.assertEqual(out_tokens.tolist(), [[20, 30, 99, 0], [21, 99, 31, 0]])
+        if os.getenv("SGLANG_DSPARK_TEST_VERBOSE", "0") == "1":
+            print(
+                "DSpark accept parity debug: "
+                + json.dumps(
+                    {
+                        "case": "longest_contiguous_match",
+                        "candidates": candidates.tolist(),
+                        "target_predict": target_predict.tolist(),
+                        "commit_lens": commit_lens.tolist(),
+                        "bonus_tokens": bonus_tokens.tolist(),
+                        "out_tokens": out_tokens.tolist(),
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+
+    def test_accept_bonus_confidence_gate_truncates_match_prefix(self):
+        t = self.torch
+        candidates = t.tensor([[10, 20, 30, 40]], dtype=t.int64)
+        target_predict = t.tensor([[20, 30, 40, 99]], dtype=t.int64)
+        confidence = t.tensor([[10.0, -10.0, 10.0]], dtype=t.float32)
+
+        commit_lens, bonus_tokens, out_tokens = (
+            self.worker_cls._compute_accept_bonus_eager(
+                self._accept_worker(use_confidence_gate=True, threshold=0.5),
+                candidates=candidates,
+                target_predict=target_predict,
+                confidence=confidence,
+            )
+        )
+
+        self.assertEqual(commit_lens.tolist(), [2])
+        self.assertEqual(bonus_tokens.tolist(), [30])
+        self.assertEqual(out_tokens.tolist(), [[20, 30, 40, 0]])
+
+    def test_accept_bonus_rejects_mismatched_shapes(self):
+        t = self.torch
+        worker = self._accept_worker()
+        candidates = t.tensor([[10, 20, 30]], dtype=t.int64)
+        target_predict = t.tensor([[20, 30]], dtype=t.int64)
+        confidence = t.zeros((1, 2), dtype=t.float32)
+
+        with self.assertRaisesRegex(ValueError, "target_predict must match"):
+            self.worker_cls._compute_accept_bonus_eager(
+                worker,
+                candidates=candidates,
+                target_predict=target_predict,
+                confidence=confidence,
+            )
+
+        with self.assertRaisesRegex(ValueError, "confidence must have"):
+            self.worker_cls._compute_accept_bonus_eager(
+                worker,
+                candidates=candidates,
+                target_predict=candidates,
+                confidence=t.zeros((1, 1), dtype=t.float32),
+            )
 
 
 class TestDSparkDeepSpecSemanticReference(CustomTestCase):
