@@ -16,8 +16,6 @@ register_cuda_ci(
     runner_config="1-gpu-small",
 )
 
-_SM120_SUPPORTED = is_sm120_supported()
-
 
 def _make_inputs(m: int, n: int, k: int, device: str = "cuda"):
     fp8_info = torch.finfo(torch.float8_e4m3fn)
@@ -97,7 +95,7 @@ def benchmark(m, n, k, provider):
 
 
 if __name__ == "__main__":
-    if not _SM120_SUPPORTED:
+    if not is_sm120_supported():
         print(
             "[skip] fp8_blockwise_scaled_mm benchmark requires SM120 with CUDA 12.8+."
         )
