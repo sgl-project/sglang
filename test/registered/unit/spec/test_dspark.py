@@ -246,7 +246,7 @@ class TestDSparkPrefillHandoff(CustomTestCase):
         self.assertEqual(draft_input.transfer_warmup_rounds.tolist(), [2, 2])
 
         recovered = self.worker_cls._get_transfer_warmup_rounds(
-            self._worker(rounds=0),
+            self._worker(0),
             draft_input,
             bs=2,
             device=self.torch.device("cpu"),
@@ -259,7 +259,7 @@ class TestDSparkPrefillHandoff(CustomTestCase):
             [1], dtype=self.torch.int32
         )
         recovered = self.worker_cls._get_transfer_warmup_rounds(
-            self._worker(rounds=0),
+            self._worker(0),
             draft_input,
             bs=2,
             device=self.torch.device("cpu"),
