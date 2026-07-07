@@ -1297,6 +1297,308 @@ class TestDSparkRuntimeDebugEvidence(CustomTestCase):
         )
         self.assertTrue(t.equal(call["main_hidden"], expected_hidden))
 
+    def test_kv_materialization_per_layer_projects_and_casts_locs_and_positions(self):
+        import contextlib
+
+        t = self.torch
+        worker = self._worker()
+        calls = []
+
+        class _DraftModel:
+            def project_main_hidden(self, hidden):
+                calls.append(("project", hidden.clone()))
+                return hidden + 1.0
+
+        class _Attn:
+            def __init__(self, layer_id):
+                self.layer_id = layer_id
+
+            def kv_from_hidden(self, ctx_x, positions, cache_loc, attn_backend):
+                calls.append(
+                    (
+                        "kv",
+                        self.layer_id,
+                        ctx_x.clone(),
+                        positions.clone(),
+                        cache_loc.clone(),
+                        positions.dtype,
+                        cache_loc.dtype,
+                        attn_backend.name,
+                    )
+                )
+
+        worker.draft_model = _DraftModel()
+        worker.draft_model_runner = SimpleNamespace(
+            tp_group="tp0",
+            attn_backend=SimpleNamespace(name="attn_backend"),
+        )
+        worker.draft_tp_context = lambda tp_group: contextlib.nullcontext(tp_group)
+        worker._stacked_wqkv_fp8_proj = None
+        worker._draft_inner = SimpleNamespace(
+            layers=[
+                SimpleNamespace(self_attn=_Attn(layer_id=10)),
+                SimpleNamespace(self_attn=_Attn(layer_id=11)),
+            ]
+        )
+        hidden = t.arange(6, dtype=t.float32).view(2, 3)
+
+        self.worker_cls._materialize_main_hidden_to_draft_kv(
+            worker,
+            main_hidden=hidden,
+            cache_loc=t.tensor([3, 4], dtype=t.int32),
+            positions=t.tensor([100, 101], dtype=t.int32),
+            projected=False,
+        )
+
+        self.assertEqual(worker._last_context_kv_path_debug, "per_layer_kv_from_hidden")
+        self.assertEqual(calls[0][0], "project")
+        kv_calls = [call for call in calls if call[0] == "kv"]
+        self.assertEqual([call[1] for call in kv_calls], [10, 11])
+        self.assertTrue(t.equal(kv_calls[0][2], hidden + 1.0))
+        self.assertEqual(kv_calls[0][3].dtype, t.int64)
+        self.assertEqual(kv_calls[0][4].dtype, t.int64)
+        self.assertEqual(kv_calls[0][5], t.int64)
+        self.assertEqual(kv_calls[0][6], t.int64)
+        self.assertEqual(kv_calls[0][7], "attn_backend")
+
+    def test_kv_materialization_projected_hidden_skips_projection(self):
+        import contextlib
+
+        t = self.torch
+        worker = self._worker()
+        calls = []
+
+        class _DraftModel:
+            def project_main_hidden(self, _hidden):
+                raise AssertionError("project_main_hidden should not be called")
+
+        class _Attn:
+            layer_id = 0
+
+            def kv_from_hidden(self, ctx_x, positions, cache_loc, _attn_backend):
+                calls.append((ctx_x.clone(), positions.clone(), cache_loc.clone()))
+
+        worker.draft_model = _DraftModel()
+        worker.draft_model_runner = SimpleNamespace(
+            tp_group=None,
+            attn_backend=SimpleNamespace(),
+        )
+        worker.draft_tp_context = lambda tp_group: contextlib.nullcontext()
+        worker._stacked_wqkv_fp8_proj = None
+        worker._draft_inner = SimpleNamespace(
+            layers=[SimpleNamespace(self_attn=_Attn())]
+        )
+        projected_hidden = t.full((2, 3), 7.0)
+
+        self.worker_cls._materialize_main_hidden_to_draft_kv(
+            worker,
+            main_hidden=projected_hidden,
+            cache_loc=t.tensor([5, 6], dtype=t.int64),
+            positions=t.tensor([9, 10], dtype=t.int64),
+            projected=True,
+        )
+
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(t.equal(calls[0][0], projected_hidden))
+
+    def test_stacked_fp8_kv_materialization_splits_and_writes_projected_kv(self):
+        import contextlib
+
+        t = self.torch
+        worker = self._worker()
+        calls = []
+
+        class _QuantMethod:
+            def apply(self, proj, ctx_x, bias):
+                calls.append(("stacked_apply", ctx_x.clone(), bias.clone()))
+                return ctx_x @ proj.weight + bias
+
+        class _DraftModel:
+            def project_main_hidden(self, hidden):
+                return hidden + 2.0
+
+        worker.draft_model = _DraftModel()
+        worker.draft_model_runner = SimpleNamespace(
+            tp_group=None,
+            attn_backend=SimpleNamespace(name="attn_backend"),
+        )
+        worker.draft_tp_context = lambda tp_group: contextlib.nullcontext()
+        proj = SimpleNamespace(
+            weight=t.arange(3 * 10, dtype=t.float32).view(3, 10) / 10.0,
+            bias=t.arange(10, dtype=t.float32),
+            quant_method=_QuantMethod(),
+        )
+        worker._stacked_wqkv_fp8_proj = proj
+        worker._stacked_wqkv_out_sizes = [4, 6]
+        worker._stacked_wqkv_kv_offsets = [(1, 4), (2, 6)]
+        worker._draft_inner = SimpleNamespace(
+            layers=[
+                SimpleNamespace(self_attn=SimpleNamespace(layer_id=0)),
+                SimpleNamespace(self_attn=SimpleNamespace(layer_id=1)),
+            ]
+        )
+
+        def record_projected_kv(**kwargs):
+            calls.append(
+                (
+                    "write",
+                    kwargs["attn"].layer_id,
+                    kwargs["kv"].clone(),
+                    kwargs["positions"].clone(),
+                    kwargs["cache_loc"].clone(),
+                    kwargs["attn_backend"].name,
+                )
+            )
+
+        worker._write_draft_kv_from_projected_kv = record_projected_kv
+        hidden = t.arange(6, dtype=t.float32).view(2, 3)
+        positions = t.tensor([10, 11], dtype=t.int64)
+        cache_loc = t.tensor([20, 21], dtype=t.int64)
+
+        self.worker_cls._materialize_main_hidden_to_draft_kv(
+            worker,
+            main_hidden=hidden,
+            cache_loc=cache_loc,
+            positions=positions,
+            projected=False,
+        )
+
+        self.assertEqual(worker._last_context_kv_path_debug, "stacked_fp8_wqkv")
+        self.assertEqual(calls[0][0], "stacked_apply")
+        stacked = (hidden + 2.0) @ proj.weight + proj.bias
+        first_layer, second_layer = t.split(stacked, [4, 6], dim=-1)
+        write_calls = [call for call in calls if call[0] == "write"]
+        self.assertEqual([call[1] for call in write_calls], [0, 1])
+        self.assertTrue(t.equal(write_calls[0][2], first_layer[:, 1:4]))
+        self.assertTrue(t.equal(write_calls[1][2], second_layer[:, 2:6]))
+        self.assertTrue(t.equal(write_calls[0][3], positions))
+        self.assertTrue(t.equal(write_calls[0][4], cache_loc))
+        self.assertEqual(write_calls[0][5], "attn_backend")
+
+    def test_write_projected_kv_translates_full_locs_and_passes_rope_metadata(self):
+        t = self.torch
+        worker = self._worker()
+        calls = []
+
+        class _TokenToKVPool:
+            def translate_loc_from_full_to_swa(self, cache_loc):
+                calls.append(("translate", cache_loc.clone()))
+                return cache_loc + 1000
+
+            def set_swa_key_buffer_radix_fused_norm_rope(self, **kwargs):
+                calls.append(("set_swa", kwargs))
+
+        token_to_kv_pool = _TokenToKVPool()
+        attn_backend = SimpleNamespace(token_to_kv_pool=token_to_kv_pool)
+        attn = SimpleNamespace(
+            layer_id=9,
+            kv_norm=SimpleNamespace(weight=SimpleNamespace(data=t.tensor([1.0, 2.0]))),
+            eps=1e-6,
+            freqs_cis="freqs",
+        )
+        kv = t.arange(4, dtype=t.float32).view(2, 2)
+        positions = t.tensor([7, 8], dtype=t.int64)
+        cache_loc = t.tensor([3, 4], dtype=t.int64)
+
+        self.worker_cls._write_draft_kv_from_projected_kv(
+            worker,
+            attn=attn,
+            kv=kv,
+            positions=positions,
+            cache_loc=cache_loc,
+            attn_backend=attn_backend,
+        )
+
+        self.assertEqual(calls[0][0], "translate")
+        self.assertTrue(t.equal(calls[0][1], cache_loc))
+        self.assertEqual(calls[1][0], "set_swa")
+        payload = calls[1][1]
+        self.assertEqual(payload["layer_id"], 9)
+        self.assertEqual(payload["swa_loc"].dtype, t.int32)
+        self.assertEqual(payload["swa_loc"].tolist(), [1003, 1004])
+        self.assertTrue(t.equal(payload["kv"], kv))
+        self.assertTrue(t.equal(payload["kv_weight"], t.tensor([1.0, 2.0])))
+        self.assertEqual(payload["eps"], 1e-6)
+        self.assertEqual(payload["freqs_cis"], "freqs")
+        self.assertTrue(t.equal(payload["positions"], positions))
+
+    def test_materialization_empty_hidden_returns_without_backend_calls(self):
+        import contextlib
+
+        t = self.torch
+        worker = self._worker()
+        calls = []
+
+        class _DraftModel:
+            def project_main_hidden(self, hidden):
+                calls.append(("project", hidden.clone()))
+                return hidden
+
+        class _AttnBackend:
+            forward_metadata = {"old": True}
+
+            def init_forward_metadata(self, forward_batch):
+                calls.append(("init_metadata", forward_batch))
+
+            def forward_core_compressor(self, *args, **kwargs):
+                calls.append(("compressor", args, kwargs))
+
+        class _Attn:
+            layer_id = 0
+            compressor = "compressor"
+
+            def kv_from_hidden(self, *args, **kwargs):
+                calls.append(("kv", args, kwargs))
+
+        worker.draft_model = _DraftModel()
+        worker.draft_model_runner = SimpleNamespace(
+            tp_group=None,
+            attn_backend=_AttnBackend(),
+        )
+        worker.draft_tp_context = lambda tp_group: contextlib.nullcontext()
+        worker._stacked_wqkv_fp8_proj = None
+        worker._draft_inner = SimpleNamespace(
+            layers=[SimpleNamespace(self_attn=_Attn())]
+        )
+        empty_hidden = t.empty((0, 3))
+
+        self.worker_cls._materialize_main_hidden_to_draft_kv(
+            worker,
+            main_hidden=empty_hidden,
+            cache_loc=t.empty((0,), dtype=t.int64),
+            positions=t.empty((0,), dtype=t.int64),
+        )
+        self.worker_cls._materialize_main_hidden_to_draft_compressors(
+            worker,
+            main_hidden=empty_hidden,
+            draft_forward_batch=SimpleNamespace(name="batch"),
+        )
+        self.worker_cls._materialize_main_hidden_to_draft_compressors(
+            worker,
+            main_hidden=t.ones((1, 3)),
+            draft_forward_batch=None,
+        )
+
+        self.assertEqual(calls, [])
+
+    def test_materialization_raises_when_main_hidden_is_missing(self):
+        t = self.torch
+        worker = self._worker()
+
+        with self.assertRaisesRegex(RuntimeError, "missing target main_hidden"):
+            self.worker_cls._materialize_main_hidden_to_draft_kv(
+                worker,
+                main_hidden=None,
+                cache_loc=t.tensor([1], dtype=t.int64),
+                positions=t.tensor([2], dtype=t.int64),
+            )
+        with self.assertRaisesRegex(RuntimeError, "missing target main_hidden"):
+            self.worker_cls._materialize_main_hidden_to_draft_compressors(
+                worker,
+                main_hidden=None,
+                draft_forward_batch=SimpleNamespace(name="batch"),
+            )
+
     def test_markov_debug_payload_maps_candidate_indices_to_markov_steps(self):
         t = self.torch
         worker = self._worker()
