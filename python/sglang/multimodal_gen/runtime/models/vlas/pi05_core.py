@@ -12,11 +12,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from transformers.modeling_outputs import BaseModelOutputWithPooling
 from transformers.models.auto import CONFIG_MAPPING
-from transformers.models.gemma.modeling_gemma import (
-    GemmaConfig,
-    GemmaMLP,
-    GemmaRotaryEmbedding,
-)
+from transformers.models.gemma.modeling_gemma import GemmaConfig
 from transformers.models.paligemma.modeling_paligemma import PaliGemmaModel
 
 from sglang.multimodal_gen.configs.pipeline_configs.pi05 import Pi05PipelineConfig
@@ -30,6 +26,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
 from sglang.multimodal_gen.runtime.layers.attention import LocalAttention, USPAttention
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.srt.layers.activation import GeluAndMul
 from sglang.srt.layers.rotary_embedding import (
     apply_rotary_pos_emb as native_apply_rotary_pos_emb,
 )
@@ -198,6 +195,95 @@ class PiGemmaRMSNorm(nn.Module):
         return normed.to(dtype), gate.to(dtype)
 
 
+class PiGemmaMLP(nn.Module):
+    def __init__(self, config: GemmaConfig):
+        super().__init__()
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = config.intermediate_size
+        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+        if config.hidden_act != "gelu_pytorch_tanh":
+            raise ValueError(f"Unsupported PiGemma activation: {config.hidden_act}")
+        self.act_fn = GeluAndMul(approximate="tanh")
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        gate_up = torch.cat([self.gate_proj(x), self.up_proj(x)], dim=-1)
+        return self.down_proj(self.act_fn(gate_up))
+
+
+class PiGemmaRotaryEmbedding(nn.Module):
+    def __init__(self, config: GemmaConfig):
+        super().__init__()
+        self.max_seq_len_cached = config.max_position_embeddings
+        self.head_dim = getattr(
+            config,
+            "head_dim",
+            config.hidden_size // config.num_attention_heads,
+        )
+        rope_parameters = config.rope_parameters
+        if rope_parameters["rope_type"] != "default":
+            raise ValueError(
+                f"Unsupported PiGemma rope type: {rope_parameters['rope_type']}"
+            )
+        self.rope_theta = rope_parameters["rope_theta"]
+        cos_cached, sin_cached = self._build_cache(
+            self.max_seq_len_cached,
+            device=None,
+        )
+        self.register_buffer("cos_cached", cos_cached, persistent=False)
+        self.register_buffer("sin_cached", sin_cached, persistent=False)
+
+    def _compute_inv_freq(self, device: torch.device | None) -> torch.Tensor:
+        return 1.0 / (
+            self.rope_theta
+            ** (
+                torch.arange(
+                    0,
+                    self.head_dim,
+                    2,
+                    dtype=torch.float,
+                    device=device,
+                )
+                / self.head_dim
+            )
+        )
+
+    def _build_cache(
+        self,
+        seq_len: int,
+        *,
+        device: torch.device | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        inv_freq = self._compute_inv_freq(device=device)
+        positions = torch.arange(seq_len, dtype=torch.float, device=device)
+        freqs = torch.einsum("i,j->ij", positions, inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        return emb.cos(), emb.sin()
+
+    def _ensure_cache(self, x: torch.Tensor) -> None:
+        if self.cos_cached.device == x.device and self.cos_cached.dtype == torch.float:
+            return
+        self.cos_cached, self.sin_cached = self._build_cache(
+            self.max_seq_len_cached,
+            device=x.device,
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        position_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        self._ensure_cache(x)
+        flat_positions = position_ids.reshape(-1)
+        cos = self.cos_cached.index_select(0, flat_positions)
+        sin = self.sin_cached.index_select(0, flat_positions)
+        output_shape = (*position_ids.shape, self.head_dim)
+        return cos.reshape(output_shape).to(x.dtype), sin.reshape(output_shape).to(
+            x.dtype
+        )
+
+
 class PiGemmaAttention(nn.Module):
     def __init__(self, config: GemmaConfig, layer_idx: int):
         super().__init__()
@@ -346,7 +432,7 @@ class PiGemmaDecoderLayer(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.self_attn = PiGemmaAttention(config=config, layer_idx=layer_idx)
-        self.mlp = GemmaMLP(config)
+        self.mlp = PiGemmaMLP(config)
         cond_dim = (
             getattr(config, "adarms_cond_dim", None)
             if getattr(config, "use_adarms", False)
@@ -418,7 +504,7 @@ class PiGemmaModel(nn.Module):
         self.norm = PiGemmaRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps, cond_dim=cond_dim
         )
-        self.rotary_emb = GemmaRotaryEmbedding(config=config)
+        self.rotary_emb = PiGemmaRotaryEmbedding(config=config)
         self.gradient_checkpointing = False
 
     def get_input_embeddings(self) -> nn.Module:
