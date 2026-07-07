@@ -368,8 +368,9 @@ class Ernie4_5_VLMoeDecoderLayer(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        rope_theta = config.rope_parameters["rope_theta"]
-        rope_scaling = config.rope_parameters
+        _rp = config.rope_parameters or {}
+        rope_theta = _rp.get("rope_theta", getattr(config, "rope_theta", 10000.0))
+        rope_scaling = _rp or None
         rope_is_neox_style = getattr(config, "rope_is_neox_style", False)
         freq_allocation = getattr(config, "freq_allocation", 20)
         max_position_embeddings = getattr(config, "max_position_embeddings", 131072)

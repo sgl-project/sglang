@@ -100,7 +100,9 @@ class Olmo2Attention(nn.Module):
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.max_position_embeddings = config.max_position_embeddings
-        self.rope_theta = config.rope_parameters["rope_theta"]
+        self.rope_theta = (config.rope_parameters or {}).get(
+            "rope_theta", getattr(config, "rope_theta", 10000.0)
+        )
 
         # Attention input projection. Projects x -> (q, k, v)
         self.qkv_proj = QKVParallelLinear(
