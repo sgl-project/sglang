@@ -30,10 +30,11 @@ use crate::error::Error;
 const SAMPLING_EPS: f64 = 1e-6;
 /// `TOP_K_ALL = 1 << 30` — `top_k` sentinel for "consider the whole vocabulary".
 const TOP_K_ALL: i64 = 1 << 30;
-/// Conservative `stop_regex_max_len`: Python's `get_max_seq_length` returns
-/// `MAX_LEN = 1 << 30` for any unbounded quantifier (the common case). The
-/// scheduler caps the match tail at the output length, so this just means "scan
-/// the whole output", matching Python's worst case.
+/// `MAX_LEN` from Python's `get_max_seq_length`: the bound for an *unbounded* stop
+/// regex (`\d+`, `.*`, …) or one we can't statically size — the scheduler then
+/// scans the whole output tail. A *bounded* regex gets its finite length instead
+/// (see [`regex_max_seq_length`]); assigning this to every regex made the scheduler
+/// re-scan the full accumulated output every token (O(T²)).
 const STOP_REGEX_MAX_LEN: i64 = 1 << 30;
 
 /// Normalize and verify the request's sampling params in place, then mark them
@@ -127,11 +128,13 @@ pub fn normalize_sampling_params(sp: &mut Option<Value>) -> Result<(), Error> {
     };
     // Match window: UTF-8 byte length is a safe upper bound on the token count.
     let stop_str_max_len = stop_strs.iter().map(|s| s.len() as i64).max().unwrap_or(0);
-    let stop_regex_max_len = if stop_regex_strs.is_empty() {
-        0
-    } else {
-        STOP_REGEX_MAX_LEN
-    };
+    // Finite bound per regex (bounded → its real max length; unbounded → MAX_LEN),
+    // matching Python's `max(get_max_seq_length(r) for r in stop_regex_strs)`.
+    let stop_regex_max_len = stop_regex_strs
+        .iter()
+        .map(|r| regex_max_seq_length(r))
+        .max()
+        .unwrap_or(0);
 
     // --- verify: same ranges as SamplingParams.verify (range-only subset) ---
     if !temperature.is_finite() || temperature < 0.0 {
@@ -227,6 +230,46 @@ pub fn normalize_sampling_params(sp: &mut Option<Value>) -> Result<(), Error> {
 
 fn bad(msg: String) -> Error {
     Error::Validation(msg)
+}
+
+/// Strict upper bound on the characters a `stop_regex` can match — the Rust port
+/// of Python's `get_max_seq_length` (`sampling_params.py`). Bounded expressions
+/// get their finite length; unbounded quantifiers, or anything the regex parser
+/// rejects (e.g. backreferences), fall back to [`STOP_REGEX_MAX_LEN`] — always an
+/// over-estimate, so the scheduler never under-buffers and misses a stop.
+fn regex_max_seq_length(pattern: &str) -> i64 {
+    match regex_syntax::parse(pattern) {
+        Ok(hir) => hir_max_len(&hir),
+        Err(_) => STOP_REGEX_MAX_LEN,
+    }
+}
+
+fn hir_max_len(hir: &regex_syntax::hir::Hir) -> i64 {
+    use regex_syntax::hir::HirKind;
+    match hir.kind() {
+        // Zero-width: empty match, anchors (`^`/`$`/`\b`).
+        HirKind::Empty | HirKind::Look(_) => 0,
+        // A concatenated literal run contributes its character count.
+        HirKind::Literal(lit) => std::str::from_utf8(&lit.0)
+            .map(|s| s.chars().count())
+            .unwrap_or(lit.0.len()) as i64,
+        // Any single-character class (`[..]`, `\d`, `.`) → 1.
+        HirKind::Class(_) => 1,
+        // `{m,n}` → n * inner; `+`/`*`/`{m,}` (max None) → unbounded.
+        HirKind::Repetition(rep) => match rep.max {
+            None => STOP_REGEX_MAX_LEN,
+            Some(max) => (max as i64)
+                .saturating_mul(hir_max_len(&rep.sub))
+                .min(STOP_REGEX_MAX_LEN),
+        },
+        HirKind::Capture(cap) => hir_max_len(&cap.sub),
+        HirKind::Concat(subs) => subs
+            .iter()
+            .map(hir_max_len)
+            .fold(0i64, i64::saturating_add)
+            .min(STOP_REGEX_MAX_LEN),
+        HirKind::Alternation(subs) => subs.iter().map(hir_max_len).max().unwrap_or(0),
+    }
 }
 
 /// Coerce a value to f64 (int or float); non-numeric (incl. null) → None, so the
@@ -371,5 +414,41 @@ mod tests {
             (Value::from("top_k"), Value::from(0i64)),
         ]));
         assert!(normalize_sampling_params(&mut sp).is_err());
+    }
+
+    /// Bounded regexes get their finite length; unbounded / unparsable ones fall
+    /// back to the full-scan `MAX_LEN`. Mirrors Python `get_max_seq_length`.
+    #[test]
+    fn regex_bound_is_finite_when_bounded() {
+        // Bounded: exact length (the reviewer's six-digit example → 6, not 1<<30).
+        assert_eq!(regex_max_seq_length(r"\d{6}"), 6);
+        assert_eq!(regex_max_seq_length("abc"), 3);
+        assert_eq!(regex_max_seq_length(r"^abc$"), 3); // anchors are zero-width
+        assert_eq!(regex_max_seq_length("a|bbb"), 3); // alternation → max branch
+        assert_eq!(regex_max_seq_length(r"(ab){3}"), 6); // group * repeat
+        assert_eq!(regex_max_seq_length(r"a\d{2,5}"), 6); // 1 + 5
+        // Unbounded → MAX_LEN.
+        assert_eq!(regex_max_seq_length(r"\d+"), STOP_REGEX_MAX_LEN);
+        assert_eq!(regex_max_seq_length(".*"), STOP_REGEX_MAX_LEN);
+        assert_eq!(regex_max_seq_length(r"a{3,}"), STOP_REGEX_MAX_LEN);
+        // Unparsable (backreference — regex-syntax rejects it) → MAX_LEN, not a panic.
+        assert_eq!(regex_max_seq_length(r"(a)\1"), STOP_REGEX_MAX_LEN);
+    }
+
+    /// End-to-end: a bounded `stop_regex` normalizes to its finite length, not the
+    /// O(T²) full-scan sentinel.
+    #[test]
+    fn bounded_stop_regex_gets_finite_max_len() {
+        let m = norm(&[("stop_regex", Value::from(r"\d{6}"))]);
+        assert_eq!(get(&m, "stop_regex_max_len").as_i64(), Some(6));
+
+        let m = norm(&[("stop_regex", Value::from(r"\d+"))]);
+        assert_eq!(
+            get(&m, "stop_regex_max_len").as_i64(),
+            Some(STOP_REGEX_MAX_LEN)
+        );
+
+        let m = norm(&[("temperature", Value::F64(0.7))]);
+        assert_eq!(get(&m, "stop_regex_max_len").as_i64(), Some(0)); // no regex → 0
     }
 }
