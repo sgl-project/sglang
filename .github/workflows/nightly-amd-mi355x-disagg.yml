@@ -17,6 +17,10 @@ on:
         description: 'Optional. Comma-separated names to run only a subset. Leave empty to run all. Available names are listed in the setup job log.'
         required: false
         default: ''
+      nodelist:
+        description: 'Optional. Comma-separated Slurm node list to pin the disagg allocation to (e.g. to validate a specific MI355X node pool). Leave empty to let the scheduler choose from the partition.'
+        required: false
+        default: ''
 
 concurrency:
   group: nightly-test-mi355x
@@ -146,6 +150,9 @@ jobs:
           # mismatches the container, so MORI reports "no active RDMA device"
           # and the disagg server dies on init. Remove once the node is fixed.
           SLURM_EXCLUDE: mia1-p01-g20
+          # Optional explicit node pin from workflow_dispatch (empty = scheduler
+          # chooses from the partition). Used to validate a specific MI355X pool.
+          SLURM_NODELIST: ${{ inputs.nodelist }}
         run: bash scripts/ci/slurm/launch_mi355x.sh
 
       - name: Pack logs
