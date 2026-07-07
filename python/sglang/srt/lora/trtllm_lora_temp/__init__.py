@@ -42,12 +42,9 @@ def get_lora_side_stream() -> torch.cuda.Stream:
     run sequentially, so one stream suffices and avoids extra graph-capture
     nodes from per-site streams.
     """
-    from sglang.srt.runtime_context import get_resources
+    from sglang.srt.runtime_context import get_stream
 
-    resources = get_resources()
-    if resources.lora_side_stream is None:
-        resources.lora_side_stream = torch.cuda.Stream()
-    return resources.lora_side_stream
+    return get_stream("lora_side")
 
 
 def init_lora_two_stream_resources(device: Optional[torch.device] = None) -> None:

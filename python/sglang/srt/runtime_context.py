@@ -337,11 +337,8 @@ class Resources(_FlagGroupBase):
     expert_location_metadata: Any = None
     # LPLB: layer_id -> solver.
     lplb_solvers: dict = dataclasses.field(default_factory=dict)
-    # Side streams, created lazily by their owning accessors (dp_attention /
-    # lora.trtllm_lora_temp) — creation is a driver call that must stay
-    # outside cuda-graph capture, which the accessors' call points guarantee.
-    dp_tbo_comm_stream: Any = None
-    lora_side_stream: Any = None
+    # Named side streams (see RuntimeContext.get_stream): name -> stream.
+    streams: dict = dataclasses.field(default_factory=dict)
     # Persistent reusable CUDA events for non-EP DP TBO, keyed by
     # (kind, subbatch) — see dp_attention._tbo_event for why reuse matters.
     tbo_event_pool: dict = dataclasses.field(default_factory=dict)
@@ -358,6 +355,25 @@ class RuntimeContext:
         self._server_args: ServerArgs | None = None
         self.flags = Flags()
         self.resources = Resources()
+
+    def get_stream(self, name: str) -> Any:
+        """Named process-level CUDA side stream: get-or-create, shared by
+        name (the keyed-lazy pattern of the persistent buffers). Creation is
+        a driver call that must stay outside cuda-graph capture — call sites
+        lease their stream at init/warmup time."""
+        stream = self.resources.streams.get(name)
+        if stream is None:
+            import torch
+
+            stream = torch.cuda.Stream()
+            self.resources.streams[name] = stream
+        return stream
+
+    def set_stream(self, name: str, stream: Any) -> Any:
+        """Install (or replace) the named stream — explicit injection for
+        tests and backends that bring their own stream."""
+        self.resources.streams[name] = stream
+        return stream
 
     @property
     def server_args(self) -> ServerArgs:
@@ -407,6 +423,14 @@ def get_flags() -> Flags:
 
 def get_resources() -> Resources:
     return _CONTEXT.resources
+
+
+def get_stream(name: str) -> Any:
+    return _CONTEXT.get_stream(name)
+
+
+def set_stream(name: str, stream: Any) -> Any:
+    return _CONTEXT.set_stream(name, stream)
 
 
 def reset_context() -> None:

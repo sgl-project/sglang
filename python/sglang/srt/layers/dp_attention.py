@@ -703,12 +703,9 @@ def dp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
 # deadlock on the RCCL communicator), each overlapping the other's compute.
 # ---------------------------------------------------------------------------
 def get_dp_tbo_comm_stream() -> torch.cuda.Stream:
-    from sglang.srt.runtime_context import get_resources
+    from sglang.srt.runtime_context import get_stream
 
-    resources = get_resources()
-    if resources.dp_tbo_comm_stream is None:
-        resources.dp_tbo_comm_stream = torch.cuda.Stream()
-    return resources.dp_tbo_comm_stream
+    return get_stream("dp_tbo_comm")
 
 
 # Persistent reusable CUDA events for non-EP DP TBO, keyed by (kind, subbatch).

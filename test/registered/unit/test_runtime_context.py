@@ -414,6 +414,41 @@ class TestResources(_IsolatedServerArgs):
         self.assertIsNone(get_global_expert_location_metadata())
 
 
+class TestNamedStreams(_IsolatedServerArgs):
+    """ctx.get_stream(name): keyed get-or-create (the persistent-buffer
+    pattern); set_stream installs explicitly."""
+
+    def test_get_or_create_shares_by_name(self):
+        from unittest.mock import patch
+
+        reset_context()
+        created = []
+
+        class _FakeStream:
+            def __init__(self):
+                created.append(self)
+
+        with patch("torch.cuda.Stream", _FakeStream):
+            a = get_context().get_stream("alt")
+            b = get_context().get_stream("alt")
+            c = get_context().get_stream("other")
+        self.assertIs(a, b)
+        self.assertIsNot(a, c)
+        self.assertEqual(len(created), 2)
+
+    def test_set_stream_installs_explicitly(self):
+        reset_context()
+        sentinel = object()
+        get_context().set_stream("alt", sentinel)
+        self.assertIs(get_context().get_stream("alt"), sentinel)
+
+    def test_reset_clears_the_registry(self):
+        reset_context()
+        get_context().set_stream("alt", object())
+        reset_context()
+        self.assertEqual(get_context().resources.streams, {})
+
+
 class TestPublishLifecycle(_IsolatedServerArgs):
     """Publish installs the resolved server_args and seeds the capture tier."""
 
