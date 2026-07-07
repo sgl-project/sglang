@@ -21,7 +21,6 @@ default parameters when initializing and generating videos.
 | FastWan2.1 T2V 1.3B          | `FastVideo/FastWan2.1-T2V-1.3B-Diffusers`         | 480p                 |    ⭕     |         ⭕         |     ⭕     |              ✅               |               ❌               |                   ❌                    |             ❌             |               ❌               |                   ❌                    |             ❌             |
 | FastWan2.2 TI2V 5B Full Attn | `FastVideo/FastWan2.2-TI2V-5B-FullAttn-Diffusers` | 720p                 |    ⭕     |         ⭕         |     ⭕     |              ✅               |               ❌               |                   ❌                    |             ❌             |               ❌               |                   ❌                    |             ❌             |
 | Wan2.2 TI2V 5B               | `Wan-AI/Wan2.2-TI2V-5B-Diffusers`                 | 720p                 |    ⭕     |         ⭕         |     ✅     |              ⭕               |               ❌               |                   ❌                    |             ❌             |               ✅               |                   ✅                    |             ✅             |
-| LongLive 2.0 5B              | `Rabinovich/LongLive-2.0-5B-Diffusers`            | 480p<br>720p         |    ❌     |         ❌         |     ❌     |              ❌               |               ❌               |                   ❌                    |             ❌             |               ❌               |                   ❌                    |             ❌             |
 | Wan2.2 T2V A14B              | `Wan-AI/Wan2.2-T2V-A14B-Diffusers`                | 480p<br>720p         |    ❌     |         ❌         |     ✅     |              ⭕               |               ✅               |                   ❌                    |             ✅             |
 | Wan2.2 I2V A14B              | `Wan-AI/Wan2.2-I2V-A14B-Diffusers`                | 480p<br>720p         |    ❌     |         ❌         |     ✅     |              ⭕               |               ❌               |                   ❌                    |             ❌             |               ✅               |                   ✅                    |             ✅             |
 | HunyuanVideo                 | `hunyuanvideo-community/HunyuanVideo`             | 720×1280<br>544×960  |    ❌     |         ✅         |     ✅     |              ⭕               |               ❌               |                   ❌                    |             ✅             |               ❌               |                   ❌                    |             ❌             |
@@ -64,7 +63,6 @@ default parameters when initializing and generating videos.
    difference is transformer depth and width, picked up from
    `transformer/config.json` at load time. A single checkpoint serves T2V,
    I2V (`--image-path`), and T2I (`--num-frames 1`).
-6. LongLive 2.0 5B is a causal video model built on Wan2.2 TI2V 5B. It supports T2V and I2V. T2V supports 1280x704, 704x1280, 832x480, and 480x832. I2V uses the Wan TI2V image preprocessing path in SGLang.
 
 ### Image Generation Models
 
