@@ -196,6 +196,14 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._use_confidence_gate = _env_flag(
             "SGLANG_DSPARK_USE_CONFIDENCE_GATE", False
         )
+        self._deepspec_prefill_handoff = _env_flag(
+            "SGLANG_DSPARK_DEEPSPEC_PREFILL_HANDOFF", True
+        )
+        self._prefill_transfer_warmup_rounds = (
+            0
+            if self._deepspec_prefill_handoff
+            else max(0, _env_int("SGLANG_DSPARK_PREFILL_TRANSFER_WARMUP_ROUNDS", 1))
+        )
 
         self._block_pos_offsets = torch.arange(
             self.block_size, device=self.device, dtype=torch.int64
@@ -284,6 +292,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 "Initialized DSpark draft runner. model=%s, block_size=%s, "
                 "num_dspark_layers=%s, noise_token_id=%s, markov_rank=%s, "
                 "confidence_threshold=%s, use_confidence_gate=%s, "
+                "deepspec_prefill_handoff=%s, prefill_transfer_warmup_rounds=%s, "
                 "target_layer_ids=%s, decoder_layer_ids=%s, "
                 "draft_config_compress_ratios=%s, "
                 "draft_runtime_compress_ratios=%s, "
@@ -295,6 +304,8 @@ class DSparkWorkerV2(BaseSpecWorker):
                 self.markov_rank,
                 self.confidence_threshold,
                 self._use_confidence_gate,
+                self._deepspec_prefill_handoff,
+                self._prefill_transfer_warmup_rounds,
                 target_layer_ids,
                 decoder_layer_ids,
                 draft_config_compress_ratios,
@@ -3078,7 +3089,15 @@ class DSparkWorkerV2(BaseSpecWorker):
             cur_allocated_seq_lens_cpu=cur_allocated_seq_lens_cpu,
             prefill_tail_hidden_states=prefill_tail_hidden_states,
             prefill_tail_valid_mask=prefill_tail_valid_mask,
-            transfer_warmup_rounds=torch.zeros_like(seq_lens, dtype=torch.int32),
+            # DeepSpec eval drafts the first proposal directly from prompt
+            # context hidden plus the prefill-sampled anchor token. SGLang
+            # realizes the same semantics by pre-materializing prompt hidden
+            # into draft KV, then running the anchor/noise block with no warmup.
+            transfer_warmup_rounds=torch.full_like(
+                seq_lens,
+                int(self._prefill_transfer_warmup_rounds),
+                dtype=torch.int32,
+            ),
         )
 
     def _get_transfer_warmup_rounds(
