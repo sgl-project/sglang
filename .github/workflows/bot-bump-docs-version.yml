@@ -65,12 +65,11 @@ jobs:
           pip install tomli
 
       - name: Configure Git and branch
-        id: set_output
         run: |
           git config user.name "sglang-bot"
           git config user.email "sglang-bot@users.noreply.github.com"
-          RANDOM_SUFFIX=$(echo $RANDOM | md5sum | head -c 4)
-          BRANCH_NAME="bot/bump-docs-version-${{ needs.resolve-version.outputs.version }}-${RANDOM_SUFFIX}"
+          # github.run_id is unique per run repo-wide; run_attempt disambiguates re-runs.
+          BRANCH_NAME="bot/bump-docs-version-${{ needs.resolve-version.outputs.version }}-${{ github.run_id }}-${{ github.run_attempt }}"
           git checkout -b "$BRANCH_NAME"
           echo "BRANCH_NAME=$BRANCH_NAME" >> $GITHUB_ENV
 
