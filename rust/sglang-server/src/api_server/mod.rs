@@ -295,9 +295,12 @@ fn hidden_states_rows(vals: &[f32], lens: &[u32]) -> serde_json::Value {
     serde_json::Value::Array(rows)
 }
 
-/// Map a terminal `abort` finish reason that carries a `status_code` (a request
-/// error the scheduler produced.
-fn abort_error_response(finish_reason: &Option<serde_json::Value>) -> Option<Response> {
+/// Classify a terminal finish reason: `Some((code, message))` when it's an
+/// `abort` carrying a `status_code` (a request error the scheduler produced, e.g.
+/// an over-context request → 400). The status lives only inside `meta_info`, so
+/// both the unary and streaming paths must inspect it rather than treat the
+/// `Done` frame as a normal completion.
+fn abort_status(finish_reason: &Option<serde_json::Value>) -> Option<(u16, String)> {
     let fr = finish_reason.as_ref()?;
     if fr.get("type").and_then(|t| t.as_str()) != Some("abort") {
         return None;
@@ -306,7 +309,14 @@ fn abort_error_response(finish_reason: &Option<serde_json::Value>) -> Option<Res
     let message = fr
         .get("message")
         .and_then(|m| m.as_str())
-        .unwrap_or("request aborted");
+        .unwrap_or("request aborted")
+        .to_string();
+    Some((code, message))
+}
+
+/// Unary form of [`abort_status`]: the classified abort as an HTTP error response.
+fn abort_error_response(finish_reason: &Option<serde_json::Value>) -> Option<Response> {
+    let (code, message) = abort_status(finish_reason)?;
     let status = StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     let body = serde_json::json!({ "error": { "message": message, "code": code } });
     Some((status, Json(body)).into_response())
@@ -687,8 +697,19 @@ async fn generate(State(state): State<AppState>, Json(payload): Json<GeneratePay
                     }
                     EgressItem::Done(out) => {
                         acc.fold(&out);
-                        let f = sglang_frame(&acc.into_output(), &rid_str);
-                        yield Ok(Event::default().data(String::from_utf8_lossy(&f)));
+                        let final_out = acc.into_output();
+                        // A validation abort carries its status only in meta_info; surface
+                        // it as an SSE error event (like the `Error` branch), not a normal
+                        // generation frame — the stream is already a committed 200.
+                        if let Some((code, message)) = abort_status(&final_out.finish_reason) {
+                            let body = serde_json::json!({
+                                "error": { "message": message, "code": code }
+                            });
+                            yield Ok(Event::default().data(body.to_string()));
+                        } else {
+                            let f = sglang_frame(&final_out, &rid_str);
+                            yield Ok(Event::default().data(String::from_utf8_lossy(&f)));
+                        }
                         terminated = true;
                         break;
                     }
@@ -894,6 +915,23 @@ mod logprob_shape_tests {
         }));
         let resp = abort_error_response(&fr).expect("abort with status → error response");
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// The shared classifier both paths use: a validation abort yields its
+    /// `(code, message)` (the streaming path turns this into an SSE error event
+    /// instead of a normal `Done` frame); anything else yields `None`.
+    #[test]
+    fn abort_status_extracts_code_and_message() {
+        let (code, msg) = abort_status(&Some(serde_json::json!({
+            "type": "abort", "message": "over the limit", "status_code": 400
+        })))
+        .expect("validation abort → (code, message)");
+        assert_eq!(code, 400);
+        assert_eq!(msg, "over the limit");
+        // Normal finish, bare abort (no status), and no finish → not an error.
+        assert!(abort_status(&Some(serde_json::json!({"type": "stop"}))).is_none());
+        assert!(abort_status(&Some(serde_json::json!({"type": "abort"}))).is_none());
+        assert!(abort_status(&None).is_none());
     }
 
     /// A normal finish, a bare abort (no status), and no finish all stay 200.
