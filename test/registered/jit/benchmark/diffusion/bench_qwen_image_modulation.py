@@ -15,7 +15,7 @@ from sglang.utils import is_in_ci
 register_cuda_ci(
     est_time=13, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
 )
-register_amd_ci(est_time=13, suite="jit-kernel-unit-test-amd")
+register_amd_ci(est_time=13, stage="jit-kernel-benchmark", runner_config="amd")
 
 if is_in_ci():
     B_RANGE, S_RANGE, D_RANGE = [1], [128], [3072]
