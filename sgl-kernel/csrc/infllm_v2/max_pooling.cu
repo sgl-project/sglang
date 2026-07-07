@@ -43,20 +43,17 @@ __global__ void max_pooling_1d_varlen_kernel(
   const int bidh = blockIdx.y;         // head index
   const int bidq_global = blockIdx.x;  // global query index across all batches
 
-  int batch_idx = 0;
-  if (batch_size != 1) {
-    int lo = 0;
-    int hi = batch_size;
-    while (lo < hi) {
-      const int mid = (lo + hi) >> 1;
-      if (bidq_global >= cu_seqlens_q[mid + 1]) {
-        lo = mid + 1;
-      } else {
-        hi = mid;
-      }
+  int lo = 0;
+  int hi = batch_size;
+  while (lo < hi) {
+    const int mid = (lo + hi) >> 1;
+    if (bidq_global >= cu_seqlens_q[mid + 1]) {
+      lo = mid + 1;
+    } else {
+      hi = mid;
     }
-    batch_idx = lo;
   }
+  const int batch_idx = lo;
 
   const int q_start = cu_seqlens_q[batch_idx];
   const int bidq_local = bidq_global - q_start;
