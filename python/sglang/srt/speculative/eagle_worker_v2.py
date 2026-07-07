@@ -130,6 +130,10 @@ def _get_plan_stream(
 
 
 class EagleDraftWorker(EagleDraftWorkerBase):
+    # Set per-instance by _maybe_enable_distributed_argmax; class default keeps
+    # it defined for harnesses that skip __init__.
+    distributed_argmax_enabled: bool = False
+
     def __init__(
         self,
         server_args: ServerArgs,
@@ -192,6 +196,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         # Alias for better readability
         self.draft_runner = self.draft_worker.model_runner
+        self._maybe_enable_distributed_argmax()
         self._init_dsa_index_share_state()
         # Eager draft-extend seed buffer (graph paths use their own static ones).
         self.dsa_extend_topk_buf: Optional[torch.Tensor] = None
@@ -257,6 +262,24 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         if (c := self.draft_runner.canary_manager) is not None:
             c.mark_init_finished()
+
+    def _maybe_enable_distributed_argmax(self) -> None:
+        """Enable the sharded-vocab distributed argmax on the draft model's
+        LogitsProcessor for greedy (topk=1) chain drafting. The LogitsProcessor
+        applies its own runtime gate (TP>1, no DP-attention, no vocab padding,
+        no softcapping)."""
+        self.distributed_argmax_enabled = False
+        if not envs.SGLANG_ENABLE_SPEC_DRAFT_DISTRIBUTED_ARGMAX.get():
+            return
+        # Match the greedy torch.argmax path: topk=1 chain drafting, non-HIP, no
+        # rejection sampling.
+        if self.topk != 1 or _is_hip:
+            return
+        if self.server_args.speculative_use_rejection_sampling:
+            return
+        lp = self.draft_runner.model.logits_processor
+        lp.do_argmax = True
+        self.distributed_argmax_enabled = True
 
     def _init_dsa_index_share_state(self) -> None:
         # Populate DSA index-share fields from the draft runner's hf_config.
@@ -688,34 +711,14 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 canary_index_ctx,
             ):
                 logits_output = self.draft_runner.forward(forward_batch).logits_output
-            maybe_detect_nan(logits_output.next_token_logits, f"draft_forward step {i}")
-            maybe_detect_inf(logits_output.next_token_logits, f"draft_forward step {i}")
-            if self.server_args.speculative_use_rejection_sampling:
-                probs = renorm_draft_probs(
-                    logits_output.next_token_logits,
-                    forward_batch.sampling_info,
-                    self.server_args.speculative_use_rejection_sampling,
-                )
-                topk_p, topk_index = fast_sample(probs, num_samples=1)
-                draft_probs_list.append(probs)
-            elif self.topk == 1 and not _is_hip:
-                topk_index = torch.argmax(
-                    logits_output.next_token_logits, dim=-1, keepdim=True
-                )
-                topk_p = torch.ones_like(topk_index, dtype=torch.float32)
-            else:
-                probs = renorm_draft_probs(
-                    logits_output.next_token_logits,
-                    forward_batch.sampling_info,
-                    self.server_args.speculative_use_rejection_sampling,
-                )
-                topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
-            maybe_detect_oob(
-                topk_index,
-                0,
-                logits_output.next_token_logits.shape[-1],
-                f"draft_forward step {i}: topk_index OOB vs vocab_size={logits_output.next_token_logits.shape[-1]}",
+            topk_p, topk_index, draft_probs = self._select_draft_tokens(
+                logits_output.next_token_ids,
+                logits_output.next_token_logits,
+                forward_batch.sampling_info,
+                probe_ctx=f"draft_forward step {i}",
             )
+            if self.server_args.speculative_use_rejection_sampling:
+                draft_probs_list.append(draft_probs)
             if self.hot_token_id is not None:
                 topk_index = self.hot_token_id[topk_index]
             hidden_states = logits_output.hidden_states
@@ -760,6 +763,51 @@ class EagleDraftWorker(EagleDraftWorkerBase):
     def draft_extend(self):
         pass
 
+    def _select_draft_tokens(
+        self,
+        next_token_ids: Optional[torch.Tensor],
+        next_token_logits: Optional[torch.Tensor],
+        sampling_info,
+        probe_ctx: str = "",
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        """Pick (topk_p, topk_index, draft_probs) from a draft forward output.
+
+        Single source of truth for draft next-token selection, shared by the
+        draft-decode loop and both draft-extend paths so they can't drift. Tiers,
+        in priority order: distributed-argmax ids (full logits never
+        materialized) -> rejection sampling -> greedy argmax (topk=1, CUDA only
+        per #26358) -> softmax topk.
+        """
+        if next_token_ids is not None:
+            # Distributed-argmax fast path: no full logits, so the NaN/Inf/OOB
+            # probes don't apply (ids are exact by construction).
+            topk_index = next_token_ids.view(-1, 1)
+            topk_p = torch.ones_like(topk_index, dtype=torch.float32)
+            return topk_p, topk_index, None
+
+        maybe_detect_nan(next_token_logits, probe_ctx)
+        maybe_detect_inf(next_token_logits, probe_ctx)
+        if self.server_args.speculative_use_rejection_sampling:
+            probs = renorm_draft_probs(next_token_logits, sampling_info, True)
+            topk_p, topk_index = fast_sample(probs, num_samples=1)
+            draft_probs = probs
+        elif self.topk == 1 and not _is_hip:
+            topk_index = torch.argmax(next_token_logits, dim=-1, keepdim=True)
+            topk_p = torch.ones_like(topk_index, dtype=torch.float32)
+            draft_probs = None
+        else:
+            probs = renorm_draft_probs(next_token_logits, sampling_info, False)
+            topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+            draft_probs = None
+        vocab_size = next_token_logits.shape[-1]
+        maybe_detect_oob(
+            topk_index,
+            0,
+            vocab_size,
+            f"{probe_ctx}: topk_index OOB vs vocab_size={vocab_size}",
+        )
+        return topk_p, topk_index, draft_probs
+
     def _draft_extend_for_prefill(
         self,
         batch: ScheduleBatch,
@@ -794,6 +842,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             # draft mode is same with decode mode, only 1 token per req
             num_tokens_per_req=1,
             num_tokens_for_logprob_per_req=1,
+            # greedy_argmax left False: cold path, not worth a distributed collective.
         )
 
         # Run forward (LAST mode: only the final hidden state per request,
@@ -840,28 +889,23 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         )
         with canary_ctx:
             logits_output = self.draft_runner.forward(forward_batch).logits_output
-        maybe_detect_nan(logits_output.next_token_logits, "draft_extend_for_prefill")
-        maybe_detect_inf(logits_output.next_token_logits, "draft_extend_for_prefill")
 
         prefill_dsa_topk = None
         if seed_from_extend:
             prefill_dsa_topk = self.dsa_extend_topk_buf[:bs].clone()
 
-        # Assemble the next-iter draft spec_info from the extend output.
-        use_rejection_sampling = self.server_args.speculative_use_rejection_sampling
-        probs = renorm_draft_probs(
+        # Assemble the next-iter draft spec_info from the extend output. LAST
+        # capture already yields one row per request, so no re-selection needed.
+        topk_p, topk_index, draft_probs = self._select_draft_tokens(
+            logits_output.next_token_ids,
             logits_output.next_token_logits,
             batch.sampling_info,
-            use_rejection_sampling,
+            probe_ctx="draft_extend_for_prefill",
         )
-        if use_rejection_sampling:
-            topk_p, topk_index = fast_sample(probs, num_samples=1)
-        else:
-            topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
         return EagleDraftInput(
             topk_p=topk_p,
             topk_index=topk_index,
-            draft_probs=probs if use_rejection_sampling else None,
+            draft_probs=draft_probs,
             hidden_states=logits_output.hidden_states,
             bonus_tokens=next_token_ids,
             num_tokens_per_req=1,
@@ -895,6 +939,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             # not num_steps + 1, so DP MLP-sync padding stays consistent for topk > 1.
             num_tokens_per_req=self.speculative_num_draft_tokens,
             num_tokens_for_logprob_per_req=self.speculative_num_draft_tokens,
+            # Opt the decode draft-extend into the distributed-argmax fast path.
+            greedy_argmax=self.distributed_argmax_enabled,
         )
         select_index = (
             torch.arange(
@@ -961,14 +1007,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     forward_batch
                 ).logits_output
 
-        maybe_detect_nan(
-            draft_logits_output.next_token_logits,
-            f"draft_extend_for_decode (cuda_graph={can_cuda_graph})",
-        )
-        maybe_detect_inf(
-            draft_logits_output.next_token_logits,
-            f"draft_extend_for_decode (cuda_graph={can_cuda_graph})",
-        )
+        # Distributed-argmax fast path: next_token_logits is None.
+        draft_next_token_ids = draft_logits_output.next_token_ids
 
         # Gather the per-request last-position indexer top-k as the next loop's
         # seed (select_index already picks the last accepted position per req).
@@ -983,40 +1023,26 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             # Fancy indexing returns a fresh tensor (detached from the buffer).
             dsa_seed_topk_indices = dsa_extend_topk_capture[select_index]
 
-        # Reorganize the spec info for the next batch
-        draft_logits_output.next_token_logits = draft_logits_output.next_token_logits[
-            select_index
-        ]
+        # Reorganize the spec info for the next batch (select the last accepted
+        # position per request).
+        if draft_next_token_ids is None:
+            draft_logits_output.next_token_logits = (
+                draft_logits_output.next_token_logits[select_index]
+            )
         if draft_logits_output.hidden_states is not None:
             draft_logits_output.hidden_states = draft_logits_output.hidden_states[
                 select_index
             ]
-        # The draft-extend graph only anchors full logits; selected-row topk is
-        # owned by the worker for both graph and eager paths.
-        if self.server_args.speculative_use_rejection_sampling:
-            probs = renorm_draft_probs(
-                draft_logits_output.next_token_logits,
-                batch.sampling_info,
-                self.server_args.speculative_use_rejection_sampling,
-            )
-            ret_topk_p, ret_topk_index = fast_sample(probs, num_samples=1)
-            ret_draft_probs = probs
-        elif self.topk == 1 and not _is_hip:
-            # Gated to CUDA: see #26358 — ROCm's argmax tie-break corrupts
-            # MTP draft selection on FP8 logits.
-            ret_topk_index = torch.argmax(
-                draft_logits_output.next_token_logits, dim=-1, keepdim=True
-            )
-            ret_topk_p = torch.ones_like(ret_topk_index, dtype=torch.float32)
-            ret_draft_probs = None
-        else:
-            probs = renorm_draft_probs(
-                draft_logits_output.next_token_logits,
-                batch.sampling_info,
-                self.server_args.speculative_use_rejection_sampling,
-            )
-            ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
-            ret_draft_probs = None
+        ret_topk_p, ret_topk_index, ret_draft_probs = self._select_draft_tokens(
+            (
+                draft_next_token_ids[select_index]
+                if draft_next_token_ids is not None
+                else None
+            ),
+            draft_logits_output.next_token_logits,
+            batch.sampling_info,
+            probe_ctx=f"draft_extend_for_decode (cuda_graph={can_cuda_graph})",
+        )
         ret_hidden_states = draft_logits_output.hidden_states
 
         # Construct the return values
