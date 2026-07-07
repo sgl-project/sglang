@@ -19,6 +19,10 @@ from tokenizers.pre_tokenizers import Whitespace
 from transformers import PreTrainedTokenizerFast
 
 from sglang.benchmark.datasets import DATASET_MAPPING, get_dataset
+from sglang.benchmark.datasets.agentic_trace import (
+    DEFAULT_AGENTIC_OUTPUT_LEN,
+    AgenticTraceDataset,
+)
 from sglang.benchmark.datasets.common import DatasetRow, gen_mm_prompt
 from sglang.benchmark.datasets.custom import sample_custom_requests
 from sglang.benchmark.datasets.generated_shared_prefix import (
@@ -148,6 +152,8 @@ def make_args(**overrides):
         "mooncake_workload": "conversation",
         "speed_bench_category": None,
         "speed_bench_output_len": 512,
+        "dataset_offset": 0,
+        "agentic_max_turns": None,
     }
     args.update(overrides)
     return SimpleNamespace(**args)
@@ -282,6 +288,37 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
         with open(path, "w") as f:
             for row in rows:
                 f.write(json.dumps(row) + "\n")
+        return str(path)
+
+    def _write_agentic_trace_json(self):
+        trace = {
+            "metadata": {"source": "test"},
+            "conversations": [
+                [
+                    {
+                        "messages": [
+                            {"role": "system", "content": "You are an agent."},
+                            {"role": "user", "content": "Fix the bug."},
+                        ],
+                        "prompt_tokens": 100,
+                    },
+                    {
+                        "messages": [{"role": "user", "content": "Tool output: ok."}],
+                        "prompt_tokens": 200,
+                    },
+                    {"messages": []},
+                ],
+                [
+                    {
+                        "messages": [{"role": "user", "content": "Run the tests."}],
+                        "prompt_tokens": 50,
+                    },
+                ],
+            ],
+        }
+        path = self.tmpdir_path / "agentic_trace.json"
+        with open(path, "w") as f:
+            json.dump(trace, f)
         return str(path)
 
     async def _collect_mooncake_rows(self, records):
@@ -517,8 +554,69 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
         with self.assertRaises(ValueError):
             SpeedBenchDataset.from_args(args)
 
+    def test_agentic_trace_sampler(self):
+        dataset_path = self._write_agentic_trace_json()
+        args = make_args(
+            dataset_name="agentic-trace",
+            dataset_path=dataset_path,
+            num_prompts=10,
+        )
+        dataset = AgenticTraceDataset.from_args(args)
+        rows = dataset.load(self.tokenizer)
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(all(isinstance(row, DatasetRow) for row in rows))
+        self.assertTrue(
+            all(row.output_len == DEFAULT_AGENTIC_OUTPUT_LEN for row in rows)
+        )
+        # Multi-turn shape: prompt is a list of per-turn message lists, with
+        # the empty third turn of the first conversation dropped.
+        self.assertEqual(len(rows[0].prompt), 2)
+        self.assertEqual(len(rows[1].prompt), 1)
+        self.assertEqual(rows[0].prompt[0][0]["role"], "system")
+        self.assertEqual(rows[0].prompt_len, 100)
+        self.assertEqual(rows[1].prompt_len, 50)
+
+    def test_agentic_trace_offset_and_max_turns(self):
+        dataset_path = self._write_agentic_trace_json()
+        args = make_args(
+            dataset_name="agentic-trace",
+            dataset_path=dataset_path,
+            num_prompts=10,
+            sharegpt_output_len=64,
+            dataset_offset=1,
+            agentic_max_turns=1,
+        )
+        dataset = AgenticTraceDataset.from_args(args)
+        rows = dataset.load(self.tokenizer)
+        self.assertEqual(len(rows), 2)
+        # offset=1 rotates the second (single-turn) conversation to the front.
+        self.assertEqual(rows[0].prompt_len, 50)
+        self.assertTrue(all(len(row.prompt) == 1 for row in rows))
+        self.assertTrue(all(row.output_len == 64 for row in rows))
+
+    def test_agentic_trace_invalid_input_raises(self):
+        args = make_args(
+            dataset_name="agentic-trace",
+            dataset_path=str(self.tmpdir_path / "missing.json"),
+            num_prompts=1,
+        )
+        with self.assertRaises(FileNotFoundError):
+            AgenticTraceDataset.from_args(args).load(self.tokenizer)
+
+        empty_path = self.tmpdir_path / "empty_trace.json"
+        with open(empty_path, "w") as f:
+            json.dump({"metadata": {}, "conversations": []}, f)
+        args = make_args(
+            dataset_name="agentic-trace",
+            dataset_path=str(empty_path),
+            num_prompts=1,
+        )
+        with self.assertRaises(ValueError):
+            AgenticTraceDataset.from_args(args).load(self.tokenizer)
+
     def test_dataset_mapping_and_dispatch(self):
         expected = {
+            "agentic-trace",
             "sharegpt",
             "custom",
             "openai",
@@ -602,6 +700,15 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
         )
         self.assertEqual(len(speed_bench_rows), 2)
         self.assertTrue(all(isinstance(row, DatasetRow) for row in speed_bench_rows))
+
+        agentic_args = make_args(
+            dataset_name="agentic-trace",
+            dataset_path=self._write_agentic_trace_json(),
+            num_prompts=2,
+        )
+        agentic_rows = get_dataset(agentic_args, self.tokenizer, model_id="dummy-model")
+        self.assertEqual(len(agentic_rows), 2)
+        self.assertTrue(all(isinstance(row, DatasetRow) for row in agentic_rows))
 
     def test_get_dataset_unknown_dataset(self):
         args = make_args(dataset_name="not-a-dataset")

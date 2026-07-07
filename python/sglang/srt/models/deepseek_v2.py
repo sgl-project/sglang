@@ -449,12 +449,7 @@ class MoEGate(nn.Module):
         if config.topk_method == "noaux_tc" and not is_hash_moe:
             correction_bias_dtype = torch.float32
             if quant_config is not None:
-                if (
-                    quant_config.get_name() == "modelopt_fp4"
-                    and get_moe_runner_backend().is_flashinfer_trtllm()
-                ):
-                    correction_bias_dtype = torch.bfloat16
-                elif _use_aiter and quant_config.get_name() in (
+                if _use_aiter and quant_config.get_name() in (
                     "fp8",
                     "compressed_tensors",
                     "quark",
@@ -513,16 +508,13 @@ class MoEGate(nn.Module):
 
             elif _use_aiter:
                 logits = aiter_dsv3_router_gemm(hidden_states, self.weight)
-            elif _is_npu:
+            elif not _is_cuda:
                 logits = F.linear(hidden_states, self.weight, None)
             else:
-                if self.is_deepseek_v4:
-                    from sglang.jit_kernel.dsv4 import linear_bf16_fp32
+                # cuBLAS bf16 x bf16 -> fp32 GEMM (torch.mm's out_dtype kwarg is CUDA-only)
+                from sglang.jit_kernel.dsv4 import linear_bf16_fp32
 
-                    logits = linear_bf16_fp32(hidden_states, self.weight)
-                else:
-                    # After testing, we may use the faster code in `if deepseek v4` branch
-                    logits = F.linear(hidden_states, self.weight, None)
+                logits = linear_bf16_fp32(hidden_states, self.weight)
 
         return logits
 
@@ -1663,6 +1655,7 @@ class DeepseekV2AttentionMLA(
                 quant_config=quant_config,
                 layer_id=layer_id,
                 alt_stream=alt_stream,
+                config=config,
             )
             # Refer: https://arxiv.org/abs/2603.12201 for more details.
             # skip_topk: when True, this layer will skip computation and reuse previous layer's topk indices.
@@ -1671,8 +1664,13 @@ class DeepseekV2AttentionMLA(
                 self.skip_topk = True
                 self.next_skip_topk = True
             else:
-                self.skip_topk = dsa_layer_skips_topk(config, layer_id)
-                self.next_skip_topk = dsa_layer_skips_topk(config, layer_id + 1)
+                index_cli_factor = getattr(config, "cli_factor", 1)
+                if index_cli_factor > 1:
+                    self.skip_topk = layer_id % index_cli_factor != 0
+                    self.next_skip_topk = (layer_id + 1) % index_cli_factor != 0
+                else:
+                    self.skip_topk = dsa_layer_skips_topk(config, layer_id)
+                    self.next_skip_topk = dsa_layer_skips_topk(config, layer_id + 1)
 
         self.kv_b_proj = ColumnParallelLinear(
             self.kv_lora_rank,
@@ -1775,6 +1773,7 @@ class DeepseekV2AttentionMLA(
             and not self.is_packed_weight
             and fused_a_gemm_weight_eligible(self.fused_qkv_a_proj_with_mqa)
         )
+        self.fused_a_gemm_backend = "auto"
 
         self.init_mha_forward()
         self.init_mla_forward()
@@ -1979,7 +1978,9 @@ class DeepseekV2AttentionMLA(
         assert self.q_lora_rank is not None
         if self.use_min_latency_fused_a_gemm:
             return linear_with_fused_a_gemm(
-                self.fused_qkv_a_proj_with_mqa, hidden_states
+                self.fused_qkv_a_proj_with_mqa,
+                hidden_states,
+                backend=self.fused_a_gemm_backend,
             )
         return self.fused_qkv_a_proj_with_mqa(hidden_states)[0]
 
