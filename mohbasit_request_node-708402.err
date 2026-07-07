@@ -1,4 +1,0 @@
-srun: Job step aborted: Waiting up to 32 seconds for job step to finish.
-slurmstepd: error: *** JOB 708402 ON tw054 CANCELLED AT 2026-07-07T06:25:00 DUE TO TIME LIMIT ***
-slurmstepd: error: *** STEP 708402.0 ON tw054 CANCELLED AT 2026-07-07T06:25:00 DUE TO TIME LIMIT ***
-srun: error: tw054: task 0: Terminated
