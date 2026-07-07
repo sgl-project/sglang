@@ -441,18 +441,13 @@ class MoEGate(nn.Module):
         super().__init__()
         self.is_nextn = is_nextn
         self.is_deepseek_v4 = is_deepseek_v4
-        self.use_flashinfer_trtllm_bf16_moe = (
-            quant_config is None and get_moe_runner_backend().is_flashinfer_trtllm()
-        )
         self.weight = nn.Parameter(
             torch.empty((config.n_routed_experts, config.hidden_size))
         )
 
         if config.topk_method == "noaux_tc" and not is_hash_moe:
             correction_bias_dtype = torch.float32
-            if self.use_flashinfer_trtllm_bf16_moe:
-                correction_bias_dtype = torch.bfloat16
-            elif quant_config is not None:
+            if quant_config is not None:
                 if _use_aiter and quant_config.get_name() in (
                     "fp8",
                     "compressed_tensors",
@@ -485,7 +480,7 @@ class MoEGate(nn.Module):
             )
 
         if get_global_server_args().enable_deterministic_inference:
-            if _is_cuda and not self.use_flashinfer_trtllm_bf16_moe:
+            if _is_cuda:
                 from sglang.jit_kernel.dsv4 import linear_bf16_fp32
 
                 return linear_bf16_fp32(hidden_states, self.weight)
@@ -499,7 +494,7 @@ class MoEGate(nn.Module):
                 or mla_use_prefill_cp(forward_batch, self.mla_enable_prefill_cp)
             )
         ):
-            if _is_cuda and not self.use_flashinfer_trtllm_bf16_moe:
+            if _is_cuda:
                 from sglang.jit_kernel.dsv4 import linear_bf16_fp32
 
                 logits = linear_bf16_fp32(hidden_states, self.weight)
@@ -510,7 +505,6 @@ class MoEGate(nn.Module):
             max_router_gemm_tokens = 4 if _device_sm in (100, 103) else 16
             if (
                 _is_cuda
-                and not self.use_flashinfer_trtllm_bf16_moe
                 and hidden_states.shape[0] <= max_router_gemm_tokens
                 and hidden_states.shape[1] % 1024 == 0
                 and (self.weight.shape[0] == 256 or self.weight.shape[0] == 384)
@@ -520,10 +514,10 @@ class MoEGate(nn.Module):
                     hidden_states, self.weight, out_dtype=torch.float32
                 )
 
-            elif not _is_cuda or self.use_flashinfer_trtllm_bf16_moe:
-                logits = F.linear(hidden_states, self.weight, None)
             elif _use_aiter:
                 logits = aiter_dsv3_router_gemm(hidden_states, self.weight)
+            elif not _is_cuda:
+                logits = F.linear(hidden_states, self.weight, None)
             else:
                 # cuBLAS bf16 x bf16 -> fp32 GEMM (torch.mm's out_dtype kwarg is CUDA-only)
                 from sglang.jit_kernel.dsv4 import linear_bf16_fp32
