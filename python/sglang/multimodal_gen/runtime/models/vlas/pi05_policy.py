@@ -586,7 +586,7 @@ class Pi05PolicyModel(nn.Module):
         self,
         target_state: dict[str, torch.Tensor],
     ) -> bool:
-        if self.device.type != "cuda" or self.runtime_role == "idle":
+        if self.device.type != "cuda":
             return False
 
         has_weight = False

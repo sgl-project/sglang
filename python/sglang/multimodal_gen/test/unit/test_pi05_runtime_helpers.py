@@ -79,7 +79,7 @@ def test_denoise_graph_skips_prefix_copy_for_same_digest(monkeypatch):
     assert captured.static_prefix_context.past_key_values[0][0].eq(1.0).all()
 
 
-def test_runai_direct_gpu_loader_allows_action_role(monkeypatch):
+def test_runai_direct_gpu_loader_does_not_reject_split_roles(monkeypatch):
     class FakeSafeOpen:
         def __enter__(self):
             return self
@@ -110,6 +110,9 @@ def test_runai_direct_gpu_loader_allows_action_role(monkeypatch):
         "action.weight": SimpleNamespace(device=SimpleNamespace(type="cuda")),
     }
 
+    assert model._should_stream_weights_to_gpu(target_state)
+
+    model.runtime_role = "idle"
     assert model._should_stream_weights_to_gpu(target_state)
 
 
