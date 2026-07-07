@@ -123,8 +123,18 @@ _hip_use_alt_stream = get_bool_env_var("SGLANG_ALT_STREAM") and _is_hip
 _gdn_use_alt_stream = _is_cuda or (
     get_bool_env_var("SGLANG_GDN_QKVZ_BA_ALT_STREAM", "False") and _hip_use_alt_stream
 )
-_fuse_gdn_oproj = _use_aiter and not get_bool_env_var(
-    "SGLANG_DISABLE_GDN_OUT_PROJ_FUSION", "False"
+_gated_rmsnorm_fp8_per_token_quant = None
+if _use_aiter:
+    try:
+        from aiter.ops.gated_rmsnorm_fp8_per_token_quant import (
+            gated_rmsnorm_fp8_per_token_quant as _gated_rmsnorm_fp8_per_token_quant,
+        )
+    except Exception:
+        _gated_rmsnorm_fp8_per_token_quant = None
+
+_fuse_gdn_oproj = (
+    _gated_rmsnorm_fp8_per_token_quant is not None
+    and not get_bool_env_var("SGLANG_DISABLE_GDN_OUT_PROJ_FUSION", "False")
 )
 _qknorm_use_alt_stream = _is_cuda or (
     get_bool_env_var("SGLANG_QK_NORM_ALT_STREAM", "False") and _hip_use_alt_stream
@@ -501,14 +511,11 @@ class Qwen3_5GatedDeltaNet(nn.Module):
     def _can_fuse_oproj(self) -> bool:
         """Whether the gated-RMSNorm + FP8 per-token quant -> out_proj fusion applies.
 
-        Only valid for AttnFP8 checkpoints whose out_proj is a per-token-act x
-        per-channel-weight a8w8 FP8 GEMM with a SiLU gate and the kernel's shape
-        constraints. Cached on first access from forward() (weights loaded by then).
-
-        The fused path feeds out_proj.weight straight into gemm_a8w8_bpreshuffle,
-        which needs a pre-shuffled weight; we require the per-token-a8w8 prep flag
-        (Fp8LinearMethod.use_per_token_if_dynamic or Quark scheme.per_token, which
-        always pre-shuffles under AITER), else the GEMM would corrupt the output."""
+        True only for AttnFP8 out_proj (per-token-act x per-channel-weight a8w8, SiLU
+        gate, shape constraints), and only when the per-token-a8w8 prep flag
+        (Fp8LinearMethod.use_per_token_if_dynamic or Quark scheme.per_token) is set --
+        it guarantees the pre-shuffled weight gemm_a8w8_bpreshuffle needs. Cached on
+        first forward()."""
         ok = False
         if _fuse_gdn_oproj:
             weight = getattr(self.out_proj, "weight", None)
@@ -538,10 +545,6 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         z_shape_og: torch.Size,
     ) -> torch.Tensor:
         """Fused gated RMSNorm + FP8 per-token quant, then the out_proj a8w8 GEMM."""
-        from aiter.ops.gated_rmsnorm_fp8_per_token_quant import (
-            gated_rmsnorm_fp8_per_token_quant,
-        )
-
         from sglang.srt.layers.quantization.fp8_utils import (
             apply_fp8_linear_aiter_prequant,
         )
@@ -556,7 +559,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             device=x3.device,
         )
         q_scale = torch.empty((num_tokens,), dtype=torch.float32, device=x3.device)
-        gated_rmsnorm_fp8_per_token_quant(
+        _gated_rmsnorm_fp8_per_token_quant(
             q_fp8, q_scale, x3, z3, self.norm.weight, self.layer_norm_epsilon
         )
         return apply_fp8_linear_aiter_prequant(
