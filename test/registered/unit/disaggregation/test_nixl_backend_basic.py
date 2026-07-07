@@ -3,9 +3,11 @@
 import struct
 import sys
 import threading
+import time
 import types
 import unittest
 from collections import defaultdict
+from queue import Empty, Queue
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -16,6 +18,7 @@ from sglang.srt.disaggregation.common.conn import CommonKVManager
 from sglang.srt.disaggregation.common.staging_handler import PrefillStagingContext
 from sglang.srt.disaggregation.common.utils import pack_int_lists
 from sglang.srt.disaggregation.nixl.conn import (
+    TRANSFER_FAILED,
     KVArgsRegisterInfo,
     NixlKVManager,
     NixlKVReceiver,
@@ -330,6 +333,254 @@ class TestNixlKVSenderChunkPolicy(CustomTestCase):
         self.assertTrue(sender.should_send_kv_chunk(3, last_chunk=False))
 
 
+class TestNixlFailurePropagation(CustomTestCase):
+    def _make_decode_manager(self, request_status):
+        mgr = object.__new__(NixlKVManager)
+        mgr.request_status = request_status
+        mgr.failure_records = {}
+        mgr.failure_lock = threading.Lock()
+        mgr.record_failure = CommonKVManager.record_failure.__get__(
+            mgr, CommonKVManager
+        )
+        mgr.update_status = CommonKVManager.update_status.__get__(mgr, CommonKVManager)
+        mgr._transfer_failure_lock = threading.Lock()
+        return mgr
+
+    def test_transfer_failure_marks_active_decode_room_failed(self):
+        for status in (
+            KVPoll.WaitingForInput,
+            KVPoll.Transferring,
+        ):
+            with self.subTest(status=status):
+                mgr = self._make_decode_manager({7: status})
+
+                mgr._handle_transfer_failure(
+                    [TRANSFER_FAILED, b"7", b"state index length mismatch"]
+                )
+
+                self.assertEqual(mgr.request_status[7], KVPoll.Failed)
+                self.assertEqual(mgr.failure_records[7], "state index length mismatch")
+
+    def test_transfer_failure_is_idempotent_for_terminal_or_unknown_room(self):
+        for request_status in ({7: KVPoll.Failed}, {7: KVPoll.Success}, {}):
+            with self.subTest(request_status=request_status):
+                mgr = self._make_decode_manager(request_status.copy())
+
+                mgr._handle_transfer_failure(
+                    [TRANSFER_FAILED, b"7", b"state index length mismatch"]
+                )
+
+                self.assertEqual(mgr.request_status, request_status)
+                self.assertEqual(mgr.failure_records, {})
+
+    def test_transfer_failure_uses_default_reason_when_empty(self):
+        mgr = self._make_decode_manager({7: KVPoll.WaitingForInput})
+
+        mgr._handle_transfer_failure([TRANSFER_FAILED, b"7", b""])
+
+        self.assertEqual(mgr.request_status[7], KVPoll.Failed)
+        self.assertEqual(mgr.failure_records[7], "Prefill signaled transfer failure")
+
+    def test_malformed_transfer_failure_is_ignored(self):
+        mgr = self._make_decode_manager({7: KVPoll.WaitingForInput})
+
+        for message in (
+            [TRANSFER_FAILED],
+            [TRANSFER_FAILED, b"not-a-room", b"failure"],
+            [TRANSFER_FAILED, b"7", b"\xff"],
+        ):
+            with self.subTest(message=message):
+                mgr._handle_transfer_failure(message)
+
+        self.assertEqual(mgr.request_status[7], KVPoll.WaitingForInput)
+        self.assertEqual(mgr.failure_records, {})
+
+    def _make_prefill_notification_manager(self, infos):
+        mgr = object.__new__(NixlKVManager)
+        mgr.transfer_infos = {7: infos}
+        mgr._transfer_info_lock = threading.Lock()
+        mgr._failure_notification_lock = threading.Lock()
+        mgr._pending_failure_notifications = {}
+        mgr._failure_notification_queue = Queue()
+        mgr.bootstrap_timeout = 5
+        return mgr
+
+    def test_prefill_queues_each_decode_endpoint_once(self):
+        mgr = self._make_prefill_notification_manager(
+            {
+                "agent-0": SimpleNamespace(
+                    endpoint="127.0.0.1",
+                    dst_port=1000,
+                    required_dst_info_num=3,
+                ),
+                "agent-1": SimpleNamespace(
+                    endpoint="127.0.0.1",
+                    dst_port=1001,
+                    required_dst_info_num=3,
+                ),
+                "agent-1-duplicate": SimpleNamespace(
+                    endpoint="127.0.0.1",
+                    dst_port=1001,
+                    required_dst_info_num=3,
+                ),
+            }
+        )
+
+        mgr.notify_decode_transfer_failure(7, "state index length mismatch")
+        mgr.notify_decode_transfer_failure(7, "state index length mismatch")
+
+        self.assertEqual(
+            mgr._failure_notification_queue.get_nowait(),
+            (
+                7,
+                "state index length mismatch",
+                [("127.0.0.1", 1000), ("127.0.0.1", 1001)],
+            ),
+        )
+        with self.assertRaises(Empty):
+            mgr._failure_notification_queue.get_nowait()
+
+    def test_prefill_queues_late_endpoint_after_partial_registration(self):
+        def info(port):
+            return SimpleNamespace(
+                endpoint="127.0.0.1",
+                dst_port=port,
+                required_dst_info_num=3,
+            )
+
+        mgr = self._make_prefill_notification_manager(
+            {"agent-0": info(1000), "agent-1": info(1001)}
+        )
+
+        mgr.notify_decode_transfer_failure(7, "state index length mismatch")
+
+        self.assertEqual(
+            mgr._failure_notification_queue.get_nowait(),
+            (
+                7,
+                "state index length mismatch",
+                [("127.0.0.1", 1000), ("127.0.0.1", 1001)],
+            ),
+        )
+        self.assertIn(7, mgr._pending_failure_notifications)
+
+        with mgr._transfer_info_lock:
+            captured = mgr._capture_failed_room_registration(7, "agent-2", info(1002))
+
+        room, reason, endpoints = mgr._failure_notification_queue.get_nowait()
+        self.assertTrue(captured)
+        self.assertEqual(room, 7)
+        self.assertEqual(reason, "state index length mismatch")
+        self.assertEqual(endpoints, [("127.0.0.1", 1002)])
+        pending = mgr._pending_failure_notifications[7]
+        self.assertEqual(pending.seen_agents, {"agent-0", "agent-1", "agent-2"})
+
+    def test_failure_worker_sends_nonblocking_wire_message(self):
+        info = SimpleNamespace(
+            endpoint="127.0.0.1",
+            dst_port=1000,
+            required_dst_info_num=1,
+        )
+        mgr = self._make_prefill_notification_manager({"agent-0": info})
+        socket = MagicMock()
+        mgr._connect = MagicMock(return_value=socket)
+
+        mgr.notify_decode_transfer_failure(7, "state index length mismatch")
+        worker = threading.Thread(target=mgr._failure_notification_worker, daemon=True)
+        worker.start()
+
+        deadline = time.monotonic() + 2
+        while socket.send_multipart.call_count == 0 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        while 7 in mgr._pending_failure_notifications and time.monotonic() < deadline:
+            time.sleep(0.01)
+        socket.send_multipart.assert_called_once()
+        self.assertEqual(
+            socket.send_multipart.call_args.args[0],
+            [TRANSFER_FAILED, b"7", b"state index length mismatch"],
+        )
+        self.assertNotEqual(socket.send_multipart.call_args.kwargs["flags"], 0)
+        self.assertNotIn(7, mgr._pending_failure_notifications)
+
+    @patch("sglang.srt.disaggregation.nixl.conn.time.monotonic")
+    def test_pending_notification_expires_without_retaining_room_state(self, mock_time):
+        mock_time.side_effect = [10, 20]
+        mgr = self._make_prefill_notification_manager({})
+
+        mgr.notify_decode_transfer_failure(7, "bootstrap failed")
+        mgr._prune_pending_failure_notifications()
+
+        self.assertNotIn(7, mgr._pending_failure_notifications)
+
+    def test_sender_failure_notifies_decode_before_cleanup(self):
+        mgr = MagicMock()
+        mgr.exceptions = {7: RuntimeError("state index length mismatch")}
+        mgr.failure_records = {7: "state index length mismatch"}
+        mgr.failure_lock = threading.Lock()
+        sender = object.__new__(NixlKVSender)
+        sender.kv_mgr = mgr
+        sender.bootstrap_room = 7
+        sender.conclude_state = None
+        sender._send_failed = False
+        sender._send_error = None
+        sender.clear = MagicMock()
+        events = []
+        mgr.notify_decode_transfer_failure.side_effect = lambda *args: events.append(
+            "notify"
+        )
+        sender.clear.side_effect = lambda: events.append("clear")
+
+        with self.assertRaisesRegex(RuntimeError, "state index length mismatch"):
+            sender.failure_exception()
+
+        mgr.notify_decode_transfer_failure.assert_called_once_with(
+            7, "state index length mismatch"
+        )
+        sender.clear.assert_called_once()
+        self.assertEqual(events, ["notify", "clear"])
+
+    def test_sender_clear_releases_room_state_with_pending_notification(self):
+        mgr = self._make_prefill_notification_manager(
+            {
+                "agent-0": SimpleNamespace(
+                    endpoint="127.0.0.1",
+                    dst_port=1000,
+                    required_dst_info_num=2,
+                )
+            }
+        )
+        mgr.request_status = {7: KVPoll.Failed}
+        mgr.req_to_decode_prefix_len = {7: 4}
+        mgr.enable_staging = False
+        mgr.notify_decode_transfer_failure(7, "bootstrap failed")
+        sender = object.__new__(NixlKVSender)
+        sender.kv_mgr = mgr
+        sender.bootstrap_room = 7
+
+        sender.clear()
+
+        self.assertNotIn(7, mgr.request_status)
+        self.assertNotIn(7, mgr.req_to_decode_prefix_len)
+        self.assertNotIn(7, mgr.transfer_infos)
+        self.assertIn(7, mgr._pending_failure_notifications)
+
+    def test_sender_abort_notifies_decode(self):
+        mgr = MagicMock()
+        sender = object.__new__(NixlKVSender)
+        sender.kv_mgr = mgr
+        sender.bootstrap_room = 7
+        sender.conclude_state = None
+
+        sender.abort()
+
+        mgr.record_failure.assert_called_once_with(7, "Aborted by AbortReq.")
+        mgr.update_status.assert_called_once_with(7, KVPoll.Failed)
+        mgr.notify_decode_transfer_failure.assert_called_once_with(
+            7, "Aborted by AbortReq."
+        )
+        self.assertTrue(sender._send_failed)
+
+
 class TestNixlNotifications(CustomTestCase):
     def _make_manager(self, messages, required=None):
         mgr = object.__new__(NixlKVManager)
@@ -396,6 +647,8 @@ class TestNixlReceiverPoll(CustomTestCase):
         mgr.transfer_statuses = {}
         mgr.addr_to_rooms_tracker = defaultdict(set)
         mgr.addr_to_rooms_tracker["prefill:8998"].add(11)
+        mgr._transfer_failure_lock = threading.Lock()
+        mgr.enable_staging = False
 
         receiver = object.__new__(NixlKVReceiver)
         receiver.kv_mgr = mgr
@@ -456,6 +709,52 @@ class TestNixlReceiverPoll(CustomTestCase):
         self.assertNotIn(11, mgr.transfer_statuses)
         self.assertNotIn(11, mgr.addr_to_rooms_tracker["prefill:8998"])
         self.assertEqual(receiver.conclude_state, KVPoll.Success)
+        mgr.update_status.assert_called_once_with(11, KVPoll.Success)
+
+    @patch("sglang.srt.disaggregation.nixl.conn.time.time")
+    def test_transfer_failure_wins_race_with_local_completion(self, mock_time):
+        mock_time.return_value = 12.0
+        receiver, mgr = self._make_receiver(status=KVPoll.WaitingForInput)
+        receiver.started_transfer = True
+        receiver.init_time = 10.0
+        mgr.check_status.side_effect = [KVPoll.WaitingForInput, KVPoll.Failed]
+        mgr.check_transfer_done.return_value = True
+        mgr.transfer_statuses = {11: TransferStatus()}
+
+        self.assertEqual(receiver.poll(), KVPoll.Failed)
+        self.assertEqual(receiver.conclude_state, KVPoll.Failed)
+        self.assertIn(11, mgr.transfer_statuses)
+        mgr.update_status.assert_not_called()
+
+    def test_clear_removes_decode_transfer_tracking(self):
+        receiver, mgr = self._make_receiver()
+        mgr.request_status = {11: KVPoll.Failed}
+        mgr.required_prefill_response_num_table = {11: 1}
+        mgr.prefill_response_tracker = {11: set()}
+        mgr.transfer_statuses = {11: TransferStatus()}
+
+        receiver.clear()
+
+        self.assertNotIn(11, mgr.request_status)
+        self.assertNotIn(11, mgr.transfer_statuses)
+        self.assertEqual(mgr.addr_to_rooms_tracker["prefill:8998"], set())
+
+    def test_clear_removes_staging_room_tracking(self):
+        receiver, mgr = self._make_receiver()
+        mgr.request_status = {11: KVPoll.Failed}
+        mgr.required_prefill_response_num_table = {11: 1}
+        mgr.prefill_response_tracker = {11: set()}
+        mgr.enable_staging = True
+        mgr._staging_ctx = SimpleNamespace(
+            room_receivers={11: receiver}, room_bootstrap={11: [object()]}
+        )
+        mgr._chunk_writer_counts = {11: {0: [object()]}}
+
+        receiver.clear()
+
+        self.assertNotIn(11, mgr._staging_ctx.room_receivers)
+        self.assertNotIn(11, mgr._staging_ctx.room_bootstrap)
+        self.assertNotIn(11, mgr._chunk_writer_counts)
 
 
 class TestNixlNodeFailure(CustomTestCase):
@@ -528,6 +827,7 @@ class TestNixlStaging(CustomTestCase):
             kv_head_num=1,
         )
         mgr.server_args = SimpleNamespace(chunked_prefill_size=4)
+        mgr._transfer_info_lock = threading.Lock()
         return mgr
 
     def test_register_buffer_to_engine_groups_kv_memory_kinds_in_one_pass(self):
