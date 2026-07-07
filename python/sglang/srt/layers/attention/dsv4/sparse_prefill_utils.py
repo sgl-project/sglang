@@ -136,6 +136,9 @@ def combine_topk_swa_indices(
     assert compressed_base.dtype == torch.int32
     assert swa_base.dtype == torch.int32
     assert compress_ratio >= 1, "compress_ratio must be >= 1 (use topk=0 for SWA-only)"
+    assert (
+        topk_indices.shape[-1] >= topk
+    ), f"topk_indices width {topk_indices.shape[-1]} must be >= topk {topk}"
 
     num_tokens = topk_indices.shape[0]
     num_reqs = seq_lens.shape[0]
@@ -279,8 +282,6 @@ def _build_swa_token_ids_kernel(
         tl.store(out_ptr + out_off + i, swa_id)
 
 
-# The configured top-k follows the live compressed extent. Keep its exact
-# value runtime while retaining stride-alignment and padded-width specialization.
 @triton.jit(do_not_specialize=["top_k"])
 def _combine_topk_swa_indices_kernel(
     combined_indices_ptr,
