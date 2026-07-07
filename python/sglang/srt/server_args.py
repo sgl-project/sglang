@@ -712,9 +712,14 @@ class ServerArgs:
                 "lof",
                 "priority",
                 "routing-key",
+                "sjf",
             ],
         ),
     ] = "fcfs"
+    sjf_aging_tokens_per_s: A[
+        float,
+        "Aging rate for --schedule-policy sjf: tokens of job-length credit granted per second of queue wait. Higher values approach FCFS; lower values approach pure shortest-job-first.",
+    ] = 1024.0
     enable_priority_scheduling: A[
         bool,
         "Enable priority scheduling. Requests with higher priority integer values will be scheduled first by default.",

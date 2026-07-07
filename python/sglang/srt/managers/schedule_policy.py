@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 
 import os
 import random
+import time
 from collections import Counter, defaultdict
 from contextlib import contextmanager
 from enum import Enum, auto
@@ -144,6 +145,12 @@ def match_prefix_for_req(
     return match_result
 
 
+# Aging rate for the "sjf" policy: tokens of job-length credit granted per
+# second of queue wait. At 1024 tok/s an 8192-token request outranks a fresh
+# 128-token request after ~8 seconds of waiting.
+SJF_AGING_TOKENS_PER_S = 1024.0
+
+
 class CacheAwarePolicy(Enum):
     """Scheduling policies that are aware of the tree cache."""
 
@@ -158,6 +165,7 @@ class CacheAgnosticPolicy(Enum):
     LOF = "lof"  # longest output first
     RANDOM = "random"
     ROUTING_KEY = "routing-key"  # prioritize by routing key frequency in running batch
+    SJF = "sjf"  # shortest job first (uncached input length) with aging
 
 
 class SchedulePolicy:
@@ -231,6 +239,11 @@ class SchedulePolicy:
             elif policy == CacheAgnosticPolicy.ROUTING_KEY:
                 if running_batch is not None:
                     SchedulePolicy._sort_by_routing_key(waiting_queue, running_batch)
+            elif policy == CacheAgnosticPolicy.SJF:
+                SchedulePolicy._sort_by_shortest_job(
+                    waiting_queue,
+                    get_server_args().sjf_aging_tokens_per_s,
+                )
             else:
                 raise ValueError(f"Unknown CacheAgnostic Policy: {policy=}")
 
@@ -359,6 +372,27 @@ class SchedulePolicy:
             )
         else:
             waiting_queue.sort(key=lambda x: -x.sampling_params.max_new_tokens)
+
+    @staticmethod
+    def _sort_by_shortest_job(
+        waiting_queue: List[Req],
+        aging_tokens_per_s: float = SJF_AGING_TOKENS_PER_S,
+    ) -> None:
+        """Shortest-job-first with aging for prefill-only workloads.
+
+        Sorts by uncached input length (the service-time proxy) minus an
+        aging credit per waited second, so sufficiently old long requests
+        overtake fresh short ones instead of starving.
+        """
+        now = time.perf_counter()
+
+        def effective_job_len(req: Req) -> float:
+            uncached = len(req.origin_input_ids) - req.num_matched_prefix_tokens
+            entry = req.time_stats.wait_queue_entry_time
+            waited_s = (now - entry) if entry > 0 else 0.0
+            return uncached - aging_tokens_per_s * waited_s
+
+        waiting_queue.sort(key=effective_job_len)
 
     @staticmethod
     def _sort_randomly(waiting_queue: List[Req]) -> None:
