@@ -442,6 +442,37 @@ class TestDSparkDraftInputBatch(CustomTestCase):
         self.assertEqual(a.prefill_tail_valid_mask.tolist(), [[True], [True]])
         self.assertEqual(a.transfer_warmup_rounds.tolist(), [0, 2])
 
+    def test_future_indices_merge_pads_variable_prefill_tail_width(self):
+        t = self.torch
+        a = self.cls(
+            bonus_tokens=t.tensor([10], dtype=t.int64),
+            new_seq_lens=t.tensor([100], dtype=t.int64),
+            prefill_tail_hidden_states=t.tensor([[[1.0], [2.0]]]),
+            prefill_tail_valid_mask=t.tensor([[True, True]]),
+            transfer_warmup_rounds=t.tensor([1], dtype=t.int32),
+            future_indices=t.tensor([5], dtype=t.int64),
+        )
+        b = self.cls(
+            bonus_tokens=t.tensor([11], dtype=t.int64),
+            new_seq_lens=t.tensor([101], dtype=t.int64),
+            prefill_tail_hidden_states=t.tensor([[[3.0], [4.0], [5.0]]]),
+            prefill_tail_valid_mask=t.tensor([[True, True, True]]),
+            transfer_warmup_rounds=t.tensor([0], dtype=t.int32),
+            future_indices=t.tensor([6], dtype=t.int64),
+        )
+
+        a.merge_batch(b)
+
+        self.assertEqual(tuple(a.prefill_tail_hidden_states.shape), (2, 3, 1))
+        self.assertEqual(
+            a.prefill_tail_hidden_states.tolist(),
+            [[[0.0], [1.0], [2.0]], [[3.0], [4.0], [5.0]]],
+        )
+        self.assertEqual(
+            a.prefill_tail_valid_mask.tolist(),
+            [[False, True, True], [True, True, True]],
+        )
+
     def test_merge_and_filter_rich_payloads_when_both_sides_have_fields(self):
         t = self.torch
         a = self.cls(
@@ -494,6 +525,41 @@ class TestDSparkDraftInputBatch(CustomTestCase):
         self.assertEqual(a.topk_p.tolist(), [[9.0], [7.0]])
         self.assertEqual(a.hidden_valid_mask.tolist(), [[True], [True]])
         self.assertEqual(a.prefill_tail_hidden_states.tolist(), [[[3.0]], [[1.0]]])
+
+    def test_merge_pads_variable_prefill_tail_width(self):
+        t = self.torch
+        a = self.cls(
+            bonus_tokens=t.tensor([10, 11], dtype=t.int64),
+            new_seq_lens=t.tensor([100, 101], dtype=t.int64),
+            prefill_tail_hidden_states=t.tensor(
+                [[[1.0], [2.0]], [[3.0], [4.0]]]
+            ),
+            prefill_tail_valid_mask=t.tensor([[True, True], [False, True]]),
+            transfer_warmup_rounds=t.tensor([1, 1], dtype=t.int32),
+        )
+        b = self.cls(
+            bonus_tokens=t.tensor([12], dtype=t.int64),
+            new_seq_lens=t.tensor([102], dtype=t.int64),
+            prefill_tail_hidden_states=t.tensor([[[5.0], [6.0], [7.0]]]),
+            prefill_tail_valid_mask=t.tensor([[True, True, True]]),
+            transfer_warmup_rounds=t.tensor([0], dtype=t.int32),
+        )
+
+        a.merge_batch(b)
+
+        self.assertEqual(tuple(a.prefill_tail_hidden_states.shape), (3, 3, 1))
+        self.assertEqual(
+            a.prefill_tail_hidden_states.tolist(),
+            [
+                [[0.0], [1.0], [2.0]],
+                [[0.0], [3.0], [4.0]],
+                [[5.0], [6.0], [7.0]],
+            ],
+        )
+        self.assertEqual(
+            a.prefill_tail_valid_mask.tolist(),
+            [[False, True, True], [False, False, True], [True, True, True]],
+        )
 
     def test_merge_preserves_existing_hidden_payload_when_peer_payload_empty(self):
         t = self.torch

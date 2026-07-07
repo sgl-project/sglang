@@ -499,6 +499,43 @@ class DSparkDraftInputV2(SpecInput):
             self.transfer_warmup_rounds, batch_rows
         )
 
+    @staticmethod
+    def _left_pad_tail_payload(tensor: torch.Tensor, target_tail_len: int):
+        tail_len = int(tensor.shape[1])
+        if tail_len == target_tail_len:
+            return tensor
+        pad_shape = (tensor.shape[0], target_tail_len - tail_len, *tensor.shape[2:])
+        pad = tensor.new_zeros(pad_shape)
+        # Tail payloads are right-aligned so padding represents older missing
+        # positions, not newer tokens.
+        return torch.cat([pad, tensor], dim=1)
+
+    @classmethod
+    def _cat_prefill_tail_hidden(
+        cls, left: torch.Tensor, right: torch.Tensor
+    ) -> torch.Tensor:
+        if left.numel() == 0:
+            return right
+        if right.numel() == 0:
+            return left
+        tail_len = max(int(left.shape[1]), int(right.shape[1]))
+        left = cls._left_pad_tail_payload(left, tail_len)
+        right = cls._left_pad_tail_payload(right, tail_len)
+        return torch.cat([left, right], dim=0)
+
+    @classmethod
+    def _cat_prefill_tail_mask(
+        cls, left: Optional[torch.Tensor], right: Optional[torch.Tensor]
+    ) -> Optional[torch.Tensor]:
+        if left is None or left.numel() == 0:
+            return right
+        if right is None or right.numel() == 0:
+            return left
+        tail_len = max(int(left.shape[1]), int(right.shape[1]))
+        left = cls._left_pad_tail_payload(left, tail_len)
+        right = cls._left_pad_tail_payload(right, tail_len)
+        return torch.cat([left, right], dim=0)
+
     def merge_batch(self, spec_info: DSparkDraftInputV2):
         if (
             self.cur_allocated_seq_lens_cpu is not None
@@ -545,12 +582,9 @@ class DSparkDraftInputV2(SpecInput):
             if self.prefill_tail_hidden_states.numel() == 0:
                 self.prefill_tail_hidden_states = spec_info.prefill_tail_hidden_states
             elif spec_info.prefill_tail_hidden_states.numel() > 0:
-                self.prefill_tail_hidden_states = torch.cat(
-                    [
-                        self.prefill_tail_hidden_states,
-                        spec_info.prefill_tail_hidden_states,
-                    ],
-                    dim=0,
+                self.prefill_tail_hidden_states = self._cat_prefill_tail_hidden(
+                    self.prefill_tail_hidden_states,
+                    spec_info.prefill_tail_hidden_states,
                 )
             if (
                 self.prefill_tail_valid_mask is None
@@ -561,12 +595,9 @@ class DSparkDraftInputV2(SpecInput):
                 spec_info.prefill_tail_valid_mask is not None
                 and spec_info.prefill_tail_valid_mask.numel() > 0
             ):
-                self.prefill_tail_valid_mask = torch.cat(
-                    [
-                        self.prefill_tail_valid_mask,
-                        spec_info.prefill_tail_valid_mask,
-                    ],
-                    dim=0,
+                self.prefill_tail_valid_mask = self._cat_prefill_tail_mask(
+                    self.prefill_tail_valid_mask,
+                    spec_info.prefill_tail_valid_mask,
                 )
             self.transfer_warmup_rounds = torch.cat(
                 [self.transfer_warmup_rounds, spec_info.transfer_warmup_rounds],
@@ -611,12 +642,9 @@ class DSparkDraftInputV2(SpecInput):
         elif spec_info.prefill_tail_hidden_states.numel() == 0:
             pass
         else:
-            self.prefill_tail_hidden_states = torch.cat(
-                [
-                    self.prefill_tail_hidden_states,
-                    spec_info.prefill_tail_hidden_states,
-                ],
-                dim=0,
+            self.prefill_tail_hidden_states = self._cat_prefill_tail_hidden(
+                self.prefill_tail_hidden_states,
+                spec_info.prefill_tail_hidden_states,
             )
         if (
             self.prefill_tail_valid_mask is None
@@ -627,9 +655,8 @@ class DSparkDraftInputV2(SpecInput):
             spec_info.prefill_tail_valid_mask is not None
             and spec_info.prefill_tail_valid_mask.numel() > 0
         ):
-            self.prefill_tail_valid_mask = torch.cat(
-                [self.prefill_tail_valid_mask, spec_info.prefill_tail_valid_mask],
-                dim=0,
+            self.prefill_tail_valid_mask = self._cat_prefill_tail_mask(
+                self.prefill_tail_valid_mask, spec_info.prefill_tail_valid_mask
             )
         self.transfer_warmup_rounds = torch.cat(
             [self.transfer_warmup_rounds, spec_info.transfer_warmup_rounds], dim=0
