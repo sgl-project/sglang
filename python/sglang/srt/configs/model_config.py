@@ -1299,6 +1299,7 @@ class ModelConfig:
             "quark",
             "modelslim",
             "quark_mxfp4",
+            "auto-round",
         ]
         compatible_quantization_methods = {
             "modelopt_fp8": ["modelopt"],
