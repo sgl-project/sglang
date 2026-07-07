@@ -198,7 +198,7 @@ curl -X POST http://127.0.0.1:30000/start_profile \
 - `start_step` (optional): Step number at which to start profiling (inclusive). Useful for skipping warmup iterations
 - `activities` (optional): List of activities to profile, e.g., `["CPU", "GPU"]`. Default is `["CPU", "GPU"]`
 - `merge_profiles` (optional): Whether to merge distributed traces. Default is `false`
-- `roofline_annotations` (optional): Whether to add per-iteration annotations describing the request and KV-length distribution to the trace, for roofline-style analysis. Default is `false`. See [Roofline annotations](#roofline-annotations) below.
+- `roofline_annotations` (optional): Whether to fold per-iteration request and KV-length aggregates into the trace's `step[...]` markers, for roofline-style analysis. Default is `false`. See [Roofline annotations](#roofline-annotations) below.
 
 **Note on step ranges:** Profiling starts at `start_step` (inclusive) and continues for `num_steps` iterations. For example, with `start_step=3` and `num_steps=10`, profiling captures steps 3, 4, 5, 6, 7, 8, 9, 10, 11, and 12 (10 steps total, starting from step 3).
 
@@ -225,21 +225,21 @@ curl -X POST http://127.0.0.1:30000/start_profile
 
 #### Roofline annotations
 
-Set `roofline_annotations` to `true` to add detailed per-iteration annotations to the trace. For every execution step that runs while profiling is active, SGLang emits a marker on the GPU stream that aggregates the request and KV-length distribution of that step. This lets you reconstruct roofline-style compute and memory bounds directly from the trace, without per-request details.
+Set `roofline_annotations` to `true` to fold per-iteration roofline aggregates into SGLang's existing per-forward `step[...]` span. For every execution step that runs while profiling is active, SGLang augments that step's marker on the GPU stream with the request and KV-length distribution of the step, so you can reconstruct roofline-style compute and memory bounds directly from the trace without per-request details.
 
-Each annotation has the form:
+Only the genuinely-new quantities are appended: the base `step[...]` label already carries `bs` (batch size) and, for prefill, `toks`, so those are not duplicated. The added fields are prefixed by phase — `c_` for context (prefill) and `g_` for generation (decode):
 
-```text
-execute_<bs>_context_<R_C>(sq<N_Q>sk<N_KV>sqsq<N_Q²>sqsk<N_Q·N_KV>)_generation_<R_G>(sq<N_Q>sk<N_KV>sqsq<N_Q²>sqsk<N_Q·N_KV>)
-```
-
-where `bs` is the total number of scheduled query tokens across both phases, the `context_` group aggregates prefill requests, and the `generation_` group aggregates decode requests. Within each group:
-
-- `R_C` / `R_G`: number of context (prefill) / generation (decode) requests in the step
-- `sq`: total query tokens (`Σ N_Q`)
-- `sk`: total KV tokens (`Σ N_KV`)
 - `sqsq`: sum of squared query tokens per request (`Σ N_Q²`)
 - `sqsk`: sum of query·KV tokens per request (`Σ N_Q·N_KV`)
+- `sk`: total KV tokens (`Σ N_KV`)
+
+A pure prefill (`EXTEND`) or decode (`DECODE`) forward emits a single group; a mixed forward emits both, with `c=`/`g=` request counts and per-phase `c_sq`/`g_sq` query-token totals. Example labels:
+
+```text
+step[EXTEND bs=1 toks=1025 c_sqsq=1050625 c_sqsk=1050625 c_sk=1025]
+step[DECODE bs=64 g_sqsq=64 g_sqsk=100032 g_sk=100032]
+step[MIXED bs=66 c=2 g=64 c_sq=2048 c_sk=2048 c_sqsq=2097152 c_sqsk=2097152 g_sq=64 g_sk=65600 g_sqsq=64 g_sqsk=65600]
+```
 
 ```bash Command
 # Profile 10 steps with roofline annotations enabled
@@ -253,7 +253,7 @@ curl -X POST http://127.0.0.1:30000/start_profile \
   }'
 ```
 
-The annotations only appear when profiling is active, so they add no overhead on the normal serving path. The behavior is identical in eager and CUDA graph modes. When viewing the trace (see [View traces](#view-traces)), the `execute_..._context_..._generation_...` markers appear on the GPU stream alongside the kernels for each step.
+The annotations only appear when profiling is active with `roofline_annotations` enabled, so they add no overhead on the normal serving path. The behavior is identical in eager and CUDA graph modes. When viewing the trace (see [View traces](#view-traces)), the augmented `step[...]` markers appear on the GPU stream alongside the kernels for each step.
 
 #### Using `/stop_profile` endpoint
 
