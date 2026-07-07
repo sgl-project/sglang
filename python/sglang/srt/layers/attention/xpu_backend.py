@@ -726,19 +726,17 @@ class XPUAttentionBackend(AttentionBackend):
         )
         window_size = (layer.sliding_window_size, 0) if is_hybrid_swa else (-1, -1)
 
-        # currently no FP8 KV cache supported
         k_descale, v_descale = None, None
-        # # only use kv scaling if: 1) fp8 kv is explicitly enabled, 2) RadixAttention
-        # # has corresponding quantization method so that layer.k_scale is not None,
-        # # 3) layer.head_dim <= 256 since fa3 kernel require fp16 and bf16 data type in this case.
-        # if self.kv_cache_dtype_str != "auto" and layer.head_dim <= 256:
-        #     if layer.k_scale is not None:
-        #         descale_shape = (forward_batch.batch_size, layer.tp_k_head_num)
-        #         k_descale = layer.k_scale.expand(descale_shape)
-        #         v_descale = layer.v_scale.expand(descale_shape)
-        #     q = q.to(self.kv_cache_dtype)
-        #     q_rope = q_rope.to(self.kv_cache_dtype) if q_rope is not None else None
-        #     k_rope = k_rope.to(self.kv_cache_dtype) if k_rope is not None else None
+        if self.kv_cache_dtype_str != "auto" and layer.head_dim <= 256:
+            if layer.k_scale is not None:
+                descale_shape = (forward_batch.batch_size, layer.tp_k_head_num)
+                k_descale = layer.k_scale.expand(descale_shape)
+                v_descale = layer.v_scale.expand(descale_shape)
+            else:
+                # No per-tensor HF scale (e.g. gpt_oss): KV is quantized with
+                # implicit scale=1.0, so dequantization is a multiply by 1.0.
+                k_descale = torch.ones(1, dtype=torch.float32, device=q.device)
+                v_descale = torch.ones(1, dtype=torch.float32, device=q.device)
         # Mirror FlashAttentionBackend: ENCODER_ONLY / bidirectional layers
         # (DFLASH draft full_attention) are non-causal, not just cross-attention.
         causal = not (
@@ -817,17 +815,6 @@ class XPUAttentionBackend(AttentionBackend):
             value_cache = value_cache.view(
                 -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
             )
-            # XPU flash-attn does not support fp8 inputs; use a lazy mirror
-            # buffer to avoid re-allocating and copying the full KV cache on
-            # every prefill step.  Only newly-written pages are copied.
-            # This only fires when kv_cache_quant_algo=FP8 is set in the model
-            # config (e.g. nvidia/Llama-3.3-70B-Instruct-FP8).  All other models
-            # have key_cache.dtype == q.dtype already so the branch is skipped.
-            _prefill_compute_dtype = q.dtype
-            if key_cache.dtype != _prefill_compute_dtype:
-                key_cache, value_cache = self._get_kv_mirror(
-                    layer.layer_id, key_cache, value_cache, _prefill_compute_dtype
-                )
             if self.is_encoder_decoder and forward_batch.encoder_lens is not None:
                 page_table, cache_seqlens, causal = self._encoder_decoder_page_table(
                     layer, metadata
@@ -1350,19 +1337,18 @@ class XPUAttentionBackend(AttentionBackend):
             kwargs["sinks"] = sinks
 
         k_descale, v_descale = None, None
-        # Save compute dtype before any fp8 cast (XPU flash-attn does not support fp8 natively)
-        compute_dtype = q.dtype
-        # only use kv scaling if: 1) fp8 kv is explicitly enabled, 2) RadixAttention
-        # has corresponding quantization method so that layer.k_scale is not None,
-        # 3) layer.head_dim <= 256 since fa3 kernel require fp16 and bf16 data type in this case.
+        # Set k_descale/v_descale whenever fp8 KV cache is active.  The new
+        # sgl-kernel-xpu supports fp8+sinks natively for head_dim==64.
         if self.kv_cache_dtype_str != "auto" and layer.head_dim <= 256:
             if layer.k_scale is not None:
                 descale_shape = (forward_batch.batch_size, layer.tp_k_head_num)
                 k_descale = layer.k_scale.expand(descale_shape)
                 v_descale = layer.v_scale.expand(descale_shape)
-            q = q.to(self.kv_cache_dtype)
-            q_rope = q_rope.to(self.kv_cache_dtype) if q_rope is not None else None
-            k_rope = k_rope.to(self.kv_cache_dtype) if k_rope is not None else None
+            else:
+                # No per-tensor HF scale (e.g. gpt_oss): KV was quantized with
+                # implicit scale=1.0, so dequantization is multiply by 1.0.
+                k_descale = torch.ones(1, dtype=torch.float32, device=q.device)
+                v_descale = torch.ones(1, dtype=torch.float32, device=q.device)
         if not self.use_mla:
             # Do multi-head attention
 
@@ -1379,17 +1365,6 @@ class XPUAttentionBackend(AttentionBackend):
                 -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
             )
 
-            # XPU flash-attn does not support fp8 inputs; use a lazy mirror
-            # buffer to avoid re-allocating and copying the full KV cache on
-            # every decode step.  Only newly-written pages are copied.
-            # q is cast directly (.to()) since it is a small per-step tensor.
-            # Only fires for models with kv_cache_quant_algo=FP8 (e.g. Llama-3.3-FP8).
-            if key_cache.dtype != compute_dtype:
-                key_cache, value_cache = self._get_kv_mirror(
-                    layer.layer_id, key_cache, value_cache, compute_dtype
-                )
-            if q.dtype != compute_dtype:
-                q = q.to(compute_dtype)
             if self.is_encoder_decoder and forward_batch.encoder_lens is not None:
                 page_table, cache_seqlens, causal = self._encoder_decoder_page_table(
                     layer, metadata
