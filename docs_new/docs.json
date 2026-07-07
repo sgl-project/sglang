@@ -1146,6 +1146,7 @@
                   {
                     "group": "Tencent",
                     "pages": [
+                      "cookbook/autoregressive/Tencent/Hy3",
                       "cookbook/autoregressive/Tencent/Hunyuan3-Preview"
                     ]
                   },
