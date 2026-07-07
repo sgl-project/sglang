@@ -17,6 +17,17 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.state_capturer.base import BaseTopkCapturer
 
 
+def _is_scattered_a2a_backend() -> bool:
+    """DeepEP-class a2a dispatchers hand the MoE layer only this attention
+    rank's DP-local tokens (dispatch happens after top-k), so the capturer
+    must attn-TP-gather at capture time and read back from the buffer head.
+    DeepEP v2 shares this token topology with legacy DeepEP; misclassifying
+    it as a TP-MoE backend would make dp_rank > 0 read unwritten buffer rows.
+    """
+    backend = get_moe_a2a_backend()
+    return backend.is_deepep() or backend.is_deepep_v2()
+
+
 class RoutedExpertsCapturer(BaseTopkCapturer):
     """Capturer for routed experts with host buffer.
 
@@ -79,11 +90,12 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
             device_topk_size=topk_size + num_fused_shared_experts,
         )
 
-        # DeepEP a2a path: each attn-TP rank only sees its scattered slice of
+        # DeepEP-class a2a path (see _is_scattered_a2a_backend): each attn-TP
+        # rank only sees its scattered slice of
         # topk_ids. All-gather across attn-TP at capture time so device_cache
         # holds the full batch and the existing _get_local_slice / D2H sync
         # paths work unchanged. Pre-allocate the gather target.
-        if get_moe_a2a_backend().is_deepep():
+        if _is_scattered_a2a_backend():
             attn_tp_size = get_attention_tp_size() if is_dp_attention_enabled() else 1
             self.gather_buffer = torch.empty(
                 (
@@ -95,7 +107,7 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
             )
 
     def capture(self, layer_id: int, topk_indices: torch.Tensor):
-        if get_moe_a2a_backend().is_deepep():
+        if _is_scattered_a2a_backend():
             local_topk = topk_indices
             topk_indices = self.gather_buffer[
                 : local_topk.size(0) * get_attention_tp_size()
@@ -109,10 +121,11 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
         can_run_graph: bool,
         cuda_graph_batch: Optional[int],
     ) -> torch.Tensor:
-        # Under DeepEP, capture() already attn_tp_all_gathered into the head of
+        # Under DeepEP-class backends, capture() already attn_tp_all_gathered
+        # into the head of
         # the per-rank buffer, so the local DP rank's data lives at [0:N_local]
         # rather than at the global [start_pos:end_pos] offset.
-        if is_dp_attention_enabled() and not get_moe_a2a_backend().is_deepep():
+        if is_dp_attention_enabled() and not _is_scattered_a2a_backend():
             # GPU->CPU sync would break overlap; operate on CPU directly.
             local_start_pos, local_num_tokens = get_dp_local_slice_cpu(
                 forward_batch, can_run_graph, cuda_graph_batch
