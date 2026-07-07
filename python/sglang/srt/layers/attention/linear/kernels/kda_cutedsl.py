@@ -105,10 +105,13 @@ class CuteDSLKDAKernel(LinearAttnKernelBase):
         lower_bound: Optional[float] = None,
         **kwargs,
     ) -> torch.Tensor:
+        # Backstop only: ServerArgs._validate_mamba_extra_buffer rejects a
+        # non-triton effective prefill backend at config time, so extra_buffer
+        # never reaches this fused kernel with the flag set in practice.
         assert not kwargs.get("output_intermediate_states"), (
-            "KDA extra_buffer prefix-cache tracking requires the Triton prefill "
-            "backend (only chunk_kda exposes the intermediate SSM state); "
-            "the cutedsl fused kernel does not. Use --linear-attn-backend triton."
+            "KDA extra_buffer prefix-cache tracking requires the triton prefill "
+            "backend (only chunk_kda exposes the intermediate SSM state); the "
+            "cutedsl fused kernel does not. Use --linear-attn-prefill-backend triton."
         )
         head_k_dim = k.shape[-1]
         self._ensure_extend_loaded(head_k_dim)

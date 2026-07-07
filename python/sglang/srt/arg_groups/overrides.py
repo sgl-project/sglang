@@ -1002,9 +1002,19 @@ _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
 
 def supports_mamba_cache_extra_buffer(view: Any, model_arch: str) -> bool:
     """Whether ``model_arch`` supports the extra_buffer strategy on the
-    configured linear-attention backend (pure read)."""
+    configured linear-attention backend (pure read).
+
+    extra_buffer prefix caching needs the per-chunk-boundary intermediate SSM
+    state, which only the Triton prefill kernel exposes (chunk_kda /
+    chunk_gated_delta_rule). Gate on the *effective* prefill backend, i.e. the
+    per-mode ``--linear-attn-prefill-backend`` override when set, otherwise the
+    base ``--linear-attn-backend`` -- so e.g. base=triton + prefill=flashkda is
+    correctly rejected here (and by ServerArgs._validate_mamba_extra_buffer)
+    instead of only tripping the late runtime assert in the fused kernel.
+    """
     if model_arch in _MAMBA_EXTRA_BUFFER_ARCHS:
-        return view.linear_attn_backend == "triton"
+        prefill_backend = view.linear_attn_prefill_backend or view.linear_attn_backend
+        return prefill_backend == "triton"
     return False
 
 

@@ -4251,6 +4251,20 @@ class ServerArgs:
     def _validate_mamba_extra_buffer(self, view, model_arch: str):
         from sglang.srt.arg_groups.overrides import supports_mamba_cache_extra_buffer
 
+        # extra_buffer prefix caching tracks the per-chunk-boundary intermediate
+        # SSM state, which only the Triton prefill kernel exposes. Report the
+        # misconfiguration here (config time) rather than deep in the fused
+        # prefill kernel: a non-triton effective prefill backend (e.g. an
+        # explicit --linear-attn-prefill-backend flashkda / cutedsl) cannot
+        # produce the intermediate state extra_buffer depends on.
+        effective_prefill = view.linear_attn_prefill_backend or view.linear_attn_backend
+        assert effective_prefill == "triton", (
+            f"extra_buffer requires the triton linear-attention prefill backend "
+            f"(it needs the intermediate SSM state only the triton prefill kernel "
+            f"exposes), but the effective prefill backend is {effective_prefill!r}. "
+            f"Use --linear-attn-prefill-backend triton, or switch to "
+            f"--mamba-radix-cache-strategy no_buffer."
+        )
         assert supports_mamba_cache_extra_buffer(
             view, model_arch
         ), f"extra_buffer is not supported for {model_arch}; use no_buffer."
