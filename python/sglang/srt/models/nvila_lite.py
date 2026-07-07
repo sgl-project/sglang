@@ -168,7 +168,11 @@ class NVILALiteForConditionalGeneration(nn.Module):
             if name.startswith("llm."):
                 self.llm.load_weights([(name[len("llm.") :], loaded_weight)])
             else:
-                param = params_dict[name]
+                param = params_dict.get(name)
+                if param is None:
+                    # Checkpoint may carry weights absent from the live model
+                    # (e.g. patch_embedding.bias removed in transformers v5).
+                    continue
                 weight_loader = getattr(
                     param, "weight_loader", weight_utils.default_weight_loader
                 )
