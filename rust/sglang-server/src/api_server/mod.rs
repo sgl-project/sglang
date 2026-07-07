@@ -28,8 +28,8 @@ use crate::fsm::RequestState;
 use crate::ids::{RequestId, RequestIdGen};
 
 use crate::message::{
-    ChunkEvent, ControlRequest, EgressItem, EgressSink, GeneratePayload, GenerateRequest, Request,
-    RequestKind,
+    ChunkEvent, ControlRequest, EgressItem, EgressSink, GenerateBody, GeneratePayload,
+    GenerateRequest, Request, RequestKind,
 };
 use crate::runtime::ServerArgs;
 use crate::runtime::channels::{Senders, TmEvent};
@@ -170,6 +170,20 @@ impl AbortGuard {
             senders,
             rids: vec![rid],
         }
+    }
+
+    /// Guard covering no rids yet — a batch arms each as it's submitted so a
+    /// mid-fan-out disconnect aborts every request already handed to the scheduler.
+    fn new_empty(senders: Senders) -> Self {
+        Self {
+            senders,
+            rids: Vec::new(),
+        }
+    }
+
+    /// Track `rid` for abort-on-drop.
+    fn arm(&mut self, rid: RequestId) {
+        self.rids.push(rid);
     }
 
     /// Request `rid` finished naturally — don't abort it on drop.
@@ -314,18 +328,16 @@ fn abort_status(finish_reason: &Option<serde_json::Value>) -> Option<(u16, Strin
     Some((code, message))
 }
 
-/// Unary form of [`abort_status`]: the classified abort as an HTTP error response.
-fn abort_error_response(finish_reason: &Option<serde_json::Value>) -> Option<Response> {
-    let (code, message) = abort_status(finish_reason)?;
-    let status = StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    let body = serde_json::json!({ "error": { "message": message, "code": code } });
-    Some((status, Json(body)).into_response())
+/// The `{ "error": { message, code } }` object every error path emits (an SSE
+/// event's data, a unary body, or one entry of a batch array).
+fn error_value(code: u16, message: &str) -> serde_json::Value {
+    serde_json::json!({ "error": { "message": message, "code": code } })
 }
 
-/// Format a decoded [`ChunkEvent`] as one SGLang `/generate` frame. `rid` (the
-/// response `meta_info.id`) is passed in as its string form — the api-server owns
-/// the canonical id; the event's numeric `rid` is just the shard routing key.
-fn sglang_frame(out: &ChunkEvent, rid: &str) -> Vec<u8> {
+/// Format a decoded [`ChunkEvent`] as one SGLang `/generate` frame's JSON. `rid`
+/// (the response `meta_info.id`) is passed in as its string form — the api-server
+/// owns the canonical id; the event's numeric `rid` is just the shard routing key.
+fn sglang_frame_value(out: &ChunkEvent, rid: &str) -> serde_json::Value {
     let mut v = serde_json::json!({
         "text": out.text,
         "meta_info": {
@@ -385,7 +397,28 @@ fn sglang_frame(out: &ChunkEvent, rid: &str) -> Vec<u8> {
     if !out.hidden_lens.is_empty() {
         v["meta_info"]["hidden_states"] = hidden_states_rows(&out.hidden_val, &out.hidden_lens);
     }
-    serde_json::to_vec(&v).unwrap_or_default()
+    v
+}
+
+/// Format one streaming frame. Non-incremental (SGLang default): the accumulator's
+/// **cumulative** view. Incremental (`incremental_streaming_output`): this step's
+/// **delta** `text`/`output_ids`/logprobs, but with the cumulative token count in
+/// `meta_info` (matching the Python `TokenizerManager`). `delta` is this chunk's
+/// event; `acc` is the cumulative fold used for both the cumulative view and the
+/// running `completion_tokens`.
+fn stream_frame_value(
+    delta: ChunkEvent,
+    acc: &OutputAccumulator,
+    incremental: bool,
+    rid_str: &str,
+) -> serde_json::Value {
+    if incremental {
+        let mut d = delta;
+        d.completion_tokens = acc.snapshot().completion_tokens;
+        sglang_frame_value(&d, rid_str)
+    } else {
+        sglang_frame_value(acc.snapshot(), rid_str)
+    }
 }
 
 /// Generic control endpoint: returns the scheduler's response rendered straight
@@ -658,18 +691,39 @@ impl OutputAccumulator {
     }
 }
 
-async fn generate(State(state): State<AppState>, Json(payload): Json<GeneratePayload>) -> Response {
-    let stream = payload.stream;
+async fn generate(State(state): State<AppState>, Json(body): Json<GenerateBody>) -> Response {
+    let stream = body.stream;
+    // Fan `text`/`input_ids`/`sampling_params` (scalar or list) into per-request
+    // payloads. `is_batch` = list form → the response is a JSON array.
+    let (payloads, is_batch) = match body.split() {
+        Ok(v) => v,
+        Err(msg) => return (StatusCode::BAD_REQUEST, msg).into_response(),
+    };
+    if !is_batch {
+        // `split` guarantees exactly one payload for a non-batch body.
+        let payload = payloads
+            .into_iter()
+            .next()
+            .expect("split yields >=1 payload");
+        generate_single(&state, payload, stream).await
+    } else {
+        generate_batch(&state, payloads, stream).await
+    }
+}
+
+/// A single (non-batched) `/generate`: submit one request, then either stream its
+/// SSE frames or fold to one unary response.
+async fn generate_single(state: &AppState, payload: GeneratePayload, stream: bool) -> Response {
     // `return_text_in_logprobs` is decoded on the detok shard (see
     // DetokMsg::Register.decode_logprob_text) into the `*_txt` columns, so
-    // `sglang_frame` just reads them — no tokenizer needed here.
+    // `sglang_frame_value` just reads them — no tokenizer needed here.
     let kind = RequestKind::Generate(GenerateRequest {
         payload,
         input_ids: None,
         stream,
         is_health_check: false,
     });
-    let (rid, mut rx) = match submit(&state, kind).await {
+    let (rid, mut rx) = match submit(state, kind).await {
         Ok(v) => v,
         Err(()) => {
             return (StatusCode::SERVICE_UNAVAILABLE, "service unavailable").into_response();
@@ -681,105 +735,199 @@ async fn generate(State(state): State<AppState>, Json(payload): Json<GeneratePay
     let mut guard = AbortGuard::new(state.senders.clone(), rid);
     // Response `meta_info.id`, stringified once and reused for every frame.
     let rid_str = rid.0.to_string();
+    // Cumulative frames (SGLang default) vs per-step deltas.
+    let incremental = state.server_args.incremental_streaming_output();
 
     if stream {
-        // SSE: the SGLang `/generate` protocol carries **cumulative** text per
-        // frame, so fold the detok deltas back up before formatting each frame.
-        let s = async_stream::stream! {
-            let mut acc = OutputAccumulator::default();
-            let mut terminated = false;
-            while let Some(item) = rx.recv().await {
-                match item {
-                    EgressItem::Frame(out) => {
-                        acc.fold(&out);
-                        let f = sglang_frame(acc.snapshot(), &rid_str);
-                        yield Ok::<_, Infallible>(Event::default().data(String::from_utf8_lossy(&f)));
-                    }
-                    EgressItem::Done(out) => {
-                        acc.fold(&out);
-                        let final_out = acc.into_output();
-                        // A validation abort carries its status only in meta_info; surface
-                        // it as an SSE error event (like the `Error` branch), not a normal
-                        // generation frame — the stream is already a committed 200.
-                        if let Some((code, message)) = abort_status(&final_out.finish_reason) {
-                            let body = serde_json::json!({
-                                "error": { "message": message, "code": code }
-                            });
-                            yield Ok(Event::default().data(body.to_string()));
-                        } else {
-                            let f = sglang_frame(&final_out, &rid_str);
-                            yield Ok(Event::default().data(String::from_utf8_lossy(&f)));
-                        }
-                        terminated = true;
-                        break;
-                    }
-                    EgressItem::Error(e) => {
-                        let body = serde_json::json!({
-                            "error": { "message": e.to_string(), "code": e.http_status() }
-                        });
-                        yield Ok(Event::default().data(body.to_string()));
-                        terminated = true;
-                        break;
-                    }
-                    // Control results never arrive on a `/generate` request.
-                    EgressItem::Control(_) => break,
-                }
-            }
-            if terminated {
-                // Saw a real terminal — don't abort a finished request.
-                guard.disarm(rid);
-            } else {
-                // The channel closed with no terminal frame, emit an explicit
-                // error rather than a clean completion.
-                let body = serde_json::json!({
-                    "error": { "message": "stream truncated before completion", "code": 500 }
-                });
-                yield Ok(Event::default().data(body.to_string()));
-            }
-            yield Ok(Event::default().data("[DONE]"));
-        };
+        // A single request is a 1-element batch without the `index` field — reuse
+        // the same stream so the frame/abort/truncation logic lives in one place.
+        use futures::StreamExt;
+        let s = generation_event_stream(vec![(rid, rx)], guard, incremental, false)
+            .map(|data| Ok::<_, Infallible>(Event::default().data(data)));
         Sse::new(s).into_response()
     } else {
-        // Unary: fold every delta, respond once from the cumulative result.
-        let mut acc = OutputAccumulator::default();
-        while let Some(item) = rx.recv().await {
-            match item {
-                EgressItem::Frame(out) => acc.fold(&out),
-                EgressItem::Done(out) => {
-                    acc.fold(&out);
-                    guard.disarm(rid);
-                    let final_out = acc.into_output();
-                    // A validation abort carries its own HTTP status + diagnostic.
-                    if let Some(resp) = abort_error_response(&final_out.finish_reason) {
-                        return resp;
-                    }
-                    return (
-                        StatusCode::OK,
-                        [("content-type", "application/json")],
-                        sglang_frame(&final_out, &rid_str),
-                    )
-                        .into_response();
+        // Unary: fold to the terminal, respond once. Disarm only on a real terminal
+        // (a truncation leaves the guard armed so the scheduler work is aborted).
+        let (status, value, terminal) = drain_unary(&mut rx, &rid_str).await;
+        if terminal {
+            guard.disarm(rid);
+        }
+        (status, Json(value)).into_response()
+    }
+}
+
+/// Fold a unary request to its terminal → (HTTP status, result/`error` JSON, saw-terminal); `false` = truncation, caller keeps the abort guard armed. Shared by single + batch.
+async fn drain_unary(
+    rx: &mut mpsc::Receiver<EgressItem>,
+    rid_str: &str,
+) -> (StatusCode, serde_json::Value, bool) {
+    let mut acc = OutputAccumulator::default();
+    while let Some(item) = rx.recv().await {
+        match item {
+            EgressItem::Frame(out) => acc.fold(&out),
+            EgressItem::Done(out) => {
+                acc.fold(&out);
+                let final_out = acc.into_output();
+                // A validation abort carries its own HTTP status + diagnostic.
+                if let Some((code, message)) = abort_status(&final_out.finish_reason) {
+                    let status =
+                        StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                    return (status, error_value(code, &message), true);
                 }
-                EgressItem::Error(e) => {
-                    guard.disarm(rid);
-                    let code = StatusCode::from_u16(e.http_status())
-                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                    let body = serde_json::json!({
-                        "error": { "message": e.to_string(), "code": e.http_status() }
-                    });
-                    return (code, Json(body)).into_response();
-                }
-                EgressItem::Control(_) => continue, // never on `/generate`
+                return (
+                    StatusCode::OK,
+                    sglang_frame_value(&final_out, rid_str),
+                    true,
+                );
+            }
+            EgressItem::Error(e) => {
+                let code = e.http_status();
+                let status =
+                    StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                return (status, error_value(code, &e.to_string()), true);
+            }
+            EgressItem::Control(_) => continue, // never on `/generate`
+        }
+    }
+    // Sender dropped without a terminal item: the shard dropped this request (a
+    // truncation — a client disconnect would have dropped the handler future).
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        error_value(500, "response truncated before completion"),
+        false,
+    )
+}
+
+/// Batch `/generate`: submit every sub-request first so the scheduler runs them
+/// together, then either (unary) drain each in order into a JSON **array** of
+/// results, or (streaming) multiplex their egress streams into one SSE response
+/// where each frame carries its batch `index`. One [`AbortGuard`] covers the whole
+/// batch, so a client disconnect aborts them all. A failed unary item is its own
+/// `{ "error": … }` array entry; the batch response is 200.
+async fn generate_batch(
+    state: &AppState,
+    payloads: Vec<GeneratePayload>,
+    stream: bool,
+) -> Response {
+    let mut guard = AbortGuard::new_empty(state.senders.clone());
+    let mut receivers = Vec::with_capacity(payloads.len());
+    for payload in payloads {
+        let kind = RequestKind::Generate(GenerateRequest {
+            payload,
+            input_ids: None,
+            stream,
+            is_health_check: false,
+        });
+        match submit(state, kind).await {
+            Ok((rid, rx)) => {
+                guard.arm(rid);
+                receivers.push((rid, rx));
+            }
+            Err(()) => {
+                return (StatusCode::SERVICE_UNAVAILABLE, "service unavailable").into_response();
             }
         }
-        // Sender dropped without a terminal item: the shard dropped this request
-        // (a truncation — a client disconnect would have dropped this handler
-        // future instead). Report a server error and leave the guard armed so the
-        // scheduler work is aborted.
-        let body = serde_json::json!({
-            "error": { "message": "response truncated before completion", "code": 500 }
-        });
-        (StatusCode::INTERNAL_SERVER_ERROR, Json(body)).into_response()
+    }
+
+    if stream {
+        // Multiplex the N streams (mirrors the Python `_handle_batch_request` path);
+        // `guard` moves into the stream so a disconnect aborts what's unfinished.
+        use futures::StreamExt;
+        let incremental = state.server_args.incremental_streaming_output();
+        let s = generation_event_stream(receivers, guard, incremental, true)
+            .map(|data| Ok::<_, Infallible>(Event::default().data(data)));
+        Sse::new(s).into_response()
+    } else {
+        // Unary: drain each in order (already all submitted, so they run together).
+        let mut results = Vec::with_capacity(receivers.len());
+        for (rid, mut rx) in receivers {
+            let rid_str = rid.0.to_string();
+            let (_status, value, terminal) = drain_unary(&mut rx, &rid_str).await;
+            if terminal {
+                guard.disarm(rid);
+            }
+            results.push(value);
+        }
+        (StatusCode::OK, Json(serde_json::Value::Array(results))).into_response()
+    }
+}
+
+/// Await the next item from `rx`, handing the receiver back so a `FuturesUnordered`
+/// (which owns one future per poll) can re-poll it. `None` = the channel closed.
+async fn recv_indexed(
+    index: usize,
+    mut rx: mpsc::Receiver<EgressItem>,
+) -> (usize, mpsc::Receiver<EgressItem>, Option<EgressItem>) {
+    let item = rx.recv().await;
+    (index, rx, item)
+}
+
+/// Multiplex `receivers` (one per request) into SSE `data` strings + a final `[DONE]`;
+/// `with_index` tags each frame (batch only), `incremental` = delta vs cumulative,
+/// `guard` aborts unfinished on drop.
+fn generation_event_stream(
+    receivers: Vec<(RequestId, mpsc::Receiver<EgressItem>)>,
+    mut guard: AbortGuard,
+    incremental: bool,
+    with_index: bool,
+) -> impl futures::Stream<Item = String> {
+    async_stream::stream! {
+        use futures::StreamExt;
+
+        let n = receivers.len();
+        let rids: Vec<RequestId> = receivers.iter().map(|(rid, _)| *rid).collect();
+        let rid_strs: Vec<String> = rids.iter().map(|r| r.0.to_string()).collect();
+        let mut accs: Vec<OutputAccumulator> =
+            (0..n).map(|_| OutputAccumulator::default()).collect();
+
+        // Tag a frame with its batch position (batch only; a single request omits it).
+        let tag = |mut v: serde_json::Value, i: usize| {
+            if with_index {
+                v["index"] = serde_json::json!(i);
+            }
+            v.to_string()
+        };
+
+        // Poll all receivers concurrently; re-arm a receiver's future after each
+        // non-terminal frame so its stream keeps flowing.
+        let mut futs = futures::stream::FuturesUnordered::new();
+        for (i, (_, rx)) in receivers.into_iter().enumerate() {
+            futs.push(recv_indexed(i, rx));
+        }
+
+        while let Some((i, rx, item)) = futs.next().await {
+            match item {
+                Some(EgressItem::Frame(out)) => {
+                    accs[i].fold(&out);
+                    let v = stream_frame_value(out, &accs[i], incremental, &rid_strs[i]);
+                    yield tag(v, i);
+                    futs.push(recv_indexed(i, rx)); // keep this item flowing
+                }
+                Some(EgressItem::Done(out)) => {
+                    accs[i].fold(&out);
+                    // A validation abort → an error object, not a frame.
+                    let v = match abort_status(&out.finish_reason) {
+                        Some((code, message)) => error_value(code, &message),
+                        None => stream_frame_value(out, &accs[i], incremental, &rid_strs[i]),
+                    };
+                    yield tag(v, i);
+                    guard.disarm(rids[i]); // terminal → not re-pushed
+                }
+                Some(EgressItem::Error(e)) => {
+                    yield tag(error_value(e.http_status(), &e.to_string()), i);
+                    guard.disarm(rids[i]);
+                }
+                Some(EgressItem::Control(_)) => {
+                    futs.push(recv_indexed(i, rx)); // never on /generate; keep polling
+                }
+                None => {
+                    // Channel closed with no terminal → truncation for this item;
+                    // leave its rid armed so the scheduler work is aborted.
+                    yield tag(error_value(500, "response truncated before completion"), i);
+                }
+            }
+        }
+        yield "[DONE]".to_string();
     }
 }
 
@@ -858,7 +1006,7 @@ mod logprob_shape_tests {
             in_lp_txt: vec!["<s>".into(), "hi".into()],
             ..Default::default()
         };
-        let frame: serde_json::Value = serde_json::from_slice(&sglang_frame(&out, "1")).unwrap();
+        let frame = sglang_frame_value(&out, "1");
         assert_eq!(
             frame["meta_info"]["input_token_logprobs"],
             serde_json::json!([[serde_json::Value::Null, 10, "<s>"], [-0.5f32, 20, "hi"]])
@@ -906,17 +1054,6 @@ mod logprob_shape_tests {
         assert_eq!(opt_texts(&t), Some(t.as_slice()));
     }
 
-    /// A validation abort (`status_code` set) maps to that HTTP status — the
-    /// over-context request must not come back as a 200.
-    #[test]
-    fn validation_abort_maps_to_its_status() {
-        let fr = Some(serde_json::json!({
-            "type": "abort", "message": "over the 40954-token limit", "status_code": 400
-        }));
-        let resp = abort_error_response(&fr).expect("abort with status → error response");
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    }
-
     /// The shared classifier both paths use: a validation abort yields its
     /// `(code, message)` (the streaming path turns this into an SSE error event
     /// instead of a normal `Done` frame); anything else yields `None`.
@@ -934,24 +1071,19 @@ mod logprob_shape_tests {
         assert!(abort_status(&None).is_none());
     }
 
-    /// A normal finish, a bare abort (no status), and no finish all stay 200.
+    /// A normal finish, a bare abort (no status), and no finish are not errors
+    /// (the unary path returns them as a 200 result frame).
     #[test]
     fn non_error_finishes_stay_ok() {
+        assert!(abort_status(&Some(serde_json::json!({"type": "stop", "matched": 5}))).is_none());
+        assert!(abort_status(&Some(serde_json::json!({"type": "length", "length": 8}))).is_none());
         assert!(
-            abort_error_response(&Some(serde_json::json!({"type": "stop", "matched": 5})))
-                .is_none()
-        );
-        assert!(
-            abort_error_response(&Some(serde_json::json!({"type": "length", "length": 8})))
-                .is_none()
-        );
-        assert!(
-            abort_error_response(&Some(
+            abort_status(&Some(
                 serde_json::json!({"type": "abort", "message": "Aborted"})
             ))
             .is_none()
         );
-        assert!(abort_error_response(&None).is_none());
+        assert!(abort_status(&None).is_none());
     }
 }
 
@@ -1050,5 +1182,155 @@ mod abort_guard_tests {
         guard.disarm(RequestId(9));
         drop(guard);
         assert!(tm_rx.try_recv().is_err(), "disarmed rid must not abort");
+    }
+}
+
+#[cfg(test)]
+mod batch_stream_tests {
+    use super::*;
+    use futures::StreamExt;
+
+    fn senders() -> Senders {
+        Senders {
+            tm: flume::unbounded().0,
+            tok: flume::unbounded().0,
+            detok: vec![],
+        }
+    }
+
+    fn frame(rid: u64, text: &str) -> EgressItem {
+        EgressItem::Frame(ChunkEvent {
+            rid,
+            text: text.into(),
+            completion_tokens: 1,
+            ..Default::default()
+        })
+    }
+    fn done(rid: u64, text: &str) -> EgressItem {
+        EgressItem::Done(ChunkEvent {
+            rid,
+            text: text.into(),
+            completion_tokens: 1,
+            finish_reason: Some(serde_json::json!({ "type": "length" })),
+            ..Default::default()
+        })
+    }
+    fn parse(s: &str) -> serde_json::Value {
+        serde_json::from_str(s).expect("frame is JSON")
+    }
+
+    /// Two sub-requests' frames interleave into one stream, each tagged with its
+    /// batch `index`; text accumulates per item; `[DONE]` comes only after both
+    /// terminate, then the stream ends.
+    #[tokio::test]
+    async fn interleaves_indexes_and_accumulates() {
+        let (tx0, rx0) = mpsc::channel(8);
+        let (tx1, rx1) = mpsc::channel(8);
+        let receivers = vec![(RequestId(10), rx0), (RequestId(11), rx1)];
+        let stream =
+            generation_event_stream(receivers, AbortGuard::new_empty(senders()), false, true);
+        futures::pin_mut!(stream);
+
+        // Drive deterministically: exactly one channel has data before each poll.
+        tx0.send(frame(10, "a")).await.unwrap();
+        let v = parse(&stream.next().await.unwrap());
+        assert_eq!(v["index"], 0);
+        assert_eq!(v["text"], "a");
+
+        tx1.send(frame(11, "b")).await.unwrap();
+        let v = parse(&stream.next().await.unwrap());
+        assert_eq!(v["index"], 1);
+        assert_eq!(v["text"], "b");
+
+        tx0.send(done(10, "!")).await.unwrap();
+        let v = parse(&stream.next().await.unwrap());
+        assert_eq!(v["index"], 0);
+        assert_eq!(v["text"], "a!", "cumulative per item");
+        assert_eq!(v["meta_info"]["finish_reason"]["type"], "length");
+
+        tx1.send(done(11, "?")).await.unwrap();
+        let v = parse(&stream.next().await.unwrap());
+        assert_eq!(v["index"], 1);
+        assert_eq!(v["text"], "b?");
+
+        assert_eq!(stream.next().await.unwrap(), "[DONE]");
+        assert!(stream.next().await.is_none());
+    }
+
+    /// A per-item error is surfaced with its `index` and doesn't end the batch;
+    /// `[DONE]` still waits for the other item.
+    #[tokio::test]
+    async fn per_item_error_carries_index() {
+        let (tx0, rx0) = mpsc::channel(8);
+        let (tx1, rx1) = mpsc::channel(8);
+        let receivers = vec![(RequestId(10), rx0), (RequestId(11), rx1)];
+        let stream =
+            generation_event_stream(receivers, AbortGuard::new_empty(senders()), false, true);
+        futures::pin_mut!(stream);
+
+        tx0.send(EgressItem::Error(crate::error::Error::Validation(
+            "bad".into(),
+        )))
+        .await
+        .unwrap();
+        let v = parse(&stream.next().await.unwrap());
+        assert_eq!(v["index"], 0);
+        assert_eq!(v["error"]["code"], 400);
+
+        tx1.send(done(11, "ok")).await.unwrap();
+        let v = parse(&stream.next().await.unwrap());
+        assert_eq!(v["index"], 1);
+
+        assert_eq!(stream.next().await.unwrap(), "[DONE]");
+    }
+
+    /// `incremental=true`: each frame carries this step's **delta** text/output_ids,
+    /// but `meta_info.completion_tokens` stays cumulative (matching Python).
+    #[tokio::test]
+    async fn incremental_emits_deltas_with_cumulative_count() {
+        let (tx, rx) = mpsc::channel(8);
+        let receivers = vec![(RequestId(10), rx)];
+        let stream =
+            generation_event_stream(receivers, AbortGuard::new_empty(senders()), true, true);
+        futures::pin_mut!(stream);
+
+        tx.send(frame(10, "Hello")).await.unwrap();
+        let v = parse(&stream.next().await.unwrap());
+        assert_eq!(v["text"], "Hello");
+        assert_eq!(v["meta_info"]["completion_tokens"], 1);
+
+        tx.send(frame(10, " world")).await.unwrap();
+        let v = parse(&stream.next().await.unwrap());
+        assert_eq!(v["text"], " world", "delta, not cumulative 'Hello world'");
+        assert_eq!(
+            v["meta_info"]["completion_tokens"], 2,
+            "count stays cumulative"
+        );
+
+        tx.send(done(10, "!")).await.unwrap();
+        let v = parse(&stream.next().await.unwrap());
+        assert_eq!(v["text"], "!");
+        assert_eq!(v["meta_info"]["completion_tokens"], 3);
+        assert_eq!(v["meta_info"]["finish_reason"]["type"], "length");
+
+        assert_eq!(stream.next().await.unwrap(), "[DONE]");
+    }
+
+    /// The single-request shape (`with_index=false`, one receiver) omits the
+    /// `index` field entirely, and still terminates with `[DONE]`.
+    #[tokio::test]
+    async fn single_shape_omits_index() {
+        let (tx, rx) = mpsc::channel(8);
+        let receivers = vec![(RequestId(10), rx)];
+        let stream =
+            generation_event_stream(receivers, AbortGuard::new_empty(senders()), false, false);
+        futures::pin_mut!(stream);
+
+        tx.send(done(10, "hi")).await.unwrap();
+        let v = parse(&stream.next().await.unwrap());
+        assert_eq!(v["text"], "hi");
+        assert!(v.get("index").is_none(), "single response has no index");
+
+        assert_eq!(stream.next().await.unwrap(), "[DONE]");
     }
 }

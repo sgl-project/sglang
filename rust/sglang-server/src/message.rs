@@ -193,6 +193,126 @@ impl GeneratePayload {
     }
 }
 
+/// A field that accepts a scalar or a list: deserializes a bare `T` **or** `[T,…]`.
+/// Lets `/generate` take `text: "hi"` or `text: ["a","b"]` (the SGLang batch
+/// contract) through the same body type.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum OneOrMany<T> {
+    One(T),
+    Many(Vec<T>),
+}
+
+/// The wire shape of a `/generate` body, before batch splitting: `text` /
+/// `input_ids` / `sampling_params` each accept a scalar (single request) or a list
+/// (batch). [`split`](GenerateBody::split) fans it into per-request
+/// [`GeneratePayload`]s. `deny_unknown_fields` rejects (4xx) any unsupported field.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GenerateBody {
+    #[serde(default)]
+    pub text: Option<OneOrMany<String>>,
+    #[serde(default)]
+    pub input_ids: Option<OneOrMany<Vec<i32>>>,
+    #[serde(default)]
+    pub stream: bool,
+    /// A single params map (broadcast to every item) or a list of maps (one per
+    /// item). Kept as a raw `Value` — an untagged scalar-or-list enum can't work
+    /// here because `rmpv::Value` itself matches a JSON array, so `split`
+    /// distinguishes map vs array at fan-out time.
+    #[serde(default)]
+    pub sampling_params: Option<rmpv::Value>,
+    #[serde(default)]
+    pub return_logprob: Option<bool>,
+    #[serde(default)]
+    pub logprob_start_len: Option<i64>,
+    #[serde(default)]
+    pub top_logprobs_num: Option<i64>,
+    #[serde(default)]
+    pub token_ids_logprob: Option<rmpv::Value>,
+    #[serde(default)]
+    pub return_hidden_states: Option<bool>,
+    #[serde(default)]
+    pub return_text_in_logprobs: Option<bool>,
+}
+
+impl GenerateBody {
+    /// Fan the body into one [`GeneratePayload`] per prompt. Returns the payloads
+    /// and `is_batch` — whether the input used **list** form. A single-element list
+    /// (`text: ["hi"]`) is still a batch (the response is a JSON array), matching
+    /// the Python contract. `Err(msg)` (→ 400) on an invalid/ inconsistent batch.
+    pub fn split(self) -> Result<(Vec<GeneratePayload>, bool), String> {
+        let GenerateBody {
+            text,
+            input_ids,
+            stream,
+            sampling_params,
+            return_logprob,
+            logprob_start_len,
+            top_logprobs_num,
+            token_ids_logprob,
+            return_hidden_states,
+            return_text_in_logprobs,
+        } = self;
+
+        // Per-item (text, input_ids) columns + whether the input used list form.
+        type Columns = (Vec<Option<String>>, Vec<Option<Vec<i32>>>, bool);
+        // Exactly one of text / input_ids, like the Python `_validate_inputs`.
+        let (mut texts, mut id_lists, is_batch): Columns = match (text, input_ids) {
+            (Some(_), Some(_)) => {
+                return Err("provide either `text` or `input_ids`, not both".into());
+            }
+            (None, None) => return Err("either `text` or `input_ids` must be provided".into()),
+            (Some(OneOrMany::One(s)), None) => (vec![Some(s)], vec![None], false),
+            (Some(OneOrMany::Many(v)), None) => {
+                let n = v.len();
+                (v.into_iter().map(Some).collect(), vec![None; n], true)
+            }
+            (None, Some(OneOrMany::One(x))) => (vec![None], vec![Some(x)], false),
+            (None, Some(OneOrMany::Many(vv))) => {
+                let n = vv.len();
+                (vec![None; n], vv.into_iter().map(Some).collect(), true)
+            }
+        };
+        let n = texts.len();
+        if n == 0 {
+            return Err("batch must contain at least one item".into());
+        }
+
+        // sampling_params: an array is per-item; anything else (a map) broadcasts.
+        let mut sps: Vec<Option<rmpv::Value>> = match sampling_params {
+            None => vec![None; n],
+            Some(rmpv::Value::Array(v)) => {
+                if v.len() != n {
+                    return Err(format!(
+                        "sampling_params list length {} does not match batch size {n}",
+                        v.len()
+                    ));
+                }
+                v.into_iter().map(Some).collect()
+            }
+            Some(sp) => vec![Some(sp); n],
+        };
+
+        // The scalar logprob/hidden opts broadcast to every item.
+        let payloads = (0..n)
+            .map(|i| GeneratePayload {
+                text: texts[i].take(),
+                input_ids: id_lists[i].take(),
+                stream,
+                sampling_params: sps[i].take(),
+                return_logprob,
+                logprob_start_len,
+                top_logprobs_num,
+                token_ids_logprob: token_ids_logprob.clone(),
+                return_hidden_states,
+                return_text_in_logprobs,
+            })
+            .collect();
+        Ok((payloads, is_batch))
+    }
+}
+
 #[cfg(test)]
 mod generate_payload_tests {
     use super::*;
@@ -213,6 +333,79 @@ mod generate_payload_tests {
         let err = serde_json::from_str::<GeneratePayload>(r#"{"text": "hi", "lora_path": "x"}"#)
             .expect_err("unknown field must be rejected");
         assert!(err.to_string().contains("lora_path"), "{err}");
+    }
+
+    fn split(body: &str) -> Result<(Vec<GeneratePayload>, bool), String> {
+        serde_json::from_str::<GenerateBody>(body).unwrap().split()
+    }
+
+    /// Scalar `text` → one item, not a batch (response stays a single object).
+    #[test]
+    fn scalar_text_is_single() {
+        let (ps, is_batch) = split(r#"{"text": "hi"}"#).unwrap();
+        assert!(!is_batch);
+        assert_eq!(ps.len(), 1);
+        assert_eq!(ps[0].text.as_deref(), Some("hi"));
+    }
+
+    /// List `text` → batch (even length 1); each prompt becomes its own payload.
+    #[test]
+    fn list_text_is_batch() {
+        let (ps, is_batch) = split(r#"{"text": ["a", "b"]}"#).unwrap();
+        assert!(is_batch);
+        assert_eq!(ps.len(), 2);
+        assert_eq!(ps[0].text.as_deref(), Some("a"));
+        assert_eq!(ps[1].text.as_deref(), Some("b"));
+
+        let (ps, is_batch) = split(r#"{"text": ["only"]}"#).unwrap();
+        assert!(is_batch, "single-element list is still a batch");
+        assert_eq!(ps.len(), 1);
+    }
+
+    /// Scalar `sampling_params` broadcasts to every item; a list maps per item.
+    #[test]
+    fn sampling_params_broadcast_and_per_item() {
+        let (ps, _) =
+            split(r#"{"text": ["a", "b"], "sampling_params": {"temperature": 0.5}}"#).unwrap();
+        assert_eq!(ps[0].sampling_params, ps[1].sampling_params);
+        assert!(ps[0].sampling_params.is_some());
+
+        let (ps, _) = split(
+            r#"{"text": ["a", "b"], "sampling_params": [{"temperature": 0.1}, {"temperature": 0.9}]}"#,
+        )
+        .unwrap();
+        assert_ne!(ps[0].sampling_params, ps[1].sampling_params);
+    }
+
+    /// A per-item `sampling_params` list whose length ≠ batch size is a 400.
+    #[test]
+    fn sampling_params_length_mismatch_errors() {
+        let err = split(r#"{"text": ["a", "b"], "sampling_params": [{}]}"#).unwrap_err();
+        assert!(err.contains("length"), "{err}");
+    }
+
+    /// `input_ids` batch (list of lists) fans out; scalar (list of ints) is single.
+    #[test]
+    fn input_ids_scalar_vs_batch() {
+        let (ps, is_batch) = split(r#"{"input_ids": [1, 2, 3]}"#).unwrap();
+        assert!(!is_batch);
+        assert_eq!(ps[0].input_ids, Some(vec![1, 2, 3]));
+
+        let (ps, is_batch) = split(r#"{"input_ids": [[1, 2], [3]]}"#).unwrap();
+        assert!(is_batch);
+        assert_eq!(ps.len(), 2);
+        assert_eq!(ps[1].input_ids, Some(vec![3]));
+    }
+
+    /// Both / neither of text+input_ids is a 400; the wire still rejects unknowns.
+    #[test]
+    fn split_validates_inputs() {
+        assert!(split(r#"{"text": "a", "input_ids": [1]}"#).is_err());
+        assert!(split(r#"{"stream": true}"#).is_err());
+        assert!(
+            serde_json::from_str::<GenerateBody>(r#"{"text": "hi", "bogus": 1}"#).is_err(),
+            "GenerateBody must deny unknown fields"
+        );
     }
 }
 
