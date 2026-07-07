@@ -12,9 +12,18 @@
 # limitations under the License.
 # ==============================================================================
 
-"""Decode Context Parallel (DCP) primitives (comm.py + kernels.py + layout/metadata).
-Only symbols used outside this subpackage are re-exported here; import package-internal
-helpers directly from sglang.srt.layers.dcp.{kernels,comm}."""
+"""Decode Context Parallel (DCP) — consolidated home for the primitives that
+were previously split between layers/attention/utils.py (PR #25090, Triton/MHA)
+and layers/utils/dcp_utils.py (PR #14194, FlashInfer-MLA).
+
+The two ``cp_lse_ag_out_rs`` variants are kept distinct (``_mha`` torch/all-reduce,
+``_mla`` Triton/reduce-scatter) because their bodies are backend-forced.
+
+Only the symbols imported by code OUTSIDE this subpackage are re-exported here.
+Package-internal helpers (the @triton.jit kernels, ``CPTritonContext``,
+``correct_attn_out``, ``create_dcp_kv_indices``, ``update_kv_lens_and_indices``,
+``_all_gather_dcp_kv_cache``) stay private to their submodules — import them from
+``sglang.srt.layers.dcp.{kernels,comm}`` if ever needed internally."""
 
 from sglang.srt.layers.dcp.comm import (
     dcp_a2a_lse_reduce,
@@ -41,8 +50,13 @@ from sglang.srt.layers.dcp.layout import (
 )
 from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
 
-# planner.py is intentionally NOT imported here: it needs server_args, but this
-# init runs at module-load for every eager DCP importer. Import planner directly.
+# NOTE: planner.py is intentionally NOT imported here. It depends on server_args
+# (get_global_server_args), whereas this package-init executes at module-load time
+# for every eager importer of the DCP primitives — triton_backend,
+# mem_cache.memory_pool, mem_cache.triton_ops.mla_buffer, mem_cache.kv_cache_builder,
+# the FlashInfer-MLA / FlashMLA backends, and the deepseek forward methods. Keeping
+# the init server_args-free avoids a load-time import edge into server_args. Import
+# planner functions from sglang.srt.layers.dcp.planner directly.
 
 __all__ = [
     "DecodeContextParallelMetadata",
