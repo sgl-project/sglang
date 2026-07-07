@@ -12,10 +12,10 @@
 namespace {
 
 struct FusedQkvParams {
-  const void* __restrict__ q;  // nullptr when this call only writes K/V
+  const void* __restrict__ q;
   const void* __restrict__ k;
   const void* __restrict__ v;
-  void* __restrict__ q_out;  // nullptr when this call only writes K/V
+  void* __restrict__ q_out;
   void* __restrict__ k_cache;
   void* __restrict__ v_cache;
   const void* __restrict__ cache_loc;
@@ -55,13 +55,6 @@ SGL_DEVICE void quant_row(const T* __restrict__ src, fp8_e4m3_t* __restrict__ ds
   }
 }
 
-// kQuantizeQ selects, at compile time, whether this instantiation also
-// quantizes Q. Some attention backends (e.g. XQA) want Q left alone —
-// sometimes in bf16, sometimes cast to FP8 later in eager torch depending on
-// the decode mode — so we can't just always quantize Q here. Baking the
-// choice into the template means the Q-handling instructions disappear
-// entirely from the compiled kernel when they're not needed, rather than
-// costing a runtime branch.
 template <typename T, typename IdxT, int kVecN, bool kUsePDL, bool kQuantizeQ>
 __global__ void fused_fp8_qkv_kv_cache_kernel(const __grid_constant__ FusedQkvParams params) {
   using namespace device;
@@ -114,9 +107,6 @@ struct FusedFp8QkvKvCache {
     return reinterpret_cast<uintptr_t>(p) % bytes == 0;
   }
 
-  // `q`/`q_out` are optional: pass both to also quantize Q into `q_out`
-  // (dividing by q_scale, same as K/V), or omit both to only quantize and
-  // write K/V, leaving Q for the caller to handle itself.
   static void
   run(const tvm::ffi::Optional<tvm::ffi::TensorView> q,
       const tvm::ffi::TensorView k,

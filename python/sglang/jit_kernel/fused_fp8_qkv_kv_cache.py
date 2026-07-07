@@ -33,7 +33,7 @@ def _scale_to_f32(scale: Optional[torch.Tensor], device: torch.device) -> torch.
 
 
 def fused_fp8_qkv_kv_cache(
-    q: Optional[torch.Tensor],
+    q: torch.Tensor | None,
     k: torch.Tensor,
     v: torch.Tensor,
     k_cache: torch.Tensor,
@@ -41,14 +41,8 @@ def fused_fp8_qkv_kv_cache(
     cache_loc: torch.Tensor,
     k_scale: Optional[torch.Tensor] = None,
     v_scale: Optional[torch.Tensor] = None,
-) -> Optional[torch.Tensor]:
-    """Fused FP8 quant of K/V + paged KV-cache write, optionally quantizing Q too.
-
-    If `q` is given, it is also quantized to FP8 and the FP8 tensor is
-    returned. If `q` is None, only K/V are quantized and written to cache,
-    and this returns None — the caller is left to decide what, if anything,
-    to do with Q (e.g. some attention kernels want Q kept in bf16).
-    """
+) -> torch.Tensor | None:
+    """Fused FP8 quant of K/V (+ optional Q) + paged KV-cache write."""
     if k.dtype not in (torch.bfloat16, torch.float16):
         raise RuntimeError(f"Unsupported dtype {k.dtype}. Supported: bfloat16, float16")
 

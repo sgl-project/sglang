@@ -592,21 +592,12 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
     def _fused_fp8_qkv_kv_cache(
         self,
-        q: Optional[torch.Tensor],
+        q: torch.Tensor | None,
         k: torch.Tensor,
         v: torch.Tensor,
         layer: RadixAttention,
         forward_batch: ForwardBatch,
-    ) -> Optional[torch.Tensor]:
-        """Fused FP8 quantization of K, V (and optionally Q) + KV cache write.
-
-        Pass `q` to also quantize it in the same kernel call and get back an
-        FP8 tensor. Pass `q=None` to only quantize/write K and V and leave Q
-        untouched — used on the XQA path, where whether Q should end up in
-        bf16 or FP8 depends on the decode mode, so the caller casts Q itself
-        afterwards in eager torch when needed (that's the standalone Q
-        quantize op you'll see in the profiler on that path).
-        """
+    ) -> torch.Tensor | None:
         from sglang.jit_kernel.fused_fp8_qkv_kv_cache import fused_fp8_qkv_kv_cache
 
         cache_loc = self._get_layer_cache_loc(layer, forward_batch)
@@ -797,9 +788,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         # For XQA, q_dtype should be bf16. For trtllm-gen,
         # q_dtype should be FP8 when KV is in FP8.
-        # If we already fused Q's quantization into the cache-write kernel
-        # above, Q is FP8 already and we skip this. Otherwise Q was left
-        # alone by the KV-only kernel, so we cast it here by hand.
         q_scale = 1.0
         if (
             self.data_type == torch.float8_e4m3fn
@@ -885,9 +873,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     layer.v_scale,
                 )
 
-        # Same story as forward_decode: if the KV-only kernel handled the
-        # cache write, Q hasn't been quantized yet, so we cast it here —
-        # unless we're in target-verify mode on XQA, where Q needs to stay bf16.
         q_scale = 1.0
         if (
             self.data_type == torch.float8_e4m3fn
