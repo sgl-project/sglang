@@ -1483,6 +1483,12 @@ class Scheduler(
             "max_total_num_tokens": self.max_total_num_tokens,
             "max_req_input_len": self.max_req_input_len,
         }
+        if self.enable_hierarchical_cache:
+            host_pool = getattr(
+                self.tree_cache, "token_to_kv_pool_host", None
+            ) or getattr(self.tree_cache, "full_kv_pool_host", None)
+            if host_pool is not None:
+                result_dict["hicache_host_total_tokens"] = host_pool.size
 
         return result_dict
 

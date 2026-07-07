@@ -268,8 +268,9 @@ class RayDataParallelController(DataParallelController):
 
         # Store init info from the first actor (same across all actors)
         if scheduler_infos:
-            self.max_total_num_tokens = scheduler_infos[0]["max_total_num_tokens"]
-            self.max_req_input_len = scheduler_infos[0]["max_req_input_len"]
+            self.scheduler_info = scheduler_infos[0]
+            self.max_total_num_tokens = self.scheduler_info["max_total_num_tokens"]
+            self.max_req_input_len = self.scheduler_info["max_req_input_len"]
 
         # Start event loops (non-blocking — runs until actor is killed)
         self.event_loop_refs.extend(

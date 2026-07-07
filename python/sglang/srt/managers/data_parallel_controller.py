@@ -599,8 +599,9 @@ class DataParallelController:
         for i in range(len(scheduler_pipe_readers)):
             scheduler_info.append(scheduler_pipe_readers[i].recv())
 
-        self.max_total_num_tokens = scheduler_info[0]["max_total_num_tokens"]
-        self.max_req_input_len = scheduler_info[0]["max_req_input_len"]
+        self.scheduler_info = scheduler_info[0]
+        self.max_total_num_tokens = self.scheduler_info["max_total_num_tokens"]
+        self.max_req_input_len = self.scheduler_info["max_req_input_len"]
 
     def maybe_external_dp_rank_routing(self, req: Req):
         if req.routed_dp_rank is not None:
@@ -695,12 +696,7 @@ def run_data_parallel_controller_process(
             proc.pid for proc in controller.scheduler_procs if proc is not None
         ]
         pipe_writer.send(
-            {
-                "status": "ready",
-                "max_total_num_tokens": controller.max_total_num_tokens,
-                "max_req_input_len": controller.max_req_input_len,
-                SCHEDULER_PIDS_ARG: scheduler_pids,
-            }
+            {**controller.scheduler_info, SCHEDULER_PIDS_ARG: scheduler_pids}
         )
         if server_args.node_rank == 0:
             controller.event_loop()

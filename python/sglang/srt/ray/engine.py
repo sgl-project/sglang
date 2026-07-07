@@ -478,12 +478,7 @@ class RayEngine(Engine):
         )
         dp_thread.start()
 
-        scheduler_infos = [
-            {
-                "max_total_num_tokens": controller.max_total_num_tokens,
-                "max_req_input_len": controller.max_req_input_len,
-            }
-        ]
+        scheduler_infos = [controller.scheduler_info]
 
         event_loop_refs = controller.event_loop_refs
 
