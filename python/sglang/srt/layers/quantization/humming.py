@@ -848,6 +848,9 @@ class HummingMoEMethod(FusedMoEMethodBase):
             # preprocess weight for inference
             HummingMethod.transform_humming_layer(layer, sublayer_name=sublayer_name)
 
+        if hasattr(layer, "dispatcher"):
+            layer.dispatcher.set_quant_config({"dispatcher_output_dtype": "bf16"})
+
     def create_moe_runner(
         self,
         layer: torch.nn.Module,

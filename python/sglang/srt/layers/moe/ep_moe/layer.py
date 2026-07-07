@@ -90,7 +90,6 @@ class DeepEPMoE(FusedMoE):
             and quant_config.get_name() == "humming"
         )
         if is_humming:
-            envs.SGLANG_DEEPEP_BF16_DISPATCH.set(True)
             self.deprecate_flag = True
         elif _use_aiter:
             self.deprecate_flag = True
