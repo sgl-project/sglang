@@ -284,6 +284,8 @@ class AttnFlags(_StaticFlags):
     # Resolved attention backend; the pristine user request stays on
     # server_args.attention_backend.
     backend: str | None = None
+    prefill_backend: str | None = None
+    decode_backend: str | None = None
 
 
 @dataclasses.dataclass
@@ -298,6 +300,10 @@ class MoeFlags(_StaticFlags):
 @dataclasses.dataclass
 class CaptureFlags(_FlagGroupBase):
     """Capture-time flags; never frozen (written during cuda-graph capture)."""
+
+    # Seeded from server_args at publish; a model whose _can_torch_compile is
+    # False clears it during warmup (the only post-publish writer).
+    enable_torch_compile: bool = False
 
 
 @dataclasses.dataclass
@@ -325,6 +331,17 @@ class Flags(_StaticFlags):
     sampling_backend: str | None = None
     page_size: int | None = None
     quantization: str | None = None
+    fp8_gemm_runner_backend: str = "auto"
+    disable_overlap_schedule: bool = False
+    uses_mamba_radix_cache: bool = False
+    mamba_radix_cache_strategy: str = "auto"
+    speculative_moe_runner_backend: str | None = None
+    speculative_moe_a2a_backend: str | None = None
+    disable_shared_experts_fusion: bool = False
+    kv_cache_dtype: str = "auto"
+    dsa_prefill_backend: str | None = None
+    dsa_decode_backend: str | None = None
+    flashinfer_allreduce_fusion_backend: str | None = None
     # Parallel-request fields: flat transitional home, to be re-homed by the
     # Parallel Parameters Clarification module.
     enable_dp_attention: bool = False
@@ -348,6 +365,8 @@ class Flags(_StaticFlags):
 # family as readers migrate.
 FLAG_LEAF_MAP: dict[str, str] = {
     "attention_backend": "attn.backend",
+    "prefill_attention_backend": "attn.prefill_backend",
+    "decode_attention_backend": "attn.decode_backend",
     "moe_runner_backend": "moe.runner_backend",
 }
 
@@ -368,12 +387,16 @@ class RuntimeContext:
     """Container for the structured runtime accessors; exposes ``parallel``,
     ``server_args``, and ``flags``."""
 
-    __slots__ = ("parallel", "_server_args", "flags")
+    __slots__ = ("parallel", "_server_args", "flags", "_runtime_overrides")
 
     def __init__(self, parallel: ParallelContext):
         self.parallel = parallel
         self._server_args: ServerArgs | None = None
         self.flags = Flags()
+        # Post-publish resolution declarations (runner- and load-time
+        # resolved fields), replayed after the publish-time stash on
+        # every re-resolve. Cleared on (re-)publish and reset.
+        self._runtime_overrides: list[tuple[str, dict]] = []
 
     @property
     def server_args(self) -> ServerArgs:
@@ -395,14 +418,90 @@ class RuntimeContext:
         into the flags tier (skipped for objects without the stash — dummy /
         "none" fixture ServerArgs and test-kit mocks never compute it).
         Resolution runs first: if it fails, the previous publish stays intact.
+        A publish after ``freeze_flags()`` is an ordering violation and raises.
         """
-        self._resolve_flags(server_args)
+        if self.flags.frozen:
+            raise RuntimeError(
+                "set_server_args() after freeze_flags(): the flags tier is "
+                "frozen for this process; use reset_context() in tests."
+            )
+        # A (re-)publish starts a fresh resolution lifecycle; a failed
+        # resolve keeps the previous lifecycle (including its recorded
+        # runtime overrides) intact.
+        saved_runtime_overrides = self._runtime_overrides
+        self._runtime_overrides = []
+        try:
+            self._resolve_flags(server_args)
+        except BaseException:
+            self._runtime_overrides = saved_runtime_overrides
+            raise
+        # Seed the capture tier for the new lifecycle (defaults for sentinel
+        # and mock publishes, which carry no config).
+        self.flags.capture.enable_torch_compile = getattr(
+            server_args, "enable_torch_compile", False
+        )
         self._server_args = server_args
+
+    def record_runtime_overrides(
+        self, entries: list[tuple[str, dict]]
+    ) -> list[tuple[str, dict]]:
+        """Append post-publish resolution declarations (the runner- and
+        load-time stages) and
+        atomically re-resolve the flags tier.
+
+        Target-worker only, and only before ``freeze_flags()``. During the
+        dual-apply transition the call sites keep their imperative
+        ``server_args`` writes; the recorded declarations must match them —
+        parity is re-asserted on every declared field. On failure the
+        recorded entries are rolled back and the previous flags stay
+        installed.
+        """
+        server_args = self._server_args
+        if server_args is None:
+            raise ValueError("Global server args is not set yet!")
+        if self.flags.frozen:
+            raise RuntimeError(
+                "record_runtime_overrides() after freeze_flags(): runtime "
+                "resolution stages must complete before the flags tier "
+                "freezes."
+            )
+        entries = [(source, dict(declared)) for source, declared in entries]
+        self._runtime_overrides.extend(entries)
+        try:
+            self._resolve_flags(server_args)
+        except BaseException:
+            del self._runtime_overrides[len(self._runtime_overrides) - len(entries) :]
+            raise
+        return entries
+
+    def freeze_flags(self) -> None:
+        """Lock every static flag group (the resolution end point: after the
+        load-time stages, before serving). ``flags.capture`` stays writable."""
+        self.flags.freeze()
 
     def _resolve_flags(self, server_args: ServerArgs) -> None:
         declarations = getattr(server_args, "_resolved_overrides", None)
-        if declarations is None:
-            return
+        if declarations is None and not self._runtime_overrides:
+            # Stash-less publish. For a config-shaped object (a dataclass:
+            # mock ServerArgs fixtures, dummy-path instances that skipped the
+            # monolith) still materialize the whitelist from its own fields,
+            # so flag reads match legacy server_args reads. Skip only for
+            # field-less sentinels (tests publishing object()).
+            if not dataclasses.is_dataclass(server_args):
+                return
+            from sglang.srt.arg_groups.arg_utils import resolvable_fields
+
+            if any(
+                field not in vars(server_args)
+                for field in resolvable_fields(type(server_args))
+            ):
+                # Bare object.__new__ fixtures: dataclass defaults live on
+                # the class, not the instance — nothing was populated, so
+                # treat it as a sentinel (hasattr would see the class
+                # defaults and materialize them, clobbering resolved flags).
+                return
+            declarations = ()
+        declarations = list(declarations or ()) + self._runtime_overrides
         from sglang.srt.arg_groups.overrides import (
             apply_model_overrides,
             assert_flag_parity,
@@ -422,6 +521,10 @@ class RuntimeContext:
             server_args,
             {field for _source, decl in declarations for field in decl},
         )
+        # The capture tier is not part of the static resolution: carry it
+        # across re-resolves so runtime-stage recording cannot clobber a
+        # capture-time write (set_server_args re-seeds it per lifecycle).
+        flags.capture = self.flags.capture
         self.flags = flags
 
 
@@ -453,3 +556,4 @@ def reset_context() -> None:
     """
     _CONTEXT._server_args = None
     _CONTEXT.flags = Flags()
+    _CONTEXT._runtime_overrides = []

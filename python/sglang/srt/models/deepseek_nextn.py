@@ -57,7 +57,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.deepseek_common.utils import enable_nextn_moe_bf16_cast_to_fp8
 from sglang.srt.models.deepseek_v2 import DeepseekV2DecoderLayer, DeepseekV3ForCausalLM
 from sglang.srt.models.utils import WeightsMapper
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_flags, get_parallel
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import BumpAllocator, add_prefix, is_cuda, is_npu
 
@@ -172,7 +172,7 @@ class DeepseekModelNextN(nn.Module):
         if (
             _is_npu
             and self.quant_config is None
-            and get_global_server_args().quantization is not None
+            and get_flags().quantization is not None
         ):
             # ascend mtp unquant
             exit_stack.enter_context(envs.SGLANG_DEEPEP_BF16_DISPATCH.override(True))
@@ -237,13 +237,22 @@ class DeepseekModelNextN(nn.Module):
                     residual,
                     zero_allocator,
                     prev_topk_indices=(
-                        forward_batch.spec_info.mtp_topk_indices
-                        if forward_batch.reuse_mtp_topk_indices
+                        forward_batch.spec_info.dsa_topk_indices
+                        if forward_batch.reuse_dsa_topk_indices
                         else None
                     ),
                 )
-                if forward_batch.reuse_mtp_topk_indices:
-                    forward_batch.spec_info.mtp_topk_indices = topk_indices
+                if forward_batch.reuse_dsa_topk_indices:
+                    forward_batch.spec_info.dsa_topk_indices = topk_indices
+
+                # MTP IndexShare: on draft-extend, publish the last-token DSA
+                # indexer top-k to seed (avoid recomputing in) the draft-decode loop.
+                if forward_batch.forward_mode.is_extend(include_draft_extend_v2=True):
+                    seed_buf = forward_batch.spec_info.dsa_seed_topk_capture
+                    if seed_buf is not None and topk_indices is not None:
+                        sel = forward_batch.spec_info.dsa_seed_topk_select
+                        src = topk_indices if sel is None else topk_indices[sel]
+                        seed_buf[: src.shape[0]].copy_(src)
 
             if not forward_batch.forward_mode.is_idle():
                 if residual is not None:
@@ -321,7 +330,7 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
             config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("model.shared_head.head", prefix),
-            use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+            use_attn_tp_group=get_flags().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
 

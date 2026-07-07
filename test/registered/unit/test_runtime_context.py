@@ -9,6 +9,7 @@ import unittest
 from unittest.mock import patch
 
 import sglang.srt.server_args as server_args_module
+from sglang.srt.arg_groups.arg_utils import A, Arg
 from sglang.srt.runtime_context import (
     Flags,
     ParallelContext,
@@ -299,6 +300,155 @@ class TestFlagsTier(_IsolatedServerArgs):
             self.assertFalse(get_flags().frozen)
         finally:
             reset_context()  # never leave the singleton frozen for other tests
+
+
+@dataclasses.dataclass
+class _FakeResolvedArgs:
+    """Publishable fixture with a resolvable whitelist (real flat leaves)."""
+
+    page_size: A[int | None, Arg(help="p", resolvable=True)] = None
+    sampling_backend: A[str | None, Arg(help="s", resolvable=True)] = None
+    _resolved_overrides: list = dataclasses.field(default_factory=list)
+
+
+class TestRuntimeResolutionStages(_IsolatedServerArgs):
+    """Runtime stages: post-publish declarations re-resolve the flags tier
+    atomically; freeze_flags() ends the resolution lifecycle."""
+
+    def _publish(self, **kw):
+        args = _FakeResolvedArgs(**kw)
+        get_context().set_server_args(args)
+        return args
+
+    def test_record_before_publish_raises(self):
+        reset_context()
+        with self.assertRaises(ValueError):
+            get_context().record_runtime_overrides([("stage", {"page_size": 64})])
+
+    def test_record_updates_leaves_and_accumulates_stages(self):
+        args = self._publish(page_size=1, sampling_backend="flashinfer")
+        self.assertEqual(get_flags().page_size, 1)  # publish-time materialize
+        # dual-apply transition: the call site keeps its imperative write
+        args.page_size = 64
+        get_context().record_runtime_overrides([("stage.runner", {"page_size": 64})])
+        self.assertEqual(get_flags().page_size, 64)
+        args.sampling_backend = "pytorch"
+        get_context().record_runtime_overrides(
+            [("stage.load", {"sampling_backend": "pytorch"})]
+        )
+        self.assertEqual(get_flags().sampling_backend, "pytorch")
+        self.assertEqual(get_flags().page_size, 64)  # earlier stage survives
+
+    def test_record_whitelist_violation_rolls_back(self):
+        self._publish()
+        with self.assertRaises(ValueError):
+            get_context().record_runtime_overrides([("bad", {"nope": 1})])
+        self.assertEqual(get_context()._runtime_overrides, [])
+
+    def test_freeze_ends_the_resolution_lifecycle(self):
+        args = self._publish(page_size=1)
+        try:
+            get_context().freeze_flags()
+            self.assertTrue(get_flags().frozen)
+            with self.assertRaises(RuntimeError):
+                get_context().record_runtime_overrides([("late", {"page_size": 64})])
+            with self.assertRaises(RuntimeError):
+                get_context().set_server_args(args)
+        finally:
+            reset_context()
+
+    def test_declare_load_time_override_applies_and_records(self):
+        from sglang.srt.arg_groups.overrides import declare_load_time_override
+
+        args = self._publish(page_size=1)
+        declare_load_time_override("model.load_time", {"page_size": 64})
+        # post-init declaration: written through to the field and resolved
+        # into the leaf
+        self.assertEqual(args.page_size, 64)
+        self.assertEqual(get_flags().page_size, 64)
+        self.assertEqual(
+            get_context()._runtime_overrides,
+            [("model.load_time", {"page_size": 64})],
+        )
+
+    def test_failed_republish_keeps_previous_lifecycle(self):
+        args = self._publish(page_size=1)
+        args.page_size = 64
+        get_context().record_runtime_overrides([("stage", {"page_size": 64})])
+        flags_before = get_flags()
+        bad = _FakeResolvedArgs(page_size=1)
+        bad._resolved_overrides = [("bad", {"nope": 1})]  # gate rejects
+        with self.assertRaises(ValueError):
+            get_context().set_server_args(bad)
+        # previous publish fully intact: slot, flags, and the recorded stages
+        self.assertIs(get_context()._server_args, args)
+        self.assertIs(get_flags(), flags_before)
+        self.assertEqual(
+            get_context()._runtime_overrides, [("stage", {"page_size": 64})]
+        )
+
+    def test_capture_tier_seeded_at_publish_and_survives_stages(self):
+        # seeded from the published config
+        args = self._publish(page_size=1)
+        args.enable_torch_compile = True
+        get_context().set_server_args(args)  # re-publish picks up the value
+        self.assertTrue(get_flags().capture.enable_torch_compile)
+        # capture-time write (B4) targets the capture leaf
+        get_flags().capture.enable_torch_compile = False
+        self.assertFalse(get_flags().capture.enable_torch_compile)
+        # a runtime-stage re-resolve must not clobber the capture write
+        args.page_size = 64
+        get_context().record_runtime_overrides([("stage", {"page_size": 64})])
+        self.assertFalse(get_flags().capture.enable_torch_compile)
+        # capture stays writable after freeze
+        try:
+            get_context().freeze_flags()
+            get_flags().capture.enable_torch_compile = True
+            self.assertTrue(get_flags().capture.enable_torch_compile)
+        finally:
+            reset_context()
+
+    def test_declared_leaf_wins_over_stale_field(self):
+        # A stash entry always drives the leaf at publish, even if the field
+        # value diverged (e.g. a fixture that skipped materialization).
+        @dataclasses.dataclass
+        class _Args:
+            enable_dp_lm_head: A[bool, Arg(help="d", resolvable=True)] = True
+            _resolved_overrides: list = dataclasses.field(default_factory=list)
+
+        args = _Args()
+        args._resolved_overrides = [("dp", {"enable_dp_lm_head": False})]
+        args._declarations_materialized = True
+        args.enable_dp_lm_head = False
+        get_context().set_server_args(args)
+        self.assertFalse(get_flags().enable_dp_lm_head)
+
+    def test_bare_dataclass_publish_skips_materialization(self):
+        # object.__new__(ServerArgs) fixtures (no __init__, no field values)
+        # must publish without touching the flags tier — dataclass defaults
+        # live on the class, so materializing from them would clobber
+        # previously resolved flags with defaults.
+        from sglang.srt.server_args import ServerArgs
+
+        self._publish(page_size=64)
+        self.assertEqual(get_flags().page_size, 64)
+        bare = object.__new__(ServerArgs)
+        get_context().set_server_args(bare)
+        self.assertIs(get_server_args(), bare)
+        self.assertEqual(get_flags().page_size, 64)  # not clobbered
+
+    def test_capture_tier_defaults_for_sentinel_publish(self):
+        get_context().set_server_args(object())
+        self.assertFalse(get_flags().capture.enable_torch_compile)
+
+    def test_republish_clears_runtime_overrides(self):
+        args = self._publish(page_size=1)
+        args.page_size = 64
+        get_context().record_runtime_overrides([("stage", {"page_size": 64})])
+        self.assertEqual(get_flags().page_size, 64)
+        self._publish(page_size=1)  # fresh lifecycle
+        self.assertEqual(get_flags().page_size, 1)
+        self.assertEqual(get_context()._runtime_overrides, [])
 
 
 if __name__ == "__main__":

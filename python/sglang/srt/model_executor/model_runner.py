@@ -32,7 +32,6 @@ import torch
 import torch.distributed as dist
 from torch import nn
 
-from sglang.jit_kernel.ngram_embedding import update_token_table_decode
 from sglang.srt.configs import (
     BailingHybridConfig,
     FalconH1Config,
@@ -165,6 +164,9 @@ from sglang.srt.model_executor.hook_manager import register_forward_hooks
 from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
     ModelRunnerKVCacheMixin,
 )
+from sglang.srt.model_executor.ngram_token_table import (
+    update_ngram_token_table_after_sampling,
+)
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 from sglang.srt.model_executor.runner import (
     EagerRunner,
@@ -180,6 +182,7 @@ from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.platforms import current_platform
+from sglang.srt.runtime_context import get_flags
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import (
     ServerArgs,
@@ -532,15 +535,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # only, so a draft init cannot clobber target-derived global state).
         if not self.is_draft_worker:
             set_global_server_args_for_scheduler(server_args)
-            # FIXME: hacky set `use_mla_backend`
-            get_global_server_args().use_mla_backend = self.use_mla_backend
 
         # Init OpenMP threads binding for CPU
         if self.device == "cpu":
             self.init_threads_binding()
 
         # Set float32 matmul precision
-        if server_args.enable_tf32_matmul:
+        if get_flags().enable_tf32_matmul:
             torch.set_float32_matmul_precision("high")
 
         # Get available memory before model loading.
@@ -1329,7 +1330,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if is_npu():
                 register_sgl_tp_rank(self.gpu_id)
 
-            # Pre-warm NCCL/RCCL to eliminate cold-start latency in first request
+            # Pre-warm NCCL/RCCL/HCCL to eliminate cold-start latency in first request
             # Controlled by --pre-warm-nccl flag (default: enabled on AMD GPUs)
             if self.server_args.pre_warm_nccl and (
                 self.tp_size > 1 or self.pp_size > 1 or self.moe_ep_size > 1
@@ -1337,14 +1338,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 warmup_start = time.perf_counter()
                 tp_group_handle = get_tp_group().device_group
 
-                # Single warmup all_reduce to initialize NCCL/RCCL communicator
+                # Single warmup all_reduce to initialize NCCL/RCCL/HCCL communicator
                 warmup_tensor = torch.zeros(1, device=torch.cuda.current_device())
                 dist.all_reduce(warmup_tensor, group=tp_group_handle)
                 current_platform.synchronize()
 
                 warmup_elapsed = time.perf_counter() - warmup_start
                 logger.info(
-                    f"NCCL/RCCL warmup completed in {warmup_elapsed:.3f}s "
+                    f"NCCL/RCCL/HCCL warmup completed in {warmup_elapsed:.3f}s "
                     f"(tp_size={self.tp_size}, pp_size={self.pp_size}, ep_size={self.moe_ep_size})"
                 )
 
@@ -2427,6 +2428,23 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         result = self._get_linear_attn_registry_result()
         return result[1] if result else None
 
+    def _record_kv_cache_dtype(self, resolved: str) -> None:
+        # Load-time resolution transition: the weight-resolved kv-cache dtype
+        # is declared into the flags tier; the dual-apply inside the helper
+        # replaces the legacy in-place write. Mock runners whose server_args
+        # is not the published object keep the plain write.
+        from sglang.srt.runtime_context import get_context
+
+        if get_context()._server_args is self.server_args:
+            from sglang.srt.arg_groups.overrides import declare_load_time_override
+
+            declare_load_time_override(
+                "ModelRunner.configure_kv_cache_dtype",
+                {"kv_cache_dtype": resolved},
+            )
+        else:
+            self.server_args.kv_cache_dtype = resolved
+
     def configure_kv_cache_dtype(self):
         if self.server_args.kv_cache_dtype == "auto":
             quant_config = getattr(self.model, "quant_config", None)
@@ -2435,16 +2453,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 isinstance(kv_cache_quant_algo, str)
                 and kv_cache_quant_algo.upper() == "FP8"
             ):
-                if _is_hip:
-                    self.kv_cache_dtype = fp8_dtype
-                    self.server_args.kv_cache_dtype = TORCH_DTYPE_TO_KV_CACHE_STR[
-                        self.kv_cache_dtype
-                    ]
-                else:
-                    self.kv_cache_dtype = torch.float8_e4m3fn
-                    self.server_args.kv_cache_dtype = TORCH_DTYPE_TO_KV_CACHE_STR[
-                        self.kv_cache_dtype
-                    ]
+                self.kv_cache_dtype = fp8_dtype if _is_hip else torch.float8_e4m3fn
+                self._record_kv_cache_dtype(
+                    TORCH_DTYPE_TO_KV_CACHE_STR[self.kv_cache_dtype]
+                )
             else:
                 self.kv_cache_dtype = self.dtype
         elif self.server_args.kv_cache_dtype == "fp8_e5m2":
@@ -2596,15 +2608,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         ngram_embedding_info = forward_batch.ngram_embedding_info
         if ngram_embedding_info is None:
             return
-        ngram_embedding_info.out_column_starts[: forward_batch.batch_size] = (
-            forward_batch.seq_lens
-        )
-        ngram_embedding_info.out_req_lens[: forward_batch.batch_size] = 1
-        update_token_table_decode(
-            ne_token_table=ngram_embedding_info.token_table,
-            tokens=next_token_ids.to(torch.int32),
-            row_indices=forward_batch.req_pool_indices,
-            column_starts=ngram_embedding_info.out_column_starts,
+        update_ngram_token_table_after_sampling(
+            ngram_embedding_info=ngram_embedding_info,
+            next_token_ids=next_token_ids,
+            req_pool_indices=forward_batch.req_pool_indices,
+            seq_lens=forward_batch.seq_lens,
+            batch_size=forward_batch.batch_size,
         )
 
     def init_decode_cuda_graph(self):
@@ -2624,7 +2633,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         ):
             return
 
-        if self.device == "cpu" and not self.server_args.enable_torch_compile:
+        if self.device == "cpu" and not get_flags().capture.enable_torch_compile:
             return
 
         tic = time.perf_counter()
