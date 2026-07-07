@@ -66,12 +66,13 @@ class TimestepPreparationStage(PipelineStage, RolloutTimestepPreparationMixin):
         prepare_extra_set_timesteps_kwargs: (
             list[Callable[[Req, ServerArgs], Tuple[str, Any]]] | None
         ) = None,
-        rollout_scheduler=None,
+        rollout_scheduler_factory: Callable[[], Any] | None = None,
     ) -> None:
         super().__init__()
         self.scheduler = scheduler
         # See RolloutTimestepPreparationMixin.
-        self.rollout_scheduler = rollout_scheduler
+        self.rollout_scheduler_factory = rollout_scheduler_factory
+        self._rollout_scheduler = None
         self.prepare_extra_set_timesteps_kwargs = list(
             prepare_extra_set_timesteps_kwargs or []
         )

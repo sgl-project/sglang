@@ -18,7 +18,9 @@ class RolloutTimestepPreparationMixin:
 
     The rollout SDE/log-prob path needs a first-order flow-match Euler
     scheduler, which not every pipeline serves (e.g. Wan serves UniPC). The
-    host stage sets ``self.rollout_scheduler``; None keeps the serving
+    host stage sets ``self.rollout_scheduler_factory``; the scheduler is
+    created on the first rollout=True request and cached, so an engine that
+    never sees rollout requests never initializes it. None keeps the serving
     scheduler for rollout requests. Downstream stages read the scheduler
     from ``batch.scheduler``, so the host stage is the single switch point.
     """
@@ -29,9 +31,11 @@ class RolloutTimestepPreparationMixin:
 
     def _resolve_rollout_scheduler(self, batch: Req):
         """Return the rollout scheduler template for this request, or None."""
-        if batch.rollout and self.rollout_scheduler is not None:
-            return self.rollout_scheduler
-        return None
+        if not batch.rollout or self.rollout_scheduler_factory is None:
+            return None
+        if self._rollout_scheduler is None:
+            self._rollout_scheduler = self.rollout_scheduler_factory()
+        return self._rollout_scheduler
 
     def _check_rollout_timesteps(self, scheduler) -> None:
         # The rollout SDE/log-prob math assumes the flow-match Euler
