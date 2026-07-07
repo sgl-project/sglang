@@ -25,11 +25,11 @@ namespace {
 // output: [num_heads, total_q, out_len]
 template <typename T>
 __global__ void max_pooling_1d_varlen_kernel(
-    const T* input,
-    T* output,
-    const int* cu_seqlens_q,
-    const int* cu_seqlens_k,
-    const int* cache_lens,
+    const T* __restrict__ input,
+    T* __restrict__ output,
+    const int* __restrict__ cu_seqlens_q,
+    const int* __restrict__ cu_seqlens_k,
+    const int* __restrict__ cache_lens,
     int batch_size,
     int num_heads,
     int max_seqlen_k,
@@ -44,21 +44,24 @@ __global__ void max_pooling_1d_varlen_kernel(
   const int bidq_global = blockIdx.x;  // global query index across all batches
 
   int batch_idx = 0;
-  int q_start = 0, q_end = 0, k_start = 0, k_end = 0;
-  for (int b = 0; b < batch_size; b++) {
-    q_start = cu_seqlens_q[b];
-    q_end = cu_seqlens_q[b + 1];
-    k_start = cu_seqlens_k[b];
-    k_end = cu_seqlens_k[b + 1];
-    if (bidq_global >= q_start && bidq_global < q_end) {
-      batch_idx = b;
-      break;
+  if (batch_size != 1) {
+    int lo = 0;
+    int hi = batch_size;
+    while (lo < hi) {
+      const int mid = (lo + hi) >> 1;
+      if (bidq_global >= cu_seqlens_q[mid + 1]) {
+        lo = mid + 1;
+      } else {
+        hi = mid;
+      }
     }
+    batch_idx = lo;
   }
 
+  const int q_start = cu_seqlens_q[batch_idx];
   const int bidq_local = bidq_global - q_start;
-  const int seqlen_q = q_end - q_start;
-  const int seqlen_k = k_end - k_start;
+  const int seqlen_q = cu_seqlens_q[batch_idx + 1] - q_start;
+  const int seqlen_k = cu_seqlens_k[batch_idx + 1] - cu_seqlens_k[batch_idx];
   if (bidq_local >= seqlen_q) return;
 
   const size_t total_q_all = static_cast<size_t>(cu_seqlens_q[batch_size]);
