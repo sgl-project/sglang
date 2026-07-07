@@ -1,5 +1,7 @@
 """Unit tests for DSpark speculative-decoding registration and arg handling."""
 
+import json
+import os
 import sys
 import unittest
 from pathlib import Path
@@ -466,6 +468,31 @@ class TestDSparkDeepSpecSemanticReference(CustomTestCase):
             next_tokens = t.argmax(base_logits[:, step, :] + bias, dim=-1)
             ref_candidates[:, step + 1] = next_tokens
             prev_tokens = next_tokens
+
+        parity_match = t.equal(candidates, ref_candidates)
+        if os.getenv("SGLANG_DSPARK_TEST_VERBOSE", "0") == "1":
+            print(
+                "DSpark Markov parity debug: "
+                + json.dumps(
+                    {
+                        "bs": bs,
+                        "block_size": block_size,
+                        "verify_stride": verify_stride,
+                        "hidden_size": hidden_size,
+                        "vocab_size": vocab_size,
+                        "markov_rank": markov_rank,
+                        "anchor_tokens": anchor_tokens.tolist(),
+                        "sglang_candidates": candidates.tolist(),
+                        "deepspec_reference_candidates": ref_candidates.tolist(),
+                        "candidate_match": bool(parity_match),
+                        "confidence_shape": list(confidence.shape),
+                        "confidence_abs_sum": float(confidence.abs().sum().item()),
+                        "base_top1": t.argmax(base_logits, dim=-1).tolist(),
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
 
         self.assertEqual(candidates.tolist(), ref_candidates.tolist())
         self.assertEqual(tuple(confidence.shape), (bs, block_size))
