@@ -64,7 +64,7 @@ Please note all your testing and benchmarking results in PR description.
 
 ### Benchmark
 
-- **(Required) MMMU**: follow MMMU benchmark [README.md](https://github.com/sgl-project/sglang/blob/main/benchmark/mmmu/README.md) to get SGLang vs. HF Transformer accuracy comparison. The accuracy score from SGLang run should not be much lower than that from HF Transformer run. Similarly, follow https://docs.sglang.io/developer_guide/benchmark_and_profiling.html to get performance comparison: TTFT and throughput must meet or exceed baselines (e.g., HF Transformer).
+- **(Required) MMMU**: follow MMMU benchmark [README.md](https://github.com/sgl-project/sglang/blob/main/benchmark/mmmu/README.md) to get SGLang vs. HF Transformer accuracy comparison. The accuracy score from SGLang run should not be much lower than that from HF Transformer run. Similarly, follow [https://docs.sglang.io/developer_guide/benchmark_and_profiling.html](https://docs.sglang.io/developer_guide/benchmark_and_profiling.html) to get performance comparison: TTFT and throughput must meet or exceed baselines (e.g., HF Transformer).
 - **(Optional) Other evals**: If you ran other evals, please note the results in PR description.
 
 <Tip>
@@ -332,7 +332,7 @@ Using the same Llama wrapper from the previous section, here is how to package a
 
 1. Create your project
 
-```
+```text
 sglang_custom_project/
 |----setup.py
 |----custom_llm/
@@ -404,8 +404,8 @@ Update the `config.json` under your HuggingFace model checkpoint directory so th
 
 ```json Config
 {
-  "architectures": ["LlamaWrapper"],
-  ...
+    "architectures": ["LlamaWrapper"],
+    ...
 }
 ```
 
@@ -435,7 +435,7 @@ For example, let's build a custom model based on Qwen2-VL-Instruct that takes th
 
 Create the project:
 
-```
+```text
 sglang_custom_project_vl/
 |----setup.py
 |----custom_vlm/

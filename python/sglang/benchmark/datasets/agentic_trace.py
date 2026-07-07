@@ -54,8 +54,8 @@ class AgenticTraceDataset(BaseDataset):
             dataset_path=args.dataset_path,
             num_requests=args.num_prompts,
             fixed_output_len=args.sharegpt_output_len,
-            offset=getattr(args, "dataset_offset", 0),
-            max_turns=getattr(args, "agentic_max_turns", None),
+            offset=args.dataset_offset,
+            max_turns=args.agentic_max_turns,
         )
 
     def load(

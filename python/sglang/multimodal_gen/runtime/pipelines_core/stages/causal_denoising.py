@@ -1094,6 +1094,7 @@ class CausalDMDDenoisingStage(DenoisingStage):
         device,
         *,
         sequence_shard_enabled: bool = False,
+        kv_cache_size: int | None = None,
     ) -> None:
         """
         Initialize (but not fill) a Per-GPU KV cache aligned with the model assumptions.
@@ -1102,9 +1103,10 @@ class CausalDMDDenoisingStage(DenoisingStage):
             sequence_shard_enabled=sequence_shard_enabled
         )
         attention_head_dim = self.transformer.attention_head_dim
-        kv_cache_size = self._get_causal_kv_cache_size(
-            sequence_shard_enabled=sequence_shard_enabled
-        )
+        if kv_cache_size is None:
+            kv_cache_size = self._get_causal_kv_cache_size(
+                sequence_shard_enabled=sequence_shard_enabled
+            )
         self.causal_kv_cache = self._allocate_causal_kv_cache(
             batch_size=batch_size,
             kv_cache_size=kv_cache_size,

@@ -337,6 +337,9 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def release_session(self, session_id: str) -> None:
         pass
 
+    def release_radix_session(self, session_id: str) -> None:
+        pass
+
     def session_held_tokens(self, active_pool_idxs: Optional[set] = None) -> int:
         return 0
 
