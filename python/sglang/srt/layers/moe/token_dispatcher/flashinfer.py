@@ -180,6 +180,7 @@ class FlashinferDispatcher(BaseDispatcher):
         output_dtype = hidden_states.dtype
         x = hidden_states
         x_sf = None
+        # FlashInfer dispatch requires materialized top-k IDs and weights.
         if TopKOutputChecker.format_is_bypassed(topk_output):
             topk_output = topk_output.to_standard()
         # FlashInfer MoeAlltoAll's expert-ID ABI is int32. This dispatcher is
