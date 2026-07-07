@@ -1094,6 +1094,10 @@ class ServerArgs:
         bool,
         "Include usage in every streaming response (even when stream_options is not specified).",
     ] = False
+    stream_response_default_continuous_usage_stats: A[
+        bool,
+        "Inject usage into every SSE event (not just the final chunk). Server-side default for stream_options.continuous_usage_stats; the client can still enable it per-request even when this is False. Useful when a gateway or proxy needs per-event token counts for metering / billing / dashboards without asking each client to opt in.",
+    ] = False
     incremental_streaming_output: A[
         bool,
         "Whether to output as a sequence of disjoint segments.",

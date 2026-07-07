@@ -77,19 +77,25 @@ def process_hidden_states_from_ret(
 
 
 def should_include_usage(
-    stream_options: StreamOptions | None, stream_response_default_include_usage: bool
+    stream_options: StreamOptions | None,
+    stream_response_default_include_usage: bool,
+    stream_response_default_continuous_usage_stats: bool = False,
 ) -> tuple[bool, bool]:
-    # When stream_options are specified in the request
+    # Server-side defaults OR with client stream_options: either side can
+    # turn either flag on, neither can force the other's off. Matches how
+    # include_usage already worked before continuous_usage_stats got a
+    # server-side default.
     if stream_options:
         include_usage = (
             stream_options.include_usage or stream_response_default_include_usage
         )
-        continuous_usage_stats = bool(stream_options.continuous_usage_stats)
-    else:
-        include_usage, continuous_usage_stats = (
-            stream_response_default_include_usage,
-            False,
+        continuous_usage_stats = bool(
+            stream_options.continuous_usage_stats
+            or stream_response_default_continuous_usage_stats
         )
+    else:
+        include_usage = stream_response_default_include_usage
+        continuous_usage_stats = stream_response_default_continuous_usage_stats
     return include_usage, continuous_usage_stats
 
 
