@@ -21,8 +21,8 @@ from grpc_health.v1 import health_pb2, health_pb2_grpc
 from grpc_reflection.v1alpha import reflection
 from smg_grpc_proto import sglang_encoder_pb2, sglang_encoder_pb2_grpc
 
-from sglang.srt.disaggregation.encode_server import (
-    MMEncoder,
+from sglang.srt.disaggregation.encode_server import MMEncoder
+from sglang.srt.disaggregation.encode_http_server import (
     handle_scheduler_receive_url_request,
     launch_encoder,
 )

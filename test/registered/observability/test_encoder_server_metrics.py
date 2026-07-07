@@ -10,7 +10,7 @@ import zmq
 from prometheus_client.parser import text_string_to_metric_families
 from prometheus_client.samples import Sample
 
-from sglang.srt.disaggregation.encode_server import MINIMUM_PNG_PICTURE_BASE64
+from sglang.srt.disaggregation.encode_http_server import MINIMUM_PNG_PICTURE_BASE64
 from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.network import get_zmq_socket_on_host
 from sglang.test.ci.ci_register import register_cuda_ci
