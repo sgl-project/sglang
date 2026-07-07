@@ -1,11 +1,24 @@
-import os
-import random
 import sys
 from typing import Optional, Type
 
 import pytest
 import torch
-from sgl_kernel import fp8_blockwise_scaled_mm
+
+from sglang.jit_kernel.fp8_blockwise_gemm import fp8_blockwise_scaled_mm
+from sglang.test.ci.ci_register import register_cuda_ci
+
+# SM120 (Blackwell / RTX 50-series) only. There is currently no SM120 CI runner,
+# so this stays in-tree but disabled in CI; run it locally on an SM120 GPU.
+register_cuda_ci(
+    est_time=30,
+    stage="base-b-kernel-unit",
+    runner_config="1-gpu-large",
+    disabled="fp8_blockwise_scaled_mm JIT kernel requires SM120 (no CI runner)",
+)
+
+
+def _sm120_supported() -> bool:
+    return torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 12
 
 
 def cdiv(a: int, b: int) -> int:
@@ -25,20 +38,6 @@ def baseline_scaled_mm(
     out_dtype: Type[torch.dtype],
     bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    # We treat N-dimensional group scaling as extended numpy-style broadcasting
-    # in numpy simply stretches dimensions with an extent of 1 to match the
-    # the target shape by repeating the data along that dimension (broadcasting)
-    # , we extend these semantics to say if the extent of a dimension in the
-    # source shape is not 1 and does not match the target shape we repeat each
-    # element along that dimension src_shape[dim] // target_shape[dim] times
-    # example if we have:
-    #       a = [[1, 2], and target_shape = (2, 4)
-    #            [3, 4]]
-    # then we would expand a to:
-    #       a = [[1, 1, 2, 2],
-    #            [3, 3, 4, 4]]
-    # NOTE this function this function does not explicitly broadcast dimensions
-    # with an extent of 1, since this can be done implicitly by pytorch
     def group_broadcast(t, shape):
         for i, s in enumerate(shape):
             if t.shape[i] != s and t.shape[i] != 1:
@@ -82,13 +81,18 @@ def _test_accuracy_once(M, N, K, out_dtype, device):
     torch.testing.assert_close(o, o1, rtol=rtol, atol=atol)
 
 
-@pytest.mark.parametrize("M", [1, 3, 5, 127, 128, 512, 1024, 4096])
-@pytest.mark.parametrize("N", [128, 512, 1024, 4096, 8192, 14080])
-@pytest.mark.parametrize("K", [512, 1024, 4096, 8192, 14080, 16384])
+@pytest.mark.skipif(
+    not _sm120_supported(), reason="fp8_blockwise_scaled_mm requires SM120 (>= 12.0)"
+)
+# M sweep covers all dispatch paths: <=32 -> swapAB tile N=32, (32,64] -> swapAB
+# tile N=64, >64 -> non-swap 128 tile.
+@pytest.mark.parametrize("M", [1, 3, 5, 32, 48, 64, 127, 128, 512, 1024, 4096])
+@pytest.mark.parametrize("N", [128, 512, 1024, 4096, 8192])
+@pytest.mark.parametrize("K", [512, 1024, 4096, 8192])
 @pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float16])
 def test_accuracy(M, N, K, out_dtype):
     _test_accuracy_once(M, N, K, out_dtype, "cuda")
 
 
 if __name__ == "__main__":
-    sys.exit(pytest.main([__file__]))
+    sys.exit(pytest.main([__file__, "-v"]))
