@@ -79,22 +79,6 @@ class Longcat2Embedding(nn.Module):
 
     def process_weights_after_loading(self):
         self.oe_projection.data = self.oe_projection.data / self.scale
-        if is_dp_attention_enabled():
-            if (
-                not self.word_embeder.enable_tp
-                or not self.word_embeder.use_attn_tp_group
-            ):
-                raise AssertionError(
-                    "LongCat2 word embedding must use attention TP group "
-                    "under dp-attention."
-                )
-            if not self.oe_embeder.enable_tp or not self.oe_embeder.use_attn_tp_group:
-                raise AssertionError(
-                    "LongCat2 OE embedding must use attention TP group "
-                    "under dp-attention."
-                )
-            if self.word_embeder.tp_size <= 1 or self.oe_embeder.tp_size <= 1:
-                raise AssertionError("Invalid embedding TP size under dp-attention.")
 
     def _compute_fused_ngram_ids_npu(
         self, input_ids: torch.Tensor, forward_batch: ForwardBatch
