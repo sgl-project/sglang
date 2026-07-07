@@ -97,7 +97,7 @@ Image dataset flags (for `image`):
 Agentic trace flags (for `agentic-trace`):
 
 - `--dataset-path`: path to the pre-built trace JSON
-- `--sharegpt-output-len`: per-turn output length (defaults to 220 with `ignore_eos`-style replay)
+- `--sharegpt-output-len`: per-turn output length (default: 220)
 - `--dataset-offset`: rotate the conversation list by this many entries before sampling, so successive sweep steps start on fresh conversations
 - `--agentic-max-turns`: cap each conversation to at most this many turns (useful for small, fast profiling runs)
 

@@ -9,18 +9,16 @@ from transformers import PreTrainedTokenizerBase
 
 from sglang.benchmark.datasets.common import BaseDataset, DatasetRow
 
-# Default per-turn output length when --sharegpt-output-len is not given.
-# Matches the OpenHands/agentic recipe used by the evalscope `swe_smith` bench
-# (--max-tokens 220 with ignore_eos).
+# Per-turn output length when --sharegpt-output-len is not given; matches the
+# ~220-token average assistant reply of OpenHands-style agentic traces.
 DEFAULT_AGENTIC_OUTPUT_LEN = 220
 
 
 @dataclass
 class AgenticTraceDataset(BaseDataset):
-    """Multi-turn agentic trace loader.
+    """Multi-turn agentic trace loader (e.g. OpenHands / SWE-smith traces).
 
-    Reads a pre-built trace JSON of the shape produced by the OpenHands /
-    SWE-smith dataset builders (``build_openhands_padded_dataset.py``)::
+    Expects a trace JSON of the shape::
 
         {
           "metadata": {...},
@@ -35,10 +33,10 @@ class AgenticTraceDataset(BaseDataset):
           ]
         }
 
-    Each turn's ``messages`` is the *delta* (the new, non-assistant messages for
-    that turn). One conversation becomes one :class:`DatasetRow` whose ``prompt``
-    is the list of per-turn message deltas. ``bench_serving`` detects this shape
-    as multi-turn and replays each conversation round by round, feeding the
+    Each turn's ``messages`` holds only the new non-assistant messages for that
+    turn. One conversation becomes one :class:`DatasetRow` whose ``prompt`` is
+    the list of per-turn message deltas; ``bench_serving`` detects this shape as
+    multi-turn and replays each conversation round by round, feeding the
     server's real assistant reply back into the next round's history.
 
     Use with a chat backend (``--backend sglang-oai-chat``).
@@ -56,7 +54,7 @@ class AgenticTraceDataset(BaseDataset):
             dataset_path=args.dataset_path,
             num_requests=args.num_prompts,
             fixed_output_len=args.sharegpt_output_len,
-            offset=getattr(args, "dataset_offset", 0) or 0,
+            offset=getattr(args, "dataset_offset", 0),
             max_turns=getattr(args, "agentic_max_turns", None),
         )
 
@@ -71,14 +69,8 @@ class AgenticTraceDataset(BaseDataset):
 
         conversations = data.get("conversations", [])
         if not conversations:
-            raise ValueError(
-                f"No 'conversations' found in {self.dataset_path}. Expected a "
-                "trace built by build_openhands_padded_dataset.py / "
-                "build_swe_smith_dataset.py."
-            )
+            raise ValueError(f"No 'conversations' found in {self.dataset_path}.")
 
-        # Rotate by offset so successive sweep steps start on fresh
-        # conversations (mirrors the evalscope --dataset-offset behavior).
         offset = self.offset % len(conversations)
         if offset:
             conversations = conversations[offset:] + conversations[:offset]
@@ -90,18 +82,14 @@ class AgenticTraceDataset(BaseDataset):
             if self.num_requests > 0 and len(filtered_dataset) >= self.num_requests:
                 break
 
-            # prompt == list of per-turn message deltas (each a List[Dict]).
-            prompt = [turn.get("messages", []) for turn in conversation]
-            prompt = [turn for turn in prompt if turn]  # drop empty turns
-            if self.max_turns is not None and self.max_turns > 0:
+            prompt = [turn["messages"] for turn in conversation if turn.get("messages")]
+            if self.max_turns:
                 prompt = prompt[: self.max_turns]
             if not prompt:
                 continue
 
-            # First turn's accumulated prompt tokens (cosmetic for multi-turn:
-            # calculate_metrics ignores per-row prompt_len in this mode).
-            first_turn = conversation[0] if conversation else {}
-            prompt_len = int(first_turn.get("prompt_tokens", 0))
+            # Informational only: multi-turn replay ignores per-row prompt_len.
+            prompt_len = int(conversation[0].get("prompt_tokens", 0))
 
             filtered_dataset.append(
                 DatasetRow(
