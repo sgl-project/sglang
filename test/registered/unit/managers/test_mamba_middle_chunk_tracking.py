@@ -161,14 +161,19 @@ class TestMambaMiddleChunkTracking(unittest.TestCase):
         self.assertEqual(tree_cache.evicted_mamba, [])
 
     def test_final_chunk_headroom_keeps_ping_pong_slots(self):
-        pool = self._make_req_to_token_pool([101])
+        # For a final (non-middle) chunk with prefix cache + extra buffer,
+        # factor = MAMBA_STATE_PER_REQ_PREFIX_CACHE = 3 (1 pool slot + 2
+        # ping-pong slots).  With 5 mamba slots available and 3 needed,
+        # no eviction is required.
+        pool = self._make_req_to_token_pool([101, 102, 103, 104, 105])
         req = self._make_req(inflight_middle_chunks=0)
         req.mamba_ping_pong_track_buffer = None
         tree_cache = _FakeMambaTreeCache()
 
         alloc_req_slots(pool, [req], tree_cache)
 
-        self.assertEqual(tree_cache.evicted_mamba, [2])
+        # mamba_state_needed=3, available=5 → no eviction needed
+        self.assertEqual(tree_cache.evicted_mamba, [])
 
 
 if __name__ == "__main__":
