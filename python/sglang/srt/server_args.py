@@ -3340,6 +3340,7 @@ class ServerArgs:
     def _handle_cuda_graph_config(self):
         self._parse_cuda_graph_config()
         self._apply_cuda_graph_compatibility()
+        self._apply_cuda_graph_disaggregation_roles()
         self._validate_cuda_graph_config()
         # Warn on the final resolved config (not inside the compat cascade —
         # that path is skipped when the user explicitly sets the backend,
@@ -3428,6 +3429,15 @@ class ServerArgs:
             self._disable_breakable_cudagraph_if_incompatible()
         elif self.cuda_graph_config.prefill.backend == Backend.FULL:
             self._disable_full_prefill_cudagraph_if_incompatible()
+
+    def _apply_cuda_graph_disaggregation_roles(self):
+        """Auto-disable CUDA graph for the unused disaggregation phase."""
+        if self.disaggregation_mode == "prefill":
+            if (Phase.DECODE, "backend") not in self._cuda_graph_config_locked:
+                self.cuda_graph_config.decode.backend = Backend.DISABLED
+        elif self.disaggregation_mode == "decode":
+            if (Phase.PREFILL, "backend") not in self._cuda_graph_config_locked:
+                self.cuda_graph_config.prefill.backend = Backend.DISABLED
 
     def _disable_tc_piecewise_cudagraph_if_incompatible(self):
         from sglang.srt.arg_groups.overrides import resolved_view as _resolved_view
