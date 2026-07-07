@@ -788,9 +788,13 @@ class TestDSparkPrefillHandoff(CustomTestCase):
         batch = SimpleNamespace(
             spec_info=spec_info,
             capture_hidden_mode=CaptureHiddenMode.FULL,
+            global_num_tokens=[2, 0],
+            global_num_tokens_for_logprob=[2, 0],
         )
 
-        result = self.worker_cls._forward_dp_idle_sync(worker, batch, on_publish=None)
+        result = self.worker_cls._forward_dp_idle_sync(
+            worker, batch, on_publish=None, num_tokens_per_req=1
+        )
 
         self.assertIs(result, idle_result)
         self.assertTrue(result.can_run_cuda_graph)
@@ -800,6 +804,55 @@ class TestDSparkPrefillHandoff(CustomTestCase):
         self.assertTrue(calls[0]["is_verify"])
         self.assertIs(batch.spec_info, spec_info)
         self.assertEqual(batch.capture_hidden_mode, CaptureHiddenMode.FULL)
+        self.assertEqual(batch.global_num_tokens, [2, 0])
+        self.assertEqual(batch.global_num_tokens_for_logprob, [2, 0])
+
+    def test_dp_idle_sync_preserves_verify_global_token_multiplier(self):
+        from sglang.srt.managers.utils import GenerationBatchResult
+        from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+
+        calls = []
+
+        def forward_batch_generation(batch, is_verify=False):
+            calls.append(
+                {
+                    "spec_info": batch.spec_info,
+                    "global_num_tokens": list(batch.global_num_tokens),
+                    "global_num_tokens_for_logprob": list(
+                        batch.global_num_tokens_for_logprob
+                    ),
+                    "is_verify": is_verify,
+                }
+            )
+            return GenerationBatchResult(can_run_cuda_graph=False)
+
+        worker = self._worker(0)
+        worker._target_worker = SimpleNamespace(
+            forward_batch_generation=forward_batch_generation
+        )
+        idle_result = GenerationBatchResult(can_run_cuda_graph=False)
+        worker._forward_idle = lambda on_publish: idle_result
+
+        spec_info = object()
+        batch = SimpleNamespace(
+            spec_info=spec_info,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
+            global_num_tokens=[1, 0, 3],
+            global_num_tokens_for_logprob=[1, 0, 3],
+        )
+
+        self.worker_cls._forward_dp_idle_sync(
+            worker, batch, on_publish=None, num_tokens_per_req=7
+        )
+
+        self.assertEqual(len(calls), 1)
+        self.assertIsNone(calls[0]["spec_info"])
+        self.assertEqual(calls[0]["global_num_tokens"], [7, 0, 21])
+        self.assertEqual(calls[0]["global_num_tokens_for_logprob"], [7, 0, 21])
+        self.assertTrue(calls[0]["is_verify"])
+        self.assertIs(batch.spec_info, spec_info)
+        self.assertEqual(batch.global_num_tokens, [1, 0, 3])
+        self.assertEqual(batch.global_num_tokens_for_logprob, [1, 0, 3])
 
     def test_prefill_idle_dp_sync_bypasses_target_prefill(self):
         from sglang.srt.managers.utils import GenerationBatchResult
@@ -808,9 +861,12 @@ class TestDSparkPrefillHandoff(CustomTestCase):
         calls = []
         worker = self._worker(0)
         worker.server_args = SimpleNamespace(enable_dp_attention=True)
-        worker._forward_dp_idle_sync = lambda batch, on_publish: calls.append(
-            (batch, on_publish)
-        ) or GenerationBatchResult()
+
+        def forward_dp_idle_sync(batch, on_publish, *, num_tokens_per_req):
+            calls.append((batch, on_publish, num_tokens_per_req))
+            return GenerationBatchResult()
+
+        worker._forward_dp_idle_sync = forward_dp_idle_sync
         worker._target_worker = SimpleNamespace(
             forward_batch_generation=lambda batch: (_ for _ in ()).throw(
                 AssertionError("idle prefill sync must not run target prefill")
@@ -826,7 +882,7 @@ class TestDSparkPrefillHandoff(CustomTestCase):
         result = self.worker_cls._forward_prefill(worker, batch, on_publish="publish")
 
         self.assertIsInstance(result, GenerationBatchResult)
-        self.assertEqual(calls, [(batch, "publish")])
+        self.assertEqual(calls, [(batch, "publish", 1)])
 
     def test_prefill_tail_hidden_packs_variable_length_batch(self):
         t = self.torch

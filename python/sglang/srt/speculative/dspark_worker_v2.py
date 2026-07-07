@@ -2652,7 +2652,9 @@ class DSparkWorkerV2(BaseSpecWorker):
         self, model_worker_batch: ScheduleBatch, on_publish
     ) -> GenerationBatchResult:
         if self._is_dp_idle_sync_batch(model_worker_batch):
-            return self._forward_dp_idle_sync(model_worker_batch, on_publish)
+            return self._forward_dp_idle_sync(
+                model_worker_batch, on_publish, num_tokens_per_req=1
+            )
 
         model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
         batch_output = self.target_worker.forward_batch_generation(model_worker_batch)
@@ -2826,7 +2828,11 @@ class DSparkWorkerV2(BaseSpecWorker):
         if model_worker_batch.forward_mode.is_idle() and not participates_in_dp_decode:
             return self._forward_idle(on_publish)
         if self._is_dp_idle_sync_batch(model_worker_batch):
-            return self._forward_dp_idle_sync(model_worker_batch, on_publish)
+            return self._forward_dp_idle_sync(
+                model_worker_batch,
+                on_publish,
+                num_tokens_per_req=int(self.verify_stride),
+            )
         dp_decode_global_num_tokens = self._get_dp_decode_global_num_tokens(
             model_worker_batch
         )
@@ -3188,7 +3194,11 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
     def _forward_dp_idle_sync(
-        self, model_worker_batch: ScheduleBatch, on_publish
+        self,
+        model_worker_batch: ScheduleBatch,
+        on_publish,
+        *,
+        num_tokens_per_req: int,
     ) -> GenerationBatchResult:
         """Run target idle forward for DP sync without DSpark verify planning.
 
@@ -3201,9 +3211,21 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         original_spec_info = model_worker_batch.spec_info
         original_capture_hidden_mode = model_worker_batch.capture_hidden_mode
+        original_global_num_tokens = model_worker_batch.global_num_tokens
+        original_global_num_tokens_for_logprob = (
+            model_worker_batch.global_num_tokens_for_logprob
+        )
         try:
             model_worker_batch.spec_info = None
             model_worker_batch.capture_hidden_mode = CaptureHiddenMode.NULL
+            if num_tokens_per_req != 1:
+                model_worker_batch.global_num_tokens = [
+                    int(x) * num_tokens_per_req for x in original_global_num_tokens
+                ]
+                model_worker_batch.global_num_tokens_for_logprob = [
+                    int(x) * num_tokens_per_req
+                    for x in original_global_num_tokens_for_logprob
+                ]
             sync_result = self.target_worker.forward_batch_generation(
                 model_worker_batch,
                 is_verify=True,
@@ -3211,6 +3233,10 @@ class DSparkWorkerV2(BaseSpecWorker):
         finally:
             model_worker_batch.spec_info = original_spec_info
             model_worker_batch.capture_hidden_mode = original_capture_hidden_mode
+            model_worker_batch.global_num_tokens = original_global_num_tokens
+            model_worker_batch.global_num_tokens_for_logprob = (
+                original_global_num_tokens_for_logprob
+            )
 
         result = self._forward_idle(on_publish)
         result.can_run_cuda_graph = sync_result.can_run_cuda_graph
