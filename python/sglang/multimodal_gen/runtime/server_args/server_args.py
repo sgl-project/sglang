@@ -20,10 +20,7 @@ import addict
 import yaml
 
 from sglang.multimodal_gen import envs
-from sglang.multimodal_gen.configs.pipeline_configs.base import (
-    ModelTaskType,
-    PipelineConfig,
-)
+from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
     LTX2PipelineConfig,
     is_ltx23_native_variant,
@@ -618,7 +615,7 @@ class ServerArgs(DisaggServerArgsMixin):
             # CPU platform does not need offload
             return
 
-        if self.pipeline_config.task_type == ModelTaskType.VLA_ACTION:
+        if self.pipeline_config.task_type.is_action_gen():
             if self.dit_cpu_offload is None:
                 self.dit_cpu_offload = False
             if self.text_encoder_cpu_offload is None:

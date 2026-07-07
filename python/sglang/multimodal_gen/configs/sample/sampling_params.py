@@ -472,18 +472,22 @@ class SamplingParams:
         """
         check if the sampling params is compatible and valid with server_args
         """
-        if pipeline_config.task_type.requires_image_input():
+        task_type = pipeline_config.task_type
+        if not task_type.is_visual_gen():
+            return
+
+        if task_type.requires_image_input():
             # requires image input
             if self.image_path is None:
                 raise ValueError(
-                    f"Served model with task type '{pipeline_config.task_type.name}' requires an 'image_path' input, but none was provided"
+                    f"Served model with task type '{task_type.name}' requires an 'image_path' input, but none was provided"
                 )
 
-        if not pipeline_config.task_type.accepts_image_input():
+        if not task_type.accepts_image_input():
             # does not support image input
             if self.image_path is not None:
                 raise ValueError(
-                    f"input_reference is not supported for {pipeline_config.task_type.name} models."
+                    f"input_reference is not supported for {task_type.name} models."
                 )
 
     def _adjust(
@@ -497,14 +501,16 @@ class SamplingParams:
 
         # TODO: SamplingParams should not rely on ServerArgs
         pipeline_config = server_args.pipeline_config
-        self.data_type = pipeline_config.task_type.data_type()
+        task_type = pipeline_config.task_type
+        self.data_type = task_type.data_type()
 
         self._adjust_output_path(server_args)
-        if self.data_type == DataType.ACTION:
+        if task_type.is_action_gen():
             self._adjust_action_fields(server_args)
             return
 
-        self._adjust_visual_fields(server_args, pipeline_config)
+        if task_type.is_visual_gen():
+            self._adjust_visual_fields(server_args, pipeline_config)
 
     def _adjust_output_path(self, server_args):
         if self.output_path is None:

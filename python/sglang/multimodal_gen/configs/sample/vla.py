@@ -118,7 +118,7 @@ class VLASamplingParams:
             )
 
     def _validate_with_pipeline_config(self, pipeline_config):
-        if pipeline_config.task_type.data_type() != DataType.ACTION:
+        if not pipeline_config.task_type.is_action_gen():
             raise ValueError(
                 f"VLASamplingParams requires an ACTION pipeline, got {pipeline_config.task_type.name}"
             )

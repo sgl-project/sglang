@@ -17,10 +17,7 @@ from copy import copy
 from typing import Any
 
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
-from sglang.multimodal_gen.configs.sample.sampling_params import (
-    DataType,
-    SamplingParams,
-)
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.registry import get_pipeline_config_classes
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.server_args import (
@@ -146,7 +143,7 @@ def _fallback_warmup_resolution(server_args: ServerArgs) -> tuple[int, int]:
 
 
 def _is_video_warmup_task(server_args: ServerArgs) -> bool:
-    return server_args.pipeline_config.task_type.data_type() == DataType.VIDEO
+    return server_args.pipeline_config.task_type.is_video_gen()
 
 
 def _warmup_resolution_alignment(server_args: ServerArgs) -> int:
@@ -295,7 +292,7 @@ def should_include_warmup_image(
     server_args: ServerArgs, server_based_warmup: bool
 ) -> bool:
     task_type = server_args.pipeline_config.task_type
-    if task_type.data_type() == DataType.ACTION:
+    if not task_type.is_visual_gen():
         return False
     if not task_type.accepts_image_input():
         return False
@@ -309,7 +306,7 @@ def should_include_warmup_image(
 
 
 def should_run_visual_warmup(server_args: ServerArgs) -> bool:
-    return server_args.pipeline_config.task_type.data_type() != DataType.ACTION
+    return server_args.pipeline_config.task_type.is_visual_gen()
 
 
 def build_warmup_reqs(

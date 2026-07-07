@@ -68,6 +68,19 @@ class ModelTaskType(Enum):
             or self == ModelTaskType.TI2I
         )
 
+    def is_action_gen(self) -> bool:
+        return self == ModelTaskType.VLA_ACTION
+
+    def is_video_gen(self) -> bool:
+        return (
+            self == ModelTaskType.I2V
+            or self == ModelTaskType.T2V
+            or self == ModelTaskType.TI2V
+        )
+
+    def is_visual_gen(self) -> bool:
+        return self.is_image_gen() or self.is_video_gen() or self == ModelTaskType.I2M
+
     def requires_image_input(self) -> bool:
         return (
             self == ModelTaskType.I2V
@@ -86,14 +99,13 @@ class ModelTaskType(Enum):
         )
 
     def data_type(self) -> DataType:
-        if self == ModelTaskType.VLA_ACTION:
+        if self.is_action_gen():
             return DataType.ACTION
         if self == ModelTaskType.I2M:
             return DataType.MESH
         if self.is_image_gen():
             return DataType.IMAGE
-        else:
-            return DataType.VIDEO
+        return DataType.VIDEO
 
 
 class STA_Mode(str, Enum):

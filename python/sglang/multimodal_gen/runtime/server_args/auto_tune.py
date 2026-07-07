@@ -7,7 +7,6 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from sglang.multimodal_gen import envs
-from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
     ModelDeploymentConfig,
 )
@@ -399,7 +398,7 @@ class ServerArgsAutoTuner:
 
     def _default_layerwise_components_for_unset_placement(self) -> list[str]:
         args = self.server_args
-        if args.pipeline_config.task_type == ModelTaskType.VLA_ACTION:
+        if args.pipeline_config.task_type.is_action_gen():
             return []
         if (
             args.is_arg_explicitly_set("layerwise_offload_components")
