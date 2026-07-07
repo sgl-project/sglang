@@ -16,6 +16,7 @@ from typing import (
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
+from sglang.srt.managers import mm_utils
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.observability.metrics_collector import (
@@ -548,6 +549,13 @@ class SchedulerMetricsReporter:
             f"#queue-req: {len(self.scheduler.waiting_queue)}, "
             f"#pending-token: {prefill_stats.num_pending_tokens}, "
         )
+
+        # Multimodal (ViT) embedding-cache cumulative hit/miss counters; only
+        # present once a multimodal item has been looked up (text-only workloads
+        # never see this segment).
+        mm_stats = mm_utils.mm_cache_stats
+        if mm_stats.hits or mm_stats.misses:
+            msg += f"mm-cache-hit: {mm_stats.hits}/{mm_stats.hits + mm_stats.misses}, "
 
         if self.scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
             msg += f"#bootstrap-req: {len(self.scheduler.disagg_prefill_bootstrap_queue.queue)}, "

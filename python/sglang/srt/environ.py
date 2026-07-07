@@ -791,6 +791,12 @@ class Envs:
     # Metrics
     SGLANG_ENABLE_METRICS_DEVICE_TIMER = EnvBool(False)
     SGLANG_ENABLE_METRICS_DP_ATTENTION = EnvBool(False)
+    # Opt-in prefill diagnostics: log GPU-synced wall time per prefill forward /
+    # per attention-metadata plan. The sync perturbs pipelining; leave off for
+    # headline latency runs. (Unlike SGLANG_ENABLE_METRICS_DEVICE_TIMER, these
+    # cover attention planning and log per event rather than via a reporter.)
+    SGLANG_PREFILL_FORWARD_TIMER = EnvBool(False)
+    SGLANG_ATTN_PLAN_TIMER = EnvBool(False)
 
     # Tokenizer (Kimi tiktoken: cache all_special_tokens / all_special_ids; the ITL can differ by +10x under high batch size).
     SGLANG_PATCH_TOKENIZER = EnvBool(True)

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import time
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Tuple, Union
 
@@ -266,6 +267,17 @@ class EagerRunner(BaseRunner):
         if not model_runner.server_args.enable_pdmux:
             forward_batch = self.load_batch(forward_batch, pp_proxy_tensors)
 
+        # SGLANG_PREFILL_FORWARD_TIMER: GPU-synced wall time of one prefill
+        # forward, covering attention-metadata planning + model.forward (for VLMs:
+        # ViT encode + LM prefill). Measures server-side prefill cost only — it
+        # excludes HTTP, base64 decode, and image preprocessing, which happen in
+        # the tokenizer process. Opt-in diagnostic: the sync perturbs pipelining,
+        # so leave off for headline latency runs.
+        prefill_timer_enabled = envs.SGLANG_PREFILL_FORWARD_TIMER.get()
+        if prefill_timer_enabled:
+            torch.cuda.synchronize()
+            prefill_timer_start = time.perf_counter()
+
         if forward_batch.needs_forward_metadata_init():
             if hasattr(model_runner.model, "prepare_context_parallel_metadata_for_dcp"):
                 # prepare kv cache buffer for dcp to gather kv cache
@@ -288,7 +300,21 @@ class EagerRunner(BaseRunner):
                 # Prepare model-specific attention metadata before planning,
                 # e.g. Moss-VL's prefill cross-attention custom mask.
                 model_runner.model.prepare_forward_batch(forward_batch)
+            # SGLANG_ATTN_PLAN_TIMER: GPU-synced wall time of attention-metadata
+            # planning for this prefill (whatever init_forward_metadata does for
+            # the active backend). Opt-in diagnostic.
+            plan_timer_enabled = envs.SGLANG_ATTN_PLAN_TIMER.get()
+            if plan_timer_enabled:
+                torch.cuda.synchronize()
+                plan_timer_start = time.perf_counter()
             model_runner.attn_backend.init_forward_metadata(forward_batch)
+            if plan_timer_enabled:
+                torch.cuda.synchronize()
+                logger.info(
+                    "[ATTN_PLAN] tokens=%d dt=%.1fms",
+                    forward_batch.input_ids.shape[0],
+                    (time.perf_counter() - plan_timer_start) * 1e3,
+                )
 
         cp_v2_active = is_cp_v2_active(forward_batch)
         forward_positions = forward_batch.positions
@@ -382,6 +408,13 @@ class EagerRunner(BaseRunner):
                     forward_batch,
                     **kwargs,
                 )
+        if prefill_timer_enabled:
+            torch.cuda.synchronize()
+            logger.info(
+                "[PREFILL_FORWARD] tokens=%d dt=%.1fms",
+                forward_batch.input_ids.shape[0],
+                (time.perf_counter() - prefill_timer_start) * 1e3,
+            )
         return ret
 
     def _execute_idle(

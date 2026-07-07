@@ -7,6 +7,7 @@ import hashlib
 import pickle
 from abc import abstractmethod
 from collections import defaultdict
+from dataclasses import dataclass
 from multiprocessing import shared_memory
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 
@@ -358,6 +359,26 @@ class MultiModalityDataPaddingPatternMultimodalTokens(MultiModalityDataPaddingPa
 embedding_cache: Optional[MultiModalStaticCache] = None
 
 
+@dataclass
+class MMEmbeddingCacheStats:
+    """Running hit/miss counters for the multimodal (ViT) embedding cache.
+
+    Incremented on every per-item cache lookup during prefill; a hit means the
+    item's vision-encoder output was reused (ViT encode skipped). Server-level
+    counters (not per-request): read for logging/metrics, reset never.
+    """
+
+    hits: int = 0
+    misses: int = 0
+
+    def record(self, hits: int, misses: int) -> None:
+        self.hits += hits
+        self.misses += misses
+
+
+mm_cache_stats = MMEmbeddingCacheStats()
+
+
 def init_mm_embedding_cache(max_size: int = 0):
     global embedding_cache
     embedding_cache = MultiModalStaticCache(max_size)
@@ -594,6 +615,9 @@ def _get_chunked_embedding_by_item(
             cached_embeddings[idx] = cached.embedding
         else:
             miss_items.append((idx, item, start, end))
+    mm_cache_stats.record(
+        hits=len(overlapping) - len(miss_items), misses=len(miss_items)
+    )
 
     # 3. Batch encode all cache-miss items in one ViT call
     if miss_items:
