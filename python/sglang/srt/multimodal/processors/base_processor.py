@@ -1248,7 +1248,14 @@ class BaseMultimodalProcessor(ABC):
 
         """
         assert images is not None
-        image_sizes = [(image.height, image.width) for image in images]
+        image_sizes = [
+            (
+                (int(image.shape[-2]), int(image.shape[-1]))
+                if isinstance(image, torch.Tensor)
+                else (image.height, image.width)
+            )
+            for image in images
+        ]
         num_image_tokens = self._processor._get_num_multimodal_tokens(
             image_sizes=image_sizes
         ).num_image_tokens

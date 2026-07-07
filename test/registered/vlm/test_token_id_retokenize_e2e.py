@@ -9,6 +9,9 @@ With SGLANG_MM_AVOID_RETOKENIZE ON (default), the server keeps the user's
 original tokens verbatim and only expands the image placeholder, so prompt_tokens
 stays faithful to what the client sent.
 
+The test uses JPEG so CUDA decoding returns a CHW tensor, covering the same
+exact-token path as PIL-backed images.
+
 For each model we launch a real server twice with the same predefined,
 non-canonical prompt ("Describe" split into "D"+"escribe") plus one image:
 
@@ -41,8 +44,8 @@ register_cuda_ci(est_time=300, stage="base-b", runner_config="1-gpu-large")
 def _data_uri():
     img = Image.new("RGB", (64, 64), (128, 128, 128))
     buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+    img.save(buf, format="JPEG")
+    return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()
 
 
 def _build_drift_prompt(model, image_token):
