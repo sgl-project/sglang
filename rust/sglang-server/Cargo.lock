@@ -1880,6 +1880,7 @@ dependencies = [
  "futures",
  "hf-hub 0.5.0",
  "pyo3",
+ "regex-syntax",
  "rmp-serde",
  "rmpv",
  "serde",
