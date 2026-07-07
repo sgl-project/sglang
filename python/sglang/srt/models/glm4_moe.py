@@ -23,6 +23,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.jit_kernel.dsv4 import linear_bf16_fp32
 from sglang.srt.batch_overlap.single_batch_overlap import SboFlags
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.distributed import (
@@ -109,6 +110,11 @@ _is_npu = is_npu()
 _device_sm = get_device_sm()
 
 logger = logging.getLogger(__name__)
+
+_GLM4_MOE_GATE_HPC_OPS_MIN_M = {
+    # GLM-5/5.1/5.2 FP8: 6144 hidden size, 256 routed experts.
+    (6144, 256): 2048,
+}
 
 if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
@@ -377,6 +383,9 @@ class Glm4MoeGate(nn.Module):
         self.e_score_correction_bias = nn.Parameter(
             torch.empty((config.n_routed_experts), dtype=torch.float32)
         )
+        self.hpc_ops_min_m = _GLM4_MOE_GATE_HPC_OPS_MIN_M.get(
+            (config.hidden_size, config.n_routed_experts)
+        )
         # GLM requires FP32 gate projection; cache to avoid per-forward cast.
         # FIXME: if gate weight is updated at runtime (e.g. expert rebalancing), _weight_fp32 must be invalidated.
         self.register_buffer("_weight_fp32", None, persistent=False)
@@ -384,6 +393,17 @@ class Glm4MoeGate(nn.Module):
     def forward(self, hidden_states):
         if self._weight_fp32 is None:
             self._weight_fp32 = self.weight.data.to(torch.float32)
+        if (
+            self.hpc_ops_min_m is not None
+            and _is_cuda
+            and not _is_hip
+            and hidden_states.shape[0] >= self.hpc_ops_min_m
+        ):
+            return linear_bf16_fp32(
+                hidden_states,
+                self._weight_fp32,
+                hpc_ops_min_m=self.hpc_ops_min_m,
+            )
         logits = F.linear(hidden_states.to(torch.float32), self._weight_fp32, None)
         return logits
 
