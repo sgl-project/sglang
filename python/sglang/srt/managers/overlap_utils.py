@@ -146,20 +146,21 @@ class FutureMap:
         self.needs_cpu_seq_lens = needs_cpu_seq_lens
         self.req_pool_size = req_to_token_pool.req_to_token.shape[0]
 
-        self.output_tokens_buf = (
-            torch.full((self.req_pool_size,), -1, dtype=torch.int64, device=self.device)
-            if _DEBUG_ASSERT
-            else torch.empty(
+        if _DEBUG_ASSERT:
+            # Poisoned init: every row must be written before its first gather.
+            self.output_tokens_buf = torch.full(
+                (self.req_pool_size,), -1, dtype=torch.int64, device=self.device
+            )
+            self.new_seq_lens_buf = torch.full(
+                (self.req_pool_size,), -1, dtype=torch.int64, device=self.device
+            )
+        else:
+            self.output_tokens_buf = torch.empty(
                 (self.req_pool_size,), dtype=torch.int64, device=self.device
             )
-        )
-        self.new_seq_lens_buf = (
-            torch.full((self.req_pool_size,), -1, dtype=torch.int64, device=self.device)
-            if _DEBUG_ASSERT
-            else torch.empty(
+            self.new_seq_lens_buf = torch.empty(
                 (self.req_pool_size,), dtype=torch.int64, device=self.device
             )
-        )
         # Pinned host copy of new_seq_lens_buf + private stream for fwd-prepare
         # D2H pulls (gated only on publish, off the schedule stream). CUDA-only:
         # recovers occupancy lost to the WAR barrier (also CUDA-only); other
