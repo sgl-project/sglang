@@ -516,8 +516,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # kernels read that layout. This is a load-time gate, not a
         # resolution-time one: out-of-tree platforms register their supported
         # backends in init_backend(), which runs when this module is imported
-        # — after ServerArgs.__post_init__.
-        if (
+        # — after ServerArgs.__post_init__. Target runner only: a draft
+        # model's (often non-MLA) config must not flip the shared setting.
+        if not self.is_draft_worker and (
             not self.use_mla_backend
             or server_args.attention_backend
             not in CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS
@@ -527,7 +528,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     "model_runner.chunked_prefix_cache_gate",
                     disable_chunked_prefix_cache=True,
                 )
-        if not server_args.disable_chunked_prefix_cache:
+        if not self.is_draft_worker and not server_args.disable_chunked_prefix_cache:
             logger.info("Chunked prefix cache is turned on.")
 
         # Set the global server_args in the scheduler process (target worker
