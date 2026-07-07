@@ -532,15 +532,11 @@ class DeepseekV4AttnBackend(
         if not self.online_c128_mtp.enabled():
             return None
 
+        # `verify_bs` is the number of real verify rows. DP padding can still
+        # execute fake rows on this rank, so the compressor plan must be built
+        # from the padded tensors passed here rather than slicing to verify_bs.
+        _ = verify_bs
         num_draft_tokens = self.speculative_num_draft_tokens
-        if verify_bs is not None:
-            verify_bs = int(verify_bs)
-            if verify_bs == 0:
-                return None
-            req_pool_indices = req_pool_indices[:verify_bs]
-            seq_lens = seq_lens[:verify_bs]
-            seq_lens_cpu = seq_lens_cpu[:verify_bs]
-            extend_seq_lens = extend_seq_lens[:verify_bs]
         seq_lens_cpu = [int(x) + num_draft_tokens for x in seq_lens_cpu]
         extend_lens_cpu = [num_draft_tokens] * len(seq_lens_cpu)
         return create_paged_compressor_data(
@@ -816,18 +812,10 @@ class DeepseekV4AttnBackend(
         seq_lens = raw_metadata.seq_lens
         out_cache_loc = raw_metadata.out_cache_loc
 
-        bs = (
-            int(raw_metadata.verify_bs)
-            if raw_metadata.verify_bs is not None
-            else len(seq_lens)
-        )
-        req_pool_indices = req_pool_indices[:bs]
-        seq_lens = seq_lens[:bs]
+        bs = len(seq_lens)
         extend_seq_lens = raw_metadata.extend_seq_lens
         assert extend_seq_lens is not None
-        extend_seq_lens = extend_seq_lens[:bs]
         num_draft_tokens = int(raw_metadata.num_draft_tokens)
-        out_cache_loc = out_cache_loc[: bs * num_draft_tokens]
         seq_lens = seq_lens + num_draft_tokens
 
         seq_lens_casual, req_pool_indices_repeated = (
@@ -852,8 +840,6 @@ class DeepseekV4AttnBackend(
             if need_compress
             else None
         )
-        if bs == 0:
-            return DSV4Metadata(core_attn_metadata, indexer_metadata)
         if not need_compress:
             return DSV4Metadata(core_attn_metadata, indexer_metadata)
         use_graph_plan = raw_metadata.use_prefill_cuda_graph
@@ -864,7 +850,7 @@ class DeepseekV4AttnBackend(
         else:
             assert raw_metadata.seq_lens_cpu is not None
             seq_lens_cpu = [
-                int(x) + num_draft_tokens for x in raw_metadata.seq_lens_cpu[:bs]
+                int(x) + num_draft_tokens for x in raw_metadata.seq_lens_cpu
             ]
             extend_lens_cpu = [num_draft_tokens] * bs
             num_q_tokens = None

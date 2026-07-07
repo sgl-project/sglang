@@ -464,7 +464,7 @@ class TestDSV4RawVerifyMetadata(CustomTestCase):
         self.assertEqual(dst.verify_bs, 3)
         self.assertTrue(dst.use_prefill_cuda_graph)
 
-    def test_online_c128_verify_metadata_slices_dp_padding_rows(self):
+    def test_online_c128_verify_metadata_keeps_dp_padding_rows(self):
         from sglang.srt.layers.attention import deepseek_v4_backend as backend_mod
         from sglang.srt.layers.attention.deepseek_v4_backend import (
             DeepseekV4AttnBackend,
@@ -497,13 +497,13 @@ class TestDSV4RawVerifyMetadata(CustomTestCase):
             )
 
         self.assertEqual(ret.name, "metadata")
-        self.assertEqual(captured["req_pool_indices"].tolist(), [0, 1])
-        self.assertEqual(captured["seq_lens"].tolist(), [12, 22])
-        self.assertEqual(captured["seq_lens_cpu"], [12, 22])
-        self.assertEqual(captured["extend_lens"].tolist(), [2, 2])
-        self.assertEqual(captured["extend_lens_cpu"], [2, 2])
+        self.assertEqual(captured["req_pool_indices"].tolist(), [0, 1, 2])
+        self.assertEqual(captured["seq_lens"].tolist(), [12, 22, 32])
+        self.assertEqual(captured["seq_lens_cpu"], [12, 22, 32])
+        self.assertEqual(captured["extend_lens"].tolist(), [2, 2, 2])
+        self.assertEqual(captured["extend_lens_cpu"], [2, 2, 2])
 
-    def test_online_c128_verify_metadata_skips_empty_dp_rank(self):
+    def test_online_c128_verify_metadata_plans_padded_empty_dp_rank(self):
         from sglang.srt.layers.attention import deepseek_v4_backend as backend_mod
         from sglang.srt.layers.attention.deepseek_v4_backend import (
             DeepseekV4AttnBackend,
@@ -515,10 +515,16 @@ class TestDSV4RawVerifyMetadata(CustomTestCase):
         backend.req_to_token = torch.zeros((4, 16), dtype=torch.int32)
         backend.online_c128_mtp = SimpleNamespace(enabled=lambda: True)
 
+        captured = {}
+
+        def fake_create_paged_compressor_data(**kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(name="metadata")
+
         with patch.object(
             backend_mod,
             "create_paged_compressor_data",
-            side_effect=AssertionError("empty verify rank must not plan compressor"),
+            side_effect=fake_create_paged_compressor_data,
         ):
             ret = backend._make_target_verify_c128_metadata(
                 req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
@@ -530,9 +536,12 @@ class TestDSV4RawVerifyMetadata(CustomTestCase):
                 verify_bs=0,
             )
 
-        self.assertIsNone(ret)
+        self.assertEqual(ret.name, "metadata")
+        self.assertEqual(captured["req_pool_indices"].tolist(), [0, 1])
+        self.assertEqual(captured["seq_lens"].tolist(), [12, 22])
+        self.assertEqual(captured["seq_lens_cpu"], [12, 22])
 
-    def test_raw_verify_metadata_skips_compressor_for_empty_dp_rank(self):
+    def test_raw_verify_metadata_plans_padded_empty_dp_rank(self):
         from sglang.srt.layers.attention import deepseek_v4_backend as backend_mod
         from sglang.srt.layers.attention.deepseek_v4_backend import (
             DeepseekV4AttnBackend,
@@ -567,15 +576,24 @@ class TestDSV4RawVerifyMetadata(CustomTestCase):
             seq_lens_cpu=[10],
         )
 
+        calls = []
+
+        def fake_create_paged_compressor_data(**kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(compress_ratio=kwargs["compress_ratio"])
+
         with patch.object(
             backend_mod,
             "create_paged_compressor_data",
-            side_effect=AssertionError("empty verify rank must not plan compressor"),
+            side_effect=fake_create_paged_compressor_data,
         ):
             metadata = backend.make_forward_metadata_from_raw_verify(raw)
 
-        self.assertIsNone(metadata.c4_compress_metadata)
-        self.assertIsNone(metadata.c128_compress_metadata)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0]["seq_lens_cpu"], [12])
+        self.assertEqual(calls[0]["extend_lens_cpu"], [2])
+        self.assertEqual(metadata.c4_compress_metadata.compress_ratio, 4)
+        self.assertEqual(metadata.c128_compress_metadata.compress_ratio, 128)
 
 
 class TestDSV4SwaOutCacheLocResolution(CustomTestCase):
