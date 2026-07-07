@@ -1250,7 +1250,7 @@ class BaseMultimodalProcessor(ABC):
         assert images is not None
         image_sizes = [
             (
-                (int(image.shape[-2]), int(image.shape[-1]))
+                tuple(image.shape[-2:])
                 if isinstance(image, torch.Tensor)
                 else (image.height, image.width)
             )
