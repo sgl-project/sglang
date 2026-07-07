@@ -1107,7 +1107,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         cache per-step intermediate states. After acceptance, we need to commit the
         state corresponding to each request's last accepted step.
         """
-        # Eligibility resolved once at init (pure-MLA targets have no state to commit).
         if not self._need_mamba_verify_commit:
             return
         attn_backend = self.target_worker.model_runner.attn_backend
@@ -1539,9 +1538,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         batch.out_cache_loc = verify_out_cache_loc
         sampling_info = batch.sampling_info
 
-        need_mamba_verify_commit = self._need_mamba_verify_commit
         seq_lens_pre_verify = (
-            batch.seq_lens.clone() if need_mamba_verify_commit else None
+            batch.seq_lens.clone() if self._need_mamba_verify_commit else None
         )
         seq_lens_cpu_backup = batch.seq_lens_cpu
         seq_lens_sum_backup = batch.seq_lens_sum
@@ -1661,7 +1659,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                     1, accept_len.to(torch.int64)[:, None], bonus[:, None]
                 )
 
-        if need_mamba_verify_commit:
+        if self._need_mamba_verify_commit:
             assert seq_lens_pre_verify is not None
             self._update_target_mamba_state_after_verify(
                 batch=batch,
