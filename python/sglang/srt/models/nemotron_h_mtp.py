@@ -39,8 +39,7 @@ from sglang.srt.models.nemotron_h import (
     NemotronHMoEDecoderLayer,
 )
 from sglang.srt.models.nemotron_h_utils import is_attn_layer
-from sglang.srt.runtime_context import get_parallel
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_flags, get_parallel
 from sglang.srt.utils import add_prefix
 
 
@@ -147,6 +146,7 @@ class NemotronHMTPMoEDecoderLayer(NemotronHMoEDecoderLayer):
         self.prev_layer_is_attn = layer_idx > 0 and is_attn_layer(
             _pat[(layer_idx - 1) % len(_pat)]
         )
+        self.layer_communicator.is_last_layer = True
 
         if has_start_projections:
             self.enorm = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
@@ -339,7 +339,7 @@ class NemotronHForCausalLMMTP(NemotronHForCausalLM):
             self.config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("lm_head", prefix),
-            use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+            use_attn_tp_group=get_flags().enable_dp_lm_head,
         )
 
         self.logits_processor = LogitsProcessor(config)

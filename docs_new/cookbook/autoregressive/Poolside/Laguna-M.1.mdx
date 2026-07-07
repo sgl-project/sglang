@@ -10,7 +10,7 @@ tag: NEW
 
 <Accordion title="Install SGLang">
 
-Laguna-M.1 support is already on SGLang `main` — **softplus per-element attention-output gating** ([PR #28400](https://github.com/sgl-project/sglang/pull/28400)) and a **global-attention fix** ([PR #28604](https://github.com/sgl-project/sglang/pull/28604), since M.1 is full-attention `sliding_window: 0`) — but not yet in a tagged release. The two paths below match the **Python / Docker** toggle in the command panel: install from `main` (Python tab), or use the **Docker** image, which bundles the same build (CUDA 13, covers H200 + all Blackwell). The model loads natively, so no `--trust-remote-code` is needed.
+Laguna-M.1 support is already on SGLang `main` — **softplus per-element attention-output gating** ([PR #28400](https://github.com/sgl-project/sglang/pull/28400)) and a **global-attention fix** ([PR #28604](https://github.com/sgl-project/sglang/pull/28604), since M.1 is full-attention `sliding_window: 0`) — but not yet in a tagged release. The two paths below match the **Python / Docker** toggle in the command panel: install from `main` (Python tab), or use the **Docker** image, which bundles the same build (CUDA 13, covers H200 + all Blackwell). The model ships custom config code on the Hub, so `--trust-remote-code` is required (it is included in the launch commands).
 
 <Tabs>
 
@@ -109,6 +109,7 @@ import { Playground } from "/src/snippets/_playground.jsx";
 
 ## 2. Configuration Tips
 
+- **Trust remote code** (`--trust-remote-code`): Laguna-M.1 ships custom modeling/config code on the Hugging Face Hub, so this flag is required for the server to load the model.
 - **Long-context memory**: M.1 is global-attention (no sliding-window), so the 262,144-token KV cache is large. If you hit OOM at full context, lower `--mem-fraction-static` or cap `--context-length`.
 - **FP8**: On **Blackwell** the recipe adds `--fp8-gemm-backend triton` — the compressed-tensors block-FP8 weight scales aren't UE8M0-packed, so the default DeepGEMM path emits garbage on Blackwell (sm_100); the Triton backend is correct (~19% slower). Temporary workaround pending [PR #28662](https://github.com/sgl-project/sglang/pull/28662) (which fixes the scales and restores the DeepGEMM fast path). On **Hopper (H200)** FP8 uses DeepGEMM with no extra flag — pre-warm its multi-session JIT with `python3 -m sglang.compile_deep_gemm --model poolside/Laguna-M.1-FP8` to avoid paying it on each restart.
 - **Parsers** (`poolside_v1`): for agentic / tool-using deployments enable the **Reasoning Parser** and **Tool Call Parser** in the Playground above — they emit `--reasoning-parser poolside_v1` (thinking → `reasoning_content`) and `--tool-call-parser poolside_v1` (structured `tool_calls`).
@@ -232,3 +233,91 @@ Args: {"location": "Beijing"}
 ```
 
 </Accordion>
+
+### 3.3 Prefill-Decode (PD) Disaggregation
+
+[PD disaggregation](../../../docs/advanced_features/pd_disaggregation) runs prefill and decode on **separate** SGLang servers linked by an RDMA KV-transfer fabric (mooncake or NIXL), fronted by the PD router. Laguna-M.1 is **global-attention with a standard KV cache** (no sliding window, no sparse "index" side-buffer), so its KV pages transfer with **no model-specific flags** — just the `--disaggregation-*` knobs. Both roles auto-select the same attention backend (FlashAttention-3) and page size because they share the model and flags, so the KV layout lines up for transfer.
+
+**Supported / validated topology:**
+
+- **Equal tensor parallelism** — prefill and decode run the same `--tp`.
+- **Single pipeline stage** — PP = 1 (the default).
+- **mooncake or NIXL** transfer backend over RDMA / InfiniBand.
+- Validated on **2 × 8×H200** (TP8 prefill + TP8 decode, BF16), one node each, over an 8× 400 Gb/s NDR InfiniBand fabric.
+
+Launch the prefill server, then the decode server — the same recipe with `--disaggregation-mode decode` and no bootstrap port. Point `--disaggregation-ib-device` at your RDMA NIC(s).
+
+```bash Prefill server (node A)
+sglang serve \
+  --model-path poolside/Laguna-M.1 \
+  --trust-remote-code \
+  --reasoning-parser poolside_v1 \
+  --tool-call-parser poolside_v1 \
+  --tp 8 \
+  --disaggregation-mode prefill \
+  --disaggregation-transfer-backend mooncake \
+  --disaggregation-ib-device mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7 \
+  --host 0.0.0.0 --port 30000 \
+  --disaggregation-bootstrap-port 8998
+```
+
+```bash Decode server (node B)
+sglang serve \
+  --model-path poolside/Laguna-M.1 \
+  --trust-remote-code \
+  --reasoning-parser poolside_v1 \
+  --tool-call-parser poolside_v1 \
+  --tp 8 \
+  --disaggregation-mode decode \
+  --disaggregation-transfer-backend mooncake \
+  --disaggregation-ib-device mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7 \
+  --host 0.0.0.0 --port 30001
+```
+
+Then start the PD router, pointing it at the prefill bootstrap (URL plus its `--disaggregation-bootstrap-port`) and the decode endpoint:
+
+```bash PD router
+python3 -m sglang_router.launch_router \
+  --pd-disaggregation \
+  --prefill http://<prefill-host>:30000 8998 \
+  --decode http://<decode-host>:30001 \
+  --policy round_robin \
+  --host 0.0.0.0 --port 8000
+```
+
+Clients hit the router exactly like a single server — it splits each request across the two stages transparently:
+
+<Accordion title="PD Client Example (Python)">
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(base_url="http://<router-host>:8000/v1", api_key="EMPTY")
+
+response = client.chat.completions.create(
+    model="poolside/Laguna-M.1",
+    messages=[{"role": "user", "content": "What is 2 + 2?"}],
+    max_tokens=64,
+)
+print(response.choices[0].message.content)
+```
+
+**Output Example:**
+
+```text Output
+2 + 2 = 4
+```
+
+</Accordion>
+
+**Transfer backend — mooncake (recommended).** mooncake honors `--disaggregation-ib-device` and establishes its RDMA connection at registration, so the **first request is already fast** (no cold start). It works with a single NIC or all eight; using **all 8 NICs lowers TTFT** (more aggregate bandwidth for the KV payload — the gap widens at longer context). On 8×H200 (random isl=512 / osl=256, 16 concurrent) it served ≈ **717 tok/s** output (≈ 2.2k tok/s total), mean **TTFT 244 ms**, mean **TPOT 17.7 ms**; with a single `mlx5_0` NIC, ≈ 697 tok/s and TTFT 287 ms (TPOT unchanged — decode is compute-bound).
+
+**Transfer backend — NIXL (works, with two caveats).**
+
+<Warning>
+The NIXL path **ignores `--disaggregation-ib-device`** — that flag is mooncake-only. NIXL uses its UCX backend, whose NIC is selected by the **`UCX_NET_DEVICES`** environment variable. **Set it** (e.g. `export UCX_NET_DEVICES=mlx5_0:1`) on both servers; without it UCX cannot establish a working cross-node path and every KV transfer hangs until it hits the 300 s timeout (`Request … timed out … in KVPoll.WaitingForInput`) and returns a 500.
+</Warning>
+
+With `UCX_NET_DEVICES` pinned, NIXL matches mooncake on quality and steady-state speed (≈ 720 tok/s, TTFT 230 ms, TPOT 17.7 ms). One difference: the **first request after launch pays a ~38 s one-time UCX connection cold-start** (a single port or all eight behave the same). Warm the path with one throwaway request after startup, or raise `SGLANG_DISAGGREGATION_WAITING_TIMEOUT` (default 300 s) so the first real request isn't dropped while UCX connects.
+
+**Validation.** PD disaggregation preserves output quality — disaggregated output matches non-disaggregated serving, and GSM8K (no-thinking, 200-question subset via the router) scored **0.945** (mooncake, 8 NICs) / **0.940** (NIXL) / **0.950** (mooncake, 1 NIC), all with 100% stop-rate and 0% errors — in line with single-node BF16 (≈ 0.93 on the full split). Logs confirm the split: the prefill node logs `Prefill batch` (CUDA graph off), the decode node logs `Decode batch` (CUDA graph on).

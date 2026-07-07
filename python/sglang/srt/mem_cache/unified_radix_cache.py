@@ -395,18 +395,17 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if not waited and self.tp_world_size > 1:
             torch.distributed.barrier(group=self.tp_group)
 
-    def _reap_completed_async_work(self):
+    def _drain_async_work(self):
         """
-        Poll outstanding async work and reap completed ones.
+        Block until all outstanding async sends are consumed, then clear.
 
-        Must be called in the scheduler thread.
+        Called at the start of each event round, so work_list holds the sends
+        accumulated since the last round. This bounds it and applies
+        backpressure when a downstream PP rank lags. Scheduler thread only.
         """
-        count = 0
-        while count < len(self.work_list) and self.work_list[count].is_completed():
-            count += 1
-        if count > 0:
-            logger.debug(f"Reap {count} completed async work")
-            self.work_list = self.work_list[count:]
+        for work in self.work_list:
+            work.wait()
+        self.work_list.clear()
 
     def _all_reduce(self, data: torch.Tensor, tp_reduce_op: torch.distributed.ReduceOp):
         """
@@ -638,7 +637,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         return result
 
     def dec_lock_ref(
-        self, node: Any, params: Optional[DecLockRefParams] = None
+        self,
+        node: Any,
+        params: Optional[DecLockRefParams] = None,
+        skip_swa: bool = False,
     ) -> DecLockRefResult:
         result = self.session.try_dec_lock_ref(node, params)
         if result is not None:
@@ -646,11 +648,35 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if self.disable:
             return DecLockRefResult()
         for component in self._components_tuple:
+            if skip_swa and component.component_type == ComponentType.SWA:
+                continue
             component.release_component_lock(node=node, params=params)
 
         self._update_evictable_leaf_sets(node)
         # TODO: delta is not aggregated from components; no caller uses it yet.
         return DecLockRefResult()
+
+    def dec_swa_lock_only(
+        self,
+        node: UnifiedTreeNode,
+        swa_uuid_for_lock: Optional[int] = None,
+    ) -> None:
+        """Early-release the SWA portion of a request's tree lock, plus any
+        strictly-lower-priority locks (e.g. Mamba) co-located on `node`.
+        """
+        if self.disable:
+            return
+        swa_component = self.components.get(ComponentType.SWA)
+        if swa_component is None:
+            return
+        swa_component.release_window_lock(node, swa_uuid_for_lock)
+
+        # Drop strictly-lower-priority locks (e.g. Mamba) co-located on `node`.
+        swa_priority = swa_component.eviction_priority(is_leaf=False)
+        dec_params = DecLockRefParams(swa_uuid_for_lock=swa_uuid_for_lock)
+        for comp in self._components_tuple:
+            if comp.eviction_priority(is_leaf=False) < swa_priority:
+                comp.release_component_lock(node, dec_params)
 
     def inc_host_lock_ref(self, node: Any) -> IncLockRefResult:
         if self.disable:
@@ -741,6 +767,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.dec_lock_ref(
             req.last_node,
             DecLockRefParams(swa_uuid_for_lock=getattr(req, "swa_uuid_for_lock", None)),
+            skip_swa=getattr(req, "swa_prefix_lock_released", False),
         )
 
         # cleanup
@@ -1132,21 +1159,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 child_key = key.child_key(self.page_size)
 
         is_new_leaf = False
-        # Create new leaf for remaining suffix
+        # Create new leaf for remaining suffix. A leaf survives on its Full
+        # value alone; auxiliary components (SWA, Mamba) may legitimately hold
+        # only a tombstone for this span (e.g. the whole leaf is outside the SWA
+        # window). Materialize it anyway so the Full KV stays cacheable.
         if len(key):
-            if any(
-                comp.should_skip_leaf_creation(
-                    total_prefix_len=total_prefix_length,
-                    key_len=len(key),
-                    params=params,
-                )
-                for comp in self._components_tuple
-            ):
-                # TODO: When leaf creation is skipped, We should release all component
-                # resources here or propagate a flag so that
-                # cleanup_after_caching_req can free them properly.
-                self.token_to_kv_pool_allocator.free(value)
-                return InsertResult(prefix_len=total_prefix_length)
             target_node = self._add_new_node(node, key, value, priority=priority)
             is_new_leaf = True
         else:
@@ -1248,6 +1265,18 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             if comp.eviction_priority(is_leaf) <= trigger_priority:
                 if comp is not trigger and comp.node_has_component_data(node, target):
                     cd = node.component_data[comp.component_type]
+                    # A comp whose TRUE internal priority outranks the trigger
+                    # is only in this loop because leaf-collapse flattened
+                    # priorities; a lock on it is a legit pin and must be
+                    # spared. A lock on a strictly-lower-priority tier is a
+                    # real strand — fall through to the assert below.
+                    if comp.eviction_priority(
+                        is_leaf=False
+                    ) >= trigger.eviction_priority(is_leaf=False):
+                        if EvictLayer.DEVICE in target and cd.lock_ref != 0:
+                            continue
+                        if EvictLayer.HOST in target and cd.host_lock_ref != 0:
+                            continue
                     if EvictLayer.DEVICE in target:
                         assert cd.lock_ref == 0
                     if EvictLayer.HOST in target:
@@ -2423,11 +2452,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
     def check_hicache_events(self) -> None:
         """Called per scheduler step to poll async HiCache events."""
+        # Reap the previous round's PP-sync sends before issuing new ones.
+        self._drain_async_work()
         self.writing_check()
         self.loading_check()
         if self.enable_storage:
             self.drain_storage_control_queues()
-        self._reap_completed_async_work()
         if self.enable_storage_metrics and self.storage_metrics_collector is not None:
             self.storage_metrics_collector.log_storage_metrics(
                 self.cache_controller.storage_backend.get_stats()

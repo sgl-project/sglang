@@ -494,6 +494,11 @@ class LTX2TwoStageResidencyController:
         )
 
     def initialize(self) -> None:
+        if self.mode == "original":
+            # maybe merge the fixed stage-1 distilled LoRA into the base once so phase switches skip per-request
+            # merge/unmerge.
+            self.pipeline._maybe_merge_stage1_distilled_into_base(self.server_args)
+            return
         if not self.should_use_premerged:
             return
         self.pipeline._initialize_premerged_stage2_transformer(self.server_args)
@@ -587,6 +592,10 @@ class LTX2TwoStagePipeline(_BaseLTX2Pipeline):
         self._active_lora_phase = None
         self._active_lora_signature = None
         self._use_premerged_stage2_transformer = False
+        # set when original mode merges stage-1 distilled LoRA into the DiT base
+        # once at init (see _merge_stage1_distilled_into_base).
+        self._stage1_distilled_in_base = False
+        self._stage1_distilled_base_strength: float | None = None
 
     def _initialize_premerged_stage2_transformer(self, server_args: ServerArgs) -> None:
         transformer_path = self._resolve_component_path(
@@ -610,6 +619,123 @@ class LTX2TwoStagePipeline(_BaseLTX2Pipeline):
             strength=self.STAGE_2_DISTILLED_LORA_STRENGTH,
             merge_weights=True,
         )
+
+    def _can_merge_stage1_distilled_into_base(self, server_args: ServerArgs) -> bool:
+        """Whether original mode can merge stage-1 distilled LoRA into the base once.
+
+        For a fixed non-zero stage-1 strength (HQ only), we merge it into the base once and run
+        stage 2 as a dynamic delta. Requires native LTX-2.3, no user stage-1
+        LoRA, plain (non-FSDP/DTensor, unquantized) weights.
+        """
+        return (
+            self._ltx2_residency.mode == "original"
+            and self._should_merge_stage2_distilled_lora(server_args)
+            and self._stage1_lora_path is None
+            and float(self.STAGE_1_DISTILLED_LORA_STRENGTH) != 0.0
+            and not bool(getattr(server_args, "use_fsdp_inference", False))
+            and getattr(server_args, "quantization", None) is None
+        )
+
+    def _maybe_merge_stage1_distilled_into_base(self, server_args: ServerArgs) -> None:
+        """Merge stage-1 distilled LoRA into the single DiT base once at init.
+
+        Stage 1 then runs on the base; stage 2 adds a dynamic delta of
+        ``stage2 - stage1`` strength on top. No per-request merge/unmerge.
+        """
+        self._stage1_distilled_in_base = False
+        self._stage1_distilled_base_strength = None
+        if not self._can_merge_stage1_distilled_into_base(server_args):
+            return
+
+        strength = float(self.STAGE_1_DISTILLED_LORA_STRENGTH)
+        # Canonical merge path (handles offload/TP), then commit it as the base.
+        self.set_lora(
+            lora_nickname="ltx2_stage1_distilled",
+            lora_path=self._distilled_lora_path,
+            target="transformer",
+            strength=strength,
+            merge_weights=True,
+        )
+        if self._uses_dtensor_weights(self.lora_layers):
+            # Unsupported layout; undo and fall back to per-request merge.
+            self.deactivate_lora_weights(target="transformer")
+            return
+
+        for layer in self.lora_layers.values():
+            layer.commit_merged_as_base()
+        # Keep the adapter loaded for the stage-2 delta; clear merged bookkeeping.
+        self.is_lora_merged["transformer"] = False
+        self.cur_adapter_strength.pop("transformer", None)
+        self.cur_adapter_config.pop("transformer", None)
+
+        self._stage1_distilled_in_base = True
+        self._stage1_distilled_base_strength = strength
+        self._active_lora_phase = "stage1"
+        self._active_lora_signature = None
+        logger.info(
+            "Merged LTX-2 stage-1 distilled LoRA (strength=%.4f) into the DiT base; "
+            "stage-2 uses a dynamic delta to avoid per-request merge/unmerge.",
+            strength,
+        )
+
+    def _unmerge_stage1_distilled_from_base(self) -> None:
+        """Restore the base weights and revert to per-request merging.
+
+        Used when a request overrides the stage-1 strength away from the merged
+        value. Subtracts the merged delta, then disables the optimization.
+        """
+        if not self._stage1_distilled_in_base:
+            return
+        self.set_lora(
+            lora_nickname="ltx2_stage1_distilled",
+            lora_path=self._distilled_lora_path,
+            target="transformer",
+            strength=-float(self._stage1_distilled_base_strength),
+            merge_weights=True,
+        )
+        for layer in self.lora_layers.values():
+            layer.commit_merged_as_base()
+        self.is_lora_merged["transformer"] = False
+        self.cur_adapter_strength.pop("transformer", None)
+        self.cur_adapter_config.pop("transformer", None)
+        self._stage1_distilled_in_base = False
+        self._stage1_distilled_base_strength = None
+        self._active_lora_signature = None
+        logger.info("Restored LTX-2 base; reverting to per-request stage-1 merge.")
+
+    def _switch_lora_phase_base_merged(
+        self, phase: str, distilled_lora_strength: float
+    ) -> bool:
+        """Phase switch when stage-1 distilled is merged into the base, unmerge or apply dynamic lora
+
+        Returns True if handled, False to fall back to the per-request path
+        (after restoring the base).
+        """
+        if phase == "stage1":
+            if distilled_lora_strength != self._stage1_distilled_base_strength:
+                self._unmerge_stage1_distilled_from_base()
+                return False
+            # Base already holds stage-1 distilled; just drop the stage-2 delta.
+            self.deactivate_lora_weights(target="transformer")
+            return True
+        if phase == "stage2":
+            delta = distilled_lora_strength - float(
+                self._stage1_distilled_base_strength
+            )
+            if delta == 0.0:
+                self.deactivate_lora_weights(target="transformer")
+                return True
+            # Dynamic delta on the merged base (base + delta == stage-2 strength);
+            # reuse the loaded adapter, so no reload/merge/unmerge.
+            self.set_lora(
+                lora_nickname="ltx2_stage1_distilled",
+                lora_path=self._distilled_lora_path,
+                target="transformer",
+                strength=delta,
+                merge_weights=False,
+            )
+            return True
+        return False
 
     def should_skip_ltx2_lora_switch_stage(self) -> bool:
         return (
@@ -696,6 +822,14 @@ class LTX2TwoStagePipeline(_BaseLTX2Pipeline):
         phase_signature = (phase, distilled_lora_strength)
         if phase_signature == self._active_lora_signature:
             return
+
+        if self._stage1_distilled_in_base:
+            if self._switch_lora_phase_base_merged(phase, distilled_lora_strength):
+                self._active_lora_phase = phase
+                self._active_lora_signature = phase_signature
+                return
+            # Base was restored (stage-1 strength override); fall through to the
+            # legacy per-request merge path below.
 
         if self._ltx2_residency.enter_phase(
             phase

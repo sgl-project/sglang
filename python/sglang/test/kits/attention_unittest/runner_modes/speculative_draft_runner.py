@@ -188,15 +188,7 @@ class _EagleDraftWorkerHarness:
         self._topk1_parents_prealloc = None
         self._topk1_score_indices_prealloc = None
         EagleDraftWorker._rebuild_topk1_chain_buffers(self)
-        # draft_forward reads this (set in EagleDraftWorker.__init__, skipped here).
-        self.index_share_for_mtp_iteration = (
-            getattr(
-                self.model_config.hf_config,
-                "index_share_for_mtp_iteration",
-                False,
-            )
-            and self.topk == 1
-        )
+        EagleDraftWorker._init_dsa_index_share_state(self)
 
     @property
     def draft_model_runner(self):
@@ -544,8 +536,8 @@ def run_eagle_draft_cuda_graph_runner_case(
         )
         adapter.prepare_replay_state(graph_fixture, case, draft_inputs, settings)
 
-        testcase.assertTrue(graph_runner.can_run(graph_batch))
-        actual = graph_runner.replay(graph_batch)
+        testcase.assertTrue(graph_runner.can_run_graph(graph_batch))
+        actual = graph_runner.execute(graph_batch)
         adapter.assert_outputs_close(actual, expected, settings)
     finally:
         _reset_cuda_graph_test_buffers()
@@ -590,8 +582,8 @@ def run_frozen_kv_mtp_cuda_graph_runner_case(
         graph_runner = _capture_frozen_kv_mtp_graph_runner(graph_worker)
         adapter.prepare_replay_state(graph_fixture, case, draft_inputs, settings)
 
-        testcase.assertTrue(graph_runner.can_run(graph_batch))
-        actual = graph_runner.replay(graph_batch)
+        testcase.assertTrue(graph_runner.can_run_graph(graph_batch))
+        actual = graph_runner.execute(graph_batch)
         adapter.assert_outputs_close(actual, expected, settings)
     finally:
         _reset_cuda_graph_test_buffers()

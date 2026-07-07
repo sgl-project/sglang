@@ -17,6 +17,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.model_executor.graph_shared_output import GraphSharedOutput
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import set_global_server_args_for_scheduler
@@ -276,6 +277,7 @@ class TinyModelConfig:
         self.is_encoder_decoder = False
         self.is_multimodal = False
         self.is_generation = True
+        self.quantization = None
         self.is_hybrid_swa = sliding_window_size is not None
         self.is_local_attention_model = sliding_window_size is not None
         self.attention_chunk_size = None
@@ -325,6 +327,11 @@ class MockModelRunner(ModelRunner):
         self.pp_size = 1
         self.is_draft_worker = False
         self.spec_algorithm = SpeculativeAlgorithm.NONE
+        # The runner lifecycle warms up kernels in capture() / first execute()
+        # via BaseRunner.warmup(); this mock never calls init_backends and has no
+        # real kernels to warm up, so mark it done (warmup becomes a no-op for
+        # the runner-mode attention tests that drive capture directly).
+        self._kernel_warmed_up = True
         speculative_num_draft_tokens = (
             max(case.input_lens)
             if case.forward_mode.is_target_verify()
@@ -397,6 +404,11 @@ class MockModelRunner(ModelRunner):
         self.is_hybrid_swa = case.sliding_window_size is not None
         self.sliding_window_size = case.sliding_window_size
         self.use_mla_backend = False
+        # Runner-mode helpers mutate speculative graph sizes after construction.
+        self.graph_shared_output = GraphSharedOutput(
+            device=self.device,
+            max_rows=pool_batch_size * max_context_len,
+        )
 
     @property
     def hybrid_gdn_config(self):
