@@ -3,16 +3,17 @@
 from __future__ import annotations
 
 import base64
+import dataclasses
 import io
 import time
 import uuid
+from functools import lru_cache
 from typing import Any
 
 import numpy as np
 from PIL import Image
 
-from sglang.multimodal_gen.configs.pipeline_configs.pi05 import Pi05PipelineConfig
-from sglang.multimodal_gen.configs.sample.pi05 import Pi05SamplingParams
+from sglang.multimodal_gen.configs.sample.vla import VLASamplingParams
 from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
 from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -123,7 +124,7 @@ def _normalize_observation(observation: dict[str, Any]) -> dict[str, Any]:
 
 def images_from_observation(
     observation: dict[str, Any],
-    pipeline_config: Pi05PipelineConfig,
+    pipeline_config: Any,
 ) -> dict[str, Any]:
     if isinstance(observation.get("images"), dict):
         images = dict(observation["images"])
@@ -139,12 +140,17 @@ def images_from_observation(
 
 
 def action_metadata(server_args: ServerArgs) -> dict[str, Any]:
-    pipeline_config: Pi05PipelineConfig = server_args.pipeline_config
+    pipeline_config = server_args.pipeline_config
+    policy_family = getattr(
+        pipeline_config,
+        "policy_family",
+        type(pipeline_config).__name__.removesuffix("PipelineConfig").lower(),
+    )
     return {
         "object": "action.metadata",
         "model": server_args.model_id or server_args.model_path,
         "model_path": server_args.model_path,
-        "policy_family": "pi05",
+        "policy_family": policy_family,
         "input": {
             "image_keys": list(pipeline_config.image_keys),
             "image_size": list(pipeline_config.image_size),
@@ -212,11 +218,60 @@ def _action_request_to_observation(payload: dict[str, Any]) -> dict[str, Any]:
     return _normalize_observation(observation)
 
 
+@lru_cache(maxsize=32)
+def _resolve_action_sampling_params_cls_cached(
+    model_path: str,
+    backend: str | None,
+    model_id: str | None,
+    pipeline_class_name: str | None,
+) -> type[VLASamplingParams]:
+    if pipeline_class_name:
+        from sglang.multimodal_gen.registry import get_pipeline_config_classes
+
+        config_classes = get_pipeline_config_classes(pipeline_class_name)
+        if config_classes is not None:
+            _, sampling_params_cls = config_classes
+            if issubclass(sampling_params_cls, VLASamplingParams):
+                return sampling_params_cls
+
+    from sglang.multimodal_gen.registry import get_model_info
+
+    model_info = get_model_info(
+        model_path,
+        backend=backend,
+        model_id=model_id,
+    )
+    sampling_params_cls = model_info.sampling_param_cls
+    if not issubclass(sampling_params_cls, VLASamplingParams):
+        raise ValueError(
+            f"Action endpoint requires VLASamplingParams, got {sampling_params_cls.__name__}"
+        )
+    return sampling_params_cls
+
+
+def _resolve_action_sampling_params_cls(
+    server_args: ServerArgs,
+) -> type[VLASamplingParams]:
+    return _resolve_action_sampling_params_cls_cached(
+        server_args.model_path,
+        getattr(server_args, "backend", None),
+        getattr(server_args, "model_id", None),
+        getattr(server_args, "pipeline_class_name", None),
+    )
+
+
+@lru_cache(maxsize=32)
+def _sampling_params_field_names(
+    sampling_params_cls: type[VLASamplingParams],
+) -> frozenset[str]:
+    return frozenset(field.name for field in dataclasses.fields(sampling_params_cls))
+
+
 def build_action_sampling_params(
     payload: dict[str, Any],
     server_args: ServerArgs,
-) -> Pi05SamplingParams:
-    pipeline_config: Pi05PipelineConfig = server_args.pipeline_config
+) -> VLASamplingParams:
+    pipeline_config = server_args.pipeline_config
     observation = _action_request_to_observation(payload)
     parameters = dict(payload.get("parameters") or {})
     runtime = dict(payload.get("runtime") or {})
@@ -248,27 +303,28 @@ def build_action_sampling_params(
     if output_format not in ("list", "numpy"):
         raise ValueError("output_format must be 'list' or 'numpy'")
 
-    sp = Pi05SamplingParams(
-        prompt=prompt,
-        images=images,
-        image_masks=observation.get("image_masks"),
-        camera_order=observation.get("camera_order"),
-        state=state,
-        noise=noise,
-        observation=observation,
-        action_horizon=int(
+    sampling_params_cls = _resolve_action_sampling_params_cls(server_args)
+    sampling_kwargs = {
+        "prompt": prompt,
+        "images": images,
+        "image_masks": observation.get("image_masks"),
+        "camera_order": observation.get("camera_order"),
+        "state": state,
+        "noise": noise,
+        "observation": observation,
+        "action_horizon": int(
             parameters.get(
                 "action_horizon",
                 observation.get("action_horizon", pipeline_config.action_horizon),
             )
         ),
-        action_dim=int(
+        "action_dim": int(
             parameters.get(
                 "action_dim",
                 observation.get("action_dim", pipeline_config.action_dim),
             )
         ),
-        num_inference_steps=int(
+        "num_inference_steps": int(
             parameters.get(
                 "num_inference_steps",
                 observation.get(
@@ -277,10 +333,18 @@ def build_action_sampling_params(
                 ),
             )
         ),
-        output_format=output_format,
-        return_timing=_runtime_bool(runtime.get("return_timing"), True),
-        enable_prefix_cache=_runtime_bool(prefix_cache, True),
-        enable_cuda_graph=_runtime_bool(cuda_graph, True),
+        "output_format": output_format,
+        "return_timing": _runtime_bool(runtime.get("return_timing"), True),
+        "enable_prefix_cache": _runtime_bool(prefix_cache, True),
+        "enable_cuda_graph": _runtime_bool(cuda_graph, True),
+    }
+    supported_fields = _sampling_params_field_names(sampling_params_cls)
+    sp = sampling_params_cls(
+        **{
+            name: value
+            for name, value in sampling_kwargs.items()
+            if name in supported_fields
+        }
     )
     sp._adjust(server_args)
     return sp

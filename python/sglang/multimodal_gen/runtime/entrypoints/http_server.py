@@ -13,7 +13,10 @@ import torch
 from fastapi import APIRouter, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 
-from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.configs.sample.sampling_params import (
+    DataType,
+    SamplingParams,
+)
 from sglang.multimodal_gen.runtime.entrypoints.openai import (
     action_api,
     image_api,
@@ -407,7 +410,7 @@ def create_app(server_args: ServerArgs):
     app.include_router(image_api.router)
     app.include_router(video_api.router)
     app.include_router(realtime_video_api.router)
-    if server_args.pipeline_config.task_type.data_type().name == "ACTION":
+    if server_args.pipeline_config.task_type.data_type() == DataType.ACTION:
         app.include_router(action_api.router)
         app.include_router(openpi_policy_api.router)
     app.include_router(mesh_api.router)

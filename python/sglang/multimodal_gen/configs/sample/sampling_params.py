@@ -497,7 +497,33 @@ class SamplingParams:
 
         # TODO: SamplingParams should not rely on ServerArgs
         pipeline_config = server_args.pipeline_config
+        self.data_type = pipeline_config.task_type.data_type()
 
+        self._adjust_output_path(server_args)
+        if self.data_type == DataType.ACTION:
+            self._adjust_action_fields(server_args)
+            return
+
+        self._adjust_visual_fields(server_args, pipeline_config)
+
+    def _adjust_output_path(self, server_args):
+        if self.output_path is None:
+            if server_args.output_path is not None:
+                self.output_path = server_args.output_path
+                logger.debug(
+                    f"Overriding output_path with server configuration: {self.output_path}"
+                )
+            else:
+                self.save_output = False
+
+    def _adjust_action_fields(self, server_args):
+        self.return_file_paths_only = False
+        self.num_frames = 1
+        self.adjust_frames = False
+        if self.save_output and not server_args.comfyui_mode:
+            self._set_output_file_name()
+
+    def _adjust_visual_fields(self, server_args, pipeline_config):
         if self.guidance_scale is None:
             try:
                 from sglang.multimodal_gen.configs.pipeline_configs.hunyuan3d import (
@@ -510,20 +536,6 @@ class SamplingParams:
                     self.guidance_scale = 1.0
             except ImportError:
                 self.guidance_scale = 1.0
-
-        self.data_type = server_args.pipeline_config.task_type.data_type()
-
-        if self.output_path is None:
-            if server_args.output_path is not None:
-                self.output_path = server_args.output_path
-                logger.debug(
-                    f"Overriding output_path with server configuration: {self.output_path}"
-                )
-            else:
-                self.save_output = False
-
-        if self.data_type == DataType.ACTION:
-            self.return_file_paths_only = False
 
         # Process negative prompt
         if self.negative_prompt is not None and not self.negative_prompt.isspace():
@@ -577,15 +589,11 @@ class SamplingParams:
                 "Sequence dimension shard is enabled, disabling frame adjustment for better performance"
             )
 
-        if self.data_type == DataType.ACTION:
-            self.num_frames = 1
-            self.adjust_frames = False
-        elif pipeline_config.task_type.is_image_gen():
+        if pipeline_config.task_type.is_image_gen():
             # settle num_frames
             if not server_args.pipeline_config.allow_set_num_frames():
                 logger.debug("Setting `num_frames` to 1 for image generation model")
                 self.num_frames = 1
-
         else:
             # mandatory frame adjusting logic, mod
             # NOTE: We must apply adjust_num_frames BEFORE the SP alignment logic below.

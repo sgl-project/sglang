@@ -14,11 +14,12 @@ from sglang.multimodal_gen.runtime.cache.vla_prefix_cache import (
     slice_prefix_context,
 )
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
-from sglang.multimodal_gen.runtime.distributed.vla import (
+from sglang.multimodal_gen.runtime.distributed.broadcast import (
     broadcast_metadata,
     broadcast_optional_tensor,
+)
+from sglang.multimodal_gen.runtime.distributed.vla import (
     broadcast_prefix_context,
-    broadcast_timing,
     get_vla_split_group,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
@@ -273,10 +274,16 @@ class VLAPrefixEncodingStage(PipelineStage):
             batch.extra[self.keys.prefix_context] = prefix_context
             batch.extra[self.keys.cache] = broadcast_metadata(
                 None,
-                split,
+                group=split.group,
+                rank=split.rank,
                 src=split.prefix_root,
             )
-            timings = broadcast_timing(None, split, src=split.prefix_root)
+            timings = broadcast_metadata(
+                None,
+                group=split.group,
+                rank=split.rank,
+                src=split.prefix_root,
+            )
             vla_timings(batch, self.keys).update(timings)
             return batch
 
@@ -312,12 +319,14 @@ class VLAPrefixEncodingStage(PipelineStage):
                 )
                 broadcast_metadata(
                     batch.extra[self.keys.cache],
-                    split,
+                    group=split.group,
+                    rank=split.rank,
                     src=split.prefix_root,
                 )
-                broadcast_timing(
+                broadcast_metadata(
                     vla_timings(batch, self.keys),
-                    split,
+                    group=split.group,
+                    rank=split.rank,
                     src=split.prefix_root,
                 )
             return batch
@@ -346,12 +355,14 @@ class VLAPrefixEncodingStage(PipelineStage):
             )
             broadcast_metadata(
                 batch.extra[self.keys.cache],
-                split,
+                group=split.group,
+                rank=split.rank,
                 src=split.prefix_root,
             )
-            broadcast_timing(
+            broadcast_metadata(
                 vla_timings(batch, self.keys),
-                split,
+                group=split.group,
+                rank=split.rank,
                 src=split.prefix_root,
             )
         if (
@@ -475,13 +486,15 @@ class VLAActionDenoisingStage(PipelineStage):
                 ) * 1000
             actions = broadcast_optional_tensor(
                 actions,
-                split,
+                group=split.group,
+                rank=split.rank,
                 src=split.action_root,
                 device=self.policy_model.device,
             )
-            timings = broadcast_timing(
+            timings = broadcast_metadata(
                 vla_timings(batch, self.keys) if should_run_action else None,
-                split,
+                group=split.group,
+                rank=split.rank,
                 src=split.action_root,
             )
             vla_timings(batch, self.keys).update(timings)

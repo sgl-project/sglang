@@ -7,7 +7,10 @@ import numpy as np
 
 from sglang.multimodal_gen.configs.pipeline_configs.pi05 import Pi05PipelineConfig
 from sglang.multimodal_gen.configs.sample.pi05 import Pi05SamplingParams
-from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.configs.sample.sampling_params import (
+    DataType,
+    SamplingParams,
+)
 from sglang.multimodal_gen.configs.sample.vla import VLASamplingParams
 from sglang.multimodal_gen.runtime.entrypoints.action_utils import (
     action_generation_response,
@@ -43,6 +46,20 @@ def test_pi05_uses_vla_sampling_params_not_visual_sampling_params():
     assert "negative_prompt" not in field_names
     assert "return_frames" not in field_names
     assert "diffusers_kwargs" not in field_names
+
+
+def test_action_adjust_skips_visual_image_video_logic():
+    params = SamplingParams()
+    params.num_frames = 0
+    params.adjust_frames = True
+    params.return_file_paths_only = True
+
+    params._adjust(_server_args())
+
+    assert params.data_type == DataType.ACTION
+    assert params.num_frames == 1
+    assert params.adjust_frames is False
+    assert params.return_file_paths_only is False
 
 
 def test_action_request_schema_builds_pi05_sampling_params():

@@ -262,16 +262,21 @@ Pi0.5 is implemented as a native VLA/action-policy pipeline, not as an SRT LLM s
 | --- | --- | --- |
 | Pipeline wiring | `python/sglang/multimodal_gen/runtime/pipelines/pi05.py` | `Pi05Pipeline.load_modules`, `Pi05Pipeline.create_pipeline_stages` |
 | VLA sampling params | `python/sglang/multimodal_gen/configs/sample/vla.py`, `python/sglang/multimodal_gen/configs/sample/pi05.py` | `VLASamplingParams`, `Pi05SamplingParams` |
-| Pipeline stages | `python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/pi05.py` | `Pi05PreprocessStage`, `Pi05PrefixStage`, `Pi05ActionDenoisingStage`, `Pi05PostprocessStage` |
+| Common VLA stages | `python/sglang/multimodal_gen/runtime/pipelines_core/stages/vla.py` | `VLAObservationPreprocessStage`, `VLAPrefixEncodingStage`, `VLAActionDenoisingStage`, `VLAActionPostprocessStage` |
+| Pi0.5 stage wiring | `python/sglang/multimodal_gen/runtime/pipelines/pi05.py` | Pi0.5 binds common VLA stages to `Pi05Preprocessor`, `Pi05PolicyModel`, and Pi0.5 stage keys |
 | Preprocessing | `python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/pi05_preprocess.py` | `Pi05Preprocessor` |
 | VLA observation batch | `python/sglang/multimodal_gen/runtime/utils/vla_observation.py` | `VLAObservationBatch`, `collate_vla_observation_batches`, `stable_tensor_sha256` |
 | Prefix cache | `python/sglang/multimodal_gen/runtime/cache/vla_prefix_cache.py` | `PrefixContext`, `VLAPrefixCacheKey`, `VLAPrefixCacheManager` |
+| Distributed broadcast helpers | `python/sglang/multimodal_gen/runtime/distributed/broadcast.py` | generic object, tensor, optional-tensor, and metadata broadcast helpers |
+| VLA split group | `python/sglang/multimodal_gen/runtime/distributed/vla.py` | `VLASplitGroup`, `get_vla_split_group`, `broadcast_prefix_context` |
 | Denoise CUDA graph | `python/sglang/multimodal_gen/runtime/utils/vla_denoise_graph.py` | `VLADenoiseShapeBucket`, `VLADenoiseGraphRunner.capture_or_run` |
 | Pi0.5 policy model | `python/sglang/multimodal_gen/runtime/models/vlas/pi05_policy.py` | `Pi05PolicyModel.encode_prefix`, `Pi05PolicyModel.sample_actions`, `Pi05PolicyModel.denoise_step` |
 | Pi0.5 core modules | `python/sglang/multimodal_gen/runtime/models/vlas/pi05_core.py` | `Pi05CoreModel`, `PaliGemmaWithExpertModel` |
 | PiGemma layers | `python/sglang/multimodal_gen/runtime/models/vlas/pi05_pigemma.py` | `PiGemmaModel`, `PiGemmaAttention`, `PiGemmaRMSNorm` |
 
-`Pi05SamplingParams` inherits from the VLA/action-specific `VLASamplingParams`, not the image/video visual `SamplingParams`. The action params surface keeps robot-policy fields such as action horizon, action dimension, prefix cache, CUDA graph, observation, state, images, and optional action noise. Visual-generation fields such as height, width, fps, frame return, and negative prompt are intentionally absent.
+`Pi05SamplingParams` inherits from the VLA/action-specific `VLASamplingParams`, not the image/video visual `SamplingParams`. The action params surface keeps robot-policy fields such as action horizon, action dimension, prefix cache, CUDA graph, observation, state, images, and optional action noise. Visual-generation fields such as height, width, fps, frame return, and negative prompt are intentionally absent. The base visual `SamplingParams._adjust` also dispatches `DataType.ACTION` before running image/video adjustment, so action requests do not inherit negative-prompt, resolution, frame-count, or visual sequence-shard logic.
+
+The common VLA stages are for prefix-conditioned continuous-action dVLA policies. They are not intended to be a universal base for every VLA architecture; autoregressive action-token policies, one-step regression policies, or world-model video policies should use a different stage shape when their dataflow differs.
 
 `VLAObservationBatch` is the normalized typed batch that crosses the preprocess, prefix, and action stages. It is not the raw OpenPI websocket observation. For one Pi0.5 request, `Pi05Preprocessor` converts input images, state, task text, optional token overrides, and optional initial noise into:
 
@@ -285,9 +290,9 @@ Pi0.5 is implemented as a native VLA/action-policy pipeline, not as an SRT LLM s
 | `tokens`, `token_masks` | tokenized task/state prompt and attention mask for the PaliGemma prefix path. |
 | `metadata` | camera order and image hashes. These feed grouped-request fingerprints and exact prefix-cache keys. |
 
-Grouped Python execution uses `collate_vla_observation_batches` to combine compatible single-request `VLAObservationBatch` objects. The prefix stage then runs one batched SigLIP/PaliGemma prefix forward, stores a grouped `PrefixContext`, and slices per-request `PrefixContext` handles for output bookkeeping.
+Grouped Python execution uses `collate_vla_observation_batches` to combine compatible single-request `VLAObservationBatch` objects. `VLAPrefixEncodingStage` then runs one batched SigLIP/PaliGemma prefix forward, stores a grouped `PrefixContext`, and slices per-request `PrefixContext` handles for output bookkeeping.
 
-`PrefixContext` is the dense request-local prefix state reused by all denoise steps. It contains prefix `past_key_values`, prefix padding masks, prefix position ids, dtype/device/layout metadata, and an optional cache-key digest. The global prefix cache stores whole `PrefixContext` objects behind an SRT `RadixCache`-style key, but v1 only accepts exact full-prefix matches. Partial prefix hits are rejected because visual/language/state prefix blocks use full-attention semantics rather than causal text-prefix semantics.
+`PrefixContext` is the dense request-local prefix state reused by all denoise steps. It contains prefix `past_key_values`, prefix padding masks, prefix position ids, dtype/device/layout metadata, and an optional cache-key digest. The global prefix cache stores whole `PrefixContext` objects behind an SRT `RadixCache`-style key, but v1 only accepts exact full-prefix matches. A radix partial match can occur when two cache-key digests share leading radix units; it is treated as a miss and counted as `partial_rejected`. SGLang does not reuse that partial state because visual/language/state prefix blocks use full-attention semantics rather than causal text-prefix semantics. Prefix cache is an optimization inside `VLAPrefixEncodingStage`, not the stage identity.
 
 The VLA CUDA graph path is based on SRT's piecewise CUDA graph mechanism via `enable_tc_piecewise_cuda_graph`. It does not capture the whole policy pipeline. `VLADenoiseGraphRunner` captures one action-expert denoise step per `VLADenoiseShapeBucket`, where the bucket includes batch size, prefix length, action horizon, action dim, dtype, and parallel layout. During replay, the runner copies the current `x_t`, timestep, and changed `PrefixContext` into static graph buffers, replays the captured step for each flow-matching timestep, and returns the static output tensor. If capture or replay fails for a bucket, that bucket is disabled and the path falls back to eager action-expert execution.
 
