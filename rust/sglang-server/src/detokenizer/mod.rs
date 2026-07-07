@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use crate::error::Error;
 use crate::fsm::{Event, RequestState};
 use crate::ids::RequestId;
-use crate::message::{ChunkEvent, EgressItem, EgressSink, GenerationOutput, SinkError};
+use crate::message::{ChunkEvent, EgressItem, EgressSink, SinkError};
 use crate::runtime::Runnable;
 use crate::runtime::channels::{DetokMsg, TmEvent};
 
@@ -224,15 +224,15 @@ fn handle_chunk(
         let _ = st.fsm.apply(Event::SchedulerPicked);
     }
 
-    // Fully incremental: decode just this chunk's delta. The chunk's raw token
-    // ids are ALSO surfaced as `output_ids` (the Python `/generate` returns them
-    // by default alongside `text`), so keep them in both modes — decode for text
-    // *and* pass the ids through. Nothing cumulative is kept here — the
-    // api-server's drain loop reassembles it where needed.
+    // Fully incremental: decode just this chunk's delta. `token_ids` stays in the
+    // event — it's ALSO surfaced as the `/generate` response's `output_ids` (the
+    // Python server returns them by default alongside `text`), in both normal and
+    // `skip_tokenizer_init` mode. Nothing cumulative is kept here — the api-server's
+    // drain loop reassembles it where needed.
     let n_tok = ev.token_ids.len() as u64;
-    let (delta_text, delta_ids) = match &mut st.decoder {
+    let delta_text = match &mut st.decoder {
         Some(decoder) => match decoder.step(&ev.token_ids) {
-            Ok(delta) => (delta, std::mem::take(&mut ev.token_ids)),
+            Ok(delta) => delta,
             Err(e) => {
                 let _ = st.fsm.apply(Event::Error(e.clone()));
                 let _ = st.sink.try_send(EgressItem::Error(e));
@@ -240,8 +240,8 @@ fn handle_chunk(
                 return;
             }
         },
-        // skip_tokenizer_init: no decode, just pass the chunk's token ids through.
-        None => (String::new(), std::mem::take(&mut ev.token_ids)),
+        // skip_tokenizer_init: no decode; the token ids pass through in `ev`.
+        None => String::new(),
     };
 
     let finished = ev.finish_reason.is_some();
@@ -249,61 +249,26 @@ fn handle_chunk(
     let _ = st.fsm.apply(Event::Chunk { finish: finished });
 
     // `return_text_in_logprobs`: decode each logprob token id to text HERE (this
-    // CPU-bound shard) rather than on the api-server I/O threads. Flat text
-    // columns stay parallel to the `idx` buffers, so `sglang_frame` just reads
-    // them. Read `ev.*_idx` before the `mem::take`s below move them.
-    let (out_lp_txt, in_lp_txt, out_top_txt, in_top_txt, out_tid_txt, in_tid_txt) =
-        if decode_lp_text {
-            (
-                backend.decode_logprob_texts(&ev.out_lp_idx),
-                backend.decode_logprob_texts(&ev.in_lp_idx),
-                backend.decode_logprob_texts(&ev.out_top_idx),
-                backend.decode_logprob_texts(&ev.in_top_idx),
-                backend.decode_logprob_texts(&ev.out_tid_idx),
-                backend.decode_logprob_texts(&ev.in_tid_idx),
-            )
-        } else {
-            Default::default()
-        };
+    // CPU-bound shard) rather than on the api-server I/O threads. Flat text columns
+    // stay parallel to the `idx` buffers, so `sglang_frame` just reads them.
+    if decode_lp_text {
+        ev.out_lp_txt = backend.decode_logprob_texts(&ev.out_lp_idx);
+        ev.in_lp_txt = backend.decode_logprob_texts(&ev.in_lp_idx);
+        ev.out_top_txt = backend.decode_logprob_texts(&ev.out_top_idx);
+        ev.in_top_txt = backend.decode_logprob_texts(&ev.in_top_idx);
+        ev.out_tid_txt = backend.decode_logprob_texts(&ev.out_tid_idx);
+        ev.in_tid_txt = backend.decode_logprob_texts(&ev.in_tid_idx);
+    }
 
-    // Protocol-neutral **delta** snapshot for this chunk; the API handler formats
-    // it (and accumulates when a cumulative view is required). `text`/`output_ids`
-    // are this chunk's delta; `completion_tokens` is this chunk's token count.
-    let output = GenerationOutput {
-        text: delta_text,
-        output_ids: delta_ids,
-        prompt_tokens: ev.prompt_tokens,
-        completion_tokens: n_tok,
-        finish_reason: ev.finish_reason,
-        out_lp_val: std::mem::take(&mut ev.out_lp_val),
-        out_lp_idx: std::mem::take(&mut ev.out_lp_idx),
-        in_lp_val: std::mem::take(&mut ev.in_lp_val),
-        in_lp_idx: std::mem::take(&mut ev.in_lp_idx),
-        out_top_val: std::mem::take(&mut ev.out_top_val),
-        out_top_idx: std::mem::take(&mut ev.out_top_idx),
-        out_top_lens: std::mem::take(&mut ev.out_top_lens),
-        in_top_val: std::mem::take(&mut ev.in_top_val),
-        in_top_idx: std::mem::take(&mut ev.in_top_idx),
-        in_top_lens: std::mem::take(&mut ev.in_top_lens),
-        out_tid_val: std::mem::take(&mut ev.out_tid_val),
-        out_tid_idx: std::mem::take(&mut ev.out_tid_idx),
-        out_tid_lens: std::mem::take(&mut ev.out_tid_lens),
-        in_tid_val: std::mem::take(&mut ev.in_tid_val),
-        in_tid_idx: std::mem::take(&mut ev.in_tid_idx),
-        in_tid_lens: std::mem::take(&mut ev.in_tid_lens),
-        hidden_val: std::mem::take(&mut ev.hidden_val),
-        hidden_lens: std::mem::take(&mut ev.hidden_lens),
-        out_lp_txt,
-        in_lp_txt,
-        out_top_txt,
-        in_top_txt,
-        out_tid_txt,
-        in_tid_txt,
-    };
+    // Fill the decode outputs in place; the pre-decode columns (logprobs/hidden,
+    // token_ids, prompt_tokens, finish_reason) already ride in `ev`. The API
+    // handler formats this delta (and accumulates for the cumulative view).
+    ev.text = delta_text;
+    ev.completion_tokens = n_tok;
 
     if finished {
         // The Done frame *is* the final frame: Finalizing → Completed.
-        let sent = st.sink.try_send(EgressItem::Done(output)).is_ok();
+        let sent = st.sink.try_send(EgressItem::Done(ev)).is_ok();
         let _ = st.fsm.apply(if sent {
             Event::FinalFrameSent
         } else {
@@ -317,7 +282,7 @@ fn handle_chunk(
         // silently dropping the frame would truncate the response and still look
         // like success at EOS. So treat both as terminal: drop the request AND
         // abort scheduler work for it.
-        if let Err(e) = st.sink.try_send(EgressItem::Frame(output)) {
+        if let Err(e) = st.sink.try_send(EgressItem::Frame(ev)) {
             match e {
                 SinkError::Full => {
                     tracing::warn!(
@@ -350,7 +315,7 @@ mod tests {
     fn full_sink_drops_request_and_aborts_scheduler() {
         // Capacity-1 sink, pre-filled so the next send hits `Full`.
         let (tx, _rx) = mpsc::channel::<EgressItem>(1);
-        tx.try_send(EgressItem::Frame(GenerationOutput::default()))
+        tx.try_send(EgressItem::Frame(ChunkEvent::default()))
             .unwrap();
 
         let mut table = HashMap::new();
