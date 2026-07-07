@@ -28,8 +28,8 @@ use crate::fsm::RequestState;
 use crate::ids::{RequestId, RequestIdGen};
 
 use crate::message::{
-    ControlRequest, EgressItem, EgressSink, GeneratePayload, GenerateRequest, GenerationOutput,
-    Request, RequestKind,
+    ChunkEvent, ControlRequest, EgressItem, EgressSink, GeneratePayload, GenerateRequest, Request,
+    RequestKind,
 };
 use crate::runtime::ServerArgs;
 use crate::runtime::channels::{Senders, TmEvent};
@@ -308,10 +308,10 @@ fn abort_error_response(finish_reason: &Option<serde_json::Value>) -> Option<Res
     Some((status, Json(body)).into_response())
 }
 
-/// Format a neutral [`GenerationOutput`] as one SGLang `/generate` frame. `rid`
-/// (the response `meta_info.id`) is passed in — the api-server owns it, so it's
-/// not carried on the per-chunk output.
-fn sglang_frame(out: &GenerationOutput, rid: &str) -> Vec<u8> {
+/// Format a decoded [`ChunkEvent`] as one SGLang `/generate` frame. `rid` (the
+/// response `meta_info.id`) is passed in as its string form — the api-server owns
+/// the canonical id; the event's numeric `rid` is just the shard routing key.
+fn sglang_frame(out: &ChunkEvent, rid: &str) -> Vec<u8> {
     let mut v = serde_json::json!({
         "text": out.text,
         "meta_info": {
@@ -325,8 +325,8 @@ fn sglang_frame(out: &GenerationOutput, rid: &str) -> Vec<u8> {
     // Logprobs: SGLang shape is a list of `[logprob, token_id, token_text|null]`
     // tuples. The token text (`return_text_in_logprobs`) was decoded on the detok
     // shard into the `*_txt` columns; empty → null text slot.
-    if !out.output_ids.is_empty() {
-        v["output_ids"] = serde_json::json!(out.output_ids);
+    if !out.token_ids.is_empty() {
+        v["output_ids"] = serde_json::json!(out.token_ids);
     }
     if !out.out_lp_val.is_empty() {
         v["meta_info"]["output_token_logprobs"] =
@@ -546,29 +546,30 @@ fn msgpack_to_json(bytes: &[u8]) -> Result<Vec<u8>, String> {
     serde_json::to_vec(&val).map_err(|e| e.to_string())
 }
 
-/// Folds the per-chunk [`GenerationOutput`] deltas the detok emits into a
-/// cumulative view. Used by the drain loops that need cumulative output — every
-/// unary response and the cumulative SGLang `/generate` stream. OpenAI streaming
+/// Folds the per-chunk [`ChunkEvent`] deltas the detok emits into a cumulative
+/// view. Used by the drain loops that need cumulative output — every unary
+/// response and the cumulative SGLang `/generate` stream. OpenAI streaming
 /// forwards deltas directly and doesn't use this. Shared with the [`openai`]
 /// submodule (`super::OutputAccumulator`).
-/// Wraps a single cumulative [`GenerationOutput`] built up across delta chunks.
+/// Wraps a single cumulative [`ChunkEvent`] built up across delta chunks.
 /// Holding it (rather than mirroring its fields) lets `snapshot` hand back a
 /// **borrow** for each streaming frame — no per-frame deep clone of the growing
 /// buffers (that made token-by-token streaming O(T²) *extra* on top of the wire
 /// format's inherent O(T²)).
 #[derive(Default)]
 struct OutputAccumulator {
-    out: GenerationOutput,
+    out: ChunkEvent,
 }
 
 impl OutputAccumulator {
     /// Fold one delta frame in. Output families concatenate; input families and
     /// hidden states are set-once / last-writer-wins (they ride the prefill/final
     /// chunk), matching the Python `meta_info` assignment.
-    fn fold(&mut self, d: &GenerationOutput) {
+    fn fold(&mut self, d: &ChunkEvent) {
         let o = &mut self.out;
+        o.rid = d.rid; // constant across the request; keeps the accumulated view coherent
         o.text.push_str(&d.text);
-        o.output_ids.extend_from_slice(&d.output_ids);
+        o.token_ids.extend_from_slice(&d.token_ids); // token_ids doubles as output_ids
         o.completion_tokens += d.completion_tokens;
         o.prompt_tokens = d.prompt_tokens; // constant across the request
         o.out_lp_val.extend_from_slice(&d.out_lp_val);
@@ -611,12 +612,12 @@ impl OutputAccumulator {
     }
 
     /// Borrow the cumulative output for an intermediate streaming frame.
-    fn snapshot(&self) -> &GenerationOutput {
+    fn snapshot(&self) -> &ChunkEvent {
         &self.out
     }
 
     /// Consume into the final cumulative output.
-    fn into_output(self) -> GenerationOutput {
+    fn into_output(self) -> ChunkEvent {
         self.out
     }
 }
@@ -799,12 +800,12 @@ mod logprob_shape_tests {
         );
     }
 
-    /// End-to-end: a `GenerationOutput` carrying a prompt-logprob request (first
-    /// input logprob is the `NaN` sentinel) formats without panicking and emits
+    /// End-to-end: a `ChunkEvent` carrying a prompt-logprob request (first input
+    /// logprob is the `NaN` sentinel) formats without panicking and emits
     /// `input_token_logprobs` with a leading `[null, token_id, text]`.
     #[test]
     fn prompt_logprob_frame_emits_null_first() {
-        let out = GenerationOutput {
+        let out = ChunkEvent {
             in_lp_val: vec![f32::NAN, -0.5],
             in_lp_idx: vec![10, 20],
             in_lp_txt: vec!["<s>".into(), "hi".into()],
@@ -822,27 +823,27 @@ mod logprob_shape_tests {
     #[test]
     fn accumulator_snapshot_is_cumulative() {
         let mut acc = OutputAccumulator::default();
-        acc.fold(&GenerationOutput {
+        acc.fold(&ChunkEvent {
             text: "he".into(),
-            output_ids: vec![1, 2],
+            token_ids: vec![1, 2],
             completion_tokens: 2,
             ..Default::default()
         });
         {
             let s = acc.snapshot();
             assert_eq!(s.text, "he");
-            assert_eq!(s.output_ids, vec![1, 2]);
+            assert_eq!(s.token_ids, vec![1, 2]);
         }
-        acc.fold(&GenerationOutput {
+        acc.fold(&ChunkEvent {
             text: "llo".into(),
-            output_ids: vec![3],
+            token_ids: vec![3],
             completion_tokens: 1,
             ..Default::default()
         });
         {
             let s = acc.snapshot();
             assert_eq!(s.text, "hello"); // cumulative
-            assert_eq!(s.output_ids, vec![1, 2, 3]);
+            assert_eq!(s.token_ids, vec![1, 2, 3]);
             assert_eq!(s.completion_tokens, 3);
         }
         let out = acc.into_output();
