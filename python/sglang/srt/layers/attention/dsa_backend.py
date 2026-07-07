@@ -268,12 +268,6 @@ class DSAIndexerMetadata(BaseIndexerMetadata):
         None
     )
     force_unfused_topk: bool = False
-    # Whether the fused top-k v2 kernel may be used for this forward. Disabled for
-    # spec verify / draft-extend: the v2 small-batch path illegal-addresses under
-    # those multi-query-per-request CUDA graphs (GLM 5.2 MTP), and it is only
-    # e2e-validated for single-query decode. TODO(dsa-topk-v2): re-enable once the
-    # small-batch kernel is fixed; see the crash analysis in the PR.
-    allow_topk_v2: bool = True
 
     def get_seqlens_int32(self) -> torch.Tensor:
         return self.attn_metadata.cache_seqlens_int32
@@ -343,7 +337,6 @@ class DSAIndexerMetadata(BaseIndexerMetadata):
             row_starts=ks,
             batch_idx_list=batch_idx_list,
             force_unfused_topk=self.force_unfused_topk,
-            allow_topk_v2=self.allow_topk_v2,
         )
 
 
@@ -2971,14 +2964,6 @@ class DeepseekSparseAttnBackend(
             self.hisparse_coordinator is not None
             and forward_batch.forward_mode.is_decode_or_idle()
         )
-        # TEMP(dsa-topk-v2): the fused v2 small-batch path illegal-addresses under
-        # spec verify / draft-extend CUDA graphs (GLM 5.2 MTP). Restrict v2 to the
-        # single-query decode shape it is e2e-validated on; spec falls back to the
-        # legacy transform (page_table_1 is present for spec, not dropped).
-        allow_topk_v2 = not (
-            forward_batch.forward_mode.is_target_verify()
-            or forward_batch.forward_mode.is_draft_extend_v2()
-        )
         return DSAIndexerMetadata(
             attn_metadata=self.forward_metadata,
             topk_transform_method=self.get_topk_transform_method(
@@ -2991,7 +2976,6 @@ class DeepseekSparseAttnBackend(
             dsl_atom=self.forward_metadata.dsl_atom,
             paged_mqa_atom_split=self.forward_metadata.paged_mqa_atom_split,
             force_unfused_topk=force_unfused,
-            allow_topk_v2=allow_topk_v2,
         )
 
     def _compute_flashmla_metadata(self, cache_seqlens: torch.Tensor, seq_len_q: int):
