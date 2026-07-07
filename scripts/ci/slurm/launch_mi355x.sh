@@ -111,6 +111,7 @@ emit("LBPORT", rt["lb_port"])
 emit("MEMFRAC", rt["mem_fraction_static"])
 emit("PAGE", rt["page_size"])
 emit("MAXREQ", rt["max_running_requests"])
+emit("MAXTOK", rt.get("max_total_tokens", ""))
 emit("CHUNK", rt["chunked_prefill_size"])
 # swa is DSV4-specific; emit empty when a model omits it so the flag is dropped.
 emit("SWA", rt.get("swa_full_tokens_ratio", ""))
@@ -239,6 +240,7 @@ PY
 EXTRA_FLAGS=""
 (( PDP > 1 )) && EXTRA_FLAGS="$EXTRA_FLAGS --enable-dp-attention --dp-size $PDP"
 (( PEP > 1 )) && EXTRA_FLAGS="$EXTRA_FLAGS --ep-size $PEP"
+[[ -n "$MAXTOK" ]] && EXTRA_FLAGS="$EXTRA_FLAGS --max-total-tokens $MAXTOK"
 if [[ "$MTP_ENABLED" == "1" ]]; then
     EXTRA_FLAGS="$EXTRA_FLAGS --speculative-algorithm $MTP_ALGO \
 --speculative-num-steps $MTP_STEPS --speculative-eagle-topk $MTP_TOPK \
