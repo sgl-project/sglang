@@ -117,9 +117,7 @@ from sglang.srt.utils import (
     configure_gc_warning,
     freeze_gc,
     get_bool_env_var,
-    get_child_process_shutdown_timeout,
     get_or_create_event_loop,
-    get_scheduler_shutdown_wait_timeout,
     graceful_kill_process_tree,
     kill_process_tree,
 )
@@ -2689,7 +2687,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # Wait for them to exit before sending SIGTERM to remaining children,
             # otherwise the SIGTERM would race with ShutdownReq processing.
             self._dispatch_to_scheduler(ShutdownReq())
-            deadline = time.monotonic() + get_scheduler_shutdown_wait_timeout()
+            deadline = time.monotonic() + envs.SGLANG_SCHEDULER_SHUTDOWN_TIMEOUT.get()
             while time.monotonic() < deadline and collect_scheduler_processes():
                 time.sleep(0.1)
 
@@ -2698,7 +2696,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             graceful_kill_process_tree(
                 os.getpid(),
                 include_parent=False,
-                timeout=get_child_process_shutdown_timeout(),
+                timeout=envs.SGLANG_CHILD_PROCESS_SHUTDOWN_TIMEOUT.get(),
             )
 
         # os._exit: sys.exit() would be caught by the asyncio event loop.

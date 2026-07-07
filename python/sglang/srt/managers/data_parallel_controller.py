@@ -56,7 +56,6 @@ from sglang.srt.server_args import (
 from sglang.srt.utils import numa_utils
 from sglang.srt.utils.common import (
     configure_logger,
-    get_child_process_shutdown_timeout,
     graceful_kill_process_tree,
     kill_itself_when_parent_died,
     maybe_reindex_device_id,
@@ -686,7 +685,9 @@ def run_data_parallel_controller_process(
             "SIGTERM received in data_parallel_controller; propagating graceful "
             "shutdown to scheduler children..."
         )
-        graceful_kill_process_tree(timeout=get_child_process_shutdown_timeout())
+        graceful_kill_process_tree(
+            timeout=envs.SGLANG_CHILD_PROCESS_SHUTDOWN_TIMEOUT.get()
+        )
         sys.exit(0)
 
     signal.signal(signal.SIGTERM, sigterm_handler)
