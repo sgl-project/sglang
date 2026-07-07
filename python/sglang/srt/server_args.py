@@ -7159,7 +7159,9 @@ def _has_cli_arg(argv: List[str], flag: str) -> bool:
     return any(arg == flag or arg.startswith(f"{flag}=") for arg in argv)
 
 
-def _apply_fuseep_mode_env_compat(raw_args: argparse.Namespace, argv: List[str]) -> None:
+def _apply_fuseep_mode_env_compat(
+    raw_args: argparse.Namespace, argv: List[str]
+) -> None:
     if not envs.SGLANG_NPU_FUSED_MOE_MODE.is_set() or _has_cli_arg(
         argv, "--fuseep-mode"
     ):
