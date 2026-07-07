@@ -474,12 +474,14 @@ class Envs:
     SGLANG_MORI_TRANSFER_TIMEOUT_MS = EnvInt(0)
     # Upper bound (bytes) on a single KV memory region registered with MORI's
     # RDMA backend. DeepSeek-V4 disagg auto-sizing can grow one unified C4 KV
-    # region past ibv_reg_mr's ~4 GiB single-registration ceiling, which makes
+    # region past the RDMA single-registration ceiling, which makes
     # RegisterRdmaMemoryRegion fail with errno=22 (EINVAL) so the PD path never
     # serves. When the profiled pool would exceed this, max_total_num_tokens is
-    # clamped so the largest region fits. Default 4 GiB (the 2**32 boundary);
-    # lower it if your NIC/driver caps MRs smaller, or set <= 0 to disable.
-    SGLANG_MORI_MAX_MR_BYTES = EnvInt(4 * 1024 * 1024 * 1024)
+    # clamped so the largest region fits. Empirically on MI355X a ~4 GiB region
+    # still fails errno=22 while ~2.19 GB registers fine, so the default is a
+    # conservative 2 GiB; raise it if your NIC/driver supports larger MRs, or
+    # set <= 0 to disable.
+    SGLANG_MORI_MAX_MR_BYTES = EnvInt(2 * 1024 * 1024 * 1024)
 
     # AMD & ROCm
     SGLANG_USE_AITER = EnvBool(False)
