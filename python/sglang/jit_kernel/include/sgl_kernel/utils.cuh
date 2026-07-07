@@ -15,6 +15,7 @@
 
 #pragma once
 
+#include <sgl_kernel/ffi.h>
 #include <sgl_kernel/utils.h>
 
 #include <dlpack/dlpack.h>
@@ -234,6 +235,21 @@ inline void RuntimeDeviceCheck(::cudaError_t error, DebugInfo location = {}) {
 /// \brief Check the last CUDA error (calls `cudaGetLastError`).
 inline void RuntimeDeviceCheck(DebugInfo location = {}) {
   return RuntimeDeviceCheck(::cudaGetLastError(), location);
+}
+
+inline int getSMVersion(int device_id) {
+  int sm_major = 0;
+  int sm_minor = 0;
+  RuntimeDeviceCheck(cudaDeviceGetAttribute(&sm_major, cudaDevAttrComputeCapabilityMajor, device_id));
+  RuntimeDeviceCheck(cudaDeviceGetAttribute(&sm_minor, cudaDevAttrComputeCapabilityMinor, device_id));
+  return sm_major * 10 + sm_minor;
+}
+
+inline auto alloc_workspace_tensor(size_t required_bytes, DLDevice device) -> tvm::ffi::Tensor {
+  if (required_bytes == 0) return {};
+  DLDataType u8 = {kDLUInt, 8, 1};
+  int64_t shape[] = {static_cast<int64_t>(required_bytes)};
+  return ffi::empty(tvm::ffi::ShapeView(shape, 1), u8, device);
 }
 
 /**

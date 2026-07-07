@@ -49,18 +49,3 @@ inline uint32_t next_pow_2(uint32_t x) noexcept {
   if (x <= 1) return 1;
   return 1u << (32 - __builtin_clz(x - 1));
 }
-
-inline auto alloc_workspace_tensor(size_t required_bytes, DLDevice device) -> tvm::ffi::Tensor {
-  if (required_bytes == 0) return {};
-  DLDataType u8 = {kDLUInt, 8, 1};
-  int64_t shape[] = {static_cast<int64_t>(required_bytes)};
-  return ffi::empty(tvm::ffi::ShapeView(shape, 1), u8, device);
-}
-
-inline int getSMVersion(int device_id) {
-  int sm_major = 0;
-  int sm_minor = 0;
-  RuntimeDeviceCheck(cudaDeviceGetAttribute(&sm_major, cudaDevAttrComputeCapabilityMajor, device_id));
-  RuntimeDeviceCheck(cudaDeviceGetAttribute(&sm_minor, cudaDevAttrComputeCapabilityMinor, device_id));
-  return sm_major * 10 + sm_minor;
-}

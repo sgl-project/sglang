@@ -7,6 +7,7 @@ import torch
 
 from sglang.jit_kernel.utils import cache_once, load_jit, override_jit_cuda_arch
 from sglang.kernel_api_logging import debug_kernel_api
+from sglang.srt.utils.common import is_sm120_supported
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -29,16 +30,12 @@ def _fp8_blockwise_cuda_flags() -> list[str]:
 
 @contextmanager
 def _fp8_blockwise_arch_env():
-    if not torch.cuda.is_available():
-        raise RuntimeError("fp8_blockwise_scaled_mm JIT kernel requires CUDA.")
-    major, minor = torch.cuda.get_device_capability()
-    if major < 12:
+    if not is_sm120_supported():
         raise RuntimeError(
-            "fp8_blockwise_scaled_mm JIT kernel requires compute capability >= 12.0 "
-            f"(SM120/Blackwell), got {major}.{minor}."
+            "fp8_blockwise_scaled_mm JIT kernel requires SM120 (Blackwell)."
         )
-    # The SM120 blockwise kernels use architecture-family-specific instructions
-    # and must be compiled for an `sm_*a` target (e.g. sm_120a), not plain sm_120.
+    major, minor = torch.cuda.get_device_capability()
+    # sm_*a target (e.g. sm_120a) required, not plain sm_120.
     with override_jit_cuda_arch(major, minor, suffix="a"):
         yield
 
@@ -52,15 +49,6 @@ def _jit_fp8_blockwise_module() -> Module:
             cuda_files=["gemm/fp8_blockwise/fp8_blockwise_scaled_mm_entry.cuh"],
             cuda_wrappers=[
                 ("fp8_blockwise_scaled_mm", "fp8_blockwise_scaled_mm"),
-                ("fp8_blockwise_scaled_mm_noswap", "fp8_blockwise_scaled_mm_noswap"),
-                (
-                    "fp8_blockwise_scaled_mm_swapab32",
-                    "fp8_blockwise_scaled_mm_swapab32",
-                ),
-                (
-                    "fp8_blockwise_scaled_mm_swapab64",
-                    "fp8_blockwise_scaled_mm_swapab64",
-                ),
             ],
             extra_dependencies=["cutlass"],
             extra_cuda_cflags=_fp8_blockwise_cuda_flags(),
@@ -90,16 +78,7 @@ def fp8_blockwise_scaled_mm(
     scales_b: torch.Tensor,
     out_dtype: torch.dtype,
 ) -> torch.Tensor:
-    """FP8 (e4m3) block-wise scaled matmul on SM120 (Blackwell).
-
-    Computes ``out = (mat_a * scales_a) @ (mat_b * scales_b)`` where scales are
-    per-128-block. ``mat_a`` is row-major [M, K], ``mat_b`` column-major [K, N];
-    output is [M, N] in ``out_dtype`` (fp16 or bf16). ``scales_a`` must be
-    M-major (column-major, ``stride(0) == 1``).
-
-    No M padding is done here: the kernel routes small or non-4-aligned M through
-    the swapAB path (tokens on the N tile), which has no M-alignment requirement.
-    """
+    """FP8 e4m3 block-wise scaled matmul on SM120."""
     assert out_dtype in (
         torch.float16,
         torch.bfloat16,

@@ -15,7 +15,36 @@ limitations under the License.
 
 #pragma once
 
-#include "fp8_blockwise_scaled_mm_common.cuh"
+#include <sgl_kernel/tensor.h>
+#include <sgl_kernel/utils.h>
+
+#include <sgl_kernel/runtime.cuh>
+#include <sgl_kernel/utils.cuh>
+
+#include <cstddef>
+#include <cstdint>
+#include <cuda_runtime.h>
+
+using namespace host;
+
+// clang-format off
+#include "cutlass/cutlass.h"
+#include "cutlass/detail/blockwise_scale_layout.hpp"
+#include "cutlass/gemm/collective/collective_builder.hpp"
+#include "cutlass/epilogue/collective/collective_builder.hpp"
+#include "cutlass/gemm/device/gemm_universal_adapter.h"
+#include "cutlass/gemm/kernel/gemm_universal.hpp"
+#include "cutlass/gemm/dispatch_policy.hpp"
+#include "cutlass/util/packed_stride.hpp"
+// clang-format on
+
+#define CUTLASS_CHECK(status)                                                        \
+  {                                                                                  \
+    cutlass::Status error = status;                                                  \
+    RuntimeCheck(error == cutlass::Status::kSuccess, cutlassGetStatusString(error)); \
+  }
+
+using namespace cute;
 
 #if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
 
@@ -232,17 +261,7 @@ void launch_sm120_fp8_blockwise_scaled_mm(
   CUTLASS_CHECK(status);
 }
 
-// swapAB variant for small token counts (small M). Instead of tiling the small
-// token dimension on M (min tile 128 due to the 128-wide 2D weight scale block),
-// we compute the transposed GEMM D^T = Wgemm(weight, activation) so tokens land on
-// the N axis, where the per-token 1D activation scale (granularity 1) allows a small
-// tile N (16/32/64). Mapping:
-//   A' = weight  (row-major [N, K], aliases the column-major [K, N] weight)
-//   B' = activation (column-major [K, M], aliases the row-major [M, K] activation)
-//   D' = out^T  (column-major [N, M], aliases the row-major [M, N] output)
-// Scales swap too: weight scale becomes SFA (K-major, 128x128), activation scale
-// becomes SFB (MN-major, per-token 1x128). Only the cooperative schedule is used
-// since the M' axis (= weight N) is large.
+// Transposed GEMM D^T = Wgemm(weight, activation): puts tokens on the N axis.
 template <
     typename OutType,
     typename MmaTileShape,
@@ -391,9 +410,10 @@ void launch_sm120_fp8_blockwise_scaled_mm_swapab(
   CUTLASS_CHECK(run_gemm(GemmKernel{}));
 }
 
-// kForceNoSwap=true forces the legacy non-swapped 128-tile path even for small M
-// (used for old-vs-new tile benchmarking); default false enables swapAB for small M.
-template <typename OutType, bool kForceNoSwap = false>
+// swapAB (tile N=32) beats the non-swap 128x128 path for M<=64 or M%4!=0
+// (cold-L2 CUPTI benchmarks, up to ~1.2x); tile N=16 is unsupported by the
+// SM120 blockwise collective (needs EPI_TILE_N=32 | CTA_N and B LDSM N>=32).
+template <typename OutType>
 void sm120_fp8_blockwise_dispatch_shape(
     tvm::ffi::TensorView out,
     tvm::ffi::TensorView a,
@@ -401,34 +421,18 @@ void sm120_fp8_blockwise_dispatch_shape(
     tvm::ffi::TensorView scales_a,
     tvm::ffi::TensorView scales_b,
     cudaStream_t stream) {
-  const int m = a.size(0);  // token count (NOT padded; may be any value)
+  const int m = a.size(0);
+  using EpilogueTileShape = Shape<_128, _64>;
+  if (m <= 64 || (m % 4 != 0)) {
+    launch_sm120_fp8_blockwise_scaled_mm_swapab<
+        OutType,
+        Shape<_128, _32, _128>,
+        Shape<_128, _32, _128>,
+        EpilogueTileShape,
+        Shape<_1, _32, _1>>(out, a, b, scales_a, scales_b, stream);
+    return;
+  }
 
-  // Use the swapAB path when M is small OR not a multiple of 4. swapAB puts the
-  // tokens on a small N tile (tile N=32) where the per-token 1D activation scale
-  // (granularity 1 in N) allows the small tile; it also has no M-alignment
-  // requirement, so it handles M % 4 != 0 that the non-swap path (which needs
-  // 4-aligned M) cannot. This replaces the previous Python-side row padding.
-  //
-  // A single tile N=32 is used for all swapAB (matching vLLM). Cold-L2 CUPTI
-  // benchmarks showed tile N=32 beats tile N=64 for M in (32,64] on typical
-  // shapes (up to ~1.2x, e.g. out_proj/gate_up_proj) and only ties on very large
-  // N (down_proj). tile N=16 is NOT supported by the SM120 blockwise collective
-  // (TMA-store epilogue needs EPI_TILE_N=32 | CTA_N, and the mainloop B LDSM copy
-  // needs N >= 32), so 32 is the floor.
-  using EpilogueTileShape = Shape<_128, _64>;  // vestigial on SM120 (epilogue tile is auto)
-  if constexpr (!kForceNoSwap) {
-    if (m <= 64 || (m % 4 != 0)) {
-      launch_sm120_fp8_blockwise_scaled_mm_swapab<
-          OutType,
-          Shape<_128, _32, _128>,
-          Shape<_128, _32, _128>,
-          EpilogueTileShape,
-          Shape<_1, _32, _1>>(out, a, b, scales_a, scales_b, stream);
-      return;
-    }
-  }  // if constexpr (!kForceNoSwap)
-
-  // 4-aligned larger M (or forced): standard (non-swapped) path, 128x128 MMA tile.
   using MmaTileShape = Shape<_128, _128, _128>;
   using PerSmTileShape = Shape<_128, _128, _128>;
   using ScalesPerTile = Shape<_128, _1, _1>;
@@ -436,14 +440,12 @@ void sm120_fp8_blockwise_dispatch_shape(
       out, a, b, scales_a, scales_b, stream);
 }
 
-// Non-templated entry: validate inputs and dispatch on the output dtype.
 inline void fp8_blockwise_scaled_mm_sm120(
     tvm::ffi::TensorView out,
     tvm::ffi::TensorView mat_a,
     tvm::ffi::TensorView mat_b,
     tvm::ffi::TensorView scales_a,
-    tvm::ffi::TensorView scales_b,
-    bool force_noswap = false) {
+    tvm::ffi::TensorView scales_b) {
   RuntimeCheck(mat_a.device().device_type == kDLCUDA, "mat_a must be a CUDA tensor");
   RuntimeCheck(mat_b.device().device_type == kDLCUDA, "mat_b must be a CUDA tensor");
 
@@ -472,43 +474,10 @@ inline void fp8_blockwise_scaled_mm_sm120(
 
   const cudaStream_t stream = LaunchKernel::resolve_device(mat_a.device());
 
-  if (force_noswap) {
-    if (host::is_type<bf16_t>(out.dtype())) {
-      sm120_fp8_blockwise_dispatch_shape<cutlass::bfloat16_t, true>(out, mat_a, mat_b, scales_a, scales_b, stream);
-    } else if (host::is_type<fp16_t>(out.dtype())) {
-      sm120_fp8_blockwise_dispatch_shape<cutlass::half_t, true>(out, mat_a, mat_b, scales_a, scales_b, stream);
-    } else {
-      Panic("out_dtype must be Half or BFloat16");
-    }
-  } else {
-    if (host::is_type<bf16_t>(out.dtype())) {
-      sm120_fp8_blockwise_dispatch_shape<cutlass::bfloat16_t, false>(out, mat_a, mat_b, scales_a, scales_b, stream);
-    } else if (host::is_type<fp16_t>(out.dtype())) {
-      sm120_fp8_blockwise_dispatch_shape<cutlass::half_t, false>(out, mat_a, mat_b, scales_a, scales_b, stream);
-    } else {
-      Panic("out_dtype must be Half or BFloat16");
-    }
-  }
-}
-
-// Benchmark/debug entry: force a fixed swapAB tile N (32 or 64) regardless of M.
-template <int TILE_N>
-inline void fp8_blockwise_scaled_mm_sm120_swapab_fixed(
-    tvm::ffi::TensorView out,
-    tvm::ffi::TensorView mat_a,
-    tvm::ffi::TensorView mat_b,
-    tvm::ffi::TensorView scales_a,
-    tvm::ffi::TensorView scales_b) {
-  const cudaStream_t stream = LaunchKernel::resolve_device(mat_a.device());
-  using Mma = Shape<_128, cute::Int<TILE_N>, _128>;
-  using ScalesPerTile = Shape<_1, cute::Int<TILE_N>, _1>;
-  using Epi = Shape<_128, _64>;
   if (host::is_type<bf16_t>(out.dtype())) {
-    launch_sm120_fp8_blockwise_scaled_mm_swapab<cutlass::bfloat16_t, Mma, Mma, Epi, ScalesPerTile>(
-        out, mat_a, mat_b, scales_a, scales_b, stream);
+    sm120_fp8_blockwise_dispatch_shape<cutlass::bfloat16_t>(out, mat_a, mat_b, scales_a, scales_b, stream);
   } else if (host::is_type<fp16_t>(out.dtype())) {
-    launch_sm120_fp8_blockwise_scaled_mm_swapab<cutlass::half_t, Mma, Mma, Epi, ScalesPerTile>(
-        out, mat_a, mat_b, scales_a, scales_b, stream);
+    sm120_fp8_blockwise_dispatch_shape<cutlass::half_t>(out, mat_a, mat_b, scales_a, scales_b, stream);
   } else {
     Panic("out_dtype must be Half or BFloat16");
   }

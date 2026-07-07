@@ -10,12 +10,10 @@ from sglang.jit_kernel.fp8_blockwise_gemm import fp8_blockwise_scaled_mm
 from sglang.srt.utils import is_sm120_supported
 from sglang.test.ci.ci_register import register_cuda_ci
 
-# SM120-only kernel; no SM120 CI runner today, so keep it in-tree but disabled in CI.
 register_cuda_ci(
     est_time=5,
     stage="base-b-kernel-benchmark",
-    runner_config="1-gpu-large",
-    disabled="fp8_blockwise_scaled_mm JIT kernel requires SM120 (no CI runner)",
+    runner_config="1-gpu-small",
 )
 
 _SM120_SUPPORTED = is_sm120_supported()
