@@ -956,8 +956,7 @@ class AutoencoderKLQwenImage(ParallelTiledVAE):
             else 0,
         }
         cuda_device = get_local_torch_device()
-        # FIXME: hardcode
-        dtype = torch.bfloat16
+        dtype = torch.get_default_dtype()
         latent_channels = config.arch_config.z_dim
 
         self.shift_factor = (
