@@ -1384,6 +1384,174 @@ class TestDSparkDeepSpecSemanticReference(CustomTestCase):
         self.assertFalse(t.allclose(expected, wrong, atol=1e-5, rtol=1e-5))
         self.assertGreater(float((expected - wrong).abs().max().item()), 1e-4)
 
+    def _rms_norm(self, x, weight):
+        return x * (x.pow(2).mean(dim=-1, keepdim=True) + 1e-6).rsqrt() * weight
+
+    def _make_toy_decoder_layer_weights(self, hidden_size, mlp_size, seed):
+        t = self.torch
+        generator = t.Generator().manual_seed(seed)
+
+        def randn(*shape):
+            return t.randn(*shape, generator=generator) / (hidden_size**0.5)
+
+        return {
+            "attn_norm": randn(hidden_size),
+            "wq": randn(hidden_size, hidden_size),
+            "wk": randn(hidden_size, hidden_size),
+            "wv": randn(hidden_size, hidden_size),
+            "wo": randn(hidden_size, hidden_size),
+            "mlp_norm": randn(hidden_size),
+            "w_gate": randn(hidden_size, mlp_size),
+            "w_up": randn(hidden_size, mlp_size),
+            "w_down": randn(mlp_size, hidden_size),
+        }
+
+    def _toy_decoder_layer_full(self, x, positions, key_valid, weights):
+        t = self.torch
+        seq_len = x.shape[1]
+        hidden_size = x.shape[-1]
+        normed = self._rms_norm(x, weights["attn_norm"])
+        q = self._apply_rope(normed @ weights["wq"], positions)
+        k = self._apply_rope(normed @ weights["wk"], positions)
+        v = normed @ weights["wv"]
+        causal = t.tril(t.ones((seq_len, seq_len), dtype=t.bool, device=x.device))
+        mask = key_valid[:, None, :] & causal[None, :, :]
+        scores = q @ k.transpose(-1, -2) / (hidden_size**0.5)
+        scores = scores.masked_fill(~mask, float("-inf"))
+        attn_out = t.softmax(scores, dim=-1) @ v
+        h = x + attn_out @ weights["wo"]
+        mlp_in = self._rms_norm(h, weights["mlp_norm"])
+        mlp_out = t.nn.functional.silu(mlp_in @ weights["w_gate"])
+        mlp_out = mlp_out * (mlp_in @ weights["w_up"])
+        return h + mlp_out @ weights["w_down"]
+
+    def _toy_decoder_layer_incremental(
+        self,
+        context_x,
+        block_x,
+        context_positions,
+        block_positions,
+        context_valid,
+        weights,
+    ):
+        t = self.torch
+        block_size = block_x.shape[1]
+        hidden_size = block_x.shape[-1]
+        context_normed = self._rms_norm(context_x, weights["attn_norm"])
+        block_normed = self._rms_norm(block_x, weights["attn_norm"])
+        cached_k = self._apply_rope(context_normed @ weights["wk"], context_positions)
+        cached_v = context_normed @ weights["wv"]
+        q = self._apply_rope(block_normed @ weights["wq"], block_positions)
+        block_k = self._apply_rope(block_normed @ weights["wk"], block_positions)
+        block_v = block_normed @ weights["wv"]
+        causal = t.tril(
+            t.ones((block_size, block_size), dtype=t.bool, device=block_x.device)
+        )
+        mask = t.cat(
+            [
+                context_valid[:, None, :].expand(-1, block_size, -1),
+                causal[None, :, :].expand(block_x.shape[0], -1, -1),
+            ],
+            dim=-1,
+        )
+        k = t.cat([cached_k, block_k], dim=1)
+        v = t.cat([cached_v, block_v], dim=1)
+        scores = q @ k.transpose(-1, -2) / (hidden_size**0.5)
+        scores = scores.masked_fill(~mask, float("-inf"))
+        attn_out = t.softmax(scores, dim=-1) @ v
+        h = block_x + attn_out @ weights["wo"]
+        mlp_in = self._rms_norm(h, weights["mlp_norm"])
+        mlp_out = t.nn.functional.silu(mlp_in @ weights["w_gate"])
+        mlp_out = mlp_out * (mlp_in @ weights["w_up"])
+        return h + mlp_out @ weights["w_down"]
+
+    def test_two_layer_toy_decoder_incremental_kv_matches_concat_block_hidden(self):
+        # This is the closest CPU-only proxy in this file for DSpark's
+        # block_hidden path: precomputed context K/V per layer, RoPE on Q/K,
+        # causal block attention, RMSNorm, residuals and an MLP.
+        t = self.torch
+        t.manual_seed(4)
+        batch_size = 2
+        context_len = 5
+        block_size = 3
+        hidden_size = 8
+        mlp_size = 16
+        context_x = t.randn(batch_size, context_len, hidden_size)
+        block_x = t.randn(batch_size, block_size, hidden_size)
+        context_valid = t.tensor(
+            [
+                [True, False, True, True, True],
+                [True, True, False, True, True],
+            ],
+            dtype=t.bool,
+        )
+        context_positions = t.tensor(
+            [[50, 51, 52, 53, 54], [100, 101, 102, 103, 104]]
+        )
+        block_positions = t.tensor([[55, 56, 57], [105, 106, 107]])
+        full_positions = t.cat([context_positions, block_positions], dim=1)
+        full_valid = t.cat(
+            [
+                context_valid,
+                t.ones((batch_size, block_size), dtype=t.bool),
+            ],
+            dim=1,
+        )
+        layer1 = self._make_toy_decoder_layer_weights(hidden_size, mlp_size, seed=10)
+        layer2 = self._make_toy_decoder_layer_weights(hidden_size, mlp_size, seed=20)
+
+        full_input = t.cat([context_x, block_x], dim=1)
+        full_l1 = self._toy_decoder_layer_full(
+            full_input, full_positions, full_valid, layer1
+        )
+        full_l2 = self._toy_decoder_layer_full(
+            full_l1, full_positions, full_valid, layer2
+        )
+        deepspec_block_hidden = full_l2[:, context_len:, :]
+
+        context_l1 = self._toy_decoder_layer_full(
+            context_x, context_positions, context_valid, layer1
+        )
+        block_l1 = self._toy_decoder_layer_incremental(
+            context_x,
+            block_x,
+            context_positions,
+            block_positions,
+            context_valid,
+            layer1,
+        )
+        block_l2 = self._toy_decoder_layer_incremental(
+            context_l1,
+            block_l1,
+            context_positions,
+            block_positions,
+            context_valid,
+            layer2,
+        )
+
+        max_abs = float((deepspec_block_hidden - block_l2).abs().max().item())
+        if os.getenv("SGLANG_DSPARK_TEST_VERBOSE", "0") == "1":
+            print(
+                "DSpark toy decoder parity debug: "
+                + json.dumps(
+                    {
+                        "case": "two_layer_incremental_kv_matches_concat",
+                        "batch_size": batch_size,
+                        "context_len": context_len,
+                        "block_size": block_size,
+                        "hidden_size": hidden_size,
+                        "max_abs_diff": max_abs,
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+
+        self.assertTrue(
+            t.allclose(deepspec_block_hidden, block_l2, atol=1e-5, rtol=1e-5)
+        )
+        self.assertLess(max_abs, 1e-5)
+
     def test_markov_refine_matches_deepspec_across_shape_grid(self):
         repo_root = Path(__file__).resolve().parents[5]
         deepspec_root = repo_root / "DeepSpec"
