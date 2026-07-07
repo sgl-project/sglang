@@ -4,7 +4,6 @@
 
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 use tokio::sync::mpsc;
 
 use crate::error::Error;
@@ -147,10 +146,10 @@ pub fn abort_req_msgpack(rid: &str) -> Result<Bytes, Error> {
     Ok(Bytes::from(buf))
 }
 
-/// Minimal decoded view of an incoming `/generate` body. Core fields are typed;
-/// everything else round-trips through `extra` so we stay faithful to the full
-/// Python schema (and the in-flight msgpack-migration) without enumerating it.
+/// Decoded `/generate` body; `deny_unknown_fields` rejects (4xx) any unsupported
+/// field rather than silently dropping it.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GeneratePayload {
     #[serde(default)]
     pub text: Option<String>,
@@ -178,9 +177,6 @@ pub struct GeneratePayload {
     /// tuple (the api-server does this at frame time; default leaves text null).
     #[serde(default)]
     pub return_text_in_logprobs: Option<bool>,
-    /// Any other fields on the request body, preserved for re-serialization.
-    #[serde(flatten)]
-    pub extra: BTreeMap<String, rmpv::Value>,
 }
 
 impl GeneratePayload {
@@ -194,6 +190,29 @@ impl GeneratePayload {
     #[allow(dead_code)]
     pub fn has_multimodal(&self) -> bool {
         false
+    }
+}
+
+#[cfg(test)]
+mod generate_payload_tests {
+    use super::*;
+
+    /// Supported fields decode fine.
+    #[test]
+    fn accepts_known_fields() {
+        let p: GeneratePayload =
+            serde_json::from_str(r#"{"text": "hi", "stream": true, "sampling_params": {}}"#)
+                .expect("known fields decode");
+        assert_eq!(p.text.as_deref(), Some("hi"));
+        assert!(p.stream);
+    }
+
+    /// An unsupported field is rejected, not silently dropped.
+    #[test]
+    fn rejects_unknown_fields() {
+        let err = serde_json::from_str::<GeneratePayload>(r#"{"text": "hi", "lora_path": "x"}"#)
+            .expect_err("unknown field must be rejected");
+        assert!(err.to_string().contains("lora_path"), "{err}");
     }
 }
 
