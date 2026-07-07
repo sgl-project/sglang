@@ -56,7 +56,10 @@ from sglang.srt.layers.moe.utils import (
     should_skip_post_experts_all_reduce,
 )
 from sglang.srt.layers.quantization import QuantizationConfig
-from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+from sglang.srt.layers.quantization.unquant import (
+    UnquantizedLinearMethod,
+    get_bf16_gemm_backend,
+)
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -253,6 +256,7 @@ class NemotronHMoE(nn.Module):
             and self.shared_experts is not None
             and isinstance(self.fc2_latent_proj.quant_method, UnquantizedLinearMethod)
             and self.fc2_latent_proj.bias is None
+            and get_bf16_gemm_backend().is_auto()
         )
 
     def _forward_core(
@@ -318,8 +322,12 @@ class NemotronHMoE(nn.Module):
         final_hidden_states: torch.Tensor,
         shared_output: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        if self._fuse_latent_projection_shared_add:
-            assert shared_output is not None
+        if (
+            self._fuse_latent_projection_shared_add
+            and shared_output is not None
+            and final_hidden_states.dtype == shared_output.dtype
+            and final_hidden_states.dtype == self.fc2_latent_proj.weight.dtype
+        ):
             return (
                 torch.addmm(
                     shared_output,

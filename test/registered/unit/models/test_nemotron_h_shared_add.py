@@ -86,3 +86,24 @@ def test_nemotron_h_latent_projection_fallback_is_unchanged():
 
     torch.testing.assert_close(projected, reference, rtol=0, atol=0)
     assert remaining_shared is shared
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@torch.inference_mode()
+def test_nemotron_h_latent_projection_falls_back_for_mixed_dtype():
+    projection = _LatentProjection(64, 128).cuda()
+    moe = SimpleNamespace(
+        _fuse_latent_projection_shared_add=True,
+        use_latent_moe=True,
+        fc2_latent_proj=projection,
+    )
+    routed = torch.randn(4, 64, device="cuda", dtype=torch.bfloat16)
+    shared = torch.randn(4, 128, device="cuda", dtype=torch.float32)
+
+    projected, remaining_shared = NemotronHMoE._apply_latent_projection(
+        moe, routed, shared
+    )
+    reference, _ = projection(routed)
+
+    torch.testing.assert_close(projected, reference, rtol=0, atol=0)
+    assert remaining_shared is shared
