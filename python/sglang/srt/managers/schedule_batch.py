@@ -2282,6 +2282,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self,
         req: Req,
     ) -> _MambaRadixCacheV2TrackEntry:
+        # Middle chunks are intermediate prefill work. Their mamba states will
+        # be overwritten by the final chunk, so avoid tracking/copying them.
+        if req.inflight_middle_chunks > 0:
+            return _MambaRadixCacheV2TrackEntry(
+                track_mask=False,
+                track_index=0,
+                track_seqlen=-1,
+            )
+
         mamba_cache_chunk_size = get_global_server_args().mamba_cache_chunk_size
 
         def _force_track_h(i: int) -> int:
