@@ -20,6 +20,67 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+# Config for the optional parallel grammar vocab-mask fill, read once. None means
+# "not yet resolved"; a resolved value is either False (disabled) or a
+# (min_bs, num_threads) tuple.
+_parallel_grammar_fill_cfg: Optional[Any] = None
+
+
+def _get_parallel_grammar_fill_cfg():
+    global _parallel_grammar_fill_cfg
+    if _parallel_grammar_fill_cfg is None:
+        from sglang.srt.environ import envs
+
+        enabled = envs.SGLANG_ENABLE_PARALLEL_GRAMMAR_FILL.get()
+        min_bs = envs.SGLANG_PARALLEL_GRAMMAR_FILL_MIN_BS.get()
+        num_threads = envs.SGLANG_PARALLEL_GRAMMAR_FILL_THREADS.get()
+        if enabled:
+            _parallel_grammar_fill_cfg = (min_bs, num_threads)
+        else:
+            _parallel_grammar_fill_cfg = False
+    return _parallel_grammar_fill_cfg
+
+
+def _fill_vocab_mask_parallel(grammars, host_mask, bs) -> bool:
+    """Try to fill the vocab bitmask with xgrammar's C++ batch thread pool.
+
+    Returns True if it handled the fill (caller skips the sequential loop),
+    False to fall back to the per-request sequential loop. Gated on: the enable
+    flag, batch size >= crossover, an xgrammar backend that supports batch fill,
+    and at least 2 active grammars sharing that backend.
+    """
+    cfg = _get_parallel_grammar_fill_cfg()
+    if cfg is False:
+        return False
+    min_bs, num_threads = cfg
+    if bs < min_bs:
+        return False
+
+    matchers = []
+    indices = []
+    batch_fill = None
+    for i, grammar in enumerate(grammars):
+        if grammar and not grammar.finished and not grammar.is_terminated():
+            # Only the xgrammar backend exposes the parallel batch fill. Mixed or
+            # non-xgrammar grammars fall back to sequential.
+            if not getattr(grammar, "supports_parallel_vocab_fill", False):
+                return False
+            matcher = getattr(grammar, "matcher", None)
+            if matcher is None:
+                return False
+            if batch_fill is None:
+                batch_fill = grammar.batch_fill_vocab_mask
+            matchers.append(matcher)
+            indices.append(i)
+
+    # Not worth the batch-call/thread coordination for 0-1 active rows.
+    if len(matchers) < 2:
+        return False
+
+    batch_fill(matchers, indices, host_mask, num_threads)
+    return True
+
+
 @dataclasses.dataclass
 class SamplingBatchInfo:
     # Basic batched sampling params
@@ -245,9 +306,10 @@ class SamplingBatchInfo:
         if pool is not None:
             # host_view() resets the used rows to "all allowed"; fill in place.
             host_mask = pool.host_view(bs)
-            for i, grammar in enumerate(self.grammars):
-                if grammar and not grammar.finished and not grammar.is_terminated():
-                    grammar.fill_vocab_mask(host_mask, i)
+            if not _fill_vocab_mask_parallel(self.grammars, host_mask, bs):
+                for i, grammar in enumerate(self.grammars):
+                    if grammar and not grammar.finished and not grammar.is_terminated():
+                        grammar.fill_vocab_mask(host_mask, i)
             # Single async host->device copy into the current double-buffer slot.
             self.vocab_mask = pool.commit_to_device(bs)
         else:

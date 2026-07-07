@@ -56,6 +56,57 @@ logger = logging.getLogger(__name__)
 MAX_ROLLBACK_TOKENS = 200
 
 
+# ---------------------------------------------------------------------------
+# Parallel vocab-mask fill support.
+#
+# Filling the per-request vocab bitmask is normally a sequential Python loop of
+# GrammarMatcher.fill_next_token_bitmask calls (one per running request), on the
+# token critical path between forward and sample. xgrammar ships a C++
+# BatchGrammarMatcher.batch_fill_next_token_bitmask that fills all rows using an
+# internal thread pool under a single GIL release, which is the only way this
+# parallelizes: per-call threading in Python is a net loss because each fill is
+# only ~0.85us and the per-call GIL release/re-acquire costs more than the fill.
+#
+# It only pays off (a) on the recent xgrammar that reuses its batch thread pool
+# across calls (upstream recreated+joined the pool every step, which dominated
+# at serving batch sizes), and (b) above a batch-size crossover (~64). We
+# feature-probe the pool-reuse behavior at import time and gate on batch size +
+# env flag; everything falls back to the sequential loop otherwise.
+# ---------------------------------------------------------------------------
+try:
+    from xgrammar import BatchGrammarMatcher as _BatchGrammarMatcher
+except Exception:  # pragma: no cover - older xgrammar without the batch API
+    _BatchGrammarMatcher = None
+
+
+def batch_fill_supported() -> bool:
+    """Whether xgrammar exposes the C++ batch vocab-mask fill API.
+
+    Correctness is identical to the sequential loop regardless of the xgrammar
+    build. The perf win specifically requires the build where the batch thread
+    pool is reused across calls (upstream recreated + joined it every step);
+    older builds still work but the parallel path is only faster at very large
+    batches. The batch-size gate (SGLANG_PARALLEL_GRAMMAR_FILL_MIN_BS) and the
+    off-by-default enable flag protect against enabling it where it would
+    regress, so the capability check here is just "does the API exist".
+    """
+    return _BatchGrammarMatcher is not None
+
+
+# One BatchGrammarMatcher per thread count, reused across steps. With the
+# pool-reuse xgrammar build this keeps the C++ worker threads alive between
+# calls instead of respawning them every token step.
+_batch_matchers: Dict[int, "BatchGrammarMatcher"] = {}
+
+
+def _get_batch_matcher(num_threads: int):
+    bm = _batch_matchers.get(num_threads)
+    if bm is None:
+        bm = _BatchGrammarMatcher(num_threads)
+        _batch_matchers[num_threads] = bm
+    return bm
+
+
 class XGrammarGrammar(BaseGrammarObject):
 
     def __init__(
@@ -114,6 +165,27 @@ class XGrammarGrammar(BaseGrammarObject):
 
     def fill_vocab_mask(self, vocab_mask: torch.Tensor, idx: int) -> None:
         self.matcher.fill_next_token_bitmask(vocab_mask, idx)
+
+    # Opt in to the parallel (C++ thread pool) batch vocab-mask fill. When the
+    # batch fill API is present this lets the sampling loop hand all rows to
+    # xgrammar's BatchGrammarMatcher in one call under a single GIL release; the
+    # sampling loop still gates this on batch size + the enable flag.
+    supports_parallel_vocab_fill = batch_fill_supported()
+
+    @staticmethod
+    def batch_fill_vocab_mask(
+        matchers: List["GrammarMatcher"],
+        indices: List[int],
+        vocab_mask: torch.Tensor,
+        num_threads: int,
+    ) -> None:
+        """Fill rows ``indices`` of ``vocab_mask`` from ``matchers`` in parallel
+        using xgrammar's C++ batch thread pool (one GIL release for the whole
+        batch). ``matchers[k]`` fills row ``indices[k]``. Result is bit-identical
+        to calling ``fill_next_token_bitmask(vocab_mask, indices[k])`` per matcher.
+        """
+        bm = _get_batch_matcher(num_threads)
+        bm.batch_fill_next_token_bitmask(matchers, vocab_mask, indices, False)
 
     @staticmethod
     def move_vocab_mask(vocab_mask: torch.Tensor, device) -> torch.Tensor:

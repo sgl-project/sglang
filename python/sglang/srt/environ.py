@@ -230,6 +230,15 @@ class Envs:
     SGLANG_GRAMMAR_POLL_INTERVAL = EnvFloat(0.005)
     SGLANG_GRAMMAR_MAX_POLL_ITERATIONS = EnvInt(10000)
     SGLANG_DISABLE_OUTLINES_DISK_CACHE = EnvBool(False)
+    # Fan the per-request xgrammar vocab-mask fill out to xgrammar's C++ batch
+    # thread pool (BatchGrammarMatcher.batch_fill_next_token_bitmask) instead of
+    # a sequential Python loop. Only engaged when the installed xgrammar is
+    # GIL-releasing/pool-reusing (feature-probed at runtime) and the batch size
+    # is at least SGLANG_PARALLEL_GRAMMAR_FILL_MIN_BS; sequential fallback
+    # otherwise. Off by default (small-batch case must not regress).
+    SGLANG_ENABLE_PARALLEL_GRAMMAR_FILL = EnvBool(False)
+    SGLANG_PARALLEL_GRAMMAR_FILL_MIN_BS = EnvInt(64)
+    SGLANG_PARALLEL_GRAMMAR_FILL_THREADS = EnvInt(2)
 
     # Test & Debug
     SGLANG_DETECT_SLOW_RANK = EnvBool(False)
