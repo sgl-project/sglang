@@ -34,6 +34,7 @@ import torch
 from sglang.srt.disaggregation.decode import DecodePreallocQueue
 from sglang.srt.disaggregation.decode_hicache_mixin import DecodePrefixMatch
 from sglang.srt.mem_cache.base_prefix_cache import (
+    DecLockRefParams,
     InsertParams,
     MatchPrefixParams,
 )
@@ -305,6 +306,7 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         req.last_node = object()
         req.finished_reason = None
         req.cache_protected_len = 0
+        req.swa_uuid_for_lock = 123
         req.sampling_params.max_new_tokens = 16
 
         decode_req = MagicMock()
@@ -321,6 +323,9 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         queue.num_reserved_decode_tokens = 0
         queue._resolve_pending_reqs = MagicMock()
         queue._update_handshake_waiters = MagicMock()
+        queue._uses_swa_tail_prealloc = MagicMock(return_value=True)
+        queue._swa_tail_len = MagicMock(return_value=8)
+        queue._swa_aware_allocatable_token_budgets = MagicMock(return_value=(8, 8))
         queue._match_prefix_and_lock = MagicMock(
             return_value=DecodePrefixMatch(
                 prefix_indices=torch.arange(4, dtype=torch.int64),
@@ -351,21 +356,28 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         scheduler.running_batch = running_batch
         scheduler.server_args = server_args
         scheduler.enable_hisparse = False
+        scheduler.enable_decode_hicache = False
+        scheduler.enable_priority_scheduling = False
         scheduler.waiting_queue = []
         scheduler.last_batch = None
         scheduler.output_streamer = MagicMock()
         queue.scheduler = scheduler
 
-        # Initial budget says the request fits; post-lock budget says it does not.
-        queue._allocatable_token_budgets = MagicMock(side_effect=[8, 3])
+        # The 4-token match is locked, then capped to zero because the whole
+        # 8-token request is inside the SWA window. Admission rejection must
+        # still release the original matched-node lock.
+        queue._allocatable_token_budgets = MagicMock(return_value=3)
 
         preallocated, failed = queue.pop_preallocated()
 
         self.assertEqual(preallocated, [])
         self.assertEqual(failed, [])
         queue._pre_alloc.assert_not_called()
-        queue.tree_cache.dec_lock_ref.assert_called_once_with(req.last_node)
-        self.assertEqual(queue._allocatable_token_budgets.call_count, 2)
+        queue.tree_cache.dec_lock_ref.assert_called_once_with(
+            req.last_node, DecLockRefParams(swa_uuid_for_lock=123)
+        )
+        queue._swa_tail_len.assert_called_once_with(8)
+        queue._allocatable_token_budgets.assert_called_once()
 
     def test_repeated_incremental_no_leak(self):
         """Multiple incremental transfers shouldn't leak lock_refs."""
