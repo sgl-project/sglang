@@ -108,6 +108,9 @@ struct DetokState {
     /// `return_text_in_logprobs`: whether to decode this request's logprob token
     /// ids to text (in this shard) for the `[logprob, token_id, text]` tuples.
     decode_logprob_text: bool,
+    /// `SamplingParams.no_stop_trim`: keep the matched stop in the output. Default
+    /// (`false`) trims it off the final chunk (see [`trim_stop_str`]).
+    no_stop_trim: bool,
     /// Per-request incremental decoder; `None` in `skip_tokenizer_init` mode.
     /// This is the *only* per-request accumulation the shard keeps: the decoder's
     /// internal byte/UTF-8 buffer. Decoded **text deltas** are emitted per chunk
@@ -160,12 +163,14 @@ impl Runnable for DetokenizerWorker {
                     id,
                     sink,
                     decode_logprob_text,
+                    no_stop_trim,
                 } => {
                     table.insert(
                         id,
                         DetokState {
                             sink,
                             decode_logprob_text,
+                            no_stop_trim,
                             decoder: self.backend.new_decoder(),
                             // Registered == handed to the scheduler == Queued.
                             fsm: RequestState::Queued,
@@ -218,19 +223,32 @@ fn handle_chunk(
         return;
     };
     let decode_lp_text = st.decode_logprob_text;
+    let no_stop_trim = st.no_stop_trim;
 
     // Queued → Streaming on the first chunk (the scheduler picked it).
     if matches!(st.fsm, RequestState::Queued) {
         let _ = st.fsm.apply(Event::SchedulerPicked);
     }
 
+    let finished = ev.finish_reason.is_some();
+    // Matched-stop trim (Python `trim_matched_stop`): the final chunk's finish
+    // reason names the stop it matched — a stop STRING or a stop TOKEN id. By
+    // default that stop is removed from the output; `no_stop_trim` keeps it.
+    let matched = finished
+        .then(|| ev.finish_reason.as_ref().and_then(|fr| fr.get("matched")))
+        .flatten()
+        .cloned();
+    // Count generated tokens (incl. a matched stop token) *before* trimming.
+    let n_tok = ev.token_ids.len() as u64;
+    // Stop TOKEN: drop it before decode, so it reaches neither `text` nor `output_ids`.
+    trim_stop_token(&mut ev.token_ids, &matched, no_stop_trim);
+
     // Fully incremental: decode just this chunk's delta. `token_ids` stays in the
     // event — it's ALSO surfaced as the `/generate` response's `output_ids` (the
     // Python server returns them by default alongside `text`), in both normal and
     // `skip_tokenizer_init` mode. Nothing cumulative is kept here — the api-server's
     // drain loop reassembles it where needed.
-    let n_tok = ev.token_ids.len() as u64;
-    let delta_text = match &mut st.decoder {
+    let mut delta_text = match &mut st.decoder {
         Some(decoder) => match decoder.step(&ev.token_ids) {
             Ok(delta) => delta,
             Err(e) => {
@@ -243,8 +261,11 @@ fn handle_chunk(
         // skip_tokenizer_init: no decode; the token ids pass through in `ev`.
         None => String::new(),
     };
+    // Stop STRING: trim it (and anything after) from the decoded delta's tail.
+    if let Some(serde_json::Value::String(stop)) = &matched {
+        trim_stop_str(&mut delta_text, stop, no_stop_trim);
+    }
 
-    let finished = ev.finish_reason.is_some();
     // Streaming → Streaming (finish:false) or Streaming → Finalizing (finish:true).
     let _ = st.fsm.apply(Event::Chunk { finish: finished });
 
@@ -303,6 +324,29 @@ fn handle_chunk(
     }
 }
 
+/// Drop a matched stop TOKEN from the final chunk (Python `trim_matched_stop`,
+/// token branch); `no_stop_trim` / non-token match keeps it.
+fn trim_stop_token(
+    token_ids: &mut Vec<i32>,
+    matched: &Option<serde_json::Value>,
+    no_stop_trim: bool,
+) {
+    if !no_stop_trim && matches!(matched, Some(serde_json::Value::Number(_))) {
+        token_ids.pop();
+    }
+}
+
+/// Remove the matched stop string from the decoded final chunk (Python
+/// `trim_matched_stop`, string branch); `no_stop_trim` keeps it.
+fn trim_stop_str(text: &mut String, stop: &str, no_stop_trim: bool) {
+    if stop.is_empty() {
+        return;
+    }
+    if let Some(pos) = text.rfind(stop) {
+        text.truncate(if no_stop_trim { pos + stop.len() } else { pos });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -324,6 +368,7 @@ mod tests {
             DetokState {
                 sink: EgressSink::Local(tx),
                 decode_logprob_text: false,
+                no_stop_trim: false,
                 decoder: None,
                 fsm: RequestState::Queued,
             },
@@ -344,5 +389,81 @@ mod tests {
             tm_rx.try_recv(),
             Ok(TmEvent::Abort(id)) if id == RequestId(1)
         ));
+    }
+
+    /// `trim_stop_str` reproduces the base's stop-string semantics: `stop: "3"` on
+    /// output " 1, 2, 3" yields " 1, 2, " by default and " 1, 2, 3" with
+    /// `no_stop_trim`.
+    #[test]
+    fn trim_stop_str_matches_base() {
+        let mut t = " 1, 2, 3".to_string();
+        trim_stop_str(&mut t, "3", false);
+        assert_eq!(t, " 1, 2, ");
+
+        let mut t = " 1, 2, 3".to_string();
+        trim_stop_str(&mut t, "3", true);
+        assert_eq!(t, " 1, 2, 3");
+
+        // Empty / absent stop is a no-op.
+        let mut t = "abc".to_string();
+        trim_stop_str(&mut t, "", false);
+        assert_eq!(t, "abc");
+    }
+
+    /// Drive a final (`finish_reason`) chunk through `handle_chunk` in skip mode and
+    /// return the emitted `Done` event.
+    fn final_chunk(
+        no_stop_trim: bool,
+        finish_reason: serde_json::Value,
+        ids: Vec<i32>,
+    ) -> ChunkEvent {
+        let (tx, mut rx) = mpsc::channel::<EgressItem>(4);
+        let mut table = HashMap::new();
+        table.insert(
+            RequestId(1),
+            DetokState {
+                sink: EgressSink::Local(tx),
+                decode_logprob_text: false,
+                no_stop_trim,
+                decoder: None, // skip mode → output_ids passthrough
+                fsm: RequestState::Queued,
+            },
+        );
+        let (tm_tx, _tm_rx) = flume::unbounded::<TmEvent>();
+        let ev = ChunkEvent {
+            rid: 1,
+            token_ids: ids,
+            finish_reason: Some(finish_reason),
+            ..Default::default()
+        };
+        handle_chunk(&mut table, ev, &DetokenizerBackend::Skip, &tm_tx);
+        match rx.try_recv() {
+            Ok(EgressItem::Done(out)) => out,
+            other => panic!("expected Done, got {other:?}"),
+        }
+    }
+
+    /// A matched stop TOKEN is dropped from the surfaced `output_ids` by default
+    /// (but still counted in `completion_tokens`); `no_stop_trim` keeps it.
+    #[test]
+    fn stop_token_trimmed_from_output_ids() {
+        let fr = serde_json::json!({ "type": "stop", "matched": 3 });
+        let out = final_chunk(false, fr.clone(), vec![1, 2, 3]);
+        assert_eq!(out.token_ids, vec![1, 2], "matched stop token dropped");
+        assert_eq!(
+            out.completion_tokens, 3,
+            "generated count still includes it"
+        );
+
+        let out = final_chunk(true, fr, vec![1, 2, 3]);
+        assert_eq!(out.token_ids, vec![1, 2, 3], "no_stop_trim keeps it");
+    }
+
+    /// A non-stop finish (`length`, no `matched`) never trims.
+    #[test]
+    fn length_finish_keeps_all_tokens() {
+        let fr = serde_json::json!({ "type": "length", "length": 3 });
+        let out = final_chunk(false, fr, vec![1, 2, 3]);
+        assert_eq!(out.token_ids, vec![1, 2, 3]);
     }
 }
