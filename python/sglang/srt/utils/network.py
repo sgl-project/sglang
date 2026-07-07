@@ -222,15 +222,9 @@ def get_zmq_socket_on_host(
 
 
 def config_socket(socket, socket_type: zmq.SocketType):
-    try:
-        mem = psutil.virtual_memory()
-        total_mem = mem.total / 1024**3
-        available_mem = mem.available / 1024**3
-    except Exception as e:
-        logger.warning("Failed to read system memory for ZMQ socket config: %s", e)
-        total_mem = 0
-        available_mem = 0
-
+    mem = psutil.virtual_memory()
+    total_mem = mem.total / 1024**3
+    available_mem = mem.available / 1024**3
     if total_mem > 32 and available_mem > 16:
         buf_size = int(0.5 * 1024**3)
     else:
