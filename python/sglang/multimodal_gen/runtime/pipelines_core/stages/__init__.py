@@ -42,6 +42,13 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.timestep_preparation im
     DMDTimestepPreparationStage,
     TimestepPreparationStage,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.vla import (
+    VLAActionDenoisingStage,
+    VLAActionPostprocessStage,
+    VLAObservationPreprocessStage,
+    VLAPrefixStage,
+    VLAStageKeys,
+)
 
 __all__ = [
     "PipelineStage",
@@ -60,4 +67,9 @@ __all__ = [
     "ImageEncodingStage",
     "ImageVAEEncodingStage",
     "TextEncodingStage",
+    "VLAStageKeys",
+    "VLAObservationPreprocessStage",
+    "VLAPrefixStage",
+    "VLAActionDenoisingStage",
+    "VLAActionPostprocessStage",
 ]

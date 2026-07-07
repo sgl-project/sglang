@@ -15,19 +15,22 @@ from sglang.multimodal_gen.runtime.models.vlas import Pi05PolicyModel
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.pi05 import (
-    Pi05ActionDenoisingStage,
-    Pi05PostprocessStage,
-    Pi05PrefixStage,
-    Pi05PreprocessStage,
-)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.pi05_preprocess import (
     Pi05Preprocessor,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.vla import (
+    VLAActionDenoisingStage,
+    VLAActionPostprocessStage,
+    VLAObservationPreprocessStage,
+    VLAPrefixStage,
+    VLAStageKeys,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
+
+PI05_STAGE_KEYS = VLAStageKeys.for_namespace("pi05")
 
 
 class Pi05Pipeline(ComposedPipelineBase):
@@ -96,21 +99,31 @@ class Pi05Pipeline(ComposedPipelineBase):
 
     def create_pipeline_stages(self, server_args: ServerArgs):
         self.add_stage(
-            Pi05PreprocessStage(self.get_module("preprocessor")),
+            VLAObservationPreprocessStage(
+                self.get_module("preprocessor"),
+                keys=PI05_STAGE_KEYS,
+            ),
             "pi05_preprocess",
         )
         self.add_stage(
-            Pi05PrefixStage(
+            VLAPrefixStage(
                 self.get_module("policy_model"),
                 self.get_module("prefix_cache"),
+                keys=PI05_STAGE_KEYS,
             ),
             "pi05_prefix",
         )
         self.add_stage(
-            Pi05ActionDenoisingStage(self.get_module("policy_model")),
+            VLAActionDenoisingStage(
+                self.get_module("policy_model"),
+                keys=PI05_STAGE_KEYS,
+            ),
             "pi05_action_denoise",
         )
-        self.add_stage(Pi05PostprocessStage(), "pi05_postprocess")
+        self.add_stage(
+            VLAActionPostprocessStage(keys=PI05_STAGE_KEYS),
+            "pi05_postprocess",
+        )
 
 
 EntryClass = Pi05Pipeline
