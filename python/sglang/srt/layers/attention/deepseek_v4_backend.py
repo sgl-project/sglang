@@ -35,6 +35,7 @@ from sglang.srt.layers.attention.dsv4.metadata import (
     PagedIndexerMetadata,
     copy_metadata,
     maybe_copy_inplace,
+    use_deep_gemm_fp8_indexer,
 )
 from sglang.srt.layers.attention.dsv4.metadata_kernel import (
     init_compression_metadata as _init_compression_metadata_triton,
@@ -51,7 +52,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc
 from sglang.srt.utils import ceil_align, is_xpu
-from sglang.srt.utils.common import is_sm120_supported
+from sglang.srt.utils.common import is_sm100_supported, is_sm120_supported
 
 if TYPE_CHECKING:
     from sgl_kernel.flash_mla import FlashMLASchedMeta
@@ -549,12 +550,31 @@ class DeepseekV4AttnBackend(
         core_attn_metadata: DSV4AttnMetadata,
         *,
         use_prefill_cuda_graph: bool = False,
+        native_next_n: Optional[int] = None,
     ):
+        c4_seq_lens_native = None
+        c4_page_table_native = None
+        use_native_deep_gemm_indexer = (
+            native_next_n is not None
+            and native_next_n >= 2
+            and is_sm100_supported()
+            and (self.enable_deepseek_v4_fp4_indexer or use_deep_gemm_fp8_indexer())
+        )
+        if use_native_deep_gemm_indexer:
+            c4_seq_lens = core_attn_metadata.c4_topk_lengths_raw
+            assert c4_seq_lens is not None
+            assert c4_seq_lens.numel() % native_next_n == 0
+            c4_seq_lens_native = c4_seq_lens.view(-1, native_next_n).contiguous()
+            c4_page_table = core_attn_metadata.page_table
+            assert c4_page_table.shape[0] % native_next_n == 0
+            c4_page_table_native = c4_page_table[::native_next_n].contiguous()
         return PagedIndexerMetadata(
             page_size=self.page_size,
             page_table=core_attn_metadata.page_table,
             c4_seq_lens=core_attn_metadata.c4_topk_lengths_raw,
             use_prefill_cuda_graph=use_prefill_cuda_graph,
+            c4_seq_lens_native=c4_seq_lens_native,
+            c4_page_table_native=c4_page_table_native,
         )
 
     def init_forward_metadata_decode(
@@ -615,6 +635,7 @@ class DeepseekV4AttnBackend(
         extend_start_loc: Optional[torch.Tensor] = None,
         need_compress: bool = True,
         use_prefill_cuda_graph: bool = False,
+        indexer_native_next_n: Optional[int] = None,
         online_c128_state_slot_offset: int = 0,
     ) -> DSV4Metadata:
         seq_lens_casual, req_pool_indices_repeated = self.expand_prefill_casually(
@@ -640,6 +661,7 @@ class DeepseekV4AttnBackend(
             self.init_forward_metadata_indexer(
                 core_attn_metadata,
                 use_prefill_cuda_graph=use_prefill_cuda_graph,
+                native_next_n=indexer_native_next_n,
             )
             if need_compress
             else None
@@ -773,6 +795,7 @@ class DeepseekV4AttnBackend(
             extend_start_loc=None,
             need_compress=True,
             use_prefill_cuda_graph=use_prefill_cuda_graph,
+            indexer_native_next_n=self.speculative_num_draft_tokens,
             online_c128_state_slot_offset=online_c128_state_slot_offset,
         )
 
@@ -803,7 +826,9 @@ class DeepseekV4AttnBackend(
             out_loc=out_cache_loc,
             need_compress=True,
         )
-        indexer_metadata = self.init_forward_metadata_indexer(core_attn_metadata)
+        indexer_metadata = self.init_forward_metadata_indexer(
+            core_attn_metadata, native_next_n=num_draft_tokens
+        )
         create = functools.partial(
             create_paged_compressor_data,
             is_prefill=True,

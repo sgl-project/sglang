@@ -13,6 +13,14 @@ if TYPE_CHECKING:
     pass
 
 
+def use_deep_gemm_fp8_indexer() -> bool:
+    return not (
+        envs.SGLANG_OPT_USE_TILELANG_INDEXER.get()
+        or envs.SGLANG_OPT_USE_AITER_INDEXER.get()
+        or envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
+    )
+
+
 """
 Some comments on the common terms used in DeepSeekV4Backend:
 
@@ -113,6 +121,8 @@ class PagedIndexerMetadata:
     page_table: torch.Tensor
     c4_seq_lens: torch.Tensor
     use_prefill_cuda_graph: bool = False
+    c4_seq_lens_native: Optional[torch.Tensor] = None
+    c4_page_table_native: Optional[torch.Tensor] = None
     deep_gemm_metadata: Any = field(init=False, repr=False)
     topk_metadata: torch.Tensor = field(init=False, repr=False)
     nonpaged_plan: Optional[NonPagedIndexerPlan] = field(
@@ -120,24 +130,28 @@ class PagedIndexerMetadata:
     )
 
     def __post_init__(self):
-        if (
-            envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
-            or envs.SGLANG_OPT_USE_AITER_INDEXER.get()
-        ):
+        if not use_deep_gemm_fp8_indexer():
             self.deep_gemm_metadata = None
         else:
             import deep_gemm
 
-            use_jit_indexer = (
+            schedule_c4_seq_lens = (
+                self.c4_seq_lens_native
+                if self.c4_seq_lens_native is not None
+                else self.c4_seq_lens
+            )
+            # The local SGLang JIT metadata kernel is flat-only; native
+            # DeepGEMM next-n scheduling needs the 2D context-lens contract.
+            use_jit_indexer = self.c4_seq_lens_native is None and (
                 envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.get()
-                or self.c4_seq_lens.numel() > _LARGE_INDEXER_QUERY_THRESHOLD
+                or schedule_c4_seq_lens.numel() > _LARGE_INDEXER_QUERY_THRESHOLD
             )
             if use_jit_indexer:
                 from sglang.jit_kernel.dsv4 import get_paged_mqa_logits_metadata
             else:
                 from deep_gemm import get_paged_mqa_logits_metadata
 
-            _c4 = self.c4_seq_lens.to(torch.int32)
+            _c4 = schedule_c4_seq_lens.to(torch.int32)
             if _c4.dim() == 1:
                 _c4 = _c4.unsqueeze(-1)
             self.deep_gemm_metadata = get_paged_mqa_logits_metadata(
@@ -171,10 +185,23 @@ class PagedIndexerMetadata:
 
     def copy_(self, other: PagedIndexerMetadata):
         if is_hip():
-            copy_fields = ["page_table", "c4_seq_lens"]
+            # HIP does not use the native DeepGEMM indexer path, but
+            # copy_metadata requires every dataclass field to be accounted for.
+            copy_fields = [
+                "page_table",
+                "c4_seq_lens",
+                "c4_seq_lens_native",
+                "c4_page_table_native",
+            ]
             assign_fields = ["deep_gemm_metadata", "nonpaged_plan"]
         else:
-            copy_fields = ["page_table", "c4_seq_lens", "deep_gemm_metadata"]
+            copy_fields = [
+                "page_table",
+                "c4_seq_lens",
+                "c4_seq_lens_native",
+                "c4_page_table_native",
+                "deep_gemm_metadata",
+            ]
             assign_fields = ["nonpaged_plan"]
         copy_fields += ["topk_metadata"]
         copy_metadata(
