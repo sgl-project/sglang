@@ -1405,7 +1405,7 @@ class ServerArgs:
         ),
     ] = None
     cuda_graph_backend_prefill: A[
-        Optional[Literal["breakable", "tc_piecewise", "disabled"]],
+        Optional[Literal["full", "breakable", "tc_piecewise", "disabled"]],
         Arg(
             help="Backend for the prefill phase. Folds into cuda_graph_config[prefill].backend.",
             choices=Backend.ALL,
@@ -3170,6 +3170,14 @@ class ServerArgs:
         self._parse_cuda_graph_config()
         self._apply_cuda_graph_compatibility()
         self._validate_cuda_graph_config()
+        # Warn on the final resolved config (not inside the compat cascade —
+        # that path is skipped when the user explicitly sets the backend,
+        # which is the only way to get 'full' for prefill today).
+        if self.cuda_graph_config.prefill.backend == Backend.FULL:
+            logger.warning(
+                "cuda_graph_config[prefill].backend='full' is experimental. "
+                "Use breakable or tc_piecewise for production workloads."
+            )
 
     def _parse_cuda_graph_config(self):
         """Resolve cuda_graph_config from explicit JSON, per-phase
@@ -3247,6 +3255,8 @@ class ServerArgs:
             self._disable_tc_piecewise_cudagraph_if_incompatible()
         elif self.cuda_graph_config.prefill.backend == Backend.BREAKABLE:
             self._disable_breakable_cudagraph_if_incompatible()
+        elif self.cuda_graph_config.prefill.backend == Backend.FULL:
+            self._disable_full_prefill_cudagraph_if_incompatible()
 
     def _disable_tc_piecewise_cudagraph_if_incompatible(self):
         from sglang.srt.arg_groups.overrides import resolved_view as _resolved_view
@@ -3357,6 +3367,19 @@ class ServerArgs:
             if predicate():
                 logger.warning(
                     "Breakable CUDA graph is incompatible with %s; "
+                    "disabling prefill CUDA graph.",
+                    name,
+                )
+                self.cuda_graph_config.prefill.backend = Backend.DISABLED
+                return
+
+    def _disable_full_prefill_cudagraph_if_incompatible(self):
+        """Full prefill CG: empty rule list today; see the experimental warning."""
+        rules = []
+        for name, predicate in rules:
+            if predicate():
+                logger.warning(
+                    "Full prefill CUDA graph is incompatible with %s; "
                     "disabling prefill CUDA graph.",
                     name,
                 )
