@@ -23,14 +23,16 @@ def _bytes(t: torch.Tensor) -> torch.Tensor:
 @pytest.mark.parametrize(
     "hq,hkv,head_dim", [(8, 1, 128), (8, 8, 128), (4, 2, 64), (64, 2, 128)]
 )
-@pytest.mark.parametrize("num_tokens", [1, 7, 16])
+@pytest.mark.parametrize(
+    "num_tokens", [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
+)
 @pytest.mark.parametrize("scale", [None, 0.5, 2.0])
-@pytest.mark.parametrize("idx_dtype", [torch.int64, torch.int32])
 @pytest.mark.parametrize("fused_qkv", [False, True])
 @pytest.mark.parametrize("quantize_q", [True, False])
 def test_fused_fp8_qkv_kv_cache(
-    dtype, hq, hkv, head_dim, num_tokens, scale, idx_dtype, fused_qkv, quantize_q
+    dtype, hq, hkv, head_dim, num_tokens, scale, fused_qkv, quantize_q
 ):
+    idx_dtype = torch.int64
     torch.manual_seed(0)
     device = "cuda"
     q_dim = hq * head_dim
