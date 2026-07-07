@@ -637,6 +637,9 @@ class Envs:
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
     SGLANG_DISABLE_DSA_INDEXER_FUSION = EnvBool(False)
+    # Double Sparsity: allow config top_k to differ from the model's DSA
+    # index_topk (ablation override; startup-only, default fail-closed).
+    SGLANG_DS_ALLOW_TOPK_MISMATCH = EnvBool(False)
 
     # sgl-kernel
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)

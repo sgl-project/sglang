@@ -2207,6 +2207,18 @@ class ServerArgs:
     offload_mode: A[str, "Mode of offloading."] = "cpu"
 
     # -------------------------------------------------------------------------
+    # Double Sparsity (standalone; mutually exclusive with HiSparse at runtime)
+    # -------------------------------------------------------------------------
+    enable_double_sparsity: A[
+        bool,
+        "Enable standalone Double Sparsity selection (e.g. GLM-5.1-FP8). Mutually exclusive with --enable-hisparse and does NOT require PD disaggregation.",
+    ] = False
+    double_sparsity_config: A[
+        Optional[str],
+        'JSON string for Double Sparsity. Required field: channel_mask_path (top_k/page_size default to 2048/64). Example: \'{"top_k": 2048, "page_size": 64, "channel_mask_path": "/cluster-storage/models/glm51-fp8-channel-mask-s256.safetensors"}\'.',
+    ] = None
+
+    # -------------------------------------------------------------------------
     # LMCache
     # -------------------------------------------------------------------------
     enable_lmcache: A[
@@ -6668,6 +6680,12 @@ class ServerArgs:
         )
 
         run_post_process_pass(self, _hisparse_validation)
+
+        from sglang.srt.layers.attention.double_sparsity.validator import (
+            validate_double_sparsity,
+        )
+
+        validate_double_sparsity(self)
 
         assert (
             self.schedule_conservativeness >= 0

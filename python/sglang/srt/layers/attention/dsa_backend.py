@@ -20,6 +20,10 @@ from sglang.srt.runtime_context import get_parallel
 logger = logging.getLogger(__name__)
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.double_sparsity.cuda_graph import (
+    DSGraphState,
+    allocate_graph_state,
+)
 from sglang.srt.layers.attention.dsa.dequant_k_cache import dequantize_k_cache_paged
 from sglang.srt.layers.attention.dsa.dsa_backend_mtp_precompute import (
     DeepseekSparseAttnBackendMTPPrecomputeMixin,
@@ -213,6 +217,23 @@ class DSAMetadata:
     # batch index for each token.
     token_to_batch_idx: Optional[torch.Tensor] = None
 
+    # Double Sparsity output buffer (preallocated by init_forward_metadata
+    # when DS is enabled). The DS adapter writes the expanded topk_indices
+    # into this buffer in-place so the captured path stays
+    # allocation-free. Shape: int32 [bs, max_top_k=2048]. None when DS is
+    # not in use.
+    ds_topk_indices_out: Optional[torch.Tensor] = None
+
+    # Double Sparsity allocation-free graph-safe scratch (preallocated by
+    # init_forward_metadata when DS is enabled). Routes the production
+    # `_select_topk_indices` call through `retrieve_topk_graph_safe`, which
+    # writes its outputs into `ds_graph_state.selected_indices` /
+    # `ds_graph_state.valid_lengths` and uses the nine scratch tensors for
+    # an allocation-free Triton + topk + searchsorted pipeline. None when
+    # DS is not in use (the path falls back to the allocating
+    # `DoubleSparsitySelector.retrieve_topk`).
+    ds_graph_state: Optional[DSGraphState] = None
+
 
 @torch.compile
 def _compiled_cat(tensors: list[torch.Tensor], dim: int = -1) -> torch.Tensor:
@@ -373,6 +394,236 @@ class DeepseekSparseAttnBackend(
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend(
             model_runner.server_args.dsa_topk_backend
         )
+        # Cache the DS enable flag so init_forward_metadata can allocate
+        # the DS adapter's out buffer without re-checking server_args
+        # every batch.
+        self.enable_double_sparsity: bool = bool(
+            getattr(model_runner.server_args, "enable_double_sparsity", False)
+        )
+        self.ds_max_top_k: int = 2048
+        # bf16 transport for the cross-TP score reduce (score_reduce_dtype);
+        # sizes the bf16 scratch in ds_graph_state.
+        self.ds_score_reduce_bf16: bool = False
+        # Served scorer ("off" = raw channel-dot, "cosine" = direction-normalized);
+        # only "cosine" allocates + populates the key-norm cache below.
+        self._ds_scorer_norm: str = "off"
+        # Compact DS selector widths to capture as extra graph variants
+        # (config-borne; empty = full width only). The CUDA-graph runner reads
+        # this to build its selector-width ladder.
+        self.ds_selector_width_buckets: list = []
+        # Overflow policy for the selector-width ladder (config-borne): the
+        # runner reads this to decide whether to also capture the full
+        # req_to_token width ("full_fallback", default) or fail closed beyond
+        # the largest compact bucket ("fail_closed").
+        self.ds_selector_width_overflow_policy: str = "full_fallback"
+        # Per-variant decode-metadata key channel: the CUDA-graph runner stamps
+        # this around capture/replay metadata init when DS selector-width
+        # keying is active (mirrors the _replay_forward_batch channel). None
+        # means plain int-bs keying (DS off, or width keying inactive).
+        self._ds_graph_variant_key = None
+        if self.enable_double_sparsity:
+            try:
+                from sglang.srt.layers.attention.double_sparsity.config import (
+                    parse_double_sparsity_config,
+                )
+
+                ds_cfg = parse_double_sparsity_config(
+                    model_runner.server_args.double_sparsity_config
+                )
+                self.ds_score_reduce_bf16 = (
+                    getattr(ds_cfg, "score_reduce_dtype", "bf16") == "bf16"
+                )
+                self._ds_scorer_norm = str(getattr(ds_cfg, "scorer_norm", "off"))
+                self.ds_selector_width_buckets = list(
+                    getattr(ds_cfg, "selector_width_buckets", []) or []
+                )
+                self.ds_selector_width_overflow_policy = str(
+                    getattr(ds_cfg, "selector_width_overflow_policy", "full_fallback")
+                )
+                # ds_max_top_k sizes ds_topk_indices_out + ds_graph_state.
+                self.ds_max_top_k = int(ds_cfg.top_k)
+            except Exception:
+                # Fall back to the canonical V3.2 default.
+                self.ds_max_top_k = 2048
+        # Selection context: populated by finalize_double_sparsity_bind()
+        # (called in model_runner before init_attention_backend), so this
+        # attribute is non-None whenever DS is enabled.
+        self._ds_channel_selection = getattr(
+            model_runner.server_args, "_ds_channel_selection", None
+        )
+        # Mask channel count (label_dim) for the absorbed scratch — derived from
+        # the published channel selection ([L, H, label_dim]); 0 leaves the
+        # scratch unallocated (and the selector falls back to the eager path).
+        self.ds_label_dim: int = (
+            int(self._ds_channel_selection.shape[-1])
+            if self._ds_channel_selection is not None
+            else 0
+        )
+        # Selection sizes its absorbed scratch (and slot_written bitmap) from
+        # ds_label_dim. A zero label_dim would silently size the scratch to 0 and
+        # drop the selector back onto the allocating fallback — fail closed
+        # instead of serving a broken selector.
+        if self.enable_double_sparsity and self.ds_label_dim <= 0:
+            raise RuntimeError(
+                "Double Sparsity is enabled but the channel selection was not "
+                "published on server_args (_ds_channel_selection is absent), so "
+                "ds_label_dim<=0. finalize_double_sparsity_bind() must publish "
+                "_ds_channel_selection before the DSA backend is built."
+            )
+        # Published by finalize_double_sparsity_bind() (which runs before this
+        # backend is constructed). Fall back to the model's own no-PE head width
+        # rather than a fixed default so a missing publish can never silently
+        # truncate a wider no-PE projection to a narrower one.
+        self._ds_qk_nope_head_dim: int = int(
+            getattr(
+                model_runner.server_args,
+                "_ds_qk_nope_head_dim",
+                self.qk_nope_head_dim,
+            )
+        )
+        # Slot-validity bitmap: 1 bool per (local layer, physical KV slot). A
+        # reused physical slot's STALE latent could be selected before the fresh
+        # KV write lands, so this bitmap drives the invalidate-before-select /
+        # mark-after-write lifecycle. Allocated whenever DS is enabled. Indexed by
+        # GLOBAL layer_id, like `_ds_channel_selection`.
+        self._ds_slot_written: Optional[torch.Tensor] = None
+        self._ds_slot_written_true: Optional[torch.Tensor] = None
+        self._ds_slot_written_false: Optional[torch.Tensor] = None
+        self._ds_key_norm_cache: Optional[torch.Tensor] = None
+        self._ds_key_norm_enabled: bool = False
+        self._ds_w_flat_by_layer = None
+        self._ds_key_norm_nan: Optional[torch.Tensor] = None
+        if self.enable_double_sparsity:
+            _num_local_layers = int(self._ds_channel_selection.shape[0])
+            _num_kv_slots = self.token_to_kv_pool.size + self.token_to_kv_pool.page_size
+            self._ds_slot_written = torch.zeros(
+                (_num_local_layers, _num_kv_slots),
+                dtype=torch.bool,
+                device=self.device,
+            )
+            # Device-resident scalar `True`/`False` for the slot_written bitmap
+            # writes (mark-after-write True here; invalidate-before-select False in
+            # deepseek_v2). A Python bool RHS materializes as a CPU scalar, which the
+            # indexed copy moves CPU->CUDA — illegal under CUDA-graph capture. Cached
+            # device scalars keep both writes pure device-side copies (graph-safe).
+            self._ds_slot_written_true = torch.ones(
+                (), dtype=torch.bool, device=self.device
+            )
+            self._ds_slot_written_false = torch.zeros(
+                (), dtype=torch.bool, device=self.device
+            )
+            # Publish so the model layer's selector path (deepseek_v2) can resolve
+            # it through the ForwardContext-published attention backend.
+            setattr(model_runner.server_args, "_ds_slot_written", self._ds_slot_written)
+            # Cosine key-norm cache: k_norm[layer, slot, h] =
+            # ||absorbed_w_sel[layer,h] @ dequant(resident fp8 latent[slot])||.
+            # Same lifecycle as _ds_slot_written (alloc here; populate at KV-append
+            # before marking the slot written; gather at decode scoring). Allocated
+            # ONLY for scorer_norm="cosine", so the raw-dot ("off") path is fully
+            # byte-identical — output AND cost — because the cache + populate are
+            # dormant. Fail-closed: unwritten slots hold NaN so an accidental read
+            # is detectably invalid.
+            self._ds_key_norm_enabled = self._ds_scorer_norm == "cosine"
+            if self._ds_key_norm_enabled:
+                from sglang.srt.layers.attention.double_sparsity.absorbed_latent import (
+                    assert_resident_fp8_layout,
+                    validate_cosine_projections,
+                )
+
+                wsel_map = (
+                    getattr(
+                        model_runner.server_args, "_ds_absorbed_w_sel_by_layer", None
+                    )
+                    or {}
+                )
+                _kn_H = self.num_q_heads
+                self._knorm_label_dim = int(self.ds_label_dim)
+                self._knorm_lora = int(self.kv_lora_rank)
+                self._knorm_nblk = self._knorm_lora // 128
+                # Fail closed: cosine requires absorbed_w_sel for EVERY DS layer,
+                # published at bind with the exact expected shape. Validate FULL
+                # coverage here (at init), never accept a partial map and fail later
+                # inside the KV-write populate.
+                self._ds_w_flat_by_layer = validate_cosine_projections(
+                    wsel_map,
+                    n_layers=int(self._ds_channel_selection.shape[0]),
+                    exp_shape=(_kn_H, self._knorm_label_dim, self._knorm_lora),
+                    device=self.device,
+                )
+                # Validate the resident fp8 byte layout the populate reads (task4),
+                # when the pool exposes it as fp8-packed.
+                _pool = self.token_to_kv_pool
+                _kvdim = getattr(_pool, "kv_cache_dim", None)
+                if _kvdim is not None and getattr(
+                    _pool, "dsa_kv_cache_store_fp8", False
+                ):
+                    _rope_dim = int(
+                        getattr(model_runner.model_config, "qk_rope_head_dim", 64)
+                    )
+                    assert_resident_fp8_layout(
+                        kv_lora_rank=self._knorm_lora,
+                        kv_cache_dim=int(_kvdim),
+                        rope_bytes=_rope_dim * 2,  # rope stored bf16 (2 bytes/elem)
+                    )
+                self._ds_key_norm_cache = torch.full(
+                    (_num_local_layers, _num_kv_slots, self.num_q_heads),
+                    float("nan"),
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+                # Device NaN scalar for graph-safe in-place invalidation (no CPU->CUDA).
+                self._ds_key_norm_nan = torch.full(
+                    (), float("nan"), dtype=torch.float32, device=self.device
+                )
+                # Preallocated scratch for the 0-alloc populate (T <= max_app). On
+                # this 0.4.4 base PREFILL is CUDA-graph-captured and the populate runs
+                # inside the captured _write_token_labels, so the eager (allocating)
+                # fallback must NEVER be reached under capture. Size for BOTH decode
+                # (T = bs <= cuda_graph_max_bs) AND the prefill-captured per-chunk
+                # token count (bounded by chunked_prefill_size), so the 0-alloc path
+                # always handles capture.
+                _max_app = max(
+                    256,
+                    int(getattr(model_runner.server_args, "cuda_graph_max_bs", 0) or 0),
+                    int(
+                        getattr(model_runner.server_args, "chunked_prefill_size", 0)
+                        or 0
+                    ),
+                )
+                self._knorm_max_app = _max_app
+                _lora = self._knorm_lora
+                _nblk = self._knorm_nblk
+                self._knorm_slots = torch.zeros(
+                    _max_app, dtype=torch.int64, device=self.device
+                )
+                self._knorm_rowu8 = torch.zeros(
+                    (_max_app, _lora + _nblk * 4), dtype=torch.uint8, device=self.device
+                )
+                self._knorm_ckv = torch.zeros(
+                    (_max_app, _lora), dtype=torch.float32, device=self.device
+                )
+                self._knorm_klabel = torch.zeros(
+                    (_max_app, _kn_H * self._knorm_label_dim),
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+                self._knorm_out = torch.zeros(
+                    (_max_app, self.num_q_heads),
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+                # Publish so the model layer's invalidation path (deepseek_v2) can
+                # NaN-reset reused slots through the ForwardContext-resolved backend.
+                setattr(
+                    model_runner.server_args,
+                    "_ds_key_norm_cache",
+                    self._ds_key_norm_cache,
+                )
+                setattr(
+                    model_runner.server_args,
+                    "_ds_key_norm_nan",
+                    self._ds_key_norm_nan,
+                )
         if self.num_q_heads <= 64:
             self.flashmla_kv_num_q_heads = 64
         elif self.num_q_heads <= 128:
@@ -925,6 +1176,26 @@ class DeepseekSparseAttnBackend(
                 paged_mqa_ctx_lens_2d, 64, deep_gemm.get_num_sms()
             )
 
+        ds_topk_indices_out = None
+        ds_graph_state: Optional[DSGraphState] = None
+        if self.enable_double_sparsity:
+            ds_topk_indices_out = torch.empty(
+                (int(forward_batch.batch_size), self.ds_max_top_k),
+                dtype=torch.int32,
+                device=cache_seqlens_int32.device,
+            )
+            ds_graph_state = allocate_graph_state(
+                max_bs=int(forward_batch.batch_size),
+                max_top_k=self.ds_max_top_k,
+                max_seq_len=int(self.req_to_token.shape[1]),
+                score_reduce_bf16=self.ds_score_reduce_bf16,
+                num_local_heads=self.num_q_heads,
+                label_dim=self.ds_label_dim,
+                kv_lora_rank=self.kv_lora_rank,
+                qk_nope_head_dim=self.qk_nope_head_dim,
+                device=cache_seqlens_int32.device,
+            )
+
         metadata = DSAMetadata(
             page_size=self.real_page_size,
             cache_seqlens_int32=cache_seqlens_int32,
@@ -957,8 +1228,22 @@ class DeepseekSparseAttnBackend(
             indexer_seq_lens_cpu=indexer_seq_lens_cpu,
             indexer_seq_lens=indexer_seq_lens,
             token_to_batch_idx=token_to_batch_idx,
+            ds_topk_indices_out=ds_topk_indices_out,
+            ds_graph_state=ds_graph_state,
         )
         self.forward_metadata = metadata
+        if ds_topk_indices_out is not None:
+            # Expose the metadata-owned buffer on forward_batch so
+            # `_select_topk_indices` can write into it via `out=` without
+            # per-step allocation.
+            forward_batch.ds_topk_indices_out = ds_topk_indices_out
+        if ds_graph_state is not None:
+            # Same convention for the allocation-free graph-safe scratch.
+            # `ForwardBatch` is the only object both eager-decode and the
+            # dynamic non-graph forward path reliably see; the CUDA-graph
+            # capture path resolves this same field through ForwardContext
+            # (`get_attn_backend().forward_metadata.ds_graph_state`).
+            forward_batch.ds_graph_state = ds_graph_state
 
     def _cal_indexer_k_start_end(
         self,
@@ -1045,6 +1330,16 @@ class DeepseekSparseAttnBackend(
         This creates fixed-size tensors that will be reused during CUDA graph replay
         to avoid memory allocations.
         """
+        # DS selector graph state is shared per SELECTOR WIDTH across all
+        # batch-size variants (allocated lazily at the first capture of each
+        # width, sized [max_bs, width]). Per-variant ownership would multiply
+        # the width-proportional scratch and capture mirrors by the ladder
+        # length (~15 GiB at the full ladder — a measured capture-OOM at
+        # mem-fraction 0.7). Sharing is safe: graphs alias the same buffers,
+        # only one graph replays at a time, and every replay fully rewrites
+        # the rows it reads.
+        self._ds_graph_max_bs: int = max_bs
+        self._ds_graph_state_by_width: Dict = {}
         self.decode_cuda_graph_metadata: Dict = {
             "cache_seqlens": torch.ones(
                 max_num_tokens, dtype=torch.int32, device=self.device
@@ -1202,6 +1497,16 @@ class DeepseekSparseAttnBackend(
                 paged_mqa_ctx_lens_2d, 64, deep_gemm.get_num_sms()
             )
 
+        ds_topk_indices_out = None
+        ds_graph_state: Optional[DSGraphState] = None
+        if self.enable_double_sparsity:
+            ds_topk_indices_out = torch.empty(
+                (bs, self.ds_max_top_k),
+                dtype=torch.int32,
+                device=cache_seqlens_int32.device,
+            )
+            ds_graph_state = self._ds_shared_graph_state(cache_seqlens_int32.device)
+
         metadata = DSAMetadata(
             page_size=self.real_page_size,
             cache_seqlens_int32=cache_seqlens_int32,
@@ -1219,9 +1524,52 @@ class DeepseekSparseAttnBackend(
             dsa_seqlens_expanded=seqlens_expanded,
             real_page_table=real_page_table,
             dsa_extend_seq_lens_list=dsa_extend_seq_lens_list,
+            ds_topk_indices_out=ds_topk_indices_out,
+            ds_graph_state=ds_graph_state,
         )
-        self.decode_cuda_graph_metadata[bs] = metadata
+        self.decode_cuda_graph_metadata[self._ds_decode_metadata_key(bs)] = metadata
         self.forward_metadata = metadata
+
+    def _ds_decode_metadata_key(self, bs: int):
+        """Per-variant decode metadata key: the runner's graph-variant key when
+        stamped (DS-on decode selector-width keying), else the plain batch
+        size. Keeps DS-off and speculative paths on today's int keys."""
+        variant_key = getattr(self, "_ds_graph_variant_key", None)
+        return bs if variant_key is None else variant_key
+
+    def _ds_selector_width_from_variant(self) -> int:
+        """Selector score width for the graph variant being captured: the
+        width half of the stamped (bs, width) key, else the full
+        req_to_token width (eager forwards and un-stamped captures)."""
+        variant_key = getattr(self, "_ds_graph_variant_key", None)
+        if isinstance(variant_key, tuple):
+            return int(variant_key[1])
+        return int(self.req_to_token.shape[1])
+
+    def _ds_shared_graph_state(self, device) -> DSGraphState:
+        """The per-WIDTH shared DSGraphState for graph capture/replay.
+
+        One state per selector width serves every batch-size variant of that
+        width: allocated at the max capture batch size on first use, then
+        referenced by each variant's DSAMetadata (stable lifetime — graphs
+        bake these addresses in).
+        """
+        width = self._ds_selector_width_from_variant()
+        state = self._ds_graph_state_by_width.get(width)
+        if state is None:
+            state = allocate_graph_state(
+                max_bs=self._ds_graph_max_bs,
+                max_top_k=self.ds_max_top_k,
+                max_seq_len=width,
+                score_reduce_bf16=self.ds_score_reduce_bf16,
+                num_local_heads=self.num_q_heads,
+                label_dim=self.ds_label_dim,
+                kv_lora_rank=self.kv_lora_rank,
+                qk_nope_head_dim=self.qk_nope_head_dim,
+                device=device,
+            )
+            self._ds_graph_state_by_width[width] = state
+        return state
 
     def _apply_cuda_graph_metadata(
         self,
@@ -1240,7 +1588,18 @@ class DeepseekSparseAttnBackend(
         also call this directly via _apply_cuda_graph_metadata when they
         need to pass out_cache_loc / actual_forward_mode explicitly.
         """
-        if bs not in self.decode_cuda_graph_metadata:
+        assert seq_lens_cpu is not None
+
+        # Decode metadata is stored under the DS selector-width variant key
+        # (``(bs, width)`` when DS width-keying is active), NOT the raw ``bs``
+        # (see the store at ``_build_forward_metadata_cuda_graph`` ->
+        # ``decode_cuda_graph_metadata[_ds_decode_metadata_key(bs)]``). Membership
+        # MUST be tested with that same key. Testing the raw ``bs`` never matches
+        # the tuple keys, so every DS replay re-ran _build and returned before the
+        # in-place refresh below — leaving the captured graph reading frozen
+        # capture-time seq_lens (decode degenerated after the first token).
+        metadata_key = self._ds_decode_metadata_key(bs)
+        if metadata_key not in self.decode_cuda_graph_metadata:
             self._build_forward_metadata_cuda_graph(
                 bs,
                 None,
@@ -1260,7 +1619,10 @@ class DeepseekSparseAttnBackend(
         req_pool_indices = req_pool_indices[:bs]
 
         # Normal Decode
-        metadata: DSAMetadata = self.decode_cuda_graph_metadata[bs]
+        # Keep the DS selector-width variant key (see _ds_decode_metadata_key /
+        # the membership check above); raw `bs` never matches the tuple keys and
+        # degenerates DS decode after the first token.
+        metadata: DSAMetadata = self.decode_cuda_graph_metadata[metadata_key]
         used_fused_metadata_generation = False
         target_verify_ctx_lens_written = False
         if forward_mode.is_decode_or_idle():
@@ -1545,7 +1907,8 @@ class DeepseekSparseAttnBackend(
         """
         self.set_dsa_prefill_impl(forward_batch=None)
 
-        metadata = self.decode_cuda_graph_metadata[bs]
+        metadata_key = self._ds_decode_metadata_key(bs)
+        metadata = self.decode_cuda_graph_metadata[metadata_key]
 
         # Track whether fused kernel succeeded
         fused_kernel_succeeded = False
@@ -1689,6 +2052,118 @@ class DeepseekSparseAttnBackend(
 
         self.forward_metadata = metadata
 
+    def _populate_key_norm_cache(self, layer_id: int, cache_loc: torch.Tensor) -> None:
+        """Store the cosine key norm for the just-written slots, read from the
+        RESIDENT fp8-dequantized latent (the bytes the score kernel reads — NOT the
+        pre-quant ``k`` — so the norm matches the absorbed-raw-dot numerator and the
+        cosine oracle). In-place scatter into the preallocated cache; same graph-safe
+        lifecycle as ``_ds_slot_written``.
+        """
+        cache = self._ds_key_norm_cache
+        w_flat = (
+            self._ds_w_flat_by_layer.get(layer_id) if self._ds_w_flat_by_layer else None
+        )
+        if cache is None or w_flat is None:
+            # Fail closed: cosine is enabled but bind did not publish this layer's
+            # projection — raise rather than silently mark the slot written with a
+            # stale/absent key norm.
+            raise RuntimeError(
+                f"Double Sparsity key-norm populate has no projection for layer "
+                f"{layer_id} (cosine enabled but the bind publish is missing)."
+            )
+        pool = self.token_to_kv_pool
+        buf = pool.kv_buffer[
+            layer_id - getattr(pool, "start_layer", 0)
+        ]  # [slots, 1, D]
+        lora = self._knorm_lora
+        nblk = self._knorm_nblk
+        H = self.num_q_heads
+        label_dim = self._knorm_label_dim
+        T = int(cache_loc.shape[0])
+        packed = buf.dtype == torch.uint8
+
+        if packed and T <= self._knorm_max_app:
+            # 0-ALLOC decode path: gather the resident [fp8 latent | fp32 scales]
+            # bytes into preallocated scratch (uint8 index_select, out=), dequant in
+            # place, matmul into the per-head signature, vector-norm into the cache.
+            # No tensor is allocated per call.
+            slots = self._knorm_slots[:T]
+            slots.copy_(cache_loc)
+            buf_ls = buf[:, 0, : lora + nblk * 4]  # [S, lora+nblk*4] uint8 view
+            rowu8 = self._knorm_rowu8[:T]
+            torch.index_select(buf_ls, 0, slots, out=rowu8)
+            fp8 = rowu8[:, :lora].view(torch.float8_e4m3fn)  # [T, lora]
+            scl = rowu8[:, lora : lora + nblk * 4].view(torch.float32)  # [T, nblk]
+            ckv = self._knorm_ckv[:T]
+            ckv.copy_(fp8)  # fp8 -> fp32 (in place)
+            ckv.view(T, nblk, lora // nblk).mul_(scl.view(T, nblk, 1))  # dequant
+            klabel = self._knorm_klabel[:T]
+            torch.matmul(ckv, w_flat.t(), out=klabel)  # [T, lora] @ [lora, H*label_dim]
+            out = self._knorm_out[:T]
+            torch.linalg.vector_norm(klabel.view(T, H, label_dim), dim=-1, out=out)
+            cache[layer_id].index_copy_(0, slots, out)  # in-place, 0-alloc
+            return
+
+        # Eager fallback (non-fp8 KV, or T beyond the preallocated scratch):
+        # correctness over 0-alloc. This allocates, so it must NEVER run under
+        # CUDA-graph capture — on this 0.4.4 base prefill IS captured and the
+        # populate runs inside it, so _knorm_max_app is sized for the captured
+        # decode + prefill token counts and the 0-alloc path above handles capture.
+        # Fail loud if that invariant ever breaks.
+        assert not torch.cuda.is_current_stream_capturing(), (
+            f"Double Sparsity key-norm populate hit the allocating eager fallback "
+            f"under CUDA-graph capture (T={T} > scratch {self._knorm_max_app}); "
+            f"_knorm_max_app must cover the prefill-captured token count."
+        )
+        from sglang.srt.layers.attention.double_sparsity.absorbed_latent import (
+            dequantize_resident_latent,
+        )
+
+        slots = cache_loc.long()
+        row = buf[slots, 0, :]  # [T, D]
+        if packed:
+            fp8 = row[:, :lora].view(torch.float8_e4m3fn)
+            scl = row[:, lora : lora + nblk * 4].contiguous().view(torch.float32)
+            c_kv = dequantize_resident_latent(fp8, scl)
+        else:
+            c_kv = row[:, :lora].to(torch.float32)
+        k_label = torch.matmul(c_kv, w_flat.t()).view(-1, H, label_dim)
+        cache[layer_id].index_copy_(0, slots, k_label.norm(dim=-1))
+
+    def _write_token_labels(
+        self,
+        layer,
+        cache_loc: torch.Tensor,
+        k: torch.Tensor,
+        forward_batch: Optional[ForwardBatch] = None,
+    ) -> None:
+        """Mark physical KV slots valid for selection after a KV-cache write.
+
+        The KV bytes for this layer/slot were just written by set_mla_kv_buffer
+        (the caller), so mark these physical slots valid: selection scores the
+        resident latent directly, and the slot-validity bitmap keeps a reused
+        physical slot's stale latent from being selected before its fresh KV
+        write lands. In-place index write on the preallocated bitmap (graph-safe
+        — no per-step allocation).
+
+        No-ops if DS is not enabled or the bitmap is unavailable.
+        ``k`` shape: ``[T, 1, kv_lora_rank]``.
+        """
+        if not self.enable_double_sparsity:
+            return
+        if self._ds_key_norm_enabled:
+            # Populate the cosine key-norm cache for the just-written slots from the
+            # resident fp8 latent, BEFORE marking the slot written, so a reader never
+            # sees a written slot whose key norm is stale/absent.
+            self._populate_key_norm_cache(layer.layer_id, cache_loc)
+        if self._ds_slot_written is not None:
+            # Device-scalar RHS (not Python `True`) so the indexed mark stays a
+            # pure device-side copy — a CPU `True` would copy CPU->CUDA, which
+            # is illegal under CUDA-graph capture.
+            self._ds_slot_written[layer.layer_id, cache_loc.long()] = (
+                self._ds_slot_written_true
+            )
+
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -1750,6 +2225,9 @@ class DeepseekSparseAttnBackend(
                     cache_loc,
                     k,
                     k_rope,
+                )
+                self._write_token_labels(
+                    layer, cache_loc, k, forward_batch=forward_batch
                 )
 
         # Use MHA kernel if in MHA_ONE_SHOT mode
@@ -1975,6 +2453,9 @@ class DeepseekSparseAttnBackend(
                     cache_loc,
                     k,
                     k_rope,
+                )
+                self._write_token_labels(
+                    layer, cache_loc, k, forward_batch=forward_batch
                 )
 
         # Do absorbed multi-latent attention
@@ -2505,6 +2986,9 @@ class DeepseekSparseAttnBackend(
         metadata = self.forward_metadata
 
         merge_query = q_rope is not None
+        # Preserve the original latent K before any FP8 quantization so that
+        # _write_token_labels receives the correct tensor regardless of dtype path.
+        k_for_labels = k
         if self.kv_cache_dtype == torch.float8_e4m3fn:
             # For FP8 path, we quantize the query and rope parts and merge them into a single tensor
             # Note: rope application in deepseek_v2.py:forward_absorb_prepare is skipped for FP8 decode path of this trtllm_mla backend
@@ -2546,6 +3030,9 @@ class DeepseekSparseAttnBackend(
                 else forward_batch.encoder_out_cache_loc
             )
             self.token_to_kv_pool.set_mla_kv_buffer(layer, cache_loc, k, k_rope)
+            self._write_token_labels(
+                layer, cache_loc, k_for_labels, forward_batch=forward_batch
+            )
 
         k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
         kv_cache = k_cache.view(-1, self.real_page_size, self.kv_cache_dim).unsqueeze(1)
@@ -2674,12 +3161,26 @@ class DeepseekSparseAttnBackend(
             device_sm = get_device_sm()
 
             # Requirements: H200/B200, short sequences, supported dtype, fits in chunk
+            #
+            # Double Sparsity is dense-prefill / sparse-decode by design (classic DS
+            # only sparsifies the decode KV read; prefill attends densely). DSA's
+            # sparse MLA prefill path runs the per-decode-query selection, which is
+            # ill-defined for the per-extend-token prefill batch (it indexes the
+            # per-request req_pool_indices/seq_lens with a per-token batch -> bad
+            # indices -> CUDA illegal access for seq_len > the dense threshold). So
+            # for DS we keep the dense MHA prefill regardless of the length threshold
+            # (subject to the remaining feasibility checks); _select_topk_indices'
+            # use_mha branch then skips DS selection during prefill, and labels are
+            # still written via the MHA_ONE_SHOT _set_mla_kv_buffer hook.
             self.use_mha = (
                 (
                     device_sm == 90 or (device_sm >= 100 and device_sm < 110)
                 )  # SM90/SM100 only
-                and max_kv_len
-                <= envs.SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.get()  # Short enough for MHA
+                and (
+                    self.enable_double_sparsity
+                    or max_kv_len
+                    <= envs.SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.get()
+                )  # DS: dense prefill always; DSA: short enough for MHA
                 and self.token_to_kv_pool.dtype in [torch.bfloat16, torch.float8_e4m3fn]
                 and sum_seq_lens
                 <= forward_batch.get_max_chunk_capacity()  # Fits in chunk
@@ -2969,8 +3470,8 @@ class DeepseekSparseAttnMultiStepBackend:
 
 
 # Backward-compat aliases (deprecated: use DSA class names)
-DeepseekSparseAttnBackend = DeepseekSparseAttnBackend
-DeepseekSparseAttnMultiStepBackend = DeepseekSparseAttnMultiStepBackend
-DSAMetadata = DSAMetadata
-DSAFlashMLAMetadata = DSAFlashMLAMetadata
-DSAIndexerMetadata = DSAIndexerMetadata
+NativeSparseAttnBackend = DeepseekSparseAttnBackend
+NativeSparseAttnMultiStepBackend = DeepseekSparseAttnMultiStepBackend
+NSAMetadata = DSAMetadata
+NSAFlashMLAMetadata = DSAFlashMLAMetadata
+NSAIndexerMetadata = DSAIndexerMetadata

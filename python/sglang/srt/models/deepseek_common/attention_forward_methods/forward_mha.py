@@ -169,7 +169,9 @@ class DeepseekMHAForwardMixin:
                     q = self.q_b_proj(q_lora)[0].view(
                         -1, self.num_local_heads, self.qk_head_dim
                     )
-                if self.should_run_indexer():
+                # Skip the indexer prefill K-store under DS (DS selects via
+                # query-signature scoring; the index-k sidecar is pool-gated off).
+                if self.should_run_indexer() and not self.use_double_sparsity:
                     _ = self.indexer(
                         x=hidden_states,
                         q_lora=q_lora,
@@ -503,6 +505,20 @@ class DeepseekMHAForwardMixin:
             get_token_to_kv_pool().set_kv_buffer(
                 self.attn_mha, forward_batch.out_cache_loc, latent_cache, None
             )
+
+        # Write DS token labels for the MHA_ONE_SHOT path.  dsa_backend.forward_extend
+        # guards _write_token_labels behind save_kv_cache=True, but forward_normal_prepare
+        # calls this function then passes save_kv_cache=False to the attention kernel,
+        # so labels would never be written for short dense prefills without this hook.
+        if getattr(self, "use_double_sparsity", False):
+            _ds_backend = _resolve_attn_backend(forward_batch)
+            if hasattr(_ds_backend, "_write_token_labels"):
+                _ds_backend._write_token_labels(
+                    self.attn_mha,
+                    forward_batch.out_cache_loc,
+                    kv_a.unsqueeze(1),
+                    forward_batch=forward_batch,
+                )
 
     def _get_mla_kv_buffer(
         self: DeepseekV2AttentionMLA,

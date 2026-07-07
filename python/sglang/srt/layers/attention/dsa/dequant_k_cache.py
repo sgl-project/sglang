@@ -165,18 +165,24 @@ def _dequantize_k_cache_fast_kernel(
         tl.store(dst_ptr, data, mask=mask)
 
 
-def dequantize_k_cache_paged(
+def dequantize_k_cache_paged_out(
     quant_k_cache: torch.Tensor,
     page_table_1_flattened: torch.Tensor,
+    out: torch.Tensor,
     group_size: int = 128,
 ) -> torch.Tensor:
-    """
-    De-quantize the k-cache with paged layout
+    """Alloc-free variant of :func:`dequantize_k_cache_paged`: dequantize the
+    selected rows into the caller-owned bf16 ``out`` buffer (no internal
+    ``torch.empty``), so callers can run under CUDA-graph capture with a
+    preallocated fixed-shape scratch.
+
     Args:
-        quant_k_cache: [total_num_tokens, 1, dim_quant] or [num_blocks, block_size, 1, dim_quant], the quantized k-cache in paged layout
-        page_table_1_flattened: [num_tokens], the flattened page_table_1 with the page indices in each requests concatenated together
+        quant_k_cache: ``[*, dim_quant=656]`` fp8 paged k-cache.
+        page_table_1_flattened: ``[num_tokens]`` int — the physical slot per
+            output row (concatenated per request); never ``-1`` (it is loaded).
+        out: ``[num_tokens, 1, 576]`` bf16, caller-owned; written in place.
     Returns:
-        output: [num_tokens, 1, dim_nope + dim_rope], the de-quantized k-cache
+        ``out`` (for convenience).
     """
     dim_quant = quant_k_cache.shape[-1]
     assert (
@@ -192,11 +198,10 @@ def dequantize_k_cache_paged(
     dim_rope = 64
     num_tiles = dim_nope // group_size  # 512 // 128 = 4
 
-    output = torch.empty(
-        (num_tokens, 1, dim_nope + dim_rope),
-        dtype=torch.bfloat16,
-        device=quant_k_cache.device,
+    assert out.shape == (num_tokens, 1, dim_nope + dim_rope), (
+        f"out shape {tuple(out.shape)} != " f"{(num_tokens, 1, dim_nope + dim_rope)}"
     )
+    assert out.dtype == torch.bfloat16
 
     # cdiv(512 + 64, 128) = 5
     num_blocks_per_token = triton.cdiv(dim_nope + dim_rope, group_size)
@@ -213,12 +218,12 @@ def dequantize_k_cache_paged(
     input_rope = quant_k_cache[:, dim_nope + num_tiles * 4 :].view(torch.bfloat16)
 
     _dequantize_k_cache_paged_kernel[(num_tokens, num_blocks_per_token)](
-        output,
+        out,
         input_nope_q,
         input_nope_s,
         input_rope,
         page_table_1_flattened,
-        output.stride(0),
+        out.stride(0),
         input_nope_q.stride(0),
         input_nope_s.stride(0),
         input_rope.stride(0),
@@ -228,7 +233,35 @@ def dequantize_k_cache_paged(
         DIM_ROPE=dim_rope,
     )
 
-    return output
+    return out
+
+
+def dequantize_k_cache_paged(
+    quant_k_cache: torch.Tensor,
+    page_table_1_flattened: torch.Tensor,
+    group_size: int = 128,
+) -> torch.Tensor:
+    """
+    De-quantize the k-cache with paged layout
+    Args:
+        quant_k_cache: [total_num_tokens, 1, dim_quant] or [num_blocks, block_size, 1, dim_quant], the quantized k-cache in paged layout
+        page_table_1_flattened: [num_tokens], the flattened page_table_1 with the page indices in each requests concatenated together
+    Returns:
+        output: [num_tokens, 1, dim_nope + dim_rope], the de-quantized k-cache
+
+    Thin allocating wrapper around :func:`dequantize_k_cache_paged_out` — kept for
+    existing callers; graph-safe callers pass their own preallocated ``out`` via
+    the ``_out`` variant.
+    """
+    num_tokens = page_table_1_flattened.shape[0]
+    output = torch.empty(
+        (num_tokens, 1, 512 + 64),
+        dtype=torch.bfloat16,
+        device=quant_k_cache.device,
+    )
+    return dequantize_k_cache_paged_out(
+        quant_k_cache, page_table_1_flattened, output, group_size=group_size
+    )
 
 
 @triton.jit

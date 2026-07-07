@@ -199,8 +199,17 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     * kv_size
                 )
 
-            # Add indexer KV cache overhead for DSA models (DeepSeek V3.2)
-            if is_deepseek_dsa(model_config.hf_config):
+            # Add indexer KV cache overhead for DSA models (DeepSeek V3.2).
+            # Double Sparsity gates the indexer index-k sidecar off (the indexer is
+            # never invoked under DS — DS replaces its selection), so DSATokenToKVPool
+            # skips that allocation; the cell-size must drop the same term in lockstep
+            # or the freed bytes never become admitted tokens. Keep the term for the
+            # shipped DSA-native default and for HiSparse (which keeps the buffer).
+            ds_index_k_gated = (
+                getattr(mr.server_args, "enable_double_sparsity", False)
+                and not mr.enable_hisparse
+            )
+            if is_deepseek_dsa(model_config.hf_config) and not ds_index_k_gated:
                 index_head_dim = get_dsa_index_head_dim(model_config.hf_config)
                 indexer_size_per_token = (
                     index_head_dim

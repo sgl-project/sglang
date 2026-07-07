@@ -3280,6 +3280,15 @@ class DSAIndexerPoolHost(HostKVCache):
         device: str = "cpu",
         allocator_type: str = "default",
     ):
+        if device_pool.gate_index_k_cache:
+            raise RuntimeError(
+                "DSAIndexerPoolHost requires the device pool's DSA index-k sidecar, but "
+                "this DSATokenToKVPool was built with gate_index_k_cache=True (Double "
+                "Sparsity gates the indexer sidecar off and selects via query "
+                "signatures). Hierarchical cache is unsupported under Double Sparsity "
+                "and is rejected at startup by validate_double_sparsity; reaching "
+                "DSAIndexerPoolHost with a gated pool means that guard was bypassed."
+            )
         self.device_pool = device_pool
         self.page_size = anchor_host.page_size
         self.layout = layout

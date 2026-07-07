@@ -3756,7 +3756,15 @@ class Scheduler(
         return success
 
     def get_internal_state(self, recv_req: GetInternalStateReq):
-        ret = dict(vars(get_global_server_args()))  # vars returns a ref to obj.__dict__
+        # Skip private, dynamically-stashed runtime attrs (leading underscore):
+        # ServerArgs config fields are all public, while underscore-prefixed
+        # attrs are runtime bind state — e.g. Double Sparsity stashes CUDA
+        # tensors there, which would crash the ZMQ pyobj serialization.
+        ret = {
+            k: v
+            for k, v in vars(get_global_server_args()).items()
+            if not k.startswith("_")
+        }
         ret["last_gen_throughput"] = self.metrics_reporter.last_gen_throughput
         ret["memory_usage"] = {
             "weight": round(self.tp_worker.model_runner.weight_load_mem_usage, 2),
