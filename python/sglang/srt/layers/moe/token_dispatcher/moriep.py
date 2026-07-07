@@ -45,6 +45,11 @@ MXFP4_BLOCK_SIZE = 32
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
+# instance_id offset for the optional small-cap DECODE mori op, so it gets a
+# distinct init_mori_op lru_cache entry / mori op instance from the prefill op
+# (inner TBO dispatchers use small ids 0/1, so this never collides).
+_DECODE_OP_INSTANCE_ID_OFFSET = 4096
+
 if _use_aiter:
     from aiter import QuantType, get_hip_quant
 
@@ -390,11 +395,22 @@ class _MoriEPDispatcherImplBase:
         self.num_max_dispatch_tokens_per_rank = get_int_env_var(
             "SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 4096
         )
+        # Optional separate (small) per-rank dispatch cap for DECODE. The normal
+        # (IntraNode, synchronous) dispatch pads its recv buffer to
+        # num_max_dispatch_tokens_per_rank*world, so decode (a few hundred real
+        # tokens) otherwise runs the whole MoE (upscale/quant/GEMM) over the padded
+        # M (e.g. 131072). A small decode cap builds a 2nd IntraNode mori_op sized
+        # for decode -> M = decode_cap*world. IntraNode supports fp8 combine and is
+        # cuda-graph-safe (static shape per graph bs). 0 = disabled (single op).
+        self.num_max_dispatch_tokens_per_rank_decode = get_int_env_var(
+            "SGLANG_MORI_DECODE_MAX_DISPATCH_TOKENS", 0
+        )
 
         self.enable_sdma = get_bool_env_var("MORI_ENABLE_SDMA", "false")
         self.use_external_inp_buf = True
 
         self._mori_op = None
+        self._mori_op_decode = None
         self.dispatch_dtype = DispatchDtype.bf16
         self.combine_dtype = CombineDtype.bf16
 
@@ -403,26 +419,48 @@ class _MoriEPDispatcherImplBase:
         self.overlap_args: Optional[CombineOverlapArgs] = None
         self.meta_overlap_args: Optional[dict] = None
 
+    def _build_mori_op(self, num_max_dispatch_tokens_per_rank: int, instance_id: int):
+        # If set_quant_config was never called, apply env var override now.
+        if self.quant_config is None:
+            self._apply_dispatch_dtype_override()
+        return init_mori_op(
+            self.group,
+            self.router_topk,
+            self.num_experts,
+            self.num_local_experts,
+            self.hidden_size,
+            self.params_dtype,
+            num_max_dispatch_tokens_per_rank,
+            self.deepep_mode,
+            instance_id,
+            self.dispatch_dtype,
+            self.combine_dtype,
+            self.enable_sdma,
+            self.use_external_inp_buf,
+        )
+
     @property
     def mori_op(self):
+        # DECODE path: use the small-cap op when a decode cap is configured and the
+        # current batch is decode (is_extend=False). The normal (IntraNode) recv
+        # buffer is padded to num_max_dispatch_tokens_per_rank*world, so decode (a
+        # few hundred real tokens) would otherwise run the whole MoE over that padded
+        # M; the small-cap op sizes it to decode_cap*world. A distinct instance_id
+        # keeps init_mori_op's lru_cache + the mori op instance separate from the
+        # prefill op.
+        if (
+            self.num_max_dispatch_tokens_per_rank_decode > 0
+            and not get_is_extend_in_batch()
+        ):
+            if self._mori_op_decode is None:
+                self._mori_op_decode = self._build_mori_op(
+                    self.num_max_dispatch_tokens_per_rank_decode,
+                    self.instance_id + _DECODE_OP_INSTANCE_ID_OFFSET,
+                )
+            return self._mori_op_decode
         if self._mori_op is None:
-            # If set_quant_config was never called, apply env var override now
-            if self.quant_config is None:
-                self._apply_dispatch_dtype_override()
-            self._mori_op = init_mori_op(
-                self.group,
-                self.router_topk,
-                self.num_experts,
-                self.num_local_experts,
-                self.hidden_size,
-                self.params_dtype,
-                self.num_max_dispatch_tokens_per_rank,
-                self.deepep_mode,
-                self.instance_id,
-                self.dispatch_dtype,
-                self.combine_dtype,
-                self.enable_sdma,
-                self.use_external_inp_buf,
+            self._mori_op = self._build_mori_op(
+                self.num_max_dispatch_tokens_per_rank, self.instance_id
             )
         return self._mori_op
 
