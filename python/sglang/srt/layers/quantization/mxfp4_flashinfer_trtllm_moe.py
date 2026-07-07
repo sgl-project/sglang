@@ -53,6 +53,7 @@ def _require_flashinfer_mxfp4() -> None:
         "dependencies to import successfully."
     ) from _FLASHINFER_MXFP4_IMPORT_ERROR
 
+
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
 
