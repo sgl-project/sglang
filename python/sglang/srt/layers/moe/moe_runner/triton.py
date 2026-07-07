@@ -252,8 +252,7 @@ def pre_permute_standard_to_triton(
     running_state: dict,
 ) -> TritonRunnerInput:
 
-    # NOTE: this is dead code as a fused func for standard format is registered.
-    # This is left here for testing and examples.
+    # Registered fallback for format-conversion tests and examples.
 
     from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
         _prepare_fused_moe_run,
@@ -309,8 +308,7 @@ def post_permute_triton_to_standard(
     running_state: dict,
 ) -> StandardCombineInput:
 
-    # NOTE: this is dead code as a fused func for standard format is registered.
-    # This is left here for testing and examples.
+    # Registered fallback for format-conversion tests and examples.
 
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
 
