@@ -45,6 +45,7 @@ from sglang.srt.entrypoints.openai.protocol import (
 from sglang.srt.entrypoints.openai.realtime import (
     handle_realtime_transcription,
 )
+from sglang.srt.entrypoints.openai.segment_streaming import SegmentStreamingASR
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.streaming_asr import (
     StreamingASRState,
@@ -242,6 +243,16 @@ class OpenAIServingTranscription(OpenAIServingBase):
         raw_request: Request,
     ) -> StreamingResponse:
         """Handle streaming transcription request."""
+        if (
+            self.tokenizer_manager.server_args.asr_streaming_mode == "segment"
+            and self._adapter.supports_segment_streaming
+        ):
+            return StreamingResponse(
+                self._generate_segment_asr_stream(
+                    adapted_request, request, raw_request
+                ),
+                media_type="text/event-stream",
+            )
         if self._adapter.supports_chunked_streaming:
             # No background abort_task: each chunk is a separate request;
             # client disconnection is detected via is_disconnected() in the loop.
@@ -368,6 +379,85 @@ class OpenAIServingTranscription(OpenAIServingBase):
         except ValueError as e:
             error = self.create_streaming_error_response(str(e))
             yield f"data: {error}\n\n"
+
+        yield "data: [DONE]\n\n"
+
+    async def _generate_segment_asr_stream(
+        self,
+        adapted_request: GenerateReqInput,
+        request: TranscriptionRequest,
+        raw_request: Request,
+    ) -> AsyncGenerator[str, None]:
+        """Segment-based streaming: each fixed-duration segment is one
+        turn of an engine streaming session, so prior segments' KV is
+        reused instead of re-encoded (see segment_streaming.py). Emitted
+        deltas are final — no rollback zone, unlike the chunked path.
+        """
+        created_time = int(time.time())
+        request_id = f"{self._request_id_prefix()}{uuid.uuid4().hex}"
+        model = request.model
+        segment_sec = self._adapter.segment_streaming_config["segment_duration_sec"]
+        last_char = ""
+
+        seg_asr = SegmentStreamingASR(
+            tokenizer_manager=self.tokenizer_manager,
+            adapter=self._adapter,
+            sampling_params=adapted_request.sampling_params,
+            routing_key=self.extract_routing_key(raw_request),
+        )
+        try:
+            data, sample_rate = decode_audio_mono(request.audio_data)
+            segment_samples = int(segment_sec * sample_rate)
+            n_segments = max(1, -(-len(data) // segment_samples))  # ceil
+
+            for i in range(n_segments):
+                if await raw_request.is_disconnected():
+                    logger.info("[segment_asr] client disconnected, stopping")
+                    break
+                start = i * segment_samples
+                end = min(start + segment_samples, len(data))
+                wav = await asyncio.to_thread(encode_wav, data[start:end], sample_rate)
+                delta = await seg_asr.transcribe_segment(wav)
+
+                for word in delta.split(" "):
+                    if not word:
+                        continue
+                    content = f" {word}" if needs_space(last_char, word) else word
+                    last_char = content[-1]
+                    chunk_resp = TranscriptionStreamResponse(
+                        id=request_id,
+                        created=created_time,
+                        model=model,
+                        choices=[
+                            TranscriptionStreamChoice(
+                                delta=DeltaMessage(content=content),
+                                finish_reason=None,
+                            )
+                        ],
+                    )
+                    yield f"data: {chunk_resp.model_dump_json()}\n\n"
+
+            chunk_resp = TranscriptionStreamResponse(
+                id=request_id,
+                created=created_time,
+                model=model,
+                choices=[
+                    TranscriptionStreamChoice(
+                        delta=DeltaMessage(),
+                        finish_reason="stop",
+                    )
+                ],
+            )
+            yield f"data: {chunk_resp.model_dump_json()}\n\n"
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.exception("[segment_asr] unrecoverable error")
+            error = self.create_streaming_error_response(str(e))
+            yield f"data: {error}\n\n"
+        finally:
+            await seg_asr.close()
 
         yield "data: [DONE]\n\n"
 

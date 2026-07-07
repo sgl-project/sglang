@@ -109,6 +109,23 @@ class TranscriptionAdapter(ABC):
         """
         return {}
 
+    @property
+    def supports_segment_streaming(self) -> bool:
+        """Whether fixed audio segments can be transcribed as successive
+        turns of one engine streaming session (--asr-streaming-mode
+        segment), so prior segments' KV is reused instead of re-encoded.
+        Requires a model trained to continue a transcript from prior
+        user(audio)/assistant(text) rounds."""
+        return False
+
+    @property
+    def segment_streaming_config(self) -> dict:
+        """Parameters for segment streaming. Keys: ``segment_duration_sec``.
+
+        Only used when ``supports_segment_streaming`` is True.
+        """
+        return {}
+
     def postprocess_text(self, text: str) -> str:
         """Strip model-specific markers from raw decoded text.
 

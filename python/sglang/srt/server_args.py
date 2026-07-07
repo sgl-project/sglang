@@ -1144,6 +1144,13 @@ class ServerArgs:
         int,
         "Maximum number of concurrent realtime ASR WebSocket sessions served by /v1/realtime. New connections beyond this cap are accepted, sent an error{code:too_many_sessions} frame, and closed. Default 32.",
     ] = 32
+    asr_streaming_mode: A[
+        str,
+        Arg(
+            help="Streaming ASR inference mode. 'chunked' re-transcribes a sliding window of audio each chunk with prefix rollback (default). 'segment' transcribes fixed audio segments as successive turns of an engine streaming session, reusing prior turns' KV so each second of audio is encoded once; requires --enable-streaming-session and an adapter that supports it (falls back to chunked otherwise).",
+            choices=["chunked", "segment"],
+        ),
+    ] = "chunked"
     preferred_sampling_params: A[
         Optional[str],
         Arg(
@@ -6417,6 +6424,10 @@ class ServerArgs:
             raise ValueError(
                 f"--asr-max-concurrent-sessions must be positive "
                 f"(got {self.asr_max_concurrent_sessions})."
+            )
+        if self.asr_streaming_mode == "segment" and not self.enable_streaming_session:
+            raise ValueError(
+                "--asr-streaming-mode segment requires --enable-streaming-session."
             )
 
     def _handle_other_validations(self):
