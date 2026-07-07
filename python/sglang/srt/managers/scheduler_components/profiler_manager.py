@@ -3,7 +3,6 @@ from __future__ import annotations
 import logging
 import os
 import time
-from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import (
@@ -52,6 +51,9 @@ class SchedulerProfilerManager:
     ps: Any
     dp_tp_cpu_group: Any
     get_forward_ct: Callable[[], int]
+    # Toggles model_runner.roofline_annotations so the step span folds in the
+    # sqsq/sqsk/sk aggregates while a roofline-annotated profile is active.
+    set_roofline_annotations: Optional[Callable[[bool], None]] = None
 
     def __post_init__(self) -> None:
         if envs.SGLANG_PROFILE_V2.get():
@@ -157,10 +159,15 @@ class SchedulerProfilerManager:
 
         return ProfileReqOutput(success=True, message="Succeeded")
 
+    def _apply_roofline_annotations(self, enabled: bool) -> None:
+        if self.set_roofline_annotations is not None:
+            self.set_roofline_annotations(enabled)
+
     def _start_profile(
         self, stage: Optional[ForwardMode] = None
     ) -> ProfileReqOutput | None:
         if envs.SGLANG_PROFILE_V2.get():
+            self._apply_roofline_annotations(self.roofline_annotations)
             return self._profile_manager.manual_start()
 
         stage_str = f" for {stage.name}" if stage else ""
@@ -255,6 +262,7 @@ class SchedulerProfilerManager:
                 torch.cuda.cudart().cudaProfilerStart()
             self.profile_in_progress = True
 
+        self._apply_roofline_annotations(self.roofline_annotations)
         return ProfileReqOutput(success=True, message="Succeeded")
 
     def _merge_profile_traces(self) -> str:
@@ -293,6 +301,7 @@ class SchedulerProfilerManager:
         self, stage: Optional[ForwardMode] = None
     ) -> ProfileReqOutput | None:
         if envs.SGLANG_PROFILE_V2.get():
+            self._apply_roofline_annotations(False)
             return self._profile_manager.manual_stop()
 
         if not self.profile_in_progress:
@@ -375,6 +384,7 @@ class SchedulerProfilerManager:
         self.profile_in_progress = False
         self.profiler_start_forward_ct = None
 
+        self._apply_roofline_annotations(False)
         return ProfileReqOutput(success=True, message=f"Succeeded.{merge_message}")
 
     def _profile_batch_predicate(self, batch: ScheduleBatch):
@@ -416,104 +426,6 @@ class SchedulerProfilerManager:
                 and self.profiler_start_forward_ct == self.get_forward_ct()
             ):
                 self._start_profile()
-
-    def _build_profile_annotation(self, batch: ScheduleBatch):
-        """Return a context manager that annotates the profiler trace with
-        iteration details and roofline-analysis aggregates.
-
-        The annotation encodes aggregate statistics needed for roofline
-        analysis of paged attention **without** per-request details:
-
-        For context (prefill) requests (prefix ``c_``):
-            R_C           — number of context requests
-            Σ N_Q         — total query tokens          (sq)
-            Σ N_KV        — total KV tokens             (sk)
-            Σ N_Q²        — sum of sq² per request      (sqsq)
-            Σ N_Q·N_KV    — sum of sq·sk per request    (sqsk)
-
-        For generation (decode) requests (prefix ``g_``):
-            R_G           — number of generation requests
-            Σ N_Q         — total query tokens          (sq)
-            Σ N_KV        — total KV tokens             (sk)
-            Σ N_Q²        — sum of sq² per request      (sqsq)
-            Σ N_Q·N_KV    — sum of sq·sk per request    (sqsk)
-
-        bs = total scheduled tokens across both phases.
-        """
-        has_profiler = getattr(self, "torch_profiler", None) is not None or (
-            getattr(self, "_profile_manager", None) is not None
-            and getattr(self._profile_manager, "profiler", None) is not None
-        )
-        if not has_profiler or not self.roofline_annotations:
-            return nullcontext()
-
-        p_nq = 0
-        p_nkv = 0
-        p_sqsq = 0
-        p_sqsk = 0
-        g_nq = 0
-        g_nkv = 0
-        g_sqsq = 0
-        g_sqsk = 0
-
-        num_ctx_requests = 0
-        num_gen_requests = 0
-        bs = 0
-
-        decoding_req_ids = set()
-        if batch.forward_mode == ForwardMode.MIXED:
-            decoding_req_ids = {req.rid for req in (batch.decoding_reqs or [])}
-
-        for req in batch.reqs:
-            is_decode = (
-                batch.forward_mode == ForwardMode.DECODE or req.rid in decoding_req_ids
-            )
-            if is_decode:
-                nq = 1
-                nkv = req.seqlen
-                num_gen_requests += 1
-                g_nq += nq
-                g_nkv += nkv
-                g_sqsq += nq * nq
-                g_sqsk += nq * nkv
-            else:
-                nq = req.extend_input_len
-                nkv = len(req.prefix_indices) + req.extend_input_len
-                num_ctx_requests += 1
-                p_nq += nq
-                p_nkv += nkv
-                p_sqsq += nq * nq
-                p_sqsk += nq * nkv
-            bs += nq
-
-        annotation = "".join(
-            [
-                "execute_",
-                str(bs),
-                "_context_",
-                str(num_ctx_requests),
-                "(sq",
-                str(p_nq),
-                "sk",
-                str(p_nkv),
-                "sqsq",
-                str(p_sqsq),
-                "sqsk",
-                str(p_sqsk),
-                ")_generation_",
-                str(num_gen_requests),
-                "(sq",
-                str(g_nq),
-                "sk",
-                str(g_nkv),
-                "sqsq",
-                str(g_sqsq),
-                "sqsk",
-                str(g_sqsk),
-                ")",
-            ]
-        )
-        return torch.profiler.record_function(annotation)
 
     def _profile(self, recv_req: ProfileReq):
         if recv_req.req_type == ProfileReqType.START_PROFILE:
