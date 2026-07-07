@@ -512,6 +512,24 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if server_args.show_time_cost:
             enable_show_time_cost()
 
+        # Chunked prefix caching requires an MLA model on a backend whose
+        # kernels read that layout. This is a load-time gate, not a
+        # resolution-time one: out-of-tree platforms register their supported
+        # backends in init_backend(), which runs when this module is imported
+        # — after ServerArgs.__post_init__.
+        if (
+            not self.use_mla_backend
+            or server_args.attention_backend
+            not in CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS
+        ):
+            if not server_args.disable_chunked_prefix_cache:
+                server_args.override(
+                    "model_runner.chunked_prefix_cache_gate",
+                    disable_chunked_prefix_cache=True,
+                )
+        if not server_args.disable_chunked_prefix_cache:
+            logger.info("Chunked prefix cache is turned on.")
+
         # Set the global server_args in the scheduler process (target worker
         # only, so a draft init cannot clobber target-derived global state).
         if not self.is_draft_worker:

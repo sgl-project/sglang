@@ -2929,17 +2929,6 @@ class ServerArgs:
                 f"{hf_config.model_type}"
             )
 
-        # Chunked prefix caching requires an MLA model on a backend whose
-        # kernels read that layout.
-        if (
-            not self.use_mla_backend()
-            or self._resolved().attention_backend
-            not in CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS
-        ):
-            self.disable_chunked_prefix_cache = True
-        if not self.disable_chunked_prefix_cache:
-            logger.info("Chunked prefix cache is turned on.")
-
     def _handle_model_source_paths(self):
         """Resolve model/tokenizer paths backed by remote object stores."""
         if is_runai_obj_uri(self.model_path):
