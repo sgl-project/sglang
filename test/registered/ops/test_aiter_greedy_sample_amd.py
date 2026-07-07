@@ -38,7 +38,9 @@ def _mock_global_server_args(backend="pytorch"):
         device_group = None
 
     sampler_mod.get_tp_group = lambda: _DummyTPGroup()
-    sampler_mod.is_dp_attention_enabled = lambda: False
+    from sglang.srt.runtime_context import get_flags
+
+    get_flags().dp.enabled = False
 
 
 def _make_sampling_info(batch_size, vocab_size, device="cuda"):
