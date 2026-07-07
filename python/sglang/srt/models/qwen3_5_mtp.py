@@ -23,7 +23,7 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
+from sglang.srt.distributed import get_pp_group
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
@@ -34,6 +34,7 @@ from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen3_5 import Qwen3_5ForCausalLM
+from sglang.srt.runtime_context import get_flags, get_parallel
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, is_npu
 
@@ -58,7 +59,10 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         config = copy.deepcopy(config)
 
         # The MTP model is unquantized in the nvfp4 checkpoint.
-        if quant_config and quant_config.get_name() == "modelopt_fp4":
+        if quant_config and quant_config.get_name() in (
+            "modelopt_fp4",
+            "modelopt_mixed",
+        ):
             quant_config = None
         if (
             is_npu()
@@ -79,7 +83,7 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
                 quant_config = None
 
         self.config = config
-        self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
         self.pp_group = get_pp_group()
 
@@ -134,6 +138,12 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
+    def set_lm_head_from_target(self, target_lm_head):
+        if self.config.tie_word_embeddings:
+            return
+
+        self.lm_head = target_lm_head
+
     @torch.no_grad()
     def forward(
         self,
@@ -147,7 +157,7 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         if (
             is_npu()
             and self.quant_config is None
-            and get_global_server_args().quantization is not None
+            and get_flags().quantization is not None
         ):
             # ascend mtp unquant
             exit_stack.enter_context(envs.SGLANG_DEEPEP_BF16_DISPATCH.override(True))

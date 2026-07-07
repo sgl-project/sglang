@@ -29,6 +29,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     init_logger,
 )
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
+from sglang.multimodal_gen.test.server.common.slack import upload_file_to_slack
 from sglang.multimodal_gen.test.server.realtime_consistency import (
     build_realtime_init_payload,
     collect_realtime_output,
@@ -44,7 +45,6 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     ScenarioConfig,
     ToleranceConfig,
 )
-from sglang.multimodal_gen.test.slack_utils import upload_file_to_slack
 from sglang.multimodal_gen.test.test_utils import (
     get_expected_image_format,
     get_video_frame_count,
@@ -732,24 +732,60 @@ class MeshValidator(PerformanceValidator):
     pass
 
 
+# Pinned to a ci-data commit (not main): invalidates the per-URL download cache
+# whenever the reference is regenerated, and keeps the mesh GT reproducible.
+# Bump this SHA when pushing a new hunyuan3d.glb to ci-data.
 HUNYUAN3D_REFERENCE_URL = (
-    "https://raw.githubusercontent.com/sgl-project/sgl-test-files/"
-    "main/diffusion-ci/consistency_gt/1-gpu/hunyuan3d_2_0/hunyuan3d.glb"
+    "https://raw.githubusercontent.com/sgl-project/ci-data/"
+    "395f6e49c37d22a57d79fbcd3653d43984099ae2"
+    "/diffusion-ci/consistency_gt/1-gpu/hunyuan3d_2_0/hunyuan3d.glb"
 )
 
 
 def _download_reference_mesh(url: str) -> Path:
-    """Download a reference mesh from URL, caching in temp dir."""
+    """Download a reference mesh from URL, caching in temp dir.
+
+    Validates that the cached/downloaded file actually *loads* as a non-empty
+    mesh — not just that a magic/length header looks right. raw.githubusercontent
+    can briefly serve a truncated or corrupt response for a just-pushed large
+    file, and a prior run may have cached those bytes on a persistent runner; a
+    size/magic check can't catch a blob whose byte count matches the declared
+    length but whose body is corrupt (exactly what poisoned this CI cache and
+    surfaced as a cryptic trimesh "incorrect header on GLB file" deep inside
+    validation). Loading via trimesh rejects any such cache (forcing a
+    re-download) and turns a bad fresh download into a clear error. The ``v2``
+    cache prefix also invalidates blobs written by the earlier, weaker checks.
+    """
     import hashlib
 
-    cache_name = f"ref_mesh_{hashlib.md5(url.encode()).hexdigest()}.glb"
+    cache_name = f"ref_mesh_v2_{hashlib.md5(url.encode()).hexdigest()}.glb"
     cache_path = Path(tempfile.gettempdir()) / cache_name
-    if cache_path.exists():
+
+    def _loads_as_mesh(path: Path) -> bool:
+        try:
+            import trimesh
+
+            mesh = trimesh.load(str(path), force="mesh")
+            return (
+                getattr(mesh, "vertices", None) is not None and len(mesh.vertices) > 0
+            )
+        except Exception:
+            return False
+
+    if cache_path.exists() and _loads_as_mesh(cache_path):
         logger.info(f"Using cached reference mesh: {cache_path}")
         return cache_path
 
     logger.info(f"Downloading reference mesh from: {url}")
     cache_path.write_bytes(_urlopen_with_retry(url, timeout=60))
+    if not _loads_as_mesh(cache_path):
+        size = cache_path.stat().st_size if cache_path.exists() else 0
+        cache_path.unlink(missing_ok=True)
+        raise RuntimeError(
+            f"Reference mesh from {url} did not load as a valid mesh "
+            f"({size} bytes). The CDN may not have propagated a recently-pushed "
+            f"file yet; retry shortly."
+        )
     logger.info(f"Reference mesh cached at: {cache_path}")
     return cache_path
 
@@ -1446,8 +1482,15 @@ def get_generate_fn(
                 if content_resp.status_code != 200:
                     pytest.fail(f"{case_id}: mesh download failed: {content_resp.text}")
 
-                temp_path = Path(tempfile.gettempdir()) / f"mesh_test_{mesh_id}.glb"
-                temp_path.write_bytes(content_resp.content)
+                content = content_resp.content
+                # Shape-only Hunyuan3D meshes are returned as OBJ, painted meshes
+                # as GLB. Pick the extension from the content magic so trimesh.load
+                # (which dispatches on the file extension) parses it correctly,
+                # instead of raising "incorrect header on GLB file" when an OBJ
+                # body is saved under a .glb name.
+                ext = ".glb" if content[:4] == b"glTF" else ".obj"
+                temp_path = Path(tempfile.gettempdir()) / f"mesh_test_{mesh_id}{ext}"
+                temp_path.write_bytes(content)
                 MESH_OUTPUT_PATHS[case_id] = str(temp_path)
 
                 logger.info(f"[Mesh Gen] Mesh downloaded to {temp_path}")
