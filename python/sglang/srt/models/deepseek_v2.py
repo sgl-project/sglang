@@ -485,9 +485,7 @@ class MoEGate(nn.Module):
             )
 
         if get_global_server_args().enable_deterministic_inference:
-            if self.use_flashinfer_trtllm_bf16_moe:
-                return F.linear(hidden_states, self.weight, None)
-            if _is_cuda:
+            if _is_cuda and not self.use_flashinfer_trtllm_bf16_moe:
                 from sglang.jit_kernel.dsv4 import linear_bf16_fp32
 
                 return linear_bf16_fp32(hidden_states, self.weight)
@@ -501,9 +499,7 @@ class MoEGate(nn.Module):
                 or mla_use_prefill_cp(forward_batch, self.mla_enable_prefill_cp)
             )
         ):
-            if self.use_flashinfer_trtllm_bf16_moe:
-                logits = F.linear(hidden_states, self.weight, None)
-            elif _is_cuda:
+            if _is_cuda and not self.use_flashinfer_trtllm_bf16_moe:
                 from sglang.jit_kernel.dsv4 import linear_bf16_fp32
 
                 logits = linear_bf16_fp32(hidden_states, self.weight)
