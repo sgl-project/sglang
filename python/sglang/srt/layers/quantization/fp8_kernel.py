@@ -37,6 +37,7 @@ from sglang.srt.utils import (
     get_device_name,
     is_cpu,
     is_cuda,
+    is_gfx1250_supported,
     is_hip,
     is_musa,
     is_sm100_supported,
@@ -52,6 +53,7 @@ _is_cpu = is_cpu()
 _is_musa = is_musa()
 _is_sm100_supported = is_sm100_supported()
 _is_sm120_supported = is_sm120_supported()
+_is_gfx1250 = is_gfx1250_supported()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _is_cuda or _is_musa:
@@ -903,6 +905,7 @@ def _w8a8_block_fp8_matmul(
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
     needs_masking: tl.constexpr,
+    UPCAST_FP8: tl.constexpr = False,
 ):
     """Triton-accelerated function used to perform linear operations (dot
     product) on input tensors `A` and `B` with block-wise quantization, and store the result in output
@@ -938,6 +941,11 @@ def _w8a8_block_fp8_matmul(
         else:
             a = tl.load(a_ptrs)
             b = tl.load(b_ptrs)
+
+        if UPCAST_FP8:
+            # gfx1250: tl.dot on fp8 operands is miscompiled; upcast to bf16.
+            a = a.to(tl.bfloat16)
+            b = b.to(tl.bfloat16)
 
         a_s = tl.load(As_ptrs)
         b_s = tl.load(Bs_ptrs)
@@ -995,6 +1003,7 @@ def _w8a8_block_fp8_matmul_unrolledx4(
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
     needs_masking: tl.constexpr,
+    UPCAST_FP8: tl.constexpr = False,
 ):
     """Triton-accelerated function used to perform linear operations (dot
     product) on input tensors `A` and `B` with block-wise quantization, and store the result in output
@@ -1216,6 +1225,10 @@ if _is_hip:
         # Use manually unrolledx4 kernel on AMD GPU when the grid size is small.
         # Empirical testing shows the sweet spot lies when it's less than the # of
         # compute units available on the device.
+        if _is_gfx1250:
+            # gfx1250: the unrolledx4 kernel triggers a GPU memory access fault
+            # (RDNA4 triton codegen). Always use the standard kernel here.
+            return False
         num_workgroups = triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(
             N, META["BLOCK_SIZE_N"]
         )
@@ -1340,6 +1353,11 @@ def w8a8_block_fp8_matmul_triton(
             "num_stages": 3,
         }
 
+    if _is_gfx1250:
+        # gfx1250: triton software pipelining (num_stages > 1) miscompiles this
+        # kernel and produces NaN. Force a single stage on this arch.
+        config = {**config, "num_stages": 1}
+
     needs_masking = bool(K % config["BLOCK_SIZE_K"] != 0)
 
     def grid(META):
@@ -1372,6 +1390,7 @@ def w8a8_block_fp8_matmul_triton(
         Bs.stride(0),
         **config,
         needs_masking=needs_masking,
+        UPCAST_FP8=_is_gfx1250,
     )
 
     return C
