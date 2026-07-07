@@ -1490,11 +1490,40 @@ class GlmMoeDsaForCausalLMNextN(DeepseekV3ForCausalLMNextN):
     # _resolve_nextn_quant_config below instead.
     hf_to_sglang_mapper = WeightsMapper()
 
+    _NEXTN_SPEC_WEIGHT_NAMES = ("shared_head.norm", "eh_proj", "enorm", "hnorm")
+
+    @classmethod
+    def _map_mtp_ckpt_name(cls, name: str, layer_prefix: str) -> str:
+        # Keep this mapping in sync with DeepseekV2WeightLoaderMixin's
+        # NextN rule: MTP-specific weights live under model.*, while the
+        # decoder block weights live under model.decoder.*.
+        if any(part in name for part in cls._NEXTN_SPEC_WEIGHT_NAMES):
+            return name.replace(layer_prefix, "model", 1)
+        return name.replace(layer_prefix, "model.decoder", 1)
+
     def _resolve_nextn_quant_config(self, config, quant_config):
         if quant_config is None or quant_config.get_name() != "quark":
             return quant_config
 
         layer_prefix = f"model.layers.{config.num_hidden_layers}"
+
+        # Quark's per-module scheme selection (e.g. MTP self_attn in PTPC-FP8
+        # while MTP MoE is MXFP4) is keyed by "layer_quant_config" patterns
+        # using the checkpoint's "model.layers.<N>.*" naming. SGLang queries
+        # schemes by the runtime "model.*"/"model.decoder.*" prefix, so those
+        # keys need the same remap as exclude_layers below, or they silently
+        # fall back to the wrong (layer-type/global) scheme.
+        layer_quant_config = quant_config.quant_config.get("layer_quant_config")
+        if layer_quant_config:
+            quant_config.quant_config["layer_quant_config"] = {
+                (
+                    self._map_mtp_ckpt_name(pattern, layer_prefix)
+                    if pattern.startswith(layer_prefix + ".")
+                    else pattern
+                ): pattern_config
+                for pattern, pattern_config in layer_quant_config.items()
+            }
+
         mtp_excluded = [
             name
             for name in quant_config.exclude_layers
@@ -1504,21 +1533,8 @@ class GlmMoeDsaForCausalLMNextN(DeepseekV3ForCausalLMNextN):
             return quant_config
 
         names = set(quant_config.exclude_layers)
-        nextn_spec_weight_names = (
-            "shared_head.norm",
-            "eh_proj",
-            "enorm",
-            "hnorm",
-        )
         for name in mtp_excluded:
-            # Keep this mapping in sync with DeepseekV2WeightLoaderMixin's
-            # NextN rule: MTP-specific weights live under model.*, while the
-            # decoder block weights live under model.decoder.*.
-            if any(part in name for part in nextn_spec_weight_names):
-                runtime_name = name.replace(layer_prefix, "model", 1)
-            else:
-                runtime_name = name.replace(layer_prefix, "model.decoder", 1)
-            names.add(runtime_name)
+            names.add(self._map_mtp_ckpt_name(name, layer_prefix))
 
         # Fused routed experts are queried by the coarse module prefix
         # "model.decoder.mlp.experts". Expanded per-expert leaf excludes do not
