@@ -995,6 +995,12 @@
                     ]
                   },
                   {
+                    "group": "DeepReinforce",
+                    "pages": [
+                      "cookbook/autoregressive/DeepReinforce/Ornith-1.0"
+                    ]
+                  },
+                  {
                     "group": "Llama",
                     "pages": [
                       "cookbook/autoregressive/Llama/Llama4",
@@ -1016,6 +1022,12 @@
                       "cookbook/autoregressive/GLM/GLM-4.6V",
                       "cookbook/autoregressive/GLM/GLM-4.5",
                       "cookbook/autoregressive/GLM/GLM-4.5V"
+                    ]
+                  },
+                  {
+                    "group": "Meituan",
+                    "pages": [
+                      "cookbook/autoregressive/Meituan/LongCat-2.0"
                     ]
                   },
                   {
