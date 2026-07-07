@@ -79,6 +79,7 @@ class LongLive2ArchConfig(WanVideoArchConfig):
     num_frames_per_block: int = 8
     sliding_window_num_frames: int = 32
 
+
 @dataclass
 class LongLive2VideoConfig(WanVideoConfig):
     arch_config: DiTArchConfig = field(default_factory=LongLive2ArchConfig)
