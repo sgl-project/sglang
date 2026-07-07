@@ -11,16 +11,14 @@ import concurrent.futures
 import functools
 import logging
 import os
-import time
-from typing import Any, Callable, List, Optional, Tuple, Union
+from typing import Callable, List, Optional
 
-import numpy as np
 import torch
 from transformers import AutoProcessor
 
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.environ import envs
-from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.multimodal.processors.qwen_vl import preprocess_video
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import load_audio, load_image, load_video
