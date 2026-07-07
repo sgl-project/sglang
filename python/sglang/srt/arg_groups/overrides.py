@@ -45,6 +45,7 @@ from sglang.srt.utils.common import (
     is_cpu,
     is_cuda,
     is_flashinfer_available,
+    is_gfx95_supported,
     is_hip,
     is_musa,
     is_npu,
@@ -1818,20 +1819,25 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
                 "flashinfer_trtllm_routed."
             )
     if view.quantization == "mxfp8":
-        if moe_runner_backend == "auto":
-            moe_runner_backend = "flashinfer_trtllm"
-        elif moe_runner_backend not in [
+        is_gfx95_mxfp8 = is_hip() and is_gfx95_supported()
+        allowed = [
             "cutlass",
             "deep_gemm",
             "flashinfer_trtllm",
             "flashinfer_trtllm_routed",
-        ]:
+        ]
+        if is_gfx95_mxfp8:
+            allowed.append("triton")
+        mxfp8_default = "triton" if is_gfx95_mxfp8 else "flashinfer_trtllm"
+        if moe_runner_backend == "auto":
+            moe_runner_backend = mxfp8_default
+        elif moe_runner_backend not in allowed:
             logger.warning(
-                "mxfp8 quantization supports only cutlass, deep_gemm, "
-                "flashinfer_trtllm, or flashinfer_trtllm_routed backends. "
-                f"Overriding {moe_runner_backend!r}."
+                "mxfp8 quantization supports only %s backends. " "Overriding %r.",
+                ", ".join(allowed),
+                moe_runner_backend,
             )
-            moe_runner_backend = "flashinfer_trtllm"
+            moe_runner_backend = mxfp8_default
     if (
         moe_runner_backend == "auto"
         and view.quantization == "modelopt_fp4"
