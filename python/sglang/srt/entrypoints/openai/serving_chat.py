@@ -1000,10 +1000,8 @@ class OpenAIServingChat(OpenAIServingBase):
         """Handle streaming chat completion request"""
         generator = self._generate_chat_stream(adapted_request, request, raw_request)
 
-        # Kick-start the generator so validation / rate-limit / capacity errors
-        # raised BEFORE the first token get a real HTTP status instead of a 200
-        # + SSE-body error payload. Widened from ValueError-only so the engine
-        # can surface HTTPException(status_code=429/503/etc.) as its real status.
+        # Kick-start so a pre-first-chunk error gets a real HTTP status instead
+        # of a 200 + SSE-body error payload. See docstring on the helper.
         try:
             first_chunk = await generator.__anext__()
         except Exception as e:

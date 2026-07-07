@@ -69,6 +69,16 @@ class TestStreamKickstartErrorMapping(unittest.TestCase):
         )
         self.assertEqual(resp.status_code, 500)
 
+    def test_stop_async_iteration_maps_to_500(self):
+        # Edge case: generator terminates without yielding anything. Old
+        # narrow ``except ValueError`` let this bubble to FastAPI's default
+        # 500. ``except Exception`` catches it too (StopAsyncIteration is
+        # Exception-derived), and we return the same 500 status with a
+        # structured body — strict improvement, not a regression.
+        serving = self._make_serving()
+        resp = serving.create_error_response_for_stream_kickstart(StopAsyncIteration())
+        self.assertEqual(resp.status_code, 500)
+
 
 if __name__ == "__main__":
     unittest.main()
