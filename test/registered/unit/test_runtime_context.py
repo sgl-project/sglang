@@ -367,6 +367,53 @@ class TestDpFlagsGroup(_IsolatedServerArgs):
         self.assertFalse(is_dp_attention_enabled())
 
 
+class TestResources(_IsolatedServerArgs):
+    """ctx.resources: named slots for process-level resource handles with one
+    reset lifecycle; owning accessors keep their creation/publish semantics."""
+
+    def test_graph_pool_lazy_create_and_reuse(self):
+        from types import SimpleNamespace
+
+        from sglang.srt.model_executor.runner_utils.pool import (
+            get_global_graph_memory_pool,
+            get_or_create_global_graph_memory_pool,
+        )
+
+        reset_context()
+        self.assertIsNone(get_global_graph_memory_pool())
+        dev = SimpleNamespace(graph_pool_handle=lambda: object())
+        handle = get_or_create_global_graph_memory_pool(dev)
+        self.assertIs(get_or_create_global_graph_memory_pool(dev), handle)
+
+    def test_expert_recorder_noop_default_and_injection(self):
+        from sglang.srt.eplb.expert_distribution import (
+            get_global_expert_distribution_recorder,
+        )
+        from sglang.srt.runtime_context import get_resources
+
+        reset_context()
+        self.assertEqual(
+            type(get_global_expert_distribution_recorder()).__name__,
+            "_ExpertDistributionRecorderNoop",
+        )
+        with get_resources().override(expert_distribution_recorder="mock"):
+            self.assertEqual(get_global_expert_distribution_recorder(), "mock")
+
+    def test_expert_location_metadata_publish_once_until_reset(self):
+        from sglang.srt.eplb.expert_location import (
+            get_global_expert_location_metadata,
+            set_global_expert_location_metadata,
+        )
+
+        reset_context()
+        self.assertIsNone(get_global_expert_location_metadata())
+        set_global_expert_location_metadata("meta")
+        with self.assertRaises(AssertionError):
+            set_global_expert_location_metadata("again")
+        reset_context()
+        self.assertIsNone(get_global_expert_location_metadata())
+
+
 class TestPublishLifecycle(_IsolatedServerArgs):
     """Publish installs the resolved server_args and seeds the capture tier."""
 

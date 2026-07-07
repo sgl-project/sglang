@@ -321,16 +321,35 @@ class Flags(_FlagGroupBase):
     dp: DpFlags = dataclasses.field(default_factory=DpFlags)
 
 
+@dataclasses.dataclass
+class Resources(_FlagGroupBase):
+    """Process-level resource handles: named slots with one reset lifecycle,
+    scoped test injection via ``override()``, and the creation/publish
+    semantics kept in the owning modules' accessors (which are thin shims
+    over these slots)."""
+
+    # CUDA graph memory pool shared across the prefill and decode graph
+    # backends (created lazily by model_executor.runner_utils.pool).
+    graph_memory_pool: Any = None
+    # EPLB: per-process recorder and the publish-once location metadata
+    # (owning accessors live in sglang.srt.eplb).
+    expert_distribution_recorder: Any = None
+    expert_location_metadata: Any = None
+    # LPLB: layer_id -> solver.
+    lplb_solvers: dict = dataclasses.field(default_factory=dict)
+
+
 class RuntimeContext:
     """Container for the structured runtime accessors; exposes ``parallel``,
-    ``server_args``, and ``flags``."""
+    ``server_args``, ``flags``, and ``resources``."""
 
-    __slots__ = ("parallel", "_server_args", "flags")
+    __slots__ = ("parallel", "_server_args", "flags", "resources")
 
     def __init__(self, parallel: ParallelContext):
         self.parallel = parallel
         self._server_args: ServerArgs | None = None
         self.flags = Flags()
+        self.resources = Resources()
 
     @property
     def server_args(self) -> ServerArgs:
@@ -378,11 +397,16 @@ def get_flags() -> Flags:
     return _CONTEXT.flags
 
 
+def get_resources() -> Resources:
+    return _CONTEXT.resources
+
+
 def reset_context() -> None:
     """Clear the context-owned store (unit-test teardown): drop the published
-    ``server_args`` and install a fresh ``Flags``.
+    ``server_args`` and install fresh ``Flags`` and ``Resources``.
 
     Wrapper subsystems (``parallel``) hold no state and are unaffected.
     """
     _CONTEXT._server_args = None
     _CONTEXT.flags = Flags()
+    _CONTEXT.resources = Resources()
