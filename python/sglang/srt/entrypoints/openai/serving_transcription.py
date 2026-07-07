@@ -48,9 +48,11 @@ from sglang.srt.entrypoints.openai.realtime import (
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.streaming_asr import (
     StreamingASRState,
+    compute_window_drop,
+    decode_audio_mono,
+    encode_wav,
     needs_space,
     process_asr_chunk,
-    split_audio_chunks,
 )
 from sglang.srt.entrypoints.openai.transcription_adapters import resolve_adapter
 from sglang.srt.managers.io_struct import GenerateReqInput
@@ -395,13 +397,32 @@ class OpenAIServingTranscription(OpenAIServingBase):
         last_char = ""
 
         try:
-            chunks = split_audio_chunks(request.audio_data, state.chunk_size_sec)
+            data, sample_rate = decode_audio_mono(request.audio_data)
+            chunk_samples = int(state.chunk_size_sec * sample_rate)
+            n_chunks = max(1, -(-len(data) // chunk_samples))  # ceil
+            # Sample offset of the audio window's start; advances when the
+            # window rolls so per-chunk cost stays O(window), not O(total).
+            window_start = 0
 
-            for i, chunk_audio in enumerate(chunks):
+            for i in range(n_chunks):
                 if await raw_request.is_disconnected():
                     logger.info("[streaming_asr] client disconnected, stopping")
                     break
-                is_last = i == len(chunks) - 1
+                is_last = i == n_chunks - 1
+                end = min((i + 1) * chunk_samples, len(data))
+
+                drop = compute_window_drop(
+                    buffered=end - window_start,
+                    inferred=i * chunk_samples - window_start,
+                    chunk_size=chunk_samples,
+                    state=state,
+                )
+                if drop > 0:
+                    window_start += drop
+                    state.start_new_window()
+                chunk_audio = await asyncio.to_thread(
+                    encode_wav, data[window_start:end], sample_rate
+                )
 
                 delta = await process_asr_chunk(
                     tokenizer_manager=self.tokenizer_manager,

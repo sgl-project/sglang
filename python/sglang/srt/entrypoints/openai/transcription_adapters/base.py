@@ -103,7 +103,9 @@ class TranscriptionAdapter(ABC):
         """Parameters for ``StreamingASRState`` when using chunked streaming.
 
         Only used when ``supports_chunked_streaming`` is True.
-        Keys: ``chunk_size_sec``, ``unfixed_chunk_num``, ``unfixed_token_num``.
+        Keys: ``chunk_size_sec``, ``unfixed_chunk_num``, ``unfixed_token_num``,
+        and optionally ``window_chunk_num`` (max chunks of audio per
+        inference; 0/absent = re-encode the whole utterance every chunk).
         """
         return {}
 

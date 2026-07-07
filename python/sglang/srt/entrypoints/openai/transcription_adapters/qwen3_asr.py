@@ -24,11 +24,15 @@ class Qwen3ASRAdapter(TranscriptionAdapter):
     def chunked_streaming_config(self) -> dict:
         # Qwen3-ASR paper (arXiv:2601.21337), Table 8 uses 4 unfixed chunks.
         # We use 2 here for lower latency; tune based on quality needs.
+        # window_chunk_num caps per-inference audio at 16 s: older audio is
+        # dropped once its transcript is emitted, and the emitted text
+        # conditions the next inference as the prompt prefix instead.
         # TODO: allow users to override these via API request parameters.
         return {
             "chunk_size_sec": 2.0,
             "unfixed_chunk_num": 2,
             "unfixed_token_num": 5,
+            "window_chunk_num": 8,
         }
 
     @property
