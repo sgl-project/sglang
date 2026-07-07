@@ -446,15 +446,6 @@ class LayerCommunicator:
         is_last_layer: bool = False,
         qkv_latent_func: Optional[Callable] = None,
         force_layernorm_before_dp_gather: bool = False,
-        # Opt-in flags for the fused AR+RMSNorm+per-group-FP8-quant kernel.
-        # ``enable_fused_ar_quant=True`` asks the communicator to prefer the
-        # fully-fused path when the previous layer requests AR fusion (i.e.
-        # when ``_sglang_needs_allreduce_fusion`` is set on the incoming
-        # hidden states). ``fused_ar_quant_keep_bf16=True`` is required for
-        # GDN-style layers that consume both bf16 (for the small gating
-        # projection) and fp8+scale (for the main FP8 projection) from the
-        # same normed output. Falls back to the plain fused AR+RMSNorm path
-        # if the fused quant kernel returns ``None``.
         enable_fused_ar_quant: bool = False,
         fused_ar_quant_keep_bf16: bool = False,
     ):
