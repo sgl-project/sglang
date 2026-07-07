@@ -11,7 +11,11 @@ from transformers import AutoConfig, PretrainedConfig, WhisperConfig
 
 from sglang.srt.utils import logger
 
-from .common import _ensure_sub_configs, download_from_hf
+from .common import (
+    _ensure_sub_configs,
+    _resolve_local_or_cached_file,
+    download_from_hf,
+)
 
 
 def adapt_config_dict(
@@ -428,6 +432,26 @@ _MISTRAL_TOKENIZER_REDIRECTS = {
     # TODO(Xinyuan): Remove this once we have a proper tokenizer for Devstral
     "mistralai/Devstral-Small-2505": "mistralai/Mistral-Small-3.1-24B-Instruct-2503",
 }
+
+
+def is_bare_tekken_checkpoint(tokenizer_name, revision=None) -> bool:
+    """True iff the checkpoint ships tekken.json but no tokenizer.json.
+
+    AutoTokenizer converts tekken.json on the fly, but the converter assigns
+    BPE ids from rank 0, dropping the 1000 special-token slots that precede
+    the BPE vocab in tekken's id space — every encoded id is shifted and
+    generation produces garbage. Such checkpoints must load through the
+    mistral-common backed tokenizer instead.
+    """
+
+    def _has(filename):
+        try:
+            _resolve_local_or_cached_file(tokenizer_name, filename, revision)
+            return True
+        except Exception:
+            return False
+
+    return _has("tekken.json") and not _has("tokenizer.json")
 
 
 def retry_without_mistral_common_kwargs(tokenizer_name, *args, **common_kwargs):

@@ -38,6 +38,7 @@ from .common import (
 )
 from .mistral_utils import (
     _MISTRAL_TOKENIZER_REDIRECTS,
+    is_bare_tekken_checkpoint,
     patch_mistral_common_tokenizer,
     retry_without_mistral_common_kwargs,
 )
@@ -496,20 +497,29 @@ def get_tokenizer(
     )
 
     try:
-        tokenizer = _auto_tokenizer_from_pretrained(
-            tokenizer_name, *args, **common_kwargs
-        )
+        if is_bare_tekken_checkpoint(tokenizer_name, tokenizer_revision):
+            from transformers.tokenization_mistral_common import (
+                MistralCommonTokenizer,
+            )
 
-        # With fastokens, the patched TokenizersBackend.from_pretrained already
-        # returned a tokenizer whose backend is a fastokens shim. Re-resolving via
-        # the declared class (e.g. Qwen2Tokenizer) would discard that work.
-        if (
-            type(tokenizer).__name__ == _TOKENIZERS_BACKEND
-            and tokenizer_backend != "fastokens"
-        ):
-            tokenizer = _resolve_tokenizers_backend(
+            tokenizer = MistralCommonTokenizer.from_pretrained(
+                tokenizer_name, revision=tokenizer_revision
+            )
+        else:
+            tokenizer = _auto_tokenizer_from_pretrained(
                 tokenizer_name, *args, **common_kwargs
             )
+
+            # With fastokens, the patched TokenizersBackend.from_pretrained already
+            # returned a tokenizer whose backend is a fastokens shim. Re-resolving via
+            # the declared class (e.g. Qwen2Tokenizer) would discard that work.
+            if (
+                type(tokenizer).__name__ == _TOKENIZERS_BACKEND
+                and tokenizer_backend != "fastokens"
+            ):
+                tokenizer = _resolve_tokenizers_backend(
+                    tokenizer_name, *args, **common_kwargs
+                )
 
         return _apply_post_load_fixes(tokenizer, tokenizer_name, tokenizer_revision)
     except Exception as e:
