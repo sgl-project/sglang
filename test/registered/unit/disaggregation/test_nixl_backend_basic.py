@@ -335,6 +335,8 @@ class TestNixlAbortHandling(CustomTestCase):
         mgr = object.__new__(NixlKVManager)
         mgr.request_status = dict(request_status or {})
         mgr._connect = MagicMock()
+        mgr.failure_lock = threading.Lock()
+        mgr.failure_records = {}
         return mgr
 
     def test_given_known_incomplete_room_when_abort_arrives_then_room_fails_without_ack(
@@ -348,6 +350,10 @@ class TestNixlAbortHandling(CustomTestCase):
 
         self.assertTrue(handled)
         self.assertEqual(mgr.request_status[11], KVPoll.Failed)
+        self.assertEqual(
+            mgr.failure_records[11],
+            "Aborted by decode-side abort notification.",
+        )
         mgr._connect.assert_not_called()
 
     def test_given_successful_room_when_abort_arrives_then_status_is_preserved(self):
@@ -359,6 +365,7 @@ class TestNixlAbortHandling(CustomTestCase):
 
         self.assertTrue(handled)
         self.assertEqual(mgr.request_status[12], KVPoll.Success)
+        self.assertEqual(mgr.failure_records, {})
         mgr._connect.assert_not_called()
 
     def test_given_unknown_room_when_abort_arrives_then_status_remains_absent(self):
@@ -370,15 +377,19 @@ class TestNixlAbortHandling(CustomTestCase):
 
         self.assertTrue(handled)
         self.assertNotIn(14, mgr.request_status)
+        self.assertEqual(mgr.failure_records, {})
         mgr._connect.assert_not_called()
 
     def test_given_malformed_abort_when_handled_then_no_exception_or_ack(self):
         mgr = self._make_manager({13: KVPoll.WaitingForInput})
 
-        handled = mgr._handle_abort_notification([b"ABORT", b"13"])
+        handled = mgr._handle_abort_notification(
+            [b"ABORT", b"invalid-room", b"127.0.0.1", b"5558"]
+        )
 
         self.assertTrue(handled)
         self.assertEqual(mgr.request_status[13], KVPoll.WaitingForInput)
+        self.assertEqual(mgr.failure_records, {})
         mgr._connect.assert_not_called()
 
 

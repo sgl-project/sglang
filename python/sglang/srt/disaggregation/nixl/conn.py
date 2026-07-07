@@ -633,10 +633,7 @@ class NixlKVManager(CommonKVManager):
 
     def update_status(self, bootstrap_room: int, status: KVPoll):
         # Keep Failed sticky until the sender clears the room.
-        if (
-            bootstrap_room in self.request_status
-            and self.request_status[bootstrap_room] == KVPoll.Failed
-        ):
+        if self.request_status.get(bootstrap_room) == KVPoll.Failed:
             return
         super().update_status(bootstrap_room, status)
 
@@ -2330,9 +2327,8 @@ class NixlKVManager(CommonKVManager):
             return False
 
         try:
-            if len(msg) != 4:
-                raise ValueError(f"expected 4 frames, got {len(msg)}")
-            room_to_be_aborted = int(msg[1].decode("ascii"))
+            _, room_frame, _, _ = msg
+            room_to_be_aborted = int(room_frame.decode("ascii"))
         except Exception as e:
             logger.debug(f"Ignoring malformed abort notification: {e}")
             return True
@@ -2341,6 +2337,10 @@ class NixlKVManager(CommonKVManager):
             room_to_be_aborted in self.request_status
             and self.check_status(room_to_be_aborted) != KVPoll.Success
         ):
+            self.record_failure(
+                room_to_be_aborted,
+                "Aborted by decode-side abort notification.",
+            )
             self.update_status(room_to_be_aborted, KVPoll.Failed)
             logger.debug(
                 f"Received abort notification for room {room_to_be_aborted}, "
