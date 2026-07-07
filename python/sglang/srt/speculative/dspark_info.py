@@ -247,8 +247,6 @@ class DSparkDraftInputV2(SpecInput):
     _prepare_batch_seq_lens_cpu_buf: Optional[torch.Tensor] = None
     _prepare_cur_kv_lens_cpu_buf: Optional[torch.Tensor] = None
     _prepare_nxt_kv_lens_cpu_buf: Optional[torch.Tensor] = None
-    _prepare_cur_kv_lens_gpu_buf: Optional[torch.Tensor] = None
-    _prepare_nxt_kv_lens_gpu_buf: Optional[torch.Tensor] = None
 
     def __post_init__(self):
         super().__init__(spec_input_type=SpecInputType.DSPARK_DRAFT)
@@ -280,19 +278,14 @@ class DSparkDraftInputV2(SpecInput):
         self._prepare_batch_seq_lens_cpu_buf = other._prepare_batch_seq_lens_cpu_buf
         self._prepare_cur_kv_lens_cpu_buf = other._prepare_cur_kv_lens_cpu_buf
         self._prepare_nxt_kv_lens_cpu_buf = other._prepare_nxt_kv_lens_cpu_buf
-        self._prepare_cur_kv_lens_gpu_buf = other._prepare_cur_kv_lens_gpu_buf
-        self._prepare_nxt_kv_lens_gpu_buf = other._prepare_nxt_kv_lens_gpu_buf
 
     def _ensure_prepare_length_buffers(
-        self, bs: int, device: torch.device | str, need_gpu: bool = False
+        self, bs: int, device: torch.device | str
     ) -> None:
         pin_memory = is_pin_memory_available(device)
 
         def needs_cpu_alloc(buf: Optional[torch.Tensor]) -> bool:
             return buf is None or buf.numel() < bs
-
-        def needs_gpu_alloc(buf: Optional[torch.Tensor]) -> bool:
-            return buf is None or buf.numel() < bs or str(buf.device) != str(device)
 
         def grown_capacity(buf: Optional[torch.Tensor]) -> int:
             current = 0 if buf is None else int(buf.numel())
@@ -308,15 +301,6 @@ class DSparkDraftInputV2(SpecInput):
             )
             self._prepare_nxt_kv_lens_cpu_buf = torch.empty(
                 (capacity,), dtype=torch.int32, device="cpu", pin_memory=pin_memory
-            )
-
-        if need_gpu and needs_gpu_alloc(self._prepare_cur_kv_lens_gpu_buf):
-            capacity = grown_capacity(self._prepare_cur_kv_lens_gpu_buf)
-            self._prepare_cur_kv_lens_gpu_buf = torch.empty(
-                (capacity,), dtype=torch.int32, device=device
-            )
-            self._prepare_nxt_kv_lens_gpu_buf = torch.empty(
-                (capacity,), dtype=torch.int32, device=device
             )
 
     @classmethod
@@ -358,7 +342,7 @@ class DSparkDraftInputV2(SpecInput):
         page_size = batch.token_to_kv_pool_allocator.page_size
         cur_alloc = self.cur_allocated_seq_lens_cpu
 
-        self._ensure_prepare_length_buffers(bs, device, need_gpu=False)
+        self._ensure_prepare_length_buffers(bs, device)
         assert self._prepare_batch_seq_lens_cpu_buf is not None
         assert self._prepare_cur_kv_lens_cpu_buf is not None
         assert self._prepare_nxt_kv_lens_cpu_buf is not None
@@ -383,11 +367,15 @@ class DSparkDraftInputV2(SpecInput):
             num_needed_tokens += reserved_len - cur_alloc_len
 
         if num_needed_tokens > 0:
-            self._ensure_prepare_length_buffers(bs, device, need_gpu=True)
-            assert self._prepare_cur_kv_lens_gpu_buf is not None
-            assert self._prepare_nxt_kv_lens_gpu_buf is not None
-            cur_kv_lens = self._prepare_cur_kv_lens_gpu_buf[:bs]
-            nxt_kv_lens = self._prepare_nxt_kv_lens_gpu_buf[:bs]
+            # Reuse existing per-batch GPU buffers instead of allocating
+            # DSpark-owned scratch tensors. Under high concurrency, even tiny
+            # extra CUDA allocations can fail when the KV pool nearly fills memory.
+            cur_kv_lens = batch.seq_lens
+            nxt_kv_lens = batch.orig_seq_lens
+            assert cur_kv_lens is not None and cur_kv_lens.numel() >= bs
+            assert nxt_kv_lens is not None and nxt_kv_lens.numel() >= bs
+            cur_kv_lens = cur_kv_lens[:bs]
+            nxt_kv_lens = nxt_kv_lens[:bs]
             cur_kv_lens.copy_(cur_kv_lens_cpu, non_blocking=True)
             nxt_kv_lens.copy_(nxt_kv_lens_cpu, non_blocking=True)
 
@@ -420,6 +408,9 @@ class DSparkDraftInputV2(SpecInput):
         for i, req in enumerate(batch.reqs):
             req.kv_allocated_len = max(req.kv_allocated_len, int(nxt_kv_lens_cpu[i]))
 
+        batch.seq_lens[:bs].copy_(committed_cpu, non_blocking=True)
+        if batch.orig_seq_lens is not None and batch.orig_seq_lens.numel() >= bs:
+            batch.orig_seq_lens[:bs].copy_(committed_cpu, non_blocking=True)
         batch.seq_lens_cpu = committed_cpu
         batch.seq_lens_sum = committed_sum
         self.reserved_seq_lens_cpu = nxt_kv_lens_cpu
