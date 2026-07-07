@@ -80,6 +80,7 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
 from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
+from sglang.srt.layers.quantization.unquant import initialize_bf16_gemm_config
 from sglang.srt.lora.lora_drainer import LoRADrainer
 from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
@@ -757,6 +758,7 @@ class Scheduler(
         # Initialize GEMM-related configuration for FP8 and FP4 backends.
         initialize_fp8_gemm_config(self.server_args)
         initialize_fp4_gemm_config(self.server_args)
+        initialize_bf16_gemm_config(self.server_args)
 
         # This must be called after initialize_moe_config
         self.require_mlp_sync = require_mlp_sync(self.server_args)
@@ -2757,7 +2759,7 @@ class Scheduler(
             for req in ready_grammar_requests:
                 self._add_request_to_queue(req)
 
-        if self.enable_hierarchical_cache:
+        if self.enable_hierarchical_cache or self.server_args.enable_flexkv:
             self.tree_cache.check_hicache_events()
 
         if self.enable_priority_preemption or self.is_hybrid_swa:
@@ -3920,6 +3922,9 @@ class Scheduler(
             for req in self.disagg_prefill_bootstrap_queue.queue:
                 if recv_req.abort_all or req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort bootstrap queue request. {req.rid=}")
+                    if self.enable_hicache_storage:
+                        self.tree_cache.release_aborted_request(req.rid)
+
                     if hasattr(req.disagg_kv_sender, "abort"):
                         req.disagg_kv_sender.abort()
 
