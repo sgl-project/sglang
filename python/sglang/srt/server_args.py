@@ -2596,6 +2596,10 @@ class ServerArgs:
             nargs="*",
         ),
     ] = None
+    custom_pull_weights_pre_read_hook: A[
+        Optional[str],
+        "Import path of hook(source_dir, target_version) called before /pull_weights reads shared storage.",
+    ] = None
     weight_loader_disable_mmap: A[
         bool,
         "Disable mmap while loading weight using safetensors.",
