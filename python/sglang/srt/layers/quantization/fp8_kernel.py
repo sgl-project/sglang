@@ -905,7 +905,6 @@ def _w8a8_block_fp8_matmul(
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
     needs_masking: tl.constexpr,
-    UPCAST_FP8: tl.constexpr = False,
 ):
     """Triton-accelerated function used to perform linear operations (dot
     product) on input tensors `A` and `B` with block-wise quantization, and store the result in output
@@ -941,11 +940,6 @@ def _w8a8_block_fp8_matmul(
         else:
             a = tl.load(a_ptrs)
             b = tl.load(b_ptrs)
-
-        if UPCAST_FP8:
-            # gfx1250: tl.dot on fp8 operands is miscompiled; upcast to bf16.
-            a = a.to(tl.bfloat16)
-            b = b.to(tl.bfloat16)
 
         a_s = tl.load(As_ptrs)
         b_s = tl.load(Bs_ptrs)
@@ -1003,7 +997,6 @@ def _w8a8_block_fp8_matmul_unrolledx4(
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
     needs_masking: tl.constexpr,
-    UPCAST_FP8: tl.constexpr = False,
 ):
     """Triton-accelerated function used to perform linear operations (dot
     product) on input tensors `A` and `B` with block-wise quantization, and store the result in output
@@ -1307,6 +1300,39 @@ def w8a8_block_fp8_matmul_deepgemm(
     return C
 
 
+def _w8a8_block_fp8_matmul_bf16_dequant(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    As: torch.Tensor,
+    Bs: torch.Tensor,
+    block_size: List[int],
+    output_dtype: torch.dtype,
+) -> torch.Tensor:
+    """
+    gfx1250 fallback for the block-fp8 matmul.
+    """
+    assert (
+        As.dtype == torch.float and Bs.dtype == torch.float
+    ), f"gfx1250 bf16 dequant path expects float block scales, got {As.dtype=} {Bs.dtype=}"
+    block_n, block_k = block_size
+    N, K = B.shape
+    out_shape = A.shape[:-1] + (N,)
+    A2 = A.reshape(-1, K)
+
+    # Dequant activation: As is (M, cdiv(K, block_k)), row-major.
+    As_full = As.repeat_interleave(block_k, dim=1)[:, :K]
+    A_deq = (A2.to(torch.float32) * As_full).to(torch.bfloat16)
+
+    # Dequant weight: Bs is (cdiv(N, block_n), cdiv(K, block_k)).
+    Bs_full = Bs.repeat_interleave(block_n, dim=0).repeat_interleave(block_k, dim=1)[
+        :N, :K
+    ]
+    B_deq = (B.to(torch.float32) * Bs_full).to(torch.bfloat16)
+
+    C = torch.matmul(A_deq, B_deq.t())
+    return C.to(output_dtype).reshape(out_shape)
+
+
 def w8a8_block_fp8_matmul_triton(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -1332,6 +1358,12 @@ def w8a8_block_fp8_matmul_triton(
         torch.Tensor: The result of matmul.
     """
 
+    if _is_gfx1250:
+        # gfx1250: the triton block-fp8 kernel is unusable
+        return _w8a8_block_fp8_matmul_bf16_dequant(
+            A, B, As, Bs, block_size, output_dtype
+        )
+
     M, N, K, C = prepare_block_fp8_matmul_inputs(A, B, As, Bs, block_size, output_dtype)
 
     block_n, block_k = block_size
@@ -1352,11 +1384,6 @@ def w8a8_block_fp8_matmul_triton(
             "num_warps": 4,
             "num_stages": 3,
         }
-
-    if _is_gfx1250:
-        # gfx1250: triton software pipelining (num_stages > 1) miscompiles this
-        # kernel and produces NaN. Force a single stage on this arch.
-        config = {**config, "num_stages": 1}
 
     needs_masking = bool(K % config["BLOCK_SIZE_K"] != 0)
 
@@ -1390,7 +1417,6 @@ def w8a8_block_fp8_matmul_triton(
         Bs.stride(0),
         **config,
         needs_masking=needs_masking,
-        UPCAST_FP8=_is_gfx1250,
     )
 
     return C
