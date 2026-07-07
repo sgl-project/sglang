@@ -13,6 +13,7 @@ from sglang.jit_kernel.dsa import (
     cutedsl_paged_mqa_logits,
     deepgemm_paged_mqa_logits_native,
     deepgemm_paged_mqa_logits_split,
+    pick_dsl_expand,
 )
 from sglang.jit_kernel.fused_store_index_cache import (
     can_use_dsa_fused_store,
@@ -842,6 +843,20 @@ class Indexer(MultiPlatformOp):
             self.paged_mqa_logits_backend.is_cutedsl()
             and not forward_batch.forward_mode.is_draft_extend_v2()
         )
+        dsl_expand_factor, dsl_atom = 1, 1
+        if (
+            use_cute_dsl
+            and forward_batch.forward_mode.is_target_verify()
+            and next_n >= 2
+        ):
+            dsl_expand_factor, dsl_atom = pick_dsl_expand(
+                next_n,
+                batch_size=B,
+                max_ctx=max_seq_len,
+                num_sms=self.sm_count,
+                kernel_atoms=(1, 2, 3, 4),
+                num_heads=self.n_heads,
+            )
         ctx_2d = getattr(metadata, "paged_mqa_ctx_lens_2d", None)
         use_dg_native = (
             not use_cute_dsl
@@ -898,8 +913,8 @@ class Indexer(MultiPlatformOp):
                 B=B,
                 next_n=next_n,
                 is_target_verify=forward_batch.forward_mode.is_target_verify(),
-                dsl_expand_factor=getattr(metadata, "dsl_expand_factor", 1),
-                dsl_atom=getattr(metadata, "dsl_atom", 1),
+                dsl_expand_factor=dsl_expand_factor,
+                dsl_atom=dsl_atom,
                 blocksize=blocksize,
                 sm_count=self.sm_count,
                 get_paged_mqa_logits_metadata_fn=deep_gemm.get_paged_mqa_logits_metadata,

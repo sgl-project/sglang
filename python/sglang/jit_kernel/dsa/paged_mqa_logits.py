@@ -129,8 +129,14 @@ def cutedsl_paged_mqa_logits(
             ctx_lens_1d.unsqueeze(-1), blocksize, sm_count
         )
     elif is_target_verify and next_n >= 2:
+        # Native single-launch: one task per batch entry (the kernel iterates
+        # next_n internally), so the schedule must be built from B-length
+        # context lens, not the caller's [B, next_n] or per-token layout.
         q_dsl = q_fp8[:q_offset].view(B, next_n, q_fp8.shape[1], q_fp8.shape[2])
         block_tables_dsl = block_tables[::next_n]
+        schedule_metadata = get_paged_mqa_logits_metadata_fn(
+            ctx_lens_1d.unsqueeze(-1), blocksize, sm_count
+        )
     else:
         q_dsl = q_fp8[:q_offset].unsqueeze(1)
         block_tables_dsl = block_tables[:B]
