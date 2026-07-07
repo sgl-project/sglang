@@ -364,6 +364,11 @@ class ZImagePipelineConfig(ZImageRolloutPipelineMixin, ImagePipelineConfig):
         Batched prompts use stored text lengths. SP mode builds image caches for
         the local spatial shard.
         """
+        if rotary_emb is None:
+            raise ValueError(
+                "Z-Image transformer has no `rotary_emb`. It likely loaded via the "
+                "native diffusers fallback; check the load logs for the real error."
+            )
 
         def create_coordinate_grid(size, start=None, device=None):
             if start is None:
