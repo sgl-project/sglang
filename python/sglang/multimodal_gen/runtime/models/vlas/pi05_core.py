@@ -12,7 +12,6 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from transformers.modeling_outputs import BaseModelOutputWithPooling
 from transformers.models.auto import CONFIG_MAPPING
-from transformers.models.gemma import modeling_gemma
 
 from sglang.multimodal_gen.configs.pipeline_configs.pi05 import Pi05PipelineConfig
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
@@ -21,6 +20,7 @@ from sglang.multimodal_gen.runtime.models.vlas.pi05_pigemma import (
     PiGemmaForCausalLM,
     gated_residual,
     layernorm_forward,
+    native_apply_rotary_pos_emb,
 )
 
 OPENPI_ATTENTION_MASK_VALUE = -2.3819763e38
@@ -214,21 +214,24 @@ def compute_layer_complete(
         dtype=query_states.dtype,
     )
     cos, sin = rotary_emb(dummy_tensor, position_ids)
-    query_states, key_states = modeling_gemma.apply_rotary_pos_emb(
-        query_states, key_states, cos, sin, unsqueeze_dim=1
-    )
-    paligemma_layer = layers[0]
-    att_output, _ = modeling_gemma.eager_attention_forward(
-        paligemma_layer.self_attn,
+    query_states, key_states = native_apply_rotary_pos_emb(
         query_states,
         key_states,
-        value_states,
-        attention_mask,
-        paligemma_layer.self_attn.scaling,
+        cos,
+        sin,
+        unsqueeze_dim=1,
+    )
+    paligemma_layer = layers[0]
+    att_output = paligemma_layer.self_attn.attn(
+        query_states.transpose(1, 2),
+        key_states.transpose(1, 2),
+        value_states.transpose(1, 2),
+        attn_mask=attention_mask,
     )
     batch_size = query_states.shape[0]
     head_dim = paligemma_layer.self_attn.head_dim
-    att_output = att_output.reshape(batch_size, -1, 8 * head_dim)
+    hidden_size = paligemma_layer.self_attn.num_heads * head_dim
+    att_output = att_output.reshape(batch_size, -1, hidden_size)
 
     outputs_embeds = []
     start_pos = 0

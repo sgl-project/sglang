@@ -10,12 +10,10 @@ from transformers.masking_utils import create_causal_mask
 from transformers.modeling_layers import GradientCheckpointingLayer
 from transformers.modeling_outputs import BaseModelOutputWithPast
 from transformers.models.gemma.modeling_gemma import (
-    GemmaAttention,
     GemmaConfig,
     GemmaForCausalLM,
     GemmaMLP,
     GemmaModel,
-    apply_rotary_pos_emb,
 )
 from transformers.models.paligemma.modeling_paligemma import (
     PaliGemmaForConditionalGeneration,
@@ -24,6 +22,9 @@ from transformers.models.paligemma.modeling_paligemma import (
 
 from sglang.multimodal_gen.runtime.layers.attention import LocalAttention
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.srt.layers.rotary_embedding import (
+    apply_rotary_pos_emb as native_apply_rotary_pos_emb,
+)
 
 
 def config_compute_dtype(config: GemmaConfig) -> torch.dtype | None:
@@ -97,10 +98,44 @@ class PiGemmaRMSNorm(nn.Module):
         return normed.to(dtype), gate.to(dtype)
 
 
-class PiGemmaAttention(GemmaAttention):
+class PiGemmaAttention(nn.Module):
     def __init__(self, config: GemmaConfig, layer_idx: int):
-        super().__init__(config=config, layer_idx=layer_idx)
-        self.native_attn = LocalAttention(
+        super().__init__()
+        self.config = config
+        self.layer_idx = layer_idx
+        self.head_dim = getattr(
+            config,
+            "head_dim",
+            config.hidden_size // config.num_attention_heads,
+        )
+        self.num_heads = config.num_attention_heads
+        self.num_key_value_heads = config.num_key_value_heads
+        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
+        self.scaling = self.head_dim**-0.5
+        self.attention_dropout = config.attention_dropout
+        self.is_causal = not getattr(config, "use_bidirectional_attention", False)
+
+        self.q_proj = nn.Linear(
+            config.hidden_size,
+            self.num_heads * self.head_dim,
+            bias=config.attention_bias,
+        )
+        self.k_proj = nn.Linear(
+            config.hidden_size,
+            self.num_key_value_heads * self.head_dim,
+            bias=config.attention_bias,
+        )
+        self.v_proj = nn.Linear(
+            config.hidden_size,
+            self.num_key_value_heads * self.head_dim,
+            bias=config.attention_bias,
+        )
+        self.o_proj = nn.Linear(
+            self.num_heads * self.head_dim,
+            config.hidden_size,
+            bias=config.attention_bias,
+        )
+        self.attn = LocalAttention(
             num_heads=config.num_attention_heads,
             head_size=self.head_dim,
             num_kv_heads=config.num_key_value_heads,
@@ -132,11 +167,12 @@ class PiGemmaAttention(GemmaAttention):
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
         cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(
+        query_states, key_states = native_apply_rotary_pos_emb(
             query_states,
             key_states,
             cos,
             sin,
+            unsqueeze_dim=1,
         )
 
         if past_key_values is not None:
@@ -148,7 +184,7 @@ class PiGemmaAttention(GemmaAttention):
                 cache_kwargs,
             )
 
-        attn_output = self.native_attn(
+        attn_output = self.attn(
             query_states.transpose(1, 2),
             key_states.transpose(1, 2),
             value_states.transpose(1, 2),

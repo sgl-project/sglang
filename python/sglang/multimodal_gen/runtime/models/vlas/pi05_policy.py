@@ -24,6 +24,7 @@ from sglang.multimodal_gen.runtime.loader.utils import (
     set_default_torch_dtype,
     skip_init_modules,
 )
+from sglang.multimodal_gen.runtime.loader.weight_load_plan import WeightLoadPlan
 from sglang.multimodal_gen.runtime.loader.weight_utils import (
     safetensors_weights_iterator,
 )
@@ -597,17 +598,19 @@ class Pi05PolicyModel(nn.Module):
         unexpected = 0
         mismatched = 0
         stream_to_gpu = self._should_stream_weights_to_gpu(target_state)
+        checkpoint_load_device = self.device if stream_to_gpu else torch.device("cpu")
+        weight_load_plan = WeightLoadPlan(checkpoint_load_device=checkpoint_load_device)
         if stream_to_gpu:
             logger.info(
                 "Pi05 weight load streams safetensors directly to %s",
-                self.device,
+                weight_load_plan.checkpoint_load_device,
             )
 
         with torch.no_grad():
             if stream_to_gpu:
                 weights = safetensors_weights_iterator(
                     self.manifest.safetensor_files,
-                    to_cpu=False,
+                    weight_load_plan=weight_load_plan,
                     key_filter=self._should_read_source_key,
                     clone_streamed_tensors=False,
                 )
