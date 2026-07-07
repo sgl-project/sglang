@@ -224,6 +224,38 @@ class OpenAIServingBase(ABC):
         )
         return ORJSONResponse(content=error.model_dump(), status_code=status_code)
 
+    def create_error_response_for_stream_kickstart(
+        self, exc: Exception
+    ) -> ORJSONResponse:
+        """Map a pre-first-chunk exception to a real HTTP error response.
+
+        Called from the streaming kickstart (in ``serving_chat`` /
+        ``serving_completions``) after ``await generator.__anext__()``
+        raises. Because headers haven't been sent yet we can still return
+        a proper HTTP status instead of a 200 with an SSE-body error
+        payload. Once the first chunk has been yielded, mid-stream errors
+        must go through ``create_streaming_error_response`` instead.
+
+        Mapping:
+        - ``HTTPException`` — preserve ``status_code`` and ``detail``. Lets
+          the engine surface 429 / 503 / 504 with their real status.
+        - ``ValueError`` — 400 (unchanged from prior behavior).
+        - Any other exception — 500 InternalServerError.
+        """
+        if isinstance(exc, HTTPException):
+            return self.create_error_response(
+                message=str(exc.detail),
+                err_type=exc.__class__.__name__,
+                status_code=exc.status_code,
+            )
+        if isinstance(exc, ValueError):
+            return self.create_error_response(str(exc))
+        return self.create_error_response(
+            message=str(exc),
+            err_type="InternalServerError",
+            status_code=500,
+        )
+
     def create_streaming_error_response(
         self,
         message: str,
