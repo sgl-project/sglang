@@ -219,6 +219,11 @@ def is_musa() -> bool:
 
 
 @lru_cache(maxsize=1)
+def is_supa() -> bool:
+    return hasattr(torch, "supa") and torch.supa.is_available()
+
+
+@lru_cache(maxsize=1)
 def is_mps() -> bool:
     return torch.backends.mps.is_available()
 
@@ -888,6 +893,11 @@ def get_device(device_id: Optional[int] = None) -> str:
             return "musa"
         return "musa:{}".format(device_id)
 
+    if is_supa():
+        if device_id is None:
+            return "supa"
+        return "supa:{}".format(device_id)
+
     if is_mps():
         if device_id is None:
             return "mps"
@@ -897,13 +907,13 @@ def get_device(device_id: Optional[int] = None) -> str:
         return current_platform.get_device(device_id)
     except Exception:
         raise RuntimeError(
-            "No accelerator (CUDA, XPU, HPU, NPU, MUSA, MPS) or platform plugin is available."
+            "No accelerator (CUDA, XPU, HPU, NPU, MUSA, SUPA, MPS) or platform plugin is available."
         )
 
 
 @lru_cache(maxsize=1)
 def get_device_count() -> int:
-    if (hasattr(torch, "cuda") and torch.cuda.is_available()) or is_musa():
+    if (hasattr(torch, "cuda") and torch.cuda.is_available()) or is_musa() or is_supa():
         try:
             return torch.cuda.device_count()
         except RuntimeError:
@@ -928,7 +938,7 @@ def get_device_count() -> int:
 
 
 def get_device_core_count(device_id: int = 0) -> int:
-    if (hasattr(torch, "cuda") and torch.cuda.is_available()) or is_musa():
+    if (hasattr(torch, "cuda") and torch.cuda.is_available()) or is_musa() or is_supa():
         return torch.cuda.get_device_properties(device_id).multi_processor_count
     elif hasattr(torch, "xpu") and torch.xpu.is_available():
         return torch.xpu.get_device_properties(device_id).gpu_eu_count
@@ -938,7 +948,7 @@ def get_device_core_count(device_id: int = 0) -> int:
 
 def get_device_capability(device_id: int = 0) -> Tuple[int, int]:
     major, minor = None, None
-    if (hasattr(torch, "cuda") and torch.cuda.is_available()) or is_musa():
+    if (hasattr(torch, "cuda") and torch.cuda.is_available()) or is_musa() or is_supa():
         major, minor = torch.cuda.get_device_capability(device_id)
 
     if hasattr(torch, "xpu") and torch.xpu.is_available():
