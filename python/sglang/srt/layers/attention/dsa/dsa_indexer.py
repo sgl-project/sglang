@@ -68,6 +68,11 @@ _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_fp8_fnuz = is_fp8_fnuz()
 _is_gfx95_supported = is_gfx95_supported()
+# Opt-in (gfx950): fuse the indexer q/k rope + k-norm + fp8 quant + index-K cache
+# store into aiter's indexer_qk_rope_quant_and_cache (ONE kernel). Collapses the
+# fragmented rope + act_quant + k_quant_and_cache (+ k-norm) launches into a single
+# kernel on the eager extend/prefill path. Enable with SGLANG_DSA_FUSE_INDEXER_QK=1.
+_DSA_FUSE_INDEXER_QK = get_bool_env_var("SGLANG_DSA_FUSE_INDEXER_QK")
 # Whether the aiter preshuffle paged-MQA path (page_size=64 + Preshuffle=True +
 # KVBlockSize=64) can be used. Falls back to the legacy page_size=1 / KVBlockSize=1
 # path when the gluon kernel is unavailable (Triton<3.5 and no AOT bundle).
@@ -86,6 +91,13 @@ if _is_cuda:
 
 if _use_aiter:
     from aiter.ops.cache import indexer_k_quant_and_cache
+
+    try:
+        from aiter import indexer_qk_rope_quant_and_cache
+    except ImportError:
+        indexer_qk_rope_quant_and_cache = None
+else:
+    indexer_qk_rope_quant_and_cache = None
 
 if is_npu():
     import torch_npu
@@ -445,6 +457,21 @@ class Indexer(MultiPlatformOp):
             device=get_global_server_args().device,
         )
         self.block_size = block_size
+        # Opt-in (gfx950): fuse q/k rope + k-norm + fp8 quant + index-K store into
+        # one aiter kernel (indexer_qk_rope_quant_and_cache) on the eager extend
+        # path; mutually exclusive with the full DSA indexer fusion split op.
+        self.fuse_indexer_qk = (
+            _DSA_FUSE_INDEXER_QK
+            and _is_hip
+            and _is_gfx95_supported
+            and not self.use_dsa_indexer_fusion
+            and indexer_qk_rope_quant_and_cache is not None
+        )
+        # Lazily-built [max_pos, rope/2] on-device cos/sin for the fused indexer
+        # kernel (aiter stores them 4D as [max_pos, 1, 1, rope/2] and only migrates
+        # them to GPU inside rotary_emb.forward, which the fused path bypasses).
+        self._fused_indexer_cos_2d = None
+        self._fused_indexer_sin_2d = None
         self.scale_fmt = scale_fmt
         self.softmax_scale = self.head_dim**-0.5
         self.num_init_tokens = self.num_local_tokens = 0
@@ -537,6 +564,74 @@ class Indexer(MultiPlatformOp):
             max_kv_len = forward_batch.seq_lens_cpu.max().item()
             return max_kv_len <= self.index_topk
         return False
+
+    def _fused_indexer_qk_prepare_and_store(
+        self,
+        q_lora: torch.Tensor,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+    ):
+        # One aiter kernel: q/k rope + k-norm + fp8 quant + index-K cache store
+        # (indexer_qk_rope_quant_and_cache). Returns q_fp8 [L,H,D] and the fully
+        # scaled weights [L,H,1]; writes the FP8 index-K cache in place.
+        query, _ = self.wq_b(q_lora)
+        query = rearrange(query, "l (h d) -> l h d", d=self.head_dim)
+        key, _ = self.wk(x)
+        weights, _ = self.weights_proj(x)
+        q_fp8 = torch.empty_like(query, dtype=fp8_dtype)
+        weights_out = torch.empty(
+            weights.shape, device=weights.device, dtype=torch.float32
+        )
+        pool = get_token_to_kv_pool()
+        page_size = pool.page_size
+        kv_cache = (
+            pool.get_index_k_with_scale_buffer(layer_id=layer_id)
+            .view(-1, page_size, 132)
+            .view(fp8_dtype)
+        )
+        out_loc = forward_batch.out_cache_loc
+        if not out_loc.is_contiguous():
+            out_loc = out_loc.contiguous()
+        weights_scale = self.n_heads**-0.5 * self.softmax_scale
+        cos_2d, sin_2d = self._fused_indexer_cos_sin_2d(query.device)
+        indexer_qk_rope_quant_and_cache(
+            query,
+            q_fp8,
+            weights,
+            weights_out,
+            key,
+            kv_cache,
+            out_loc,
+            self.k_norm.weight,
+            self.k_norm.bias,
+            positions,
+            cos_2d,
+            sin_2d,
+            self.k_norm.variance_epsilon,
+            self.block_size,
+            self.scale_fmt,
+            weights_scale,
+            preshuffle=_use_aiter_preshuffle,
+            is_neox=self.rotary_emb.is_neox_style,
+        )
+        return q_fp8, weights_out.unsqueeze(-1)
+
+    def _fused_indexer_cos_sin_2d(self, device: torch.device):
+        # indexer_qk_rope_quant_and_cache wants cos/sin as [max_pos, rope/2] on the
+        # query's device; the rope wrapper keeps them 4D ([max_pos, 1, 1, rope/2])
+        # and only migrates them to GPU inside forward, which this fused path skips.
+        # Reshape + move once.
+        if self._fused_indexer_cos_2d is None:
+            mp = self.rotary_emb.cos_cache.shape[0]
+            self._fused_indexer_cos_2d = (
+                self.rotary_emb.cos_cache.reshape(mp, -1).to(device).contiguous()
+            )
+            self._fused_indexer_sin_2d = (
+                self.rotary_emb.sin_cache.reshape(mp, -1).to(device).contiguous()
+            )
+        return self._fused_indexer_cos_2d, self._fused_indexer_sin_2d
 
     def _get_q_k_bf16(
         self,
@@ -1814,6 +1909,23 @@ class Indexer(MultiPlatformOp):
             )
             return maybe_capture_indexer_topk(layer_id, result)
 
+        elif (
+            self.fuse_indexer_qk
+            and forward_batch.forward_mode.is_extend()
+            and not forward_batch.forward_mode.is_target_verify()
+            and not forward_batch.forward_mode.is_draft_extend_v2()
+            and not in_piecewise_or_breakable_cuda_graph
+            and forward_batch.attn_cp_metadata is None
+            and not enable_dual_stream
+            and not weights_proj_lora
+            and not isinstance(x, tuple)
+        ):
+            # Eager extend/prefill only (not graph-captured): fuse the indexer q/k
+            # rope + k-norm + quant + index-K store into one kernel. Decode/verify/
+            # draft (CUDA-graph) still use the fragmented path below.
+            q_fp8, weights = self._fused_indexer_qk_prepare_and_store(
+                q_lora, x, positions, forward_batch, layer_id
+            )
         elif enable_dual_stream and forward_batch.forward_mode.is_decode_or_idle():
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
