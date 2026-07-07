@@ -114,6 +114,17 @@ class MemoryPoolConfigurator:
     ) -> MemoryPoolConfig:
         return config
 
+    def largest_registered_kv_region_bytes_per_token(self) -> int:
+        """Upper bound, per unit of max_total_num_tokens, on the byte size of
+        the largest single KV region that a disagg transfer backend registers
+        as one RDMA memory region.
+
+        Returns 0 ("no known bound") so callers skip clamping. Only
+        architectures whose per-region registration can exceed a backend's
+        single-MR ceiling override this.
+        """
+        return 0
+
 
 class DefaultPoolConfigurator(MemoryPoolConfigurator):
     """Configurator for standard models: MHA, MLA, DSA, FP4.
@@ -647,6 +658,21 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             * c4_indexer_state_bytes
             * self.num_layers_ca4
         )
+
+    def largest_registered_kv_region_bytes_per_token(self) -> int:
+        # Registered kv_data regions are per-layer compressed KV buffers (see
+        # DeepSeekV4TokenToKVPool.get_contiguous_buf_infos). The largest is a
+        # C4 layer: with the unified bf16 layout each compressed row is
+        # head_dim*2 bytes over ~max_total_num_tokens/ratio rows, i.e.
+        # (head_dim*2 / ratio) * max_total_num_tokens. The smallest (densest)
+        # compress ratio dominates. This also upper-bounds the packed-FP8
+        # non-unified layout (< head_dim*2 bytes per compressed token).
+        if not self.compression_ratios:
+            return 0
+        head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+        min_ratio = min(self.compression_ratios)
+        bf16_bytes = 2
+        return (head_dim * bf16_bytes + min_ratio - 1) // min_ratio
 
     def _compute_dsv4_sizes(self, full_token: int, page_size: int) -> _DSV4PoolSizes:
         full_token = full_token // page_size * page_size

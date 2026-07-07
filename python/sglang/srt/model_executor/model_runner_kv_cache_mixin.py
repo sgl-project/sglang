@@ -1222,6 +1222,49 @@ class ModelRunnerKVCacheMixin:
 
         return token_capacity
 
+    def _apply_mori_mr_limit(
+        self: ModelRunner, token_capacity: int, configurator
+    ) -> int:
+        """Clamp token capacity so no single KV region exceeds MORI's RDMA
+        single-MR byte limit.
+
+        DeepSeek-V4 disagg auto-sizing can grow one unified C4 KV region past
+        ibv_reg_mr's ~4 GiB single-registration ceiling; MORI then fails
+        RegisterRdmaMemoryRegion with errno=22 (EINVAL) and the PD path never
+        serves. Keep the largest region strictly below SGLANG_MORI_MAX_MR_BYTES.
+        No-op unless this is a MORI-backed disaggregation worker.
+        """
+        if self.server_args.disaggregation_mode == "null":
+            return token_capacity
+        if self.server_args.disaggregation_transfer_backend != "mori":
+            return token_capacity
+
+        per_token_bytes = configurator.largest_registered_kv_region_bytes_per_token()
+        if per_token_bytes <= 0:
+            return token_capacity
+
+        limit = envs.SGLANG_MORI_MAX_MR_BYTES.get()
+        if limit <= 0:
+            return token_capacity
+
+        # Strictly below the limit, minus one page of tokens to absorb the
+        # per-buffer page rounding applied in get_contiguous_buf_infos.
+        max_tokens = (limit - 1) // per_token_bytes - self.server_args.page_size
+        if max_tokens <= 0 or token_capacity <= max_tokens:
+            return token_capacity
+
+        logger.warning(
+            "MORI single-MR cap: clamping max_total_num_tokens %d -> %d "
+            "(largest KV region ~%d bytes/token, SGLANG_MORI_MAX_MR_BYTES=%d "
+            "= %.2f GiB). Raise the env if the NIC/driver supports larger MRs.",
+            token_capacity,
+            max_tokens,
+            per_token_bytes,
+            limit,
+            limit / (1 << 30),
+        )
+        return max_tokens
+
     def _resolve_max_num_reqs(self: ModelRunner, token_capacity: int) -> int:
         """Compute max concurrent requests (per dp worker) from the finalized
         token capacity."""
@@ -1308,6 +1351,8 @@ class ModelRunnerKVCacheMixin:
 
         # Apply external constraints (user cap, page alignment, PP sync)
         constrained = self._apply_token_constraints(config.max_total_num_tokens)
+        # Clamp so a single KV region stays within MORI's RDMA MR size limit.
+        constrained = self._apply_mori_mr_limit(constrained, configurator)
         if constrained != config.max_total_num_tokens:
             config = configurator.calculate_pool_sizes_from_max_tokens(
                 constrained, page_size

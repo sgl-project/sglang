@@ -472,6 +472,14 @@ class Envs:
     # Per-transfer SLA (ms) before a KV transfer is failed; 0 disables the SLA
     # and relies on the RDMA retry-exceeded timeout only.
     SGLANG_MORI_TRANSFER_TIMEOUT_MS = EnvInt(0)
+    # Upper bound (bytes) on a single KV memory region registered with MORI's
+    # RDMA backend. DeepSeek-V4 disagg auto-sizing can grow one unified C4 KV
+    # region past ibv_reg_mr's ~4 GiB single-registration ceiling, which makes
+    # RegisterRdmaMemoryRegion fail with errno=22 (EINVAL) so the PD path never
+    # serves. When the profiled pool would exceed this, max_total_num_tokens is
+    # clamped so the largest region fits. Default 4 GiB (the 2**32 boundary);
+    # lower it if your NIC/driver caps MRs smaller, or set <= 0 to disable.
+    SGLANG_MORI_MAX_MR_BYTES = EnvInt(4 * 1024 * 1024 * 1024)
 
     # AMD & ROCm
     SGLANG_USE_AITER = EnvBool(False)
