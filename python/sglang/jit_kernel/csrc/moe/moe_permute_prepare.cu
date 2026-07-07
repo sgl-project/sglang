@@ -14,7 +14,6 @@ limitations under the License.
 ==============================================================================*/
 
 #include "tvm_ffi_utils.h"
-
 #include <algorithm>
 #include <cuda_runtime.h>
 #include <limits>
@@ -22,8 +21,7 @@ limitations under the License.
 namespace sglang {
 
 // Binary search: find first index where data[index] >= target.
-__device__ __forceinline__ int32_t lower_bound(
-    const int32_t* __restrict__ data, int32_t n, int32_t target) {
+__device__ __forceinline__ int32_t lower_bound(const int32_t* __restrict__ data, int32_t n, int32_t target) {
   int32_t lo = 0, hi = n;
   while (lo < hi) {
     int32_t mid = lo + (hi - lo) / 2;
@@ -110,8 +108,7 @@ void moe_permute_prepare(
   int32_t numel = static_cast<int32_t>(sorted_topk_ids.size(0));
   int32_t num_experts_i32 = static_cast<int32_t>(num_experts);
   constexpr int threads = 256;
-  int num_blocks =
-      std::max(1, (std::max(numel, num_experts_i32 + 1) + threads - 1) / threads);
+  int num_blocks = std::max(1, (std::max(numel, num_experts_i32 + 1) + threads - 1) / threads);
 
   sglang::moe_permute_prepare_kernel<<<num_blocks, threads, 0, stream>>>(
       static_cast<const int32_t*>(sorted_topk_ids.data_ptr()),
@@ -124,8 +121,7 @@ void moe_permute_prepare(
       is_ep);
 
   cudaError_t err = cudaGetLastError();
-  TVM_FFI_ICHECK(err == cudaSuccess)
-      << "moe_permute_prepare launch failed: " << cudaGetErrorString(err);
+  TVM_FFI_ICHECK(err == cudaSuccess) << "moe_permute_prepare launch failed: " << cudaGetErrorString(err);
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(moe_permute_prepare, moe_permute_prepare);
