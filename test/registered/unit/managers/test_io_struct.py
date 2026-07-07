@@ -1,7 +1,7 @@
 import copy
 import unittest
 
-from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.managers.io_struct import AbortReq, GenerateReqInput
 from sglang.test.ci.ci_register import (
     register_amd_ci,
     register_cpu_ci,
@@ -618,6 +618,33 @@ class TestGenerateReqInputNormalization(CustomTestCase):
                 text="Hello", input_ids=[1, 2, 3], input_embeds=[[0.1, 0.2]]
             )
             req.normalize_batch_and_arguments()
+
+
+class TestAbortReqMatches(CustomTestCase):
+    """`AbortReq.matches` — prefix (Python batch) vs exact (Rust frontend) rids."""
+
+    def test_prefix_mode_is_default(self):
+        # Python frontend: a batch abort `<uuid>` targets its `<uuid>_<idx>` subs.
+        req = AbortReq(rid="abc123")
+        self.assertTrue(req.matches("abc123"))
+        self.assertTrue(req.matches("abc123_0"))
+        self.assertTrue(req.matches("abc123_17"))
+        self.assertFalse(req.matches("def456"))
+
+    def test_exact_mode_no_prefix_collision(self):
+        # Rust frontend: monotonic u64 rids. Aborting "7" must NOT hit "70"/"71".
+        req = AbortReq(rid="7")
+        self.assertTrue(req.matches("7", exact=True))
+        self.assertFalse(req.matches("70", exact=True))
+        self.assertFalse(req.matches("71", exact=True))
+        # Prefix mode (default) would wrongly match these — the bug being fixed.
+        self.assertTrue(req.matches("70", exact=False))
+
+    def test_abort_all_matches_regardless_of_mode(self):
+        req = AbortReq(abort_all=True, rid="")
+        for exact in (True, False):
+            self.assertTrue(req.matches("anything", exact=exact))
+            self.assertTrue(req.matches("", exact=exact))
 
 
 if __name__ == "__main__":
