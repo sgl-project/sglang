@@ -2456,6 +2456,18 @@ class HybridLinearKVPool(KVCache):
             k_size, v_size = self.get_kv_size_bytes()
             self.mem_usage = (k_size + v_size) / GB
 
+    @property
+    def kv_cache_layout(self):
+        # Expose the inner full-attention sub-pool's physical layout so the
+        # AITER backend's `_pool_is_vec5d` detection (and any other
+        # layout-aware caller) sees the SHUFFLE 5D layout through the hybrid
+        # wrapper. The full_kv_pool (MHATokenToKVPool) picks the layout up
+        # from SGLANG_AITER_KV_CACHE_LAYOUT in its own ctor; without this
+        # delegation the wrapper would always report the default "nhd" and
+        # pa_decode_gluon would never be enabled for hybrid (GDN + full-attn)
+        # models such as Qwen3.5-MoE.
+        return getattr(self.full_kv_pool, "kv_cache_layout", "nhd")
+
     def get_kv_size_bytes(self):
         return self.full_kv_pool.get_kv_size_bytes()
 
