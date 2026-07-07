@@ -857,7 +857,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Init ngram embedding token table
         self.maybe_init_ngram_embedding()
 
-        if self.enable_hisparse:
+        if self.enable_hisparse and not self.is_draft_worker:
             from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
             from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
