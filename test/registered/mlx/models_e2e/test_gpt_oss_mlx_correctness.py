@@ -40,7 +40,6 @@ import unittest
 
 import requests
 
-from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import (
@@ -59,12 +58,14 @@ _HAS_MLX = (
 )
 _SKIP_REASON = "requires mlx + mlx_lm (Apple Silicon only)"
 
-MODEL_PATH = envs.SGLANG_MLX_TEST_MODEL.get() or "mlx-community/gpt-oss-20b-MXFP4-Q8"
-MEM_FRACTION_STATIC = str(envs.SGLANG_MLX_TEST_MEM_FRACTION.get() or 0.9)
+MODEL_PATH = os.environ.get(
+    "SGLANG_MLX_TEST_MODEL", "mlx-community/gpt-oss-20b-MXFP4-Q8"
+)
+MEM_FRACTION_STATIC = os.environ.get("SGLANG_MLX_TEST_MEM_FRACTION", "0.9")
 # Skip (do NOT crash) unless this much system memory is free; an MLX Metal
 # OOM is uncatchable and can reboot the machine. ~12 GB suits the default
 # 20B MXFP4-Q8 repo (11 GB of weights).
-MIN_FREE_GB = envs.SGLANG_MLX_TEST_MIN_FREE_GB.get() or 12.0
+MIN_FREE_GB = float(os.environ.get("SGLANG_MLX_TEST_MIN_FREE_GB", "12"))
 
 # Filler that pushes every prompt past 128 tokens (the gpt-oss sliding
 # window) while staying far below 2048. The question at the end keeps greedy
