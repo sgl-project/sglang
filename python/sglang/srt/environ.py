@@ -24,35 +24,6 @@ def _default_hip() -> bool:
         return False
 
 
-@contextmanager
-def temp_set_env(*, allow_sglang: bool = False, **env_vars: Any):
-    """Temporarily set environment variables, restoring originals on exit.
-
-    By default, SGLANG_*/SGL_* keys are rejected — use ``Envs`` descriptors
-    for those.  Pass ``allow_sglang=True`` only for special env vars that
-    intentionally bypass ``environ.py``.
-    """
-    if not allow_sglang:
-        for key in env_vars:
-            if key.startswith("SGLANG_") or key.startswith("SGL_"):
-                raise ValueError("temp_set_env should not be used for sglang env vars")
-
-    backup = {key: os.environ.get(key) for key in env_vars}
-    try:
-        for key, value in env_vars.items():
-            if value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = str(value)
-        yield
-    finally:
-        for key, value in backup.items():
-            if value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = value
-
-
 class EnvField:
     _allow_set_name = True
 
@@ -659,9 +630,6 @@ class Envs:
     )
     SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC = EnvBool(False)
     SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK = EnvStr(None)
-    SGLANG_DSA_ENABLE_MTP_PRECOMPUTE_METADATA = EnvBoolWithAlias(
-        True, deprecated_name="SGLANG_NSA_ENABLE_MTP_PRECOMPUTE_METADATA"
-    )
     SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = EnvIntWithAlias(
         2048, deprecated_name="SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD"
     )
@@ -670,8 +638,6 @@ class Envs:
     )
     SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION = EnvFloat(0.2)
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
-    SGLANG_USE_FUSED_METADATA_COPY = EnvBool(True)
-    SGLANG_DSA_USE_FUSED_METADATA_GENERATION = EnvBool(True)
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
     SGLANG_DISABLE_DSA_INDEXER_FUSION = EnvBool(False)
 
@@ -859,6 +825,7 @@ class Envs:
 
     # Set False when using FP4-to-FP8 converted DeepSeek V4 checkpoint.
     SGLANG_DSV4_FP4_EXPERTS = EnvBool(True)
+    SGLANG_DSV4_FP4_DEQUANT = EnvBool(False)
     # Default reasoning_effort for dsv4 chat encoder when request doesn't set it.
     # Accepts "", "max", "high" (empty string means unset); other values filtered to None.
     SGLANG_DSV4_REASONING_EFFORT = EnvStr("")

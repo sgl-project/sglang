@@ -143,6 +143,10 @@ if _is_cuda:
 
 if _is_cpu:
     fused_sigmoid_mul = torch.ops.sgl_kernel.fused_sigmoid_mul_cpu
+    fused_qk_gemma_rmsnorm = torch.ops.sgl_kernel.fused_qk_gemma_rmsnorm_cpu
+    fused_qk_gemma_rmsnorm_with_gate = (
+        torch.ops.sgl_kernel.fused_qk_gemma_rmsnorm_with_gate_cpu
+    )
 
 if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import (
@@ -876,7 +880,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 k_by_head = k.reshape(-1, self.head_dim)
                 k_by_head = self.k_norm(k_by_head)
             current_stream.wait_stream(self.alt_stream)
-        elif _is_hip or _is_xpu:
+        elif _is_hip or _is_xpu or _is_cpu:
             q_by_head, k_by_head = fused_qk_gemma_rmsnorm(
                 q,
                 k,
@@ -1001,7 +1005,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 positions=positions,
                 hidden_states=hidden_states,
             )
-        elif (_is_hip or _is_xpu) and self.attn_output_gate:
+        elif (_is_hip or _is_xpu or _is_cpu) and self.attn_output_gate:
             q, k, v, gate = self.forward_prepare_fused_gate(
                 positions=positions,
                 hidden_states=hidden_states,
