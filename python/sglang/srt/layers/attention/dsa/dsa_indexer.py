@@ -909,11 +909,7 @@ class Indexer(MultiPlatformOp):
         )
         if dsl_atom_split:
             atom_split = getattr(metadata, "paged_mqa_atom_split", None)
-            assert atom_split is not None, (
-                "paged_mqa_atom_split metadata must be preprocessed per forward "
-                "batch (see DSAMetadata.paged_mqa_atom_split) -- fail loudly "
-                "rather than silently recompute it per layer."
-            )
+            assert atom_split is not None
             cute_dsl_ctx_lens, cute_dsl_block_table, cute_dsl_schedule_metadata = (
                 atom_split
             )
