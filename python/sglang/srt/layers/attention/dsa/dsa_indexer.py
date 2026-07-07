@@ -31,7 +31,7 @@ from sglang.srt.layers.attention.dsa.utils import (
     is_graph_dsa_split_op_surface,
 )
 from sglang.srt.layers.dp_attention import attn_tp_all_gather_into_tensor
-from sglang.srt.layers.layernorm import LayerNorm
+from sglang.srt.layers.layernorm import LayerNorm, RMSNorm
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
@@ -364,6 +364,7 @@ class Indexer(MultiPlatformOp):
         prefix: str = "",
         quant_config: Optional[QuantizationConfig] = None,
         alt_stream: Optional[torch.cuda.Stream] = None,
+        config=None,
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -425,9 +426,12 @@ class Indexer(MultiPlatformOp):
                 params_dtype=torch.bfloat16,
                 prefix=add_prefix("weights_proj", prefix),
             )
-        self.k_norm = LayerNorm(
-            self.head_dim, dtype=torch.bfloat16 if _use_aiter else torch.float32
-        )
+        if config is not None and getattr(config, "index_k_norm_type", "layer") == "rms":
+            self.k_norm = RMSNorm(self.head_dim)
+        else:
+            self.k_norm = LayerNorm(
+                self.head_dim, dtype=torch.bfloat16 if _use_aiter else torch.float32
+            )
         self.rotary_emb = get_rope_wrapper(
             rope_head_dim,
             rotary_dim=rope_head_dim,
@@ -440,6 +444,10 @@ class Indexer(MultiPlatformOp):
         self.block_size = block_size
         self.scale_fmt = scale_fmt
         self.softmax_scale = self.head_dim**-0.5
+        self.num_init_tokens = self.num_local_tokens = 0
+        if config is not None:
+            self.num_init_tokens = getattr(config, "index_init_tokens", 0)
+            self.num_local_tokens = getattr(config, "index_local_tokens", 0)
 
         self.paged_mqa_logits_backend = DSAPagedMQALogitsBackend.resolve(
             get_server_args().dsa_paged_mqa_logits_backend
@@ -786,6 +794,47 @@ class Indexer(MultiPlatformOp):
             return
         dst.copy_(src)
 
+    @staticmethod
+    def _pad_heads_for_deep_gemm(q_fp8, weights):
+        """Pad q and weights to 32 heads when num_heads < 32,
+        so that block_q = 128/num_heads doesn't exceed seq_len_alignment(4)."""
+        num_heads = q_fp8.shape[1]
+        if num_heads >= 32:
+            return q_fp8, weights, num_heads
+        target_heads = 32
+        q_fp8 = torch.nn.functional.pad(q_fp8, (0, 0, 0, target_heads - num_heads))
+        weights = torch.nn.functional.pad(weights, (0, target_heads - num_heads))
+        return q_fp8, weights, num_heads
+
+    def _mask_init_and_local_tokens(
+        self,
+        logits: torch.Tensor,
+        lengths: torch.Tensor,
+        row_starts: Optional[torch.Tensor] = None,
+    ):
+        if self.num_init_tokens == 0 and self.num_local_tokens == 0:
+            return logits
+        if row_starts is None:
+            row_starts = lengths.new_zeros(lengths.shape[0])
+        num_init_tokens = self.num_init_tokens
+        num_local_tokens = self.num_local_tokens
+        if num_init_tokens > 0:
+            init_idxs = torch.arange(
+                num_init_tokens, dtype=lengths.dtype, device=lengths.device
+            )[None, :] + row_starts[:, None]
+            init_idxs.clamp_max_(logits.shape[-1] - 1)
+            logits.scatter_(dim=1, index=init_idxs, value=float("inf"))
+        if num_local_tokens > 0:
+            local_idxs = (
+                lengths[:, None] - 1 + row_starts[:, None]
+                - torch.arange(
+                    num_local_tokens, dtype=lengths.dtype, device=lengths.device
+                )[None, :]
+            )
+            local_idxs.clamp_min_(0)
+            logits.scatter_(dim=1, index=local_idxs, value=float("inf"))
+        return logits
+
     def _get_topk_paged(
         self,
         forward_batch: ForwardBatch,
@@ -947,6 +996,7 @@ class Indexer(MultiPlatformOp):
             )
 
         # NOTE(dark): logits should be cleaned in topk_transform
+        self._mask_init_and_local_tokens(logits, seqlens_32)
         topk_result = metadata.topk_transform(logits, self.index_topk)
         # Restore possible padding exist in the hidden states.
         if not _is_hip and q_offset < q_fp8.shape[0]:
@@ -1121,10 +1171,13 @@ class Indexer(MultiPlatformOp):
                         clean_logits=False,
                     )
                 else:
+                    q_padded, w_padded, _ = self._pad_heads_for_deep_gemm(
+                        q_fp8[:q_offset], weights[:q_offset]
+                    )
                     logits = deep_gemm.fp8_mqa_logits(
-                        q_fp8[:q_offset],
+                        q_padded,
                         kv_fp8,
-                        weights[:q_offset],
+                        w_padded,
                         ks,
                         ke,
                         clean_logits=False,
@@ -1132,6 +1185,7 @@ class Indexer(MultiPlatformOp):
             assert logits.shape[0] == len(seq_lens_expanded)
             assert logits.shape[1] == k_offset
 
+            self._mask_init_and_local_tokens(logits, seq_lens_expanded, ks)
             raw_topk_result = metadata.topk_transform(logits, self.index_topk, ks=ks)
             topk_result[:q_offset] = raw_topk_result
             return topk_result
@@ -1173,16 +1227,22 @@ class Indexer(MultiPlatformOp):
                         clean_logits=False,
                     )
                 else:
+                    q_padded, w_padded, _ = self._pad_heads_for_deep_gemm(
+                        q_fp8[start:end], weights[start:end]
+                    )
                     logits_chunk = deep_gemm.fp8_mqa_logits(
-                        q_fp8[start:end],
+                        q_padded,
                         kv_fp8,
-                        weights[start:end],
+                        w_padded,
                         ks[start:end],
                         ke[start:end],
                         clean_logits=False,
                     )
 
             lengths_chunk = seq_lens_expanded[start:end]
+            self._mask_init_and_local_tokens(
+                logits_chunk, lengths_chunk, ks[start:end]
+            )
 
             # RAGGED: use global offset; PAGED: construct local cu_seqlens_q per chunk
             if global_topk_offset is not None:
@@ -1379,10 +1439,11 @@ class Indexer(MultiPlatformOp):
             ke = ks + ke_offset
             actual_seq_q = torch.cat(actual_seq_q_list, dim=0)
             with self._with_real_sm_count():
+                q_padded, w_padded, _ = self._pad_heads_for_deep_gemm(q_fp8, weights)
                 logits = deep_gemm.fp8_mqa_logits(
-                    q_fp8,
+                    q_padded,
                     kv_fp8,
-                    weights,
+                    w_padded,
                     ks,
                     ke,
                     clean_logits=False,
@@ -1425,10 +1486,11 @@ class Indexer(MultiPlatformOp):
             ke = ks + ke_offset
 
             with self._with_real_sm_count():
+                q_padded, w_padded, _ = self._pad_heads_for_deep_gemm(q_fp8, weights)
                 logits = deep_gemm.fp8_mqa_logits(
-                    q_fp8,
+                    q_padded,
                     kv_fp8,
-                    weights,
+                    w_padded,
                     ks,
                     ke,
                     clean_logits=False,
