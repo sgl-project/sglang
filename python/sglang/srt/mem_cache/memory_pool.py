@@ -980,9 +980,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             mamba_indices
         ), "Not enough space for mamba cache, try to increase --mamba-full-memory-ratio or --max-mamba-cache-size."
         if self.enable_mamba_extra_buffer:
-            assert len(select_index) == len(
-                mamba_ping_pong_track_buffers
-            ) + len(
+            assert len(select_index) == len(mamba_ping_pong_track_buffers) + len(
                 empty_ping_pong_track_buffer_indices
             ), "Not enough space for mamba ping pong idx, try to increase --mamba-full-memory-ratio."
         mamba_index_tensor = torch.stack(mamba_indices).to(dtype=torch.int32)
