@@ -34,7 +34,7 @@ dependencies = [
   "flashinfer_cubin==0.6.12",
   "flashinfer_python[cu13]==0.6.12", # keep it aligned with jit-cache version in Dockerfile
   "gguf",
-  "humming-kernels[cu13]==0.1.7",
+  "humming-kernels[cu13]==0.1.10",
   "interegular",
   "IPython",
   "kernels>=0.14.1,<0.15",
