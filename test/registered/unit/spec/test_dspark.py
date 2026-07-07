@@ -206,6 +206,44 @@ class TestDSparkDraftInputBatch(CustomTestCase):
         self.assertEqual(a.bonus_tokens.tolist(), [10, 12])
         self.assertEqual(a.transfer_warmup_rounds.tolist(), [2, 0])
 
+    def test_future_indices_merge_and_filter_carry_payload_by_future_row(self):
+        t = self.torch
+        a = self.cls(
+            bonus_tokens=t.tensor([10, 11], dtype=t.int64),
+            new_seq_lens=t.tensor([100, 101], dtype=t.int64),
+            hidden_states=t.arange(2 * 2, dtype=t.float32).view(2, 2),
+            hidden_valid_mask=t.tensor([[True, False], [True, True]]),
+            prefill_tail_hidden_states=t.arange(2 * 2, dtype=t.float32).view(2, 1, 2),
+            prefill_tail_valid_mask=t.tensor([[True], [False]]),
+            transfer_warmup_rounds=t.tensor([2, 1], dtype=t.int32),
+            future_indices=t.tensor([5, 6], dtype=t.int64),
+        )
+        b = self.cls(
+            bonus_tokens=t.tensor([12], dtype=t.int64),
+            new_seq_lens=t.tensor([102], dtype=t.int64),
+            hidden_states=t.tensor([[4.0, 5.0]]),
+            hidden_valid_mask=t.tensor([[False, True]]),
+            prefill_tail_hidden_states=t.tensor([[[4.0, 5.0]]]),
+            prefill_tail_valid_mask=t.tensor([[True]]),
+            transfer_warmup_rounds=t.tensor([0], dtype=t.int32),
+            future_indices=t.tensor([7], dtype=t.int64),
+        )
+
+        a.merge_batch(b)
+        self.assertFalse(a.direct_carry_valid)
+        self.assertEqual(a.future_indices.tolist(), [5, 6, 7])
+        self.assertEqual(
+            a.hidden_states.tolist(), [[0.0, 1.0], [2.0, 3.0], [4.0, 5.0]]
+        )
+        self.assertEqual(a.transfer_warmup_rounds.tolist(), [2, 1, 0])
+
+        a.filter_batch(t.tensor([2, 0], dtype=t.int64))
+        self.assertFalse(a.direct_carry_valid)
+        self.assertEqual(a.future_indices.tolist(), [7, 5])
+        self.assertEqual(a.hidden_valid_mask.tolist(), [[False, True], [True, False]])
+        self.assertEqual(a.prefill_tail_valid_mask.tolist(), [[True], [True]])
+        self.assertEqual(a.transfer_warmup_rounds.tolist(), [0, 2])
+
 
 class TestDSparkPrefillHandoff(CustomTestCase):
     def setUp(self):
@@ -309,6 +347,29 @@ class TestDSparkPrefillHandoff(CustomTestCase):
         self.assertTrue(tail_mask.all())
         self.assertEqual(tail_hidden[:, 0, 0].item(), 2.0)
         self.assertEqual(tail_hidden[:, -1, 0].item(), 129.0)
+
+    def test_prefill_tail_hidden_empty_or_nonpositive_lens_returns_empty_payload(self):
+        t = self.torch
+        hidden = t.empty((0, 3), dtype=t.float32)
+        tail_hidden, tail_mask = self.worker_cls._pack_prefill_tail_hidden(
+            self._worker(0),
+            hidden=hidden,
+            extend_lens=[4],
+        )
+
+        self.assertEqual(tuple(tail_hidden.shape), (0, 0))
+        self.assertEqual(tuple(tail_mask.shape), (0, 0))
+        self.assertEqual(tail_hidden.dtype, hidden.dtype)
+        self.assertEqual(tail_mask.dtype, t.bool)
+
+        hidden = t.arange(6, dtype=t.float32).view(3, 2)
+        tail_hidden, tail_mask = self.worker_cls._pack_prefill_tail_hidden(
+            self._worker(0),
+            hidden=hidden,
+            extend_lens=[0, -2],
+        )
+        self.assertEqual(tuple(tail_hidden.shape), (0, 0))
+        self.assertEqual(tuple(tail_mask.shape), (0, 0))
 
     def test_decode_anchor_tokens_mix_prompt_output_and_fallback(self):
         t = self.torch
@@ -416,6 +477,64 @@ class TestDSparkPrefillHandoff(CustomTestCase):
         self.assertEqual(commit_lens.tolist(), [2])
         self.assertEqual(bonus_tokens.tolist(), [30])
         self.assertEqual(out_tokens.tolist(), [[20, 30, 40, 0]])
+
+    def test_accept_bonus_confidence_gate_is_applied_per_batch_row(self):
+        t = self.torch
+        candidates = t.tensor(
+            [
+                [10, 20, 30, 40],
+                [11, 21, 31, 41],
+            ],
+            dtype=t.int64,
+        )
+        target_predict = t.tensor(
+            [
+                [20, 30, 40, 99],
+                [21, 31, 41, 88],
+            ],
+            dtype=t.int64,
+        )
+        confidence = t.tensor(
+            [
+                [10.0, 10.0, -10.0],
+                [-10.0, 10.0, 10.0],
+            ],
+            dtype=t.float32,
+        )
+
+        commit_lens, bonus_tokens, out_tokens = (
+            self.worker_cls._compute_accept_bonus_eager(
+                self._accept_worker(use_confidence_gate=True, threshold=0.5),
+                candidates=candidates,
+                target_predict=target_predict,
+                confidence=confidence,
+            )
+        )
+
+        self.assertEqual(commit_lens.tolist(), [3, 1])
+        self.assertEqual(bonus_tokens.tolist(), [40, 21])
+        self.assertEqual(
+            out_tokens.tolist(), [[20, 30, 40, 0], [21, 31, 41, 0]]
+        )
+
+    def test_accept_bonus_verify_stride_one_commits_only_target_bonus(self):
+        t = self.torch
+        candidates = t.tensor([[10], [11]], dtype=t.int64)
+        target_predict = t.tensor([[20], [21]], dtype=t.int64)
+        confidence = t.empty((2, 0), dtype=t.float32)
+
+        commit_lens, bonus_tokens, out_tokens = (
+            self.worker_cls._compute_accept_bonus_eager(
+                self._accept_worker(),
+                candidates=candidates,
+                target_predict=target_predict,
+                confidence=confidence,
+            )
+        )
+
+        self.assertEqual(commit_lens.tolist(), [1, 1])
+        self.assertEqual(bonus_tokens.tolist(), [20, 21])
+        self.assertEqual(out_tokens.tolist(), [[20], [21]])
 
     def test_accept_bonus_rejects_mismatched_shapes(self):
         t = self.torch
