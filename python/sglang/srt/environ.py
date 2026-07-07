@@ -846,6 +846,7 @@ class Envs:
     SGLANG_TOPK_TRANSFORM_512_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
     SGLANG_OPT_MIXED_SPLIT_DECODE_ATTN = EnvBool(True)
+    SGLANG_EXPERIMENTAL_FORCE_BCG = EnvBool(False)
 
     # SWA radix cache
     # TODO(DSV4): @ispobock this has bug on main branch when retract

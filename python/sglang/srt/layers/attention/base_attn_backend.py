@@ -42,6 +42,10 @@ class AttentionBackend(ABC):
     prefill_attention_backend_str: Optional[str] = None
     decode_attention_backend_str: Optional[str] = None
 
+    # All scheduler-shared reads of the current BCG replay were enqueued at
+    # the pre-replay snapshot, so the WAR read-done event may publish early.
+    war_reads_done_at_snapshot: bool = False
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Eager entry point. Default = ``_out_graph(fb) + _in_graph(fb)``.
 

@@ -1227,6 +1227,66 @@ class DeepseekV4AttnBackend(
         assert isinstance(capture_metadata, DSV4Metadata)
         capture_metadata.refresh_for_breakable_cuda_graph_replay_(static_metadata)
         self.forward_metadata = capture_metadata
+        self._prepare_bcg_prefill_replay(capture_metadata, forward_batch)
+
+    def _prepare_bcg_prefill_replay(
+        self, metadata: DSV4Metadata, forward_batch: ForwardBatch
+    ) -> None:
+        """Pre-build the sparse-prefill cache and split boundary from the
+        live batch so BCG replays read no scheduler-shared state mid-replay,
+        allowing the WAR read-done event to publish at the snapshot."""
+        self.war_reads_done_at_snapshot = False
+        if _is_sm120 or _is_xpu:
+            return
+        seq_lens_cpu = forward_batch.seq_lens_cpu
+        extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
+        if (
+            seq_lens_cpu is None
+            or extend_seq_lens_cpu is None
+            or forward_batch.extend_seq_lens is None
+        ):
+            return
+
+        num_tail = 0
+        if (
+            envs.SGLANG_OPT_MIXED_SPLIT_DECODE_ATTN.get()
+            and forward_batch.forward_mode.is_mixed()
+            and forward_batch.num_mixed_decode_tokens is not None
+        ):
+            num_tail = forward_batch.num_mixed_decode_tokens
+
+        num_head_reqs = int(forward_batch.seq_lens.shape[0]) - num_tail
+        num_qo_tokens = int(len(forward_batch.input_ids)) - num_tail
+        if num_head_reqs <= 0 or num_qo_tokens <= 0:
+            return
+
+        head_seq_lens_cpu = seq_lens_cpu[:num_head_reqs]
+        window = SWA_WINDOW - 1
+        total_swa = 0
+        for seq_len, ext_len in zip(
+            head_seq_lens_cpu.tolist(), extend_seq_lens_cpu[:num_head_reqs]
+        ):
+            total_swa += min(int(seq_len), int(ext_len) + window)
+
+        metadata.sparse_prefill_cache = SparsePrefillChunkCache.build(
+            seq_lens=forward_batch.seq_lens[:num_head_reqs].to(torch.int32),
+            extend_seq_lens=forward_batch.extend_seq_lens[:num_head_reqs].to(
+                torch.int32
+            ),
+            req_pool_indices=forward_batch.req_pool_indices[:num_head_reqs].to(
+                torch.int32
+            ),
+            req_to_token=self.req_to_token,
+            full_to_swa=self.token_to_kv_pool.full_to_swa_index_mapping,
+            swa_window_size=SWA_WINDOW,
+            swa_page_size=self.token_to_kv_pool.swa_window_size,
+            num_qo_tokens=num_qo_tokens,
+            max_seq_len=int(head_seq_lens_cpu.max().item()),
+            total_swa=total_swa,
+        )
+        if num_tail > 0:
+            metadata.mixed_decode_tail_len = num_tail
+        self.war_reads_done_at_snapshot = True
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int) -> None:
         self.cuda_graph_metadata_of_bucket_and_bs: Dict[
@@ -1423,31 +1483,25 @@ class DeepseekV4AttnBackend(
                 q.shape[0] > _LARGE_INDEXER_QUERY_THRESHOLD
                 or envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
             ):
-                if (
-                    envs.SGLANG_OPT_MIXED_SPLIT_DECODE_ATTN.get()
-                    and forward_batch.forward_mode.is_mixed()
-                    and not _is_sm120
-                    and not _is_xpu
-                ):
-                    num_tail = metadata.mixed_decode_tail_len
-                    if num_tail is not None and 0 < num_tail < q.shape[0]:
-                        return self._forward_mixed_split(
-                            q=q,
-                            layer_id=layer_id,
-                            compress_ratio=compress_ratio,
-                            forward_batch=forward_batch,
-                            token_to_kv_pool=token_to_kv_pool,
-                            core_attn_metadata=core_attn_metadata,
-                            attn_sink=attn_sink,
-                            num_tail=num_tail,
-                            swa_k_cache=swa_k_cache,
-                            swa_page_indices=swa_page_indices,
-                            swa_topk_lengths=swa_topk_lengths,
-                            extra_k_cache=extra_k_cache,
-                            extra_indices=extra_indices,
-                            extra_topk_lengths=extra_topk_lengths,
-                            flashmla_metadata=flashmla_metadata,
-                        )
+                num_tail = metadata.mixed_decode_tail_len
+                if num_tail is not None and 0 < num_tail < q.shape[0]:
+                    return self._forward_mixed_split(
+                        q=q,
+                        layer_id=layer_id,
+                        compress_ratio=compress_ratio,
+                        forward_batch=forward_batch,
+                        token_to_kv_pool=token_to_kv_pool,
+                        core_attn_metadata=core_attn_metadata,
+                        attn_sink=attn_sink,
+                        num_tail=num_tail,
+                        swa_k_cache=swa_k_cache,
+                        swa_page_indices=swa_page_indices,
+                        swa_topk_lengths=swa_topk_lengths,
+                        extra_k_cache=extra_k_cache,
+                        extra_indices=extra_indices,
+                        extra_topk_lengths=extra_topk_lengths,
+                        flashmla_metadata=flashmla_metadata,
+                    )
                 return self._forward_prefill_sparse(
                     q=q,
                     layer_id=layer_id,
