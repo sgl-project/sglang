@@ -348,17 +348,82 @@ class Resources(_FlagGroupBase):
     tbo_event_pool: dict = dataclasses.field(default_factory=dict)
 
 
+class ForwardFlags:
+    """Per-forward runtime flags. Each flag is backed by a context variable,
+    so concurrent ubatch threads (TBO) and nested scopes stay isolated: a new
+    thread sees the defaults, and ``scoped(**kw)`` — the one regular write
+    path — restores on exit. ``set()`` exists for the legacy unscoped
+    setters' shims only."""
+
+    _DEFAULTS = {
+        "multi_stream": False,
+        "moe_output_buffer": None,
+    }
+
+    __slots__ = ("_vars",)
+
+    def __init__(self):
+        import contextvars
+
+        object.__setattr__(
+            self,
+            "_vars",
+            {
+                name: contextvars.ContextVar(f"forward.{name}", default=default)
+                for name, default in self._DEFAULTS.items()
+            },
+        )
+
+    def __getattr__(self, name: str) -> Any:
+        try:
+            return self._vars[name].get()
+        except KeyError:
+            raise AttributeError(
+                f"ForwardFlags has no flag '{name}' (flags are declared in "
+                "ForwardFlags._DEFAULTS; check for typos)"
+            ) from None
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        raise AttributeError(
+            "ForwardFlags is written through scoped(**kw) (or the legacy "
+            "set() shim), never by attribute assignment"
+        )
+
+    def set(self, name: str, value: Any) -> None:
+        """Unscoped write for legacy setter shims; persists in the current
+        context until the next write."""
+        self._vars[name].set(value)
+
+    @contextmanager
+    def scoped(self, **kwargs):
+        """Set flags for the current scope, restoring on exit. Transactional
+        (keys validated before any write) and exception-safe."""
+        unknown = set(kwargs) - set(self._vars)
+        if unknown:
+            raise ValueError(f"unknown forward flag(s): {sorted(unknown)}")
+        tokens = [
+            (self._vars[name], self._vars[name].set(value))
+            for name, value in kwargs.items()
+        ]
+        try:
+            yield self
+        finally:
+            for var, token in reversed(tokens):
+                var.reset(token)
+
+
 class RuntimeContext:
     """Container for the structured runtime accessors; exposes ``parallel``,
-    ``server_args``, ``flags``, and ``resources``."""
+    ``server_args``, ``flags``, ``resources``, and ``forward``."""
 
-    __slots__ = ("parallel", "_server_args", "flags", "resources")
+    __slots__ = ("parallel", "_server_args", "flags", "resources", "forward")
 
     def __init__(self, parallel: ParallelContext):
         self.parallel = parallel
         self._server_args: ServerArgs | None = None
         self.flags = Flags()
         self.resources = Resources()
+        self.forward = ForwardFlags()
 
     def get_stream(self, name: str) -> Any:
         """Named process-level CUDA side stream: get-or-create, shared by
@@ -439,6 +504,10 @@ def get_resources() -> Resources:
     return _CONTEXT.resources
 
 
+def get_forward() -> ForwardFlags:
+    return _CONTEXT.forward
+
+
 def get_stream(name: str) -> Any:
     return _CONTEXT.get_stream(name)
 
@@ -460,3 +529,4 @@ def reset_context() -> None:
     _CONTEXT._server_args = None
     _CONTEXT.flags = Flags()
     _CONTEXT.resources = Resources()
+    _CONTEXT.forward = ForwardFlags()

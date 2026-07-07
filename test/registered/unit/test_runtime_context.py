@@ -500,6 +500,79 @@ class TestEpBufferState(_IsolatedServerArgs):
         self.assertIsNone(DeepEPBuffer._state().buffer)
 
 
+class TestForwardFlags(_IsolatedServerArgs):
+    """ctx.forward: contextvar-backed per-forward flags; scoped() restores,
+    threads see defaults."""
+
+    def test_scoped_set_restore_and_nesting(self):
+        from sglang.srt.runtime_context import get_forward
+
+        reset_context()
+        fwd = get_forward()
+        self.assertFalse(fwd.multi_stream)
+        with fwd.scoped(multi_stream=True):
+            self.assertTrue(fwd.multi_stream)
+            with fwd.scoped(multi_stream=False):
+                self.assertFalse(fwd.multi_stream)
+            self.assertTrue(fwd.multi_stream)
+        self.assertFalse(fwd.multi_stream)
+
+    def test_scoped_restores_on_exception_and_validates_keys(self):
+        from sglang.srt.runtime_context import get_forward
+
+        reset_context()
+        fwd = get_forward()
+        with self.assertRaises(RuntimeError):
+            with fwd.scoped(moe_output_buffer="buf"):
+                raise RuntimeError("boom")
+        self.assertIsNone(fwd.moe_output_buffer)
+        with self.assertRaises(ValueError):
+            with fwd.scoped(nope=1):
+                pass
+        with self.assertRaises(AttributeError):
+            fwd.multi_stream = True  # attribute writes are rejected
+
+    def test_threads_see_defaults(self):
+        import threading
+
+        from sglang.srt.runtime_context import get_forward
+
+        reset_context()
+        fwd = get_forward()
+        seen = {}
+        with fwd.scoped(multi_stream=True):
+
+            def probe():
+                seen["value"] = get_forward().multi_stream
+
+            worker = threading.Thread(target=probe)
+            worker.start()
+            worker.join()
+        self.assertFalse(seen["value"])  # a new thread sees the default
+
+    def test_multi_stream_shims(self):
+        from sglang.srt.utils.multi_stream_utils import (
+            do_multi_stream,
+            with_multi_stream,
+        )
+
+        reset_context()
+        self.assertFalse(do_multi_stream())
+        with with_multi_stream(True):
+            self.assertTrue(do_multi_stream())
+        self.assertFalse(do_multi_stream())
+
+    def test_moe_output_buffer_ctx(self):
+        from sglang.srt.layers.moe.moe_runner.base import moe_output_buffer_ctx
+        from sglang.srt.runtime_context import get_forward
+
+        reset_context()
+        sentinel = object()
+        with moe_output_buffer_ctx(sentinel):
+            self.assertIs(get_forward().moe_output_buffer, sentinel)
+        self.assertIsNone(get_forward().moe_output_buffer)
+
+
 class TestPublishLifecycle(_IsolatedServerArgs):
     """Publish installs the resolved server_args and seeds the capture tier."""
 
