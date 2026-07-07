@@ -12,9 +12,7 @@ register_cuda_ci(est_time=3600, suite="nightly-8-gpu-b200", nightly=True)
 MODEL_PATH = "nvidia/Kimi-K2.6-NVFP4"
 DRAFT_MODEL_PATH = "nvidia/Kimi-K2.6-DFlash"
 
-# trtllm_mla verify exercises the pure-MLA fp8-KV DFlash path (bf16 draft-KV decouple +
-# Mamba verify-commit guard) without depending on the cuteDSL fold kernel, which only
-# needs a newer flashinfer. The target keeps fp8 KV; the fa4 draft gets its own bf16 KV.
+# trtllm_mla verify only; cuteDSL fold verify depends on the flashinfer version.
 EXTRA_ARGS = [
     "--trust-remote-code",
     "--quantization=modelopt_fp4",
