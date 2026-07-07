@@ -3293,13 +3293,41 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 ret = self.piecewise_cuda_graph_runner.replay(forward_batch, **kwargs)
             return (ret, can_run_graph)
 
+        # SGLANG_PREFILL_FORWARD_TIMER: GPU-synced wall time of one prefill
+        # forward, covering attention-metadata planning + model.forward (for VLMs:
+        # ViT encode + LM prefill). Measures server-side prefill cost only — it
+        # excludes HTTP, base64 decode, and image preprocessing, which happen in
+        # the tokenizer process. Opt-in diagnostic: the sync perturbs pipelining,
+        # so leave off for headline latency runs.
+        prefill_timer_enabled = (
+            envs.SGLANG_PREFILL_FORWARD_TIMER.get()
+            and forward_batch.forward_mode.is_extend()
+        )
+        if prefill_timer_enabled:
+            torch.cuda.synchronize()
+            prefill_timer_start = time.perf_counter()
+
         # Launch model forward
         if not skip_attn_backend_init:
             if hasattr(self.model, "prepare_forward_batch"):
                 # Prepare model-specific attention metadata before planning,
                 # e.g. Moss-VL's prefill cross-attention custom mask.
                 self.model.prepare_forward_batch(forward_batch)
+            # SGLANG_ATTN_PLAN_TIMER: GPU-synced wall time of attention-metadata
+            # planning for this prefill (whatever init_forward_metadata does for
+            # the active backend). Opt-in diagnostic.
+            plan_timer_enabled = envs.SGLANG_ATTN_PLAN_TIMER.get()
+            if plan_timer_enabled:
+                torch.cuda.synchronize()
+                plan_timer_start = time.perf_counter()
             self.attn_backend.init_forward_metadata(forward_batch)
+            if plan_timer_enabled:
+                torch.cuda.synchronize()
+                logger.info(
+                    "[ATTN_PLAN] tokens=%d dt=%.1fms",
+                    forward_batch.input_ids.shape[0],
+                    (time.perf_counter() - plan_timer_start) * 1e3,
+                )
 
         ctx = (
             self.device_timer.wrap(metadata={"category": "extend"})
@@ -3312,6 +3340,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 forward_batch.positions,
                 forward_batch,
                 **kwargs,
+            )
+        if prefill_timer_enabled:
+            torch.cuda.synchronize()
+            logger.info(
+                "[PREFILL_FORWARD] tokens=%d dt=%.1fms",
+                forward_batch.input_ids.shape[0],
+                (time.perf_counter() - prefill_timer_start) * 1e3,
             )
         return (ret, can_run_graph)
 
