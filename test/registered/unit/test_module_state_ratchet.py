@@ -36,8 +36,6 @@ _PINNED_GLOBALS = {
             "_ATTN_DP_SIZE",
             "_LOCAL_ATTN_DP_SIZE",
             "_LOCAL_ATTN_DP_RANK",
-            # Comm stream resource (resources vertical scope).
-            "_DP_TBO_COMM_STREAM",
         }
     ),
 }

@@ -337,6 +337,14 @@ class Resources(_FlagGroupBase):
     expert_location_metadata: Any = None
     # LPLB: layer_id -> solver.
     lplb_solvers: dict = dataclasses.field(default_factory=dict)
+    # Side streams, created lazily by their owning accessors (dp_attention /
+    # lora.trtllm_lora_temp) — creation is a driver call that must stay
+    # outside cuda-graph capture, which the accessors' call points guarantee.
+    dp_tbo_comm_stream: Any = None
+    lora_side_stream: Any = None
+    # Persistent reusable CUDA events for non-EP DP TBO, keyed by
+    # (kind, subbatch) — see dp_attention._tbo_event for why reuse matters.
+    tbo_event_pool: dict = dataclasses.field(default_factory=dict)
 
 
 class RuntimeContext:

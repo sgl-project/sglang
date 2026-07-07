@@ -35,9 +35,6 @@ def is_two_stream_active(x: torch.Tensor) -> bool:
     return x.shape[0] <= lora_envs.SGLANG_TWO_STREAM_MAX_TOKENS.get()
 
 
-_LORA_SIDE_STREAM: Optional[torch.cuda.Stream] = None
-
-
 def get_lora_side_stream() -> torch.cuda.Stream:
     """Lazily allocate a single shared LoRA side stream.
 
@@ -45,10 +42,12 @@ def get_lora_side_stream() -> torch.cuda.Stream:
     run sequentially, so one stream suffices and avoids extra graph-capture
     nodes from per-site streams.
     """
-    global _LORA_SIDE_STREAM
-    if _LORA_SIDE_STREAM is None:
-        _LORA_SIDE_STREAM = torch.cuda.Stream()
-    return _LORA_SIDE_STREAM
+    from sglang.srt.runtime_context import get_resources
+
+    resources = get_resources()
+    if resources.lora_side_stream is None:
+        resources.lora_side_stream = torch.cuda.Stream()
+    return resources.lora_side_stream
 
 
 def init_lora_two_stream_resources(device: Optional[torch.device] = None) -> None:
