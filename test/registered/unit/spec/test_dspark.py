@@ -393,7 +393,8 @@ class TestDSparkSpecInputDataclasses(CustomTestCase):
 
         self.assertEqual(draft.get_spec_adjust_token_coefficient(), (3, 3))
         self.assertEqual(verify.get_spec_adjust_token_coefficient(), (4, 4))
-        self.assertTrue(draft.is_draft_input())
+        self.assertEqual(draft.spec_input_type, SpecInputType.DSPARK_DRAFT_BLOCK)
+        self.assertFalse(draft.is_draft_input())
         self.assertTrue(verify.is_verify_input())
         self.assertEqual(draft.num_tokens_per_batch, 3)
         self.assertEqual(verify.num_tokens_per_req, 4)
