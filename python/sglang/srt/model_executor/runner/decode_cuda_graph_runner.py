@@ -93,6 +93,7 @@ from sglang.srt.model_executor.runner_utils.deepep_adapter import (
     DeepEPCudaGraphRunnerAdapter,
 )
 from sglang.srt.multiplex.pdmux_context import get_current_stream_idx, get_stream_groups
+from sglang.srt.runtime_context import get_flags
 from sglang.srt.utils import (
     empty_context,
     get_available_gpu_memory,
@@ -187,7 +188,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     ):
         super().__init__(model_runner)
         # --- core state ------------------------------------------------
-        self.enable_torch_compile = model_runner.server_args.enable_torch_compile
+        self.enable_torch_compile = get_flags().capture.enable_torch_compile
         self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
         self.is_encoder_decoder = model_runner.model_config.is_encoder_decoder
         self.require_gathered_buffer = require_gathered_buffer(model_runner.server_args)
@@ -239,7 +240,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # --- capture mode + tokens-per-bs ------------------------------
         self.capture_forward_mode = ForwardMode.DECODE
         self.capture_hidden_mode = CaptureHiddenMode.NULL
-        self.num_tokens_per_bs = 1
+        self.num_tokens_per_bs = model_runner.decode_num_tokens_per_bs(
+            num_draft_tokens=self.speculative_num_draft_tokens
+        )
         if model_runner.spec_algorithm.is_speculative():
             if self.model_runner.is_draft_worker:
                 # Draft workers can use TARGET_VERIFY mode.
@@ -248,14 +251,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 ):
                     raise RuntimeError("This should not happen")
             self.capture_forward_mode = ForwardMode.TARGET_VERIFY
-            self.num_tokens_per_bs = (
-                model_runner.spec_algorithm.get_num_tokens_per_bs_for_target_verify(
-                    self.speculative_num_draft_tokens, model_runner.is_draft_worker
-                )
-            )
         elif self.is_dllm:
             self.capture_forward_mode = ForwardMode.DLLM_EXTEND
-            self.num_tokens_per_bs = self.dllm_config.block_size
 
         # --- bucket sizes ---------------------------------------------
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(
@@ -314,7 +311,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             max_bs=self.max_bs,
             max_num_token=self.max_num_token,
             hidden_size=self.model_runner.model_config.hidden_size,
-            vocab_size=self.model_runner.model_config.vocab_size,
+            next_token_logits_buffer=self.model_runner.graph_shared_output.get_logits_buffer(
+                self.model_runner.model_config.vocab_size, rows=self.max_num_token
+            ),
             dtype=self.model_runner.model_config.dtype,
             dp_size=self.dp_size,
             pp_size=self.pp_size,
@@ -670,9 +669,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.warmup()
         # warmup() may disable torch.compile for a model whose _can_torch_compile
         # is False; recompute the compile bucket so capture matches.
-        if self.enable_torch_compile and not (
-            self.model_runner.server_args.enable_torch_compile
-        ):
+        if self.enable_torch_compile and not (get_flags().capture.enable_torch_compile):
             self.enable_torch_compile = False
             _, self.compile_bs = get_batch_sizes_to_capture(
                 self.model_runner, self.num_tokens_per_bs

@@ -53,46 +53,6 @@ class MambaAttnBackendBase(AttentionBackend):
         self.cached_cuda_graph_verify_query_start_loc: torch.Tensor = None
         self.conv_states_shape: tuple[int, int] = None
 
-    def _execute_deferred_mamba_cow_and_clear(self, forward_batch: ForwardBatch):
-        """Run deferred clear/COW ops on the forward stream to avoid races."""
-        if (
-            not forward_batch.forward_mode.is_extend()
-            or forward_batch.forward_mode.is_target_verify()
-            or forward_batch.forward_mode.is_draft_extend_v2()
-            or self.is_draft_worker
-        ):
-            return
-        if (
-            forward_batch.mamba_clear_indices is not None
-            and len(forward_batch.mamba_clear_indices) > 0
-        ):
-            # mamba_pool is a pure PHYSICAL store; translate before zeroing or
-            # clear_slots zeroes the wrong physical slots.
-            self.req_to_token_pool.mamba_pool.clear_slots(
-                self._translate_mamba_indices(forward_batch.mamba_clear_indices)
-            )
-        if (
-            forward_batch.mamba_cow_src_indices is not None
-            and len(forward_batch.mamba_cow_src_indices) > 0
-        ):
-            ckpt_pool = getattr(self.req_to_token_pool, "mamba_ckpt_pool", None)
-            if ckpt_pool is not None:
-                # int8 checkpoints: dequantize src int8 ckpt slot into the active bf16 dst.
-                ckpt_pool.load_to_active(
-                    self.req_to_token_pool.mamba_pool,
-                    forward_batch.mamba_cow_src_indices,
-                    forward_batch.mamba_cow_dst_indices,
-                )
-            else:
-                # mamba_pool is a pure PHYSICAL store; translate both COW slot ids.
-                self.req_to_token_pool.mamba_pool.copy_from(
-                    self._translate_mamba_indices(forward_batch.mamba_cow_src_indices),
-                    self._translate_mamba_indices(forward_batch.mamba_cow_dst_indices),
-                )
-        forward_batch.mamba_clear_indices = None
-        forward_batch.mamba_cow_src_indices = None
-        forward_batch.mamba_cow_dst_indices = None
-
     def _translate_mamba_indices(self, mamba_indices: torch.Tensor) -> torch.Tensor:
         """Virtual->physical mamba slot-id translate (identity for the non-unified
         pool). Must run everywhere mamba ids feed the SSM/conv kernels or mamba-pool
@@ -274,7 +234,6 @@ class MambaAttnBackendBase(AttentionBackend):
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        self._execute_deferred_mamba_cow_and_clear(forward_batch)
         self.forward_metadata = self._forward_metadata(forward_batch)
 
     def _init_track_conv_indices(
@@ -767,7 +726,6 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        self._execute_deferred_mamba_cow_and_clear(forward_batch)
         metadata = self._forward_metadata(forward_batch)
         self.forward_metadata = Mamba2Metadata.prepare_mixed(
             metadata,
@@ -784,6 +742,7 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
         forward_batch: ForwardBatch,
         mup_vector: Optional[torch.Tensor] = None,
         use_triton_causal_conv: bool = False,
+        should_allreduce_fusion: bool = False,
     ):
         assert isinstance(self.forward_metadata, Mamba2Metadata)
         # Page-major stores state strided; only the stride-aware Triton causal-conv
@@ -801,6 +760,7 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
             forward_batch=forward_batch,
             mup_vector=mup_vector,
             use_triton_causal_conv=use_triton_causal_conv,
+            should_allreduce_fusion=should_allreduce_fusion,
         )
 
         if forward_batch.mamba_track_mask is not None:
@@ -879,6 +839,10 @@ class HybridLinearAttnBackend(AttentionBackend):
             attn_backend.init_forward_metadata_out_graph(
                 forward_batch, in_capture=in_capture
             )
+
+    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
+        for attn_backend in self.attn_backend_list:
+            attn_backend.init_forward_metadata_in_graph(forward_batch)
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         if forward_batch.forward_mode.is_draft_extend_v2():
@@ -1096,3 +1060,31 @@ class HybridLinearAttnBackend(AttentionBackend):
                 mamba_track_indices,
                 mamba_steps_to_track,
             )
+
+
+class ShortConvHybridAttnBackend(HybridLinearAttnBackend):
+    """HybridLinearAttnBackend variant for short-conv hybrid models (ZAYA1 CCA,
+    LFM2 short conv).
+
+    The linear sidecar is a :class:`ShortConvAttnBackend
+    <sglang.srt.layers.attention.linear.short_conv_backend.ShortConvAttnBackend>`
+    that owns the per-request conv-state plumbing. The model's conv module
+    reaches it via :meth:`conv_state_metadata` (``get_attn_backend()`` returns
+    this wrapper) and runs its own conv kernel against the returned handle, so
+    the model definition holds no pool access. The sidecar is never reached
+    through the full-vs-linear ``forward_decode`` / ``forward_extend`` dispatch.
+    """
+
+    def __init__(
+        self,
+        full_attn_backend: AttentionBackend,
+        short_conv_backend: MambaAttnBackendBase,
+        full_attn_layers: list,
+    ):
+        # Register short_conv_backend as the linear sidecar so it rides in
+        # attn_backend_list and inherits the metadata / cuda-graph fan-out.
+        super().__init__(full_attn_backend, short_conv_backend, full_attn_layers)
+        self.short_conv_backend = short_conv_backend
+
+    def conv_state_metadata(self, layer_id: int, forward_batch: ForwardBatch):
+        return self.short_conv_backend.conv_state_metadata(layer_id, forward_batch)

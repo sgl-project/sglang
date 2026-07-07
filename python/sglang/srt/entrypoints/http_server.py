@@ -1537,7 +1537,11 @@ async def parse_function_call_request(
     A native API endpoint to parse function calls from a text.
     """
     # 1) Initialize the parser based on the request body
-    parser = FunctionCallParser(tools=obj.tools, tool_call_parser=obj.tool_call_parser)
+    parser = FunctionCallParser(
+        tools=obj.tools,
+        tool_call_parser=obj.tool_call_parser,
+        tokenizer=get_global_state().tokenizer_manager.tokenizer,
+    )
 
     # 2) Call the non-stream parsing method (non-stream)
     normal_text, calls = parser.parse_non_stream(obj.text)
@@ -1561,7 +1565,11 @@ async def separate_reasoning_request(
     A native API endpoint to separate reasoning from a text.
     """
     # 1) Initialize the parser based on the request body
-    parser = ReasoningParser(model_type=obj.reasoning_parser, request=request)
+    parser = ReasoningParser(
+        model_type=obj.reasoning_parser,
+        request=request,
+        tokenizer=get_global_state().tokenizer_manager.tokenizer,
+    )
 
     # 2) Call the non-stream parsing method (non-stream)
     if obj.return_blocks:
