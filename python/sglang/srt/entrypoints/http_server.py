@@ -1742,6 +1742,7 @@ async def openai_v1_audio_transcriptions(
     language: Optional[str] = Form(default=None),
     response_format: str = Form(default="json"),
     temperature: float = Form(default=0.0),
+    max_new_tokens: Optional[int] = Form(default=None, ge=1),
     stream: bool = Form(default=False),
     timestamp_granularities: Optional[List[str]] = Form(
         default=None, alias="timestamp_granularities[]"
@@ -1767,6 +1768,7 @@ async def openai_v1_audio_transcriptions(
             language=language,
             response_format=response_format,
             temperature=temperature,
+            max_new_tokens=max_new_tokens,
             stream=stream,
             timestamp_granularities=timestamp_granularities,
             raw_request=raw_request,

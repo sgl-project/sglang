@@ -1837,6 +1837,7 @@ class TranscriptionRequest(BaseModel):
     language: Optional[str] = None
     response_format: str = "json"
     temperature: float = 0.0
+    max_new_tokens: Optional[int] = None
     timestamp_granularities: Optional[List[str]] = None
     stream: bool = False
     # Internal fields (not from API)

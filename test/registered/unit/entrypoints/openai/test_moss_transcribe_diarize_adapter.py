@@ -35,7 +35,13 @@ class TestMossTranscribeDiarizeAdapter(CustomTestCase):
             TranscriptionRequest(temperature=0.0)
         )
         self.assertEqual(params["temperature"], 0.0)
-        self.assertEqual(params["max_new_tokens"], 2048)
+        self.assertEqual(params["max_new_tokens"], 20480)
+
+    def test_build_sampling_params_uses_moss_max_new_tokens_override(self):
+        params = MossTranscribeDiarizeAdapter().build_sampling_params(
+            TranscriptionRequest(temperature=0.0, max_new_tokens=32)
+        )
+        self.assertEqual(params["max_new_tokens"], 32)
 
     def test_postprocess_strips_chat_special_tokens(self):
         text = "[0.00][S01]你好[1.00]<|im_end|>"
