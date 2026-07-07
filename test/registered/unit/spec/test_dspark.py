@@ -63,6 +63,7 @@ class TestDSparkPredicates(CustomTestCase):
 def _make_server_args(**overrides):
     base = dict(
         enable_dp_attention=False,
+        enable_dp_lm_head=False,
         pp_size=1,
         speculative_draft_model_path="deepseek-ai/DeepSeek-V4-Flash-DSpark",
         speculative_draft_model_revision="main",
@@ -119,10 +120,10 @@ class TestHandleDspark(CustomTestCase):
         self.assertEqual(args.speculative_draft_model_path, "my/target")
         self.assertEqual(args.speculative_draft_model_revision, "abc")
 
-    def test_dp_attention_rejected(self):
+    def test_dp_attention_enables_dp_lm_head(self):
         args = _make_server_args(enable_dp_attention=True)
-        with self.assertRaisesRegex(ValueError, "dp attention"):
-            _handle_dspark(args)
+        _handle_dspark(args)
+        self.assertTrue(args.enable_dp_lm_head)
 
     def test_pipeline_parallel_rejected(self):
         args = _make_server_args(pp_size=2)
@@ -181,6 +182,141 @@ class TestDSparkDraftInputBatch(CustomTestCase):
         self.assertEqual(a.topk_p.numel(), 0)
         a.filter_batch(self.torch.tensor([1], dtype=self.torch.int64))
         self.assertEqual(len(a.bonus_tokens), 1)
+
+    def test_transfer_warmup_rounds_survive_batch_ops(self):
+        t = self.torch
+        a = self.cls(
+            bonus_tokens=t.tensor([10, 11], dtype=t.int64),
+            new_seq_lens=t.tensor([100, 101], dtype=t.int64),
+            transfer_warmup_rounds=t.tensor([2, 1], dtype=t.int32),
+        )
+        b = self.cls(
+            bonus_tokens=t.tensor([12], dtype=t.int64),
+            new_seq_lens=t.tensor([102], dtype=t.int64),
+            transfer_warmup_rounds=t.tensor([0], dtype=t.int32),
+        )
+        a.merge_batch(b)
+        self.assertEqual(a.transfer_warmup_rounds.tolist(), [2, 1, 0])
+
+        a.filter_batch(t.tensor([0, 2], dtype=t.int64))
+        self.assertEqual(a.bonus_tokens.tolist(), [10, 12])
+        self.assertEqual(a.transfer_warmup_rounds.tolist(), [2, 0])
+
+
+class TestDSparkPrefillHandoff(CustomTestCase):
+    def setUp(self):
+        try:
+            import torch
+
+            from sglang.srt.speculative.dspark_worker_v2 import DSparkWorkerV2
+        except Exception as e:  # pragma: no cover - GPU-only deps on some runners
+            self.skipTest(f"dspark worker unavailable on this runner: {e}")
+        self.torch = torch
+        self.worker_cls = DSparkWorkerV2
+
+    def _worker(self, prefill_transfer_warmup_rounds):
+        worker = self.worker_cls.__new__(self.worker_cls)
+        worker._prefill_transfer_warmup_rounds = prefill_transfer_warmup_rounds
+        return worker
+
+    def _make_prefill_input(self, rounds):
+        t = self.torch
+        worker = self._worker(rounds)
+        return self.worker_cls._make_next_draft_input_prefill(
+            worker,
+            bonus_tokens=t.tensor([1262, 2808], dtype=t.int32),
+            seq_lens=t.tensor([3676, 42], dtype=t.int32),
+        )
+
+    def test_prefill_handoff_matches_deepspec_reference_no_warmup(self):
+        # DeepSpec first proposal uses prompt context hidden plus the
+        # prefill-sampled anchor immediately. In SGLang that contract is encoded
+        # as transfer_warmup_rounds == 0 for the handoff draft input.
+        draft_input = self._make_prefill_input(rounds=0)
+        self.assertEqual(draft_input.bonus_tokens.tolist(), [1262, 2808])
+        self.assertEqual(draft_input.new_seq_lens.tolist(), [3676, 42])
+        self.assertEqual(draft_input.transfer_warmup_rounds.tolist(), [0, 0])
+        self.assertEqual(
+            tuple(draft_input.prefill_tail_hidden_states.shape), (0, 0, 0)
+        )
+        self.assertEqual(tuple(draft_input.prefill_tail_valid_mask.shape), (0, 0))
+
+    def test_service_warmup_prefill_handoff_uses_configured_rounds(self):
+        draft_input = self._make_prefill_input(rounds=2)
+        self.assertEqual(draft_input.transfer_warmup_rounds.tolist(), [2, 2])
+
+        recovered = self.worker_cls._get_transfer_warmup_rounds(
+            self._worker(rounds=0),
+            draft_input,
+            bs=2,
+            device=self.torch.device("cpu"),
+        )
+        self.assertEqual(recovered.tolist(), [2, 2])
+
+    def test_mismatched_warmup_shape_falls_back_to_zero(self):
+        draft_input = self._make_prefill_input(rounds=1)
+        draft_input.transfer_warmup_rounds = self.torch.tensor(
+            [1], dtype=self.torch.int32
+        )
+        recovered = self.worker_cls._get_transfer_warmup_rounds(
+            self._worker(rounds=0),
+            draft_input,
+            bs=2,
+            device=self.torch.device("cpu"),
+        )
+        self.assertEqual(recovered.tolist(), [0, 0])
+
+
+class TestDSparkDeepSpecSemanticReference(CustomTestCase):
+    def setUp(self):
+        try:
+            import torch
+        except Exception as e:  # pragma: no cover - torch unavailable on some runners
+            self.skipTest(f"torch unavailable on this runner: {e}")
+        self.torch = torch
+
+    def test_materialized_context_matches_deepspec_concat_when_kv_is_equivalent(self):
+        # This is the algebra DSpark relies on:
+        #   DeepSpec: K/V = K/V(context hidden) + K/V(anchor/noise block)
+        #   SGLang:   write K/V(context hidden), then run anchor/noise block
+        # If the same projections, positions, masks and cache cleanup are used,
+        # the block output should be identical.
+        t = self.torch
+        t.manual_seed(0)
+        batch_size = 1
+        context_len = 4
+        block_size = 3
+        hidden_size = 8
+        head_dim = 8
+
+        context_hidden = t.randn(batch_size, context_len, hidden_size)
+        block_hidden = t.randn(batch_size, block_size, hidden_size)
+        wq = t.randn(hidden_size, head_dim)
+        wk = t.randn(hidden_size, head_dim)
+        wv = t.randn(hidden_size, head_dim)
+
+        def attention(q, k, v):
+            scores = q @ k.transpose(-1, -2) / (head_dim**0.5)
+            probs = t.softmax(scores, dim=-1)
+            return probs @ v
+
+        q_block = block_hidden @ wq
+        k_context = context_hidden @ wk
+        v_context = context_hidden @ wv
+        k_block = block_hidden @ wk
+        v_block = block_hidden @ wv
+
+        deepspec_k = t.cat([k_context, k_block], dim=1)
+        deepspec_v = t.cat([v_context, v_block], dim=1)
+        deepspec_out = attention(q_block, deepspec_k, deepspec_v)
+
+        materialized_k_cache = k_context.clone()
+        materialized_v_cache = v_context.clone()
+        sglang_k = t.cat([materialized_k_cache, k_block], dim=1)
+        sglang_v = t.cat([materialized_v_cache, v_block], dim=1)
+        sglang_out = attention(q_block, sglang_k, sglang_v)
+
+        self.assertTrue(t.equal(deepspec_out, sglang_out))
 
 
 if __name__ == "__main__":
