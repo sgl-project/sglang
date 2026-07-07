@@ -50,7 +50,6 @@ Serve the base Pi0.5 policy:
 ```bash Command
 sglang serve lerobot/pi05_base \
   --model-type diffusion \
-  --pipeline pi05 \
   --host 127.0.0.1 \
   --port 30000
 ```
@@ -60,12 +59,11 @@ Serve the LIBERO checkpoint:
 ```bash Command
 sglang serve lerobot/pi05_libero_base \
   --model-type diffusion \
-  --pipeline pi05 \
   --host 127.0.0.1 \
   --port 30000
 ```
 
-The command dispatches to the native `multimodal_gen` Pi0.5 pipeline. It does not start a second SRT LLM serving engine.
+These registered LeRobot checkpoints dispatch to the native `multimodal_gen` Pi0.5 pipeline automatically. The `--pipeline` / `--pipeline-class-name` flag is only an advanced override for local or private checkpoints that cannot be resolved from the model registry. Pi0.5 serving does not start a second SRT LLM serving engine.
 
 ### 3.1 Action Request Schema
 
@@ -337,7 +335,6 @@ Start a single-GPU server with the override:
 ```bash Command
 sglang serve lerobot/pi05_base \
   --model-type diffusion \
-  --pipeline pi05 \
   --pipeline-config-path pi05_edge_16gb.json \
   --num-gpus 1 \
   --warmup-mode off \
@@ -425,7 +422,6 @@ The `python[diffusion]` extra includes `runai_model_streamer`. If the package is
 SGLANG_USE_RUNAI_MODEL_STREAMER=false \
 sglang serve lerobot/pi05_base \
   --model-type diffusion \
-  --pipeline pi05 \
   --host 127.0.0.1 \
   --port 30000
 ```

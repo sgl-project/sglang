@@ -96,10 +96,10 @@ For more usage examples (e.g. OpenAI compatible API, server mode), check the [CL
 Pi0.5/OpenPI/LeRobot action policies are registered as native `multimodal_gen` pipelines:
 
 ```bash
-sglang serve lerobot/pi05_base --model-type diffusion --pipeline pi05
+sglang serve lerobot/pi05_base --model-type diffusion
 ```
 
-The action HTTP API is served under `/v1/actions/generations` with metadata at `/v1/actions/metadata`. Robot clients can use the OpenPI-compatible msgpack websocket adapter at `/openpi/policy`. The native path includes request-local `PrefixContext`, exact full-prefix cache, split prefix/action execution, action denoise CUDA graph support, and the SGLang-owned PaliGemma prefix encoder plus Gemma action expert execution.
+The registered LeRobot checkpoints resolve to `Pi05Pipeline` automatically. The action HTTP API is served under `/v1/actions/generations` with metadata at `/v1/actions/metadata`. Robot clients can use the OpenPI-compatible msgpack websocket adapter at `/openpi/policy`. The native path includes request-local `PrefixContext`, exact full-prefix cache, split prefix/action execution, action denoise CUDA graph support, and the SGLang-owned PaliGemma prefix encoder plus Gemma action expert execution.
 
 ## Contributing
 

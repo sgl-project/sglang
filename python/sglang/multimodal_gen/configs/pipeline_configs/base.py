@@ -906,16 +906,6 @@ class PipelineConfig:
         pipeline_class_name = kwargs.get(
             prefix_with_dot + "pipeline_class_name"
         ) or kwargs.get("pipeline_class_name")
-        if isinstance(pipeline_class_name, str):
-            pipeline_class_aliases = {
-                "pi05": "Pi05Pipeline",
-                "pi0.5": "Pi05Pipeline",
-            }
-            pipeline_class_name = pipeline_class_aliases.get(
-                pipeline_class_name.lower(),
-                pipeline_class_name,
-            )
-            kwargs["pipeline_class_name"] = pipeline_class_name
         is_safetensors_file = os.path.isfile(model_path) and model_path.endswith(
             ".safetensors"
         )

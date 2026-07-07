@@ -665,7 +665,6 @@ def create_sglang_python_pipeline(
 
     kwargs: dict[str, Any] = {
         "model_path": model_path,
-        "pipeline_class_name": "pi05",
         "warmup_mode": "off",
         "num_gpus": 1,
     }
