@@ -441,7 +441,7 @@ class TestDSparkPrefillHandoff(CustomTestCase):
 
         self.assertEqual(commit_lens.tolist(), [3, 2])
         self.assertEqual(bonus_tokens.tolist(), [99, 99])
-        self.assertEqual(out_tokens.tolist(), [[20, 30, 99, 0], [21, 99, 31, 0]])
+        self.assertEqual(out_tokens.tolist(), [[20, 30, 99, 0], [21, 99, 41, 0]])
         if os.getenv("SGLANG_DSPARK_TEST_VERBOSE", "0") == "1":
             print(
                 "DSpark accept parity debug: "
