@@ -157,15 +157,16 @@ def store_cache_4d_kernel(
         dst_ptr = (
             k_view_ptr + page_id * stride_k_page + tok_in_p * stride_k_tok + base_off
         )
+        src = tl.load(src_ptr, mask=mask)
+        tl.store(dst_ptr, src, mask=mask)
     else:
         mask = base_off < V_ROW_DIM
         src_ptr = cache_v_ptr + pid_n * stride_src_v_row + base_off
         dst_ptr = (
             v_view_ptr + page_id * stride_v_page + tok_in_p * stride_v_tok + base_off
         )
-
-    src = tl.load(src_ptr, mask=mask)
-    tl.store(dst_ptr, src, mask=mask)
+        src = tl.load(src_ptr, mask=mask)
+        tl.store(dst_ptr, src, mask=mask)
 
 
 def store_cache_4d(
