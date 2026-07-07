@@ -373,14 +373,8 @@ _FI_A2A_STATE: Optional[dict] = None
 
 
 def init_fi_a2a_workspace(cp_group: "GroupCoordinator") -> None:
-    """Allocate + initialize the FlashInfer MNNVL DCP all-to-all workspace.
-
-    MUST be called exactly once per process, BEFORE any CUDA-graph capture: the
-    FlashInfer init synchronizes the stream and this routine issues a cross-rank
-    barrier, neither of which is capturable. Raises a clear error if FlashInfer
-    is unavailable or the platform lacks MNNVL fabric memory (the kernel would
-    otherwise deadlock at runtime).
-    """
+    # Call once per process BEFORE CUDA-graph capture: the FlashInfer init syncs
+    # the stream and barriers cross-rank, neither of which is capturable.
     global _FI_A2A_STATE
     if _FI_A2A_STATE is not None:
         return
@@ -419,8 +413,6 @@ def init_fi_a2a_workspace(cp_group: "GroupCoordinator") -> None:
 
     cp_size = cp_group.world_size
     cp_rank = cp_group.rank_in_group
-    # Pure-DCP mapping: CP is the only parallel axis of this group, so
-    # world_size == cp_size and tp_size == pp_size == 1.
     mapping = Mapping(
         world_size=cp_size,
         rank=cp_rank,
@@ -436,11 +428,9 @@ def init_fi_a2a_workspace(cp_group: "GroupCoordinator") -> None:
         ),
     )
     decode_cp_a2a_init_workspace(workspace, cp_rank, cp_size)
-    # REQUIRED cross-rank barrier before the first alltoall (flashinfer
-    # dcp_alltoall docstring): every rank must finish init first, else a rank
-    # may write a peer's FIFO before that peer is ready -> deadlock.
+    # REQUIRED barrier before the first alltoall: every rank must finish init,
+    # else a rank writes a peer's FIFO before it is ready -> deadlock.
     dist.barrier(group=cp_group.device_group)
-    # cp_size not stored: dcp_a2a_lse_reduce recomputes N from cp_group at call time.
     _FI_A2A_STATE = {
         "workspace": workspace,
         "cp_rank": cp_rank,
@@ -455,24 +445,10 @@ def dcp_a2a_lse_reduce(
     cuda_graph_buffers: Optional[dict] = None,
     comm_backend: str = "a2a",
 ) -> torch.Tensor:
-    """A2A-based DCP reduce: exchange head partials, then local combine.
-
-    Fuses output + LSE into a single all_to_all call by packing fp32 LSE
-    as reinterpreted output-dtype elements along the D dimension:
-      combined = [N, B, H_per_rank, D + lse_pack_dim]
-    This halves the NCCL calls (1 instead of 2 per layer, 27 fewer per step).
-
-    Args:
-        cp_attn_out: [B, H, D]  attention output (all heads, local KV shard)
-        cp_attn_lse: [B, H]     log-sum-exp values (fp32)
-        cp_group:    DCP GroupCoordinator
-        is_lse_base_on_e: True for FlashAttention (base-e), False for FlashInfer (base-2)
-        cuda_graph_buffers: Pre-allocated buffers for CUDA graph mode.
-            Keys: send_combined, recv_combined  [N, bs, H_per_rank, D+lse_pack_dim]
-                  send_lse, recv_lse            [N, bs, H_per_rank] fp32 staging
-
-    Returns:
-        [B, H_local, D] combined attention output for this rank's local heads.
+    """A2A DCP reduce: all-to-all exchange of head partials, then local Triton
+    combine. Output + fp32 LSE are packed into ONE all_to_all (LSE reinterpreted
+    as output-dtype columns along D) -> 1 NCCL call/layer instead of 2.
+    is_lse_base_on_e: True=base-e (FlashAttention), False=base-2 (FlashInfer-MLA).
     """
     if cp_group.world_size == 1:
         return cp_attn_out
@@ -500,34 +476,22 @@ def dcp_a2a_lse_reduce(
         send_lse_stg = cuda_graph_buffers["send_lse"]
         recv_lse_stg = cuda_graph_buffers["recv_lse"]
 
-        # Pack output into [:D] columns
         send_combined[:, :B, :, :D].copy_(reshaped_out)
-        # Pack LSE: fp32 → view as output dtype → copy into [D:] columns
         send_lse_stg[:, :B, :].copy_(reshaped_lse)
         send_combined[:, :, :, D:].copy_(
             send_lse_stg.view(out_dtype).view(N, -1, H_per_rank, lpd)
         )
 
-        # Single fused all_to_all
-        # Transport the packed buffer as raw bytes (uint8) so the NCCL exchange
-        # is dtype-agnostic — the attention output can be fp8 (e.g. fp8 KV cache),
-        # which pynccl's ncclDataTypeEnum.from_torch does not support. Byte-level
-        # all-to-all is exact for the equal-sized chunks; the combine reads the
-        # recv buffer back in its native dtype (shared storage).
         cp_group.all_to_all_single(
             recv_combined.reshape(-1).view(torch.uint8),
             send_combined.reshape(-1).view(torch.uint8),
         )
-
-        # Unpack output (non-contiguous view — Triton handles strides)
         recv_output = recv_combined[:, :B, :, :D]
-        # Unpack LSE: copy [D:] columns back to fp32 staging buffer
         recv_lse_stg.view(out_dtype).view(N, -1, H_per_rank, lpd).copy_(
             recv_combined[:, :, :, D:]
         )
         recv_lse = recv_lse_stg[:, :B, :]
     else:
-        # Eager path: allocate fused buffer on the fly
         send_lse_contig = reshaped_lse.contiguous()  # [N, B, H_per_rank] fp32
         send_combined = torch.empty(
             N,
@@ -544,11 +508,8 @@ def dcp_a2a_lse_reduce(
             send_lse_contig.view(out_dtype).view(N, B, H_per_rank, lpd)
         )
 
-        # Transport the packed buffer as raw bytes (uint8) so the NCCL exchange
-        # is dtype-agnostic — the attention output can be fp8 (e.g. fp8 KV cache),
-        # which pynccl's ncclDataTypeEnum.from_torch does not support. Byte-level
-        # all-to-all is exact for the equal-sized chunks; the combine reads the
-        # recv buffer back in its native dtype (shared storage).
+        # Transport as raw bytes (uint8): the output may be fp8 (fp8 KV cache),
+        # which pynccl's dtype enum can't send; byte a2a is exact for equal chunks.
         cp_group.all_to_all_single(
             recv_combined.reshape(-1).view(torch.uint8),
             send_combined.reshape(-1).view(torch.uint8),
@@ -579,12 +540,10 @@ def _dcp_fi_a2a_lse_reduce(
     cp_group: "GroupCoordinator",
     is_lse_base_on_e: bool = True,
 ) -> torch.Tensor:
-    """fi_a2a variant: delegate only the cross-rank EXCHANGE to FlashInfer's
-    MNNVL all-to-all kernel, then reuse the same local Triton LSE combine.
-
-    FlashInfer takes output and LSE as SEPARATE tensors (no manual packing):
-      partial_o     : [B, H_per_rank, cp_size, D]   (peer axis second-to-last)
-      softmax_stats : [B, H_per_rank, cp_size, 2]   fp32, S padded 1->2
+    """fi_a2a: delegate only the cross-rank exchange to FlashInfer's MNNVL kernel,
+    then reuse the local Triton LSE combine. FlashInfer takes output + LSE as
+    separate tensors: partial_o [B, H_per_rank, cp_size, D] (peer axis 2nd-to-last),
+    softmax_stats [B, H_per_rank, cp_size, 2] fp32 (S padded 1->2).
     """
     from flashinfer.comm.dcp_alltoall import decode_cp_a2a_alltoall
 

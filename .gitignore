@@ -174,7 +174,6 @@ docs/_build
 # SGL
 benchmark/mmlu/data
 benchmark/mmlu/data.tar
-benchmark/dcp/results/
 benchmark/llava_bench/images
 benchmark/llava_bench/mme_pack
 *.jsonl

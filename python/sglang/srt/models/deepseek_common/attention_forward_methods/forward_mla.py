@@ -272,10 +272,9 @@ class DeepseekMLAForwardMixin:
             self.q_lora_rank is not None
             and self._can_fuse_bmm_into_attention(forward_batch)
         )
-        # --dcp-replicate-q-proj: each DCP rank holds the full-head q_b_proj / w_kc
-        # (gathered pre-capture in model_runner), so it projects the full-head Q
-        # locally and skips the per-layer head-dim Q all-gather. Supported on the
-        # standard bf16 decode absorb path only; otherwise fall back to all-gather.
+        # --dcp-replicate-q-proj: rank holds full-head q_b_proj/w_kc (gathered
+        # pre-capture) -> projects full-head Q locally, skips the Q all-gather.
+        # bf16 decode absorb path only; else fall back to all-gather.
         q_replicate_active = (
             get_global_server_args().dcp_replicate_q_proj
             and dcp_enabled()
