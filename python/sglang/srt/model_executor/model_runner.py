@@ -142,7 +142,7 @@ from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.schedule_batch import sanity_check_mm_pad_shift_value
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -180,6 +180,7 @@ from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.platforms import current_platform
+from sglang.srt.runtime_context import get_flags
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import (
     ServerArgs,
@@ -528,19 +529,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Model-specific adjustment
         self.model_specific_adjustment()
 
-        # Set the global server_args in the scheduler process
-        set_global_server_args_for_scheduler(server_args)
-        global_server_args = get_global_server_args()
-
-        # FIXME: hacky set `use_mla_backend`
-        global_server_args.use_mla_backend = self.use_mla_backend
+        # Set the global server_args in the scheduler process (target worker
+        # only, so a draft init cannot clobber target-derived global state).
+        if not self.is_draft_worker:
+            set_global_server_args_for_scheduler(server_args)
 
         # Init OpenMP threads binding for CPU
         if self.device == "cpu":
             self.init_threads_binding()
 
         # Set float32 matmul precision
-        if server_args.enable_tf32_matmul:
+        if get_flags().enable_tf32_matmul:
             torch.set_float32_matmul_precision("high")
 
         # Get available memory before model loading.
@@ -1064,7 +1063,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def remote_instance_init_transfer_engine(self):
         try:
             from mooncake.engine import TransferEngine
-        except ImportError as e:
+        except ImportError:
             logger.warning(
                 "Please install mooncake for using remote instance transfer engine: pip install mooncake-transfer-engine"
             )
@@ -1128,6 +1127,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
 
     def model_specific_adjustment(self):
+        if self.is_draft_worker:
+            return
+
         server_args = self.server_args
 
         # HRM-Text needs bidirectional prompt attention (prefill), which only the
@@ -1180,6 +1182,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if not server_args.disable_chunked_prefix_cache:
             log_info_on_rank0(logger, "Chunked prefix cache is turned on.")
+
+        # The imperative adjustments above may overwrite fields the resolution passes
+        # already declared (HRM-Text forces attention_backend); redeclare the
+        # adjusted values so publish parity holds.
+        from sglang.srt.arg_groups.overrides import refresh_declared_fields
+
+        refresh_declared_fields(server_args, ("attention_backend",))
 
     def check_quantized_moe_compatibility(self):
         if (
@@ -2417,6 +2426,23 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         result = self._get_linear_attn_registry_result()
         return result[1] if result else None
 
+    def _record_kv_cache_dtype(self, resolved: str) -> None:
+        # Load-time resolution transition: the weight-resolved kv-cache dtype
+        # is declared into the flags tier; the dual-apply inside the helper
+        # replaces the legacy in-place write. Mock runners whose server_args
+        # is not the published object keep the plain write.
+        from sglang.srt.runtime_context import get_context
+
+        if get_context()._server_args is self.server_args:
+            from sglang.srt.arg_groups.overrides import declare_load_time_override
+
+            declare_load_time_override(
+                "ModelRunner.configure_kv_cache_dtype",
+                {"kv_cache_dtype": resolved},
+            )
+        else:
+            self.server_args.kv_cache_dtype = resolved
+
     def configure_kv_cache_dtype(self):
         if self.server_args.kv_cache_dtype == "auto":
             quant_config = getattr(self.model, "quant_config", None)
@@ -2425,16 +2451,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 isinstance(kv_cache_quant_algo, str)
                 and kv_cache_quant_algo.upper() == "FP8"
             ):
-                if _is_hip:
-                    self.kv_cache_dtype = fp8_dtype
-                    self.server_args.kv_cache_dtype = TORCH_DTYPE_TO_KV_CACHE_STR[
-                        self.kv_cache_dtype
-                    ]
-                else:
-                    self.kv_cache_dtype = torch.float8_e4m3fn
-                    self.server_args.kv_cache_dtype = TORCH_DTYPE_TO_KV_CACHE_STR[
-                        self.kv_cache_dtype
-                    ]
+                self.kv_cache_dtype = fp8_dtype if _is_hip else torch.float8_e4m3fn
+                self._record_kv_cache_dtype(
+                    TORCH_DTYPE_TO_KV_CACHE_STR[self.kv_cache_dtype]
+                )
             else:
                 self.kv_cache_dtype = self.dtype
         elif self.server_args.kv_cache_dtype == "fp8_e5m2":
@@ -2614,7 +2634,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         ):
             return
 
-        if self.device == "cpu" and not self.server_args.enable_torch_compile:
+        if self.device == "cpu" and not get_flags().capture.enable_torch_compile:
             return
 
         tic = time.perf_counter()
@@ -3072,6 +3092,54 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         return output
 
+    def _maybe_execute_deferred_mamba_cow_and_clear(
+        self, forward_batch: ForwardBatch
+    ) -> None:
+        """Run deferred clear/COW on the forward stream, before the mamba layers
+        read the pool, so the copies don't race the scheduler copy stream.
+
+        No-op unless this is an extend forward on a mamba model's target worker;
+        COW/clear only happen at prefix match on extend.
+        """
+        pool = self.req_to_token_pool
+        if (
+            not isinstance(pool, HybridReqToTokenPool)
+            or self.is_draft_worker
+            or not forward_batch.forward_mode.is_extend()
+            or forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_draft_extend_v2()
+        ):
+            return
+        if (
+            forward_batch.mamba_clear_indices is not None
+            and len(forward_batch.mamba_clear_indices) > 0
+        ):
+            # mamba_pool is a pure PHYSICAL store; translate before zeroing or
+            # clear_slots zeroes the wrong physical slots.
+            pool.mamba_pool.clear_slots(
+                pool.translate_mamba_indices(forward_batch.mamba_clear_indices)
+            )
+        if (
+            forward_batch.mamba_cow_src_indices is not None
+            and len(forward_batch.mamba_cow_src_indices) > 0
+        ):
+            if pool.mamba_ckpt_pool is not None:
+                # int8 checkpoints: dequantize src int8 ckpt slot into the active bf16 dst.
+                pool.mamba_ckpt_pool.load_to_active(
+                    pool.mamba_pool,
+                    forward_batch.mamba_cow_src_indices,
+                    forward_batch.mamba_cow_dst_indices,
+                )
+            else:
+                # mamba_pool is a pure PHYSICAL store; translate both COW slot ids.
+                pool.mamba_pool.copy_from(
+                    pool.translate_mamba_indices(forward_batch.mamba_cow_src_indices),
+                    pool.translate_mamba_indices(forward_batch.mamba_cow_dst_indices),
+                )
+        forward_batch.mamba_clear_indices = None
+        forward_batch.mamba_cow_src_indices = None
+        forward_batch.mamba_cow_dst_indices = None
+
     def _forward_raw(
         self,
         forward_batch: ForwardBatch,
@@ -3118,6 +3186,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             # global_dp_buffer_len / padded token counts that graph eligibility
             # and the collectives depend on.
             self._prepare_eager_forward_batch(forward_batch)
+
+            # Deferred mamba COW/clear on the forward stream, before the extend
+            # dispatch below reads the pool.
+            self._maybe_execute_deferred_mamba_cow_and_clear(forward_batch)
 
             if forward_batch.forward_mode.is_split_prefill():
                 # Layer-split mode; stays on ModelRunner, not the eager runner.
