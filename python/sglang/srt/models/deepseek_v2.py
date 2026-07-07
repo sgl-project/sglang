@@ -497,9 +497,8 @@ class MoEGate(nn.Module):
             if _is_cuda:
                 from sglang.jit_kernel.dsv4 import linear_bf16_fp32
 
-                logits = linear_bf16_fp32(hidden_states, self.weight)
-            else:
-                logits = F.linear(hidden_states, self.weight, None)
+                return linear_bf16_fp32(hidden_states, self.weight)
+            return F.linear(hidden_states, self.weight, None)
         else:
             # NOTE(b8zhong): this threshold has been empirically verified
             max_router_gemm_tokens = 4 if _device_sm in (100, 103) else 16
