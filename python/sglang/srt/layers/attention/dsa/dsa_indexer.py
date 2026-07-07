@@ -8,12 +8,22 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 import torch
 from einops import rearrange
 
+from sglang.jit_kernel.dsa import (
+    aiter_paged_mqa_logits,
+    cutedsl_paged_mqa_logits,
+    deepgemm_paged_mqa_logits_native,
+    deepgemm_paged_mqa_logits_split,
+    pick_dsl_expand,
+)
 from sglang.jit_kernel.fused_store_index_cache import (
     can_use_dsa_fused_store,
     fused_store_index_k_cache,
 )
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsa.paged_mqa_logits_backend import (
+    DSAPagedMQALogitsBackend,
+)
 from sglang.srt.layers.attention.dsa.utils import (
     aiter_can_use_preshuffle_paged_mqa,
     is_dsa_enable_prefill_cp,
@@ -34,7 +44,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     get_tc_piecewise_forward_context,
     is_in_tc_piecewise_cuda_graph,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.state_capturer.indexer_topk import (
     maybe_capture_indexer_topk,
 )
@@ -431,6 +441,10 @@ class Indexer(MultiPlatformOp):
         self.scale_fmt = scale_fmt
         self.softmax_scale = self.head_dim**-0.5
 
+        self.paged_mqa_logits_backend = DSAPagedMQALogitsBackend.resolve(
+            get_server_args().dsa_paged_mqa_logits_backend
+        )
+
     @contextlib.contextmanager
     def _with_real_sm_count(self):
         # When pipeline parallelism is enabled, each PP rank initiates a recv operation after the _pp_launch_batch
@@ -818,22 +832,35 @@ class Indexer(MultiPlatformOp):
         # Reuse pre-computed schedule metadata if available (from init_forward_metadata),
         # otherwise fall back to computing it here.
         schedule_metadata = getattr(metadata, "paged_mqa_schedule_metadata", None)
-
         assert len(q_fp8.shape) == 3
         # attn_tp_size > 1 or MAX_LEN padding mode can leave padding in the
         # hidden states; q_offset is the real (unpadded) q length.
         q_offset = sum(metadata.get_dsa_extend_len_cpu())
 
-        # DG-native q=[B,next_n,H,D] is faster than expanded q=[B*next_n,1,H,D]
-        # for target_verify with next_n>=2 (bigger MMA tile, fewer atoms). The
-        # precomputed ctx_lens_2d's shape is the single source of truth — if
-        # dsa_backend chose the per-token layout (e.g. non-SM100), fall through
-        # to the expanded path.
         B = metadata.get_seqlens_int32().shape[0]
         next_n = q_offset // B if B > 0 else 0
+        use_cute_dsl = (
+            self.paged_mqa_logits_backend.is_cutedsl()
+            and not forward_batch.forward_mode.is_draft_extend_v2()
+        )
+        dsl_expand_factor, dsl_atom = 1, 1
+        if (
+            use_cute_dsl
+            and forward_batch.forward_mode.is_target_verify()
+            and next_n >= 2
+        ):
+            dsl_expand_factor, dsl_atom = pick_dsl_expand(
+                next_n,
+                batch_size=B,
+                max_ctx=max_seq_len,
+                num_sms=self.sm_count,
+                kernel_atoms=(1, 2, 3, 4),
+                num_heads=self.n_heads,
+            )
         ctx_2d = getattr(metadata, "paged_mqa_ctx_lens_2d", None)
         use_dg_native = (
-            _is_cuda
+            not use_cute_dsl
+            and _is_cuda
             and forward_batch.forward_mode.is_target_verify()
             and next_n >= 2
             and ctx_2d is not None
@@ -862,51 +889,61 @@ class Indexer(MultiPlatformOp):
         assert len(weights.shape) == 3
         weights = weights.squeeze(2)
 
-        if _is_hip:
-            from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
-
-            q_fp8 = q_fp8.unsqueeze(1)
-            batch_size, next_n, heads, _ = q_fp8.shape
-            logits = torch.empty(
-                (batch_size * next_n, max_seq_len),
-                device=q_fp8.device,
-                dtype=torch.float32,
-            )
-            deepgemm_fp8_paged_mqa_logits(
+        if self.paged_mqa_logits_backend.is_aiter():
+            logits = aiter_paged_mqa_logits(
                 q_fp8,
                 kv_cache_fp8,
                 weights,
-                logits,
                 seqlens_32,
                 block_tables,
                 max_seq_len,
-                Preshuffle=_use_aiter_preshuffle,
-                KVBlockSize=block_kv,
+                preshuffle=_use_aiter_preshuffle,
+                kv_block_size=block_kv,
             )
-        elif use_dg_native:
-            # block_tables[::next_n] de-expands dsa_backend's repeat_interleave
-            # without a copy (DG only checks `stride(1) == 1`).
-            logits = deep_gemm.fp8_paged_mqa_logits(
-                q_fp8[:q_offset].view(B, next_n, q_fp8.shape[1], q_fp8.shape[2]),
+        elif use_cute_dsl:
+            logits = cutedsl_paged_mqa_logits(
+                q_fp8,
                 kv_cache_fp8,
-                weights[:q_offset],
-                seqlens_32_2d,
-                block_tables[::next_n],
+                weights,
+                metadata.get_seqlens_int32(),
+                block_tables,
                 schedule_metadata,
                 max_seq_len,
-                clean_logits=False,
+                q_offset=q_offset,
+                B=B,
+                next_n=next_n,
+                is_target_verify=forward_batch.forward_mode.is_target_verify(),
+                dsl_expand_factor=dsl_expand_factor,
+                dsl_atom=dsl_atom,
+                blocksize=blocksize,
+                sm_count=self.sm_count,
+                get_paged_mqa_logits_metadata_fn=deep_gemm.get_paged_mqa_logits_metadata,
             )
-        else:
-            q_fp8 = q_fp8.unsqueeze(1)
-            logits = deep_gemm.fp8_paged_mqa_logits(
-                q_fp8[:q_offset],
+        elif use_dg_native:
+            logits = deepgemm_paged_mqa_logits_native(
+                deep_gemm.fp8_paged_mqa_logits,
+                q_fp8,
                 kv_cache_fp8,
-                weights[:q_offset],
+                weights,
                 seqlens_32_2d,
                 block_tables,
                 schedule_metadata,
                 max_seq_len,
-                clean_logits=False,
+                q_offset=q_offset,
+                B=B,
+                next_n=next_n,
+            )
+        else:
+            logits = deepgemm_paged_mqa_logits_split(
+                deep_gemm.fp8_paged_mqa_logits,
+                q_fp8,
+                kv_cache_fp8,
+                weights,
+                seqlens_32_2d,
+                block_tables,
+                schedule_metadata,
+                max_seq_len,
+                q_offset=q_offset,
             )
 
         # NOTE(dark): logits should be cleaned in topk_transform

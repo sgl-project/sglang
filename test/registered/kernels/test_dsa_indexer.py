@@ -260,6 +260,7 @@ class MockModelRunner:
                 "dsa_prefill_backend": "flashmla_sparse",
                 "dsa_decode_backend": "fa3",
                 "dsa_topk_backend": "sgl-kernel",
+                "dsa_paged_mqa_logits_backend": "auto",
             },
         )()
         self.hisparse_coordinator = None
