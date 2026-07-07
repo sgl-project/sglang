@@ -1311,7 +1311,7 @@ class TestDSparkRuntimeDebugEvidence(CustomTestCase):
         )
         draft_input = self.draft_input_cls(
             bonus_tokens=t.tensor([0], dtype=t.int64),
-            new_seq_lens=t.tensor([1], dtype=t.int64),
+            new_seq_lens=t.tensor([0], dtype=t.int64),
             prefill_tail_hidden_states=t.ones((1, 4, 3)),
             prefill_tail_valid_mask=t.ones((1, 4), dtype=t.bool),
         )
@@ -1320,7 +1320,7 @@ class TestDSparkRuntimeDebugEvidence(CustomTestCase):
             worker,
             draft_input=draft_input,
             batch=SimpleNamespace(req_pool_indices=t.tensor([0], dtype=t.int64)),
-            prefix_lens=t.tensor([1], dtype=t.int64),
+            prefix_lens=t.tensor([0], dtype=t.int64),
         )
 
         self.assertEqual(materialize_calls, [])
@@ -1387,7 +1387,8 @@ class TestDSparkRuntimeDebugEvidence(CustomTestCase):
         self.assertEqual(payload["writes"]["swa_locs"], [113, 114])
         history = self.worker_cls._prefill_tail_replay_history_debug(worker, 9)
         self.assertEqual(history["valid_write_count"], 2)
-        self.assertEqual(history["writes"]["hidden"]["shape"], [2, 2])
+        self.assertEqual(history["write_positions_first_last"], [3, 4])
+        self.assertEqual(history["write_swa_first_last"], [113, 114])
 
     def test_materialize_state_uses_main_hidden_for_kv_by_default(self):
         t = self.torch
