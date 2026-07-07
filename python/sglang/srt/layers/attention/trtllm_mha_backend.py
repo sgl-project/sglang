@@ -264,15 +264,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         return self.forward_metadata.page_table
 
     @staticmethod
-    def _fill_cu_seqlens_k(metadata: TRTLLMMHAMetadata):
-        torch.cumsum(
-            metadata.cache_seqlens_int32,
-            dim=0,
-            dtype=torch.int32,
-            out=metadata.cu_seqlens_k[1:],
-        )
-
-    @staticmethod
     def _get_scalar_scale(
         layer: RadixAttention,
         float_attr: str,
