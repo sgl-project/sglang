@@ -339,6 +339,10 @@ class Resources(_FlagGroupBase):
     lplb_solvers: dict = dataclasses.field(default_factory=dict)
     # Named side streams (see RuntimeContext.get_stream): name -> stream.
     streams: dict = dataclasses.field(default_factory=dict)
+    # Named persistent buffers (see RuntimeContext.get_buffer): name -> tensor.
+    # Accessors with bespoke semantics (grow-only, per-device keys) manage
+    # their entries directly.
+    buffers: dict = dataclasses.field(default_factory=dict)
     # Persistent reusable CUDA events for non-EP DP TBO, keyed by
     # (kind, subbatch) — see dp_attention._tbo_event for why reuse matters.
     tbo_event_pool: dict = dataclasses.field(default_factory=dict)
@@ -374,6 +378,16 @@ class RuntimeContext:
         tests and backends that bring their own stream."""
         self.resources.streams[name] = stream
         return stream
+
+    def get_buffer(self, name: str, factory: Any) -> Any:
+        """Named process-level persistent buffer: get-or-create via
+        ``factory()``, shared by name (the keyed-lazy pattern of the
+        persistent buffers / named streams)."""
+        buf = self.resources.buffers.get(name)
+        if buf is None:
+            buf = factory()
+            self.resources.buffers[name] = buf
+        return buf
 
     @property
     def server_args(self) -> ServerArgs:
@@ -431,6 +445,10 @@ def get_stream(name: str) -> Any:
 
 def set_stream(name: str, stream: Any) -> Any:
     return _CONTEXT.set_stream(name, stream)
+
+
+def get_buffer(name: str, factory: Any) -> Any:
+    return _CONTEXT.get_buffer(name, factory)
 
 
 def reset_context() -> None:

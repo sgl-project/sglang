@@ -436,6 +436,20 @@ class TestNamedStreams(_IsolatedServerArgs):
         self.assertIsNot(a, c)
         self.assertEqual(len(created), 2)
 
+    def test_get_buffer_keyed_lazy(self):
+        reset_context()
+        created = []
+
+        def factory():
+            created.append(object())
+            return created[-1]
+
+        a = get_context().get_buffer("ws", factory)
+        b = get_context().get_buffer("ws", factory)
+        self.assertIs(a, b)
+        self.assertEqual(len(created), 1)
+        self.assertIsNot(get_context().get_buffer("other", factory), a)
+
     def test_set_stream_installs_explicitly(self):
         reset_context()
         sentinel = object()
