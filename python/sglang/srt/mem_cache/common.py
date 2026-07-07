@@ -25,6 +25,7 @@ from sglang.srt.mem_cache.triton_ops.common import (
     get_last_loc_triton_safe,
     write_req_to_token_pool_triton,
 )
+from sglang.srt.runtime_context import get_flags
 from sglang.srt.server_args import ServerArgs, get_global_server_args
 from sglang.srt.utils import is_cuda, is_hip, is_npu, support_triton
 from sglang.srt.utils.common import ceil_align, is_pin_memory_available
@@ -133,7 +134,7 @@ def write_cache_indices(
     prefix_tensors: list[torch.Tensor],
     req_to_token_pool: ReqToTokenPool,
 ):
-    if support_triton(get_global_server_args().attention_backend):
+    if support_triton(get_flags().attn.backend):
         prefix_pointers = torch.tensor(
             [t.data_ptr() for t in prefix_tensors],
             dtype=torch.uint64,
@@ -174,7 +175,7 @@ def get_last_loc(
     req_pool_indices_tensor: torch.Tensor,
     prefix_lens_tensor: torch.Tensor,
 ) -> torch.Tensor:
-    attn_backend = get_global_server_args().attention_backend
+    attn_backend = get_flags().attn.backend
     uses_triton_dispatch = attn_backend not in ("ascend", "torch_native")
 
     if _is_hip and uses_triton_dispatch:
