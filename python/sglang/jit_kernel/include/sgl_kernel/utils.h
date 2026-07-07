@@ -165,7 +165,7 @@ inline constexpr auto div_ceil(T a, U b) {
 
 /// \brief Smallest power of two >= x (returns 1 for x <= 1, up to 2^31).
 /// Common host-side bit trick shared by the MoE align / sort kernels.
-__host__ __forceinline__ uint32_t next_pow2(uint32_t x) noexcept {
+inline constexpr uint32_t next_pow2(uint32_t x) noexcept {
   --x;
   x |= x >> 1;
   x |= x >> 2;
