@@ -57,10 +57,7 @@ class WanPipeline(LoRAPipeline, ComposedPipelineBase):
         self.add_stage(InputValidationStage())
         self.add_standard_text_encoding_stage()
         self.add_standard_latent_preparation_stage()
-        # Serving keeps UniPC; requests with rollout=True bind a first-order
-        # flow-match Euler scheduler, which the RL SDE/log-prob path requires.
-        # Passed as a factory so it is only initialized on the first rollout
-        # request — a pure-serving engine never constructs it.
+        # rollout=True requests lazily bind a flow-match Euler scheduler (RL SDE path).
         self.add_stage(
             TimestepPreparationStage(
                 scheduler=self.get_module("scheduler"),
