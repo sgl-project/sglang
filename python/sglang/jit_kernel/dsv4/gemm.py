@@ -107,9 +107,19 @@ def _linear_bf16_fp32_hpc_ops(
     )
 
 
-def linear_bf16_fp32(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+def linear_bf16_fp32(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    *,
+    hpc_ops_min_m: Optional[int] = None,
+) -> torch.Tensor:
     if _use_aiter and y.dtype == torch.bfloat16:
         return tgemm.mm(x, y, otype=x.dtype).float()
+    elif hpc_ops_min_m is not None:
+        output = _linear_bf16_fp32_hpc_ops(x, y, min_m=hpc_ops_min_m)
+        if output is not None:
+            return output
+        return _linear_bf16_fp32_cublas(x, y)
     elif _linear_bf16_fp32_algo == "hpc_ops":
         output = _linear_bf16_fp32_hpc_ops(x, y)
         if output is not None:

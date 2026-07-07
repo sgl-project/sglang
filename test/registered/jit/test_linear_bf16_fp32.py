@@ -5,6 +5,7 @@ import sys
 import pytest
 import torch
 
+import sglang.jit_kernel.dsv4.gemm as dsv4_gemm
 from sglang.jit_kernel.dsv4.gemm import (
     _linear_bf16_fp32_hpc_ops,
     linear_bf16_fp32,
@@ -28,6 +29,44 @@ def test_linear_bf16_fp32_matches_fp32_reference(weight_dtype, m):
     assert out.shape == (m, 256)
     assert out.dtype == torch.float32
     torch.testing.assert_close(out, ref, atol=1e-1, rtol=8e-2)
+
+
+def test_linear_bf16_fp32_explicit_hpc_ops_dispatch(monkeypatch):
+    x = torch.randn((8, 16), dtype=torch.bfloat16)
+    w = torch.randn((64, 16), dtype=torch.float32)
+    expected = torch.randn((8, 64), dtype=torch.float32)
+    seen_min_m = []
+
+    def fake_hpc_ops(x_arg, w_arg, *, min_m=8, **_kwargs):
+        assert x_arg is x
+        assert w_arg is w
+        seen_min_m.append(min_m)
+        return expected
+
+    monkeypatch.setattr(dsv4_gemm, "_linear_bf16_fp32_hpc_ops", fake_hpc_ops)
+
+    out = linear_bf16_fp32(x, w, hpc_ops_min_m=128)
+
+    assert out is expected
+    assert seen_min_m == [128]
+
+
+def test_linear_bf16_fp32_explicit_hpc_ops_fallback(monkeypatch):
+    x = torch.randn((8, 16), dtype=torch.bfloat16)
+    w = torch.randn((64, 16), dtype=torch.float32)
+
+    monkeypatch.setattr(
+        dsv4_gemm,
+        "_linear_bf16_fp32_hpc_ops",
+        lambda *_args, **_kwargs: None,
+    )
+
+    out = linear_bf16_fp32(x, w, hpc_ops_min_m=128)
+    ref = x.float() @ w.t()
+
+    assert out.shape == (8, 64)
+    assert out.dtype == torch.float32
+    torch.testing.assert_close(out, ref)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
