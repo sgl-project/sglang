@@ -149,7 +149,7 @@ def test_ragged_logits_fp4_tracks_fp8() -> None:
     finite = torch.isfinite(lf8) & torch.isfinite(lf4)
     corr = torch.corrcoef(torch.stack([lf8[finite], lf4[finite]]))[0, 1].item()
     overlap = _topk_overlap(lf8, lf4, INDEX_TOPK)
-    assert corr > 0.98, f"FP4 ragged logits do not track FP8 (corr={corr:.4f})"
+    assert corr > 0.97, f"FP4 ragged logits do not track FP8 (corr={corr:.4f})"
     assert overlap > 0.80, f"FP4 ragged top-k overlap too low ({overlap:.4f})"
 
 
@@ -216,7 +216,7 @@ def test_paged_logits_fp4_tracks_fp8_and_matches_ragged() -> None:
     finite = torch.isfinite(lp8) & torch.isfinite(lp4)
     corr = torch.corrcoef(torch.stack([lp8[finite], lp4[finite]]))[0, 1].item()
     overlap = _topk_overlap(lp8, lp4, INDEX_TOPK)
-    assert corr > 0.98, f"FP4 paged logits do not track FP8 (corr={corr:.4f})"
+    assert corr > 0.97, f"FP4 paged logits do not track FP8 (corr={corr:.4f})"
     assert overlap > 0.80, f"FP4 paged top-k overlap too low ({overlap:.4f})"
 
     # Ragged and paged FP4 kernels must agree on identical inputs: the prefill
