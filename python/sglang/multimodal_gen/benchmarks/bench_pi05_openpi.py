@@ -26,6 +26,11 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if sys.path and Path(sys.path[0]).resolve() == SCRIPT_DIR:
     sys.path.pop(0)
 
+from sglang.multimodal_gen.runtime.entrypoints.action_utils import (  # noqa: E402
+    pack_msgpack,
+    unpack_msgpack,
+)
+
 
 @dataclass(frozen=True)
 class Pi05BenchProfile:
@@ -265,54 +270,6 @@ def _json_tensor(array: np.ndarray) -> dict[str, Any]:
         "shape": list(array.shape),
         "values": array.tolist(),
     }
-
-
-def pack_numpy_payload(obj):
-    if isinstance(obj, (np.ndarray, np.generic)) and obj.dtype.kind in ("V", "O", "c"):
-        raise ValueError(f"Unsupported dtype: {obj.dtype}")
-    if isinstance(obj, np.ndarray):
-        return {
-            b"__ndarray__": True,
-            b"data": obj.tobytes(),
-            b"dtype": obj.dtype.str,
-            b"shape": obj.shape,
-        }
-    if isinstance(obj, np.generic):
-        return {
-            b"__npgeneric__": True,
-            b"data": obj.item(),
-            b"dtype": obj.dtype.str,
-        }
-    return obj
-
-
-def unpack_numpy_payload(obj):
-    ndarray_marker = obj.get("__ndarray__") or obj.get(b"__ndarray__")
-    npgeneric_marker = obj.get("__npgeneric__") or obj.get(b"__npgeneric__")
-    data = obj.get("data", obj.get(b"data"))
-    dtype = obj.get("dtype", obj.get(b"dtype"))
-    shape = obj.get("shape", obj.get(b"shape"))
-    if ndarray_marker:
-        return np.ndarray(
-            buffer=data,
-            dtype=np.dtype(dtype),
-            shape=shape,
-        )
-    if npgeneric_marker:
-        return np.dtype(dtype).type(data)
-    return obj
-
-
-def pack_msgpack(payload: Any) -> bytes:
-    import msgpack
-
-    return msgpack.packb(payload, default=pack_numpy_payload, use_bin_type=True)
-
-
-def unpack_msgpack(payload: bytes) -> Any:
-    import msgpack
-
-    return msgpack.unpackb(payload, object_hook=unpack_numpy_payload, raw=False)
 
 
 def build_sglang_payload(

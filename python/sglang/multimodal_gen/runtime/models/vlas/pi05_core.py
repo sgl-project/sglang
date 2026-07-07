@@ -24,6 +24,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     model_parallel_is_initialized,
 )
 from sglang.multimodal_gen.runtime.layers.attention import LocalAttention, USPAttention
+from sglang.multimodal_gen.runtime.layers.rotary_embedding import RotaryEmbedding
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.srt.layers.activation import GeluAndMul
@@ -226,48 +227,22 @@ class PiGemmaRotaryEmbedding(nn.Module):
             raise ValueError(
                 f"Unsupported PiGemma rope type: {rope_parameters['rope_type']}"
             )
-        self.rope_theta = rope_parameters["rope_theta"]
-        cos_cached, sin_cached = self._build_cache(
-            self.max_seq_len_cached,
-            device=None,
+        self.rope = RotaryEmbedding(
+            head_size=self.head_dim,
+            rotary_dim=self.head_dim,
+            max_position_embeddings=self.max_seq_len_cached,
+            base=rope_parameters["rope_theta"],
+            is_neox_style=True,
+            dtype=torch.float32,
         )
-        self.register_buffer("cos_cached", cos_cached, persistent=False)
-        self.register_buffer("sin_cached", sin_cached, persistent=False)
-
-    def _compute_inv_freq(self, device: torch.device | None) -> torch.Tensor:
-        return 1.0 / (
-            self.rope_theta
-            ** (
-                torch.arange(
-                    0,
-                    self.head_dim,
-                    2,
-                    dtype=torch.float,
-                    device=device,
-                )
-                / self.head_dim
-            )
-        )
-
-    def _build_cache(
-        self,
-        seq_len: int,
-        *,
-        device: torch.device | None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        inv_freq = self._compute_inv_freq(device=device)
-        positions = torch.arange(seq_len, dtype=torch.float, device=device)
-        freqs = torch.einsum("i,j->ij", positions, inv_freq)
-        emb = torch.cat((freqs, freqs), dim=-1)
-        return emb.cos(), emb.sin()
 
     def _ensure_cache(self, x: torch.Tensor) -> None:
-        if self.cos_cached.device == x.device and self.cos_cached.dtype == torch.float:
+        cache = self.rope.cos_sin_cache
+        if cache.device == x.device and cache.dtype == torch.float:
             return
-        self.cos_cached, self.sin_cached = self._build_cache(
-            self.max_seq_len_cached,
-            device=x.device,
-        )
+        if cache.dtype != torch.float:
+            cache = self.rope._compute_cos_sin_cache()
+        self.rope.cos_sin_cache = cache.to(device=x.device, dtype=torch.float)
 
     def forward(
         self,
@@ -276,8 +251,10 @@ class PiGemmaRotaryEmbedding(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         self._ensure_cache(x)
         flat_positions = position_ids.reshape(-1)
-        cos = self.cos_cached.index_select(0, flat_positions)
-        sin = self.sin_cached.index_select(0, flat_positions)
+        cos_sin = self.rope.cos_sin_cache.index_select(0, flat_positions)
+        cos_half, sin_half = cos_sin.chunk(2, dim=-1)
+        cos = torch.cat((cos_half, cos_half), dim=-1)
+        sin = torch.cat((sin_half, sin_half), dim=-1)
         output_shape = (*position_ids.shape, self.head_dim)
         return cos.reshape(output_shape).to(x.dtype), sin.reshape(output_shape).to(
             x.dtype
@@ -829,40 +806,6 @@ def siglip_vision_forward_with_openpi_dtype(
         hidden_states=encoder_outputs.hidden_states,
         attentions=encoder_outputs.attentions,
     )
-
-
-class ReadOnlyPrefixCache:
-    def __init__(self, past_key_values):
-        self.layers = tuple(past_key_values)
-
-    def get_seq_length(self, layer_idx: int = 0) -> int:
-        if layer_idx >= len(self.layers):
-            return 0
-        return int(self.layers[layer_idx][0].shape[-2])
-
-    def get_mask_sizes(
-        self,
-        cache_position: torch.Tensor,
-        layer_idx: int,
-    ) -> tuple[int, int]:
-        return self.get_seq_length(layer_idx) + int(cache_position.shape[0]), 0
-
-    def update(
-        self,
-        key_states: torch.Tensor,
-        value_states: torch.Tensor,
-        layer_idx: int,
-        cache_kwargs=None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        prefix_keys, prefix_values, _ = self.layers[layer_idx]
-        return (
-            torch.cat([prefix_keys, key_states], dim=-2),
-            torch.cat([prefix_values, value_states], dim=-2),
-        )
-
-    def get_prefix(self, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-        prefix_keys, prefix_values, _ = self.layers[layer_idx]
-        return prefix_keys, prefix_values
 
 
 def compute_layer_complete(
@@ -1442,7 +1385,10 @@ class Pi05CoreModel(nn.Module):
             outputs_embeds, _ = self.paligemma_with_expert.forward(
                 attention_mask=attention_mask,
                 position_ids=position_ids,
-                past_key_values=ReadOnlyPrefixCache(past_key_values),
+                past_key_values=VLADensePrefixCache(
+                    past_key_values,
+                    read_only=True,
+                ),
                 inputs_embeds=[None, suffix_embs],
                 use_cache=False,
                 adarms_cond=[None, adarms_cond],

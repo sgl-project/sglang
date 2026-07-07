@@ -6,6 +6,7 @@ import hashlib
 import json
 from array import array
 from collections import OrderedDict
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -43,9 +44,12 @@ class PrefixContext:
 class VLADensePrefixCache:
     def __init__(
         self,
-        layers: tuple[tuple[torch.Tensor, torch.Tensor, Any], ...] | None = None,
+        layers: Iterable[tuple[torch.Tensor, torch.Tensor, Any]] | None = None,
+        *,
+        read_only: bool = False,
     ):
         self.layers = list(layers or ())
+        self.read_only = read_only
 
     def __iter__(self):
         return iter(self.layers)
@@ -68,6 +72,10 @@ class VLADensePrefixCache:
     ) -> tuple[int, int]:
         return self.get_seq_length(layer_idx) + int(cache_position.shape[0]), 0
 
+    def get_prefix(self, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        prefix_keys, prefix_values, _ = self.layers[layer_idx]
+        return prefix_keys, prefix_values
+
     def update(
         self,
         key_states: torch.Tensor,
@@ -75,6 +83,13 @@ class VLADensePrefixCache:
         layer_idx: int,
         cache_kwargs=None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.read_only:
+            prefix_keys, prefix_values = self.get_prefix(layer_idx)
+            return (
+                torch.cat([prefix_keys, key_states], dim=-2),
+                torch.cat([prefix_values, value_states], dim=-2),
+            )
+
         if layer_idx == len(self.layers):
             self.layers.append((key_states, value_states, None))
             return key_states, value_states
