@@ -30,7 +30,6 @@ class HostSharedMemoryManager:
         self._operation_index += 1
         shm_name = f"{self._base_name}_op{self._operation_index}"
 
-        # TODO handle dispose
         if get_naive_distributed().get_rank() == 0:
             shm = shared_memory.SharedMemory(name=shm_name, create=True, size=num_bytes)
 
@@ -59,6 +58,36 @@ class HostSharedMemoryManager:
         )
         return tensor
 
+    def dispose(self):
+        import cuda.bindings.runtime as cuda_rt
+
+        for record in self._records:
+            # Unregister cuda host memory
+            try:
+                check_cuda_result(cuda_rt.cudaHostUnregister(record.tensor.data_ptr()))
+            except Exception as e:
+                logger.warning(
+                    f"Failed to cudaHostUnregister in HostSharedMemoryManager: {e}"
+                )
+
+            # Close shared memory
+            try:
+                record.shm.close()
+            except Exception as e:
+                logger.warning(
+                    f"Failed to close shared memory in HostSharedMemoryManager: {e}"
+                )
+
+            # Unlink shared memory
+            try:
+                if get_naive_distributed().get_rank() == 0:
+                    record.shm.unlink()
+            except Exception:
+                # Ignore unlink failures (e.g. already unlinked)
+                pass
+
+        self._records.clear()
+
 
 @dataclass
 class _Record:
@@ -80,3 +109,10 @@ def set_host_shared_memory_manager(instance: HostSharedMemoryManager):
     global _instance
     assert _instance is None
     _instance = instance
+
+
+def dispose_host_shared_memory_manager():
+    global _instance
+    if _instance is not None:
+        _instance.dispose()
+        _instance = None
