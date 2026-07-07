@@ -101,6 +101,11 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         forward_mode = getattr(forward_batch, "forward_mode", None)
         if forward_mode is not None and not forward_mode.is_context_parallel_extend():
             return False
+        if forward_mode is not None:
+            from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+            if forward_mode == ForwardMode.MIXED:
+                return False
 
         extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
         if extend_lens is None:

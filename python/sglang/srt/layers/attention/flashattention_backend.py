@@ -45,6 +45,19 @@ from sglang.jit_kernel.flash_attention import (
 from sglang.srt.model_executor.cuda_graph_config import cuda_graph_fully_disabled
 
 
+def _should_disable_scheduler_metadata_precompute(
+    server_args, attn_cp_size: int
+) -> bool:
+    prefill_cp_enabled = bool(
+        getattr(server_args, "enable_prefill_context_parallel", False)
+        or getattr(server_args, "enable_prefill_cp", False)
+    )
+    return bool(
+        getattr(server_args, "enable_dp_attention", False)
+        or (prefill_cp_enabled and attn_cp_size > 1)
+    )
+
+
 @triton.jit
 def _build_pa_page_table_kernel(
     req_to_token_ptr,
@@ -361,14 +374,15 @@ class FlashAttentionBackend(AttentionBackend):
             and not self.use_mla
         )
 
-        # Skip the FA3 scheduler_metadata precompute (PR #21104) under DP
-        # attention. The precomputed buffer can become inconsistent with the
-        # num_splits the C++ mha_fwd kernel derives from live cache_seqlens
-        # during decode, leading to an OOB read in the split-KV combine kernel
-        # (flash_fwd_combine_launch_template.h:52). Leaving scheduler_metadata
-        # unset uses the existing per-layer metadata path.
-        self._disable_scheduler_metadata_precompute = bool(
-            getattr(server_args, "enable_dp_attention", False)
+        # Skip the FA3 scheduler_metadata precompute (PR #21104) when distributed
+        # attention modes can change live cache_seqlens/num_splits across ranks.
+        # A stale precomputed buffer can lead to an OOB read in the split-KV
+        # combine kernel (flash_fwd_combine_launch_template.h:52). Leaving
+        # scheduler_metadata unset uses the existing per-layer metadata path.
+        self._disable_scheduler_metadata_precompute = (
+            _should_disable_scheduler_metadata_precompute(
+                server_args, self.attn_cp_size
+            )
         )
 
     def _compute_scheduler_metadata(
