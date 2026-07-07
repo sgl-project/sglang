@@ -98,18 +98,6 @@ apt-get install -y --no-install-recommends libfabric-dev || {
 # Install DeepEP
 DEEPEP_DIR=/root/.cache/deepep
 rm -rf ${DEEPEP_DIR}
-
-# Runner images may carry a DeepEP from a previous bake installed via
-# `setup.py install`, i.e. an egg + easy-install.pth entry that `pip/uv
-# uninstall` cannot remove and that shadows the fresh install at import time
-# (eggs are prepended to sys.path). Scrub stale deep_ep eggs explicitly.
-for _site in /usr/local/lib/python3*/dist-packages /usr/lib/python3*/dist-packages; do
-    [ -d "${_site}" ] || continue
-    rm -rf "${_site}"/deep_ep-*.egg
-    if [ -f "${_site}/easy-install.pth" ]; then
-        sed -i "/deep_ep-/d" "${_site}/easy-install.pth"
-    fi
-done
 if [ "$GRACE_BLACKWELL" = "1" ]; then
     GRACE_BLACKWELL_DEEPEP_BRANCH=hybrid-ep
     git clone https://github.com/deepseek-ai/DeepEP.git -b ${GRACE_BLACKWELL_DEEPEP_BRANCH} ${DEEPEP_DIR} && \
@@ -118,17 +106,9 @@ if [ "$GRACE_BLACKWELL" = "1" ]; then
     sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && \
     popd
 else
-    # DeepEP d4f41e4 (v1.2.1-32) is the first pinned commit that ships DeepEP v2's
-    # ElasticBuffer (DeepEP v2 was introduced in DeepEP #605 / b306af0). It is a
-    # descendant of the previous pin 9af0e0d0 and still exports the legacy v1
-    # `Buffer`, so the existing DeepEP backend keeps working while the `deepep_v2`
-    # MoE A2A backend can now import `ElasticBuffer`. DeepEP v2 links NCCL's symmetric
-    # memory API (nccl::NCCLSymmetricMemoryContext); the build therefore needs an
-    # NCCL that ships the symmetric-memory headers (verified with
-    # nvidia-nccl-cu13>=2.30.7).
     git clone https://github.com/deepseek-ai/DeepEP.git ${DEEPEP_DIR} && \
     pushd ${DEEPEP_DIR} && \
-    git checkout d4f41e4e93602a15e95f55f6ee8df8f1aaa0e4bb && \
+    git checkout 9af0e0d0e74f3577af1979c9b9e1ac2cad0104ee && \
     popd
 fi
 
@@ -193,31 +173,5 @@ else
     else
         CHOSEN_TORCH_CUDA_ARCH_LIST='9.0'
     fi
-    # DeepEP d4f41e4's NCCL backend (csrc/kernels/backend/nccl.cu) uses NCCL's
-    # GIN / symmetric-memory API (ncclCommQueryProperties, NCCL_GIN_*), which
-    # requires NCCL >= 2.30 at build AND run time; older wheels (e.g. 2.28.x)
-    # fail the build with "identifier ncclCommProperties is undefined". The
-    # official pip wheels ship the full dev headers and DeepEP's setup.py
-    # auto-detects the pip package, so upgrading the wheel is sufficient (NCCL
-    # is backward compatible, so the rest of the job runs unchanged).
-    CUDA_MAJOR="${CUDA_VERSION%%.*}"
-    if [ "$CUDA_MAJOR" = "12" ] || [ "$CUDA_MAJOR" = "13" ]; then
-        ${PIP_CMD:-pip} install --no-deps "nvidia-nccl-cu${CUDA_MAJOR}>=2.30.3" ${PIP_INSTALL_SUFFIX:-}
-    fi
     TORCH_CUDA_ARCH_LIST="${CHOSEN_TORCH_CUDA_ARCH_LIST}" python3 setup.py install
-fi
-
-# Post-install verification: the legacy v1 `Buffer` must still import (the existing
-# DeepEP backend depends on it), and on the default pin the v2 `ElasticBuffer` must
-# import as well. Importing `ElasticBuffer` also exercises the NCCL symmetric-memory
-# API (nccl::NCCLSymmetricMemoryContext) that deepep_v2 links, so a clean import
-# confirms the build found an NCCL shipping the symmetric-memory headers.
-# The check must run outside ${DEEPEP_DIR}: the source tree contains a deep_ep/
-# package directory without the built _C extension, which would shadow the
-# installed package via sys.path[0] and fail the import spuriously.
-cd /
-if [ "$GRACE_BLACKWELL" = "1" ]; then
-    python3 -c "from deep_ep import Buffer; print('DeepEP install verified: v1 Buffer imports')"
-else
-    python3 -c "from deep_ep import Buffer, ElasticBuffer; print('DeepEP install verified: v1 Buffer + v2 ElasticBuffer import')"
 fi

@@ -8,7 +8,7 @@ ARG GRACE_BLACKWELL=0
 ARG HOPPER_SBO=0
 
 ARG HOPPER_SBO_DEEPEP_COMMIT=9f2fc4b3182a51044ae7ecb6610f7c9c3258c4d6
-ARG DEEPEP_COMMIT=d4f41e4e93602a15e95f55f6ee8df8f1aaa0e4bb
+ARG DEEPEP_COMMIT=9af0e0d0e74f3577af1979c9b9e1ac2cad0104ee
 ARG BUILD_AND_DOWNLOAD_PARALLEL=8
 ARG SGL_KERNEL_VERSION=0.4.4
 ARG SGL_VERSION
@@ -300,9 +300,7 @@ RUN set -eux; \
         cd .. ; \
     fi
 
-# Build DeepEP wheel. The pinned default DeepEP commit uses NCCL's GIN /
-# symmetric-memory API and needs nvidia-nccl >= 2.30 headers to compile
-# (and the matching runtime wheel in the final image, see below).
+# Build DeepEP wheel
 RUN --mount=type=cache,target=/root/.cache/pip \
     cd /build/DeepEP && \
     case "$CUDA_VERSION" in \
@@ -321,9 +319,6 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     esac && \
     if [ "${CUDA_VERSION%%.*}" = "13" ]; then \
         sed -i "/^    include_dirs = \['csrc\/'\]/a\    include_dirs.append('${CUDA_HOME}/include/cccl')" setup.py; \
-    fi && \
-    if [ "$GRACE_BLACKWELL" != "1" ] && [ "$HOPPER_SBO" != "1" ]; then \
-        pip install --no-deps "nvidia-nccl-cu${CUDA_VERSION%%.*}>=2.30.3"; \
     fi && \
     TORCH_CUDA_ARCH_LIST="${CHOSEN_TORCH_CUDA_ARCH_LIST}" MAX_JOBS=${BUILD_AND_DOWNLOAD_PARALLEL} \
         python3 setup.py bdist_wheel -d /wheels
@@ -443,8 +438,6 @@ FROM torch_deps AS framework
 ARG BRANCH_TYPE
 ARG BUILD_TYPE
 ARG CUDA_VERSION
-ARG GRACE_BLACKWELL
-ARG HOPPER_SBO
 ARG BUILD_AND_DOWNLOAD_PARALLEL
 ARG SGL_VERSION
 ARG USE_LATEST_SGLANG
@@ -462,13 +455,8 @@ WORKDIR /sgl-workspace
 # Copy DeepEP wheel and install
 COPY --from=deepep_builder /wheels /tmp/wheels/deepep
 COPY --from=deepep_builder /build/DeepEP /sgl-workspace/DeepEP
-# deep_ep links NCCL >=2.30 GIN/symmetric-memory symbols at load time; keep the
-# runtime wheel in step with the build-time headers (default DeepEP commit only).
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install /tmp/wheels/deepep/*.whl && rm -rf /tmp/wheels/deepep && \
-    if [ "$GRACE_BLACKWELL" != "1" ] && [ "$HOPPER_SBO" != "1" ]; then \
-        pip install --no-deps "nvidia-nccl-cu${CUDA_VERSION%%.*}>=2.30.3"; \
-    fi
+    pip install /tmp/wheels/deepep/*.whl && rm -rf /tmp/wheels/deepep
 
 # Copy flashinfer jit-cache package (if installed)
 COPY --from=flashinfer_cache /flashinfer_jit_output/ /usr/local/lib/python3.12/dist-packages/
