@@ -384,7 +384,36 @@ class MoriKVManager(CommonKVManager):
         return engine
 
     def _register_local_buffers(self) -> None:
-        for ptr, length in zip(self.kv_args.kv_data_ptrs, self.kv_args.kv_data_lens):
+        trace_mr = os.environ.get("SGLANG_MORI_TRACE_MR", "1").lower() not in (
+            "0",
+            "false",
+            "no",
+            "off",
+        )
+        trace_prefix = (
+            f"[mori-mr-trace] mode={self.disaggregation_mode.value} "
+            f"dp={self.system_dp_rank} tp={self.attn_tp_rank} "
+            f"gpu={self.kv_args.gpu_id}"
+        )
+        for i, (ptr, length) in enumerate(
+            zip(self.kv_args.kv_data_ptrs, self.kv_args.kv_data_lens)
+        ):
+            item_len = (
+                self.kv_args.kv_item_lens[i]
+                if i < len(self.kv_args.kv_item_lens)
+                else 0
+            )
+            if trace_mr:
+                token_capacity = length // item_len if item_len else None
+                logger.warning(
+                    "%s register kv[%s] ptr=%#x len=%s item_len=%s tokens=%s",
+                    trace_prefix,
+                    i,
+                    ptr,
+                    length,
+                    item_len,
+                    token_capacity,
+                )
             mem_desc = self.engine.register_memory(
                 ptr,
                 length,
@@ -392,7 +421,16 @@ class MoriKVManager(CommonKVManager):
                 MemoryLocationType.GPU,
             )
             self.kv_mem_descs.append(mem_desc)
+            if trace_mr:
+                logger.warning("%s register kv[%s] done", trace_prefix, i)
         for ptr, length in zip(self.kv_args.aux_data_ptrs, self.kv_args.aux_data_lens):
+            if trace_mr:
+                logger.warning(
+                    "%s register aux ptr=%#x len=%s",
+                    trace_prefix,
+                    ptr,
+                    length,
+                )
             desc = self.engine.register_memory(
                 ptr,
                 length,
@@ -400,12 +438,24 @@ class MoriKVManager(CommonKVManager):
                 MemoryLocationType.CPU,
             )
             self.aux_mem_descs.append(desc)
+            if trace_mr:
+                logger.warning("%s register aux done", trace_prefix)
         for component_ptrs, component_lens in zip(
             self.kv_args.state_data_ptrs,
             getattr(self.kv_args, "state_data_lens", []),
         ):
             component_descs: List[MemoryDesc] = []
-            for ptr, length in zip(component_ptrs, component_lens):
+            component_id = len(self.state_mem_descs)
+            for i, (ptr, length) in enumerate(zip(component_ptrs, component_lens)):
+                if trace_mr:
+                    logger.warning(
+                        "%s register state[%s][%s] ptr=%#x len=%s",
+                        trace_prefix,
+                        component_id,
+                        i,
+                        ptr,
+                        length,
+                    )
                 desc = self.engine.register_memory(
                     ptr,
                     length,
@@ -413,6 +463,13 @@ class MoriKVManager(CommonKVManager):
                     MemoryLocationType.GPU,
                 )
                 component_descs.append(desc)
+                if trace_mr:
+                    logger.warning(
+                        "%s register state[%s][%s] done",
+                        trace_prefix,
+                        component_id,
+                        i,
+                    )
             self.state_mem_descs.append(component_descs)
 
     def update_status(self, bootstrap_room: int, status: KVPoll):

@@ -24,6 +24,11 @@
 #   SLURM_NODELIST     - optional explicit node pin (else scheduler chooses)
 #   SLURM_EXCLUDE      - optional comma-separated nodes to keep the scheduler
 #                        off (e.g. hosts with a broken RDMA driver)
+#   SGLANG_USE_CHECKOUT_RUNTIME
+#                      - default 1. Reinstall this workflow checkout's Python
+#                        sglang package inside each runtime container before
+#                        launching servers/bench. Set 0 to use the image's
+#                        baked-in sglang package.
 #   RUNNER_NAME        - GitHub runner name (a built-in default env var)
 #   GITHUB_RUN_ID      - GitHub Actions run id (a built-in default env var)
 #                        The allocation is named
@@ -52,6 +57,11 @@ set -x
 SLURM_PARTITION="${SLURM_PARTITION:-amd-sglang}"
 TIME_LIMIT="${TIME_LIMIT:-02:30:00}"
 MODEL_PATH="${MODEL_PATH:-${MODEL:-}}"
+SGLANG_USE_CHECKOUT_RUNTIME="${SGLANG_USE_CHECKOUT_RUNTIME:-1}"
+case "${SGLANG_USE_CHECKOUT_RUNTIME,,}" in
+    0|false|no|off) SGLANG_USE_CHECKOUT_RUNTIME=0 ;;
+    *) SGLANG_USE_CHECKOUT_RUNTIME=1 ;;
+esac
 
 if [[ -z "$MODEL_PATH" ]]; then
     echo "ERROR: set MODEL_PATH (local snapshot) or MODEL" >&2
@@ -144,6 +154,22 @@ WORKDIR="$HOME/.mi355x_ci/${MATRIX_CONFIG_NAME}"
 rm -rf "$WORKDIR"; mkdir -p "$WORKDIR"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# Stage the workflow checkout on shared NFS so Slurm compute-node containers can
+# reinstall the same code SHA the workflow checked out.
+CHECKOUT_DOCKER_ARGS="-e SGLANG_USE_CHECKOUT_RUNTIME=$SGLANG_USE_CHECKOUT_RUNTIME"
+if [[ "$SGLANG_USE_CHECKOUT_RUNTIME" == "1" ]]; then
+    CHECKOUT_STAGE="$WORKDIR/checkout"
+    CHECKOUT_SHA="$(git -C "$GITHUB_WORKSPACE" rev-parse HEAD)"
+    echo "Staging checkout runtime: sha=$CHECKOUT_SHA -> $CHECKOUT_STAGE"
+    rm -rf "$CHECKOUT_STAGE"
+    mkdir -p "$CHECKOUT_STAGE"
+    tar --exclude='__pycache__' --exclude='*.pyc' \
+        -C "$GITHUB_WORKSPACE" -cf - . | tar -C "$CHECKOUT_STAGE" -xf -
+    CHECKOUT_DOCKER_ARGS="$CHECKOUT_DOCKER_ARGS -e SGLANG_CHECKOUT_SHA=$CHECKOUT_SHA -v $CHECKOUT_STAGE:/sglang-checkout:ro"
+else
+    echo "SGLANG_USE_CHECKOUT_RUNTIME=0; using sglang package baked into image."
+fi
+
 # Accuracy-gate helpers (written when enabled). Pre-stage the GSM8K test set on
 # shared NFS from the login node (which has internet) so the in-container eval
 # doesn't depend on compute-node connectivity; fall back to in-container
@@ -206,19 +232,107 @@ COMMON_FLAGS="--trust-remote-code --tp $PTP --disable-radix-cache \
 DOCKER_COMMON="--rm --network host --ipc host --shm-size 32g --privileged \
 --security-opt seccomp=unconfined \
 --device /dev/kfd --device /dev/dri --device /dev/infiniband \
--v /it-share:/it-share:ro -v $HOME:/host_home"
+-v /it-share:/it-share:ro -v $HOME:/host_home $CHECKOUT_DOCKER_ARGS"
 
 # ---------------------------------------------------------------------------
 # Write per-role scripts that srun dispatches to each compute node.
 # ---------------------------------------------------------------------------
+cat > "$WORKDIR/install_checkout_sglang.sh" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+
+case "${SGLANG_USE_CHECKOUT_RUNTIME:-1}" in
+  0|false|False|FALSE|no|No|NO|off|Off|OFF)
+    echo "[checkout-sglang] disabled; using image-baked sglang"
+    exit 0
+    ;;
+esac
+
+CHECKOUT_SRC="${CHECKOUT_SRC:-/sglang-checkout}"
+RUNTIME_CHECKOUT="${RUNTIME_CHECKOUT:-/tmp/sglang-checkout-runtime}"
+
+if [[ ! -f "$CHECKOUT_SRC/python/sglang/version.py" ]]; then
+  echo "[checkout-sglang] ERROR: invalid checkout mount: $CHECKOUT_SRC" >&2
+  exit 1
+fi
+
+echo "[checkout-sglang] reinstalling sglang from $CHECKOUT_SRC"
+rm -rf "$RUNTIME_CHECKOUT"
+mkdir -p "$RUNTIME_CHECKOUT"
+tar --exclude='__pycache__' --exclude='*.pyc' \
+  -C "$CHECKOUT_SRC" -cf - . | tar -C "$RUNTIME_CHECKOUT" -xf -
+
+git config --global --add safe.directory "$RUNTIME_CHECKOUT" || true
+
+rm -f "$RUNTIME_CHECKOUT/python/pyproject.toml"
+cp "$RUNTIME_CHECKOUT/python/pyproject_other.toml" "$RUNTIME_CHECKOUT/python/pyproject.toml"
+for f in README.md LICENSE; do
+  if [[ -f "$RUNTIME_CHECKOUT/$f" && ! -e "$RUNTIME_CHECKOUT/python/$f" ]]; then
+    cp "$RUNTIME_CHECKOUT/$f" "$RUNTIME_CHECKOUT/python/$f"
+  fi
+done
+
+python3 -m pip uninstall -y sglang || true
+python3 -m pip install --no-deps --no-build-isolation -e "$RUNTIME_CHECKOUT/python"
+
+export RUNTIME_CHECKOUT
+export PYTHONPATH="$RUNTIME_CHECKOUT/python:${PYTHONPATH:-}"
+python3 - <<'PY'
+import importlib.metadata
+import os
+import subprocess
+import sglang
+
+checkout = os.environ["RUNTIME_CHECKOUT"]
+expected = os.path.realpath(os.path.join(checkout, "python", "sglang")) + os.sep
+actual = os.path.realpath(os.path.dirname(sglang.__file__)) + os.sep
+try:
+    sha = subprocess.check_output(
+        ["git", "-C", checkout, "rev-parse", "HEAD"], text=True
+    ).strip()
+except Exception:
+    sha = os.environ.get("SGLANG_CHECKOUT_SHA", "unknown")
+
+print(f"[checkout-sglang] sha={sha}")
+print(f"[checkout-sglang] sglang_file={sglang.__file__}")
+print(f"[checkout-sglang] sglang_version={importlib.metadata.version('sglang')}")
+if not actual.startswith(expected):
+    raise SystemExit(f"sglang did not import from checkout: {sglang.__file__}")
+PY
+EOF
+
+cat > "$WORKDIR/prefill_entry.sh" <<EOF
+#!/bin/bash
+set -euo pipefail
+CIDIR=/host_home/.mi355x_ci/${MATRIX_CONFIG_NAME}
+bash "\$CIDIR/install_checkout_sglang.sh"
+if [[ "\${SGLANG_USE_CHECKOUT_RUNTIME:-1}" != "0" ]]; then
+  export PYTHONPATH=/tmp/sglang-checkout-runtime/python:\${PYTHONPATH:-}
+fi
+exec python3 -m sglang.launch_server \
+  --model-path $MODEL_PATH --host 0.0.0.0 --port $PPORT \
+  $COMMON_FLAGS --disaggregation-mode prefill --disaggregation-bootstrap-port $PBOOT
+EOF
+
+cat > "$WORKDIR/decode_entry.sh" <<EOF
+#!/bin/bash
+set -euo pipefail
+CIDIR=/host_home/.mi355x_ci/${MATRIX_CONFIG_NAME}
+bash "\$CIDIR/install_checkout_sglang.sh"
+if [[ "\${SGLANG_USE_CHECKOUT_RUNTIME:-1}" != "0" ]]; then
+  export PYTHONPATH=/tmp/sglang-checkout-runtime/python:\${PYTHONPATH:-}
+fi
+exec python3 -m sglang.launch_server \
+  --model-path $MODEL_PATH --host 0.0.0.0 --port $DPORT \
+  $COMMON_FLAGS --disaggregation-mode decode --disaggregation-bootstrap-port $DBOOT
+EOF
+
 cat > "$WORKDIR/prefill.sh" <<EOF
 #!/bin/bash
 docker rm -f mi355x_prefill 2>/dev/null || true
 docker run $DOCKER_COMMON --name mi355x_prefill \
   -e HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 $MORI_ENV $DSV4_ENV_STR \
-  $IMAGE python3 -m sglang.launch_server \
-  --model-path $MODEL_PATH --host 0.0.0.0 --port $PPORT \
-  $COMMON_FLAGS --disaggregation-mode prefill --disaggregation-bootstrap-port $PBOOT
+  $IMAGE bash /host_home/.mi355x_ci/${MATRIX_CONFIG_NAME}/prefill_entry.sh
 EOF
 
 cat > "$WORKDIR/decode.sh" <<EOF
@@ -226,9 +340,7 @@ cat > "$WORKDIR/decode.sh" <<EOF
 docker rm -f mi355x_decode 2>/dev/null || true
 docker run $DOCKER_COMMON --name mi355x_decode \
   -e HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 $MORI_ENV $DSV4_ENV_STR \
-  $IMAGE python3 -m sglang.launch_server \
-  --model-path $MODEL_PATH --host 0.0.0.0 --port $DPORT \
-  $COMMON_FLAGS --disaggregation-mode decode --disaggregation-bootstrap-port $DBOOT
+  $IMAGE bash /host_home/.mi355x_ci/${MATRIX_CONFIG_NAME}/decode_entry.sh
 EOF
 
 # Smoke-test payload + validator (separate files to avoid quoting inside the
@@ -256,7 +368,13 @@ docker rm -f mi355x_bench 2>/dev/null || true
 docker run $DOCKER_COMMON --name mi355x_bench \
   -e PIP=\$PIP -e DIP=\$DIP \
   $IMAGE bash -lc '
-    export PYTHONPATH=/sgl-workspace/sglang/python:\$PYTHONPATH
+    CIDIR=/host_home/.mi355x_ci/${MATRIX_CONFIG_NAME}
+    bash \$CIDIR/install_checkout_sglang.sh
+    if [ "\${SGLANG_USE_CHECKOUT_RUNTIME:-1}" != "0" ]; then
+      export PYTHONPATH=/tmp/sglang-checkout-runtime/python:\${PYTHONPATH:-}
+    else
+      export PYTHONPATH=/sgl-workspace/sglang/python:\${PYTHONPATH:-}
+    fi
     echo "[wait] prefill"; for i in \$(seq 1 600); do curl -sf http://\$PIP:$PPORT/health >/dev/null && break; sleep 5; done
     echo "[wait] decode";  for i in \$(seq 1 600); do curl -sf http://\$DIP:$DPORT/health >/dev/null && break; sleep 5; done
     python3 -m sglang_router.launch_router \
@@ -266,7 +384,6 @@ docker run $DOCKER_COMMON --name mi355x_bench \
       --host 0.0.0.0 --port $LBPORT \
       --disable-circuit-breaker &
     for i in \$(seq 1 30); do curl -sf http://127.0.0.1:$LBPORT/health >/dev/null && break; sleep 2; done
-    CIDIR=/host_home/.mi355x_ci/${MATRIX_CONFIG_NAME}
     echo "[smoke] PD end-to-end check via LB"
     curl -sf -X POST http://127.0.0.1:$LBPORT/generate \
       -H "content-type: application/json" -d @\$CIDIR/smoke.json > \$CIDIR/smoke_out.json \
