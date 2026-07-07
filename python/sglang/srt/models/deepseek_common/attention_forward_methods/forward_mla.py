@@ -836,16 +836,31 @@ class DeepseekMLAForwardMixin:
             else:
                 _bmm_buf = None
                 if _use_aiter_gfx95 and self.w_kc.dtype == torch.float8_e4m3fn:
-                    attn_bmm_output = batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
+                    # Write the absorbed v_up bmm output batch-major
+                    # (tokens, heads, v_head_dim) via transpose_bm=True so the
+                    # downstream flatten(1, 2) in the `_bmm_buf is not None` block is
+                    # a free view. With the old transpose_bm=False the output was
+                    # (heads, tokens, v) and needed a transpose(0,1).flatten copy =
+                    # a per-layer direct_copy (elementwise_manual_unroll ~5us/layer),
+                    # which ATOM / the MXFP4 path do not pay.
+                    _bmm_buf = torch.empty(
+                        attn_output.shape[0],
+                        self.num_local_heads,
+                        self.w_vc.shape[-1],
+                        device=attn_output.device,
+                        dtype=torch.bfloat16,
+                    )
+                    batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
                         X=attn_output,
                         WQ=self.w_vc.transpose(-1, -2),
                         w_scale=self.w_scale,
                         group_size=128,
-                        YQ=None,
-                        transpose_bm=False,
+                        YQ=_bmm_buf,
+                        transpose_bm=True,
                         transpose_bm_in=True,
                         dtype=torch.bfloat16,
                     )
+                    attn_bmm_output = _bmm_buf
                 else:
                     attn_bmm_output = torch.bmm(
                         attn_output.to(torch.bfloat16).transpose(0, 1),
