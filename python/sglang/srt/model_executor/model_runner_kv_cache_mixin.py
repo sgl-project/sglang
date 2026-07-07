@@ -77,7 +77,9 @@ MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP_LAZY = 1
 MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_OVERLAP = 1
 
 # KV budget kept when the DeepEP reservation exceeds it (partial-reserve floor).
-_DEEPEP_MIN_KV_BUDGET_GIB = 1.0
+# 2 GiB clears the fixed pool overhead of multi-pool models (DSV4 c4/c128/state
+# pools consume ~1.5 GiB before the first KV token).
+_DEEPEP_MIN_KV_BUDGET_GIB = 2.0
 
 logger = logging.getLogger(__name__)
 

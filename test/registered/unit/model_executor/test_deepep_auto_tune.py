@@ -407,13 +407,13 @@ class TestDeepEPKvBudgetReserve(unittest.TestCase):
         # of refusing to serve a config that would in fact capture fine.
         plan = _plan(ceiling=128)
         plan.reserve_mib = 18 * 1024
-        self.assertAlmostEqual(self._reserve(plan, 16.5), 1.0)
+        self.assertAlmostEqual(self._reserve(plan, 16.5), 2.0)
 
     def test_exhausted_budget_raises(self):
         plan = _plan(ceiling=128)
         plan.reserve_mib = 18 * 1024
         with self.assertRaisesRegex(ValueError, "KV budget"):
-            self._reserve(plan, 0.8)
+            self._reserve(plan, 1.8)
 
 
 @unittest.skipUnless(_HAS_MODEL_RUNNER, "model_runner not importable")
