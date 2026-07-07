@@ -184,8 +184,10 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_flags
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-from sglang.srt.server_args import (
+from sglang.srt.server_args import (  # noqa: F401  (re-export)
+    CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS,
     ServerArgs,
+    add_chunked_prefix_cache_attention_backend,
     get_global_server_args,
     set_global_server_args_for_scheduler,
 )
@@ -285,9 +287,6 @@ def add_mla_attention_backend(backend_name):
         MLA_ATTENTION_BACKENDS.append(backend_name)
         logger.info(f"Added {backend_name} to MLA_ATTENTION_BACKENDS.")
 
-
-# Moved to server_args (evaluated during resolution); re-exported here for
-# out-of-tree platform compatibility.
 
 # Detect stragger ranks in model loading
 UNBALANCED_MODEL_LOADING_TIMEOUT_S = 480  # leave more time for post data processing
