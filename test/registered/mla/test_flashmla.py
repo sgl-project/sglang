@@ -9,7 +9,6 @@ from types import SimpleNamespace
 import requests
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_eval import run_eval
@@ -21,7 +20,7 @@ from sglang.test.test_utils import (
 )
 
 # FlashMLA attention backend tests with MTP speculative decoding
-register_cuda_ci(est_time=160, stage="stage-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=160, stage="base-b", runner_config="1-gpu-large")
 
 
 class TestFlashMLAMTP(CustomTestCase):
@@ -33,7 +32,7 @@ class TestFlashMLAMTP(CustomTestCase):
         if torch.cuda.is_available() and torch.version.cuda:
             other_args.extend(
                 [
-                    "--cuda-graph-max-bs",
+                    "--cuda-graph-max-bs-decode",
                     "4",
                     "--disable-radix",
                     "--enable-torch-compile",
@@ -54,13 +53,12 @@ class TestFlashMLAMTP(CustomTestCase):
                 ]
             )
         # Use longer timeout for DeepGEMM JIT compilation which can take 10-20 minutes
-        with envs.SGLANG_ENABLE_SPEC_V2.override(False):
-            cls.process = popen_launch_server(
-                cls.model,
-                cls.base_url,
-                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH * 2,
-                other_args=other_args,
-            )
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH * 2,
+            other_args=other_args,
+        )
 
     @classmethod
     def tearDownClass(cls):

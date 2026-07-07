@@ -24,6 +24,9 @@ from sglang.multimodal_gen.runtime.layers.linear import (
 from sglang.multimodal_gen.runtime.layers.quantization import QuantizationConfig
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import get_rope
 from sglang.multimodal_gen.runtime.loader.weight_utils import default_weight_loader
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+)
 from sglang.multimodal_gen.runtime.utils.common import add_prefix
 
 logger = logging.getLogger(__name__)
@@ -526,6 +529,9 @@ class SiglipAttention(nn.Module):
         tp_size = get_tp_world_size()
         self.head_dim = hidden_size // num_heads
         self.num_heads_per_partition = num_heads // tp_size
+        # Cache the per-rank projection width so forward() does not re-read the
+        # global TP size (which is not patched to the folding group at run time).
+        self.embed_dim_per_partition = self.num_heads_per_partition * self.head_dim
         self.scaling = self.head_dim**-0.5
 
         self.qkv_proj = QKVParallelLinear(
@@ -556,7 +562,7 @@ class SiglipAttention(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.hidden_size // get_tp_world_size()] * 3, dim=-1)
+        q, k, v = qkv.split([self.embed_dim_per_partition] * 3, dim=-1)
 
         batch_size, seq_len, _ = q.shape
         q = q.view(batch_size, seq_len, self.num_heads_per_partition, self.head_dim)
@@ -566,7 +572,7 @@ class SiglipAttention(nn.Module):
         attn_output = self.attn(q, k, v)
 
         attn_output = attn_output.reshape(
-            batch_size, seq_len, self.hidden_size // get_tp_world_size()
+            batch_size, seq_len, self.embed_dim_per_partition
         )
 
         output, _ = self.out_proj(attn_output)
@@ -934,10 +940,13 @@ class Gemma3TextModel(nn.Module):
         return loaded_params
 
 
-class Gemma3ForConditionalGeneration(nn.Module):
+class Gemma3ForConditionalGeneration(nn.Module, LayerwiseOffloadableModuleMixin):
     # transformers 5.6.0 flattened SiglipVisionModel, dropping the
     # `vision_model` intermediate wrapper. Our reimpl keeps it, so remap
     # HF source keys back into our nested namespace when transferring weights.
+    layerwise_offload_dit_group_enabled = False
+    layer_names = ["language_model.layers"]
+
     param_names_mapping = {
         r"^(vision_tower\.)(embeddings|encoder|post_layernorm|head)\.": r"\1vision_model.\2.",
     }

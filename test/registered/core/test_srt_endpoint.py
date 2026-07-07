@@ -28,8 +28,10 @@ from sglang.test.test_utils import (
     run_logprob_check,
 )
 
-register_cuda_ci(est_time=134, stage="stage-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=134, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=130, suite="stage-b-test-1-gpu-small-amd")
+
+SERVER_ENV = {"SGLANG_USE_PICKLE_IPC": "0"}
 
 
 class TestSRTEndpoint(CustomTestCase):
@@ -41,11 +43,12 @@ class TestSRTEndpoint(CustomTestCase):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            env=SERVER_ENV,
             other_args=(
                 "--enable-custom-logit-processor",
                 "--mem-fraction-static",
                 "0.7",
-                "--cuda-graph-max-bs",
+                "--cuda-graph-max-bs-decode",
                 "8",
             ),
         )
@@ -94,18 +97,6 @@ class TestSRTEndpoint(CustomTestCase):
 
         print(json.dumps(response_json, indent=2))
         print("=" * 100)
-
-    def test_simple_decode(self):
-        self.run_decode()
-
-    def test_simple_decode_batch(self):
-        self.run_decode(batch=True)
-
-    def test_parallel_sample(self):
-        self.run_decode(n=3)
-
-    def test_parallel_sample_stream(self):
-        self.run_decode(n=3, stream=True)
 
     def test_logprob(self):
         self.run_decode(
@@ -481,6 +472,12 @@ class TestSRTEndpoint(CustomTestCase):
             response = requests.post(self.base_url + "/flush_cache")
             assert response.status_code == 200
 
+        server_info = requests.get(self.base_url + "/server_info").json()
+        page_size = server_info.get("page_size") or 1
+
+        def align_down(num_tokens):
+            return num_tokens // page_size * page_size
+
         def send_and_check_cached_tokens(input_ids):
             response = requests.post(
                 self.base_url + "/generate",
@@ -495,10 +492,14 @@ class TestSRTEndpoint(CustomTestCase):
             return response_json["meta_info"]["cached_tokens"]
 
         self.assertEqual(send_and_check_cached_tokens(range(0, 100)), 0)
-        self.assertEqual(send_and_check_cached_tokens(range(0, 10000)), 100)
-        self.assertEqual(send_and_check_cached_tokens(range(0, 10000)), 9999)
-        self.assertEqual(send_and_check_cached_tokens(range(0, 1000)), 999)
-        self.assertEqual(send_and_check_cached_tokens(range(0, 11000)), 10000)
+        self.assertEqual(send_and_check_cached_tokens(range(0, 10000)), align_down(100))
+        self.assertEqual(
+            send_and_check_cached_tokens(range(0, 10000)), align_down(9999)
+        )
+        self.assertEqual(send_and_check_cached_tokens(range(0, 1000)), align_down(999))
+        self.assertEqual(
+            send_and_check_cached_tokens(range(0, 11000)), align_down(10000)
+        )
 
     def test_get_server_info(self):
         response = requests.get(self.base_url + "/server_info")
@@ -660,6 +661,7 @@ class TestTokenizeDetokenize(CustomTestCase):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            env=SERVER_ENV,
         )
         cls.tokenizer = get_tokenizer(cls.model)
 

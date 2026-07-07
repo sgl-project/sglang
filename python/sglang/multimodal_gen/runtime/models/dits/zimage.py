@@ -41,7 +41,9 @@ from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     _apply_rotary_emb,
     apply_flashinfer_rope_qk_inplace,
 )
-from sglang.multimodal_gen.runtime.managers.layerwise_offload import OffloadableDiTMixin
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+)
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -256,6 +258,7 @@ class ZImageAttention(nn.Module):
         freqs_cis: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         num_replicated_prefix: int = 0,
         num_replicated_suffix: int = 0,
+        skip_sequence_parallel_override: bool = False,
     ):
         if self.use_fused_qkv:
             qkv, _ = self.to_qkv(hidden_states)
@@ -360,6 +363,7 @@ class ZImageAttention(nn.Module):
                 v,
                 num_replicated_prefix=num_replicated_prefix,
                 num_replicated_suffix=num_replicated_suffix,
+                skip_sequence_parallel_override=skip_sequence_parallel_override,
             )
         hidden_states = hidden_states.flatten(2)
 
@@ -452,6 +456,7 @@ class ZImageTransformerBlock(nn.Module):
         adaln_input: Optional[torch.Tensor] = None,
         num_replicated_prefix: int = 0,
         num_replicated_suffix: int = 0,
+        skip_sequence_parallel_override: bool = False,
     ):
         if self.modulation:
             assert adaln_input is not None
@@ -467,6 +472,7 @@ class ZImageTransformerBlock(nn.Module):
                 freqs_cis=freqs_cis,
                 num_replicated_prefix=num_replicated_prefix,
                 num_replicated_suffix=num_replicated_suffix,
+                skip_sequence_parallel_override=skip_sequence_parallel_override,
             )
             if (
                 _is_cuda
@@ -509,6 +515,7 @@ class ZImageTransformerBlock(nn.Module):
                 freqs_cis=freqs_cis,
                 num_replicated_prefix=num_replicated_prefix,
                 num_replicated_suffix=num_replicated_suffix,
+                skip_sequence_parallel_override=skip_sequence_parallel_override,
             )
             x = x + self.attention_norm2(attn_out)
 
@@ -612,7 +619,7 @@ class RopeEmbedder:
         return torch.cat(cos_out, dim=-1), torch.cat(sin_out, dim=-1)
 
 
-class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
+class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     _supports_gradient_checkpointing = True
     _no_split_modules = ["ZImageTransformerBlock"]
     _fsdp_shard_conditions = ZImageDitConfig().arch_config._fsdp_shard_conditions
@@ -810,6 +817,7 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         patch_size: int,
         f_patch_size: int,
         image_seq_len_target: int | None = None,
+        caption_valid_lens: torch.Tensor | None = None,
     ):
         """Patchify images and pad image/caption tokens to batch targets.
 
@@ -839,7 +847,12 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
             for cap_feat in all_cap_feats
         )
 
-        for cap_feat in all_cap_feats:
+        if caption_valid_lens is not None:
+            caption_valid_lens = caption_valid_lens.to(
+                device=all_cap_feats[0].device, dtype=torch.long
+            )
+
+        for idx, cap_feat in enumerate(all_cap_feats):
             cap_ori_len = cap_feat.size(0)
             cap_padding_len = cap_seq_len_target - cap_ori_len
             cap_padded_feat = torch.cat(
@@ -847,7 +860,10 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
                 dim=0,
             )
             all_cap_feats_out.append(cap_padded_feat)
-            all_cap_valid_lens.append(cap_ori_len)
+            if caption_valid_lens is None:
+                all_cap_valid_lens.append(cap_ori_len)
+            else:
+                all_cap_valid_lens.append(caption_valid_lens[idx])
 
         target_image_seq_len = image_seq_len_target or 0
         for image in all_image:
@@ -878,12 +894,15 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
             all_image_size.append(image_size)
             all_image_valid_lens.append(image_ori_len)
 
+        cap_valid_lens_out = (
+            caption_valid_lens if caption_valid_lens is not None else all_cap_valid_lens
+        )
         return (
             torch.stack(all_image_out, dim=0),
             torch.stack(all_cap_feats_out, dim=0),
             all_image_size,
             all_image_valid_lens,
-            all_cap_valid_lens,
+            cap_valid_lens_out,
         )
 
     @staticmethod
@@ -916,12 +935,16 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
     @staticmethod
     def _replace_padding_with_token(
         tensor: torch.Tensor,
-        valid_lens: list[int],
+        valid_lens: list[int] | torch.Tensor,
         pad_token: torch.Tensor,
     ) -> torch.Tensor:
         """Replace padded token rows after each valid sequence length."""
         positions = torch.arange(tensor.shape[1], device=tensor.device).unsqueeze(0)
-        lengths = torch.tensor(valid_lens, device=tensor.device).unsqueeze(1)
+        if torch.is_tensor(valid_lens):
+            lengths = valid_lens.to(device=tensor.device, dtype=torch.long)
+        else:
+            lengths = torch.tensor(valid_lens, device=tensor.device)
+        lengths = lengths.unsqueeze(1)
         pad_mask = positions >= lengths
         if pad_mask.any():
             tensor = tensor.clone()
@@ -938,6 +961,7 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         f_patch_size=1,
         freqs_cis=None,
         image_seq_len_target: int | None = None,
+        caption_valid_lens: torch.Tensor | None = None,
         **kwargs,
     ):
         assert patch_size in self.all_patch_size
@@ -947,7 +971,6 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         cap_feats = self._as_caption_list(encoder_hidden_states)
         timestep = 1000.0 - timestep
         t = timestep
-        device = x[0].device
         t = self.t_embedder(t)
         adaln_input = t.to(dtype=x[0].dtype)
         (
@@ -962,6 +985,7 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
             patch_size,
             f_patch_size,
             image_seq_len_target=image_seq_len_target,
+            caption_valid_lens=caption_valid_lens,
         )
 
         x, _ = self.all_x_embedder[f"{patch_size}-{f_patch_size}"](x)
@@ -1002,13 +1026,13 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         )
         num_replicated_suffix = cap_seq_len if not use_full_unified_sequence else 0
 
-        for layer_id, layer in enumerate(self.layers):
-            layer.attention.attn.skip_sequence_parallel = use_full_unified_sequence
+        for layer in self.layers:
             unified = layer(
                 unified,
                 unified_freqs_cis,
                 adaln_input,
                 num_replicated_suffix=num_replicated_suffix,
+                skip_sequence_parallel_override=use_full_unified_sequence,
             )
 
         unified = self.all_final_layer[f"{patch_size}-{f_patch_size}"](

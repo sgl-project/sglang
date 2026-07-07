@@ -16,7 +16,7 @@ from sglang.test.test_utils import (
 )
 
 # DeepSeek-V3 INT8 quantization tests (channel and block INT8)
-register_cuda_ci(est_time=160, stage="stage-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=160, stage="base-b", runner_config="1-gpu-large")
 
 
 class TestDeepseekV3MTPChannelInt8(CustomTestCase):
@@ -28,7 +28,7 @@ class TestDeepseekV3MTPChannelInt8(CustomTestCase):
         if torch.cuda.is_available() and torch.version.cuda:
             other_args.extend(
                 [
-                    "--cuda-graph-max-bs",
+                    "--cuda-graph-max-bs-decode",
                     "16",
                     "--enable-torch-compile",
                     "--torch-compile-max-bs",
@@ -91,7 +91,7 @@ class TestDeepseekV3MTPBlockInt8(CustomTestCase):
         if torch.cuda.is_available() and torch.version.cuda:
             other_args.extend(
                 [
-                    "--cuda-graph-max-bs",
+                    "--cuda-graph-max-bs-decode",
                     "16",
                     "--enable-torch-compile",
                     "--torch-compile-max-bs",

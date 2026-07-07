@@ -14,7 +14,6 @@ The CI pipeline runs in three sequential stages: **A** (pre-flight, ~3 min) → 
 - `registered/`: CI test files, auto-discovered by `run_suite.py`. Most tests live here. JIT kernel tests are an exception (see below).
 - `manual/`: Non-CI tests for local debugging or special setups.
 - `run_suite.py`: CI runner — scans `registered/` and JIT kernel directories.
-- `srt/`: Legacy CI setup, to be deprecated.
 
 The system supports both [unittest](https://docs.python.org/3/library/unittest.html) and [pytest](https://docs.pytest.org/en/stable/). The launcher runs `python filename.py -f` with **failfast enabled by default**.
 
@@ -45,17 +44,17 @@ python3 test/registered/core/test_srt_endpoint.py
 python3 test/registered/core/test_srt_endpoint.py TestSRTEndpoint.test_simple_decode
 
 # Single JIT kernel test
-python3 python/sglang/jit_kernel/tests/test_add_constant.py
+python3 test/registered/jit/test_add_constant.py
 
 # Run a suite
-python3 test/run_suite.py --hw cpu --suite stage-a-test-cpu
-python3 test/run_suite.py --hw cuda --suite stage-a-test-1-gpu-small
+python3 test/run_suite.py --hw cpu --suite base-a-test-cpu
+python3 test/run_suite.py --hw cuda --suite base-a-test-1-gpu-small
 
 # Nightly tests
 python3 test/run_suite.py --hw cuda --suite nightly-1-gpu --nightly
 
 # With auto-partitioning (for parallel CI jobs)
-python3 test/run_suite.py --hw cuda --suite stage-b-test-1-gpu-small \
+python3 test/run_suite.py --hw cuda --suite base-b-test-1-gpu-small \
     --auto-partition-id 0 --auto-partition-size 4
 ```
 
@@ -66,16 +65,16 @@ Every CI-discovered test file must call a registration function at module level:
 ```python
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=80, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=80, stage="base-b", runner_config="1-gpu-small")
 ```
 
-Parameters: `est_time` (seconds), `suite` (target suite), `nightly=True` (nightly-only), `disabled="reason"` (temporarily disable).
+Parameters: `est_time` (seconds), `stage` + `runner_config` (target stage and runner pool from `scripts/ci/runner_configs.yml`), `nightly=True` (nightly-only), `disabled="reason"` (temporarily disable).
 
-Keep `est_time` and `suite` as **literal values** — `run_suite.py` collects them by AST parsing.
+Keep `est_time`, `stage`, `runner_config` as **literal values** — `run_suite.py` collects them by AST parsing.
 
-JIT kernel files live outside `test/registered/` but still use registration:
-- Correctness tests: `python/sglang/jit_kernel/tests/test_*.py` → `stage-b-kernel-unit-1-gpu-large`
-- Benchmarks: `python/sglang/jit_kernel/benchmark/bench_*.py` → `stage-b-kernel-benchmark-1-gpu-large`
+JIT kernel correctness tests and benchmarks live under `test/registered/jit/`, same as other registered tests (their helpers stay alongside the kernel source under `python/sglang/jit_kernel/` and are imported by absolute path):
+- Correctness tests: `test/registered/jit/test_*.py` → `base-b-kernel-unit-test-1-gpu-large`
+- Benchmarks: `test/registered/jit/benchmark/bench_*.py` → `base-b-kernel-benchmark-test-1-gpu-large`
 
 ## Choosing a Suite
 
@@ -83,12 +82,12 @@ Use the lightest suite that meets your test's needs. Full suite tables are in th
 
 | Need | Suite |
 |------|-------|
-| No GPU required | `stage-a-test-cpu` |
-| Small GPU (fits 5090, 32GB) | `stage-b-test-1-gpu-small` (most tests go here) |
-| Large GPU memory or Hopper features | `stage-b-test-1-gpu-large` |
-| JIT kernel correctness | `stage-b-kernel-unit-1-gpu-large` |
-| JIT kernel benchmarks | `stage-b-kernel-benchmark-1-gpu-large` |
-| Multi-GPU (2/4/8) | `stage-b-test-2-gpu-large`, `stage-c-test-*` |
+| No GPU required | `base-a-test-cpu` |
+| Small GPU (fits 5090, 32GB) | `base-b-test-1-gpu-small` (most tests go here) |
+| Large GPU memory or Hopper features | `base-b-test-1-gpu-large` |
+| JIT kernel correctness | `base-b-kernel-unit-test-1-gpu-large` |
+| JIT kernel benchmarks | `base-b-kernel-benchmark-test-1-gpu-large` |
+| Multi-GPU (2/4/8) | `base-b-test-2-gpu-large`, `base-c-test-*` |
 | Long-running or experimental | `nightly-*` suites |
 
 ## Steps for Adding a Test
@@ -112,4 +111,4 @@ This README mostly describes the NVIDIA GPU CI pipeline. Other hardware backends
 
 ### Adding New Models to Nightly CI
 - **Text models**: Extend the [global model list variables](https://github.com/sgl-project/sglang/blob/85c1f7937781199203b38bb46325a2840f353a04/python/sglang/test/test_utils.py#L104) in `test_utils.py`.
-- **VLMs**: Extend the `MODEL_THRESHOLDS` dictionary in `test/srt/nightly/test_vlms_mmmu_eval.py`.
+- **VLMs**: Extend the `MODEL_THRESHOLDS` dictionary in `test/registered/eval/test_vlms_mmmu_eval.py`.

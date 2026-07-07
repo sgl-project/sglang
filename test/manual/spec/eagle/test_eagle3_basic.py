@@ -4,16 +4,12 @@ from types import SimpleNamespace
 import requests
 
 from sglang.srt.utils import is_hip
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.server_fixtures.eagle_fixture import EagleServerBase
 from sglang.test.test_utils import (
     DEFAULT_DRAFT_MODEL_EAGLE3,
     DEFAULT_TARGET_MODEL_EAGLE3,
 )
-
-register_cuda_ci(est_time=88, suite="stage-b-test-1-gpu-small")
-register_amd_ci(est_time=50, suite="stage-b-test-1-gpu-small")
 
 _is_hip = is_hip()
 

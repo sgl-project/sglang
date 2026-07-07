@@ -6,7 +6,7 @@ import sglang as sgl
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=76, stage="stage-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=76, stage="base-b", runner_config="1-gpu-small")
 
 
 class TestGGUF(CustomTestCase):
@@ -19,7 +19,9 @@ class TestGGUF(CustomTestCase):
             filename="qwen2-1_5b-instruct-q4_k_m.gguf",
         )
 
-        engine = sgl.Engine(model_path=model_path, random_seed=42, cuda_graph_max_bs=2)
+        engine = sgl.Engine(
+            model_path=model_path, random_seed=42, cuda_graph_max_bs_decode=2
+        )
         outputs = engine.generate(prompt, sampling_params)["text"]
         engine.shutdown()
 

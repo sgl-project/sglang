@@ -261,7 +261,7 @@ class TokenizerManagerScoreMixin:
         has_phs = False
         prompt_tokens = 0
 
-        is_generation = getattr(self, "is_generation", True)
+        is_generation = self.is_generation
         if is_generation:
             for result in results:
                 # For single-item scoring, logprobs are in output_token_ids_logprobs
@@ -563,7 +563,7 @@ class TokenizerManagerScoreMixin:
                     return_pooled_hidden_states=True and the model supports it;
                     None otherwise.
         """
-        is_generation = getattr(self, "is_generation", True)
+        is_generation = self.is_generation
 
         if is_generation and label_token_ids is None:
             raise ValueError(
@@ -676,7 +676,7 @@ class TokenizerManagerScoreMixin:
                     "It requires a model with a task-specific head "
                     "(e.g. SequenceClassification or RewardModel)."
                 )
-            model_config = getattr(self, "model_config", None)
+            model_config = self.model_config
             if model_config is not None:
                 archs = getattr(model_config.hf_config, "architectures", []) or []
                 if is_cross_encoding_pooler_model(archs):

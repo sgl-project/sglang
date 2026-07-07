@@ -1,11 +1,16 @@
 """Unit tests for srt/sampling/sampling_params.py — no server, no model loading."""
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_cpu_ci, register_xpu_ci
 
-register_cpu_ci(est_time=7, suite="stage-a-test-cpu")
+register_cpu_ci(est_time=7, suite="base-a-test-cpu")
+register_cpu_ci(est_time=7, suite="base-c-test-cpu")
+register_xpu_ci(est_time=10, suite="stage-a-test-1-gpu-xpu")
 
+import copy
 import unittest
 from unittest.mock import MagicMock
+
+import msgspec
 
 from sglang.srt.sampling.sampling_params import (
     MAX_LEN,
@@ -87,6 +92,18 @@ class TestSamplingParamsVerify(CustomTestCase):
     def test_negative_temperature_raises(self):
         """Test that verify() rejects negative temperature (must be >= 0)."""
         sp = self._make(temperature=-0.5)
+        with self.assertRaises(ValueError):
+            sp.verify(self.VOCAB_SIZE)
+
+    def test_nan_temperature_raises(self):
+        """verify() must reject NaN temperature; the bare < 0.0 check alone lets it through."""
+        sp = self._make(temperature=float("nan"))
+        with self.assertRaises(ValueError):
+            sp.verify(self.VOCAB_SIZE)
+
+    def test_inf_temperature_raises(self):
+        """verify() must reject non-finite (inf) temperature."""
+        sp = self._make(temperature=float("inf"))
         with self.assertRaises(ValueError):
             sp.verify(self.VOCAB_SIZE)
 
@@ -275,6 +292,17 @@ class TestSamplingParamsVerify(CustomTestCase):
 
 class TestSamplingParamsNormalize(CustomTestCase):
 
+    def _mock_tokenizer(self, encode_map=None):
+        """Create a mock tokenizer that returns predetermined token lists."""
+        tokenizer = MagicMock()
+        if encode_map:
+            tokenizer.encode.side_effect = (
+                lambda s, add_special_tokens=False: encode_map.get(s, [1])
+            )
+        else:
+            tokenizer.encode.return_value = [1]  # Default: 1 token
+        return tokenizer
+
     def test_none_stop_strs_becomes_empty_list(self):
         """Test that normalize() converts None stop to empty list with max_len=0."""
         sp = SamplingParams(stop=None)
@@ -285,20 +313,24 @@ class TestSamplingParamsNormalize(CustomTestCase):
     def test_string_stop_str_wrapped_in_list(self):
         """Test that normalize() wraps a single stop string into a list."""
         sp = SamplingParams(stop="<|end|>")
-        sp.normalize(tokenizer=None)
+        tokenizer = self._mock_tokenizer()
+        sp.normalize(tokenizer=tokenizer)
         self.assertEqual(sp.stop_strs, ["<|end|>"])
 
     def test_list_stop_strs_unchanged(self):
         """Test that normalize() preserves a list of stop strings as-is."""
         sp = SamplingParams(stop=["stop1", "stop2"])
-        sp.normalize(tokenizer=None)
+        tokenizer = self._mock_tokenizer()
+        sp.normalize(tokenizer=tokenizer)
         self.assertEqual(sp.stop_strs, ["stop1", "stop2"])
 
-    def test_stop_str_max_len_without_tokenizer(self):
-        """Test that without a tokenizer, max_len is the raw string character count."""
+    def test_stop_str_max_len_uses_encoded_length(self):
+        """Test that max_len is based on encoded token count, not character count."""
+        # "ab" encodes to 1 token, "cdef" encodes to 2 tokens
+        tokenizer = self._mock_tokenizer(encode_map={"ab": [1], "cdef": [2, 3]})
         sp = SamplingParams(stop=["ab", "cdef"])
-        sp.normalize(tokenizer=None)
-        self.assertEqual(sp.stop_str_max_len, 4)  # len("cdef")
+        sp.normalize(tokenizer=tokenizer)
+        self.assertEqual(sp.stop_str_max_len, 2)  # max token count
 
     def test_stop_str_max_len_with_tokenizer(self):
         """Test that with a tokenizer, max_len counts encoded token IDs."""
@@ -322,14 +354,94 @@ class TestSamplingParamsNormalize(CustomTestCase):
     def test_string_stop_regex_wrapped_in_list(self):
         """Test that normalize() wraps a single stop_regex string into a list."""
         sp = SamplingParams(stop_regex=r"\d+")
-        sp.normalize(tokenizer=None)
+        tokenizer = self._mock_tokenizer()
+        sp.normalize(tokenizer=tokenizer)
         self.assertEqual(sp.stop_regex_strs, [r"\d+"])
 
     def test_stop_regex_max_len_computed(self):
         """Test that bounded regex computes a finite max length."""
         sp = SamplingParams(stop_regex=r"[a-z]{3}")
-        sp.normalize(tokenizer=None)
+        tokenizer = self._mock_tokenizer()
+        sp.normalize(tokenizer=tokenizer)
         self.assertEqual(sp.stop_regex_max_len, 3)
+
+
+class TestSamplingParamsMsgspecStruct(CustomTestCase):
+
+    def test_copy_remains_mutable_and_independent(self):
+        sp = SamplingParams(max_new_tokens=8, custom_params={"a": 1})
+
+        copied = copy.copy(sp)
+        copied.max_new_tokens = 16
+        copied.custom_params = {"b": 2}
+
+        self.assertEqual(sp.max_new_tokens, 8)
+        self.assertEqual(sp.custom_params, {"a": 1})
+        self.assertEqual(copied.max_new_tokens, 16)
+        self.assertEqual(copied.custom_params, {"b": 2})
+
+    def test_none_values_still_use_constructor_defaults(self):
+        sp = SamplingParams(
+            temperature=None,
+            top_p=None,
+            top_k=None,
+            min_p=None,
+            frequency_penalty=None,
+            presence_penalty=None,
+            repetition_penalty=None,
+            min_new_tokens=None,
+            n=None,
+            ignore_eos=None,
+            skip_special_tokens=None,
+            spaces_between_special_tokens=None,
+            no_stop_trim=None,
+        )
+
+        self.assertEqual(sp.temperature, 1.0)
+        self.assertEqual(sp.top_p, 1.0)
+        self.assertEqual(sp.top_k, TOP_K_ALL)
+        self.assertEqual(sp.min_p, 0.0)
+        self.assertEqual(sp.frequency_penalty, 0.0)
+        self.assertEqual(sp.presence_penalty, 0.0)
+        self.assertEqual(sp.repetition_penalty, 1.0)
+        self.assertEqual(sp.min_new_tokens, 0)
+        self.assertEqual(sp.n, 1)
+        self.assertFalse(sp.ignore_eos)
+        self.assertTrue(sp.skip_special_tokens)
+        self.assertTrue(sp.spaces_between_special_tokens)
+        self.assertFalse(sp.no_stop_trim)
+
+    def test_msgpack_omits_default_fields(self):
+        encoded = msgspec.msgpack.encode(SamplingParams())
+
+        self.assertEqual(msgspec.msgpack.decode(encoded), {})
+
+    def test_msgpack_round_trip_preserves_normalized_state(self):
+        tokenizer = MagicMock()
+        tokenizer.encode.side_effect = lambda s, add_special_tokens=False: {
+            "hello": [101, 102],
+            "world": [201],
+        }[s]
+        sp = SamplingParams(
+            stop=["hello", "world"],
+            stop_regex=r"[a-z]{3}",
+            stop_token_ids=[1, 2],
+            temperature=0.5,
+        )
+        sp.normalize(tokenizer)
+
+        encoder = msgspec.msgpack.Encoder()
+        decoder = msgspec.msgpack.Decoder(SamplingParams)
+        rebuilt = decoder.decode(encoder.encode(sp))
+
+        self.assertIsInstance(rebuilt, SamplingParams)
+        self.assertTrue(rebuilt.is_normalized)
+        self.assertEqual(rebuilt.stop_strs, ["hello", "world"])
+        self.assertEqual(rebuilt.stop_str_max_len, 2)
+        self.assertEqual(rebuilt.stop_regex_strs, [r"[a-z]{3}"])
+        self.assertEqual(rebuilt.stop_regex_max_len, 3)
+        self.assertEqual(rebuilt.stop_token_ids, {1, 2})
+        self.assertEqual(rebuilt.temperature, 0.5)
 
 
 class TestRegexMaxLength(CustomTestCase):

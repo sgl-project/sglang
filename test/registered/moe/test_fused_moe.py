@@ -4,6 +4,7 @@ import torch
 from tqdm import tqdm
 
 from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import fused_moe
 from sglang.srt.layers.moe.topk import TopKConfig, select_experts
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
@@ -13,7 +14,7 @@ from sglang.srt.utils import get_device, get_device_capability, is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase, empty_gpu_cache
 
-register_cuda_ci(est_time=87, stage="stage-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=87, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=30, suite="stage-b-test-1-gpu-small-amd")
 
 _is_hip = is_hip()
@@ -66,6 +67,7 @@ class TestFusedMOE(CustomTestCase):
         w2_scale=None,
         a1_scale=None,
         a2_scale=None,
+        routed_scaling_factor=None,
     ):
         set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
 
@@ -100,11 +102,16 @@ class TestFusedMOE(CustomTestCase):
                     a[mask] @ w1_compute[i].transpose(0, 1)
                 ) @ w2_compute[i].transpose(0, 1)
 
-        return (
+        result = (
             out.view(B, -1, w2.shape[1]) * topk_weight.view(B, -1, 1).to(out.dtype)
         ).sum(dim=1)
+        if routed_scaling_factor is not None:
+            result = result * routed_scaling_factor
+        return result
 
-    def _test_case(self, m, n, k, e, topk, dtype, use_fp8_w8a8=False):
+    def _test_case(
+        self, m, n, k, e, topk, dtype, use_fp8_w8a8=False, routed_scaling_factor=None
+    ):
         rtol, atol = self.get_tolerance(dtype)
 
         if use_fp8_w8a8:
@@ -183,8 +190,15 @@ class TestFusedMOE(CustomTestCase):
                 topk_config=TopKConfig(top_k=topk, renormalize=False),
             )
 
-            triton_output = fused_moe(a, w1, w2, topk_output)
-            torch_output = self.torch_naive_moe(a, w1, w2, score, topk)
+            moe_runner_config = MoeRunnerConfig(
+                routed_scaling_factor=routed_scaling_factor
+            )
+            triton_output = fused_moe(
+                a, w1, w2, topk_output, moe_runner_config=moe_runner_config
+            )
+            torch_output = self.torch_naive_moe(
+                a, w1, w2, score, topk, routed_scaling_factor=routed_scaling_factor
+            )
             torch.testing.assert_close(
                 triton_output, torch_output, rtol=rtol, atol=atol
             )
@@ -238,6 +252,25 @@ class TestFusedMOE(CustomTestCase):
                                             )
                                             empty_gpu_cache()
                                         pbar.update(1)
+
+    def test_single_expert_routing(self):
+        # Cover the topk == 1 fast path (e.g. Llama-4-Scout num_experts_per_tok=1),
+        # where the second kernel writes directly into the output when
+        # routed_scaling_factor == 1.0 and the reduction is otherwise applied.
+        set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
+        for routed_scaling_factor in [1.0, 1.5]:
+            for m in [1, 33]:
+                with self.subTest(m=m, routed_scaling_factor=routed_scaling_factor):
+                    self._test_case(
+                        m,
+                        n=128,
+                        k=128,
+                        e=8,
+                        topk=1,
+                        dtype=torch.bfloat16,
+                        routed_scaling_factor=routed_scaling_factor,
+                    )
+                    empty_gpu_cache()
 
 
 if __name__ == "__main__":

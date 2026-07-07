@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from array import array
 from typing import TYPE_CHECKING, List, Optional, Set, Union
 
 from sglang.srt.dllm.config import DllmConfig
@@ -79,21 +80,23 @@ class SchedulerDllmMixin:
                 if new_tokens == 0:
                     continue
 
-                req.fill_ids[-new_tokens:] = next_token_ids[:]
-                self.num_generated_tokens += new_tokens
+                req.full_untruncated_fill_ids[
+                    req.extend_range.end - new_tokens : req.extend_range.end
+                ] = array("q", next_token_ids)
+                self.metrics_reporter.num_generated_tokens += new_tokens
 
                 req.output_ids.extend(next_token_ids)
-                req.check_finished(new_accepted_len=new_tokens)
+                req.update_finish_state(new_accepted_len=new_tokens)
 
                 if req.finished():
                     release_kv_cache(req, self.tree_cache)
                     req.time_stats.set_completion_time()
 
-            self.stream_output(batch.reqs, batch.return_logprob)
+            self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
             self.token_to_kv_pool_allocator.free_group_end()
 
-        can_run_cuda_graph = getattr(result, "can_run_cuda_graph", False)
-        self.report_prefill_stats(
+        can_run_cuda_graph = result.can_run_cuda_graph
+        self.metrics_reporter.report_prefill_stats(
             batch=batch,
             prefill_stats=batch.prefill_stats,
             can_run_cuda_graph=can_run_cuda_graph,
@@ -137,7 +140,7 @@ class SchedulerDllmMixin:
             self.tree_cache,
             self.token_to_kv_pool_allocator,
             self.running_batch,
-            self.new_token_ratio,
+            self.new_token_ratio_tracker.current,
             self.max_prefill_tokens,
             self.chunked_prefill_size,
             running_bs if self.is_mixed_chunk else 0,
@@ -200,7 +203,7 @@ class SchedulerDllmMixin:
 
         if can_run_list:
             self.dllm_manager.add_staging_reqs(can_run_list)
-            self.dllm_manager.increment_chunked_count()
+            self.dllm_manager.increment_inflight_middle_chunks()
 
         self.adder = adder
         self.can_run_list = can_run_list
@@ -225,7 +228,9 @@ class SchedulerDllmMixin:
         new_batch.decoding_reqs = None
 
         # Record prefill stats for logging after forward
-        from sglang.srt.observability.scheduler_metrics_mixin import PrefillStats
+        from sglang.srt.managers.scheduler_components.metrics_reporter import (
+            PrefillStats,
+        )
 
         new_batch.prefill_stats = PrefillStats.from_adder(
             self.adder, self.running_batch.reqs, self.enable_priority_scheduling
@@ -336,10 +341,10 @@ class DllmManager:
             return True
         return len(self.waiting_queue) == 0
 
-    def increment_chunked_count(self) -> None:
+    def increment_inflight_middle_chunks(self) -> None:
         """Increment chunked count for all staging requests."""
         for req in self.staging_queue:
-            req.is_chunked += 1
+            req.inflight_middle_chunks += 1
 
     def filter_finished_reqs(self) -> None:
         """Remove finished requests from both queues."""

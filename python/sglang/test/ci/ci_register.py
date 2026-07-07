@@ -12,12 +12,15 @@ __all__ = [
     "register_cpu_ci",
     "register_cuda_ci",
     "register_amd_ci",
+    "register_musa_ci",
     "register_npu_ci",
+    "register_xpu_ci",
+    "register_musa_ci",
     "ut_parse_one_file",
 ]
 
 # `suite` stays in positional slot 2 for backward compat with existing
-# `register_cpu_ci(5, "stage-a-test-cpu")` style positional calls. New fields
+# `register_cpu_ci(5, "base-a-test-cpu")` style positional calls. New fields
 # (`stage`, `runner_config`) are kwarg-only.
 _PARAM_ORDER = ("est_time", "suite", "nightly", "disabled")
 _KWARG_ONLY = ("stage", "runner_config")
@@ -30,6 +33,8 @@ class HWBackend(Enum):
     CUDA = auto()
     AMD = auto()
     NPU = auto()
+    XPU = auto()
+    MUSA = auto()
 
 
 @dataclass
@@ -91,6 +96,19 @@ def register_amd_ci(
     return None
 
 
+def register_musa_ci(
+    est_time: float,
+    suite: Optional[str] = None,
+    nightly: bool = False,
+    disabled: Optional[str] = None,
+    *,
+    stage: Optional[str] = None,
+    runner_config: Optional[str] = None,
+):
+    """Marker for MUSA CI registration (parsed via AST; runtime no-op)."""
+    return None
+
+
 def register_npu_ci(
     est_time: float,
     suite: Optional[str] = None,
@@ -104,11 +122,40 @@ def register_npu_ci(
     return None
 
 
+def register_xpu_ci(
+    est_time: float,
+    suite: Optional[str] = None,
+    nightly: bool = False,
+    disabled: Optional[str] = None,
+    *,
+    stage: Optional[str] = None,
+    runner_config: Optional[str] = None,
+):
+    """Marker for XPU CI registration (parsed via AST; runtime no-op)."""
+    return None
+
+
+def register_musa_ci(
+    est_time: float,
+    suite: Optional[str] = None,
+    nightly: bool = False,
+    disabled: Optional[str] = None,
+    *,
+    stage: Optional[str] = None,
+    runner_config: Optional[str] = None,
+):
+    """Marker for MUSA CI registration (parsed via AST; runtime no-op)."""
+    return None
+
+
 REGISTER_MAPPING = {
     "register_cpu_ci": HWBackend.CPU,
     "register_cuda_ci": HWBackend.CUDA,
     "register_amd_ci": HWBackend.AMD,
+    "register_musa_ci": HWBackend.MUSA,
     "register_npu_ci": HWBackend.NPU,
+    "register_xpu_ci": HWBackend.XPU,
+    "register_musa_ci": HWBackend.MUSA,
 }
 
 
@@ -287,17 +334,30 @@ def ut_parse_one_file(filename: str) -> Tuple[List[CIRegistry], bool]:
     return visitor.registries, visitor.has_main_entry
 
 
-def auto_partition(files: List[CIRegistry], rank: int, size: int) -> List[CIRegistry]:
+def auto_partition(
+    files: List[CIRegistry],
+    rank: int,
+    size: int,
+    live_est: Optional[dict] = None,
+) -> List[CIRegistry]:
     """Partition files into `size` sublists with approximately equal sums of
     estimated times using a greedy algorithm (LPT heuristic), and return the
     partition for the specified rank.
+
+    `live_est`: optional `filename -> est seconds` overrides; missing
+    files fall back to in-source `est_time`.
     """
     if not files or size <= 0:
         return []
 
+    def est_of(f: CIRegistry) -> float:
+        if live_est is not None and f.filename in live_est:
+            return live_est[f.filename]
+        return f.est_time
+
     # Sort by estimated_time descending; filename as tie-breaker for
     # deterministic partitioning regardless of glob ordering.
-    sorted_files = sorted(files, key=lambda f: (-f.est_time, f.filename))
+    sorted_files = sorted(files, key=lambda f: (-est_of(f), f.filename))
 
     partitions: List[List[CIRegistry]] = [[] for _ in range(size)]
     partition_sums = [0.0] * size
@@ -306,7 +366,7 @@ def auto_partition(files: List[CIRegistry], rank: int, size: int) -> List[CIRegi
     for file in sorted_files:
         min_sum_idx = min(range(size), key=partition_sums.__getitem__)
         partitions[min_sum_idx].append(file)
-        partition_sums[min_sum_idx] += file.est_time
+        partition_sums[min_sum_idx] += est_of(file)
 
     if rank < size:
         return partitions[rank]

@@ -47,5 +47,65 @@ def test_accuracy(M, N, K, with_bias, out_dtype):
     _test_accuracy_once(M, N, K, with_bias, out_dtype, "cuda")
 
 
+# (M, N) shapes that exercise each dispatch bucket / boundary. K is varied
+# separately below so every (M, N) is tested across multiple K values.
+SM90_SWAP_AB_MN_SHAPES = [
+    (1, 128),
+    (1, 4096),
+    (8, 1024),
+    (8, 8192),
+    (16, 1280),
+    (16, 8192),
+    (17, 128),
+    (17, 4096),
+    (32, 1024),
+    (32, 8192),
+    (64, 1280),
+    (64, 8192),
+    (65, 4096),
+    (96, 4096),
+    (128, 4096),
+    # Cluster-misaligned M_orig in the M64_smallN bucket (TileN=16, cluster_N=4).
+    # For M_orig in {17, 20, 33, 48}, grid_N = ceil(M_orig/16) in {2, 2, 3, 3},
+    # not a multiple of cluster_N=4. Explicit coverage so any can_implement
+    # failure or silent miscompute surfaces here.
+    (20, 128),
+    (20, 1024),
+    (20, 1280),
+    (33, 128),
+    (33, 1024),
+    (33, 1280),
+    (48, 128),
+    (48, 1024),
+    (48, 1280),
+]
+
+
+@pytest.mark.parametrize(
+    "shape_mn", SM90_SWAP_AB_MN_SHAPES, ids=lambda s: f"M{s[0]}_N{s[1]}"
+)
+@pytest.mark.parametrize("K", [2048, 4096, 8192])
+@pytest.mark.parametrize("with_bias", [True, False])
+@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float16])
+def test_accuracy_sm90_swap_ab(shape_mn, K, with_bias, out_dtype):
+    M, N = shape_mn
+    _test_accuracy_once(M, N, K, with_bias, out_dtype, "cuda")
+
+
+PRODUCTION_LIKE_FP8_GEMM_CASES = [
+    (189, 4608, 8192, False, torch.bfloat16),
+    (3330, 256, 8192, False, torch.bfloat16),
+    (17, 9216, 2048, False, torch.bfloat16),
+]
+
+
+@pytest.mark.parametrize(
+    "M,N,K,with_bias,out_dtype",
+    PRODUCTION_LIKE_FP8_GEMM_CASES,
+)
+def test_accuracy_production_like_shapes(M, N, K, with_bias, out_dtype):
+    _test_accuracy_once(M, N, K, with_bias, out_dtype, "cuda")
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))

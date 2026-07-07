@@ -12,9 +12,10 @@ from sglang.srt.disaggregation.decode import (  # noqa: E402
 from sglang.srt.disaggregation.utils import DisaggregationMode  # noqa: E402
 from sglang.srt.managers.schedule_batch import FINISH_ABORT  # noqa: E402
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=5, stage="stage-a", runner_config="1-gpu-small")
+register_cuda_ci(est_time=5, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=5, suite="stage-b-test-1-gpu-small-amd")
 
 
 class TestDisaggregationPriorityQueueing(unittest.TestCase):
@@ -30,7 +31,7 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
         scheduler.model_config = SimpleNamespace(num_key_value_heads=8)
         scheduler.disagg_prefill_bootstrap_queue = MagicMock()
         scheduler.disagg_decode_prealloc_queue = MagicMock()
-        scheduler.send_to_tokenizer = MagicMock()
+        scheduler.ipc_channels = MagicMock()
         return scheduler
 
     def _new_req(self, priority=None):
@@ -72,7 +73,7 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
         scheduler._add_request_to_queue(req)
 
         scheduler.disagg_decode_prealloc_queue.add.assert_not_called()
-        scheduler.send_to_tokenizer.send_output.assert_called_once()
+        scheduler.ipc_channels.send_to_tokenizer.send_output.assert_called_once()
         req.time_stats.trace_ctx.abort.assert_called_once()
 
 
@@ -106,11 +107,13 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
         queue._resolve_pending_reqs = MagicMock()
         queue._update_handshake_waiters = MagicMock()
         queue._allocatable_tokens = MagicMock(return_value=1000)
-        queue._pre_alloc = MagicMock(
-            side_effect=lambda req, prefix_indices=None, prefix_len=0: torch.arange(
+
+        def pre_alloc_mock(req, prefix_indices=None, prefix_len=0, total_prefix_len=0):
+            return torch.arange(
                 len(req.origin_input_ids) - prefix_len, dtype=torch.int64
             )
-        )
+
+        queue._pre_alloc = MagicMock(side_effect=pre_alloc_mock)
 
         queue.req_to_token_pool = MagicMock()
         queue.req_to_token_pool.available_size.return_value = 100
@@ -138,7 +141,7 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
         scheduler.enable_hisparse = False
         scheduler.waiting_queue = []
         scheduler.last_batch = None
-        scheduler.stream_output = MagicMock()
+        scheduler.output_streamer = MagicMock()
         queue.scheduler = scheduler
         return queue
 
@@ -197,7 +200,7 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
         )
         self.assertEqual([decode_req.req.rid for decode_req in failed], ["failed-low"])
         self.assertEqual(queue.queue, [])
-        queue.scheduler.stream_output.assert_called_once_with(
+        queue.scheduler.output_streamer.stream_output.assert_called_once_with(
             [failed_low.req], failed_low.req.return_logprob
         )
 

@@ -22,6 +22,7 @@ limitations under the License.
 #include <torch/library.h>
 #include <torch/torch.h>
 
+#include <optional>
 #include <tuple>
 #include <vector>
 
@@ -88,20 +89,6 @@ std::tuple<std::vector<int64_t>, std::vector<int64_t>> get_graph_buffer_ipc_meta
 void register_buffer(fptr_t _fa, const std::vector<fptr_t>& fake_ipc_ptrs);
 void register_graph_buffers(
     fptr_t _fa, const std::vector<std::vector<int64_t>>& handles, const std::vector<std::vector<int64_t>>& offsets);
-
-// mscclpp
-torch::Tensor mscclpp_generate_unique_id();
-fptr_t mscclpp_init_context(
-    const torch::Tensor& unique_id,
-    const int64_t rank,
-    const int64_t world_size,
-    torch::Tensor& scratch,
-    torch::Tensor& put_buffer,
-    const int64_t nranks_per_node,
-    const std::vector<int64_t>& rank_to_node,
-    const std::vector<int64_t>& rank_to_ib,
-    const int64_t context_selection);
-void mscclpp_allreduce(fptr_t _context, torch::Tensor& inp, torch::Tensor& out, int64_t nthreads, int64_t nblocks);
 #endif
 
 /*
@@ -124,6 +111,25 @@ int64_t cutlass_mla_get_workspace_size(
     int64_t num_batches,
     int64_t sm_count = 0,
     int64_t num_kv_splits = 1 /* Set to 1 to avoid cuda_graph issue by default. */);
+
+/*
+ * From csrc/infllm_v2
+ */
+void infllm_v2_max_pooling_1d_varlen(
+    at::Tensor input,
+    at::Tensor output,
+    at::Tensor cu_seqlens_q,
+    at::Tensor cu_seqlens_k,
+    at::Tensor cache_lens,
+    int64_t max_seqlen_q,
+    int64_t max_seqlen_k,
+    int64_t kernel_size,
+    int64_t stride,
+    int64_t padding,
+    int64_t block_size,
+    int64_t local_blocks,
+    int64_t init_blocks,
+    int64_t total_q);
 
 /*
  * From csrc/elementwise
@@ -172,7 +178,44 @@ void fast_topk_transform_ragged_interface(
 
 #ifdef USE_ROCM
 void gelu_quick(at::Tensor& out, const at::Tensor& input);
+
+void deepseek_v4_topk_transform_512(
+    const at::Tensor& scores,
+    const at::Tensor& seq_lens,
+    const at::Tensor& page_table,
+    at::Tensor& page_indices,
+    int64_t page_size,
+    std::optional<at::Tensor> raw_indices_opt = std::nullopt);
 #endif
+
+/*
+ * From csrc/elementwise (DeepSeek-V4 norm + rope)
+ */
+void dsv4_fused_q_norm_rope(
+    const at::Tensor& q_input,
+    at::Tensor& q_output,
+    const at::Tensor& freqs_cis,
+    const at::Tensor& positions,
+    double eps);
+
+void dsv4_fused_k_norm_rope_flashmla(
+    const at::Tensor& kv,
+    const at::Tensor& kv_weight,
+    const at::Tensor& freqs_cis,
+    const at::Tensor& positions,
+    const at::Tensor& out_loc,
+    at::Tensor& kvcache,
+    double eps,
+    int64_t page_size);
+
+void dsv4_fused_q_indexer_rope_hadamard_quant(
+    const at::Tensor& q_input,
+    at::Tensor& q_fp8,
+    const at::Tensor& weight,
+    at::Tensor& weights_out,
+    double weight_scale,
+    const at::Tensor& freqs_cis,
+    const at::Tensor& positions);
 
 /*
  * From csrc/gemm
@@ -227,7 +270,6 @@ void bmm_fp8(
     at::Tensor B_scale,
     at::Tensor workspace_buffer,
     int64_t cublas_handle);
-void dsv3_router_gemm(torch::Tensor& output, const torch::Tensor& mat_a, const torch::Tensor& mat_b);
 void dsv3_fused_a_gemm(torch::Tensor& output, torch::Tensor const& mat_a, torch::Tensor const& mat_b);
 
 torch::Tensor gptq_gemm(
@@ -273,24 +315,6 @@ void moe_sum_reduce(at::Tensor& input, at::Tensor& output, double routed_scaling
 
 void moe_sum(torch::Tensor& input, torch::Tensor& output);
 
-std::vector<at::Tensor> moe_fused_gate(
-    at::Tensor& input,
-    at::Tensor& bias,
-    int64_t num_expert_group,
-    int64_t topk_group,
-    int64_t topk,
-    int64_t num_fused_shared_experts,
-    double routed_scaling_factor,
-    bool apply_routed_scaling_factor_on_output);
-
-std::vector<at::Tensor> kimi_k2_moe_fused_gate(
-    at::Tensor& input,
-    at::Tensor& bias,
-    int64_t topk,
-    bool renormalize,
-    double routed_scaling_factor,
-    bool apply_routed_scaling_factor_on_output);
-
 void fp8_blockwise_scaled_grouped_mm(
     torch::Tensor& output,
     torch::Tensor& a_ptrs,
@@ -330,6 +354,35 @@ void apply_shuffle_mul_sum(
     torch::Tensor& output,
     const torch::Tensor& permutation,
     const std::optional<torch::Tensor>& factors);
+
+/*
+ * From csrc/elementwise (DeepSeek-V4 norm + rope)
+ */
+void dsv4_fused_q_norm_rope(
+    const at::Tensor& q_input,
+    at::Tensor& q_output,
+    const at::Tensor& freqs_cis,
+    const at::Tensor& positions,
+    double eps);
+
+void dsv4_fused_k_norm_rope_flashmla(
+    const at::Tensor& kv,
+    const at::Tensor& kv_weight,
+    const at::Tensor& freqs_cis,
+    const at::Tensor& positions,
+    const at::Tensor& out_loc,
+    at::Tensor& kvcache,
+    double eps,
+    int64_t page_size);
+
+void dsv4_fused_q_indexer_rope_hadamard_quant(
+    const at::Tensor& q_input,
+    at::Tensor& q_fp8,
+    const at::Tensor& weight,
+    at::Tensor& weights_out,
+    double weight_scale,
+    const at::Tensor& freqs_cis,
+    const at::Tensor& positions);
 
 void fused_qk_norm_rope(
     torch::Tensor& qkv,
@@ -811,8 +864,12 @@ std::vector<at::Tensor> fwd_kvcache_mla(
     const at::Tensor& tile_scheduler_metadata,  // num_sm_parts x TileSchedulerMetaDataSize
     const at::Tensor& num_splits,               // batch_size + 1
     const bool& is_fp8,
-    const std::optional<at::Tensor>& indices  // None, or batch_size x seqlen_q x topk
-);
+    const std::optional<at::Tensor>& indices,  // None, or batch_size x seqlen_q x topk
+    const std::optional<at::Tensor>& attn_sink,
+    const std::optional<at::Tensor>& extra_k_cache,
+    const std::optional<at::Tensor>& extra_indices_in_kvcache,
+    const std::optional<at::Tensor>& topk_length,
+    const std::optional<at::Tensor>& extra_topk_length);
 
 void FMHACutlassSM100FwdRun(
     at::Tensor workspace_buffer,
@@ -829,8 +886,14 @@ void FMHACutlassSM100FwdRun(
     int64_t max_seqlen_kv,
     bool is_varlen);
 
-std::vector<at::Tensor>
-sparse_prefill_fwd(const at::Tensor& q, const at::Tensor& kv, const at::Tensor& indices, double sm_scale, int64_t d_v);
+std::vector<at::Tensor> sparse_prefill_fwd(
+    const at::Tensor& q,
+    const at::Tensor& kv,
+    const at::Tensor& indices,
+    double sm_scale,
+    int64_t d_v,
+    const std::optional<at::Tensor>& attn_sink,
+    const std::optional<at::Tensor>& topk_length);
 
 std::vector<at::Tensor> fwd_kvcache_mla_fp8(
     at::Tensor& q,             // batch_size x seqlen_q x num_heads x head_size

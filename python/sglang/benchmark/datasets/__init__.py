@@ -1,5 +1,6 @@
 from typing import Dict, Type
 
+from sglang.benchmark.datasets.agentic_trace import AgenticTraceDataset
 from sglang.benchmark.datasets.autobench import AutoBenchmarkDataset
 from sglang.benchmark.datasets.common import BaseDataset, DatasetRow
 from sglang.benchmark.datasets.custom import CustomDataset
@@ -13,8 +14,10 @@ from sglang.benchmark.datasets.mooncake import MooncakeDataset
 from sglang.benchmark.datasets.openai_dataset import OpenAIDataset
 from sglang.benchmark.datasets.random import RandomDataset
 from sglang.benchmark.datasets.sharegpt import ShareGPTDataset
+from sglang.benchmark.datasets.speed_bench import SpeedBenchDataset
 
 DATASET_MAPPING: Dict[str, Type[BaseDataset]] = {
+    "agentic-trace": AgenticTraceDataset,
     "autobench": AutoBenchmarkDataset,
     "sharegpt": ShareGPTDataset,
     "custom": CustomDataset,
@@ -28,6 +31,7 @@ DATASET_MAPPING: Dict[str, Type[BaseDataset]] = {
     "image": ImageDataset,
     "mooncake": MooncakeDataset,
     "longbench_v2": LongBenchV2Dataset,
+    "speed-bench": SpeedBenchDataset,
 }
 
 

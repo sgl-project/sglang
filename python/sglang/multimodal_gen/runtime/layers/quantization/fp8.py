@@ -75,7 +75,11 @@ logger = logging.getLogger(__name__)
 
 
 class Fp8Config(QuantizationConfig):
-    """Config class for FP8."""
+    """Config class for FP8.
+
+    No-arg ``Fp8Config()`` selects online (post-load) weight quantization:
+    ``is_checkpoint_fp8_serialized=False`` with ``activation_scheme="dynamic"``.
+    """
 
     def __init__(
         self,
@@ -96,7 +100,7 @@ class Fp8Config(QuantizationConfig):
         if weight_block_size is not None:
             if not is_checkpoint_fp8_serialized:
                 raise ValueError(
-                    f"The block-wise quantization only supports fp8-serialized checkpoint for now."
+                    "The block-wise quantization only supports fp8-serialized checkpoint for now."
                 )
             if len(weight_block_size) != 2:
                 raise ValueError(
