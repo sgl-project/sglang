@@ -254,8 +254,8 @@ void sgl_per_token_quant_fp8(torch::Tensor input, torch::Tensor output_q, torch:
   const int sm_count = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
   const int TOKENS_PER_CTA = 8;
   const bool use_warp_kernel = (num_tokens >= sm_count * 2 * TOKENS_PER_CTA);
-  const bool use_vec16 = (hidden_dim % 16 == 0);
-  const bool use_vec8 = (hidden_dim % 8 == 0);
+  const bool use_vec16 = (hidden_dim % 16 == 0) && (reinterpret_cast<uint64_t>(output_q.data_ptr()) % alignof(uint4) == 0);
+  const bool use_vec8 = (hidden_dim % 8 == 0) && (reinterpret_cast<uint64_t>(output_q.data_ptr()) % alignof(uint64_t) == 0);
 
   const int sizeof_T = input.scalar_type() == torch::kFloat16 ? 2 : (input.scalar_type() == torch::kBFloat16 ? 2 : 4);
   const int smem_padding = 32;  // Pad to bank boundary to avoid conflicts
