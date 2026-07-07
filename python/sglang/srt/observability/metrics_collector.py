@@ -312,6 +312,12 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
+        self.gpu_kv_cache_occupancy = Gauge(
+            name="sglang:gpu_kv_cache_occupancy",
+            documentation="GPU KV cache occupancy (0-1). Alias of token_usage kept for HiCache dashboards.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
         self.full_token_usage = Gauge(
             name="sglang:full_token_usage",
             documentation="The token usage for full attention layers.",
@@ -1282,6 +1288,7 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
 
         # Memory pool usage ratios
         self._log_gauge(self.token_usage, stats.token_usage)
+        self._log_gauge(self.gpu_kv_cache_occupancy, stats.token_usage)
         self._log_gauge(self.full_token_usage, stats.full_token_usage)
         self._log_gauge(self.swa_token_usage, stats.swa_token_usage)
         self._log_gauge(self.mamba_usage, stats.mamba_usage)
@@ -1769,6 +1776,18 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             labelnames=labels.keys(),
         )
 
+        self.prefetched_bytes_total = Counter(
+            name="sglang:prefetched_bytes_total",
+            documentation="Number of bytes prefetched from L3 storage to host.",
+            labelnames=labels.keys(),
+        )
+
+        self.backuped_bytes_total = Counter(
+            name="sglang:backuped_bytes_total",
+            documentation="Number of bytes backed up from host to L3 storage.",
+            labelnames=labels.keys(),
+        )
+
         bucket_io = [
             1,
             5,
@@ -1822,6 +1841,14 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
     def log_backuped_tokens(self, backuped_tokens: int):
         if backuped_tokens > 0:
             self.backuped_tokens_total.labels(**self.labels).inc(backuped_tokens)
+
+    def log_prefetched_bytes(self, num_bytes: int):
+        if num_bytes > 0:
+            self.prefetched_bytes_total.labels(**self.labels).inc(num_bytes)
+
+    def log_backuped_bytes(self, num_bytes: int):
+        if num_bytes > 0:
+            self.backuped_bytes_total.labels(**self.labels).inc(num_bytes)
 
     def _log_histogram(self, histogram, data: Union[int, float]):
         histogram.labels(**self.labels).observe(data)
@@ -1932,6 +1959,21 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
             labelnames=labels.keys(),
         )
 
+        # Split of evicted_tokens_total by whether the node had already been
+        # backed up to host (cheap detach) vs dropped without a host copy
+        # (write-through under host memory pressure, or write_through mode
+        # without a host tier at all).
+        self.evicted_backuped_tokens_total = Counter(
+            name="sglang:evicted_backuped_tokens_total",
+            documentation="Number of evicted GPU tokens that had already been backed up to host (cheap detach, no data loss).",
+            labelnames=labels.keys(),
+        )
+        self.evicted_regular_tokens_total = Counter(
+            name="sglang:evicted_regular_tokens_total",
+            documentation="Number of evicted GPU tokens dropped without a host backup (data is gone, must be recomputed).",
+            labelnames=labels.keys(),
+        )
+
         self.load_back_duration_seconds = Histogram(
             name="sglang:load_back_duration_seconds",
             documentation="Time taken to load KV cache from CPU back to GPU in seconds.",
@@ -1945,8 +1987,35 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
             labelnames=labels.keys(),
         )
 
+        bucket_bandwidth_gb_s = [0.1, 0.5, 1, 5, 10, 20, 40, 80, 160, 320]
+
+        # PCIe bandwidth, measured via CUDA start/finish events bracketing the
+        # actual D2H (eviction/write-back) and H2D (load-back) copy on the
+        # dedicated write/load streams -- not wall-clock time around the
+        # (often async) Python call.
+        self.eviction_bandwidth_gb_s = Histogram(
+            name="sglang:eviction_bandwidth_gb_s",
+            documentation="L1(GPU)->L2(Host) PCIe write bandwidth in GB/s, measured per write-back batch via CUDA events.",
+            labelnames=labels.keys(),
+            buckets=bucket_bandwidth_gb_s,
+        )
+        self.load_back_bandwidth_gb_s = Histogram(
+            name="sglang:load_back_bandwidth_gb_s",
+            documentation="L2(Host)->L1(GPU) PCIe load bandwidth in GB/s, measured per load-back batch via CUDA events.",
+            labelnames=labels.keys(),
+            buckets=bucket_bandwidth_gb_s,
+        )
+
     def increment_eviction_num_tokens(self, num_tokens: int) -> None:
         self.eviction_num_tokens.labels(**self.labels).inc(num_tokens)
+
+    def increment_evicted_backuped_tokens(self, num_tokens: int) -> None:
+        if num_tokens > 0:
+            self.evicted_backuped_tokens_total.labels(**self.labels).inc(num_tokens)
+
+    def increment_evicted_regular_tokens(self, num_tokens: int) -> None:
+        if num_tokens > 0:
+            self.evicted_regular_tokens_total.labels(**self.labels).inc(num_tokens)
 
     def increment_load_back_num_tokens(self, num_tokens: int) -> None:
         self.load_back_num_tokens.labels(**self.labels).inc(num_tokens)
@@ -1956,6 +2025,12 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
 
     def observe_load_back_duration(self, duration_seconds: float) -> None:
         self.load_back_duration_seconds.labels(**self.labels).observe(duration_seconds)
+
+    def observe_eviction_bandwidth_gb_s(self, gb_per_s: float) -> None:
+        self.eviction_bandwidth_gb_s.labels(**self.labels).observe(gb_per_s)
+
+    def observe_load_back_bandwidth_gb_s(self, gb_per_s: float) -> None:
+        self.load_back_bandwidth_gb_s.labels(**self.labels).observe(gb_per_s)
 
 
 class EncoderMetricsCollector(_StatLoggerDIMixin):

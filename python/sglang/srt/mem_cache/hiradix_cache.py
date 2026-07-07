@@ -664,6 +664,10 @@ class HiRadixCache(RadixCache):
                     self.storage_metrics_collector.log_backuped_tokens(
                         operation.completed_tokens
                     )
+                    self.storage_metrics_collector.log_backuped_bytes(
+                        operation.completed_tokens
+                        * self.cache_controller.mem_pool_host.get_size_per_token()
+                    )
 
         def _drain_release():
             host_indices_list = []
@@ -978,12 +982,30 @@ class HiRadixCache(RadixCache):
                 # write to host if the node is not backuped
                 self.write_backup(node)
 
+    def _report_transfer_bandwidth(self, ack, is_eviction: bool) -> None:
+        # PCIe bandwidth per ack'd batch, via CUDA event timing bracketing the
+        # actual D2H (write-back) / H2D (load-back) copy -- see start_writing()/
+        # start_loading() in cache_controller.py. timing_enabled is False on
+        # backends where the CUDA/HIP event timing API is unavailable.
+        if self.metrics_collector is None or ack.num_tokens <= 0 or not ack.timing_enabled:
+            return
+        elapsed_ms = ack.start_event.elapsed_time(ack.finish_event)
+        if elapsed_ms <= 0:
+            return
+        bytes_per_token = self.cache_controller.mem_pool_host.get_size_per_token()
+        gb_per_s = (ack.num_tokens * bytes_per_token / 1e9) / (elapsed_ms / 1000.0)
+        if is_eviction:
+            self.metrics_collector.observe_eviction_bandwidth_gb_s(gb_per_s)
+        else:
+            self.metrics_collector.observe_load_back_bandwidth_gb_s(gb_per_s)
+
     def writing_check(self, write_back=False):
         if write_back:
             # blocking till all write back complete
             while len(self.ongoing_write_through) > 0:
                 for ack in self.cache_controller.ack_write_queue:
                     ack.finish_event.synchronize()
+                    self._report_transfer_bandwidth(ack, is_eviction=True)
                     for ack_id in ack.node_ids:
                         self._finish_write_through_ack(ack_id, release_lock=False)
                 self.cache_controller.ack_write_queue.clear()
@@ -1009,6 +1031,7 @@ class HiRadixCache(RadixCache):
         while finish_count > 0:
             ack = self.cache_controller.ack_write_queue.pop(0)
             ack.finish_event.synchronize()
+            self._report_transfer_bandwidth(ack, is_eviction=True)
             for ack_id in ack.node_ids:
                 self._finish_write_through_ack(ack_id, release_lock=True)
             finish_count -= 1
@@ -1029,6 +1052,7 @@ class HiRadixCache(RadixCache):
         while finish_count > 0:
             ack = self.cache_controller.ack_load_queue.pop(0)
             ack.finish_event.synchronize()
+            self._report_transfer_bandwidth(ack, is_eviction=False)
             for ack_id in ack.node_ids:
                 end_node = self.ongoing_load_back.pop(ack_id)
                 self.dec_lock_ref(end_node)
@@ -1116,10 +1140,21 @@ class HiRadixCache(RadixCache):
         start_time = time.perf_counter()
         num_tokens = params.num_tokens
         if self.cache_controller.write_policy == "write_back":
-            num_evicted = self._evict_write_back(num_tokens)
+            num_evicted, num_backuped_evicted = self._evict_write_back(num_tokens)
         else:
-            num_evicted = self._evict_write_through(num_tokens)
+            num_evicted, num_backuped_evicted = self._evict_write_through(num_tokens)
         self.update_eviction_metrics(num_evicted, start_time)
+        if self.metrics_collector is not None and num_evicted > 0:
+            # Split of evicted_tokens_total: "backuped" nodes were already on
+            # host (cheap detach, no data loss); "regular" nodes are dropped
+            # without a host copy (write-through under pressure, or plain
+            # write_through mode with no host tier at all).
+            self.metrics_collector.increment_evicted_backuped_tokens(
+                num_backuped_evicted
+            )
+            self.metrics_collector.increment_evicted_regular_tokens(
+                num_evicted - num_backuped_evicted
+            )
         return EvictResult(num_tokens_evicted=num_evicted)
 
     def _make_eviction_heap(self):
@@ -1136,30 +1171,38 @@ class HiRadixCache(RadixCache):
         if p is not self.root_node and all(c.evicted for c in p.children.values()):
             heapq.heappush(heap, (self.eviction_strategy.get_priority(p), p))
 
-    def _evict_write_through(self, num_tokens: int) -> int:
+    def _evict_write_through(self, num_tokens: int) -> Tuple[int, int]:
         """write_through / write_through_selective: drop non-backuped leaves,
         demote already-backuped ones. Nothing is staged to host during eviction,
         so this is a plain on-the-fly pass.
+
+        Returns (num_evicted, num_backuped_evicted).
         """
         heap = self._make_eviction_heap()
         num_evicted = 0
+        num_backuped_evicted = 0
         while num_evicted < num_tokens and heap:
             _, x = heapq.heappop(heap)
             if x.lock_ref > 0:
                 continue
             if x.backuped:
-                num_evicted += self._evict_backuped(x)
+                n = self._evict_backuped(x)
+                num_evicted += n
+                num_backuped_evicted += n
             else:
                 num_evicted += self._evict_regular(x)
             self._promote_parent(x, heap)
-        return num_evicted
+        return num_evicted, num_backuped_evicted
 
-    def _evict_write_back(self, num_tokens: int) -> int:
+    def _evict_write_back(self, num_tokens: int) -> Tuple[int, int]:
         """eviction for write_back mode: demote already-backuped leaves, stage non-backuped ones to host if possible, otherwise drop them.
         note this path will be deprecated in the future.
+
+        Returns (num_evicted, num_backuped_evicted).
         """
         heap = self._make_eviction_heap()
         num_evicted = 0
+        num_backuped_evicted = 0
         staged: List[Tuple[TreeNode, torch.Tensor]] = []
 
         def flush_staged() -> None:
@@ -1176,17 +1219,21 @@ class HiRadixCache(RadixCache):
             if x.lock_ref > 0:
                 continue
             if x.backuped:
-                num_evicted += self._evict_backuped(x)
+                n = self._evict_backuped(x)
+                num_evicted += n
+                num_backuped_evicted += n
             elif self.write_backup(x, write_back=True) > 0:
                 x.protect_host()
                 staged.append((x, x.value))
-                num_evicted += self._detach_backuped(x)
+                n = self._detach_backuped(x)
+                num_evicted += n
+                num_backuped_evicted += n
             else:
                 flush_staged()
                 num_evicted += self._drop_subtree_no_host(x)
             self._promote_parent(x, heap)
         flush_staged()
-        return num_evicted
+        return num_evicted, num_backuped_evicted
 
     def _detach_backuped(self, node: TreeNode) -> int:
         # detach nodes from tree while keeping device slots, for write-back eviction
@@ -1592,6 +1639,10 @@ class HiRadixCache(RadixCache):
 
         if self.enable_storage_metrics:
             self.storage_metrics_collector.log_prefetched_tokens(loaded_from_storage)
+            self.storage_metrics_collector.log_prefetched_bytes(
+                loaded_from_storage
+                * self.cache_controller.mem_pool_host.get_size_per_token()
+            )
 
         return True
 
