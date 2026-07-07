@@ -44,10 +44,13 @@ model:
 
 runtime:
   image: lmsysorg/sglang-rocm:v0.5.13.post1-rocm720-mi35x-20260623
-  # Kimi uses split attention backends (aiter prefill / triton decode), not a
-  # single --attention-backend.
+  # Kimi normally uses split backends (aiter prefill / triton decode). Experiment:
+  # non-MTP disagg (triton decode reading transferred KV) only reaches ~0.88, while
+  # MTP verify — which dispatch_attn_forward_method routes to the PREFILL backend
+  # (aiter) under speculative_attention_mode=prefill — passes at ~0.95. So switch
+  # decode to aiter to test whether the triton MLA decode path is what degrades it.
   prefill_attention_backend: aiter
-  decode_attention_backend: triton
+  decode_attention_backend: aiter
   # RoCE HCAs MORI uses for cross-node KV transfer.
   ib_devices: rdma0,rdma1,rdma2,rdma3
   prefill_port: 30025
@@ -56,10 +59,7 @@ runtime:
   decode_bootstrap_port: 9001
   lb_port: 8000
   mem_fraction_static: 0.90
-  # Experiment: single-node default is page_size=1 (GSM8K 0.944 PASS); disagg
-  # uses 256 and only reaches ~0.89. Testing page_size=1 here to check whether
-  # the large page (on the triton decode / MLA path) is what degrades accuracy.
-  page_size: 1
+  page_size: 256
   max_running_requests: 256
   chunked_prefill_size: 8192
 
