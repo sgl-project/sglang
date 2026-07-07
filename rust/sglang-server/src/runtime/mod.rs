@@ -194,6 +194,16 @@ impl ServerArgs {
             .unwrap_or(false)
     }
 
+    /// `incremental_streaming_output` (default `false`): when set, each streamed
+    /// `/generate` frame carries this step's **delta** `text`/`output_ids` rather
+    /// than the cumulative text so far. Matches the Python `TokenizerManager`.
+    pub fn incremental_streaming_output(&self) -> bool {
+        self.data
+            .get("incremental_streaming_output")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    }
+
     fn str_field(&self, key: &str) -> Option<&str> {
         self.data.get(key).and_then(|v| v.as_str())
     }
