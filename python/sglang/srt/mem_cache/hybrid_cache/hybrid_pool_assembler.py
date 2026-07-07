@@ -27,6 +27,7 @@ from sglang.srt.mem_cache.pool_host.mha import (
 )
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.mem_cache.unified_cache_components import ComponentType
+from sglang.srt.mem_cache.pool_host.common import get_allocator_type
 
 if TYPE_CHECKING:
     import torch
@@ -35,15 +36,12 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.hi_mamba_radix_cache import HiMambaRadixCache
     from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
-    from sglang.srt.mem_cache.pool_host.common import get_allocator_type
     from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
 
 
 def _get_allocator_type(server_args: ServerArgs) -> str:
-    
-
     return get_allocator_type(server_args)
 
 
