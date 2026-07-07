@@ -103,9 +103,7 @@ class AWQConfig(QuantizationConfig):
         return "awq"
 
     def get_supported_act_dtypes(self) -> List[torch.dtype]:
-        if _is_npu:
-            return [torch.float16, torch.bfloat16]
-        return [torch.float16]
+        return [torch.float16] if not _is_npu else [torch.float16, torch.bfloat16]
 
     @classmethod
     def get_min_capability(cls) -> int:

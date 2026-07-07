@@ -27,6 +27,40 @@ def pack_int4_to_uint8(q: torch.Tensor) -> torch.Tensor:
     return (low | (high << 4)).contiguous()
 
 
+def unpack_awq_to_codes(packed: torch.Tensor, rows: int) -> torch.Tensor:
+    """Deinterleave AWQ-packed int32 ``[rows, cols]`` into codes ``[rows, cols*8]``.
+
+    Codes are in ``[0, 15]`` and restored to natural (non-interleaved) order.
+    """
+    t = packed.contiguous().view(torch.uint8)  # [rows, cols * 4]
+    shifter = torch.tensor([0, 4], dtype=torch.uint8, device=t.device)
+    t = (t[:, :, None] >> shifter) & 0xF  # [rows, cols * 4, 2]
+    t = t.view(-1, 8)[:, AWQ_REVERSE_PACK_ORDER]  # undo interleave
+    return t.reshape(rows, -1)  # [rows, cols * 8]
+
+
+def _nibble_shifts(device: torch.device) -> torch.Tensor:
+    return torch.arange(0, 32, 4, device=device, dtype=torch.int32)
+
+
+def unpack_gptq_qweight(qweight: torch.Tensor) -> torch.Tensor:
+    """``[K // 8, N]`` int32 packed along K -> ``[K, N]`` codes in ``[0, 15]``."""
+    n = qweight.shape[1]
+    shifts = _nibble_shifts(qweight.device)  # [8]
+    # [K // 8, 8, N]; sub-index i selects k = row * 8 + i
+    codes = (qweight.unsqueeze(1) >> shifts.view(1, 8, 1)) & 0xF
+    return codes.reshape(-1, n)  # [K, N]
+
+
+def unpack_gptq_qzeros(qzeros: torch.Tensor) -> torch.Tensor:
+    """``[K // gs, N // 8]`` int32 packed along N -> ``[K // gs, N]`` codes."""
+    rows = qzeros.shape[0]
+    shifts = _nibble_shifts(qzeros.device)  # [8]
+    # [K // gs, N // 8, 8]; sub-index j selects n = col * 8 + j
+    codes = (qzeros.unsqueeze(-1) >> shifts.view(1, 1, 8)) & 0xF
+    return codes.reshape(rows, -1)  # [K // gs, N]
+
+
 def build_qscale_and_zeros(
     scales: torch.Tensor, zp: torch.Tensor
 ) -> torch.Tensor:

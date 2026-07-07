@@ -12,34 +12,14 @@ from sglang.srt.hardware_backend.xpu.quantization.int4pack_utils import (
     SUPPORTED_GROUP_SIZES,
     build_qscale_and_zeros,
     pack_int4_to_uint8,
+    unpack_gptq_qweight,
+    unpack_gptq_qzeros,
     xpu_int4pack_mm,
 )
 from sglang.srt.layers.quantization.utils import replace_parameter
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
-
-
-def _nibble_shifts(device: torch.device) -> torch.Tensor:
-    return torch.arange(0, 32, 4, device=device, dtype=torch.int32)
-
-
-def _unpack_gptq_qweight(qweight: torch.Tensor) -> torch.Tensor:
-    """``[K // 8, N]`` int32 packed along K -> ``[K, N]`` codes in ``[0, 15]``."""
-    n = qweight.shape[1]
-    shifts = _nibble_shifts(qweight.device)  # [8]
-    # [K // 8, 8, N]; sub-index i selects k = row * 8 + i
-    codes = (qweight.unsqueeze(1) >> shifts.view(1, 8, 1)) & 0xF
-    return codes.reshape(-1, n)  # [K, N]
-
-
-def _unpack_gptq_qzeros(qzeros: torch.Tensor) -> torch.Tensor:
-    """``[K // gs, N // 8]`` int32 packed along N -> ``[K // gs, N]`` codes."""
-    rows = qzeros.shape[0]
-    shifts = _nibble_shifts(qzeros.device)  # [8]
-    # [K // gs, N // 8, 8]; sub-index j selects n = col * 8 + j
-    codes = (qzeros.unsqueeze(-1) >> shifts.view(1, 1, 8)) & 0xF
-    return codes.reshape(rows, -1)  # [K // gs, N]
 
 
 class GPTQXPULinearKernel:
@@ -63,11 +43,11 @@ class GPTQXPULinearKernel:
         scales = layer.scales.data  # [K // gs, N]
         desc_act = bool(self.quant_config.desc_act)
 
-        codes = _unpack_gptq_qweight(qweight)  # [K, N]
+        codes = unpack_gptq_qweight(qweight)  # [K, N]
         k, n = codes.shape
 
         # qzeros -> [K // gs, N] effective zero-points (v1 is off-by-one).
-        zp = _unpack_gptq_qzeros(qzeros).to(torch.int32)  # [num_groups, N]
+        zp = unpack_gptq_qzeros(qzeros).to(torch.int32)  # [num_groups, N]
         if not self.use_v2_format:
             zp = zp + 1
 
