@@ -186,7 +186,7 @@ class VLAObservationPreprocessStage(PipelineStage):
         return batch
 
 
-class VLAPrefixStage(PipelineStage):
+class VLAPrefixEncodingStage(PipelineStage):
     def __init__(
         self,
         policy_model: Any,

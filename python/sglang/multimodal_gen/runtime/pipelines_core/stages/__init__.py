@@ -46,7 +46,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.vla import (
     VLAActionDenoisingStage,
     VLAActionPostprocessStage,
     VLAObservationPreprocessStage,
-    VLAPrefixStage,
+    VLAPrefixEncodingStage,
     VLAStageKeys,
 )
 
@@ -69,7 +69,7 @@ __all__ = [
     "TextEncodingStage",
     "VLAStageKeys",
     "VLAObservationPreprocessStage",
-    "VLAPrefixStage",
+    "VLAPrefixEncodingStage",
     "VLAActionDenoisingStage",
     "VLAActionPostprocessStage",
 ]

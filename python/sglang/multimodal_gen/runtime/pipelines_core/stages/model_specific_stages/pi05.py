@@ -11,7 +11,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.vla import (
     VLAActionDenoisingStage,
     VLAActionPostprocessStage,
     VLAObservationPreprocessStage,
-    VLAPrefixStage,
+    VLAPrefixEncodingStage,
     VLAStageKeys,
 )
 
@@ -23,7 +23,7 @@ class Pi05PreprocessStage(VLAObservationPreprocessStage):
         super().__init__(preprocessor, keys=PI05_STAGE_KEYS)
 
 
-class Pi05PrefixStage(VLAPrefixStage):
+class Pi05PrefixStage(VLAPrefixEncodingStage):
     def __init__(
         self,
         policy_model: Pi05PolicyModel,

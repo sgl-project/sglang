@@ -22,7 +22,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.vla import (
     VLAActionDenoisingStage,
     VLAActionPostprocessStage,
     VLAObservationPreprocessStage,
-    VLAPrefixStage,
+    VLAPrefixEncodingStage,
     VLAStageKeys,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -106,7 +106,7 @@ class Pi05Pipeline(ComposedPipelineBase):
             "pi05_preprocess",
         )
         self.add_stage(
-            VLAPrefixStage(
+            VLAPrefixEncodingStage(
                 self.get_module("policy_model"),
                 self.get_module("prefix_cache"),
                 keys=PI05_STAGE_KEYS,
