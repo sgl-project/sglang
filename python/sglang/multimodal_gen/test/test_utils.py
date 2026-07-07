@@ -37,7 +37,7 @@ logger = init_logger(__name__)
 SGL_TEST_FILES_CI_DATA_REVISION = "916cbff23aa4e89f78128397ede7ce29a73d6d8c"
 
 if current_platform.is_npu():
-    SGL_TEST_FILES_CI_DATA_REVISION = "670d66a8a290b62c0c3c077b3e9b0f4a4d9a44e7"
+    SGL_TEST_FILES_CI_DATA_REVISION = "6b62f4b6825c76a25fd2ba28248df68f2b400e65"
 
 SGL_TEST_FILES_CONSISTENCY_GT_ROOT = (
     "https://raw.githubusercontent.com/"
