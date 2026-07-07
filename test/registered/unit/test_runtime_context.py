@@ -550,6 +550,54 @@ class TestForwardFlags(_IsolatedServerArgs):
             worker.join()
         self.assertFalse(seen["value"])  # a new thread sees the default
 
+    def test_graph_visible_flags_trace_under_torch_compile(self):
+        # Regression: dynamo cannot trace ContextVar.get, and these flags are
+        # read inside compiled model code (vocab embedding, communicator, DP
+        # gather) — they must stay plain-slot backed. fullgraph=True turns
+        # any graph break back into a failure.
+        import torch
+
+        from sglang.srt.runtime_context import get_forward
+
+        reset_context()
+
+        @torch.compile(fullgraph=True, backend="eager", dynamic=False)
+        def probe(x):
+            fwd = get_forward()
+            if fwd.attn_input_scattered:
+                x = x + 1
+            if fwd.is_extend_in_batch:
+                x = x + 2
+            return x
+
+        self.assertEqual(probe(torch.zeros(())).item(), 0)
+        with get_forward().scoped(attn_input_scattered=True):
+            self.assertEqual(probe(torch.zeros(())).item(), 1)
+        get_forward().set("is_extend_in_batch", True)
+        self.assertEqual(probe(torch.zeros(())).item(), 2)
+        get_forward().set("is_extend_in_batch", False)
+
+    def test_graph_visible_flags_are_process_visible_across_threads(self):
+        # Documented divergence from the contextvar-backed flags: plain slots
+        # are process-global (the storage form these flags had before the
+        # tier), so another thread sees the current value, not the default.
+        import threading
+
+        from sglang.srt.runtime_context import get_forward
+
+        reset_context()
+        seen = {}
+        with get_forward().scoped(attn_input_scattered=True):
+
+            def probe():
+                seen["value"] = get_forward().attn_input_scattered
+
+            worker = threading.Thread(target=probe)
+            worker.start()
+            worker.join()
+        self.assertTrue(seen["value"])
+        self.assertFalse(get_forward().attn_input_scattered)
+
     def test_multi_stream_shims(self):
         from sglang.srt.utils.multi_stream_utils import (
             do_multi_stream,
@@ -561,6 +609,43 @@ class TestForwardFlags(_IsolatedServerArgs):
         with with_multi_stream(True):
             self.assertTrue(do_multi_stream())
         self.assertFalse(do_multi_stream())
+
+    def test_attn_tp_context_per_forward_slots(self):
+        from types import SimpleNamespace
+
+        from sglang.srt.layers.communicator import get_attn_tp_context
+        from sglang.srt.runtime_context import get_forward
+
+        reset_context()
+        ctx = get_attn_tp_context()
+        self.assertFalse(ctx.input_scattered)
+        fb = SimpleNamespace(
+            forward_mode=SimpleNamespace(
+                is_extend=lambda: False, is_target_verify=lambda: False
+            ),
+            input_ids=None,
+            can_run_tbo=False,
+        )
+        sentinel = SimpleNamespace(fetch_qkv_latent=lambda: "qkv")
+        with ctx.maybe_input_scattered(fb):
+            ctx.set_attn_inputs(sentinel)
+            self.assertEqual(ctx.fetch_qkv_latent(), "qkv")
+        # attn inputs are cleared at scope exit, flag restored
+        self.assertIsNone(get_forward().attn_inputs)
+        self.assertFalse(ctx.input_scattered)
+
+    def test_is_extend_in_batch_sticky_within_thread(self):
+        from sglang.srt.layers.dp_attention import (
+            get_is_extend_in_batch,
+            set_is_extend_in_batch,
+        )
+
+        reset_context()
+        self.assertFalse(get_is_extend_in_batch())
+        set_is_extend_in_batch(True)
+        self.assertTrue(get_is_extend_in_batch())  # sticky until next write
+        set_is_extend_in_batch(False)
+        self.assertFalse(get_is_extend_in_batch())
 
     def test_moe_output_buffer_ctx(self):
         from sglang.srt.layers.moe.moe_runner.base import moe_output_buffer_ctx

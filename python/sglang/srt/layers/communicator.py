@@ -73,7 +73,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     check_cuda_graph_backend,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_forward, get_parallel
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
@@ -262,8 +262,6 @@ class AttentionInputs:
 class AttnTpContext:
     def __init__(self):
         self.allow_input_scattered = False
-        self.input_scattered_ = False
-        self.attn_inputs_: Optional[AttentionInputs] = None
         self.is_dsa = False
 
     def init_context(self, q_lora_rank, is_dsa):
@@ -299,30 +297,35 @@ class AttnTpContext:
 
     @property
     def input_scattered(self):
-        return self.input_scattered_
+        return get_forward().attn_input_scattered
 
     def set_attn_inputs(self, attn_inputs: AttentionInputs):
-        self.attn_inputs_ = attn_inputs
+        get_forward().set("attn_inputs", attn_inputs)
 
     def fetch_qkv_latent(self):
-        assert self.attn_inputs_ is not None
-        return self.attn_inputs_.fetch_qkv_latent()
+        attn_inputs = get_forward().attn_inputs
+        assert attn_inputs is not None
+        return attn_inputs.fetch_qkv_latent()
 
     def fetch_hidden_states(self):
-        assert self.attn_inputs_ is not None
-        return self.attn_inputs_.fetch_hidden_states()
+        attn_inputs = get_forward().attn_inputs
+        assert attn_inputs is not None
+        return attn_inputs.fetch_hidden_states()
 
     def clear_attn_inputs(self) -> None:
-        self.attn_inputs_ = None
+        get_forward().set("attn_inputs", None)
 
     @contextmanager
     def maybe_input_scattered(self, forward_batch: ForwardBatch):
         flag = self.use_input_scattered(forward_batch)
-        old_flag = self.input_scattered
-        self.input_scattered_ = flag
-        yield
-        self.input_scattered_ = old_flag
-        self.attn_inputs_ = None
+        forward = get_forward()
+        # scoped() also restores when the forward raises — the old in-place
+        # swap leaked the flag on exceptions.
+        with forward.scoped(attn_input_scattered=flag):
+            try:
+                yield
+            finally:
+                forward.set("attn_inputs", None)
 
 
 ATTN_TP_CONTEXT = AttnTpContext()
