@@ -12,9 +12,10 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import numpy as np
+import zmq
 
 from sglang.srt.disaggregation.base.conn import KVPoll
-from sglang.srt.disaggregation.common.conn import CommonKVManager
+from sglang.srt.disaggregation.common.conn import CommonKVManager, KVTransferError
 from sglang.srt.disaggregation.common.staging_handler import PrefillStagingContext
 from sglang.srt.disaggregation.common.utils import pack_int_lists
 from sglang.srt.disaggregation.nixl.conn import (
@@ -343,6 +344,7 @@ class TestNixlFailurePropagation(CustomTestCase):
             mgr, CommonKVManager
         )
         mgr.update_status = CommonKVManager.update_status.__get__(mgr, CommonKVManager)
+        mgr.propagated_failure_rooms = set()
         mgr._transfer_failure_lock = threading.Lock()
         return mgr
 
@@ -360,6 +362,7 @@ class TestNixlFailurePropagation(CustomTestCase):
 
                 self.assertEqual(mgr.request_status[7], KVPoll.Failed)
                 self.assertEqual(mgr.failure_records[7], "state index length mismatch")
+                self.assertEqual(mgr.propagated_failure_rooms, {7})
 
     def test_transfer_failure_is_idempotent_for_terminal_or_unknown_room(self):
         for request_status in ({7: KVPoll.Failed}, {7: KVPoll.Success}, {}):
@@ -372,6 +375,7 @@ class TestNixlFailurePropagation(CustomTestCase):
 
                 self.assertEqual(mgr.request_status, request_status)
                 self.assertEqual(mgr.failure_records, {})
+                self.assertEqual(mgr.propagated_failure_rooms, set())
 
     def test_transfer_failure_uses_default_reason_when_empty(self):
         mgr = self._make_decode_manager({7: KVPoll.WaitingForInput})
@@ -380,6 +384,7 @@ class TestNixlFailurePropagation(CustomTestCase):
 
         self.assertEqual(mgr.request_status[7], KVPoll.Failed)
         self.assertEqual(mgr.failure_records[7], "Prefill signaled transfer failure")
+        self.assertEqual(mgr.propagated_failure_rooms, {7})
 
     def test_malformed_transfer_failure_is_ignored(self):
         mgr = self._make_decode_manager({7: KVPoll.WaitingForInput})
@@ -394,6 +399,61 @@ class TestNixlFailurePropagation(CustomTestCase):
 
         self.assertEqual(mgr.request_status[7], KVPoll.WaitingForInput)
         self.assertEqual(mgr.failure_records, {})
+        self.assertEqual(mgr.propagated_failure_rooms, set())
+
+    def test_decode_control_thread_retries_transient_receive_error(self):
+        mgr = object.__new__(NixlKVManager)
+        mgr.server_socket = MagicMock()
+        mgr.server_socket.recv_multipart.side_effect = [
+            zmq.ZMQError(zmq.EAGAIN),
+            zmq.ZMQError(zmq.ETERM),
+        ]
+
+        with (
+            patch("sglang.srt.disaggregation.nixl.conn.threading.Thread") as thread,
+            patch("sglang.srt.disaggregation.nixl.conn.time.sleep") as sleep,
+        ):
+            mgr._start_decode_control_thread()
+            control_loop = thread.call_args.kwargs["target"]
+            control_loop()
+
+        thread.return_value.start.assert_called_once()
+        self.assertEqual(mgr.server_socket.recv_multipart.call_count, 2)
+        sleep.assert_called_once_with(0.1)
+
+    def test_decode_control_thread_stops_on_unexpected_receive_error(self):
+        mgr = object.__new__(NixlKVManager)
+        mgr.server_socket = MagicMock()
+        mgr.server_socket.recv_multipart.side_effect = zmq.ZMQError(zmq.EFAULT)
+
+        with (
+            patch("sglang.srt.disaggregation.nixl.conn.threading.Thread") as thread,
+            patch("sglang.srt.disaggregation.nixl.conn.time.sleep") as sleep,
+        ):
+            mgr._start_decode_control_thread()
+            control_loop = thread.call_args.kwargs["target"]
+            control_loop()
+
+        self.assertEqual(mgr.server_socket.recv_multipart.call_count, 1)
+        sleep.assert_not_called()
+
+    def test_receiver_preserves_propagated_failure_reason(self):
+        mgr = self._make_decode_manager({7: KVPoll.Failed})
+        mgr.failure_records[7] = "state index length mismatch"
+        mgr.propagated_failure_rooms.add(7)
+        receiver = object.__new__(NixlKVReceiver)
+        receiver.kv_mgr = mgr
+        receiver.bootstrap_room = 7
+
+        with self.assertRaises(KVTransferError) as context:
+            receiver.failure_exception()
+
+        self.assertEqual(
+            context.exception.failure_reason, "state index length mismatch"
+        )
+        self.assertTrue(context.exception.is_from_another_rank)
+        self.assertNotIn(7, mgr.failure_records)
+        self.assertNotIn(7, mgr.propagated_failure_rooms)
 
     def _make_prefill_notification_manager(self, infos):
         mgr = object.__new__(NixlKVManager)
@@ -647,6 +707,9 @@ class TestNixlReceiverPoll(CustomTestCase):
         mgr.transfer_statuses = {}
         mgr.addr_to_rooms_tracker = defaultdict(set)
         mgr.addr_to_rooms_tracker["prefill:8998"].add(11)
+        mgr.failure_records = {}
+        mgr.failure_lock = threading.Lock()
+        mgr.propagated_failure_rooms = set()
         mgr._transfer_failure_lock = threading.Lock()
         mgr.enable_staging = False
 
@@ -732,11 +795,15 @@ class TestNixlReceiverPoll(CustomTestCase):
         mgr.required_prefill_response_num_table = {11: 1}
         mgr.prefill_response_tracker = {11: set()}
         mgr.transfer_statuses = {11: TransferStatus()}
+        mgr.failure_records = {11: "state index length mismatch"}
+        mgr.propagated_failure_rooms = {11}
 
         receiver.clear()
 
         self.assertNotIn(11, mgr.request_status)
         self.assertNotIn(11, mgr.transfer_statuses)
+        self.assertNotIn(11, mgr.failure_records)
+        self.assertNotIn(11, mgr.propagated_failure_rooms)
         self.assertEqual(mgr.addr_to_rooms_tracker["prefill:8998"], set())
 
     def test_clear_removes_staging_room_tracking(self):

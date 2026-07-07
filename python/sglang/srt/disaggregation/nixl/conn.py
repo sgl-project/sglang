@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import errno
 import json
 import logging
 import struct
@@ -58,6 +59,7 @@ logger = logging.getLogger(__name__)
 
 GUARD = "NixlMsgGuard".encode("ascii")
 TRANSFER_FAILED = b"TRANSFER_FAILED"
+DECODE_CONTROL_RECV_RETRY_DELAY = 0.1
 KV_MEM_KINDS = {"VRAM", "DRAM"}
 
 
@@ -481,6 +483,7 @@ class NixlKVManager(CommonKVManager):
             self.transfer_statuses: Dict[int, TransferStatus] = defaultdict(
                 TransferStatus
             )
+            self.propagated_failure_rooms: Set[int] = set()
             self._transfer_failure_lock = threading.Lock()
             self._staging_handler = None
             self._chunk_writer_counts: dict = defaultdict(lambda: defaultdict(list))
@@ -573,9 +576,16 @@ class NixlKVManager(CommonKVManager):
             while True:
                 try:
                     msg = self.server_socket.recv_multipart()
-                except (zmq.ContextTerminated, zmq.ZMQError):
-                    logger.debug("Decode control thread stopped")
-                    return
+                except zmq.ZMQError as e:
+                    if e.errno in (zmq.ETERM, zmq.ENOTSOCK):
+                        logger.debug("Decode control thread stopped")
+                        return
+                    if e.errno not in (zmq.EAGAIN, errno.EINTR):
+                        logger.exception("Decode control thread stopped unexpectedly")
+                        return
+                    logger.exception("Decode control receive failed")
+                    time.sleep(DECODE_CONTROL_RECV_RETRY_DELAY)
+                    continue
                 try:
                     if msg[0] == b"STAGING_REQ":
                         if self.enable_staging:
@@ -595,6 +605,11 @@ class NixlKVManager(CommonKVManager):
 
         threading.Thread(target=decode_control_thread, daemon=True).start()
 
+    def _record_propagated_failure(self, room: int, reason: str) -> None:
+        with self.failure_lock:
+            self.failure_records[room] = reason
+            self.propagated_failure_rooms.add(room)
+
     def _handle_transfer_failure(self, msg: List[bytes]) -> None:
         """Mark an active decode room failed from a prefill notification."""
         try:
@@ -612,7 +627,7 @@ class NixlKVManager(CommonKVManager):
                 )
                 return
 
-            self.record_failure(room, reason)
+            self._record_propagated_failure(room, reason)
             self.update_status(room, KVPoll.Failed)
         logger.debug("Prefill reported transfer failure for room %s: %s", room, reason)
 
@@ -2811,6 +2826,9 @@ class NixlKVReceiver(CommonKVReceiver):
         with self.kv_mgr._transfer_failure_lock:
             super().clear()
             self.kv_mgr.transfer_statuses.pop(self.bootstrap_room, None)
+            with self.kv_mgr.failure_lock:
+                self.kv_mgr.failure_records.pop(self.bootstrap_room, None)
+                self.kv_mgr.propagated_failure_rooms.discard(self.bootstrap_room)
             rooms = self.kv_mgr.addr_to_rooms_tracker.get(self.bootstrap_addr)
             if rooms is not None:
                 rooms.discard(self.bootstrap_room)
@@ -2890,8 +2908,12 @@ class NixlKVReceiver(CommonKVReceiver):
     def failure_exception(self):
         with self.kv_mgr.failure_lock:
             failure_reason = self.kv_mgr.failure_records.pop(self.bootstrap_room, None)
-        is_propagated = failure_reason is None
-        if is_propagated:
+            is_propagated = (
+                failure_reason is None
+                or self.bootstrap_room in self.kv_mgr.propagated_failure_rooms
+            )
+            self.kv_mgr.propagated_failure_rooms.discard(self.bootstrap_room)
+        if failure_reason is None:
             failure_reason = "NIXL KVReceiver Exception"
         raise KVTransferError(
             self.bootstrap_room, failure_reason, is_from_another_rank=is_propagated
