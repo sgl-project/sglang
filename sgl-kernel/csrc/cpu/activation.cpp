@@ -101,6 +101,46 @@ void fused_sigmoid_mul_kernel_impl(
   });
 }
 
+template <typename scalar_t, typename func_t, typename vec_func_t>
+void act_kernel_impl(
+    scalar_t* __restrict__ output,
+    const scalar_t* __restrict__ input,
+    int64_t num_tokens,
+    int64_t dim,
+    const func_t& f,
+    const vec_func_t& vf) {
+  using bVec = at::vec::Vectorized<scalar_t>;
+  using fVec = at::vec::Vectorized<float>;
+
+  constexpr int64_t kVecSize = bVec::size();
+  at::parallel_for(0, num_tokens, 0, [&](int64_t begin, int64_t end) {
+    for (int64_t i = begin; i < end; ++i) {
+      const scalar_t* __restrict__ input_ptr = input + i * dim;
+      scalar_t* __restrict__ output_ptr = output + i * dim;
+
+      int64_t d = 0;
+#pragma GCC unroll 4
+      for (; d <= dim - kVecSize; d += kVecSize) {
+        bVec x_bvec = bVec::loadu(input_ptr + d);
+        fVec x_fvec0, x_fvec1;
+        std::tie(x_fvec0, x_fvec1) = at::vec::convert_to_float(x_bvec);
+
+        x_fvec0 = vf(x_fvec0);
+        x_fvec1 = vf(x_fvec1);
+
+        x_bvec = convert_from_float_ext<scalar_t>(x_fvec0, x_fvec1);
+        x_bvec.store(output_ptr + d);
+      }
+
+#pragma GCC unroll 4
+      for (; d < dim; ++d) {
+        float x_val = static_cast<float>(input_ptr[d]);
+        output_ptr[d] = static_cast<scalar_t>(f(x_val));
+      }
+    }
+  });
+}
+
 }  // anonymous namespace
 
 // input   : {num_tokens, 2 * d}
@@ -215,5 +255,53 @@ at::Tensor fused_sigmoid_mul_cpu(at::Tensor& input, const at::Tensor& gate, bool
         g_strideT,
         g_strideH);
   });
+  return out;
+}
+
+at::Tensor quick_gelu_cpu(const at::Tensor& input) {
+  auto sizes = input.sizes().vec();
+  int64_t dim = input.size(-1);
+  int64_t num_tokens = input.numel() / dim;
+  at::Tensor out = at::empty_like(input);
+
+  AT_DISPATCH_REDUCED_FLOATING_TYPES(input.scalar_type(), "quick_gelu", [&] {
+    using Vec = at::vec::Vectorized<float>;
+    act_kernel_impl(
+        out.data_ptr<scalar_t>(),
+        input.data_ptr<scalar_t>(),
+        num_tokens,
+        dim,
+        [](float x) { return x / (1.f + std::exp(-1.702f * x)); },
+        [](Vec x) { return x / (Vec(1.f) + (x * Vec(-1.702f)).exp()); });
+  });
+
+  return out;
+}
+at::Tensor new_gelu_cpu(const at::Tensor& input) {
+  int64_t dim = input.size(-1);
+  int64_t num_tokens = input.numel() / dim;
+  at::Tensor out = at::empty_like(input);
+
+  const float sqrt_2_div_pi = std::sqrt(2.f / M_PI);
+
+  AT_DISPATCH_REDUCED_FLOATING_TYPES(input.scalar_type(), "new_gelu", [&] {
+    using Vec = at::vec::Vectorized<float>;
+    act_kernel_impl(
+        out.data_ptr<scalar_t>(),
+        input.data_ptr<scalar_t>(),
+        num_tokens,
+        dim,
+        [sqrt_2_div_pi](float x) {
+          float x3 = x * x * x;
+          float tanh_arg = sqrt_2_div_pi * (x + 0.044715f * x3);
+          return 0.5f * x * (1.f + std::tanh(tanh_arg));
+        },
+        [sqrt_2_div_pi](Vec x) {
+          Vec x3 = x * x * x;
+          Vec tanh_arg = Vec(sqrt_2_div_pi) * (x + Vec(0.044715f) * x3);
+          return Vec(0.5f) * x * (Vec(1.f) + tanh_arg.tanh());
+        });
+  });
+
   return out;
 }

@@ -12,11 +12,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.srt.utils import cpu_has_amx_support
 
 _is_cuda = current_platform.is_cuda()
 _is_hip = current_platform.is_hip()
 _is_npu = current_platform.is_npu()
 _is_xpu = current_platform.is_xpu()
+_is_cpu = current_platform.is_cpu()
+_is_cpu_amx_available = cpu_has_amx_support()
 
 if _is_cuda:
     from sglang.jit_kernel.activation import silu_and_mul
@@ -121,6 +124,13 @@ class NewGELU(CustomOp):
     def forward_xpu(self, *args, **kwargs) -> Any:
         return self.forward_native(*args, **kwargs)
 
+    def forward_cpu(self, x: torch.Tensor) -> torch.Tensor:
+        if _is_cpu and _is_cpu_amx_available:
+            if not x.is_contiguous():
+                x = x.contiguous()
+            return torch.ops.sgl_kernel.new_gelu_cpu(x)
+        return self.forward_native(x)
+
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
         """PyTorch-native implementation equivalent to forward()."""
         c = math.sqrt(2.0 / math.pi)
@@ -138,6 +148,13 @@ class QuickGELU(CustomOp):
 
     def forward_xpu(self, *args, **kwargs) -> Any:
         return self.forward_native(*args, **kwargs)
+
+    def forward_cpu(self, x: torch.Tensor) -> torch.Tensor:
+        if _is_cpu and _is_cpu_amx_available:
+            if not x.is_contiguous():
+                x = x.contiguous()
+            return torch.ops.sgl_kernel.quick_gelu_cpu(x)
+        return self.forward_native(x)
 
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
         """PyTorch-native implementation equivalent to forward()."""

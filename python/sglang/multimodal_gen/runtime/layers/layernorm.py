@@ -26,6 +26,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
 from sglang.multimodal_gen.runtime.layers.custom_op import CustomOp
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
+from sglang.srt.utils import cpu_has_amx_support
 
 _is_cuda = current_platform.is_cuda()
 _is_hip = current_platform.is_hip()
@@ -33,6 +34,7 @@ _is_npu = current_platform.is_npu()
 _is_musa = current_platform.is_musa()
 _is_cpu = current_platform.is_cpu()
 _is_xpu = current_platform.is_xpu()
+_is_cpu_amx_available = cpu_has_amx_support()
 _use_rocm_flydsl = get_bool_env_var("SGLANG_USE_ROCM_FLYDSL")
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
@@ -168,7 +170,17 @@ class RMSNorm(CustomOp):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        return self.forward_native(x, residual)
+        if _is_cpu_amx_available:
+            if residual is not None:
+                torch.ops.sgl_kernel.fused_add_rmsnorm_cpu(
+                    x, residual, self.weight.data, self.variance_epsilon
+                )
+                return x, residual
+            return torch.ops.sgl_kernel.rmsnorm_cpu(
+                x, self.weight.data, self.variance_epsilon
+            )
+        else:
+            return self.forward_native(x, residual)
 
     def forward_npu(
         self,
