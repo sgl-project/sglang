@@ -1,6 +1,6 @@
 //! OpenAI-compatible endpoints: `/v1/completions`, `/v1/chat/completions`, and
 //! `/v1/models`. Each runs the same tokenize→generate→detok pipeline as
-//! `/generate` and shapes the neutral [`GenerationOutput`] into OpenAI types
+//! `/generate` and shapes the neutral [`ChunkEvent`] delta into OpenAI types
 //! (`dynamo-protocols`), with chat-template rendering (`dynamo-renderer`) and
 //! reasoning / tool-call parsing (`dynamo-parsers`).
 //!
