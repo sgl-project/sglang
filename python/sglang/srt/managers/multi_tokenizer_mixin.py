@@ -600,9 +600,7 @@ class TokenizerWorker(TokenizerManager):
         # correct role ("prefill" / "decode").
         if self.enable_metrics:
             self.metrics_collector.labels["engine_type"] = (
-                DisaggregationMode.to_engine_type(
-                    self.server_args.disaggregation_mode
-                )
+                DisaggregationMode.to_engine_type(self.server_args.disaggregation_mode)
             )
 
         # Register this worker with the router for pause/continue broadcasting
