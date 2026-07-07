@@ -95,7 +95,9 @@ def get_allocator_type(server_args) -> str:
     if backend == "shm":
         return "shm"
     if backend == "dynamic":
-        extra_config_str = getattr(server_args, "hicache_storage_backend_extra_config", None)
+        extra_config_str = getattr(
+            server_args, "hicache_storage_backend_extra_config", None
+        )
         if extra_config_str:
             try:
                 config = json.loads(extra_config_str)
@@ -104,7 +106,6 @@ def get_allocator_type(server_args) -> str:
             except Exception:
                 pass
     return backend or "default"
-
 
 
 def _cuda_host_register(buffer: torch.Tensor) -> None:

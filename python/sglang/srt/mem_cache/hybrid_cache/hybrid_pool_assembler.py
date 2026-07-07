@@ -25,9 +25,9 @@ from sglang.srt.mem_cache.pool_host.mha import (
     MHATokenToKOnlyPoolHost,
     get_mha_host_pool_cls,
 )
+from sglang.srt.mem_cache.pool_host.common import get_allocator_type
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.mem_cache.unified_cache_components import ComponentType
-from sglang.srt.mem_cache.pool_host.common import get_allocator_type
 
 if TYPE_CHECKING:
     import torch

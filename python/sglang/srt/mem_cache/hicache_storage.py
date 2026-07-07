@@ -722,7 +722,9 @@ class HiCacheShm(HiCacheStorage):
     Since shm is a local allocator, there's no actual storage transfer needed.
     """
 
-    def __init__(self, storage_config: HiCacheStorageConfig, mem_pool_host: Optional[Any] = None):
+    def __init__(
+        self, storage_config: HiCacheStorageConfig, mem_pool_host: Optional[Any] = None
+    ):
         pass
 
     def get(
@@ -794,4 +796,3 @@ class HiCacheShm(HiCacheStorage):
 
     def clear(self) -> bool:
         return True
-
