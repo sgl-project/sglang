@@ -102,13 +102,9 @@ def _is_probably_video_source(source: Any) -> bool:
 
 
 def _is_cosmos3_server(server_args) -> bool:
-    pipeline_config = getattr(server_args, "pipeline_config", None)
-    values = (
-        getattr(server_args, "model_path", None),
-        getattr(server_args, "pipeline_class_name", None),
-        type(pipeline_config).__name__ if pipeline_config is not None else None,
-    )
-    return any("cosmos3" in str(value).lower() for value in values if value)
+    from sglang.multimodal_gen.configs.pipeline_configs.cosmos3 import Cosmos3Config
+
+    return isinstance(server_args.pipeline_config, Cosmos3Config)
 
 
 def _normalize_optional_string(value: Any) -> Any:
@@ -182,9 +178,7 @@ def _cosmos3_sampling_param_kwargs(
 
     condition_frame_indexes = _request_value(req, "condition_frame_indexes")
     if condition_frame_indexes is None:
-        condition_frame_indexes = _request_value(
-            req, "condition_frame_indexes_vision"
-        )
+        condition_frame_indexes = _request_value(req, "condition_frame_indexes_vision")
     condition_frame_indexes = _coerce_optional_int_list(condition_frame_indexes)
     if condition_frame_indexes is not None:
         kwargs["condition_frame_indexes"] = condition_frame_indexes
@@ -198,7 +192,6 @@ def _cosmos3_sampling_param_kwargs(
         "action_fps",
         "action",
         "action_view_point",
-        "action_stats_path",
         "action_normalization",
     ):
         value = _parse_form_extra_value(_request_value(req, name))
@@ -215,19 +208,21 @@ def _build_video_sampling_params(request_id: str, request: VideoGenerationsReque
     server_args = get_global_server_args()
     seconds = request.seconds if request.seconds is not None else DEFAULT_VIDEO_SECONDS
     fps = request.fps if request.fps is not None else DEFAULT_FPS
-    num_frames = (
-        request.num_frames if request.num_frames is not None else fps * seconds
-    )
+    num_frames = request.num_frames if request.num_frames is not None else fps * seconds
     num_outputs = request.num_outputs_per_prompt
     if num_outputs is None:
         num_outputs = request.n or 1
     video_path = _resolve_video_path(request)
     image_path = _resolve_image_path(request, video_path)
-    cosmos3_kwargs = (
-        _cosmos3_sampling_param_kwargs(request, num_frames=num_frames, fps=fps)
-        if _is_cosmos3_server(server_args)
-        else {}
-    )
+    cosmos3_kwargs = {}
+    if _is_cosmos3_server(server_args):
+        cosmos3_kwargs = _cosmos3_sampling_param_kwargs(
+            request, num_frames=num_frames, fps=fps
+        )
+        if server_args.pipeline_config.action_stats_path is not None:
+            cosmos3_kwargs["action_stats_path"] = (
+                server_args.pipeline_config.action_stats_path
+            )
 
     return build_sampling_params(
         request_id,
@@ -385,20 +380,6 @@ async def create_video(
     max_sequence_length: Optional[int] = Form(None),
     flow_shift: Optional[float] = Form(None),
     enable_teacache: Optional[bool] = Form(None),
-    generate_sound: Optional[bool] = Form(None),
-    sound_duration: Optional[float] = Form(None),
-    condition_frame_indexes: Optional[str] = Form(None),
-    condition_frame_indexes_vision: Optional[str] = Form(None),
-    condition_video_keep: Optional[str] = Form(None),
-    action_mode: Optional[str] = Form(None),
-    domain_id: Optional[int] = Form(None),
-    domain_name: Optional[str] = Form(None),
-    raw_action_dim: Optional[int] = Form(None),
-    action_fps: Optional[float] = Form(None),
-    action: Optional[str] = Form(None),
-    action_view_point: Optional[str] = Form(None),
-    action_stats_path: Optional[str] = Form(None),
-    action_normalization: Optional[str] = Form(None),
     enable_frame_interpolation: Optional[bool] = Form(None),
     frame_interpolation_exp: Optional[int] = Form(None),
     frame_interpolation_scale: Optional[float] = Form(None),
@@ -449,9 +430,7 @@ async def create_video(
             )
         elif video_path or video_url:
             video_input_path = video_path or video_url
-        elif input_reference is not None and _is_probably_video_source(
-            input_reference
-        ):
+        elif input_reference is not None and _is_probably_video_source(input_reference):
             video_input_path = await _save_first_input_image(
                 input_reference,
                 request_id,
@@ -521,7 +500,6 @@ async def create_video(
             "action_fps",
             "action",
             "action_view_point",
-            "action_stats_path",
             "action_normalization",
             "condition_frame_indexes_vision",
             "condition_video_keep",
@@ -561,28 +539,6 @@ async def create_video(
             max_sequence_length=form_value("max_sequence_length", max_sequence_length),
             flow_shift=form_value("flow_shift", flow_shift),
             enable_teacache=form_value("enable_teacache", enable_teacache),
-            generate_sound=form_value("generate_sound", generate_sound),
-            sound_duration=form_value("sound_duration", sound_duration),
-            condition_frame_indexes=form_value(
-                "condition_frame_indexes", condition_frame_indexes
-            ),
-            condition_frame_indexes_vision=form_value(
-                "condition_frame_indexes_vision", condition_frame_indexes_vision
-            ),
-            condition_video_keep=form_value(
-                "condition_video_keep", condition_video_keep
-            ),
-            action_mode=form_value("action_mode", action_mode),
-            domain_id=form_value("domain_id", domain_id),
-            domain_name=form_value("domain_name", domain_name),
-            raw_action_dim=form_value("raw_action_dim", raw_action_dim),
-            action_fps=form_value("action_fps", action_fps),
-            action=form_value("action", action),
-            action_view_point=form_value("action_view_point", action_view_point),
-            action_stats_path=form_value("action_stats_path", action_stats_path),
-            action_normalization=form_value(
-                "action_normalization", action_normalization
-            ),
             enable_frame_interpolation=form_value(
                 "enable_frame_interpolation", enable_frame_interpolation
             ),

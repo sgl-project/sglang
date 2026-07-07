@@ -282,9 +282,7 @@ class TestCosmos3SchedulerConfig(unittest.TestCase):
     def test_per_mode_flow_shift_defaults(self):
         stage = self._stage()
         self.assertEqual(
-            stage._default_flow_shift_for_mode(
-                self._batch(data_type=DataType.IMAGE)
-            ),
+            stage._default_flow_shift_for_mode(self._batch(data_type=DataType.IMAGE)),
             3.0,
         )
         self.assertEqual(
@@ -362,27 +360,31 @@ class TestCosmos3OpenAIProtocol(unittest.TestCase):
                 self.assertNotIn("use_system_prompt", request_cls.model_fields)
                 self.assertNotIn("use_guardrails", request_cls.model_fields)
 
-    def test_cosmos3_modal_fields_are_video_request_fields(self):
-        for field_name in (
-            "video_path",
-            "video_url",
-            "generate_sound",
-            "sound_duration",
-            "condition_frame_indexes",
-            "condition_frame_indexes_vision",
-            "condition_video_keep",
-            "action_mode",
-            "domain_id",
-            "domain_name",
-            "raw_action_dim",
-            "action_fps",
-            "action",
-            "action_view_point",
-            "action_stats_path",
-            "action_normalization",
-        ):
+    def test_cosmos3_modal_fields_pass_through_as_extras(self):
+        for field_name in ("video_path", "video_url"):
             with self.subTest(field_name=field_name):
                 self.assertIn(field_name, VideoGenerationsRequest.model_fields)
+
+        modal_values = {
+            "generate_sound": True,
+            "sound_duration": 3.0,
+            "condition_frame_indexes": [0, 2],
+            "condition_frame_indexes_vision": [0, 2],
+            "condition_video_keep": "last",
+            "action_mode": "policy",
+            "domain_id": 1,
+            "domain_name": "umi",
+            "raw_action_dim": 9,
+            "action_fps": 30.0,
+            "action": [0.0, 1.0],
+            "action_view_point": "ego_view",
+            "action_normalization": "mean_std",
+        }
+        req = VideoGenerationsRequest(prompt="test", **modal_values)
+        for field_name, value in modal_values.items():
+            with self.subTest(field_name=field_name):
+                self.assertNotIn(field_name, VideoGenerationsRequest.model_fields)
+                self.assertEqual(getattr(req, field_name), value)
 
     def test_cosmos3_http_aliases_map_to_sampling_params(self):
         req = VideoGenerationsRequest(

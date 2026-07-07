@@ -55,6 +55,11 @@ class Cosmos3Config(PipelineConfig):
     use_duration_template: bool = True
     use_system_prompt: bool = False
 
+    # Filesystem path to dataset-derived action stats (JSON) for action
+    # (de)normalization. Set at server launch rather than per request, since it
+    # names a server-side file. ``None`` disables normalization.
+    action_stats_path: str | None = None
+
     def __post_init__(self):
         self.vae_config.arch_config.z_dim = 48
         # Encoder is needed for I2V; T2V/T2I never invoke it.
