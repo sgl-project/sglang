@@ -506,13 +506,11 @@ class MoEGate(nn.Module):
             else:
                 logits = F.linear(hidden_states, self.weight, None)
         else:
-            if self.use_flashinfer_trtllm_bf16_moe:
-                return F.linear(hidden_states, self.weight, None)
-
             # NOTE(b8zhong): this threshold has been empirically verified
             max_router_gemm_tokens = 4 if _device_sm in (100, 103) else 16
             if (
                 _is_cuda
+                and not self.use_flashinfer_trtllm_bf16_moe
                 and hidden_states.shape[0] <= max_router_gemm_tokens
                 and hidden_states.shape[1] % 1024 == 0
                 and (self.weight.shape[0] == 256 or self.weight.shape[0] == 384)
@@ -522,10 +520,10 @@ class MoEGate(nn.Module):
                     hidden_states, self.weight, out_dtype=torch.float32
                 )
 
+            elif not _is_cuda or self.use_flashinfer_trtllm_bf16_moe:
+                logits = F.linear(hidden_states, self.weight, None)
             elif _use_aiter:
                 logits = aiter_dsv3_router_gemm(hidden_states, self.weight)
-            elif not _is_cuda:
-                logits = F.linear(hidden_states, self.weight, None)
             else:
                 # cuBLAS bf16 x bf16 -> fp32 GEMM (torch.mm's out_dtype kwarg is CUDA-only)
                 from sglang.jit_kernel.dsv4 import linear_bf16_fp32
