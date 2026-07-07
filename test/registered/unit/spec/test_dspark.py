@@ -96,6 +96,25 @@ class TestHandleDspark(CustomTestCase):
         self.assertEqual(args.speculative_num_draft_tokens, 5)
         self.assertEqual(args.max_running_requests, 48)
 
+    def test_explicit_num_draft_tokens_used_when_block_size_alias_unset(self):
+        args = _make_server_args(
+            speculative_dspark_block_size=None,
+            speculative_num_draft_tokens=6,
+        )
+        _handle_dspark(args)
+        self.assertEqual(args.speculative_num_draft_tokens, 6)
+
+    def test_overrides_steps_and_topk_but_preserves_explicit_max_requests(self):
+        args = _make_server_args(
+            speculative_num_steps=3,
+            speculative_eagle_topk=4,
+            max_running_requests=96,
+        )
+        _handle_dspark(args)
+        self.assertEqual(args.speculative_num_steps, 1)
+        self.assertEqual(args.speculative_eagle_topk, 1)
+        self.assertEqual(args.max_running_requests, 96)
+
     def test_block_size_alias_conflict_raises(self):
         args = _make_server_args(
             speculative_dspark_block_size=5, speculative_num_draft_tokens=8
@@ -110,6 +129,16 @@ class TestHandleDspark(CustomTestCase):
 
     def test_confidence_threshold_bounds(self):
         args = _make_server_args(speculative_dspark_confidence_threshold=1.5)
+        with self.assertRaisesRegex(ValueError, "confidence-threshold"):
+            _handle_dspark(args)
+
+    def test_confidence_threshold_accepts_endpoints_and_rejects_negative(self):
+        for threshold in (0.0, 1.0):
+            args = _make_server_args(speculative_dspark_confidence_threshold=threshold)
+            _handle_dspark(args)
+            self.assertEqual(args.speculative_dspark_confidence_threshold, threshold)
+
+        args = _make_server_args(speculative_dspark_confidence_threshold=-0.1)
         with self.assertRaisesRegex(ValueError, "confidence-threshold"):
             _handle_dspark(args)
 
@@ -244,6 +273,144 @@ class TestDSparkDraftInputBatch(CustomTestCase):
         self.assertEqual(a.prefill_tail_valid_mask.tolist(), [[True], [True]])
         self.assertEqual(a.transfer_warmup_rounds.tolist(), [0, 2])
 
+    def test_merge_and_filter_rich_payloads_when_both_sides_have_fields(self):
+        t = self.torch
+        a = self.cls(
+            bonus_tokens=t.tensor([10, 11], dtype=t.int64),
+            new_seq_lens=t.tensor([100, 101], dtype=t.int64),
+            main_hidden=t.arange(4, dtype=t.float32).view(2, 2),
+            confidence=t.tensor([[1.0, 2.0], [3.0, 4.0]]),
+            topk_p=t.tensor([[7.0], [8.0]]),
+            topk_index=t.tensor([[7], [8]], dtype=t.int64),
+            hidden_states=t.tensor([[1.0], [2.0]]),
+            hidden_valid_mask=t.tensor([[True], [False]]),
+            prefill_tail_hidden_states=t.tensor([[[1.0]], [[2.0]]]),
+            prefill_tail_valid_mask=t.tensor([[True], [False]]),
+            transfer_warmup_rounds=t.tensor([2, 1], dtype=t.int32),
+            reserved_seq_lens_cpu=t.tensor([20, 21], dtype=t.int32),
+            reserved_seq_lens_sum=41,
+        )
+        b = self.cls(
+            bonus_tokens=t.tensor([12], dtype=t.int64),
+            new_seq_lens=t.tensor([102], dtype=t.int64),
+            main_hidden=t.tensor([[4.0, 5.0]]),
+            confidence=t.tensor([[5.0, 6.0]]),
+            topk_p=t.tensor([[9.0]]),
+            topk_index=t.tensor([[9]], dtype=t.int64),
+            hidden_states=t.tensor([[3.0]]),
+            hidden_valid_mask=t.tensor([[True]]),
+            prefill_tail_hidden_states=t.tensor([[[3.0]]]),
+            prefill_tail_valid_mask=t.tensor([[True]]),
+            transfer_warmup_rounds=t.tensor([0], dtype=t.int32),
+            reserved_seq_lens_cpu=t.tensor([22], dtype=t.int32),
+            reserved_seq_lens_sum=22,
+        )
+
+        a.merge_batch(b)
+        self.assertEqual(a.reserved_seq_lens_cpu.tolist(), [20, 21, 22])
+        self.assertEqual(a.reserved_seq_lens_sum, 63)
+        self.assertEqual(
+            a.main_hidden.tolist(), [[0.0, 1.0], [2.0, 3.0], [4.0, 5.0]]
+        )
+        self.assertEqual(a.confidence.tolist(), [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
+        self.assertEqual(a.topk_p.tolist(), [[7.0], [8.0], [9.0]])
+        self.assertEqual(a.topk_index.tolist(), [[7], [8], [9]])
+
+        a.filter_batch(t.tensor([2, 0], dtype=t.int64))
+        self.assertEqual(a.bonus_tokens.tolist(), [12, 10])
+        self.assertEqual(a.reserved_seq_lens_cpu.tolist(), [22, 20])
+        self.assertEqual(a.reserved_seq_lens_sum, 42)
+        self.assertEqual(a.main_hidden.tolist(), [[4.0, 5.0], [0.0, 1.0]])
+        self.assertEqual(a.confidence.tolist(), [[5.0, 6.0], [1.0, 2.0]])
+        self.assertEqual(a.topk_p.tolist(), [[9.0], [7.0]])
+        self.assertEqual(a.hidden_valid_mask.tolist(), [[True], [True]])
+        self.assertEqual(a.prefill_tail_hidden_states.tolist(), [[[3.0]], [[1.0]]])
+
+    def test_future_indices_merge_requires_peer_future_indices(self):
+        a = self.cls(
+            bonus_tokens=self.torch.tensor([10], dtype=self.torch.int64),
+            new_seq_lens=self.torch.tensor([100], dtype=self.torch.int64),
+            future_indices=self.torch.tensor([5], dtype=self.torch.int64),
+        )
+        b = self._make(1)
+
+        with self.assertRaises(AssertionError):
+            a.merge_batch(b)
+
+    def test_create_idle_input_and_carry_prepare_buffers(self):
+        t = self.torch
+        idle = self.cls.create_idle_input(t.device("cpu"))
+
+        self.assertTrue(idle.is_draft_input())
+        self.assertEqual(idle.get_spec_adjust_token_coefficient(), (1, 1))
+        self.assertEqual(idle.bonus_tokens.dtype, t.int64)
+        self.assertEqual(tuple(idle.prefill_tail_hidden_states.shape), (0, 0, 0))
+        self.assertIsNone(idle.verify_done)
+
+        source = self._make(1)
+        source._prepare_batch_seq_lens_cpu_buf = t.tensor([1, 2], dtype=t.int64)
+        source._prepare_cur_kv_lens_cpu_buf = t.tensor([3, 4], dtype=t.int32)
+        idle.carry_prepare_buffers_from(source)
+        self.assertIs(
+            idle._prepare_batch_seq_lens_cpu_buf,
+            source._prepare_batch_seq_lens_cpu_buf,
+        )
+        self.assertIs(
+            idle._prepare_cur_kv_lens_cpu_buf,
+            source._prepare_cur_kv_lens_cpu_buf,
+        )
+
+
+class TestDSparkSpecInputDataclasses(CustomTestCase):
+    def setUp(self):
+        try:
+            import torch
+
+            from sglang.srt.speculative.dspark_info import (
+                DSparkDraftBlockInput,
+                DSparkDraftExtendInput,
+                DSparkVerifyInput,
+            )
+        except Exception as e:  # pragma: no cover - GPU-only deps on some runners
+            self.skipTest(f"dspark_info unavailable on this runner: {e}")
+        self.torch = torch
+        self.draft_block_cls = DSparkDraftBlockInput
+        self.draft_extend_cls = DSparkDraftExtendInput
+        self.verify_cls = DSparkVerifyInput
+
+    def test_block_and_verify_inputs_expose_spec_adjust_coefficients(self):
+        t = self.torch
+        draft = self.draft_block_cls(
+            draft_token=t.tensor([1, 2, 3], dtype=t.int64),
+            positions=t.tensor([10, 11, 12], dtype=t.int64),
+            draft_token_num=3,
+        )
+        verify = self.verify_cls(
+            draft_token=t.tensor([1, 2, 3, 4], dtype=t.int64),
+            positions=t.tensor([10, 11, 12, 13], dtype=t.int64),
+            draft_token_num=4,
+        )
+
+        self.assertEqual(draft.get_spec_adjust_token_coefficient(), (3, 3))
+        self.assertEqual(verify.get_spec_adjust_token_coefficient(), (4, 4))
+        self.assertTrue(draft.is_draft_input())
+        self.assertTrue(verify.is_verify_input())
+        self.assertEqual(draft.num_tokens_per_batch, 3)
+        self.assertEqual(verify.num_tokens_per_req, 4)
+
+    def test_draft_extend_defaults_and_explicit_logprob_counts(self):
+        t = self.torch
+        default_extend = self.draft_extend_cls(hidden_states=t.zeros((2, 3)))
+        explicit_extend = self.draft_extend_cls(
+            hidden_states=t.zeros((2, 3)),
+            num_tokens_per_req=2,
+            num_tokens_for_logprob_per_req=1,
+        )
+
+        self.assertTrue(default_extend.is_draft_input())
+        self.assertEqual(default_extend.get_spec_adjust_token_coefficient(), (1, 1))
+        self.assertEqual(explicit_extend.get_spec_adjust_token_coefficient(), (2, 1))
+
 
 class TestDSparkPrefillHandoff(CustomTestCase):
     def setUp(self):
@@ -288,6 +455,32 @@ class TestDSparkPrefillHandoff(CustomTestCase):
             tuple(draft_input.prefill_tail_hidden_states.shape), (0, 0, 0)
         )
         self.assertEqual(tuple(draft_input.prefill_tail_valid_mask.shape), (0, 0))
+
+    def test_prefill_handoff_preserves_explicit_tail_payload_and_cur_alloc(self):
+        t = self.torch
+        worker = self._worker(1)
+        tail_hidden = t.arange(2 * 3 * 4, dtype=t.float32).view(2, 3, 4)
+        tail_mask = t.tensor(
+            [[False, True, True], [True, True, True]],
+            dtype=t.bool,
+        )
+        cur_alloc = t.tensor([4096, 128], dtype=t.int32)
+
+        draft_input = self.worker_cls._make_next_draft_input_prefill(
+            worker,
+            bonus_tokens=t.tensor([1262, 2808], dtype=t.int32),
+            seq_lens=t.tensor([3676, 42], dtype=t.int32),
+            cur_allocated_seq_lens_cpu=cur_alloc,
+            prefill_tail_hidden_states=tail_hidden,
+            prefill_tail_valid_mask=tail_mask,
+        )
+
+        self.assertEqual(draft_input.bonus_tokens.dtype, t.int64)
+        self.assertEqual(draft_input.new_seq_lens.dtype, t.int64)
+        self.assertIs(draft_input.cur_allocated_seq_lens_cpu, cur_alloc)
+        self.assertIs(draft_input.prefill_tail_hidden_states, tail_hidden)
+        self.assertIs(draft_input.prefill_tail_valid_mask, tail_mask)
+        self.assertEqual(draft_input.transfer_warmup_rounds.tolist(), [1, 1])
 
     def test_service_warmup_prefill_handoff_uses_configured_rounds(self):
         draft_input = self._make_prefill_input(rounds=2)
@@ -453,6 +646,23 @@ class TestDSparkPrefillHandoff(CustomTestCase):
         self.assertEqual(draft_input.new_seq_lens.tolist(), [3681, 9])
         self.assertEqual(draft_input.transfer_warmup_rounds.tolist(), [1, 0])
 
+    def test_decode_next_input_defaults_warmup_zero_and_preserves_cur_alloc(self):
+        t = self.torch
+        cur_alloc = t.tensor([4096, 128], dtype=t.int32)
+
+        draft_input = self.worker_cls._make_next_draft_input_decode(
+            self._worker(0),
+            bonus_tokens=t.tensor([301, 302], dtype=t.int32),
+            new_seq_lens=t.tensor([3681, 9], dtype=t.int32),
+            cur_allocated_seq_lens_cpu=cur_alloc,
+        )
+
+        self.assertEqual(draft_input.bonus_tokens.dtype, t.int64)
+        self.assertEqual(draft_input.new_seq_lens.dtype, t.int64)
+        self.assertIs(draft_input.cur_allocated_seq_lens_cpu, cur_alloc)
+        self.assertEqual(draft_input.transfer_warmup_rounds.dtype, t.int32)
+        self.assertEqual(draft_input.transfer_warmup_rounds.tolist(), [0, 0])
+
     def test_accept_bonus_uses_longest_contiguous_draft_match(self):
         t = self.torch
         candidates = t.tensor(
@@ -518,6 +728,25 @@ class TestDSparkPrefillHandoff(CustomTestCase):
         self.assertEqual(commit_lens.tolist(), [1])
         self.assertEqual(bonus_tokens.tolist(), [99])
         self.assertEqual(out_tokens.tolist(), [[99, 30, 40, 0]])
+
+    def test_accept_bonus_all_drafts_match_uses_final_target_as_bonus(self):
+        t = self.torch
+        candidates = t.tensor([[10, 20, 30, 40]], dtype=t.int64)
+        target_predict = t.tensor([[20, 30, 40, 99]], dtype=t.int64)
+        confidence = t.zeros((1, 3), dtype=t.float32)
+
+        commit_lens, bonus_tokens, out_tokens = (
+            self.worker_cls._compute_accept_bonus_eager(
+                self._accept_worker(),
+                candidates=candidates,
+                target_predict=target_predict,
+                confidence=confidence,
+            )
+        )
+
+        self.assertEqual(commit_lens.tolist(), [4])
+        self.assertEqual(bonus_tokens.tolist(), [99])
+        self.assertEqual(out_tokens.tolist(), [[20, 30, 40, 99]])
 
     def test_accept_bonus_confidence_gate_truncates_match_prefix(self):
         t = self.torch
