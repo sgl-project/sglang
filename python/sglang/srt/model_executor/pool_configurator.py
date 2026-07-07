@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.srt.configs.model_config import (
+    dsa_layer_skips_topk,
     get_dsa_index_head_dim,
     get_minimax_sparse_attention_config,
     get_minimax_sparse_disable_value_layer_ids,
@@ -209,7 +210,20 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 element_size = torch._utils._element_size(
                     DSATokenToKVPool.index_k_with_scale_buffer_dtype
                 )
-                cell_size += indexer_size_per_token * num_layers * element_size
+                # skip_topk (index-share) layers get a 0-page index-K buffer
+                # (see DSATokenToKVPool), so only non-skip layers cost bytes
+                # here. HiSparse keeps a full-size indexer buffer per layer
+                # regardless of skip_topk (its own device/host ratio sizing),
+                # so it still charges every layer.
+                if mr.enable_hisparse:
+                    num_indexer_layers = num_layers
+                else:
+                    num_indexer_layers = sum(
+                        1
+                        for layer_id in range(mr.start_layer, mr.end_layer)
+                        if not dsa_layer_skips_topk(model_config.hf_config, layer_id)
+                    )
+                cell_size += indexer_size_per_token * num_indexer_layers * element_size
         elif is_minimax_sparse(model_config.hf_config):
             # Mirrors MiniMaxSparseKVPool: main pool (K+V all layers) + indexer pool
             # (sparse-only, single-head; kv layers store K+V, k-only layers store K).

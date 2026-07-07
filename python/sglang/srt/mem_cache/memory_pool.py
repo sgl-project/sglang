@@ -3022,6 +3022,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
         index_buf_size: Optional[int] = None,
+        skip_topk_layers: Optional[List[bool]] = None,
     ):
         override_dim = (
             kv_cache_dim if kv_cache_dim != kv_lora_rank + qk_rope_head_dim else None
@@ -3049,6 +3050,13 @@ class DSATokenToKVPool(MLATokenToKVPool):
         # num head == 1 and head dim == 128 for index_k in DSA
         assert index_head_dim == 128
 
+        self.skip_topk_layers = (
+            list(skip_topk_layers)
+            if skip_topk_layers is not None
+            else [False] * layer_num
+        )
+        assert len(self.skip_topk_layers) == layer_num
+
         if _is_hip:
             if aiter_can_use_preshuffle_paged_mqa():
                 assert (
@@ -3065,6 +3073,10 @@ class DSATokenToKVPool(MLATokenToKVPool):
             if self.custom_mem_pool
             else nullcontext()
         ):
+            cols = self.page_size * (
+                index_head_dim + index_head_dim // self.quant_block_size * 4
+            )
+            num_pages = (index_buf_size + page_size + 1) // self.page_size
             self.index_k_with_scale_buffer = [
                 torch.zeros(
                     # Layout:
@@ -3073,17 +3085,15 @@ class DSATokenToKVPool(MLATokenToKVPool):
                     #     data: for page i,
                     #         * buf[i, :page_size * head_dim] for fp8 data
                     #         * buf[i, page_size * head_dim:].view(float32) for scale
-                    (
-                        (index_buf_size + page_size + 1) // self.page_size,
-                        self.page_size
-                        * (
-                            index_head_dim + index_head_dim // self.quant_block_size * 4
-                        ),
-                    ),
+                    # skip_topk (index-share) layers never run the indexer
+                    # (should_run_indexer gates both store and read), so their
+                    # index-K is allocated with 0 pages -- kept in the list so
+                    # every `[layer_id]` access still resolves.
+                    (0 if self.skip_topk_layers[i] else num_pages, cols),
                     dtype=self.index_k_with_scale_buffer_dtype,
                     device=device,
                 )
-                for _ in range(layer_num)
+                for i in range(layer_num)
             ]
         self._finalize_allocation_log(size)
 
@@ -3100,7 +3110,9 @@ class DSATokenToKVPool(MLATokenToKVPool):
 
         tgt_loc_flat = tgt_loc.view(-1).long()
         src_loc_flat = src_loc.view(-1).long()
-        for index_k in self.index_k_with_scale_buffer:
+        for i, index_k in enumerate(self.index_k_with_scale_buffer):
+            if self.skip_topk_layers[i]:
+                continue
             index_k[tgt_loc_flat] = index_k[src_loc_flat]
 
     def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
@@ -3191,6 +3203,9 @@ class DSATokenToKVPool(MLATokenToKVPool):
         chunk_size = self.cpu_offloading_chunk_size
         page_chunk_size = max(1, chunk_size // self.page_size)
         for layer_id in range(self.layer_num):
+            if self.skip_topk_layers[layer_id]:
+                index_k_cpu.append(None)
+                continue
             index_k_cpu.append([])
             for i in range(0, len(page_indices), page_chunk_size):
                 chunk_page_indices = page_indices[i : i + page_chunk_size]
@@ -3213,6 +3228,8 @@ class DSATokenToKVPool(MLATokenToKVPool):
         chunk_size = self.cpu_offloading_chunk_size
         page_chunk_size = max(1, chunk_size // self.page_size)
         for layer_id in range(self.layer_num):
+            if self.skip_topk_layers[layer_id]:
+                continue
             for i in range(0, len(page_indices), page_chunk_size):
                 chunk_page_indices = page_indices[i : i + page_chunk_size]
                 idx_cpu = index_k_cpu[layer_id][i // page_chunk_size]
@@ -3231,7 +3248,12 @@ class DSATokenToKVPool(MLATokenToKVPool):
             self.index_k_with_scale_buffer[i].nbytes for i in range(self.layer_num)
         ]
         item_lens = [
-            self.index_k_with_scale_buffer[i][0].nbytes for i in range(self.layer_num)
+            (
+                0
+                if self.skip_topk_layers[i]
+                else self.index_k_with_scale_buffer[i][0].nbytes
+            )
+            for i in range(self.layer_num)
         ]
         return data_ptrs, data_lens, item_lens
 
