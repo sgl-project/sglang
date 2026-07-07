@@ -118,6 +118,9 @@ _use_hip_int4 = get_bool_env_var("SGLANG_INT4_WEIGHT") and _is_hip
 _use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
 _is_shuffle_moe_mxfp4 = is_gfx95_supported()
 _is_gfx1250_supported = is_gfx1250_supported()
+# gfx1250 grouped MoE runs the a8w4 (fp8 activation) FlyDSL kernel when
+# AITER_FORCE_A8W4 is set; that kernel consumes (16,16)-preshuffled weights.
+_use_aiter_a8w4 = get_bool_env_var("AITER_FORCE_A8W4", "false")
 
 
 def _require_fp4_dtype():
@@ -1334,16 +1337,17 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer.w13_weight.data = layer.w13_weight.data.view(fp4_weight_dtype)
             layer.w2_weight.data = layer.w2_weight.data.view(fp4_weight_dtype)
 
-            is_shuffled = _is_shuffle_moe_mxfp4
+            is_shuffled = _is_shuffle_moe_mxfp4 or _use_aiter_a8w4
             if is_shuffled:
+                shuffle_gu_intv = gu_intv and not _use_aiter_a8w4
                 layer.w13_weight.data = shuffle_weight(
                     layer.w13_weight,
-                    is_guinterleave=gu_intv,
+                    is_guinterleave=shuffle_gu_intv,
                     gate_up=True,
                 )
                 layer.w2_weight.data = shuffle_weight(
                     layer.w2_weight,
-                    is_guinterleave=gu_intv,
+                    is_guinterleave=shuffle_gu_intv,
                     gate_up=False,
                 )
             layer.w13_weight.is_shuffled = is_shuffled
