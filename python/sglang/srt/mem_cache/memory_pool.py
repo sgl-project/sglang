@@ -2581,9 +2581,9 @@ class HybridLinearKVPool(KVCache):
     def get_v_head_dim(self):
         # Use start_layer to handle pipeline parallelism where layer 0
         # may not be present in this stage's buffer.
-        return self.full_kv_pool.get_value_buffer(
-            self.full_kv_pool.start_layer
-        ).shape[-1]
+        return self.full_kv_pool.get_value_buffer(self.full_kv_pool.start_layer).shape[
+            -1
+        ]
 
     def set_mla_kv_buffer(
         self,
@@ -3748,6 +3748,4 @@ class MiniMaxSparseKVPool(KVCache):
     def get_v_head_dim(self):
         # Use start_layer to handle pipeline parallelism where layer 0
         # may not be present in this stage's buffer.
-        return self.main_pool.get_value_buffer(
-            self.main_pool.start_layer
-        ).shape[-1]
+        return self.main_pool.get_value_buffer(self.main_pool.start_layer).shape[-1]
