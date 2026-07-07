@@ -1346,6 +1346,24 @@ class MultiModalMixin:
         super().__init__(*args, **kwargs)
         self._mm_padding_pattern = MultiModalityDataPaddingPatternMultimodalTokens()
 
+        # transformers v5 flattened SigLIP/CLIP: the vision_tower no longer
+        # wraps its layers under a "vision_model" sub-module.  Checkpoints
+        # saved with the old layout still carry "vision_tower.vision_model.*"
+        # keys.  If the live model's vision_tower has no "vision_model" child,
+        # prepend a mapper to drop that extra level so weights load correctly.
+        vt = getattr(self.model, "vision_tower", None)
+        if vt is not None and not any(
+            name == "vision_model" for name, _ in vt.named_children()
+        ):
+            self.weight_mapper = (
+                WeightsMapper(
+                    orig_to_new_prefix={
+                        "vision_tower.vision_model.": "model.vision_tower.",
+                    }
+                )
+                | self.weight_mapper
+            )
+
     def _uses_mrope_positions(self) -> bool:
         rope_scaling = getattr(self.text_config, "rope_scaling", None)
         if isinstance(rope_scaling, Mapping) and "mrope_section" in rope_scaling:
