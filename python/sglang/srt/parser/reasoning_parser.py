@@ -545,14 +545,39 @@ class HunyuanDetector(BaseReasoningFormatDetector):
         previous_content: str = "",
         tokenizer=None,
     ):
+        def _close(open_tok: str) -> str:
+            return "</" + open_tok[1:] if open_tok.startswith("<") else open_tok
+
         t = resolve_hunyuan_tokens(tokenizer)
         think_open = t["think"]
-        think_close = (
-            "</" + think_open[1:] if think_open.startswith("<") else think_open
-        )
+        think_close = _close(think_open)
+        answer_open = t["answer"]
+
+        think_excluded_tokens = None
+        if tokenizer is not None:
+            try:
+                vocab = tokenizer.get_vocab()
+            except Exception:
+                vocab = None
+            if isinstance(vocab, dict):
+                candidates = [
+                    getattr(tokenizer, "eos_token", None),
+                    answer_open,
+                    _close(answer_open),
+                    think_open,
+                ]
+                # The grammar backend excludes every id a string encodes to,
+                # so only single vocab entries are safe to exclude.
+                think_excluded_tokens = [
+                    tok
+                    for tok in dict.fromkeys(candidates)
+                    if isinstance(tok, str) and tok in vocab
+                ] or None
+
         super().__init__(
             think_open,
             think_close,
+            think_excluded_tokens=think_excluded_tokens,
             force_reasoning=force_reasoning,
             stream_reasoning=stream_reasoning,
             tool_start_token=t["tool_calls"],

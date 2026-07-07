@@ -520,6 +520,30 @@ class TestGlm45Detector(CustomTestCase):
         self.assertEqual(result.normal_text, "<tool_call>tool call")
 
 
+_HY3_VOCAB = {
+    "<｜hy_eos:opensource｜>": 120025,
+    "<think:opensource>": 120029,
+    "</think:opensource>": 120030,
+    "<answer>": 120031,
+    "</answer>": 120032,
+}
+
+
+class _FakeHy3Tokenizer:
+    """Minimal stand-in for the shipping Hy3 tokenizer (suffixed specials)."""
+
+    eos_token = "<｜hy_eos:opensource｜>"
+
+    def __init__(self, vocab):
+        self._vocab = dict(vocab)
+
+    def get_vocab(self):
+        return dict(self._vocab)
+
+    def convert_tokens_to_ids(self, token):
+        return self._vocab.get(token)
+
+
 class TestHunyuanDetector(CustomTestCase):
     """Test cases for Hunyuan detector with tool interruption support."""
 
@@ -611,6 +635,43 @@ class TestHunyuanDetector(CustomTestCase):
 
         self.assertEqual(all_reasoning, "reasoning")
         self.assertIn("<tool_calls>", all_normal)
+
+    def test_suffixed_think_tokens_resolve_from_tokenizer(self):
+        """Suffixed think tags resolve from the tokenizer vocab."""
+        detector = HunyuanDetector(tokenizer=_FakeHy3Tokenizer(_HY3_VOCAB))
+        self.assertEqual(detector.think_start_token, "<think:opensource>")
+        self.assertEqual(detector.think_end_token, "</think:opensource>")
+
+        text = "<think:opensource>Let me think</think:opensource>The answer is 42."
+        result = detector.detect_and_parse(text)
+        self.assertEqual(result.reasoning_text, "Let me think")
+        self.assertEqual(result.normal_text, "The answer is 42.")
+
+    def test_think_excluded_tokens_from_tokenizer(self):
+        """With a tokenizer, the single-token specials are excluded."""
+        detector = HunyuanDetector(tokenizer=_FakeHy3Tokenizer(_HY3_VOCAB))
+        self.assertEqual(
+            detector.think_excluded_tokens,
+            [
+                "<｜hy_eos:opensource｜>",
+                "<answer>",
+                "</answer>",
+                "<think:opensource>",
+            ],
+        )
+
+    def test_no_tokenizer_declares_no_excluded_tokens(self):
+        """Without a tokenizer, no tokens are declared for exclusion."""
+        self.assertIsNone(self.detector.think_excluded_tokens)
+
+    def test_vocab_without_answer_specials_omits_them(self):
+        """Answer specials absent from the vocab are omitted, without error."""
+        vocab = {k: v for k, v in _HY3_VOCAB.items() if "answer" not in k}
+        detector = HunyuanDetector(tokenizer=_FakeHy3Tokenizer(vocab))
+        self.assertEqual(
+            detector.think_excluded_tokens,
+            ["<｜hy_eos:opensource｜>", "<think:opensource>"],
+        )
 
 
 class TestNemotron3Detector(CustomTestCase):
