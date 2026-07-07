@@ -199,7 +199,10 @@ class OffloaderV2(BaseOffloader):
     ):
         assert len(self.offloaders) == 0, "should only call wrap_modules once"
 
-        alt_stream = get_stream("alt")
+        # The offloader's async prefetch/offload copies run on their own
+        # stream — sharing the models' "alt" overlap stream would serialize
+        # unrelated copy and compute work.
+        alt_stream = get_stream("offload")
 
         all_modules = []
         offload_submodules = []
