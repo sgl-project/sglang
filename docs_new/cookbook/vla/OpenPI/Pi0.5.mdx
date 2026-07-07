@@ -266,9 +266,8 @@ Pi0.5 is implemented as a native VLA/action-policy pipeline, not as an SRT LLM s
 | Pi0.5 stage wiring | `python/sglang/multimodal_gen/runtime/pipelines/pi05.py` | Pi0.5 binds common VLA stages to `Pi05Preprocessor`, `Pi05PolicyModel`, and Pi0.5 stage keys |
 | Preprocessing | `python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/pi05_preprocess.py` | `Pi05Preprocessor` |
 | VLA observation batch | `python/sglang/multimodal_gen/runtime/utils/vla_observation.py` | `VLAObservationBatch`, `collate_vla_observation_batches`, `stable_tensor_sha256` |
-| Prefix cache | `python/sglang/multimodal_gen/runtime/cache/vla_prefix_cache.py` | `PrefixContext`, `VLAPrefixCacheKey`, `VLAPrefixCacheManager` |
-| Distributed broadcast helpers | `python/sglang/multimodal_gen/runtime/distributed/broadcast.py` | generic object, tensor, optional-tensor, and metadata broadcast helpers |
-| VLA split group | `python/sglang/multimodal_gen/runtime/distributed/vla.py` | `VLASplitGroup`, `get_vla_split_group`, `broadcast_prefix_context` |
+| Prefix cache | `python/sglang/multimodal_gen/runtime/cache/vla_prefix_cache.py` | `PrefixContext`, `VLADensePrefixCache`, `VLAPrefixCacheKey`, `VLAPrefixCacheManager` |
+| VLA split group | `python/sglang/multimodal_gen/runtime/distributed/vla.py` | `VLASplitGroup`, `get_vla_split_group`, `broadcast_prefix_context`, `broadcast_tensor_from_rank` |
 | Denoise CUDA graph | `python/sglang/multimodal_gen/runtime/utils/vla_denoise_graph.py` | `VLADenoiseShapeBucket`, `VLADenoiseGraphRunner.capture_or_run` |
 | Pi0.5 policy model | `python/sglang/multimodal_gen/runtime/models/vlas/pi05_policy.py` | `Pi05PolicyModel.encode_prefix`, `Pi05PolicyModel.sample_actions`, `Pi05PolicyModel.denoise_step` |
 | Pi0.5 core modules | `python/sglang/multimodal_gen/runtime/models/vlas/pi05_core.py` | `Pi05CoreModel`, `PaliGemmaWithExpertModel`, `PiGemmaModel`, `PiGemmaAttention`, `Pi05SiglipAttention`, `PiGemmaRMSNorm` |

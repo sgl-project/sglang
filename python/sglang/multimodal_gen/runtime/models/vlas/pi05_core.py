@@ -5,31 +5,22 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
-from transformers.cache_utils import DynamicCache
-from transformers.masking_utils import create_causal_mask
-from transformers.modeling_layers import GradientCheckpointingLayer
-from transformers.modeling_outputs import (
-    BaseModelOutputWithPast,
-    BaseModelOutputWithPooling,
-)
+from transformers.modeling_outputs import BaseModelOutputWithPooling
 from transformers.models.auto import CONFIG_MAPPING
 from transformers.models.gemma.modeling_gemma import (
     GemmaConfig,
-    GemmaForCausalLM,
     GemmaMLP,
-    GemmaModel,
+    GemmaRotaryEmbedding,
 )
-from transformers.models.paligemma.modeling_paligemma import (
-    PaliGemmaForConditionalGeneration,
-    PaliGemmaModel,
-)
+from transformers.models.paligemma.modeling_paligemma import PaliGemmaModel
 
 from sglang.multimodal_gen.configs.pipeline_configs.pi05 import Pi05PipelineConfig
+from sglang.multimodal_gen.runtime.cache.vla_prefix_cache import VLADensePrefixCache
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ring_parallel_world_size,
     get_sequence_parallel_world_size,
@@ -56,6 +47,14 @@ def config_compute_dtype(config: GemmaConfig) -> torch.dtype | None:
     if dtype_name in ("fp32", "float32", "torch.float32"):
         return torch.float32
     return None
+
+
+@dataclass
+class PiGemmaModelOutput:
+    last_hidden_state: torch.Tensor
+    past_key_values: object | None = None
+    hidden_states: tuple[torch.Tensor, ...] | None = None
+    attentions: tuple[torch.Tensor, ...] | None = None
 
 
 def gated_residual(
@@ -342,7 +341,7 @@ class PiGemmaAttention(nn.Module):
         return self.o_proj(attn_output), None
 
 
-class PiGemmaDecoderLayer(GradientCheckpointingLayer):
+class PiGemmaDecoderLayer(nn.Module):
     def __init__(self, config: GemmaConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -395,11 +394,17 @@ class PiGemmaDecoderLayer(GradientCheckpointingLayer):
         return hidden_states
 
 
-class PiGemmaModel(GemmaModel):
+class PiGemmaModel(nn.Module):
     def __init__(self, config: GemmaConfig, **kwargs):
-        super().__init__(config, **kwargs)
-        del self.layers
-        del self.norm
+        super().__init__()
+        self.config = config
+        self.padding_idx = config.pad_token_id
+        self.vocab_size = config.vocab_size
+        self.embed_tokens = nn.Embedding(
+            config.vocab_size,
+            config.hidden_size,
+            self.padding_idx,
+        )
         self.layerwise_cpu_offload_enabled = False
         self.layerwise_cpu_offload_device: torch.device | None = None
         self.layerwise_cpu_offload_empty_cache = True
@@ -413,6 +418,11 @@ class PiGemmaModel(GemmaModel):
         self.norm = PiGemmaRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps, cond_dim=cond_dim
         )
+        self.rotary_emb = GemmaRotaryEmbedding(config=config)
+        self.gradient_checkpointing = False
+
+    def get_input_embeddings(self) -> nn.Module:
+        return self.embed_tokens
 
     def configure_layerwise_cpu_offload(
         self,
@@ -484,7 +494,7 @@ class PiGemmaModel(GemmaModel):
         input_ids: torch.LongTensor | None = None,
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.LongTensor | None = None,
-        past_key_values: DynamicCache | None = None,
+        past_key_values: Any | None = None,
         inputs_embeds: torch.FloatTensor | None = None,
         use_cache: bool | None = None,
         output_attentions: bool | None = None,
@@ -492,7 +502,7 @@ class PiGemmaModel(GemmaModel):
         cache_position: torch.LongTensor | None = None,
         adarms_cond: torch.Tensor | None = None,
         **kwargs,
-    ) -> BaseModelOutputWithPast:
+    ) -> PiGemmaModelOutput:
         output_attentions = (
             output_attentions
             if output_attentions is not None
@@ -525,7 +535,7 @@ class PiGemmaModel(GemmaModel):
         )
 
         if use_cache and past_key_values is None:
-            past_key_values = DynamicCache()
+            past_key_values = VLADensePrefixCache()
 
         if cache_position is None:
             past_seen_tokens = (
@@ -540,17 +550,7 @@ class PiGemmaModel(GemmaModel):
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
 
-        if attention_mask is None and not getattr(self.config, "is_causal", True):
-            causal_mask = None
-        else:
-            causal_mask = create_causal_mask(
-                config=self.config,
-                inputs_embeds=inputs_embeds,
-                attention_mask=attention_mask,
-                cache_position=cache_position,
-                past_key_values=past_key_values,
-                position_ids=position_ids,
-            )
+        causal_mask = attention_mask
 
         hidden_states = inputs_embeds
         if (
@@ -588,7 +588,7 @@ class PiGemmaModel(GemmaModel):
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
 
-        return BaseModelOutputWithPast(
+        return PiGemmaModelOutput(
             last_hidden_state=hidden_states,
             past_key_values=past_key_values if use_cache else None,
             hidden_states=all_hidden_states,
@@ -596,11 +596,12 @@ class PiGemmaModel(GemmaModel):
         )
 
 
-class PiGemmaForCausalLM(GemmaForCausalLM):
+class PiGemmaForCausalLM(nn.Module):
     def __init__(self, config: GemmaConfig, **kwargs):
-        super().__init__(config, **kwargs)
-        del self.model
+        super().__init__()
+        self.config = config
         self.model = PiGemmaModel(config)
+        self.lm_head = None
 
 
 class PaliGemmaModelWithPiGemma(PaliGemmaModel):
@@ -610,11 +611,12 @@ class PaliGemmaModelWithPiGemma(PaliGemmaModel):
         self.language_model = PiGemmaModel(config.text_config)
 
 
-class PaliGemmaForConditionalGenerationWithPiGemma(PaliGemmaForConditionalGeneration):
+class PaliGemmaForConditionalGenerationWithPiGemma(nn.Module):
     def __init__(self, config):
-        super().__init__(config)
-        del self.model
+        super().__init__()
+        self.config = config
         self.model = PaliGemmaModelWithPiGemma(config)
+        self.lm_head = None
 
     @property
     def language_model(self):

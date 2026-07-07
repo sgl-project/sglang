@@ -8,7 +8,10 @@ from typing import Any, Callable
 
 import torch
 
-from sglang.multimodal_gen.runtime.cache.vla_prefix_cache import PrefixContext
+from sglang.multimodal_gen.runtime.cache.vla_prefix_cache import (
+    PrefixContext,
+    VLADensePrefixCache,
+)
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     enable_tc_piecewise_cuda_graph,
 )
@@ -38,9 +41,7 @@ class _CapturedDenoiseGraph:
 
 
 def _clone_past_key_values(past_key_values: Any) -> Any:
-    from transformers.cache_utils import DynamicCache
-
-    return DynamicCache(
+    return VLADensePrefixCache(
         tuple(
             (keys.detach().clone(), values.detach().clone(), sliding_window)
             for keys, values, sliding_window in past_key_values

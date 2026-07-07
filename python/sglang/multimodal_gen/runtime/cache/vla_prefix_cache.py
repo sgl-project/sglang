@@ -40,11 +40,56 @@ class PrefixContext:
         return self
 
 
-def slice_prefix_context(context: PrefixContext, index: int) -> PrefixContext:
-    from transformers.cache_utils import DynamicCache
+class VLADensePrefixCache:
+    def __init__(
+        self,
+        layers: tuple[tuple[torch.Tensor, torch.Tensor, Any], ...] | None = None,
+    ):
+        self.layers = list(layers or ())
 
+    def __iter__(self):
+        return iter(self.layers)
+
+    def __len__(self) -> int:
+        return len(self.layers)
+
+    def __getitem__(self, layer_idx: int):
+        return self.layers[layer_idx]
+
+    def get_seq_length(self, layer_idx: int = 0) -> int:
+        if layer_idx >= len(self.layers):
+            return 0
+        return int(self.layers[layer_idx][0].shape[-2])
+
+    def get_mask_sizes(
+        self,
+        cache_position: torch.Tensor,
+        layer_idx: int,
+    ) -> tuple[int, int]:
+        return self.get_seq_length(layer_idx) + int(cache_position.shape[0]), 0
+
+    def update(
+        self,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        layer_idx: int,
+        cache_kwargs=None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if layer_idx == len(self.layers):
+            self.layers.append((key_states, value_states, None))
+            return key_states, value_states
+        if layer_idx > len(self.layers):
+            raise IndexError(f"Invalid VLA prefix cache layer: {layer_idx}")
+        cached_keys, cached_values, sliding_window = self.layers[layer_idx]
+        key_states = torch.cat([cached_keys, key_states], dim=-2)
+        value_states = torch.cat([cached_values, value_states], dim=-2)
+        self.layers[layer_idx] = (key_states, value_states, sliding_window)
+        return key_states, value_states
+
+
+def slice_prefix_context(context: PrefixContext, index: int) -> PrefixContext:
     return PrefixContext(
-        past_key_values=DynamicCache(
+        past_key_values=VLADensePrefixCache(
             tuple(
                 (
                     keys[index : index + 1],

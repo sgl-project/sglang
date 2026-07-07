@@ -4,11 +4,13 @@ from types import SimpleNamespace
 
 import torch
 from torch import nn
-from transformers.cache_utils import DynamicCache
 
 import sglang.multimodal_gen.runtime.models.vlas.pi05_policy as pi05_policy_module
 from sglang.multimodal_gen.configs.pipeline_configs.pi05 import Pi05PipelineConfig
-from sglang.multimodal_gen.runtime.cache.vla_prefix_cache import PrefixContext
+from sglang.multimodal_gen.runtime.cache.vla_prefix_cache import (
+    PrefixContext,
+    VLADensePrefixCache,
+)
 from sglang.multimodal_gen.runtime.distributed.vla import VLASplitGroup
 from sglang.multimodal_gen.runtime.models.vlas.pi05_core import (
     Pi05SiglipAttention,
@@ -28,7 +30,7 @@ def _prefix_context(value: float, digest: str | None) -> PrefixContext:
     keys = torch.full((1, 1, 2, 4), value)
     values = torch.full((1, 1, 2, 4), value)
     return PrefixContext(
-        past_key_values=DynamicCache(((keys, values, None),)),
+        past_key_values=VLADensePrefixCache(((keys, values, None),)),
         prefix_pad_masks=torch.ones(1, 2, dtype=torch.bool),
         prefix_position_ids=torch.arange(2).unsqueeze(0),
         prefix_len=2,

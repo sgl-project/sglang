@@ -19,9 +19,6 @@ from sglang.multimodal_gen.runtime.cache.vla_prefix_cache import (
     VLAPrefixCacheKey,
     VLAPrefixCacheManager,
 )
-from sglang.multimodal_gen.runtime.distributed.broadcast import (
-    broadcast_optional_tensor,
-)
 from sglang.multimodal_gen.runtime.distributed.communication_op import (
     sequence_model_parallel_all_gather,
 )
@@ -32,7 +29,10 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ulysses_parallel_world_size,
     model_parallel_is_initialized,
 )
-from sglang.multimodal_gen.runtime.distributed.vla import get_vla_split_group
+from sglang.multimodal_gen.runtime.distributed.vla import (
+    broadcast_tensor_from_rank,
+    get_vla_split_group,
+)
 from sglang.multimodal_gen.runtime.loader.utils import (
     set_default_torch_dtype,
     skip_init_modules,
@@ -879,10 +879,9 @@ class Pi05PolicyModel(nn.Module):
             if x_t is None:
                 raise RuntimeError("Pi05 action state is missing on single-rank run")
             return x_t
-        x_t = broadcast_optional_tensor(
-            x_t if split.rank == split.action_root else None,
-            group=split.group,
-            rank=split.rank,
+        x_t = broadcast_tensor_from_rank(
+            x_t,
+            split,
             src=split.action_root,
             device=self.device,
         )
