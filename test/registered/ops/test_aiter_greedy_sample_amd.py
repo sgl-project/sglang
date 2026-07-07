@@ -23,12 +23,15 @@ register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd")
 
 def _mock_global_server_args(backend="pytorch"):
     from sglang.srt.layers import sampler as sampler_mod
+    from sglang.srt.runtime_context import get_flags
     from sglang.srt.server_args import ServerArgs
 
     sampler_mod.get_global_server_args = lambda: ServerArgs(
         model_path="dummy",
         sampling_backend=backend,
     )
+    # The sampler reads the resolved backend from the flags tier.
+    get_flags().sampling_backend = backend
 
     class _DummyTPGroup:
         device_group = None

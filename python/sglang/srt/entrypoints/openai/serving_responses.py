@@ -672,6 +672,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 stream_reasoning=False,
                 force_reasoning=self._is_thinking_enabled_for_request(request),
                 request=request,
+                tokenizer=self.tokenizer_manager.tokenizer,
             )
             reasoning_content, content = reasoning_parser.parse_non_stream(final_output)
         else:
@@ -714,7 +715,11 @@ class OpenAIServingResponses(OpenAIServingChat):
             and self.tool_call_parser
             and request.tool_choice != "none"
         ):
-            parser = FunctionCallParser(chat_tools, self.tool_call_parser)
+            parser = FunctionCallParser(
+                chat_tools,
+                self.tool_call_parser,
+                tokenizer=self.tokenizer_manager.tokenizer,
+            )
             should_try_native = (
                 not is_required or parser.detector.supports_structural_tag()
             )
@@ -1799,14 +1804,22 @@ class OpenAIServingResponses(OpenAIServingChat):
         if chat_tools and request.tool_choice != "none":
             native_supports_structural_tag = False
             if self.tool_call_parser:
-                probe = FunctionCallParser(chat_tools, self.tool_call_parser)
+                probe = FunctionCallParser(
+                    chat_tools,
+                    self.tool_call_parser,
+                    tokenizer=self.tokenizer_manager.tokenizer,
+                )
                 native_supports_structural_tag = (
                     probe.detector.supports_structural_tag()
                 )
             if is_required and not native_supports_structural_tag:
                 tool_parser = JsonArrayParser()
             elif self.tool_call_parser:
-                tool_parser = FunctionCallParser(chat_tools, self.tool_call_parser)
+                tool_parser = FunctionCallParser(
+                    chat_tools,
+                    self.tool_call_parser,
+                    tokenizer=self.tokenizer_manager.tokenizer,
+                )
         reasoning_parser_obj: Optional[ReasoningParser] = None
         if self.reasoning_parser:
             reasoning_parser_obj = ReasoningParser(
@@ -1814,6 +1827,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 stream_reasoning=True,
                 force_reasoning=self._is_thinking_enabled_for_request(request),
                 request=request,
+                tokenizer=self.tokenizer_manager.tokenizer,
             )
 
         current_output_index = -1
