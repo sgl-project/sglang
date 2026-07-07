@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 
 import sglang.srt.server_args as server_args_module
 from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
+from sglang.srt.environ import envs
 from sglang.srt.layers.cp.base import is_cp_enabled, is_interleave
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -354,7 +355,10 @@ class TestFa4PageSizeAutoForce(CustomTestCase):
 
         args._handle_attention_backend_compatibility()
 
-        self.assertEqual(args.page_size, 128)
+        from sglang.srt.arg_groups.overrides import resolved_view
+
+        self.assertEqual(args.page_size, 1)  # dual-apply retired: pristine
+        self.assertEqual(resolved_view(args).page_size, 128)
 
     @patch("sglang.srt.arg_groups.overrides.is_sm100_supported", return_value=True)
     @patch("sglang.srt.server_args.ServerArgs.use_mla_backend", return_value=False)
@@ -364,7 +368,10 @@ class TestFa4PageSizeAutoForce(CustomTestCase):
 
         args._handle_attention_backend_compatibility()
 
-        self.assertEqual(args.page_size, 128)
+        from sglang.srt.arg_groups.overrides import resolved_view
+
+        self.assertEqual(args.page_size, 1)  # dual-apply retired: pristine
+        self.assertEqual(resolved_view(args).page_size, 128)
 
 
 class TestContextParallelServerArgs(CustomTestCase):
@@ -1119,7 +1126,11 @@ class TestDeepEPWaterfillArgs(CustomTestCase):
         # dummy-model path short-circuits __post_init__; invoke the handler directly.
         server_args._handle_a2a_moe()
 
-        self.assertFalse(server_args.disable_shared_experts_fusion)
+        from sglang.srt.arg_groups.overrides import resolved_view
+
+        # dual-apply retired: the fields stay pristine, the declarations win
+        self.assertTrue(server_args.disable_shared_experts_fusion)
+        self.assertFalse(resolved_view(server_args).disable_shared_experts_fusion)
         self.assertTrue(server_args.enforce_shared_experts_fusion)
 
     def test_waterfill_overrides_moe_a2a_backend_to_deepep(self):
@@ -1131,7 +1142,10 @@ class TestDeepEPWaterfillArgs(CustomTestCase):
         # dummy-model path short-circuits __post_init__; invoke the handler directly.
         server_args._handle_a2a_moe()
 
-        self.assertEqual(server_args.moe_a2a_backend, "deepep")
+        from sglang.srt.arg_groups.overrides import resolved_view
+
+        self.assertEqual(server_args.moe_a2a_backend, "none")  # pristine
+        self.assertEqual(resolved_view(server_args).moe_a2a_backend, "deepep")
         self.assertTrue(server_args.enforce_shared_experts_fusion)
 
     def test_waterfill_supports_deepep_low_latency_mode(self):
@@ -1367,6 +1381,117 @@ class TestSamplingBackendTokenOracleEnvGate(CustomTestCase):
             ]
         )
         self.assertEqual(parsed.sampling_backend, "token_oracle")
+
+
+class TestGrpcServerArgs(CustomTestCase):
+    """Native gRPC is enabled by --grpc-port (or SGLANG_GRPC_PORT) and runs
+    alongside HTTP; --smg-grpc-mode (and the deprecated --grpc-mode) select the
+    legacy SMG server. Worker-threads / max-prefill-tokens are env-only knobs.
+
+    The gRPC setup lives in ServerArgs._handle_deprecated_args, which
+    __post_init__ skips for dummy models, so these tests build a dummy
+    ServerArgs and invoke that handler directly (mirroring the real flow for a
+    concrete model path).
+    """
+
+    @staticmethod
+    def _args(**kwargs):
+        return ServerArgs(model_path="dummy", **kwargs)
+
+    def test_defaults_native_grpc_off_legacy_off(self):
+        sa = self._args()
+        sa._handle_deprecated_args()
+        self.assertIsNone(sa.grpc_port)
+        self.assertFalse(sa.smg_grpc_mode)
+
+    def test_http_only_high_port_does_not_derive_grpc_port(self):
+        sa = self._args(port=56000)
+        sa._handle_deprecated_args()
+        self.assertIsNone(sa.grpc_port)
+
+    def test_grpc_port_enables_native_and_env_knobs(self):
+        sa = self._args(grpc_port=50051)
+        with envs.SGLANG_GRPC_WORKER_THREADS.override(8):
+            sa._handle_deprecated_args()
+        self.assertEqual(sa.grpc_port, 50051)
+        self.assertEqual(sa.grpc_worker_threads, 8)
+
+    def test_env_grpc_port_enables_native(self):
+        sa = self._args(port=30000)
+        with envs.SGLANG_GRPC_PORT.override(45000):
+            sa._handle_deprecated_args()
+        self.assertEqual(sa.grpc_port, 45000)
+
+    def test_legacy_smg_derives_grpc_port_from_http_port(self):
+        sa = self._args(port=30000, smg_grpc_mode=True)
+        sa._handle_deprecated_args()
+        self.assertEqual(sa.grpc_port, 40000)
+
+    def test_grpc_mode_is_deprecated_alias_for_smg_grpc_mode(self):
+        sa = self._args(grpc_mode=True)
+        with self.assertLogs(server_args_module.logger, level="WARNING") as cm:
+            sa._handle_deprecated_args()
+        self.assertTrue(sa.smg_grpc_mode)
+        self.assertTrue(any("--grpc-mode is deprecated" in line for line in cm.output))
+
+    def test_legacy_smg_takes_precedence_over_grpc_port(self):
+        sa = self._args(grpc_port=50051, smg_grpc_mode=True)
+        sa._handle_deprecated_args()
+        self.assertTrue(sa.smg_grpc_mode)
+        self.assertEqual(sa.grpc_port, 50051)
+
+    def test_native_grpc_rejects_multi_tokenizer(self):
+        sa = self._args(grpc_port=40000, tokenizer_worker_num=2)
+        with self.assertRaises(ValueError):
+            sa._handle_deprecated_args()
+
+    def test_native_grpc_rejects_http_auth(self):
+        sa = self._args(grpc_port=40000, api_key="secret")
+        with self.assertRaises(ValueError):
+            sa._handle_deprecated_args()
+
+    def test_invalid_grpc_worker_threads_rejected(self):
+        sa = self._args(grpc_port=40000)
+        with envs.SGLANG_GRPC_WORKER_THREADS.override(0):
+            with self.assertRaises(ValueError):
+                sa._handle_deprecated_args()
+
+    def test_start_server_call_site_matches_native_signature(self):
+        """Regression for the startup blocker: the native start_server binding
+        only accepts (host, port, runtime_handle, worker_threads, ...). The
+        arg-parsing tests above never call start_server, so a stray kwarg (e.g.
+        the removed max_prefill_tokens) would only surface as a TypeError at
+        launch. This mocks the native extension and locks the kwarg set."""
+        import sys
+
+        from sglang.srt.entrypoints import http_server
+
+        fake_core = SimpleNamespace(start_server=MagicMock(return_value="handle"))
+        fake_bridge = SimpleNamespace(RuntimeHandle=MagicMock(return_value="rt"))
+        server_args = SimpleNamespace(
+            host="127.0.0.1", grpc_port=50051, grpc_worker_threads=4
+        )
+        with patch.dict(
+            sys.modules,
+            {
+                "sglang.srt.grpc": SimpleNamespace(_core=fake_core),
+                "sglang.srt.grpc._core": fake_core,
+                "sglang.srt.entrypoints.grpc_bridge": fake_bridge,
+            },
+        ):
+            handle = http_server._start_native_grpc_server_for_runtime(
+                server_args=server_args,
+                tokenizer_manager=MagicMock(),
+                template_manager=MagicMock(),
+                scheduler_info={},
+            )
+
+        self.assertEqual(handle, "handle")
+        _, kwargs = fake_core.start_server.call_args
+        self.assertEqual(
+            set(kwargs), {"host", "port", "runtime_handle", "worker_threads"}
+        )
+        self.assertNotIn("max_prefill_tokens", kwargs)
 
 
 class TestTwoBatchOverlapBackend(CustomTestCase):
