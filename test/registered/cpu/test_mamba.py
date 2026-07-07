@@ -252,7 +252,7 @@ def torch_gdn_gating(A_log, a, b, dt_bias):
 
 class TestMambaAttention(CustomTestCase):
     def test_chunk_gated_delta_rule(self):
-        B, T_PER_SEQ, HK, HV, K, V, N = 1, 128, 16, 32, 128, 128, 4
+        B, T_PER_SEQ, HK, HV, K, V, POOL_SIZE = 1, 128, 16, 32, 128, 128, 17
         seq_lens = torch.tensor(
             [T_PER_SEQ - 7, T_PER_SEQ + 11, T_PER_SEQ - 13, T_PER_SEQ + 9],
             dtype=torch.int32,
@@ -264,12 +264,14 @@ class TestMambaAttention(CustomTestCase):
             ]
         )
         T = cu_seqlens_[-1].item()
+        cache_indices = torch.tensor([3, 11, 15, 7], dtype=torch.int32)
+        state_slots = cache_indices
         query_ = torch.randn((B, T, HK, K), dtype=torch.bfloat16)
         key_ = torch.randn((B, T, HK, K), dtype=torch.bfloat16)
         value_ = torch.randn((B, T, HV, V), dtype=torch.bfloat16)
         g_ = F.logsigmoid(torch.randn((B, T, HV), dtype=torch.float32))
         beta_ = torch.sigmoid(torch.randn((B, T, HV), dtype=torch.bfloat16))
-        initial_state_ = torch.randn((N, HV, V, K), dtype=torch.float32) * 0.1
+        initial_state_ = torch.randn((POOL_SIZE, HV, V, K), dtype=torch.float32) * 0.1
 
         # skip `use_qk_l2norm_in_kernel=False` case since it's not numerically stable in bfloat16
         for use_qk_l2norm_in_kernel in [True]:
@@ -280,7 +282,7 @@ class TestMambaAttention(CustomTestCase):
                 g=g_,
                 beta=beta_,
                 cu_seqlens=cu_seqlens_,
-                initial_state=initial_state_,
+                initial_state=initial_state_[state_slots],
                 use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
             )
 
@@ -291,8 +293,9 @@ class TestMambaAttention(CustomTestCase):
             beta = beta_.clone()
             cu_seqlens = cu_seqlens_.clone()
             initial_state = initial_state_.clone().transpose(-1, -2).contiguous()
+            initial_state_before = initial_state.clone()
 
-            core_attn_out, last_recurrent_state = (
+            core_attn_out, returned_state = (
                 torch.ops.sgl_kernel.chunk_gated_delta_rule_cpu(
                     query=query,
                     key=key,
@@ -304,15 +307,24 @@ class TestMambaAttention(CustomTestCase):
                     cu_seqlens=cu_seqlens,
                     head_first=False,
                     use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+                    initial_state_indices=cache_indices,
                 )
             )
-            last_recurrent_state = last_recurrent_state.transpose(-1, -2).contiguous()
+            last_recurrent_state = (
+                initial_state[state_slots].transpose(-1, -2).contiguous()
+            )
+            untouched_slots = torch.ones(POOL_SIZE, dtype=torch.bool)
+            untouched_slots[state_slots] = False
             atol = rtol = precision[core_attn_out.dtype]
             torch.testing.assert_close(
                 core_attn_out, core_attn_out_ref, atol=atol, rtol=rtol
             )
             torch.testing.assert_close(
                 last_recurrent_state, last_recurrent_state_ref, atol=atol, rtol=rtol
+            )
+            torch.testing.assert_close(returned_state, initial_state)
+            torch.testing.assert_close(
+                initial_state[untouched_slots], initial_state_before[untouched_slots]
             )
 
     def test_fused_gdn_gating(self):

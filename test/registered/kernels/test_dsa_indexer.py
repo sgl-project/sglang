@@ -260,6 +260,7 @@ class MockModelRunner:
                 "dsa_prefill_backend": "flashmla_sparse",
                 "dsa_decode_backend": "fa3",
                 "dsa_topk_backend": "sgl-kernel",
+                "dsa_paged_mqa_logits_backend": "auto",
             },
         )()
         self.hisparse_coordinator = None
@@ -321,8 +322,8 @@ class TestDSAIndexer(CustomTestCase):
         params.update(kwargs)
 
         torch.set_default_dtype(self.dtype)
-        indexer = Indexer(**params)
-        # Move indexer to CUDA device
+        with torch.device(self.device):
+            indexer = Indexer(**params)
         indexer = indexer.to(device=self.device)
 
         # Convert linear layer weights to bfloat16 (but preserve LayerNorm's float32

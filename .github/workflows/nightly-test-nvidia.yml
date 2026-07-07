@@ -26,7 +26,7 @@ on:
           - 'nightly-test-specialized-8-gpu-b200'
           - 'nightly-test-perf-4-gpu-gb300'
           - 'nightly-test-kernel-1-gpu-h100'
-          - 'nightly-test-diffusion-comparison'
+          - 'nightly-test-diffusion'
           - 'nightly-test-kernel-8-gpu-h200'
           - 'nightly-test-precision-8-gpu-h200'
   workflow_call:
@@ -539,7 +539,20 @@ jobs:
   # GB300 (Grace-Blackwell NVL4) performance tests - 4 GPU (ARM64)
   nightly-test-perf-4-gpu-gb300:
     if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-perf-4-gpu-gb300')
-    runs-on: 4-gpu-gb300
+    name: nightly-test-perf-4-gpu-gb300 (${{ matrix.model }})
+    runs-on: 4-gpu-gb300-nightly
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - model: glm5-nvfp4
+            suite: nightly-4-gpu-gb300-glm5-nvfp4
+          - model: qwen35-fp8
+            suite: nightly-4-gpu-gb300-qwen35-fp8
+          - model: deepseek-v4-pro-fp4
+            suite: nightly-4-gpu-gb300-deepseek-v4-pro-fp4
+          - model: kimi-k25-nvfp4
+            suite: nightly-4-gpu-gb300-kimi-k25-nvfp4
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -549,8 +562,10 @@ jobs:
       - uses: ./.github/actions/check-maintenance
 
       - name: Install dependencies
+        env:
+          GRACE_BLACKWELL: "1"
         run: |
-          bash scripts/ci/cuda/ci_install_dependency.sh
+          bash scripts/ci/cuda/ci_install_deepep.sh
 
       - name: Run test
         timeout-minutes: 600
@@ -560,7 +575,7 @@ jobs:
           GPU_CONFIG: "4-gpu-gb300"
         run: |
           cd test
-          python3 run_suite.py --hw cuda --suite nightly-4-gpu-gb300 --nightly --continue-on-error --timeout-per-file 7200
+          python3 run_suite.py --hw cuda --suite ${{ matrix.suite }} --nightly --continue-on-error --timeout-per-file 7200
 
       - name: Publish traces to storage repo
         if: always()
@@ -613,9 +628,9 @@ jobs:
       - uses: ./.github/actions/upload-cuda-coredumps
         if: failure()
 
-  # Diffusion cross-framework comparison
-  nightly-test-diffusion-comparison:
-    if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-diffusion-comparison')
+  # SGLang-Diffusion nightly benchmark
+  nightly-test-diffusion:
+    if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-diffusion')
     runs-on: 4-gpu-h100
     timeout-minutes: 300
     steps:
@@ -628,7 +643,7 @@ jobs:
         run: |
           bash scripts/ci/cuda/ci_install_dependency.sh diffusion
 
-      - name: Run cross-framework comparison
+      - name: Run diffusion benchmark
         env:
           GITHUB_SHA: ${{ github.sha }}
           GITHUB_RUN_ID: ${{ github.run_id }}
@@ -661,11 +676,11 @@ jobs:
             --dashboard dashboard.md \
             --charts-dir comparison-charts
 
-      - name: Upload comparison artifacts
+      - name: Upload benchmark artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: diffusion-comparison-${{ github.run_id }}
+          name: diffusion-benchmark-${{ github.run_id }}
           path: |
             comparison-results.json
             dashboard.md
@@ -768,7 +783,7 @@ jobs:
       - nightly-test-perf-4-gpu-b200
       - nightly-test-specialized-8-gpu-b200
       - nightly-test-perf-4-gpu-gb300
-      - nightly-test-diffusion-comparison
+      - nightly-test-diffusion
       - nightly-test-precision-8-gpu-h200
       - consolidate-metrics
     runs-on: ubuntu-latest

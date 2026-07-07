@@ -71,28 +71,71 @@ class TestPrepareServerArgs(CustomTestCase):
             os.unlink(config_file)
 
 
+class TestMambaCacheStochasticRounding(unittest.TestCase):
+    def test_rejects_fp32_ssm_cache(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            mamba_ssm_dtype="float32",
+            enable_mamba_cache_stochastic_rounding=True,
+        )
+
+        with self.assertRaisesRegex(ValueError, "--mamba-ssm-dtype float16"):
+            server_args._handle_mamba_backend()
+
+    @patch("sglang.srt.server_args.is_cuda", return_value=False)
+    def test_rejects_non_cuda(self, _mock_is_cuda):
+        server_args = ServerArgs(
+            model_path="dummy",
+            mamba_ssm_dtype="float16",
+            enable_mamba_cache_stochastic_rounding=True,
+        )
+
+        with self.assertRaisesRegex(ValueError, "NVIDIA CUDA"):
+            server_args._handle_mamba_backend()
+
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    @patch("sglang.srt.server_args.is_sm100_supported", return_value=False)
+    def test_rejects_triton_without_sm100(self, _mock_sm100, _mock_is_cuda):
+        server_args = ServerArgs(
+            model_path="dummy",
+            mamba_ssm_dtype="float16",
+            mamba_backend="triton",
+            enable_mamba_cache_stochastic_rounding=True,
+        )
+
+        with self.assertRaisesRegex(ValueError, "requires SM100"):
+            server_args._handle_mamba_backend()
+
+
 class TestLoadBalanceMethod(unittest.TestCase):
+    def _load_balance_args(self, **kwargs):
+        server_args = ServerArgs(model_path="dummy", **kwargs)
+        server_args._handle_pd_disaggregation()
+        server_args._handle_load_balance_method()
+        return server_args
+
     def test_non_pd_defaults_to_round_robin(self):
-        server_args = ServerArgs(model_path="dummy", disaggregation_mode="null")
+        server_args = self._load_balance_args(disaggregation_mode="null")
         self.assertEqual(server_args.load_balance_method, "round_robin")
 
     def test_pd_prefill_defaults_to_follow_bootstrap_room(self):
-        server_args = ServerArgs(model_path="dummy", disaggregation_mode="prefill")
+        server_args = self._load_balance_args(disaggregation_mode="prefill")
         self.assertEqual(server_args.load_balance_method, "follow_bootstrap_room")
 
     def test_pd_decode_defaults_to_round_robin(self):
-        server_args = ServerArgs(model_path="dummy", disaggregation_mode="decode")
+        server_args = self._load_balance_args(disaggregation_mode="decode")
         self.assertEqual(server_args.load_balance_method, "round_robin")
 
     def test_pd_decode_radix_cache_rejects_hisparse(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            disaggregation_mode="decode",
+            disaggregation_decode_enable_radix_cache=True,
+            disaggregation_transfer_backend="nixl",
+            enable_hisparse=True,
+        )
         with self.assertRaises(ValueError) as context:
-            ServerArgs(
-                model_path="dummy",
-                disaggregation_mode="decode",
-                disaggregation_decode_enable_radix_cache=True,
-                disaggregation_transfer_backend="nixl",
-                enable_hisparse=True,
-            )
+            server_args._handle_pd_disaggregation()
 
         self.assertIn(
             "--disaggregation-decode-enable-radix-cache is incompatible with "
@@ -101,8 +144,7 @@ class TestLoadBalanceMethod(unittest.TestCase):
         )
 
     def test_pd_decode_radix_cache_allows_mooncake(self):
-        server_args = ServerArgs(
-            model_path="dummy",
+        server_args = self._load_balance_args(
             disaggregation_mode="decode",
             disaggregation_decode_enable_radix_cache=True,
             disaggregation_transfer_backend="mooncake",
@@ -111,13 +153,14 @@ class TestLoadBalanceMethod(unittest.TestCase):
         self.assertFalse(server_args.disable_radix_cache)
 
     def test_pd_decode_radix_cache_rejects_fake_backend(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            disaggregation_mode="decode",
+            disaggregation_decode_enable_radix_cache=True,
+            disaggregation_transfer_backend="fake",
+        )
         with self.assertRaises(ValueError) as context:
-            ServerArgs(
-                model_path="dummy",
-                disaggregation_mode="decode",
-                disaggregation_decode_enable_radix_cache=True,
-                disaggregation_transfer_backend="fake",
-            )
+            server_args._handle_pd_disaggregation()
 
         self.assertIn(
             "--disaggregation-decode-enable-radix-cache is incompatible "
@@ -126,8 +169,7 @@ class TestLoadBalanceMethod(unittest.TestCase):
         )
 
     def test_pd_decode_radix_cache_allows_ascend(self):
-        server_args = ServerArgs(
-            model_path="dummy",
+        server_args = self._load_balance_args(
             disaggregation_mode="decode",
             disaggregation_decode_enable_radix_cache=True,
             disaggregation_transfer_backend="ascend",
@@ -136,8 +178,7 @@ class TestLoadBalanceMethod(unittest.TestCase):
         self.assertFalse(server_args.disable_radix_cache)
 
     def test_pd_decode_radix_cache_allows_mooncake_tcp(self):
-        server_args = ServerArgs(
-            model_path="dummy",
+        server_args = self._load_balance_args(
             disaggregation_mode="decode",
             disaggregation_decode_enable_radix_cache=True,
             disaggregation_transfer_backend="mooncake_tcp",
@@ -148,47 +189,75 @@ class TestLoadBalanceMethod(unittest.TestCase):
 
 
 class TestHiSparseDsaBackendPolicy(unittest.TestCase):
+    # The backend selection moved to the resolution pipeline; these policy
+    # tests drive the pass through its read-only view.
+    @staticmethod
+    def _resolve(kv_cache_dtype, **kw):
+        from types import SimpleNamespace
+
+        from sglang.srt.arg_groups.overrides import (
+            ResolvedView,
+            _dsa_split_backend_resolution,
+        )
+
+        hf = SimpleNamespace(architectures=["DeepseekV32ForCausalLM"])
+        defaults = dict(
+            kv_cache_dtype=kv_cache_dtype,
+            dsa_prefill_backend=None,
+            dsa_decode_backend=None,
+            enable_hisparse=True,
+        )
+        defaults.update(kw)
+        view = ResolvedView(
+            SimpleNamespace(
+                get_model_config=lambda: SimpleNamespace(hf_config=hf), **defaults
+            )
+        )
+        with (
+            patch("sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True),
+            patch("sglang.srt.arg_groups.overrides.is_npu", return_value=False),
+            patch("sglang.srt.arg_groups.overrides.is_xpu", return_value=False),
+            patch("torch.cuda.get_device_capability", return_value=(9, 0)),
+        ):
+            declared = _dsa_split_backend_resolution(view)
+        return {
+            "dsa_prefill_backend": declared.get(
+                "dsa_prefill_backend", defaults["dsa_prefill_backend"]
+            ),
+            "dsa_decode_backend": declared.get(
+                "dsa_decode_backend", defaults["dsa_decode_backend"]
+            ),
+        }
+
     @patch("sglang.srt.server_args.is_hip", return_value=False)
     def test_hisparse_defaults_to_flashmla_sparse_on_cuda_bfloat16(self, _mock_is_hip):
-        server_args = ServerArgs(model_path="dummy", enable_hisparse=True)
+        resolved = self._resolve("bfloat16")
 
-        server_args._set_default_dsa_backends(kv_cache_dtype="bfloat16", major=9)
-
-        self.assertEqual(server_args.dsa_prefill_backend, "flashmla_sparse")
-        self.assertEqual(server_args.dsa_decode_backend, "flashmla_sparse")
+        self.assertEqual(resolved["dsa_prefill_backend"], "flashmla_sparse")
+        self.assertEqual(resolved["dsa_decode_backend"], "flashmla_sparse")
 
     @patch("sglang.srt.server_args.is_hip", return_value=False)
     def test_hisparse_defaults_to_flashmla_kv_on_cuda_fp8(self, _mock_is_hip):
-        server_args = ServerArgs(model_path="dummy", enable_hisparse=True)
+        resolved = self._resolve("fp8_e4m3")
 
-        server_args._set_default_dsa_backends(kv_cache_dtype="fp8_e4m3", major=9)
-
-        self.assertEqual(server_args.dsa_prefill_backend, "flashmla_kv")
-        self.assertEqual(server_args.dsa_decode_backend, "flashmla_kv")
+        self.assertEqual(resolved["dsa_prefill_backend"], "flashmla_kv")
+        self.assertEqual(resolved["dsa_decode_backend"], "flashmla_kv")
 
     @patch("sglang.srt.server_args.is_hip", return_value=True)
     def test_hisparse_defaults_to_tilelang_on_rocm(self, _mock_is_hip):
-        server_args = ServerArgs(model_path="dummy", enable_hisparse=True)
+        resolved = self._resolve("bfloat16")
 
-        server_args._set_default_dsa_backends(kv_cache_dtype="bfloat16", major=9)
-
-        self.assertEqual(server_args.dsa_prefill_backend, "tilelang")
-        self.assertEqual(server_args.dsa_decode_backend, "tilelang")
+        self.assertEqual(resolved["dsa_prefill_backend"], "tilelang")
+        self.assertEqual(resolved["dsa_decode_backend"], "tilelang")
 
     @patch("sglang.srt.server_args.is_hip", return_value=True)
     def test_hisparse_preserves_rocm_user_backend_and_defaults_missing_side(
         self, _mock_is_hip
     ):
-        server_args = ServerArgs(
-            model_path="dummy",
-            enable_hisparse=True,
-            dsa_prefill_backend="tilelang",
-        )
+        resolved = self._resolve("bfloat16", dsa_prefill_backend="tilelang")
 
-        server_args._set_default_dsa_backends(kv_cache_dtype="bfloat16", major=9)
-
-        self.assertEqual(server_args.dsa_prefill_backend, "tilelang")
-        self.assertEqual(server_args.dsa_decode_backend, "tilelang")
+        self.assertEqual(resolved["dsa_prefill_backend"], "tilelang")
+        self.assertEqual(resolved["dsa_decode_backend"], "tilelang")
 
     @patch("sglang.srt.server_args.is_hip", return_value=True)
     def test_hisparse_accepts_aiter_backend_on_rocm(self, _mock_is_hip):
@@ -275,7 +344,7 @@ class TestFa4PageSizeAutoForce(CustomTestCase):
         args.model_config.hf_config.dual_chunk_attention_config = None
         return args
 
-    @patch("sglang.srt.server_args.is_sm100_supported", return_value=True)
+    @patch("sglang.srt.arg_groups.overrides.is_sm100_supported", return_value=True)
     @patch("sglang.srt.server_args.ServerArgs.use_mla_backend", return_value=False)
     def test_combined_attention_backend_fa4_forces_page_size_128(
         self, _mock_mla, _mock_sm100
@@ -285,9 +354,12 @@ class TestFa4PageSizeAutoForce(CustomTestCase):
 
         args._handle_attention_backend_compatibility()
 
-        self.assertEqual(args.page_size, 128)
+        from sglang.srt.arg_groups.overrides import resolved_view
 
-    @patch("sglang.srt.server_args.is_sm100_supported", return_value=True)
+        self.assertEqual(args.page_size, 1)  # dual-apply retired: pristine
+        self.assertEqual(resolved_view(args).page_size, 128)
+
+    @patch("sglang.srt.arg_groups.overrides.is_sm100_supported", return_value=True)
     @patch("sglang.srt.server_args.ServerArgs.use_mla_backend", return_value=False)
     def test_explicit_prefill_fa4_forces_page_size_128(self, _mock_mla, _mock_sm100):
         # `--prefill-attention-backend fa4`: the previously-covered path.
@@ -295,7 +367,10 @@ class TestFa4PageSizeAutoForce(CustomTestCase):
 
         args._handle_attention_backend_compatibility()
 
-        self.assertEqual(args.page_size, 128)
+        from sglang.srt.arg_groups.overrides import resolved_view
+
+        self.assertEqual(args.page_size, 1)  # dual-apply retired: pristine
+        self.assertEqual(resolved_view(args).page_size, 128)
 
 
 class TestContextParallelServerArgs(CustomTestCase):
@@ -645,6 +720,11 @@ class TestPortArgs(unittest.TestCase):
 
 
 class TestSSLArgs(unittest.TestCase):
+    def _validate_ssl(self, **kwargs):
+        server_args = ServerArgs(model_path="dummy", **kwargs)
+        server_args._handle_ssl_validation()
+        return server_args
+
     def test_default_ssl_fields_are_none(self):
         server_args = ServerArgs(model_path="dummy")
         self.assertIsNone(server_args.ssl_keyfile)
@@ -654,19 +734,17 @@ class TestSSLArgs(unittest.TestCase):
 
     def test_ssl_keyfile_without_certfile_raises(self):
         with self.assertRaises(ValueError) as context:
-            ServerArgs(model_path="dummy", ssl_keyfile="key.pem")
+            self._validate_ssl(ssl_keyfile="key.pem")
         self.assertIn("--ssl-certfile", str(context.exception))
 
     def test_ssl_certfile_without_keyfile_raises(self):
         with self.assertRaises(ValueError) as context:
-            ServerArgs(model_path="dummy", ssl_certfile="cert.pem")
+            self._validate_ssl(ssl_certfile="cert.pem")
         self.assertIn("--ssl-keyfile", str(context.exception))
 
     @patch("os.path.isfile", return_value=True)
     def test_ssl_both_keyfile_and_certfile_accepted(self, _mock_isfile):
-        server_args = ServerArgs(
-            model_path="dummy", ssl_keyfile="key.pem", ssl_certfile="cert.pem"
-        )
+        server_args = self._validate_ssl(ssl_keyfile="key.pem", ssl_certfile="cert.pem")
         self.assertEqual(server_args.ssl_keyfile, "key.pem")
         self.assertEqual(server_args.ssl_certfile, "cert.pem")
 
@@ -684,9 +762,7 @@ class TestSSLArgs(unittest.TestCase):
 
     @patch("os.path.isfile", return_value=True)
     def test_url_returns_https_with_ssl(self, _mock_isfile):
-        server_args = ServerArgs(
-            model_path="dummy", ssl_keyfile="key.pem", ssl_certfile="cert.pem"
-        )
+        server_args = self._validate_ssl(ssl_keyfile="key.pem", ssl_certfile="cert.pem")
         self.assertTrue(server_args.url().startswith("https://"))
 
     @patch("os.path.isfile", return_value=True)
@@ -716,15 +792,12 @@ class TestSSLArgs(unittest.TestCase):
 
     @patch("os.path.isfile", return_value=True)
     def test_ssl_verify_with_ssl_no_ca(self, _mock_isfile):
-        server_args = ServerArgs(
-            model_path="dummy", ssl_keyfile="key.pem", ssl_certfile="cert.pem"
-        )
+        server_args = self._validate_ssl(ssl_keyfile="key.pem", ssl_certfile="cert.pem")
         self.assertIs(server_args.ssl_verify(), False)
 
     @patch("os.path.isfile", return_value=True)
     def test_ssl_verify_with_ssl_and_ca(self, _mock_isfile):
-        server_args = ServerArgs(
-            model_path="dummy",
+        server_args = self._validate_ssl(
             ssl_keyfile="key.pem",
             ssl_certfile="cert.pem",
             ssl_ca_certs="ca.pem",
@@ -733,18 +806,17 @@ class TestSSLArgs(unittest.TestCase):
 
     def test_ssl_ca_certs_without_certfile_raises(self):
         with self.assertRaises(ValueError) as context:
-            ServerArgs(model_path="dummy", ssl_ca_certs="ca.pem")
+            self._validate_ssl(ssl_ca_certs="ca.pem")
         self.assertIn("--ssl-ca-certs", str(context.exception))
 
     def test_ssl_keyfile_password_without_certfile_raises(self):
         with self.assertRaises(ValueError) as context:
-            ServerArgs(model_path="dummy", ssl_keyfile_password="secret")
+            self._validate_ssl(ssl_keyfile_password="secret")
         self.assertIn("--ssl-keyfile-password", str(context.exception))
 
     def test_ssl_keyfile_not_found_raises(self):
         with self.assertRaises(ValueError) as context:
-            ServerArgs(
-                model_path="dummy",
+            self._validate_ssl(
                 ssl_keyfile="/nonexistent/key.pem",
                 ssl_certfile="/nonexistent/cert.pem",
             )
@@ -753,8 +825,7 @@ class TestSSLArgs(unittest.TestCase):
     def test_ssl_certfile_not_found_raises(self):
         with tempfile.NamedTemporaryFile(suffix=".pem") as keyfile:
             with self.assertRaises(ValueError) as context:
-                ServerArgs(
-                    model_path="dummy",
+                self._validate_ssl(
                     ssl_keyfile=keyfile.name,
                     ssl_certfile="/nonexistent/cert.pem",
                 )
@@ -764,8 +835,7 @@ class TestSSLArgs(unittest.TestCase):
         with tempfile.NamedTemporaryFile(suffix=".pem") as keyfile:
             with tempfile.NamedTemporaryFile(suffix=".pem") as certfile:
                 with self.assertRaises(ValueError) as context:
-                    ServerArgs(
-                        model_path="dummy",
+                    self._validate_ssl(
                         ssl_keyfile=keyfile.name,
                         ssl_certfile=certfile.name,
                         ssl_ca_certs="/nonexistent/ca.pem",
@@ -780,14 +850,13 @@ class TestSSLArgs(unittest.TestCase):
 
     def test_enable_ssl_refresh_without_ssl_raises(self):
         with self.assertRaises(ValueError) as context:
-            ServerArgs(model_path="dummy", enable_ssl_refresh=True)
+            self._validate_ssl(enable_ssl_refresh=True)
         self.assertIn("--enable-ssl-refresh", str(context.exception))
         self.assertIn("--ssl-certfile", str(context.exception))
 
     @patch("os.path.isfile", return_value=True)
     def test_enable_ssl_refresh_with_ssl_accepted(self, _mock_isfile):
-        server_args = ServerArgs(
-            model_path="dummy",
+        server_args = self._validate_ssl(
             ssl_keyfile="key.pem",
             ssl_certfile="cert.pem",
             enable_ssl_refresh=True,
@@ -1056,7 +1125,11 @@ class TestDeepEPWaterfillArgs(CustomTestCase):
         # dummy-model path short-circuits __post_init__; invoke the handler directly.
         server_args._handle_a2a_moe()
 
-        self.assertFalse(server_args.disable_shared_experts_fusion)
+        from sglang.srt.arg_groups.overrides import resolved_view
+
+        # dual-apply retired: the fields stay pristine, the declarations win
+        self.assertTrue(server_args.disable_shared_experts_fusion)
+        self.assertFalse(resolved_view(server_args).disable_shared_experts_fusion)
         self.assertTrue(server_args.enforce_shared_experts_fusion)
 
     def test_waterfill_overrides_moe_a2a_backend_to_deepep(self):
@@ -1068,7 +1141,10 @@ class TestDeepEPWaterfillArgs(CustomTestCase):
         # dummy-model path short-circuits __post_init__; invoke the handler directly.
         server_args._handle_a2a_moe()
 
-        self.assertEqual(server_args.moe_a2a_backend, "deepep")
+        from sglang.srt.arg_groups.overrides import resolved_view
+
+        self.assertEqual(server_args.moe_a2a_backend, "none")  # pristine
+        self.assertEqual(resolved_view(server_args).moe_a2a_backend, "deepep")
         self.assertTrue(server_args.enforce_shared_experts_fusion)
 
     def test_waterfill_supports_deepep_low_latency_mode(self):
@@ -1096,8 +1172,7 @@ class TestPrefillOnlyDisableKvCache(unittest.TestCase):
       - no context-parallel attention (CP writes to the pool via set_kv_buffer),
       - no HiSparse (uses a different pool family),
       - kv_cache_dtype != fp4_e2m1 (FP4 pool is a separate allocation path).
-    All other configurations must be rejected at __post_init__ time so users
-    get a clear error before model load.
+    All other configurations must be rejected before model load.
     """
 
     def _base_kwargs(self, **overrides):
@@ -1111,47 +1186,54 @@ class TestPrefillOnlyDisableKvCache(unittest.TestCase):
         kwargs.update(overrides)
         return kwargs
 
+    def _validate_prefill_only_args(self, **overrides):
+        sa = ServerArgs(**self._base_kwargs(**overrides))
+        sa._handle_legacy_cp_arguments()
+        sa._validate_prefill_only_disable_kv_cache_args()
+        return sa
+
     def test_valid_minimal_config_constructs(self):
-        sa = ServerArgs(**self._base_kwargs())
+        sa = self._validate_prefill_only_args()
         self.assertTrue(sa.prefill_only_disable_kv_cache)
 
     def test_rejects_when_not_embedding(self):
         with self.assertRaisesRegex(ValueError, "requires --is-embedding"):
-            ServerArgs(**self._base_kwargs(is_embedding=False))
+            self._validate_prefill_only_args(is_embedding=False)
 
     def test_rejects_when_chunked_prefill_size_not_minus_one(self):
         with self.assertRaisesRegex(ValueError, "--chunked-prefill-size=-1"):
-            ServerArgs(**self._base_kwargs(chunked_prefill_size=8192))
+            self._validate_prefill_only_args(chunked_prefill_size=8192)
 
     def test_rejects_when_radix_cache_enabled(self):
         with self.assertRaisesRegex(ValueError, "--disable-radix-cache"):
-            ServerArgs(**self._base_kwargs(disable_radix_cache=False))
+            self._validate_prefill_only_args(disable_radix_cache=False)
 
     def test_rejects_attn_cp_size_greater_than_one(self):
         with self.assertRaisesRegex(ValueError, "--attn-cp-size"):
-            ServerArgs(**self._base_kwargs(attn_cp_size=2, tp_size=2))
+            self._validate_prefill_only_args(attn_cp_size=2, tp_size=2)
 
     def test_rejects_prefill_context_parallel(self):
         with self.assertRaisesRegex(ValueError, "--enable-prefill-cp"):
-            ServerArgs(**self._base_kwargs(enable_prefill_context_parallel=True))
+            self._validate_prefill_only_args(enable_prefill_context_parallel=True)
 
     def test_rejects_hisparse(self):
         with self.assertRaisesRegex(ValueError, "--enable-hisparse"):
-            ServerArgs(**self._base_kwargs(enable_hisparse=True))
+            self._validate_prefill_only_args(enable_hisparse=True)
 
     def test_rejects_fp4_kv_cache(self):
         with self.assertRaisesRegex(ValueError, "fp4_e2m1"):
-            ServerArgs(**self._base_kwargs(kv_cache_dtype="fp4_e2m1"))
+            self._validate_prefill_only_args(kv_cache_dtype="fp4_e2m1")
 
 
 class TestSessionRadixCacheServerArgs(unittest.TestCase):
     def test_requires_priority_radix_eviction_policy(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_session_radix_cache=True,
+            radix_eviction_policy="lru",
+        )
         with self.assertRaisesRegex(ValueError, "--radix-eviction-policy priority"):
-            ServerArgs(
-                model_path="dummy",
-                enable_session_radix_cache=True,
-                radix_eviction_policy="lru",
-            )
+            server_args._handle_cache_compatibility()
 
 
 class TestCudaGraphConfigDataclassAccess(CustomTestCase):
@@ -1298,6 +1380,49 @@ class TestSamplingBackendTokenOracleEnvGate(CustomTestCase):
             ]
         )
         self.assertEqual(parsed.sampling_backend, "token_oracle")
+
+
+class TestTwoBatchOverlapBackend(CustomTestCase):
+    """Non-EP DP two-batch-overlap backend requirement.
+
+    With no EP a2a backend (moe_a2a_backend='none'), --enable-two-batch-overlap
+    is only valid on the DeepSeek-V4 non-EP DP TP-MoE path (overlapping the DP
+    all_gatherv / reduce_scatterv with the other ubatch's compute), which
+    requires --enable-dp-attention. This replaced the removed opt-in
+    SGLANG_ENABLE_DP_TBO env: enabling DP TBO now needs no extra flag.
+
+    dummy-model short-circuits __post_init__, so the guard handler is invoked
+    directly (same pattern as TestDeepEPWaterfillArgs)."""
+
+    def _args(self, **overrides):
+        args = ServerArgs(model_path="dummy")
+        args.enable_two_batch_overlap = True
+        args.moe_a2a_backend = "none"
+        args.enable_dp_attention = False
+        for key, value in overrides.items():
+            setattr(args, key, value)
+        return args
+
+    def test_no_a2a_without_dp_attention_raises(self):
+        args = self._args(enable_dp_attention=False)
+        with self.assertRaisesRegex(ValueError, "enable-dp-attention"):
+            args._check_two_batch_overlap()
+
+    def test_no_a2a_with_dp_attention_ok(self):
+        # DP TBO path is valid: --enable-dp-attention + --enable-two-batch-overlap
+        # with a2a backend 'none' must NOT raise (no SGLANG_ENABLE_DP_TBO needed).
+        args = self._args(enable_dp_attention=True)
+        args._check_two_batch_overlap()
+
+    def test_ep_a2a_backend_ok_without_dp_attention(self):
+        # EP a2a path (e.g. deepep) overlaps dispatch/combine; the guard does not
+        # require dp-attention there.
+        args = self._args(moe_a2a_backend="deepep", enable_dp_attention=False)
+        args._check_two_batch_overlap()
+
+    def test_tbo_disabled_is_noop(self):
+        args = self._args(enable_two_batch_overlap=False, enable_dp_attention=False)
+        args._check_two_batch_overlap()
 
 
 if __name__ == "__main__":
