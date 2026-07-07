@@ -356,3 +356,63 @@ kimik26-fp8-mi355x-mtp-sglang:
       search-space:
         - conc-list: [1, 8, 16, 32, 64, 128, 256]
           config_file: scripts/ci/slurm/recipes/mi355x-fp8/kimik26/1k1k/1p1d-mtp.yaml
+
+# ---------------------------------------------------------------------------
+# DIAGNOSTIC Kimi-K2.6 variants for the non-MTP disagg GSM8K accuracy drop
+# (~0.88 vs single-node 0.944 while MTP passes ~0.95). Not part of the default
+# nightly signal — trigger explicitly via the workflow_dispatch `configs` input.
+# Each isolates ONE variable vs the base 1p1d.yaml / 1p1d-mtp.yaml recipes and
+# trims the perf sweep to conc=1 (only the accuracy gate matters here):
+#   * -aiterdecode : non-MTP, decode backend triton -> aiter (control: is it
+#                    the backend or the decode forward-mode path?)
+#   * -nocudagraph : non-MTP + --disable-cuda-graph (is it HIP graph
+#                    capture/replay over the transferred prefix?)
+#   * -mtp-specdecode : MTP + --speculative-attention-mode decode (does routing
+#                    verify through the decode-mode path break MTP too?)
+kimik26-fp8-mi355x-aiterdecode-sglang:
+  model: moonshotai/Kimi-K2.6
+  model-prefix: kimik26
+  model_path: /it-share/model_coverage/models--moonshotai--Kimi-K2.6
+  runner: mi355x
+  precision: fp8
+  framework: sglang
+  multinode: true
+  disagg: true
+  seq-len-configs:
+    - isl: 1024
+      osl: 1024
+      search-space:
+        - conc-list: [1]
+          config_file: scripts/ci/slurm/recipes/mi355x-fp8/kimik26/1k1k/1p1d-aiterdecode.yaml
+
+kimik26-fp8-mi355x-nocudagraph-sglang:
+  model: moonshotai/Kimi-K2.6
+  model-prefix: kimik26
+  model_path: /it-share/model_coverage/models--moonshotai--Kimi-K2.6
+  runner: mi355x
+  precision: fp8
+  framework: sglang
+  multinode: true
+  disagg: true
+  seq-len-configs:
+    - isl: 1024
+      osl: 1024
+      search-space:
+        - conc-list: [1]
+          config_file: scripts/ci/slurm/recipes/mi355x-fp8/kimik26/1k1k/1p1d-nocudagraph.yaml
+
+kimik26-fp8-mi355x-mtp-specdecode-sglang:
+  model: moonshotai/Kimi-K2.6
+  model-prefix: kimik26
+  model_path: /it-share/model_coverage/models--moonshotai--Kimi-K2.6
+  runner: mi355x
+  precision: fp8
+  framework: sglang
+  multinode: true
+  disagg: true
+  seq-len-configs:
+    - isl: 1024
+      osl: 1024
+      search-space:
+        - conc-list: [1]
+          config_file: scripts/ci/slurm/recipes/mi355x-fp8/kimik26/1k1k/1p1d-mtp-specdecode.yaml

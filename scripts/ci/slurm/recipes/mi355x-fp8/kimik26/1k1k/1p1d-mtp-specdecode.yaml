@@ -1,0 +1,94 @@
+# MI355X Kimi-K2.6 (FP8) 2-node 1P1D disaggregation recipe (DIAGNOSTIC:
+# EAGLE3 MTP with speculative_attention_mode=decode).
+#
+# Purpose: decide the AXIS of the non-MTP disagg accuracy drop. Same as
+# 1p1d-mtp.yaml (which passes at ~0.95) except --speculative-attention-mode
+# decode. By default MTP verify runs on the PREFILL backend
+# (speculative_attention_mode=prefill); forcing "decode" routes target_verify
+# through the SAME decode-mode path that plain non-MTP decode uses
+# (dispatch_attn_forward_method -> decode backend). If this variant now ALSO
+# drops to ~0.88, it proves the regression lives on the decode forward-mode
+# path (metadata / graph over the MORI-transferred prefix), independent of
+# MTP vs non-MTP and independent of the attention backend.
+#
+# Consumed by:
+#   * scripts/ci/slurm/process_result.py reads `resources` and
+#     `backend.sglang_config` (TP/EP/DP + worker counts) for the summary table.
+#   * scripts/ci/slurm/launch_mi355x.sh reads `runtime`, `bench`, `model`, `mtp`.
+
+resources:
+  prefill_workers: 1
+  decode_workers: 1
+
+backend:
+  sglang_config:
+    prefill:
+      tensor-parallel-size: 8
+      expert-parallel-size: 1
+      data-parallel-size: 1
+    decode:
+      tensor-parallel-size: 8
+      expert-parallel-size: 1
+      data-parallel-size: 1
+
+# Model-specific docker env + sglang server args (written verbatim via
+# model_flags.sh). Each server arg + value is a SEPARATE list item.
+model:
+  env:
+    SGLANG_USE_AITER: 1
+    SGLANG_ROCM_FUSED_DECODE_MLA: 0
+  server_args:
+    - --model-loader-extra-config
+    - '{"enable_multithread_load": true}'
+    - --watchdog-timeout
+    - 1200
+    - --reasoning-parser
+    - kimi_k2
+    - --tool-call-parser
+    - kimi_k2
+    # DIAGNOSTIC: route MTP target_verify through the decode-mode attention
+    # path (default is "prefill").
+    - --speculative-attention-mode
+    - decode
+
+# EAGLE3 speculative decoding with an external draft checkpoint.
+mtp:
+  enabled: true
+  algorithm: EAGLE3
+  num_steps: 3
+  eagle_topk: 1
+  num_draft_tokens: 4
+  draft_model_path: /it-share/model_coverage/models--lightseekorg--kimi-k2.6-eagle3.1-mla
+
+runtime:
+  image: lmsysorg/sglang-rocm:v0.5.13.post1-rocm720-mi35x-20260623
+  # Kimi uses split attention backends (aiter prefill / triton decode), not a
+  # single --attention-backend.
+  prefill_attention_backend: aiter
+  decode_attention_backend: triton
+  # RoCE HCAs MORI uses for cross-node KV transfer.
+  ib_devices: rdma0,rdma1,rdma2,rdma3
+  prefill_port: 30025
+  decode_port: 30026
+  prefill_bootstrap_port: 8998
+  decode_bootstrap_port: 9001
+  lb_port: 8000
+  mem_fraction_static: 0.90
+  page_size: 256
+  max_running_requests: 256
+  chunked_prefill_size: 8192
+
+bench:
+  # Diagnostic run: only the GSM8K accuracy gate matters, so the perf sweep is
+  # trimmed to a single concurrency to keep the cluster allocation short.
+  concurrencies: [1]
+  num_prompts_factor: 4      # num-prompts = concurrency * factor
+  random_range_ratio: 1.0
+
+  # Correctness gate run through the PD path before the perf sweep. Mirrors the
+  # registered single-node Kimi-K2.6 eval (full GSM8K, 8-shot, accuracy > 0.92).
+  accuracy:
+    enabled: true
+    num_shots: 8
+    num_questions: 1319    # full GSM8K test set
+    threshold: 0.92
