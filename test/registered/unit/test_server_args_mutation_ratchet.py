@@ -25,10 +25,10 @@ import re
 import unittest
 from pathlib import Path
 
-import sglang.srt
+import sglang
 from sglang.test.test_utils import CustomTestCase
 
-_SRT_ROOT = Path(next(iter(sglang.srt.__path__)))
+_SGLANG_ROOT = Path(next(iter(sglang.__path__)))
 
 # Assignments to a server_args attribute (``server_args.x = ...``,
 # ``self.server_args.x = ...``, and the ``sa`` alias used by a few helpers).
@@ -40,8 +40,16 @@ _MUTATION_PATTERNS = [
     re.compile(r"get_(?:global_)?server_args\(\)\.[a-z0-9_]+\s*=(?![=}])"),
 ]
 
-# The resolution pipeline itself: mutation is its job.
-_PIPELINE = ("server_args.py", "arg_groups")
+# The resolution pipeline itself (mutation is its job); multimodal_gen, whose
+# ServerArgs is a different class outside this contract; and the sanctioned
+# mock-fixture factory (bare object.__new__ instances never materialize, so
+# the strict guard does not apply to their construction).
+_EXCLUDED = (
+    "srt/server_args.py",
+    "srt/arg_groups",
+    "multimodal_gen",
+    "test/kits/attention_unittest/mock_server_args.py",
+)
 
 _BASELINE = 0
 
@@ -49,9 +57,9 @@ _BASELINE = 0
 class TestServerArgsMutationRatchet(CustomTestCase):
     def test_out_of_pipeline_mutations_match_the_baseline(self):
         count = 0
-        for path in sorted(_SRT_ROOT.rglob("*.py")):
-            rel = path.relative_to(_SRT_ROOT)
-            if rel.parts[0] in _PIPELINE:
+        for path in sorted(_SGLANG_ROOT.rglob("*.py")):
+            rel = path.relative_to(_SGLANG_ROOT).as_posix()
+            if rel.startswith(_EXCLUDED):
                 continue
             source = path.read_text()
             count += sum(len(p.findall(source)) for p in _MUTATION_PATTERNS)
