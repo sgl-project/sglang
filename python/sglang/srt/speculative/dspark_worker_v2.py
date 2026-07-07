@@ -2651,6 +2651,9 @@ class DSparkWorkerV2(BaseSpecWorker):
     def _forward_prefill(
         self, model_worker_batch: ScheduleBatch, on_publish
     ) -> GenerationBatchResult:
+        if self._is_dp_idle_sync_batch(model_worker_batch):
+            return self._forward_dp_idle_sync(model_worker_batch, on_publish)
+
         model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
         batch_output = self.target_worker.forward_batch_generation(model_worker_batch)
 
@@ -2822,7 +2825,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
         if model_worker_batch.forward_mode.is_idle() and not participates_in_dp_decode:
             return self._forward_idle(on_publish)
-        if participates_in_dp_decode and model_worker_batch.batch_size() == 0:
+        if self._is_dp_idle_sync_batch(model_worker_batch):
             return self._forward_dp_idle_sync(model_worker_batch, on_publish)
         dp_decode_global_num_tokens = self._get_dp_decode_global_num_tokens(
             model_worker_batch
@@ -3173,6 +3176,15 @@ class DSparkWorkerV2(BaseSpecWorker):
             can_run_cuda_graph=False,
             speculative_num_draft_tokens=int(self.verify_stride),
             new_seq_lens=next_draft_input.new_seq_lens,
+        )
+
+    def _is_dp_idle_sync_batch(self, model_worker_batch: ScheduleBatch) -> bool:
+        return (
+            self.server_args.enable_dp_attention
+            and model_worker_batch.forward_mode.is_idle()
+            and model_worker_batch.batch_size() == 0
+            and model_worker_batch.global_num_tokens is not None
+            and any(int(x) > 0 for x in model_worker_batch.global_num_tokens)
         )
 
     def _forward_dp_idle_sync(

@@ -801,6 +801,33 @@ class TestDSparkPrefillHandoff(CustomTestCase):
         self.assertIs(batch.spec_info, spec_info)
         self.assertEqual(batch.capture_hidden_mode, CaptureHiddenMode.FULL)
 
+    def test_prefill_idle_dp_sync_bypasses_target_prefill(self):
+        from sglang.srt.managers.utils import GenerationBatchResult
+        from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+
+        calls = []
+        worker = self._worker(0)
+        worker.server_args = SimpleNamespace(enable_dp_attention=True)
+        worker._forward_dp_idle_sync = lambda batch, on_publish: calls.append(
+            (batch, on_publish)
+        ) or GenerationBatchResult()
+        worker._target_worker = SimpleNamespace(
+            forward_batch_generation=lambda batch: (_ for _ in ()).throw(
+                AssertionError("idle prefill sync must not run target prefill")
+            )
+        )
+        batch = SimpleNamespace(
+            forward_mode=SimpleNamespace(is_idle=lambda: True),
+            batch_size=lambda: 0,
+            global_num_tokens=[0, 1024],
+            capture_hidden_mode=CaptureHiddenMode.FULL,
+        )
+
+        result = self.worker_cls._forward_prefill(worker, batch, on_publish="publish")
+
+        self.assertIsInstance(result, GenerationBatchResult)
+        self.assertEqual(calls, [(batch, "publish")])
+
     def test_prefill_tail_hidden_packs_variable_length_batch(self):
         t = self.torch
         hidden = t.arange(10 * 2, dtype=t.float32).view(10, 2)
