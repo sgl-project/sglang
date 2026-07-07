@@ -354,7 +354,10 @@ class TestFa4PageSizeAutoForce(CustomTestCase):
 
         args._handle_attention_backend_compatibility()
 
-        self.assertEqual(args.page_size, 128)
+        from sglang.srt.arg_groups.overrides import resolved_view
+
+        self.assertEqual(args.page_size, 1)  # dual-apply retired: pristine
+        self.assertEqual(resolved_view(args).page_size, 128)
 
     @patch("sglang.srt.arg_groups.overrides.is_sm100_supported", return_value=True)
     @patch("sglang.srt.server_args.ServerArgs.use_mla_backend", return_value=False)
@@ -364,7 +367,10 @@ class TestFa4PageSizeAutoForce(CustomTestCase):
 
         args._handle_attention_backend_compatibility()
 
-        self.assertEqual(args.page_size, 128)
+        from sglang.srt.arg_groups.overrides import resolved_view
+
+        self.assertEqual(args.page_size, 1)  # dual-apply retired: pristine
+        self.assertEqual(resolved_view(args).page_size, 128)
 
 
 class TestContextParallelServerArgs(CustomTestCase):
@@ -1119,7 +1125,11 @@ class TestDeepEPWaterfillArgs(CustomTestCase):
         # dummy-model path short-circuits __post_init__; invoke the handler directly.
         server_args._handle_a2a_moe()
 
-        self.assertFalse(server_args.disable_shared_experts_fusion)
+        from sglang.srt.arg_groups.overrides import resolved_view
+
+        # dual-apply retired: the fields stay pristine, the declarations win
+        self.assertTrue(server_args.disable_shared_experts_fusion)
+        self.assertFalse(resolved_view(server_args).disable_shared_experts_fusion)
         self.assertTrue(server_args.enforce_shared_experts_fusion)
 
     def test_waterfill_overrides_moe_a2a_backend_to_deepep(self):
@@ -1131,7 +1141,10 @@ class TestDeepEPWaterfillArgs(CustomTestCase):
         # dummy-model path short-circuits __post_init__; invoke the handler directly.
         server_args._handle_a2a_moe()
 
-        self.assertEqual(server_args.moe_a2a_backend, "deepep")
+        from sglang.srt.arg_groups.overrides import resolved_view
+
+        self.assertEqual(server_args.moe_a2a_backend, "none")  # pristine
+        self.assertEqual(resolved_view(server_args).moe_a2a_backend, "deepep")
         self.assertTrue(server_args.enforce_shared_experts_fusion)
 
     def test_waterfill_supports_deepep_low_latency_mode(self):

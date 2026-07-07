@@ -1,6 +1,4 @@
 import torch
-from sgl_kernel import kimi_k2_moe_fused_gate as aot_kimi_k2_gate
-from sgl_kernel import moe_fused_gate as aot_moe_fused_gate
 
 from sglang.jit_kernel.benchmark import marker
 from sglang.jit_kernel.benchmark.utils import create_random
@@ -14,10 +12,6 @@ register_cuda_ci(
 
 TOPK = 8
 SCALE = 2.5
-# AOT moe_fused_gate requires experts_per_group <= 32, so split experts into
-# groups of 32 and select every group (topk_group == num_expert_group) to get a
-# flat top-k. The 384-expert (3x128) layout uses the dedicated Kimi-K2 kernel.
-AOT_GROUP_SIZE = 32
 
 
 @torch.compile
@@ -37,7 +31,7 @@ def torch_router(scores, bias, topk, scoring_func):
 @marker.parametrize("scoring_func", ["sigmoid", "sqrtsoftplus"])
 @marker.parametrize("num_experts", [128, 256, 384, 512], [256, 384])
 @marker.parametrize("num_tokens", [1, 4, 16, 64, 512, 1024, 8192], [16, 1024])
-@marker.benchmark("provider", ["triton", "jit", "aot", "torch"])
+@marker.benchmark("provider", ["triton", "jit", "torch"])
 def benchmark(num_tokens: int, num_experts: int, scoring_func: str, provider: str):
     torch.manual_seed(0)
     scores = create_random(num_tokens, num_experts, dtype=torch.float32)
@@ -61,35 +55,6 @@ def benchmark(num_tokens: int, num_experts: int, scoring_func: str, provider: st
     if provider == "torch":
         return marker.do_bench(
             torch_router, input_args=(scores, bias, TOPK, scoring_func)
-        )
-    if provider == "aot":
-        # The AOT CUDA kernels only implement sigmoid scoring.
-        if scoring_func != "sigmoid":
-            marker.skip("AOT kernel supports sigmoid only")
-        if num_experts == 384:  # 3 groups of 128 -> dedicated Kimi-K2 kernel
-            return marker.do_bench(
-                aot_kimi_k2_gate,
-                input_args=(scores, bias),
-                input_kwargs=dict(
-                    topk=TOPK,
-                    renormalize=True,
-                    routed_scaling_factor=SCALE,
-                    apply_routed_scaling_factor_on_output=True,
-                ),
-            )
-        num_group = max(num_experts // AOT_GROUP_SIZE, 1)
-        return marker.do_bench(
-            aot_moe_fused_gate,
-            input_args=(
-                scores,
-                bias,
-                num_group,
-                num_group,
-                TOPK,
-                0,  # num_fused_shared_experts
-                SCALE,
-                True,  # apply_routed_scaling_factor_on_output
-            ),
         )
     raise ValueError(f"unknown provider: {provider}")
 
