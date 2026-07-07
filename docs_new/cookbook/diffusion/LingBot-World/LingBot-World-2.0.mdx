@@ -1,0 +1,46 @@
+---
+title: LingBot World 2.0
+sidebarTitle: LingBot World 2.0
+description: "Serve LingBot World 2.0 realtime camera-controlled video world models with SGLang-diffusion."
+metatags:
+    description: "Serve LingBot World 2.0 realtime camera-controlled video world models with SGLang-diffusion."
+tag: "COMING SOON"
+---
+
+## 1. Model introduction
+
+LingBot World 2.0 uses the same SGLang realtime causal DMD serving path as [LingBot World](/cookbook/diffusion/LingBot-World/LingBot-World). It keeps the `LingBotWorldCausalDMDPipeline` pipeline and realtime WebSocket API, while selecting the 2.0 pipeline config from the model id.
+
+Compared with `robbyant/lingbot-world-fast-diffusers`, the 2.0 config uses:
+
+| Setting | Value |
+| --- | --- |
+| Model id | `robbyant/lingbot-world-v2-diffusers` |
+| DMD denoising steps | `[1000, 750, 500, 250]` |
+| Flow shift | `5.0` |
+
+<Note>
+The LingBot World 2.0 checkpoint is coming soon. Use this command once the Hugging Face repository is available.
+</Note>
+
+## 2. Deployment
+
+```bash Command
+sglang serve \
+  --model-path robbyant/lingbot-world-v2-diffusers \
+  --pipeline-class-name LingBotWorldCausalDMDPipeline \
+  --num-gpus 4 \
+  --ulysses-degree 4 \
+  --dit-cpu-offload false \
+  --text-encoder-cpu-offload false \
+  --vae-config.use-parallel-decode true \
+  --vae-config.parallel-decode-mode spatial \
+  --enable-torch-compile false
+```
+
+## 3. Realtime WebUI and API
+
+LingBot World 2.0 uses the same realtime WebUI and WebSocket endpoint as LingBot World:
+
+- WebUI: [LingBot World realtime WebUI](/cookbook/diffusion/LingBot-World/LingBot-World#3-realtime-webui)
+- API: [LingBot World HTTP and WebSocket API](/cookbook/diffusion/LingBot-World/LingBot-World#4-http-and-websocket-api)
