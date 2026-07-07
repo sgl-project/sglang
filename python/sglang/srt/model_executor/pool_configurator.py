@@ -532,7 +532,13 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 f"layers=[{mr.start_layer},{mr.end_layer}) "
                 f"local={len(self.compression_ratios)}/{len(cfg.compress_ratios)}"
             )
-        self.swa_page_size = cfg.window_size
+        # State pools are addressed at runtime by the pool's SWA *storage* page
+        # size (server_args.page_size, 256), not the model's SWA window
+        # (cfg.window_size, 128). See DeepSeekV4TokenToKVPool(swa_page_size=...)
+        # and CompressStatePool.translate_from_swa_loc_to_state_loc, which both
+        # divide swa_loc by page_size. Sizing the c4 state pool by window_size
+        # (128) instead over-allocates it ~2x and inflates bytes_per_full_token.
+        self.swa_storage_page_size = mr.server_args.page_size
         self.swa_ratio = mr.server_args.swa_full_tokens_ratio
         self.is_speculative = mr.server_args.speculative_algorithm is not None
         self.online_c128_mtp_max_draft_tokens = (
@@ -628,7 +634,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         )
         c4_indexer_state_bytes = 2 * 2 * self.indexer_head_dim * c4_state_dtype_size
 
-        c4_state_ratio = self.c4_ring_size / self.swa_page_size
+        c4_state_ratio = self.c4_ring_size / self.swa_storage_page_size
         # C128 state is request-scoped and is finalized after
         # max_running_requests is known, so it should not scale with
         # full-token capacity here.
@@ -656,7 +662,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             swa_max_total_num_tokens=swa_tokens,
             c4_max_total_num_tokens=full_token // (4 * self.c4_shrink_factor),
             c128_max_total_num_tokens=full_token // 128,
-            c4_state_pool_size=swa_tokens // self.swa_page_size * self.c4_ring_size,
+            c4_state_pool_size=swa_tokens // self.swa_storage_page_size * self.c4_ring_size,
             c128_state_pool_size=0,
         )
 
