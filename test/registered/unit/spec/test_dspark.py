@@ -6,6 +6,7 @@ import sys
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from sglang.srt.arg_groups.speculative_hook import _handle_dspark
 from sglang.srt.speculative.spec_info import SpecInputType, SpeculativeAlgorithm
@@ -116,6 +117,25 @@ class TestHandleDspark(CustomTestCase):
         )
 
         self.assertEqual(get_req_to_token_extra_context_len(args), 12)
+
+    def test_spec_prepare_routes_dspark_to_draft_input_prepare(self):
+        from sglang.srt.speculative.spec_utils import spec_prepare_for_decode
+
+        calls = []
+        spec_info = SimpleNamespace(prepare_for_decode=lambda batch: calls.append(batch))
+        spec_algorithm = SimpleNamespace(
+            is_dflash=lambda: False,
+            is_dspark=lambda: True,
+        )
+        batch = SimpleNamespace(spec_algorithm=spec_algorithm, spec_info=spec_info)
+
+        with patch(
+            "sglang.srt.speculative.eagle_utils.eagle_prepare_for_decode",
+            side_effect=AssertionError("DSpark must not use EAGLE prepare"),
+        ):
+            spec_prepare_for_decode(batch)
+
+        self.assertEqual(calls, [batch])
 
     def test_overrides_steps_and_topk_but_preserves_explicit_max_requests(self):
         args = _make_server_args(
