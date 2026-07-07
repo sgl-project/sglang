@@ -910,6 +910,12 @@ class Envs:
     # Eager forward wraps the ForwardBatch's own tensors instead of copying them
     # into the CUDA graph buffer registry (no per-iter device-to-device copy).
     SGLANG_EAGER_INPUT_NO_COPY = EnvBool(False)
+    # Apply the same no-copy wrap while a graph runner is capturing
+    # (model_capture_mode). The multi-step spec-draft loops route each per-step
+    # forward through the eager path during capture, so staging would bake
+    # per-step copy kernels into the graph that re-read the same graph-stable
+    # sources the wrap exposes directly.
+    SGLANG_EAGER_INPUT_NO_COPY_IN_CAPTURE = EnvBool(True)
 
     # Distributed
     SGLANG_DSV4_FIX_TP_ATTN_A2A_SCATTER = EnvBool(True)
