@@ -237,13 +237,22 @@ class DeepseekModelNextN(nn.Module):
                     residual,
                     zero_allocator,
                     prev_topk_indices=(
-                        forward_batch.spec_info.mtp_topk_indices
-                        if forward_batch.reuse_mtp_topk_indices
+                        forward_batch.spec_info.dsa_topk_indices
+                        if forward_batch.reuse_dsa_topk_indices
                         else None
                     ),
                 )
-                if forward_batch.reuse_mtp_topk_indices:
-                    forward_batch.spec_info.mtp_topk_indices = topk_indices
+                if forward_batch.reuse_dsa_topk_indices:
+                    forward_batch.spec_info.dsa_topk_indices = topk_indices
+
+                # MTP IndexShare: on draft-extend, publish the last-token DSA
+                # indexer top-k to seed (avoid recomputing in) the draft-decode loop.
+                if forward_batch.forward_mode.is_extend(include_draft_extend_v2=True):
+                    seed_buf = forward_batch.spec_info.dsa_seed_topk_capture
+                    if seed_buf is not None and topk_indices is not None:
+                        sel = forward_batch.spec_info.dsa_seed_topk_select
+                        src = topk_indices if sel is None else topk_indices[sel]
+                        seed_buf[: src.shape[0]].copy_(src)
 
             if not forward_batch.forward_mode.is_idle():
                 if residual is not None:

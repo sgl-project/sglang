@@ -265,6 +265,8 @@ FP4_GEMM_RUNNER_BACKEND_CHOICES = [
     "marlin",
 ]
 
+BF16_GEMM_BACKEND_CHOICES = ["auto", "cutedsl"]
+
 RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru", "priority"]
 
 RL_ON_POLICY_TARGET_CHOICES = ["fsdp"]
@@ -292,6 +294,8 @@ DSA_CHOICES = [
 NSA_CHOICES = DSA_CHOICES  # deprecated alias
 
 DSA_TOPK_BACKEND_CHOICES = ["sgl-kernel", "torch", "flashinfer"]
+
+DSA_PAGED_MQA_LOGITS_BACKEND_CHOICES = ["auto", "deepgemm", "cutedsl", "aiter"]
 
 MAMBA_RADIX_CACHE_STRATEGY_CHOICES = [
     "auto",
@@ -1346,6 +1350,14 @@ class ServerArgs:
             choices=FP4_GEMM_RUNNER_BACKEND_CHOICES,
         ),
     ] = "auto"
+    bf16_gemm_backend: A[
+        str,
+        Arg(
+            help="Choose the backend for unquantized BF16 GEMM operations. Options: 'auto' (default; uses cuBLAS via torch.nn.functional.linear), 'cutedsl' (SGLang JIT CuTe DSL TGV BF16 GEMM on SM10X; dispatches between the CuTe DSL kernel and cuBLAS).",
+            cli_name="--bf16-gemm-backend",
+            choices=BF16_GEMM_BACKEND_CHOICES,
+        ),
+    ] = "auto"
     dsa_prefill_backend: A[
         Optional[str],
         Arg(
@@ -1362,6 +1374,13 @@ class ServerArgs:
             resolvable=True,
         ),
     ] = None
+    dsa_paged_mqa_logits_backend: A[
+        str,
+        Arg(
+            help="DSA indexer paged MQA logits kernel backend. Options: 'auto' (default; DeepGEMM on CUDA, aiter on ROCm), 'deepgemm', 'cutedsl' (CuTe DSL kernel, SM 100 (Blackwell) only; wins at low batch size and long context), 'aiter' (ROCm only).",
+            choices=DSA_PAGED_MQA_LOGITS_BACKEND_CHOICES,
+        ),
+    ] = "auto"
     dsa_topk_backend: A[
         str,
         Arg(
