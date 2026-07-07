@@ -26,7 +26,7 @@ from mori.io import (
     StatusCode,
 )
 
-from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll
+from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, KVTransferMetric
 from sglang.srt.disaggregation.common.conn import (
     CommonKVBootstrapServer,
     CommonKVManager,
@@ -1412,7 +1412,11 @@ class MoriKVSender(CommonKVSender):
         self._notify_lock = threading.Lock()
         self._notified_status: Optional[KVPoll] = None
         self._notified_reason: Optional[str] = None
-        self._transfer_start_time: Optional[float] = None
+        # Per-chunk transfer accounting for the byte-weighted average bandwidth:
+        # bytes actually moved and active transfer time summed across chunks
+        # (inter-chunk idle excluded). Consumed by get_transfer_metric().
+        self._chunk_bytes_sum = 0
+        self._chunk_transfer_time_s = 0.0
 
     def send(
         self,
@@ -1424,11 +1428,6 @@ class MoriKVSender(CommonKVSender):
         )
         if should_skip:
             return
-
-        if self._transfer_start_time is None and (
-            len(kv_indices) > 0 or state_indices is not None
-        ):
-            self._transfer_start_time = time.perf_counter()
 
         normalized_state = (
             _normalize_state_indices_per_component(state_indices)
@@ -1457,6 +1456,23 @@ class MoriKVSender(CommonKVSender):
         if self.kv_mgr.request_status.get(self.bootstrap_room) == KVPoll.Failed:
             self._finalize_failure()
 
+    def _chunk_transfer_bytes(self, task: _TransferChunk) -> int:
+        """Bytes moved by a single chunk (kv + state), mirroring the totals in
+        CommonKVSender.get_transfer_metric / _record_transfer_indices."""
+        total = len(task.kv_indices) * self.kv_mgr.kv_item_lens_sum
+        if task.normalized_state:
+            for component_indices in task.normalized_state:
+                if component_indices is not None:
+                    total += len(component_indices) * self.kv_mgr.state_item_lens_sum
+        return total
+
+    def get_transfer_metric(self) -> KVTransferMetric:
+        metric = super().get_transfer_metric()
+        if self._chunk_transfer_time_s > 0 and self._chunk_bytes_sum > 0:
+            gb = self._chunk_bytes_sum / (1024**3)
+            metric.avg_chunk_bandwidth_gb_s = gb / self._chunk_transfer_time_s
+        return metric
+
     def _run_chunk(self, task: _TransferChunk) -> None:
         if self.conclude_state is not None:
             return
@@ -1469,6 +1485,7 @@ class MoriKVSender(CommonKVSender):
         if task.wait_event is not None:
             task.wait_event.synchronize()
 
+        chunk_start = time.perf_counter()
         statuses, infos = self.kv_mgr.add_transfer_request(
             self.bootstrap_room,
             task.kv_indices,
@@ -1491,14 +1508,16 @@ class MoriKVSender(CommonKVSender):
         if rc != StatusCode.SUCCESS:
             self._finalize_failure(self._collect_failure_reason())
             return
+        # Successful chunk: accumulate bytes moved + active transfer time for the
+        # byte-weighted per-chunk average bandwidth (see get_transfer_metric()).
+        # Skip empty/aux-only chunks (0 KV+state bytes) so they don't add time
+        # without bytes and deflate the average.
+        chunk_elapsed = time.perf_counter() - chunk_start
+        chunk_bytes = self._chunk_transfer_bytes(task)
+        if chunk_elapsed > 0 and chunk_bytes > 0:
+            self._chunk_bytes_sum += chunk_bytes
+            self._chunk_transfer_time_s += chunk_elapsed
         if task.is_last_chunk:
-            if (
-                self._transfer_start_time is not None
-                and self._transfer_metric.transfer_latency_s is None
-            ):
-                self._transfer_metric.transfer_latency_s = (
-                    time.perf_counter() - self._transfer_start_time
-                )
             self._notify_decode(KVPoll.Success)
             with self._notify_lock:
                 if self.conclude_state is None:
@@ -1562,13 +1581,6 @@ class MoriKVSender(CommonKVSender):
             return sent_status
 
         if status == KVPoll.Success:
-            if (
-                self._transfer_start_time is not None
-                and self._transfer_metric.transfer_latency_s is None
-            ):
-                self._transfer_metric.transfer_latency_s = (
-                    time.perf_counter() - self._transfer_start_time
-                )
             self.conclude_state = KVPoll.Success
             return KVPoll.Success
 

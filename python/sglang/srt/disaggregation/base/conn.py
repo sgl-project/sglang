@@ -33,6 +33,13 @@ class KVTransferMetric:
     # Backends that cannot isolate allocation wait latency can leave this as None.
     alloc_latency_s: Optional[float] = None
     transfer_total_bytes: Optional[int] = None
+    # Backends that time each chunk's actual RDMA transfer can report the
+    # byte-weighted average per-chunk bandwidth here (GB/s): total bytes moved
+    # divided by total *active* per-chunk transfer time. Unlike a speed derived
+    # from total_bytes / end-to-end latency, this excludes inter-chunk idle
+    # (waiting on the next prefill chunk), so it reflects true NIC throughput.
+    # None if the backend cannot measure per-chunk timing.
+    avg_chunk_bandwidth_gb_s: Optional[float] = None
 
 
 class KVArgs:
