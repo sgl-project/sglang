@@ -1736,6 +1736,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Staging consumed by resolve_forward_inputs (prefill H2D / mixed gather).
     prefill_input_ids_cpu: Optional[torch.Tensor] = None
     mix_running_indices: Optional[torch.Tensor] = None
+    # Set by mix_with_running: number of decode tokens appended after the
+    # prefill tokens (one per running request).
+    num_mixed_decode_tokens: Optional[int] = None
     input_embeds: torch.Tensor = None  # shape: [b, hidden_size], float32
 
     # Token replacement embeddings and absolute positions (optional).
@@ -2402,6 +2405,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # Decode tokens of the running portion live in future_map.output_tokens_buf.
         self.input_ids = None
         self.mix_running_indices = running_batch.req_pool_indices
+        self.num_mixed_decode_tokens = running_bs
         out_cache_loc = torch.cat([self.out_cache_loc, running_batch.out_cache_loc])
 
         self.merge_batch(running_batch)
