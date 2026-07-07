@@ -9,22 +9,9 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.speculative.eagle_info_v2 import EagleDraftInputV2Mixin
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 
 logger = logging.getLogger(__name__)
-
-
-def _draft_runner_of(worker):
-    """Draft model_runner accessor across worker shapes.
-
-    v2 draft workers (`EagleDraftWorker` and subclasses) expose the draft
-    model_runner as `draft_runner`; fall back to `model_runner` for workers
-    that run the draft model directly.
-    """
-    return (
-        worker.draft_runner if hasattr(worker, "draft_runner") else worker.model_runner
-    )
 
 
 @dataclass
@@ -155,7 +142,7 @@ class EagleVerifyInput(SpecInput):
 
 
 @dataclass
-class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
+class EagleDraftInput(SpecInput):
     # For idle stubs use `create_idle_input`, not the bare ctor: `filter_batch`
     # / `merge_batch` slice / cat `topk_p` / `topk_index` / `hidden_states` /
     # `bonus_tokens` unconditionally.
@@ -171,6 +158,10 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     # (e.g., STANDALONE — vanilla LLM draft).
     hidden_states: Optional[torch.Tensor] = None
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.FULL
+
+    # Survives across draft steps: spec_info is shared by reference across the
+    # per-step forwards (each runs on a copied ForwardBatch, dropping writebacks).
+    dsa_topk_indices: Optional[torch.Tensor] = None
 
     # Per-req bonus token (the "+1" target prediction at end of each accept
     # chain); the worker copies it here post-extend for next iter's draft.
@@ -191,22 +182,6 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
 
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
         return self.num_tokens_per_req, self.num_tokens_for_logprob_per_req
-
-    @classmethod
-    def hidden_size_for(cls, worker) -> Optional[int]:
-        """Decode-phase `hidden_states` width: draft self-chain output
-        (draft model writes its own last hidden back via `capture_for_decode`
-        and the draft loop). Returns None when the draft architecture doesn't
-        consume the field (e.g., STANDALONE)."""
-        if worker.speculative_algorithm.is_standalone():
-            return None
-        return _draft_runner_of(worker).model_config.spec_hidden_size
-
-    @classmethod
-    def dtype_for(cls, worker) -> Optional[torch.dtype]:
-        if worker.speculative_algorithm.is_standalone():
-            return None
-        return _draft_runner_of(worker).model_config.dtype
 
     @classmethod
     def create_idle_input(
@@ -258,6 +233,8 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             if self.hidden_states is not None:
                 self.hidden_states = self.hidden_states[: len(new_indices)]
             self.bonus_tokens = self.bonus_tokens[: len(new_indices)]
+            if self.dsa_topk_indices is not None:
+                self.dsa_topk_indices = self.dsa_topk_indices[: len(new_indices)]
         else:
             # in some cases(e.g draft_extend), we have not filtered the batch by `unfinished_index`
             self.topk_p = self.topk_p[new_indices]
@@ -267,6 +244,8 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             if self.hidden_states is not None:
                 self.hidden_states = self.hidden_states[new_indices]
             self.bonus_tokens = self.bonus_tokens[new_indices]
+            if self.dsa_topk_indices is not None:
+                self.dsa_topk_indices = self.dsa_topk_indices[new_indices]
 
     def merge_batch(self, spec_info: "EagleDraftInput"):
         if self.future_indices is not None:
@@ -285,6 +264,7 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             self.topk_p = spec_info.topk_p
             self.topk_index = spec_info.topk_index
             self.draft_probs = spec_info.draft_probs
+            self.dsa_topk_indices = spec_info.dsa_topk_indices
             return
         if len(spec_info.topk_index) == 0:
             return
@@ -297,6 +277,12 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         )
         self.topk_p = torch.cat([self.topk_p, spec_info.topk_p])
         self.topk_index = torch.cat([self.topk_index, spec_info.topk_index])
+        if self.dsa_topk_indices is not None and spec_info.dsa_topk_indices is not None:
+            self.dsa_topk_indices = torch.cat(
+                [self.dsa_topk_indices, spec_info.dsa_topk_indices]
+            )
+        else:
+            self.dsa_topk_indices = None
         if self.draft_probs is not None and spec_info.draft_probs is not None:
             self.draft_probs = torch.cat([self.draft_probs, spec_info.draft_probs])
 
@@ -342,6 +328,9 @@ class EagleDraftExtendInput(SpecInput):
     num_tokens_per_req: int = -1
     num_tokens_for_logprob_per_req: int = 1
 
+    dsa_seed_topk_capture: Optional[torch.Tensor] = None
+    dsa_seed_topk_select: Optional[torch.Tensor] = None
+
     # None for draft-extend's idle batch; attention backends fall back to
     # rebuilding plain metadata from seq_lens when this is None.
     kv_indptr: torch.Tensor = None
@@ -351,39 +340,6 @@ class EagleDraftExtendInput(SpecInput):
 
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
         return self.num_tokens_per_req, self.num_tokens_for_logprob_per_req
-
-    @classmethod
-    def hidden_size_for(cls, worker) -> Optional[int]:
-        """Extend-phase `hidden_states` width: target's `spec_hidden_size`,
-        widened to `num_aux * target_hidden` for EAGLE-3 aux mode. Returns
-        None when the draft architecture doesn't consume the field
-        (e.g., STANDALONE)."""
-        if worker.speculative_algorithm.is_standalone():
-            return None
-        target_cfg = worker.target_worker.model_runner.model_config
-        if not (
-            worker.speculative_algorithm.is_eagle3()
-            and worker.eagle_use_aux_hidden_state
-        ):
-            return target_cfg.spec_hidden_size
-
-        hf_config = target_cfg.hf_config
-
-        # `num_aux` resolution: explicit attr > eagle_config layer_ids > default 3.
-        num_aux = getattr(hf_config, "num_aux_hidden_states", None)
-        if num_aux is None:
-            eagle_config = getattr(hf_config, "eagle_config", None) or {}
-            layer_ids = eagle_config.get("eagle_aux_hidden_state_layer_ids")
-            num_aux = len(layer_ids) if layer_ids else 3
-
-        target_hidden = getattr(hf_config, "target_hidden_size", target_cfg.hidden_size)
-        return target_hidden * num_aux
-
-    @classmethod
-    def dtype_for(cls, worker) -> Optional[torch.dtype]:
-        if worker.speculative_algorithm.is_standalone():
-            return None
-        return worker.target_worker.model_runner.model_config.dtype
 
     @classmethod
     def create_idle_input(
