@@ -482,6 +482,8 @@ class C4IndexerBackendMixin:
         c4_seq_lens: torch.Tensor,
         query_rows: int,
     ) -> Optional[NonPagedIndexerPlan]:
+        if query_rows < envs.SGLANG_OPT_DSV4_NONPAGED_INDEXER_MIN_QUERY_TOKENS.get():
+            return None
         if not self._can_use_nonpaged_indexer(
             c4_indexer=c4_indexer,
             forward_batch=forward_batch,
