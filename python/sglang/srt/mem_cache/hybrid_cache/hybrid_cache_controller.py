@@ -642,17 +642,18 @@ class HybridCacheController(BaseHiCacheController):
         # KV pools first — determines actual completed page count
         super()._page_transfer(operation)
 
-        # Extra pools only after KV fully completes. If KV terminated early
-        # (IO failure, timeout, TP mismatch), skip extra IO entirely to avoid
-        # data misalignment.
+        # Fetch sidecars for whatever KV pages landed; the caller clamps the
+        # usable prefix to sidecar coverage via clamp_prefix_to_sidecar_coverage.
         kv_completed_pages = operation.completed_tokens // self.page_size
-        if operation.pool_transfers and kv_completed_pages == len(operation.hash_value):
+        if operation.pool_transfers and kv_completed_pages > 0:
             self._sync_trailing_keys(
                 operation.pool_transfers, operation.hash_value, kv_completed_pages
             )
-            self._resolve_sidecar_derived_pool_transfers(operation)
+            self._resolve_sidecar_derived_pool_transfers(operation, kv_completed_pages)
             results = self.storage_backend.batch_get_v2(operation.pool_transfers)
-            operation.pool_storage_result.update_extra_pool_hit_pages(results)
+            operation.pool_storage_result.update_extra_pool_hit_pages(
+                results, operation.pool_transfers
+            )
         operation.pool_transfers_done = True
 
     def _page_backup(self, operation):
@@ -660,12 +661,17 @@ class HybridCacheController(BaseHiCacheController):
         if operation.pool_transfers:
             self._resolve_sidecar_derived_pool_transfers(operation)
             results = self.storage_backend.batch_set_v2(operation.pool_transfers)
-            operation.pool_storage_result.update_extra_pool_hit_pages(results)
+            operation.pool_storage_result.update_extra_pool_hit_pages(
+                results, operation.pool_transfers
+            )
 
         # Backup kv pools
         super()._page_backup(operation)
 
-    def _resolve_sidecar_derived_pool_transfers(self, operation):
+    def _resolve_sidecar_derived_pool_transfers(self, operation, num_pages=None):
+        if num_pages is None:
+            num_pages = len(operation.hash_value)
+        num_tokens = num_pages * self.page_size
         for transfer in operation.pool_transfers:
             if transfer.indices_from_pool is None:
                 continue
@@ -688,9 +694,9 @@ class HybridCacheController(BaseHiCacheController):
                 if transfer.keys is None:
                     transfer.keys = source.keys
             else:
-                transfer.host_indices = operation.host_indices
+                transfer.host_indices = operation.host_indices[:num_tokens]
                 if transfer.keys is None:
-                    transfer.keys = operation.hash_value
+                    transfer.keys = operation.hash_value[:num_pages]
 
     def _sync_trailing_keys(
         self,

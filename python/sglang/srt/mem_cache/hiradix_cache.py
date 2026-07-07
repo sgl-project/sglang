@@ -31,6 +31,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
     PrefetchTimeoutConfig,
+    clamp_prefix_to_sidecar_coverage,
 )
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
@@ -1500,12 +1501,23 @@ class HiRadixCache(RadixCache):
         logger.debug(f"Prefetch {req_id} completed with {completed_tokens} tokens")
 
         min_completed_tokens = completed_tokens
-        # Synchronize workers before mutating host cache tree state.
-        completed_tokens_tensor = torch.tensor(min_completed_tokens, dtype=torch.int)
-        self._all_reduce_attn_groups(
-            completed_tokens_tensor, torch.distributed.ReduceOp.MIN
+        hit_pages = operation.pool_storage_result.extra_pool_hit_pages
+        # Reduce completed tokens and each sidecar pool's hit-page count together.
+        sidecar_pools = [t.name for t in operation.pool_transfers or []]
+        packed = torch.tensor(
+            [min_completed_tokens] + [hit_pages.get(p, 0) for p in sidecar_pools],
+            dtype=torch.int,
         )
-        min_completed_tokens = completed_tokens_tensor.item()
+        self._all_reduce_attn_groups(packed, torch.distributed.ReduceOp.MIN)
+        min_completed_tokens = int(packed[0].item())
+        for i, p in enumerate(sidecar_pools, start=1):
+            hit_pages[p] = int(packed[i].item())
+
+        # Bound the prefix by ALL_PAGES sidecar coverage (e.g. INDEXER).
+        min_completed_tokens = clamp_prefix_to_sidecar_coverage(
+            min_completed_tokens, operation.pool_transfers, hit_pages, self.page_size
+        )
+
         fetched_key = prefetch_key[:min_completed_tokens]
         written_indices = host_indices[:min_completed_tokens]
         matched_length = self._insert_helper_host(

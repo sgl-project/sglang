@@ -32,6 +32,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
     SidecarPoolSpec,
+    clamp_prefix_to_sidecar_coverage,
 )
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
@@ -2019,9 +2020,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         min_completed_tokens = completed_tokens
         hit_pages = operation.pool_storage_result.extra_pool_hit_pages
         if self.tp_world_size > 1:
-            # Reduce full completed tokens together with the sidecar pools that
-            # this prefetch actually transferred, in one all_reduce.
-            sidecar_pools = [t.name for xfers in comp_xfers.values() for t in xfers]
+            # pool_transfers is a superset of comp_xfers (includes raw
+            # sidecars like INDEXER not attached to a TreeComponent).
+            sidecar_pools = [t.name for t in operation.pool_transfers or []]
             packed = torch.tensor(
                 [completed_tokens] + [hit_pages.get(p, 0) for p in sidecar_pools],
                 dtype=torch.int,
@@ -2030,6 +2031,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             min_completed_tokens = int(packed[0].item())
             for i, p in enumerate(sidecar_pools, start=1):
                 hit_pages[p] = int(packed[i].item())
+
+        # Bound the prefix by ALL_PAGES sidecar coverage (e.g. INDEXER).
+        min_completed_tokens = clamp_prefix_to_sidecar_coverage(
+            min_completed_tokens, operation.pool_transfers, hit_pages, self.page_size
+        )
 
         fetched_key = prefetch_key[:min_completed_tokens]
         insert_result = self._insert_helper_host(

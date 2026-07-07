@@ -130,11 +130,45 @@ class PoolTransferResult:
         """Accumulate kv_hit_pages across batches (max = last successful batch)."""
         self.kv_hit_pages = max(self.kv_hit_pages, kv_hit_pages)
 
-    def update_extra_pool_hit_pages(self, results: dict[str, List[bool]]) -> None:
-        """Record actual load/write success counts per extra pool."""
-        self.extra_pool_hit_pages.update(
-            {name: sum(rs) for name, rs in results.items()}
+    def update_extra_pool_hit_pages(
+        self,
+        results: dict[str, List[bool]],
+        pool_transfers: Optional[List[PoolTransfer]] = None,
+    ) -> None:
+        """Record actual load/write success counts per extra pool.
+
+        ALL_PAGES pools count the leading contiguous run of successes
+        instead of summing.
+        """
+        hit_policies = {t.name: t.hit_policy for t in pool_transfers or []}
+        updates = {}
+        for name, rs in results.items():
+            if hit_policies.get(name) == PoolHitPolicy.ALL_PAGES:
+                try:
+                    updates[name] = rs.index(False)
+                except ValueError:
+                    updates[name] = len(rs)
+            else:
+                updates[name] = sum(rs)
+        self.extra_pool_hit_pages.update(updates)
+
+
+def clamp_prefix_to_sidecar_coverage(
+    completed_tokens: int,
+    pool_transfers: Optional[List[PoolTransfer]],
+    extra_pool_hit_pages: dict[str, int],
+    page_size: int,
+) -> int:
+    """Clamp completed_tokens to the min ALL_PAGES sidecar coverage. TRAILING_PAGES
+    sidecars are ignored (they only cover the tail of the prefix)."""
+    safe_tokens = completed_tokens
+    for transfer in pool_transfers or []:
+        if transfer.hit_policy != PoolHitPolicy.ALL_PAGES:
+            continue
+        safe_tokens = min(
+            safe_tokens, extra_pool_hit_pages.get(transfer.name, 0) * page_size
         )
+    return safe_tokens
 
 
 class HiCacheStorage(ABC):
