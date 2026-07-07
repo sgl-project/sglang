@@ -1337,24 +1337,35 @@ class TestDSparkDeepSpecSemanticReference(CustomTestCase):
 
     def test_materialized_context_precision_test_detects_wrong_kv_order(self):
         t = self.torch
-        t.manual_seed(3)
         batch_size = 1
-        context_len = 5
-        block_size = 3
-        hidden_size = 8
-        context_hidden = t.randn(batch_size, context_len, hidden_size)
-        block_hidden = t.randn(batch_size, block_size, hidden_size)
-        wq = t.randn(hidden_size, hidden_size)
-        wk = t.randn(hidden_size, hidden_size)
-        wv = t.randn(hidden_size, hidden_size)
-        q_block = block_hidden @ wq
-        k_context = context_hidden @ wk
-        v_context = context_hidden @ wv
-        k_block = block_hidden @ wk
-        v_block = block_hidden @ wv
+        block_size = 1
+        hidden_size = 4
+        q_block = t.tensor([[[20.0, 0.0, 0.0, 0.0]]])
+        k_context = t.tensor(
+            [
+                [
+                    [1.0, 0.0, 0.0, 0.0],
+                    [-1.0, 0.0, 0.0, 0.0],
+                    [0.0, 1.0, 0.0, 0.0],
+                ]
+            ]
+        )
+        v_context = t.tensor(
+            [
+                [
+                    [100.0, 0.0, 0.0, 0.0],
+                    [-100.0, 0.0, 0.0, 0.0],
+                    [0.0, 10.0, 0.0, 0.0],
+                ]
+            ]
+        )
+        k_block = t.zeros((batch_size, block_size, hidden_size))
+        v_block = t.zeros((batch_size, block_size, hidden_size))
+        mask = t.tensor([[[True, False, True, True]]], dtype=t.bool)
 
         def attention(q, k, v):
             scores = q @ k.transpose(-1, -2) / (hidden_size**0.5)
+            scores = scores.masked_fill(~mask, float("-inf"))
             return t.softmax(scores, dim=-1) @ v
 
         expected = attention(
