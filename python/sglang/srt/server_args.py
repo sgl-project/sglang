@@ -7155,6 +7155,30 @@ def get_global_server_args() -> ServerArgs:
     return get_context().server_args
 
 
+def _has_cli_arg(argv: List[str], flag: str) -> bool:
+    return any(arg == flag or arg.startswith(f"{flag}=") for arg in argv)
+
+
+def _apply_fuseep_mode_env_compat(raw_args: argparse.Namespace, argv: List[str]) -> None:
+    if not envs.SGLANG_NPU_FUSED_MOE_MODE.is_set() or _has_cli_arg(
+        argv, "--fuseep-mode"
+    ):
+        return
+
+    fuseep_mode = envs.SGLANG_NPU_FUSED_MOE_MODE.get()
+    if fuseep_mode not in (1, 2):
+        raise ValueError(
+            f"Wrong value of SGLANG_NPU_FUSED_MOE_MODE={fuseep_mode}, "
+            "the NPU only supports 1 or 2."
+        )
+
+    logger.warning(
+        "The env variable SGLANG_NPU_FUSED_MOE_MODE is deprecated and will be "
+        "removed in a future release. Please use --fuseep-mode instead."
+    )
+    raw_args.fuseep_mode = fuseep_mode
+
+
 def prepare_server_args(argv: List[str]) -> ServerArgs:
     """
     Prepare the server arguments from the command line arguments.
@@ -7188,6 +7212,8 @@ def prepare_server_args(argv: List[str]) -> ServerArgs:
         datefmt="%Y-%m-%d %H:%M:%S",
         force=True,
     )
+
+    _apply_fuseep_mode_env_compat(raw_args, argv)
 
     return ServerArgs.from_cli_args(raw_args)
 
