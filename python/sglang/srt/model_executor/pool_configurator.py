@@ -532,12 +532,8 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 f"layers=[{mr.start_layer},{mr.end_layer}) "
                 f"local={len(self.compression_ratios)}/{len(cfg.compress_ratios)}"
             )
-        # State pools are addressed at runtime by the pool's SWA *storage* page
-        # size (server_args.page_size, 256), not the model's SWA window
-        # (cfg.window_size, 128). See DeepSeekV4TokenToKVPool(swa_page_size=...)
-        # and CompressStatePool.translate_from_swa_loc_to_state_loc, which both
-        # divide swa_loc by page_size. Sizing the c4 state pool by window_size
-        # (128) instead over-allocates it ~2x and inflates bytes_per_full_token.
+        # State pools are addressed by the SWA storage page size (page_size=256),
+        # not the model window (cfg.window_size=128); the latter over-allocates ~2x.
         self.swa_storage_page_size = mr.page_size
         self.swa_ratio = mr.server_args.swa_full_tokens_ratio
         self.is_speculative = mr.server_args.speculative_algorithm is not None
