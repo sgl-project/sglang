@@ -21,7 +21,11 @@ CHUNK_SIZE = 64
 #   Phase 1: store h to output, accumulate v_correction = sum_k(w_k @ h_k^T)
 #   Phase 2: update h = gate * h + k^T @ v_gated, save to scratch (initial_state)
 @triton.autotune(
-    configs=[triton.Config({"BV": 64}, num_warps=8, num_stages=2)],
+    configs=[
+        triton.Config({"BV": 64}, num_warps=n_warps, num_stages=n_stages)
+        for n_warps in [4, 8, 16, 32]
+        for n_stages in [2, 3, 4, 5, 6, 7, 8]
+    ],
     key=["H", "K", "V", "BT", "USE_GK", "USE_INITIAL_STATE", "NT_BUCKET"],
     **autotune_cache_kwargs,
 )
