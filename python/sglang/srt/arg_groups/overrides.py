@@ -1905,21 +1905,6 @@ def _a2a_fusion_adjustments(view: Any) -> dict:
     return {}
 
 
-def _cutlass_moe_env_override(view: Any) -> dict:
-    from sglang.srt.environ import envs
-
-    if envs.SGLANG_CUTLASS_MOE.get():
-        logger.warning(
-            "SGLANG_CUTLASS_MOE is deprecated, use --moe-runner-backend=cutlass and/or --speculative-moe-runner-backend=cutlass instead"
-        )
-        assert view.quantization in [
-            "fp8",
-            "mxfp8",
-        ], "cutlass MoE is only supported with fp8/mxfp8 quantization"
-        return {"moe_runner_backend": "cutlass"}
-    return {}
-
-
 # Every A2A backend that forces expert parallelism to span the TP group.
 _A2A_EP_SPANNING_BACKENDS = frozenset(
     {"megamoe", "deepep", "mooncake", "nixl", "ascend_fuseep", "flashinfer", "mori"}
