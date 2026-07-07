@@ -938,12 +938,16 @@ jobs:
       - name: Run diffusion unit tests
         timeout-minutes: 60
         run: |
+          # Skip ltx2_vae_channels_last: it asserts CUDA `channels_last_3d`
+          # memory-format behavior that the ROCm conv path doesn't reproduce
+          # (CUDA-specific). The rest of the unit suite is portable.
           docker exec \
             -e AITER_JIT_DIR=/sgl-data/aiter-kernels \
             -e MIOPEN_USER_DB_PATH=/sgl-data/miopen-cache \
             -w /sglang-checkout/python \
             ci_sglang python3 sglang/multimodal_gen/test/run_suite.py \
               --suite unit \
+              -k "not ltx2_vae_channels_last" \
               ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
   wait-for-stage-b-amd:
