@@ -604,14 +604,19 @@ class TokenizerWorker(TokenizerManager):
         torch.set_num_threads(1)
         # prevent init prefill bootstrapserver again
         disaggregation_mode = server_args.disaggregation_mode
-        server_args.disaggregation_mode = "null"
+        server_args.override(
+            "tokenizer_worker.suppress_bootstrap", disaggregation_mode="null"
+        )
         super().__init__(server_args, port_args)
 
         self.worker_id = os.getpid()
         self.tokenizer_ipc_name = port_args.tokenizer_ipc_name
 
         # For PD disaggregtion
-        self.server_args.disaggregation_mode = disaggregation_mode
+        self.server_args.override(
+            "tokenizer_worker.restore_disaggregation_mode",
+            disaggregation_mode=disaggregation_mode,
+        )
         self.disaggregation_mode = DisaggregationMode(
             self.server_args.disaggregation_mode
         )
