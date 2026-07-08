@@ -25,6 +25,7 @@ from sglang.srt.configs import (
     AfmoeConfig,
     BailingHybridConfig,
     ChatGLMConfig,
+    Cosmos3Config,
     DbrxConfig,
     DeepseekVL2Config,
     DotsOCRConfig,
@@ -145,6 +146,18 @@ for name, cls in _CONFIG_REGISTRY.items():
         err = str(e).lower()
         if "already registered" not in err and "already used" not in err:
             logger.warning("Failed to register config %s: %s", name, e)
+
+# Cosmos3 (understanding tower) reuses the Qwen3-VL config schema. Register it
+# with AutoConfig only (not `_CONFIG_REGISTRY`), so the nested `text_config` is
+# flattened onto the top-level config in `get_config` — the same path the base
+# Qwen3-VL config relies on. Adding it to `_CONFIG_REGISTRY` would trigger a
+# `from_pretrained` reload that drops that flattening.
+try:
+    AutoConfig.register(Cosmos3Config.model_type, Cosmos3Config)
+except ValueError as e:
+    err = str(e).lower()
+    if "already registered" not in err and "already used" not in err:
+        logger.warning("Failed to register config %s: %s", Cosmos3Config.model_type, e)
 
 
 # ---------------------------------------------------------------------------

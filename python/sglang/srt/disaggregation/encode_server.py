@@ -1486,6 +1486,7 @@ class MMEncoder:
                 "qwen3_5",
                 "qwen3_5_moe",
                 "intern_s2_preview",
+                "cosmos3_omni",
             ]
             and video_processor_kwargs.get("video_metadata", None) is not None
         ):
