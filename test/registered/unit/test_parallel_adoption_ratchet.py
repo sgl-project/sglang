@@ -36,14 +36,19 @@ _BANNED_CALLS = re.compile(
     r"|attn_tensor_model_parallel_(?:world_size|rank)"
     r"|attn_context_model_parallel_(?:world_size|rank)"
     r"|dcp_(?:world_size|rank)"
+    r"|attention_(?:tp|cp)_(?:group|rank|size)"
     r")\(\)"
 )
 
-_SWEPT_DIRS = ("models", "layers")
+# The whole package is swept; the exemptions are the substrate itself.
+_SWEPT_DIRS = ("",)
 
 _EXEMPT = (
+    "distributed/",  # parallel_state: defines the canonical getters
     "layers/dp_attention.py",  # delegation substrate for the attn-DP dims
-    "layers/dcp/",  # DCP subsystem plumbing; follow-up sweep
+    # The dumper's megatron plugin calls third-party getters that share the
+    # parallel_state names (self._mpu.get_tensor_model_parallel_rank()).
+    "debug_utils/dumper.py",
 )
 
 

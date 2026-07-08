@@ -25,7 +25,6 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.layers.dp_attention import (
-    get_attention_tp_group,
     is_allocation_symmetric,
 )
 from sglang.srt.layers.parameter import (
@@ -1531,7 +1530,7 @@ class RowParallelLinear(LinearBase):
         # bias will not get added more than once in TP>1 case)
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
         if self.use_dp_attention_reduce:
-            symm_ctx = use_symmetric_memory(get_attention_tp_group())
+            symm_ctx = use_symmetric_memory(get_parallel().attn_tp_group)
         else:
             symm_ctx = use_symmetric_memory(
                 get_tp_group(), disabled=not is_allocation_symmetric()
@@ -1541,7 +1540,7 @@ class RowParallelLinear(LinearBase):
 
         if self.reduce_results and self.tp_size > 1 and not skip_all_reduce:
             if self.use_dp_attention_reduce:
-                output = get_attention_tp_group().all_reduce(output_parallel)
+                output = get_parallel().attn_tp_group.all_reduce(output_parallel)
             else:
                 quantize_communications = (
                     (

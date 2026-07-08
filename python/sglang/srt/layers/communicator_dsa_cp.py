@@ -34,7 +34,6 @@ from sglang.srt.layers.communicator import (
 from sglang.srt.layers.dp_attention import (
     attn_cp_all_gather_into_tensor,
     attn_cp_reduce_scatter_tensor,
-    get_attention_cp_group,
     get_local_dp_buffer,
 )
 from sglang.srt.layers.utils.cp_utils import mla_use_prefill_cp
@@ -54,7 +53,7 @@ def dsa_cp_gather_hidden_states(hidden_states: torch.Tensor):
     attn_tp_size = get_parallel().attn_tp_size
     assert attn_dp_size == 1 and attn_tp_size == 1
     hidden_states, local_hidden_states = (
-        get_local_dp_buffer(get_attention_cp_group()),
+        get_local_dp_buffer(get_parallel().attn_cp_group),
         hidden_states,
     )
     attn_cp_all_gather_into_tensor(hidden_states, local_hidden_states)

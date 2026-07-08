@@ -20,6 +20,7 @@ from sglang.srt.mem_cache.common import (
     get_alloc_reserve_per_decode,
     get_last_loc,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.triton_ops.spec_tree import (
     sgl_build_tree_kernel_efficient_triton,
     verify_tree_greedy_kernel_triton,
@@ -591,7 +592,6 @@ def eagle_sample(
 
     from sglang.srt.distributed import get_tp_group
     from sglang.srt.layers.dp_attention import (
-        get_attention_tp_group,
         is_dp_attention_enabled,
     )
     from sglang.srt.sampling.penaltylib.repetition_penalty import (
@@ -762,7 +762,9 @@ def eagle_sample(
         # non-determinism in softmax/top_k/top_p, causing different
         # sampled tokens. Broadcast from rank 0 to ensure consistency.
         tp_group = (
-            get_attention_tp_group() if is_dp_attention_enabled() else get_tp_group()
+            get_parallel().attn_tp_group
+            if is_dp_attention_enabled()
+            else get_tp_group()
         )
         if tp_group.world_size > 1:
             tp_group.broadcast(predict, src=0)

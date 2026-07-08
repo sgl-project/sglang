@@ -7,13 +7,12 @@ from torch import nn
 
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.layers.dp_attention import (
-    get_attention_tp_group,
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.utils.hash import murmur_hash32
 from sglang.srt.layers.utils.logprob import get_token_ids_logprobs, get_top_logprobs
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.server_args import get_global_server_args
@@ -71,7 +70,7 @@ class Sampler(nn.Module):
         super().__init__()
         self.tp_sync_group = get_tp_group().device_group
         if is_dp_attention_enabled():
-            self.tp_sync_group = get_attention_tp_group().device_group
+            self.tp_sync_group = get_parallel().attn_tp_group.device_group
 
         self.rl_on_policy_target = get_global_server_args().rl_on_policy_target
         # In RL on-policy mode, deterministic inference is automatically enabled.

@@ -7,12 +7,12 @@ import torch
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather_into_tensor,
-    get_attention_tp_size,
     get_dp_local_slice_cpu,
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.state_capturer.base import BaseTopkCapturer
 
@@ -84,7 +84,9 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
         # holds the full batch and the existing _get_local_slice / D2H sync
         # paths work unchanged. Pre-allocate the gather target.
         if get_moe_a2a_backend().is_deepep():
-            attn_tp_size = get_attention_tp_size() if is_dp_attention_enabled() else 1
+            attn_tp_size = (
+                get_parallel().attn_tp_size if is_dp_attention_enabled() else 1
+            )
             self.gather_buffer = torch.empty(
                 (
                     self.device_cache.buffer.shape[0] * attn_tp_size,
@@ -98,7 +100,7 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
         if get_moe_a2a_backend().is_deepep():
             local_topk = topk_indices
             topk_indices = self.gather_buffer[
-                : local_topk.size(0) * get_attention_tp_size()
+                : local_topk.size(0) * get_parallel().attn_tp_size
             ]
             attn_tp_all_gather_into_tensor(topk_indices, local_topk)
         super().capture(layer_id, topk_indices)

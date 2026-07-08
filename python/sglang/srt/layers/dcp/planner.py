@@ -20,7 +20,6 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.distributed.parallel_state import get_dcp_rank, get_dcp_world_size
 from sglang.srt.layers.dcp.comm import dcp_enabled
 from sglang.srt.layers.dcp.kernels import (
     create_dcp_kv_indices,
@@ -28,6 +27,7 @@ from sglang.srt.layers.dcp.kernels import (
 )
 from sglang.srt.layers.dcp.layout import update_local_kv_lens_for_dcp
 from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import get_global_server_args
 
 
@@ -108,13 +108,13 @@ def prepare_decode_context_parallel_metadata(
         extend_cu_prefix_lens,
         dcp_kv_indices,
         extend_prefix_lens_sum,
-        get_dcp_world_size(),
+        get_parallel().dcp_size,
     )
     dcp_local_prefix_kv_indices = (
         dcp_prefix_kv_indices[
-            dcp_prefix_kv_indices % get_dcp_world_size() == get_dcp_rank()
+            dcp_prefix_kv_indices % get_parallel().dcp_size == get_parallel().dcp_rank
         ]
-        // get_dcp_world_size()
+        // get_parallel().dcp_size
     )
     dcp_kv_buffer = torch.empty(
         (
@@ -179,8 +179,8 @@ def plan_dcp_decode_metadata(
         local_kv_lens,
         local_kv_lens_cumsum,
         local_kv_indices,
-        dcp_rank=get_dcp_rank(),
-        dcp_world_size=get_dcp_world_size(),
+        dcp_rank=get_parallel().dcp_rank,
+        dcp_world_size=get_parallel().dcp_size,
         BLOCK_SIZE=BLOCK_SIZE,
     )
     kv_indices[:total_local_len] = local_kv_indices[:total_local_len]

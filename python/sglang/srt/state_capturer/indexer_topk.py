@@ -5,7 +5,7 @@ import numpy as np
 import pybase64
 import torch
 
-from sglang.srt.layers.dp_attention import get_attention_tp_size
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.state_capturer.base import BaseTopkCapturer
 
 logger = logging.getLogger(__name__)
@@ -25,7 +25,7 @@ class IndexerTopkCapturer(BaseTopkCapturer):
         self.num_indexer_layers = num_indexer_layers
         self.index_topk = index_topk
 
-        attn_tp_size = get_attention_tp_size()
+        attn_tp_size = get_parallel().attn_tp_size
         assert attn_tp_size == 1, "IndexerTopkCapturer now only supports DP attention"
 
         # DP-attention capture is per-rank-local: each rank writes [:local_batch, ...]
