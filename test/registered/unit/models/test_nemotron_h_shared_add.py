@@ -34,7 +34,6 @@ def test_nemotron_h_fused_latent_projection_shared_add_and_graph():
     projection = _LatentProjection(2048, 8192).cuda()
     moe = SimpleNamespace(
         _fuse_latent_projection_shared_add=True,
-        use_latent_moe=True,
         fc2_latent_proj=projection,
     )
     routed = torch.randn(16, 2048, device="cuda", dtype=torch.bfloat16)
@@ -73,7 +72,6 @@ def test_nemotron_h_latent_projection_fallback_is_unchanged():
     projection = _LatentProjection(64, 128).cuda()
     moe = SimpleNamespace(
         _fuse_latent_projection_shared_add=False,
-        use_latent_moe=True,
         fc2_latent_proj=projection,
     )
     routed = torch.randn(4, 64, device="cuda", dtype=torch.bfloat16)
@@ -94,7 +92,6 @@ def test_nemotron_h_latent_projection_falls_back_for_mixed_dtype():
     projection = _LatentProjection(64, 128).cuda()
     moe = SimpleNamespace(
         _fuse_latent_projection_shared_add=True,
-        use_latent_moe=True,
         fc2_latent_proj=projection,
     )
     routed = torch.randn(4, 64, device="cuda", dtype=torch.bfloat16)

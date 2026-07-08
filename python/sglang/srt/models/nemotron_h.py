@@ -250,6 +250,8 @@ class NemotronHMoE(nn.Module):
             self.fc1_latent_proj = None
             self.fc2_latent_proj = None
 
+        # This fusion assumes AUTO CUDA UnquantizedLinearMethod uses F.linear.
+        # Keep this guard in sync with UnquantizedLinearMethod.apply.
         self._fuse_latent_projection_shared_add = (
             _is_cuda
             and self.fc2_latent_proj is not None
@@ -333,12 +335,13 @@ class NemotronHMoE(nn.Module):
                     shared_output,
                     final_hidden_states,
                     self.fc2_latent_proj.weight.t(),
+                    # Intentionally use the shared output as the GEMM beta input
+                    # and destination to avoid a separate allocation and add.
                     out=shared_output,
                 ),
                 None,
             )
-        if self.use_latent_moe:
-            final_hidden_states, _ = self.fc2_latent_proj(final_hidden_states)
+        final_hidden_states, _ = self.fc2_latent_proj(final_hidden_states)
         return final_hidden_states, shared_output
 
     def forward(
@@ -352,9 +355,10 @@ class NemotronHMoE(nn.Module):
         # MoE runner / topk), so final_hidden_states is already scaled.
         final_hidden_states, shared_output = self._forward_core(hidden_states)
 
-        final_hidden_states, shared_output = self._apply_latent_projection(
-            final_hidden_states, shared_output
-        )
+        if self.use_latent_moe:
+            final_hidden_states, shared_output = self._apply_latent_projection(
+                final_hidden_states, shared_output
+            )
 
         if shared_output is not None:
             final_hidden_states += shared_output
