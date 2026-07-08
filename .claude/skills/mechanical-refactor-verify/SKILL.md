@@ -1,50 +1,134 @@
 ---
 name: mechanical-refactor-verify
-description: Make mechanical refactoring (file splits, function moves, module extractions, renames) machine-checkable instead of eyeballed. Reproduce a relocation commit byte-for-byte from faithful primitives, and split an extraction into a verifiable prepare + move + postpare. Use when doing or reviewing such changes.
+description: Verify mechanical refactoring commits by requiring a reproducible transform script (gist) in the PR description. Use when doing or reviewing file splits, function moves, or module extractions.
+user_invocable: true
+argument: "[verify <pr_url_or_commit>] — verify an existing PR, or omit to see the workflow guide"
 ---
 
-# Mechanical Refactor — Machine-Checkable Verification
+# Mechanical Refactor — Reproducible Verification
 
-## 1. Overview
+## Core Principle
 
-- The correctness of a mechanical change (file split, function move, module extraction,
-  rename) must be **machine-checkable, not eyeballed** — the proof is something anyone can
-  re-run, whoever made the change and whenever.
-- **One property**: *a commit is a pure relocation*. **One proof**: **reproduce** —
-  regenerate the move from the base commit with faithful primitives, run the formatter,
-  byte-diff against the target.
-- Empty diff = the proof. Any residual = a bundled non-move change, surfaced for review.
-- A reshape must not ride along: split into optional **prepare** + certified **move** +
-  optional **postpare** (`guide-split.md`).
+The deliverable of a mechanical move (file split, function move, module extraction) is NOT the diff — it is **the script that produces the diff**.
+A script is auditable; a diff is not.
 
-## 2. What do you want to do?
+## Workflow
 
-- **Split a change into commits** (extract, move, file split) → `guide-split.md`: the
-  prepare + move + postpare rule, the case recipes, and the anti-patterns.
-- **Construct the proof for a move commit** → `guide-construct-proof.md`: run
-  `scripts/mechanical_refactor_proof_generator.py`, or hand-write a `Repro` when the
-  generator reports `UNSUPPORTED`.
-- **Verify someone's proof** → `guide-verify-proof.md`: re-run it, read the verdict, audit
-  the authored surfaces.
-- **Decide whether a change counts as a clean move** → `spec-reproduction-utils.md`: the
-  property, the whole whitelist / not-allowed list, and each primitive's contract. The
-  source of truth for the reproduction module; if any other file disagrees, it wins.
+Regardless of who did the move (human or agent) and when (before or after committing), the workflow is the same:
 
-## 3. Files
+### Step 1: Write the transform script to /tmp/
 
-- [`guide-split.md`](guide-split.md) — split a change into prepare + move + postpare: the
-  case recipes, what stays mechanical, and the anti-patterns.
-- [`guide-construct-proof.md`](guide-construct-proof.md) — produce the proof: the
-  generator, the hand-written `Repro`, and publishing the proof with the PR.
-- [`guide-verify-proof.md`](guide-verify-proof.md) — consume the proof: re-run, verdicts,
-  and the audit checklist for authored surfaces.
-- [`spec-reproduction-utils.md`](spec-reproduction-utils.md) — the normative spec of the
-  clean-move property and the reproduction primitives.
-- [`scripts/mechanical_refactor_proof_generator.py`](scripts/mechanical_refactor_proof_generator.py) —
-  the **generator**: infers a reproduce recipe from a commit's diff and emits/runs a
-  standalone, auditable script per commit, with a `PASS` / `RESIDUAL` / `UNSUPPORTED` verdict.
-- [`scripts/mechanical_refactor_reproduction_utils.py`](scripts/mechanical_refactor_reproduction_utils.py) — the
-  **proof engine**: the `Repro` builder's faithful relocation primitives plus the worktree +
-  pre-commit + byte-diff scaffold. Self-contained — only git and the standard library.
-- [`scripts/tests/`](scripts/tests/) — pytest suites, one folder per module:
-  `reproduction_utils/` for the proof engine, `proof_generator/` for the generator.
+Write the script to `/tmp/transform_<short_description>.py`. **Never write it inside the repo.**
+
+The scaffold (worktree creation, diff check, ruff format, result reporting) lives in `mechanical_refactor_verify_utils.py` next to this skill.
+
+**MANDATORY**: The transform script MUST use `verify_mechanical_refactor()` from the utils module. Do NOT reimplement the verification scaffold — no hand-written worktree management, no hand-written diff checking. The script only defines `transform()` and calls `verify_mechanical_refactor`.
+
+Script template (follow this structure exactly):
+
+```python
+#!/usr/bin/env python3
+"""Reproducible transform for: <describe the mechanical move>
+
+Run from the repo root:  python3 /tmp/transform_<short_description>.py
+"""
+import sys
+from pathlib import Path
+
+sys.path.append(".claude/skills/mechanical-refactor-verify")
+from mechanical_refactor_verify_utils import verify_mechanical_refactor, exec_command, git_add_and_commit, dedent
+
+BASE_COMMIT = "<base_sha>"
+TARGET_COMMIT = "<pr_mechanical_move_final_sha>"
+
+
+def transform(dir_root: Path) -> None:
+    """Perform the mechanical transformation and commit each step.
+
+    Args:
+        dir_root: Path to the worktree (checked out at BASE_COMMIT).
+    """
+    # --- Step 1: Split source file ---
+    source = dir_root / "path/to/source.py"
+    content = source.read_text()
+    lines = content.splitlines(keepends=True)
+
+    splits = [
+        ("path/to/pkg/target_a.py", 1, 50),
+        ("path/to/pkg/target_b.py", 51, 120),
+    ]
+    for target_path, start, end in splits:
+        target = dir_root / target_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("".join(lines[start - 1 : end]))
+
+    source.unlink()
+    (dir_root / "path/to/pkg/__init__.py").touch()
+
+    git_add_and_commit("mechanical: split source.py", cwd=str(dir_root))
+
+    # --- Step 2: Fix imports ---
+    # <edit files>
+    # git_add_and_commit("fix imports", cwd=str(dir_root))
+
+    # Note: pre-commit run --all-files is run automatically after transform() returns
+
+
+if __name__ == "__main__":
+    verify_mechanical_refactor(
+        base_commit=BASE_COMMIT,
+        target_commit=TARGET_COMMIT,
+        transform=transform,
+    )
+```
+
+### Step 2: Run the script from the repo root
+
+```bash
+cd <repo_root>
+python3 /tmp/transform_<short_description>.py
+# Expected: "PASS: transform reproduces the commit exactly."
+```
+
+If FAIL, fix the script and re-run until PASS.
+
+### Step 3: Upload gist, delete local file, update PR description
+
+One gist per PR. Do all three:
+
+```bash
+# 1. Create gist (or update existing)
+gh gist create --public -d "Mechanical refactor transform: <description>" /tmp/transform_<short_description>.py
+# Or update: gh gist edit <gist_id> -a /tmp/transform_<short_description>.py
+
+# 2. Delete local file
+rm /tmp/transform_<short_description>.py
+
+# 3. Update PR description (paste the block below)
+```
+
+PR description must include:
+
+````markdown
+## Mechanical Move
+
+Transform script: <gist_url>
+
+### One-click verification
+
+```bash
+python3 <(curl -sL <gist_raw_url>)
+```
+````
+
+### Step 4: PR scope
+
+A mechanical refactor PR must contain **only** mechanical changes (moves, splits, renames, import fixes, formatting). All of these must be reproducible by the transform script.
+
+Semantic changes (new logic, API restructuring, behavior changes) belong in a **separate PR**.
+
+## Verifying an existing PR (`/mechanical-refactor-verify verify`)
+
+1. Find the gist URL and one-click command in the PR description
+2. Run the one-click command from the repo root
+3. Report: PASS or show the diff
