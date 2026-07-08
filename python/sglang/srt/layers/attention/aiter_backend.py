@@ -2458,6 +2458,12 @@ class AiterAttnBackend(AttentionBackend):
 
             num_kv_splits = self.forward_metadata.num_kv_splits
 
+            from sglang.srt.debug_utils.disagg_decode_meta_probe import (
+                maybe_dump_decode_meta,
+            )
+
+            maybe_dump_decode_meta("aiter", self, layer, forward_batch)
+
             o = self._mla_decode_fwd_with_head_pad(
                 q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
                 k_buffer.view(-1, 1, 1, layer.qk_head_dim),

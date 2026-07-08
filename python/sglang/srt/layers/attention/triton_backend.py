@@ -1751,6 +1751,12 @@ class TritonAttnBackend(AttentionBackend):
             o = cp_lse_ag_out_rs_mha(o_for_decode, local_lse, group)
             return o.reshape(-1, layer.tp_q_head_num * layer.v_head_dim).to(q.dtype)
 
+        from sglang.srt.debug_utils.disagg_decode_meta_probe import (
+            maybe_dump_decode_meta,
+        )
+
+        maybe_dump_decode_meta("triton", self, layer, forward_batch)
+
         self.decode_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             self.token_to_kv_pool.get_key_buffer(layer.layer_id),
