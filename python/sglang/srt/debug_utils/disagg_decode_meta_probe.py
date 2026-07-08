@@ -133,7 +133,13 @@ def _dump_impl(tag: str, backend, layer, forward_batch) -> None:
     fwd_mode = forward_batch.forward_mode
     is_decode = fwd_mode.is_decode() or fwd_mode.is_idle()
     is_verify = fwd_mode.is_target_verify()
-    if not (is_decode or is_verify):
+    is_extend = (
+        fwd_mode.is_extend() and not is_verify and not fwd_mode.is_draft_extend_v2()
+    )
+    # DECODE/VERIFY fire on the decode worker; EXTEND fires on the prefill
+    # worker (its prompt extend) -> one disagg run yields both the
+    # prefill-stored and decode-received latent norms for the same tokens.
+    if not (is_decode or is_verify or is_extend):
         return
 
     seq_lens = getattr(forward_batch, "seq_lens_cpu", None)
@@ -169,7 +175,7 @@ def _dump_impl(tag: str, backend, layer, forward_batch) -> None:
         else None
     )
 
-    mode_name = "VERIFY" if is_verify else "DECODE"
+    mode_name = "VERIFY" if is_verify else ("EXTEND" if is_extend else "DECODE")
     lines = []
     for b in range(bs):
         seq_len = int(seq_lens[b])
@@ -190,7 +196,12 @@ def _dump_impl(tag: str, backend, layer, forward_batch) -> None:
             n_kv = hi - lo
             idx_slice = kv_indices[lo:hi].detach().to("cpu")
             idx_str = _ht(idx_slice.tolist())
-            if idx_slice.numel() == rtt.numel():
+            # kv_indices == req_to_token[req, :seq_len] only for DECODE; EXTEND's
+            # kv_indices covers the prefix (empty for a pure prefill), so the
+            # equality check is decode-only to avoid a spurious LEN_MISMATCH.
+            if not is_decode:
+                match_str = "n/a(non-decode)"
+            elif idx_slice.numel() == rtt.numel():
                 match_str = str(bool(torch.equal(idx_slice.to(rtt.dtype), rtt)))
             else:
                 match_str = f"LEN_MISMATCH({idx_slice.numel()} vs {rtt.numel()})"
@@ -211,11 +222,13 @@ def _dump_impl(tag: str, backend, layer, forward_batch) -> None:
             f"    rtt     = {_ht(rtt.tolist())}"
         )
 
-        # KV-pool row norms at the attended slots (real decode step, unlike the
-        # warmup-only #30433 dump). Same prompt => same norms across runs.
+        # KV-pool row norms at req_to_token[req, :seq_len] (real step, unlike the
+        # warmup-only #30433 dump). This is the SAME quantity on both sides:
+        # what the prefill worker stored (EXTEND) vs what the decode worker reads
+        # (DECODE). Same prompt (shared 8-shot prefix) => identical norm sequence
+        # iff the MORI transfer preserved the latent values.
         if _KVNORM and layer_id == _FIRST_LAYER:
-            slots = idx_slice if idx_slice is not None else rtt
-            block += "\n" + _kv_norm_report(backend, layer_id, slots)
+            block += "\n" + _kv_norm_report(backend, layer_id, rtt)
 
         lines.append(block)
 

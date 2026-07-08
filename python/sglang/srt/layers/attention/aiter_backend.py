@@ -1957,6 +1957,16 @@ class AiterAttnBackend(AttentionBackend):
                         v_descale,
                     )
 
+        from sglang.srt.debug_utils.disagg_decode_meta_probe import (
+            maybe_dump_decode_meta,
+        )
+
+        # Prefill-side latent dump: KV is now written to the pool above, so this
+        # captures what the prefill worker stored for the prompt. Compared with
+        # the decode-worker DECODE dump over the same tokens, it isolates whether
+        # the MORI transfer preserved the latent values.
+        maybe_dump_decode_meta("aiter-extend", self, layer, forward_batch)
+
         if self.use_mla:
             max_q_len = self.forward_metadata.max_q_len
             max_kv_len = self.forward_metadata.max_kv_len
