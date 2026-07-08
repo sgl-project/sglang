@@ -48,9 +48,14 @@ def _dump_records(
                 mode="cap-accept",
                 budget=5,
                 lag_steps=2,
-                verify_lens_cpu=verify_lens_cpu,
+                verify_lens=(
+                    None
+                    if verify_lens_cpu is None
+                    else torch.tensor(verify_lens_cpu, dtype=torch.int32)
+                ),
                 confidence=confidence,
                 req_pool_indices=torch.tensor([4, 5][:bs]),
+                rids=None,
                 prefix_lens=torch.tensor([100, 200][:bs]),
                 draft_tokens=torch.tensor([[11, 12, 13], [21, 22, 23]][:bs]),
                 bonus_tokens=torch.tensor([7, 8][:bs]),

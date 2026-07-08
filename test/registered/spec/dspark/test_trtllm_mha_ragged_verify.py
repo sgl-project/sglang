@@ -1,5 +1,12 @@
+import os
 import types
 import unittest
+
+# This suite runs on CPU-only CI; pin the layout kernels to their torch
+# implementations (the triton defaults require CUDA tensors). Must be set
+# before the kernel modules are imported.
+os.environ.setdefault("SGLANG_DSPARK_KERNEL_QO_INDPTR", "torch")
+os.environ.setdefault("SGLANG_DSPARK_KERNEL_PADDED_TO_BUCKET", "torch")
 
 import torch
 
@@ -228,7 +235,7 @@ def _fake_model_runner(capture_num_tokens, max_bs):
 
 
 class TestBudgetTierSelection(CustomTestCase):
-    def test_floor_uses_budget_upper_bound(self):
+    def test_floor_uses_tier_hint_capped_at_uniform_window(self):
         from sglang.srt.speculative.dspark_components.dspark_verify import (
             verify_layout_graph_num_tokens_floor,
         )
@@ -240,9 +247,17 @@ class TestBudgetTierSelection(CustomTestCase):
             ragged_verify_mode=RaggedVerifyMode.COMPACT,
             verify_num_draft_tokens=8,
             model_runner=model_runner,
-            verify_token_budget=50,
+            tier_num_tokens=150,
         )
         self.assertEqual(floor, 150)
+        capped = verify_layout_graph_num_tokens_floor(
+            num_reqs=10,
+            ragged_verify_mode=RaggedVerifyMode.COMPACT,
+            verify_num_draft_tokens=8,
+            model_runner=model_runner,
+            tier_num_tokens=150,
+        )
+        self.assertEqual(capped, 80)
         pinned = verify_layout_graph_num_tokens_floor(
             num_reqs=100,
             ragged_verify_mode=RaggedVerifyMode.COMPACT,

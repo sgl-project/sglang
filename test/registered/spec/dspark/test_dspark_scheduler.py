@@ -1,5 +1,11 @@
 import functools
+import os
 import unittest
+
+# This suite runs on CPU-only CI; pin the layout kernel to its torch
+# implementation (the triton default requires CUDA tensors). Must be set
+# before the kernel modules are imported.
+os.environ.setdefault("SGLANG_DSPARK_KERNEL_QO_INDPTR", "torch")
 
 import torch
 
@@ -65,7 +71,7 @@ def _bruteforce_budget(
 ) -> int:
     num_requests = history_survival_probs.shape[0]
     max_len = cfg.resolved_max_verify_len()
-    candidates = history_survival_probs[:, cfg.min_verify_len : max_len].flatten()
+    candidates = history_survival_probs[:, :max_len].flatten()
     candidates = [float(x) for x in candidates.tolist() if float(x) >= cfg.survival_eps]
     candidates.sort(reverse=True)
 
@@ -94,7 +100,7 @@ def schedule_verify_lens_topk_vanilla(
 
     candidates: list[tuple[float, int, int]] = []
     for request in range(num_requests):
-        for position in range(cfg.min_verify_len, max_len):
+        for position in range(min(max_len, len(valid_rows[request]))):
             if valid_rows[request][position]:
                 candidates.append((survival_rows[request][position], position, request))
 
@@ -155,10 +161,10 @@ class TestComputeVerifyTokenBudget(CustomTestCase):
             )
             actual = compute_verify_token_budget(
                 history_survival_probs=survival, sps_table=table, cfg=cfg
-            )
+            ).budget
             self.assertEqual(actual, expected)
 
-    def test_budget_excludes_forced_min_positions(self):
+    def test_budget_pool_is_independent_of_min_verify_len(self):
         survival = torch.tensor([[0.9, 0.8, 0.7, 0.6]], dtype=torch.float32)
         cfg_no_min = DSparkScheduleConfig(gamma=4, min_verify_len=0)
         cfg_min2 = DSparkScheduleConfig(gamma=4, min_verify_len=2)
@@ -169,8 +175,10 @@ class TestComputeVerifyTokenBudget(CustomTestCase):
         budget_min2 = compute_verify_token_budget(
             history_survival_probs=survival, sps_table=table, cfg=cfg_min2
         ).budget
+        # The budget candidate pool spans all positions; the per-request floor
+        # is enforced later at verify-lens scheduling, not at budget time.
         self.assertEqual(budget_no_min, 4)
-        self.assertEqual(budget_min2, 2)
+        self.assertEqual(budget_min2, 4)
 
     def test_budget_drops_candidates_below_survival_eps(self):
         survival = torch.tensor([[0.9, 1e-9, 1e-12]], dtype=torch.float32)
@@ -278,7 +286,7 @@ class TestScheduleVerifyLensTopk(CustomTestCase):
         flat = [
             (float(survival[r, p]), p, r)
             for r in range(num_requests)
-            for p in range(cfg.min_verify_len, max_len)
+            for p in range(min(max_len, survival.shape[1]))
             if float(survival[r, p]) >= cfg.survival_eps
         ]
         flat.sort(key=lambda e: (-e[0], e[1], e[2]))
@@ -293,9 +301,7 @@ class TestScheduleVerifyLensTopk(CustomTestCase):
                 count,
                 f"request {request}: verify_len count mismatch",
             )
-            expected_prefix = list(
-                range(cfg.min_verify_len, cfg.min_verify_len + count)
-            )
+            expected_prefix = list(range(count))
             self.assertEqual(
                 positions,
                 expected_prefix,
@@ -348,7 +354,8 @@ class TestScheduleVerifyLensTopk(CustomTestCase):
         survival = torch.tensor([[0.9, 0.8, 0.7]], dtype=torch.float32)
         cfg = DSparkScheduleConfig(gamma=3)
         verify_lens = impl(survival_probs=survival, budget=1000, cfg=cfg)
-        self.assertEqual(int(verify_lens[0].item()), 3)
+        # anchor (min_verify_len=1) + all 3 admitted drafts
+        self.assertEqual(int(verify_lens[0].item()), 4)
 
     @_for_each_impl
     def test_tie_break_is_deterministic(self, impl):
@@ -523,7 +530,9 @@ class TestVanillaMatchesReference(CustomTestCase):
 
 class TestVerifyLensComposition(CustomTestCase):
     def test_verify_lens_respects_history_budget(self):
-        low_history = torch.tensor([[0.95, 0.30, 0.05]], dtype=torch.float32)
+        # low history keeps only one candidate above survival_eps, so its
+        # budget stops below the high-history one for a single request.
+        low_history = torch.tensor([[0.95, 1e-9, 1e-12]], dtype=torch.float32)
         high_history = torch.tensor([[0.95, 0.90, 0.85]], dtype=torch.float32)
         sort_survival = torch.tensor([[0.95, 0.90, 0.85]], dtype=torch.float32)
         cfg = DSparkScheduleConfig(gamma=3)
@@ -554,13 +563,13 @@ class TestDSparkScheduleConfig(CustomTestCase):
         with self.assertRaises(ValueError):
             DSparkScheduleConfig(gamma=4, min_verify_len=3, max_verify_len=2).validate()
 
-    def test_validate_rejects_max_greater_than_gamma(self):
+    def test_validate_rejects_max_greater_than_gamma_plus_one(self):
         with self.assertRaises(ValueError):
-            DSparkScheduleConfig(gamma=4, max_verify_len=5).validate()
+            DSparkScheduleConfig(gamma=4, max_verify_len=6).validate()
 
-    def test_zero_max_resolves_to_gamma(self):
+    def test_zero_max_resolves_to_gamma_plus_one(self):
         cfg = DSparkScheduleConfig(gamma=7)
-        self.assertEqual(cfg.resolved_max_verify_len(), 7)
+        self.assertEqual(cfg.resolved_max_verify_len(), 8)
 
 
 class TestGraphTierFillBudget(CustomTestCase):
