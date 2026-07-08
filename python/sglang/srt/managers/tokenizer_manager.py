@@ -2679,6 +2679,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Stop the watchdog: child exits are expected during shutdown, not crashes.
         if self._subprocess_watchdog is not None:
             self._subprocess_watchdog.stop()
+        # Flush buffered per-request metrics exporters now that all requests have
+        # drained, so their final records are not lost on exit.
+        exporter_manager = getattr(self, "request_metrics_exporter_manager", None)
+        if exporter_manager is not None:
+            exporter_manager.close()
         # Ask schedulers to release resources in userspace and exit (see
         # ShutdownReq), then wait for them before hard-killing the rest.
         self._dispatch_to_scheduler(ShutdownReq())

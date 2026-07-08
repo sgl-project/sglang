@@ -340,6 +340,33 @@ class TestRequestMetricsExporterManager(unittest.TestCase):
         files = os.listdir(self.tmp_dir)
         self.assertEqual(len(files), 1)
 
+    def test_close_delegates_to_all_exporters(self):
+        server_args = _make_server_args(self.tmp_dir, enabled=False)
+        manager = RequestMetricsExporterManager(server_args)
+        e1, e2 = MagicMock(), MagicMock()
+        manager._exporters = [e1, e2]
+
+        manager.close()
+
+        e1.close.assert_called_once_with()
+        e2.close.assert_called_once_with()
+
+    def test_close_is_best_effort_when_one_exporter_raises(self):
+        server_args = _make_server_args(self.tmp_dir, enabled=False)
+        manager = RequestMetricsExporterManager(server_args)
+        bad, good = MagicMock(), MagicMock()
+        bad.close.side_effect = RuntimeError("boom")
+        manager._exporters = [bad, good]
+
+        manager.close()  # must not raise; the good exporter still closes
+
+        good.close.assert_called_once_with()
+
+    def test_close_with_no_exporters_is_noop(self):
+        server_args = _make_server_args(self.tmp_dir, enabled=False)
+        manager = RequestMetricsExporterManager(server_args)
+        manager.close()  # must not raise
+
 
 class TestCreateExporters(unittest.TestCase):
     def setUp(self):
@@ -358,6 +385,17 @@ class TestCreateExporters(unittest.TestCase):
         exporters = create_request_metrics_exporters(server_args)
         self.assertEqual(len(exporters), 1)
         self.assertIsInstance(exporters[0], FileRequestMetricsExporter)
+
+
+class TestRequestMetricsExporterBaseClose(unittest.TestCase):
+    def test_base_close_is_noop(self):
+        # The abstract base provides a no-op close() so exporters without
+        # buffered/async delivery need not override it.
+        server_args = _make_server_args("/tmp/unused")
+        exporter = _ConcreteExporter(
+            server_args, obj_skip_names=None, out_skip_names=None
+        )
+        exporter.close()  # inherits base no-op; must not raise
 
 
 if __name__ == "__main__":

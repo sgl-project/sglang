@@ -68,6 +68,14 @@ class RequestMetricsExporter(ABC):
         """Write a data record corresponding to a single request, containing performance metric data."""
         pass
 
+    def close(self) -> None:
+        """Release resources held by the exporter (flush buffered records, close
+        connections, stop background threads). Called once during shutdown.
+
+        The default is a no-op; exporters with buffered or asynchronous delivery
+        should override this to flush pending records before the process exits."""
+        pass
+
 
 class FileRequestMetricsExporter(RequestMetricsExporter):
     """Lightweight `RequestMetricsExporter` implementation that writes records to files on disk.
@@ -202,6 +210,22 @@ class RequestMetricsExporterManager:
         """Write a record using all configured exporters."""
         for exporter in self._exporters:
             await exporter.write_record(obj, out_dict)
+
+    def close(self) -> None:
+        """Close all configured exporters (best-effort).
+
+        Invoked on server/engine shutdown so exporters with buffered or
+        asynchronous delivery can flush their final records. One exporter
+        failing to close must not prevent the others from closing."""
+        for exporter in self._exporters:
+            try:
+                exporter.close()
+            except Exception:
+                logger.warning(
+                    "Failed to close request metrics exporter %r",
+                    exporter,
+                    exc_info=True,
+                )
 
 
 def create_request_metrics_exporters(

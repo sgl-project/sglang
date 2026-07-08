@@ -911,11 +911,18 @@ class Engine(EngineScoreMixin, EngineBase):
         """Shutdown the engine; block until the scheduler subprocess releases
         its GPU context so the caller can immediately reallocate on the same
         device."""
-        if (
-            self.tokenizer_manager is not None
-            and self.tokenizer_manager._subprocess_watchdog is not None
-        ):
-            self.tokenizer_manager._subprocess_watchdog.stop()
+        if self.tokenizer_manager is not None:
+            # Flush buffered per-request metrics exporters before teardown so a
+            # short-lived engine does not lose its final records. Guarded with
+            # getattr: not every tokenizer-manager variant builds one (e.g.
+            # MultiTokenizerRouter, which is not a TokenizerManager subclass).
+            exporter_manager = getattr(
+                self.tokenizer_manager, "request_metrics_exporter_manager", None
+            )
+            if exporter_manager is not None:
+                exporter_manager.close()
+            if self.tokenizer_manager._subprocess_watchdog is not None:
+                self.tokenizer_manager._subprocess_watchdog.stop()
 
         send_to_rpc = getattr(self, "send_to_rpc", None)
         if send_to_rpc is not None:
