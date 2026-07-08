@@ -1,12 +1,11 @@
-# Mechanical-move verifier — specification (source of truth)
+# Mechanical-move proof — specification (source of truth)
 
 ## 1. What this file is
 
 - This file is the **single source of truth** for *what the skill certifies* and *how*. The
   code (`scripts/mechanical_refactor_reproduce_utils.py`, `scripts/mechanical_refactor_generate_proof.py`),
-  the tests, and the prose guides (`SKILL.md`, `how-to-guide.md`, `mental-model-prep-and-move.md`) all
-  implement or describe this file. If any of them disagrees with it, **this file wins** and
-  the others are the bug.
+  the tests, and the prose guides (`SKILL.md`, `guide.md`) all implement or describe this
+  file. If any of them disagrees with it, **this file wins** and the others are the bug.
 - There is **one property** being certified — *a commit is a pure relocation* — and **one
   proof** of it: **reproduce** (§3). Regenerate the move from the base commit with faithful
   AST primitives, run the formatter, and diff byte-for-byte against the target commit. An
@@ -32,10 +31,13 @@ list is what they refuse to do, so it surfaces as a residual diff.
   whole block (the unavoidable reindent of relocation).
 - **Defs/classes gathered from scattered positions** in one source into a **new module**,
   each cut verbatim and assembled under an **authored header** — the module-level imports, a
-  `logger`, an `if TYPE_CHECKING:` guard, platform constants — reproduced from the target.
-  The defs are the proven relocation (the byte diff certifies the bodies); the small header is
-  authored, the same way an import is (§2.4). A module-level constant that moved into that
-  header (e.g. `_is_hip = is_hip()`) is dropped from the source too.
+  `logger`, an `if TYPE_CHECKING:` guard — reproduced from the target. The defs are the
+  proven relocation (the byte diff certifies the bodies). The header is **audited**, not
+  trusted: every header statement must be an import, a docstring, a TYPE_CHECKING import
+  block, a `logging.getLogger(__name__)` logger, or an unparse-equivalent copy of an
+  assignment actually deleted from the source (`drop_assigns`, e.g. `_is_hip = is_hip()`),
+  and every dropped assignment must reappear in the header — anything else raises instead
+  of certifying.
 - The **body of an extracted function** — an inline block relocated verbatim into a new def,
   with the `def` **signature**, an optional `return`, and the **call** that replaces the block
   authored. The body is the proven relocation; the small interface is authored (§2.4). This is
@@ -51,11 +53,15 @@ list is what they refuse to do, so it surfaces as a residual diff.
 - A **`self` type annotation dropped** from the moved definition — relocating
   `@staticmethod def foo(self: Target)` into `Target` as `def foo(self)` drops the
   decorator and the now-redundant `self` annotation.
-- A **call-site requalification of a moved symbol** — `self.foo(x)` → `foo(x)`, or
-  `Old.foo(x)` → `New.foo(x)`: same symbol, same arguments, only the qualifier differs.
+- A **call-site requalification of a moved symbol** — `Owner.foo(x)` → `foo(x)`: same
+  symbol, same argument bytes, only the qualifier dropped. (An `Old.foo(x)` → `New.foo(x)`
+  owner swap is not a primitive; it surfaces as a residual.)
 - A **call-site lowering of a moved method** — a staticmethod call
   `Owner.method(receiver, rest)` → the instance-method call `receiver.method(rest)` (the
   receiver moves out of the argument list).
+- **Deleting a source file the relocation emptied** — after its defs moved out, a file
+  holding nothing beyond a docstring, imports, or a `TYPE_CHECKING` block may be deleted
+  (`delete_file` refuses anything else).
 - **Blank-line changes** — ignored (§2.3): the formatter normalises them.
 
 ### 2.2 Not allowed — the commit is **not** a clean move
@@ -83,7 +89,7 @@ list is what they refuse to do, so it surfaces as a residual diff.
   it is a semantic rewrite, not a relocation (it goes in its own commit, §2.4).
 
 A rename, fresh scaffolding, a statement reorder, or an extraction whose body changed is
-reshape work, so it does not ride in the move (§2.4, `mental-model-prep-and-move.md`). The
+reshape work, so it does not ride in the move (§2.4, `guide.md`). The
 reproduce proof reports such a commit as a residual diff (or, when no definition relocated at
 all, as unsupported) — it does not certify it.
 
@@ -92,7 +98,9 @@ all, as unsupported) — it does not certify it.
 - A blank line never changes Python behavior, and PEP 8 separator blanks legitimately
   collapse when code is split across files or relocated. The formatter normalises them on
   both the reproduced and target sides, so a blank-line-only difference cannot appear in the
-  byte diff.
+  byte diff. This assumes the **target commit is itself pre-commit-clean** (true for any
+  commit that passed this repo's hooks); a target that skipped the formatter can show
+  blank-line residuals.
 
 ### 2.4 The three phases — prepare, move, postpare
 
@@ -109,24 +117,9 @@ Both ends are optional and minimal; neither prepare nor postpare ever relocates 
 files or moves a body. The whitelist in §2.1 is exactly what a relocation *forces*; it is
 **not** a licence to fold reshape work into the move.
 
-**A semantic refactor is not prepare.** A large behaviour-affecting rewrite — consolidating
-bookkeeping, deduplicating logic, redesigning an API, restructuring control flow — is its
-**own commit**, reviewed for **equivalence** (tests, or a written argument), never bundled into
-a prepare so it rides under the "small reshape" label. Prepare is for the *minimal* reshape a
-relocation forces, nothing more.
-
-**Extract-function puts the bulk in the move.** An extraction's big part — the relocated body
-— belongs in a certified move (the `extract_function` primitive cuts the inline block verbatim
-and authors only the signature/return/call). The faithful split is: a semantic commit for any
-de-self / restructure / consolidation **first** (reviewed for equivalence), then a move that
-relocates the now-unchanged body. An extraction that changes the body *as* it extracts (the
-two entangled) is a semantic commit, not a certifiable move — do not force it.
-
-**Extracting to a new module** no longer needs the body staged at the source tail first: the
-move gathers the defs from wherever they sit (`extract_symbols_to_new_module`) and assembles
-the new file under an authored header (imports, a logger, platform constants, a
-`TYPE_CHECKING` block) reproduced from the target. The defs are the proven relocation; only
-the small header is authored.
+A semantic refactor is never a prepare, an extraction's bulk goes in the move, and a
+new-module extraction needs no staging prep — the rationale, the case recipes, and the
+anti-patterns live in `guide.md` Part 1; this spec only fixes the phase boundaries above.
 
 ## 3. The proof — reproduce: regenerate the move and byte-diff
 
@@ -171,14 +164,22 @@ empty diff proves the commit is exactly that relocation.
   not a hand-written transform.
 - It is **self-contained and re-runnable** by anyone (a CI step, a PR reviewer), so the
   certification is not tied to the skill being installed.
+- One tradeoff is explicit: whatever the repo's **pre-commit hooks auto-fix is absorbed**
+  into both sides (e.g. ruff's F401 removing a now-unused import). A hook-introduced change
+  rides under a PASS, so the hook set itself is part of the trusted base.
 
 ### 3.3 The faithful relocation primitives
 
 Each primitive does only a **relocation-faithful, AST-driven** edit and never changes logic,
 so a byte match after the formatter certifies the commit is *exactly* that relocation:
 
-- `move_symbol` — cut a `def`/`class` with its decorators, drop `@staticmethod` /
-  `@classmethod`, dedent, paste at a class end or at module level.
+- `move_symbol` — cut a `def` (functions only; a class moves via the extract primitives)
+  with its decorators, drop its own `@staticmethod`/`@classmethod`, shift the indentation
+  uniformly, and paste it at a class end, at module level, or above a named sibling
+  (`before=`). Same-named defs must be disambiguated with `from_class=`; an ambiguous or
+  missing anchor raises. `leave_delegate=` additionally **authors** a forwarding stub
+  (the original header plus one `return self.<attr>.<name>(...)` line) in the source —
+  authored code, so audit it in the emitted script like any header.
 - `extract_to_new_module` — cut the contiguous tail of the source (the moved defs plus the
   scaffolding that leads into them) and write it as a new module, prepending
   `from __future__ import annotations` when the move adds it.
@@ -201,6 +202,8 @@ so a byte match after the formatter certifies the commit is *exactly* that reloc
   block (a moved annotation needs its type imported there); the sorter orders the block.
 - `repath_import` — repath a function-scoped `from old import ... name ...` to
   `from new import ...` in place (module-level repaths fall out of add/remove + the sorter).
+- `delete_file` — delete a source module the relocation emptied; refuses a file still
+  holding anything beyond a docstring, imports, or a `TYPE_CHECKING` block.
 
 ### 3.4 What the proof does **not** certify
 
@@ -216,7 +219,7 @@ so a byte match after the formatter certifies the commit is *exactly* that reloc
   literal — surfaces as a residual; it is a one-line **postpare** (or prepare), not a move.
 
 For an inference gap (not a property violation), write the `Repro` by hand (see
-`how-to-guide.md`); the same byte-diff then certifies it.
+`guide.md`); the same byte-diff then certifies it.
 
 ## 4. What a verdict asserts (and does not)
 

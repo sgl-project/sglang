@@ -19,7 +19,7 @@ that left" — you have to re-read the logic to be sure.
 **prepare** (a minimal in-place reshape), the **move** (the pure relocation, certified by the
 reproduce proof; see `SKILL.md`), and an optional **postpare** (a minimal tail fixup the move
 cannot do mechanically, e.g. a module path inside a string literal). Both ends are minimal and
-covered by tests; the move carries the bulk. See `verifier-spec.md` §2.4. ("prep" below is the
+covered by tests; the move carries the bulk. See `spec.md` §2.4. ("prep" below is the
 prepare phase.)
 
 **A large semantic refactor is not one of these phases.** Consolidating bookkeeping,
@@ -245,19 +245,17 @@ small and independently reviewable, beats one big prep that mixes ten flavors of
 semantic change. Review order follows commit order: prep → move → then any
 non-mechanical reshapes as separate follow-up commits.
 
-### Long constructor calls → `init_X` wrapper methods
-
-See `.claude/skills/large-class-style/SKILL.md`.
-
 ### Naming
 
 A split relocation uses consecutive commits with reserved suffixes:
 
 ```
-<id>-prepare    # optional: minimal in-place reshape (Case 1 de-self, or Case 2 retype-self)
-<id>-move       # pure relocation, certified by the reproduce proof
-<id>-postpare   # optional: minimal tail fixup the move cannot do (e.g. a string-literal path)
+<id>-prepare: <subject>    # optional: minimal in-place reshape (de-self, or retype-self)
+<id>-move: <subject>       # pure relocation, certified by the reproduce proof
+<id>-postpare: <subject>   # optional: minimal tail fixup (e.g. a string-literal path)
 ```
+
+The `<phase>:` form is what the range command's `--match -move:` regex keys on.
 
 Both ends are optional and minimal. A large semantic refactor is a separate commit, not one of
 these phases. Use a short kebab identifier for `<id>`.
@@ -266,7 +264,7 @@ these phases. Use a short kebab identifier for `<id>`.
 
 The proof that a commit is a pure relocation: regenerate it from the base commit with
 faithful AST primitives, run the formatter, and diff byte-for-byte against the target. An
-empty diff is the proof. See `SKILL.md` for the principle and `verifier-spec.md` for exactly
+empty diff is the proof. See `SKILL.md` for the principle and `spec.md` for exactly
 what counts as a clean move.
 
 ### Auto-generate the reproduce script from a commit (primary path)
@@ -305,7 +303,9 @@ The **module-level import diff is realised directly** from the target — gained
 `remove_imported_name`. This is deterministic and does not rely on the formatter pruning (this
 repo's ruff has no F811).
 
-It reports `UNSUPPORTED` (review as prepare, or hand-write the `Repro`) for:
+It reports `UNSUPPORTED` (single-commit mode prints the verdict with the notes and exits
+non-zero; range mode records it in `output.log`/`output.html`) — review as prepare, or
+hand-write the `Repro` — for:
 
 - a commit that relocates **no definition** — a rename (even a privacy flip `_foo` → `foo`)
   or a statement-level reorder; these are reshapes that belong in prepare;
@@ -319,8 +319,8 @@ It reports `UNSUPPORTED` (review as prepare, or hand-write the `Repro`) for:
 ### The `Repro` builder — relocation primitives
 
 When the generator reports `UNSUPPORTED`, compose the transform from the same faithful
-primitives by hand. Each does only a relocation-faithful, AST-driven edit (it never changes
-logic), so a byte match after the formatter certifies the commit is exactly that relocation —
+primitives by hand. Each does only a relocation-faithful edit -- AST-located, spliced as
+original source text (it never changes logic), so a byte match after the formatter certifies the commit is exactly that relocation —
 and a bundled change surfaces as a residual diff.
 
 ```python
@@ -342,8 +342,11 @@ r.run()   # PASS = byte-identical; otherwise prints the residual
 
 Primitives:
 
-- `move_symbol` — cut a def with its decorators, drop `@staticmethod`/`@classmethod`, dedent,
-  paste at the end of a class or at module level.
+- `move_symbol(name, *, src, dst, into_class, from_class, dedent, drop_self_annotation,
+  before, leave_delegate, delegate_name)` — cut a def with its decorators, drop its own
+  `@staticmethod`/`@classmethod`, shift indentation (a negative `dedent` indents into a
+  class), paste at a class end / module level / above the sibling `before`. Same-named defs
+  need `from_class`; `leave_delegate` authors a forwarding stub in the source (audit it).
 - `extract_to_new_module(src, dst, *, symbols, future_import)` — cut the contiguous tail of
   the source (the moved defs/classes plus the scaffolding that leads into them) and write it
   as a new module, prepending `from __future__ import annotations` when the move adds it.
@@ -357,7 +360,9 @@ Primitives:
   unchanged; compose it by hand (no auto-inference).
 - `lower_call_sites` — `Owner.m(receiver, rest)` → `receiver.m(rest)`.
 - `requalify_call_sites` — `Owner.m(args)` → `m(args)`.
-- `remove_import` — function-scoped or module-level, all occurrences, with the trailing blank.
+- `remove_import` — function-scoped or module-level; matches whole statements (token
+  boundaries), removes exactly the matched import even on a semicolon-joined line.
+- `delete_file` — delete a module the relocation emptied (refuses live code).
 - `remove_imported_name(rel, *, module, name, asname)` — drop a single name from a
   `from m import a, b` (or a plain `import x`), realising a lost import directly.
 - `add_import` — the formatter's import sorter places it.
@@ -399,14 +404,19 @@ if __name__ == "__main__":
 
 ### Make the proof re-runnable by reviewers
 
-Put the generated script (or your hand-written one) where a reviewer can run it — attached to
-the PR description or a gist — and include the one-click command:
+Share the whole `--out` folder (a gist, a PR attachment, a repo branch) — it is
+self-contained: `repro_scripts/<sha>.py` plus the copied
+`mechanical_refactor_reproduce_utils.py` it imports. A generated script resolves that module
+relative to its own path, so share the folder, not one raw file (a
+`python3 <(curl ...)` process substitution breaks the relative import). Include the
+commands in the PR description:
 
 ````markdown
 ## Mechanical move — reproducible
 
 ```bash
-python3 <(curl -sL <raw_url>)   # PASS = byte-identical to this PR
+# from the repo root, with the shared folder unpacked next to it
+python3 <folder>/repro_scripts/<sha>.py   # PASS = byte-identical to this commit
 ```
 ````
 
