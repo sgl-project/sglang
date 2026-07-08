@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 
 set -eu
 SGLANG_IMAGE="${SGLANG_IMAGE:-lmsysorg/sglang@sha256:1d8d7976fe11a8341408b92527200502e93dd69df0a63a81c57b92e70ec6fada}"
@@ -10,22 +10,26 @@ DFLASH_REV="${DFLASH_REV:-0919688658996800f86b895034249700e9481106}"
 WEAVER_REV="${WEAVER_REV:-309ceb4b1a6c44e6a3dfaeab8db1547e904254f8}"
 WEAVER_CKPT="${WEAVER_CKPT:-/artifacts/weaver/weaver/qwen36_27b_weaver.pth}"
 
-BASE_URL="${BASE_URL:-http://127.0.0.1:30000}"
 PORT="${PORT:-30000}"
+BASE_URL="${BASE_URL:-http://127.0.0.1:${PORT}}"
 
 usage() {
-  cat <<'EOF'
+  cat <<EOF
 Usage:
-  sh run_benchmark.sh run
-      Enter a shell in the pinned SGLang Docker image with this checkout mounted.
+  sh reproduction.sh exec [command...]
+      Run a command in the pinned SGLang Docker image.
 
-  sh run_benchmark.sh serve-ar
-  sh run_benchmark.sh serve-dflash
-  sh run_benchmark.sh serve-tfm
-      Launch one serving configuration on port 30000.
+  sh reproduction.sh serve-ar
+  sh reproduction.sh serve-dflash
+  sh reproduction.sh serve-tfm
+      Launch one serving configuration on the selected PORT (default 30000).
 
-  sh run_benchmark.sh bench
-      Run the benchmark harness against the server on port 30000.
+  sh reproduction.sh bench
+      Run the benchmark harness against BASE_URL (default http://127.0.0.1:\$PORT).
+
+Examples:
+  CUDA_VISIBLE_DEVICES=3 PORT=30003 sh reproduction.sh serve-tfm
+  PORT=30003 sh reproduction.sh bench
 
 EOF
 }
@@ -41,20 +45,58 @@ export_common_env() {
   export TARGET_MODEL TARGET_REV
   export DFLASH_MODEL DFLASH_REV
   export WEAVER_REV WEAVER_CKPT
+  export PORT BASE_URL
 }
 
-cmd_run() {
+cmd_exec() {
   need docker
+  mkdir -p artifacts
+  if [ "$#" -eq 0 ]; then
+    set -- /bin/zsh
+  fi
+  docker_tty="-i"
+  if [ -t 0 ]; then
+    docker_tty="-it"
+  fi
   docker pull "$SGLANG_IMAGE"
-  docker run -it --rm --shm-size 32g --gpus all \
+  docker run $docker_tty --rm --shm-size 32g --gpus all \
     -v "$HOME/.cache/huggingface:/root/.cache/huggingface" \
     -v "$PWD":/sgl-workspace/sglang \
     -v "$PWD/artifacts":/artifacts \
     -w /sgl-workspace/sglang \
+    -e CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}" \
     -e PYTHONPATH=/sgl-workspace/sglang/python \
+    -e SGL_REPRO_IN_CONTAINER=1 \
+    -e TARGET_MODEL="$TARGET_MODEL" \
+    -e TARGET_REV="$TARGET_REV" \
+    -e DFLASH_MODEL="$DFLASH_MODEL" \
+    -e DFLASH_REV="$DFLASH_REV" \
+    -e WEAVER_REV="$WEAVER_REV" \
+    -e WEAVER_CKPT="$WEAVER_CKPT" \
+    -e PORT="$PORT" \
+    -e BASE_URL="$BASE_URL" \
     --ipc=host --network=host --privileged \
     "$SGLANG_IMAGE" \
-    /bin/zsh
+    "$@"
+}
+
+run_in_container() {
+  subcommand="$1"
+  shift
+  if [ "${SGL_REPRO_IN_CONTAINER:-0}" = "1" ]; then
+    case "$subcommand" in
+      serve-ar) cmd_serve_ar "$@" ;;
+      serve-dflash) cmd_serve_dflash "$@" ;;
+      serve-tfm) cmd_serve_tfm "$@" ;;
+      bench) cmd_bench "$@" ;;
+      *)
+        echo "error: unknown in-container command: $subcommand" >&2
+        exit 1
+        ;;
+    esac
+  else
+    cmd_exec sh ./reproduction.sh "$subcommand" "$@"
+  fi
 }
 
 cmd_serve_ar() {
@@ -137,15 +179,20 @@ cmd_bench() {
     --flush-cache-between-requests
 }
 
-case "${1:-}" in
-  run) cmd_run ;;
-  serve-ar) cmd_serve_ar ;;
-  serve-dflash) cmd_serve_dflash ;;
-  serve-tfm) cmd_serve_tfm ;;
-  bench) cmd_bench ;;
+command="${1:-}"
+if [ "$#" -gt 0 ]; then
+  shift
+fi
+
+case "$command" in
+  exec) cmd_exec "$@" ;;
+  serve-ar) run_in_container serve-ar "$@" ;;
+  serve-dflash) run_in_container serve-dflash "$@" ;;
+  serve-tfm) run_in_container serve-tfm "$@" ;;
+  bench) run_in_container bench "$@" ;;
   ""|-h|--help|help) usage ;;
   *)
-    echo "error: unknown command: $1" >&2
+    echo "error: unknown command: $command" >&2
     usage >&2
     exit 1
     ;;
