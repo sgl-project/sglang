@@ -79,13 +79,13 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     commit_mamba_states_after_verify,
     draft_tp_context,
-    fast_sample,
     generate_token_bitmask,
     load_token_map,
     move_accept_tokens_to_target_kvcache,
     record_stream_each,
     record_stream_for_v2_verify,
     renorm_draft_probs,
+    sample_draft_proposal,
     select_top_k_tokens,
     spec_stage_span,
 )
@@ -784,9 +784,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         maybe_detect_nan(next_token_logits, probe_ctx)
         maybe_detect_inf(next_token_logits, probe_ctx)
         if self.server_args.speculative_use_rejection_sampling:
-            probs = renorm_draft_probs(next_token_logits, sampling_info, True)
-            topk_p, topk_index = fast_sample(probs, num_samples=1)
-            draft_probs = probs
+            draft_probs, topk_p, topk_index = sample_draft_proposal(
+                next_token_logits, sampling_info.temperatures
+            )
         elif self.topk == 1 and not _is_hip:
             topk_index = torch.argmax(next_token_logits, dim=-1, keepdim=True)
             topk_p = torch.ones_like(topk_index, dtype=torch.float32)

@@ -150,8 +150,8 @@ class EagleDraftInput(SpecInput):
     # shape: (b, topk)
     topk_p: torch.Tensor = None
     topk_index: torch.Tensor = None
-    # shape: (b, vocab) - single-step draft proposal q from draft-extend;
-    # only set under rejection sampling.
+    # Draft proposal q from draft-extend, only set under rejection sampling:
+    # (b, vocab) single-layer; (b, num_steps, vocab) multi-layer chain.
     draft_probs: torch.Tensor = None
     # shape: (b, hidden_size) - one hidden per req, consumed by `draft` forward.
     # None when the spec algorithm's draft doesn't read hidden_states
