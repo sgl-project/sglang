@@ -77,8 +77,8 @@ class Arg:
     no_cli: bool = False
     # When True, this field may be written by config resolution (model
     # overrides and post-process passes): it is part of the whitelist accepted
-    # by the apply_model_overrides gate, and its resolved value lives on the
-    # flags tier (the server_args field itself stays the pristine user input).
+    # by the declaration stash, and its resolved value materializes onto the
+    # field at the end of __post_init__.
     resolvable: bool = False
 
 

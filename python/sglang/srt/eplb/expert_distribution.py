@@ -284,18 +284,20 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         return self._recording
 
 
-_global_expert_distribution_recorder: Optional[ExpertDistributionRecorder] = (
-    _ExpertDistributionRecorderNoop()
-)
-
-
 def get_global_expert_distribution_recorder():
-    return _global_expert_distribution_recorder
+    from sglang.srt.runtime_context import get_resources
+
+    resources = get_resources()
+    if resources.expert_distribution_recorder is None:
+        # Call sites expect a recorder unconditionally; default to the noop.
+        resources.expert_distribution_recorder = _ExpertDistributionRecorderNoop()
+    return resources.expert_distribution_recorder
 
 
 def set_global_expert_distribution_recorder(value):
-    global _global_expert_distribution_recorder
-    _global_expert_distribution_recorder = value
+    from sglang.srt.runtime_context import get_resources
+
+    get_resources().expert_distribution_recorder = value
 
 
 # --------------------------------------- SinglePassGatherer -----------------------------------------

@@ -286,7 +286,7 @@ class EagerRunner(BaseRunner):
                         forward_batch.req_pool_indices,
                         get_req_to_token_pool().req_to_token,
                         forward_batch.seq_lens_sum,
-                        get_token_to_kv_pool().get_key_buffer(0).shape,
+                        get_token_to_kv_pool().get_kv_buffer_shape()[0],
                         model_runner.kv_cache_dtype,
                         model_runner.device,
                         create_chunked_prefix_cache_kv_indices,
@@ -313,6 +313,8 @@ class EagerRunner(BaseRunner):
             )
             kwargs["input_embeds"] = sharded_hidden_states
             forward_positions = sharded_positions
+        else:
+            forward_batch.attn_cp_metadata = None
 
         category = (
             "target_verify"

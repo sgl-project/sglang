@@ -188,15 +188,7 @@ class _EagleDraftWorkerHarness:
         self._topk1_parents_prealloc = None
         self._topk1_score_indices_prealloc = None
         EagleDraftWorker._rebuild_topk1_chain_buffers(self)
-        # draft_forward reads this (set in EagleDraftWorker.__init__, skipped here).
-        self.index_share_for_mtp_iteration = (
-            getattr(
-                self.model_config.hf_config,
-                "index_share_for_mtp_iteration",
-                False,
-            )
-            and self.topk == 1
-        )
+        EagleDraftWorker._init_dsa_index_share_state(self)
 
     @property
     def draft_model_runner(self):
@@ -398,7 +390,9 @@ def _build_frozen_kv_mtp_fixture(
         runner_batch_size=settings.capture_batch_size,
     )
     _configure_runner_for_eagle_draft(fixture.runner, case, settings)
-    fixture.runner.server_args.speculative_algorithm = "FROZEN_KV_MTP"
+    fixture.runner.server_args.override(
+        "attention_unittest.frozen_kv_draft", speculative_algorithm="FROZEN_KV_MTP"
+    )
     fixture.runner.spec_algorithm = SpeculativeAlgorithm.FROZEN_KV_MTP
     fixture.runner.draft_attn_backend = fixture.backend
     fixture.runner.attn_backend = fixture.backend
