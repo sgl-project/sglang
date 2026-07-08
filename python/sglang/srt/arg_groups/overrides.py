@@ -2018,7 +2018,16 @@ def _cutlass_moe_env_override(view: Any) -> dict:
 
 # Every A2A backend that forces expert parallelism to span the TP group.
 _A2A_EP_SPANNING_BACKENDS = frozenset(
-    {"megamoe", "deepep", "mooncake", "nixl", "ascend_fuseep", "flashinfer", "mori"}
+    {
+        "megamoe",
+        "deepep",
+        "mooncake",
+        "nixl",
+        "ascend_fuseep",
+        "flashinfer",
+        "mori",
+        "pplx",
+    }
 )
 
 

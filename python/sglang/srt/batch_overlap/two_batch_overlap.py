@@ -30,6 +30,7 @@ from sglang.srt.layers.moe.token_dispatcher import (
     MooncakeEPDispatcher,
     MoriEPDispatcher,
     NixlEPDispatcher,
+    PplxEPDispatcher,
 )
 from sglang.srt.layers.moe.token_dispatcher.base import BaseDispatcher
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -1088,6 +1089,10 @@ class MaybeTboDeepEPDispatcher(BaseDispatcher):
         elif get_moe_a2a_backend().is_nixl():
             self._inners = [
                 NixlEPDispatcher(**kwargs) for _ in range(num_inner_dispatchers)
+            ]
+        elif get_moe_a2a_backend().is_pplx():
+            self._inners = [
+                PplxEPDispatcher(**kwargs) for _ in range(num_inner_dispatchers)
             ]
 
     @property

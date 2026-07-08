@@ -329,7 +329,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         if (
             self.use_deep_gemm
             and layer.w13_weight.dtype == torch.bfloat16
-            and get_moe_a2a_backend().is_deepep()
+            and (get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_pplx())
             and get_deepep_mode().enable_low_latency()
             and not _is_npu
             and not _is_hip

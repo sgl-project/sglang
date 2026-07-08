@@ -677,6 +677,9 @@ class Envs:
     SGLANG_NIXL_EP_BF16_DISPATCH = EnvBool(False)
     SGLANG_NIXL_EP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
 
+    # PPLX-EP (Perplexity pplx-kernels NVSHMEM all-to-all)
+    SGLANG_PPLX_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
+
     # DSA Backend (canonical names; fall back to SGLANG_NSA_* with deprecation warning)
     SGLANG_DSA_FUSE_TOPK = EnvBoolWithAlias(
         True, deprecated_name="SGLANG_NSA_FUSE_TOPK"

@@ -273,6 +273,7 @@ MOE_A2A_BACKEND_CHOICES = [
     "ascend_fuseep",
     "flashinfer",
     "megamoe",
+    "pplx",
     "ascend_tp",
 ]
 
@@ -1912,7 +1913,7 @@ class ServerArgs:
             "ascend_fuseep",
             "flashinfer",
             "megamoe",
-            "ascend_tp",
+            "pplx",
         ],
         Arg(
             help="Choose the backend for MoE A2A.",
@@ -5686,6 +5687,27 @@ class ServerArgs:
                     "must be >= the per-rank MoRI dispatch tokens "
                     "(chunked_prefill_size by default)"
                 )
+
+        if a2a_backend == "pplx":
+            # pplx-kernels is a low-latency-only masked all-to-all backend, so
+            # force the low-latency dispatch mode (it does not have a normal /
+            # contiguous path).
+            if self.deepep_mode == "normal":
+                raise ValueError(
+                    "moe_a2a_backend='pplx' only supports low-latency mode; "
+                    "set --deepep-mode to 'low_latency' or 'auto'."
+                )
+            if self.deepep_mode == "auto":
+                self.deepep_mode = "low_latency"
+                logger.warning("auto set deepep_mode=`low_latency` for PPLX EP")
+            # pplx AllToAll requires at least 2 DP groups (world_size > dp_size).
+            assert (
+                resolved_view(self).ep_size >= 2
+            ), "moe_a2a_backend='pplx' requires ep_size >= 2."
+            logger.warning(
+                f"PPLX MoE is enabled. The expert parallel size is adjusted to "
+                f"be the same as the tensor parallel size[{self.tp_size}]."
+            )
 
     def _required_mori_dispatch_tokens_per_rank(self) -> int:
         """Max tokens a single rank dispatches through MoRI in one forward."""
