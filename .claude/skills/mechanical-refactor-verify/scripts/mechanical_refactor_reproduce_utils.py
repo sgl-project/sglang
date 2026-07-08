@@ -462,9 +462,16 @@ class Repro:
                 else:
                     shared.append(node)
             text = "".join(lines)
-            for node in sorted(shared, key=lambda n: (n.lineno, n.col_offset), reverse=True):
+            for node in sorted(
+                shared, key=lambda n: (n.lineno, n.col_offset), reverse=True
+            ):
                 text = _replace_span(
-                    text, node.lineno, node.col_offset, node.end_lineno, node.end_col_offset, ""
+                    text,
+                    node.lineno,
+                    node.col_offset,
+                    node.end_lineno,
+                    node.end_col_offset,
+                    "",
                 )
                 fixed = _split_keepends(text)
                 joined_line = fixed[node.lineno - 1]
@@ -510,11 +517,7 @@ class Repro:
                     if "." * node.level + (node.module or "") != module:
                         continue
                 dropped_alias = next(
-                    (
-                        a
-                        for a in node.names
-                        if a.name == name and a.asname == asname
-                    ),
+                    (a for a in node.names if a.name == name and a.asname == asname),
                     None,
                 )
                 if dropped_alias is None:
@@ -559,9 +562,12 @@ class Repro:
             nl = _newline_style("".join(lines))
             body = ast.parse("".join(lines)).body
             last = 0
-            if body and isinstance(body[0], ast.Expr) and isinstance(
-                body[0].value, ast.Constant
-            ) and isinstance(body[0].value.value, str):
+            if (
+                body
+                and isinstance(body[0], ast.Expr)
+                and isinstance(body[0].value, ast.Constant)
+                and isinstance(body[0].value.value, str)
+            ):
                 last = body[0].end_lineno
             for node in body:
                 if isinstance(node, (ast.Import, ast.ImportFrom)):
@@ -623,9 +629,9 @@ class Repro:
                     replaced = lines[node.lineno - 1].replace(
                         f"from {spelled} import", f"from {new_module} import", 1
                     )
-                    assert replaced != lines[node.lineno - 1], (
-                        f"import spelling {spelled!r} not found on its line in {rel}"
-                    )
+                    assert (
+                        replaced != lines[node.lineno - 1]
+                    ), f"import spelling {spelled!r} not found on its line in {rel}"
                     lines[node.lineno - 1] = replaced
                     changed = True
             assert changed, f"nested import of {name} from {old_module} not in {rel}"
