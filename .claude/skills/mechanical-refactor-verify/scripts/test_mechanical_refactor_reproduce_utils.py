@@ -1020,7 +1020,9 @@ def test_move_symbol_moves_an_async_def_verbatim(tmp_path: Path) -> None:
 
 def test_move_symbol_moves_a_def_within_the_same_file(tmp_path: Path) -> None:
     """With src == dst the def is cut and re-inserted above its sibling in one file."""
-    (tmp_path / "m.py").write_text("def a():\n    return 1\n\n\ndef b():\n    return 2\n")
+    (tmp_path / "m.py").write_text(
+        "def a():\n    return 1\n\n\ndef b():\n    return 2\n"
+    )
     r = Repro("b", "t").move_symbol(
         "b", src="m.py", dst="m.py", into_class=None, before="a"
     )
@@ -1103,7 +1105,9 @@ def test_move_symbol_without_trailing_newlines_keeps_moved_bytes(
     tmp_path: Path,
 ) -> None:
     """Files lacking a final newline lose no bytes of the moved def or the remainder."""
-    (tmp_path / "src.py").write_text("def keep():\n    return 0\n\n\ndef foo():\n    return 1")
+    (tmp_path / "src.py").write_text(
+        "def keep():\n    return 0\n\n\ndef foo():\n    return 1"
+    )
     (tmp_path / "dst.py").write_text("x = 1")
     r = Repro("b", "t").move_symbol("foo", src="src.py", dst="dst.py", into_class=None)
     _apply(r, tmp_path)
@@ -1111,7 +1115,9 @@ def test_move_symbol_without_trailing_newlines_keeps_moved_bytes(
     assert (tmp_path / "dst.py").read_text() == "x = 1\ndef foo():\n    return 1"
 
 
-def test_move_symbol_dedent_leaves_string_literal_interior_lines(tmp_path: Path) -> None:
+def test_move_symbol_dedent_leaves_string_literal_interior_lines(
+    tmp_path: Path,
+) -> None:
     """Dedent only strips lines with exactly n leading spaces, so string interiors survive."""
     (tmp_path / "src.py").write_text(
         "class Old:\n"
@@ -1142,7 +1148,9 @@ def test_move_symbol_asserts_when_destination_class_missing(tmp_path: Path) -> N
     """Naming an into_class absent from the destination fails loudly."""
     (tmp_path / "src.py").write_text("def foo():\n    return 1\n")
     (tmp_path / "dst.py").write_text("x = 1\n")
-    r = Repro("b", "t").move_symbol("foo", src="src.py", dst="dst.py", into_class="Nope")
+    r = Repro("b", "t").move_symbol(
+        "foo", src="src.py", dst="dst.py", into_class="Nope"
+    )
     with pytest.raises(AssertionError):
         _apply(r, tmp_path)
 
@@ -1164,7 +1172,9 @@ def test_move_symbol_preserves_staticmethod_inside_moved_body(tmp_path: Path) ->
         "                return y\n"
         "        return Inner.helper(x)\n"
     )
-    (tmp_path / "dst.py").write_text("class New:\n    def keep(self):\n        return 0\n")
+    (tmp_path / "dst.py").write_text(
+        "class New:\n    def keep(self):\n        return 0\n"
+    )
     r = Repro("b", "t").move_symbol("foo", src="src.py", dst="dst.py", into_class="New")
     _apply(r, tmp_path)
     dst_out = (tmp_path / "dst.py").read_text()
@@ -1187,7 +1197,9 @@ def test_move_symbol_rejects_ambiguous_duplicate_names(tmp_path: Path) -> None:
         "    def foo(self):\n"
         "        return 'B'\n"
     )
-    (tmp_path / "dst.py").write_text("class New:\n    def keep(self):\n        return 0\n")
+    (tmp_path / "dst.py").write_text(
+        "class New:\n    def keep(self):\n        return 0\n"
+    )
     r = Repro("b", "t").move_symbol("foo", src="src.py", dst="dst.py", into_class="New")
     with pytest.raises(AssertionError):
         _apply(r, tmp_path)
@@ -1300,7 +1312,9 @@ def test_move_symbol_leave_delegate_forwards_posonly_vararg_kwonly_kwargs(
         "    def compute(self, a, /, b, *args, c, d=3, **kw):\n"
         "        return a\n"
     )
-    (tmp_path / "dst.py").write_text("class Cfg:\n    def keep(self):\n        return 0\n")
+    (tmp_path / "dst.py").write_text(
+        "class Cfg:\n    def keep(self):\n        return 0\n"
+    )
     r = Repro("b", "t").move_symbol(
         "compute", src="src.py", dst="dst.py", into_class="Cfg", leave_delegate="cfg"
     )
@@ -1330,7 +1344,9 @@ def test_move_symbol_leave_delegate_survives_paren_in_string_default(
         "    ) -> int:\n"
         "        return n + self.cfg.base\n"
     )
-    (tmp_path / "dst.py").write_text("class Cfg:\n    def keep(self):\n        return 0\n")
+    (tmp_path / "dst.py").write_text(
+        "class Cfg:\n    def keep(self):\n        return 0\n"
+    )
     r = Repro("b", "t").move_symbol(
         "compute", src="src.py", dst="dst.py", into_class="Cfg", leave_delegate="cfg"
     )
@@ -1667,7 +1683,9 @@ def test_add_typechecking_import_raises_without_a_block(tmp_path: Path) -> None:
         _apply(r, tmp_path)
 
 
-def test_repath_import_repaths_a_multiline_aliased_nested_import(tmp_path: Path) -> None:
+def test_repath_import_repaths_a_multiline_aliased_nested_import(
+    tmp_path: Path,
+) -> None:
     """A nested multi-line from-import with an alias is repathed on its first line."""
     (tmp_path / "c.py").write_text(
         "def run():\n"
@@ -1861,7 +1879,9 @@ def test_extract_function_does_not_reindent_string_literal_interiors(
     tmp_path: Path,
 ) -> None:
     """Triple-quoted string interior lines keep their exact bytes through the extraction."""
-    (tmp_path / "src.py").write_text("TEMPLATE = '''\nliteral line\n'''\nx = TEMPLATE\n")
+    (tmp_path / "src.py").write_text(
+        "TEMPLATE = '''\nliteral line\n'''\nx = TEMPLATE\n"
+    )
     (tmp_path / "dst.py").write_text("def existing():\n    return 0\n")
     r = Repro("b", "t").extract_function(
         "src.py",
@@ -1909,7 +1929,9 @@ def test_extract_function_into_class_indents_body_to_method_depth(
 ) -> None:
     """Extracting into a class must indent the relocated body to method depth."""
     (tmp_path / "src.py").write_text("val = compute_thing()\n")
-    (tmp_path / "dst.py").write_text("class H:\n    def last(self):\n        return 0\n")
+    (tmp_path / "dst.py").write_text(
+        "class H:\n    def last(self):\n        return 0\n"
+    )
     r = Repro("b", "t").extract_function(
         "src.py",
         "dst.py",
