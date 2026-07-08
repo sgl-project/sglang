@@ -65,7 +65,22 @@ def mamba2_state_dtype(config=None) -> Mamba2StateDType:
         "bfloat16": torch.bfloat16,
         "float16": torch.float16,
     }
-    conv_dtype = dtype_map.get(envs.SGLANG_MAMBA_CONV_DTYPE.get(), torch.bfloat16)
+    # Get conv dtype: default -> config -> env var
+    # Default to model dtype if available, otherwise bfloat16
+    default_conv_dtype = torch.bfloat16
+    if config is not None:
+        # For VL models, dtype is in text_config
+        text_config = getattr(config, "text_config", config)
+        if hasattr(text_config, "dtype"):
+            default_conv_dtype = text_config.dtype
+
+    conv_dtype = dtype_map.get(envs.SGLANG_MAMBA_CONV_DTYPE.get(), default_conv_dtype)
+    if isinstance(conv_dtype, str):
+        if conv_dtype not in dtype_map:
+            logger.warning(f"Invalid conv_dtype '{conv_dtype}'. Using default.")
+            conv_dtype = default_conv_dtype
+        else:
+            conv_dtype = dtype_map[conv_dtype]
 
     # Get SSM dtype: default -> config -> env var
     ssm_dtype = torch.float32  # Step 1: Default value
