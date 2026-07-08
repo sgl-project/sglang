@@ -1637,6 +1637,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             output_topk_p,
             output_topk_index,
             output_hidden_states,
+            output_dsa_topk_indices,
             output_bootstrap_room,
         ) = self.metadata_buffers.get_buf(idx)
 
@@ -1730,6 +1731,12 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             decode_req.req.output_topk_p = output_topk_p
             decode_req.req.output_topk_index = output_topk_index
             decode_req.req.hidden_states_tensor = output_hidden_states
+            if (
+                output_dsa_topk_indices is not None
+                and torch.all(output_dsa_topk_indices < 0).item()
+            ):
+                output_dsa_topk_indices = None
+            decode_req.req.output_dsa_topk_indices = output_dsa_topk_indices
 
         if decode_req.req.return_logprob and not replayed_boundary:
             decode_req.req.logprob.output_token_logprobs_val.append(
