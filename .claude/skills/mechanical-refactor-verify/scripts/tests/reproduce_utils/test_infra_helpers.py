@@ -21,6 +21,7 @@ from mechanical_refactor_reproduce_utils import (
 )
 from reproduce_testlib import _apply, _commit, _git, _write  # noqa: F401
 
+
 # --- exec_command --------------------------------------------------------------
 
 
@@ -50,6 +51,9 @@ def test_exec_command_check_false_returns_stdout_without_exiting() -> None:
 # --- git_add_and_commit --------------------------------------------------------
 
 
+# --- git_add_and_commit --------------------------------------------------------
+
+
 def test_git_add_and_commit_stages_and_commits(repo: Path) -> None:
     """It stages every change in the cwd and records a commit with the message."""
     _write(repo, **{"file.txt": "content\n"})
@@ -74,6 +78,9 @@ def test_git_add_and_commit_message_round_trips_with_metacharacters(
     _write(repo, **{"file.txt": "content\n"})
     git_add_and_commit(message, cwd=str(repo))
     assert _git(repo, "log", "-1", "--format=%B") == message
+
+
+# --- dedent --------------------------------------------------------------------
 
 
 # --- dedent --------------------------------------------------------------------
@@ -113,6 +120,9 @@ def test_dedent_preserves_absence_of_trailing_newline() -> None:
 # --- span / call helpers -------------------------------------------------------
 
 
+# --- span / call helpers -------------------------------------------------------
+
+
 def test_replace_span_single_line() -> None:
     """A span within one line is replaced in place."""
     assert _replace_span("ab cd ef\n", 1, 3, 1, 5, "XY") == "ab XY ef\n"
@@ -128,14 +138,6 @@ def test_slice_span_returns_the_overwritten_text() -> None:
     """_slice_span returns exactly the region _replace_span would overwrite."""
     text = "a = foo(\n    x,\n) + 1\n"
     assert _slice_span(text, 1, 4, 3, 1) == "foo(\n    x,\n)"
-
-
-def test_lowered_call_text_preserves_magic_trailing_comma(tmp_path: Path) -> None:
-    """A magic trailing comma in the original call survives the textual lowering."""
-    (tmp_path / "m.py").write_text("x = Old.foo(\n    self.r,\n    a,\n    b,\n)\n")
-    r = Repro("b", "t").lower_call_sites("foo", "Old", paths=["m.py"])
-    _apply(r, tmp_path)
-    assert (tmp_path / "m.py").read_text() == "x = self.r.foo(\n    a,\n    b,\n)\n"
 
 
 def test_find_def_span_includes_decorators() -> None:

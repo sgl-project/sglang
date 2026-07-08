@@ -21,6 +21,15 @@ from mechanical_refactor_reproduce_utils import (
 )
 from reproduce_testlib import _apply, _commit, _git, _write  # noqa: F401
 
+
+def test_lowered_call_text_preserves_magic_trailing_comma(tmp_path: Path) -> None:
+    """A magic trailing comma in the original call survives the textual lowering."""
+    (tmp_path / "m.py").write_text("x = Old.foo(\n    self.r,\n    a,\n    b,\n)\n")
+    r = Repro("b", "t").lower_call_sites("foo", "Old", paths=["m.py"])
+    _apply(r, tmp_path)
+    assert (tmp_path / "m.py").read_text() == "x = self.r.foo(\n    a,\n    b,\n)\n"
+
+
 # --- lower_call_sites ----------------------------------------------------------
 
 
@@ -59,12 +68,18 @@ def test_lower_call_sites_preserves_magic_trailing_comma(tmp_path: Path) -> None
 # --- requalify_call_sites ------------------------------------------------------
 
 
+# --- requalify_call_sites ------------------------------------------------------
+
+
 def test_requalify_call_sites_drops_the_qualifier(tmp_path: Path) -> None:
     """Owner.bar(args) becomes bar(args) when bar moves to a free function."""
     (tmp_path / "m.py").write_text("y = ModelRunner.bar(a, b)\n")
     r = Repro("b", "t").requalify_call_sites("bar", "ModelRunner", paths=["m.py"])
     _apply(r, tmp_path)
     assert (tmp_path / "m.py").read_text() == "y = bar(a, b)\n"
+
+
+# --- adversarial audit: call-site rewrites ---------------------------------------
 
 
 # --- adversarial audit: call-site rewrites ---------------------------------------
