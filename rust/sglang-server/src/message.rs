@@ -368,26 +368,35 @@ pub const EGRESS_TAG_BATCH: u8 = 2;
 /// header, so it routes a 400 back to that request instead of crashing the loop.
 pub const EGRESS_TAG_ERROR: u8 = 3;
 
-/// Read `n` little-endian f32s from `data` at `*off`, advancing `*off`.
-fn take_f32(data: &[u8], off: &mut usize, n: usize) -> Vec<f32> {
-    let end = (*off + n * 4).min(data.len());
-    let out = data[*off..end]
+/// Read `n` little-endian f32s from `data` at `*off`, advancing `*off`. `None` when
+/// the range runs past the buffer (a malformed / positional-ABI-drifted frame): the
+/// caller rejects the whole frame. Bounds-checked via `data.get` — clamping only the
+/// end is unsafe because a prior bad length can push `*off` past `len`, making the
+/// range reversed (`start > end`) and the slice panic.
+fn take_f32(data: &[u8], off: &mut usize, n: usize) -> Option<Vec<f32>> {
+    let start = *off;
+    let end = start.checked_add(n.checked_mul(4)?)?;
+    let out = data
+        .get(start..end)?
         .chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
     *off = end;
-    out
+    Some(out)
 }
 
-/// Read `n` little-endian i32s from `data` at `*off`, advancing `*off`.
-fn take_i32(data: &[u8], off: &mut usize, n: usize) -> Vec<i32> {
-    let end = (*off + n * 4).min(data.len());
-    let out = data[*off..end]
+/// Read `n` little-endian i32s from `data` at `*off`, advancing `*off`. `None` past
+/// the buffer end (see [`take_f32`]).
+fn take_i32(data: &[u8], off: &mut usize, n: usize) -> Option<Vec<i32>> {
+    let start = *off;
+    let end = start.checked_add(n.checked_mul(4)?)?;
+    let out = data
+        .get(start..end)?
         .chunks_exact(4)
         .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
     *off = end;
-    out
+    Some(out)
 }
 
 /// Frame a decode batch: `[BATCH tag][u32 header len][header][data cols…]`. The
@@ -443,12 +452,19 @@ pub struct BatchHeader {
 
 /// Read a request's flat logprob column (`l` val/idx pairs) from `data` at cursors
 /// `cv`/`ci`, advancing them. Only this request is copied — no whole-column buffer.
-fn take_flat(data: &[u8], cv: &mut usize, ci: &mut usize, l: usize) -> (Vec<f32>, Vec<i32>) {
-    (take_f32(data, cv, l), take_i32(data, ci, l))
+/// `None` if either read runs past the buffer (see [`take_f32`]).
+fn take_flat(
+    data: &[u8],
+    cv: &mut usize,
+    ci: &mut usize,
+    l: usize,
+) -> Option<(Vec<f32>, Vec<i32>)> {
+    Some((take_f32(data, cv, l)?, take_i32(data, ci, l)?))
 }
 
 /// Read a request's ragged logprob column (`np` positions): its per-position `lens`
-/// from `poslens` (advancing `pcur`), then that many val/idx from `cv`/`ci`.
+/// from `poslens` (advancing `pcur`), then that many val/idx from `cv`/`ci`. `None`
+/// if the val/idx read runs past the buffer (see [`take_f32`]).
 fn take_ragged(
     data: &[u8],
     cv: &mut usize,
@@ -456,28 +472,28 @@ fn take_ragged(
     poslens: &[u32],
     pcur: &mut usize,
     np: usize,
-) -> (Vec<f32>, Vec<i32>, Vec<u32>) {
+) -> Option<(Vec<f32>, Vec<i32>, Vec<u32>)> {
     let pe = (*pcur + np).min(poslens.len());
     let lens = poslens[(*pcur).min(pe)..pe].to_vec();
     *pcur = pe;
     let nv: usize = lens.iter().map(|&x| x as usize).sum();
-    (take_f32(data, cv, nv), take_i32(data, ci, nv), lens)
+    Some((take_f32(data, cv, nv)?, take_i32(data, ci, nv)?, lens))
 }
 
 /// Like [`take_ragged`] but for hidden states — a val column + row `poslens`, no
-/// idx column.
+/// idx column. `None` if the val read runs past the buffer (see [`take_f32`]).
 fn take_hidden(
     data: &[u8],
     cv: &mut usize,
     poslens: &[u32],
     pcur: &mut usize,
     nr: usize,
-) -> (Vec<f32>, Vec<u32>) {
+) -> Option<(Vec<f32>, Vec<u32>)> {
     let pe = (*pcur + nr).min(poslens.len());
     let lens = poslens[(*pcur).min(pe)..pe].to_vec();
     *pcur = pe;
     let nv: usize = lens.iter().map(|&x| x as usize).sum();
-    (take_f32(data, cv, nv), lens)
+    Some((take_f32(data, cv, nv)?, lens))
 }
 
 /// Decode a batch egress frame (tag stripped), calling `route` with each request's
@@ -523,17 +539,29 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> bool {
     let mut c_id_i = col(sum(&h.in_tid_poslens));
     let mut c_h_v = col(sum(&h.hidden_poslens));
 
+    // `col` summed every column's byte span into `base`. A header whose lengths
+    // exceed the data buffer is a malformed / positional-ABI-drifted frame: reject
+    // it whole — *before* routing any request — rather than reading out of bounds.
+    // (Out of bounds would panic the sole egress thread and stall every request;
+    // partially-routed misaligned columns would deliver garbage to real requests.)
+    if base > data.len() {
+        return false;
+    }
+
     // Position cursors into the header's per-request `poslens` (ragged + hidden).
     let (mut p_ot, mut p_it, mut p_od, mut p_id, mut p_h) =
         (0usize, 0usize, 0usize, 0usize, 0usize);
     let lens_i = |v: &[u32], i: usize| v.get(i).copied().unwrap_or(0) as usize;
 
-    for i in 0..n {
-        let token_ids = take_i32(data, &mut c_ids, lens_i(&h.tok_lens, i));
+    // Decode one request's slice of every column, advancing the cursors. `None` if a
+    // read overruns `data` (belt-and-suspenders past the upfront check) — the caller
+    // then rejects the frame instead of slicing out of bounds.
+    let mut decode_one = |i: usize| -> Option<ChunkEvent> {
+        let token_ids = take_i32(data, &mut c_ids, lens_i(&h.tok_lens, i))?;
         let (out_lp_val, out_lp_idx) =
-            take_flat(data, &mut c_olp_v, &mut c_olp_i, lens_i(&h.out_lp_lens, i));
+            take_flat(data, &mut c_olp_v, &mut c_olp_i, lens_i(&h.out_lp_lens, i))?;
         let (in_lp_val, in_lp_idx) =
-            take_flat(data, &mut c_ilp_v, &mut c_ilp_i, lens_i(&h.in_lp_lens, i));
+            take_flat(data, &mut c_ilp_v, &mut c_ilp_i, lens_i(&h.in_lp_lens, i))?;
         let (out_top_val, out_top_idx, out_top_lens) = take_ragged(
             data,
             &mut c_ot_v,
@@ -541,7 +569,7 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> bool {
             &h.out_top_poslens,
             &mut p_ot,
             lens_i(&h.out_top_reqlens, i),
-        );
+        )?;
         let (in_top_val, in_top_idx, in_top_lens) = take_ragged(
             data,
             &mut c_it_v,
@@ -549,7 +577,7 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> bool {
             &h.in_top_poslens,
             &mut p_it,
             lens_i(&h.in_top_reqlens, i),
-        );
+        )?;
         let (out_tid_val, out_tid_idx, out_tid_lens) = take_ragged(
             data,
             &mut c_od_v,
@@ -557,7 +585,7 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> bool {
             &h.out_tid_poslens,
             &mut p_od,
             lens_i(&h.out_tid_reqlens, i),
-        );
+        )?;
         let (in_tid_val, in_tid_idx, in_tid_lens) = take_ragged(
             data,
             &mut c_id_v,
@@ -565,14 +593,14 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> bool {
             &h.in_tid_poslens,
             &mut p_id,
             lens_i(&h.in_tid_reqlens, i),
-        );
+        )?;
         let (hidden_val, hidden_lens) = take_hidden(
             data,
             &mut c_h_v,
             &h.hidden_poslens,
             &mut p_h,
             lens_i(&h.hidden_reqlens, i),
-        );
+        )?;
 
         // Logprob/hidden columns ride behind the boxed extras — allocate only when
         // this request actually carries some (the common frame stays extras-free).
@@ -597,14 +625,21 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> bool {
             hidden_lens,
             ..Default::default()
         };
-        route(ChunkEvent {
+        Some(ChunkEvent {
             rid: h.rids[i],
             token_ids,
             finish_reason: h.finish_reasons.get(i).cloned().flatten(),
             prompt_tokens: h.prompt_tokens.get(i).copied().unwrap_or(0),
             extras: (!extras.is_empty()).then(|| Box::new(extras)),
             ..Default::default()
-        });
+        })
+    };
+
+    for i in 0..n {
+        let Some(ev) = decode_one(i) else {
+            return false;
+        };
+        route(ev);
     }
     true
 }
@@ -888,6 +923,36 @@ mod tests {
         assert_eq!(events[2].rid, 3);
         assert_eq!(events[2].token_ids, vec![12]);
         assert_eq!(events[2].prompt_tokens, 6);
+    }
+
+    /// A header whose column lengths exceed the data buffer (a Python/Rust
+    /// positional-ABI drift, or a truncated frame) is rejected: `for_each_chunk`
+    /// returns false and routes nothing — it must NOT panic the sole egress thread
+    /// on an out-of-bounds slice. Built the way Python emits (positional msgpack
+    /// header + concatenated data columns).
+    #[test]
+    fn rejects_frame_with_lengths_past_data() {
+        use rmpv::Value;
+        // 1 request: tok_lens[0]=10 claims 40 bytes and out_lp_lens[0]=1 puts the
+        // logprob column's base past the 4-byte data buffer. The old clamp-only-`end`
+        // code advanced the cursor past `len`, then sliced `data[40..4]` (start > end)
+        // and panicked.
+        let header_arr = Value::Array(vec![
+            Value::Array(vec![Value::from(1u64)]),  // rids
+            Value::Array(vec![Value::Nil]),         // finish_reasons
+            Value::Array(vec![Value::from(0u32)]),  // prompt_tokens
+            Value::Array(vec![Value::from(10u32)]), // tok_lens (claims 40 bytes)
+            Value::Array(vec![Value::from(1u32)]),  // out_lp_lens (base now past data)
+        ]);
+        let mut header = Vec::new();
+        rmpv::encode::write_value(&mut header, &header_arr).unwrap();
+        let data: Vec<u8> = [0i32].iter().flat_map(|x| x.to_le_bytes()).collect(); // 4 bytes
+
+        let framed = frame_egress_batch_cols(&header, &[&data]);
+        let mut routed = 0usize;
+        let ok = for_each_chunk(&framed[1..], |_| routed += 1);
+        assert!(!ok, "malformed frame must be rejected, not decoded");
+        assert_eq!(routed, 0, "no request may be routed from a rejected frame");
     }
 
     /// A batch frame carrying the numeric columns (extras path): 2 requests,
