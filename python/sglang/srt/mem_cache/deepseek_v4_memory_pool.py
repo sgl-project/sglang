@@ -485,6 +485,7 @@ class DeepSeekV4UnifiedKVPool:
         memory_saver_adapter,
         custom_mem_pool,
         swa_ring_size: int,
+        c4_compress_pages: Optional[int] = None,
     ):
         self.swa_ring_size = swa_ring_size
         self.head_dim = qk_nope_head_dim + qk_rope_head_dim
@@ -492,6 +493,9 @@ class DeepSeekV4UnifiedKVPool:
         self.swa_pages = num_slots * self.swa_ring_size
         self.num_blocks = num_blocks
         self.k_per_block = dict(self.K_PER_BLOCK)
+        # When set (unified-KV HiSparse), size the on-device C4 region to the
+        # shrunk hot budget (c4_size); the cold remainder lives on the host mirror.
+        self.c4_compress_pages = c4_compress_pages
 
         bufs = []
         with memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
@@ -501,7 +505,10 @@ class DeepSeekV4UnifiedKVPool:
                 else nullcontext()
             ):
                 for ratio in stage_ratios:
-                    compress_pages = self.num_blocks * self.k_per_block[ratio]
+                    if ratio == 4 and self.c4_compress_pages is not None:
+                        compress_pages = self.c4_compress_pages
+                    else:
+                        compress_pages = self.num_blocks * self.k_per_block[ratio]
                     bufs.append(
                         torch.zeros(
                             self.swa_pages + compress_pages,
@@ -652,10 +659,14 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 if server_args.speculative_algorithm is not None
                 else 0
             )
+            # Unified-KV HiSparse (ROCm): device holds only the shrunk C4 hot
+            # budget (c4_size); the full C4 is mirrored on the host cold pool.
+            unified_c4_hisparse = enable_hisparse and _is_hip
             self.unified_kv_pool = DeepSeekV4UnifiedKVPool(
                 stage_ratios=stage_ratios,
                 num_slots=self.num_req_slots,
                 num_blocks=self.c128_size,
+                c4_compress_pages=(c4_size if unified_c4_hisparse else None),
                 qk_nope_head_dim=qk_nope_head_dim,
                 qk_rope_head_dim=qk_rope_head_dim,
                 device=device,
