@@ -25,7 +25,7 @@ register_xpu_ci(
     "modeling_deepseek.py in gaunernst/DeepSeek-V2-Lite-Chat-FP8 does not "
     "recognize. Re-enable after fixing the fallback path in "
     "sglang/srt/models/transformers.py and/or the transitive cutlass import "
-    "on sglang/srt/models/deepseek_v2.py.",
+    "on sglang/srt/models/deepseek_v2.py",
 )
 
 
