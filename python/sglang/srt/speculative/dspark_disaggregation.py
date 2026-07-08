@@ -14,14 +14,27 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
 
-def _env_int(name: str, default: int) -> int:
+def _env_flag(name: str, default: bool = False) -> bool:
     value = os.getenv(name)
     if value is None:
         return default
+    return value.lower() in ("1", "true", "yes", "on")
+
+
+def _get_dspark_disagg_warmup_rounds() -> int:
+    if _env_flag("SGLANG_DSPARK_DEEPSPEC_PREFILL_HANDOFF", True):
+        return 0
+
+    value = os.getenv("SGLANG_DSPARK_PREFILL_TRANSFER_WARMUP_ROUNDS")
+    if value is None:
+        # Backward-compatible alias used by the early PD handoff path.
+        value = os.getenv("SGLANG_DSPARK_TRANSFER_WARMUP_ROUNDS")
+    if value is None:
+        return 1
     try:
-        return int(value)
+        return max(0, int(value))
     except ValueError:
-        return default
+        return 1
 
 
 def build_dspark_disagg_draft_input(
@@ -31,7 +44,7 @@ def build_dspark_disagg_draft_input(
     future_map: FutureMap,
 ) -> DSparkDraftInputV2:
     del server_args
-    warmup_rounds = max(0, _env_int("SGLANG_DSPARK_TRANSFER_WARMUP_ROUNDS", 0))
+    warmup_rounds = _get_dspark_disagg_warmup_rounds()
     req_hidden_states = [req.hidden_states_tensor for req in batch.reqs]
     if all(hidden is not None for hidden in req_hidden_states):
         hidden_states = torch.stack(req_hidden_states, dim=0).to(batch.device)

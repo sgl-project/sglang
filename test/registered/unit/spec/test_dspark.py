@@ -1019,6 +1019,92 @@ class TestDSparkPrefillHandoff(CustomTestCase):
         self.assertEqual(draft_input.transfer_warmup_rounds.dtype, t.int32)
         self.assertEqual(draft_input.transfer_warmup_rounds.tolist(), [0, 0])
 
+    def _make_disagg_batch(self):
+        t = self.torch
+        return SimpleNamespace(
+            reqs=[
+                SimpleNamespace(hidden_states_tensor=t.tensor([1.0, 2.0])),
+                SimpleNamespace(hidden_states_tensor=t.tensor([3.0, 4.0])),
+            ],
+            batch_size=lambda: 2,
+            device=t.device("cpu"),
+            seq_lens=t.tensor([10, 11], dtype=t.int64),
+            seq_lens_cpu=t.tensor([10, 11], dtype=t.int64),
+            enable_overlap=False,
+        )
+
+    def test_dspark_disagg_warmup_matches_deepspec_handoff_default(self):
+        t = self.torch
+        from sglang.srt.speculative.dspark_disaggregation import (
+            build_dspark_disagg_draft_input,
+        )
+
+        with patch.dict(
+            os.environ,
+            {
+                "SGLANG_DSPARK_DEEPSPEC_PREFILL_HANDOFF": "1",
+                "SGLANG_DSPARK_PREFILL_TRANSFER_WARMUP_ROUNDS": "7",
+            },
+        ):
+            draft_input = build_dspark_disagg_draft_input(
+                self._make_disagg_batch(),
+                SimpleNamespace(),
+                t.tensor([101, 102], dtype=t.int64),
+                SimpleNamespace(),
+            )
+
+        self.assertEqual(draft_input.transfer_warmup_rounds.tolist(), [0, 0])
+
+    def test_dspark_disagg_warmup_uses_prefill_env_when_handoff_disabled(self):
+        t = self.torch
+        from sglang.srt.speculative.dspark_disaggregation import (
+            build_dspark_disagg_draft_input,
+        )
+
+        with patch.dict(
+            os.environ,
+            {
+                "SGLANG_DSPARK_DEEPSPEC_PREFILL_HANDOFF": "0",
+                "SGLANG_DSPARK_PREFILL_TRANSFER_WARMUP_ROUNDS": "3",
+                "SGLANG_DSPARK_TRANSFER_WARMUP_ROUNDS": "5",
+            },
+        ):
+            draft_input = build_dspark_disagg_draft_input(
+                self._make_disagg_batch(),
+                SimpleNamespace(),
+                t.tensor([101, 102], dtype=t.int64),
+                SimpleNamespace(),
+            )
+
+        self.assertEqual(draft_input.transfer_warmup_rounds.tolist(), [3, 3])
+
+    def test_dspark_disagg_warmup_supports_legacy_env_alias(self):
+        t = self.torch
+        from sglang.srt.speculative.dspark_disaggregation import (
+            build_dspark_disagg_draft_input,
+        )
+
+        with patch.dict(
+            os.environ,
+            {
+                "SGLANG_DSPARK_DEEPSPEC_PREFILL_HANDOFF": "0",
+                "SGLANG_DSPARK_TRANSFER_WARMUP_ROUNDS": "4",
+            },
+        ):
+            with patch.dict(
+                os.environ,
+                {"SGLANG_DSPARK_PREFILL_TRANSFER_WARMUP_ROUNDS": ""},
+            ):
+                os.environ.pop("SGLANG_DSPARK_PREFILL_TRANSFER_WARMUP_ROUNDS", None)
+                draft_input = build_dspark_disagg_draft_input(
+                    self._make_disagg_batch(),
+                    SimpleNamespace(),
+                    t.tensor([101, 102], dtype=t.int64),
+                    SimpleNamespace(),
+                )
+
+        self.assertEqual(draft_input.transfer_warmup_rounds.tolist(), [4, 4])
+
     def test_accept_bonus_uses_longest_contiguous_draft_match(self):
         t = self.torch
         candidates = t.tensor(
