@@ -3083,10 +3083,26 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                             msgs.append(f"L{lyr}:ERR {e!r}")
                     zpages = sorted({i // page_size for i in zero_idx0})
                     npages = (pref.numel() + page_size - 1) // page_size
+                    # RoPE/position check: decode's current-token position must be
+                    # seq_len-1 per request; an off-by-one here (vs the absolute
+                    # positions the transferred keys were RoPE'd with at prefill)
+                    # corrupts attention scores while leaving KV norms untouched.
+                    pos = getattr(fb, "positions", None)
+                    pos_cpu = pos.detach().cpu() if pos is not None else None
+                    pos0 = (
+                        int(pos_cpu[0].item())
+                        if pos_cpu is not None and pos_cpu.numel()
+                        else -1
+                    )
+                    pos_mismatch = (
+                        int((pos_cpu != (seq_cpu.to(pos_cpu.dtype) - 1)).sum().item())
+                        if pos_cpu is not None and pos_cpu.numel() == seq_cpu.numel()
+                        else -1
+                    )
                     logger.warning(
                         "[DISAGG_DECODE_DUMP #%d rank=%s] seq_len=%d prefix=%d "
-                        "page_size=%d neg_slots=%d | %s | zero_pos_first20=%s | "
-                        "zero_pages=%d/%d %s",
+                        "page_size=%d neg_slots=%d | %s | zero_pages=%d/%d %s | "
+                        "pos0=%d exp=%d pos_vs_(seq-1)_mismatch=%d",
                         self._disagg_decode_dump_count,
                         getattr(self, "tp_rank", "?"),
                         s0,
@@ -3094,10 +3110,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         page_size,
                         neg,
                         " ".join(msgs),
-                        zero_idx0[:20],
                         len(zpages),
                         npages,
                         zpages[:20],
+                        pos0,
+                        s0 - 1,
+                        pos_mismatch,
                     )
                 except Exception as e:  # never let the probe break a run
                     logger.warning("[DISAGG_DECODE_DUMP] failed: %r", e)
