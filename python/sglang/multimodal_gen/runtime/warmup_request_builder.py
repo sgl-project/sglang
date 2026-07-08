@@ -259,6 +259,17 @@ def _resolve_warmup_steps(
     server_based_warmup: bool,
 ) -> int:
     warmup_steps = server_args.warmup_steps
+    default_steps = sampling_defaults.num_inference_steps
+
+    # Breakable CUDA graph captures one graph per step-branch at warmup so that
+    # serving never records a fresh graph. Run the model's full recommended
+    # steps (uncapped) so every step-branch signature is captured up front.
+    if (
+        getattr(server_args, "enable_breakable_cuda_graph", False) is True
+        and default_steps
+    ):
+        return max(int(default_steps), warmup_steps)
+
     if not server_based_warmup:
         return warmup_steps
 
@@ -288,6 +299,8 @@ def should_include_warmup_image(
         return False
     if task_type.requires_image_input():
         return True
+    if type(server_args.pipeline_config).__name__ == "GlmImagePipelineConfig":
+        return False
     if server_based_warmup:
         return task_type in (ModelTaskType.TI2I, ModelTaskType.TI2V)
     return True
