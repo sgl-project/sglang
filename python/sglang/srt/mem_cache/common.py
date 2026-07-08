@@ -311,12 +311,22 @@ def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
         if full_available_size < num_tokens or swa_available_size < num_tokens:
             full_num_tokens = max(0, num_tokens - full_available_size)
             swa_num_tokens = max(0, num_tokens - swa_available_size)
+            if torch.distributed.get_rank() == 0:
+                print(
+                    f"[MB_EVICT] full_evict={full_num_tokens} swa_evict={swa_num_tokens} "
+                    f"requested={num_tokens} full_avail={full_available_size} swa_avail={swa_available_size}",
+                    flush=True,
+                )
             tree_cache.evict(
                 EvictParams(num_tokens=full_num_tokens, swa_num_tokens=swa_num_tokens)
             )
     else:
         # Standard allocator
         if allocator.available_size() < num_tokens:
+            if torch.distributed.get_rank() == 0:
+                print(
+                    f"[MB_EVICT] evict={num_tokens} avail={allocator.available_size()}", flush=True
+                )
             tree_cache.evict(EvictParams(num_tokens=num_tokens))
 
 
@@ -350,6 +360,14 @@ def alloc_paged_token_slots_extend(
     # Over estimate the number of tokens: assume each request needs a new page.
     allocator = tree_cache.token_to_kv_pool_allocator
     num_tokens = extend_num_tokens + len(seq_lens_cpu) * allocator.page_size
+    if torch.distributed.get_rank() == 0:
+        print(
+            f"[MB_ALLOC_EXTEND] extend_num_tokens={extend_num_tokens} "
+            f"over_est={num_tokens} bs={len(seq_lens_cpu)} "
+            f"page_size={allocator.page_size} "
+            f"pre_lens={prefix_lens_cpu.tolist()} seq_lens={seq_lens_cpu.tolist()}",
+            flush=True,
+        )
     evict_from_tree_cache(tree_cache, num_tokens)
 
     state = None

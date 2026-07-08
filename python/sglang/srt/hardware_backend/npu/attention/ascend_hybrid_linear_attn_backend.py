@@ -243,6 +243,14 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
         - nonzero kernel launches
         """
         request_number = last_correct_step_indices.shape[0]
+        if torch.distributed.get_rank() == 0:
+            print(
+                f"[MB_MTP_UPDATE] request_number={request_number} "
+                f"last_correct_step_indices={last_correct_step_indices.tolist()} "
+                f"mamba_track_indices={mamba_track_indices.tolist() if mamba_track_indices is not None else None} "
+                f"mamba_steps_to_track={mamba_steps_to_track.tolist() if mamba_steps_to_track is not None else None}",
+            flush=True,
+        )
 
         state_indices_tensor = (
             self.linear_attn_backend.forward_metadata.mamba_cache_indices[
@@ -257,6 +265,16 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
         conv_states = mamba_caches.conv[0]
         ssm_states = mamba_caches.temporal
         intermediate_state_cache = mamba_caches.intermediate_ssm
+
+        if torch.distributed.get_rank() == 0:
+            print(
+                f"[MB_MTP_CACHE] bs={request_number} "
+                f"mamba_cache_indices={state_indices_tensor.tolist()} "
+                f"intermediate_ssm_shape={list(intermediate_state_cache.shape) if intermediate_state_cache is not None else None} "
+                f"ssm_states_shape={list(ssm_states.shape)} "
+                f"conv_states_shape={list(conv_states.shape)}",
+                flush=True,
+            )
         dst_indices_tensor = state_indices_tensor.to(torch.int64)  # [N]
         src_indices_tensor = torch.arange(
             dst_indices_tensor.shape[0],
@@ -265,13 +283,55 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
         )
         last_steps = last_correct_step_indices.to(torch.int64)  # [N]
 
-        move_intermediate_cache(
-            ssm_states,
-            intermediate_state_cache,
-            dst_indices_tensor,
-            src_indices_tensor,
-            last_steps,
-        )
+        # NPU: skip intermediate_ssm copy when accept_lens == 1.
+        # The state at step 0 is the just-computed recurrent state, which
+        # is already correct in the model's ssm buffer.  The intermediate
+        # cache path exists for CUDA's per-step gather; on NPU the fused
+        # kernel may produce slightly different bfloat16 rounding that
+        # accumulates over thousands of decode steps and drifts into
+        # garbage output.
+        all_step0 = (last_steps == 0).all().item()
+        if torch.distributed.get_rank() == 0:
+            print(
+                f"[MB_MTP_SKIP] all_step0={all_step0} last_steps={last_steps.tolist()}",
+                flush=True,
+            )
+        if not all_step0:
+            # Snapshot intermediate SSM state before move_intermediate_cache
+            # mutates it. Print first layer's first source slot's accepted-step
+            # state to compare against non-spec decode SSM state later.
+            if intermediate_state_cache is not None and intermediate_state_cache.numel() > 0:
+                src_idx = src_indices_tensor[0].item()
+                step = last_steps[0].item()
+                vals = intermediate_state_cache[0, src_idx, step, 0, 0, :4].flatten()
+                dst_idx = dst_indices_tensor[0].item()
+                dst_vals_before = ssm_states[0, dst_idx, 0, 0, :4].flatten()
+                if torch.distributed.get_rank() == 0:
+                    print(
+                        f"[MB_SSM_SNAP] src_idx={src_idx} dst_idx={dst_idx} step={step} "
+                        f"intermediate_layer0_h0_v0_k0_4={vals.cpu().tolist()} "
+                        f"ssm_before_layer0_h0_v0_k0_4={dst_vals_before.cpu().tolist()}",
+                        flush=True,
+                    )
+
+            move_intermediate_cache(
+                ssm_states,
+                intermediate_state_cache,
+                dst_indices_tensor,
+                src_indices_tensor,
+                last_steps,
+            )
+
+            # Verify the write landed correctly
+            if intermediate_state_cache is not None and intermediate_state_cache.numel() > 0:
+                dst_idx = dst_indices_tensor[0].item()
+                dst_vals_after = ssm_states[0, dst_idx, 0, 0, :4].flatten()
+                if torch.distributed.get_rank() == 0:
+                    print(
+                        f"[MB_SSM_AFTER] dst_idx={dst_idx} "
+                        f"ssm_after_layer0_h0_v0_k0_4={dst_vals_after.cpu().tolist()}",
+                        flush=True,
+                    )
 
         draft_token_num = intermediate_state_cache.shape[2]
         if mamba_track_indices is not None:

@@ -1473,6 +1473,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
         # Batch 1: Target verify
         # Prepare for target verify in a separate stream
         with self.plan_stream_ctx:
+            if self.plan_stream is not None:
+                self.plan_stream.wait_stream(fwd_stream)
             verify_forward_batch, can_run_cuda_graph = eagle_prepare_for_verify(
                 verify_input,
                 self.req_to_token_pool,
@@ -1586,6 +1588,15 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         if not batch.forward_mode.is_idle():
             accept_tokens = predict[accept_index]
+            # Log accepted tokens at crossing boundaries and at regular intervals
+            seq_lens = batch.seq_lens.cpu().tolist()
+            block = accept_tokens.view(bs, -1)[0].cpu().tolist()[:8]
+            if torch.distributed.get_rank() == 0:
+                print(
+                    f"[MB_ACCEPT] seq_lens={seq_lens} accept_lens={accept_lens.cpu().tolist()} "
+                    f"accepted_ids={block}",
+                    flush=True,
+                )
             bonus_tokens = torch.empty_like(accept_lens, dtype=torch.int32)
             # stride = accept_tokens per-req width = accept_index.shape[1]
             # (spec_steps + 1); NOT num_draft_tokens, wrong for topk > 1 trees.

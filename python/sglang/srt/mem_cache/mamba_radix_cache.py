@@ -504,6 +504,20 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             )
 
         value, last_node, best_value_len = self._match_prefix_helper(key)
+        mamba_branching = None
+        if len(value) > best_value_len:
+            chunk_aligned = (sum(len(v) for v in value) // self.mamba_cache_chunk_size) * self.mamba_cache_chunk_size
+            mamba_branching = chunk_aligned if chunk_aligned > 0 else None
+
+        if torch.distributed.get_rank() == 0:
+            print(
+                f"[MB_MATCH] key_len={len(params.key)} matched_tokens={sum(len(v) for v in value)} "
+                f"best_value_len={best_value_len} "
+                f"mamba_branching={mamba_branching} "
+                f"last_node_mamba_value={'yes' if last_node.mamba_value is not None else 'no'} "
+                f"cow_mamba={params.cow_mamba}",
+                flush=True,
+            )
         return self._match_post_processor(params, value, last_node, best_value_len)
 
     def insert(self, params: InsertParams) -> InsertResult:
@@ -514,7 +528,13 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         value = params.value
         mamba_value = params.mamba_value
         prev_prefix_len = params.prev_prefix_len
-
+        if torch.distributed.get_rank() == 0:
+            print(
+                f"[MB_INSERT] key_len={len(key)} value_len={len(value) if value is not None else None} "
+                f"mamba_value={mamba_value.tolist() if mamba_value is not None else None} "
+                f"prev_prefix_len={prev_prefix_len}",
+                flush=True,
+            )
         if value is None:
             value = torch.tensor([x for x in key.raw_token_ids()], dtype=torch.int64)
         prefix_len, mamba_exist = self._insert_helper(
@@ -525,6 +545,14 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
     def cache_finished_req(self, req: Req, is_insert: bool = True) -> None:
         """Cache request when it finishes."""
         kv_committed_len = req.pop_committed_kv_cache()
+        if torch.distributed.get_rank() == 0:
+            print(
+                f"[MB_FINISHED] rid={req.rid} kv_committed_len={kv_committed_len} "
+                f"is_insert={is_insert} "
+                f"mamba_last_track_seqlen={getattr(req, 'mamba_last_track_seqlen', None)} "
+                f"output_len={len(req.output_ids)}",
+                flush=True,
+            )
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, :kv_committed_len
@@ -552,8 +580,16 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
                 if write_pos_buf is not None:
                     cache_len -= int(write_pos_buf[req.mamba_pool_idx].item())
                     write_pos_buf[req.mamba_pool_idx] = 0
-            if cache_len is None:
-                cache_len = 0
+            if cache_len is None or cache_len == 0:
+                # Nothing to cache: free KV and mamba slots without inserting
+                # a key_len=0 ghost node into the radix tree. Such empty nodes
+                # poison subsequent match_prefix calls by serving as a stale
+                # mamba COW source with best_value_len=0 (see cache_finished_req
+                # of a short request with no track boundary).
+                self.token_to_kv_pool_allocator.free(kv_indices)
+                self.req_to_token_pool.free_mamba_cache(req)
+                self.dec_lock_ref(req.last_node)
+                return
             if cache_len != len(token_ids):
                 cache_end_idx = max(cache_len, req.cache_protected_len)
                 self.token_to_kv_pool_allocator.free(kv_indices[cache_end_idx:])
@@ -641,7 +677,14 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
 
     def cache_unfinished_req(self, req: Req, chunked=False) -> None:
         """Cache request when it is unfinished."""
-
+        if torch.distributed.get_rank() == 0:
+            print(
+                f"[MB_UNFINISHED] rid={req.rid} chunked={chunked} "
+                f"mamba_last_track_seqlen={getattr(req, 'mamba_last_track_seqlen', None)} "
+                f"extend_len={req.extend_range.length} prefix_len={len(req.prefix_indices)} "
+                f"cache_protected_len={req.cache_protected_len}",
+                flush=True,
+            )
         def _skip_cache_unfinished_req(req: Req) -> None:
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, : req.extend_range.end
@@ -759,6 +802,14 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         req.cache_protected_len = len(new_indices)
         req.mamba_last_track_seqlen = None
         req.last_node = new_last_node
+        if torch.distributed.get_rank() == 0:
+            print(
+                f"[MB_UNFINISHED_DONE] rid={req.rid} "
+                f"new_prefix_len={new_prefix_len} mamba_exist={mamba_exist} "
+                f"cached_tokens={page_aligned_len} total_tokens={len(kv_indices_orig)} "
+                f"new_cache_protected_len={req.cache_protected_len}",
+                flush=True,
+            )
 
     def pretty_print(self) -> None:
         self._print_helper(self.root_node, 0)
@@ -782,6 +833,13 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         full_num_evicted = len(x.value)
         self._free_mamba_value(x.mamba_value)
         mamba_num_evicted = len(x.mamba_value)
+        if torch.distributed.get_rank() == 0:
+            print(
+                f"[MB_EVICT_LEAF] node_id={x.id} evict_full={full_num_evicted} "
+                f"evict_mamba={mamba_num_evicted} is_evict_mamba={is_evict_mamba} "
+                f"mamba_lock_ref={x.mamba_lock_ref} full_lock_ref={x.full_lock_ref}",
+                flush=True,
+            )
 
         # 2. get the next node, update the lru lists
         if is_evict_mamba:

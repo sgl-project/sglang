@@ -645,6 +645,15 @@ class MambaAttnBackendBase(AttentionBackend):
         dests come from the metadata (under cuda-graph: the static buffer), so the
         InputBuffer registry slot is never mutated."""
         if forward_batch.mamba_track_mask is not None:
+            mask = forward_batch.mamba_track_mask
+            track_idx = self.forward_metadata.mamba_track_indices
+            if mask.any():
+                print(
+                    f"[MB_TRACK_DECODE] mask={mask.int().tolist()} "
+                    f"track_indices={track_idx[mask].tolist() if track_idx is not None else None} "
+                    f"ssm_shape={list(ssm_states.shape)} conv_shape={list(conv_states.shape)}",
+                    flush=True,
+                )
             track_mamba_states_if_needed(
                 conv_states,
                 ssm_states,
@@ -665,6 +674,13 @@ class MambaAttnBackendBase(AttentionBackend):
         """Copy extend SSM state at the last chunk boundary to track slots (source
         depends on chunk alignment; see `_init_track_ssm_indices`)."""
         if forward_metadata.has_mamba_track_mask:
+            print(
+                f"[MB_TRACK_EXTEND] has_mask=True "
+                f"ssm_h_src_numel={forward_metadata.track_ssm_h_src.numel()} "
+                f"ssm_final_src_numel={forward_metadata.track_ssm_final_src.numel()} "
+                f"h_shape={list(h.shape)} ssm_shape={list(ssm_states.shape)}",
+                flush=True,
+            )
             h = h.squeeze(0)
 
             if forward_metadata.track_ssm_h_src.numel() > 0:

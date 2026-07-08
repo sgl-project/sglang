@@ -2357,11 +2357,23 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     mamba_track_seqlen_aligned = req.mamba_branching_seqlen
             req.mamba_last_track_seqlen = mamba_track_seqlen_aligned
 
-        return _MambaRadixCacheV2TrackEntry(
+        # raise NotImplementedError("mamba_track_seqlen_aligned must be aligned with mamba_cache_chunk_size")
+        entry = _MambaRadixCacheV2TrackEntry(
             track_mask=mask,
             track_index=track_index,
             track_seqlen=mamba_track_seqlen,
         )
+        if torch.distributed.get_rank() == 0:
+            print(
+                f"[MB_EXTEND] rid={req.rid} mask={mask} track_index={track_index} "
+                f"track_seqlen={mamba_track_seqlen} "
+                f"last_track_seqlen={getattr(req, 'mamba_last_track_seqlen', None)} "
+                f"extend_len={req.extend_range.length} prefix_len={len(req.prefix_indices)} "
+                f"branching_seqlen={getattr(req, 'mamba_branching_seqlen', None)} "
+                f"next_track_idx={getattr(req, 'mamba_next_track_idx', None)}",
+                flush=True,
+            )
+        return entry
 
     def _collect_deferred_mamba_cow_and_clear(self, reqs):
         """Collect deferred COW/clear info from requests."""

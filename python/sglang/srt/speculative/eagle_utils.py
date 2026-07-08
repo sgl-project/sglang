@@ -492,6 +492,48 @@ def eagle_prepare_for_verify(
             device=device,
         )
 
+
+        import logging
+
+        _dbg_logger = logging.getLogger(__name__)
+        # --- BEGIN diagnostic: verify out_cache_loc on NPU with radix-cache ---
+        if (
+            _is_npu
+            and getattr(batch, "tree_cache", None) is not None
+            and batch.tree_cache.page_size > 1
+        ):
+            max_slot = batch.token_to_kv_pool_allocator.size
+            assert max_slot is not None, "allocator size is None"
+            ocl = batch.out_cache_loc
+            oob = (ocl < 0) | (ocl >= max_slot)
+            oob_cnt = int(oob.sum().item())
+            if oob_cnt > 0:
+                _dbg_logger.error(
+                    f"RADIX-DEBUG: out_cache_loc has {oob_cnt}/{ocl.numel()} "
+                    f"out-of-range values (valid range [0, {max_slot})). "
+                    f"batch_size={bs} draft_token_num={verify_input.draft_token_num} "
+                    f"seq_lens={batch.seq_lens.tolist() if batch.seq_lens is not None else 'N/A'}"
+                )
+                _dbg_logger.error(
+                    f"RADIX-DEBUG: out_cache_loc sample={ocl.flatten()[: min(64, ocl.numel())].tolist()}"
+                )
+                _dbg_logger.error(
+                    f"RADIX-DEBUG: OOB indices={ocl[oob][:16].tolist()}"
+                )
+         # Sanity: print out_cache_loc bounds to catch OOB KV indices
+        loc = batch.out_cache_loc
+        pool_size = req_to_token_pool.req_to_token.shape[1]
+        if torch.distributed.get_rank() == 0:
+            print(
+                f"[MB_CACHE_LOC] bs={bs} draft_token_num={verify_input.draft_token_num} "
+                f"out_cache_loc_min={loc.min().item()} max={loc.max().item()} "
+                f"seq_lens={batch.seq_lens.tolist()} "
+                f"pool_row_size={pool_size} "
+                f"oob={(loc >= pool_size).any().item()}",
+                flush=True,
+            )
+
+        # --- END diagnostic ---
         batch.out_cache_loc_dsv4 = maybe_build_dsv4_verify_bundle(
             batch, verify_input.draft_token_num
         )
@@ -822,6 +864,14 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
     nxt_kv_lens_device = nxt_kv_lens_cpu.to(device=batch.device, non_blocking=True)
     if page_size == 1:
         out_cache_loc = alloc_token_slots(batch.tree_cache, num_needed_tokens)
+    elif num_needed_tokens == 0:
+        # No new tokens needed (cur >= committed + double_alloc); skip the
+        # paged allocator to avoid an unnecessary tree_cache.evict() inside
+        # alloc_paged_token_slots_extend that can race with spec verify's
+        # plan-stream reads of req_to_token.
+        out_cache_loc = torch.empty(
+            (0,), dtype=torch.int64, device=batch.device
+        )
     else:
         last_loc = get_last_loc(
             batch.req_to_token_pool.req_to_token,
