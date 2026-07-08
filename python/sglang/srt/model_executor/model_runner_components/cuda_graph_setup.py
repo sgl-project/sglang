@@ -195,22 +195,32 @@ def capture_prefill_graph(
         logger.warning("Disable prefill CUDA graph because the capture size is not set")
         return None
 
-    prefill_backend = model_runner.server_args.cuda_graph_config.prefill.backend
+    prefill_config = model_runner.server_args.cuda_graph_config.prefill
+    prefill_backend = prefill_config.backend
     context_length = model_runner.model_config.context_len
-    max_capture_tokens = (
-        model_runner.req_to_token_pool.size * context_length
-        if prefill_backend in (Backend.TC_PIECEWISE, Backend.BREAKABLE)
-        else context_length
+    supports_multi_request_capture = prefill_backend in (
+        Backend.TC_PIECEWISE,
+        Backend.BREAKABLE,
     )
+    max_capture_requests = (
+        model_runner.req_to_token_pool.size if supports_multi_request_capture else 1
+    )
+    max_capture_tokens = max_capture_requests * context_length
     capture_num_tokens = sorted(
         num_tokens
-        for num_tokens in model_runner.server_args.cuda_graph_config.prefill.bs
+        for num_tokens in prefill_config.bs
         if num_tokens <= max_capture_tokens
     )
+    # Resolve the legal buckets once before constructing the runner so
+    # every capture backend consumes the same in-place configuration.
+    prefill_config.bs = capture_num_tokens
     if not capture_num_tokens:
         logger.warning(
             "Disable prefill CUDA graph capture because no configured "
-            "capture size fits context_length=%s and request-pool size=%s.",
+            "capture size fits backend=%s with max_capture_tokens=%s "
+            "(context_length=%s, request-pool size=%s).",
+            prefill_backend,
+            max_capture_tokens,
             context_length,
             model_runner.req_to_token_pool.size,
         )
