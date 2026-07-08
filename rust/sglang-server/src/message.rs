@@ -1,6 +1,5 @@
-//! Messages moved between stages. All payloads are *moved* through `flume`
-//! channels (zero copy); variable-length buffers are `bytes::Bytes` so the
-//! egress fan-out to detokenizer shards is a refcount bump, never a copy.
+//! Messages moved between stages via `flume` (zero-copy moves); variable-length
+//! buffers are `bytes::Bytes`, so egress fan-out to detok shards is a refcount bump.
 
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
@@ -10,19 +9,15 @@ use crate::error::Error;
 use crate::fsm::RequestState;
 use crate::ids::RequestId;
 
-/// Where the egress side (detok shard) writes a request's generation/control
-/// frames — the in-process per-request `Local` channel the API handler drains
-/// for SSE. One per request, bounded for backpressure; dropping the receiver
-/// (client disconnect) is observed as stream end.
+/// Per-request back-channel the detok shard writes egress frames to and the API
+/// handler drains for SSE; bounded, and receiver-drop (disconnect) = stream end.
 #[derive(Clone, Debug)]
 pub enum EgressSink {
     Local(mpsc::Sender<EgressItem>),
 }
 
-/// Why an [`EgressSink::try_send`] failed. `Full` = the client isn't reading fast
-/// enough (backpressure); `Closed` = the client is gone. Both are terminal for a
-/// streaming request (the shard can't buffer unboundedly), but the caller
-/// distinguishes them for logging and reporting.
+/// Why an [`EgressSink::try_send`] failed: `Full` = client backpressure, `Closed`
+/// = client gone. Both terminal for a stream; the caller distinguishes for logging.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SinkError {
     Full,
@@ -44,10 +39,8 @@ impl EgressSink {
 #[allow(dead_code)] // the receiver half is created inline in api_server::submit.
 pub type EgressSource = mpsc::Receiver<EgressItem>;
 
-/// What the connection handler receives on the egress stream. Generation output
-/// is protocol-neutral (the handler formats it); control results are a single
-/// verbatim payload. The generation variants carry a [`ChunkEvent`] the detok
-/// shard has decoded in place (its `text`/`*_txt` filled).
+/// What the connection handler receives on the egress stream: a detok-decoded
+/// [`ChunkEvent`] (handler formats it), a verbatim control payload, or an error.
 #[derive(Debug)]
 pub enum EgressItem {
     /// An intermediate streamed generation step (only sent for streaming reqs).
@@ -61,11 +54,8 @@ pub enum EgressItem {
     Error(Error),
 }
 
-/// What kind of request this is — selects the ingress branch, the wire message
-/// pushed to the scheduler, and the egress shape. Each variant owns its own
-/// body, so the type system keeps generate fields off control requests (and
-/// vice versa); a control endpoint migrated with parameters grows
-/// `ControlRequest` rather than abusing the generate payload.
+/// Request variant — selects the ingress branch, scheduler wire message, and
+/// egress shape. Each owns its body, so generate/control fields stay type-separate.
 #[derive(Debug)]
 pub enum RequestKind {
     /// `/generate`: tokenize (if needed) then push a `TokenizedGenerateReqInput`.
@@ -75,32 +65,114 @@ pub enum RequestKind {
     Control(ControlRequest),
 }
 
-/// Body of a `/generate` request.
+/// A single in-flight `/generate` request (per-item from [`GenerateBody::split`]),
+/// serialized to the scheduler wire once tokenized (see `to_header_msgpack`). Not a
+/// wire type — built by `split`/handlers, never (de)serialized; `input_ids` is
+/// client-supplied or filled by the Tokenizer stage.
 #[derive(Debug, Default)]
 pub struct GenerateRequest {
-    /// Decoded HTTP body (the `GenerateReqInput` view we need for tokenization).
-    pub payload: GeneratePayload,
-    /// Token ids, populated by the Tokenizer stage (or already present from the
-    /// client).
+    pub text: Option<String>,
+    /// Client-supplied token ids, or filled by the Tokenizer stage.
     pub input_ids: Option<Vec<i32>>,
+    /// Opaque sampling params, normalized in place at ingress then carried through.
+    pub sampling_params: Option<rmpv::Value>,
     /// Whether the client asked for SSE streaming.
     pub stream: bool,
     /// Internal `/health_generate` probe: the scheduler skips it when busy so it
     /// never occupies a waiting-queue slot. Never set from the client wire.
     pub is_health_check: bool,
+    /// Logprob / hidden-state options. This path bypasses the Python
+    /// `TokenizerManager`, so the ingress replicates its scalar normalization
+    /// (defaults applied in `to_header_msgpack`) before the scheduler sees them.
+    pub return_logprob: Option<bool>,
+    pub logprob_start_len: Option<i64>,
+    pub top_logprobs_num: Option<i64>,
+    pub token_ids_logprob: Option<rmpv::Value>,
+    pub return_hidden_states: Option<bool>,
+    /// Decode logprob token ids to text in each `[logprob, token_id, text]` tuple
+    /// (the api-server does this at frame time; default leaves text null).
+    pub return_text_in_logprobs: Option<bool>,
 }
 
-/// Body of a control request. `tag` is the scheduler request-struct name
-/// (msgspec class, e.g. `"GetInternalStateReq"`) pushed as a bare
-/// `[tag, rid, nil]`. Typed params for migrated control endpoints land here.
+impl GenerateRequest {
+    /// True when the client already supplied token ids → skip tokenization.
+    pub fn already_tokenized(&self) -> bool {
+        self.input_ids.as_ref().is_some_and(|v| !v.is_empty())
+    }
+
+    /// Multimodal detection hook. Deferred (Encoder stubbed): always false until mm
+    /// fields are wired in.
+    #[allow(dead_code)]
+    pub fn has_multimodal(&self) -> bool {
+        false
+    }
+
+    /// `input_ids` widened to raw little-endian int64 bytes (the scheduler's
+    /// `array("q")` columnar cell — rides the ingress ring outside msgpack). Empty
+    /// when not tokenized.
+    pub fn input_ids_i64_le(&self) -> Bytes {
+        let ids = self.input_ids.as_deref().unwrap_or(&[]);
+        let mut buf = Vec::with_capacity(ids.len() * 8);
+        for &id in ids {
+            buf.extend_from_slice(&(id as i64).to_le_bytes());
+        }
+        Bytes::from(buf)
+    }
+
+    /// Serialize the scalar header as the scheduler's `TokenizedGenerateReqInput`
+    /// positional tagged msgpack array, resolving `Option` scalars to wire defaults.
+    /// `input_ids` is `Nil` (rides columnar via `input_ids_i64_le`); idx 5/7 stay
+    /// `Nil` so the array reaches the last non-defaulted field (`stream`, idx 13).
+    pub fn to_header_msgpack(&self, rid: &str) -> Result<Bytes, Error> {
+        use rmpv::Value;
+
+        let input_text_val = match &self.text {
+            Some(t) => Value::from(t.as_str()),
+            None => Value::Nil,
+        };
+        // `sampling_params` is required + map-encoded; empty map when absent (send
+        // only what the client set — injecting `""` would make the scheduler's
+        // normalize expand it to `[""]`, stopping on the first token).
+        let sampling_params_val = match self.sampling_params.clone() {
+            Some(v @ Value::Map(_)) => v,
+            _ => Value::Map(Vec::new()),
+        };
+        let token_ids_logprob_val = self.token_ids_logprob.clone().unwrap_or(Value::Nil);
+
+        let arr = Value::Array(vec![
+            Value::from("TokenizedGenerateReqInput"),          // 0  tag
+            Value::from(rid),                                  // 1  rid
+            Value::Nil,                                        // 2  http_worker_ipc
+            input_text_val,                                    // 3  input_text
+            Value::Nil,                                        // 4  input_ids (columnar)
+            Value::Nil,                                        // 5  input_embeds
+            Value::Nil,                                        // 6  mm_inputs
+            Value::Nil,                                        // 7  token_type_ids
+            sampling_params_val,                               // 8  sampling_params
+            Value::from(self.return_logprob.unwrap_or(false)), // 9  return_logprob
+            Value::from(self.logprob_start_len.unwrap_or(-1)), // 10 logprob_start_len
+            Value::from(self.top_logprobs_num.unwrap_or(0)),   // 11 top_logprobs_num
+            token_ids_logprob_val,                             // 12 token_ids_logprob
+            Value::from(self.stream),                          // 13 stream
+            Value::from(self.return_hidden_states.unwrap_or(false)), // 14 return_hidden_states
+            Value::from(self.is_health_check),                 // 15 is_health_check
+        ]);
+
+        let mut buf = Vec::new();
+        rmpv::encode::write_value(&mut buf, &arr).map_err(|e| Error::Codec(e.to_string()))?;
+        Ok(Bytes::from(buf))
+    }
+}
+
+/// Body of a control request. `tag` = the scheduler request-struct name (e.g.
+/// `"GetInternalStateReq"`), pushed as a bare `[tag, rid, nil]`.
 #[derive(Debug)]
 pub struct ControlRequest {
     pub tag: &'static str,
 }
 
-/// The owned request as it travels ingress stages. Single owner at all times,
-/// so the embedded `state` FSM is mutated without any lock. Fields common to
-/// every request live here; variant-specific data lives in [`RequestKind`].
+/// The owned request as it travels ingress stages (single owner, so `state` is
+/// mutated lock-free). Common fields here; variant data in [`RequestKind`].
 #[derive(Debug)]
 pub struct Request {
     pub id: RequestId,
@@ -111,9 +183,8 @@ pub struct Request {
     pub kind: RequestKind,
 }
 
-/// Encode a bare `BaseReq` control message (just `rid` + `http_worker_ipc`) as
-/// the msgspec tagged array `[tag, rid, nil]`. Used for control requests like
-/// `GetInternalStateReq` that carry no extra fields.
+/// Encode a bare `BaseReq` control message as the msgspec tagged array
+/// `[tag, rid, nil]` (e.g. `GetInternalStateReq`; no extra fields).
 pub fn control_req_msgpack(tag: &str, rid: &str) -> Result<Bytes, Error> {
     use rmpv::Value;
     let arr = Value::Array(vec![
@@ -126,11 +197,8 @@ pub fn control_req_msgpack(tag: &str, rid: &str) -> Result<Bytes, Error> {
     Ok(Bytes::from(buf))
 }
 
-/// Encode an `AbortReq(rid)` as its msgspec tagged array. `AbortReq` extends
-/// `BaseReq` (`rid`, `http_worker_ipc`) with `abort_all`, `finished_reason`,
-/// `abort_message`, so the array is `["AbortReq", rid, nil, false, nil, nil]`.
-/// The scheduler decodes it off the ingress ring and dispatches to its
-/// `abort_request`, stopping generation for `rid`.
+/// Encode `AbortReq(rid)` as its msgspec tagged array
+/// `["AbortReq", rid, nil, false, nil, nil]`; the scheduler stops generation for `rid`.
 pub fn abort_req_msgpack(rid: &str) -> Result<Bytes, Error> {
     use rmpv::Value;
     let arr = Value::Array(vec![
@@ -146,56 +214,8 @@ pub fn abort_req_msgpack(rid: &str) -> Result<Bytes, Error> {
     Ok(Bytes::from(buf))
 }
 
-/// Decoded `/generate` body; `deny_unknown_fields` rejects (4xx) any unsupported
-/// field rather than silently dropping it.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct GeneratePayload {
-    #[serde(default)]
-    pub text: Option<String>,
-    #[serde(default)]
-    pub input_ids: Option<Vec<i32>>,
-    #[serde(default)]
-    pub stream: bool,
-    /// Opaque sampling params, carried through to the scheduler untouched.
-    #[serde(default)]
-    pub sampling_params: Option<rmpv::Value>,
-    /// Logprob / hidden-state request options. This path bypasses the Python
-    /// `TokenizerManager`, so the ingress replicates its scalar normalization
-    /// (see [`TokenizedReqPayload`]) before handing them to the scheduler.
-    #[serde(default)]
-    pub return_logprob: Option<bool>,
-    #[serde(default)]
-    pub logprob_start_len: Option<i64>,
-    #[serde(default)]
-    pub top_logprobs_num: Option<i64>,
-    #[serde(default)]
-    pub token_ids_logprob: Option<rmpv::Value>,
-    #[serde(default)]
-    pub return_hidden_states: Option<bool>,
-    /// Decode logprob token ids to text in each `[logprob, token_id, text]`
-    /// tuple (the api-server does this at frame time; default leaves text null).
-    #[serde(default)]
-    pub return_text_in_logprobs: Option<bool>,
-}
-
-impl GeneratePayload {
-    /// True when the client already supplied token ids → skip tokenization.
-    pub fn already_tokenized(&self) -> bool {
-        self.input_ids.as_ref().is_some_and(|v| !v.is_empty())
-    }
-
-    /// Multimodal detection hook. Deferred this iteration (Encoder stubbed):
-    /// always false until mm fields are wired in. Unused for now.
-    #[allow(dead_code)]
-    pub fn has_multimodal(&self) -> bool {
-        false
-    }
-}
-
-/// A field that accepts a scalar or a list: deserializes a bare `T` **or** `[T,…]`.
-/// Lets `/generate` take `text: "hi"` or `text: ["a","b"]` (the SGLang batch
-/// contract) through the same body type.
+/// A field accepting a scalar or a list: deserializes a bare `T` **or** `[T,…]` —
+/// so `/generate` takes `text: "hi"` or `text: ["a","b"]` through one body type.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 pub enum OneOrMany<T> {
@@ -203,10 +223,9 @@ pub enum OneOrMany<T> {
     Many(Vec<T>),
 }
 
-/// The wire shape of a `/generate` body, before batch splitting: `text` /
-/// `input_ids` / `sampling_params` each accept a scalar (single request) or a list
-/// (batch). [`split`](GenerateBody::split) fans it into per-request
-/// [`GeneratePayload`]s. `deny_unknown_fields` rejects (4xx) any unsupported field.
+/// The `/generate` wire body before batch splitting: `text`/`input_ids`/`sampling_params`
+/// each scalar-or-list, fanned into per-request [`GenerateRequest`]s by
+/// [`split`](GenerateBody::split). `deny_unknown_fields` rejects (4xx) unknowns.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GenerateBody {
@@ -216,10 +235,9 @@ pub struct GenerateBody {
     pub input_ids: Option<OneOrMany<Vec<i32>>>,
     #[serde(default)]
     pub stream: bool,
-    /// A single params map (broadcast to every item) or a list of maps (one per
-    /// item). Kept as a raw `Value` — an untagged scalar-or-list enum can't work
-    /// here because `rmpv::Value` itself matches a JSON array, so `split`
-    /// distinguishes map vs array at fan-out time.
+    /// A single params map (broadcast) or a list of maps (per item). Raw `Value`,
+    /// not `OneOrMany` — `rmpv::Value` matches a JSON array, so `split` decides
+    /// map-vs-array at fan-out time.
     #[serde(default)]
     pub sampling_params: Option<rmpv::Value>,
     #[serde(default)]
@@ -237,11 +255,10 @@ pub struct GenerateBody {
 }
 
 impl GenerateBody {
-    /// Fan the body into one [`GeneratePayload`] per prompt. Returns the payloads
-    /// and `is_batch` — whether the input used **list** form. A single-element list
-    /// (`text: ["hi"]`) is still a batch (the response is a JSON array), matching
-    /// the Python contract. `Err(msg)` (→ 400) on an invalid/ inconsistent batch.
-    pub fn split(self) -> Result<(Vec<GeneratePayload>, bool), String> {
+    /// Fan the body into one [`GenerateRequest`] per prompt + `is_batch` (list form
+    /// — a 1-element list is still a batch → JSON array response). `Err` (→ 400) on
+    /// an invalid/inconsistent batch.
+    pub fn split(self) -> Result<(Vec<GenerateRequest>, bool), String> {
         let GenerateBody {
             text,
             input_ids,
@@ -294,13 +311,15 @@ impl GenerateBody {
             Some(sp) => vec![Some(sp); n],
         };
 
-        // The scalar logprob/hidden opts broadcast to every item.
-        let payloads = (0..n)
-            .map(|i| GeneratePayload {
+        // The scalar logprob/hidden opts broadcast to every item. `is_health_check`
+        // is never client-set (only the internal `/health_generate` probe sets it).
+        let requests = (0..n)
+            .map(|i| GenerateRequest {
                 text: texts[i].take(),
                 input_ids: id_lists[i].take(),
-                stream,
                 sampling_params: sps[i].take(),
+                stream,
+                is_health_check: false,
                 return_logprob,
                 logprob_start_len,
                 top_logprobs_num,
@@ -309,225 +328,26 @@ impl GenerateBody {
                 return_text_in_logprobs,
             })
             .collect();
-        Ok((payloads, is_batch))
+        Ok((requests, is_batch))
     }
 }
 
-#[cfg(test)]
-mod generate_payload_tests {
-    use super::*;
-
-    /// Supported fields decode fine.
-    #[test]
-    fn accepts_known_fields() {
-        let p: GeneratePayload =
-            serde_json::from_str(r#"{"text": "hi", "stream": true, "sampling_params": {}}"#)
-                .expect("known fields decode");
-        assert_eq!(p.text.as_deref(), Some("hi"));
-        assert!(p.stream);
-    }
-
-    /// An unsupported field is rejected, not silently dropped.
-    #[test]
-    fn rejects_unknown_fields() {
-        let err = serde_json::from_str::<GeneratePayload>(r#"{"text": "hi", "lora_path": "x"}"#)
-            .expect_err("unknown field must be rejected");
-        assert!(err.to_string().contains("lora_path"), "{err}");
-    }
-
-    fn split(body: &str) -> Result<(Vec<GeneratePayload>, bool), String> {
-        serde_json::from_str::<GenerateBody>(body).unwrap().split()
-    }
-
-    /// Scalar `text` → one item, not a batch (response stays a single object).
-    #[test]
-    fn scalar_text_is_single() {
-        let (ps, is_batch) = split(r#"{"text": "hi"}"#).unwrap();
-        assert!(!is_batch);
-        assert_eq!(ps.len(), 1);
-        assert_eq!(ps[0].text.as_deref(), Some("hi"));
-    }
-
-    /// List `text` → batch (even length 1); each prompt becomes its own payload.
-    #[test]
-    fn list_text_is_batch() {
-        let (ps, is_batch) = split(r#"{"text": ["a", "b"]}"#).unwrap();
-        assert!(is_batch);
-        assert_eq!(ps.len(), 2);
-        assert_eq!(ps[0].text.as_deref(), Some("a"));
-        assert_eq!(ps[1].text.as_deref(), Some("b"));
-
-        let (ps, is_batch) = split(r#"{"text": ["only"]}"#).unwrap();
-        assert!(is_batch, "single-element list is still a batch");
-        assert_eq!(ps.len(), 1);
-    }
-
-    /// Scalar `sampling_params` broadcasts to every item; a list maps per item.
-    #[test]
-    fn sampling_params_broadcast_and_per_item() {
-        let (ps, _) =
-            split(r#"{"text": ["a", "b"], "sampling_params": {"temperature": 0.5}}"#).unwrap();
-        assert_eq!(ps[0].sampling_params, ps[1].sampling_params);
-        assert!(ps[0].sampling_params.is_some());
-
-        let (ps, _) = split(
-            r#"{"text": ["a", "b"], "sampling_params": [{"temperature": 0.1}, {"temperature": 0.9}]}"#,
-        )
-        .unwrap();
-        assert_ne!(ps[0].sampling_params, ps[1].sampling_params);
-    }
-
-    /// A per-item `sampling_params` list whose length ≠ batch size is a 400.
-    #[test]
-    fn sampling_params_length_mismatch_errors() {
-        let err = split(r#"{"text": ["a", "b"], "sampling_params": [{}]}"#).unwrap_err();
-        assert!(err.contains("length"), "{err}");
-    }
-
-    /// `input_ids` batch (list of lists) fans out; scalar (list of ints) is single.
-    #[test]
-    fn input_ids_scalar_vs_batch() {
-        let (ps, is_batch) = split(r#"{"input_ids": [1, 2, 3]}"#).unwrap();
-        assert!(!is_batch);
-        assert_eq!(ps[0].input_ids, Some(vec![1, 2, 3]));
-
-        let (ps, is_batch) = split(r#"{"input_ids": [[1, 2], [3]]}"#).unwrap();
-        assert!(is_batch);
-        assert_eq!(ps.len(), 2);
-        assert_eq!(ps[1].input_ids, Some(vec![3]));
-    }
-
-    /// Both / neither of text+input_ids is a 400; the wire still rejects unknowns.
-    #[test]
-    fn split_validates_inputs() {
-        assert!(split(r#"{"text": "a", "input_ids": [1]}"#).is_err());
-        assert!(split(r#"{"stream": true}"#).is_err());
-        assert!(
-            serde_json::from_str::<GenerateBody>(r#"{"text": "hi", "bogus": 1}"#).is_err(),
-            "GenerateBody must deny unknown fields"
-        );
-    }
-}
-
-/// One ingress-ring entry, split columnar: the scalar `header` (msgpack, with
-/// `input_ids` omitted) plus the request's raw `ids` cell (little-endian int64,
-/// empty for control requests). `recv_requests` concatenates the `ids` cells of
-/// a drained batch into one buffer so the large tensor never goes through
-/// msgpack; the scalar headers stay tiny.
+/// One ingress-ring entry, split columnar: the scalar `header` (msgpack, `input_ids`
+/// omitted) + the raw int64 `ids` cell, so the big tensor never goes through msgpack.
 #[derive(Debug)]
 pub struct IngressMsg {
     pub header: Bytes,
     pub ids: Bytes,
 }
 
-/// Wire form of `TokenizedGenerateReqInput`.
-///
-/// The scheduler decodes this with msgspec, whose IPC structs are
-/// `array_like=True, tag=True` — so the wire format is a **tagged msgpack
-/// array** `[tag, ...fields in declaration order]`, NOT a named map. msgspec
-/// fills trailing fields (all of which carry defaults) from a short array, so
-/// we emit only through `stream` (index 11) and let it default the rest.
-#[derive(Debug)]
-pub struct TokenizedReqPayload {
-    pub rid: String,
-    pub input_text: Option<String>,
-    pub input_ids: Vec<i32>,
-    pub sampling_params: Option<rmpv::Value>,
-    /// Scalar-normalized logprob options (defaults already applied at ingress).
-    pub return_logprob: bool,
-    pub logprob_start_len: i64,
-    pub top_logprobs_num: i64,
-    pub token_ids_logprob: Option<rmpv::Value>,
-    pub return_hidden_states: bool,
-    /// Health-check probe marker (scheduler skips it when busy).
-    pub is_health_check: bool,
-    pub stream: bool,
-}
-
-impl TokenizedReqPayload {
-    /// Widen `input_ids` (i32) to the raw little-endian **int64** bytes the
-    /// scheduler's `array("q")` expects. This is the *columnar tensor cell*: it
-    /// travels the ingress ring as raw bytes (no msgpack) and is concatenated
-    /// with the other requests' cells in `recv_requests`.
-    pub fn input_ids_i64_le(&self) -> Bytes {
-        let mut buf = Vec::with_capacity(self.input_ids.len() * 8);
-        for &id in &self.input_ids {
-            buf.extend_from_slice(&(id as i64).to_le_bytes());
-        }
-        Bytes::from(buf)
-    }
-
-    /// Serialize the *scalar header* to the msgspec-compatible tagged array,
-    /// with `input_ids` left as `Nil` — the ids ride alongside as a raw columnar
-    /// buffer (see [`input_ids_i64_le`](Self::input_ids_i64_le)) and are set on
-    /// the decoded struct by the Python `drain`.
-    pub fn to_header_msgpack(&self) -> Result<Bytes, Error> {
-        use rmpv::Value;
-
-        // input_ids omitted from the header; delivered as a columnar buffer.
-        let input_ids_val = Value::Nil;
-
-        let input_text_val = match &self.input_text {
-            Some(t) => Value::from(t.as_str()),
-            None => Value::Nil,
-        };
-
-        // `sampling_params: SamplingParams` is required (not Optional) and
-        // map-encoded; default to an empty map (all-defaults) when absent. Send
-        // only what the client set: the scheduler normalizes these and turns an
-        // absent `stop` / `stop_regex` into an empty list. Injecting `""` here
-        // instead would make `normalize` expand it to `[""]`, which matches at
-        // every position and ends generation on the first token.
-        let sampling_params_val = match self.sampling_params.clone() {
-            Some(v @ Value::Map(_)) => v,
-            _ => Value::Map(Vec::new()),
-        };
-
-        let token_ids_logprob_val = self.token_ids_logprob.clone().unwrap_or(Value::Nil);
-
-        // Tagged array in TokenizedGenerateReqInput declaration order (BaseReq
-        // fields first), truncated at `is_health_check`. msgspec requires the
-        // array to be at least as long as the last non-defaulted field (`stream`,
-        // index 13), so `input_embeds` and `token_type_ids` must be present even
-        // though we always send them Nil.
-        let arr = Value::Array(vec![
-            Value::from("TokenizedGenerateReqInput"), // 0  tag
-            Value::from(self.rid.as_str()),           // 1  rid
-            Value::Nil,                               // 2  http_worker_ipc
-            input_text_val,                           // 3  input_text
-            input_ids_val,                            // 4  input_ids (columnar)
-            Value::Nil,                               // 5  input_embeds
-            Value::Nil,                               // 6  mm_inputs
-            Value::Nil,                               // 7  token_type_ids
-            sampling_params_val,                      // 8  sampling_params
-            Value::from(self.return_logprob),         // 9  return_logprob
-            Value::from(self.logprob_start_len),      // 10 logprob_start_len
-            Value::from(self.top_logprobs_num),       // 11 top_logprobs_num
-            token_ids_logprob_val,                    // 12 token_ids_logprob
-            Value::from(self.stream),                 // 13 stream
-            Value::from(self.return_hidden_states),   // 14 return_hidden_states
-            Value::from(self.is_health_check),        // 15 is_health_check
-        ]);
-
-        let mut buf = Vec::new();
-        rmpv::encode::write_value(&mut buf, &arr).map_err(|e| Error::Codec(e.to_string()))?;
-        Ok(Bytes::from(buf))
-    }
-}
-
-/// Egress-ring frame discriminator (first byte). Internal to the Rust egress
-/// ring: Python pushes raw payloads via `push_batch` / `push_result` and the
-/// tag is prepended on the Rust side, so the Python wire format is unchanged.
+/// Egress-ring frame tag (first byte, prepended Rust-side; Python wire unchanged):
+/// a single control-request result payload.
 pub const EGRESS_TAG_RESULT: u8 = 1;
-/// A whole decode batch in one frame: columnar scalars + numeric-column length
-/// metadata (msgpack header) plus one concatenated raw buffer (token ids +
-/// optional logprob/hidden columns). The tm-egress dispatcher decodes it into
-/// per-request [`ChunkEvent`]s and routes each by rid — no per-request FFI /
-/// msgpack from Python.
+/// A whole decode batch: msgpack columnar header + one concatenated raw buffer;
+/// tm-egress decodes it into per-request [`ChunkEvent`]s (no per-request FFI).
 pub const EGRESS_TAG_BATCH: u8 = 2;
 /// A per-request failure `[rid, message]`: the Python drain couldn't decode a
-/// request's header (e.g. a malformed field), so instead of letting the error
-/// escape the scheduler loop it routes a 400 back to the owning request.
+/// header, so it routes a 400 back to that request instead of crashing the loop.
 pub const EGRESS_TAG_ERROR: u8 = 3;
 
 /// Read `n` little-endian f32s from `data` at `*off`, advancing `*off`.
@@ -552,14 +372,9 @@ fn take_i32(data: &[u8], off: &mut usize, n: usize) -> Vec<i32> {
     out
 }
 
-/// Frame a whole decode batch: `[EGRESS_TAG_BATCH][u32 header_len][header][data]`.
-/// `header` is the msgpack [`BatchHeader`] (columnar scalars + lens); `data` is
-/// the concatenated raw little-endian numeric buffer.
-/// Frame a decode batch: `[BATCH tag][u32 header len][header][data...]`, where
-/// `data` is the data *columns* (the caller's `data_cols`) concatenated directly
-/// into the frame — one copy, instead of the caller first `b"".join`-ing them
-/// into a single `bytes`. Run off the GIL (the big memcpy of the whole decode
-/// batch doesn't need it).
+/// Frame a decode batch: `[BATCH tag][u32 header len][header][data cols…]`. The
+/// caller's `data_cols` are concatenated straight into the frame (one copy, no
+/// `b"".join`); `header` is the msgpack [`BatchHeader`]. Runs off the GIL.
 pub fn frame_egress_batch_cols(header: &[u8], data_cols: &[&[u8]]) -> Bytes {
     let data_len: usize = data_cols.iter().map(|c| c.len()).sum();
     let mut buf = Vec::with_capacity(1 + 4 + header.len() + data_len);
@@ -572,13 +387,12 @@ pub fn frame_egress_batch_cols(header: &[u8], data_cols: &[&[u8]]) -> Bytes {
     Bytes::from(buf)
 }
 
-/// Columnar scalar header for a whole decode batch. . All numeric fields are
-/// `#[serde(default)]`, the hot path (no extras) emits just the first four.
+/// Columnar scalar header for a whole decode batch. All numeric fields are
+/// `#[serde(default)]`; the hot path (no extras) emits just the first four.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct BatchHeader {
-    /// Request ids as raw `u64` (a numeric column like `prompt_tokens`) — the
-    /// rids originate from `RequestIdGen` (a u64 counter), so carrying them
-    /// numerically avoids a per-request string encode/decode + parse.
+    /// Request ids as a raw `u64` column — the rids are a u64 counter, so carrying
+    /// them numerically avoids a per-request string encode/decode + parse.
     pub rids: Vec<u64>,
     pub finish_reasons: Vec<Option<serde_json::Value>>,
     pub prompt_tokens: Vec<u32>,
@@ -609,16 +423,14 @@ pub struct BatchHeader {
     pub hidden_poslens: Vec<u32>,
 }
 
-/// Read request `i`'s flat logprob column (`l` parallel val/idx elements)
-/// directly from the frame `data` at the per-column byte cursors `cv`/`ci`,
-/// advancing them. No whole-column intermediate — only this request is copied.
+/// Read a request's flat logprob column (`l` val/idx pairs) from `data` at cursors
+/// `cv`/`ci`, advancing them. Only this request is copied — no whole-column buffer.
 fn take_flat(data: &[u8], cv: &mut usize, ci: &mut usize, l: usize) -> (Vec<f32>, Vec<i32>) {
     (take_f32(data, cv, l), take_i32(data, ci, l))
 }
 
-/// Read a request's ragged logprob column (`np` positions) from `data`: pull its
-/// per-position `lens` from the header's `poslens` (advancing `pcur`), then the
-/// summed val/idx count from the val/idx byte cursors `cv`/`ci`.
+/// Read a request's ragged logprob column (`np` positions): its per-position `lens`
+/// from `poslens` (advancing `pcur`), then that many val/idx from `cv`/`ci`.
 fn take_ragged(
     data: &[u8],
     cv: &mut usize,
@@ -650,12 +462,9 @@ fn take_hidden(
     (take_f32(data, cv, nv), lens)
 }
 
-/// Decode a batch egress frame (tag stripped), invoking `route` with each
-/// request's [`ChunkEvent`] **as it is decoded** — one pass, no intermediate
-/// `Vec<ChunkEvent>` and no whole-column buffers. Each request reads its own
-/// slice straight from `data` via per-column byte cursors, so peak extra memory
-/// is one request (routing overlaps decode). Returns `false` on a malformed
-/// frame (nothing routed). Column order must match Python's `push_generation`.
+/// Decode a batch egress frame (tag stripped), calling `route` with each request's
+/// [`ChunkEvent`] as it's decoded — one pass, no intermediate `Vec`, peak memory
+/// one request. `false` on a malformed frame. Column order matches `push_generation`.
 pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> bool {
     if body.len() < 4 {
         return false;
@@ -797,13 +606,9 @@ pub fn frame_egress_error(rid: &str, message: &str) -> Bytes {
     Bytes::from(buf)
 }
 
-/// One scheduler output increment for a request. It carries the request through
-/// both sides of the detok decode boundary: the fields above `text` arrive from
-/// Python via `push_chunk` on the egress ring (a **pre-decode** frame); the detok
-/// shard then fills `text` + the `*_txt` columns **in place** and forwards the
-/// same struct as the protocol-neutral result the API handler formats/accumulates.
-/// A consumer that needs the cumulative view folds these deltas with
-/// `OutputAccumulator`.
+/// One scheduler output increment. Carries the request across the detok boundary:
+/// fields above `text` arrive from Python (pre-decode); the detok shard fills
+/// `text` + `*_txt` in place. Deltas — fold with `OutputAccumulator` for cumulative.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ChunkEvent {
     /// Request id as raw `u64` — the shard routing key; no parse, no clone.
@@ -829,10 +634,8 @@ pub struct ChunkEvent {
     pub in_lp_val: Vec<f32>,
     #[serde(default)]
     pub in_lp_idx: Vec<i32>,
-    /// Top-k logprobs (2-level ragged): flat `val`/`idx` buffers plus a
-    /// per-position `lens` (top-k count at each position; 0 = null position).
-    /// Output = per-step delta; input = once on the first chunk. Empty unless
-    /// `top_logprobs_num > 0`.
+    /// Top-k logprobs (2-level ragged): flat `val`/`idx` + per-position `lens` (0 =
+    /// null). Output = per-step delta, input = once on the first chunk.
     #[serde(default)]
     pub out_top_val: Vec<f32>,
     #[serde(default)]
@@ -859,9 +662,8 @@ pub struct ChunkEvent {
     pub in_tid_idx: Vec<i32>,
     #[serde(default)]
     pub in_tid_lens: Vec<u32>,
-    /// Hidden states (dense f32): flat buffer + per-row lengths (one row per
-    /// output position). Last-writer-wins across chunks (the final message
-    /// carries the full set). Empty unless `return_hidden_states`.
+    /// Hidden states (dense f32): flat buffer + per-row lengths. Last-writer-wins
+    /// across chunks (the final message has the full set).
     #[serde(default)]
     pub hidden_val: Vec<f32>,
     #[serde(default)]
@@ -869,17 +671,14 @@ pub struct ChunkEvent {
 
     // --- Detok-stage outputs: empty on the wire (a pre-decode frame), filled in
     // place by the detok shard so the same struct carries the decoded result. ---
-    /// Decoded text **delta** for this chunk (empty in `skip_tokenizer_init` mode,
-    /// or when the step only produced a partial multi-byte sequence). `token_ids`
-    /// doubles as the response's `output_ids`; `completion_tokens` is this chunk's
-    /// token count (the accumulator sums it).
+    /// Decoded text **delta** for this chunk (empty in skip mode / on partial UTF-8).
+    /// `token_ids` doubles as `output_ids`; `completion_tokens` is this chunk's count.
     #[serde(default)]
     pub text: String,
     #[serde(default)]
     pub completion_tokens: u64,
-    /// Decoded logprob token text (`return_text_in_logprobs`), flat and parallel to
-    /// the matching `*_idx` buffers. Decoded on the detok shard; empty when the
-    /// request didn't ask for text (the tuple's text slot stays null).
+    /// Decoded logprob token text (`return_text_in_logprobs`), parallel to the `*_idx`
+    /// buffers; empty when not requested (the tuple's text slot stays null).
     #[serde(default)]
     pub out_lp_txt: Vec<String>,
     #[serde(default)]
@@ -895,8 +694,81 @@ pub struct ChunkEvent {
 }
 
 #[cfg(test)]
-mod chunk_event_tests {
+mod tests {
     use super::*;
+
+    fn split(body: &str) -> Result<(Vec<GenerateRequest>, bool), String> {
+        serde_json::from_str::<GenerateBody>(body).unwrap().split()
+    }
+
+    /// Scalar `text` → one item, not a batch (response stays a single object).
+    #[test]
+    fn scalar_text_is_single() {
+        let (ps, is_batch) = split(r#"{"text": "hi"}"#).unwrap();
+        assert!(!is_batch);
+        assert_eq!(ps.len(), 1);
+        assert_eq!(ps[0].text.as_deref(), Some("hi"));
+    }
+
+    /// List `text` → batch (even length 1); each prompt becomes its own payload.
+    #[test]
+    fn list_text_is_batch() {
+        let (ps, is_batch) = split(r#"{"text": ["a", "b"]}"#).unwrap();
+        assert!(is_batch);
+        assert_eq!(ps.len(), 2);
+        assert_eq!(ps[0].text.as_deref(), Some("a"));
+        assert_eq!(ps[1].text.as_deref(), Some("b"));
+
+        let (ps, is_batch) = split(r#"{"text": ["only"]}"#).unwrap();
+        assert!(is_batch, "single-element list is still a batch");
+        assert_eq!(ps.len(), 1);
+    }
+
+    /// Scalar `sampling_params` broadcasts to every item; a list maps per item.
+    #[test]
+    fn sampling_params_broadcast_and_per_item() {
+        let (ps, _) =
+            split(r#"{"text": ["a", "b"], "sampling_params": {"temperature": 0.5}}"#).unwrap();
+        assert_eq!(ps[0].sampling_params, ps[1].sampling_params);
+        assert!(ps[0].sampling_params.is_some());
+
+        let (ps, _) = split(
+            r#"{"text": ["a", "b"], "sampling_params": [{"temperature": 0.1}, {"temperature": 0.9}]}"#,
+        )
+        .unwrap();
+        assert_ne!(ps[0].sampling_params, ps[1].sampling_params);
+    }
+
+    /// A per-item `sampling_params` list whose length ≠ batch size is a 400.
+    #[test]
+    fn sampling_params_length_mismatch_errors() {
+        let err = split(r#"{"text": ["a", "b"], "sampling_params": [{}]}"#).unwrap_err();
+        assert!(err.contains("length"), "{err}");
+    }
+
+    /// `input_ids` batch (list of lists) fans out; scalar (list of ints) is single.
+    #[test]
+    fn input_ids_scalar_vs_batch() {
+        let (ps, is_batch) = split(r#"{"input_ids": [1, 2, 3]}"#).unwrap();
+        assert!(!is_batch);
+        assert_eq!(ps[0].input_ids, Some(vec![1, 2, 3]));
+
+        let (ps, is_batch) = split(r#"{"input_ids": [[1, 2], [3]]}"#).unwrap();
+        assert!(is_batch);
+        assert_eq!(ps.len(), 2);
+        assert_eq!(ps[1].input_ids, Some(vec![3]));
+    }
+
+    /// Both / neither of text+input_ids is a 400; the wire still rejects unknowns.
+    #[test]
+    fn split_validates_inputs() {
+        assert!(split(r#"{"text": "a", "input_ids": [1]}"#).is_err());
+        assert!(split(r#"{"stream": true}"#).is_err());
+        assert!(
+            serde_json::from_str::<GenerateBody>(r#"{"text": "hi", "bogus": 1}"#).is_err(),
+            "GenerateBody must deny unknown fields"
+        );
+    }
 
     /// Concatenating N data columns produces the exact same frame as one joined
     /// buffer (the `b"".join` the Python side used to do), with the layout
@@ -1032,11 +904,6 @@ mod chunk_event_tests {
         assert_eq!(events[1].token_ids, vec![20]);
         assert!(events[1].out_lp_val.is_empty() && events[1].hidden_val.is_empty());
     }
-}
-
-#[cfg(test)]
-mod abort_tests {
-    use super::*;
 
     #[test]
     fn abort_req_msgpack_shape() {
@@ -1055,37 +922,27 @@ mod abort_tests {
         assert!(arr[4].is_nil());
         assert!(arr[5].is_nil());
     }
-}
 
-#[cfg(test)]
-mod ingress_header_tests {
-    use super::*;
-
-    /// The ingress header must carry ALL fields the scheduler's msgspec struct
-    /// `TokenizedGenerateReqInput` requires positionally through `stream` — i.e.
-    /// `input_embeds` (idx 5) and `token_type_ids` (idx 7) must be present, so
-    /// `sampling_params` lands at idx 8. Omitting them makes the array too short
-    /// (msgspec: "Expected array of at least length 14") and misaligns
-    /// `sampling_params`. Regression guard for that exact decode failure.
+    /// The header must be positionally aligned: `input_embeds` (idx 5) /
+    /// `token_type_ids` (idx 7) present as nil so `sampling_params` lands at idx 8 and
+    /// the array reaches msgspec's min length. Regression guard for that decode failure.
     #[test]
     fn to_header_msgpack_is_positionally_aligned() {
-        let payload = TokenizedReqPayload {
-            rid: "r1".into(),
-            input_text: Some("hi".into()),
-            input_ids: vec![1, 2, 3],
+        let req = GenerateRequest {
+            text: Some("hi".into()),
+            input_ids: Some(vec![1, 2, 3]),
             sampling_params: Some(rmpv::Value::Map(vec![(
                 rmpv::Value::from("max_new_tokens"),
                 rmpv::Value::from(5),
             )])),
-            return_logprob: true,
-            logprob_start_len: -1,
-            top_logprobs_num: 3,
-            token_ids_logprob: None,
-            return_hidden_states: false,
+            return_logprob: Some(true),
+            logprob_start_len: Some(-1),
+            top_logprobs_num: Some(3),
             is_health_check: true,
             stream: true,
+            ..Default::default()
         };
-        let bytes = payload.to_header_msgpack().unwrap();
+        let bytes = req.to_header_msgpack("r1").unwrap();
         let val = rmpv::decode::read_value(&mut &bytes[..]).unwrap();
         let arr = val.as_array().expect("array");
         // msgspec requires >= 14 (through `stream`); we emit 16.
