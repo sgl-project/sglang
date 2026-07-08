@@ -275,19 +275,20 @@ fn handle_chunk(
 
     // `return_text_in_logprobs`: decode each logprob token id to text HERE (this
     // CPU-bound shard) rather than on the api-server I/O threads. Flat text columns
-    // stay parallel to the `idx` buffers, so `sglang_frame` just reads them.
-    if decode_lp_text {
-        ev.out_lp_txt = backend.decode_logprob_texts(&ev.out_lp_idx);
-        ev.in_lp_txt = backend.decode_logprob_texts(&ev.in_lp_idx);
-        ev.out_top_txt = backend.decode_logprob_texts(&ev.out_top_idx);
-        ev.in_top_txt = backend.decode_logprob_texts(&ev.in_top_idx);
-        ev.out_tid_txt = backend.decode_logprob_texts(&ev.out_tid_idx);
-        ev.in_tid_txt = backend.decode_logprob_texts(&ev.in_tid_idx);
+    // stay parallel to the `idx` buffers, so `sglang_frame` just reads them. Only the
+    // logprob-carrying frames have an `extras` box; a plain token frame skips this.
+    if decode_lp_text && let Some(ex) = ev.extras.as_deref_mut() {
+        ex.out_lp_txt = backend.decode_logprob_texts(&ex.out_lp_idx);
+        ex.in_lp_txt = backend.decode_logprob_texts(&ex.in_lp_idx);
+        ex.out_top_txt = backend.decode_logprob_texts(&ex.out_top_idx);
+        ex.in_top_txt = backend.decode_logprob_texts(&ex.in_top_idx);
+        ex.out_tid_txt = backend.decode_logprob_texts(&ex.out_tid_idx);
+        ex.in_tid_txt = backend.decode_logprob_texts(&ex.in_tid_idx);
     }
 
-    // Fill the decode outputs in place; the pre-decode columns (logprobs/hidden,
-    // token_ids, prompt_tokens, finish_reason) already ride in `ev`. The API
-    // handler formats this delta (and accumulates for the cumulative view).
+    // Fill the decode outputs in place; the pre-decode columns (boxed logprobs/hidden,
+    // token_ids, prompt_tokens, finish_reason) already ride in `ev`. The API handler
+    // formats this delta (and accumulates for the cumulative view).
     ev.text = delta_text;
     ev.completion_tokens = n_tok;
 
