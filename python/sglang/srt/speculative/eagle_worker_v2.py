@@ -225,6 +225,21 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.init_token_map()
         self.init_lm_head()
 
+        # QuaRot: the target model's hidden states are in a rotated space;
+        # apply inverse rotation to the draft model's fc and embed_tokens so
+        # the draft sees original-space features.
+        if (
+            self.speculative_algorithm.is_eagle3()
+            and self.server_args.quantization == "modelslim"
+        ):
+            from sglang.srt.layers.quantization.modelslim.quarot_utils import (
+                maybe_apply_quarot_anti_rotation,
+            )
+
+            maybe_apply_quarot_anti_rotation(
+                self.server_args.model_path, self.draft_runner.model
+            )
+
         if self.server_args.speculative_use_rejection_sampling:
             target_vocab_size = self.target_worker.model_config.vocab_size
             draft_vocab_size = (
