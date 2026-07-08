@@ -139,10 +139,7 @@ impl Runnable for TokenizerWorker {
                     tracing::error!("tokenizer pool received a non-generate request");
                     continue;
                 };
-                match self
-                    .tokenizer
-                    .encode(g.payload.text.as_deref().unwrap_or(""))
-                {
+                match self.tokenizer.encode(g.text.as_deref().unwrap_or("")) {
                     Ok(ids) => {
                         g.input_ids = Some(ids);
                         Event::TokenizeDone

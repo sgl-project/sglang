@@ -1,12 +1,8 @@
-//! API server (axum / tokio). I/O-bound; runs on its own pinned multi-thread
-//! runtime. Designed so additional protocols (h2/h3/websocket/grpc) can mount
-//! the same `AppState` later — only this module knows about HTTP.
-//!
-//! `/generate` opens a per-request egress channel, moves a `Request` into the
-//! ingress pipeline, and then either awaits a single `Done` (unary) or relays
-//! frames as Server-Sent Events (streaming), byte-compatible with the Python
-//! `http_server.generate_request` (`data: {json}\n\n` … `data: [DONE]\n\n`).
-//! `/server_info` reuses the same submit machinery for a single control result.
+//! API server (axum / tokio). I/O-bound; own pinned multi-thread runtime. Only
+//! this module knows HTTP, so other protocols can mount the same `AppState`.
+//! `/generate` submits a `Request` then awaits one `Done` (unary) or relays SSE
+//! frames (`data: {json}` … `[DONE]`), byte-compatible with Python
+//! `http_server.generate_request`; `/server_info` reuses it for one control result.
 mod openai;
 
 use std::sync::Arc;
@@ -28,17 +24,15 @@ use crate::fsm::RequestState;
 use crate::ids::{RequestId, RequestIdGen};
 
 use crate::message::{
-    ChunkEvent, ControlRequest, EgressItem, EgressSink, GenerateBody, GeneratePayload,
-    GenerateRequest, Request, RequestKind,
+    ChunkEvent, ControlRequest, EgressItem, EgressSink, GenerateBody, GenerateRequest, Request,
+    RequestKind,
 };
 use crate::runtime::ServerArgs;
 use crate::runtime::channels::{Senders, TmEvent};
 use crate::tokenizer_manager::ActivityCounter;
 
-/// Shared state for every handler. Holds the submit machinery (`senders`,
-/// `id_gen`, `egress_buf`) and the shared tokenizer. `Clone` is a set of
-/// refcount bumps (each field is `Arc`-backed), so axum's per-request clone is
-/// cheap.
+/// Shared handler state: the submit machinery (`senders`, `id_gen`, `egress_buf`)
+/// + shared tokenizer. `Clone` is cheap refcount bumps (every field is `Arc`).
 #[derive(Clone)]
 struct AppState {
     senders: Senders,
@@ -53,9 +47,8 @@ struct AppState {
     health_endpoint_generation: bool,
 }
 
-/// Parse `SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION`, matching Python's `EnvBool`
-/// (`true/1/yes/y` → true, `false/0/no/n` → false). Unset or unrecognized → the
-/// `true` default (health generation on).
+/// Parse `SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION` (Python `EnvBool`:
+/// `false/0/no/n` → false, else true; unset → true).
 fn read_health_endpoint_generation() -> bool {
     match std::env::var("SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION") {
         Ok(v) => !matches!(
@@ -85,26 +78,22 @@ pub async fn serve(
     };
     let app = Router::new()
         .route("/generate", post(generate))
-        // Health: `/health` runs the generation round-trip by default
-        // (`SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION`, else plain 200);
-        // `/health_generate` always does. Mirrors the Python handler.
+        // `/health` runs the generation round-trip by default (env-gated, else
+        // plain 200); `/health_generate` always does. Mirrors Python.
         .route("/health", get(health))
         .route("/health_generate", get(health_generate))
-        // Control-plane endpoints: each reuses the ingress FSM (no tokenization)
-        // and returns a single, non-streamed JSON result from the scheduler.
-        // Adding one = a route line passing its scheduler request-struct tag.
+        // Control-plane: reuses the ingress FSM (no tokenization), returns one
+        // non-streamed JSON result. Adding one = a route line + its struct tag.
         .route("/server_info", get(server_info))
-        // Static config endpoints: no scheduler round-trip. `/get_model_info`
-        // (+ its `/model_info` alias) is what the SGLang lang backend
-        // (`RuntimeEndpoint`, used by the gsm8k/eval benchmarks) calls at
-        // startup; `/v1/models` is OpenAI-compatible.
+        // Static config, no scheduler round-trip. `/get_model_info` (+ `/model_info`
+        // alias) is what the SGLang lang backend (`RuntimeEndpoint`, gsm8k/eval)
+        // calls at startup; `/v1/models` is OpenAI-compatible.
         .route("/get_model_info", get(model_info))
         .route("/model_info", get(model_info))
         .route("/v1/models", get(openai::available_models))
-        // TODO(auth): no API-key boundary yet. The Python server gates every route
-        // (except /health*, /metrics*, OPTIONS) with `add_api_key_middleware`
-        // (`api_key` / `admin_api_key`); until that is ported here, a configured
-        // `api_key` does NOT protect these routes.
+        // TODO(auth): no API-key boundary yet. Python gates every route (except
+        // /health*, /metrics*, OPTIONS) via `add_api_key_middleware`; until ported,
+        // a configured `api_key` does NOT protect these routes.
         .with_state(state);
 
     // The listener was already bound synchronously in `runtime::start` (so a port
@@ -119,14 +108,12 @@ pub async fn serve(
     if let Ok(addr) = listener.local_addr() {
         tracing::info!(%addr, "sglang-server api listening");
     }
-    // Non-graceful shutdown: on the signal, stop accepting and RETURN — do NOT
-    // wait for in-flight handlers (a `/generate` blocked on its egress channel
-    // would never complete, wedging the join). Returning drops `serve` (stops
-    // accepts) and unwinds `block_on` in `runtime::start`, so the api thread's
-    // tokio runtime is dropped — which cancels the detached in-flight handler
-    // tasks. Each cancelled handler's `AbortGuard` fires, releasing its `Senders`
-    // clone; once every clone is gone the detok/tok channels close and those
-    // workers exit. Full graceful drain is deferred (see `request_shutdown`).
+    // Non-graceful shutdown: on the signal, stop accepting and RETURN without
+    // waiting for in-flight handlers (a `/generate` blocked on egress would wedge
+    // the join). Returning unwinds `block_on` in `runtime::start` → the api tokio
+    // runtime drops → detached handlers cancel → their `AbortGuard`s fire, release
+    // `Senders` clones → tok/detok channels close → workers exit. Full drain is
+    // deferred (see `request_shutdown`).
     let serve = axum::serve(listener, app);
     tokio::select! {
         r = serve => {
@@ -140,17 +127,15 @@ pub async fn serve(
     }
 }
 
-/// Submit a request into the ingress pipeline. Returns the per-request egress
-/// receiver to read the result(s) from. The `kind` carries the variant body
-/// (generate payload / control tag), so this stays generic over both.
+/// Submit a request into the ingress pipeline; returns its egress receiver. `kind`
+/// carries the variant body (generate / control), so this is generic over both.
 async fn submit(
     state: &AppState,
     kind: RequestKind,
 ) -> Result<(RequestId, mpsc::Receiver<EgressItem>), ()> {
     let id = state.id_gen.next();
-    // Move the request into the in-process pipeline. Async-aware send so a full
-    // TM inbox yields (backpressure) instead of parking a worker thread; Err only
-    // when the inbox is closed (runtime shutdown).
+    // Async-aware send so a full TM inbox yields (backpressure) instead of parking
+    // a thread; Err only when the inbox is closed (shutdown).
     let (tx, rx) = mpsc::channel::<EgressItem>(state.egress_buf);
     let req = Request {
         id,
@@ -167,11 +152,9 @@ async fn submit(
     }
 }
 
-/// Aborts any still-in-flight request when dropped before normal completion —
-/// i.e. axum dropped the handler future / SSE stream because the HTTP client
-/// disconnected. Mirrors the Python `TokenizerManager` aborting on
-/// `request.is_disconnected()`. Each rid is disarmed once it finishes naturally;
-/// whatever is left when the guard drops gets an abort.
+/// Aborts still-in-flight rids on drop — i.e. axum dropped the handler/SSE stream
+/// because the client disconnected (mirrors Python's `is_disconnected` abort).
+/// Each rid is disarmed on natural finish; whatever remains at drop is aborted.
 struct AbortGuard {
     senders: Senders,
     rids: Vec<RequestId>,
@@ -207,8 +190,7 @@ impl AbortGuard {
 
 impl Drop for AbortGuard {
     fn drop(&mut self) {
-        // Best-effort, non-blocking abort of each still-in-flight rid — route a
-        // `TmEvent::Abort` to the ingress loop. A full/closed channel just drops
+        // Best-effort non-blocking abort per rid; a full/closed channel just drops
         // it (the request then finishes at EOS, only later).
         for &rid in &self.rids {
             let _ = self.senders.tm.try_send(TmEvent::Abort(rid));
@@ -216,10 +198,9 @@ impl Drop for AbortGuard {
     }
 }
 
-/// Submit a `Control(tag)` request through the same ingress FSM as `/generate`
-/// (minus tokenization) and await the scheduler's single msgpack `Result`. The
-/// scheduler pushes a *named map* (`structs.asdict` of the response struct).
-/// Returns the raw msgpack bytes, or an error `Response` to return as-is.
+/// Submit a `Control(tag)` through the ingress FSM (no tokenization) and await the
+/// scheduler's single msgpack result (a `structs.asdict` named map). Returns the
+/// raw bytes, or an error `Response` to return as-is.
 async fn await_control_result(
     state: &AppState,
     tag: &'static str,
@@ -268,9 +249,8 @@ fn lp_value(v: f32) -> serde_json::Value {
     }
 }
 
-/// Build the SGLang logprob wire shape: a list of `[logprob, token_id, text]`
-/// tuples. `texts` (flat, parallel to `idxs`) fills the text slot when
-/// `return_text_in_logprobs` is set; otherwise it is `null`.
+/// SGLang logprob shape: a list of `[logprob, token_id, text]` tuples. `texts`
+/// (parallel to `idxs`) fills the text slot when set, else `null`.
 fn logprob_tuples(vals: &[f32], idxs: &[i32], texts: Option<&[String]>) -> serde_json::Value {
     let tuples: Vec<serde_json::Value> = vals
         .iter()
@@ -281,10 +261,9 @@ fn logprob_tuples(vals: &[f32], idxs: &[i32], texts: Option<&[String]>) -> serde
     serde_json::Value::Array(tuples)
 }
 
-/// Build the ragged top-k / token-ids logprob shape: one entry per position,
-/// each a list of `[logprob, token_id, text]` tuples, or `null` for an empty
-/// position (`lens[p] == 0`) — mirroring `detokenize_top_logprobs_tokens`.
-/// `texts` is flat, parallel to `vals`/`idxs`.
+/// Ragged top-k / token-ids shape: one entry per position — a list of
+/// `[logprob, token_id, text]` tuples, or `null` when `lens[p] == 0` (mirrors
+/// `detokenize_top_logprobs_tokens`). `texts` is parallel to `vals`/`idxs`.
 fn ragged_logprob_tuples(
     vals: &[f32],
     idxs: &[i32],
@@ -309,8 +288,7 @@ fn ragged_logprob_tuples(
 }
 
 /// Reshape flat hidden-state f32s + per-row lengths into `meta_info`'s nested
-/// `list[list[float]]` (one row per output position). A single row of length 1
-/// wins the common last-token case; multi-row is the per-token case.
+/// `list[list[float]]` (one row per output position).
 fn hidden_states_rows(vals: &[f32], lens: &[u32]) -> serde_json::Value {
     let mut rows = Vec::with_capacity(lens.len());
     let mut off = 0usize;
@@ -322,11 +300,9 @@ fn hidden_states_rows(vals: &[f32], lens: &[u32]) -> serde_json::Value {
     serde_json::Value::Array(rows)
 }
 
-/// Classify a terminal finish reason: `Some((code, message))` when it's an
-/// `abort` carrying a `status_code` (a request error the scheduler produced, e.g.
-/// an over-context request → 400). The status lives only inside `meta_info`, so
-/// both the unary and streaming paths must inspect it rather than treat the
-/// `Done` frame as a normal completion.
+/// Classify a terminal finish reason: `Some((code, message))` when it's an `abort`
+/// carrying a `status_code` (a scheduler request error, e.g. over-context → 400).
+/// Both unary + streaming paths inspect this instead of treating `Done` as normal.
 fn abort_status(finish_reason: &Option<serde_json::Value>) -> Option<(u16, String)> {
     let fr = finish_reason.as_ref()?;
     if fr.get("type").and_then(|t| t.as_str()) != Some("abort") {
@@ -348,8 +324,8 @@ fn error_value(code: u16, message: &str) -> serde_json::Value {
 }
 
 /// Format a decoded [`ChunkEvent`] as one SGLang `/generate` frame's JSON. `rid`
-/// (the response `meta_info.id`) is passed in as its string form — the api-server
-/// owns the canonical id; the event's numeric `rid` is just the shard routing key.
+/// (response `meta_info.id`) is passed as a string; the event's numeric `rid` is
+/// just the shard routing key.
 fn sglang_frame_value(out: &ChunkEvent, rid: &str) -> serde_json::Value {
     let mut v = serde_json::json!({
         "text": out.text,
@@ -361,9 +337,8 @@ fn sglang_frame_value(out: &ChunkEvent, rid: &str) -> serde_json::Value {
             "finish_reason": out.finish_reason,
         },
     });
-    // Logprobs: SGLang shape is a list of `[logprob, token_id, token_text|null]`
-    // tuples. The token text (`return_text_in_logprobs`) was decoded on the detok
-    // shard into the `*_txt` columns; empty → null text slot.
+    // Logprobs: `[logprob, token_id, text|null]` tuples. Text (`return_text_in_logprobs`)
+    // was decoded on the detok shard into `*_txt`; empty → null slot.
     if !out.token_ids.is_empty() {
         v["output_ids"] = serde_json::json!(out.token_ids);
     }
@@ -413,12 +388,10 @@ fn sglang_frame_value(out: &ChunkEvent, rid: &str) -> serde_json::Value {
     v
 }
 
-/// Format one streaming frame. Non-incremental (SGLang default): the accumulator's
-/// **cumulative** view. Incremental (`incremental_streaming_output`): this step's
-/// **delta** `text`/`output_ids`/logprobs, but with the cumulative token count in
-/// `meta_info` (matching the Python `TokenizerManager`). `delta` is this chunk's
-/// event; `acc` is the cumulative fold used for both the cumulative view and the
-/// running `completion_tokens`.
+/// Format one streaming frame. Non-incremental (default): the accumulator's
+/// cumulative view. Incremental: this step's delta `text`/`output_ids`/logprobs
+/// but with the cumulative token count in `meta_info` (matching Python). `acc` is
+/// the cumulative fold; `delta` is this chunk.
 fn stream_frame_value(
     delta: ChunkEvent,
     acc: &OutputAccumulator,
@@ -434,9 +407,8 @@ fn stream_frame_value(
     }
 }
 
-/// Generic control endpoint: returns the scheduler's response rendered straight
-/// to JSON (`tag` = the scheduler request-struct name). Used by control
-/// endpoints whose response needs no shaping.
+/// Generic control endpoint: the scheduler's response straight to JSON (`tag` =
+/// request-struct name). For control endpoints whose response needs no shaping.
 #[allow(dead_code)] // first non-/server_info control endpoint will use this
 async fn control(State(state): State<AppState>, tag: &'static str) -> Response {
     match await_control_result(&state, tag).await {
@@ -453,10 +425,9 @@ async fn control(State(state): State<AppState>, tag: &'static str) -> Response {
     }
 }
 
-/// `GET /health` — liveness. By default (`SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION`
-/// True, mirroring Python) this runs the same 1-token round-trip as
-/// `/health_generate`; when the env is set false it returns a plain 200 (the
-/// api-server routing the request already proves the frontend is up).
+/// `GET /health` — liveness. By default (env true, mirroring Python) runs the same
+/// 1-token round-trip as `/health_generate`; env false → plain 200 (routing the
+/// request already proves the frontend is up).
 async fn health(State(state): State<AppState>) -> Response {
     if state.health_endpoint_generation {
         health_generate_inner(&state).await
@@ -470,42 +441,34 @@ async fn health_generate(State(state): State<AppState>) -> Response {
     health_generate_inner(&state).await
 }
 
-/// Deep health: confirm the scheduler → detok path is actually producing output.
-/// Returns 200 iff the egress heartbeat advances within the timeout, else 503.
+/// Deep health: confirm the scheduler → detok path is producing output. 200 iff
+/// the egress heartbeat advances within the timeout, else 503.
 ///
-/// It fires a pre-tokenized 1-token probe (`input_ids = [0]`, which skips the
-/// tokenizer via `classify → AlreadyTokenized`) so an **idle** pipeline produces
-/// a frame, then watches the **global** [`AppState::egress_activity`] counter
-/// (not the probe's own rid). So a **busy** server passes immediately on
-/// concurrent traffic and a backlogged queue never causes a false 503 — the
-/// rust-native analogue of the Python health check's `last_receive_tstamp`. The
-/// scheduler's `HEALTH_CHECK`-rid skip and `http_worker_ipc` ack are irrelevant
-/// here: those exist for the multi-tokenizer-*process* setup, whereas this
-/// single-process server owns the egress ring and observes activity directly.
+/// Fires a pre-tokenized 1-token probe (`input_ids = [0]`, skips the tokenizer) so
+/// an idle pipeline produces a frame, then watches the *global*
+/// [`AppState::egress_activity`] counter (not the probe's own rid) — so a busy
+/// server passes immediately and a backlog never false-503s (the analogue of
+/// Python's `last_receive_tstamp`). The `HEALTH_CHECK` skip + `http_worker_ipc`
+/// ack are irrelevant here: this single-process server owns the egress ring.
 async fn health_generate_inner(state: &AppState) -> Response {
     let baseline = state
         .egress_activity
         .load(std::sync::atomic::Ordering::Relaxed);
 
-    // Fire the probe (we do not await its own response; the heartbeat is the
-    // signal). We must NOT assume it self-completes: a busy scheduler skips the
-    // health request without emitting any terminal frame, so its detok
-    // registration is cleaned up only by the `AbortGuard` below.
+    // Fire the probe (the heartbeat is the signal, not its own response). A busy
+    // scheduler skips it with no terminal frame, so its detok registration is
+    // cleaned up only by the `AbortGuard` below.
     let sampling_params = rmpv::Value::Map(vec![
         (rmpv::Value::from("max_new_tokens"), rmpv::Value::from(1)),
         (rmpv::Value::from("temperature"), rmpv::Value::F64(0.0)),
     ]);
-    let payload = GeneratePayload {
+    let kind = RequestKind::Generate(GenerateRequest {
         input_ids: Some(vec![0]),
         sampling_params: Some(sampling_params),
-        ..Default::default()
-    };
-    let kind = RequestKind::Generate(GenerateRequest {
-        payload,
-        input_ids: None,
         stream: false,
         // The scheduler skips this when busy so it never occupies a queue slot.
         is_health_check: true,
+        ..Default::default()
     });
     let (rid, _keepalive) = match submit(state, kind).await {
         // Hold the receiver so the probe's sink stays open until it completes.
@@ -553,11 +516,10 @@ async fn model_info(State(state): State<AppState>) -> Response {
 }
 
 /// `GET /server_info` — surface only an allowlist ([`INTERNAL_STATE_ALLOWLIST`] +
-/// curated [`ServerArgs`] accessors), never the scheduler's raw server-args dump,
-/// which embeds `api_key`/`admin_api_key` (see [`shape_server_info`]).
+/// curated [`ServerArgs`] accessors), never the raw server-args dump (embeds
+/// `api_key`/`admin_api_key`; see [`shape_server_info`]).
 ///
-/// TODO(server_info): the Python endpoint also includes `version` and `kv_events`;
-/// add them once plumbed through (captured at `Server.start` / a richer response).
+/// TODO(server_info): Python also includes `version` + `kv_events`; add once plumbed.
 async fn server_info(State(state): State<AppState>) -> Response {
     let bytes = match await_control_result(&state, "GetInternalStateReq").await {
         Ok(b) => b,
@@ -576,10 +538,9 @@ async fn server_info(State(state): State<AppState>) -> Response {
     }
 }
 
-/// Runtime-metric keys the scheduler's `get_internal_state` adds on top of the
-/// server-args dump. We copy ONLY these out of `internal_state` — an allowlist, so
-/// the co-mingled `api_key`/`admin_api_key` (and any secret added later) can never
-/// reach the response.
+/// Runtime-metric keys `get_internal_state` adds atop the server-args dump. We copy
+/// ONLY these out of `internal_state` (an allowlist), so the co-mingled
+/// `api_key`/`admin_api_key` can never reach the response.
 const INTERNAL_STATE_ALLOWLIST: &[&str] = &[
     "last_gen_throughput",
     "memory_usage",
@@ -609,8 +570,8 @@ fn shape_server_info(msgpack: &[u8], server_args: &ServerArgs) -> Result<Vec<u8>
         }
     }
 
-    // Top-level non-secret config from typed accessors — these structurally cannot
-    // surface a key field, unlike the raw dump.
+    // Top-level non-secret config from typed accessors (structurally can't surface
+    // a key field, unlike the raw dump).
     let response = serde_json::json!({
         "model_path": server_args.model_path(),
         "served_model_name": server_args.served_model_name(),
@@ -628,16 +589,12 @@ fn msgpack_to_json(bytes: &[u8]) -> Result<Vec<u8>, String> {
     serde_json::to_vec(&val).map_err(|e| e.to_string())
 }
 
-/// Folds the per-chunk [`ChunkEvent`] deltas the detok emits into a cumulative
-/// view. Used by the drain loops that need cumulative output — every unary
-/// response and the cumulative SGLang `/generate` stream. OpenAI streaming
-/// forwards deltas directly and doesn't use this. Shared with the [`openai`]
-/// submodule (`super::OutputAccumulator`).
-/// Wraps a single cumulative [`ChunkEvent`] built up across delta chunks.
-/// Holding it (rather than mirroring its fields) lets `snapshot` hand back a
-/// **borrow** for each streaming frame — no per-frame deep clone of the growing
-/// buffers (that made token-by-token streaming O(T²) *extra* on top of the wire
-/// format's inherent O(T²)).
+/// Folds per-chunk [`ChunkEvent`] deltas into a cumulative view — used by the drain
+/// loops needing cumulative output (every unary response + the cumulative SGLang
+/// stream; OpenAI streaming forwards deltas and skips this). Holds a single
+/// [`ChunkEvent`] so `snapshot` hands back a **borrow** per frame — no per-frame
+/// clone of the growing buffers (that added O(T²) atop the wire's inherent O(T²)).
+/// Shared with the [`openai`] submodule.
 #[derive(Default)]
 struct OutputAccumulator {
     out: ChunkEvent,
@@ -726,25 +683,17 @@ async fn generate(State(state): State<AppState>, Json(body): Json<GenerateBody>)
 
 /// A single (non-batched) `/generate`: submit one request, then either stream its
 /// SSE frames or fold to one unary response.
-async fn generate_single(state: &AppState, payload: GeneratePayload, stream: bool) -> Response {
-    // `return_text_in_logprobs` is decoded on the detok shard (see
-    // DetokMsg::Register.decode_logprob_text) into the `*_txt` columns, so
+async fn generate_single(state: &AppState, req: GenerateRequest, stream: bool) -> Response {
+    // `return_text_in_logprobs` is decoded on the detok shard into `*_txt`, so
     // `sglang_frame_value` just reads them — no tokenizer needed here.
-    let kind = RequestKind::Generate(GenerateRequest {
-        payload,
-        input_ids: None,
-        stream,
-        is_health_check: false,
-    });
-    let (rid, mut rx) = match submit(state, kind).await {
+    let (rid, mut rx) = match submit(state, RequestKind::Generate(req)).await {
         Ok(v) => v,
         Err(()) => {
             return (StatusCode::SERVICE_UNAVAILABLE, "service unavailable").into_response();
         }
     };
-    // Abort the request if the client disconnects: the guard fires `try_abort`
-    // when dropped before the request finishes — i.e. axum drops this handler /
-    // SSE stream because the connection closed. Disarmed on a natural terminal.
+    // Abort on client disconnect: the guard fires when dropped before the request
+    // finishes (axum drops the handler/SSE stream). Disarmed on a natural terminal.
     let mut guard = AbortGuard::new(state.senders.clone(), rid);
     // Response `meta_info.id`, stringified once and reused for every frame.
     let rid_str = rid.0.to_string();
@@ -811,27 +760,20 @@ async fn drain_unary(
     )
 }
 
-/// Batch `/generate`: submit every sub-request first so the scheduler runs them
-/// together, then either (unary) drain each in order into a JSON **array** of
-/// results, or (streaming) multiplex their egress streams into one SSE response
-/// where each frame carries its batch `index`. One [`AbortGuard`] covers the whole
-/// batch, so a client disconnect aborts them all. A failed unary item is its own
-/// `{ "error": … }` array entry; the batch response is 200.
+/// Batch `/generate`: submit all sub-requests first (scheduler runs them together),
+/// then either (unary) drain each in order into a JSON array, or (streaming)
+/// multiplex their streams into one SSE response, each frame carrying its `index`.
+/// One [`AbortGuard`] covers the batch. A failed unary item is its own
+/// `{ "error": … }` entry; the batch response is 200.
 async fn generate_batch(
     state: &AppState,
-    payloads: Vec<GeneratePayload>,
+    requests: Vec<GenerateRequest>,
     stream: bool,
 ) -> Response {
     let mut guard = AbortGuard::new_empty(state.senders.clone());
-    let mut receivers = Vec::with_capacity(payloads.len());
-    for payload in payloads {
-        let kind = RequestKind::Generate(GenerateRequest {
-            payload,
-            input_ids: None,
-            stream,
-            is_health_check: false,
-        });
-        match submit(state, kind).await {
+    let mut receivers = Vec::with_capacity(requests.len());
+    for req in requests {
+        match submit(state, RequestKind::Generate(req)).await {
             Ok((rid, rx)) => {
                 guard.arm(rid);
                 receivers.push((rid, rx));
@@ -945,8 +887,9 @@ fn generation_event_stream(
 }
 
 #[cfg(test)]
-mod logprob_shape_tests {
+mod tests {
     use super::*;
+    use futures::StreamExt;
 
     #[test]
     fn flat_logprob_tuples_shape() {
@@ -1098,11 +1041,6 @@ mod logprob_shape_tests {
         );
         assert!(abort_status(&None).is_none());
     }
-}
-
-#[cfg(test)]
-mod server_info_tests {
-    use super::*;
 
     /// The scheduler's `internal_state` embeds the full server-args dump (incl.
     /// `api_key`/`admin_api_key`). `/server_info` must surface only the allowlisted
@@ -1158,13 +1096,8 @@ mod server_info_tests {
         // Curated top-level config comes from typed accessors, not the dump.
         assert_eq!(v["model_path"], "/m");
     }
-}
 
-#[cfg(test)]
-mod abort_guard_tests {
-    use super::*;
-
-    fn senders(tm: flume::Sender<TmEvent>) -> Senders {
+    fn senders_with_tm(tm: flume::Sender<TmEvent>) -> Senders {
         Senders {
             tm,
             tok: flume::unbounded().0,
@@ -1179,7 +1112,7 @@ mod abort_guard_tests {
     #[test]
     fn armed_guard_aborts_on_drop() {
         let (tm_tx, tm_rx) = flume::unbounded();
-        drop(AbortGuard::new(senders(tm_tx), RequestId(7)));
+        drop(AbortGuard::new(senders_with_tm(tm_tx), RequestId(7)));
         assert!(
             matches!(tm_rx.try_recv(), Ok(TmEvent::Abort(id)) if id == RequestId(7)),
             "armed guard must abort its rid on drop",
@@ -1191,17 +1124,11 @@ mod abort_guard_tests {
     #[test]
     fn disarmed_guard_does_not_abort() {
         let (tm_tx, tm_rx) = flume::unbounded();
-        let mut guard = AbortGuard::new(senders(tm_tx), RequestId(9));
+        let mut guard = AbortGuard::new(senders_with_tm(tm_tx), RequestId(9));
         guard.disarm(RequestId(9));
         drop(guard);
         assert!(tm_rx.try_recv().is_err(), "disarmed rid must not abort");
     }
-}
-
-#[cfg(test)]
-mod batch_stream_tests {
-    use super::*;
-    use futures::StreamExt;
 
     fn senders() -> Senders {
         Senders {
