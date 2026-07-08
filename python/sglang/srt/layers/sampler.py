@@ -1,3 +1,5 @@
+import functools
+import inspect
 import logging
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -60,6 +62,13 @@ if is_npu():
 
 logger = logging.getLogger(__name__)
 
+
+@functools.lru_cache(maxsize=256)
+def _processor_accepts_hidden_states(proc_cls: type) -> bool:
+    """Return True if proc_cls.__call__ declares a 'hidden_states' parameter."""
+    return "hidden_states" in inspect.signature(proc_cls.__call__).parameters
+
+
 SYNC_TOKEN_IDS_ACROSS_TP = get_bool_env_var("SYNC_TOKEN_IDS_ACROSS_TP")
 SGLANG_RETURN_ORIGINAL_LOGPROB = get_bool_env_var("SGLANG_RETURN_ORIGINAL_LOGPROB")
 _CUSTOM_SAMPLER_FACTORIES: Dict[str, Callable[[], "Sampler"]] = {}
@@ -83,11 +92,16 @@ class Sampler(nn.Module):
         self.use_ascend_backend = get_server_args().sampling_backend == "ascend"
 
     def _preprocess_logits(
-        self, logits: torch.Tensor, sampling_info: SamplingBatchInfo
+        self,
+        logits: torch.Tensor,
+        sampling_info: SamplingBatchInfo,
+        hidden_states: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Apply custom logit processors and sanitize non-finite logits."""
         if sampling_info.has_custom_logit_processor:
-            apply_custom_logit_processor(logits, sampling_info)
+            apply_custom_logit_processor(
+                logits, sampling_info, hidden_states=hidden_states
+            )
         sanitize_nan_logits(logits, "sampler: next_token_logits")
         return logits
 
@@ -117,7 +131,9 @@ class Sampler(nn.Module):
         logits = logits_output.next_token_logits
 
         # Preprocess logits (custom processors and NaN handling)
-        logits = self._preprocess_logits(logits, sampling_info)
+        logits = self._preprocess_logits(
+            logits, sampling_info, hidden_states=logits_output.hidden_states
+        )
 
         if sampling_info.is_all_greedy:
             if _use_aiter and not _disable_aiter_greedy_sample:
@@ -768,11 +784,17 @@ def apply_custom_logit_processor(
     logits: torch.Tensor,
     sampling_batch_info: SamplingBatchInfo,
     num_tokens_in_batch: int = 1,
+    hidden_states: Optional[torch.Tensor] = None,
 ):
     """Apply custom logit processors to the logits.
     This function will modify the logits in-place.
     num_tokens_in_batch is needed to support spec decoding, where each batch can contain multiple
     tokens. By default, we assume each batch contains only 1 token.
+
+    hidden_states: optional [total_tokens, hidden_dim] tensor from LogitsProcessorOutput.
+    When non-None AND the processor declares a 'hidden_states' parameter in its __call__,
+    the sliced hidden states are forwarded as a keyword argument. Processors that do not
+    declare 'hidden_states' receive only (logits, params) — no change to their interface.
     """
 
     assert logits.shape[0] == len(sampling_batch_info) * num_tokens_in_batch, (
@@ -792,13 +814,20 @@ def apply_custom_logit_processor(
             f"The number of batch mask ({batch_mask.shape[0]}) does not match the number of "
             f"sampling_batch_info ({len(sampling_batch_info)})"
         )
-        batch_mask = torch.repeat_interleave(batch_mask, num_tokens_in_batch)
+        batch_mask_rep = torch.repeat_interleave(batch_mask, num_tokens_in_batch)
+        params_slice = [sampling_batch_info.custom_params[i] for i in batch_indices]
 
-        # Apply the processor to the logits
-        logits[batch_mask] = processor(
-            logits[batch_mask],
-            [sampling_batch_info.custom_params[i] for i in batch_indices],
-        )
+        # Capability-aware dispatch: only forward hidden_states to processors that accept it.
+        if hidden_states is not None and _processor_accepts_hidden_states(
+            type(processor)
+        ):
+            logits[batch_mask_rep] = processor(
+                logits[batch_mask_rep],
+                params_slice,
+                hidden_states=hidden_states[batch_mask_rep],
+            )
+        else:
+            logits[batch_mask_rep] = processor(logits[batch_mask_rep], params_slice)
 
         logger.debug(
             f"Custom logit processor {processor.__class__.__name__} is applied."
