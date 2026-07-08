@@ -125,6 +125,64 @@ retry_with_backoff() {
   done
 }
 
+network_diagnostics_enabled() {
+  case "${AMD_NETWORK_DIAGNOSTICS:-0}" in
+    1|true|yes|on) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+run_network_diagnostics_phase() {
+  if ! network_diagnostics_enabled; then
+    return 0
+  fi
+
+  local mode="$1"
+  local phase="$2"
+  local image="${3:-}"
+  local image_tag="${NETWORK_DIAG_IMAGE_TAG:-}"
+
+  if [[ -n "${image}" && "${image}" == *":"* ]]; then
+    image_tag="${image##*:}"
+  fi
+
+  NETWORK_DIAG_MODE="${mode}" \
+  NETWORK_DIAG_SOURCE="inline" \
+  NETWORK_DIAG_PHASE="${phase}" \
+  NETWORK_DIAG_ROCM_VERSION="${ROCM_VERSION}" \
+  NETWORK_DIAG_IMAGE_TAG="${image_tag}" \
+    bash scripts/ci/amd/network_diagnostics.sh || true
+}
+
+timed_docker_pull_capture() {
+  local label="$1"
+  shift
+  local start end rc tmp
+  tmp="$(mktemp)"
+
+  echo "::group::network diagnostic: ${label}" >&2
+  echo "docker_pull_label=${label}" >&2
+  echo "docker_pull_command=$*" >&2
+  echo "docker_pull_start=$(date -Is)" >&2
+  start=$(date +%s)
+  "$@" >"${tmp}" 2>&1
+  rc=$?
+  end=$(date +%s)
+  cat "${tmp}" >&2
+  cat "${tmp}"
+  rm -f "${tmp}"
+  echo "docker_pull_rc=${rc}" >&2
+  echo "docker_pull_elapsed_sec=$((end - start))" >&2
+  echo "docker_pull_end=$(date -Is)" >&2
+  echo "::endgroup::" >&2
+  return "${rc}"
+}
+
+timed_public_docker_pull() {
+  local image="$1"
+  timed_docker_pull_capture "public docker pull ${image}" docker pull "${image}"
+}
+
 # Authenticate to Docker Hub to avoid anonymous pull rate limits.
 # Credentials are optional; when absent we fall back to unauthenticated pulls.
 if [[ -n "${DOCKERHUB_AMD_USERNAME:-}" && -n "${DOCKERHUB_AMD_TOKEN:-}" ]]; then
@@ -238,10 +296,11 @@ if [[ -n "${CUSTOM_IMAGE}" ]]; then
   # Use explicitly provided custom image
   IMAGE="${CUSTOM_IMAGE}"
   echo "Using custom image: ${IMAGE}"
+  run_network_diagnostics_phase prepull start_container_custom_prepull "${IMAGE}"
   if [[ "${IMAGE}" == "${LOCAL_DOCKER_REGISTRY}/"* ]]; then
-    docker pull "${IMAGE}"
+    timed_docker_pull_capture "custom local docker pull ${IMAGE}" docker pull "${IMAGE}"
   else
-    retry_with_backoff 6 docker pull "${IMAGE}"
+    retry_with_backoff 6 timed_public_docker_pull "${IMAGE}"
   fi
 elif [[ -n "${BUILD_FROM_DOCKERFILE}" ]]; then
   # Build image from Dockerfile
@@ -272,18 +331,19 @@ elif [[ -n "${BUILD_FROM_DOCKERFILE}" ]]; then
 else
   # Find the latest pre-built image
   IMAGE=$(find_latest_image "${GPU_ARCH}")
+  run_network_diagnostics_phase prepull start_container_prepull "${IMAGE}"
   # Try the local docker registry first (avoids Docker Hub rate limits and is
   # faster on the LAN); if that fails for any reason, fall back to the
   # public registry with exponential-backoff retries. Capture stderr so the
   # real failure reason (TLS handshake, 404, connection refused, etc.) is
   # visible in the job log instead of being silently swallowed.
-  if local_pull_output=$(docker pull "${LOCAL_DOCKER_REGISTRY}/${IMAGE}" 2>&1); then
+  if local_pull_output=$(timed_docker_pull_capture "local docker pull ${LOCAL_DOCKER_REGISTRY}/${IMAGE}" docker pull "${LOCAL_DOCKER_REGISTRY}/${IMAGE}"); then
     echo "Pulled from local docker registry: ${LOCAL_DOCKER_REGISTRY}/${IMAGE}"
     docker tag "${LOCAL_DOCKER_REGISTRY}/${IMAGE}" "${IMAGE}"
   else
     echo "Local docker registry pull failed; falling back to public registry: ${IMAGE}" >&2
     printf '%s\n' "${local_pull_output}" | sed 's/^/  [local-pull] /' >&2
-    retry_with_backoff 6 docker pull "${IMAGE}"
+    retry_with_backoff 6 timed_public_docker_pull "${IMAGE}"
   fi
 fi
 

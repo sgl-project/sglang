@@ -48,6 +48,8 @@ on:
           - multimodal-gen-test-1-gpu-amd-rocm720
           - multimodal-gen-test-2-gpu-amd-rocm720
           - multimodal-gen-unit-test-amd-rocm720
+          - network-diagnostics-amd-rocm720
+          - network-diagnostics-mi300-amd-rocm720
           - stage-c-test-large-8-gpu-amd-rocm720
           - stage-c-test-large-8-gpu-amd-mi35x-rocm720
           - stage-b-test-large-8-gpu-mi35x-disaggregation-amd-rocm720
@@ -79,6 +81,11 @@ on:
         required: false
         type: boolean
         default: false
+      enable_network_diagnostics:
+        description: 'Run lightweight network probes in every AMD job'
+        required: false
+        type: boolean
+        default: false
   workflow_call:
     inputs:
       ref:
@@ -101,6 +108,11 @@ on:
         required: false
         type: boolean
         default: true
+      enable_network_diagnostics:
+        description: 'Run lightweight network probes in every AMD job'
+        required: false
+        type: boolean
+        default: false
 
 # Mirror pr-test.yml: the chained extra suite (call-pr-test-amd-extra-rocm720
 # -> pr-test-amd-extra.yml) declares actions: write / issues: read /
@@ -115,6 +127,8 @@ permissions:
 
 env:
   AITER_COMMIT_OVERRIDE: ${{ inputs.aiter_ref }}
+  AMD_NETWORK_DIAGNOSTICS: ${{ inputs.enable_network_diagnostics && '1' || '0' }}
+  NETWORK_DIAG_ROCM_VERSION: rocm720
   DOCKERHUB_AMD_USERNAME: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
   DOCKERHUB_AMD_TOKEN: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
 
@@ -230,6 +244,237 @@ jobs:
       aiter_ref: ${{ inputs.aiter_ref }}
       continue_on_error: true
     secrets: inherit
+
+  # =============================================== network diagnostics ====================================================
+  network-diagnostics-dockerhub-amd-rocm720:
+    name: network-diagnostics-amd-rocm720 / public-dockerhub (linux-mi300-1gpu-sglang)
+    needs: [check-changes]
+    if: |
+      always() && !cancelled() &&
+      contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',network-diagnostics-amd-rocm720,')
+    runs-on: linux-mi300-1gpu-sglang
+    timeout-minutes: 180
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
+
+      - name: Run network diagnostics (public Docker Hub)
+        env:
+          NETWORK_DIAG_SOURCE: dockerhub
+          NETWORK_DIAG_ROCM_VERSION: rocm720
+          NETWORK_DIAG_IMAGE_TAG: v0.5.14-rocm720-mi30x-20260705
+        run: bash scripts/ci/amd/network_diagnostics.sh
+
+      - name: Upload network diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: network-diagnostics-dockerhub-amd-rocm720-${{ github.run_id }}
+          path: ${{ runner.temp }}/network-diagnostics-*.txt
+
+  network-diagnostics-local-registry-amd-rocm720:
+    name: network-diagnostics-amd-rocm720 / local-registry (linux-mi300-1gpu-sglang)
+    needs: [check-changes]
+    if: |
+      always() && !cancelled() &&
+      contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',network-diagnostics-amd-rocm720,')
+    runs-on: linux-mi300-1gpu-sglang
+    timeout-minutes: 180
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
+
+      - name: Run network diagnostics (local registry)
+        env:
+          NETWORK_DIAG_SOURCE: local
+          NETWORK_DIAG_ROCM_VERSION: rocm720
+          NETWORK_DIAG_IMAGE_TAG: v0.5.14-rocm720-mi30x-20260705
+        run: bash scripts/ci/amd/network_diagnostics.sh
+
+      - name: Upload network diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: network-diagnostics-local-registry-amd-rocm720-${{ github.run_id }}
+          path: ${{ runner.temp }}/network-diagnostics-*.txt
+
+  network-diagnostics-mi300-amd-rocm720:
+    name: ${{ format('network-diagnostics-mi300-amd-rocm720 / {0} ({1}, {2})', matrix.job, matrix.runner, matrix.part) }}
+    needs: [check-changes]
+    if: |
+      always() && !cancelled() &&
+      contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',network-diagnostics-mi300-amd-rocm720,')
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: sgl-kernel-unit-test-amd-rocm720
+            job: sgl-kernel-unit-test-amd-rocm720
+            runner: linux-mi300-1gpu-sglang
+            part: main
+          - id: sgl-kernel-unit-test-2-gpu-amd-rocm720
+            job: sgl-kernel-unit-test-2-gpu-amd-rocm720
+            runner: linux-mi300-2gpu-sglang
+            part: main
+          - id: stage-a-test-1-gpu-small-amd-rocm720
+            job: stage-a-test-1-gpu-small-amd-rocm720
+            runner: linux-mi300-1gpu-sglang
+            part: main
+          - id: jit-kernel-unit-test-amd-rocm720
+            job: jit-kernel-unit-test-amd-rocm720
+            runner: linux-mi300-1gpu-sglang
+            part: main
+          - id: stage-b-test-1-gpu-small-amd-rocm720-0
+            job: stage-b-test-1-gpu-small-amd-rocm720
+            runner: linux-mi300-1gpu-sglang
+            part: "0"
+          - id: stage-b-test-1-gpu-small-amd-rocm720-1
+            job: stage-b-test-1-gpu-small-amd-rocm720
+            runner: linux-mi300-1gpu-sglang
+            part: "1"
+          - id: stage-b-test-1-gpu-small-amd-rocm720-2
+            job: stage-b-test-1-gpu-small-amd-rocm720
+            runner: linux-mi300-1gpu-sglang
+            part: "2"
+          - id: stage-b-test-1-gpu-small-amd-rocm720-3
+            job: stage-b-test-1-gpu-small-amd-rocm720
+            runner: linux-mi300-1gpu-sglang
+            part: "3"
+          - id: stage-b-test-1-gpu-small-amd-rocm720-4
+            job: stage-b-test-1-gpu-small-amd-rocm720
+            runner: linux-mi300-1gpu-sglang
+            part: "4"
+          - id: stage-b-test-1-gpu-small-amd-rocm720-5
+            job: stage-b-test-1-gpu-small-amd-rocm720
+            runner: linux-mi300-1gpu-sglang
+            part: "5"
+          - id: stage-b-test-1-gpu-small-amd-rocm720-6
+            job: stage-b-test-1-gpu-small-amd-rocm720
+            runner: linux-mi300-1gpu-sglang
+            part: "6"
+          - id: stage-b-test-1-gpu-small-amd-rocm720-7
+            job: stage-b-test-1-gpu-small-amd-rocm720
+            runner: linux-mi300-1gpu-sglang
+            part: "7"
+          - id: stage-b-test-1-gpu-small-amd-rocm720-8
+            job: stage-b-test-1-gpu-small-amd-rocm720
+            runner: linux-mi300-1gpu-sglang
+            part: "8"
+          - id: stage-b-test-1-gpu-small-amd-rocm720-9
+            job: stage-b-test-1-gpu-small-amd-rocm720
+            runner: linux-mi300-1gpu-sglang
+            part: "9"
+          - id: stage-b-test-1-gpu-small-amd-rocm720-10
+            job: stage-b-test-1-gpu-small-amd-rocm720
+            runner: linux-mi300-1gpu-sglang
+            part: "10"
+          - id: stage-b-test-1-gpu-small-amd-rocm720-11
+            job: stage-b-test-1-gpu-small-amd-rocm720
+            runner: linux-mi300-1gpu-sglang
+            part: "11"
+          - id: stage-b-test-1-gpu-small-amd-rocm720-12
+            job: stage-b-test-1-gpu-small-amd-rocm720
+            runner: linux-mi300-1gpu-sglang
+            part: "12"
+          - id: stage-b-test-1-gpu-small-amd-rocm720-13
+            job: stage-b-test-1-gpu-small-amd-rocm720
+            runner: linux-mi300-1gpu-sglang
+            part: "13"
+          - id: stage-b-test-1-gpu-small-amd-nondeterministic-rocm720
+            job: stage-b-test-1-gpu-small-amd-nondeterministic-rocm720
+            runner: linux-mi300-1gpu-sglang
+            part: main
+          - id: stage-b-test-1-gpu-large-amd-rocm720-0
+            job: stage-b-test-1-gpu-large-amd-rocm720
+            runner: linux-mi300-1gpu-sglang
+            part: "0"
+          - id: stage-b-test-1-gpu-large-amd-rocm720-1
+            job: stage-b-test-1-gpu-large-amd-rocm720
+            runner: linux-mi300-1gpu-sglang
+            part: "1"
+          - id: stage-b-test-2-gpu-large-amd-rocm720-0
+            job: stage-b-test-2-gpu-large-amd-rocm720
+            runner: linux-mi300-2gpu-sglang
+            part: "0"
+          - id: stage-b-test-2-gpu-large-amd-rocm720-1
+            job: stage-b-test-2-gpu-large-amd-rocm720
+            runner: linux-mi300-2gpu-sglang
+            part: "1"
+          - id: multimodal-gen-test-1-gpu-amd-rocm720-0
+            job: multimodal-gen-test-1-gpu-amd-rocm720
+            runner: linux-mi300-1gpu-sglang
+            part: "0"
+          - id: multimodal-gen-test-1-gpu-amd-rocm720-1
+            job: multimodal-gen-test-1-gpu-amd-rocm720
+            runner: linux-mi300-1gpu-sglang
+            part: "1"
+          - id: multimodal-gen-test-1-gpu-amd-rocm720-2
+            job: multimodal-gen-test-1-gpu-amd-rocm720
+            runner: linux-mi300-1gpu-sglang
+            part: "2"
+          - id: multimodal-gen-test-1-gpu-amd-rocm720-3
+            job: multimodal-gen-test-1-gpu-amd-rocm720
+            runner: linux-mi300-1gpu-sglang
+            part: "3"
+          - id: multimodal-gen-test-2-gpu-amd-rocm720-0
+            job: multimodal-gen-test-2-gpu-amd-rocm720
+            runner: linux-mi300-2gpu-sglang
+            part: "0"
+          - id: multimodal-gen-test-2-gpu-amd-rocm720-1
+            job: multimodal-gen-test-2-gpu-amd-rocm720
+            runner: linux-mi300-2gpu-sglang
+            part: "1"
+          - id: multimodal-gen-test-2-gpu-amd-rocm720-2
+            job: multimodal-gen-test-2-gpu-amd-rocm720
+            runner: linux-mi300-2gpu-sglang
+            part: "2"
+          - id: stage-c-test-4-gpu-amd-rocm720-0
+            job: stage-c-test-4-gpu-amd-rocm720
+            runner: linux-mi300-4gpu-sglang
+            part: "0"
+          - id: stage-c-test-large-8-gpu-amd-rocm720-0
+            job: stage-c-test-large-8-gpu-amd-rocm720
+            runner: linux-mi300-8gpu-sglang
+            part: "0"
+          - id: stage-c-test-large-8-gpu-amd-rocm720-1
+            job: stage-c-test-large-8-gpu-amd-rocm720
+            runner: linux-mi300-8gpu-sglang
+            part: "1"
+          - id: stage-c-test-large-8-gpu-amd-rocm720-2
+            job: stage-c-test-large-8-gpu-amd-rocm720
+            runner: linux-mi300-8gpu-sglang
+            part: "2"
+          - id: stage-c-test-large-8-gpu-amd-rocm720-3
+            job: stage-c-test-large-8-gpu-amd-rocm720
+            runner: linux-mi300-8gpu-sglang
+            part: "3"
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
+
+      - name: Run high-concurrency MI300 network diagnostics
+        env:
+          NETWORK_DIAG_MODE: high-concurrency
+          NETWORK_DIAG_SOURCE: mi300
+          NETWORK_DIAG_PHASE: ${{ matrix.id }}
+          NETWORK_DIAG_ROCM_VERSION: rocm720
+          NETWORK_DIAG_IMAGE_TAG: v0.5.14-rocm720-mi30x-20260705
+        run: bash scripts/ci/amd/network_diagnostics.sh
+
+      - name: Upload network diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: network-diagnostics-mi300-amd-rocm720-${{ matrix.id }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/network-diagnostics-*.txt
 
   # =============================================== sgl-kernel ====================================================
   sgl-kernel-unit-test-amd-rocm720:
