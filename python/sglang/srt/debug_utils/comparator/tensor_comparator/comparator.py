@@ -9,6 +9,12 @@ from sglang.srt.debug_utils.comparator.tensor_comparator.types import (
     TensorInfo,
     TensorStats,
 )
+from sglang.srt.debug_utils.comparator.threshold_dsl import (
+    DiffThresholdRule,
+    evaluate_predicate,
+    parse_predicate,
+    resolve_predicate,
+)
 from sglang.srt.debug_utils.comparator.utils import (
     Pair,
     argmax_coord,
@@ -21,6 +27,7 @@ from sglang.srt.debug_utils.dumper import get_truncated_value
 
 QUANTILE_NUMEL_THRESHOLD = 10_000_000
 SAMPLE_DIFF_THRESHOLD = 1e-3
+DEFAULT_PREDICATE: str = "rel <= 0.001"
 
 
 def compute_tensor_info(
@@ -43,9 +50,13 @@ def compare_tensor_pair(
     x_baseline: torch.Tensor,
     x_target: torch.Tensor,
     name: str = "",
-    diff_threshold: float = 1e-3,
+    diff_threshold_rules: Optional[list[DiffThresholdRule]] = None,
     seq_dim: Optional[int] = None,
 ) -> TensorComparisonInfo:
+    predicate = resolve_predicate(
+        name, diff_threshold_rules, default_predicate=DEFAULT_PREDICATE
+    )
+
     baseline_info: TensorInfo = compute_tensor_info(x_baseline)
     target_info: TensorInfo = compute_tensor_info(x_target)
 
@@ -68,7 +79,7 @@ def compare_tensor_pair(
         diff = compute_diff(
             x_baseline=x_baseline_f,
             x_target=x_target_f,
-            diff_threshold=diff_threshold,
+            predicate=predicate,
             seq_dim=seq_dim,
         )
 
@@ -85,7 +96,7 @@ def compare_tensor_pair(
                 diff_downcast = compute_diff(
                     x_baseline=x_baseline_f.to(downcast_dtype),
                     x_target=x_target_f.to(downcast_dtype),
-                    diff_threshold=diff_threshold,
+                    predicate=predicate,
                 )
 
     return TensorComparisonInfo(
@@ -135,7 +146,7 @@ def _compute_percentiles(x: torch.Tensor, *, include: bool) -> dict[int, float]:
 def compute_diff(
     x_baseline: torch.Tensor,
     x_target: torch.Tensor,
-    diff_threshold: float = 1e-3,
+    predicate: str = DEFAULT_PREDICATE,
     seq_dim: Optional[int] = None,
 ) -> DiffInfo:
     if x_baseline.numel() == 0:
@@ -147,7 +158,7 @@ def compute_diff(
             max_diff_coord=[],
             baseline_at_max=0.0,
             target_at_max=0.0,
-            diff_threshold=diff_threshold,
+            predicate=predicate,
             passed=True,
         )
 
@@ -176,7 +187,12 @@ def compute_diff(
         max_diff_coord=list(max_diff_coord),
         baseline_at_max=x_baseline[max_diff_coord].item(),
         target_at_max=x_target[max_diff_coord].item(),
-        diff_threshold=diff_threshold,
-        passed=rel_diff <= diff_threshold,
+        predicate=predicate,
+        passed=evaluate_predicate(
+            parse_predicate(predicate),
+            rel=rel_diff,
+            max_abs=max_abs_diff,
+            mean_abs=mean_abs_diff,
+        ),
         per_token_rel_diff=per_token_rel_diff,
     )
