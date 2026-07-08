@@ -113,6 +113,9 @@ class StandaloneDraftWorker(EagleDraftWorker):
             )
             and self.topk == 1
         )
+        self.dsa_index_topk = None
+        self.seed_dsa_topk_from_draft_extend = False
+        self.dsa_extend_topk_buf = None
 
     def alloc_memory_pool(
         self,
@@ -178,7 +181,10 @@ class StandaloneWorkerV2(EAGLEWorkerV2):
         )
 
         # Override the context length of the draft model to be the same as the target model.
-        server_args.context_length = target_worker.model_runner.model_config.context_len
+        server_args.override(
+            "spec_worker.match_target_context_length",
+            context_length=target_worker.model_runner.model_config.context_len,
+        )
 
         # Create our custom draft worker that doesn't share embeddings/lm_head
         self._draft_worker = StandaloneDraftWorker(
