@@ -62,7 +62,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.runtime_context import get_parallel, get_server_args, get_stream
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import LazyValue, add_prefix, is_cuda, make_layers
 
@@ -637,7 +637,7 @@ class ExaoneMoEForCausalLM(nn.Module):
         self.pp_group = get_pp_group()
         self.config = config
         self.quant_config = quant_config
-        alt_stream = torch.cuda.Stream() if _is_cuda else None
+        alt_stream = get_stream("alt") if _is_cuda else None
         self.model = ExaoneMoEModel(
             config,
             quant_config=quant_config,

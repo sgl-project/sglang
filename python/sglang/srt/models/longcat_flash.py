@@ -86,7 +86,7 @@ from sglang.srt.model_loader.utils import (
 )
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.runtime_context import get_parallel, get_server_args, get_stream
 from sglang.srt.utils import (
     BumpAllocator,
     add_prefix,
@@ -538,7 +538,7 @@ class LongcatFlashModel(nn.Module):
                 use_attn_tp_group=is_dp_attention_enabled(),
             )
 
-        self.alt_stream = torch.cuda.Stream()
+        self.alt_stream = get_stream("alt")
         self.layers = nn.ModuleList(
             [
                 LongcatFlashDecoderLayer(

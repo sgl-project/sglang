@@ -114,6 +114,7 @@ if is_npu():
     )
 
 from sglang.srt.environ import envs
+from sglang.srt.runtime_context import get_stream
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
@@ -991,7 +992,7 @@ class Qwen2MoeForCausalLM(nn.Module):
         self.pp_group = get_pp_group()
         self.config = config
         self.quant_config = quant_config
-        alt_stream = torch.cuda.Stream() if _is_cuda else None
+        alt_stream = get_stream("alt") if _is_cuda else None
         self.model = Qwen2MoeModel(
             config,
             quant_config,

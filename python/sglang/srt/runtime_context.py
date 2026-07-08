@@ -321,16 +321,73 @@ class Flags(_FlagGroupBase):
     dp: DpFlags = dataclasses.field(default_factory=DpFlags)
 
 
+@dataclasses.dataclass
+class Resources(_FlagGroupBase):
+    """Process-level resource handles: named slots with one reset lifecycle,
+    scoped test injection via ``override()``, and the creation/publish
+    semantics kept in the owning modules' accessors (which are thin shims
+    over these slots)."""
+
+    # CUDA graph memory pool shared across the prefill and decode graph
+    # backends (created lazily by model_executor.runner_utils.pool).
+    graph_memory_pool: Any = None
+    # EPLB: per-process recorder and the publish-once location metadata
+    # (owning accessors live in sglang.srt.eplb).
+    expert_distribution_recorder: Any = None
+    expert_location_metadata: Any = None
+    # LPLB: layer_id -> solver.
+    lplb_solvers: dict = dataclasses.field(default_factory=dict)
+    # Named side streams (see RuntimeContext.get_stream): name -> stream.
+    streams: dict = dataclasses.field(default_factory=dict)
+    # Named persistent buffers (see RuntimeContext.get_buffer): name -> tensor.
+    # Accessors with bespoke semantics (grow-only, per-device keys) manage
+    # their entries directly.
+    buffers: dict = dataclasses.field(default_factory=dict)
+    # Persistent reusable CUDA events for non-EP DP TBO, keyed by
+    # (kind, subbatch) — see dp_attention._tbo_event for why reuse matters.
+    tbo_event_pool: dict = dataclasses.field(default_factory=dict)
+
+
 class RuntimeContext:
     """Container for the structured runtime accessors; exposes ``parallel``,
-    ``server_args``, and ``flags``."""
+    ``server_args``, ``flags``, and ``resources``."""
 
-    __slots__ = ("parallel", "_server_args", "flags")
+    __slots__ = ("parallel", "_server_args", "flags", "resources")
 
     def __init__(self, parallel: ParallelContext):
         self.parallel = parallel
         self._server_args: ServerArgs | None = None
         self.flags = Flags()
+        self.resources = Resources()
+
+    def get_stream(self, name: str) -> Any:
+        """Named process-level CUDA side stream: get-or-create, shared by
+        name (the keyed-lazy pattern of the persistent buffers). Creation is
+        a driver call that must stay outside cuda-graph capture — call sites
+        lease their stream at init/warmup time."""
+        stream = self.resources.streams.get(name)
+        if stream is None:
+            import torch
+
+            stream = torch.cuda.Stream()
+            self.resources.streams[name] = stream
+        return stream
+
+    def set_stream(self, name: str, stream: Any) -> Any:
+        """Install (or replace) the named stream — explicit injection for
+        tests and backends that bring their own stream."""
+        self.resources.streams[name] = stream
+        return stream
+
+    def get_buffer(self, name: str, factory: Any) -> Any:
+        """Named process-level persistent buffer: get-or-create via
+        ``factory()``, shared by name (the keyed-lazy pattern of the
+        persistent buffers / named streams)."""
+        buf = self.resources.buffers.get(name)
+        if buf is None:
+            buf = factory()
+            self.resources.buffers[name] = buf
+        return buf
 
     @property
     def server_args(self) -> ServerArgs:
@@ -378,11 +435,28 @@ def get_flags() -> Flags:
     return _CONTEXT.flags
 
 
+def get_resources() -> Resources:
+    return _CONTEXT.resources
+
+
+def get_stream(name: str) -> Any:
+    return _CONTEXT.get_stream(name)
+
+
+def set_stream(name: str, stream: Any) -> Any:
+    return _CONTEXT.set_stream(name, stream)
+
+
+def get_buffer(name: str, factory: Any) -> Any:
+    return _CONTEXT.get_buffer(name, factory)
+
+
 def reset_context() -> None:
     """Clear the context-owned store (unit-test teardown): drop the published
-    ``server_args`` and install a fresh ``Flags``.
+    ``server_args`` and install fresh ``Flags`` and ``Resources``.
 
     Wrapper subsystems (``parallel``) hold no state and are unaffected.
     """
     _CONTEXT._server_args = None
     _CONTEXT.flags = Flags()
+    _CONTEXT.resources = Resources()

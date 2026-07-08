@@ -367,6 +367,102 @@ class TestDpFlagsGroup(_IsolatedServerArgs):
         self.assertFalse(is_dp_attention_enabled())
 
 
+class TestResources(_IsolatedServerArgs):
+    """ctx.resources: named slots for process-level resource handles with one
+    reset lifecycle; owning accessors keep their creation/publish semantics."""
+
+    def test_graph_pool_lazy_create_and_reuse(self):
+        from types import SimpleNamespace
+
+        from sglang.srt.model_executor.runner_utils.pool import (
+            get_global_graph_memory_pool,
+            get_or_create_global_graph_memory_pool,
+        )
+
+        reset_context()
+        self.assertIsNone(get_global_graph_memory_pool())
+        dev = SimpleNamespace(graph_pool_handle=lambda: object())
+        handle = get_or_create_global_graph_memory_pool(dev)
+        self.assertIs(get_or_create_global_graph_memory_pool(dev), handle)
+
+    def test_expert_recorder_noop_default_and_injection(self):
+        from sglang.srt.eplb.expert_distribution import (
+            get_global_expert_distribution_recorder,
+        )
+        from sglang.srt.runtime_context import get_resources
+
+        reset_context()
+        self.assertEqual(
+            type(get_global_expert_distribution_recorder()).__name__,
+            "_ExpertDistributionRecorderNoop",
+        )
+        with get_resources().override(expert_distribution_recorder="mock"):
+            self.assertEqual(get_global_expert_distribution_recorder(), "mock")
+
+    def test_expert_location_metadata_publish_once_until_reset(self):
+        from sglang.srt.eplb.expert_location import (
+            get_global_expert_location_metadata,
+            set_global_expert_location_metadata,
+        )
+
+        reset_context()
+        self.assertIsNone(get_global_expert_location_metadata())
+        set_global_expert_location_metadata("meta")
+        with self.assertRaises(AssertionError):
+            set_global_expert_location_metadata("again")
+        reset_context()
+        self.assertIsNone(get_global_expert_location_metadata())
+
+
+class TestNamedStreams(_IsolatedServerArgs):
+    """ctx.get_stream(name): keyed get-or-create (the persistent-buffer
+    pattern); set_stream installs explicitly."""
+
+    def test_get_or_create_shares_by_name(self):
+        from unittest.mock import patch
+
+        reset_context()
+        created = []
+
+        class _FakeStream:
+            def __init__(self):
+                created.append(self)
+
+        with patch("torch.cuda.Stream", _FakeStream):
+            a = get_context().get_stream("alt")
+            b = get_context().get_stream("alt")
+            c = get_context().get_stream("other")
+        self.assertIs(a, b)
+        self.assertIsNot(a, c)
+        self.assertEqual(len(created), 2)
+
+    def test_get_buffer_keyed_lazy(self):
+        reset_context()
+        created = []
+
+        def factory():
+            created.append(object())
+            return created[-1]
+
+        a = get_context().get_buffer("ws", factory)
+        b = get_context().get_buffer("ws", factory)
+        self.assertIs(a, b)
+        self.assertEqual(len(created), 1)
+        self.assertIsNot(get_context().get_buffer("other", factory), a)
+
+    def test_set_stream_installs_explicitly(self):
+        reset_context()
+        sentinel = object()
+        get_context().set_stream("alt", sentinel)
+        self.assertIs(get_context().get_stream("alt"), sentinel)
+
+    def test_reset_clears_the_registry(self):
+        reset_context()
+        get_context().set_stream("alt", object())
+        reset_context()
+        self.assertEqual(get_context().resources.streams, {})
+
+
 class TestPublishLifecycle(_IsolatedServerArgs):
     """Publish installs the resolved server_args and seeds the capture tier."""
 

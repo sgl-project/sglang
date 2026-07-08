@@ -72,7 +72,7 @@ from sglang.srt.models.utils import (
     create_fused_set_kv_buffer_arg,
     enable_fused_set_kv_buffer,
 )
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.runtime_context import get_parallel, get_server_args, get_stream
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     LazyValue,
@@ -916,7 +916,7 @@ class Qwen3MoeModel(Qwen2MoeModel):
         prefix: str = "",
         decoder_layer_type=Qwen3MoeDecoderLayer,
     ) -> None:
-        alt_stream = torch.cuda.Stream() if _is_cuda else None
+        alt_stream = get_stream("alt") if _is_cuda else None
         super().__init__(
             config=config,
             quant_config=quant_config,

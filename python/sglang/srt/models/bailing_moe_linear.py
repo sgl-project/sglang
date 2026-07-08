@@ -58,7 +58,7 @@ from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA, DeepseekV2MLP, _is_hip
 from sglang.srt.models.utils import WeightsMapper
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.runtime_context import get_parallel, get_server_args, get_stream
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     BumpAllocator,
@@ -957,7 +957,7 @@ class BailingMoELinearModel(nn.Module):
         else:
             self.word_embeddings = PPMissingLayer()
 
-        self.alt_stream = torch.cuda.Stream() if _is_cuda else None
+        self.alt_stream = get_stream("alt") if _is_cuda else None
 
         def layer_fn(idx, prefix):
             layer_idx = idx

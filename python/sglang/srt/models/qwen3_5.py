@@ -91,7 +91,7 @@ from sglang.srt.models.utils import (
     fused_qk_gemma_rmsnorm,
     fused_qk_gemma_rmsnorm_with_gate,
 )
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.runtime_context import get_parallel, get_server_args, get_stream
 
 # Utils
 from sglang.srt.utils import (
@@ -1206,7 +1206,7 @@ class Qwen3_5ForCausalLM(nn.Module):
         if _is_hip:
             self._maybe_autodisable_shared_experts_fusion(config, quant_config)
 
-        alt_stream = torch.cuda.Stream() if _is_cuda or _hip_use_alt_stream else None
+        alt_stream = get_stream("alt") if _is_cuda or _hip_use_alt_stream else None
 
         # Embedding layer
         if self.pp_group.is_first_rank:

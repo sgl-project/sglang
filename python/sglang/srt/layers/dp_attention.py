@@ -702,14 +702,10 @@ def dp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
 # stream -> their collectives serialize in-order (no concurrent-collective
 # deadlock on the RCCL communicator), each overlapping the other's compute.
 # ---------------------------------------------------------------------------
-_DP_TBO_COMM_STREAM: Optional[torch.cuda.Stream] = None
-
-
 def get_dp_tbo_comm_stream() -> torch.cuda.Stream:
-    global _DP_TBO_COMM_STREAM
-    if _DP_TBO_COMM_STREAM is None:
-        _DP_TBO_COMM_STREAM = torch.cuda.Stream()
-    return _DP_TBO_COMM_STREAM
+    from sglang.srt.runtime_context import get_stream
+
+    return get_stream("dp_tbo_comm")
 
 
 # Persistent reusable CUDA events for non-EP DP TBO, keyed by (kind, subbatch).
@@ -718,14 +714,14 @@ def get_dp_tbo_comm_stream() -> torch.cuda.Stream:
 # pool is exhausted after a few hundred forwards -> HSA_STATUS_ERROR_OUT_OF_RESOURCES
 # ("...create internal OS-specific events"). Reuse one event per (kind, subbatch)
 # and just re-record it (mirrors the mori CommStreamPool event reuse).
-_TBO_EVENT_POOL: dict = {}
-
-
 def _tbo_event(key) -> torch.cuda.Event:
-    ev = _TBO_EVENT_POOL.get(key)
+    from sglang.srt.runtime_context import get_resources
+
+    pool = get_resources().tbo_event_pool
+    ev = pool.get(key)
     if ev is None:
         ev = torch.cuda.Event()
-        _TBO_EVENT_POOL[key] = ev
+        pool[key] = ev
     return ev
 
 
