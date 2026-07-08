@@ -46,8 +46,6 @@ from sglang.srt.model_executor.cuda_graph_config import cuda_graph_fully_disable
 
 
 def _should_disable_scheduler_metadata_precompute(server_args) -> bool:
-    assert getattr(server_args, "enable_prefill_cp", None) is not None
-    assert getattr(server_args, "enable_dp_attention", None) is not None
     return bool(server_args.enable_prefill_cp or server_args.enable_dp_attention)
 
 
