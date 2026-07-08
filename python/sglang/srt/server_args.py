@@ -1042,8 +1042,9 @@ class ServerArgs:
         Optional[Dict[str, Any]],
         Arg(
             help="Default chat template kwargs applied to every request when not "
-            "overridden per-request, e.g. '{\"enable_thinking\": false}' to disable "
-            "thinking server-side. Per-request chat_template_kwargs takes precedence.",
+            "overridden per-request. Keys must match what the model's chat template "
+            "expects (e.g. enable_thinking, thinking, reasoning_effort). Per-request "
+            "chat_template_kwargs takes precedence.",
             type_parser=json.loads,
         ),
     ] = None
