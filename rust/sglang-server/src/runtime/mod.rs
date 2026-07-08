@@ -229,14 +229,41 @@ pub struct Runtime {
     shutdown_tx: Mutex<Option<flume::Sender<()>>>,
 }
 
+/// Deadline for joining worker threads on shutdown. Past it we abandon the join
+/// so process teardown can't deadlock on a worker that somehow failed to exit.
+const SHUTDOWN_JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 impl Runtime {
-    /// Stop the runtime and join every worker thread.
+    /// Stop the runtime and join every worker thread (with a bounded wait).
+    ///
+    /// Dropping `shutdown_tx` wakes the tm-ingress/tm-egress selectors (which
+    /// otherwise never see their inbox close — one self-holds a `tm` sender, the
+    /// other's inbox is the Python-fed egress ring). Those exit and drop their
+    /// `Senders` clones; the api thread's `serve` returns non-gracefully, so its
+    /// `block_on` unwinds and the api tokio runtime is dropped — cancelling
+    /// in-flight handlers, whose `AbortGuard`s release the remaining clones. With
+    /// every clone gone the tok/detok channels close and those workers exit.
+    ///
+    /// In-flight requests are **aborted**, not drained — this is the hard-stop
+    /// path (also run on `Drop`). Clients of aborted requests retry.
     pub fn request_shutdown(&self) {
-        // TODO(drain): split into a non-blocking `drain()` (close listener, keep pools up)
-        // + `shutdown()` so in-flight requests finish before the pools stop.
         drop(self.shutdown_tx.lock().unwrap().take());
-        for h in self.threads.lock().unwrap().drain(..) {
-            let _ = h.join();
+        let handles: Vec<JoinHandle<()>> = self.threads.lock().unwrap().drain(..).collect();
+        if handles.is_empty() {
+            return; // Idempotent: a `Drop` after an explicit shutdown has nothing to join.
+        }
+        // Join off-thread and wait with a deadline: a stuck worker can't wedge exit.
+        let (done_tx, done_rx) = flume::bounded::<()>(1);
+        std::thread::spawn(move || {
+            for h in handles {
+                let _ = h.join();
+            }
+            let _ = done_tx.send(());
+        });
+        if done_rx.recv_timeout(SHUTDOWN_JOIN_TIMEOUT).is_err() {
+            tracing::warn!(
+                "shutdown: workers did not exit within {SHUTDOWN_JOIN_TIMEOUT:?}; abandoning join"
+            );
         }
     }
 }
@@ -474,6 +501,57 @@ mod tests {
             std::net::TcpStream::connect(addr).is_err(),
             "port still accepting connections after shutdown",
         );
+    }
+
+    /// Regression: shutdown must return promptly even with an in-flight `/generate`.
+    /// No scheduler drains the ingress ring or feeds the egress ring here, so the
+    /// handler parks on its egress channel forever. Graceful shutdown would wait
+    /// for it (deadlock → only the 5s bounded-join fallback returns); the
+    /// non-graceful path cancels the handler via the api runtime drop, whose
+    /// `AbortGuard` releases the last `Senders` clone so the workers exit.
+    #[test]
+    fn shutdown_returns_with_in_flight_request() {
+        use std::io::Write;
+        use std::time::{Duration, Instant};
+
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = probe.local_addr().unwrap();
+        drop(probe);
+
+        let server_args = ServerArgs::from_json(r#"{"skip_tokenizer_init": true}"#).unwrap();
+        let cfg = RuntimeConfig {
+            bind: addr,
+            pin_cores: false,
+            api_worker_num: 1,
+            tokenizer_worker_num: 1,
+            detokenizer_worker_num: 1,
+            server_args: Arc::new(server_args),
+            ..Default::default()
+        };
+        let rt = start(cfg).expect("start runtime");
+
+        // Fire a request that will block (already-tokenized → valid → pushed to the
+        // ring, then the handler awaits egress frames that never arrive).
+        let mut conn = std::net::TcpStream::connect(addr).expect("connect");
+        let body = r#"{"input_ids":[1,2,3],"stream":false,"sampling_params":{"max_new_tokens":8}}"#;
+        let req = format!(
+            "POST /generate HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        conn.write_all(req.as_bytes()).unwrap();
+        conn.flush().unwrap();
+        std::thread::sleep(Duration::from_millis(300)); // reach the blocked state
+
+        let t = Instant::now();
+        rt.request_shutdown();
+        let elapsed = t.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "shutdown took {elapsed:?} with an in-flight request (deadlock?)",
+        );
+        drop(conn);
     }
 
     /// Regression: a port conflict must fail `start` (so the scheduler doesn't
