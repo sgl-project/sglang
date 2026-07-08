@@ -10,7 +10,8 @@ export const Llama31Deployment = () => {
         { id: 'b200', label: 'B200', default: false },
         { id: 'mi300x', label: 'MI300X', default: false },
         { id: 'mi325x', label: 'MI325X', default: false },
-        { id: 'mi355x', label: 'MI355X', default: false }
+        { id: 'mi355x', label: 'MI355X', default: false },
+        { id: 'xeon', label: 'XEON', default: false }
       ]
     },
     modelsize: {
@@ -57,6 +58,27 @@ export const Llama31Deployment = () => {
     }
   };
 
+  const getDisplayOptions = (values) => {
+    const displayOptions = {
+      ...options,
+      quantization: {
+        ...options.quantization,
+        items: options.quantization.items.map(item => ({
+          ...item,
+          disabled: values.hardware === 'xeon' && item.id === 'fp8'
+        }))
+      },
+      optimization: {
+        ...options.optimization,
+        items: options.optimization.items.map(item => ({
+          ...item,
+          disabled: values.hardware === 'xeon' && item.id !== 'basic'
+        }))
+      }
+    };
+    return displayOptions;
+  };
+
   // Initialize state
   const getInitialState = () => {
     const initialState = {};
@@ -86,7 +108,14 @@ export const Llama31Deployment = () => {
   }, []);
 
   const handleRadioChange = (optionName, value) => {
-    setValues(prev => ({ ...prev, [optionName]: value }));
+    setValues(prev => {
+      const next = { ...prev, [optionName]: value };
+      if (optionName === 'hardware' && value === 'xeon') {
+        next.quantization = 'bf16';
+        next.optimization = 'basic';
+      }
+      return next;
+    });
   };
 
   // Generate command
@@ -94,6 +123,7 @@ export const Llama31Deployment = () => {
     const { hardware, optimization, modelsize, category, toolcall, quantization } = values;
 
     const isAMD = hardware === 'mi300x' || hardware === 'mi325x' || hardware === 'mi355x';
+    const isXeon = hardware === 'xeon';
 
     // Model size mapping
     const sizeMap = {
@@ -106,7 +136,7 @@ export const Llama31Deployment = () => {
 
     // Determine model path
     let modelPath;
-    if (quantization === 'fp8' && category === 'instruct') {
+    if (quantization === 'fp8' && category === 'instruct' && !isXeon) {
       if (modelsize === '405b') {
         // Meta official FP8 for 405B
         modelPath = `meta-llama/Llama-3.1-${sizeToken}${categorySuffix}-FP8`;
@@ -144,6 +174,9 @@ export const Llama31Deployment = () => {
       tpSize = quantization === 'fp8'
         ? amdTpConfig[hardware][modelsize].fp8
         : amdTpConfig[hardware][modelsize].bf16;
+    } else if (isXeon) {
+      // Intel Xeon CPU TP configuration
+      tpSize = modelsize === '8b' ? 3 : 6;
     } else {
       // NVIDIA GPU TP configuration
       if (modelsize === '405b') {
@@ -157,17 +190,22 @@ export const Llama31Deployment = () => {
     const args = [];
     args.push(`--model-path ${modelPath}`);
 
+    if (isXeon) {
+      args.push(`--device cpu`);
+      args.push(`--disable-overlap-schedule`);
+    }
+
     if (tpSize) {
       args.push(`--tp ${tpSize}`);
     }
 
     // Add quantization flag only if not using FP8 variant model
-    if (quantization === 'fp8' && category !== 'instruct') {
+    if (quantization === 'fp8' && category !== 'instruct' && !isXeon) {
       args.push(`--quantization fp8`);
     }
 
     // NVIDIA-specific optimizations
-    if (!isAMD) {
+    if (!isAMD && !isXeon) {
       if (optimization === 'throughput') {
         args.push(`--enable-dp-attention`);
         args.push(`--mem-fraction-static 0.85`);
@@ -212,7 +250,7 @@ export const Llama31Deployment = () => {
 
   return (
     <div style={containerStyle} className="not-prose">
-      {Object.entries(options).map(([key, option]) => (
+      {Object.entries(getDisplayOptions(values)).map(([key, option]) => (
         <div key={key} style={cardStyle}>
           <div style={titleStyle}>{option.title}</div>
           <div style={itemsStyle}>
@@ -231,9 +269,10 @@ export const Llama31Deployment = () => {
             ) : (
               option.items.map(item => {
                 const isChecked = values[option.name] === item.id;
+                const isDisabled = Boolean(item.disabled);
                 return (
-                  <label key={item.id} style={{ ...labelBaseStyle, ...(isChecked ? checkedStyle : {}) }}>
-                    <input type="radio" name={option.name} value={item.id} checked={isChecked} onChange={() => handleRadioChange(option.name, item.id)} style={{ display: 'none' }} />
+                  <label key={item.id} style={{ ...labelBaseStyle, ...(isChecked ? checkedStyle : {}), ...(isDisabled ? disabledStyle : {}) }}>
+                    <input type="radio" name={option.name} value={item.id} checked={isChecked} disabled={isDisabled} onChange={() => !isDisabled && handleRadioChange(option.name, item.id)} style={{ display: 'none' }} />
                     {item.label}
                     {item.subtitle && <small style={{ ...subtitleStyle, color: isChecked ? 'rgba(255,255,255,0.85)' : 'inherit' }}>{item.subtitle}</small>}
                   </label>
