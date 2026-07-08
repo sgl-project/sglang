@@ -1147,12 +1147,11 @@ class Scheduler(
             disagg_hidden_states_dtype = self.model_config.dtype
             # DSpark PD decode needs the same target hidden states that non-PD
             # prefill injects into the draft KV cache. Each request copies its
-            # actual extend length into this fixed-capacity metadata slot. Keep
-            # the default bounded to avoid excessive registered auxiliary memory;
-            # users can raise it with SGLANG_DSPARK_PD_PREFILL_TOKENS.
-            default_dspark_prefill_tokens = min(
-                int(self.max_prefill_tokens),
-                max(256, int(self.server_args.speculative_num_draft_tokens) + 1),
+            # actual extend length into this fixed-capacity metadata slot, so the
+            # default capacity should match the scheduler's prefill chunk ceiling.
+            default_dspark_prefill_tokens = int(
+                self.server_args.max_prefill_buffer_tokens()
+                or self.max_prefill_tokens
             )
             dspark_prefill_tokens_env = os.getenv(
                 "SGLANG_DSPARK_PD_PREFILL_TOKENS",
