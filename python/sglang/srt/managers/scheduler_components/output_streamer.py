@@ -363,7 +363,6 @@ class _GenerationStreamAccumulator:
 
         send_token_offset = req.send_token_offset
         send_output_token_logprobs_offset = req.send_output_token_logprobs_offset
-        send_output_sampling_mask_offset = req.send_output_sampling_mask_offset
         self.rids.append(req.rid)
         self.http_worker_ipcs.append(req.http_worker_ipc)
         self.finished_reasons.append(
@@ -494,6 +493,7 @@ class _GenerationStreamAccumulator:
 
         if self.return_sampling_mask:
             if req.return_sampling_mask:
+                send_output_sampling_mask_offset = req.send_output_sampling_mask_offset
                 sampling_mask_end = len(req.output_token_sampling_mask)
                 self.output_token_sampling_mask.append(
                     req.output_token_sampling_mask[
