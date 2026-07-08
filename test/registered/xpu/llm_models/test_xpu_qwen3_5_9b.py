@@ -1,4 +1,4 @@
-"""Qwen3.5-9B GSM8K accuracy on Intel XPU (TP=1).
+"""Qwen3.5-9B GSM8K accuracy on Intel XPU (TP=4).
 
 Scored by ``simple_eval_gsm8k.GSM8KEval`` (the same evaluator AMD and
 NVIDIA nightlies use).
@@ -12,7 +12,7 @@ from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.xpu.simple_eval_gsm8k_xpu_mixin import SimpleEvalGSM8KXPUMixin
 
-register_xpu_ci(est_time=4000, suite="nightly-xpu-1-gpu", nightly=True)
+register_xpu_ci(est_time=2400, suite="nightly-xpu-4-gpu", nightly=True)
 
 
 @unittest.skipUnless(
@@ -21,13 +21,17 @@ register_xpu_ci(est_time=4000, suite="nightly-xpu-1-gpu", nightly=True)
 )
 class TestQwen3_5_9BXPU(SimpleEvalGSM8KXPUMixin, CustomTestCase):
     model = "Qwen/Qwen3.5-9B"
-    tp_size = 1
-    accuracy = 0.55
-    # 200 questions @ ~21 s/q single-thread = ~70 min; the runner's
-    # per-file budget must cover this (see the 4200s --timeout-per-file
-    # in .github/workflows/nightly-test-intel.yml). num_threads=4 halved
-    # wall clock but hurt GSM8K CoT accuracy (0.245 vs 0.60 baseline);
-    # single-thread is required to match the reference score.
+    tp_size = 4
+    accuracy = 0.90
+    # The earlier num_threads=4 accuracy drop (0.245 vs 0.60) was an artifact
+    # of the default max_tokens=512 truncating GSM8K CoT mid-answer. At
+    # max_tokens=8192 the CoT completes and concurrency no longer hurts:
+    # tp=4, num_threads=4, max_tokens=8192, gsm8k n=50 scored 0.96 (reproduced
+    # across two runs), at ~98 tok/s and ~29 min wall clock. num_threads=4
+    # sharing 4 tiles cleared the Level Zero wedge that single-stream tp=1 was
+    # working around, so the 4-gpu suite is the right home for this test.
+    num_threads = 4
+    max_tokens = 8192
 
     # Server args mirror /data/pgirijal/scripts/run_upstream_key_models.sh
     # accuracy_commands["Qwen/Qwen3.5-9B"]. --disable-radix-cache /
