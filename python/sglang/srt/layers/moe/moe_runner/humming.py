@@ -722,20 +722,14 @@ def post_permute_humming_to_deepep_ll(
 ) -> DeepEPLLCombineInput:
     from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPLLCombineInput
 
-    topk_weights = running_state["topk_weights"]
-    routed_scaling_factor = runner_config.routed_scaling_factor
-    # deepep_ll combine is an external weighted sum and cannot fuse the
-    # routed_scaling_factor inside its reduce kernel. Pre-scaling topk_weights
-    # is mathematically equivalent to scaling the combined output afterwards,
-    # since combine is linear in topk_weights: s * sum_k(w_k * x_k) ==
-    # sum_k((s * w_k) * x_k).
-    if routed_scaling_factor is not None and routed_scaling_factor != 1.0:
-        topk_weights = topk_weights * routed_scaling_factor
-
+    # Pass raw topk_weights to the DeepEP LL combine (matching the deep_gemm
+    # runner): the model applies routed_scaling_factor once on the combined
+    # output (e.g. DeepSeek's op_output does so unconditionally on the EP
+    # path). Pre-scaling here would double-apply it (s^2 on the routed branch)
     return DeepEPLLCombineInput(
         hidden_states=runner_output.hidden_states,
         topk_ids=running_state["topk_ids"],
-        topk_weights=topk_weights,
+        topk_weights=running_state["topk_weights"],
     )
 
 
