@@ -963,9 +963,12 @@ class MoriKVManager(CommonKVManager):
         dst_aux_index: int,
         room: int,
     ) -> List[TransferStatus]:
-        if not self.aux_mem_descs or len(self.aux_mem_descs) != len(
-            peer_info.dst_aux_mem_descs
-        ):
+        num_aux_buffers = min(
+            len(self.aux_mem_descs),
+            len(self.kv_args.aux_item_lens),
+            len(peer_info.dst_aux_mem_descs),
+        )
+        if not self.aux_mem_descs or num_aux_buffers != len(self.aux_mem_descs):
             return self.send_aux_tcp(peer_info, prefill_aux_index, dst_aux_index, room)
 
         src_descs: List[MemoryDesc] = []
@@ -974,7 +977,7 @@ class MoriKVManager(CommonKVManager):
         remote_offsets: List[List[int]] = []
         sizes: List[List[int]] = []
         uids = []
-        for i in range(len(self.aux_mem_descs)):
+        for i in range(num_aux_buffers):
             item_len = self.kv_args.aux_item_lens[i]
             src_descs.append(self.aux_mem_descs[i])
             dst_descs.append(peer_info.dst_aux_mem_descs[i])
@@ -995,7 +998,12 @@ class MoriKVManager(CommonKVManager):
         dst_aux_index: int,
         room: int,
     ) -> List[TransferStatus]:
-        for i in range(len(self.kv_args.aux_data_ptrs)):
+        num_aux_buffers = min(
+            len(self.kv_args.aux_data_ptrs),
+            len(self.kv_args.aux_item_lens),
+            len(peer_info.dst_aux_mem_descs),
+        )
+        for i in range(num_aux_buffers):
             length = self.kv_args.aux_item_lens[i]
             src_addr = self.kv_args.aux_data_ptrs[i] + length * prefill_aux_index
             data = AuxDataCodec.serialize_data_from_buffer(src_addr, length)

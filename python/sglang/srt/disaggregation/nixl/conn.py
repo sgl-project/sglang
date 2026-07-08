@@ -1751,7 +1751,10 @@ class NixlKVManager(CommonKVManager):
         prefill_aux_ptrs = self.kv_args.aux_data_ptrs
         prefill_aux_item_lens = self.kv_args.aux_item_lens
 
-        for i, _ in enumerate(dst_aux_ptrs):
+        num_aux_buffers = min(
+            len(prefill_aux_ptrs), len(prefill_aux_item_lens), len(dst_aux_ptrs)
+        )
+        for i in range(num_aux_buffers):
             length = prefill_aux_item_lens[i]
             src_addr = prefill_aux_ptrs[i] + length * prefill_aux_index
             dst_addr = dst_aux_ptrs[i] + length * dst_aux_index
