@@ -1,4 +1,4 @@
-"""Unit tests for LongCat-Flash router GEMM dispatch."""
+"""Unit tests for LongCat-Flash router GEMM dispatch to the JIT bf16xfp32 kernel."""
 
 import unittest
 from types import SimpleNamespace
@@ -24,8 +24,8 @@ def _longcat_config(hidden_size, n_routed_experts, *, router_bias=False):
     )
 
 
-class TestLongcatFlashRouterHpcOps(CustomTestCase):
-    def _assert_dispatches_to_hpc_ops(
+class TestLongcatFlashRouterJitGemm(CustomTestCase):
+    def _assert_dispatches_to_jit_gemm(
         self,
         *,
         hidden_size,
@@ -54,7 +54,7 @@ class TestLongcatFlashRouterHpcOps(CustomTestCase):
         args, kwargs = mock_linear.call_args
         self.assertIs(args[0], hidden_states)
         self.assertIs(args[1], router.classifier.weight)
-        self.assertEqual(kwargs["hpc_ops_min_m"], expected_min_m)
+        self.assertEqual(kwargs["jit_kernel_min_m"], expected_min_m)
 
     def _assert_uses_classifier(self, router, hidden_size):
         hidden_states = torch.randn((4, hidden_size), dtype=torch.bfloat16)
@@ -63,7 +63,7 @@ class TestLongcatFlashRouterHpcOps(CustomTestCase):
         with (
             patch(
                 "sglang.srt.models.longcat_flash.linear_bf16_fp32",
-                side_effect=AssertionError("unexpected hpc_ops dispatch"),
+                side_effect=AssertionError("unexpected jit kernel dispatch"),
             ),
             patch.object(
                 router.classifier,
@@ -78,7 +78,7 @@ class TestLongcatFlashRouterHpcOps(CustomTestCase):
         self.assertEqual(mock_classifier.call_args.args[0].dtype, torch.float32)
 
     def test_chat_shape_dispatches_with_benchmark_guard(self):
-        self._assert_dispatches_to_hpc_ops(
+        self._assert_dispatches_to_jit_gemm(
             hidden_size=6144,
             n_routed_experts=512,
             zero_expert_num=256,
@@ -86,7 +86,7 @@ class TestLongcatFlashRouterHpcOps(CustomTestCase):
         )
 
     def test_lite_shape_dispatches_with_benchmark_guard(self):
-        self._assert_dispatches_to_hpc_ops(
+        self._assert_dispatches_to_jit_gemm(
             hidden_size=3072,
             n_routed_experts=256,
             zero_expert_num=128,
