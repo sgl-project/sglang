@@ -2724,6 +2724,10 @@ class ServerArgs:
         # _handle_model_specific_adjustments never runs.
         self._resolved_overrides = []
 
+        # Model-independent bootstrap: normalize log levels before the
+        # dummy-model short-circuit so the HTTP server gets a valid value.
+        self._handle_log_level()
+
         if self.model_path.lower() in ["none", "dummy"]:
             return
 
@@ -3164,6 +3168,24 @@ class ServerArgs:
                     "--grpc-port is incompatible with --api-key/--admin-api-key: "
                     "the native gRPC listener bypasses HTTP auth middleware."
                 )
+
+    def _handle_log_level(self):
+        # SGLang's own logger accepts aliased levels via getattr(logging,
+        # level.upper()) (e.g. WARN, FATAL), but the same value is forwarded
+        # verbatim to uvicorn, whose LOG_LEVELS map is keyed by lowercase names
+        # with no `warn`/`fatal` aliases -- so `--log-level WARN` raises a
+        # KeyError before the socket binds and the server hangs (issue #30353).
+        # Normalize to a value both consumers accept.
+        aliases = {"warn": "warning", "fatal": "critical"}
+
+        def normalize(level):
+            if level is None:
+                return None
+            level = level.lower()
+            return aliases.get(level, level)
+
+        self.log_level = normalize(self.log_level)
+        self.log_level_http = normalize(self.log_level_http)
 
     def _handle_prefill_delayer_env_compat(self):
         if envs.SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE.get():
