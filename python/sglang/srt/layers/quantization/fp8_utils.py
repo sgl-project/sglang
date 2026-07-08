@@ -459,9 +459,8 @@ def _dispatch_explicit_backend(backend: Fp8GemmRunnerBackend) -> Callable:
     elif backend.is_cutlass():
         if not is_sm120_supported():
             raise RuntimeError(
-                "CUTLASS block FP8 requested via --fp8-gemm-backend=cutlass, "
-                "but hardware does not support it. CUTLASS block FP8 now requires "
-                "SM120 (Blackwell, e.g. RTX 50-series) GPUs with CUDA 12.8+."
+                "--fp8-gemm-backend=cutlass is deprecated on this hardware. "
+                "Please switch to DeepGEMM or FlashInfer TRTLLM on SM90/SM100."
             )
         return cutlass_w8a8_block_fp8_linear_with_fallback
 
