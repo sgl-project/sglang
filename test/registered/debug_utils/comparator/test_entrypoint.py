@@ -5243,5 +5243,25 @@ class TestDiffThresholdPredicateExitCode:
         assert exit_code == 1
 
 
+class TestFailureDisplayBudgetWiring:
+    def test_run_emits_full_detail_for_failing_tensor(self, tmp_path, capsys) -> None:
+        """run() builds a fresh per-run budget, so failing tensors carry percentile detail."""
+        ones = torch.ones(4, 4)
+        baseline = _create_rank_dump(
+            tmp_path / "baseline", rank=0, name="g", tensor=ones
+        )
+        target = _create_rank_dump(
+            tmp_path / "target", rank=0, name="g", tensor=ones * 2
+        )
+
+        records, exit_code = _run_and_parse(_make_argv(baseline, target), capsys)
+
+        tensors = [r for r in records if isinstance(r, ComparisonTensorRecord)]
+        assert len(tensors) == 1
+        assert tensors[0].diff is not None and tensors[0].diff.passed is False
+        assert len(tensors[0].diff.abs_diff_percentiles) > 0
+        assert exit_code == 1
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))

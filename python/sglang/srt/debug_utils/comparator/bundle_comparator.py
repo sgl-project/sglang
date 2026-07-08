@@ -41,6 +41,7 @@ from sglang.srt.debug_utils.comparator.output_types import (
     _split_logs,
 )
 from sglang.srt.debug_utils.comparator.tensor_comparator.comparator import (
+    FailureDisplayBudget,
     compare_tensor_pair,
     compute_tensor_info,
 )
@@ -132,6 +133,7 @@ def compare_bundle_pair(
     token_aligner_mode: Optional[str],
     token_aligner_plan: Optional[TokenAlignerPlan],
     diff_threshold_rules: Optional[list[DiffThresholdRule]] = None,
+    failure_display_budget: Optional[FailureDisplayBudget] = None,
     thd_seq_lens_by_step_pair: Pair[Optional[dict[int, list[int]]]] = Pair(
         x=None, y=None
     ),
@@ -147,6 +149,7 @@ def compare_bundle_pair(
             token_aligner_mode=token_aligner_mode,
             token_aligner_plan=token_aligner_plan,
             diff_threshold_rules=diff_threshold_rules,
+            failure_display_budget=failure_display_budget,
             thd_seq_lens_by_step_pair=thd_seq_lens_by_step_pair,
             viz_output_dir=viz_output_dir,
             compute_per_token=compute_per_token,
@@ -165,6 +168,7 @@ def _compare_bundle_pair_inner(
     token_aligner_mode: Optional[str],
     token_aligner_plan: Optional[TokenAlignerPlan],
     diff_threshold_rules: Optional[list[DiffThresholdRule]] = None,
+    failure_display_budget: Optional[FailureDisplayBudget] = None,
     thd_seq_lens_by_step_pair: Pair[Optional[dict[int, list[int]]]] = Pair(
         x=None, y=None
     ),
@@ -221,6 +225,7 @@ def _compare_bundle_pair_inner(
         token_aligner_mode=token_aligner_mode,
         token_aligner_plan=token_aligner_plan,
         diff_threshold_rules=diff_threshold_rules,
+        failure_display_budget=failure_display_budget,
         thd_seq_lens_by_step_pair=thd_seq_lens_by_step_pair,
         viz_output_dir=viz_output_dir,
         compute_per_token=compute_per_token,
@@ -244,6 +249,7 @@ def _compare_bundle_pair_tensor_type(
     token_aligner_mode: Optional[str],
     token_aligner_plan: Optional[TokenAlignerPlan],
     diff_threshold_rules: Optional[list[DiffThresholdRule]] = None,
+    failure_display_budget: Optional[FailureDisplayBudget] = None,
     thd_seq_lens_by_step_pair: Pair[Optional[dict[int, list[int]]]] = Pair(
         x=None, y=None
     ),
@@ -309,6 +315,7 @@ def _compare_bundle_pair_tensor_type(
         x_target=aligned_target,
         name=name,
         diff_threshold_rules=diff_threshold_rules,
+        failure_display_budget=failure_display_budget,
         seq_dim=seq_dim,
     )
     record = ComparisonTensorRecord(
