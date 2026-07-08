@@ -76,6 +76,7 @@ else:
         max_pooling_1d_varlen,
     )
     from sgl_kernel.kvcacheio import (
+        copy_all_layer_kv_cache_cpu,
         transfer_kv_all_layer,
         transfer_kv_all_layer_mla,
         transfer_kv_per_layer,

@@ -915,6 +915,69 @@ class TestAssignCacheLocKernels(CustomTestCase):
         torch.testing.assert_close(req_to_token, req_to_token_ref, atol=0, rtol=0)
 
 
+class TestCopyAllLayerKvCache(CustomTestCase):
+    def setUp(self):
+        torch.manual_seed(1234)
+
+    def _make_buffers(self, num_slots=32, layer_num=3, head_num=2):
+        # K and V rows deliberately differ in width (v_head_dim < head_dim) so
+        # the per-buffer byte strides differ, like a real MHA pool.
+        k_buffer = [
+            torch.randn(num_slots, head_num, 64, dtype=torch.bfloat16)
+            for _ in range(layer_num)
+        ]
+        v_buffer = [
+            torch.randn(num_slots, head_num, 32, dtype=torch.bfloat16)
+            for _ in range(layer_num)
+        ]
+        return k_buffer + v_buffer
+
+    def _run_and_check(self, buffers, tgt_loc, src_loc):
+        # Reference: gather-then-scatter semantics (advanced indexing gathers
+        # buf[src] before assigning)
+        refs = []
+        for buf in buffers:
+            ref = buf.clone()
+            ref[tgt_loc.long()] = buf[src_loc.long()]
+            refs.append(ref)
+
+        data_ptrs = torch.tensor([b.data_ptr() for b in buffers], dtype=torch.uint64)
+        strides = torch.tensor(
+            [b[0].numel() * b.dtype.itemsize for b in buffers], dtype=torch.int64
+        )
+        torch.ops.sgl_kernel.copy_all_layer_kv_cache_cpu(
+            data_ptrs, strides, tgt_loc, src_loc
+        )
+        for buf, ref in zip(buffers, refs):
+            torch.testing.assert_close(buf, ref, atol=0, rtol=0)
+
+    def test_disjoint_locs(self):
+        buffers = self._make_buffers()
+        tgt_loc = torch.tensor([1, 5, 9, 13], dtype=torch.int64)
+        src_loc = torch.tensor([17, 21, 25, 29], dtype=torch.int64)
+        self._run_and_check(buffers, tgt_loc, src_loc)
+
+    def test_overlapping_locs_reverse_shift(self):
+        # tgt[i] == src[i + 1]: a sequential row-by-row copy would read
+        # already-overwritten rows; the kernel must stage all sources first.
+        buffers = self._make_buffers()
+        tgt_loc = torch.tensor([1, 2, 3, 4], dtype=torch.int64)
+        src_loc = torch.tensor([0, 1, 2, 3], dtype=torch.int64)
+        self._run_and_check(buffers, tgt_loc, src_loc)
+
+    def test_self_copy_noop(self):
+        # The pool warmup issues loc -> loc copies; buffers must be unchanged.
+        buffers = self._make_buffers()
+        loc = torch.zeros(1, dtype=torch.int64)
+        self._run_and_check(buffers, loc, loc)
+
+    def test_int32_locs(self):
+        buffers = self._make_buffers()
+        tgt_loc = torch.tensor([0, 3], dtype=torch.int32)
+        src_loc = torch.tensor([8, 11], dtype=torch.int32)
+        self._run_and_check(buffers, tgt_loc, src_loc)
+
+
 class TestExtendAttentionTreeMask(CustomTestCase):
     H_Q, H_KV, D, DV = 4, 2, 64, 64
 

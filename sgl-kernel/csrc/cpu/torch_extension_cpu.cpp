@@ -530,6 +530,9 @@ void store_cache_cpu(
     const at::Tensor& indices,
     std::optional<int64_t> row_dim);
 
+void copy_all_layer_kv_cache_cpu(
+    const at::Tensor& data_ptrs, const at::Tensor& strides, const at::Tensor& tgt_loc, const at::Tensor& src_loc);
+
 // [NOTE] When registering kernels, we should accurately describe the in-place information.
 // Taking fused_add_rmsnorm_cpu as an example, add `Tensor(a!)` modifier to all tensors that
 // will be modified in-place to avoid incorrect fusing and execution order on graph mode.
@@ -855,6 +858,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "store_cache_cpu(Tensor k, Tensor v, Tensor(a!) k_cache, Tensor(a!) v_cache, Tensor indices, int? row_dim) -> "
       "()");
   m.impl("store_cache_cpu", torch::kCPU, &store_cache_cpu);
+
+  // The copy mutates the K/V buffers addressed via `data_ptrs` (a table of
+  // raw base pointers), which schema-level alias annotations cannot express.
+  m.def("copy_all_layer_kv_cache_cpu(Tensor data_ptrs, Tensor strides, Tensor tgt_loc, Tensor src_loc) -> ()");
+  m.impl("copy_all_layer_kv_cache_cpu", torch::kCPU, &copy_all_layer_kv_cache_cpu);
 }
 
 TORCH_LIBRARY_IMPL(sgl_kernel, CatchAll, m) {
