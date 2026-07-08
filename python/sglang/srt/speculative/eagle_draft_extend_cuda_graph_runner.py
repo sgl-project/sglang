@@ -371,6 +371,8 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             num_accept_tokens=num_accept_tokens,
             # Padded tree width per req; drives the constant qo layout.
             num_tokens_per_req=self.num_tokens_per_bs,
+            # Match the eager path's distributed-argmax opt-in.
+            greedy_argmax=self.eagle_worker.distributed_argmax_enabled,
         )
 
         forward_batch = ForwardBatch(
@@ -424,10 +426,14 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
                 forward_batch.positions,
                 forward_batch,
             )
+            if ret.next_token_ids is not None:
+                # Distributed-argmax fast path: full logits were never produced.
+                ret.topk_index = ret.next_token_ids.view(-1, 1)
+                ret.topk_p = torch.ones_like(ret.topk_index, dtype=torch.float32)
             # ROCm's argmax tie-breaks differently from CUDA's softmax+max
             # path on FP8 logits, which corrupts MTP draft selection on AMD.
             # Keep the fastpath CUDA-only.
-            if self.topk == 1 and not _is_hip:
+            elif self.topk == 1 and not _is_hip:
                 ret.topk_index = torch.argmax(
                     ret.next_token_logits, dim=-1, keepdim=True
                 )
@@ -610,8 +616,16 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         with timer_ctx:
             out = self._replay_graph(shape_key, forward_batch)
 
-        out = LogitsProcessorOutput(
-            next_token_logits=out.next_token_logits[:num_tokens],
-            hidden_states=out.hidden_states[:num_tokens],
-        )
+        if out.next_token_ids is not None:
+            # Distributed-argmax fast path: no full logits were produced.
+            out = LogitsProcessorOutput(
+                next_token_logits=None,
+                next_token_ids=out.next_token_ids[:num_tokens],
+                hidden_states=out.hidden_states[:num_tokens],
+            )
+        else:
+            out = LogitsProcessorOutput(
+                next_token_logits=out.next_token_logits[:num_tokens],
+                hidden_states=out.hidden_states[:num_tokens],
+            )
         return out

@@ -328,6 +328,10 @@ class EagleDraftExtendInput(SpecInput):
     num_tokens_per_req: int = -1
     num_tokens_for_logprob_per_req: int = 1
 
+    # Opt into distributed argmax (set only for decode draft-extend, not prefill
+    # draft-extend, which shares the DRAFT_EXTEND_V2 mode but needs full logits).
+    greedy_argmax: bool = False
+
     dsa_seed_topk_capture: Optional[torch.Tensor] = None
     dsa_seed_topk_select: Optional[torch.Tensor] = None
 

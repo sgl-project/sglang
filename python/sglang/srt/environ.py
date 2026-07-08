@@ -687,6 +687,10 @@ class Envs:
 
     # Spec Config
     SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK = EnvBool(True)
+    # Greedy (topk=1) EAGLE drafting only: pick the next draft token via a
+    # cross-rank argmax over each TP rank's local top-1 instead of all-gathering
+    # the full logits. Requires tp_size > 1. Temporary guard.
+    SGLANG_ENABLE_SPEC_DRAFT_DISTRIBUTED_ARGMAX = EnvBool(False)
     # Skip draft_extend while adaptive spec is at steps=0 (drafting disabled).
     # Saves the per-step draft forward, but the draft KV goes stale: an upshift
     # back to steps>0 starts from a cold draft state (low accept until it recovers).

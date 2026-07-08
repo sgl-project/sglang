@@ -21,7 +21,10 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
 from torch import nn
 
-from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
+from sglang.srt.distributed.device_communicators import (
+    triton_symm_mem_ag,
+    triton_symm_mem_argmax,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
@@ -160,6 +163,9 @@ class LogitsProcessorOutput:
     # Used by speculative decoding (EAGLE)
     # The last hidden layers
     hidden_states: Optional[torch.Tensor] = None
+    # Greedy next-token ids from the TP-sharded vocab (do_argmax); when set,
+    # next_token_logits is None. shape: [#seq]
+    next_token_ids: Optional[torch.Tensor] = None
 
     ## Part 2: This part will be assigned in python/sglang/srt/layers/sampler.py::Sampler
     # he log probs of output tokens, if SGLANG_RETURN_ORIGINAL_LOGPROB = True, will get the log probs before applying temperature. If False, will get the log probs before applying temperature.
@@ -235,6 +241,11 @@ class LogitsMetadata:
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
 
+    # Decode draft-extend opts into the greedy distributed-argmax fast path via
+    # its spec_info; prefill draft-extend shares the DRAFT_EXTEND_V2 forward mode
+    # but keeps full logits, so forward_mode alone can't distinguish them.
+    spec_greedy_argmax: bool = False
+
     mm_input_embeds: Optional[torch.Tensor] = None
 
     @classmethod
@@ -288,6 +299,9 @@ class LogitsMetadata:
             global_num_tokens_for_logprob_gpu=forward_batch.global_num_tokens_for_logprob_gpu,
             dp_padding_mode=DpPaddingMode.SUM_LEN,
             mm_input_embeds=forward_batch.mm_input_embeds,
+            spec_greedy_argmax=bool(
+                getattr(forward_batch.spec_info, "greedy_argmax", False)
+            ),
         )
 
     def compute_dp_attention_metadata(self):
@@ -330,11 +344,15 @@ class LogitsProcessor(nn.Module):
         skip_all_gather: bool = False,
         logit_scale: Optional[float] = None,
         return_full_logits: bool = False,
+        do_argmax: bool = False,
     ):
         super().__init__()
         self.config = config
         self.vocab_size = config.vocab_size
         self.logit_scale = logit_scale
+        # Set at runtime by the speculative draft worker. When set, forward()
+        # takes the local _try_distributed_argmax fast path.
+        self.do_argmax = do_argmax
         self.use_attn_tp_group = get_flags().enable_dp_lm_head
         self.use_fp32_lm_head = get_global_server_args().enable_fp32_lm_head
         if self.use_attn_tp_group:
@@ -368,6 +386,24 @@ class LogitsProcessor(nn.Module):
             ),
             enabled=self.do_tensor_parallel_all_gather and not self.use_attn_tp_group,
             skip_entry_sync=True,
+        )
+
+        # Excluded under any DP attention so every rank runs the same collective
+        # in lockstep; otherwise idle/padded ranks would desync.
+        self._dist_argmax_ok = (
+            self.do_tensor_parallel_all_gather
+            and not self.use_attn_tp_group
+            and not self.do_tensor_parallel_all_gather_dp_attn
+        )
+        self._dist_argmax = (
+            triton_symm_mem_argmax.DistributedArgmax(
+                max_tokens=triton_symm_mem_ag.recommended_max_tokens(
+                    include_prefill=False, floor=128
+                ),
+                enabled=self._dist_argmax_ok,
+            )
+            if self._dist_argmax_ok
+            else None
         )
 
         # enable chunked logprobs processing
@@ -438,6 +474,25 @@ class LogitsProcessor(nn.Module):
         del hidden_states
 
         if not logits_metadata.extend_return_logprob:
+            # Greedy fast path: next-token ids from the local shard, skipping the
+            # full-logits all-gather (draft decode loop + decode draft-extend).
+            if (
+                self.do_argmax
+                and sample_indices is None
+                and (
+                    logits_metadata.forward_mode.is_decode_or_idle()
+                    or logits_metadata.spec_greedy_argmax
+                )
+            ):
+                next_token_ids = self._try_distributed_argmax(pruned_states, lm_head)
+                if next_token_ids is not None:
+                    return LogitsProcessorOutput(
+                        next_token_logits=None,
+                        next_token_ids=next_token_ids,
+                        hidden_states=hidden_states_to_store,
+                        mm_input_embeds=logits_metadata.mm_input_embeds,
+                    )
+
             # Compute logits for both input and sampled tokens.
             logits = self._get_logits(pruned_states, lm_head, logits_metadata)
             sampled_logits = (
@@ -900,6 +955,40 @@ class LogitsProcessor(nn.Module):
             ),
             sampled_logits,
         )
+
+    def _try_distributed_argmax(
+        self,
+        hidden_states: torch.Tensor,
+        lm_head: VocabParallelEmbedding,
+    ) -> Optional[torch.Tensor]:
+        """Greedy next-token ids over the TP-sharded vocab, or ``None`` to use the
+        full-logits path. Eligibility is rank-invariant so all ranks agree: TP>1,
+        no added vocab, no vocab padding, no softcapping, non-inverting scale."""
+        if self._dist_argmax is None:
+            return None
+        if self.final_logit_softcapping is not None:
+            return None
+        if self.logit_scale is not None and self.logit_scale < 0:
+            return None
+
+        num_embeddings = lm_head.num_embeddings
+        if (
+            lm_head.tp_size <= 1
+            or num_embeddings != lm_head.org_vocab_size  # added vocab
+            or lm_head.num_embeddings_padded != num_embeddings  # vocab padding
+            or num_embeddings % lm_head.tp_size != 0
+        ):
+            return None
+
+        # Resolve the transport before the LM head so the fallback costs nothing
+        # over the original full-logits argmax.
+        if not self._dist_argmax.resolve(hidden_states.shape[0]):
+            return None
+
+        local_logits = self._compute_lm_head(hidden_states, lm_head)
+        start = lm_head.shard_indices.org_vocab_start_index
+        local_val, local_arg = torch.max(local_logits, dim=-1)
+        return self._dist_argmax(local_val, local_arg.to(torch.int64) + start)
 
     def _get_logits(
         self,
