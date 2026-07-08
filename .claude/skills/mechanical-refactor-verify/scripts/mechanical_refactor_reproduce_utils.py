@@ -411,22 +411,70 @@ class Repro:
             tree = ast.parse("".join(lines))
             scope: tuple[int, int] | None = None
             if in_function is not None:
-                fn = _find_def(tree, in_function)
-                assert fn is not None, f"function {in_function} not found in {rel}"
+                fn = _find_unique_def(tree, in_function, where=rel)
                 scope = (fn.lineno, fn.end_lineno)
-            spans: list[tuple[int, int]] = []
+            compound = (
+                ast.FunctionDef,
+                ast.AsyncFunctionDef,
+                ast.ClassDef,
+                ast.If,
+                ast.For,
+                ast.AsyncFor,
+                ast.While,
+                ast.With,
+                ast.AsyncWith,
+                ast.Try,
+                ast.Match,
+            )
+            simple_stmt_lines: dict[int, int] = {}
+            for stmt in ast.walk(tree):
+                if isinstance(stmt, ast.stmt) and not isinstance(stmt, compound):
+                    for lineno in range(stmt.lineno, stmt.end_lineno + 1):
+                        simple_stmt_lines[lineno] = simple_stmt_lines.get(lineno, 0) + 1
+            pattern = re.compile(rf"(?<![\w.]){re.escape(import_text)}(?![\w.])")
+            matched: list[ast.stmt] = []
             for node in ast.walk(tree):
                 if isinstance(node, (ast.Import, ast.ImportFrom)):
                     if scope is not None and not (scope[0] <= node.lineno <= scope[1]):
                         continue
-                    seg = "".join(lines[node.lineno - 1 : node.end_lineno])
-                    if import_text in seg:
-                        lo, hi = node.lineno, node.end_lineno
-                        if hi < len(lines) and lines[hi].strip() == "":
-                            hi += 1
-                        spans.append((lo, hi))
-            assert spans, f"import {import_text!r} not found in {rel}"
-            for lo, hi in sorted(spans, reverse=True):
+                    seg = _slice_span(
+                        "".join(lines),
+                        node.lineno,
+                        node.col_offset,
+                        node.end_lineno,
+                        node.end_col_offset,
+                    )
+                    if pattern.search(seg):
+                        matched.append(node)
+            assert matched, f"import {import_text!r} not found in {rel}"
+            whole: list[tuple[int, int]] = []
+            shared: list[ast.stmt] = []
+            for node in matched:
+                alone = all(
+                    simple_stmt_lines[lineno] == 1
+                    for lineno in range(node.lineno, node.end_lineno + 1)
+                )
+                if alone:
+                    lo, hi = node.lineno, node.end_lineno
+                    if hi < len(lines) and lines[hi].strip() == "":
+                        hi += 1
+                    whole.append((lo, hi))
+                else:
+                    shared.append(node)
+            text = "".join(lines)
+            for node in sorted(shared, key=lambda n: (n.lineno, n.col_offset), reverse=True):
+                text = _replace_span(
+                    text, node.lineno, node.col_offset, node.end_lineno, node.end_col_offset, ""
+                )
+                fixed = _split_keepends(text)
+                joined_line = fixed[node.lineno - 1]
+                cleaned = re.sub(r";\s*;", ";", joined_line)
+                cleaned = re.sub(r"^(\s*);\s*", r"\1", cleaned)
+                cleaned = re.sub(r"\s*;(\s*)$", r"\1", cleaned)
+                fixed[node.lineno - 1] = cleaned
+                text = "".join(fixed)
+            lines = _split_keepends(text)
+            for lo, hi in sorted(whole, reverse=True):
                 del lines[lo - 1 : hi]
             _write_source(path, "".join(lines))
 
@@ -461,13 +509,31 @@ class Repro:
                         continue
                     if "." * node.level + (node.module or "") != module:
                         continue
-                kept = [
-                    a for a in node.names if not (a.name == name and a.asname == asname)
-                ]
-                if len(kept) == len(node.names):
+                dropped_alias = next(
+                    (
+                        a
+                        for a in node.names
+                        if a.name == name and a.asname == asname
+                    ),
+                    None,
+                )
+                if dropped_alias is None:
                     continue
+                kept = [a for a in node.names if a is not dropped_alias]
                 if not kept:
                     edits.append((node.lineno, node.end_lineno, None))
+                    continue
+                stmt_lines = lines[node.lineno - 1 : node.end_lineno]
+                if any("#" in ln for ln in stmt_lines):
+                    own = dropped_alias.lineno
+                    own_line = lines[own - 1]
+                    assert own_line.strip().rstrip(",").strip() == alias_text(
+                        dropped_alias
+                    ), (
+                        f"cannot drop {name!r}: it shares a line with other text and "
+                        f"the import holds comments that a rebuild would delete"
+                    )
+                    edits.append((own, own, None))
                 else:
                     keyword = "import " if module is None else f"from {module} import "
                     rebuilt = keyword + ", ".join(alias_text(a) for a in kept) + nl
@@ -491,8 +557,13 @@ class Repro:
             path = root / rel
             lines = _split_keepends(_read_source(path))
             nl = _newline_style("".join(lines))
+            body = ast.parse("".join(lines)).body
             last = 0
-            for node in ast.parse("".join(lines)).body:
+            if body and isinstance(body[0], ast.Expr) and isinstance(
+                body[0].value, ast.Constant
+            ) and isinstance(body[0].value.value, str):
+                last = body[0].end_lineno
+            for node in body:
                 if isinstance(node, (ast.Import, ast.ImportFrom)):
                     last = max(last, node.end_lineno)
             _write_source(
@@ -548,9 +619,14 @@ class Repro:
                     and node.module == old_module
                     and any(alias.name == name for alias in node.names)
                 ):
-                    lines[node.lineno - 1] = lines[node.lineno - 1].replace(
-                        f"from {old_module} import", f"from {new_module} import", 1
+                    spelled = "." * node.level + (node.module or "")
+                    replaced = lines[node.lineno - 1].replace(
+                        f"from {spelled} import", f"from {new_module} import", 1
                     )
+                    assert replaced != lines[node.lineno - 1], (
+                        f"import spelling {spelled!r} not found on its line in {rel}"
+                    )
+                    lines[node.lineno - 1] = replaced
                     changed = True
             assert changed, f"nested import of {name} from {old_module} not in {rel}"
             _write_source(path, "".join(lines))

@@ -1458,11 +1458,6 @@ def test_remove_import_asserts_when_scope_function_missing(tmp_path: Path) -> No
         _apply(r, tmp_path)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="whole source lines are deleted for any statement whose text matches, so "
-    "`import os; import sys` loses the sys import (and the next line) too",
-)
 def test_remove_import_leaves_other_statements_on_a_semicolon_line(
     tmp_path: Path,
 ) -> None:
@@ -1474,11 +1469,6 @@ def test_remove_import_leaves_other_statements_on_a_semicolon_line(
     assert "import sys" in out and "print(sys.path)" in out
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="the match is a plain substring, so 'import os' also deletes the separate "
-    "'import os.path' statement",
-)
 def test_remove_import_does_not_overmatch_a_submodule_import(tmp_path: Path) -> None:
     """Removing 'import os' must not also remove 'import os.path'."""
     (tmp_path / "m.py").write_text("import os\nimport os.path\nprint(os.path.sep)\n")
@@ -1507,11 +1497,6 @@ def test_remove_imported_name_matches_a_relative_module(tmp_path: Path) -> None:
     assert (tmp_path / "m.py").read_text() == "from .pkg import a\n\nx = a\n"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="rebuilding a multi-line parenthesized import from its aliases silently "
-    "deletes the comments that sat on its lines",
-)
 def test_remove_imported_name_preserves_comments_in_a_multiline_import(
     tmp_path: Path,
 ) -> None:
@@ -1538,11 +1523,6 @@ def test_add_import_into_an_empty_file(tmp_path: Path) -> None:
     assert (tmp_path / "m.py").read_text() == "import os\n"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="with no existing imports the statement is inserted at line 0, above the "
-    "module docstring, demoting the docstring to a plain expression",
-)
 def test_add_import_lands_below_a_module_docstring(tmp_path: Path) -> None:
     """In a file with only a docstring, the new import must land below the docstring."""
     (tmp_path / "m.py").write_text('"""Module doc."""\n\nx = 1\n')
@@ -1639,11 +1619,6 @@ def test_repath_import_repaths_a_multiline_aliased_nested_import(
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="a relative nested import matches on node.module but the textual replace "
-    "finds nothing, so the op is a silent no-op that still asserts success",
-)
 def test_repath_import_rewrites_a_relative_nested_import(tmp_path: Path) -> None:
     """A nested `from .mod import` matched by module name must actually be repathed."""
     (tmp_path / "c.py").write_text(
