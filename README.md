@@ -49,6 +49,8 @@ DFlash-TfM with Weaver is the fastest configuration on every task in this sweep.
   <img src="assets/tfm-results-table.png" alt="Full DFlash-TfM table with speedup and accepted-token statistics across sampling and reasoning settings." width="900">
 </p>
 
+> See [`reproduction.sh`](./reproduction.sh) for the pinned reproduction commands.
+
 #### 1. Install the SGLang fork
 
 ```bash
