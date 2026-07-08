@@ -34,6 +34,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
+from sglang.srt.runtime_context import get_buffer
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.speculative.spec_utils import (
@@ -80,7 +81,6 @@ class PrefillMetadata:
 
 
 # Reuse this workspace buffer across all flashinfer wrappers
-global_workspace_buffer = None
 
 
 class FlashInferMhaChunkKVRunner:
@@ -233,15 +233,15 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         self.page_size = model_runner.page_size
 
         # Allocate buffers
-        global global_workspace_buffer
-        if global_workspace_buffer is None:
-            # different from flashinfer zero_init_global_workspace_buffer
-            global_workspace_buffer = torch.empty(
+        # different from flashinfer zero_init_global_workspace_buffer
+        self.workspace_buffer = get_buffer(
+            "flashinfer_mla_workspace",
+            lambda: torch.empty(
                 envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get(),
                 dtype=torch.uint8,
                 device=model_runner.device,
-            )
-        self.workspace_buffer = global_workspace_buffer
+            ),
+        )
 
         max_bs = model_runner.req_to_token_pool.size
         if kv_indptr_buf is None:
