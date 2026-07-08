@@ -239,7 +239,11 @@ class OnlineBlockAcceptEstimateRecorder:
         prefix_lens: torch.Tensor,
         layout: Optional[RaggedVerifyLayout],
     ) -> None:
-        if self._delayed is not None and torch.cuda.is_current_stream_capturing():
+        if (
+            self._delayed is not None
+            and torch.cuda.is_available()
+            and torch.cuda.is_current_stream_capturing()
+        ):
             return
 
         skip_reason = self._skip_reason(
