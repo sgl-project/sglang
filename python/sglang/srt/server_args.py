@@ -5523,9 +5523,17 @@ class ServerArgs:
                 "deployment with --max-ep-size larger than its local TP size."
             )
         if scaling_active:
+            resolved = self._resolved()
             assert self.tokenizer_worker_num == 1, (
                 "Elastic EP runtime scale-up currently requires "
                 "--tokenizer-worker-num 1."
+            )
+            assert (
+                not self.use_ray
+            ), "Elastic EP runtime scale-up does not support --use-ray."
+            assert not self.enable_elastic_expert_backup, (
+                "Elastic EP runtime scale-up does not support "
+                "--enable-elastic-expert-backup."
             )
             self.enable_dp_attention_local_control_broadcast = True
             if self.ep_join_mode == "scale":
@@ -5543,6 +5551,11 @@ class ServerArgs:
                     "Elastic EP joining group exceeds --max-ep-size "
                     f"(join_target={join_target}, max_ep_size={self.max_ep_size})."
                 )
+                if self.tp_size == 1:
+                    assert self.moe_dense_tp_size == 1, (
+                        "A single-rank Elastic EP joining group requires "
+                        "--moe-dense-tp-size 1."
+                    )
             else:
                 if self.elastic_ep_initial_size is None:
                     self.elastic_ep_initial_size = self.tp_size
@@ -5576,36 +5589,35 @@ class ServerArgs:
                 "Elastic EP runtime scale-up requires decode and prefill CUDA "
                 "graphs to be disabled."
             )
-            assert self.enable_dp_attention, (
+            assert resolved.enable_dp_attention, (
                 "Elastic EP scale-up requires --enable-dp-attention; without it "
                 "the TP group is not equivalent to WORLD and the post-scale "
                 "collective path is invalid."
             )
-            assert self.enable_dp_lm_head, (
+            assert resolved.enable_dp_lm_head, (
                 "Elastic EP scale-up requires --enable-dp-lm-head so output "
                 "projection does not depend on the joining group's TP size."
             )
-            assert self.attn_cp_size == 1, (
+            assert resolved.attn_cp_size == 1, (
                 "Elastic EP scale-up requires --attn-cp-size 1 "
-                f"(got attn_cp_size={self.attn_cp_size})."
+                f"(got attn_cp_size={resolved.attn_cp_size})."
             )
             assert self.moe_dp_size == 1, (
                 "Elastic EP scale-up requires --moe-dp-size 1 "
                 f"(got moe_dp_size={self.moe_dp_size})."
             )
-            resolved_ep_size = self._resolved().ep_size
-            assert resolved_ep_size == self.tp_size, (
+            assert resolved.ep_size == self.tp_size, (
                 "Elastic EP scale-up requires ep_size == tp_size "
-                f"(got ep_size={resolved_ep_size}, tp_size={self.tp_size}); EP, TP "
+                f"(got ep_size={resolved.ep_size}, tp_size={self.tp_size}); EP, TP "
                 "and the attention DP group must all coincide with WORLD."
             )
             assert self.dp_size == self.tp_size, (
                 "Elastic EP scale-up requires dp_size == tp_size "
                 f"(got dp_size={self.dp_size}, tp_size={self.tp_size})."
             )
-            assert self.moe_a2a_backend == "nixl", (
+            assert resolved.moe_a2a_backend == "nixl", (
                 "Elastic EP scale-up requires --moe-a2a-backend nixl "
-                f"(got moe_a2a_backend={self.moe_a2a_backend})."
+                f"(got moe_a2a_backend={resolved.moe_a2a_backend})."
             )
 
     def _handle_expert_distribution_metrics(self):

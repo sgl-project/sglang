@@ -1852,7 +1852,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         return from_ep_size
 
     def _report_elastic_scale_failure(self, error: str, effective_size: int) -> None:
-        if self.tp_rank != 0 or self.server_args.is_ep_joiner:
+        if self.tp_rank != 0 or self.server_args.is_ep_scale_joiner:
             return
         from sglang.srt.managers.io_struct import ElasticScaleUpdateReq
 
@@ -1935,11 +1935,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         ElasticEPStateManager.mark_syncing_new_world()
         self._elastic_scale_ready_barrier(
             target_size=target_size,
-            log_tag="JOINER" if self.server_args.is_ep_joiner else "PRIMARY",
+            log_tag="JOINER" if self.server_args.is_ep_scale_joiner else "PRIMARY",
         )
         ElasticEPStateManager.commit_scale()
 
-        if self.tp_rank == 0 and not self.server_args.is_ep_joiner:
+        if self.tp_rank == 0 and not self.server_args.is_ep_scale_joiner:
             from sglang.srt.managers.io_struct import ElasticScaleUpdateReq
 
             slot_offset = self._joiner_slot_offset_for_scale(from_ep_size)
@@ -1950,7 +1950,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 slot_count=target_size - from_ep_size,
             )
 
-        if self.tp_rank == 0 and not self.server_args.is_ep_joiner:
+        if self.tp_rank == 0 and not self.server_args.is_ep_scale_joiner:
             logger.info(
                 "[Elastic EP] Scale completed: old_ep_size=%d "
                 "new_ep_size=%d joined_ranks=%s",
@@ -2020,7 +2020,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
                 ElasticEPStateManager.fail_scale(error)
                 self._report_elastic_scale_failure(error, effective_size)
-                if self.tp_rank == 0 and not self.server_args.is_ep_joiner:
+                if self.tp_rank == 0 and not self.server_args.is_ep_scale_joiner:
                     logger.error("[Elastic EP] %s", error)
                 return
 
