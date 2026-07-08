@@ -59,7 +59,10 @@ from sglang.srt.layers.moe import (
     should_use_dp_reduce_scatterv,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
-from sglang.srt.layers.quantization.fp8_utils import _use_aiter_bpreshuffle_gfx95
+from sglang.srt.layers.quantization.fp8_utils import (
+    _use_aiter_bpreshuffle_gfx95,
+    materialize_bpreshuffle_fp8_scale_tuple,
+)
 from sglang.srt.layers.utils.cp_utils import (
     is_mla_prefill_cp_enabled,
     mla_use_prefill_cp,
@@ -606,8 +609,12 @@ class LayerCommunicator:
                             dtype_quant=torch.float8_e4m3fn,
                             res1=None,
                             output_unquantized_inp1=_dsa_needs_bf16,
-                            transpose_scale=_use_aiter_bpreshuffle_gfx95,
+                            transpose_scale=False,
                         )
+                        if _use_aiter_bpreshuffle_gfx95:
+                            hidden_states = materialize_bpreshuffle_fp8_scale_tuple(
+                                hidden_states
+                            )
                         if _dsa_needs_bf16:
                             hidden_states = (
                                 hidden_states[0],
@@ -652,9 +659,13 @@ class LayerCommunicator:
                                 dtype_quant=torch.float8_e4m3fn,
                                 res1=residual,
                                 output_unquantized_inp1=_dsa_needs_bf16,
-                                transpose_scale=_use_aiter_bpreshuffle_gfx95,
+                                transpose_scale=False,
                             )
                         )
+                        if _use_aiter_bpreshuffle_gfx95:
+                            hidden_states = materialize_bpreshuffle_fp8_scale_tuple(
+                                hidden_states
+                            )
                         if _dsa_needs_bf16:
                             hidden_states = (
                                 hidden_states[0],
@@ -796,6 +807,8 @@ class LayerCommunicator:
                     _use_aiter
                     and batch_size > 0
                     and get_parallel().tp_size != 6
+                    and not is_dp_attention_enabled()
+                    and get_moe_a2a_backend().is_none()
                     and get_global_server_args().enable_aiter_allreduce_fusion
                 )
             )

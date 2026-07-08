@@ -386,13 +386,26 @@ class GlmImageAR(PipelineStage):
             width = width or ar_condition_images[0].width
 
         time_start = time.time()
-        prior_token_id, prior_token_image_ids = self.generate_prior_tokens(
-            prompt=prompt,
-            image=ar_condition_images,
-            height=height,
-            width=width,
-            server_args=server_args,
-        )
+        seed = getattr(batch, "seed", None)
+        if seed is None:
+            prior_token_id, prior_token_image_ids = self.generate_prior_tokens(
+                prompt=prompt,
+                image=ar_condition_images,
+                height=height,
+                width=width,
+            )
+        else:
+            rng_devices = []
+            if device.type == "cuda":
+                rng_devices.append(torch.cuda.current_device())
+            with torch.random.fork_rng(devices=rng_devices, enabled=True):
+                torch.manual_seed(int(seed))
+                prior_token_id, prior_token_image_ids = self.generate_prior_tokens(
+                    prompt=prompt,
+                    image=ar_condition_images,
+                    height=height,
+                    width=width,
+                )
         prior_token_id = prior_token_id.to(device=device)
         time_end = time.time()
         logger.info(f"generate_prior_tokens time: {time_end - time_start}")

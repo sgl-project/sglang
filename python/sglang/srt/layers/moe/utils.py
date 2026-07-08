@@ -4,7 +4,7 @@ import logging
 import os
 from contextlib import contextmanager
 from enum import Enum, IntEnum
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -12,7 +12,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_flags, get_parallel
 from sglang.srt.utils import is_cuda, is_npu
 
 _is_npu = is_npu()
@@ -245,128 +245,112 @@ def get_deepep_output_dtype(self) -> DeepEPOutputDtype:
     return DeepEPOutputDtype.FP8
 
 
-MOE_A2A_BACKEND: Optional[MoeA2ABackend] = None
-MOE_RUNNER_BACKEND: Optional[MoeRunnerBackend] = None
-SPECULATIVE_MOE_RUNNER_BACKEND: Optional[MoeRunnerBackend] = None
-SPECULATIVE_MOE_A2A_BACKEND: Optional[MoeA2ABackend] = None
-DEEPEP_MODE: Optional[DeepEPMode] = None
-IS_TBO_ENABLED: Optional[bool] = None
-IS_SBO_ENABLED: Optional[bool] = None
-TBO_TOKEN_DISTRIBUTION_THRESHOLD: Optional[float] = None
-DEEPEP_CONFIG: Optional[str] = None
-DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER: Optional[bool] = None
-MOE_QUANTIZATION: Optional[str] = None
-
-
 def initialize_moe_config(server_args: ServerArgs):
-    global MOE_A2A_BACKEND
-    global MOE_RUNNER_BACKEND
-    global SPECULATIVE_MOE_RUNNER_BACKEND
-    global SPECULATIVE_MOE_A2A_BACKEND
-    global DEEPEP_MODE
-    global DEEPEP_CONFIG
-    global IS_TBO_ENABLED
-    global IS_SBO_ENABLED
-    global TBO_TOKEN_DISTRIBUTION_THRESHOLD
-    global DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER
-    global MOE_QUANTIZATION
-
-    MOE_A2A_BACKEND = MoeA2ABackend(server_args.moe_a2a_backend)
-    MOE_RUNNER_BACKEND = MoeRunnerBackend(server_args.moe_runner_backend)
-    SPECULATIVE_MOE_RUNNER_BACKEND = (
+    moe = get_flags().moe
+    moe.a2a_backend = MoeA2ABackend(server_args.moe_a2a_backend)
+    moe.runner_backend = MoeRunnerBackend(server_args.moe_runner_backend)
+    moe.speculative_runner_backend = (
         MoeRunnerBackend(server_args.speculative_moe_runner_backend)
         if server_args.speculative_moe_runner_backend is not None
-        else MOE_RUNNER_BACKEND
+        else moe.runner_backend
     )
-    SPECULATIVE_MOE_A2A_BACKEND = (
+    moe.speculative_a2a_backend = (
         MoeA2ABackend(server_args.speculative_moe_a2a_backend)
         if server_args.speculative_moe_a2a_backend is not None
-        else MOE_A2A_BACKEND
+        else moe.a2a_backend
     )
-    DEEPEP_MODE = DeepEPMode(server_args.deepep_mode)
-    DEEPEP_CONFIG = server_args.deepep_config or ""
-    IS_TBO_ENABLED = server_args.enable_two_batch_overlap
-    IS_SBO_ENABLED = server_args.enable_single_batch_overlap
-    if IS_SBO_ENABLED and is_cuda():
+    moe.deepep_mode = DeepEPMode(server_args.deepep_mode)
+    moe.deepep_config = server_args.deepep_config or ""
+    moe.tbo_enabled = server_args.enable_two_batch_overlap
+    moe.sbo_enabled = server_args.enable_single_batch_overlap
+    if moe.sbo_enabled and is_cuda():
         if torch.cuda.get_device_capability()[0] == 9:
             raise ValueError(
                 "SBO (single batch overlap) is not supported on SM90 GPUs with latest sgl-deep-gemm wheel. Please try removing --enable-single-batch-overlap argument."
             )
-    TBO_TOKEN_DISTRIBUTION_THRESHOLD = server_args.tbo_token_distribution_threshold
-    DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER = (
-        server_args.disable_flashinfer_cutlass_moe_fp4_allgather
-    )
-    MOE_QUANTIZATION = server_args.quantization
+    moe.tbo_token_distribution_threshold = server_args.tbo_token_distribution_threshold
+    moe.disable_fp4_allgather = server_args.disable_flashinfer_cutlass_moe_fp4_allgather
+    moe.quantization = server_args.quantization
 
 
 def get_moe_a2a_backend() -> MoeA2ABackend:
-    global MOE_A2A_BACKEND
-    if MOE_A2A_BACKEND is None:
-        MOE_A2A_BACKEND = MoeA2ABackend.NONE
-    return MOE_A2A_BACKEND
+    moe = get_flags().moe
+    if moe.a2a_backend is None:
+        moe.a2a_backend = MoeA2ABackend.NONE
+    return moe.a2a_backend
 
 
 def get_moe_runner_backend() -> MoeRunnerBackend:
-    global MOE_RUNNER_BACKEND
-    if MOE_RUNNER_BACKEND is None:
-        MOE_RUNNER_BACKEND = MoeRunnerBackend.AUTO
-    return MOE_RUNNER_BACKEND
+    moe = get_flags().moe
+    if moe.runner_backend is None:
+        moe.runner_backend = MoeRunnerBackend.AUTO
+    return moe.runner_backend
 
 
 def get_speculative_moe_runner_backend() -> MoeRunnerBackend:
-    global SPECULATIVE_MOE_RUNNER_BACKEND
-    if SPECULATIVE_MOE_RUNNER_BACKEND is None:
+    moe = get_flags().moe
+    if moe.speculative_runner_backend is None:
         logger.warning(
             "SPECULATIVE_MOE_RUNNER_BACKEND is not initialized, using auto backend"
         )
-        SPECULATIVE_MOE_RUNNER_BACKEND = MoeRunnerBackend.AUTO
-    return SPECULATIVE_MOE_RUNNER_BACKEND
+        moe.speculative_runner_backend = MoeRunnerBackend.AUTO
+    return moe.speculative_runner_backend
 
 
 def get_speculative_moe_a2a_backend() -> MoeA2ABackend:
-    global SPECULATIVE_MOE_A2A_BACKEND
-    if SPECULATIVE_MOE_A2A_BACKEND is None:
+    moe = get_flags().moe
+    if moe.speculative_a2a_backend is None:
         logger.warning(
             "SPECULATIVE_MOE_A2A_BACKEND is not initialized, using none backend"
         )
-        SPECULATIVE_MOE_A2A_BACKEND = MoeA2ABackend.NONE
-    return SPECULATIVE_MOE_A2A_BACKEND
+        moe.speculative_a2a_backend = MoeA2ABackend.NONE
+    return moe.speculative_a2a_backend
 
 
 def get_deepep_mode() -> DeepEPMode:
-    global DEEPEP_MODE
-    if DEEPEP_MODE is None:
+    moe = get_flags().moe
+    if moe.deepep_mode is None:
         logger.warning("DEEPEP_MODE is not initialized, using auto mode")
-        DEEPEP_MODE = DeepEPMode.AUTO
-    return DEEPEP_MODE
+        moe.deepep_mode = DeepEPMode.AUTO
+    return moe.deepep_mode
 
 
 def get_deepep_config() -> str:
-    global DEEPEP_CONFIG
-    if DEEPEP_CONFIG is None:
+    moe = get_flags().moe
+    if moe.deepep_config is None:
         logger.warning("DEEPEP_CONFIG is not initialized, using default config")
-        DEEPEP_CONFIG = ""
-    return DEEPEP_CONFIG
+        moe.deepep_config = ""
+    return moe.deepep_config
 
 
 def is_tbo_enabled() -> bool:
-    global IS_TBO_ENABLED
-    if IS_TBO_ENABLED is None:
-        IS_TBO_ENABLED = False
-    return IS_TBO_ENABLED
+    moe = get_flags().moe
+    if moe.tbo_enabled is None:
+        moe.tbo_enabled = False
+    return moe.tbo_enabled
 
 
 def is_sbo_enabled() -> bool:
-    global IS_SBO_ENABLED
-    if IS_SBO_ENABLED is None:
-        IS_SBO_ENABLED = False
-    return IS_SBO_ENABLED
+    moe = get_flags().moe
+    if moe.sbo_enabled is None:
+        moe.sbo_enabled = False
+    return moe.sbo_enabled
 
 
 def is_deepep_class_backend() -> bool:
     """Check if the MoE backend is DeepEP-family (DeepEP, Mooncake, or Mori)."""
     b = get_moe_a2a_backend()
     return b.is_deepep() or b.is_mooncake() or b.is_mori()
+
+
+def uses_per_rank_fused_shared_slots() -> bool:
+    """Check whether fused shared experts use per-rank physical slots."""
+    return is_deepep_class_backend() or get_moe_a2a_backend().is_megamoe()
+
+
+def has_per_rank_fused_shared_slots(num_fused_shared_experts: int) -> bool:
+    """Check whether this layer has fused shared experts in per-rank slots."""
+    return num_fused_shared_experts > 0 and uses_per_rank_fused_shared_slots()
 
 
 def is_flashinfer_cutedsl_v1_path() -> bool:
@@ -378,13 +362,13 @@ def is_flashinfer_cutedsl_v1_path() -> bool:
 
 
 def get_tbo_token_distribution_threshold() -> float:
-    global TBO_TOKEN_DISTRIBUTION_THRESHOLD
-    if TBO_TOKEN_DISTRIBUTION_THRESHOLD is None:
+    moe = get_flags().moe
+    if moe.tbo_token_distribution_threshold is None:
         logger.warning(
             "TBO_TOKEN_DISTRIBUTION_THRESHOLD is not initialized, using 0.48"
         )
-        TBO_TOKEN_DISTRIBUTION_THRESHOLD = 0.48
-    return TBO_TOKEN_DISTRIBUTION_THRESHOLD
+        moe.tbo_token_distribution_threshold = 0.48
+    return moe.tbo_token_distribution_threshold
 
 
 def filter_moe_weight_param_global_expert(name, x, num_local_experts):
@@ -403,11 +387,11 @@ def should_use_flashinfer_cutlass_moe_fp4_allgather():
     Perform FP4 quantize before all-gather for flashinfer cutlass moe to reduce communication cost for high-throughput serving.
     """
     return (
-        not DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER
+        not get_flags().moe.disable_fp4_allgather
         and get_moe_a2a_backend().is_none()
         and get_moe_runner_backend().is_flashinfer_cutlass()
         and is_dp_attention_enabled()
-        and MOE_QUANTIZATION == "modelopt_fp4"
+        and get_flags().moe.quantization == "modelopt_fp4"
         and get_parallel().moe_ep_size == get_parallel().attn_dp_size
     )
 
@@ -474,13 +458,13 @@ def speculative_moe_backend_context():
     Context manager to temporarily use the speculative MoE backend for draft model operations.
     This ensures that draft models in speculative decoding use the configured speculative backend.
     """
-    global MOE_RUNNER_BACKEND
-    original_backend = MOE_RUNNER_BACKEND
+    moe = get_flags().moe
+    original_backend = moe.runner_backend
     try:
-        MOE_RUNNER_BACKEND = get_speculative_moe_runner_backend()
+        moe.runner_backend = get_speculative_moe_runner_backend()
         yield
     finally:
-        MOE_RUNNER_BACKEND = original_backend
+        moe.runner_backend = original_backend
 
 
 @contextmanager
@@ -489,22 +473,17 @@ def speculative_moe_a2a_backend_context():
     Context manager to temporarily use the speculative MoE A2A backend for draft model operations.
     This ensures that draft models in speculative decoding use the configured speculative A2A backend.
     """
-    global MOE_A2A_BACKEND
-    global DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER
-    original_backend = MOE_A2A_BACKEND
-    original_disable_flashinfer_cutlass_moe_fp4_allgather = (
-        DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER
-    )
+    moe = get_flags().moe
+    original_backend = moe.a2a_backend
+    original_disable_fp4_allgather = moe.disable_fp4_allgather
     try:
-        MOE_A2A_BACKEND = get_speculative_moe_a2a_backend()
+        moe.a2a_backend = get_speculative_moe_a2a_backend()
         # Disable FP4 allgather for spec decode since MTP layers are unquantized
-        DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER = True
+        moe.disable_fp4_allgather = True
         yield
     finally:
-        MOE_A2A_BACKEND = original_backend
-        DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER = (
-            original_disable_flashinfer_cutlass_moe_fp4_allgather
-        )
+        moe.a2a_backend = original_backend
+        moe.disable_fp4_allgather = original_disable_fp4_allgather
 
 
 # The type of method in top-K routing, for use in torch custom op

@@ -25,6 +25,7 @@ from sglang.srt.mem_cache.triton_ops.common import (
     get_last_loc_triton_safe,
     write_req_to_token_pool_triton,
 )
+from sglang.srt.runtime_context import get_server_args
 from sglang.srt.server_args import ServerArgs, get_global_server_args
 from sglang.srt.utils import is_cuda, is_hip, is_npu, support_triton
 from sglang.srt.utils.common import ceil_align, is_pin_memory_available
@@ -73,10 +74,8 @@ def free_swa_out_of_window_slots(
     page_size: int,
     req_to_token_pool: ReqToTokenPool,
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
-    drop_page_margin: bool = False,
+    is_chunk_cache: bool = False,
 ) -> None:
-    from sglang.srt.environ import envs
-
     # For swa radix cache, we need to evict the tokens that are not in the tree cache and also not in the sliding window
     assert (
         req.cache_protected_len % page_size == 0
@@ -86,13 +85,16 @@ def free_swa_out_of_window_slots(
         evict_floor = -(-evict_floor // page_size) * page_size
     req.swa_evicted_seqlen = max(req.swa_evicted_seqlen, evict_floor)
 
-    # Subtract an extra page_size so the eviction frontier never reaches the
-    # radix tree insert boundary, keeping >=1 page of non-evicted SWA KV for the
-    # tree to store as a non-tombstone node (else leaf nodes tombstone -> SWA leak).
-    if drop_page_margin or envs.SGLANG_OPT_SWA_EVICT_DROP_PAGE_MARGIN.get():
+    if is_chunk_cache:
+        # Chunk cache builds no radix tree, so no tombstone-leaf concern; evict
+        # up to the window boundary (the trailing floor keeps it page-aligned).
         evict_threshold = pre_len - sliding_window_size
     else:
-        evict_threshold = pre_len - sliding_window_size - page_size
+        # Radix cache: keep max(window, page). The trailing floor page-aligns the
+        # frontier, and subtracting at least one page keeps it below the insert
+        # boundary (page_floor(seq_len)) so the last leaf is never all-tombstone.
+        # No extra page margin is needed.
+        evict_threshold = pre_len - max(sliding_window_size, page_size)
     new_swa_evicted_seqlen = max(
         req.swa_evicted_seqlen,
         evict_threshold,
@@ -132,7 +134,7 @@ def write_cache_indices(
     prefix_tensors: list[torch.Tensor],
     req_to_token_pool: ReqToTokenPool,
 ):
-    if support_triton(get_global_server_args().attention_backend):
+    if support_triton(get_server_args().attention_backend):
         prefix_pointers = torch.tensor(
             [t.data_ptr() for t in prefix_tensors],
             dtype=torch.uint64,
@@ -173,7 +175,7 @@ def get_last_loc(
     req_pool_indices_tensor: torch.Tensor,
     prefix_lens_tensor: torch.Tensor,
 ) -> torch.Tensor:
-    attn_backend = get_global_server_args().attention_backend
+    attn_backend = get_server_args().attention_backend
     uses_triton_dispatch = attn_backend not in ("ascend", "torch_native")
 
     if _is_hip and uses_triton_dispatch:
