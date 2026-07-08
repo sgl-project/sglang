@@ -364,8 +364,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.pp_rank = params.pp_rank
         self.pp_size = params.pp_size
         self.work_list: list[torch.distributed.Work] = []
-        self._decode_event_check_interval = 16
-        self._decode_event_check_steps = 0
+        # Only poll decode-only HiCache events every N scheduler steps on PP=1.
+        self.decode_event_check_interval = 16
+        # Tracks decode-only scheduler steps since the last HiCache event poll.
+        self.decode_event_check_steps = 0
 
         # HiCache D↔H defaults (overridden by init_hicache)
         self.cache_controller: Optional[HybridCacheController] = None
@@ -2220,6 +2222,40 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         _drain_release()
         _drain_extra_release()
 
+    def drain_storage_control_queues(self) -> None:
+        cache_controller = self.cache_controller
+        extra_release_queues = getattr(
+            cache_controller, "extra_host_mem_release_queues", {}
+        )
+        extra_release_pool_names = list(extra_release_queues)
+        local_queue_sizes = [
+            cache_controller.prefetch_revoke_queue.qsize(),
+            cache_controller.ack_backup_queue.qsize(),
+            cache_controller.host_mem_release_queue.qsize(),
+            *[
+                extra_release_queues[pool_name].qsize()
+                for pool_name in extra_release_pool_names
+            ],
+        ]
+        queue_sizes = torch.tensor(
+            local_queue_sizes,
+            dtype=torch.int,
+        )
+        self._all_reduce_attn_groups(queue_sizes, torch.distributed.ReduceOp.MIN)
+        queue_size_list = list(map(int, queue_sizes.tolist()))
+        n_revoke, n_backup, n_release = queue_size_list[:3]
+        extra_release_counts = {
+            pool_name: count
+            for pool_name, count in zip(extra_release_pool_names, queue_size_list[3:])
+        }
+        self._drain_storage_control_queues_impl(
+            n_revoke=n_revoke,
+            n_backup=n_backup,
+            n_release=n_release,
+            extra_release_counts=extra_release_counts,
+            log_metrics=True,
+        )
+
     def _apply_storage_runtime_config(
         self,
         *,
@@ -2391,10 +2427,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return
 
         if finish_count is None:
-            finish_count = self._count_ready_acks(cache_controller.ack_write_queue)
-            ack_count_tensor = torch.tensor(finish_count, dtype=torch.int, device="cpu")
-            self._all_reduce(ack_count_tensor, torch.distributed.ReduceOp.MIN)
-            finish_count = ack_count_tensor.item()
+            finish_count = 0
+            if self.pp_rank == 0:
+                finish_count = self._count_ready_acks(cache_controller.ack_write_queue)
+            finish_count_tensor = torch.tensor(
+                finish_count, dtype=torch.int, device="cpu"
+            )
+            self._all_reduce(finish_count_tensor, torch.distributed.ReduceOp.MIN)
+            finish_count = finish_count_tensor.item()
 
         while finish_count > 0:
             _, finish_event, ack_list = cache_controller.ack_write_queue.pop(0)
@@ -2403,11 +2443,21 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 self._finish_write_through_ack(ack_id)
             finish_count -= 1
 
-    def loading_check(self, finish_count: int) -> None:
+    def loading_check(self, finish_count: Optional[int] = None) -> None:
         """Poll load-back completions."""
         cache_controller = self.cache_controller
         if cache_controller is None:
             return
+
+        if finish_count is None:
+            finish_count = 0
+            if self.pp_rank == 0:
+                finish_count = self._count_ready_acks(cache_controller.ack_load_queue)
+            finish_count_tensor = torch.tensor(
+                finish_count, dtype=torch.int, device="cpu"
+            )
+            self._all_reduce(finish_count_tensor, torch.distributed.ReduceOp.MIN)
+            finish_count = finish_count_tensor.item()
 
         while finish_count > 0:
             _, finish_event, ack_list = cache_controller.ack_load_queue.pop(0)
@@ -2476,16 +2526,30 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     def check_hicache_events(self, decode_only: bool = False) -> None:
         """Called per scheduler step to poll async HiCache events."""
         self._drain_async_work()
-        decode_only = decode_only and self.pp_size == 1
+
+        if self.pp_size != 1:
+            self.decode_event_check_steps = 0
+            self.writing_check()
+            self.loading_check()
+            if self.enable_storage:
+                self.drain_storage_control_queues()
+            if (
+                self.enable_storage_metrics
+                and self.storage_metrics_collector is not None
+            ):
+                self.storage_metrics_collector.log_storage_metrics(
+                    self.cache_controller.storage_backend.get_stats()
+                )
+            return
 
         if decode_only:
-            next_step = self._decode_event_check_steps + 1
-            if next_step < self._decode_event_check_interval:
-                self._decode_event_check_steps = next_step
+            next_step = self.decode_event_check_steps + 1
+            if next_step < self.decode_event_check_interval:
+                self.decode_event_check_steps = next_step
                 return
-            self._decode_event_check_steps = 0
+            self.decode_event_check_steps = 0
         else:
-            self._decode_event_check_steps = 0
+            self.decode_event_check_steps = 0
 
         (
             write_finish_count,
