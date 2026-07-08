@@ -189,7 +189,9 @@ def _node_slice(text: str, node: ast.AST) -> str:
     )
 
 
-def _rewrite_matching_calls(text: str, predicate: "Callable", rewrite: "Callable") -> str:
+def _rewrite_matching_calls(
+    text: str, predicate: "Callable", rewrite: "Callable"
+) -> str:
     """Rewrite every call ``predicate`` accepts by splicing the original source text
     (never ``ast.unparse``, which would re-spell literals and drop comments). One call is
     rewritten per pass and the text re-parsed, so a matching call nested inside another
@@ -218,12 +220,13 @@ def _rewrite_matching_calls(text: str, predicate: "Callable", rewrite: "Callable
 def _lowered_call_text(text: str, node: ast.Call) -> str:
     """Original call text with the leading receiver argument spliced out and made the
     call's new receiver: ``Owner.foo(recv, rest...)`` -> ``recv.foo(rest...)``. All other
-    argument bytes (literal spelling, comments, the magic trailing comma) are untouched."""
+    argument bytes (literal spelling, comments, the magic trailing comma) are untouched.
+    """
     receiver = node.args[0]
     receiver_src = _node_slice(text, receiver)
-    assert "\n" not in receiver_src and "#" not in receiver_src, (
-        f"receiver {receiver_src!r} must be single-line and comment-free"
-    )
+    assert (
+        "\n" not in receiver_src and "#" not in receiver_src
+    ), f"receiver {receiver_src!r} must be single-line and comment-free"
     opener = _slice_span(
         text,
         node.func.end_lineno,
