@@ -800,7 +800,10 @@ class TokenizerControlMixin:
             # Keep the tokenizer-manager's view of the role in sync so future
             # control ops and bootstrap routing behave consistently.
             self.server_args.disaggregation_mode = obj.new_role
-        msg = "; ".join(f"dp{i}:{r.message}" for i, r in enumerate(results))
+            msg = "ok"
+        else:
+            # Surface only the failing workers' messages.
+            msg = "; ".join(r.message for r in results if not r.success)
         return PdRoleSwitchReqOutput(
             success=all_success,
             message=msg,

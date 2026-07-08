@@ -1434,9 +1434,8 @@ async def slow_down(obj: Annotated[SlowDownReqInput, Body()], request: Request):
 async def pd_role_switch(
     obj: Annotated[PdRoleSwitchReqInput, Body()], request: Request
 ):
-    """(PoC) Switch this instance's PD disaggregation role at runtime
-    ("prefill" <-> "decode"). The instance must be idle. Requires the server to
-    be launched with --enable-pd-role-switch."""
+    """Switch this instance's PD disaggregation role (prefill<->decode) at runtime.
+    Requires --enable-pd-role-switch; the instance must be idle."""
     try:
         result = await _global_state.tokenizer_manager.pd_role_switch(obj, request)
     except Exception as e:

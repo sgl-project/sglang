@@ -243,6 +243,10 @@ class ReqToTokenPool:
     """A memory pool that maps a request to its token locations."""
 
     enable_mamba_extra_buffer_lazy: bool = False
+    # Extra pre-allocation headroom (reserved for in-transfer decode requests).
+    # 0 for a plain pool; the decode-flavored pool (DecodeReqToTokenPool) sets a
+    # positive value. Declared here so callers can read it without getattr.
+    pre_alloc_size: int = 0
 
     def __init__(
         self,

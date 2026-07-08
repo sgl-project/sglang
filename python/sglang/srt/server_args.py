@@ -2374,12 +2374,12 @@ class ServerArgs:
         int,
         "Number of optimistic prefill retries that will skip the bootstrap wait. ",
     ] = 0
-    # PoC: allow runtime P<->D role switching for this instance. When enabled,
-    # the bootstrap server is always started (so a flipped-to-prefill instance
-    # can serve bootstrap) and the /pd_role_switch control endpoint is active.
+    # Allow runtime P<->D role switching for this instance. When enabled, the
+    # bootstrap server is always started (so a flipped-to-prefill instance can
+    # serve bootstrap) and the /pd_role_switch control endpoint is active.
     enable_pd_role_switch: A[
         bool,
-        "Allow runtime prefill<->decode role switching for this instance via the /pd_role_switch endpoint (PD mode). Default off.",
+        "Allow runtime prefill<->decode role switch via /pd_role_switch (PD mode).",
     ] = False
 
     # -------------------------------------------------------------------------

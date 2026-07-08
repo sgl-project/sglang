@@ -537,22 +537,17 @@ class ModelRunnerKVCacheMixin:
                 self.server_args.disaggregation_mode == "decode"
                 or self.server_args.enable_pd_role_switch
             ):
-                # With runtime P<->D role switching the pool must be role-agnostic.
-                # DecodeReqToTokenPool is a superset of ReqToTokenPool (same alloc
-                # interface + pre_alloc headroom), so a prefill-starting instance
-                # can also use it and later flip to decode without reallocation.
+                # Role switching needs a role-agnostic pool: DecodeReqToTokenPool
+                # is a superset of ReqToTokenPool, so a prefill instance can use
+                # it and later flip to decode without reallocation.
                 from sglang.srt.disaggregation.decode import (
                     DecodeReqToTokenPool,
                     HybridMambaDecodeReqToTokenPool,
                 )
 
-                # Extra slots for pre-allocated requests. A role-switch prefill
-                # instance pre-allocates this decode-flavored pool too, but the
-                # extra-slots default is only computed for the decode role, so
-                # fall back to 0 here to stay role-agnostic.
-                pre_alloc_size = (
-                    self.server_args.disaggregation_decode_extra_slots or 0
-                )
+                # extra_slots is only defaulted for the decode role; fall back to
+                # 0 so a role-switch prefill can build the same pool.
+                pre_alloc_size = self.server_args.disaggregation_decode_extra_slots or 0
                 if config := self.mambaish_config:
                     self.req_to_token_pool = HybridMambaDecodeReqToTokenPool(
                         size=max_num_reqs,

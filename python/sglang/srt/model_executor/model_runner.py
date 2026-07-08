@@ -891,6 +891,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.graph_mem_usage = 0
         self.prefill_cuda_graph_runner = None
         self.graph_shared_output = None
+        # Set once real decode CUDA graphs are captured (makes on-flip role-switch
+        # capture idempotent).
+        self.decode_cuda_graph_captured = False
+        # Captured decode bs; exposed via /get_server_info for role-switch queries.
+        self.decode_cuda_graph_capture_bs: List[int] = []
 
     def init_attention_backends(self):
         """Initialize attention backends only (no cuda graph capture)."""
@@ -2642,6 +2647,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             capture_name = f"{role} decode"
             num_tokens_per_bs = 1
         capture_bs, _ = get_batch_sizes_to_capture(self, num_tokens_per_bs)
+        # Record the captured bs so it can be queried via /get_server_info.
+        self.decode_cuda_graph_capture_bs = list(capture_bs)
         decode_backend = self.server_args.cuda_graph_config.decode.backend
         logger.info(
             f"Capture {capture_name} {graph_backend[self.device]} begin. "
@@ -2669,11 +2676,48 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         after_mem = get_available_gpu_memory(self.device, self.gpu_id)
         self.graph_mem_usage = before_mem - after_mem
+        self.decode_cuda_graph_captured = self.decode_cuda_graph_runner is not None
         logger.info(
             f"Capture {capture_name} {graph_backend[self.device]} end. "
             f"elapsed={time.perf_counter() - tic:.2f} s, "
             f"mem usage={self.graph_mem_usage:.2f} GB, avail mem={after_mem:.2f} GB."
         )
+
+    def ensure_decode_cuda_graphs(self, capture_bs: Optional[List[int]] = None):
+        """Idempotently capture decode CUDA graphs after startup.
+
+        Used by the PD role switch: an instance launched as prefill runs fully
+        eager (decode CUDA graph disabled). On the first flip to decode we
+        enable the decode CUDA graph and capture it here, so the flipped
+        instance replays decode graphs instead of running eager.
+        """
+        if self.decode_cuda_graph_captured:
+            logger.info("Decode CUDA graphs already captured; skipping re-capture.")
+            return
+
+        cfg = self.server_args.cuda_graph_config
+        was_disabled = cfg is not None and cfg.decode.backend == Backend.DISABLED
+        if was_disabled:
+            # Prefill was launched with the decode CUDA graph disabled; enable it
+            # for the decode role.
+            logger.info(
+                "Enabling decode CUDA graph on role switch (was disabled at startup)."
+            )
+            cfg.decode.backend = Backend.FULL
+            self.server_args.disable_cuda_graph = False
+
+        if capture_bs:
+            # Capture-to-fit: only the requested (router-sized) batch sizes.
+            filtered_bs = sorted({int(b) for b in capture_bs if int(b) > 0})
+            if filtered_bs:
+                cfg.decode.bs = filtered_bs
+
+        if was_disabled:
+            # graph_shared_output is skipped at startup when decode is disabled,
+            # so build it now (before the decode runner reads its logits buffer).
+            self.graph_shared_output = GraphSharedOutput.create_for_model_runner(self)
+
+        self.init_decode_cuda_graph()
 
     def init_prefill_cuda_graph(self, force_for_draft_worker: bool = False):
         """Initialize prefill CUDA graph runner."""

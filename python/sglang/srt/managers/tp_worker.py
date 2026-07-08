@@ -354,6 +354,17 @@ class TpModelWorker(BaseTpWorker):
         for mr in self.model_runner_list[1:]:
             mr.init_cuda_graphs(capture_decode_cuda_graph=capture_decode_cuda_graph)
 
+    def ensure_decode_cuda_graphs(self, capture_bs: Optional[List[int]] = None):
+        """Idempotently capture decode cuda graphs for all model runners (used
+        for the on-flip capture during a runtime PD role switch)."""
+        self.model_runner.ensure_decode_cuda_graphs(capture_bs)
+        for mr in self.model_runner_list[1:]:
+            mr.ensure_decode_cuda_graphs(capture_bs)
+
+    def get_decode_cuda_graph_bs(self) -> List[int]:
+        """Decode bs captured as CUDA graphs (empty on a not-yet-flipped prefill)."""
+        return list(self.model_runner.decode_cuda_graph_capture_bs)
+
     def _init_model_config(self):
         from sglang.srt.configs.model_config import ModelConfig
 

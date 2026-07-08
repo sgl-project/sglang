@@ -101,6 +101,15 @@ class BaseKVManager(ABC):
         """Register prefill server info to the bootstrap server."""
         ...
 
+    # Opt-in per backend: set True and implement teardown() to support runtime PD
+    # role switch (release transfer resources; the scheduler owns the KV pool).
+    supports_role_switch: bool = False
+
+    def teardown(self) -> None:
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support PD role switch teardown"
+        )
+
 
 class BaseKVSender(ABC):
     @abstractmethod

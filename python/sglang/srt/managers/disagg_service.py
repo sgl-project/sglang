@@ -18,11 +18,8 @@ def start_disagg_service(
     disagg_mode = DisaggregationMode(server_args.disaggregation_mode)
     transfer_backend = TransferBackend(server_args.disaggregation_transfer_backend)
 
-    # Normally the bootstrap server only runs on prefill instances. When runtime
-    # P<->D role switching is enabled, start it on every disaggregated instance so
-    # an instance that is flipped to prefill already has a live bootstrap server
-    # (the bootstrap server lives in the tokenizer-manager process and is not
-    # rebuilt during a flip).
+    # With role switching, run bootstrap on every instance (not just prefill) so
+    # one flipped to prefill already has it; it isn't rebuilt on flip.
     start_bootstrap = disagg_mode == DisaggregationMode.PREFILL or (
         server_args.enable_pd_role_switch and disagg_mode != DisaggregationMode.NULL
     )

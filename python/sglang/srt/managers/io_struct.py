@@ -1730,8 +1730,11 @@ class SlowDownReqOutput(BaseReq, kw_only=True):
 
 
 class PdRoleSwitchReqInput(BaseReq, kw_only=True):
-    # Target disaggregation role: "prefill" or "decode".
-    new_role: str = ""
+    # Target role; "" is an invalid sentinel rejected by the handler.
+    new_role: Literal["prefill", "decode", ""] = ""
+    # Optional decode bs to capture on a flip to decode (capture-to-fit);
+    # None uses the server's configured decode bs list.
+    decode_cuda_graph_bs: Optional[List[int]] = None
 
 
 class PdRoleSwitchReqOutput(BaseReq, kw_only=True):

@@ -42,6 +42,7 @@ from sglang.jit_kernel.ngram_embedding import update_token_table
 from sglang.srt.configs.model_config import ModelConfig, ModelImpl
 from sglang.srt.constrained.grammar_manager import GrammarManager
 from sglang.srt.debug_utils.pr_fix_toggle import maybe_revert_pr_fix
+from sglang.srt.disaggregation import role_switch
 from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
     DecodeTransferQueue,
@@ -125,7 +126,6 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqInput,
     PauseGenerationReqInput,
     PdRoleSwitchReqInput,
-    PdRoleSwitchReqOutput,
     ProfileReq,
     ReleaseMemoryOccupationReqInput,
     RemoveExternalCorpusReqInput,
@@ -967,6 +967,11 @@ class Scheduler(
     def init_running_status(self):
         # Set by a runtime PD role switch to break out of the current event loop.
         self._event_loop_should_restart = False
+        # Guards against concurrent/re-entrant PD role switches.
+        self._pd_role_switch_in_progress = False
+        # Set if a role switch tore down the old role but failed to rebuild
+        # either the new or the old role; the instance can no longer serve.
+        self._pd_role_switch_unhealthy = False
         # Set by the ShutdownReq handler to break the event loop for graceful shutdown.
         self.gracefully_exit = False
         self.waiting_queue: List[Req] = []
@@ -1125,23 +1130,7 @@ class Scheduler(
         self.transfer_backend = TransferBackend(
             self.server_args.disaggregation_transfer_backend
         )
-        # Sub-components cache disaggregation_mode at construction time. When
-        # this runs as part of a runtime P<->D role switch they already exist,
-        # so propagate the new mode to keep them consistent (the first call at
-        # __init__ is a no-op because they are not built yet).
-        for _comp_name in (
-            "invariant_checker",
-            "load_inquirer",
-            "output_streamer",
-            "batch_result_processor",
-        ):
-            _comp = getattr(self, _comp_name, None)
-            if _comp is not None and hasattr(_comp, "disaggregation_mode"):
-                # Some of these are frozen dataclasses, so bypass the frozen
-                # check with object.__setattr__ (the slot already exists).
-                object.__setattr__(
-                    _comp, "disaggregation_mode", self.disaggregation_mode
-                )
+        self._sync_disaggregation_mode_to_subcomponents()
 
         # todo: should we fix this when enabling mtp or it doesn't matter since we only enable mtp in decode node thus we don't transfer draft kvs between P and D?
         draft_token_to_kv_pool = kv_cache_builder.get_draft_kv_pool(
@@ -1699,7 +1688,7 @@ class Scheduler(
         # A runtime PD role switch rebuilt the disaggregation structures for a new
         # role. The response has already been sent above; now break out of the
         # current (old-role) event loop so the supervisor can re-dispatch.
-        if getattr(self, "_event_loop_should_restart", False):
+        if self._event_loop_should_restart:
             self._event_loop_should_restart = False
             raise _PdRoleSwitchRestart()
 
@@ -3784,6 +3773,13 @@ class Scheduler(
             "graph": round(self.tp_worker.model_runner.graph_mem_usage, 2),
         }
         ret["effective_max_running_requests_per_dp"] = self.max_running_requests
+        # PD role switch: expose this instance's role and the decode CUDA graph
+        # batch sizes it has captured (empty on a prefill that has not flipped to
+        # decode). A router can query a live decode server here and pass the value
+        # as PdRoleSwitchReqInput.decode_cuda_graph_bs so the instance being
+        # flipped to decode captures a size-matched graph set.
+        ret["disaggregation_mode"] = self.server_args.disaggregation_mode
+        ret["decode_cuda_graph_bs"] = self.tp_worker.get_decode_cuda_graph_bs()
 
         if (
             not self.spec_algorithm.is_none()
@@ -4119,81 +4115,25 @@ class Scheduler(
         return SlowDownReqOutput()
 
     def handle_pd_role_switch(self, recv_req: PdRoleSwitchReqInput):
-        """(PoC) Flip this instance's disaggregation role at runtime.
-
-        The instance must be fully idle (drained). The token KV pool is role
-        independent and is NOT reallocated; only the role-specific disaggregation
-        structures (queues, metadata buffers, KV transfer manager) are torn down
-        and rebuilt for the new role via init_disaggregation().
-        """
-        old_role = self.disaggregation_mode.value
-        new_role = (recv_req.new_role or "").lower()
-
-        def _fail(msg):
-            logger.warning(
-                "PD role switch rejected (%s -> %s): %s", old_role, new_role, msg
-            )
-            return PdRoleSwitchReqOutput(
-                success=False, message=msg, old_role=old_role, new_role=new_role
-            )
-
-        try:
-            if not self.server_args.enable_pd_role_switch:
-                return _fail("--enable-pd-role-switch is not set on this instance")
-            if new_role not in ("prefill", "decode"):
-                return _fail(f"invalid new_role={recv_req.new_role!r}")
-            if self.disaggregation_mode == DisaggregationMode.NULL:
-                return _fail("instance is not running in PD disaggregation mode")
-            if new_role == old_role:
-                return PdRoleSwitchReqOutput(
-                    success=True,
-                    message="already in target role",
-                    old_role=old_role,
-                    new_role=new_role,
-                )
-            if not self.is_fully_idle():
-                return _fail(
-                    "instance is not idle; drain all requests before switching"
-                )
-
-            self._teardown_disaggregation()
-            self.server_args.disaggregation_mode = new_role
-            self.init_disaggregation()
-            # Signal process_input_requests to break out of the current (old-role)
-            # event loop after this response is sent; the supervisor in
-            # dispatch_event_loop then re-dispatches to the new-role loop.
-            self._event_loop_should_restart = True
-            logger.info("PD role switch succeeded: %s -> %s", old_role, new_role)
-            return PdRoleSwitchReqOutput(
-                success=True, message="ok", old_role=old_role, new_role=new_role
-            )
-        except Exception as e:
-            logger.exception("PD role switch failed")
-            return _fail(f"role switch raised: {e}")
+        return role_switch.handle_pd_role_switch(self, recv_req)
 
     def _teardown_disaggregation(self):
-        """Release the current role's disaggregation structures so the other
-        role can be rebuilt. Used by runtime P<->D role switching (PoC)."""
-        mode = self.disaggregation_mode
-        if mode == DisaggregationMode.PREFILL:
-            q = getattr(self, "disagg_prefill_bootstrap_queue", None)
-            if q is not None:
-                km = getattr(q, "kv_manager", None)
-                if km is not None and hasattr(km, "teardown"):
-                    km.teardown()
-                self.disagg_prefill_bootstrap_queue = None
-            self.disagg_prefill_inflight_queue = []
-        elif mode == DisaggregationMode.DECODE:
-            q = getattr(self, "disagg_decode_prealloc_queue", None)
-            if q is not None:
-                km = getattr(q, "kv_manager", None)
-                if km is not None and hasattr(km, "teardown"):
-                    km.teardown()
-                self.disagg_decode_prealloc_queue = None
-            self.disagg_decode_transfer_queue = None
-        # Role-specific metadata buffers + index allocator; rebuilt on the new role.
-        self.disagg_metadata_buffers = None
-        self.req_to_metadata_buffer_idx_allocator = None
+        role_switch.teardown_disaggregation(self)
+
+    def _sync_disaggregation_mode_to_subcomponents(self):
+        # Push the (possibly flipped) mode into sub-components that cache it.
+        # object.__setattr__ because some are frozen dataclasses.
+        for name in (
+            "invariant_checker",
+            "load_inquirer",
+            "output_streamer",
+            "batch_result_processor",
+        ):
+            comp = getattr(self, name, None)
+            if comp is not None and hasattr(comp, "disaggregation_mode"):
+                object.__setattr__(
+                    comp, "disaggregation_mode", self.disaggregation_mode
+                )
 
     def expert_distribution_handle(self, recv_req: ExpertDistributionReq):
         action = recv_req.action

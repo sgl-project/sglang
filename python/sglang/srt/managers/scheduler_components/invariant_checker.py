@@ -401,8 +401,8 @@ class SchedulerInvariantChecker:
         # pool always does; with runtime P<->D role switching a prefill instance
         # may also hold a decode-flavored (pre-alloc) pool, so key off the pool
         # itself rather than the current role.
-        req_total_size = self.req_to_token_pool.size + getattr(
-            self.req_to_token_pool, "pre_alloc_size", 0
+        req_total_size = (
+            self.req_to_token_pool.size + self.req_to_token_pool.pre_alloc_size
         )
 
         session_req_count = self.pool_stats_observer.session_held_req_count()

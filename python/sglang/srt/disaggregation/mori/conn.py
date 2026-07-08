@@ -300,6 +300,8 @@ class _TransferChunk:
 
 class MoriKVManager(CommonKVManager):
     AUX_DATA_HEADER = b"AUX_DATA"
+    # Implements teardown() below, so runtime PD role switching is supported.
+    supports_role_switch = True
 
     def __init__(
         self,
@@ -330,7 +332,10 @@ class MoriKVManager(CommonKVManager):
             self._wait_poll_ms = envs.SGLANG_MORI_WAIT_POLL_MS.get()
             self._transfer_timeout_ms = envs.SGLANG_MORI_TRANSFER_TIMEOUT_MS.get()
             for shard, queue in enumerate(self._transfer_queues):
-                threading.Thread(
+                # Track the thread so teardown() can join it: otherwise every
+                # P->D->P flip that re-enters PREFILL leaks _num_shards threads
+                # (each parked forever in FastQueue.get()).
+                t = threading.Thread(
                     target=self._transfer_worker,
                     args=(queue,),
                     daemon=True,
@@ -338,7 +343,9 @@ class MoriKVManager(CommonKVManager):
                         f"mori-xfer-dp{self.system_dp_rank}-"
                         f"tp{self.attn_tp_rank}-s{shard}"
                     ),
-                ).start()
+                )
+                t.start()
+                self._worker_threads.append(t)
             self._start_bootstrap_thread()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.room_to_bootstrap_addr: Dict[int, str] = {}
@@ -437,6 +444,11 @@ class MoriKVManager(CommonKVManager):
     def _transfer_worker(self, queue: FastQueue) -> None:
         while True:
             task = queue.get()
+            # teardown() pushes a None sentinel to unblock get() and stop the
+            # worker: FastQueue.get() blocks indefinitely, so checking _stopped
+            # alone can never wake a parked worker during a role switch.
+            if task is None:
+                break
             try:
                 task.sender._run_chunk(task)
             except Exception as exc:
@@ -563,7 +575,7 @@ class MoriKVManager(CommonKVManager):
         def bootstrap_worker():
             while not self._stopped:
                 try:
-                    if not dict(poller.poll(timeout=500)):
+                    if not poller.poll(timeout=500):
                         continue
                     msg = self.server_socket.recv_multipart()
                     payload = self._validate_message(msg)
@@ -600,7 +612,7 @@ class MoriKVManager(CommonKVManager):
         def decode_worker():
             while not self._stopped:
                 try:
-                    if not dict(poller.poll(timeout=500)):
+                    if not poller.poll(timeout=500):
                         continue
                     msg = self.server_socket.recv_multipart()
                     if msg and msg[0] == MoriKVManager.AUX_DATA_HEADER:
@@ -658,26 +670,33 @@ class MoriKVManager(CommonKVManager):
 
     def teardown(self) -> None:
         """Stop worker threads and release transport resources so this
-        KVManager can be discarded during a P<->D role switch (PoC).
+        KVManager can be discarded during a P<->D role switch.
 
-        The KV cache pool memory itself is owned by the scheduler and is NOT
-        freed here; only mori-side registrations / sockets / engine are released.
+        The KV cache pool memory is owned by the scheduler and is NOT freed
+        here; only mori-side registrations / sockets / engine are released.
         """
         self._stopped = True
-        # First let the worker threads observe _stopped and exit their poll
-        # loops; only then is it safe to touch their sockets (ZMQ sockets are
-        # not thread-safe, so we must not close server_socket while a worker
-        # may still be polling it).
+        # Transfer workers (PREFILL role) park in FastQueue.get(), which has no
+        # timeout; push a None sentinel per shard to wake and stop them so the
+        # join below returns instead of leaking the thread.
+        for queue in getattr(self, "_transfer_queues", []):
+            try:
+                queue.put(None)
+            except Exception:
+                logger.exception("Failed to signal mori transfer worker on teardown")
+        # Join workers before touching their sockets: ZMQ sockets aren't
+        # thread-safe, so don't close server_socket while a worker may poll it.
         for t in self._worker_threads:
             t.join(timeout=3.0)
         self._worker_threads = []
+        # Drop the queues so their buffered tasks/senders are released too.
+        self._transfer_queues = []
         try:
             self.server_socket.close(linger=0)
         except Exception:
             logger.exception("Failed to close mori server_socket during teardown")
-        # destroy() force-closes every socket in the context (including the
-        # per-thread PUSH sockets cached in thread-locals) and then terminates.
-        # Plain term() would block forever waiting for those sockets to close.
+        # destroy() force-closes every socket in the context (incl. per-thread
+        # cached PUSH sockets); plain term() would block waiting on them.
         try:
             self._zmq_ctx.destroy(linger=0)
         except Exception:
