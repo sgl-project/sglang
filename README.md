@@ -11,8 +11,6 @@
   <img src="https://assets.trymirai.com/images/logo/ml_small_logo.svg" alt="Mirai Labs" width="64" height="64" style="width:80px;height:80px;object-fit:contain;flex:0 0 auto">
 </div>
 
-### Weaver
-
 To run it, you also need:
 
 - the Qwen3.6-27B target model;
