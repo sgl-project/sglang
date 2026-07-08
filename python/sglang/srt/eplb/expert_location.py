@@ -290,6 +290,9 @@ class ExpertLocationMetadata:
     ) -> List[int]:
         # Use CPU copy to avoid GPU→CPU sync on every call, which is expensive in update weights scenario
         cpu_map = self.logical_to_all_physical_map_cpu
+        # Draft workers can query MoE layers whose layer_id lies beyond the
+        # target-sized expert map; fall back to the identity mapping (no EPLB
+        # rebalancing for those layers) instead of indexing out of range.
         if layer_id >= cpu_map.shape[0]:
             if require_global_experts:
                 num_physical_experts = cpu_map.shape[-1]
