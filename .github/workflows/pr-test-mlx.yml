@@ -43,6 +43,7 @@ jobs:
               - ".github/workflows/pr-test-mlx.yml"
             sgl_kernel:
               - "sgl-kernel/**/!(*.md|THIRDPARTYNOTICES.txt|LICENSE)"
+              - ".github/workflows/pr-test-mlx.yml"
 
   # ==================== PR Gate ==================== #
   pr-gate:
@@ -152,10 +153,7 @@ jobs:
       - name: Run MLX e2e smoke tests
         timeout-minutes: 90
         run: |
-          uv run python -m pytest -v \
-            test/registered/mlx/models_e2e/test_qwen2_moe_mlx_correctness.py \
-            test/registered/mlx/models_e2e/test_qwen3_moe_mlx_correctness.py \
-            test/registered/unit/hardware_backend/mlx/test_mlx_reference_correctness.py
+          uv run python test/run_suite.py --hw mlx --suite stage-b-e2e-mlx
 
   pr-test-mlx-finish:
     needs:

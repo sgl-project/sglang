@@ -108,6 +108,7 @@ PER_COMMIT_SUITES = {
     ],
     HWBackend.MLX: [
         "stage-a-unit-test-mlx",
+        "stage-b-e2e-mlx",
     ],
 }
 
