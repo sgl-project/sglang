@@ -1,16 +1,19 @@
 # Construct a proof for a move commit
 
-How the author of a claimed-mechanical commit produces its proof: a runnable script that
-regenerates the commit from its base with the faithful relocation primitives and byte-diffs
-the result against it. What counts as a clean move — and each primitive's exact contract —
-is `spec-reproduction-utils.md`; how to split the change so the move commit is provable is
-`guide-split.md`; how a reviewer consumes the proof is `guide-verify-proof.md`.
+## 1. What a proof is
 
-## Auto-generate the reproduce script (primary path)
+- A runnable script that regenerates the commit from its base with the faithful relocation
+  primitives and byte-diffs the result against it.
+- The property and primitive contracts: `spec-reproduction-utils.md`. Splitting the change
+  so the move is provable: `guide-split.md`. Consuming the proof: `guide-verify-proof.md`.
+
+## 2. Auto-generate the script (primary path)
 
 `mechanical_refactor_proof_generator.py` infers the recipe from a commit's diff and
-before-state AST, then emits and runs a standalone, auditable reproduce script — no one
-hand-writes it.
+before-state AST, then emits and runs a standalone, auditable script — no one hand-writes
+it.
+
+### 2.1 Commands
 
 ```bash
 # one commit: print the inferred script and run it (non-zero exit unless PASS)
@@ -21,46 +24,49 @@ python3 .claude/skills/mechanical-refactor-verify/scripts/mechanical_refactor_pr
     <base>..<tip> --match -move: --out repro_out
 ```
 
-The range product is a self-contained folder, auditable without the skill installed:
-`repro_scripts/<sha>.py` (one script per commit), `output.log` + `output.html` (the
-verdicts), and a copy of `mechanical_refactor_reproduction_utils.py` — the scripts' only
-dependency.
+### 2.2 The range product
 
-The inference covers:
+A self-contained folder, auditable without the skill installed:
 
-- a **method moved onto an existing class** — call sites lowered (`Owner.m(recv, …)` →
-  `recv.m(…)`), the orphaned local import removed;
-- a **method moved to a module-level free function** — call sites requalified
-  (`Owner.m(…)` → `m(…)`);
-- a **free-function-source move to an existing module** — the call stays bare, callers
-  repath their import (`repath_import` for a function-scoped import; a module-level repoint is
-  realised as remove-old + add-new);
-- a **new-module extract of scattered defs** — the defs are cut from wherever they sit
-  (`extract_symbols_to_new_module`) and assembled under the audited header; a constant that
-  relocated into the header is dropped from the source. A contiguous-tail source still uses
-  `extract_to_new_module`;
-- a **source file the commit deletes** once its defs relocated (`delete_file`).
+- `repro_scripts/<sha>.py` — one script per commit;
+- `output.log` + `output.html` — the verdicts;
+- a copy of `mechanical_refactor_reproduction_utils.py` — the scripts' only dependency.
 
-The **module-level import diff is realised directly** from the target — gained names are added
-(a wholly new module's statement verbatim, so its wrapping is kept), lost names removed with
-`remove_imported_name`. A commit that also touches non-Python files infers normally; the
-non-Python diff is noted and left to the residual.
+### 2.3 What the inference covers
 
-It reports `UNSUPPORTED` — review as prepare, or hand-write the `Repro` — for:
+- **Method → existing class**: call sites lowered (`Owner.m(recv, …)` → `recv.m(…)`), the
+  orphaned local import removed.
+- **Method → module-level free function**: call sites requalified (`Owner.m(…)` → `m(…)`).
+- **Free function → existing module**: the call stays bare; callers repath their import
+  (`repath_import` when function-scoped; module-level repoints realised as remove-old +
+  add-new).
+- **New-module extract of scattered defs**: `extract_symbols_to_new_module` under the
+  audited header; a constant that relocated into the header is dropped from the source.
+  A contiguous-tail source still uses `extract_to_new_module`.
+- **A source file the commit deletes** once its defs relocated: `delete_file`.
+- **The module-level import diff**, realised directly from the target: gained names added
+  (a wholly new module's statement verbatim, wrapping kept), lost names removed with
+  `remove_imported_name`.
+- Non-Python files in the commit do not block inference; their diff is noted and left to
+  the residual.
 
-- a commit that relocates **no definition** — a rename (even a privacy flip `_foo` → `foo`)
-  or a statement-level reorder; these are reshapes that belong in prepare;
-- a **new-module extract whose symbols are not all top-level in the source** — a method still
-  inside a class; prepare must de-self it out first;
-- an **extract drawing from more than one source file** into one new module, and an
-  **inline-block extract-function** — compose `extract_function` by hand for a disciplined
-  extraction (the body must be unchanged; a de-self / restructure is a separate semantic
-  commit).
+### 2.4 What it reports `UNSUPPORTED`
 
-## Hand-write the `Repro` when inference falls short
+(Single-commit mode prints the verdict with notes and exits non-zero; range mode records
+it in the outputs.) Review as prepare, or hand-write the `Repro`:
 
-Compose the transform from the same primitives (contracts in `spec-reproduction-utils.md`
-§2); the same byte-diff then certifies it.
+- **No definition relocated** — a rename (even a privacy flip `_foo` → `foo`) or a
+  statement-level reorder; reshapes belong in prepare.
+- **A new-module extract whose symbols are not all top-level in the source** — a method
+  still inside a class; prepare must de-self it out first.
+- **An extract drawing from more than one source file**, and an **inline-block
+  extract-function** — compose `extract_function` by hand (the body must be unchanged; a
+  de-self / restructure is a separate semantic commit).
+
+## 3. Hand-write the `Repro` when inference falls short
+
+Compose the transform from the same primitives (`spec-reproduction-utils.md` §3); the same
+byte-diff then certifies it.
 
 ```python
 import sys
@@ -79,11 +85,11 @@ r.add_import("dst.py", "import gc")
 r.run()   # PASS = byte-identical; otherwise prints the residual
 ```
 
-## A hand-written transform for a non-relocation mechanical change
+## 4. A hand-written transform for a non-relocation mechanical change
 
-For a whole-file split or rename — where no single symbol relocates — write a `transform()`
-and call `verify_mechanical_refactor`; the scaffold (worktree, pre-commit on the changed
-files, diff, reporting) lives in the skill's utils.
+For a whole-file split or rename — no single symbol relocates — write a `transform()` and
+call `verify_mechanical_refactor`; the scaffold (worktree, pre-commit, diff, reporting)
+lives in the skill's utils.
 
 ```python
 import sys
@@ -110,22 +116,23 @@ if __name__ == "__main__":
     verify_mechanical_refactor(BASE_COMMIT, TARGET_COMMIT, transform)
 ```
 
-## Publish the proof with the PR
+## 5. Publish the proof with the PR
 
-Share the whole `--out` folder (a gist, a PR attachment, a repo branch) — it is
-self-contained. A generated script resolves `mechanical_refactor_reproduction_utils`
-relative to its own path, so share the folder, not one raw file (a `python3 <(curl ...)`
-process substitution breaks the relative import). Include the commands in the PR
-description:
+- Share the whole `--out` folder (a gist, a PR attachment, a repo branch) — it is
+  self-contained.
+- Share the folder, not one raw file: a generated script resolves
+  `mechanical_refactor_reproduction_utils` relative to its own path, so a
+  `python3 <(curl ...)` process substitution breaks the import.
+- Include the commands in the PR description:
 
-````markdown
-## Mechanical move — reproducible
+  ````markdown
+  ## Mechanical move — reproducible
 
-```bash
-# from the repo root, with the shared folder unpacked next to it
-python3 <folder>/repro_scripts/<sha>.py   # PASS = byte-identical to this commit
-```
-````
+  ```bash
+  # from the repo root, with the shared folder unpacked next to it
+  python3 <folder>/repro_scripts/<sha>.py   # PASS = byte-identical to this commit
+  ```
+  ````
 
-A mechanical PR contains **only** mechanical changes (moves, splits, renames, import fixes,
-formatting). Semantic changes go in a separate PR.
+- A mechanical PR contains **only** mechanical changes (moves, splits, renames, import
+  fixes, formatting). Semantic changes go in a separate PR.

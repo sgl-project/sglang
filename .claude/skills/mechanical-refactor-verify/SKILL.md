@@ -5,7 +5,7 @@ description: Make mechanical refactoring (file splits, function moves, module ex
 
 # Mechanical Refactor — Machine-Checkable Verification
 
-## Overview
+## 1. Overview
 
 The correctness of a mechanical change (file split, function move, module extraction,
 rename) must be **machine-checkable, not eyeballed**. Whoever made the change and whenever,
@@ -18,7 +18,7 @@ residual is a bundled non-move change surfaced for review. A reshape that is not
 relocation must not ride along: split the work into an optional **prepare**, the certified
 **move**, and an optional **postpare** (`guide-split.md`).
 
-## What do you want to do?
+## 2. What do you want to do?
 
 - **Split a change into commits** (extract, move, file split) → `guide-split.md`: the
   prepare + move + postpare rule, the case recipes, and the anti-patterns.
@@ -31,7 +31,7 @@ relocation must not ride along: split the work into an optional **prepare**, the
   property, the whole whitelist / not-allowed list, and each primitive's contract. The
   source of truth for the reproduction module; if any other file disagrees, it wins.
 
-## Files
+## 3. Files
 
 - [`guide-split.md`](guide-split.md) — split a change into prepare + move + postpare: the
   case recipes, what stays mechanical, and the anti-patterns.
