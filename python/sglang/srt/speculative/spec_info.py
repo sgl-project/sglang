@@ -175,6 +175,22 @@ class SpeculativeAlgorithm(Enum):
             return build_eagle_disagg_draft_input(
                 batch, server_args, last_tokens_tensor, future_map
             )
+        if self.is_dspark():
+            from sglang.srt.managers.overlap_utils import RelayPayload
+            from sglang.srt.speculative.dspark_components.dspark_draft import (
+                make_next_draft_input,
+            )
+
+            spec_info = make_next_draft_input(
+                bonus_tokens=last_tokens_tensor,
+                new_seq_lens=batch.seq_lens,
+            )
+            spec_info.future_indices = batch.req_pool_indices
+            future_map.stash(
+                spec_info.future_indices, RelayPayload(bonus_tokens=last_tokens_tensor)
+            )
+            future_map.publish(spec_info.future_indices, batch.seq_lens)
+            return spec_info
         return None
 
     def need_topk(self) -> bool:
