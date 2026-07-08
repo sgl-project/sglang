@@ -17,6 +17,7 @@ import os
 import unittest
 from typing import List, Optional
 
+from sglang.srt.utils import is_xpu
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.lora_utils import (
     ALL_OTHER_LORA_MODELS,
@@ -56,6 +57,12 @@ class TestLoRATP(CustomTestCase):
                 if not model_case.skip_long_prompt
                 else [p for p in DEFAULT_PROMPTS if len(p) < 1000]
             )
+            _backend = "csgmv"
+            _attention_backend = "fa3"
+            if is_xpu():
+                _backend = "torch_native"
+                _attention_backend = "triton" # Using triton instead of intel_xpu to avoid NaN issue
+
             for tp_size in tp_list:
                 model_case.tp_size = tp_size
                 for torch_dtype in TORCH_DTYPES:
@@ -66,7 +73,8 @@ class TestLoRATP(CustomTestCase):
                         max_new_tokens=32,
                         enable_lora_overlap_loading=enable_lora_overlap_loading,
                         test_tag=f"tp={tp_size}, enable_lora_overlap_loading={enable_lora_overlap_loading}",
-                        attention_backend="fa3",
+                        backend=_backend,
+                        attention_backend=_attention_backend,
                     )
 
     def test_ci_lora_models(self):
