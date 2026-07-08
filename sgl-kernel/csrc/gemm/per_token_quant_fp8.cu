@@ -96,7 +96,7 @@ __global__ void per_token_quant_fp8_kernel(
       input_vec.cast_load(token_input + i * kVecSize);
     }
 
-    DST_DTYPE output_arr[kVecSize];
+    alignas(sizeof(DST_DTYPE) * kVecSize) DST_DTYPE output_arr[kVecSize];
 #pragma unroll
     for (uint32_t j = 0; j < kVecSize; ++j) {
       float val = static_cast<float>(input_vec[j]) * scale_inv;
@@ -174,7 +174,7 @@ __global__ void per_token_quant_fp8_small_batch_kernel(
     vec_t input_vec;
     input_vec.cast_load(token_input + i * kVecSize);
 
-    DST_DTYPE output_arr[kVecSize];
+    alignas(sizeof(DST_DTYPE) * kVecSize) DST_DTYPE output_arr[kVecSize];
 #pragma unroll
     for (uint32_t j = 0; j < kVecSize; ++j) {
       float val = fmaxf(fminf(static_cast<float>(input_vec[j]) * scale_inv, FP8_E4M3_MAX), -FP8_E4M3_MAX);
