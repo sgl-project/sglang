@@ -65,6 +65,34 @@ def _overlap_transform(
 
 class CompressorAscendBackendMixin(CompressorBackendMixin):
 
+    @staticmethod
+    def _to_cpu_int_list(values) -> Optional[list[int]]:
+        if values is None:
+            return None
+        if isinstance(values, torch.Tensor):
+            values = values.cpu().tolist()
+        return [int(v) for v in values]
+
+    def _extend_prefix_lens_cpu(
+        self, forward_batch: ForwardBatch
+    ) -> Optional[list[int]]:
+        prefix_lens = self._to_cpu_int_list(
+            getattr(forward_batch, "extend_prefix_lens_cpu", None)
+        )
+        if prefix_lens is not None:
+            return prefix_lens
+
+        seq_lens = self._to_cpu_int_list(getattr(forward_batch, "seq_lens_cpu", None))
+        extend_lens = self._to_cpu_int_list(
+            getattr(forward_batch, "extend_seq_lens_cpu", None)
+        )
+        if seq_lens is None or extend_lens is None or len(seq_lens) != len(extend_lens):
+            return None
+        return [
+            max(0, seq_len - extend_len)
+            for seq_len, extend_len in zip(seq_lens, extend_lens)
+        ]
+
     def _build_npu_compress_metadata(self, forward_batch: ForwardBatch) -> None:
         fm = self.forward_metadata
         is_decode = forward_batch.forward_mode.is_decode()
@@ -115,7 +143,7 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
         cu = fm.actual_seq_lengths_q_pa
 
         cu_cpu = cu.cpu().tolist()
-        prefix_cpu = forward_batch.extend_prefix_lens_cpu
+        prefix_cpu = self._extend_prefix_lens_cpu(forward_batch)
         ratio_lists: dict = {
             r: [] for r in self._dsv4_unique_compress_ratios if r in (4, 128)
         }
@@ -124,7 +152,11 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
             end = int(cu_cpu[idx + 1])
             if end == start:
                 continue
-            prefix = int(prefix_cpu[idx])
+            prefix = (
+                int(prefix_cpu[idx])
+                if prefix_cpu is not None and idx < len(prefix_cpu)
+                else 0
+            )
             total = prefix + (end - start)
             for ratio in ratio_lists:
                 first_k = prefix // ratio
@@ -156,6 +188,12 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
         if forward_batch.extend_prefix_lens is not None:
             fm.start_pos = forward_batch.extend_prefix_lens.to(
                 device=device, dtype=torch.int32
+            )
+        elif prefix_cpu is not None:
+            fm.start_pos = torch.tensor(
+                prefix_cpu[:bs] + [0] * max(0, bs - len(prefix_cpu)),
+                dtype=torch.int32,
+                device=device,
             )
         else:
             fm.start_pos = torch.zeros(bs, dtype=torch.int32, device=device)
@@ -354,7 +392,11 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
         )
 
         cos, sin = get_fused_compressor_rope_cos_sin(
-            compressor.freqs_cis, positions_cmp, dtype=torch.float32
+            compressor.freqs_cis,
+            positions_cmp,
+            dtype=torch.float32,
+            cache_owner=getattr(compressor, "rotary_emb", None),
+            allow_build=False,
         )
 
         cmp_kv = torch.ops.custom.compressor(
@@ -434,7 +476,7 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
         score_full = F.linear(x_f32, W[coff * d :])  # [T, coff*d]
 
         seq_lens_cpu = forward_batch.seq_lens_cpu
-        extend_prefix_lens_cpu = forward_batch.extend_prefix_lens_cpu
+        extend_prefix_lens_cpu = self._extend_prefix_lens_cpu(forward_batch)
         is_prefill = forward_batch.forward_mode.is_prefill()
         token_to_kv_pool = self.token_to_kv_pool
         backend_fm = self.forward_metadata
@@ -538,7 +580,7 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
                 kv = kv_full[seqlen_offset : seqlen_offset + seqlen]
                 score = score_full[seqlen_offset : seqlen_offset + seqlen]
 
-                if overlap and cutoff >= ratio:
+                if overlap and should_compress:
                     # Stash the trailing ratio tokens of the cutoff so the next
                     # decode step can do overlap compression across the boundary
                     # (for ratio=4 this window is inside the state alloc range).
@@ -671,28 +713,19 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
             kv_out = torch.cat(kv_out_list, dim=0).to(dtype)
             pos_out = torch.cat(kv_out_positions, dim=0)
             kv_out = compressor.norm(kv_out)
-            # npu_rotary_mul wants cos/sin in repeat_interleave(2) layout, reshaped
-            # to (T, 1, 1, rope_dim); cos=real, sin=imag of the complex freqs_cis.
             rope_dim = compressor.rope_head_dim
-            # Use the same contig cache as the outer rope path; .real/.imag on a
-            # complex tensor are strided views and aclnnIndex over them triggers
-            # StridedSlice (see _get_contig_freqs_real_imag in deepseek_v4_rope.py).
             from sglang.kernels.ops.attention.deepseek_v4_rope import (
-                _get_contig_freqs_real_imag,
+                get_npu_interleaved_rope_cos_sin,
             )
 
-            freqs_real, freqs_imag = _get_contig_freqs_real_imag(compressor.freqs_cis)
-            cos_half = freqs_real[pos_out].to(kv_out.dtype)
-            sin_half = freqs_imag[pos_out].to(kv_out.dtype)
-            cos = (
-                cos_half.repeat_interleave(2, dim=-1)
-                .view(-1, 1, 1, rope_dim)
-                .contiguous()
-            )
-            sin = (
-                sin_half.repeat_interleave(2, dim=-1)
-                .view(-1, 1, 1, rope_dim)
-                .contiguous()
+            cos, sin = get_npu_interleaved_rope_cos_sin(
+                getattr(compressor, "rotary_emb", None),
+                compressor.freqs_cis,
+                pos_out,
+                kv_out.dtype,
+                view_4d=True,
+                allow_build=False,
+                cache_dtype=torch.float32,
             )
             rope_slice = kv_out[..., -rope_dim:]
             rope_view = rope_slice.unsqueeze(-2).unsqueeze(1)  # (T, 1, 1, rope_dim)
@@ -918,16 +951,33 @@ class C4IndexerAscendBackendMixin(C4IndexerBackendMixin):
     def _compute_q_npu(
         self, c4_indexer, q_lora: torch.Tensor, positions: torch.Tensor
     ) -> torch.Tensor:
-        from sglang.kernels.ops.attention.deepseek_v4_rope import v4_rope_inplace_npu
+        from sglang.kernels.ops.attention.deepseek_v4_rope import (
+            get_npu_interleaved_rope_cos_sin,
+            npu_partial_rotary_mul_inplace,
+        )
 
         bs = q_lora.shape[0]
         q, _ = c4_indexer.wq_b(q_lora)
         q = q.view(bs, c4_indexer.n_local_heads, c4_indexer.head_dim)
-        v4_rope_inplace_npu(
-            q[..., -c4_indexer.rope_head_dim :],
-            None,
+        qk_nope = c4_indexer.head_dim - c4_indexer.rope_head_dim
+        # Position-gathered RoPE values are forward-local.  The rotary embedding
+        # object is shared, so retaining them there can leak target positions into
+        # NextN (or a previous graph replay) when the next batch has the same shape.
+        cos4, sin4 = get_npu_interleaved_rope_cos_sin(
+            c4_indexer.rotary_emb,
             c4_indexer.freqs_cis,
             positions,
+            q.dtype,
+            view_4d=True,
+            allow_build=False,
+            cache_dtype=torch.float32,
+        )
+        npu_partial_rotary_mul_inplace(
+            q,
+            None,
+            cos4,
+            sin4,
+            qk_nope=qk_nope,
         )
         return _apply_hadamard(q, c4_indexer.hadamard_matrix)
 

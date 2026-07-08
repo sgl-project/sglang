@@ -30,7 +30,9 @@ from sglang.jit_kernel.dsv4 import (
     sglang_per_token_group_quant_fp8_dsv4_wo_a,
 )
 from sglang.kernels.ops.attention.deepseek_v4_rope import (
-    v4_rope_inplace_npu,
+    ensure_npu_interleaved_rope_cache,
+    get_npu_interleaved_rope_cos_sin,
+    npu_partial_rotary_mul_inplace,
 )
 from sglang.kernels.ops.quantization.fp8_kernel import (
     sglang_per_token_group_quant_fp8,
@@ -578,6 +580,11 @@ class MQALayer(MqaAttentionBase):
             device=get_server_args().device,
         )
 
+        if _is_npu:
+            ensure_npu_interleaved_rope_cache(
+                self.rotary_emb, self.freqs_cis, torch.float32
+            )
+
         if _is_hip:
             cos_cache = (
                 self.freqs_cis.real.to(torch.bfloat16).unsqueeze(-2).unsqueeze(-2)
@@ -641,6 +648,25 @@ class MQALayer(MqaAttentionBase):
         # KV cache write is always fused into the K kernel
         # (`_compute_kv_to_cache`), so the legacy "overlap store cache" flag
         # has no effect here -- the fused path is on by default.
+
+    def _get_npu_rope_position_cache(
+        self, positions: torch.Tensor, dtype: torch.dtype, inverse: bool = False
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # ``rotary_emb`` is shared by layers with the same RoPE configuration and
+        # can also be shared by the target and NextN models.  Only cache the
+        # immutable full table on it.  A position-gathered tensor is specific to
+        # this forward and reusing it based on shape alone gives MTP decode the
+        # previous step's RoPE values when positions change but batch size does not.
+        return get_npu_interleaved_rope_cos_sin(
+            self.rotary_emb,
+            self.freqs_cis,
+            positions,
+            dtype,
+            view_4d=True,
+            inverse=inverse,
+            allow_build=False,
+            cache_dtype=torch.float32,
+        )
 
     def _compute_q_a(
         self,
@@ -1006,11 +1032,15 @@ class MQALayer(MqaAttentionBase):
                 kv, _ = self.wkv(x)
             kv = self.kv_norm(kv)
 
-            v4_rope_inplace_npu(
-                q[..., -self.qk_rope_head_dim :],
-                kv[..., -self.qk_rope_head_dim :].unsqueeze(1),
-                self.freqs_cis,
-                positions,
+            cos4, sin4 = self._get_npu_rope_position_cache(
+                positions, q.dtype, inverse=False
+            )
+            npu_partial_rotary_mul_inplace(
+                q,
+                kv.unsqueeze(1),
+                cos4,
+                sin4,
+                qk_nope=self.qk_nope_head_dim,
             )
             attn_backend.store_cache(
                 layer_id=self.layer_id,
@@ -1215,12 +1245,15 @@ class MQALayer(MqaAttentionBase):
                 )
             o = o[:, tp_slice, :]
         if _is_npu:
-            v4_rope_inplace_npu(
-                o[..., -self.qk_rope_head_dim :],
+            cos4, sin4 = self._get_npu_rope_position_cache(
+                positions, o.dtype, inverse=True
+            )
+            npu_partial_rotary_mul_inplace(
+                o,
                 None,
-                self.freqs_cis,
-                positions,
-                inverse=True,
+                cos4,
+                sin4,
+                qk_nope=self.qk_nope_head_dim,
             )
         else:
             fused_rope_inplace(
@@ -2297,7 +2330,6 @@ class DeepseekV4Model(nn.Module):
         for _attr in ("freqs_cis_c4", "freqs_cis_c128"):
             if hasattr(forward_batch, _attr):
                 delattr(forward_batch, _attr)
-
         capture_dspark = self.dspark_layers_to_capture is not None
         if capture_dspark and dsa_use_prefill_cp(forward_batch):
             raise NotImplementedError(

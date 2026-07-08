@@ -654,6 +654,9 @@ def fused_norm_rope_inplace_triton(
 # Cache contiguous real/imag halves of each freqs_cis (its .real/.imag are
 # strided views, stride=2 on the interleaved layout), keyed by id.
 _NPU_ROPE_CONTIG_CACHE: dict[int, tuple] = {}
+_NPU_INTERLEAVED_ROPE_CACHE: dict[
+    tuple[int, torch.dtype, torch.device], tuple[torch.Tensor, torch.Tensor]
+] = {}
 
 
 def _get_contig_freqs_real_imag(
@@ -678,10 +681,152 @@ def _get_contig_freqs_real_imag(
     return cached
 
 
+def _npu_rope_dtype_suffix(dtype: torch.dtype) -> str:
+    return str(dtype).replace("torch.", "").replace(".", "_")
+
+
+def _register_or_set_buffer(cache_owner, name: str, tensor: torch.Tensor) -> None:
+    if hasattr(cache_owner, "register_buffer"):
+        buffers = getattr(cache_owner, "_buffers", {})
+        if name in buffers:
+            setattr(cache_owner, name, tensor)
+        else:
+            cache_owner.register_buffer(name, tensor, persistent=False)
+    else:
+        setattr(cache_owner, name, tensor)
+
+
+def ensure_npu_interleaved_rope_cache(
+    cache_owner,
+    freqs_cis: torch.Tensor,
+    dtype: torch.dtype,
+    *,
+    allow_build: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return full interleaved NPU RoPE cos/sin tables for ``freqs_cis``.
+
+    The returned tensors have shape ``[max_pos, rope_dim]`` and layout
+    ``[c0, c0, c1, c1, ...]`` / ``[s0, s0, s1, s1, ...]``. They are derived
+    from ``freqs_cis`` once per owner/dtype so decode-time position gathers do
+    not pay ``repeat_interleave`` every layer.
+    """
+    suffix = _npu_rope_dtype_suffix(dtype)
+    cos_name = f"_npu_interleaved_rope_cos_cache_{suffix}"
+    sin_name = f"_npu_interleaved_rope_sin_cache_{suffix}"
+    expected_shape = (freqs_cis.shape[0], freqs_cis.shape[1] * 2)
+
+    if cache_owner is not None:
+        cos = getattr(cache_owner, cos_name, None)
+        sin = getattr(cache_owner, sin_name, None)
+        if (
+            cos is not None
+            and sin is not None
+            and tuple(cos.shape) == expected_shape
+            and tuple(sin.shape) == expected_shape
+            and cos.dtype == dtype
+            and sin.dtype == dtype
+            and cos.device == freqs_cis.device
+            and sin.device == freqs_cis.device
+        ):
+            return cos, sin
+    else:
+        cache_key = (id(freqs_cis), dtype, freqs_cis.device)
+        cached = _NPU_INTERLEAVED_ROPE_CACHE.get(cache_key)
+        if cached is not None:
+            cos, sin = cached
+            if (
+                tuple(cos.shape) == expected_shape
+                and tuple(sin.shape) == expected_shape
+            ):
+                return cached
+
+    if not allow_build:
+        raise RuntimeError(
+            "NPU interleaved RoPE cache is missing in a no-build path. "
+            "Initialize it before forward to keep decode free of repeat_interleave."
+        )
+
+    real_contig, imag_contig = _get_contig_freqs_real_imag(freqs_cis)
+    cos = real_contig.repeat_interleave(2, dim=-1).to(dtype=dtype).contiguous()
+    sin = imag_contig.repeat_interleave(2, dim=-1).to(dtype=dtype).contiguous()
+
+    if cache_owner is not None:
+        _register_or_set_buffer(cache_owner, cos_name, cos)
+        _register_or_set_buffer(cache_owner, sin_name, sin)
+    else:
+        _NPU_INTERLEAVED_ROPE_CACHE[(id(freqs_cis), dtype, freqs_cis.device)] = (
+            cos,
+            sin,
+        )
+    return cos, sin
+
+
+def get_npu_interleaved_rope_cos_sin(
+    cache_owner,
+    freqs_cis: torch.Tensor,
+    positions: torch.Tensor,
+    dtype: torch.dtype,
+    *,
+    view_4d: bool = False,
+    inverse: bool = False,
+    allow_build: bool = True,
+    cache_dtype: Optional[torch.dtype] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Gather NPU interleaved RoPE cos/sin by position from cached tables."""
+    cache_dtype = dtype if cache_dtype is None else cache_dtype
+    cos_cache, sin_cache = ensure_npu_interleaved_rope_cache(
+        cache_owner, freqs_cis, cache_dtype, allow_build=allow_build
+    )
+    cos = cos_cache.index_select(0, positions)
+    sin = sin_cache.index_select(0, positions)
+    if inverse:
+        sin = -sin
+    if cos.dtype != dtype:
+        cos = cos.to(dtype)
+        sin = sin.to(dtype)
+    if view_4d:
+        rope_dim = cos.shape[-1]
+        cos = cos.view(-1, 1, 1, rope_dim)
+        sin = sin.view(-1, 1, 1, rope_dim)
+    return cos, sin
+
+
+def npu_partial_rotary_mul_inplace(
+    q_rope: torch.Tensor,
+    kv_rope: Optional[torch.Tensor],
+    cos4: torch.Tensor,
+    sin4: torch.Tensor,
+    qk_nope: int = 0,
+) -> None:
+    """Apply Ascend custom partial interleaved RoPE using pre-gathered caches."""
+    rope_dim = cos4.shape[-1]
+    torch.ops.custom.inplace_partial_rotary_mul(
+        q_rope.unsqueeze(1),
+        cos4,
+        sin4,
+        rotary_mode="interleave",
+        partial_slice=[qk_nope, qk_nope + rope_dim],
+    )
+    if kv_rope is not None:
+        if kv_rope.dim() == 3:
+            kv_view = kv_rope.unsqueeze(1)
+        else:
+            kv_view = kv_rope.view(-1, 1, 1, rope_dim)
+        torch.ops.custom.inplace_partial_rotary_mul(
+            kv_view,
+            cos4,
+            sin4,
+            rotary_mode="interleave",
+            partial_slice=[qk_nope, qk_nope + rope_dim],
+        )
+
+
 def get_fused_compressor_rope_cos_sin(
     freqs_cis: torch.Tensor,
     positions_cmp: torch.Tensor,
     dtype: torch.dtype,
+    cache_owner=None,
+    allow_build: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Build (cos, sin) tensors shaped ``[T, rope_head_dim]`` for the fused
     compressor op (``torch.ops.custom.compressor``).
@@ -693,18 +838,17 @@ def get_fused_compressor_rope_cos_sin(
     (matches dsv4_release ``ComplexExpRotaryEmbedding.cos_cache``, which
     is built as ``complex_cache.real.repeat_interleave(2, dim=-1)``).
 
-    Safe to call from inside a captured aclgraph: both ``index_select`` and
-    ``repeat_interleave`` over a graph-input ``positions_cmp`` of fixed
-    capture-time shape produce static-shape outputs. Identical to what the
-    existing inplace_partial_rotary_mul fallback does at
-    :func:`v4_rope_inplace_npu`, just without the inverse / 4D-view step.
+    Safe to call from inside a captured aclgraph: the per-call work is only a
+    static-shape ``index_select`` from the pre-expanded cache.
     """
-    real_contig, imag_contig = _get_contig_freqs_real_imag(freqs_cis)
-    cos_half = real_contig.index_select(0, positions_cmp)
-    sin_half = imag_contig.index_select(0, positions_cmp)
-    cos = cos_half.repeat_interleave(2, dim=-1).to(dtype)
-    sin = sin_half.repeat_interleave(2, dim=-1).to(dtype)
-    return cos, sin
+    return get_npu_interleaved_rope_cos_sin(
+        cache_owner,
+        freqs_cis,
+        positions_cmp,
+        dtype,
+        view_4d=False,
+        allow_build=allow_build,
+    )
 
 
 def v4_rope_inplace_npu(
@@ -712,6 +856,7 @@ def v4_rope_inplace_npu(
     kv_rope: Optional[torch.Tensor],
     freqs_cis: torch.Tensor,
     positions: torch.Tensor,
+    qk_nope: int = 0,
     inverse: bool = False,
 ) -> None:
     """In-place interleaved RoPE for V4 — torch fallback used on NPU.
@@ -735,37 +880,8 @@ def v4_rope_inplace_npu(
     """
     # Build cos/sin caches in the kernel's expected (T, 1, 1, rope_dim) layout,
     # each freq value repeated twice for the interleaved pairing convention.
-    freqs_real_contig, freqs_imag_contig = _get_contig_freqs_real_imag(freqs_cis)
-    cos_half = freqs_real_contig[positions]  # (T, rope_dim/2)
-    sin_half = freqs_imag_contig[positions]
-    if inverse:
-        sin_half = -sin_half
-    cos_full = cos_half.repeat_interleave(2, dim=-1).to(q_rope.dtype)
-    sin_full = sin_half.repeat_interleave(2, dim=-1).to(q_rope.dtype)
-    rope_dim = cos_full.shape[-1]
-    # repeat_interleave produces a contiguous tensor, so the .view()
-    # below already returns a contiguous result — no .contiguous() needed.
-    cos4 = cos_full.view(-1, 1, 1, rope_dim)
-    sin4 = sin_full.view(-1, 1, 1, rope_dim)
-    # q_rope: (T, n_heads, rope_dim) → (T, 1, n_heads, rope_dim) view
-    # kv_rope: (T, 1, rope_dim) → (T, 1, 1, rope_dim) view
-    q_view = q_rope.unsqueeze(1)
-    torch.ops.custom.inplace_partial_rotary_mul(
-        q_view,
-        cos4,
-        sin4,
-        rotary_mode="interleave",
-        partial_slice=[0, rope_dim],
+    cos4, sin4 = get_npu_interleaved_rope_cos_sin(
+        None, freqs_cis, positions, q_rope.dtype, view_4d=True, inverse=inverse
     )
-    if kv_rope is not None:
-        if kv_rope.dim() == 3:
-            kv_view = kv_rope.unsqueeze(1)
-        else:
-            kv_view = kv_rope.view(-1, 1, 1, rope_dim)
-        torch.ops.custom.inplace_partial_rotary_mul(
-            kv_view,
-            cos4,
-            sin4,
-            rotary_mode="interleave",
-            partial_slice=[0, rope_dim],
-        )
+    npu_partial_rotary_mul_inplace(q_rope, kv_rope, cos4, sin4, qk_nope=qk_nope)
+    return
