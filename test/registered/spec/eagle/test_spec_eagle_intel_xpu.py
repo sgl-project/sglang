@@ -8,9 +8,9 @@ from sglang.test.kits.matched_stop_kit import MatchedStopMixin
 from sglang.test.kits.spec_server_kits import (
     SpecAccuracyKit,
     SpecFeatureKit,
+    SpecHiddenStatesKit,
     SpecLogprobKit,
     SpecPenaltyKit,
-    SpecHiddenStatesKit
 )
 from sglang.test.server_fixtures.spec_eagle_fixture import Eagle3Base, EagleLlama2Base
 

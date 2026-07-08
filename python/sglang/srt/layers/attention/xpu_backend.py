@@ -1100,9 +1100,9 @@ class XPUAttentionBackend(AttentionBackend):
         # buffers here don't carry, so reject it explicitly.
         is_verify = forward_mode.is_target_verify()
         is_draft_decode = forward_mode.is_decode_or_idle() and spec_info is not None
-        assert forward_mode.is_decode_or_idle() or is_verify, (
-            "XPUAttentionBackend XPU graph only supports decode / target-verify modes"
-        )
+        assert (
+            forward_mode.is_decode_or_idle() or is_verify
+        ), "XPUAttentionBackend XPU graph only supports decode / target-verify modes"
         assert not (
             (is_verify or is_draft_decode) and self.topk > 1
         ), "XPUAttentionBackend XPU graph spec decoding supports topk <= 1 only"
@@ -1437,7 +1437,9 @@ class XPUMultiStepDraftBackend:
             encoder_lens=forward_batch.encoder_lens,
         )
         for attn_backend in self.attn_backends:
-            attn_backend.init_forward_metadata_out_graph(inner_fb, in_capture=in_capture)
+            attn_backend.init_forward_metadata_out_graph(
+                inner_fb, in_capture=in_capture
+            )
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
         for attn_backend in self.attn_backends:
