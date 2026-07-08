@@ -29,6 +29,7 @@ import gc
 import logging
 import os
 import pickle
+import warnings
 import weakref
 from collections import namedtuple
 from contextlib import contextmanager, nullcontext
@@ -1721,13 +1722,35 @@ def get_attn_cp_group() -> GroupCoordinator:
     return _ATTN_CP
 
 
+def _warn_deprecated_dcp_parallel_state(name: str, replacement: str) -> None:
+    warnings.warn(
+        f"{name} is deprecated; use {replacement} instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+
+
+def _get_dcp_group_no_assert() -> Optional[GroupCoordinator]:
+    return _DCP
+
+
 def get_dcp_group_no_assert() -> Optional[GroupCoordinator]:
+    """Deprecated: use ``get_parallel().dcp_enabled`` or ``get_parallel().dcp_group``."""
+    _warn_deprecated_dcp_parallel_state(
+        "get_dcp_group_no_assert()", "get_parallel().dcp_enabled"
+    )
+    return _get_dcp_group_no_assert()
+
+
+def _get_dcp_group() -> GroupCoordinator:
+    assert _DCP is not None, "decode context parallel group is not initialized"
     return _DCP
 
 
 def get_dcp_group() -> GroupCoordinator:
-    assert _DCP is not None, "decode context parallel group is not initialized"
-    return _DCP
+    """Deprecated: use ``get_parallel().dcp_group``."""
+    _warn_deprecated_dcp_parallel_state("get_dcp_group()", "get_parallel().dcp_group")
+    return _get_dcp_group()
 
 
 _MOE_DP: Optional[GroupCoordinator] = None
@@ -2397,7 +2420,7 @@ def ensure_model_parallel_initialized(
         f"{pipeline_model_parallel_size=}"
     )
     if decode_context_parallel_size > 1:
-        dcp_world_size = get_dcp_group().world_size
+        dcp_world_size = _get_dcp_group().world_size
         assert (
             dcp_world_size == decode_context_parallel_size
         ), f"decode context parallel group already initialized, but of unexpected size: {dcp_world_size=} {decode_context_parallel_size=}"
@@ -2451,12 +2474,26 @@ def get_tensor_model_parallel_world_size():
     return get_tp_group().world_size
 
 
+def _get_dcp_world_size():
+    return _get_dcp_group().world_size
+
+
 def get_dcp_world_size():
-    return get_dcp_group().world_size
+    """Deprecated: use ``get_parallel().dcp_size``."""
+    _warn_deprecated_dcp_parallel_state(
+        "get_dcp_world_size()", "get_parallel().dcp_size"
+    )
+    return _get_dcp_world_size()
+
+
+def _get_dcp_rank():
+    return _get_dcp_group().rank_in_group
 
 
 def get_dcp_rank():
-    return get_dcp_group().rank_in_group
+    """Deprecated: use ``get_parallel().dcp_rank``."""
+    _warn_deprecated_dcp_parallel_state("get_dcp_rank()", "get_parallel().dcp_rank")
+    return _get_dcp_rank()
 
 
 def get_tensor_model_parallel_rank():

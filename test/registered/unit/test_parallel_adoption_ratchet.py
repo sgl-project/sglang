@@ -8,9 +8,9 @@ test primitive. Direct calls to the ``parallel_state`` size/rank getters in
 these directories are regressions against that sweep.
 
 Exemptions, pinned by path: ``layers/dp_attention.py`` is delegation
-substrate (the wrapper's attn-DP dims delegate TO it), and ``layers/dcp/``
-is the DCP subsystem's own plumbing, booked for a follow-up sweep. Sweeping
-an exempt path must remove it from the pin.
+substrate (the wrapper's attn-DP dims delegate TO it), while
+``layers/dcp/comm.py`` retains deprecated DCP compatibility shims for
+out-of-tree callers. Sweeping an exempt path must remove it from the pin.
 """
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -27,7 +27,7 @@ from sglang.test.test_utils import CustomTestCase
 _SRT_ROOT = Path(next(iter(sglang.srt.__path__)))
 
 _BANNED_CALLS = re.compile(
-    r"\bget_(?:"
+    r"\b(?:dcp_enabled|get_(?:"
     r"tensor_model_parallel_(?:world_size|rank)"
     r"|pipeline_model_parallel_(?:world_size|rank)"
     r"|moe_expert_parallel_(?:world_size|rank)"
@@ -36,8 +36,10 @@ _BANNED_CALLS = re.compile(
     r"|attn_tensor_model_parallel_(?:world_size|rank)"
     r"|attn_context_model_parallel_(?:world_size|rank)"
     r"|dcp_(?:world_size|rank)"
+    r"|dcp_group(?:_no_assert)?"
+    r"|attention_dcp_(?:world_size|rank)"
     r"|attention_(?:tp|cp)_(?:group|rank|size)"
-    r")\(\)"
+    r"))\(\)"
 )
 
 # The whole package is swept; the exemptions are the substrate itself.
@@ -46,6 +48,7 @@ _SWEPT_DIRS = ("",)
 _EXEMPT = (
     "distributed/",  # parallel_state: defines the canonical getters
     "layers/dp_attention.py",  # delegation substrate for the attn-DP dims
+    "layers/dcp/comm.py",  # deprecated out-of-tree DCP compatibility shims
     # The dumper's megatron plugin calls third-party getters that share the
     # parallel_state names (self._mpu.get_tensor_model_parallel_rank()).
     "debug_utils/dumper.py",
