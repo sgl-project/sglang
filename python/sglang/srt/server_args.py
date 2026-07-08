@@ -232,7 +232,7 @@ FP4_GEMM_RUNNER_BACKEND_CHOICES = [
     "flashinfer_trtllm",
 ]
 
-RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru", "priority"]
+RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru", "priority", "qos-hotprefix"]
 
 RL_ON_POLICY_TARGET_CHOICES = ["fsdp"]
 
@@ -4902,6 +4902,7 @@ class ServerArgs:
                 "random",
                 "fcfs",
                 "dfs-weight",
+                "qos-lpm",
                 "lof",
                 "priority",
                 "routing-key",
@@ -4978,7 +4979,12 @@ class ServerArgs:
             type=str,
             choices=RADIX_EVICTION_POLICY_CHOICES,
             default=ServerArgs.radix_eviction_policy,
-            help="The eviction policy of radix trees. 'lru' stands for Least Recently Used, 'lfu' stands for Least Frequently Used, 'slru' stands for Segmented Least Recently Used, and 'priority' evicts lower-priority requests first.",
+            help=(
+                "The eviction policy of radix trees. 'lru' stands for Least Recently Used, "
+                "'lfu' stands for Least Frequently Used, 'slru' stands for Segmented "
+                "Least Recently Used, 'priority' evicts lower-priority requests first, "
+                "and 'qos-hotprefix' evicts low hotness/QoS prefixes first."
+            ),
         )
         parser.add_argument(
             "--enable-prefill-delayer",
@@ -7328,7 +7334,11 @@ class ServerArgs:
             assert self.schedule_policy in [
                 "fcfs",
                 "lof",
-            ], f"To use priority scheduling, schedule_policy must be 'fcfs' or 'lof'. '{self.schedule_policy}' is not supported."
+                "qos-lpm",
+            ], (
+                "To use priority scheduling, schedule_policy must be 'fcfs', "
+                f"'lof', or 'qos-lpm'. '{self.schedule_policy}' is not supported."
+            )
             if self.default_priority_value is None:
                 logger.warning(
                     "--default-priority-value is not set while --enable-priority-scheduling is enabled. "

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Tuple, Union
 
@@ -44,6 +45,18 @@ class PriorityStrategy(EvictionStrategy):
     def get_priority(self, node: "TreeNode") -> Tuple[int, float]:
         # Return (priority, last_access_time) so lower priority nodes are evicted first
         return (node.priority, node.last_access_time)
+
+
+class QoSHotPrefixStrategy(EvictionStrategy):
+    """HotPrefix-lite eviction weighted by request QoS priority."""
+
+    def get_priority(self, node: "TreeNode") -> Tuple[float, float]:
+        prefix_len = max(len(node.key), 1)
+        age = max(time.monotonic() - node.last_access_time, 0.0)
+        recency_bonus = 1.0 / (1.0 + age)
+        hotness = node.hit_count + recency_bonus / prefix_len
+        qos_weight = max(node.priority, 1)
+        return (hotness * qos_weight, node.last_access_time)
 
 
 class SLRUStrategy(EvictionStrategy):

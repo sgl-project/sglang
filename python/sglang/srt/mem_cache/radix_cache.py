@@ -55,6 +55,7 @@ from sglang.srt.mem_cache.evict_policy import (
     LRUStrategy,
     MRUStrategy,
     PriorityStrategy,
+    QoSHotPrefixStrategy,
     SLRUStrategy,
 )
 from sglang.srt.mem_cache.utils import split_node_hash_value
@@ -303,12 +304,16 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             self.eviction_strategy: EvictionStrategy = FILOStrategy()
         elif self.eviction_policy == "priority":
             self.eviction_strategy: EvictionStrategy = PriorityStrategy()
+        elif self.eviction_policy == "qos-hotprefix":
+            self.eviction_strategy: EvictionStrategy = QoSHotPrefixStrategy()
         elif self.eviction_policy == "slru":
             self.eviction_strategy: EvictionStrategy = SLRUStrategy()
 
         else:
             raise ValueError(
-                f"Unknown eviction policy: {self.eviction_policy}. Supported policies: 'lru', 'lfu', 'fifo', 'mru', 'filo', 'priority', 'slru'."
+                f"Unknown eviction policy: {self.eviction_policy}. Supported policies: "
+                "'lru', 'lfu', 'fifo', 'mru', 'filo', 'priority', "
+                "'qos-hotprefix', 'slru'."
             )
 
         self.evictable_leaves = set()
@@ -321,6 +326,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         mock_allocator: Optional[Any] = None,
         page_size: int = 1,
         enable_kv_cache_events: bool = False,
+        eviction_policy: str = "lru",
     ) -> RadixCache:
         """Init a radix cache without memory pools for simulation purpose."""
         params = CacheInitParams(
@@ -329,6 +335,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             token_to_kv_pool_allocator=mock_allocator,
             page_size=page_size,
             enable_kv_cache_events=enable_kv_cache_events,
+            eviction_policy=eviction_policy,
         )
         return RadixCache(params)
 
@@ -655,10 +662,12 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             prefix_len = child.key.match(key, page_size=self.page_size)
             if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
+                self._inc_qos_hotprefix_hit_count(new_node)
                 value.append(new_node.value)
                 node = new_node
                 break
             else:
+                self._inc_qos_hotprefix_hit_count(child)
                 value.append(child.value)
                 node = child
                 key = key[prefix_len:]
@@ -697,6 +706,10 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         if chunked:
             return
         node.hit_count += 1
+
+    def _inc_qos_hotprefix_hit_count(self, node: TreeNode):
+        if self.eviction_policy == "qos-hotprefix":
+            node.hit_count += 1
 
     def _insert_helper(
         self,

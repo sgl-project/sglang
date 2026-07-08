@@ -126,6 +126,7 @@ class CacheAwarePolicy(Enum):
 
     LPM = "lpm"  # longest prefix match
     DFS_WEIGHT = "dfs-weight"  # depth-first search weighting
+    QOS_LPM = "qos-lpm"  # QoS priority, then longest prefix match
 
 
 class CacheAgnosticPolicy(Enum):
@@ -178,6 +179,10 @@ class SchedulePolicy:
             )
             if policy == CacheAwarePolicy.LPM:
                 SchedulePolicy._sort_by_longest_prefix(
+                    waiting_queue, temporary_deprioritized
+                )
+            elif policy == CacheAwarePolicy.QOS_LPM:
+                SchedulePolicy._sort_by_qos_longest_prefix(
                     waiting_queue, temporary_deprioritized
                 )
             elif policy == CacheAwarePolicy.DFS_WEIGHT:
@@ -286,6 +291,27 @@ class SchedulePolicy:
                 else float("inf")
             )
         )
+
+    @staticmethod
+    def _sort_by_qos_longest_prefix(
+        waiting_queue: List[Req], temporary_deprioritized: Set[int]
+    ) -> None:
+        """Sorts by higher QoS priority, longer prefix match, then arrival time."""
+
+        def sort_key(req: Req):
+            prefix_key = (
+                -len(req.prefix_indices)
+                if req.rid not in temporary_deprioritized
+                else float("inf")
+            )
+            qos_weight = max(req.priority or 1, 1)
+            return (
+                -qos_weight,
+                prefix_key,
+                req.time_stats.wait_queue_entry_time,
+            )
+
+        waiting_queue.sort(key=sort_key)
 
     @staticmethod
     def _sort_by_dfs_weight(
