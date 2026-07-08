@@ -71,6 +71,29 @@ class TestPrepareServerArgs(CustomTestCase):
         finally:
             os.unlink(config_file)
 
+    def test_config_accepts_options_with_deprecated_aliases(self):
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+            f.write("dsa-prefill-backend: trtllm\ndsa-decode-backend: trtllm\n")
+            config_file = f.name
+
+        try:
+            parser = server_args_module.argparse.ArgumentParser()
+            ServerArgs.add_cli_args(parser)
+            merged = ConfigArgumentMerger(parser).merge_config_with_args(
+                [
+                    "--config",
+                    config_file,
+                    "--model-path",
+                    DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
+                ]
+            )
+            parsed = parser.parse_args(merged)
+
+            self.assertEqual(parsed.dsa_prefill_backend, "trtllm")
+            self.assertEqual(parsed.dsa_decode_backend, "trtllm")
+        finally:
+            os.unlink(config_file)
+
 
 class TestMambaCacheStochasticRounding(unittest.TestCase):
     def test_rejects_fp32_ssm_cache(self):
