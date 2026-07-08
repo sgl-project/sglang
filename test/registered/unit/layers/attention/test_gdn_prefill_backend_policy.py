@@ -4,6 +4,7 @@ from unittest.mock import MagicMock, patch, sentinel
 
 import torch
 
+from sglang.srt.configs.model_config import ModelImpl
 from sglang.srt.layers.attention.linear import gdn_backend
 from sglang.srt.layers.attention.linear.gdn_backend import (
     GDNKernelDispatcher,
@@ -22,6 +23,7 @@ def make_runner(
     key_dim=128,
     value_dim=128,
     multimodal=False,
+    model_impl=ModelImpl.SGLANG,
     **arg_overrides,
 ):
     args = SimpleNamespace(
@@ -42,7 +44,10 @@ def make_runner(
             linear_key_head_dim=key_dim,
             linear_value_head_dim=value_dim,
         ),
-        model_config=SimpleNamespace(is_multimodal=multimodal),
+        model_config=SimpleNamespace(
+            is_multimodal=multimodal,
+            _resolved_model_impl=model_impl,
+        ),
         req_to_token_pool=SimpleNamespace(
             mamba_pool=SimpleNamespace(
                 mamba_cache=SimpleNamespace(temporal=SimpleNamespace(dtype=state_dtype))
@@ -83,6 +88,9 @@ class TestFlashInferGDNPrefillBackendPolicy(unittest.TestCase):
             mamba_radix_cache_strategy="no_buffer",
         )
         self.assertEqual(self.apply_policy(runner), "flashinfer")
+
+    def test_selects_flashinfer_for_native_multimodal_model(self):
+        self.assertEqual(self.apply_policy(make_runner(multimodal=True)), "flashinfer")
 
     def test_preserves_explicit_prefill_override(self):
         for backend in ("triton", "flashinfer", "cutedsl"):
@@ -134,12 +142,14 @@ class TestFlashInferGDNPrefillBackendPolicy(unittest.TestCase):
             ("unchunked", {"chunked_prefill_size": -1}),
             ("unknown_chunk", {"chunked_prefill_size": None}),
             ("large_chunk", {"chunked_prefill_size": 8193}),
+            (
+                "transformers_multimodal",
+                {"multimodal": True, "model_impl": ModelImpl.TRANSFORMERS},
+            ),
         )
         for name, runner_args in cases:
             with self.subTest(name=name):
                 self.assertIsNone(self.apply_policy(make_runner(**runner_args)))
-
-        self.assertIsNone(self.apply_policy(make_runner(multimodal=True)))
 
     def test_tree_verify_uses_triton_kernel(self):
         flashinfer_kernel = MagicMock(supports_target_verify=True)
