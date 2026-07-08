@@ -18,7 +18,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 import threading
-from typing import Callable, List, Optional
+from typing import List, Optional
 
 import ray
 from ray.util.placement_group import PlacementGroup
@@ -27,6 +27,7 @@ from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 from sglang.srt.entrypoints.engine import (
     Engine,
     SchedulerInitResult,
+    SubprocessTarget,
     _calculate_rank_ranges,
     _compute_parallelism_ranks,
 )
@@ -251,7 +252,7 @@ class RayEngine(Engine):
         cls,
         server_args: ServerArgs,
         port_args: PortArgs,
-        run_scheduler_process_func: Callable,
+        run_scheduler_process_func: SubprocessTarget,
     ) -> tuple[SchedulerInitResult, None]:
         """Launch schedulers as Ray actors.
 

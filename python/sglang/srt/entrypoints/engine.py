@@ -53,11 +53,6 @@ from sglang.srt.entrypoints.engine_info_bootstrap_server import (
 )
 from sglang.srt.entrypoints.engine_score_mixin import EngineScoreMixin
 from sglang.srt.entrypoints.EngineBase import EngineBase
-from sglang.srt.managers.data_parallel_controller import (
-    SCHEDULER_PIDS_ARG,
-    run_data_parallel_controller_process,
-)
-from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
 from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
     DestroyWeightsUpdateGroupReqInput,
@@ -83,11 +78,7 @@ from sglang.srt.managers.io_struct import (
     sock_recv,
     sock_send,
 )
-from sglang.srt.managers.multi_tokenizer_mixin import (
-    MultiTokenizerRouter,
-    run_multi_detokenizer_router_process,
-)
-from sglang.srt.managers.scheduler import run_scheduler_process
+from sglang.srt.managers.multi_tokenizer_mixin import MultiTokenizerRouter
 from sglang.srt.managers.template_detection import resolve_auto_parsers
 from sglang.srt.managers.template_manager import TemplateManager
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -111,12 +102,38 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.srt.utils.network import get_zmq_socket, is_port_available
+from sglang.srt.utils.subprocess_bootstrap import (
+    DEFAULT_DATA_PARALLEL_CONTROLLER_TARGET,
+    DEFAULT_DETOKENIZER_TARGET,
+    DEFAULT_MULTI_DETOKENIZER_ROUTER_TARGET,
+    DEFAULT_SCHEDULER_TARGET,
+    SCHEDULER_PIDS_ARG,
+    SubprocessTarget,
+    get_subprocess_target_args,
+)
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils.watchdog import SubprocessWatchdog
 from sglang.version import __version__
 
 logger = logging.getLogger(__name__)
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+
+
+def run_detokenizer_process(*args: Any, **kwargs: Any) -> Any:
+    """Compatibility wrapper that lazily imports the detokenizer process target."""
+    from sglang.srt.managers.detokenizer_manager import (
+        run_detokenizer_process as target,
+    )
+
+    return target(*args, **kwargs)
+
+
+def run_scheduler_process(*args: Any, **kwargs: Any) -> Any:
+    """Compatibility wrapper that lazily imports the scheduler process target."""
+    from sglang.srt.managers.scheduler import run_scheduler_process as target
+
+    return target(*args, **kwargs)
+
 
 _is_cuda = is_cuda()
 
@@ -198,8 +215,8 @@ class Engine(EngineScoreMixin, EngineBase):
     # and launch processes for their private forks.
     server_args_class: ServerArgs = ServerArgs
     init_tokenizer_manager_func: Callable = staticmethod(init_tokenizer_manager)
-    run_scheduler_process_func: Callable = staticmethod(run_scheduler_process)
-    run_detokenizer_process_func: Callable = staticmethod(run_detokenizer_process)
+    run_scheduler_process_func: SubprocessTarget = DEFAULT_SCHEDULER_TARGET
+    run_detokenizer_process_func: SubprocessTarget = DEFAULT_DETOKENIZER_TARGET
 
     def __init__(self, **kwargs):
         """
@@ -593,7 +610,7 @@ class Engine(EngineScoreMixin, EngineBase):
         cls,
         server_args: ServerArgs,
         port_args: PortArgs,
-        run_scheduler_process_func: Callable,
+        run_scheduler_process_func: SubprocessTarget,
     ) -> Tuple[SchedulerInitResult, Optional[List]]:
         """Launch scheduler processes using multiprocessing.
         Override in subclasses for different backends (e.g. Ray).
@@ -633,20 +650,22 @@ class Engine(EngineScoreMixin, EngineBase):
                     )
 
                     with maybe_reindex_device_id(gpu_id) as gpu_id:
+                        scheduler_target, scheduler_args = get_subprocess_target_args(
+                            run_scheduler_process_func,
+                            server_args,
+                            port_args,
+                            gpu_id,
+                            tp_rank,
+                            attn_cp_rank,
+                            moe_dp_rank,
+                            moe_ep_rank,
+                            pp_rank,
+                            None,
+                            writer,
+                        )
                         proc = mp.Process(
-                            target=run_scheduler_process_func,
-                            args=(
-                                server_args,
-                                port_args,
-                                gpu_id,
-                                tp_rank,
-                                attn_cp_rank,
-                                moe_dp_rank,
-                                moe_ep_rank,
-                                pp_rank,
-                                None,
-                                writer,
-                            ),
+                            target=scheduler_target,
+                            args=scheduler_args,
                         )
                         with (
                             memory_saver_adapter.configure_subprocess(),
@@ -660,14 +679,16 @@ class Engine(EngineScoreMixin, EngineBase):
             # Launch the data parallel controller
             reader, writer = mp.Pipe(duplex=False)
             scheduler_pipe_readers = [reader]
+            controller_target, controller_args = get_subprocess_target_args(
+                DEFAULT_DATA_PARALLEL_CONTROLLER_TARGET,
+                server_args,
+                port_args,
+                writer,
+                run_scheduler_process_func,
+            )
             proc = mp.Process(
-                target=run_data_parallel_controller_process,
-                kwargs=dict(
-                    server_args=server_args,
-                    port_args=port_args,
-                    pipe_writer=writer,
-                    run_scheduler_process_func=run_scheduler_process_func,
-                ),
+                target=controller_target,
+                args=controller_args,
             )
             proc.start()
             scheduler_procs.append(proc)
@@ -707,7 +728,7 @@ class Engine(EngineScoreMixin, EngineBase):
         cls,
         server_args: ServerArgs,
         port_args: PortArgs,
-        run_detokenizer_process_func: Callable,
+        run_detokenizer_process_func: SubprocessTarget,
     ) -> Tuple[List[mp.Process], List[str]]:
         """Launch detokenizer worker(s).
 
@@ -723,9 +744,14 @@ class Engine(EngineScoreMixin, EngineBase):
         names: List[str] = []
 
         if server_args.detokenizer_worker_num <= 1:
+            detokenizer_target, detokenizer_args = get_subprocess_target_args(
+                run_detokenizer_process_func,
+                server_args,
+                port_args,
+            )
             proc = mp.Process(
-                target=run_detokenizer_process_func,
-                args=(server_args, port_args),
+                target=detokenizer_target,
+                args=detokenizer_args,
             )
             proc.start()
             processes.append(proc)
@@ -738,9 +764,14 @@ class Engine(EngineScoreMixin, EngineBase):
             for i in range(server_args.detokenizer_worker_num):
                 worker_ipc = f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
                 port_args.detokenizer_ipc_name = worker_ipc
+                detokenizer_target, detokenizer_args = get_subprocess_target_args(
+                    run_detokenizer_process_func,
+                    server_args,
+                    port_args,
+                )
                 proc = mp.Process(
-                    target=run_detokenizer_process_func,
-                    args=(server_args, port_args),
+                    target=detokenizer_target,
+                    args=detokenizer_args,
                 )
                 proc.start()
                 processes.append(proc)
@@ -749,9 +780,15 @@ class Engine(EngineScoreMixin, EngineBase):
         finally:
             port_args.detokenizer_ipc_name = router_ipc_name
 
+        router_target, router_args = get_subprocess_target_args(
+            DEFAULT_MULTI_DETOKENIZER_ROUTER_TARGET,
+            worker_ipc_names,
+            server_args,
+            port_args,
+        )
         router_proc = mp.Process(
-            target=run_multi_detokenizer_router_process,
-            args=(worker_ipc_names, server_args, port_args),
+            target=router_target,
+            args=router_args,
         )
         router_proc.start()
         processes.append(router_proc)
@@ -764,8 +801,8 @@ class Engine(EngineScoreMixin, EngineBase):
         cls,
         server_args: ServerArgs,
         init_tokenizer_manager_func: Callable,
-        run_scheduler_process_func: Callable,
-        run_detokenizer_process_func: Callable,
+        run_scheduler_process_func: SubprocessTarget,
+        run_detokenizer_process_func: SubprocessTarget,
         port_args: Optional[PortArgs] = None,
     ) -> Tuple[
         TokenizerManager,

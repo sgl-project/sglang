@@ -20,7 +20,7 @@ import signal
 import threading
 import time
 from enum import Enum, auto
-from typing import Callable, List, Optional
+from typing import List, Optional
 
 import psutil
 import setproctitle
@@ -43,10 +43,10 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.load_snapshot import create_load_snapshot_reader
 from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.observability.req_time_stats import DPControllerReqTimeStats
 from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
+from sglang.srt.plugins import load_plugins
 from sglang.srt.server_args import (
     DP_ATTENTION_HANDSHAKE_PORT_DELTA,
     PortArgs,
@@ -64,13 +64,25 @@ from sglang.srt.utils.network import (
     get_zmq_socket,
     get_zmq_socket_on_host,
 )
+from sglang.srt.utils.subprocess_bootstrap import (
+    DEFAULT_SCHEDULER_TARGET,
+    SCHEDULER_PIDS_ARG,
+    SubprocessTarget,
+    get_subprocess_target_args,
+)
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils.watchdog import Watchdog
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
-logger = logging.getLogger(__name__)
 
-SCHEDULER_PIDS_ARG = "scheduler_pids"
+def run_scheduler_process(*args, **kwargs):
+    """Compatibility wrapper that lazily imports the scheduler process target."""
+    from sglang.srt.managers.scheduler import run_scheduler_process as target
+
+    return target(*args, **kwargs)
+
+
+logger = logging.getLogger(__name__)
 
 
 class LoadBalanceMethod(Enum):
@@ -133,7 +145,7 @@ class DataParallelController:
         self,
         server_args: ServerArgs,
         port_args: PortArgs,
-        run_scheduler_process_func: Callable,
+        run_scheduler_process_func: SubprocessTarget,
     ) -> None:
         # Parse args
         self.server_args = server_args
@@ -571,20 +583,22 @@ class DataParallelController:
                 )
 
                 with self.env_lock, maybe_reindex_device_id(gpu_id) as gpu_id:
+                    scheduler_target, scheduler_args = get_subprocess_target_args(
+                        self.run_scheduler_process_func,
+                        server_args,
+                        rank_port_args,
+                        gpu_id,
+                        tp_rank,
+                        attn_cp_rank,
+                        moe_dp_rank,
+                        moe_ep_rank,
+                        pp_rank,
+                        dp_rank,
+                        writer,
+                    )
                     proc = mp.Process(
-                        target=self.run_scheduler_process_func,
-                        args=(
-                            server_args,
-                            rank_port_args,
-                            gpu_id,
-                            tp_rank,
-                            attn_cp_rank,
-                            moe_dp_rank,
-                            moe_ep_rank,
-                            pp_rank,
-                            dp_rank,
-                            writer,
-                        ),
+                        target=scheduler_target,
+                        args=scheduler_args,
                     )
                     with (
                         memory_saver_adapter.configure_subprocess(),
@@ -666,8 +680,10 @@ def run_data_parallel_controller_process(
     server_args: ServerArgs,
     port_args: PortArgs,
     pipe_writer,
-    run_scheduler_process_func: Callable = run_scheduler_process,
+    run_scheduler_process_func: SubprocessTarget = DEFAULT_SCHEDULER_TARGET,
 ):
+    # Load plugins so hooks can override DataParallelController and dependencies.
+    load_plugins()
     setproctitle.setproctitle("sglang::data_parallel_controller")
     faulthandler.enable()
     kill_itself_when_parent_died()
