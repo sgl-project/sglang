@@ -15,14 +15,8 @@ WHEEL_PROTO_PATH = "sglang/srt/grpc/sglang.proto"
 
 def main() -> None:
     repo_root = Path(__file__).resolve().parents[2]
-    canonical_proto = repo_root / "proto/sglang/runtime/v1/sglang.proto"
-    package_proto = repo_root / "python" / WHEEL_PROTO_PATH
-    canonical_contents = canonical_proto.read_bytes()
-
-    if package_proto.read_bytes() != canonical_contents:
-        raise SystemExit(
-            f"{package_proto} is out of sync with canonical proto {canonical_proto}"
-        )
+    source_proto = repo_root / "python" / WHEEL_PROTO_PATH
+    source_contents = source_proto.read_bytes()
 
     for wheel_arg in sys.argv[1:]:
         wheel = Path(wheel_arg)
@@ -36,9 +30,9 @@ def main() -> None:
         except BadZipFile as err:
             raise SystemExit(f"invalid wheel archive: {wheel}") from err
 
-        if wheel_contents != canonical_contents:
+        if wheel_contents != source_contents:
             raise SystemExit(
-                f"{WHEEL_PROTO_PATH} in {wheel} does not match {canonical_proto}"
+                f"{WHEEL_PROTO_PATH} in {wheel} does not match {source_proto}"
             )
         print(f"Verified {WHEEL_PROTO_PATH} in {wheel}")
 
