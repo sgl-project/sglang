@@ -25,6 +25,7 @@ from sglang.srt.models.qwen3_5 import (
     Qwen3_5MoeForConditionalGeneration,
 )
 from sglang.srt.models.qwen3_5_mtp import Qwen3_5ForCausalLMMTP
+from sglang.srt.models.cosmos3 import Cosmos3ForConditionalGeneration
 from sglang.srt.models.qwen3_omni_moe import Qwen3OmniMoeForConditionalGeneration
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from sglang.srt.models.qwen3_vl_moe import Qwen3VLMoeForConditionalGeneration
@@ -293,6 +294,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         Qwen3_5ForCausalLMMTP,
         InternS2PreviewForConditionalGeneration,
         Qwen3OmniMoeForConditionalGeneration,
+        Cosmos3ForConditionalGeneration,
     ]
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
@@ -514,6 +516,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             "qwen3_5",
             "qwen3_5_moe",
             "intern_s2_preview",
+            "cosmos3_omni",
         ):
             return None
 
@@ -649,6 +652,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
                 "qwen3_5",
                 "qwen3_5_moe",
                 "intern_s2_preview",
+                "cosmos3_omni",
             ]
             and video_timestamps is not None
         ):
@@ -757,6 +761,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             "qwen3_5",
             "qwen3_5_moe",
             "intern_s2_preview",
+            "cosmos3_omni",
         ):
             processor_kwargs.update(
                 video_metadata=video_metadata,
