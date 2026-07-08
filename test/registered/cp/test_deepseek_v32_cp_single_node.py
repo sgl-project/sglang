@@ -14,8 +14,7 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=616, stage="extra-b", runner_config="deepep-8-gpu-h200")
-DEEPSEEK_V32_MODEL_PATH = "/home/t4/models/deepSeek-v32-real"
-DEEPSEEK_V32_SERVER_LAUNCH_TIMEOUT = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH * 5
+DEEPSEEK_V32_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2"
 
 
 class TestDeepseekV32CPInSeqSplit(CustomTestCase):
@@ -55,7 +54,7 @@ class TestDeepseekV32CPInSeqSplit(CustomTestCase):
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
-            timeout=DEEPSEEK_V32_SERVER_LAUNCH_TIMEOUT,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=other_args,
         )
 
@@ -121,7 +120,7 @@ class TestDeepseekV32CPRoundRobinSplit(CustomTestCase):
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
-            timeout=DEEPSEEK_V32_SERVER_LAUNCH_TIMEOUT,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=other_args,
         )
 
@@ -187,7 +186,7 @@ class TestDeepseekV32CPV2Interleave(CustomTestCase):
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
-            timeout=DEEPSEEK_V32_SERVER_LAUNCH_TIMEOUT,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=other_args,
         )
 
