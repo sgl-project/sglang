@@ -79,16 +79,20 @@ def _handle_attention_backend(attn, forward_batch, backend_name):
     if is_in_tc_piecewise_cuda_graph():
         return AttnForwardMethod.MLA
 
-    # Logical-page KV sharding (MLA shards across attn-TP ranks): the pool
-    # cannot serve absorbed-MLA or one-shot reads (a rank's pool holds only
-    # its stripe of the prefix and of the current chunk). The chunked-prefix
-    # MHA path is the supported read path: it fetches the prefix through the
-    # assembled scratch (get_mla_kv_buffer) and attends the current chunk
-    # from activations.
+    # Logical-page KV sharding: a rank's pool holds only its stripe of the
+    # prefix and of the current chunk, so extend reads go through the
+    # assembled scratch. Under prefill CP (shard axis = attn-CP) the
+    # CP-aware absorbed-MLA path is required — it reads the scratch through
+    # the translated page table (get_key_buffer). Without CP the
+    # chunked-prefix MHA path is the validated reader: it fetches the prefix
+    # through get_mla_kv_buffer and attends the current chunk from
+    # activations.
     if (
         get_global_server_args().enable_kv_cache_sharding
         and forward_batch.forward_mode.is_extend_without_speculative()
     ):
+        if mla_use_prefill_cp(forward_batch):
+            return _dispatch_mla_subtype(attn, forward_batch)
         return AttnForwardMethod.MHA_CHUNKED_KV
 
     # MLA prefill CP forces absorbed MLA regardless of prefix length: the

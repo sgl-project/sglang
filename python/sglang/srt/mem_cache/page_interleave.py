@@ -98,15 +98,29 @@ def is_kv_cache_sharding_enabled(model_runner: ModelRunner) -> bool:
 
 
 def get_kv_shard_group(use_mla_backend: bool) -> GroupCoordinator:
-    """The group KV pages are striped across: attn TP for MLA, attn CP otherwise."""
+    """The group KV pages are striped across — the axis that replicates KV
+    at rest, chosen by topology:
+
+    - An active attention-CP group takes precedence: prefill CP replicates
+      KV storage across CP ranks for every attention type (GQA via the
+      full-chunk allgather, MLA via rebuild_cp_kv_cache).
+    - Without CP, MLA latent KV is still replicated across attention-TP
+      (ReplicatedLinear projection), so the attn-TP group is the shard axis.
+    - GQA without CP has no replicated axis (KV is head-sharded across TP);
+      the returned trivial CP group has world_size 1, which disables
+      sharding in get_kv_shard_group_info.
+    """
     from sglang.srt.layers.dp_attention import (
         get_attention_cp_group,
         get_attention_tp_group,
     )
 
+    cp_group = get_attention_cp_group()
+    if cp_group.world_size > 1:
+        return cp_group
     if use_mla_backend:
         return get_attention_tp_group()
-    return get_attention_cp_group()
+    return cp_group
 
 
 def get_kv_shard_group_info(

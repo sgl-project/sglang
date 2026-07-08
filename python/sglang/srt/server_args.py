@@ -5128,17 +5128,22 @@ class ServerArgs:
         init_cp_strategy(self)
 
     def kv_shard_group_size(self) -> int:
-        """Shard-group size of logical-page KV sharding: attn-TP size for MLA
-        models, attn-CP size for GQA models; 1 when the feature is off."""
+        """Shard-group size of logical-page KV sharding; 1 when the feature
+        is off. Mirrors mem_cache.page_interleave.get_kv_shard_group: the
+        shard axis is chosen by topology — an active attention-CP group
+        takes precedence (CP replicates KV at rest for every attention
+        type); without CP, MLA latent KV is still replicated across
+        attention-TP."""
         if not self.enable_kv_cache_sharding:
             return 1
         view = self._resolved()
+        if view.attn_cp_size > 1:
+            return view.attn_cp_size
         if self.use_mla_backend():
-            # v1 shards MLA across attn-TP with plain-TP prefill
-            # (enable_dp_attention and prefill CP are validated off), so
-            # attn_tp_size == tp_size.
+            # Plain-TP MLA prefill (enable_dp_attention and prefill CP are
+            # validated off in this arm), so attn_tp_size == tp_size.
             return self.tp_size
-        return view.attn_cp_size
+        return 1
 
     def _handle_kv_cache_sharding(self):
         if not self.enable_kv_cache_sharding:
@@ -5219,22 +5224,27 @@ class ServerArgs:
                     "--enable-kv-cache-sharding does not support DSA models "
                     "yet (indexer buffers are not striped)."
                 )
-            if self.enable_prefill_cp or view.attn_cp_size > 1:
-                raise ValueError(
-                    "--enable-kv-cache-sharding shards MLA KV across the "
-                    "attention-TP group and does not compose with prefill CP "
-                    "yet; remove --enable-prefill-cp."
-                )
-            if self._resolved().enable_dp_attention:
-                raise ValueError(
-                    "--enable-kv-cache-sharding for MLA models requires plain "
-                    "TP attention; disable --enable-dp-attention."
-                )
-            if self.tp_size <= 1:
-                raise ValueError(
-                    "--enable-kv-cache-sharding for MLA models shards across "
-                    "attention-TP ranks and needs tp_size > 1."
-                )
+            # Shard axis is chosen by topology (get_kv_shard_group): with
+            # prefill CP active, MLA shards across the attn-CP group and
+            # reads through the absorbed-MLA CP path (dp-attention is forced
+            # on by the DeepSeek CP overrides and is fine — the CP group is
+            # the replicated axis). Without CP, MLA shards across attn-TP
+            # and requires plain-TP attention.
+            if view.attn_cp_size > 1:
+                pass
+            else:
+                if self._resolved().enable_dp_attention:
+                    raise ValueError(
+                        "--enable-kv-cache-sharding for MLA models without "
+                        "prefill CP shards across attention-TP and requires "
+                        "plain TP attention; disable --enable-dp-attention."
+                    )
+                if self.tp_size <= 1:
+                    raise ValueError(
+                        "--enable-kv-cache-sharding for MLA models without "
+                        "prefill CP shards across attention-TP ranks and "
+                        "needs tp_size > 1."
+                    )
         else:
             if not self.enable_prefill_cp or view.attn_cp_size <= 1:
                 raise ValueError(

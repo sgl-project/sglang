@@ -112,12 +112,17 @@ def _run_mla(rank, world, port):
     _dist_init(rank, world, port, attn_cp_size=1)
 
     from sglang.srt.layers.dp_attention import get_attention_tp_group
+    from sglang.srt.mem_cache.page_interleave import get_kv_shard_group
     from sglang.srt.mem_cache.page_interleave_pool import (
         PageInterleaveMLATokenToKVPool,
     )
 
     group = get_attention_tp_group()
     assert group.world_size == world
+    # Topology-first shard-group selection: no CP here, so MLA falls back to
+    # the attn-TP axis, while GQA has no replicated axis (world_size 1).
+    assert get_kv_shard_group(use_mla_backend=True) is group
+    assert get_kv_shard_group(use_mla_backend=False).world_size == 1
     spec = _make_spec(shard_rank=group.rank_in_group)
 
     pool = PageInterleaveMLATokenToKVPool(
@@ -165,16 +170,27 @@ def _run_mla(rank, world, port):
         expect = _mla_value(owned_locs, KV_LORA_RANK + QK_ROPE)
         _check(rank, f"mla owned stripe g{q}", got, expect)
 
-    # ---- chunk 2: prefix gather through get_mla_kv_buffer ------------------
+    # ---- chunk 2: prefix gather + staged chunk, both read styles -----------
     seq_groups = chunk1_groups + [12]  # one new chunk group
     prefix_len = 3 * GRANULE
     seq_len = prefix_len + GRANULE
     req_to_token = _fake_req_to_token(seq_groups, seq_len, device)
+    chunk2_locs = req_to_token[0, prefix_len:seq_len].long()
     pool.begin_shard_extend(req_to_token, torch.tensor([0]), [prefix_len], [seq_len])
 
     for layer_id in range(LAYER_NUM):
         layer = SimpleNamespace(layer_id=layer_id)
-        # Arbitrary sub-range of the prefix, like a chunked-prefix iteration.
+        # Write the current chunk (stages it into the slot + persists the
+        # owned stripe), like the extend forward does before attention.
+        chunk_vals = _mla_value(chunk2_locs + layer_id * 1000, KV_LORA_RANK + QK_ROPE)
+        pool.set_mla_kv_buffer(
+            layer,
+            chunk2_locs,
+            chunk_vals[:, :KV_LORA_RANK].unsqueeze(1),
+            chunk_vals[:, KV_LORA_RANK:].unsqueeze(1),
+        )
+        # Chunked-prefix MHA style: fetch an arbitrary sub-range of the
+        # prefix through get_mla_kv_buffer.
         sub = chunk1_locs[PAGE_SIZE // 2 : prefix_len - 3]
         k_nope, k_rope = pool.get_mla_kv_buffer(layer, sub, DTYPE)
         expect = _mla_value(sub + layer_id * 1000, KV_LORA_RANK + QK_ROPE)
@@ -190,6 +206,17 @@ def _run_mla(rank, world, port):
             k_rope[:, 0, :],
             expect[:, KV_LORA_RANK:],
         )
+        # Absorbed-MLA style (what MLA-under-CP uses): read [prefix | chunk]
+        # from get_key_buffer through the translated page table.
+        all_locs = req_to_token[0, :seq_len].long()
+        rows = pool.translate_loc_to_scratch(all_locs)
+        kv_scratch = pool.get_key_buffer(layer_id)
+        _check(
+            rank,
+            f"mla absorbed read l{layer_id}",
+            kv_scratch[rows, 0, :],
+            _mla_value(all_locs + layer_id * 1000, KV_LORA_RANK + QK_ROPE),
+        )
 
     torch.distributed.barrier()
     if rank == 0:
@@ -200,12 +227,18 @@ def _run_mha(rank, world, port):
     _dist_init(rank, world, port, attn_cp_size=world)
 
     from sglang.srt.layers.dp_attention import get_attention_cp_group
+    from sglang.srt.mem_cache.page_interleave import get_kv_shard_group
     from sglang.srt.mem_cache.page_interleave_pool import (
         PageInterleaveMHATokenToKVPool,
     )
 
     group = get_attention_cp_group()
     assert group.world_size == world
+    # Topology-first shard-group selection: with an active CP group, both
+    # GQA and MLA shard across CP (CP replicates KV for every attention
+    # type; the TP axis is only the no-CP MLA fallback).
+    assert get_kv_shard_group(use_mla_backend=False) is group
+    assert get_kv_shard_group(use_mla_backend=True) is group
     spec = _make_spec(shard_rank=group.rank_in_group)
 
     pool = PageInterleaveMHATokenToKVPool(

@@ -145,18 +145,23 @@ class CommonKVManager(BaseKVManager):
         self.pp_rank = self.kv_args.pp_rank
         self.local_ip = get_local_ip_auto()
         # Logical-page KV sharding (prefill side): the group whose ranks each
-        # hold a disjoint 1/N of every page — attn-TP for MLA, attn-CP for
-        # GQA. (0, 1) when sharding is off (including on decode workers).
+        # hold a disjoint 1/N of every page, chosen by topology (mirrors
+        # mem_cache.page_interleave.get_kv_shard_group): an active attn-CP
+        # group takes precedence; without CP, MLA shards across attn-TP.
+        # (0, 1) when sharding is off (including on decode workers).
         if (
             server_args.enable_kv_cache_sharding
             and disaggregation_mode == DisaggregationMode.PREFILL
         ):
-            if self.is_mla_backend:
+            if self.attn_cp_size > 1:
+                self.kv_shard_rank = self.attn_cp_rank
+                self.kv_shard_size = self.attn_cp_size
+            elif self.is_mla_backend:
                 self.kv_shard_rank = self.attn_tp_rank
                 self.kv_shard_size = self.attn_tp_size
             else:
-                self.kv_shard_rank = self.attn_cp_rank
-                self.kv_shard_size = self.attn_cp_size
+                self.kv_shard_rank = 0
+                self.kv_shard_size = 1
         else:
             self.kv_shard_rank = 0
             self.kv_shard_size = 1
@@ -306,9 +311,14 @@ class CommonKVManager(BaseKVManager):
         """Compute TP/CP/PP rank mapping and store on the PrefillServerInfo object.
         Deterministic for a given (bootstrap_addr, decode engine) pair."""
         # TP rank mapping
-        if info.enable_kv_cache_sharding and self.is_mla_backend:
-            # Logical-page KV sharding on an MLA prefill: pages are striped
-            # across the prefill attn-TP group, so every decode rank pulls its
+        if (
+            info.enable_kv_cache_sharding
+            and self.is_mla_backend
+            and info.attn_cp_size == 1
+        ):
+            # Logical-page KV sharding on the attn-TP axis (MLA prefill
+            # without CP — with CP active the shard axis is the CP group and
+            # the CP fan-in below handles it): every decode rank pulls its
             # full latent KV from ALL prefill TP ranks (each sends the pages
             # it owns, paired positionally). v1 requires equal TP sizes.
             assert self.attn_tp_size == info.attn_tp_size, (
@@ -1076,10 +1086,15 @@ class CommonKVReceiver(BaseKVReceiver):
                             target_pp_rank,
                         )
                         if bootstrap_info is not None:
-                            if (
-                                self.kv_mgr.is_mla_backend
-                                and not self.prefill_info.enable_kv_cache_sharding
-                            ):
+                            # TP-axis KV sharding (MLA without CP) needs every
+                            # prefill TP rank to be a real sender; CP-axis
+                            # sharding keeps MLA's one-real-TP-rank rule (the
+                            # pages fan in across CP ranks instead).
+                            tp_axis_sharding = (
+                                self.prefill_info.enable_kv_cache_sharding
+                                and self.prefill_info.attn_cp_size == 1
+                            )
+                            if self.kv_mgr.is_mla_backend and not tp_axis_sharding:
                                 # For MLA: target_tp_rank is the selected real rank, others are dummy ranks
                                 bootstrap_info["is_dummy"] = not bool(
                                     target_tp_rank == self.target_tp_rank

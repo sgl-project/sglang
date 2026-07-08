@@ -34,7 +34,7 @@ scratch slot laid out ``[prefix region | chunk region | trash page]``:
   output needs no reorder pass.
 - The chunk region is staged locally on the compute stream where the write
   path already holds the full chunk (GQA CP allgathers K/V before the pool
-  write; MLA never reads the chunk through the pool, so it skips staging).
+  write; MLA latent is replicated across the shard group at write time).
 - The trash page absorbs padded/dummy locations (logical group 0 — the
   reserved padded page — and any location outside the current batch's plan).
 
@@ -68,7 +68,10 @@ from sglang.srt.mem_cache.page_interleave import (
     PageInterleavePlacement,
     PageShardSpec,
 )
-from sglang.srt.mem_cache.utils import get_mla_kv_buffer_triton
+from sglang.srt.mem_cache.utils import (
+    get_mla_kv_buffer_triton,
+    set_mla_kv_buffer_triton,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.distributed.device_communicators.pynccl import PyNcclCommunicator
@@ -468,15 +471,19 @@ class PageInterleaveMHATokenToKVPool(PageInterleaveKVPoolMixin, MHATokenToKVPool
 
 
 class PageInterleaveMLATokenToKVPool(PageInterleaveKVPoolMixin, MLATokenToKVPool):
-    """MLA latent pool striped across the attention TP group.
+    """MLA latent pool striped across its shard group (the attn-CP group when
+    prefill CP is active, the attn-TP group otherwise — see
+    ``page_interleave.get_kv_shard_group``).
 
-    The latent KV is computed replicated on every attn-TP rank
-    (``ReplicatedLinear`` projection), so the write filter needs no
-    compute-time communication. The v1 read consumer is the chunked-prefix
-    MHA path (``forward_mha.py::_chunked_prefix_attn_mha``), which fetches
-    prefix latent rows through ``get_mla_kv_buffer``; the current chunk is
-    attended from activations and is never read back through the pool, so MLA
-    skips chunk staging.
+    The latent KV reaching the write path is identical on every shard-group
+    rank (``ReplicatedLinear`` projection across attn-TP; the CP allgather of
+    ``rebuild_cp_kv_cache`` across attn-CP), so the write filter needs no
+    compute-time communication. Read consumers, all served from the assembled
+    scratch: the chunked-prefix MHA path fetches prefix rows through
+    ``get_mla_kv_buffer``; the absorbed-MLA and one-shot paths read
+    ``get_key_buffer``/``get_value_buffer`` through the translated page
+    table. The current chunk is staged into the slot at write time so the
+    page-table consumers cover ``[prefix | chunk]`` uniformly.
     """
 
     def __init__(
@@ -502,6 +509,12 @@ class PageInterleaveMLATokenToKVPool(PageInterleaveKVPoolMixin, MLATokenToKVPool
     def _gather_pairs(self, local_layer: int):
         return [(self.kv_buffer[local_layer], "kv")]
 
+    def _scratch_kv(self, slot: _ScratchSlot) -> torch.Tensor:
+        kv = slot.tensors["kv"]
+        if self.store_dtype != self.dtype:
+            return kv.view(self.dtype)
+        return kv
+
     def set_kv_buffer(
         self,
         layer: RadixAttention,
@@ -510,6 +523,16 @@ class PageInterleaveMLATokenToKVPool(PageInterleaveKVPoolMixin, MLATokenToKVPool
         cache_v: torch.Tensor,
     ):
         loc, _, _ = unwrap_write_loc(loc_info)
+        if self._shard_extend_active:
+            # Stage the full chunk into this layer's slot (compute stream):
+            # the absorbed / one-shot readers cover the current chunk through
+            # the translated page table too.
+            slot = self._slots[layer.layer_id % 2]
+            rows = self.translate_loc_to_scratch(loc)
+            staged_k = cache_k
+            if staged_k.dtype != self.dtype:
+                staged_k = staged_k.to(self.dtype)
+            self._scratch_kv(slot)[rows] = staged_k
         owned_idx, local_rows = self._get_write_plan(loc)
         if owned_idx.numel() == 0:
             return
@@ -527,6 +550,17 @@ class PageInterleaveMLATokenToKVPool(PageInterleaveKVPoolMixin, MLATokenToKVPool
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
     ):
+        if self._shard_extend_active:
+            slot = self._slots[layer.layer_id % 2]
+            rows = self.translate_loc_to_scratch(loc)
+            staged_nope, staged_rope = cache_k_nope, cache_k_rope
+            if staged_nope.dtype != self.dtype:
+                staged_nope = staged_nope.to(self.dtype)
+                staged_rope = staged_rope.to(self.dtype)
+            if self.store_dtype != self.dtype:
+                staged_nope = staged_nope.view(self.store_dtype)
+                staged_rope = staged_rope.view(self.store_dtype)
+            set_mla_kv_buffer_triton(slot.tensors["kv"], rows, staged_nope, staged_rope)
         owned_idx, local_rows = self._get_write_plan(loc)
         if owned_idx.numel() == 0:
             return
@@ -539,28 +573,25 @@ class PageInterleaveMLATokenToKVPool(PageInterleaveKVPoolMixin, MLATokenToKVPool
 
     def get_kv_buffer_shape(self):
         # Shape probes (e.g. the eager runner's DCP-metadata prep) must not
-        # route through the guarded attention getters below — they may run
-        # before this batch's metadata build while the previous batch's
-        # shard-extend flag is still set.
+        # route through the attention getters below — they may run before
+        # this batch's metadata build while the previous batch's shard-extend
+        # flag is still set.
         k = self.kv_buffer[0]
         return k.shape, k[..., : self.kv_lora_rank].shape
 
     def get_key_buffer(self, layer_id: int):
-        # The absorbed-MLA and one-shot paths read the pool through the page
-        # table; a sharded pool cannot serve them (each rank holds only its
-        # stripe). attention_backend_handler forces MHA_CHUNKED_KV under
-        # sharding, so reaching here during a sharded extend is a wiring bug.
-        assert not self._shard_extend_active, (
-            "direct pool read on a page-sharded MLA pool during a sharded "
-            "extend; only get_mla_kv_buffer (chunked-prefix MHA) is supported"
-        )
+        # During a sharded extend the pool holds only this rank's stripe;
+        # page-table readers (absorbed MLA, incl. the CP zigzag wrapper) get
+        # the assembled scratch — metadata.page_table is already translated
+        # to scratch rows.
+        if self._shard_extend_active:
+            return self._scratch_kv(self._acquire_slot_for_read(layer_id))
         return super().get_key_buffer(layer_id)
 
     def get_value_buffer(self, layer_id: int):
-        assert not self._shard_extend_active, (
-            "direct pool read on a page-sharded MLA pool during a sharded "
-            "extend; only get_mla_kv_buffer (chunked-prefix MHA) is supported"
-        )
+        if self._shard_extend_active:
+            kv = self._scratch_kv(self._acquire_slot_for_read(layer_id))
+            return kv[..., : self.kv_lora_rank]
         return super().get_value_buffer(layer_id)
 
     def get_mla_kv_buffer(
