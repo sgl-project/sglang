@@ -291,6 +291,7 @@ class MoeFlags(_FlagGroupBase):
     tbo_token_distribution_threshold: float | None = None
     disable_fp4_allgather: bool | None = None
     quantization: str | None = None
+    mixed_nvfp4_moe: bool | None = None
 
 
 @dataclasses.dataclass

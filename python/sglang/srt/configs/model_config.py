@@ -376,6 +376,18 @@ class ModelConfig:
                 len(self.nvfp4_moe_meta["exclude_modules"]),
             )
 
+        # True iff a MIXED_PRECISION checkpoint's expert layers are all plain
+        # NVFP4 (w4a4); also set in _parse_modelopt_quant_config.
+        self.mixed_nvfp4_moe: bool = False
+        if (
+            hybrid_quant_cfg is not None
+            and str(hybrid_quant_cfg.get("quant_algo", "")).upper()
+            == "MIXED_PRECISION"
+        ):
+            self.mixed_nvfp4_moe = self._mixed_precision_experts_all_nvfp4(
+                hybrid_quant_cfg.get("quantized_layers")
+            )
+
         # Check model type
         self.attention_chunk_size = getattr(
             self.hf_text_config, "attention_chunk_size", None
@@ -1147,6 +1159,16 @@ class ModelConfig:
 
         return quant_cfg
 
+    @staticmethod
+    def _mixed_precision_experts_all_nvfp4(quantized_layers) -> bool:
+        # Match "experts" as a path segment, not "...shared_expert.up_proj".
+        expert_algos = {
+            str(layer_info.get("quant_algo", "")).upper()
+            for name, layer_info in (quantized_layers or {}).items()
+            if isinstance(layer_info, dict) and "experts" in name.split(".")
+        }
+        return expert_algos == {"NVFP4"}
+
     def _parse_modelopt_quant_config(self, quant_config_dict: dict) -> Optional[dict]:
         """Parse ModelOpt quantization config and return the appropriate quant_method."""
         json_quant_configs = quant_config_dict["quantization"]
@@ -1159,6 +1181,9 @@ class ModelConfig:
                 in ("NVFP4", "W4A16_NVFP4")
                 for layer_info in quantized_layers.values()
                 if isinstance(layer_info, dict)
+            )
+            self.mixed_nvfp4_moe = self._mixed_precision_experts_all_nvfp4(
+                quantized_layers
             )
             if has_modelopt_nvfp4_layers:
                 return {"quant_method": "modelopt_mixed", "quant_algo": quant_algo}

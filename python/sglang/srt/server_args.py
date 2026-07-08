@@ -5380,6 +5380,7 @@ class ServerArgs:
             if not envs.SGLANG_MOE_NVFP4_DISPATCH.is_set() and (
                 resolved_view(self).quantization == "modelopt_fp4"
                 or self.get_model_config().nvfp4_moe_meta is not None
+                or self.get_model_config().mixed_nvfp4_moe
             ):
                 envs.SGLANG_MOE_NVFP4_DISPATCH.set(True)
                 logger.warning(

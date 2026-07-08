@@ -684,6 +684,59 @@ class TestModelOptMixedPrecisionConfig(CustomTestCase):
 
         self.assertEqual(result["quant_method"], "modelopt_mixed")
 
+    def test_mixed_precision_nvfp4_experts_sets_mixed_nvfp4_moe(self):
+        model_config = ModelConfig.__new__(ModelConfig)
+        model_config.hf_config = MagicMock()
+        model_config.hf_config.model_type = "qwen3_5_moe"
+        model_config.hf_config.architectures = ["Qwen3_5MoeForConditionalGeneration"]
+
+        result = model_config._parse_modelopt_quant_config(
+            {
+                "quantization": {
+                    "quant_algo": "MIXED_PRECISION",
+                    "quantized_layers": {
+                        "model.language_model.layers.0.mlp.experts": {
+                            "quant_algo": "NVFP4",
+                            "group_size": 16,
+                        },
+                        # contains "expert" but is not a routed-experts entry
+                        "model.language_model.layers.0.mlp.shared_expert.up_proj": {
+                            "quant_algo": "FP8"
+                        },
+                        "model.language_model.layers.0.linear_attn.in_proj_qkv": {
+                            "quant_algo": "FP8"
+                        },
+                    },
+                }
+            }
+        )
+
+        self.assertEqual(result["quant_method"], "modelopt_mixed")
+        self.assertTrue(model_config.mixed_nvfp4_moe)
+
+    def test_mixed_precision_w4a16_experts_not_marked_nvfp4_moe(self):
+        model_config = ModelConfig.__new__(ModelConfig)
+        model_config.hf_config = MagicMock()
+        model_config.hf_config.model_type = "qwen3_5_moe"
+        model_config.hf_config.architectures = ["Qwen3_5MoeForConditionalGeneration"]
+
+        result = model_config._parse_modelopt_quant_config(
+            {
+                "quantization": {
+                    "quant_algo": "MIXED_PRECISION",
+                    "quantized_layers": {
+                        "model.layers.0.mlp.experts": {
+                            "quant_algo": "W4A16_NVFP4",
+                            "group_size": 16,
+                        },
+                    },
+                }
+            }
+        )
+
+        self.assertEqual(result["quant_method"], "modelopt_mixed")
+        self.assertFalse(model_config.mixed_nvfp4_moe)
+
     def test_mixed_precision_override_does_not_hijack_w4afp8(self):
         self.assertIsNone(
             ModelOptMixedPrecisionConfig.override_quantization_method(

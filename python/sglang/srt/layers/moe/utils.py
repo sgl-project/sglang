@@ -271,6 +271,7 @@ def initialize_moe_config(server_args: ServerArgs):
     moe.tbo_token_distribution_threshold = server_args.tbo_token_distribution_threshold
     moe.disable_fp4_allgather = server_args.disable_flashinfer_cutlass_moe_fp4_allgather
     moe.quantization = server_args.quantization
+    moe.mixed_nvfp4_moe = server_args.get_model_config().mixed_nvfp4_moe
 
 
 def get_moe_a2a_backend() -> MoeA2ABackend:
@@ -391,7 +392,10 @@ def should_use_flashinfer_cutlass_moe_fp4_allgather():
         and get_moe_a2a_backend().is_none()
         and get_moe_runner_backend().is_flashinfer_cutlass()
         and is_dp_attention_enabled()
-        and get_flags().moe.quantization == "modelopt_fp4"
+        and (
+            get_flags().moe.quantization == "modelopt_fp4"
+            or bool(get_flags().moe.mixed_nvfp4_moe)
+        )
         and get_parallel().moe_ep_size == get_parallel().attn_dp_size
     )
 
