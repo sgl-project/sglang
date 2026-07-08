@@ -20,10 +20,9 @@ from typing import TYPE_CHECKING, Any, Callable, Iterator, Optional
 
 import torch
 
-from sglang.srt.model_executor.runner.shape_key import ShapeKey
-
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+    from sglang.srt.model_executor.runner.shape_key import ShapeKey
 
 
 class BaseCudaGraphBackend(ABC):

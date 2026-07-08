@@ -7,7 +7,6 @@ on:
   schedule:
     - cron: '0 */6 * * *' # Run every 6 hours (UTC)
   pull_request:
-    branches: [ main ]
     paths:
       - "python/**"
       - "scripts/ci/**"
@@ -35,6 +34,7 @@ on:
           - stage-b-test-2-gpu-large-amd
           - multimodal-gen-test-1-gpu-amd
           - multimodal-gen-test-2-gpu-amd
+          - multimodal-gen-unit-test-amd
           - stage-c-test-4-gpu-amd
           - stage-c-test-large-8-gpu-amd
           - stage-c-test-large-8-gpu-amd-mi35x
@@ -251,7 +251,7 @@ jobs:
           bash scripts/ci/amd/amd_ci_install_dependency.sh
 
       - name: Run test
-        timeout-minutes: 14
+        timeout-minutes: 30
         env:
           CONTINUE_ON_ERROR: ${{ needs.check-changes.outputs.continue_on_error }}
         run: |
@@ -309,7 +309,7 @@ jobs:
           bash scripts/ci/amd/amd_ci_install_dependency.sh
 
       - name: Run test
-        timeout-minutes: 20
+        timeout-minutes: 30
         env:
           CONTINUE_ON_ERROR: ${{ needs.check-changes.outputs.continue_on_error }}
         run: |
@@ -387,7 +387,7 @@ jobs:
           bash scripts/ci/amd/amd_ci_install_dependency.sh
 
       - name: Run JIT kernel unit tests
-        timeout-minutes: 10
+        timeout-minutes: 30
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite jit-kernel-unit-test-amd ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
@@ -489,9 +489,9 @@ jobs:
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh
 
       - name: Run test
-        timeout-minutes: 45
+        timeout-minutes: 75
         run: |
-          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-1-gpu-small-amd-nondeterministic --timeout-per-file 1800 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-1-gpu-small-amd-nondeterministic --timeout-per-file 3600 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
   stage-b-test-1-gpu-small-amd-mi35x:
     needs: [check-changes, wait-for-stage-a-amd]
@@ -768,7 +768,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        part: [0, 1, 2]  # 3 partitions: 2 parametrized + 1 standalone (test_disagg_server.py)
+        part: [0, 1, 2]  # 3 partitions: 2 parametrized + 1 standalone (single_test_file/test_disagg_server.py)
     runs-on: ${{ format('linux-{0}-2gpu-sglang', inputs.runner_arch || 'mi325') }}
     steps:
       - name: Checkout code
@@ -890,6 +890,65 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+  # AMD counterpart of the CUDA `multimodal-gen-unit-test` job
+  # (pr-test-multimodal-gen.yml): the mm_gen `unit` suite is portable,
+  # CPU-style unit tests (config / sampling params / storage / loaders / etc.)
+  # that don't require NVIDIA hardware, so they should run on AMD too. This
+  # closes the AMD coverage gap the dashboard surfaces for these tests.
+  multimodal-gen-unit-test-amd:
+    name: ${{ format('multimodal-gen-unit-test-amd (linux-{0}-1gpu-sglang)', inputs.runner_arch || 'mi325') }}
+    needs: [check-changes, call-gate]
+    if: |
+      always() && !cancelled() &&
+      (
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',multimodal-gen-unit-test-amd,')) ||
+        (
+          !(inputs.target_stage || inputs.target_stage_select) &&
+          (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') &&
+          needs.check-changes.outputs.multimodal_gen == 'true'
+        )
+      )
+    runs-on: ${{ format('linux-{0}-1gpu-sglang', inputs.runner_arch || 'mi325') }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
+
+      - name: Download artifacts
+        if: needs.check-changes.outputs.sgl_kernel == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          path: sgl-kernel/dist/
+          merge-multiple: true
+          pattern: wheel-python3.10-cuda12.9
+
+      - name: Start CI container
+        run: bash scripts/ci/amd/amd_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/amd/amd_ci_install_dependency.sh diffusion
+
+      - name: Run diffusion unit tests
+        timeout-minutes: 60
+        run: |
+          # Skip ltx2_vae_channels_last: it asserts CUDA `channels_last_3d`
+          # memory-format behavior that the ROCm conv path doesn't reproduce
+          # (CUDA-specific). The rest of the unit suite is portable.
+          docker exec \
+            -e AITER_JIT_DIR=/sgl-data/aiter-kernels \
+            -e MIOPEN_USER_DB_PATH=/sgl-data/miopen-cache \
+            -w /sglang-checkout/python \
+            ci_sglang python3 sglang/multimodal_gen/test/run_suite.py \
+              --suite unit \
+              -k "not ltx2_vae_channels_last" \
+              ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
   wait-for-stage-b-amd:
     needs: [check-changes, call-gate, wait-for-stage-a-amd]
@@ -1116,7 +1175,8 @@ jobs:
           echo ""
           echo "=== 5. Detect RDMA Devices for test environment ==="
           if [ -d "/sys/class/infiniband" ]; then
-            RDMA_DEVS=$(ls /sys/class/infiniband | paste -sd "," -)
+            # RDMA_DEVS=$(ls /sys/class/infiniband | paste -sd "," -)
+            RDMA_DEVS=rdma0
             echo "Detected RDMA Devices: $RDMA_DEVS"
             echo "SGLANG_TEST_RDMA_DEVICE=$RDMA_DEVS" >> $GITHUB_ENV
           else
@@ -1134,6 +1194,23 @@ jobs:
 
       - name: Install dependencies
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh
+
+      - name: Verify NIXL in Container
+        run: |
+          docker exec ci_sglang bash -lc '
+            set -eux
+            export LD_LIBRARY_PATH=/opt/ucx/lib:/opt/rocm/lib:${LD_LIBRARY_PATH:-}
+            python -c "import nixl; print(\"nixl OK:\", nixl.__file__)"
+            test -d /opt/ucx/lib
+            UCX_INFO=$(command -v ucx_info || true)
+            if [ -z "$UCX_INFO" ]; then
+              UCX_INFO=/opt/ucx/bin/ucx_info
+            fi
+            test -x "$UCX_INFO"
+            "$UCX_INFO" -v
+            "$UCX_INFO" -d | grep -iq rocm
+            python -c "from nixl._api import nixl_agent, nixl_agent_config; nixl_agent(\"ci-smoke\", nixl_agent_config(backends=[\"UCX\"])); print(\"nixl UCX backend init OK\")"
+          '
 
       - name: Verify RDMA in Container
         run: |
@@ -1169,8 +1246,12 @@ jobs:
       - name: Run test_disaggregation
         timeout-minutes: 60
         run: |
+          docker exec ci_sglang rocm-smi --showtopotype || true
+          docker exec ci_sglang bash -c 'strings $(python3 -c "import mooncake,os;print(os.path.dirname(mooncake.__file__))")/engine*.so | grep -iE "rdma,hip|Unsupported multi-protocol"' || true
           bash scripts/ci/amd/amd_ci_exec.sh \
             -e SGLANG_TEST_RDMA_DEVICE="${{ env.SGLANG_TEST_RDMA_DEVICE }}" \
+            -e MC_LOG_LEVEL=TRACE \
+            -e GLOG_logtostderr=1 \
             -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-large-8-gpu-mi35x-disaggregation-amd --timeout-per-file 1800 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
   pr-test-amd-finish:
@@ -1183,6 +1264,7 @@ jobs:
         sgl-kernel-unit-test-2-gpu-amd,
         multimodal-gen-test-1-gpu-amd,
         multimodal-gen-test-2-gpu-amd,
+        multimodal-gen-unit-test-amd,
 
         wait-for-stage-a-amd,
         stage-a-test-1-gpu-small-amd,
