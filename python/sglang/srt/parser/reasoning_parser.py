@@ -183,6 +183,14 @@ class BaseReasoningFormatDetector:
 
         return StreamingParseResult()
 
+    def finish(self) -> StreamingParseResult:
+        """
+        Called once when the stream ends. Subclasses may override to flush
+        buffered state (e.g. reclassify accumulated reasoning as content).
+        Default: no-op.
+        """
+        return StreamingParseResult()
+
 
 class DeepSeekR1Detector(BaseReasoningFormatDetector):
     """
@@ -489,17 +497,43 @@ class Nemotron3Detector(BaseReasoningFormatDetector):
             "</think>",
             force_reasoning=force_reasoning,
             stream_reasoning=stream_reasoning,
+            tool_start_token="<tool_call>",
             continue_final_message=continue_final_message,
             previous_content=previous_content,
             reasoning_default="enable_thinking",
         )
         self._force_nonempty_content = force_nonempty_content
+        self._accumulated_reasoning = ""
 
     def detect_and_parse(self, text: str) -> StreamingParseResult:
         ret = super().detect_and_parse(text)
         if self._force_nonempty_content and not ret.normal_text:
             ret.normal_text, ret.reasoning_text = ret.reasoning_text, ret.normal_text
         return ret
+
+    def parse_streaming_increment(self, new_text: str) -> StreamingParseResult:
+        ret = super().parse_streaming_increment(new_text)
+        if self._force_nonempty_content:
+            if self._in_reasoning:
+                self._accumulated_reasoning += ret.reasoning_text
+            else:
+                self._accumulated_reasoning = ""
+        return ret
+
+    def finish(self) -> StreamingParseResult:
+        """
+        The model sometimes never emits a closing `</think>` (e.g. it hits
+        max_tokens mid-reasoning). When that happens with force_nonempty_content
+        set, reclassify whatever reasoning content was streamed (plus any
+        partial token still buffered) as content so the response isn't empty.
+        """
+        if self._force_nonempty_content and self._in_reasoning:
+            normal_text = self._accumulated_reasoning + self._buffer
+            self._accumulated_reasoning = ""
+            self._buffer = ""
+            if normal_text:
+                return StreamingParseResult(normal_text=normal_text)
+        return StreamingParseResult()
 
 
 class MistralDetector(BaseReasoningFormatDetector):
@@ -1169,4 +1203,10 @@ class ReasoningParser:
     ) -> Tuple[Optional[str], Optional[str]]:
         """Streaming call: incremental parsing"""
         ret = self.detector.parse_streaming_increment(chunk_text)
+        return ret.reasoning_text, ret.normal_text
+
+    def parse_stream_end(self) -> Tuple[Optional[str], Optional[str]]:
+        """Streaming call: flush any detector-specific buffered state once
+        the stream ends."""
+        ret = self.detector.finish()
         return ret.reasoning_text, ret.normal_text
