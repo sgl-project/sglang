@@ -1803,6 +1803,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # Read by ForwardBatch ngram embedding init
     ne_token_table: torch.Tensor = None
+    # Mask marking chunked (not-yet-finished) prefill requests whose sampled
+    # pseudo next-token must NOT be written into the ngram token table.
+    ne_skip_token_table_update: torch.Tensor = None
 
     req_pool_indices: torch.Tensor = None  # shape: [b], int64
     seq_lens: torch.Tensor = None  # shape: [b], int64
