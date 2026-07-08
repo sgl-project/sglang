@@ -11,24 +11,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Runtime state for the breakable CUDA graph runner."""
+"""Backward-compatible re-export shim for the moved BCG context helpers.
 
-from __future__ import annotations
+See :mod:`sglang.srt.breakable_cuda_graph.context`.
+"""
 
-from contextlib import contextmanager
+from sglang.srt.breakable_cuda_graph.context import (  # noqa: F401
+    BCG_FAILURE_HINT,
+    enable_breakable_cuda_graph,
+    is_in_breakable_cuda_graph,
+)
 
-_in_breakable_cuda_graph = False
-
-
-def is_in_breakable_cuda_graph() -> bool:
-    return _in_breakable_cuda_graph
-
-
-@contextmanager
-def enable_breakable_cuda_graph():
-    global _in_breakable_cuda_graph
-    _in_breakable_cuda_graph = True
-    try:
-        yield
-    finally:
-        _in_breakable_cuda_graph = False
+__all__ = [
+    "BCG_FAILURE_HINT",
+    "enable_breakable_cuda_graph",
+    "is_in_breakable_cuda_graph",
+]
