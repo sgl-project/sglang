@@ -123,6 +123,8 @@ class DeepseekV4ModelNextN(nn.Module):
         hc_base: torch.Tensor,
     ):
         shape, dtype = x.size(), x.dtype
+        if x.shape[0] == 0:
+            return torch.empty((0, shape[-1]), dtype=dtype, device=x.device)
         x = x.flatten(1).float()
         rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + self.rms_norm_eps)
         mixes = F.linear(x, hc_fn) * rsqrt
@@ -193,7 +195,12 @@ class DeepseekV4ModelNextN(nn.Module):
                 torch.cuda.current_stream(),
             )
 
-        pre_hc_head = hidden_states.flatten(1)
+        if hidden_states.shape[0] == 0:
+            pre_hc_head = hidden_states.new_empty(
+                (0, self.hc_mult * self.config.hidden_size)
+            )
+        else:
+            pre_hc_head = hidden_states.flatten(1)
 
         hidden_states = self.hc_head(
             hidden_states, self.hc_head_fn, self.hc_head_scale, self.hc_head_base

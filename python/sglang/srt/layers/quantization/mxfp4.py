@@ -1173,6 +1173,16 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         if self._fi_kernel == "cutlass_sm90":
             return self._apply_sm90_cutlass(layer, dispatch_output)
         if self.use_flashinfer:
+            if x.shape[0] == 0:
+                return StandardCombineInput(
+                    hidden_states=torch.empty(
+                        0,
+                        x.shape[-1],
+                        dtype=torch.bfloat16,
+                        device=x.device,
+                    )
+                )
+
             # When bf16 mode is enabled, we don't need to quantize the input,
             # TRT-LLM automatically handles quantization in the kernel implementation and pipelines it with GEMM operations,
             # which can theoretically improve performance
