@@ -441,10 +441,13 @@ def alloc_req_slots(
 
 
 def _alloc_page_size(batch: ScheduleBatch) -> int:
-    # DCP swaps in an allocator whose page_size is server_args.page_size *
-    # dcp_size, so it can be > 1 even when tree_cache.page_size is 1; branch on
-    # the real allocator's page_size there. Elsewhere the two are equal.
+    # DCP and logical-page KV sharding swap in an allocator whose page_size is
+    # server_args.page_size * group size, so it can be > 1 even when
+    # tree_cache.page_size is 1; branch on the real allocator's page_size
+    # there. Elsewhere the two are equal.
     if (_is_hip or _is_cuda) and get_global_server_args().dcp_size > 1:
+        return batch.tree_cache.token_to_kv_pool_allocator.page_size
+    if get_global_server_args().enable_kv_cache_sharding:
         return batch.tree_cache.token_to_kv_pool_allocator.page_size
     return batch.tree_cache.page_size
 
@@ -659,7 +662,6 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     start_p, end_p = req.pop_overallocated_kv_cache()
 
     global_server_args = get_global_server_args()
-    page_size = global_server_args.page_size
     spec_algo = global_server_args.speculative_algorithm
 
     # strip_thinking_cache intentionally reports output tokens as overallocated
@@ -669,8 +671,13 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
             start_p == end_p
         ), f"Unexpected overallocated KV cache, {req.kv_committed_len=}, {req.kv_allocated_len=}"
 
-    if page_size > 1:
-        start_p = ceil_align(start_p, page_size)
+    # Align the free boundary to the ALLOCATOR's page (the widened granule
+    # under DCP / logical-page KV sharding): paged free() releases the whole
+    # page containing any freed index, so a boundary aligned only to the
+    # kernel page could free a widened page whose head rows are still live.
+    allocator_page_size = tree_cache.token_to_kv_pool_allocator.page_size
+    if allocator_page_size > 1:
+        start_p = ceil_align(start_p, allocator_page_size)
 
     if start_p < end_p:
         indices_to_free = tree_cache.req_to_token_pool.req_to_token[req.req_pool_idx][

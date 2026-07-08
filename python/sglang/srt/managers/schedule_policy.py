@@ -532,6 +532,19 @@ class PrefillAdder:
         self.dsa_prefill_cp_in_seq_split = is_dsa_prefill_cp_in_seq_split()
         self.max_running_requests = max_running_requests
         self.prefill_context_parallel_enabled = is_prefill_context_parallel_enabled()
+        # Logical-page KV sharding: the allocation granule (allocator page) all
+        # mid-request chunk boundaries must land on; 0 when sharding is off.
+        # v1 also restricts sharded prefill batches to a single request (the
+        # assembly scratch is sized for one request's [prefix | chunk]).
+        from sglang.srt.mem_cache.allocator.page_interleave import (
+            page_interleave_shard_size,
+        )
+
+        self.kv_shard_granule = (
+            self.token_to_kv_pool_allocator.page_size
+            if page_interleave_shard_size(self.token_to_kv_pool_allocator) > 1
+            else 0
+        )
         self.prefill_max_requests = prefill_max_requests
         self.prefill_delayer_single_pass = prefill_delayer_single_pass
         self.max_prefill_bs = max_prefill_bs
@@ -811,6 +824,15 @@ class PrefillAdder:
                 if self.is_hybrid_swa:
                     return req
                 _rem_tokens = self.rem_chunk_tokens
+            if self.kv_shard_granule:
+                # Logical-page KV sharding: a mid-request chunk boundary must
+                # land on the allocation granule, or the next chunk's prefix
+                # would cover a partially-owned logical page (design doc §5).
+                # When flooring would leave no budget, fall back to
+                # rem_chunk_tokens like the <= 0 case above — it is a granule
+                # multiple (chunked_prefill_size is rounded up at validation).
+                floored = _rem_tokens // self.kv_shard_granule * self.kv_shard_granule
+                _rem_tokens = floored if floored > 0 else self.rem_chunk_tokens
 
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
             req.prefix_indices
@@ -981,7 +1003,11 @@ class PrefillAdder:
         # TODO support cp with multiple requests
         # Enabling context parallelism currently presents precision issues;
         # therefore, the prefill-batch setting is temporarily set to 1.
-        if (self.dsa_prefill_cp_in_seq_split) and len(self.can_run_list) >= 1:
+        # KV sharding v1 likewise runs one request per prefill batch (the
+        # assembly scratch is sized for a single request's [prefix | chunk]).
+        if (self.dsa_prefill_cp_in_seq_split or self.kv_shard_granule) and len(
+            self.can_run_list
+        ) >= 1:
             return AddReqResult.OTHER
 
         if (x := self.prefill_max_requests) is not None and len(self.can_run_list) >= x:

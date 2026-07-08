@@ -137,6 +137,14 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
         self._cell_size = self._compute_cell_size(mr, num_layers)
 
+        # Logical-page KV sharding reserves a fixed double-buffered assembly
+        # scratch next to the pool; charge it before token sizing.
+        from sglang.srt.mem_cache.page_interleave import (
+            compute_page_shard_scratch_bytes,
+        )
+
+        self._fixed_overhead_bytes = compute_page_shard_scratch_bytes(mr)
+
         # EAGLE/STANDALONE: scale cell_size to account for draft model KV cache.
         # Assumes draft and target share the same per-layer KV size (head_dim,
         # num_kv_heads, dtype), which holds for EAGLE/MTP draft models that
@@ -279,6 +287,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int
     ) -> MemoryPoolConfig:
+        available_bytes = max(available_bytes - self._fixed_overhead_bytes, 0)
         max_total_num_tokens = available_bytes // self._cell_size
         max_total_num_tokens = max_total_num_tokens // page_size * page_size
         return MemoryPoolConfig(max_total_num_tokens=max_total_num_tokens)

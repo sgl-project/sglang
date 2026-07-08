@@ -101,6 +101,12 @@ _is_npu = is_npu()
 _is_hip = is_hip()
 
 
+def _get_kv_shard_group_info(model_runner: ModelRunner):
+    from sglang.srt.mem_cache.page_interleave import get_kv_shard_group_info
+
+    return get_kv_shard_group_info(model_runner)
+
+
 class ModelRunnerKVCacheMixin:
     def _profile_available_bytes(self: ModelRunner, pre_model_load_memory: int) -> int:
         # KV pool budget = currently-free GPU memory minus the non-static runtime
@@ -735,6 +741,28 @@ class ModelRunnerKVCacheMixin:
             is_dsa_model, is_dsv4_model, current_platform
         )
 
+        # Logical-page KV sharding: (rank, size) of the shard group, or
+        # (None, 1) when off. Resolved once; consumed by the pool selection
+        # below and the widened allocator branch.
+        kv_shard_rank, kv_shard_size = _get_kv_shard_group_info(self)
+        kv_shard_spec = kv_shard_group = None
+        if kv_shard_rank is not None:
+            from sglang.srt.mem_cache.page_interleave import (
+                PageShardSpec,
+                get_kv_shard_group,
+            )
+            from sglang.srt.utils.common import ceil_align
+
+            granule = kv_shard_size * self.page_size
+            kv_shard_group = get_kv_shard_group(self.use_mla_backend)
+            kv_shard_spec = PageShardSpec(
+                shard_rank=kv_shard_rank,
+                shard_size=kv_shard_size,
+                page_size=self.page_size,
+                max_prefix_tokens=ceil_align(self.model_config.context_len, granule),
+                chunk_tokens=ceil_align(self.server_args.chunked_prefill_size, granule),
+            )
+
         # Page-granularity envelope layout for the MHA-shaped (full / SWA) pools,
         # selected by swapping in the PageMajorMHATokenToKVPool subclass. The
         # default keeps upstream's per-layer layout. The Mamba state pool is routed
@@ -994,7 +1022,17 @@ class ModelRunnerKVCacheMixin:
                     end_layer=self.end_layer,
                 )
             else:
-                self.token_to_kv_pool = MLATokenToKVPool(
+                mla_pool_cls = MLATokenToKVPool
+                mla_pool_kwargs = {}
+                if kv_shard_rank is not None:
+                    from sglang.srt.mem_cache.page_interleave_pool import (
+                        PageInterleaveMLATokenToKVPool,
+                    )
+
+                    mla_pool_cls = PageInterleaveMLATokenToKVPool
+                    mla_pool_kwargs["shard_spec"] = kv_shard_spec
+                    mla_pool_kwargs["shard_group"] = kv_shard_group
+                self.token_to_kv_pool = mla_pool_cls(
                     self.max_total_num_tokens,
                     page_size=self.page_size,
                     dtype=self.kv_cache_dtype,
@@ -1005,6 +1043,7 @@ class ModelRunnerKVCacheMixin:
                     enable_memory_saver=self.server_args.enable_memory_saver,
                     start_layer=self.start_layer,
                     end_layer=self.end_layer,
+                    **mla_pool_kwargs,
                 )
         else:
             if self.is_hybrid_swa:
@@ -1132,6 +1171,19 @@ class ModelRunnerKVCacheMixin:
                         if self.server_args.prefill_only_disable_kv_cache
                         else mha_pool_class
                     )
+                    mha_pool_kwargs = {}
+                    if kv_shard_rank is not None:
+                        from sglang.srt.mem_cache.page_interleave_pool import (
+                            PageInterleaveMHATokenToKVPool,
+                        )
+
+                        assert pool_cls is MHATokenToKVPool, (
+                            "--enable-kv-cache-sharding is incompatible with "
+                            f"the {pool_cls.__name__} pool"
+                        )
+                        pool_cls = PageInterleaveMHATokenToKVPool
+                        mha_pool_kwargs["shard_spec"] = kv_shard_spec
+                        mha_pool_kwargs["shard_group"] = kv_shard_group
                     self.token_to_kv_pool = pool_cls(
                         self.max_total_num_tokens,
                         page_size=self.page_size,
@@ -1151,7 +1203,19 @@ class ModelRunnerKVCacheMixin:
                             self.server_args.speculative_algorithm is not None
                         ),
                         post_capture_active=self.post_capture_kv_active,
+                        **mha_pool_kwargs,
                     )
+
+        if kv_shard_rank is not None:
+            from sglang.srt.mem_cache.page_interleave_pool import (
+                PageInterleaveKVPoolMixin,
+            )
+
+            if not isinstance(self.token_to_kv_pool, PageInterleaveKVPoolMixin):
+                raise ValueError(
+                    "--enable-kv-cache-sharding does not support this model "
+                    f"family (pool {type(self.token_to_kv_pool).__name__})."
+                )
 
         # Initialize token_to_kv_pool_allocator
         need_sort = self.server_args.disaggregation_mode in ("decode", "prefill")
@@ -1241,6 +1305,23 @@ class ModelRunnerKVCacheMixin:
                                 need_sort=need_sort,
                                 host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
                             )
+                        )
+                    elif kv_shard_size > 1:
+                        # Logical-page sharding: index space widened xN over the
+                        # stock 1x pool, allocation granule = N physical pages
+                        # (the DCP configuration at page granularity).
+                        from sglang.srt.mem_cache.allocator.page_interleave import (
+                            PageInterleavePoolAllocator,
+                        )
+
+                        self.token_to_kv_pool_allocator = PageInterleavePoolAllocator(
+                            self.max_total_num_tokens,
+                            physical_page_size=self.page_size,
+                            shard_size=kv_shard_size,
+                            dtype=self.kv_cache_dtype,
+                            device=self.device,
+                            kvcache=self.token_to_kv_pool,
+                            need_sort=need_sort,
                         )
                     elif self.page_size == 1 and self.dcp_size == 1:
                         self.token_to_kv_pool_allocator = TokenToKVPoolAllocator(

@@ -267,6 +267,18 @@ class FlashAttentionBackend(AttentionBackend):
             and model_runner.token_to_kv_pool.swa_layer_nums > 0
         )
 
+        # Logical-page KV sharding: the pool exposing begin_shard_extend /
+        # translate_loc_to_scratch, or None when sharding is off.
+        from sglang.srt.mem_cache.page_interleave_pool import (
+            PageInterleaveKVPoolMixin,
+        )
+
+        self.kv_shard_pool = (
+            model_runner.token_to_kv_pool
+            if isinstance(model_runner.token_to_kv_pool, PageInterleaveKVPoolMixin)
+            else None
+        )
+
         self.topk = model_runner.server_args.speculative_eagle_topk or 0
         self.speculative_num_steps = speculative_num_steps
         self.speculative_num_draft_tokens = (
@@ -940,6 +952,27 @@ class FlashAttentionBackend(AttentionBackend):
                         forward_batch.out_cache_loc
                     )
                 )
+
+        # Logical-page KV sharding: capture the batch's gather plan and swap
+        # the page table to scratch rows (a parallel translate like the SWA
+        # block above). During a sharded extend the pool serves attention from
+        # its assembled [prefix | chunk] scratch, never from the striped pool
+        # rows; the plan capture also kicks the first layer's prefix gather.
+        if self.kv_shard_pool is not None:
+            if forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed(
+                include_draft_extend_v2=True
+            ):
+                self.kv_shard_pool.begin_shard_extend(
+                    self.req_to_token,
+                    forward_batch.req_pool_indices,
+                    forward_batch.extend_prefix_lens_cpu,
+                    forward_batch.seq_lens_cpu,
+                )
+                metadata.page_table = self.kv_shard_pool.translate_loc_to_scratch(
+                    metadata.page_table
+                ).to(torch.int32)
+            else:
+                self.kv_shard_pool.end_shard_extend()
 
         # Convert the page table to a strided format which is needed by FA3 API
         if self.page_size > 1:

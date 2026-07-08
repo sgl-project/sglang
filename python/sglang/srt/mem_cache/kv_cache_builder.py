@@ -27,6 +27,7 @@ from sglang.srt.configs.model_config import ModelImpl
 from sglang.srt.environ import envs
 from sglang.srt.layers.dcp import dcp_enabled
 from sglang.srt.managers.mm_utils import init_mm_embedding_cache
+from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.registry import TreeCacheBuildContext, create_tree_cache
 from sglang.srt.model_loader.utils import get_resolved_model_impl
@@ -202,11 +203,15 @@ def build_kv_cache(
         disable=disable_radix_cache,
         req_to_token_pool=req_to_token_pool,
         token_to_kv_pool_allocator=token_to_kv_pool_allocator,
-        # When dcp enabled, kv_pool_allocator.page_size is page_size * dcp_size.
-        # TreeCache.page_size should keep the same as allocator.page_size to
-        # avoid kv page eviction conflicts.
+        # When DCP or logical-page KV sharding is enabled, the allocator's
+        # page_size is widened (page_size * group size). TreeCache.page_size
+        # must follow the allocator's page so match/insert/evict quantize on
+        # whole allocator pages and never free a partially-shared group.
         page_size=(
-            page_size if not dcp_enabled() else token_to_kv_pool_allocator.page_size
+            token_to_kv_pool_allocator.page_size
+            if dcp_enabled()
+            or page_interleave_shard_size(token_to_kv_pool_allocator) > 1
+            else page_size
         ),
         is_eagle=spec_algorithm.is_eagle(),
         tp_cache_group=(
