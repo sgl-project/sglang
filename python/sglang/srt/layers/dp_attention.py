@@ -100,10 +100,14 @@ class DpPaddingMode(IntEnum):
 
 
 class _DpGatheredBufferWrapper:
+    """Facade for the DP gathered-buffer state: allocation metadata lives on
+    ``flags.dp`` (set once at initialize_dp_attention). The per-forward
+    sizing quartet stays as class attributes: the values are read inside
+    torch.compile-traced model code, and attribute-source ints get dynamo's
+    automatic-dynamic treatment, while contextvars are untraceable and dict
+    slots value-guard into the recompile limit (one recompile per distinct
+    size)."""
 
-    _hidden_size: int
-    _dtype: torch.dtype
-    _device: torch.device
     _global_dp_buffer_len: int
     _local_dp_buffer_len: int
     _dp_max_padding: bool
@@ -111,9 +115,12 @@ class _DpGatheredBufferWrapper:
 
     @classmethod
     def set_metadata(cls, hidden_size: int, dtype: torch.dtype, device: torch.device):
-        cls._hidden_size = hidden_size
-        cls._dtype = dtype
-        cls._device = device
+        from sglang.srt.runtime_context import get_flags
+
+        dp = get_flags().dp
+        dp.buffer_hidden_size = hidden_size
+        dp.buffer_dtype = dtype
+        dp.buffer_device = device
 
     @classmethod
     def set_dp_buffer_len(
@@ -130,21 +137,27 @@ class _DpGatheredBufferWrapper:
 
     @classmethod
     def get_global_dp_buffer(cls, group: GroupCoordinator) -> torch.Tensor:
+        from sglang.srt.runtime_context import get_flags
+
+        dp = get_flags().dp
         with use_symmetric_memory(group, disabled=not cls._dp_max_padding):
             buffer = torch.empty(
-                (cls._global_dp_buffer_len, cls._hidden_size),
-                dtype=cls._dtype,
-                device=cls._device,
+                (cls._global_dp_buffer_len, dp.buffer_hidden_size),
+                dtype=dp.buffer_dtype,
+                device=dp.buffer_device,
             )
         return buffer
 
     @classmethod
     def get_local_dp_buffer(cls, group: GroupCoordinator) -> torch.Tensor:
+        from sglang.srt.runtime_context import get_flags
+
+        dp = get_flags().dp
         with use_symmetric_memory(group, disabled=not cls._dp_max_padding):
             buffer = torch.empty(
-                (cls._local_dp_buffer_len, cls._hidden_size),
-                dtype=cls._dtype,
-                device=cls._device,
+                (cls._local_dp_buffer_len, dp.buffer_hidden_size),
+                dtype=dp.buffer_dtype,
+                device=dp.buffer_device,
             )
         return buffer
 
@@ -162,15 +175,21 @@ class _DpGatheredBufferWrapper:
 
     @classmethod
     def get_dp_hidden_size(cls) -> int:
-        return cls._hidden_size
+        from sglang.srt.runtime_context import get_flags
+
+        return get_flags().dp.buffer_hidden_size
 
     @classmethod
     def get_dp_dtype(cls) -> torch.dtype:
-        return cls._dtype
+        from sglang.srt.runtime_context import get_flags
+
+        return get_flags().dp.buffer_dtype
 
     @classmethod
     def get_dp_device(cls) -> torch.device:
-        return cls._device
+        from sglang.srt.runtime_context import get_flags
+
+        return get_flags().dp.buffer_device
 
     @classmethod
     def is_dp_max_padding(cls) -> bool:
