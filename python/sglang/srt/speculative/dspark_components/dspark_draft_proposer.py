@@ -141,6 +141,10 @@ class DraftBlockProposer:
             spec_info=self._draft_block_spec_info,
             capture_hidden_mode=CaptureHiddenMode.NULL,
         )
+        idle_batch.num_token_non_padded = torch.zeros(
+            (1,), dtype=torch.int32, device=device
+        )
+        idle_batch.num_token_non_padded_cpu = 0
         self._fill_dp_moe_sync_metadata(idle_batch, batch)
         with torch.inference_mode():
             self.draft_model_runner.forward(idle_batch)
@@ -197,6 +201,10 @@ class DraftBlockProposer:
             spec_info=self._draft_block_spec_info,
             capture_hidden_mode=CaptureHiddenMode.NULL,
         )
+        draft_forward_batch.num_token_non_padded = torch.tensor(
+            draft_block_ids.numel(), dtype=torch.int32, device=device
+        )
+        draft_forward_batch.num_token_non_padded_cpu = draft_block_ids.numel()
         self._fill_dp_moe_sync_metadata(draft_forward_batch, batch)
         with torch.inference_mode():
             draft_out = self.draft_model_runner.forward(draft_forward_batch)
