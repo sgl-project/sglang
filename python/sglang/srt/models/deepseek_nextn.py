@@ -287,6 +287,25 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         },
     )
 
+    def _resolve_nextn_quant_config(self, config, quant_config):
+        """Resolve the quant config used to build the nextn (MTP) model.
+
+        For quark, if the whole MTP/nextn layer is kept unquantized (bf16) and
+        listed in the checkpoint `exclude` set, drop quant for the nextn model.
+        Subclasses (e.g. GLM) override this to do finer, prefix-aware exclude
+        remapping so that mixed-precision MTP layers are handled correctly.
+        """
+        if quant_config is None or quant_config.get_name() != "quark":
+            return quant_config
+
+        from sglang.srt.layers.quantization.quark.utils import should_ignore_layer
+
+        ckpt_prefix = f"model.layers.{config.num_hidden_layers}"
+        mapped_prefix = self.hf_to_sglang_mapper._map_name(ckpt_prefix)
+        if should_ignore_layer(mapped_prefix, quant_config.exclude_layers):
+            return None
+        return quant_config
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -310,17 +329,7 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
             self.cp_rank = None
             self.cp_size = None
 
-        nextn_quant_config = quant_config
-        # For quark, if the MTP layer is listed in exclude_layers, set quant_config to None.
-        if nextn_quant_config is not None and nextn_quant_config.get_name() == "quark":
-            from sglang.srt.layers.quantization.quark.utils import (
-                should_ignore_layer,
-            )
-
-            ckpt_prefix = f"model.layers.{config.num_hidden_layers}"
-            mapped_prefix = self.hf_to_sglang_mapper._map_name(ckpt_prefix)
-            if should_ignore_layer(mapped_prefix, nextn_quant_config.exclude_layers):
-                nextn_quant_config = None
+        nextn_quant_config = self._resolve_nextn_quant_config(config, quant_config)
 
         self.model = DeepseekModelNextN(
             config, nextn_quant_config, prefix=add_prefix("model", prefix)
