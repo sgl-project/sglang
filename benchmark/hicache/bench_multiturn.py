@@ -445,20 +445,25 @@ class WorkloadGenerator:
                 self.client_records[client_id]["round"] += 1
 
                 if not response.success:
-                    self.failures.append({
-                        "client_id": client_id,
-                        "round": current_round,
-                        "error": response.error or "(no error message)",
-                        "prompt_len": response.prompt_len,
-                        "timestamp": datetime.now().isoformat(),
-                    })
+                    self.failures.append(
+                        {
+                            "client_id": client_id,
+                            "round": current_round,
+                            "error": response.error or "(no error message)",
+                            "prompt_len": response.prompt_len,
+                            "timestamp": datetime.now().isoformat(),
+                        }
+                    )
                     self.completed_requests += 1
                 else:
                     # Extend history with response
                     if self.api_format == "openai":
                         if response.generated_text:
                             self.client_records[client_id]["history"].append(
-                                {"role": "assistant", "content": response.generated_text}
+                                {
+                                    "role": "assistant",
+                                    "content": response.generated_text,
+                                }
                             )
                     else:
                         self.client_records[client_id]["history"].extend(
@@ -468,12 +473,16 @@ class WorkloadGenerator:
                     self.performance_metrics["itl"].extend(response.itl)
                     self.performance_metrics["latency"].append(response.latency)
                     self.performance_metrics["prompt_len"].append(response.prompt_len)
-                    self.performance_metrics["cached_tokens"].append(response.cached_tokens)
-                    self.performance_metrics["generated_len"].append(response.generated_len)
+                    self.performance_metrics["cached_tokens"].append(
+                        response.cached_tokens
+                    )
+                    self.performance_metrics["generated_len"].append(
+                        response.generated_len
+                    )
                     if self.enable_round_barrier:
-                        self.performance_metrics[f"round_{current_round}"]["ttft"].append(
-                            response.ttft
-                        )
+                        self.performance_metrics[f"round_{current_round}"][
+                            "ttft"
+                        ].append(response.ttft)
                         self.performance_metrics[f"round_{current_round}"][
                             "latency"
                         ].append(response.latency)

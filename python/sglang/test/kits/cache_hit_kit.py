@@ -33,7 +33,9 @@ async def async_request_sglang_generate(
 
         try:
             async with session.post(
-                url=url, json=payload, headers=headers,
+                url=url,
+                json=payload,
+                headers=headers,
                 timeout=STREAM_REQUEST_TIMEOUT,
             ) as response:
                 if response.status == 200:
@@ -127,7 +129,8 @@ async def async_request_openai_chat_completions(
 
         try:
             async with session.post(
-                url=url, json=payload,
+                url=url,
+                json=payload,
                 timeout=STREAM_REQUEST_TIMEOUT,
             ) as response:
                 if response.status == 200:
@@ -189,7 +192,9 @@ async def async_request_openai_chat_completions(
                         output.prompt_len = prompt_tokens
                         output.cached_tokens = cached_tokens
                         output.generated_len = (
-                            completion_tokens if completion_tokens else len(output.itl) + 1
+                            completion_tokens
+                            if completion_tokens
+                            else len(output.itl) + 1
                         )
                 else:
                     try:
