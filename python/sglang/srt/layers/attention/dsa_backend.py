@@ -990,7 +990,7 @@ class DeepseekSparseAttnBackend(
                     cache_seqlens=dsa_cache_seqlens_int32,
                     seq_len_q=1,
                 )
-                if use_flashmla_kv
+                if use_flashmla_kv and not _is_xpu
                 else None
             ),
             paged_mqa_schedule_metadata=paged_mqa_schedule_metadata,

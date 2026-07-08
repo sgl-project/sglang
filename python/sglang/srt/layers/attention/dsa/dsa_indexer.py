@@ -1055,7 +1055,12 @@ class Indexer(MultiPlatformOp):
         if cached_budget is not None:
             return cached_budget
 
-        total_mem = torch.cuda.get_device_properties(device_index).total_memory
+        if _is_xpu:
+            import torch.xpu
+
+            total_mem = torch.xpu.get_device_properties(device_index).total_memory
+        else:
+            total_mem = torch.cuda.get_device_properties(device_index).total_memory
 
         total_mem_budget = int(total_mem * self._MQA_LOGITS_TOTAL_MEM_FRACTION)
         mem_fraction_static = get_global_server_args().mem_fraction_static
@@ -1076,10 +1081,14 @@ class Indexer(MultiPlatformOp):
             return static_budget
 
         # Match the original free-memory guard: logits_bytes * 2 > free_mem.
-        # torch.cuda.mem_get_info synchronizes the host, so cache the result,
-        # capped by the workload-independent serving-memory headroom.
-        free_mem, _ = torch.cuda.mem_get_info(device_index)
-        budget_bytes = min(int(free_mem * free_mem_fraction), static_budget)
+        # Synchronizes the host; cache the result capped by serving-memory headroom.
+        if _is_xpu:
+            # On XPU, use total_mem budget as the free-memory estimate;
+            # dynamic free-memory query is not supported the same way as CUDA.
+            budget_bytes = static_budget
+        else:
+            free_mem, _ = torch.cuda.mem_get_info(device_index)
+            budget_bytes = min(int(free_mem * free_mem_fraction), static_budget)
 
         budget_bytes = max(1, budget_bytes)
         self._mqa_logits_budget_bytes[device_index] = budget_bytes

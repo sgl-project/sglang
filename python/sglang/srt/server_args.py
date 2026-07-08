@@ -4090,9 +4090,20 @@ class ServerArgs:
                     import os
 
                     os.environ.setdefault("SGLANG_DSA_FUSE_TOPK", "0")
+                    # Disable CUDA-JIT topk-v2 (TileLang/TVM-based, requires CUDA)
+                    envs.SGLANG_OPT_USE_TOPK_V2.set(False)
                     logger.warning(
                         f"Set DSA backends for XPU: prefill={self.dsa_prefill_backend}, decode={self.dsa_decode_backend}."
                     )
+                    # Use dsa as the decode attention backend so HybridAttnBackend
+                    # contains a DeepseekSparseAttnBackend that manages the DSA
+                    # indexer (K-cache store + fp8 logit computation).
+                    # XPUAttentionBackend ("intel_xpu") lacks indexer support.
+                    # The prefill attention backend is set to triton because the kernel of flash MLA for prefill is missing in sgl-kernel-xpu.
+                    if self.decode_attention_backend is None:
+                        self.decode_attention_backend = "dsa"
+                    if self.prefill_attention_backend is None:
+                        self.prefill_attention_backend = "triton"
 
                 if self.enable_prefill_cp:
                     assert (

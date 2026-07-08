@@ -58,6 +58,14 @@ class HybridAttnBackend(AttentionBackend):
     ):
         backend = self._select_backend(forward_batch.forward_mode)
         backend.init_forward_metadata_out_graph(forward_batch, in_capture=in_capture)
+        # If the selected backend is not the decode backend, also initialize
+        # the decode backend so that get_indexer_metadata works for prefill
+        # (e.g., Triton prefill + DSA decode hybrid, where only the DSA decode
+        # backend manages the DSA index K-cache).
+        if backend is not self.decode_backend:
+            self.decode_backend.init_forward_metadata_out_graph(
+                forward_batch, in_capture=in_capture
+            )
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
         backend = self._select_backend(forward_batch.forward_mode)
@@ -66,6 +74,8 @@ class HybridAttnBackend(AttentionBackend):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         backend = self._select_backend(forward_batch.forward_mode)
         backend.init_forward_metadata(forward_batch)
+        if backend is not self.decode_backend:
+            self.decode_backend.init_forward_metadata(forward_batch)
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         self.decode_backend.init_cuda_graph_state(max_bs, max_num_tokens)
@@ -140,6 +150,13 @@ class HybridAttnBackend(AttentionBackend):
     def get_indexer_metadata(
         self, layer_id: int, forward_batch: ForwardBatch
     ) -> Optional[BaseIndexerMetadata]:
+        # The DSA indexer (K-cache storage + logit computation) always uses the
+        # decode backend because the decode backend (DeepseekSparseAttnBackend)
+        # maintains the DSA index K-cache. The prefill attention backend (e.g.
+        # Triton) handles the main attention but does not manage the DSA index.
+        meta = self.decode_backend.get_indexer_metadata(layer_id, forward_batch)
+        if meta is not None:
+            return meta
         backend = self._select_backend(forward_batch.forward_mode)
         return backend.get_indexer_metadata(layer_id, forward_batch)
 

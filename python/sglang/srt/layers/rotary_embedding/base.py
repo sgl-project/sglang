@@ -471,8 +471,16 @@ class RotaryEmbedding(MultiPlatformOp):
             )
             return query, key
         else:
-            # Use fallback kernel of 'rotary_embedding'
-            return torch.ops.sgl_kernel.rotary_embedding(
+            # Use fallback kernel of 'rotary_embedding'.
+            # The kernel requires 3D tensors (batch, num_heads, head_size);
+            # add a num_heads=1 dim for 2D tensors (e.g. DSA indexer k_rope).
+            q_2d = query.dim() == 2
+            k_2d = key.dim() == 2
+            if q_2d:
+                query = query.unsqueeze(1)
+            if k_2d:
+                key = key.unsqueeze(1)
+            q_out, k_out = torch.ops.sgl_kernel.rotary_embedding(
                 positions,
                 query,
                 key,
@@ -480,6 +488,11 @@ class RotaryEmbedding(MultiPlatformOp):
                 self.cos_sin_cache,
                 self.is_neox_style,
             )
+            if q_2d:
+                q_out = q_out.squeeze(1)
+            if k_2d:
+                k_out = k_out.squeeze(1)
+            return q_out, k_out
 
 
 class LinearScalingRotaryEmbedding(RotaryEmbedding):
