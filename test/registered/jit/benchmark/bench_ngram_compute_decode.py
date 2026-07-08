@@ -20,6 +20,7 @@ register_cuda_ci(
 NE_N = 8
 NE_K = 2
 VOCAB_SIZE = 32000
+EOS_TOKEN_ID = VOCAB_SIZE
 MAX_CONTEXT_LEN = 1024
 BATCH_SIZE_LIST = get_benchmark_range(
     full_range=[1, 2, 8, 32, 128, 512, 1024, 2048, 4096],
@@ -99,6 +100,7 @@ def benchmark(batch_size: int, provider: str):
                 row_indices,
                 column_starts,
                 n_gram_ids,
+                EOS_TOKEN_ID,
             )
 
     else:
@@ -114,6 +116,7 @@ def benchmark(batch_size: int, provider: str):
                 row_indices,
                 column_starts,
                 n_gram_ids,
+                EOS_TOKEN_ID,
             )
 
     return run_benchmark_no_cudagraph(fn)
