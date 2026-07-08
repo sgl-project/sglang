@@ -2033,6 +2033,15 @@ class DeepseekSparseAttnBackend(
                 page_table_1=page_table_1,
                 layer=layer,
             )
+        elif dsa_impl == "intel_xpu":
+            return self._forward_intel_xpu_dense_prefill(
+                q_nope=q_nope,
+                q_rope=q_rope,
+                kv_cache=kv_cache,
+                v_head_dim=layer.v_head_dim,
+                sm_scale=layer.scaling,
+                metadata=metadata,
+            )
         else:
             raise ValueError(
                 f"Unsupported {dsa_impl = } for forward_extend. Consider using an other attention backend."
@@ -2513,6 +2522,52 @@ class DeepseekSparseAttnBackend(
         )
         return o
 
+    def _forward_intel_xpu_dense_prefill(
+        self,
+        q_nope: torch.Tensor,
+        q_rope: torch.Tensor,
+        kv_cache: torch.Tensor,
+        v_head_dim: int,
+        sm_scale: float,
+        metadata: DSAMetadata,
+    ) -> torch.Tensor:
+        """Dense prefill for XPU using flash_mla_prefill.
+
+        Runs full causal MLA attention over all KV positions (no sparse top-K
+        selection).  This is the XPU equivalent of the CUDA flashmla_kv /
+        flashmla_sparse prefill paths.
+        """
+        from sgl_kernel import flash_mla_prefill, flash_mla_prefill_get_workspace_size
+
+        D_ckv = kv_cache.shape[-1]
+        # kv_cache: (N_tokens, 1, D_ckv) from MLATokenToKVPool → (N_pages, page_size, D_ckv)
+        kv_paged = kv_cache.view(-1, self.real_page_size, D_ckv)
+
+        block_table = metadata.real_page_table  # (B, max_pages), page-indexed int32
+        seq_lens_k = metadata.cache_seqlens_int32  # (B,) total KV lengths
+        cu_seqlens_q = metadata.cu_seqlens_q  # (B+1,) cumulative Q lengths
+        max_seqlen_q = metadata.max_seq_len_q
+
+        max_seq_len_k = int(seq_lens_k.max().item())
+        ws_size = flash_mla_prefill_get_workspace_size(
+            max_seq_len_k, seq_lens_k.shape[0]
+        )
+        workspace = torch.empty(ws_size, device=q_nope.device, dtype=torch.uint8)
+
+        return flash_mla_prefill(
+            q_nope,
+            q_rope,
+            kv_paged,
+            cu_seqlens_q,
+            seq_lens_k,
+            max_seqlen_q,
+            block_table,
+            workspace,
+            sm_scale,
+            causal=True,
+            num_kv_splits=1,
+        )
+
     def _forward_aiter(
         self,
         q_all: torch.Tensor,
@@ -2873,11 +2928,12 @@ class DeepseekSparseAttnBackend(
             sum_seq_lens = sum(forward_batch.seq_lens_cpu)
             device_sm = get_device_sm()
 
-            # Requirements: H200/B200/XPU, short sequences, supported dtype, fits in chunk
+            # Requirements: H200/B200, short sequences, supported dtype, fits in chunk
+            # XPU uses flash_mla_prefill for all prefill lengths; MHA_ONE_SHOT not needed.
             self.use_mha = (
                 (
-                    device_sm == 90 or (device_sm >= 100 and device_sm < 110) or _is_xpu
-                )  # SM90/SM100/XPU
+                    device_sm == 90 or (device_sm >= 100 and device_sm < 110)
+                )  # SM90/SM100 only (not XPU)
                 and max_kv_len
                 <= envs.SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.get()  # Short enough for MHA
                 and self.token_to_kv_pool.dtype in [torch.bfloat16, torch.float8_e4m3fn]

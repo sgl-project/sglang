@@ -4080,9 +4080,7 @@ class ServerArgs:
                             f"Setting KV cache dtype to {self.kv_cache_dtype} for DeepSeek DSA on XPU."
                         )
                     if self.dsa_prefill_backend is None:
-                        self.dsa_prefill_backend = (
-                            "flashmla_kv"  # Not used when MHA_ONE_SHOT is active
-                        )
+                        self.dsa_prefill_backend = "intel_xpu"
                     if self.dsa_decode_backend is None:
                         self.dsa_decode_backend = "intel_xpu"
                     self.dsa_topk_backend = "torch"
@@ -4095,15 +4093,15 @@ class ServerArgs:
                     logger.warning(
                         f"Set DSA backends for XPU: prefill={self.dsa_prefill_backend}, decode={self.dsa_decode_backend}."
                     )
-                    # Use dsa as the decode attention backend so HybridAttnBackend
-                    # contains a DeepseekSparseAttnBackend that manages the DSA
-                    # indexer (K-cache store + fp8 logit computation).
-                    # XPUAttentionBackend ("intel_xpu") lacks indexer support.
-                    # The prefill attention backend is set to triton because the kernel of flash MLA for prefill is missing in sgl-kernel-xpu.
+                    # Use dsa for both prefill and decode so DeepseekSparseAttnBackend
+                    # handles the full forward pass (KV cache store, DSA indexer, and
+                    # MLA attention) without needing a HybridAttnBackend.
                     if self.decode_attention_backend is None:
                         self.decode_attention_backend = "dsa"
+                    # Prefill now uses flash_mla_prefill via the intel_xpu dsa path;
+                    # no longer needs a separate Triton backend.
                     if self.prefill_attention_backend is None:
-                        self.prefill_attention_backend = "triton"
+                        self.prefill_attention_backend = "dsa"
 
                 if self.enable_prefill_cp:
                     assert (
