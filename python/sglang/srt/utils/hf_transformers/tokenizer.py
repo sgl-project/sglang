@@ -511,6 +511,29 @@ def get_tokenizer(
                 tokenizer_name, *args, **common_kwargs
             )
 
+        # Transformers v5 may load a fast tokenizer via slow to fast conversion
+        # (e.g. InternLM2Converter) when tokenizer.json is missing. The
+        # conversion can introduce tokenization differences that hurt accuracy.
+        # Fall back to the declared slow tokenizer when possible.
+        if isinstance(tokenizer, PreTrainedTokenizerFast):
+            tokenizer_json = Path(tokenizer_name) / "tokenizer.json"
+            if not tokenizer_json.is_file():
+                slow = _load_tokenizer_by_declared_class(
+                    tokenizer_name,
+                    *args,
+                    **{**common_kwargs, "use_fast": False},
+                )
+                if slow is not None and not isinstance(
+                    slow, PreTrainedTokenizerFast
+                ):
+                    logger.warning(
+                        "Fast tokenizer for %s was created via slow to fast "
+                        "conversion (no tokenizer.json). Falling back to "
+                        "slow tokenizer for accuracy.",
+                        tokenizer_name,
+                    )
+                    tokenizer = slow
+
         return _apply_post_load_fixes(tokenizer, tokenizer_name, tokenizer_revision)
     except Exception as e:
         if tokenizer_backend == "fastokens":
