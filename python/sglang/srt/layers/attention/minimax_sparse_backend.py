@@ -1267,6 +1267,13 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         query_positions = (per_query_seq_lens.to(torch.long) - 1).clamp(min=0)
         topk_merged = self._merge_sparse_blocks(topk_2d, query_positions, max_blocks)
         topk_idx = topk_merged.permute(1, 0, 2).contiguous()
+        # Guard the merged top-k: clamp into valid logical-block range [-1, max_blocks-1].
+        # -1 is the skip sentinel; real blocks are >= 0. Prevents the main kernel from
+        # indexing block_table_f past its column dim if _merge_sparse_blocks appended a
+        # local/init block beyond the query's real KV extent. Mirrors the verify path
+        # (the clamp at the verify main). Real indices already in-range -> correctness
+        # unchanged; this only sanitizes out-of-range entries.
+        topk_idx = topk_idx.clamp(min=-1, max=max_blocks - 1).to(torch.int32)
 
         # 4) main sparse attention over the selected blocks.
         # Default: per-query **decode main** (validated, ~10ms/sparse-layer). The
@@ -1290,8 +1297,19 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 torch.arange(max_blocks, device=q.device, dtype=torch.long) * page_size
             )
             blk_cols_f = blk_cols_f.clamp(max=max_cols - 1)
-            token_slots_f = self.req_to_token[per_query_req][:, blk_cols_f]
+            # Advanced-index directly to [total_q, max_blocks] -- avoid the
+            # `req_to_token[per_query_req][:, blk_cols_f]` form which materializes
+            # [total_q, max_context_len] (1.6 GB at ctx 131072) and OOMs. See the
+            # matching fix in prefill_block_score._build_qblock_mappings.
+            token_slots_f = self.req_to_token[per_query_req[:, None], blk_cols_f]
             block_table_f = (token_slots_f // page_size).to(torch.int32)
+            # Sanitize block_table_f: columns beyond a query's real KV length may hold
+            # stale/garbage page ids from pool reuse, and _merge_sparse_blocks can
+            # append an init/local block past the real KV extent (see verify-path
+            # comment). Clamp every page id into [0, num_pages) so the main kernel can
+            # never OOB / dereference a garbage page id (the device-memory-fault
+            # `image_word=bb33bb33` seen in long-context prefill). Mirrors verify.
+            block_table_f = block_table_f.clamp(min=0, max=num_pages - 1)
             return flash_decode_bnsd_with_gqa_share_sparse(
                 q=q,
                 sink=None,
