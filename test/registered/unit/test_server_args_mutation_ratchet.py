@@ -40,15 +40,12 @@ _MUTATION_PATTERNS = [
     re.compile(r"get_(?:global_)?server_args\(\)\.[a-z0-9_]+\s*=(?![=}])"),
 ]
 
-# The resolution pipeline itself (mutation is its job); multimodal_gen, whose
-# ServerArgs is a different class outside this contract; and the sanctioned
-# mock-fixture factory (bare object.__new__ instances never materialize, so
-# the strict guard does not apply to their construction).
+# The resolution pipeline itself (mutation is its job) and multimodal_gen,
+# whose ServerArgs is a different class outside this contract.
 _EXCLUDED = (
     "srt/server_args.py",
     "srt/arg_groups",
     "multimodal_gen",
-    "test/kits/attention_unittest/mock_server_args.py",
 )
 
 _BASELINE = 0

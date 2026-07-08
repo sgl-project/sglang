@@ -208,6 +208,86 @@ class TestServerArgsOwnership(_IsolatedServerArgs):
         with self.assertRaises(ValueError):
             get_server_args()
 
+
+class TestServerArgsScopedOverride(_IsolatedServerArgs):
+    """ctx.override_server_args: the config tier's scoped test override —
+    tests force execution paths by overriding the context, not by
+    hand-building and publishing config objects."""
+
+    def test_install_publishes_fresh_config_with_fields(self):
+        reset_context()
+        override = get_context().override_server_args(
+            attention_backend="triton", chunked_prefill_size=-1
+        )
+        published = override.install()
+        self.assertIs(get_server_args(), published)
+        self.assertEqual(published.attention_backend, "triton")
+        self.assertEqual(published.chunked_prefill_size, -1)
+        # unnamed fields keep their dataclass defaults
+        self.assertEqual(published.tp_size, 1)
+
+    def test_fields_carry_provenance(self):
+        published = get_context().override_server_args(tp_size=4).install()
+        self.assertIn(("test-override", {"tp_size": 4}), published._runtime_mutations)
+
+    def test_restore_reinstates_previous_publish(self):
+        previous = object()
+        get_context().set_server_args(previous)
+        override = get_context().override_server_args(tp_size=8)
+        override.install()
+        self.assertEqual(get_server_args().tp_size, 8)
+        override.restore()
+        self.assertIs(get_server_args(), previous)
+
+    def test_restore_reinstates_the_empty_slot(self):
+        reset_context()
+        with get_context().override_server_args():
+            get_server_args()  # published inside the scope
+        with self.assertRaises(ValueError):
+            get_server_args()
+
+    def test_nesting_restores_in_order(self):
+        reset_context()
+        with get_context().override_server_args(tp_size=2) as outer:
+            with get_context().override_server_args(tp_size=4):
+                self.assertEqual(get_server_args().tp_size, 4)
+            self.assertIs(get_server_args(), outer)
+            self.assertEqual(get_server_args().tp_size, 2)
+
+    def test_private_attribute_seeding(self):
+        # Property caches (e.g. _mamba_cache_chunk_size) are seeded through
+        # the same call; the strict guard exempts underscore names.
+        published = (
+            get_context().override_server_args(_mamba_cache_chunk_size=64).install()
+        )
+        self.assertEqual(published.mamba_cache_chunk_size, 64)
+
+    def test_installed_config_arms_the_strict_guard(self):
+        # The published dummy must behave like a resolved config: bare writes
+        # raise under the strict harness; override() stays the entry point.
+        published = get_context().override_server_args(tp_size=2).install()
+        with self.assertRaises(AttributeError):
+            published.tp_size = 4
+        published.override(source="test", tp_size=4)
+        self.assertEqual(published.tp_size, 4)
+
+    def test_restore_resets_the_capture_seed(self):
+        # install() seeds flags.capture from the published dummy; restore()
+        # must put back the pre-install runtime state on both restore paths.
+        reset_context()
+        self.assertFalse(get_flags().capture.enable_torch_compile)
+        override = get_context().override_server_args(enable_torch_compile=True)
+        override.install()
+        self.assertTrue(get_flags().capture.enable_torch_compile)
+        override.restore()
+        self.assertFalse(get_flags().capture.enable_torch_compile)
+
+    def test_double_install_rejected(self):
+        override = get_context().override_server_args()
+        override.install()
+        with self.assertRaises(AssertionError):
+            override.install()
+
     def test_module_global_removed(self):
         # The legacy storage must not survive: a stale _global_server_args would
         # silently fork the config into two objects.

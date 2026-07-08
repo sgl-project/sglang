@@ -558,6 +558,87 @@ class RuntimeContext:
         )
         self._server_args = server_args
 
+    def override_server_args(self, **fields) -> _ServerArgsOverride:
+        """Test-only scoped override for the config tier — the sibling of
+        ``get_parallel().override()`` and the flag groups' ``override()``:
+        tests force execution paths by overriding the context instead of
+        hand-building config objects.
+
+        ``install()`` (or entering it as a context manager) publishes a fresh
+        dummy-boundary ``ServerArgs`` carrying ``fields`` and returns it;
+        ``restore()`` (or exiting) reinstates whatever the slot held before.
+
+        Transitional — to be deprecated: it exists because production code
+        still branches on raw ``server_args`` fields at runtime, so forcing a
+        path needs a full config in the slot. As those readers migrate onto
+        the named runtime tiers (flags / resources / forward), prefer the
+        finer-grained overrides; once they cover the branching surface this
+        override loses its clients and goes away.
+        """
+        return _ServerArgsOverride(self, fields)
+
+
+class _ServerArgsOverride:
+    """Scoped config override (see ``RuntimeContext.override_server_args``).
+
+    Deliberately a plain class rather than a generator context manager:
+    fixtures that live for a whole test case install the override without a
+    ``with`` block, and a suspended generator would run its restore whenever
+    the garbage collector closes it — un-publishing the active config at a
+    nondeterministic point.
+    """
+
+    __slots__ = ("_context", "_fields", "_previous", "_previous_capture", "_installed")
+
+    def __init__(self, context: RuntimeContext, fields: dict):
+        self._context = context
+        self._fields = fields
+        self._previous: ServerArgs | None = None
+        self._previous_capture = False
+        self._installed = False
+
+    def install(self) -> ServerArgs:
+        """Publish a fresh dummy-boundary ``ServerArgs`` carrying the
+        overrides (written through ``ServerArgs.override`` for provenance);
+        returns the published instance."""
+        from sglang.srt.server_args import ServerArgs
+
+        assert not self._installed, "override_server_args already installed"
+        self._previous = self._context._server_args
+        self._previous_capture = self._context.flags.capture.enable_torch_compile
+        server_args = ServerArgs(model_path="dummy")
+        if self._fields:
+            server_args.override(source="test-override", **self._fields)
+        # The dummy boundary skips materialization, which would leave the
+        # strict mutation guard unarmed on the published object — mark it
+        # materialized so bare post-publish writes raise like they do on a
+        # fully resolved config.
+        object.__setattr__(server_args, "_declarations_materialized", True)
+        self._context.set_server_args(server_args)
+        self._installed = True
+        return server_args
+
+    def restore(self) -> None:
+        """Reinstate the previously published config (or the empty slot)."""
+        if not self._installed:
+            return
+        self._installed = False
+        previous, self._previous = self._previous, None
+        if previous is None:
+            self._context._server_args = None
+        else:
+            self._context.set_server_args(previous)
+        # set_server_args reseeds the capture tier from the published object
+        # (and the empty-slot path does not touch it at all); the snapshot
+        # puts back the exact pre-install runtime state either way.
+        self._context.flags.capture.enable_torch_compile = self._previous_capture
+
+    def __enter__(self) -> ServerArgs:
+        return self.install()
+
+    def __exit__(self, *exc) -> None:
+        self.restore()
+
 
 _PARALLEL = ParallelContext()
 _CONTEXT = RuntimeContext(parallel=_PARALLEL)
