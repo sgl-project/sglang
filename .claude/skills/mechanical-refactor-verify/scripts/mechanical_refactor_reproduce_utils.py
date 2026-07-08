@@ -174,9 +174,9 @@ def _find_unique_def(
         and node.name == name
     ]
     assert matches, f"{name} not found in {where}"
-    assert len(matches) == 1, (
-        f"{len(matches)} defs named {name} in {where}; pass from_class to disambiguate"
-    )
+    assert (
+        len(matches) == 1
+    ), f"{len(matches)} defs named {name} in {where}; pass from_class to disambiguate"
     return matches[0]
 
 
@@ -606,13 +606,17 @@ class Repro:
                 # colon opens the body). node.body[0].lineno would skip over any leading
                 # comment/blank lines (not AST nodes), wrongly absorbing them into the
                 # delegate, so the header end is found by tokenizing the def.
-                header_end = node.lineno - 1 + _def_header_end(
-                    "".join(src_lines[node.lineno - 1 : end])
+                header_end = (
+                    node.lineno
+                    - 1
+                    + _def_header_end("".join(src_lines[node.lineno - 1 : end]))
                 )
                 signature = src_lines[start - 1 : header_end]
                 body_indent = " " * node.body[0].col_offset
                 returning = (
-                    "return await" if isinstance(node, ast.AsyncFunctionDef) else "return"
+                    "return await"
+                    if isinstance(node, ast.AsyncFunctionDef)
+                    else "return"
                 )
                 forward = (
                     f"{body_indent}{returning} self.{leave_delegate}."
