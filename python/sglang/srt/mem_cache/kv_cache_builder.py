@@ -85,11 +85,13 @@ def maybe_register_hicache_draft(
         return
 
     from sglang.srt.mem_cache.memory_pool import (
+        DSATokenToKVPool,
         HybridLinearKVPool,
         MHATokenToKVPool,
         MLATokenToKVPool,
     )
     from sglang.srt.mem_cache.memory_pool_host import (
+        DSAIndexerPoolHost,
         MLATokenToKVPoolHost,
         get_mha_host_pool_cls,
     )
@@ -108,7 +110,18 @@ def maybe_register_hicache_draft(
         layout=server_args.hicache_mem_layout,
         allocator_type=server_args.hicache_storage_backend,
     )
-    if isinstance(pool, MHATokenToKVPool):
+    draft_indexer_host_pool = None
+    if isinstance(pool, DSATokenToKVPool):
+        draft_host_pool = MLATokenToKVPoolHost(
+            pool, **kw, override_kv_cache_dim=pool.kv_cache_dim
+        )
+        draft_indexer_host_pool = DSAIndexerPoolHost(
+            pool,
+            draft_host_pool,
+            server_args.hicache_mem_layout,
+            allocator_type=server_args.hicache_storage_backend,
+        )
+    elif isinstance(pool, MHATokenToKVPool):
         draft_host_pool = get_mha_host_pool_cls(pool)(pool, **kw)
     elif isinstance(pool, MLATokenToKVPool):
         draft_host_pool = MLATokenToKVPoolHost(pool, **kw)
@@ -119,7 +132,9 @@ def maybe_register_hicache_draft(
         )
         return
 
-    tree_cache.cache_controller.set_draft_kv_pool(pool, draft_host_pool)
+    tree_cache.cache_controller.set_draft_kv_pool(
+        pool, draft_host_pool, draft_indexer_host_pool
+    )
 
 
 def build_kv_cache(
