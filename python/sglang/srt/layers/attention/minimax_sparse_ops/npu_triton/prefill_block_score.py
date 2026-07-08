@@ -382,7 +382,13 @@ def _build_qblock_mappings(
     blk_cols = torch.arange(max_blocks, device=device, dtype=torch.long) * page_size
     max_cols = req_to_token.shape[1]
     blk_cols = blk_cols.clamp(max=max_cols - 1)
-    token_slots = req_to_token[qb_to_req][:, blk_cols]  # [all_seqblock_q, max_blocks]
+    # Advanced-index directly to [all_seqblock_q, max_blocks] (12 MB at 128K).
+    # DO NOT write `req_to_token[qb_to_req][:, blk_cols]` -- that materializes the
+    # intermediate [all_seqblock_q, max_context_len] (= 1.6 GB at ctx 131072) and
+    # OOMs the card (only ~600 MB free after weights+KV+capture). Broadcast the
+    # row/column index arrays instead so only the needed [Q, max_blocks] slab is
+    # ever allocated.
+    token_slots = req_to_token[qb_to_req[:, None], blk_cols]  # [all_seqblock_q, max_blocks]
     block_table = (token_slots // page_size).to(torch.int32)
 
     return (
@@ -446,7 +452,11 @@ def flash_prefill_bnsd_score(
         )
 
     if num_score_chunks is None:
-        num_score_chunks = _choose_num_score_chunks(max_seqblock_k)
+        num_score_chunks = _choose_num_score_chunks(
+            max_seqblock_k,
+            all_seqblock_q=all_seqblock_q,
+            num_kv_heads=num_kv_heads,
+        )
     num_score_chunks = max(1, min(num_score_chunks, max_seqblock_k))
 
     BLOCK_SIZE_Q = _next_power_of_2(block_size_q)
