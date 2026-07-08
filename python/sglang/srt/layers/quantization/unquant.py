@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from enum import Enum
 from typing import TYPE_CHECKING, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -46,6 +47,7 @@ if TYPE_CHECKING:
         DispatchOutput,
         StandardDispatchOutput,
     )
+    from sglang.srt.server_args import ServerArgs
 
 from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
     NPUUnquantMoEMethod,
@@ -60,6 +62,53 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 if _use_aiter:
     from aiter.ops.shuffle import shuffle_weight
     from aiter.tuned_gemm import tgemm
+
+
+class Bf16GemmBackend(Enum):
+    AUTO = "auto"
+    CUTEDSL = "cutedsl"
+
+    def is_auto(self) -> bool:
+        return self == Bf16GemmBackend.AUTO
+
+    def is_cutedsl(self) -> bool:
+        return self == Bf16GemmBackend.CUTEDSL
+
+
+_BF16_GEMM_BACKEND: Optional[Bf16GemmBackend] = None
+_cutedsl_bf16_gemm = None
+_use_cutedsl_bf16_gemm = None
+
+
+def initialize_bf16_gemm_config(server_args: ServerArgs) -> None:
+    global _BF16_GEMM_BACKEND, _cutedsl_bf16_gemm, _use_cutedsl_bf16_gemm
+
+    backend = Bf16GemmBackend(server_args.bf16_gemm_backend)
+
+    if backend.is_cutedsl():
+        from sglang.srt.utils import is_sm100_supported
+
+        if not is_sm100_supported():
+            raise ValueError(
+                "--bf16-gemm-backend cutedsl requires SM100/SM103 (Blackwell)"
+            )
+
+        from sglang.jit_kernel.cutedsl_bf16_gemm import (
+            cutedsl_bf16_gemm,
+            use_cutedsl_bf16_gemm,
+        )
+
+        _cutedsl_bf16_gemm = cutedsl_bf16_gemm
+        _use_cutedsl_bf16_gemm = use_cutedsl_bf16_gemm
+
+    _BF16_GEMM_BACKEND = backend
+
+
+def get_bf16_gemm_backend() -> Bf16GemmBackend:
+    global _BF16_GEMM_BACKEND
+    if _BF16_GEMM_BACKEND is None:
+        _BF16_GEMM_BACKEND = Bf16GemmBackend.AUTO
+    return _BF16_GEMM_BACKEND
 
 
 class UnquantizedEmbeddingMethod(QuantizeMethodBase):
@@ -151,6 +200,22 @@ class UnquantizedLinearMethod(LinearMethodBase):
 
         elif _use_aiter and type(layer.weight.data) is torch.Tensor:
             return tgemm.mm(x, layer.weight, bias, otype=x.dtype)
+
+        elif (
+            get_bf16_gemm_backend().is_cutedsl()
+            and x.is_cuda
+            and x.dtype == torch.bfloat16
+            and layer.weight.dtype == torch.bfloat16
+            and (bias is None or bias.dtype == torch.bfloat16)
+            and _use_cutedsl_bf16_gemm(
+                x.numel() // x.shape[-1],
+                layer.weight.shape[0],
+                layer.weight.shape[1],
+            )
+        ):
+            x_shapes = x.shape
+            output = _cutedsl_bf16_gemm(x.view(-1, x_shapes[-1]), layer.weight, bias)
+            return output.view(*x_shapes[:-1], -1)
 
         return F.linear(x, layer.weight, bias)
 
