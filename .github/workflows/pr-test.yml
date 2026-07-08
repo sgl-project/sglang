@@ -394,8 +394,7 @@ jobs:
 
   call-multimodal-gen-tests:
     needs: [check-changes, call-gate, sgl-kernel-build-wheels]
-    # TEMP: disable multimodal-gen CI for the torch-213-merge PR only; revert before merging to main.
-    # Several call-multimodal-gen-tests jobs are consistently failing on this branch.
+    # TEMP: disable multimodal-gen CI due to consistent failures
     if: |
       false &&
       always() &&
