@@ -111,15 +111,22 @@ def build_draft_tp_worker(
     algo_label: str,
 ) -> DraftWorkerBundle:
     draft_server_args = deepcopy(server_args)
-    draft_server_args.skip_tokenizer_init = True
     draft_backend = _resolve_draft_attention_backend(
         draft_server_args=draft_server_args, algo_label=algo_label
     )
-    draft_server_args.speculative_draft_attention_backend = None
-    draft_server_args.prefill_attention_backend = None
-    draft_server_args.decode_attention_backend = None
-    draft_server_args.attention_backend = draft_backend
-    draft_server_args.context_length = target_model_config.context_len
+    # Post-resolution ServerArgs rejects bare assignment; route the draft-copy
+    # adjustments through the audited mutation point. The backend fields make
+    # the draft worker explicit and self-contained (no further overrides);
+    # context_length keeps the draft aligned with the target.
+    draft_server_args.override(
+        "draft_worker.build",
+        skip_tokenizer_init=True,
+        speculative_draft_attention_backend=None,
+        prefill_attention_backend=None,
+        decode_attention_backend=None,
+        attention_backend=draft_backend,
+        context_length=target_model_config.context_len,
+    )
 
     saved_server_args = get_global_server_args()
     draft_worker = TpModelWorker(
