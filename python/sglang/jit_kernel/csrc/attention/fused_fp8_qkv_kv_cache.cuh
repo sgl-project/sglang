@@ -119,7 +119,8 @@ struct FusedFp8QkvKvCache {
       const tvm::ffi::TensorView v_scale) {
     using namespace host;
     const bool quantize_q = q.has_value();
-    RuntimeCheck(quantize_q == q_out.has_value(), "fused_fp8_qkv_kv_cache: q and q_out must both be given or both omitted");
+    RuntimeCheck(
+        quantize_q == q_out.has_value(), "fused_fp8_qkv_kv_cache: q and q_out must both be given or both omitted");
 
     auto N = SymbolicSize{"num_tokens"};
     auto Dkv = SymbolicSize{"kv_dim"};
@@ -159,8 +160,8 @@ struct FusedFp8QkvKvCache {
 
     auto fits = [&](int vec) {
       const int in_bytes = vec * static_cast<int>(sizeof(T));
-      bool ok = kv_dim % vec == 0 && k_stride % vec == 0 && v_stride % vec == 0 &&
-                aligned(k.data_ptr(), in_bytes) && aligned(v.data_ptr(), in_bytes);
+      bool ok = kv_dim % vec == 0 && k_stride % vec == 0 && v_stride % vec == 0 && aligned(k.data_ptr(), in_bytes) &&
+                aligned(v.data_ptr(), in_bytes);
       if (quantize_q) {
         ok = ok && q_dim % vec == 0 && q_stride % vec == 0 && aligned(q_ptr, in_bytes);
       }
