@@ -364,9 +364,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.pp_rank = params.pp_rank
         self.pp_size = params.pp_size
         self.work_list: list[torch.distributed.Work] = []
-        # Only poll decode-only HiCache events every N scheduler steps on PP=1.
         self.decode_event_check_interval = 16
-        # Tracks decode-only scheduler steps since the last HiCache event poll.
         self.decode_event_check_steps = 0
 
         # HiCache D↔H defaults (overridden by init_hicache)
@@ -2223,30 +2221,28 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         _drain_extra_release()
 
     def drain_storage_control_queues(self) -> None:
-        cache_controller = self.cache_controller
-        extra_release_queues = getattr(
-            cache_controller, "extra_host_mem_release_queues", {}
-        )
-        extra_release_pool_names = list(extra_release_queues)
-        local_queue_sizes = [
-            cache_controller.prefetch_revoke_queue.qsize(),
-            cache_controller.ack_backup_queue.qsize(),
-            cache_controller.host_mem_release_queue.qsize(),
+        cc = self.cache_controller
+        extra_release_queues = getattr(cc, "extra_host_mem_release_queues", {})
+        extra_pool_names = list(extra_release_queues)
+        local_qsize_list = [
+            cc.prefetch_revoke_queue.qsize(),
+            cc.ack_backup_queue.qsize(),
+            cc.host_mem_release_queue.qsize(),
             *[
                 extra_release_queues[pool_name].qsize()
-                for pool_name in extra_release_pool_names
+                for pool_name in extra_pool_names
             ],
         ]
-        queue_sizes = torch.tensor(
-            local_queue_sizes,
+        qsizes = torch.tensor(
+            local_qsize_list,
             dtype=torch.int,
         )
-        self._all_reduce_attn_groups(queue_sizes, torch.distributed.ReduceOp.MIN)
-        queue_size_list = list(map(int, queue_sizes.tolist()))
-        n_revoke, n_backup, n_release = queue_size_list[:3]
+        self._all_reduce_attn_groups(qsizes, torch.distributed.ReduceOp.MIN)
+        qsize_list = list(map(int, qsizes.tolist()))
+        n_revoke, n_backup, n_release = qsize_list[:3]
         extra_release_counts = {
             pool_name: count
-            for pool_name, count in zip(extra_release_pool_names, queue_size_list[3:])
+            for pool_name, count in zip(extra_pool_names, qsize_list[3:])
         }
         self._drain_storage_control_queues_impl(
             n_revoke=n_revoke,
@@ -2358,29 +2354,27 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     def _sync_hicache_ready_counts(
         self,
     ) -> tuple[int, int, tuple[int, ...], tuple[PoolName, ...]]:
-        cache_controller = self.cache_controller
-        if cache_controller is None:
+        cc = self.cache_controller
+        if cc is None:
             write_acks = 0
             load_acks = 0
             storage_queue_sizes = ()
-            extra_release_pool_names = ()
+            extra_pool_names = ()
         else:
-            write_acks = self._count_ready_acks(cache_controller.ack_write_queue)
-            load_acks = self._count_ready_acks(cache_controller.ack_load_queue)
-            extra_release_queues = getattr(
-                cache_controller, "extra_host_mem_release_queues", {}
-            )
-            extra_release_pool_names = (
+            write_acks = self._count_ready_acks(cc.ack_write_queue)
+            load_acks = self._count_ready_acks(cc.ack_load_queue)
+            extra_release_queues = getattr(cc, "extra_host_mem_release_queues", {})
+            extra_pool_names = (
                 tuple(extra_release_queues) if self.enable_storage else ()
             )
             storage_queue_sizes = (
                 (
-                    cache_controller.prefetch_revoke_queue.qsize(),
-                    cache_controller.ack_backup_queue.qsize(),
-                    cache_controller.host_mem_release_queue.qsize(),
+                    cc.prefetch_revoke_queue.qsize(),
+                    cc.ack_backup_queue.qsize(),
+                    cc.host_mem_release_queue.qsize(),
                     *(
                         extra_release_queues[name].qsize()
-                        for name in extra_release_pool_names
+                        for name in extra_pool_names
                     ),
                 )
                 if self.enable_storage
@@ -2403,41 +2397,44 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             count_values[0],
             count_values[1],
             tuple(count_values[2:]),
-            extra_release_pool_names,
+            extra_pool_names,
         )
 
     def writing_check(
         self, write_back: bool = False, finish_count: Optional[int] = None
     ) -> None:
         """Poll write-through completions."""
-        cache_controller = self.cache_controller
-        if cache_controller is None:
+        cc = self.cache_controller
+        if cc is None:
             return
 
         if write_back:
             # Blocking: wait for all pending write-backs
             while self.ongoing_write_through:
-                for _, finish_event, ack_list in cache_controller.ack_write_queue:
+                for _, finish_event, ack_list in cc.ack_write_queue:
                     finish_event.synchronize()
                     for ack_id in ack_list:
                         if ack_id in self.ongoing_write_through:
                             self._finish_write_through_ack(ack_id)
-                cache_controller.ack_write_queue.clear()
+                cc.ack_write_queue.clear()
                 assert len(self.ongoing_write_through) == 0
             return
 
         if finish_count is None:
+            # Every rank must enter the all_reduce below; ongoing_write_through can
+            # diverge across ranks (e.g. write_backup returning 0 on a subset).
             finish_count = 0
             if self.pp_rank == 0:
-                finish_count = self._count_ready_acks(cache_controller.ack_write_queue)
+                finish_count = self._count_ready_acks(cc.ack_write_queue)
             finish_count_tensor = torch.tensor(
                 finish_count, dtype=torch.int, device="cpu"
             )
             self._all_reduce(finish_count_tensor, torch.distributed.ReduceOp.MIN)
             finish_count = finish_count_tensor.item()
 
+        # Process completed acks
         while finish_count > 0:
-            _, finish_event, ack_list = cache_controller.ack_write_queue.pop(0)
+            _, finish_event, ack_list = cc.ack_write_queue.pop(0)
             finish_event.synchronize()
             for ack_id in ack_list:
                 self._finish_write_through_ack(ack_id)
@@ -2445,14 +2442,16 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
     def loading_check(self, finish_count: Optional[int] = None) -> None:
         """Poll load-back completions."""
-        cache_controller = self.cache_controller
-        if cache_controller is None:
+        cc = self.cache_controller
+        if cc is None:
             return
 
         if finish_count is None:
+            # Every rank must enter the all_reduce below; ongoing_load_back can
+            # diverge across ranks.
             finish_count = 0
             if self.pp_rank == 0:
-                finish_count = self._count_ready_acks(cache_controller.ack_load_queue)
+                finish_count = self._count_ready_acks(cc.ack_load_queue)
             finish_count_tensor = torch.tensor(
                 finish_count, dtype=torch.int, device="cpu"
             )
@@ -2460,7 +2459,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             finish_count = finish_count_tensor.item()
 
         while finish_count > 0:
-            _, finish_event, ack_list = cache_controller.ack_load_queue.pop(0)
+            _, finish_event, ack_list = cc.ack_load_queue.pop(0)
             finish_event.synchronize()
             for ack_id in ack_list:
                 node, lock_params, host_lock_params = self.ongoing_load_back.pop(ack_id)
@@ -2525,6 +2524,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
     def check_hicache_events(self, decode_only: bool = False) -> None:
         """Called per scheduler step to poll async HiCache events."""
+        # Reap the previous round's PP-sync sends before issuing new ones.
         self._drain_async_work()
 
         if self.pp_size != 1:
@@ -2533,49 +2533,41 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             self.loading_check()
             if self.enable_storage:
                 self.drain_storage_control_queues()
-            if (
-                self.enable_storage_metrics
-                and self.storage_metrics_collector is not None
-            ):
-                self.storage_metrics_collector.log_storage_metrics(
-                    self.cache_controller.storage_backend.get_stats()
-                )
-            return
-
-        if decode_only:
-            next_step = self.decode_event_check_steps + 1
-            if next_step < self.decode_event_check_interval:
-                self.decode_event_check_steps = next_step
-                return
-            self.decode_event_check_steps = 0
         else:
-            self.decode_event_check_steps = 0
+            if decode_only:
+                next_step = self.decode_event_check_steps + 1
+                if next_step < self.decode_event_check_interval:
+                    self.decode_event_check_steps = next_step
+                    return
+                self.decode_event_check_steps = 0
+            else:
+                self.decode_event_check_steps = 0
 
-        (
-            write_finish_count,
-            load_finish_count,
-            storage_queue_sizes,
-            extra_release_pool_names,
-        ) = self._sync_hicache_ready_counts()
-        self.writing_check(finish_count=write_finish_count)
-        self.loading_check(finish_count=load_finish_count)
+            (
+                write_finish_count,
+                load_finish_count,
+                storage_queue_sizes,
+                extra_pool_names,
+            ) = self._sync_hicache_ready_counts()
+            self.writing_check(finish_count=write_finish_count)
+            self.loading_check(finish_count=load_finish_count)
 
-        if self.enable_storage and storage_queue_sizes:
-            n_revoke, n_backup, n_release = storage_queue_sizes[:3]
-            extra_release_counts = {
-                pool_name: count
-                for pool_name, count in zip(
-                    extra_release_pool_names,
-                    storage_queue_sizes[3:],
+            if self.enable_storage and storage_queue_sizes:
+                n_revoke, n_backup, n_release = storage_queue_sizes[:3]
+                extra_release_counts = {
+                    pool_name: count
+                    for pool_name, count in zip(
+                        extra_pool_names,
+                        storage_queue_sizes[3:],
+                    )
+                }
+                self._drain_storage_control_queues_impl(
+                    n_revoke=n_revoke,
+                    n_backup=n_backup,
+                    n_release=n_release,
+                    extra_release_counts=extra_release_counts,
+                    log_metrics=True,
                 )
-            }
-            self._drain_storage_control_queues_impl(
-                n_revoke=n_revoke,
-                n_backup=n_backup,
-                n_release=n_release,
-                extra_release_counts=extra_release_counts,
-                log_metrics=True,
-            )
         if self.enable_storage_metrics and self.storage_metrics_collector is not None:
             self.storage_metrics_collector.log_storage_metrics(
                 self.cache_controller.storage_backend.get_stats()

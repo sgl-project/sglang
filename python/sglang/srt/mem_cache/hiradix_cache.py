@@ -74,6 +74,7 @@ logger = logging.getLogger(__name__)
 
 
 class HiRadixCache(RadixCache):
+
     def __init__(self, params: CacheInitParams, server_args: ServerArgs):
         self._enable_metrics_flag = params.enable_metrics
 
@@ -203,7 +204,6 @@ class HiRadixCache(RadixCache):
             1 if server_args.hicache_write_policy == "write_through" else 2
         )
         self.load_back_threshold = 10
-        # Only poll decode-only HiCache events every N scheduler steps
         self.decode_event_check_interval = 16
         self.decode_event_check_steps = 0
         # Detach storage backend automatically on process shutdown
@@ -978,6 +978,10 @@ class HiRadixCache(RadixCache):
             return
 
         if finish_count is None:
+            # Every rank must enter the all_reduce below; ongoing_write_through can
+            # diverge across ranks (e.g. write_backup returning 0 on a subset under
+            # host memory pressure), so a conditional skip desyncs the NCCL op
+            # sequence and deadlocks under TP > 1. (Matches UnifiedRadixCache.)
             finish_count = 0
             if self.pp_rank == 0:
                 finish_count = self._count_ready_acks(
@@ -1410,6 +1414,7 @@ class HiRadixCache(RadixCache):
         self.writing_check()
 
     def check_hicache_events(self, decode_only: bool = False):
+        # Reap the previous round's PP-sync sends before issuing new ones.
         self._drain_async_work()
 
         if self.pp_size != 1:
@@ -1418,37 +1423,32 @@ class HiRadixCache(RadixCache):
             self.loading_check()
             if self.enable_storage:
                 self.drain_storage_control_queues()
-            if self.enable_storage_metrics:
-                self.storage_metrics_collector.log_storage_metrics(
-                    self.cache_controller.storage_backend.get_stats()
-                )
-            return
-
-        if decode_only:
-            next_step = self.decode_event_check_steps + 1
-            if next_step < self.decode_event_check_interval:
-                self.decode_event_check_steps = next_step
-                return
-            self.decode_event_check_steps = 0
         else:
-            self.decode_event_check_steps = 0
+            if decode_only:
+                next_step = self.decode_event_check_steps + 1
+                if next_step < self.decode_event_check_interval:
+                    self.decode_event_check_steps = next_step
+                    return
+                self.decode_event_check_steps = 0
+            else:
+                self.decode_event_check_steps = 0
 
-        (
-            write_finish_count,
-            load_finish_count,
-            storage_queue_sizes,
-        ) = self._sync_hicache_ready_counts()
-        self.writing_check(finish_count=write_finish_count)
-        self.loading_check(finish_count=load_finish_count)
+            (
+                write_finish_count,
+                load_finish_count,
+                storage_queue_sizes,
+            ) = self._sync_hicache_ready_counts()
+            self.writing_check(finish_count=write_finish_count)
+            self.loading_check(finish_count=load_finish_count)
 
-        if self.enable_storage and storage_queue_sizes:
-            n_revoke, n_backup, n_release = storage_queue_sizes[:3]
-            self._drain_storage_control_queues_impl(
-                n_revoke=n_revoke,
-                n_backup=n_backup,
-                n_release=n_release,
-                log_metrics=True,
-            )
+            if self.enable_storage and storage_queue_sizes:
+                n_revoke, n_backup, n_release = storage_queue_sizes[:3]
+                self._drain_storage_control_queues_impl(
+                    n_revoke=n_revoke,
+                    n_backup=n_backup,
+                    n_release=n_release,
+                    log_metrics=True,
+                )
         if self.enable_storage_metrics:
             self.storage_metrics_collector.log_storage_metrics(
                 self.cache_controller.storage_backend.get_stats()
@@ -1459,19 +1459,19 @@ class HiRadixCache(RadixCache):
         Combine prefetch revoke, backup ack, and host mem release checks
         to minimize TP synchronization and Python overhead.
         """
-        cache_controller = self.cache_controller
+        cc = self.cache_controller
 
-        queue_sizes = torch.tensor(
+        qsizes = torch.tensor(
             [
-                cache_controller.prefetch_revoke_queue.qsize(),
-                cache_controller.ack_backup_queue.qsize(),
-                cache_controller.host_mem_release_queue.qsize(),
+                cc.prefetch_revoke_queue.qsize(),
+                cc.ack_backup_queue.qsize(),
+                cc.host_mem_release_queue.qsize(),
             ],
             dtype=torch.int,
         )
-        self._all_reduce_attn_groups(queue_sizes, torch.distributed.ReduceOp.MIN)
+        self._all_reduce_attn_groups(qsizes, torch.distributed.ReduceOp.MIN)
 
-        n_revoke, n_backup, n_release = map(int, queue_sizes.tolist())
+        n_revoke, n_backup, n_release = map(int, qsizes.tolist())
         self._drain_storage_control_queues_impl(
             n_revoke=n_revoke,
             n_backup=n_backup,
