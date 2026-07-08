@@ -38,6 +38,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.runner_utils.capture_mode import model_capture_mode
+from sglang.srt.runtime_context import get_flags
 from sglang.srt.utils import (
     empty_context,
     log_info_on_rank0,
@@ -534,7 +535,8 @@ def register_fake_ops(tp_size: int):
         cu_seqlens,
         head_first,
         use_qk_l2norm_in_kernel,
-        eps,
+        initial_state_indices,
+        eps=1e-6,
     ):
         output = torch.empty_like(value)
         assert initial_state is not None
@@ -557,7 +559,7 @@ class CPUGraphRunner:
         # bs -> compiled fn (cross-attention / skip_cross_attention=False, enc-dec only)
         self.graphs_cross = {}
         self.output_buffers = {}
-        self.enable_torch_compile = model_runner.server_args.enable_torch_compile
+        self.enable_torch_compile = get_flags().capture.enable_torch_compile
         self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
         self.is_encoder_decoder = model_runner.model_config.is_encoder_decoder
         self.require_gathered_buffer = require_gathered_buffer(model_runner.server_args)
