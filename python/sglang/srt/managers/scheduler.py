@@ -2390,13 +2390,6 @@ class Scheduler(
                     abort_reason.status_code,
                 )
             req.disagg_kv_sender.abort()
-            abort_reason = req.to_finish or req.finished_reason
-            if isinstance(abort_reason, FINISH_ABORT) and kv_mgr is not None:
-                kv_mgr.record_failure(
-                    req.bootstrap_room,
-                    abort_reason.message,
-                    abort_reason.status_code,
-                )
         # set_finish_with_abort records the reason in to_finish; promote it so
         # stream_output sees req.finished() and emits the abort to the client.
         if req.finished_reason is None and req.to_finish is not None:

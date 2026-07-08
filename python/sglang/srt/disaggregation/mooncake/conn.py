@@ -314,9 +314,7 @@ class MooncakeKVManager(CommonKVManager):
         self.kv_buffer_tensors = None
 
     def _handle_staging_req(self, msg):
-        from sglang.srt.disaggregation.common.staging_handler import (
-            handle_staging_req,
-        )
+        from sglang.srt.disaggregation.common.staging_handler import handle_staging_req
 
         room = int(msg[1].decode("ascii"))
         session_id = msg[4].decode("ascii")
@@ -350,9 +348,7 @@ class MooncakeKVManager(CommonKVManager):
     def _is_watermark_ready(
         self, session_id: str, alloc_round: int, alloc_end: int
     ) -> bool:
-        from sglang.srt.disaggregation.common.staging_handler import (
-            is_watermark_ready,
-        )
+        from sglang.srt.disaggregation.common.staging_handler import is_watermark_ready
 
         return is_watermark_ready(self._staging_ctx, session_id, alloc_round, alloc_end)
 
@@ -1299,6 +1295,43 @@ class MooncakeKVManager(CommonKVManager):
                 )
         return True
 
+    def _is_decode_metadata_ready(self, room: int) -> bool:
+        if room not in self.transfer_infos:
+            return False
+        required_dst_info_num = self.required_dst_info_num_table.get(room)
+        if required_dst_info_num is None:
+            return True
+        return len(self.transfer_infos[room]) >= required_dst_info_num
+
+    def clear_room(self, room: int) -> None:
+        self.request_status.pop(room, None)
+        with self.failure_lock:
+            self.failure_records.pop(room, None)
+            self.failure_status_codes.pop(room, None)
+        self.transfer_infos.pop(room, None)
+        self.req_to_decode_prefix_len.pop(room, None)
+        self.required_dst_info_num_table.pop(room, None)
+
+    def try_notify_decode_failure_and_clear(self, room: int) -> bool:
+        if room not in self.request_status or self.check_status(room) != KVPoll.Failed:
+            return False
+        if not self._is_decode_metadata_ready(room):
+            return False
+
+        with self.failure_lock:
+            failure_reason = self.failure_records.get(room)
+            status_code = self.failure_status_codes.get(room)
+
+        notified = self.notify_decode_status_for_room(
+            room,
+            KVPoll.Failed,
+            failure_reason,
+            status_code,
+        )
+        if notified:
+            self.clear_room(room)
+        return notified
+
     def transfer_worker(
         self,
         queue: FastQueue,
@@ -1613,6 +1646,7 @@ class MooncakeKVManager(CommonKVManager):
                 else:
                     required_dst_info_num = int(waiting_req_bytes[7].decode("ascii"))
                     room = int(room)
+                    self.required_dst_info_num_table[room] = required_dst_info_num
                     if room not in self.transfer_infos:
                         self.transfer_infos[room] = {}
 
@@ -1634,15 +1668,7 @@ class MooncakeKVManager(CommonKVManager):
                             room in self.request_status
                             and self.check_status(room) == KVPoll.Failed
                         ):
-                            with self.failure_lock:
-                                failure_reason = self.failure_records.get(room)
-                                status_code = self.failure_status_codes.get(room)
-                            self.notify_decode_status_for_room(
-                                room,
-                                KVPoll.Failed,
-                                failure_reason,
-                                status_code,
-                            )
+                            self.try_notify_decode_failure_and_clear(room)
                             continue
                         self.update_status(room, KVPoll.WaitingForInput)
 
@@ -1934,16 +1960,8 @@ class MooncakeKVSender(CommonKVSender):
 
     def abort(self):
         super().abort()
-        with self.kv_mgr.failure_lock:
-            failure_reason = self.kv_mgr.failure_records.get(self.bootstrap_room)
-            status_code = self.kv_mgr.failure_status_codes.get(self.bootstrap_room)
-        if hasattr(self.kv_mgr, "notify_decode_status_for_room"):
-            self.kv_mgr.notify_decode_status_for_room(
-                self.bootstrap_room,
-                KVPoll.Failed,
-                failure_reason,
-                status_code,
-            )
+        if hasattr(self.kv_mgr, "try_notify_decode_failure_and_clear"):
+            self.kv_mgr.try_notify_decode_failure_and_clear(self.bootstrap_room)
         self.trace_ctx.abort(abort_info={"reason": "Aborted"})
         self.trace_ctx.trace_req_finish()
 

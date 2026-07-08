@@ -8,9 +8,14 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import torch
 
+from sglang.srt.disaggregation.base.conn import KVPoll  # noqa: E402
 from sglang.srt.disaggregation.decode import (  # noqa: E402
     DecodePreallocQueue,
     SchedulerDisaggregationDecodeMixin,
+)
+from sglang.srt.disaggregation.mooncake.conn import (  # noqa: E402
+    MooncakeKVManager,
+    MooncakeKVSender,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode  # noqa: E402
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req  # noqa: E402
@@ -104,6 +109,7 @@ class TestDisaggregationAbortedRequestQueueing(unittest.TestCase):
         req = MagicMock()
         req.priority = None
         req.rid = "req"
+        req.bootstrap_room = 7
         req.return_logprob = False
         req.finished_reason = None
         req.to_finish = FINISH_ABORT("Input is too long")
@@ -139,6 +145,30 @@ class TestDisaggregationAbortedRequestQueueing(unittest.TestCase):
         self.assertIsInstance(req.finished_reason, FINISH_ABORT)
         self.assertIsNone(req.to_finish)
 
+    def test_prefill_mode_aborted_req_records_failure_once_before_abort(self):
+        scheduler = self._new_scheduler(DisaggregationMode.PREFILL)
+        req = self._new_aborted_req()
+        kv_mgr = MagicMock()
+        sender = MagicMock()
+        sender.kv_mgr = kv_mgr
+
+        def create_sender(req, _num_kv_heads):
+            req.disagg_kv_sender = sender
+            return True
+
+        scheduler.disagg_prefill_bootstrap_queue.create_sender.side_effect = (
+            create_sender
+        )
+
+        scheduler._add_request_to_queue(req)
+
+        kv_mgr.record_failure.assert_called_once_with(
+            req.bootstrap_room,
+            "Input is too long",
+            None,
+        )
+        sender.abort.assert_called_once()
+
     def test_decode_mode_aborted_req_skips_prealloc_queue(self):
         scheduler = self._new_scheduler(DisaggregationMode.DECODE)
         req = self._new_aborted_req()
@@ -158,6 +188,110 @@ class TestDisaggregationAbortedRequestQueueing(unittest.TestCase):
 
         scheduler.disagg_prefill_bootstrap_queue.add.assert_called_once_with(req, 8)
         scheduler.output_streamer.stream_output.assert_not_called()
+
+
+class TestMooncakeEarlyAbortLifecycle(unittest.TestCase):
+    def _new_manager(self):
+        manager = MooncakeKVManager.__new__(MooncakeKVManager)
+        manager.request_status = {}
+        manager.failure_records = {}
+        manager.failure_status_codes = {}
+        manager.failure_lock = threading.Lock()
+        manager.transfer_infos = {}
+        manager.req_to_decode_prefix_len = {}
+        manager.required_dst_info_num_table = {}
+        manager.attn_tp_rank = 0
+        manager.pp_size = 1
+        manager.attn_cp_size = 1
+        manager.pp_rank = 0
+        manager.attn_cp_rank = 0
+        manager.sync_status_to_decode_endpoint = MagicMock()
+        return manager
+
+    def _new_transfer_info(self, room: int):
+        return SimpleNamespace(
+            is_dummy=False,
+            endpoint="127.0.0.1",
+            dst_port=23456,
+            room=room,
+            decode_prefix_len=3,
+        )
+
+    def test_terminal_failure_with_ready_metadata_notifies_decode_and_clears_room(self):
+        manager = self._new_manager()
+        room = 7
+        manager.request_status[room] = KVPoll.Failed
+        manager.failure_records[room] = "Input is too long"
+        manager.failure_status_codes[room] = 400
+        manager.required_dst_info_num_table[room] = 1
+        manager.transfer_infos[room] = {"decode-session": self._new_transfer_info(room)}
+        manager.req_to_decode_prefix_len[room] = 3
+
+        notified = manager.try_notify_decode_failure_and_clear(room)
+
+        self.assertTrue(notified)
+        manager.sync_status_to_decode_endpoint.assert_called_once_with(
+            "127.0.0.1",
+            23456,
+            room,
+            KVPoll.Failed,
+            0,
+            "Input is too long",
+            400,
+        )
+        self.assertNotIn(room, manager.request_status)
+        self.assertNotIn(room, manager.failure_records)
+        self.assertNotIn(room, manager.failure_status_codes)
+        self.assertNotIn(room, manager.transfer_infos)
+        self.assertNotIn(room, manager.req_to_decode_prefix_len)
+        self.assertNotIn(room, manager.required_dst_info_num_table)
+
+    def test_terminal_failure_waits_for_decode_metadata_before_clearing_room(self):
+        manager = self._new_manager()
+        room = 8
+        manager.request_status[room] = KVPoll.Failed
+        manager.failure_records[room] = "Input is too long"
+        manager.failure_status_codes[room] = 400
+
+        notified = manager.try_notify_decode_failure_and_clear(room)
+
+        self.assertFalse(notified)
+        manager.sync_status_to_decode_endpoint.assert_not_called()
+        self.assertEqual(manager.request_status[room], KVPoll.Failed)
+        self.assertEqual(manager.failure_records[room], "Input is too long")
+        self.assertEqual(manager.failure_status_codes[room], 400)
+
+        manager.required_dst_info_num_table[room] = 1
+        manager.transfer_infos[room] = {"decode-session": self._new_transfer_info(room)}
+
+        notified = manager.try_notify_decode_failure_and_clear(room)
+
+        self.assertTrue(notified)
+        manager.sync_status_to_decode_endpoint.assert_called_once()
+        self.assertNotIn(room, manager.request_status)
+        self.assertNotIn(room, manager.failure_records)
+        self.assertNotIn(room, manager.failure_status_codes)
+        self.assertNotIn(room, manager.transfer_infos)
+
+    def test_sender_abort_delegates_terminal_failure_lifecycle_to_manager(self):
+        manager = self._new_manager()
+        room = 9
+        manager.request_status[room] = KVPoll.Bootstrapping
+        manager.try_notify_decode_failure_and_clear = MagicMock(return_value=False)
+
+        sender = MooncakeKVSender.__new__(MooncakeKVSender)
+        sender.kv_mgr = manager
+        sender.bootstrap_room = room
+        sender.conclude_state = None
+        sender.trace_ctx = MagicMock()
+
+        sender.abort()
+
+        self.assertEqual(manager.request_status[room], KVPoll.Failed)
+        self.assertEqual(manager.failure_records[room], "Aborted by AbortReq.")
+        manager.try_notify_decode_failure_and_clear.assert_called_once_with(room)
+        sender.trace_ctx.abort.assert_called_once_with(abort_info={"reason": "Aborted"})
+        sender.trace_ctx.trace_req_finish.assert_called_once()
 
 
 class TestDecodePreallocQueuePriority(unittest.TestCase):
