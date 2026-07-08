@@ -413,7 +413,7 @@ def dispatch_w8a8_block_fp8_linear() -> Callable:
     """
     backend = get_fp8_gemm_runner_backend()
 
-    if backend.is_auto() or backend.is_flashinfer():
+    if backend.is_auto():
         return _dispatch_auto_backend()
 
     return _dispatch_explicit_backend(backend)
@@ -428,7 +428,14 @@ def dispatch_w8a8_mxfp8_linear() -> Callable:
 
 def _dispatch_explicit_backend(backend: Fp8GemmRunnerBackend) -> Callable:
     """Dispatch based on explicitly selected backend."""
-    if backend.is_flashinfer_trtllm():
+    if backend.is_flashinfer():
+        raise RuntimeError(
+            "--fp8-gemm-backend=flashinfer is only valid for per-tensor/per-channel "
+            "FP8 checkpoints. For block-quantized (blockwise) FP8 checkpoints, use "
+            "flashinfer_trtllm, flashinfer_cutlass, flashinfer_deepgemm, or auto instead."
+        )
+
+    elif backend.is_flashinfer_trtllm():
         if not (is_sm100_supported() and is_flashinfer_available()):
             raise RuntimeError(
                 "FlashInfer FP8 GEMM requested via --fp8-gemm-backend=flashinfer_trtllm, "
