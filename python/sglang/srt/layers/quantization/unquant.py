@@ -67,6 +67,7 @@ if _is_npu:
 class Bf16GemmBackend(Enum):
     AUTO = "auto"
     CUTEDSL = "cutedsl"
+    TORCH = "torch"
 
     def is_auto(self) -> bool:
         return self == Bf16GemmBackend.AUTO
@@ -83,11 +84,15 @@ _use_cutedsl_bf16_gemm = None
 def initialize_bf16_gemm_config(server_args: ServerArgs) -> None:
     global _BF16_GEMM_BACKEND, _cutedsl_bf16_gemm, _use_cutedsl_bf16_gemm
 
-    backend = Bf16GemmBackend(server_args.bf16_gemm_backend)
+    from sglang.srt.utils import is_sm100_supported
+
+    backend_str = server_args.bf16_gemm_backend
+    if backend_str == "auto" and is_sm100_supported():
+        backend_str = "cutedsl"
+
+    backend = Bf16GemmBackend(backend_str)
 
     if backend.is_cutedsl():
-        from sglang.srt.utils import is_sm100_supported
-
         if not is_sm100_supported():
             raise ValueError(
                 "--bf16-gemm-backend cutedsl requires SM100/SM103 (Blackwell)"
@@ -207,6 +212,8 @@ class UnquantizedLinearMethod(LinearMethodBase):
             and x.dtype == torch.bfloat16
             and layer.weight.dtype == torch.bfloat16
             and (bias is None or bias.dtype == torch.bfloat16)
+            and not layer.weight.requires_grad
+            and (bias is None or not bias.requires_grad)
             and _use_cutedsl_bf16_gemm(
                 x.numel() // x.shape[-1],
                 layer.weight.shape[0],
