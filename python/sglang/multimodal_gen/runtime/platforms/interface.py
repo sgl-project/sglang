@@ -394,6 +394,18 @@ class Platform:
         """
         raise NotImplementedError
 
+    def get_process_reserved_memory_mb(self) -> float | None:
+        """Return allocator-reserved memory for the current process in MiB."""
+        if self.is_cpu():
+            return None
+        try:
+            device_module = torch.get_device_module()
+            if hasattr(device_module, "memory_reserved"):
+                return float(device_module.memory_reserved()) / (1024**2)
+        except Exception:
+            return None
+        return None
+
     @classmethod
     def get_device_communicator_cls(cls) -> str:
         """
