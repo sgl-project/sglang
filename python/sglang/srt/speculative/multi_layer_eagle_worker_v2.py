@@ -64,6 +64,7 @@ from sglang.srt.speculative.spec_utils import (
     draft_tp_context,
     record_stream_each,
     record_stream_for_v2_verify,
+    sample_draft_proposal,
     select_top_k_tokens,
 )
 from sglang.srt.speculative.triton_ops.eagle import fill_bonus_tokens
@@ -124,6 +125,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         self.topk = server_args.speculative_eagle_topk
         self.speculative_num_steps = server_args.speculative_num_steps
         self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
+        self.use_rejection_sampling = server_args.speculative_use_rejection_sampling
         assert self.speculative_num_draft_tokens == self.speculative_num_steps + 1, (
             "multi-layer EAGLE requires speculative_num_draft_tokens == "
             "speculative_num_steps + 1, "
@@ -305,6 +307,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             capture_hidden_mode=None,
             seq_lens_sum=None,
             seq_lens_cpu=None,
+            draft_probs=draft_input.draft_probs,
         )
 
     def draft_forward(self, forward_batch: ForwardBatch):
@@ -441,6 +444,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
 
         topk_p_list = []
         topk_index_list = []
+        draft_probs_list = []
         for step in range(self.speculative_num_steps):
             output: ModelRunnerOutput = self.draft_runner_list[step].forward(
                 forward_batch
@@ -453,8 +457,16 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                 output.logits_output.next_token_logits,
                 f"draft_extend_for_prefill step {step}",
             )
-            probs = torch.softmax(output.logits_output.next_token_logits, dim=-1)
-            topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+            if self.use_rejection_sampling and self.topk == 1:
+                # Sample X ~ q and stash q for the first verify's Leviathan step.
+                probs, topk_p, topk_index = sample_draft_proposal(
+                    output.logits_output.next_token_logits,
+                    forward_batch.sampling_info.temperatures,
+                )
+                draft_probs_list.append(probs)
+            else:
+                probs = torch.softmax(output.logits_output.next_token_logits, dim=-1)
+                topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
             topk_p_list.append(topk_p)
             topk_index_list.append(topk_index)
             # Chain-style: use this step's output hidden_states as next step's input
@@ -483,6 +495,12 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             bonus_tokens=next_token_ids,
             num_tokens_per_req=1,
             num_tokens_for_logprob_per_req=1,
+        )
+        # q [bs, num_steps, vocab] for the first verify's Leviathan step (RS only).
+        next_draft_input.draft_probs = (
+            torch.stack(draft_probs_list, dim=1)
+            if self.use_rejection_sampling and draft_probs_list
+            else None
         )
 
         return next_draft_input
@@ -526,6 +544,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         )
         ret_topk_p_list = []
         ret_topk_index_list = []
+        ret_draft_probs_list = []
         next_token_ids_backup = batch_result.next_token_ids.clone()
 
         if can_cuda_graph:
@@ -534,7 +553,16 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             # against it and the chain is advanced in place between steps.
             cgr.prepare(forward_batch)
             for step in range(self.speculative_num_steps):
-                _, ret_topk_p, ret_topk_index = cgr.replay(step)
+                _out, ret_topk_p, ret_topk_index = cgr.replay(step)
+                if self.use_rejection_sampling and self.topk == 1:
+                    # Re-pick X ~ q worker-side so the chain rotation carries it
+                    # to step N+1 (per-step graph does not sample in-graph).
+                    sel = cgr.buffers.select_index[: cgr.raw_bs]
+                    probs, ret_topk_p, ret_topk_index = sample_draft_proposal(
+                        _out.next_token_logits[sel],
+                        forward_batch.sampling_info.temperatures,
+                    )
+                    ret_draft_probs_list.append(probs)
                 ret_topk_p_list.append(ret_topk_p.clone())
                 ret_topk_index_list.append(ret_topk_index.clone())
                 # Advance the draft chain by rotating the shared input_ids window
@@ -572,11 +600,17 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                 draft_logits_output = self.draft_runner_list[step].forward(
                     forward_batch
                 )
-                probs = torch.softmax(
-                    draft_logits_output.logits_output.next_token_logits[select_index],
-                    dim=-1,
-                )
-                ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
+                logits_sel = draft_logits_output.logits_output.next_token_logits[
+                    select_index
+                ]
+                if self.use_rejection_sampling and self.topk == 1:
+                    probs, ret_topk_p, ret_topk_index = sample_draft_proposal(
+                        logits_sel, forward_batch.sampling_info.temperatures
+                    )
+                    ret_draft_probs_list.append(probs)
+                else:
+                    probs = torch.softmax(logits_sel, dim=-1)
+                    ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
                 # Chain-style: use this step's output hidden_states as next step's input
                 if (
                     self.chain_mtp_hidden_states
@@ -608,6 +642,12 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             torch.cat(ret_topk_p_list, dim=1).clone(),
             torch.cat(ret_topk_index_list, dim=1).clone(),
             None,
+        )
+        # q [bs, num_steps, vocab] carries the per-chain-step draft distributions
+        # to the next verify's Leviathan step (accept iff coin*q < p). None
+        # otherwise (default target-only tree sampling).
+        next_draft_input.draft_probs = (
+            torch.stack(ret_draft_probs_list, dim=1) if ret_draft_probs_list else None
         )
 
 

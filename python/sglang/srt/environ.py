@@ -24,35 +24,6 @@ def _default_hip() -> bool:
         return False
 
 
-@contextmanager
-def temp_set_env(*, allow_sglang: bool = False, **env_vars: Any):
-    """Temporarily set environment variables, restoring originals on exit.
-
-    By default, SGLANG_*/SGL_* keys are rejected — use ``Envs`` descriptors
-    for those.  Pass ``allow_sglang=True`` only for special env vars that
-    intentionally bypass ``environ.py``.
-    """
-    if not allow_sglang:
-        for key in env_vars:
-            if key.startswith("SGLANG_") or key.startswith("SGL_"):
-                raise ValueError("temp_set_env should not be used for sglang env vars")
-
-    backup = {key: os.environ.get(key) for key in env_vars}
-    try:
-        for key, value in env_vars.items():
-            if value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = str(value)
-        yield
-    finally:
-        for key, value in backup.items():
-            if value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = value
-
-
 class EnvField:
     _allow_set_name = True
 
@@ -316,6 +287,9 @@ class Envs:
     # page tables (DP attn); paged backends like trtllm_mha consume it directly.
     SGLANG_USE_HND_KVCACHE = EnvBool(False)
 
+    # size the KV pool after CUDA-graph capture
+    SGLANG_ENABLE_POST_CAPTURE_KV_SIZING = EnvBool(False)
+
     # Scheduler: memory leak test
     SGLANG_TEST_RETRACT = EnvBool(False)
     SGLANG_TEST_RETRACT_INTERVAL = EnvInt(3)
@@ -439,6 +413,10 @@ class Envs:
     SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE = EnvStr(None)
     SGLANG_HICACHE_FILE_BACKEND_EVICTION_RATIO = EnvFloat(0.9)
     SGLANG_HICACHE_FILE_BACKEND_MIN_FREE_SPACE = EnvStr("0")
+    # Enable client-side metadata caching to optimize filesystem checks (e.g. for Lustre/NFS/FUSE)
+    SGLANG_HICACHE_FILE_BACKEND_ENABLE_METADATA_CACHE = EnvBool(False)
+    # Positive cache TTL for filesystem metadata lookups (-1 disables positive expiration)
+    SGLANG_HICACHE_FILE_BACKEND_METADATA_TTL = EnvFloat(5.0)
     SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR = EnvStr(None)
     # Enable O_DIRECT when opening NIXL POSIX backend files (bypasses OS page cache).
     # Disable with SGLANG_HICACHE_NIXL_USE_DIRECT_IO=0 or via the
@@ -656,9 +634,6 @@ class Envs:
     )
     SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC = EnvBool(False)
     SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK = EnvStr(None)
-    SGLANG_DSA_ENABLE_MTP_PRECOMPUTE_METADATA = EnvBoolWithAlias(
-        True, deprecated_name="SGLANG_NSA_ENABLE_MTP_PRECOMPUTE_METADATA"
-    )
     SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = EnvIntWithAlias(
         2048, deprecated_name="SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD"
     )
@@ -667,8 +642,6 @@ class Envs:
     )
     SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION = EnvFloat(0.2)
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
-    SGLANG_USE_FUSED_METADATA_COPY = EnvBool(True)
-    SGLANG_DSA_USE_FUSED_METADATA_GENERATION = EnvBool(True)
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
     SGLANG_DISABLE_DSA_INDEXER_FUSION = EnvBool(False)
 
@@ -808,9 +781,12 @@ class Envs:
     # Encoder receiver selection: http|grpc (used by EPD paths).
     SGLANG_ENCODER_MM_RECEIVER_MODE = EnvStr("http")
 
-    # Native gRPC server (internal, not yet user-facing)
+    # Native gRPC server. SGLANG_GRPC_PORT is the env fallback for the
+    # --grpc-port CLI flag; setting either enables the native server alongside
+    # HTTP. The worker-threads knob stays env-only (internal tuning, no CLI
+    # surface).
     SGLANG_GRPC_PORT = EnvInt(None)
-    SGLANG_ENABLE_GRPC = EnvBool(False)
+    SGLANG_GRPC_WORKER_THREADS = EnvInt(4)
 
     # External models
     SGLANG_EXTERNAL_MODEL_PACKAGE = EnvStr("")
@@ -856,6 +832,7 @@ class Envs:
 
     # Set False when using FP4-to-FP8 converted DeepSeek V4 checkpoint.
     SGLANG_DSV4_FP4_EXPERTS = EnvBool(True)
+    SGLANG_DSV4_FP4_DEQUANT = EnvBool(False)
     # Default reasoning_effort for dsv4 chat encoder when request doesn't set it.
     # Accepts "", "max", "high" (empty string means unset); other values filtered to None.
     SGLANG_DSV4_REASONING_EFFORT = EnvStr("")
@@ -869,7 +846,10 @@ class Envs:
     SGLANG_OPT_FUSE_MHC_POST_PRE = EnvBool(False)
     SGLANG_OPT_USE_TILELANG_INDEXER = EnvBool(False)
     SGLANG_OPT_USE_AITER_INDEXER = EnvBool(False)
-    SGLANG_OPT_DSV4_NONPAGED_INDEXER = EnvBool(False)
+    SGLANG_OPT_DSV4_NONPAGED_INDEXER = EnvBool(True)
+    # Per-rank local query rows (after DP-attention sharding when enabled),
+    # not request ISL.
+    SGLANG_OPT_DSV4_NONPAGED_INDEXER_MIN_QUERY_TOKENS = EnvInt(8192)
     SGLANG_OPT_USE_JIT_INDEXER_METADATA = EnvBool(True)
     SGLANG_OPT_USE_ONLINE_COMPRESS = EnvBool(False)
     SGLANG_EXPERIMENTAL_ONLINE_C128_MTP = EnvBool(False)
@@ -1073,6 +1053,10 @@ def _convert_SGL_to_SGLANG():
 
 
 _convert_SGL_to_SGLANG()
+_warn_deprecated_env_to_cli_flag(
+    "SGLANG_ENABLE_GRPC",
+    "Please use '--grpc-port' to enable the native gRPC server.",
+)
 _warn_deprecated_env_to_cli_flag(
     "SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE",
     "Please use '--enable-prefill-delayer' instead.",
