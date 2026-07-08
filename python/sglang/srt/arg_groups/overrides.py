@@ -1688,6 +1688,16 @@ def _mla_backend_page_constraints(view: Any) -> dict:
                 f"TensorRT-LLM MHA only supports page_size of 16, 32 or 64, changing page_size from {page_size} to 64."
             )
             page_size = 64
+    if (
+        view.attention_backend == "hpc_ops"
+        or view.decode_attention_backend == "hpc_ops"
+        or view.prefill_attention_backend == "hpc_ops"
+    ):
+        if page_size != 64:
+            logger.warning(
+                f"HPC-Ops attention only supports a page_size of 64, changing page_size from {page_size} to 64."
+            )
+            page_size = 64
     if page_size != view.page_size:
         return {"page_size": page_size}
     return {}
