@@ -47,6 +47,7 @@ from sglang.srt.utils import (
     is_gfx95_supported,
     is_hip,
     is_musa,
+    is_sm89_supported,
     is_sm90_supported,
     is_sm100_supported,
     is_sm120_supported,
@@ -1633,7 +1634,9 @@ def apply_fp8_linear(
     compressed_tensor_quant: bool = False,
 ) -> torch.Tensor:
     gemm_backend = get_fp8_gemm_runner_backend()
-    cutlass_fp8_supported = is_sm90_supported() or is_blackwell_supported()
+    cutlass_fp8_supported = (
+        is_sm89_supported() or is_sm90_supported() or is_blackwell_supported()
+    )
 
     if (
         use_flashinfer_fp8()

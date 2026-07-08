@@ -62,6 +62,7 @@ from sglang.srt.utils.common import (
     get_device_capability,
     is_cuda,
     is_flashinfer_available,
+    is_sm89_supported,
     is_sm90_supported,
     is_sm100_supported,
     is_sm120_supported,
@@ -579,7 +580,7 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
         )
         layer.weight = Parameter(quantized_weight.t(), requires_grad=False)
         if (
-            is_sm90_supported() or is_blackwell_supported()
+            is_sm89_supported() or is_sm90_supported() or is_blackwell_supported()
         ) and not self.enable_flashinfer_bmm:
             max_w_scale = convert_to_channelwise(max_w_scale, layer.logical_widths)
         layer.weight_scale = Parameter(max_w_scale, requires_grad=False)

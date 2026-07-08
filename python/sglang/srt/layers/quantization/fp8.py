@@ -91,6 +91,7 @@ from sglang.srt.utils import (
     is_hip,
     is_musa,
     is_npu,
+    is_sm89_supported,
     is_sm90_supported,
     is_sm100_supported,
     is_sm120_supported,
@@ -729,7 +730,11 @@ class Fp8LinearMethod(LinearMethodBase):
             if not self.is_checkpoint_fp8_serialized:
                 if (
                     (
-                        (is_sm90_supported() or is_blackwell_supported())
+                        (
+                            is_sm89_supported()
+                            or is_sm90_supported()
+                            or is_blackwell_supported()
+                        )
                         and not use_flashinfer_fp8()
                     )
                     or self.use_marlin
@@ -773,7 +778,11 @@ class Fp8LinearMethod(LinearMethodBase):
                 # cutlass sgl-kernel and marlin only support per-channel scale; aiter supports per-channel scale
                 if (
                     (
-                        (is_sm90_supported() or is_blackwell_supported())
+                        (
+                            is_sm89_supported()
+                            or is_sm90_supported()
+                            or is_blackwell_supported()
+                        )
                         and not use_flashinfer_fp8()
                     )
                     or self.use_marlin

@@ -25,6 +25,7 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
     is_blackwell_supported,
+    is_sm89_supported,
     is_sm90_supported,
 )
 from sglang.srt.layers.quantization.modelopt_quant import (
@@ -351,7 +352,9 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
 
     def __init__(self, quant_config: ModelOptFp8Config):
         self.quant_config = quant_config
-        self.cutlass_fp8_supported = is_sm90_supported() or is_blackwell_supported()
+        self.cutlass_fp8_supported = (
+            is_sm89_supported() or is_sm90_supported() or is_blackwell_supported()
+        )
 
     def create_weights(
         self,

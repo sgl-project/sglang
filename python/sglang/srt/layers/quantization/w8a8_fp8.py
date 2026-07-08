@@ -27,6 +27,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
 )
 from sglang.srt.utils import (
     is_blackwell_supported,
+    is_sm89_supported,
     is_sm90_supported,
     set_weight_attrs,
 )
@@ -125,7 +126,7 @@ class W8A8Fp8LinearMethod(LinearMethodBase):
         else:
             # If checkpoint not offline quantized, quantize the weights with per-channel quantization.
             if (
-                is_sm90_supported() or is_blackwell_supported()
+                is_sm89_supported() or is_sm90_supported() or is_blackwell_supported()
             ) and not use_flashinfer_fp8():
                 # if cutlass supported, we use cutlass_scaled_mm
                 # which requires per-channel quantization on weight
