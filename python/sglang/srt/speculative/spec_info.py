@@ -181,9 +181,37 @@ class SpeculativeAlgorithm(Enum):
                 make_next_draft_input,
             )
 
+            tail_hidden = [
+                getattr(req, "prefill_tail_hidden_states_tensor", None)
+                for req in batch.reqs
+            ]
+            tail_mask = [
+                getattr(req, "prefill_tail_valid_mask", None) for req in batch.reqs
+            ]
+            if (
+                tail_hidden
+                and all(t is not None for t in tail_hidden)
+                and all(t is not None for t in tail_mask)
+            ):
+                prefill_tail_hidden_states = torch.stack(tail_hidden, dim=0).to(
+                    device=batch.device, non_blocking=True
+                )
+                prefill_tail_valid_mask = torch.stack(tail_mask, dim=0).to(
+                    device=batch.device, non_blocking=True
+                )
+                if not bool(prefill_tail_valid_mask.any()):
+                    prefill_tail_hidden_states = None
+                    prefill_tail_valid_mask = None
+            else:
+                prefill_tail_hidden_states = None
+                prefill_tail_valid_mask = None
+
             spec_info = make_next_draft_input(
                 bonus_tokens=last_tokens_tensor,
                 new_seq_lens=batch.seq_lens,
+                prefill_tail_hidden_states=prefill_tail_hidden_states,
+                prefill_tail_valid_mask=prefill_tail_valid_mask,
+                prefill_tail_hidden_projected=False,
             )
             spec_info.future_indices = batch.req_pool_indices
             future_map.stash(

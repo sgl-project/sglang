@@ -443,7 +443,8 @@ class DSparkWorkerV2(BaseSpecWorker):
             cache_loc=batch.out_cache_loc,
             positions=positions,
         )
-        logits_output.hidden_states = None
+        if self.server_args.disaggregation_mode != "prefill":
+            logits_output.hidden_states = None
 
         batch_output.next_draft_input = make_next_draft_input(
             bonus_tokens=next_token_ids,
@@ -518,6 +519,8 @@ class DSparkWorkerV2(BaseSpecWorker):
                         self._proposer.run_idle_participation(batch)
                 self._run_idle_verify_participation(batch)
             return self._decode_idle_result(on_publish=on_publish)
+
+        self._maybe_inject_pd_prefill_tail(batch, draft_input)
 
         batch.seq_lens.record_stream(
             torch.get_device_module(self.device).current_stream()
@@ -694,7 +697,110 @@ class DSparkWorkerV2(BaseSpecWorker):
             can_run_cuda_graph=can_run_cuda_graph,
             next_draft_input=next_draft_input,
             speculative_num_draft_tokens=int(self.verify_num_draft_tokens),
-            new_seq_lens=accept.new_seq_lens,
+            new_seq_lens=new_seq_lens,
+        )
+
+    def _maybe_inject_pd_prefill_tail(
+        self,
+        batch: ScheduleBatch,
+        draft_input: DFlashDraftInputV2,
+    ) -> None:
+        tail_hidden = getattr(draft_input, "prefill_tail_hidden_states", None)
+        tail_mask = getattr(draft_input, "prefill_tail_valid_mask", None)
+        if tail_hidden is None or tail_mask is None or tail_hidden.numel() == 0:
+            return
+
+        tail_hidden = tail_hidden.to(device=self.device, non_blocking=True)
+        tail_mask = tail_mask.to(device=self.device, non_blocking=True).bool()
+        bs, tail_len = tail_mask.shape
+        if bs == 0 or tail_len == 0:
+            return
+
+        device = torch.device(self.device)
+        row = torch.arange(tail_len, device=device).view(1, tail_len)
+        valid_counts = tail_mask.sum(dim=1).to(torch.int64)
+        start_pos = batch.seq_lens.to(torch.int64).view(-1, 1) - valid_counts.view(
+            -1, 1
+        )
+        positions_2d = start_pos + row
+
+        req_to_token = self.model_runner.req_to_token_pool.req_to_token
+        cache_loc_2d = req_to_token[batch.req_pool_indices, positions_2d.clamp_min(0)]
+
+        flat_mask = tail_mask.reshape(-1)
+        if not bool(flat_mask.any()):
+            return
+        self._kv_injector.inject_target_hidden(
+            target_hidden=tail_hidden.reshape(bs * tail_len, -1)[flat_mask],
+            cache_loc=cache_loc_2d.reshape(-1)[flat_mask],
+            positions=positions_2d.reshape(-1)[flat_mask],
+        )
+        draft_input.prefill_tail_hidden_states = None
+        draft_input.prefill_tail_valid_mask = None
+
+    def _simulated_correct_len(
+        self, *, bs: int, dtype: torch.dtype, device: torch.device
+    ) -> torch.Tensor:
+        buf = self._simulated_correct_drafts_buf
+        if buf is None or buf.numel() < bs or buf.dtype != dtype:
+            correct_target = int(
+                round(min(max(self._simulate_acc_len - 1.0, 0.0), float(self.gamma)))
+            )
+            buf = torch.full(
+                (max(bs, 512),), correct_target, dtype=dtype, device=device
+            )
+            self._simulated_correct_drafts_buf = buf
+        return buf[:bs]
+
+    def _maybe_record_sts_collect(
+        self,
+        *,
+        verify_ids_2d: torch.Tensor,
+        target_logits: torch.Tensor,
+        bs: int,
+    ) -> None:
+        collect_path = envs.SGLANG_DSPARK_STS_COLLECT_PATH.get()
+        if not collect_path:
+            return
+        if not self._verify_planner.carries_confidence:
+            return
+        confidence_raw = self._verify_planner.last_confidence_raw
+        if confidence_raw is None:
+            return
+        if self._sts_recorder is None:
+            self._sts_recorder = StsDataRecorder(
+                path_stem=collect_path,
+                gamma=self.gamma,
+                flush_every=_STS_COLLECT_FLUSH_EVERY,
+            )
+        target_predict = torch.argmax(target_logits, dim=-1).view(
+            bs, self.verify_num_draft_tokens
+        )
+        num_correct_drafts, _ = compute_dflash_correct_drafts_and_bonus(
+            candidates=verify_ids_2d,
+            target_predict=target_predict,
+        )
+        self._sts_recorder.record(
+            confidence_raw=confidence_raw,
+            num_correct_drafts=num_correct_drafts,
+        )
+
+    def _resolve_verify_token_budget(
+        self,
+        *,
+        batch: ScheduleBatch,
+        draft_input: DFlashDraftInputV2,
+        confidence: Optional[torch.Tensor],
+        prefix_lens: torch.Tensor,
+    ) -> Optional[int]:
+        if not self._verify_planner.schedules_verify_budget or confidence is None:
+            return None
+        if not self.server_args.disable_overlap_schedule:
+            return draft_input.verify_token_budget
+        return self._verify_planner.compute_budget_sync(
+            confidence=confidence,
+            prefix_lens=prefix_lens,
+            req_pool_indices=batch.req_pool_indices,
         )
 
     def get_confidence_budget_prepare(self):
