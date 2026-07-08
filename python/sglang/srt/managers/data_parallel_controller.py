@@ -450,10 +450,12 @@ class DataParallelController:
         endpoint = na.to_tcp()
 
         if server_args.node_rank == 0:
+            # Node 0: Broadcast worker ports to all other nodes
             return self._broadcast_ports_as_server(
                 endpoint, server_args.nnodes - 1, worker_ports
             )
         else:
+            # Other nodes: Receive worker ports from node 0
             return self._receive_ports_as_client(endpoint, server_args.node_rank)
 
     def _broadcast_ports_as_server(

@@ -262,14 +262,13 @@ def prepare_mlp_sync_batch_raw(
         local_batch.is_extend_in_batch = is_extend_in_batch
 
     tbo_preparer = TboDPAttentionPreparer()
-    use_world_group = False
-    if world_dp_gather_enabled():
+    use_world_group = world_dp_gather_enabled()
+    if use_world_group:
         from sglang.srt.distributed.parallel_state import get_world_group
 
         world = get_world_group()
         group = torch.distributed.group.WORLD
         device = world.device
-        use_world_group = True
     elif len(offload_tags) == 0 and (
         disable_overlap_schedule
         or envs.SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH.get()

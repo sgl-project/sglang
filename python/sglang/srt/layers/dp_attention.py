@@ -52,6 +52,7 @@ _ELASTIC_JOINER_SKIP_ALL_GATHER: bool = False
 
 
 def world_dp_gather_enabled() -> bool:
+    """Whether DP gathers should use expanded WORLD after joiner admission."""
     return _USE_WORLD_GROUP_FOR_DP_GATHER and not _ELASTIC_JOINER_SKIP_ALL_GATHER
 
 
@@ -69,22 +70,6 @@ def update_dp_attention_post_scale(new_dp_size: int, new_dp_rank: int):
         "[Elastic EP] dp_attention switched to WORLD: dp_size=%d dp_rank=%d",
         new_dp_size,
         new_dp_rank,
-    )
-
-
-def _elastic_world_all_reduce(tensor: torch.Tensor) -> None:
-    torch.distributed.all_reduce(
-        tensor,
-        op=torch.distributed.ReduceOp.SUM,
-        group=torch.distributed.group.WORLD,
-    )
-
-
-def _elastic_world_all_gather_into_tensor(
-    output: torch.Tensor, input_: torch.Tensor
-) -> None:
-    torch.distributed.all_gather_into_tensor(
-        output, input_, group=torch.distributed.group.WORLD
     )
 
 
@@ -539,8 +524,12 @@ def _dp_gather_via_all_reduce(
         )
 
     # Input IDs are in int 32. We should use inplace_all_reduce for local case because of custom all reduce.
-    if _USE_WORLD_GROUP_FOR_DP_GATHER and not _ELASTIC_JOINER_SKIP_ALL_GATHER:
-        _elastic_world_all_reduce(global_tokens)
+    if world_dp_gather_enabled():
+        torch.distributed.all_reduce(
+            global_tokens,
+            op=torch.distributed.ReduceOp.SUM,
+            group=torch.distributed.group.WORLD,
+        )
     else:
         NUM_GPUS_PER_NODE = 8
         if (
@@ -561,11 +550,15 @@ def _dp_gather_via_all_gather(
     forward_batch: ForwardBatch,
     is_partial: bool,
 ):
-    use_world = _USE_WORLD_GROUP_FOR_DP_GATHER and not _ELASTIC_JOINER_SKIP_ALL_GATHER
+    use_world = world_dp_gather_enabled()
 
     if get_attention_tp_size() == 1:
         if use_world:
-            _elastic_world_all_gather_into_tensor(global_tokens, local_tokens)
+            torch.distributed.all_gather_into_tensor(
+                global_tokens,
+                local_tokens,
+                group=torch.distributed.group.WORLD,
+            )
         else:
             get_tp_group().all_gather_into_tensor(global_tokens, local_tokens)
         return
@@ -578,7 +571,11 @@ def _dp_gather_via_all_gather(
     ]
     get_attention_tp_group().reduce_scatter_tensor(scattered_local_tokens, local_tokens)
     if use_world:
-        _elastic_world_all_gather_into_tensor(global_tokens, scattered_local_tokens)
+        torch.distributed.all_gather_into_tensor(
+            global_tokens,
+            scattered_local_tokens,
+            group=torch.distributed.group.WORLD,
+        )
     else:
         get_tp_group().all_gather_into_tensor(global_tokens, scattered_local_tokens)
 
