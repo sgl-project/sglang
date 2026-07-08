@@ -594,5 +594,104 @@ class TestDisaggregationGDNHybridHeteroTP(PDDisaggregationServerBase):
         self.assertGreater(metrics["score"], 0.60)
 
 
+class TestDisaggregationStagingRadixPrefillLargerTP(PDDisaggregationServerBase):
+    """Prefill TP=4 -> Decode TP=2, staging + radix cache on both sides.
+
+    The gsm8k few-shot preamble is a prefix shared by every request. With a
+    small chunked-prefill-size it spans several staging grid slots, so a
+    prefill radix hit bundles a multi-slot prefix into the first send and the
+    decode side reuses its own cached prefix -- the exact grid-split and
+    decode-prefix scatter-offset paths that a default (single-slot) prefix
+    never reaches. Unpatched, this configuration corrupts KV or wedges; the
+    gsm8k score guards against both.
+    """
+
+    # Small enough that the shared gsm8k few-shot prefix (~900 tokens) spans
+    # several staging grid slots, so a radix hit exercises the grid-split path.
+    CHUNKED_PREFILL_SIZE = "256"
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        envs.SGLANG_ENABLE_JIT_DEEPGEMM.set(False)
+
+        cls.model = try_cached_model(DEFAULT_MODEL_NAME_FOR_TEST)
+
+        cls.start_prefill()
+        cls.start_decode()
+
+        cls.wait_server_ready(cls.prefill_url + "/health", process=cls.process_prefill)
+        cls.wait_server_ready(cls.decode_url + "/health", process=cls.process_decode)
+
+        cls.launch_lb()
+
+    @classmethod
+    def start_prefill(cls):
+        prefill_args = [
+            "--trust-remote-code",
+            "--disaggregation-mode",
+            "prefill",
+            "--disaggregation-bootstrap-port",
+            cls.bootstrap_port,
+            "--tp",
+            "4",
+            "--chunked-prefill-size",
+            cls.CHUNKED_PREFILL_SIZE,
+            "--enable-metrics",
+            "--enable-request-time-stats-logging",
+        ]
+        prefill_args += cls.transfer_backend + cls.rdma_devices
+        env = {**os.environ, **STAGING_ENV}
+        cls.process_prefill = popen_launch_pd_server(
+            cls.model,
+            cls.prefill_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=prefill_args,
+            env=env,
+        )
+
+    @classmethod
+    def start_decode(cls):
+        decode_args = [
+            "--trust-remote-code",
+            "--disaggregation-mode",
+            "decode",
+            "--disaggregation-bootstrap-port",
+            cls.bootstrap_port,
+            "--tp",
+            "2",
+            "--base-gpu-id",
+            "4",
+            "--chunked-prefill-size",
+            cls.CHUNKED_PREFILL_SIZE,
+            "--disaggregation-decode-enable-radix-cache",
+            "--enable-metrics",
+            "--enable-request-time-stats-logging",
+        ]
+        decode_args += cls.transfer_backend + cls.rdma_devices
+        env = {**os.environ, **STAGING_ENV}
+        cls.process_decode = popen_launch_pd_server(
+            cls.model,
+            cls.decode_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=decode_args,
+            env=env,
+        )
+
+    def test_gsm8k(self):
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="gsm8k",
+            api="completion",
+            max_tokens=512,
+            num_examples=200,
+            num_threads=128,
+        )
+        metrics = run_eval(args)
+        print(f"[Staging Radix PrefillLargerTP] Evaluation metrics: {metrics}")
+        self.assertGreater(metrics["score"], 0.60)
+
+
 if __name__ == "__main__":
     unittest.main()
