@@ -67,6 +67,15 @@ _PLAN_METADATA_INTS_PER_BATCH = 2
 
 
 def plan_topk_v2(seq_lens: torch.Tensor, static_threshold: int = 0) -> torch.Tensor:
+    """Preprocess the per-batch routing plan for :func:`topk_transform_512_v2`.
+
+    IMPORTANT: every entry of ``seq_lens`` must be NON-NEGATIVE. The device
+    kernel reads the int32 buffer as ``uint32_t``, so a negative length (e.g.
+    -4 from a DP-padded / idle-companion row) reinterprets as ~4e9, poisons
+    the plan, and drives the transform kernel into an illegal memory access.
+    Producers of padded rows must clamp their lengths to 0 (0 selects the
+    trivial all-(-1) output path, which is safe).
+    """
     module = _jit_topk_v2_module()
     bs = seq_lens.shape[0]
     metadata = seq_lens.new_empty(bs + 1, _PLAN_METADATA_INTS_PER_BATCH)
@@ -83,6 +92,17 @@ def topk_transform_512_v2(
     metadata: torch.Tensor,
     out_raw_indices: Optional[torch.Tensor] = None,
 ) -> None:
+    """Fused top-k + page-table transform (DeepSeek-V4 top-k v2 kernel).
+
+    IMPORTANT: every entry of ``seq_lens`` must be NON-NEGATIVE, and
+    ``metadata`` must come from :func:`plan_topk_v2` over the same ``seq_lens``
+    values. The kernel reads lengths as ``uint32_t``: a negative entry
+    reinterprets as a ~4e9-token sequence, sending the row down the cluster
+    path over garbage scores and crashing with an illegal memory access
+    (GLM 5.2 MTP DP-idle companion rows hit exactly this). A length of 0 is
+    the valid way to express "no tokens": the row takes the trivial path and
+    the output is all -1.
+    """
     module = _jit_topk_v2_module()
     module.topk_transform(
         scores,
