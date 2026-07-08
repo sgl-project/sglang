@@ -17,6 +17,10 @@ DEFAULT_FA3_KERNEL_LOCKFILE = "kernels.lock"
 
 
 def _call_fa3_kernel(kernel, *args, out=None, **kwargs):
+    # only_qv=False is the kernel default; drop it so older kernel builds
+    # without the argument keep working.
+    if kwargs.get("only_qv") is False:
+        del kwargs["only_qv"]
     if out is None:
         return kernel(*args, **kwargs)
     try:

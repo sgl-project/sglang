@@ -129,7 +129,13 @@ def _load_weights_into_module(module: torch.nn.Module, weights_iter) -> None:
         offload_managers = [m for m in module.layerwise_offload_managers if m.enabled]
 
     if offload_managers:
-        weight_dict = dict(weights_iter)
+        entries = list(weights_iter)
+        if any(shard_id is not None for _, _, shard_id in entries):
+            raise NotImplementedError(
+                "Fused-parameter weight updates are not supported for "
+                "layerwise-offloaded modules."
+            )
+        weight_dict = {n: w for n, w, _ in entries}
         offloaded_names: set[str] = set()
         for manager in offload_managers:
             offloaded_names.update(manager.update_cpu_weights(weight_dict))
@@ -151,11 +157,14 @@ def _build_module_weight_name_mapper(module: torch.nn.Module):
     if not mapping_fns:
         return None
 
-    def map_name(name: str) -> str:
+    def map_name(name: str) -> tuple[str, Any]:
         mapped_name = name
+        merge_index = None
         for mapping_fn in mapping_fns:
-            mapped_name = mapping_fn(mapped_name)[0]
-        return mapped_name
+            mapped_name, index, _ = mapping_fn(mapped_name)
+            if index is not None:
+                merge_index = index
+        return mapped_name, merge_index
 
     return map_name
 
@@ -165,17 +174,19 @@ def _iter_module_weight_updates(
     weights_iter,
     model_params: dict,
 ):
+    """Yield (mapped_name, weight, shard_id); shard_id is the merge index for
+    weights that map into a fused parameter (e.g. q/k/v -> to_qkv), else None."""
     map_name = _build_module_weight_name_mapper(module)
     module_name = type(module).__name__
 
     for name, loaded_weight in weights_iter:
         if name in model_params:
-            yield name, loaded_weight
+            yield name, loaded_weight, None
             continue
 
-        mapped_name = map_name(name) if map_name is not None else name
+        mapped_name, merge_index = map_name(name) if map_name is not None else (name, None)
         if mapped_name in model_params:
-            yield mapped_name, loaded_weight
+            yield mapped_name, loaded_weight, merge_index
             continue
 
         logger.warning(
@@ -189,15 +200,24 @@ def _iter_module_weight_updates(
 def load_weights_into_model(
     weights_iter, model_params: dict, module_name: str | None = None
 ) -> None:
-    """Copy weights from weights_iter into model_params in-place."""
-    for name, loaded_weight in weights_iter:
+    """Copy weights from weights_iter into model_params in-place.
+
+    Accepts (name, weight) or (name, weight, shard_id) entries; shard_id
+    routes fused-parameter parts through the layer's weight_loader.
+    """
+    for entry in weights_iter:
+        name, loaded_weight, *rest = entry
+        shard_id = rest[0] if rest else None
         if name not in model_params:
             logger.warning("Skipping weight update: parameter %r not found", name)
             continue
         param = model_params[name]
         weight_loader = getattr(param, "weight_loader", None)
         if callable(weight_loader):
-            weight_loader(param, loaded_weight.to(param.dtype))
+            if shard_id is not None:
+                weight_loader(param, loaded_weight.to(param.dtype), shard_id)
+            else:
+                weight_loader(param, loaded_weight.to(param.dtype))
         else:
             dtensor_param = param if isinstance(param, DTensor) else None
             if dtensor_param is None and isinstance(

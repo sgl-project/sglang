@@ -623,6 +623,7 @@ class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 neg_cond_kwargs={
                     "text_ids": uncond_text_ids,
                     "text_mask": uncond_text_mask,
+                    "fps": fps,
                 },
                 guidance=None,
             )
@@ -1013,4 +1014,5 @@ class Cosmos3DecodingStage(PipelineStage):
         return OutputBatch(
             output=output,
             metrics=batch.metrics if hasattr(batch, "metrics") else None,
+            rollout_trajectory_data=batch.rollout_trajectory_data,
         )
