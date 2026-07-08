@@ -240,6 +240,103 @@ to generate some requests.
 
 Then you should be able to see the metrics in the Grafana dashboard.
 
+## Forward-Pass Decode Interference Metrics
+
+SGLang also exports per-forward-pass histograms for diagnosing whether long
+prefill work co-scheduled with decode work is causing decode-step latency tail
+spikes. These metrics are available with `--enable-metrics`.
+
+- `sglang:forward_pass_duration_seconds`: Histogram of every scheduler/model
+  forward pass duration. The `phase` label is `prefill_only`, `decode_only`,
+  `mixed`, or `other`.
+- `sglang:decode_step_latency_seconds`: Histogram of forward pass duration only
+  for passes that include decode requests. This approximates the delay active
+  decoding requests experience before the next decode step completes.
+
+Labels:
+
+- `phase`: Scheduling phase derived from scheduled prefill token and decode
+  request counts.
+- `prefill_tokens_bucket`: Bucketed scheduled prefill token count for
+  `sglang:forward_pass_duration_seconds`.
+- `co_scheduled_prefill_bucket`: Bucketed scheduled prefill token count for
+  `sglang:decode_step_latency_seconds`.
+- `decode_reqs_bucket`: Bucketed number of scheduled decode requests.
+
+Prefill token buckets are `0`, `1_1k`, `1k_4k`, `4k_16k`, `16k_64k`, and
+`64k_plus`. Decode request buckets are `0`, `1`, `2_4`, `5_8`, `9_16`,
+`17_32`, and `33_plus`.
+
+These metrics are intentionally not completed-request TPOT. They measure
+scheduler/model forward pass duration. Speculative decoding, stream interval,
+and two-batch-overlap can make "one forward pass equals one visible token
+interval" only approximate.
+
+To check that the metrics are exposed:
+
+```bash
+curl http://localhost:<metrics_port>/metrics | grep -E "decode_step_latency|forward_pass_duration"
+```
+
+### PromQL examples
+
+Decode-only p99:
+
+```promql
+histogram_quantile(
+  0.99,
+  sum by (le) (
+    rate(sglang:decode_step_latency_seconds_bucket{
+      phase="decode_only",
+      co_scheduled_prefill_bucket="0"
+    }[1m])
+  )
+)
+```
+
+Mixed long-prefill p99:
+
+```promql
+histogram_quantile(
+  0.99,
+  sum by (le, co_scheduled_prefill_bucket) (
+    rate(sglang:decode_step_latency_seconds_bucket{
+      phase="mixed",
+      co_scheduled_prefill_bucket=~"16k_64k|64k_plus"
+    }[1m])
+  )
+)
+```
+
+Compare p99 by prefill bucket:
+
+```promql
+histogram_quantile(
+  0.99,
+  sum by (le, co_scheduled_prefill_bucket) (
+    rate(sglang:decode_step_latency_seconds_bucket{
+      phase=~"decode_only|mixed"
+    }[5m])
+  )
+)
+```
+
+Sample count sanity check:
+
+```promql
+sum by (co_scheduled_prefill_bucket) (
+  rate(sglang:decode_step_latency_seconds_count[5m])
+)
+```
+
+If `sglang:decode_step_latency_seconds` p99 for `phase="mixed"` and
+`co_scheduled_prefill_bucket="16k_64k"` or `"64k_plus"` is repeatedly much
+higher than `phase="decode_only"`, long prefill co-scheduling is likely causing
+decode ITL/TPOT tail spikes. As a practical guide, mixed p99 within 1.2x of
+decode-only p99 is weak interference, repeated 1.5x or higher suggests tuning
+chunked prefill or mixed batching, and repeated 2x or higher suggests prefill
+throttling or prefill/decode disaggregation.
+
 ## Estimated Performance Metrics (MFU-related)
 
 SGLang exports the following estimated per-GPU counters that can be used to derive

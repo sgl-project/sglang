@@ -2616,7 +2616,10 @@ class Scheduler(
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
         self.process_pending_chunked_abort()
 
-        if self.enable_fpm:
+        collect_forward_pass_timing = (
+            self.enable_fpm or self.metrics_reporter.current_scheduler_metrics_enabled
+        )
+        if collect_forward_pass_timing:
             self._fpm_batch_t0 = time.monotonic()
         self._abort_on_waiting_timeout()
         self._abort_on_running_timeout()
@@ -2738,7 +2741,7 @@ class Scheduler(
 
         if ret:
             set_schedule_time_batch(ret)
-            if self.enable_fpm:
+            if collect_forward_pass_timing:
                 ret.fpm_start_time = self._fpm_batch_t0
 
         return ret
@@ -3486,6 +3489,7 @@ class Scheduler(
             self.batch_result_processor.process_batch_result_idle(batch, result)
 
         self.metrics_reporter.log_batch_result_stats(batch, result)
+        self.metrics_reporter.observe_forward_pass_interference(batch)
 
         # Emit forward pass metrics (every iteration when enabled)
         if self.enable_fpm:

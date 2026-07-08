@@ -85,7 +85,20 @@ class _DummyPublisherThread:
         pass
 
 
-def _make_reporter(scheduler) -> SchedulerMetricsReporter:
+class _CollectingMetricsCollector:
+    def __init__(self):
+        self.forward_pass_interference = []
+
+    def observe_forward_pass_interference(self, **kwargs):
+        self.forward_pass_interference.append(kwargs)
+
+
+def _make_reporter(
+    scheduler,
+    *,
+    metrics_collector=None,
+    current_scheduler_metrics_enabled=False,
+) -> SchedulerMetricsReporter:
     if not hasattr(scheduler, "server_args"):
         scheduler.server_args = types.SimpleNamespace(
             enable_metrics=False,
@@ -109,11 +122,11 @@ def _make_reporter(scheduler) -> SchedulerMetricsReporter:
     if not hasattr(scheduler, "draft_worker"):
         scheduler.draft_worker = None
     context = types.SimpleNamespace(
-        enable_metrics=False,
+        enable_metrics=current_scheduler_metrics_enabled,
         is_stats_logging_rank=True,
-        current_scheduler_metrics_enabled=False,
+        current_scheduler_metrics_enabled=current_scheduler_metrics_enabled,
         enable_kv_cache_events=False,
-        collector=None,
+        collector=metrics_collector,
     )
     return SchedulerMetricsReporter(
         scheduler=scheduler,
@@ -121,7 +134,7 @@ def _make_reporter(scheduler) -> SchedulerMetricsReporter:
         pp_rank=0,
         dp_rank=0,
         metrics_collector_context=context,
-        metrics_collector=None,
+        metrics_collector=metrics_collector,
     )
 
 
@@ -233,6 +246,45 @@ class TestForwardPassMetrics(unittest.TestCase):
         self.assertAlmostEqual(
             self.scheduler._fpm_publisher.metrics[0].wall_time, 0.035, places=4
         )
+
+    def test_prometheus_forward_pass_observation_does_not_require_fpm(self):
+        self.scheduler.enable_fpm = False
+        metrics_collector = _CollectingMetricsCollector()
+        self.reporter = _make_reporter(
+            self.scheduler,
+            metrics_collector=metrics_collector,
+            current_scheduler_metrics_enabled=True,
+        )
+
+        prefill_req = _FakeReq(10, prefix_len=2)
+        decode_req = _FakeReq(8, output_len=3)
+        batch = self._make_batch(
+            forward_mode=_FakeForwardMode(is_mixed=True, is_extend=True),
+            reqs=[prefill_req, decode_req],
+            decoding_reqs=[decode_req],
+            prefill_stats=PrefillStats(
+                log_input_tokens=1200,
+                log_hit_tokens=0,
+                new_token_ratio=1.0,
+                num_running_reqs=types.SimpleNamespace(),
+                num_new_seqs=1,
+            ),
+            seq_lens_cpu=[decode_req.seqlen],
+            fpm_start_time=100.0,
+        )
+
+        with patch(
+            "sglang.srt.managers.scheduler_components.metrics_reporter.time.monotonic",
+            return_value=100.075,
+        ):
+            self.reporter.observe_forward_pass_interference(batch)
+
+        self.assertEqual(len(metrics_collector.forward_pass_interference), 1)
+        observation = metrics_collector.forward_pass_interference[0]
+        self.assertAlmostEqual(observation["duration_seconds"], 0.075, places=4)
+        self.assertEqual(observation["phase"], "mixed")
+        self.assertEqual(observation["prefill_tokens"], 1200)
+        self.assertEqual(observation["decode_reqs"], 1)
 
     def test_disagg_prefill_queued_metrics(self):
         self.scheduler.disaggregation_mode = DisaggregationMode.PREFILL
