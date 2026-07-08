@@ -2,20 +2,19 @@
 
 ## 1. Why split
 
-A "move a method/function" change is really **two operations with different correctness
-criteria**:
+- A "move a method/function" change is really **two operations with different
+  correctness criteria**:
 
 | Operation | What it does | How you check it |
 |---|---|---|
 | **Semantic reshape** | method → free function or method; `self.X` → a parameter, or `self` retyped to the target class; signature / typing change | behavior unchanged: lint + tests pass |
 | **Physical move** | cut from the source, paste into the target, fix imports | the moved body is byte-identical, line for line; the only other changes are move artifacts |
 
-Put both in one commit and the criteria contaminate each other:
-
-- one hunk then holds the reshape **and** an indentation shift **and** a cross-file
-  relocation;
-- neither a human nor a tool can mechanically confirm "the body that landed is the body
-  that left" — you must re-read the logic.
+- Put both in one commit and the criteria contaminate each other:
+    - one hunk then holds the reshape **and** an indentation shift **and** a cross-file
+      relocation;
+    - neither a human nor a tool can mechanically confirm "the body that landed is the
+      body that left" — you must re-read the logic.
 
 ## 2. The rule — up to three commits, in this order
 
@@ -39,14 +38,18 @@ Hard lines ("prep" below = the prepare phase):
   **equivalence** (tests or a written argument). Never smuggled into prep as a "small
   reshape".
 
-The prep's shape depends on the destination — a module-level function (§3) or a class
-(§4). The move is the same idea in both: a pure relocation, body byte-identical.
+- The prep's shape depends on the destination: a module-level function (§3.1) or a class
+  (§3.2).
+- The move is the same idea in both: a pure relocation, body byte-identical.
 
-## 3. Case 1: method → free function
+## 3. Cases
 
-### 3.1 Commit 1 — prep: de-self in place (no relocation)
+### 3.1 Case 1: method → free function
 
-Reshape the method **in its original file and position** so it no longer needs `self`:
+#### 3.1.1 Commit 1 — prep: de-self in place (no relocation)
+
+Reshape the method **in its original file and position** so it no longer needs `self`.
+The body stays put:
 
 - `self.X` (read) → pass `X` in as a parameter.
 - `self.X = v` (write) → `return v`; the caller assigns. (Or pass an explicit mutable
@@ -56,13 +59,13 @@ Reshape the method **in its original file and position** so it no longer needs `
 - Once `self` is gone → mark `@staticmethod`; the body **does not move**.
 - Call site: `self.foo(args)` → `TheClass.foo(args)`.
 
-The decorator and the qualifier are the only artifacts the move will carry — exactly what
-the whitelist (`spec-reproduction-utils.md` §2.1) forgives.
+- The decorator and the qualifier are the only artifacts the move will carry — exactly
+  what the whitelist (`spec-reproduction-utils.md` §2.1) forgives.
 
 **Check:** lint + tests pass; the diff is the body reshape plus the call-site qualifier;
 nothing moved.
 
-### 3.2 Commit 2 — move: relocate to the module
+#### 3.1.2 Commit 2 — move: relocate to the module
 
 - Cut the `@staticmethod` block; paste into the target module.
 - Drop `@staticmethod`, dedent to module level — body **unchanged, line for line**.
@@ -73,12 +76,13 @@ nothing moved.
 `git show <commit> --color-moved=dimmed-zebra --color-moved-ws=allow-indentation-change`
 marks the whole block as moved.
 
-## 4. Case 2: method → method on a class
+### 3.2 Case 2: method → method on a class
 
-For pulling **several methods and the fields they touch** into a new (or existing) class.
-Prep does **not** de-self — it builds the class and retypes `self`, body untouched.
+- For pulling **several methods and the fields they touch** into a new (or existing)
+  class.
+- Prep does **not** de-self — it builds the class and retypes `self`, body untouched.
 
-### 4.1 Commit 1 — prep: build the class, retype `self`
+#### 3.2.1 Commit 1 — prep: build the class, retype `self`
 
 1. Create the target class with the fields the moved methods touch (a frozen dataclass is
    simplest; drop `frozen` only if they mutate).
@@ -98,10 +102,12 @@ Prep does **not** de-self — it builds the class and retypes `self`, body untou
 
 4. Caller: `self.foo(...)` → `Source.foo(self.component, ...)`.
 
-Why keep the name `self`: it is an ordinary parameter name, so every `self.X` resolves
-against the target class statically and at runtime (the argument *is* a target-class
-instance). Renaming it would rewrite every `self.X` and destroy the "body unchanged across
-both commits" invariant.
+Why keep the name `self`:
+
+- it is an ordinary parameter name, so every `self.X` resolves against the target class
+  statically and at runtime (the argument *is* a target-class instance);
+- renaming it would rewrite every `self.X` and destroy the "body unchanged across both
+  commits" invariant.
 
 Boundaries:
 
@@ -137,7 +143,7 @@ Boundaries:
 **Check:** lint + tests pass; body unchanged; types check (`self: Target` matches the
 instance the caller passes).
 
-### 4.2 Commit 2 — move: relocate into the class
+#### 3.2.2 Commit 2 — move: relocate into the class
 
 - Cut `foo` into the target class; drop `@staticmethod` — body **unchanged, line for
   line**.
@@ -148,7 +154,7 @@ instance the caller passes).
 **Check:** `mechanical_refactor_proof_generator.py <commit>` reports `PASS`. The split
 paid off: prep left the body untouched, so the move is a clean cut/paste.
 
-## 5. Extracting to a new module: one move commit, no prep
+### 3.3 Case 3: extract to a new module — one move commit, no prep
 
 - The move gathers the defs **from wherever they sit** — no prep staging at the source
   tail. Replayed by `extract_symbols_to_new_module`.
@@ -160,9 +166,9 @@ paid off: prep left the body untouched, so the move is a clean cut/paste.
 - The only work outside the move: a non-mechanical reference the move cannot derive (a
   string-literal module path) — a one-line **postpare**.
 - A symbol **not top-level** in the source (a method still in a class): prepare de-selfs
-  it out first (§3); the proof reports `UNSUPPORTED` until then.
+  it out first (§3.1); the proof reports `UNSUPPORTED` until then.
 
-## 6. Extract-function: the bulk goes in the move
+### 3.4 Case 4: extract-function — the bulk goes in the move
 
 - The relocated body belongs in a certified move, not buried in a prep: the
   `extract_function` primitive cuts the inline block **verbatim** and authors only the
@@ -173,7 +179,9 @@ paid off: prep left the body untouched, so the move is a clean cut/paste.
 - An extraction that rewrites the body *as* it extracts is a semantic commit, not a
   certifiable move — do not dress it up as one.
 
-## 7. A move never renames
+## 4. Remarks
+
+### 4.1 A move never renames
 
 - The moved symbol keeps the **same name on both sides**.
 - A rename — even a privacy flip `_foo` → `foo` — is its own single-purpose commit
@@ -181,7 +189,7 @@ paid off: prep left the body untouched, so the move is a clean cut/paste.
 - A move that also renames cannot be machine-certified: split it — rename first, then
   move.
 
-## 8. Anti-pattern: prep adds the body, move deletes it
+### 4.2 Anti-pattern: prep adds the body, move deletes it
 
 - Symptom: prep **adds** a large block to the target; the move **deletes** the same block
   from the source. The order is reversed.
@@ -190,17 +198,17 @@ paid off: prep left the body untouched, so the move is a clean cut/paste.
 - The body appears and disappears exactly once — on the move side. Fix by pushing the
   "add the body" work out of prep into the move.
 
-## 9. When NOT to split (single commit)
+### 4.3 When NOT to split (single commit)
 
 - Moving an **already** module-level free function.
 - Pure file rename / whole-file move.
 - Trivial field deletion, or `getattr(obj, "x", ...)` → direct attribute access.
 - A class-internal helper relocated next to another helper in the same module.
 
-## 10. Which actions are mechanical vs not
+### 4.4 Which actions are mechanical vs not
 
-Boundary: building the component correctly the first time is mechanical; reshaping it
-*after* it exists is not.
+- Boundary: building the component correctly the first time is mechanical; reshaping it
+  *after* it exists is not.
 
 | Action | Bucket |
 |---|---|
@@ -217,13 +225,14 @@ Boundary: building the component correctly the first time is mechanical; reshapi
 | body simplification / dead-branch removal / logic rewrite | **not** mechanical |
 | semantic method rename | **not** mechanical |
 
-The smaller the prep, the easier "behavior unchanged" is to confirm. Many small,
-independently reviewable commits beat one big prep mixing ten flavors of change. Review
-order = commit order: prep → move → non-mechanical follow-ups.
+- The smaller the prep, the easier "behavior unchanged" is to confirm.
+- Many small, independently reviewable commits beat one big prep mixing ten flavors of
+  change.
+- Review order = commit order: prep → move → non-mechanical follow-ups.
 
-## 11. Naming
+### 4.5 Naming
 
-Consecutive commits with reserved suffixes; short kebab `<id>`:
+- Consecutive commits with reserved suffixes; short kebab `<id>`:
 
 ```
 <id>-prepare: <subject>    # optional: minimal in-place reshape (de-self, or retype-self)
@@ -231,4 +240,4 @@ Consecutive commits with reserved suffixes; short kebab `<id>`:
 <id>-postpare: <subject>   # optional: minimal tail fixup (e.g. a string-literal path)
 ```
 
-The `<phase>:` form is what the range command's `--match -move:` regex keys on.
+- The `<phase>:` form is what the range command's `--match -move:` regex keys on.

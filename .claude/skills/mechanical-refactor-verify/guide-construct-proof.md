@@ -9,9 +9,9 @@
 
 ## 2. Auto-generate the script (primary path)
 
-`mechanical_refactor_proof_generator.py` infers the recipe from a commit's diff and
-before-state AST, then emits and runs a standalone, auditable script — no one hand-writes
-it.
+- `mechanical_refactor_proof_generator.py` infers the recipe from a commit's diff and
+  before-state AST.
+- It emits and runs a standalone, auditable script — no one hand-writes it.
 
 ### 2.1 Commands
 
@@ -26,7 +26,7 @@ python3 .claude/skills/mechanical-refactor-verify/scripts/mechanical_refactor_pr
 
 ### 2.2 The range product
 
-A self-contained folder, auditable without the skill installed:
+Self-contained, auditable without the skill installed:
 
 - `repro_scripts/<sha>.py` — one script per commit;
 - `output.log` + `output.html` — the verdicts;
@@ -52,21 +52,22 @@ A self-contained folder, auditable without the skill installed:
 
 ### 2.4 What it reports `UNSUPPORTED`
 
-(Single-commit mode prints the verdict with notes and exits non-zero; range mode records
-it in the outputs.) Review as prepare, or hand-write the `Repro`:
-
-- **No definition relocated** — a rename (even a privacy flip `_foo` → `foo`) or a
-  statement-level reorder; reshapes belong in prepare.
-- **A new-module extract whose symbols are not all top-level in the source** — a method
-  still inside a class; prepare must de-self it out first.
-- **An extract drawing from more than one source file**, and an **inline-block
-  extract-function** — compose `extract_function` by hand (the body must be unchanged; a
-  de-self / restructure is a separate semantic commit).
+- Single-commit mode prints the verdict with notes and exits non-zero; range mode
+  records it in the outputs.
+- Review such a commit as prepare, or hand-write the `Repro` (§3).
+- The cases:
+    - **no definition relocated** — a rename (even a privacy flip `_foo` → `foo`) or a
+      statement-level reorder; reshapes belong in prepare;
+    - **a new-module extract whose symbols are not all top-level in the source** — a
+      method still inside a class; prepare must de-self it out first;
+    - **an extract drawing from more than one source file**, and an **inline-block
+      extract-function** — compose `extract_function` by hand (the body must be unchanged;
+      a de-self / restructure is a separate semantic commit).
 
 ## 3. Hand-write the `Repro` when inference falls short
 
-Compose the transform from the same primitives (`spec-reproduction-utils.md` §3); the same
-byte-diff then certifies it.
+- Compose the transform from the same primitives (`spec-reproduction-utils.md` §3).
+- The same byte-diff then certifies it.
 
 ```python
 import sys
@@ -87,9 +88,9 @@ r.run()   # PASS = byte-identical; otherwise prints the residual
 
 ## 4. A hand-written transform for a non-relocation mechanical change
 
-For a whole-file split or rename — no single symbol relocates — write a `transform()` and
-call `verify_mechanical_refactor`; the scaffold (worktree, pre-commit, diff, reporting)
-lives in the skill's utils.
+- For a whole-file split or rename — no single symbol relocates — write a `transform()`
+  and call `verify_mechanical_refactor`.
+- The scaffold (worktree, pre-commit, diff, reporting) lives in the skill's utils.
 
 ```python
 import sys

@@ -16,9 +16,9 @@
 > order** — allowing one **uniform indentation shift** of the whole block — plus a small
 > fixed set of **move artifacts**, and nothing else.
 
-Equivalently: the commit is reproducible by composing only the primitives of §3. The
-whitelist is exactly what they do; the not-allowed list is what they refuse, so it
-surfaces as a residual diff.
+- Equivalently: the commit is reproducible by composing only the primitives of §3.
+- The whitelist (§2.1) is exactly what they do; the not-allowed list (§2.2) is what they
+  refuse, so it surfaces as a residual diff.
 
 ### 2.1 Allowed — the whole whitelist
 
@@ -71,9 +71,9 @@ surfaces as a residual diff.
 - A **changed body in an extracted function** — de-self, control-flow restructure, or a
   folded-in bookkeeping change: a semantic rewrite, not a relocation.
 
-Reshape work (rename, fresh scaffolding, statement reorder, changed extraction body)
-belongs in the prepare/postpare phases of `guide-split.md`; the proof reports it as a
-residual, never certifies it.
+- Reshape work (rename, fresh scaffolding, statement reorder, changed extraction body)
+  belongs in the prepare/postpare phases of `guide-split.md`.
+- The proof reports it as a residual — never certifies it.
 
 ### 2.3 Blank lines are ignored
 
@@ -87,9 +87,10 @@ residual, never certifies it.
 
 ## 3. The faithful relocation primitives
 
-Each primitive does only a relocation-faithful edit — AST-located, spliced as original
-source text, never regenerated — so a byte match after the formatter certifies the commit
-is *exactly* that relocation.
+- Each primitive does only a relocation-faithful edit — AST-located, spliced as original
+  source text, never regenerated.
+- Therefore a byte match after the formatter certifies the commit is *exactly* that
+  relocation.
 
 - `move_symbol(name, *, src, dst, into_class, from_class, dedent, drop_self_annotation,
   before, leave_delegate, delegate_name)`:

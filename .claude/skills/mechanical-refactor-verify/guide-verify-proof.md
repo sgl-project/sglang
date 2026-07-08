@@ -1,8 +1,8 @@
 # Verify a proof for a move commit
 
-How the reviewer of a claimed-mechanical commit consumes its proof. The certified property
-and primitive contracts: `spec-reproduction-utils.md`. How the proof was produced and the
-folder it arrives in: `guide-construct-proof.md`.
+- How the reviewer of a claimed-mechanical commit consumes its proof.
+- The certified property and primitive contracts: `spec-reproduction-utils.md`.
+- How the proof was produced and the folder it arrives in: `guide-construct-proof.md`.
 
 ## 1. Re-run it
 
@@ -29,17 +29,17 @@ folder it arrives in: `guide-construct-proof.md`.
 
 ## 3. Audit the authored surfaces
 
-A PASS certifies the relocated bytes; the small **authored** surfaces are reproduced from
-the target and need human eyes. In the script, check:
-
-- **3.1** the `header=` of `extract_symbols_to_new_module` — the module audits its content
-  (imports / docstring / TYPE_CHECKING imports / logger / relocated `drop_assigns` copies
-  only); what remains for you: should those assignments move at all?
-- **3.2** a `leave_delegate=` on `move_symbol` — the forwarding stub is authored code in
-  the source file.
-- **3.3** the `signature=` / `return_text=` / `call=` of `extract_function` — the new
-  function's interface is authored; only its body is certified.
-- **3.4** the `drop_assigns=` list — each named constant leaves the source file.
+- A PASS certifies the relocated bytes; the small **authored** surfaces are reproduced
+  from the target and need human eyes.
+- In the script, check:
+    - the `header=` of `extract_symbols_to_new_module` — the module audits its content
+      (imports / docstring / TYPE_CHECKING imports / logger / relocated `drop_assigns`
+      copies only); what remains for you: should those assignments move at all?
+    - a `leave_delegate=` on `move_symbol` — the forwarding stub is authored code in the
+      source file;
+    - the `signature=` / `return_text=` / `call=` of `extract_function` — the new
+      function's interface is authored; only its body is certified;
+    - the `drop_assigns=` list — each named constant leaves the source file.
 
 ## 4. Know what a PASS does and does not assert
 
@@ -56,7 +56,7 @@ the target and need human eyes. In the script, check:
 
 - It runs the real formatter and compares bytes — no diff-shape heuristic to fool
   (`spec-reproduction-utils.md` §4).
-- The proof is the few primitive calls in the script; auditing them (plus §3) is the whole
-  human surface.
+- The proof is the few primitive calls in the script; auditing them (plus §3) is the
+  whole human surface.
 - The folder is self-contained and re-runnable by anyone — a CI step or a reviewer —
   without the skill installed.

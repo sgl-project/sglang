@@ -7,16 +7,15 @@ description: Make mechanical refactoring (file splits, function moves, module ex
 
 ## 1. Overview
 
-The correctness of a mechanical change (file split, function move, module extraction,
-rename) must be **machine-checkable, not eyeballed**. Whoever made the change and whenever,
-the proof is something anyone can re-run.
-
-There is **one property** — *a commit is a pure relocation* — and **one proof** of it:
-**reproduce**. Regenerate the move from the base commit with faithful primitives, run the
-formatter, and diff byte-for-byte against the target commit. An empty diff is the proof; any
-residual is a bundled non-move change surfaced for review. A reshape that is not a pure
-relocation must not ride along: split the work into an optional **prepare**, the certified
-**move**, and an optional **postpare** (`guide-split.md`).
+- The correctness of a mechanical change (file split, function move, module extraction,
+  rename) must be **machine-checkable, not eyeballed** — the proof is something anyone can
+  re-run, whoever made the change and whenever.
+- **One property**: *a commit is a pure relocation*. **One proof**: **reproduce** —
+  regenerate the move from the base commit with faithful primitives, run the formatter,
+  byte-diff against the target.
+- Empty diff = the proof. Any residual = a bundled non-move change, surfaced for review.
+- A reshape must not ride along: split into optional **prepare** + certified **move** +
+  optional **postpare** (`guide-split.md`).
 
 ## 2. What do you want to do?
 
