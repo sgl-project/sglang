@@ -13,7 +13,7 @@
 
 ### What is in this repo
 
-This repository contains the Weaver checkpoint for DFlash-TfM, short for DFlash-TreeFromMarginals. It is not a standalone language model: Weaver is an autoregressive adapter used during speculative decoding, on top of a target model and a factorized DFlash drafter.
+This repository contains the SGLang implementation for DFlash-TfM, short for DFlash-TreeFromMarginals. It is not a standalone language model: Weaver is an autoregressive adapter used during speculative decoding, on top of a target model and a factorized DFlash drafter.
 
 To run it, you also need:
 
