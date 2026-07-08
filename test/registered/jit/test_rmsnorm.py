@@ -37,18 +37,36 @@ def flashinfer_rmsnorm(
     output: torch.Tensor,
     eps: float = EPS,
 ) -> None:
-    if is_hip():
-        # flashinfer is CUDA-only; on ROCm use a torch reference so the sglang
-        # JIT kernel still gets validated (matches flashinfer math). The NVIDIA
-        # path below is unchanged.
-        x = input.float()
-        normed = x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + eps)
-        output.copy_((normed * weight.float()).to(output.dtype))
-        return
-
     from flashinfer.norm import rmsnorm
 
     rmsnorm(input, weight, out=output, eps=eps)
+
+
+def torch_rmsnorm(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    *,
+    output: torch.Tensor,
+    eps: float = EPS,
+) -> None:
+    x = input.float()
+    normed = x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + eps)
+    output.copy_((normed * weight.float()).to(output.dtype))
+
+
+def reference_rmsnorm(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    *,
+    output: torch.Tensor,
+    eps: float = EPS,
+) -> None:
+    # NVIDIA uses flashinfer (the bitwise reference); flashinfer is CUDA-only,
+    # so on ROCm fall back to the torch reference (matches flashinfer math).
+    if is_hip():
+        torch_rmsnorm(input, weight, output=output, eps=eps)
+    else:
+        flashinfer_rmsnorm(input, weight, output=output, eps=eps)
 
 
 BS_LIST = [2**n for n in range(0, 14)]
@@ -92,9 +110,9 @@ def test_rmsnorm(
     input = torch.randn(batch_size, hidden_size, device=DEVICE, dtype=dtype)
     weight = torch.randn(hidden_size, device=DEVICE, dtype=dtype)
 
-    input_flashinfer = input.clone()
-    output_flashinfer = torch.empty_like(input)
-    flashinfer_rmsnorm(input_flashinfer, weight, output=output_flashinfer)
+    input_ref = input.clone()
+    output_ref = torch.empty_like(input)
+    reference_rmsnorm(input_ref, weight, output=output_ref)
 
     if specify_out:
         output_sglang = torch.empty_like(input)
@@ -103,7 +121,7 @@ def test_rmsnorm(
         output_sglang = input.clone()
         sglang_jit_rmsnorm(output_sglang, weight, output=output_sglang)
 
-    torch.testing.assert_close(output_sglang, output_flashinfer, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(output_sglang, output_ref, atol=1e-2, rtol=1e-2)
 
 
 @pytest.mark.parametrize("hidden_size", [64, 128, 256, 512, 8192, 8704, 16384])
