@@ -895,10 +895,11 @@ class SchedulerBatchResultProcessor:
         if lazy:
             self.mamba_lazy_post_decode_at_boundary(req, batch)
         else:
-            req.mamba_next_track_idx = (
+            batch.req_to_token_pool.set_mamba_next_track_idx(
+                req,
                 batch.req_to_token_pool.get_mamba_ping_pong_other_idx(
                     req.mamba_next_track_idx
-                )
+                ),
             )
 
     def _mamba_check_track_boundary(self, req, batch, result, i):

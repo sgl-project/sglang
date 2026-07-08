@@ -926,6 +926,9 @@ class HybridReqToTokenPool(ReqToTokenPool):
                     device=self.device,
                 )
             )
+            self.req_index_to_active_mamba_track_slot_mapping: torch.Tensor = (
+                torch.zeros(req_pool_size, dtype=torch.int64, device=self.device)
+            )
 
     def register_layer_transfer_counter(self, layer_transfer_counter: LayerDoneCounter):
         self.layer_transfer_counter = layer_transfer_counter
@@ -973,6 +976,15 @@ class HybridReqToTokenPool(ReqToTokenPool):
             ping_pong_tensor = torch.stack(mamba_ping_pong_track_buffers)
             self.req_index_to_mamba_ping_pong_track_buffer_mapping[select_index] = (
                 ping_pong_tensor
+            )
+            active_track_slots = torch.stack(
+                [
+                    req.mamba_ping_pong_track_buffer[req.mamba_next_track_idx]
+                    for req in reqs
+                ]
+            )
+            self.req_index_to_active_mamba_track_slot_mapping[select_index] = (
+                active_track_slots
             )
         return select_index
 
@@ -1044,6 +1056,14 @@ class HybridReqToTokenPool(ReqToTokenPool):
         req.mamba_ping_pong_track_buffer = buf
         req.mamba_next_track_idx = 0
 
+    def set_mamba_next_track_idx(self, req: Req, idx: int):
+        """Update the active ping-pong index and the pre-resolved device mapping."""
+        req.mamba_next_track_idx = idx
+        if req.mamba_ping_pong_track_buffer is not None:
+            self.req_index_to_active_mamba_track_slot_mapping[req.req_pool_idx] = (
+                req.mamba_ping_pong_track_buffer[idx]
+            )
+
     def set_mamba_ping_pong_slot(self, req: Req, idx: int, value):
         """Update a ping-pong slot value and sync the device-side mapping.
 
@@ -1055,6 +1075,10 @@ class HybridReqToTokenPool(ReqToTokenPool):
         self.req_index_to_mamba_ping_pong_track_buffer_mapping[req.req_pool_idx] = (
             req.mamba_ping_pong_track_buffer
         )
+        if idx == req.mamba_next_track_idx:
+            self.req_index_to_active_mamba_track_slot_mapping[req.req_pool_idx] = (
+                req.mamba_ping_pong_track_buffer[idx]
+            )
 
     def donate_mamba_ping_pong_slot(
         self, req: Req, new_slot: torch.Tensor
@@ -1131,6 +1155,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             # tensor on the req side while the new pool slot leaks).
             req.mamba_ping_pong_track_buffer = None
             req.mamba_next_track_idx = None
+            self.req_index_to_active_mamba_track_slot_mapping[req.req_pool_idx] = 0
 
     def clear(self):
         logger.info("Reset HybridReqToTokenPool")
@@ -1145,6 +1170,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         self.req_index_to_mamba_index_mapping.zero_()
         if self.enable_mamba_extra_buffer:
             self.req_index_to_mamba_ping_pong_track_buffer_mapping.zero_()
+            self.req_index_to_active_mamba_track_slot_mapping.zero_()
 
 
 @dataclass

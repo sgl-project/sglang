@@ -914,8 +914,39 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if not forward_batch.needs_forward_metadata_init():
             # Pre-planned (plan-stream load_batch already ran).
             # In speculative decoding, these two fields are still needed.
-            self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
-            self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
+            raw_bs = forward_batch.batch_size
+            raw_num_token = raw_bs * self.num_tokens_per_bs
+            self.raw_bs = raw_bs
+            self.raw_num_token = raw_num_token
+
+            if self.require_mlp_tp_gather:
+                max_num_tokens = max(forward_batch.global_num_tokens_cpu)
+                max_batch_size = (
+                    max_num_tokens / self.num_tokens_per_bs
+                    if self.model_runner.spec_algorithm.is_eagle()
+                    or self.model_runner.spec_algorithm.is_standalone()
+                    or self.model_runner.spec_algorithm.is_dflash()
+                    else max_num_tokens
+                )
+                default_bs = self._pad_to_bucket(int(max_batch_size), self.capture_bs)
+            else:
+                default_bs = self._pad_to_bucket(raw_bs, self.capture_bs)
+
+            can_skip_input_copy = (
+                not torch.cuda.is_current_stream_capturing()
+                and forward_batch.is_cuda_graph_batch_loaded(
+                    runner_id=id(self),
+                    raw_bs=raw_bs,
+                    raw_num_tokens=raw_num_token,
+                )
+            )
+            if can_skip_input_copy:
+                self.bs = forward_batch.cuda_graph_batch_loaded_padded_bs
+            else:
+                self.bs = default_bs
+                self.buffers.input_ids[:raw_num_token].copy_(forward_batch.input_ids)
+                self.buffers.positions[:raw_num_token].copy_(forward_batch.positions)
+
             if (
                 self.model_runner.spec_algorithm.is_dflash()
                 and self.model_runner.is_draft_worker
@@ -996,6 +1027,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.raw_bs = raw_bs
         self.raw_num_token = raw_num_token
         self.bs = bs
+        forward_batch.mark_cuda_graph_batch_loaded(
+            runner_id=id(self),
+            raw_bs=raw_bs,
+            padded_bs=bs,
+            raw_num_tokens=raw_num_token,
+            padded_num_tokens=bs * self.num_tokens_per_bs,
+        )
 
         if self.model_runner.hisparse_coordinator is not None:
             self.model_runner.hisparse_coordinator.num_real_reqs.fill_(raw_bs)
