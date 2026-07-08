@@ -441,7 +441,7 @@ def test_dtype_contract_rejects_e5m2_q():
         torch.float8_e5m2
     )
     k = torch.randn(256, 1, 128, dtype=torch.bfloat16, device=DEVICE).to(FP8)
-    from sglang.srt.layers.attention.minimax_sparse_ops.common.utils import (
+    from sglang.kernels.ops.attention.minimax_sparse.common.utils import (
         check_sparse_kv_fp8,
     )
 
