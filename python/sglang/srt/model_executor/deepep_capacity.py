@@ -125,7 +125,7 @@ def plan_deepep_capacity(
     env = envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK
     static_plan = DeepEPCapacityPlan(ceiling=env.get(), tokens_per_req=tokens_per_req)
 
-    slack_mib = server_args.auto_mem_chunked_slack_mib
+    slack_mib = server_args.auto_mem_deepep_slack_mib
     if slack_mib is None or gpu_total_mib is None:
         # mem_fraction_static was user-set (or capacity unknown): the auto
         # formula budgeted nothing for deepep, stay at the static bound.

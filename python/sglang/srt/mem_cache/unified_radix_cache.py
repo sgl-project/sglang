@@ -496,7 +496,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # Direct IO layout fixup (must happen before pool creation)
         if server_args.hicache_io_backend == "direct":
             if server_args.hicache_mem_layout == "page_first":
-                server_args.hicache_mem_layout = "page_first_direct"
+                server_args.override(
+                    "hicache.mem_layout_force", hicache_mem_layout="page_first_direct"
+                )
                 logger.warning(
                     "Page first layout is not supported with direct IO backend, "
                     "switching to page first direct layout"

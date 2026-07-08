@@ -149,7 +149,7 @@ class TestDeepEPCapacityPlanning(unittest.TestCase):
             speculative_num_draft_tokens=num_draft,
             max_running_requests=max_running,
             dp_size=dp_size,
-            auto_mem_chunked_slack_mib=(
+            auto_mem_deepep_slack_mib=(
                 slack_gib * 1024 if slack_gib is not None else None
             ),
         )
@@ -251,7 +251,7 @@ class TestDeepEPCapacityPlanning(unittest.TestCase):
                 speculative_num_draft_tokens=None,
                 max_running_requests=None,
                 dp_size=8,
-                auto_mem_chunked_slack_mib=10.5 * 1024,
+                auto_mem_deepep_slack_mib=10.5 * 1024,
             )
             model_config = SimpleNamespace(
                 hidden_size=7168, hf_config=SimpleNamespace()

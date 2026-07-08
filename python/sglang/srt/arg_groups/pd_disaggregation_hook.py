@@ -44,7 +44,9 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                     "with speculative decoding "
                     f"(--speculative-algorithm {server_args.speculative_algorithm})"
                 )
-            if server_args.enable_dp_attention:
+            from sglang.srt.arg_groups.overrides import resolved_view
+
+            if resolved_view(server_args).enable_dp_attention:
                 logger.warning(
                     "EXPERIMENTAL: Decode radix cache with DP attention. "
                     "Requires prefix-aware DP rank routing for optimal cache hits."

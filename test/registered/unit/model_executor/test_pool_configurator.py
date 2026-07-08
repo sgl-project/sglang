@@ -102,10 +102,6 @@ def _make_model_runner(
 
     sa = SimpleNamespace()
     sa.swa_full_tokens_ratio = swa_full_tokens_ratio
-    # The configurator reads the resolved ratio from the flags tier.
-    from sglang.srt.runtime_context import get_flags
-
-    get_flags().swa_full_tokens_ratio = swa_full_tokens_ratio
     sa.page_size = page_size
     sa.disable_radix_cache = disable_radix_cache
     sa.chunked_prefill_size = chunked_prefill_size

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
@@ -47,6 +47,7 @@ from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.deepep_capacity import plan_deepep_capacity
 from sglang.srt.platforms import current_platform
 from sglang.srt.utils.common import (
@@ -116,9 +117,17 @@ class ModelRunnerKVCacheMixin:
             cpu_group=get_world_group().cpu_group,
         )
 
-        rest_memory = available_gpu_memory - pre_model_load_memory * (
-            1 - self.mem_fraction_static
-        )
+        slack_gb = pre_model_load_memory * (1 - self.mem_fraction_static)
+        if self.mambaish_config is not None and self.post_capture_kv_active:
+            # Mamba state is a fixed pre-capture allocation, so it can't ride the ~0 post-capture slack.
+            slack_gb = max(
+                slack_gb,
+                self.server_args.mamba_pre_capture_reserve_mb(
+                    get_device_memory_capacity(self.device)
+                )
+                / 1024,
+            )
+        rest_memory = available_gpu_memory - slack_gb
         if self.mambaish_config is not None:
             rest_memory = self.handle_max_mamba_cache(rest_memory)
 
@@ -211,8 +220,10 @@ class ModelRunnerKVCacheMixin:
 
         if server_args.max_mamba_cache_size is not None:
             # Use explicitly set max_mamba_cache_size
-            server_args.max_mamba_cache_size = server_args.max_mamba_cache_size // (
-                server_args.dp_size if server_args.enable_dp_attention else 1
+            server_args.override(
+                "mamba_pool.per_dp_shard",
+                max_mamba_cache_size=server_args.max_mamba_cache_size
+                // (server_args.dp_size if server_args.enable_dp_attention else 1),
             )
             # Reserve intermediate memory based on capped max_num_reqs
             if has_spec_dec:
@@ -233,8 +244,10 @@ class ModelRunnerKVCacheMixin:
             and server_args.max_running_requests is not None
         ):
             # Use explicitly set max_running_requests when radix cache is disabled
-            server_args.max_mamba_cache_size = server_args.max_running_requests // (
-                server_args.dp_size if server_args.enable_dp_attention else 1
+            server_args.override(
+                "mamba_pool.from_max_running_requests",
+                max_mamba_cache_size=server_args.max_running_requests
+                // (server_args.dp_size if server_args.enable_dp_attention else 1),
             )
             # Reserve intermediate memory based on capped max_num_reqs
             if has_spec_dec:
@@ -265,8 +278,11 @@ class ModelRunnerKVCacheMixin:
                 ratio = self._calculate_mamba_ratio()
                 D = server_args.speculative_num_draft_tokens
                 # Joint solve: main_state + intermediate = mamba_budget
-                server_args.max_mamba_cache_size = int(
-                    mamba_budget_bytes // (per_req * (1 + D / ratio))
+                server_args.override(
+                    "mamba_pool.memory_budget_spec",
+                    max_mamba_cache_size=int(
+                        mamba_budget_bytes // (per_req * (1 + D / ratio))
+                    ),
                 )
                 # Intermediate memory is included in mamba_budget, subtract it
                 # so the return value only has main_state subtracted from total
@@ -278,7 +294,10 @@ class ModelRunnerKVCacheMixin:
                 intermediate_size = per_req * capped_reqs * D
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
             else:
-                server_args.max_mamba_cache_size = int(mamba_budget_bytes // per_req)
+                server_args.override(
+                    "mamba_pool.memory_budget",
+                    max_mamba_cache_size=int(mamba_budget_bytes // per_req),
+                )
 
         # Validate: max_mamba_cache_size must be positive after memory allocation.
         # A non-positive value means GPU memory is insufficient for the requested
@@ -409,6 +428,92 @@ class ModelRunnerKVCacheMixin:
                 "--chunked-prefill-size=-1, --disable-radix-cache, no context-parallel "
                 "attention, no HiSparse, and --kv-cache-dtype != fp4_e2m1."
             )
+
+    @property
+    def post_capture_kv_active(self: ModelRunner) -> bool:
+        return (
+            self.server_args.post_capture_kv_sizing_planned()
+            and current_platform.is_cuda()
+            and not self.is_draft_worker
+        )
+
+    def post_capture_resize_kv_pool(self: ModelRunner) -> None:
+        """Resize the KV pool after capture."""
+        pool = self.token_to_kv_pool
+        torch.cuda.synchronize()
+        free_gb = get_available_gpu_memory(
+            self.device,
+            self.gpu_id,
+            distributed=get_world_group().world_size > 1,
+            cpu_group=get_world_group().cpu_group,
+        )
+        headroom_gb = self.pre_model_load_memory * (1 - self.mem_fraction_static)
+        decode_cuda_graph_config = self.server_args.cuda_graph_config.decode
+        decode_max_bs = int(decode_cuda_graph_config.max_bs or 0)
+        running_requests = int(self.max_running_requests or decode_max_bs or 1)
+        eager_decode_gap = (
+            self.server_args.disaggregation_mode != "prefill"
+            and decode_cuda_graph_config.backend != Backend.DISABLED
+            and decode_max_bs < running_requests
+        )
+        if eager_decode_gap:
+            logger.warning(
+                "Post-capture KV sizing: decode CUDA graph max_bs=%d < "
+                "max_running_requests=%d; reserving activation headroom",
+                decode_max_bs,
+                running_requests,
+            )
+        if eager_decode_gap or self.mambaish_config is not None:
+            headroom_gb = max(
+                headroom_gb,
+                self.server_args.mamba_pre_capture_reserve_mb(
+                    get_device_memory_capacity(self.device)
+                )
+                / 1024,
+            )
+        budget_bytes = (
+            int(max(0.0, free_gb - headroom_gb) * (1 << 30))
+            + pool.post_capture_backed_bytes
+        )
+        config = self._config_from_budget(
+            budget_bytes, cap_tokens=self.max_total_num_tokens
+        )
+        pool.finalize_backing(config)
+        self.token_to_kv_pool_allocator.resize(config)
+
+        # Set the new pool size
+        self.max_total_num_tokens = config.max_total_num_tokens
+        if self.is_hybrid_swa:
+            self.full_max_total_num_tokens = config.full_max_total_num_tokens
+            self.swa_max_total_num_tokens = config.swa_max_total_num_tokens
+        if self.memory_pool_config is not None:
+            self.memory_pool_config.max_total_num_tokens = config.max_total_num_tokens
+            self.memory_pool_config.full_max_total_num_tokens = (
+                config.full_max_total_num_tokens
+            )
+            self.memory_pool_config.swa_max_total_num_tokens = (
+                config.swa_max_total_num_tokens
+            )
+        if self.max_running_requests is not None:
+            # Re-calculate max_running_requests for the now smaller pool
+            capped_reqs = min(
+                self.max_running_requests,
+                self._resolve_max_num_reqs(config.max_total_num_tokens),
+            )
+            if capped_reqs < self.max_running_requests:
+                logger.warning(
+                    "Post-capture KV sizing: max_running_requests %d -> %d",
+                    self.max_running_requests,
+                    capped_reqs,
+                )
+                self.max_running_requests = capped_reqs
+                if self.memory_pool_config is not None:
+                    self.memory_pool_config.max_running_requests = capped_reqs
+        logger.info(
+            "Post-capture KV sizing: max_total_num_tokens=%d, free memory=%.2f GB",
+            config.max_total_num_tokens,
+            get_available_gpu_memory(self.device, self.gpu_id),
+        )
 
     def _init_unified_mamba_pools(self: ModelRunner, max_num_reqs: int):
         """Build the shared-KV-pool stack for a hybrid-Mamba model:
@@ -853,6 +958,7 @@ class ModelRunnerKVCacheMixin:
                     size_swa=self.swa_max_total_num_tokens,
                     page_size=self.page_size,
                     dtype=self.kv_cache_dtype,
+                    post_capture_active=self.post_capture_kv_active,
                     head_num=self.model_config.get_num_kv_heads(
                         get_attention_tp_size()
                     ),
@@ -1049,6 +1155,7 @@ class ModelRunnerKVCacheMixin:
                     use_mla=self.use_mla_backend,
                     start_layer=self.start_layer,
                     full_kv_pool_class=mha_pool_class,
+                    post_capture_active=self.post_capture_kv_active,
                     **extra_args,
                 )
             else:
@@ -1099,6 +1206,7 @@ class ModelRunnerKVCacheMixin:
                         enable_kv_cache_copy=(
                             self.server_args.speculative_algorithm is not None
                         ),
+                        post_capture_active=self.post_capture_kv_active,
                     )
 
         # Initialize token_to_kv_pool_allocator
@@ -1391,6 +1499,28 @@ class ModelRunnerKVCacheMixin:
 
         self._init_pools()
 
+    def _config_from_budget(
+        self: ModelRunner, budget_bytes: int, *, cap_tokens: Optional[int] = None
+    ) -> MemoryPoolConfig:
+        """Turn a KV byte budget into a pool config via the configurator, re-applying
+        the external token constraints (user cap, page alignment, PP sync) and the
+        optional ``cap_tokens`` clamp."""
+        # Local import avoids a pool_configurator import cycle.
+        from sglang.srt.model_executor.pool_configurator import (
+            create_memory_pool_configurator,
+        )
+
+        configurator = create_memory_pool_configurator(self)
+        config = configurator.calculate_pool_sizes(budget_bytes, self.page_size)
+        max_tokens = self._apply_token_constraints(config.max_total_num_tokens)
+        if cap_tokens is not None:
+            max_tokens = min(max_tokens, cap_tokens)
+        if max_tokens != config.max_total_num_tokens:
+            config = configurator.calculate_pool_sizes_from_max_tokens(
+                max_tokens, self.page_size
+            )
+        return config
+
     def _resolve_memory_pool_config(
         self: ModelRunner, pre_model_load_memory: int
     ) -> MemoryPoolConfig:
@@ -1406,21 +1536,11 @@ class ModelRunnerKVCacheMixin:
             moe_ep_size=self.moe_ep_size,
         )
         available_bytes = self._profile_available_bytes(pre_model_load_memory)
-        page_size = self.server_args.page_size
-
-        configurator = create_memory_pool_configurator(self)
-        config = configurator.calculate_pool_sizes(available_bytes, page_size)
-
-        # Apply external constraints (user cap, page alignment, PP sync)
-        constrained = self._apply_token_constraints(config.max_total_num_tokens)
-        if constrained != config.max_total_num_tokens:
-            config = configurator.calculate_pool_sizes_from_max_tokens(
-                constrained, page_size
-            )
-
+        config = self._config_from_budget(available_bytes)
         config.max_running_requests = self._resolve_max_num_reqs(
             config.max_total_num_tokens
         )
+        configurator = create_memory_pool_configurator(self)
         config = configurator.finalize_with_max_running_requests(config)
         config.mem_fraction_static = self.server_args.mem_fraction_static
         return config

@@ -125,6 +125,30 @@ LOAD_FORMAT_CHOICES = [
 
 # TODO: this list should likely contain only methods that support online quantization, or that support using custom quantization classes compatible with a given `quant_method` in config.json.
 # Some of the choices here do NOT support online quantization.
+# Attention backends whose kernels read the chunked prefix-cache layout.
+# Out-of-tree platforms may extend this list (via
+# add_chunked_prefix_cache_attention_backend) before ServerArgs construction;
+# the chunked-prefix gate is evaluated during resolution.
+CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS = [
+    "flashinfer",
+    "fa3",
+    "fa4",
+    "flashmla",
+    "cutedsl_mla",
+    "cutlass_mla",
+    "trtllm_mla",
+    "tokenspeed_mla",
+]
+
+
+def add_chunked_prefix_cache_attention_backend(backend_name):
+    if backend_name not in CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS:
+        CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS.append(backend_name)
+        logger.info(
+            f"Added {backend_name} to CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS."
+        )
+
+
 QUANTIZATION_CHOICES = [
     "awq",
     "fp8",  # MOE + linear online quantization.
@@ -632,9 +656,11 @@ class ServerArgs:
         Optional[float],
         "The fraction of the memory used for static allocation (model weights and KV cache memory pool). Use a smaller value if you see out-of-memory errors.",
     ] = None
-    # Derived in __post_init__, not a CLI arg (see _auto_mem_chunked_slack).
-    # None when mem_fraction_static is user-set. Credited by deepep_capacity.
-    auto_mem_chunked_slack_mib: Optional[float] = None
+    # Derived in __post_init__, not a CLI arg: MiB the auto mem_fraction formula
+    # already set aside that deepep_capacity may credit against its reservation
+    # (chunked over-reservation + the flat deepep a2a headroom). None when
+    # mem_fraction_static is user-set.
+    auto_mem_deepep_slack_mib: Optional[float] = None
     max_running_requests: A[
         Optional[int], "The maximum number of running requests."
     ] = None
@@ -980,7 +1006,22 @@ class ServerArgs:
     host: A[str, "The host of the HTTP server."] = "127.0.0.1"
     port: A[int, "The port of the HTTP server."] = 30000
     fastapi_root_path: A[str, "App is behind a path based routing proxy."] = ""
-    grpc_mode: A[bool, "If set, use gRPC server instead of HTTP server."] = False
+    smg_grpc_mode: A[
+        bool,
+        "Use the legacy SMG gRPC server (smg-grpc-servicer) instead of the HTTP "
+        "server. Replaces the deprecated --grpc-mode.",
+    ] = False
+    grpc_mode: A[
+        bool,
+        "(Deprecated, use --smg-grpc-mode) Legacy SMG gRPC server selector.",
+    ] = False
+    grpc_port: A[
+        Optional[int],
+        "Port for the native gRPC server, started alongside HTTP. Setting this "
+        "(or SGLANG_GRPC_PORT) enables the native gRPC server; it is off by "
+        "default. In legacy --smg-grpc-mode this is the SMG server port and "
+        "defaults to --port + 10000.",
+    ] = None
     skip_server_warmup: A[bool, "If set, skip warmup."] = False
     warmups: A[
         Optional[str],
@@ -1157,9 +1198,12 @@ class ServerArgs:
     ] = None
     show_time_cost: A[bool, "Show time cost of custom marks."] = False
     enable_metrics: A[bool, "Enable log prometheus metrics."] = False
-    grpc_http_sidecar_port: A[
+    smg_http_sidecar_port: A[
         Optional[int],
-        "Port for the HTTP sidecar server in gRPC mode (--grpc-mode). Serves Prometheus metrics and profiling endpoints. Defaults to --port + 1. Not used in HTTP mode.",
+        Arg(
+            help="Port for the HTTP sidecar server in legacy SMG gRPC mode (--smg-grpc-mode). Serves Prometheus metrics and profiling endpoints. Defaults to --port + 1. Not used in HTTP mode.",
+            aliases=["--grpc-http-sidecar-port"],
+        ),
     ] = None
     enable_mfu_metrics: A[bool, "Enable estimated MFU-related prometheus metrics."] = (
         False
@@ -2830,6 +2874,10 @@ class ServerArgs:
         # Handle any other necessary validations.
         self._handle_other_validations()
 
+        # Model-capability adjustments that legacy code applied at model-load
+        # time; last declarations of the resolution, mirroring that order.
+        self._handle_model_capability_adjustments()
+
         # End of resolution: apply the accumulated declarations onto the
         # fields once (gate order). From here on server_args carries the
         # resolved configuration — post-init readers, in any process, read
@@ -2837,6 +2885,54 @@ class ServerArgs:
         from sglang.srt.arg_groups.overrides import materialize_declarations
 
         materialize_declarations(self)
+
+    def _handle_model_capability_adjustments(self):
+        if parse_connector_type(self.model_path) == ConnectorType.INSTANCE:
+            return
+        from sglang.srt.arg_groups.overrides import (
+            _hrm_text_attention_force,
+            run_post_process_pass,
+        )
+
+        model_config = self.get_model_config()
+        hf_config = model_config.hf_config
+
+        # HRM-Text needs bidirectional prompt attention (prefill), which only
+        # the Triton backend honors at the kernel level. Radix/prefix reuse is
+        # also unsafe: the recurrent forward writes direction-dependent KV
+        # across many slots.
+        is_hrm_text = getattr(
+            hf_config, "model_type", None
+        ) == "hrm_text" or "HrmTextForCausalLM" in getattr(
+            hf_config, "architectures", []
+        )
+        # prefix_lm defaults to True upstream; defaulting False would skip the
+        # bidirectional-attention forcing and silently produce junk output.
+        if is_hrm_text and getattr(hf_config, "prefix_lm", True):
+            run_post_process_pass(self, _hrm_text_attention_force)
+            self.chunked_prefill_size = -1
+            self.disable_radix_cache = True
+            self.disable_cuda_graph = True
+            # cuda_graph_config was already parsed from the legacy boolean, so
+            # flipping the boolean alone would not stop graph capture.
+            self.cuda_graph_config.decode.backend = Backend.DISABLED
+            self.cuda_graph_config.prefill.backend = Backend.DISABLED
+            logger.warning(
+                "HRM-Text (prefix_lm) detected: forcing --attention-backend "
+                "triton, --chunked-prefill-size -1, --disable-radix-cache, and "
+                "--disable-cuda-graph for correctness of the bidirectional "
+                "prompt attention."
+            )
+
+        if (
+            model_config.is_multimodal
+            and not model_config.is_multimodal_chunked_prefill_supported
+        ):
+            self.chunked_prefill_size = -1
+            logger.info(
+                f"Automatically turn off --chunked-prefill-size as it is not supported for "
+                f"{hf_config.model_type}"
+            )
 
     def _handle_model_source_paths(self):
         """Resolve model/tokenizer paths backed by remote object stores."""
@@ -3014,20 +3110,65 @@ class ServerArgs:
                 )
                 setattr(self, attr, "dsv4")
 
-        # Native gRPC flags — env-only for now, not exposed as CLI args.
-        # Set as instance attributes (not dataclass fields) to avoid
-        # argparse namespace lookup in from_cli_args.
-        self.enable_grpc = envs.SGLANG_ENABLE_GRPC.get()
+        # --grpc-mode is a deprecated alias for --smg-grpc-mode.
+        if self.grpc_mode and not self.smg_grpc_mode:
+            logger.warning(
+                "--grpc-mode is deprecated and will be removed in a future "
+                "version. Use --smg-grpc-mode for the legacy SMG gRPC server, "
+                "or --grpc-port for the native gRPC server."
+            )
+            self.smg_grpc_mode = True
+
+        # Native gRPC tuning knob is env-only; --grpc-port (CLI) enables the
+        # native server, falling back to SGLANG_GRPC_PORT.
+        self.grpc_worker_threads = envs.SGLANG_GRPC_WORKER_THREADS.get()
 
         grpc_port_env = envs.SGLANG_GRPC_PORT.get()
-        self.grpc_port = (
-            grpc_port_env if grpc_port_env is not None else self.port + 10000
-        )
+        if self.grpc_port is None and grpc_port_env is not None:
+            self.grpc_port = grpc_port_env
 
-        if not (1 <= self.grpc_port <= 65535):
-            raise ValueError(
-                f"SGLANG_GRPC_PORT ({self.grpc_port}) must be between 1 and 65535"
-            )
+        # Legacy SMG defaults its port to --port + 10000. Derive/validate only
+        # when gRPC is in use, so HTTP-only high ports don't fail validation.
+        legacy_grpc = self.smg_grpc_mode or self.grpc_mode
+        if legacy_grpc and self.grpc_port is None:
+            self.grpc_port = self.port + 10000
+
+        if self.grpc_port is not None:
+            if not (1 <= self.grpc_port <= 65535):
+                raise ValueError(
+                    "--grpc-port / SGLANG_GRPC_PORT "
+                    f"({self.grpc_port}) must be between 1 and 65535"
+                )
+            if self.grpc_worker_threads < 1:
+                raise ValueError(
+                    "SGLANG_GRPC_WORKER_THREADS "
+                    f"({self.grpc_worker_threads}) must be >= 1"
+                )
+
+        # Native gRPC is incompatible with launch paths it doesn't wire into.
+        # Legacy takes precedence over grpc_port, keeping re-runs idempotent.
+        native_grpc = self.grpc_port is not None and not legacy_grpc
+        if native_grpc:
+            if self.use_ray:
+                raise ValueError(
+                    "--grpc-port is not supported with --use-ray: the Ray "
+                    "serve launch path does not start the native gRPC server."
+                )
+            if self.encoder_only:
+                raise ValueError(
+                    "--grpc-port is not supported with --encoder-only: "
+                    "encoder disaggregation uses its own server."
+                )
+            if self.tokenizer_worker_num > 1:
+                raise ValueError(
+                    "Native gRPC does not yet support --tokenizer-worker-num > 1. "
+                    "Unset --grpc-port or set --tokenizer-worker-num 1."
+                )
+            if self.api_key or self.admin_api_key:
+                raise ValueError(
+                    "--grpc-port is incompatible with --api-key/--admin-api-key: "
+                    "the native gRPC listener bypasses HTTP auth middleware."
+                )
 
     def _handle_prefill_delayer_env_compat(self):
         if envs.SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE.get():
@@ -3646,67 +3787,35 @@ class ServerArgs:
             )
 
         if self.mem_fraction_static is None:
-            # Constant meta data (e.g., from attention backend)
-            reserved_mem = 512
-            # For activation slack
-            if self.disaggregation_mode == "decode":
-                # Decode nodes do no prefill; size activation to the decode batch.
-                running_requests = (
-                    self.max_running_requests or decode_cuda_graph_config.max_bs or 1
-                )
-                draft_tokens = self.speculative_num_draft_tokens or 1
-                reserved_mem += max(running_requests * draft_tokens, 2048) * 1.5
-            elif self.chunked_prefill_size > 0:
-                reserved_mem += max(self.chunked_prefill_size, 2048) * 1.5
+            if self.post_capture_kv_sizing_planned():
+                # Post-capture sizing measures free memory after graph capture, so
+                # skip the graph/activation reserve; keep only the floor + parallel slack.
+                reserved_mem = 512
+                reserved_mem += self.tp_size * self.pp_size / 8 * 1024
             else:
-                reserved_mem += max(self.max_prefill_tokens, 2048) * 1.5
-            # For decode cuda graphs (skip on prefill-only nodes)
-            if (
-                self.disaggregation_mode != "prefill"
-                and decode_cuda_graph_config.backend != Backend.DISABLED
-            ):
-                reserved_mem += decode_cuda_graph_config.max_bs * 2
-            # Some adjustments for large parallel size
-            reserved_mem += self.tp_size * self.pp_size / 8 * 1024
-
-            if (
-                self._resolved().enable_dp_attention
-                and self.disaggregation_mode != "prefill"
-            ):
-                # DP attention needs more padding for some operations
-                reserved_mem += decode_cuda_graph_config.max_bs * self.dp_size * 3
-
-                # DP attention uses much more memory for large cuda graph max bs,
-                # likely due to some inefficiencies in torch allocator or our implementation.
-                # So we need to reserve more memory.
-                if decode_cuda_graph_config.max_bs > 300:
-                    reserved_mem += decode_cuda_graph_config.max_bs * self.dp_size * 1.5
-
-            # For prefill piecewise cuda graphs (skip on decode-only nodes)
-            if (
-                self.disaggregation_mode != "decode"
-                and prefill_cuda_graph_config.backend != Backend.DISABLED
-            ):
-                if not self.use_mla_backend():
-                    # Only calculate the memory overhead for Non-Torch Memory use since the Torch Memory can be reused with Cuda Graph Capture
-                    reserved_mem += len(prefill_cuda_graph_config.bs) * 8
+                # Tokens the activation working set scales with (per serving mode).
+                if self.disaggregation_mode == "decode":
+                    running_requests = (
+                        self.max_running_requests
+                        or decode_cuda_graph_config.max_bs
+                        or 1
+                    )
+                    draft_tokens = self.speculative_num_draft_tokens or 1
+                    activation_tokens = max(running_requests * draft_tokens, 2048)
+                elif self.chunked_prefill_size > 0:
+                    activation_tokens = max(self.chunked_prefill_size, 2048)
                 else:
-                    # For MLA backend the memory overhead is much higher than expected with fa3
-                    reserved_mem += 1.5 * 1024
-
-            if gpu_mem is not None and gpu_mem > 60 * 1024:
-                reserved_mem = max(reserved_mem, 10 * 1024)
-
-            # DeepEP all-to-all buffers captured in the decode graph are real
-            # extra allocations, so reserve them on top of the floor.
-            from sglang.srt.arg_groups.overrides import resolved_view
-
-            if (
-                self.disaggregation_mode != "prefill"
-                and decode_cuda_graph_config.backend != Backend.DISABLED
-                and resolved_view(self).moe_a2a_backend == "deepep"
-            ):
-                reserved_mem += 2 * 1024
+                    activation_tokens = max(self.max_prefill_tokens, 2048)
+                # Constant meta data (e.g., from attention backend) + activation slack.
+                reserved_mem = 512
+                reserved_mem += activation_tokens * 1.5
+                # Some adjustments for large parallel size
+                reserved_mem += self.tp_size * self.pp_size / 8 * 1024
+                reserved_mem += self.reserve_for_graph_mb()
+                if gpu_mem is not None and gpu_mem > 60 * 1024:
+                    reserved_mem = max(reserved_mem, 10 * 1024)
+                # Reserve headroom for DeepEP all-to-all buffers on top of the floor.
+                reserved_mem += self.reserve_for_deepep_a2a_mb()
 
             self.mem_fraction_static = (
                 round((gpu_mem - reserved_mem) / gpu_mem, 3)
@@ -3714,7 +3823,14 @@ class ServerArgs:
                 else 0.88
             )
             if gpu_mem is not None:
-                self.auto_mem_chunked_slack_mib = self._auto_mem_chunked_slack()
+                # Post-capture sizing reserves neither activations nor the a2a
+                # headroom, so there is nothing for deepep_capacity to credit.
+                self.auto_mem_deepep_slack_mib = (
+                    0.0
+                    if self.post_capture_kv_sizing_planned()
+                    else self._auto_mem_chunked_slack()
+                    + self.reserve_for_deepep_a2a_mb()
+                )
 
             # Multimodal models need more memory for the image processing,
             # so we adjust the mem_fraction_static accordingly.
@@ -3745,6 +3861,106 @@ class ServerArgs:
             return 0.0
         per_rank = self.chunked_prefill_size // self.dp_size
         return (max(self.chunked_prefill_size, 2048) - max(per_rank, 2048)) * 1.5
+
+    def post_capture_kv_sizing_planned(self) -> bool:
+        """Whether the mem_fraction heuristic may skip the graph reserve; must be
+        False for any config the runtime won't post-capture-size, else it gets an
+        under-reserved fraction (still-unsupported: MiniMax sparse)."""
+        # use_mla_backend is a method at args time but ModelRunner overwrites it
+        # with a bool on global_server_args (see the FIXME there) -- handle both.
+        use_mla = self.use_mla_backend
+        return (
+            envs.SGLANG_ENABLE_POST_CAPTURE_KV_SIZING.get()
+            and self.device == "cuda"
+            and self.dcp_size == 1
+            and not (use_mla() if callable(use_mla) else use_mla)
+            and not self.prefill_only_disable_kv_cache
+            and not self.enable_memory_saver
+            and envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get() is None
+            # Accurate sizing assumes graph-covered execution (graphs retain the
+            # activation workspace, so it is measured post-capture). An eager
+            # phase would pay activations outside the measurement: DP attention
+            # runs prefill eager internally, and an explicitly disabled phase
+            # backend runs eager -- keep those on the heuristic reserve.
+            and not self.enable_dp_attention
+            and (
+                self.disaggregation_mode == "decode"
+                or self.cuda_graph_config.prefill.backend != Backend.DISABLED
+            )
+            and (
+                self.disaggregation_mode == "prefill"
+                or self.cuda_graph_config.decode.backend != Backend.DISABLED
+            )
+        )
+
+    def mamba_pre_capture_reserve_mb(self, gpu_mem: Optional[float]) -> float:
+        # Realistic runtime reserve for the fixed (non-resizable) mamba state cache,
+        # which post-capture can't size from measured free memory.
+        if self.disaggregation_mode == "decode":
+            running_requests = (
+                self.max_running_requests or self.cuda_graph_config.decode.max_bs or 1
+            )
+            activation_tokens = max(
+                running_requests * (self.speculative_num_draft_tokens or 1), 2048
+            )
+        elif self.chunked_prefill_size > 0:
+            activation_tokens = max(self.chunked_prefill_size, 2048)
+        else:
+            activation_tokens = max(self.max_prefill_tokens, 2048)
+        reserved_mem = (
+            512 + activation_tokens * 1.5 + self.tp_size * self.pp_size / 8 * 1024
+        )
+        if gpu_mem is not None and gpu_mem > 60 * 1024:
+            reserved_mem = max(reserved_mem, 10 * 1024)
+        return reserved_mem
+
+    def reserve_for_graph_mb(self) -> float:
+        decode_cuda_graph_config = self.cuda_graph_config.decode
+        prefill_cuda_graph_config = self.cuda_graph_config.prefill
+
+        reserved_mem = 0.0
+        if (
+            self.disaggregation_mode != "prefill"
+            and decode_cuda_graph_config.backend != Backend.DISABLED
+        ):
+            reserved_mem += decode_cuda_graph_config.max_bs * 2
+
+        if (
+            self._resolved().enable_dp_attention
+            and self.disaggregation_mode != "prefill"
+        ):
+            # DP attention needs more padding for some operations, and much more for large
+            # cuda graph max bs (torch allocator / implementation inefficiencies).
+            reserved_mem += decode_cuda_graph_config.max_bs * self.dp_size * 3
+            if decode_cuda_graph_config.max_bs > 300:
+                reserved_mem += decode_cuda_graph_config.max_bs * self.dp_size * 1.5
+
+        if (
+            self.disaggregation_mode != "decode"
+            and prefill_cuda_graph_config.backend != Backend.DISABLED
+        ):
+            if not self.use_mla_backend():
+                # Only non-torch memory is counted; torch memory is reused by cuda graph capture.
+                reserved_mem += len(prefill_cuda_graph_config.bs) * 8
+            else:
+                # MLA backend overhead is much higher than expected with fa3.
+                reserved_mem += 1.5 * 1024
+
+        return reserved_mem
+
+    def reserve_for_deepep_a2a_mb(self) -> float:
+        # DeepEP all-to-all buffers captured in the decode graph are real extra
+        # allocations, reserved on top of the floor.
+        from sglang.srt.arg_groups.overrides import resolved_view
+
+        decode_cuda_graph_config = self.cuda_graph_config.decode
+        if (
+            self.disaggregation_mode != "prefill"
+            and decode_cuda_graph_config.backend != Backend.DISABLED
+            and resolved_view(self).moe_a2a_backend == "deepep"
+        ):
+            return 2 * 1024
+        return 0.0
 
     def _generate_decode_cuda_graph_batch_sizes(self, max_bs: int):
         """
@@ -3828,7 +4044,7 @@ class ServerArgs:
 
         run_post_process_pass(self, _dsa_kv_cache_dtype_default)
 
-    def _set_default_dsa_backends(self, kv_cache_dtype: str, major: int) -> None:
+    def _set_default_dsa_backends(self, major: int) -> None:
         # Moved to the resolution pipeline (arg_groups/overrides.py:
         # _dsa_split_backend_resolution), invoked here at its legacy slot.
         from sglang.srt.arg_groups.overrides import (
@@ -3959,7 +4175,7 @@ class ServerArgs:
                     self._set_default_dsa_kv_cache_dtype(
                         major, resolved_view(self).quantization
                     )
-                    self._set_default_dsa_backends(self.kv_cache_dtype, major)
+                    self._set_default_dsa_backends(major)
 
                 if self.enable_prefill_cp:
                     assert (
@@ -4983,10 +5199,11 @@ class ServerArgs:
             ], "The expert parallel size must be 1 or the same as the tensor parallel size"
 
         if view.moe_runner_backend == "flashinfer_cutedsl":
+            # modelopt_mixed with non-NVFP4 MoE layers is rejected at load time.
             assert (
-                view.quantization in ["modelopt_fp4"]
+                view.quantization in ["modelopt_fp4", "modelopt_mixed"]
                 or self.get_model_config().nvfp4_moe_meta is not None
-            ), f"Invalid quantization '{view.quantization}'. \nFlashInfer CuteDSL MOE currently supports only: 'modelopt_fp4' or hybrid NVFP4 models."
+            ), f"Invalid quantization '{view.quantization}'. \nFlashInfer CuteDSL MOE currently supports only: 'modelopt_fp4', 'modelopt_mixed' (with NVFP4 MoE layers), or hybrid NVFP4 models."
             assert view.ep_size in [
                 1,
                 self.tp_size,
@@ -6497,6 +6714,58 @@ class ServerArgs:
 
         return resolved_view(self)
 
+    def override(self, source: str, **fields) -> None:
+        """The single post-resolution mutation point.
+
+        After ``__post_init__`` the configuration is resolved; the audited
+        runtime adjustments (load-resolved values, control-plane
+        reconfiguration, deployment wiring) go through here instead of
+        assigning fields. Whitelisted resolvable fields also join the
+        declaration stash, so a republish resolves the same values;
+        everything is recorded with its ``source`` for provenance.
+        """
+        from sglang.srt.arg_groups.arg_utils import resolvable_fields
+
+        whitelist = resolvable_fields(type(self))
+        declared = {k: v for k, v in fields.items() if k in whitelist}
+        rest = {k: v for k, v in fields.items() if k not in whitelist}
+        if declared:
+            stash = getattr(self, "_resolved_overrides", None)
+            if stash is None:
+                stash = []
+                object.__setattr__(self, "_resolved_overrides", stash)
+            stash.append((source, dict(declared)))
+        if rest:
+            log = getattr(self, "_runtime_mutations", None)
+            if log is None:
+                log = []
+                object.__setattr__(self, "_runtime_mutations", log)
+            log.append((source, dict(rest)))
+        object.__setattr__(self, "_in_override", True)
+        try:
+            for field, value in fields.items():
+                setattr(self, field, value)
+        finally:
+            object.__setattr__(self, "_in_override", False)
+
+    def __setattr__(self, name, value):
+        # After materialization the fields are the resolved configuration:
+        # under the strict test harness, a bare assignment outside
+        # ServerArgs.override() (and the resolution pipeline itself) raises.
+        if (
+            not name.startswith("_")
+            and getattr(self, "_declarations_materialized", False)
+            and not getattr(self, "_in_override", False)
+        ):
+            from sglang.srt.environ import envs
+
+            if envs.SGLANG_STRICT_CONFIG_MUTATION.get():
+                raise AttributeError(
+                    f"server_args.{name} assigned after resolution; use "
+                    "server_args.override(source, ...) instead."
+                )
+        object.__setattr__(self, name, value)
+
     def _resolved_attention_backends(self):
         """Mid-resolution (prefill, decode) backends: reads through the pass
         view so declared fields resolve from the declaration stash."""
@@ -6763,13 +7032,11 @@ class ServerArgs:
                 "Communications quantization is only supported for NPU device"
             )
 
-        if (
-            self.enable_grpc
-            and self.grpc_port is not None
-            and self.grpc_port == self.port
-        ):
+        # grpc_port is None for HTTP-only launches, so the == comparison is
+        # already False there; no explicit None check needed.
+        if not (self.smg_grpc_mode or self.grpc_mode) and self.grpc_port == self.port:
             raise ValueError(
-                f"SGLANG_GRPC_PORT ({self.grpc_port}) must differ from --port ({self.port})"
+                f"--grpc-port ({self.grpc_port}) must differ from --port ({self.port})"
             )
 
         # TODO: Also validate grpc_port != metrics_http_port and grpc_port != nccl_port
@@ -6793,7 +7060,7 @@ class ServerArgs:
         # Enable LoRA if any LoRA paths are provided for backward compatibility.
         if self.lora_paths:
             if self.enable_lora is None:
-                self.enable_lora = True
+                self.override("check_lora_server_args", enable_lora=True)
                 logger.warning(
                     "--enable-lora is set to True because --lora-paths is provided."
                 )
@@ -6804,7 +7071,9 @@ class ServerArgs:
 
         if self.enable_lora:
             if self.enable_lora_overlap_loading is None:
-                self.enable_lora_overlap_loading = False
+                self.override(
+                    "check_lora_server_args", enable_lora_overlap_loading=False
+                )
 
             if self.enable_lora_overlap_loading:
                 # TODO (glenliu21): use some sort of buffer with eviction instead of enforcing a limit
@@ -6825,9 +7094,8 @@ class ServerArgs:
 
             # Parse lora_paths
             if isinstance(self.lora_paths, list):
-                lora_paths = self.lora_paths
-                self.lora_paths = []
-                for lora_path in lora_paths:
+                parsed_lora_paths = []
+                for lora_path in self.lora_paths:
                     if isinstance(lora_path, str):
                         if "=" in lora_path:
                             name, path = lora_path.split("=", 1)
@@ -6861,19 +7129,23 @@ class ServerArgs:
                             f"Invalid type for item in --lora-paths list: {type(lora_path)}. "
                             "Expected a string or a dictionary."
                         )
-                    self.lora_paths.append(lora_ref)
+                    parsed_lora_paths.append(lora_ref)
+                self.override("check_lora_server_args", lora_paths=parsed_lora_paths)
             elif isinstance(self.lora_paths, dict):
-                self.lora_paths = [
-                    LoRARef(
-                        lora_id=LoRARef.deterministic_id(k, v),
-                        lora_name=k,
-                        lora_path=v,
-                        pinned=False,
-                    )
-                    for k, v in self.lora_paths.items()
-                ]
+                self.override(
+                    "check_lora_server_args",
+                    lora_paths=[
+                        LoRARef(
+                            lora_id=LoRARef.deterministic_id(k, v),
+                            lora_name=k,
+                            lora_path=v,
+                            pinned=False,
+                        )
+                        for k, v in self.lora_paths.items()
+                    ],
+                )
             elif self.lora_paths is None:
-                self.lora_paths = []
+                self.override("check_lora_server_args", lora_paths=[])
             else:
                 raise ValueError(
                     f"Invalid type for --lora-paths: {type(self.lora_paths)}. "
@@ -6883,7 +7155,10 @@ class ServerArgs:
             # Normalize target modules to a set; keep {"all"} as a sentinel
             # that gets resolved model-awarely in lora_manager.init_lora_shapes().
             if self.lora_target_modules:
-                self.lora_target_modules = set(self.lora_target_modules)
+                self.override(
+                    "check_lora_server_args",
+                    lora_target_modules=set(self.lora_target_modules),
+                )
                 if "all" in self.lora_target_modules:
                     assert (
                         len(self.lora_target_modules) == 1
