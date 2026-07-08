@@ -37,7 +37,10 @@ from sglang.srt.layers.dcp.comm import (
     get_attention_dcp_rank,
     get_attention_dcp_world_size,
 )
-from sglang.srt.layers.dcp.kernels import create_triton_kv_indices_for_dcp_triton
+from sglang.srt.layers.dcp.kernels import (
+    LOG2_E,
+    create_triton_kv_indices_for_dcp_triton,
+)
 from sglang.srt.layers.dcp.layout import (
     filter_dcp_local_kv_indices,
     get_dcp_lens,
@@ -54,6 +57,7 @@ from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
 # planner functions from sglang.srt.layers.dcp.planner directly.
 
 __all__ = [
+    "LOG2_E",
     "DecodeContextParallelMetadata",
     "all_gather_kv_cache_for_dcp",
     "all_gather_kv_cache_for_mha_chunk_extend",

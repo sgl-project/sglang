@@ -2824,9 +2824,8 @@ class ServerArgs:
         handle_pd_disaggregation(self)
 
     def _handle_dcp_validation(self):
-        # Decode context parallel (DCP) is currently implemented and validated
-        # only on AMD HIP/ROCm. Reject invalid or unverified configurations
-        # early instead of letting them fail deeper in model initialization.
+        # DCP is supported on AMD HIP/ROCm and, on CUDA, for the flashinfer /
+        # flashmla / triton MLA backends. Reject unsupported configs early.
         if self.dcp_size < 1:
             raise ValueError(
                 "Decode context parallel size (--dcp-size / "
@@ -2845,6 +2844,18 @@ class ServerArgs:
                     "does not support any speculative algorithm, but got "
                     f"dcp_size={self.dcp_size} on a CUDA platform with "
                     "speculative decoding enabled."
+                )
+            triton_backend_selected = "triton" in (
+                self.attention_backend,
+                self.decode_attention_backend,
+            )
+            if triton_backend_selected and self.page_size not in (None, 1):
+                raise ValueError(
+                    "Decode context parallel (--dcp-size > 1) with the triton "
+                    "attention backend supports only --page-size 1 (the DCP "
+                    "token-interleaved KV layout is unvalidated for larger "
+                    f"pages), but got page_size={self.page_size} with "
+                    f"dcp_size={self.dcp_size}."
                 )
         else:
             raise ValueError(

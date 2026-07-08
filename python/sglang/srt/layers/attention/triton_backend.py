@@ -18,6 +18,7 @@ from sglang.srt.layers.attention.triton_ops.kv_indices import (
 )
 from sglang.srt.layers.attention.triton_ops.metadata import get_num_kv_splits_triton
 from sglang.srt.layers.dcp import (
+    LOG2_E,
     cp_lse_ag_out_rs_mha,
     create_triton_kv_indices_for_dcp_triton,
     get_dcp_lens,
@@ -1272,6 +1273,16 @@ class TritonAttnBackend(AttentionBackend):
         ):
             causal = False
 
+        if (
+            forward_batch.attn_attend_prefix_cache is not None
+            and not forward_batch.forward_mode.is_target_verify()
+            and not forward_batch.forward_mode.is_draft_extend_v2()
+        ):
+            # Model gathers + merges prefix KV; backend runs dense attention.
+            return self._forward_extend_mha_chunked(
+                q, k, v, layer, forward_batch, causal, logits_soft_cap
+            )
+
         if self.dcp_size > 1:
             return self._forward_extend_dcp(
                 q, k, v, layer, forward_batch, causal, logits_soft_cap, sinks
@@ -1366,6 +1377,99 @@ class TritonAttnBackend(AttentionBackend):
             page_size=self.page_size,
         )
         return o
+
+    def _forward_extend_mha_chunked(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        causal: bool,
+        logits_soft_cap: float,
+    ):
+        """Dense attention for the model's chunked-prefix MHA protocol.
+
+        attend_prefix_cache=False: causal self-attention over extend tokens;
+        =True: cross-attention of q against the given prefix chunk.
+        """
+        num_tokens = q.shape[0]
+        q3 = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+        k = k.contiguous()
+        v = v.contiguous()
+        out = torch.zeros(
+            (num_tokens, layer.tp_q_head_num, layer.v_head_dim),
+            dtype=torch.float32,
+            device=q.device,
+        )
+        lse = torch.full(
+            (num_tokens, layer.tp_q_head_num),
+            -float("inf"),
+            dtype=torch.float32,
+            device=q.device,
+        )
+        if forward_batch.attn_attend_prefix_cache:
+            assert forward_batch.mha_return_lse
+            chunk_idx = forward_batch.prefix_chunk_idx
+            assert chunk_idx is not None and chunk_idx >= 0
+            kv_indptr = forward_batch.prefix_chunk_cu_seq_lens[chunk_idx]
+            kv_indices = torch.arange(k.shape[0], dtype=torch.int64, device=q.device)
+            self.extend_attention_fwd(
+                q3,
+                k[:0],
+                v[:0],
+                out,
+                k,
+                v,
+                self.forward_metadata.qo_indptr,
+                kv_indptr,
+                kv_indices,
+                None,
+                False,
+                None,
+                self.forward_metadata.max_extend_len,
+                1.0,
+                1.0,
+                sm_scale=layer.scaling,
+                logit_cap=logits_soft_cap,
+                xai_temperature_len=layer.xai_temperature_len,
+                lse_extend=lse,
+                skip_extend=True,
+            )
+            # Empty chunk ranges come back as 0/0 from the kernel; normalize
+            # to the (0, -inf) merge convention.
+            invalid = ~torch.isfinite(lse)
+            lse.masked_fill_(invalid, -float("inf"))
+            out.masked_fill_(invalid.unsqueeze(-1), 0.0)
+        else:
+            empty_kv_indptr = torch.zeros_like(self.forward_metadata.qo_indptr)
+            kv_indices = torch.empty(0, dtype=torch.int64, device=q.device)
+            self.extend_attention_fwd(
+                q3,
+                k,
+                v,
+                out,
+                k,
+                v,
+                self.forward_metadata.qo_indptr,
+                empty_kv_indptr,
+                kv_indices,
+                None,
+                causal,
+                None,
+                self.forward_metadata.max_extend_len,
+                1.0,
+                1.0,
+                sm_scale=layer.scaling,
+                logit_cap=logits_soft_cap,
+                xai_temperature_len=layer.xai_temperature_len,
+                lse_extend=lse,
+                skip_prefix=True,
+            )
+        out = out.to(q.dtype)
+        if forward_batch.mha_return_lse:
+            return out, lse
+        return out
 
     def _forward_extend_dcp(
         self,
@@ -1710,6 +1814,42 @@ class TritonAttnBackend(AttentionBackend):
             and layer.v_head_dim == self.swa_v_head_dim
         ):
             attn_logits = self.forward_metadata.swa_attn_logits
+
+        if self.dcp_size > 1 and self.use_mla:
+            # Per-rank shard decode returning (out, lse) for the model's merge.
+            # attn_lse is natural-log, correct_attn_out base-2 — hence log2(e).
+            self.forward_metadata.attn_lse.fill_(-float("inf"))
+            self.decode_attention_fwd(
+                q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                self.token_to_kv_pool.get_key_buffer(layer.layer_id),
+                self.token_to_kv_pool.get_value_buffer(layer.layer_id),
+                o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                kv_indptr,
+                kv_indices,
+                attn_logits,
+                self.forward_metadata.attn_lse,
+                self.forward_metadata.num_kv_splits,
+                self.max_kv_splits,
+                layer.scaling,
+                k_descale,
+                v_descale,
+                logit_cap=logits_soft_cap,
+                sinks=sinks,
+                xai_temperature_len=layer.xai_temperature_len,
+                has_mla=True,
+                use_pdl=self.use_pdl,
+                page_size=self.page_size,
+            )
+            local_lse = torch.logsumexp(
+                self.forward_metadata.attn_lse[: q.shape[0], : layer.tp_q_head_num, :],
+                dim=-1,
+            ).mul_(LOG2_E)
+            # Zero-token ranks get 0/0 = NaN rows; zero them so the merge
+            # cannot propagate NaN.
+            o.view(-1, layer.tp_q_head_num, layer.v_head_dim).masked_fill_(
+                torch.isneginf(local_lse).unsqueeze(-1), 0.0
+            )
+            return o, local_lse
 
         if self.dcp_size > 1:
             group = get_dcp_group()

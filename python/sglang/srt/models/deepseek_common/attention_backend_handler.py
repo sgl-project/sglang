@@ -1,4 +1,5 @@
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
+from sglang.srt.layers.dcp import dcp_enabled
 from sglang.srt.layers.utils.cp_utils import mla_use_prefill_cp
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
@@ -185,6 +186,15 @@ def handle_attention_triton(attn, forward_batch):
     # when deterministic inference is enabled, use MLA
     if get_global_server_args().enable_deterministic_inference:
         return _dispatch_mla_subtype(attn, forward_batch)
+
+    if (
+        dcp_enabled()
+        and forward_batch.forward_mode.is_extend_without_speculative()
+        and sum(forward_batch.extend_prefix_lens_cpu) > 0
+    ):
+        # Prefix KV is dcp-sharded; only the MHA chunked path gathers it
+        # (triton's absorbed extend has no gather).
+        return AttnForwardMethod.MHA_CHUNKED_KV
 
     if (
         forward_batch.forward_mode.is_extend_without_speculative()
