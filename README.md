@@ -5,6 +5,7 @@
     <p style="margin:10px 0 0;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
       <a href="#"><img src="https://img.shields.io/badge/arXiv-coming%20soon-b31b1b?style=for-the-badge&logo=arxiv&logoColor=white" alt="arXiv coming soon"></a>
       <a href="#"><img src="https://img.shields.io/badge/PDF-coming%20soon-374151?style=for-the-badge&logo=readthedocs&logoColor=white" alt="PDF coming soon"></a>
+      <a href="https://huggingface.co/trymirai/weaver"><img src="https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Weaver-FFD21E?style=for-the-badge" alt="Hugging Face"></a>
     </p>
   </div>
   <img src="https://assets.trymirai.com/images/logo/ml_small_logo.svg" alt="Mirai Labs" width="64" height="64" style="width:80px;height:80px;object-fit:contain;flex:0 0 auto">
@@ -48,7 +49,7 @@ DFlash-TfM with Weaver is the fastest configuration on every task in this sweep.
   <img src="assets/tfm-results-table.png" alt="Full DFlash-TfM table with speedup and accepted-token statistics across sampling and reasoning settings." width="900">
 </p>
 
-#### 1. Install the SGLang fork at the release tag
+#### 1. Install the SGLang fork
 
 ```bash
 git clone https://github.com/trymirai/sglang
@@ -64,6 +65,8 @@ docker run -it --rm --shm-size 32g --gpus all \
   -v ~/.cache/huggingface:/root/.cache/huggingface \
   -v "$PWD":/sgl-workspace/sglang \
   -v "$PWD/artifacts":/artifacts \
+  -w /sgl-workspace/sglang \
+  -e PYTHONPATH=/sgl-workspace/sglang/python \
   --ipc=host --network=host --privileged \
   lmsysorg/sglang@sha256:1d8d7976fe11a8341408b92527200502e93dd69df0a63a81c57b92e70ec6fada \
   /bin/zsh
@@ -101,9 +104,13 @@ hf download trymirai/weaver \
 
 #### 3. Launch the three serving configurations
 
-The launches below match the paper setup: one NVIDIA B200 SXM, TP=1, concurrency=1, CUDA graph max batch size 32, page size 64, memory fraction 0.75, radix cache disabled, TRT-LLM MHA decode attention, FlashInfer prefill attention, and FA4 draft attention. The DFlash chain baseline is the exception: it keeps the decode/prefill split unset and runs both on TRT-LLM MHA (`--attention-backend trtllm_mha`), because routing its target-verify pass through the FlashInfer prefill backend changes the DFlash acceptance profile. Run with persistence mode enabled, no MIG/MPS partitioning, default application clocks, and no other GPU workloads.
+**Setup**
+- Runtime: 1x NVIDIA B200 SXM, tensor parallel size 1, `concurrency=1`, `bfloat16`, CUDA graph max batch size 32, page size 64, radix cache disabled.
+- Backends: TRT-LLM MHA decode attention, FlashInfer prefill attention, and FA4 draft attention unless specified.
+- Acceptance length: `τ = completion_tokens / verify_steps per request` (bonus token included); reported values are the unweighted mean over requests, then over datasets for Macro Avg.
+- Throughput: `total generated tokens / wall-clock time per dataset` (prefill and scheduling included; reasoning tokens counted). Macro Avg. averages the eight datasets unweighted.
 
-Autoregressive baseline:
+**Autoregressive baseline:**
 
 ```bash
 python3 -m sglang.launch_server \
@@ -122,7 +129,9 @@ python3 -m sglang.launch_server \
   --port 30000
 ```
 
-DFlash baseline:
+**DFlash baseline:**
+
+> Note: DFlash uses `--attention-backend trtllm_mha` rather than split decode/prefill backends, because, in our experiments, the FlashInfer prefill reduced the DFlash acceptance length. This configuration gave the best DFlash tokens/step and throughput.
 
 ```bash
 python3 -m sglang.launch_server \
@@ -146,7 +155,7 @@ python3 -m sglang.launch_server \
   --port 30000
 ```
 
-DFlash-TfM with Weaver:
+**DFlash-TfM with Weaver:**
 
 ```bash
 python3 -m sglang.launch_server \
