@@ -46,6 +46,9 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.events import KVCacheEventMixin
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
+from sglang.srt.mem_cache.multi_ended_allocator import (
+    UnifiedMambaTokenToKVPoolAllocator,
+)
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.utils import split_node_hash_value
 from sglang.srt.server_args import get_global_server_args
@@ -420,9 +423,15 @@ class LRUList:
 
 class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
     def __init__(self, params: CacheInitParams):
-        assert isinstance(
-            params.token_to_kv_pool_allocator, TokenToKVPoolAllocator
-        ) or isinstance(params.token_to_kv_pool_allocator, PagedTokenToKVPoolAllocator)
+        assert (
+            isinstance(params.token_to_kv_pool_allocator, TokenToKVPoolAllocator)
+            or isinstance(
+                params.token_to_kv_pool_allocator, PagedTokenToKVPoolAllocator
+            )
+            or isinstance(
+                params.token_to_kv_pool_allocator, UnifiedMambaTokenToKVPoolAllocator
+            )
+        )
         self.req_to_token_pool: HybridReqToTokenPool = params.req_to_token_pool
         self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator
         self.mamba_cache_chunk_size = get_global_server_args().mamba_cache_chunk_size
@@ -530,11 +539,19 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         ]
 
         if is_insert:
-            cache_len = (
-                req.mamba_last_track_seqlen
-                if self.enable_mamba_extra_buffer
-                else len(token_ids)
-            )
+            if self.enable_mamba_extra_buffer:
+                cache_len = req.mamba_last_track_seqlen
+            else:
+                cache_len = len(token_ids)
+                # ReplaySSM (no_buffer): `temporal[slot]` lags the live state by
+                # the slot's unflushed ring depth (`write_pos`), so cap the
+                # donate to the last flush boundary (where temporal is current)
+                # and reset the cursor, keeping the donated checkpoint consistent
+                # with its key length. page_size is asserted == 1, so no realign.
+                write_pos_buf = self.req_to_token_pool.mamba_pool.replayssm_write_pos
+                if write_pos_buf is not None:
+                    cache_len -= int(write_pos_buf[req.mamba_pool_idx].item())
+                    write_pos_buf[req.mamba_pool_idx] = 0
             if cache_len is None:
                 cache_len = 0
             if cache_len != len(token_ids):
@@ -686,8 +703,12 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             )
         else:
             mamba_value_donated = self._alloc_mamba_slot()
+            # mamba_pool is a pure PHYSICAL store; translate both slot ids
+            # virtual->physical (identity for the non-unified memory pool) before the copy.
+            translate = self.req_to_token_pool.translate_mamba_indices
             self.req_to_token_pool.mamba_pool.copy_from(
-                req.mamba_pool_idx.unsqueeze(0), mamba_value_donated
+                translate(req.mamba_pool_idx.unsqueeze(0)),
+                translate(mamba_value_donated),
             )
 
         result = self.insert(

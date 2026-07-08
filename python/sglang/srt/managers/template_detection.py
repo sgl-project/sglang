@@ -24,6 +24,10 @@ import re
 from dataclasses import dataclass
 from typing import Callable, Optional, Tuple
 
+import jinja2
+import jinja2.ext
+import jinja2.sandbox
+
 logger = logging.getLogger(__name__)
 
 
@@ -42,6 +46,10 @@ class TemplateDetectionContext:
 
     def has_pattern(self, pattern: str, flags: int = 0) -> bool:
         return re.search(pattern, self.template, flags) is not None
+
+    def has_vocab_pattern(self, pattern: str) -> bool:
+        compiled = re.compile(pattern)
+        return any(isinstance(tok, str) and compiled.search(tok) for tok in self.vocab)
 
 
 @dataclass(frozen=True)
@@ -233,10 +241,17 @@ def _is_deepseek_v4(ctx):
 
 
 def _is_hunyuan(ctx):
-    return (
-        (ctx.has_text("<tool_calls>") or ctx.has_vocab("<tool_calls>"))
-        and (ctx.has_text("<tool_sep>") or ctx.has_vocab("<tool_sep>"))
-    ) or (ctx.has_text("reasoning_effort") and ctx.has_text("interleaved_thinking"))
+    # The shipping Hy3 tokenizer appends a shared suffix to each special token
+    # (e.g. ``<tool_calls:opensource>``), so match the bare or suffixed form.
+    tc = ctx.has_text("<tool_calls>") or ctx.has_vocab_pattern(
+        r"^<tool_calls(?::[^>]+)?>$"
+    )
+    sep = ctx.has_text("<tool_sep>") or ctx.has_vocab_pattern(
+        r"^<tool_sep(?::[^>]+)?>$"
+    )
+    return (tc and sep) or (
+        ctx.has_text("reasoning_effort") and ctx.has_text("interleaved_thinking")
+    )
 
 
 def _is_poolside_v1(ctx):
@@ -481,6 +496,37 @@ def detect_tool_call_parser(
     if ctx is None:
         return None
     return match_rules(ctx, TOOL_CALL_PARSER_RULES, "tool-call parser")
+
+
+def detect_inline_system_support(chat_template: Optional[str]) -> bool:
+    """True if mid-conversation ``role: "system"`` renders inline; False if the
+    template raises or silently drops it (then merge into the leading block).
+
+    The probe requires the second system's sentinel to appear in the output —
+    not raising isn't enough, since some templates ignore non-leading system."""
+    if not chat_template:
+        return False
+    sentinel = "__sglang_inline_system_sentinel__"
+    try:
+        env = jinja2.sandbox.ImmutableSandboxedEnvironment(
+            trim_blocks=True,
+            lstrip_blocks=True,
+            extensions=[jinja2.ext.loopcontrols],
+        )
+        rendered = env.from_string(chat_template).render(
+            messages=[
+                {"role": "system", "content": "t"},
+                {"role": "user", "content": "t"},
+                {"role": "system", "content": sentinel},
+                {"role": "user", "content": "t"},
+            ],
+            add_generation_prompt=False,
+        )
+        return sentinel in rendered
+    except jinja2.TemplateError:
+        return False
+    except Exception:
+        return False
 
 
 def _resolve_auto_parser(

@@ -180,10 +180,10 @@ class InterleaveCPStrategy(ContextParallelStrategy):
     ) -> Any:
         """CP-v2 indexer dispatch: _get_q_k_bf16 (skips AllGather) + strategy gathers Key.
 
-        Returns (query, full_key) for forward_cuda to continue with topk.
+        Returns (query, full_key, weights_raw) for forward_cuda to continue with topk.
         """
         stream = torch.cuda.current_stream()
-        query, local_key = indexer._get_q_k_bf16(
+        query, local_key, weights_raw = indexer._get_q_k_bf16(
             q_lora,
             x,
             positions,
@@ -192,7 +192,7 @@ class InterleaveCPStrategy(ContextParallelStrategy):
         )
         # Strategy does the AllGather
         full_key = self.gather_kv_cache(local_key.contiguous(), forward_batch, stream)
-        return query, full_key
+        return query, full_key, weights_raw
 
     def run_attention(
         self,

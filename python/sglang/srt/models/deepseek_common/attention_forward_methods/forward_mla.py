@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
 import torch
 
 from sglang.srt.compilation.compilation_config import register_split_op
+from sglang.srt.distributed.parallel_state import get_dcp_group
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.dsa.utils import (
@@ -14,6 +16,13 @@ from sglang.srt.layers.attention.dsa.utils import (
 )
 from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.layers.cp.utils import is_cp_v2_active
+from sglang.srt.layers.dcp import (
+    all_gather_kv_cache_for_mla_extend,
+    all_gather_q_for_mla_decode,
+    cp_lse_ag_out_rs_mla,
+    dcp_enabled,
+    get_attention_dcp_world_size,
+)
 from sglang.srt.layers.quantization.fp8_kernel import (
     fp8_dtype,
     per_tensor_quant_mla_fp8,
@@ -63,6 +72,7 @@ from sglang.srt.state_capturer.indexer_topk import (
 from sglang.srt.utils import BumpAllocator
 from sglang.srt.utils.custom_op import register_custom_op
 
+logger = logging.getLogger(__name__)
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 
 if TYPE_CHECKING:
@@ -155,11 +165,40 @@ if _use_aiter_gfx95:
     from sglang.srt.layers.rocm_linear_utils import fused_qk_rope_cat_and_cache_mla
 
 
+def _should_defer_dsa_cp_kv_gather(
+    *,
+    dsa_prefill_cp: bool,
+    fuse_rope_for_trtllm_mla: bool,
+) -> bool:
+    return dsa_prefill_cp and fuse_rope_for_trtllm_mla
+
+
 class DeepseekMLAForwardMixin:
     def init_mla_forward(self: DeepseekV2AttentionMLA):
         self.flashinfer_mla_disable_ragged = (
             get_global_server_args().flashinfer_mla_disable_ragged
         )
+
+    def should_run_indexer(
+        self: DeepseekV2AttentionMLA,
+        prev_topk_indices: Optional[torch.Tensor] = None,
+    ) -> bool:
+        """Whether this layer runs its own indexer vs reusing carried topk.
+
+        skip_topk (shared) layers carry no indexer weights in the checkpoint,
+        so they must reuse the carried topk and never run the indexer. Do NOT
+        widen this to `or prev_topk_indices is None` (the upstream gate): that
+        recomputes with an uninitialized indexer whenever cross-layer
+        propagation is unavailable (e.g. the TBO op path drops topk_indices),
+        reintroducing the >index_topk garbling. The is_nextn clause is the
+        sole intentional fallback (the NextN layer has its own weights).
+
+        Eager-MHA prefill calls this with no argument: it needs no topk for
+        the current forward, but producer layers must still fill their indexer
+        K cache for later MLA/decode; shared layers' cache is never read, so
+        filling it is dead work.
+        """
+        return not self.skip_topk or (self.is_nextn and prev_topk_indices is None)
 
     def _can_fuse_bmm_into_attention(
         self: DeepseekV2AttentionMLA, forward_batch: ForwardBatch
@@ -336,15 +375,7 @@ class DeepseekMLAForwardMixin:
                     q = self.q_b_proj(q)[0].view(
                         -1, self.num_local_heads, self.qk_head_dim
                     )
-                # skip_topk (shared) layers carry no indexer weights in the
-                # checkpoint, so they must reuse the carried topk and never run
-                # the indexer. Do NOT widen this to `or prev_topk_indices is
-                # None` (the upstream gate): that recomputes with an
-                # uninitialized indexer whenever cross-layer propagation is
-                # unavailable (e.g. the TBO op path drops topk_indices),
-                # reintroducing the >index_topk garbling. The is_nextn clause is
-                # the sole intentional fallback (layer 78 has its own weights).
-                if not self.skip_topk or (self.is_nextn and prev_topk_indices is None):
+                if self.should_run_indexer(prev_topk_indices):
                     topk_indices = self.indexer(
                         x=hidden_states,
                         q_lora=q_lora,
@@ -370,12 +401,7 @@ class DeepseekMLAForwardMixin:
                     fusion_plan = self._make_mla_bmm_fusion_plan(q, q_nope)
 
                 if q_lora is not None:
-                    # See the skip_topk note above: shared layers have no
-                    # indexer weights, so this gate must not fall back to
-                    # computing when prev_topk_indices is None.
-                    if not self.skip_topk or (
-                        self.is_nextn and prev_topk_indices is None
-                    ):
+                    if self.should_run_indexer(prev_topk_indices):
                         topk_indices = self.indexer(
                             x=hidden_states,
                             q_lora=q_lora,
@@ -513,11 +539,12 @@ class DeepseekMLAForwardMixin:
             elif is_kv_b_lora_active(self):
                 q_nope_out = apply_kv_b_lora_q_correction(self, q_nope, q_nope_out)
 
+        fuse_rope_for_trtllm_mla = self._fuse_rope_for_trtllm_mla(forward_batch)
         skip_rope_for_dsa_tilelang_fused = self._skip_rope_for_dsa_tilelang_fused()
         skip_rope_for_aiter_fused_mla = self._skip_rope_for_aiter_fused_mla()
         if (
             self.rotary_emb is not None
-            and (not self._fuse_rope_for_trtllm_mla(forward_batch))
+            and (not fuse_rope_for_trtllm_mla)
             and (not skip_rope_for_dsa_tilelang_fused)
             and (not skip_rope_for_aiter_fused_mla)
             and (not _use_aiter or not _is_gfx95_supported or self.use_dsa)
@@ -535,11 +562,46 @@ class DeepseekMLAForwardMixin:
                 k_pe=k_pe,
                 kv_lora_rank=self.kv_lora_rank,
             )
-        elif dsa_use_prefill_cp(forward_batch) or mla_use_prefill_cp(forward_batch):
-            # support allgather+rerrange
-            k_nope, k_pe = self.rebuild_cp_kv_cache(
-                latent_cache, forward_batch, k_nope, k_pe
+        else:
+            dsa_prefill_cp = dsa_use_prefill_cp(forward_batch)
+            mla_prefill_cp = mla_use_prefill_cp(forward_batch)
+            defer_kv_gather_until_after_rope = _should_defer_dsa_cp_kv_gather(
+                dsa_prefill_cp=dsa_prefill_cp,
+                fuse_rope_for_trtllm_mla=fuse_rope_for_trtllm_mla,
             )
+            if (
+                dsa_prefill_cp or mla_prefill_cp
+            ) and not defer_kv_gather_until_after_rope:
+                # support allgather+rerrange
+                k_nope, k_pe = self.rebuild_cp_kv_cache(
+                    latent_cache, forward_batch, k_nope, k_pe
+                )
+
+        # all_gather q_pe, q_nope_out,take tp8 as an example， q_pe [B, H, ROPE_DIM], q_nope_out [B, H, NOPE_DIM] gathered to [B, H * dcp_world_size, ROPE_DIM] [B, H * dcp_world_size, NOPE_DIM] for decode batch, and all gather k_pe, k_nope for extend batch.
+        if dcp_enabled():
+            if forward_batch.forward_mode.is_decode():
+                # if forward_batch.forward_mode is decode, gather q
+                q_nope_out, q_pe = all_gather_q_for_mla_decode(
+                    q_nope_out=q_nope_out,
+                    q_pe=q_pe,
+                )
+            elif forward_batch.forward_mode.is_extend():
+                # for extend, gather kv
+                all_gather_kv_cache_for_mla_extend(
+                    get_token_to_kv_pool(),
+                    self.attn_mqa,
+                    forward_batch.extend_prefix_lens_cpu,
+                    forward_batch.attn_dcp_metadata.dcp_local_prefix_kv_indices,
+                    forward_batch.attn_dcp_metadata.dcp_extend_prefix_lens_sum,
+                    forward_batch.attn_dcp_metadata.dcp_kv_buffer,
+                    self.kv_lora_rank,
+                    k_nope,
+                    k_pe,
+                )
+            else:
+                logger.warning(
+                    f"not supported forward_mode {forward_batch.forward_mode}"
+                )
 
         return (
             q_pe,
@@ -670,6 +732,22 @@ class DeepseekMLAForwardMixin:
                         topk_indices=topk_indices,
                     )
                     attn_output = fusion_plan.attn_output_buf
+                elif forward_batch.forward_mode.is_decode() and dcp_enabled():
+                    # set return_lse=True to correct attn_output
+                    attn_output, lse = self.attn_mqa_for_dcp_decode(
+                        q_nope_out,
+                        k_nope,
+                        k_nope,
+                        forward_batch,
+                        q_rope=q_pe,
+                        k_rope=k_pe,
+                        **extra_args,
+                        **(
+                            dict(topk_indices=topk_indices)
+                            if topk_indices is not None
+                            else {}
+                        ),
+                    )
                 else:
                     attn_output = self.attn_mqa(
                         q_nope_out,
@@ -726,6 +804,16 @@ class DeepseekMLAForwardMixin:
                 save_kv_cache=save_kv_cache,
                 **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
             )
+
+        # correct attn_output with respect to lse from other ranks
+        if forward_batch.forward_mode.is_decode() and dcp_enabled():
+            attn_output = attn_output.view(
+                -1,
+                self.num_local_heads * get_attention_dcp_world_size(),
+                self.kv_lora_rank,
+            )
+            attn_output = cp_lse_ag_out_rs_mla(attn_output, lse, get_dcp_group())
+            attn_output = attn_output.transpose(0, 1)
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 
         _kvb_v = None
