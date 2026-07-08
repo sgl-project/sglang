@@ -202,7 +202,9 @@ class Fp8LinearMethod(LinearMethodBase):
 
         self.block_quant = self.quant_config.weight_block_size is not None
 
-        self.w8a8_block_fp8_linear = dispatch_w8a8_block_fp8_linear()
+        self.w8a8_block_fp8_linear = None
+        if self.block_quant:
+            self.w8a8_block_fp8_linear = dispatch_w8a8_block_fp8_linear()
 
     def create_weights(
         self,

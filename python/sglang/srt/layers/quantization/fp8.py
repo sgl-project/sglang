@@ -434,7 +434,7 @@ class Fp8LinearMethod(LinearMethodBase):
         self.w8a8_mxfp8_linear = None
         if self.use_mxfp8:
             self.w8a8_mxfp8_linear = dispatch_w8a8_mxfp8_linear()
-        else:
+        elif self.block_quant:
             self.w8a8_block_fp8_linear = dispatch_w8a8_block_fp8_linear()
         self.is_checkpoint_fp8_serialized = (
             self.quant_config.is_checkpoint_fp8_serialized
