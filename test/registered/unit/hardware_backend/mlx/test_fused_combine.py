@@ -333,6 +333,21 @@ class TestFusedCombine(unittest.TestCase):
 
 
 @unittest.skipUnless(_IS_APPLE_SILICON and _HAS_MLX, _SKIP_REASON)
+class TestFusedMoeCombineKernelOp(unittest.TestCase):
+    """Decorator plus class registration surface of the combine op."""
+
+    def test_op_class_shape(self):
+        self.assertTrue(issubclass(fc.FusedMoeCombineKernel, metal_jit.MetalJitOp))
+        self.assertEqual(fc.FusedMoeCombineKernel.source, fc._KERNEL_SOURCE)
+        # The module level guard is the class's own, not a diverging copy.
+        self.assertIs(fc.can_fuse, fc.FusedMoeCombineKernel.can_fuse)
+
+    def test_warmup_specs_default_empty(self):
+        # Inherited default; the AOT policy layer lands in a follow up PR.
+        self.assertEqual(list(fc.FusedMoeCombineKernel().warmup_specs(model=None)), [])
+
+
+@unittest.skipUnless(_IS_APPLE_SILICON and _HAS_MLX, _SKIP_REASON)
 class TestPatchMoeCombine(unittest.TestCase):
     """patch_moe_combine_with_fused: subclass swap with no-op idempotency."""
 

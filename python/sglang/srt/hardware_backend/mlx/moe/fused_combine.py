@@ -84,81 +84,99 @@ _KERNEL_SOURCE = r"""
 """
 
 
-metal_jit.register(
-    "fused_moe_combine",
-    name_template="fused_moe_combine_y{0}_s{1}",
-    input_names=["y", "scores"],
-    output_names=["out"],
-    source=_KERNEL_SOURCE,
-)
-
-
 _Y_DTYPES = (mx.float16, mx.bfloat16)
 _SCORES_DTYPES = (mx.float16, mx.bfloat16, mx.float32)
 
 
-def can_fuse(y: mx.array, scores: mx.array) -> bool:
-    """Cheap structural check: does this combine match the fast-path regime?"""
-    if y.ndim < 3 or scores.ndim != y.ndim - 1:
-        return False
-    if tuple(y.shape[:-1]) != tuple(scores.shape):
-        return False
-    if any(d == 0 for d in y.shape):
-        return False
-    if y.dtype not in _Y_DTYPES or scores.dtype not in _SCORES_DTYPES:
-        return False
-    if y.shape[-1] % _OUTPUTS_PER_TG != 0:
-        return False
-    return True
+@metal_jit.kernel(
+    name="fused_moe_combine",
+    name_template="fused_moe_combine_y{0}_s{1}",
+    input_names=["y", "scores"],
+    output_names=["out"],
+)
+class FusedMoeCombineKernel(metal_jit.MetalJitOp):
+    """Registered op for the fused combine; owns the guard and geometry."""
+
+    source = _KERNEL_SOURCE
+
+    @staticmethod
+    def can_fuse(y: mx.array, scores: mx.array) -> bool:
+        """Cheap structural check: does this combine match the fast-path regime?"""
+        if y.ndim < 3 or scores.ndim != y.ndim - 1:
+            return False
+        if tuple(y.shape[:-1]) != tuple(scores.shape):
+            return False
+        if any(d == 0 for d in y.shape):
+            return False
+        if y.dtype not in _Y_DTYPES or scores.dtype not in _SCORES_DTYPES:
+            return False
+        if y.shape[-1] % _OUTPUTS_PER_TG != 0:
+            return False
+        return True
+
+    def dispatch(self, y: mx.array, scores: mx.array) -> mx.array:
+        """Compute ``out[..., h] = sum_k y[..., k, h] * scores[..., k]`` in one kernel.
+
+        Numerical contract: this computes the same reduction as the reference::
+
+            (y * scores[..., None]).sum(axis=-2)
+
+        but is NOT bit-identical to it. The reference forms the ``y * scores``
+        product in the operands' own dtype (an fp16 product when both are fp16)
+        and reduces in that dtype. The fused kernel promotes both operands to
+        fp32, forms the product in fp32, accumulates in fp32, and narrows to
+        ``y.dtype`` only on the final write. The fused path is therefore strictly
+        closer to the fp32 ground truth; the two paths can differ in the last
+        fp16/bf16 ULPs on a given layer depending on which one can_fuse selects.
+
+        Falls back to the broadcast/sum reference, narrowed to ``y.dtype``, when
+        can_fuse(y, scores) is False; both paths return ``y.dtype``.
+
+        Leading dims (everything before TOP_K) are flattened into the kernel's
+        row dim and restored on the output, so rank 3 [B, TOP_K, H] and the
+        mlx-lm site's rank 4 [batch, seq, TOP_K, H] both dispatch.
+        """
+        if not self.can_fuse(y, scores):
+            return (y * scores[..., None]).sum(axis=-2).astype(y.dtype)
+
+        TOPK, H = y.shape[-2], y.shape[-1]
+        lead = tuple(y.shape[:-2])
+        y = y.reshape(-1, TOPK, H)
+        scores = scores.reshape(-1, TOPK)
+        B = y.shape[0]
+        kernel = metal_jit.get("fused_moe_combine", y.dtype, scores.dtype)
+        (out,) = kernel(
+            inputs=[y, scores],
+            template=[
+                ("T", y.dtype),
+                ("TS", scores.dtype),
+                ("TOP_K", TOPK),
+                ("HIDDEN", H),
+            ],
+            # grid is in *threads* (MLX convention): total threads = B * H / N_READS,
+            # one TG = 64 threads handles 256 contiguous outputs.
+            grid=(B * H // _N_READS, 1, 1),
+            threadgroup=(_THREADS_PER_TG, 1, 1),
+            output_shapes=[(B, H)],
+            output_dtypes=[y.dtype],
+        )
+        return out.reshape(*lead, H)
+
+
+_OP = FusedMoeCombineKernel()
+
+# Module level guard kept as the public seam for callers and tests; dispatch
+# applies the same check inline.
+can_fuse = FusedMoeCombineKernel.can_fuse
 
 
 def fused_combine(y: mx.array, scores: mx.array) -> mx.array:
-    """Compute ``out[..., h] = sum_k y[..., k, h] * scores[..., k]`` in one kernel.
+    """Fused MoE combine entry point used by the patched forwards.
 
-    Numerical contract: this computes the same reduction as the reference::
-
-        (y * scores[..., None]).sum(axis=-2)
-
-    but is NOT bit-identical to it. The reference forms the ``y * scores``
-    product in the operands' own dtype (an fp16 product when both are fp16)
-    and reduces in that dtype. The fused kernel promotes both operands to
-    fp32, forms the product in fp32, accumulates in fp32, and narrows to
-    ``y.dtype`` only on the final write. The fused path is therefore strictly
-    closer to the fp32 ground truth; the two paths can differ in the last
-    fp16/bf16 ULPs on a given layer depending on which one can_fuse selects.
-
-    Falls back to the broadcast/sum reference, narrowed to ``y.dtype``, when
-    can_fuse(y, scores) is False; both paths return ``y.dtype``.
-
-    Leading dims (everything before TOP_K) are flattened into the kernel's
-    row dim and restored on the output, so rank 3 [B, TOP_K, H] and the
-    mlx-lm site's rank 4 [batch, seq, TOP_K, H] both dispatch.
+    Thin wrapper over the registered op; see FusedMoeCombineKernel.dispatch
+    for the numerical contract, eligibility rules, and fallback behavior.
     """
-    if not can_fuse(y, scores):
-        return (y * scores[..., None]).sum(axis=-2).astype(y.dtype)
-
-    TOPK, H = y.shape[-2], y.shape[-1]
-    lead = tuple(y.shape[:-2])
-    y = y.reshape(-1, TOPK, H)
-    scores = scores.reshape(-1, TOPK)
-    B = y.shape[0]
-    kernel = metal_jit.get("fused_moe_combine", y.dtype, scores.dtype)
-    (out,) = kernel(
-        inputs=[y, scores],
-        template=[
-            ("T", y.dtype),
-            ("TS", scores.dtype),
-            ("TOP_K", TOPK),
-            ("HIDDEN", H),
-        ],
-        # grid is in *threads* (MLX convention): total threads = B * H / N_READS,
-        # one TG = 64 threads handles 256 contiguous outputs.
-        grid=(B * H // _N_READS, 1, 1),
-        threadgroup=(_THREADS_PER_TG, 1, 1),
-        output_shapes=[(B, H)],
-        output_dtypes=[y.dtype],
-    )
-    return out.reshape(*lead, H)
+    return _OP.dispatch(y, scores)
 
 
 def _fused_qwen2_moe_call(self, x):

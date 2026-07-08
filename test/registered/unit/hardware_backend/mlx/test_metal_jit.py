@@ -3,8 +3,9 @@ name-keyed registry.
 
 Covers per-key compile caching, kernel name formatting, dtype_tag output,
 warm_once dedupe and its non-array assertion, one on-device dispatch through
-a trivial kernel, and the registry's register/get/warm_once round trip,
-per-name cache isolation, and duplicate-name rejection.
+a trivial kernel, the registry's get/warm_once round trip via decorator
+registration, per-name cache isolation, duplicate-name rejection, and the
+@kernel decorator's validation plus the MetalJitOp default surface.
 
 Hermetic: tiny synthetic kernels only; skips off Darwin/arm64 or without
 ``mlx``.
@@ -101,16 +102,19 @@ class TestMetalJitKernel(unittest.TestCase):
 
 @unittest.skipUnless(_IS_APPLE_SILICON and _HAS_MLX, _SKIP_REASON)
 class TestMetalJitRegistry(unittest.TestCase):
-    """Name-keyed registry: register()/get()/warm_once() over MetalJitKernel."""
+    """Name-keyed registry: @kernel registration, get()/warm_once() dispatch."""
 
     def _register(self, name):
-        metal_jit.register(
-            name,
+        @metal_jit.kernel(
+            name=name,
             name_template=f"{name}_{{0}}",
             input_names=["x"],
             output_names=["out"],
-            source=_ADD_ONE_SOURCE,
         )
+        class _Op(metal_jit.MetalJitOp):
+            source = _ADD_ONE_SOURCE
+
+        return _Op
 
     def test_register_get_round_trip(self):
         self._register("metal_jit_test_registry_round_trip")
@@ -152,6 +156,87 @@ class TestMetalJitRegistry(unittest.TestCase):
         self.assertTrue(metal_jit.warm_once(name, ("k1",), dispatch))
         self.assertFalse(metal_jit.warm_once(name, ("k1",), dispatch))
         self.assertEqual(len(calls), 1)
+
+
+@unittest.skipUnless(_IS_APPLE_SILICON and _HAS_MLX, _SKIP_REASON)
+class TestMetalJitOpDecorator(unittest.TestCase):
+    """@metal_jit.kernel validation and the MetalJitOp default surface."""
+
+    def _decorate(self, name, cls_body_source=_ADD_ONE_SOURCE):
+        @metal_jit.kernel(
+            name=name,
+            name_template=f"{name}_{{0}}",
+            input_names=["x"],
+            output_names=["out"],
+        )
+        class _Op(metal_jit.MetalJitOp):
+            source = cls_body_source
+
+        return _Op
+
+    def test_decorator_returns_class_unchanged(self):
+        op_cls = self._decorate("metal_jit_test_op_identity")
+        self.assertTrue(issubclass(op_cls, metal_jit.MetalJitOp))
+        self.assertEqual(op_cls.source, _ADD_ONE_SOURCE)
+
+    def test_rejects_non_metaljitop_class(self):
+        with self.assertRaises(TypeError):
+
+            @metal_jit.kernel(
+                name="metal_jit_test_op_not_subclass",
+                name_template="metal_jit_test_op_not_subclass_{0}",
+                input_names=["x"],
+                output_names=["out"],
+            )
+            class _NotAnOp:
+                source = _ADD_ONE_SOURCE
+
+    def test_missing_source_raises_and_leaves_name_free(self):
+        name = "metal_jit_test_op_missing_source"
+        with self.assertRaises(TypeError):
+
+            @metal_jit.kernel(
+                name=name,
+                name_template=f"{name}_{{0}}",
+                input_names=["x"],
+                output_names=["out"],
+            )
+            class _NoSource(metal_jit.MetalJitOp):
+                pass
+
+        # Validation precedes registry insertion, so the failed registration
+        # must not consume the name.
+        self._decorate(name)
+
+    def test_warmup_specs_default_empty(self):
+        op_cls = self._decorate("metal_jit_test_op_warmup_default")
+        self.assertEqual(list(op_cls().warmup_specs(model=None)), [])
+
+    def test_resolved_kernel_name_matches_template(self):
+        name = "metal_jit_test_op_name_template"
+
+        @metal_jit.kernel(
+            name=name,
+            name_template=f"{name}_y{{0}}_s{{1}}",
+            input_names=["x"],
+            output_names=["out"],
+        )
+        class _Op(metal_jit.MetalJitOp):
+            source = _ADD_ONE_SOURCE
+
+        captured = []
+        orig = mx.fast.metal_kernel
+
+        def spy(*, name, **kwargs):
+            captured.append(name)
+            return orig(name=name, **kwargs)
+
+        mx.fast.metal_kernel = spy
+        try:
+            metal_jit.get(name, mx.float16, mx.float32)
+        finally:
+            mx.fast.metal_kernel = orig
+        self.assertEqual(captured, [f"{name}_yfloat16_sfloat32"])
 
 
 if __name__ == "__main__":
