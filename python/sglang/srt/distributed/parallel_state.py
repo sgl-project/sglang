@@ -1442,19 +1442,22 @@ class GroupCoordinator:
                 async_handle.wait()
         return tensor_dict
 
-    def send_tensor_dict(
+    def isend_tensor_dict(
         self,
         tensor_dict: Dict[str, Union[torch.Tensor, Any]],
         dst: Optional[int] = None,
         all_gather_group: Optional["GroupCoordinator"] = None,
-        async_send: bool = False,
-    ) -> Optional[List[P2PWork]]:
-        """Send the input tensor dictionary.
-        NOTE: `dst` is the local rank of the source rank.
+    ) -> List["P2PWork"]:
         """
-        # Bypass the function if we are using only 1 GPU.
-        if self.world_size == 1:
-            return tensor_dict
+        Non-blocking send of a tensor dictionary. Returns a list of P2PWork
+        handles that the caller must wait on before the send buffers can be
+        reused or freed.
+
+        This is the async building-block; send_tensor_dict() is a
+        synchronous wrapper around this method.
+        """
+        if self.world_size <= 1:
+            return []
 
         all_gather_size = 1 if all_gather_group is None else all_gather_group.world_size
         all_gather_rank = (
@@ -1468,46 +1471,89 @@ class GroupCoordinator:
             dst = (self.rank_in_group + 1) % self.world_size
         assert dst < self.world_size, f"Invalid dst rank ({dst})"
 
-        assert isinstance(
-            tensor_dict, dict
-        ), f"Expecting a dictionary, got {type(tensor_dict)}"
         metadata_list, tensor_list = _split_tensor_dict(tensor_dict)
-        # Note: While switching to Device-to-Device (D2D) would introduce an extra
-        # Device-to-Host (D2H) memory copy overhead for serialization, our benchmarks
-        # show better overall transmission performance with D2D due to:
-        # 1. Superior D2D transfer bandwidth
-        # 2. Ability to overlap send and recv operations
-        # Thus the net performance gain justifies this approach.
 
-        send_func = torch.distributed.isend if async_send else torch.distributed.send
-        p2p_works = self.send_object(metadata_list, dst=dst, async_send=async_send)
+        # Async send metadata (pickle object on CPU)
+        p2p_works = self.send_object(metadata_list, dst=dst, async_send=True)
 
         for tensor in tensor_list:
             if tensor.numel() == 0:
-                # Skip sending empty tensors.
                 continue
-
-            # send-allgather: send only a slice, then do allgather.
             if all_gather_group is not None and tensor.numel() % all_gather_size == 0:
                 tensor = tensor.reshape(all_gather_size, -1)[all_gather_rank]
 
             comm_group = metadata_group if tensor.is_cpu else group
-            work = send_func(tensor, self.ranks[dst], group=comm_group)
-            if async_send:
-                p2p_works.append(P2PWork(work, tensor))
+            work = torch.distributed.isend(tensor, self.ranks[dst], group=comm_group)
+
+            if tensor.is_cuda:
+                tensor.record_stream(torch.cuda.current_stream(tensor.device))
+
+            p2p_works.append(P2PWork(work, tensor))
+
         return p2p_works
 
-    def recv_tensor_dict(
+    def send_tensor_dict(
+        self,
+        tensor_dict: Dict[str, Union[torch.Tensor, Any]],
+        dst: Optional[int] = None,
+        all_gather_group: Optional["GroupCoordinator"] = None,
+        async_send: bool = False,
+    ) -> Optional[List[P2PWork]]:
+        """Send the input tensor dictionary.
+        NOTE: `dst` is the local rank of the destination rank.
+
+        When async_send=True, returns a list of P2PWork handles.
+        When async_send=False (default), blocks until all sends complete.
+        """
+        if self.world_size == 1:
+            return tensor_dict if not async_send else []
+
+        handles = self.isend_tensor_dict(
+            tensor_dict,
+            dst=dst,
+            all_gather_group=all_gather_group,
+        )
+
+        # Async mode
+        if async_send:
+            return handles
+
+        # Sync mode
+        for h in handles:
+            if h.work is not None:
+                h.work.wait()
+        return None
+
+    def irecv_tensor_dict(
         self,
         src: Optional[int] = None,
         all_gather_group: Optional["GroupCoordinator"] = None,
-    ) -> Optional[Dict[str, Union[torch.Tensor, Any]]]:
-        """Recv the input tensor dictionary.
-        NOTE: `src` is the local rank of the source rank.
+    ) -> Tuple[
+        Optional[Dict[str, Union[torch.Tensor, Any]]],
+        List[torch.distributed.Work],
+        List[Callable[[], None]],
+    ]:
         """
-        # Bypass the function if we are using only 1 GPU.
-        if not torch.distributed.is_initialized() or self.world_size == 1:
-            return None
+        Non-blocking receive of a tensor dictionary.
+
+        Returns:
+            tensor_dict: pre-allocated tensor dict (tensor data is not ready yet,
+                        need to wait until handles complete）
+            handles:     irecv's work object list, caller needs to wait
+            postprocess: the function list to be executed after wait completed
+                        (used by all_gather to rebuild complete tensor)
+
+        Usage:
+            tensor_dict, handles, postprocess = pp_group.irecv_tensor_dict(src=src)
+            # ... here can do overlap to perform computation ...
+            for h in handles:
+                h.wait()
+            for fn in postprocess:
+                fn()
+            # till now data in tensor_dict is ready
+        """
+        if not torch.distributed.is_initialized() or self.world_size <= 1:
+            return None, [], []
 
         all_gather_size = 1 if all_gather_group is None else all_gather_group.world_size
         all_gather_rank = (
@@ -1521,40 +1567,85 @@ class GroupCoordinator:
             src = (self.rank_in_group - 1) % self.world_size
         assert src < self.world_size, f"Invalid src rank ({src})"
 
+        # recv metadata
         recv_metadata_list = self.recv_object(src=src)
+
         tensor_dict: Dict[str, Any] = {}
+        handles: List[torch.distributed.Work] = []
+        postprocess: List[Callable[[], None]] = []
+
         for key, value in recv_metadata_list:
             if isinstance(value, TensorMetadata):
-                tensor = torch.empty(value.size, dtype=value.dtype, device=value.device)
-                if tensor.numel() == 0:
-                    # Skip broadcasting empty tensors.
-                    tensor_dict[key] = tensor
+                full_tensor = torch.empty(
+                    value.size, dtype=value.dtype, device=value.device
+                )
+                if full_tensor.numel() == 0:
+                    tensor_dict[key] = full_tensor
                     continue
 
-                # send-allgather: send only a slice, then do allgather.
+                # send-allgather
                 use_all_gather = (
                     all_gather_group is not None
-                    and tensor.numel() % all_gather_size == 0
+                    and full_tensor.numel() % all_gather_size == 0
                 )
 
                 if use_all_gather:
-                    orig_shape = tensor.shape
-                    tensor = tensor.reshape(all_gather_size, -1)[all_gather_rank]
+                    orig_shape = full_tensor.shape
+                    slice_tensor = full_tensor.reshape(all_gather_size, -1)[
+                        all_gather_rank
+                    ]
+                    comm_group = metadata_group if slice_tensor.is_cpu else group
+                    handle = torch.distributed.irecv(
+                        slice_tensor, src=self.ranks[src], group=comm_group
+                    )
+                    handles.append(handle)
 
-                # We have to use irecv here to make it work for both isend and send.
-                comm_group = metadata_group if tensor.is_cpu else group
-                work = torch.distributed.irecv(
-                    tensor, src=self.ranks[src], group=comm_group
-                )
-                work.wait()
+                    def _postprocess(
+                        key=key,
+                        slice_tensor=slice_tensor,
+                        orig_shape=tuple(orig_shape),
+                        all_gather_group=all_gather_group,
+                    ):
+                        assert all_gather_group is not None
+                        tensor_dict[key] = all_gather_group.all_gather(
+                            slice_tensor, dim=0
+                        ).reshape(orig_shape)
 
-                if use_all_gather:
-                    tensor = all_gather_group.all_gather(tensor, dim=0)
-                    tensor = tensor.reshape(orig_shape)
-
-                tensor_dict[key] = tensor
+                    postprocess.append(_postprocess)
+                    tensor_dict[key] = slice_tensor
+                else:
+                    comm_group = metadata_group if full_tensor.is_cpu else group
+                    handle = torch.distributed.irecv(
+                        full_tensor, src=self.ranks[src], group=comm_group
+                    )
+                    handles.append(handle)
+                    tensor_dict[key] = full_tensor
             else:
                 tensor_dict[key] = value
+
+        return tensor_dict, handles, postprocess
+
+    def recv_tensor_dict(
+        self,
+        src: Optional[int] = None,
+        all_gather_group: Optional["GroupCoordinator"] = None,
+    ) -> Optional[Dict[str, Union[torch.Tensor, Any]]]:
+        """Recv the input tensor dictionary (synchronous wrapper).
+        NOTE: `src` is the local rank of the source rank.
+        """
+        if not torch.distributed.is_initialized() or self.world_size == 1:
+            return None
+
+        tensor_dict, handles, postprocess = self.irecv_tensor_dict(
+            src=src,
+            all_gather_group=all_gather_group,
+        )
+
+        for handle in handles:
+            handle.wait()
+        for fn in postprocess:
+            fn()
+
         return tensor_dict
 
     def barrier(self):

@@ -111,9 +111,13 @@ class SchedulerPPMixin:
                     self.mbs[mb_id] = self.get_next_batch_to_run()
                 self.running_mbs[mb_id] = self.running_batch
                 self.cur_batch: Optional[ScheduleBatch] = self.mbs[mb_id]
+
+                # Async pp processing
+                proxy_recv_state = None
                 if self.cur_batch:
                     server_is_idle = False
-                    pp_proxy_tensors = self._pp_recv_proxy_tensors()
+                    proxy_recv_state = self._pp_irecv_proxy_tensors()
+
                 next_pp_outputs = None
                 next_batch_result = None
                 d2h_event = None
@@ -125,13 +129,16 @@ class SchedulerPPMixin:
                         )
                     )
                 self._pp_commit_comm_work(self.send_proxy_work)
+
                 if self.cur_batch:
+                    pp_proxy_tensors = self._pp_wait_proxy_tensors(proxy_recv_state)
                     result, self.launch_event = self._pp_launch_batch(
                         mb_id,
                         pp_proxy_tensors,
                         self.mb_metadata,
                         self.last_rank_comm_queue,
                     )
+
                 if self.server_args.pp_async_batch_depth == 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
@@ -252,10 +259,12 @@ class SchedulerPPMixin:
                 self.mbs[mb_id] = batch
                 self.running_mbs[mb_id] = self.running_batch
 
+                # Async PP processing
+                proxy_recv_state = None
                 self.cur_batch: Optional[ScheduleBatch] = self.mbs[mb_id]
                 if self.cur_batch:
                     server_is_idle = False
-                    pp_proxy_tensors = self._pp_recv_proxy_tensors()
+                    proxy_recv_state = self._pp_irecv_proxy_tensors()
 
                 if self.server_args.pp_async_batch_depth > 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
@@ -265,13 +274,16 @@ class SchedulerPPMixin:
                         )
                     )
                 self._pp_commit_comm_work(self.send_proxy_work)
+
                 if self.cur_batch:
+                    pp_proxy_tensors = self._pp_wait_proxy_tensors(proxy_recv_state)
                     result, self.launch_event = self._pp_launch_batch(
                         mb_id,
                         pp_proxy_tensors,
                         self.mb_metadata,
                         self.last_rank_comm_queue,
                     )
+
                 if self.server_args.pp_async_batch_depth == 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
@@ -403,11 +415,14 @@ class SchedulerPPMixin:
                 self.running_mbs[mb_id] = self.running_batch
 
                 self.cur_batch: Optional[ScheduleBatch] = self.mbs[mb_id]
+
+                # Async PP processing
+                proxy_recv_state = None
                 if self.cur_batch:
                     server_is_idle = False
                     pp_proxy_tensors = None
                     if not self.cur_batch.forward_mode.is_prebuilt():
-                        pp_proxy_tensors = self._pp_recv_proxy_tensors()
+                        proxy_recv_state = self._pp_irecv_proxy_tensors()
 
                 # early send output if possible
                 if self.server_args.pp_async_batch_depth > 0:
@@ -420,6 +435,9 @@ class SchedulerPPMixin:
                 self._pp_commit_comm_work(self.send_proxy_work)
 
                 if self.cur_batch:
+                    pp_proxy_tensors = None
+                    if not self.cur_batch.forward_mode.is_prebuilt():
+                        pp_proxy_tensors = self._pp_wait_proxy_tensors(proxy_recv_state)
                     result, self.launch_event = self._pp_launch_batch(
                         mb_id,
                         pp_proxy_tensors,
@@ -793,6 +811,40 @@ class SchedulerPPMixin:
             self.waiting_queue.extend(good_reqs)
             return [[req.rid for req in good_reqs], [req.rid for req in failed_reqs]]
         return None
+
+    def _pp_irecv_proxy_tensors(
+        self: "Scheduler",
+    ) -> Optional[Tuple[Dict, List, List]]:
+        """Start async recv of proxy tensors from the previous PP stage.
+        Returns None if this is the first rank (no recv needed),
+        otherwise returns (tensor_dict, handles, postprocess) from irecv_tensor_dict.
+        """
+        if self.pp_group.is_first_rank:
+            return None
+
+        tensor_dict, handles, postprocess = self.pp_group.irecv_tensor_dict(
+            all_gather_group=(
+                self.attn_tp_group if self.require_attn_tp_allgather else None
+            ),
+        )
+        return (tensor_dict, handles, postprocess)
+
+    def _pp_wait_proxy_tensors(
+        self: "Scheduler",
+        recv_state: Optional[Tuple[Dict, List, List]],
+    ) -> Optional["PPProxyTensors"]:
+        """Wait for async proxy tensor recv to complete."""
+        if recv_state is None:
+            return None
+
+        tensor_dict, handles, postprocess = recv_state
+
+        for h in handles:
+            h.wait()
+        for fn in postprocess:
+            fn()
+
+        return PPProxyTensors(tensor_dict)
 
     def _pp_pd_get_bootstrapped_ids(self: Scheduler):
         # communicate pre-consensus bootstrapp reqs
