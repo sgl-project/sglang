@@ -90,9 +90,7 @@ class ModelSlimW4A8Mxfp4MoE(ModelSlimMoEScheme):
         )
 
         layer.register_parameter(f"{self.weight_prefix}_weight", weight)
-        layer.register_parameter(
-            f"{self.weight_prefix}_weight_scale", weight_scale
-        )
+        layer.register_parameter(f"{self.weight_prefix}_weight_scale", weight_scale)
         set_weight_attrs(weight, extra_weight_attrs)
         set_weight_attrs(weight_scale, extra_weight_attrs)
 
