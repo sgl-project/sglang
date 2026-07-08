@@ -244,10 +244,23 @@ def _kv_norm_report(backend, layer_id: int, slots: torch.Tensor) -> str:
         rows = kbuf[dev_slots].reshape(dev_slots.shape[0], -1).float()
         norms = rows.norm(dim=-1)
         zero_rows = int((norms < 1e-6).sum().item())
-        norms_list = [round(x, 3) for x in norms.detach().to("cpu").tolist()]
+        norms_cpu = norms.detach().to("cpu")
+        norms_list = [round(x, 3) for x in norms_cpu.tolist()]
+        # Fixed ABSOLUTE-position samples. These token positions fall in the
+        # shared 8-shot GSM8K prefix, so they are the SAME token on the prefill
+        # (EXTEND) and decode (DECODE) side and across questions/runs -> the norm
+        # at each position must match iff the MORI transfer preserved that page.
+        # Spans multiple pages (page_size=256) to catch per-page transfer bugs
+        # that head/tail (page 0 + current token) would miss.
+        n = norms_cpu.numel()
+        samples = {
+            p: round(float(norms_cpu[p]), 3)
+            for p in (0, 128, 256, 512, 768, 1024)
+            if p < n
+        }
         return (
-            f"    KV L{layer_id}: zero_rows={zero_rows}/{norms.numel()} "
-            f"norm={_ht(norms_list)}"
+            f"    KV L{layer_id}: zero_rows={zero_rows}/{n} "
+            f"norm={_ht(norms_list)} samples@abs={samples}"
         )
     except Exception as exc:
         return f"    KV L{layer_id}: norm probe failed: {exc!r}"
