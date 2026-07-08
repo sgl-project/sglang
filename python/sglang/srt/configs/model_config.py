@@ -30,6 +30,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import is_hip, is_sm100_supported, retry
 from sglang.srt.utils.hf_transformers_utils import (
     get_config,
+    get_config_allow_missing_model_type,
     get_context_length,
     get_generation_config,
     get_hf_text_config,
@@ -98,6 +99,69 @@ def _hf_attr(config, name):
     if isinstance(config, dict):
         return config.get(name)
     return getattr(config, name, None)
+
+
+def _restore_glm_moe_dsa_head_dims_from_raw_config(
+    hf_config: PretrainedConfig,
+    raw_config_dict: Optional[dict],
+    model_override_args: dict,
+    model_path: str,
+    trust_remote_code: bool,
+    revision: Optional[str],
+    kwargs: dict,
+) -> None:
+    if _hf_arch(hf_config) != "GlmMoeDsaForCausalLM":
+        return
+
+    if raw_config_dict is None:
+        try:
+            raw_config_dict, _ = PretrainedConfig.get_config_dict(
+                model_path,
+                trust_remote_code=trust_remote_code,
+                revision=revision,
+                **kwargs,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to restore GLM DSA raw head dimensions from config.json: %s",
+                exc,
+            )
+            return
+
+    for name in (
+        "qk_nope_head_dim",
+        "qk_rope_head_dim",
+        "qk_head_dim",
+        "v_head_dim",
+    ):
+        value = model_override_args.get(name, raw_config_dict.get(name))
+        if value is not None:
+            setattr(hf_config, name, value)
+
+
+def _normalize_nested_transformer_config(hf_config: PretrainedConfig) -> None:
+    """Materialize nested speculator transformer config fields on the HF config."""
+    transformer_cfg = _hf_attr(hf_config, "transformer_layer_config")
+    if transformer_cfg is None:
+        return
+
+    if isinstance(transformer_cfg, dict):
+        items = transformer_cfg.items()
+    else:
+        to_dict = getattr(transformer_cfg, "to_dict", None)
+        items = to_dict().items() if callable(to_dict) else vars(transformer_cfg).items()
+
+    for key, value in items:
+        if key.startswith("_"):
+            continue
+        if _hf_attr(hf_config, key) is None:
+            setattr(hf_config, key, value)
+
+    aux_layer_ids = _hf_attr(hf_config, "aux_hidden_state_layer_ids")
+    if _hf_attr(hf_config, "num_target_layers") is None and aux_layer_ids is not None:
+        parsed = [int(x) for x in aux_layer_ids]
+        if parsed:
+            setattr(hf_config, "num_target_layers", max(parsed) + 1)
 
 
 def is_deepseek_dsa(config) -> bool:
@@ -271,15 +335,29 @@ class ModelConfig:
         # get_config() is cached. ModelConfig mutates hf_config for draft-model
         # remapping and architecture-specific normalization, so each instance
         # must own an isolated copy.
-        self.hf_config = copy.deepcopy(
-            get_config(
-                self.model_path,
-                trust_remote_code=trust_remote_code,
-                revision=revision,
-                model_override_args=self.model_override_args,
-                model_config_parser=model_config_parser,
-                **kwargs,
-            )
+        raw_config_dict = None
+        config_loader = (
+            get_config_allow_missing_model_type if is_draft_model else get_config
+        )
+        hf_config = config_loader(
+            self.model_path,
+            trust_remote_code=trust_remote_code,
+            revision=revision,
+            model_override_args=self.model_override_args,
+            model_config_parser=model_config_parser,
+            **kwargs,
+        )
+        self.hf_config = copy.deepcopy(hf_config)
+        if is_draft_model:
+            _normalize_nested_transformer_config(self.hf_config)
+        _restore_glm_moe_dsa_head_dims_from_raw_config(
+            self.hf_config,
+            raw_config_dict,
+            self.model_override_args,
+            self.model_path,
+            trust_remote_code,
+            revision,
+            kwargs,
         )
         self.hf_text_config = get_hf_text_config(self.hf_config)
         self.hf_generation_config = get_generation_config(

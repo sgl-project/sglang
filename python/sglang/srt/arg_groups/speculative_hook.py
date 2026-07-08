@@ -10,21 +10,50 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_DSPARK_DRAFT_ARCHITECTURES = frozenset({"DSparkDraftModel", "Qwen3DSparkModel"})
+
+
+def _load_speculative_draft_config(
+    model_path: str,
+    *,
+    trust_remote_code: bool,
+    revision: Optional[str] = None,
+    model_override_args: Optional[dict] = None,
+    **kwargs,
+):
+    from sglang.srt.utils.hf_transformers_utils import (
+        get_config_allow_missing_model_type,
+    )
+
+    return get_config_allow_missing_model_type(
+        model_path,
+        trust_remote_code=trust_remote_code,
+        revision=revision,
+        model_override_args=model_override_args,
+        **kwargs,
+    )
+
+
+def _is_dspark_draft_config(config) -> bool:
+    draft_archs = getattr(config, "architectures", None) or []
+    return any(arch in _DSPARK_DRAFT_ARCHITECTURES for arch in draft_archs)
+
 
 def _resolve_speculative_algorithm_alias(
     speculative_algorithm: Optional[str],
     speculative_draft_model_path: Optional[str],
     trust_remote_code: bool = False,
-    kwargs: Optional[dict] = {},
+    kwargs: Optional[dict] = None,
 ) -> Optional[str]:
     """Resolve CLI speculative algorithm; NEXTN/EAGLE may become FROZEN_KV_MTP for Gemma4 assistant drafts."""
 
+    kwargs = kwargs or {}
     is_gemma4_draft = False
     if speculative_draft_model_path:
-        from sglang.srt.utils.hf_transformers_utils import get_config
-
-        cfg = get_config(
-            speculative_draft_model_path, trust_remote_code=trust_remote_code, **kwargs
+        cfg = _load_speculative_draft_config(
+            speculative_draft_model_path,
+            trust_remote_code=trust_remote_code,
+            **kwargs,
         )
         draft_archs = getattr(cfg, "architectures", None) or []
         is_gemma4_draft = any(
@@ -147,6 +176,26 @@ def _handle_dflash(server_args: ServerArgs) -> None:
             "DFLASH speculative decoding requires setting --speculative-draft-model-path."
         )
 
+    draft_hf_config = None
+    draft_config_error = None
+    model_override_args = json.loads(server_args.json_model_override_args)
+    try:
+        draft_hf_config = _load_speculative_draft_config(
+            server_args.speculative_draft_model_path,
+            trust_remote_code=server_args.trust_remote_code,
+            revision=server_args.speculative_draft_model_revision,
+            model_override_args=model_override_args,
+        )
+    except Exception as e:
+        draft_config_error = e
+    else:
+        if _is_dspark_draft_config(draft_hf_config):
+            raise ValueError(
+                "The draft checkpoint architecture is DSparkDraftModel, but "
+                "speculative_algorithm=DFLASH was requested. Use "
+                "--speculative-algorithm DSPARK for DSpark draft checkpoints."
+            )
+
     # DFLASH does not use EAGLE-style `num_steps`/`topk`, but those fields still
     # affect generic scheduler/KV-cache accounting (buffer sizing, KV freeing,
     # RoPE reservation). Force them to 1 to avoid surprising memory behavior.
@@ -194,17 +243,10 @@ def _handle_dflash(server_args: ServerArgs) -> None:
             parse_dflash_draft_config,
         )
 
-        model_override_args = json.loads(server_args.json_model_override_args)
         inferred_block_size = None
         try:
-            from sglang.srt.utils.hf_transformers_utils import get_config
-
-            draft_hf_config = get_config(
-                server_args.speculative_draft_model_path,
-                trust_remote_code=server_args.trust_remote_code,
-                revision=server_args.speculative_draft_model_revision,
-                model_override_args=model_override_args,
-            )
+            if draft_config_error is not None:
+                raise draft_config_error
             inferred_block_size = parse_dflash_draft_config(
                 draft_hf_config=draft_hf_config
             ).resolve_block_size(default=None)
@@ -340,9 +382,7 @@ def _handle_dspark(server_args: ServerArgs) -> None:
 
         model_override_args = json.loads(server_args.json_model_override_args)
         try:
-            from sglang.srt.utils.hf_transformers_utils import get_config
-
-            draft_hf_config = get_config(
+            draft_hf_config = _load_speculative_draft_config(
                 server_args.speculative_draft_model_path,
                 trust_remote_code=server_args.trust_remote_code,
                 revision=server_args.speculative_draft_model_revision,
@@ -373,9 +413,7 @@ def _handle_dspark(server_args: ServerArgs) -> None:
         model_override_args = json.loads(server_args.json_model_override_args)
         config_gamma: Optional[int] = None
         try:
-            from sglang.srt.utils.hf_transformers_utils import get_config
-
-            draft_hf_config = get_config(
+            draft_hf_config = _load_speculative_draft_config(
                 server_args.speculative_draft_model_path,
                 trust_remote_code=server_args.trust_remote_code,
                 revision=server_args.speculative_draft_model_revision,
@@ -396,8 +434,8 @@ def _handle_dspark(server_args: ServerArgs) -> None:
             if int(server_args.speculative_num_draft_tokens) != config_verify_window:
                 raise ValueError(
                     "DSpark speculative_num_draft_tokens must equal the draft "
-                    "checkpoint block_size + 1 "
-                    f"(= {config_verify_window} for block_size={config_gamma}), "
+                    "checkpoint gamma + 1 "
+                    f"(= {config_verify_window} for gamma={config_gamma}), "
                     "but got speculative_num_draft_tokens="
                     f"{server_args.speculative_num_draft_tokens}."
                 )

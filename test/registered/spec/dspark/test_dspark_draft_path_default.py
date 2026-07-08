@@ -1,7 +1,9 @@
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from sglang.srt.arg_groups.speculative_hook import (
+    _handle_dflash,
     _handle_dspark,
     _target_checkpoint_bundles_dspark_draft,
 )
@@ -27,6 +29,31 @@ def _bundled_hf_config() -> SimpleNamespace:
 
 def _plain_hf_config() -> SimpleNamespace:
     return SimpleNamespace(architectures=["DeepseekV4ForCausalLM"])
+
+
+def _redhat_glm52_dspark_config() -> SimpleNamespace:
+    return SimpleNamespace(
+        architectures=["DSparkDraftModel"],
+        aux_hidden_state_layer_ids=[8, 23, 39, 55, 70],
+        block_size=8,
+        markov_head_type="vanilla",
+        markov_rank=256,
+        mask_token_id=154856,
+        speculators_config={
+            "default_proposal_method": "greedy",
+            "proposal_methods": [
+                {
+                    "proposal_type": "greedy",
+                    "speculative_tokens": 7,
+                }
+            ],
+        },
+        transformer_layer_config={
+            "hidden_size": 6144,
+            "num_hidden_layers": 5,
+            "vocab_size": 154880,
+        },
+    )
 
 
 def _make_dspark_server_args(
@@ -82,6 +109,72 @@ class TestDsparkDraftPathDefaulting(CustomTestCase):
             server_args.speculative_draft_model_path,
             "deepseek-ai/some-other-dspark-draft",
         )
+
+    def test_external_config_infers_gamma_from_speculators_config(self):
+        server_args = _make_dspark_server_args(
+            model_path=_PLAIN_MODEL_PATH, hf_config=_plain_hf_config()
+        )
+        server_args.speculative_draft_model_path = "RedHatAI/GLM-5.2-speculator.dspark"
+        server_args.speculative_dspark_block_size = None
+
+        with patch(
+            "sglang.srt.arg_groups.speculative_hook._load_speculative_draft_config",
+            return_value=_redhat_glm52_dspark_config(),
+        ):
+            _handle_dspark(server_args)
+
+        self.assertEqual(server_args.speculative_num_draft_tokens, 8)
+
+    def test_explicit_num_draft_tokens_uses_external_config_loader(self):
+        server_args = _make_dspark_server_args(
+            model_path=_PLAIN_MODEL_PATH, hf_config=_plain_hf_config()
+        )
+        server_args.speculative_draft_model_path = "RedHatAI/GLM-5.2-speculator.dspark"
+        server_args.speculative_dspark_block_size = None
+        server_args.speculative_num_draft_tokens = 8
+
+        with patch(
+            "sglang.srt.arg_groups.speculative_hook._load_speculative_draft_config",
+            return_value=_redhat_glm52_dspark_config(),
+        ) as load_config:
+            _handle_dspark(server_args)
+
+        load_config.assert_called_once()
+        self.assertEqual(server_args.speculative_num_draft_tokens, 8)
+
+    def test_explicit_num_draft_tokens_validates_gamma_from_speculators_config(self):
+        server_args = _make_dspark_server_args(
+            model_path=_PLAIN_MODEL_PATH, hf_config=_plain_hf_config()
+        )
+        server_args.speculative_draft_model_path = "RedHatAI/GLM-5.2-speculator.dspark"
+        server_args.speculative_dspark_block_size = None
+        server_args.speculative_num_draft_tokens = 7
+
+        with (
+            patch(
+                "sglang.srt.arg_groups.speculative_hook._load_speculative_draft_config",
+                return_value=_redhat_glm52_dspark_config(),
+            ),
+            self.assertRaisesRegex(ValueError, "gamma \\+ 1"),
+        ):
+            _handle_dspark(server_args)
+
+    def test_dflash_rejects_dspark_draft_checkpoint(self):
+        server_args = _make_dspark_server_args(
+            model_path=_PLAIN_MODEL_PATH, hf_config=_plain_hf_config()
+        )
+        server_args.speculative_algorithm = "DFLASH"
+        server_args.speculative_draft_model_path = "RedHatAI/GLM-5.2-speculator.dspark"
+        server_args.speculative_dspark_block_size = None
+
+        with (
+            patch(
+                "sglang.srt.arg_groups.speculative_hook._load_speculative_draft_config",
+                return_value=_redhat_glm52_dspark_config(),
+            ),
+            self.assertRaisesRegex(ValueError, "Use --speculative-algorithm DSPARK"),
+        ):
+            _handle_dflash(server_args)
 
 
 if __name__ == "__main__":

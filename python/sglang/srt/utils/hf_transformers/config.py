@@ -58,6 +58,11 @@ def _is_legacy_glm_moe_dsa_layer_types_error(error: Exception) -> bool:
     )
 
 
+def is_missing_model_type_error(error: ValueError) -> bool:
+    error_msg = str(error)
+    return "Unrecognized model" in error_msg and "model_type" in error_msg
+
+
 def _load_glm_moe_dsa_config_without_legacy_layer_types(
     model,
     revision: Optional[str] = None,
@@ -307,4 +312,47 @@ def get_config(
             raise RuntimeError(f"Can't get gguf config for {config.model_type}.")
         _set_architectures(config, MODEL_FOR_CAUSAL_LM_MAPPING_NAMES[config.model_type])
 
+    return config
+
+
+def get_config_allow_missing_model_type(
+    model: str,
+    trust_remote_code: bool,
+    revision: Optional[str] = None,
+    model_override_args: Optional[dict] = None,
+    model_config_parser: str = "auto",
+    **kwargs,
+):
+    """Load a config, falling back to a generic config for draft-only checkpoints.
+
+    Some speculative draft checkpoints are intentionally not target models and
+    omit ``model_type`` while still carrying SGLang-readable architecture and
+    draft metadata. ``AutoConfig`` rejects those before SGLang can inspect the
+    metadata, so fall back to a plain ``PretrainedConfig`` only for that exact
+    missing-model-type error.
+    """
+    try:
+        return get_config(
+            model,
+            trust_remote_code=trust_remote_code,
+            revision=revision,
+            model_override_args=model_override_args,
+            model_config_parser=model_config_parser,
+            **kwargs,
+        )
+    except ValueError as exc:
+        if not is_missing_model_type_error(exc):
+            raise
+
+    from transformers import PretrainedConfig
+
+    raw_config_dict, _ = PretrainedConfig.get_config_dict(
+        model,
+        trust_remote_code=trust_remote_code,
+        revision=revision,
+        **kwargs,
+    )
+    config = PretrainedConfig.from_dict(raw_config_dict)
+    if model_override_args:
+        config.update(model_override_args)
     return config

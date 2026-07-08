@@ -36,7 +36,7 @@ from .common import (
     get_sparse_attention_config,
     get_tokenizer_from_processor,
 )
-from .config import get_config
+from .config import get_config, get_config_allow_missing_model_type
 from .processor import get_processor
 from .tokenizer import (
     _fix_added_tokens_encoding,
@@ -53,6 +53,7 @@ __all__ = [
     "check_gguf_file",
     "download_from_hf",
     "get_config",
+    "get_config_allow_missing_model_type",
     "get_context_length",
     "get_generation_config",
     "get_hf_text_config",

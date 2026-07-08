@@ -19,7 +19,7 @@ from sglang.srt.server_args import (
 )
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
-from sglang.srt.utils.hf_transformers_utils import get_config
+from sglang.srt.utils.hf_transformers_utils import get_config_allow_missing_model_type
 
 logger = logging.getLogger(__name__)
 
@@ -51,7 +51,7 @@ def _load_draft_hf_config(*, draft_server_args: ServerArgs) -> Optional[Any]:
     if not draft_model_path:
         return None
     model_override_args = json.loads(draft_server_args.json_model_override_args)
-    return get_config(
+    return get_config_allow_missing_model_type(
         draft_model_path,
         trust_remote_code=draft_server_args.trust_remote_code,
         revision=draft_server_args.speculative_draft_model_revision,

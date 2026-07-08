@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Callable, Iterable, Optional, Tuple
+from typing import Any, Callable, Iterable, Optional, Tuple
 
 import torch
 from torch import nn
@@ -20,6 +20,49 @@ from sglang.srt.speculative.ragged_verify import (
 logger = logging.getLogger(__name__)
 
 StepSampler = Callable[[torch.Tensor, int], torch.Tensor]
+
+
+def _cfg_get(config: Any, key: str, default: Any = None) -> Any:
+    if isinstance(config, dict):
+        return config.get(key, default)
+    return getattr(config, key, default)
+
+
+def _cfg_set(config: Any, key: str, value: Any) -> None:
+    if isinstance(config, dict):
+        config[key] = value
+    else:
+        setattr(config, key, value)
+
+
+def _cfg_items(config: Any):
+    if isinstance(config, dict):
+        return config.items()
+    to_dict = getattr(config, "to_dict", None)
+    if callable(to_dict):
+        return to_dict().items()
+    return vars(config).items()
+
+
+def normalize_dspark_draft_config(config: Any) -> Any:
+    """Expose nested speculator transformer fields as normal draft config attrs."""
+    transformer_cfg = _cfg_get(config, "transformer_layer_config", None)
+    if transformer_cfg is None:
+        return config
+
+    for key, value in _cfg_items(transformer_cfg):
+        if key.startswith("_"):
+            continue
+        if _cfg_get(config, key, None) is None:
+            _cfg_set(config, key, value)
+
+    aux_layer_ids = _cfg_get(config, "aux_hidden_state_layer_ids", None)
+    if _cfg_get(config, "num_target_layers", None) is None and aux_layer_ids is not None:
+        parsed = [int(x) for x in aux_layer_ids]
+        if parsed:
+            _cfg_set(config, "num_target_layers", max(parsed) + 1)
+
+    return config
 
 
 def gather_and_crop_vocab(
@@ -361,6 +404,7 @@ _DSPARK_SKIPPED_WEIGHT_PREFIXES = (
 class DSparkDraftMixin:
 
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:
+        config = normalize_dspark_draft_config(config)
         super().__init__(config=config, quant_config=quant_config, prefix=prefix)
         dspark_config = parse_dspark_draft_config(draft_hf_config=config)
         if not dspark_config.require_markov():
@@ -507,4 +551,4 @@ class Qwen3DSparkModel(DSparkDraftModel):
     pass
 
 
-EntryClass = [Qwen3DSparkModel]
+EntryClass = [Qwen3DSparkModel, DSparkDraftModel]
