@@ -263,6 +263,7 @@ class GroupCoordinator:
         use_pymscclpp: bool,
         use_custom_allreduce: bool,
         use_torch_symm_mem_all_reduce: bool,
+        use_torch_symm_mem_comm: bool,
         use_hpu_communicator: bool,
         use_xpu_communicator: bool,
         use_npu_communicator: bool,
@@ -347,6 +348,7 @@ class GroupCoordinator:
         self.use_pymscclpp = use_pymscclpp
         self.use_custom_allreduce = use_custom_allreduce
         self.use_torch_symm_mem_all_reduce = use_torch_symm_mem_all_reduce
+        self.use_torch_symm_mem_comm = use_torch_symm_mem_comm
         self.use_hpu_communicator = use_hpu_communicator
         self.use_xpu_communicator = use_xpu_communicator
         self.use_npu_communicator = use_npu_communicator
@@ -431,7 +433,10 @@ class GroupCoordinator:
             logger.info("[AR] All-reduce call path: NCCL (custom AR disabled)")
 
         self.torch_symm_mem_comm: Optional[TorchSymmMemCommunicator] = None
-        if self.use_torch_symm_mem_all_reduce and self.world_size > 1:
+        if (
+            self.use_torch_symm_mem_all_reduce
+            or (envs.SGLANG_OPT_USE_TORCH_SYMM_MEM_FUSED_KERNEL.get() and self.use_torch_symm_mem_comm)
+        ) and self.world_size > 1:
             self.torch_symm_mem_comm = TorchSymmMemCommunicator(
                 group=self.cpu_group,
                 device=self.device,
@@ -651,7 +656,7 @@ class GroupCoordinator:
             outplace_all_reduce_method = "pymscclpp"
         elif (
             self.torch_symm_mem_comm is not None
-            and not self.torch_symm_mem_comm.disabled
+            and not self.torch_symm_mem_comm.allreduce_disabled
             and self.torch_symm_mem_comm.should_torch_symm_mem_allreduce(input_)
         ):
             outplace_all_reduce_method = "torch_symm_mem"
@@ -759,7 +764,7 @@ class GroupCoordinator:
             assert not qr_comm.disabled
             out = qr_comm.quick_all_reduce(input_)
         elif outplace_all_reduce_method == "torch_symm_mem":
-            assert not torch_symm_mem_comm.disabled
+            assert not torch_symm_mem_comm.allreduce_disabled
             out = torch_symm_mem_comm.all_reduce(input_)
         elif outplace_all_reduce_method == "pymscclpp":
             assert not pymscclpp_comm.disabled
@@ -776,8 +781,8 @@ class GroupCoordinator:
         if pynccl_comm is not None and not pynccl_comm.disabled:
             pynccl_comm.all_reduce(input_)
         elif (
-            torch_symm_mem_comm is not None
-            and not torch_symm_mem_comm.disabled
+            torch_symm_mem_comm is not None 
+            and not torch_symm_mem_comm.allreduce_disabled
             and torch_symm_mem_comm.should_torch_symm_mem_allreduce(input_)
         ):
             torch_symm_mem_comm.all_reduce(input_, out=input_)
@@ -1630,6 +1635,7 @@ def init_world_group(
         use_pymscclpp=False,
         use_custom_allreduce=False,
         use_torch_symm_mem_all_reduce=False,
+        use_torch_symm_mem_comm=False,
         use_hpu_communicator=False,
         use_xpu_communicator=False,
         use_npu_communicator=False,
@@ -1648,6 +1654,7 @@ def init_model_parallel_group(
     group_name: Optional[str] = None,
     use_mscclpp_allreduce: Optional[bool] = None,
     use_torch_symm_mem_allreduce: Optional[bool] = None,
+    use_torch_symm_mem_comm: Optional[bool] = None,
     recovered_rank: bool = False,
 ) -> GroupCoordinator:
     if use_custom_allreduce is None:
@@ -1656,6 +1663,8 @@ def init_model_parallel_group(
         use_mscclpp_allreduce = _ENABLE_MSCCLPP_ALL_REDUCE
     if use_torch_symm_mem_allreduce is None:
         use_torch_symm_mem_allreduce = _ENABLE_TORCH_SYMM_MEM_ALL_REDUCE
+    if use_torch_symm_mem_comm is None:
+        use_torch_symm_mem_comm = _ENABLE_TORCH_SYMM_MEM_COMM
     return GroupCoordinator(
         group_ranks=group_ranks,
         local_rank=local_rank,
@@ -1668,6 +1677,7 @@ def init_model_parallel_group(
         use_pymscclpp=use_mscclpp_allreduce,
         use_custom_allreduce=use_custom_allreduce,
         use_torch_symm_mem_all_reduce=use_torch_symm_mem_allreduce,
+        use_torch_symm_mem_comm=use_torch_symm_mem_comm,
         use_hpu_communicator=True,
         use_xpu_communicator=True,
         use_npu_communicator=True,
@@ -1806,6 +1816,7 @@ logger = logging.getLogger(__name__)
 _ENABLE_CUSTOM_ALL_REDUCE = True
 _ENABLE_MSCCLPP_ALL_REDUCE = False
 _ENABLE_TORCH_SYMM_MEM_ALL_REDUCE = False
+_ENABLE_TORCH_SYMM_MEM_COMM = False
 
 
 def set_custom_all_reduce(enable: bool):
@@ -2088,6 +2099,7 @@ def initialize_model_parallel(
         use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
         group_name="tp",
         recovered_rank=recovered_rank,
+        use_torch_symm_mem_comm=True,
     )
 
     if duplicate_tp_group:
@@ -2164,6 +2176,7 @@ def initialize_model_parallel(
             use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
             group_name="attn_cp",
             recovered_rank=recovered_rank,
+            use_torch_symm_mem_comm=True,
         )
 
     from sglang.srt.layers.sampler import SYNC_TOKEN_IDS_ACROSS_TP
