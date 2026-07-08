@@ -655,15 +655,21 @@ class SchedulerDisaggregationPrefillMixin:
                         req_hidden = logits_output.hidden_states[
                             offset : offset + extend_len
                         ]
-                        copy_len = min(tail_len, extend_len)
+                        if extend_len > tail_len:
+                            raise RuntimeError(
+                                "DSpark PD prefill hidden buffer is too small: "
+                                f"extend_len={extend_len}, capacity={tail_len}. "
+                                "Increase SGLANG_DSPARK_PD_PREFILL_TOKENS."
+                            )
+                        copy_len = extend_len
                         tail_hidden = req_hidden.new_zeros(
                             (tail_len, req_hidden.shape[-1])
                         )
                         tail_mask = torch.zeros(
                             (tail_len,), dtype=torch.bool, device=req_hidden.device
                         )
-                        tail_hidden[-copy_len:].copy_(req_hidden[-copy_len:])
-                        tail_mask[-copy_len:] = True
+                        tail_hidden[:copy_len].copy_(req_hidden)
+                        tail_mask[:copy_len] = True
                         req.prefill_tail_hidden_states_tensor = (
                             tail_hidden.cpu().clone()
                         )

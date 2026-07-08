@@ -429,11 +429,11 @@ class MetadataBuffers:
                 )
                 if tail_len > 0:
                     self.output_dspark_prefill_tail_hidden_states[
-                        req.metadata_buffer_index, -tail_len:
-                    ].copy_(tail_hidden[-tail_len:])
+                        req.metadata_buffer_index, :tail_len
+                    ].copy_(tail_hidden[:tail_len])
                     self.output_dspark_prefill_tail_valid_mask[
-                        req.metadata_buffer_index, -tail_len:
-                    ].copy_(tail_mask[-tail_len:])
+                        req.metadata_buffer_index, :tail_len
+                    ].copy_(tail_mask[:tail_len])
         # Store bootstrap_room for validation on decode side
         self.bootstrap_room[req.metadata_buffer_index, 0] = (
             req.bootstrap_room if req.bootstrap_room is not None else 0
