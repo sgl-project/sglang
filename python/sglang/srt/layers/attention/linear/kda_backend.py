@@ -235,17 +235,14 @@ class KDAAttnBackend(MambaAttnBackendBase):
             self.req_to_token_pool.size, dtype=torch.int32, device=model_runner.device
         )
 
-    def init_forward_metadata(self, forward_batch: ForwardBatch):
-        super().init_forward_metadata(forward_batch)
-        if self.forward_metadata.has_mamba_track_mask:
-            self.forward_metadata.mamba_track_mask_indices = (
-                forward_batch.mamba_track_mask.nonzero(as_tuple=True)[0]
-            )
-            self.forward_metadata.conv_states_mask_indices = (
-                forward_batch.mamba_track_indices[
-                    self.forward_metadata.mamba_track_mask_indices
-                ]
-            )
+    # NOTE: The GDN backend overrides init_forward_metadata here to precompute
+    # mamba_track_mask_indices / conv_states_mask_indices for its extra_buffer
+    # prefix-cache track path. KDA + extra_buffer is out of scope for this PR
+    # (KDA runs no_buffer only; the whitelist rejects extra_buffer for
+    # KimiLinearForCausalLM), and nothing in this backend consumes those indices,
+    # so we intentionally do NOT add that override — it would only cost a
+    # `.nonzero()` device sync per tracked extend batch with no effect. The KDA
+    # extra_buffer track path is tracked in #30243.
 
     def forward_decode(
         self,
@@ -344,6 +341,12 @@ class KDAAttnBackend(MambaAttnBackendBase):
             query_start_loc=query_start_loc,
         )
 
+        # extra_buffer prefix-cache state tracking. This is a no-op on the
+        # merge-relevant KDA path: on CUDA the packed_decode branch above returns
+        # early (supports_packed_decode is True), and under no_buffer
+        # forward_batch.mamba_track_mask is None so the call short-circuits. Only
+        # the CPU/NPU non-packed fallback reaches here; the KDA extra_buffer track
+        # path is tracked in #30243.
         self._track_mamba_state_decode(
             forward_batch, conv_states, ssm_states, cache_indices
         )

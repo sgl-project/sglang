@@ -1,6 +1,6 @@
 """Engine-level integration test for KDA speculative decoding path.
 
-Launches server with KDA model + extra_buffer, sends requests,
+Launches server with KDA model + no_buffer, sends requests,
 and verifies the forward path works correctly. Without a draft model,
 this verifies no regression in normal decode/extend paths after adding
 target_verify code.
@@ -10,7 +10,7 @@ Usage:
     python -m sglang.launch_server \
         --model-path /path/to/Kimi-Linear-48B-A3B-Instruct \
         --tp 2 --trust-remote-code \
-        --mamba-scheduler-strategy extra_buffer
+        --mamba-scheduler-strategy no_buffer
 
     # Then run this test:
     python test/manual/test_kda_spec_integration.py
