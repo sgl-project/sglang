@@ -7,8 +7,11 @@ TARGET_MODEL="${TARGET_MODEL:-Qwen/Qwen3.6-27B}"
 TARGET_REV="${TARGET_REV:-6a9e13bd6fc8f0983b9b99948120bc37f49c13e9}"
 DFLASH_MODEL="${DFLASH_MODEL:-z-lab/Qwen3.6-27B-DFlash}"
 DFLASH_REV="${DFLASH_REV:-0919688658996800f86b895034249700e9481106}"
+WEAVER_REPO="${WEAVER_REPO:-trymirai/weaver}"
 WEAVER_REV="${WEAVER_REV:-309ceb4b1a6c44e6a3dfaeab8db1547e904254f8}"
+WEAVER_FILE="${WEAVER_FILE:-weaver/qwen36_27b_weaver.pth}"
 WEAVER_CKPT="${WEAVER_CKPT:-/artifacts/weaver/weaver/qwen36_27b_weaver.pth}"
+WEAVER_SHA256="${WEAVER_SHA256:-71f540b143fb6bab14ba724c20e97a72ce198de103cfd228d31c3ce339227833}"
 
 PORT="${PORT:-30000}"
 BASE_URL="${BASE_URL:-http://127.0.0.1:${PORT}}"
@@ -23,6 +26,9 @@ Usage:
   sh reproduction.sh serve-dflash
   sh reproduction.sh serve-tfm
       Launch one serving configuration on the selected PORT (default 30000).
+
+  sh reproduction.sh download
+      Download and verify the Weaver checkpoint used by DFlash-TfM.
 
   sh reproduction.sh bench
       Run the benchmark harness against BASE_URL (default http://127.0.0.1:\$PORT).
@@ -44,7 +50,7 @@ need() {
 export_common_env() {
   export TARGET_MODEL TARGET_REV
   export DFLASH_MODEL DFLASH_REV
-  export WEAVER_REV WEAVER_CKPT
+  export WEAVER_REPO WEAVER_REV WEAVER_FILE WEAVER_CKPT WEAVER_SHA256
   export PORT BASE_URL
 }
 
@@ -71,8 +77,11 @@ cmd_exec() {
     -e TARGET_REV="$TARGET_REV" \
     -e DFLASH_MODEL="$DFLASH_MODEL" \
     -e DFLASH_REV="$DFLASH_REV" \
+    -e WEAVER_REPO="$WEAVER_REPO" \
     -e WEAVER_REV="$WEAVER_REV" \
+    -e WEAVER_FILE="$WEAVER_FILE" \
     -e WEAVER_CKPT="$WEAVER_CKPT" \
+    -e WEAVER_SHA256="$WEAVER_SHA256" \
     -e PORT="$PORT" \
     -e BASE_URL="$BASE_URL" \
     --ipc=host --network=host --privileged \
@@ -88,6 +97,7 @@ run_in_container() {
       serve-ar) cmd_serve_ar "$@" ;;
       serve-dflash) cmd_serve_dflash "$@" ;;
       serve-tfm) cmd_serve_tfm "$@" ;;
+      download) cmd_download "$@" ;;
       bench) cmd_bench "$@" ;;
       *)
         echo "error: unknown in-container command: $subcommand" >&2
@@ -140,8 +150,35 @@ cmd_serve_dflash() {
     --port "$PORT"
 }
 
+ensure_weaver_checkpoint() {
+  need hf
+  need sha256sum
+  mkdir -p /artifacts/weaver
+  if [ ! -f "$WEAVER_CKPT" ]; then
+    hf download "$WEAVER_REPO" \
+      "$WEAVER_FILE" \
+      --revision "$WEAVER_REV" \
+      --local-dir /artifacts/weaver
+  fi
+  actual_sha256="$(sha256sum "$WEAVER_CKPT" | awk '{print $1}')"
+  if [ "$actual_sha256" != "$WEAVER_SHA256" ]; then
+    echo "error: Weaver checkpoint hash mismatch" >&2
+    echo "  path: $WEAVER_CKPT" >&2
+    echo "  expected: $WEAVER_SHA256" >&2
+    echo "  actual:   $actual_sha256" >&2
+    exit 1
+  fi
+}
+
+cmd_download() {
+  export_common_env
+  ensure_weaver_checkpoint
+  echo "Weaver checkpoint is ready: $WEAVER_CKPT"
+}
+
 cmd_serve_tfm() {
   export_common_env
+  ensure_weaver_checkpoint
   python3 -m sglang.launch_server \
     --model-path "$TARGET_MODEL" \
     --revision "$TARGET_REV" \
@@ -189,6 +226,7 @@ case "$command" in
   serve-ar) run_in_container serve-ar "$@" ;;
   serve-dflash) run_in_container serve-dflash "$@" ;;
   serve-tfm) run_in_container serve-tfm "$@" ;;
+  download) run_in_container download "$@" ;;
   bench) run_in_container bench "$@" ;;
   ""|-h|--help|help) usage ;;
   *)
