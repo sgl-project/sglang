@@ -171,7 +171,11 @@ class RMSNorm(CustomOp):
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         if _is_cpu_amx_available:
+            if not x.is_contiguous():
+                x = x.contiguous()
             if residual is not None:
+                if not residual.is_contiguous():
+                    residual = residual.contiguous()
                 torch.ops.sgl_kernel.fused_add_rmsnorm_cpu(
                     x, residual, self.weight.data, self.variance_epsilon
                 )

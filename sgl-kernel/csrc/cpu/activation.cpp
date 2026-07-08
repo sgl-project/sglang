@@ -259,7 +259,7 @@ at::Tensor fused_sigmoid_mul_cpu(at::Tensor& input, const at::Tensor& gate, bool
 }
 
 at::Tensor quick_gelu_cpu(const at::Tensor& input) {
-  auto sizes = input.sizes().vec();
+  CHECK_CONTIGUOUS(input);
   int64_t dim = input.size(-1);
   int64_t num_tokens = input.numel() / dim;
   at::Tensor out = at::empty_like(input);
@@ -278,6 +278,7 @@ at::Tensor quick_gelu_cpu(const at::Tensor& input) {
   return out;
 }
 at::Tensor new_gelu_cpu(const at::Tensor& input) {
+  CHECK_CONTIGUOUS(input);
   int64_t dim = input.size(-1);
   int64_t num_tokens = input.numel() / dim;
   at::Tensor out = at::empty_like(input);
