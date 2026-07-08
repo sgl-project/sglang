@@ -39,7 +39,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     compute_position,
 )
 from sglang.srt.model_executor.forward_context import get_attn_backend
-from sglang.srt.runtime_context import get_flags, get_parallel
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import BumpAllocator, empty_context, get_bool_env_var, is_hip
@@ -634,7 +634,7 @@ class TboForwardBatchPreparer:
             sum_field=None,
         )
         _, child_b.extend_start_loc = compute_position(
-            get_flags().attn.backend,
+            get_server_args().attention_backend,
             child_b.extend_prefix_lens,
             child_b.extend_seq_lens,
             child_b.extend_num_tokens,
@@ -737,7 +737,7 @@ class TboForwardBatchPreparer:
             "split_index",  # for split prefill
             "orig_seq_lens",  # only used by qwen-1m, thus not care
             "return_pooled_hidden_states",
-            "reuse_mtp_topk_indices",  # forward-level flag, inherited by both child batches
+            "reuse_dsa_topk_indices",  # forward-level flag, inherited by both child batches
         ]:
             output_dict[key] = getattr(batch, key)
 

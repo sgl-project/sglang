@@ -30,7 +30,7 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.qwen3_next import Qwen3NextForCausalLM, Qwen3NextModel
-from sglang.srt.runtime_context import get_flags, get_parallel
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, is_npu
 
@@ -82,7 +82,7 @@ class Qwen3NextForCausalLMMTP(Qwen3NextForCausalLM):
             config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("model.shared_head.head", prefix),
-            use_attn_tp_group=get_flags().enable_dp_lm_head,
+            use_attn_tp_group=get_server_args().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
         # Mirror Qwen3NextForCausalLM.__init__'s shared-expert fusion setup so
