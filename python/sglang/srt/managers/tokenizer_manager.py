@@ -1918,15 +1918,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     recv_obj,
                     i,
                 )
-            if getattr(state.obj, "return_sampling_mask", False):
-                output_sampling_mask = getattr(
-                    recv_obj, "output_token_sampling_mask", None
-                )
+            if (
+                isinstance(state.obj, GenerateReqInput)
+                and state.obj.return_sampling_mask
+            ):
+                output_sampling_mask = recv_obj.output_token_sampling_mask
                 if output_sampling_mask is not None:
                     state.output_token_sampling_mask.extend(output_sampling_mask[i])
-                    output_sampling_logprobs = getattr(
-                        recv_obj, "output_token_sampling_logprobs", None
-                    )
+                    output_sampling_logprobs = recv_obj.output_token_sampling_logprobs
                     if output_sampling_logprobs is not None:
                         state.output_token_sampling_logprobs.extend(
                             output_sampling_logprobs[i]

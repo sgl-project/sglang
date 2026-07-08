@@ -1,3 +1,4 @@
+import math
 import unittest
 
 import requests
@@ -44,16 +45,22 @@ class SamplingMaskTestMixin:
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
 
-    def _post_generate(self, sampling_params, return_sampling_mask=True):
-        return requests.post(
-            self.base_url + "/generate",
-            json={
-                "text": "The capital of France is",
-                "sampling_params": sampling_params,
-                "return_sampling_mask": return_sampling_mask,
-            },
-            timeout=60,
-        )
+    def _post_generate(
+        self,
+        sampling_params,
+        return_sampling_mask=True,
+        return_logprob=False,
+        top_logprobs_num=0,
+    ):
+        payload = {
+            "text": "The capital of France is",
+            "sampling_params": sampling_params,
+            "return_sampling_mask": return_sampling_mask,
+        }
+        if return_logprob:
+            payload["return_logprob"] = True
+            payload["top_logprobs_num"] = top_logprobs_num
+        return requests.post(self.base_url + "/generate", json=payload, timeout=60)
 
     def _generate_sampling_masks(self, sampling_params):
         response = self._post_generate(sampling_params)
@@ -70,6 +77,8 @@ class SamplingMaskTestMixin:
             meta_info["output_token_sampling_mask_length"], len(output_ids)
         )
         self.assertEqual(len(sampling_masks), len(output_ids))
+        for output_id, sampling_mask in zip(output_ids, sampling_masks):
+            self.assertIn(output_id, sampling_mask)
         return sampling_masks
 
     def _assert_rejects_unbounded_sampling_mask(self, sampling_params):
@@ -118,6 +127,65 @@ class TestSamplingMask(SamplingMaskTestMixin, CustomTestCase):
         )
         for sampling_mask in top_k_top_p_one_sampling_masks:
             self.assertEqual(len(sampling_mask), _TOP_K)
+
+    def test_sampling_mask_matches_topk_logprobs(self):
+        """Check the returned mask and its renormalized logprobs.
+
+        We get the per-token full-vocab logprobs via ``return_logprob`` with
+        ``top_logprobs_num == top_k``, which covers every token the mask can
+        contain. With ``temperature=1.0`` these are the sampler's distribution,
+        so ``p = exp(logprob)`` are the exact probabilities. For each token, we check:
+
+        1. the returned mask matches the nucleus reconstructed from those probs,
+        2. sampling_logprob == log(p[sampled] / sum(p[t] for t in mask)).
+        """
+        top_k, top_p = _TOP_K, _TOP_P
+        response = self._post_generate(
+            {
+                "temperature": 1.0,
+                "top_k": top_k,
+                "top_p": top_p,
+                "max_new_tokens": _MAX_NEW_TOKENS,
+                "ignore_eos": True,
+            },
+            return_logprob=True,
+            top_logprobs_num=top_k,
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+
+        output = response.json()
+        meta_info = output["meta_info"]
+        output_ids = output["output_ids"]
+        sampling_masks = meta_info["output_token_sampling_mask"]
+        sampling_logprobs = meta_info["output_token_sampling_logprobs"]
+        top_logprobs = meta_info["output_top_logprobs"]  # [logprob, id, text] per token
+
+        self.assertEqual(len(sampling_masks), len(output_ids))
+        self.assertEqual(len(sampling_logprobs), len(output_ids))
+        self.assertEqual(len(top_logprobs), len(output_ids))
+
+        for output_id, mask, mask_logprob, step_top_logprobs in zip(
+            output_ids, sampling_masks, sampling_logprobs, top_logprobs
+        ):
+            probs = {
+                int(tid): math.exp(logprob) for logprob, tid, _ in step_top_logprobs
+            }
+
+            reconstructed = []
+            mass_before = 0.0
+            for logprob, tid, _ in step_top_logprobs:
+                if mass_before <= top_p:
+                    reconstructed.append(int(tid))
+                mass_before += math.exp(logprob)
+            if output_id not in reconstructed:
+                reconstructed.append(output_id)
+            # ``<= 1``: fp32 (server) and fp64 (here) cumsums may split on the
+            # single token straddling the top_p cut.
+            self.assertLessEqual(len(set(mask) ^ set(reconstructed)), 1)
+
+            support_mass = sum(probs[tid] for tid in mask)
+            expected_logprob = math.log(probs[output_id] / support_mass)
+            self.assertAlmostEqual(mask_logprob, expected_logprob, delta=1e-2)
 
     def test_generate_rejects_unbounded_sampling_mask(self):
         self._assert_rejects_unbounded_sampling_mask(

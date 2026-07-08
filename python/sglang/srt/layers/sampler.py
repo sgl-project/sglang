@@ -115,7 +115,6 @@ class Sampler(nn.Module):
         # Preprocess logits (custom processors and NaN handling)
         logits = self._preprocess_logits(logits, sampling_info)
         return_sampling_mask = any(sampling_info.return_sampling_masks or [])
-        sampling_mask_data = None
 
         if sampling_info.is_all_greedy:
             if _use_aiter and not _disable_aiter_greedy_sample:
@@ -193,7 +192,7 @@ class Sampler(nn.Module):
                 batch_next_token_ids = self._sample_from_probs(
                     probs, sampling_info, positions, simple_sampling_case
                 )
-                if sampling_mask_data is not None:
+                if return_sampling_mask:
                     self._attach_sampling_mask_to_output(
                         logits_output,
                         sampling_info,
@@ -282,7 +281,7 @@ class Sampler(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Return sorted token ids, sorted probs, keep mask, and raw probs."""
         vocab_size = probs.shape[-1]
-        max_top_k = int(sampling_info.top_ks.max().item())
+        max_top_k = sampling_info.sampling_mask_max_top_k
         if 0 < max_top_k < vocab_size:
             probs_sort, probs_idx = torch.topk(
                 probs,
