@@ -19,7 +19,6 @@ from typing import Any
 import torch
 import torch.nn as nn
 
-from sglang.jit_kernel.nvfp4 import prewarm_nvfp4_jit_modules
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType, STA_Mode
 from sglang.multimodal_gen.configs.pipeline_configs.flux import (
@@ -394,13 +393,6 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             compile_kwargs = build_torch_compile_kwargs(mode=mode)
             logger.info(f"Compiling transformer with mode: {mode}")
 
-        if self._needs_nvfp4_jit_prewarm(module):
-            logger.info(
-                "Prewarming NVFP4 JIT modules before torch.compile to avoid "
-                "Dynamo tracing JIT initialization."
-            )
-            prewarm_nvfp4_jit_modules()
-
         # TODO(triple-mu): support customized fullgraph and dynamic in the future
         self._torch_compile_registry.compile_once(
             module,
@@ -414,16 +406,6 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         self._maybe_enable_cache_dit(num_inference_steps, batch)
         for transformer in filter(None, [self.transformer, self.transformer_2]):
             self._maybe_torch_compile(transformer)
-
-    @staticmethod
-    def _needs_nvfp4_jit_prewarm(module: nn.Module) -> bool:
-        for submodule in module.modules():
-            quant_method = getattr(submodule, "quant_method", None)
-            if quant_method is None:
-                continue
-            if type(quant_method).__name__ == "ModelOptFp4LinearMethod":
-                return True
-        return False
 
     def _cache_dit_dual_model_name(self) -> str:
         return "wan2.2"
