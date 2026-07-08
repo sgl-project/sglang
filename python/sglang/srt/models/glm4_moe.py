@@ -80,10 +80,14 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
 from sglang.srt.models.deepseek_nextn import DeepseekV3ForCausalLMNextN
+from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
 from sglang.srt.models.utils import WeightsMapper, apply_qk_norm
-from sglang.srt.runtime_context import get_flags, get_parallel, get_server_args, get_stream
+from sglang.srt.runtime_context import (
+    get_parallel,
+    get_server_args,
+    get_stream,
+)
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     add_prefix,
@@ -1547,6 +1551,7 @@ class GlmMoeDsaForCausalLMNextN(DeepseekV3ForCausalLMNextN):
             names.add("model.decoder.mlp.experts")
 
         import copy
+
         quant_config = copy.copy(quant_config)
         quant_config.exclude_layers = list(names)
         return quant_config
