@@ -24,8 +24,8 @@ use crate::fsm::RequestState;
 use crate::ids::{RequestId, RequestIdGen};
 
 use crate::message::{
-    ChunkEvent, ControlRequest, EgressItem, EgressSink, GenerateBody, GenerateRequest, Request,
-    RequestKind,
+    ChunkEvent, ChunkExtras, ControlRequest, EgressItem, EgressSink, GenerateBody, GenerateRequest,
+    Request, RequestKind,
 };
 use crate::runtime::ServerArgs;
 use crate::runtime::channels::{Senders, TmEvent};
@@ -337,53 +337,57 @@ fn sglang_frame_value(out: &ChunkEvent, rid: &str) -> serde_json::Value {
             "finish_reason": out.finish_reason,
         },
     });
-    // Logprobs: `[logprob, token_id, text|null]` tuples. Text (`return_text_in_logprobs`)
-    // was decoded on the detok shard into `*_txt`; empty → null slot.
     if !out.token_ids.is_empty() {
         v["output_ids"] = serde_json::json!(out.token_ids);
     }
-    if !out.out_lp_val.is_empty() {
+    // Logprobs + hidden states ride behind the boxed extras (absent for a plain
+    // token/text frame). `[logprob, token_id, text|null]` tuples; text
+    // (`return_text_in_logprobs`) was decoded on the detok shard into `*_txt`.
+    let Some(ex) = out.extras.as_deref() else {
+        return v;
+    };
+    if !ex.out_lp_val.is_empty() {
         v["meta_info"]["output_token_logprobs"] =
-            logprob_tuples(&out.out_lp_val, &out.out_lp_idx, opt_texts(&out.out_lp_txt));
+            logprob_tuples(&ex.out_lp_val, &ex.out_lp_idx, opt_texts(&ex.out_lp_txt));
     }
-    if !out.in_lp_val.is_empty() {
+    if !ex.in_lp_val.is_empty() {
         v["meta_info"]["input_token_logprobs"] =
-            logprob_tuples(&out.in_lp_val, &out.in_lp_idx, opt_texts(&out.in_lp_txt));
+            logprob_tuples(&ex.in_lp_val, &ex.in_lp_idx, opt_texts(&ex.in_lp_txt));
     }
-    if !out.out_top_lens.is_empty() {
+    if !ex.out_top_lens.is_empty() {
         v["meta_info"]["output_top_logprobs"] = ragged_logprob_tuples(
-            &out.out_top_val,
-            &out.out_top_idx,
-            &out.out_top_lens,
-            opt_texts(&out.out_top_txt),
+            &ex.out_top_val,
+            &ex.out_top_idx,
+            &ex.out_top_lens,
+            opt_texts(&ex.out_top_txt),
         );
     }
-    if !out.in_top_lens.is_empty() {
+    if !ex.in_top_lens.is_empty() {
         v["meta_info"]["input_top_logprobs"] = ragged_logprob_tuples(
-            &out.in_top_val,
-            &out.in_top_idx,
-            &out.in_top_lens,
-            opt_texts(&out.in_top_txt),
+            &ex.in_top_val,
+            &ex.in_top_idx,
+            &ex.in_top_lens,
+            opt_texts(&ex.in_top_txt),
         );
     }
-    if !out.out_tid_lens.is_empty() {
+    if !ex.out_tid_lens.is_empty() {
         v["meta_info"]["output_token_ids_logprobs"] = ragged_logprob_tuples(
-            &out.out_tid_val,
-            &out.out_tid_idx,
-            &out.out_tid_lens,
-            opt_texts(&out.out_tid_txt),
+            &ex.out_tid_val,
+            &ex.out_tid_idx,
+            &ex.out_tid_lens,
+            opt_texts(&ex.out_tid_txt),
         );
     }
-    if !out.in_tid_lens.is_empty() {
+    if !ex.in_tid_lens.is_empty() {
         v["meta_info"]["input_token_ids_logprobs"] = ragged_logprob_tuples(
-            &out.in_tid_val,
-            &out.in_tid_idx,
-            &out.in_tid_lens,
-            opt_texts(&out.in_tid_txt),
+            &ex.in_tid_val,
+            &ex.in_tid_idx,
+            &ex.in_tid_lens,
+            opt_texts(&ex.in_tid_txt),
         );
     }
-    if !out.hidden_lens.is_empty() {
-        v["meta_info"]["hidden_states"] = hidden_states_rows(&out.hidden_val, &out.hidden_lens);
+    if !ex.hidden_lens.is_empty() {
+        v["meta_info"]["hidden_states"] = hidden_states_rows(&ex.hidden_val, &ex.hidden_lens);
     }
     v
 }
@@ -611,42 +615,50 @@ impl OutputAccumulator {
         o.token_ids.extend_from_slice(&d.token_ids); // token_ids doubles as output_ids
         o.completion_tokens += d.completion_tokens;
         o.prompt_tokens = d.prompt_tokens; // constant across the request
-        o.out_lp_val.extend_from_slice(&d.out_lp_val);
-        o.out_lp_idx.extend_from_slice(&d.out_lp_idx);
-        o.out_top_val.extend_from_slice(&d.out_top_val);
-        o.out_top_idx.extend_from_slice(&d.out_top_idx);
-        o.out_top_lens.extend_from_slice(&d.out_top_lens);
-        o.out_tid_val.extend_from_slice(&d.out_tid_val);
-        o.out_tid_idx.extend_from_slice(&d.out_tid_idx);
-        o.out_tid_lens.extend_from_slice(&d.out_tid_lens);
-        o.out_lp_txt.extend_from_slice(&d.out_lp_txt);
-        o.out_top_txt.extend_from_slice(&d.out_top_txt);
-        o.out_tid_txt.extend_from_slice(&d.out_tid_txt);
-        if !d.in_lp_val.is_empty() {
-            o.in_lp_val = d.in_lp_val.clone();
-            o.in_lp_idx = d.in_lp_idx.clone();
-            o.in_lp_txt = d.in_lp_txt.clone();
-        }
-        // Input families ride once (prefill); `lens` non-empty marks their arrival.
-        if !d.in_top_lens.is_empty() {
-            o.in_top_val = d.in_top_val.clone();
-            o.in_top_idx = d.in_top_idx.clone();
-            o.in_top_lens = d.in_top_lens.clone();
-            o.in_top_txt = d.in_top_txt.clone();
-        }
-        if !d.in_tid_lens.is_empty() {
-            o.in_tid_val = d.in_tid_val.clone();
-            o.in_tid_idx = d.in_tid_idx.clone();
-            o.in_tid_lens = d.in_tid_lens.clone();
-            o.in_tid_txt = d.in_tid_txt.clone();
-        }
-        // Hidden states are non-cumulative: the latest non-empty set wins.
-        if !d.hidden_lens.is_empty() {
-            o.hidden_val = d.hidden_val.clone();
-            o.hidden_lens = d.hidden_lens.clone();
-        }
         if d.finish_reason.is_some() {
             o.finish_reason = d.finish_reason.clone();
+        }
+        // Logprobs/hidden ride behind the boxed extras — most frames have none, so
+        // only allocate the accumulator's box once a delta actually carries some.
+        let Some(de) = d.extras.as_deref() else {
+            return;
+        };
+        let oe = o
+            .extras
+            .get_or_insert_with(|| Box::new(ChunkExtras::default()));
+        oe.out_lp_val.extend_from_slice(&de.out_lp_val);
+        oe.out_lp_idx.extend_from_slice(&de.out_lp_idx);
+        oe.out_top_val.extend_from_slice(&de.out_top_val);
+        oe.out_top_idx.extend_from_slice(&de.out_top_idx);
+        oe.out_top_lens.extend_from_slice(&de.out_top_lens);
+        oe.out_tid_val.extend_from_slice(&de.out_tid_val);
+        oe.out_tid_idx.extend_from_slice(&de.out_tid_idx);
+        oe.out_tid_lens.extend_from_slice(&de.out_tid_lens);
+        oe.out_lp_txt.extend_from_slice(&de.out_lp_txt);
+        oe.out_top_txt.extend_from_slice(&de.out_top_txt);
+        oe.out_tid_txt.extend_from_slice(&de.out_tid_txt);
+        if !de.in_lp_val.is_empty() {
+            oe.in_lp_val = de.in_lp_val.clone();
+            oe.in_lp_idx = de.in_lp_idx.clone();
+            oe.in_lp_txt = de.in_lp_txt.clone();
+        }
+        // Input families ride once (prefill); `lens` non-empty marks their arrival.
+        if !de.in_top_lens.is_empty() {
+            oe.in_top_val = de.in_top_val.clone();
+            oe.in_top_idx = de.in_top_idx.clone();
+            oe.in_top_lens = de.in_top_lens.clone();
+            oe.in_top_txt = de.in_top_txt.clone();
+        }
+        if !de.in_tid_lens.is_empty() {
+            oe.in_tid_val = de.in_tid_val.clone();
+            oe.in_tid_idx = de.in_tid_idx.clone();
+            oe.in_tid_lens = de.in_tid_lens.clone();
+            oe.in_tid_txt = de.in_tid_txt.clone();
+        }
+        // Hidden states are non-cumulative: the latest non-empty set wins.
+        if !de.hidden_lens.is_empty() {
+            oe.hidden_val = de.hidden_val.clone();
+            oe.hidden_lens = de.hidden_lens.clone();
         }
     }
 
@@ -957,9 +969,12 @@ mod tests {
     #[test]
     fn prompt_logprob_frame_emits_null_first() {
         let out = ChunkEvent {
-            in_lp_val: vec![f32::NAN, -0.5],
-            in_lp_idx: vec![10, 20],
-            in_lp_txt: vec!["<s>".into(), "hi".into()],
+            extras: Some(Box::new(ChunkExtras {
+                in_lp_val: vec![f32::NAN, -0.5],
+                in_lp_idx: vec![10, 20],
+                in_lp_txt: vec!["<s>".into(), "hi".into()],
+                ..Default::default()
+            })),
             ..Default::default()
         };
         let frame = sglang_frame_value(&out, "1");
