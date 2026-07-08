@@ -77,10 +77,13 @@ def _get_text_config(config: Any) -> Any:
     if config is None:
         return None
     if isinstance(config, dict):
-        return config.get("text_config", config)
+        return config.get("text_config", config.get("transformer_layer_config", config))
     text_config = getattr(config, "text_config", None)
     if text_config is not None:
         return text_config
+    transformer_layer_config = getattr(config, "transformer_layer_config", None)
+    if transformer_layer_config is not None:
+        return transformer_layer_config
     return config
 
 
@@ -94,6 +97,33 @@ def _get_dspark_config(config: Any) -> dict:
         return dict(cfg)
     except Exception:
         return {}
+
+
+def _get_speculators_config(config: Any) -> dict:
+    cfg = _cfg_get(config, "speculators_config", None)
+    if cfg is None:
+        return {}
+    if isinstance(cfg, dict):
+        return cfg
+    try:
+        return dict(cfg)
+    except Exception:
+        return {}
+
+
+def _get_speculators_greedy_tokens(config: Any) -> Optional[int]:
+    cfg = _get_speculators_config(config)
+    proposal_methods = cfg.get("proposal_methods", None)
+    if not isinstance(proposal_methods, (list, tuple)):
+        return None
+    for method in proposal_methods:
+        proposal_type = _cfg_get(method, "proposal_type", None)
+        if proposal_type is not None and str(proposal_type).lower() != "greedy":
+            continue
+        speculative_tokens = _cfg_get(method, "speculative_tokens", None)
+        if speculative_tokens is not None:
+            return int(speculative_tokens)
+    return None
 
 
 def parse_dspark_draft_config(*, draft_hf_config: Any) -> DSparkDraftConfig:
@@ -177,9 +207,13 @@ def parse_dspark_draft_config(*, draft_hf_config: Any) -> DSparkDraftConfig:
             f"DSpark mask_token_id must be non-negative, got {mask_token_id}."
         )
 
-    gamma = (
-        int(prefixed_block_size) if prefixed_block_size is not None else base.block_size
-    )
+    speculators_gamma = _get_speculators_greedy_tokens(draft_hf_config)
+    if prefixed_block_size is not None:
+        gamma = int(prefixed_block_size)
+    elif speculators_gamma is not None:
+        gamma = speculators_gamma
+    else:
+        gamma = base.block_size
 
     if prefixed_target_layer_ids is not None:
         if not isinstance(prefixed_target_layer_ids, (list, tuple)) or not len(

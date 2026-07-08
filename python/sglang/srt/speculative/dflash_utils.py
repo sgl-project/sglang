@@ -352,10 +352,13 @@ def _get_text_config(config: Any) -> Any:
     if config is None:
         return None
     if isinstance(config, dict):
-        return config.get("text_config", config)
+        return config.get("text_config", config.get("transformer_layer_config", config))
     text_config = getattr(config, "text_config", None)
     if text_config is not None:
         return text_config
+    transformer_layer_config = getattr(config, "transformer_layer_config", None)
+    if transformer_layer_config is not None:
+        return transformer_layer_config
     get_text_config = getattr(config, "get_text_config", None)
     if callable(get_text_config):
         try:
@@ -486,7 +489,11 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
 
     layer_ids = dflash_cfg.get(
         "target_layer_ids",
-        _cfg_get(draft_hf_config, "target_layer_ids", None),
+        _cfg_get(
+            draft_hf_config,
+            "target_layer_ids",
+            _cfg_get(draft_hf_config, "aux_hidden_state_layer_ids", None),
+        ),
     )
     parsed_target_layer_ids: Optional[List[int]]
     if layer_ids is None:

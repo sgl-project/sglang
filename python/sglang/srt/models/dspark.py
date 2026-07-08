@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Callable, Iterable, Optional, Tuple
+from typing import Any, Callable, Iterable, Optional, Tuple
 
 import torch
 from torch import nn
@@ -358,9 +358,67 @@ _DSPARK_SKIPPED_WEIGHT_PREFIXES = (
 )
 
 
+_DSPARK_TRANSFORMER_CONFIG_FIELDS = (
+    "attention_bias",
+    "attention_dropout",
+    "bos_token_id",
+    "eos_token_id",
+    "head_dim",
+    "hidden_act",
+    "hidden_size",
+    "initializer_range",
+    "intermediate_size",
+    "layer_types",
+    "max_position_embeddings",
+    "max_window_layers",
+    "model_type",
+    "num_attention_heads",
+    "num_hidden_layers",
+    "num_key_value_heads",
+    "pad_token_id",
+    "rms_norm_eps",
+    "rope_parameters",
+    "rope_scaling",
+    "rope_theta",
+    "sliding_window",
+    "tie_word_embeddings",
+    "use_cache",
+    "use_sliding_window",
+    "vocab_size",
+)
+
+
+def _get_config_value(config: Any, key: str, default: Any = None) -> Any:
+    if isinstance(config, dict):
+        return config.get(key, default)
+    return getattr(config, key, default)
+
+
+def _normalize_dspark_transformer_config(config: Any) -> None:
+    """Promote nested speculators transformer config fields for SGLang layers."""
+    transformer_config = _get_config_value(config, "transformer_layer_config", None)
+    if transformer_config is None:
+        return
+
+    for key in _DSPARK_TRANSFORMER_CONFIG_FIELDS:
+        value = _get_config_value(transformer_config, key, None)
+        if value is None:
+            continue
+        if _get_config_value(config, key, None) is not None:
+            continue
+        if isinstance(config, dict):
+            config[key] = value
+            continue
+        try:
+            setattr(config, key, value)
+        except Exception:
+            logger.debug("Could not set DSpark draft config field %s.", key)
+
+
 class DSparkDraftMixin:
 
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:
+        _normalize_dspark_transformer_config(config)
         super().__init__(config=config, quant_config=quant_config, prefix=prefix)
         dspark_config = parse_dspark_draft_config(draft_hf_config=config)
         if not dspark_config.require_markov():
@@ -507,4 +565,4 @@ class Qwen3DSparkModel(DSparkDraftModel):
     pass
 
 
-EntryClass = [Qwen3DSparkModel]
+EntryClass = [DSparkDraftModel, Qwen3DSparkModel]
