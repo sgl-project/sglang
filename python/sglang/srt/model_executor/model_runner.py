@@ -3011,58 +3011,96 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         self.forward_pass_id += 1
 
-        # --- DIAGNOSTIC (env-gated, one-shot): dump disagg-decode KV metadata +
-        # content for the first few decode batches. Localizes the Kimi-K2.6
-        # non-MTP disagg GSM8K drop: is the decode-side seq_len / req_to_token
-        # mapping wrong, or is the MORI-transferred KV missing/zero at some slots
-        # (e.g. the prefix boundary token)? No-op unless the env is set.
+        # --- DIAGNOSTIC (env-gated): localize the Kimi-K2.6 non-MTP disagg GSM8K
+        # drop. The warmup-probe pass showed the MORI-transferred prefix KV reads
+        # as exactly 0 in the decode KV pool. Here we skip the short warmup probe
+        # (seq_len < 64), inspect a real (long, GSM8K) prefix across several
+        # layers, and page-bucket the zero rows to test whether the gaps are
+        # page-aligned (page_size=256) or a boundary. No-op unless the env is set.
         if (
             os.environ.get("SGLANG_DEBUG_DISAGG_DECODE_DUMP", "0") == "1"
             and forward_batch.forward_mode.is_decode()
-            and getattr(self, "_disagg_decode_dump_count", 0) < 5
         ):
-            self._disagg_decode_dump_count = (
-                getattr(self, "_disagg_decode_dump_count", 0) + 1
+            fb = forward_batch
+            seq_cpu = (
+                fb.seq_lens_cpu
+                if fb.seq_lens_cpu is not None
+                else fb.seq_lens.detach().cpu()
             )
-            try:
-                fb = forward_batch
-                seq_cpu = (
-                    fb.seq_lens_cpu
-                    if fb.seq_lens_cpu is not None
-                    else fb.seq_lens.detach().cpu()
+            s0 = int(seq_cpu[0].item()) if seq_cpu.numel() else 0
+            if s0 >= 64 and getattr(self, "_disagg_decode_dump_count", 0) < 3:
+                self._disagg_decode_dump_count = (
+                    getattr(self, "_disagg_decode_dump_count", 0) + 1
                 )
-                seq = seq_cpu.tolist()
-                r0 = int(fb.req_pool_indices[0].item())
-                s0 = int(seq[0])
-                slots = self.req_to_token_pool.req_to_token[r0, :s0]
-                neg = int((slots < 0).sum().item())
-                translate = getattr(
-                    self.token_to_kv_pool_allocator, "translate_kv_loc", None
-                )
-                phys = translate(slots) if translate is not None else slots
-                kbuf = self.token_to_kv_pool.get_key_buffer(0)
-                rows = kbuf[phys.to(kbuf.device).long()].float()
-                rownorm = rows.reshape(rows.shape[0], -1).norm(dim=-1)
-                logger.warning(
-                    "[DISAGG_DECODE_DUMP #%d rank=%s] mode=%s bs=%d seq_lens[:8]=%s | "
-                    "req0 pool_idx=%d seq_len=%d kv_slots=%d neg_slots=%d | "
-                    "KV L0 absmean=%.4e zero_rows=%d first3_norm=%s last3_norm=%s",
-                    self._disagg_decode_dump_count,
-                    getattr(self, "tp_rank", "?"),
-                    fb.forward_mode,
-                    len(seq),
-                    seq[:8],
-                    r0,
-                    s0,
-                    int(slots.numel()),
-                    neg,
-                    rows.abs().mean().item(),
-                    int((rownorm == 0).sum().item()),
-                    [round(x, 3) for x in rownorm[:3].tolist()],
-                    [round(x, 3) for x in rownorm[-3:].tolist()],
-                )
-            except Exception as e:  # never let the probe break a run
-                logger.warning("[DISAGG_DECODE_DUMP] failed: %r", e)
+                try:
+                    page_size = int(
+                        getattr(
+                            self.token_to_kv_pool,
+                            "page_size",
+                            getattr(self.server_args, "page_size", 1),
+                        )
+                        or 1
+                    )
+                    r0 = int(fb.req_pool_indices[0].item())
+                    slots = self.req_to_token_pool.req_to_token[r0, :s0]
+                    translate = getattr(
+                        self.token_to_kv_pool_allocator, "translate_kv_loc", None
+                    )
+                    phys = (translate(slots) if translate is not None else slots).to(
+                        "cpu"
+                    ).long()
+                    # Exclude the current (last) token: its KV is written later
+                    # this forward, so it is legitimately 0 here.
+                    pref = phys[:-1]
+                    neg = int((pref < 0).sum().item())
+                    nlayers = int(
+                        getattr(
+                            self.token_to_kv_pool,
+                            "layer_num",
+                            getattr(self.model_config, "num_hidden_layers", 1),
+                        )
+                    )
+                    layers = sorted({0, nlayers // 2, max(0, nlayers - 1)})
+                    msgs = []
+                    zero_idx0 = []
+                    for li, lyr in enumerate(layers):
+                        try:
+                            kbuf = self.token_to_kv_pool.get_key_buffer(lyr)
+                            rows = (
+                                kbuf[pref.to(kbuf.device)]
+                                .float()
+                                .reshape(pref.numel(), -1)
+                            )
+                            rn = rows.norm(dim=-1)
+                            zmask = rn == 0
+                            msgs.append(
+                                f"L{lyr}:zero={int(zmask.sum().item())}/{pref.numel()} "
+                                f"mean={rows.abs().mean().item():.3e}"
+                            )
+                            if li == 0:
+                                zero_idx0 = torch.nonzero(zmask).flatten().tolist()
+                        except Exception as e:
+                            msgs.append(f"L{lyr}:ERR {e!r}")
+                    zpages = sorted({i // page_size for i in zero_idx0})
+                    npages = (pref.numel() + page_size - 1) // page_size
+                    logger.warning(
+                        "[DISAGG_DECODE_DUMP #%d rank=%s] seq_len=%d prefix=%d "
+                        "page_size=%d neg_slots=%d | %s | zero_pos_first20=%s | "
+                        "zero_pages=%d/%d %s",
+                        self._disagg_decode_dump_count,
+                        getattr(self, "tp_rank", "?"),
+                        s0,
+                        pref.numel(),
+                        page_size,
+                        neg,
+                        " ".join(msgs),
+                        zero_idx0[:20],
+                        len(zpages),
+                        npages,
+                        zpages[:20],
+                    )
+                except Exception as e:  # never let the probe break a run
+                    logger.warning("[DISAGG_DECODE_DUMP] failed: %r", e)
 
         # Try msprob debugger
         if self.msprobe_debugger is not None:
