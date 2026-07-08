@@ -1142,6 +1142,16 @@ class Scheduler(
             disagg_hidden_size = 16  # minimal padding size for RDMA
             disagg_hidden_states_dtype = torch.float32
 
+        output_dsa_topk_indices_dim = 0
+        if (
+            self.spec_algorithm.is_eagle()
+            and self.draft_worker is not None
+            and self.server_args.speculative_eagle_topk == 1
+        ):
+            hf_config = draft_runner.model_config.hf_config
+            if getattr(hf_config, "index_share_for_mtp_iteration", False):
+                output_dsa_topk_indices_dim = getattr(hf_config, "index_topk", 0) or 0
+
         if (
             self.disaggregation_mode == DisaggregationMode.DECODE
         ):  # *2 for the headroom.
@@ -1154,6 +1164,7 @@ class Scheduler(
                 hidden_size=disagg_hidden_size,
                 hidden_states_dtype=disagg_hidden_states_dtype,
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
+                output_dsa_topk_indices_dim=output_dsa_topk_indices_dim,
             )
 
             # The decode requests polling kv cache
@@ -1199,6 +1210,7 @@ class Scheduler(
                 hidden_size=disagg_hidden_size,
                 hidden_states_dtype=disagg_hidden_states_dtype,
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
+                output_dsa_topk_indices_dim=output_dsa_topk_indices_dim,
             )
 
             self.disagg_prefill_bootstrap_queue = PrefillBootstrapQueue(

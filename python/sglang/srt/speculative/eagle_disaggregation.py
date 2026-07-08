@@ -51,11 +51,21 @@ def build_eagle_disagg_draft_input(
         [req.hidden_states_tensor for req in batch.reqs], dim=0
     ).to(batch.device)
 
+    dsa_topk_indices = None
+    dsa_indices_list = [
+        getattr(req, "output_dsa_topk_indices", None) for req in batch.reqs
+    ]
+    if dsa_indices_list and all(t is not None for t in dsa_indices_list):
+        dsa_topk_indices = torch.stack(dsa_indices_list, dim=0).to(batch.device)
+        if torch.any(torch.all(dsa_topk_indices < 0, dim=1)).item():
+            dsa_topk_indices = None
+
     spec_info = EagleDraftInput(
         topk_p=topk_p,
         topk_index=topk_index,
         hidden_states=hidden_states,
         bonus_tokens=last_tokens_tensor,
+        dsa_topk_indices=dsa_topk_indices,
     )
     spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
 
