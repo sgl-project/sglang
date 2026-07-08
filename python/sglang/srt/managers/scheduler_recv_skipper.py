@@ -11,8 +11,11 @@ class SchedulerRecvSkipper:
         return SchedulerRecvSkipper(server_args)
 
     def __init__(self, server_args: ServerArgs):
-        # Can be supported if needed, but may need e.g. `global_forward_mode`
-        assert not server_args.enable_dp_attention
+        # DP-attention is supported: the scheduler feeds ``handle`` the
+        # DP-synchronized ``global_forward_mode`` (identical on every rank),
+        # so all ranks accumulate the same counter and make the same
+        # ``should_recv`` decision. This keeps the request-broadcast collective
+        # consistent across ranks without any extra communication.
         self._counter = 0
         self._threshold = server_args.scheduler_recv_interval
         # All can be tuned if needed

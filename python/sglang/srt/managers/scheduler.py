@@ -1754,6 +1754,21 @@ class Scheduler(
         else:
             self.scripted_scheduler_hook = None
 
+    def _recv_skipper_last_forward_mode(self) -> Optional[ForwardMode]:
+        # The recv-skipper decision must be identical on every rank that takes
+        # part in the request-broadcast collective. Under DP-attention a rank's
+        # *local* forward mode can differ across ranks (e.g. IDLE vs DECODE), so
+        # we use the DP-synchronized ``global_forward_mode`` instead -- it is
+        # produced by the per-step all-gather and is identical on all ranks.
+        if self.last_batch is None:
+            return None
+        if self.server_args.enable_dp_attention:
+            gfm = getattr(self.last_batch, "global_forward_mode", None)
+            if gfm is None:
+                return None
+            return gfm if isinstance(gfm, ForwardMode) else ForwardMode(gfm)
+        return self.last_batch.forward_mode
+
     def init_request_receiver(self) -> None:
         self.request_receiver = SchedulerRequestReceiver(
             recv_from_tokenizer=self.ipc_channels.recv_from_tokenizer,
@@ -1773,9 +1788,7 @@ class Scheduler(
             model_config=self.model_config,
             max_recv_per_poll=self.max_recv_per_poll,
             stream_output=lambda *a, **kw: self.output_streamer.stream_output(*a, **kw),
-            get_last_forward_mode=lambda: (
-                self.last_batch.forward_mode if self.last_batch is not None else None
-            ),
+            get_last_forward_mode=self._recv_skipper_last_forward_mode,
             scripted_scheduler_hook=self.scripted_scheduler_hook,
         )
 
