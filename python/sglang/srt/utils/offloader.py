@@ -12,6 +12,7 @@ from sglang.srt.distributed.naive_distributed import (
     set_naive_distributed,
 )
 from sglang.srt.layers.parameter import ModelWeightParameter
+from sglang.srt.runtime_context import get_stream
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import MultiprocessingSerializer, is_pin_memory_available
 from sglang.srt.utils.host_shared_memory import (
@@ -198,7 +199,10 @@ class OffloaderV2(BaseOffloader):
     ):
         assert len(self.offloaders) == 0, "should only call wrap_modules once"
 
-        alt_stream = torch.cuda.Stream()
+        # The offloader's async prefetch/offload copies run on their own
+        # stream — sharing the models' "alt" overlap stream would serialize
+        # unrelated copy and compute work.
+        alt_stream = get_stream("offload")
 
         all_modules = []
         offload_submodules = []
@@ -306,6 +310,10 @@ class _ModuleOffloader(ABC):
             param_offloader.post_init()
 
     def start_onload(self):
+        if torch.cuda.is_current_stream_capturing():
+            self._device_tensors = self._create_device_tensors()
+            self._load_event = None
+            return
         self.alt_stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(self.alt_stream):
             self._device_tensors = self._create_device_tensors()
@@ -318,7 +326,13 @@ class _ModuleOffloader(ABC):
 
     def wait_and_get_device_tensors(self):
         assert self._device_tensors is not None
-        self._load_event.wait()
+        if torch.cuda.is_current_stream_capturing():
+            if self._load_event is not None:
+                self._device_tensors = self._create_device_tensors()
+                self._load_event = None
+            return self._device_tensors
+        if self._load_event is not None:
+            self._load_event.wait()
         return self._device_tensors
 
     def _create_device_tensors(self):

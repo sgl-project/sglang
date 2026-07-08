@@ -58,8 +58,14 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
     ):
         server_args.speculative_draft_model_revision = "main"
 
-    if server_args.speculative_moe_runner_backend is None:
-        server_args.speculative_moe_runner_backend = server_args.moe_runner_backend
+    # Moved to the resolution pipeline (arg_groups/overrides.py:
+    # _speculative_moe_runner_default), invoked here at its legacy slot.
+    from sglang.srt.arg_groups.overrides import (
+        _speculative_moe_runner_default,
+        run_post_process_pass,
+    )
+
+    run_post_process_pass(server_args, _speculative_moe_runner_default)
 
     if server_args.speculative_algorithm is not None:
         server_args.speculative_algorithm = server_args.speculative_algorithm.upper()
@@ -129,7 +135,9 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
 
 
 def _handle_dflash(server_args: ServerArgs) -> None:
-    if server_args.enable_dp_attention:
+    from sglang.srt.arg_groups.overrides import resolved_view
+
+    if resolved_view(server_args).enable_dp_attention:
         raise ValueError(
             "Currently DFLASH speculative decoding does not support dp attention."
         )
@@ -229,6 +237,8 @@ def _handle_dflash(server_args: ServerArgs) -> None:
                 f"window_size={server_args.speculative_draft_window_size}, block_size={draft_tokens}."
             )
 
+    _resolve_dflash_draft_attention_backend(server_args)
+
     if server_args.max_running_requests is None:
         server_args.max_running_requests = 48
         logger.warning(
@@ -240,6 +250,50 @@ def _handle_dflash(server_args: ServerArgs) -> None:
         logger.warning(
             "Mixed chunked prefill is disabled because of using dflash speculative decoding."
         )
+
+
+def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
+    """Resolve `speculative_draft_attention_backend` to a final, supported value.
+
+    Consumed by ModelRunner's `is_draft_worker` override (one backend for all
+    draft modes).
+    """
+    from sglang.srt.utils import is_hip
+
+    supported_draft_backends = ("flashinfer", "fa3", "fa4", "triton", "ascend")
+    # Use triton on ROCm (no FlashInfer), flashinfer on CUDA.
+    fallback_backend = "triton" if is_hip() else "flashinfer"
+
+    draft_backend = server_args.speculative_draft_attention_backend
+    if draft_backend is None:
+        from sglang.srt.arg_groups.overrides import (
+            attention_backends_of,
+            resolved_view,
+        )
+
+        draft_backend, _ = attention_backends_of(resolved_view(server_args))
+    if draft_backend is None:
+        draft_backend = fallback_backend
+    elif draft_backend == "trtllm_mha":
+        logger.warning(
+            "DFLASH draft worker does not support 'trtllm_mha' because the "
+            "draft path requires per-layer DFlash attention. Falling back to "
+            "'%s'.",
+            fallback_backend,
+        )
+        draft_backend = fallback_backend
+    elif draft_backend not in supported_draft_backends:
+        logger.warning(
+            "DFLASH draft worker only supports attention_backend in %s for now, "
+            "but got %r. Falling back to '%s'.",
+            supported_draft_backends,
+            draft_backend,
+            fallback_backend,
+        )
+        draft_backend = fallback_backend
+    # FIXME: avoid overriding server args directly; pass the resolved draft
+    # backend to the draft worker explicitly instead.
+    server_args.speculative_draft_attention_backend = draft_backend
 
 
 def _handle_frozen_kv_mtp(server_args: ServerArgs) -> None:
@@ -258,9 +312,14 @@ def _handle_frozen_kv_mtp(server_args: ServerArgs) -> None:
 
 
 def _handle_eagle_family(server_args: ServerArgs) -> None:
+    from sglang.srt.arg_groups.overrides import (
+        attention_backends_of,
+        resolved_view,
+    )
+
     if (
         server_args.speculative_algorithm == "STANDALONE"
-        and server_args.enable_dp_attention
+        and resolved_view(server_args).enable_dp_attention
     ):
         # TODO: support dp attention for standalone speculative decoding
         raise ValueError(
@@ -273,7 +332,7 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
             "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
         )
 
-    if server_args.disable_overlap_schedule:
+    if resolved_view(server_args).disable_overlap_schedule:
         logger.warning(
             "Non-overlap (synchronous) spec v2 is used for eagle/eagle3/standalone "
             "speculative decoding."
@@ -328,11 +387,7 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
             server_args.speculative_num_draft_tokens,
         ) = _auto_choose_speculative_params(server_args, model_arch)
 
-    if (
-        server_args.attention_backend == "trtllm_mha"
-        or server_args.decode_attention_backend == "trtllm_mha"
-        or server_args.prefill_attention_backend == "trtllm_mha"
-    ):
+    if "trtllm_mha" in attention_backends_of(resolved_view(server_args)):
         if server_args.speculative_eagle_topk > 1:
             raise ValueError(
                 "trtllm_mha backend only supports topk = 1 for speculative decoding."
@@ -369,10 +424,17 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
                 "--enable-deterministic-inference; the sampling kernel draws "
                 "coins from the global RNG and is not batch-invariant."
             )
-        if server_args.enable_multi_layer_eagle:
-            raise NotImplementedError(
-                "--speculative-use-rejection-sampling is not supported with "
-                "multi-layer EAGLE (--enable-multi-layer-eagle)."
+
+        from sglang.srt.arg_groups.overrides import resolved_view
+
+        if (
+            resolved_view(server_args).enable_multi_layer_eagle
+            and server_args.speculative_eagle_topk != 1
+        ):
+            raise ValueError(
+                "--speculative-use-rejection-sampling with multi-layer EAGLE "
+                "(--enable-multi-layer-eagle) requires --speculative-eagle-topk 1; "
+                "rejection sampling is only implemented for the linear (topk=1) chain."
             )
         logger.info(
             "Rejection sampling is enabled for speculative decoding "
@@ -393,15 +455,16 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
     # pass + per-branch expand pass with prefix-tail dup). Only these backends implement
     # it; flashmla / trtllm_mla / cutlass_mla can't express the per-branch tree, so reject.
     _PAGE_TREE_SPEC_BACKENDS = ("flashinfer", "fa3", "triton")
+    view = resolved_view(server_args)
     if (
         server_args.speculative_eagle_topk > 1
-        and server_args.page_size > 1
-        and server_args.attention_backend not in _PAGE_TREE_SPEC_BACKENDS
+        and view.page_size > 1
+        and view.attention_backend not in _PAGE_TREE_SPEC_BACKENDS
     ):
         raise ValueError(
             f"speculative_eagle_topk > 1 with page_size > 1 is only supported on "
             f"{_PAGE_TREE_SPEC_BACKENDS}; got attention_backend="
-            f"{server_args.attention_backend!r}. Use page_size == 1 or one of those backends."
+            f"{view.attention_backend!r}. Use page_size == 1 or one of those backends."
         )
 
 
@@ -452,18 +515,21 @@ def _handle_ngram(server_args: ServerArgs) -> None:
         "using ngram speculative decoding."
     )
 
+    from sglang.srt.arg_groups.overrides import resolved_view
+
+    view = resolved_view(server_args)
     if (
         server_args.speculative_eagle_topk > 1
-        and server_args.page_size > 1
-        and server_args.attention_backend != "flashinfer"
+        and view.page_size > 1
+        and view.attention_backend != "flashinfer"
     ):
         raise ValueError(
             f"speculative_eagle_topk({server_args.speculative_eagle_topk}) > 1 "
-            f"with page_size({server_args.page_size}) > 1 is unstable "
+            f"with page_size({view.page_size}) > 1 is unstable "
             "and produces incorrect results for paged attention backends. "
             "This combination is only supported for the 'flashinfer' backend."
         )
-    if server_args.enable_dp_attention:
+    if view.enable_dp_attention:
         # TODO: support dp attention for ngram speculative decoding
         raise ValueError(
             "Currently ngram speculative decoding does not support dp attention."
