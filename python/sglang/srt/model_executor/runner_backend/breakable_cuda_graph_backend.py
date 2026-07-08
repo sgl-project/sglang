@@ -117,7 +117,7 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             if post_warmup_hook is not None:
                 post_warmup_hook()
 
-        graph = BreakableCUDAGraph(self.deduped_cuda_graph)
+        graph = BreakableCUDAGraph()
         captured_fn = (
             eager_on_graph(True)(forward_fn) if self._debug_eager else forward_fn
         )

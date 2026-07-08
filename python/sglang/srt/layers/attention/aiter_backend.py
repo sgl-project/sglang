@@ -123,9 +123,6 @@ class ForwardMetadata:
     swa_out_cache_loc: Optional[torch.Tensor] = None
 
 
-global_workspace_buffer = None
-
-
 _AITER_PARTITION_SIZE_ROCM = 256
 
 

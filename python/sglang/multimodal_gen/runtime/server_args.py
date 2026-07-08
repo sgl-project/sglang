@@ -121,6 +121,55 @@ class Backend(str, Enum):
 
 WARMUP_MODES = ("off", "request", "server")
 
+# Default prompt sequence-length buckets for breakable CUDA graph (BCG) padding.
+# Prompt-conditioning is padded up to the smallest bucket that fits so prompts
+# of different lengths share one captured graph.
+DEFAULT_BCG_TEXT_BUCKETS = (64, 128, 256, 512, 1024)
+
+BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS = frozenset(
+    {
+        "comfy-org/ideogram-4",
+        "glm-image",
+        "ideogram-4",
+        "ideogram-4-fp8",
+        "ideogram-4-nf4",
+        "ideogram-ai/ideogram-4-fp8",
+        "ideogram-ai/ideogram-4-nf4",
+        "qwen/qwen-image",
+        "qwen/qwen-image-2512",
+        "qwen-image",
+        "qwen-image-2512",
+        "tongyi-mai/z-image",
+        "tongyi-mai/z-image-turbo",
+        "zai-org/glm-image",
+        "z-image",
+        "z-image-turbo",
+    }
+)
+
+BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS = frozenset(
+    {
+        "GlmImagePipelineConfig",
+        "Ideogram4PipelineConfig",
+        "QwenImagePipelineConfig",
+        "ZImagePipelineConfig",
+    }
+)
+
+
+def _normalized_bcg_model_refs(model_ref: str | None) -> set[str]:
+    if not model_ref:
+        return set()
+
+    normalized = str(model_ref).strip().rstrip("/").lower()
+    refs = {normalized, os.path.basename(normalized)}
+
+    if "models--" in normalized:
+        hf_cache_name = normalized.split("models--", 1)[1].split("/", 1)[0]
+        refs.add(hf_cache_name.replace("--", "/"))
+
+    return refs
+
 
 @dataclasses.dataclass
 class ServerArgs(DisaggServerArgsMixin):
@@ -229,6 +278,22 @@ class ServerArgs(DisaggServerArgsMixin):
 
     # Compilation
     enable_torch_compile: bool = False
+
+    # Breakable CUDA graph (BCG): capture the DiT forward as CUDA-graph
+    # segments split at attention modules (SP all-to-all / dynamic attention
+    # stay eager). Mutually exclusive with --enable-torch-compile and
+    # Cache-DiT; BCG takes priority when more than one is requested.
+    #
+    # BCG graphs are resolution-specific, so --warmup-resolutions is required
+    # when BCG is enabled: every requested resolution is captured at warmup so
+    # serving never triggers a fresh capture.
+    enable_breakable_cuda_graph: bool = False
+    # Text/prompt sequence-length padding budget for BCG. Prompt-conditioning
+    # inputs are padded up to the smallest bucket that fits, so prompts of
+    # different lengths reuse one captured graph. Warmup captures one graph per
+    # bucket; a prompt longer than the largest bucket falls back to eager.
+    # ``None`` resolves to DEFAULT_BCG_TEXT_BUCKETS.
+    bcg_text_buckets: list[int] = None
 
     # NVTX profiling
     enable_layerwise_nvtx_marker: bool = False
@@ -382,6 +447,7 @@ class ServerArgs(DisaggServerArgsMixin):
             auto_tuner.maybe_replace_cpu_offloaded_components_with_layerwise()
         self._adjust_path()
         self._adjust_quant_config()
+        self._adjust_breakable_cuda_graph_support()
         self._adjust_warmup()
         self._adjust_network_ports()
         # adjust parallelism before attention backend
@@ -416,6 +482,65 @@ class ServerArgs(DisaggServerArgsMixin):
             self._validate_parallelism()
         self._validate_cfg_parallel()
         self._validate_batching()
+        self._validate_breakable_cuda_graph()
+
+    def resolved_bcg_text_buckets(self) -> tuple[int, ...]:
+        """Sorted, de-duplicated, positive BCG text buckets.
+
+        Falls back to :data:`DEFAULT_BCG_TEXT_BUCKETS` when ``--bcg-text-buckets``
+        is unset, so both prompt padding and warmup capture share one source of
+        truth instead of the legacy ``SGLANG_BCG_TEXT_BUCKETS`` env var.
+        """
+        raw = self.bcg_text_buckets
+        if not raw:
+            return DEFAULT_BCG_TEXT_BUCKETS
+        buckets = sorted({int(b) for b in raw if int(b) > 0})
+        return tuple(buckets) or DEFAULT_BCG_TEXT_BUCKETS
+
+    def _validate_breakable_cuda_graph(self):
+        if not self.enable_breakable_cuda_graph:
+            return
+        # BCG graphs are captured per resolution and only replay for that exact
+        # latent shape, so the user must declare the resolutions up front. We
+        # capture every one of them at warmup; serving then never re-captures.
+        if not self.warmup_resolutions:
+            raise ValueError(
+                "--enable-breakable-cuda-graph requires --warmup-resolutions: "
+                "diffusion CUDA graphs only replay for a fixed resolution, so "
+                "every served resolution must be declared and captured at "
+                "warmup, e.g. --warmup-resolutions 1024x1024 1328x1328."
+            )
+        if self.bcg_text_buckets is not None and not any(
+            int(b) > 0 for b in self.bcg_text_buckets
+        ):
+            raise ValueError(
+                "--bcg-text-buckets must contain at least one positive integer."
+            )
+
+    def _adjust_breakable_cuda_graph_support(self):
+        if not self.enable_breakable_cuda_graph:
+            return
+
+        pipeline_config = getattr(self, "pipeline_config", None)
+        pipeline_config_name = type(pipeline_config).__name__
+        if (
+            pipeline_config_name in BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS
+            and self._is_breakable_cuda_graph_supported_model()
+        ):
+            return
+
+        logger.warning(
+            "[Diffusion BCG] disabled for %s: only Ideogram-4, Qwen/Qwen-Image, "
+            "Qwen/Qwen-Image-2512, Tongyi-MAI/Z-Image/Z-Image-Turbo, "
+            "and zai-org/GLM-Image are currently supported.",
+            pipeline_config_name,
+        )
+        self.enable_breakable_cuda_graph = False
+
+    def _is_breakable_cuda_graph_supported_model(self) -> bool:
+        refs = _normalized_bcg_model_refs(self.model_id)
+        refs.update(_normalized_bcg_model_refs(self.model_path))
+        return bool(refs & BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS)
 
     def _adjust_save_paths(self):
         """Normalize empty-string save paths to None (disabled)."""
@@ -770,6 +895,14 @@ class ServerArgs(DisaggServerArgsMixin):
                 "real requests do not pay compile latency. Set --warmup-mode off "
                 "to disable this behavior."
             )
+
+        # BCG captures every graph during a synthetic warmup forward at startup
+        # so that serving never records a fresh graph. That requires
+        # server-based warmup (a real warmup request issued at startup), not
+        # request-based warmup which runs no forward until the first request.
+        if self.enable_breakable_cuda_graph and self.disagg_role == RoleType.MONOLITHIC:
+            self.warmup = True
+            self.server_warmup = True
 
         if self.disagg_role != RoleType.MONOLITHIC:
             self.server_warmup = False
@@ -1342,6 +1475,28 @@ class ServerArgs(DisaggServerArgsMixin):
             action=StoreBoolean,
             default=ServerArgs.offload_during_compile,
             help="Offload components during the torch.compile warmup (the DiT layerwise) so max-autotune fits on tighter-memory GPUs, then restore the configured residency for serving. Skipped when the DiT is already layerwise-offloaded, or under cache-dit / FSDP.",
+        )
+        parser.add_argument(
+            "--enable-breakable-cuda-graph",
+            action=StoreBoolean,
+            default=ServerArgs.enable_breakable_cuda_graph,
+            help="Capture the DiT forward as breakable CUDA graph segments "
+            "(split at attention; SP all-to-all / dynamic attention stay "
+            "eager) to cut per-kernel launch overhead. Mutually exclusive "
+            "with --enable-torch-compile and Cache-DiT (BCG takes priority). "
+            "Requires --warmup-resolutions; all of them are captured at warmup.",
+        )
+        parser.add_argument(
+            "--bcg-text-buckets",
+            type=int,
+            nargs="+",
+            default=ServerArgs.bcg_text_buckets,
+            help="Prompt sequence-length padding budget for breakable CUDA "
+            "graph. Prompt-conditioning is padded up to the smallest bucket "
+            "that fits so different prompt lengths reuse one captured graph; "
+            "warmup captures one graph per bucket. Defaults to "
+            f"{' '.join(map(str, DEFAULT_BCG_TEXT_BUCKETS))}. "
+            "Replaces the legacy SGLANG_BCG_TEXT_BUCKETS env var.",
         )
 
         parser.add_argument(
