@@ -550,7 +550,7 @@ class Envs:
     # Enable int4x2 weights loading
     SGLANG_NPU_W4A4_NEW_PACKING = EnvBool(False)
     # Quantize x to int8 in the dispatch operator
-    DEEP_NORMAL_MODE_USE_INT8_QUANT = EnvBool(False) # This argument is deprecated
+    DEEP_NORMAL_MODE_USE_INT8_QUANT = EnvBool(False)  # This argument is deprecated
 
     # MTHREADS & MUSA
     SGLANG_MUSA_FA3_FORCE_UPDATE_METADATA = EnvBool(False)

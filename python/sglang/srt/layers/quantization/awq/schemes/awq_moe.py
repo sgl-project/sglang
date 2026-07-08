@@ -25,9 +25,6 @@ if TYPE_CHECKING:
 __all__ = ["AWQMoEScheme", "AWQAscendMoEScheme"]
 
 
-from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
-    NPUWNA16Int4MoEMethod,
-)
 from sglang.srt.layers.moe import (
     MoeRunner,
     MoeRunnerBackend,

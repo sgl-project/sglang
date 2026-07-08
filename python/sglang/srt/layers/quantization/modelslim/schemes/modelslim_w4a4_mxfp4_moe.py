@@ -5,11 +5,11 @@ from typing import Any, Dict
 
 import torch
 
-from sglang.srt.layers.quantization.modelslim.schemes import ModelSlimMoEScheme
-from sglang.srt.utils import set_weight_attrs
 from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
     NPUW4A4Mxfp4MoEMethod,  # to be implemented
 )
+from sglang.srt.layers.quantization.modelslim.schemes import ModelSlimMoEScheme
+from sglang.srt.utils import set_weight_attrs
 
 logger = logging.getLogger(__name__)
 
