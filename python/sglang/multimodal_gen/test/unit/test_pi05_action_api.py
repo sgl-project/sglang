@@ -28,6 +28,11 @@ def _server_args(config: Pi05PipelineConfig | None = None) -> SimpleNamespace:
         model_path="lerobot/pi05_base",
         output_path=None,
         comfyui_mode=False,
+        num_gpus=1,
+        tp_size=1,
+        sp_degree=1,
+        ulysses_degree=1,
+        ring_degree=1,
         pipeline_config=config or Pi05PipelineConfig(),
     )
 
@@ -163,6 +168,9 @@ def test_action_metadata_reports_policy_shape_and_capabilities():
     assert metadata["output"]["padded_action_dim"] == 32
     assert metadata["runtime"]["materialize_dtype"] == "bf16"
     assert metadata["runtime"]["enable_autocast"] is True
+    assert metadata["runtime"]["parallelism"]["num_gpus"] == 1
+    assert metadata["runtime"]["parallelism"]["prefix_strategy"] == "tp"
+    assert metadata["runtime"]["parallelism"]["action_strategy"] == "sp"
     assert metadata["defaults"]["prefix_cache"] is False
     assert metadata["capabilities"]["realtime_websocket"]
     assert metadata["capabilities"]["openpi_websocket"]
@@ -174,6 +182,7 @@ def test_action_generation_response_uses_actual_output_parameters():
         "parameters": {"num_inference_steps": 3},
         "timings": {"preprocess_ms": 1.5},
         "cache": {"hit": True},
+        "parallel": {"split_group": False},
     }
 
     response = action_generation_response(output, _server_args())
@@ -187,6 +196,7 @@ def test_action_generation_response_uses_actual_output_parameters():
     assert response["usage"]["prefix_cache_hit"] is True
     assert response["timings"] == output["timings"]
     assert response["cache"] == output["cache"]
+    assert response["parallel"] == output["parallel"]
 
 
 def test_action_raw_response_preserves_policy_payload_shape():

@@ -118,6 +118,19 @@ def test_runai_direct_gpu_loader_does_not_reject_split_roles(monkeypatch):
     assert model._should_stream_weights_to_gpu(target_state)
 
 
+def test_action_parallel_info_reports_single_rank_without_process_group():
+    model = Pi05PolicyModel.__new__(Pi05PolicyModel)
+    model.runtime_role = "all"
+
+    info = model.action_parallel_info(prefix_context=None)
+
+    assert info == {
+        "split_group": False,
+        "runtime_role": "all",
+        "action_sequence_parallel": False,
+    }
+
+
 class _FakeSiglipAttention(nn.Module):
     def __init__(self):
         super().__init__()

@@ -166,6 +166,16 @@ def action_metadata(server_args: ServerArgs) -> dict[str, Any]:
         "runtime": {
             "materialize_dtype": pipeline_config.materialize_dtype,
             "enable_autocast": pipeline_config.enable_autocast,
+            "parallelism": {
+                "num_gpus": server_args.num_gpus,
+                "tp_size": server_args.tp_size,
+                "sp_degree": server_args.sp_degree,
+                "ulysses_degree": server_args.ulysses_degree,
+                "ring_degree": server_args.ring_degree,
+                "prefix_strategy": pipeline_config.prefix_parallel_strategy,
+                "action_strategy": pipeline_config.action_parallel_strategy,
+                "layout_version": pipeline_config.parallel_layout_version,
+            },
         },
         "defaults": {
             "num_inference_steps": pipeline_config.default_num_inference_steps,
@@ -415,6 +425,8 @@ def action_generation_response(
         response["timings"] = output["timings"]
     if "cache" in output:
         response["cache"] = output["cache"]
+    if "parallel" in output:
+        response["parallel"] = output["parallel"]
     return response
 
 

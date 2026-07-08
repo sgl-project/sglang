@@ -41,6 +41,7 @@ class VLAStageKeys:
     prefix_context_group: str = "vla_prefix_context_group"
     prefix_cache_key: str = "vla_prefix_cache_key"
     cache: str = "vla_cache"
+    parallel: str = "vla_parallel"
     group_index: str = "vla_group_index"
     group_size: str = "vla_group_size"
     actions: str = "vla_actions"
@@ -58,6 +59,7 @@ class VLAStageKeys:
             prefix_context_group=f"{namespace}_prefix_context_group",
             prefix_cache_key=f"{namespace}_prefix_cache_key",
             cache=f"{namespace}_cache",
+            parallel=f"{namespace}_parallel",
             group_index=f"{namespace}_group_index",
             group_size=f"{namespace}_group_size",
             actions=f"{namespace}_actions",
@@ -427,9 +429,11 @@ class VLAActionDenoisingStage(PipelineStage):
                 str(options.get("output_format") or "list"),
             )
             action_ms = (time.perf_counter() - start) * 1000
+            parallel_info = self.policy_model.action_parallel_info(prefix_context)
 
             for offset, (index, batch) in enumerate(group):
                 vla_timings(batch, self.keys)["action_denoise_ms"] = action_ms
+                batch.extra[self.keys.parallel] = parallel_info
                 batch.extra[self.keys.actions] = actions[offset : offset + 1]
                 batch.extra[self.keys.actions_output] = actions_out[offset]
                 results[index] = batch
@@ -444,6 +448,7 @@ class VLAActionDenoisingStage(PipelineStage):
         should_run_action = (
             split is None or self.policy_model.should_run_action_denoise(prefix_context)
         )
+        parallel_info = self.policy_model.action_parallel_info(prefix_context)
         if batch.is_warmup:
             actions = (
                 self.policy_model.warmup_actions(batch_size=1)
@@ -483,10 +488,15 @@ class VLAActionDenoisingStage(PipelineStage):
                 src=split.action_root,
             )
             vla_timings(batch, self.keys).update(timings)
+            parallel_info = split.broadcast_object_from_rank(
+                parallel_info if should_run_action else None,
+                src=split.action_root,
+            )
         else:
             vla_timings(batch, self.keys)["action_denoise_ms"] = (
                 time.perf_counter() - start
             ) * 1000
+        batch.extra[self.keys.parallel] = parallel_info
         batch.extra[self.keys.actions] = actions
         return batch
 
@@ -531,6 +541,8 @@ class VLAActionPostprocessStage(PipelineStage):
             payload["timings"] = timings
         if not batch.is_warmup:
             payload["cache"] = batch.extra.get(self.keys.cache, {})
+        if batch.extra.get(self.keys.parallel) is not None:
+            payload["parallel"] = batch.extra[self.keys.parallel]
 
         return OutputBatch(
             output=[payload],

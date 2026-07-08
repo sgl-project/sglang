@@ -870,6 +870,30 @@ class Pi05PolicyModel(nn.Module):
             return split.is_action_rank
         return split.rank == split.action_root
 
+    def action_parallel_info(
+        self,
+        prefix_context: PrefixContext | None,
+    ) -> dict[str, Any]:
+        split = get_vla_split_group()
+        if split is None:
+            return {
+                "split_group": False,
+                "runtime_role": self.runtime_role,
+                "action_sequence_parallel": False,
+            }
+        return {
+            "split_group": True,
+            "runtime_role": self.runtime_role,
+            "world_size": split.group.world_size,
+            "prefix_root": split.prefix_root,
+            "action_root": split.action_root,
+            "action_ranks": list(split.action_ranks),
+            "action_sequence_parallel": self._can_use_action_sequence_parallel(
+                prefix_context,
+                self.config.action_horizon,
+            ),
+        }
+
     def _broadcast_initial_action_state(
         self,
         x_t: torch.Tensor | None,

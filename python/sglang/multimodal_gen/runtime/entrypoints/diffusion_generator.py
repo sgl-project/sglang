@@ -376,6 +376,34 @@ class DiffGenerator:
             return None
         return results[0] if len(results) == 1 else results
 
+    def generate_action(
+        self,
+        sampling_params_kwargs: dict | None = None,
+        external_trace_header: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        sampling_params_kwargs = sampling_params_kwargs or {}
+        sampling_params = SamplingParams.from_user_sampling_params_args(
+            self.server_args.model_path,
+            server_args=self.server_args,
+            **sampling_params_kwargs,
+        )
+        if sampling_params.data_type != DataType.ACTION:
+            raise ValueError(
+                f"generate_action requires an ACTION pipeline, got {sampling_params.data_type}"
+            )
+
+        req = prepare_request(
+            server_args=self.server_args,
+            sampling_params=sampling_params,
+            external_trace_header=external_trace_header,
+        )
+        output_batch = self._send_to_scheduler_and_wait_for_response(req)
+        if output_batch.error:
+            raise RuntimeError(output_batch.error)
+        if output_batch.output is None:
+            raise RuntimeError("action policy returned no output")
+        return output_batch.output[0]
+
     def _resolve_prompts(
         self,
         prompt: str | list[str] | None,
