@@ -31,7 +31,6 @@ from __future__ import annotations
 
 import dataclasses
 import logging
-import os
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from sglang.srt.arg_groups.arg_utils import resolvable_fields
@@ -464,6 +463,8 @@ def _minimax_m2_overrides(server_args: Any, hf_config: Any) -> dict:
 
 @_register_for("MiniMaxM3SparseForCausalLM", "MiniMaxM3SparseForConditionalGeneration")
 def _minimax_m3_overrides(server_args: Any, hf_config: Any) -> dict:
+    from sglang.srt.environ import envs
+
     overrides: Dict[str, Any] = {}
 
     quant_method = get_quantization_config(hf_config)
@@ -481,7 +482,8 @@ def _minimax_m3_overrides(server_args: Any, hf_config: Any) -> dict:
             overrides["attention_backend"] = "triton"
         if server_args.moe_runner_backend == "auto" and quant_resolved == "mxfp8":
             overrides["moe_runner_backend"] = "triton"
-        os.environ.setdefault("USE_ROCM_AITER_ROPE_BACKEND", "0")
+        if not envs.USE_ROCM_AITER_ROPE_BACKEND.is_set():
+            envs.USE_ROCM_AITER_ROPE_BACKEND.set("0")
         aiter_fusion_resolved = server_args.enable_aiter_allreduce_fusion
         if (
             server_args.ep_size > 1
