@@ -1870,7 +1870,16 @@ class ServerArgs:
         "Select the mode when enable Ascend FuseEP MoE, 1 -> dispatch_gmm_combine_decode is executed；2 -> dispatch_ffn_combine is executed (support hybrid deployment when 2).",
     ] = 2
     deepep_dispatcher_output_dtype: A[
-        Literal["auto", "bf16", "fp8", "int8", "nvfp4"],
+        Literal[
+            "auto",
+            "bf16",
+            "int8",
+            "fp8",
+            "mxfp8_e4m3fn",
+            "mxfp8_e5m2",
+            "mxfp4_e2m1fn_x2",
+            "nvfp4",
+        ],
         "Select DeepEP dispatcher output dtype",
     ] = "auto"
     ep_num_redundant_experts: A[

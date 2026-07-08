@@ -688,7 +688,6 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
     ):
-        
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
         topk_ids = topk_ids.to(torch.int64)
         expected_m = (
@@ -765,7 +764,6 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         # NPU requires topk_weights during dispatch
         if _is_npu and topk_weights is not None:
             dispatch_kwargs["topk_weights"] = topk_weights
-        
         packed_recv_hidden, self.packed_recv_count, self.handle, event, hook = (
             buffer.low_latency_dispatch(
                 hidden_states,
