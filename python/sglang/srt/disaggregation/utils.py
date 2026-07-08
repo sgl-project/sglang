@@ -592,6 +592,36 @@ def page_indices_to_cp_rank_page_indices(
     return np.asarray(page_indices)[mask]
 
 
+def filter_kv_indices_for_shard_rank(
+    kv_mgr: CommonKVManager,
+    kv_indices: np.ndarray,
+    index_slice: slice,
+    page_offset: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Ownership-driven page filter for logical-page KV cache sharding.
+
+    ``kv_indices`` holds one entry per PHYSICAL page position of this chunk
+    (the entry value is the logical group id == the owner rank's local page
+    id — symmetric allocation makes it the same integer on every rank).
+    Absolute sequence page ``P`` is owned by shard rank ``P % shard_size``
+    (chunk boundaries are granule-aligned, so position ownership equals value
+    ownership); ``page_offset`` is the absolute page index of send position 0
+    (the decode-cached prefix length in pages).
+
+    Returns the owned subset of ``kv_indices`` and an int64 positions array
+    (in the request's canonical send-position space) replacing the contiguous
+    ``index_slice`` contract — decode-side dst pairing is positional and
+    consumes a fancy index the same way it consumes a slice.
+    """
+    shard_rank = kv_mgr.kv_shard_rank
+    shard_size = kv_mgr.kv_shard_size
+    chunk_start = index_slice.start if index_slice.start is not None else 0
+    chunk_end = index_slice.stop if index_slice.stop is not None else chunk_start
+    positions = np.arange(chunk_start, chunk_end, dtype=np.int64)
+    owned = (positions + page_offset) % shard_size == shard_rank
+    return np.asarray(kv_indices)[owned], positions[owned]
+
+
 def filter_kv_indices_for_cp_rank(
     kv_mgr: CommonKVManager,
     kv_indices: np.ndarray,
