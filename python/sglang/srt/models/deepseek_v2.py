@@ -934,10 +934,8 @@ class DeepseekV2MoE(nn.Module):
         # - dispose_tensor: shared reads shared_in (ref taken pre-dispose) to avoid null data_ptr.
         current_stream = torch.cuda.current_stream()
         self.alt_stream.wait_stream(current_stream)
-        # Separate ref over the same storage, taken before the routed call's deep_gemm
-        # pre-permute `set_()`s `hidden_states` to empty (which would null the shared read).
-        # This keeps the buffer alive past dispose_tensor, but decode/verify hidden_states is
-        # small (bs*num_draft_tokens rows vs thousands in prefill), so the lost free is negligible.
+        # Alias taken pre-dispose so shared survives the routed deep_gemm's dispose_tensor `set_()`.
+        # Lost free is negligible: decode/verify hidden_states is tiny (bs*num_draft_tokens rows).
         shared_in = hidden_states[:]
         has_shared_output = (
             hidden_states.shape[0] > 0 and self.num_fused_shared_experts == 0
