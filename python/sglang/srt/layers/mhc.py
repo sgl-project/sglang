@@ -4,6 +4,8 @@ import math
 from typing import Tuple
 
 import torch
+import triton
+import triton.language as tl
 
 from sglang.jit_kernel.utils import is_arch_support_pdl
 from sglang.srt.environ import envs
@@ -176,6 +178,125 @@ def _hc_split_sinkhorn_torch(
     return pre, post, comb
 
 
+@triton.jit
+def _hc_split_sinkhorn_triton_kernel(
+    mixes_ptr,
+    hc_scale_ptr,
+    hc_base_ptr,
+    pre_ptr,
+    post_ptr,
+    comb_ptr,
+    n,
+    HC: tl.constexpr,
+    MIX_HC: tl.constexpr,
+    SINKHORN_ITERS: tl.constexpr,
+    EPS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Triton port of hc_split_sinkhorn_kernel (one program per token row).
+
+    Layout mirrors the TileLang/torch reference exactly: the flattened ``mixes``
+    row holds ``pre`` (HC), ``post`` (HC) and the ``comb`` matrix (HC*HC)
+    consecutively. gfx1250 can't compile TileLang's CK-backed addressing, so this
+    replaces it while keeping the numerics identical.
+    """
+    row = tl.program_id(0)
+    if row >= n:
+        return
+
+    scale0 = tl.load(hc_scale_ptr + 0)
+    scale1 = tl.load(hc_scale_ptr + 1)
+    scale2 = tl.load(hc_scale_ptr + 2)
+
+    j = tl.arange(0, BLOCK)
+    jmask = j < HC
+
+    # pre = sigmoid(mixes[:HC] * scale0 + base[:HC]) + eps
+    base_pre = tl.load(hc_base_ptr + j, mask=jmask, other=0.0)
+    mix_pre = tl.load(mixes_ptr + row * MIX_HC + j, mask=jmask, other=0.0)
+    pre = tl.sigmoid(mix_pre * scale0 + base_pre) + EPS
+    tl.store(pre_ptr + row * HC + j, pre, mask=jmask)
+
+    # post = 2 * sigmoid(mixes[HC:2*HC] * scale1 + base[HC:2*HC])
+    base_post = tl.load(hc_base_ptr + HC + j, mask=jmask, other=0.0)
+    mix_post = tl.load(mixes_ptr + row * MIX_HC + HC + j, mask=jmask, other=0.0)
+    post = 2.0 * tl.sigmoid(mix_post * scale1 + base_post)
+    tl.store(post_ptr + row * HC + j, post, mask=jmask)
+
+    # comb[j, k] = mixes[2*HC + j*HC + k] * scale2 + base[2*HC + j*HC + k]
+    jj = j[:, None]
+    kk = j[None, :]
+    mmask = (jj < HC) & (kk < HC)
+    coff = 2 * HC + jj * HC + kk
+    base_c = tl.load(hc_base_ptr + coff, mask=mmask, other=0.0)
+    mix_c = tl.load(mixes_ptr + row * MIX_HC + coff, mask=mmask, other=0.0)
+    comb = mix_c * scale2 + base_c
+
+    # Initial row softmax (numerically stabilized) then column normalize.
+    comb_masked = tl.where(mmask, comb, float("-inf"))
+    row_max = tl.max(comb_masked, axis=1)
+    comb = tl.exp(comb - row_max[:, None])
+    comb = tl.where(mmask, comb, 0.0)
+    row_sum = tl.sum(comb, axis=1)
+    comb = comb / row_sum[:, None] + EPS
+    comb = tl.where(mmask, comb, 0.0)
+    col_sum = tl.sum(comb, axis=0)
+    comb = comb / (col_sum[None, :] + EPS)
+    comb = tl.where(mmask, comb, 0.0)
+
+    for _ in tl.static_range(SINKHORN_ITERS - 1):
+        row_sum = tl.sum(comb, axis=1)
+        comb = comb / (row_sum[:, None] + EPS)
+        comb = tl.where(mmask, comb, 0.0)
+        col_sum = tl.sum(comb, axis=0)
+        comb = comb / (col_sum[None, :] + EPS)
+        comb = tl.where(mmask, comb, 0.0)
+
+    tl.store(comb_ptr + row * HC * HC + jj * HC + kk, comb, mask=mmask)
+
+
+def _hc_split_sinkhorn_triton(
+    mixes: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    hc_mult: int = 4,
+    sinkhorn_iters: int = 20,
+    eps: float = 1e-6,
+):
+    b, s, _ = mixes.size()
+    hc = hc_mult
+    mix_hc = (2 + hc) * hc
+    n = b * s
+
+    flat = mixes.reshape(n, mix_hc).float()
+    scale = hc_scale.float().contiguous()
+    base = hc_base.float().contiguous()
+
+    pre = mixes.new_empty(n, hc, dtype=torch.float32)
+    post = mixes.new_empty(n, hc, dtype=torch.float32)
+    comb = mixes.new_empty(n, hc, hc, dtype=torch.float32)
+
+    _hc_split_sinkhorn_triton_kernel[(n,)](
+        flat,
+        scale,
+        base,
+        pre,
+        post,
+        comb,
+        n,
+        HC=hc,
+        MIX_HC=mix_hc,
+        SINKHORN_ITERS=sinkhorn_iters,
+        EPS=eps,
+        BLOCK=triton.next_power_of_2(hc),
+    )
+
+    pre = pre.reshape(b, s, hc).to(mixes.dtype)
+    post = post.reshape(b, s, hc).to(mixes.dtype)
+    comb = comb.reshape(b, s, hc, hc).to(mixes.dtype)
+    return pre, post, comb
+
+
 def hc_split_sinkhorn(
     mixes: torch.Tensor,
     hc_scale: torch.Tensor,
@@ -185,7 +306,9 @@ def hc_split_sinkhorn(
     eps: float = 1e-6,
 ):
     if is_gfx1250_supported():
-        return _hc_split_sinkhorn_torch(
+        # TileLang's CK-backed addressing doesn't compile on gfx1250; use the
+        # Triton port. _hc_split_sinkhorn_torch is kept as a reference fallback.
+        return _hc_split_sinkhorn_triton(
             mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps
         )
     b, s, _ = mixes.size()
