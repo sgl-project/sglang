@@ -867,6 +867,33 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             hisparse_top_k = getattr(
                 self.model_config.hf_text_config, "index_topk", hisparse_cfg.top_k
             )
+            # Shared-index (IndexShare) prefetch: auto-enabled for models that
+            # reuse an anchor layer's top-k across skip layers (e.g. GLM-5.2).
+            shared_index_layers = None
+            hf_text_config = self.model_config.hf_text_config
+            if is_deepseek_dsa(hf_text_config):
+                pattern = [
+                    dsa_layer_skips_topk(hf_text_config, i)
+                    for i in range(hf_text_config.num_hidden_layers)
+                ]
+                if any(pattern):
+                    if self.pp_size != 1 or not self.spec_algorithm.is_none():
+                        # Unsupported under pipeline parallelism (the mask spans the
+                        # full model, but the coordinator indexes layers per rank)
+                        # and speculative decoding (overlap untested).
+                        logger.warning(
+                            "HiSparse shared-index prefetch is unsupported under "
+                            "pipeline parallelism / speculative decoding; falling "
+                            "back to synchronous swap-in."
+                        )
+                    elif envs.SGLANG_HISPARSE_DISABLE_PREFETCH.get():
+                        logger.info(
+                            "HiSparse shared-index prefetch disabled via "
+                            "SGLANG_HISPARSE_DISABLE_PREFETCH; using synchronous "
+                            "swap-in."
+                        )
+                    else:
+                        shared_index_layers = pattern
             self.hisparse_coordinator = HiSparseCoordinator(
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
@@ -880,6 +907,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 ),
                 host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
                 swap_in_block_size=hisparse_cfg.swap_in_block_size,
+                shared_index_layers=shared_index_layers,
             )
 
         self.init_routed_experts_capturer()

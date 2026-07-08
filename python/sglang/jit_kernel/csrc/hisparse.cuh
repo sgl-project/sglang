@@ -209,7 +209,16 @@ __global__ void load_cache_to_device_buffer_kernel(
     int64_t top_k_tokens_stride,
     int64_t top_k_device_locs_stride,
     int64_t page_size,
-    int64_t item_size_bytes) {
+    int64_t item_size_bytes,
+    int64_t* __restrict__ miss_src_out,
+    int64_t* __restrict__ miss_dst_out,
+    int32_t* __restrict__ miss_count_out,
+    int64_t plan_stride) {
+  // When miss_*_out != nullptr, additionally record this step's miss plan:
+  //   miss_src_out[bid, k] / miss_dst_out[bid, k] = (host_loc, device_loc) of the
+  //   k-th miss, miss_count_out[bid] = number of misses. A shared-index skip layer
+  //   later replays exactly these copies into its own buffers (copy_cache_planned)
+  //   instead of re-running the full plan+IO kernel.
   static_assert(!IsDsv4Layout || IsMLA, "DSv4 page-padded layout is K-only (MLA).");
   // todo hisparse: support page wise sparsity
   constexpr int NUM_WARPS = BLOCK_SIZE / WARP_SIZE;
@@ -246,6 +255,10 @@ __global__ void load_cache_to_device_buffer_kernel(
       if (token_pos >= 0) {
         req_top_k_device_locs[i] = req_device_buffer_locs[token_pos];
       }
+    }
+    // Short sequences load nothing from host: an empty miss plan for this request.
+    if (miss_count_out != nullptr && tid == 0) {
+      miss_count_out[bid] = 0;
     }
     return;
   }
@@ -461,6 +474,9 @@ __global__ void load_cache_to_device_buffer_kernel(
   __syncthreads();
 
   total_misses = NUM_TOP_K - s_total_hits - s_newest_hit;
+  if (miss_count_out != nullptr && tid == 0) {
+    miss_count_out[bid] = total_misses;
+  }
   // Write back LRU order: evictables at front (LRU), hits at back (MRU).
   {
     const int total_evictable = HOT_BUFFER_SIZE - s_total_hits;
@@ -504,6 +520,13 @@ __global__ void load_cache_to_device_buffer_kernel(
 
     const int64_t src_loc = req_host_cache_locs[miss_token];
     const int64_t dst_loc = static_cast<int64_t>(req_device_buffer_locs[evict_slot]);
+
+    // Record the (host, device) locations so shared-index skip layers can replay
+    // this exact copy without re-planning (device/host locs are layer-independent).
+    if (miss_src_out != nullptr && lane_id == 0) {
+      miss_src_out[bid * plan_stride + miss_idx] = src_loc;
+      miss_dst_out[bid * plan_stride + miss_idx] = dst_loc;
+    }
 
     if constexpr (IsDsv4Layout) {
 #ifdef USE_ROCM
@@ -559,10 +582,19 @@ void load_cache_to_device_buffer(
     tvm::ffi::TensorView lru_slots,
     tvm::ffi::TensorView num_real_reqs,
     int64_t page_size,
-    int64_t item_size_bytes) {
+    int64_t item_size_bytes,
+    tvm::ffi::TensorView miss_src_out,
+    tvm::ffi::TensorView miss_dst_out,
+    tvm::ffi::TensorView miss_count_out,
+    int64_t plan_stride) {
   using namespace host;
 
   const int64_t bs = top_k_tokens.shape()[0];
+  // Optional miss-plan outputs: 0-dim tensors mean "don't record".
+  int64_t* const miss_src_ptr = (miss_src_out.ndim() == 0) ? nullptr : static_cast<int64_t*>(miss_src_out.data_ptr());
+  int64_t* const miss_dst_ptr = (miss_dst_out.ndim() == 0) ? nullptr : static_cast<int64_t*>(miss_dst_out.data_ptr());
+  int32_t* const miss_count_ptr =
+      (miss_count_out.ndim() == 0) ? nullptr : static_cast<int32_t*>(miss_count_out.data_ptr());
   const int64_t host_stride = host_cache_locs.shape()[1];
   const int64_t buffer_stride_0 = device_buffer_tokens.strides()[0];
   const int64_t lru_slot_stride_0 = lru_slots.strides()[0];
@@ -600,7 +632,11 @@ void load_cache_to_device_buffer(
         top_k_tokens_stride,
         top_k_device_locs_stride,
         page_size,
-        item_size_bytes);
+        item_size_bytes,
+        miss_src_ptr,
+        miss_dst_ptr,
+        miss_count_ptr,
+        plan_stride);
   };
 
   const auto seq_dtype = seq_lens.dtype();
@@ -657,6 +693,98 @@ void load_cache_to_device_buffer(
         static_cast<const int32_t*>(seq_lens.data_ptr()),
         static_cast<const int32_t*>(req_pool_indices.data_ptr()));
   }
+}
+
+// Copy-only ("IO-only") swap-in for shared-index skip layers.
+//
+// Replays a miss plan recorded by the anchor's load_cache_to_device_buffer:
+// for each real request r, copy its miss_counts[r] entries host->device using the
+// anchor's (miss_src_locs, miss_dst_locs). No hit detection / LRU / hashing -- the
+// slot layout is shared with the anchor (lockstep), so the anchor's slot table is
+// reused verbatim. Launched with a small fixed grid (NUM_BLOCKS) so the copies keep
+// a low SM/copy-engine footprint while overlapping compute on a side stream.
+template <int BLOCK_SIZE, bool IsMLA, bool IsDsv4Layout>
+__global__ __launch_bounds__(BLOCK_SIZE, 1) void copy_cache_planned_kernel(
+    const int64_t* __restrict__ miss_src_locs,
+    const int64_t* __restrict__ miss_dst_locs,
+    const int32_t* __restrict__ miss_counts,
+    const int32_t* __restrict__ num_real_reqs,
+    const void* __restrict__ host_cache_k,
+    const void* __restrict__ host_cache_v,
+    void* __restrict__ device_buffer_k,
+    void* __restrict__ device_buffer_v,
+    int64_t plan_stride,
+    int64_t item_size_bytes) {
+  static_assert(!IsDsv4Layout || IsMLA, "DSv4 page-padded layout is K-only (MLA).");
+  constexpr int NUM_WARPS = BLOCK_SIZE / WARP_SIZE;
+  const int lane_id = threadIdx.x % WARP_SIZE;
+  const int warp_global = blockIdx.x * NUM_WARPS + threadIdx.x / WARP_SIZE;
+  const int total_warps = gridDim.x * NUM_WARPS;
+  const int real = num_real_reqs[0];
+
+  for (int r = 0; r < real; ++r) {
+    const int cnt = miss_counts[r];
+    const int64_t* src_row = miss_src_locs + static_cast<int64_t>(r) * plan_stride;
+    const int64_t* dst_row = miss_dst_locs + static_cast<int64_t>(r) * plan_stride;
+    for (int m = warp_global; m < cnt; m += total_warps) {
+      const int64_t src_loc = src_row[m];
+      const int64_t dst_loc = dst_row[m];
+      if constexpr (IsDsv4Layout) {
+#ifdef USE_ROCM
+        using namespace device::hisparse;
+        const auto [dst_value_ptr, dst_scale_ptr] = get_pointer_paged(device_buffer_k, static_cast<int32_t>(dst_loc));
+        const auto [src_value_ptr, src_scale_ptr] =
+            get_pointer_paged(const_cast<void*>(host_cache_k), static_cast<int32_t>(src_loc));
+        transfer_item_warp(lane_id, src_value_ptr, dst_value_ptr, kValueBytes);
+        transfer_item_warp(lane_id, src_scale_ptr, dst_scale_ptr, kScaleBytes);
+#else
+        device::hisparse::transfer_item(
+            /*dst_cache=*/device_buffer_k,
+            /*src_cache=*/const_cast<void*>(host_cache_k),
+            /*dst_index=*/static_cast<int32_t>(dst_loc),
+            /*src_index=*/static_cast<int32_t>(src_loc));
+#endif
+      } else {
+        const auto src_k = static_cast<const char*>(host_cache_k) + src_loc * item_size_bytes;
+        auto dst_k = static_cast<char*>(device_buffer_k) + dst_loc * item_size_bytes;
+        transfer_item_warp(lane_id, src_k, dst_k, item_size_bytes);
+        if constexpr (!IsMLA) {
+          const auto src_v = static_cast<const char*>(host_cache_v) + src_loc * item_size_bytes;
+          auto dst_v = static_cast<char*>(device_buffer_v) + dst_loc * item_size_bytes;
+          transfer_item_warp(lane_id, src_v, dst_v, item_size_bytes);
+        }
+      }
+    }
+  }
+}
+
+template <int BLOCK_SIZE, bool IsMLA, bool IsDsv4Layout>
+void copy_cache_planned(
+    tvm::ffi::TensorView miss_src_locs,
+    tvm::ffi::TensorView miss_dst_locs,
+    tvm::ffi::TensorView miss_counts,
+    tvm::ffi::TensorView num_real_reqs,
+    tvm::ffi::TensorView host_cache_k,
+    tvm::ffi::TensorView host_cache_v,
+    tvm::ffi::TensorView device_buffer_k,
+    tvm::ffi::TensorView device_buffer_v,
+    int64_t num_blocks,
+    int64_t item_size_bytes) {
+  using namespace host;
+  const int64_t plan_stride = miss_src_locs.strides()[0];
+  const auto device = LaunchKernel::resolve_device(miss_src_locs.device());
+  LaunchKernel(num_blocks, BLOCK_SIZE, device)(
+      copy_cache_planned_kernel<BLOCK_SIZE, IsMLA, IsDsv4Layout>,
+      static_cast<const int64_t*>(miss_src_locs.data_ptr()),
+      static_cast<const int64_t*>(miss_dst_locs.data_ptr()),
+      static_cast<const int32_t*>(miss_counts.data_ptr()),
+      static_cast<const int32_t*>(num_real_reqs.data_ptr()),
+      host_cache_k.data_ptr(),
+      (IsMLA || host_cache_v.ndim() == 0) ? (const void*)nullptr : host_cache_v.data_ptr(),
+      device_buffer_k.data_ptr(),
+      (IsMLA || device_buffer_v.ndim() == 0) ? (void*)nullptr : device_buffer_v.data_ptr(),
+      plan_stride,
+      item_size_bytes);
 }
 
 }  // namespace

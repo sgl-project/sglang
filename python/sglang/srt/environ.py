@@ -287,6 +287,10 @@ class Envs:
     # page tables (DP attn); paged backends like trtllm_mha consume it directly.
     SGLANG_USE_HND_KVCACHE = EnvBool(False)
 
+    # HiSparse: kill-switch for the shared-index prefetch (auto-on for
+    # GLM-5.2-style shared-index DSA). Set True to A/B the synchronous swap-in.
+    SGLANG_HISPARSE_DISABLE_PREFETCH = EnvBool(False)
+
     # size the KV pool after CUDA-graph capture
     SGLANG_ENABLE_POST_CAPTURE_KV_SIZING = EnvBool(False)
 
