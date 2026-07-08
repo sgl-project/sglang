@@ -115,45 +115,24 @@ class TestDisaggregationAbortedRequestQueueing(unittest.TestCase):
         req.time_stats.trace_ctx = MagicMock()
         return req
 
-    def test_prefill_mode_aborted_req_skips_bootstrap_queue(self):
-        scheduler = self._new_scheduler(DisaggregationMode.PREFILL)
-        req = self._new_aborted_req()
-        req.disagg_kv_sender = None
+    def _install_prefill_sender(self, scheduler, sender=None):
+        sender = sender or MagicMock()
 
         def create_sender(req, _num_kv_heads):
-            req.disagg_kv_sender = MagicMock()
-            return True
+            req.disagg_kv_sender = sender
 
         scheduler.disagg_prefill_bootstrap_queue.create_sender.side_effect = (
             create_sender
         )
+        return sender
 
-        scheduler._add_request_to_queue(req)
-
-        scheduler.disagg_prefill_bootstrap_queue.add.assert_not_called()
-        scheduler.disagg_prefill_bootstrap_queue.create_sender.assert_called_once_with(
-            req, 8
-        )
-        req.disagg_kv_sender.abort.assert_called_once()
-        scheduler._prefetch_kvcache.assert_not_called()
-        scheduler.output_streamer.stream_output.assert_called_once_with([req], False)
-        self.assertIsInstance(req.finished_reason, FINISH_ABORT)
-        self.assertIsNone(req.to_finish)
-
-    def test_prefill_mode_aborted_req_records_failure_once_before_abort(self):
+    def test_prefill_mode_aborted_req_skips_bootstrap_queue_and_records_failure(self):
         scheduler = self._new_scheduler(DisaggregationMode.PREFILL)
         req = self._new_aborted_req()
         kv_mgr = MagicMock()
         sender = MagicMock()
         sender.kv_mgr = kv_mgr
-
-        def create_sender(req, _num_kv_heads):
-            req.disagg_kv_sender = sender
-            return True
-
-        scheduler.disagg_prefill_bootstrap_queue.create_sender.side_effect = (
-            create_sender
-        )
+        self._install_prefill_sender(scheduler, sender)
 
         scheduler._add_request_to_queue(req)
 
@@ -163,6 +142,10 @@ class TestDisaggregationAbortedRequestQueueing(unittest.TestCase):
             None,
         )
         sender.abort.assert_called_once()
+        scheduler._prefetch_kvcache.assert_not_called()
+        scheduler.output_streamer.stream_output.assert_called_once_with([req], False)
+        self.assertIsInstance(req.finished_reason, FINISH_ABORT)
+        self.assertIsNone(req.to_finish)
 
     def test_decode_mode_aborted_req_skips_prealloc_queue(self):
         scheduler = self._new_scheduler(DisaggregationMode.DECODE)
@@ -208,24 +191,56 @@ class TestMooncakeEarlyAbortLifecycle(unittest.TestCase):
         manager.sync_status_to_decode_endpoint = MagicMock()
         return manager
 
-    def _new_transfer_info(self, room: int):
-        return SimpleNamespace(
-            is_dummy=False,
-            endpoint="127.0.0.1",
-            dst_port=23456,
-            room=room,
-            decode_prefix_len=3,
-        )
+    def _seed_failed_room(
+        self,
+        manager,
+        room: int,
+        *,
+        metadata_ready: bool = False,
+        timestamp=None,
+    ):
+        manager.request_status[room] = KVPoll.Failed
+        manager.failure_records[room] = "Input is too long"
+        manager.failure_status_codes[room] = 400
+        if timestamp is not None:
+            manager.failure_timestamps[room] = timestamp
+        if metadata_ready:
+            manager.required_dst_info_num_table[room] = 1
+            manager.transfer_infos[room] = {
+                "decode-session": SimpleNamespace(
+                    is_dummy=False,
+                    endpoint="127.0.0.1",
+                    dst_port=23456,
+                    room=room,
+                    decode_prefix_len=3,
+                )
+            }
+            manager.req_to_decode_prefix_len[room] = 3
+
+    def _assert_failed_room_absent(
+        self, manager, room: int, *, metadata: bool = False, timestamp: bool = False
+    ):
+        table_names = ["request_status", "failure_records", "failure_status_codes"]
+        if metadata:
+            table_names += [
+                "transfer_infos",
+                "req_to_decode_prefix_len",
+                "required_dst_info_num_table",
+            ]
+        if timestamp:
+            table_names.append("failure_timestamps")
+        for table_name in table_names:
+            self.assertNotIn(room, getattr(manager, table_name))
+
+    def _cleanup_at(self, manager, now_s: float):
+        with patch("sglang.srt.disaggregation.mooncake.conn.time.monotonic") as now:
+            now.return_value = now_s
+            manager.maybe_cleanup_orphan_failed_rooms()
 
     def test_terminal_failure_with_ready_metadata_notifies_decode_and_clears_room(self):
         manager = self._new_manager()
         room = 7
-        manager.request_status[room] = KVPoll.Failed
-        manager.failure_records[room] = "Input is too long"
-        manager.failure_status_codes[room] = 400
-        manager.required_dst_info_num_table[room] = 1
-        manager.transfer_infos[room] = {"decode-session": self._new_transfer_info(room)}
-        manager.req_to_decode_prefix_len[room] = 3
+        self._seed_failed_room(manager, room, metadata_ready=True)
 
         notified = manager.try_notify_decode_failure_and_clear(room)
 
@@ -239,19 +254,12 @@ class TestMooncakeEarlyAbortLifecycle(unittest.TestCase):
             "Input is too long",
             400,
         )
-        self.assertNotIn(room, manager.request_status)
-        self.assertNotIn(room, manager.failure_records)
-        self.assertNotIn(room, manager.failure_status_codes)
-        self.assertNotIn(room, manager.transfer_infos)
-        self.assertNotIn(room, manager.req_to_decode_prefix_len)
-        self.assertNotIn(room, manager.required_dst_info_num_table)
+        self._assert_failed_room_absent(manager, room, metadata=True)
 
     def test_terminal_failure_waits_for_decode_metadata_before_clearing_room(self):
         manager = self._new_manager()
         room = 8
-        manager.request_status[room] = KVPoll.Failed
-        manager.failure_records[room] = "Input is too long"
-        manager.failure_status_codes[room] = 400
+        self._seed_failed_room(manager, room)
 
         notified = manager.try_notify_decode_failure_and_clear(room)
 
@@ -261,64 +269,36 @@ class TestMooncakeEarlyAbortLifecycle(unittest.TestCase):
         self.assertEqual(manager.failure_records[room], "Input is too long")
         self.assertEqual(manager.failure_status_codes[room], 400)
 
-        manager.required_dst_info_num_table[room] = 1
-        manager.transfer_infos[room] = {"decode-session": self._new_transfer_info(room)}
+        self._seed_failed_room(manager, room, metadata_ready=True)
 
         notified = manager.try_notify_decode_failure_and_clear(room)
 
         self.assertTrue(notified)
         manager.sync_status_to_decode_endpoint.assert_called_once()
-        self.assertNotIn(room, manager.request_status)
-        self.assertNotIn(room, manager.failure_records)
-        self.assertNotIn(room, manager.failure_status_codes)
-        self.assertNotIn(room, manager.transfer_infos)
+        self._assert_failed_room_absent(manager, room)
 
-    def test_orphan_failed_room_cleanup_waits_until_ttl(self):
-        manager = self._new_manager()
-        room = 10
-        manager.request_status[room] = KVPoll.Failed
-        manager.failure_records[room] = "Input is too long"
-        manager.failure_status_codes[room] = 400
-        manager.failure_timestamps[room] = 100.0
+    def test_orphan_failed_room_cleanup_respects_ttl(self):
+        for now_s, should_clear in ((109.0, False), (111.0, True)):
+            with self.subTest(now_s=now_s):
+                manager = self._new_manager()
+                room = 10
+                self._seed_failed_room(manager, room, timestamp=100.0)
 
-        with patch("sglang.srt.disaggregation.mooncake.conn.time.monotonic") as now:
-            now.return_value = 109.0
-            manager.maybe_cleanup_orphan_failed_rooms()
+                self._cleanup_at(manager, now_s)
 
-        self.assertIn(room, manager.request_status)
-        self.assertIn(room, manager.failure_records)
-        self.assertIn(room, manager.failure_status_codes)
-
-    def test_orphan_failed_room_cleanup_clears_after_ttl_without_metadata(self):
-        manager = self._new_manager()
-        room = 11
-        manager.request_status[room] = KVPoll.Failed
-        manager.failure_records[room] = "Input is too long"
-        manager.failure_status_codes[room] = 400
-        manager.failure_timestamps[room] = 100.0
-
-        with patch("sglang.srt.disaggregation.mooncake.conn.time.monotonic") as now:
-            now.return_value = 111.0
-            manager.maybe_cleanup_orphan_failed_rooms()
-
-        self.assertNotIn(room, manager.request_status)
-        self.assertNotIn(room, manager.failure_records)
-        self.assertNotIn(room, manager.failure_status_codes)
-        self.assertNotIn(room, manager.failure_timestamps)
+                if should_clear:
+                    self._assert_failed_room_absent(manager, room, timestamp=True)
+                else:
+                    self.assertIn(room, manager.request_status)
+                    self.assertIn(room, manager.failure_records)
+                    self.assertIn(room, manager.failure_status_codes)
 
     def test_orphan_failed_room_cleanup_keeps_ready_metadata_for_notification(self):
         manager = self._new_manager()
         room = 12
-        manager.request_status[room] = KVPoll.Failed
-        manager.failure_records[room] = "Input is too long"
-        manager.failure_status_codes[room] = 400
-        manager.failure_timestamps[room] = 100.0
-        manager.required_dst_info_num_table[room] = 1
-        manager.transfer_infos[room] = {"decode-session": self._new_transfer_info(room)}
+        self._seed_failed_room(manager, room, metadata_ready=True, timestamp=100.0)
 
-        with patch("sglang.srt.disaggregation.mooncake.conn.time.monotonic") as now:
-            now.return_value = 111.0
-            manager.maybe_cleanup_orphan_failed_rooms()
+        self._cleanup_at(manager, 111.0)
 
         self.assertIn(room, manager.request_status)
         notified = manager.try_notify_decode_failure_and_clear(room)
