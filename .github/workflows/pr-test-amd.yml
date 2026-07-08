@@ -5,7 +5,7 @@ run-name: ${{ (inputs.target_stage || inputs.target_stage_select) && (inputs.pr_
 
 on:
   schedule:
-    - cron: '0 */6 * * *' # Run every 6 hours (UTC)
+    - cron: '0 */12 * * *' # Run every 12 hours (UTC)
   pull_request:
     paths:
       - "python/**"
@@ -972,6 +972,7 @@ jobs:
           jobs: |
             [
               {"prefix": "stage-b-test-1-gpu-small-amd", "expected_count": 14},
+              {"prefix": "stage-b-test-1-gpu-large-amd", "expected_count": 3},
               {"prefix": "stage-b-test-2-gpu-large-amd", "expected_count": 2}
             ]
           max-wait-minutes: '480'

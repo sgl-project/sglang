@@ -3335,11 +3335,10 @@ class ServerArgs:
     # ------------------------------------------------------------------
     # CUDA graph configuration resolution
     # ------------------------------------------------------------------
-    # TODO: add unit tests in test/srt/test_server_args.py covering the
-    # precedence cascade + auto-disable matrix (follow-up PR).
     def _handle_cuda_graph_config(self):
         self._parse_cuda_graph_config()
         self._apply_cuda_graph_compatibility()
+        self._apply_cuda_graph_disaggregation_roles()
         self._validate_cuda_graph_config()
         # Warn on the final resolved config (not inside the compat cascade —
         # that path is skipped when the user explicitly sets the backend,
@@ -3428,6 +3427,14 @@ class ServerArgs:
             self._disable_breakable_cudagraph_if_incompatible()
         elif self.cuda_graph_config.prefill.backend == Backend.FULL:
             self._disable_full_prefill_cudagraph_if_incompatible()
+
+    def _apply_cuda_graph_disaggregation_roles(self):
+        if self.disaggregation_mode == "prefill":
+            if (Phase.DECODE, "backend") not in self._cuda_graph_config_locked:
+                self.cuda_graph_config.decode.backend = Backend.DISABLED
+        elif self.disaggregation_mode == "decode":
+            if (Phase.PREFILL, "backend") not in self._cuda_graph_config_locked:
+                self.cuda_graph_config.prefill.backend = Backend.DISABLED
 
     def _disable_tc_piecewise_cudagraph_if_incompatible(self):
         from sglang.srt.arg_groups.overrides import resolved_view as _resolved_view
@@ -5169,10 +5176,11 @@ class ServerArgs:
             ], "The expert parallel size must be 1 or the same as the tensor parallel size"
 
         if view.moe_runner_backend == "flashinfer_cutedsl":
+            # modelopt_mixed with non-NVFP4 MoE layers is rejected at load time.
             assert (
-                view.quantization in ["modelopt_fp4"]
+                view.quantization in ["modelopt_fp4", "modelopt_mixed"]
                 or self.get_model_config().nvfp4_moe_meta is not None
-            ), f"Invalid quantization '{view.quantization}'. \nFlashInfer CuteDSL MOE currently supports only: 'modelopt_fp4' or hybrid NVFP4 models."
+            ), f"Invalid quantization '{view.quantization}'. \nFlashInfer CuteDSL MOE currently supports only: 'modelopt_fp4', 'modelopt_mixed' (with NVFP4 MoE layers), or hybrid NVFP4 models."
             assert view.ep_size in [
                 1,
                 self.tp_size,
