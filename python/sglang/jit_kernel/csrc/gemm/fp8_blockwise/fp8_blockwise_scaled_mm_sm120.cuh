@@ -203,8 +203,24 @@ void launch_sm120_fp8_blockwise_scaled_mm(
       CooperativeStageCount,
       cutlass::gemm::KernelScheduleSm120Blockwise>::CollectiveOp;
 
-  using CooperativeGemmKernel = cutlass::gemm::kernel::
+  using CooperativeGemmKernelStreamK = cutlass::gemm::kernel::GemmUniversal<
+      Shape<int, int, int, int>,
+      CooperativeCollectiveMainloop,
+      CooperativeCollectiveEpilogue,
+      cutlass::gemm::StreamKScheduler>;
+  using CooperativeGemmKernelVoid = cutlass::gemm::kernel::
       GemmUniversal<Shape<int, int, int, int>, CooperativeCollectiveMainloop, CooperativeCollectiveEpilogue, void>;
+
+  auto run_cooperative = [&]() -> cutlass::Status {
+    static const uint32_t kNumSM = host::runtime::get_sm_count(a.device().device_id);
+    constexpr int kTileM = size<0>(MmaTileShape{});
+    constexpr int kTileN = size<1>(MmaTileShape{});
+    uint64_t tiles = static_cast<uint64_t>((m + kTileM - 1) / kTileM) * ((n + kTileN - 1) / kTileN);
+    uint32_t last_wave = static_cast<uint32_t>(tiles % kNumSM);
+    if (last_wave == 0) last_wave = kNumSM;
+    float waste = 1.0f - static_cast<float>(last_wave) / static_cast<float>(kNumSM);
+    return (waste > 0.5f) ? run_gemm(CooperativeGemmKernelStreamK{}) : run_gemm(CooperativeGemmKernelVoid{});
+  };
 
   cutlass::Status status = cutlass::Status::kSuccess;
   if constexpr (kCanUsePingpong) {
@@ -249,13 +265,13 @@ void launch_sm120_fp8_blockwise_scaled_mm(
     if (m <= 64) {
       status = run_gemm(PingpongGemmKernel{});
       if (status != cutlass::Status::kSuccess) {
-        status = run_gemm(CooperativeGemmKernel{});
+        status = run_cooperative();
       }
     } else {
-      status = run_gemm(CooperativeGemmKernel{});
+      status = run_cooperative();
     }
   } else {
-    status = run_gemm(CooperativeGemmKernel{});
+    status = run_cooperative();
   }
 
   CUTLASS_CHECK(status);
