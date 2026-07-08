@@ -135,35 +135,14 @@ def kernel(
                 f"metal_jit.kernel: {cls.__name__} must define a `source` "
                 "class attribute holding the Metal kernel body"
             )
-        register(
-            name,
-            name_template=name_template,
-            input_names=input_names,
-            output_names=output_names,
-            source=source,
+        if name in _REGISTRY:
+            raise ValueError(f"metal_jit: kernel {name!r} already registered")
+        _REGISTRY[name] = MetalJitKernel(
+            name_template, input_names, output_names, source
         )
         return cls
 
     return decorate
-
-
-def register(
-    name: str,
-    *,
-    name_template: str,
-    input_names: list[str],
-    output_names: list[str],
-    source: str,
-) -> None:
-    """Register one kernel under `name`, dispatched via get()/warm_once().
-
-    `name` is the registry key (e.g. "fused_moe_combine"); `name_template` is
-    the on-device Metal entry name, kept separate so shader cache keys and
-    profiler labels are unaffected by the registry key chosen.
-    """
-    if name in _REGISTRY:
-        raise ValueError(f"metal_jit: kernel {name!r} already registered")
-    _REGISTRY[name] = MetalJitKernel(name_template, input_names, output_names, source)
 
 
 def get(name: str, *dtypes: mx.Dtype):
