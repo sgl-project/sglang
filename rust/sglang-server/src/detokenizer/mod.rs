@@ -157,6 +157,10 @@ impl Runnable for DetokenizerWorker {
         let mut table: HashMap<RequestId, DetokState> = HashMap::new();
         tracing::debug!(shard = self.shard, "detokenizer worker started");
 
+        // Plain `recv`: exits when the `DetokMsg` channel closes (every `Senders`
+        // clone gone). On shutdown that happens once the API runtime drop cancels
+        // in-flight handlers (their `AbortGuard`s release the last clones) and
+        // tm-ingress/tm-egress exit — no shutdown signal needed here.
         while let Ok(msg) = self.rx.recv() {
             match msg {
                 DetokMsg::Register {
