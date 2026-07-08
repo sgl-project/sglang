@@ -170,6 +170,7 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.auth import AuthLevel, app_has_admin_force_endpoints, auth_level
 from sglang.srt.utils.http_server_tuning import (
+    granian_http1_settings_kwargs,
     granian_http2_settings_kwargs,
     resolved_keep_alive_timeout,
     uvicorn_tuning_kwargs,
@@ -2208,6 +2209,7 @@ def _run_granian_server(
     ssl_verify=False,  # MTls is not supported
     backlog=2048,
     backpressure=2048,
+    http1_settings_kwargs=None,
     http2_settings_kwargs=None,
 ):
     """Serve the in-process ASGI app with Granian (embedded mode) over HTTP/2.
@@ -2224,7 +2226,7 @@ def _run_granian_server(
 
     from granian import Granian
     from granian.constants import HTTPModes, Interfaces, Loops
-    from granian.http import HTTP2Settings
+    from granian.http import HTTP1Settings, HTTP2Settings
     from granian.server.embed import Server as GranianEmbeddedServer
 
     Server = GranianEmbeddedServer if tokenizer_worker_num == 1 else Granian
@@ -2246,9 +2248,11 @@ def _run_granian_server(
         backlog=backlog,
         backpressure=backpressure,
     )
-    # HTTP/2-specific tunables go through Granian's HTTP2Settings, not as
-    # top-level kwargs. The kwargs dict is built by the caller; we
-    # construct HTTP2Settings here so the granian import stays lazy.
+    # Protocol-specific tunables go through Granian's HTTP{1,2}Settings, not
+    # as top-level kwargs. The kwargs dicts are built by the caller; we
+    # construct the settings here so the granian import stays lazy.
+    if http1_settings_kwargs:
+        granian_kwargs["http1_settings"] = HTTP1Settings(**http1_settings_kwargs)
     if http2_settings_kwargs:
         granian_kwargs["http2_settings"] = HTTP2Settings(**http2_settings_kwargs)
 
@@ -2375,6 +2379,7 @@ def _setup_and_run_http_server(
                     ssl_keyfile_password=server_args.ssl_keyfile_password,
                     ssl_verify=False,  # No MTLS supported for now.
                     backlog=server_args.http_backlog,
+                    http1_settings_kwargs=granian_http1_settings_kwargs(server_args),
                     http2_settings_kwargs=granian_http2_settings_kwargs(server_args),
                 )
             elif server_args.enable_ssl_refresh:
@@ -2463,6 +2468,7 @@ def _setup_and_run_http_server(
                     ssl_ca_certs=server_args.ssl_ca_certs,
                     ssl_keyfile_password=server_args.ssl_keyfile_password,
                     backlog=server_args.http_backlog,
+                    http1_settings_kwargs=granian_http1_settings_kwargs(server_args),
                     http2_settings_kwargs=granian_http2_settings_kwargs(server_args),
                 )
             else:

@@ -46,6 +46,10 @@ class TestHttpTuningConfig(unittest.TestCase):
         self.assertIsNone(args.http_timeout_graceful_shutdown)
         self.assertIsNone(args.http2_max_concurrent_streams)
         self.assertIsNone(args.http2_max_frame_size)
+        self.assertIsNone(args.http2_keep_alive_interval)
+        self.assertIsNone(args.http2_keep_alive_timeout)
+        self.assertIsNone(args.http1_header_read_timeout)
+        self.assertIsNone(args.http1_max_buffer_size)
 
     def test_all_cli_flags_parse(self):
         args = prepare_server_args(
@@ -64,6 +68,14 @@ class TestHttpTuningConfig(unittest.TestCase):
                 "256",
                 "--http2-max-frame-size",
                 "65536",
+                "--http2-keep-alive-interval",
+                "30",
+                "--http2-keep-alive-timeout",
+                "10",
+                "--http1-header-read-timeout",
+                "15000",
+                "--http1-max-buffer-size",
+                "1048576",
             ]
         )
         self.assertEqual(args.timeout_keep_alive, 120)
@@ -72,6 +84,10 @@ class TestHttpTuningConfig(unittest.TestCase):
         self.assertEqual(args.http_timeout_graceful_shutdown, 30)
         self.assertEqual(args.http2_max_concurrent_streams, 256)
         self.assertEqual(args.http2_max_frame_size, 65536)
+        self.assertEqual(args.http2_keep_alive_interval, 30)
+        self.assertEqual(args.http2_keep_alive_timeout, 10)
+        self.assertEqual(args.http1_header_read_timeout, 15000)
+        self.assertEqual(args.http1_max_buffer_size, 1048576)
 
     def test_keep_alive_cli_overrides_env(self):
         from sglang.srt.utils.http_server_tuning import resolved_keep_alive_timeout
@@ -198,6 +214,42 @@ class TestGranianHttp2Settings(unittest.TestCase):
         # When the operator sets nothing, we let Granian use its defaults
         # rather than pinning them from our side.
         self.assertNotIn("http2_settings", kwargs)
+
+    def test_passes_http1_settings_when_tunables_set(self):
+        # Symmetric with the HTTP/2 case above: HTTP/1.1-specific knobs
+        # go through granian.http.HTTP1Settings, not as top-level kwargs.
+        from granian.http import HTTP1Settings
+
+        from sglang.srt.entrypoints.http_server import _run_granian_server
+
+        with patch("granian.Granian") as MockGranian:
+            _run_granian_server(
+                host="127.0.0.1",
+                port=30000,
+                log_level="info",
+                tokenizer_worker_num=2,
+                http1_settings_kwargs={
+                    "header_read_timeout": 15000,
+                    "max_buffer_size": 1048576,
+                },
+            )
+
+        kwargs = MockGranian.call_args.kwargs
+        self.assertIn("http1_settings", kwargs)
+        self.assertIsInstance(kwargs["http1_settings"], HTTP1Settings)
+        self.assertEqual(kwargs["http1_settings"].header_read_timeout, 15000)
+        self.assertEqual(kwargs["http1_settings"].max_buffer_size, 1048576)
+
+    def test_no_http1_settings_when_tunables_unset(self):
+        from sglang.srt.entrypoints.http_server import _run_granian_server
+
+        with patch("granian.Granian") as MockGranian:
+            _run_granian_server(
+                host="127.0.0.1", port=30000, log_level="info", tokenizer_worker_num=2
+            )
+
+        kwargs = MockGranian.call_args.kwargs
+        self.assertNotIn("http1_settings", kwargs)
 
 
 class TestHttp2FlagValidation(unittest.TestCase):

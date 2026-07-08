@@ -565,6 +565,22 @@ class ServerArgs:
         Optional[int],
         "(Granian only, --enable-http2) HTTP/2 frame size in bytes. None = Granian default. Larger frames reduce overhead for chunky JSON request/response bodies.",
     ] = None
+    http2_keep_alive_interval: A[
+        Optional[int],
+        "(Granian only, --enable-http2) HTTP/2 keep-alive PING interval in seconds. None = disabled. Set for long-lived HTTP/2 connections to detect dead peers behind NATs / load balancers with idle-connection reaping.",
+    ] = None
+    http2_keep_alive_timeout: A[
+        Optional[int],
+        "(Granian only, --enable-http2) Seconds to wait for a HTTP/2 keep-alive PING ack before closing the connection. Only meaningful when --http2-keep-alive-interval is set. Granian default is 20.",
+    ] = None
+    http1_header_read_timeout: A[
+        Optional[int],
+        "(Granian only) HTTP/1.1 header-read timeout in milliseconds. Slowloris-style clients that dribble headers past this deadline get their connections closed. Granian default is 30000.",
+    ] = None
+    http1_max_buffer_size: A[
+        Optional[int],
+        "(Granian only) HTTP/1.1 request-parser buffer size in bytes. Raise this if your workload sends very large request bodies / prompts that overrun Granian's default (~417KB).",
+    ] = None
 
     # -------------------------------------------------------------------------
     # SSL/TLS

@@ -61,4 +61,24 @@ def granian_http2_settings_kwargs(server_args: ServerArgs) -> dict:
         kwargs["max_concurrent_streams"] = server_args.http2_max_concurrent_streams
     if server_args.http2_max_frame_size is not None:
         kwargs["max_frame_size"] = server_args.http2_max_frame_size
+    if server_args.http2_keep_alive_interval is not None:
+        kwargs["keep_alive_interval"] = server_args.http2_keep_alive_interval
+    if server_args.http2_keep_alive_timeout is not None:
+        kwargs["keep_alive_timeout"] = server_args.http2_keep_alive_timeout
+    return kwargs
+
+
+def granian_http1_settings_kwargs(server_args: ServerArgs) -> dict:
+    """Kwargs for ``granian.http.HTTP1Settings``, empty when none set.
+
+    Same lazy-import pattern as HTTP2Settings above. Note that Granian's
+    HTTP/1.1 idle-connection timeout is *not* exposed by the library, so
+    ``--timeout-keep-alive`` remains uvicorn-only; the flags here address
+    header-read timeout (slowloris protection) and buffer sizing.
+    """
+    kwargs: dict = {}
+    if server_args.http1_header_read_timeout is not None:
+        kwargs["header_read_timeout"] = server_args.http1_header_read_timeout
+    if server_args.http1_max_buffer_size is not None:
+        kwargs["max_buffer_size"] = server_args.http1_max_buffer_size
     return kwargs
