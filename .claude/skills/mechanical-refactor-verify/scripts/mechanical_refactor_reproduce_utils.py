@@ -360,22 +360,17 @@ def _audit_extract_header(
         if (
             isinstance(stmt, ast.If)
             and ast.unparse(stmt.test) in ("TYPE_CHECKING", "typing.TYPE_CHECKING")
-            and all(
-                isinstance(sub, (ast.Import, ast.ImportFrom)) for sub in stmt.body
-            )
+            and all(isinstance(sub, (ast.Import, ast.ImportFrom)) for sub in stmt.body)
         ):
             continue
         if isinstance(stmt, (ast.Assign, ast.AnnAssign)):
-            targets = (
-                stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target]
-            )
+            targets = stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target]
             names = [x.id for x in targets if isinstance(x, ast.Name)]
             value_src = ast.unparse(stmt.value) if stmt.value is not None else None
             if value_src == "logging.getLogger(__name__)":
                 continue
             if names and all(
-                n in removed_assigns and removed_assigns[n] == value_src
-                for n in names
+                n in removed_assigns and removed_assigns[n] == value_src for n in names
             ):
                 header_assigned.update(names)
                 continue
@@ -966,14 +961,16 @@ class Repro:
                 hit = names & dropped
                 if not hit:
                     continue
-                assert len(names) == len(targets), (
-                    f"drop_assigns {sorted(hit)}: non-name targets in {src}"
-                )
+                assert len(names) == len(
+                    targets
+                ), f"drop_assigns {sorted(hit)}: non-name targets in {src}"
                 value_src = ast.unparse(node.value) if node.value is not None else None
                 for dropped_name in hit:
                     removed_assigns[dropped_name] = value_src
                 surviving = [
-                    x.id for x in targets if isinstance(x, ast.Name) and x.id not in dropped
+                    x.id
+                    for x in targets
+                    if isinstance(x, ast.Name) and x.id not in dropped
                 ]
                 if surviving:
                     kept_stmt = (
@@ -1071,9 +1068,9 @@ class Repro:
             src_text = _read_source(src_path)
             assert src_text.count(body) == 1, f"block not found uniquely in {src}"
             at = src_text.find(body)
-            assert at == 0 or src_text[at - 1] == "\n", (
-                f"block matches mid-line in {src}; it must start at a line boundary"
-            )
+            assert (
+                at == 0 or src_text[at - 1] == "\n"
+            ), f"block matches mid-line in {src}; it must start at a line boundary"
             _write_source(src_path, src_text.replace(body, call, 1))
 
             dst_path = root / dst
