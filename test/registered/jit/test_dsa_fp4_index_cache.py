@@ -245,3 +245,118 @@ def test_paged_logits_fp4_tracks_fp8_and_matches_ragged() -> None:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+# ----------------------------------------------------------------------------
+# Fused-kernel MXFP4 mode (is_fp4=True store kernel, rope-first FP4 Q kernel;
+# interleave RoPE — GLM-5.x). The fused K store shares its norm+rope path with
+# fused_k_indexer_norm_rope and rounds through bf16 before quant, so it must
+# match the un-fused bf16-kernel + store_fp4_index_k_cache path bit-for-bit.
+# The Q kernel ropes in fp32 (fma scheduling may differ from the torch
+# reference), so it is held to a high byte-match rate plus exact head-gate
+# weights instead.
+# ----------------------------------------------------------------------------
+
+MAX_POS = 8192
+ROPE_DIM = 64
+HALF = ROPE_DIM // 2
+EPS = 1e-6
+
+
+def _make_rope_inputs(B, seed=0):
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    cos = torch.randn(MAX_POS, HALF, device="cuda", generator=g)
+    sin = torch.randn(MAX_POS, HALF, device="cuda", generator=g)
+    cos_sin_cache = torch.cat((cos, sin), dim=-1)
+    positions = torch.randint(
+        0, 4096, (B,), device="cuda", dtype=torch.int32, generator=g
+    )
+    return cos, sin, cos_sin_cache, positions
+
+
+def _rope_first_interleave_ref(x, cos_p, sin_p):
+    x = x.clone()
+    xr = x[..., 0:ROPE_DIM:2].clone()
+    xi = x[..., 1:ROPE_DIM:2].clone()
+    x[..., 0:ROPE_DIM:2] = xr * cos_p - xi * sin_p
+    x[..., 1:ROPE_DIM:2] = xr * sin_p + xi * cos_p
+    return x
+
+
+def test_fused_k_fp4_store_matches_unfused_path() -> None:
+    from sglang.jit_kernel.dsv32 import (
+        fused_k_indexer_norm_rope,
+        fused_k_indexer_norm_rope_store,
+    )
+
+    torch.manual_seed(10)
+    B = 1024
+    total_pages = 32
+    assert B <= total_pages * PAGE_SIZE
+    _, _, cos_sin_cache, positions = _make_rope_inputs(B, seed=10)
+    # Strided input: the non-contiguous wk_weights_proj slice path.
+    kw = torch.randn(B, HEAD_DIM + 64, dtype=torch.bfloat16, device="cuda")
+    key = kw[:, :HEAD_DIM]
+    weight = torch.randn(HEAD_DIM, dtype=torch.float32, device="cuda")
+    bias = torch.randn(HEAD_DIM, dtype=torch.float32, device="cuda")
+    loc = torch.randperm(total_pages * PAGE_SIZE, device="cuda")[:B]
+
+    cache_fused = torch.zeros(
+        total_pages, PAGE_SIZE * (FP4_BYTES + 4), dtype=torch.uint8, device="cuda"
+    )
+    fused_k_indexer_norm_rope_store(
+        key,
+        cache_fused,
+        loc,
+        weight,
+        bias,
+        EPS,
+        cos_sin_cache,
+        positions,
+        PAGE_SIZE,
+        is_fp4=True,
+    )
+
+    # Un-fused reference: the bf16 K kernel (same norm+rope path) + the
+    # standalone Triton FP4 store.
+    k_bf16 = fused_k_indexer_norm_rope(key, weight, bias, EPS, cos_sin_cache, positions)
+    cache_ref = torch.zeros_like(cache_fused)
+    store_fp4_index_k_cache(k_bf16, cache_ref, loc, page_size=PAGE_SIZE)
+
+    assert torch.equal(cache_fused, cache_ref), "fused FP4 K store != un-fused path"
+
+
+def test_fused_q_fp4_matches_eager_reference() -> None:
+    from sglang.jit_kernel.dsv4 import fused_q_indexer_rope_first_fp4_quant
+
+    torch.manual_seed(11)
+    B, H = 256, 32
+    cos, sin, cos_sin_cache, positions = _make_rope_inputs(B, seed=11)
+    q = torch.randn(B, H, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+    # Strided head-gate weights: the non-contiguous wk_weights_proj slice path.
+    kw = torch.randn(B, HEAD_DIM + H, dtype=torch.bfloat16, device="cuda")
+    weights_raw = kw[:, HEAD_DIM:]
+    weight_scale = 0.0625
+
+    (q_fp4, q_sf), w_out = fused_q_indexer_rope_first_fp4_quant(
+        q, weights_raw, weight_scale, cos_sin_cache, positions
+    )
+    assert q_fp4.shape == (B, H, FP4_BYTES) and q_fp4.dtype == torch.int8
+    assert q_sf.shape == (B, H) and q_sf.dtype == torch.int32
+
+    # Head-gate weights carry no per-token q_scale on the FP4 path.
+    torch.testing.assert_close(
+        w_out.squeeze(-1), weights_raw.float() * weight_scale, atol=1e-6, rtol=0.0
+    )
+
+    # Eager reference: fp32 rope -> bf16 round -> Triton MXFP4 quant. The
+    # kernel's fp32 fma scheduling may differ by 1 ulp at E2M1 code
+    # boundaries, so demand a very high (not perfect) byte-match rate.
+    cp = cos[positions.long()].unsqueeze(1)
+    sp = sin[positions.long()].unsqueeze(1)
+    ref = _rope_first_interleave_ref(q.float(), cp, sp).to(torch.bfloat16)
+    ref_fp4, ref_sf = quantize_fp4_indexer_tensor(ref.view(-1, HEAD_DIM))
+    byte_match = (q_fp4.view(-1, FP4_BYTES) == ref_fp4).float().mean().item()
+    sf_match = (q_sf.view(-1) == ref_sf).float().mean().item()
+    assert byte_match > 0.999, f"FP4 Q byte match too low: {byte_match:.5f}"
+    assert sf_match > 0.999, f"FP4 Q sf match too low: {sf_match:.5f}"

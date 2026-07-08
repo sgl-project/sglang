@@ -165,7 +165,10 @@ def _uses_dsa_attention_backend(forward_batch: ForwardBatch) -> bool:
 
 
 if _is_cuda:
-    from sglang.jit_kernel.dsv4 import fused_q_indexer_rope_first_quant
+    from sglang.jit_kernel.dsv4 import (
+        fused_q_indexer_rope_first_fp4_quant,
+        fused_q_indexer_rope_first_quant,
+    )
     from sglang.jit_kernel.dsv32 import (
         fused_k_indexer_norm_rope,
         fused_k_indexer_norm_rope_store,
@@ -385,13 +388,13 @@ class Indexer(MultiPlatformOp):
         self.use_fp4_index_cache = (
             _is_cuda and get_global_server_args().enable_dsa_fp4_indexer
         )
-        # The fused indexer kernels quantize/store the FP8 132 B index-K layout;
-        # the opt-in MXFP4 cache routes Q/K prep through the split path instead.
+        # The fused indexer kernels have both FP8 (132 B) and MXFP4 (68 B)
+        # quant/store modes, so the FP4 index cache keeps fusion enabled
+        # (still interleave-only; NeoX models take the split path).
         self.use_dsa_indexer_fusion = (
             _is_cuda
             and not envs.SGLANG_DISABLE_DSA_INDEXER_FUSION.get()
             and not is_neox_style
-            and not self.use_fp4_index_cache
         )
         self.alt_stream = alt_stream
         self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
@@ -768,6 +771,7 @@ class Indexer(MultiPlatformOp):
                 self._indexer_cos_sin_cache,
                 positions,
                 page_size,
+                is_fp4=self.use_fp4_index_cache,
             )
             return
 
@@ -803,6 +807,13 @@ class Indexer(MultiPlatformOp):
         # num_tokens (graph split-op contract) slices q/k/positions/out_cache_loc
         # to the unpadded count; the returned q_fp8/weights are sliced to match.
         q_scale_gate = self.softmax_scale * self.n_heads**-0.5
+        # FP4 returns ((q_fp4, q_sf), weights); downstream top-k paths take the
+        # q representation opaquely.
+        fused_q_fn = (
+            fused_q_indexer_rope_first_fp4_quant
+            if self.use_fp4_index_cache
+            else fused_q_indexer_rope_first_quant
+        )
         out_cache_loc = forward_batch.out_cache_loc
         if num_tokens is not None:
             positions = positions[:num_tokens]
@@ -825,7 +836,7 @@ class Indexer(MultiPlatformOp):
             q = self.wq_b(q_lora)[0].view(-1, self.n_heads, self.head_dim)
             if num_tokens is not None:
                 q = q[:num_tokens]
-            return fused_q_indexer_rope_first_quant(
+            return fused_q_fn(
                 q.contiguous(),
                 weights_raw,
                 q_scale_gate,
@@ -852,7 +863,7 @@ class Indexer(MultiPlatformOp):
 
         current_stream.wait_stream(self.alt_stream)
         self.alt_stream.wait_stream(current_stream)
-        q_fp8, weights = fused_q_indexer_rope_first_quant(
+        q_fp8, weights = fused_q_fn(
             q.contiguous(),
             weights_raw,
             q_scale_gate,

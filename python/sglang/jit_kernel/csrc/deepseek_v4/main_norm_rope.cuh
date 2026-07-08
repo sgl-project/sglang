@@ -20,20 +20,7 @@ namespace {
 using deepseek_v4::fp8::cast_to_ue8m0;
 using deepseek_v4::fp8::inv_scale_ue8m0;
 using deepseek_v4::fp8::pack_fp8;
-
-SGL_DEVICE uint8_t quant_fp4_e2m1(float x) {
-  const float ax = fminf(fabsf(x), 6.0f);
-  uint8_t idx = 0;
-  idx += ax > 0.25f;
-  idx += ax > 0.75f;
-  idx += ax > 1.25f;
-  idx += ax > 1.75f;
-  idx += ax > 2.5f;
-  idx += ax > 3.5f;
-  idx += ax > 5.0f;
-  if (x < 0.0f && idx != 0) idx |= 0x8;
-  return idx;
-}
+using deepseek_v4::fp8::quant_fp4_e2m1;
 
 // 4 warps per block: warp-per-(token, head) work-item dispatch (Q kernel).
 constexpr uint32_t kFusedQBlockSize = 128;
@@ -680,11 +667,13 @@ struct FusedQIndexerRopeHadamardFp4QuantParams {
   float weight_scale;
   const float* __restrict__ freqs_cis;
   const void* __restrict__ positions;
+  // Row stride for `weight` (V3.2/GLM pass the non-contiguous wk slice directly).
+  int64_t weight_stride_batch;
   uint32_t batch_size;
   uint32_t num_heads;
 };
 
-template <typename DType, typename PosT, bool kUsePDL>
+template <typename DType, typename PosT, bool kUsePDL, bool kRopeFirst = false, bool kHadamard = true>
 Q_KERNEL void
 fused_q_indexer_rope_hadamard_fp4_quant(const __grid_constant__ FusedQIndexerRopeHadamardFp4QuantParams params) {
   using namespace device;
@@ -703,7 +692,9 @@ fused_q_indexer_rope_hadamard_fp4_quant(const __grid_constant__ FusedQIndexerRop
   const auto warp_id = threadIdx.x / kWarpThreads;
   const auto lane_id = threadIdx.x % kWarpThreads;
   const auto work_id = blockIdx.x * kFusedQNumWarps + warp_id;
-  const bool is_rope_lane = lane_id >= kWarpThreads - kRopeSize;
+  // V4 ropes the trailing kRopeDim dims (kRopeFirst=false); V3.2/GLM rope the
+  // leading kRopeDim dims (kRopeFirst=true). Select the owning lanes per layout.
+  const bool is_rope_lane = kRopeFirst ? (lane_id < kRopeSize) : (lane_id >= kWarpThreads - kRopeSize);
 
   const uint32_t total_works = params.batch_size * params.num_heads;
   if (work_id >= total_works) return;
@@ -715,12 +706,20 @@ fused_q_indexer_rope_hadamard_fp4_quant(const __grid_constant__ FusedQIndexerRop
 
   PDLWaitPrimary<kUsePDL>();
   Float4 data, freq;
-  const auto weight_val = cast<float>(static_cast<const DType*>(params.weight)[work_id]);
+  const uint32_t head_id = work_id - batch_id * params.num_heads;
+  const auto weight_val =
+      cast<float>(static_cast<const DType*>(params.weight)[batch_id * params.weight_stride_batch + head_id]);
 
   {
     Storage input_vec;
     input_vec.load(input_ptr, lane_id);
-    if (is_rope_lane) freq.load(freqs_cis, lane_id - (kWarpThreads - kRopeSize));
+    if (is_rope_lane) {
+      if constexpr (kRopeFirst) {
+        freq = load_rope_first_cos_sin<kRopeDim>(freqs_cis, lane_id);
+      } else {
+        freq.load(freqs_cis, lane_id - (kWarpThreads - kRopeSize));
+      }
+    }
 #pragma unroll
     for (int i = 0; i < kVecSize; ++i) {
       data[i] = cast<float>(input_vec[i]);
@@ -740,6 +739,8 @@ fused_q_indexer_rope_hadamard_fp4_quant(const __grid_constant__ FusedQIndexerRop
     data[1] = x_real * fxi + x_imag * fxr;
     data[2] = y_real * fyr - y_imag * fyi;
     data[3] = y_real * fyi + y_imag * fyr;
+    // Round through DType so the FP4 codes match the eager reference, which
+    // quantizes the bf16 rope output.
 #pragma unroll
     for (int i = 0; i < kVecSize; ++i)
       data[i] = cast<float>(cast<DType>(data[i]));
@@ -747,7 +748,7 @@ fused_q_indexer_rope_hadamard_fp4_quant(const __grid_constant__ FusedQIndexerRop
 
   PDLTriggerSecondary<kUsePDL>();
 
-  {
+  if constexpr (kHadamard) {
     {
       const float a0 = data[0], a1 = data[1], a2 = data[2], a3 = data[3];
       data[0] = a0 + a1;
@@ -801,10 +802,10 @@ fused_q_indexer_rope_hadamard_fp4_quant(const __grid_constant__ FusedQIndexerRop
   }
 }
 
-template <typename DType, bool kUsePDL>
+template <typename DType, bool kUsePDL, bool kRopeFirst = false, bool kHadamard = true>
 struct FusedQIndexerRopeHadamardFp4QuantKernel {
   template <typename PosT>
-  static constexpr auto kernel = fused_q_indexer_rope_hadamard_fp4_quant<DType, PosT, kUsePDL>;
+  static constexpr auto kernel = fused_q_indexer_rope_hadamard_fp4_quant<DType, PosT, kUsePDL, kRopeFirst, kHadamard>;
 
   static void forward(
       const tvm::ffi::TensorView q_input,
@@ -836,7 +837,7 @@ struct FusedQIndexerRopeHadamardFp4QuantKernel {
         .with_device(device_)
         .verify(q_fp4);
     TensorMatcher({B, H}).with_dtype<int32_t>().with_device(device_).verify(q_sf);
-    TensorMatcher({B, H}).with_dtype<DType>().with_device(device_).verify(weight);
+    TensorMatcher({B, H}).with_strides({-1, 1}).with_dtype<DType>().with_device(device_).verify(weight);
     TensorMatcher({B, H, 1}).with_dtype<float>().with_device(device_).verify(weights_out);
     TensorMatcher({-1, kRopeDim}).with_dtype<float>().with_device(device_).verify(freqs_cis);
     auto pos_dtype = SymbolicDType{};
@@ -861,6 +862,7 @@ struct FusedQIndexerRopeHadamardFp4QuantKernel {
         .weight_scale = static_cast<float>(weight_scale),
         .freqs_cis = static_cast<const float*>(freqs_cis.data_ptr()),
         .positions = positions.data_ptr(),
+        .weight_stride_batch = weight.stride(0),
         .batch_size = batch_size,
         .num_heads = num_heads,
     };
