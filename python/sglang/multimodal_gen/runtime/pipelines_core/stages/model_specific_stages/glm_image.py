@@ -393,6 +393,7 @@ class GlmImageAR(PipelineStage):
                 image=ar_condition_images,
                 height=height,
                 width=width,
+                server_args=server_args,
             )
         else:
             rng_devices = []
@@ -405,6 +406,7 @@ class GlmImageAR(PipelineStage):
                     image=ar_condition_images,
                     height=height,
                     width=width,
+                    server_args=server_args,
                 )
         prior_token_id = prior_token_id.to(device=device)
         time_end = time.time()
