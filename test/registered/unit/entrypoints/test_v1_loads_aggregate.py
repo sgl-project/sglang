@@ -40,6 +40,7 @@ def _temp_path() -> str:
 class _FakeTokenizerManager(TokenizerControlMixin):
     def __init__(self, reader, dp_size: int):
         self.load_snapshot_reader = reader
+        self.elastic_worker_count = dp_size
         self.server_args = SimpleNamespace(
             dp_size=dp_size,
             enable_dp_attention=False,

@@ -46,26 +46,22 @@ _ATTN_DP_SIZE: Optional[int] = None
 _LOCAL_ATTN_DP_SIZE: Optional[int] = None
 _LOCAL_ATTN_DP_RANK: Optional[int] = None
 
-_USE_WORLD_GROUP_FOR_DP_GATHER: bool = False
-
-_ELASTIC_JOINER_SKIP_ALL_GATHER: bool = False
-
 
 def world_dp_gather_enabled() -> bool:
     """Whether DP gathers should use expanded WORLD after joiner admission."""
-    return _USE_WORLD_GROUP_FOR_DP_GATHER and not _ELASTIC_JOINER_SKIP_ALL_GATHER
+    dp = get_flags().dp
+    return dp.use_world_group_for_gather and not dp.joiner_skip_all_gather
 
 
 def enable_joiner_all_gather():
-    global _ELASTIC_JOINER_SKIP_ALL_GATHER
-    _ELASTIC_JOINER_SKIP_ALL_GATHER = False
+    get_flags().dp.joiner_skip_all_gather = False
 
 
 def update_dp_attention_post_scale(new_dp_size: int, new_dp_rank: int):
-    global _ATTN_DP_SIZE, _ATTN_DP_RANK, _USE_WORLD_GROUP_FOR_DP_GATHER
+    global _ATTN_DP_SIZE, _ATTN_DP_RANK
     _ATTN_DP_SIZE = new_dp_size
     _ATTN_DP_RANK = new_dp_rank
-    _USE_WORLD_GROUP_FOR_DP_GATHER = True
+    get_flags().dp.use_world_group_for_gather = True
     logger.debug(
         "[Elastic EP] dp_attention switched to WORLD: dp_size=%d dp_rank=%d",
         new_dp_size,
@@ -335,9 +331,8 @@ def initialize_dp_attention(
         if server_args.elastic_ep_backend is not None and server_args.max_ep_size:
             _ATTN_DP_RANK = tp_rank + server_args.ep_join_rank_offset
 
-            global _ELASTIC_JOINER_SKIP_ALL_GATHER
             if server_args.is_ep_scale_joiner:
-                _ELASTIC_JOINER_SKIP_ALL_GATHER = True
+                dp.joiner_skip_all_gather = True
         if moe_dense_tp_size is None:
             _LOCAL_ATTN_DP_SIZE = _ATTN_DP_SIZE
         else:
