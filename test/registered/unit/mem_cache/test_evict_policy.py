@@ -6,7 +6,7 @@ register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 register_cpu_ci(est_time=7, suite="base-c-test-cpu")
 
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from sglang.srt.mem_cache.evict_policy import (
     FIFOStrategy,
@@ -15,6 +15,7 @@ from sglang.srt.mem_cache.evict_policy import (
     LRUStrategy,
     MRUStrategy,
     PriorityStrategy,
+    QoSAwareStrategy,
     SLRUStrategy,
 )
 
@@ -25,6 +26,7 @@ def _make_node(**kwargs):
     node.hit_count = kwargs.get("hit_count", 0)
     node.creation_time = kwargs.get("creation_time", 0.0)
     node.priority = kwargs.get("priority", 0)
+    node.key = kwargs.get("key", [0])
     return node
 
 
@@ -137,6 +139,45 @@ class TestPriorityStrategy(unittest.TestCase):
         new = _make_node(priority=3, last_access_time=10.0)
         self.assertLess(
             self.strategy.get_priority(old), self.strategy.get_priority(new)
+        )
+
+
+class TestQoSAwareStrategy(unittest.TestCase):
+    def setUp(self):
+        self.strategy = QoSAwareStrategy()
+
+    def _get_priority(self, node):
+        with patch(
+            "sglang.srt.mem_cache.evict_policy.time.monotonic",
+            return_value=20.0,
+        ):
+            return self.strategy.get_priority(node)
+
+    def test_higher_hit_count_evicted_later(self):
+        cold = _make_node(hit_count=1, priority=1, key=[1], last_access_time=10.0)
+        hot = _make_node(hit_count=5, priority=1, key=[1], last_access_time=1.0)
+        self.assertLess(self._get_priority(cold), self._get_priority(hot))
+
+    def test_higher_qos_priority_evicted_later(self):
+        low_qos = _make_node(hit_count=2, priority=1, key=[1], last_access_time=10.0)
+        high_qos = _make_node(hit_count=2, priority=8, key=[1], last_access_time=1.0)
+        self.assertLess(self._get_priority(low_qos), self._get_priority(high_qos))
+
+    def test_default_qos_weight_is_one(self):
+        zero_qos = _make_node(hit_count=2, priority=0, key=[1], last_access_time=1.0)
+        one_qos = _make_node(hit_count=2, priority=1, key=[1], last_access_time=1.0)
+        self.assertEqual(
+            self._get_priority(zero_qos)[0],
+            self._get_priority(one_qos)[0],
+        )
+
+    def test_same_score_older_access_evicted_first(self):
+        old = _make_node(hit_count=2, priority=1, key=[1], last_access_time=1.0)
+        new = _make_node(hit_count=2, priority=1, key=[1], last_access_time=10.0)
+        old_score, _ = self._get_priority(old)
+        self.assertLess(
+            (old_score, old.last_access_time),
+            (old_score, new.last_access_time),
         )
 
 

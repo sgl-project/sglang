@@ -315,6 +315,7 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         mock_allocator: Optional[Any] = None,
         page_size: int = 1,
         enable_kv_cache_events: bool = False,
+        eviction_policy: str = "lru",
     ) -> RadixCache:
         """Init a radix cache without memory pools for simulation purpose."""
         params = CacheInitParams(
@@ -323,6 +324,7 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
             token_to_kv_pool_allocator=mock_allocator,
             page_size=page_size,
             enable_kv_cache_events=enable_kv_cache_events,
+            eviction_policy=eviction_policy,
         )
         return RadixCache(params)
 
@@ -658,10 +660,12 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
             prefix_len = child.key.match(key, page_size=self.page_size)
             if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
+                self._inc_qos_aware_hit_count(new_node)
                 value.append(new_node.value)
                 node = new_node
                 break
             else:
+                self._inc_qos_aware_hit_count(child)
                 value.append(child.value)
                 node = child
                 key = key[prefix_len:]
@@ -700,6 +704,10 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         if chunked:
             return
         node.hit_count += 1
+
+    def _inc_qos_aware_hit_count(self, node: TreeNode):
+        if self.eviction_policy == "qos-aware":
+            node.hit_count += 1
 
     def _insert_helper(
         self,

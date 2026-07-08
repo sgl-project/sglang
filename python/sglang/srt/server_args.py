@@ -291,7 +291,7 @@ FP4_GEMM_RUNNER_BACKEND_CHOICES = [
 
 BF16_GEMM_BACKEND_CHOICES = ["auto", "cutedsl"]
 
-RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru", "priority"]
+RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru", "priority", "qos-aware"]
 
 RL_ON_POLICY_TARGET_CHOICES = ["fsdp"]
 
@@ -710,6 +710,7 @@ class ServerArgs:
                 "dfs-weight",
                 "lof",
                 "priority",
+                "qos-lpm",
                 "routing-key",
             ],
         ),
@@ -766,8 +767,9 @@ class ServerArgs:
             help=(
                 "The eviction policy of radix trees. 'lru' stands for Least "
                 "Recently Used, 'lfu' stands for Least Frequently Used, 'slru' "
-                "stands for Segmented Least Recently Used, and 'priority' evicts "
-                "lower-priority requests first."
+                "stands for Segmented Least Recently Used, 'priority' evicts "
+                "lower-priority requests first, and 'qos-aware' evicts low hotness/QoS "
+                "prefixes first."
             ),
             choices=RADIX_EVICTION_POLICY_CHOICES,
         ),
@@ -6939,7 +6941,11 @@ class ServerArgs:
             assert self.schedule_policy in [
                 "fcfs",
                 "lof",
-            ], f"To use priority scheduling, schedule_policy must be 'fcfs' or 'lof'. '{self.schedule_policy}' is not supported."
+                "qos-lpm",
+            ], (
+                "To use priority scheduling, schedule_policy must be 'fcfs', "
+                f"'lof', or 'qos-lpm'. '{self.schedule_policy}' is not supported."
+            )
             if self.default_priority_value is None:
                 logger.warning(
                     "--default-priority-value is not set while --enable-priority-scheduling is enabled. "

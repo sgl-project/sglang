@@ -580,6 +580,91 @@ class TestRadixCache(unittest.TestCase):
         # Non-existent extra_key should not match
         self.assertEqual(len(result4.device_indices), 0)
 
+    def test_qos_aware_match_updates_hit_count_only_for_policy(self):
+        qos_cache = RadixCache.create_simulated(eviction_policy="qos-aware")
+        lru_cache = RadixCache.create_simulated(eviction_policy="lru")
+
+        key = RadixKey([1, 2, 3])
+        qos_cache.insert(InsertParams(key=key, value=torch.tensor([1, 2, 3])))
+        lru_cache.insert(InsertParams(key=key, value=torch.tensor([1, 2, 3])))
+
+        qos_node = qos_cache.match_prefix(MatchPrefixParams(key=key)).last_device_node
+        lru_node = lru_cache.match_prefix(MatchPrefixParams(key=key)).last_device_node
+
+        self.assertEqual(qos_node.hit_count, 2)
+        self.assertEqual(lru_node.hit_count, 1)
+
+    def test_qos_aware_evicts_colder_prefix_first(self):
+        mock_allocator = unittest.mock.Mock()
+        cache = RadixCache.create_simulated(
+            mock_allocator=mock_allocator, eviction_policy="qos-aware"
+        )
+
+        hot_key = RadixKey([1, 2])
+        cold_key = RadixKey([3, 4])
+        cache.insert(InsertParams(key=hot_key, value=torch.tensor([1, 2])))
+        cache.insert(InsertParams(key=cold_key, value=torch.tensor([3, 4])))
+        cache.match_prefix(MatchPrefixParams(key=hot_key))
+        cache.match_prefix(MatchPrefixParams(key=hot_key))
+
+        cache.evict(EvictParams(num_tokens=2))
+
+        self.assertEqual(
+            len(cache.match_prefix(MatchPrefixParams(key=cold_key)).device_indices), 0
+        )
+        self.assertEqual(
+            len(cache.match_prefix(MatchPrefixParams(key=hot_key)).device_indices), 2
+        )
+
+    def test_qos_aware_evicts_lower_qos_first(self):
+        mock_allocator = unittest.mock.Mock()
+        cache = RadixCache.create_simulated(
+            mock_allocator=mock_allocator, eviction_policy="qos-aware"
+        )
+
+        high_qos_key = RadixKey([1, 2])
+        low_qos_key = RadixKey([3, 4])
+        cache.insert(
+            InsertParams(key=high_qos_key, value=torch.tensor([1, 2]), priority=8)
+        )
+        cache.insert(
+            InsertParams(key=low_qos_key, value=torch.tensor([3, 4]), priority=1)
+        )
+
+        cache.evict(EvictParams(num_tokens=2))
+
+        self.assertEqual(
+            len(cache.match_prefix(MatchPrefixParams(key=low_qos_key)).device_indices),
+            0,
+        )
+        self.assertEqual(
+            len(cache.match_prefix(MatchPrefixParams(key=high_qos_key)).device_indices),
+            2,
+        )
+
+    def test_qos_aware_shared_prefix_uses_max_priority(self):
+        cache = RadixCache.create_simulated(eviction_policy="qos-aware")
+
+        cache.insert(
+            InsertParams(
+                key=RadixKey([1, 2, 3]),
+                value=torch.tensor([1, 2, 3]),
+                priority=1,
+            )
+        )
+        cache.insert(
+            InsertParams(
+                key=RadixKey([1, 2, 4]),
+                value=torch.tensor([1, 2, 4]),
+                priority=9,
+            )
+        )
+
+        shared_node = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey([1, 2]))
+        ).last_device_node
+        self.assertEqual(shared_node.priority, 9)
+
     def test_lock_ref_operations(self):
         """Test lock reference counting operations."""
         cache = RadixCache.create_simulated()
