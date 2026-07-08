@@ -60,11 +60,15 @@ class KVArgs:
     # for pp prefill
     pp_rank: int
     prefill_start_layer: int
-    # Absolute end layer (exclusive) for this PP stage, needed to reconstruct
-    # PP sub-ranges when kv_data_ptrs isn't flat layer-indexed (e.g. DeepSeek V4).
+    # Absolute end layer (exclusive) for this prefill PP stage. Needed to
+    # reconstruct PP sub-ranges when kv_data_ptrs does not use a flat
+    # layer-indexed layout (e.g. DeepSeek V4's buffer-type-organized flat
+    # list).
     prefill_end_layer: Optional[int]
-    # Compressed-MLA pools only. Per-layer compression ratio (0/4/128) for
-    # PP-aware slicing of the buffer-type-organized flat list.
+    # For DeepSeek V4 (and other compressed-MLA) memory pools only.
+    # Full-model compression ratio per layer (entries are 0/4/128). Used by
+    # the connection layer to slice the buffer-type-organized flat list in a
+    # PP-aware manner.
     mla_compression_ratios: Optional[List[int]]
     # Only used of npu, for kv buf groups
     kv_buf_groups: int
