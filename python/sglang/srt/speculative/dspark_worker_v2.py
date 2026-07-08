@@ -712,9 +712,11 @@ class DSparkWorkerV2(BaseSpecWorker):
         batch: ScheduleBatch,
         seq_lens_before: torch.Tensor,
         cache_loc: torch.Tensor,
+        req_pool_indices: Optional[torch.Tensor] = None,
     ) -> ForwardBatch:
         old_input_ids = batch.input_ids
         old_out_cache_loc = batch.out_cache_loc
+        old_req_pool_indices = batch.req_pool_indices
         old_spec_info = batch.spec_info
         old_forward_mode = batch.forward_mode
         old_capture_hidden_mode = batch.capture_hidden_mode
@@ -726,6 +728,8 @@ class DSparkWorkerV2(BaseSpecWorker):
                 (seq_lens_before.numel(),), dtype=torch.int64, device=self.device
             )
             batch.out_cache_loc = cache_loc
+            if req_pool_indices is not None:
+                batch.req_pool_indices = req_pool_indices
             batch.spec_info = None
             batch.forward_mode = ForwardMode.DECODE
             batch.capture_hidden_mode = CaptureHiddenMode.NULL
@@ -741,6 +745,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         finally:
             batch.input_ids = old_input_ids
             batch.out_cache_loc = old_out_cache_loc
+            batch.req_pool_indices = old_req_pool_indices
             batch.spec_info = old_spec_info
             batch.forward_mode = old_forward_mode
             batch.capture_hidden_mode = old_capture_hidden_mode
@@ -833,16 +838,6 @@ class DSparkWorkerV2(BaseSpecWorker):
             return
         if hidden.dim() != 2:
             return
-        if hidden.shape[0] != bs:
-            if not self._is_tp0():
-                return
-            logger.warning(
-                "Skip DSpark PD hidden bootstrap due to shape mismatch: "
-                "hidden_shape=%s bs=%s",
-                tuple(hidden.shape),
-                bs,
-            )
-            return
         expected_hidden_size = self._get_target_aux_hidden_size()
         if expected_hidden_size and hidden.shape[-1] != expected_hidden_size:
             if not self._is_tp0():
@@ -855,12 +850,50 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
             return
         hidden_valid_mask = draft_input.hidden_valid_mask
-        if hidden_valid_mask is None or hidden_valid_mask.numel() != bs:
+        hidden_rows = int(hidden.shape[0])
+        if hidden_valid_mask is None or hidden_valid_mask.numel() != hidden_rows:
             return
+
+        if hidden_rows == bs:
+            batch_rows = torch.arange(bs, dtype=torch.int64, device=prefix_lens.device)
+            payload_rows = batch_rows
+        elif hidden_rows < bs:
+            future_indices = getattr(draft_input, "future_indices", None)
+            if future_indices is not None and int(future_indices.numel()) == hidden_rows:
+                future_indices = future_indices.to(
+                    device=batch.req_pool_indices.device,
+                    dtype=batch.req_pool_indices.dtype,
+                )
+                matched = (
+                    batch.req_pool_indices.view(-1, 1)
+                    == future_indices.view(1, -1)
+                )
+                batch_rows, payload_rows = torch.nonzero(matched, as_tuple=True)
+                if batch_rows.numel() == 0:
+                    return
+            else:
+                # A PD handoff payload can be sparse after merging a few newly
+                # transferred requests into a larger running batch. In that
+                # synchronous merge path the sparse payload belongs to the
+                # appended tail rows.
+                batch_rows = torch.arange(
+                    bs - hidden_rows, bs, dtype=torch.int64, device=prefix_lens.device
+                )
+                payload_rows = torch.arange(
+                    hidden_rows, dtype=torch.int64, device=hidden.device
+                )
+        else:
+            return
+
+        req_pool_indices = batch.req_pool_indices[batch_rows]
+        prefix_lens = prefix_lens[batch_rows]
+        payload_rows_for_hidden = payload_rows.to(device=hidden.device)
+        hidden = hidden[payload_rows_for_hidden]
+        hidden_valid_mask = hidden_valid_mask.reshape(-1)[payload_rows_for_hidden]
 
         cache_loc = get_last_loc(
             self.model_runner.req_to_token_pool.req_to_token,
-            batch.req_pool_indices,
+            req_pool_indices,
             prefix_lens,
         )
         positions = prefix_lens.to(torch.int64) - 1
@@ -876,6 +909,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             batch=batch,
             seq_lens_before=seq_lens_before,
             cache_loc=cache_loc[valid],
+            req_pool_indices=req_pool_indices[valid],
         )
         self._materialize_main_hidden_to_draft_state(
             main_hidden=hidden[valid],

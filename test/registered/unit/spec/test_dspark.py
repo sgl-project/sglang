@@ -970,6 +970,100 @@ class TestDSparkPrefillHandoff(CustomTestCase):
 
         self.assertEqual(anchors.tolist(), [777, 777, 6])
 
+    def _pd_materialize_worker(self):
+        t = self.torch
+        worker = self._worker(0)
+        worker.device = t.device("cpu")
+        worker._get_target_aux_hidden_size = lambda: 2
+        req_to_token = t.full((64, 8), -1, dtype=t.int64)
+        for req_pool_idx in range(1, 64):
+            req_to_token[req_pool_idx, 4] = req_pool_idx * 100 + 4
+        worker.model_runner = SimpleNamespace(
+            req_to_token_pool=SimpleNamespace(req_to_token=req_to_token)
+        )
+        return worker
+
+    def test_disagg_hidden_bootstrap_maps_sparse_future_payload(self):
+        t = self.torch
+        from sglang.srt.speculative.dspark_info import DSparkDraftInputV2
+
+        worker = self._pd_materialize_worker()
+        captures = {}
+
+        def make_forward_batch(**kwargs):
+            captures["forward_kwargs"] = kwargs
+            return SimpleNamespace()
+
+        def materialize(**kwargs):
+            captures["materialize_kwargs"] = kwargs
+
+        worker._make_draft_decode_forward_batch_for_materialize = make_forward_batch
+        worker._materialize_main_hidden_to_draft_state = materialize
+
+        req_pool_indices = t.arange(1, 53, dtype=t.int64)
+        draft_input = DSparkDraftInputV2(
+            bonus_tokens=t.tensor([101], dtype=t.int64),
+            new_seq_lens=t.tensor([5], dtype=t.int64),
+            hidden_states=t.tensor([[1.0, 2.0]]),
+            hidden_valid_mask=t.tensor([True]),
+            future_indices=t.tensor([17], dtype=t.int64),
+        )
+        batch = SimpleNamespace(req_pool_indices=req_pool_indices)
+
+        self.worker_cls._materialize_disagg_prefill_hidden_to_draft_state(
+            worker,
+            draft_input=draft_input,
+            batch=batch,
+            prefix_lens=t.full((52,), 5, dtype=t.int64),
+        )
+
+        self.assertEqual(
+            captures["forward_kwargs"]["req_pool_indices"].tolist(), [17]
+        )
+        self.assertEqual(captures["forward_kwargs"]["cache_loc"].tolist(), [1704])
+        self.assertEqual(captures["forward_kwargs"]["seq_lens_before"].tolist(), [4])
+        self.assertEqual(
+            captures["materialize_kwargs"]["main_hidden"].tolist(), [[1.0, 2.0]]
+        )
+        self.assertEqual(captures["materialize_kwargs"]["positions"].tolist(), [4])
+
+    def test_disagg_hidden_bootstrap_maps_sparse_tail_payload_after_merge(self):
+        t = self.torch
+        from sglang.srt.speculative.dspark_info import DSparkDraftInputV2
+
+        worker = self._pd_materialize_worker()
+        captures = {}
+        worker._make_draft_decode_forward_batch_for_materialize = (
+            lambda **kwargs: captures.setdefault("forward_kwargs", kwargs)
+            or SimpleNamespace()
+        )
+        worker._materialize_main_hidden_to_draft_state = (
+            lambda **kwargs: captures.setdefault("materialize_kwargs", kwargs)
+        )
+
+        draft_input = DSparkDraftInputV2(
+            bonus_tokens=t.tensor([101], dtype=t.int64),
+            new_seq_lens=t.tensor([5], dtype=t.int64),
+            hidden_states=t.tensor([[3.0, 4.0]]),
+            hidden_valid_mask=t.tensor([True]),
+        )
+        batch = SimpleNamespace(req_pool_indices=t.arange(1, 53, dtype=t.int64))
+
+        self.worker_cls._materialize_disagg_prefill_hidden_to_draft_state(
+            worker,
+            draft_input=draft_input,
+            batch=batch,
+            prefix_lens=t.full((52,), 5, dtype=t.int64),
+        )
+
+        self.assertEqual(
+            captures["forward_kwargs"]["req_pool_indices"].tolist(), [52]
+        )
+        self.assertEqual(captures["forward_kwargs"]["cache_loc"].tolist(), [5204])
+        self.assertEqual(
+            captures["materialize_kwargs"]["main_hidden"].tolist(), [[3.0, 4.0]]
+        )
+
     def test_prefill_next_input_defaults_empty_tail_payloads(self):
         t = self.torch
         worker = self._worker(2)
