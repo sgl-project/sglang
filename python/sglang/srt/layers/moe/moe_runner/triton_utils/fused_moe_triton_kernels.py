@@ -442,7 +442,11 @@ def fused_moe_kernel(
     off_experts = off_experts_i32.to(tl.int64)
 
     if filter_expert and off_experts == -1:
-        if not FUSE_ADD_TO_OUTPUT and not (FUSE_SUM_ALL_REDUCE and LORA_PRESERVE_BASE):
+        # FUSE_SUM_ALL_REDUCE: C is the combined output (num_tokens rows), while
+        # write_zeros_to_output indexes by offs_token (num_tokens*topk range) --
+        # storing would go out of bounds AND race with other blocks' atomic_add.
+        # The output was zero-initialized on the host, so skipping is correct.
+        if not FUSE_ADD_TO_OUTPUT and not FUSE_SUM_ALL_REDUCE:
             # Write zeros only when this kernel owns the full output; the experimental LoRA
             # add path (LORA_PRESERVE_BASE) keeps the base output from the prior MoE kernel.
             write_zeros_to_output(
