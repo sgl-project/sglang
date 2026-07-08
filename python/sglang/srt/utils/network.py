@@ -15,9 +15,10 @@ logger = logging.getLogger(__name__)
 
 
 def get_open_port() -> int:
-    port = os.getenv("SGLANG_PORT")
+    from sglang.srt.environ import envs
+
+    port = envs.SGLANG_PORT.get()
     if port is not None:
-        port = int(port)
         while True:
             if is_port_available(port):
                 return port

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import dataclasses
 import time
 from dataclasses import dataclass
 from typing import (
@@ -10,12 +9,15 @@ from typing import (
     Optional,
 )
 
+import msgspec
 import zmq
 
 from sglang.srt.disaggregation.kv_events import (
     EventPublisherFactory,
     KVEventBatch,
+    select_kv_publisher_dp_rank,
 )
+from sglang.srt.managers.io_struct import hook_custom_types, sock_send
 
 if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state_wrapper import ParallelState
@@ -25,8 +27,7 @@ if TYPE_CHECKING:
 class SchedulerStats: ...  # type: ignore[no-redef]
 
 
-@dataclasses.dataclass
-class KvMetrics:
+class KvMetrics(msgspec.Struct, tag=True, kw_only=True, array_like=True):
     request_active_slots: int = 0
     request_total_slots: int = 0
     kv_active_blocks: int = 0
@@ -35,6 +36,9 @@ class KvMetrics:
     gpu_cache_usage_perc: float = 0.0
     gpu_prefix_cache_hit_rate: float = 0.0
     data_parallel_rank: int = 0
+
+
+hook_custom_types(KvMetrics)
 
 
 @dataclass(kw_only=True, slots=True)
@@ -58,12 +62,18 @@ class SchedulerKvEventsPublisher:
 
     def init_kv_events(self, kv_events_config: Optional[str]):
         self.enable_kv_cache_events = bool(
-            kv_events_config and self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0
+            kv_events_config
+            and self.ps.pp_rank == 0
+            and self.ps.attn_tp_rank == 0
+            and self.ps.attn_cp_rank == 0
         )
 
         if self.enable_kv_cache_events:
             self.kv_event_publisher = EventPublisherFactory.create(
-                kv_events_config, self.ps.attn_dp_rank
+                kv_events_config,
+                select_kv_publisher_dp_rank(
+                    self.ps.attn_dp_size, self.ps.attn_dp_rank, self.ps.dp_rank
+                ),
             )
 
     def emit_kv_metrics(self):
@@ -85,7 +95,7 @@ class SchedulerKvEventsPublisher:
         )
 
         if not self.send_metrics_from_scheduler.closed:
-            self.send_metrics_from_scheduler.send_pyobj(kv_metrics)
+            sock_send(self.send_metrics_from_scheduler, kv_metrics)
 
     def publish_kv_events(self):
         if not self.enable_kv_cache_events:

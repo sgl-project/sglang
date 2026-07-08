@@ -165,10 +165,13 @@ class LTX2AVDecodingStage(DecodingStage):
                     audio_vae_dtype, server_args.disable_autocast
                 )
                 should_cast_audio_vae = not audio_vae_autocast_enabled
-                with torch.no_grad(), torch.autocast(
-                    device_type=current_platform.device_type,
-                    dtype=audio_vae_dtype,
-                    enabled=audio_vae_autocast_enabled,
+                with (
+                    torch.no_grad(),
+                    torch.autocast(
+                        device_type=current_platform.device_type,
+                        dtype=audio_vae_dtype,
+                        enabled=audio_vae_autocast_enabled,
+                    ),
                 ):
                     # Decode latents to spectrogram
                     with temporary_module_dtype(

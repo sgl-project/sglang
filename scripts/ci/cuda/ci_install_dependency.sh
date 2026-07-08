@@ -196,6 +196,27 @@ setup_pip_toolchain() {
     mark_step_done "${FUNCNAME[0]}"
 }
 
+remove_stale_cuda12_nvidia_wheels() {
+    if [ "$CU_MAJOR" != "13" ]; then
+        mark_step_done "${FUNCNAME[0]}"
+        return
+    fi
+
+    mapfile -t STALE_CUDA12_NVIDIA_WHEELS < <(
+        python3 -m pip list --format=freeze | sed -n 's/^\(nvidia-.*-cu12\)==.*/\1/p'
+    )
+    if [ ${#STALE_CUDA12_NVIDIA_WHEELS[@]} -eq 0 ]; then
+        echo "No stale CUDA 12 NVIDIA wheels found for ${CU_VERSION} job"
+        mark_step_done "${FUNCNAME[0]}"
+        return
+    fi
+
+    echo "Removing stale CUDA 12 NVIDIA wheels from ${CU_VERSION} job: ${STALE_CUDA12_NVIDIA_WHEELS[*]}"
+    $PIP_UNINSTALL_CMD "${STALE_CUDA12_NVIDIA_WHEELS[@]}" $PIP_UNINSTALL_SUFFIX
+
+    mark_step_done "${FUNCNAME[0]}"
+}
+
 uninstall_stale_flashinfer() {
     # Keep flashinfer packages if version matches to avoid re-downloading:
     # - flashinfer-cubin: 150+ MB
@@ -441,13 +462,17 @@ stabilize_flashinfer_jit_paths() {
 }
 
 install_extra_deps() {
+    MOONCAKE_VERSION="0.3.11.post1"
+    NIXL_VERSION="1.3.0"
     if [ "$CU_MAJOR" = "13" ]; then
-        MOONCAKE_PKG="mooncake-transfer-engine-cuda13==0.3.11.post1"
+        MOONCAKE_PKG="mooncake-transfer-engine-cuda13==${MOONCAKE_VERSION}"
         MOONCAKE_STALE_PKG="mooncake-transfer-engine"
+        NIXL_BIN_NAME="nixl-cu13"
         EXTRA_NVIDIA_SPECS="nvidia-cuda-nvrtc"
     else
-        MOONCAKE_PKG="mooncake-transfer-engine==0.3.11.post1"
+        MOONCAKE_PKG="mooncake-transfer-engine==${MOONCAKE_VERSION}"
         MOONCAKE_STALE_PKG="mooncake-transfer-engine-cuda13"
+        NIXL_BIN_NAME="nixl-cu12"
         EXTRA_NVIDIA_SPECS="nvidia-cuda-nvrtc-cu12"
     fi
     # Both variants own the same mooncake/ package files and bin/ scripts
@@ -461,8 +486,18 @@ install_extra_deps() {
     fi
     $PIP_CMD install ${MOONCAKE_PKG} ${EXTRA_NVIDIA_SPECS} py-spy scipy huggingface_hub[hf_xet] pytest $PIP_INSTALL_SUFFIX
 
-    # Best-effort NIXL install for decode-radix disaggregation coverage.
-    $PIP_CMD install nixl $PIP_INSTALL_SUFFIX || echo "Warning: nixl install failed; continuing without nixl"
+    NIXL_INSTALLED=$(pip show nixl 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "")
+    NIXL_BIN_INSTALLED=$(pip show "${NIXL_BIN_NAME}" 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "")
+    if [ "$NIXL_INSTALLED" = "$NIXL_VERSION" ] && [ "$NIXL_BIN_INSTALLED" = "$NIXL_VERSION" ]; then
+        echo "nixl==${NIXL_VERSION} and ${NIXL_BIN_NAME}==${NIXL_VERSION} already installed, keeping them"
+    else
+        echo "nixl mismatch (meta: ${NIXL_INSTALLED:-none}, ${NIXL_BIN_NAME}: ${NIXL_BIN_INSTALLED:-none}, required: ${NIXL_VERSION}); installing"
+        # Meta stub owns the nixl import path; install only the CUDA binary for
+        # this runner's torch CUDA major. --no-deps avoids pulling the other CUDA
+        # variant; leave any other variant already on the runner image untouched.
+        $PIP_CMD install "nixl==${NIXL_VERSION}" "${NIXL_BIN_NAME}==${NIXL_VERSION}" \
+            --no-deps --force-reinstall $PIP_INSTALL_SUFFIX
+    fi
 
     if [ "$IS_BLACKWELL" != "1" ]; then
         git clone --branch v0.5 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git
@@ -538,8 +573,14 @@ main() {
     install_apt_packages
     clean_site_packages
     setup_pip_toolchain
+    remove_stale_cuda12_nvidia_wheels
     uninstall_stale_flashinfer
     install_sglang
+    # Diffusion B200 CI imports torch inside install_sglang_kernel after removing
+    # stale CUDA 12 NVIDIA wheels, so opt into one early LD_LIBRARY_PATH refresh.
+    if [ "${SGLANG_CI_EARLY_LD_LIBRARY_PATH:-0}" = "1" ]; then
+        setup_ld_library_path
+    fi
     install_sglang_kernel
     install_sglang_router
     download_flashinfer_cache
