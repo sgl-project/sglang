@@ -769,7 +769,7 @@ def _register_configs():
         sampling_param_cls=LingBotWorldSamplingParams,
         pipeline_config_cls=LingBotWorldV2CausalDMDConfig,
         hf_model_paths=[
-            "robbyant/lingbot-world-v2-diffusers",
+            "robbyant/lingbot-world-v2-14b-causal-fast-diffusers",
         ],
     )
     register_configs(
