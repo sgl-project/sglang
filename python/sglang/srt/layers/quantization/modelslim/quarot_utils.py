@@ -55,7 +55,11 @@ def maybe_apply_quarot_anti_rotation(model_path: str, draft_model) -> bool:
         return False
 
     draft_model_inner = draft_model.model
-    num_aux = draft_model_inner.num_aux_hidden_states
+    num_aux = (
+        draft_model_inner.num_aux_hidden_states
+        if hasattr(draft_model_inner, "num_aux_hidden_states")
+        else 3
+    )
     device = draft_model_inner.fc.weight.device
     Q = _load_quarot_rotation_matrix(rotation_path).to(
         dtype=torch.float32, device=device
