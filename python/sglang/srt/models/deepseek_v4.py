@@ -2938,7 +2938,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                                 if key not in cache_compressor_weight:
                                     cache_compressor_weight[key] = (
                                         is_kv,
-                                        loaded_weight,
+                                        _clone_if_runai_streamed_tensor(loaded_weight),
                                     )
                                 else:
                                     assert key in cache_compressor_weight
@@ -2976,7 +2976,9 @@ class DeepseekV4ForCausalLM(nn.Module):
                                 assert (
                                     shard_key not in bucket
                                 ), f"duplicate shard {shard_key} for {param_name}"
-                                bucket[shard_key] = loaded_weight
+                                bucket[shard_key] = (
+                                    _clone_if_runai_streamed_tensor(loaded_weight),
+                                )
                                 if len(bucket) == 2:
                                     fused_weight = torch.cat(
                                         [bucket["q"], bucket["kv"]], dim=0
