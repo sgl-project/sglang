@@ -1,8 +1,10 @@
 try:
     from .cutedsl_paged_mqa_logits import CuteDSLPagedMQALogitsRunner, pick_dsl_expand
-    _cutedsl_available = True
 except ImportError:
-    _cutedsl_available = False
+    # cutlass not available on XPU/non-CUDA environments; provide None stubs so
+    # downstream imports of these names don't raise ImportError at module load time.
+    CuteDSLPagedMQALogitsRunner = None
+    pick_dsl_expand = None
 
 from .paged_mqa_logits import (
     aiter_paged_mqa_logits,
