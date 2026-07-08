@@ -176,7 +176,6 @@ def fp8_paged_mqa_logits_torch_sm120(
     block_size = kvcache_fp8.shape[1]
     device = q_fp8.device
 
-    # Bound FP32 gathered-KV materialization during long prefills.
     _QUERY_CHUNK = 1024
     if batch_size > _QUERY_CHUNK:
         return torch.cat(

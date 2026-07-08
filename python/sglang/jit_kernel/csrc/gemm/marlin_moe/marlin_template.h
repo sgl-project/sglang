@@ -375,7 +375,6 @@ __global__ void Marlin(
       is_zp_float ? prob_n * prob_k / group_size / 8 : prob_n * prob_k / group_size / (pack_factor * 4);
   const int b_bias_expert_stride = prob_n / 8;
 
-  // EP masking encodes non-local expert blocks as -1; exclude them from scheduling.
   int num_tokens_past_padded = num_tokens_past_padded_ptr[0];
   int parallel = num_tokens_past_padded / moe_block_size;
   int num_valid_blocks = parallel;

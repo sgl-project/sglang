@@ -1443,7 +1443,6 @@ def fp8_paged_mqa_logits_kernel(
             for j in T.Pipelined(n_iters, num_stages=2):
                 i = i_start + j
                 page = page_table[bx, i]
-                # TileLang's swizzled GEMM lowering requires a 2-D base buffer.
                 k_smem_u8 = T.alloc_shared((1, B * D), UINT8)
                 T.copy(kvcache_u8[page : page + 1, 0:SCALE_OFFSET], k_smem_u8)
                 k_smem = T.view(k_smem_u8, (B, D), FP8)
