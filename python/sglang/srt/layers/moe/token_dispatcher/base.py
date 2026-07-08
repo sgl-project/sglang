@@ -217,7 +217,7 @@ class CombineInputChecker:
         return combine_input.format == CombineInputFormat.STANDARD
 
     @staticmethod
-    def format_is_torch_npu(
+    def format_is_ascend_tp(
         combine_input: CombineInput,
     ) -> TypeGuard[AscendTPCombineInput]:
         return combine_input.format == CombineInputFormat.ASCEND_TP
@@ -255,7 +255,7 @@ class CombineInputFormat(Enum):
     DEEPEP_NORMAL = "deepep_normal"
     DEEPEP_LL = "deepep_ll"
     FLASHINFER = "flashinfer"
-    TORCH_NPU = "torch_npu"
+    ASCEND_TP = "ascend_tp"
 
 
 @runtime_checkable

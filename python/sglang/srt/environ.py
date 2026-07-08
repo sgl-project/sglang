@@ -547,9 +547,10 @@ class Envs:
     # Master switch for the experimental TRT-LLM LoRA fast path; when OFF (default) every
     # fine-grained opt switch reads False, keeping non-experimental paths byte-identical.
     SGLANG_EXPERIMENTAL_LORA_OPTI = EnvBool(False)
+    # Enable int4x2 weights loading
+    SGLANG_NPU_W4A4_NEW_PACKING = EnvBool(False)
     # Quantize x to int8 in the dispatch operator
     DEEP_NORMAL_MODE_USE_INT8_QUANT = EnvBool(False) # This argument is deprecated
-    SGLANG_NPU_W4A4_NEW_PACKING = EnvBool(False)
 
     # MTHREADS & MUSA
     SGLANG_MUSA_FA3_FORCE_UPDATE_METADATA = EnvBool(False)

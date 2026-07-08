@@ -322,8 +322,8 @@ class NPUW4A4Mxfp4MoEMethod(_NPUMoEMethodBase):
             "per_token_scale": [pertoken_scale],
             "scale_dtype": torch.float8_e8m0fnu,
             "per_token_scale_dtype": torch.float8_e8m0fnu,
-            "x_dtype" = torch_npu.float4_e2m1fn_x2,
-            "weight_dtype" = torch_npu.float4_e2m1fn_x2,
+            "x_dtype": torch_npu.float4_e2m1fn_x2,
+            "weight_dtype": torch_npu.float4_e2m1fn_x2,
         }
 
         return self.matmul.forward(
@@ -930,8 +930,8 @@ class NPUUnquantMoEMethod(_NPUMoEMethodBase):
     def process_weights_after_loading(self, layer, weight_prefix):
         self._validate_weight_prefix(layer, weight_prefix)
         weight_name = f"{weight_prefix}_weight"
-
-        online_quant = "w8a8_mxfp8"      # set by server_args
+        server_args = get_global_server_args()
+        online_quant = getattr(server_args, "online_quantization", None)
 
         if online_quant == "w8a8_int8":
             self._apply_online_w8a8(layer, weight_prefix, weight_name)

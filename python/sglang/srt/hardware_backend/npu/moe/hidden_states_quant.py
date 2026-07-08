@@ -69,6 +69,7 @@ class HiddenStatesStaticQuant(BaseHiddenStatesQuant):
         hidden_states: torch.Tensor,
         layer: torch.nn.Module,
     ) -> Tuple[torch.Tensor, None]:
+        # Optional defensive check (as suggested in the review)
         if not hasattr(layer, "aclnn_input_scale_reciprocal") or not hasattr(
             layer, "aclnn_input_offset"
         ):

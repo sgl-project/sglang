@@ -268,8 +268,6 @@ class ModelSlimConfig(QuantizationConfig):
                 logger.warning(f"Unsupported scheme '{name}' for layer {prefix}")
                 return None
             return cls(self, weight_group)
-
-
         w13_scheme = instantiate(w13_scheme_name, weight_group="w13")
         logger.info_once(
             f"Using {scheme_map[w13_scheme_name].__name__} for gate_up_proj"
@@ -431,7 +429,6 @@ class ModelSlimFusedMoEMethod(FusedMoEMethodBase):
         layer,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
-        backend = self.runner.runner_backend
         quant_info = AscendQuantInfo(
             w13_weight=layer.w13_weight,
             w2_weight=layer.w2_weight,

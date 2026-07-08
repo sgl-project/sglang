@@ -63,9 +63,6 @@ if _use_aiter:
     from aiter.ops.shuffle import shuffle_weight
     from aiter.tuned_gemm import tgemm
 
-if _is_npu:
-    from sglang.srt.hardware_backend.npu.utils import npu_format_cast
-
 
 class Bf16GemmBackend(Enum):
     AUTO = "auto"
@@ -408,6 +405,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         if _is_npu:
             layer.w13_kernel.process_weights_after_loading(layer, "w13")
             layer.w2_kernel.process_weights_after_loading(layer, "w2")
+            if hasattr(layer, "dispatcher"):
+                layer.dispatcher.set_quant_config({"dispatcher_output_dtype": "bf16"})
 
         return
 
@@ -727,8 +726,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         layer: torch.nn.Module,
         dispatch_output: DispatchOutput,
     ) -> CombineInput:
-
-        backend = self.runner.runner_backend
         return self.runner.run(dispatch_output, layer)
 
     def forward_tpu(self, *args, **kwargs) -> CombineInput:

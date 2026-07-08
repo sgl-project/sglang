@@ -48,8 +48,14 @@ class NPUCompressedTensorsW4A8Int8DynamicMoE(CompressedTensorsMoEScheme):
             .get("group_1", {})
             .get("activation_use_clip", False)
         )
-        self.w13_kernel = NPUW4A8Int8MoEMethod()
-        self.w2_kernel = NPUW4A8Int8MoEMethod()
+        self.w13_kernel = NPUW4A8Int8MoEMethod(
+            is_per_channel_weight=self.is_per_channel_weight,
+            activation_use_clip=self.activation_use_clip,
+        )
+        self.w2_kernel = NPUW4A8Int8MoEMethod(
+            is_per_channel_weight=self.is_per_channel_weight,
+            activation_use_clip=self.activation_use_clip,
+        )
 
     def create_weights(
         self,
@@ -268,12 +274,8 @@ class NPUCompressedTensorsW4A8Int8DynamicMoE(CompressedTensorsMoEScheme):
         set_weight_attrs(w2_scale_bias, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        self.w13_kernel.process_weights_after_loading(
-            layer, "w13", self.is_per_channel_weight, self.activation_use_clip
-        )
-        self.w2_kernel.process_weights_after_loading(
-            layer, "w2", self.is_per_channel_weight, self.activation_use_clip
-        )
+        self.w13_kernel.process_weights_after_loading(layer, "w13")
+        self.w2_kernel.process_weights_after_loading(layer, "w2")
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
@@ -292,13 +294,12 @@ class NPUCompressedTensorsW4A8Int8DynamicMoE(CompressedTensorsMoEScheme):
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
-        backend = self.runner.runner_backend
         quant_info = AscendQuantInfo(
             w13_weight=layer.w13_weight,
             w2_weight=layer.w2_weight,
-            w13_scale=layer.w13_weight_scale,
-            w2_scale=layer.w2_weight_scale,
-            w13_offset=layer.w13_weight_offset,
-            w2_offset=layer.w2_weight_offset,
+            w13_weight_scale=layer.w13_weight_scale,
+            w2_weight_scale=layer.w2_weight_scale,
+            w13_weight_offset=layer.w13_weight_offset,
+            w2_weight_offset=layer.w2_weight_offset,
         )
         return self.runner.run(dispatch_output, quant_info)

@@ -173,6 +173,10 @@ class AWQAscendMoEScheme(AWQMoEScheme):
         moe_runner_config: MoeRunnerConfig,
         **extra_weight_attrs,
     ):
+        from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
+            NPUWNA16Int4MoEMethod,
+        )
+
         self.moe_runner_config = moe_runner_config
         layer.w13_kernel = NPUWNA16Int4MoEMethod()
         layer.w2_kernel = NPUWNA16Int4MoEMethod()
@@ -187,7 +191,6 @@ class AWQAscendMoEScheme(AWQMoEScheme):
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
-        backend = self.runner.runner_backend
         quant_info = AscendQuantInfo(
             w13_weight=layer.w13_qweight,
             w2_weight=layer.w2_qweight,

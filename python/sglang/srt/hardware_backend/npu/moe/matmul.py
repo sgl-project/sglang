@@ -12,7 +12,8 @@ class BaseMatmul(ABC):
         hidden_states: torch.Tensor,
         expert_tokens: torch.Tensor,
         output_dtype: torch.dtype,
-        group_list_type,
+        group_list_type: int,
+        transposed: bool,
         **scale_args,
     ) -> torch.Tensor:
         pass
@@ -21,23 +22,23 @@ class BaseMatmul(ABC):
 class GroupedMatmul(BaseMatmul):
     def forward(
         self,
-        quant_info,
+        quant_info_or_layer,
         weight_prefix: str,
         hidden_states: torch.Tensor,
         expert_tokens: torch.Tensor,
         output_dtype: torch.dtype,
-        group_list_type,
+        group_list_type: int,
+        transposed: bool = True,
         **scale_args,
     ) -> torch.Tensor:
-        # Use cached weight attribute if available, otherwise fall back to direct getattr
-        weight = getattr(quant_info, f"{weight_prefix}_weight", None)
+        weight = getattr(quant_info_or_layer, f"{weight_prefix}_weight", None)
         if weight is None:
             raise AttributeError(
                 f"Weight attribute '{weight_prefix}_weight' not found in layer"
             )
         return torch.ops.npu.npu_grouped_matmul(
             x=[hidden_states],
-            weight=[weight],
+            weight=[weight] if transposed else [weight.transpose(1, 2)],
             **scale_args,
             split_item=2,
             group_list_type=group_list_type,
