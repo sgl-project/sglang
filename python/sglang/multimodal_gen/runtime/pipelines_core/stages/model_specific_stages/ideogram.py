@@ -25,6 +25,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
     DenoisingContext,
     DenoisingStage,
     DenoisingStepState,
+    DualTransformerExecutionMode,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.text_encoding import (
     TextEncodingStage,
@@ -36,6 +37,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.nvtx_pytorch_hooks import maybe_nvtx_range
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 
@@ -43,6 +45,8 @@ SEQUENCE_PADDING_INDICATOR = -1
 OUTPUT_IMAGE_INDICATOR = 2
 LLM_TOKEN_INDICATOR = 3
 IMAGE_POSITION_OFFSET = 65536
+
+logger = init_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -264,45 +268,31 @@ class Ideogram4DenoisingStage(DenoisingStage):
     def __init__(self, transformer, unconditional_transformer, pipeline=None) -> None:
         super().__init__(
             transformer=transformer,
+            transformer_2=unconditional_transformer,
             scheduler=Ideogram4Scheduler(),
             pipeline=pipeline,
         )
-        self.unconditional_transformer = unconditional_transformer
-        self._maybe_enable_torch_compile(self.unconditional_transformer)
+        self.unconditional_transformer = self.transformer_2
 
     def _component_name_for_stage_module(self, module, default_name: str) -> str:
         if module is self.unconditional_transformer:
             return "unconditional_transformer"
         return super()._component_name_for_stage_module(module, default_name)
 
-    def component_uses(
-        self, server_args: ServerArgs, stage_name: str | None = None
-    ) -> list[ComponentUse]:
-        stage_name = self._component_stage_name(stage_name)
-        return [
-            ComponentUse(
-                stage_name=stage_name,
-                component_name="transformer",
-                phase="transformer",
-                preferred_ready_after_request=True,
-                memory_intensive=True,
-            ),
-            ComponentUse(
-                stage_name=stage_name,
-                component_name="unconditional_transformer",
-                phase="unconditional_transformer",
-                memory_intensive=True,
-            ),
-        ]
+    def _cache_dit_dual_model_name(self) -> str:
+        return "ideogram4"
 
-    def _maybe_enable_cache_dit_and_torch_compile(
-        self, num_inference_steps: int | tuple[int, int], batch: Req
-    ) -> None:
-        self._maybe_enable_cache_dit(num_inference_steps, batch)
-        for transformer in filter(
-            None, [self.transformer, self.unconditional_transformer]
-        ):
-            self._maybe_enable_torch_compile(transformer)
+    def _dual_transformer_execution_mode(
+        self,
+    ) -> DualTransformerExecutionMode | None:
+        return DualTransformerExecutionMode.PAIRED_PER_STEP
+
+    def _cache_dit_secondary_uses_primary_config(self) -> bool:
+        return True
+
+    def _maybe_enable_cache_dit(self, *args, **kwargs) -> None:
+        super()._maybe_enable_cache_dit(*args, **kwargs)
+        self.unconditional_transformer = self.transformer_2
 
     def _manage_unconditional_transformer_use_site(self, batch: Req) -> None:
         manager = self._component_residency_manager
