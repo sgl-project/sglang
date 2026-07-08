@@ -75,7 +75,7 @@ class TestQwen35BNVFP4KVCacheSM120(CustomTestCase):
             test_name="Qwen3.5-35B-A3B-FP8-NVFP4-KV-SM120",
             accuracy_params=AccuracyTestParams(
                 dataset="gsm8k",
-                baseline_accuracy=0.94,
+                baseline_accuracy=0.96,
                 num_examples=200,
                 num_threads=128,
                 max_tokens=10240,
