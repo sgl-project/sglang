@@ -254,7 +254,7 @@ class _GenerationStreamAccumulator:
     return_hidden_states: bool
     return_routed_experts: bool
     return_indexer_topk: bool
-    return_sampling_mask: bool
+    return_sampling_mask: bool = False
     spec_algorithm: Any
     disaggregation_mode: DisaggregationMode
     default_stream_interval: int
