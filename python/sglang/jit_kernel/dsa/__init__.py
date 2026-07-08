@@ -1,4 +1,9 @@
-from .cutedsl_paged_mqa_logits import CuteDSLPagedMQALogitsRunner, pick_dsl_expand
+try:
+    from .cutedsl_paged_mqa_logits import CuteDSLPagedMQALogitsRunner, pick_dsl_expand
+    _cutedsl_available = True
+except ImportError:
+    _cutedsl_available = False
+
 from .paged_mqa_logits import (
     aiter_paged_mqa_logits,
     cutedsl_paged_mqa_logits,
