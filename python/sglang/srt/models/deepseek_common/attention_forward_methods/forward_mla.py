@@ -551,27 +551,25 @@ class DeepseekMLAForwardMixin:
         ):
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
 
-        # ─── CP-v2: AllGather latent KV via strategy.materialize_full_kv ───
-        if is_cp_v2_active(forward_batch) and self.use_dsa and q_lora is not None:
-            from sglang.srt.layers.cp.base import get_cp_strategy
+        dsa_prefill_cp = dsa_use_prefill_cp(forward_batch)
+        mla_prefill_cp = mla_use_prefill_cp(forward_batch)
+        defer_kv_gather_until_after_rope = _should_defer_dsa_cp_kv_gather(
+            dsa_prefill_cp=dsa_prefill_cp,
+            fuse_rope_for_trtllm_mla=fuse_rope_for_trtllm_mla,
+        )
+        if (dsa_prefill_cp or mla_prefill_cp) and not defer_kv_gather_until_after_rope:
+            if is_cp_v2_active(forward_batch):
+                # CP-v2: AllGather latent KV via strategy.materialize_full_kv
+                from sglang.srt.layers.cp.base import get_cp_strategy
 
-            k_nope, k_pe = get_cp_strategy().materialize_full_kv(
-                forward_batch,
-                latent_cache=latent_cache,
-                k_nope=k_nope,
-                k_pe=k_pe,
-                kv_lora_rank=self.kv_lora_rank,
-            )
-        else:
-            dsa_prefill_cp = dsa_use_prefill_cp(forward_batch)
-            mla_prefill_cp = mla_use_prefill_cp(forward_batch)
-            defer_kv_gather_until_after_rope = _should_defer_dsa_cp_kv_gather(
-                dsa_prefill_cp=dsa_prefill_cp,
-                fuse_rope_for_trtllm_mla=fuse_rope_for_trtllm_mla,
-            )
-            if (
-                dsa_prefill_cp or mla_prefill_cp
-            ) and not defer_kv_gather_until_after_rope:
+                k_nope, k_pe = get_cp_strategy().materialize_full_kv(
+                    forward_batch,
+                    latent_cache=latent_cache,
+                    k_nope=k_nope,
+                    k_pe=k_pe,
+                    kv_lora_rank=self.kv_lora_rank,
+                )
+            else:
                 # support allgather+rerrange
                 k_nope, k_pe = self.rebuild_cp_kv_cache(
                     latent_cache, forward_batch, k_nope, k_pe
