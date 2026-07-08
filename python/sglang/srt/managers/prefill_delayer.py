@@ -95,9 +95,9 @@ class PrefillDelayer:
 
         # Fields packed per rank into the all-gather tensor: prefillable,
         # token_watermark_force_allow, running_batch, max_prefill_bs,
-        # waiting_queue_len.
+        # waiting_queue_len, queue_delay_timeout_expired.
         self._global_info_buffer = torch.empty(
-            (dp_size_dim, attn_tp_size, 5),
+            (dp_size_dim, attn_tp_size, 6),
             dtype=torch.int64,
             device=self._gather_device,
         )
@@ -150,6 +150,15 @@ class PrefillDelayer:
             and (token_usage < x)
         )
 
+        # The queue-delay timeout must ride the all-gather like every other
+        # input: a rank-local wall-clock read can flip on one rank and not
+        # another at the max_delay_ms boundary and split the batch decision.
+        local_queue_timeout_expired = (
+            prev_state is not None
+            and (time.perf_counter() - prev_state.start_time) * 1000.0
+            >= self._max_delay_ms
+        )
+
         # Gather global states
         tp0_info = self._gather_info(
             local_prefillable=local_prefillable,
@@ -157,12 +166,14 @@ class PrefillDelayer:
             running_batch=running_batch,
             max_prefill_bs=max_prefill_bs,
             waiting_queue_len=waiting_queue_len,
+            queue_timeout_expired=local_queue_timeout_expired,
         )
         global_prefillable = tp0_info[:, 0]
         global_token_watermark_force_allow = tp0_info[:, 1]
         global_running_batch = tp0_info[:, 2]
         global_max_prefill_bs = tp0_info[:, 3]
         global_waiting_queue_len = tp0_info[:, 4]
+        global_queue_timeout_expired = tp0_info[:, 5].max().item() > 0
 
         # Compute derived global states
         if global_prefillable.min().item() > 0:
@@ -227,10 +238,8 @@ class PrefillDelayer:
                     queue_min_effective > 0
                     and global_waiting_queue_max < queue_min_effective
                 )
-                if queue_condition and prev_state is not None:
-                    elapsed_ms = (time.perf_counter() - prev_state.start_time) * 1000.0
-                    if elapsed_ms >= self._max_delay_ms:
-                        queue_condition = False
+                if queue_condition and global_queue_timeout_expired:
+                    queue_condition = False
 
             slot_condition = (
                 max_running_requests - global_running_batch_max
@@ -307,6 +316,7 @@ class PrefillDelayer:
         running_batch: int = 0,
         max_prefill_bs: int = 0,
         waiting_queue_len: int = 0,
+        queue_timeout_expired: bool = False,
     ):
         local_info = torch.tensor(
             [
@@ -315,6 +325,7 @@ class PrefillDelayer:
                 running_batch,
                 max_prefill_bs,
                 waiting_queue_len,
+                int(queue_timeout_expired),
             ],
             device=self._gather_device,
             dtype=torch.int64,

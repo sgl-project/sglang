@@ -12,7 +12,7 @@ import requests
 import torch
 
 from sglang.benchmark.serving import run_benchmark
-from sglang.srt.managers.prefill_delayer import PrefillDelayer
+from sglang.srt.managers.prefill_delayer import PrefillDelayer, _State
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_eval import run_eval
@@ -52,6 +52,10 @@ class NegotiateCall:
     # Inter-call sleep (seconds). Used to exercise the queue-trigger
     # wall-clock timeout.
     sleep_before_s: float = 0.0
+    # Per-rank age (ms) of an injected delay state. Simulates rank-skewed
+    # wall clocks around the max_delay_ms boundary; the negotiation must
+    # still release (or hold) on every rank in lockstep.
+    inject_state_age_ms: Optional[List[float]] = None
 
 
 @dataclass
@@ -94,6 +98,13 @@ def _run_negotiate_test(rank, test_cases):
         for call in case.calls:
             if call.sleep_before_s > 0:
                 time.sleep(call.sleep_before_s)
+
+            if call.inject_state_age_ms is not None:
+                delayer._curr_state = _State(
+                    delayed_count=1,
+                    start_time=time.perf_counter()
+                    - call.inject_state_age_ms[rank] / 1000.0,
+                )
 
             extra_kwargs = {}
             if call.running_batch is not None:
@@ -369,6 +380,38 @@ _NEGOTIATE_TEST_CASES = [
         expected_allow=True,
         expected_reason="wait_success",
         # One queue-trigger delay was recorded before the wall-clock release.
+        expected_wait_forward_passes=1,
+    ),
+    NegotiateTestCase(
+        name="queue_trigger_timeout_rank_skew_stays_lockstep",
+        max_delay_passes=100,
+        token_usage_low_watermark=None,
+        queue_min_ratio=0.5,
+        max_delay_ms=50,
+        calls=[
+            # First queue-delay attempt only consumes skip_first_delayer.
+            NegotiateCall(
+                prefillable=[True, True, True, True],
+                token_usage=[0.9, 0.9, 0.9, 0.9],
+                running_batch=[100, 100, 100, 100],
+                max_prefill_bs=[80, 80, 80, 80],
+                waiting_queue_len=[10, 10, 10, 10],
+                max_running_requests=1024,
+            ),
+            NegotiateCall(
+                prefillable=[True, True, True, True],
+                token_usage=[0.9, 0.9, 0.9, 0.9],
+                running_batch=[100, 100, 100, 100],
+                max_prefill_bs=[80, 80, 80, 80],
+                waiting_queue_len=[10, 10, 10, 10],
+                max_running_requests=1024,
+                # Only rank 0 is past the 50ms cap. Local wall-clock reads
+                # would release rank 0 and keep delaying the others.
+                inject_state_age_ms=[60.0, 10.0, 10.0, 10.0],
+            ),
+        ],
+        expected_allow=True,
+        expected_reason="wait_success",
         expected_wait_forward_passes=1,
     ),
 ]
