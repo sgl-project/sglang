@@ -257,4 +257,3 @@ The `<phase>:` form is what the range command's `--match -move:` regex keys on.
 
 Both ends are optional and minimal. A large semantic refactor is a separate commit, not one of
 these phases. Use a short kebab identifier for `<id>`.
-
