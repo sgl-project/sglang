@@ -183,39 +183,71 @@ def _slice_span(text: str, sl: int, sc: int, el: int, ec: int) -> str:
     )
 
 
-def _had_magic_comma(call_text: str) -> bool:
-    """Whether a call kept a trailing comma before its closing paren -- the formatter's
-    'magic trailing comma' that forces one-argument-per-line. A rewrite must preserve it so
-    the formatter re-wraps the call the same way."""
-    inner = call_text.rstrip()
-    return inner.endswith(")") and inner[:-1].rstrip().endswith(",")
+def _node_slice(text: str, node: ast.AST) -> str:
+    return _slice_span(
+        text, node.lineno, node.col_offset, node.end_lineno, node.end_col_offset
+    )
 
 
-def _rewrite_calls(text: str, predicate: "Callable", build: "Callable") -> str:
-    """Replace every call node ``predicate`` accepts with the unparse of ``build(node)``,
-    preserving a magic trailing comma; later edits are applied first so spans stay valid.
-    """
-    repls = []
-    for node in ast.walk(ast.parse(text)):
-        if isinstance(node, ast.Call) and predicate(node):
-            new_text = ast.unparse(build(node))
-            orig = _slice_span(
-                text, node.lineno, node.col_offset, node.end_lineno, node.end_col_offset
-            )
-            if _had_magic_comma(orig) and new_text.endswith(")"):
-                new_text = new_text[:-1] + ",)"
-            repls.append(
-                (
-                    node.lineno,
-                    node.col_offset,
-                    node.end_lineno,
-                    node.end_col_offset,
-                    new_text,
-                )
-            )
-    for sl, sc, el, ec, r in sorted(repls, reverse=True):
-        text = _replace_span(text, sl, sc, el, ec, r)
-    return text
+def _rewrite_matching_calls(text: str, predicate: "Callable", rewrite: "Callable") -> str:
+    """Rewrite every call ``predicate`` accepts by splicing the original source text
+    (never ``ast.unparse``, which would re-spell literals and drop comments). One call is
+    rewritten per pass and the text re-parsed, so a matching call nested inside another
+    match is rewritten on a later pass instead of being overwritten."""
+    while True:
+        node = next(
+            (
+                n
+                for n in ast.walk(ast.parse(text))
+                if isinstance(n, ast.Call) and predicate(n)
+            ),
+            None,
+        )
+        if node is None:
+            return text
+        text = _replace_span(
+            text,
+            node.lineno,
+            node.col_offset,
+            node.end_lineno,
+            node.end_col_offset,
+            rewrite(text, node),
+        )
+
+
+def _lowered_call_text(text: str, node: ast.Call) -> str:
+    """Original call text with the leading receiver argument spliced out and made the
+    call's new receiver: ``Owner.foo(recv, rest...)`` -> ``recv.foo(rest...)``. All other
+    argument bytes (literal spelling, comments, the magic trailing comma) are untouched."""
+    receiver = node.args[0]
+    receiver_src = _node_slice(text, receiver)
+    assert "\n" not in receiver_src and "#" not in receiver_src, (
+        f"receiver {receiver_src!r} must be single-line and comment-free"
+    )
+    opener = _slice_span(
+        text,
+        node.func.end_lineno,
+        node.func.end_col_offset,
+        receiver.lineno,
+        receiver.col_offset,
+    )
+    assert "#" not in opener, f"comment before the receiver in {opener!r}"
+    seg = _slice_span(
+        text,
+        receiver.end_lineno,
+        receiver.end_col_offset,
+        node.end_lineno,
+        node.end_col_offset,
+    )
+    head, comma, rest = seg.partition(",")
+    assert "#" not in head, f"comment after the receiver in {head!r}"
+    if comma:
+        assert head.strip() == "", f"unexpected text {head!r} after the receiver"
+        rest = rest.lstrip(" \t")
+    else:
+        assert head.strip() == ")", f"unexpected text {head!r} after the receiver"
+        rest = head.lstrip(" \t")
+    return f"{receiver_src}.{node.func.attr}({rest}"
 
 
 def _drop_self_annotation(method_text: str, name: str) -> str:
@@ -272,17 +304,11 @@ class Repro:
                         and ast.unparse(node.func.value) == owner
                     )
 
-                def build(node: ast.Call) -> ast.Call:
-                    return ast.Call(
-                        func=ast.Attribute(
-                            value=node.args[0], attr=name, ctx=ast.Load()
-                        ),
-                        args=node.args[1:],
-                        keywords=node.keywords,
-                    )
-
                 _write_source(
-                    path, _rewrite_calls(_read_source(path), predicate, build)
+                    path,
+                    _rewrite_matching_calls(
+                        _read_source(path), predicate, _lowered_call_text
+                    ),
                 )
 
         self.ops.append(op)
@@ -305,15 +331,14 @@ class Repro:
                         and ast.unparse(node.func.value) == owner
                     )
 
-                def build(node: ast.Call) -> ast.Call:
-                    return ast.Call(
-                        func=ast.Name(id=name, ctx=ast.Load()),
-                        args=node.args,
-                        keywords=node.keywords,
-                    )
+                def rewrite(text: str, node: ast.Call) -> str:
+                    call_src = _node_slice(text, node)
+                    func_src = _node_slice(text, node.func)
+                    return name + call_src[len(func_src) :]
 
                 _write_source(
-                    path, _rewrite_calls(_read_source(path), predicate, build)
+                    path,
+                    _rewrite_matching_calls(_read_source(path), predicate, rewrite),
                 )
 
         self.ops.append(op)

@@ -12,7 +12,6 @@ from mechanical_refactor_reproduce_utils import (
     _def_span,
     _find_class,
     _find_def,
-    _had_magic_comma,
     _replace_span,
     _slice_span,
     dedent,
@@ -294,11 +293,12 @@ def test_slice_span_returns_the_overwritten_text() -> None:
     assert _slice_span(text, 1, 4, 3, 1) == "foo(\n    x,\n)"
 
 
-def test_had_magic_comma_detects_trailing_comma() -> None:
-    """A trailing comma before the closing paren is the formatter's magic comma."""
-    assert _had_magic_comma("f(\n    a,\n    b,\n)")
-    assert not _had_magic_comma("f(a, b)")
-    assert not _had_magic_comma("f(\n    a,\n    b\n)")
+def test_lowered_call_text_preserves_magic_trailing_comma(tmp_path: Path) -> None:
+    """A magic trailing comma in the original call survives the textual lowering."""
+    (tmp_path / "m.py").write_text("x = Old.foo(\n    self.r,\n    a,\n    b,\n)\n")
+    r = Repro("b", "t").lower_call_sites("foo", "Old", paths=["m.py"])
+    _apply(r, tmp_path)
+    assert (tmp_path / "m.py").read_text() == "x = self.r.foo(\n    a,\n    b,\n)\n"
 
 
 def test_find_def_span_includes_decorators() -> None:
@@ -347,7 +347,7 @@ def test_lower_call_sites_preserves_magic_trailing_comma(tmp_path: Path) -> None
     (tmp_path / "m.py").write_text("ModelRunner.foo(\n    self.r,\n    a,\n)\n")
     r = Repro("b", "t").lower_call_sites("foo", "ModelRunner", paths=["m.py"])
     _apply(r, tmp_path)
-    assert (tmp_path / "m.py").read_text() == "self.r.foo(a,)\n"
+    assert (tmp_path / "m.py").read_text() == "self.r.foo(\n    a,\n)\n"
 
 
 # --- requalify_call_sites ------------------------------------------------------
@@ -1384,11 +1384,6 @@ def test_requalify_call_sites_matches_a_zero_argument_call(tmp_path: Path) -> No
     assert (tmp_path / "m.py").read_text() == "y = bar()\n"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="ast.unparse regenerates the call, silently deleting comments inside a "
-    "multi-line call's argument list",
-)
 def test_lower_call_sites_preserves_comments_inside_a_multiline_call(
     tmp_path: Path,
 ) -> None:
@@ -1401,11 +1396,6 @@ def test_lower_call_sites_preserves_comments_inside_a_multiline_call(
     assert "# keep me" in (tmp_path / "m.py").read_text()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="ast.unparse normalizes argument spelling (0x10 -> 16, quote style flipped), "
-    "altering bytes the formatter would have preserved",
-)
 def test_lower_call_sites_preserves_arg_literal_spelling(tmp_path: Path) -> None:
     """Hex literals and quote styles inside the rewritten call must not be normalized."""
     (tmp_path / "m.py").write_text('x = Old.foo(self.r, 0x10, "s")\n')
@@ -1414,11 +1404,6 @@ def test_lower_call_sites_preserves_arg_literal_spelling(tmp_path: Path) -> None
     assert (tmp_path / "m.py").read_text() == 'x = self.r.foo(0x10, "s")\n'
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="overlapping spans go stale: the outer rewrite (unparsed from the original "
-    "AST) overwrites the inner edit, leaving the nested call un-lowered",
-)
 def test_lower_call_sites_lowers_a_nested_matching_call_too(tmp_path: Path) -> None:
     """A matching call nested inside another matching call is lowered as well."""
     (tmp_path / "m.py").write_text("x = Old.foo(self.r, Old.foo(self.q, 1))\n")
@@ -1427,11 +1412,6 @@ def test_lower_call_sites_lowers_a_nested_matching_call_too(tmp_path: Path) -> N
     assert (tmp_path / "m.py").read_text() == "x = self.r.foo(self.q.foo(1))\n"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="the magic-comma restore appends ',' inside empty parens when the receiver "
-    "was the sole argument, emitting invalid `self.r.foo(,)`",
-)
 def test_lower_call_sites_magic_comma_with_sole_receiver_arg_stays_valid(
     tmp_path: Path,
 ) -> None:
@@ -1459,11 +1439,6 @@ def test_call_rewrite_survives_a_form_feed_line_start(tmp_path: Path) -> None:
     assert (tmp_path / "m.py").read_text() == "a = 1\n\x0cb = 2\ny = self.r.foo(1)\n"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="ast.unparse drops redundant parentheses in keyword values (b=(2) -> b=2), "
-    "altering call-site bytes beyond the relocation",
-)
 def test_requalify_call_sites_preserves_redundant_parens_in_kwargs(
     tmp_path: Path,
 ) -> None:
