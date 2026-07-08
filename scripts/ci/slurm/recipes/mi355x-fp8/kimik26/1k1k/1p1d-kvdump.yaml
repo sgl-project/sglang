@@ -1,0 +1,83 @@
+# MI355X Kimi-K2.6 (FP8) 2-node 1P1D disaggregation recipe (DIAGNOSTIC:
+# non-MTP + decode-side KV metadata/content dump).
+#
+# Identical to 1p1d.yaml (reproduces ~0.88) plus SGLANG_DEBUG_DISAGG_DECODE_DUMP=1,
+# which makes ModelRunner.forward log, for the first few decode batches on the
+# decode worker: seq_lens, the req_to_token KV slot mapping (count / negative
+# slots), and layer-0 KV-pool content at those slots (abs mean, #zero-norm rows,
+# first/last row norms). Purpose: check whether the MORI-transferred KV is
+# present (non-zero) at every attended slot — especially the prefix boundary
+# token — and whether the decode seq_len / slot mapping is correct. Needs the
+# runtime-checkout mechanism (this branch is stacked on #30386) so the dump code
+# actually runs. Read it from the decode server log in the packed logs artifact.
+#
+# Consumed by:
+#   * scripts/ci/slurm/process_result.py reads `resources` and
+#     `backend.sglang_config` (TP/EP/DP + worker counts) for the summary table.
+#   * scripts/ci/slurm/launch_mi355x.sh reads `runtime`, `bench`, `model`, `mtp`.
+
+resources:
+  prefill_workers: 1
+  decode_workers: 1
+
+backend:
+  sglang_config:
+    prefill:
+      tensor-parallel-size: 8
+      expert-parallel-size: 1
+      data-parallel-size: 1
+    decode:
+      tensor-parallel-size: 8
+      expert-parallel-size: 1
+      data-parallel-size: 1
+
+# Model-specific docker env + sglang server args (written verbatim via
+# model_flags.sh). Each server arg + value is a SEPARATE list item.
+model:
+  env:
+    SGLANG_USE_AITER: 1
+    SGLANG_ROCM_FUSED_DECODE_MLA: 0
+    # DIAGNOSTIC: one-shot decode-side KV metadata/content dump.
+    SGLANG_DEBUG_DISAGG_DECODE_DUMP: 1
+  server_args:
+    - --model-loader-extra-config
+    - '{"enable_multithread_load": true}'
+    - --watchdog-timeout
+    - 1200
+    - --reasoning-parser
+    - kimi_k2
+    - --tool-call-parser
+    - kimi_k2
+
+runtime:
+  image: lmsysorg/sglang-rocm:v0.5.13.post1-rocm720-mi35x-20260623
+  # Kimi uses split attention backends (aiter prefill / triton decode), not a
+  # single --attention-backend.
+  prefill_attention_backend: aiter
+  decode_attention_backend: triton
+  # RoCE HCAs MORI uses for cross-node KV transfer.
+  ib_devices: rdma0,rdma1,rdma2,rdma3
+  prefill_port: 30025
+  decode_port: 30026
+  prefill_bootstrap_port: 8998
+  decode_bootstrap_port: 9001
+  lb_port: 8000
+  mem_fraction_static: 0.90
+  page_size: 256
+  max_running_requests: 256
+  chunked_prefill_size: 8192
+
+bench:
+  # Diagnostic run: only the GSM8K accuracy gate matters (it triggers decode
+  # forwards, which produce the dump), so the perf sweep is trimmed to conc=1.
+  concurrencies: [1]
+  num_prompts_factor: 4      # num-prompts = concurrency * factor
+  random_range_ratio: 1.0
+
+  # Correctness gate run through the PD path before the perf sweep. Mirrors the
+  # registered single-node Kimi-K2.6 eval (full GSM8K, 8-shot, accuracy > 0.92).
+  accuracy:
+    enabled: true
+    num_shots: 8
+    num_questions: 1319    # full GSM8K test set
+    threshold: 0.92

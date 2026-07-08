@@ -416,3 +416,19 @@ kimik26-fp8-mi355x-mtp-specdecode-sglang:
       search-space:
         - conc-list: [1]
           config_file: scripts/ci/slurm/recipes/mi355x-fp8/kimik26/1k1k/1p1d-mtp-specdecode.yaml
+
+kimik26-fp8-mi355x-kvdump-sglang:
+  model: moonshotai/Kimi-K2.6
+  model-prefix: kimik26
+  model_path: /it-share/model_coverage/models--moonshotai--Kimi-K2.6
+  runner: mi355x
+  precision: fp8
+  framework: sglang
+  multinode: true
+  disagg: true
+  seq-len-configs:
+    - isl: 1024
+      osl: 1024
+      search-space:
+        - conc-list: [1]
+          config_file: scripts/ci/slurm/recipes/mi355x-fp8/kimik26/1k1k/1p1d-kvdump.yaml
