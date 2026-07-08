@@ -1,12 +1,14 @@
 """Declaration surface for JIT Metal kernels (``mx.fast.metal_kernel``).
 
 One ``MetalJitKernel`` owns a body-only Metal source and compiles lazily per
-dtype key. ``aot.py`` is the separate policy layer for precompiled kernels.
+dtype key. Kernel modules declare a ``MetalJitOp`` subclass registered with
+the ``@kernel(...)`` decorator. ``aot.py`` is the separate policy layer for
+precompiled kernels.
 """
 
 from __future__ import annotations
 
-from typing import Callable
+from typing import Callable, Iterable, NamedTuple
 
 import mlx.core as mx
 
@@ -67,10 +69,82 @@ class MetalJitKernel:
         return True
 
 
+class WarmupSpec(NamedTuple):
+    """One precompile request: the dtype key plus the dispatch shapes.
+
+    Placeholder for the AOT policy layer (aot.py, follow up PR); nothing
+    enumerates or consumes these yet.
+    """
+
+    dtypes: tuple
+    shapes: tuple = ()
+
+
+class MetalJitOp:
+    """Declarative JIT kernel: subclass, set ``source``, register with
+    ``@metal_jit.kernel(...)``.
+
+    The decorator stores the class's Metal source in the registry; dispatch
+    then compiles lazily per dtype key through the module level ``get()`` and
+    ``warm_once()`` seams. Subclasses implement ``dispatch`` with the op's own
+    call signature, owning the eligibility guard and launch geometry.
+    """
+
+    source: str  # Body only Metal source; the decorator validates presence.
+
+    def dispatch(self, *args, **kwargs):
+        """Run the op. Subclasses own the signature, guards, and geometry."""
+        raise NotImplementedError
+
+    def warmup_specs(self, model) -> Iterable[WarmupSpec]:
+        """Precompile keys aot.py should warm for ``model``.
+
+        Hook for the AOT policy layer (follow up PR) to enumerate per model
+        precompile shapes; the default warms nothing.
+        """
+        return ()
+
+
 # Name-keyed registry: kernel modules register their source once at import
 # time and dispatch through get()/warm_once(), instead of each holding its own
 # module-level MetalJitKernel plus a _get_kernel wrapper for test spies.
 _REGISTRY: dict[str, MetalJitKernel] = {}
+
+
+def kernel(
+    *,
+    name: str,
+    name_template: str,
+    input_names: list[str],
+    output_names: list[str],
+):
+    """Class decorator registering a ``MetalJitOp`` subclass under ``name``.
+
+    ``name`` is the registry key (e.g. "fused_moe_combine"); ``name_template``
+    is the on device Metal entry name, formatted with one ``dtype_tag`` per
+    dtype key slot, kept separate so shader cache keys and profiler labels are
+    unaffected by the registry key chosen. Returns the class unchanged.
+    """
+
+    def decorate(cls: type) -> type:
+        if not (isinstance(cls, type) and issubclass(cls, MetalJitOp)):
+            raise TypeError(f"metal_jit.kernel: {cls!r} is not a MetalJitOp subclass")
+        source = getattr(cls, "source", None)
+        if not isinstance(source, str):
+            raise TypeError(
+                f"metal_jit.kernel: {cls.__name__} must define a `source` "
+                "class attribute holding the Metal kernel body"
+            )
+        register(
+            name,
+            name_template=name_template,
+            input_names=input_names,
+            output_names=output_names,
+            source=source,
+        )
+        return cls
+
+    return decorate
 
 
 def register(
