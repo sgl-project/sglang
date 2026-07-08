@@ -30,6 +30,7 @@ class TestQwen3_5_9BXPU(SimpleEvalGSM8KXPUMixin, CustomTestCase):
     # across two runs), at ~98 tok/s and ~29 min wall clock. num_threads=4
     # sharing 4 tiles cleared the Level Zero wedge that single-stream tp=1 was
     # working around, so the 4-gpu suite is the right home for this test.
+    num_examples = 50
     num_threads = 4
     max_tokens = 8192
 

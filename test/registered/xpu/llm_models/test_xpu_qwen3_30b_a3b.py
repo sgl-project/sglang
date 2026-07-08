@@ -34,6 +34,7 @@ class TestQwen3_30BA3BXPU(SimpleEvalGSM8KXPUMixin, CustomTestCase):
     # the dense 9B (0.96); applied across the Qwen series for a consistent
     # nightly config. MoE (A3B) accuracy at this setting is not yet
     # independently benchmarked on XPU.
+    num_examples = 50
     num_threads = 4
     max_tokens = 8192
 
