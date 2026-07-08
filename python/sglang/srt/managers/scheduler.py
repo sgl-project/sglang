@@ -74,8 +74,6 @@ from sglang.srt.layers.attention.mamba.ops import (
 )
 from sglang.srt.layers.dp_attention import (
     compute_dp_attention_world_info,
-    get_attention_cp_group,
-    get_attention_tp_group,
 )
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
@@ -239,6 +237,7 @@ from sglang.srt.observability.trace import process_tracing_init, trace_set_threa
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.platforms import current_platform
 from sglang.srt.plugins import load_plugins
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import PortArgs, ServerArgs, get_global_server_args
 from sglang.srt.session.session_controller import SessionController
@@ -903,9 +902,9 @@ class Scheduler(
 
         self.tp_group = get_tp_group()
         self.tp_cpu_group = self.tp_group.cpu_group
-        self.attn_tp_group = get_attention_tp_group()
+        self.attn_tp_group = get_parallel().attn_tp_group
         self.attn_tp_cpu_group = self.attn_tp_group.cpu_group
-        self.attn_cp_group = get_attention_cp_group()
+        self.attn_cp_group = get_parallel().attn_cp_group
         self.attn_cp_cpu_group = self.attn_cp_group.cpu_group
         self.pp_group = get_pp_group()
         self.world_group = get_world_group()

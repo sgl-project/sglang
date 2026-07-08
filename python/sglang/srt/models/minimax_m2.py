@@ -45,7 +45,6 @@ from sglang.srt.layers.communicator import (
 )
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_reduce,
-    get_attention_tp_group,
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layernorm import RMSNorm
@@ -437,7 +436,7 @@ class MiniMaxM2QKRMSNorm:
         # typically, this should not exceed 1M, since max_tokens is usually less than 16384
         max_size = ((8 * max_tokens + ALIGN - 1) // ALIGN) * ALIGN
         comm = CustomAllReduceV2(
-            group=get_attention_tp_group().cpu_group,
+            group=get_parallel().attn_tp_group.cpu_group,
             device=device,
             max_pull_size=0,
             max_pull_blocks=0,
@@ -877,7 +876,7 @@ class MiniMaxM2Attention(nn.Module):
                 rotary_dim=self.rotary_dim,
                 eps=self.q_norm.variance_epsilon,
                 tp_world=self.q_norm.attn_tp_size,
-                tp_group=get_attention_tp_group().device_group,
+                tp_group=get_parallel().attn_tp_group.device_group,
             )
         else:
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)

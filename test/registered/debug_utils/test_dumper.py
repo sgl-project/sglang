@@ -2344,8 +2344,6 @@ class TestDumperE2E:
                 "attn_tp_size",
                 "attn_dp_rank",
                 "attn_dp_size",
-                "local_attn_dp_rank",
-                "local_attn_dp_size",
                 "attn_cp_rank",
                 "attn_cp_size",
             ]

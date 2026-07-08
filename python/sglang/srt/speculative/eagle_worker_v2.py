@@ -22,7 +22,6 @@ from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
 from sglang.srt.layers.attention.trtllm_mla_backend import (
     TRTLLMMLABackend,
 )
-from sglang.srt.layers.dp_attention import get_attention_tp_group
 from sglang.srt.layers.moe.utils import (
     speculative_moe_a2a_backend_context,
     speculative_moe_backend_context,
@@ -47,6 +46,7 @@ from sglang.srt.model_executor.runner import (
     DecodeCudaGraphRunner,
     get_batch_sizes_to_capture,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.adaptive_runtime_state import (
     AdaptiveController,
@@ -172,7 +172,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         # Load draft model weights only.
         if server_args.enable_dp_attention and self.speculative_algorithm.is_eagle3():
-            ctx = draft_tp_context(get_attention_tp_group())
+            ctx = draft_tp_context(get_parallel().attn_tp_group)
         else:
             ctx = empty_context()
         with (

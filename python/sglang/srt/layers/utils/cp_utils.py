@@ -10,7 +10,6 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.layers.dp_attention import (
     attn_cp_all_gather_into_tensor,
-    get_attention_cp_group,
     is_allocation_symmetric,
 )
 from sglang.srt.layers.moe import get_moe_a2a_backend
@@ -227,7 +226,7 @@ def cp_all_gather_reorganized_into_tensor(input_tensor, cp_size, forward_batch, 
             input_tensor, (0, 0, 0, pad_size), mode="constant", value=0
         )
     with use_symmetric_memory(
-        get_attention_cp_group(), disabled=not is_allocation_symmetric()
+        get_parallel().attn_cp_group, disabled=not is_allocation_symmetric()
     ):
         input_tensor_full = torch.empty(
             max_len * cp_size,
@@ -236,7 +235,7 @@ def cp_all_gather_reorganized_into_tensor(input_tensor, cp_size, forward_batch, 
             dtype=input_tensor.dtype,
         )
 
-    get_attention_cp_group().cp_all_gather_into_tensor_async(
+    get_parallel().attn_cp_group.cp_all_gather_into_tensor_async(
         input_tensor_full, input_tensor, stream
     )
 
@@ -276,7 +275,7 @@ def cp_all_gather_reorganized_into_tensor_kv_cache(
 
     # Create output tensor with proper shape for all dimensions
     with use_symmetric_memory(
-        get_attention_cp_group(), disabled=not is_allocation_symmetric()
+        get_parallel().attn_cp_group, disabled=not is_allocation_symmetric()
     ):
         input_tensor_full = torch.empty(
             max_len * cp_size,
@@ -285,7 +284,7 @@ def cp_all_gather_reorganized_into_tensor_kv_cache(
             dtype=input_tensor.dtype,
         )
 
-    get_attention_cp_group().cp_all_gather_into_tensor_async(
+    get_parallel().attn_cp_group.cp_all_gather_into_tensor_async(
         input_tensor_full, input_tensor, stream
     )
 
@@ -340,7 +339,7 @@ def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
 
     if is_dsa_prefill_cp_round_robin_split():
         with use_symmetric_memory(
-            get_attention_cp_group(), disabled=not is_allocation_symmetric()
+            get_parallel().attn_cp_group, disabled=not is_allocation_symmetric()
         ):
             output_tensor = input_tensor.new_empty(
                 (input_tensor.shape[0] * cp_size, *input_tensor.shape[1:]),

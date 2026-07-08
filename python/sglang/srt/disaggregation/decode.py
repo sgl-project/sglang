@@ -60,7 +60,6 @@ from sglang.srt.disaggregation.utils import (
     setup_state_kv_args,
 )
 from sglang.srt.environ import envs
-from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, ScheduleBatch
 from sglang.srt.managers.schedule_policy import match_prefix_for_req
 from sglang.srt.managers.utils import GenerationBatchResult
@@ -85,6 +84,7 @@ from sglang.srt.observability.req_time_stats import (
     set_schedule_time_batch,
     set_time_batch,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_num_new_pages
 from sglang.srt.utils.network import NetworkAddress
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
@@ -392,7 +392,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         kv_args_class = get_kv_class(self.transfer_backend, KVClassType.KVARGS)
         kv_args = kv_args_class()
 
-        attn_tp_size = get_attention_tp_size()
+        attn_tp_size = get_parallel().attn_tp_size
         kv_args.engine_rank = self.tp_rank % (attn_tp_size)
 
         kv_args.pp_rank = self.pp_rank
