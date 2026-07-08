@@ -75,9 +75,6 @@ class PrefillServerInfo:
     page_size: Optional[int]
     kv_cache_dtype: Optional[str]
     follow_bootstrap_room: bool
-    layer_pipeline_enabled: bool = False
-    layer_group_size: int = 0
-    layer_pipeline_min_prefill_len: int = 0
 
     # Pre-computed rank mapping (set by try_ensure_parallel_info on decode side)
     target_tp_rank: Optional[int] = None
@@ -95,11 +92,6 @@ class PrefillServerInfo:
         self.page_size = int(self.page_size) if self.page_size is not None else None
         self.kv_cache_dtype = (
             str(self.kv_cache_dtype) if self.kv_cache_dtype is not None else None
-        )
-        self.layer_pipeline_enabled = bool(self.layer_pipeline_enabled)
-        self.layer_group_size = int(self.layer_group_size)
-        self.layer_pipeline_min_prefill_len = int(
-            self.layer_pipeline_min_prefill_len
         )
         self.follow_bootstrap_room = bool(self.follow_bootstrap_room)
 
@@ -290,14 +282,6 @@ class CommonKVManager(BaseKVManager):
                 f"Both servers must use the same --kv-cache-dtype value."
             )
 
-        if info.layer_pipeline_enabled != self.layer_pipeline_enabled:
-            logger.warning(
-                "PD layer pipeline setting mismatch between prefill and decode "
-                f"(prefill={info.layer_pipeline_enabled}, decode={self.layer_pipeline_enabled}); "
-                "falling back to non-layer-pipeline transfer for this connection."
-            )
-            info.layer_pipeline_enabled = False
-
         self._resolve_rank_mapping(info)
         self.prefill_info_table[bootstrap_addr] = info
         logger.debug(f"Prefill parallel info for [{bootstrap_addr}]: {info}")
@@ -444,9 +428,6 @@ class CommonKVManager(BaseKVManager):
             "rank_port": self.rank_port,
             "page_size": self.kv_args.page_size,
             "kv_cache_dtype": self.server_args.kv_cache_dtype,
-            "layer_pipeline_enabled": self.layer_pipeline_enabled,
-            "layer_group_size": self.layer_group_size,
-            "layer_pipeline_min_prefill_len": self.layer_pipeline_min_prefill_len,
             "load_balance_method": self.server_args.load_balance_method,
         }
 
@@ -518,47 +499,47 @@ class CommonKVManager(BaseKVManager):
             return sock
 
     @staticmethod
-    def _split_local_main_draft(
+    def _resolve_main_draft_layout(
         helper_name: str,
-        src_logical_layers: int,
+        src_count: int,
+        dst_total_count: int,
+        start_layer: int,
         num_main_local: Optional[int],
-    ) -> Tuple[int, int]:
-        """Compute ``(main_count, draft_count)`` for a local source list."""
-        if num_main_local is None or num_main_local >= src_logical_layers:
-            return src_logical_layers, 0
-        if num_main_local < 0:
+        dst_num_main: Optional[int],
+    ) -> Tuple[int, int, int, bool]:
+        if num_main_local is not None and num_main_local < 0:
             raise ValueError(
                 f"{helper_name}: num_main_local must be >= 0, "
                 f"got {num_main_local}"
             )
-        return num_main_local, src_logical_layers - num_main_local
 
-    @staticmethod
-    def _equal_layout_safe(
-        local_main_count: int,
-        local_draft_count: int,
-        dst_num_main: Optional[int],
-    ) -> bool:
-        if local_draft_count == 0:
-            return dst_num_main is None or dst_num_main >= local_main_count
-        return dst_num_main == local_main_count
+        local_main_count = (
+            src_count
+            if num_main_local is None or num_main_local >= src_count
+            else num_main_local
+        )
+        local_draft_count = src_count - local_main_count
+        same_layout = (
+            src_count == dst_total_count
+            and (
+                dst_num_main == local_main_count
+                if local_draft_count
+                else dst_num_main is None or dst_num_main >= local_main_count
+            )
+        )
+        if same_layout:
+            return local_main_count, local_draft_count, dst_total_count, True
 
-    @staticmethod
-    def _resolve_dst_main_count(
-        helper_name: str,
-        dst_total_count: int,
-        local_draft_count: int,
-        dst_num_main: Optional[int],
-    ) -> int:
+        if dst_num_main is not None and dst_num_main < 0:
+            raise ValueError(
+                f"{helper_name}: dst_num_main must be >= 0, got {dst_num_main}"
+            )
+
         if local_draft_count > 0:
             if dst_num_main is None:
                 raise ValueError(
                     f"{helper_name}: src has a draft tail but decode did "
                     "not advertise num_main_kv_layers."
-                )
-            if dst_num_main < 0:
-                raise ValueError(
-                    f"{helper_name}: dst_num_main must be >= 0, got {dst_num_main}"
                 )
             dst_draft_count = dst_total_count - dst_num_main
             if dst_draft_count < local_draft_count:
@@ -566,29 +547,19 @@ class CommonKVManager(BaseKVManager):
                     f"{helper_name}: src has {local_draft_count} draft ptr(s) "
                     f"but dst exposes only {dst_draft_count}."
                 )
-            return dst_num_main
+            dst_main_count = dst_num_main
+        else:
+            dst_main_count = (
+                dst_num_main if dst_num_main is not None else dst_total_count
+            )
 
-        if dst_num_main is not None:
-            if dst_num_main < 0:
-                raise ValueError(
-                    f"{helper_name}: dst_num_main must be >= 0, got {dst_num_main}"
-                )
-            return dst_num_main
-        return dst_total_count
-
-    @staticmethod
-    def _check_dst_main_slice(
-        helper_name: str,
-        dst_main_count: int,
-        start_layer: int,
-        local_main_count: int,
-    ) -> None:
         if dst_main_count < start_layer + local_main_count:
             raise ValueError(
                 f"{helper_name}: dst has {dst_main_count} main ptrs, "
                 f"but prefill PP rank covers "
                 f"[{start_layer}, {start_layer + local_main_count})."
             )
+        return local_main_count, local_draft_count, dst_main_count, False
 
     @staticmethod
     def _slice_main_then_draft(
@@ -612,17 +583,6 @@ class CommonKVManager(BaseKVManager):
         dst_num_main: Optional[int] = None,
     ) -> Tuple[List[int], List[int], List[int], List[int], int]:
         """Align MHA KV ptrs across PP and optional draft-tail layouts."""
-        # Probe path: caller wants src ptrs + layer count only.
-        if not dst_kv_ptrs:
-            num_kv_layers_probe = len(src_kv_ptrs) // 2
-            return (
-                src_kv_ptrs[:num_kv_layers_probe],
-                src_kv_ptrs[num_kv_layers_probe:],
-                [],
-                [],
-                num_kv_layers_probe,
-            )
-
         start_layer = self.kv_args.prefill_start_layer
         num_kv_layers = len(src_kv_ptrs) // 2
         dst_num_total_layers = len(dst_kv_ptrs) // 2
@@ -630,36 +590,27 @@ class CommonKVManager(BaseKVManager):
         src_v_ptrs = src_kv_ptrs[num_kv_layers:]
         layers_current_pp_stage = len(src_k_ptrs)
 
-        local_main_count, local_draft_count = CommonKVManager._split_local_main_draft(
-            "get_mha_kv_ptrs_with_pp", num_kv_layers, num_main_local
+        local_main_count, local_draft_count, dst_main_count, same_layout = (
+            CommonKVManager._resolve_main_draft_layout(
+                "get_mha_kv_ptrs_with_pp",
+                num_kv_layers,
+                dst_num_total_layers,
+                start_layer,
+                num_main_local,
+                dst_num_main,
+            )
         )
 
-        if num_kv_layers == dst_num_total_layers:
-            if CommonKVManager._equal_layout_safe(
-                local_main_count, local_draft_count, dst_num_main
-            ):
-                dst_k_ptrs = dst_kv_ptrs[:dst_num_total_layers]
-                dst_v_ptrs = dst_kv_ptrs[dst_num_total_layers:]
-                return (
-                    src_k_ptrs,
-                    src_v_ptrs,
-                    dst_k_ptrs,
-                    dst_v_ptrs,
-                    layers_current_pp_stage,
-                )
-
-        dst_main_count = CommonKVManager._resolve_dst_main_count(
-            "get_mha_kv_ptrs_with_pp",
-            dst_num_total_layers,
-            local_draft_count,
-            dst_num_main,
-        )
-        CommonKVManager._check_dst_main_slice(
-            "get_mha_kv_ptrs_with_pp",
-            dst_main_count,
-            start_layer,
-            local_main_count,
-        )
+        if same_layout:
+            dst_k_ptrs = dst_kv_ptrs[:dst_num_total_layers]
+            dst_v_ptrs = dst_kv_ptrs[dst_num_total_layers:]
+            return (
+                src_k_ptrs,
+                src_v_ptrs,
+                dst_k_ptrs,
+                dst_v_ptrs,
+                layers_current_pp_stage,
+            )
 
         dst_k_ptrs = CommonKVManager._slice_main_then_draft(
             dst_kv_ptrs,
@@ -694,10 +645,6 @@ class CommonKVManager(BaseKVManager):
         dst_num_main: Optional[int] = None,
     ) -> Tuple[List[int], List[int], int]:
         """Align MLA KV ptrs across PP and optional draft-tail layouts."""
-        # Probe path (hash logging): empty dst ⇒ return src as-is.
-        if not dst_kv_ptrs:
-            return src_kv_ptrs, [], len(src_kv_ptrs)
-
         mla_ratios = getattr(self.kv_args, "mla_compression_ratios", None)
         if mla_ratios:
             # Compressed-MLA groups ptrs by buffer type; draft tail is not
@@ -721,28 +668,19 @@ class CommonKVManager(BaseKVManager):
         start_layer = self.kv_args.prefill_start_layer
         src_len = len(src_kv_ptrs)
 
-        local_main_count, local_draft_count = CommonKVManager._split_local_main_draft(
-            "get_mla_kv_ptrs_with_pp", src_len, num_main_local
+        local_main_count, local_draft_count, dst_main_count, same_layout = (
+            CommonKVManager._resolve_main_draft_layout(
+                "get_mla_kv_ptrs_with_pp",
+                src_len,
+                len(dst_kv_ptrs),
+                start_layer,
+                num_main_local,
+                dst_num_main,
+            )
         )
 
-        if len(src_kv_ptrs) == len(dst_kv_ptrs):
-            if CommonKVManager._equal_layout_safe(
-                local_main_count, local_draft_count, dst_num_main
-            ):
-                return src_kv_ptrs, dst_kv_ptrs, len(src_kv_ptrs)
-
-        dst_main_count = CommonKVManager._resolve_dst_main_count(
-            "get_mla_kv_ptrs_with_pp",
-            len(dst_kv_ptrs),
-            local_draft_count,
-            dst_num_main,
-        )
-        CommonKVManager._check_dst_main_slice(
-            "get_mla_kv_ptrs_with_pp",
-            dst_main_count,
-            start_layer,
-            local_main_count,
-        )
+        if same_layout:
+            return src_kv_ptrs, dst_kv_ptrs, len(src_kv_ptrs)
 
         sliced_dst_kv_ptrs = CommonKVManager._slice_main_then_draft(
             dst_kv_ptrs,
@@ -766,28 +704,19 @@ class CommonKVManager(BaseKVManager):
         start_layer = getattr(self.kv_args, "prefill_start_layer", 0) or 0
         src_len = len(src_state_ptrs)
 
-        local_main_count, local_draft_count = CommonKVManager._split_local_main_draft(
-            "get_state_ptrs_with_pp", src_len, num_main_local
+        local_main_count, local_draft_count, dst_main_count, same_layout = (
+            CommonKVManager._resolve_main_draft_layout(
+                "get_state_ptrs_with_pp",
+                src_len,
+                len(dst_state_ptrs),
+                start_layer,
+                num_main_local,
+                dst_num_main,
+            )
         )
 
-        if len(src_state_ptrs) == len(dst_state_ptrs):
-            if CommonKVManager._equal_layout_safe(
-                local_main_count, local_draft_count, dst_num_main
-            ):
-                return src_state_ptrs, dst_state_ptrs, src_state_item_lens
-
-        dst_main_count = CommonKVManager._resolve_dst_main_count(
-            "get_state_ptrs_with_pp",
-            len(dst_state_ptrs),
-            local_draft_count,
-            dst_num_main,
-        )
-        CommonKVManager._check_dst_main_slice(
-            "get_state_ptrs_with_pp",
-            dst_main_count,
-            start_layer,
-            local_main_count,
-        )
+        if same_layout:
+            return src_state_ptrs, dst_state_ptrs, src_state_item_lens
 
         aligned_dst = CommonKVManager._slice_main_then_draft(
             dst_state_ptrs,
@@ -1574,9 +1503,6 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.page_size = None
         self.kv_cache_dtype: Optional[str] = None
         self.follow_bootstrap_room: Optional[bool] = None
-        self.layer_pipeline_enabled: bool = False
-        self.layer_group_size: int = 0
-        self.layer_pipeline_min_prefill_len: int = 0
         self.prefill_port_table: Dict[
             int, Dict[int, Dict[int, Dict[int, PrefillRankInfo]]]
         ] = {}
@@ -1643,11 +1569,6 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         rank_port = int(data["rank_port"])
         page_size = int(data["page_size"])
         kv_cache_dtype = data["kv_cache_dtype"]
-        layer_pipeline_enabled = bool(data.get("layer_pipeline_enabled", False))
-        layer_group_size = int(data.get("layer_group_size", 0))
-        layer_pipeline_min_prefill_len = int(
-            data.get("layer_pipeline_min_prefill_len", 0)
-        )
 
         if self.attn_tp_size is None:
             self.attn_tp_size = attn_tp_size
@@ -1666,16 +1587,6 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
 
         if self.kv_cache_dtype is None and kv_cache_dtype is not None:
             self.kv_cache_dtype = kv_cache_dtype
-
-        # OR-aggregation across ranks; per-connection mismatches are validated
-        # again in try_ensure_parallel_info and fall back individually there.
-        self.layer_pipeline_enabled = (
-            self.layer_pipeline_enabled or layer_pipeline_enabled
-        )
-        if layer_group_size > 0:
-            self.layer_group_size = layer_group_size
-        if layer_pipeline_min_prefill_len > 0:
-            self.layer_pipeline_min_prefill_len = layer_pipeline_min_prefill_len
 
         if self.follow_bootstrap_room is None:
             load_balance_method = data.get(
@@ -1746,9 +1657,6 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                     if self.follow_bootstrap_room is not None
                     else True
                 ),
-                layer_pipeline_enabled=self.layer_pipeline_enabled,
-                layer_group_size=self.layer_group_size,
-                layer_pipeline_min_prefill_len=self.layer_pipeline_min_prefill_len,
             )
             return web.json_response(dataclasses.asdict(info), status=200)
 
