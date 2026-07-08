@@ -912,6 +912,7 @@ jobs:
           jobs: |
             [
               {"prefix": "stage-b-test-1-gpu-small-amd", "expected_count": 14},
+              {"prefix": "stage-b-test-1-gpu-large-amd", "expected_count": 3},
               {"prefix": "stage-b-test-2-gpu-large-amd", "expected_count": 2}
             ]
           max-wait-minutes: '480'
