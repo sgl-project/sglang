@@ -1,7 +1,7 @@
 <div style="display:flex;align-items:center;justify-content:space-between;gap:20px;flex-wrap:wrap">
   <div style="flex:1;min-width:260px">
-    <h1 style="margin:0 0 12px">Trees from Marginals: Weaver</h1>
-    <p style="margin:0">Weaver is a lightweight autoregressive Transformer that turns DFlash marginal predictions into proposal trees. With rollback-free Gated Delta Net tree verification, DFlash-TfM reaches 392.8 tokens/s/sequence on Qwen3.6-27B on a single B200: 4.37x over autoregressive decoding and 24.7% over tuned DFlash.</p>
+    <h1 style="margin:0 0 12px">Trees from Marginals: DFlash-TfM</h1>
+    <p style="margin:0">An implementation of DFlash-TfM, a tree-based speculative decoding method. A DFlash drafter produces factorized token marginals; Weaver, a lightweight autoregressive Transformer, expands them into a proposal tree; and fused, rollback-free kernels verify it against hybrid Gated DeltaNet target models. On Qwen3.6-27B, DFlash-TfM reaches 392.8 tokens/s per sequence on a single B200: 4.37× over autoregressive decoding and 24.7% over tuned DFlash.</p>
     <p style="margin:10px 0 0;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
       <a href="#"><img src="https://img.shields.io/badge/arXiv-coming%20soon-b31b1b?style=for-the-badge&logo=arxiv&logoColor=white" alt="arXiv coming soon"></a>
       <a href="#"><img src="https://img.shields.io/badge/PDF-coming%20soon-374151?style=for-the-badge&logo=readthedocs&logoColor=white" alt="PDF coming soon"></a>
@@ -11,15 +11,13 @@
   <img src="https://assets.trymirai.com/images/logo/ml_small_logo.svg" alt="Mirai Labs" width="64" height="64" style="width:80px;height:80px;object-fit:contain;flex:0 0 auto">
 </div>
 
-### What is in this repo
-
-This repository contains the SGLang implementation for DFlash-TfM, short for DFlash-TreeFromMarginals. It is not a standalone language model: Weaver is an autoregressive adapter used during speculative decoding, on top of a target model and a factorized DFlash drafter.
+### Weaver
 
 To run it, you also need:
 
 - the Qwen3.6-27B target model;
 - the Qwen3.6-27B DFlash drafter;
-- the Mirai Labs SGLang fork with DFlash-TfM and the fused GDN tree-verification kernels.
+- the Qwen3.6-27B [Weaver checkpoint](https://huggingface.co/trymirai/);
 
 Weaver has 56.7M trainable parameters. At inference time, DFlash produces future-state lookaheads in one forward pass; Weaver conditions on the realized draft tokens and scores only the top-512 marginal candidates instead of projecting over the full vocabulary.
 
