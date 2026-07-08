@@ -956,6 +956,13 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
     kernels derive copy sizes from each call's first tensor.
     """
 
+    def _init_write_back_staging_buffers(self):
+        # K and V have different strides so the MHA write-back JIT kernel
+        # (which assumes a uniform element_dim) cannot be used.  Keeping
+        # can_use_write_back_jit=True would leave dst_indices on CPU,
+        # violating the MLA kernel's CUDA-tensor requirement.
+        self.can_use_write_back_jit = False
+
     def get_size_per_token(self):
         self.head_num = self.device_pool.head_num
         self.head_dim = self.device_pool.head_dim
