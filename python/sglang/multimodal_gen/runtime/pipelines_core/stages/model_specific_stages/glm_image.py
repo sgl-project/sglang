@@ -16,7 +16,6 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager im
     ComponentUse,
 )
 from sglang.multimodal_gen.runtime.models.dits.glm_image import GlmImageKVCache
-from sglang.multimodal_gen.runtime.models.vision_utils import load_image
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
@@ -28,6 +27,7 @@ from sglang.multimodal_gen.runtime.utils.precision import (
     align_tensor_to_module_dtype,
     get_module_dtype,
 )
+from sglang.multimodal_gen.runtime.utils.vision import load_image
 
 logger = init_logger(__name__)
 

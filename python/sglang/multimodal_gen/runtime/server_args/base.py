@@ -42,11 +42,11 @@ from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
 )
-from sglang.multimodal_gen.runtime.server_args_auto_tune import (
+from sglang.multimodal_gen.runtime.server_args.auto_tune import (
     PERFORMANCE_MODES,
     ServerArgsAutoTuner,
 )
-from sglang.multimodal_gen.runtime.server_args_disagg import DisaggServerArgsMixin
+from sglang.multimodal_gen.runtime.server_args.disagg import DisaggServerArgsMixin
 from sglang.multimodal_gen.runtime.utils.common import (
     is_port_available,
     is_valid_ipv6_address,

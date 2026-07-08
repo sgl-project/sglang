@@ -20,8 +20,8 @@ from sglang.multimodal_gen.runtime.models.parameter import (
     ModelWeightParameter,
     PerTensorScaleParameter,
 )
-from sglang.multimodal_gen.runtime.models.utils import set_weight_attrs
 from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.utils.weight_attrs import set_weight_attrs
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
     cutlass_fp8_supported,

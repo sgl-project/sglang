@@ -1855,9 +1855,9 @@ class TestPerRoleParallelism(unittest.TestCase):
         self.assertEqual(args.get_role_parallelism(RoleType.DENOISER)["tp_size"], 2)
         self.assertEqual(args.get_role_parallelism(RoleType.DECODER)["sp_degree"], 4)
 
-    def test_disagg_args_import_path_stays_compatible(self):
+    def test_disagg_args_import_path_matches_server_args_package(self):
         from sglang.multimodal_gen.runtime.disaggregation import disagg_args
-        from sglang.multimodal_gen.runtime.server_args_disagg import (
+        from sglang.multimodal_gen.runtime.server_args.disagg import (
             DisaggServerArgsMixin,
         )
 
