@@ -185,14 +185,13 @@ class Sampler(nn.Module):
                 logits[:] = torch.softmax(logits, dim=-1)
                 probs = logits
 
-                if return_sampling_mask:
-                    sampling_mask_data = self._compute_sampling_mask_from_probs(
-                        probs, sampling_info
-                    )
                 batch_next_token_ids = self._sample_from_probs(
                     probs, sampling_info, positions, simple_sampling_case
                 )
                 if return_sampling_mask:
+                    sampling_mask_data = self._compute_sampling_mask_from_probs(
+                        probs, sampling_info
+                    )
                     self._attach_sampling_mask_to_output(
                         logits_output,
                         sampling_info,
