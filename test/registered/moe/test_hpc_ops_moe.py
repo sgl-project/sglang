@@ -131,9 +131,7 @@ class TestHpcOpsMoeBlockwise(CustomTestCase):
                     out_hpc.flatten(), out_triton.flatten(), dim=0
                 )
                 self.assertGreater(cos.item(), 0.999)
-                torch.testing.assert_close(
-                    out_hpc, out_triton, rtol=0.05, atol=0.05
-                )
+                torch.testing.assert_close(out_hpc, out_triton, rtol=0.05, atol=0.05)
 
 
 if __name__ == "__main__":

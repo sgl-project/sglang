@@ -26,7 +26,6 @@ from typing import TYPE_CHECKING, List, Optional
 import torch
 
 from sglang.srt.layers.moe.moe_runner.base import MoeQuantInfo, register_fused_func
-from sglang.srt.layers.moe.utils import MoeRunnerBackend
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
@@ -106,7 +105,15 @@ def _check_runner_config_supported(runner_config: MoeRunnerConfig) -> None:
             "The hpc_ops MoE runner backend does not support "
             "apply_router_weight_on_input."
         )
-    if runner_config.gemm1_alpha is not None or runner_config.gemm1_clamp_limit is not None:
+    if runner_config.no_combine:
+        raise ValueError(
+            "The hpc_ops MoE runner backend does not support no_combine "
+            "(the fused kernel always reduces over top-k experts)."
+        )
+    if (
+        runner_config.gemm1_alpha is not None
+        or runner_config.gemm1_clamp_limit is not None
+    ):
         raise ValueError(
             "The hpc_ops MoE runner backend does not support gemm1_alpha / "
             "gemm1_clamp_limit."

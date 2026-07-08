@@ -2050,8 +2050,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     "'static' in the checkpoint quantization config)."
                 )
             layer.hpc_ops_gate_up_alphas = (
-                layer.w13_weight_scale.data.float()
-                * layer.w13_input_scale.data.float()
+                layer.w13_weight_scale.data.float() * layer.w13_input_scale.data.float()
             )
             layer.hpc_ops_down_alphas = (
                 layer.w2_weight_scale.data.float() * layer.w2_input_scale.data.float()
