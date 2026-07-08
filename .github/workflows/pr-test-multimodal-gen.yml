@@ -352,6 +352,8 @@ jobs:
 
       - name: Install dependencies
         timeout-minutes: 20
+        env:
+          SGLANG_CI_EARLY_LD_LIBRARY_PATH: "1"
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{inputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh diffusion
 
