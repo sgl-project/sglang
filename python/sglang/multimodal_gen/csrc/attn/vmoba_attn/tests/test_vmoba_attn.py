@@ -6,7 +6,6 @@ import pytest
 import torch
 from sglang.multimodal_gen.csrc.attn.vmoba_attn.vmoba import moba_attn_varlen
 
-
 def generate_test_data(
     batch_size, total_seqlen, num_heads, head_dim, dtype, device="cuda"
 ):
