@@ -83,9 +83,27 @@ class GeneratedSharedPrefixDataset(BaseDataset):
                 "or set --gsp-group-distribution=zipf"
             )
 
+        prompts_per_group = args.gsp_prompts_per_group
+        warmup_requests = getattr(args, "warmup_requests", 0) or 0
+        num_groups = args.gsp_num_groups
+        if warmup_requests > 0 and num_groups > 0:
+            extra_per_group = warmup_requests // num_groups
+            remainder = warmup_requests % num_groups
+            prompts_per_group += extra_per_group
+            if remainder > 0:
+                prompts_per_group += 1  # one extra in first few groups
+            print(
+                f"[gsp] warmup_requests={warmup_requests}: "
+                f"generating {prompts_per_group} prompts per group "
+                f"(original {args.gsp_prompts_per_group} + {warmup_requests} warmup). "
+                f"First {warmup_requests} prompts will be consumed by warmup, "
+                f"remaining {args.gsp_prompts_per_group * num_groups} for benchmark.",
+                flush=True,
+            )
+
         return cls(
-            num_groups=args.gsp_num_groups,
-            prompts_per_group=args.gsp_prompts_per_group,
+            num_groups=num_groups,
+            prompts_per_group=prompts_per_group,
             system_prompt_len=args.gsp_system_prompt_len,
             question_len=args.gsp_question_len,
             output_len=args.gsp_output_len,

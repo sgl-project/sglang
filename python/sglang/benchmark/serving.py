@@ -1322,56 +1322,65 @@ async def benchmark(
         async with semaphore:
             return await request_func(request_func_input=request_func_input, pbar=pbar)
 
-    # Warmup
-    print(f"Starting warmup with {warmup_requests} sequences...")
-
-    # Handle the data structure difference for the warmup request
-    if args.dataset_name == "mooncake":
-        # For mooncake, input_requests is a list of dicts.
-        # We need to build a temporary DatasetRow for the warmup phase.
-        warmup_record = input_requests[0]
-
-        # Build prompt from hash_ids, just like in the async generator
-        hash_ids = warmup_record.get("hash_ids", [])
-        prompt_text = ""
-        for hash_id in hash_ids:
-            prompt_text += f"{hash_id}" + " ".join(["hi"] * 512)
-        prompt_text += "Can you tell me a detailed story in 1000 words?"
-
-        output_len = warmup_record.get("output_length", 32)
-        prompt_len = len(tokenizer.encode(prompt_text))
-
-        # Create a temporary DatasetRow object for warmup
-        test_request = DatasetRow(
-            prompt=prompt_text,
-            prompt_len=prompt_len,
-            output_len=output_len,
-            image_data=None,  # Mooncake doesn't have image data
-        )
+    # Warmup: pop dedicated prompts from the front so the test set is
+    # not contaminated by cache-warm entries. If warmup_requests exceeds
+    # the available prompts, repeat from the beginning.
+    if len(input_requests) > warmup_requests >= 0:
+        warmup_inputs = input_requests[:warmup_requests]
+        input_requests = input_requests[warmup_requests:]
     else:
-        # For all other datasets, input_requests is a list of DatasetRow objects
-        test_request = input_requests[0]
+        raise ValueError(
+            f"warmup_requests ({warmup_requests}) must be 0 or "
+            f"less than the total number of input requests ({len(input_requests)})."
+        )
 
     if lora_names is not None and len(lora_names) != 0:
         lora_name = lora_names[0]
     else:
         lora_name = None
 
-    # Create the test input once
-    test_input = RequestFuncInput(
-        model=model_id,
-        prompt=test_request.prompt,
-        api_url=api_url,
-        prompt_len=test_request.prompt_len,
-        output_len=min(test_request.output_len, 32),
-        lora_name=lora_name,
-        image_data=test_request.image_data,
-        extra_request_body=extra_request_body,
-    )
-
-    # Run warmup requests
     warmup_tasks = []
-    for _ in range(warmup_requests):
+    for warmup_input in warmup_inputs:
+        # Handle the data structure difference for the warmup request
+        if args.dataset_name == "mooncake":
+            # For mooncake, input_requests is a list of dicts.
+            # We need to build a temporary DatasetRow for the warmup phase.
+            warmup_record = warmup_input
+
+            # Build prompt from hash_ids, just like in the async generator
+            hash_ids = warmup_record.get("hash_ids", [])
+            prompt_text = ""
+            for hash_id in hash_ids:
+                prompt_text += f"{hash_id}" + " ".join(["hi"] * 512)
+            prompt_text += "Can you tell me a detailed story in 1000 words?"
+
+            output_len = warmup_record.get("output_length", 32)
+            prompt_len = len(tokenizer.encode(prompt_text))
+
+            # Create a temporary DatasetRow object for warmup
+            test_request = DatasetRow(
+                prompt=prompt_text,
+                prompt_len=prompt_len,
+                output_len=output_len,
+                image_data=None,  # Mooncake doesn't have image data
+            )
+        else:
+            # For all other datasets, input_requests is a list of DatasetRow objects
+            test_request = warmup_input
+
+        # Create the test input once
+        test_input = RequestFuncInput(
+            model=model_id,
+            prompt=test_request.prompt,
+            api_url=api_url,
+            prompt_len=test_request.prompt_len,
+            output_len=min(test_request.output_len, 32),
+            lora_name=lora_name,
+            image_data=test_request.image_data,
+            extra_request_body=extra_request_body,
+        )
+
+        # Run warmup requests
         warmup_tasks.append(
             asyncio.create_task(request_func(request_func_input=test_input))
         )
