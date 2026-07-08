@@ -15,19 +15,6 @@ from sglang.srt.environ import envs
 logger = logging.getLogger(__name__)
 
 
-def _xpu_assert_sync(condition: torch.Tensor, msg: str) -> bool:
-    """XPU has no torch._assert_async; fall back to a synchronous check.
-
-    Returns True if the (XPU) tensor was handled here so the caller can skip
-    the async assert; False for non-XPU tensors which take the async path.
-    """
-    if condition.device.type == "xpu":
-        if not bool(condition.item()):
-            raise AssertionError(msg)
-        return True
-    return False
-
-
 class _AsyncNanWarner:
     """One-shot NaN monitor: device-side detection lands in pinned host
     memory without any stream sync; the host reads the (slightly stale) flag
@@ -103,10 +90,7 @@ def maybe_detect_nan(tensor: Optional[torch.Tensor], msg: str = ""):
     # capture_hidden_mode=NULL paths (STANDALONE speculative decoding).
     if tensor is None:
         return
-    condition = ~torch.any(torch.isnan(tensor))
-    if _xpu_assert_sync(condition, f"NaN detected! {msg}"):
-        return
-    torch._assert_async(condition, f"NaN detected! {msg}")
+    torch._assert_async(~torch.any(torch.isnan(tensor)), f"NaN detected! {msg}")
 
 
 def maybe_detect_inf(tensor: Optional[torch.Tensor], msg: str = ""):
@@ -115,10 +99,7 @@ def maybe_detect_inf(tensor: Optional[torch.Tensor], msg: str = ""):
         return
     if tensor is None:
         return
-    condition = ~torch.any(torch.isinf(tensor))
-    if _xpu_assert_sync(condition, f"Inf detected! {msg}"):
-        return
-    torch._assert_async(condition, f"Inf detected! {msg}")
+    torch._assert_async(~torch.any(torch.isinf(tensor)), f"Inf detected! {msg}")
 
 
 def maybe_detect_in_closed_range(
@@ -144,20 +125,14 @@ def maybe_detect_oob(indices: Optional[torch.Tensor], low: int, high: int, msg: 
         return
     if indices is None or indices.numel() == 0:
         return
-    low_ok = indices.min() >= low
-    if not _xpu_assert_sync(
-        low_ok, f"index < {low} (negative / unmasked sentinel?): {msg}"
-    ):
-        torch._assert_async(
-            low_ok,
-            f"index < {low} (negative / unmasked sentinel?): {msg}",
-        )
-    high_ok = indices.max() < high
-    if not _xpu_assert_sync(high_ok, f"index >= {high} (out of range): {msg}"):
-        torch._assert_async(
-            high_ok,
-            f"index >= {high} (out of range): {msg}",
-        )
+    torch._assert_async(
+        indices.min() >= low,
+        f"index < {low} (negative / unmasked sentinel?): {msg}",
+    )
+    torch._assert_async(
+        indices.max() < high,
+        f"index >= {high} (out of range): {msg}",
+    )
 
 
 def maybe_detect_page_aligned(
@@ -168,12 +143,7 @@ def maybe_detect_page_aligned(
         return
     if indices is None or indices.numel() == 0 or page_size <= 1:
         return
-    condition = (indices % page_size == 0).all()
-    if _xpu_assert_sync(
-        condition, f"page-misaligned indices (page_size={page_size}): {msg}"
-    ):
-        return
     torch._assert_async(
-        condition,
+        (indices % page_size == 0).all(),
         f"page-misaligned indices (page_size={page_size}): {msg}",
     )
