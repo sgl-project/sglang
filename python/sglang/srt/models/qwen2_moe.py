@@ -92,7 +92,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_parallel, get_server_args
-from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     add_prefix,
     cpu_has_amx_support,
@@ -276,10 +275,10 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 else config.num_experts_per_tok + self.num_fused_shared_experts
             ),
             num_experts=(
-                config.num_experts + get_global_server_args().ep_num_redundant_experts
+                config.num_experts + get_server_args().ep_num_redundant_experts
                 if not self.enable_shared_expert_fusion
                 else config.num_experts
-                + get_global_server_args().ep_num_redundant_experts
+                + get_server_args().ep_num_redundant_experts
                 + self.num_fused_shared_experts
             ),
             hidden_size=config.hidden_size,
@@ -338,7 +337,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             # TODO: we will support tp < ep in the future
             self.ep_size = get_parallel().moe_ep_size
             self.num_experts = (
-                config.num_experts + get_global_server_args().ep_num_redundant_experts
+                config.num_experts + get_server_args().ep_num_redundant_experts
             )
             self.top_k = config.num_experts_per_tok
         self.is_nextn = is_nextn

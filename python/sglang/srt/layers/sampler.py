@@ -15,7 +15,6 @@ from sglang.srt.layers.utils.logprob import get_token_ids_logprobs, get_top_logp
 from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
-from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils.async_probe import sanitize_nan_logits
 from sglang.srt.utils.common import (
     get_bool_env_var,
@@ -72,11 +71,9 @@ class Sampler(nn.Module):
         if is_dp_attention_enabled():
             self.tp_sync_group = get_parallel().attn_tp_group.device_group
 
-        self.rl_on_policy_target = get_global_server_args().rl_on_policy_target
+        self.rl_on_policy_target = get_server_args().rl_on_policy_target
         # In RL on-policy mode, deterministic inference is automatically enabled.
-        self.enable_deterministic = (
-            get_global_server_args().enable_deterministic_inference
-        )
+        self.enable_deterministic = get_server_args().enable_deterministic_inference
         # In RL on-policy mode, we use log_softmax to compute logprobs to match the trainer.
         self.use_log_softmax_logprob = self.rl_on_policy_target is not None
         self.use_ascend_backend = get_server_args().sampling_backend == "ascend"
@@ -460,7 +457,7 @@ def register_sampler_backend(backend: str, factory: Callable[[], "Sampler"]) -> 
 def create_sampler(backend: Optional[str] = None) -> "Sampler":
     """Create a sampler honoring custom backend registrations."""
 
-    server_args = get_global_server_args()
+    server_args = get_server_args()
     backend = backend or (server_args.sampling_backend if server_args else None)
 
     if backend in _CUSTOM_SAMPLER_FACTORIES:

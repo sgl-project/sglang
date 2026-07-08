@@ -56,10 +56,10 @@ from sglang.srt.mem_cache.unified_radix_cache import (
     UnifiedRadixCache,
     UnifiedTreeNode,
 )
+from sglang.srt.runtime_context import get_server_args
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import (
     ServerArgs,
-    get_global_server_args,
     set_global_server_args_for_scheduler,
 )
 from sglang.srt.utils import get_device
@@ -942,13 +942,13 @@ class UnifiedRadixCacheSuite:
             req.mamba_last_track_seqlen = kv_len
         req.reasoning_tokens = 1
 
-        get_global_server_args().strip_thinking_cache = True
+        get_server_args().strip_thinking_cache = True
         try:
             avail_before = allocator.available_size()
             cache.cache_finished_req(req, is_insert=True)
             start_p, end_p = req.pop_overallocated_kv_cache()
         finally:
-            get_global_server_args().strip_thinking_cache = False
+            get_server_args().strip_thinking_cache = False
         if ps > 1:
             start_p = ((start_p + ps - 1) // ps) * ps
         if start_p < end_p:
@@ -3527,7 +3527,7 @@ class UnifiedRadixCacheSuite:
         if not self.cfg.has_mamba or self.cfg.has_swa or self.cfg.page_size != 1:
             self.skipTest("requires page_size=1 Full+Mamba")
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
-        chunk_size = get_global_server_args().mamba_cache_chunk_size
+        chunk_size = get_server_args().mamba_cache_chunk_size
         tokens = self._make_seq(1, chunk_size + 1)
         self._insert(cache, allocator, req_to_token_pool, tokens)
         leaf = cache.match_prefix(

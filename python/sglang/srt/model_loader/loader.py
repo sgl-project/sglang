@@ -44,7 +44,7 @@ from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     get_remote_instance_transfer_engine_info_per_rank,
     register_memory_region,
 )
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import get_available_gpu_memory
 
 # Try to import accelerate (optional dependency)
@@ -481,7 +481,7 @@ class DefaultModelLoader(BaseModelLoader):
         else:
             hf_folder = model_name_or_path
 
-        server_args = get_global_server_args()
+        server_args = get_server_args()
         if server_args and server_args.model_checksum is not None:
             from sglang.srt.utils.model_file_verifier import verify
 
@@ -567,7 +567,7 @@ class DefaultModelLoader(BaseModelLoader):
                 hf_weights_files,
             )
         elif use_safetensors:
-            server_args = get_global_server_args()
+            server_args = get_server_args()
             weight_loader_disable_mmap = server_args.weight_loader_disable_mmap
             weight_loader_prefetch = server_args.weight_loader_prefetch_checkpoints
             prefetch_num_threads = server_args.weight_loader_prefetch_num_threads
@@ -866,9 +866,9 @@ class LayeredModelLoader(DefaultModelLoader):
         device_config: DeviceConfig,
     ) -> nn.Module:
         from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
-        from sglang.srt.server_args import get_global_server_args
+        from sglang.srt.runtime_context import get_server_args
 
-        torchao_config = get_global_server_args().torchao_config
+        torchao_config = get_server_args().torchao_config
         target_device = torch.device(device_config.device)
         quant_config = _get_quantization_config(model_config, self.load_config)
 
@@ -3078,7 +3078,7 @@ class RunaiModelStreamerLoader(BaseModelLoader):
             )
         )
 
-        server_args = get_global_server_args()
+        server_args = get_server_args()
         if server_args and server_args.model_checksum is not None:
             from sglang.srt.utils.model_file_verifier import verify
 
