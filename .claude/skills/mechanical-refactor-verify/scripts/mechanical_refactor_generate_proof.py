@@ -497,7 +497,9 @@ def infer_recipe(commit: str, root: str) -> Recipe:
     files = {path: f for path, f in all_files.items() if path.endswith(".py")}
     recipe = Recipe(base=f"{commit}~1", target=commit)
     for path in sorted(set(all_files) - set(files)):
-        recipe.notes.append(f"non-Python file changed: {path} (left to the residual diff)")
+        recipe.notes.append(
+            f"non-Python file changed: {path} (left to the residual diff)"
+        )
 
     def def_names(lines: list[str]) -> set[str]:
         return {
@@ -861,9 +863,7 @@ def generate_range(
             recipe = infer_recipe(commit, root)
             script = recipe_to_script(recipe, subject)
             (scripts_dir / f"{commit[:9]}.py").write_text(script)
-            relocates = bool(
-                recipe.moves or recipe.extracts or recipe.scatter_extracts
-            )
+            relocates = bool(recipe.moves or recipe.extracts or recipe.scatter_extracts)
             supported = recipe.supported and relocates
             notes = recipe.notes
             if supported:
