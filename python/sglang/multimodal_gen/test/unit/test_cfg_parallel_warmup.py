@@ -646,12 +646,13 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
             ModelTaskType.TI2V: True,
             ModelTaskType.I2I: True,
             ModelTaskType.I2V: True,
-            ModelTaskType.I2M: True,
+            ModelTaskType.I2M: False,
             ModelTaskType.VLA_ACTION: False,
         }
         request_based_expected = {
             task_type: task_type.accepts_image_input() for task_type in ModelTaskType
         }
+        request_based_expected[ModelTaskType.I2M] = False
         request_based_expected[ModelTaskType.VLA_ACTION] = False
 
         for task_type in ModelTaskType:

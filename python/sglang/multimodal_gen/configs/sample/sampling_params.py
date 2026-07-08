@@ -473,7 +473,7 @@ class SamplingParams:
         check if the sampling params is compatible and valid with server_args
         """
         task_type = pipeline_config.task_type
-        if not task_type.is_visual_gen():
+        if task_type.is_action_gen():
             return
 
         if task_type.requires_image_input():
@@ -509,6 +509,10 @@ class SamplingParams:
             self._adjust_action_fields(server_args)
             return
 
+        if task_type.is_mesh_gen():
+            self._adjust_mesh_fields(server_args, pipeline_config)
+            return
+
         if task_type.is_visual_gen():
             self._adjust_visual_fields(server_args, pipeline_config)
 
@@ -529,7 +533,7 @@ class SamplingParams:
         if self.save_output and not server_args.comfyui_mode:
             self._set_output_file_name()
 
-    def _adjust_visual_fields(self, server_args, pipeline_config):
+    def _adjust_mesh_fields(self, server_args, pipeline_config):
         if self.guidance_scale is None:
             try:
                 from sglang.multimodal_gen.configs.pipeline_configs.hunyuan3d import (
@@ -542,6 +546,16 @@ class SamplingParams:
                     self.guidance_scale = 1.0
             except ImportError:
                 self.guidance_scale = 1.0
+        self.return_frames = False
+        self.return_video = False
+        self.num_frames = 1
+        self.adjust_frames = False
+        if self.save_output and not server_args.comfyui_mode:
+            self._set_output_file_name()
+
+    def _adjust_visual_fields(self, server_args, pipeline_config):
+        if self.guidance_scale is None:
+            self.guidance_scale = 1.0
 
         # Process negative prompt
         if self.negative_prompt is not None and not self.negative_prompt.isspace():

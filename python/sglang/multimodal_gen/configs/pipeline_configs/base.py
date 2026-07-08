@@ -71,6 +71,9 @@ class ModelTaskType(Enum):
     def is_action_gen(self) -> bool:
         return self == ModelTaskType.VLA_ACTION
 
+    def is_mesh_gen(self) -> bool:
+        return self == ModelTaskType.I2M
+
     def is_video_gen(self) -> bool:
         return (
             self == ModelTaskType.I2V
@@ -79,7 +82,7 @@ class ModelTaskType(Enum):
         )
 
     def is_visual_gen(self) -> bool:
-        return self.is_image_gen() or self.is_video_gen() or self == ModelTaskType.I2M
+        return self.is_image_gen() or self.is_video_gen()
 
     def requires_image_input(self) -> bool:
         return (
@@ -101,7 +104,7 @@ class ModelTaskType(Enum):
     def data_type(self) -> DataType:
         if self.is_action_gen():
             return DataType.ACTION
-        if self == ModelTaskType.I2M:
+        if self.is_mesh_gen():
             return DataType.MESH
         if self.is_image_gen():
             return DataType.IMAGE
