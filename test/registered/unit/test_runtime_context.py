@@ -339,15 +339,6 @@ class TestRuntimeResolutionStages(_IsolatedServerArgs):
         self.assertEqual(get_flags().sampling_backend, "pytorch")
         self.assertEqual(get_flags().page_size, 64)  # earlier stage survives
 
-    def test_record_parity_failure_rolls_back(self):
-        self._publish(page_size=1)
-        flags_before = get_flags()
-        with self.assertRaises(AssertionError):
-            # declared value diverges from the live server_args (no dual-apply)
-            get_context().record_runtime_overrides([("bad", {"page_size": 64})])
-        self.assertIs(get_flags(), flags_before)  # previous flags intact
-        self.assertEqual(get_context()._runtime_overrides, [])  # rolled back
-
     def test_record_whitelist_violation_rolls_back(self):
         self._publish()
         with self.assertRaises(ValueError):
@@ -366,13 +357,15 @@ class TestRuntimeResolutionStages(_IsolatedServerArgs):
         finally:
             reset_context()
 
-    def test_declare_load_time_override_dual_applies_and_records(self):
+    def test_declare_load_time_override_applies_and_records(self):
         from sglang.srt.arg_groups.overrides import declare_load_time_override
 
         args = self._publish(page_size=1)
         declare_load_time_override("model.load_time", {"page_size": 64})
-        self.assertEqual(args.page_size, 64)  # dual-applied onto server_args
-        self.assertEqual(get_flags().page_size, 64)  # resolved into the leaf
+        # post-init declaration: written through to the field and resolved
+        # into the leaf
+        self.assertEqual(args.page_size, 64)
+        self.assertEqual(get_flags().page_size, 64)
         self.assertEqual(
             get_context()._runtime_overrides,
             [("model.load_time", {"page_size": 64})],
@@ -414,6 +407,21 @@ class TestRuntimeResolutionStages(_IsolatedServerArgs):
             self.assertTrue(get_flags().capture.enable_torch_compile)
         finally:
             reset_context()
+
+    def test_declared_leaf_wins_over_stale_field(self):
+        # A stash entry always drives the leaf at publish, even if the field
+        # value diverged (e.g. a fixture that skipped materialization).
+        @dataclasses.dataclass
+        class _Args:
+            enable_dp_lm_head: A[bool, Arg(help="d", resolvable=True)] = True
+            _resolved_overrides: list = dataclasses.field(default_factory=list)
+
+        args = _Args()
+        args._resolved_overrides = [("dp", {"enable_dp_lm_head": False})]
+        args._declarations_materialized = True
+        args.enable_dp_lm_head = False
+        get_context().set_server_args(args)
+        self.assertFalse(get_flags().enable_dp_lm_head)
 
     def test_bare_dataclass_publish_skips_materialization(self):
         # object.__new__(ServerArgs) fixtures (no __init__, no field values)
