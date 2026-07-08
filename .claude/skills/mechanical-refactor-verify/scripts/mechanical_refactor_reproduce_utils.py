@@ -328,6 +328,68 @@ def _drop_self_annotation(method_text: str, name: str) -> str:
     )
 
 
+def _multiline_string_interior_lines(top_level_text: str) -> set[int]:
+    """1-based lines of ``top_level_text`` that lie inside a multi-line string token
+    (every line after the token's opening line, including the closing-delimiter line).
+    Re-indenting those lines would change the literal's value, not its layout."""
+    interior: set[int] = set()
+    for token in tokenize.generate_tokens(io.StringIO(top_level_text).readline):
+        if token.type == tokenize.STRING and token.end[0] > token.start[0]:
+            interior.update(range(token.start[0] + 1, token.end[0] + 1))
+    return interior
+
+
+def _audit_extract_header(
+    header: str, removed_assigns: dict[str, str | None], where: str
+) -> None:
+    """Refuse header content the extraction cannot vouch for. The header of a scattered
+    extraction is authored text reproduced from the target commit, so anything beyond
+    imports, a TYPE_CHECKING import block, a logger, or a byte-equivalent copy of an
+    assignment deleted from the source would let arbitrary new code ride into the new
+    module under a PASS verdict."""
+    header_assigned: set[str] = set()
+    for stmt in ast.parse(header).body:
+        if isinstance(stmt, (ast.Import, ast.ImportFrom)):
+            continue
+        if (
+            isinstance(stmt, ast.Expr)
+            and isinstance(stmt.value, ast.Constant)
+            and isinstance(stmt.value.value, str)
+        ):
+            continue
+        if (
+            isinstance(stmt, ast.If)
+            and ast.unparse(stmt.test) in ("TYPE_CHECKING", "typing.TYPE_CHECKING")
+            and all(
+                isinstance(sub, (ast.Import, ast.ImportFrom)) for sub in stmt.body
+            )
+        ):
+            continue
+        if isinstance(stmt, (ast.Assign, ast.AnnAssign)):
+            targets = (
+                stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target]
+            )
+            names = [x.id for x in targets if isinstance(x, ast.Name)]
+            value_src = ast.unparse(stmt.value) if stmt.value is not None else None
+            if value_src == "logging.getLogger(__name__)":
+                continue
+            if names and all(
+                n in removed_assigns and removed_assigns[n] == value_src
+                for n in names
+            ):
+                header_assigned.update(names)
+                continue
+        raise AssertionError(
+            f"unverifiable header statement in {where}: {ast.unparse(stmt)!r} is "
+            f"neither scaffolding nor a relocated source assignment"
+        )
+    missing = set(removed_assigns) - header_assigned
+    assert not missing, (
+        f"drop_assigns {sorted(missing)} deleted from the source but not reproduced "
+        f"in the header of {where}"
+    )
+
+
 class Repro:
     """Builds a faithful relocation transform from primitives, then reproduces a commit.
 
@@ -793,13 +855,21 @@ class Repro:
             src_lines = _split_keepends(_read_source(src_path))
             body = ast.parse("".join(src_lines)).body
             wanted = set(symbols)
-            scaffolding = (
-                ast.Import,
-                ast.ImportFrom,
-                ast.If,
-                ast.Assign,
-                ast.AnnAssign,
-            )
+
+            def is_scaffolding(node: ast.stmt) -> bool:
+                if isinstance(node, (ast.Import, ast.ImportFrom)):
+                    return True
+                if isinstance(node, ast.If):
+                    return ast.unparse(node.test) in (
+                        "TYPE_CHECKING",
+                        "typing.TYPE_CHECKING",
+                    )
+                if isinstance(node, ast.Assign):
+                    return all(isinstance(x, ast.Name) for x in node.targets)
+                if isinstance(node, ast.AnnAssign):
+                    return isinstance(node.target, ast.Name)
+                return False
+
             cut = len(body)
             while cut > 0:
                 node = body[cut - 1]
@@ -809,7 +879,7 @@ class Repro:
                     )
                     and node.name in wanted
                 )
-                if is_symbol or isinstance(node, scaffolding):
+                if is_symbol or is_scaffolding(node):
                     cut -= 1
                 else:
                     break
@@ -883,6 +953,8 @@ class Repro:
                 for name, (start, end) in spans.items()
             }
             assign_spans: list[tuple[int, int]] = []
+            assign_rewrites: list[tuple[int, int, str]] = []
+            removed_assigns: dict[str, str] = {}
             found_assigns: set[str] = set()
             for node in tree.body:
                 targets = (
@@ -891,15 +963,50 @@ class Repro:
                     else [node.target] if isinstance(node, ast.AnnAssign) else []
                 )
                 names = {t.id for t in targets if isinstance(t, ast.Name)}
-                if names & dropped:
+                hit = names & dropped
+                if not hit:
+                    continue
+                assert len(names) == len(targets), (
+                    f"drop_assigns {sorted(hit)}: non-name targets in {src}"
+                )
+                value_src = ast.unparse(node.value) if node.value is not None else None
+                for dropped_name in hit:
+                    removed_assigns[dropped_name] = value_src
+                surviving = [
+                    x.id for x in targets if isinstance(x, ast.Name) and x.id not in dropped
+                ]
+                if surviving:
+                    kept_stmt = (
+                        " = ".join(surviving)
+                        + " = "
+                        + _slice_span(
+                            "".join(src_lines),
+                            node.value.lineno,
+                            node.value.col_offset,
+                            node.value.end_lineno,
+                            node.value.end_col_offset,
+                        )
+                        + src_nl
+                    )
+                    assign_rewrites.append((node.lineno, node.end_lineno, kept_stmt))
+                else:
                     assign_spans.append((node.lineno, node.end_lineno))
-                    found_assigns |= names & dropped
+                found_assigns |= hit
             assert (
                 found_assigns == dropped
             ), f"{dropped - found_assigns} not assigned in {src}"
-            cuts = list(spans.values()) + assign_spans
-            for start, end in sorted(cuts, reverse=True):
-                del src_lines[start - 1 : end]
+            if header.strip() or removed_assigns:
+                _audit_extract_header(header, removed_assigns, where=dst)
+            cuts = [(start, end, None) for start, end in spans.values()]
+            cuts += [(start, end, None) for start, end in assign_spans]
+            cuts += assign_rewrites
+            for start, end, repl in sorted(
+                cuts, key=lambda c: (c[0], c[1]), reverse=True
+            ):
+                if repl is None:
+                    del src_lines[start - 1 : end]
+                else:
+                    src_lines[start - 1 : end] = [repl]
             _write_source(src_path, "".join(src_lines))
 
             gap = src_nl * 3
@@ -940,25 +1047,44 @@ class Repro:
         mental-model-prep-and-move.md)."""
 
         def reindent(text: str, shift: int) -> str:
-            if shift <= 0:
-                return dedent(text, -shift)
+            if shift == 0:
+                return text
+            interior = _multiline_string_interior_lines(dedent(text, body_indent))
+            lines = _split_keepends(text)
+            if shift < 0:
+                return "".join(
+                    (
+                        line[-shift:]
+                        if index + 1 not in interior and line[:-shift] == " " * -shift
+                        else line
+                    )
+                    for index, line in enumerate(lines)
+                )
             pad = " " * shift
             return "".join(
-                pad + line if line.strip() else line
-                for line in text.splitlines(keepends=True)
+                pad + line if line.strip() and index + 1 not in interior else line
+                for index, line in enumerate(lines)
             )
 
         def op(root: Path) -> None:
             src_path = root / src
             src_text = _read_source(src_path)
             assert src_text.count(body) == 1, f"block not found uniquely in {src}"
+            at = src_text.find(body)
+            assert at == 0 or src_text[at - 1] == "\n", (
+                f"block matches mid-line in {src}; it must start at a line boundary"
+            )
             _write_source(src_path, src_text.replace(body, call, 1))
 
             dst_path = root / dst
             dst_lines = _split_keepends(_read_source(dst_path))
             dst_nl = _newline_style("".join(dst_lines))
+            sig_first = _split_keepends(signature)[0]
+            sig_indent = len(sig_first) - len(sig_first.lstrip(" "))
             function = (
-                signature.rstrip("\r\n") + dst_nl + reindent(body, 4 - body_indent)
+                signature.rstrip("\r\n")
+                + dst_nl
+                + reindent(body, sig_indent + 4 - body_indent)
             )
             if return_text is not None:
                 function = function.rstrip("\r\n") + dst_nl + return_text
@@ -1006,12 +1132,36 @@ class Repro:
 
     def delete_file(self, path: str) -> "Repro":
         """Delete a source module that its symbols' relocation left empty (the chain deletes
-        the leftover scaffolding-only file). Run after the moves that empty it."""
+        the leftover scaffolding-only file). Run after the moves that empty it. Refuses a
+        file that still holds anything beyond a docstring, imports, or a TYPE_CHECKING
+        block -- deleting live code is not a relocation."""
 
         def op(root: Path) -> None:
             target = root / path
-            if target.exists():
-                target.unlink()
+            if not target.exists():
+                return
+            leftover = [
+                ast.unparse(stmt)
+                for stmt in ast.parse(_read_source(target)).body
+                if not (
+                    isinstance(stmt, (ast.Import, ast.ImportFrom))
+                    or (
+                        isinstance(stmt, ast.Expr)
+                        and isinstance(stmt.value, ast.Constant)
+                        and isinstance(stmt.value.value, str)
+                    )
+                    or (
+                        isinstance(stmt, ast.If)
+                        and ast.unparse(stmt.test)
+                        in ("TYPE_CHECKING", "typing.TYPE_CHECKING")
+                    )
+                )
+            ]
+            assert not leftover, (
+                f"{path} still holds non-scaffolding code, refusing to delete: "
+                f"{leftover[:3]}"
+            )
+            target.unlink()
 
         self.ops.append(op)
         return self

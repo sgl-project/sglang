@@ -1646,15 +1646,8 @@ def test_extract_to_new_module_asserts_when_symbol_not_in_the_tail(
         _apply(r, tmp_path)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="the tail scan treats any ast.If as scaffolding, so a trailing "
-    "`if __name__ == '__main__':` block is silently relocated into the new module",
-)
-def test_extract_to_new_module_keeps_a_trailing_main_guard_in_source(
-    tmp_path: Path,
-) -> None:
-    """A trailing __main__ guard is not a moved symbol and must stay in the source."""
+def test_extract_to_new_module_refuses_a_trailing_main_guard(tmp_path: Path) -> None:
+    """A trailing __main__ guard is executable code, not scaffolding: the tail cut raises."""
     (tmp_path / "src.py").write_text(
         "class Keep:\n"
         "    pass\n"
@@ -1670,7 +1663,8 @@ def test_extract_to_new_module_keeps_a_trailing_main_guard_in_source(
     r = Repro("b", "t").extract_to_new_module(
         "src.py", "new.py", symbols=["foo"], future_import=False
     )
-    _apply(r, tmp_path)
+    with pytest.raises(AssertionError):
+        _apply(r, tmp_path)
     assert "__main__" in (tmp_path / "src.py").read_text()
 
 
@@ -1709,11 +1703,6 @@ def test_extract_symbols_to_new_module_leaves_a_comment_above_a_moved_def(
     assert (tmp_path / "new.py").read_text() == "def moved():\n    return 2\n"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="drop_assigns deletes the whole statement when any target matches, so "
-    "`A = B = 1` silently loses B's binding from the source",
-)
 def test_extract_symbols_drop_assigns_preserves_other_targets_of_chained_assign(
     tmp_path: Path,
 ) -> None:
@@ -1731,11 +1720,6 @@ def test_extract_symbols_drop_assigns_preserves_other_targets_of_chained_assign(
     assert "B" in (tmp_path / "src.py").read_text()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="delete_file has no emptiness guard, so deleting a module that still holds "
-    "live definitions is silently certifiable",
-)
 def test_delete_file_refuses_a_file_with_remaining_definitions(tmp_path: Path) -> None:
     """Deleting a module that still contains defs must fail loudly."""
     (tmp_path / "live.py").write_text("def still_used():\n    return 42\n")
@@ -1775,11 +1759,6 @@ def test_extract_function_does_not_pad_blank_lines_in_the_body(tmp_path: Path) -
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="a positive reindent pads every non-blank line, shifting triple-quoted "
-    "string interiors and changing the literal's value",
-)
 def test_extract_function_does_not_reindent_string_literal_interiors(
     tmp_path: Path,
 ) -> None:
@@ -1802,11 +1781,6 @@ def test_extract_function_does_not_reindent_string_literal_interiors(
     assert "\nliteral line\n" in (tmp_path / "dst.py").read_text()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="the body is matched with a raw substring count/replace, so a mid-line "
-    "match splices the call into the middle of an unrelated statement",
-)
 def test_extract_function_rejects_a_mid_line_substring_match(tmp_path: Path) -> None:
     """A body that only matches mid-line must fail loudly instead of splicing the call."""
     (tmp_path / "src.py").write_text("value = prefix_total = 0\n")
@@ -1824,11 +1798,6 @@ def test_extract_function_rejects_a_mid_line_substring_match(tmp_path: Path) -> 
         _apply(r, tmp_path)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="the body is always reindented to depth 4 (a module-level function body), "
-    "so into_class extraction emits a method with a mis-indented, invalid body",
-)
 def test_extract_function_into_class_indents_body_to_method_depth(
     tmp_path: Path,
 ) -> None:
