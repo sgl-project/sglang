@@ -60,6 +60,7 @@ from sglang.srt.utils import (
 from sglang.srt.utils.common import ceil_align, is_pin_memory_available
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
     from sglang.srt.layers.utils.cp_utils import ContextParallelMetadata
     from sglang.srt.managers.schedule_batch import MultimodalInputs, ScheduleBatch
@@ -285,6 +286,9 @@ class NgramEmbeddingInfo:
     req_lens: torch.Tensor
     out_column_starts: torch.Tensor
     out_req_lens: torch.Tensor
+    # Mask marking chunked (not-yet-finished) prefill requests whose sampled
+    # pseudo next-token must NOT be written into the token table.
+    skip_token_table_update: Optional[torch.Tensor] = None
 
     @classmethod
     def create(
@@ -294,6 +298,7 @@ class NgramEmbeddingInfo:
         device: torch.device,
         column_starts=None,
         req_lens=None,
+        skip_token_table_update=None,
     ) -> NgramEmbeddingInfo:
         info = cls(
             token_table=token_table,
@@ -301,6 +306,7 @@ class NgramEmbeddingInfo:
             req_lens=torch.empty(batch_size, dtype=torch.int32, device=device),
             out_column_starts=torch.empty(batch_size, dtype=torch.int32, device=device),
             out_req_lens=torch.empty(batch_size, dtype=torch.int32, device=device),
+            skip_token_table_update=skip_token_table_update,
         )
         if column_starts is not None:
             info.column_starts[:] = column_starts
@@ -315,6 +321,11 @@ class NgramEmbeddingInfo:
             req_lens=self.req_lens[:bs],
             out_column_starts=self.out_column_starts[:bs],
             out_req_lens=self.out_req_lens[:bs],
+            skip_token_table_update=(
+                self.skip_token_table_update[:bs]
+                if self.skip_token_table_update is not None
+                else None
+            ),
         )
 
 
@@ -429,9 +440,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For hidden states before normal
     return_hidden_states_before_norm: bool = False
 
-    # For NSA/DSA topk_indices reuse across forward calls (e.g., EAGLE draft)
-    topk_indices: Optional[torch.Tensor] = None
-    reuse_mtp_topk_indices: Optional[bool] = False
+    # Gate for reusing the first MTP draft step's indexer topk across steps;
+    # the carried topk lives on spec_info (see EagleDraftInput.dsa_topk_indices).
+    reuse_dsa_topk_indices: Optional[bool] = False
 
     # === Forward-derived (built in init_new on the forward stream; FB-owned) ===
     # Position information
@@ -502,6 +513,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     tbo_children: Optional[List[ForwardBatch]] = None
 
     attn_cp_metadata: Optional[ContextParallelMetadata] = None
+
+    # For decode context parallel.
+    # NOTE: DecodeContextParallelMetadata is imported under TYPE_CHECKING only (see the
+    # import block above) — available for annotations but NOT bound at runtime in this
+    # module. Import it from sglang.srt.layers.dcp.metadata if a runtime use is added.
+    attn_dcp_metadata: Optional[DecodeContextParallelMetadata] = None
+
+    # Decode context parallel KV write mask.
+    dcp_kv_mask: Optional[torch.Tensor] = None
 
     # For ngram embedding
     ngram_embedding_info: Optional[NgramEmbeddingInfo] = None
@@ -857,6 +877,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
             model_runner.lora_manager.prepare_lora_batch(ret)
 
+        if (
+            getattr(model_runner, "dcp_size", 1) > 1
+            and ret.out_cache_loc is not None
+            and is_hip()
+        ):
+            ret.dcp_kv_mask = (
+                ret.positions % model_runner.dcp_size == model_runner.dcp_rank
+            )
+
         return ret
 
     def _maybe_init_non_generation_fields(self, batch: ScheduleBatch):
@@ -984,6 +1013,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             device,
             column_starts=column_starts,
             req_lens=req_lens,
+            skip_token_table_update=batch.ne_skip_token_table_update,
         )
 
     def compute_spec_mrope_positions(
@@ -1336,6 +1366,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 spec_info.topk_index = self._pad_tensor_to_size(
                     spec_info.topk_index, bs
                 )
+            if getattr(spec_info, "draft_probs", None) is not None:
+                spec_info.draft_probs = self._pad_tensor_to_size(
+                    spec_info.draft_probs, bs
+                )
             if getattr(spec_info, "num_correct_drafts", None) is not None:
                 spec_info.num_correct_drafts = self._pad_tensor_to_size(
                     spec_info.num_correct_drafts, bs
@@ -1455,6 +1489,7 @@ def build_inner_fb_view(
         seq_lens_cpu=forward_batch.seq_lens_cpu,
         encoder_lens=encoder_lens,
         out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
+        out_cache_loc_dsv4=getattr(forward_batch, "out_cache_loc_dsv4", None),
         spec_info=forward_batch.spec_info,
     )
 

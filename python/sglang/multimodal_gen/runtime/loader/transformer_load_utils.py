@@ -22,7 +22,10 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config i
 )
 from sglang.multimodal_gen.runtime.loader.utils import _list_safetensors_files
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_model
+from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
+    maybe_download_model,
+    snapshot_download,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.precision import resolve_precision
 from sglang.multimodal_gen.runtime.utils.quantization_utils import (
@@ -119,6 +122,7 @@ class TransformerQuantLoadSpec:
     quant_config: Optional[QuantizationConfig]
     nunchaku_config: Optional[NunchakuConfig]
     param_dtype: Optional[torch.dtype]
+    needs_device_weight_postprocess: bool = False
     post_load_hooks: list[PostLoadHook] = field(default_factory=list)
 
     @property
@@ -252,6 +256,7 @@ class _ModelOptFp8OffloadAdapter(_TransformerQuantAdapter):
 
         quant_name_getter = getattr(type(quant_config), "get_name", None)
         quant_name = quant_name_getter() if callable(quant_name_getter) else None
+
         if quant_name != "modelopt_fp8":
             return
 
@@ -317,12 +322,31 @@ def resolve_transformer_safetensors_to_load(
     quantized_path = server_args.transformer_weights_path
 
     if quantized_path:
-        quantized_path = maybe_download_model(quantized_path)
+        original_quantized_path = quantized_path
+        quantized_path = maybe_download_model(original_quantized_path)
         logger.info("using quantized transformer weights from: %s", quantized_path)
         if os.path.isfile(quantized_path) and quantized_path.endswith(".safetensors"):
             safetensors_list = [quantized_path]
         else:
             safetensors_list = _list_safetensors_files(quantized_path)
+            if not safetensors_list and not os.path.exists(original_quantized_path):
+                logger.warning(
+                    "No safetensors files found in cached transformer weights path "
+                    "%s; refreshing snapshot for %s",
+                    quantized_path,
+                    original_quantized_path,
+                )
+                quantized_path = snapshot_download(
+                    repo_id=original_quantized_path,
+                    ignore_patterns=["*.onnx", "*.msgpack"],
+                    allow_patterns=[
+                        "*.json",
+                        "*.safetensors",
+                        "*.safetensors.index.json",
+                    ],
+                    max_workers=8,
+                )
+                safetensors_list = _list_safetensors_files(quantized_path)
     else:
         safetensors_list = _list_safetensors_files(component_model_path)
 
@@ -458,8 +482,26 @@ def resolve_transformer_quant_load_spec(
         quant_config=quant_config,
         nunchaku_config=nunchaku_config,
         param_dtype=param_dtype,
+        needs_device_weight_postprocess=_needs_device_weight_postprocess(quant_config),
         post_load_hooks=post_load_hooks,
     )
+
+
+def _needs_device_weight_postprocess(
+    quant_config: Optional[QuantizationConfig],
+) -> bool:
+    """Return whether post-load weight processing needs CUDA/NPU tensors."""
+    quant_name = _get_quant_config_name(quant_config)
+    serialized_flag_by_quant_name = {
+        "fp8": "is_checkpoint_fp8_serialized",
+        "mxfp8": "is_checkpoint_fp8_serialized",
+        "mxfp4": "is_checkpoint_mxfp4_serialized",
+        "mxfp4_npu": "is_checkpoint_mxfp4_npu_serialized",
+    }
+    serialized_flag = serialized_flag_by_quant_name.get(quant_name)
+    if serialized_flag is None:
+        return False
+    return not getattr(quant_config, serialized_flag, False)
 
 
 def _build_transformer_quant_adapters(

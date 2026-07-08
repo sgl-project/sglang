@@ -7,12 +7,15 @@ BaseCudaGraphBackend chosen via cuda_graph_config.
 
 Public API:
   - BaseRunner — minimal abstract base shared by the cuda-graph runners
-    and the eager runner (shared __init__ + abstract
+    and the eager runner (shared __init__ + warmup + abstract
     can_run_graph/load_batch/execute).
   - BaseCudaGraphRunner — abstract cuda-graph base; bucket padding +
     capture-loop scaffolding on top of BaseRunner.
   - DecodeCudaGraphRunner — concrete decode-phase runner.
   - PrefillCudaGraphRunner — concrete prefill-phase runner.
+  - EagerRunner — no-cuda-graph runner; runs model.forward live (the
+    eager dual of the cuda-graph runners), mode-dispatched over decode +
+    extend + idle.
   - Buffer dataclasses, capture-mode flags, the global memory pool,
     and the DeepEP adapter live in
     sglang.srt.model_executor.runner_utils; they are
@@ -29,12 +32,13 @@ from sglang.srt.model_executor.runner.base_runner import BaseRunner  # noqa: F40
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,
 )
+from sglang.srt.model_executor.runner.eager_runner import EagerRunner  # noqa: F401
 from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (  # noqa: F401
     PrefillCudaGraphRunner,
 )
 from sglang.srt.model_executor.runner.shape_key import ShapeKey  # noqa: F401
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (  # noqa: F401
-    TC_PIECEWISE_CUDA_GRAPH_CAPTURE_FAILED_MSG,
+    TCPCG_FAILURE_HINT,
 )
 from sglang.srt.model_executor.runner_utils import (  # noqa: F401
     DecodeInputBuffers,

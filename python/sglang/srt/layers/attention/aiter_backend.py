@@ -123,9 +123,6 @@ class ForwardMetadata:
     swa_out_cache_loc: Optional[torch.Tensor] = None
 
 
-global_workspace_buffer = None
-
-
 _AITER_PARTITION_SIZE_ROCM = 256
 
 
@@ -845,6 +842,8 @@ class AiterAttnBackend(AttentionBackend):
             reduce_final_map,
             reduce_partial_map,
             tile_q,
+            # Prefill PS metadata has no split cap; 0 keeps AITER's default reduce sizing.
+            0,
             output,
             final_lse,
         )
@@ -2323,6 +2322,11 @@ class AiterAttnBackend(AttentionBackend):
                 page_table = self.forward_metadata.swa_page_table
 
             extra_kwargs = {}
+            attn_out = getattr(forward_batch, "_attn_output", None)
+            if attn_out is not None and q.dtype != fp8_dtype:
+                extra_kwargs["out"] = attn_out.view(
+                    -1, layer.tp_q_head_num, layer.head_dim
+                )
 
             o = mha_batch_prefill_func(
                 q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),

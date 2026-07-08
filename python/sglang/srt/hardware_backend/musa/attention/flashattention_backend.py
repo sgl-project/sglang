@@ -32,7 +32,6 @@ if TYPE_CHECKING:
 
 # Global workspace buffer for MLA
 _MATE_MLA_WORKSPACE_SIZE_BYTES = 128 * 1024 * 1024
-_MATE_MLA_WORKSPACE_BUFFER: torch.Tensor | None = None
 
 # Cache for non-MLA scheduler metadata by prefix
 _MATE_NO_MLA_SCHEDULER_METADATA_DICT: dict = {}
@@ -54,7 +53,7 @@ def _compute_scheduler_metadata(
     num_splits: int,
 ) -> Tuple[torch.Tensor, bool] | torch.Tensor:
     """Compute scheduler metadata based on backend's current state."""
-    global _MATE_MLA_WORKSPACE_BUFFER, _MATE_NO_MLA_SCHEDULER_METADATA_DICT
+    global _MATE_NO_MLA_SCHEDULER_METADATA_DICT
 
     layer = backend._current_layer
     current_layer_id = layer.layer_id
@@ -84,11 +83,15 @@ def _compute_scheduler_metadata(
         should_update = True
 
     if backend.use_mla:
-        if _MATE_MLA_WORKSPACE_BUFFER is None:
-            _MATE_MLA_WORKSPACE_BUFFER = torch.empty(
+        from sglang.srt.runtime_context import get_buffer
+
+        workspace = get_buffer(
+            "musa_mate_mla_workspace",
+            lambda: torch.empty(
                 _MATE_MLA_WORKSPACE_SIZE_BYTES, device=backend.device, dtype=torch.uint8
-            )
-        return (_MATE_MLA_WORKSPACE_BUFFER, not should_update)
+            ),
+        )
+        return (workspace, not should_update)
     else:
         with _MATE_NO_MLA_SCHEDULER_METADATA_LOCK:
             if (

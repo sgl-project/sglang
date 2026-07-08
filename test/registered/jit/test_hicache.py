@@ -5,16 +5,16 @@ import torch
 
 from sglang.jit_kernel.hicache import can_use_write_back_jit_kernel
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
-from sglang.srt.mem_cache.memory_pool_host import (
+from sglang.srt.mem_cache.memory_pool_host import MLATokenToKVPoolHost
+from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
-    MHATokenToKVPoolHost,
-    MLATokenToKVPoolHost,
     alloc_with_pin_memory,
 )
+from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=10, suite="base-b-kernel-unit-1-gpu-large")
+register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
 
 pytestmark = pytest.mark.skipif(

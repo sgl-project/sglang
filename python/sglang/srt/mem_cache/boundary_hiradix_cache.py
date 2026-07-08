@@ -17,8 +17,6 @@ if TYPE_CHECKING:
 class BoundaryHiRadixCache(HiRadixCache):
     """Experimental HiRadixCache variant for the L1/L2 boundary invariant."""
 
-    allow_host_pool_smaller_than_device = True
-
     def __init__(self, params: CacheInitParams, server_args: ServerArgs):
         if server_args.hicache_storage_backend is not None:
             raise ValueError("BoundaryHiRadixCache does not support L3 storage")

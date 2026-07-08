@@ -257,17 +257,6 @@ class TestBoundaryHiRadixCachePolicy(CustomTestCase):
             end_layer=1,
         )
 
-        with self.assertRaisesRegex(AssertionError, "host memory should be larger"):
-            _TinyHostKVCache(
-                device_pool,
-                host_to_device_ratio=0.5,
-                host_size=0,
-                page_size=1,
-                layout="layer_first",
-                pin_memory=False,
-                device="cpu",
-            )
-
         host_pool = _TinyHostKVCache(
             device_pool,
             host_to_device_ratio=0.5,
@@ -276,7 +265,6 @@ class TestBoundaryHiRadixCachePolicy(CustomTestCase):
             layout="layer_first",
             pin_memory=False,
             device="cpu",
-            enforce_host_larger_than_device=False,
         )
         self.assertLess(host_pool.size, device_pool.size)
 
