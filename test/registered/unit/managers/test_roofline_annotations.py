@@ -60,9 +60,7 @@ class TestStepSpanRoofline(CustomTestCase):
         # Two decode reqs: each nq=1, nkv=seqlen.
         # sk=30, sqsq=1+1=2, sqsk=1*10+1*20=30.
         fb = _fb(ForwardMode.DECODE, batch_size=2, seq_lens_cpu=[10, 20])
-        self.assertEqual(
-            self._name(fb), "step[DECODE bs=2 g_sqsq=2 g_sqsk=30 g_sk=30]"
-        )
+        self.assertEqual(self._name(fb), "step[DECODE bs=2 g_sqsq=2 g_sqsk=30 g_sk=30]")
 
     def test_pure_prefill_batch(self):
         # req a: nq=8, nkv=10 -> sqsq=64, sqsk=80
