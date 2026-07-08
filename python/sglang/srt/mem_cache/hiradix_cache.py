@@ -204,8 +204,6 @@ class HiRadixCache(RadixCache):
             1 if server_args.hicache_write_policy == "write_through" else 2
         )
         self.load_back_threshold = 10
-        self.decode_event_check_interval = 16
-        self.decode_event_check_steps = 0
         # Detach storage backend automatically on process shutdown
         atexit.register(self.shutdown)
 
@@ -1428,29 +1426,16 @@ class HiRadixCache(RadixCache):
         """
         return self.cache_controller.start_loading()
 
-    def flush_write_through_acks(self) -> None:
-        self.writing_check()
-
-    def check_hicache_events(self, can_defer: bool = False):
+    def check_hicache_events(self):
         # Reap the previous round's PP-sync sends before issuing new ones.
         self._drain_async_work()
 
         if self.pp_size != 1:
-            self.decode_event_check_steps = 0
             self.writing_check()
             self.loading_check()
             if self.enable_storage:
                 self.drain_storage_control_queues()
         else:
-            if can_defer:
-                next_step = self.decode_event_check_steps + 1
-                if next_step < self.decode_event_check_interval:
-                    self.decode_event_check_steps = next_step
-                    return
-                self.decode_event_check_steps = 0
-            else:
-                self.decode_event_check_steps = 0
-
             (
                 write_finish_count,
                 load_finish_count,

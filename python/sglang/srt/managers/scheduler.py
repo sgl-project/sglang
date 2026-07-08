@@ -2778,9 +2778,7 @@ class Scheduler(
                 self._add_request_to_queue(req)
 
         if self.enable_hierarchical_cache or self.server_args.enable_flexkv:
-            self.tree_cache.check_hicache_events(
-                can_defer=len(self.waiting_queue) == 0 and self.chunked_req is None
-            )
+            self.tree_cache.check_hicache_events()
 
         if self.enable_priority_preemption or self.is_hybrid_swa:
             # Reset batch_is_full to try preemption with a prefill adder.
@@ -3066,11 +3064,6 @@ class Scheduler(
         if batch.is_empty():
             batch.batch_is_full = False
             return batch
-
-        # Eagerly release lock_ref on completed write-through nodes so they
-        # become evictable, improving batch scheduling headroom.
-        if self.enable_hierarchical_cache:
-            self.tree_cache.flush_write_through_acks()
 
         # Check if decode out of memory
         if (kv_full_retract_flag := not batch.check_decode_mem()) or (

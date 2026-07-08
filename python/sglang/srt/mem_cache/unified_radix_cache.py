@@ -364,8 +364,6 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.pp_rank = params.pp_rank
         self.pp_size = params.pp_size
         self.work_list: list[torch.distributed.Work] = []
-        self.decode_event_check_interval = 16
-        self.decode_event_check_steps = 0
 
         # HiCache D↔H defaults (overridden by init_hicache)
         self.cache_controller: Optional[HybridCacheController] = None
@@ -2512,27 +2510,17 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             last_best_match_device_node,
         )
 
-    def check_hicache_events(self, can_defer: bool = False) -> None:
+    def check_hicache_events(self) -> None:
         """Called per scheduler step to poll async HiCache events."""
         # Reap the previous round's PP-sync sends before issuing new ones.
         self._drain_async_work()
 
         if self.pp_size != 1:
-            self.decode_event_check_steps = 0
             self.writing_check()
             self.loading_check()
             if self.enable_storage:
                 self.drain_storage_control_queues()
         else:
-            if can_defer:
-                next_step = self.decode_event_check_steps + 1
-                if next_step < self.decode_event_check_interval:
-                    self.decode_event_check_steps = next_step
-                    return
-                self.decode_event_check_steps = 0
-            else:
-                self.decode_event_check_steps = 0
-
             (
                 write_finish_count,
                 load_finish_count,
@@ -2562,10 +2550,6 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             self.storage_metrics_collector.log_storage_metrics(
                 self.cache_controller.storage_backend.get_stats()
             )
-
-    def flush_write_through_acks(self) -> None:
-        """Flush pending write-through acknowledgements."""
-        self.writing_check()
 
     def ready_to_load_host_cache(self) -> int:
         """Notify the cache controller to start the KV cache loading."""
