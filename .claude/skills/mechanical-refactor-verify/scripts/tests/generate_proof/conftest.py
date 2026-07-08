@@ -6,12 +6,11 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from generate_testlib import _git
 from mechanical_refactor_generate_proof import (
     infer_recipe,
     recipe_to_script,
 )
-
-from generate_testlib import _git
 
 
 @pytest.fixture

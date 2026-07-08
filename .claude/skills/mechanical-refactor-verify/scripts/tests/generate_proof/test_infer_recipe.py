@@ -6,17 +6,16 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from mechanical_refactor_generate_proof import (
-    infer_recipe,
-    recipe_to_script,
-)
-
 from generate_testlib import (  # noqa: F401
     _commit,
     _free_function_move_with_module_level_caller,
     _git,
     _method_onto_class,
     _write,
+)
+from mechanical_refactor_generate_proof import (
+    infer_recipe,
+    recipe_to_script,
 )
 
 

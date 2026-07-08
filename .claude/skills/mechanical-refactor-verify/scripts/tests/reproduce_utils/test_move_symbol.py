@@ -21,7 +21,6 @@ from mechanical_refactor_reproduce_utils import (
 )
 from reproduce_testlib import _apply, _commit, _git, _write  # noqa: F401
 
-
 # --- move_symbol ---------------------------------------------------------------
 
 
