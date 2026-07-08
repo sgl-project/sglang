@@ -13,12 +13,21 @@ contains the reshape **and** an indentation shift **and** a cross-file relocatio
 neither a human nor a tool can mechanically confirm "the body that landed is the body
 that left" — you have to re-read the logic to be sure.
 
-**Rule:** split a mechanical relocation into up to **three** commits — an optional
-**prepare** (a minimal in-place reshape), the **move** (the pure relocation, certified by the
-reproduce proof; see `guide-prove.md`), and an optional **postpare** (a minimal tail fixup the move
-cannot do mechanically, e.g. a module path inside a string literal). Both ends are minimal and
-covered by tests; the move carries the bulk. See `spec.md` §2.4. ("prep" below is the
-prepare phase.)
+**Rule:** a behaviour-preserving relocation is up to **three commits**, in this order:
+
+- an **(optional) prepare** commit — a **minimal** in-place reshape that the relocation needs
+  (de-self a method, retype `self`). A human reviews it, so it must be small and contain **no
+  cross-file def relocation and no body relocation**: the code stays where it is.
+- a **move** commit — the pure relocation, certified by the reproduce proof
+  (`guide-construct-proof.md`; the property it certifies is `spec-reproduction-utils.md`).
+  This carries the **bulk**.
+- an **(optional) postpare** commit — a **minimal** tail fixup the relocation cannot do
+  mechanically: a module path inside a **string literal**, a doc reference. A human reviews it.
+
+Both ends are optional, minimal, and covered by tests; neither prepare nor postpare ever
+relocates a def across files or moves a body. The move-artifact whitelist is exactly what a
+relocation *forces*; it is **not** a licence to fold reshape work into the move. ("prep"
+below is the prepare phase.)
 
 **A large semantic refactor is not one of these phases.** Consolidating bookkeeping,
 deduplicating logic, restructuring control flow, or redesigning an API is its **own commit**,
@@ -28,9 +37,9 @@ the "small reshape" label. Prepare is for the *minimal* reshape a relocation for
 **Prep is human-reviewed, so it stays small and relocates nothing.** The code keeps its
 place — prep only changes its *shape* (de-self a method, retype `self`) so a human can
 eyeball the whole diff. The **move** does all the relocating and is machine-certified;
-the verifier forgives only the artifacts a relocation forces (imports, a dropped
+the proof forgives only the artifacts a relocation forces (imports, a dropped
 `@staticmethod`, requalifying the moved symbol's call sites). Never fold reshape work
-into the move to make the verifier pass — if the move's diff has anything outside those
+into the move to make the proof pass — if the move's diff has anything outside those
 artifacts, the reshape leaked in and belongs back in prep.
 
 The shape of the **prep** commit depends on where the code is going — to a
@@ -54,7 +63,7 @@ Reshape the method **in its original file and position** so it no longer depends
 
 Qualifying the call site reflects the real fact that `foo` no longer needs an instance.
 The decorator and this qualifier are the only relocation artifacts the next commit will
-carry, and the verifier whitelists exactly those — so prep can stay this small.
+carry, and the whitelist (`spec-reproduction-utils.md` §1.1) forgives exactly those — so prep can stay this small.
 
 **Check:** lint + tests pass; the diff is just the body reshape plus the call-site
 qualifier — and nothing has moved.

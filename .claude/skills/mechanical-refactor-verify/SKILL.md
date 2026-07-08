@@ -16,27 +16,31 @@ There is **one property** — *a commit is a pure relocation* — and **one proo
 formatter, and diff byte-for-byte against the target commit. An empty diff is the proof; any
 residual is a bundled non-move change surfaced for review. A reshape that is not a pure
 relocation must not ride along: split the work into an optional **prepare**, the certified
-**move**, and an optional **postpare** (defined in `spec.md` §2.4; recipes in `guide-prep-move.md`).
+**move**, and an optional **postpare** (`guide-split.md`).
 
 ## What do you want to do?
 
-- **Do a mechanical refactor** (extract, move, split) → `guide-prep-move.md`: how to cut the
-  change into prepare + move + postpare, with the case recipes and anti-patterns.
-- **Certify or review a move commit** → `guide-prove.md`: run
-  `scripts/mechanical_refactor_proof_generator.py <commit>` (or a `<base>..<tip>` range with
-  `--match -move: --out DIR`), audit the emitted script, and hand-write a `Repro` when the
+- **Split a change into commits** (extract, move, file split) → `guide-split.md`: the
+  prepare + move + postpare rule, the case recipes, and the anti-patterns.
+- **Construct the proof for a move commit** → `guide-construct-proof.md`: run
+  `scripts/mechanical_refactor_proof_generator.py`, or hand-write a `Repro` when the
   generator reports `UNSUPPORTED`.
-- **Decide whether a change counts as a clean move** → `spec.md`: the property, the whole
-  whitelist / not-allowed list, and what a verdict does and does not assert. The single
-  source of truth; if any other file disagrees, `spec.md` wins.
+- **Verify someone's proof** → `guide-verify-proof.md`: re-run it, read the verdict, audit
+  the authored surfaces.
+- **Decide whether a change counts as a clean move** → `spec-reproduction-utils.md`: the
+  property, the whole whitelist / not-allowed list, and each primitive's contract. The
+  source of truth for the reproduction module; if any other file disagrees, it wins.
 
 ## Files
 
-- [`guide-prep-move.md`](guide-prep-move.md) — split a change into prepare + move +
-  postpare: the case recipes, what stays mechanical, and the anti-patterns.
-- [`guide-prove.md`](guide-prove.md) — prove the move commit: the generator, the `Repro`
-  primitives, and how reviewers re-run the proof.
-- [`spec.md`](spec.md) — the normative spec of the certified property and its proof.
+- [`guide-split.md`](guide-split.md) — split a change into prepare + move + postpare: the
+  case recipes, what stays mechanical, and the anti-patterns.
+- [`guide-construct-proof.md`](guide-construct-proof.md) — produce the proof: the
+  generator, the hand-written `Repro`, and publishing the proof with the PR.
+- [`guide-verify-proof.md`](guide-verify-proof.md) — consume the proof: re-run, verdicts,
+  and the audit checklist for authored surfaces.
+- [`spec-reproduction-utils.md`](spec-reproduction-utils.md) — the normative spec of the
+  clean-move property and the reproduction primitives.
 - [`scripts/mechanical_refactor_proof_generator.py`](scripts/mechanical_refactor_proof_generator.py) —
   the **generator**: infers a reproduce recipe from a commit's diff and emits/runs a
   standalone, auditable script per commit, with a `PASS` / `RESIDUAL` / `UNSUPPORTED` verdict.
