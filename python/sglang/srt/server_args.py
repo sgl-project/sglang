@@ -5033,9 +5033,15 @@ class ServerArgs:
             return
 
         mode = strategy_to_legacy_mode[self.cp_strategy]
-        use_dsa_legacy_aliases = self.enable_dsa_prefill_context_parallel or getattr(
-            self, "attention_backend", None
-        ) in ("dsa", "dsv4")
+        attention_backend = getattr(self, "attention_backend", None)
+        if attention_backend is None:
+            from sglang.srt.arg_groups.overrides import resolved_view
+
+            attention_backend = getattr(resolved_view(self), "attention_backend", None)
+        use_dsa_legacy_aliases = (
+            self.enable_dsa_prefill_context_parallel
+            or attention_backend in ("dsa", "dsv4")
+        )
         if use_dsa_legacy_aliases:
             self.enable_dsa_prefill_context_parallel = True
             self.enable_prefill_context_parallel = False

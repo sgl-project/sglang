@@ -556,36 +556,29 @@ class TestCPInterleaveStrategy(CustomTestCase):
         self.assertEqual(metadata.total_seq_lens, 8)
 
     def test_interleave_can_apply_uses_legacy_round_robin_predicate(self):
+        # seq_len (8) >= cp_size (4) under a context-parallel extend → applicable.
         active_batch = SimpleNamespace(
             input_ids=torch.arange(8),
             forward_mode=_ExtendMode(),
             extend_seq_lens_cpu=[8],
         )
-
-        with (
-            patch(
-                "sglang.srt.environ.envs.SGLANG_ENABLE_CP_V2.get",
-                return_value=True,
-            ),
-            patch(
-                "sglang.srt.layers.cp.interleave.can_dsa_prefill_cp_round_robin_split",
-                return_value=True,
-            ) as can_round_robin_split,
+        with patch(
+            "sglang.srt.environ.envs.SGLANG_ENABLE_CP_V2.get",
+            return_value=True,
         ):
             self.assertTrue(is_cp_v2_active(active_batch))
-            can_round_robin_split.assert_called_once_with(active_batch)
 
-        with (
-            patch(
-                "sglang.srt.environ.envs.SGLANG_ENABLE_CP_V2.get",
-                return_value=True,
-            ),
-            patch(
-                "sglang.srt.layers.cp.interleave.can_dsa_prefill_cp_round_robin_split",
-                return_value=False,
-            ),
+        # seq_len (2) < cp_size (4) → not applicable.
+        small_batch = SimpleNamespace(
+            input_ids=torch.arange(2),
+            forward_mode=_ExtendMode(),
+            extend_seq_lens_cpu=[2],
+        )
+        with patch(
+            "sglang.srt.environ.envs.SGLANG_ENABLE_CP_V2.get",
+            return_value=True,
         ):
-            self.assertFalse(is_cp_v2_active(active_batch))
+            self.assertFalse(is_cp_v2_active(small_batch))
 
     def test_interleave_shards_hidden_states_and_position_ids(self):
         cp_size = 4
@@ -616,15 +609,9 @@ class TestCPInterleaveStrategy(CustomTestCase):
                 local_x = strategy.shard_hidden_states(x, fb)
                 local_positions = strategy.shard_position_ids(positions, fb)
 
-                with (
-                    patch(
-                        "sglang.srt.environ.envs.SGLANG_ENABLE_CP_V2.get",
-                        return_value=True,
-                    ),
-                    patch(
-                        "sglang.srt.layers.cp.interleave.can_dsa_prefill_cp_round_robin_split",
-                        return_value=True,
-                    ),
+                with patch(
+                    "sglang.srt.environ.envs.SGLANG_ENABLE_CP_V2.get",
+                    return_value=True,
                 ):
                     helper_x, helper_positions = cp_split_before_forward(
                         x,
