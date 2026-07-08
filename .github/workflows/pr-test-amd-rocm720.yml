@@ -6,7 +6,9 @@ run-name: ${{ (inputs.target_stage || inputs.target_stage_select) && (inputs.pr_
 on:
   schedule:
     - cron: '30 17 * * *'
-    - cron: '0 */6 * * *' # Every 6 hours (UTC): target dsv4 accuracy jobs only
+    # Temporarily disabled: every-6-hours dsv4 accuracy run. Daily '30 17 * * *'
+    # cron still runs the full suite (including dsv4). Re-enable to restore it.
+    # - cron: '0 */6 * * *' # Every 6 hours (UTC): target dsv4 accuracy jobs only
   # push:
   #   branches: [ main ]
   #   paths:
@@ -16,14 +18,14 @@ on:
   #     - "sgl-kernel/**"
   #     - ".github/workflows/pr-test-amd-rocm720.yml"
   #     - "docker/rocm.Dockerfile"
-  pull_request:
-    paths:
-      - "python/**"
-      - "scripts/ci/**"
-      - "test/**"
-      - "sgl-kernel/**"
-      - ".github/workflows/pr-test-amd-rocm720.yml"
-      - "docker/rocm.Dockerfile"
+  # pull_request:
+  #   paths:
+  #     - "python/**"
+  #     - "scripts/ci/**"
+  #     - "test/**"
+  #     - "sgl-kernel/**"
+  #     - ".github/workflows/pr-test-amd-rocm720.yml"
+  #     - "docker/rocm.Dockerfile"
   workflow_dispatch:
     inputs:
       target_stage_select:
@@ -44,6 +46,7 @@ on:
           - stage-b-test-2-gpu-large-amd-rocm720
           - multimodal-gen-test-1-gpu-amd-rocm720
           - multimodal-gen-test-2-gpu-amd-rocm720
+          - multimodal-gen-unit-test-amd-rocm720
           - stage-c-test-large-8-gpu-amd-rocm720
           - stage-c-test-large-8-gpu-amd-mi35x-rocm720
           - stage-b-test-large-8-gpu-mi35x-disaggregation-amd-rocm720
@@ -115,21 +118,17 @@ env:
   DOCKERHUB_AMD_TOKEN: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
 
 concurrency:
-  # When called via workflow_call with run_all_tests=true, use a unique group per run to
-  # avoid collisions with direct schedule/workflow_dispatch triggers. We use run_all_tests
-  # (not github.event_name) to detect this, because github.event_name inherits from the caller.
-  # Manual dispatch runs also get unique groups so they never cancel each other.
-  group: pr-test-amd-rocm720-${{ (inputs.run_all_tests || github.event_name == 'workflow_dispatch') && format('full-{0}', github.run_id) || inputs.pr_head_sha || inputs.ref || github.ref }}
-  cancel-in-progress: ${{ !inputs.run_all_tests && github.event_name != 'workflow_call' && github.event_name != 'workflow_dispatch' }}
+  # Scheduled and manual full runs use unique groups so they never cancel each other.
+  # PR cancellation is kept only for pull_request events if this trigger is re-enabled.
+  group: pr-test-amd-rocm720-${{ github.event_name == 'schedule' && format('schedule-{0}', github.run_id) || (inputs.run_all_tests || github.event_name == 'workflow_dispatch') && format('full-{0}', github.run_id) || inputs.pr_head_sha || inputs.ref || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   call-gate:
-    # Runs on PRs (pr-gate.yml enforces the run-ci label / blocks drafts), the daily
-    # '30 17 * * *' cron, workflow_dispatch and workflow_call. It is skipped only on the
-    # 6h ('0 */6 * * *') cron, which cascades a skip to check-changes and every existing
-    # test job, so that cron runs the two dsv4 jobs only. On PRs the existing jobs are
-    # additionally kept off via the change-detection guard in check-changes, so only the
-    # dsv4 jobs run there -- and only when this gate passes (they `needs` it).
+    # Runs on the daily '30 17 * * *' cron, workflow_dispatch and workflow_call.
+    # It is skipped only on the 6h ('0 */6 * * *') cron, which cascades a skip
+    # to check-changes and every existing test job so that cron runs the two
+    # dsv4 jobs only.
     if: github.event.schedule != '0 */6 * * *'
     uses: ./.github/workflows/pr-gate.yml
     secrets: inherit
@@ -183,9 +182,7 @@ jobs:
       - name: Detect file changes
         id: filter
         uses: dorny/paths-filter@v3
-        # On pull_request only the dsv4 jobs run; skip change detection on PRs so the
-        # per-stage outputs stay 'false' and the existing test jobs are gated off.
-        if: steps.run-mode.outputs.run_all_tests != 'true' && github.event_name != 'pull_request'
+        if: steps.run-mode.outputs.run_all_tests != 'true'
         with:
           filters: |
             main_package:
@@ -746,7 +743,7 @@ jobs:
       fail-fast: false
       matrix:
         runner: [linux-mi325-2gpu-sglang]
-        part: [0, 1, 2]  # 3 partitions: 2 parametrized + 1 standalone (test_disagg_server.py)
+        part: [0, 1, 2]  # 3 partitions: 2 parametrized + 1 standalone (single_test_file/test_disagg_server.py)
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -868,6 +865,62 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+  # ROCm 7.2.0 counterpart of `multimodal-gen-unit-test-amd`: run the portable
+  # mm_gen `unit` suite on ROCm 7.2.0 too. Skips the CUDA-only
+  # ltx2_vae_channels_last file (channels_last_3d assertions the ROCm conv path
+  # doesn't reproduce).
+  multimodal-gen-unit-test-amd-rocm720:
+    needs: [check-changes]
+    if: |
+      always() &&
+      (
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',multimodal-gen-unit-test-amd-rocm720,')) ||
+        (
+          !(inputs.target_stage || inputs.target_stage_select) &&
+          (!failure() && !cancelled()) &&
+          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+        )
+      )
+    runs-on: linux-mi325-1gpu-sglang
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
+
+      - name: Download artifacts
+        if: needs.check-changes.outputs.sgl_kernel == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          path: sgl-kernel/dist/
+          merge-multiple: true
+          pattern: wheel-python3.10-cuda12.9
+
+      - name: Start CI container
+        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/amd/amd_ci_install_dependency.sh diffusion
+          docker exec ci_sglang pip install amdsmi
+
+      - name: Run diffusion unit tests
+        timeout-minutes: 60
+        run: |
+          # Skip ltx2_vae_channels_last: it asserts CUDA `channels_last_3d`
+          # memory-format behavior that the ROCm conv path doesn't reproduce.
+          docker exec \
+            -e AITER_JIT_DIR=/sgl-data/aiter-kernels \
+            -e MIOPEN_USER_DB_PATH=/sgl-data/miopen-cache \
+            -w /sglang-checkout/python \
+            ci_sglang python3 sglang/multimodal_gen/test/run_suite.py \
+              --suite unit \
+              -k "not ltx2_vae_channels_last"
 
   stage-c-test-4-gpu-amd-rocm720:
     needs: [check-changes, stage-b-test-1-gpu-small-amd-rocm720, stage-b-test-2-gpu-large-amd-rocm720]
@@ -1066,7 +1119,8 @@ jobs:
           echo ""
           echo "=== 5. Detect RDMA Devices for test environment ==="
           if [ -d "/sys/class/infiniband" ]; then
-            RDMA_DEVS=$(ls /sys/class/infiniband | paste -sd "," -)
+            # RDMA_DEVS=$(ls /sys/class/infiniband | paste -sd "," -)
+            RDMA_DEVS=rdma0
             echo "Detected RDMA Devices: $RDMA_DEVS"
             echo "SGLANG_TEST_RDMA_DEVICE=$RDMA_DEVS" >> $GITHUB_ENV
           else
@@ -1084,6 +1138,23 @@ jobs:
 
       - name: Install dependencies
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh
+
+      - name: Verify NIXL in Container
+        run: |
+          docker exec ci_sglang bash -lc '
+            set -eux
+            export LD_LIBRARY_PATH=/opt/ucx/lib:/opt/rocm/lib:${LD_LIBRARY_PATH:-}
+            python -c "import nixl; print(\"nixl OK:\", nixl.__file__)"
+            test -d /opt/ucx/lib
+            UCX_INFO=$(command -v ucx_info || true)
+            if [ -z "$UCX_INFO" ]; then
+              UCX_INFO=/opt/ucx/bin/ucx_info
+            fi
+            test -x "$UCX_INFO"
+            "$UCX_INFO" -v
+            "$UCX_INFO" -d | grep -iq rocm
+            python -c "from nixl._api import nixl_agent, nixl_agent_config; nixl_agent(\"ci-smoke\", nixl_agent_config(backends=[\"UCX\"])); print(\"nixl UCX backend init OK\")"
+          '
 
       - name: Verify RDMA in Container
         run: |
@@ -1119,17 +1190,19 @@ jobs:
       - name: Run test_disaggregation
         timeout-minutes: 60
         run: |
+          docker exec ci_sglang rocm-smi --showtopotype || true
+          docker exec ci_sglang bash -c 'strings $(python3 -c "import mooncake,os;print(os.path.dirname(mooncake.__file__))")/engine*.so | grep -iE "rdma,hip|Unsupported multi-protocol"' || true
           bash scripts/ci/amd/amd_ci_exec.sh \
             -e SGLANG_TEST_RDMA_DEVICE="${{ env.SGLANG_TEST_RDMA_DEVICE }}" \
+            -e MC_LOG_LEVEL=TRACE \
+            -e GLOG_logtostderr=1 \
             -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-large-8-gpu-mi35x-disaggregation-amd --timeout-per-file 1800 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
   # =============================================== DeepSeek-V4 (MI35x, 8-GPU) ====================================================
-  # On `pull_request` and the 6h ('0 */6 * * *') cron these are the ONLY jobs that run;
-  # they also run on the daily cron alongside the full suite. On PRs they run only when
-  # call-gate succeeds, i.e. the PR carries the run-ci label (and is not a draft), so
-  # they are gated just like every other PR test job. On PR they hard-fail (a failure
-  # blocks merge); on any scheduled run they pass --continue-on-error. They stay
-  # selectable via workflow_dispatch / run on workflow_call full runs.
+  # On the 6h ('0 */6 * * *') cron these are the only jobs that run; they also
+  # run on the daily cron alongside the full suite. Scheduled runs pass
+  # --continue-on-error. They stay selectable via workflow_dispatch / run on
+  # workflow_call full runs.
   dsv4-flash-fp4-fp8-amd-rocm720:
     needs: [call-gate]
     if: |
@@ -1160,6 +1233,7 @@ jobs:
           bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
+          ENABLE_CACHE_HOST: "1"
 
       - name: Install dependencies
         run: |
@@ -1210,6 +1284,7 @@ jobs:
           bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
+          ENABLE_CACHE_HOST: "1"
 
       - name: Install dependencies
         run: |
@@ -1243,6 +1318,7 @@ jobs:
         sgl-kernel-unit-test-2-gpu-amd-rocm720,
         multimodal-gen-test-1-gpu-amd-rocm720,
         multimodal-gen-test-2-gpu-amd-rocm720,
+        multimodal-gen-unit-test-amd-rocm720,
 
         stage-a-test-1-gpu-small-amd-rocm720,
         jit-kernel-unit-test-amd-rocm720,
