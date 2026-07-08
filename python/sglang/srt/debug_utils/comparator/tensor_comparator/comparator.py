@@ -165,8 +165,10 @@ def compute_diff(
     raw_abs_diff = (x_target - x_baseline).abs()
     max_diff_coord = argmax_coord(raw_abs_diff)
 
-    rel_diff = calc_rel_diff(x_target, x_baseline).item()
     max_abs_diff = raw_abs_diff.max().item()
+    rel_diff = (
+        0.0 if max_abs_diff == 0.0 else calc_rel_diff(x_target, x_baseline).item()
+    )
     mean_abs_diff = raw_abs_diff.mean().item()
 
     include_quantiles: bool = raw_abs_diff.numel() < QUANTILE_NUMEL_THRESHOLD

@@ -458,6 +458,20 @@ class TestComputeDiffPredicate:
             is False
         )
 
+    def test_bitwise_predicate(self) -> None:
+        """'rel <= 0' passes only for bitwise-identical tensors."""
+        ident = torch.randn(5, 5)
+        assert (
+            compute_diff(
+                x_baseline=ident, x_target=ident.clone(), predicate="rel <= 0"
+            ).passed
+            is True
+        )
+        x, y = self._near_zero_pair()
+        assert (
+            compute_diff(x_baseline=x, x_target=y, predicate="rel <= 0").passed is False
+        )
+
     def test_predicate_recorded_for_empty_tensor(self) -> None:
         """Empty tensors short-circuit to passed=True and still record the predicate."""
         empty = torch.empty(0)
