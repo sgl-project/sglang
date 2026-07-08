@@ -644,38 +644,72 @@ class DDTreeWorker(DFlashWorkerV2):
         if tp_size == 1:
             return local_logits.float()
 
-        # TP > 1: compute global log-probs (the exp→log path is needed
-        # here because vocab shard sizes may differ across ranks).
+        # TP > 1: materialize logits in global vocab-id order.  The DDTree
+        # builder uses torch.topk(...).indices as token ids, so concatenating
+        # rank-local/padded shard columns would produce shard positions rather
+        # than global vocab ids.
         num_org = int(shard.num_org_elements)
         num_org_padded = int(shard.num_org_elements_padded)
         num_added = int(shard.num_added_elements)
+        org_vocab_start = int(shard.org_vocab_start_index)
+        added_vocab_start = int(shard.added_vocab_start_index)
 
-        local_max = local_logits.amax(dim=-1, keepdim=True)
-        gathered_max = torch.empty(
+        local_dim = local_logits.shape[-1]
+        local_global_ids = torch.full(
+            (local_dim,), -1, dtype=torch.int64, device=local_logits.device
+        )
+        if num_org > 0:
+            local_global_ids[:num_org] = org_vocab_start + torch.arange(
+                num_org, dtype=torch.int64, device=local_logits.device
+            )
+        if num_added > 0:
+            local_global_ids[num_org_padded : num_org_padded + num_added] = (
+                added_vocab_start
+                + torch.arange(num_added, dtype=torch.int64, device=local_logits.device)
+            )
+
+        logits_for_gather = local_logits.float()
+        valid_local = local_global_ids >= 0
+        if not bool(valid_local.all()):
+            logits_for_gather = logits_for_gather.masked_fill(
+                ~valid_local.unsqueeze(0), float("-inf")
+            )
+
+        gathered_logits = torch.empty(
             tp_size,
             hidden_states.shape[0],
-            dtype=local_max.dtype,
-            device=local_max.device,
+            local_dim,
+            dtype=logits_for_gather.dtype,
+            device=logits_for_gather.device,
         )
-        tp_group.all_gather_into_tensor(gathered_max, local_max.squeeze(-1))
-        global_max = gathered_max.amax(dim=0, keepdim=True)
-
-        local_exp = torch.exp(local_logits - global_max.unsqueeze(-1))
-
-        gathered_exp = torch.empty(
+        gathered_ids = torch.empty(
             tp_size,
-            hidden_states.shape[0],
-            local_logits.shape[-1],
-            dtype=local_exp.dtype,
-            device=local_exp.device,
+            local_dim,
+            dtype=local_global_ids.dtype,
+            device=local_global_ids.device,
         )
-        tp_group.all_gather_into_tensor(gathered_exp, local_exp)
-        global_sum = gathered_exp.sum(dim=(0, 2), keepdim=True)
+        tp_group.all_gather_into_tensor(gathered_logits, logits_for_gather.contiguous())
+        tp_group.all_gather_into_tensor(gathered_ids, local_global_ids.contiguous())
 
-        global_logits = torch.cat([gathered_exp[i] for i in range(tp_size)], dim=-1)
-        global_log_probs = torch.log(global_logits / global_sum.unsqueeze(-1))
+        vocab_size = int(self.target_worker.model_runner.model_config.vocab_size)
+        global_logits = torch.full(
+            (hidden_states.shape[0], vocab_size),
+            float("-inf"),
+            dtype=torch.float32,
+            device=hidden_states.device,
+        )
+        flat_ids = gathered_ids.reshape(1, -1).expand(hidden_states.shape[0], -1)
+        flat_logits = gathered_logits.permute(1, 0, 2).reshape(hidden_states.shape[0], -1)
+        valid = (flat_ids >= 0) & (flat_ids < vocab_size)
+        global_logits.scatter_reduce_(
+            dim=1,
+            index=flat_ids.clamp(0, vocab_size - 1),
+            src=flat_logits.masked_fill(~valid, float("-inf")),
+            reduce="amax",
+            include_self=True,
+        )
 
-        return global_log_probs.float()
+        return global_logits
 
     # -----------------------------------------------------------------
     # DDTree uses DFlashWorkerV2 for common draft-worker setup, but keeps a

@@ -68,7 +68,7 @@ from sglang.srt.models.utils import (
     create_fused_set_kv_buffer_arg,
     enable_fused_set_kv_buffer,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_flags, get_parallel
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     LazyValue,
@@ -390,7 +390,7 @@ class GptOssAttention(nn.Module):
 
         # Choose dtype of sinks based on attention backend: trtllm_mha requires float32,
         # others can use bfloat16
-        attn_backend = get_global_server_args().attention_backend
+        attn_backend = get_flags().attn.backend
         sinks_dtype = torch.float32 if attn_backend == "trtllm_mha" else torch.bfloat16
         self.sinks = nn.Parameter(
             torch.empty(self.num_heads, dtype=sinks_dtype), requires_grad=False
@@ -745,7 +745,7 @@ class GptOssForCausalLM(nn.Module):
             config.hidden_size,
             # quant_config=quant_config,
             prefix=add_prefix("lm_head", prefix),
-            use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+            use_attn_tp_group=get_flags().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
         self.capture_aux_hidden_states = False
@@ -933,6 +933,9 @@ class GptOssForCausalLM(nn.Module):
         moe_ep_size = get_parallel().moe_ep_size
 
         intermediate_size = self.config.intermediate_size
+        original_intermediate_size = getattr(
+            self.config, "original_intermediate_size", intermediate_size
+        )
         assert (
             intermediate_size % mxfp4_block == 0
         ), f"{intermediate_size=} must be divisible by {mxfp4_block=}"
@@ -951,7 +954,7 @@ class GptOssForCausalLM(nn.Module):
 
         moe_tp_rank_start = moe_tp_rank * per_rank_intermediate_size
         moe_tp_rank_end = min(
-            (moe_tp_rank + 1) * per_rank_intermediate_size, intermediate_size
+            (moe_tp_rank + 1) * per_rank_intermediate_size, original_intermediate_size
         )
 
         moe_ep_rank_start = moe_ep_rank * moe_num_local_experts
@@ -968,7 +971,7 @@ class GptOssForCausalLM(nn.Module):
                 # flat weight from (E, 2 * N, block_size, entry_per_block)
                 # to (E, 2 * N, -1), shouldn't trigger copy for contiguous
                 weight = weight.view(
-                    moe_num_global_experts, 2 * intermediate_size, -1
+                    moe_num_global_experts, 2 * original_intermediate_size, -1
                 ).contiguous()
 
                 narrow_weight = weight[
@@ -994,7 +997,7 @@ class GptOssForCausalLM(nn.Module):
                 # same flatten here, but since 2 mx4 value are packed in 1
                 # uint8, divide by 2
                 weight = weight.view(
-                    moe_num_global_experts, -1, intermediate_size // 2
+                    moe_num_global_experts, -1, original_intermediate_size // 2
                 ).contiguous()
                 narrow_weight = weight[
                     moe_ep_rank_start:moe_ep_rank_end,

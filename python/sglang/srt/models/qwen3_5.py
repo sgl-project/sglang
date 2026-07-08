@@ -91,8 +91,7 @@ from sglang.srt.models.utils import (
     fused_qk_gemma_rmsnorm,
     fused_qk_gemma_rmsnorm_with_gate,
 )
-from sglang.srt.runtime_context import get_parallel
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_flags, get_parallel
 
 # Utils
 from sglang.srt.utils import (
@@ -134,7 +133,7 @@ cached_get_processor = lru_cache(get_processor)
 def _disable_shared_experts_fusion() -> bool:
     # Resolved lazily: the global server args is not set at module import time
     # (e.g. when this module is imported by unit tests).
-    return get_global_server_args().disable_shared_experts_fusion
+    return get_flags().disable_shared_experts_fusion
 
 
 if _is_cuda:
@@ -144,6 +143,10 @@ if _is_cuda:
 
 if _is_cpu:
     fused_sigmoid_mul = torch.ops.sgl_kernel.fused_sigmoid_mul_cpu
+    fused_qk_gemma_rmsnorm = torch.ops.sgl_kernel.fused_qk_gemma_rmsnorm_cpu
+    fused_qk_gemma_rmsnorm_with_gate = (
+        torch.ops.sgl_kernel.fused_qk_gemma_rmsnorm_with_gate_cpu
+    )
 
 if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import (
@@ -877,7 +880,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 k_by_head = k.reshape(-1, self.head_dim)
                 k_by_head = self.k_norm(k_by_head)
             current_stream.wait_stream(self.alt_stream)
-        elif _is_hip or _is_xpu:
+        elif _is_hip or _is_xpu or _is_cpu:
             q_by_head, k_by_head = fused_qk_gemma_rmsnorm(
                 q,
                 k,
@@ -1002,7 +1005,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 positions=positions,
                 hidden_states=hidden_states,
             )
-        elif (_is_hip or _is_xpu) and self.attn_output_gate:
+        elif (_is_hip or _is_xpu or _is_cpu) and self.attn_output_gate:
             q, k, v, gate = self.forward_prepare_fused_gate(
                 positions=positions,
                 hidden_states=hidden_states,
@@ -1172,13 +1175,17 @@ class Qwen3_5ForCausalLM(nn.Module):
     def _maybe_autodisable_shared_experts_fusion(self, config, quant_config):
         # Auto-disable fusion when the checkpoint can't fuse (e.g. MXFP4 Qwen3.5)
         # so the model still gets the #25885 multi-streaming path. ROCm-only.
-        server_args = get_global_server_args()
         if (
             config.model_type == "qwen3_5_moe_text"
-            and not server_args.disable_shared_experts_fusion
+            and not get_flags().disable_shared_experts_fusion
             and not can_fuse_shared_expert(config, quant_config)
         ):
-            server_args.disable_shared_experts_fusion = True
+            from sglang.srt.arg_groups.overrides import declare_load_time_override
+
+            declare_load_time_override(
+                "Qwen3_5ForCausalLM._maybe_autodisable_shared_experts_fusion",
+                {"disable_shared_experts_fusion": True},
+            )
             logger.info(
                 "Qwen3.5: shared-expert fusion not supported for this checkpoint; "
                 "auto-disabling (multi-streaming #25885 still applies)."

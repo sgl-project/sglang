@@ -416,7 +416,7 @@ class SWAChunkCapPoolConfigurator(HybridSWAPoolConfigurator):
         sa = mr.server_args
         page_size = mr.page_size
         window = mr.sliding_window_size
-        draft_tokens = sa.speculative_num_draft_tokens or 1
+        draft_tokens = sa.max_speculative_num_draft_tokens or 1
         eviction_interval = max(1, envs.SGLANG_SWA_EVICTION_INTERVAL.get())
 
         """

@@ -130,6 +130,9 @@ class EagerRunner(BaseRunner):
                 if is_encoder_decoder
                 else 0
             ),
+            encoder_lens_dtype=(
+                torch.int64 if torch.device(mr.device).type == "cpu" else torch.int32
+            ),
             dp_size=sa.dp_size,
         )
         # Eager has no capture step, so warm up here (run-once via mr._kernel_warmed_up).
@@ -147,9 +150,12 @@ class EagerRunner(BaseRunner):
         mr = self.model_runner
         num_tokens_per_bs = 1
         if mr.spec_algorithm.is_speculative():
+            num_draft_tokens = mr.server_args.speculative_num_draft_tokens
+            if mr.spec_algorithm.is_ddtree() and not mr.is_draft_worker:
+                num_draft_tokens = mr.server_args.max_speculative_num_draft_tokens
             num_tokens_per_bs = (
                 mr.spec_algorithm.get_num_tokens_per_bs_for_target_verify(
-                    mr.server_args.speculative_num_draft_tokens, mr.is_draft_worker
+                    num_draft_tokens, mr.is_draft_worker
                 )
             )
         return (
@@ -275,7 +281,7 @@ class EagerRunner(BaseRunner):
                         forward_batch.req_pool_indices,
                         get_req_to_token_pool().req_to_token,
                         forward_batch.seq_lens_sum,
-                        get_token_to_kv_pool().get_key_buffer(0).shape,
+                        get_token_to_kv_pool().get_kv_buffer_shape()[0],
                         model_runner.kv_cache_dtype,
                         model_runner.device,
                         create_chunked_prefix_cache_kv_indices,

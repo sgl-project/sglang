@@ -1,3 +1,5 @@
+from typing import Optional
+
 import torch
 import triton
 import triton.language as tl
@@ -33,6 +35,7 @@ def _fused_dsa_decode_metadata_kernel(
     dsa_index_topk: tl.constexpr,
     real_page_size: tl.constexpr,
     HAS_REAL_PAGE_TABLE: tl.constexpr,
+    HAS_PAGE_TABLE_1: tl.constexpr,
     BLOCK_BS: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
@@ -73,11 +76,14 @@ def _fused_dsa_decode_metadata_kernel(
         mask=mask,
         other=0,
     ).to(tl.int32)
-    tl.store(
-        page_table_1 + row * page_table_stride_0 + offs_n * page_table_stride_1,
-        vals,
-        mask=mask,
-    )
+    # Write the wide page_size=1 table only when the caller provides it; the
+    # fused decode CUDA graph drops it and consumes real_page_table alone.
+    if HAS_PAGE_TABLE_1:
+        tl.store(
+            page_table_1 + row * page_table_stride_0 + offs_n * page_table_stride_1,
+            vals,
+            mask=mask,
+        )
 
     if HAS_REAL_PAGE_TABLE:
         real_mask = mask & ((offs_n % real_page_size) == 0)
@@ -97,7 +103,7 @@ def fused_dsa_decode_metadata(
     req_to_token: torch.Tensor,
     cache_seqlens: torch.Tensor,
     cu_seqlens_k: torch.Tensor,
-    page_table_1: torch.Tensor,
+    page_table_1: Optional[torch.Tensor],
     dsa_cache_seqlens: torch.Tensor,
     dsa_cu_seqlens_k: torch.Tensor,
     real_page_table: torch.Tensor,
@@ -106,12 +112,20 @@ def fused_dsa_decode_metadata(
     dsa_index_topk: int,
     real_page_size: int,
 ) -> None:
+    """Fill decode-graph DSA metadata (seqlens + page tables) from req_to_token.
+
+    ``page_table_1`` (the wide page_size=1 table) is optional: pass ``None`` to
+    skip materializing it and write only the compact ``real_page_table``
+    (page_size=``real_page_size``). This is used by the fused decode CUDA graph,
+    where the wide table is never read (attention uses topk_indices, the indexer
+    uses real_page_table); ``real_page_size`` must be >1 in that case. When a
+    tensor is passed, behavior is unchanged (both tables are written).
+    """
     assert seq_lens.is_cuda
     assert req_pool_indices.is_cuda
     assert req_to_token.is_cuda
     assert cache_seqlens.is_cuda
     assert cu_seqlens_k.is_cuda
-    assert page_table_1.is_cuda
     assert dsa_cache_seqlens.is_cuda
     assert dsa_cu_seqlens_k.is_cuda
 
@@ -125,7 +139,18 @@ def fused_dsa_decode_metadata(
         assert real_page_table is not None
         assert real_page_table.is_cuda
     else:
+        # page_size==1: real IS page_table_1, so page_table_1 must be present.
+        assert page_table_1 is not None
         real_page_table = page_table_1
+
+    # page_table_1 (the wide page_size=1 table) may be dropped for the fused
+    # decode CUDA graph; the kernel then writes only real_page_table.
+    has_page_table_1 = page_table_1 is not None
+    if not has_page_table_1:
+        assert has_real_page_table
+        page_table_1 = real_page_table  # dummy pointer for stride args
+    else:
+        assert page_table_1.is_cuda
 
     block_bs = triton.next_power_of_2(bs)
     block_n = 128
@@ -155,6 +180,7 @@ def fused_dsa_decode_metadata(
         dsa_index_topk,
         real_page_size,
         has_real_page_table,
+        has_page_table_1,
         BLOCK_BS=block_bs,
         BLOCK_N=block_n,
     )
@@ -196,6 +222,7 @@ def _fused_dsa_target_verify_metadata_kernel(
     next_n: tl.constexpr,
     HAS_REAL_PAGE_TABLE: tl.constexpr,
     HAS_PAGED_MQA_CTX_LENS: tl.constexpr,
+    HAS_PAGE_TABLE_1: tl.constexpr,
     BLOCK_BS: tl.constexpr,
     BLOCK_EXPANDED: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -261,11 +288,14 @@ def _fused_dsa_target_verify_metadata_kernel(
         mask=mask,
         other=0,
     ).to(tl.int32)
-    tl.store(
-        page_table_1 + out_row * page_table_stride_0 + offs_n * page_table_stride_1,
-        vals,
-        mask=mask,
-    )
+    # Write the wide page_size=1 table only when the caller provides it (see
+    # fused_dsa_decode_metadata for the optional-page_table_1 contract).
+    if HAS_PAGE_TABLE_1:
+        tl.store(
+            page_table_1 + out_row * page_table_stride_0 + offs_n * page_table_stride_1,
+            vals,
+            mask=mask,
+        )
 
     if HAS_REAL_PAGE_TABLE:
         real_mask = mask & ((offs_n % real_page_size) == 0)
@@ -285,7 +315,7 @@ def fused_dsa_target_verify_metadata(
     req_to_token: torch.Tensor,
     cache_seqlens: torch.Tensor,
     cu_seqlens_k: torch.Tensor,
-    page_table_1: torch.Tensor,
+    page_table_1: Optional[torch.Tensor],
     seqlens_expanded: torch.Tensor,
     dsa_cache_seqlens: torch.Tensor,
     dsa_cu_seqlens_k: torch.Tensor,
@@ -302,7 +332,6 @@ def fused_dsa_target_verify_metadata(
     assert req_to_token.is_cuda
     assert cache_seqlens.is_cuda
     assert cu_seqlens_k.is_cuda
-    assert page_table_1.is_cuda
     assert seqlens_expanded.is_cuda
     assert dsa_cache_seqlens.is_cuda
     assert dsa_cu_seqlens_k.is_cuda
@@ -318,7 +347,17 @@ def fused_dsa_target_verify_metadata(
         assert real_page_table is not None
         assert real_page_table.is_cuda
     else:
+        assert page_table_1 is not None
         real_page_table = page_table_1
+
+    # page_table_1 (the wide page_size=1 table) may be dropped for the fused
+    # decode CUDA graph; the kernel then writes only real_page_table.
+    has_page_table_1 = page_table_1 is not None
+    if not has_page_table_1:
+        assert has_real_page_table
+        page_table_1 = real_page_table  # dummy pointer for stride args
+    else:
+        assert page_table_1.is_cuda
 
     has_paged_mqa_ctx_lens = paged_mqa_ctx_lens_2d is not None
     if has_paged_mqa_ctx_lens:
@@ -366,6 +405,7 @@ def fused_dsa_target_verify_metadata(
         next_n,
         has_real_page_table,
         has_paged_mqa_ctx_lens,
+        has_page_table_1,
         BLOCK_BS=block_bs,
         BLOCK_EXPANDED=block_expanded,
         BLOCK_N=block_n,
@@ -407,6 +447,7 @@ def _fused_dsa_draft_extend_metadata_kernel(
     dsa_index_topk: tl.constexpr,
     real_page_size: tl.constexpr,
     HAS_REAL_PAGE_TABLE: tl.constexpr,
+    HAS_PAGE_TABLE_1: tl.constexpr,
     STATIC_EXTEND_LEN: tl.constexpr,
     BLOCK_BS: tl.constexpr,
     BLOCK_EXPANDED: tl.constexpr,
@@ -502,13 +543,16 @@ def _fused_dsa_draft_extend_metadata_kernel(
         mask=col_mask & has_rows,
         other=0,
     ).to(tl.int32)
-    tl.store(
-        page_table_1
-        + out_rows[:, None] * page_table_stride_0
-        + offs_n[None, :] * page_table_stride_1,
-        vals[None, :],
-        mask=mask,
-    )
+    # Write the wide page_size=1 table only when the caller provides it (see
+    # fused_dsa_decode_metadata for the optional-page_table_1 contract).
+    if HAS_PAGE_TABLE_1:
+        tl.store(
+            page_table_1
+            + out_rows[:, None] * page_table_stride_0
+            + offs_n[None, :] * page_table_stride_1,
+            vals[None, :],
+            mask=mask,
+        )
 
     if HAS_REAL_PAGE_TABLE:
         real_mask = mask & ((offs_n[None, :] % real_page_size) == 0)
@@ -529,7 +573,7 @@ def fused_dsa_draft_extend_metadata(
     req_to_token: torch.Tensor,
     cache_seqlens: torch.Tensor,
     cu_seqlens_k: torch.Tensor,
-    page_table_1: torch.Tensor,
+    page_table_1: Optional[torch.Tensor],
     seqlens_expanded: torch.Tensor,
     dsa_cache_seqlens: torch.Tensor,
     dsa_cu_seqlens_k: torch.Tensor,
@@ -549,7 +593,6 @@ def fused_dsa_draft_extend_metadata(
     assert req_to_token.is_cuda
     assert cache_seqlens.is_cuda
     assert cu_seqlens_k.is_cuda
-    assert page_table_1.is_cuda
     assert seqlens_expanded.is_cuda
     assert dsa_cache_seqlens.is_cuda
     assert dsa_cu_seqlens_k.is_cuda
@@ -577,7 +620,17 @@ def fused_dsa_draft_extend_metadata(
         assert real_page_table is not None
         assert real_page_table.is_cuda
     else:
+        assert page_table_1 is not None
         real_page_table = page_table_1
+
+    # page_table_1 (the wide page_size=1 table) may be dropped for the fused
+    # decode CUDA graph; the kernel then writes only real_page_table.
+    has_page_table_1 = page_table_1 is not None
+    if not has_page_table_1:
+        assert has_real_page_table
+        page_table_1 = real_page_table  # dummy pointer for stride args
+    else:
+        assert page_table_1.is_cuda
 
     block_bs = triton.next_power_of_2(bs)
     block_expanded = triton.next_power_of_2(max_total_len)
@@ -613,6 +666,7 @@ def fused_dsa_draft_extend_metadata(
         dsa_index_topk,
         real_page_size,
         has_real_page_table,
+        has_page_table_1,
         static_extend_len,
         BLOCK_BS=block_bs,
         BLOCK_EXPANDED=block_expanded,

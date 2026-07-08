@@ -16,6 +16,7 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     MODELOPT_WAN22_NVFP4_B200_ENV_VARS,
     MODELOPT_WAN22_NVFP4_MODEL,
     T2V_PROMPT,
+    COSMOS3_NANO_CI_sampling_params,
     DiffusionSamplingParams,
     DiffusionServerArgs,
     DiffusionTestCase,
@@ -165,21 +166,7 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
             model_path=DEFAULT_COSMOS3_NANO_MODEL_NAME_FOR_TEST,
             modality="image",
         ),
-        DiffusionSamplingParams(
-            prompt="A red cube on a white table, product photo.",
-            output_size="832x480",
-            output_format="png",
-            extras={
-                "num_inference_steps": 35,
-                "seed": 0,
-                "max_sequence_length": 128,
-                "flow_shift": 10.0,
-                "extra_args": {
-                    "guardrails": False,
-                    "use_resolution_template": False,
-                },
-            },
-        ),
+        COSMOS3_NANO_CI_sampling_params,
         run_perf_check=False,
         run_consistency_check=True,
         run_component_accuracy_check=False,
@@ -912,14 +899,15 @@ def _make_5090_flux_layerwise_cpu_offload_case() -> DiffusionTestCase:
     )
 
 
-ONE_GPU_5090_CASES = _select_5090_canary_cases(
-    (
-        "zimage_image_t2i",
-        "flux_2_klein_base_image_t2i",
-        "wan2_1_t2v_1.3b",
-        "turbo_wan2_1_t2v_1.3b",
-    )
+ONE_GPU_5090_CANARY_CASE_IDS = (
+    "zimage_image_t2i",
+    "flux_2_klein_base_image_t2i",
+    "wan2_1_t2v_1.3b",
 )
+if not current_platform.is_hip():
+    ONE_GPU_5090_CANARY_CASE_IDS += ("turbo_wan2_1_t2v_1.3b",)
+
+ONE_GPU_5090_CASES = _select_5090_canary_cases(ONE_GPU_5090_CANARY_CASE_IDS)
 ONE_GPU_5090_CASES.append(_make_5090_flux_layerwise_cpu_offload_case())
 
 

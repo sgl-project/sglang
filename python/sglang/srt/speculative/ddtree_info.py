@@ -132,6 +132,7 @@ class DDTreeVerifyInput(SpecInput):
     retrive_next_token: Optional[torch.Tensor] = None
     retrive_next_sibling: Optional[torch.Tensor] = None
     spec_steps: int = 0
+    draft_probs: Optional[torch.Tensor] = None
 
     # Populated by verify(): flat batch-global accepted node slots (EAGLE
     # contract, used by the worker to compute mamba accepted_steps).
@@ -150,6 +151,28 @@ class DDTreeVerifyInput(SpecInput):
 
     def get_spec_adjust_token_coefficient(self):
         return (self.draft_token_num, self.draft_token_num)
+
+    @property
+    def retrieve_index(self) -> Optional[torch.Tensor]:
+        return self.retrive_index
+
+    @property
+    def retrieve_next_token(self) -> Optional[torch.Tensor]:
+        return self.retrive_next_token
+
+    @property
+    def retrieve_next_sibling(self) -> Optional[torch.Tensor]:
+        return self.retrive_next_sibling
+
+    @property
+    def max_tree_depth(self) -> int:
+        return (
+            self.spec_steps if self.spec_steps > 0 else self.draft_token_num - 1
+        ) + 1
+
+    @property
+    def tree_topk(self) -> int:
+        return self.topk
 
     def prepare_for_verify(self, batch, page_size):
         bs = len(batch.reqs)
@@ -261,33 +284,22 @@ class DDTreeVerifyInput(SpecInput):
         bs = len(batch.reqs)
         device = batch.device
 
-        target_predict = torch.argmax(logits_output.next_token_logits, dim=-1)
-        target_predict = target_predict.reshape(bs, self.draft_token_num)
-
-        # --- 1) Acceptance via EAGLE's tree-verify kernel ---
-        # Works for both spine (degenerate chain) and full tree. Requires the
-        # LCRS topology (retrive_index/next_token/next_sibling) populated by the
-        # worker. Greedy only (sampling on trees is not supported here).
-        from sglang.srt.speculative.eagle_utils import verify_tree_greedy_func
-
         D = self.draft_token_num
-        S = self.spec_steps if self.spec_steps > 0 else (D - 1)
-        candidates = self.draft_token.view(bs, D)
+        target_predict_for_probe = torch.argmax(
+            logits_output.next_token_logits, dim=-1
+        ).reshape(bs, D)
 
-        predict = torch.full((bs * D + 1,), -1, dtype=torch.int32, device=device)
-        accept_index = torch.full((bs, S + 1), -1, dtype=torch.int32, device=device)
-        accept_length = torch.empty((bs,), dtype=torch.int32, device=device)
+        # --- 1) Acceptance via EAGLE's tree sampling/verify path ---
+        # Greedy requests still use verify_tree_greedy. Non-greedy requests use
+        # target-only tree sampling, so temperature/top-p/top-k/penalty/logit-bias
+        # semantics are honored by the target verifier instead of silently falling
+        # back to greedy decoding.
+        from sglang.srt.speculative.eagle_utils import eagle_sample
 
-        verify_tree_greedy_func(
-            predicts=predict,
-            accept_index=accept_index,
-            accept_token_num=accept_length,
-            candidates=candidates,
-            retrieve_index=self.retrive_index,
-            retrieve_next_token=self.retrive_next_token,
-            retrieve_next_sibling=self.retrive_next_sibling,
-            target_predict=target_predict,
-            topk=self.topk,
+        predict, accept_length, accept_index = eagle_sample(
+            verify_input=self,
+            batch=batch,
+            logits_output=logits_output,
         )
 
         # accept_index[b]: [root_global_slot, accepted child global slots..., -1...]
@@ -431,7 +443,7 @@ class DDTreeVerifyInput(SpecInput):
                 buck = getattr(cls, "_rank_buck", None)
                 if buck is None:
                     buck = [[0] * (len(THR) + 1) for _ in range(D)]
-                tp_cpu = target_predict.tolist()
+                tp_cpu = target_predict_for_probe.tolist()
                 # draft_pos_topk: [bs, block_size-1, 32]; position p (depth p+1)
                 dpt = _draft_pos_topk.tolist()
                 npos = _draft_pos_topk.shape[1]

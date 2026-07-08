@@ -2350,7 +2350,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         ):
             # Total number of proposed draft tokens per request.
             num_proposed_drafts = recv_obj.spec_verify_ct[i] * (
-                self.server_args.speculative_num_draft_tokens - 1
+                self.server_args.max_speculative_num_draft_tokens - 1
             )
             num_correct_drafts = recv_obj.spec_num_correct_drafts[i]
 
@@ -3153,5 +3153,10 @@ class SignalHandler:
 def stamp_http_worker_ipc(obj: Any, ipc_name: str) -> None:
     if isinstance(obj, BaseReq):
         obj.http_worker_ipc = ipc_name
+    elif isinstance(
+        obj, (BatchTokenizedGenerateReqInput, BatchTokenizedEmbeddingReqInput)
+    ):
+        for req in obj:
+            req.http_worker_ipc = ipc_name
     elif isinstance(obj, BaseBatchReq):
         obj.http_worker_ipcs = [ipc_name] * len(obj.rids)

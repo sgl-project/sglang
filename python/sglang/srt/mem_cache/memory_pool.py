@@ -44,13 +44,13 @@ from sglang.srt.layers.attention.dsa.quant_k_cache import (
     quantize_k_cache_separate,
 )
 from sglang.srt.layers.attention.dsa.utils import aiter_can_use_preshuffle_paged_mqa
-from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
-from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.utils.dcp_utils import (
+from sglang.srt.layers.dcp import (
     dcp_enabled,
     get_attention_dcp_rank,
     get_attention_dcp_world_size,
 )
+from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
+from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.allocator.mamba import MambaSlotAllocator
 from sglang.srt.mem_cache.layout.page_major import (
     build_page_major_mamba_views,
@@ -1267,6 +1267,10 @@ class KVCache(abc.ABC):
                 f"KV Cache is allocated. dtype: {self.dtype}, #tokens: {num_tokens}, KV size: {kv_size_GB:.2f} GB"
             )
             self.mem_usage = kv_size_GB
+
+    def get_kv_buffer_shape(self) -> Tuple[torch.Size, torch.Size]:
+        k_buffer, v_buffer = self.get_kv_buffer(self.start_layer)
+        return k_buffer.shape, v_buffer.shape
 
     @abc.abstractmethod
     def get_key_buffer(self, layer_id: int) -> torch.Tensor:

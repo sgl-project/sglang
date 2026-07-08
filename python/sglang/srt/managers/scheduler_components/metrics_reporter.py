@@ -732,9 +732,9 @@ class SchedulerMetricsReporter:
         else:
             spec_accept_length = self.spec_num_accept_tokens / self.spec_num_forward_ct
             num_correct_drafts = self.spec_num_accept_tokens - self.spec_num_forward_ct
-            if self.scheduler.server_args.speculative_num_draft_tokens:
+            if self.scheduler.server_args.max_speculative_num_draft_tokens:
                 draft_per_round = (
-                    self.scheduler.server_args.speculative_num_draft_tokens - 1
+                    self.scheduler.server_args.max_speculative_num_draft_tokens - 1
                 )
             else:
                 draft_per_round = self.scheduler.server_args.speculative_num_steps or 0
