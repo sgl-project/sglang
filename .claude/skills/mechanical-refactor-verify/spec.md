@@ -4,7 +4,7 @@
 
 - This file is the **single source of truth** for *what the skill certifies* and *how*. The
   code (`scripts/mechanical_refactor_reproduce_utils.py`, `scripts/mechanical_refactor_generate_proof.py`),
-  the tests, and the prose guides (`SKILL.md`, `guide.md`) all implement or describe this
+  the tests, and the prose guides (`SKILL.md`, `guide-prep-move.md`, `guide-prove.md`) all implement or describe this
   file. If any of them disagrees with it, **this file wins** and the others are the bug.
 - There is **one property** being certified — *a commit is a pure relocation* — and **one
   proof** of it: **reproduce** (§3). Regenerate the move from the base commit with faithful
@@ -89,7 +89,7 @@ list is what they refuse to do, so it surfaces as a residual diff.
   it is a semantic rewrite, not a relocation (it goes in its own commit, §2.4).
 
 A rename, fresh scaffolding, a statement reorder, or an extraction whose body changed is
-reshape work, so it does not ride in the move (§2.4, `guide.md`). The
+reshape work, so it does not ride in the move (§2.4, `guide-prep-move.md`). The
 reproduce proof reports such a commit as a residual diff (or, when no definition relocated at
 all, as unsupported) — it does not certify it.
 
@@ -119,7 +119,7 @@ files or moves a body. The whitelist in §2.1 is exactly what a relocation *forc
 
 A semantic refactor is never a prepare, an extraction's bulk goes in the move, and a
 new-module extraction needs no staging prep — the rationale, the case recipes, and the
-anti-patterns live in `guide.md` Part 1; this spec only fixes the phase boundaries above.
+anti-patterns live in `guide-prep-move.md`; this spec only fixes the phase boundaries above.
 
 ## 3. The proof — reproduce: regenerate the move and byte-diff
 
@@ -219,7 +219,7 @@ so a byte match after the formatter certifies the commit is *exactly* that reloc
   literal — surfaces as a residual; it is a one-line **postpare** (or prepare), not a move.
 
 For an inference gap (not a property violation), write the `Repro` by hand (see
-`guide.md`); the same byte-diff then certifies it.
+`guide-prove.md`); the same byte-diff then certifies it.
 
 ## 4. What a verdict asserts (and does not)
 

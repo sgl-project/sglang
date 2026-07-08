@@ -13,7 +13,7 @@ The ``Repro`` builder composes faithful relocation primitives (``move_symbol``,
 that a formatter re-wrapped can be reproduced and certified. Each primitive does only a relocation-faithful
 edit (it never changes logic), so a byte match after the formatter certifies the commit is
 exactly that relocation. The primitives are deliberately small -- AST-located, spliced as
-original source text; see guide.md.
+original source text; see guide-prove.md.
 
 This module is self-contained and needs only git and the standard library.
 """
@@ -1041,7 +1041,7 @@ class Repro:
         faithful **only** when the body is moved unchanged -- a de-self (``self.x`` -> a
         parameter), a control-flow restructure, or a bookkeeping consolidation must be done as a
         separate semantic commit first, since those are not relocations (see
-        guide.md)."""
+        guide-prep-move.md)."""
 
         def reindent(text: str, shift: int) -> str:
             if shift == 0:
