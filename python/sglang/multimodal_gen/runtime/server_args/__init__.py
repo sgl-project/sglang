@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
-from sglang.multimodal_gen.runtime.server_args import base as _base
-from sglang.multimodal_gen.runtime.server_args.base import (
+from sglang.multimodal_gen.runtime.server_args import server_args as _server_args
+from sglang.multimodal_gen.runtime.server_args.server_args import (
     LORA_MERGE_MODES,
     Backend,
     PortArgs,
@@ -26,5 +26,5 @@ __all__ = [
 
 def __getattr__(name: str):
     if name == "_global_server_args":
-        return _base._global_server_args
+        return _server_args._global_server_args
     raise AttributeError(name)
