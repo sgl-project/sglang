@@ -11,6 +11,7 @@ from sglang.srt.models.deepseek_common.attention_forward_methods.forward_methods
     AttnForwardMethod,
 )
 from sglang.srt.models.deepseek_common.utils import _is_hip
+from sglang.srt.runtime_context import get_server_args
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import use_intel_amx_backend
 
@@ -88,7 +89,7 @@ def _handle_attention_backend(attn, forward_batch, backend_name):
     # through get_mla_kv_buffer and attends the current chunk from
     # activations.
     if (
-        get_global_server_args().enable_kv_cache_sharding
+        get_server_args().enable_kv_cache_sharding
         and forward_batch.forward_mode.is_extend_without_speculative()
     ):
         if mla_use_prefill_cp(forward_batch):
@@ -134,7 +135,7 @@ def handle_attention_fa3(attn, forward_batch):
     # — absorbed MLA cannot read a sharded pool)
     if (
         get_global_server_args().enable_deterministic_inference
-        and not get_global_server_args().enable_kv_cache_sharding
+        and not get_server_args().enable_kv_cache_sharding
     ):
         return _dispatch_mla_subtype(attn, forward_batch)
     else:

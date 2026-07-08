@@ -445,9 +445,11 @@ def _alloc_page_size(batch: ScheduleBatch) -> int:
     # server_args.page_size * group size, so it can be > 1 even when
     # tree_cache.page_size is 1; branch on the real allocator's page_size
     # there. Elsewhere the two are equal.
+    from sglang.srt.runtime_context import get_server_args
+
     if (_is_hip or _is_cuda) and get_global_server_args().dcp_size > 1:
         return batch.tree_cache.token_to_kv_pool_allocator.page_size
-    if get_global_server_args().enable_kv_cache_sharding:
+    if get_server_args().enable_kv_cache_sharding:
         return batch.tree_cache.token_to_kv_pool_allocator.page_size
     return batch.tree_cache.page_size
 

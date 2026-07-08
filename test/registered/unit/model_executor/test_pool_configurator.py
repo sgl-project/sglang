@@ -116,6 +116,9 @@ def _make_model_runner(
     sa.disaggregation_mode = disaggregation_mode
     sa.max_running_requests = max_running_requests
     sa.disaggregation_decode_extra_slots = disaggregation_decode_extra_slots
+    # Read by the logical-page KV sharding scratch charge
+    # (compute_page_shard_scratch_bytes) during configurator construction.
+    sa.enable_kv_cache_sharding = False
     mr.server_args = sa
 
     spec = MagicMock()
