@@ -480,10 +480,6 @@ class MoEGate(nn.Module):
             )
 
         if get_global_server_args().enable_deterministic_inference:
-            if _is_cuda:
-                from sglang.jit_kernel.dsv4 import linear_bf16_fp32
-
-                return linear_bf16_fp32(hidden_states, self.weight)
             return F.linear(hidden_states, self.weight, None)
 
         if (
