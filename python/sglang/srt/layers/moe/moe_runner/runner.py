@@ -76,6 +76,11 @@ class MoeRunner:
             )
         elif runner_backend.is_cutlass():
             self.runner_core = None  # CUTLASS uses the direct cutlass_moe_fp4 path
+        elif runner_backend.is_hpc_ops():
+            self.runner_core = None  # HPC-Ops only supports the fused path
+            # Import here (not at module top, to avoid a circular import) to
+            # register the hpc_ops fused func before the pool lookup.
+            from sglang.srt.layers.moe.moe_runner import hpc_ops  # noqa: F401
         else:
             raise NotImplementedError(f"Unsupported runner backend: {runner_backend}")
 

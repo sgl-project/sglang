@@ -99,9 +99,13 @@ class MoeRunnerBackend(Enum):
     MARLIN = "marlin"
     HUMMING = "humming"
     AITER = "aiter"
+    HPC_OPS = "hpc_ops"
 
     def is_auto(self):
         return self == MoeRunnerBackend.AUTO
+
+    def is_hpc_ops(self):
+        return self == MoeRunnerBackend.HPC_OPS
 
     def is_deep_gemm(self):
         return self == MoeRunnerBackend.DEEP_GEMM
