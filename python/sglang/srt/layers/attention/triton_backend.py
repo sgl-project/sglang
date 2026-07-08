@@ -191,14 +191,11 @@ class TritonAttnBackend(AttentionBackend):
             self.v_head_dim = model_runner.token_to_kv_pool.get_v_head_dim()
             self.swa_v_head_dim = None
         else:
-            # Use model_config.v_head_dim to avoid PP start_layer issues.
-            # In pipeline parallelism, start_layer may be > 0, so accessing
-            # get_value_buffer(0) would cause IndexError on PP stages 1+.
-            self.v_head_dim = (
-                model_runner.model_config.v_head_dim
-                if model_runner.model_config.v_head_dim is not None
-                else model_runner.model_config.head_dim
-            )
+            # Use start_layer instead of 0 to handle pipeline parallelism.
+            # In PP, start_layer may be > 0, so layer 0 isn't in this stage's buffer.
+            self.v_head_dim = model_runner.token_to_kv_pool.get_value_buffer(
+                model_runner.token_to_kv_pool.start_layer
+            ).shape[-1]
             self.swa_v_head_dim = None
         self.max_context_len = model_runner.model_config.context_len
         self.device = model_runner.device
