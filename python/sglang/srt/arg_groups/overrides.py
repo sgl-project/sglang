@@ -14,8 +14,9 @@
 """Declarative model-override registry.
 
 Model-identity adjustments to the server configuration are DECLARED here and
-resolved into the flags tier through the ``apply_model_overrides`` gate —
-model code never mutates ``ServerArgs``, which stays the pristine user input.
+materialized onto ``server_args`` at the end of ``__post_init__`` (gate
+order, last writer wins) — model code never mutates ``ServerArgs`` fields
+imperatively.
 
 Two declaration forms, keyed on ``hf_config.architectures[0]``:
 
@@ -30,11 +31,10 @@ from __future__ import annotations
 
 import dataclasses
 import logging
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from sglang.srt.arg_groups.arg_utils import resolvable_fields
 from sglang.srt.model_executor.cuda_graph_config import Backend
-from sglang.srt.runtime_context import resolve_flag_leaf
 from sglang.srt.utils.common import (
     cpu_has_amx_support,
     get_device_capability,
@@ -197,8 +197,18 @@ def run_post_process_pass(server_args: Any, fn: Callable[..., dict]) -> None:
         stash.append(entry)
         validate_declarations(server_args, [entry])
         if getattr(server_args, "_declarations_materialized", False):
-            for field, value in declared.items():
-                setattr(server_args, field, value)
+            _apply_fields(server_args, declared)
+
+
+def _apply_fields(server_args: Any, fields: Dict[str, Any]) -> None:
+    """Write fields on behalf of the pipeline (bypasses the strict bare-
+    assignment guard that protects post-resolution mutation)."""
+    object.__setattr__(server_args, "_in_override", True)
+    try:
+        for field, value in fields.items():
+            setattr(server_args, field, value)
+    finally:
+        object.__setattr__(server_args, "_in_override", False)
 
 
 def materialize_declarations(server_args: Any) -> None:
@@ -249,17 +259,19 @@ def mamba_extra_buffer_of(cfg: Any) -> bool:
 
 def declare_load_time_override(source: str, declared: Dict[str, Any]) -> None:
     """Declare a load-time resolved field (model-file config overrides,
-    weight-resolved dtypes): apply it onto the published ``server_args`` —
-    resolution has already materialized, so post-init declarations write
-    through — and record it into the flags tier through the runtime gate."""
+    weight-resolved dtypes) on the published ``server_args``: resolution has
+    already materialized, so the declaration writes through, joining the
+    declaration stash for provenance and republish consistency."""
     from sglang.srt.runtime_context import get_context
 
-    ctx = get_context()
-    entry = (source, dict(declared))
-    validate_declarations(ctx.server_args, [entry])
-    for field, value in declared.items():
-        setattr(ctx.server_args, field, value)
-    ctx.record_runtime_overrides([entry])
+    server_args = get_context().server_args
+    validate_declarations(server_args, [(source, dict(declared))])
+    override = getattr(server_args, "override", None)
+    if override is not None:
+        override(source, **declared)
+    else:
+        # Config-shaped fixtures without the mutation entry point.
+        _apply_fields(server_args, declared)
 
 
 def collect_model_override_declarations(
@@ -2030,84 +2042,6 @@ def _dllm_page_size(view: Any) -> dict:
     return {}
 
 
-@dataclasses.dataclass(frozen=True)
-class OverrideRecord:
-    """Provenance of one resolved write: ``base`` is the value before this
-    declaration applied (the pristine value for the first writer)."""
-
-    source: str
-    field: str
-    base: Any
-    resolved: Any
-
-
-def apply_model_overrides(
-    flags: Any,
-    server_args: Any,
-    declarations: Sequence[Tuple[str, Dict[str, Any]]],
-    *,
-    terminal: Sequence[Tuple[str, Dict[str, Any]]] = (),
-    whitelist: Optional[Iterable[str]] = None,
-    leaf_map: Optional[Dict[str, str]] = None,
-) -> List[OverrideRecord]:
-    """Resolve model-override declarations into the flags tier.
-
-    - **Transactional**: every declaration (``terminal`` included) is
-      validated against the whitelist and the flag-leaf layout BEFORE any
-      write; on error nothing is applied.
-    - **Ordering**: ``declarations`` apply in order (last writer wins), then
-      ``terminal`` (the enforce-disable pass) applies after everything.
-    - **Materialization**: every whitelisted field becomes a flag leaf —
-      declared fields carry the resolved value, undeclared ones the pristine
-      ``server_args`` value — so readers only ever read flags, never a
-      "flag or fallback to config" combination.
-    - ``server_args`` is read-only here: resolution output lives on flags.
-
-    Returns the provenance log, one record per declared write.
-    """
-    if whitelist is None:
-        whitelist = resolvable_fields(type(server_args))
-    whitelist = frozenset(whitelist)
-
-    ordered = list(declarations) + list(terminal)
-
-    problems = [
-        f"{source}: {sorted(set(decl) - whitelist)} not model-overridable"
-        for source, decl in ordered
-        if set(decl) - whitelist
-    ]
-    if problems:
-        raise ValueError(
-            "model override validation failed (nothing was applied): "
-            + "; ".join(problems)
-        )
-    for field in sorted(whitelist):
-        owner, leaf = resolve_flag_leaf(flags, field, leaf_map=leaf_map)
-        if leaf not in type(owner).__dataclass_fields__:
-            raise ValueError(
-                f"flag leaf for '{field}' is not declared on "
-                f"{type(owner).__name__} (declare the dataclass field and map "
-                "it in FLAG_LEAF_MAP); nothing was applied"
-            )
-        if getattr(owner, "_frozen", False):
-            raise RuntimeError(
-                f"cannot resolve '{field}': {type(owner).__name__} is frozen; "
-                "nothing was applied"
-            )
-
-    resolved = {field: getattr(server_args, field) for field in whitelist}
-    records: List[OverrideRecord] = []
-    for source, decl in ordered:
-        for field, value in decl.items():
-            records.append(OverrideRecord(source, field, resolved[field], value))
-            resolved[field] = value
-
-    for field, value in resolved.items():
-        owner, leaf = resolve_flag_leaf(flags, field, leaf_map=leaf_map)
-        setattr(owner, leaf, value)
-    return records
-
-
 def validate_declarations(
     server_args: Any,
     declarations: Sequence[Tuple[str, Dict[str, Any]]],
@@ -2131,44 +2065,16 @@ def validate_declarations(
             )
 
 
-def refresh_declared_fields(server_args: Any, fields: Iterable[str]) -> None:
-    """Helper for legacy code that overwrites a resolved field AFTER
-    materialization (e.g. ``ModelRunner.model_specific_adjustment`` forcing
-    ``attention_backend`` for HRM-Text). Redeclares the live value so the
-    publish parity holds and the flags tier materializes the adjusted end
-    state.
-    """
-    _missing = object()
-    declarations = server_args._resolved_overrides
-    for field in fields:
-        effective = _missing
-        for _source, decl in declarations:
-            if field in decl:
-                effective = decl[field]
-        if effective is _missing:
-            continue
-        live = getattr(server_args, field)
-        if effective != live:
-            declarations.append((f"runtime_adjustment[{field}]", {field: live}))
-
-
-def assert_flag_parity(
-    flags: Any,
-    server_args: Any,
-    fields: Iterable[str],
-    *,
-    leaf_map: Optional[Dict[str, str]] = None,
-) -> None:
-    """Drift guard: each declared field's flag leaf must equal the
-    (materialized) ``server_args`` value."""
-    mismatches = []
-    for field in fields:
-        owner, leaf = resolve_flag_leaf(flags, field, leaf_map=leaf_map)
-        flag_value = getattr(owner, leaf)
-        args_value = getattr(server_args, field)
-        if flag_value != args_value:
-            mismatches.append(
-                f"{field}: flags={flag_value!r} server_args={args_value!r}"
-            )
-    if mismatches:
-        raise AssertionError("flag/server_args parity broken: " + "; ".join(mismatches))
+def _hrm_text_attention_force(view: Any) -> dict:
+    """HRM-Text's bidirectional prefix attention only works on the Triton
+    backend. Invoked as the last attention declaration of the resolution
+    (mirroring the legacy runner-side force, which ran after the whole
+    pipeline)."""
+    if view.attention_backend not in (None, "triton"):
+        logger.warning(
+            f"Overriding --attention-backend "
+            f"{view.attention_backend!r} -> 'triton': only the "
+            "Triton backend supports HRM-Text's bidirectional prefix "
+            "attention."
+        )
+    return {"attention_backend": "triton"}
