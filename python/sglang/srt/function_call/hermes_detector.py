@@ -46,14 +46,26 @@ class HermesDetector(BaseFormatDetector):
         calls = []
         try:
             for match in self.tool_call_regex.findall(text):
-                raw = match[0] or match[1]
-                if not raw:
-                    continue
-                parsed = json.loads(raw.strip())
-                if isinstance(parsed, list):
-                    calls.extend(self.parse_base_json(parsed, tools))
+                if match[0]:
+                    parsed = json.loads(match[0].strip())
+                elif match[1]:
+                    # Unterminated <tool_call> block: generation was cut
+                    # off (e.g. by max_tokens) before the closing tag.
+                    # The streaming path drops the markup from content,
+                    # so drop the unparsable block here too instead of
+                    # leaking raw markup into content; finish_reason
+                    # ("length") tells the client the call is incomplete.
+                    try:
+                        parsed = json.loads(match[1].strip())
+                    except json.JSONDecodeError:
+                        logger.warning(
+                            "Dropping truncated tool call block: %s",
+                            match[1][:80],
+                        )
+                        continue
                 else:
-                    calls.extend(self.parse_base_json(parsed, tools))
+                    continue
+                calls.extend(self.parse_base_json(parsed, tools))
             return StreamingParseResult(normal_text=normal_text, calls=calls)
         except Exception as e:
             logger.error(f"Error in detect_and_parse: {e}")
