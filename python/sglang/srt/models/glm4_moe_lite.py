@@ -74,7 +74,7 @@ from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
 )
 from sglang.srt.models.deepseek_common.utils import _is_cuda, _use_aiter
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
-from sglang.srt.runtime_context import get_flags, get_parallel
+from sglang.srt.runtime_context import get_parallel, get_server_args, get_stream
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     BumpAllocator,
@@ -188,7 +188,9 @@ class Glm4MoeLiteSparseMoeBlock(nn.Module):
         self.routed_scaling_factor = config.routed_scaling_factor
         self.n_shared_experts = config.n_shared_experts
         self.num_fused_shared_experts = (
-            0 if get_flags().disable_shared_experts_fusion else config.n_shared_experts
+            0
+            if get_server_args().disable_shared_experts_fusion
+            else config.n_shared_experts
         )
         self.config = config
         self.layer_id = layer_id
@@ -787,7 +789,7 @@ class Glm4MoeLiteModel(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
 
-        self.alt_stream = torch.cuda.Stream() if _is_cuda else None
+        self.alt_stream = get_stream("alt") if _is_cuda else None
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
             lambda idx, prefix: Glm4MoeLiteDecoderLayer(
@@ -918,7 +920,7 @@ class Glm4MoeLiteForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("lm_head", prefix),
-            use_attn_tp_group=get_flags().enable_dp_lm_head,
+            use_attn_tp_group=get_server_args().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
 
@@ -939,7 +941,7 @@ class Glm4MoeLiteForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         self, architecture: str = "Glm4MoeLiteForCausalLM"
     ):
         self.num_fused_shared_experts = 0
-        if get_flags().disable_shared_experts_fusion:
+        if get_server_args().disable_shared_experts_fusion:
             return
 
         disable_reason = None
