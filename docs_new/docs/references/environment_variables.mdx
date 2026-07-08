@@ -802,19 +802,6 @@ SGLang supports various environment variables that can be used to configure its 
 </tbody>
 </table>
 
-Example:
-
-```bash
-# Quantize loaded weights and runtime activations to FP8 E4M3 for Humming,
-# then use grouped Humming MoE GEMM. EnvJSON values can also be file paths.
-export SGLANG_HUMMING_ONLINE_QUANT_CONFIG='{"dtype":"float8e4m3","scale_dtype":"float8e8m0","group_size":128,"scale_type":"group","force_requant":true}'
-export SGLANG_HUMMING_INPUT_QUANT_CONFIG='{"dtype":"float8e4m3","group_size":128}'
-export SGLANG_HUMMING_MOE_GEMM_TYPE=grouped
-export SGLANG_HUMMING_USE_F16_ACCUM=true
-
-python3 -m sglang.launch_server --model-path <model-path> --dtype float16 --quantization humming --moe-runner-backend humming
-```
-
 
 ## Distributed Computing
 
