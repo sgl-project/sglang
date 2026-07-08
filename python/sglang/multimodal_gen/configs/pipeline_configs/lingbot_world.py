@@ -427,3 +427,11 @@ class LingBotWorldCausalDMDConfig(LingBotWorldI2VConfig):
             mask[:, :, initial_latent_frames:] = 0
 
         return torch.cat([mask, latent_condition], dim=1)
+
+
+@dataclass
+class LingBotWorldV2CausalDMDConfig(LingBotWorldCausalDMDConfig):
+    flow_shift: float | None = 5.0
+    dmd_denoising_steps: list[int] | None = field(
+        default_factory=lambda: [1000, 750, 500, 250]
+    )
