@@ -86,9 +86,7 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
 
 
 class TestDisaggregationAbortedRequestQueueing(unittest.TestCase):
-    """An already-aborted request (e.g. input too long) must not enter the
-    bootstrap/prealloc queue for KV transfer, otherwise the decode side decodes
-    from uninitialized KV and emits garbage output (issue #30233)."""
+    """Already-aborted PD requests must skip KV transfer queues."""
 
     def _new_scheduler(self, disaggregation_mode: DisaggregationMode) -> Scheduler:
         scheduler = Scheduler.__new__(Scheduler)
@@ -104,8 +102,6 @@ class TestDisaggregationAbortedRequestQueueing(unittest.TestCase):
         return scheduler
 
     def _new_aborted_req(self):
-        # Mirror set_finish_with_abort: reason is recorded in to_finish, and the
-        # long input is truncated to a single token.
         req = MagicMock()
         req.priority = None
         req.rid = "req"
@@ -141,7 +137,6 @@ class TestDisaggregationAbortedRequestQueueing(unittest.TestCase):
         req.disagg_kv_sender.abort.assert_called_once()
         scheduler._prefetch_kvcache.assert_not_called()
         scheduler.output_streamer.stream_output.assert_called_once_with([req], False)
-        # to_finish is promoted to finished_reason so stream_output emits it.
         self.assertIsInstance(req.finished_reason, FINISH_ABORT)
         self.assertIsNone(req.to_finish)
 

@@ -2333,13 +2333,6 @@ class Scheduler(
             self.waiting_queue.append(req)
             req.time_stats.set_wait_queue_entry_time()
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
-            # A request may already be aborted before reaching the queue, e.g.
-            # its input is longer than max_req_input_len so validation truncates
-            # origin_input_ids to a single token (see set_finish_with_abort).
-            # Such a request has no real KV to transfer, so it must not enter the
-            # bootstrap queue. Still create and abort the sender first: the
-            # decode worker may already have preallocated KV and be waiting for
-            # this request's transfer status.
             if self._abort_disagg_request_before_queue(req):
                 return
             self._prefetch_kvcache(req)
@@ -2348,10 +2341,6 @@ class Scheduler(
             )
             req.time_stats.set_prefill_bootstrap_queue_entry_time()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
-            # Same as the PREFILL branch: an already-aborted request (e.g. input
-            # too long) must not be preallocated KV and left waiting for a
-            # transfer that will never complete. Retracted requests are running
-            # requests re-queued for decode and are never aborted here.
             if not is_retracted and self._abort_disagg_request_before_queue(req):
                 return
             self.disagg_decode_prealloc_queue.add(req, is_retracted=is_retracted)
@@ -2363,14 +2352,7 @@ class Scheduler(
             raise ValueError(f"Invalid {self.disaggregation_mode=}")
 
     def _abort_disagg_request_before_queue(self, req: Req) -> bool:
-        """Stream out an already-aborted disaggregation request instead of
-        enqueueing it for KV transfer. Returns True if the request was aborted.
-
-        A request can be aborted before reaching the queue (e.g. input longer
-        than max_req_input_len truncates origin_input_ids to one token via
-        set_finish_with_abort). Enqueueing it would transfer/preallocate KV for
-        a request that has no valid KV, producing garbage decode output.
-        """
+        """Handle already-aborted PD requests before KV transfer queues."""
         if not is_aborted(req):
             return False
         has_valid_bootstrap = (
@@ -2398,8 +2380,6 @@ class Scheduler(
                     abort_reason.status_code,
                 )
             req.disagg_kv_sender.abort()
-        # set_finish_with_abort records the reason in to_finish; promote it so
-        # stream_output sees req.finished() and emits the abort to the client.
         if req.finished_reason is None and req.to_finish is not None:
             req.finished_reason = req.to_finish
             req.to_finish = None
