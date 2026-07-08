@@ -33,7 +33,10 @@ class Cosmos3Pipeline(ComposedPipelineBase):
     stages from ``batch.data_type`` and ``batch.preprocessed_image``.
     """
 
-    pipeline_name = "Cosmos3OmniDiffusersPipeline"
+    # Canonical name, matching ``_class_name`` in newer checkpoints'
+    # ``model_index.json``. Older checkpoints declare ``Cosmos3OmniDiffusersPipeline``
+    # (see the back-compat alias below).
+    pipeline_name = "Cosmos3OmniPipeline"
     is_video_pipeline = True
 
     _required_config_modules = [
@@ -94,4 +97,16 @@ class Cosmos3Pipeline(ComposedPipelineBase):
         )
 
 
-EntryClass = Cosmos3Pipeline
+class Cosmos3OmniDiffusersPipeline(Cosmos3Pipeline):
+    """Backward-compat alias for checkpoints whose ``model_index.json`` still
+    declares the legacy ``_class_name`` ``Cosmos3OmniDiffusersPipeline``.
+
+    Diffusers renamed the pipeline to ``Cosmos3OmniPipeline``; registering both
+    names lets old and new checkpoints resolve to the same native pipeline.
+    Remove once no in-use checkpoint carries the legacy name.
+    """
+
+    pipeline_name = "Cosmos3OmniDiffusersPipeline"
+
+
+EntryClass = [Cosmos3Pipeline, Cosmos3OmniDiffusersPipeline]

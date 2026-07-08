@@ -1014,7 +1014,9 @@ def _register_configs():
             "nvidia/Cosmos3-Super-Text2Image",
             "nvidia/Cosmos3-Super-Image2Video",
         ],
-        model_detectors=[lambda hf_id: "cosmos3omnidiffuserspipeline" in hf_id.lower()],
+        # Match both the new ``Cosmos3OmniPipeline`` and the legacy
+        # ``Cosmos3OmniDiffusersPipeline`` ``_class_name`` (diffusers rename).
+        model_detectors=[lambda hf_id: "cosmos3omni" in hf_id.lower()],
     )
 
     # SANA
