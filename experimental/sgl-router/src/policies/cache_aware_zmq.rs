@@ -486,6 +486,8 @@ mod tests {
                 id: "tiny".into(),
                 tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
                 tokenizer_shards: 1,
+                tokenizer_backend: Default::default(),
+                tokenizer_l1_cache_mb: 0,
                 policy: crate::config::PolicyKind::RoundRobin,
                 circuit_breaker: None,
                 cache_aware: None,

@@ -177,6 +177,8 @@ mod tests {
                 id: id.into(),
                 tokenizer_path: "/tmp/x".into(),
                 tokenizer_shards: 1,
+                tokenizer_backend: Default::default(),
+                tokenizer_l1_cache_mb: 0,
                 policy,
                 circuit_breaker: None,
                 cache_aware: None,

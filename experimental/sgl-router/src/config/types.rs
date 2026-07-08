@@ -252,7 +252,22 @@ pub struct ModelConfig {
     /// them (see [`crate::tokenizer::TokenizerRegistry::get`]) spreads that
     /// contention across N locks with no change to tokenization output.
     /// Always >= 1 (enforced in [`crate::config::cli::Cli::into_config`]).
+    /// The FIELD keeps the configured value; when the L1 cache is genuinely
+    /// active, `TokenizerShards::load` treats the effective count as 1 —
+    /// per-shard caches would split the hit rate and multiply the byte
+    /// budget.
     pub tokenizer_shards: usize,
+    /// Encode backend: HuggingFace `tokenizers` (default) or the `fastokens`
+    /// hybrid (fast encode, HF decode, HF fallback on load failure). See
+    /// [`crate::tokenizer::adapter::TokenizerBackend`].
+    pub tokenizer_backend: crate::tokenizer::adapter::TokenizerBackend,
+    /// MiB budget for the L1 special-token-boundary prefix tokenization
+    /// cache ([`dynamo_tokenizers::CachedTokenizer`]). 0 (default) disables
+    /// it. When enabled, a multi-turn chat request re-encodes only the
+    /// suffix past the deepest cached special-token boundary instead of the
+    /// whole conversation — the O(prompt) ingress-encode that dominates the
+    /// router-over-engine TTFT gap on long-context traffic.
+    pub tokenizer_l1_cache_mb: usize,
     pub policy: PolicyKind,
     pub circuit_breaker: Option<CircuitBreakerConfig>,
     /// Tuning for the cache-aware ZMQ policy. Ignored unless

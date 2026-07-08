@@ -36,6 +36,8 @@ async fn failover_when_one_worker_dies() {
             id: "tiny".into(),
             tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
             tokenizer_shards: 1,
+            tokenizer_backend: Default::default(),
+            tokenizer_l1_cache_mb: 0,
             policy: PolicyKind::RoundRobin,
             circuit_breaker: Some(CircuitBreakerConfig {
                 threshold: std::num::NonZeroU32::new(1).unwrap(), // open after first failure
@@ -170,6 +172,8 @@ async fn retry_recovers_request_that_lands_on_a_dead_worker() {
             id: "tiny".into(),
             tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
             tokenizer_shards: 1,
+            tokenizer_backend: Default::default(),
+            tokenizer_l1_cache_mb: 0,
             policy: PolicyKind::RoundRobin,
             // Unreachably-high threshold: the dead worker's failures never trip
             // the breaker, so it is never filtered out of `healthy_workers_for`
@@ -309,6 +313,8 @@ async fn retry_skipped_when_the_only_other_worker_is_full() {
             id: "tiny".into(),
             tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
             tokenizer_shards: 1,
+            tokenizer_backend: Default::default(),
+            tokenizer_l1_cache_mb: 0,
             policy: PolicyKind::RoundRobin,
             // Unreachably-high threshold: without it, w_dead's third refused
             // dispatch trips the DEFAULT breaker (threshold 3 — `None` does not
@@ -470,6 +476,8 @@ async fn retry_recovers_streaming_request_that_lands_on_a_dead_worker() {
             id: "tiny".into(),
             tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
             tokenizer_shards: 1,
+            tokenizer_backend: Default::default(),
+            tokenizer_l1_cache_mb: 0,
             policy: PolicyKind::RoundRobin,
             // Unreachably-high threshold — see the non-streaming recovery
             // test for why (`None` means the DEFAULT breaker, threshold 3).
@@ -607,6 +615,8 @@ async fn retry_is_bounded_to_one_when_every_worker_is_dead() {
             id: "tiny".into(),
             tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
             tokenizer_shards: 1,
+            tokenizer_backend: Default::default(),
+            tokenizer_l1_cache_mb: 0,
             policy: PolicyKind::RoundRobin,
             // Unreachably-high threshold so both dead workers stay in the
             // candidate set for every request (`None` = DEFAULT breaker).
@@ -753,6 +763,8 @@ async fn engine_error_status_is_forwarded_verbatim_and_never_retried() {
             id: "tiny".into(),
             tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
             tokenizer_shards: 1,
+            tokenizer_backend: Default::default(),
+            tokenizer_l1_cache_mb: 0,
             policy: PolicyKind::RoundRobin,
             circuit_breaker: Some(CircuitBreakerConfig {
                 threshold: std::num::NonZeroU32::new(u32::MAX).unwrap(),

@@ -55,6 +55,20 @@ pub struct Cli {
     /// across N locks with no change to tokenization output. Must be >= 1.
     #[arg(long, default_value_t = default_tokenizer_shards())]
     pub tokenizer_shards: usize,
+    /// Tokenizer encode backend: "hf" (HuggingFace `tokenizers`, the
+    /// pre-existing default) or "fast" (`fastokens` hybrid — fast encode,
+    /// HF decode, automatic HF fallback if fastokens can't load the
+    /// tokenizer file; the fallback is visible on
+    /// `sgl_router_tokenizer_backend`).
+    #[arg(long, value_enum, default_value = "hf")]
+    pub tokenizer_backend: crate::tokenizer::adapter::TokenizerBackend,
+    /// MiB budget for the L1 special-token-boundary prefix tokenization
+    /// cache. 0 (default) disables it. When the cache is genuinely active
+    /// (the tokenizer declares safe special tokens) --tokenizer-shards is
+    /// forced to 1; pair with `--tokenizer-backend fast` so miss-heavy
+    /// traffic doesn't funnel through one HF merge-cache lock.
+    #[arg(long, default_value_t = 0)]
+    pub tokenizer_l1_cache_mb: usize,
     /// Routing policy.
     #[arg(long, value_enum, default_value = "round_robin")]
     pub policy: PolicyKind,
@@ -318,6 +332,8 @@ impl Cli {
                 // HuggingFace repo id) when --tokenizer-path is omitted.
                 tokenizer_path: self.tokenizer_path.unwrap_or_else(|| self.model_id.clone()),
                 tokenizer_shards: self.tokenizer_shards,
+                tokenizer_backend: self.tokenizer_backend,
+                tokenizer_l1_cache_mb: self.tokenizer_l1_cache_mb,
                 id: self.model_id,
                 policy: self.policy,
                 circuit_breaker,
@@ -537,6 +553,43 @@ mod tests {
                 || err.to_string().to_lowercase().contains("0"),
             "got: {err}",
         );
+    }
+
+    /// `--tokenizer-backend` is a clap `ValueEnum`, so an unknown value is
+    /// rejected at parse time with the flag named in the error.
+    #[test]
+    fn bogus_tokenizer_backend_is_rejected() {
+        let err = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://10.0.0.1:30000",
+            "--tokenizer-backend",
+            "bogus",
+        ]))
+        .expect_err("--tokenizer-backend bogus must be rejected");
+        assert!(err.to_string().contains("tokenizer-backend"), "got: {err}");
+    }
+
+    /// The two tokenizer flags map into `ModelConfig` — and default to the
+    /// pre-existing behavior (HF backend, cache off) when omitted.
+    #[test]
+    fn tokenizer_backend_and_l1_cache_map_into_config() {
+        use crate::tokenizer::adapter::TokenizerBackend;
+
+        let c = into_config_owned(with_model(&["--worker-urls", "http://10.0.0.1:30000"])).unwrap();
+        assert_eq!(c.model.tokenizer_backend, TokenizerBackend::Hf);
+        assert_eq!(c.model.tokenizer_l1_cache_mb, 0);
+
+        let c = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://10.0.0.1:30000",
+            "--tokenizer-backend",
+            "fast",
+            "--tokenizer-l1-cache-mb",
+            "64",
+        ]))
+        .unwrap();
+        assert_eq!(c.model.tokenizer_backend, TokenizerBackend::Fast);
+        assert_eq!(c.model.tokenizer_l1_cache_mb, 64);
     }
 
     #[test]

@@ -1175,6 +1175,64 @@ impl MetricsRegistry {
         }
         drop(guard);
 
+        // tokenizer_backend / tokenizer_l1_state — the RESOLVED tokenizer
+        // runtime state (what actually loaded, not what was requested).
+        // Every known state renders (selected = 1, others = 0) so a
+        // dashboard can alert on backend="fast_fallback_hf" (operator asked
+        // for fastokens, running at HF baseline) or
+        // state="disabled_no_specials" (cache flag set but inert) without
+        // an absent-series ambiguity.
+        let (backend_state, l1_state) = crate::tokenizer::adapter::tokenizer_runtime_states();
+        out.push_str(
+            "# HELP sgl_router_tokenizer_backend Resolved tokenizer encode backend; fast_fallback_hf means --tokenizer-backend fast was requested but fastokens could not load the tokenizer, so encode runs on HF at baseline speed.\n",
+        );
+        out.push_str("# TYPE sgl_router_tokenizer_backend gauge\n");
+        for b in ["hf", "fast", "fast_fallback_hf"] {
+            out.push_str(&format!(
+                "sgl_router_tokenizer_backend{{backend=\"{b}\"}} {}\n",
+                u8::from(b == backend_state)
+            ));
+        }
+        out.push_str(
+            "# HELP sgl_router_tokenizer_l1_state Resolved L1 prefix-tokenization-cache state; disabled_no_specials means the cache was requested but the tokenizer declares no safely-splittable special tokens, so it is inert.\n",
+        );
+        out.push_str("# TYPE sgl_router_tokenizer_l1_state gauge\n");
+        for s in ["off", "active", "disabled_no_specials"] {
+            out.push_str(&format!(
+                "sgl_router_tokenizer_l1_state{{state=\"{s}\"}} {}\n",
+                u8::from(s == l1_state)
+            ));
+        }
+
+        // tokenizer_l1_* — process-global L1 prefix-tokenization-cache
+        // counters, fed by the CachedTokenizer observers wired in
+        // `tokenizer::adapter::load_with_opts`. All four render 0 (not
+        // absent) when the cache is disabled, so dashboards can tell
+        // "cache off" from "scrape broken". Unlabeled: one model per
+        // router process today.
+        let (l1_hits, l1_misses, l1_cached_tok, l1_uncached_tok) =
+            crate::tokenizer::adapter::l1_cache_counters();
+        out.push_str(
+            "# HELP sgl_router_tokenizer_l1_lookups_total L1 prefix-tokenization-cache lookups by outcome (one lookup per encode while the cache is ACTIVE — see sgl_router_tokenizer_l1_state; hit = some prefix served from cache, boundary-less prompts count as misses).\n",
+        );
+        out.push_str("# TYPE sgl_router_tokenizer_l1_lookups_total counter\n");
+        out.push_str(&format!(
+            "sgl_router_tokenizer_l1_lookups_total{{outcome=\"hit\"}} {l1_hits}\n"
+        ));
+        out.push_str(&format!(
+            "sgl_router_tokenizer_l1_lookups_total{{outcome=\"miss\"}} {l1_misses}\n"
+        ));
+        out.push_str(
+            "# HELP sgl_router_tokenizer_l1_tokens_total Tokens produced by encodes through the L1 cache, split into prefix tokens served from cache vs freshly encoded (cached/(cached+uncached) = fraction of tokenize work the cache absorbed).\n",
+        );
+        out.push_str("# TYPE sgl_router_tokenizer_l1_tokens_total counter\n");
+        out.push_str(&format!(
+            "sgl_router_tokenizer_l1_tokens_total{{source=\"cached\"}} {l1_cached_tok}\n"
+        ));
+        out.push_str(&format!(
+            "sgl_router_tokenizer_l1_tokens_total{{source=\"encoded\"}} {l1_uncached_tok}\n"
+        ));
+
         // backpressure_rejected_total
         out.push_str(
             "# HELP sgl_router_backpressure_rejected_total Requests rejected with 503 because every worker was at its in-flight cap and the admission wait queue was full.\n",
@@ -1361,6 +1419,39 @@ mod tests {
         assert!(out.contains("# TYPE sgl_router_decode_affinity_total counter"));
         assert!(out.contains("# TYPE sgl_router_sticky_total counter"));
         assert!(out.contains("# TYPE sgl_router_ingress_tokenize_errors_total counter"));
+        // Tokenizer runtime state + L1 counters render UNCONDITIONALLY —
+        // "cache off" must be distinguishable from "scrape broken", and the
+        // fastokens-fallback state must be visible after startup. All three
+        // backend states and all three l1 states render (selected=1,
+        // others=0); the four counter series render a value even when the
+        // cache never fired. Values are asserted only as PRESENT-with-a-
+        // digit, not exactly 0: the backing counters are process-global and
+        // sibling tokenizer tests in this binary may have bumped them.
+        assert!(out.contains("# TYPE sgl_router_tokenizer_backend gauge"));
+        assert!(out.contains("# TYPE sgl_router_tokenizer_l1_state gauge"));
+        for series in [
+            r#"sgl_router_tokenizer_backend{backend="hf"} "#,
+            r#"sgl_router_tokenizer_backend{backend="fast"} "#,
+            r#"sgl_router_tokenizer_backend{backend="fast_fallback_hf"} "#,
+            r#"sgl_router_tokenizer_l1_state{state="off"} "#,
+            r#"sgl_router_tokenizer_l1_state{state="active"} "#,
+            r#"sgl_router_tokenizer_l1_state{state="disabled_no_specials"} "#,
+            r#"sgl_router_tokenizer_l1_lookups_total{outcome="hit"} "#,
+            r#"sgl_router_tokenizer_l1_lookups_total{outcome="miss"} "#,
+            r#"sgl_router_tokenizer_l1_tokens_total{source="cached"} "#,
+            r#"sgl_router_tokenizer_l1_tokens_total{source="encoded"} "#,
+        ] {
+            let line = out
+                .lines()
+                .find(|l| l.starts_with(series))
+                .unwrap_or_else(|| panic!("missing always-rendered series {series:?}"));
+            assert!(
+                line[series.len()..].chars().all(|c| c.is_ascii_digit()),
+                "series {series:?} must render a numeric value, got {line:?}"
+            );
+        }
+        assert!(out.contains("# TYPE sgl_router_tokenizer_l1_lookups_total counter"));
+        assert!(out.contains("# TYPE sgl_router_tokenizer_l1_tokens_total counter"));
         // engine_aborts always emits one series per AbortReason variant,
         // starting at 0 — deliberately, so a Grafana panel aliased on
         // `reason="stream_client_gone"` doesn't go blank during a healthy

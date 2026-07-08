@@ -89,8 +89,9 @@ impl ChatEncoderEntry {
 /// committed. Loading N instances from the same file gives each its own
 /// independent cache/lock, so concurrent callers spread across N locks
 /// instead of contending one. Every instance is loaded from the same source
-/// via [`adapter::load`], so which shard a call lands on can never change
-/// the tokenization output — only which lock it contends.
+/// with the same opts via [`adapter::load_with_opts`], so which shard a
+/// call lands on can never change the tokenization output — only which lock
+/// it contends.
 struct TokenizerShards {
     /// Always non-empty — the type's only constructors (`load`, and the
     /// `#[cfg(test)]`-only `single`) both guarantee at least one element, so
@@ -114,8 +115,8 @@ impl TokenizerShards {
     /// unusable registry entry.
     ///
     /// Sequential by design — do not parallelize this loop. For an HF
-    /// repo-id `source`, `adapter::load`'s first call downloads and
-    /// populates `hf-hub`'s on-disk cache; every subsequent call in this
+    /// repo-id `source`, the first `adapter::load_with_opts` call downloads
+    /// and populates `hf-hub`'s on-disk cache; every subsequent call in this
     /// same sequential loop then hits that cache with no network at all
     /// (`hf_hub::api::sync::ApiRepo::get` checks the cache before ever
     /// calling out). Running these N calls concurrently instead would
@@ -125,10 +126,37 @@ impl TokenizerShards {
     /// attempt, serialized only by `hf-hub`'s file lock rather than
     /// deduplicated — turning "1 download + (N-1) free cache reads" back
     /// into up to N downloads racing each other.
-    fn load(source: &str, n: usize) -> Result<Self> {
-        let n = n.max(1);
+    fn load(source: &str, n: usize, opts: adapter::TokenizerLoadOpts) -> Result<Self> {
+        // Settle the L1 half of the opts FIRST: a requested-but-inert cache
+        // (tokenizer declares no safely-splittable specials) is downgraded
+        // to budget 0 there, so it must not cost the shard spread below.
+        let opts = adapter::finalize_load_opts(source, opts)?;
+        // The L1 prefix cache lives INSIDE each CachedTokenizer instance, so
+        // N shards would mean N independent caches: N× the byte budget and a
+        // 1/N hit rate (a conversation's turn-2 request only hits if it lands
+        // on the same shard as turn 1 — round-robin guarantees it usually
+        // won't). One shared instance wins for the hit-dominated multi-turn
+        // traffic the cache targets: a hit touches the BPE merge cache only
+        // for the (short) fresh suffix, and with the fast backend misses
+        // avoid that lock too. KNOWN TRADE-OFF: with the HF backend,
+        // miss-heavy traffic (all-fresh conversations, boundary-less
+        // prompts) funnels full encodes through the single instance's
+        // merge-cache RwLock that sharding existed to spread — prefer
+        // --tokenizer-backend fast alongside the cache.
+        let n = if opts.l1_cache_bytes > 0 {
+            if n > 1 {
+                tracing::info!(
+                    requested_shards = n,
+                    "tokenizer L1 cache enabled; using a single shared tokenizer instance \
+                     (per-shard caches would split the hit rate and multiply the byte budget)"
+                );
+            }
+            1
+        } else {
+            n.max(1)
+        };
         let shards = (0..n)
-            .map(|_| adapter::load(source))
+            .map(|_| adapter::load_with_opts(source, opts))
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             shards,
@@ -190,7 +218,11 @@ impl TokenizerRegistry {
     pub fn load_from_config(cfg: &crate::config::Config) -> Result<Self> {
         let me = TokenizerRegistry::default();
         let m = &cfg.model;
-        let shards = TokenizerShards::load(&m.tokenizer_path, m.tokenizer_shards)?;
+        let opts = adapter::TokenizerLoadOpts {
+            backend: m.tokenizer_backend,
+            l1_cache_bytes: m.tokenizer_l1_cache_mb.saturating_mul(1024 * 1024),
+        };
+        let shards = TokenizerShards::load(&m.tokenizer_path, m.tokenizer_shards, opts)?;
         me.inner.insert(m.id.clone(), shards);
         // Resolve the chat encoder, best-effort: a Jinja template from
         // tokenizer_config.json, else a built-in encoder for a recognized model
@@ -340,6 +372,8 @@ mod tests {
                 id: "tiny".into(),
                 tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
                 tokenizer_shards: 1,
+                tokenizer_backend: Default::default(),
+                tokenizer_l1_cache_mb: 0,
                 policy: PolicyKind::RoundRobin,
                 circuit_breaker: None,
                 cache_aware: None,
@@ -376,6 +410,29 @@ mod tests {
         assert!(
             Arc::ptr_eq(&a, &b),
             "with a single shard, registry should return the same Arc every call"
+        );
+    }
+
+    /// The wire from `--tokenizer-l1-cache-mb` to the feature: a nonzero
+    /// MiB budget flowing through `load_from_config` must actually enable
+    /// the cache — observable as the shard collapse (4 configured shards →
+    /// one shared instance). If the MiB→bytes conversion regressed to 0,
+    /// four distinct Arcs would come back and this fails.
+    #[test]
+    fn load_from_config_wires_l1_cache_budget() {
+        let mut c = cfg();
+        c.model.tokenizer_shards = 4;
+        c.model.tokenizer_l1_cache_mb = 1;
+        // The BPE fixture's <|endoftext|> special keeps the cache genuinely
+        // active (finalize_load_opts would zero the budget on a
+        // specials-less tokenizer and the shard collapse wouldn't happen).
+        c.model.tokenizer_path = "tests/fixtures/tiny_bpe_tokenizer.json".into();
+        let r = TokenizerRegistry::load_from_config(&c).unwrap();
+        let a = r.get("tiny").unwrap();
+        let b = r.get("tiny").unwrap();
+        assert!(
+            Arc::ptr_eq(&a, &b),
+            "an active L1 cache must collapse to one shared tokenizer instance"
         );
     }
 
@@ -673,7 +730,8 @@ mod tests {
         eprintln!("sharded_instances_produce_identical_output: using {source}");
 
         const N: usize = 8;
-        let shards = TokenizerShards::load(&source, N).expect("load N independent instances");
+        let shards = TokenizerShards::load(&source, N, adapter::TokenizerLoadOpts::default())
+            .expect("load N independent instances");
         assert_eq!(shards.shards.len(), N);
 
         let inputs: &[&str] = &[
@@ -717,6 +775,317 @@ mod tests {
              would then be checking N identical byte-level passthroughs, not real shard-to-shard \
              merge-cache divergence, silently validating nothing. Use a tokenizer.json with a \
              non-empty merges table (see tests/fixtures/tiny_bpe_tokenizer.json)."
+        );
+    }
+
+    /// A growing multi-turn-shaped conversation over the tiny BPE fixture,
+    /// using its one special token (`<|endoftext|>`, id 256) as the turn
+    /// boundary — the shape the L1 prefix cache exists for: element `k` is
+    /// element `k-1` plus one boundary and one new "turn".
+    fn growing_conversation(turns: usize) -> Vec<String> {
+        let mut out = Vec::with_capacity(turns);
+        let mut text = String::new();
+        for t in 0..turns {
+            text.push_str(&format!("the thing in turn {t} is interesting "));
+            text.push_str("<|endoftext|>");
+            out.push(text.clone());
+        }
+        out
+    }
+
+    /// The L1-cached tokenizer must be OUTPUT-INVISIBLE: byte-identical ids
+    /// vs a plain (uncached) load, on cold encodes, warm re-encodes, AND the
+    /// growing-conversation pattern where extend-on-hit builds ever-deeper
+    /// cached prefixes. These ids feed cache-affinity hashing and are
+    /// forwarded to the engine as `input_ids`, so any divergence is silent
+    /// output corruption — equality here is the gate for enabling the cache.
+    #[test]
+    fn l1_cached_encode_matches_plain_encode() {
+        let plain = adapter::load("tests/fixtures/tiny_bpe_tokenizer.json").unwrap();
+        let cached = adapter::load_with_opts(
+            "tests/fixtures/tiny_bpe_tokenizer.json",
+            adapter::TokenizerLoadOpts {
+                backend: adapter::TokenizerBackend::Hf,
+                l1_cache_bytes: 8 * 1024 * 1024,
+            },
+        )
+        .unwrap();
+
+        for text in growing_conversation(8) {
+            let want = adapter::encode(&plain, &text).unwrap();
+            let cold = adapter::encode(&cached, &text).unwrap();
+            assert_eq!(cold, want, "cold cached encode diverged for {text:?}");
+            // Second encode of the same text re-runs the lookup; from the
+            // 2-turn element on it hits at the deepest INTERIOR boundary (a
+            // trailing special's end-of-text boundary is never cached, so
+            // the 1-turn element stays a miss and hits are partial).
+            let warm = adapter::encode(&cached, &text).unwrap();
+            assert_eq!(warm, want, "warm cached encode diverged for {text:?}");
+        }
+        // Also texts with NO special-token boundary (cache can't help) and
+        // suffixes AFTER a cached boundary that differ from what was cached.
+        for text in [
+            "no boundaries here at all",
+            "the thing in turn 0 is interesting <|endoftext|>but a different suffix",
+            "",
+        ] {
+            let want = adapter::encode(&plain, text).unwrap();
+            let got = adapter::encode(&cached, text).unwrap();
+            assert_eq!(got, want, "cached encode diverged for {text:?}");
+        }
+    }
+
+    /// The fastokens backend must be encode-equivalent to the HF backend.
+    /// The first assertion pins that fastokens genuinely LOADS the fixture:
+    /// `load_with_opts` silently falls back to HF on a fastokens load
+    /// failure, which would turn the equivalence assertions below into
+    /// HF-vs-HF theater (this happened — the fixture originally lacked the
+    /// `"type": "BPE"` model tag fastokens requires, and the test passed
+    /// while exercising zero fastokens code).
+    #[test]
+    fn fast_backend_encode_matches_hf() {
+        assert!(
+            dynamo_tokenizers::FastTokenizer::from_file("tests/fixtures/tiny_bpe_tokenizer.json")
+                .is_ok(),
+            "fixture no longer loads under fastokens — the equivalence assertions below are \
+             vacuous (load_with_opts silently falls back to HF). Fix the fixture or fastokens \
+             pin before trusting this test."
+        );
+        let hf = adapter::load("tests/fixtures/tiny_bpe_tokenizer.json").unwrap();
+        let fast = adapter::load_with_opts(
+            "tests/fixtures/tiny_bpe_tokenizer.json",
+            adapter::TokenizerLoadOpts {
+                backend: adapter::TokenizerBackend::Fast,
+                l1_cache_bytes: 0,
+            },
+        )
+        .unwrap();
+        let corpus = [
+            "hello world",
+            "the thing <|endoftext|> another thing",
+            "你好，世界！ mixed 🚀 content",
+            "",
+            "aaaaaaaaaa the the the ing ing ing",
+        ];
+        for text in corpus {
+            let want = adapter::encode(&hf, text).unwrap();
+            let got = adapter::encode(&fast, text).unwrap();
+            assert_eq!(
+                got, want,
+                "fast-backend encode diverged from HF for {text:?} — fastokens is NOT \
+                 engine-equivalent for this tokenizer; do not deploy --tokenizer-backend fast"
+            );
+        }
+    }
+
+    /// The PRODUCTION target config — fast backend + L1 cache STACKED — must
+    /// match the plain HF oracle. The two single-lever tests don't compose
+    /// automatically (disjoint corpora, and the cache wraps a different
+    /// inner), so the deploy config gets its own always-run equivalence.
+    #[test]
+    fn fast_l1_stacked_encode_matches_plain_encode() {
+        let plain = adapter::load("tests/fixtures/tiny_bpe_tokenizer.json").unwrap();
+        let stacked = adapter::load_with_opts(
+            "tests/fixtures/tiny_bpe_tokenizer.json",
+            adapter::TokenizerLoadOpts {
+                backend: adapter::TokenizerBackend::Fast,
+                l1_cache_bytes: 8 * 1024 * 1024,
+            },
+        )
+        .unwrap();
+        for text in growing_conversation(8) {
+            let want = adapter::encode(&plain, &text).unwrap();
+            assert_eq!(
+                adapter::encode(&stacked, &text).unwrap(),
+                want,
+                "cold fast+L1 encode diverged for {text:?}"
+            );
+            assert_eq!(
+                adapter::encode(&stacked, &text).unwrap(),
+                want,
+                "warm fast+L1 encode diverged for {text:?}"
+            );
+        }
+    }
+
+    /// Concurrent encodes through ONE shared L1-cached tokenizer — the
+    /// production topology (the cache collapses shards to a single
+    /// instance). Unlike the plain-path sibling test, every call here also
+    /// MUTATES cache state (insert / extend-on-hit / eviction bookkeeping),
+    /// so this is the only place a logic race in the cache's concurrent
+    /// bookkeeping would surface as wrong ids. Growing-conversation inputs
+    /// make extend-on-hit actually race.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cached_tokenizer_supports_concurrent_encode() {
+        use tokio::task::JoinSet;
+
+        let plain = adapter::load("tests/fixtures/tiny_bpe_tokenizer.json").unwrap();
+        let cached = adapter::load_with_opts(
+            "tests/fixtures/tiny_bpe_tokenizer.json",
+            adapter::TokenizerLoadOpts {
+                backend: adapter::TokenizerBackend::Fast,
+                l1_cache_bytes: 8 * 1024 * 1024,
+            },
+        )
+        .unwrap();
+
+        // Sequential reference from the UNCACHED oracle; 4 interleaved
+        // copies of each growing-conversation element so concurrent tasks
+        // contend on the same prefixes.
+        let mut inputs: Vec<String> = Vec::new();
+        for text in growing_conversation(6) {
+            for _ in 0..4 {
+                inputs.push(text.clone());
+            }
+        }
+        let expected: Vec<Vec<u32>> = inputs
+            .iter()
+            .map(|s| adapter::encode(&plain, s).unwrap())
+            .collect();
+
+        let mut set = JoinSet::new();
+        for (i, text) in inputs.into_iter().enumerate() {
+            let shared = Arc::clone(&cached);
+            set.spawn(async move {
+                let ids = adapter::encode(&shared, &text)
+                    .expect("concurrent cached encode must not fail");
+                (i, ids)
+            });
+        }
+        let mut got: Vec<Option<Vec<u32>>> = vec![None; expected.len()];
+        while let Some(joined) = set.join_next().await {
+            let (i, ids) = joined.expect("task panicked");
+            got[i] = Some(ids);
+        }
+        for (i, ids) in got.into_iter().enumerate() {
+            let ids = ids.unwrap_or_else(|| panic!("task {i} did not record a result"));
+            assert_eq!(
+                ids, expected[i],
+                "concurrent cached encode produced wrong tokens for task {i} — \
+                 sign of a race in the shared L1 cache's insert/extend path"
+            );
+        }
+    }
+
+    /// An enabled L1 cache forces a single tokenizer instance — per-shard
+    /// caches would split the hit rate across shards and multiply the byte
+    /// budget (see `TokenizerShards::load`).
+    #[test]
+    fn l1_cache_forces_single_shard() {
+        let shards = TokenizerShards::load(
+            "tests/fixtures/tiny_bpe_tokenizer.json",
+            8,
+            adapter::TokenizerLoadOpts {
+                backend: adapter::TokenizerBackend::Hf,
+                l1_cache_bytes: 1024 * 1024,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            shards.shards.len(),
+            1,
+            "L1 cache enabled must collapse tokenizer shards to one shared instance"
+        );
+    }
+
+    /// Real-model equivalence + timing for the DSV4 workload this prototype
+    /// targets. Ignored by default: needs a real DeepSeek-V4 tokenizer.json,
+    /// pointed at via env. Run with:
+    ///
+    ///   DSV4_TOKENIZER_JSON=/path/to/tokenizer.json \
+    ///     cargo test --release -p sgl-router dsv4_real -- --ignored --nocapture
+    ///
+    /// Asserts (the deploy gates):
+    ///   1. fastokens encode ids == HF encode ids on multi-turn DSV4-rendered
+    ///      prompts (ids are forwarded to the engine — divergence is silent
+    ///      wrong output);
+    ///   2. L1-cached encode ids == plain ids at every turn of a growing
+    ///      conversation;
+    ///   3. the pinned engine-`/tokenize` vector from `dsv4.rs` holds through
+    ///      every backend/wrapper combination.
+    ///
+    /// Prints cold/warm timings for HF, fast, and fast+L1 so the run doubles
+    /// as the prototype benchmark.
+    #[test]
+    #[ignore = "needs DSV4_TOKENIZER_JSON pointing at a real DeepSeek-V4 tokenizer.json"]
+    fn dsv4_real_tokenizer_equivalence_and_timing() {
+        let Ok(path) = std::env::var("DSV4_TOKENIZER_JSON") else {
+            panic!("set DSV4_TOKENIZER_JSON to a DeepSeek-V4 tokenizer.json path");
+        };
+        let hf = adapter::load(&path).unwrap();
+        let fast = adapter::load_with_opts(
+            &path,
+            adapter::TokenizerLoadOpts {
+                backend: adapter::TokenizerBackend::Fast,
+                l1_cache_bytes: 0,
+            },
+        )
+        .unwrap();
+        let fast_l1 = adapter::load_with_opts(
+            &path,
+            adapter::TokenizerLoadOpts {
+                backend: adapter::TokenizerBackend::Fast,
+                l1_cache_bytes: 512 * 1024 * 1024,
+            },
+        )
+        .unwrap();
+
+        // Gate 3: the pinned engine-/tokenize vector (dsv4.rs module doc).
+        let pinned = serde_json::json!([{"role": "user", "content": "ABCD"}]);
+        let rendered = dsv4::render_messages(&pinned);
+        for (name, tok) in [("hf", &hf), ("fast", &fast), ("fast+l1", &fast_l1)] {
+            assert_eq!(
+                adapter::encode(tok, &rendered).unwrap(),
+                vec![0, 128803, 51453, 128804, 128822],
+                "pinned DSV4 vector diverged through {name}"
+            );
+        }
+
+        // Build a deterministic multi-turn conversation totalling ~70k tokens
+        // when rendered — the shape and scale of the live workload.
+        let mut messages: Vec<serde_json::Value> = Vec::new();
+        let words = [
+            "alpha", "beta", "gamma", "delta", "system", "router", "tensor", "kernel", "deploy",
+            "metric", "latency", "bucket", "engine", "token", "prefix", "cache", "the", "of",
+            "and", "request",
+        ];
+        let mut w = 0usize;
+        for turn in 0..40 {
+            let mut content = format!("turn {turn}: ");
+            for _ in 0..1500 {
+                content.push_str(words[w % words.len()]);
+                content.push(' ');
+                w = w.wrapping_mul(31).wrapping_add(17);
+            }
+            let role = if turn % 2 == 0 { "user" } else { "assistant" };
+            messages.push(serde_json::json!({"role": role, "content": content}));
+        }
+
+        let time_encode = |tok: &Arc<Tokenizer>, text: &str| -> (Vec<u32>, f64) {
+            let t0 = std::time::Instant::now();
+            let ids = adapter::encode(tok, text).unwrap();
+            (ids, t0.elapsed().as_secs_f64() * 1000.0)
+        };
+
+        // Gates 1 + 2 across a GROWING conversation (each iteration appends
+        // one turn — the production shape), timing every layer per turn.
+        eprintln!("turn | tokens | hf_ms | fast_ms | fast_l1_ms");
+        for upto in (2..=messages.len()).step_by(8) {
+            let msgs = serde_json::Value::Array(messages[..upto].to_vec());
+            let text = dsv4::render_messages(&msgs);
+            let (want, hf_ms) = time_encode(&hf, &text);
+            let (got_fast, fast_ms) = time_encode(&fast, &text);
+            let (got_l1, l1_ms) = time_encode(&fast_l1, &text);
+            assert_eq!(got_fast, want, "fastokens diverged at {upto} turns");
+            assert_eq!(got_l1, want, "fast+L1 diverged at {upto} turns");
+            eprintln!(
+                "{upto:4} | {:6} | {hf_ms:7.1} | {fast_ms:7.1} | {l1_ms:7.1}",
+                want.len()
+            );
+        }
+        let (hits, misses, cached_tok, encoded_tok) = adapter::l1_cache_counters();
+        eprintln!(
+            "l1 counters: hits={hits} misses={misses} cached_tokens={cached_tok} encoded_tokens={encoded_tok}"
         );
     }
 }
