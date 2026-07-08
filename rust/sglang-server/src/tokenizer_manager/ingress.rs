@@ -22,8 +22,7 @@ use crate::error::Error;
 use crate::fsm::{Event, RequestState, ValidationOutcome};
 use crate::ids::RequestId;
 use crate::message::{
-    EgressItem, IngressMsg, Request, RequestKind, TokenizedReqPayload, abort_req_msgpack,
-    control_req_msgpack,
+    EgressItem, IngressMsg, Request, RequestKind, abort_req_msgpack, control_req_msgpack,
 };
 use crate::runtime::Runnable;
 use crate::runtime::channels::{DetokMsg, Senders, TmEvent, recv};
@@ -132,11 +131,10 @@ impl Ingress {
                             );
                             return;
                         };
-                        match normalize_sampling_params(&mut g.payload.sampling_params) {
+                        match normalize_sampling_params(&mut g.sampling_params) {
                             Err(e) => Err(e),
                             // Client ids skip the pool (→ Queued); text is tokenized.
-                            Ok(()) if g.payload.already_tokenized() => {
-                                g.input_ids = g.payload.input_ids.clone();
+                            Ok(()) if g.already_tokenized() => {
                                 Ok(ValidationOutcome::AlreadyTokenized)
                             }
                             Ok(()) => Ok(ValidationOutcome::NeedsTokenize),
@@ -199,8 +197,8 @@ impl Ingress {
     fn register_detok(&self, req: &Request) -> bool {
         let (decode_logprob_text, no_stop_trim) = match &req.kind {
             RequestKind::Generate(g) => (
-                g.payload.return_text_in_logprobs.unwrap_or(false),
-                sampling_flag(&g.payload.sampling_params, "no_stop_trim"),
+                g.return_text_in_logprobs.unwrap_or(false),
+                sampling_flag(&g.sampling_params, "no_stop_trim"),
             ),
             RequestKind::Control(_) => (false, false),
         };
@@ -254,62 +252,28 @@ impl Ingress {
         }
     }
 
-    /// Build the msgpack `TokenizedGenerateReqInput` and push it onto the ingress
-    /// ring for the scheduler. On backpressure, fail the request.
+    /// Serialize the tokenized request to its `TokenizedGenerateReqInput` wire and
+    /// push it onto the ingress ring for the scheduler. On backpressure, fail it.
     fn push_to_ring(&self, mut req: Request) {
         // Only generate requests reach here (control uses `push_control_to_ring`).
-        let RequestKind::Generate(g) = &mut req.kind else {
-            self.fail(
-                &mut req,
-                Error::Internal("non-generate request reached push_to_ring".into()),
-            );
-            return;
+        // Validate + serialize while borrowing `g` immutably; the resulting `Bytes`
+        // own their data, so the borrow ends before any `fail(&mut req)`.
+        let serialized = match &req.kind {
+            RequestKind::Generate(g) if g.already_tokenized() => g
+                .to_header_msgpack(&req.id.0.to_string())
+                .map(|header| (header, g.input_ids_i64_le())),
+            RequestKind::Generate(_) => Err(Error::Tokenize("empty input_ids".into())),
+            RequestKind::Control(_) => Err(Error::Internal(
+                "non-generate request reached push_to_ring".into(),
+            )),
         };
-        // Move the fields out (`take` frees the `req.kind` borrow for `fail`).
-        let input_ids = g.input_ids.take();
-        let input_text = g.payload.text.take();
-        let sampling_params = g.payload.sampling_params.take();
-        let stream = g.stream;
-        // Scalar logprob normalization the TokenizerManager would do: absent →
-        // scheduler defaults.
-        let return_logprob = g.payload.return_logprob.unwrap_or(false);
-        let logprob_start_len = g.payload.logprob_start_len.unwrap_or(-1);
-        let top_logprobs_num = g.payload.top_logprobs_num.unwrap_or(0);
-        let token_ids_logprob = g.payload.token_ids_logprob.take();
-        let return_hidden_states = g.payload.return_hidden_states.unwrap_or(false);
-        let is_health_check = g.is_health_check;
-
-        let input_ids = match input_ids {
-            Some(ids) if !ids.is_empty() => ids,
-            _ => {
-                self.fail(&mut req, Error::Tokenize("empty input_ids".into()));
-                return;
-            }
-        };
-
-        let payload = TokenizedReqPayload {
-            rid: req.id.0.to_string(),
-            input_text,
-            input_ids,
-            sampling_params,
-            return_logprob,
-            logprob_start_len,
-            top_logprobs_num,
-            token_ids_logprob,
-            return_hidden_states,
-            is_health_check,
-            stream,
-        };
-
-        // Columnar split: scalar header via msgpack, ids as a raw int64 buffer.
-        let header: Bytes = match payload.to_header_msgpack() {
-            Ok(b) => b,
+        let (header, ids) = match serialized {
+            Ok(v) => v,
             Err(e) => {
                 self.fail(&mut req, e);
                 return;
             }
         };
-        let ids = payload.input_ids_i64_le();
 
         if !self.ingress.try_push(IngressMsg { header, ids }) {
             self.fail(&mut req, Error::QueueFull);
@@ -340,7 +304,7 @@ fn validate(req: &mut Request, skip_tokenizer_init: bool) -> Result<(), Error> {
         .state
         .apply(Event::Validated(ValidationOutcome::NeedsTokenize));
     if skip_tokenizer_init
-        && matches!(&req.kind, RequestKind::Generate(g) if !g.payload.already_tokenized())
+        && matches!(&req.kind, RequestKind::Generate(g) if !g.already_tokenized())
     {
         return Err(Error::Tokenize(
             "skip_tokenizer_init is set: request must provide input_ids".into(),
@@ -354,7 +318,7 @@ fn validate(req: &mut Request, skip_tokenizer_init: bool) -> Result<(), Error> {
 mod tests {
     use super::*;
     use crate::fsm::RequestState;
-    use crate::message::{EgressSink, GeneratePayload, GenerateRequest};
+    use crate::message::{EgressSink, GenerateRequest};
     use crate::runtime::ring::{IngressConsumer, ingress_ring};
     use tokio::sync::mpsc;
 
@@ -384,18 +348,14 @@ mod tests {
     }
 
     fn generate_req(id: u64, sampling_params: rmpv::Value) -> Request {
-        let payload = GeneratePayload {
-            input_ids: Some(vec![1, 2, 3]),
-            sampling_params: Some(sampling_params),
-            ..Default::default()
-        };
         let (tx, _rx) = mpsc::channel(8);
         Request {
             id: RequestId(id),
             state: RequestState::Received,
             sink: EgressSink::Local(tx),
             kind: RequestKind::Generate(GenerateRequest {
-                payload,
+                input_ids: Some(vec![1, 2, 3]),
+                sampling_params: Some(sampling_params),
                 ..Default::default()
             }),
         }
@@ -510,7 +470,7 @@ mod tests {
         // No ids → NeedsTokenize → Tokenizing branch.
         let mut req = generate_req(21, rmpv::Value::Map(vec![]));
         if let RequestKind::Generate(g) = &mut req.kind {
-            g.payload.input_ids = None;
+            g.input_ids = None;
         }
         ingress.drive(req);
 
