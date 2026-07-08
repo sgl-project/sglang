@@ -70,10 +70,12 @@ class TorchFlexAttnBackend(AttentionBackend):
                     )
                 )
 
-    def _causal_mask(self, b, h, q_idx, kv_idx):
+    @staticmethod
+    def _causal_mask(b, h, q_idx, kv_idx):
         return q_idx >= kv_idx
 
-    def _decode_mask(self, b, h, q_idx, kv_idx):
+    @staticmethod
+    def _decode_mask(b, h, q_idx, kv_idx):
         return q_idx <= kv_idx
 
     def _run_flex_forward_extend(

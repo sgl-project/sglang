@@ -19,7 +19,6 @@ from sglang.srt.layers.communicator import (
     CommunicateSummableTensorPairFn,
     ScatterMode,
 )
-from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.moe import (
     get_deepep_mode,
     get_moe_a2a_backend,
@@ -40,6 +39,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     compute_position,
 )
 from sglang.srt.model_executor.forward_context import get_attn_backend
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import BumpAllocator, empty_context, get_bool_env_var, is_hip
@@ -103,9 +103,28 @@ def _is_two_chunk_split_enabled(extend_lens: Sequence[int]) -> bool:
     overall_sum = sum(extend_lens)
     threshold = get_tbo_token_distribution_threshold()
     assert threshold <= 0.5, f"{threshold=}"
-    return left_sum < overall_sum * threshold or left_sum > overall_sum * (
+    want_two_chunk = left_sum < overall_sum * threshold or left_sum > overall_sum * (
         1 - threshold
     )
+    if not want_two_chunk:
+        return False
+
+    # Two-chunk splits a single seq across both micro-batches by cutting at
+    # overall_sum // 2. child_a then spans seqs [0 : split_seq_index + 1]
+    # (batch_size = split_seq_index + 1) but only receives overall_sum // 2
+    # query tokens. For a degenerate batch (a single seq, or a near-empty
+    # DP-sync batch) this cut is 0 or tiny, leaving child_a with more seqs
+    # than query tokens (e.g. (bs=1, tok=0)). That violates the DSV4 compress
+    # planner invariant `batch_size <= num_q_tokens` and crashes the kernel.
+    # Fall back to a seq-boundary split, whose child_a is seq-aligned (each
+    # seq contributes >= 1 token) and cannot become empty-with-count.
+    split_seq_index = _split_array_by_cum_less_than_half(extend_lens)
+    child_a_batch_size = split_seq_index + 1
+    child_a_num_q_tokens = overall_sum // 2
+    if child_a_batch_size > child_a_num_q_tokens:
+        return False
+
+    return True
 
 
 def _split_extend_seqs(arr: Sequence[int]) -> int:
@@ -266,7 +285,7 @@ def split_spec_info(
 
 def compute_split_token_index(
     split_seq_index: int,
-    forward_mode: "ForwardMode",
+    forward_mode: ForwardMode,
     extend_seq_lens: Optional[Sequence[int]],
     token_num_per_seq: Optional[int],
 ) -> int:
@@ -316,7 +335,9 @@ def compute_split_indices_for_cuda_graph_replay(
 
 class TboCudaGraphRunnerPlugin:
     def __init__(self):
-        self._tbo_children_num_token_non_padded = torch.zeros((2,), dtype=torch.int32)
+        self._tbo_children_num_token_non_padded = torch.zeros(
+            (2,), dtype=torch.int32, device=get_global_server_args().device
+        )
 
     def capture_one_batch_size(self, batch: ForwardBatch, num_tokens: int):
         if not is_tbo_enabled():
@@ -380,6 +401,14 @@ class TboDPAttentionPreparer:
         enable_two_batch_overlap = is_tbo_enabled()
 
         self.enable_two_batch_overlap = enable_two_batch_overlap
+
+        # Short-circuit when TBO is off: prepare_mlp_sync_batch_raw invokes
+        # this preparer unconditionally for the forward_mode all-gather, but
+        # compute_split_seq_index is TBO-only and undefined for some modes
+        # (e.g. MIXED from enable_mixed_chunk).
+        if not enable_two_batch_overlap:
+            self.local_tbo_split_seq_index = None
+            return False, self._compute_local_forward_mode(local_batch)
 
         if local_batch is not None:
             token_num_per_seq = get_token_num_per_seq(
@@ -605,7 +634,7 @@ class TboForwardBatchPreparer:
             sum_field=None,
         )
         _, child_b.extend_start_loc = compute_position(
-            get_global_server_args().attention_backend,
+            get_server_args().attention_backend,
             child_b.extend_prefix_lens,
             child_b.extend_seq_lens,
             child_b.extend_num_tokens,
@@ -641,10 +670,11 @@ class TboForwardBatchPreparer:
             ), f"{key=} {old_value=} {num_tokens=} {batch=}"
             output_dict[key] = old_value[start_token_index:end_token_index]
 
-        attention_tp_size = get_attention_tp_size()
-        output_dict["tbo_padded_len"] = (
+        attention_tp_size = get_parallel().attn_tp_size
+        _tbo_padded_len = (
             (end_token_index - start_token_index - 1) // attention_tp_size + 1
         ) * attention_tp_size
+        output_dict["tbo_padded_len"] = _tbo_padded_len
 
         for key in [
             "req_pool_indices",
@@ -672,6 +702,11 @@ class TboForwardBatchPreparer:
             ):
                 output_dict[key] = None
                 continue
+            elif key == "rids" and len(old_value) != num_seqs:
+                output_dict[key] = old_value[
+                    start_seq_index : min(end_seq_index, len(old_value))
+                ]
+                continue
             assert (
                 len(old_value) == num_seqs
             ), f"{key=} {old_value=} {num_seqs=} {batch=}"
@@ -692,6 +727,7 @@ class TboForwardBatchPreparer:
             "all_extend_in_batch",
             "return_logprob",
             "can_run_dp_cuda_graph",
+            "can_run_dp_breakable_cuda_graph",
             "dp_padding_mode",
             "global_forward_mode",
             "is_prefill_only",
@@ -701,6 +737,7 @@ class TboForwardBatchPreparer:
             "split_index",  # for split prefill
             "orig_seq_lens",  # only used by qwen-1m, thus not care
             "return_pooled_hidden_states",
+            "reuse_dsa_topk_indices",  # forward-level flag, inherited by both child batches
         ]:
             output_dict[key] = getattr(batch, key)
 
@@ -747,6 +784,8 @@ class TboForwardBatchPreparer:
                 tbo_parent_token_range=(start_token_index, end_token_index),
                 tbo_children=None,
                 original_global_num_tokens_cpu=None,
+                _original_batch_size=None,
+                _original_forward_mode=None,
                 global_num_tokens_gpu=None,
                 global_num_tokens_cpu=None,
                 global_dp_buffer_len=global_dp_buffer_len,
@@ -754,15 +793,19 @@ class TboForwardBatchPreparer:
                 global_num_tokens_for_logprob_cpu=None,
                 sampling_info=None,
                 # For logits and logprobs post processing, thus we do not care
-                temp_scaled_logprobs=False,
                 temperature=None,
-                top_p_normalized_logprobs=False,
                 top_p=None,
                 mm_inputs=None,
                 top_logprobs_nums=None,
                 token_ids_logprobs=None,
                 next_token_logits_buffer=None,
                 return_hidden_states_before_norm=False,
+                # TBO children start unplanned — planned by the TBO-aware init
+                # flow; a stale parent "ready" would wrongly skip that.
+                forward_metadata_ready=False,
+                forward_metadata_planned_bs=None,
+                forward_metadata_planned_num_tokens=None,
+                forward_metadata_replan_equivalent=False,
             )
         )
 

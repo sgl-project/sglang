@@ -42,6 +42,7 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     prepare_diffusers_component_path_for_loading,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.precision import resolve_component_precision
 
 logger = init_logger(__name__)
 
@@ -111,6 +112,11 @@ class ComponentLoader(ABC):
     ) -> dict[str, Any]:
         return {}
 
+    def should_raise_customized_load_error(
+        self, _server_args: ServerArgs, _component_name: str
+    ) -> bool:
+        return False
+
     @staticmethod
     def _is_component_set_as_layerwise_load(
         server_args: ServerArgs, component_name: str
@@ -167,6 +173,49 @@ class ComponentLoader(ABC):
             return component
         return component.to(get_local_torch_device())
 
+    def _load_customized_with_context(
+        self,
+        component_model_path: str,
+        server_args: ServerArgs,
+        component_name: str,
+        attn_backend: Any,
+        component_attn_name: str | None,
+    ) -> AutoModel:
+        with component_attn_backend_context_manager(
+            attn_backend, component_name=component_attn_name
+        ):
+            load_kwargs = self.customized_load_kwargs_for_component(
+                server_args, component_name
+            )
+            component = self.load_customized(
+                component_model_path, server_args, component_name, **load_kwargs
+            )
+            return self._maybe_configure_layerwise_after_startup_cpu_staging(
+                component, server_args, component_name, load_kwargs
+            )
+
+    def _load_native_with_context(
+        self,
+        component_model_path: str,
+        server_args: ServerArgs,
+        component_name: str,
+        transformers_or_diffusers: str,
+        attn_backend: Any,
+        component_attn_name: str | None,
+    ) -> AutoModel:
+        with component_attn_backend_context_manager(
+            attn_backend, component_name=component_attn_name
+        ):
+            component = self.load_native(
+                component_model_path,
+                server_args,
+                transformers_or_diffusers,
+                component_name,
+            )
+        should_offload = self.should_offload(server_args)
+        target_device = self.target_device(should_offload)
+        return component.to(device=target_device)
+
     def load(
         self,
         component_model_path: str,
@@ -203,21 +252,21 @@ class ComponentLoader(ABC):
                     matched_backend_key,
                 )
         try:
-            with component_attn_backend_context_manager(
-                attn_backend, component_name=component_attn_name
-            ):
-                load_kwargs = self.customized_load_kwargs_for_component(
-                    server_args, component_name
-                )
-                component = self.load_customized(
-                    component_model_path, server_args, component_name, **load_kwargs
-                )
-                # configure layerwise to make enough VRAM headroom
-                component = self._maybe_configure_layerwise_after_startup_cpu_staging(
-                    component, server_args, component_name, load_kwargs
-                )
+            component = self._load_customized_with_context(
+                component_model_path,
+                server_args,
+                component_name,
+                attn_backend,
+                component_attn_name,
+            )
             source = "sgl-diffusion"
         except Exception as e:
+            if self.should_raise_customized_load_error(server_args, component_name):
+                traceback.print_exc()
+                raise RuntimeError(
+                    f"Failed to load customized {component_name}; native fallback "
+                    "is disabled for this component configuration."
+                ) from e
             if "Unsupported model architecture" in str(e):
                 logger.info(
                     f"Component: {component_name} doesn't have a customized version yet, using native version"
@@ -228,15 +277,14 @@ class ComponentLoader(ABC):
                     f"Error while loading customized {component_name}, falling back to native version"
                 )
             # fallback to native version
-            with component_attn_backend_context_manager(
-                attn_backend, component_name=component_attn_name
-            ):
-                component = self.load_native(
-                    component_model_path, server_args, transformers_or_diffusers
-                )
-            should_offload = self.should_offload(server_args)
-            target_device = self.target_device(should_offload)
-            component = component.to(device=target_device)
+            component = self._load_native_with_context(
+                component_model_path,
+                server_args,
+                component_name,
+                transformers_or_diffusers,
+                attn_backend,
+                component_attn_name,
+            )
             source = "native"
             logger.warning(
                 "Native component %s: %s is loaded, performance may be sub-optimal",
@@ -268,10 +316,20 @@ class ComponentLoader(ABC):
         component_model_path: str,
         server_args: ServerArgs,
         transformers_or_diffusers: str,
+        component_name: str | None = None,
     ) -> AutoModel:
         """
         Load the component using the native library (transformers/diffusers).
         """
+        precision = (
+            resolve_component_precision(server_args, component_name)
+            if component_name is not None
+            else None
+        )
+        load_kwargs = {}
+        if precision is not None:
+            load_kwargs["torch_dtype"] = precision
+
         if transformers_or_diffusers == "transformers":
             from transformers import AutoModel
 
@@ -285,6 +343,7 @@ class ComponentLoader(ABC):
                 config=config,
                 trust_remote_code=server_args.trust_remote_code,
                 revision=server_args.revision,
+                **load_kwargs,
             )
         elif transformers_or_diffusers == "diffusers":
             from diffusers import AutoModel
@@ -296,6 +355,7 @@ class ComponentLoader(ABC):
                 component_model_path,
                 revision=server_args.revision,
                 trust_remote_code=server_args.trust_remote_code,
+                **load_kwargs,
             )
         else:
             raise ValueError(f"Unsupported library: {transformers_or_diffusers}")
@@ -432,7 +492,7 @@ class AutoProcessorLoader(ComponentLoader):
 class TokenizerLoader(ComponentLoader):
     """Loader for tokenizers."""
 
-    component_names = ["tokenizer"]
+    component_names = ["tokenizer", "text_tokenizer"]
     expected_library = "transformers"
 
     def load_customized(

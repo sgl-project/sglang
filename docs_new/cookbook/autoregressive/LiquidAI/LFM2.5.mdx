@@ -1,0 +1,359 @@
+---
+title: LFM2.5
+description: "Deploy Liquid AI's LFM2.5 with SGLang — hybrid gated short conv + GQA models from 350M to the 8B-A1B MoE, plus LFM2.5-VL vision, with reasoning and Pythonic tool calling."
+tag: NEW
+---
+
+## Deployment
+
+<a id="install" />
+
+<Accordion title="Install SGLang">
+
+For all methods and hardware platforms, see the [official SGLang installation guide](../../../docs/get-started/install). The two paths below match the **Python / Docker** toggle in the command panel.
+
+<Tabs>
+
+<Tab title="Python (pip / uv)">
+
+```bash Command
+pip install --upgrade pip
+pip install uv
+uv pip install sglang
+```
+
+<Note>
+LFM2.5 support — the dense / MoE / VL model classes and the `lfm2` tool-call parser — ships on SGLang `main`. If your installed release predates it, install from source or use the Docker dev image.
+</Note>
+
+Then run the **Python** output of the command panel below in that environment.
+
+</Tab>
+
+<Tab title="Docker">
+
+LFM2.5 support ships in the pinned SGLang dev image:
+
+```bash Command
+docker pull lmsysorg/sglang:dev-cu13
+```
+
+For how to launch the image, see [Install → Method 3: Using Docker](../../../docs/get-started/install#method-3-using-docker). A minimal example (substitute the inner `sglang serve ...` with whatever the command generator below produces):
+
+```bash Command
+docker run --gpus all \
+    --shm-size 32g \
+    -p 30000:30000 \
+    -v ~/.cache/huggingface:/root/.cache/huggingface \
+    --env "HF_TOKEN=<your-hf-token>" \
+    --ipc=host \
+    lmsysorg/sglang:dev-cu13 \
+    sglang serve <use args below>
+```
+
+</Tab>
+
+</Tabs>
+
+</Accordion>
+
+Every LFM2.5 model runs on a **single GPU (TP=1)** — pick your hardware + model variant to generate the launch command. One recipe covers all operating points per variant; the commands differ only by the parsers a model needs and, on Blackwell, the attention backend. The `lfm2` tool-call parser and each reasoning model's `--reasoning-parser` are already part of the verified command.
+
+import { Deployment } from "/src/snippets/_deployment.jsx";
+import { config }     from "/src/snippets/configs/LiquidAI/lfm2.5.jsx";
+import { benchmarks } from "/src/snippets/configs/LiquidAI/lfm2.5-benchmarks.jsx";
+
+<Deployment config={config} benchmarks={benchmarks} />
+
+<div style={{fontSize: "0.85em", lineHeight: "1.55", color: "#6b7280", margin: "0.5rem 0 1rem 0"}}>
+  <p style={{margin: "0 0 0.3rem 0"}}><strong>Panel controls</strong> (top of the command box):</p>
+  <ul style={{margin: 0, paddingLeft: "1.25rem"}}>
+    <li style={{marginBottom: "0.2rem"}}><strong>Python / Docker</strong> — bare <code>sglang serve …</code> for an existing SGLang env, or a <code>docker run … sglang serve …</code> wrap against the dev image from the <a href="#install">Install SGLang</a> panel above.</li>
+    <li style={{marginBottom: "0.2rem"}}><strong>⧉ Copy</strong> — copies the current command (with whichever framing is active) to your clipboard.</li>
+    <li style={{marginBottom: "0.2rem"}}><strong>$ cURL</strong> — a sample request against <code>localhost:30000</code> to confirm the server is up.</li>
+    <li style={{marginBottom: "0.2rem"}}><strong>⚙ Env</strong> — edits the placeholders (<code>HOST_IP</code>, <code>PORT</code>, <code>HF_TOKEN</code>) the command and cURL share. Persists in localStorage across cookbooks.</li>
+    <li><strong>Verified / Not Verified</strong> badge — green when the <code>(hw, variant, quant, strategy, nodes)</code> combo has been run end-to-end on real hardware; yellow when auto-derived from a neighbor and not yet re-checked.</li>
+  </ul>
+</div>
+
+## Playground
+
+The Playground is where you experiment with **SGLang features beyond the verified matrix**. The Deploy panel above only emits combinations that have been signed off on; the Playground lets you turn on additional knobs on top of whichever cell the Deploy panel is currently showing. The base is read live from your Deploy selection — only your overrides change.
+
+For LFM2.5 the exposed knob is the **TP override** (every variant is verified at TP=1; TP=2 is available for experimentation on the larger checkpoints). The reasoning and tool-call parsers are not playground toggles here — they are variant-intrinsic and already baked into each verified command.
+
+Lines highlighted **green** are added by your overrides; lines with **red strikethrough** were in the verified base but stripped by an override. When no override differs from the base cell, the playground inherits the base's **Verified** badge; any actual change flips it to **Not Verified** until the new configuration is run end-to-end and submitted back.
+
+import { Playground } from "/src/snippets/_playground.jsx";
+
+<Playground config={config} />
+
+<div style={{fontSize: "0.85em", lineHeight: "1.55", color: "#6b7280", margin: "0.5rem 0 1rem 0"}}>
+  <p style={{margin: "0 0 0.3rem 0"}}><strong>Panel controls</strong> reuse <strong>Python / Docker</strong> · <strong>⧉ Copy</strong> · <strong>$ cURL</strong> · <strong>⚙ Env</strong> from the Deploy panel, plus one extra:</p>
+  <ul style={{margin: 0, paddingLeft: "1.25rem"}}>
+    <li><strong>Submit ↗</strong> — opens a pre-filled GitHub issue so you can land your override combo as a new verified cookbook cell. Shown only while the badge says <strong>Not Verified</strong>; click it once you've actually run the command on your hardware and confirmed it works.</li>
+  </ul>
+</div>
+
+## 1. Model Introduction
+
+LFM2.5 is [Liquid AI](https://www.liquid.ai/)'s family of hybrid models for on-device deployment, released under the [LFM Open License v1.0](https://huggingface.co/LiquidAI/LFM2.5-8B-A1B/blob/main/LICENSE). It builds on the LFM2 architecture with extended pre-training — 10T → 28T tokens for the dense models, 12T → 38T for the 8B-A1B MoE — and large-scale reinforcement learning.
+
+The backbone interleaves **gated short convolution blocks** with a small minority of **grouped query attention (GQA) blocks**. Each convolution block applies input-dependent multiplicative gating around a depthwise short convolution, giving fast local mixing at low compute and memory cost. The GQA blocks handle global context and long-range retrieval.
+
+This minimal hybrid layout was selected by a hardware-in-the-loop architecture search under edge latency and memory budgets. On CPUs it delivers up to 2× faster prefill and decode than similarly sized models (see the [LFM2 Technical Report](https://arxiv.org/abs/2511.23404)).
+
+**Key Features:**
+
+- **Hybrid gated short conv + GQA layout**: the 1.2B / 350M dense models are 16 layers (10 conv + 6 GQA); the 8B-A1B MoE is 24 layers (18 conv + 6 GQA). With only 6 attention layers per model, the KV cache stays small even at long context.
+- **Block details**: depthwise convolutions with kernel size 3; GQA with 8 KV groups and head size 64, plus RoPE and QK-Norm; pre-norm RMSNorm and SwiGLU MLPs throughout.
+- **Sparse MoE (8B-A1B)**: 8.3B total / 1.5B active parameters. Every layer except the first two replaces its dense MLP with a 32-expert MoE block; each token is routed to the top-4 SwiGLU experts by a normalized sigmoid router with adaptive bias load balancing.
+- **New in 2.5 (8B-A1B)**: the blocks are unchanged from LFM2-8B-A1B, but the context window grows from 32K to 128K (a RoPE base-θ increase plus long-context midtraining) and the vocabulary doubles from 65,536 to 128,000 tokens for more efficient non-Latin tokenization.
+- **Pythonic tool calling**: function calls are emitted as a Python list between `<|tool_call_start|>` and `<|tool_call_end|>` tokens. The `lfm2` tool-call parser surfaces these as standard `message.tool_calls`.
+- **Reasoning variants**: the 8B-A1B and 1.2B-Thinking checkpoints are reasoning-only models that always emit an explicit `<think>...</think>` chain-of-thought before the answer. The MoE's 1.5B active parameters keep those reasoning tokens cheap.
+- **Multilingual**: every model except the JP checkpoints covers at least English, Arabic, Chinese, French, German, Japanese, Korean, and Spanish (some variants add more). The dedicated JP chat checkpoints focus on Japanese (Japanese + English only).
+- **Vision**: LFM2.5-VL-1.6B pairs the 1.2B language backbone with a SigLIP2 So400M NaFlex encoder for OCR, document understanding, and multilingual vision. LFM2.5-VL-450M pairs the 350M backbone with a SigLIP2 Base-86M encoder for captioning and object detection at edge sizes; bounding-box grounding and function calling are new in the 2.5 release.
+
+**Available Models:**
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "26%"}} />
+    <col style={{width: "18%"}} />
+    <col style={{width: "12%"}} />
+    <col style={{width: "44%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Model</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Parameters</th>
+      <th style={{textAlign: "right", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Context</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Role</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong><a href="https://huggingface.co/LiquidAI/LFM2.5-8B-A1B">LFM2.5-8B-A1B</a></strong></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>8.3B total / 1.5B active (MoE)</td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.02)"}}>128K</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Reasoning-tuned, agentic / tool use</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong><a href="https://huggingface.co/LiquidAI/LFM2.5-1.2B-Instruct">LFM2.5-1.2B-Instruct</a></strong></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1.17B (dense)</td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.02)"}}>32K</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>General instruct, RAG, data extraction</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong><a href="https://huggingface.co/LiquidAI/LFM2.5-1.2B-Thinking">LFM2.5-1.2B-Thinking</a></strong></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1.17B (dense)</td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.02)"}}>32K</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Reasoning (always-on chain-of-thought)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong><a href="https://huggingface.co/LiquidAI/LFM2.5-350M">LFM2.5-350M</a></strong></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>350M (dense)</td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.02)"}}>32K</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Compact instruct, structured output</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong><a href="https://huggingface.co/LiquidAI/LFM2.5-230M">LFM2.5-230M</a></strong></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>230M (dense)</td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.02)"}}>32K</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Most compact; data extraction, structured output</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong><a href="https://huggingface.co/LiquidAI/LFM2.5-1.2B-JP-202606">LFM2.5-1.2B-JP-202606</a></strong></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1.17B (dense)</td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.02)"}}>32K</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Japanese chat (latest)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://huggingface.co/LiquidAI/LFM2.5-1.2B-JP">LFM2.5-1.2B-JP</a></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1.17B (dense)</td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.02)"}}>32K</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Japanese chat (original)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong><a href="https://huggingface.co/LiquidAI/LFM2.5-VL-1.6B">LFM2.5-VL-1.6B</a></strong></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1.2B LM + SigLIP2 400M</td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.02)"}}>32K</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Vision-language (OCR, docs, multi-image)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong><a href="https://huggingface.co/LiquidAI/LFM2.5-VL-450M">LFM2.5-VL-450M</a></strong></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>350M LM + SigLIP2 86M</td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.02)"}}>32K</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Compact vision-language (captioning, object detection)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://huggingface.co/LiquidAI/LFM2.5-1.2B-Base">LFM2.5-1.2B-Base</a></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1.17B (dense)</td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.02)"}}>32K</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Pre-trained base (no post-training)</td>
+    </tr>
+  </tbody>
+</table>
+
+The Deploy panel above covers the eight serving variants; **LFM2.5-1.2B-JP** (original — launch without `--tool-call-parser`) and the **Base** repos (pre-trained only, no post-training — see [§3.5](#35-base-checkpoints)) launch the same way with the model path swapped.
+
+**Choosing a variant:**
+
+- **8B-A1B** — flagship for agentic and tool-calling workloads; the only 128K-context option.
+- **1.2B-Thinking** — reasoning-heavy tasks: math, tool use, programming.
+- **1.2B-Instruct** — the recommended pick for chat and creative writing.
+- **350M** — tool use, data extraction, and structured output; not recommended for math, code, or creative writing.
+- **230M** — the most compact checkpoint; same use as the 350M, not for math, code, or creative writing.
+
+**License:** [LFM Open License v1.0](https://huggingface.co/LiquidAI/LFM2.5-8B-A1B/blob/main/LICENSE).
+
+**Resources:** [LFM2.5 announcement](https://www.liquid.ai/blog/introducing-lfm2-5-the-next-generation-of-on-device-ai), [LFM2.5-8B-A1B blog](https://www.liquid.ai/blog/lfm2-5-8b-a1b), [LFM docs](https://docs.liquid.ai/lfm/getting-started/welcome), [LFM2 Technical Report (arXiv:2511.23404)](https://arxiv.org/abs/2511.23404).
+
+## 2. Configuration Tips
+
+- **Reasoning parser**: LFM2.5 reasoning models wrap their chain-of-thought in `<think>...</think>` tags. The command generator passes `--reasoning-parser qwen3` for **8B-A1B** (it emits an explicit opening `<think>`) and `--reasoning-parser qwen3-thinking` for **1.2B-Thinking** (always-on reasoning). This splits the thinking process into `reasoning_content`; without it the chain-of-thought stays inline in `content`.
+- **Tool calling**: `--tool-call-parser lfm2` surfaces LFM2.5's Pythonic `<|tool_call_start|>[...]<|tool_call_end|>` calls as standard `message.tool_calls`. The original **1.2B-JP** does not expose tool calling; **Base** has no post-training (see [§3.5](#35-base-checkpoints)).
+- **Attention backend on Blackwell (B200/sm100)**: SGLang defaults to the `trtllm_mha` backend on sm100, which is fastest for the dense text models. The **8B-A1B** uses a mamba-style state cache that runs on a page-size-1 backend, so the generator picks `--attention-backend flashinfer` for it. The **VL** language model also uses that state cache and offers two backends: `--attention-backend flashinfer` (keeps prefix/radix caching — what the generator emits), or `--attention-backend trtllm_mha --disable-radix-cache` to run the language model on Blackwell `trtllm_mha` attention (`--disable-radix-cache` lifts the page-size-1 requirement, at the cost of prefix caching). Pair either with `--mm-attention-backend fa4` for the vision tower.
+- **VL vision tower (`--mm-attention-backend`)**: on sm100 the `trtllm_mha` default is fastest for text but applies *causal* attention to image tokens. For the VL model, pass `--mm-attention-backend fa4` on B200/B300 (or `fa3` on H100/H200) to restore bidirectional image-token attention and full vision quality.
+- **VL multimodal feature transport**: the generator launches the VL models with `SGLANG_USE_CUDA_IPC_TRANSPORT=1 SGLANG_USE_IPC_POOL_HANDLE_CACHE=1`. The first moves the processor→scheduler image-feature handoff onto CUDA IPC instead of serializing tensors between processes; the second ships the pool handle so the scheduler opens it once and caches it, instead of opening a per-item handle on every request. On the image serving workload (1 image @ 720p, measured on VL-1.6B on H100 and B200) this pair is worth roughly 30–50% higher image throughput and 30–40% lower image TTFT vs running without them (measured on VL-1.6B, H100 and B200); decode speed (TPOT) is unaffected.
+- **VL-450M memory headroom (`--mem-fraction-static 0.8`)**: with the default memory fraction, the 450M's small weights make SGLang size its static KV/mamba pools to nearly the whole GPU, leaving no headroom for image-feature tensors — under sustained concurrent image load the scheduler can crash with a CUDA OOM in the radix-cache free path. The generator caps `--mem-fraction-static 0.8` for VL-450M; the pool is still far larger than this model ever needs.
+- **Mamba scheduling**: LFM2.5 runs on the default `no_buffer` mamba scheduler strategy — no `--mamba-scheduler-strategy` flag is needed. The `extra_buffer` strategy (an overlap-scheduling throughput optimization available for some Gated-DeltaNet hybrids) does not apply to LFM2.5, whose convolution blocks use `mamba_chunk_size=1`.
+- **Hardware requirements**: all LFM2.5 models run on a single GPU (TP=1) on either Hopper or Blackwell. The 1.2B / 350M dense models fit in a few GB; the 8B-A1B MoE needs roughly 16 GB for bf16 weights plus KV cache. Multi-GPU tensor parallelism is not required for any variant.
+
+**Recommended sampling parameters** — pass these explicitly on every request. Some LFM2.5 checkpoints do not ship sampling defaults in `generation_config.json`, so the server will not apply them for you. `top_k`, `min_p`, and `repetition_penalty` are not standard OpenAI `chat.completions` fields — pass them through **`extra_body`** and SGLang forwards them to its sampler. Do not set `max_tokens` unless you intend to cap output, as it can truncate a response (or a reasoning model's chain-of-thought) mid-stream.
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Model</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>temperature</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>extra_body (sampler)</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr><td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>LFM2.5-8B-A1B</td><td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>0.2</td><td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>{`{"top_k": 80, "repetition_penalty": 1.05}`}</code></td></tr>
+    <tr><td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>LFM2.5-1.2B-Instruct</td><td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>0.1</td><td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>{`{"top_k": 50, "repetition_penalty": 1.05}`}</code></td></tr>
+    <tr><td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>LFM2.5-1.2B-Thinking</td><td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>0.05</td><td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>{`{"top_k": 50, "repetition_penalty": 1.05}`}</code></td></tr>
+    <tr><td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>LFM2.5-350M</td><td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>0.1</td><td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>{`{"top_k": 50, "repetition_penalty": 1.05}`}</code></td></tr>
+    <tr><td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>LFM2.5-230M</td><td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>0.1</td><td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>{`{"top_k": 50, "repetition_penalty": 1.05}`}</code></td></tr>
+    <tr><td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>LFM2.5-1.2B-JP-202606</td><td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>0.1</td><td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>{`{"top_k": 50, "repetition_penalty": 1.05}`}</code></td></tr>
+    <tr><td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>LFM2.5-1.2B-JP</td><td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>0.3</td><td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>{`{"min_p": 0.15, "repetition_penalty": 1.05}`}</code></td></tr>
+    <tr><td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>LFM2.5-VL-1.6B (text)</td><td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>0.1</td><td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>{`{"min_p": 0.15, "repetition_penalty": 1.05}`}</code></td></tr>
+    <tr><td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>LFM2.5-VL-450M (text)</td><td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>0.1</td><td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>{`{"min_p": 0.15, "repetition_penalty": 1.05}`}</code></td></tr>
+    <tr><td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>LFM2.5-1.2B-Base</td><td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>0.3</td><td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>{`{"min_p": 0.15, "repetition_penalty": 1.05}`}</code></td></tr>
+  </tbody>
+</table>
+
+## 3. Advanced Usage
+
+### 3.1 Basic Usage
+
+A single client with the recommended sampling presets applied per model (the examples in the following sections reuse this `chat` helper):
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
+
+# Non-OpenAI fields (top_k / min_p / repetition_penalty) ride in extra_body.
+SAMPLING = {
+    "LiquidAI/LFM2.5-8B-A1B":         dict(temperature=0.2,  extra_body={"top_k": 80, "repetition_penalty": 1.05}),
+    "LiquidAI/LFM2.5-1.2B-Instruct":  dict(temperature=0.1,  extra_body={"top_k": 50, "repetition_penalty": 1.05}),
+    "LiquidAI/LFM2.5-1.2B-Thinking":  dict(temperature=0.05, extra_body={"top_k": 50, "repetition_penalty": 1.05}),
+    "LiquidAI/LFM2.5-350M":           dict(temperature=0.1,  extra_body={"top_k": 50, "repetition_penalty": 1.05}),
+    "LiquidAI/LFM2.5-230M":           dict(temperature=0.1,  extra_body={"top_k": 50, "repetition_penalty": 1.05}),
+    "LiquidAI/LFM2.5-1.2B-JP-202606": dict(temperature=0.1,  extra_body={"top_k": 50, "repetition_penalty": 1.05}),
+    "LiquidAI/LFM2.5-VL-1.6B":        dict(temperature=0.1,  extra_body={"min_p": 0.15, "repetition_penalty": 1.05}),
+    "LiquidAI/LFM2.5-VL-450M":        dict(temperature=0.1,  extra_body={"min_p": 0.15, "repetition_penalty": 1.05}),
+}
+
+def chat(model, messages, **overrides):
+    cfg = SAMPLING[model]
+    body = cfg["extra_body"] | overrides.pop("extra_body", {})
+    return client.chat.completions.create(
+        model=model, messages=messages,
+        temperature=cfg["temperature"], extra_body=body, **overrides,
+    )
+
+resp = chat(
+    "LiquidAI/LFM2.5-1.2B-Instruct",
+    [{"role": "user", "content": "What is C. elegans? Answer in one sentence."}],
+)
+print(resp.choices[0].message.content)
+```
+
+### 3.2 Reasoning
+
+The 8B-A1B and 1.2B-Thinking checkpoints emit chain-of-thought as a built-in behavior. The Deploy panel launches them with the matching `--reasoning-parser`, which separates the thinking process into `reasoning_content`:
+
+```python Example
+resp = chat(
+    "LiquidAI/LFM2.5-8B-A1B",
+    [{"role": "user", "content": "If a train travels 60 km/h for 2.5 hours, how far does it go?"}],
+)
+msg = resp.choices[0].message
+print("Reasoning:", msg.reasoning_content)
+print("Answer:", msg.content)
+```
+
+### 3.3 Tool Calling
+
+LFM2.5 writes Pythonic tool calls. With `--tool-call-parser lfm2` (already part of the launch command) they are surfaced as standard `message.tool_calls`:
+
+```python Example
+resp = chat(
+    "LiquidAI/LFM2.5-1.2B-Instruct",
+    [{"role": "user", "content": "What's the weather in Paris?"}],
+    tools=[{
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get current weather for a location",
+            "parameters": {
+                "type": "object",
+                "properties": {"location": {"type": "string"}},
+                "required": ["location"],
+            },
+        },
+    }],
+)
+for call in resp.choices[0].message.tool_calls or []:
+    print(call.function.name, call.function.arguments)
+```
+
+Tool calling is supported on 8B-A1B, 1.2B-Thinking, 1.2B-Instruct, 350M, 230M, 1.2B-JP-202606, VL-1.6B, and VL-450M. For the **VL** models it is text-turn-only — do not combine an image and tools in the same turn.
+
+### 3.4 Vision Input
+
+The VL models (VL-1.6B and VL-450M) accept images via standard OpenAI multimodal content blocks. Base64 data URIs (`data:image/jpeg;base64,...`) work in place of a URL:
+
+```python Example
+resp = chat(
+    "LiquidAI/LFM2.5-VL-1.6B",
+    [{
+        "role": "user",
+        "content": [
+            {"type": "image_url", "image_url": {
+                "url": "https://cdn.britannica.com/61/93061-050-99147DCE/Statue-of-Liberty-Island-New-York-Bay.jpg"}},
+            {"type": "text", "text": "What is in this image?"},
+        ],
+    }],
+)
+print(resp.choices[0].message.content)
+```
+
+### 3.5 Base Checkpoints
+
+Each size ships a pre-trained Base repo — [LFM2.5-230M-Base](https://huggingface.co/LiquidAI/LFM2.5-230M-Base), [LFM2.5-1.2B-Base](https://huggingface.co/LiquidAI/LFM2.5-1.2B-Base), [LFM2.5-350M-Base](https://huggingface.co/LiquidAI/LFM2.5-350M-Base), and [LFM2.5-8B-A1B-Base](https://huggingface.co/LiquidAI/LFM2.5-8B-A1B-Base) — intended for fine-tuning and continued pre-training.
+
+The repos ship a ChatML-style chat template, so `chat.completions` requests format normally. The checkpoints have no post-training, though — don't expect instruction following. For raw text continuation:
+
+```python Example
+comp = client.completions.create(
+    model="LiquidAI/LFM2.5-1.2B-Base",
+    prompt="The capital of France is",
+    temperature=0.3,
+    extra_body={"min_p": 0.15, "repetition_penalty": 1.05},
+)
+print(comp.choices[0].text)
+```

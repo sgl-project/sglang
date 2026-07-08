@@ -20,7 +20,8 @@ export const Nemotron3SuperDeployment = () => {
       title: 'Hardware Platform',
       items: [
         { id: 'h200', label: 'H200', default: false },
-        { id: 'b200', label: 'B200', default: true }
+        { id: 'b200', label: 'B200', default: true },
+        { id: 'b300', label: 'B300', default: false }
       ]
     },
     tp: {
@@ -39,7 +40,10 @@ export const Nemotron3SuperDeployment = () => {
         { id: 'enabled', label: 'Enabled', default: false },
         { id: 'disabled', label: 'Disabled', default: true }
       ],
-      commandRule: (value) => value === 'enabled' ? '--speculative-algorithm EAGLE \\\n  --speculative-num-steps 3 \\\n  --speculative-eagle-topk 1 \\\n  --speculative-num-draft-tokens 4 \\\n  --disable-radix-cache' : null
+      // trtllm_mha is Blackwell-only; on B200 it replaces the flashinfer default,
+      // whose per-step plan() host-sync breaks the spec-v2 overlap scheduler. H200
+      // defaults to fa3 (no such sync), so no override is needed there.
+      commandRule: (value, state) => value === 'enabled' ? '--speculative-algorithm EAGLE \\\n  --speculative-num-steps 3 \\\n  --speculative-eagle-topk 1 \\\n  --speculative-num-draft-tokens 4 \\\n  --mamba-scheduler-strategy extra_buffer' + (state.hardware === 'b200' ? ' \\\n  --attention-backend trtllm_mha' : '') : null
     },
     kvcache: {
       name: 'kvcache',
@@ -75,7 +79,8 @@ export const Nemotron3SuperDeployment = () => {
 
     const modelPath = MODEL_PATHS[model] || MODEL_PATHS['bf16'];
 
-    let cmd = 'python3 -m sglang.launch_server \\\n';
+    const specV2Env = values.mtp === 'enabled' ? 'SGLANG_ENABLE_SPEC_V2=1 ' : '';
+    let cmd = `${specV2Env}sglang serve \\\n`;
     cmd += `  --model-path ${modelPath} \\\n`;
     cmd += `  --trust-remote-code \\\n`;
     cmd += `  --tp ${tp} \\\n`;
@@ -83,10 +88,13 @@ export const Nemotron3SuperDeployment = () => {
     if (kvcache && kvcache !== 'none') {
       cmd += `  --kv-cache-dtype ${kvcache} \\\n`;
     }
+    if (values.hardware === 'b300') {
+      cmd += `  --attention-backend flashinfer \\\n`;
+    }
 
     for (const [key, option] of Object.entries(options)) {
       if (option.commandRule) {
-        const rule = option.commandRule(values[key]);
+        const rule = option.commandRule(values[key], values);
         if (rule) {
           cmd += `  ${rule} \\\n`;
         }

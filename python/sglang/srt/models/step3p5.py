@@ -5,19 +5,15 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang.srt.distributed import (
-    get_moe_expert_parallel_world_size,
     get_pp_group,
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.dp_attention import (
-    get_attention_tp_rank,
-    get_attention_tp_size,
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layernorm import GemmaRMSNorm
@@ -50,6 +46,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.runtime_context import get_parallel, get_server_args, get_stream
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, is_cuda, is_non_idle_and_non_empty, make_layers
 
@@ -119,7 +116,7 @@ class Step3p5MoEMLP(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_size = get_parallel().tp_size
         self.layer_id = layer_id
 
         self.need_fp32_gate = config.need_fp32_gate
@@ -173,7 +170,7 @@ class Step3p5MoEMLP(nn.Module):
 
         if get_moe_a2a_backend().is_deepep():
             # TODO: we will support tp < ep in the future
-            self.ep_size = get_moe_expert_parallel_world_size()
+            self.ep_size = get_parallel().moe_ep_size
             self.moe_num_experts = (
                 config.moe_num_experts
                 + get_global_server_args().ep_num_redundant_experts
@@ -225,6 +222,8 @@ class Step3p5MoEMLP(nn.Module):
             # router_logits: (batch * sequence_length, n_experts)
             router_logits, _ = self.gate(hidden_states)
         topk_output = self.topk(hidden_states, router_logits)
+        if hasattr(topk_output, "to_standard"):
+            topk_output = topk_output.to_standard(layer_id=self.layer_id)
         if self.routed_scaling_factor != 1.0:
             topk_output = StandardTopKOutput(
                 topk_weights=topk_output.topk_weights * self.routed_scaling_factor,
@@ -351,10 +350,10 @@ class Step3p5Attention(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
-        self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_size = get_parallel().tp_size
         self.total_num_heads = num_heads
-        attn_tp_rank = get_attention_tp_rank()
-        attn_tp_size = get_attention_tp_size()
+        attn_tp_rank = get_parallel().attn_tp_rank
+        attn_tp_size = get_parallel().attn_tp_size
 
         assert self.total_num_heads % attn_tp_size == 0
         self.num_heads = self.total_num_heads // attn_tp_size
@@ -374,7 +373,7 @@ class Step3p5Attention(nn.Module):
         self.scaling = self.head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
-        self.tp_rank = get_tensor_model_parallel_rank()
+        self.tp_rank = get_parallel().tp_rank
         self.q_norm = GemmaRMSNorm(self.head_dim, eps=rms_norm_eps)
         self.k_norm = GemmaRMSNorm(self.head_dim, eps=rms_norm_eps)
 
@@ -671,7 +670,7 @@ class Step3p5Model(nn.Module):
         self.vocab_size = config.vocab_size
         self.pp_group = get_pp_group()
 
-        alt_stream = torch.cuda.Stream() if _is_cuda else None
+        alt_stream = get_stream("alt") if _is_cuda else None
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -794,6 +793,13 @@ class Step3p5ForCausalLM(nn.Module):
         "up_proj": ("gate_up_proj", 1),
     }
 
+    @classmethod
+    def get_model_config_for_expert_location(cls, config):
+        return ModelConfigForExpertLocation(
+            num_layers=config.num_hidden_layers,
+            num_logical_experts=config.moe_num_experts,
+        )
+
     def __init__(
         self,
         config: Step3p5Config,
@@ -820,7 +826,7 @@ class Step3p5ForCausalLM(nn.Module):
                     config.vocab_size,
                     config.hidden_size,
                     quant_config=quant_config,
-                    use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+                    use_attn_tp_group=get_server_args().enable_dp_lm_head,
                     prefix=add_prefix("lm_head", prefix),
                 )
         else:
@@ -1019,7 +1025,13 @@ class Step3p5ForCausalLM(nn.Module):
                         )
                         loaded_params.add(actual_param_name)
 
-        print_params = set(params_dict.keys()) - loaded_params
+        # Derived parameters (e.g. blockscale_swizzled from NVFP4 quantization)
+        # are computed in process_weights_after_loading, not loaded from checkpoint.
+        print_params = {
+            p
+            for p in set(params_dict.keys()) - loaded_params
+            if "blockscale_swizzled" not in p
+        }
         assert len(print_params) == 0, f"Some parameters are not loaded: {print_params}"
 
     def get_embed_and_head(self):

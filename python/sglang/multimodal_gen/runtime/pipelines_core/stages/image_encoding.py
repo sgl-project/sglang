@@ -44,7 +44,12 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
+from sglang.multimodal_gen.runtime.utils.precision import (
+    align_tensor_to_module_dtype,
+    autocast_enabled,
+    resolve_precision,
+    temporary_module_dtype,
+)
 
 logger = init_logger(__name__)
 
@@ -250,6 +255,14 @@ class ImageEncodingStage(PipelineStage):
                 ) as image_encoder:
                     assert image_encoder is not None
                     self.image_encoder = image_encoder
+                    if hasattr(image_inputs, "pixel_values") and isinstance(
+                        image_inputs.pixel_values, torch.Tensor
+                    ):
+                        image_inputs["pixel_values"] = align_tensor_to_module_dtype(
+                            image_inputs.pixel_values,
+                            self.image_encoder,
+                            device=cuda_device,
+                        )
                     with set_forward_context(current_timestep=0, attn_metadata=None):
                         outputs = self.image_encoder(
                             **image_inputs,
@@ -284,6 +297,24 @@ class ImageEncodingStage(PipelineStage):
                 ) as text_encoder:
                     assert text_encoder is not None
                     self.text_encoder = text_encoder
+                    if hasattr(image_inputs, "pixel_values") and isinstance(
+                        image_inputs.pixel_values, torch.Tensor
+                    ):
+                        image_inputs["pixel_values"] = align_tensor_to_module_dtype(
+                            image_inputs.pixel_values,
+                            self.text_encoder,
+                            device=cuda_device,
+                        )
+                    if (
+                        batch.do_classifier_free_guidance
+                        and hasattr(neg_image_inputs, "pixel_values")
+                        and isinstance(neg_image_inputs.pixel_values, torch.Tensor)
+                    ):
+                        neg_image_inputs["pixel_values"] = align_tensor_to_module_dtype(
+                            neg_image_inputs.pixel_values,
+                            self.text_encoder,
+                            device=cuda_device,
+                        )
                     with set_forward_context(current_timestep=0, attn_metadata=None):
                         outputs = self.text_encoder(
                             input_ids=image_inputs.input_ids,
@@ -573,10 +604,10 @@ class LTX2ImageEncodingStage(PipelineStage):
         generator: torch.Generator | None,
     ) -> torch.Tensor:
         """VAE encode → sample → per-channel normalize (LTX-2 convention)."""
-        vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
-        vae_autocast_enabled = (
-            vae_dtype != torch.float32
-        ) and not server_args.disable_autocast
+        vae_dtype = resolve_precision(
+            server_args, "vae", precision_attr="vae_precision"
+        )
+        vae_autocast_enabled = autocast_enabled(vae_dtype, server_args.disable_autocast)
 
         with torch.autocast(
             device_type=current_platform.device_type,
@@ -588,7 +619,13 @@ class LTX2ImageEncodingStage(PipelineStage):
                     self.vae.enable_tiling()
             except Exception:
                 pass
-            latent_dist = self.vae.encode(video_condition)
+            should_cast_vae = not vae_autocast_enabled
+            if not vae_autocast_enabled:
+                video_condition = video_condition.to(vae_dtype)
+            with temporary_module_dtype(
+                self.vae, vae_dtype, enabled=should_cast_vae
+            ) as vae:
+                latent_dist = vae.encode(video_condition)
             if isinstance(latent_dist, AutoencoderKLOutput):
                 latent_dist = latent_dist.latent_dist
 
@@ -610,10 +647,10 @@ class LTX2ImageEncodingStage(PipelineStage):
         self, video_condition: torch.Tensor, server_args: ServerArgs
     ) -> torch.Tensor:
         """LTX-2.3 condition-image encoder path (bypasses VAE)."""
-        vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
-        vae_autocast_enabled = (
-            vae_dtype != torch.float32
-        ) and not server_args.disable_autocast
+        vae_dtype = resolve_precision(
+            server_args, "vae", precision_attr="vae_precision"
+        )
+        vae_autocast_enabled = autocast_enabled(vae_dtype, server_args.disable_autocast)
 
         with torch.autocast(
             device_type=current_platform.device_type,
@@ -816,7 +853,9 @@ class ImageVAEEncodingStage(PipelineStage):
     def component_uses(
         self, server_args: ServerArgs, stage_name: str | None = None
     ) -> list[ComponentUse]:
-        vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
+        vae_dtype = resolve_precision(
+            server_args, self.component_name, precision_attr="vae_precision"
+        )
         stage_name = self._component_stage_name(stage_name)
         return [
             ComponentUse(
@@ -851,11 +890,11 @@ class ImageVAEEncodingStage(PipelineStage):
             server_args.pipeline_config, "prepare_condition_image_latent_ids", None
         )
         condition_latents = [] if callable(prepare_condition_image_latent_ids) else None
-        # Setup VAE precision
-        vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
-        vae_autocast_enabled = (
-            vae_dtype != torch.float32
-        ) and not server_args.disable_autocast
+        # Setup VAE precision from user policy.
+        vae_dtype = resolve_precision(
+            server_args, self.component_name, precision_attr="vae_precision"
+        )
+        vae_autocast_enabled = autocast_enabled(vae_dtype, server_args.disable_autocast)
 
         with self.use_declared_component(
             component_name=self.component_name,
@@ -902,11 +941,18 @@ class ImageVAEEncodingStage(PipelineStage):
                         self.vae.enable_tiling()
                     # if server_args.vae_sp:
                     #     self.vae.enable_parallel()
+                    should_cast_vae = not vae_autocast_enabled
                     if not vae_autocast_enabled:
                         video_condition = video_condition.to(vae_dtype)
-                    latent_dist: DiagonalGaussianDistribution = self.vae.encode(
-                        video_condition
+                    video_condition = server_args.pipeline_config.preprocess_vae_encode(
+                        video_condition, self.vae
                     )
+                    with temporary_module_dtype(
+                        self.vae, vae_dtype, enabled=should_cast_vae
+                    ) as vae:
+                        latent_dist: DiagonalGaussianDistribution = vae.encode(
+                            video_condition
+                        )
                     # for auto_encoder from diffusers
                     if isinstance(latent_dist, AutoencoderKLOutput):
                         latent_dist = latent_dist.latent_dist
@@ -939,15 +985,9 @@ class ImageVAEEncodingStage(PipelineStage):
                         )
                     )
 
-                    # apply shift & scale if needed
-                    if isinstance(shift_factor, torch.Tensor):
-                        shift_factor = shift_factor.to(latent_condition.device)
-
-                    if isinstance(scaling_factor, torch.Tensor):
-                        scaling_factor = scaling_factor.to(latent_condition.device)
-
-                    latent_condition -= shift_factor
-                    latent_condition = latent_condition * scaling_factor
+                    latent_condition = self.scale_and_shift_encode_latents(
+                        latent_condition, scaling_factor, shift_factor
+                    )
                 else:
                     latent_condition = normalized_latent_condition
 
@@ -964,6 +1004,19 @@ class ImageVAEEncodingStage(PipelineStage):
             prepare_condition_image_latent_ids(condition_latents, batch)
 
         return batch
+
+    @staticmethod
+    def scale_and_shift_encode_latents(
+        latents: torch.Tensor, scaling_factor, shift_factor
+    ) -> torch.Tensor:
+        if shift_factor is not None:
+            if isinstance(shift_factor, torch.Tensor):
+                shift_factor = shift_factor.to(latents.device)
+            latents -= shift_factor
+
+        if isinstance(scaling_factor, torch.Tensor):
+            scaling_factor = scaling_factor.to(latents.device)
+        return latents * scaling_factor
 
     def build_dedup_fingerprint(
         self, batch: Req, server_args: ServerArgs
@@ -992,8 +1045,20 @@ class ImageVAEEncodingStage(PipelineStage):
         sample_mode: str = "sample",
     ):
         if sample_mode == "sample":
+            if hasattr(encoder_output, "latent_dist"):
+                return encoder_output.latent_dist.sample(generator)
+            if hasattr(encoder_output, "latent"):
+                return encoder_output.latent
+            if hasattr(encoder_output, "latents"):
+                return encoder_output.latents
             return encoder_output.sample(generator)
         elif sample_mode == "argmax":
+            if hasattr(encoder_output, "latent_dist"):
+                return encoder_output.latent_dist.mode()
+            if hasattr(encoder_output, "latent"):
+                return encoder_output.latent
+            if hasattr(encoder_output, "latents"):
+                return encoder_output.latents
             return encoder_output.mode()
         else:
             raise AttributeError("Could not access latents of provided encoder_output")

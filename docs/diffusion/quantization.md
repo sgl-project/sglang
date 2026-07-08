@@ -125,7 +125,7 @@ official `black-forest-labs/FLUX.2-dev-NVFP4` repo.
 | `FP8` | `Qwen/Qwen-Image-Edit-2511` | `--transformer-path` | `lmsys/qwen-image-edit-modelopt-fp8-sglang-transformer` | TI2I edit path, BF16-vs-FP8 image comparison, H100 benchmark | shares `QwenImageTransformer2DModel` with Qwen Image and uses the same Qwen Image FP8 fallback preset |
 | `NVFP4` | `black-forest-labs/FLUX.1-dev` | `--transformer-path` | `lmsys/flux1-dev-modelopt-nvfp4-sglang-transformer` | mixed BF16+NVFP4 transformer override, correctness validation, 4x RTX 5090 benchmark, torch-profiler trace | use `build_modelopt_nvfp4_transformer.py`; validated builder keeps selected FLUX.1 modules in BF16 and sets `swap_weight_nibbles=false` |
 | `NVFP4` | `black-forest-labs/FLUX.2-dev` | `--transformer-weights-path` | `black-forest-labs/FLUX.2-dev-NVFP4` | packed-QKV load path | official raw export repo; validated packed export detection and runtime layout handling |
-| `NVFP4` | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | `--transformer-path` | `lmsys/wan22-t2v-a14b-modelopt-nvfp4-sglang-transformer` | primary `transformer` quantized with ModelOpt NVFP4, `transformer_2` kept BF16 | primary-transformer-only path; keep `transformer_2` on the base checkpoint, and current B200/Blackwell bring-up uses `SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND=cudnn` |
+| `NVFP4` | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | `--transformer-path` | `lmsys/wan22-t2v-a14b-modelopt-nvfp4-sglang-transformer` | primary `transformer` quantized with ModelOpt NVFP4, `transformer_2` kept BF16 | primary-transformer-only path; keep `transformer_2` on the base checkpoint; the default FP4 GEMM backend is `flashinfer_trtllm` |
 
 These nine checkpoints are also the intended case set for the B200 diffusion
 CI job (`multimodal-gen-test-1-b200`).
@@ -261,7 +261,6 @@ For a dual-transformer Wan2.2 export where only the primary `transformer`
 was quantized:
 
 ```bash
-SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND=cudnn \
 sglang generate \
   --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers \
   --transformer-path lmsys/wan22-t2v-a14b-modelopt-nvfp4-sglang-transformer \
@@ -279,20 +278,15 @@ sglang generate \
   primary `--transformer-path` override targets only `transformer`. Use a
   per-component override such as `--transformer-2-path` only when you
   intentionally want a non-default `transformer_2`.
-- On Blackwell, the validated Wan2.2 ModelOpt NVFP4 path currently prefers
-  FlashInfer FP4 GEMM via
-  `SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND=cudnn`.
-- This environment-variable override is a current workaround for NVFP4 cases
-  where the default sglang JIT/CUTLASS `sm100` path rejects a large-M shape at
-  `can_implement()`. The intended long-term fix is to add a validated CUTLASS
-  fallback for those shapes rather than rely on the override.
+- On Blackwell, the diffusion ModelOpt NVFP4 path defaults to FlashInfer
+  TensorRT-LLM FP4 GEMM (`flashinfer_trtllm`).
 - Direct `--model-path` loading is a compatibility path for FLUX.2 NVFP4-style
   repos or local directories.
 - If `--transformer-weights-path` is provided explicitly, it takes precedence
   over the compatibility `--model-path` flow.
 - For local directories, SGLang first looks for `*-mixed.safetensors`, then
   falls back to loading from the directory.
-- To force the generic diffusion ModelOpt FP4 path onto a specific FlashInfer
+- To force the diffusion ModelOpt FP4 path onto a different FlashInfer
   backend, set `SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND`. Supported values
   include `flashinfer_cudnn`, `flashinfer_cutlass`, and `flashinfer_trtllm`.
 - On disk, the quantization config stays `quant_method=modelopt` with

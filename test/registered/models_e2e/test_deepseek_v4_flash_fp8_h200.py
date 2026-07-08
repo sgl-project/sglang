@@ -5,7 +5,7 @@ with FP4 experts disabled via SGLANG_DSV4_FP4_EXPERTS=0.
 Runs 12 ServerSanity probes (correctness, streaming, concurrency, determinism)
 plus a GSM8K accuracy gate.
 
-Registry: base-c-test-dsv4-8-gpu-h200 (per-commit, 8x H200 — only 4 used by TP=4)
+Registry: extra-b-test-deepep-8-gpu-h200 (label-gated, 8x H200 — only 4 used by TP=4)
 """
 
 import unittest
@@ -14,6 +14,7 @@ from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.basic_decode_correctness_kit import BasicDecodeCorrectnessMixin
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
+from sglang.test.kits.spec_decoding_kit import SpecDecodingMixin
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -21,7 +22,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=280, stage="base-c", runner_config="dsv4-8-gpu-h200")
+register_cuda_ci(est_time=280, stage="extra-b", runner_config="deepep-8-gpu-h200")
 
 MODEL_FP8 = "sgl-project/DeepSeek-V4-Flash-FP8"
 SERVER_LAUNCH_TIMEOUT = 3600
@@ -29,6 +30,7 @@ DEEPEP_CONFIG = '{"normal_dispatch":{"num_sms":96},"normal_combine":{"num_sms":9
 
 
 class TestDSV4FlashFP8H200(
+    SpecDecodingMixin,
     BasicDecodeCorrectnessMixin,
     GSM8KMixin,
     CustomTestCase,
@@ -36,6 +38,8 @@ class TestDSV4FlashFP8H200(
     """LowLatency recipe: TP=4, Marlin FP4, EAGLE spec decoding."""
 
     gsm8k_accuracy_thres = 0.93
+    accept_length_thres = 1.8
+    bs_1_speed_thres = 140
 
     @classmethod
     def setUpClass(cls):
@@ -62,7 +66,7 @@ class TestDSV4FlashFP8H200(
                 "1",
                 "--speculative-num-draft-tokens",
                 "2",
-                "--cuda-graph-max-bs",
+                "--cuda-graph-max-bs-decode",
                 "128",
                 "--max-running-requests",
                 "128",
