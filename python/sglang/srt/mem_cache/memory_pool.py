@@ -1457,7 +1457,7 @@ class MHATokenToKVPool(KVCache):
         return not isinstance(self.quant_method, UnquantizedKVCacheMethod)
 
     def _create_buffers(self):
-        if not isinstance(self.quant_method, UnquantizedKVCacheMethod):
+        if self.is_quantized_kv_cache:
             # Quantized recipes own packed-data, scale, and workspace shapes.
             with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
                 with (
@@ -1580,7 +1580,7 @@ class MHATokenToKVPool(KVCache):
 
         self._init_data_ptrs_and_strides()
 
-    def _slot_move_buffers(self):
+    def _slot_move_pointer_buffers(self):
         """Buffers that must move together when KV slots are remapped.
 
         FP4 KV cache stores data and per-block scales separately, so slot moves
@@ -1603,14 +1603,17 @@ class MHATokenToKVPool(KVCache):
             dtype=torch.uint64,
             device=self.device,
         )
-        slot_move_buffers = self._slot_move_buffers()
+        slot_move_pointer_buffers = self._slot_move_pointer_buffers()
         self.data_ptrs = torch.tensor(
-            [x.data_ptr() for x in slot_move_buffers],
+            [x.data_ptr() for x in slot_move_pointer_buffers],
             dtype=torch.uint64,
             device=self.device,
         )
         self.data_strides = torch.tensor(
-            [np.prod(x.shape[1:]) * x.dtype.itemsize for x in slot_move_buffers],
+            [
+                np.prod(x.shape[1:]) * x.dtype.itemsize
+                for x in slot_move_pointer_buffers
+            ],
             device=self.device,
         )
 
@@ -1911,7 +1914,7 @@ class MHATokenToKVPool(KVCache):
             v_scale,
         )
 
-    def get_raw_fp4_kv_buffer(
+    def get_raw_kv_buffer(
         self, layer_id: int
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         local_layer_id = layer_id - self.start_layer
@@ -1924,14 +1927,70 @@ class MHATokenToKVPool(KVCache):
             self.v_scale_buffer[local_layer_id].view(torch.float8_e4m3fn),
         )
 
-    def get_fp8_workspace(self) -> tuple[torch.Tensor, torch.Tensor]:
+    def get_dequant_workspace(self) -> tuple[torch.Tensor, torch.Tensor]:
         if self.dq_k_buffer is None or self.dq_v_buffer is None:
             raise RuntimeError(
                 "Dequant workspace requested from a KV pool without FP4 dequant buffers."
             )
         return self.dq_k_buffer, self.dq_v_buffer
 
-    def prepare_fp8_extend_workspace(
+    def get_flashinfer_quantized_kv_buffer(
+        self,
+        layer: RadixAttention,
+        req_to_token: torch.Tensor,
+        req_pool_indices_cpu,
+        extend_prefix_lens_cpu,
+        extend_seq_lens_cpu,
+        page_size: int,
+        *,
+        prepare_workspace: bool,
+        use_ragged: bool,
+        k_cur: Optional[torch.Tensor] = None,
+        v_cur: Optional[torch.Tensor] = None,
+        layer_id_override: Optional[int] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the FlashInfer FP8 KV view for a quantized KV cache.
+
+        FlashInfer prefill consumes FP8 KV. Quantized pools store packed FP4 plus
+        per-block scales, so the pool owns the dequant workspace and returns the
+        view shape expected by FlashInfer.
+        """
+        if not self.is_quantized_kv_cache:
+            raise RuntimeError(
+                "FlashInfer quantized KV buffer requested from a non-quantized KV pool."
+            )
+
+        if prepare_workspace:
+            transfer_cur_kv = not use_ragged
+            k_cur_fp8 = (
+                k_cur.to(torch.float8_e4m3fn)
+                if k_cur is not None and transfer_cur_kv
+                else None
+            )
+            v_cur_fp8 = (
+                v_cur.to(torch.float8_e4m3fn)
+                if v_cur is not None and transfer_cur_kv
+                else None
+            )
+            self._prepare_dequant_extend_workspace(
+                layer.layer_id if layer_id_override is None else layer_id_override,
+                layer.layer_id,
+                req_to_token,
+                req_pool_indices_cpu,
+                extend_prefix_lens_cpu,
+                extend_seq_lens_cpu,
+                page_size,
+                k_cur_fp8=k_cur_fp8,
+                v_cur_fp8=v_cur_fp8,
+            )
+
+        k_buffer_dq, v_buffer_dq = self.get_dequant_workspace()
+        return (
+            k_buffer_dq.view(-1, layer.tp_k_head_num, layer.head_dim),
+            v_buffer_dq.view(-1, layer.tp_v_head_num, layer.head_dim),
+        )
+
+    def _prepare_dequant_extend_workspace(
         self,
         layer_id: int,
         global_layer_id: int,
@@ -1950,8 +2009,8 @@ class MHATokenToKVPool(KVCache):
         The current extend chunk can already be FP8 and is copied into the same
         workspace after the prefix region.
         """
-        k_fp4, v_fp4, k_scales, v_scales = self.get_raw_fp4_kv_buffer(layer_id)
-        dq_k, dq_v = self.get_fp8_workspace()
+        k_fp4, v_fp4, k_scales, v_scales = self.get_raw_kv_buffer(layer_id)
+        dq_k, dq_v = self.get_dequant_workspace()
 
         cur_batch_start_loc_cpu = 0
         cur_token_idx_dq = page_size
@@ -2740,23 +2799,21 @@ class HybridLinearKVPool(KVCache):
         layer_id = self._transfer_full_attention_id(layer_id)
         return self.full_kv_pool.get_kv_buffer(layer_id)
 
-    def get_raw_fp4_kv_buffer(
+    def get_raw_kv_buffer(
         self, layer_id: int
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         self._wait_for_layer(layer_id)
         layer_id = self._transfer_full_attention_id(layer_id)
-        return self.full_kv_pool.get_raw_fp4_kv_buffer(layer_id)
+        return self.full_kv_pool.get_raw_kv_buffer(layer_id)
 
-    def get_fp8_workspace(self) -> tuple[torch.Tensor, torch.Tensor]:
-        return self.full_kv_pool.get_fp8_workspace()
+    def get_dequant_workspace(self) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.full_kv_pool.get_dequant_workspace()
 
-    def prepare_fp8_extend_workspace(
-        self, layer_id: int, global_layer_id: int, *args, **kwargs
-    ):
-        self._wait_for_layer(layer_id)
-        local_layer_id = self._transfer_full_attention_id(layer_id)
-        return self.full_kv_pool.prepare_fp8_extend_workspace(
-            local_layer_id, global_layer_id, *args, **kwargs
+    def get_flashinfer_quantized_kv_buffer(self, layer, *args, **kwargs):
+        self._wait_for_layer(layer.layer_id)
+        local_layer_id = self._transfer_full_attention_id(layer.layer_id)
+        return self.full_kv_pool.get_flashinfer_quantized_kv_buffer(
+            layer, *args, layer_id_override=local_layer_id, **kwargs
         )
 
     @contextmanager

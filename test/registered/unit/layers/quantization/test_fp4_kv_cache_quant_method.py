@@ -65,8 +65,18 @@ class TestKVCacheQuantRegistry(CustomTestCase):
             resolve_kv_cache_quant,
         )
 
-        with self.assertRaises(ValueError):
+        with self.assertRaisesRegex(ValueError, "fp4_mx_block16"):
             resolve_kv_cache_quant("fp4_e2m1")
+
+    def test_model_runner_rejects_legacy_fp4_alias(self):
+        from types import SimpleNamespace
+
+        from sglang.srt.model_executor.model_runner import ModelRunner
+
+        runner = object.__new__(ModelRunner)
+        runner.server_args = SimpleNamespace(kv_cache_dtype="fp4_e2m1")
+        with self.assertRaisesRegex(ValueError, "fp4_mx_block16"):
+            runner.configure_kv_cache_dtype()
 
     def test_resolve_mxfp4_name_raises(self):
         from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (

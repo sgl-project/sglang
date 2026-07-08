@@ -496,8 +496,8 @@ def resolve_kv_cache_quant(kv_cache_dtype) -> Optional[str]:
 
     if kv_cache_dtype == "fp4_e2m1":
         raise ValueError(
-            "--kv-cache-dtype=fp4_e2m1 no longer auto-selects an FP4 KV recipe. "
-            "Use --kv-cache-dtype=nvfp4 or --kv-cache-dtype=fp4_mx_block16."
+            "--kv-cache-dtype=fp4_e2m1 is deprecated. "
+            "Use --kv-cache-dtype=fp4_mx_block16."
         )
     if kv_cache_dtype == "mxfp4":
         raise ValueError(

@@ -99,6 +99,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         super().__init__(
             model_runner, skip_prefill, kv_indptr_buf, kv_last_page_len_buf
         )
+        self.is_nvfp4_kvcache = (
+            getattr(self.kv_cache_quant_method, "name", None) == "nvfp4"
+        )
 
         config = model_runner.model_config
 
@@ -786,13 +789,15 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         return k_cache, v_cache
 
     def _get_nvfp4_bmm_scales(self, layer: RadixAttention) -> tuple[float, float]:
+        assert self.is_nvfp4_kvcache
         return self.kv_cache_quant_method.get_bmm_scales(layer.layer_id)
 
     def _get_nvfp4_decode_kv_cache(self, layer: RadixAttention) -> tuple[
         tuple[torch.Tensor, torch.Tensor],
         tuple[torch.Tensor, torch.Tensor],
     ]:
-        k_fp4, v_fp4, k_scale, v_scale = self.token_to_kv_pool.get_raw_fp4_kv_buffer(
+        assert self.is_nvfp4_kvcache
+        k_fp4, v_fp4, k_scale, v_scale = self.token_to_kv_pool.get_raw_kv_buffer(
             layer.layer_id
         )
         kv_cache = self._reshape_paged_kv_cache(

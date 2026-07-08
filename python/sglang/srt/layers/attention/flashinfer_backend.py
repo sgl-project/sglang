@@ -1106,36 +1106,17 @@ class FlashInferAttnBackend(AttentionBackend):
         # We perform dequant for chunk prefill/cache reuse.
         pool = self.token_to_kv_pool
         if self.is_nvfp4_kvcache:
-            if self.dq_page_table is not None:
-                # Paged prefill reads prefix + current chunk from the FP8 workspace.
-                # Ragged prefill reads the current chunk directly from raw k/v.
-                transfer_cur_kv = not self.forward_metadata.use_ragged
-                k_cur_fp8 = (
-                    k.to(torch.float8_e4m3fn)
-                    if k is not None and transfer_cur_kv
-                    else None
-                )
-                v_cur_fp8 = (
-                    v.to(torch.float8_e4m3fn)
-                    if v is not None and transfer_cur_kv
-                    else None
-                )
-                self.token_to_kv_pool.prepare_fp8_extend_workspace(
-                    layer.layer_id,
-                    layer.layer_id,
-                    self.req_to_token_pool.req_to_token,
-                    self.cpu_req_pool_indices,
-                    forward_batch.extend_prefix_lens_cpu,
-                    forward_batch.extend_seq_lens_cpu,
-                    self.page_size,
-                    k_cur_fp8=k_cur_fp8,
-                    v_cur_fp8=v_cur_fp8,
-                )
-
-            k_buffer_dq, v_buffer_dq = self.token_to_kv_pool.get_fp8_workspace()
-            kv_cache = (
-                k_buffer_dq.view(-1, layer.tp_k_head_num, layer.head_dim),
-                v_buffer_dq.view(-1, layer.tp_v_head_num, layer.head_dim),
+            kv_cache = pool.get_flashinfer_quantized_kv_buffer(
+                layer,
+                self.req_to_token_pool.req_to_token,
+                self.cpu_req_pool_indices,
+                forward_batch.extend_prefix_lens_cpu,
+                forward_batch.extend_seq_lens_cpu,
+                self.page_size,
+                prepare_workspace=self.dq_page_table is not None,
+                use_ragged=self.forward_metadata.use_ragged,
+                k_cur=k,
+                v_cur=v,
             )
         else:
             kv_cache = pool.get_kv_buffer(layer.layer_id)

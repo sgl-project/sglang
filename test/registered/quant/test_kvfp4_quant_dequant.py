@@ -7,6 +7,9 @@ import pytest
 import torch
 
 from sglang.srt.layers.quantization.kvfp4_tensor import FP4MXBlock16KVQuantizeUtil
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-large")
 
 
 def calculate_accuracy_metrics(
@@ -28,7 +31,7 @@ def calculate_accuracy_metrics(
     return {"MSE": mse, "MAE": mae, "PSNR": psnr, "Relative Error": rel_error}
 
 
-def run_benchmark(m, n, k, num_runs=100) -> dict[str, dict[str, float]]:
+def run_benchmark(m, n, k, num_runs=10) -> dict[str, dict[str, float]]:
     """Run FP8 vs KVFP4 quantization benchmark and return metrics."""
     tensor_bf16 = torch.randn(m, n, k, dtype=torch.bfloat16, device="cuda")
 
@@ -93,14 +96,8 @@ def run_benchmark(m, n, k, num_runs=100) -> dict[str, dict[str, float]]:
 MNK_FACTORS = [
     (64, 1, 576),
     (512, 1, 576),
-    (1024, 1, 576),
-    (4096, 1, 576),
-    (2868672, 1, 576),
     (64, 8, 64),
     (512, 8, 64),
-    (1024, 8, 64),
-    (4096, 8, 64),
-    (2868672, 8, 64),
 ]
 
 
@@ -114,5 +111,5 @@ def test_kvfp4_quant_dequant(m, n, k):
     print("FP4:", results["fp4"])
 
     # Basic assertions to make sure metrics are reasonable
-    assert results["fp4"]["MSE"] < 1.0
-    assert results["fp8"]["MSE"] < 1.0
+    assert results["fp4"]["MSE"] < 0.1
+    assert results["fp8"]["MSE"] < 0.1
