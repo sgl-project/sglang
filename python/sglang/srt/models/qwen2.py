@@ -53,6 +53,7 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, make_layers
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
+from sglang.srt.utils.offloader import ALL_MODEL_PARAMS
 
 Qwen2Config = None
 
@@ -318,6 +319,7 @@ class Qwen2Model(nn.Module):
             pp_rank=self.pp_group.rank_in_group,
             pp_size=self.pp_group.world_size,
             prefix=add_prefix("layers", prefix),
+            offloader_kwargs=ALL_MODEL_PARAMS,
         )
         if self.pp_group.is_last_rank:
             norm_kwargs = (

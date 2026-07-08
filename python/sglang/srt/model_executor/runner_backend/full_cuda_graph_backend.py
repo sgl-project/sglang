@@ -34,6 +34,7 @@ from sglang.srt.model_executor.runner_utils.pool import (
     get_or_create_global_graph_memory_pool,
 )
 from sglang.srt.utils import get_bool_env_var
+from sglang.srt.utils.offloader import OffloaderV2, get_offloader
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 if TYPE_CHECKING:
@@ -107,8 +108,19 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         else:
             graph_ctx = self._device_module.graph
 
+        # (OffloaderV2) Drain alt_stream before capture starts so any eager
+        # prefetches are settled outside the graph. Then, inside the
+        # capture context, join any alt_stream prefetches issued during
+        # forward back into the capture stream before ``capture_end``;
+        # otherwise CUDA reports ``cudaErrorStreamCaptureUnjoined``.
+        offloader = get_offloader()
+        if isinstance(offloader, OffloaderV2):
+            offloader.wait_for_prev_onload()
+
         with graph_ctx(cuda_graph=graph, pool=self._pool, stream=self._capture_stream):
             out = forward_fn()
+            if isinstance(offloader, OffloaderV2):
+                offloader.join_after_forward()
 
         self._graphs[shape_key] = graph
         self._outputs[shape_key] = out
@@ -126,6 +138,12 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         static_forward_batch: ForwardBatch,
         **kwargs,
     ) -> Any:
+        # (OffloaderV2) Drain alt_stream so any prefetches issued eagerly
+        # by the previous forward complete before this replay reads / mutates
+        # the same static parameter buffers.
+        offloader = get_offloader()
+        if isinstance(offloader, OffloaderV2):
+            offloader.wait_for_prev_onload()
         self._graphs[shape_key].replay()
         return self._outputs[shape_key]
 
