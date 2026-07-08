@@ -758,6 +758,13 @@ class ModelConfig:
             self.kv_lora_rank = self.hf_text_config.kv_lora_rank
             self.qk_nope_head_dim = self.hf_text_config.qk_nope_head_dim
             self.qk_rope_head_dim = self.hf_text_config.qk_rope_head_dim
+            qk_head_dim = getattr(self.hf_text_config, "qk_head_dim", None)
+            if (
+                qk_head_dim is not None
+                and self.qk_nope_head_dim + self.qk_rope_head_dim != qk_head_dim
+            ):
+                self.qk_rope_head_dim = qk_head_dim - self.qk_nope_head_dim
+                self.hf_text_config.qk_rope_head_dim = self.qk_rope_head_dim
             self.v_head_dim = self.hf_text_config.v_head_dim
             self.index_head_dim = (
                 get_dsa_index_head_dim(self.hf_text_config)
