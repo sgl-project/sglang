@@ -80,14 +80,6 @@ inline auto get_cached_workspace(size_t required_bytes, int device_id, cudaStrea
   return ws.ptr;
 }
 
-inline int getSMVersion(int device_id) {
-  int sm_major = 0;
-  int sm_minor = 0;
-  RuntimeDeviceCheck(cudaDeviceGetAttribute(&sm_major, cudaDevAttrComputeCapabilityMajor, device_id));
-  RuntimeDeviceCheck(cudaDeviceGetAttribute(&sm_minor, cudaDevAttrComputeCapabilityMinor, device_id));
-  return sm_major * 10 + sm_minor;
-}
-
 template <
     typename ElementAB,
     typename ElementC,
