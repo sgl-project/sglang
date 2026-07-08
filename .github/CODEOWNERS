@@ -24,7 +24,7 @@
 /python/sglang/srt/dllm @ClawSeven @btw616
 /python/sglang/srt/entrypoints @ispobock @CatherineSue @slin1237 @merrymercy @JustinTong0323
 /python/sglang/srt/entrypoints/anthropic @JustinTong0323
-/python/sglang/srt/entrypoints/openai @JustinTong0323 @merrymercy
+/python/sglang/srt/entrypoints/openai @JustinTong0323
 /python/sglang/srt/entrypoints/engine_score_mixin.py @sundar24295s @chanh @fortunecookiee
 /python/sglang/srt/entrypoints/grpc_server.py @CatherineSue @slin1237
 /python/sglang/srt/entrypoints/openai/serving_score.py @sundar24295s @chanh @fortunecookiee
