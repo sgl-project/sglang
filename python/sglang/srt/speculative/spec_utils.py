@@ -591,13 +591,6 @@ def prepare_mamba_track_for_verify(batch: ScheduleBatch) -> None:
     if not get_global_server_args().enable_mamba_extra_buffer():
         return
     set_mamba_track_indices_from_reqs(batch)
-    if torch.distributed.get_rank() == 0:
-        print(
-            f"[MB_VERIFY_TRACK] bs={len(batch.reqs)} "
-            f"mamba_track_indices={batch.mamba_track_indices.tolist() if batch.mamba_track_indices is not None else None} "
-            f"seq_lens={batch.seq_lens.tolist()}",
-            flush=True,
-        )
     batch.mamba_track_mask = None
     batch.mamba_track_seqlens = None
 
@@ -651,29 +644,10 @@ def commit_mamba_states_after_verify(
             seq_lens_pre_verify = batch.seq_lens
             seq_lens_post_verify = batch.seq_lens + accept_lens
             mamba_track_interval = get_global_server_args().mamba_track_interval
-            pre_quot = seq_lens_pre_verify // mamba_track_interval
-            post_quot = seq_lens_post_verify // mamba_track_interval
-            to_track_mask = pre_quot != post_quot
-
-            if torch.distributed.get_rank() == 0:
-                # Debug: dump full crossing logic inputs
-                print(
-                    f"[MB_VERIFY_CROSS] mamba_track_interval={mamba_track_interval} "
-                    f"seq_lens_pre={seq_lens_pre_verify.tolist()} "
-                    f"seq_lens_post={seq_lens_post_verify.tolist()} "
-                    f"pre//interval={pre_quot.tolist()} post//interval={post_quot.tolist()} "
-                    f"to_track_mask={to_track_mask.tolist()} "
-                    f"accept_lens={accept_lens.tolist()}",
-                    flush=True,
-                )
-            # to_track_ith picks the verify step whose SSM state corresponds to
-            # the track boundary. Verify positions are [seq_lens_pre, ...,
-            # seq_lens_pre+accept_lens-1] at steps [0, ..., accept_lens-1].
-            # When tracking_point lies inside the verify range, select the
-            # matching step; when it equals seq_lens_post, clamp to the last
-            # accepted step. The original `- 1` formula overshot by one step
-            # when the boundary falls inside the range (Case A), giving the
-            # state at a position one token BEFORE the actual boundary.
+            to_track_mask = (
+                seq_lens_pre_verify // mamba_track_interval
+                != seq_lens_post_verify // mamba_track_interval
+            )
             tracking_point = (
                 seq_lens_post_verify // mamba_track_interval * mamba_track_interval
             )
@@ -694,14 +668,7 @@ def commit_mamba_states_after_verify(
             )
         else:
             mamba_steps_to_track = None
-        if torch.distributed.get_rank() == 0:
-            print(
-                f"[MB_VERIFY_COMMIT] bs={bs} accept_lens={accept_lens.tolist()} "
-                f"mamba_track_indices={batch.mamba_track_indices.tolist() if batch.mamba_track_indices is not None else None} "
-                f"mamba_steps_to_track={mamba_steps_to_track.tolist() if mamba_steps_to_track is not None else None} "
-                f"last_correct_step_indices={last_correct_step_indices.tolist()}",
-                flush=True,
-            )
+
         attn_backend.update_mamba_state_after_mtp_verify(
             last_correct_step_indices=last_correct_step_indices,
             mamba_track_indices=batch.mamba_track_indices,

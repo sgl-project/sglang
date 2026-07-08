@@ -1588,15 +1588,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         if not batch.forward_mode.is_idle():
             accept_tokens = predict[accept_index]
-            # Log accepted tokens at crossing boundaries and at regular intervals
-            seq_lens = batch.seq_lens.cpu().tolist()
-            block = accept_tokens.view(bs, -1)[0].cpu().tolist()[:8]
-            if torch.distributed.get_rank() == 0:
-                print(
-                    f"[MB_ACCEPT] seq_lens={seq_lens} accept_lens={accept_lens.cpu().tolist()} "
-                    f"accepted_ids={block}",
-                    flush=True,
-                )
             bonus_tokens = torch.empty_like(accept_lens, dtype=torch.int32)
             # stride = accept_tokens per-req width = accept_index.shape[1]
             # (spec_steps + 1); NOT num_draft_tokens, wrong for topk > 1 trees.
