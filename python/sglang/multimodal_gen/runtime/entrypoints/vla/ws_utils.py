@@ -9,7 +9,7 @@ from typing import Any
 
 from fastapi import WebSocket, WebSocketDisconnect
 
-from sglang.multimodal_gen.runtime.entrypoints.action_utils import (
+from sglang.multimodal_gen.runtime.entrypoints.vla.protocol import (
     action_metadata,
     infer_action,
     pack_msgpack,

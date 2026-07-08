@@ -12,7 +12,7 @@ from sglang.multimodal_gen.configs.sample.sampling_params import (
     SamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.vla import VLASamplingParams
-from sglang.multimodal_gen.runtime.entrypoints.action_utils import (
+from sglang.multimodal_gen.runtime.entrypoints.vla.protocol import (
     action_generation_response,
     action_metadata,
     action_raw_response,

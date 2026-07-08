@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Request, Response, WebSocket
 
-from sglang.multimodal_gen.runtime.entrypoints.action_utils import (
+from sglang.multimodal_gen.runtime.entrypoints.vla.protocol import (
     action_generation_response,
     action_metadata,
     action_raw_response,

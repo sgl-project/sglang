@@ -26,7 +26,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if sys.path and Path(sys.path[0]).resolve() == SCRIPT_DIR:
     sys.path.pop(0)
 
-from sglang.multimodal_gen.runtime.entrypoints.action_utils import (  # noqa: E402
+from sglang.multimodal_gen.runtime.entrypoints.vla.protocol import (  # noqa: E402
     pack_msgpack,
     unpack_msgpack,
 )
@@ -638,10 +638,10 @@ def create_sglang_python_pipeline(
 
 
 def _make_sglang_python_req(server_args, payload: dict[str, Any]):
-    from sglang.multimodal_gen.runtime.entrypoints.action_utils import (
+    from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
+    from sglang.multimodal_gen.runtime.entrypoints.vla.protocol import (
         build_action_sampling_params,
     )
-    from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
 
     sampling_params = build_action_sampling_params(payload, server_args)
     req = prepare_request(server_args, sampling_params)
@@ -686,7 +686,7 @@ def run_sglang_python(
         model_path,
         pipeline_config_path=pipeline_config_path,
     )
-    from sglang.multimodal_gen.runtime.entrypoints.action_utils import action_metadata
+    from sglang.multimodal_gen.runtime.entrypoints.vla.protocol import action_metadata
 
     metadata = action_metadata(server_args)
     metadata["precision"] = sglang_precision_metadata(pipeline)
