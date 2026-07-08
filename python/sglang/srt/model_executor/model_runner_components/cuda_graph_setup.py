@@ -198,29 +198,39 @@ def capture_prefill_graph(
     prefill_config = model_runner.server_args.cuda_graph_config.prefill
     prefill_backend = prefill_config.backend
     context_length = model_runner.model_config.context_len
-    supports_multi_request_capture = prefill_backend in (
-        Backend.TC_PIECEWISE,
-        Backend.BREAKABLE,
-    )
-    max_capture_requests = (
-        model_runner.req_to_token_pool.size if supports_multi_request_capture else 1
-    )
+    if prefill_backend == Backend.FULL:
+        max_capture_requests = prefill_config.full_prefill_max_req
+        if max_capture_requests is None:
+            max_capture_requests = max(
+                model_runner.server_args.chunked_prefill_size // 512, 1
+            )
+        max_capture_requests = min(
+            max_capture_requests, model_runner.req_to_token_pool.size
+        )
+        # Resolve Full's fixed request-axis shape once, just like bs below.
+        prefill_config.full_prefill_max_req = max_capture_requests
+    else:
+        max_capture_requests = model_runner.req_to_token_pool.size
+    # The capture dummy batch has at most max_capture_requests rows, and
+    # each row can contain at most context_length tokens. Their product is
+    # therefore the largest aggregate-token bucket capture can represent.
     max_capture_tokens = max_capture_requests * context_length
     capture_num_tokens = sorted(
         num_tokens
         for num_tokens in prefill_config.bs
         if num_tokens <= max_capture_tokens
     )
-    # Resolve the legal buckets once before constructing the runner so
-    # every capture backend consumes the same in-place configuration.
+    # Resolve the context- and request-capacity-bounded buckets once before
+    # constructing the runner so every backend consumes the same config.
     prefill_config.bs = capture_num_tokens
     if not capture_num_tokens:
         logger.warning(
             "Disable prefill CUDA graph capture because no configured "
             "capture size fits backend=%s with max_capture_tokens=%s "
-            "(context_length=%s, request-pool size=%s).",
+            "(max_capture_requests=%s, context_length=%s, request-pool size=%s).",
             prefill_backend,
             max_capture_tokens,
+            max_capture_requests,
             context_length,
             model_runner.req_to_token_pool.size,
         )

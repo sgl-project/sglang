@@ -276,10 +276,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self._is_full_backend = isinstance(self.backend, FullCudaGraphBackend)
         if self._is_full_backend:
             max_req = prefill_config.full_prefill_max_req
-            if max_req is None:
-                # Auto: scale request slots with the chunked prefill size.
-                max_req = max(model_runner.server_args.chunked_prefill_size // 512, 1)
-            self._capture_req_slots = min(max_req, self.max_bs)
+            assert max_req is not None, "full_prefill_max_req must be resolved"
+            self._capture_req_slots = max_req
             self._full_cg_seq_lens_cpu = torch.zeros(
                 (self._capture_req_slots,), dtype=torch.int64, device="cpu"
             )
@@ -734,27 +732,26 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         Returns ``(forward_batch, attn_backend)`` to mirror decode's
         capture_prepare signature.
         """
+        context_length = self.model_runner.model_config.context_len
+        # A prefill bucket is an aggregate token count. Capture it as the
+        # fewest synthetic requests, with every request containing no more
+        # than context_length tokens.
+        capture_seq_lens = [
+            min(context_length, num_tokens - start)
+            for start in range(0, num_tokens, context_length)
+        ]
         if self.prefill_backend_name == Backend.FULL:
-            bs = self._capture_req_slots
-            # Slot 0 carries num_tokens; slots 1..bs-1 are zero-length sentinels.
-            capture_seq_lens = [num_tokens] + [0] * (bs - 1)
-            capture_start_locs = [0] + [num_tokens] * (bs - 1)
-        else:
-            context_length = self.model_runner.model_config.context_len
-            # Build a dummy prefill batch with num_tokens aggregate tokens while
-            # keeping every synthetic request at or below context_length.
-            capture_seq_lens = [
-                min(context_length, num_tokens - start)
-                for start in range(0, num_tokens, context_length)
-            ]
-            bs = len(capture_seq_lens)
-            assert bs <= self.max_bs, (
-                f"Capture batch needs {bs} request slots for {num_tokens} tokens, "
-                f"but the request pool has only {self.max_bs}."
-            )
-            capture_start_locs = [0]
-            for seq_len in capture_seq_lens[:-1]:
-                capture_start_locs.append(capture_start_locs[-1] + seq_len)
+            # Full captures a fixed request-axis shape; unused slots are
+            # zero-length sentinels after the context-bounded real requests.
+            capture_seq_lens += [0] * (self._capture_req_slots - len(capture_seq_lens))
+        bs = len(capture_seq_lens)
+        assert bs <= self.max_bs, (
+            f"Capture batch needs {bs} request slots for {num_tokens} tokens, "
+            f"but the request pool has only {self.max_bs}."
+        )
+        capture_start_locs = [0]
+        for seq_len in capture_seq_lens[:-1]:
+            capture_start_locs.append(capture_start_locs[-1] + seq_len)
 
         with torch.device(self.device):
             shape_inputs = {
