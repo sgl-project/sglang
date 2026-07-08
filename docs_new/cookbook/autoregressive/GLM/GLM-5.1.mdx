@@ -94,7 +94,7 @@ import { GLM51Deployment } from '/src/snippets/autoregressive/glm-51-deployment.
 
 - **H100 and H200**: FP8 is the recommended deployment path.
 - **B300 and GB300**: NVFP4 is the recommended deployment path. Use `nvidia/GLM-5.1-NVFP4` with `--quantization modelopt_fp4`. Use `tp=8` on B300 and `tp=4` on GB300. The CUDA 13 image variant is required for B300 and GB300.
-- **AMD GPUs**: BF16 and FP8 checkpoints run on MI300X/MI325X/MI355X at tp=8. On MI355X (gfx950), the MXFP4 checkpoint `amd/GLM-5.1-MXFP4` is also supported at tp=4 with `--kv-cache-dtype fp8_e4m3`. All AMD paths pass `--dsa-prefill-backend tilelang --dsa-decode-backend tilelang`, `--chunked-prefill-size 131072`, and `--watchdog-timeout 1200` (20 minutes for weight loading). FP8 uses approximately half the memory of BF16 (~89 GB/GPU vs ~175 GB/GPU). EAGLE speculative decoding is supported on MI355X (gfx950) and unverified on MI300X/MI325X (gfx942).
+- **AMD GPUs**: BF16 and FP8 checkpoints run on MI300X/MI325X/MI355X at tp=8. On MI355X (gfx950), the MXFP4 checkpoint `amd/GLM-5.1-MXFP4` is also supported at tp=4 with `--kv-cache-dtype fp8_e4m3`. All AMD paths pass `--dsa-prefill-backend tilelang --dsa-decode-backend tilelang`, `--chunked-prefill-size 131072`, and `--watchdog-timeout 1200` (20 minutes for weight loading). FP8 uses approximately half the memory of BF16 (~89 GB/GPU vs ~175 GB/GPU). EAGLE speculative decoding is supported on AMD GPUs: MI300X/MI325X (gfx942) and MI355X (gfx950), but it **requires `--disable-custom-all-reduce`** — the aiter custom all-reduce kernel deadlocks during EAGLE verify at high concurrency, so without this flag the server will hang.
 - For other configuration tips (MTP, DSA kernel, Context Parallel, HiSparse, NVFP4, Index Cache), see the [DeepSeek-V3.2 cookbook page](../DeepSeek/DeepSeek-V3_2). GLM-5.1 and DeepSeek-V3.2 share the same model structure, so the optimization techniques are common.
 - Use `--json-model-override-args '{"index_topk_pattern": "FFSFSSSFSSFFFSSSFFFSFSSSSSSFFSFFSFFSSFFFFFFSFFFFFSFFSSSSSSFSFFFSFSSSFSFFSFFSSS"}'` to enable the [IndexCache](https://github.com/THUDM/IndexCache) method for GLM-5.1. This can improve serving efficiency with only a small accuracy loss. If you are running rigorous accuracy evaluations, do not enable this feature.
 
@@ -183,6 +183,7 @@ SGLANG_DSA_TRITON_PREFILL=1 sglang serve \
   --speculative-num-steps 3 \
   --speculative-eagle-topk 1 \
   --speculative-num-draft-tokens 4 \
+  --disable-custom-all-reduce \
   --host 0.0.0.0 \
   --port 30000
 ```
@@ -201,6 +202,11 @@ sglang serve \
   --chunked-prefill-size 131072 \
   --mem-fraction-static 0.80 \
   --watchdog-timeout 1200 \
+  --speculative-algorithm EAGLE \
+  --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 4 \
+  --disable-custom-all-reduce \
   --host 0.0.0.0 \
   --port 30000
 ```
@@ -217,6 +223,11 @@ sglang serve \
   --chunked-prefill-size 131072 \
   --mem-fraction-static 0.80 \
   --watchdog-timeout 1200 \
+  --speculative-algorithm EAGLE \
+  --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 4 \
+  --disable-custom-all-reduce \
   --host 0.0.0.0 \
   --port 30000
 ```

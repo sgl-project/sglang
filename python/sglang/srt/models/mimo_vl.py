@@ -301,6 +301,11 @@ class MiMoVisionTransformer(nn.Module):
         self.merger = Qwen2_5_VisionPatchMerger(
             dim=vision_config.out_hidden_size,
             context_dim=hidden_size,
+            # MiMo-VL's merger MLP is square (intermediate == context_dim * merge**2),
+            # so no dim padding is needed. The Qwen2.5-VL formula num_heads * head_dim
+            # over-sizes it here because MiMo uses qk_channels (64) for head_dim rather
+            # than hidden_size // num_heads, which would mismatch the checkpoint.
+            padded_context_dim=hidden_size,
             spatial_merge_size=spatial_merge_size,
             quant_config=quant_config,
             prefix=add_prefix("merger", prefix),
@@ -377,8 +382,11 @@ class MiMoVisionTransformer(nn.Module):
 
             pos_ids.append(torch.stack([hpos_ids, wpos_ids], dim=-1).repeat(t, 1))
         pos_ids = torch.cat(pos_ids, dim=0)
-        max_grid_size = grid_thw[:, 1:].max()
-        rotary_pos_emb_full = self.rotary_pos_emb(max_grid_size)
+        max_grid_size = int(grid_thw[:, 1:].max())
+        # transformers 5.12's rotary forward takes 1-D position_ids on the input device (grid_thw is CPU).
+        rotary_pos_emb_full = self.rotary_pos_emb(
+            torch.arange(max_grid_size, device=self.device)
+        )
         rotary_pos_emb = rotary_pos_emb_full[pos_ids].flatten(1)
         return rotary_pos_emb
 

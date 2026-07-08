@@ -111,6 +111,7 @@ class RelayPayload:
     topk_index: Optional[torch.Tensor] = None
     hidden_states: Optional[torch.Tensor] = None
     draft_probs: Optional[torch.Tensor] = None
+    dsa_topk_indices: Optional[torch.Tensor] = None
 
     @classmethod
     def from_draft_input(cls, draft_input: EagleDraftInput) -> RelayPayload:
@@ -120,6 +121,7 @@ class RelayPayload:
             topk_index=draft_input.topk_index,
             hidden_states=draft_input.hidden_states,
             draft_probs=getattr(draft_input, "draft_probs", None),
+            dsa_topk_indices=getattr(draft_input, "dsa_topk_indices", None),
         )
 
 
@@ -216,6 +218,15 @@ class FutureMap:
                 device=self.device,
             )
 
+        self.dsa_topk_indices_buf = None
+        if payload.dsa_topk_indices is not None:
+            seed0 = payload.dsa_topk_indices[0]
+            self.dsa_topk_indices_buf = torch.empty(
+                (self.req_pool_size, *seed0.shape),
+                dtype=payload.dsa_topk_indices.dtype,
+                device=self.device,
+            )
+
     def _resolve_spec_extras(self, batch: ScheduleBatch) -> None:
         if self.spec_algo.is_ngram():
             # FIXME: remove once precomputed draft is supported.
@@ -223,10 +234,6 @@ class FutureMap:
         draft_input: EagleDraftInput = batch.spec_info
         if draft_input is None:
             # FIXME(lsyin): only prefill; not compatible with mixed mode
-            return
-        if self.spec_algo.is_dflash() and getattr(
-            draft_input, "direct_carry_valid", False
-        ):
             return
         indices = draft_input.future_indices
         if indices.shape[0] == 0:
@@ -259,6 +266,8 @@ class FutureMap:
             draft_input.bonus_tokens = self.output_tokens_buf[indices]
         if self.need_hidden_states and not self.need_topk:
             draft_input.hidden_states = self.hidden_states_buf[indices]
+        if self.dsa_topk_indices_buf is not None:
+            draft_input.dsa_topk_indices = self.dsa_topk_indices_buf[indices]
         if _DEBUG_ASSERT:
             _assert_nonneg_and_invalidate(
                 draft_input.bonus_tokens, self.output_tokens_buf, indices
@@ -266,17 +275,10 @@ class FutureMap:
 
     def resolve_seq_lens_cpu(self, batch: ScheduleBatch) -> None:
         # Lazy pull from new_seq_lens_buf for spec_v2 (accept_lens not known to
-        # schedule). DFLASH intentionally keeps host-side lengths lagging and
-        # uses its carried KV allocation watermark for planning, so only the GPU
-        # seq_lens is resolved there. Other spec-v2 algorithms still need the CPU
-        # mirror for host planning; use a private D2H stream for those copies.
+        # schedule). The CPU mirror is gated by needs_cpu_seq_lens; backends that
+        # opt out take the GPU-only path below. A private D2H stream overlaps the copy.
         draft_input = batch.spec_info
         if draft_input is None:
-            return
-        if self.spec_algo.is_dflash() and getattr(
-            draft_input, "direct_carry_valid", False
-        ):
-            batch.seq_lens = draft_input.new_seq_lens
             return
 
         fi = draft_input.future_indices
@@ -289,11 +291,6 @@ class FutureMap:
             else:
                 self.publish_ready.wait()
         batch.seq_lens = self.new_seq_lens_buf[fi]
-
-        if self.spec_algo.is_dflash():
-            # DFLASH keeps seq_lens_cpu as the lagging committed host view;
-            # planning/reserved host lengths live on DFlashDraftInputV2.
-            return
 
         if not self.needs_cpu_seq_lens:
             # GPU gather above is kept (SB.seq_lens must advance each verify);
@@ -354,3 +351,10 @@ class FutureMap:
             )
         if self.draft_probs_buf is not None and payload.draft_probs is not None:
             self.draft_probs_buf[indices] = payload.draft_probs
+        if (
+            self.dsa_topk_indices_buf is not None
+            and payload.dsa_topk_indices is not None
+        ):
+            self.dsa_topk_indices_buf[indices] = payload.dsa_topk_indices.to(
+                self.dsa_topk_indices_buf.dtype
+            )

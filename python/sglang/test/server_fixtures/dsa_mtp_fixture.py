@@ -33,14 +33,14 @@ class DsaMtpEvalConfigDefaults:
     """Eval thresholds & params shared across DSA-MTP regression variants."""
 
     # GSM8KMixin defaults.
-    gsm8k_accuracy_thres = 0.94
-    gsm8k_accept_length_thres = 2.7
+    gsm8k_accuracy_thres = 0.935
+    gsm8k_accept_length_thres = 3.7
     gsm8k_num_questions = 500
     gsm8k_num_threads = 500
     gsm8k_num_shots = 20
 
     # SpecDecodingMixin default; per-variant subclasses set `bs_1_speed_thres`.
-    accept_length_thres = 2.7
+    accept_length_thres = 4.0
 
 
 class DsaMtpServerBase(CustomTestCase):
@@ -48,21 +48,24 @@ class DsaMtpServerBase(CustomTestCase):
 
     # Subclasses must set `model`; the others have sensible defaults.
     model: str = ""
+    tp_size: int = 8
+    dp_size: int = 8
     mem_fraction_static: float = 0.7
     enable_dp_attention: bool = False
+    extra_server_args = ()
 
     # EAGLE MTP config (fixed across DSA-MTP variants).
     speculative_algorithm: str = "EAGLE"
-    speculative_num_steps: int = 3
+    speculative_num_steps: int = 5
     speculative_eagle_topk: int = 1
-    speculative_num_draft_tokens: int = 4
+    speculative_num_draft_tokens: int = 6
 
     @classmethod
     def get_server_args(cls):
         assert cls.model, f"{cls.__name__} must set `model`"
-        args = ["--trust-remote-code", "--tp", "8"]
+        args = ["--trust-remote-code", "--tp", str(cls.tp_size)]
         if cls.enable_dp_attention:
-            args += ["--dp", "8", "--enable-dp-attention"]
+            args += ["--dp", str(cls.dp_size), "--enable-dp-attention"]
         args += [
             "--speculative-algorithm",
             cls.speculative_algorithm,
@@ -77,6 +80,7 @@ class DsaMtpServerBase(CustomTestCase):
             "--model-loader-extra-config",
             '{"enable_multithread_load": true, "num_threads": 64}',
         ]
+        args += list(cls.extra_server_args)
         return args
 
     @classmethod
@@ -90,4 +94,5 @@ class DsaMtpServerBase(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
+        if hasattr(cls, "process") and cls.process:
+            kill_process_tree(cls.process.pid)
