@@ -4,90 +4,20 @@ from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from mechanical_refactor_generate_proof import (
     infer_recipe,
     recipe_to_script,
 )
 
-
-def _git(repo: Path, *args: str) -> str:
-    return subprocess.run(
-        ["git", *args], cwd=repo, check=True, capture_output=True, text=True
-    ).stdout.strip()
-
-
-def _write(repo: Path, **files: str | None) -> None:
-    for name, content in files.items():
-        path = repo / name.replace("__", "/")
-        if content is None:
-            path.unlink()
-        else:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(content)
-
-
-def _commit(repo: Path, message: str) -> str:
-    _git(repo, "add", "-A")
-    _git(repo, "commit", "-q", "-m", message)
-    return _git(repo, "rev-parse", "HEAD")
-
-
-@pytest.fixture
-def repo(tmp_path: Path) -> Path:
-    root = tmp_path / "repo"
-    root.mkdir()
-    _git(root, "init", "-q")
-    _git(root, "config", "user.email", "test@example.com")
-    _git(root, "config", "user.name", "test")
-    _git(root, "config", "commit.gpgsign", "false")
-    return root
-
-
-def _method_onto_class(repo: Path) -> None:
-    """Stage a base + a 'move foo from M onto C, lower the caller' commit."""
-    _write(
-        repo,
-        **{
-            "model.py": (
-                "class M:\n"
-                "    @staticmethod\n"
-                "    def foo(self, x):\n"
-                "        return x + 1\n"
-                "\n"
-                "    def other(self):\n"
-                "        return 0\n"
-            ),
-            "comp.py": "class C:\n    def keep(self):\n        return 1\n",
-            "caller.py": (
-                "class K:\n"
-                "    def run(self):\n"
-                "        from model import M\n"
-                "\n"
-                "        return M.foo(self.c, 9)\n"
-            ),
-        },
-    )
-    _commit(repo, "base")
-    _write(
-        repo,
-        **{
-            "model.py": "class M:\n    def other(self):\n        return 0\n",
-            "comp.py": (
-                "class C:\n"
-                "    def keep(self):\n"
-                "        return 1\n"
-                "\n"
-                "    def foo(self, x):\n"
-                "        return x + 1\n"
-            ),
-            "caller.py": (
-                "class K:\n    def run(self):\n        return self.c.foo(9)\n"
-            ),
-        },
-    )
-    _commit(repo, "move foo onto C")
+from generate_testlib import (  # noqa: F401
+    _commit,
+    _free_function_move_with_module_level_caller,
+    _git,
+    _method_onto_class,
+    _write,
+)
 
 
 def test_infer_recipe_method_onto_class(repo: Path) -> None:
@@ -415,45 +345,6 @@ def test_infer_recipe_free_function_source_move_repaths_caller(repo: Path) -> No
     ]
 
 
-def test_recipe_to_script_is_self_contained_and_ordered(repo: Path) -> None:
-    """The emitted script imports only the reproduce util and lowers before moving."""
-    _method_onto_class(repo)
-    script = recipe_to_script(infer_recipe("HEAD", str(repo)), "move foo onto C")
-    assert "from mechanical_refactor_reproduce_utils import Repro" in script
-    assert script.index("lower_call_sites") < script.index("move_symbol")
-    assert "r.run()" in script
-    # importing nothing else from the skill keeps the script auditable in isolation
-    assert "mechanical_refactor_verify_utils" not in script
-    assert "mechanical_refactor_generate_proof" not in script
-
-
-def _free_function_move_with_module_level_caller(repo: Path) -> None:
-    """Stage a free function moved model.py -> util.py whose caller imports it at module
-    level (so the repoint shows up in the symmetric module-level import diff)."""
-    _write(
-        repo,
-        **{
-            "model.py": "def keep():\n    return 0\n\n\ndef resolve(m):\n    return m\n",
-            "util.py": "import os\n",
-            "caller.py": (
-                "from model import resolve\n\n\ndef run(m):\n    return resolve(m)\n"
-            ),
-        },
-    )
-    _commit(repo, "base")
-    _write(
-        repo,
-        **{
-            "model.py": "def keep():\n    return 0\n",
-            "util.py": "import os\n\n\ndef resolve(m):\n    return m\n",
-            "caller.py": (
-                "from util import resolve\n\n\ndef run(m):\n    return resolve(m)\n"
-            ),
-        },
-    )
-    _commit(repo, "move resolve to util")
-
-
 def test_infer_recipe_module_level_import_repoint_realised_by_diff(repo: Path) -> None:
     """A module-level consumer whose import is repointed old -> new yields a remove of the old
     name and an add of the new -- not a reliance on the formatter pruning a duplicate.
@@ -470,15 +361,6 @@ def test_infer_recipe_module_level_import_repoint_realised_by_diff(repo: Path) -
     assert {"path": "caller.py", "text": "from util import resolve"} in (
         recipe.import_additions
     )
-
-
-def test_recipe_to_script_orders_import_ops_after_moves(repo: Path) -> None:
-    """The emitted script applies module-level import add/remove AFTER the move, matching
-    build_repro's run order so the script and the in-process verdict cannot diverge."""
-    _free_function_move_with_module_level_caller(repo)
-    script = recipe_to_script(infer_recipe("HEAD", str(repo)), "move resolve to util")
-    assert script.index("move_symbol") < script.index("remove_imported_name")
-    assert script.index("move_symbol") < script.index("add_import")
 
 
 def test_infer_recipe_removes_an_import_the_source_no_longer_uses(repo: Path) -> None:
@@ -767,17 +649,3 @@ def test_infer_recipe_records_the_source_class_for_disambiguation(repo: Path) ->
     assert [mv["from_class"] for mv in recipe.moves] == ["M"]
     script = recipe_to_script(recipe, "move M.foo onto C")
     assert "from_class='M'" in script
-
-
-def test_per_file_diff_keeps_content_lines_starting_with_plus_signs(repo: Path) -> None:
-    """An added content line beginning with '++' is collected, not mistaken for a header."""
-    from mechanical_refactor_generate_proof import _per_file_diff
-
-    _write(repo, **{"notes.py": "a = 1\n"})
-    _commit(repo, "base")
-    _write(repo, **{"notes.py": 'a = 1\nb = "++x"\n'})
-    commit = _commit(repo, "add plus-plus line")
-
-    files = _per_file_diff(commit, str(repo))
-
-    assert files["notes.py"]["added"] == ['b = "++x"']
