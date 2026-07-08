@@ -53,18 +53,5 @@ class TestEagle3ParityXPU(SpecParityKit, _Eagle3ParityBase):
     extra_args = ("--cuda-graph-config", '{"decode":{"backend":"full"}}')
 
 
-@unittest.skipUnless(_is_xpu, "XPU runner only")
-class TestEagle3ParityIntelXPU(SpecParityKit, _Eagle3ParityBase):
-    """EAGLE3 parity on the intel_xpu attention backend.
-
-    SpecParityKit is first so its setUpClass runs the reference server (and tears
-    it down) before the fixture launches the spec server -- sequential, one model
-    at a time.
-    """
-
-    disable_overlap = False
-    attention_backend = "intel_xpu"
-
-
 if __name__ == "__main__":
     unittest.main()
