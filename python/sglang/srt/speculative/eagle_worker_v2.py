@@ -87,6 +87,7 @@ from sglang.srt.speculative.spec_utils import (
     record_stream_each,
     record_stream_for_v2_verify,
     renorm_draft_probs,
+    sample_draft_proposal,
     select_top_k_tokens,
     spec_stage_span,
 )
@@ -698,12 +699,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     logits_output.next_token_logits, f"draft_forward step {i}"
                 )
                 if self.server_args.speculative_use_rejection_sampling:
-                    probs = renorm_draft_probs(
+                    probs, topk_p, topk_index = sample_draft_proposal(
                         logits_output.next_token_logits,
-                        forward_batch.sampling_info,
-                        self.server_args.speculative_use_rejection_sampling,
+                        forward_batch.sampling_info.temperatures,
                     )
-                    topk_p, topk_index = fast_sample(probs, num_samples=1)
                     draft_probs_list.append(probs)
                 elif self.topk == 1 and not _is_hip:
                     topk_index = torch.argmax(
@@ -997,13 +996,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         # The draft-extend graph only anchors full logits; selected-row topk is
         # owned by the worker for both graph and eager paths.
         if self.server_args.speculative_use_rejection_sampling:
-            probs = renorm_draft_probs(
+            ret_draft_probs, ret_topk_p, ret_topk_index = sample_draft_proposal(
                 draft_logits_output.next_token_logits,
-                batch.sampling_info,
-                self.server_args.speculative_use_rejection_sampling,
+                batch.sampling_info.temperatures,
             )
-            ret_topk_p, ret_topk_index = fast_sample(probs, num_samples=1)
-            ret_draft_probs = probs
         elif self.topk == 1 and not _is_hip:
             # Gated to CUDA: see #26358 — ROCm's argmax tie-break corrupts
             # MTP draft selection on FP8 logits.

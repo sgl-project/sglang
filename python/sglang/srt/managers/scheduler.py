@@ -866,12 +866,15 @@ class Scheduler(
         self.init_tp_model_worker()
         self.maybe_init_draft_worker()
 
-        # Allocate KV cache pools for all workers.
+        # Prepare KV cache pools for all workers
         self.init_memory_pools()
 
-        # TODO: make memory profile consider cuda graph memory as well
         self.init_all_attention_backends()
         self.init_all_cuda_graphs()
+
+        model_runner = self.tp_worker.model_runner
+        if model_runner.token_to_kv_pool.post_capture_active:
+            model_runner.post_capture_resize_kv_pool()
 
         # Dispatch the model worker
         if self.spec_algorithm.is_none():
