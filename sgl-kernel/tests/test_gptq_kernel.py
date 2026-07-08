@@ -2,7 +2,7 @@ import sys
 
 import pytest
 import torch
-from sgl_kernel import gptq_gemm
+from sgl_kernel import gptq_gemm, gptq_shuffle
 
 from sglang.srt.layers.quantization.utils import pack_cols, pack_rows
 
@@ -127,6 +127,36 @@ def test_gptq_gemm(M, N, K, bit, group_size, use_shuffle, dtype):
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
     _test_gptq_gemm_once(M, N, K, bit, group_size, use_shuffle, dtype, "cuda")
+
+
+@pytest.mark.parametrize("use_perm", [False, True])
+def test_gptq_shuffle_wrapper(use_perm):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+
+    bit = 4
+    q_weight = torch.tensor(
+        [
+            [0x76543210, 0x12345678],
+            [0x07654321, 0x01234567],
+            [0x13572468, 0x02468135],
+            [0x11112222, 0x33334444],
+        ],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    if use_perm:
+        q_perm = torch.arange(31, -1, -1, dtype=torch.int32, device="cuda")
+    else:
+        q_perm = torch.empty((0,), dtype=torch.int32, device="cuda")
+
+    expected = q_weight.clone()
+    torch.ops.sgl_kernel.gptq_shuffle(expected, q_perm, bit)
+
+    actual = q_weight.clone()
+    gptq_shuffle(actual, q_perm, bit)
+
+    torch.testing.assert_close(actual, expected)
 
 
 if __name__ == "__main__":

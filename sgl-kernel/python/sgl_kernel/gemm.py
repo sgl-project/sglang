@@ -217,4 +217,4 @@ def gptq_gemm(
 
 
 def gptq_shuffle(q_weight: torch.Tensor, q_perm: torch.Tensor, bit: int) -> None:
-    torch.torch.ops.sgl_kernel.gptq_shuffle(q_weight, q_perm, bit)
+    torch.ops.sgl_kernel.gptq_shuffle(q_weight, q_perm, bit)
