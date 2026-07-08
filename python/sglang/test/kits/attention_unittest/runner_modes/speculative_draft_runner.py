@@ -390,7 +390,9 @@ def _build_frozen_kv_mtp_fixture(
         runner_batch_size=settings.capture_batch_size,
     )
     _configure_runner_for_eagle_draft(fixture.runner, case, settings)
-    fixture.runner.server_args.speculative_algorithm = "FROZEN_KV_MTP"
+    fixture.runner.server_args.override(
+        "attention_unittest.frozen_kv_draft", speculative_algorithm="FROZEN_KV_MTP"
+    )
     fixture.runner.spec_algorithm = SpeculativeAlgorithm.FROZEN_KV_MTP
     fixture.runner.draft_attn_backend = fixture.backend
     fixture.runner.attn_backend = fixture.backend
