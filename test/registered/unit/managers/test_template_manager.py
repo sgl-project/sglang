@@ -128,6 +128,20 @@ class TestTemplateDetectionRuleMatrix(unittest.TestCase):
     PARSER_RULES_MATRIX = [
         # (name, template_snippet, vocab, expected_parser, expected_toggle_param)
         (
+            "qwen3_5_no_enable_thinking",
+            "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>assistant\n<think>\nThinking...\n</think>\n",
+            [],
+            "qwen3",
+            None,
+        ),
+        (
+            "deepseek_v4_reasoning_effort",
+            "{% if reasoning_effort is defined %}<think>...</think><｜Assistant｜>",
+            [],
+            "deepseek-v3",
+            None,
+        ),
+        (
             "apertus2509_via_unique_vocab_token",
             "{% set enable_thinking = enable_thinking if enable_thinking is defined else true %}\n",
             ["<|inner_prefix|>"],
