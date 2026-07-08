@@ -271,16 +271,54 @@ class CaptureFlags(_FlagGroupBase):
 
 
 @dataclasses.dataclass
+class MoeFlags(_FlagGroupBase):
+    """MoE runtime flags, materialized by ``initialize_moe_config`` (scheduler
+    init, after distributed setup). ``a2a_backend`` / ``runner_backend`` /
+    ``disable_fp4_allgather`` are the ACTIVE values: the speculative contexts
+    in ``layers.moe.utils`` swap them around draft-model forwards. Values are
+    the parsed enums from ``layers.moe.utils``; ``None`` means "not
+    initialized yet" and the accessors fall back lazily.
+    """
+
+    a2a_backend: Any = None
+    runner_backend: Any = None
+    speculative_runner_backend: Any = None
+    speculative_a2a_backend: Any = None
+    deepep_mode: Any = None
+    deepep_config: str | None = None
+    tbo_enabled: bool | None = None
+    sbo_enabled: bool | None = None
+    tbo_token_distribution_threshold: float | None = None
+    disable_fp4_allgather: bool | None = None
+    quantization: str | None = None
+
+
+@dataclasses.dataclass
+class DpFlags(_FlagGroupBase):
+    """DP-attention runtime flags, materialized by ``initialize_dp_attention``
+    (after distributed setup; reads the model config). Topology values
+    (sizes/ranks) stay on ``layers.dp_attention`` until the parallel vertical
+    migrates them."""
+
+    enabled: bool = False
+    # Hybrid-SSM models materialize idle ranks via the MAX_LEN fabricated-row
+    # conversion (set when hf_config has hybrid_override_pattern).
+    max_len_with_idle: bool = False
+
+
+@dataclasses.dataclass
 class Flags(_FlagGroupBase):
     """Root of the runtime-flags tier.
 
     Resolved configuration lives on ``server_args`` fields (materialized at
     the end of ``__post_init__``) — this tier only carries genuine runtime
     state whose value is not a function of the configuration alone, grouped
-    by lifecycle (today: ``capture``).
+    by lifecycle (``capture``) or subsystem (``moe`` / ``dp``).
     """
 
     capture: CaptureFlags = dataclasses.field(default_factory=CaptureFlags)
+    moe: MoeFlags = dataclasses.field(default_factory=MoeFlags)
+    dp: DpFlags = dataclasses.field(default_factory=DpFlags)
 
 
 class RuntimeContext:

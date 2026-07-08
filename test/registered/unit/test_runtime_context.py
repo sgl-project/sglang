@@ -265,6 +265,108 @@ class _FakeResolvedArgs:
     _resolved_overrides: list = dataclasses.field(default_factory=list)
 
 
+class TestMoeFlagsGroup(_IsolatedServerArgs):
+    """flags.moe: materialized by initialize_moe_config; the ACTIVE backends
+    swap under the speculative contexts and restore on exit."""
+
+    def _init(self, **kw):
+        from types import SimpleNamespace
+
+        from sglang.srt.layers.moe.utils import initialize_moe_config
+
+        defaults = dict(
+            moe_a2a_backend="none",
+            moe_runner_backend="auto",
+            speculative_moe_runner_backend=None,
+            speculative_moe_a2a_backend=None,
+            deepep_mode="auto",
+            deepep_config=None,
+            enable_two_batch_overlap=False,
+            enable_single_batch_overlap=False,
+            tbo_token_distribution_threshold=0.48,
+            disable_flashinfer_cutlass_moe_fp4_allgather=False,
+            quantization=None,
+        )
+        defaults.update(kw)
+        initialize_moe_config(SimpleNamespace(**defaults))
+
+    def test_lazy_defaults_before_initialize(self):
+        from sglang.srt.layers.moe.utils import (
+            get_moe_a2a_backend,
+            get_moe_runner_backend,
+            is_tbo_enabled,
+        )
+
+        reset_context()
+        self.assertTrue(get_moe_a2a_backend().is_none())
+        self.assertEqual(get_moe_runner_backend().name, "AUTO")
+        self.assertFalse(is_tbo_enabled())
+
+    def test_initialize_materializes_group(self):
+        from sglang.srt.layers.moe.utils import get_moe_a2a_backend, is_tbo_enabled
+
+        self._init(moe_a2a_backend="deepep", enable_two_batch_overlap=True)
+        self.assertTrue(get_moe_a2a_backend().is_deepep())
+        self.assertTrue(is_tbo_enabled())
+        self.assertEqual(get_flags().moe.deepep_config, "")
+
+    def test_speculative_swap_and_restore(self):
+        from sglang.srt.layers.moe.utils import (
+            get_moe_a2a_backend,
+            get_moe_runner_backend,
+            speculative_moe_a2a_backend_context,
+            speculative_moe_backend_context,
+        )
+
+        self._init(
+            moe_a2a_backend="deepep",
+            moe_runner_backend="triton",
+            speculative_moe_runner_backend="auto",
+            speculative_moe_a2a_backend="none",
+        )
+        with speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+            self.assertEqual(get_moe_runner_backend().name, "AUTO")
+            self.assertTrue(get_moe_a2a_backend().is_none())
+            # MTP layers are unquantized: fp4 allgather is forced off
+            self.assertTrue(get_flags().moe.disable_fp4_allgather)
+        self.assertEqual(get_moe_runner_backend().name, "TRITON")
+        self.assertTrue(get_moe_a2a_backend().is_deepep())
+        self.assertFalse(get_flags().moe.disable_fp4_allgather)
+
+    def test_swap_restores_on_exception(self):
+        from sglang.srt.layers.moe.utils import (
+            get_moe_runner_backend,
+            speculative_moe_backend_context,
+        )
+
+        self._init(moe_runner_backend="triton", speculative_moe_runner_backend="auto")
+        with self.assertRaises(RuntimeError):
+            with speculative_moe_backend_context():
+                raise RuntimeError("boom")
+        self.assertEqual(get_moe_runner_backend().name, "TRITON")
+
+
+class TestDpFlagsGroup(_IsolatedServerArgs):
+    """flags.dp: the DP-attention runtime flags; is_dp_attention_enabled is a
+    thin shim over the group leaf."""
+
+    def test_shim_reads_the_leaf(self):
+        from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+
+        reset_context()
+        self.assertFalse(is_dp_attention_enabled())
+        get_flags().dp.enabled = True
+        self.assertTrue(is_dp_attention_enabled())
+
+    def test_scoped_override_forces_the_predicate(self):
+        from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+
+        reset_context()
+        with get_flags().dp.override(enabled=True):
+            self.assertTrue(is_dp_attention_enabled())
+        self.assertFalse(is_dp_attention_enabled())
+
+
 class TestPublishLifecycle(_IsolatedServerArgs):
     """Publish installs the resolved server_args and seeds the capture tier."""
 
