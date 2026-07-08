@@ -188,6 +188,10 @@ class ToolStrictLevel(IntEnum):
 
 class Envs:
 
+    # Raise on bare server_args field assignments after resolution; mutation
+    # must go through ServerArgs.override() (enabled by the test harness).
+    SGLANG_STRICT_CONFIG_MUTATION = EnvBool(False)
+
     # Model & File Download
     SGLANG_USE_MODELSCOPE = EnvBool(False)
     # Controls weight-file ordering for load-time I/O optimization.
@@ -413,6 +417,10 @@ class Envs:
     SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE = EnvStr(None)
     SGLANG_HICACHE_FILE_BACKEND_EVICTION_RATIO = EnvFloat(0.9)
     SGLANG_HICACHE_FILE_BACKEND_MIN_FREE_SPACE = EnvStr("0")
+    # Enable client-side metadata caching to optimize filesystem checks (e.g. for Lustre/NFS/FUSE)
+    SGLANG_HICACHE_FILE_BACKEND_ENABLE_METADATA_CACHE = EnvBool(False)
+    # Positive cache TTL for filesystem metadata lookups (-1 disables positive expiration)
+    SGLANG_HICACHE_FILE_BACKEND_METADATA_TTL = EnvFloat(5.0)
     SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR = EnvStr(None)
     # Enable O_DIRECT when opening NIXL POSIX backend files (bypasses OS page cache).
     # Disable with SGLANG_HICACHE_NIXL_USE_DIRECT_IO=0 or via the
@@ -842,7 +850,10 @@ class Envs:
     SGLANG_OPT_FUSE_MHC_POST_PRE = EnvBool(False)
     SGLANG_OPT_USE_TILELANG_INDEXER = EnvBool(False)
     SGLANG_OPT_USE_AITER_INDEXER = EnvBool(False)
-    SGLANG_OPT_DSV4_NONPAGED_INDEXER = EnvBool(False)
+    SGLANG_OPT_DSV4_NONPAGED_INDEXER = EnvBool(True)
+    # Per-rank local query rows (after DP-attention sharding when enabled),
+    # not request ISL.
+    SGLANG_OPT_DSV4_NONPAGED_INDEXER_MIN_QUERY_TOKENS = EnvInt(8192)
     SGLANG_OPT_USE_JIT_INDEXER_METADATA = EnvBool(True)
     SGLANG_OPT_USE_ONLINE_COMPRESS = EnvBool(False)
     SGLANG_EXPERIMENTAL_ONLINE_C128_MTP = EnvBool(False)
