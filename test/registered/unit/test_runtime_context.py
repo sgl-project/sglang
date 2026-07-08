@@ -32,6 +32,8 @@ SIZE_RANK_DELEGATIONS = [
     ("world_rank", f"{_PS}.get_world_rank"),
     ("tp_size", f"{_PS}.get_tensor_model_parallel_world_size"),
     ("tp_rank", f"{_PS}.get_tensor_model_parallel_rank"),
+    ("dcp_size", f"{_PS}.get_dcp_world_size"),
+    ("dcp_rank", f"{_PS}.get_dcp_rank"),
     ("pp_size", f"{_PS}.get_pipeline_model_parallel_world_size"),
     ("pp_rank", f"{_PS}.get_pipeline_model_parallel_rank"),
     ("moe_ep_size", f"{_PS}.get_moe_expert_parallel_world_size"),
@@ -51,6 +53,7 @@ SIZE_RANK_DELEGATIONS = [
 GROUP_DELEGATIONS = [
     ("world_group", f"{_PS}.get_world_group"),
     ("tp_group", f"{_PS}.get_tp_group"),
+    ("dcp_group", f"{_PS}.get_dcp_group"),
     ("pp_group", f"{_PS}.get_pp_group"),
     ("moe_ep_group", f"{_PS}.get_moe_ep_group"),
     ("moe_dp_group", f"{_PS}.get_moe_dp_group"),

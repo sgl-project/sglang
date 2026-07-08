@@ -13,7 +13,7 @@
 # ==============================================================================
 """A single structured accessor for process-static runtime state.
 
-``get_parallel()`` returns a ``ParallelContext`` whose attributes — tp / pp /
+``get_parallel()`` returns a ``ParallelContext`` whose attributes — tp / dcp / pp /
 moe / attn size and rank, plus the process-group handles — each delegate live to
 the canonical getter in ``distributed.parallel_state`` / ``layers.dp_attention``.
 Returned values are exactly what those getters return; this is a read-through
@@ -67,6 +67,8 @@ _PARALLEL_FIELDS = frozenset(
         "world_rank",
         "tp_size",
         "tp_rank",
+        "dcp_size",
+        "dcp_rank",
         "pp_size",
         "pp_rank",
         "moe_ep_size",
@@ -85,6 +87,7 @@ _PARALLEL_FIELDS = frozenset(
         "dcp_rank",
         "world_group",
         "tp_group",
+        "dcp_group",
         "pp_group",
         "moe_ep_group",
         "moe_dp_group",
@@ -137,6 +140,14 @@ class ParallelContext:
     @property
     def tp_rank(self) -> int:
         return self._v("tp_rank", _ps().get_tensor_model_parallel_rank)
+
+    @property
+    def dcp_size(self) -> int:
+        return self._v("dcp_size", _ps().get_dcp_world_size)
+
+    @property
+    def dcp_rank(self) -> int:
+        return self._v("dcp_rank", _ps().get_dcp_rank)
 
     @property
     def pp_size(self) -> int:
@@ -209,6 +220,10 @@ class ParallelContext:
     @property
     def tp_group(self) -> Any:
         return self._v("tp_group", _ps().get_tp_group)
+
+    @property
+    def dcp_group(self) -> Any:
+        return self._v("dcp_group", _ps().get_dcp_group)
 
     @property
     def pp_group(self) -> Any:
