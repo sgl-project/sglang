@@ -2522,7 +2522,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             last_best_match_device_node,
         )
 
-    def check_hicache_events(self, decode_only: bool = False) -> None:
+    def check_hicache_events(self, can_defer: bool = False) -> None:
         """Called per scheduler step to poll async HiCache events."""
         # Reap the previous round's PP-sync sends before issuing new ones.
         self._drain_async_work()
@@ -2534,7 +2534,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             if self.enable_storage:
                 self.drain_storage_control_queues()
         else:
-            if decode_only:
+            if can_defer:
                 next_step = self.decode_event_check_steps + 1
                 if next_step < self.decode_event_check_interval:
                     self.decode_event_check_steps = next_step

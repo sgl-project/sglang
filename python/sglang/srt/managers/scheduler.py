@@ -2742,7 +2742,7 @@ class Scheduler(
 
         if self.enable_hierarchical_cache:
             self.tree_cache.check_hicache_events(
-                decode_only=len(self.waiting_queue) == 0 and self.chunked_req is None
+                can_defer=len(self.waiting_queue) == 0 and self.chunked_req is None
             )
 
         if self.enable_priority_preemption or self.is_hybrid_swa:

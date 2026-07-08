@@ -1413,7 +1413,7 @@ class HiRadixCache(RadixCache):
     def flush_write_through_acks(self) -> None:
         self.writing_check()
 
-    def check_hicache_events(self, decode_only: bool = False):
+    def check_hicache_events(self, can_defer: bool = False):
         # Reap the previous round's PP-sync sends before issuing new ones.
         self._drain_async_work()
 
@@ -1424,7 +1424,7 @@ class HiRadixCache(RadixCache):
             if self.enable_storage:
                 self.drain_storage_control_queues()
         else:
-            if decode_only:
+            if can_defer:
                 next_step = self.decode_event_check_steps + 1
                 if next_step < self.decode_event_check_interval:
                     self.decode_event_check_steps = next_step
