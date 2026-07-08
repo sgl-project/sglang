@@ -362,46 +362,18 @@ def assign_extend_cache_locs_func(
 
         return out_cache_loc
 
-    elif _is_npu:        # The NPU AscendC kernel (cache_loc_update) uses a hard-coded
-        # MAX_STEP=16 as the per-request token stride in its tiling data.
-        # DataCopyPad writes cacheLocSize (= batch_size * MAX_STEP) int32s
-        # back to the output tensor. If the tensor is smaller than that
-        # (draft_token_num < MAX_STEP), the kernel overflows into adjacent
-        # memory, corrupting other tensors (e.g., req_to_token or
-        # free_pages). Pad the output tensor to MAX_STEP and slice back.
-        _CACHE_UPDATE_MAX_STEP = 16
-        if draft_token_num <= _CACHE_UPDATE_MAX_STEP:
-            out_cache_loc_padded = torch.empty(
-                (batch_size * _CACHE_UPDATE_MAX_STEP,),
-                dtype=torch.int32,
-                device=device,
-            )
-            torch.ops.npu.cache_loc_update(
-                req_pool_indices,
-                req_to_token,
-                start_offset,
-                end_offset,
-                out_cache_loc_padded,
-            )
-            out_cache_loc = out_cache_loc_padded[
-                : batch_size * draft_token_num
-            ].contiguous()
-        else:
-            # draft_token_num > MAX_STEP: NPU kernel's CopyIn truncates at
-            # MAX_STEP tokens per req. Fall back to a PyTorch gather.
-            starts = start_offset.cpu().tolist()
-            ends = end_offset.cpu().tolist()
-            req_indices = req_pool_indices.cpu().tolist()
-            out_cache_loc = torch.empty(
-                (batch_size * draft_token_num,),
-                dtype=torch.int32,
-                device=device,
-            )
-            for i in range(batch_size):
-                step = ends[i] - starts[i]
-                if step > 0:
-                    out_cache_loc[
-                        i * draft_token_num : i * draft_token_num + step
-                    ] = req_to_token[req_indices[i], starts[i] : ends[i]]
+    elif _is_npu:
+        out_cache_loc = torch.empty(
+            (batch_size * draft_token_num,),
+            dtype=torch.int32,
+            device=device,
+        )
+        torch.ops.npu.cache_loc_update(
+            req_pool_indices,
+            req_to_token,
+            start_offset,
+            end_offset,
+            out_cache_loc,
+        )
 
         return out_cache_loc
