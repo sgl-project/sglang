@@ -14,6 +14,7 @@
 
 """Inference-only GLM-4.5, GLM-4.6 and GLM-4.7 model compatible with HuggingFace weights"""
 
+import copy
 import logging
 import re
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
@@ -1520,7 +1521,26 @@ class GlmMoeDsaForCausalLMNextN(DeepseekV3ForCausalLMNextN):
         # keys need the same remap as exclude_layers below, or they silently
         # fall back to the wrong (layer-type/global) scheme.
         layer_quant_config = quant_config.quant_config.get("layer_quant_config")
-        if layer_quant_config:
+        needs_layer_quant_remap = bool(layer_quant_config) and any(
+            pattern.startswith(layer_prefix + ".") for pattern in layer_quant_config
+        )
+
+        mtp_excluded = [
+            name
+            for name in quant_config.exclude_layers
+            if name.startswith(layer_prefix + ".")
+        ]
+
+        if not needs_layer_quant_remap and not mtp_excluded:
+            return quant_config
+
+        # Copy before mutating so a shared/cached quant_config instance is never
+        # modified in place. copy.copy() is a shallow copy, so also copy the
+        # nested quant_config dict that we rewrite below.
+        quant_config = copy.copy(quant_config)
+        quant_config.quant_config = dict(quant_config.quant_config)
+
+        if needs_layer_quant_remap:
             quant_config.quant_config["layer_quant_config"] = {
                 (
                     self._map_mtp_ckpt_name(pattern, layer_prefix)
@@ -1530,30 +1550,21 @@ class GlmMoeDsaForCausalLMNextN(DeepseekV3ForCausalLMNextN):
                 for pattern, pattern_config in layer_quant_config.items()
             }
 
-        mtp_excluded = [
-            name
-            for name in quant_config.exclude_layers
-            if name.startswith(layer_prefix + ".")
-        ]
-        if not mtp_excluded:
-            return quant_config
+        if mtp_excluded:
+            names = set(quant_config.exclude_layers)
+            for name in mtp_excluded:
+                names.add(self._map_mtp_ckpt_name(name, layer_prefix))
 
-        names = set(quant_config.exclude_layers)
-        for name in mtp_excluded:
-            names.add(self._map_mtp_ckpt_name(name, layer_prefix))
+            # Fused routed experts are queried by the coarse module prefix
+            # "model.decoder.mlp.experts". Expanded per-expert leaf excludes do
+            # not match that prefix, so add the coarse prefix when any routed
+            # expert in the MTP layer is excluded. This keeps only that fused
+            # MoE module bf16 while the rest of the draft modules use their
+            # quant config.
+            if any(".mlp.experts." in name for name in mtp_excluded):
+                names.add("model.decoder.mlp.experts")
+            quant_config.exclude_layers = list(names)
 
-        # Fused routed experts are queried by the coarse module prefix
-        # "model.decoder.mlp.experts". Expanded per-expert leaf excludes do not
-        # match that prefix, so add the coarse prefix when any routed expert in
-        # the MTP layer is excluded. This keeps only that fused MoE module bf16
-        # while allowing the remaining draft modules to use their quant config.
-        if any(".mlp.experts." in name for name in mtp_excluded):
-            names.add("model.decoder.mlp.experts")
-
-        import copy
-
-        quant_config = copy.copy(quant_config)
-        quant_config.exclude_layers = list(names)
         return quant_config
 
 

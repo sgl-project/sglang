@@ -288,6 +288,13 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
     )
 
     def _resolve_nextn_quant_config(self, config, quant_config):
+        """Resolve the quant config used to build the nextn (MTP) model.
+
+        For quark, if the whole MTP/nextn layer is kept unquantized (bf16) and
+        listed in the checkpoint `exclude` set, drop quant for the nextn model.
+        Subclasses (e.g. GLM) override this to do finer, prefix-aware exclude
+        remapping so that mixed-precision MTP layers are handled correctly.
+        """
         if quant_config is None or quant_config.get_name() != "quark":
             return quant_config
 
