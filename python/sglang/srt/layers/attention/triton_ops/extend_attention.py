@@ -16,6 +16,8 @@ Memory-efficient attention for prefill.
 It supports page size = 1 and prefill with KV cache (i.e. extend).
 """
 
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -619,6 +621,394 @@ def _fwd_kernel(
         )
 
 
+@triton.jit
+def _fwd_kernel_gqa_split(
+    Q_Extend,
+    K_Buffer,
+    V_Buffer,
+    Mid_O,
+    qo_indptr,
+    kv_indptr,
+    kv_indices,
+    sm_scale,
+    k_scale,
+    v_scale,
+    stride_qbs,
+    stride_qh,
+    stride_buf_kbs,
+    stride_buf_kh,
+    stride_buf_vbs,
+    stride_buf_vh,
+    stride_mid_seq,
+    stride_mid_h,
+    stride_mid_split,
+    logit_cap: tl.constexpr,
+    Lq: tl.constexpr,
+    Lv: tl.constexpr,
+    BLOCK_DMODEL: tl.constexpr,
+    BLOCK_DPE: tl.constexpr,
+    BLOCK_DV: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    DRAFT_NUM: tl.constexpr,
+    KV_GROUP_NUM: tl.constexpr,
+    NUM_KV_SPLITS: tl.constexpr,
+):
+    """
+    GQA-grouped, split-K variant of `_fwd_kernel` for the EAGLE/MTP "few query
+    token" verify shape.  One program per (sequence, kv_head, kv_split).
+
+    Two structural wins over the per-query-head `_fwd_kernel`:
+      1. GQA grouping: each KV head is loaded ONCE and ALL `KV_GROUP_NUM` query
+         heads in the group are computed against it.  The query heads are packed
+         into the M (row) dimension:
+             row r -> q-head g = r // DRAFT_NUM, draft token t = r % DRAFT_NUM
+         softmax (per row) is unchanged; `acc`/`deno`/`e_max` keep the SAME
+         register footprint as the single-head kernel, but K/V HBM traffic
+         drops by up to KV_GROUP_NUM x.
+      2. Split-K: the long (~50K) prefix loop is split across `NUM_KV_SPLITS`
+         programs so the grid (batch * kv_head * splits) fills the GPU even
+         though GQA grouping cut the head count by KV_GROUP_NUM.  Each split
+         writes a partial (acc, deno, e_max) to `Mid_O`; `_fwd_kernel_gqa_combine`
+         reduces across splits and adds the small stage-2 triangle.
+
+    `Mid_O` layout: [batch, kv_head, NUM_KV_SPLITS, BLOCK_M, BLOCK_DV + 2]
+    where the last axis stores [acc(BLOCK_DV), deno(1), e_max(1)].
+    Constraint (host gate): KV_GROUP_NUM * DRAFT_NUM <= BLOCK_M.
+    """
+    cur_seq = tl.program_id(0)
+    cur_kv_head = tl.program_id(1)
+    cur_split = tl.program_id(2)
+
+    cur_seq_kv_start_idx = tl.load(kv_indptr + cur_seq)
+    cur_seq_len_prefix = tl.load(kv_indptr + cur_seq + 1) - cur_seq_kv_start_idx
+    cur_seq_extend_start_idx = tl.load(qo_indptr + cur_seq)
+    cur_seq_len_extend = tl.load(qo_indptr + cur_seq + 1) - cur_seq_extend_start_idx
+
+    offs_d = tl.arange(0, BLOCK_DMODEL)
+    offs_dv = tl.arange(0, BLOCK_DV)
+    offs_m = tl.arange(0, BLOCK_M)
+    # packed-row decode: g = head index in the group, t = draft token index
+    offs_g = offs_m // DRAFT_NUM
+    offs_t = offs_m % DRAFT_NUM
+    mask_m = (offs_g < KV_GROUP_NUM) & (offs_t < cur_seq_len_extend)
+
+    mask_d = offs_d < Lq
+    mask_dv = offs_dv < Lv
+
+    # q gather: q_extend is [bs*draft, head_num, head_dim], seq-major.
+    offs_q = (
+        (cur_seq_extend_start_idx + offs_t[:, None]) * stride_qbs
+        + (cur_kv_head * KV_GROUP_NUM + offs_g[:, None]) * stride_qh
+        + offs_d[None, :]
+    )
+    q = tl.load(
+        Q_Extend + offs_q, mask=(mask_m[:, None]) & (mask_d[None, :]), other=0.0
+    )
+    if BLOCK_DPE > 0:
+        offs_dpe = BLOCK_DMODEL + tl.arange(0, BLOCK_DPE)
+        offs_qpe = (
+            (cur_seq_extend_start_idx + offs_t[:, None]) * stride_qbs
+            + (cur_kv_head * KV_GROUP_NUM + offs_g[:, None]) * stride_qh
+            + offs_dpe[None, :]
+        )
+        qpe = tl.load(Q_Extend + offs_qpe, mask=mask_m[:, None], other=0.0)
+
+    offs_n = tl.arange(0, BLOCK_N)
+    acc = tl.zeros([BLOCK_M, BLOCK_DV], dtype=tl.float32)
+    deno = tl.zeros([BLOCK_M], dtype=tl.float32)
+    e_max = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
+
+    # this split owns prefix tokens [split_start, split_end)
+    split_len = tl.cdiv(cur_seq_len_prefix, NUM_KV_SPLITS)
+    split_start = cur_split * split_len
+    split_end = tl.minimum(split_start + split_len, cur_seq_len_prefix)
+
+    # stage 1 (this split's slice of the prefix). custom_mask NOT loaded here
+    # (host always passes skip_prefix_custom_mask=True for this path).
+    for start_n in range(split_start, split_end, BLOCK_N):
+        start_n = tl.multiple_of(start_n, BLOCK_N)
+        mask_n = (start_n + offs_n) < split_end
+
+        offs_kv_loc = tl.load(
+            kv_indices + cur_seq_kv_start_idx + start_n + offs_n,
+            mask=mask_n,
+            other=0,
+        )
+
+        offs_buf_k = (
+            offs_kv_loc[None, :] * stride_buf_kbs
+            + cur_kv_head * stride_buf_kh
+            + offs_d[:, None]
+        )
+        k = tl.load(
+            K_Buffer + offs_buf_k,
+            mask=(mask_n[None, :]) & (mask_d[:, None]),
+            other=0.0,
+        )
+        qk = tl.dot(q.to(k.dtype), k)
+        if BLOCK_DPE > 0:
+            offs_kpe = (
+                offs_kv_loc[None, :] * stride_buf_kbs
+                + cur_kv_head * stride_buf_kh
+                + offs_dpe[:, None]
+            )
+            kpe = tl.load(K_Buffer + offs_kpe, mask=mask_n[None, :], other=0.0)
+            qk += tl.dot(qpe.to(kpe.dtype), kpe)
+        qk *= sm_scale * k_scale
+
+        if logit_cap > 0:
+            qk = logit_cap * tanh(qk / logit_cap)
+
+        final_mask = mask_m[:, None] & mask_n[None, :]
+        qk = tl.where(final_mask, qk, float("-inf"))
+
+        row_max = tl.max(qk, 1)
+        row_max_fixed = tl.where(row_max == float("-inf"), -1e20, row_max)
+        n_e_max = tl.maximum(row_max_fixed, e_max)
+
+        re_scale = tl.exp(e_max - n_e_max)
+        p = tl.exp(qk - n_e_max[:, None])
+        deno = deno * re_scale + tl.sum(p, 1)
+
+        offs_buf_v = (
+            offs_kv_loc[:, None] * stride_buf_vbs
+            + cur_kv_head * stride_buf_vh
+            + offs_dv[None, :]
+        )
+        v = tl.load(
+            V_Buffer + offs_buf_v,
+            mask=mask_n[:, None] & mask_dv[None, :],
+            other=0.0,
+        )
+        p = p.to(v.dtype)
+        acc = acc * re_scale[:, None] + tl.dot(p, v) * v_scale
+        e_max = n_e_max
+
+    # write this split's partial (acc, deno, e_max) to Mid_O
+    mid_base = (
+        Mid_O
+        + cur_seq * stride_mid_seq
+        + cur_kv_head * stride_mid_h
+        + cur_split * stride_mid_split
+    )
+    tl.store(
+        mid_base + offs_m[:, None] * (BLOCK_DV + 2) + offs_dv[None, :],
+        acc,
+        mask=mask_m[:, None] & mask_dv[None, :],
+    )
+    tl.store(
+        mid_base + offs_m * (BLOCK_DV + 2) + BLOCK_DV,
+        deno,
+        mask=mask_m,
+    )
+    tl.store(
+        mid_base + offs_m * (BLOCK_DV + 2) + BLOCK_DV + 1,
+        e_max,
+        mask=mask_m,
+    )
+
+
+@triton.jit
+def _fwd_kernel_gqa_combine(
+    Q_Extend,
+    K_Extend,
+    V_Extend,
+    O_Extend,
+    Mid_O,
+    qo_indptr,
+    kv_indptr,
+    mask_ptr,
+    mask_indptr,
+    sink_ptr,
+    sm_scale,
+    stride_qbs,
+    stride_qh,
+    stride_kbs,
+    stride_kh,
+    stride_vbs,
+    stride_vh,
+    stride_obs,
+    stride_oh,
+    stride_mid_seq,
+    stride_mid_h,
+    stride_mid_split,
+    logit_cap: tl.constexpr,
+    Lq: tl.constexpr,
+    Lv: tl.constexpr,
+    BLOCK_DMODEL: tl.constexpr,
+    BLOCK_DPE: tl.constexpr,
+    BLOCK_DV: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    DRAFT_NUM: tl.constexpr,
+    KV_GROUP_NUM: tl.constexpr,
+    NUM_KV_SPLITS: tl.constexpr,
+    USE_CUSTOM_MASK: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
+    STORE_TRANSPOSE: tl.constexpr,
+    HAS_SINK: tl.constexpr,
+):
+    """
+    Combine the NUM_KV_SPLITS partial softmax states from `_fwd_kernel_gqa_split`
+    (online-softmax reduction), then run the small stage-2 triangle (DRAFT_NUM
+    extend tokens vs DRAFT_NUM newly-written K/V) and store the final output.
+    One program per (sequence, kv_head).
+    """
+    cur_seq = tl.program_id(0)
+    cur_kv_head = tl.program_id(1)
+
+    cur_seq_extend_start_idx = tl.load(qo_indptr + cur_seq)
+    cur_seq_len_extend = tl.load(qo_indptr + cur_seq + 1) - cur_seq_extend_start_idx
+    cur_seq_kv_start_idx = tl.load(kv_indptr + cur_seq)
+    cur_seq_len_prefix = tl.load(kv_indptr + cur_seq + 1) - cur_seq_kv_start_idx
+    cur_seq_len = cur_seq_len_prefix + cur_seq_len_extend
+
+    if USE_CUSTOM_MASK:
+        cur_seq_mask_start_idx = tl.load(mask_indptr + cur_seq)
+
+    offs_d = tl.arange(0, BLOCK_DMODEL)
+    offs_dv = tl.arange(0, BLOCK_DV)
+    offs_m = tl.arange(0, BLOCK_M)
+    offs_g = offs_m // DRAFT_NUM
+    offs_t = offs_m % DRAFT_NUM
+    mask_m = (offs_g < KV_GROUP_NUM) & (offs_t < cur_seq_len_extend)
+    mask_d = offs_d < Lq
+    mask_dv = offs_dv < Lv
+
+    acc = tl.zeros([BLOCK_M, BLOCK_DV], dtype=tl.float32)
+    deno = tl.zeros([BLOCK_M], dtype=tl.float32)
+    e_max = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
+
+    # reduce partial states across kv splits
+    mid_seq_base = Mid_O + cur_seq * stride_mid_seq + cur_kv_head * stride_mid_h
+    for s in range(0, NUM_KV_SPLITS):
+        mid_base = mid_seq_base + s * stride_mid_split
+        p_acc = tl.load(
+            mid_base + offs_m[:, None] * (BLOCK_DV + 2) + offs_dv[None, :],
+            mask=mask_m[:, None] & mask_dv[None, :],
+            other=0.0,
+        )
+        p_deno = tl.load(mid_base + offs_m * (BLOCK_DV + 2) + BLOCK_DV, mask=mask_m, other=0.0)
+        p_emax = tl.load(
+            mid_base + offs_m * (BLOCK_DV + 2) + BLOCK_DV + 1,
+            mask=mask_m,
+            other=-float("inf"),
+        )
+        n_e_max = tl.maximum(e_max, p_emax)
+        old_scale = tl.exp(e_max - n_e_max)
+        p_scale = tl.exp(p_emax - n_e_max)
+        acc = acc * old_scale[:, None] + p_acc * p_scale[:, None]
+        deno = deno * old_scale + p_deno * p_scale
+        e_max = n_e_max
+
+    # load q for the stage-2 triangle
+    offs_q = (
+        (cur_seq_extend_start_idx + offs_t[:, None]) * stride_qbs
+        + (cur_kv_head * KV_GROUP_NUM + offs_g[:, None]) * stride_qh
+        + offs_d[None, :]
+    )
+    q = tl.load(Q_Extend + offs_q, mask=(mask_m[:, None]) & (mask_d[None, :]), other=0.0)
+    if BLOCK_DPE > 0:
+        offs_dpe = BLOCK_DMODEL + tl.arange(0, BLOCK_DPE)
+        offs_qpe = (
+            (cur_seq_extend_start_idx + offs_t[:, None]) * stride_qbs
+            + (cur_kv_head * KV_GROUP_NUM + offs_g[:, None]) * stride_qh
+            + offs_dpe[None, :]
+        )
+        qpe = tl.load(Q_Extend + offs_qpe, mask=mask_m[:, None], other=0.0)
+
+    offs_n = tl.arange(0, BLOCK_N)
+    # stage 2: the small triangle
+    for start_n in range(0, cur_seq_len_extend, BLOCK_N):
+        start_n = tl.multiple_of(start_n, BLOCK_N)
+        mask_n = (start_n + offs_n) < cur_seq_len_extend
+
+        final_mask = mask_m[:, None] & mask_n[None, :]
+        if USE_CUSTOM_MASK:
+            # custom_mask is indexed by (token_row, kv_col); with heads packed
+            # into M we must use the TOKEN index offs_t, not the packed offs_m.
+            custom_mask = tl.load(
+                mask_ptr
+                + cur_seq_mask_start_idx
+                + offs_t[:, None] * cur_seq_len
+                + cur_seq_len_prefix
+                + start_n
+                + offs_n[None, :],
+                mask=(mask_m[:, None] & mask_n[None, :]),
+                other=0,
+            )
+            final_mask &= custom_mask > 0
+        elif IS_CAUSAL:
+            mask_causal = offs_t[:, None] >= (start_n + offs_n[None, :])
+            final_mask &= mask_causal
+
+        offs_k = (
+            (cur_seq_extend_start_idx + start_n + offs_n[None, :]) * stride_kbs
+            + cur_kv_head * stride_kh
+            + offs_d[:, None]
+        )
+        k = tl.load(
+            K_Extend + offs_k, mask=(mask_n[None, :]) & (mask_d[:, None]), other=0.0
+        )
+        qk = tl.dot(q, k, out_dtype=tl.float32)
+        if BLOCK_DPE > 0:
+            offs_kpe = (
+                (cur_seq_extend_start_idx + start_n + offs_n[None, :]) * stride_kbs
+                + cur_kv_head * stride_kh
+                + offs_dpe[:, None]
+            )
+            kpe = tl.load(K_Extend + offs_kpe, mask=mask_n[None, :], other=0.0)
+            qk += tl.dot(qpe, kpe)
+
+        qk *= sm_scale
+        if logit_cap > 0:
+            qk = logit_cap * tanh(qk / logit_cap)
+        qk = tl.where(final_mask, qk, float("-inf"))
+
+        row_max = tl.max(qk, 1)
+        row_max_fixed = tl.where(row_max == float("-inf"), -1e20, row_max)
+        n_e_max = tl.maximum(row_max_fixed, e_max)
+
+        re_scale = tl.exp(e_max - n_e_max)
+        p = tl.exp(qk - n_e_max[:, None])
+        deno = deno * re_scale + tl.sum(p, 1)
+
+        offs_v = (
+            (cur_seq_extend_start_idx + start_n + offs_n[:, None]) * stride_vbs
+            + cur_kv_head * stride_vh
+            + offs_dv[None, :]
+        )
+        v = tl.load(
+            V_Extend + offs_v, mask=mask_n[:, None] & mask_dv[None, :], other=0.0
+        )
+        p = p.to(v.dtype)
+        acc = acc * re_scale[:, None] + tl.dot(p, v)
+        e_max = n_e_max
+
+    if HAS_SINK:
+        cur_sink = tl.load(sink_ptr + cur_kv_head * KV_GROUP_NUM + offs_g)
+        deno += tl.exp(cur_sink - e_max)
+
+    offs_o = (
+        (cur_seq_extend_start_idx + offs_t[:, None]) * stride_obs
+        + (cur_kv_head * KV_GROUP_NUM + offs_g[:, None]) * stride_oh
+        + offs_dv[None, :]
+    )
+    if STORE_TRANSPOSE:
+        tl.store(
+            O_Extend + offs_o.T,
+            (acc / deno[:, None]).T,
+            mask=(mask_m[:, None] & mask_dv[None, :]).T,
+        )
+    else:
+        tl.store(
+            O_Extend + offs_o,
+            acc / deno[:, None],
+            mask=mask_m[:, None] & mask_dv[None, :],
+        )
+
+
 def extend_attention_fwd(
     q_extend,
     k_extend,
@@ -668,6 +1058,15 @@ def extend_attention_fwd(
         _get_block_sizes_for_extend_attention(Lq, Lv)
     )
 
+    # Few-query verify shape (EAGLE/MTP target-verify & draft-extend, a handful
+    # of query tokens against very long paged KV): the default BLOCK_M=64 wastes
+    # 60/64 rows of every tile and waves_per_eu=1 leaves HBM latency unhidden.
+    # BLOCK_M=16 / BLOCK_N=128 / waves_per_eu=4 saturates HBM (~3.5x on MI355X,
+    # microbenched at 50K KV). Large-extend prefill keeps the tuned defaults.
+    hip_few_query = _is_hip and max_len_extend <= 16
+    if hip_few_query:
+        BLOCK_M, BLOCK_N, num_warps = 16, 128, 4
+
     sm_scale = sm_scale or 1.0 / (Lq**0.5)
     batch_size, head_num = qo_indptr.shape[0] - 1, q_extend.shape[1]
     kv_group_num = q_extend.shape[1] // k_extend.shape[1]
@@ -681,12 +1080,134 @@ def extend_attention_fwd(
     stride_lse_bs = lse_extend.stride(0) if STORE_LSE else 0
     stride_lse_h = lse_extend.stride(1) if STORE_LSE else 0
 
+    # GQA-grouped few-query path: load each KV head ONCE and compute all
+    # kv_group_num query heads against it (query heads packed into the M
+    # dimension).  Up to kv_group_num x less HBM traffic.  Only the plain
+    # verify shape — no SWA / no xai temperature — falls through here; every
+    # other case keeps the existing per-query-head `_fwd_kernel`.
+    use_gqa_packed = (
+        hip_few_query
+        and kv_group_num > 1
+        and sliding_window_size <= 0
+        and xai_temperature_len <= 0
+        and skip_prefix_custom_mask
+        and os.environ.get("EXT_DISABLE_GQA", "0") != "1"  # microbench A/B hook
+    )
+    if use_gqa_packed:
+        kv_head_num = head_num // kv_group_num
+        # whole extend region packs into one M block: kv_group_num * draft <= BLOCK_M
+        BLOCK_M_PACKED = triton.next_power_of_2(kv_group_num * max_len_extend)
+        # split-K: split the long prefix loop across the grid so that
+        # (batch * kv_head * splits) fills the GPU even though GQA grouping
+        # cut the active head count by kv_group_num.  NUM_KV_SPLITS chosen so
+        # the split grid is comfortably above the ~256-CU MI355X count.
+        # NUM_KV_SPLITS / BLOCK_N / waves_per_eu are env-tunable for sweeping.
+        BLOCK_N_PACKED = int(os.environ.get("EXT_GQA_BLOCK_N", "128"))
+        NUM_KV_SPLITS = int(os.environ.get("EXT_GQA_SPLITS", "16"))
+        _gqa_wpe = int(os.environ.get("EXT_GQA_WPE", "4"))
+        # Mid_O: [batch, kv_head, NUM_KV_SPLITS, BLOCK_M, BLOCK_DV + 2]
+        mid_o = torch.empty(
+            (batch_size, kv_head_num, NUM_KV_SPLITS, BLOCK_M_PACKED, BLOCK_DV + 2),
+            dtype=torch.float32,
+            device=q_extend.device,
+        )
+        extra_kargs = {}
+        if _is_hip:
+            extra_kargs = {
+                "waves_per_eu": _gqa_wpe,
+                "matrix_instr_nonkdim": 16,
+                "kpack": 2,
+            }
+        _fwd_kernel_gqa_split[(batch_size, kv_head_num, NUM_KV_SPLITS)](
+            q_extend,
+            k_buffer,
+            v_buffer,
+            mid_o,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            sm_scale,
+            k_scale,
+            v_scale,
+            q_extend.stride(0),
+            q_extend.stride(1),
+            k_buffer.stride(0),
+            k_buffer.stride(1),
+            v_buffer.stride(0),
+            v_buffer.stride(1),
+            mid_o.stride(0),
+            mid_o.stride(1),
+            mid_o.stride(2),
+            logit_cap=logit_cap,
+            Lq=Lq,
+            Lv=Lv,
+            BLOCK_DMODEL=BLOCK_DMODEL,
+            BLOCK_DPE=BLOCK_DPE,
+            BLOCK_DV=BLOCK_DV,
+            BLOCK_M=BLOCK_M_PACKED,
+            BLOCK_N=BLOCK_N_PACKED,
+            DRAFT_NUM=max_len_extend,
+            KV_GROUP_NUM=kv_group_num,
+            NUM_KV_SPLITS=NUM_KV_SPLITS,
+            num_warps=4,
+            num_stages=1,
+            **extra_kargs,
+        )
+        _fwd_kernel_gqa_combine[(batch_size, kv_head_num)](
+            q_extend,
+            k_extend,
+            v_extend,
+            o_extend,
+            mid_o,
+            qo_indptr,
+            kv_indptr,
+            custom_mask,
+            mask_indptr,
+            sinks,
+            sm_scale,
+            q_extend.stride(0),
+            q_extend.stride(1),
+            k_extend.stride(0),
+            k_extend.stride(1),
+            v_extend.stride(0),
+            v_extend.stride(1),
+            o_extend.stride(0),
+            o_extend.stride(1),
+            mid_o.stride(0),
+            mid_o.stride(1),
+            mid_o.stride(2),
+            logit_cap=logit_cap,
+            Lq=Lq,
+            Lv=Lv,
+            BLOCK_DMODEL=BLOCK_DMODEL,
+            BLOCK_DPE=BLOCK_DPE,
+            BLOCK_DV=BLOCK_DV,
+            BLOCK_M=BLOCK_M_PACKED,
+            BLOCK_N=BLOCK_N_PACKED,
+            DRAFT_NUM=max_len_extend,
+            KV_GROUP_NUM=kv_group_num,
+            NUM_KV_SPLITS=NUM_KV_SPLITS,
+            USE_CUSTOM_MASK=USE_CUSTOM_MASK,
+            IS_CAUSAL=is_causal,
+            STORE_TRANSPOSE=_is_hip,
+            HAS_SINK=HAS_SINK,
+            num_warps=4,
+            num_stages=1,
+            **extra_kargs,
+        )
+        return
+
     grid = (batch_size, head_num, triton.cdiv(max_len_extend, BLOCK_M))
     num_stages = 1
 
     extra_kargs = {}
     if _is_hip:
-        extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
+        waves_per_eu = 4 if hip_few_query else 1
+        extra_kargs = {
+            "waves_per_eu": waves_per_eu,
+            "matrix_instr_nonkdim": 16,
+            "kpack": 2,
+        }
 
     k_slot_stride, k_head_stride, k_page_stride, k_tok_stride = _extract_kv_strides(
         k_buffer, page_size
