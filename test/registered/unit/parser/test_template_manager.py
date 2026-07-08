@@ -4,7 +4,7 @@ import unittest
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
 
-from sglang.srt.managers.template_detection import (
+from sglang.srt.parser.template_detection import (
     REASONING_PARSER_RULES,
     TOOL_CALL_PARSER_RULES,
     ReasoningToggleConfig,
