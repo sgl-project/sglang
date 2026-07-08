@@ -686,8 +686,7 @@ def commit_mamba_states_after_verify(
             to_track = to_track_mask.cpu().tolist()
             pool = batch.req_to_token_pool
             if (
-                pool is not None
-                and hasattr(pool, "get_mamba_ping_pong_other_idx")
+                getattr(pool, "get_mamba_ping_pong_other_idx", None)
                 and not get_global_server_args().enable_mamba_extra_buffer_lazy()
             ):
                 for i, req in enumerate(batch.reqs):

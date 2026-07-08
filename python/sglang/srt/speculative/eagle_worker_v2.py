@@ -1473,8 +1473,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
         # Batch 1: Target verify
         # Prepare for target verify in a separate stream
         with self.plan_stream_ctx:
-            if self.plan_stream is not None:
-                self.plan_stream.wait_stream(fwd_stream)
             verify_forward_batch, can_run_cuda_graph = eagle_prepare_for_verify(
                 verify_input,
                 self.req_to_token_pool,

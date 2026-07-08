@@ -822,14 +822,6 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
     nxt_kv_lens_device = nxt_kv_lens_cpu.to(device=batch.device, non_blocking=True)
     if page_size == 1:
         out_cache_loc = alloc_token_slots(batch.tree_cache, num_needed_tokens)
-    elif num_needed_tokens == 0:
-        # No new tokens needed (cur >= committed + double_alloc); skip the
-        # paged allocator to avoid an unnecessary tree_cache.evict() inside
-        # alloc_paged_token_slots_extend that can race with spec verify's
-        # plan-stream reads of req_to_token.
-        out_cache_loc = torch.empty(
-            (0,), dtype=torch.int64, device=batch.device
-        )
     else:
         last_loc = get_last_loc(
             batch.req_to_token_pool.req_to_token,
