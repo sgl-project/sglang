@@ -22,10 +22,10 @@ from sglang.jit_kernel.fused_store_index_cache import (
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
-from sglang.srt.layers.attention.dsa.transform_index import write_dsa_only_k_topk_paged
 from sglang.srt.layers.attention.dsa.paged_mqa_logits_backend import (
     DSAPagedMQALogitsBackend,
 )
+from sglang.srt.layers.attention.dsa.transform_index import write_dsa_only_k_topk_paged
 from sglang.srt.layers.attention.dsa.utils import (
     aiter_can_use_preshuffle_paged_mqa,
     is_dsa_enable_prefill_cp,
