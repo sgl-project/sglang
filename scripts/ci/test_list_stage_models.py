@@ -115,6 +115,41 @@ class ConstantTable(unittest.TestCase):
         table = lsm.extract_constants_from_source(source)
         self.assertEqual(table["M"], {"meta-llama/Llama-3.1-8B-Instruct"})
 
+    def test_nested_static_model_tables(self):
+        source = (
+            "CASES = [\n"
+            "    ModelCase(\n"
+            '        base="meta-llama/Llama-2-7b-hf",\n'
+            "        adaptors=[\n"
+            '            LoRAAdaptor(name="winddude/wizardLM-LlaMA-LoRA-7B"),\n'
+            "        ],\n"
+            "    ),\n"
+            "    {\n"
+            '        "model_path": "Qwen/Qwen3-8B",\n'
+            '        "mime": "text/plain",\n'
+            "    },\n"
+            "]\n"
+        )
+        table = lsm.extract_constants_from_source(source)
+        self.assertEqual(
+            table["CASES"],
+            {
+                "Qwen/Qwen3-8B",
+                "meta-llama/Llama-2-7b-hf",
+                "winddude/wizardLM-LlaMA-LoRA-7B",
+            },
+        )
+
+    def test_nested_fstring_fragments_are_skipped(self):
+        source = (
+            "CASES = [\n"
+            '    f"meta-llama/Llama-3.1-8B-Instruct-{suffix}",\n'
+            '    {"model_path": "Qwen/Qwen3-8B"},\n'
+            "]\n"
+        )
+        table = lsm.extract_constants_from_source(source)
+        self.assertEqual(table["CASES"], {"Qwen/Qwen3-8B"})
+
     def test_deny_excludes_from_constant_table(self):
         source = 'BAD = "weird/thing"\nGOOD = "meta-llama/Llama-3.1-8B-Instruct"\n'
         table = lsm.extract_constants_from_source(source, deny={"weird/thing"})

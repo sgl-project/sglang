@@ -134,16 +134,30 @@ def looks_like_model_id(value: str, deny: Optional[Set[str]] = None) -> bool:
 
 
 def _string_values(node: ast.AST) -> List[str]:
-    """String constants directly held by ``node`` (a Constant, Tuple, or List)."""
-    if isinstance(node, ast.Constant):
-        return [node.value] if isinstance(node.value, str) else []
-    if isinstance(node, (ast.Tuple, ast.List)):
-        out: List[str] = []
-        for elt in node.elts:
-            if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
-                out.append(elt.value)
-        return out
-    return []
+    """Static string constants reachable from an assignment RHS.
+
+    Shared test helpers often define model tables as lists of dataclass
+    constructors or dicts, e.g. ``[ModelCase(base="org/model")]``. Walk the
+    RHS recursively so name references to those tables can still populate the
+    inventory. String fragments inside f-strings are skipped because they are
+    partial/dynamic and can look like truncated model ids.
+    """
+    fstring_fragments = {
+        id(part)
+        for joined in ast.walk(node)
+        if isinstance(joined, ast.JoinedStr)
+        for part in joined.values
+        if isinstance(part, ast.Constant)
+    }
+    out: List[str] = []
+    for child in ast.walk(node):
+        if (
+            isinstance(child, ast.Constant)
+            and isinstance(child.value, str)
+            and id(child) not in fstring_fragments
+        ):
+            out.append(child.value)
+    return out
 
 
 def extract_constants_from_source(
