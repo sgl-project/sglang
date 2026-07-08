@@ -111,7 +111,7 @@ from sglang.utils import wait_for_server, print_highlight, terminate_process
 from openai import OpenAI
 
 server_process, port = launch_server_cmd(
-    "python3 -m sglang.launch_server --model-path Qwen/Qwen2.5-7B-Instruct --tool-call-parser qwen25 --host 0.0.0.0 --log-level warning"  # qwen25
+    "python3 -m sglang.launch_server --model-path Qwen/Qwen2.5-7B-Instruct --tool-call-parser qwen --host 0.0.0.0 --log-level warning"  # qwen
 )
 wait_for_server(f"http://localhost:{port}")
 ```
@@ -375,7 +375,7 @@ parse_url = f"http://localhost:{port}/parse_function_call"
 
 function_call_input = {
     "text": gen_response,
-    "tool_call_parser": "qwen25",
+    "tool_call_parser": "qwen",
     "tools": tools,
 }
 
@@ -442,7 +442,7 @@ def convert_dict_to_tool(tool_dict: dict) -> Tool:
 
 tools = [convert_dict_to_tool(raw_tool) for raw_tool in tools]
 
-parser = FunctionCallParser(tools=tools, tool_call_parser="qwen25")
+parser = FunctionCallParser(tools=tools, tool_call_parser="qwen")
 normal_text, calls = parser.parse_non_stream(generated_text)
 
 print_highlight("=== Parsing Result ===")
@@ -485,7 +485,7 @@ from sglang.test.doc_patch import launch_server_cmd
 
 # Start a new server session for tool choice examples
 server_process_tool_choice, port_tool_choice = launch_server_cmd(
-    "python3 -m sglang.launch_server --model-path Qwen/Qwen2.5-7B-Instruct --tool-call-parser qwen25 --host 0.0.0.0  --log-level warning"
+    "python3 -m sglang.launch_server --model-path Qwen/Qwen2.5-7B-Instruct --tool-call-parser qwen --host 0.0.0.0  --log-level warning"
 )
 wait_for_server(f"http://localhost:{port_tool_choice}")
 
