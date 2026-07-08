@@ -2,11 +2,9 @@
 
 Covers the three input paths:
   * default: the live batch is staged into the eager registry buffers.
-  * ``model_capture_mode``: staging is skipped so no copy nodes are baked
-    into a captured graph (spec-draft loops route per-step forwards through
-    the eager path during capture); the wrap must alias the live tensors.
-  * env overrides: ``SGLANG_EAGER_INPUT_NO_COPY`` forces the wrap anywhere,
-    ``SGLANG_EAGER_INPUT_NO_COPY_IN_CAPTURE=0`` restores staging in capture.
+  * ``skip_eager_input_staging``: graph-stable capture batches can opt out of
+    staging explicitly; capture mode alone is not enough.
+  * env overrides: ``SGLANG_EAGER_INPUT_NO_COPY`` forces the wrap anywhere.
 
 Imports pull ``sgl_kernel`` transitively, hence CUDA CI instead of CPU.
 """
@@ -34,6 +32,7 @@ class _MiniForwardBatch:
     batch_size: int = 1
     input_ids: Optional[torch.Tensor] = None
     input_embeds: Optional[torch.Tensor] = None
+    skip_eager_input_staging: bool = False
 
 
 def _make_runner() -> Tuple[EagerRunner, MagicMock]:
@@ -54,14 +53,12 @@ class TestEagerRunnerLoadBatch(CustomTestCase):
         registry.fill_from.assert_called_once()
         self.assertEqual(out, "staged-batch")
 
-    def test_capture_mode_skips_staging(self):
+    def test_capture_mode_stages_by_default(self):
         runner, registry = _make_runner()
         with model_capture_mode():
             out = runner.load_batch(self.fb)
-        registry.fill_from.assert_not_called()
-        # A fresh wrapper object, but aliasing the live tensors.
-        self.assertIsNot(out, self.fb)
-        self.assertIs(out.input_ids, self.fb.input_ids)
+        registry.fill_from.assert_called_once()
+        self.assertEqual(out, "staged-batch")
 
     def test_capture_mode_exit_restores_staging(self):
         runner, registry = _make_runner()
@@ -71,13 +68,14 @@ class TestEagerRunnerLoadBatch(CustomTestCase):
         registry.fill_from.assert_called_once()
         self.assertEqual(out, "staged-batch")
 
-    def test_capture_kill_switch_restores_staging(self):
+    def test_batch_flag_skips_staging(self):
         runner, registry = _make_runner()
-        with envs.SGLANG_EAGER_INPUT_NO_COPY_IN_CAPTURE.override(False):
-            with model_capture_mode():
-                out = runner.load_batch(self.fb)
-        registry.fill_from.assert_called_once()
-        self.assertEqual(out, "staged-batch")
+        self.fb.skip_eager_input_staging = True
+        out = runner.load_batch(self.fb)
+        registry.fill_from.assert_not_called()
+        # A fresh wrapper object, but aliasing the live tensors.
+        self.assertIsNot(out, self.fb)
+        self.assertIs(out.input_ids, self.fb.input_ids)
 
     def test_global_no_copy_flag_skips_staging(self):
         runner, registry = _make_runner()

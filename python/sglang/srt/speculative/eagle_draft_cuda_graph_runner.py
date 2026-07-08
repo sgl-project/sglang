@@ -406,6 +406,12 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             spec_algorithm=self.model_runner.spec_algorithm,
             spec_info=spec_info,
             sampling_info=sampling_info,
+            # These fields are views into self.buffers. Replay refreshes
+            # contents in-place, so captured addresses stay stable and eager
+            # staging would only record redundant copy nodes.
+            skip_eager_input_staging=(
+                envs.SGLANG_EAGER_INPUT_NO_COPY_IN_DRAFT_CAPTURE.get()
+            ),
             rids_int=rids_int,
             bootstrap_room_ids_int=bootstrap_room_ids_int,
             capture_hidden_mode=(

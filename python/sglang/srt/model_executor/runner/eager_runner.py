@@ -49,7 +49,6 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     enable_tc_piecewise_cuda_graph,
     set_tc_piecewise_forward_context,
 )
-from sglang.srt.model_executor.runner_utils import capture_mode
 from sglang.srt.utils import is_hip
 from sglang.srt.utils.common import ceil_align, require_mlp_sync
 
@@ -175,14 +174,13 @@ class EagerRunner(BaseRunner):
         this batch's shape) — the eager counterpart of the cuda-graph runners'
         load_batch.
 
-        Skipped during graph capture: the spec-draft graph runners route each
-        per-step forward through this eager path inside their captured region,
-        and the staging copy_ nodes would be baked into the graph re-reading
-        the same graph-stable sources that the no-copy wrap exposes directly.
+        Skipped only when the caller marks the batch as already backed by
+        graph-stable input buffers; generic graph capture is not enough to
+        prove that aliasing contract.
         """
-        if envs.SGLANG_EAGER_INPUT_NO_COPY.get() or (
-            capture_mode.is_capture_mode
-            and envs.SGLANG_EAGER_INPUT_NO_COPY_IN_CAPTURE.get()
+        if (
+            envs.SGLANG_EAGER_INPUT_NO_COPY.get()
+            or forward_batch.skip_eager_input_staging
         ):
             return replace(forward_batch)
         raw_bs = forward_batch.batch_size
