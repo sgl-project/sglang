@@ -464,6 +464,7 @@ class Scheduler(
         self.token_to_kv_pool_allocator = result.token_to_kv_pool_allocator
         self.disable_radix_cache = result.disable_radix_cache
         self.tree_cache = result.tree_cache
+        self.init_session_radix_cache_guard()
 
         if (c := self.tp_worker.model_runner.canary_manager) is not None:
             c.attach_radix_cache(self.tree_cache)
@@ -949,6 +950,24 @@ class Scheduler(
                 context_len=self.model_config.context_len,
                 startup_available_gpu_memory_gb=avail_mem,
             )
+
+    def init_session_radix_cache_guard(self) -> None:
+        # TODO (zhangmj): need to remove if support UnifiedRadixCache
+        if not self.server_args.enable_session_radix_cache:
+            return
+
+        from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
+        from sglang.srt.mem_cache.radix_cache import RadixCache
+
+        if type(self.tree_cache) not in (RadixCache, HiRadixCache):
+            logger.warning(
+                "enable_session_radix_cache is set but tree_cache is %s, "
+                "disabling session radix cache.",
+                type(self.tree_cache).__name__,
+            )
+            self.server_args.enable_session_radix_cache = False
+            if isinstance(self.tree_cache, RadixCache):
+                self.tree_cache.enable_session_radix_cache = False
 
     def init_hisparse_coordinator(self) -> None:
         self.hisparse_coordinator: Optional[HiSparseCoordinator] = None
@@ -4432,6 +4451,8 @@ class Scheduler(
         return ExpertDistributionReqOutput()
 
     def open_session(self, recv_req: OpenSessionReqInput):
+        if self.server_args.enable_session_radix_cache:
+            self.tree_cache.open_radix_session(recv_req.session_id)
         output = self.session_controller.open(recv_req)
         if self.ps.pp_rank == 0 and self.ps.tp_rank == 0 and self.ps.attn_cp_rank == 0:
             return output
