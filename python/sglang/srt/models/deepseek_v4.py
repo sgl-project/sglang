@@ -53,7 +53,6 @@ from sglang.srt.layers.deepseek_v4_rope import (
     v4_rope_inplace_npu,
 )
 from sglang.srt.layers.dp_attention import (
-    _DpGatheredBufferWrapper,
     _tbo_event,
     attn_tp_all_gather,
     attn_tp_all_reduce,
@@ -2055,7 +2054,7 @@ class DeepseekV4Model(nn.Module):
 
         if get_parallel().attn_dp_size > 1 and get_moe_a2a_backend().is_none():
             input_ids_global = torch.empty(
-                (_DpGatheredBufferWrapper._global_dp_buffer_len, 1),
+                (get_global_dp_buffer_len(), 1),
                 dtype=input_ids.dtype,
                 device=input_ids.device,
             )

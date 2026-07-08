@@ -634,6 +634,33 @@ class TestForwardFlags(_IsolatedServerArgs):
         self.assertIsNone(get_forward().attn_inputs)
         self.assertFalse(ctx.input_scattered)
 
+    def test_dp_buffer_state_split(self):
+        import torch
+
+        from sglang.srt.layers.dp_attention import _DpGatheredBufferWrapper as wrapper
+        from sglang.srt.layers.dp_attention import (
+            get_dp_dtype,
+            get_dp_global_num_tokens,
+            get_global_dp_buffer_len,
+            is_dp_max_padding,
+            set_dp_buffer_len,
+        )
+
+        reset_context()
+        # metadata is init-static (flags.dp); sizing is per-forward sticky
+        wrapper.set_metadata(64, torch.float16, torch.device("cpu"))
+        self.assertEqual(get_dp_dtype(), torch.float16)
+        set_dp_buffer_len(128, 32, True, [64, 64])
+        self.assertEqual(get_global_dp_buffer_len(), 128)
+        self.assertTrue(is_dp_max_padding())
+        self.assertEqual(get_dp_global_num_tokens(), [64, 64])
+        set_dp_buffer_len(256, 64, False)  # sticky until the next write
+        self.assertEqual(get_global_dp_buffer_len(), 256)
+        self.assertFalse(is_dp_max_padding())
+        self.assertIsNone(get_dp_global_num_tokens())
+        reset_context()
+        self.assertIsNone(get_dp_dtype())
+
     def test_is_extend_in_batch_sticky_within_thread(self):
         from sglang.srt.layers.dp_attention import (
             get_is_extend_in_batch,
