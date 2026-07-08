@@ -239,5 +239,33 @@ class TestMetalJitOpDecorator(unittest.TestCase):
         self.assertEqual(captured, [f"{name}_yfloat16_sfloat32"])
 
 
+@unittest.skipUnless(_IS_APPLE_SILICON and _HAS_MLX, _SKIP_REASON)
+class TestMetalJitOpDispatchTemplate(unittest.TestCase):
+    """Base dispatch routes through can_fuse to the fused or fallback hook."""
+
+    def _stub_op(self, eligible):
+        class _Stub(metal_jit.MetalJitOp):
+            def can_fuse(self, *args, **kwargs):
+                return eligible
+
+            def dispatch_fused(self, *args, **kwargs):
+                return ("fused", args, kwargs)
+
+            def dispatch_fallback(self, *args, **kwargs):
+                return ("fallback", args, kwargs)
+
+        return _Stub()
+
+    def test_dispatch_routes_to_fused_when_eligible(self):
+        self.assertEqual(
+            self._stub_op(True).dispatch(1, k=2), ("fused", (1,), {"k": 2})
+        )
+
+    def test_dispatch_routes_to_fallback_when_ineligible(self):
+        self.assertEqual(
+            self._stub_op(False).dispatch(1, k=2), ("fallback", (1,), {"k": 2})
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

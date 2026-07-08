@@ -210,7 +210,26 @@ class FusedGateQmvSiluMulKernel(metal_jit.MetalJitOp):
 
     source = _KERNEL_SOURCE
 
-    def dispatch(
+    def can_fuse(
+        self,
+        x: mx.array,
+        gate_w: mx.array,
+        gate_s: mx.array,
+        gate_b: mx.array,
+        indices: mx.array,
+        x_up: mx.array,
+    ) -> bool:
+        """Regime predicate over the same checks dispatch_fallback diagnoses."""
+        K = gate_s.shape[-1] * _GROUP_SIZE
+        N = gate_w.shape[-2]
+        return (
+            K % _BLOCK_SIZE == 0
+            and N % _ROWS_PER_TG == 0
+            and gate_s.dtype == x.dtype
+            and gate_b.dtype == x.dtype
+        )
+
+    def dispatch_fused(
         self,
         x: mx.array,
         gate_w: mx.array,
@@ -240,25 +259,8 @@ class FusedGateQmvSiluMulKernel(metal_jit.MetalJitOp):
         up to floating-point ordering of accumulations (which matches MLX's own
         qmv_fast_impl exactly).
         """
-        # Validate the regime this kernel supports. Outside it, the caller should
-        # fall back to the unfused MLX path.
         K = gate_s.shape[-1] * _GROUP_SIZE
         N = gate_w.shape[-2]
-        if K % _BLOCK_SIZE != 0:
-            raise ValueError(
-                f"fused_gate_qmv_silu_mul: K={K} not divisible by {_BLOCK_SIZE}. "
-                f"Use the unfused path."
-            )
-        if N % _ROWS_PER_TG != 0:
-            raise ValueError(
-                f"fused_gate_qmv_silu_mul: N={N} not divisible by {_ROWS_PER_TG}."
-            )
-        # Scales/biases dtype must match x dtype for in-kernel float() conversion.
-        if gate_s.dtype != x.dtype or gate_b.dtype != x.dtype:
-            raise ValueError(
-                f"fused_gate_qmv_silu_mul: dtype mismatch x={x.dtype} "
-                f"s={gate_s.dtype} b={gate_b.dtype}"
-            )
 
         # Shape handling: x always has K as its last axis. M_tok is the number of
         # distinct pre-gather tokens (= x.size // K). T is the top_k axis carried
@@ -305,6 +307,41 @@ class FusedGateQmvSiluMulKernel(metal_jit.MetalJitOp):
         # Reshape to x_up's shape, which is exactly what self.activation(x_up,
         # x_gate) would have returned (silu*mul is shape-preserving).
         return y_flat.reshape(x_up.shape)
+
+    def dispatch_fallback(
+        self,
+        x: mx.array,
+        gate_w: mx.array,
+        gate_s: mx.array,
+        gate_b: mx.array,
+        indices: mx.array,
+        x_up: mx.array,
+    ):
+        """Raise the regime diagnostic; this op has no in-op reference path.
+
+        The unfused gate path needs the gate module and the sorted flag,
+        neither of which the op receives; _fused_gate_or_fallback catches
+        this ValueError and runs it.
+        """
+        # Validate the regime this kernel supports. Outside it, the caller should
+        # fall back to the unfused MLX path.
+        K = gate_s.shape[-1] * _GROUP_SIZE
+        N = gate_w.shape[-2]
+        if K % _BLOCK_SIZE != 0:
+            raise ValueError(
+                f"fused_gate_qmv_silu_mul: K={K} not divisible by {_BLOCK_SIZE}. "
+                f"Use the unfused path."
+            )
+        if N % _ROWS_PER_TG != 0:
+            raise ValueError(
+                f"fused_gate_qmv_silu_mul: N={N} not divisible by {_ROWS_PER_TG}."
+            )
+        # Scales/biases dtype must match x dtype for in-kernel float() conversion.
+        if gate_s.dtype != x.dtype or gate_b.dtype != x.dtype:
+            raise ValueError(
+                f"fused_gate_qmv_silu_mul: dtype mismatch x={x.dtype} "
+                f"s={gate_s.dtype} b={gate_b.dtype}"
+            )
 
 
 _OP = FusedGateQmvSiluMulKernel()

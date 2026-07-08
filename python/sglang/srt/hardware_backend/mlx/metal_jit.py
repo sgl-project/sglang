@@ -86,14 +86,29 @@ class MetalJitOp:
 
     The decorator stores the class's Metal source in the registry; dispatch
     then compiles lazily per dtype key through the module level ``get()`` and
-    ``warm_once()`` seams. Subclasses implement ``dispatch`` with the op's own
-    call signature, owning the eligibility guard and launch geometry.
+    ``warm_once()`` seams. Subclasses implement ``can_fuse``, ``dispatch_fused``,
+    and ``dispatch_fallback`` with the op's own call signature; the base owns
+    ``dispatch`` and its guard branch.
     """
 
     source: str  # Body only Metal source; the decorator validates presence.
 
     def dispatch(self, *args, **kwargs):
-        """Run the op. Subclasses own the signature, guards, and geometry."""
+        """Run the op: fused kernel when eligible, reference fallback otherwise."""
+        if self.can_fuse(*args, **kwargs):
+            return self.dispatch_fused(*args, **kwargs)
+        return self.dispatch_fallback(*args, **kwargs)
+
+    def can_fuse(self, *args, **kwargs):
+        """Eligibility guard: True routes dispatch to the fused kernel."""
+        raise NotImplementedError
+
+    def dispatch_fused(self, *args, **kwargs):
+        """Fused path: launch geometry plus the kernel call."""
+        raise NotImplementedError
+
+    def dispatch_fallback(self, *args, **kwargs):
+        """Reference path for inputs can_fuse declines."""
         raise NotImplementedError
 
     def warmup_specs(self, model) -> Iterable[WarmupSpec]:

@@ -114,7 +114,7 @@ class FusedMoeCombineKernel(metal_jit.MetalJitOp):
             return False
         return True
 
-    def dispatch(self, y: mx.array, scores: mx.array) -> mx.array:
+    def dispatch_fused(self, y: mx.array, scores: mx.array) -> mx.array:
         """Compute ``out[..., h] = sum_k y[..., k, h] * scores[..., k]`` in one kernel.
 
         Numerical contract: this computes the same reduction as the reference::
@@ -136,9 +136,6 @@ class FusedMoeCombineKernel(metal_jit.MetalJitOp):
         row dim and restored on the output, so rank 3 [B, TOP_K, H] and the
         mlx-lm site's rank 4 [batch, seq, TOP_K, H] both dispatch.
         """
-        if not self.can_fuse(y, scores):
-            return (y * scores[..., None]).sum(axis=-2).astype(y.dtype)
-
         TOPK, H = y.shape[-2], y.shape[-1]
         lead = tuple(y.shape[:-2])
         y = y.reshape(-1, TOPK, H)
@@ -161,6 +158,10 @@ class FusedMoeCombineKernel(metal_jit.MetalJitOp):
             output_dtypes=[y.dtype],
         )
         return out.reshape(*lead, H)
+
+    def dispatch_fallback(self, y: mx.array, scores: mx.array) -> mx.array:
+        """Broadcast multiply and sum reference, narrowed to ``y.dtype``."""
+        return (y * scores[..., None]).sum(axis=-2).astype(y.dtype)
 
 
 _OP = FusedMoeCombineKernel()
