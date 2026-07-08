@@ -134,10 +134,10 @@ def test_lower_call_sites_magic_comma_with_sole_receiver_arg_stays_valid(
 
 def test_call_rewrite_is_column_accurate_on_non_ascii_lines(tmp_path: Path) -> None:
     """A call after a non-ASCII string on the same line is rewritten at the right columns."""
-    (tmp_path / "m.py").write_text('x = "€€"; y = Owner.foo(self.r, 1)\n')
+    (tmp_path / "m.py").write_text('x = "中文"; y = Owner.foo(self.r, 1)\n')
     r = Repro("b", "t").lower_call_sites("foo", "Owner", paths=["m.py"])
     _apply(r, tmp_path)
-    assert (tmp_path / "m.py").read_text() == 'x = "€€"; y = self.r.foo(1)\n'
+    assert (tmp_path / "m.py").read_text() == 'x = "中文"; y = self.r.foo(1)\n'
 
 
 def test_call_rewrite_survives_a_form_feed_line_start(tmp_path: Path) -> None:
