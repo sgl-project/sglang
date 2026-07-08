@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import os
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from sglang.srt.arg_groups.arg_utils import resolvable_fields
@@ -459,6 +460,90 @@ def _minimax_m2_overrides(server_args: Any, hf_config: Any) -> dict:
         "Enable TF32 matmul for MiniMaxM2ForCausalLM model to improve gate gemm performance."
     )
     return {"enable_tf32_matmul": True}
+
+
+@_register_for("MiniMaxM3SparseForCausalLM", "MiniMaxM3SparseForConditionalGeneration")
+def _minimax_m3_overrides(server_args: Any, hf_config: Any) -> dict:
+    overrides: Dict[str, Any] = {}
+
+    quant_method = get_quantization_config(hf_config)
+    quant_resolved = server_args.quantization
+    if (
+        quant_resolved is None
+        and not server_args._quantization_explicitly_unset
+        and quant_method is not None
+    ):
+        overrides["quantization"] = quant_method
+        quant_resolved = quant_method
+
+    if is_hip():
+        if server_args.is_attention_backend_not_set():
+            overrides["attention_backend"] = "triton"
+        if server_args.moe_runner_backend == "auto" and quant_resolved == "mxfp8":
+            overrides["moe_runner_backend"] = "triton"
+        os.environ.setdefault("USE_ROCM_AITER_ROPE_BACKEND", "0")
+        aiter_fusion_resolved = server_args.enable_aiter_allreduce_fusion
+        if (
+            server_args.ep_size > 1
+            and server_args.moe_a2a_backend == "none"
+            and aiter_fusion_resolved
+        ):
+            logger.warning(
+                "Disable --enable-aiter-allreduce-fusion for MiniMax-M3 "
+                "standard EP on ROCm because the deferred fused all-reduce "
+                "corrupts sparse MoE partial outputs."
+            )
+            overrides["enable_aiter_allreduce_fusion"] = False
+            aiter_fusion_resolved = False
+        if not aiter_fusion_resolved:
+            overrides["disable_custom_all_reduce"] = True
+    elif is_sm100_supported():
+        if server_args.is_attention_backend_not_set():
+            overrides["attention_backend"] = "fa4"
+        page_resolved = server_args.page_size
+        if (
+            page_resolved is None
+            and overrides.get("attention_backend", server_args.attention_backend)
+            == "fa4"
+        ):
+            overrides["page_size"] = 128
+            page_resolved = 128
+        if server_args.moe_runner_backend == "auto" and quant_resolved == "mxfp8":
+            overrides["moe_runner_backend"] = "deep_gemm"
+        logger.info(
+            "MiniMax-M3 on SM100: attention_backend="
+            f"{overrides.get('attention_backend', server_args.attention_backend)}, page_size={page_resolved}, "
+            f"moe_runner_backend={overrides.get('moe_runner_backend', server_args.moe_runner_backend)}."
+        )
+    elif is_sm90_supported():
+        if server_args.is_attention_backend_not_set():
+            overrides["attention_backend"] = "fa3"
+        page_resolved = server_args.page_size
+        if (
+            page_resolved is None
+            and overrides.get("attention_backend", server_args.attention_backend)
+            == "fa3"
+        ):
+            overrides["page_size"] = 128
+            page_resolved = 128
+        logger.info(
+            "MiniMax-M3 on Hopper: attention_backend="
+            f"{overrides.get('attention_backend', server_args.attention_backend)}, page_size={page_resolved} "
+            "(MSA is SM100-only; sparse attention runs on the Triton path)."
+        )
+
+    moe_runner_resolved = overrides.get(
+        "moe_runner_backend", server_args.moe_runner_backend
+    )
+    if quant_resolved is None and moe_runner_resolved in ("auto", "deep_gemm"):
+        if moe_runner_resolved == "deep_gemm":
+            logger.warning(
+                "MiniMax-M3: the deep_gemm MoE runner produces corrupted output "
+                "on bf16 full weights; overriding --moe-runner-backend to 'triton'."
+            )
+        overrides["moe_runner_backend"] = "triton"
+
+    return overrides
 
 
 @_register_for(
