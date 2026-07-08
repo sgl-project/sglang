@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from typing import Optional
 
 import torch
@@ -30,11 +31,30 @@ SAMPLE_DIFF_THRESHOLD = 1e-3
 DEFAULT_PREDICATE: str = "rel <= 0.001"
 
 
+@dataclass
+class FailureDisplayBudget:
+    max_detail: int = 50
+    num_emitted: int = 0
+
+    def take(self) -> bool:
+        if self.max_detail < 0:
+            return True
+        if self.num_emitted >= self.max_detail:
+            return False
+        self.num_emitted += 1
+        return True
+
+
 def compute_tensor_info(
-    tensor: torch.Tensor, *, include_sample: bool = False
+    tensor: torch.Tensor,
+    *,
+    include_sample: bool = False,
+    include_percentiles: bool = True,
 ) -> TensorInfo:
     """Compute TensorInfo (shape, dtype, stats, optional sample) for a single tensor."""
-    stats: TensorStats = _compute_tensor_stats(tensor.float())
+    stats: TensorStats = _compute_tensor_stats(
+        tensor.float(), include_percentiles=include_percentiles
+    )
     sample: Optional[str] = (
         str(get_truncated_value(tensor.float())) if include_sample else None
     )
@@ -52,14 +72,13 @@ def compare_tensor_pair(
     name: str = "",
     diff_threshold_rules: Optional[list[DiffThresholdRule]] = None,
     seq_dim: Optional[int] = None,
+    failure_display_budget: Optional[FailureDisplayBudget] = None,
 ) -> TensorComparisonInfo:
     predicate = resolve_predicate(
         name, diff_threshold_rules, default_predicate=DEFAULT_PREDICATE
     )
 
-    baseline_info: TensorInfo = compute_tensor_info(x_baseline)
-    target_info: TensorInfo = compute_tensor_info(x_target)
-
+    x_baseline_original = x_baseline
     x_baseline = try_unify_shape(x_baseline, target_shape=x_target.shape)
     unified_shape = list(x_baseline.shape)
 
@@ -81,8 +100,31 @@ def compare_tensor_pair(
             x_target=x_target_f,
             predicate=predicate,
             seq_dim=seq_dim,
+            include_percentiles=False,
         )
 
+    is_failure = shape_mismatch or (diff is not None and not diff.passed)
+    needs_detail = is_failure and (
+        failure_display_budget is None or failure_display_budget.take()
+    )
+
+    baseline_info: TensorInfo = compute_tensor_info(
+        x_baseline_original, include_percentiles=needs_detail
+    )
+    target_info: TensorInfo = compute_tensor_info(
+        x_target, include_percentiles=needs_detail
+    )
+
+    if not shape_mismatch and needs_detail:
+        diff = compute_diff(
+            x_baseline=x_baseline_f,
+            x_target=x_target_f,
+            predicate=predicate,
+            seq_dim=seq_dim,
+            include_percentiles=True,
+        )
+
+    if diff is not None:
         needs_sample = diff.max_abs_diff > SAMPLE_DIFF_THRESHOLD
         if needs_sample:
             baseline_info.sample = str(get_truncated_value(x_baseline_f))
@@ -97,6 +139,7 @@ def compare_tensor_pair(
                     x_baseline=x_baseline_f.to(downcast_dtype),
                     x_target=x_target_f.to(downcast_dtype),
                     predicate=predicate,
+                    include_percentiles=needs_detail,
                 )
 
     return TensorComparisonInfo(
@@ -111,7 +154,9 @@ def compare_tensor_pair(
     )
 
 
-def _compute_tensor_stats(x: torch.Tensor) -> TensorStats:
+def _compute_tensor_stats(
+    x: torch.Tensor, *, include_percentiles: bool = True
+) -> TensorStats:
     if x.numel() == 0:
         return TensorStats(
             mean=0.0,
@@ -122,7 +167,9 @@ def _compute_tensor_stats(x: torch.Tensor) -> TensorStats:
             percentiles={},
         )
 
-    include_quantiles: bool = x.numel() < QUANTILE_NUMEL_THRESHOLD
+    include_quantiles: bool = (
+        include_percentiles and x.numel() < QUANTILE_NUMEL_THRESHOLD
+    )
     return TensorStats(
         mean=torch.mean(x).item(),
         abs_mean=torch.mean(x.abs()).item(),
@@ -148,6 +195,7 @@ def compute_diff(
     x_target: torch.Tensor,
     predicate: str = DEFAULT_PREDICATE,
     seq_dim: Optional[int] = None,
+    include_percentiles: bool = True,
 ) -> DiffInfo:
     if x_baseline.numel() == 0:
         return DiffInfo(
@@ -171,7 +219,9 @@ def compute_diff(
     )
     mean_abs_diff = raw_abs_diff.mean().item()
 
-    include_quantiles: bool = raw_abs_diff.numel() < QUANTILE_NUMEL_THRESHOLD
+    include_quantiles: bool = (
+        include_percentiles and raw_abs_diff.numel() < QUANTILE_NUMEL_THRESHOLD
+    )
 
     per_token_rel_diff: Optional[list[float]] = None
     if seq_dim is not None and x_baseline.dim() > seq_dim:
