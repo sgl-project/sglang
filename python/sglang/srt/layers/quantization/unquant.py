@@ -727,7 +727,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         dispatch_output: DispatchOutput,
     ) -> CombineInput:
 
-        backend = self.runner.runner_backend
         return self.runner.run(dispatch_output, layer)
 
     def forward_tpu(self, *args, **kwargs) -> CombineInput:

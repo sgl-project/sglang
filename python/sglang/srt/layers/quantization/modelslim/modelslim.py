@@ -426,7 +426,6 @@ class ModelSlimFusedMoEMethod(FusedMoEMethodBase):
         layer,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
-        backend = self.runner.runner_backend
         quant_info = AscendQuantInfo(
             w13_weight=layer.w13_weight,
             w2_weight=layer.w2_weight,

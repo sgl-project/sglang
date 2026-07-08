@@ -612,7 +612,6 @@ do
         export HCCL_BUFFSIZE=800
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=131072
-        export SGLANG_NPU_FUSED_MOE_MODE=2
         export SGLANG_USE_AG_AFTER_QLORA=1
         export TASK_QUEUE_ENABLE=2
 
@@ -680,7 +679,7 @@ do
         --mem-fraction-static 0.82 \
         --max-running-requests 1024 \
         --moe-a2a-backend ascend_fuseep \
-        --fuseep_mode 1 \
+        --fuseep-mode 1 \
         --enable-dp-attention \
         --deepep-mode low_latency \
         --moe-dense-tp 1 \

@@ -6,7 +6,6 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.utils import npu_format_cast
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
-from sglang.srt.server_args import get_global_server_args
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -237,7 +236,7 @@ class NPUW4A4Int4MoEMethod(_NPUMoEMethodBase):
         pertoken_scale: torch.Tensor,
         output_dtype: torch.dtype,
         weight_prefix: str,
-        group_list_type: int,
+        group_list_type,
     ) -> torch.Tensor:
         scale = getattr(quant_info, f"{weight_prefix}_weight_scale", None)
         if pertoken_scale is None:
@@ -342,7 +341,7 @@ class NPUW8A8Int8MoEMethod(_NPUMoEMethodBase):
         pertoken_scale: torch.Tensor,
         output_dtype: torch.dtype,
         weight_prefix: str,
-        group_list_type: int,
+        group_list_type,
     ) -> torch.Tensor:
         scale = getattr(quant_info, f"{weight_prefix}_weight_scale", None)
         if pertoken_scale is None:
@@ -490,7 +489,7 @@ class NPUW4A8Int8MoEMethod(_NPUMoEMethodBase):
         pertoken_scale: torch.Tensor,
         output_dtype: torch.dtype,
         weight_prefix: str,
-        group_list_type: int,
+        group_list_type,
     ) -> torch.Tensor:
         scale = getattr(quant_info, f"{weight_prefix}_weight_scale", None)
         if pertoken_scale is None:
@@ -650,7 +649,7 @@ class NPUWNA16Int4MoEMethod(_NPUMoEMethodBase):
         pertoken_scale: torch.Tensor,  # not used, but kept for interface consistency
         output_dtype: torch.dtype,
         weight_prefix: str,
-        group_list_type: int,
+        group_list_type,
     ) -> torch.Tensor:
         scale = getattr(quant_info, f"{weight_prefix}_weight_scale", None)
         offset = getattr(quant_info, f"{weight_prefix}_weight_offset", None)
@@ -671,82 +670,41 @@ class NPUWNA16Int4MoEMethod(_NPUMoEMethodBase):
 
 
 # ---------------------------------------------------------------------------
-# NPUUnquantMoEMethod + w8a8 online quantization
+#  NPUWUnquantMoEMethod
 # ---------------------------------------------------------------------------
 class NPUUnquantMoEMethod(_NPUMoEMethodBase):
+    """Unquant MoE – all computations in BF16, no quantization."""
+
     def __init__(self):
         super().__init__(quant_config=None)
         self.matmul = GroupedMatmul()
-        self.hidden_states_quantizer = None
-        self._quant_mode = None
-        self.transposed = False
 
-    def process_weights_after_loading(self, layer, weight_prefix):
+    def process_weights_after_loading(
+        self, layer: torch.nn.Module, weight_prefix: str
+    ) -> None:
         self._validate_weight_prefix(layer, weight_prefix)
-        weight_name = f"{weight_prefix}_weight"
 
-        online_quant = (
-            get_global_server_args().online_quantization
-        )  # set by server_args
-
-        if online_quant == "w8a8_int8":
-            self._apply_online_w8a8(layer, weight_prefix, weight_name)
-            self._quant_mode = "w8a8_int8"
-        else:
-            # Pure BF16
-            weight = getattr(layer, weight_name)
-            formatted = npu_format_cast(weight.data)
-            layer.__setattr__(
-                weight_name, torch.nn.Parameter(formatted, requires_grad=False)
-            )
-            setattr(self, weight_name, formatted)
-            self._quant_mode = "bf16"
-            if weight_prefix == "w13":
-                self._set_dispatcher_output_dtype(layer, "bf16")
-
-    # --------------- W8A8 int8 ---------------
-    def _apply_online_w8a8(self, layer, weight_prefix, weight_name):
-        weight_fp = getattr(layer, weight_name)
-        qw, weight_scale = torch.ops.npu.npu_dynamic_quant(weight_fp)
-        qw_npu = npu_format_cast(qw.transpose(-2, -1))
-
-        setattr(layer, weight_name, torch.nn.Parameter(qw_npu, requires_grad=False))
-        layer.register_parameter(
-            f"{weight_name}_scale",
-            torch.nn.Parameter(weight_scale, requires_grad=False),
+        weight: torch.Tensor = getattr(layer, f"{weight_prefix}_weight")
+        weight.data = npu_format_cast(weight)
+        setattr(
+            layer,
+            f"{weight_prefix}_weight",
+            torch.nn.Parameter(weight, requires_grad=False),
         )
-        setattr(self, weight_name, qw_npu)
-        setattr(self, f"{weight_name}_scale", weight_scale)
-        torch.npu.empty_cache()
 
         if weight_prefix == "w13":
-            self._set_dispatcher_output_dtype(layer, "int8")
-        self.hidden_states_quantizer = HiddenStatesDynamicQuant(quant_dtype=torch.int8)
-        self.transposed = True
+            self._set_dispatcher_output_dtype(layer, "bf16")
 
-    # ------------------------------------------------------------------
-    # Forward pass
-    # ------------------------------------------------------------------
     def apply(
         self,
         quant_info: "AscendQuantInfo",
         hidden_states: torch.Tensor,
         expert_tokens: torch.Tensor,
-        pertoken_scale: torch.Tensor,
+        pertoken_scale: torch.Tensor,  # ignored
         output_dtype: torch.dtype,
         weight_prefix: str,
-        group_list_type: int,
+        group_list_type,
     ) -> torch.Tensor:
-
-        scale_args = {}
-        weight_scale = getattr(self, f"{weight_prefix}_weight_scale", None)
-        if weight_scale is None:
-            scale_args = {"scale": [weight_scale]}
-
-        if self.hidden_states_quantizer is not None and pertoken_scale is None:
-            hidden_states, pertoken_scale = self.hidden_states_quantizer(hidden_states)
-            scale_args["per_token_scale"] = [pertoken_scale]
-
         return self.matmul.forward(
             quant_info,
             weight_prefix,
@@ -754,6 +712,5 @@ class NPUUnquantMoEMethod(_NPUMoEMethodBase):
             expert_tokens,
             output_dtype,
             group_list_type=group_list_type,
-            transposed=self.transposed,
-            **scale_args,
+            transposed=False,
         )
