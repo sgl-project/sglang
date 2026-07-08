@@ -7,16 +7,16 @@ to split the change so the move commit is provable.
 
 ## Auto-generate the reproduce script from a commit (primary path)
 
-`mechanical_refactor_generate_proof.py` infers the recipe from a commit's diff and
+`mechanical_refactor_proof_generator.py` infers the recipe from a commit's diff and
 before-state AST, then emits and runs a standalone, auditable reproduce script — no one
 hand-writes it.
 
 ```bash
 # one commit: print the inferred script and run it
-python3 .claude/skills/mechanical-refactor-verify/scripts/mechanical_refactor_generate_proof.py <commit>
+python3 .claude/skills/mechanical-refactor-verify/scripts/mechanical_refactor_proof_generator.py <commit>
 
 # a range: write a self-contained folder (repro_scripts/<sha>.py + output.log + output.html)
-python3 .claude/skills/mechanical-refactor-verify/scripts/mechanical_refactor_generate_proof.py \
+python3 .claude/skills/mechanical-refactor-verify/scripts/mechanical_refactor_proof_generator.py \
     <base>..<tip> --match -move: --out repro_out
 ```
 
@@ -66,7 +66,7 @@ import sys
 from pathlib import Path
 
 sys.path.append(".claude/skills/mechanical-refactor-verify/scripts")
-from mechanical_refactor_reproduce_utils import Repro
+from mechanical_refactor_reproduction_utils import Repro
 
 r = Repro(base="<base_sha>", target="<commit>")
 # Adapt call sites / repath imports BEFORE moving, so a call to a moved method from inside
@@ -120,7 +120,7 @@ import sys
 from pathlib import Path
 
 sys.path.append(".claude/skills/mechanical-refactor-verify/scripts")
-from mechanical_refactor_reproduce_utils import verify_mechanical_refactor, git_add_and_commit
+from mechanical_refactor_reproduction_utils import verify_mechanical_refactor, git_add_and_commit
 
 BASE_COMMIT = "<base_sha>"
 TARGET_COMMIT = "<final_sha>"
@@ -144,7 +144,7 @@ if __name__ == "__main__":
 
 Share the whole `--out` folder (a gist, a PR attachment, a repo branch) — it is
 self-contained: `repro_scripts/<sha>.py` plus the copied
-`mechanical_refactor_reproduce_utils.py` it imports. A generated script resolves that module
+`mechanical_refactor_reproduction_utils.py` it imports. A generated script resolves that module
 relative to its own path, so share the folder, not one raw file (a
 `python3 <(curl ...)` process substitution breaks the relative import). Include the
 commands in the PR description:

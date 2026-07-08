@@ -70,7 +70,7 @@ sealing:
 
 **Check:** the body is byte-identical and the only other changes are move artifacts —
 the dropped decorator, the import, and the requalified call site — so the reproduce proof
-(`mechanical_refactor_generate_proof.py <commit>`) reports `PASS`. Cross-check with
+(`mechanical_refactor_proof_generator.py <commit>`) reports `PASS`. Cross-check with
 `git show <commit> --color-moved=dimmed-zebra --color-moved-ws=allow-indentation-change`,
 which marks the whole block as moved.
 
@@ -159,7 +159,7 @@ method); the body is **unchanged, line for line**:
 `def foo(self: Target)` → `def foo(self)` annotation drop are move artifacts. The caller
 changes from `Source.foo(self.component, ...)` to `self.component.foo(...)` — the receiver
 moves out of the argument list — which the reproduce proof replays with its `lower_call_sites`
-primitive, so the whole commit reports `PASS` (`mechanical_refactor_generate_proof.py
+primitive, so the whole commit reports `PASS` (`mechanical_refactor_proof_generator.py
 <commit>`). The split still pays off: because prep left the body untouched, the move is a
 clean cut/paste.
 

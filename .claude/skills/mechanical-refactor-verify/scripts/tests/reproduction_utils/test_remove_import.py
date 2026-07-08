@@ -6,8 +6,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-import mechanical_refactor_reproduce_utils as rr
-from mechanical_refactor_reproduce_utils import (
+import mechanical_refactor_reproduction_utils as rr
+from mechanical_refactor_reproduction_utils import (
     Repro,
     _def_span,
     _find_class,
@@ -19,7 +19,7 @@ from mechanical_refactor_reproduce_utils import (
     git_add_and_commit,
     verify_mechanical_refactor,
 )
-from reproduce_testlib import _apply, _commit, _git, _write  # noqa: F401
+from reproduction_testlib import _apply, _commit, _git, _write  # noqa: F401
 
 # --- remove_import -------------------------------------------------------------
 

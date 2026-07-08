@@ -6,14 +6,14 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from generate_testlib import (  # noqa: F401
+from generator_testlib import (  # noqa: F401
     _commit,
     _free_function_move_with_module_level_caller,
     _git,
     _method_onto_class,
     _write,
 )
-from mechanical_refactor_generate_proof import (
+from mechanical_refactor_proof_generator import (
     infer_recipe,
     recipe_to_script,
 )
@@ -23,12 +23,12 @@ def test_recipe_to_script_is_self_contained_and_ordered(repo: Path) -> None:
     """The emitted script imports only the reproduce util and lowers before moving."""
     _method_onto_class(repo)
     script = recipe_to_script(infer_recipe("HEAD", str(repo)), "move foo onto C")
-    assert "from mechanical_refactor_reproduce_utils import Repro" in script
+    assert "from mechanical_refactor_reproduction_utils import Repro" in script
     assert script.index("lower_call_sites") < script.index("move_symbol")
     assert "r.run()" in script
     # importing nothing else from the skill keeps the script auditable in isolation
     assert "mechanical_refactor_verify_utils" not in script
-    assert "mechanical_refactor_generate_proof" not in script
+    assert "mechanical_refactor_proof_generator" not in script
 
 
 def test_recipe_to_script_orders_import_ops_after_moves(repo: Path) -> None:
@@ -42,7 +42,7 @@ def test_recipe_to_script_orders_import_ops_after_moves(repo: Path) -> None:
 
 def test_per_file_diff_keeps_content_lines_starting_with_plus_signs(repo: Path) -> None:
     """An added content line beginning with '++' is collected, not mistaken for a header."""
-    from mechanical_refactor_generate_proof import _per_file_diff
+    from mechanical_refactor_proof_generator import _per_file_diff
 
     _write(repo, **{"notes.py": "a = 1\n"})
     _commit(repo, "base")

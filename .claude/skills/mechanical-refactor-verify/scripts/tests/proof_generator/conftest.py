@@ -6,8 +6,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from generate_testlib import _git
-from mechanical_refactor_generate_proof import (
+from generator_testlib import _git
+from mechanical_refactor_proof_generator import (
     infer_recipe,
     recipe_to_script,
 )

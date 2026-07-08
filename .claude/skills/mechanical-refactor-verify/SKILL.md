@@ -23,7 +23,7 @@ relocation must not ride along: split the work into an optional **prepare**, the
 - **Do a mechanical refactor** (extract, move, split) → `guide-prep-move.md`: how to cut the
   change into prepare + move + postpare, with the case recipes and anti-patterns.
 - **Certify or review a move commit** → `guide-prove.md`: run
-  `scripts/mechanical_refactor_generate_proof.py <commit>` (or a `<base>..<tip>` range with
+  `scripts/mechanical_refactor_proof_generator.py <commit>` (or a `<base>..<tip>` range with
   `--match -move: --out DIR`), audit the emitted script, and hand-write a `Repro` when the
   generator reports `UNSUPPORTED`.
 - **Decide whether a change counts as a clean move** → `spec.md`: the property, the whole
@@ -37,11 +37,11 @@ relocation must not ride along: split the work into an optional **prepare**, the
 - [`guide-prove.md`](guide-prove.md) — prove the move commit: the generator, the `Repro`
   primitives, and how reviewers re-run the proof.
 - [`spec.md`](spec.md) — the normative spec of the certified property and its proof.
-- [`scripts/mechanical_refactor_generate_proof.py`](scripts/mechanical_refactor_generate_proof.py) —
+- [`scripts/mechanical_refactor_proof_generator.py`](scripts/mechanical_refactor_proof_generator.py) —
   the **generator**: infers a reproduce recipe from a commit's diff and emits/runs a
   standalone, auditable script per commit, with a `PASS` / `RESIDUAL` / `UNSUPPORTED` verdict.
-- [`scripts/mechanical_refactor_reproduce_utils.py`](scripts/mechanical_refactor_reproduce_utils.py) — the
+- [`scripts/mechanical_refactor_reproduction_utils.py`](scripts/mechanical_refactor_reproduction_utils.py) — the
   **proof engine**: the `Repro` builder's faithful relocation primitives plus the worktree +
   pre-commit + byte-diff scaffold. Self-contained — only git and the standard library.
 - [`scripts/tests/`](scripts/tests/) — pytest suites, one folder per module:
-  `reproduce_utils/` for the proof engine, `generate_proof/` for the generator.
+  `reproduction_utils/` for the proof engine, `proof_generator/` for the generator.

@@ -18,8 +18,8 @@ commit staged the whole module body (scaffolding plus def) as a trailing block i
 source, so the move cuts that tail into the new file (extract_to_new_module). A rename or a
 statement-level reorder relocates no def and is reported unsupported. Runnable directly:
 
-    python3 mechanical_refactor_generate_proof.py <commit>
-    python3 mechanical_refactor_generate_proof.py <base>..<tip> --match -move: --out DIR
+    python3 mechanical_refactor_proof_generator.py <commit>
+    python3 mechanical_refactor_proof_generator.py <base>..<tip> --match -move: --out DIR
 """
 
 import ast
@@ -33,7 +33,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import mechanical_refactor_reproduce_utils as rr
+import mechanical_refactor_reproduction_utils as rr
 
 
 def _git_output(args: list[str], cwd: str) -> str:
@@ -810,7 +810,7 @@ def recipe_to_script(recipe: Recipe, subject: str) -> str:
         "from pathlib import Path",
         "",
         "sys.path.insert(0, str(Path(__file__).resolve().parent.parent))",
-        "from mechanical_refactor_reproduce_utils import Repro",
+        "from mechanical_refactor_reproduction_utils import Repro",
         "",
         f"r = Repro(base={recipe.base!r}, target={recipe.target!r})",
     ]
@@ -849,7 +849,7 @@ def generate_range(
     out = Path(out_dir)
     scripts_dir = out / "repro_scripts"
     scripts_dir.mkdir(parents=True, exist_ok=True)
-    (out / "mechanical_refactor_reproduce_utils.py").write_text(
+    (out / "mechanical_refactor_reproduction_utils.py").write_text(
         Path(rr.__file__).read_text()
     )
 
@@ -1002,8 +1002,8 @@ def _main(argv: list[str]) -> int:
         argv = argv[:i] + argv[i + 2 :]
     if len(argv) != 1:
         print(
-            "usage: python3 mechanical_refactor_generate_proof.py <commit>\n"
-            "       python3 mechanical_refactor_generate_proof.py <base>..<tip> "
+            "usage: python3 mechanical_refactor_proof_generator.py <commit>\n"
+            "       python3 mechanical_refactor_proof_generator.py <base>..<tip> "
             "[--match REGEX] --out DIR",
             file=sys.stderr,
         )

@@ -3,7 +3,7 @@
 ## 1. What this file is
 
 - This file is the **single source of truth** for *what the skill certifies* and *how*. The
-  code (`scripts/mechanical_refactor_reproduce_utils.py`, `scripts/mechanical_refactor_generate_proof.py`),
+  code (`scripts/mechanical_refactor_reproduction_utils.py`, `scripts/mechanical_refactor_proof_generator.py`),
   the tests, and the prose guides (`SKILL.md`, `guide-prep-move.md`, `guide-prove.md`) all implement or describe this
   file. If any of them disagrees with it, **this file wins** and the others are the bug.
 - There is **one property** being certified — *a commit is a pure relocation* — and **one
@@ -132,7 +132,7 @@ empty diff proves the commit is exactly that relocation.
 - The generator is run over a commit range:
 
   ```
-  python3 scripts/mechanical_refactor_generate_proof.py <base>..<tip> --match -move: --out DIR
+  python3 scripts/mechanical_refactor_proof_generator.py <base>..<tip> --match -move: --out DIR
   ```
 
 - For each matched commit it:
@@ -141,14 +141,14 @@ empty diff proves the commit is exactly that relocation.
       or requalified, which imports were repathed, and the symmetric module-level import diff
       each file gained or lost;
     - **emits** a standalone `repro_scripts/<sha>.py` whose only import is
-      `mechanical_refactor_reproduce_utils`;
+      `mechanical_refactor_reproduction_utils`;
     - **runs** it — checks out the base in a throwaway worktree, replays the primitives, runs
       `pre-commit`, and byte-diffs against the target;
     - records the verdict.
 - The **product** is a self-contained folder, independently auditable without the skill:
     - `repro_scripts/<sha>.py` — one script per commit;
     - `output.log` and `output.html` — the verdicts;
-    - a copy of `mechanical_refactor_reproduce_utils.py` — the only dependency.
+    - a copy of `mechanical_refactor_reproduction_utils.py` — the only dependency.
 - **Verdicts**:
     - `PASS` — byte-identical to the target; the commit is certified a clean move.
     - `RESIDUAL` — a non-empty diff; the residual is the bundled non-move change to review.
