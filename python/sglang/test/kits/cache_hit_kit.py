@@ -10,6 +10,7 @@ from sglang.benchmark.serving import RequestFuncOutput
 from sglang.benchmark.utils import get_tokenizer, remove_prefix
 
 AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=20 * 60 * 60)
+STREAM_REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=600, sock_read=300)
 
 
 async def async_request_sglang_generate(
@@ -31,10 +32,14 @@ async def async_request_sglang_generate(
         output = RequestFuncOutput()
 
         try:
-            async with session.post(url=url, json=payload, headers=headers) as response:
+            async with session.post(
+                url=url, json=payload, headers=headers,
+                timeout=STREAM_REQUEST_TIMEOUT,
+            ) as response:
                 if response.status == 200:
                     prompt_tokens = 0
                     cached_tokens = 0
+                    done_received = False
 
                     async for chunk_bytes in response.content:
                         chunk_bytes = chunk_bytes.strip()
@@ -45,7 +50,7 @@ async def async_request_sglang_generate(
                         latency = time.perf_counter() - st
 
                         if chunk == "[DONE]":
-                            pass
+                            done_received = True
                         else:
                             data = json.loads(chunk)
 
@@ -69,20 +74,33 @@ async def async_request_sglang_generate(
 
                                 most_recent_timestamp = timestamp
 
-                    output.generated_text = generated_text
-                    output.output_ids = all_output_ids
-                    output.success = True
-                    output.latency = latency
-                    output.prompt_len = prompt_tokens
-                    output.cached_tokens = cached_tokens
-                    output.generated_len = len(output.itl) + 1
+                    if not done_received:
+                        output.success = False
+                        output.error = (
+                            f"Stream truncated: connection closed before [DONE] "
+                            f"(received {len(all_output_ids)} output ids)"
+                        )
+                    else:
+                        output.generated_text = generated_text
+                        output.output_ids = all_output_ids
+                        output.success = True
+                        output.latency = latency
+                        output.prompt_len = prompt_tokens
+                        output.cached_tokens = cached_tokens
+                        output.generated_len = len(output.itl) + 1
                 else:
-                    output.error = response.reason or ""
+                    try:
+                        body = await response.text()
+                    except Exception:
+                        body = ""
+                    output.error = (
+                        f"HTTP {response.status}: "
+                        f"{body or response.reason or '(empty)'}"
+                    )
                     output.success = False
         except Exception as e:
             output.success = False
             output.error = str(e)
-            print(f"Request failed: {e}")
 
     if pbar:
         pbar.update(1)
@@ -108,11 +126,15 @@ async def async_request_openai_chat_completions(
         output = RequestFuncOutput()
 
         try:
-            async with session.post(url=url, json=payload) as response:
+            async with session.post(
+                url=url, json=payload,
+                timeout=STREAM_REQUEST_TIMEOUT,
+            ) as response:
                 if response.status == 200:
                     prompt_tokens = 0
                     cached_tokens = 0
                     completion_tokens = 0
+                    done_received = False
 
                     async for chunk_bytes in response.content:
                         chunk_bytes = chunk_bytes.strip()
@@ -123,7 +145,7 @@ async def async_request_openai_chat_completions(
                         latency = time.perf_counter() - st
 
                         if chunk == "[DONE]":
-                            pass
+                            done_received = True
                         else:
                             data = json.loads(chunk)
 
@@ -153,22 +175,35 @@ async def async_request_openai_chat_completions(
                                 details = usage.get("prompt_tokens_details", {}) or {}
                                 cached_tokens = details.get("cached_tokens", 0)
 
-                    output.generated_text = generated_text
-                    output.output_ids = []  # Not available from OpenAI endpoint
-                    output.success = True
-                    output.latency = latency
-                    output.prompt_len = prompt_tokens
-                    output.cached_tokens = cached_tokens
-                    output.generated_len = (
-                        completion_tokens if completion_tokens else len(output.itl) + 1
-                    )
+                    if not done_received:
+                        output.success = False
+                        output.error = (
+                            f"Stream truncated: connection closed before [DONE] "
+                            f"(generated {len(output.itl) + 1} tokens)"
+                        )
+                    else:
+                        output.generated_text = generated_text
+                        output.output_ids = []  # Not available from OpenAI endpoint
+                        output.success = True
+                        output.latency = latency
+                        output.prompt_len = prompt_tokens
+                        output.cached_tokens = cached_tokens
+                        output.generated_len = (
+                            completion_tokens if completion_tokens else len(output.itl) + 1
+                        )
                 else:
-                    output.error = response.reason or ""
+                    try:
+                        body = await response.text()
+                    except Exception:
+                        body = ""
+                    output.error = (
+                        f"HTTP {response.status}: "
+                        f"{body or response.reason or '(empty)'}"
+                    )
                     output.success = False
         except Exception as e:
             output.success = False
             output.error = str(e)
-            print(f"Request failed: {e}")
 
     if pbar:
         pbar.update(1)

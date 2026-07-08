@@ -360,6 +360,7 @@ class WorkloadGenerator:
 
         self.response_queue = queue.Queue()
         self.pbar = tqdm(total=self.total_requests)
+        self.failures = []
         self.performance_metrics = {
             "ttft": [],
             "itl": [],
@@ -389,11 +390,10 @@ class WorkloadGenerator:
         client_id, payload = item
         try:
             response = await self.request_func(payload, self.url, self.pbar)
-            if self.pbar.n == self.pbar.total:
+            if self.completed_requests + 1 >= self.total_requests:
                 self.finished_time = time.perf_counter()
             self.response_queue.put((client_id, response))
         except Exception as e:
-            print(f"Request failed for client {client_id}: {e}")
             failed_response = RequestFuncOutput()
             failed_response.success = False
             failed_response.error = str(e)
@@ -402,6 +402,9 @@ class WorkloadGenerator:
     def request_sender(self):
         async def request_loop():
             while True:
+                if self.completed_requests >= self.total_requests:
+                    break
+
                 if self.sent_requests - self.completed_requests < self.max_parallel:
                     new_request = self.ready_queue.pop()
                     if new_request:
@@ -410,9 +413,6 @@ class WorkloadGenerator:
                 else:
                     await asyncio.sleep(0.05)
                     continue
-
-                if self.pbar.n == self.pbar.total:
-                    break
 
                 # Calculate Poisson-distributed wait time
                 if self.distribution == "poisson":
@@ -441,45 +441,52 @@ class WorkloadGenerator:
                 client_id, response = self.response_queue.get(
                     timeout=10
                 )  # Block until response is available
-                if not response.success:
-                    print(f"Request failed for client {client_id}: {response.error}")
-                    self.completed_requests += 1
-                    continue
-                # Extend history with response
-                if self.api_format == "openai":
-                    if response.generated_text:
-                        self.client_records[client_id]["history"].append(
-                            {"role": "assistant", "content": response.generated_text}
-                        )
-                else:
-                    self.client_records[client_id]["history"].extend(
-                        response.output_ids
-                    )
                 current_round = self.client_records[client_id]["round"]
                 self.client_records[client_id]["round"] += 1
-                self.performance_metrics["ttft"].append(response.ttft)
-                self.performance_metrics["itl"].extend(response.itl)
-                self.performance_metrics["latency"].append(response.latency)
-                self.performance_metrics["prompt_len"].append(response.prompt_len)
-                self.performance_metrics["cached_tokens"].append(response.cached_tokens)
-                self.performance_metrics["generated_len"].append(response.generated_len)
-                if self.enable_round_barrier:
-                    self.performance_metrics[f"round_{current_round}"]["ttft"].append(
-                        response.ttft
-                    )
-                    self.performance_metrics[f"round_{current_round}"][
-                        "latency"
-                    ].append(response.latency)
-                    self.performance_metrics[f"round_{current_round}"][
-                        "prompt_len"
-                    ].append(response.prompt_len)
-                    self.performance_metrics[f"round_{current_round}"][
-                        "cached_tokens"
-                    ].append(response.cached_tokens)
-                    self.performance_metrics[f"round_{current_round}"][
-                        "generated_len"
-                    ].append(response.generated_len)
-                self.completed_requests += 1
+
+                if not response.success:
+                    self.failures.append({
+                        "client_id": client_id,
+                        "round": current_round,
+                        "error": response.error or "(no error message)",
+                        "prompt_len": response.prompt_len,
+                        "timestamp": datetime.now().isoformat(),
+                    })
+                    self.completed_requests += 1
+                else:
+                    # Extend history with response
+                    if self.api_format == "openai":
+                        if response.generated_text:
+                            self.client_records[client_id]["history"].append(
+                                {"role": "assistant", "content": response.generated_text}
+                            )
+                    else:
+                        self.client_records[client_id]["history"].extend(
+                            response.output_ids
+                        )
+                    self.performance_metrics["ttft"].append(response.ttft)
+                    self.performance_metrics["itl"].extend(response.itl)
+                    self.performance_metrics["latency"].append(response.latency)
+                    self.performance_metrics["prompt_len"].append(response.prompt_len)
+                    self.performance_metrics["cached_tokens"].append(response.cached_tokens)
+                    self.performance_metrics["generated_len"].append(response.generated_len)
+                    if self.enable_round_barrier:
+                        self.performance_metrics[f"round_{current_round}"]["ttft"].append(
+                            response.ttft
+                        )
+                        self.performance_metrics[f"round_{current_round}"][
+                            "latency"
+                        ].append(response.latency)
+                        self.performance_metrics[f"round_{current_round}"][
+                            "prompt_len"
+                        ].append(response.prompt_len)
+                        self.performance_metrics[f"round_{current_round}"][
+                            "cached_tokens"
+                        ].append(response.cached_tokens)
+                        self.performance_metrics[f"round_{current_round}"][
+                            "generated_len"
+                        ].append(response.generated_len)
+                    self.completed_requests += 1
 
                 client_total = self.client_records[client_id]["total_rounds"]
                 if self.client_records[client_id]["round"] < client_total:
@@ -537,7 +544,7 @@ class WorkloadGenerator:
                         current_barrier_round += 1
                         barrier_round_completed = 0
             except queue.Empty:
-                if self.pbar.n == self.pbar.total:
+                if self.completed_requests >= self.total_requests:
                     break
             except ValueError as e:
                 print(f"Error processing response for client {client_id}: {e}")
@@ -564,6 +571,17 @@ class WorkloadGenerator:
         response_thread.join()
         self.pbar.close()
 
+        if self.failures:
+            failures_file = "failures.jsonl"
+            try:
+                with open(failures_file, "a") as f:
+                    for fail in self.failures:
+                        f.write(json.dumps(fail) + "\n")
+            except IOError as e:
+                print(f"Error writing failures file: {e}")
+
+        if self.finished_time is None:
+            self.finished_time = time.perf_counter()
         duration = self.finished_time - self.start_time
         sorted_ttft = sorted(self.performance_metrics["ttft"])
         sorted_latency = sorted(self.performance_metrics["latency"])
@@ -708,6 +726,29 @@ class WorkloadGenerator:
             f"  Request Throughput: {performance_data['summary']['throughput']:.2f} requests per second"
         )
         print(f"  Cache Hit Rate: {performance_data['summary']['cache_hit_rate']:.6f}")
+
+        successful = len(self.performance_metrics["ttft"])
+        print(
+            f"  Failed requests: {len(self.failures)}/{self.total_requests} "
+            f"(successful: {successful})"
+        )
+        if self.failures:
+            print("  Failure details (first 20):")
+            for fail in self.failures[:20]:
+                error_preview = fail["error"][:200]
+                print(
+                    f"    client {fail['client_id']} round {fail['round']}: "
+                    f"{error_preview}"
+                )
+            if len(self.failures) > 20:
+                print(
+                    f"    ... and {len(self.failures) - 20} more "
+                    f"(see failures.jsonl)"
+                )
+
+        performance_data["failures"] = self.failures
+        performance_data["summary"]["failed_requests"] = len(self.failures)
+        performance_data["summary"]["successful_requests"] = successful
 
         if self.enable_round_barrier:
             # Print round-basedsummary
