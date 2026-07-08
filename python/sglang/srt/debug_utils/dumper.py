@@ -1783,9 +1783,9 @@ class _SGLangPlugin(_FrameworkPlugin):
             return None
 
         try:
-            from sglang.srt.server_args import get_global_server_args
+            from sglang.srt.runtime_context import get_server_args
 
-            args = get_global_server_args()
+            args = get_server_args()
             if args is None:
                 return None
 

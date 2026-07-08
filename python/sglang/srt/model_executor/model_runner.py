@@ -780,9 +780,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         torchao_applied = getattr(self.model, "torchao_applied", False)
         # In layered loading, torchao may have been applied
         if not torchao_applied:
-            apply_torchao_config_to_model(
-                self.model, get_global_server_args().torchao_config
-            )
+            apply_torchao_config_to_model(self.model, get_server_args().torchao_config)
 
         # Apply torch TP if the model supports it
         supports_torch_tp = getattr(self.model, "supports_torch_tp", False)
@@ -1007,7 +1005,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         set_global_experts_capturer(
             RoutedExpertsCapturer.create(
-                enable=get_global_server_args().enable_return_routed_experts,
+                enable=get_server_args().enable_return_routed_experts,
                 model_config=self.model_config,
                 num_fused_shared_experts=num_fused_shared_experts,
                 num_tokens=self.max_total_num_tokens + self.page_size,
@@ -1017,7 +1015,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
 
     def init_indexer_capturer(self):
-        enable = get_global_server_args().enable_return_indexer_topk
+        enable = get_server_args().enable_return_indexer_topk
         # Producer wiring is CUDA-only (Indexer.forward_cuda + MLA skip_topk
         # path); other backends would create a capturer but never feed it.
         if enable and self.device != "cuda":
@@ -1709,8 +1707,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             else:
                 # Load the missing weights from disk
                 self.update_weights_from_disk(
-                    get_global_server_args().model_path,
-                    get_global_server_args().load_format,
+                    get_server_args().model_path,
+                    get_server_args().load_format,
                     weight_name_filter=weight_name_filter,
                 )
 

@@ -27,8 +27,7 @@ from sglang.srt.layers.dcp.kernels import (
 )
 from sglang.srt.layers.dcp.layout import update_local_kv_lens_for_dcp
 from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
-from sglang.srt.runtime_context import get_parallel
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_parallel, get_server_args
 
 
 def prepare_decode_context_parallel_metadata(
@@ -54,12 +53,12 @@ def prepare_decode_context_parallel_metadata(
     extend_prefix_starts = torch.zeros(
         len(seq_lens),
         dtype=torch.int32,
-        device=get_global_server_args().device,
+        device=get_server_args().device,
     )
     extend_cu_prefix_lens = torch.zeros(
         len(seq_lens) + 1,
         dtype=torch.int32,
-        device=get_global_server_args().device,
+        device=get_server_args().device,
     )
     extend_cu_prefix_lens[1:] = torch.cumsum(extend_prefix_lens, dim=0)
     extend_cu_prefix_lens = extend_cu_prefix_lens[:-1]
@@ -68,7 +67,7 @@ def prepare_decode_context_parallel_metadata(
     dcp_prefix_kv_indices = torch.empty(
         sum(extend_prefix_lens_cpu),
         dtype=torch.int32,
-        device=get_global_server_args().device,
+        device=get_server_args().device,
     )
     create_chunked_prefix_cache_kv_indices_fn[(len(seq_lens),)](
         req_to_token,
@@ -82,20 +81,20 @@ def prepare_decode_context_parallel_metadata(
     dcp_kv_indptr = torch.zeros(
         len(seq_lens) + 1,
         dtype=torch.int32,
-        device=get_global_server_args().device,
+        device=get_server_args().device,
     )
     dcp_kv_indptr[1:] = seq_lens.cumsum(dim=0)
     dcp_kv_indptr = dcp_kv_indptr[: (len(seq_lens) + 1)]
     dcp_kv_indices = torch.zeros(
         seq_lens_sum,
         dtype=torch.int32,
-        device=get_global_server_args().device,
+        device=get_server_args().device,
     )
 
     extend_cu_lens = torch.zeros(
         len(seq_lens) + 1,
         dtype=torch.int32,
-        device=get_global_server_args().device,
+        device=get_server_args().device,
     )
     extend_cu_lens[1:] = torch.cumsum(extend_seq_lens, dim=0)
     extend_cu_lens = extend_cu_lens[:-1]

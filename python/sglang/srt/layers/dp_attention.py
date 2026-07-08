@@ -778,9 +778,9 @@ def get_moe_cp_size() -> int:
 
 def is_enable_moe_cp_allgather() -> bool:
     """True when moe_dp_size < attn_cp_size, requiring allgather across CP ranks before MoE."""
-    from sglang.srt.server_args import get_global_server_args
+    from sglang.srt.runtime_context import get_server_args
 
-    sa = get_global_server_args()
+    sa = get_server_args()
     return sa.attn_cp_size > sa.moe_dp_size
 
 

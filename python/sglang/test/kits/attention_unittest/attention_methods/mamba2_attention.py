@@ -351,7 +351,7 @@ class MockMamba2ModelRunner(ModelRunner):
             enable_mis=False,
             # `RowParallelLinear.forward` (called by the production
             # `MambaMixer2.out_proj`) consults
-            # `get_global_server_args().enable_symm_mem` to decide whether
+            # `get_server_args().enable_symm_mem` to decide whether
             # to wrap allocations in a symmetric-memory context. With
             # `world_size=1` the wrapper short-circuits, but the
             # attribute read still happens, so it must exist on the mock
