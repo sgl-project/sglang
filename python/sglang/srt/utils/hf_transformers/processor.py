@@ -50,6 +50,19 @@ from .tokenizer import (
 )
 
 
+def _should_reload_processor_tokenizer(config, tokenizer) -> bool:
+    if type(tokenizer).__name__ != _TOKENIZERS_BACKEND:
+        return False
+
+    # LLaVA processors can legitimately wrap a fast TokenizersBackend
+    # tokenizer. Reloading it via get_tokenizer() may downgrade to a slow
+    # tokenizer and add unnecessary tokenization overhead.
+    if getattr(config, "model_type", None) == "llava":
+        return False
+
+    return True
+
+
 def _build_processor_manually(
     model_path, config, trust_remote_code, revision, **kwargs
 ):
@@ -270,7 +283,7 @@ def get_processor(
 
     # AutoProcessor may internally create a TokenizersBackend tokenizer
     # (same issue as get_tokenizer). Replace it with a properly loaded one.
-    if type(tokenizer).__name__ == _TOKENIZERS_BACKEND:
+    if _should_reload_processor_tokenizer(config, tokenizer):
         from .tokenizer import get_tokenizer
 
         logger.warning(
