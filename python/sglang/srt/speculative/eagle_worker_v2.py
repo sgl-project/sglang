@@ -770,17 +770,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         sampling_info,
         probe_ctx: str = "",
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-        """Pick (topk_p, topk_index, draft_probs) from a draft forward output.
-
-        Single source of truth for draft next-token selection, shared by the
-        draft-decode loop and both draft-extend paths so they can't drift. Tiers,
-        in priority order: distributed-argmax ids (full logits never
-        materialized) -> rejection sampling -> greedy argmax (topk=1, CUDA only
-        per #26358) -> softmax topk.
-        """
+        """Pick (topk_p, topk_index, draft_probs) from a draft forward output --
+        the single source of truth shared by the draft-decode loop and both
+        draft-extend paths. Priority: distributed-argmax ids -> rejection sampling
+        -> greedy argmax (topk=1, CUDA only per #26358) -> softmax topk."""
         if next_token_ids is not None:
-            # Distributed-argmax fast path: no full logits, so the NaN/Inf/OOB
-            # probes don't apply (ids are exact by construction).
+            # Distributed-argmax ids are exact, so the NaN/Inf/OOB probes below
+            # (which need full logits) don't apply.
             topk_index = next_token_ids.view(-1, 1)
             topk_p = torch.ones_like(topk_index, dtype=torch.float32)
             return topk_p, topk_index, None

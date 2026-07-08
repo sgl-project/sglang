@@ -1,20 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 """Distributed argmax over a tensor-parallel-sharded vocab.
 
-Each rank argmaxes its local vocab shard; only the per-rank
-``(max_value, global_token_id)`` pair crosses the wire, so the greedy draft loop
-avoids the all-gather of the full ``[T, V]`` logits (traffic ``O(tp*T*V)`` ->
-``O(tp*T)``). Two transports return identical ids: ``nccl`` (default,
-capture-safe) and an opt-in ``multimem.st`` NVLink path
-(``SGLANG_DIST_ARGMAX_USE_MULTIMEM=1``).
+Each rank argmaxes its local shard and only its ``(max_value, global_token_id)``
+pair crosses the wire via a single ``multimem.st`` NVLink scatter, avoiding the
+all-gather of the full ``[T, V]`` logits. When multimem is unavailable the caller
+uses the original full-logits path; there is no NCCL transport.
 
-Tie-break matches ``torch.argmax`` over the full logits (smallest global id on
-ties): each rank owns an ascending contiguous vocab range and ``torch.max``
-returns the lowest local index, so the cross-rank reduction reproduces it.
+Tie-break matches ``torch.argmax`` (smallest global id on ties): each rank owns an
+ascending contiguous vocab range and ``torch.max`` returns the lowest local index,
+so the cross-rank max reproduces it.
 """
 
 import logging
-import os
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -27,10 +24,6 @@ logger = logging.getLogger(__name__)
 # plain signed-int64 max reduces it correctly.
 _ID_BITS = 31
 _ID_MASK = (1 << _ID_BITS) - 1
-
-
-def _use_multimem() -> bool:
-    return os.environ.get("SGLANG_DIST_ARGMAX_USE_MULTIMEM", "0") == "1"
 
 
 def _orderable_u32(values: torch.Tensor) -> torch.Tensor:
@@ -53,45 +46,6 @@ def unpack_ids(best_key: torch.Tensor) -> torch.Tensor:
     return _ID_MASK - (best_key & _ID_MASK)
 
 
-def fits_packing(vocab_size: int) -> bool:
-    return vocab_size <= _ID_MASK
-
-
-def reduce_pairs(
-    gathered_val: torch.Tensor, gathered_ids: torch.Tensor
-) -> torch.Tensor:
-    """Reduce ``[world_size, T]`` ``(value, id)`` pairs to the global argmax id."""
-    best_rank = torch.argmax(gathered_val, dim=0, keepdim=True)
-    return torch.gather(gathered_ids, 0, best_rank).view(gathered_ids.shape[1])
-
-
-def nccl_pair_argmax(
-    local_val: torch.Tensor,
-    global_id: torch.Tensor,
-    tp_group,
-) -> torch.Tensor:
-    """Global argmax token id per token via an all-gather of ``(value, id)``."""
-    world_size = int(tp_group.world_size)
-    num_tokens = int(local_val.shape[0])
-
-    local_val = local_val.contiguous()
-    global_id = global_id.to(torch.int64).contiguous()
-
-    gathered_val = torch.empty(
-        world_size * num_tokens, dtype=local_val.dtype, device=local_val.device
-    )
-    gathered_ids = torch.empty(
-        world_size * num_tokens, dtype=torch.int64, device=global_id.device
-    )
-    tp_group.all_gather_into_tensor(gathered_val, local_val)
-    tp_group.all_gather_into_tensor(gathered_ids, global_id)
-
-    return reduce_pairs(
-        gathered_val.view(world_size, num_tokens),
-        gathered_ids.view(world_size, num_tokens),
-    )
-
-
 @dataclass
 class _DistArgmaxState:
     group: Any
@@ -110,40 +64,35 @@ def _create_multimem_state(
     max_tokens: int,
     device: torch.device,
 ) -> Optional[_DistArgmaxState]:
-    try:
-        import torch.distributed._symmetric_memory as symm_mem
+    import torch.distributed._symmetric_memory as symm_mem
 
-        from sglang.srt.distributed.device_communicators.triton_symm_mem_ag import (
-            _MAX_BLOCKS,
-        )
+    from sglang.srt.distributed.device_communicators.triton_symm_mem_ag import (
+        _MAX_BLOCKS,
+    )
 
-        pad_bytes = _MAX_BLOCKS * world_size * 4
-        symm_mem.set_signal_pad_size(max(symm_mem.get_signal_pad_size(), pad_bytes))
-        with torch.inference_mode(False), torch.no_grad():
-            comm_buff = symm_mem.empty(
-                (max_tokens, world_size), dtype=torch.int64, device=device
-            )
-        hdl = symm_mem.rendezvous(comm_buff, group=group)
-        if hdl.multicast_ptr == 0:
-            # No multicast for this world size / arch; multimem.st writes nowhere.
-            logger.warning(
-                "distributed_argmax multimem disabled (no multicast for "
-                "world_size=%d); falling back to NCCL",
-                world_size,
-            )
-            return None
-        return _DistArgmaxState(
-            group=group,
-            rank_in_group=rank_in_group,
-            world_size=world_size,
-            device=device,
-            max_tokens=max_tokens,
-            comm_buff=comm_buff,
-            symm_mem_hdl=hdl,
+    pad_bytes = _MAX_BLOCKS * world_size * 4
+    symm_mem.set_signal_pad_size(max(symm_mem.get_signal_pad_size(), pad_bytes))
+    with torch.inference_mode(False), torch.no_grad():
+        comm_buff = symm_mem.empty(
+            (max_tokens, world_size), dtype=torch.int64, device=device
         )
-    except Exception as e:  # pragma: no cover - hardware/setup dependent
-        logger.warning("distributed_argmax multimem disabled (%s)", e)
+    hdl = symm_mem.rendezvous(comm_buff, group=group)
+    if hdl.multicast_ptr == 0:
+        # No multicast for this world size / arch; use the full-logits fallback.
+        logger.warning(
+            "distributed argmax: no multicast for world_size=%d; using full-logits",
+            world_size,
+        )
         return None
+    return _DistArgmaxState(
+        group=group,
+        rank_in_group=rank_in_group,
+        world_size=world_size,
+        device=device,
+        max_tokens=max_tokens,
+        comm_buff=comm_buff,
+        symm_mem_hdl=hdl,
+    )
 
 
 def _build_multimem_kernel():
@@ -246,56 +195,52 @@ def multimem_argmax(
 
 
 class DistributedArgmax:
-    """Guarded distributed argmax: NCCL baseline, optional multimem fast path.
+    """Distributed argmax over the multimem NVLink scatter.
 
-    Guards use TP-replicated quantities so every rank picks the same transport.
+    ``resolve(num_tokens)`` builds the symmetric-memory state on the first eager
+    call (it can't allocate under CUDA-graph capture) and reports whether the
+    scatter is usable; ``__call__`` then runs it. Eligibility uses only
+    TP-replicated quantities so every rank makes the same decision -- both the
+    scatter and the full-logits fallback issue a collective, so a split would
+    desync.
     """
 
     _UNINIT = object()
 
     def __init__(self, max_tokens: int, *, enabled: bool = True):
         self._max_tokens = int(max_tokens)
-        self._enabled = enabled
-        # None => NCCL only; _UNINIT => try to build multimem on first eager call.
-        self._state = self._UNINIT if (enabled and _use_multimem()) else None
+        # None => never multimem; _UNINIT => build on first eager call.
+        self._state = self._UNINIT if enabled else None
 
-    def __call__(
-        self,
-        local_val: torch.Tensor,
-        global_id: torch.Tensor,
-    ) -> Optional[torch.Tensor]:
-        """``[T]`` int64 argmax ids, or ``None`` when TP is disabled."""
+    def resolve(self, num_tokens: int) -> bool:
+        """Build the state on the first eager call and report whether the scatter
+        will handle ``num_tokens``. Check before computing the LM head so the
+        fallback costs nothing extra."""
         from sglang.srt.distributed import get_tp_group
 
         tp_group = get_tp_group()
         if tp_group.world_size <= 1:
-            return None
-
-        num_tokens = int(local_val.shape[0])
+            return False
         state = self._state
         if state is self._UNINIT:
             state = self._maybe_build(tp_group)
             if state is not self._UNINIT:
                 self._state = state
-
-        if (
+        return (
             state is not None
             and state is not self._UNINIT
             and 0 < num_tokens <= state.max_tokens
-        ):
-            try:
-                return multimem_argmax(
-                    state, local_val, global_id, skip_entry_sync=False
-                )
-            except Exception as e:  # pragma: no cover - hardware dependent
-                logger.warning("distributed_argmax multimem failed (%s); using NCCL", e)
-                self._state = None
+        )
 
-        return nccl_pair_argmax(local_val, global_id, tp_group)
+    def __call__(
+        self, local_val: torch.Tensor, global_id: torch.Tensor
+    ) -> torch.Tensor:
+        """Multimem argmax ids ``[T]``; valid only after ``resolve`` returned True."""
+        return multimem_argmax(self._state, local_val, global_id, skip_entry_sync=False)
 
     def _maybe_build(self, tp_group):
+        # Can't allocate symmetric memory under capture; retry on a later call.
         if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
-            # Can't allocate symmetric memory under capture; retry later.
             return self._UNINIT
         return _create_multimem_state(
             group=tp_group.device_group,

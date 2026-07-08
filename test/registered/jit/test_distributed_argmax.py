@@ -1,10 +1,10 @@
-"""Correctness test for the sharded-vocab distributed argmax transports.
+"""Correctness test for the sharded-vocab distributed argmax kernel.
 
 Each rank owns a contiguous vocab shard and contributes only its local
-``(max_value, global_token_id)`` pair; the cross-rank reduction must reproduce a
-full-vocab ``torch.argmax`` (lowest global id on ties). Validates both the NCCL
-pair all-gather and the ``multimem.st`` NVLink kernel against that reference,
-across a sweep of token counts and vocab sizes.
+``(max_value, global_token_id)`` pair; the ``multimem.st`` NVLink scatter must
+reproduce a full-vocab ``torch.argmax`` (lowest global id on ties), across a
+sweep of token counts and vocab sizes. Skips when the world size / arch has no
+multicast (production falls back to the full-logits path in that case).
 
 Usage::
 
@@ -29,7 +29,6 @@ from sglang.jit_kernel.utils import cache_once, get_ci_test_range
 from sglang.srt.distributed.device_communicators.triton_symm_mem_argmax import (
     _create_multimem_state,
     multimem_argmax,
-    nccl_pair_argmax,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -119,6 +118,8 @@ def test_distributed_argmax(num_tokens: int, vocab: int) -> None:
     rank = coord.rank_in_group
     device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
 
+    if state is None:
+        pytest.skip(f"multimem multicast unavailable for world_size={world_size}")
     if vocab % world_size != 0:
         pytest.skip(f"vocab={vocab} incompatible with world_size={world_size}")
 
@@ -132,23 +133,22 @@ def test_distributed_argmax(num_tokens: int, vocab: int) -> None:
         ref = torch.argmax(full, dim=-1).to(torch.int64)
         local_val, global_id = _local_shard(full, rank, world_size)
 
-        nccl_out = nccl_pair_argmax(local_val, global_id, coord)
-        torch.testing.assert_close(nccl_out, ref, atol=0, rtol=0)
-
-        if state is not None:
-            mm_out = multimem_argmax(state, local_val, global_id).clone()
-            torch.testing.assert_close(mm_out, ref, atol=0, rtol=0)
+        mm_out = multimem_argmax(state, local_val, global_id).clone()
+        torch.testing.assert_close(mm_out, ref, atol=0, rtol=0)
 
 
 @torch.inference_mode()
 def test_distributed_argmax_tie_break() -> None:
     # Equal maximum in every shard: torch.argmax picks the lowest global id
-    # (rank 0's peak), and both transports must reproduce that tie-break.
+    # (rank 0's peak), and the kernel must reproduce that tie-break.
     coord = _init_world_once()
     state = _init_state_once()
     world_size = coord.world_size
     rank = coord.rank_in_group
     device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
+
+    if state is None:
+        pytest.skip(f"multimem multicast unavailable for world_size={world_size}")
 
     shard = 8
     vocab = world_size * shard
@@ -159,15 +159,11 @@ def test_distributed_argmax_tie_break() -> None:
     local_val, global_id = _local_shard(full, rank, world_size)
 
     dist.barrier(coord.device_group)
-    nccl_out = nccl_pair_argmax(local_val, global_id, coord)
-    torch.testing.assert_close(nccl_out, ref, atol=0, rtol=0)
-
-    if state is not None:
-        mm_out = multimem_argmax(state, local_val, global_id).clone()
-        torch.testing.assert_close(mm_out, ref, atol=0, rtol=0)
+    mm_out = multimem_argmax(state, local_val, global_id).clone()
+    torch.testing.assert_close(mm_out, ref, atol=0, rtol=0)
 
 
 if __name__ == "__main__":
     # multimem multicast needs world_size in {4, 6, 8} (cc9) or {6, 8} (cc10);
-    # unsupported sizes fall back to the NCCL path via the state=None guard.
+    # unsupported sizes self-skip via the state=None guard.
     multigpu_pytest_main(__name__, __file__, num_gpus=(4, 8))

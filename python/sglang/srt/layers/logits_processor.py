@@ -961,13 +961,9 @@ class LogitsProcessor(nn.Module):
         hidden_states: torch.Tensor,
         lm_head: VocabParallelEmbedding,
     ) -> Optional[torch.Tensor]:
-        """Greedy next-token ids over the TP-sharded vocab, or ``None`` to fall
-        back to the full-logits path.
-
-        Because it selects a collective, eligibility must use only rank-invariant
-        config so all ranks agree: no added vocab, no vocab padding (each rank
-        owns a contiguous ``vocab/tp`` slice), no softcapping, non-inverting scale.
-        """
+        """Greedy next-token ids over the TP-sharded vocab, or ``None`` to use the
+        full-logits path. Eligibility is rank-invariant so all ranks agree: TP>1,
+        no added vocab, no vocab padding, no softcapping, non-inverting scale."""
         if self._dist_argmax is None:
             return None
         if self.final_logit_softcapping is not None:
@@ -975,32 +971,24 @@ class LogitsProcessor(nn.Module):
         if self.logit_scale is not None and self.logit_scale < 0:
             return None
 
-        shard = getattr(lm_head, "shard_indices", None)
-        num_embeddings = getattr(lm_head, "num_embeddings", None)
-        num_embeddings_padded = getattr(lm_head, "num_embeddings_padded", None)
-        org_vocab_size = getattr(lm_head, "org_vocab_size", None)
-        tp_size = getattr(lm_head, "tp_size", 1)
+        num_embeddings = lm_head.num_embeddings
         if (
-            shard is None
-            or num_embeddings is None
-            or num_embeddings_padded is None
-            or org_vocab_size is None
-            or num_embeddings != org_vocab_size  # added vocab present
-            or num_embeddings_padded != num_embeddings  # vocab padding present
-            or tp_size <= 1
-            or num_embeddings % tp_size != 0
+            lm_head.tp_size <= 1
+            or num_embeddings != lm_head.org_vocab_size  # added vocab
+            or lm_head.num_embeddings_padded != num_embeddings  # vocab padding
+            or num_embeddings % lm_head.tp_size != 0
         ):
             return None
 
-        local_logits = self._compute_lm_head(hidden_states, lm_head)
-        if local_logits is None or local_logits.dim() != 2:
-            return None
-        if local_logits.shape[-1] != num_embeddings // tp_size:
+        # Resolve the transport before the LM head so the fallback costs nothing
+        # over the original full-logits argmax.
+        if not self._dist_argmax.resolve(hidden_states.shape[0]):
             return None
 
+        local_logits = self._compute_lm_head(hidden_states, lm_head)
+        start = lm_head.shard_indices.org_vocab_start_index
         local_val, local_arg = torch.max(local_logits, dim=-1)
-        global_id = local_arg.to(torch.int64) + int(shard.org_vocab_start_index)
-        return self._dist_argmax(local_val, global_id)
+        return self._dist_argmax(local_val, local_arg.to(torch.int64) + start)
 
     def _get_logits(
         self,
