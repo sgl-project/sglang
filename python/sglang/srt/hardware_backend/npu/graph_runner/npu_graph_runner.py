@@ -218,6 +218,14 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
             self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
             self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
             if (
+                self.model_runner.spec_algorithm.is_dflash()
+                and self.model_runner.is_draft_worker
+                and forward_batch.input_embeds is not None
+            ):
+                self.buffers.input_embeds[: self.raw_num_token].copy_(
+                    forward_batch.input_embeds
+                )
+            if (
                 envs.SGLANG_ENABLE_OVERLAP_PLAN_STREAM.get()
                 and forward_batch.mrope_positions is not None
             ):
