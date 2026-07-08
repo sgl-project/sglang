@@ -38,7 +38,7 @@ def _agg(nqs: List[int], nkvs: List[int]) -> Tuple[int, int, int, int]:
     return sq, sk, sqsq, sqsk
 
 
-def build_roofline_suffix(forward_batch: "ForwardBatch") -> str:
+def build_roofline_suffix(forward_batch: ForwardBatch) -> str:
     """Compute the roofline aggregates from the batch's CPU-side length mirrors.
 
     Only the terms SGLang's base ``step[...]`` label does *not* already carry
@@ -101,7 +101,7 @@ def build_roofline_suffix(forward_batch: "ForwardBatch") -> str:
 
 
 def build_step_span_name(
-    forward_batch: "ForwardBatch", roofline_annotations: bool = False
+    forward_batch: ForwardBatch, roofline_annotations: bool = False
 ) -> str:
     """Build the profile-trace span name for one forward step.
 
