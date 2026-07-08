@@ -119,11 +119,24 @@ pub async fn serve(
     if let Ok(addr) = listener.local_addr() {
         tracing::info!(%addr, "sglang-server api listening");
     }
-    let serve = axum::serve(listener, app).with_graceful_shutdown(async move {
-        let _ = shutdown.recv_async().await;
-    });
-    if let Err(e) = serve.await {
-        tracing::error!(error = %e, "axum serve exited");
+    // Non-graceful shutdown: on the signal, stop accepting and RETURN — do NOT
+    // wait for in-flight handlers (a `/generate` blocked on its egress channel
+    // would never complete, wedging the join). Returning drops `serve` (stops
+    // accepts) and unwinds `block_on` in `runtime::start`, so the api thread's
+    // tokio runtime is dropped — which cancels the detached in-flight handler
+    // tasks. Each cancelled handler's `AbortGuard` fires, releasing its `Senders`
+    // clone; once every clone is gone the detok/tok channels close and those
+    // workers exit. Full graceful drain is deferred (see `request_shutdown`).
+    let serve = axum::serve(listener, app);
+    tokio::select! {
+        r = serve => {
+            if let Err(e) = r {
+                tracing::error!(error = %e, "axum serve exited");
+            }
+        }
+        _ = shutdown.recv_async() => {
+            tracing::info!("shutdown: stopping accepts, aborting in-flight handlers");
+        }
     }
 }
 
