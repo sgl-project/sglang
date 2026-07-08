@@ -33,6 +33,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.ideogram import (
 )
 from sglang.multimodal_gen.configs.pipeline_configs.lingbot_world import (
     LingBotWorldCausalDMDConfig,
+    LingBotWorldV2CausalDMDConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
     LTX2PipelineConfig,
@@ -80,4 +81,5 @@ __all__ = [
     "LTX2PipelineConfig",
     "LTX23PipelineConfig",
     "LingBotWorldCausalDMDConfig",
+    "LingBotWorldV2CausalDMDConfig",
 ]

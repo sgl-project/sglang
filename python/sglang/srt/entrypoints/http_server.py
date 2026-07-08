@@ -104,6 +104,7 @@ from sglang.srt.entrypoints.openai.serving_tokenize import (
 from sglang.srt.entrypoints.openai.serving_transcription import (
     OpenAIServingTranscription,
 )
+from sglang.srt.entrypoints.request_headers import apply_header_overrides
 from sglang.srt.entrypoints.warmup import execute_warmups
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
@@ -173,6 +174,7 @@ from sglang.srt.utils.json_response import (
     dumps_json,
     orjson_response,
 )
+from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.srt.utils.watchdog import SubprocessWatchdog
 from sglang.utils import get_exception_traceback
 from sglang.version import __version__
@@ -258,6 +260,8 @@ async def init_multi_tokenizer() -> ServerArgs:
 
 @asynccontextmanager
 async def lifespan(fast_api_app: FastAPI):
+    grpc_handle = None
+    warmup_thread = None
     if getattr(fast_api_app, "is_single_tokenizer_mode", False):
         server_args = fast_api_app.server_args
         warmup_thread_kwargs = fast_api_app.warmup_thread_kwargs
@@ -336,6 +340,10 @@ async def lifespan(fast_api_app: FastAPI):
 
         tool_server = MCPToolServer()
         await tool_server.add_tool_server(server_args.tool_server)
+    elif envs.EXA_API_KEY.get():
+        from sglang.srt.entrypoints.openai.tool_server import NativeToolServer
+
+        tool_server = NativeToolServer()
 
     try:
         from sglang.srt.entrypoints.openai.serving_responses import (
@@ -369,18 +377,38 @@ async def lifespan(fast_api_app: FastAPI):
         )
         logger.info("Warmup ended")
 
-    # Execute the general warmup
-    warmup_thread = threading.Thread(
-        target=_wait_and_warmup,
-        kwargs=warmup_thread_kwargs,
-    )
-    warmup_thread.start()
-
-    # Start the HTTP server
+    # Start the native gRPC server and warmup inside the try so a failure in
+    # either still runs the finally cleanup below. Native gRPC is enabled via
+    # --grpc-port / SGLANG_GRPC_PORT; only the single-tokenizer process is
+    # gRPC-capable (__post_init__ rejects --tokenizer-worker-num > 1).
     try:
+        if (
+            getattr(fast_api_app, "is_single_tokenizer_mode", False)
+            and server_args.grpc_port is not None
+            and not (server_args.smg_grpc_mode or server_args.grpc_mode)
+        ):
+            grpc_handle = _start_native_grpc_server_for_runtime(
+                server_args=server_args,
+                tokenizer_manager=_global_state.tokenizer_manager,
+                template_manager=_global_state.template_manager,
+                scheduler_info=_global_state.scheduler_info,
+            )
+
+        # Execute the general warmup
+        warmup_thread = threading.Thread(
+            target=_wait_and_warmup,
+            kwargs=warmup_thread_kwargs,
+        )
+        warmup_thread.start()
+
+        # Start the HTTP server
         yield
     finally:
-        warmup_thread.join()
+        _shutdown_native_grpc_server(grpc_handle)
+        if tool_server is not None and hasattr(tool_server, "aclose"):
+            await tool_server.aclose()
+        if warmup_thread is not None:
+            warmup_thread.join()
 
 
 # Fast API
@@ -395,6 +423,13 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+if envs.SGLANG_ENABLE_REQUEST_DECOMPRESSION.get():
+    from sglang.srt.entrypoints.http_request_decompression import (
+        RequestDecompressionMiddleware,
+    )
+
+    app.add_middleware(RequestDecompressionMiddleware)
 
 # Include routers
 from sglang.srt.entrypoints.v1_loads import router as v1_loads_router
@@ -698,16 +733,18 @@ async def server_info():
     server_args = _global_state.tokenizer_manager.server_args
 
     # server_args.model_config is not serializable but should be excluded by asdict.
-    return {
-        **dataclasses.asdict(server_args),
-        **_global_state.scheduler_info,
-        "internal_states": internal_states,
-        "version": __version__,
-        # Structured KV-event publisher descriptor for KV-aware routers.
-        # `None` when publishing is disabled or misconfigured; see
-        # `ServerArgs.describe_kv_events_publisher` for the precise contract.
-        "kv_events": server_args.describe_kv_events_publisher(),
-    }
+    return msgspec_to_builtins(
+        {
+            **dataclasses.asdict(server_args),
+            **_global_state.scheduler_info,
+            "internal_states": internal_states,
+            "version": __version__,
+            # Structured KV-event publisher descriptor for KV-aware routers.
+            # `None` when publishing is disabled or misconfigured; see
+            # `ServerArgs.describe_kv_events_publisher` for the precise contract.
+            "kv_events": server_args.describe_kv_events_publisher(),
+        }
+    )
 
 
 @app.get("/get_load")
@@ -772,6 +809,8 @@ if os.environ.get("DUMPER_SERVER_PORT") == "reuse":
 )
 async def generate_request(obj: GenerateReqInput, request: Request):
     """Handle a generate request."""
+    if envs.SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES.get():
+        apply_header_overrides(obj, request.headers)
     if obj.stream:
 
         async def stream_results() -> AsyncIterator[bytes]:
@@ -1316,7 +1355,9 @@ async def update_weight_version(
     # since weight_version update is a simple operation that doesn't affect model weights
     try:
         # Update the weight version in server args (the single source of truth)
-        _global_state.tokenizer_manager.server_args.weight_version = obj.new_version
+        _global_state.tokenizer_manager.server_args.override(
+            "http.update_weight_version", weight_version=obj.new_version
+        )
 
         return ORJSONResponse(
             {
@@ -1417,7 +1458,7 @@ async def load_lora_adapter(
     """Load a new LoRA adapter without re-launching the server."""
     result = await _global_state.tokenizer_manager.load_lora_adapter(obj, request)
     status_code = HTTPStatus.OK if result.success else HTTPStatus.BAD_REQUEST
-    return ORJSONResponse(result, status_code=status_code)
+    return ORJSONResponse(msgspec_to_builtins(result), status_code=status_code)
 
 
 @app.api_route("/load_lora_adapter_from_tensors", methods=["POST"])
@@ -1429,7 +1470,7 @@ async def load_lora_adapter_from_tensors(
         obj, request
     )
     status_code = HTTPStatus.OK if result.success else HTTPStatus.BAD_REQUEST
-    return ORJSONResponse(result, status_code=status_code)
+    return ORJSONResponse(msgspec_to_builtins(result), status_code=status_code)
 
 
 @app.api_route("/unload_lora_adapter", methods=["POST"])
@@ -1440,7 +1481,7 @@ async def unload_lora_adapter(
     """Load a new LoRA adapter without re-launching the server."""
     result = await _global_state.tokenizer_manager.unload_lora_adapter(obj, request)
     status_code = HTTPStatus.OK if result.success else HTTPStatus.BAD_REQUEST
-    return ORJSONResponse(result, status_code=status_code)
+    return ORJSONResponse(msgspec_to_builtins(result), status_code=status_code)
 
 
 @app.api_route("/open_session", methods=["GET", "POST"])
@@ -1498,7 +1539,11 @@ async def parse_function_call_request(
     A native API endpoint to parse function calls from a text.
     """
     # 1) Initialize the parser based on the request body
-    parser = FunctionCallParser(tools=obj.tools, tool_call_parser=obj.tool_call_parser)
+    parser = FunctionCallParser(
+        tools=obj.tools,
+        tool_call_parser=obj.tool_call_parser,
+        tokenizer=get_global_state().tokenizer_manager.tokenizer,
+    )
 
     # 2) Call the non-stream parsing method (non-stream)
     normal_text, calls = parser.parse_non_stream(obj.text)
@@ -1522,7 +1567,11 @@ async def separate_reasoning_request(
     A native API endpoint to separate reasoning from a text.
     """
     # 1) Initialize the parser based on the request body
-    parser = ReasoningParser(model_type=obj.reasoning_parser, request=request)
+    parser = ReasoningParser(
+        model_type=obj.reasoning_parser,
+        request=request,
+        tokenizer=get_global_state().tokenizer_manager.tokenizer,
+    )
 
     # 2) Call the non-stream parsing method (non-stream)
     if obj.return_blocks:
@@ -2447,6 +2496,51 @@ def _setup_and_run_http_server(
                 multi_tokenizer_args_shm.unlink()
             if _global_state is not None:
                 _global_state.tokenizer_manager.socket_mapping.clear_all_sockets()
+
+
+def _start_native_grpc_server_for_runtime(
+    server_args,
+    tokenizer_manager,
+    template_manager,
+    scheduler_info,
+):
+    try:
+        from sglang.srt.entrypoints.grpc_bridge import RuntimeHandle
+        from sglang.srt.grpc import _core as grpc_native
+    except ImportError as e:
+        raise RuntimeError(
+            "Native gRPC extension (sglang.srt.grpc._core) not found in this wheel, "
+            "but --grpc-port was set. The extension is built from "
+            "rust/sglang-grpc/ via setuptools-rust during wheel build. Either "
+            "install a wheel that includes the extension or unset --grpc-port."
+        ) from e
+
+    runtime_handle = RuntimeHandle(
+        tokenizer_manager=tokenizer_manager,
+        template_manager=template_manager,
+        server_args=server_args,
+        scheduler_info=scheduler_info or {},
+    )
+
+    grpc_handle = grpc_native.start_server(
+        host=server_args.host,
+        port=server_args.grpc_port,
+        runtime_handle=runtime_handle,
+        worker_threads=server_args.grpc_worker_threads,
+    )
+    logger.info(
+        f"Native gRPC server started on {server_args.host}:{server_args.grpc_port}"
+    )
+    return grpc_handle
+
+
+def _shutdown_native_grpc_server(grpc_handle) -> None:
+    if grpc_handle is None:
+        return
+    try:
+        grpc_handle.shutdown()
+    except Exception as e:
+        logger.warning(f"Failed to shut down native gRPC server: {e}")
 
 
 def launch_server(

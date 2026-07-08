@@ -24,6 +24,8 @@ _is_hip = is_hip()
 # Host RAM to leave free when sizing HiCache pools (OS, other processes).
 HICACHE_HOST_MEMORY_RESERVE_BYTES: int = 10 * (1024**3)
 
+_WRITE_BACK_STAGING_PAGE_CHUNK = 64
+
 
 def sync_fixed_hicache_size(size: int, host_size: int) -> int:
     """Sync fixed-size HiCache token capacity across PP ranks.
@@ -111,9 +113,14 @@ class HostKVCache(abc.ABC):
         self.start_layer = device_pool.start_layer
         self.end_layer = device_pool.end_layer
 
-        assert (
-            self.size > device_pool.size
-        ), "The host memory should be larger than the device memory with the current protocol"
+        if self.size <= device_pool.size:
+            logger.warning(
+                "HiCache host KV pool (%d tokens) is smaller than the device pool (%d tokens);"
+                "L2 cache effectiveness is reduced."
+                "Consider increasing --hicache-ratio (or --hicache-size) for higher L2 cache hit rate.",
+                self.size,
+                device_pool.size,
+            )
 
         # Verify there is enough available host memory.
         host_mem = psutil.virtual_memory()
@@ -225,6 +232,9 @@ class HostKVCache(abc.ABC):
             (self.size,), dtype=torch.uint8, device=self.device
         )
         self.free_slots = torch.arange(self.size, dtype=torch.int64)
+        # Per-slot flag used to detect double-free.
+        # slot_used[k] is true if slot k is allocated.
+        self.slot_used = torch.zeros(self.size, dtype=torch.bool)
 
     def available_size(self):
         return len(self.free_slots)
@@ -240,9 +250,21 @@ class HostKVCache(abc.ABC):
         select_index = self.free_slots[:need_size]
         self.free_slots = self.free_slots[need_size:]
 
+        assert not self.slot_used[select_index].any(), (
+            f"Double-alloc detected: slots already allocated: "
+            f"{select_index[self.slot_used[select_index]].tolist()}."
+        )
+        self.slot_used[select_index] = True
+
         return select_index
 
     @synchronized
     def free(self, indices: torch.Tensor) -> int:
-        self.free_slots = torch.cat([self.free_slots, indices.cpu()])
+        indices_cpu = indices.cpu()
+        assert self.slot_used[indices_cpu].all(), (
+            f"Double-free detected: slots not currently allocated: "
+            f"{indices_cpu[~self.slot_used[indices_cpu]].tolist()}."
+        )
+        self.slot_used[indices_cpu] = False
+        self.free_slots = torch.cat([self.free_slots, indices_cpu])
         return len(indices)

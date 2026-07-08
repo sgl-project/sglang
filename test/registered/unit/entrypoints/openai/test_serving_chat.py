@@ -102,6 +102,7 @@ class ServingChatTestCase(unittest.TestCase):
         self.basic_req = ChatCompletionRequest(
             model="x",
             messages=[{"role": "user", "content": "Hi?"}],
+            session_id="session-1",
             temperature=0.7,
             max_tokens=100,
             stream=False,
@@ -145,6 +146,7 @@ class ServingChatTestCase(unittest.TestCase):
             adapted, processed = self.chat._convert_to_internal_request(self.basic_req)
             self.assertIsInstance(adapted, GenerateReqInput)
             self.assertFalse(adapted.stream)
+            self.assertEqual(adapted.session_id, "session-1")
             self.assertEqual(processed, self.basic_req)
 
     def test_convert_to_internal_request_rejects_stream_return_prompt_token_ids(self):
@@ -1797,6 +1799,63 @@ class ServingChatTestCase(unittest.TestCase):
                 "storage_backend": "file",
             },
         )
+
+    def _collect_continuous_usage(self, cached_tokens):
+        content = {
+            "text": "Hello",
+            "meta_info": {
+                "id": "chatcmpl-cont-usage",
+                "prompt_tokens": 10,
+                "completion_tokens": 2,
+                "cached_tokens": cached_tokens,
+                "finish_reason": {"type": "stop", "matched": None},
+                "output_token_logprobs": None,
+                "output_top_logprobs": None,
+            },
+            "index": 0,
+        }
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            stream=True,
+        )
+
+        async def _collect():
+            chunks = []
+            async for chunk in self.chat._generate_stream_content(
+                content=content,
+                index=0,
+                request=req,
+                stream_offsets={},
+                reasoning_parser_dict={},
+                parser_dict={},
+                has_tool_calls={},
+                choice_logprobs=None,
+                finish_reason_type="stop",
+                continuous_usage_stats=True,
+                prompt_tokens={0: 10},
+                reasoning_tokens={0: 0},
+                completion_tokens={0: 2},
+            ):
+                chunks.append(chunk)
+            return chunks
+
+        chunks = get_or_create_event_loop().run_until_complete(_collect())
+        return [c["usage"] for c in self._parse_chunks(chunks) if c.get("usage")]
+
+    def test_continuous_usage_reports_cached_tokens(self):
+        """continuous_usage_stats chunks include cached tokens when cache reporting is on."""
+        self.tm.server_args.enable_cache_report = True
+        usages = self._collect_continuous_usage(cached_tokens=6)
+        self.assertTrue(usages, "continuous_usage_stats attached no usage")
+        self.assertEqual(usages[0]["prompt_tokens_details"]["cached_tokens"], 6)
+
+    def test_continuous_usage_omits_cached_tokens_when_report_disabled(self):
+        """With cache reporting off, continuous_usage_stats must not leak cached tokens."""
+        self.tm.server_args.enable_cache_report = False
+        usages = self._collect_continuous_usage(cached_tokens=6)
+        self.assertTrue(usages, "continuous_usage_stats attached no usage")
+        self.assertIsNone(usages[0].get("prompt_tokens_details"))
 
     # ------------- incremental streaming output tests -------------
     def test_incremental_streaming_output_delta(self):
