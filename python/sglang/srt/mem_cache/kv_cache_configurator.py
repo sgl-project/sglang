@@ -11,6 +11,7 @@ import torch
 from sglang.srt.configs.hybrid_arch import hybrid_gdn_config, mambaish_config
 from sglang.srt.configs.model_config import (
     ModelConfig,
+    dsa_layer_skips_topk,
     get_dsa_index_head_dim,
     get_minimax_sparse_attention_config,
     get_minimax_sparse_disable_value_layer_ids,
@@ -1074,6 +1075,17 @@ class KVCacheConfigurator:
             pool_kwargs["layer_shard_size"] = dsa_cp_layer_shard_size
         else:
             PoolCls = DSATokenToKVPool
+        if (
+            not self.server_args.enable_hisparse
+            and not self.is_draft_worker
+            and not self.server_args.enable_hierarchical_cache
+        ):
+            pool_kwargs["skip_topk_layers"] = [
+                dsa_layer_skips_topk(self.model_config.hf_config, layer_id)
+                for layer_id in range(
+                    self.layer_info.start_layer, self.layer_info.end_layer
+                )
+            ]
         token_to_kv_pool = PoolCls(
             max_total_num_tokens,
             page_size=self.server_args.page_size,

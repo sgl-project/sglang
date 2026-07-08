@@ -21,6 +21,7 @@ import torch
 
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.configs.model_config import (
+    dsa_layer_skips_topk,
     get_dsa_index_head_dim,
     get_minimax_sparse_attention_config,
     get_minimax_sparse_disable_value_layer_ids,
@@ -212,9 +213,46 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 element_size = torch._utils._element_size(
                     DSATokenToKVPool.index_k_with_scale_buffer_dtype
                 )
-                cell_size += (
-                    indexer_size_per_token * effective_num_layers * element_size
-                )
+                if (
+                    kvc.server_args.enable_hisparse
+                    or kvc.is_draft_worker
+                    or kvc.server_args.enable_hierarchical_cache
+                ):
+                    num_indexer_layers = num_layers
+                else:
+                    active_indexer_layers = [
+                        layer_id
+                        for layer_id in range(
+                            kvc.layer_info.start_layer, kvc.layer_info.end_layer
+                        )
+                        if not dsa_layer_skips_topk(model_config.hf_config, layer_id)
+                    ]
+                    from sglang.srt.layers.cp.utils import (
+                        get_glm_dsa_cp_layer_shard_info,
+                        get_layer_shard_range,
+                    )
+
+                    _, shard_size = get_glm_dsa_cp_layer_shard_info(kvc)
+                    if shard_size > 1:
+                        # Every CP rank sizes identically using the largest owned
+                        # active-layer partition, plus one remote read buffer.
+                        active_set = set(active_indexer_layers)
+                        max_owned = 0
+                        for rank in range(shard_size):
+                            start, end = get_layer_shard_range(
+                                rank, shard_size, num_layers
+                            )
+                            max_owned = max(
+                                max_owned,
+                                sum(
+                                    kvc.layer_info.start_layer + i in active_set
+                                    for i in range(start, end)
+                                ),
+                            )
+                        num_indexer_layers = max_owned + 1
+                    else:
+                        num_indexer_layers = len(active_indexer_layers)
+                cell_size += indexer_size_per_token * num_indexer_layers * element_size
         elif is_minimax_sparse(model_config.hf_config):
             # Mirrors MiniMaxSparseKVPool: main pool (K+V all layers) + indexer pool
             # (sparse-only, single-head; kv layers store K+V, k-only layers store K).
