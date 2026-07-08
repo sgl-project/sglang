@@ -183,6 +183,7 @@ killall_sglang = "sglang.cli.killall:main"
 [tool.setuptools.package-data]
 "sglang" = [
   "srt/**/*",
+  "srt/grpc/*.proto",
   "jit_kernel/**/*",
   "multimodal_gen/apps/realtime_webui/**/*"
 ]
