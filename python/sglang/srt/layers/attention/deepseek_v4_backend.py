@@ -18,6 +18,7 @@ from typing import (
 import torch
 import torch.nn.functional as F
 
+from sglang.kernels.ops.attention.dsv4 import CompressorPrefillPlan
 from sglang.kernels.ops.attention.dsv4.dequant_k_cache import (
     cast_q_fp8_for_q8kv8_prefill,
     dequantize_k_cache_paged,
@@ -691,9 +692,7 @@ class DeepseekV4AttnBackend(
         self.online_c128_mtp = OnlineC128MTPController(self)
         self.sparse_prefill_workspace = SparsePrefillWorkspace(self.device)
         spec_alg = model_runner.spec_algorithm
-        self.needs_cpu_seq_lens = not spec_alg.is_dspark() and (
-            not _is_cuda or self.online_c128_mtp.enabled()
-        )
+        self.needs_cpu_seq_lens = not spec_alg.is_dspark() and not _is_cuda
 
         self.is_dspark_draft = model_runner.is_draft_worker and spec_alg.is_dspark()
         self.is_draft_runner = model_runner.is_draft_worker
@@ -745,30 +744,19 @@ class DeepseekV4AttnBackend(
         self,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        seq_lens_cpu: Optional[List[int]],
-        extend_seq_lens: torch.Tensor,
-        use_prefill_cuda_graph: bool,
         online_c128_state_slot_offset: int,
+        active_batch_size: int,
     ) -> Optional[FusedCompressMetadata]:
         if not self.online_c128_mtp.enabled():
             return None
 
-        assert seq_lens_cpu is not None
         num_draft_tokens = self.speculative_num_draft_tokens
-        seq_lens_cpu = [int(x) + num_draft_tokens for x in seq_lens_cpu]
-        extend_lens_cpu = [num_draft_tokens] * len(seq_lens_cpu)
-        return create_paged_compressor_data(
-            compress_ratio=128,
-            is_prefill=True,
-            token_to_kv_pool=self.token_to_kv_pool,
-            req_to_token=self.req_to_token,
+        return CompressorPrefillPlan.generate_online_mtp(
+            prefix_lens=seq_lens,
             req_pool_indices=req_pool_indices,
-            seq_lens=seq_lens + self.speculative_num_draft_tokens,
-            seq_lens_cpu=seq_lens_cpu,
-            extend_lens=extend_seq_lens,
-            extend_lens_cpu=extend_lens_cpu,
-            use_prefill_cuda_graph=use_prefill_cuda_graph,
-            online_state_slot_offset=online_c128_state_slot_offset,
+            num_draft_tokens=num_draft_tokens,
+            state_slot_offset=online_c128_state_slot_offset,
+            active_batch_size=active_batch_size,
         )
 
     def init_forward_metadata_indexer(
@@ -922,6 +910,7 @@ class DeepseekV4AttnBackend(
         use_prefill_cuda_graph: bool = False,
         online_c128_state_slot_offset: int = 0,
         ragged_layout: Optional[RaggedVerifyLayout] = None,
+        verify_bs: Optional[int] = None,
     ) -> Union[DSV4Metadata, DSV4RawVerifyMetadata]:
         assert out_cache_loc is not None
         bs = len(seq_lens)
@@ -944,6 +933,9 @@ class DeepseekV4AttnBackend(
             verify_lens = self.extend_seq_lens_buffer[:bs]
             total_verify_tokens = ragged_layout.graph_num_tokens
 
+        if verify_bs is None:
+            verify_bs = bs
+
         return DSV4RawVerifyMetadata(
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
@@ -953,10 +945,8 @@ class DeepseekV4AttnBackend(
             c128_compress_metadata=self._make_target_verify_c128_metadata(
                 req_pool_indices,
                 seq_lens,
-                seq_lens_cpu_list,
-                extend_seq_lens,
-                use_prefill_cuda_graph,
                 online_c128_state_slot_offset,
+                verify_bs,
             ),
             extend_start_loc=extend_start_loc,
             verify_lens=verify_lens,
@@ -1356,12 +1346,6 @@ class DeepseekV4AttnBackend(
             graph_key, num_tokens_v = self._target_verify_graph_key(
                 bs=bs, ragged_layout=ragged_layout
             )
-            if self.online_c128_mtp.enabled() and verify_bs == 0:
-                self.online_c128_mtp.clear()
-                self.forward_metadata = self.cuda_graph_metadata_of_bucket_and_bs[
-                    bucket
-                ][graph_key]
-                return
             assert out_cache_loc is not None
             assert num_tokens_v >= len(out_cache_loc), (
                 f"ragged verify token-keyed graph requires the decode cuda-graph "
@@ -1390,6 +1374,7 @@ class DeepseekV4AttnBackend(
                 use_prefill_cuda_graph=True,
                 online_c128_state_slot_offset=online_c128_state_slot_offset,
                 ragged_layout=ragged_layout,
+                verify_bs=verify_bs,
             )
         elif bucket == _GraphBucket.DRAFT_EXTEND:
             self.online_c128_mtp.prepare_forward(
@@ -1572,6 +1557,7 @@ class DeepseekV4AttnBackend(
                 out_cache_loc=forward_batch.out_cache_loc,
                 online_c128_state_slot_offset=online_c128_state_slot_offset,
                 ragged_layout=ragged_layout,
+                verify_bs=verify_bs,
             )
         elif logical_forward_mode.is_draft_extend_v2():
             num_tokens_per_req = self.speculative_num_draft_tokens
