@@ -281,7 +281,7 @@ jobs:
         env:
           UV_SYSTEM_PYTHON: "1"
         run: |
-          uv pip install -e "python[dev]" --index-strategy unsafe-best-match --prerelease allow
+          uv pip install -e "python[dev]" --extra-index-url https://download.pytorch.org/whl/cu130 --index-strategy unsafe-best-match --prerelease allow
 
       - name: Run test
         timeout-minutes: 60

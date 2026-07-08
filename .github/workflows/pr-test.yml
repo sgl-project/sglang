@@ -321,7 +321,7 @@ jobs:
         env:
           UV_SYSTEM_PYTHON: "1"
         run: |
-          uv pip install -e "python[dev]" --index-strategy unsafe-best-match --prerelease allow
+          uv pip install -e "python[dev]" --extra-index-url https://download.pytorch.org/whl/cu130 --index-strategy unsafe-best-match --prerelease allow
 
       # Hosted runners are ephemeral, so models are re-fetched every run and the
       # Hub occasionally returns 429s. Persist the HF cache in GitHub's cache
