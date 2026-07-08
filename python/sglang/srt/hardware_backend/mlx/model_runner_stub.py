@@ -119,6 +119,32 @@ class MlxModelRunnerStub(ModelRunner):
         self.dtype = self.model_config.dtype
         self.weight_load_mem_usage = 0
 
+    def _resolve_max_running_requests(self) -> int:
+        """Concurrency cap handed to the scheduler.
+
+        Honors ``--max-running-requests``, mirroring the base runner's clamp
+        (``model_runner_kv_cache_mixin._resolve_max_num_reqs``): the requested
+        value is split per dp worker and capped by the KV pool capacity. When
+        the flag is unset, fall back to a capacity-based default.
+
+        Requires ``self.max_total_num_tokens`` to already be set.
+        """
+        capacity_cap = self.max_total_num_tokens // 2
+        requested = self.server_args.max_running_requests
+        if requested is None:
+            return min(capacity_cap, 4096)
+
+        requested_per_worker = requested // self.dp_size
+        resolved = min(requested_per_worker, capacity_cap)
+        if resolved < requested_per_worker:
+            logger.warning(
+                "max_running_requests was reduced from the requested %d to %d "
+                "(per dp worker) due to the available KV cache capacity.",
+                requested_per_worker,
+                resolved,
+            )
+        return resolved
+
     def initialize(self):
         """Lightweight initialize that skips heavy PyTorch setup.
 
@@ -153,10 +179,7 @@ class MlxModelRunnerStub(ModelRunner):
             self.max_total_num_tokens = self._mlx_pool_size
         else:
             self.max_total_num_tokens = self.model_config.context_len
-        self.max_running_requests = min(
-            self.max_total_num_tokens // 2,
-            4096,
-        )
+        self.max_running_requests = self._resolve_max_running_requests()
         self.is_hybrid_swa = False
 
         # Create minimal pools
