@@ -19,7 +19,7 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.layers.attention.minimax_sparse_ops.common.utils import unit_scale
+from sglang.kernels.ops.attention.minimax_sparse.common.utils import unit_scale
 
 
 class MSAUnavailableError(RuntimeError):
