@@ -133,23 +133,6 @@ SGLang supports various environment variables that can be used to configure its 
 | `SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE` | Quantize moe of nextn layer from BF16 to FP8 when launching DeepSeek NVFP4 checkpoint | `false` |
 | `SGLANG_QUANT_ALLOW_DOWNCASTING` | Allow weight dtype downcasting during loading (e.g., fp32 → fp16). By default, SGLang rejects this kind of downcasting when using quantization. | `false` |
 | `SGLANG_FP8_IGNORED_LAYERS` | A comma-separated list of layer names to ignore during FP8 quantization. For example: `model.layers.0,model.layers.1.,qkv_proj`. | `""` |
-| `SGLANG_HUMMING_ONLINE_QUANT_CONFIG` | JSON object or JSON file path for Humming online weight quantization. When a layer has no checkpoint quantization config, this config tells Humming how to quantize the loaded fp16/bf16 weight. When the checkpoint already has a Humming config, add `"force_requant": true` to requantize it to this schema during loading. Common keys include `dtype`/`weight_dtype`, `scale_dtype`, `group_size`, `scale_type`, `ignored_layers`, `ignore`, and `modules_to_not_convert`. | `None` |
-| `SGLANG_HUMMING_INPUT_QUANT_CONFIG` | JSON object or JSON file path for Humming input activation quantization. This controls the activation dtype and scale grouping passed into Humming kernels, independently of the weight schema. For example, `{"dtype": "float8e4m3"}` quantizes Humming inputs to FP8 E4M3. | `None` |
-| `SGLANG_HUMMING_USE_F16_ACCUM` | Use FP16 accumulation in Humming compute/tuning config. This is only meaningful for Humming dtype combinations that support FP16 accumulation, such as fp16 or FP8 E4M3 activations with float16 output. Leave it `false` for the default accumulator behavior. | `false` |
-| `SGLANG_HUMMING_MOE_GEMM_TYPE` | Select the Humming MoE GEMM path for standard dispatch and DeepEP normal dispatch. `indexed` uses top-k expert ids directly and is the fallback for unset or unknown values. `grouped` maps to Humming grouped-contiguous GEMM. DeepEP low-latency dispatch uses grouped-masked GEMM internally and does not use this selector. | `""` (`indexed`) |
-
-Example:
-
-```bash
-# Quantize loaded weights and runtime activations to FP8 E4M3 for Humming,
-# then use grouped Humming MoE GEMM. EnvJSON values can also be file paths.
-export SGLANG_HUMMING_ONLINE_QUANT_CONFIG='{"dtype":"float8e4m3","scale_dtype":"float8e8m0","group_size":128,"scale_type":"group","force_requant":true}'
-export SGLANG_HUMMING_INPUT_QUANT_CONFIG='{"dtype":"float8e4m3","group_size":128}'
-export SGLANG_HUMMING_MOE_GEMM_TYPE=grouped
-export SGLANG_HUMMING_USE_F16_ACCUM=true
-
-python3 -m sglang.launch_server --model-path <model-path> --dtype float16 --quantization humming --moe-runner-backend humming
-```
 
 
 ## Distributed Computing
