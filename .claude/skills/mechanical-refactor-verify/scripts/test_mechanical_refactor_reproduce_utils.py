@@ -1155,11 +1155,6 @@ def test_move_symbol_asserts_when_destination_class_missing(tmp_path: Path) -> N
         _apply(r, tmp_path)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="the _MOVE_DECORATORS filter strips @staticmethod/@classmethod lines anywhere "
-    "in the moved block, so a nested class's decorator inside the body silently vanishes",
-)
 def test_move_symbol_preserves_staticmethod_inside_moved_body(tmp_path: Path) -> None:
     """A @staticmethod on a nested def inside the moved body must survive the move."""
     (tmp_path / "src.py").write_text(
@@ -1181,11 +1176,6 @@ def test_move_symbol_preserves_staticmethod_inside_moved_body(tmp_path: Path) ->
     assert "            @staticmethod\n            def helper(y):\n" in dst_out
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="_find_def takes the first ast.walk hit with no ambiguity check, silently "
-    "moving A.foo and leaving `class A:` with an empty (invalid) body",
-)
 def test_move_symbol_rejects_ambiguous_duplicate_names(tmp_path: Path) -> None:
     """Two same-named defs at equal depth must raise instead of silently picking one."""
     (tmp_path / "src.py").write_text(
@@ -1205,11 +1195,6 @@ def test_move_symbol_rejects_ambiguous_duplicate_names(tmp_path: Path) -> None:
         _apply(r, tmp_path)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="a `before` sibling that does not exist is silently ignored and the def is "
-    "appended at the end instead of failing loudly",
-)
 def test_move_symbol_asserts_when_before_sibling_missing(tmp_path: Path) -> None:
     """A before= anchor absent from the destination must raise, not fall back to append."""
     (tmp_path / "src.py").write_text("def moved():\n    return 1\n")
@@ -1235,11 +1220,6 @@ def test_move_symbol_preserves_crlf_line_endings(tmp_path: Path) -> None:
     assert dst_bytes.count(b"\n") == dst_bytes.count(b"\r\n")
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="a negative dedent never indents (the slice comparison is a no-op), so a "
-    "module-level def lands unindented outside the target class body",
-)
 def test_move_symbol_negative_dedent_indents_into_the_class(tmp_path: Path) -> None:
     """Moving a module-level def into a class with dedent=-4 must indent it as a method."""
     (tmp_path / "src.py").write_text("def helper(x):\n    return x\n")
@@ -1321,11 +1301,6 @@ def test_move_symbol_leave_delegate_forwards_posonly_vararg_kwonly_kwargs(
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="the header scan counts parens with str.count, so a '(' inside a string "
-    "default truncates the signature and emits a syntactically broken stub",
-)
 def test_move_symbol_leave_delegate_survives_paren_in_string_default(
     tmp_path: Path,
 ) -> None:
@@ -1351,11 +1326,6 @@ def test_move_symbol_leave_delegate_survives_paren_in_string_default(
     assert "return self.cfg.compute(sep, n)" in src_out
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="the delegate stub for an async def forwards without await, so callers get "
-    "a coroutine that must be awaited twice",
-)
 def test_move_symbol_async_leave_delegate_awaits_the_forwarded_call(
     tmp_path: Path,
 ) -> None:

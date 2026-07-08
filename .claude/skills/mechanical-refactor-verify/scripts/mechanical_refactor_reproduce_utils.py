@@ -19,11 +19,13 @@ This module is self-contained and needs only git and the standard library.
 """
 
 import ast
+import io
 import re
 import shlex
 import subprocess
 import sys
 import tempfile
+import tokenize
 from collections.abc import Callable
 from pathlib import Path
 
@@ -143,6 +145,55 @@ def _find_def(tree: ast.AST, name: str) -> ast.AST | None:
         ):
             return node
     return None
+
+
+def _find_unique_def(
+    tree: ast.AST, name: str, *, from_class: str | None = None, where: str
+) -> ast.AST:
+    """Resolve ``def name`` and refuse ambiguity: with same-named defs in scope the
+    first-match lookup could silently cut the wrong body, so the caller must scope the
+    search with ``from_class``."""
+    root: ast.AST = tree
+    if from_class is not None:
+        cls = _find_class(tree, from_class)
+        assert cls is not None, f"class {from_class} not found in {where}"
+        root = cls
+    elif isinstance(tree, ast.Module):
+        top_level = [
+            node
+            for node in tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == name
+        ]
+        if len(top_level) == 1:
+            return top_level[0]
+    matches = [
+        node
+        for node in ast.walk(root)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == name
+    ]
+    assert matches, f"{name} not found in {where}"
+    assert len(matches) == 1, (
+        f"{len(matches)} defs named {name} in {where}; pass from_class to disambiguate"
+    )
+    return matches[0]
+
+
+def _def_header_end(def_text: str) -> int:
+    """1-based line (within ``def_text``, which starts at the def line) of the colon that
+    opens the body. Tokenize-based, so parentheses inside string defaults do not confuse
+    the bracket depth."""
+    depth = 0
+    for token in tokenize.generate_tokens(io.StringIO(def_text).readline):
+        if token.type == tokenize.OP:
+            if token.string in "([{":
+                depth += 1
+            elif token.string in ")]}":
+                depth -= 1
+            elif token.string == ":" and depth == 0:
+                return token.start[0]
+    raise AssertionError("no header-ending colon found")
 
 
 def _find_class(tree: ast.AST, name: str) -> ast.ClassDef | None:
@@ -514,6 +565,7 @@ class Repro:
         src: str,
         dst: str,
         into_class: str | None,
+        from_class: str | None = None,
         dedent: int = 0,
         drop_self_annotation: bool = False,
         before: str | None = None,
@@ -533,11 +585,16 @@ class Repro:
             dst_path = root / dst
             src_lines = _split_keepends(_read_source(src_path))
             src_nl = _newline_style("".join(src_lines))
-            node = _find_def(ast.parse("".join(src_lines)), name)
-            assert node is not None, f"{name} not found in {src}"
+            node = _find_unique_def(
+                ast.parse("".join(src_lines)), name, from_class=from_class, where=src
+            )
             start, end = _def_span(node)
             block = src_lines[start - 1 : end]
+            decorator_lines = node.lineno - start
             if leave_delegate is not None:
+                assert not any(
+                    ln.strip() in _MOVE_DECORATORS for ln in block[:decorator_lines]
+                ), f"leave_delegate on a {_MOVE_DECORATORS} method has no self to forward"
                 args = node.args
                 parts = [p.arg for p in args.posonlyargs + args.args if p.arg != "self"]
                 if args.vararg is not None:
@@ -548,20 +605,17 @@ class Repro:
                 # The signature spans the def header only (def line through the line whose
                 # colon opens the body). node.body[0].lineno would skip over any leading
                 # comment/blank lines (not AST nodes), wrongly absorbing them into the
-                # delegate, so the header end is found by a bracket-balanced scan instead.
-                depth = 0
-                header_end = start
-                for offset in range(start - 1, node.body[0].lineno - 1):
-                    line = src_lines[offset]
-                    depth += line.count("(") - line.count(")")
-                    depth += line.count("[") - line.count("]")
-                    if depth <= 0 and line.rstrip().endswith(":"):
-                        header_end = offset + 1
-                        break
+                # delegate, so the header end is found by tokenizing the def.
+                header_end = node.lineno - 1 + _def_header_end(
+                    "".join(src_lines[node.lineno - 1 : end])
+                )
                 signature = src_lines[start - 1 : header_end]
                 body_indent = " " * node.body[0].col_offset
+                returning = (
+                    "return await" if isinstance(node, ast.AsyncFunctionDef) else "return"
+                )
                 forward = (
-                    f"{body_indent}return self.{leave_delegate}."
+                    f"{body_indent}{returning} self.{leave_delegate}."
                     f"{delegate_name or name}({', '.join(parts)})" + src_nl
                 )
                 delegate = "".join(signature) + forward
@@ -574,11 +628,18 @@ class Repro:
                     src_path, "".join(src_lines[: start - 1] + src_lines[end:])
                 )
 
-            kept = [ln for ln in block if ln.strip() not in _MOVE_DECORATORS]
-            if dedent:
+            kept = [
+                ln
+                for index, ln in enumerate(block)
+                if not (index < decorator_lines and ln.strip() in _MOVE_DECORATORS)
+            ]
+            if dedent > 0:
                 kept = [
                     ln[dedent:] if ln[:dedent] == " " * dedent else ln for ln in kept
                 ]
+            elif dedent < 0:
+                pad = " " * -dedent
+                kept = [pad + ln if ln.strip() else ln for ln in kept]
             method_text = "".join(kept)
             if drop_self_annotation:
                 method_text = _drop_self_annotation(method_text, name)
@@ -605,6 +666,7 @@ class Repro:
                     ),
                     None,
                 )
+                assert target is not None, f"before={before!r} not found in {dst}"
             if target is not None:
                 at = _def_span(target)[0] - 1
                 _write_source(
