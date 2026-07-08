@@ -928,23 +928,26 @@ class DeepseekV2MoE(nn.Module):
         *,
         use_flashinfer_trtllm_bypass: bool = False,
     ) -> torch.Tensor:
-        # Note(kpham-sgl): launch the shared expert BEFORE the routed call.
-        # The routed deep_gemm pre-permute calls `dispose_tensor` which
-        # `set_()`s `hidden_states` to empty (host-side); any later kernel
-        # launch consuming `hidden_states` then captures `data_ptr() == 0`
-        # into the decode CUDA graph and replays from null.
+        # Note(kpham-sgl): issue order satisfies 3 constraints:
+        # - no stream explosion: main (routed) issued before alt block -> capture reuses 1 alt stream;
+        # - PDL overlap: routed is the last main-stream kernel (fuses w/ residual add);
+        # - dispose_tensor: shared reads shared_in (ref taken pre-dispose) to avoid null data_ptr.
         current_stream = torch.cuda.current_stream()
         self.alt_stream.wait_stream(current_stream)
+        # Separate ref over the same storage, taken before the routed call's deep_gemm
+        # pre-permute `set_()`s `hidden_states` to empty (which would null the shared read).
+        # This keeps the buffer alive past dispose_tensor, but decode/verify hidden_states is
+        # small (bs*num_draft_tokens rows vs thousands in prefill), so the lost free is negligible.
+        shared_in = hidden_states[:]
+        has_shared_output = (
+            hidden_states.shape[0] > 0 and self.num_fused_shared_experts == 0
+        )
         server_args = get_global_server_args()
         dispatch_info = (
             ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
             if server_args.enable_eplb
             else None
         )
-        with torch.cuda.stream(self.alt_stream):
-            shared_output = self._forward_shared_experts(
-                hidden_states, gemm_output_zero_allocator
-            )
         # router_logits: (num_tokens, n_experts)
         router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
         if use_flashinfer_trtllm_bypass:
@@ -966,7 +969,7 @@ class DeepseekV2MoE(nn.Module):
                 **topk_kwargs,
             )
         deferred_finalize = (
-            shared_output is not None
+            has_shared_output
             and not self._shared_expert_tp1
             and topk_output.format == TopKOutputFormat.BYPASSED
             and self.experts.supports_deferred_finalize
@@ -986,6 +989,12 @@ class DeepseekV2MoE(nn.Module):
             or isinstance(self.experts.quant_method, KTEPWrapperMethod)
         ):
             final_hidden_states *= self.routed_scaling_factor
+
+        # Shared expert on alt stream, issued AFTER the main (routed) branch. See note above.
+        with torch.cuda.stream(self.alt_stream):
+            shared_output = self._forward_shared_experts(
+                shared_in, gemm_output_zero_allocator
+            )
 
         current_stream.wait_stream(self.alt_stream)
 
