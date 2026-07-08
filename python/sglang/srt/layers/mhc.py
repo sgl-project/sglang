@@ -4,6 +4,8 @@ import math
 from typing import Tuple
 
 import torch
+import triton
+import triton.language as tl
 
 from sglang.jit_kernel.utils import is_arch_support_pdl
 from sglang.srt.environ import envs
@@ -1608,3 +1610,49 @@ def npu_hc_pre(
     # not fold input_layernorm. Return norm_fused=False so the caller
     # applies the layernorm itself, matching the deepgemm/torch paths.
     return y.to(dtype), post, comb, False
+
+
+@triton.jit
+def _hc_combine_kernel(
+    x_ptr,
+    pre_ptr,
+    y_ptr,
+    H,
+    x_stride_m,
+    y_stride_m,
+    HC: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_h = tl.program_id(1)
+    offs_h = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
+    mask = offs_h < H
+    acc = tl.zeros([BLOCK_H], dtype=tl.float32)
+    for k in tl.static_range(HC):
+        pk = tl.load(pre_ptr + pid_m * HC + k).to(tl.float32)
+        xv = tl.load(
+            x_ptr + pid_m * x_stride_m + k * H + offs_h, mask=mask, other=0.0
+        ).to(tl.float32)
+        acc += pk * xv
+    tl.store(y_ptr + pid_m * y_stride_m + offs_h, acc, mask=mask)
+
+
+def hc_combine(
+    x_flat: torch.Tensor, pre: torch.Tensor, hc: int, out_dtype: torch.dtype
+) -> torch.Tensor:
+    """Fused y[m, h] = sum_k pre[m, k] * x_flat[m, k*H + h]."""
+    m = x_flat.shape[0]
+    h = x_flat.shape[1] // hc
+    y = torch.empty((m, h), dtype=out_dtype, device=x_flat.device)
+    block_h = 1024
+    _hc_combine_kernel[(m, triton.cdiv(h, block_h))](
+        x_flat,
+        pre,
+        y,
+        h,
+        x_flat.stride(0),
+        y.stride(0),
+        HC=hc,
+        BLOCK_H=block_h,
+    )
+    return y

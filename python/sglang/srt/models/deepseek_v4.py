@@ -1412,8 +1412,10 @@ class DeepseekV4DecoderLayer(nn.Module):
             self.hc_sinkhorn_iters,
             self.hc_eps,
         )
-        y = (pre.squeeze(1).unsqueeze(-1) * x_flat.view(shape)).sum(dim=1)
-        return y.to(dtype), post.squeeze(1), comb.squeeze(1), False
+        from sglang.srt.layers.mhc import hc_combine
+
+        y = hc_combine(x_flat, pre.squeeze(1).contiguous(), self.hc_mult, dtype)
+        return y, post.squeeze(1), comb.squeeze(1), False
 
     def hc_post(
         self,
