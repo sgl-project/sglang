@@ -85,11 +85,8 @@ class SchedulerLoadInquirer:
         return num_tokens
 
     def get_loads(self) -> LoadSnapshot:
-        """Build the per-DP-rank load snapshot for DP balancing and /v1/loads.
-
-        Every applicable section is always built; per-request section filtering
-        happens later in ``LoadSnapshot.to_dict``.
-        """
+        """Build the per-DP-rank load snapshot for DP balancing and /v1/loads."""
+        stats = self.get_stats()
         num_running_reqs = len(self.get_running_batch().reqs)
 
         waiting_queues = [self.get_waiting_queue()]
@@ -130,7 +127,7 @@ class SchedulerLoadInquirer:
                 graph_gb=round(self.tp_worker.model_runner.graph_mem_usage, 3),
                 token_capacity=int(self.max_total_num_tokens),
             )
-        except AttributeError as e:
+        except (AttributeError, TypeError) as e:
             logger.debug(f"Memory metrics not available: {e}")
 
         speculative = None
@@ -143,15 +140,15 @@ class SchedulerLoadInquirer:
                     self.get_spec_total_num_accept_tokens()
                     / self.get_spec_total_num_forward_ct()
                 ),
-                accept_rate=self.get_stats().spec_accept_rate,
+                accept_rate=stats.spec_accept_rate,
             )
 
         lora = None
         if self.server_args.enable_lora:
             lora = LoRAMetrics(
-                slots_used=self.get_stats().lora_pool_slots_used,
-                slots_total=self.get_stats().lora_pool_slots_total,
-                utilization=self.get_stats().lora_pool_utilization,
+                slots_used=stats.lora_pool_slots_used,
+                slots_total=stats.lora_pool_slots_total,
+                utilization=stats.lora_pool_utilization,
             )
 
         mode_str = "null"
@@ -175,15 +172,15 @@ class SchedulerLoadInquirer:
             decode_prealloc_queue_reqs=decode_prealloc,
             decode_transfer_queue_reqs=decode_transfer,
             decode_retracted_queue_reqs=decode_retracted,
-            kv_transfer_speed_gb_s=self.get_stats().kv_transfer_speed_gb_s,
-            kv_transfer_latency_ms=self.get_stats().kv_transfer_latency_ms,
+            kv_transfer_speed_gb_s=stats.kv_transfer_speed_gb_s,
+            kv_transfer_latency_ms=stats.kv_transfer_latency_ms,
         )
 
         queues = QueueMetrics(
             waiting=len(self.get_waiting_queue()),
-            grammar=self.get_stats().num_grammar_queue_reqs,
-            paused=self.get_stats().num_paused_reqs,
-            retracted=self.get_stats().num_retracted_reqs,
+            grammar=stats.num_grammar_queue_reqs,
+            paused=stats.num_paused_reqs,
+            retracted=stats.num_retracted_reqs,
         )
 
         return LoadSnapshot(
@@ -197,9 +194,9 @@ class SchedulerLoadInquirer:
             max_total_num_tokens=self.max_total_num_tokens,
             max_running_requests=self.max_running_requests,
             token_usage=round(kv_token_usage, 4),
-            gen_throughput=round(self.get_stats().gen_throughput, 2),
-            cache_hit_rate=round(self.get_stats().cache_hit_rate, 4),
-            utilization=round(self.get_stats().utilization, 4),
+            gen_throughput=round(stats.gen_throughput, 2),
+            cache_hit_rate=round(stats.cache_hit_rate, 4),
+            utilization=round(stats.utilization, 4),
             memory=memory,
             speculative=speculative,
             lora=lora,

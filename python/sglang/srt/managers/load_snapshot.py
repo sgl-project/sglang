@@ -173,8 +173,8 @@ class QueueMetrics(msgspec.Struct, array_like=True):
     retracted: int
 
 
-# Core scalar fields echoed verbatim into the /v1/loads response.
 _CORE_KEYS = (
+    "timestamp",
     "dp_rank",
     "num_running_reqs",
     "num_waiting_reqs",
@@ -188,21 +188,10 @@ _CORE_KEYS = (
     "cache_hit_rate",
     "utilization",
 )
-# (LoadSnapshot field / JSON key, /v1/loads include token).
-_SECTIONS = (
-    ("memory", "memory"),
-    ("speculative", "spec"),
-    ("lora", "lora"),
-    ("disaggregation", "disagg"),
-    ("queues", "queues"),
-)
 
 
 class LoadSnapshot(msgspec.Struct, omit_defaults=True):
-    """Per-DP-rank load metrics: the SHM/zmq wire format for DP balancing and
-    the source of the /v1/loads response. Built directly by
-    ``SchedulerLoadInquirer.get_loads``; sections are None when not applicable
-    and filtered per request in ``to_dict``."""
+    """Per-DP-rank load metrics: the SHM/zmq wire format and the /v1/loads source."""
 
     timestamp: float = 0.0
     dp_rank: int = 0
@@ -243,8 +232,13 @@ class LoadSnapshot(msgspec.Struct, omit_defaults=True):
                 return load
             include_all = False
 
-        for field, include_name in _SECTIONS:
-            section = getattr(self, field)
+        for field, include_name, section in (
+            ("memory", "memory", self.memory),
+            ("speculative", "spec", self.speculative),
+            ("lora", "lora", self.lora),
+            ("disaggregation", "disagg", self.disaggregation),
+            ("queues", "queues", self.queues),
+        ):
             if section is None or (not include_all and include_name not in include):
                 continue
             load[field] = msgspec.structs.asdict(section)
@@ -253,8 +247,7 @@ class LoadSnapshot(msgspec.Struct, omit_defaults=True):
 
 
 def _enc_hook(obj):
-    """Coerce numpy scalars (e.g. from ``round(np.float32(x), n)`` in the
-    scheduler) to native Python; msgpack has no numpy types."""
+    """Coerce numpy scalars to native Python; msgpack has no numpy types."""
     to_item = getattr(obj, "item", None)
     if to_item is not None:
         return to_item()
