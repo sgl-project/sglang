@@ -315,6 +315,8 @@ class _Dumper:
         model: "torch.nn.Module",
         name_prefix: str = "param",
         save: bool = True,
+        get_grad: Optional[Callable] = None,
+        step: Optional[int] = None,
         **kwargs,
     ) -> None:
         for param_name, param in model.named_parameters():
@@ -332,6 +334,8 @@ class _Dumper:
                 enable_future_grad=False,
                 value_tag="Dumper.ParamValue",
                 grad_tag="Dumper.ParamGrad",
+                get_grad=get_grad,
+                step=step,
             )
 
     def dump_dict(self, name_prefix, data, save: bool = True, **kwargs):
@@ -469,6 +473,8 @@ class _Dumper:
         value_meta_only_fields: Optional[dict] = None,
         grad_meta_only_fields: Optional[dict] = None,
         grafter_extras: Optional[dict] = None,
+        get_grad: Optional[Callable] = None,
+        step: Optional[int] = None,
     ) -> None:
         self._http_manager  # noqa: B018
 
@@ -499,19 +505,22 @@ class _Dumper:
                 tags=tags,
                 value=value,
                 save=save,
+                step=step,
                 meta_only_fields={**(value_meta_only_fields or {}), **recompute_meta},
             )
 
-        if (
-            enable_curr_grad
-            and isinstance(value, torch.Tensor)
-            and (g := value.grad) is not None
-        ):
+        if enable_curr_grad and isinstance(value, torch.Tensor):
+            g = get_grad(value) if get_grad is not None else value.grad
+        else:
+            g = None
+
+        if g is not None:
             self._dump_single(
                 tag=grad_tag,
                 tags={**tags, "name": f"grad__{name}"},
                 value=g,
                 save=save,
+                step=step,
                 meta_only_fields={**(grad_meta_only_fields or {}), **recompute_meta},
             )
 
