@@ -199,22 +199,32 @@ class DeepSeekV32Detector(BaseFormatDetector):
 
         calls = []
         try:
-            # Extract content between function_calls tags
+            # Extract content between function_calls tags. When the output is
+            # truncated (e.g. by max_tokens) the closing tag never arrives;
+            # fall back to everything after the opener so complete invoke
+            # blocks are still recovered instead of being silently dropped.
             function_calls_match = re.search(
                 self.function_calls_regex,
                 text,
                 re.DOTALL,
             )
-            if not function_calls_match:
-                return StreamingParseResult(normal_text=normal_text, calls=[])
-
-            function_calls_content = function_calls_match.group(1)
+            if function_calls_match:
+                function_calls_content = function_calls_match.group(1)
+            else:
+                function_calls_content = text[idx + len(self.bot_token) :]
 
             # Find all invoke blocks
             for invoke_match in re.finditer(
                 self.invoke_regex, function_calls_content, re.DOTALL
             ):
-                func_name, invoke_content, _ = self._unpack_invoke_match(invoke_match)
+                func_name, invoke_content, is_complete = self._unpack_invoke_match(
+                    invoke_match
+                )
+                if not is_complete:
+                    # Unterminated invoke block (truncated output): drop it
+                    # rather than emitting a call with partial arguments,
+                    # matching the streaming path's behavior.
+                    continue
                 func_args = self._parse_parameters_from_xml(invoke_content)
                 # construct match_result for parse_base_json
                 match_result = {"name": func_name, "parameters": json.loads(func_args)}

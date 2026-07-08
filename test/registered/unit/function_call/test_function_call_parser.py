@@ -1488,6 +1488,78 @@ class TestDeepSeekV32Detector(unittest.TestCase):
         params = json.loads(params_str)
         self.assertEqual(params["city"], "San Francisco")
 
+    def test_detect_and_parse_truncated_preserves_complete_calls(self):
+        """A complete invoke followed by a max_tokens-truncated one must not
+        be dropped: the closing function_calls tag never arrives, but every
+        complete invoke block should still be returned."""
+        text = (
+            "Check both.<｜DSML｜function_calls>"
+            '<｜DSML｜invoke name="get_favorite_tourist_spot">'
+            '<｜DSML｜parameter name="city" string="true">Paris</｜DSML｜parameter>'
+            "</｜DSML｜invoke>"
+            '<｜DSML｜invoke name="search">'
+            '<｜DSML｜parameter name="query" string="true">WebNav ben'
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(result.normal_text, "Check both.")
+        self.assertEqual(len(result.calls), 1)
+        call = result.calls[0]
+        self.assertEqual(call.name, "get_favorite_tourist_spot")
+        self.assertEqual(json.loads(call.parameters), {"city": "Paris"})
+
+    def test_detect_and_parse_truncated_single_call_dropped(self):
+        """A single invoke truncated mid-arguments is dropped instead of
+        being emitted with partial arguments or leaked into content."""
+        text = (
+            "I will check.<｜DSML｜function_calls>"
+            '<｜DSML｜invoke name="get_favorite_tourist_spot">'
+            '<｜DSML｜parameter name="city" string="true">San Fr'
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(result.normal_text, "I will check.")
+        self.assertEqual(len(result.calls), 0)
+
+    def test_detect_and_parse_truncated_at_opener(self):
+        """Output cut right after the opener yields clean content and no calls."""
+        text = "I will check.<｜DSML｜function_calls>"
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(result.normal_text, "I will check.")
+        self.assertEqual(len(result.calls), 0)
+
+    def test_detect_and_parse_truncated_json_format_dropped(self):
+        """Direct-JSON invoke truncated mid-arguments is dropped."""
+        text = (
+            "Check.<｜DSML｜function_calls>"
+            '<｜DSML｜invoke name="get_favorite_tourist_spot">{"city": "San Fr'
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(result.normal_text, "Check.")
+        self.assertEqual(len(result.calls), 0)
+
+    def test_detect_and_parse_missing_eot_self_closing_invoke(self):
+        """A complete self-closing invoke survives a missing closing
+        function_calls tag."""
+        tools_with_no_param = self.tools + [
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_date",
+                    description="Get the current date.",
+                    parameters={"type": "object", "properties": {}},
+                ),
+            ),
+        ]
+        text = 'Go.<｜DSML｜function_calls><｜DSML｜invoke name="get_date"/>'
+        result = self.detector.detect_and_parse(text, tools_with_no_param)
+
+        self.assertEqual(result.normal_text, "Go.")
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "get_date")
+
     def test_detect_and_parse_no_parameters(self):
         """Test parsing function calls with no parameters (non-streaming)"""
         # Add a no-parameter tool
