@@ -5,7 +5,7 @@ A lightweight HTTP sidecar is started alongside the gRPC server to expose:
 - /metrics (Prometheus, when --enable-metrics is set)
 - /start_profile, /stop_profile (profiling control)
 
-The sidecar is started on --grpc-http-sidecar-port (default: --port + 1)
+The sidecar is started on --smg-http-sidecar-port (default: --port + 1)
 once the gRPC request manager is ready, regardless of whether --enable-metrics
 is set.
 """
@@ -182,8 +182,8 @@ async def serve_grpc(server_args, model_info=None):
     sidecar_app = web.Application()
     sidecar_runner = None
     sidecar_port = (
-        server_args.grpc_http_sidecar_port
-        if server_args.grpc_http_sidecar_port is not None
+        server_args.smg_http_sidecar_port
+        if server_args.smg_http_sidecar_port is not None
         else server_args.port + 1
     )
 

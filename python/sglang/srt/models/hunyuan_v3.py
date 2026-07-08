@@ -44,7 +44,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.managers.schedule_batch import ForwardBatch
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, get_stream
 from sglang.srt.utils import is_cuda
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
@@ -424,7 +424,7 @@ class HYV3Model(nn.Module):
             prefix=f"{prefix}.embed_tokens",
         )
 
-        self.alt_stream = torch.cuda.Stream() if is_cuda() else None
+        self.alt_stream = get_stream("alt") if is_cuda() else None
 
         self.layers = nn.ModuleList(
             [

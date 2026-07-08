@@ -268,12 +268,42 @@ def _run_mega_routed(
     return y
 
 
+def _interleave_mega_moe_gate_up(t: torch.Tensor, gran: int = 8) -> torch.Tensor:
+    # Match DeepGEMM's L1 gate/up layout:
+    # [gate: 0..7, up: 0..7, gate: 8..15, up: 8..15, ...].
+    num_groups, n, *rest = t.shape
+    half = n // 2
+    gate = t[:, :half].reshape(num_groups, half // gran, gran, *rest)
+    up = t[:, half:].reshape(num_groups, half // gran, gran, *rest)
+    result = torch.stack([gate, up], dim=2).reshape(num_groups, n, *rest)
+    return torch.empty_like(t).copy_(result)
+
+
+def _interleave_mega_moe_l1_weights(
+    l1_weights: tuple[torch.Tensor, torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return (
+        _interleave_mega_moe_gate_up(l1_weights[0]),
+        _interleave_mega_moe_gate_up(l1_weights[1]),
+    )
+
+
+def _transpose_mega_moe_sf_for_utccp(sf: torch.Tensor) -> torch.Tensor:
+    num_groups, mn, packed_sf_k = sf.shape
+    assert sf.dtype == torch.int and mn % 128 == 0
+    result = (
+        sf.reshape(num_groups, -1, 4, 32, packed_sf_k)
+        .transpose(2, 3)
+        .reshape(num_groups, mn, packed_sf_k)
+    )
+    return torch.empty_like(sf).copy_(result)
+
+
 def build_mega_moe_experts_weights(experts) -> None:
     from deep_gemm import (
         transform_sf_into_required_layout,
         transform_weights_for_mega_moe,
     )
-    from deep_gemm.mega import _interleave_l1_weights, _transpose_sf_for_utccp
 
     if getattr(experts, "_mega_moe_weights_built", False):
         return
@@ -312,9 +342,11 @@ def build_mega_moe_experts_weights(experts) -> None:
         # the deep-ep path consumes the non-transposed interleaved scale and a
         # swizzle-aware activation kernel. L2 weight is untouched by the mega
         # transform, so the existing `w2_weight.data` is shared directly.
-        w13_interleaved, w13_sf_interleaved = _interleave_l1_weights((w13, w13_sf))
-        w13_sf_utccp = _transpose_sf_for_utccp(w13_sf_interleaved)
-        w2_sf_utccp = _transpose_sf_for_utccp(w2_sf)
+        w13_interleaved, w13_sf_interleaved = _interleave_mega_moe_l1_weights(
+            (w13, w13_sf)
+        )
+        w13_sf_utccp = _transpose_mega_moe_sf_for_utccp(w13_sf_interleaved)
+        w2_sf_utccp = _transpose_mega_moe_sf_for_utccp(w2_sf)
 
         experts.w13_weight.data = w13_interleaved
         experts.w13_weight_scale_inv.data = w13_sf_interleaved

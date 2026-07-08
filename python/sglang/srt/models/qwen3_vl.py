@@ -68,7 +68,7 @@ from sglang.srt.models.utils import (
 )
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
 from sglang.srt.multimodal.vit_cuda_graph_runner import ViTCudaGraphRunner
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     add_prefix,
@@ -1278,7 +1278,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                         self.config.vocab_size,
                         self.config.hidden_size,
                         quant_config=quant_config,
-                        use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+                        use_attn_tp_group=get_server_args().enable_dp_lm_head,
                         prefix=add_prefix("lm_head", prefix),
                     )
             else:

@@ -58,7 +58,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, get_stream
 from sglang.srt.utils import add_prefix, is_npu
 
 _is_npu = is_npu()
@@ -650,7 +650,7 @@ class Grok1Model(nn.Module):
             prefix=add_prefix("embed_tokens", prefix),
         )
 
-        self.alt_stream = torch.cuda.Stream()
+        self.alt_stream = get_stream("alt")
         self.layers = nn.ModuleList(
             [
                 Grok1DecoderLayer(

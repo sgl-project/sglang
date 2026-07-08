@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.srt.compilation.compilation_config import register_split_op
+from sglang.srt.distributed.parallel_state import get_dcp_group
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.dsa.utils import (
@@ -14,6 +15,13 @@ from sglang.srt.layers.attention.dsa.utils import (
     is_graph_dsa_split_op_surface,
 )
 from sglang.srt.layers.communicator import get_attn_tp_context
+from sglang.srt.layers.dcp import (
+    all_gather_kv_cache_for_mla_extend,
+    all_gather_q_for_mla_decode,
+    cp_lse_ag_out_rs_mla,
+    dcp_enabled,
+    get_attention_dcp_world_size,
+)
 from sglang.srt.layers.quantization.fp8_kernel import (
     fp8_dtype,
     per_tensor_quant_mla_fp8,
@@ -21,14 +29,6 @@ from sglang.srt.layers.quantization.fp8_kernel import (
 )
 from sglang.srt.layers.radix_attention import unified_attention_with_output
 from sglang.srt.layers.utils.cp_utils import mla_use_prefill_cp
-from sglang.srt.layers.utils.dcp_utils import (
-    all_gather_kv_cache_for_mla_extend,
-    all_gather_q_for_mla_decode,
-    cp_lse_ag_out_rs,
-    dcp_enabled,
-    get_attention_dcp_group,
-    get_attention_dcp_world_size,
-)
 from sglang.srt.lora.deepseek_mla_correction import (
     apply_q_correction as apply_kv_b_lora_q_correction,
 )
@@ -177,6 +177,27 @@ class DeepseekMLAForwardMixin:
         self.flashinfer_mla_disable_ragged = (
             get_global_server_args().flashinfer_mla_disable_ragged
         )
+
+    def should_run_indexer(
+        self: DeepseekV2AttentionMLA,
+        prev_topk_indices: Optional[torch.Tensor] = None,
+    ) -> bool:
+        """Whether this layer runs its own indexer vs reusing carried topk.
+
+        skip_topk (shared) layers carry no indexer weights in the checkpoint,
+        so they must reuse the carried topk and never run the indexer. Do NOT
+        widen this to `or prev_topk_indices is None` (the upstream gate): that
+        recomputes with an uninitialized indexer whenever cross-layer
+        propagation is unavailable (e.g. the TBO op path drops topk_indices),
+        reintroducing the >index_topk garbling. The is_nextn clause is the
+        sole intentional fallback (the NextN layer has its own weights).
+
+        Eager-MHA prefill calls this with no argument: it needs no topk for
+        the current forward, but producer layers must still fill their indexer
+        K cache for later MLA/decode; shared layers' cache is never read, so
+        filling it is dead work.
+        """
+        return not self.skip_topk or (self.is_nextn and prev_topk_indices is None)
 
     def _can_fuse_bmm_into_attention(
         self: DeepseekV2AttentionMLA, forward_batch: ForwardBatch
@@ -358,15 +379,7 @@ class DeepseekMLAForwardMixin:
                     q = self.q_b_proj(q)[0].view(
                         -1, self.num_local_heads, self.qk_head_dim
                     )
-                # skip_topk (shared) layers carry no indexer weights in the
-                # checkpoint, so they must reuse the carried topk and never run
-                # the indexer. Do NOT widen this to `or prev_topk_indices is
-                # None` (the upstream gate): that recomputes with an
-                # uninitialized indexer whenever cross-layer propagation is
-                # unavailable (e.g. the TBO op path drops topk_indices),
-                # reintroducing the >index_topk garbling. The is_nextn clause is
-                # the sole intentional fallback (layer 78 has its own weights).
-                if not self.skip_topk or (self.is_nextn and prev_topk_indices is None):
+                if self.should_run_indexer(prev_topk_indices):
                     topk_indices = self.indexer(
                         x=hidden_states,
                         q_lora=q_lora,
@@ -392,12 +405,7 @@ class DeepseekMLAForwardMixin:
                     fusion_plan = self._make_mla_bmm_fusion_plan(q, q_nope)
 
                 if q_lora is not None:
-                    # See the skip_topk note above: shared layers have no
-                    # indexer weights, so this gate must not fall back to
-                    # computing when prev_topk_indices is None.
-                    if not self.skip_topk or (
-                        self.is_nextn and prev_topk_indices is None
-                    ):
+                    if self.should_run_indexer(prev_topk_indices):
                         topk_indices = self.indexer(
                             x=hidden_states,
                             q_lora=q_lora,
@@ -794,7 +802,7 @@ class DeepseekMLAForwardMixin:
                 self.num_local_heads * get_attention_dcp_world_size(),
                 self.kv_lora_rank,
             )
-            attn_output = cp_lse_ag_out_rs(attn_output, lse, get_attention_dcp_group())
+            attn_output = cp_lse_ag_out_rs_mla(attn_output, lse, get_dcp_group())
             attn_output = attn_output.transpose(0, 1)
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 

@@ -43,7 +43,7 @@ from sglang.srt.speculative.triton_ops.cache_locs import (
 from sglang.srt.speculative.triton_ops.eagle import (
     fill_accept_out_cache_loc as fill_accept_out_cache_loc,
 )
-from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu, next_power_of_2
+from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu, is_xpu, next_power_of_2
 from sglang.srt.utils.async_probe import maybe_detect_oob
 from sglang.srt.utils.nvtx_utils import profile_range
 
@@ -51,6 +51,7 @@ _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_musa = is_musa()
+_is_xpu = is_xpu()
 
 if TYPE_CHECKING:
     from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
@@ -92,6 +93,18 @@ def renorm_draft_probs(
     if not use_rejection_sampling or not next_token_logits.size(0):
         return torch.softmax(next_token_logits, dim=-1)
     return torch.softmax(next_token_logits / sampling_info.temperatures, dim=-1)
+
+
+def sample_draft_proposal(next_token_logits: torch.Tensor, temperatures: torch.Tensor):
+    """Leviathan draft proposal: q = softmax(logits / T), X ~ q.
+
+    Returns (q, q(X), X). The verify's accept test coin*q(X) < p(X) is unbiased
+    only if q is exactly the distribution X was drawn from, so callers must hand
+    the returned q (not a recomputed one) to the verify.
+    """
+    probs = torch.softmax(next_token_logits / temperatures, dim=-1)
+    topk_p, topk_index = fast_sample(probs, num_samples=1)
+    return probs, topk_p, topk_index
 
 
 # Simulate acceptance length for benchmarking purposes
@@ -189,7 +202,7 @@ def spec_need_hidden_states(server_args: Optional[ServerArgs] = None) -> bool:
     return not server_args.enable_multi_layer_eagle
 
 
-@torch.compile(dynamic=True, disable=_is_npu)
+@torch.compile(dynamic=True, disable=_is_npu or _is_xpu)
 def create_num_accept_tokens_filter(
     num_correct_drafts: torch.Tensor,
     unfinished_index_device: torch.Tensor,
@@ -223,7 +236,7 @@ def _select_top_k_tokens_first(
     return input_ids, hidden_states, topk_p, tree_info
 
 
-@torch.compile(dynamic=True, disable=_is_npu)
+@torch.compile(dynamic=True, disable=_is_npu or _is_xpu)
 def _select_top_k_tokens_later(
     i: int,
     topk_p: torch.Tensor,
