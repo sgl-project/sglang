@@ -43,12 +43,6 @@ class StandaloneServerBase:
     speculative_num_draft_tokens: int = 5
     disable_overlap: bool = False
     enable_deterministic_inference: bool = False
-    # Memory / batching knobs. Defaults reproduce the historical launch args;
-    # subclasses lower max_running_requests / bound prefill to avoid OOM.
-    mem_fraction_static: float = 0.7
-    max_running_requests: int = None
-    chunked_prefill_size: int = None
-    extra_args: tuple = ()
 
     @classmethod
     def get_server_args(cls):
@@ -68,17 +62,12 @@ class StandaloneServerBase:
             "--speculative-num-draft-tokens",
             str(cls.speculative_num_draft_tokens),
             "--mem-fraction-static",
-            str(cls.mem_fraction_static),
+            0.7,
             "--attention-backend",
             cls.attention_backend,
         ]
-        if cls.max_running_requests is not None:
-            args += ["--max-running-requests", str(cls.max_running_requests)]
-        if cls.chunked_prefill_size is not None:
-            args += ["--chunked-prefill-size", str(cls.chunked_prefill_size)]
         if cls.enable_deterministic_inference:
             args.append("--enable-deterministic-inference")
-        args += [str(a) for a in cls.extra_args]
         return args
 
     @classmethod
