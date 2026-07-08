@@ -47,6 +47,10 @@ class TemplateDetectionContext:
     def has_pattern(self, pattern: str, flags: int = 0) -> bool:
         return re.search(pattern, self.template, flags) is not None
 
+    def has_vocab_pattern(self, pattern: str) -> bool:
+        compiled = re.compile(pattern)
+        return any(isinstance(tok, str) and compiled.search(tok) for tok in self.vocab)
+
 
 @dataclass(frozen=True)
 class DetectionRule:
@@ -60,6 +64,7 @@ class ReasoningToggleConfig:
     toggle_param: Optional[str] = None
     default_enabled: Optional[bool] = None
     special_case: Optional[str] = None
+    effort_kwarg: Optional[str] = None
 
     @property
     def always_on(self) -> bool:
@@ -99,6 +104,16 @@ REASONING_MODE_RULES = (
             r"{%\s*set\s+enable_thinking\s*=\s*(?:false|False)\s*%}",
             re.DOTALL,
         ),
+    ),
+    DetectionRule(
+        name="nemotron_3_super_low_effort",
+        value=ReasoningToggleConfig(
+            toggle_param="enable_thinking",
+            default_enabled=True,
+            effort_kwarg="low_effort",
+        ),
+        predicate=lambda ctx: ctx.has_text("low_effort")
+        and ctx.has_text("truncate_history_thinking"),
     ),
     DetectionRule(
         name="enable_thinking_default_true",
@@ -189,8 +204,10 @@ def _is_kimi_k2(ctx):
 
 
 def _is_nemotron_3(ctx):
-    return ctx.has_text("truncate_history_thinking") and ctx.reasoning_config == (
-        ReasoningToggleConfig(toggle_param="enable_thinking", default_enabled=True)
+    return ctx.has_text("truncate_history_thinking") and (
+        ctx.reasoning_config is not None
+        and ctx.reasoning_config.toggle_param == "enable_thinking"
+        and ctx.reasoning_config.default_enabled is True
     )
 
 
@@ -237,10 +254,17 @@ def _is_deepseek_v4(ctx):
 
 
 def _is_hunyuan(ctx):
-    return (
-        (ctx.has_text("<tool_calls>") or ctx.has_vocab("<tool_calls>"))
-        and (ctx.has_text("<tool_sep>") or ctx.has_vocab("<tool_sep>"))
-    ) or (ctx.has_text("reasoning_effort") and ctx.has_text("interleaved_thinking"))
+    # The shipping Hy3 tokenizer appends a shared suffix to each special token
+    # (e.g. ``<tool_calls:opensource>``), so match the bare or suffixed form.
+    tc = ctx.has_text("<tool_calls>") or ctx.has_vocab_pattern(
+        r"^<tool_calls(?::[^>]+)?>$"
+    )
+    sep = ctx.has_text("<tool_sep>") or ctx.has_vocab_pattern(
+        r"^<tool_sep(?::[^>]+)?>$"
+    )
+    return (tc and sep) or (
+        ctx.has_text("reasoning_effort") and ctx.has_text("interleaved_thinking")
+    )
 
 
 def _is_poolside_v1(ctx):

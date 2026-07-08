@@ -6,6 +6,7 @@
 # isort: off
 from .modelslim_scheme import ModelSlimLinearScheme, ModelSlimMoEScheme
 from .modelslim_mxfp8 import ModelSlimMXFP8Scheme
+from .modelslim_mxfp4_w4a8 import ModelSlimMXFP4W4A8Scheme
 
 # isort: on
 from .modelslim_w4a4_int4 import ModelSlimW4A4Int4
@@ -20,6 +21,7 @@ __all__ = [
     "ModelSlimLinearScheme",
     "ModelSlimMoEScheme",
     "ModelSlimMXFP8Scheme",
+    "ModelSlimMXFP4W4A8Scheme",
     "ModelSlimW8A8Int8",
     "ModelSlimW4A4Int4",
     "ModelSlimW4A4Int4MoE",
