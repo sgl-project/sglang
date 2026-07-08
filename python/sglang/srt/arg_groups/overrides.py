@@ -34,6 +34,7 @@ import logging
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from sglang.srt.arg_groups.arg_utils import resolvable_fields
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.utils.common import (
     cpu_has_amx_support,
@@ -463,7 +464,6 @@ def _minimax_m2_overrides(server_args: Any, hf_config: Any) -> dict:
 
 @_register_for("MiniMaxM3SparseForCausalLM", "MiniMaxM3SparseForConditionalGeneration")
 def _minimax_m3_overrides(server_args: Any, hf_config: Any) -> dict:
-    from sglang.srt.environ import envs
 
     overrides: Dict[str, Any] = {}
 
@@ -613,7 +613,6 @@ def _gpt_oss_overrides(server_args: Any, hf_config: Any) -> dict:
         # use bf16 for mxfp4 triton kernels
         overrides["dtype"] = "bfloat16"
     if server_args.moe_runner_backend == "auto":
-        from sglang.srt.environ import envs
 
         if is_sm100_supported() and is_mxfp4_quant_format:
             overrides["moe_runner_backend"] = "flashinfer_mxfp4"
@@ -920,7 +919,6 @@ def _qwen3_5_hybrid_overrides(server_args: Any, hf_config: Any) -> dict:
 
 @_register_for("Qwen3VLForConditionalGeneration")
 def _qwen3vl_overrides(server_args: Any, hf_config: Any) -> dict:
-    from sglang.srt.environ import envs
 
     if (
         is_hip()
@@ -1367,7 +1365,6 @@ def _deepseek_spec_moe_resolution(view: Any) -> dict:
     backends for the DeepSeek fp4 checkpoint. Reads the mid-resolution
     quantization (after _deepseek_moe_quant_resolution) and the pre-a2a
     ep_size, exactly like the legacy in-branch writes."""
-    from sglang.srt.environ import envs
 
     hf_config = view.get_model_config().hf_config
     model_arch = hf_config.architectures[0]
@@ -1452,7 +1449,6 @@ def _deepseek_v4_sm120_moe(view: Any) -> dict:
 
 @register_post_process
 def _sparse_head_overlap_disable(view: Any) -> dict:
-    from sglang.srt.environ import envs
 
     if envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.is_set():
         logger.warning(
@@ -1870,7 +1866,6 @@ def _attention_backend_dual_chunk(view: Any) -> dict:
 def _page_size_default(view: Any) -> dict:
     if view.page_size is not None:
         return {}
-    from sglang.srt.environ import envs
 
     # SHUFFLE 5D vectorized KV layout (aiter backend + pa_decode_gluon)
     # is tuned for and prefers page_size=64 — making it the default
@@ -2012,7 +2007,6 @@ def _a2a_fusion_adjustments(view: Any) -> dict:
 
 
 def _cutlass_moe_env_override(view: Any) -> dict:
-    from sglang.srt.environ import envs
 
     if envs.SGLANG_CUTLASS_MOE.get():
         logger.warning(
@@ -2034,7 +2028,6 @@ _A2A_EP_SPANNING_BACKENDS = frozenset(
 
 @register_post_process
 def _a2a_backend_overrides(view: Any) -> dict:
-    from sglang.srt.environ import envs
 
     moe_a2a_backend = view.moe_a2a_backend
     if view.enable_deepep_waterfill and moe_a2a_backend != "deepep":
