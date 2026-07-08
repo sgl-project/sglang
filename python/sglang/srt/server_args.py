@@ -4298,10 +4298,7 @@ class ServerArgs:
                 envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.set(False)
                 envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
                 envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.set(True)
-                # No deep_gemm path exists for SM120 (sm90 impl needs
-                # WGMMA, sm100 needs tcgen05); route the indexer to the
-                # tilelang kernel, which JIT-compiles for the local arch
-                # and outranks the torch fallback above in the dispatch.
+                # Prefer TileLang over the Torch fallback.
                 envs.SGLANG_OPT_USE_TILELANG_INDEXER.set(True)
             elif is_hip():
                 envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)

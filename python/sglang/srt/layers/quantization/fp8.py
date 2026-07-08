@@ -364,11 +364,7 @@ class Fp8Config(QuantizationConfig):
                 return Mxfp4MarlinMoEMethod(fp8_method, prefix=prefix)
 
             if self.is_fp4_experts and get_moe_runner_backend().is_flashinfer_mxfp4():
-                # SM100 (Blackwell)       -> trtllm-gen path.
-                # SM90  (Hopper)          -> cutlass mixed-input path (FlashInfer #3084).
-                # SM120 (Blackwell GeForce/RTX PRO, no tcgen05) -> the same
-                # cutlass path; FlashInfer's cutlass_fused_moe dispatches to
-                # its SM120 module by device arch.
+                # SM100 uses TRT-LLM; SM90 uses W4A16 and SM120 uses MXFP8xMXFP4.
                 if (
                     is_sm90_supported() and not is_sm100_supported()
                 ) or is_sm120_supported():
@@ -975,6 +971,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         intermediate_size_per_partition: int,
         params_dtype: torch.dtype,
         with_bias: bool = False,
+        fp4_scale_dtype: Optional[torch.dtype] = None,
         **extra_weight_attrs,
     ):
         self.with_bias = with_bias
@@ -1110,7 +1107,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         # WEIGHT_SCALES
         if self.is_fp4_expert:
             fp4_block_k = 32
-            fp4_scale_dtype = torch.float8_e8m0fnu if _use_aiter else torch.float32
+            if fp4_scale_dtype is None:
+                fp4_scale_dtype = torch.float8_e8m0fnu if _use_aiter else torch.float32
             w13_weight_scale = torch.nn.Parameter(
                 torch.ones(
                     num_experts,

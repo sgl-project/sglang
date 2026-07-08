@@ -71,12 +71,7 @@ class Mxfp4MarlinMoEMethod:
         layer.register_parameter("w2_weight", w2_weight)
         set_weight_attrs(w2_weight, extra_weight_attrs)
 
-        # The checkpoint stores these scales as 1-byte E8M0 and the marlin
-        # preparation normalizes from any container dtype, so register them
-        # at the checkpoint dtype: a float32 container would 4x the bytes
-        # (~12 GB per rank for a 43-layer 256-expert model at ep2) purely
-        # as a loader-side inflation. The uint8 fill of 127 is E8M0 1.0,
-        # preserving the previous torch.ones initialization.
+        # Store loader scales in E8M0; uint8 127 encodes 1.0.
         def _e8m0_ones(*shape: int) -> torch.Tensor:
             return torch.full(shape, 127, dtype=torch.uint8).view(torch.float8_e8m0fnu)
 

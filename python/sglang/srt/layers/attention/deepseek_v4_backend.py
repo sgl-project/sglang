@@ -1411,10 +1411,7 @@ class DeepseekV4AttnBackend(
                     extra_indices.shape[-1] % 64 == 0
                 ), f"{extra_indices.shape=}'s last dimension is not aligned to 64"
 
-            # sgl-kernel's sparse_prefill_fwd is only built for SM90a and
-            # SM100f. On SM120 every extend stays on the FlashInfer
-            # sparse-MLA path below, which takes arbitrary extend-token
-            # counts (per-token indices + topk_length).
+            # sparse_prefill_fwd does not support SM120.
             if (
                 forward_batch.forward_mode.is_extend_without_speculative()
                 and not _is_sm120

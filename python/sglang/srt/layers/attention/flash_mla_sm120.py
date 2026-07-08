@@ -440,13 +440,7 @@ def _flash_mla_flashinfer(
     output = torch.empty(B, H, head_dim_v, dtype=torch.bfloat16, device=dev)
     out_lse = torch.empty(B, H, dtype=torch.float32, device=dev)
 
-    # Route through FlashInfer's dispatching entry instead of hardwiring
-    # the split-K decode fast path: batches up to _DECODE_MAX_TOKENS take
-    # the fast path (caller-supplied scratch, bounded at 64 tokens), and
-    # larger extend batches take the generic paged-attention kernel,
-    # which needs no split-K scratch. The old direct decode call ran
-    # every prefill batch through the decode kernel with ~1 MB of scratch
-    # per extend token, which dominated prefill memory.
+    # Use split-K for decode-sized batches and paged attention otherwise.
     if B <= _FI_DECODE_MAX_TOKENS:
         topk = idx.shape[-1]
         extra_topk = extra_idx.shape[-1] if extra_idx is not None else 0

@@ -176,11 +176,7 @@ def fp8_paged_mqa_logits_torch_sm120(
     block_size = kvcache_fp8.shape[1]
     device = q_fp8.device
 
-    # Bound the fp32 materialization: the gathered-KV dequant below costs
-    # about 1 MB per query token at 8k context, so a single shot over a
-    # prefill-sized extend batch allocates several GB and OOMs. Chunk the
-    # query dimension; decode-sized batches (CUDA-graph capture) stay
-    # single-chunk, so capture semantics are unchanged.
+    # Bound FP32 gathered-KV materialization during long prefills.
     _QUERY_CHUNK = 1024
     if batch_size > _QUERY_CHUNK:
         return torch.cat(
