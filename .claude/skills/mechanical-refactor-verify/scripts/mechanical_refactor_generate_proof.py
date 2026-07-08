@@ -77,19 +77,22 @@ def _per_file_diff(commit: str, root: str) -> dict[str, dict]:
     )
     files: dict[str, dict] = {}
     path: str | None = None
+    in_hunk = False
     for line in out.splitlines():
-        if line.startswith("diff --git"):
-            path = line.split(" b/")[-1]
+        header = re.match(r"diff --git a/(.*) b/(.+)$", line)
+        if header:
+            path = header.group(2)
             files[path] = {"removed": [], "added": [], "new": False, "deleted": False}
+            in_hunk = False
         elif line.startswith("new file"):
             files[path]["new"] = True
         elif line.startswith("deleted file"):
             files[path]["deleted"] = True
-        elif line.startswith(("+++", "---", "@@", "index ")):
-            continue
-        elif line.startswith("+"):
+        elif line.startswith("@@"):
+            in_hunk = True
+        elif in_hunk and line.startswith("+"):
             files[path]["added"].append(line[1:])
-        elif line.startswith("-"):
+        elif in_hunk and line.startswith("-"):
             files[path]["removed"].append(line[1:])
     return files
 
@@ -424,7 +427,18 @@ def _symbols_form_tail(src_text: str, symbols: list[str]) -> bool:
     other code, fails this and is not an extractable tail."""
     body = ast.parse(src_text).body
     wanted = set(symbols)
-    scaffolding = (ast.Import, ast.ImportFrom, ast.If, ast.Assign, ast.AnnAssign)
+
+    def is_scaffolding(node: ast.stmt) -> bool:
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            return True
+        if isinstance(node, ast.If):
+            return ast.unparse(node.test) in ("TYPE_CHECKING", "typing.TYPE_CHECKING")
+        if isinstance(node, ast.Assign):
+            return all(isinstance(x, ast.Name) for x in node.targets)
+        if isinstance(node, ast.AnnAssign):
+            return isinstance(node.target, ast.Name)
+        return False
+
     cut = len(body)
     while cut > 0:
         node = body[cut - 1]
@@ -432,7 +446,7 @@ def _symbols_form_tail(src_text: str, symbols: list[str]) -> bool:
             isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
             and node.name in wanted
         )
-        if is_symbol or isinstance(node, scaffolding):
+        if is_symbol or is_scaffolding(node):
             cut -= 1
         else:
             break
@@ -479,8 +493,11 @@ def infer_recipe(commit: str, root: str) -> Recipe:
     tail into the new file). Method-source moves adapt their call sites; free-function-source
     moves keep the bare call and only repath imports. A rename or a statement-level reorder
     relocates no def, so nothing is inferred and the commit is reported unsupported."""
-    files = _per_file_diff(commit, root)
+    all_files = _per_file_diff(commit, root)
+    files = {path: f for path, f in all_files.items() if path.endswith(".py")}
     recipe = Recipe(base=f"{commit}~1", target=commit)
+    for path in sorted(set(all_files) - set(files)):
+        recipe.notes.append(f"non-Python file changed: {path} (left to the residual diff)")
 
     def def_names(lines: list[str]) -> set[str]:
         return {
@@ -604,6 +621,7 @@ def infer_recipe(commit: str, root: str) -> Recipe:
                 "src": src,
                 "dst": dst,
                 "into_class": into_class,
+                "from_class": src_class,
                 "dedent": src_indent - dst_indent,
                 "dst_order": dst_def.lineno if dst_def else 0,
                 "before": _next_sibling_def_name(dst_tree, name, into_class),
@@ -721,6 +739,7 @@ def _recipe_ops(recipe: Recipe) -> list:
                     "src": mv["src"],
                     "dst": mv["dst"],
                     "into_class": mv["into_class"],
+                    "from_class": mv.get("from_class"),
                     "dedent": mv["dedent"],
                     "drop_self_annotation": mv["drop_self_annotation"],
                     "before": mv.get("before"),
@@ -765,9 +784,9 @@ def _recipe_ops(recipe: Recipe) -> list:
     return ops
 
 
-def build_repro(recipe: Recipe) -> rr.Repro:
+def build_repro(recipe: Recipe, repo_root: str | None = None) -> rr.Repro:
     """Compose a Repro from the recipe's canonical ordered operations (``_recipe_ops``)."""
-    repro = rr.Repro(base=recipe.base, target=recipe.target)
+    repro = rr.Repro(base=recipe.base, target=recipe.target, repo_root=repo_root)
     for method, args, kwargs in _recipe_ops(recipe):
         getattr(repro, method)(*args, **kwargs)
     return repro
@@ -837,26 +856,32 @@ def generate_range(
         subject = _git_output(["log", "-1", "--format=%s", commit], root).strip()
         if pattern is not None and not pattern.search(subject):
             continue
-        recipe = infer_recipe(commit, root)
-        script = recipe_to_script(recipe, subject)
-        (scripts_dir / f"{commit[:9]}.py").write_text(script)
-        passed, residual = False, ""
-        relocates = bool(recipe.moves or recipe.extracts or recipe.scatter_extracts)
-        if recipe.supported and relocates:
-            try:
-                residual = build_repro(recipe).run()
+        passed, residual, script, supported, notes = False, "", "", False, []
+        try:
+            recipe = infer_recipe(commit, root)
+            script = recipe_to_script(recipe, subject)
+            (scripts_dir / f"{commit[:9]}.py").write_text(script)
+            relocates = bool(
+                recipe.moves or recipe.extracts or recipe.scatter_extracts
+            )
+            supported = recipe.supported and relocates
+            notes = recipe.notes
+            if supported:
+                residual = build_repro(recipe, repo_root=root).run()
                 passed = residual == ""
-            except Exception as exc:
-                residual = f"reproduce raised {type(exc).__name__}: {exc}"
+        except Exception as exc:
+            supported = False
+            residual = f"reproduce raised {type(exc).__name__}: {exc}"
+            notes = notes + [residual]
         results.append(
             GenResult(
                 commit=commit,
                 subject=subject,
-                supported=recipe.supported and relocates,
+                supported=supported,
                 passed=passed,
                 residual=residual,
                 script=script,
-                notes=recipe.notes,
+                notes=notes,
             )
         )
 
@@ -997,11 +1022,12 @@ def _main(argv: list[str]) -> int:
             recipe, _git_output(["log", "-1", "--format=%s", target], root)
         )
     )
-    if recipe.supported and (
-        recipe.moves or recipe.extracts or recipe.scatter_extracts
-    ):
-        build_repro(recipe).run()
-    return 0
+    relocates = bool(recipe.moves or recipe.extracts or recipe.scatter_extracts)
+    if not (recipe.supported and relocates):
+        print("UNSUPPORTED: " + "; ".join(recipe.notes), file=sys.stderr)
+        return 1
+    residual = build_repro(recipe, repo_root=root).run()
+    return 0 if residual == "" else 1
 
 
 if __name__ == "__main__":

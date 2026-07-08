@@ -690,3 +690,94 @@ def test_infer_recipe_adds_wholly_new_module_import_verbatim(repo: Path) -> None
         "name": "solve",
         "asname": None,
     } in recipe.module_import_removals
+
+
+def test_infer_recipe_survives_a_non_python_file_in_the_commit(repo: Path) -> None:
+    """A commit also touching a .md file infers the move and notes the non-Python path."""
+    _write(
+        repo,
+        **{
+            "model.py": "def foo():\n    return 1\n\n\ndef keep():\n    return 0\n",
+            "util.py": "x = 1\n",
+            "README.md": "hello\n",
+        },
+    )
+    _commit(repo, "base")
+    _write(
+        repo,
+        **{
+            "model.py": "def keep():\n    return 0\n",
+            "util.py": "x = 1\n\n\ndef foo():\n    return 1\n",
+            "README.md": "hello world, this is plain markdown text\n",
+        },
+    )
+    commit = _commit(repo, "move foo and touch docs")
+
+    recipe = infer_recipe(commit, str(repo))
+
+    assert [mv["name"] for mv in recipe.moves] == ["foo"]
+    assert any("README.md" in note for note in recipe.notes)
+
+
+def test_infer_recipe_records_the_source_class_for_disambiguation(repo: Path) -> None:
+    """A method move carries from_class so the cut cannot hit a same-named other method."""
+    _write(
+        repo,
+        **{
+            "model.py": (
+                "class M:\n"
+                "    def foo(self, x):\n"
+                "        return x + 1\n"
+                "\n"
+                "\n"
+                "class Other:\n"
+                "    def foo(self, x):\n"
+                "        return x + 2\n"
+            ),
+            "comp.py": "class C:\n    def keep(self):\n        return 1\n",
+        },
+    )
+    _commit(repo, "base")
+    _write(
+        repo,
+        **{
+            "model.py": (
+                "class M:\n"
+                "    pass\n"
+                "\n"
+                "\n"
+                "class Other:\n"
+                "    def foo(self, x):\n"
+                "        return x + 2\n"
+            ),
+            "comp.py": (
+                "class C:\n"
+                "    def keep(self):\n"
+                "        return 1\n"
+                "\n"
+                "    def foo(self, x):\n"
+                "        return x + 1\n"
+            ),
+        },
+    )
+    commit = _commit(repo, "move M.foo onto C")
+
+    recipe = infer_recipe(commit, str(repo))
+
+    assert [mv["from_class"] for mv in recipe.moves] == ["M"]
+    script = recipe_to_script(recipe, "move M.foo onto C")
+    assert "from_class='M'" in script
+
+
+def test_per_file_diff_keeps_content_lines_starting_with_plus_signs(repo: Path) -> None:
+    """An added content line beginning with '++' is collected, not mistaken for a header."""
+    from mechanical_refactor_generate_proof import _per_file_diff
+
+    _write(repo, **{"notes.py": "a = 1\n"})
+    _commit(repo, "base")
+    _write(repo, **{"notes.py": 'a = 1\nb = "++x"\n'})
+    commit = _commit(repo, "add plus-plus line")
+
+    files = _per_file_diff(commit, str(repo))
+
+    assert files["notes.py"]["added"] == ['b = "++x"']
