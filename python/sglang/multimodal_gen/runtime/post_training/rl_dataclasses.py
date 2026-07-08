@@ -52,6 +52,10 @@ class RolloutDitTrajectory:
     # final denoised latent x_{t_T} (last scheduler.step output).
     latents: torch.Tensor | None = None
     timesteps: torch.Tensor | None = None  # [T]
+    # Scheduler sigma grid [T+1] including the terminal sigma. Lets the
+    # training side replay the exact rollout noise levels instead of
+    # reconstructing them from timesteps (which drifts in fp32).
+    sigmas: torch.Tensor | None = None
 
 
 @dataclass
