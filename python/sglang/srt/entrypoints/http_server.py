@@ -1355,7 +1355,9 @@ async def update_weight_version(
     # since weight_version update is a simple operation that doesn't affect model weights
     try:
         # Update the weight version in server args (the single source of truth)
-        _global_state.tokenizer_manager.server_args.weight_version = obj.new_version
+        _global_state.tokenizer_manager.server_args.override(
+            "http.update_weight_version", weight_version=obj.new_version
+        )
 
         return ORJSONResponse(
             {

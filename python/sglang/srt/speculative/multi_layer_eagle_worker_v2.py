@@ -678,7 +678,10 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         )
 
         # Override the context length of the draft model to be the same as the target model.
-        server_args.context_length = target_worker.model_runner.model_config.context_len
+        server_args.override(
+            "spec_worker.match_target_context_length",
+            context_length=target_worker.model_runner.model_config.context_len,
+        )
 
         self._draft_worker = MultiLayerEagleDraftWorker(
             server_args,
