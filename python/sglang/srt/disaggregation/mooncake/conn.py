@@ -168,6 +168,10 @@ class MooncakeKVManager(CommonKVManager):
         self.register_buffer_to_engine()
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
         self.enable_trace = server_args.enable_trace
+        self.failure_timestamps: dict[int, float] = {}
+        self.orphan_failed_room_ttl = envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT.get()
+        self._orphan_failed_room_cleanup_interval = 60.0
+        self._next_orphan_failed_room_cleanup_time = 0.0
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.start_prefill_thread()
             self.session_failures = defaultdict(int)
@@ -1272,6 +1276,17 @@ class MooncakeKVManager(CommonKVManager):
             + self.attn_cp_rank
         )
 
+    def record_failure(
+        self,
+        bootstrap_room: int,
+        failure_reason: str,
+        status_code: Optional[int] = None,
+    ):
+        super().record_failure(bootstrap_room, failure_reason, status_code)
+        with self.failure_lock:
+            self.failure_timestamps.setdefault(bootstrap_room, time.monotonic())
+        self.maybe_cleanup_orphan_failed_rooms()
+
     def notify_decode_status_for_room(
         self,
         room: int,
@@ -1308,14 +1323,49 @@ class MooncakeKVManager(CommonKVManager):
         with self.failure_lock:
             self.failure_records.pop(room, None)
             self.failure_status_codes.pop(room, None)
+            self.failure_timestamps.pop(room, None)
         self.transfer_infos.pop(room, None)
         self.req_to_decode_prefix_len.pop(room, None)
         self.required_dst_info_num_table.pop(room, None)
+
+    def maybe_cleanup_orphan_failed_rooms(self) -> None:
+        if self.disaggregation_mode != DisaggregationMode.PREFILL:
+            return
+
+        now = time.monotonic()
+        if now < self._next_orphan_failed_room_cleanup_time:
+            return
+        self._next_orphan_failed_room_cleanup_time = (
+            now + self._orphan_failed_room_cleanup_interval
+        )
+
+        with self.failure_lock:
+            failure_timestamps = list(self.failure_timestamps.items())
+
+        for room, failed_at in failure_timestamps:
+            if now - failed_at < self.orphan_failed_room_ttl:
+                continue
+            if (
+                room not in self.request_status
+                or self.check_status(room) != KVPoll.Failed
+            ):
+                continue
+            if self._is_decode_metadata_ready(room):
+                continue
+
+            logger.warning(
+                "Clean up orphan failed Mooncake room %s after waiting %.1fs "
+                "for decode metadata.",
+                room,
+                now - failed_at,
+            )
+            self.clear_room(room)
 
     def try_notify_decode_failure_and_clear(self, room: int) -> bool:
         if room not in self.request_status or self.check_status(room) != KVPoll.Failed:
             return False
         if not self._is_decode_metadata_ready(room):
+            self.maybe_cleanup_orphan_failed_rooms()
             return False
 
         with self.failure_lock:
@@ -1575,6 +1625,7 @@ class MooncakeKVManager(CommonKVManager):
             while True:
                 waiting_req_bytes = self.server_socket.recv_multipart()
                 room = waiting_req_bytes[0].decode("ascii")
+                self.maybe_cleanup_orphan_failed_rooms()
                 # Staging: decode reports consumption watermark back to prefill
                 if room == "WATERMARK":
                     from sglang.srt.disaggregation.common.staging_handler import (

@@ -1167,6 +1167,8 @@ class CommonKVSender(BaseKVSender):
             self.kv_mgr.required_dst_info_num_table.pop(self.bootstrap_room, None)
         if hasattr(self.kv_mgr, "failure_status_codes"):
             self.kv_mgr.failure_status_codes.pop(self.bootstrap_room, None)
+        if hasattr(self.kv_mgr, "failure_timestamps"):
+            self.kv_mgr.failure_timestamps.pop(self.bootstrap_room, None)
 
     def abort(self):
         with self.kv_mgr.failure_lock:
@@ -1417,6 +1419,8 @@ class CommonKVReceiver(BaseKVReceiver):
         self.kv_mgr.required_prefill_response_num_table.pop(self.bootstrap_room, None)
         self.kv_mgr.prefill_response_tracker.pop(self.bootstrap_room, None)
         self.kv_mgr.failure_status_codes.pop(self.bootstrap_room, None)
+        if hasattr(self.kv_mgr, "failure_timestamps"):
+            self.kv_mgr.failure_timestamps.pop(self.bootstrap_room, None)
 
     def abort(self):
         with self.kv_mgr.failure_lock:

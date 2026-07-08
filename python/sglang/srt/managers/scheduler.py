@@ -2373,15 +2373,23 @@ class Scheduler(
         """
         if not is_aborted(req):
             return False
+        has_valid_bootstrap = (
+            req.bootstrap_room is not None and req.bootstrap_host is not None
+        )
         if (
             self.disaggregation_mode == DisaggregationMode.PREFILL
             and req.disagg_kv_sender is None
+            and has_valid_bootstrap
         ):
             self.disagg_prefill_bootstrap_queue.create_sender(
                 req, self.model_config.num_key_value_heads
             )
         abort_reason = req.to_finish or req.finished_reason
-        if req.disagg_kv_sender is not None and hasattr(req.disagg_kv_sender, "abort"):
+        if (
+            has_valid_bootstrap
+            and req.disagg_kv_sender is not None
+            and hasattr(req.disagg_kv_sender, "abort")
+        ):
             kv_mgr = getattr(req.disagg_kv_sender, "kv_mgr", None)
             if isinstance(abort_reason, FINISH_ABORT) and kv_mgr is not None:
                 kv_mgr.record_failure(
