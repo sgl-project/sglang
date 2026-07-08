@@ -26,6 +26,33 @@ IDEOGRAM4_PRESETS: dict[str, dict[str, object]] = {
         "mu": 0.5,
         "std": 1.75,
     },
+    "V4_TURBOTIME_LORA_2": {
+        "num_steps": 2,
+        "guidance_schedule": (1.0,) * 2,
+        "mu": 0.5,
+        "std": 1.75,
+        "skip_unconditional": True,
+        "lora_scale": 1.0,
+        "requires_lora": True,
+    },
+    "V4_TURBOTIME_LORA_4": {
+        "num_steps": 4,
+        "guidance_schedule": (1.0,) * 4,
+        "mu": 0.5,
+        "std": 1.75,
+        "skip_unconditional": True,
+        "lora_scale": 1.0,
+        "requires_lora": True,
+    },
+    "V4_TURBOTIME_LORA_8": {
+        "num_steps": 8,
+        "guidance_schedule": (1.0,) * 8,
+        "mu": 0.5,
+        "std": 1.75,
+        "skip_unconditional": True,
+        "lora_scale": 1.0,
+        "requires_lora": True,
+    },
 }
 
 
