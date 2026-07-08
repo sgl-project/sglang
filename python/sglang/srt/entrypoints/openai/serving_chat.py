@@ -851,6 +851,18 @@ class OpenAIServingChat(OpenAIServingBase):
             if request.chat_template_kwargs:
                 extra_template_kwargs.update(request.chat_template_kwargs)
 
+            rc = self.template_manager.reasoning_config
+            if rc is not None and rc.effort_kwarg is not None:
+                if request.reasoning_effort == "low":
+                    extra_template_kwargs.setdefault(rc.effort_kwarg, True)
+                elif request.reasoning_effort in ("medium", "high", "max"):
+                    logger.warning(
+                        "Model '%s' supports only 'low' reasoning effort; "
+                        "requested '%s' treated as default thinking",
+                        self.tokenizer_manager.server_args.served_model_name,
+                        request.reasoning_effort,
+                    )
+
             # Split apply_chat_template(tokenize=True) into render + encode so we
             # can skip add_special_tokens=False on tokenizers that don't auto-add
             # specials (Kimi-like, OpenAI-chat analogue of #25265). Chat

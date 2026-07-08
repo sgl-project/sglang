@@ -103,6 +103,24 @@ class TestTemplateManagerReasoningDetection(unittest.TestCase):
         )
         self.assertEqual(parser, "nemotron_3")
 
+    def test_nemotron_super_detects_low_effort_kwarg(self):
+        template = """
+        {% set enable_thinking = enable_thinking if enable_thinking is defined else True %}
+        {%- set low_effort = low_effort if low_effort is defined else False %}
+        {% set truncate_history_thinking = truncate_history_thinking if truncate_history_thinking is defined else True %}
+        """
+        _, config, parser = self._detect(template, [""])
+
+        self.assertEqual(
+            config,
+            ReasoningToggleConfig(
+                toggle_param="enable_thinking",
+                default_enabled=True,
+                effort_kwarg="low_effort",
+            ),
+        )
+        self.assertEqual(parser, "nemotron_3")
+
     def test_minimax_uses_template_signature_without_toggle_config(self):
         template = """
         {%- set toolcall_begin_token = '<minimax:tool_call>' -%}
