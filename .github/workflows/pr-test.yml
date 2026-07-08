@@ -18,11 +18,6 @@ on:
         required: false
         type: boolean
         default: false
-      test_parallel_dispatch:
-        description: "Test parallel dispatch behavior (simulates scheduled run)"
-        required: false
-        type: boolean
-        default: false
       run_all_tests:
         description: "Run all tests (mirrors the scheduled cron's behavior — combine with test_parallel_dispatch for full sim)"
         required: false
@@ -37,6 +32,11 @@ on:
         default: ''
       run_all_tests:
         description: "Run all tests (for releasing or testing purpose)"
+        required: false
+        type: boolean
+        default: false
+      test_parallel_dispatch:
+        description: "Test parallel dispatch behavior (simulates scheduled run)"
         required: false
         type: boolean
         default: false
@@ -101,7 +101,7 @@ jobs:
       !cancelled() &&
       github.event_name == 'pull_request' &&
       inputs.test_parallel_dispatch != true &&
-      (needs.check-changes.outputs.main_package == 'true' || needs.check-changes.outputs.sgl_kernel == 'true') &&
+      (needs.check-changes.outputs.main_package == 'true' || needs.check-changes.outputs.sgl_kernel == 'true' || needs.check-changes.outputs.sgl_deep_gemm == 'true') &&
       (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped')
     runs-on: ubuntu-latest
     outputs:
@@ -129,7 +129,7 @@ jobs:
       !cancelled() &&
       github.event_name == 'pull_request' &&
       inputs.test_parallel_dispatch != true &&
-      (needs.check-changes.outputs.main_package == 'true' || needs.check-changes.outputs.sgl_kernel == 'true') &&
+      (needs.check-changes.outputs.main_package == 'true' || needs.check-changes.outputs.sgl_kernel == 'true' || needs.check-changes.outputs.sgl_deep_gemm == 'true') &&
       (needs.wait-for-base-a.result == 'success' || needs.wait-for-base-a.result == 'skipped') &&
       (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped')
     runs-on: ubuntu-latest
@@ -163,6 +163,7 @@ jobs:
       (
         needs.check-changes.outputs.main_package == 'true' ||
         needs.check-changes.outputs.sgl_kernel == 'true' ||
+        needs.check-changes.outputs.sgl_deep_gemm == 'true' ||
         needs.check-changes.outputs.jit_kernel == 'true' ||
         needs.check-changes.outputs.multimodal_gen == 'true'
       )
@@ -206,9 +207,48 @@ jobs:
       skip_pr_test_health_check: ${{ inputs.skip_pr_test_health_check == true }}
     secrets: inherit
 
-  call-sgl-kernel-tests:
-    needs: [check-changes, call-gate, sgl-kernel-build-wheels]
+  sgl-deep-gemm-build-wheels:
+    needs: [check-changes, call-gate]
+    # Skip for scheduled runs (they use released wheels).
     if: |
+      github.event_name != 'schedule' &&
+      inputs.test_parallel_dispatch != true &&
+      needs.check-changes.result == 'success' &&
+      needs.check-changes.outputs.sgl_deep_gemm == 'true' &&
+      needs.call-gate.result == 'success'
+    uses: ./.github/workflows/_pr-test-sgl-deep-gemm-build.yml
+    with:
+      runs_on: x64-kernel-build-node
+      job_display_name: Build DeepGEMM Wheel
+      git_ref: ${{ inputs.git_ref || '' }}
+      skip_pr_test_health_check: ${{ inputs.skip_pr_test_health_check == true }}
+    secrets: inherit
+
+  sgl-deep-gemm-build-wheels-arm:
+    needs: [check-changes, call-gate]
+    # Skip for scheduled runs (they use released wheels).
+    if: |
+      github.event_name != 'schedule' &&
+      inputs.test_parallel_dispatch != true &&
+      needs.check-changes.result == 'success' &&
+      needs.check-changes.outputs.sgl_deep_gemm == 'true' &&
+      needs.call-gate.result == 'success'
+    uses: ./.github/workflows/_pr-test-sgl-deep-gemm-build.yml
+    with:
+      runs_on: arm-kernel-build-node
+      job_display_name: Build DeepGEMM Wheel Arm
+      arch: aarch64
+      arch_suffix: '-aarch64'
+      git_ref: ${{ inputs.git_ref || '' }}
+      skip_pr_test_health_check: ${{ inputs.skip_pr_test_health_check == true }}
+    secrets: inherit
+
+  call-sgl-kernel-tests:
+    needs: [check-changes, call-gate, sgl-kernel-build-wheels, sgl-deep-gemm-build-wheels]
+    if: |
+      always() &&
+      !failure() &&
+      !cancelled() &&
       github.event_name != 'schedule' &&
       inputs.test_parallel_dispatch != true &&
       needs.check-changes.outputs.sgl_kernel == 'true'
@@ -217,6 +257,7 @@ jobs:
       runner_config: 4-gpu-b200
       runs_on_map: ${{ needs.check-changes.outputs.runs_on_map }}
       sgl_kernel: ${{ needs.check-changes.outputs.sgl_kernel }}
+      sgl_deep_gemm: ${{ needs.check-changes.outputs.sgl_deep_gemm }}
       git_ref: ${{ inputs.git_ref || '' }}
       skip_pr_test_health_check: ${{ inputs.skip_pr_test_health_check == true }}
     secrets: inherit
@@ -224,7 +265,7 @@ jobs:
   # =============================================== jit-kernel ====================================================
 
   call-jit-kernel-tests:
-    needs: [check-changes, call-gate, sgl-kernel-build-wheels]
+    needs: [check-changes, call-gate, sgl-kernel-build-wheels, sgl-deep-gemm-build-wheels]
     # Run on scheduled/parallel-dispatch runs (same pattern as the base-* stages) so the
     # jit_kernel suite is exercised on main 3x daily, not only on PRs that touch jit_kernel/**.
     # check-changes already forces jit_kernel='true' on scheduled runs (run_all_tests).
@@ -241,6 +282,7 @@ jobs:
       # artifact does not exist. Force sgl_kernel='false' there so the jit-kernel jobs skip the
       # wheel download and run against the released/pinned sgl-kernel instead of a fresh build.
       sgl_kernel: ${{ (github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) && 'false' || needs.check-changes.outputs.sgl_kernel }}
+      sgl_deep_gemm: ${{ (github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) && 'false' || needs.check-changes.outputs.sgl_deep_gemm }}
       git_ref: ${{ inputs.git_ref || '' }}
       test_parallel_dispatch: ${{ inputs.test_parallel_dispatch == true && 'true' || 'false' }}
       skip_pr_test_health_check: ${{ inputs.skip_pr_test_health_check == true }}
@@ -250,7 +292,7 @@ jobs:
 
   # Runs on 5090 (32GB, SM120)
   base-a-test-1-gpu-small:
-    needs: [check-changes, call-gate, sgl-kernel-build-wheels]
+    needs: [check-changes, call-gate, sgl-kernel-build-wheels, sgl-deep-gemm-build-wheels]
     if: ${{ !failure() && !cancelled() }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
@@ -341,7 +383,7 @@ jobs:
 
   # Runs on 5090 (32GB, SM120)
   base-b-test-1-gpu-small:
-    needs: [check-changes, call-gate, wait-for-base-a, sgl-kernel-build-wheels]
+    needs: [check-changes, call-gate, wait-for-base-a, sgl-kernel-build-wheels, sgl-deep-gemm-build-wheels]
     if: ${{ !failure() && !cancelled() }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
@@ -355,7 +397,7 @@ jobs:
 
   # Runs on H100 (80GB, SM90) - tests that don't pass on 5090 (FA3, FP8, high VRAM, etc.)
   base-b-test-1-gpu-large:
-    needs: [check-changes, call-gate, wait-for-base-a, sgl-kernel-build-wheels]
+    needs: [check-changes, call-gate, wait-for-base-a, sgl-kernel-build-wheels, sgl-deep-gemm-build-wheels]
     if: ${{ !failure() && !cancelled() }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
@@ -369,7 +411,7 @@ jobs:
     secrets: inherit
 
   base-b-test-2-gpu-large:
-    needs: [check-changes, call-gate, wait-for-base-a, sgl-kernel-build-wheels]
+    needs: [check-changes, call-gate, wait-for-base-a, sgl-kernel-build-wheels, sgl-deep-gemm-build-wheels]
     if: ${{ !failure() && !cancelled() }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
@@ -382,7 +424,7 @@ jobs:
     secrets: inherit
 
   base-b-test-4-gpu-b200:
-    needs: [check-changes, call-gate, wait-for-base-a, sgl-kernel-build-wheels]
+    needs: [check-changes, call-gate, wait-for-base-a, sgl-kernel-build-wheels, sgl-deep-gemm-build-wheels]
     if: ${{ !failure() && !cancelled() }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
@@ -395,7 +437,7 @@ jobs:
     secrets: inherit
 
   call-multimodal-gen-tests:
-    needs: [check-changes, call-gate, sgl-kernel-build-wheels]
+    needs: [check-changes, call-gate, sgl-kernel-build-wheels, sgl-deep-gemm-build-wheels]
     if: |
       always() &&
       !cancelled() &&
@@ -407,15 +449,16 @@ jobs:
       runs_on_map: ${{ needs.check-changes.outputs.runs_on_map }}
       multimodal_gen: ${{ needs.check-changes.outputs.multimodal_gen }}
       sgl_kernel: ${{ needs.check-changes.outputs.sgl_kernel }}
+      sgl_deep_gemm: ${{ needs.check-changes.outputs.sgl_deep_gemm }}
       continue_on_error: ${{ needs.check-changes.outputs.continue_on_error }}
       git_ref: ${{ inputs.git_ref || '' }}
       test_parallel_dispatch: ${{ inputs.test_parallel_dispatch == true && 'true' || 'false' }}
-      caller_needs_failure: ${{ (needs.call-gate.result == 'failure' || needs.sgl-kernel-build-wheels.result == 'failure' || needs.check-changes.result == 'failure') && 'true' || 'false' }}
+      caller_needs_failure: ${{ (needs.call-gate.result == 'failure' || needs.sgl-kernel-build-wheels.result == 'failure' || needs.sgl-deep-gemm-build-wheels.result == 'failure' || needs.check-changes.result == 'failure') && 'true' || 'false' }}
       skip_pr_test_health_check: ${{ inputs.skip_pr_test_health_check == true && 'true' || 'false' }}
     secrets: inherit
 
   base-c-test-4-gpu-h100:
-    needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels]
+    needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels, sgl-deep-gemm-build-wheels]
     if: ${{ !failure() && !cancelled() }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
@@ -428,7 +471,7 @@ jobs:
     secrets: inherit
 
   base-c-test-8-gpu-h200:
-    needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels]
+    needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels, sgl-deep-gemm-build-wheels]
     if: ${{ !failure() && !cancelled() }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
@@ -448,7 +491,7 @@ jobs:
     secrets: inherit
 
   base-c-test-8-gpu-h20:
-    needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels]
+    needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels, sgl-deep-gemm-build-wheels]
     if: ${{ !failure() && !cancelled() }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
@@ -461,7 +504,7 @@ jobs:
     secrets: inherit
 
   base-c-test-deepep-4-gpu-h100:
-    needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels]
+    needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels, sgl-deep-gemm-build-wheels]
     if: ${{ !failure() && !cancelled() }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
@@ -476,7 +519,7 @@ jobs:
     secrets: inherit
 
   base-c-test-deepep-4-gpu-b200:
-    needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels]
+    needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels, sgl-deep-gemm-build-wheels]
     if: ${{ !failure() && !cancelled() }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
@@ -490,7 +533,7 @@ jobs:
     secrets: inherit
 
   base-c-test-deepep-8-gpu-h200:
-    needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels]
+    needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels, sgl-deep-gemm-build-wheels]
     if: ${{ !failure() && !cancelled() }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
@@ -504,7 +547,7 @@ jobs:
     secrets: inherit
 
   base-c-test-4-gpu-b200:
-    needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels]
+    needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels, sgl-deep-gemm-build-wheels]
     if: ${{ !failure() && !cancelled() }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
@@ -518,7 +561,7 @@ jobs:
     secrets: inherit
 
   base-c-test-4-gpu-gb300:
-    needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels]
+    needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels, sgl-kernel-build-wheels-arm, sgl-deep-gemm-build-wheels, sgl-deep-gemm-build-wheels-arm]
     if: ${{ !failure() && !cancelled() }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
@@ -539,6 +582,8 @@ jobs:
 
         sgl-kernel-build-wheels,
         sgl-kernel-build-wheels-arm,
+        sgl-deep-gemm-build-wheels,
+        sgl-deep-gemm-build-wheels-arm,
         call-sgl-kernel-tests,
 
         wait-for-base-a,

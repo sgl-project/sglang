@@ -1,0 +1,120 @@
+name: PR Test - Build sgl-deep-gemm Wheels
+
+on:
+  workflow_call:
+    inputs:
+      runs_on:
+        description: 'Runner label (e.g. x64-kernel-build-node, arm-kernel-build-node)'
+        type: string
+        required: true
+      job_display_name:
+        description: 'Display name shown in the Actions UI'
+        type: string
+        default: 'Build DeepGEMM Wheel'
+      arch_suffix:
+        description: "Suffix appended to the upload-artifact name. '' for x86, '-aarch64' for arm."
+        type: string
+        default: ''
+      arch:
+        description: 'Wheel platform architecture.'
+        type: string
+        default: 'x86_64'
+      git_ref:
+        type: string
+        default: ''
+      deepgemm_ref:
+        description: 'sgl-project/DeepGEMM ref to build from.'
+        # Intentionally mirrors release-whl-deepgemm.yml's default so PR CI
+        # catches integration breakage against the source used for the next
+        # sgl-deep-gemm wheel release.
+        type: string
+        default: 'dev'
+      skip_pr_test_health_check:
+        description: 'Forwarded from the caller workflow input of the same name. Not consumed inside this reusable workflow today, but mirrored so the resulting env context matches the inline-job baseline.'
+        type: boolean
+        default: false
+
+env:
+  SGLANG_IS_IN_CI: true
+  SGLANG_CUDA_COREDUMP: "1"
+  SGLANG_JIT_DEEPGEMM_FAST_WARMUP: true
+  SKIP_PR_TEST_HEALTH_CHECK: ${{ inputs.skip_pr_test_health_check && 'true' || 'false' }}
+  FORCE_REBUILD_DEEPEP: '1'
+  PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
+  USE_VENV: false
+
+jobs:
+  build:
+    runs-on: ${{ inputs.runs_on }}
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # PR CUDA CI currently runs cu130. cu129 wheels are built only by the
+          # release workflow and consumed through the released-wheel fallback.
+          - python-version: "3.10"
+            cuda-version: "13.0"
+    name: ${{ inputs.job_display_name }}
+    steps:
+      - name: Cleanup
+        run: |
+          if [ -d "$GITHUB_WORKSPACE" ]; then
+            sudo rm -rf "$GITHUB_WORKSPACE"/* || true
+          else
+            echo "$GITHUB_WORKSPACE does not exist, nothing to clean"
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          submodules: "recursive"
+          ref: ${{ inputs.git_ref || github.sha }}
+
+      - uses: ./.github/actions/check-maintenance
+
+      - name: Checkout DeepGEMM
+        uses: actions/checkout@v4
+        with:
+          repository: sgl-project/DeepGEMM
+          ref: ${{ inputs.deepgemm_ref }}
+          path: DeepGEMM
+          submodules: recursive
+
+      - name: Set wheel version and Torch ABI
+        run: |
+          set -eux
+          SGL_DEEP_GEMM_VERSION=$(grep -Po -m1 '(?<=sgl-deep-gemm==)[0-9A-Za-z\.\-]+' python/pyproject.toml)
+          TORCH_VER=$(grep -Po -m1 '(?<=torch==)[0-9A-Za-z\.\-]+' python/pyproject.toml)
+          # PR CI intentionally rebuilds the currently pinned package version
+          # and consumes it only as an in-run artifact, matching sgl-kernel.
+          echo -n "${SGL_DEEP_GEMM_VERSION}" > DeepGEMM/sgl_deep_gemm/VERSION
+          echo "TORCH_VER=${TORCH_VER}" >> "$GITHUB_ENV"
+          cat DeepGEMM/sgl_deep_gemm/VERSION
+          echo "Building against torch==${TORCH_VER}"
+
+      - name: Free Docker disk space
+        run: |
+          set -x
+          docker image prune -f
+          df -h /
+
+      - name: Build wheel for Python ${{ matrix.python-version }} and CUDA ${{ matrix.cuda-version }}
+        run: |
+          chmod +x ./scripts/build_sgl_deep_gemm.sh ./scripts/rename_sgl_deep_gemm_whl.sh
+          if ! ./scripts/build_sgl_deep_gemm.sh "${{ matrix.python-version }}" "${{ matrix.cuda-version }}" "${{ github.workspace }}/DeepGEMM" "${{ inputs.arch }}"; then
+            echo "sgl-deep-gemm build failed; retrying after pruning dangling Docker images"
+            docker image prune -f
+            ./scripts/build_sgl_deep_gemm.sh "${{ matrix.python-version }}" "${{ matrix.cuda-version }}" "${{ github.workspace }}/DeepGEMM" "${{ inputs.arch }}"
+          fi
+
+      - name: Verify wheel artifacts
+        run: |
+          ls -alh DeepGEMM/dist
+          ls -alh DeepGEMM/dist/*.whl
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: deepgemm-wheel-python${{ matrix.python-version }}-cuda${{ matrix.cuda-version }}${{ inputs.arch_suffix }}
+          path: DeepGEMM/dist/*.whl
+          if-no-files-found: error
