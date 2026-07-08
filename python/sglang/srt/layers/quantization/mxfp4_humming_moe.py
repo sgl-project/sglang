@@ -33,7 +33,6 @@ class Mxfp4HummingMoEMethod:
     def create_moe_runner(self, layer, moe_runner_config):
         from sglang.srt.layers.moe.moe_runner import MoeRunner
 
-        moe_runner_config.layer = layer
         self.runner = MoeRunner(MoeRunnerBackend.HUMMING, moe_runner_config)
 
     def create_weights(
@@ -98,5 +97,5 @@ class Mxfp4HummingMoEMethod:
     ) -> CombineInput:
         from sglang.srt.layers.moe.moe_runner.humming import HummingMoeQuantInfo
 
-        quant_info = HummingMoeQuantInfo()
+        quant_info = HummingMoeQuantInfo(layer=layer)
         return self.runner.run(dispatch_output, quant_info)

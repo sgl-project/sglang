@@ -90,7 +90,7 @@ class HummingRunnerOutput(RunnerOutput):
 
 @dataclass
 class HummingMoeQuantInfo(MoeQuantInfo):
-    pass
+    layer: torch.nn.Module
 
 
 @register_custom_op()
@@ -134,14 +134,13 @@ class HummingRunnerCore(MoeRunnerCore):
 
     def __init__(self, config: MoeRunnerConfig):
         super().__init__(config)
-        assert config.layer is not None
-        self.layer = config.layer
         assert config.num_local_experts is not None
         assert config.num_experts is not None
         self.num_experts = config.num_local_experts
         self.global_num_experts = config.num_experts
         self.activation = config.activation
         self.swiglu_limit = config.swiglu_limit
+        self.layer: torch.nn.Module | None = None
         self.humming_gemm_configs = {}
         HummingRunnerCore.runner_cores[id(self)] = self
 
@@ -400,6 +399,7 @@ class HummingRunnerCore(MoeRunnerCore):
         running_state: dict,
         hooks: Optional[Any] = None,
     ) -> HummingRunnerOutput:
+        self.layer = quant_info.layer
         if runner_input.hidden_states.size(0) == 0:
             return HummingRunnerOutput(
                 hidden_states=torch.empty_like(runner_input.hidden_states)

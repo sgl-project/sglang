@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import dataclasses
 import json
 import math
 from collections.abc import Callable
@@ -863,7 +862,6 @@ class HummingMoEMethod(FusedMoEMethodBase):
                 f"moe_runner_backend='auto' or 'humming', got "
                 f"{moe_runner_backend.value!r}."
             )
-        moe_runner_config = dataclasses.replace(moe_runner_config, layer=layer)
         self.runner = MoeRunner(MoeRunnerBackend.HUMMING, moe_runner_config)
 
     def apply(
@@ -873,5 +871,5 @@ class HummingMoEMethod(FusedMoEMethodBase):
     ) -> "CombineInput":
         from sglang.srt.layers.moe.moe_runner.humming import HummingMoeQuantInfo
 
-        quant_info = HummingMoeQuantInfo()
+        quant_info = HummingMoeQuantInfo(layer=layer)
         return self.runner.run(dispatch_output, quant_info)
