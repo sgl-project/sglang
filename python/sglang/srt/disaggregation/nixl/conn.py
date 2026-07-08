@@ -2327,8 +2327,7 @@ class NixlKVManager(CommonKVManager):
             return False
 
         try:
-            _, room_frame, _, _ = msg
-            room_to_be_aborted = int(room_frame.decode("ascii"))
+            room_to_be_aborted = int(msg[1].decode("ascii"))
         except Exception as e:
             logger.debug(f"Ignoring malformed abort notification: {e}")
             return True
