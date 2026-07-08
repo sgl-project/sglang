@@ -983,6 +983,15 @@ class TestDSparkPrefillHandoff(CustomTestCase):
         )
         return worker
 
+    def _patch_get_last_loc(self):
+        def fake_get_last_loc(req_to_token, req_pool_indices, prefix_lens):
+            return req_to_token[req_pool_indices, prefix_lens - 1]
+
+        return patch(
+            "sglang.srt.speculative.dspark_worker_v2.get_last_loc",
+            side_effect=fake_get_last_loc,
+        )
+
     def test_disagg_hidden_bootstrap_maps_sparse_future_payload(self):
         t = self.torch
         from sglang.srt.speculative.dspark_info import DSparkDraftInputV2
@@ -1010,12 +1019,13 @@ class TestDSparkPrefillHandoff(CustomTestCase):
         )
         batch = SimpleNamespace(req_pool_indices=req_pool_indices)
 
-        self.worker_cls._materialize_disagg_prefill_hidden_to_draft_state(
-            worker,
-            draft_input=draft_input,
-            batch=batch,
-            prefix_lens=t.full((52,), 5, dtype=t.int64),
-        )
+        with self._patch_get_last_loc():
+            self.worker_cls._materialize_disagg_prefill_hidden_to_draft_state(
+                worker,
+                draft_input=draft_input,
+                batch=batch,
+                prefix_lens=t.full((52,), 5, dtype=t.int64),
+            )
 
         self.assertEqual(
             captures["forward_kwargs"]["req_pool_indices"].tolist(), [17]
@@ -1049,12 +1059,13 @@ class TestDSparkPrefillHandoff(CustomTestCase):
         )
         batch = SimpleNamespace(req_pool_indices=t.arange(1, 53, dtype=t.int64))
 
-        self.worker_cls._materialize_disagg_prefill_hidden_to_draft_state(
-            worker,
-            draft_input=draft_input,
-            batch=batch,
-            prefix_lens=t.full((52,), 5, dtype=t.int64),
-        )
+        with self._patch_get_last_loc():
+            self.worker_cls._materialize_disagg_prefill_hidden_to_draft_state(
+                worker,
+                draft_input=draft_input,
+                batch=batch,
+                prefix_lens=t.full((52,), 5, dtype=t.int64),
+            )
 
         self.assertEqual(
             captures["forward_kwargs"]["req_pool_indices"].tolist(), [52]
