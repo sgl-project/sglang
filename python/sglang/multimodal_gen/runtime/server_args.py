@@ -20,7 +20,6 @@ import addict
 import yaml
 
 from sglang.multimodal_gen import envs
-from sglang.multimodal_gen.configs.models.encoders import T5Config
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
     LTX2PipelineConfig,
@@ -567,24 +566,44 @@ class ServerArgs(DisaggServerArgsMixin):
         self.nunchaku_config = resolution.nunchaku_config
 
     def adjust_pipeline_config(self):
-        # enable parallel folding when SP is enabled
-        if self.tp_size != 1 or self.sp_degree <= 1:
+        # 1. adjust for encoder parallel folding
+        tp_size = self.tp_size or 1
+        dp_size = self.dp_size or 1
+        sp_degree = self.sp_degree or 1
+        # one replica = all its GPUs
+        replica_size = (self.num_gpus or tp_size) // dp_size
+        fold_world = dp_size == 1 and not self.disagg_mode and replica_size > tp_size
+
+        if fold_world:
+            mode = "world"
+        elif tp_size == 1 and sp_degree > 1:
+            # Preserve prior behavior for dp>1 / disaggregated SP runs.
+            mode = "sp"
+        else:
             return
 
-        enabled = False
-        for text_encoder_config in self.pipeline_config.text_encoder_configs:
-            if isinstance(text_encoder_config, T5Config):
-                text_encoder_config.parallel_folding = True
-                enabled = True
-                text_encoder_config.parallel_folding_mode = "sp"
+        # Propose the fold group from the parallelism for every encoder. The
+        # loader keeps it only for encoders wide enough to benefit at their real
+        # (post-load) size and whose dims divide the group -- see
+        # finalize_encoder_folding. Deciding on real size (not architecture)
+        # handles the same encoder family at different parameter counts.
+        encoder_configs = list(self.pipeline_config.text_encoder_configs) + list(
+            getattr(self.pipeline_config, "image_encoder_configs", ()) or ()
+        )
+        for encoder_config in encoder_configs:
+            encoder_config.parallel_folding_mode = mode
 
-        if enabled:
-            logger.info(
-                "Enabled T5 text encoder parallel folding (mode=sp) for %s (tp_size=%s, sp_degree=%s).",
-                self.__class__.__name__,
-                self.tp_size,
-                self.sp_degree,
-            )
+        logger.info(
+            "Proposed encoder parallel folding (mode=%s) for %s "
+            "(tp=%s sp=%s cfg=%s replica=%s); the loader keeps it for encoders "
+            "wide enough to benefit.",
+            mode,
+            self.__class__.__name__,
+            tp_size,
+            sp_degree,
+            self.cfg_parallel_degree or 1,
+            replica_size,
+        )
 
     def _adjust_offload(self):
         if current_platform.is_cpu():
