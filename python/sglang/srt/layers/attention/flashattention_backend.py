@@ -243,6 +243,7 @@ class FlashAttentionBackend(AttentionBackend):
         self.device = model_runner.device
         self.decode_cuda_graph_metadata = {}
         self.target_verify_metadata = {}
+        # Pool refs — captured at construction so they survive deletion of the
         # corresponding ForwardBatch fields.
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
@@ -255,6 +256,9 @@ class FlashAttentionBackend(AttentionBackend):
         self.max_num_pages = (
             self.max_context_len + self.page_size - 1
         ) // self.page_size
+        # Opt out of the seq_lens_cpu D2H only for dflash/dspark (their workers
+        # adapted to the GPU-only relay); EAGLE/MTP/standalone/non-spec keep the
+        # CPU mirror.
         self.needs_cpu_seq_lens = not SpeculativeAlgorithm.from_string(
             model_runner.server_args.speculative_algorithm
         ).is_dflash_or_dspark()
@@ -1600,6 +1604,7 @@ class FlashAttentionBackend(AttentionBackend):
 
         # When Spec Decode enabled, forward_decode would be called with two mode:
         # 1. DRAFT_DECODE: we enable cascade attention when top_k > 1
+        # 2. IDLE: we don’t need cascade attention, spec_info will be none in this case
         use_cascade_attn = forward_batch.spec_info is not None and self.topk > 1
 
         # Calculate window size (can be moved to metadata if layer properties don't change)
