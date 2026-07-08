@@ -115,6 +115,8 @@ set(FlashMLA_SOURCES
     ${repo-flashmla_SOURCE_DIR}/csrc/sm90/decode/sparse_fp8/instantiations/model1_persistent_h128.cu
     ${repo-flashmla_SOURCE_DIR}/csrc/sm90/decode/sparse_fp8/instantiations/v32_persistent_h64.cu
     ${repo-flashmla_SOURCE_DIR}/csrc/sm90/decode/sparse_fp8/instantiations/v32_persistent_h128.cu
+    ${repo-flashmla_SOURCE_DIR}/csrc/sm90/decode/sparse_fp8/instantiations/v32_no_rope_persistent_h64.cu
+    ${repo-flashmla_SOURCE_DIR}/csrc/sm90/decode/sparse_fp8/instantiations/v32_no_rope_persistent_h128.cu
 
     # sm90 sparse prefill.
     ${repo-flashmla_SOURCE_DIR}/csrc/sm90/prefill/sparse/fwd.cu
@@ -143,6 +145,7 @@ if(FLASHMLA_ENABLE_SM100)
 
         # sm100 sparse decode.
         ${repo-flashmla_SOURCE_DIR}/csrc/sm100/decode/head64/instantiations/v32.cu
+        ${repo-flashmla_SOURCE_DIR}/csrc/sm100/decode/head64/instantiations/v32_no_rope.cu
         ${repo-flashmla_SOURCE_DIR}/csrc/sm100/decode/head64/instantiations/model1.cu
         ${repo-flashmla_SOURCE_DIR}/csrc/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_decode_k512.cu
     )
