@@ -199,6 +199,15 @@ struct TopKConfig {
       const uint32_t num_ties,
       const uint32_t topk,
       TieHandleSmem* smem) {
+    // Ties beyond kMaxNumTie are dropped at collect, so there can be fewer
+    // candidates than remaining slots. Pad [num_ties, topk) with -1 ("no
+    // token"): the transform pass reads all `topk` output slots, and any slot
+    // left unwritten holds uninitialized staging memory whose page-table
+    // translation yields a garbage KV index (-> illegal memory access in the
+    // downstream sparse attention kernel).
+    for (uint32_t t = num_ties + threadIdx.x; t < topk; t += kBlockSize) {
+      problem.emit(base + t, -1u);
+    }
     constexpr auto is_greater = [](const TieValue& a, const TieValue& b) {
       return (a.value > b.value) || (a.value == b.value && a.idx < b.idx);
     };
