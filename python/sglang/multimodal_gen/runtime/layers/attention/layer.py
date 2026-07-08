@@ -2,6 +2,7 @@
 
 # SPDX-License-Identifier: Apache-2.0
 import os
+from collections.abc import Sequence
 from contextlib import nullcontext
 from typing import Type
 
@@ -89,6 +90,84 @@ def build_varlen_mask_meta(
         "indices": indices,
         "inv_indices": inv_indices,
         "max_seqlen": seq,  # upper bound; FA varlen uses cu_seqlens for actual ranges
+    }
+
+
+def build_varlen_mask_meta_from_lengths(
+    lengths: Sequence[int],
+    max_seqlen: int,
+    device: torch.device,
+) -> dict:
+    """Build varlen FA metadata for prefix-valid masks without CUDA nonzero.
+
+    This is equivalent to ``build_varlen_mask_meta`` for masks where row ``i`` is
+    true on ``[:lengths[i]]`` and false afterwards. Keeping the lengths on the
+    host lets callers avoid a GPU ``nonzero``/dynamic-shape path while still
+    producing the same packed indices.
+    """
+
+    return build_varlen_mask_meta_from_ranges(
+        [[(0, int(length))] for length in lengths],
+        max_seqlen=max_seqlen,
+        device=device,
+    )
+
+
+def build_varlen_mask_meta_from_ranges(
+    valid_ranges: Sequence[Sequence[tuple[int, int]]],
+    max_seqlen: int,
+    device: torch.device,
+) -> dict:
+    """Build varlen FA metadata from host-side valid token ranges.
+
+    ``valid_ranges[i]`` contains half-open intervals in row-local coordinates.
+    The intervals are packed in the provided order, matching the flattened
+    ``nonzero`` order for ordinary left-to-right masks.
+    """
+
+    range_values = [
+        [(int(start), int(end)) for start, end in row_ranges]
+        for row_ranges in valid_ranges
+    ]
+    if any(
+        start < 0 or end < start or end > max_seqlen
+        for row_ranges in range_values
+        for start, end in row_ranges
+    ):
+        raise ValueError(
+            f"All ranges must be within [0, {max_seqlen}], got {range_values}"
+        )
+
+    bs = len(range_values)
+    length_values = [
+        sum(end - start for start, end in row_ranges) for row_ranges in range_values
+    ]
+    valid_lens = torch.as_tensor(length_values, dtype=torch.int32, device=device)
+    cu_seqlens = torch.zeros(bs + 1, dtype=torch.int32, device=device)
+    cu_seqlens[1:] = torch.cumsum(valid_lens, dim=0)
+
+    index_parts = [
+        torch.arange(
+            row * max_seqlen + start,
+            row * max_seqlen + end,
+            dtype=torch.long,
+            device=device,
+        )
+        for row, row_ranges in enumerate(range_values)
+        for start, end in row_ranges
+        if end > start
+    ]
+    if index_parts:
+        indices = torch.cat(index_parts, dim=0)
+    else:
+        indices = torch.empty((0,), dtype=torch.long, device=device)
+    inv_indices = build_inv_indices(indices, bs * max_seqlen)
+
+    return {
+        "cu_seqlens": cu_seqlens,
+        "indices": indices,
+        "inv_indices": inv_indices,
+        "max_seqlen": max_seqlen,
     }
 
 
@@ -899,12 +978,16 @@ class USPAttention(nn.Module):
         k_shard = _usp_input_all_to_all(k_shard, head_dim=2)
         v_shard = _usp_input_all_to_all(v_shard, head_dim=2)
 
+        # Q and KV can have different head counts (GQA), so slice each replicated
+        # prefix by its own per-rank head shard to match the all-to-all'd suffix.
+        # For MHA (kv heads == q heads) this is identical to the q shard.
         h_local = q_shard.shape[2]
+        kv_h_local = k_shard.shape[2]
         h_start = sp_rank * h_local
-        h_end = h_start + h_local
-        q_rep = q_rep[:, :, h_start:h_end, :].contiguous()
-        k_rep = k_rep[:, :, h_start:h_end, :].contiguous()
-        v_rep = v_rep[:, :, h_start:h_end, :].contiguous()
+        kv_h_start = sp_rank * kv_h_local
+        q_rep = q_rep[:, :, h_start : h_start + h_local, :].contiguous()
+        k_rep = k_rep[:, :, kv_h_start : kv_h_start + kv_h_local, :].contiguous()
+        v_rep = v_rep[:, :, kv_h_start : kv_h_start + kv_h_local, :].contiguous()
 
         q = torch.cat([q_rep, q_shard], dim=1)
         k = torch.cat([k_rep, k_shard], dim=1)
