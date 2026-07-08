@@ -9,18 +9,17 @@ import unittest
 from unittest.mock import patch
 
 import sglang.srt.server_args as server_args_module
+from sglang.srt.arg_groups.arg_utils import A, Arg
 from sglang.srt.runtime_context import (
     Flags,
     ParallelContext,
     RuntimeContext,
     _FlagGroupBase,
-    _StaticFlags,
     get_context,
     get_flags,
     get_parallel,
     get_server_args,
     reset_context,
-    resolve_flag_leaf,
 )
 from sglang.test.test_utils import CustomTestCase
 
@@ -215,90 +214,303 @@ class TestServerArgsOwnership(_IsolatedServerArgs):
 
 
 @dataclasses.dataclass
-class _FakeStaticGroup(_StaticFlags):
-    alpha: int = 1
-    beta: str = "b"
-
-
-@dataclasses.dataclass
 class _FakeCaptureGroup(_FlagGroupBase):
     gamma: int = 0
 
 
 class TestFlagsTier(_IsolatedServerArgs):
-    """V3a skeleton: typed dataclass groups, freeze guard, override primitive."""
+    """Runtime-flags tier: typed groups, typo-safe writes, override primitive.
+
+    Resolved configuration lives on server_args fields (materialized at the
+    end of __post_init__); the flags tier only carries runtime state
+    (today: the capture lifecycle)."""
 
     def test_wiring_and_groups(self):
         flags = get_flags()
         self.assertIs(flags, get_context().flags)
         self.assertIsInstance(flags, Flags)
-        for group in ("attn", "moe", "capture"):
-            self.assertTrue(hasattr(flags, group))
-        self.assertFalse(flags.frozen)
+        self.assertTrue(hasattr(flags, "capture"))
 
     def test_typo_safety(self):
-        group = _FakeStaticGroup()
+        group = _FakeCaptureGroup()
         with self.assertRaises(AttributeError):
-            group.alpha_misspelled = 2  # undeclared leaf
+            group.gamma_misspelled = 2  # undeclared leaf
         with self.assertRaises(AttributeError):
             get_flags().not_a_flag = 1
 
-    def test_static_group_writable_until_freeze(self):
-        group = _FakeStaticGroup()
-        group.alpha = 5
-        self.assertEqual(group.alpha, 5)
-        group.freeze()
-        with self.assertRaises(RuntimeError):
-            group.alpha = 6
-        self.assertEqual(group.alpha, 5)
-
-    def test_override_is_transactional_and_works_on_frozen(self):
-        group = _FakeStaticGroup()
-        group.freeze()
-        with group.override(alpha=99, beta="x"):
-            self.assertEqual(group.alpha, 99)
-            self.assertEqual(group.beta, "x")
-        self.assertEqual(group.alpha, 1)
-        self.assertEqual(group.beta, "b")
-        with self.assertRaises(ValueError):
-            with group.override(alpha=2, gamma=3):  # gamma undeclared
-                pass
-        self.assertEqual(group.alpha, 1)  # validated before any write
-
-    def test_non_static_group_has_no_freeze(self):
+    def test_override_is_transactional(self):
         group = _FakeCaptureGroup()
-        group.gamma = 42
-        self.assertEqual(group.gamma, 42)
-        self.assertFalse(hasattr(group, "freeze"))
+        with group.override(gamma=99):
+            self.assertEqual(group.gamma, 99)
+        self.assertEqual(group.gamma, 0)
+        with self.assertRaises(ValueError):
+            with group.override(gamma=2, delta=3):  # delta undeclared
+                pass
+        self.assertEqual(group.gamma, 0)  # validated before any write
 
-    def test_container_freeze_cascades_except_capture(self):
-        flags = Flags()  # fresh container, not the process singleton
-        flags.freeze()
-        self.assertTrue(flags.frozen)
-        self.assertTrue(flags.attn.frozen)
-        self.assertTrue(flags.moe.frozen)
+    def test_reset_context_installs_fresh_flags(self):
+        old = get_flags()
+        old.capture.enable_torch_compile = True
+        reset_context()
+        self.assertIsNot(get_flags(), old)
+        self.assertFalse(get_flags().capture.enable_torch_compile)
+
+
+@dataclasses.dataclass
+class _FakeResolvedArgs:
+    """Publishable fixture with a resolvable whitelist (real flat leaves)."""
+
+    page_size: A[int | None, Arg(help="p", resolvable=True)] = None
+    sampling_backend: A[str | None, Arg(help="s", resolvable=True)] = None
+    _resolved_overrides: list = dataclasses.field(default_factory=list)
+
+
+class TestMoeFlagsGroup(_IsolatedServerArgs):
+    """flags.moe: materialized by initialize_moe_config; the ACTIVE backends
+    swap under the speculative contexts and restore on exit."""
+
+    def _init(self, **kw):
+        from types import SimpleNamespace
+
+        from sglang.srt.layers.moe.utils import initialize_moe_config
+
+        defaults = dict(
+            moe_a2a_backend="none",
+            moe_runner_backend="auto",
+            speculative_moe_runner_backend=None,
+            speculative_moe_a2a_backend=None,
+            deepep_mode="auto",
+            deepep_config=None,
+            enable_two_batch_overlap=False,
+            enable_single_batch_overlap=False,
+            tbo_token_distribution_threshold=0.48,
+            disable_flashinfer_cutlass_moe_fp4_allgather=False,
+            quantization=None,
+        )
+        defaults.update(kw)
+        initialize_moe_config(SimpleNamespace(**defaults))
+
+    def test_lazy_defaults_before_initialize(self):
+        from sglang.srt.layers.moe.utils import (
+            get_moe_a2a_backend,
+            get_moe_runner_backend,
+            is_tbo_enabled,
+        )
+
+        reset_context()
+        self.assertTrue(get_moe_a2a_backend().is_none())
+        self.assertEqual(get_moe_runner_backend().name, "AUTO")
+        self.assertFalse(is_tbo_enabled())
+
+    def test_initialize_materializes_group(self):
+        from sglang.srt.layers.moe.utils import get_moe_a2a_backend, is_tbo_enabled
+
+        self._init(moe_a2a_backend="deepep", enable_two_batch_overlap=True)
+        self.assertTrue(get_moe_a2a_backend().is_deepep())
+        self.assertTrue(is_tbo_enabled())
+        self.assertEqual(get_flags().moe.deepep_config, "")
+
+    def test_speculative_swap_and_restore(self):
+        from sglang.srt.layers.moe.utils import (
+            get_moe_a2a_backend,
+            get_moe_runner_backend,
+            speculative_moe_a2a_backend_context,
+            speculative_moe_backend_context,
+        )
+
+        self._init(
+            moe_a2a_backend="deepep",
+            moe_runner_backend="triton",
+            speculative_moe_runner_backend="auto",
+            speculative_moe_a2a_backend="none",
+        )
+        with speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+            self.assertEqual(get_moe_runner_backend().name, "AUTO")
+            self.assertTrue(get_moe_a2a_backend().is_none())
+            # MTP layers are unquantized: fp4 allgather is forced off
+            self.assertTrue(get_flags().moe.disable_fp4_allgather)
+        self.assertEqual(get_moe_runner_backend().name, "TRITON")
+        self.assertTrue(get_moe_a2a_backend().is_deepep())
+        self.assertFalse(get_flags().moe.disable_fp4_allgather)
+
+    def test_swap_restores_on_exception(self):
+        from sglang.srt.layers.moe.utils import (
+            get_moe_runner_backend,
+            speculative_moe_backend_context,
+        )
+
+        self._init(moe_runner_backend="triton", speculative_moe_runner_backend="auto")
         with self.assertRaises(RuntimeError):
-            flags.attn = flags.attn  # container leaves lock too
-        self.assertFalse(getattr(flags.capture, "_frozen", False))
+            with speculative_moe_backend_context():
+                raise RuntimeError("boom")
+        self.assertEqual(get_moe_runner_backend().name, "TRITON")
 
-    def test_resolve_flag_leaf_flat_default_and_mapped(self):
-        flags = Flags()
-        owner, leaf = resolve_flag_leaf(flags, "some_field")
-        self.assertIs(owner, flags)
-        self.assertEqual(leaf, "some_field")
-        owner, leaf = resolve_flag_leaf(flags, "x", leaf_map={"x": "attn.x"})
-        self.assertIs(owner, flags.attn)
-        self.assertEqual(leaf, "x")
 
-    def test_reset_context_installs_fresh_unfrozen_flags(self):
-        try:
-            old = get_flags()
-            old.freeze()
-            reset_context()
-            self.assertIsNot(get_flags(), old)
-            self.assertFalse(get_flags().frozen)
-        finally:
-            reset_context()  # never leave the singleton frozen for other tests
+class TestDpFlagsGroup(_IsolatedServerArgs):
+    """flags.dp: the DP-attention runtime flags; is_dp_attention_enabled is a
+    thin shim over the group leaf."""
+
+    def test_shim_reads_the_leaf(self):
+        from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+
+        reset_context()
+        self.assertFalse(is_dp_attention_enabled())
+        get_flags().dp.enabled = True
+        self.assertTrue(is_dp_attention_enabled())
+
+    def test_scoped_override_forces_the_predicate(self):
+        from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+
+        reset_context()
+        with get_flags().dp.override(enabled=True):
+            self.assertTrue(is_dp_attention_enabled())
+        self.assertFalse(is_dp_attention_enabled())
+
+
+class TestResources(_IsolatedServerArgs):
+    """ctx.resources: named slots for process-level resource handles with one
+    reset lifecycle; owning accessors keep their creation/publish semantics."""
+
+    def test_graph_pool_lazy_create_and_reuse(self):
+        from types import SimpleNamespace
+
+        from sglang.srt.model_executor.runner_utils.pool import (
+            get_global_graph_memory_pool,
+            get_or_create_global_graph_memory_pool,
+        )
+
+        reset_context()
+        self.assertIsNone(get_global_graph_memory_pool())
+        dev = SimpleNamespace(graph_pool_handle=lambda: object())
+        handle = get_or_create_global_graph_memory_pool(dev)
+        self.assertIs(get_or_create_global_graph_memory_pool(dev), handle)
+
+    def test_expert_recorder_noop_default_and_injection(self):
+        from sglang.srt.eplb.expert_distribution import (
+            get_global_expert_distribution_recorder,
+        )
+        from sglang.srt.runtime_context import get_resources
+
+        reset_context()
+        self.assertEqual(
+            type(get_global_expert_distribution_recorder()).__name__,
+            "_ExpertDistributionRecorderNoop",
+        )
+        with get_resources().override(expert_distribution_recorder="mock"):
+            self.assertEqual(get_global_expert_distribution_recorder(), "mock")
+
+    def test_expert_location_metadata_publish_once_until_reset(self):
+        from sglang.srt.eplb.expert_location import (
+            get_global_expert_location_metadata,
+            set_global_expert_location_metadata,
+        )
+
+        reset_context()
+        self.assertIsNone(get_global_expert_location_metadata())
+        set_global_expert_location_metadata("meta")
+        with self.assertRaises(AssertionError):
+            set_global_expert_location_metadata("again")
+        reset_context()
+        self.assertIsNone(get_global_expert_location_metadata())
+
+
+class TestNamedStreams(_IsolatedServerArgs):
+    """ctx.get_stream(name): keyed get-or-create (the persistent-buffer
+    pattern); set_stream installs explicitly."""
+
+    def test_get_or_create_shares_by_name(self):
+        from unittest.mock import patch
+
+        reset_context()
+        created = []
+
+        class _FakeStream:
+            def __init__(self):
+                created.append(self)
+
+        with patch("torch.cuda.Stream", _FakeStream):
+            a = get_context().get_stream("alt")
+            b = get_context().get_stream("alt")
+            c = get_context().get_stream("other")
+        self.assertIs(a, b)
+        self.assertIsNot(a, c)
+        self.assertEqual(len(created), 2)
+
+    def test_get_buffer_keyed_lazy(self):
+        reset_context()
+        created = []
+
+        def factory():
+            created.append(object())
+            return created[-1]
+
+        a = get_context().get_buffer("ws", factory)
+        b = get_context().get_buffer("ws", factory)
+        self.assertIs(a, b)
+        self.assertEqual(len(created), 1)
+        self.assertIsNot(get_context().get_buffer("other", factory), a)
+
+    def test_set_stream_installs_explicitly(self):
+        reset_context()
+        sentinel = object()
+        get_context().set_stream("alt", sentinel)
+        self.assertIs(get_context().get_stream("alt"), sentinel)
+
+    def test_reset_clears_the_registry(self):
+        reset_context()
+        get_context().set_stream("alt", object())
+        reset_context()
+        self.assertEqual(get_context().resources.streams, {})
+
+
+class TestPublishLifecycle(_IsolatedServerArgs):
+    """Publish installs the resolved server_args and seeds the capture tier."""
+
+    def _publish(self, **kw):
+        args = _FakeResolvedArgs(**kw)
+        get_context().set_server_args(args)
+        return args
+
+    def test_capture_tier_seeded_at_publish(self):
+        args = self._publish(page_size=1)
+        args.enable_torch_compile = True
+        get_context().set_server_args(args)  # re-publish picks up the value
+        self.assertTrue(get_flags().capture.enable_torch_compile)
+        # capture-time write (B4) targets the capture leaf
+        get_flags().capture.enable_torch_compile = False
+        self.assertFalse(get_flags().capture.enable_torch_compile)
+
+    def test_capture_tier_defaults_for_sentinel_publish(self):
+        get_context().set_server_args(object())
+        self.assertFalse(get_flags().capture.enable_torch_compile)
+
+    def test_declare_load_time_override_writes_through(self):
+        from sglang.srt.arg_groups.overrides import declare_load_time_override
+
+        args = self._publish(page_size=1)
+        declare_load_time_override("model.load_time", {"page_size": 64})
+        self.assertEqual(args.page_size, 64)
+
+    def test_declare_load_time_override_validates_whitelist(self):
+        from sglang.srt.arg_groups.overrides import declare_load_time_override
+
+        args = self._publish(page_size=1)
+        with self.assertRaises(ValueError):
+            declare_load_time_override("bad", {"nope": 1})
+        self.assertEqual(args.page_size, 1)
+
+    def test_declare_load_time_override_records_provenance(self):
+        from sglang.srt.arg_groups.overrides import declare_load_time_override
+        from sglang.srt.server_args import ServerArgs
+
+        class _Args(_FakeResolvedArgs):
+            override = ServerArgs.override
+
+        args = _Args(page_size=1)
+        get_context().set_server_args(args)
+        declare_load_time_override("model.load_time", {"page_size": 64})
+        self.assertEqual(args.page_size, 64)
+        self.assertIn(("model.load_time", {"page_size": 64}), args._resolved_overrides)
 
 
 if __name__ == "__main__":

@@ -28,13 +28,13 @@ tier). The context owns the storage: publishing goes through
 ``server_args.py`` are thin shims over this slot), and the object is returned
 by reference — the same live instance everywhere, never a copy.
 
-``get_flags()`` returns the resolved-flags tier: what the system *resolved*
-the configuration to (``server_args`` stays the pristine user input). Flags
-live in typed dataclass groups (``flags.attn`` / ``flags.moe`` / flat generic
-leaves on ``flags`` itself); reads and writes are plain attribute access.
-Static groups are writable during resolution and locked by ``freeze()``;
-``flags.capture`` stays writable (capture-time state). Each group offers a
-transactional, test-only ``override(**kw)`` that also works on frozen groups.
+``get_flags()`` returns the runtime-flags tier. Resolved configuration lives
+on ``server_args`` fields (declarations materialize at the end of
+``__post_init__``), so this tier only carries genuine runtime state that is
+not a function of the configuration alone — today the capture lifecycle
+(``flags.capture``). Flags live in typed dataclass groups; reads and writes
+are plain attribute access, and each group offers a transactional, test-only
+``override(**kw)``.
 """
 
 from __future__ import annotations
@@ -238,18 +238,13 @@ class _FlagGroupBase:
                 f"{type(self).__name__} has no flag '{name}' (leaves are "
                 "declared as dataclass fields; check for typos)"
             )
-        if getattr(self, "_frozen", False):
-            raise RuntimeError(
-                f"{type(self).__name__} is frozen; cannot write '{name}'. "
-                "Test-scoped changes go through override()."
-            )
         object.__setattr__(self, name, value)
 
     @contextmanager
     def override(self, **kwargs):
         """Temporarily force flag values, restoring on exit. Transactional
-        (keys validated before any write) and usable on frozen groups — this
-        is the test-only injection primitive."""
+        (keys validated before any write) — the test-only injection
+        primitive."""
         fields = type(self).__dataclass_fields__
         unknown = set(kwargs) - set(fields)
         if unknown:
@@ -266,114 +261,133 @@ class _FlagGroupBase:
                 object.__setattr__(self, name, value)
 
 
-class _StaticFlags(_FlagGroupBase):
-    """Static flag-group: writable during resolution, locked by ``freeze()``."""
-
-    def freeze(self) -> None:
-        object.__setattr__(self, "_frozen", True)
-
-    @property
-    def frozen(self) -> bool:
-        return getattr(self, "_frozen", False)
-
-
-@dataclasses.dataclass
-class AttnFlags(_StaticFlags):
-    """Attention-family resolved flags (leaves arrive with the V3 sweeps)."""
-
-    # Resolved attention backend; the pristine user request stays on
-    # server_args.attention_backend.
-    backend: str | None = None
-
-
-@dataclasses.dataclass
-class MoeFlags(_StaticFlags):
-    """MoE-family resolved flags (leaves arrive with the V3 sweeps)."""
-
-    # Resolved MoE runner backend; the pristine user request stays on
-    # server_args.moe_runner_backend.
-    runner_backend: str = "auto"
-
-
 @dataclasses.dataclass
 class CaptureFlags(_FlagGroupBase):
     """Capture-time flags; never frozen (written during cuda-graph capture)."""
 
+    # Seeded from server_args at publish; a model whose _can_torch_compile is
+    # False clears it during warmup (the only post-publish writer).
+    enable_torch_compile: bool = False
+
 
 @dataclasses.dataclass
-class Flags(_StaticFlags):
-    """Root of the resolved-flags tier.
-
-    Family groups hang off it (``flags.attn`` / ``flags.moe`` / ``flags.capture``);
-    single generic flags live flat on this container, declared as fields here.
-    ``freeze()`` locks the container and every static sub-group; ``capture``
-    stays writable.
+class MoeFlags(_FlagGroupBase):
+    """MoE runtime flags, materialized by ``initialize_moe_config`` (scheduler
+    init, after distributed setup). ``a2a_backend`` / ``runner_backend`` /
+    ``disable_fp4_allgather`` are the ACTIVE values: the speculative contexts
+    in ``layers.moe.utils`` swap them around draft-model forwards. Values are
+    the parsed enums from ``layers.moe.utils``; ``None`` means "not
+    initialized yet" and the accessors fall back lazily.
     """
 
-    attn: AttnFlags = dataclasses.field(default_factory=AttnFlags)
-    moe: MoeFlags = dataclasses.field(default_factory=MoeFlags)
-    capture: CaptureFlags = dataclasses.field(default_factory=CaptureFlags)
-
-    # -- resolved config leaves (flat; materialized at publish) --------------
-    # Pristine user requests stay on the matching server_args fields; these
-    # leaves carry the model-resolved values.
-    dtype: str = "auto"
-    enable_tf32_matmul: bool = False
-    enable_multi_layer_eagle: bool = False
-    swa_full_tokens_ratio: float = 0.8
-    disable_hybrid_swa_memory: bool = False
-    sampling_backend: str | None = None
-    page_size: int | None = None
+    a2a_backend: Any = None
+    runner_backend: Any = None
+    speculative_runner_backend: Any = None
+    speculative_a2a_backend: Any = None
+    deepep_mode: Any = None
+    deepep_config: str | None = None
+    tbo_enabled: bool | None = None
+    sbo_enabled: bool | None = None
+    tbo_token_distribution_threshold: float | None = None
+    disable_fp4_allgather: bool | None = None
     quantization: str | None = None
-    # Parallel-request fields: flat transitional home, to be re-homed by the
-    # Parallel Parameters Clarification module.
-    enable_dp_attention: bool = False
-    enable_dp_lm_head: bool = False
-    moe_a2a_backend: str = "none"
-    ep_size: int = 1
-    moe_dense_tp_size: int | None = None
-    attn_cp_size: int = 1
-
-    def freeze(self) -> None:
-        for field in dataclasses.fields(self):
-            value = getattr(self, field.name)
-            if isinstance(value, _StaticFlags):
-                value.freeze()
-        super().freeze()
 
 
-# Resolved-config field name → dotted flag-leaf path (e.g. a V3 sweep adds
-# "use_mla_backend": "attn.use_mla_backend"). Fields not listed default to a
-# flat leaf of the same name on the Flags container. Populated per field
-# family as readers migrate.
-FLAG_LEAF_MAP: dict[str, str] = {
-    "attention_backend": "attn.backend",
-    "moe_runner_backend": "moe.runner_backend",
-}
+@dataclasses.dataclass
+class DpFlags(_FlagGroupBase):
+    """DP-attention runtime flags, materialized by ``initialize_dp_attention``
+    (after distributed setup; reads the model config). Topology values
+    (sizes/ranks) stay on ``layers.dp_attention`` until the parallel vertical
+    migrates them."""
+
+    enabled: bool = False
+    # Hybrid-SSM models materialize idle ranks via the MAX_LEN fabricated-row
+    # conversion (set when hf_config has hybrid_override_pattern).
+    max_len_with_idle: bool = False
 
 
-def resolve_flag_leaf(
-    flags: Flags, field: str, *, leaf_map: dict[str, str] | None = None
-) -> tuple[Any, str]:
-    """Return ``(owning group, leaf attribute name)`` for a resolved-config field."""
-    path = (FLAG_LEAF_MAP if leaf_map is None else leaf_map).get(field, field)
-    owner: Any = flags
-    *groups, leaf = path.split(".")
-    for part in groups:
-        owner = getattr(owner, part)
-    return owner, leaf
+@dataclasses.dataclass
+class Flags(_FlagGroupBase):
+    """Root of the runtime-flags tier.
+
+    Resolved configuration lives on ``server_args`` fields (materialized at
+    the end of ``__post_init__``) — this tier only carries genuine runtime
+    state whose value is not a function of the configuration alone, grouped
+    by lifecycle (``capture``) or subsystem (``moe`` / ``dp``).
+    """
+
+    capture: CaptureFlags = dataclasses.field(default_factory=CaptureFlags)
+    moe: MoeFlags = dataclasses.field(default_factory=MoeFlags)
+    dp: DpFlags = dataclasses.field(default_factory=DpFlags)
+
+
+@dataclasses.dataclass
+class Resources(_FlagGroupBase):
+    """Process-level resource handles: named slots with one reset lifecycle,
+    scoped test injection via ``override()``, and the creation/publish
+    semantics kept in the owning modules' accessors (which are thin shims
+    over these slots)."""
+
+    # CUDA graph memory pool shared across the prefill and decode graph
+    # backends (created lazily by model_executor.runner_utils.pool).
+    graph_memory_pool: Any = None
+    # EPLB: per-process recorder and the publish-once location metadata
+    # (owning accessors live in sglang.srt.eplb).
+    expert_distribution_recorder: Any = None
+    expert_location_metadata: Any = None
+    # LPLB: layer_id -> solver.
+    lplb_solvers: dict = dataclasses.field(default_factory=dict)
+    # Named side streams (see RuntimeContext.get_stream): name -> stream.
+    streams: dict = dataclasses.field(default_factory=dict)
+    # Named persistent buffers (see RuntimeContext.get_buffer): name -> tensor.
+    # Accessors with bespoke semantics (grow-only, per-device keys) manage
+    # their entries directly.
+    buffers: dict = dataclasses.field(default_factory=dict)
+    # Persistent reusable CUDA events for non-EP DP TBO, keyed by
+    # (kind, subbatch) — see dp_attention._tbo_event for why reuse matters.
+    tbo_event_pool: dict = dataclasses.field(default_factory=dict)
 
 
 class RuntimeContext:
     """Container for the structured runtime accessors; exposes ``parallel``,
-    ``server_args``, and ``flags``."""
+    ``server_args``, ``flags``, and ``resources``."""
 
-    __slots__ = ("parallel", "_server_args", "flags")
+    __slots__ = ("parallel", "_server_args", "flags", "resources")
 
     def __init__(self, parallel: ParallelContext):
         self.parallel = parallel
         self._server_args: ServerArgs | None = None
         self.flags = Flags()
+        self.resources = Resources()
+
+    def get_stream(self, name: str) -> Any:
+        """Named process-level CUDA side stream: get-or-create, shared by
+        name (the keyed-lazy pattern of the persistent buffers). Creation is
+        a driver call that must stay outside cuda-graph capture — call sites
+        lease their stream at init/warmup time."""
+        stream = self.resources.streams.get(name)
+        if stream is None:
+            import torch
+
+            stream = torch.cuda.Stream()
+            self.resources.streams[name] = stream
+        return stream
+
+    def set_stream(self, name: str, stream: Any) -> Any:
+        """Install (or replace) the named stream — explicit injection for
+        tests and backends that bring their own stream."""
+        self.resources.streams[name] = stream
+        return stream
+
+    def get_buffer(self, name: str, factory: Any) -> Any:
+        """Named process-level persistent buffer: get-or-create via
+        ``factory()``, shared by name (the keyed-lazy pattern of the
+        persistent buffers / named streams)."""
+        buf = self.resources.buffers.get(name)
+        if buf is None:
+            buf = factory()
+            self.resources.buffers[name] = buf
+        return buf
 
     @property
     def server_args(self) -> ServerArgs:
@@ -389,40 +403,16 @@ class RuntimeContext:
 
         Overwrite-allowed: a re-publish replaces the slot (test kits re-publish
         per test; production ordering discipline lives at the call-sites, e.g.
-        the draft-worker guard in ``ModelRunner.__init__``).
-
-        Publishing also resolves the stashed model-override declarations
-        into the flags tier (skipped for objects without the stash — dummy /
-        "none" fixture ServerArgs and test-kit mocks never compute it).
-        Resolution runs first: if it fails, the previous publish stays intact.
+        the draft-worker guard in ``ModelRunner.__init__``). The published
+        object already carries the resolved configuration (declarations
+        materialize at the end of ``__post_init__``).
         """
-        self._resolve_flags(server_args)
+        # Seed the capture tier for the new lifecycle (defaults for sentinel
+        # and mock publishes, which carry no config).
+        self.flags.capture.enable_torch_compile = getattr(
+            server_args, "enable_torch_compile", False
+        )
         self._server_args = server_args
-
-    def _resolve_flags(self, server_args: ServerArgs) -> None:
-        declarations = getattr(server_args, "_resolved_overrides", None)
-        if declarations is None:
-            return
-        from sglang.srt.arg_groups.overrides import (
-            apply_model_overrides,
-            assert_flag_parity,
-        )
-
-        # Resolve into a fresh container and only install it once everything
-        # passed: a failed resolution (gate validation or the parity assert)
-        # must not leave the process-global flags half-written for callers
-        # that catch the error or republish (same install-fresh semantics as
-        # reset_context()).
-        flags = Flags()
-        apply_model_overrides(flags, server_args, declarations)
-        # Transition-period drift guard: dual-apply keeps the declared fields
-        # on server_args byte-identical to the resolved flag leaves.
-        assert_flag_parity(
-            flags,
-            server_args,
-            {field for _source, decl in declarations for field in decl},
-        )
-        self.flags = flags
 
 
 _PARALLEL = ParallelContext()
@@ -445,11 +435,28 @@ def get_flags() -> Flags:
     return _CONTEXT.flags
 
 
+def get_resources() -> Resources:
+    return _CONTEXT.resources
+
+
+def get_stream(name: str) -> Any:
+    return _CONTEXT.get_stream(name)
+
+
+def set_stream(name: str, stream: Any) -> Any:
+    return _CONTEXT.set_stream(name, stream)
+
+
+def get_buffer(name: str, factory: Any) -> Any:
+    return _CONTEXT.get_buffer(name, factory)
+
+
 def reset_context() -> None:
     """Clear the context-owned store (unit-test teardown): drop the published
-    ``server_args`` and install a fresh, unfrozen ``Flags``.
+    ``server_args`` and install fresh ``Flags`` and ``Resources``.
 
     Wrapper subsystems (``parallel``) hold no state and are unaffected.
     """
     _CONTEXT._server_args = None
     _CONTEXT.flags = Flags()
+    _CONTEXT.resources = Resources()

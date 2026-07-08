@@ -15,6 +15,7 @@ register_cuda_ci(
 NE_N = 8
 NE_K = 2
 VOCAB_SIZE = 32000
+EOS_TOKEN_ID = VOCAB_SIZE
 MAX_CONTEXT_LEN = 1024
 
 
@@ -83,6 +84,7 @@ def benchmark(batch_size: int, provider: str):
                 row_indices,
                 column_starts,
                 n_gram_ids,
+                EOS_TOKEN_ID,
             ),
             memory_output=(n_gram_ids,),  # inplace write to n_gram_ids
         )
@@ -99,6 +101,7 @@ def benchmark(batch_size: int, provider: str):
             row_indices,
             column_starts,
             n_gram_ids,
+            EOS_TOKEN_ID,
         ),
         memory_output=(n_gram_ids,),  # inplace write to n_gram_ids
     )
