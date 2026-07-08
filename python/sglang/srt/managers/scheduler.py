@@ -3821,7 +3821,6 @@ class Scheduler(
 
     def set_internal_state(self, recv_req: SetInternalStateReq):
         server_args_dict = recv_req.server_args
-        logging.info(f"set_internal_state received server_args={server_args_dict}")
         args_allow_update = set(
             [
                 "pp_max_micro_batch_size",
