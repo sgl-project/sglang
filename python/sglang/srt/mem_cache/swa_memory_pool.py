@@ -86,6 +86,26 @@ class SWAKVPool(BaseSWAKVPool):
             f"SWAKVPool mem usage: {self.mem_usage:.2f} GB, swa size: {self.size_swa}, full size: {self.size}"
         )
 
+    @property
+    def post_capture_active(self) -> bool:
+        """True iff the sub-pools took the post-capture VA-backed path (both share the flag)."""
+        return self.full_kv_pool.post_capture_active
+
+    @property
+    def post_capture_backed_bytes(self) -> int:
+        """Physically-backed KV bytes across both sub-pools (post-capture only)."""
+        return (
+            self.full_kv_pool.post_capture_backed_bytes
+            + self.swa_kv_pool.post_capture_backed_bytes
+        )
+
+    def finalize_backing(self, config) -> None:
+        """Back both sub-pools to their post-capture final sizes and record them."""
+        self.full_kv_pool._finalize_backing_tokens(config.full_max_total_num_tokens)
+        self.swa_kv_pool._finalize_backing_tokens(config.swa_max_total_num_tokens)
+        self.size = int(config.full_max_total_num_tokens)
+        self.size_swa = int(config.swa_max_total_num_tokens)
+
     def register_mapping(self, full_to_swa_index_mapping: torch.Tensor):
         self.full_to_swa_index_mapping = full_to_swa_index_mapping
 
@@ -160,7 +180,7 @@ class SWAKVPool(BaseSWAKVPool):
         v_scale: float = 1.0,
     ):
         # loc_info bundles the full loc and the pre-translated SWA loc.
-        loc, swa_loc = unwrap_write_loc(loc_info)
+        loc, swa_loc, _ = unwrap_write_loc(loc_info)
         layer_id = layer.layer_id
         layer_id_pool, is_swa_layer = self.layers_mapping[layer_id]
         if is_swa_layer:
