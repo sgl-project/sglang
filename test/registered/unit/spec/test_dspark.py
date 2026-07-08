@@ -1124,13 +1124,27 @@ class TestDSparkPrefillHandoff(CustomTestCase):
         self.assertEqual(draft_input.transfer_warmup_rounds.dtype, t.int32)
         self.assertEqual(draft_input.transfer_warmup_rounds.tolist(), [0, 0])
 
-    def _make_disagg_batch(self):
+    def _make_disagg_batch(self, with_tail=False):
         t = self.torch
+        reqs = [
+            SimpleNamespace(hidden_states_tensor=t.tensor([1.0, 2.0])),
+            SimpleNamespace(hidden_states_tensor=t.tensor([3.0, 4.0])),
+        ]
+        if with_tail:
+            reqs[0].prefill_tail_hidden_states_tensor = t.tensor(
+                [[0.0, 0.0], [1.0, 2.0], [3.0, 4.0]]
+            )
+            reqs[0].prefill_tail_valid_mask = t.tensor(
+                [False, True, True], dtype=t.bool
+            )
+            reqs[1].prefill_tail_hidden_states_tensor = t.tensor(
+                [[5.0, 6.0], [7.0, 8.0], [9.0, 10.0]]
+            )
+            reqs[1].prefill_tail_valid_mask = t.tensor(
+                [True, True, True], dtype=t.bool
+            )
         return SimpleNamespace(
-            reqs=[
-                SimpleNamespace(hidden_states_tensor=t.tensor([1.0, 2.0])),
-                SimpleNamespace(hidden_states_tensor=t.tensor([3.0, 4.0])),
-            ],
+            reqs=reqs,
             batch_size=lambda: 2,
             device=t.device("cpu"),
             seq_lens=t.tensor([10, 11], dtype=t.int64),
@@ -1209,6 +1223,80 @@ class TestDSparkPrefillHandoff(CustomTestCase):
                 )
 
         self.assertEqual(draft_input.transfer_warmup_rounds.tolist(), [4, 4])
+
+    def test_dspark_disagg_carries_prefill_tail_and_requests_full_hidden(self):
+        t = self.torch
+        from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+        from sglang.srt.speculative.dspark_disaggregation import (
+            build_dspark_disagg_draft_input,
+        )
+
+        draft_input = build_dspark_disagg_draft_input(
+            self._make_disagg_batch(with_tail=True),
+            SimpleNamespace(),
+            t.tensor([101, 102], dtype=t.int64),
+            SimpleNamespace(),
+        )
+
+        self.assertEqual(draft_input.capture_hidden_mode, CaptureHiddenMode.FULL)
+        self.assertFalse(draft_input.prefill_tail_hidden_projected)
+        self.assertEqual(tuple(draft_input.prefill_tail_hidden_states.shape), (2, 3, 2))
+        self.assertEqual(
+            draft_input.prefill_tail_valid_mask.tolist(),
+            [[False, True, True], [True, True, True]],
+        )
+        self.assertEqual(
+            draft_input.prefill_tail_hidden_states[0].tolist(),
+            [[0.0, 0.0], [1.0, 2.0], [3.0, 4.0]],
+        )
+
+    def test_metadata_buffers_roundtrip_dspark_prefill_tail(self):
+        t = self.torch
+        from sglang.srt.disaggregation.utils import MetadataBuffers
+
+        buffers = MetadataBuffers(
+            size=2,
+            hidden_size=3,
+            hidden_states_dtype=t.float32,
+            dspark_prefill_tail_len=3,
+        )
+        req = SimpleNamespace(
+            metadata_buffer_index=1,
+            output_ids=[77],
+            cached_tokens=4,
+            cached_tokens_device=0,
+            cached_tokens_host=0,
+            cached_tokens_storage=0,
+            multimodal_inputs=None,
+            return_logprob=False,
+            output_topk_p=None,
+            output_topk_index=None,
+            hidden_states_tensor=t.tensor([1.0, 2.0, 3.0]),
+            prefill_tail_hidden_states_tensor=t.arange(15, dtype=t.float32).view(5, 3),
+            prefill_tail_valid_mask=t.tensor([True, False, True, True, False]),
+            bootstrap_room=123,
+        )
+
+        buffers.set_buf(req)
+        out = buffers.get_buf(1)
+
+        self.assertEqual(len(buffers.get_buf_infos()[0]), 12)
+        self.assertEqual(out[8].tolist(), [1.0, 2.0, 3.0])
+        self.assertEqual(out[9][0].item(), 123)
+        self.assertEqual(
+            out[10].tolist(),
+            [[6.0, 7.0, 8.0], [9.0, 10.0, 11.0], [12.0, 13.0, 14.0]],
+        )
+        self.assertEqual(out[11].tolist(), [True, True, False])
+
+        req.prefill_tail_hidden_states_tensor = None
+        req.prefill_tail_valid_mask = None
+        req.hidden_states_tensor = None
+        buffers.set_buf(req)
+        out = buffers.get_buf(1)
+        self.assertEqual(out[8].tolist(), [0.0, 0.0, 0.0])
+        self.assertTrue(t.equal(out[10], t.zeros_like(out[10])))
+        self.assertEqual(out[11].tolist(), [False, False, False])
 
     def test_accept_bonus_uses_longest_contiguous_draft_match(self):
         t = self.torch

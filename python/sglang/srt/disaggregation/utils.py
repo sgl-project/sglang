@@ -226,9 +226,11 @@ class MetadataBuffers:
         hidden_size: int,
         hidden_states_dtype: torch.dtype,
         max_top_logprobs_num: int = 128,
+        dspark_prefill_tail_len: int = 0,
         custom_mem_pool: torch.cuda.MemPool = None,
     ):
         self.custom_mem_pool = custom_mem_pool
+        self.dspark_prefill_tail_len = max(0, int(dspark_prefill_tail_len))
         bootstrap_room_dtype = torch.uint64
         device = "cpu"
         if is_npu():
@@ -276,6 +278,19 @@ class MetadataBuffers:
             self.output_hidden_states = torch.zeros(
                 (size, hidden_size), dtype=hidden_states_dtype, device=device
             )
+            self.output_dspark_prefill_tail_hidden_states = None
+            self.output_dspark_prefill_tail_valid_mask = None
+            if self.dspark_prefill_tail_len > 0:
+                self.output_dspark_prefill_tail_hidden_states = torch.zeros(
+                    (size, self.dspark_prefill_tail_len, hidden_size),
+                    dtype=hidden_states_dtype,
+                    device=device,
+                )
+                self.output_dspark_prefill_tail_valid_mask = torch.zeros(
+                    (size, self.dspark_prefill_tail_len),
+                    dtype=torch.bool,
+                    device=device,
+                )
             # Request validation: store bootstrap_room to detect metadata corruption
             self.bootstrap_room = torch.zeros(
                 (size, 8), dtype=bootstrap_room_dtype, device=device
@@ -318,9 +333,35 @@ class MetadataBuffers:
             self.output_hidden_states[0].nbytes,
             self.bootstrap_room[0].nbytes,
         ]
+        if self.output_dspark_prefill_tail_hidden_states is not None:
+            ptrs.extend(
+                [
+                    self.output_dspark_prefill_tail_hidden_states.data_ptr(),
+                    self.output_dspark_prefill_tail_valid_mask.data_ptr(),
+                ]
+            )
+            data_lens.extend(
+                [
+                    self.output_dspark_prefill_tail_hidden_states.nbytes,
+                    self.output_dspark_prefill_tail_valid_mask.nbytes,
+                ]
+            )
+            item_lens.extend(
+                [
+                    self.output_dspark_prefill_tail_hidden_states[0].nbytes,
+                    self.output_dspark_prefill_tail_valid_mask[0].nbytes,
+                ]
+            )
         return ptrs, data_lens, item_lens
 
     def get_buf(self, idx: int):
+        dspark_tail_hidden = None
+        dspark_tail_mask = None
+        if self.output_dspark_prefill_tail_hidden_states is not None:
+            dspark_tail_hidden = self.output_dspark_prefill_tail_hidden_states[
+                idx
+            ].clone()
+            dspark_tail_mask = self.output_dspark_prefill_tail_valid_mask[idx].clone()
         return (
             self.output_ids[idx].clone(),
             self.cached_tokens[idx].clone(),
@@ -332,6 +373,8 @@ class MetadataBuffers:
             self.output_topk_index[idx].clone(),
             self.output_hidden_states[idx].clone(),
             self.bootstrap_room[idx].clone(),
+            dspark_tail_hidden,
+            dspark_tail_mask,
         )
 
     def set_buf(self, req: Req):
@@ -393,10 +436,32 @@ class MetadataBuffers:
                 self.output_topk_index[req.metadata_buffer_index, :topk].copy_(
                     req.output_topk_index
                 )
+        self.output_hidden_states[req.metadata_buffer_index].zero_()
         if req.hidden_states_tensor is not None:
             self.output_hidden_states[req.metadata_buffer_index].copy_(
                 req.hidden_states_tensor
             )
+        if self.output_dspark_prefill_tail_hidden_states is not None:
+            self.output_dspark_prefill_tail_hidden_states[
+                req.metadata_buffer_index
+            ].zero_()
+            self.output_dspark_prefill_tail_valid_mask[
+                req.metadata_buffer_index
+            ].zero_()
+            tail_hidden = getattr(req, "prefill_tail_hidden_states_tensor", None)
+            tail_mask = getattr(req, "prefill_tail_valid_mask", None)
+            if tail_hidden is not None and tail_mask is not None:
+                tail_len = min(
+                    int(tail_hidden.shape[0]),
+                    int(self.output_dspark_prefill_tail_hidden_states.shape[1]),
+                )
+                if tail_len > 0:
+                    self.output_dspark_prefill_tail_hidden_states[
+                        req.metadata_buffer_index, -tail_len:
+                    ].copy_(tail_hidden[-tail_len:])
+                    self.output_dspark_prefill_tail_valid_mask[
+                        req.metadata_buffer_index, -tail_len:
+                    ].copy_(tail_mask[-tail_len:].to(dtype=torch.bool))
         # Store bootstrap_room for validation on decode side
         self.bootstrap_room[req.metadata_buffer_index, 0] = (
             req.bootstrap_room if req.bootstrap_room is not None else 0

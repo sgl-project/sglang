@@ -1041,7 +1041,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             cache_loc=flat_cache_locs,
             positions=flat_positions,
             draft_forward_batch=None,
-            projected=True,
+            projected=getattr(draft_input, "prefill_tail_hidden_projected", True),
         )
 
     def _write_draft_kv_from_projected_kv(

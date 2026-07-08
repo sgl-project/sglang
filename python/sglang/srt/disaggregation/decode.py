@@ -1528,6 +1528,8 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             output_topk_index,
             output_hidden_states,
             output_bootstrap_room,
+            output_dspark_prefill_tail_hidden_states,
+            output_dspark_prefill_tail_valid_mask,
         ) = self.metadata_buffers.get_buf(idx)
 
         # Validate bootstrap_room to detect context corruption
@@ -1602,6 +1604,12 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             decode_req.req.output_topk_p = output_topk_p
             decode_req.req.output_topk_index = output_topk_index
             decode_req.req.hidden_states_tensor = output_hidden_states
+            decode_req.req.prefill_tail_hidden_states_tensor = (
+                output_dspark_prefill_tail_hidden_states
+            )
+            decode_req.req.prefill_tail_valid_mask = (
+                output_dspark_prefill_tail_valid_mask
+            )
 
         if decode_req.req.return_logprob:
             decode_req.req.logprob.output_token_logprobs_val.append(

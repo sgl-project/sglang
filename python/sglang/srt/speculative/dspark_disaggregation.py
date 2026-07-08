@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.srt.managers.overlap_utils import RelayPayload
+from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.speculative.dspark_info import DSparkDraftInputV2
 
 if TYPE_CHECKING:
@@ -55,6 +56,29 @@ def build_dspark_disagg_draft_input(
         hidden_states = torch.empty((0, 0), dtype=torch.float16, device=batch.device)
         hidden_valid_mask = torch.empty((0, 0), dtype=torch.bool, device=batch.device)
 
+    req_tail_hidden = [
+        getattr(req, "prefill_tail_hidden_states_tensor", None) for req in batch.reqs
+    ]
+    req_tail_mask = [
+        getattr(req, "prefill_tail_valid_mask", None) for req in batch.reqs
+    ]
+    if (
+        req_tail_hidden
+        and all(tail is not None for tail in req_tail_hidden)
+        and all(mask is not None for mask in req_tail_mask)
+    ):
+        prefill_tail_hidden_states = torch.stack(req_tail_hidden, dim=0).to(
+            batch.device
+        )
+        prefill_tail_valid_mask = torch.stack(req_tail_mask, dim=0).to(batch.device)
+    else:
+        prefill_tail_hidden_states = torch.empty(
+            (0, 0, 0), dtype=torch.float16, device=batch.device
+        )
+        prefill_tail_valid_mask = torch.empty(
+            (0, 0), dtype=torch.bool, device=batch.device
+        )
+
     spec_info = DSparkDraftInputV2(
         bonus_tokens=last_tokens_tensor.to(dtype=torch.int64),
         new_seq_lens=batch.seq_lens.to(dtype=torch.int64),
@@ -63,6 +87,9 @@ def build_dspark_disagg_draft_input(
         topk_index=torch.empty((0, 0), dtype=torch.int64, device=batch.device),
         hidden_states=hidden_states,
         hidden_valid_mask=hidden_valid_mask,
+        prefill_tail_hidden_states=prefill_tail_hidden_states,
+        prefill_tail_valid_mask=prefill_tail_valid_mask,
+        prefill_tail_hidden_projected=False,
         transfer_warmup_rounds=torch.full(
             (batch.batch_size(),),
             warmup_rounds,
@@ -70,6 +97,7 @@ def build_dspark_disagg_draft_input(
             device=batch.device,
         ),
     )
+    spec_info.capture_hidden_mode = CaptureHiddenMode.FULL
 
     if batch.enable_overlap:
         spec_info.future_indices = batch.req_pool_indices
@@ -80,6 +108,8 @@ def build_dspark_disagg_draft_input(
                 bonus_tokens=spec_info.bonus_tokens,
                 hidden_states=spec_info.hidden_states,
                 hidden_valid_mask=spec_info.hidden_valid_mask,
+                prefill_tail_hidden_states=spec_info.prefill_tail_hidden_states,
+                prefill_tail_valid_mask=spec_info.prefill_tail_valid_mask,
                 transfer_warmup_rounds=spec_info.transfer_warmup_rounds,
             ),
         )

@@ -218,6 +218,7 @@ class DSparkDraftExtendInput(SpecInput):
 class DSparkDraftInputV2(SpecInput):
     bonus_tokens: torch.Tensor
     new_seq_lens: torch.Tensor
+    capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.NULL
     main_hidden: Optional[torch.Tensor] = None
     confidence: Optional[torch.Tensor] = None
     verify_done: Optional[torch.cuda.Event] = None
@@ -238,6 +239,7 @@ class DSparkDraftInputV2(SpecInput):
         default_factory=lambda: torch.empty((0, 0, 0), dtype=torch.float16)
     )
     prefill_tail_valid_mask: Optional[torch.Tensor] = None
+    prefill_tail_hidden_projected: bool = True
     transfer_warmup_rounds: torch.Tensor = field(
         default_factory=lambda: torch.empty((0,), dtype=torch.int32)
     )
@@ -603,6 +605,10 @@ class DSparkDraftInputV2(SpecInput):
                 [self.transfer_warmup_rounds, spec_info.transfer_warmup_rounds],
                 dim=0,
             )
+            self.prefill_tail_hidden_projected = (
+                self.prefill_tail_hidden_projected
+                and spec_info.prefill_tail_hidden_projected
+            )
             self.direct_carry_valid = False
             return
 
@@ -660,4 +666,8 @@ class DSparkDraftInputV2(SpecInput):
             )
         self.transfer_warmup_rounds = torch.cat(
             [self.transfer_warmup_rounds, spec_info.transfer_warmup_rounds], dim=0
+        )
+        self.prefill_tail_hidden_projected = (
+            self.prefill_tail_hidden_projected
+            and spec_info.prefill_tail_hidden_projected
         )

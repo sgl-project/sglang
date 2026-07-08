@@ -651,15 +651,52 @@ class SchedulerDisaggregationPrefillMixin:
                     hidden_states = getattr(logits_output, "hidden_states", None)
                     if hidden_states is None:
                         req.hidden_states_tensor = None
+                        req.prefill_tail_hidden_states_tensor = None
+                        req.prefill_tail_valid_mask = None
                     elif hidden_states.shape[0] == len(batch.reqs):
                         req.hidden_states_tensor = hidden_states[i].cpu().clone()
+                        req.prefill_tail_hidden_states_tensor = None
+                        req.prefill_tail_valid_mask = None
                     elif extend_input_len_per_req is None:
                         req.hidden_states_tensor = None
+                        req.prefill_tail_hidden_states_tensor = None
+                        req.prefill_tail_valid_mask = None
                     else:
-                        offset = sum(extend_input_len_per_req[: i + 1]) - 1
+                        next_offset = sum(extend_input_len_per_req[: i + 1])
+                        offset = next_offset - 1
                         req.hidden_states_tensor = hidden_states[offset].cpu().clone()
+                        tail_len = int(
+                            getattr(
+                                self.disagg_metadata_buffers,
+                                "dspark_prefill_tail_len",
+                                0,
+                            )
+                        )
+                        copy_len = min(tail_len, int(extend_input_len_per_req[i]))
+                        if copy_len > 0:
+                            tail_hidden = hidden_states.new_zeros(
+                                (tail_len, hidden_states.shape[-1])
+                            )
+                            tail_mask = torch.zeros(
+                                (tail_len,),
+                                dtype=torch.bool,
+                                device=hidden_states.device,
+                            )
+                            tail_hidden[-copy_len:].copy_(
+                                hidden_states[next_offset - copy_len : next_offset]
+                            )
+                            tail_mask[-copy_len:] = True
+                            req.prefill_tail_hidden_states_tensor = (
+                                tail_hidden.cpu().clone()
+                            )
+                            req.prefill_tail_valid_mask = tail_mask.cpu().clone()
+                        else:
+                            req.prefill_tail_hidden_states_tensor = None
+                            req.prefill_tail_valid_mask = None
                 else:
                     req.hidden_states_tensor = None
+                    req.prefill_tail_hidden_states_tensor = None
+                    req.prefill_tail_valid_mask = None
                 if req.return_logprob:
                     assert extend_logprob_start_len_per_req is not None
                     assert extend_input_len_per_req is not None
@@ -1135,6 +1172,8 @@ class SchedulerDisaggregationPrefillMixin:
         req.start_send_idx = 0
         req.tmp_end_idx = -1
         req.hidden_states_tensor = None
+        req.prefill_tail_hidden_states_tensor = None
+        req.prefill_tail_valid_mask = None
         req.pending_bootstrap = True
         req.time_stats.reset_prefill_retry_time()
         if req.time_stats.prefill_retry_count >= max_retries:

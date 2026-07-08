@@ -286,6 +286,22 @@ else:
 
 logger = logging.getLogger(__name__)
 
+
+def _get_dspark_pd_prefill_tail_len(default_tail_len: int) -> int:
+    value = os.getenv("SGLANG_DSPARK_PD_PREFILL_TAIL_TOKENS")
+    if value is None:
+        return max(0, default_tail_len)
+    try:
+        return max(0, int(value))
+    except ValueError:
+        logger.warning(
+            "Invalid SGLANG_DSPARK_PD_PREFILL_TAIL_TOKENS=%r; fallback to %d",
+            value,
+            default_tail_len,
+        )
+        return max(0, default_tail_len)
+
+
 # Test retract decode for debugging purposes
 TEST_RETRACT = envs.SGLANG_TEST_RETRACT.get()
 TEST_RETRACT_INTERVAL = envs.SGLANG_TEST_RETRACT_INTERVAL.get()
@@ -1141,6 +1157,9 @@ class Scheduler(
                 self.model_config.hidden_size
             )
             disagg_hidden_states_dtype = self.model_config.dtype
+            dspark_prefill_tail_len = _get_dspark_pd_prefill_tail_len(
+                max(1, int(self.server_args.speculative_num_draft_tokens) + 1)
+            )
         elif self.spec_algorithm.carries_draft_hidden_states():
             # `draft_runner` aliases `draft_runner_list[0]` in the multi-layer
             # worker, so a single accessor covers both shapes.
@@ -1148,9 +1167,11 @@ class Scheduler(
             disagg_hidden_size, disagg_hidden_states_dtype = (
                 get_draft_recurrent_hidden_state_spec(draft_runner)
             )
+            dspark_prefill_tail_len = 0
         else:
             disagg_hidden_size = 16  # minimal padding size for RDMA
             disagg_hidden_states_dtype = torch.float32
+            dspark_prefill_tail_len = 0
 
         if (
             self.disaggregation_mode == DisaggregationMode.DECODE
@@ -1163,6 +1184,7 @@ class Scheduler(
                 buffer_size,
                 hidden_size=disagg_hidden_size,
                 hidden_states_dtype=disagg_hidden_states_dtype,
+                dspark_prefill_tail_len=dspark_prefill_tail_len,
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
             )
 
@@ -1208,6 +1230,7 @@ class Scheduler(
                 buffer_size,
                 hidden_size=disagg_hidden_size,
                 hidden_states_dtype=disagg_hidden_states_dtype,
+                dspark_prefill_tail_len=dspark_prefill_tail_len,
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
             )
 
