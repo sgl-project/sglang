@@ -76,9 +76,9 @@ def test_exec_command_respects_cwd(tmp_path: Path) -> None:
     assert exec_command("pwd", cwd=str(sub)) == str(sub.resolve())
 
 
-def test_exec_command_check_true_exits_on_failure() -> None:
-    """With check=True a non-zero exit status raises SystemExit."""
-    with pytest.raises(SystemExit):
+def test_exec_command_check_true_raises_on_failure() -> None:
+    """With check=True a non-zero exit status raises RuntimeError with the command."""
+    with pytest.raises(RuntimeError, match="exit 7"):
         exec_command("exit 7", check=True)
 
 
@@ -1221,11 +1221,6 @@ def test_move_symbol_asserts_when_before_sibling_missing(tmp_path: Path) -> None
         _apply(r, tmp_path)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="text-mode read/write rewrites every CRLF line ending in touched files to LF, "
-    "an unrequested whole-file byte change",
-)
 def test_move_symbol_preserves_crlf_line_endings(tmp_path: Path) -> None:
     """Moving a def in a CRLF file must keep every line ending CRLF."""
     (tmp_path / "src.py").write_bytes(
@@ -1448,11 +1443,6 @@ def test_lower_call_sites_magic_comma_with_sole_receiver_arg_stays_valid(
     compile(out, "m.py", "exec")
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="AST col_offset counts UTF-8 bytes while the span helpers index str "
-    "characters, so a non-ASCII prefix on the line splices the rewrite mid-token",
-)
 def test_call_rewrite_is_column_accurate_on_non_ascii_lines(tmp_path: Path) -> None:
     """A call after a non-ASCII string on the same line is rewritten at the right columns."""
     (tmp_path / "m.py").write_text('x = "中文"; y = Owner.foo(self.r, 1)\n')
@@ -1461,11 +1451,6 @@ def test_call_rewrite_is_column_accurate_on_non_ascii_lines(tmp_path: Path) -> N
     assert (tmp_path / "m.py").read_text() == 'x = "中文"; y = self.r.foo(1)\n'
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="str.splitlines splits on form feed while ast line numbers do not, so the "
-    "span helpers slice the wrong lines and duplicate text",
-)
 def test_call_rewrite_survives_a_form_feed_line_start(tmp_path: Path) -> None:
     """A form feed at a line start must not shift the rewrite onto the wrong line."""
     (tmp_path / "m.py").write_text("a = 1\n\x0cb = 2\ny = Owner.foo(self.r, 1)\n")
