@@ -821,7 +821,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
 
         with patch.object(overrides_module, "is_sm120_supported", return_value=True):
             self.assertEqual(
-                _deepseek_v4_sm120_moe(_view()), {"moe_runner_backend": "marlin"}
+                _deepseek_v4_sm120_moe(_view()),
+                {"moe_runner_backend": "flashinfer_mxfp4"},
             )
             self.assertEqual(
                 _deepseek_v4_sm120_moe(_view(moe_runner_backend="triton")), {}
