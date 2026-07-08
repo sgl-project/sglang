@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.srt.configs.model_config import (
+    dsa_layer_skips_topk,
     get_dsa_index_head_dim,
     get_minimax_sparse_attention_config,
     get_minimax_sparse_disable_value_layer_ids,
@@ -158,8 +159,10 @@ class ModelRunnerKVCacheMixin:
 
         if server_args.max_mamba_cache_size is not None:
             # Use explicitly set max_mamba_cache_size
-            server_args.max_mamba_cache_size = server_args.max_mamba_cache_size // (
-                server_args.dp_size if server_args.enable_dp_attention else 1
+            server_args.override(
+                "mamba_pool.per_dp_shard",
+                max_mamba_cache_size=server_args.max_mamba_cache_size
+                // (server_args.dp_size if server_args.enable_dp_attention else 1),
             )
             # Reserve intermediate memory based on capped max_num_reqs
             if has_spec_dec:
@@ -180,8 +183,10 @@ class ModelRunnerKVCacheMixin:
             and server_args.max_running_requests is not None
         ):
             # Use explicitly set max_running_requests when radix cache is disabled
-            server_args.max_mamba_cache_size = server_args.max_running_requests // (
-                server_args.dp_size if server_args.enable_dp_attention else 1
+            server_args.override(
+                "mamba_pool.from_max_running_requests",
+                max_mamba_cache_size=server_args.max_running_requests
+                // (server_args.dp_size if server_args.enable_dp_attention else 1),
             )
             # Reserve intermediate memory based on capped max_num_reqs
             if has_spec_dec:
@@ -212,8 +217,11 @@ class ModelRunnerKVCacheMixin:
                 ratio = self._calculate_mamba_ratio()
                 D = server_args.speculative_num_draft_tokens
                 # Joint solve: main_state + intermediate = mamba_budget
-                server_args.max_mamba_cache_size = int(
-                    mamba_budget_bytes // (per_req * (1 + D / ratio))
+                server_args.override(
+                    "mamba_pool.memory_budget_spec",
+                    max_mamba_cache_size=int(
+                        mamba_budget_bytes // (per_req * (1 + D / ratio))
+                    ),
                 )
                 # Intermediate memory is included in mamba_budget, subtract it
                 # so the return value only has main_state subtracted from total
@@ -225,7 +233,10 @@ class ModelRunnerKVCacheMixin:
                 intermediate_size = per_req * capped_reqs * D
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
             else:
-                server_args.max_mamba_cache_size = int(mamba_budget_bytes // per_req)
+                server_args.override(
+                    "mamba_pool.memory_budget",
+                    max_mamba_cache_size=int(mamba_budget_bytes // per_req),
+                )
 
         # Validate: max_mamba_cache_size must be positive after memory allocation.
         # A non-positive value means GPU memory is insufficient for the requested
@@ -947,6 +958,11 @@ class ModelRunnerKVCacheMixin:
                 pool_kwargs["host_to_device_ratio"] = parse_hisparse_config(
                     self.server_args
                 ).host_to_device_ratio
+            elif not self.is_draft_worker:
+                pool_kwargs["skip_topk_layers"] = [
+                    dsa_layer_skips_topk(self.model_config.hf_config, layer_id)
+                    for layer_id in range(self.start_layer, self.end_layer)
+                ]
             self.token_to_kv_pool = PoolCls(
                 self.max_total_num_tokens,
                 page_size=self.page_size,
