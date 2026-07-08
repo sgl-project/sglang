@@ -975,6 +975,13 @@ class Qwen3LLMModel(Qwen3Model):
                     deepstack_embeds = input_deepstack_embeds[
                         :, sep : sep + self.hidden_size
                     ]
+                    # VLCache (Stage B): when the previous layer reused an image, the
+                    # hidden_states entering this layer are compressed to recompute-token
+                    # rows only, so the (full-length) deepstack slice must be compressed
+                    # to match before being added as the residual.
+                    _cm = forward_batch.compute_mask
+                    if _cm is not None and prev_layer_idx in _cm:
+                        deepstack_embeds = deepstack_embeds[_cm[prev_layer_idx]]
 
             # SGLang applies residual at the START of the next layer, not at the END like HuggingFace.
             # See: https://github.com/huggingface/transformers/blob/v5.0.0rc0/src/transformers/models/qwen3_vl/modeling_qwen3_vl.py#L549
@@ -987,6 +994,37 @@ class Qwen3LLMModel(Qwen3Model):
                 residual,
                 post_residual_addition=deepstack_embeds,
             )
+
+        # VLCache (Stage B): the hidden stream was compressed to recompute-token rows
+        # only (reused image rows dropped) for the attention layers. Downstream logit
+        # extraction (_get_pruned_states) indexes by the UNCOMPRESSED extend_seq_lens,
+        # so scatter the compressed rows back into a full-length tensor here, before the
+        # final norm. Reused rows are never read for last-token sampling (the last token
+        # of each sequence is always a recompute row), so zero-filling them is safe.
+        # PP is not supported with VLCache (compression state would not survive the
+        # cross-rank proxy hand-off); this only fires on the last rank.
+        if (
+            forward_batch.compute_mask is not None
+            and len(forward_batch.compute_mask) > 0
+            and self.pp_group.is_last_rank
+        ):
+            _mask = next(iter(forward_batch.compute_mask.values()))
+            if hidden_states.shape[0] != _mask.shape[0]:
+                assert hidden_states.shape[0] == int(_mask.sum()), (
+                    f"VLCache scatter: compressed rows {hidden_states.shape[0]} != "
+                    f"recompute rows {int(_mask.sum())}"
+                )
+                full_hidden = hidden_states.new_zeros(
+                    (_mask.shape[0], hidden_states.shape[1])
+                )
+                full_hidden[_mask] = hidden_states
+                hidden_states = full_hidden
+                if residual is not None:
+                    full_residual = residual.new_zeros(
+                        (_mask.shape[0], residual.shape[1])
+                    )
+                    full_residual[_mask] = residual
+                    residual = full_residual
 
         # Handle deepstack for the last processed layer if it exists.
         last_deepstack = self.get_deepstack_embeds(

@@ -706,6 +706,13 @@ class ServerArgs:
     # placeholder token. See MIS_DELIMITER_TOKEN_ID for details.
     enable_mis: bool = False
 
+    # VLCache (Stage B): reuse a repeated image's attention K/V across requests
+    # (position-independent, pre-RoPE) instead of recomputing it. Default off.
+    enable_vlcache: bool = False
+    # Fraction of each image's tokens recomputed (the rest reused). Higher = more
+    # accurate, less saving. Uniform across layers.
+    vlcache_recompute_ratio: float = 0.3
+
     # Optimization/debug options
     disable_radix_cache: bool = False
     cuda_graph_max_bs: Optional[int] = None
@@ -6451,6 +6458,23 @@ class ServerArgs:
             "into a single sequence for efficient batch processing. "
             "Requires --attention-backend flashinfer; auto-disables CUDA graph, "
             "radix cache, and chunked prefill.",
+        )
+
+        # Args for VLCache (image-KV reuse)
+        parser.add_argument(
+            "--enable-vlcache",
+            action="store_true",
+            default=ServerArgs.enable_vlcache,
+            help="Enable VLCache: reuse a repeated image's attention K/V "
+            "(position-independent, pre-RoPE) instead of recomputing it. "
+            "Requires --attention-backend flashinfer.",
+        )
+        parser.add_argument(
+            "--vlcache-recompute-ratio",
+            type=float,
+            default=ServerArgs.vlcache_recompute_ratio,
+            help="Fraction of each image's tokens recomputed under VLCache "
+            "(rest reused). Higher = more accurate, less saving.",
         )
 
         # Optimization/debug options

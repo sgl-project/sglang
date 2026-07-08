@@ -491,6 +491,9 @@ class TpModelWorker(BaseTpWorker):
                 expert_distribution_metrics=out.expert_distribution_metrics,
                 routed_experts_output=out.routed_experts_output,
                 indexer_topk_output=out.indexer_topk_output,
+                # VLCache: per-request reused-token counts from the prefill plan
+                # (None unless --enable-vlcache and this was an extend batch).
+                vlcache_reused_tokens_per_req=forward_batch.vlcache_reused_tokens_per_req,
             )
 
             if is_verify:

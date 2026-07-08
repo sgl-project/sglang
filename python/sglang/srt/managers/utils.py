@@ -34,6 +34,10 @@ class GenerationBatchResult:
     # For output processing
     extend_input_len_per_req: Optional[List[int]] = None
     extend_logprob_start_len_per_req: Optional[List[int]] = None
+    # Per-request prompt tokens served from the VLCache image-KV store this
+    # prefill (reused, not recomputed), in batch order. Folded into each
+    # request's cached_tokens accounting (-> meta_info) alongside radix hits.
+    vlcache_reused_tokens_per_req: Optional[List[int]] = None
 
     # For overlap scheduling
     copy_done: Optional[torch.cuda.Event] = None

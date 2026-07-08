@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 from sglang.srt.disaggregation.kv_events import EventPublisherFactory, KVEventBatch
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
+from sglang.srt.managers import mm_utils
 from sglang.srt.managers.io_struct import (
     DisaggregationMetrics,
     GetLoadsReqInput,
@@ -518,6 +519,13 @@ class SchedulerMetricsMixin:
             f"#queue-req: {len(self.waiting_queue)}, "
             f"#pending-token: {prefill_stats.num_pending_tokens}, "
         )
+
+        # Multimodal (ViT) embedding-cache cumulative hit/miss counters; only
+        # present once a multimodal item has been looked up (text-only workloads
+        # never see this segment).
+        mm_stats = mm_utils.mm_cache_stats
+        if mm_stats.hits or mm_stats.misses:
+            msg += f"mm-cache-hit: {mm_stats.hits}/{mm_stats.hits + mm_stats.misses}, "
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             msg += f"#bootstrap-req: {len(self.disagg_prefill_bootstrap_queue.queue)}, "

@@ -156,6 +156,25 @@ class Qwen3Attention(nn.Module):
         )
         self.alt_stream = alt_stream
 
+        # --- VLCache (Stage B: image-KV reuse) ---
+        self.layer_id = layer_id
+        _sa = get_global_server_args()
+        self.vlcache_enabled = getattr(_sa, "enable_vlcache", False)
+        if self.vlcache_enabled:
+            from sglang.srt.managers.mock_kv_manager import mock_kv_manager
+
+            self.mock_kv_manager = mock_kv_manager
+            ratio = getattr(_sa, "vlcache_recompute_ratio", 0.3)
+            num_layers = getattr(_sa, "_vlcache_num_layers", layer_id + 1)
+            self.recompute_ratio_in_layer = [ratio] * max(num_layers, layer_id + 1)
+            self.max_recompute_layer_id = int(
+                torch.argmax(torch.tensor(self.recompute_ratio_in_layer)).item()
+            )
+            self.is_max_recompute_layer = (
+                max(self.recompute_ratio_in_layer)
+                == self.recompute_ratio_in_layer[self.layer_id]
+            )
+
         self.use_fused_qk_norm_mrope = (
             _has_fused_qk_norm_mrope
             and isinstance(self.rotary_emb, MRotaryEmbedding)
@@ -168,6 +187,39 @@ class Qwen3Attention(nn.Module):
             # a `with torch.device('cuda'):` context that changes the default device.
             self._fused_k_scale = torch.tensor(1.0, dtype=torch.float32, device="cpu")
             self._fused_v_scale = torch.tensor(1.0, dtype=torch.float32, device="cpu")
+
+    def maybe_write_kv(self, k: torch.Tensor, v: torch.Tensor, write_info) -> None:
+        """Write freshly-computed image K/V slices to the VLCache store (Stage B).
+
+        ``write_info[layer_id]`` is a list of ``[start, end, uid_k, uid_v]`` slices
+        into the *compressed* K/V (rows the image occupies after reused tokens were
+        dropped). Each slice is a cache-miss image being stored for future reuse.
+
+        R3 (tensor parallelism): each TP rank computes and writes its own KV shard
+        under a rank-scoped uid, so shards never collide and a later read on the same
+        rank retrieves the matching shard. Reuse only fires when every rank's shard is
+        present, so a rank that missed a write simply forces a recompute rather than
+        reading another rank's data.
+        """
+        if write_info is None or self.layer_id not in write_info:
+            return
+        k = k.contiguous()
+        v = v.contiguous()
+        # uids come from write_info (built by the mask-builder), which already scopes
+        # them per TP rank -- do NOT re-suffix here, or write/read uids won't match.
+        for start_idx, end_idx, uid_k, uid_v in write_info[self.layer_id]:
+            # Skip empty slices: at recompute_ratio >= 1.0 the reuse portion is empty
+            # (nothing to cache), which would otherwise store a 0-row tensor.
+            if end_idx < start_idx:
+                continue
+            part_k = k[start_idx : end_idx + 1, :]
+            part_v = v[start_idx : end_idx + 1, :]
+            # No torch.cuda.synchronize() here: write_kv's copy is issued on the current
+            # stream and is ordered after the projection that produced part_k/part_v, so
+            # it observes materialized data without a device-wide flush. The previous
+            # per-layer sync stalled the whole GPU ~num_layers times per prefill.
+            self.mock_kv_manager.write_kv(part_k, uid_k, non_blocking=True)
+            self.mock_kv_manager.write_kv(part_v, uid_v, non_blocking=True)
 
     def forward_prepare_native(self, positions, hidden_states):
         qkv, _ = self.qkv_proj(hidden_states)
@@ -271,6 +323,16 @@ class Qwen3Attention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
+        # --- VLCache (Stage B): reuse-aware attention for this layer ---
+        # Fires only when enabled AND this layer has a reuse plan (recompute_info),
+        # i.e. an image in the batch is a cache hit. Otherwise fall through to stock.
+        if (
+            self.vlcache_enabled
+            and forward_batch.recompute_info is not None
+            and self.layer_id in forward_batch.recompute_info
+        ):
+            return self._forward_vlcache_reuse(positions, hidden_states, forward_batch)
+
         if (
             should_force_bfloat16_dense_tensor_math()
             or hidden_states.dtype != self.qkv_proj.weight.dtype
@@ -286,6 +348,37 @@ class Qwen3Attention(nn.Module):
             and forward_batch.forward_mode.is_decode()
             and not should_disable_fused_qk_norm_mrope()
         )
+
+        # VLCache (Stage B): on a cache MISS this layer must STORE the image's K/V
+        # pre-RoPE (so a later hit can re-RoPE it at the shifted position). The stock
+        # prepare paths RoPE before returning, so we project + write + RoPE inline
+        # here, mirroring the reference. Only fires when there is a write plan for
+        # this layer (an image was a miss this batch).
+        if (
+            self.vlcache_enabled
+            and not use_aiter_fused
+            and forward_batch.write_info is not None
+            and self.layer_id in forward_batch.write_info
+        ):
+            qkv, _ = self.qkv_proj(hidden_states)
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            # Store pre-QK-norm, pre-RoPE K/V under the image's per-layer uids.
+            self.maybe_write_kv(k, v, forward_batch.write_info)
+            # allow_inplace=True: write_kv already took a synchronous .clone() of k, so
+            # the stored copy is independent -- normalizing k in place here is safe and
+            # keeps the FUSED qk-norm kernel (allow_inplace=False forced the slow
+            # unfused fallback on every layer, the dominant cost on cache-miss prefills).
+            q, k = apply_qk_norm(
+                q=q, k=k, q_norm=self.q_norm, k_norm=self.k_norm,
+                head_dim=self.head_dim, alt_stream=self.alt_stream, allow_inplace=True,
+            )
+            q, k = self.rotary_emb(positions, q, k)
+            if should_force_bfloat16_dense_tensor_math() or q.dtype != v.dtype:
+                q = q.to(v.dtype)
+                k = k.to(v.dtype)
+            attn_output = self.attn(q, k, v, forward_batch, save_kv_cache=True)
+            output, _ = self.o_proj(attn_output)
+            return output
 
         if use_aiter_fused:
             q, k, v = self.forward_prepare_aiter_fused_mrope(
@@ -312,6 +405,93 @@ class Qwen3Attention(nn.Module):
             k = k.to(v.dtype)
 
         attn_output = self.attn(q, k, v, forward_batch, save_kv_cache=save_kv_cache)
+        output, _ = self.o_proj(attn_output)
+        return output
+
+    def _forward_vlcache_reuse(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        """Reuse-aware attention for one layer when an image is a cache hit (Stage B).
+
+        Only the *recompute* tokens (compute_mask) get a fresh Q/K/V projection; the
+        reused image K/V come from the store (already loaded into recompute_info by
+        the mask-builder). We:
+          1. project + QK-norm only the recompute tokens (compressed hidden states),
+          2. store the freshly-computed image K/V (maybe_write_kv) BEFORE RoPE,
+          3. re-apply RoPE to the recompute tokens at their *current* positions,
+          4. re-apply RoPE to the reused K at their current positions (pre-RoPE keys
+             were stored, so this rotates them to where the image now sits),
+          5. splice recomputed K/V into the reused K/V at the compute_mask rows,
+          6. run attention with the sparse (reuse-aware) backend path.
+
+        Assumes a uniform recompute ratio across layers (every layer is the
+        max-recompute layer), which is how VLCache is configured here. The
+        non-uniform (per-layer differing ratio) case is not yet supported.
+        """
+        assert (
+            self.is_max_recompute_layer
+        ), "VLCache non-uniform per-layer recompute ratio is not supported yet"
+
+        compute_mask = forward_batch.compute_mask[self.max_recompute_layer_id]
+        k, v = forward_batch.recompute_info[self.layer_id]
+
+        # 1. Project + QK-norm ONLY the recompute tokens.
+        #    The hidden stream is compressed exactly once (at the first reuse layer):
+        #    Qwen3DecoderLayer slices the residual+hidden to the recompute rows after
+        #    self_attn returns, so every downstream reuse layer receives an ALREADY
+        #    compressed tensor. compute_mask stays full batch length (it also masks the
+        #    full-length reused K/V below), so only index hidden when it's still full.
+        if hidden_states.shape[0] == compute_mask.shape[0]:
+            compute_hidden = hidden_states[compute_mask]
+        else:
+            assert hidden_states.shape[0] == int(compute_mask.sum()), (
+                f"VLCache: pre-compressed hidden rows {hidden_states.shape[0]} != "
+                f"recompute rows {int(compute_mask.sum())} (layer {self.layer_id})"
+            )
+            compute_hidden = hidden_states
+        qkv, _ = self.qkv_proj(compute_hidden)
+        q, k_part, v_part = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+
+        # 2. Store the freshly-computed (pre-RoPE) image K/V for future reuse.
+        self.maybe_write_kv(k_part, v_part, forward_batch.write_info)
+
+        # 3. QK-norm, then RoPE the recompute tokens at their current positions.
+        #    allow_inplace=True: write_kv already cloned k_part, so in-place norm is safe
+        #    and keeps the fused kernel.
+        q, k_part = apply_qk_norm(
+            q=q, k=k_part, q_norm=self.q_norm, k_norm=self.k_norm,
+            head_dim=self.head_dim, alt_stream=self.alt_stream, allow_inplace=True,
+        )
+        q, k_part = self.rotary_emb(positions[..., compute_mask], q.contiguous(), k_part.contiguous())
+
+        # 4. The reused K were stored pre-RoPE; QK-norm + RoPE them at CURRENT positions
+        #    (a dummy q satisfies the rotary_emb signature; only k is used).
+        #    Only the REUSED rows (~compute_mask) need this: the recompute rows of k are
+        #    overwritten by k_part in step 5, so RoPE-ing the full batch here wasted work
+        #    on every row that gets discarded. RoPE is per-position independent, so
+        #    processing just the reused subset is exactly equivalent. positions is
+        #    [3, total_tokens] (mRoPE); slicing the reuse columns keeps them aligned.
+        reuse_sel = ~compute_mask
+        k_reuse = k[reuse_sel]
+        dummy_q = torch.empty_like(k_reuse)
+        dummy_q, k_reuse = apply_qk_norm(
+            q=dummy_q, k=k_reuse, q_norm=self.q_norm, k_norm=self.k_norm,
+            head_dim=self.head_dim, alt_stream=self.alt_stream,
+        )
+        _, k_reuse = self.rotary_emb(
+            positions[..., reuse_sel], dummy_q, k_reuse.contiguous()
+        )
+
+        # 5. Assemble the full per-layer K/V: re-RoPE'd reused rows + fresh recompute rows.
+        k[reuse_sel, :] = k_reuse
+        k[compute_mask, :] = k_part
+        v[compute_mask, :] = v_part
+
+        # 6. Attention: q holds only recompute tokens; k/v hold the full image KV.
+        attn_output = self.attn(q, k, v, forward_batch)
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -402,6 +582,22 @@ class Qwen3DecoderLayer(nn.Module):
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
             )
+            # VLCache (Stage B): if this layer reused an image, self_attn returned only
+            # the recompute-token rows, so the residual (full length) must be sliced to
+            # match before the residual add downstream.
+            if (
+                self.self_attn.vlcache_enabled
+                and forward_batch.recompute_info is not None
+                and self.self_attn.layer_id in forward_batch.recompute_info
+                and residual is not None
+            ):
+                # Compress the residual to match self_attn's recompute-only output.
+                # The stream compresses exactly once (first reuse layer); downstream
+                # reuse layers already receive a compressed residual, so only slice
+                # when it is still full batch length.
+                _mask = forward_batch.compute_mask[self.self_attn.max_recompute_layer_id]
+                if residual.shape[0] == _mask.shape[0]:
+                    residual = residual[_mask]
 
         # Fully Connected
         hidden_states, residual = self.layer_communicator.prepare_mlp(

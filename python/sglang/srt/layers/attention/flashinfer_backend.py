@@ -20,6 +20,7 @@ from sglang.kernel_api_logging import debug_kernel_api
 from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
+from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.dp_attention import get_attention_tp_size
@@ -50,6 +51,7 @@ if is_flashinfer_available():
         BatchDecodeWithPagedKVCacheWrapper,
         BatchPrefillWithPagedKVCacheWrapper,
         BatchPrefillWithRaggedKVCacheWrapper,
+        VariableBlockSparseAttentionWrapper,  # VLCache (Stage B): reuse-aware sparse attention
         fast_decode_plan,
     )
     from flashinfer.cascade import merge_state
@@ -286,6 +288,30 @@ class FlashInferAttnBackend(AttentionBackend):
                 )
             )
 
+        # --- VLCache (Stage B: image-KV reuse) setup ---
+        # Enabled by an explicit server flag; default OFF so the stock path is
+        # unchanged. When on, build one VariableBlockSparseAttentionWrapper per
+        # distinct per-layer recompute ratio (the sparse attention used by the
+        # reuse path in _forward_extend_vlcache / update_variable_block_wrapper).
+        self.vlcache_enabled = getattr(
+            model_runner.server_args, "enable_vlcache", False
+        )
+        self.mock_kv_manager = None
+        self.recompute_ratio_in_layer = None
+        self.prefill_wrappers_variable_block = {}
+        if self.vlcache_enabled and not skip_prefill:
+            from sglang.srt.managers.mock_kv_manager import mock_kv_manager
+
+            self.mock_kv_manager = mock_kv_manager
+            num_layers = model_runner.model_config.num_hidden_layers
+            ratio = getattr(model_runner.server_args, "vlcache_recompute_ratio", 0.3)
+            assert 0.0 <= ratio <= 1.0, f"vlcache_recompute_ratio must be in [0,1], got {ratio}"
+            self.recompute_ratio_in_layer = [ratio] * num_layers
+            for r in set(self.recompute_ratio_in_layer):
+                self.prefill_wrappers_variable_block[r] = VariableBlockSparseAttentionWrapper(
+                    self.workspace_buffer
+                )
+
         # Create indices updater
         if not skip_prefill:
             self.indices_updater_prefill = FlashInferIndicesUpdaterPrefill(
@@ -478,6 +504,36 @@ class FlashInferAttnBackend(AttentionBackend):
             )
         else:
             prefix_lens = forward_batch.extend_prefix_lens
+
+            # --- VLCache (Stage B): reuse-aware prefill planning ---
+            # When enabled, build the per-image reuse plan (fills compute_mask /
+            # recompute_info / write_info on forward_batch) and plan the sparse
+            # wrappers, then use them as the prefill metadata. Multimodal prefill
+            # already forces use_ragged=False (paged), which the sparse path needs.
+            if self.vlcache_enabled:
+                extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
+                any_reuse = self.indices_updater_prefill.update_variable_block_wrapper(
+                    prefill_wrappers=self.prefill_wrappers_variable_block,
+                    forward_batch=forward_batch,
+                    seq_lens_sum=forward_batch.seq_lens_sum,
+                    use_ragged=False,
+                )
+                # Only route through the sparse + prefix-merge machinery when an image
+                # actually reused cached KV this batch. On a pure cache MISS (every
+                # image's first occurrence, or a text-only batch) reuse fires for
+                # nothing, yet the sparse path still ran a per-sequence torch-loop
+                # prefix attention on all layers -- ~32ms/prefill of pure overhead that
+                # made misses SLOWER than the stock dense kernel. Misses still STORE
+                # their KV (driven by write_info in the model forward, independent of
+                # which attention kernel runs), so future hits are unaffected. When no
+                # reuse fired we fall through to the stock paged prefill path below.
+                if any_reuse:
+                    self.forward_metadata = PrefillMetadata(
+                        self.prefill_wrappers_variable_block,
+                        False,
+                        extend_no_prefix,
+                    )
+                    return
 
             # Disable ragged wrapper and ensure prefix handling for multimodal and multi-item scoring
             if self.is_multimodal or self.enable_mis:
@@ -786,9 +842,6 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
     ):
-        prefill_wrapper_paged = self.forward_metadata.prefill_wrappers[
-            self._get_wrapper_idx(layer)
-        ]
         cache_loc = (
             forward_batch.out_cache_loc
             if not layer.is_cross_attention
@@ -798,6 +851,34 @@ class FlashInferAttnBackend(AttentionBackend):
         logits_soft_cap = layer.logit_cap
 
         q = q.contiguous()
+
+        # --- VLCache (Stage B): when enabled, forward_metadata.prefill_wrappers is a
+        # dict keyed by recompute ratio (not the stock int-indexed list), so this
+        # path owns the whole prefill. Two sub-cases:
+        #   - this layer has an image-reuse plan -> reuse-aware sparse attention.
+        #   - no reuse this layer (all-miss / non-image) -> the same sparse wrapper,
+        #     which the mask-builder planned as a single full-compute block.
+        # Route to the VLCache reuse-aware path ONLY when the mask-builder installed the
+        # variable-block sparse metadata (i.e. an image actually reused cached KV this
+        # batch). On a pure miss / text-only batch it leaves the stock paged metadata in
+        # place and we fall through to the fast dense kernel below -- the sparse +
+        # per-sequence torch-loop prefix attention is skipped entirely. Identity check
+        # against the sparse-wrapper dict is the routing signal (its keys are float
+        # ratios, vs the stock int-indexed list).
+        if (
+            getattr(self, "vlcache_enabled", False)
+            and not self.forward_metadata.use_ragged
+            and self.forward_metadata.prefill_wrappers
+            is self.prefill_wrappers_variable_block
+        ):
+            return self._forward_extend_vlcache(
+                q, k, v, layer, forward_batch, cache_loc, save_kv_cache
+            )
+
+        prefill_wrapper_paged = self.forward_metadata.prefill_wrappers[
+            self._get_wrapper_idx(layer)
+        ]
+
         if not self.forward_metadata.use_ragged:
             if k is not None:
                 assert v is not None
@@ -889,6 +970,145 @@ class FlashInferAttnBackend(AttentionBackend):
                 )
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
+
+    def _forward_extend_vlcache(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        cache_loc: torch.Tensor,
+        save_kv_cache: bool,
+    ):
+        """VLCache reuse-aware prefill attention for one layer (Stage B).
+
+        ``q``/``k``/``v`` here are the *compressed* tensors: the model
+        (``Qwen3Attention.forward``) has already dropped reused image tokens via
+        ``compute_mask`` and re-applied RoPE at their current positions, and spliced
+        the reused KV (from ``recompute_info``) back into ``k``/``v``. So k/v hold
+        the full per-layer KV (recomputed + reused) and q holds only the tokens that
+        need an attention result. The block-sparse wrapper (planned by
+        update_variable_block_wrapper) computes attention with the correct
+        reuse-aware block mask.
+
+        Two cases mirror the stock path:
+          - no radix prefix: the sparse wrapper handles it in one ``run``.
+          - with prefix (chunked): sparse-attend the current chunk, then attend q
+            against the cached-prefix KV (torch fallback ``_vlcache_prefix_attn``),
+            then ``merge_state`` the two. The torch fallback avoids a known illegal
+            memory access when the paged + variable-block wrappers run together.
+        """
+        sparse_wrapper = self.forward_metadata.prefill_wrappers[
+            self.recompute_ratio_in_layer[layer.layer_id]
+        ]
+
+        if self.forward_metadata.extend_no_prefix:
+            o = sparse_wrapper.run(
+                q.view(-1, layer.tp_q_head_num, layer.head_dim).transpose(0, 1),
+                k.view(-1, layer.tp_k_head_num, layer.head_dim).transpose(0, 1),
+                v.view(-1, layer.tp_v_head_num, layer.head_dim).transpose(0, 1),
+            )
+            o = o.transpose(0, 1).contiguous()
+        else:
+            o1, s1 = sparse_wrapper.run(
+                q.view(-1, layer.tp_q_head_num, layer.head_dim).transpose(0, 1),
+                k.view(-1, layer.tp_k_head_num, layer.head_dim).transpose(0, 1),
+                v.view(-1, layer.tp_v_head_num, layer.head_dim).transpose(0, 1),
+                return_lse=True,
+            )
+            o1 = o1.transpose(0, 1).contiguous()
+            s1 = s1.transpose(0, 1).contiguous()
+
+            o2 = torch.zeros(
+                (o1.shape[0], layer.tp_q_head_num, layer.head_dim), dtype=q.dtype, device=q.device
+            )
+            s2 = torch.zeros((o1.shape[0], layer.tp_q_head_num), dtype=q.dtype, device=q.device)
+            self._vlcache_prefix_attn(
+                q.clone().view(-1, layer.tp_q_head_num, layer.head_dim),
+                o2,
+                s2,
+                forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
+                forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
+                forward_batch.req_to_token_pool.req_to_token,
+                forward_batch.req_pool_indices,
+                forward_batch.seq_lens,
+                forward_batch.extend_seq_lens,
+                forward_batch.orig_seq_lens,
+                layer.head_dim,
+            )
+            o, _ = merge_state(o1, s1, o2, s2)
+
+        if save_kv_cache and k is not None:
+            assert v is not None
+            forward_batch.token_to_kv_pool.set_kv_buffer(
+                layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+            )
+
+        return o.view(-1, layer.tp_q_head_num * layer.head_dim)
+
+    @staticmethod
+    def _vlcache_prefix_attn(
+        query: torch.Tensor,
+        output: torch.Tensor,
+        lse: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        req_to_token: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        extend_seq_lens: torch.Tensor,
+        orig_seq_lens: torch.Tensor,
+        head_dim: int,
+    ) -> None:
+        """Torch attention of the current chunk's q against each request's cached
+        prefix KV, writing output + log-sum-exp in place for a later merge_state.
+
+        A torch implementation (adapted from the native backend) because running the
+        paged wrapper alongside the variable-block sparse wrapper triggers an illegal
+        memory access; this is the correctness-safe fallback for the chunked-prefill
+        case. Per-sequence loop -- correct but not optimized (a known perf follow-up).
+        """
+        query = query.movedim(0, query.dim() - 2)  # [heads, q_tokens, head_dim]
+        num_qo_heads = query.shape[0]
+        num_kv_heads = k_cache.shape[1]
+        start_q, start_kv = 0, 0
+        for seq_idx in range(seq_lens.shape[0]):
+            extend_len_q = int(extend_seq_lens[seq_idx])
+            seq_len_kv = int(seq_lens[seq_idx])
+            end_q = start_q + extend_len_q
+            end_kv = start_kv + seq_len_kv
+            # No cached prefix for this request -> nothing to attend against.
+            if extend_len_q == int(orig_seq_lens[seq_idx]):
+                start_q, start_kv = end_q, end_kv
+                continue
+            # Attend ONLY the cached radix prefix [:prefix_len], NOT the whole sequence.
+            # prefix_len = seq_len - extend_len (tokens already in the pool from prior
+            # turns). The current chunk's intra-attention is handled by the sparse
+            # wrapper; gathering [:seq_len_kv] here re-attended the entire sequence in
+            # unfused torch every layer (~O(chunk*seq) instead of O(chunk*prefix)) --
+            # the dominant HIT-path cost. For a 5-token prefix on a 1116-token seq that
+            # was ~220x too much work.
+            prefix_len_kv = seq_len_kv - extend_len_q
+            if prefix_len_kv <= 0:
+                start_q, start_kv = end_q, end_kv
+                continue
+            per_req_query = query[:, start_q:end_q, :]
+            per_req_tokens = req_to_token[req_pool_indices[seq_idx], :prefix_len_kv]
+            per_req_key = k_cache[per_req_tokens].movedim(0, query.dim() - 2)
+            per_req_value = v_cache[per_req_tokens].movedim(0, query.dim() - 2)
+            if num_qo_heads != num_kv_heads:
+                per_req_key = per_req_key.repeat_interleave(num_qo_heads // num_kv_heads, dim=0)
+                per_req_value = per_req_value.repeat_interleave(num_qo_heads // num_kv_heads, dim=0)
+            attn_scores = torch.matmul(per_req_query, per_req_key.transpose(-2, -1)) / (head_dim**0.5)
+            attn_lse = torch.logsumexp(attn_scores, dim=-1).transpose(0, 1)
+            attn_lse /= 0.6931  # ln(2): flashinfer's lse base differs from torch's
+            attn_weights = torch.softmax(attn_scores, dim=-1)
+            attn_weights[torch.isnan(attn_weights)] = 0
+            per_req_out = torch.matmul(attn_weights, per_req_value).movedim(query.dim() - 2, 0)
+            output[start_q:end_q, :, :] = per_req_out
+            lse[start_q:end_q, :] = attn_lse
+            start_q, start_kv = end_q, end_kv
 
     @debug_kernel_api
     def forward_decode(
@@ -1226,6 +1446,24 @@ class FlashInferIndicesUpdaterPrefill:
         self.token_to_kv_pool_allocator = model_runner.token_to_kv_pool_allocator
         self.prefill_wrapper_ragged = attn_backend.prefill_wrapper_ragged
 
+        # --- VLCache (Stage B: image-KV reuse) ---
+        # Filled from the backend when VLCache is enabled; harmless defaults keep
+        # the stock path unchanged when it is not.
+        self.vlcache_enabled = getattr(attn_backend, "vlcache_enabled", False)
+        self.mock_kv_manager = getattr(attn_backend, "mock_kv_manager", None)
+        self.recompute_ratio_in_layer = getattr(attn_backend, "recompute_ratio_in_layer", None)
+        self.num_hidden_layers = model_runner.model_config.num_hidden_layers
+        self.layer_ids = list(range(self.num_hidden_layers))
+        self.kv_size = self.num_kv_heads * self.head_dim
+        # R3 (TP): scope cache uids per rank so shards never collide. The uid built
+        # here is the SINGLE source of truth for both the hit-check/read and the
+        # write (via write_info), so write and read uids match by construction.
+        self.tp_rank = get_tensor_model_parallel_rank()
+        if self.recompute_ratio_in_layer is not None:
+            self.max_recompute_layer_id = int(
+                torch.argmax(torch.tensor(self.recompute_ratio_in_layer)).item()
+            )
+
         # Dispatch the update function
         if self.attn_backend.dispatch_reason == WrapperDispatch.SLIDING_WINDOW:
             self.update = self.update_sliding_window
@@ -1252,6 +1490,286 @@ class FlashInferIndicesUpdaterPrefill:
     ):
         # Keep the signature for type checking. It will be assigned during runtime.
         raise NotImplementedError()
+
+    def update_variable_block_wrapper(
+        self,
+        prefill_wrappers: dict,
+        forward_batch: ForwardBatch,
+        seq_lens_sum: int,
+        use_ragged: bool,
+    ) -> bool:
+        """Build the VLCache reuse plan for a prefill batch (Stage B).
+
+        Returns ``True`` iff at least one image reused cached KV this batch (a cache
+        hit). The caller uses this to skip the sparse + prefix-merge attention path on
+        pure-miss / text-only batches, which reuse nothing and would only pay overhead.
+
+        For every image in the batch, decide per layer which of its tokens to
+        recompute (the leading ``recompute_ratio`` fraction) vs. reuse from the
+        image-KV store. Produces, on ``forward_batch``:
+          - ``compute_mask[layer]``  bool over the flattened batch, True=recompute.
+          - ``recompute_info[layer]`` = [retrieved_k, retrieved_v] loaded from store.
+          - ``write_info[layer]``    = [[start, end, uid_k, uid_v], ...] slices of the
+                                       *compressed* output to write back to the store.
+          - ``actual_extend_seq_len`` per-request computed-token counts (post-drop).
+        And plans the ``VariableBlockSparseAttentionWrapper`` for each distinct ratio.
+
+        R1 fix (mixed batches): the compressed compute tensor is a single
+        ``hidden_states[compute_mask]`` over the WHOLE batch, so a reused image in
+        request A shifts the positions of every later request's tokens. The write
+        offset for a cache-miss image must therefore subtract the *batch-cumulative*
+        number of dropped (reused) rows before it -- NOT a per-request counter (the
+        reference fork reset it per request, corrupting mixed [hit|miss|...] batches
+        under real batched / tp>1 serving). We keep one running ``batch_dropped``
+        across the whole request loop.
+        """
+        assert not use_ragged, "VLCache reuse path requires paged KV (use_ragged=False)"
+        layer_ids = self.layer_ids
+        device = forward_batch.input_ids.device
+        total_tokens = forward_batch.input_ids.shape[0]
+
+        # Per-layer plan accumulators (concatenated across requests in batch order).
+        block_compute_list = [[] for _ in layer_ids]  # 1=compute block, 0=reuse block
+        compute_num_list = [[] for _ in layer_ids]  # token count of each block
+        valid_cumsum = [[] for _ in layer_ids]  # per-request cumulative #compute-blocks
+        total_cumsum = [[] for _ in layer_ids]  # per-request cumulative #blocks
+        actual_extend_seq_len: List[int] = []
+
+        compute_mask: dict = {}
+        recompute_info: dict = {}
+        write_info: dict = {}
+
+        if not forward_batch.forward_mode.is_extend():
+            return False
+
+        # Per-layer batch-wide compute mask (True=recompute). Cheap (1 byte/token).
+        compute_mask_list = [
+            torch.ones(total_tokens, dtype=torch.bool, device=device) for _ in layer_ids
+        ]
+        # Per-layer reused-KV staging buffers, allocated LAZILY: only a layer that
+        # actually gets a cache hit needs one. Eagerly allocating num_layers*2
+        # full-batch tensors every prefill (even with zero reuse) zeroed ~hundreds of
+        # MB per forward for nothing. `empty` (not `zeros`) is safe: every row is
+        # either filled by get_kv (reuse rows) or overwritten by the recompute splice
+        # before attention reads it, so uninitialized rows are never observed.
+        retrieved_k_list: List[Optional[torch.Tensor]] = [None] * len(layer_ids)
+        retrieved_v_list: List[Optional[torch.Tensor]] = [None] * len(layer_ids)
+
+        def _ensure_staging(layer_id: int) -> None:
+            if retrieved_k_list[layer_id] is None:
+                retrieved_k_list[layer_id] = torch.empty(
+                    (total_tokens, self.kv_size), dtype=self.data_type, device=device
+                )
+                retrieved_v_list[layer_id] = torch.empty(
+                    (total_tokens, self.kv_size), dtype=self.data_type, device=device
+                )
+
+        # R1 FIX: batch-cumulative count of dropped (reused) rows, spanning ALL
+        # requests. Never reset inside the request loop.
+        batch_dropped = 0
+        # Whether any image reused cached KV this batch (drives the caller's decision
+        # to route through the sparse path vs the stock dense kernel).
+        any_reuse = False
+
+        # Structured per-prefill diagnostics (VLCACHE_LOG=1).
+        _log = os.environ.get("VLCACHE_LOG") == "1"
+        _n_img = _n_skip = _n_hit = _n_miss = 0
+
+        # Per-request reused-token counts, folded into each request's cached_tokens
+        # accounting (-> meta_info) by the scheduler's prefill output processing.
+        vlcache_reused_tokens_per_req: List[int] = []
+
+        for mm_inputs, prefix_len, start_loc, seq_len in zip(
+            forward_batch.mm_inputs,
+            forward_batch.extend_prefix_lens_cpu,
+            forward_batch.extend_start_loc.tolist(),
+            forward_batch.extend_seq_lens.tolist(),
+        ):
+            # last_idx tracks, within THIS request, the first not-yet-blocked token.
+            last_idx = 0
+            req_computed = 0  # tokens actually computed for this request (post-drop)
+            req_dropped_start = batch_dropped  # snapshot to derive this request's reuse
+
+            if mm_inputs is not None:
+                for item in mm_inputs.mm_items:
+                    # sglang-miles keys the per-image ViT/embedding cache on item.hash
+                    # (items are already split per-image), so Stage B reuses that same
+                    # per-image hash. One image => one hash, applied to each of its
+                    # placement offsets. (MultimodalDataItem.__getattr__ raises for
+                    # unknown attrs, so read offsets via the always-present field.)
+                    offsets = item.offsets if item.offsets is not None else []
+                    for start_idx, end_idx in offsets:
+                        cur_hash = item.hash
+                        _n_img += 1
+                        start_idx -= prefix_len
+                        end_idx -= prefix_len
+                        if start_idx < 0 or end_idx > seq_len - 1:
+                            # image lies in the cached prefix / outside this chunk:
+                            # radix serves it, VLCache has nothing to do here.
+                            _n_skip += 1
+                            continue
+
+                        # Reuse is ALL-OR-NOTHING per image: an image is a hit only if
+                        # EVERY layer's K/V shard is still in the store. If even one layer
+                        # was evicted (bounded-capacity LRU), a partial hit would leave
+                        # recompute_info populated for some layers but not the anchor
+                        # (max_recompute_layer_id), so the model's reuse forward would
+                        # KeyError reading compute_mask[anchor]. Decide once, up front.
+                        image_hit = all(
+                            (f"{cur_hash}_{lid}_tp{self.tp_rank}_k" in self.mock_kv_manager)
+                            and (f"{cur_hash}_{lid}_tp{self.tp_rank}_v" in self.mock_kv_manager)
+                            for lid in layer_ids
+                        )
+                        _n_hit += int(image_hit)
+                        _n_miss += int(not image_hit)
+
+                        reuse_happened = False
+                        for layer_id in layer_ids:
+                            ratio = self.recompute_ratio_in_layer[layer_id]
+                            total_num = end_idx - start_idx + 1
+                            recompute_num = max(1, int(total_num * ratio))
+                            reuse_start = start_idx + recompute_num
+                            reuse_end = end_idx + 1
+
+                            uid_k = f"{cur_hash}_{layer_id}_tp{self.tp_rank}_k"
+                            uid_v = f"{cur_hash}_{layer_id}_tp{self.tp_rank}_v"
+                            is_hit = image_hit
+
+                            if is_hit:
+                                reuse_happened = True
+                                any_reuse = True
+                                # Allocate this layer's staging buffers on first hit only.
+                                _ensure_staging(layer_id)
+                                # Load reused KV into this request's slice (absolute batch pos).
+                                part_k = retrieved_k_list[layer_id][start_loc + reuse_start : start_loc + reuse_end]
+                                part_v = retrieved_v_list[layer_id][start_loc + reuse_start : start_loc + reuse_end]
+                                # get_kv issues a stream-ordered H2D copy into part_k/part_v;
+                                # no device sync is needed here (the copy is ordered against
+                                # the later attention reads on the same stream). The previous
+                                # per-layer torch.cuda.synchronize() flushed the whole GPU
+                                # pipeline ~num_layers times per request -- the dominant TTFT
+                                # overhead -- for no correctness benefit.
+                                self.mock_kv_manager.get_kv(part_k, uid_k, non_blocking=False)
+                                self.mock_kv_manager.get_kv(part_v, uid_v, non_blocking=False)
+
+                                # Preceding compute block (text + this image's recompute head).
+                                block_compute_list[layer_id].extend([1, 0])
+                                compute_num_list[layer_id].extend(
+                                    [reuse_start - last_idx, reuse_end - reuse_start]
+                                )
+                                if layer_id == layer_ids[0]:
+                                    req_computed += reuse_start - last_idx
+
+                                # Mark reused tokens as "don't compute" in the batch mask.
+                                compute_mask_list[layer_id][start_loc + reuse_start : start_loc + reuse_end] = False
+                                recompute_info.setdefault(
+                                    layer_id, [retrieved_k_list[layer_id], retrieved_v_list[layer_id]]
+                                )
+                                compute_mask.setdefault(layer_id, compute_mask_list[layer_id])
+                            else:
+                                # Cache miss: this image is computed fresh and must be stored.
+                                # Store ONLY the reuse portion (tokens reuse_start..end),
+                                # NOT the recompute head -- a later hit reuses exactly that
+                                # tail (see the is_hit branch, which reads reuse_start..reuse_end).
+                                # Storing the full image would mismatch the read slice.
+                                # Offsets are into the batch-global COMPRESSED tensor: absolute
+                                # position minus all dropped rows before this image.
+                                abs_reuse_start = start_loc + reuse_start
+                                abs_reuse_end = start_loc + end_idx  # inclusive end of image
+                                real_start = abs_reuse_start - batch_dropped
+                                real_end = abs_reuse_end - batch_dropped
+                                write_info.setdefault(layer_id, []).append(
+                                    [real_start, real_end, uid_k, uid_v]
+                                )
+
+                        if reuse_happened:
+                            last_idx = reuse_end
+                            # R1 FIX: accumulate dropped rows across the whole batch.
+                            batch_dropped += reuse_end - reuse_start
+
+            # Trailing compute block for the rest of this request.
+            for layer_id in layer_ids:
+                if last_idx != seq_len:
+                    block_compute_list[layer_id].append(1)
+                    compute_num_list[layer_id].append(seq_len - last_idx)
+                    if layer_id == layer_ids[0]:
+                        req_computed += seq_len - last_idx
+                valid_cumsum[layer_id].append(sum(block_compute_list[layer_id]))
+                total_cumsum[layer_id].append(len(block_compute_list[layer_id]))
+
+            actual_extend_seq_len.append(req_computed if req_computed != 0 else seq_len)
+            vlcache_reused_tokens_per_req.append(batch_dropped - req_dropped_start)
+
+        forward_batch.compute_mask = compute_mask
+        forward_batch.recompute_info = recompute_info
+        forward_batch.write_info = write_info
+        forward_batch.vlcache_reused_tokens_per_req = vlcache_reused_tokens_per_req
+        if actual_extend_seq_len:
+            forward_batch.actual_extend_seq_len = torch.tensor(
+                actual_extend_seq_len, dtype=torch.int32, device=device
+            )
+
+        if _log:
+            n_reuse_layers = len(recompute_info)
+            n_dropped = batch_dropped
+            print(
+                f"[VLCACHE_LOG] tokens={total_tokens} images={_n_img} "
+                f"hit={_n_hit} miss={_n_miss} skip_prefix={_n_skip} "
+                f"any_reuse={any_reuse} reuse_layers={n_reuse_layers} "
+                f"tokens_dropped={n_dropped} "
+                f"path={'SPARSE_REUSE' if any_reuse else 'STOCK_DENSE'}",
+                flush=True,
+            )
+
+        # No image reused cached KV this batch: the sparse wrapper would never run
+        # (caller routes to the stock dense kernel), so skip planning it entirely.
+        # write_info is still set above, so cache-miss images store their KV normally.
+        if not any_reuse:
+            return False
+
+        # Plan the sparse wrapper once per distinct recompute ratio.
+        processed_ratio: dict = {}
+        for layer_id in layer_ids:
+            ratio = self.recompute_ratio_in_layer[layer_id]
+            if ratio in processed_ratio:
+                continue
+            processed_ratio[ratio] = True
+
+            cur_blocks = block_compute_list[layer_id]
+            cur_nums = compute_num_list[layer_id]
+            if not cur_blocks:  # no image in any request this batch
+                cur_blocks = [1]
+                cur_nums = [seq_lens_sum]
+
+            block_num = len(cur_blocks)
+            row_mask = torch.tensor(cur_blocks, dtype=torch.bool)
+            block_mask_map = torch.tril(
+                torch.ones(block_num, block_num, dtype=torch.bool), diagonal=0
+            )[row_mask].to(device)
+            # Mask cross-attention between different requests in the batch.
+            for si, ei in zip(valid_cumsum[layer_id][:-1], total_cumsum[layer_id][:-1]):
+                block_mask_map[si:, :ei] = False
+            block_mask_map = block_mask_map.repeat(self.num_kv_heads, 1, 1)
+
+            block_row_sz = torch.tensor(cur_nums, dtype=torch.int32, device=device)[row_mask]
+            block_row_sz = block_row_sz.repeat(self.num_kv_heads, 1)
+            block_col_sz = torch.tensor([cur_nums], dtype=torch.int32, device=device)
+            block_col_sz = block_col_sz.repeat(self.num_kv_heads, 1)
+
+            prefill_wrappers[ratio].plan(
+                block_mask_map,
+                block_row_sz,
+                block_col_sz,
+                self.num_qo_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                causal=True,
+                non_blocking=True,
+                q_data_type=self.q_data_type,
+                kv_data_type=self.data_type,
+            )
+
+        return True
 
     def update_single_wrapper(
         self,

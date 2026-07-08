@@ -244,6 +244,13 @@ class SchedulerOutputProcessorMixin:
                     # decode req in mixed batch or retracted req
                     continue
 
+                # VLCache: fold this prefill's image-KV reused tokens into the
+                # request's cached-token accounting (-> meta_info), alongside radix
+                # hits. Accumulated per chunk: each chunk's plan reports only the
+                # tokens it reused, so chunked prefills sum to the request total.
+                if result.vlcache_reused_tokens_per_req is not None:
+                    req.cached_tokens += result.vlcache_reused_tokens_per_req[i]
+
                 if req.is_chunked <= 0:
                     req.time_stats.set_prefill_finished_time()
 
