@@ -5169,10 +5169,11 @@ class ServerArgs:
             ], "The expert parallel size must be 1 or the same as the tensor parallel size"
 
         if view.moe_runner_backend == "flashinfer_cutedsl":
+            # modelopt_mixed with non-NVFP4 MoE layers is rejected at load time.
             assert (
-                view.quantization in ["modelopt_fp4"]
+                view.quantization in ["modelopt_fp4", "modelopt_mixed"]
                 or self.get_model_config().nvfp4_moe_meta is not None
-            ), f"Invalid quantization '{view.quantization}'. \nFlashInfer CuteDSL MOE currently supports only: 'modelopt_fp4' or hybrid NVFP4 models."
+            ), f"Invalid quantization '{view.quantization}'. \nFlashInfer CuteDSL MOE currently supports only: 'modelopt_fp4', 'modelopt_mixed' (with NVFP4 MoE layers), or hybrid NVFP4 models."
             assert view.ep_size in [
                 1,
                 self.tp_size,
