@@ -2,11 +2,23 @@ from typing import Optional, Tuple, Union
 
 import torch
 
+from sglang.srt.layers.attention.fla.chunk_tree_verify import (
+    advance_ssm_states_along_accept_paths,
+    build_tree_ancestor_masks,
+    chunk_gated_delta_rule_tree_verify,
+    derive_tree_parent_tokens,
+    tree_mask_capacity,
+    tree_verify_conv1d_update,
+)
 from sglang.srt.layers.attention.fla.fused_gdn_gating import fused_gdn_gating
+from sglang.srt.layers.attention.fla.l2norm import l2norm_fwd, l2norm_fwd_strided
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
 from sglang.srt.layers.attention.linear.utils import (
     LinearAttnKernelBackend,
+    gdn_chunk_tree_verify_enabled,
+    gdn_dflash_tfm_tree_verify_enabled,
+    gdn_fused_tree_verify_enabled,
     get_linear_attn_decode_backend,
     get_linear_attn_prefill_backend,
 )
@@ -287,6 +299,30 @@ class GDNAttnBackend(MambaAttnBackendBase):
         self.verify_intermediate_state_indices = torch.arange(
             self.req_to_token_pool.size, dtype=torch.int32, device=model_runner.device
         )
+        self.chunk_tree_verify_active = (
+            gdn_chunk_tree_verify_enabled(model_runner.server_args)
+            and not model_runner.is_draft_worker
+        )
+        self.fused_tree_verify_active = (
+            self.chunk_tree_verify_active
+            and gdn_fused_tree_verify_enabled(model_runner.server_args)
+        )
+        if (
+            model_runner.server_args.speculative_gdn_verify_kernel == "chunk"
+            and not model_runner.is_draft_worker
+            and not self.chunk_tree_verify_active
+            and (model_runner.server_args.speculative_num_draft_tokens or 0) > 0
+        ):
+            msg = (
+                "speculative_gdn_verify_kernel=chunk requested but unsupported "
+                f"(uses_tree_spec_inputs={self.uses_tree_spec_inputs}, "
+                f"num_draft_tokens={model_runner.server_args.speculative_num_draft_tokens})."
+            )
+            if gdn_dflash_tfm_tree_verify_enabled(model_runner.server_args):
+                raise ValueError(msg + " Refusing recurrent fallback for DFLASH_TFM.")
+            rank0_log(msg + " Falling back to the recurrent verify kernel.")
+        self.tree_verify_stash = None
+        self.last_target_verify_used_tree = False
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         super().init_forward_metadata(forward_batch)
@@ -428,22 +464,47 @@ class GDNAttnBackend(MambaAttnBackendBase):
         if is_target_verify:
             batch_size = seq_len // forward_batch.spec_info.draft_token_num
             draft_token_num = forward_batch.spec_info.draft_token_num
+            tree_verify_request = (
+                self.chunk_tree_verify_active and retrieve_parent_token is not None
+            )
+            self.last_target_verify_used_tree = tree_verify_request
             mixed_qkv_reshaped = mixed_qkv.view(
                 batch_size, draft_token_num, -1
             ).transpose(1, 2)
-            mixed_qkv_processed = causal_conv1d_update(
-                mixed_qkv_reshaped,
-                conv_states,
-                layer.conv_weights,
-                layer.bias,
-                layer.activation,
-                conv_state_indices=cache_indices[:batch_size],
-                intermediate_conv_window=intermediate_conv_window_cache,
-                intermediate_state_indices=intermediate_state_indices[:batch_size],
-                retrieve_next_token=retrieve_next_token,
-                retrieve_next_sibling=retrieve_next_sibling,
-                retrieve_parent_token=retrieve_parent_token,
-            )
+            if tree_verify_request:
+                self._ensure_tree_verify_step_metadata(
+                    layer=layer,
+                    batch_size=batch_size,
+                    draft_token_num=draft_token_num,
+                    retrieve_next_token=retrieve_next_token,
+                    retrieve_next_sibling=retrieve_next_sibling,
+                    retrieve_parent_token=retrieve_parent_token,
+                )
+                mixed_qkv_processed = tree_verify_conv1d_update(
+                    mixed_qkv_reshaped,
+                    conv_states,
+                    layer.conv_weights,
+                    layer.bias,
+                    layer.activation,
+                    conv_state_indices=cache_indices[:batch_size],
+                    parent_tokens=retrieve_parent_token,
+                    intermediate_conv_window=intermediate_conv_window_cache,
+                    intermediate_state_indices=intermediate_state_indices[:batch_size],
+                )
+            else:
+                mixed_qkv_processed = causal_conv1d_update(
+                    mixed_qkv_reshaped,
+                    conv_states,
+                    layer.conv_weights,
+                    layer.bias,
+                    layer.activation,
+                    conv_state_indices=cache_indices[:batch_size],
+                    intermediate_conv_window=intermediate_conv_window_cache,
+                    intermediate_state_indices=intermediate_state_indices[:batch_size],
+                    retrieve_next_token=retrieve_next_token,
+                    retrieve_next_sibling=retrieve_next_sibling,
+                    retrieve_parent_token=retrieve_parent_token,
+                )
             mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
         else:
             mixed_qkv = mixed_qkv.transpose(0, 1)
@@ -490,22 +551,51 @@ class GDNAttnBackend(MambaAttnBackendBase):
             value = value.view(1, actual_seq_len, layer.num_v_heads, layer.head_v_dim)
 
         if is_target_verify:
-            core_attn_out = self.kernel_dispatcher.target_verify(
-                A_log=layer.A_log,
-                dt_bias=layer.dt_bias,
-                q=query,
-                k=key,
-                v=value,
-                a=a,
-                b=b,
-                ssm_states=ssm_states,
-                cache_indices=cache_indices,
-                query_start_loc=query_start_loc,
-                intermediate_states_buffer=intermediate_state_cache,
-                intermediate_state_indices=intermediate_state_indices,
-                cache_steps=forward_batch.spec_info.draft_token_num,
-                retrieve_parent_token=retrieve_parent_token,
-            )
+            if tree_verify_request and self.fused_tree_verify_active:
+                core_attn_out = self._fused_tree_verify_forward(
+                    layer=layer,
+                    batch_size=batch_size,
+                    draft_token_num=draft_token_num,
+                    query=query,
+                    key=key,
+                    value=value,
+                    a=a,
+                    b=b,
+                    ssm_states=ssm_states,
+                    cache_indices=cache_indices,
+                    retrieve_parent_token=retrieve_parent_token,
+                )
+            elif tree_verify_request:
+                core_attn_out = self._chunk_tree_verify_forward(
+                    layer=layer,
+                    batch_size=batch_size,
+                    draft_token_num=draft_token_num,
+                    query=query,
+                    key=key,
+                    value=value,
+                    a=a,
+                    b=b,
+                    ssm_states=ssm_states,
+                    cache_indices=cache_indices,
+                    retrieve_parent_token=retrieve_parent_token,
+                )
+            else:
+                core_attn_out = self.kernel_dispatcher.target_verify(
+                    A_log=layer.A_log,
+                    dt_bias=layer.dt_bias,
+                    q=query,
+                    k=key,
+                    v=value,
+                    a=a,
+                    b=b,
+                    ssm_states=ssm_states,
+                    cache_indices=cache_indices,
+                    query_start_loc=query_start_loc,
+                    intermediate_states_buffer=intermediate_state_cache,
+                    intermediate_state_indices=intermediate_state_indices,
+                    cache_steps=forward_batch.spec_info.draft_token_num,
+                    retrieve_parent_token=retrieve_parent_token,
+                )
         else:
             g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
             core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
@@ -531,3 +621,241 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 )
 
         return core_attn_out
+
+    def _ensure_tree_verify_step_metadata(
+        self,
+        layer: RadixLinearAttention,
+        batch_size: int,
+        draft_token_num: int,
+        retrieve_next_token: torch.Tensor,
+        retrieve_next_sibling: torch.Tensor,
+        retrieve_parent_token: torch.Tensor,
+    ):
+        """Once per verify step, derive tree parents and ancestor bitsets
+        shared by every GDN layer's tree kernels."""
+        if self.req_to_token_pool.mamba_map[layer.layer_id] != 0:
+            return
+        if self.tree_verify_stash is None:
+            self.tree_verify_stash = TreeVerifyStash(
+                num_layers=len(self.req_to_token_pool.mamba_map),
+                num_slots=self.req_to_token_pool.mamba_pool.mamba_cache.intermediate_ssm.shape[
+                    1
+                ],
+                T=draft_token_num,
+                Hg=layer.num_k_heads,
+                K=layer.head_k_dim,
+                H=layer.num_v_heads,
+                V=layer.head_v_dim,
+                dtype=self.req_to_token_pool.mamba_pool.mamba_cache.conv[0].dtype,
+                device=retrieve_parent_token.device,
+            )
+        derive_tree_parent_tokens(
+            retrieve_next_token,
+            retrieve_next_sibling,
+            retrieve_parent_token,
+            draft_token_num,
+        )
+        build_tree_ancestor_masks(
+            retrieve_parent_token[:batch_size],
+            draft_token_num,
+            out=self.tree_verify_stash.ancestor_masks,
+        )
+        if self.fused_tree_verify_active:
+            from sglang.srt.layers.attention.fla.gdn_tree_fused import (
+                alloc_tree_structure_buffers,
+                build_tree_structure_into,
+            )
+
+            if getattr(self, "_fused_tree_struct", None) is None:
+                self._fused_tree_struct = alloc_tree_structure_buffers(
+                    batch_size, draft_token_num, retrieve_parent_token.device
+                )
+            build_tree_structure_into(
+                retrieve_parent_token[:batch_size].view(batch_size, draft_token_num),
+                self._fused_tree_struct,
+            )
+
+    def _fused_tree_verify_forward(
+        self,
+        layer,
+        batch_size: int,
+        draft_token_num: int,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+        retrieve_parent_token: torch.Tensor,
+    ) -> torch.Tensor:
+        """Verify draft trees with the fused K0-K3 lag-folding kernels.
+
+        Same stash contract as _chunk_tree_verify_forward: writes no SSM
+        state; per-layer (k, v, g, beta) are stashed so the commit replays
+        the accept path. Output kernel differs only.
+        """
+        from sglang.srt.layers.attention.fla.gdn_tree_triton import (
+            tree_gdn_triton_verify,
+        )
+
+        bs, T = batch_size, draft_token_num
+        H, V = layer.num_v_heads, layer.head_v_dim
+        Hg, K = layer.num_k_heads, layer.head_k_dim
+
+        stash = self.tree_verify_stash
+        assert stash is not None and T == stash.T and bs <= stash.k.shape[1]
+        layer_ordinal = self.req_to_token_pool.mamba_map[layer.layer_id]
+
+        # Gating, l2norm and the value copy land directly in the stash: the
+        # verify kernel reads the stash-backed views and the commit replays
+        # from the same memory, so the four per-layer stash copies vanish.
+        # l2norm reads the strided projection slices in place, so q/k need no
+        # contiguous() copies either.
+        fused_gdn_gating(
+            layer.A_log,
+            a,
+            b,
+            layer.dt_bias,
+            out_g=stash.g[layer_ordinal, :bs],
+            out_beta=stash.beta[layer_ordinal, :bs],
+        )
+        query = l2norm_fwd_strided(query)
+        key = l2norm_fwd_strided(
+            key, out=stash.k[layer_ordinal, :bs].view(bs * T, Hg * K)
+        ).view(key.shape)
+        stash_v = stash.v[layer_ordinal, :bs].view(bs, T, H, V)
+        stash_v.copy_(value.view(bs, T, H, V))
+        value = stash_v
+
+        tree = self._fused_tree_struct
+        assert tree is not None, "fused tree structure metadata missing"
+        o = tree_gdn_triton_verify(
+            layer.A_log,
+            a.view(bs, T, H),
+            layer.dt_bias,
+            1.0,
+            20.0,
+            query.view(bs, T, Hg, K),
+            key.view(bs, T, Hg, K),
+            value.view(bs, T, H, V),
+            b.view(bs, T, H),
+            ssm_states,
+            cache_indices[:bs].long(),
+            tree,
+            use_qk_l2norm_in_kernel=False,
+            precision="tf32",
+        )
+        return o.view(1, bs * T, H, V)
+
+    def _chunk_tree_verify_forward(
+        self,
+        layer: RadixLinearAttention,
+        batch_size: int,
+        draft_token_num: int,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+        retrieve_parent_token: torch.Tensor,
+    ) -> torch.Tensor:
+        """Verify draft trees with the block-quadratic kernel.
+
+        Writes no SSM state: per-layer (k, v, g, beta) are stashed so that
+        advance_ssm_states_after_verify can replay the accept path once the
+        verified tokens are known.
+        """
+        bs, T = batch_size, draft_token_num
+        H, V = layer.num_v_heads, layer.head_v_dim
+        Hg, K = layer.num_k_heads, layer.head_k_dim
+
+        g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
+        # q/k/v are views of the fused qkv projection.
+        query = l2norm_fwd(query.contiguous())
+        key = l2norm_fwd(key.contiguous())
+        value = value.contiguous()
+
+        stash = self.tree_verify_stash
+        assert stash is not None and T == stash.T and bs <= stash.k.shape[1]
+        layer_ordinal = self.req_to_token_pool.mamba_map[layer.layer_id]
+
+        stash.k[layer_ordinal, :bs].copy_(key.view(bs, T, Hg * K))
+        stash.v[layer_ordinal, :bs].copy_(value.view(bs, T, H * V))
+        stash.g[layer_ordinal, :bs].copy_(g.view(bs, T, H))
+        stash.beta[layer_ordinal, :bs].copy_(beta.view(bs, T, H))
+
+        o = chunk_gated_delta_rule_tree_verify(
+            q=query.view(bs, T, Hg, K),
+            k=key.view(bs, T, Hg, K),
+            v=value.view(bs, T, H, V),
+            g=g.view(bs, T, H),
+            beta=beta.view(bs, T, H),
+            ancestor_masks=stash.ancestor_masks[:bs],
+            initial_state_source=ssm_states,
+            initial_state_indices=cache_indices[:bs],
+            scale=layer.head_k_dim**-0.5,
+            use_qk_l2norm_in_kernel=False,
+        )
+        return o.view(1, bs * T, H, V)
+
+    def advance_ssm_states_after_verify(
+        self,
+        last_correct_steps: torch.Tensor,
+        track_slots: Optional[torch.Tensor],
+        track_steps: Optional[torch.Tensor],
+    ):
+        """Commit SSM states along each request's accepted tree path."""
+        stash = self.tree_verify_stash
+        assert stash is not None, "no tree verify forward preceded the state commit"
+        bs = last_correct_steps.shape[0]
+        advance_ssm_states_along_accept_paths(
+            k_stash=stash.k,
+            v_stash=stash.v,
+            g_stash=stash.g,
+            beta_stash=stash.beta,
+            ssm_states=self.req_to_token_pool.mamba_pool.mamba_cache.temporal,
+            cache_indices=self.forward_metadata.mamba_cache_indices[:bs],
+            ancestor_masks=stash.ancestor_masks,
+            last_correct_steps=last_correct_steps,
+            T=stash.T,
+            Hg=stash.Hg,
+            K=stash.K,
+            V=stash.V,
+            track_steps=track_steps,
+            track_slots=track_slots,
+        )
+
+
+class TreeVerifyStash:
+    """Per-layer verify activations kept alive for post-accept state advance."""
+
+    def __init__(
+        self,
+        num_layers: int,
+        num_slots: int,
+        T: int,
+        Hg: int,
+        K: int,
+        H: int,
+        V: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ):
+        self.T, self.Hg, self.K, self.V = T, Hg, K, V
+        self.k = torch.zeros(
+            num_layers, num_slots, T, Hg * K, dtype=dtype, device=device
+        )
+        self.v = torch.zeros(num_layers, num_slots, T, H * V, dtype=dtype, device=device)
+        self.g = torch.zeros(
+            num_layers, num_slots, T, H, dtype=torch.float32, device=device
+        )
+        self.beta = torch.zeros(
+            num_layers, num_slots, T, H, dtype=torch.float32, device=device
+        )
+        BT = tree_mask_capacity(T)
+        self.ancestor_masks = torch.zeros(
+            num_slots, BT, BT // 64, dtype=torch.int64, device=device
+        )

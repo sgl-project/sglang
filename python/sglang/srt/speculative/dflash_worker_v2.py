@@ -1123,18 +1123,28 @@ class DFlashWorkerV2(BaseSpecWorker):
         batch: ScheduleBatch,
         seq_lens_pre_verify: torch.Tensor,
         commit_lens: torch.Tensor,
+        accept_leaf_slots: Optional[torch.Tensor] = None,
     ) -> None:
         """Commit Mamba intermediate states for accepted verify steps.
 
         During TARGET_VERIFY, Mamba kernels run with `disable_state_update=True` and
         cache per-step intermediate states. After acceptance, we need to commit the
-        state corresponding to each request's last accepted step.
+        state corresponding to each request's last accepted step. Chain drafts use
+        `commit_lens - 1`; tree drafts must pass the accepted leaf's tree-local slot.
         """
         attn_backend = self.target_worker.model_runner.attn_backend
         if not hasattr(attn_backend, "update_mamba_state_after_mtp_verify"):
             return
 
-        last_correct_step_indices = commit_lens.to(torch.int64) - 1
+        if accept_leaf_slots is not None:
+            if batch.mamba_track_indices is not None:
+                raise NotImplementedError(
+                    "Mamba state tracking (radix prefix cache) is not supported "
+                    "with tree verify inputs; run with --disable-radix-cache."
+                )
+            last_correct_step_indices = accept_leaf_slots.to(torch.int64)
+        else:
+            last_correct_step_indices = commit_lens.to(torch.int64) - 1
         mamba_steps_to_track = None
 
         if batch.mamba_track_indices is not None:

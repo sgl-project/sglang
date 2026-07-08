@@ -33,6 +33,7 @@ class SpeculativeAlgorithm(Enum):
     """
 
     DFLASH = auto()
+    DFLASH_TFM = auto()
     EAGLE = auto()
     EAGLE3 = auto()
     FROZEN_KV_MTP = auto()
@@ -107,7 +108,13 @@ class SpeculativeAlgorithm(Enum):
         return self == SpeculativeAlgorithm.FROZEN_KV_MTP
 
     def is_dflash(self) -> bool:
-        return self == SpeculativeAlgorithm.DFLASH
+        return self in (
+            SpeculativeAlgorithm.DFLASH,
+            SpeculativeAlgorithm.DFLASH_TFM,
+        )
+
+    def is_dflash_tfm(self) -> bool:
+        return self == SpeculativeAlgorithm.DFLASH_TFM
 
     def is_standalone(self) -> bool:
         return self == SpeculativeAlgorithm.STANDALONE
@@ -196,6 +203,11 @@ class SpeculativeAlgorithm(Enum):
         assert (
             not self.is_none()
         ), "Cannot create worker for NONE speculative algorithm."
+
+        if self.is_dflash_tfm():
+            from sglang.srt.speculative.dflash_tfm import DFlashTfmWorker
+
+            return DFlashTfmWorker
 
         if self.is_dflash():
             # V2 worker drives both overlap and non-overlap (scheduler runs it
@@ -298,6 +310,8 @@ def create_dummy_verify_input(
     custom_mask: torch.Tensor,
     num_tokens_per_bs: int,
     is_draft_worker: bool,
+    batch_size: int = 1,
+    device: Optional[torch.device] = None,
 ) -> Optional[SpecInput]:
     """Dummy verify ``SpecInput`` for CUDA-graph capture (per-algorithm dispatch)."""
     from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
@@ -327,12 +341,39 @@ def create_dummy_verify_input(
     elif spec_algorithm.is_dflash():
         from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 
-        # Dummy warmup only needs shape metadata; avoid forcing custom-mask mode.
+        is_tfm_tree = (
+            hasattr(spec_algorithm, "is_dflash_tfm")
+            and spec_algorithm.is_dflash_tfm()
+            and server_args.speculative_num_draft_tokens
+            != server_args.speculative_dflash_block_size
+        )
+        use_tree_metadata = is_tfm_tree and not is_draft_worker
+        if device is None:
+            device = custom_mask.device
+        retrieve_next_token = retrieve_next_sibling = None
+        if use_tree_metadata:
+            retrieve_next_token = torch.full(
+                (batch_size, num_tokens_per_bs),
+                -1,
+                dtype=torch.int64,
+                device=device,
+            )
+            if num_tokens_per_bs > 1:
+                retrieve_next_token[:, :-1] = torch.arange(
+                    1, num_tokens_per_bs, dtype=torch.int64, device=device
+                )
+            retrieve_next_sibling = torch.full_like(retrieve_next_token, -1)
+
+        # Tree-mode DFlash dummy forwards must carry retrieve metadata; otherwise
+        # GDN would fall back to recurrent verify while tree-mode cache sizing is
+        # active. Chain-mode dummies only need shape metadata, so no custom mask.
         spec_info = DFlashVerifyInput(
             draft_token=None,
             positions=None,
             draft_token_num=server_args.speculative_num_draft_tokens,
-            custom_mask=None,
+            custom_mask=custom_mask if use_tree_metadata else None,
+            retrieve_next_token=retrieve_next_token,
+            retrieve_next_sibling=retrieve_next_sibling,
             capture_hidden_mode=(
                 CaptureHiddenMode.NULL if is_draft_worker else CaptureHiddenMode.FULL
             ),

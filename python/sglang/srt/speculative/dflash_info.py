@@ -36,6 +36,13 @@ class DFlashVerifyInput(SpecInput):
     # Custom attention "allow mask" for TARGET_VERIFY in backends that require it.
     # Semantics follow SGLang speculative conventions: True means the (q, k) pair is allowed.
     custom_mask: torch.Tensor | None = None
+    # Draft-side proposal sample and its probability per draft slot, consumed by
+    # non-greedy (speculative-sampling) verification.
+    proposal_tokens: torch.Tensor | None = None
+    proposal_probs: torch.Tensor | None = None
+    # Tree metadata (DFLASH_TFM tree verify); None for linear-chain DFlash.
+    retrieve_next_token: torch.Tensor | None = None
+    retrieve_next_sibling: torch.Tensor | None = None
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.FULL
 
     # Shape info for padding (e.g., DP attention / CUDA graph).

@@ -459,14 +459,27 @@ class MambaPool:
                     )
                 # Cache intermediate SSM states per draft token during target verify
                 # Shape: [num_layers, size + 1, speculative_num_draft_tokens, HV, K, V]
+                from sglang.srt.layers.attention.linear.utils import (
+                    gdn_chunk_tree_verify_enabled,
+                    gdn_dflash_tfm_tree_verify_enabled,
+                )
+                from sglang.srt.server_args import get_global_server_args
+
+                # The chunk tree-verify path never caches per-draft-token SSM
+                # states (it commits by replaying the accepted path), so the
+                # intermediate SSM cache can be zero-sized.
+                if gdn_chunk_tree_verify_enabled(get_global_server_args()):
+                    intermediate_temporal_state_shape = (0, 0, 0)
+                else:
+                    intermediate_temporal_state_shape = temporal_state_shape
                 intermediate_ssm_state_cache = torch.zeros(
                     size=(
                         num_mamba_layers,
                         spec_state_size + 1,
                         speculative_num_draft_tokens,
-                        temporal_state_shape[0],
-                        temporal_state_shape[1],
-                        temporal_state_shape[2],
+                        intermediate_temporal_state_shape[0],
+                        intermediate_temporal_state_shape[1],
+                        intermediate_temporal_state_shape[2],
                     ),
                     dtype=ssm_dtype,
                     device="cuda",
@@ -492,9 +505,13 @@ class MambaPool:
                 # `conv_window_dedup_enabled` for the full rationale. The
                 # `fused_conv_window_scatter_with_mask` scatter is layout-agnostic,
                 # so the dense fallback reads correctly through the same code path.
+                # DFLASH_TFM tree verify walks per-token tree ancestors (like
+                # EAGLE topk > 1) while speculative_eagle_topk stays forced to
+                # 1, so the dedup safety check above cannot see it -- aliased
+                # columns would mix sibling branches. Force the dense layout.
                 dedup_conv_window = conv_window_dedup_enabled(
                     _is_npu, _is_cpu, speculative_eagle_topk
-                )
+                ) and not gdn_dflash_tfm_tree_verify_enabled(get_global_server_args())
                 self._intermediate_conv_window_phys = []
                 if dedup_conv_window:
                     intermediate_conv_window_cache = []

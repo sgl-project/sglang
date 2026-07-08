@@ -72,12 +72,19 @@ def l2norm_fwd_kernel(
 
 
 def l2norm_fwd(
-    x: torch.Tensor, eps: float = 1e-6, output_dtype: Optional[torch.dtype] = None
+    x: torch.Tensor,
+    eps: float = 1e-6,
+    output_dtype: Optional[torch.dtype] = None,
+    out: Optional[torch.Tensor] = None,
 ):
     x_shape_og = x.shape
     x = x.view(-1, x.shape[-1])
-    # allocate output
-    if output_dtype is None:
+    # allocate output (or write straight into a caller-provided dense buffer,
+    # e.g. the tree-verify stash, skipping a separate copy)
+    if out is not None:
+        y = out.view(-1, x.shape[-1])
+        assert y.shape == x.shape and y.is_contiguous()
+    elif output_dtype is None:
         y = torch.empty_like(x)
     else:
         y = torch.empty_like(x, dtype=output_dtype)
@@ -120,6 +127,69 @@ def l2norm_fwd(
         )
 
     return y.view(x_shape_og)
+
+
+@triton.jit(do_not_specialize=["R"])
+def l2norm_fwd_kernel_strided(
+    x,
+    y,
+    eps,
+    R,
+    stride_t,
+    stride_h,
+    H: tl.constexpr,
+    D: tl.constexpr,
+    BD: tl.constexpr,
+):
+    """Row-wise L2 norm where rows live at two-level strides (token, head):
+    normalizes strided q/k projection slices without a contiguous() copy.
+    Output is dense [R, D]."""
+    i_r = tl.program_id(0)
+    i_t = i_r // H
+    i_h = i_r % H
+    cols = tl.arange(0, BD)
+    mask = cols < D
+    b_x = tl.load(
+        x + i_t * stride_t + i_h * stride_h + cols, mask=mask, other=0.0
+    ).to(tl.float32)
+    b_y = b_x / tl.sqrt(tl.sum(b_x * b_x, 0) + eps)
+    tl.store(y + i_r * D + cols, b_y.to(y.dtype.element_ty), mask=mask)
+
+
+def l2norm_fwd_strided(
+    x: torch.Tensor, eps: float = 1e-6, out: Optional[torch.Tensor] = None
+):
+    """L2-normalize the last dim of a [..., H, D] tensor whose last dim is
+    dense but whose leading dims may be strided (e.g. q/k slices of the fused
+    qkv projection output). Returns a contiguous tensor of x's shape (or
+    writes into the dense buffer `out`)."""
+    assert x.stride(-1) == 1
+    if x.dim() == 4:
+        assert x.shape[0] == 1
+        _, T, H, D = x.shape
+        stride_t, stride_h = x.stride(1), x.stride(2)
+    else:
+        assert x.dim() == 3
+        T, H, D = x.shape
+        stride_t, stride_h = x.stride(0), x.stride(1)
+    if out is not None:
+        y = out.view(-1, D)
+        assert y.shape == (T * H, D) and y.is_contiguous()
+    else:
+        y = torch.empty(T * H, D, dtype=x.dtype, device=x.device)
+    l2norm_fwd_kernel_strided[(T * H,)](
+        x=x,
+        y=y,
+        eps=eps,
+        R=T * H,
+        stride_t=stride_t,
+        stride_h=stride_h,
+        H=H,
+        D=D,
+        BD=triton.next_power_of_2(D),
+        num_warps=4 if D <= 512 else 8,
+    )
+    return y.view(x.shape) if out is None else out
 
 
 class L2NormFunction(torch.autograd.Function):

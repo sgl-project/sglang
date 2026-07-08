@@ -48,14 +48,24 @@ def fused_gdn_gating(
     dt_bias: torch.Tensor,
     beta: float = 1.0,
     threshold: float = 20.0,
+    out_g: torch.Tensor = None,
+    out_beta: torch.Tensor = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     batch, num_heads = a.shape
     seq_len = 1
     stride_a = a.stride(0)
     stride_b = b.stride(0)
     grid = (batch, seq_len, triton.cdiv(num_heads, 8))
-    g = torch.empty(1, batch, num_heads, dtype=torch.float32, device=a.device)
-    beta_output = torch.empty(1, batch, num_heads, dtype=torch.float32, device=b.device)
+    if out_g is not None:
+        g = out_g.view(1, batch, num_heads)
+        beta_output = out_beta.view(1, batch, num_heads)
+        assert g.is_contiguous() and beta_output.is_contiguous()
+        assert g.dtype == torch.float32 and beta_output.dtype == torch.float32
+    else:
+        g = torch.empty(1, batch, num_heads, dtype=torch.float32, device=a.device)
+        beta_output = torch.empty(
+            1, batch, num_heads, dtype=torch.float32, device=b.device
+        )
     fused_gdn_gating_kernel[grid](
         g,
         beta_output,

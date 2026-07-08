@@ -1485,7 +1485,7 @@ class ServerArgs:
     # -------------------------------------------------------------------------
     speculative_algorithm: A[
         Optional[str],
-        "Speculative algorithm. Builtins: EAGLE, EAGLE3, NEXTN, STANDALONE, NGRAM, DFLASH. Or any name registered via `SpeculativeAlgorithm.register`.",
+        "Speculative algorithm. Builtins: EAGLE, EAGLE3, NEXTN, STANDALONE, NGRAM, DFLASH, DFLASH_TFM. Or any name registered via `SpeculativeAlgorithm.register`.",
     ] = None
     speculative_draft_model_path: A[
         Optional[str],
@@ -1521,6 +1521,25 @@ class ServerArgs:
         Optional[int],
         "DFLASH only. Block size (verify window length). Alias of --speculative-num-draft-tokens for DFLASH.",
     ] = None
+    speculative_dflash_tfm_path: A[
+        Optional[str],
+        "DFLASH_TFM only. Path to the Weaver draft-adapter checkpoint (a .pth file holding {config, state_dict}).",
+    ] = None
+    speculative_dflash_tfm_tree_budget: A[
+        Optional[int],
+        "DFLASH_TFM only. Number of non-root proposal tree nodes (target verify tokens = budget + 1). Defaults to 128.",
+    ] = None
+    speculative_dflash_tfm_candidate_pool_size: A[
+        Optional[int],
+        "DFLASH_TFM only. Per-depth top-k candidate pool taken from the DFlash marginals. Defaults to the Weaver checkpoint's pool size.",
+    ] = None
+    speculative_gdn_verify_kernel: A[
+        str,
+        Arg(
+            help="GDN/hybrid-linear targets only. Kernel used by linear-attention layers during target verify: 'recurrent' steps draft tokens sequentially and caches one SSM state per draft token; 'chunk' verifies the whole draft tree with the chunk-form kernels and commits states along the accepted path only.",
+            choices=["recurrent", "chunk"],
+        ),
+    ] = "recurrent"
     speculative_accept_threshold_single: A[
         float,
         "Accept a draft token if its probability in the target model is greater than this threshold.",

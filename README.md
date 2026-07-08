@@ -1,3 +1,214 @@
+<div style="display:flex;align-items:center;justify-content:space-between;gap:20px;flex-wrap:wrap">
+  <div style="flex:1;min-width:260px">
+    <h1 style="margin:0 0 12px">Trees from Marginals: Weaver</h1>
+    <p style="margin:0">Weaver is a lightweight autoregressive Transformer that turns DFlash marginal predictions into proposal trees. With rollback-free Gated Delta Net tree verification, DFlash-TfM reaches 392.8 tokens/s/sequence on Qwen3.6-27B on a single B200: 4.37x over autoregressive decoding and 24.7% over tuned DFlash.</p>
+    <p style="margin:10px 0 0;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+      <a href="#"><img src="https://img.shields.io/badge/arXiv-coming%20soon-b31b1b?style=for-the-badge&logo=arxiv&logoColor=white" alt="arXiv coming soon"></a>
+      <a href="#"><img src="https://img.shields.io/badge/PDF-coming%20soon-374151?style=for-the-badge&logo=readthedocs&logoColor=white" alt="PDF coming soon"></a>
+    </p>
+  </div>
+  <img src="https://assets.trymirai.com/images/logo/ml_small_logo.svg" alt="Mirai Labs" width="64" height="64" style="width:80px;height:80px;object-fit:contain;flex:0 0 auto">
+</div>
+
+### What is in this repo
+
+This repository contains the Weaver checkpoint for DFlash-TfM, short for DFlash-TreeFromMarginals. It is not a standalone language model: Weaver is an autoregressive adapter used during speculative decoding, on top of a target model and a factorized DFlash drafter.
+
+To run it, you also need:
+
+- the Qwen3.6-27B target model;
+- the Qwen3.6-27B DFlash drafter;
+- the Mirai Labs SGLang fork with DFlash-TfM and the fused GDN tree-verification kernels.
+
+Weaver has 56.7M trainable parameters. At inference time, DFlash produces future-state lookaheads in one forward pass; Weaver conditions on the realized draft tokens and scores only the top-512 marginal candidates instead of projecting over the full vocabulary.
+
+<p align="center">
+  <img src="assets/tfm-architecture.png" alt="DFlash-TfM uses DFlash marginals in parallel, then conditions tree proposals autoregressively with Weaver." width="760">
+</p>
+
+### Reproducing the headline number
+
+We evaluate on Qwen3.6-27B over chat, math, and code workloads: MTBench, ShareChat, GSM8K, MATH500, AIME25, HumanEval, MBPP, and LiveCodeBench. All runs use BF16 precision on a single B200 with batch size 1, temperature 1.0, reasoning enabled, maximum output length 4096, and the server cache flushed between requests.
+
+Throughput is computed as total generated tokens divided by wall-clock runtime, including prefill, scheduling, and decoding. Speedup is measured against autoregressive decoding under the same dataset, temperature, and reasoning setting. Macro Avg. is the unweighted average across datasets.
+
+| Method | Setting | Throughput | Speedup |
+| --- | --- | ---: | ---: |
+| Autoregressive | BF16 target only | 89.9 tok/s/seq | 1.00x |
+| DFlash | tuned chain baseline | 315.0 tok/s/seq | 3.50x |
+| DFlash-TfM + Weaver | tree budget 64 | 392.8 tok/s/seq | 4.37x |
+
+DFlash-TfM with Weaver is the fastest configuration on every task in this sweep. The gap comes from acceptance: Weaver's trees lengthen the mean accepted draft by 77% relative to the chain DFlash baseline and by 32% relative to DDTree at the same tree size.
+
+<p align="center">
+  <img src="assets/tfm-throughput.png" alt="Per-dataset Qwen3.6-27B throughput comparison for autoregressive decoding, DFlash, DDTree, and DFlash-TfM." width="760">
+</p>
+
+<p align="center">
+  <img src="assets/tfm-results-table.png" alt="Full DFlash-TfM table with speedup and accepted-token statistics across sampling and reasoning settings." width="900">
+</p>
+
+#### 1. Install the SGLang fork at the release tag
+
+```bash
+git clone https://github.com/trymirai/sglang
+cd sglang
+```
+
+We recommend using the release container. The experiments were done with the CUDA 13 SGLang development image:
+
+```bash
+docker pull lmsysorg/sglang@sha256:1d8d7976fe11a8341408b92527200502e93dd69df0a63a81c57b92e70ec6fada
+
+docker run -it --rm --shm-size 32g --gpus all \
+  -v ~/.cache/huggingface:/root/.cache/huggingface \
+  -v "$PWD":/sgl-workspace/sglang \
+  -v "$PWD/artifacts":/artifacts \
+  --ipc=host --network=host --privileged \
+  lmsysorg/sglang@sha256:1d8d7976fe11a8341408b92527200502e93dd69df0a63a81c57b92e70ec6fada \
+  /bin/zsh
+```
+
+If you cannot use Docker, build from source instead:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python3 -m pip install -U pip
+python3 -m pip install -e "python[all]"
+```
+
+The source build path expects Python 3.11, the CUDA 13 runtime expected by the package, `torch==2.11.0`, FlashInfer `0.6.12`, and the TensorRT-LLM / FA4 kernels installed by the tagged SGLang package.
+
+#### 2. Select the model artifacts
+
+```bash
+export TARGET_MODEL=Qwen/Qwen3.6-27B
+export TARGET_REV=6a9e13bd6fc8f0983b9b99948120bc37f49c13e9
+export DFLASH_MODEL=z-lab/Qwen3.6-27B-DFlash
+export DFLASH_REV=0919688658996800f86b895034249700e9481106
+export WEAVER_REV=309ceb4b1a6c44e6a3dfaeab8db1547e904254f8
+export WEAVER_CKPT=/artifacts/weaver/weaver/qwen36_27b_weaver.pth
+
+hf download trymirai/weaver \
+  weaver/qwen36_27b_weaver.pth \
+  --revision "$WEAVER_REV" \
+  --local-dir /artifacts/weaver
+```
+
+- The DFlash drafter checkpoint is `model.safetensors` from `z-lab/Qwen3.6-27B-DFlash` at revision `0919688658996800f86b895034249700e9481106`. Its SHA-256 is `e0c050b34798d32728a164d2c3f1681746ff85c11945701b0205b654e2f1fdbe`.
+- The Weaver checkpoint is the `weaver/qwen36_27b_weaver.pth` file in this repository at the same release tag. Its SHA-256 is `71f540b143fb6bab14ba724c20e97a72ce198de103cfd228d31c3ce339227833`.
+
+#### 3. Launch the three serving configurations
+
+The launches below match the paper setup: one NVIDIA B200 SXM, TP=1, concurrency=1, CUDA graph max batch size 32, page size 64, memory fraction 0.75, radix cache disabled, TRT-LLM MHA decode attention, FlashInfer prefill attention, and FA4 draft attention. The DFlash chain baseline is the exception: it keeps the decode/prefill split unset and runs both on TRT-LLM MHA (`--attention-backend trtllm_mha`), because routing its target-verify pass through the FlashInfer prefill backend changes the DFlash acceptance profile. Run with persistence mode enabled, no MIG/MPS partitioning, default application clocks, and no other GPU workloads.
+
+Autoregressive baseline:
+
+```bash
+python3 -m sglang.launch_server \
+  --model-path "$TARGET_MODEL" \
+  --revision "$TARGET_REV" \
+  --dtype bfloat16 \
+  --tp-size 1 \
+  --max-running-requests 1 \
+  --cuda-graph-max-bs 32 \
+  --mem-fraction-static 0.75 \
+  --page-size 64 \
+  --disable-radix-cache \
+  --decode-attention-backend trtllm_mha \
+  --prefill-attention-backend flashinfer \
+  --host 127.0.0.1 \
+  --port 30000
+```
+
+DFlash baseline:
+
+```bash
+python3 -m sglang.launch_server \
+  --model-path "$TARGET_MODEL" \
+  --revision "$TARGET_REV" \
+  --dtype bfloat16 \
+  --tp-size 1 \
+  --max-running-requests 1 \
+  --cuda-graph-max-bs 32 \
+  --mem-fraction-static 0.75 \
+  --page-size 64 \
+  --disable-radix-cache \
+  --attention-backend trtllm_mha \
+  --speculative-draft-attention-backend fa4 \
+  --speculative-algorithm DFLASH \
+  --speculative-draft-model-path "$DFLASH_MODEL" \
+  --speculative-draft-model-revision "$DFLASH_REV" \
+  --speculative-dflash-block-size 16 \
+  --speculative-num-draft-tokens 16 \
+  --host 127.0.0.1 \
+  --port 30000
+```
+
+DFlash-TfM with Weaver:
+
+```bash
+python3 -m sglang.launch_server \
+  --model-path "$TARGET_MODEL" \
+  --revision "$TARGET_REV" \
+  --dtype bfloat16 \
+  --tp-size 1 \
+  --max-running-requests 1 \
+  --cuda-graph-max-bs 32 \
+  --mem-fraction-static 0.75 \
+  --page-size 64 \
+  --disable-radix-cache \
+  --decode-attention-backend trtllm_mha \
+  --prefill-attention-backend flashinfer \
+  --speculative-draft-attention-backend fa4 \
+  --speculative-algorithm DFLASH_TFM \
+  --speculative-draft-model-path "$DFLASH_MODEL" \
+  --speculative-draft-model-revision "$DFLASH_REV" \
+  --speculative-dflash-tfm-path "$WEAVER_CKPT" \
+  --speculative-dflash-tfm-tree-budget 64 \
+  --speculative-gdn-verify-kernel chunk \
+  --disable-overlap-schedule \
+  --host 127.0.0.1 \
+  --port 30000
+```
+
+#### 4. Run the paper benchmark harness
+
+Run the benchmark harness included with the DFlash-TfM SGLang fork against each server configuration. Use the same dataset list for all three runs; the macro table above is computed from the per-dataset throughputs printed by the harness.
+
+```bash
+python3 -m sglang.bench_dflash_tfm \
+  --base-url http://127.0.0.1:30000 \
+  --model "$TARGET_MODEL" \
+  --datasets mtbench sharechat gsm8k math500 aime25 humaneval mbpp livecodebench \
+  --temperature 1.0 \
+  --reasoning on \
+  --max-new-tokens 4096 \
+  --concurrency 1 \
+  --flush-cache-between-requests
+```
+
+Repeat this command once for the autoregressive server, once for the DFlash server, and once for the DFlash-TfM server. To print speedup rows, pass the per-dataset `tok/s/seq` values from the autoregressive run via `--baseline mtbench=... gsm8k=...`; without `--baseline` the speedup column prints `-`.
+
+### Citation
+
+If you find our work helpful, feel free to give us a cite.
+
+```bibtex
+@misc{dflash-tfm,
+    title  = {{Trees from Marginals}: Autoregressive Drafting with Factorized Priors},
+    author = {Yuma Oda and Ryan Mathieu and Roman Knyazhitskiy and Artur Chakhvadze},
+    note   = {In collaboration with others at Mirai Labs},
+    month  = {July},
+    year   = {2026}
+}
+```
+
+---
+
+The following is the README of the original SGLang.
+
 <div align="center" id="sglangtop">
 <img src="https://raw.githubusercontent.com/sgl-project/sglang/main/assets/logo.png" alt="logo" width="400" margin="10px"></img>
 

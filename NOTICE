@@ -1,0 +1,58 @@
+trymirai/sglang DFlash-TfM Fork
+
+Copyright 2026 Mirai Labs.
+
+This product is derived from SGLang (https://github.com/sgl-project/sglang),
+Copyright 2023-2024 SGLang Team, licensed under the Apache License, Version 2.0.
+
+This fork is based on SGLang commit 5169df70f6f5434026a89e33946a9f2af2044a79.
+The Apache License, Version 2.0 is included in the LICENSE file.
+
+Mirai Labs modifications relative to the upstream base include:
+
+- DFlash-TfM / Weaver speculative decoding support, including the DFLASH_TFM
+  algorithm registration, server arguments, checkpoint loading, chain and tree
+  proposal construction, traversal verification, proposal sampling, CUDA graph
+  support, and target-KV materialization.
+- Fast Gated Delta Network (GDN) tree verification for hybrid linear-attention
+  models, including block-quadratic tree verify kernels, fused Triton tree-GDN
+  verify kernels, tree-aware convolution, accepted-path SSM state replay/commit,
+  and reduced intermediate-state cache allocation.
+- DFlash-family verification and scheduling extensions for proposal
+  probabilities, tree metadata, committed-sequence-length planning, hidden-state
+  capture, and DFlash-TfM serving/reproduction paths.
+- Supporting runtime integration in speculative decoding, CUDA graph capture and
+  replay, logits/hidden-state processing, model runner plumbing, and Qwen3.5 /
+  Qwen3.6-family model support.
+
+The file-level changes are recorded in git history. The main files added or
+modified by this fork include:
+
+- python/sglang/srt/speculative/dflash_tfm.py
+- python/sglang/srt/speculative/dflash_info.py
+- python/sglang/srt/speculative/dflash_info_v2.py
+- python/sglang/srt/speculative/dflash_utils.py
+- python/sglang/srt/speculative/dflash_worker_v2.py
+- python/sglang/srt/speculative/spec_info.py
+- python/sglang/srt/speculative/spec_registry.py
+- python/sglang/srt/arg_groups/speculative_hook.py
+- python/sglang/srt/server_args.py
+- python/sglang/srt/layers/attention/fla/chunk_tree_verify.py
+- python/sglang/srt/layers/attention/fla/gdn_tree_fused.py
+- python/sglang/srt/layers/attention/fla/gdn_tree_triton.py
+- python/sglang/srt/layers/attention/fla/fused_gdn_gating.py
+- python/sglang/srt/layers/attention/fla/l2norm.py
+- python/sglang/jit_kernel/triton/gdn_fused_proj.py
+- python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py
+- python/sglang/srt/layers/attention/linear/gdn_backend.py
+- python/sglang/srt/layers/attention/linear/utils.py
+- python/sglang/srt/layers/logits_processor.py
+- python/sglang/srt/mem_cache/memory_pool.py
+- python/sglang/srt/model_executor/runner/base_runner.py
+- python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py
+- python/sglang/srt/models/qwen3_5.py
+
+Unless otherwise stated in a file or directory, Mirai Labs modifications are
+licensed under the Apache License, Version 2.0. This NOTICE file is for
+attribution and change-summary purposes only and does not modify the terms of
+the Apache License, Version 2.0.

@@ -136,6 +136,9 @@ class DFlashDraftInputV2(SpecInput):
         assert self._prepare_nxt_kv_lens_gpu_buf is not None
         batch_seq_lens_cpu_t = self._prepare_batch_seq_lens_cpu_buf[:bs]
         cur_kv_lens_cpu_t = self._prepare_cur_kv_lens_cpu_buf[:bs]
+        # DFLASH_TFM tree drafts commit per-request accepted path lengths that
+        # can lag req.kv_committed_len; the draft input carries the override.
+        committed_seq_lens_cpu = getattr(self, "committed_seq_lens_cpu", None)
 
         # For DFLASH, each decode step needs a fixed-size verify block.
         block_size = int(get_global_server_args().speculative_num_draft_tokens)
@@ -152,7 +155,10 @@ class DFlashDraftInputV2(SpecInput):
         uniform_top_k_value = None
         uniform_top_k = True
         for i, req in enumerate(batch.reqs):
-            committed_len = int(req.kv_committed_len)
+            if committed_seq_lens_cpu is not None and i < len(committed_seq_lens_cpu):
+                committed_len = int(committed_seq_lens_cpu[i])
+            else:
+                committed_len = int(req.kv_committed_len)
             # Read the allocation watermark from the req object like EAGLE.
             cur_alloc_len = int(req.kv_allocated_len)
             reserved_len = max(cur_alloc_len, committed_len + 2 * block_size)

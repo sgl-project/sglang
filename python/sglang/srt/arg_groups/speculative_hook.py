@@ -95,10 +95,10 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
                 f"--speculative-draft-window-size must be positive, got {window_size}."
             )
         server_args.speculative_draft_window_size = window_size
-        if server_args.speculative_algorithm not in ("EAGLE3", "DFLASH"):
+        if server_args.speculative_algorithm not in ("EAGLE3", "DFLASH", "DFLASH_TFM"):
             logger.warning(
                 "--speculative-draft-window-size has no effect with "
-                "speculative_algorithm=%s (honored by Llama EAGLE-3 and DFLASH only).",
+                "speculative_algorithm=%s (honored by Llama EAGLE-3 and DFLASH-family algorithms only).",
                 server_args.speculative_algorithm,
             )
 
@@ -129,6 +129,10 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
 
 
 def _handle_dflash(server_args: ServerArgs) -> None:
+    # DFLASH_TFM = DFlash marginals + Weaver tree drafting. The tree budget sets
+    # the target-verify token count (budget + 1), decoupled from the DFlash
+    # block size, which stays the draft-forward unit.
+    is_tfm = server_args.speculative_algorithm == "DFLASH_TFM"
     if server_args.enable_dp_attention:
         raise ValueError(
             "Currently DFLASH speculative decoding does not support dp attention."
@@ -143,6 +147,15 @@ def _handle_dflash(server_args: ServerArgs) -> None:
         raise ValueError(
             "DFLASH speculative decoding requires setting --speculative-draft-model-path."
         )
+    if is_tfm:
+        if server_args.speculative_dflash_tfm_path is None:
+            raise ValueError(
+                "DFLASH_TFM requires setting --speculative-dflash-tfm-path."
+            )
+        if server_args.tp_size != 1:
+            raise ValueError(
+                "Currently DFLASH_TFM speculative decoding only supports tp_size == 1."
+            )
 
     # DFLASH does not use EAGLE-style `num_steps`/`topk`, but those fields still
     # affect generic scheduler/KV-cache accounting (buffer sizing, KV freeing,
@@ -173,20 +186,26 @@ def _handle_dflash(server_args: ServerArgs) -> None:
                 "DFLASH requires --speculative-dflash-block-size to be positive, "
                 f"got {server_args.speculative_dflash_block_size}."
             )
-        if server_args.speculative_num_draft_tokens is not None and int(
-            server_args.speculative_num_draft_tokens
-        ) != int(server_args.speculative_dflash_block_size):
+        if (
+            not is_tfm
+            and server_args.speculative_num_draft_tokens is not None
+            and int(server_args.speculative_num_draft_tokens)
+            != int(server_args.speculative_dflash_block_size)
+        ):
             raise ValueError(
                 "Both --speculative-num-draft-tokens and --speculative-dflash-block-size are set "
                 "but they differ. For DFLASH they must match. "
                 f"speculative_num_draft_tokens={server_args.speculative_num_draft_tokens}, "
                 f"speculative_dflash_block_size={server_args.speculative_dflash_block_size}."
             )
-        server_args.speculative_num_draft_tokens = int(
-            server_args.speculative_dflash_block_size
-        )
+        if not is_tfm:
+            server_args.speculative_num_draft_tokens = int(
+                server_args.speculative_dflash_block_size
+            )
 
-    if server_args.speculative_num_draft_tokens is None:
+    if server_args.speculative_num_draft_tokens is None or (
+        is_tfm and server_args.speculative_dflash_block_size is None
+    ):
         from sglang.srt.speculative.dflash_utils import (
             parse_dflash_draft_config,
         )
@@ -215,13 +234,42 @@ def _handle_dflash(server_args: ServerArgs) -> None:
         if inferred_block_size is None:
             inferred_block_size = 16
             logger.warning(
-                "speculative_num_draft_tokens is not set; defaulting to %d for DFLASH.",
+                "DFLASH block size is not set; defaulting to %d.",
                 inferred_block_size,
             )
-        server_args.speculative_num_draft_tokens = inferred_block_size
+        if is_tfm:
+            if server_args.speculative_dflash_block_size is None:
+                server_args.speculative_dflash_block_size = int(inferred_block_size)
+        else:
+            server_args.speculative_num_draft_tokens = inferred_block_size
+
+    if is_tfm:
+        tree_budget = int(
+            server_args.speculative_dflash_tfm_tree_budget
+            if server_args.speculative_dflash_tfm_tree_budget is not None
+            else 128
+        )
+        if tree_budget < 0:
+            raise ValueError(
+                f"DFLASH_TFM tree budget must be non-negative, got {tree_budget}."
+            )
+        target_verify_tokens = tree_budget + 1
+        if server_args.speculative_num_draft_tokens is None:
+            server_args.speculative_num_draft_tokens = target_verify_tokens
+        elif int(server_args.speculative_num_draft_tokens) != target_verify_tokens:
+            raise ValueError(
+                "For DFLASH_TFM, --speculative-num-draft-tokens is the target tree "
+                "verify token count and must equal --speculative-dflash-tfm-tree-budget + 1. "
+                f"got speculative_num_draft_tokens={server_args.speculative_num_draft_tokens}, "
+                f"tree_budget={tree_budget}."
+            )
 
     if server_args.speculative_draft_window_size is not None:
-        draft_tokens = int(server_args.speculative_num_draft_tokens)
+        draft_tokens = int(
+            server_args.speculative_dflash_block_size
+            if is_tfm
+            else server_args.speculative_num_draft_tokens
+        )
         if server_args.speculative_draft_window_size < draft_tokens:
             raise ValueError(
                 "--speculative-draft-window-size must be >= "

@@ -510,7 +510,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         )
 
         if (
-            self.num_v_heads // self.num_k_heads in [1, 2, 4]
+            self.num_v_heads // self.num_k_heads in [1, 2, 3, 4]
             and not _is_cpu
             and not _is_npu
         ):

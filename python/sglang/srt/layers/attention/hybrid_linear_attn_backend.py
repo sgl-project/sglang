@@ -15,6 +15,9 @@ from sglang.srt.layers.attention.mamba.mamba_state_scatter_triton import (
     fused_mamba_state_scatter_with_mask,
     track_mamba_states_if_needed,
 )
+from sglang.srt.layers.attention.linear.utils import (
+    gdn_dflash_tfm_tree_verify_enabled,
+)
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -32,6 +35,12 @@ class MambaAttnBackendBase(AttentionBackend):
         self.pad_slot_id = PAD_SLOT_ID
         self.device = model_runner.device
         self.topk = model_runner.server_args.speculative_eagle_topk or 0
+        # DFLASH_TFM tree verify carries retrieve_next_token/retrieve_next_sibling
+        # even though speculative_eagle_topk is forced to 1 for DFLASH-style
+        # accounting. CUDA graph capture must include those metadata buffers.
+        self.uses_tree_spec_inputs = self.topk > 1 or gdn_dflash_tfm_tree_verify_enabled(
+            model_runner.server_args
+        )
         self.is_draft_worker = model_runner.is_draft_worker
         self.req_to_token_pool: HybridReqToTokenPool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
@@ -203,14 +212,15 @@ class MambaAttnBackendBase(AttentionBackend):
                     device=forward_batch.input_ids.device,
                 )
 
-                if self.topk > 1:
-                    retrieve_next_token = forward_batch.spec_info.retrieve_next_token
-                    retrieve_next_sibling = (
-                        forward_batch.spec_info.retrieve_next_sibling
+                retrieve_next_token = getattr(
+                    forward_batch.spec_info, "retrieve_next_token", None
+                )
+                # retrieve_next_token is None during dummy run so skip tensor creation
+                if retrieve_next_token is not None:
+                    retrieve_next_sibling = getattr(
+                        forward_batch.spec_info, "retrieve_next_sibling", None
                     )
-                    # retrieve_next_token is None during dummy run so skip tensor creation
-                    if retrieve_next_token is not None:
-                        retrieve_parent_token = torch.empty_like(retrieve_next_token)
+                    retrieve_parent_token = torch.empty_like(retrieve_next_token)
             else:
                 query_start_loc = torch.empty(
                     (bs + 1,), dtype=torch.int32, device=self.device
@@ -577,8 +587,9 @@ class MambaAttnBackendBase(AttentionBackend):
             else None
         )
 
-        # If topk > 1, we need to use retrieve_next_token and retrieve_next_sibling to handle the eagle tree custom attention mask
-        if forward_mode.is_target_verify() and self.topk > 1:
+        # Tree spec inputs need retrieve_next_token/retrieve_next_sibling to
+        # handle the tree custom attention mask.
+        if forward_mode.is_target_verify() and self.uses_tree_spec_inputs:
             # They are None during cuda graph capture so skip the copy_...
             # self.retrieve_next_token_list[bs - 1].copy_(spec_info.retrieve_next_token)
             # self.retrieve_next_sibling_list[bs - 1].copy_(spec_info.retrieve_next_sibling)
@@ -726,8 +737,9 @@ class MambaAttnBackendBase(AttentionBackend):
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
 
-        # If topk > 1, we need to use retrieve_next_token and retrieve_next_sibling to handle the eagle tree custom attention mask
-        if forward_mode.is_target_verify() and self.topk > 1:
+        # Tree spec inputs need retrieve_next_token/retrieve_next_sibling to
+        # handle the tree custom attention mask.
+        if forward_mode.is_target_verify() and self.uses_tree_spec_inputs:
             if (
                 spec_info is not None
                 and getattr(spec_info, "retrieve_next_token", None) is not None
@@ -1176,14 +1188,27 @@ class HybridLinearAttnBackend(AttentionBackend):
         intermediate_state_cache = mamba_caches.intermediate_ssm
         intermediate_conv_window_cache = mamba_caches.intermediate_conv_window[0]
 
-        # Use fully fused kernel that handles masking internally
-        # This avoids separate nonzero() and index_select() calls
-        fused_mamba_state_scatter_with_mask(
-            ssm_states,
-            intermediate_state_cache,
-            state_indices_tensor,
-            last_correct_step_indices,
+        # The chunk tree-verify path caches no intermediate SSM states: it
+        # commits them by replaying the accepted tree path instead. Conv
+        # windows keep the cache+scatter scheme below.
+        chunk_tree_verify = getattr(
+            self.linear_attn_backend, "last_target_verify_used_tree", False
         )
+        if chunk_tree_verify:
+            self.linear_attn_backend.advance_ssm_states_after_verify(
+                last_correct_steps=last_correct_step_indices,
+                track_slots=mamba_track_indices,
+                track_steps=mamba_steps_to_track,
+            )
+        else:
+            # Use fully fused kernel that handles masking internally
+            # This avoids separate nonzero() and index_select() calls
+            fused_mamba_state_scatter_with_mask(
+                ssm_states,
+                intermediate_state_cache,
+                state_indices_tensor,
+                last_correct_step_indices,
+            )
         # conv intermediate uses the deduplicated sliding-window (overlapping)
         # layout, so it needs the strided-read scatter variant.
         fused_conv_window_scatter_with_mask(
@@ -1197,12 +1222,13 @@ class HybridLinearAttnBackend(AttentionBackend):
         if mamba_track_indices is not None:
             assert mamba_steps_to_track is not None
             # Use fully fused kernel for track scatter operations
-            fused_mamba_state_scatter_with_mask(
-                ssm_states,
-                intermediate_state_cache,
-                mamba_track_indices,
-                mamba_steps_to_track,
-            )
+            if not chunk_tree_verify:
+                fused_mamba_state_scatter_with_mask(
+                    ssm_states,
+                    intermediate_state_cache,
+                    mamba_track_indices,
+                    mamba_steps_to_track,
+                )
             fused_conv_window_scatter_with_mask(
                 conv_states,
                 intermediate_conv_window_cache,

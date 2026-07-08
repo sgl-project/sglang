@@ -8,6 +8,8 @@ from typing import Any, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
+import triton
+import triton.language as tl
 
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.sampler import apply_custom_logit_processor
@@ -53,6 +55,288 @@ else:
 
 def is_dflash_sampling_verify_available() -> bool:
     return _DFLASH_SAMPLING_VERIFY_AVAILABLE
+
+
+def sample_dflash_proposal_from_logits(
+    *,
+    logits: torch.Tensor,
+    sampling_info: Any,
+    steps_per_batch: int,
+    token_ids: Optional[torch.Tensor] = None,
+    uniform_samples: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Draw one proposal token per draft slot from the drafter's distribution.
+
+    Returns (sampled_tokens, support_tokens, support_probs) so the verifier can
+    later evaluate exact proposal probabilities for speculative sampling.
+    """
+    if bool(getattr(sampling_info, "need_top_k_sampling", False)) or bool(
+        getattr(sampling_info, "need_top_p_sampling", False)
+    ):
+        raise RuntimeError("DFlash proposal sampling expects top_k=-1 and top_p=1.0.")
+    if logits.ndim != 2:
+        raise ValueError(f"logits must be 2D, got shape={tuple(logits.shape)}")
+    if token_ids is not None and token_ids.ndim not in (1, 2):
+        raise ValueError(
+            "token_ids must be 1D [vocab] or 2D matching logits, "
+            f"got shape={tuple(token_ids.shape)}."
+        )
+    if (
+        token_ids is not None
+        and token_ids.ndim == 1
+        and token_ids.shape[0] != logits.shape[1]
+    ):
+        raise ValueError(
+            "1D token_ids must match logits width, "
+            f"got token_ids={tuple(token_ids.shape)}, logits={tuple(logits.shape)}."
+        )
+    if token_ids is not None and token_ids.ndim == 2 and token_ids.shape != logits.shape:
+        raise ValueError(
+            "token_ids must match logits shape, "
+            f"got token_ids={tuple(token_ids.shape)}, logits={tuple(logits.shape)}."
+        )
+
+    steps_per_batch = int(steps_per_batch)
+    if steps_per_batch <= 0:
+        raise ValueError(f"steps_per_batch must be positive, got {steps_per_batch}.")
+    rows, width = logits.shape
+    if rows % steps_per_batch != 0:
+        raise ValueError(
+            "logits row count must be divisible by steps_per_batch, "
+            f"got rows={rows}, steps_per_batch={steps_per_batch}."
+        )
+
+    temperatures = (
+        torch.repeat_interleave(sampling_info.temperatures, steps_per_batch, dim=0)
+        .to(device=logits.device, dtype=torch.float32)
+        .reshape(rows, 1)
+    )
+    scores = logits.float() / temperatures
+    support_probs = F.softmax(scores, dim=-1)
+    support_tokens = torch.arange(width, dtype=torch.long, device=logits.device)[
+        None, :
+    ].expand(rows, -1)
+
+    if token_ids is not None:
+        token_ids = token_ids.to(device=logits.device, dtype=torch.long)
+        if token_ids.ndim == 1:
+            support_tokens = token_ids[None, :].expand(rows, -1)
+        else:
+            support_tokens = token_ids
+
+    sampled_pos = _sample_categorical_from_probs(
+        support_probs, uniform_samples=uniform_samples
+    )[:, None]
+    sampled_tokens = torch.gather(support_tokens, 1, sampled_pos).squeeze(1)
+    return sampled_tokens.to(torch.long), support_tokens, support_probs
+
+
+@triton.jit
+def _sample_categorical_from_probs_kernel(
+    probs,
+    uniform_samples,
+    sampled_pos_out,
+    WIDTH: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK)
+
+    total = tl.full((), 0.0, dtype=tl.float32)
+    for start in tl.range(0, WIDTH, BLOCK, loop_unroll_factor=1):
+        cols = start + offsets
+        mask = cols < WIDTH
+        vals = tl.load(probs + row * WIDTH + cols, mask=mask, other=0.0).to(tl.float32)
+        total += tl.sum(tl.where(mask, vals, 0.0), axis=0)
+
+    coin = tl.load(uniform_samples + row).to(tl.float32)
+    threshold = coin * total
+    running = tl.full((), 0.0, dtype=tl.float32)
+    sampled = tl.full((), WIDTH - 1, dtype=tl.int64)
+    found = tl.full((), False, dtype=tl.int1)
+
+    for start in tl.range(0, WIDTH, BLOCK, loop_unroll_factor=1):
+        cols = start + offsets
+        mask = cols < WIDTH
+        vals = tl.load(probs + row * WIDTH + cols, mask=mask, other=0.0).to(tl.float32)
+        vals = tl.where(mask, vals, 0.0)
+        prefix = running + tl.cumsum(vals, axis=0)
+        hit = (prefix >= threshold) & mask & (~found)
+        hit_idx = tl.min(tl.where(hit, cols, WIDTH), axis=0)
+        take = hit_idx < WIDTH
+        sampled = tl.where((~found) & take, hit_idx, sampled)
+        found = found | take
+        running += tl.sum(vals, axis=0)
+
+    tl.store(sampled_pos_out + row, sampled)
+
+
+def _sample_categorical_from_probs(
+    probs: torch.Tensor,
+    *,
+    uniform_samples: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    if probs.ndim != 2:
+        raise ValueError(f"probs must be 2D, got shape={tuple(probs.shape)}")
+    rows, width = probs.shape
+    if uniform_samples is None:
+        uniform_samples = torch.rand((rows,), dtype=torch.float32, device=probs.device)
+    else:
+        if uniform_samples.shape != (rows,):
+            raise ValueError(
+                "uniform_samples shape mismatch, "
+                f"got {tuple(uniform_samples.shape)}, expected {(rows,)}."
+            )
+        uniform_samples = uniform_samples.to(device=probs.device, dtype=torch.float32)
+    sampled_pos = torch.empty((rows,), dtype=torch.int64, device=probs.device)
+    block = 1024 if width > 1024 else triton.next_power_of_2(width)
+    _sample_categorical_from_probs_kernel[(rows,)](
+        probs.contiguous(),
+        uniform_samples,
+        sampled_pos,
+        WIDTH=int(width),
+        BLOCK=int(block),
+        num_warps=4,
+    )
+    return sampled_pos
+
+
+@triton.jit
+def _dflash_chain_speculative_sampling_kernel(
+    candidates,
+    target_probs,
+    draft_probs,
+    uniform_samples,
+    uniform_samples_for_final_sampling,
+    correct_len_out,
+    bonus_out,
+    threshold_single: tl.constexpr,
+    threshold_acc: tl.constexpr,
+    DRAFT_TOKEN_NUM: tl.constexpr,
+    DRAFT_STEPS: tl.constexpr,
+    VOCAB_SIZE: tl.constexpr,
+    BLOCK_V: tl.constexpr,
+):
+    batch = tl.program_id(0)
+
+    accepted = tl.full((), 0, dtype=tl.int32)
+    keep_going = tl.full((), True, dtype=tl.int1)
+
+    for step in tl.range(0, DRAFT_STEPS, loop_unroll_factor=1):
+        token = tl.load(candidates + batch * DRAFT_TOKEN_NUM + step + 1)
+        token_valid = (0 <= token) & (token < VOCAB_SIZE)
+        p = tl.load(
+            target_probs + (batch * DRAFT_TOKEN_NUM + step) * VOCAB_SIZE + token,
+            mask=token_valid,
+            other=0.0,
+        ).to(tl.float32)
+        q = tl.load(
+            draft_probs + (batch * DRAFT_STEPS + step) * VOCAB_SIZE + token,
+            mask=token_valid,
+            other=0.0,
+        ).to(tl.float32)
+        u = tl.load(uniform_samples + batch * DRAFT_TOKEN_NUM + step).to(tl.float32)
+        accept_prob = tl.minimum(p / tl.maximum(q * threshold_acc, 1.0e-20), 1.0)
+        accept_now = keep_going & ((u <= accept_prob) | (p >= threshold_single))
+        accepted += accept_now.to(tl.int32)
+        keep_going = keep_going & accept_now
+
+    tl.store(correct_len_out + batch, accepted)
+
+    row = accepted
+    rejected = row < DRAFT_STEPS
+
+    residual_total = tl.full((), 0.0, dtype=tl.float32)
+    target_total = tl.full((), 0.0, dtype=tl.float32)
+    offsets = tl.arange(0, BLOCK_V)
+    for start in tl.range(0, VOCAB_SIZE, BLOCK_V, loop_unroll_factor=1):
+        vocab_offsets = start + offsets
+        mask = vocab_offsets < VOCAB_SIZE
+        p_vals = tl.load(
+            target_probs + (batch * DRAFT_TOKEN_NUM + row) * VOCAB_SIZE + vocab_offsets,
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+        q_vals = tl.load(
+            draft_probs + (batch * DRAFT_STEPS + row) * VOCAB_SIZE + vocab_offsets,
+            mask=mask & rejected,
+            other=0.0,
+        ).to(tl.float32)
+        vals = tl.where(rejected, tl.maximum(p_vals - q_vals, 0.0), p_vals)
+        vals = tl.where(mask, vals, 0.0)
+        residual_total += tl.sum(vals, axis=0)
+        target_total += tl.sum(tl.where(mask, p_vals, 0.0), axis=0)
+
+    fallback_to_target = residual_total <= 1.0e-20
+    total = tl.where(fallback_to_target, target_total, residual_total)
+
+    coin = tl.load(uniform_samples_for_final_sampling + batch).to(tl.float32)
+    threshold = coin * total
+    running = tl.full((), 0.0, dtype=tl.float32)
+    sampled = tl.full((), VOCAB_SIZE - 1, dtype=tl.int64)
+    found = tl.full((), False, dtype=tl.int1)
+
+    for start in tl.range(0, VOCAB_SIZE, BLOCK_V, loop_unroll_factor=1):
+        vocab_offsets = start + offsets
+        mask = vocab_offsets < VOCAB_SIZE
+        p_vals = tl.load(
+            target_probs + (batch * DRAFT_TOKEN_NUM + row) * VOCAB_SIZE + vocab_offsets,
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+        q_vals = tl.load(
+            draft_probs + (batch * DRAFT_STEPS + row) * VOCAB_SIZE + vocab_offsets,
+            mask=mask & rejected & (~fallback_to_target),
+            other=0.0,
+        ).to(tl.float32)
+        vals = tl.where(
+            rejected & (~fallback_to_target),
+            tl.maximum(p_vals - q_vals, 0.0),
+            p_vals,
+        )
+        vals = tl.where(mask, vals, 0.0)
+        prefix = running + tl.cumsum(vals, axis=0)
+        hit = (prefix >= threshold) & mask & (~found)
+        hit_idx = tl.min(tl.where(hit, vocab_offsets, VOCAB_SIZE), axis=0)
+        take = hit_idx < VOCAB_SIZE
+        sampled = tl.where((~found) & take, hit_idx, sampled)
+        found = found | take
+        running += tl.sum(vals, axis=0)
+
+    tl.store(bonus_out + batch, sampled)
+
+
+def _chain_speculative_sampling_triton(
+    *,
+    candidates: torch.Tensor,
+    target_probs: torch.Tensor,
+    draft_probs: torch.Tensor,
+    uniform_samples: torch.Tensor,
+    uniform_samples_for_final_sampling: torch.Tensor,
+    threshold_single: float,
+    threshold_acc: float,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    bs, draft_token_num = candidates.shape
+    draft_steps = draft_token_num - 1
+    correct_len = torch.empty((bs,), dtype=torch.int32, device=candidates.device)
+    bonus = torch.empty((bs,), dtype=torch.int64, device=candidates.device)
+    _dflash_chain_speculative_sampling_kernel[(bs,)](
+        candidates,
+        target_probs,
+        draft_probs,
+        uniform_samples,
+        uniform_samples_for_final_sampling,
+        correct_len,
+        bonus,
+        float(threshold_single),
+        float(threshold_acc),
+        DRAFT_TOKEN_NUM=int(draft_token_num),
+        DRAFT_STEPS=int(draft_steps),
+        VOCAB_SIZE=int(target_probs.shape[-1]),
+        BLOCK_V=1024,
+        num_warps=4,
+    )
+    return correct_len, bonus
 
 
 def scale_kv_cell_size_per_token_for_dflash(
@@ -590,6 +874,8 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
     candidates: torch.Tensor,
     next_token_logits: torch.Tensor,
     sampling_info: Any,
+    proposal_tokens: Optional[torch.Tensor] = None,
+    proposal_probs: Optional[torch.Tensor] = None,
     max_top_k: Optional[int] = None,
     uniform_top_k_value: Optional[int] = None,
     threshold_single: Optional[float] = None,
@@ -675,6 +961,13 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
 
     need_top_k = bool(getattr(sampling_info, "need_top_k_sampling", True))
     need_top_p = bool(getattr(sampling_info, "need_top_p_sampling", False))
+    has_proposal_distribution = (
+        proposal_tokens is not None or proposal_probs is not None
+    )
+    if has_proposal_distribution and (need_top_k or need_top_p):
+        raise RuntimeError(
+            "DFlash proposal verification expects top_k=-1 and top_p=1.0."
+        )
     # Build target distribution once over all verify rows.
     expanded_temperature = torch.repeat_interleave(
         sampling_info.temperatures, draft_token_num, dim=0
@@ -731,6 +1024,64 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
                 torch.repeat_interleave(sampling_info.top_ps, draft_token_num, dim=0),
             )
     target_probs = target_probs.view(bs, draft_token_num, -1).contiguous()
+
+    if proposal_tokens is not None or proposal_probs is not None:
+        # Proposal-based chain speculative sampling: the drafter supplied the
+        # sampled proposal and its distribution support, so run the exact
+        # accept/residual test against them.
+        if proposal_tokens is None or proposal_probs is None:
+            raise ValueError(
+                "proposal_tokens and proposal_probs must be provided together."
+            )
+        if proposal_tokens.ndim != 3 or proposal_probs.ndim != 3:
+            raise ValueError(
+                "proposal tensors must be 3D [bs, draft_steps, support_width], "
+                f"got tokens={tuple(proposal_tokens.shape)}, probs={tuple(proposal_probs.shape)}."
+            )
+        draft_steps = draft_token_num - 1
+        if proposal_tokens.shape[:2] != (bs, draft_steps):
+            raise ValueError(
+                "proposal_tokens shape mismatch. "
+                f"Expected {(bs, draft_steps)}, got {tuple(proposal_tokens.shape[:2])}."
+            )
+        if proposal_probs.shape != proposal_tokens.shape:
+            raise ValueError(
+                "proposal_probs must match proposal_tokens shape, "
+                f"got probs={tuple(proposal_probs.shape)}, tokens={tuple(proposal_tokens.shape)}."
+            )
+        if draft_steps == 0:
+            correct_len = torch.zeros((bs,), dtype=torch.int32, device=device)
+            bonus = torch.multinomial(target_probs[:, 0].float(), 1).squeeze(1)
+            return correct_len, bonus.to(torch.int64)
+
+        proposal_tokens = proposal_tokens.to(device=device, dtype=torch.long)
+        proposal_probs = proposal_probs.to(device=device, dtype=torch.float32)
+        vocab_size = int(target_probs.shape[-1])
+        valid = (proposal_tokens >= 0) & (proposal_tokens < vocab_size)
+        safe_tokens = proposal_tokens.clamp(min=0, max=max(vocab_size - 1, 0))
+        draft_probs = torch.zeros(
+            (bs, draft_steps, vocab_size), dtype=torch.float32, device=device
+        )
+        draft_probs.scatter_add_(
+            2,
+            safe_tokens,
+            torch.where(valid, proposal_probs, torch.zeros_like(proposal_probs)),
+        )
+        candidates_i64 = (
+            candidates
+            if candidates.dtype == torch.int64
+            else candidates.to(torch.int64)
+        )
+        return _chain_speculative_sampling_triton(
+            candidates=candidates_i64,
+            target_probs=target_probs,
+            draft_probs=draft_probs,
+            uniform_samples=uniform_samples,
+            uniform_samples_for_final_sampling=uniform_samples_for_final_sampling,
+            threshold_single=threshold_single,
+            threshold_acc=threshold_acc,
+        )
+
     draft_probs = torch.zeros_like(target_probs)
 
     (

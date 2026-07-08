@@ -168,6 +168,9 @@ class LogitsMetadata:
     is_prefill_only: bool = False
 
     mm_input_embeds: Optional[torch.Tensor] = None
+    # DFLASH_TFM stores aux hidden states concatenated with the final hidden
+    # states: the Weaver adapter consumes both.
+    capture_aux_with_hidden: bool = False
 
     @classmethod
     def from_forward_batch(cls, forward_batch: ForwardBatch):
@@ -220,6 +223,11 @@ class LogitsMetadata:
             global_num_tokens_for_logprob_gpu=forward_batch.global_num_tokens_for_logprob_gpu,
             dp_padding_mode=DpPaddingMode.SUM_LEN,
             mm_input_embeds=forward_batch.mm_input_embeds,
+            capture_aux_with_hidden=(
+                forward_batch.spec_algorithm is not None
+                and hasattr(forward_batch.spec_algorithm, "is_dflash_tfm")
+                and forward_batch.spec_algorithm.is_dflash_tfm()
+            ),
         )
 
     def compute_dp_attention_metadata(self):
@@ -603,7 +611,11 @@ class LogitsProcessor(nn.Module):
             if logits_metadata.capture_hidden_mode.is_full():
                 if aux_hidden_states is not None:
                     aux_hidden_states = torch.cat(aux_hidden_states, dim=-1)
-                    hidden_states_to_store = aux_hidden_states
+                    hidden_states_to_store = (
+                        torch.cat([aux_hidden_states, hidden_states], dim=-1)
+                        if logits_metadata.capture_aux_with_hidden
+                        else aux_hidden_states
+                    )
                 else:
                     hidden_states_to_store = hidden_states
                 hidden_states_to_store_before_norm = hidden_states_before_norm

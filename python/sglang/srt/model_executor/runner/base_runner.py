@@ -368,7 +368,43 @@ class BaseRunner(ABC):
             ):
                 self._dummy_run(batch_size=batch_size, buffers=buffers)
         torch.cuda.current_stream().wait_stream(mr.forward_stream)
+        self._clear_flashinfer_autotune_dummy_state()
         logger.info("FlashInfer autotune completed.")
+
+    def _clear_flashinfer_autotune_dummy_state(self):
+        """Drop per-step state left behind by the autotune dummy forwards.
+
+        Tree-verify backends stash step metadata (TreeVerifyStash, fused tree
+        structure, forward metadata) keyed to the dummy batch; letting it leak
+        into CUDA-graph capture would replay dummy-shaped tree state.
+        """
+        attn_backend = getattr(self.model_runner, "attn_backend", None)
+        if attn_backend is None:
+            return
+        backends = []
+        stack = [attn_backend]
+        seen = set()
+        while stack:
+            backend = stack.pop()
+            if backend is None or id(backend) in seen:
+                continue
+            seen.add(id(backend))
+            backends.append(backend)
+            for attr in (
+                "prefill_backend",
+                "decode_backend",
+                "full_attn_backend",
+                "linear_attn_backend",
+            ):
+                stack.append(getattr(backend, attr, None))
+            stack.extend(getattr(backend, "attn_backend_list", ()))
+        for backend in backends:
+            if hasattr(backend, "tree_verify_stash"):
+                backend.tree_verify_stash = None
+            if hasattr(backend, "_fused_tree_struct"):
+                backend._fused_tree_struct = None
+            if hasattr(backend, "forward_metadata"):
+                backend.forward_metadata = None
 
     def _flashinfer_autotune_cache_path(self) -> Path:
         import flashinfer
@@ -612,6 +648,8 @@ class BaseRunner(ABC):
             buffers.custom_mask,
             num_tokens_per_bs,
             mr.is_draft_worker,
+            batch_size=batch_size,
+            device=mr.device,
         )
         if spec_info is not None and (
             mr.spec_algorithm.is_eagle() or mr.spec_algorithm.is_standalone()
