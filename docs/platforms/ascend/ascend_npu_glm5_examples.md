@@ -119,7 +119,7 @@ python3 -m sglang.launch_server \
 
 ### Multi-node Deployment
 
-- `GLM-5-bf16`: require at least 2 Atlas 800 A3 (64G × 16).
+- Quantized model `glm5_w4a8` can be deployed on 2 Atlas 800 A3 (64G × 16) .
 
 **A3 series**
 
