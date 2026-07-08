@@ -95,6 +95,7 @@ class SchedulerBatchResultProcessor:
                 if self.server_args.enable_hisparse:
                     self.hisparse_coordinator.request_finished(req)
                 release_kv_cache(req, self.tree_cache)
+                self._maybe_register_session_ref(req)
 
         # Note: Logprobs should be handled on the prefill engine.
         self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
@@ -240,6 +241,7 @@ class SchedulerBatchResultProcessor:
                         self._maybe_collect_routed_experts(req)
                         self._maybe_collect_indexer_topk(req)
                         release_kv_cache(req, self.tree_cache)
+                        self._maybe_register_session_ref(req)
                         req.time_stats.set_completion_time()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         maybe_cache_unfinished_req(req, self.tree_cache)
@@ -329,6 +331,7 @@ class SchedulerBatchResultProcessor:
 
                     if req.finished():
                         release_kv_cache(req, self.tree_cache)
+                        self._maybe_register_session_ref(req)
                         req.time_stats.set_completion_time()
                     else:
                         maybe_cache_unfinished_req(req, self.tree_cache)
@@ -977,10 +980,15 @@ class SchedulerBatchResultProcessor:
                     else True
                 )
                 release_kv_cache(req, self.tree_cache, is_insert=is_insert)
+                self._maybe_register_session_ref(req)
 
             req.time_stats.set_completion_time()
 
         self._maybe_collect_customized_info(i, req, logits_output)
+
+    def _maybe_register_session_ref(self, req):
+        if self.server_args.enable_session_radix_cache:
+            self.tree_cache.register_session_ref(req)
 
     def _maybe_update_reasoning_tokens(
         self,

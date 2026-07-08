@@ -239,6 +239,9 @@ class TreeNode:
         # priority for priority-aware eviction
         self.priority = priority
 
+        self.session_ref = 0
+        self.tracked_session_ids: Optional[set] = None
+
         self.id = TreeNode.counter if id is None else id
         TreeNode.counter += 1
 
@@ -467,13 +470,13 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
             result = self.insert(
                 InsertParams(key=radix_key, value=values, priority=priority)
             )
-            session_leaf = result.last_device_node
+            new_last_node = result.last_device_node
             # Free the duplicates that were already in the tree
             self.token_to_kv_pool_allocator.free(
                 kv_indices[req.cache_protected_len : result.prefix_len]
             )
         else:
-            session_leaf = None
+            new_last_node = req.last_node
             self.token_to_kv_pool_allocator.free(
                 kv_indices[req.cache_protected_len : key_len]
             )
@@ -481,11 +484,10 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         # free the unaligned tail
         self.token_to_kv_pool_allocator.free(kv_indices[key_len:])
 
-        self._tag_session_leaf(req, radix_key, node=session_leaf)
-
         # Remove req slot release the cache lock
         if req.last_node is not None:
             self.dec_lock_ref(req.last_node)
+        req.last_node = new_last_node
 
     def cache_unfinished_req(self, req: Req, chunked=False):
         """Cache request when it is unfinished."""
@@ -553,8 +555,6 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
 
         req.last_node = new_last_node
 
-        self._tag_session_leaf(req, radix_key, node=new_last_node)
-
     def pretty_print(self):
         self._print_helper(self.root_node, 0)
         print(f"#tokens: {self.total_size()}")
@@ -565,6 +565,9 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
     def evict(self, params: EvictParams) -> EvictResult:
         if self.disable:
             return EvictResult()
+
+        if self.enable_session_radix_cache:
+            return self._evict_tiered_device(params)
 
         start_time = time.perf_counter()
         num_tokens = params.num_tokens
@@ -601,6 +604,7 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
                 self.evictable_size_ -= len(node.key)
                 self.protected_size_ += len(node.key)
                 delta -= len(node.key)
+                self._session_on_lock(node)
             node.lock_ref += 1
             self._update_leaf_status(node)
             node = node.parent
@@ -618,6 +622,7 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
                 self.evictable_size_ += len(node.key)
                 self.protected_size_ -= len(node.key)
                 delta += len(node.key)
+                self._session_on_unlock(node)
             node.lock_ref -= 1
             self._update_leaf_status(node)
             if node.parent is None:
@@ -693,6 +698,8 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
             child.hash_value, split_len, self.page_size
         )
 
+        self._session_on_split(new_node, child)
+
         return new_node
 
     def _inc_hit_count(self, node: TreeNode, chunked: bool = False):
@@ -751,6 +758,7 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
             self._inc_hit_count(new_node, chunked)
             node.children[child_key] = new_node
             self.evictable_size_ += len(key)
+            self._account_new_evictable_node(new_node)
             self._update_leaf_status(node)
             self._update_leaf_status(new_node)
             # Hash will be computed lazily during event emission
@@ -781,13 +789,14 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         v = node.parent.children.pop(key, None)
         assert v == node, f"parent does not have child key, {key}"
 
-        self._discard_session_leaf(node)
+        self._session_on_delete_leaf(node)
         self.evictable_size_ -= len(node.key)
         if node in self.evictable_leaves:
             self.evictable_leaves.remove(node)
         self._update_leaf_status(node.parent)
 
     def _update_leaf_status(self, node: TreeNode):
+        self._update_session_leaf_status(node)
         if node.evicted or node.lock_ref > 0:
             if node in self.evictable_leaves:
                 self.evictable_leaves.remove(node)

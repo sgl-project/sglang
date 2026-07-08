@@ -1,5 +1,5 @@
-"""Manual test for the session radix cache (--enable-session-radix-cache).
-Run directly: python test/manual/core/test_session_radix_cache.py
+"""Manual tests for the session radix cache (--enable-session-radix-cache).
+Run: PYTHONPATH=python python test/manual/core/test_session_radix_cache.py
 """
 
 import unittest
@@ -7,6 +7,10 @@ from array import array
 from types import SimpleNamespace
 
 import torch
+
+# Import before sglang: its triton stub breaks torch's lazy _inductor import
+# on hosts without real triton.
+import torch._inductor.runtime.triton_heuristics  # noqa: F401
 
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -19,155 +23,219 @@ from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
 
 
-class TestSessionRadixCache(unittest.TestCase):
-    def setUp(self):
-        dtype = torch.float16
-        kv = MHATokenToKVPool(
-            size=64,
+def make_cache(enable: bool = True) -> RadixCache:
+    dtype = torch.float16
+    kv = MHATokenToKVPool(
+        size=128,
+        page_size=1,
+        dtype=dtype,
+        head_num=2,
+        head_dim=8,
+        layer_num=1,
+        device="cpu",
+        enable_memory_saver=False,
+    )
+    allocator = TokenToKVPoolAllocator(
+        size=128, dtype=dtype, device="cpu", kvcache=kv, need_sort=False
+    )
+    req_to_token_pool = ReqToTokenPool(
+        size=8, max_context_len=1024, device="cpu", enable_memory_saver=False
+    )
+    return RadixCache(
+        CacheInitParams(
+            disable=False,
+            req_to_token_pool=req_to_token_pool,
+            token_to_kv_pool_allocator=allocator,
             page_size=1,
-            dtype=dtype,
-            head_num=2,
-            head_dim=8,
-            layer_num=1,
-            device="cpu",
-            enable_memory_saver=False,
+            eviction_policy="lru",
+            enable_kv_cache_events=False,
+            enable_session_radix_cache=enable,
         )
-        allocator = TokenToKVPoolAllocator(
-            size=64, dtype=dtype, device="cpu", kvcache=kv, need_sort=False
-        )
-        req_to_token_pool = ReqToTokenPool(
-            size=8, max_context_len=1024, device="cpu", enable_memory_saver=False
-        )
-        self.cache = RadixCache(
-            CacheInitParams(
-                disable=False,
-                req_to_token_pool=req_to_token_pool,
-                token_to_kv_pool_allocator=allocator,
-                page_size=1,
-                eviction_policy="lru",
-                enable_kv_cache_events=False,
-                enable_session_radix_cache=True,
-            )
-        )
+    )
 
-    def _insert(self, toks):
+
+class SessionCacheTestBase(unittest.TestCase):
+    enable = True
+
+    def setUp(self):
+        self.cache = make_cache(self.enable)
+
+    def insert(self, toks):
         idx = self.cache.token_to_kv_pool_allocator.alloc(len(toks))
-        self.cache.insert(
+        result = self.cache.insert(
             InsertParams(key=RadixKey(array("q", toks)), value=idx.to(torch.int64))
         )
+        return result.last_device_node
 
-    def _tag(self, toks, sid):
-        self.cache._tag_session_leaf(
-            SimpleNamespace(session_id=sid),
-            RadixKey(array("q", toks)),
-            node=self._leaf(toks),
-        )
-
-    def _cached(self, toks):
-        return int(
-            self.cache.match_prefix(
-                MatchPrefixParams(key=RadixKey(array("q", toks)))
-            ).device_indices.numel()
-        )
-
-    def _leaf(self, toks):
+    def match_node(self, toks):
         return self.cache.match_prefix(
             MatchPrefixParams(key=RadixKey(array("q", toks)))
         ).last_device_node
 
-    def test_tag_with_known_node_skips_match_prefix(self):
-        self._insert([1, 2, 3, 4])
-        leaf = self._leaf([1, 2, 3, 4])
-        orig_match_prefix = self.cache.match_prefix
-
-        def fail_match_prefix(_params):
-            raise AssertionError("match_prefix should not run when node is supplied")
-
-        self.cache.match_prefix = fail_match_prefix
-        try:
-            self.cache._tag_session_leaf(
-                SimpleNamespace(session_id="S"),
-                RadixKey(array("q", [1, 2, 3, 4])),
-                node=leaf,
-            )
-        finally:
-            self.cache.match_prefix = orig_match_prefix
-        self.assertEqual(getattr(leaf, "session_ids", None), {"S"})
-        self.assertIn(leaf, self.cache._session_leaves["S"])
-
-    def test_disabled_cache_does_not_tag_session_kv(self):
-        self.cache.enable_session_radix_cache = False
-        self._insert([1, 2, 3, 4])
-        self._tag([1, 2, 3, 4], "S")
-        self.assertIsNone(getattr(self._leaf([1, 2, 3, 4]), "session_ids", None))
-
-    def test_shared_prefix_frees_only_unique_tail(self):
-        # A/B share prefix [1,2]; close(A) frees only A's tail, B + shared stay.
-        self._insert([1, 2, 3, 4])
-        self._tag([1, 2, 3, 4], "A")
-        self._insert([1, 2, 5, 6])
-        self._tag([1, 2, 5, 6], "B")
-        self.assertGreater(self.cache.release_radix_session("A"), 0)
-        self.assertEqual(self._cached([1, 2, 3, 4]), 2)  # only shared [1,2] left
-        self.assertEqual(self._cached([1, 2, 5, 6]), 4)  # B intact
-
-    def test_same_leaf_freed_only_on_last_holder(self):
-        # Identical content -> one leaf held by {A,B}; freed only on last close.
-        self._insert([1, 2, 3, 4])
-        self._tag([1, 2, 3, 4], "A")
-        self._insert([1, 2, 3, 4])
-        self._tag([1, 2, 3, 4], "B")
-        self.assertEqual(
-            getattr(self._leaf([1, 2, 3, 4]), "session_ids", None), {"A", "B"}
+    def matched_len(self, toks):
+        return len(
+            self.cache.match_prefix(
+                MatchPrefixParams(key=RadixKey(array("q", toks)))
+            ).device_indices
         )
-        self.assertEqual(self.cache.release_radix_session("A"), 0)  # B still holds
-        self.assertEqual(self._cached([1, 2, 3, 4]), 4)
-        self.assertEqual(self.cache.release_radix_session("B"), 1)  # last holder frees
-        self.assertEqual(self._cached([1, 2, 3, 4]), 0)
 
-    def test_legacy_release_does_not_release_radix_session(self):
-        self._insert([1, 2, 3, 4])
-        self._tag([1, 2, 3, 4], "S")
-        self.cache.release_session("S")
-        self.assertEqual(self._cached([1, 2, 3, 4]), 4)
-        self.assertEqual(self.cache.release_radix_session("S"), 1)
+    def register(self, toks, sid):
+        req = SimpleNamespace(
+            session_id=sid,
+            last_node=self.match_node(toks),
+            origin_input_ids=list(toks),
+            output_ids=[],
+            kv_committed_len=len(toks),
+            extra_key=None,
+        )
+        self.cache.register_session_ref(req)
 
-    def test_tag_is_lru_neutral_not_pinned(self):
-        # The tag must add no lock/pin: a tagged, never-closed node is evictable.
-        self._insert([1, 2, 3, 4])
-        self._tag([1, 2, 3, 4], "S")
-        leaf = self._leaf([1, 2, 3, 4])
-        self.assertEqual(leaf.lock_ref, 0)
-        self.assertEqual(self.cache.protected_size(), 0)
-        self.assertIn(leaf, self.cache.evictable_leaves)
-        self.cache.evict(EvictParams(num_tokens=4))  # LRU reclaims it while open
-        self.assertEqual(self._cached([1, 2, 3, 4]), 0)
-        self.assertNotIn("S", self.cache._session_leaves)
+    def assert_conservation(self):
         self.assertEqual(
-            self.cache.release_radix_session("S"), 0
-        )  # late close is a no-op
+            self.cache.unused_evictable_size_ + self.cache.referenced_evictable_size_,
+            self.cache.evictable_size(),
+        )
 
-    def test_close_tombstone_blocks_late_finish(self):
-        self._insert([1, 2, 3, 4])
-        self._tag([1, 2, 3, 4], "S")
-        self.assertEqual(self.cache.release_radix_session("S"), 1)
 
-        self._insert([5, 6, 7, 8])
-        self._tag([5, 6, 7, 8], "S")  # simulates a finish racing after close
-        self.assertIsNone(getattr(self._leaf([5, 6, 7, 8]), "session_ids", None))
+class TestTierAccounting(SessionCacheTestBase):
+    def test_insert_lands_in_unused_tier(self):
+        self.insert([1, 2, 3, 4])
+        self.assertEqual(self.cache.unused_evictable_size_, 4)
+        self.assertEqual(self.cache.referenced_evictable_size_, 0)
+        self.assert_conservation()
 
-    def test_tombstoned_shared_holder_cannot_retag_after_last_holder_close(self):
-        self._insert([1, 2, 3, 4])
-        self._tag([1, 2, 3, 4], "A")
-        self._tag([1, 2, 3, 4], "B")
+    def test_register_moves_path_to_referenced_tier(self):
+        self.insert([1, 2, 3, 4])
+        self.insert([7, 8])
+        self.register([1, 2, 3, 4], "s1")
+        self.assertEqual(self.cache.referenced_evictable_size_, 4)
+        self.assertEqual(self.cache.unused_evictable_size_, 2)
+        self.assert_conservation()
 
-        self.assertEqual(self.cache.release_radix_session("B"), 0)
-        self.assertEqual(getattr(self._leaf([1, 2, 3, 4]), "session_ids", None), {"A"})
-        self.assertEqual(self.cache.release_radix_session("A"), 1)
+    def test_lock_ref_excludes_node_from_tier_sizes(self):
+        node = self.insert([1, 2, 3, 4])
+        self.register([1, 2, 3, 4], "s1")
+        self.cache.inc_lock_ref(node)
+        self.assertEqual(self.cache.referenced_evictable_size_, 0)
+        self.assert_conservation()
+        self.cache.dec_lock_ref(node)
+        self.assertEqual(self.cache.referenced_evictable_size_, 4)
+        self.assert_conservation()
 
-        self._insert([5, 6, 7, 8])
-        self._tag([5, 6, 7, 8], "B")
-        self.assertIsNone(getattr(self._leaf([5, 6, 7, 8]), "session_ids", None))
+    def test_split_propagates_ref_and_session_index(self):
+        self.insert([1, 2, 3, 4])
+        self.register([1, 2, 3, 4], "s1")
+        self.insert([1, 2, 9])
+        prefix_node = self.match_node([1, 2])
+        self.assertEqual(prefix_node.session_ref, 1)
+        self.assertIn("s1", prefix_node.tracked_session_ids)
+        self.assertIn(prefix_node, self.cache.session_id_to_ref_nodes["s1"])
+        self.assertEqual(self.cache.referenced_evictable_size_, 4)
+        self.assert_conservation()
+
+
+class TestRegisterRelease(SessionCacheTestBase):
+    def test_register_marks_whole_path(self):
+        self.insert([1, 2])
+        self.insert([1, 2, 3, 4])
+        self.register([1, 2, 3, 4], "s1")
+        self.assertEqual(self.match_node([1, 2]).session_ref, 1)
+        self.assertEqual(self.match_node([1, 2, 3, 4]).session_ref, 1)
+
+    def test_shared_prefix_counts_each_session(self):
+        self.insert([1, 2, 3, 4])
+        self.register([1, 2, 3, 4], "s1")
+        self.register([1, 2, 3, 4], "s2")
+        self.assertEqual(self.match_node([1, 2, 3, 4]).session_ref, 2)
+        self.cache.release_radix_session("s1")
+        self.assertEqual(self.match_node([1, 2, 3, 4]).session_ref, 1)
+        self.assertEqual(self.cache.referenced_evictable_size_, 4)
+
+    def test_release_only_dereferences(self):
+        self.insert([1, 2, 3, 4])
+        self.register([1, 2, 3, 4], "s1")
+        released = self.cache.release_radix_session("s1")
+        self.assertEqual(released, 1)
+        self.assertEqual(self.matched_len([1, 2, 3, 4]), 4)
+        self.assertEqual(self.match_node([1, 2, 3, 4]).session_ref, 0)
+        self.assertEqual(self.cache.referenced_evictable_size_, 0)
+        self.assertEqual(self.cache.unused_evictable_size_, 4)
+        self.assert_conservation()
+
+    def test_release_unknown_session_is_noop(self):
+        self.assertEqual(self.cache.release_radix_session("nope"), 0)
+
+    def test_tombstone_blocks_late_register(self):
+        self.insert([1, 2, 3, 4])
+        self.cache.release_radix_session("s1")
+        self.register([1, 2, 3, 4], "s1")
+        self.assertEqual(self.match_node([1, 2, 3, 4]).session_ref, 0)
+
+    def test_open_clears_tombstone(self):
+        self.insert([1, 2, 3, 4])
+        self.cache.release_radix_session("s1")
+        self.cache.open_radix_session("s1")
+        self.register([1, 2, 3, 4], "s1")
+        self.assertEqual(self.match_node([1, 2, 3, 4]).session_ref, 1)
+
+    def test_register_via_path_fallback(self):
+        self.insert([1, 2])
+        self.insert([1, 2, 3, 4])
+        req = SimpleNamespace(
+            session_id="s1",
+            last_node=None,
+            origin_input_ids=array("q", [1, 2, 3, 4]),
+            output_ids=array("q", []),
+            kv_committed_len=4,
+            extra_key=None,
+        )
+        self.cache.register_session_ref(req)
+        self.assertEqual(self.match_node([1, 2]).session_ref, 1)
+        self.assertEqual(self.match_node([1, 2, 3, 4]).session_ref, 1)
+        self.assertEqual(self.cache.referenced_evictable_size_, 4)
+
+
+class TestTieredEviction(SessionCacheTestBase):
+    def test_unused_evicted_before_referenced(self):
+        self.insert([1, 2, 3, 4])
+        self.insert([7, 8, 9])
+        self.register([1, 2, 3, 4], "s1")
+        self.cache.evict(EvictParams(num_tokens=3))
+        self.assertEqual(self.matched_len([7, 8, 9]), 0)
+        self.assertEqual(self.matched_len([1, 2, 3, 4]), 4)
+
+    def test_referenced_evicted_as_fallback_by_default(self):
+        self.insert([1, 2, 3, 4])
+        self.register([1, 2, 3, 4], "s1")
+        result = self.cache.evict(EvictParams(num_tokens=4))
+        self.assertEqual(result.num_tokens_evicted, 4)
+        self.assertEqual(self.matched_len([1, 2, 3, 4]), 0)
+
+    def test_release_then_evict_frees_kv(self):
+        self.insert([1, 2, 3, 4])
+        self.register([1, 2, 3, 4], "s1")
+        self.cache.release_radix_session("s1")
+        result = self.cache.evict(EvictParams(num_tokens=4))
+        self.assertEqual(result.num_tokens_evicted, 4)
+        self.assertEqual(self.cache.unused_evictable_size_, 0)
+        self.assert_conservation()
+
+
+class TestDisabledFlag(SessionCacheTestBase):
+    enable = False
+
+    def test_register_and_tiers_are_noop(self):
+        self.insert([1, 2, 3, 4])
+        self.register([1, 2, 3, 4], "s1")
+        self.assertEqual(self.match_node([1, 2, 3, 4]).session_ref, 0)
+        self.assertIsNone(self.match_node([1, 2, 3, 4]).tracked_session_ids)
+        self.assertEqual(self.cache.unused_evictable_size_, 0)
+        self.assertEqual(self.cache.referenced_evictable_size_, 0)
+
+    def test_plain_eviction_still_works(self):
+        self.insert([1, 2, 3, 4])
+        result = self.cache.evict(EvictParams(num_tokens=4))
+        self.assertEqual(result.num_tokens_evicted, 4)
 
 
 if __name__ == "__main__":

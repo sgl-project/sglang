@@ -55,6 +55,7 @@ from sglang.srt.mem_cache.radix_cache import (
     RadixKey,
     TreeNode,
 )
+from sglang.srt.mem_cache.session_radix_cache import SessionHiRadixCacheMixin
 from sglang.srt.mem_cache.utils import (
     compute_node_hash_values,
     split_node_hash_value,
@@ -72,7 +73,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-class HiRadixCache(RadixCache):
+class HiRadixCache(SessionHiRadixCacheMixin, RadixCache):
 
     def __init__(self, params: CacheInitParams, server_args: ServerArgs):
         self._enable_metrics_flag = params.enable_metrics
@@ -1069,6 +1070,7 @@ class HiRadixCache(RadixCache):
                 self.evictable_size_ -= len(node.key)
                 self.protected_size_ += len(node.key)
                 delta -= len(node.key)
+                self._session_on_lock(node)
             node.lock_ref += 1
             self._update_leaf_status(node)
             self._update_host_leaf_status(node)
@@ -1087,6 +1089,7 @@ class HiRadixCache(RadixCache):
                 self.evictable_size_ += len(node.key)
                 self.protected_size_ -= len(node.key)
                 delta += len(node.key)
+                self._session_on_unlock(node)
             node.lock_ref -= 1
             self._update_leaf_status(node)
             self._update_host_leaf_status(node)
@@ -1113,6 +1116,8 @@ class HiRadixCache(RadixCache):
             self.evictable_host_leaves.add(node)
 
     def evict(self, params: EvictParams) -> EvictResult:
+        if self.enable_session_radix_cache:
+            return self._evict_tiered(params)
         start_time = time.perf_counter()
         num_tokens = params.num_tokens
         if self.cache_controller.write_policy == "write_back":
@@ -1189,6 +1194,7 @@ class HiRadixCache(RadixCache):
         return num_evicted
 
     def _detach_backuped(self, node: TreeNode) -> int:
+        self._session_on_detach_backuped(node)
         # detach nodes from tree while keeping device slots, for write-back eviction
         self._record_remove_event(node, medium=StorageMedium.GPU)
         num_evicted = len(node.value)
@@ -1236,6 +1242,7 @@ class HiRadixCache(RadixCache):
 
         freed_device = 0
         for n in nodes:
+            self._session_forget_node(n)
             if n.host_value is not None:
                 self._record_remove_event(n, medium=StorageMedium.CPU)
                 self.cache_controller.evict_host(n.host_value)
@@ -1245,6 +1252,7 @@ class HiRadixCache(RadixCache):
                 self.cache_controller.mem_pool_device_allocator.free(n.value)
                 freed_device += len(n.value)
                 self.evictable_size_ -= len(n.value)
+                self._session_on_detach_backuped(n)
                 n.value = None
             self.ongoing_write_through.pop(n.id, None)
             self.evictable_leaves.discard(n)
@@ -1257,6 +1265,8 @@ class HiRadixCache(RadixCache):
         return freed_device
 
     def evict_host(self, num_tokens: int):
+        if self.enable_session_radix_cache:
+            return self._evict_host_tiered(num_tokens)
         leaves = list(self.evictable_host_leaves)
         eviction_heap = [
             (self.eviction_strategy.get_priority(node), node) for node in leaves
@@ -1356,6 +1366,7 @@ class HiRadixCache(RadixCache):
         for node in nodes_to_load:
             node.value = device_indices[offset : offset + len(node.host_value)].clone()
             offset += len(node.host_value)
+            self._account_new_evictable_node(node)
             # Block promoted from host to GPU -- emit store(GPU) so downstream
             # indexers see it as device-local again.
             self._record_store_event(node, medium=StorageMedium.GPU)
@@ -1812,6 +1823,8 @@ class HiRadixCache(RadixCache):
         if child.backuped:
             self._replace_pending_write_through_node(child, [new_node, child])
 
+        self._session_on_split(new_node, child)
+
         return new_node
 
     def insert(self, params: InsertParams) -> InsertResult:
@@ -1847,6 +1860,7 @@ class HiRadixCache(RadixCache):
                     # this often happens in the case of KV cache recomputation
                     node.value = value[:prefix_len].clone()
                     self.evictable_size_ += len(node.value)
+                    self._account_new_evictable_node(node)
                     self._update_leaf_status(node)
                     self._update_host_leaf_status(node)
                     # update parent status as a new leaf is added into device
@@ -1862,6 +1876,7 @@ class HiRadixCache(RadixCache):
                 if new_node.evicted:
                     new_node.value = value[:prefix_len].clone()
                     self.evictable_size_ += len(new_node.value)
+                    self._account_new_evictable_node(new_node)
                     self._update_leaf_status(new_node)
                     self._update_host_leaf_status(new_node)
                     # update parent status as a new leaf is added into device
@@ -1884,6 +1899,7 @@ class HiRadixCache(RadixCache):
             new_node.value = value.clone()
             node.children[child_key] = new_node
             self.evictable_size_ += len(value)
+            self._account_new_evictable_node(new_node)
             self._update_leaf_status(node)
             self._update_leaf_status(new_node)
 
