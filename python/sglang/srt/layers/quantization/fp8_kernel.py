@@ -170,23 +170,23 @@ def _per_token_group_quant_8bit(
 
     This function converts the tensor values into float8 values.
     """
-    # Map the program id to the row of X and Y it should compute.
-    g_id = tl.program_id(0)
-    y_ptr += g_id * y_stride
-    y_q_ptr += g_id * y_stride
+    g_id = tl.program_id(0).to(tl.int64)
+    y_off = g_id * y_stride
+    y_ptr += y_off
+    y_q_ptr += y_off
     y_s_ptr += g_id
 
     cols = tl.arange(0, BLOCK)  # N <= BLOCK
     mask = cols < N
 
-    y = tl.load(y_ptr + cols, mask=mask, other=0.0).to(tl.float32)
-    # Quant
-    _absmax = tl.maximum(tl.max(tl.abs(y)), eps)
+    y = tl.load(y_ptr + cols, mask=mask, other=0.0, eviction_policy="evict_first").to(tl.float32)
+    y_abs = tl.abs(y)
+    _absmax = tl.maximum(tl.max(y_abs), eps)
     y_s = _absmax / bit8_max
-    y_s_inv = 1.0 / y_s
+    y_s_inv = tl.math.fast_dividef(1.0, y_s)
     y_q = tl.clamp(y * y_s_inv, bit8_min, bit8_max).to(y_q_ptr.dtype.element_ty)
 
-    tl.store(y_q_ptr + cols, y_q, mask=mask)
+    tl.store(y_q_ptr + cols, y_q, mask=mask, eviction_policy="evict_first")
     tl.store(y_s_ptr, y_s)
 
 
