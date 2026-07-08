@@ -222,13 +222,20 @@ def get_zmq_socket_on_host(
 
 
 def config_socket(socket, socket_type: zmq.SocketType):
-    mem = psutil.virtual_memory()
-    total_mem = mem.total / 1024**3
-    available_mem = mem.available / 1024**3
-    if total_mem > 32 and available_mem > 16:
-        buf_size = int(0.5 * 1024**3)
+    buf_size = -1
+    try:
+        mem = psutil.virtual_memory()
+    except (OSError, ValueError):
+        logger.debug(
+            "Failed to inspect system memory for ZMQ socket buffer sizing; "
+            "using default socket buffers.",
+            exc_info=True,
+        )
     else:
-        buf_size = -1
+        total_mem = mem.total / 1024**3
+        available_mem = mem.available / 1024**3
+        if total_mem > 32 and available_mem > 16:
+            buf_size = int(0.5 * 1024**3)
 
     def set_send_opt():
         socket.setsockopt(zmq.SNDHWM, 0)
