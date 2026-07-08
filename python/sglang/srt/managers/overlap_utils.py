@@ -307,11 +307,6 @@ class FutureMap:
         # Mechanism: don't sync the schedule stream; gate a private stream on the
         # publish event and copy into the static pinned buffer.
         self.fwd_prepare_d2h_stream.wait_event(self.publish_ready)
-        # Rows seeded on the schedule stream (record_event=False publishes)
-        # carry no event; give the private-stream copy an explicit edge.
-        self.fwd_prepare_d2h_stream.wait_stream(
-            torch.get_device_module(self.device).current_stream()
-        )
         with torch.get_device_module(self.device).stream(self.fwd_prepare_d2h_stream):
             self.new_seq_lens_cpu_pinned.copy_(self.new_seq_lens_buf, non_blocking=True)
         self.fwd_prepare_d2h_stream.synchronize()
@@ -320,21 +315,21 @@ class FutureMap:
         batch.seq_lens_cpu = self.new_seq_lens_cpu_pinned[batch.req_pool_indices_cpu]
         batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
 
-    def publish(
-        self,
-        future_indices: torch.Tensor,
-        new_seq_lens: torch.Tensor,
-        record_event: bool = True,
-    ) -> None:
+    def publish(self, future_indices: torch.Tensor, new_seq_lens: torch.Tensor) -> None:
         indices = future_indices
         if indices.shape[0] == 0:
             return  # DP idle
         self.new_seq_lens_buf[indices] = new_seq_lens.to(self.new_seq_lens_buf.dtype)
-        # publish_ready is forward-owned (spec_v2 only): re-recording it off the
-        # forward stream would drop the fence on the in-flight forward's write.
-        if record_event and self.spec_algo.is_some():
+        # Only spec_v2 needs the event; it gates the seq_lens D2H on the private stream.
+        if self.spec_algo.is_some():
+            device_module = torch.get_device_module(self.device)
             if self.publish_ready is None:
-                self.publish_ready = torch.get_device_module(self.device).Event()
+                self.publish_ready = device_module.Event()
+            else:
+                # Chain the records: event fire implies every prior publish is
+                # visible, so an off-forward-stream publish (PD-decode prebuilt
+                # seeding) cannot drop the in-flight forward's fence.
+                device_module.current_stream().wait_event(self.publish_ready)
             self.publish_ready.record()
 
     def stash(self, future_indices: torch.Tensor, payload: RelayPayload) -> None:

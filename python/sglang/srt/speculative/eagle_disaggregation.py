@@ -61,9 +61,9 @@ def build_eagle_disagg_draft_input(
 
     if batch.enable_overlap:
         spec_info.future_indices = batch.req_pool_indices
-        # Seed the relay buf with the known seq_lens; not a forward-completion
-        # signal, so skip the publish_ready record (see FutureMap.publish).
-        future_map.publish(spec_info.future_indices, batch.seq_lens, record_event=False)
+        # Seed the relay buf with the known seq_lens; publish's chained record
+        # keeps the in-flight forward's fence intact (see FutureMap.publish).
+        future_map.publish(spec_info.future_indices, batch.seq_lens)
         future_map.stash(
             spec_info.future_indices, RelayPayload.from_draft_input(spec_info)
         )
