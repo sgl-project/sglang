@@ -281,6 +281,11 @@ class TestCommonKVManagerPrefillRecompute(unittest.TestCase):
         mgr.waiting_timeout = 300
         mgr.failure_records = {}
         mgr.failure_lock = threading.Lock()
+        # Only the attn-tp/attn-cp group leader on the first PP stage issues the
+        # single rebootstrap /generate; default the mock manager to that leader.
+        mgr.attn_tp_rank = 0
+        mgr.attn_cp_rank = 0
+        mgr.pp_rank = 0
         # Decode-side prefill info cache; the rebootstrap /generate URL is derived
         # from here (bootstrap_addr host + self-registered prefill_http_port)
         # instead of a router-injected pd_rebootstrap_prefill_url.
@@ -322,6 +327,34 @@ class TestCommonKVManagerPrefillRecompute(unittest.TestCase):
         # URL derived from bootstrap_addr host + registered prefill_http_port.
         self.assertEqual(args[2], "http://127.0.0.1:30000")
         receiver.abort.assert_not_called()
+
+    def test_submit_is_noop_on_non_leader_ranks(self):
+        # A retracted request is replicated across every rank in its attention
+        # TP/CP group and every PP stage; only the group/first-stage leader must
+        # POST the single /generate, or the prefill recomputes it once per rank.
+        for attn_tp_rank, attn_cp_rank, pp_rank in (
+            (1, 0, 0),
+            (0, 1, 0),
+            (0, 0, 1),
+        ):
+            with self.subTest(
+                attn_tp_rank=attn_tp_rank,
+                attn_cp_rank=attn_cp_rank,
+                pp_rank=pp_rank,
+            ):
+                mgr = self._new_manager()
+                mgr.attn_tp_rank = attn_tp_rank
+                mgr.attn_cp_rank = attn_cp_rank
+                mgr.pp_rank = pp_rank
+                mgr._prefill_recompute_executor = MagicMock()
+                receiver = MagicMock(bootstrap_room=7, bootstrap_addr="127.0.0.1:8998")
+                self._register_prefill_info(mgr, "127.0.0.1:8998", 30000)
+
+                mgr.submit_prefill_recompute(receiver, self._payload())
+
+                mgr._prefill_recompute_executor.submit.assert_not_called()
+                receiver.abort.assert_not_called()
+                self.assertEqual(mgr.failure_records, {})
 
     def test_submit_unresolved_url_fails_via_abort(self):
         mgr = self._new_manager()

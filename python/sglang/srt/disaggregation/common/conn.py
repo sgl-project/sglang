@@ -320,7 +320,21 @@ class CommonKVManager(BaseKVManager):
         handling streams the aborted request back to the client. ``payload`` is
         prebuilt by the decode scheduler (``Req.build_rebootstrap_payload``) so
         HTTP/sampling concerns stay on the kv manager.
+
+        The decode scheduler broadcasts each retracted request to every rank in
+        its attention TP/CP group and every PP stage, so all of them reach this
+        call and would each POST an identical ``/generate`` -- making the prefill
+        worker recompute the same request once per decode rank. The ``/generate``
+        is a server-level call: the prefill frontend fans it out to its own
+        workers and transfers the recomputed KV back to *all* decode ranks, so
+        exactly one decode rank must issue it. Elect the same leader the request
+        receiver uses (attn-tp/attn-cp group leader, first PP stage); the other
+        ranks still bootstrap and receive their KV shard as usual, and on failure
+        the leader-only abort matches the leader-only output streaming (other
+        ranks fall back to the per-request waiting-timeout safety net).
         """
+        if self.attn_tp_rank != 0 or self.attn_cp_rank != 0 or self.pp_rank != 0:
+            return
         prefill_url = self._resolve_rebootstrap_prefill_url(kv_receiver)
         if not prefill_url:
             logger.error(
