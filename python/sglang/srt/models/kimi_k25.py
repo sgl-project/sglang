@@ -6,29 +6,20 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
-from transformers import activations
+from transformers.activations import PytorchGELUTanh
 
 from sglang.srt.configs.kimi_k25 import KimiK25Config, KimiK25VisionConfig
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.conv import Conv2dLayer
+from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
+from sglang.srt.layers.quantization.quark.quark import QuarkConfig
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
 )
-
-try:
-    from transformers.activations import PytorchGELUTanh
-except ImportError:
-    from transformers.activations import GELUTanh
-
-    activations.PytorchGELUTanh = GELUTanh
-    PytorchGELUTanh = GELUTanh
-
-from sglang.srt.layers.attention.vision import VisionAttention
-from sglang.srt.layers.linear import ReplicatedLinear
-from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
-from sglang.srt.layers.quantization.quark.quark import QuarkConfig
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
@@ -674,6 +665,19 @@ class KimiK25ForConditionalGeneration(nn.Module):
             self.vision_tower = self.vision_tower.to(dtype=target_dtype)
             self.mm_projector = self.mm_projector.to(dtype=target_dtype)
 
+    @property
+    def model(self):
+        # Alias .model to .language_model so this class satisfies the piecewise
+        # CUDA graph gate, which checks `hasattr(model, "model")`.
+        return self.language_model
+
+    def __setattr__(self, name, value):
+        # Skip redundant self.model.model assignment in runner to avoid duplicate
+        # nn.Module registration.
+        if name == "model":
+            return
+        super().__setattr__(name, value)
+
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         device = self.vision_tower.device
         target_dtype = self.vision_tower.patch_embed.proj.weight.dtype
@@ -790,6 +794,24 @@ class KimiK25ForConditionalGeneration(nn.Module):
             # encoder-only: drain the generator so inline vision-weight loading fires.
             for _ in stream_language_weights():
                 pass
+
+    def post_load_weights(self):
+        if self.language_model is not None:
+            self.language_model.post_load_weights()
+
+    @property
+    def stacked_params_mapping(self):
+        return getattr(self.language_model, "stacked_params_mapping", [])
+
+    @property
+    def expert_params_mapping(self):
+        return getattr(self.language_model, "expert_params_mapping", [])
+
+    def mutate_weight_preload(self, name):
+        return self.language_model.mutate_weight_preload(name)
+
+    def custom_scale_remap(self, name):
+        return self.language_model.custom_scale_remap(name)
 
     @classmethod
     def get_model_config_for_expert_location(cls, config: KimiK25Config):

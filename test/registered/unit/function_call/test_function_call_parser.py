@@ -32,6 +32,7 @@ from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
+register_cpu_ci(est_time=61, suite="base-c-test-cpu")
 
 
 class TestPythonicDetector(unittest.TestCase):
@@ -1642,12 +1643,17 @@ class TestDeepSeekV32Detector(unittest.TestCase):
     def test_get_model_structural_tag(self):
         import xgrammar as xgr
 
+        self.assertEqual(self.detector.get_structural_tag_name(), "deepseek_v3_2")
+
         structural_tag = self.detector.get_structural_tag(
             self.tools, thinking_mode=True
         )
         self.assertIsInstance(structural_tag, xgr.StructuralTag)
         grammar = xgr.Grammar.from_structural_tag(structural_tag)
         self.assertIsInstance(grammar, xgr.Grammar)
+        serialized = structural_tag.model_dump_json()
+        self.assertIn("</｜DSML｜invoke>\\n", serialized)
+        self.assertNotIn("</｜DSML｜invoke>\\n\\n", serialized)
 
         structural_tag = self.detector.get_structural_tag(
             self.tools, thinking_mode=False
@@ -2087,12 +2093,17 @@ class TestDeepSeekV4Detector(unittest.TestCase):
     def test_get_model_structural_tag(self):
         import xgrammar as xgr
 
+        self.assertEqual(self.detector.get_structural_tag_name(), "deepseek_v4")
+
         structural_tag = self.detector.get_structural_tag(
             self.tools, thinking_mode=True
         )
         self.assertIsInstance(structural_tag, xgr.StructuralTag)
         grammar = xgr.Grammar.from_structural_tag(structural_tag)
         self.assertIsInstance(grammar, xgr.Grammar)
+        serialized = structural_tag.model_dump_json()
+        self.assertIn("</｜DSML｜invoke>\\n", serialized)
+        self.assertNotIn("</｜DSML｜invoke>\\n\\n", serialized)
 
         structural_tag = self.detector.get_structural_tag(
             self.tools, thinking_mode=False
@@ -3348,6 +3359,69 @@ class TestGlm47MoeDetector(unittest.TestCase):
         params = json.loads(result.calls[0].parameters)
         self.assertEqual(params["old_string"], "    indented code")
         self.assertEqual(params["new_string"], "        also indented")
+
+    def test_get_model_structural_tag(self):
+        """GLM-4.7/GLM-5 use xgrammar's native "glm_4_7" structural tag."""
+        import xgrammar as xgr
+
+        self.assertTrue(self.detector.supports_structural_tag())
+        self.assertEqual(self.detector.get_structural_tag_name(), "glm_4_7")
+
+        # thinking_mode=True keeps the </think> reasoning prefix.
+        structural_tag = self.detector.get_structural_tag(
+            self.tools, thinking_mode=True
+        )
+        self.assertIsInstance(structural_tag, xgr.StructuralTag)
+        self.assertIsInstance(
+            xgr.Grammar.from_structural_tag(structural_tag), xgr.Grammar
+        )
+        serialized = structural_tag.model_dump_json()
+        self.assertIn("glm_xml", serialized)
+        self.assertIn("<tool_call>", serialized)
+        self.assertIn("</think>", serialized)
+
+        # thinking_mode=False drops the reasoning prefix (ReasonerGrammarBackend
+        # owns </think> when --reasoning-parser is configured).
+        structural_tag = self.detector.get_structural_tag(
+            self.tools, thinking_mode=False
+        )
+        self.assertIsInstance(structural_tag, xgr.StructuralTag)
+        self.assertIsInstance(
+            xgr.Grammar.from_structural_tag(structural_tag), xgr.Grammar
+        )
+        self.assertNotEqual("sequence", structural_tag.model_dump()["format"]["type"])
+
+        # tool_choice="required" must still compile to a grammar.
+        structural_tag = self.detector.get_structural_tag(
+            self.tools, thinking_mode=True, tool_choice="required"
+        )
+        self.assertIsInstance(structural_tag, xgr.StructuralTag)
+        self.assertIsInstance(
+            xgr.Grammar.from_structural_tag(structural_tag), xgr.Grammar
+        )
+
+    def test_required_tool_choice_falls_back_when_native_tag_is_unavailable(self):
+        from unittest.mock import patch
+
+        from sglang.srt.function_call.function_call_parser import FunctionCallParser
+        from sglang.srt.function_call.glm47_moe_detector import (
+            _glm47_native_structural_tag_available,
+        )
+
+        with patch(
+            "sglang.srt.function_call.glm47_moe_detector.get_model_structural_tag",
+            None,
+        ):
+            _glm47_native_structural_tag_available.cache_clear()
+            self.assertFalse(self.detector.supports_structural_tag())
+            self.assertIsNone(self.detector.get_structural_tag(self.tools))
+
+            parser = FunctionCallParser(self.tools, "glm47")
+            constraint = parser.get_structure_constraint("required")
+
+            self.assertIsNotNone(constraint)
+            self.assertEqual("json_schema", constraint[0])
+            _glm47_native_structural_tag_available.cache_clear()
 
 
 class TestJsonArrayParser(unittest.TestCase):
@@ -4685,46 +4759,54 @@ class TestGetStructureConstraint(unittest.TestCase):
 
         return FunctionCallParser(self._make_tools(strict=strict), parser_name)
 
+    def _constraint_json(self, result):
+        return result[1].model_dump_json()
+
     # --- structural_tag detectors (kimi_k2, deepseekv3, qwen25, etc.) ---
 
     def test_kimi_required_strict_returns_structural_tag(self):
+        import xgrammar as xgr
+
         parser = self._make_parser("kimi_k2", strict=True)
         result = parser.get_structure_constraint("required")
         self.assertIsNotNone(result)
         self.assertEqual(result[0], "structural_tag")
-        self.assertTrue(result[1].at_least_one)
+        self.assertIsInstance(result[1], xgr.StructuralTag)
+        self.assertIn("<|tool_calls_section_begin|>", self._constraint_json(result))
 
     def test_kimi_required_no_strict_returns_structural_tag(self):
         """required should use structural_tag even without strict, to preserve native format."""
+        import xgrammar as xgr
+
         parser = self._make_parser("kimi_k2", strict=False)
         result = parser.get_structure_constraint("required")
         self.assertIsNotNone(result)
         self.assertEqual(result[0], "structural_tag")
-        self.assertTrue(result[1].at_least_one)
+        self.assertIsInstance(result[1], xgr.StructuralTag)
+        self.assertIn("<|tool_calls_section_begin|>", self._constraint_json(result))
 
     def test_kimi_auto_strict_returns_structural_tag(self):
+        import xgrammar as xgr
+
         parser = self._make_parser("kimi_k2", strict=True)
         result = parser.get_structure_constraint("auto")
         self.assertIsNotNone(result)
         self.assertEqual(result[0], "structural_tag")
-        self.assertFalse(result[1].at_least_one)
+        self.assertIsInstance(result[1], xgr.StructuralTag)
+        serialized = self._constraint_json(result)
+        self.assertIn('"type":"triggered_tags"', serialized)
+        self.assertIn("<|tool_calls_section_begin|>", serialized)
 
-    def test_kimi_routes_through_legacy_with_section_markers(self):
-        """xgrammar 0.2.0's get_kimi_structural_tag(tool_choice='auto') emits
-        a bare <|tool_call_begin|>...<|tool_call_end|> grammar without the
-        section wrapper Kimi's chat template uses, so the parser would drop
-        any generated tool calls. KimiK2Detector therefore stays on the
-        legacy path; pin that here so a future tweak doesn't silently
-        re-route Kimi through the broken builtin."""
-        from sglang.srt.entrypoints.openai.protocol import (
-            LegacyStructuralTagResponseFormat,
-        )
+    def test_kimi_routes_through_native_with_section_markers(self):
+        """xgrammar 0.2.1's Kimi builtin keeps auto tool calls section-wrapped."""
+        import xgrammar as xgr
 
         parser = self._make_parser("kimi_k2", strict=True)
         result = parser.get_structure_constraint("auto")
-        self.assertIsInstance(result[1], LegacyStructuralTagResponseFormat)
-        self.assertIn("<|tool_calls_section_begin|>", result[1].structures[0].begin)
-        self.assertIn("<|tool_calls_section_end|>", result[1].structures[0].end)
+        self.assertIsInstance(result[1], xgr.StructuralTag)
+        serialized = self._constraint_json(result)
+        self.assertIn("<|tool_calls_section_begin|>", serialized)
+        self.assertIn("<|tool_calls_section_end|>", serialized)
 
     def test_kimi_auto_no_strict_returns_none(self):
         """auto without strict should not constrain."""
@@ -4762,25 +4844,29 @@ class TestGetStructureConstraint(unittest.TestCase):
         """Verify structural_tag contains kimi-specific special tokens."""
         parser = self._make_parser("kimi_k2", strict=True)
         result = parser.get_structure_constraint("required")
-        tag = result[1]
-        self.assertTrue(len(tag.structures) > 0)
-        self.assertIn("<|tool_calls_section_begin|>", tag.structures[0].begin)
-        self.assertIn("<|tool_call_end|>", tag.structures[0].end)
+        serialized = self._constraint_json(result)
+        self.assertIn("<|tool_calls_section_begin|>", serialized)
+        self.assertIn("functions.get_weather:", serialized)
+        self.assertIn('"pattern":"\\\\d+"', serialized)
+        self.assertIn("<|tool_call_end|>", serialized)
+        self.assertIn("<|tool_calls_section_end|>", serialized)
 
-    def test_kimi_required_no_strict_uses_empty_schema(self):
-        """Without strict, structural_tag should use empty schema per OpenAI
-        protocol: strict=False means no parameter schema enforcement."""
+    def test_kimi_required_no_strict_uses_loose_object_schema(self):
+        """Kimi required calls keep non-strict arguments object-shaped but loose."""
         parser = self._make_parser("kimi_k2", strict=False)
         result = parser.get_structure_constraint("required")
-        self.assertEqual(result[1].structures[0].schema_, {})
+        serialized = self._constraint_json(result)
+        self.assertIn('"json_schema":{"type":"object"}', serialized)
+        self.assertNotIn('"additionalProperties":false', serialized)
+        self.assertNotIn('"properties"', serialized)
 
     def test_kimi_required_strict_uses_tool_schema(self):
-        """With strict, structural_tag should include the tool's parameter schema."""
+        """With strict, native xgrammar should include the tool's parameter schema."""
         parser = self._make_parser("kimi_k2", strict=True)
         result = parser.get_structure_constraint("required")
-        schema = result[1].structures[0].schema_
-        self.assertIn("properties", schema)
-        self.assertIn("city", schema["properties"])
+        serialized = self._constraint_json(result)
+        self.assertIn('"properties"', serialized)
+        self.assertIn('"city"', serialized)
 
     # --- reasoning-prefix ownership ---
 

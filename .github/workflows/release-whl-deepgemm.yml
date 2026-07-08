@@ -17,14 +17,19 @@ on:
           - 'cu129'
           - 'cu130'
       branch:
-        description: "DeepGEMM branch to build from (default: release-0426)"
+        description: "DeepGEMM branch to build from (default: dev)"
         type: string
         required: false
-        default: 'release-0426'
+        default: 'dev'
 
 concurrency:
   group: release-sgl-deepgemm-${{ github.ref }}
   cancel-in-progress: true
+
+env:
+  # Must match TORCH_VER in docker/sgl-deep-gemm.Dockerfile — the wheel's
+  # pre-compiled _C.so links against this torch ABI.
+  TORCH_VER: "2.11.0"
 
 jobs:
   build-cu129-matrix:
@@ -54,7 +59,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: sgl-project/DeepGEMM
-          ref: ${{ inputs.branch }}
+          ref: ${{ inputs.branch || 'dev' }}
           path: DeepGEMM
           submodules: recursive
 
@@ -74,8 +79,57 @@ jobs:
           name: deepgemm-wheel-cuda${{ matrix.cuda-version }}-${{ matrix.arch }}
           path: DeepGEMM/dist/*.whl
 
-  release-cu129:
+  test-cu129:
     needs: build-cu129-matrix
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch_label: sm90
+            runner: 8-gpu-h200
+            wheel_arch: x86_64
+          - arch_label: sm100
+            runner: 8-gpu-b200
+            wheel_arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout DeepGEMM
+        uses: actions/checkout@v4
+        with:
+          repository: sgl-project/DeepGEMM
+          ref: ${{ inputs.branch || 'dev' }}
+          path: DeepGEMM
+          submodules: recursive
+
+      - name: Download wheel
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/
+          merge-multiple: true
+          pattern: deepgemm-wheel-cuda12.9-${{ matrix.wheel_arch }}
+
+      - name: Install wheel and deps
+        env:
+          CU_TAG: cu129
+        run: |
+          python3 -m pip install --upgrade pip
+          # deep_gemm imports torch before loading _C.so, so torch must preload the
+          # libcudart the cu129 wheel links. Pin the CUDA-matched torch (see sgl-deep-gemm.Dockerfile).
+          python3 -m pip install "torch==${TORCH_VER}" --index-url "https://download.pytorch.org/whl/${CU_TAG}" --force-reinstall
+          python3 -m pip install numpy
+          python3 -m pip install dist/*.whl
+          python3 -c "import deep_gemm; print('deep_gemm:', deep_gemm.__file__)"
+
+      - name: Run DeepGEMM test suite
+        run: |
+          chmod +x "${{ github.workspace }}/DeepGEMM/sgl_deep_gemm/run_tests.sh"
+          "${{ github.workspace }}/DeepGEMM/sgl_deep_gemm/run_tests.sh"
+
+  release-cu129:
+    needs: [build-cu129-matrix, test-cu129]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -140,7 +194,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: sgl-project/DeepGEMM
-          ref: ${{ inputs.branch }}
+          ref: ${{ inputs.branch || 'dev' }}
           path: DeepGEMM
           submodules: recursive
 
@@ -159,20 +213,73 @@ jobs:
           chmod +x ./scripts/build_sgl_deep_gemm.sh ./scripts/rename_sgl_deep_gemm_whl.sh
           ./scripts/build_sgl_deep_gemm.sh "${{ matrix.python-version }}" "${{ matrix.cuda-version }}" "${{ github.workspace }}/DeepGEMM" "${{ matrix.arch }}"
 
-      - name: Upload to PyPI
-        working-directory: DeepGEMM
-        run: |
-          pip install twine
-          python3 -m twine upload --skip-existing dist-pypi/* -u __token__ -p ${{ secrets.SGL_DEEP_GEMM_PYPI_TOKEN }}
-
+      # PyPI upload moved to release-cu130 so it is gated on test-cu130.
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: deepgemm-wheel-cuda${{ matrix.cuda-version }}-${{ matrix.arch }}
           path: DeepGEMM/dist/*.whl
 
-  release-cu130:
+      - name: Upload PyPI artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: deepgemm-pypi-cuda${{ matrix.cuda-version }}-${{ matrix.arch }}
+          path: DeepGEMM/dist-pypi/*.whl
+
+  test-cu130:
     needs: build-cu130-matrix
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch_label: sm90
+            runner: 8-gpu-h200
+            wheel_arch: x86_64
+          - arch_label: sm100
+            runner: 8-gpu-b200
+            wheel_arch: x86_64
+          - arch_label: sm100-aarch64
+            runner: 4-gpu-gb300
+            wheel_arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout DeepGEMM
+        uses: actions/checkout@v4
+        with:
+          repository: sgl-project/DeepGEMM
+          ref: ${{ inputs.branch || 'dev' }}
+          path: DeepGEMM
+          submodules: recursive
+
+      - name: Download wheel
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/
+          merge-multiple: true
+          pattern: deepgemm-wheel-cuda13.0-${{ matrix.wheel_arch }}
+
+      - name: Install wheel and deps
+        env:
+          CU_TAG: cu130
+        run: |
+          python3 -m pip install --upgrade pip
+          # deep_gemm imports torch before loading _C.so, so torch must preload the
+          # libcudart the cu130 wheel links. Pin the CUDA-matched torch (see sgl-deep-gemm.Dockerfile).
+          python3 -m pip install "torch==${TORCH_VER}" --index-url "https://download.pytorch.org/whl/${CU_TAG}" --force-reinstall
+          python3 -m pip install numpy
+          python3 -m pip install dist/*.whl
+          python3 -c "import deep_gemm; print('deep_gemm:', deep_gemm.__file__)"
+
+      - name: Run DeepGEMM test suite
+        run: |
+          chmod +x "${{ github.workspace }}/DeepGEMM/sgl_deep_gemm/run_tests.sh"
+          "${{ github.workspace }}/DeepGEMM/sgl_deep_gemm/run_tests.sh"
+
+  release-cu130:
+    needs: [build-cu130-matrix, test-cu130]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -183,6 +290,18 @@ jobs:
           path: dist/
           merge-multiple: true
           pattern: deepgemm-wheel-cuda13.0-*
+
+      - name: Download PyPI artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist-pypi/
+          merge-multiple: true
+          pattern: deepgemm-pypi-cuda13.0-*
+
+      - name: Upload to PyPI
+        run: |
+          pip install --upgrade twine "packaging>=24.2"
+          python3 -m twine upload --skip-existing dist-pypi/* -u __token__ -p ${{ secrets.SGL_DEEP_GEMM_PYPI_TOKEN }}
 
       - name: Release
         uses: softprops/action-gh-release@v2

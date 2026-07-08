@@ -36,6 +36,9 @@ else:
         concat_mla_absorb_q,
         concat_mla_k,
         copy_to_gpu_no_ce,
+        dsv4_fused_k_norm_rope_flashmla,
+        dsv4_fused_q_indexer_rope_hadamard_quant,
+        dsv4_fused_q_norm_rope,
         fused_add_rmsnorm,
         gelu_and_mul,
         gelu_tanh_and_mul,
@@ -54,7 +57,6 @@ else:
         awq_dequantize,
         bmm_fp8,
         dsv3_fused_a_gemm,
-        dsv3_router_gemm,
         fp8_blockwise_scaled_mm,
         fp8_scaled_mm,
         gptq_gemm,
@@ -69,6 +71,10 @@ else:
         shuffle_rows,
     )
     from sgl_kernel.grammar import apply_token_bitmask_inplace_cuda
+    from sgl_kernel.infllm_v2 import (
+        infllmv2_attn_stage1,
+        max_pooling_1d_varlen,
+    )
     from sgl_kernel.kvcacheio import (
         transfer_kv_all_layer,
         transfer_kv_all_layer_mla,
@@ -87,9 +93,7 @@ else:
         apply_shuffle_mul_sum,
         fp8_blockwise_scaled_grouped_mm,
         fused_qk_norm_rope,
-        kimi_k2_moe_fused_gate,
         moe_align_block_size,
-        moe_fused_gate,
         moe_sum,
         moe_sum_reduce,
         prepare_moe_input,
@@ -125,6 +129,7 @@ else:
 
     if torch.version.hip is not None:
         from sgl_kernel.elementwise import gelu_quick
+        from sgl_kernel.top_k import deepseek_v4_topk_transform_512
 
     if hasattr(torch.version, "musa") and torch.version.musa is not None:
         from sgl_kernel.musa import (
@@ -152,6 +157,9 @@ else:
         "cutlass_mla_get_workspace_size",
         "dsv3_fused_a_gemm",
         "dsv3_router_gemm",
+        "dsv4_fused_k_norm_rope_flashmla",
+        "dsv4_fused_q_indexer_rope_hadamard_quant",
+        "dsv4_fused_q_norm_rope",
         "es_fp8_blockwise_scaled_grouped_mm",
         "es_sm100_mxfp8_blockscaled_grouped_mm",
         "es_sm100_mxfp8_blockscaled_grouped_quant",
@@ -171,10 +179,8 @@ else:
         "gptq_gemm",
         "gptq_shuffle",
         "int8_scaled_mm",
-        "kimi_k2_moe_fused_gate",
         "merge_state_v2",
         "moe_align_block_size",
-        "moe_fused_gate",
         "moe_sum",
         "moe_sum_reduce",
         "prepare_moe_input",
@@ -205,6 +211,7 @@ else:
 
     if torch.version.hip is not None:
         _DEBUG_EXPORT_NAMES.append("gelu_quick")
+        _DEBUG_EXPORT_NAMES.append("deepseek_v4_topk_transform_512")
 
     for _name in _DEBUG_EXPORT_NAMES:
         if _name in globals():

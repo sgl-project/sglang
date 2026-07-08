@@ -300,4 +300,6 @@ class AscendLoRABackend(BaseLoRABackend):
             scalings_tensor, non_blocking=True
         )
         batch_info.weight_indices[:bs].copy_(weight_indices_tensor, non_blocking=True)
+
+        batch_info = self._add_moe_lora_info(forward_batch, batch_info)
         self.batch_info = batch_info

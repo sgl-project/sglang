@@ -12,9 +12,14 @@ import triton.language as tl
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.dsa_indexer import rotate_activation
 from sglang.srt.layers.attention.dsv4.compressor import Compressor as _CompressorBase
+from sglang.srt.layers.attention.dsv4.fused_compress_triton import (
+    fused_ape_pool_norm_rope,
+)
+from sglang.srt.layers.attention.nsa.nsa_indexer import rotate_activation
 from sglang.srt.layers.deepseek_v4_rope import (
     apply_rotary_emb_triton,
     fused_norm_rope_inplace_triton,
+    fused_softmax_pool_triton,
 )
 
 try:
@@ -205,13 +210,18 @@ class CompressorHip(_CompressorBase):
             pre_state_indices = self.compute_state_len_indices(
                 seq_len=prefix_lens[i], ratio=self.ratio
             ).to(device)
-            raw_loc = torch.where(
-                pre_state_indices < 0,
-                -1,
-                req_to_token[req_pool_indices[i], pre_state_indices],
-            )
-            swa_loc = token_to_kv_pool.translate_loc_from_full_to_swa(raw_loc)
-            state_loc = state_pool.translate_from_swa_loc_to_state_loc(swa_loc)
+            if self.ratio == 128:
+                state_loc = state_pool.translate_from_req_position_to_state_loc(
+                    req_pool_indices[i], pre_state_indices
+                )
+            else:
+                raw_loc = torch.where(
+                    pre_state_indices < 0,
+                    -1,
+                    req_to_token[req_pool_indices[i], pre_state_indices],
+                )
+                swa_loc = token_to_kv_pool.translate_loc_from_full_to_swa(raw_loc)
+                state_loc = state_pool.translate_from_swa_loc_to_state_loc(swa_loc)
             pre_kv_state = state_pool.get_state_by_state_loc(state_loc)
             kv_and_score_buffer = KVAndScore.cat([pre_kv_state, kv_and_score], dim=0)
             valid_kv_len = kv_and_score_buffer.kv.size(0)
@@ -222,15 +232,22 @@ class CompressorHip(_CompressorBase):
             post_state_len = post_state_indices.size(0)
 
             assert post_state_len <= valid_kv_len
-            post_raw_loc = torch.where(
-                post_state_indices < 0,
-                -1,
-                req_to_token[req_pool_indices[i], post_state_indices],
-            )
-            post_swa_loc = token_to_kv_pool.translate_loc_from_full_to_swa(post_raw_loc)
-            post_state_loc = state_pool.translate_from_swa_loc_to_state_loc(
-                post_swa_loc
-            )
+            if self.ratio == 128:
+                post_state_loc = state_pool.translate_from_req_position_to_state_loc(
+                    req_pool_indices[i], post_state_indices
+                )
+            else:
+                post_raw_loc = torch.where(
+                    post_state_indices < 0,
+                    -1,
+                    req_to_token[req_pool_indices[i], post_state_indices],
+                )
+                post_swa_loc = token_to_kv_pool.translate_loc_from_full_to_swa(
+                    post_raw_loc
+                )
+                post_state_loc = state_pool.translate_from_swa_loc_to_state_loc(
+                    post_swa_loc
+                )
             post_state_to_set = kv_and_score_buffer[valid_kv_len - post_state_len :]
             state_pool.set_state_by_state_loc(post_state_loc, post_state_to_set)
 
@@ -332,10 +349,14 @@ class CompressorHip(_CompressorBase):
             seq_lens = seq_lens_2d.view(-1)
             req_pool_indices = req_pool_indices.repeat_interleave(draft_tokens)
 
-        raw_locs = req_to_token[req_pool_indices, seq_lens - 1]
-
-        swa_locs = token_to_kv_pool.translate_loc_from_full_to_swa(raw_locs)
-        state_locs = state_pool.translate_from_swa_loc_to_state_loc(swa_locs)
+        if self.ratio == 128:
+            state_locs = state_pool.translate_from_req_position_to_state_loc(
+                req_pool_indices, seq_lens - 1
+            )
+        else:
+            raw_locs = req_to_token[req_pool_indices, seq_lens - 1]
+            swa_locs = token_to_kv_pool.translate_loc_from_full_to_swa(raw_locs)
+            state_locs = state_pool.translate_from_swa_loc_to_state_loc(swa_locs)
         state_pool.set_state_by_state_loc(state_locs, kv_and_scores)
 
         compress_bulk_len = self.ratio * self.coff
@@ -343,17 +364,24 @@ class CompressorHip(_CompressorBase):
             -compress_bulk_len, 0, device=seq_lens.device
         )
         compress_indices.clamp_(min=-1)
-        compress_indices_raw = torch.where(
-            compress_indices < 0,
-            -1,
-            req_to_token[req_pool_indices[:, None], compress_indices],
-        )
-        compress_indices_swa = token_to_kv_pool.translate_loc_from_full_to_swa(
-            compress_indices_raw
-        )
-        compress_indices_state = state_pool.translate_from_swa_loc_to_state_loc(
-            compress_indices_swa
-        )
+        if self.ratio == 128:
+            compress_indices_state = (
+                state_pool.translate_from_req_position_to_state_loc(
+                    req_pool_indices[:, None], compress_indices
+                )
+            )
+        else:
+            compress_indices_raw = torch.where(
+                compress_indices < 0,
+                -1,
+                req_to_token[req_pool_indices[:, None], compress_indices],
+            )
+            compress_indices_swa = token_to_kv_pool.translate_loc_from_full_to_swa(
+                compress_indices_raw
+            )
+            compress_indices_state = state_pool.translate_from_swa_loc_to_state_loc(
+                compress_indices_swa
+            )
         kv_and_score_to_compress = state_pool.get_state_by_state_loc(
             compress_indices_state.view(-1)
         ).view(-1, self.ratio, self.coff * self.head_dim)
@@ -371,10 +399,6 @@ class CompressorHip(_CompressorBase):
             comp_positions = (seq_lens - 1) // self.ratio * self.ratio
             freqs_real_table = self._get_freqs_cis_real()
             freqs_batch = freqs_real_table[comp_positions]
-
-            from sglang.srt.layers.attention.dsv4.fused_compress_kernel import (
-                fused_ape_pool_norm_rope,
-            )
 
             kv_compressed = fused_ape_pool_norm_rope(
                 kv_score_gathered=gathered,
