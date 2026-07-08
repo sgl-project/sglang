@@ -375,3 +375,22 @@ kimik26-fp8-mi355x-metadump-sglang:
       search-space:
         - conc-list: [1]
           config_file: scripts/ci/slurm/recipes/mi355x-fp8/kimik26/1k1k/1p1d-metadump.yaml
+
+# DIAGNOSTIC (DO NOT MERGE): non-MTP + force decode nsplit=1 to test whether the
+# split-KV reduction is the source of the drop. Run via
+# workflow_dispatch `configs=kimik26-fp8-1k1k-1p1d-nsplit1`.
+kimik26-fp8-mi355x-nsplit1-sglang:
+  model: moonshotai/Kimi-K2.6
+  model-prefix: kimik26
+  model_path: /it-share/model_coverage/models--moonshotai--Kimi-K2.6
+  runner: mi355x
+  precision: fp8
+  framework: sglang
+  multinode: true
+  disagg: true
+  seq-len-configs:
+    - isl: 1024
+      osl: 1024
+      search-space:
+        - conc-list: [1]
+          config_file: scripts/ci/slurm/recipes/mi355x-fp8/kimik26/1k1k/1p1d-nsplit1.yaml
