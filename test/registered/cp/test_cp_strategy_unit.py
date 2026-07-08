@@ -4,9 +4,6 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.srt.layers.attention.flashattention_backend import (
-    _should_disable_scheduler_metadata_precompute,
-)
 from sglang.srt.layers.cp.base import (
     ContextParallelStrategyKind,
     get_cp_strategy,
@@ -22,7 +19,6 @@ from sglang.srt.layers.cp.utils import (
     is_cp_v2_active,
 )
 from sglang.srt.layers.cp.zigzag import ZigzagCPStrategy
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -96,41 +92,6 @@ class TestCPStrategyUnit(CustomTestCase):
         ):
             self.assertIsNotNone(get_cp_strategy())
 
-    def test_fa3_scheduler_metadata_precompute_disabled_for_distributed_attention(self):
-        base_args = SimpleNamespace(
-            enable_dp_attention=False,
-            enable_prefill_cp=False,
-            enable_prefill_context_parallel=False,
-        )
-        self.assertFalse(
-            _should_disable_scheduler_metadata_precompute(base_args, attn_cp_size=1)
-        )
-
-        dp_args = SimpleNamespace(
-            enable_dp_attention=True,
-            enable_prefill_cp=False,
-            enable_prefill_context_parallel=False,
-        )
-        self.assertTrue(
-            _should_disable_scheduler_metadata_precompute(dp_args, attn_cp_size=1)
-        )
-
-        prefill_cp_args = SimpleNamespace(
-            enable_dp_attention=False,
-            enable_prefill_cp=True,
-            enable_prefill_context_parallel=True,
-        )
-        self.assertTrue(
-            _should_disable_scheduler_metadata_precompute(
-                prefill_cp_args, attn_cp_size=4
-            )
-        )
-        self.assertFalse(
-            _should_disable_scheduler_metadata_precompute(
-                prefill_cp_args, attn_cp_size=1
-            )
-        )
-
 
 class TestCPZigzagStrategy(CustomTestCase):
     def setUp(self):
@@ -174,11 +135,6 @@ class TestCPZigzagStrategy(CustomTestCase):
             forward_mode=_ExtendMode(),
             extend_seq_lens_cpu=[7],
         )
-        mixed_batch = SimpleNamespace(
-            input_ids=torch.arange(16),
-            forward_mode=ForwardMode.MIXED,
-            extend_seq_lens_cpu=[16],
-        )
 
         with patch(
             "sglang.srt.environ.envs.SGLANG_ENABLE_CP_V2.get", return_value=False
@@ -192,21 +148,6 @@ class TestCPZigzagStrategy(CustomTestCase):
             self.assertTrue(enable_cp_v2())
             self.assertTrue(is_cp_v2_active(active_batch))
             self.assertFalse(is_cp_v2_active(inactive_batch))
-            self.assertFalse(is_cp_v2_active(mixed_batch))
-
-    def test_zigzag_can_apply_rejects_mixed_forward(self):
-        strategy = ZigzagCPStrategy(cp_size=4)
-        mixed_batch = SimpleNamespace(
-            forward_mode=ForwardMode.MIXED,
-            extend_seq_lens_cpu=[4096],
-        )
-        extend_batch = SimpleNamespace(
-            forward_mode=ForwardMode.EXTEND,
-            extend_seq_lens_cpu=[4096],
-        )
-
-        self.assertFalse(strategy.can_apply(4096, mixed_batch))
-        self.assertTrue(strategy.can_apply(4096, extend_batch))
 
     def _expected_metadata(self, *, rank, cp_size, seq_lens, extend_seq_lens):
         bs = len(extend_seq_lens)

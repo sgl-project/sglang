@@ -45,17 +45,10 @@ from sglang.jit_kernel.flash_attention import (
 from sglang.srt.model_executor.cuda_graph_config import cuda_graph_fully_disabled
 
 
-def _should_disable_scheduler_metadata_precompute(
-    server_args, attn_cp_size: int
-) -> bool:
-    prefill_cp_enabled = bool(
-        getattr(server_args, "enable_prefill_context_parallel", False)
-        or getattr(server_args, "enable_prefill_cp", False)
-    )
-    return bool(
-        getattr(server_args, "enable_dp_attention", False)
-        or (prefill_cp_enabled and attn_cp_size > 1)
-    )
+def _should_disable_scheduler_metadata_precompute(server_args) -> bool:
+    assert getattr(server_args, "enable_prefill_cp", None) is not None
+    assert getattr(server_args, "enable_dp_attention", None) is not None
+    return bool(server_args.enable_prefill_cp or server_args.enable_dp_attention)
 
 
 @triton.jit
@@ -380,9 +373,7 @@ class FlashAttentionBackend(AttentionBackend):
         # combine kernel (flash_fwd_combine_launch_template.h:52). Leaving
         # scheduler_metadata unset uses the existing per-layer metadata path.
         self._disable_scheduler_metadata_precompute = (
-            _should_disable_scheduler_metadata_precompute(
-                server_args, self.attn_cp_size
-            )
+            _should_disable_scheduler_metadata_precompute(server_args)
         )
 
     def _compute_scheduler_metadata(
