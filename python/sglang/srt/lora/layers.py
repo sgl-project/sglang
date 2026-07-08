@@ -1043,6 +1043,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         """
         # Get the base layer's dispatch and combine logic
         base_layer = self.base_layer
+        origin_hidden_states_dim = hidden_states.shape[-1]
 
         # Dispatch tokens (doesn't do much in the LoRA case)
         dispatch_output = base_layer.dispatcher.dispatch(
@@ -1067,9 +1068,11 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
                 dispatch_output, quant_info, lora_info=lora_info
             )
 
-        final_hidden_states = base_layer.dispatcher.combine(combine_input=combine_input)
-
-        return final_hidden_states
+        # End the pipeline exactly like FusedMoE.forward_impl (combine, trim
+        # to the original hidden dim, reduce_results all-reduce) — under
+        # multi-rank MoE, skipping the reduction silently returns per-rank
+        # partial expert sums.
+        return base_layer.combine_and_reduce(combine_input, origin_hidden_states_dim)
 
     def slice_lora_a_weights(self, A: torch.Tensor, tp_rank: int):
         return A
