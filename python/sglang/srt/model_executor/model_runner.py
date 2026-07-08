@@ -423,7 +423,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.forward_pass_id = 0
         self.init_new_workspace = False
         self.draft_model_idx = draft_model_idx
-        self.enable_hisparse = server_args.enable_hisparse
+        self.enable_hisparse = server_args.enable_hisparse and not is_draft_worker
 
         self.remote_instance_transfer_engine = None
         self.remote_instance_transfer_engine_session_id = ""
