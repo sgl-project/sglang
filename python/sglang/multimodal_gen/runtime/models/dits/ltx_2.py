@@ -847,7 +847,7 @@ class LTX2Attention(nn.Module):
             else:
                 if self.qk_norm:
                     assert self.q_norm is not None and self.k_norm is not None
-                    # Torch 2.12 marks rms_norm as fp32 under autocast; keep q/k in the original attention dtype.
+                    # Torch 2.13 marks rms_norm as fp32 under autocast; keep q/k in the original attention dtype.
                     q_dtype = q.dtype
                     k_dtype = k.dtype
                     q = self.q_norm(q).to(dtype=q_dtype)

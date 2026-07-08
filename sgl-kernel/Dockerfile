@@ -97,9 +97,9 @@ RUN set -eux; \
 RUN --mount=type=cache,id=sgl-kernel-pip,target=/root/.cache/pip \
     set -eux; \
     case "${CUDA_VERSION}" in \
-      13.0) TORCH_VER=2.12.1; CU_TAG=cu130 ;; \
-      12.9) TORCH_VER=2.12.1; CU_TAG=cu129 ;; \
-      *)    TORCH_VER=2.12.1; CU_TAG=cu126 ;; \
+      13.0) TORCH_VER=2.13.0; CU_TAG=cu130 ;; \
+      12.9) TORCH_VER=2.13.0; CU_TAG=cu129 ;; \
+      *)    TORCH_VER=2.13.0; CU_TAG=cu126 ;; \
     esac; \
     ${PYTHON_ROOT_PATH}/bin/pip install torch==${TORCH_VER} --index-url ${PYTORCH_INDEX_BASE}/${CU_TAG}; \
     ${PYTHON_ROOT_PATH}/bin/pip install ninja setuptools==75.0.0 wheel==0.41.0 numpy uv scikit-build-core --index-url ${PIP_DEFAULT_INDEX}

@@ -14,18 +14,18 @@ def preload_mooncake_engine_global() -> None:
     """Load Mooncake's shared engine before importing mooncake.ep.
 
     FIXME: Drop this workaround after the Mooncake wheel links the
-    torch-2.12 EP extension against engine.so/libglog directly.
+    torch-versioned EP extension against engine.so/libglog directly.
 
-    Mooncake 0.3.11.post1's torch-2.12 EP extension references symbols provided
+    Mooncake 0.3.11.post1's torch-versioned EP extension references symbols provided
     by engine.so, but the wheel does not declare engine.so as a direct dynamic
-    dependency for ep_2_12_0.so. Loading engine.so with RTLD_GLOBAL makes those
+    dependency for the EP extension. Loading engine.so with RTLD_GLOBAL makes those
     symbols available before mooncake.ep imports the versioned EP extension.
     In the same wheel, the older torch-specific EP extensions such as
     ep_2_9_1.so, ep_2_10_0.so, and ep_2_11_0.so do declare engine.so as a
-    dependency; ep_2_12_0.so is the outlier.
+    dependency.
 
     This covers the observed failure:
-      ImportError: ep_2_12_0...so: undefined symbol:
+      ImportError: ep_2_*_0...so: undefined symbol:
       _ZN6google10LogMessageC1EPKcii
 
     Local wheel inspection/repro confirmed direct ``from mooncake import ep``
