@@ -24,6 +24,8 @@ _is_hip = is_hip()
 # Host RAM to leave free when sizing HiCache pools (OS, other processes).
 HICACHE_HOST_MEMORY_RESERVE_BYTES: int = 10 * (1024**3)
 
+_WRITE_BACK_STAGING_PAGE_CHUNK = 64
+
 
 def sync_fixed_hicache_size(size: int, host_size: int) -> int:
     """Sync fixed-size HiCache token capacity across PP ranks.
