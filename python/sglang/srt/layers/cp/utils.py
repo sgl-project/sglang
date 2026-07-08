@@ -14,6 +14,7 @@
 
 """Public import facade and runtime helpers for context parallel strategies."""
 
+from contextlib import contextmanager
 from typing import Any, Optional, Tuple
 
 from sglang.srt.layers.cp.base import (
@@ -35,6 +36,7 @@ from sglang.srt.layers.cp.zigzag import (
 
 CP_V2_DEFAULT_MODEL_CLASSES = frozenset(
     {
+        "DeepseekV32ForCausalLM",
         "Qwen3MoeForCausalLM",
     }
 )
@@ -89,14 +91,32 @@ def cp_split_before_forward(
 ) -> Tuple[Optional[Any], Optional[Any]]:
     """Shard embeddings and positions for CP-v2 model-runner forwarding."""
     assert is_cp_v2_active(forward_batch)
+    assert complete_hidden_states is not None
+    assert getattr(forward_batch, "attn_cp_metadata", None) is not None
+    return (
+        cp_shard_hidden_states(complete_hidden_states, forward_batch),
+        cp_shard_position_ids(complete_position_ids, forward_batch),
+    )
+
+
+def cp_shard_hidden_states(complete_hidden_states: Any, forward_batch):
+    """Shard a CP-v2 token-major hidden-state tensor without changing positions."""
+    assert is_cp_v2_active(forward_batch)
     strategy = get_cp_strategy()
     assert strategy is not None
     assert complete_hidden_states is not None
     assert getattr(forward_batch, "attn_cp_metadata", None) is not None
-    return (
-        strategy.shard_hidden_states(complete_hidden_states, forward_batch),
-        strategy.shard_position_ids(complete_position_ids, forward_batch),
-    )
+    return strategy.shard_hidden_states(complete_hidden_states, forward_batch)
+
+
+def cp_shard_position_ids(complete_position_ids: Any, forward_batch):
+    """Shard CP-v2 position ids without changing hidden states."""
+    assert is_cp_v2_active(forward_batch)
+    strategy = get_cp_strategy()
+    assert strategy is not None
+    assert complete_position_ids is not None
+    assert getattr(forward_batch, "attn_cp_metadata", None) is not None
+    return strategy.shard_position_ids(complete_position_ids, forward_batch)
 
 
 def cp_gather_after_forward(x: Any, forward_batch, stream: Optional[Any] = None):
@@ -113,6 +133,44 @@ def cp_gather_after_forward(x: Any, forward_batch, stream: Optional[Any] = None)
         return (hidden_states, *rest)
 
     return strategy.gather_hidden_states(x, forward_batch, stream)
+
+
+@contextmanager
+def cp_shard_model_inputs(
+    complete_hidden_states: Any,
+    complete_position_ids: Any,
+    forward_batch,
+):
+    """Shard all model inputs for CP-v2 at the runner boundary.
+
+    Yields ``(sharded_hidden_states, sharded_positions)``. ``spec_info.hidden_states``
+    is sharded in-place (the model reads it via ``forward_batch``, not as an
+    argument) and restored on exit, so the model stays CP-agnostic. This mirrors
+    the backup/restore pattern already used by the EAGLE cuda-graph runners.
+    """
+    assert is_cp_v2_active(forward_batch)
+    sharded_hidden_states = cp_shard_hidden_states(
+        complete_hidden_states, forward_batch
+    )
+    sharded_positions = cp_shard_position_ids(complete_position_ids, forward_batch)
+
+    spec_info = getattr(forward_batch, "spec_info", None)
+    spec_hidden_states = getattr(spec_info, "hidden_states", None)
+    spec_hidden_states_backup = None
+    if (
+        spec_hidden_states is not None
+        and spec_hidden_states.shape[0] == complete_hidden_states.shape[0]
+    ):
+        spec_hidden_states_backup = spec_hidden_states
+        spec_info.hidden_states = cp_shard_hidden_states(
+            spec_hidden_states, forward_batch
+        )
+
+    try:
+        yield sharded_hidden_states, sharded_positions
+    finally:
+        if spec_hidden_states_backup is not None:
+            spec_info.hidden_states = spec_hidden_states_backup
 
 
 def _to_int_list(values) -> Optional[list[int]]:
@@ -138,6 +196,9 @@ __all__ = [
     "get_cp_strategy",
     "is_cp_v2_active",
     "cp_gather_after_forward",
+    "cp_shard_hidden_states",
+    "cp_shard_model_inputs",
+    "cp_shard_position_ids",
     "cp_split_before_forward",
     "prepare_cp_forward",
 ]

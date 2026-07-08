@@ -87,6 +87,8 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.communicator import ScatterMode
+from sglang.srt.layers.cp.base import get_cp_strategy
+from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
@@ -521,6 +523,10 @@ class Indexer(MultiPlatformOp):
             self.alt_stream.wait_stream(current_stream)
             query = rotate_activation(query)
 
+            if is_cp_v2_active(forward_batch):
+                current_stream.wait_stream(self.alt_stream)
+                return query, key
+
             with torch.cuda.stream(self.alt_stream):
                 key = cp_all_gather_rerange_output(
                     key.contiguous(),
@@ -533,6 +539,9 @@ class Indexer(MultiPlatformOp):
         else:
             query = rotate_activation(query)
             key = rotate_activation(key)
+
+        if is_cp_v2_active(forward_batch):
+            return query, key
 
         # allgather+rerrange
         if forward_batch.attn_cp_metadata is not None and self.dsa_enable_prefill_cp:
@@ -1497,9 +1506,18 @@ class Indexer(MultiPlatformOp):
             current_stream.wait_stream(self.alt_stream)
             weights = self._apply_q_scale_and_softmax_scale(weights, q_scale)
         else:
-            query, key = self._get_q_k_bf16(
-                q_lora, x, positions, enable_dual_stream, forward_batch=forward_batch
-            )
+            if is_cp_v2_active(forward_batch):
+                query, key = get_cp_strategy().run_indexer(
+                    self, q_lora, x, positions, forward_batch
+                )
+            else:
+                query, key = self._get_q_k_bf16(
+                    q_lora,
+                    x,
+                    positions,
+                    enable_dual_stream,
+                    forward_batch=forward_batch,
+                )
 
             if enable_dual_stream:
                 current_stream = torch.cuda.current_stream()

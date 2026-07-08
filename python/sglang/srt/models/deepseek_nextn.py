@@ -33,6 +33,7 @@ from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
     is_dsa_enable_prefill_cp,
 )
+from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -214,9 +215,10 @@ class DeepseekModelNextN(nn.Module):
                 else:
                     hidden_states = self.eh_proj(eh_input)
 
-            if dsa_use_prefill_cp(
-                forward_batch, self.dsa_enable_prefill_cp
-            ) or mla_use_prefill_cp(forward_batch, self.mla_enable_prefill_cp):
+            if not is_cp_v2_active(forward_batch) and (
+                dsa_use_prefill_cp(forward_batch, self.dsa_enable_prefill_cp)
+                or mla_use_prefill_cp(forward_batch, self.mla_enable_prefill_cp)
+            ):
                 hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
                 positions = cp_split_and_rebuild_position(forward_batch, positions)
             residual = None
@@ -242,9 +244,10 @@ class DeepseekModelNextN(nn.Module):
                 else:
                     hidden_states = self.shared_head.norm(hidden_states)
 
-                if dsa_use_prefill_cp(
-                    forward_batch, self.dsa_enable_prefill_cp
-                ) or mla_use_prefill_cp(forward_batch, self.mla_enable_prefill_cp):
+                if not is_cp_v2_active(forward_batch) and (
+                    dsa_use_prefill_cp(forward_batch, self.dsa_enable_prefill_cp)
+                    or mla_use_prefill_cp(forward_batch, self.mla_enable_prefill_cp)
+                ):
                     # allgather + rerrange
                     hidden_states = cp_all_gather_rerange_output(
                         hidden_states,
@@ -324,26 +327,27 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         # TODO current just support prefill batch=1 and len(input_ids) > self.cp_size * 2
-        if self.dsa_enable_prefill_cp:
-            if can_dsa_cp_split(
-                len(input_ids), self.cp_size, self.use_dsa, forward_batch
-            ):
-                forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(
-                    len(input_ids),
-                    self.cp_rank,
-                    self.cp_size,
-                    forward_batch.seq_lens_cpu.tolist(),
-                    extend_seqs_len=forward_batch.extend_seq_lens_cpu,
-                )
-        elif self.mla_enable_prefill_cp:
-            if can_cp_split(len(input_ids), self.cp_size, forward_batch):
-                forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(
-                    len(input_ids),
-                    self.cp_rank,
-                    self.cp_size,
-                    forward_batch.seq_lens_cpu.tolist(),
-                    extend_seqs_len=forward_batch.extend_seq_lens_cpu,
-                )
+        if not is_cp_v2_active(forward_batch):
+            if self.dsa_enable_prefill_cp:
+                if can_dsa_cp_split(
+                    len(input_ids), self.cp_size, self.use_dsa, forward_batch
+                ):
+                    forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(
+                        len(input_ids),
+                        self.cp_rank,
+                        self.cp_size,
+                        forward_batch.seq_lens_cpu.tolist(),
+                        extend_seqs_len=forward_batch.extend_seq_lens_cpu,
+                    )
+            elif self.mla_enable_prefill_cp:
+                if can_cp_split(len(input_ids), self.cp_size, forward_batch):
+                    forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(
+                        len(input_ids),
+                        self.cp_rank,
+                        self.cp_size,
+                        forward_batch.seq_lens_cpu.tolist(),
+                        extend_seqs_len=forward_batch.extend_seq_lens_cpu,
+                    )
         hidden_states = self.model(input_ids, positions, forward_batch)
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch

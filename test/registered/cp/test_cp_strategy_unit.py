@@ -1,4 +1,5 @@
 import unittest
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -13,6 +14,7 @@ from sglang.srt.layers.cp.base import (
     is_interleave,
     is_zigzag,
 )
+from sglang.srt.layers.cp.interleave import InterleaveCPStrategy
 from sglang.srt.layers.cp.utils import (
     cp_split_before_forward,
     enable_cp_v2,
@@ -453,6 +455,250 @@ class TestCPZigzagStrategy(CustomTestCase):
         self.assertTrue(torch.equal(calls[0][0], q[:2]))
         self.assertTrue(torch.equal(calls[1][0], q[2:]))
         self.assertTrue(torch.equal(out, q + 100))
+
+
+class TestCPInterleaveStrategy(CustomTestCase):
+    def setUp(self):
+        init_cp_strategy(
+            SimpleNamespace(
+                enable_prefill_cp=True,
+                cp_strategy="interleave",
+                attn_cp_size=4,
+                attention_backend="fa3",
+            )
+        )
+
+    def tearDown(self):
+        init_cp_strategy(SimpleNamespace(enable_prefill_cp=False))
+
+    def _metadata_for_rank(self, rank, *, cp_size, seq_lens, extend_seq_lens):
+        strategy = InterleaveCPStrategy(cp_size=cp_size)
+        with get_parallel().override(attn_cp_rank=rank, attn_cp_size=cp_size):
+            return strategy.build_metadata(
+                num_tokens=sum(extend_seq_lens),
+                seqs_len=seq_lens,
+                extend_seqs_len=extend_seq_lens,
+            )
+
+    def _forward_batch(self, metadata, extend_seq_lens):
+        return SimpleNamespace(
+            input_ids=torch.arange(sum(extend_seq_lens)),
+            forward_mode=_ExtendMode(),
+            extend_seq_lens_cpu=extend_seq_lens,
+            attn_cp_metadata=metadata,
+        )
+
+    def _rank_tensors(self, x, *, cp_size, seq_lens, extend_seq_lens):
+        per_rank = []
+        metas = []
+        with self._patch_legacy_round_robin_mode():
+            for rank in range(cp_size):
+                metadata = self._metadata_for_rank(
+                    rank,
+                    cp_size=cp_size,
+                    seq_lens=seq_lens,
+                    extend_seq_lens=extend_seq_lens,
+                )
+                metas.append(metadata)
+                fb = self._forward_batch(metadata, extend_seq_lens)
+                strategy = InterleaveCPStrategy(cp_size=cp_size)
+                with get_parallel().override(attn_cp_rank=rank, attn_cp_size=cp_size):
+                    per_rank.append(strategy.shard_hidden_states(x, fb))
+        return metas, per_rank
+
+    @contextmanager
+    def _patch_legacy_round_robin_mode(self):
+        with patch(
+            "sglang.srt.layers.attention.dsa.utils.is_dsa_prefill_cp_round_robin_split",
+            return_value=True,
+        ):
+            yield
+
+    @contextmanager
+    def _patch_interleave_all_gather(self, rank_tensors):
+        def all_gather(output, input_tensor):
+            del input_tensor
+            torch.cat(rank_tensors, dim=0, out=output)
+
+        patchers = (
+            patch(
+                "sglang.srt.layers.cp.interleave.attn_cp_all_gather_into_tensor",
+                side_effect=all_gather,
+            ),
+            patch(
+                "sglang.srt.layers.cp.interleave.get_attention_cp_group",
+                return_value=object(),
+            ),
+            patch(
+                "sglang.srt.layers.cp.interleave.is_allocation_symmetric",
+                return_value=False,
+            ),
+            patch(
+                "sglang.srt.layers.cp.interleave.use_symmetric_memory",
+                return_value=torch.no_grad(),
+            ),
+            patch(
+                "sglang.srt.layers.attention.dsa.utils.is_dsa_prefill_cp_round_robin_split",
+                return_value=True,
+            ),
+        )
+        with patchers[0], patchers[1], patchers[2], patchers[3], patchers[4]:
+            yield
+
+    def test_interleave_metadata_matches_legacy_round_robin_placeholder(self):
+        metadata = InterleaveCPStrategy(cp_size=4).build_metadata(
+            num_tokens=8,
+            seqs_len=[5, 6],
+            extend_seqs_len=[3, 4],
+        )
+
+        self.assertEqual(metadata.bs, 2)
+        self.assertEqual(metadata.total_seq_lens, 8)
+
+    def test_interleave_can_apply_uses_legacy_round_robin_predicate(self):
+        active_batch = SimpleNamespace(
+            input_ids=torch.arange(8),
+            forward_mode=_ExtendMode(),
+            extend_seq_lens_cpu=[8],
+        )
+
+        with (
+            patch(
+                "sglang.srt.environ.envs.SGLANG_ENABLE_CP_V2.get",
+                return_value=True,
+            ),
+            patch(
+                "sglang.srt.layers.cp.interleave.can_dsa_prefill_cp_round_robin_split",
+                return_value=True,
+            ) as can_round_robin_split,
+        ):
+            self.assertTrue(is_cp_v2_active(active_batch))
+            can_round_robin_split.assert_called_once_with(active_batch)
+
+        with (
+            patch(
+                "sglang.srt.environ.envs.SGLANG_ENABLE_CP_V2.get",
+                return_value=True,
+            ),
+            patch(
+                "sglang.srt.layers.cp.interleave.can_dsa_prefill_cp_round_robin_split",
+                return_value=False,
+            ),
+        ):
+            self.assertFalse(is_cp_v2_active(active_batch))
+
+    def test_interleave_shards_hidden_states_and_position_ids(self):
+        cp_size = 4
+        seq_lens = [8]
+        extend_seq_lens = [8]
+        x = torch.arange(sum(extend_seq_lens) * 2).view(sum(extend_seq_lens), 2)
+        positions = torch.arange(sum(extend_seq_lens))
+
+        for rank in range(cp_size):
+            metadata = self._metadata_for_rank(
+                rank,
+                cp_size=cp_size,
+                seq_lens=seq_lens,
+                extend_seq_lens=extend_seq_lens,
+            )
+            fb = self._forward_batch(metadata, extend_seq_lens)
+            strategy = InterleaveCPStrategy(cp_size=cp_size)
+            expected_x = x[rank::cp_size]
+            expected_positions = positions[rank::cp_size]
+
+            with (
+                get_parallel().override(
+                    attn_cp_rank=rank,
+                    attn_cp_size=cp_size,
+                ),
+                self._patch_legacy_round_robin_mode(),
+            ):
+                local_x = strategy.shard_hidden_states(x, fb)
+                local_positions = strategy.shard_position_ids(positions, fb)
+
+                with (
+                    patch(
+                        "sglang.srt.environ.envs.SGLANG_ENABLE_CP_V2.get",
+                        return_value=True,
+                    ),
+                    patch(
+                        "sglang.srt.layers.cp.interleave.can_dsa_prefill_cp_round_robin_split",
+                        return_value=True,
+                    ),
+                ):
+                    helper_x, helper_positions = cp_split_before_forward(
+                        x,
+                        positions,
+                        fb,
+                    )
+
+            self.assertTrue(torch.equal(local_x, expected_x))
+            self.assertTrue(torch.equal(local_positions, expected_positions))
+            self.assertTrue(torch.equal(helper_x, expected_x))
+            self.assertTrue(torch.equal(helper_positions, expected_positions))
+
+    def test_interleave_gathers_hidden_states_to_original_order(self):
+        cp_size = 4
+        seq_lens = [10]
+        extend_seq_lens = [10]
+        x = torch.arange(sum(extend_seq_lens) * 2).view(sum(extend_seq_lens), 2)
+        metas, rank_tensors = self._rank_tensors(
+            x,
+            cp_size=cp_size,
+            seq_lens=seq_lens,
+            extend_seq_lens=extend_seq_lens,
+        )
+        max_rank_len = max(t.shape[0] for t in rank_tensors)
+        padded_rank_tensors = []
+        for tensor in rank_tensors:
+            if tensor.shape[0] < max_rank_len:
+                padded = tensor.new_zeros((max_rank_len, *tensor.shape[1:]))
+                padded[: tensor.shape[0]] = tensor
+                padded_rank_tensors.append(padded)
+            else:
+                padded_rank_tensors.append(tensor)
+
+        for rank in range(cp_size):
+            fb = self._forward_batch(metas[rank], extend_seq_lens)
+            with (
+                get_parallel().override(
+                    attn_cp_rank=rank,
+                    attn_cp_size=cp_size,
+                ),
+                self._patch_interleave_all_gather(padded_rank_tensors),
+            ):
+                gathered = InterleaveCPStrategy(cp_size=cp_size).gather_hidden_states(
+                    rank_tensors[rank], fb, stream=None
+                )
+
+            self.assertTrue(torch.equal(gathered, x))
+
+    def test_interleave_gathers_kv_cache_to_original_order(self):
+        cp_size = 4
+        seq_lens = [8]
+        extend_seq_lens = [8]
+        kv = torch.arange(sum(extend_seq_lens) * 2 * 3).view(sum(extend_seq_lens), 2, 3)
+        metas, rank_tensors = self._rank_tensors(
+            kv,
+            cp_size=cp_size,
+            seq_lens=seq_lens,
+            extend_seq_lens=extend_seq_lens,
+        )
+
+        for rank in range(cp_size):
+            fb = self._forward_batch(metas[rank], extend_seq_lens)
+            with (
+                get_parallel().override(
+                    attn_cp_rank=rank,
+                    attn_cp_size=cp_size,
+                ),
+                self._patch_interleave_all_gather(rank_tensors),
+            ):
+                gathered = InterleaveCPStrategy(cp_size=cp_size).gather_kv_cache(
+                    rank_tensors[rank], fb, stream=None
+                )
+
+            self.assertTrue(torch.equal(gathered, kv))
 
 
 if __name__ == "__main__":

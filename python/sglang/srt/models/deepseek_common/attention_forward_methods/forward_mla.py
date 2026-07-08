@@ -13,6 +13,7 @@ from sglang.srt.layers.attention.dsa.utils import (
     is_graph_dsa_split_op_surface,
 )
 from sglang.srt.layers.communicator import get_attn_tp_context
+from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.layers.quantization.fp8_kernel import (
     fp8_dtype,
     per_tensor_quant_mla_fp8,
@@ -523,7 +524,18 @@ class DeepseekMLAForwardMixin:
         ):
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
 
-        if dsa_use_prefill_cp(forward_batch) or mla_use_prefill_cp(forward_batch):
+        # ─── CP-v2: AllGather latent KV via strategy.materialize_full_kv ───
+        if is_cp_v2_active(forward_batch) and self.use_dsa and q_lora is not None:
+            from sglang.srt.layers.cp.base import get_cp_strategy
+
+            k_nope, k_pe = get_cp_strategy().materialize_full_kv(
+                forward_batch,
+                latent_cache=latent_cache,
+                k_nope=k_nope,
+                k_pe=k_pe,
+                kv_lora_rank=self.kv_lora_rank,
+            )
+        elif dsa_use_prefill_cp(forward_batch) or mla_use_prefill_cp(forward_batch):
             # support allgather+rerrange
             k_nope, k_pe = self.rebuild_cp_kv_cache(
                 latent_cache, forward_batch, k_nope, k_pe

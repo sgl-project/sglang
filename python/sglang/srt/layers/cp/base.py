@@ -67,14 +67,17 @@ class CPAttentionBackendKind(IntEnum):
     """Attention backend calling convention used by CP strategy dispatch."""
 
     FLASH_ATTENTION = 0
+    DSA = 1
 
     @classmethod
     def from_string(cls, value: str) -> CPAttentionBackendKind:
         if value in ("fa3", "flashinfer"):
             return cls.FLASH_ATTENTION
+        if value in ("dsa"):
+            return cls.DSA
         raise ValueError(
             f"Unsupported attention_backend={value!r} for CP strategy; expected one "
-            "of {'fa3', 'flashinfer'}"
+            "of {'fa3', 'flashinfer', 'dsa'}"
         )
 
 
