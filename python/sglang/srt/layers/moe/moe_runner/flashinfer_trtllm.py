@@ -36,7 +36,6 @@ from sglang.srt.layers.quantization.fp8_kernel import (
 from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import PackTopkIds
 from sglang.srt.layers.utils import copy_or_rebind_param
 from sglang.srt.utils.common import (
-    is_cuda_alike,
     is_flashinfer_available,
     next_power_of_2,
 )

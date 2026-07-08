@@ -4,7 +4,6 @@ from typing import Optional, Tuple
 
 import torch
 
-from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams
 from sglang.srt.utils import is_cuda, is_sm90_supported, is_sm100_supported
 
 _is_cuda = is_cuda()

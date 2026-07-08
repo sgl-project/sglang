@@ -629,7 +629,9 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
 
         fp4_quantize = _get_fp4_quantize_op()
         if fp4_quantize is None:
-            raise RuntimeError("No FP4 quantization kernel available. Install flashinfer.")
+            raise RuntimeError(
+                "No FP4 quantization kernel available. Install flashinfer."
+            )
 
         x_fp4, x_scale_interleaved = fp4_quantize(x, layer.input_scale_inv)
         weights_padding_cols = getattr(layer, "weights_padding_cols", 0)

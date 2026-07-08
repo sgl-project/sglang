@@ -2430,7 +2430,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         layer: FusedMoE,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
-        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
         # Note: dispatch_output may be a DeepEPLLDispatchOutput (no topk_output
         # attribute -- topk_ids/topk_weights live directly on the dispatch
