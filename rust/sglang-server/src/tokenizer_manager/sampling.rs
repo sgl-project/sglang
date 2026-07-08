@@ -73,21 +73,28 @@ pub fn normalize_sampling_params(sp: &mut Option<Value>) -> Result<(), Error> {
     let mut out: Vec<(Value, Value)> = Vec::with_capacity(map.len() + 8);
     for (k, v) in map {
         match k.as_str() {
-            Some("temperature") => temperature_in = as_f64(&v).unwrap_or(temperature_in),
-            Some("top_k") => top_k_in = as_i64(&v).unwrap_or(top_k_in),
-            Some("top_p") => top_p = as_f64(&v).unwrap_or(top_p),
-            Some("min_p") => min_p = as_f64(&v).unwrap_or(min_p),
+            Some("temperature") => {
+                temperature_in = opt_f64("temperature", &v)?.unwrap_or(temperature_in)
+            }
+            Some("top_k") => top_k_in = opt_i64("top_k", &v)?.unwrap_or(top_k_in),
+            Some("top_p") => top_p = opt_f64("top_p", &v)?.unwrap_or(top_p),
+            Some("min_p") => min_p = opt_f64("min_p", &v)?.unwrap_or(min_p),
             Some("frequency_penalty") => {
-                frequency_penalty = as_f64(&v).unwrap_or(frequency_penalty)
+                frequency_penalty = opt_f64("frequency_penalty", &v)?.unwrap_or(frequency_penalty)
             }
-            Some("presence_penalty") => presence_penalty = as_f64(&v).unwrap_or(presence_penalty),
+            Some("presence_penalty") => {
+                presence_penalty = opt_f64("presence_penalty", &v)?.unwrap_or(presence_penalty)
+            }
             Some("repetition_penalty") => {
-                repetition_penalty = as_f64(&v).unwrap_or(repetition_penalty)
+                repetition_penalty =
+                    opt_f64("repetition_penalty", &v)?.unwrap_or(repetition_penalty)
             }
-            Some("min_new_tokens") => min_new_tokens = as_i64(&v).unwrap_or(min_new_tokens),
+            Some("min_new_tokens") => {
+                min_new_tokens = opt_i64("min_new_tokens", &v)?.unwrap_or(min_new_tokens)
+            }
             // Read for verify but kept on the wire — the scheduler still needs it.
             Some("max_new_tokens") => {
-                max_new_tokens = as_i64(&v).unwrap_or(max_new_tokens);
+                max_new_tokens = opt_i64("max_new_tokens", &v)?.unwrap_or(max_new_tokens);
                 out.push((k, v));
             }
             // stop / stop_regex → string lists + match-window lengths (below). Kept
@@ -272,8 +279,33 @@ fn hir_max_len(hir: &regex_syntax::hir::Hir) -> i64 {
     }
 }
 
-/// Coerce a value to f64 (int or float); non-numeric (incl. null) → None, so the
-/// caller keeps its default — matching Python's `x if x is not None else default`.
+/// Parse an optional numeric param: null/absent → `Ok(None)` (keep the default,
+/// matching Python's `x if x is not None`); a number → `Ok(Some)`; any other type →
+/// a request-local 400. A wrong type must NOT silently fall back to the default —
+/// `temperature: "bad"` has different semantics than an unset temperature and must
+/// be rejected, not accepted as 1.0.
+fn opt_f64(name: &str, v: &Value) -> Result<Option<f64>, Error> {
+    if v.is_nil() {
+        return Ok(None);
+    }
+    as_f64(v)
+        .map(Some)
+        .ok_or_else(|| bad(format!("{name} must be a number")))
+}
+
+/// Like [`opt_f64`] for integer fields (a float is accepted and truncated, as
+/// before); a non-numeric type is a 400 rather than a silent default.
+fn opt_i64(name: &str, v: &Value) -> Result<Option<i64>, Error> {
+    if v.is_nil() {
+        return Ok(None);
+    }
+    as_i64(v)
+        .map(Some)
+        .ok_or_else(|| bad(format!("{name} must be a number")))
+}
+
+/// Coerce a value to f64 (int or float); non-numeric (incl. null) → None. Used by
+/// [`opt_f64`] as the pure "is this a number?" extractor.
 fn as_f64(v: &Value) -> Option<f64> {
     match v {
         Value::F64(f) => Some(*f),
@@ -414,6 +446,29 @@ mod tests {
             (Value::from("top_k"), Value::from(0i64)),
         ]));
         assert!(normalize_sampling_params(&mut sp).is_err());
+    }
+
+    /// A wrong JSON type for a numeric field is a 400 — it must NOT silently fall
+    /// back to the default. `temperature: "bad"` previously normalized to 1.0 and
+    /// returned 200; now it is rejected. Covers a float and an int field.
+    #[test]
+    fn wrong_typed_numeric_field_is_rejected() {
+        for field in ["temperature", "top_p", "top_k", "max_new_tokens"] {
+            let mut sp = Some(Value::Map(vec![(Value::from(field), Value::from("bad"))]));
+            assert!(
+                normalize_sampling_params(&mut sp).is_err(),
+                "{field}: \"bad\" must be a 400, not a silent default"
+            );
+        }
+    }
+
+    /// A present-but-null numeric field keeps the default (Python's
+    /// `x if x is not None`) — null is absent, not a wrong type, so it's accepted.
+    #[test]
+    fn null_numeric_field_keeps_default() {
+        let m = norm(&[("temperature", Value::Nil), ("top_k", Value::Nil)]);
+        assert_eq!(get(&m, "temperature"), &Value::F64(1.0)); // default 1.0
+        assert_eq!(get(&m, "top_k").as_i64(), Some(TOP_K_ALL)); // default -1 → all
     }
 
     /// Bounded regexes get their finite length; unbounded / unparsable ones fall
