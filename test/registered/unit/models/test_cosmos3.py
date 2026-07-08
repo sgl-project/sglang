@@ -154,8 +154,9 @@ class TestCosmos3Config(CustomTestCase):
 
     def test_registered_with_autoconfig(self):
         # Importing common runs the AutoConfig registration side effects.
-        import sglang.srt.utils.hf_transformers.common  # noqa: F401
         from transformers import AutoConfig
+
+        import sglang.srt.utils.hf_transformers.common  # noqa: F401
 
         cfg = AutoConfig.for_model(
             "cosmos3_omni",
@@ -235,7 +236,9 @@ class TestAllowPatternsOverrides(CustomTestCase):
             )
             self.assertTrue(use_safetensors)
             self.assertEqual(len(files), 1)
-            self.assertTrue(files[0].endswith("transformer/diffusion_pytorch_model.safetensors"))
+            self.assertTrue(
+                files[0].endswith("transformer/diffusion_pytorch_model.safetensors")
+            )
 
     @patch("sglang.srt.model_loader.loader.get_global_server_args")
     def test_override_selects_vision_subfolder(self, mock_gsa):
