@@ -139,7 +139,8 @@ class AITerImpl(AttentionImpl):
         key: torch.Tensor,
         value: torch.Tensor,
         attn_metadata: AttentionMetadata | None = None,
-    ) -> torch.Tensor:
+        return_softmax_lse: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """
         Performs attention using one of:
           - _fmha_fp8_prefill_attention (FP8, SGLANG_DIFFUSION_AITER_FP8_ATTN=1 when eligible)
@@ -170,7 +171,10 @@ class AITerImpl(AttentionImpl):
             h_q = q_fp8.shape[2]
             h_kv = k_fp8.shape[2]
 
-            if _can_use_fmha_fp8_prefill(d_q, d_k, d_v, h_q, h_kv):
+            if (
+                _can_use_fmha_fp8_prefill(d_q, d_k, d_v, h_q, h_kv)
+                and not return_softmax_lse
+            ):
                 return _fmha_fp8_prefill_attention(
                     q_fp8,
                     k_fp8,
@@ -184,8 +188,8 @@ class AITerImpl(AttentionImpl):
 
             logger.warning_once(
                 "FP8 FMHA prefill unsupported for this shape (need gfx950-class AITER, "
-                "full MHA, q/k/v head_dim=%d; got q=%d, k=%d, v=%d, num_heads=%d, "
-                "num_kv_heads=%d). Falling back to BF16.",
+                "no return_lse, full MHA, q/k/v head_dim=%d; got q=%d, k=%d, v=%d, "
+                "num_heads=%d, num_kv_heads=%d). Falling back to BF16.",
                 _FMHA_FP8_HEAD_DIM,
                 d_q,
                 d_k,
@@ -195,7 +199,7 @@ class AITerImpl(AttentionImpl):
             )
 
         # BF16 path
-        output, _ = aiter.flash_attn_func(
+        output, softmax_lse = aiter.flash_attn_func(
             query,
             key,
             value,
@@ -204,4 +208,7 @@ class AITerImpl(AttentionImpl):
             return_attn_probs=False,
             return_lse=True,
         )
-        return output
+        if return_softmax_lse:
+            return output, softmax_lse
+        else:
+            return output

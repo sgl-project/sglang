@@ -571,9 +571,10 @@ class USPAttention(nn.Module):
             if backend_enum not in (
                 AttentionBackendEnum.FA,
                 AttentionBackendEnum.SAGE_ATTN,
+                AttentionBackendEnum.AITER,
             ):
                 raise RuntimeError(
-                    f"Ring Attention is only supported for FlashAttention or SageAttention backends, "
+                    f"Ring Attention is only supported for FlashAttention, SageAttention and AITER backends, "
                     f"but got {backend_enum.name}. "
                     f"Please ensure your platform supports these backends."
                 )
@@ -928,6 +929,7 @@ class USPAttention(nn.Module):
             return out
 
         sp_size = get_ulysses_parallel_world_size()
+        ring_size = get_ring_parallel_world_size()
         if (
             (num_replicated_prefix > 0 and num_replicated_suffix > 0)
             or (num_replicated_prefix > 0 and num_replicated_kv_prefix > 0)
@@ -936,6 +938,16 @@ class USPAttention(nn.Module):
             raise ValueError(
                 "USPAttention supports at most one replicated-token mode per call."
             )
+
+        # When both ulysses > 1 and ring > 1, convert replicated tokens
+        # to sharded so the standard ulysses + ring path can handle them.
+        # When ulysses == 1, ring handles the full tensor correctly.
+        num_rep = num_replicated_prefix or num_replicated_suffix
+        if ring_size > 1 and sp_size > 1 and num_rep > 0:
+            return self._shard_replicated_and_forward(
+                q, k, v, num_replicated_prefix, num_replicated_suffix
+            )
+
         if sp_size > 1 and num_replicated_prefix > 0:
             return self._forward_with_replicated_prefix(
                 q, k, v, ctx_attn_metadata, num_replicated_prefix
@@ -969,7 +981,7 @@ class USPAttention(nn.Module):
                 v = _usp_input_all_to_all(v, head_dim=2)
 
         # Ring Attention within subgroups or local attention
-        if get_ring_parallel_world_size() > 1:
+        if ring_size > 1:
             out = ring_attn(
                 q,
                 k,
@@ -1007,6 +1019,10 @@ class USPAttention(nn.Module):
         3. Locally slice the replicated prefix to the same head shard.
         4. Concatenate [prefix_h_local, gathered_suffix] and run attention.
         5. Split output, all-to-all back the suffix, all-gather prefix heads.
+
+        Note: this path is used when ulysses > 1 and ring == 1.
+        When both ulysses > 1 and ring > 1, forward() dispatches to
+        _shard_replicated_and_forward() instead.
         """
         sp_size = get_ulysses_parallel_world_size()
         sp_rank = get_sp_parallel_rank()
@@ -1144,6 +1160,74 @@ class USPAttention(nn.Module):
 
         out = self.attn_impl.forward(q, k, v, ctx_attn_metadata)
         return _usp_output_all_to_all(out, head_dim=2)
+
+    def _shard_replicated_and_forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        num_replicated_prefix: int,
+        num_replicated_suffix: int,
+    ) -> torch.Tensor:
+        """Convert replicated prefix/suffix into sharded tokens, run the
+        standard USPAttention path (ulysses + ring), then reconstruct.
+
+        Called when both ulysses > 1 and ring > 1 with replicated tokens.
+        """
+        sp_group = get_sp_group()
+        total_sp_size = get_sp_world_size()
+        sp_rank = get_sp_parallel_rank()
+        num_rep = num_replicated_prefix or num_replicated_suffix
+        is_suffix = num_replicated_suffix > 0
+
+        # For suffix, rotate to front so we can treat it as prefix.
+        if is_suffix:
+            q = torch.cat([q[:, -num_rep:], q[:, :-num_rep]], dim=1)
+            k = torch.cat([k[:, -num_rep:], k[:, :-num_rep]], dim=1)
+            v = torch.cat([v[:, -num_rep:], v[:, :-num_rep]], dim=1)
+
+        q_rep, q_shard = q[:, :num_rep], q[:, num_rep:]
+        k_rep, k_shard = k[:, :num_rep], k[:, num_rep:]
+        v_rep, v_shard = v[:, :num_rep], v[:, num_rep:]
+
+        assert num_rep % total_sp_size == 0, (
+            f"Number of replicated tokens ({num_rep}) is not divisible by "
+            f"total_sp_size ({total_sp_size}). Ring attention requires an "
+            f"even split of replicated tokens across ranks. Try "
+            f"--ring-degree 1 or adjusting the prompt length."
+        )
+
+        # Each rank keeps only its chunk of the replicated tokens.
+        rep_chunk = num_rep // total_sp_size
+        rep_start = sp_rank * rep_chunk
+        rep_end = rep_start + rep_chunk
+
+        q_rep = q_rep[:, rep_start:rep_end].contiguous()
+        k_rep = k_rep[:, rep_start:rep_end].contiguous()
+        v_rep = v_rep[:, rep_start:rep_end].contiguous()
+
+        # Now fully SP-sharded — delegate to standard path.
+        out = self.forward(
+            torch.cat([q_rep, q_shard], dim=1),
+            torch.cat([k_rep, k_shard], dim=1),
+            torch.cat([v_rep, v_shard], dim=1),
+        )
+
+        out_rep = out[:, :rep_chunk]
+        out_shard = out[:, rep_chunk:]
+
+        # All-gather replicated tokens across full SP group.
+        gathered = [torch.empty_like(out_rep) for _ in range(total_sp_size)]
+        torch.distributed.all_gather(
+            gathered,
+            out_rep.contiguous(),
+            group=sp_group.device_group,
+        )
+        out_rep = torch.cat(gathered, dim=1)[:, :num_rep]
+
+        if is_suffix:
+            return torch.cat([out_shard, out_rep], dim=1)
+        return torch.cat([out_rep, out_shard], dim=1)
 
     def _forward_with_replicated_suffix(
         self,
