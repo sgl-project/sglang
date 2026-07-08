@@ -17,8 +17,8 @@ from sglang.srt.layers.attention.triton_ops.kv_indices import (
     create_flashinfer_kv_indices_triton,
 )
 from sglang.srt.layers.attention.triton_ops.metadata import get_num_kv_splits_triton
-from sglang.srt.layers.attention.utils import (
-    cp_lse_ag_out_rs,
+from sglang.srt.layers.dcp import (
+    cp_lse_ag_out_rs_mha,
     create_triton_kv_indices_for_dcp_triton,
     get_dcp_lens,
 )
@@ -636,15 +636,31 @@ class TritonAttnBackend(AttentionBackend):
         """
         if self._translate_kv_loc is None:
             return None
-        # Full-attention read path.
-        n_kv = int(self.kv_indptr[bs].item())
+        # seq_lens_sum is the reliable "mirror present" signal: it is
+        # None-preserving into the replay view, unlike seq_lens_cpu (always a
+        # non-None but stale slice for gpu_only batches). None -> fall back to a
+        # per-step D2H `.item()` on the indptr.
+        have_cpu_mirror = forward_batch.seq_lens_sum is not None
+        # Full-attention read path. kv_indptr[bs] == seq_lens_sum.
+        n_kv = (
+            forward_batch.seq_lens_sum
+            if have_cpu_mirror
+            else int(self.kv_indptr[bs].item())
+        )
         if n_kv > 0:
             self.cuda_graph_kv_indices[:n_kv] = self._translate_kv_loc(
                 self.cuda_graph_kv_indices[:n_kv]
             )
-        # SWA window read path (hybrid-SWA unified pools only).
+        # SWA window read path. window_kv_indptr[bs] == sum(min(seq_len, window)).
         if self.sliding_window_size is not None and self.sliding_window_size > 0:
-            n_win = int(self.window_kv_indptr[bs].item())
+            if have_cpu_mirror:
+                n_win = int(
+                    forward_batch.seq_lens_cpu[:bs]
+                    .clamp(max=self.sliding_window_size)
+                    .sum()
+                )
+            else:
+                n_win = int(self.window_kv_indptr[bs].item())
             if n_win > 0:
                 self.cuda_graph_window_kv_indices[:n_win] = (
                     self.token_to_kv_pool.translate_loc_from_full_to_swa(
@@ -1473,7 +1489,7 @@ class TritonAttnBackend(AttentionBackend):
             skip_extend=True,
         )
 
-        prefix_out, prefix_lse = cp_lse_ag_out_rs(
+        prefix_out, prefix_lse = cp_lse_ag_out_rs_mha(
             prefix_out, prefix_lse, group, return_lse=True
         )
         final_lse = torch.logaddexp(prefix_lse, current_lse)
@@ -1732,7 +1748,7 @@ class TritonAttnBackend(AttentionBackend):
                 ],
                 dim=-1,
             )
-            o = cp_lse_ag_out_rs(o_for_decode, local_lse, group)
+            o = cp_lse_ag_out_rs_mha(o_for_decode, local_lse, group)
             return o.reshape(-1, layer.tp_q_head_num * layer.v_head_dim).to(q.dtype)
 
         self.decode_attention_fwd(

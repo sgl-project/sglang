@@ -102,6 +102,7 @@ tracing = [
 ]
 test = [
   "accelerate",
+  "pymupdf",
   "expecttest",
   "jsonlines",
   "matplotlib",

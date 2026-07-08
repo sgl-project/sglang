@@ -36,6 +36,7 @@ from sglang.multimodal_gen.configs.pipeline_configs import (
     HeliosT2VConfig,
     HunyuanConfig,
     LingBotWorldCausalDMDConfig,
+    LingBotWorldV2CausalDMDConfig,
     WanI2V480PConfig,
     WanI2V720PConfig,
     WanT2V480PConfig,
@@ -805,6 +806,13 @@ def _register_configs():
         hf_model_paths=[
             "IPostYellow/lingbot-world-fast-diffusers",
             "robbyant/lingbot-world-fast-diffusers",
+        ],
+    )
+    register_configs(
+        sampling_param_cls=LingBotWorldSamplingParams,
+        pipeline_config_cls=LingBotWorldV2CausalDMDConfig,
+        hf_model_paths=[
+            "robbyant/lingbot-world-v2-14b-causal-fast-diffusers",
         ],
     )
     register_configs(
