@@ -598,7 +598,8 @@ class DSparkWorkerV2(BaseSpecWorker):
             cache_loc=batch.out_cache_loc,
             positions=positions,
         )
-        logits_output.hidden_states = None
+        if self.server_args.disaggregation_mode != "prefill":
+            logits_output.hidden_states = None
 
         batch_output.next_draft_input = make_next_draft_input(
             bonus_tokens=next_token_ids,
@@ -718,6 +719,8 @@ class DSparkWorkerV2(BaseSpecWorker):
                         self._proposer.run_idle_participation(batch)
                 self._run_idle_verify_participation(batch)
             return self._decode_idle_result(on_publish=on_publish)
+
+        self._maybe_inject_pd_prefill_tail(batch, draft_input)
 
         batch.seq_lens.record_stream(
             torch.get_device_module(self.device).current_stream()
@@ -1032,6 +1035,44 @@ class DSparkWorkerV2(BaseSpecWorker):
             speculative_num_draft_tokens=int(self.verify_num_draft_tokens),
             new_seq_lens=new_seq_lens,
         )
+
+    def _maybe_inject_pd_prefill_tail(
+        self,
+        batch: ScheduleBatch,
+        draft_input: DFlashDraftInputV2,
+    ) -> None:
+        tail_hidden = getattr(draft_input, "prefill_tail_hidden_states", None)
+        tail_mask = getattr(draft_input, "prefill_tail_valid_mask", None)
+        if tail_hidden is None or tail_mask is None or tail_hidden.numel() == 0:
+            return
+
+        tail_hidden = tail_hidden.to(device=self.device, non_blocking=True)
+        tail_mask = tail_mask.to(device=self.device, non_blocking=True).bool()
+        bs, tail_len = tail_mask.shape
+        if bs == 0 or tail_len == 0:
+            return
+
+        device = torch.device(self.device)
+        row = torch.arange(tail_len, device=device).view(1, tail_len)
+        valid_counts = tail_mask.sum(dim=1).to(torch.int64)
+        start_pos = batch.seq_lens.to(torch.int64).view(-1, 1) - valid_counts.view(
+            -1, 1
+        )
+        positions_2d = start_pos + row
+
+        req_to_token = self.model_runner.req_to_token_pool.req_to_token
+        cache_loc_2d = req_to_token[batch.req_pool_indices, positions_2d.clamp_min(0)]
+
+        flat_mask = tail_mask.reshape(-1)
+        if not bool(flat_mask.any()):
+            return
+        self._kv_injector.inject_target_hidden(
+            target_hidden=tail_hidden.reshape(bs * tail_len, -1)[flat_mask],
+            cache_loc=cache_loc_2d.reshape(-1)[flat_mask],
+            positions=positions_2d.reshape(-1)[flat_mask],
+        )
+        draft_input.prefill_tail_hidden_states = None
+        draft_input.prefill_tail_valid_mask = None
 
     def _simulated_correct_len(
         self, *, bs: int, dtype: torch.dtype, device: torch.device

@@ -1131,7 +1131,35 @@ class Scheduler(
             server_args=self.server_args,
         )
 
-        if self.spec_algorithm.carries_draft_hidden_states():
+        dspark_prefill_tail_len = 0
+        if self.spec_algorithm.is_dspark():
+            dspark_target_layer_ids = (
+                getattr(
+                    self.tp_worker.model_runner,
+                    "dflash_or_dspark_target_layer_ids",
+                    None,
+                )
+                or []
+            )
+            disagg_hidden_size = max(1, len(dspark_target_layer_ids)) * int(
+                self.model_config.hidden_size
+            )
+            disagg_hidden_states_dtype = self.model_config.dtype
+            dspark_prefill_tail_len = max(
+                0,
+                int(
+                    os.getenv(
+                        "SGLANG_DSPARK_PD_PREFILL_TAIL_TOKENS",
+                        str(
+                            max(
+                                1,
+                                int(self.server_args.speculative_num_draft_tokens) + 1,
+                            )
+                        ),
+                    )
+                ),
+            )
+        elif self.spec_algorithm.carries_draft_hidden_states():
             # `draft_runner` aliases `draft_runner_list[0]` in the multi-layer
             # worker, so a single accessor covers both shapes.
             draft_runner = self.draft_worker.draft_worker.draft_runner
@@ -1154,6 +1182,7 @@ class Scheduler(
                 hidden_size=disagg_hidden_size,
                 hidden_states_dtype=disagg_hidden_states_dtype,
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
+                dspark_prefill_tail_len=dspark_prefill_tail_len,
             )
 
             # The decode requests polling kv cache
@@ -1199,6 +1228,7 @@ class Scheduler(
                 hidden_size=disagg_hidden_size,
                 hidden_states_dtype=disagg_hidden_states_dtype,
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
+                dspark_prefill_tail_len=dspark_prefill_tail_len,
             )
 
             self.disagg_prefill_bootstrap_queue = PrefillBootstrapQueue(
