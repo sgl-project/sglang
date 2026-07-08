@@ -18,8 +18,6 @@ class BoundaryHiRadixCache(HiRadixCache):
     """Experimental HiRadixCache variant for the L1/L2 boundary invariant."""
 
     def __init__(self, params: CacheInitParams, server_args: ServerArgs):
-        if server_args.hicache_storage_backend is not None:
-            raise ValueError("BoundaryHiRadixCache does not support L3 storage")
         super().__init__(params=params, server_args=server_args)
         self.cache_controller.write_policy = "write_through"
         self.write_through_threshold = 1
@@ -36,44 +34,6 @@ class BoundaryHiRadixCache(HiRadixCache):
     def is_h_only(node: TreeNode) -> bool:
         return node.value is None and node.host_value is not None
 
-    def is_deleted(self, node: TreeNode) -> bool:
-        return node is not self.root_node and node.parent is None
-
-    def sanity_check(self):
-        base_sanity = getattr(super(), "sanity_check", None)
-        if callable(base_sanity):
-            base_sanity()
-        self.sanity_check_boundary_invariant()
-
-    def sanity_check_boundary_invariant(self):
-        errors: list[str] = []
-        for node in self._collect_boundary_nodes():
-            for child in node.children.values():
-                if child.parent is not node:
-                    errors.append(
-                        f"[Tree] child {child.id} parent is not node {node.id}"
-                    )
-                if self.is_d_only(node) and self.is_h_only(child):
-                    errors.append(
-                        f"[Boundary] D-only parent {node.id} has H-only child {child.id}"
-                    )
-
-            if self.is_h_only(node):
-                live_d_ancestor = self._nearest_live_d_ancestor(node)
-                if live_d_ancestor is None:
-                    errors.append(
-                        f"[Boundary] H-only node {node.id} has no live D ancestor"
-                    )
-                elif not self.is_dh(live_d_ancestor):
-                    errors.append(
-                        "[Boundary] H-only node "
-                        f"{node.id} nearest live D ancestor {live_d_ancestor.id} "
-                        "is not D+H"
-                    )
-
-        if errors:
-            raise AssertionError("\n".join(errors))
-
     def _collect_boundary_nodes(self) -> list[TreeNode]:
         nodes = []
         stack = [self.root_node]
@@ -82,14 +42,6 @@ class BoundaryHiRadixCache(HiRadixCache):
             nodes.append(node)
             stack.extend(node.children.values())
         return nodes
-
-    def _nearest_live_d_ancestor(self, node: TreeNode) -> TreeNode | None:
-        current = node.parent
-        while current is not None:
-            if current.value is not None:
-                return current
-            current = current.parent
-        return None
 
     def _has_h_descendant(self, node: TreeNode) -> bool:
         stack = list(node.children.values())

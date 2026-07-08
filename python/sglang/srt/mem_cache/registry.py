@@ -171,8 +171,6 @@ def _create_boundary_hicache(ctx: TreeCacheBuildContext) -> BasePrefixCache:
         raise ValueError(
             "--radix-cache-backend='boundary_hicache' only supports non-hybrid HiCache"
         )
-    if ctx.server_args.hicache_storage_backend is not None:
-        raise ValueError("BoundaryHiRadixCache does not support L3 storage")
 
     from sglang.srt.mem_cache.boundary_hiradix_cache import BoundaryHiRadixCache
 

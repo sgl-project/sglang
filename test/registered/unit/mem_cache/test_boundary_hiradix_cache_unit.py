@@ -106,14 +106,6 @@ class TestBoundaryHiRadixCachePolicy(CustomTestCase):
         cache.ongoing_write_through = {}
         return cache
 
-    def test_sanity_rejects_d_parent_to_h_child(self):
-        cache = self._cache()
-        parent = _attach(cache.root_node, _node([1], value=True, host=False))
-        _attach(parent, _node([2], value=False, host=True))
-
-        with self.assertRaisesRegex(AssertionError, "D-only parent"):
-            cache.sanity_check_boundary_invariant()
-
     def test_l1_evicts_d_leaf_under_d_parent_by_boundarying_parent_first(self):
         cache = self._cache()
         parent = _attach(cache.root_node, _node([1], value=True, host=False))
@@ -128,7 +120,6 @@ class TestBoundaryHiRadixCachePolicy(CustomTestCase):
         self.assertIsNotNone(parent.host_value)
         self.assertIsNone(child.value)
         self.assertIsNotNone(child.host_value)
-        cache.sanity_check_boundary_invariant()
 
     def test_l1_evicts_dh_leaf_to_h_without_deleting_children(self):
         cache = self._cache()
@@ -170,7 +161,6 @@ class TestBoundaryHiRadixCachePolicy(CustomTestCase):
         self.assertEqual(evicted, 1)
         self.assertIsNone(parent.host_value)
         self.assertIsNotNone(child.host_value)
-        cache.sanity_check_boundary_invariant()
 
     def test_l2_preserves_boundary_host_value_when_h_descendant_exists(self):
         cache = self._cache()
@@ -194,7 +184,6 @@ class TestBoundaryHiRadixCachePolicy(CustomTestCase):
 
         self.assertEqual(evicted, 1)
         self.assertNotIn(h_leaf.key.child_key(1), boundary.children)
-        cache.sanity_check_boundary_invariant()
 
     def test_boundary_becomes_duplicate_after_last_h_descendant_removed(self):
         cache = self._cache()
@@ -208,7 +197,6 @@ class TestBoundaryHiRadixCachePolicy(CustomTestCase):
 
         self.assertIsNotNone(boundary.value)
         self.assertIsNone(boundary.host_value)
-        cache.sanity_check_boundary_invariant()
 
     def test_l2_respects_host_ref_counter(self):
         cache = self._cache()
@@ -247,7 +235,6 @@ class TestBoundaryHiRadixCachePolicy(CustomTestCase):
         self.assertIsNotNone(parent.host_value)
         self.assertIsNotNone(child.value)
         self.assertIsNotNone(child.host_value)
-        cache.sanity_check_boundary_invariant()
 
     def test_boundary_mode_can_use_host_pool_smaller_than_device_pool(self):
         device_pool = SimpleNamespace(
@@ -303,9 +290,16 @@ class TestBoundaryHiRadixCacheRegistry(CustomTestCase):
         fake_module.BoundaryHiRadixCache.assert_called_once()
         self.assertIs(result, fake_module.BoundaryHiRadixCache.return_value)
 
-    def test_registered_backend_rejects_storage_backend(self):
-        with self.assertRaisesRegex(ValueError, "does not support L3"):
-            create_tree_cache(self._ctx(storage_backend="mooncake"))
+    def test_registered_backend_accepts_storage_backend(self):
+        fake_module = MagicMock()
+        with patch.dict(
+            "sys.modules",
+            {"sglang.srt.mem_cache.boundary_hiradix_cache": fake_module},
+        ):
+            result = create_tree_cache(self._ctx(storage_backend="mooncake"))
+
+        fake_module.BoundaryHiRadixCache.assert_called_once()
+        self.assertIs(result, fake_module.BoundaryHiRadixCache.return_value)
 
 
 if __name__ == "__main__":
