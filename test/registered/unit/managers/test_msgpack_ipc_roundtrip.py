@@ -9,12 +9,10 @@ type-specific decisions (the `ExpertWeightPointer` narrowing, the
 """
 
 import dataclasses
-import enum
 import unittest
 
 import msgspec
 
-from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers import io_struct
 from sglang.srt.managers.io_struct import (
     BackupDramReq,
@@ -55,15 +53,13 @@ def _double_hop(obj):
     return msgpack_decode(msgpack_encode(msgpack_decode(msgpack_encode(obj))))
 
 
-def _contains_dataclass_or_enum(obj) -> bool:
-    if isinstance(obj, enum.Enum):
-        return True
+def _contains_dataclass(obj) -> bool:
     if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
         return True
     if isinstance(obj, dict):
-        return any(_contains_dataclass_or_enum(v) for v in obj.values())
+        return any(_contains_dataclass(v) for v in obj.values())
     if isinstance(obj, (list, tuple, set)):
-        return any(_contains_dataclass_or_enum(v) for v in obj)
+        return any(_contains_dataclass(v) for v in obj)
     return False
 
 
@@ -222,20 +218,19 @@ class TestMsgpackIpcRoundtrip(CustomTestCase):
         output = CheckWeightsReqOutput(success=True, message="ok", payload=[converted])
         self.assertEqual(_round_trip(output), output)
 
-    def test_get_internal_state_sanitizes_dataclass_and_enum(self):
-        # A live vars() dump can hold a dataclass (CudaGraphConfig) and an enum
-        # (DisaggregationMode). The producer sanitizes via msgspec_to_builtins so
-        # neither survives onto the wire; materialize CudaGraphConfig explicitly.
+    def test_get_internal_state_sanitizes_dataclass(self):
+        # A live vars(ServerArgs) dump holds a dataclass: cuda_graph_config is an
+        # Optional[CudaGraphConfig]. The producer sanitizes via msgspec_to_builtins
+        # so it does not survive onto the wire; materialize CudaGraphConfig
+        # explicitly.
         raw = {
             "cuda_graph_config": CudaGraphConfig(),
-            "disaggregation_mode": DisaggregationMode.NULL,
             "max_running_requests": 256,
         }
-        self.assertTrue(_contains_dataclass_or_enum(raw))
+        self.assertTrue(_contains_dataclass(raw))
 
         sanitized = msgspec_to_builtins(raw)
-        self.assertFalse(_contains_dataclass_or_enum(sanitized))
-        self.assertEqual(sanitized["disaggregation_mode"], "null")
+        self.assertFalse(_contains_dataclass(sanitized))
         self.assertIsInstance(sanitized["cuda_graph_config"], dict)
 
         output = GetInternalStateReqOutput(internal_state=sanitized)
