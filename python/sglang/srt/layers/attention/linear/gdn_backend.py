@@ -2,7 +2,6 @@ from typing import Optional, Tuple, Union
 
 import torch
 
-from sglang.srt.configs.model_config import ModelImpl
 from sglang.srt.layers.attention.fla.fused_gdn_gating import fused_gdn_gating
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
@@ -19,7 +18,6 @@ from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu
 from sglang.srt.utils.common import rank0_log
@@ -73,19 +71,12 @@ def maybe_set_default_flashinfer_gdn_prefill(model_runner: ModelRunner) -> None:
     cuda_version = torch.version.cuda
     chunk_size = args.chunked_prefill_size
     config = model_runner.hybrid_gdn_config
-    # Transformers multimodal disables chunked prefill in the scheduler, so its
-    # effective prefill chunk can exceed the configured limit checked here.
     if (
         cuda_version is None
         or int(cuda_version.split(".", 1)[0]) < 13
         or args.enable_dynamic_chunking
         or chunk_size is None
         or not 1 <= chunk_size <= 8192
-        or (
-            model_runner.model_config.is_multimodal
-            and get_resolved_model_impl(model_runner.model_config)
-            == ModelImpl.TRANSFORMERS
-        )
         or getattr(config, "linear_key_head_dim", None) != 128
         or getattr(config, "linear_value_head_dim", None) != 128
         or model_runner.req_to_token_pool.mamba_pool.mamba_cache.temporal.dtype
