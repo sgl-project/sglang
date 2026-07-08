@@ -111,7 +111,6 @@ from sglang.srt.utils import (
     get_compiler_backend,
     is_cpu,
     is_cuda,
-    is_gfx1250_supported,
     is_hip,
     is_musa,
     is_npu,
@@ -132,11 +131,7 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_xpu = is_xpu()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
-# gfx1250 (RDNA4) cannot compile the AITER CK topk_gating kernel; fall back to
-# the plain-HIP moe_fused_gate path (which supports sqrtsoftplus).
-_use_aiter = (
-    get_bool_env_var("SGLANG_USE_AITER") and _is_hip and not is_gfx1250_supported()
-)
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_musa = is_musa()
 
 # Experimental: skip the HIP padded-token routing-weight masking entirely.
@@ -1096,12 +1091,6 @@ def biased_topk_jit_kernel_impl(
 
     else:
         from sglang.jit_kernel.moe_fused_gate import moe_fused_gate
-
-        # moe_fused_gate requires float32 input/bias, but router logits may be
-        # bf16 (the aiter topk_gating path tolerates bf16).
-        gating_output = gating_output.float()
-        if correction_bias is not None:
-            correction_bias = correction_bias.float()
 
         topk_weights, topk_ids = moe_fused_gate(
             gating_output,
