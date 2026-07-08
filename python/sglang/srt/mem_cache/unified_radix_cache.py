@@ -2360,10 +2360,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     cc.prefetch_revoke_queue.qsize(),
                     cc.ack_backup_queue.qsize(),
                     cc.host_mem_release_queue.qsize(),
-                    *(
-                        extra_release_queues[name].qsize()
-                        for name in extra_pool_names
-                    ),
+                    *(extra_release_queues[name].qsize() for name in extra_pool_names),
                 )
                 if self.enable_storage
                 else ()
