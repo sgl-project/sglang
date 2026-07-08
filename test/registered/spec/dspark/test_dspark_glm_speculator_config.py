@@ -2,6 +2,7 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.models.dspark import _normalize_dspark_transformer_config
+from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
 from sglang.srt.speculative.dspark_components.dspark_utils import (
     parse_dspark_draft_config,
 )
@@ -61,11 +62,18 @@ def _glm52_dspark_config():
 
 class TestDSparkGLMSpeculatorConfig(CustomTestCase):
     def test_parse_speculators_config_shape(self):
+        dflash_parsed = parse_dflash_draft_config(
+            draft_hf_config=_glm52_dspark_config(),
+        )
         parsed = parse_dspark_draft_config(
             draft_hf_config=_glm52_dspark_config(),
         )
 
+        self.assertEqual(dflash_parsed.num_hidden_layers, 5)
+        self.assertEqual(dflash_parsed.block_size, 8)
         self.assertEqual(parsed.gamma, 7)
+        self.assertEqual(parsed.gamma + 1, 8)
+        self.assertEqual(parsed.num_hidden_layers, 5)
         self.assertEqual(parsed.target_layer_ids, [8, 23, 39, 55, 70])
         self.assertEqual(parsed.mask_token_id, 154856)
         self.assertEqual(parsed.markov_rank, 256)
@@ -80,6 +88,7 @@ class TestDSparkGLMSpeculatorConfig(CustomTestCase):
         self.assertEqual(cfg.num_attention_heads, 64)
         self.assertEqual(cfg.num_key_value_heads, 64)
         self.assertEqual(cfg.vocab_size, 154880)
+        self.assertEqual(cfg.block_size, 8)
         self.assertEqual(cfg.rope_parameters["rope_theta"], 8000000)
 
 
