@@ -1,3 +1,4 @@
+import unittest
 from types import SimpleNamespace
 
 import torch
@@ -116,3 +117,7 @@ class TestDSALayerShardUtils(CustomTestCase):
             )
             self.assertTrue(torch.equal(buf, owner_kv[layer_id]))
             self.assertEqual(pool.remote_kv_layer_id, layer_id)
+
+
+if __name__ == "__main__":
+    unittest.main()
