@@ -691,10 +691,8 @@ def commit_mamba_states_after_verify(
             ):
                 for i, req in enumerate(batch.reqs):
                     if to_track[i] and req.mamba_next_track_idx is not None:
-                        req.mamba_next_track_idx = (
-                            pool.get_mamba_ping_pong_other_idx(
-                                req.mamba_next_track_idx
-                            )
+                        req.mamba_next_track_idx = pool.get_mamba_ping_pong_other_idx(
+                            req.mamba_next_track_idx
                         )
 
 
