@@ -82,12 +82,22 @@ class SchedulerInvariantChecker:
         return leak, msg
 
     def _check_full_pool(self, ps: PoolStats, uncached: int = 0) -> Tuple[bool, str]:
+        if self.is_hybrid_swa and not self.full_tokens_per_layer:
+            return False, ""
         if self.is_hybrid_swa:
             protected = self.tree_cache.full_protected_size()
             session_held = self.pool_stats_observer.session_held_full_tokens()
             total = self.full_tokens_per_layer
-        elif self.is_hybrid_ssm and self.tree_cache.supports_mamba():
-            protected = self.tree_cache.full_protected_size()
+        elif self.is_hybrid_ssm:
+            # Branch on cache type for the protected accessor (MambaRadixCache
+            # splits full/mamba; ChunkCache only has the single protected_size).
+            # Use the allocator's `.size` for `total`: static max_total_num_tokens for
+            # non-unified pools, the dynamic byte-coordinated cap (matching
+            # `available_size`) for the unified pool.
+            if self.tree_cache.supports_mamba():
+                protected = self.tree_cache.full_protected_size()
+            else:
+                protected = self.tree_cache.protected_size()
             session_held = self.pool_stats_observer.session_held_tokens()
             total = self.token_to_kv_pool_allocator.size
         else:

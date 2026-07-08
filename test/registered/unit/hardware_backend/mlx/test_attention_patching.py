@@ -190,6 +190,31 @@ class TestMlxAttentionPatching(unittest.TestCase):
         self.assertEqual(out.shape, (1, 1, 4))
         self.assertEqual(inner.o_proj.last_input_shape, (1, 1, 4))
 
+    def test_write_token_grows_buffer_past_max_seq_len(self):
+        max_seq_len = 4
+        cache = ContiguousAttentionKVCache(
+            n_kv_heads=1, head_dim=2, max_seq_len=max_seq_len, dtype=mx.float32
+        )
+        n_tokens = max_seq_len * 2 + 1  # force at least one grow past the boundary
+
+        for t in range(n_tokens):
+            k = mx.full((1, 1, 1, 2), t, dtype=mx.float32)
+            v = mx.full((1, 1, 1, 2), -t, dtype=mx.float32)
+            cache.write_token(k, v)
+
+        self.assertEqual(cache.offset, n_tokens)
+        self.assertGreaterEqual(cache.max_seq_len, n_tokens)
+
+        keys, values = cache.get_kv()
+        mx.eval(keys, values)
+        self.assertEqual(keys.shape, (1, 1, n_tokens, 2))
+        self.assertEqual(values.shape, (1, 1, n_tokens, 2))
+        # Every token (including those written before the grow) is preserved
+        # at its original position.
+        for t in range(n_tokens):
+            self.assertEqual(keys[0, 0, t, 0].item(), float(t))
+            self.assertEqual(values[0, 0, t, 0].item(), float(-t))
+
     def test_attn_config_uses_float_dtype_for_quantized_projection(self):
         runner = object.__new__(MlxModelRunner)
         attn = FakeAttention()
@@ -1124,6 +1149,7 @@ class TestMlxOverlapScheduler(unittest.TestCase):
         self.assertTrue(torch.equal(schedule_batch.input_ids, token_ids))
         self.assertIs(scheduler.processed_batch, batch_copy)
         self.assertIs(scheduler.processed_result, scheduler.tp_worker.result)
+        self.assertEqual(scheduler.forward_ct, 1)
 
     def test_overlap_loop_materializes_prefill_input_ids(self):
         # Regression: the MLX overlap loop must materialize batch.input_ids
@@ -1513,6 +1539,13 @@ if _HAS_MLX:
             self.last_batch = None
             self.processed_batch = None
             self.processed_result = None
+            # _finalize_mlx_pending_job now advances forward_ct and runs the
+            # profiler batch predicate (mirroring run_batch); stub both so the
+            # overlap accounting added in #29217 has something to call.
+            self.forward_ct = 0
+            self.profiler_manager = SimpleNamespace(
+                _profile_batch_predicate=lambda batch: None
+            )
 
         def process_batch_result(self, batch, result):
             self.processed_batch = batch

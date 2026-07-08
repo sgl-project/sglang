@@ -50,7 +50,9 @@ from sglang.srt.disaggregation.utils import (
     ReqToMetadataIdxAllocator,
     TransferBackend,
     _is_fake_transfer,
+    get_dsv4_c128_state_indices,
     get_kv_class,
+    is_dsv4_c128_online_enabled,
     is_mla_backend,
     poll_and_all_reduce,
     poll_and_all_reduce_with_staging,
@@ -403,6 +405,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
             transfer_kv_pool.get_contiguous_buf_infos()
         )
+        kv_data_mem_kinds = (
+            ["DRAM"] * len(kv_data_ptrs)
+            if self.scheduler.enable_hisparse
+            else ["VRAM"] * len(kv_data_ptrs)
+        )
         if self.scheduler.enable_hisparse and isinstance(
             self.token_to_kv_pool, DeepSeekV4TokenToKVPool
         ):
@@ -413,6 +420,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             kv_data_ptrs += device_kv_data_ptrs[c4_layer_num:]
             kv_data_lens += device_kv_data_lens[c4_layer_num:]
             kv_item_lens += device_kv_item_lens[c4_layer_num:]
+            kv_data_mem_kinds += ["VRAM"] * len(device_kv_data_ptrs[c4_layer_num:])
         if self.draft_token_to_kv_pool is not None:
             # We should also transfer draft model kv cache. The indices are
             # always shared with a target model.
@@ -422,10 +430,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             kv_data_ptrs += draft_kv_data_ptrs
             kv_data_lens += draft_kv_data_lens
             kv_item_lens += draft_kv_item_lens
+            kv_data_mem_kinds += ["VRAM"] * len(draft_kv_data_ptrs)
 
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
         kv_args.kv_item_lens = kv_item_lens
+        if self.transfer_backend == TransferBackend.NIXL:
+            kv_args.kv_data_mem_kinds = kv_data_mem_kinds
         kv_args.page_size = self.token_to_kv_pool.page_size
 
         kv_args.aux_data_ptrs, kv_args.aux_data_lens, kv_args.aux_item_lens = (
@@ -714,7 +725,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 error_msg = f"Could not fetch prefill parallel info from {bootstrap_addr} after {count} attempts"
                 logger.error(error_msg)
                 for decode_req in reqs:
-                    decode_req.kv_receiver.abort()
+                    # kv_receiver may be None from a prior self.queue cleanup
+                    if decode_req.kv_receiver is not None:
+                        decode_req.kv_receiver.abort()
                 del self._ensure_retry_count[bootstrap_addr]
                 del self._ensure_last_attempt_time[bootstrap_addr]
             else:
@@ -825,6 +838,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 decode_req.kv_receiver = None
                 failed_reqs.append(decode_req)
                 indices_to_remove.add(i)
+
+        # DecodeRequest is shared between self.queue and self.pending_reqs;
+        # drop failed reqs from both
+        if failed_reqs:
+            failed_ids = {id(r) for r in failed_reqs}
+            self.pending_reqs = [
+                r for r in self.pending_reqs if id(r) not in failed_ids
+            ]
 
         # HiSparse physical constraint: max requests by device buffer capacity.
         # Each admitted req needs padded_buffer_size from hisparse device pool.
@@ -1040,8 +1061,24 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 ring_rows = state_slot * ring_stride + (positions % ring_stride)
                 return ring_rows.astype(np.int32)
 
+            def _c128_state_payload():
+                online = is_dsv4_c128_online_enabled()
+                ring_size = 1 if online else self.token_to_kv_pool.get_ring_size(128)
+                return get_dsv4_c128_state_indices(
+                    int(decode_req.req.req_pool_idx),
+                    seq_len,
+                    online=online,
+                    ring_size=ring_size,
+                )
+
             state_types = self.kv_manager.kv_args.state_types
             state_indices: Optional[List] = []
+            if StateType.C128_STATE in state_types:
+                clear_c128_state = getattr(
+                    self.token_to_kv_pool, "clear_c128_req_state", None
+                )
+                if clear_c128_state is not None:
+                    clear_c128_state(int(decode_req.req.req_pool_idx))
             for st in state_types:
                 if st == StateType.MAMBA:
                     state_indices.append(_mamba_payload())
@@ -1049,8 +1086,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     state_indices.append(_swa_payload())
                 elif st == StateType.DSA:
                     state_indices.append(_dsa_payload())
+                elif st == StateType.MINIMAX_INDEX_K:
+                    # Index rows live at the same loc as main KV on the same
+                    # page_size, so reuse the full-seq page-ids.
+                    state_indices.append(_dsa_payload())
                 elif st == StateType.SWA_RING:
                     state_indices.append(_swa_ring_payload())
+                elif st == StateType.C128_STATE:
+                    state_indices.append(_c128_state_payload())
                 else:
                     state_indices.append(None)
 
