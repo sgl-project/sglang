@@ -502,10 +502,36 @@ class SchedulerDisaggregationPrefillMixin:
     def event_loop_overlap_disagg_prefill(self: Scheduler) -> None:
         self.result_queue = deque()
 
+        # Only multimodal models benefit from pipelining mm_inputs processing
+        # with GPU forward; text-only requests keep the plain synchronous path.
+        pipeline_mm = self.model_config.is_multimodal
+        if pipeline_mm:
+            from concurrent.futures import ThreadPoolExecutor
+
+            mm_executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="mm_proc"
+            )
+            self._skip_recv_shm_flush = True
+            prev_recv_reqs = prev_mm_future = prev_mm_indices = None
+
         while True:
+            if pipeline_mm and prev_recv_reqs is not None:
+                self._collect_mm_results_and_dispatch(
+                    prev_recv_reqs, prev_mm_future, prev_mm_indices
+                )
+
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
-            self.process_input_requests(recv_reqs)
+
+            if pipeline_mm:
+                self._flush_oldest_shm_generation()
+                prev_mm_future, prev_mm_indices = self._submit_mm_processing(
+                    mm_executor, recv_reqs
+                )
+                prev_recv_reqs = recv_reqs
+            else:
+                self.process_input_requests(recv_reqs)
+
             self.waiting_queue.extend(
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
             )
@@ -519,13 +545,12 @@ class SchedulerDisaggregationPrefillMixin:
             self.cur_batch = batch
 
             # Launch the current batch
+            batch_result = None
             if batch:
                 if self.enable_staging:
                     self.maybe_prefetch_staging_for_batch(batch)
                 batch_result = self.run_batch(batch)
                 self.result_queue.append((batch.copy(), batch_result))
-            else:
-                batch_result = None
 
             # Process the last batch
             if self.last_batch:
