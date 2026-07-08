@@ -84,15 +84,16 @@ When you extract domain logic into a collaborator (a factory, an initializer, a 
 When a callee genuinely takes the live object, it should **read** fields off it and **return** results — and avoid **writing** fields back into it unless there is genuinely no other way. Let the orchestrator own the assignment onto its own fields. A callee that mutates the god object scatters that object's writes across other modules: you can no longer see what `ModelRunner` owns by reading `model_runner.py`, the hidden writes race with the orchestrator's own ordering, and the callee silently depends on being invoked at exactly the right moment.
 
 ```python
-# Good — callee reads the runner and returns; the orchestrator owns the writes.
+# Good — callee reads the runner and returns a small frozen struct; the orchestrator
+# owns the writes.
 # model_runner.py
 class ModelRunner:
     def bar(self):
-        self.a, self.b, self.c = foo(self)
+        self.foo_result = foo(self)
 
 # another_file.py
-def foo(model_runner):
-    return xxx, yy, zz
+def foo(model_runner) -> FooResult:
+    return FooResult(a=xx, b=yy, c=zz)
 
 # Avoid — callee reaches back in and writes the runner's fields.
 # model_runner.py
