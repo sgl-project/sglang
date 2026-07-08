@@ -51,16 +51,65 @@ def split_fp32_weight(
     return w_high, w_low
 
 
+# The upstream hpc-ops heuristic below was tuned on 78-SM H20 parts. On
+# 132-SM H200 it systematically under-parallelizes (too little split-k /
+# wgn at small-mid m) and never uses the tile64 + two-math-warpgroup layout
+# that the kernel template supports; an exhaustive per-config sweep on H200
+# measured 1.2-1.6x for the LongCat router shapes (see PR #30247). The
+# tables below hold the measured-best config per m-range for exactly those
+# shapes, applied only on large-SM parts; every other shape and H20-class
+# parts keep the upstream heuristic. Note: the tile64 + wgn=2 rows require
+# split_k == 1 — the split-k variant of that layout crashes and must not be
+# added here without kernel-level validation.
+_TUNED_MIN_SM_COUNT = 100
+
+_SM90_LARGE_SM_TUNED = {
+    # (n, k) -> ascending (min_m, (tile_m, tile_n, tile_k, stage, wgn, split_k))
+    # LongCat-Flash-Chat router: hidden 6144, 512 routed + 256 zero experts.
+    (768, 6144): (
+        (0, (16, 64, 128, 3, 2, 4)),
+        (96, (16, 64, 128, 3, 2, 8)),
+        (256, (64, 64, 64, 3, 1, 2)),
+        (384, (64, 64, 64, 5, 1, 4)),
+        (768, (64, 64, 64, 4, 2, 1)),
+    ),
+    # LongCat-Flash-Lite router: hidden 3072, 256 routed + 128 zero experts.
+    (384, 3072): (
+        (0, (16, 64, 128, 3, 2, 4)),
+        (192, (16, 64, 128, 3, 2, 8)),
+        (384, (16, 64, 128, 3, 2, 4)),
+        (768, (64, 64, 64, 3, 1, 1)),
+        (1536, (64, 64, 64, 4, 2, 1)),
+    ),
+}
+
+
+@cache_once
+def _device_sm_count(device_index: int) -> int:
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
+
+
 def _select_launch_config(
-    m: int, n: int, k: int
+    m: int, n: int, k: int, sm_count: Optional[int] = None
 ) -> Tuple[int, int, int, int, int, int]:
     """Pick (tile_m, tile_n, tile_k, stage, wgn, split_k) for a problem shape.
 
     Port of ``select_config`` in hpc-ops src/gemm/sm90/entry.cc plus the
     (stage, tile_k) resolution in ``gemm_bf16xfp32_async``. The thresholds are
     over ``norm_m``, the workload normalized to a reference n=192, k=4096
-    problem, and were tuned upstream on SM90 parts.
+    problem, and were tuned upstream on H20. When ``sm_count`` indicates a
+    large-SM part and the shape has an H200-measured entry, that table wins.
     """
+    if sm_count is not None and sm_count >= _TUNED_MIN_SM_COUNT:
+        tuned = _SM90_LARGE_SM_TUNED.get((n, k))
+        if tuned is not None:
+            config = tuned[0][1]
+            for min_m, cfg in tuned:
+                if m < min_m:
+                    break
+                config = cfg
+            return config
+
     norm_m = (m * n * 4096 + 192 * k - 1) // (192 * k)
 
     if 624 < norm_m <= 832:
@@ -138,7 +187,9 @@ def _gemm_bf16xfp32_custom_op(
 ) -> None:
     m, k = x.shape
     n = w_high.shape[0]
-    tile_m, tile_n, tile_k, stage, wgn, split_k = _select_launch_config(m, n, k)
+    tile_m, tile_n, tile_k, stage, wgn, split_k = _select_launch_config(
+        m, n, k, sm_count=_device_sm_count(x.device.index)
+    )
     module = _jit_gemm_bf16xfp32_module(
         tile_m, tile_n, tile_k, stage, wgn, split_k, output.dtype == torch.float32
     )
