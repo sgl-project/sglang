@@ -495,7 +495,14 @@ def _fused_dsa_draft_extend_metadata_kernel(
             mask=mask_e,
             other=0,
         ).to(tl.int32)
+        # Clamp to >= 0: DP-padded / idle-companion rows carry the CUDA-graph
+        # seq_len fill value (1), which is smaller than qo_len, so the raw
+        # per-row visible kv length goes negative. Consumers treat these
+        # lengths as unsigned (the top-k v2 kernel reads them as uint32), so a
+        # negative row becomes a ~4e9-token length and an illegal memory
+        # access. 0 keeps padded rows on the trivial all-(-1) output path.
         expanded_seq = base_seq - qo_len_for_row + local_off + 1
+        expanded_seq = tl.maximum(expanded_seq, 0)
         expanded_seq = tl.where(mask_e, expanded_seq, 0)
         dsa_seq = tl.minimum(expanded_seq, dsa_index_topk)
         dsa_cu = tl.cumsum(dsa_seq, 0)

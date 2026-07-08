@@ -147,6 +147,7 @@ def _allocate_decode_buffers(
                 req_lens=torch.ones([max_bs], dtype=torch.int32),
                 out_column_starts=torch.zeros([max_bs], dtype=torch.int32),
                 out_req_lens=torch.ones([max_bs], dtype=torch.int32),
+                skip_token_table_update=torch.zeros([max_bs], dtype=torch.bool),
             )
             if ne_token_table is not None
             else None
@@ -297,6 +298,7 @@ class BaseRunner(ABC):
             num_tokens_per_bs=num_tokens_per_bs,
             cache_loc_dtype=torch.int64,
             enable_mamba_track=False,
+            ne_token_table=mr.token_table if mr.use_ngram_embedding else None,
             hc_hidden_size=getattr(mr.model_config, "hc_hidden_size", None),
             pp_proxy_topk_size=mr.get_pp_proxy_topk_size(),
         )
@@ -524,6 +526,10 @@ class BaseRunner(ABC):
             global_forward_mode=capture_forward_mode,
             lora_ids=lora_ids,
         )
+        if buffers.ngram_embedding_info is not None:
+            forward_batch.ngram_embedding_info = buffers.ngram_embedding_info.slice(
+                batch_size
+            )
 
         if lora_ids is not None:
             mr.lora_manager.prepare_lora_batch(forward_batch)
