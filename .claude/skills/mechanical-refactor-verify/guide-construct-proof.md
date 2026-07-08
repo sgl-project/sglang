@@ -119,21 +119,39 @@ if __name__ == "__main__":
 
 ## 5. Publish the proof with the PR
 
-- Share the whole `--out` folder (a gist, a PR attachment, a repo branch) — it is
-  self-contained.
-- Share the folder, not one raw file: a generated script resolves
-  `mechanical_refactor_reproduction_utils` relative to its own path, so a
-  `python3 <(curl ...)` process substitution breaks the import.
-- Include the commands in the PR description:
+### 5.1 What to share
 
-  ````markdown
-  ## Mechanical move — reproducible
+- Share the scripts **plus** the copied `mechanical_refactor_reproduction_utils.py` — the
+  scripts import it, so a lone raw file is not runnable.
+- Never a `python3 <(curl ...)` one-liner: process substitution gives the script no real
+  directory, so the import breaks.
+- Flat layouts work: Python puts the script's own directory on `sys.path`, so the utils
+  module can sit either next to the script or one level up (the `--out` layout).
 
-  ```bash
-  # from the repo root, with the shared folder unpacked next to it
-  python3 <folder>/repro_scripts/<sha>.py   # PASS = byte-identical to this commit
-  ```
-  ````
+### 5.2 Author: create a gist
+
+```bash
+cd repro_out
+gh gist create --desc "mechanical-move proof for PR #NNNN" \
+    repro_scripts/*.py mechanical_refactor_reproduction_utils.py output.log
+# prints https://gist.github.com/<user>/<gist_id> -- put it in the PR description
+```
+
+- `gh gist create` flattens paths — fine per §5.1.
+- Alternatives: a PR attachment (zip the `--out` folder) or a branch holding it.
+
+### 5.3 Reviewer: download and re-run
+
+```bash
+gh gist clone <gist_id> /tmp/proof        # or: git clone https://gist.github.com/<gist_id>.git /tmp/proof
+cd <repo-root>                            # the run resolves the repo from the cwd
+python3 /tmp/proof/<sha>.py               # PASS = byte-identical to this commit
+```
+
+- Include exactly these commands in the PR description under a
+  "Mechanical move — reproducible" heading.
+
+### 5.4 Keep the PR mechanical
 
 - A mechanical PR contains **only** mechanical changes (moves, splits, renames, import
   fixes, formatting). Semantic changes go in a separate PR.
