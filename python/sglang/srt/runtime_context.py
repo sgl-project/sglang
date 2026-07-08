@@ -81,6 +81,8 @@ _PARALLEL_FIELDS = frozenset(
         "attn_cp_rank",
         "attn_dp_size",
         "attn_dp_rank",
+        "dcp_size",
+        "dcp_rank",
         "world_group",
         "tp_group",
         "pp_group",
@@ -89,6 +91,7 @@ _PARALLEL_FIELDS = frozenset(
         "moe_tp_group",
         "attn_tp_group",
         "attn_cp_group",
+        "dcp_group",
     }
 )
 
@@ -184,6 +187,14 @@ class ParallelContext:
         return self._v("attn_cp_rank", _ps().get_attn_context_model_parallel_rank)
 
     @property
+    def dcp_size(self) -> int:
+        return self._v("dcp_size", _ps().get_dcp_world_size)
+
+    @property
+    def dcp_rank(self) -> int:
+        return self._v("dcp_rank", _ps().get_dcp_rank)
+
+    @property
     def attn_dp_size(self) -> int:
         return self._v("attn_dp_size", _dp().get_attention_dp_size)
 
@@ -222,6 +233,10 @@ class ParallelContext:
     @property
     def attn_cp_group(self) -> Any:
         return self._v("attn_cp_group", _ps().get_attn_cp_group)
+
+    @property
+    def dcp_group(self) -> Any:
+        return self._v("dcp_group", _ps().get_dcp_group)
 
 
 class _FlagGroupBase:

@@ -30,7 +30,6 @@ from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.distributed import (
     get_pp_group,
-    get_tensor_model_parallel_world_size,
     get_tp_group,
 )
 from sglang.srt.environ import envs
@@ -469,8 +468,7 @@ class MQALayer(nn.Module):
             self.hidden_size,
             bias=False,
             quant_config=quant_config,
-            reduce_results=attn_tp_size == get_tensor_model_parallel_world_size()
-            and attn_tp_size > 1,
+            reduce_results=attn_tp_size == get_parallel().tp_size and attn_tp_size > 1,
             prefix=add_prefix("wo_b", prefix),
             tp_rank=attn_tp_rank,
             tp_size=attn_tp_size,
@@ -1104,7 +1102,7 @@ class MQALayer(nn.Module):
             o = torch.einsum("tgd,grd->tgr", o, wo_a)
 
         o, _ = self.wo_b(o.flatten(1))
-        if self.tp_size > 1 and self.tp_size < get_tensor_model_parallel_world_size():
+        if self.tp_size > 1 and self.tp_size < get_parallel().tp_size:
             o = attn_tp_all_reduce(o)
 
         return o
