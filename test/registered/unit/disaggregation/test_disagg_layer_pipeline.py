@@ -13,6 +13,10 @@ from sglang.srt.disaggregation.mooncake.conn import (
     TransferKVChunk,
     split_layer_groups,
 )
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class _FakeQueue:
@@ -191,7 +195,7 @@ def _all_chunks(mgr):
     return chunks
 
 
-class TestKVArgsRegisterInfo(unittest.TestCase):
+class TestKVArgsRegisterInfo(CustomTestCase):
     def test_kv_args_register_info_parses_num_main_kv_layers_slot(self):
         """Pin msg[17]: decode-side `num_main_kv_layers` ships after the two staging slots (15, 16)
         so the staging-always-at-final invariant in `_register_kv_args` holds. A reorder of slot
@@ -281,7 +285,7 @@ def _invoke_layer_group(mgr, **kwargs):
     return MooncakeKVManager._send_kvcache_layer_group(mgr, **defaults)
 
 
-class TestSendKVCacheLayerGroupSlicingMHA(unittest.TestCase):
+class TestSendKVCacheLayerGroupSlicingMHA(CustomTestCase):
     def _make_mgr(self, layers_per_pp_stage=12):
         src_k = [100 + i for i in range(layers_per_pp_stage)]
         src_v = [200 + i for i in range(layers_per_pp_stage)]
@@ -509,7 +513,7 @@ def _legacy_chunk(room, *, is_last=True):
     )
 
 
-class TestPerGroupWatermarkSync(unittest.TestCase):
+class TestPerGroupWatermarkSync(CustomTestCase):
     """Issue #6: receiver-side success notification must wait for every enqueued chunk to actually
     complete, regardless of completion order, so Phase 2's parallel/out-of-order RDMA cannot trigger
     premature `KVPoll.Success` and silent KV corruption."""
@@ -750,7 +754,7 @@ def _wm_chunk_for(room, group_id, *, is_last, total_groups, total_chunks=None):
     )
 
 
-class TestWatermarkStress(unittest.TestCase):
+class TestWatermarkStress(CustomTestCase):
     """Issue #5: stress the per-(room, dst-rank) watermark state machine under combinatorial chunk
     orderings, many concurrent rooms, and per-room failure injection — beyond the 5 baseline
     scenarios in `TestPerGroupWatermarkSync`. Covers the Phase 2 worker hot path under realistic
@@ -881,7 +885,7 @@ class _FakeCudaEvent:
         self.synchronize_calls += 1
 
 
-class TestTransferEventSynchronize(unittest.TestCase):
+class TestTransferEventSynchronize(CustomTestCase):
     """Phase 2 commit 2: when a chunk carries a `transfer_event` (recorded by the forward hook on the
     compute stream), `transfer_worker` MUST `event.synchronize()` before any KV send so RDMA reads
     committed bytes. Phase 1 chunks (event=None) take no extra cost."""
@@ -915,7 +919,7 @@ class TestTransferEventSynchronize(unittest.TestCase):
         self.assertEqual(mgr.send_aux_calls, 1)
 
 
-class TestMakeLayerPipelineHook(unittest.TestCase):
+class TestMakeLayerPipelineHook(CustomTestCase):
     """Phase 2 commit 3: `MooncakeKVManager.make_layer_pipeline_hook` returns a closure that, on every
     layer-group boundary (and on the last layer), records a single CUDA event and enqueues one chunk per
     dispatch entry. Sub-group-boundary layers must be no-ops."""
@@ -1008,7 +1012,7 @@ class TestMakeLayerPipelineHook(unittest.TestCase):
             _torch.cuda.Event = original_event
 
 
-class TestReviewR2HookCeilDivision(unittest.TestCase):
+class TestReviewR2HookCeilDivision(CustomTestCase):
     """R2 (review): the hook must compute `total_layer_groups` with ceil division, not floor —
     num_layers=10, group_size=4 is 3 groups, not 2. Asserts chunk metadata receivers see is correct."""
 
@@ -1060,7 +1064,7 @@ class TestReviewR2HookCeilDivision(unittest.TestCase):
             )
 
 
-class TestReviewR3EventSyncFailureIsolation(unittest.TestCase):
+class TestReviewR3EventSyncFailureIsolation(CustomTestCase):
     """R3 (review): a CUDA error in one room's `event.synchronize()` must not bring down the whole transfer
     worker thread. Mark just that room failed and continue."""
 
@@ -1198,7 +1202,7 @@ def _make_hook_mgr_with_offset(
     return mgr, dispatch, captured, sender
 
 
-class TestMakeLayerPipelineHookPpOffset(unittest.TestCase):
+class TestMakeLayerPipelineHookPpOffset(CustomTestCase):
     """P0-A (#28): the hook receives the GLOBAL `RadixAttention.layer_id` but `local_num_kv_layers()` /
     `kv_data_ptrs` are sliced to the local PP stage. Hook must subtract `kv_args.prefill_start_layer` and drop
     fires outside `[0, num_layers)`. PP=1 (offset=0) keeps Phase 1 + 35 existing cases bit-equivalent; PP > 1
@@ -1241,7 +1245,7 @@ class TestMakeLayerPipelineHookPpOffset(unittest.TestCase):
         self.assertEqual(sender._hook_enqueued_chunks, 8)
 
 
-class TestMakeLayerPipelineHookDraftLayerSlots(unittest.TestCase):
+class TestMakeLayerPipelineHookDraftLayerSlots(CustomTestCase):
     """When a draft (MTP/EAGLE NEXTN) model exists on prefill, its KV pool ptrs get APPENDED to the main
     pool's ptrs in `disaggregation/prefill.py:147-155` so mooncake registers a single contiguous RDMA buffer
     covering both. `len(kv_data_ptrs)` then becomes `num_main + num_draft` (e.g. GLM-MoE-DSA: 78 main + 1
@@ -1322,7 +1326,7 @@ class TestMakeLayerPipelineHookDraftLayerSlots(unittest.TestCase):
         self.assertEqual(sender._hook_enqueued_chunks, 20)
 
 
-class TestSenderHookMixedPathDetection(unittest.TestCase):
+class TestSenderHookMixedPathDetection(CustomTestCase):
     """P0-B (#28) fail-loud: scheduler sets `_hook_handled_in_current_send` True but no hook fire bumped
     `_hook_enqueued_chunks` in between (eg. the dispatched req's forward path bypassed `RadixAttention.forward`,
     or eligibility flipped mid-batch). `send()` MUST raise rather than emit an aux finalizer with
@@ -1382,7 +1386,7 @@ def _make_metrics_mgr():
     return mgr
 
 
-class TestLayerPipelineMetrics(unittest.TestCase):
+class TestLayerPipelineMetrics(CustomTestCase):
     """#18 Phase 3: per-LP-chunk metrics — Counter + Histogram fed through `MooncakeKVManager._record_layer_group_metric`
     and snapshot via `pop_layer_pipeline_metrics`. Also covers the failure-path regression: failed chunks must NOT
     increment any metric (the `transfer_worker` failure branches return/break before reaching the record call)."""
@@ -1435,7 +1439,7 @@ class TestLayerPipelineMetrics(unittest.TestCase):
         )
 
 
-class TestMooncakeKVSenderSendDraftKV(unittest.TestCase):
+class TestMooncakeKVSenderSendDraftKV(CustomTestCase):
     """B2: draft KV transfer via separate `send_draft_kv` call from `prefill.py send_kv_chunk`, AFTER
     `forward_batch_generation` returns so the draft model forward has actually written draft KV bytes.
 
@@ -1510,7 +1514,7 @@ class TestMooncakeKVSenderSendDraftKV(unittest.TestCase):
         )
 
 
-class TestMergeMainAndDraftKVLayout(unittest.TestCase):
+class TestMergeMainAndDraftKVLayout(CustomTestCase):
     """Regression for `merge_main_and_draft_kv_layout` MHA reorder.
 
     `CommonKVManager.get_mha_kv_ptrs_with_pp` slices the merged `kv_data_ptrs` as `[:half], [half:]`
@@ -1544,7 +1548,7 @@ class TestMergeMainAndDraftKVLayout(unittest.TestCase):
         self.assertEqual(ptrs[half:], [200, 201, 202, 210])
 
 
-class TestGetStatePtrsWithPp(unittest.TestCase):
+class TestGetStatePtrsWithPp(CustomTestCase):
     """Regression for the SWA/DSA state-ptr PP alignment bug in `MooncakeKVManager.maybe_send_extra`.
 
     Before the fix the per-LP-chunk state path applied the local `layer_range = (layer_start, layer_end)` slice
@@ -1583,7 +1587,7 @@ class TestGetStatePtrsWithPp(unittest.TestCase):
         self.assertIn("num_main_kv_layers", str(cm.exception))
 
 
-class TestMakeLayerPipelineHookCpLayerShard(unittest.TestCase):
+class TestMakeLayerPipelineHookCpLayerShard(CustomTestCase):
     """Phase 3 CP layer-shard: `make_layer_pipeline_hook` partitions main-layer groups across CP ranks when
     `use_layer_cp_shard_for_transfer()` is True. Each rank owns groups whose `id % attn_cp_size == attn_cp_rank`;
     non-owner fires skip BOTH `add_transfer_request` AND the per-sender chunk-counter bump (so the empty-owner case
@@ -1677,7 +1681,7 @@ class TestMakeLayerPipelineHookCpLayerShard(unittest.TestCase):
                     )
 
 
-class TestSkipAuxRdmaWorkerBehavior(unittest.TestCase):
+class TestSkipAuxRdmaWorkerBehavior(CustomTestCase):
     """Phase 3 CP layer-shard (plan §9.1): worker honors the `skip_aux_rdma` flag on the aux-only finalizer.
 
     Production wiring: `MooncakeKVSender.send()` stamps the flag for non-CP0 ranks under layer-shard mode (covered by
