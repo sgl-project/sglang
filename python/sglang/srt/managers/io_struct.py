@@ -210,6 +210,11 @@ class GenerateReqInput:
     stream: bool = False
     # Whether to log metrics for this request (e.g. health_generate calls do not log metrics)
     log_metrics: bool = True
+    # Skip inserting this request's KV into the radix cache. Set by internal
+    # fake-transfer reqs (warmup / health-check) so throwaway KV does not pollute
+    # the tree. User reqs (incl. standalone-prefill testing with bootstrap_host
+    # 2.2.2.2) leave this False so prefix caching works.
+    skip_radix_cache_insert: bool = False
     # Whether to return hidden states
     return_hidden_states: Union[List[bool], bool] = False
     # Whether to return captured routed experts
@@ -761,6 +766,7 @@ class GenerateReqInput:
             priority=self.priority,
             extra_key=self.extra_key[i] if self.extra_key is not None else None,
             no_logs=self.no_logs,
+            skip_radix_cache_insert=self.skip_radix_cache_insert,
             custom_labels=self.custom_labels,
             return_bytes=self.return_bytes,
             return_entropy=self.return_entropy,
@@ -847,6 +853,10 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
 
     # Whether to disallow logging for this request (e.g. due to ZDR)
     no_logs: bool = False
+
+    # Skip inserting this request's KV into the radix cache (warmup / health-check
+    # fake-transfer reqs). See GenerateReqInput.skip_radix_cache_insert.
+    skip_radix_cache_insert: bool = False
 
     # (Internal) Whether to return bytes for image generation
     return_bytes: bool = False
