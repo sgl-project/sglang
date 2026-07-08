@@ -143,9 +143,7 @@ class TokenizerControlMixin:
             dispatch_pairs.append((resp_type, comm.handle_recv))
         self._result_dispatcher += TypeBasedDispatcher(dispatch_pairs)
 
-    def update_control_communicator_fan_out(
-        self: TokenizerManager, worker_count: int
-    ):
+    def update_control_communicator_fan_out(self: TokenizerManager, worker_count: int):
         primary_group_control = (
             self.server_args.enable_dp_attention
             and not self.server_args.enable_dp_attention_local_control_broadcast

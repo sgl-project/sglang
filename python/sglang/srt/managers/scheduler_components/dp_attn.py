@@ -128,11 +128,9 @@ class MLPSyncBatchInfo:
         fallback_tensor = self._get_fallback_tensor(device=device)
         info_width = local_info_tensor.numel()
         # Inactive max_world_size slots must decode as IDLE.
-        global_info_tensor = (
-            fallback_tensor
-            .expand(self.dp_size, self.tp_size * self.cp_size, info_width)
-            .contiguous()
-        )
+        global_info_tensor = fallback_tensor.expand(
+            self.dp_size, self.tp_size * self.cp_size, info_width
+        ).contiguous()
 
         if use_all_reduce:
             # Admission can expose different WORLD sizes; use fixed global slots.
@@ -165,7 +163,8 @@ class MLPSyncBatchInfo:
             tp_active_ranks = get_tp_group().active_ranks
         if tp_active_ranks.shape[0] < num_ranks_in_tp_info:
             tp_active_ranks = torch.ones(
-                num_ranks_in_tp_info, dtype=tp_active_ranks.dtype,
+                num_ranks_in_tp_info,
+                dtype=tp_active_ranks.dtype,
                 device=tp_active_ranks.device,
             )
         tp_info[tp_active_ranks[:num_ranks_in_tp_info] == 0] = fallback_tensor
@@ -266,6 +265,7 @@ def prepare_mlp_sync_batch_raw(
     use_world_group = False
     if world_dp_gather_enabled():
         from sglang.srt.distributed.parallel_state import get_world_group
+
         world = get_world_group()
         group = torch.distributed.group.WORLD
         device = world.device

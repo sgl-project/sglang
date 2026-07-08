@@ -149,14 +149,8 @@ class ExpertLocationMetadata:
             return None
 
         model_config_for_expert_location = common["model_config_for_expert_location"]
-        if (
-            common["num_physical_experts"]
-            > common["base_num_physical_experts"]
-        ):
-            if (
-                physical_to_logical_map.shape[-1]
-                == common["base_num_physical_experts"]
-            ):
+        if common["num_physical_experts"] > common["base_num_physical_experts"]:
+            if physical_to_logical_map.shape[-1] == common["base_num_physical_experts"]:
                 physical_to_logical_map = append_trivial_expert_slots(
                     physical_to_logical_map,
                     common["num_physical_experts"]
@@ -610,10 +604,7 @@ def _find_nearest_expert(
         return same_gpu_physical_expert_ids[0]
 
     # Prefer same-node experts only when it narrows the candidate set.
-    if (
-        num_gpus_per_node is not None
-        and num_local_node_physical_experts is not None
-    ):
+    if num_gpus_per_node is not None and num_local_node_physical_experts is not None:
         node_rank = moe_ep_rank // num_gpus_per_node
         same_node_physical_expert_ids = [
             physical_expert_id
@@ -623,9 +614,7 @@ def _find_nearest_expert(
             )
             == node_rank
         ]
-        if 0 < len(same_node_physical_expert_ids) < len(
-            candidate_physical_expert_ids
-        ):
+        if 0 < len(same_node_physical_expert_ids) < len(candidate_physical_expert_ids):
             return same_node_physical_expert_ids[0]
 
     # 4. At last, leave it as -1 to indicate not found.

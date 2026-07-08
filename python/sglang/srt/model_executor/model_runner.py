@@ -1312,8 +1312,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             is_scale_joiner = self.server_args.is_ep_scale_joiner
             if is_scale_joiner:
                 pg_world_size = (
-                    self.server_args.ep_join_rank_offset
-                    + self.tp_size * self.pp_size
+                    self.server_args.ep_join_rank_offset + self.tp_size * self.pp_size
                 )
                 pg_rank = (
                     self.server_args.ep_join_rank_offset
@@ -1925,6 +1924,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
 
         from sglang.srt.layers.dp_attention import update_dp_attention_post_scale
+
         update_dp_attention_post_scale(
             new_dp_size=target_size,
             new_dp_rank=self._elastic_global_rank(),
@@ -2050,9 +2050,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             else:
                 self._finalize_recovered_ep_ranks(ranks_to_join)
 
-    def _get_healthy_expert_location_src_rank(
-        self, is_rejoining_rank: bool
-    ) -> int:
+    def _get_healthy_expert_location_src_rank(self, is_rejoining_rank: bool) -> int:
         world_group = get_world_group()
         gathered_rejoin_flags = world_group.all_gather_object(is_rejoining_rank)
 

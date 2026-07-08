@@ -138,7 +138,6 @@ class ElasticEPStateManager:
 
         return torch.ones(size, dtype=torch.int32, device=dev)
 
-
     @classmethod
     def begin_scale(cls, n: int) -> bool:
         inst = cls._instance
@@ -236,6 +235,7 @@ class ElasticEPStateManager:
     @staticmethod
     def _on_scale_nixl(from_ep_size: int, to_ep_size: int) -> None:
         from sglang.srt.layers.moe.token_dispatcher.nixl import NixlEPBuffer
+
         NixlEPBuffer.on_scale(from_ep_size, to_ep_size)
 
     @classmethod
@@ -249,9 +249,7 @@ class ElasticEPStateManager:
             return False
         if inst.pending_ep_size is not None:
             return True
-        active_count = int(
-            inst.active_ranks_cpu[: inst.effective_ep_size].sum().item()
-        )
+        active_count = int(inst.active_ranks_cpu[: inst.effective_ep_size].sum().item())
         return active_count < inst.effective_ep_size
 
 

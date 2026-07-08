@@ -47,8 +47,10 @@ def _extra_server_args() -> list[str]:
 
 
 DISABLED_CUDA_GRAPH_ARGS = [
-    "--cuda-graph-backend-decode", "disabled",
-    "--cuda-graph-backend-prefill", "disabled",
+    "--cuda-graph-backend-decode",
+    "disabled",
+    "--cuda-graph-backend-prefill",
+    "disabled",
 ]
 
 
@@ -91,9 +93,7 @@ def _visible_device_ids() -> list[str]:
 LAUNCH_EP_SIZE = 4
 MAX_EP_SIZE = 8
 
-DIST_INIT_ADDR = os.environ.get(
-    "SGLANG_ELASTIC_SCALE_DIST_INIT", "127.0.0.1:24555"
-)
+DIST_INIT_ADDR = os.environ.get("SGLANG_ELASTIC_SCALE_DIST_INIT", "127.0.0.1:24555")
 PORT_A = int(os.environ.get("SGLANG_ELASTIC_SCALE_PORT_A", "21000"))
 PORT_B = int(os.environ.get("SGLANG_ELASTIC_SCALE_PORT_B", "10000"))
 PORT_C = int(os.environ.get("SGLANG_ELASTIC_SCALE_PORT_C", "11000"))
@@ -114,23 +114,37 @@ def _scale_up_common_args(
 ) -> list[str]:
     args = [
         "--trust-remote-code",
-        "--moe-a2a-backend", "nixl",
-        "--deepep-mode", "low_latency",
-        "--tp", str(tp_size),
-        "--dp", str(tp_size),
+        "--moe-a2a-backend",
+        "nixl",
+        "--deepep-mode",
+        "low_latency",
+        "--tp",
+        str(tp_size),
+        "--dp",
+        str(tp_size),
         "--enable-dp-attention",
         "--enable-dp-lm-head",
-        "--elastic-ep-backend", "mooncake",
-        "--mooncake-ib-device", ib_devices,
+        "--elastic-ep-backend",
+        "mooncake",
+        "--mooncake-ib-device",
+        ib_devices,
         "--enable-eplb",
-        "--ep-num-redundant-experts", "24",
-        "--elastic-ep-initial-size", str(LAUNCH_EP_SIZE),
-        "--max-ep-size", str(MAX_EP_SIZE),
-        "--mem-fraction-static", "0.5",
-        "--chunked-prefill-size", "1024",
-        "--nnodes", str(nnodes),
-        "--node-rank", str(node_rank),
-        "--dist-init-addr", dist_init_addr,
+        "--ep-num-redundant-experts",
+        "24",
+        "--elastic-ep-initial-size",
+        str(LAUNCH_EP_SIZE),
+        "--max-ep-size",
+        str(MAX_EP_SIZE),
+        "--mem-fraction-static",
+        "0.5",
+        "--chunked-prefill-size",
+        "1024",
+        "--nnodes",
+        str(nnodes),
+        "--node-rank",
+        str(node_rank),
+        "--dist-init-addr",
+        dist_init_addr,
     ]
     if moe_dense_tp_size is not None:
         args.extend(["--moe-dense-tp-size", str(moe_dense_tp_size)])
@@ -178,9 +192,7 @@ class _ElasticScaleUpEndToEndBase(CustomTestCase):
                 f"Scale-up requires {LAUNCH_EP_SIZE} visible GPUs, got "
                 f"{len(visible_devices)}"
             )
-        primary_env["CUDA_VISIBLE_DEVICES"] = ",".join(
-            visible_devices[:LAUNCH_EP_SIZE]
-        )
+        primary_env["CUDA_VISIBLE_DEVICES"] = ",".join(visible_devices[:LAUNCH_EP_SIZE])
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
@@ -198,8 +210,10 @@ class _ElasticScaleUpEndToEndBase(CustomTestCase):
         port: int,
     ) -> subprocess.Popen:
         cmd = [
-            "sglang", "serve",
-            "--model-path", cls.model,
+            "sglang",
+            "serve",
+            "--model-path",
+            cls.model,
             *_scale_up_common_args(
                 DIST_INIT_ADDR,
                 tp_size=join_tp,
@@ -208,11 +222,16 @@ class _ElasticScaleUpEndToEndBase(CustomTestCase):
                 cuda_graph_args=cls.CUDA_GRAPH_ARGS,
                 moe_dense_tp_size=cls.MOE_DENSE_TP_SIZE,
             ),
-            "--elastic-ep-join-mode", "scale",
-            "--elastic-ep-join-rank-offset", str(rank_offset),
-            "--host", "127.0.0.1",
-            "--port", str(port),
-            "--device", "cuda",
+            "--elastic-ep-join-mode",
+            "scale",
+            "--elastic-ep-join-rank-offset",
+            str(rank_offset),
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(port),
+            "--device",
+            "cuda",
         ]
         env = os.environ.copy()
         visible_devices = _visible_device_ids()
@@ -222,9 +241,7 @@ class _ElasticScaleUpEndToEndBase(CustomTestCase):
                 f"Scale-up requires {join_end} visible GPUs, got "
                 f"{len(visible_devices)}"
             )
-        env["CUDA_VISIBLE_DEVICES"] = ",".join(
-            visible_devices[rank_offset:join_end]
-        )
+        env["CUDA_VISIBLE_DEVICES"] = ",".join(visible_devices[rank_offset:join_end])
         base_joining_log = os.environ.get(
             "SGLANG_ELASTIC_SCALE_JOINING_LOG",
             f"/tmp/elastic_scale_joining_nnodes{cls.JOIN_NNODES}_{int(time.time())}.log",
@@ -275,9 +292,7 @@ class _ElasticScaleUpEndToEndBase(CustomTestCase):
     def _post(self, path: str, **kwargs) -> requests.Response:
         return requests.post(f"{self.base_url}{path}", timeout=60, **kwargs)
 
-    def _generate_ok(
-        self, msg_suffix: str, routed_dp_rank: int | None = None
-    ) -> None:
+    def _generate_ok(self, msg_suffix: str, routed_dp_rank: int | None = None) -> None:
         payload = {
             "text": "Hello",
             "sampling_params": {"max_new_tokens": 4, "temperature": 0.0},
@@ -298,7 +313,9 @@ class _ElasticScaleUpEndToEndBase(CustomTestCase):
         try:
             _assert_generate_logprob_ok(self, self.base_url)
         except AssertionError as exc:
-            raise AssertionError(f"/generate logprob {msg_suffix} failed: {exc}") from exc
+            raise AssertionError(
+                f"/generate logprob {msg_suffix} failed: {exc}"
+            ) from exc
 
     def _scale_once(
         self,
@@ -324,9 +341,7 @@ class _ElasticScaleUpEndToEndBase(CustomTestCase):
                 "Joining group exited before scale request; see joining log",
             )
 
-        resp = self._post(
-            "/scale_elastic_ep", json={"new_ep_size": target_ep_size}
-        )
+        resp = self._post("/scale_elastic_ep", json={"new_ep_size": target_ep_size})
         self.assertEqual(resp.status_code, 200, resp.text)
         body = resp.json()
         self.assertEqual(body["old_ep_size"], old_ep_size)

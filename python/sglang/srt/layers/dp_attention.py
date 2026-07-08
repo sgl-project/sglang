@@ -67,7 +67,8 @@ def update_dp_attention_post_scale(new_dp_size: int, new_dp_rank: int):
     _USE_WORLD_GROUP_FOR_DP_GATHER = True
     logger.debug(
         "[Elastic EP] dp_attention switched to WORLD: dp_size=%d dp_rank=%d",
-        new_dp_size, new_dp_rank,
+        new_dp_size,
+        new_dp_rank,
     )
 
 

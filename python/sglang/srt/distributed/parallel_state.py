@@ -351,7 +351,9 @@ class GroupCoordinator:
                     timeout=subgroup_timeout,
                 )
             else:
-                active_ranks = torch.ones(len(ranks), dtype=torch.int32, device=self.device)
+                active_ranks = torch.ones(
+                    len(ranks), dtype=torch.int32, device=self.device
+                )
                 active_ranks_cpu = torch.ones(len(ranks), dtype=torch.int32)
                 pg_options = get_torch_distributed_pg_options(group_name)
                 device_group = torch.distributed.new_group(
@@ -1892,7 +1894,7 @@ def _create_global_tcp_store(
     if not master_ip and allow_dynamic_membership and dist_init_addr:
         addr = dist_init_addr
         if addr.startswith("tcp://"):
-            addr = addr[len("tcp://"):]
+            addr = addr[len("tcp://") :]
         master_ip = addr.rsplit(":", 1)[0]
     if not master_ip:
         logger.warning(
@@ -1993,7 +1995,9 @@ def init_distributed_environment(
             active_ranks = torch.zeros(ar_size, dtype=torch.int32, device="cuda")
             active_ranks[:world_size] = 1
             if use_max_ws:
-                pg_options = MooncakeBackendOptions(active_ranks, recovered_rank, max_world_size)
+                pg_options = MooncakeBackendOptions(
+                    active_ranks, recovered_rank, max_world_size
+                )
             else:
                 pg_options = MooncakeBackendOptions(active_ranks, recovered_rank)
         else:

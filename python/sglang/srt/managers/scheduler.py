@@ -4132,7 +4132,9 @@ class Scheduler(
         logger.debug(
             "[Elastic EP][scale] request received: new_ep_size=%d "
             "old_ep_size=%d max_ep_size=%d",
-            new_ep_size, old_ep_size, max_ep_size,
+            new_ep_size,
+            old_ep_size,
+            max_ep_size,
         )
 
         if new_ep_size <= old_ep_size:

@@ -78,7 +78,7 @@ _is_npu = is_npu()
 
 def _elastic_should_preserve_local_token_counts(
     *,
-    model_runner: "ModelRunner",
+    model_runner: ModelRunner,
     dp_padding_mode: DpPaddingMode,
     global_num_tokens: List[int],
 ) -> bool:

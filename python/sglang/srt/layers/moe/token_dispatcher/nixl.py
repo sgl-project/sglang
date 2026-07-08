@@ -69,7 +69,9 @@ class NixlEPBuffer:
         cls._buffer.connect_ranks(ranks)
         logger.debug(
             "[Elastic EP][nixl] connect (%s) ranks=%s group_size=%s",
-            tag, ranks, cls._buffer.group_size,
+            tag,
+            ranks,
+            cls._buffer.group_size,
         )
 
     @classmethod

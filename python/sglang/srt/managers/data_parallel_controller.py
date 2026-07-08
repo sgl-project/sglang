@@ -172,9 +172,8 @@ class DataParallelController:
             f"--dp ({self.launch_dp_size})."
         )
 
-        self.dp_active: List[bool] = (
-            [True] * self.launch_dp_size
-            + [False] * (self.max_dp_size - self.launch_dp_size)
+        self.dp_active: List[bool] = [True] * self.launch_dp_size + [False] * (
+            self.max_dp_size - self.launch_dp_size
         )
 
         self.dp_budget = DPBudget(server_args.dp_size)
@@ -237,7 +236,8 @@ class DataParallelController:
                 logger.warning(
                     "[Elastic EP][DPC] active rank status len=%d != max_dp_size=%d; "
                     "ignoring update",
-                    len(ranks.status), self.max_dp_size,
+                    len(ranks.status),
+                    self.max_dp_size,
                 )
                 return
             self.status = [
@@ -250,7 +250,8 @@ class DataParallelController:
             logger.warning(
                 "[DPC] update_active_ranks: status len=%d != max_dp_size=%d; "
                 "ignoring update",
-                len(ranks.status), self.max_dp_size,
+                len(ranks.status),
+                self.max_dp_size,
             )
             return
         self.status = list(ranks.status)
@@ -291,9 +292,7 @@ class DataParallelController:
 
     def _refresh_active_workers(self) -> None:
         self._active_workers = [
-            i
-            for i, active in enumerate(self.dp_active)
-            if active and self.status[i]
+            i for i, active in enumerate(self.dp_active) if active and self.status[i]
         ]
         self._active_count_cache = len(self._active_workers)
 
@@ -580,9 +579,7 @@ class DataParallelController:
                     slot,
                     bind_host,
                 )
-            broadcasted_ports = self._broadcast_worker_ports(
-                server_args, worker_ports
-            )
+            broadcasted_ports = self._broadcast_worker_ports(server_args, worker_ports)
         else:
             broadcasted_ports = self._broadcast_worker_ports(server_args, None)
 
@@ -695,9 +692,7 @@ class DataParallelController:
                 offset = server_args.ep_join_rank_offset
                 display_tp_rank = tp_rank + offset
                 display_moe_ep_rank = moe_ep_rank + offset
-                display_dp_rank = (
-                    dp_rank + offset if dp_rank is not None else None
-                )
+                display_dp_rank = dp_rank + offset if dp_rank is not None else None
 
                 with self.env_lock, maybe_reindex_device_id(gpu_id) as gpu_id:
                     proc = mp.Process(
