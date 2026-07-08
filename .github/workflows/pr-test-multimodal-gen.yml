@@ -9,6 +9,10 @@ on:
       sgl_kernel:
         required: true
         type: string
+      sgl_deep_gemm:
+        required: false
+        type: string
+        default: 'false'
       runner_config:
         required: true
         type: string
@@ -102,10 +106,20 @@ jobs:
           merge-multiple: true
           pattern: wheel-python3.10-cuda*
 
+      - name: Download sgl-deep-gemm artifacts
+        if: inputs.sgl_deep_gemm == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          path: DeepGEMM/dist/
+          merge-multiple: true
+          pattern: deepgemm-wheel-python3.10-cuda*
+
       - name: Install dependencies
         timeout-minutes: 20
         run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{inputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh diffusion
+          CUSTOM_BUILD_SGL_KERNEL=${{inputs.sgl_kernel}} \
+          CUSTOM_BUILD_SGL_DEEP_GEMM=${{inputs.sgl_deep_gemm}} \
+            bash scripts/ci/cuda/ci_install_dependency.sh diffusion
       - name: Run diffusion server tests
         timeout-minutes: 240
         env:
@@ -168,10 +182,20 @@ jobs:
           merge-multiple: true
           pattern: wheel-python3.10-cuda*
 
+      - name: Download sgl-deep-gemm artifacts
+        if: inputs.sgl_deep_gemm == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          path: DeepGEMM/dist/
+          merge-multiple: true
+          pattern: deepgemm-wheel-python3.10-cuda*
+
       - name: Install dependencies
         timeout-minutes: 20
         run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{inputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh diffusion
+          CUSTOM_BUILD_SGL_KERNEL=${{inputs.sgl_kernel}} \
+          CUSTOM_BUILD_SGL_DEEP_GEMM=${{inputs.sgl_deep_gemm}} \
+            bash scripts/ci/cuda/ci_install_dependency.sh diffusion
 
       - name: Run 5090 diffusion canary tests
         timeout-minutes: 120
@@ -238,10 +262,20 @@ jobs:
           merge-multiple: true
           pattern: wheel-python3.10-cuda*
 
+      - name: Download sgl-deep-gemm artifacts
+        if: inputs.sgl_deep_gemm == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          path: DeepGEMM/dist/
+          merge-multiple: true
+          pattern: deepgemm-wheel-python3.10-cuda*
+
       - name: Install dependencies
         timeout-minutes: 20
         run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{inputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh diffusion
+          CUSTOM_BUILD_SGL_KERNEL=${{inputs.sgl_kernel}} \
+          CUSTOM_BUILD_SGL_DEEP_GEMM=${{inputs.sgl_deep_gemm}} \
+            bash scripts/ci/cuda/ci_install_dependency.sh diffusion
 
       - name: Run diffusion server tests
         timeout-minutes: 240
@@ -305,10 +339,20 @@ jobs:
           merge-multiple: true
           pattern: wheel-python3.10-cuda*
 
+      - name: Download sgl-deep-gemm artifacts
+        if: inputs.sgl_deep_gemm == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          path: DeepGEMM/dist/
+          merge-multiple: true
+          pattern: deepgemm-wheel-python3.10-cuda*
+
       - name: Install dependencies
         timeout-minutes: 20
         run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{inputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh diffusion
+          CUSTOM_BUILD_SGL_KERNEL=${{inputs.sgl_kernel}} \
+          CUSTOM_BUILD_SGL_DEEP_GEMM=${{inputs.sgl_deep_gemm}} \
+            bash scripts/ci/cuda/ci_install_dependency.sh diffusion
 
       - name: Run diffusion component accuracy tests
         timeout-minutes: 240
@@ -350,12 +394,22 @@ jobs:
           merge-multiple: true
           pattern: wheel-python3.10-cuda*
 
+      - name: Download sgl-deep-gemm artifacts
+        if: inputs.sgl_deep_gemm == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          path: DeepGEMM/dist/
+          merge-multiple: true
+          pattern: deepgemm-wheel-python3.10-cuda*
+
       - name: Install dependencies
         timeout-minutes: 20
         env:
           SGLANG_CI_EARLY_LD_LIBRARY_PATH: "1"
         run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{inputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh diffusion
+          CUSTOM_BUILD_SGL_KERNEL=${{inputs.sgl_kernel}} \
+          CUSTOM_BUILD_SGL_DEEP_GEMM=${{inputs.sgl_deep_gemm}} \
+            bash scripts/ci/cuda/ci_install_dependency.sh diffusion
 
       - name: Run diffusion server tests
         timeout-minutes: 240
@@ -404,10 +458,20 @@ jobs:
           merge-multiple: true
           pattern: wheel-python3.10-cuda*
 
+      - name: Download sgl-deep-gemm artifacts
+        if: inputs.sgl_deep_gemm == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          path: DeepGEMM/dist/
+          merge-multiple: true
+          pattern: deepgemm-wheel-python3.10-cuda*
+
       - name: Install dependencies
         timeout-minutes: 20
         run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{inputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh diffusion
+          CUSTOM_BUILD_SGL_KERNEL=${{inputs.sgl_kernel}} \
+          CUSTOM_BUILD_SGL_DEEP_GEMM=${{inputs.sgl_deep_gemm}} \
+            bash scripts/ci/cuda/ci_install_dependency.sh diffusion
 
       - name: Run diffusion unit tests
         timeout-minutes: 60

@@ -333,9 +333,41 @@ install_sglang_kernel() {
     else
         echo "CUSTOM_BUILD_SGL_KERNEL=true: keeping freshly built sgl-kernel wheel."
     fi
+
+    mark_step_done "${FUNCNAME[0]}"
+}
+
+install_sgl_deep_gemm() {
     SGL_DEEP_GEMM_VERSION=$(grep -Po -m1 '(?<=sgl-deep-gemm==)[0-9A-Za-z\.\-]+' python/pyproject.toml)
-    if [ "$CU_MAJOR" = "13" ]; then
-        $PIP_CMD install "sgl-deep-gemm==${SGL_DEEP_GEMM_VERSION}" --force-reinstall $PIP_INSTALL_SUFFIX
+    echo "SGL_DEEP_GEMM_VERSION=${SGL_DEEP_GEMM_VERSION}"
+
+    if [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then
+        WHEEL_ARCH="aarch64"
+    else
+        WHEEL_ARCH="x86_64"
+    fi
+
+    if [ "${CUSTOM_BUILD_SGL_DEEP_GEMM:-}" = "true" ]; then
+        if [ ! -d "DeepGEMM/dist" ]; then
+            echo "ERROR: CUSTOM_BUILD_SGL_DEEP_GEMM=true but DeepGEMM/dist not found."
+            echo "This usually happens when rerunning a stage without the sgl-deep-gemm-build-wheels job."
+            echo "Please re-run the full workflow using /tag-and-rerun-ci to rebuild sgl-deep-gemm."
+            exit 1
+        fi
+
+        ls -alh DeepGEMM/dist
+        DEEP_GEMM_WHL=$(ls DeepGEMM/dist/sgl_deep_gemm-${SGL_DEEP_GEMM_VERSION}+${CU_VERSION}-py3-none-manylinux2014_${WHEEL_ARCH}.whl 2>/dev/null | head -1 || true)
+        if [ -z "$DEEP_GEMM_WHL" ]; then
+            echo "ERROR: No matching sgl-deep-gemm wheel found in DeepGEMM/dist/ for version ${SGL_DEEP_GEMM_VERSION} arch ${WHEEL_ARCH} cuda ${CU_VERSION}"
+            ls -alh DeepGEMM/dist/
+            exit 1
+        fi
+        echo "Installing sgl-deep-gemm wheel: $DEEP_GEMM_WHL"
+        $PIP_CMD install "$DEEP_GEMM_WHL" --force-reinstall $PIP_INSTALL_SUFFIX
+    elif [ "$CU_MAJOR" = "13" ]; then
+        # This release asset must be rebuilt with the TORCH_VER matching this
+        # branch; PyPI cannot replace an existing same-version wheel.
+        $PIP_CMD install "https://github.com/sgl-project/whl/releases/download/v${SGL_DEEP_GEMM_VERSION}/sgl_deep_gemm-${SGL_DEEP_GEMM_VERSION}+cu130-py3-none-manylinux2014_$(uname -m).whl" --force-reinstall $PIP_INSTALL_SUFFIX
     else
         $PIP_CMD install "https://github.com/sgl-project/whl/releases/download/v${SGL_DEEP_GEMM_VERSION}/sgl_deep_gemm-${SGL_DEEP_GEMM_VERSION}+cu129-py3-none-manylinux2014_$(uname -m).whl" --force-reinstall $PIP_INSTALL_SUFFIX
     fi
@@ -562,6 +594,7 @@ main() {
         setup_ld_library_path
     fi
     install_sglang_kernel
+    install_sgl_deep_gemm
     install_sglang_router
     download_flashinfer_cache
     force_reinstall_cutlass_dsl_libs_cu13

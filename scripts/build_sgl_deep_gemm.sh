@@ -55,7 +55,11 @@ echo "ARCH:           ${ARCH}"
 echo "BASE_IMG:       ${BASE_IMG}"
 echo "DEEPGEMM_SRC:   ${DEEPGEMM_SRC}"
 echo "DEPS_TAG:       ${DEPS_TAG}"
+echo "TORCH_VER:      ${TORCH_VER:-Dockerfile default}"
 echo "----------------------------------------"
+
+BUILD_ARGS=()
+[ -n "${TORCH_VER:-}" ] && BUILD_ARGS+=(--build-arg TORCH_VER="${TORCH_VER}")
 
 docker build \
   -f "${DOCKERFILE}" "$(dirname "${DOCKERFILE}")" \
@@ -64,6 +68,7 @@ docker build \
   --build-arg ARCH="${ARCH}" \
   --build-arg PYTHON_VERSION="${PYTHON_VERSION}" \
   --build-arg PYTHON_TAG="${PY_TAG}" \
+  "${BUILD_ARGS[@]}" \
   -t "${DEPS_TAG}" \
   --network=host
 

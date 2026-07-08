@@ -292,6 +292,54 @@ def has_sgl_kernel_changes(pr):
         return False
 
 
+def has_sgl_deep_gemm_changes(pr):
+    """
+    Check if the PR has changes that require rebuilding sgl-deep-gemm wheels.
+    Mirrors the sgl_deep_gemm path filter in _pr-test-check-changes.yml.
+    """
+    deep_gemm_paths = {
+        ".github/workflows/_pr-test-sgl-deep-gemm-build.yml",
+        ".github/workflows/release-whl-deepgemm.yml",
+        "docker/sgl-deep-gemm.Dockerfile",
+        "scripts/build_sgl_deep_gemm.sh",
+        "scripts/rename_sgl_deep_gemm_whl.sh",
+        "python/pyproject.toml",
+    }
+
+    try:
+        files = pr.get_files()
+        return any(f.filename in deep_gemm_paths for f in files)
+    except Exception as e:
+        print(f"Warning: Could not check PR files for sgl-deep-gemm changes: {e}")
+        # Default to False to avoid unnecessary full reruns
+        return False
+
+
+def check_artifact_builds_succeeded(gh_repo, head_sha, name_prefix, label):
+    """
+    Return True only when all matching check runs for an artifact build passed.
+    Empty matches count as not built.
+    """
+    try:
+        builds = [
+            cr
+            for cr in gh_repo.get_commit(head_sha).get_check_runs()
+            if cr.name.startswith(name_prefix)
+        ]
+        built = bool(builds) and all(cr.conclusion == "success" for cr in builds)
+        print(
+            f"All {len(builds)} {label} build(s) passed - using rerun_failed_jobs"
+            if built
+            else f"{label.capitalize()} not fully built "
+            f"({sum(1 for c in builds if c.conclusion == 'success')}"
+            f"/{len(builds)} success) - will use full rerun"
+        )
+        return built
+    except Exception as e:
+        print(f"Failed to check {label} status: {e} - falling back to full rerun")
+        return False
+
+
 def handle_tag_run_ci(
     gh_repo, pr, comment, user_perms, react_on_success=True, tag_extra=False
 ):
@@ -348,49 +396,40 @@ def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=Tr
 
     print("Permission granted. Triggering rerun of failed or skipped workflows.")
 
-    # Check if PR has sgl-kernel changes - if so, we may need full reruns
-    # to ensure sgl-kernel-build-wheels runs and produces fresh artifacts.
-    # However, if the wheel already built successfully for this commit,
-    # we can just rerun failed jobs — the artifact is already there.
+    # Check if PR has custom wheel changes. If so, we may need full reruns
+    # to ensure the wheel build jobs run and produce fresh artifacts. However,
+    # if the wheels already built successfully for this commit, we can just
+    # rerun failed jobs — the artifacts are already there.
     sgl_kernel_changes = has_sgl_kernel_changes(pr)
+    sgl_deep_gemm_changes = has_sgl_deep_gemm_changes(pr)
     if sgl_kernel_changes:
         print("PR has sgl-kernel changes - checking if kernel wheel already built")
+    if sgl_deep_gemm_changes:
+        print("PR has sgl-deep-gemm changes - checking if DeepGEMM wheel already built")
 
     # Get the SHA of the latest commit in the PR
     head_sha = pr.head.sha
     print(f"Checking workflows for commit: {head_sha}")
 
-    # If PR has sgl-kernel changes, check whether ALL wheel builds already
-    # succeeded for this commit (CUDA + ARM). If so, we can use
-    # rerun_failed_jobs and avoid retriggering all tests. If any wheel
-    # build is pending/failed, a dependent job could fail for missing
-    # artifacts, so fall back to full rerun.
-    # Check-runs display names: "Build Wheel (<python>, <cuda>)" (CUDA) and
-    # "Build Wheel Arm (<python>, <cuda>)" (ARM). The YAML job ids
-    # sgl-kernel-build-wheels{,-arm} are NOT what the check-runs API
-    # returns — it returns the job's `name:` field.
+    # If PR has custom wheel changes, check whether ALL corresponding wheel
+    # builds already succeeded for this commit (CUDA + ARM). If so, we can use
+    # rerun_failed_jobs and avoid retriggering all tests. If any wheel build is
+    # pending/failed, a dependent job could fail for missing artifacts, so fall
+    # back to full rerun.
+    # Check-runs API returns the jobs' `name:` fields, not YAML job ids:
+    # Build Wheel / Build Wheel Arm for sgl-kernel, and
+    # Build DeepGEMM Wheel / Build DeepGEMM Wheel Arm for sgl-deep-gemm.
     kernel_wheel_built = False
     if sgl_kernel_changes:
-        try:
-            wheel_builds = [
-                cr
-                for cr in gh_repo.get_commit(head_sha).get_check_runs()
-                if cr.name.startswith("Build Wheel")
-            ]
-            kernel_wheel_built = bool(wheel_builds) and all(
-                cr.conclusion == "success" for cr in wheel_builds
-            )
-            print(
-                f"All {len(wheel_builds)} kernel wheel build(s) passed - using rerun_failed_jobs"
-                if kernel_wheel_built
-                else f"Kernel wheel not fully built "
-                f"({sum(1 for c in wheel_builds if c.conclusion == 'success')}"
-                f"/{len(wheel_builds)} success) - will use full rerun"
-            )
-        except Exception as e:
-            print(
-                f"Failed to check kernel wheel status: {e} - falling back to full rerun"
-            )
+        kernel_wheel_built = check_artifact_builds_succeeded(
+            gh_repo, head_sha, "Build Wheel", "kernel wheel"
+        )
+
+    deep_gemm_wheel_built = False
+    if sgl_deep_gemm_changes:
+        deep_gemm_wheel_built = check_artifact_builds_succeeded(
+            gh_repo, head_sha, "Build DeepGEMM Wheel", "DeepGEMM wheel"
+        )
 
     # Rerun workflows with conclusion=failure or conclusion=skipped.
     #
@@ -407,9 +446,9 @@ def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=Tr
     #   label-gated workflow, add the missing label (the `labeled` event
     #   dispatches a fresh run with the current label set); this function
     #   cannot recover those by rerun alone.
-    # - kernel wheel escape: if the PR touches sgl-kernel and not all wheel
-    #   builds are success yet, full-rerun failure runs too — Build Wheel
-    #   lives in pr-test-sgl-kernel.yml, consumers in pr-test.yml, and
+    # - custom wheel escape: if the PR touches a custom-built wheel and not all
+    #   wheel builds are success yet, full-rerun failure runs too — Build Wheel
+    #   jobs and consumers live in separate reusable workflows, and
     #   rerun_failed_jobs() is scoped to a single workflow run.
     runs = gh_repo.get_workflow_runs(head_sha=head_sha)
 
@@ -422,9 +461,10 @@ def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=Tr
 
         print(f"Processing {run.conclusion} workflow: {run.name} (ID: {run.id})")
         try:
-            if run.conclusion == "skipped" or (
+            needs_full_rerun_for_artifacts = (
                 sgl_kernel_changes and not kernel_wheel_built
-            ):
+            ) or (sgl_deep_gemm_changes and not deep_gemm_wheel_built)
+            if run.conclusion == "skipped" or needs_full_rerun_for_artifacts:
                 print("  Full rerun")
                 run.rerun()
             else:
