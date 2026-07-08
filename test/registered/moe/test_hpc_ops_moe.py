@@ -133,6 +133,72 @@ class TestHpcOpsMoeBlockwise(CustomTestCase):
                 self.assertGreater(cos.item(), 0.999)
                 torch.testing.assert_close(out_hpc, out_triton, rtol=0.05, atol=0.05)
 
+    def test_per_tensor_fp8_matches_triton(self):
+
+        device = "cuda"
+        for num_tokens in (7, 64, 512):
+            with self.subTest(num_tokens=num_tokens):
+                x = torch.randn(num_tokens, H, dtype=torch.bfloat16, device=device)
+                w13_f = torch.randn(E, 2 * I, H, device=device) * 0.02
+                w2_f = torch.randn(E, H, I, device=device) * 0.02
+                # Per-tensor per-expert weight quant.
+                w13_scale = w13_f.abs().amax(dim=(1, 2)) / 448.0
+                w2_scale = w2_f.abs().amax(dim=(1, 2)) / 448.0
+                w13 = (w13_f / w13_scale[:, None, None]).to(torch.float8_e4m3fn)
+                w2 = (w2_f / w2_scale[:, None, None]).to(torch.float8_e4m3fn)
+                # Static activation scales.
+                a1_scale = torch.tensor(x.float().abs().max() / 448.0, device=device)
+                a2_scale = torch.tensor(0.005, device=device)
+                logits = torch.randn(num_tokens, E, device=device)
+                topk_weights, topk_ids = torch.topk(logits.softmax(dim=-1), TOPK, -1)
+                topk_weights = (
+                    topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+                ).float()
+                topk_ids = topk_ids.to(torch.int32)
+
+                dispatch_output = StandardDispatchOutput(
+                    hidden_states=x,
+                    hidden_states_scale=None,
+                    topk_output=StandardTopKOutput(topk_weights, topk_ids, None),
+                )
+                quant_info = HpcOpsMoeQuantInfo(
+                    w13_weight=w13,
+                    w2_weight=w2,
+                    block_quant=False,
+                    global_num_experts=E,
+                    moe_ep_rank=0,
+                    gate_up_alphas=w13_scale * a1_scale,
+                    down_alphas=w2_scale * a2_scale,
+                    w13_input_scale=a1_scale,
+                    w2_input_scale=a2_scale,
+                )
+                out_hpc = fused_experts_none_to_hpc_ops(
+                    dispatch_output, quant_info, self._runner_config()
+                ).hidden_states.float()
+
+                from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
+                    fused_experts,
+                )
+
+                out_triton = fused_experts(
+                    hidden_states=x.clone(),
+                    w1=w13,
+                    w2=w2,
+                    topk_output=StandardTopKOutput(topk_weights, topk_ids, None),
+                    moe_runner_config=self._runner_config(),
+                    use_fp8_w8a8=True,
+                    w1_scale=w13_scale,
+                    w2_scale=w2_scale,
+                    a1_scale=a1_scale,
+                    a2_scale=a2_scale,
+                ).float()
+
+                cos = torch.nn.functional.cosine_similarity(
+                    out_hpc.flatten(), out_triton.flatten(), dim=0
+                )
+                self.assertGreater(cos.item(), 0.99)
+                torch.testing.assert_close(out_hpc, out_triton, rtol=0.10, atol=0.10)
+
 
 if __name__ == "__main__":
     unittest.main()
