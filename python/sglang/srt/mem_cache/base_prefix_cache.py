@@ -316,7 +316,7 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         """
         pass
 
-    def check_hicache_events(self) -> Any:
+    def check_hicache_events(self, decode_only: bool = False) -> Any:
         """
         Check HiCache related activities to update radix tree and synchronize across TP workers if needed
         """

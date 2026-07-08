@@ -74,7 +74,6 @@ logger = logging.getLogger(__name__)
 
 
 class HiRadixCache(RadixCache):
-
     def __init__(self, params: CacheInitParams, server_args: ServerArgs):
         self._enable_metrics_flag = params.enable_metrics
 
@@ -115,6 +114,8 @@ class HiRadixCache(RadixCache):
         self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
         self.pp_rank = params.pp_rank
         self.pp_size = params.pp_size
+        self._decode_event_check_interval = 16
+        self._decode_event_check_steps = 0
         self.enable_storage = server_args.hicache_storage_backend is not None
         self.enable_storage_metrics = self.enable_storage and params.enable_metrics
         self.extra_metric_labels = server_args.extra_metric_labels
@@ -929,7 +930,42 @@ class HiRadixCache(RadixCache):
                 # write to host if the node is not backuped
                 self.write_backup(node)
 
-    def writing_check(self, write_back=False):
+    @staticmethod
+    def _count_ready_acks(ack_queue) -> int:
+        ready_count = 0
+        for _, finish_event, _ in ack_queue:
+            if not finish_event.query():
+                break
+            ready_count += 1
+        return ready_count
+
+    def _sync_hicache_ready_counts(self) -> tuple[int, int, tuple[int, ...]]:
+        cache_controller = self.cache_controller
+        storage_queue_sizes = (
+            (
+                cache_controller.prefetch_revoke_queue.qsize(),
+                cache_controller.ack_backup_queue.qsize(),
+                cache_controller.host_mem_release_queue.qsize(),
+            )
+            if self.enable_storage
+            else ()
+        )
+
+        ready_counts = torch.tensor(
+            [
+                self._count_ready_acks(cache_controller.ack_write_queue),
+                self._count_ready_acks(cache_controller.ack_load_queue),
+                *storage_queue_sizes,
+            ],
+            dtype=torch.int,
+            device="cpu",
+        )
+        self._all_reduce(ready_counts, torch.distributed.ReduceOp.MIN)
+
+        count_values = list(map(int, ready_counts.tolist()))
+        return count_values[0], count_values[1], tuple(count_values[2:])
+
+    def writing_check(self, write_back=False, finish_count: Optional[int] = None):
         if write_back:
             # blocking till all write back complete
             while len(self.ongoing_write_through) > 0:
@@ -941,19 +977,13 @@ class HiRadixCache(RadixCache):
                 assert len(self.ongoing_write_through) == 0
             return
 
-        # Every rank must enter the all_reduce below; ongoing_write_through can
-        # diverge across ranks (e.g. write_backup returning 0 on a subset under
-        # host memory pressure), so a conditional skip desyncs the NCCL op
-        # sequence and deadlocks under TP > 1. (Matches UnifiedRadixCache.)
-        finish_count = 0
-        if self.pp_rank == 0:
-            for _, finish_event, ack_list in self.cache_controller.ack_write_queue:
-                if not finish_event.query():
-                    break
-                finish_count += 1
-        finish_count_tensor = torch.tensor(finish_count, dtype=torch.int, device="cpu")
-        self._all_reduce(finish_count_tensor, torch.distributed.ReduceOp.MIN)
-        finish_count = finish_count_tensor.item()
+        if finish_count is None:
+            finish_count = self._count_ready_acks(
+                self.cache_controller.ack_write_queue
+            )
+            ack_count_tensor = torch.tensor(finish_count, dtype=torch.int, device="cpu")
+            self._all_reduce(ack_count_tensor, torch.distributed.ReduceOp.MIN)
+            finish_count = ack_count_tensor.item()
 
         if finish_count > 0:
             logger.debug(f"Process {finish_count} write back operations")
@@ -964,16 +994,14 @@ class HiRadixCache(RadixCache):
                 self._finish_write_through_ack(ack_id, release_lock=True)
             finish_count -= 1
 
-    def loading_check(self):
-        finish_count = 0
-        if self.pp_rank == 0:
-            for _, finish_event, ack_list in self.cache_controller.ack_load_queue:
-                if not finish_event.query():
-                    break
-                finish_count += 1
-        finish_count_tensor = torch.tensor(finish_count, dtype=torch.int, device="cpu")
-        self._all_reduce(finish_count_tensor, torch.distributed.ReduceOp.MIN)
-        finish_count = finish_count_tensor.item()
+    def loading_check(self, finish_count: Optional[int] = None):
+        if finish_count is None:
+            finish_count = self._count_ready_acks(
+                self.cache_controller.ack_load_queue
+            )
+            ack_count_tensor = torch.tensor(finish_count, dtype=torch.int, device="cpu")
+            self._all_reduce(ack_count_tensor, torch.distributed.ReduceOp.MIN)
+            finish_count = ack_count_tensor.item()
 
         if finish_count > 0:
             logger.debug(f"Process {finish_count} load operations")
@@ -1373,42 +1401,39 @@ class HiRadixCache(RadixCache):
     def flush_write_through_acks(self) -> None:
         self.writing_check()
 
-    def check_hicache_events(self):
-        # Reap the previous round's PP-sync sends before issuing new ones.
+    def check_hicache_events(self, decode_only: bool = False):
         self._drain_async_work()
-        self.writing_check()
-        self.loading_check()
-        if self.enable_storage:
-            self.drain_storage_control_queues()
+        decode_only = decode_only and self.pp_size == 1
+
+        if decode_only:
+            next_step = self._decode_event_check_steps + 1
+            if next_step < self._decode_event_check_interval:
+                self._decode_event_check_steps = next_step
+                return
+            self._decode_event_check_steps = 0
+        else:
+            self._decode_event_check_steps = 0
+
+        (
+            write_finish_count,
+            load_finish_count,
+            storage_queue_sizes,
+        ) = self._sync_hicache_ready_counts()
+        self.writing_check(finish_count=write_finish_count)
+        self.loading_check(finish_count=load_finish_count)
+
+        if self.enable_storage and storage_queue_sizes:
+            n_revoke, n_backup, n_release = storage_queue_sizes[:3]
+            self._drain_storage_control_queues_impl(
+                n_revoke=n_revoke,
+                n_backup=n_backup,
+                n_release=n_release,
+                log_metrics=True,
+            )
         if self.enable_storage_metrics:
             self.storage_metrics_collector.log_storage_metrics(
                 self.cache_controller.storage_backend.get_stats()
             )
-
-    def drain_storage_control_queues(self):
-        """
-        Combine prefetch revoke, backup ack, and host mem release checks
-        to minimize TP synchronization and Python overhead.
-        """
-        cc = self.cache_controller
-
-        qsizes = torch.tensor(
-            [
-                cc.prefetch_revoke_queue.qsize(),
-                cc.ack_backup_queue.qsize(),
-                cc.host_mem_release_queue.qsize(),
-            ],
-            dtype=torch.int,
-        )
-        self._all_reduce_attn_groups(qsizes, torch.distributed.ReduceOp.MIN)
-
-        n_revoke, n_backup, n_release = map(int, qsizes.tolist())
-        self._drain_storage_control_queues_impl(
-            n_revoke=n_revoke,
-            n_backup=n_backup,
-            n_release=n_release,
-            log_metrics=True,
-        )
 
     # Timeout is linearly increasing with the number of pages
     def _prefetch_timeout_check_linear_func(self, operation: PrefetchOperation):

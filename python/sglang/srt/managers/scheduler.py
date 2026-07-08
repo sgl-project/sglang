@@ -2741,7 +2741,9 @@ class Scheduler(
                 self._add_request_to_queue(req)
 
         if self.enable_hierarchical_cache:
-            self.tree_cache.check_hicache_events()
+            self.tree_cache.check_hicache_events(
+                decode_only=len(self.waiting_queue) == 0 and self.chunked_req is None
+            )
 
         if self.enable_priority_preemption or self.is_hybrid_swa:
             # Reset batch_is_full to try preemption with a prefill adder.
