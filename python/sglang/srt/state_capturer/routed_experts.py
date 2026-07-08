@@ -127,16 +127,16 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
         ]
 
 
-_global_expert_capturer: Optional[RoutedExpertsCapturer] = None
-
-
 def get_global_experts_capturer() -> Optional[RoutedExpertsCapturer]:
-    return _global_expert_capturer
+    from sglang.srt.runtime_context import get_resources
+
+    return get_resources().experts_capturer
 
 
 def set_global_experts_capturer(capturer: Optional[RoutedExpertsCapturer]):
-    global _global_expert_capturer
-    _global_expert_capturer = capturer
+    from sglang.srt.runtime_context import get_resources
+
+    get_resources().experts_capturer = capturer
 
 
 def extract_routed_experts_from_meta_info(data):

@@ -366,6 +366,13 @@ class Resources(_FlagGroupBase):
     # Persistent reusable CUDA events for non-EP DP TBO, keyed by
     # (kind, subbatch) — see dp_attention._tbo_event for why reuse matters.
     tbo_event_pool: dict = dataclasses.field(default_factory=dict)
+    # State capturers (installed by their subsystems when capture is on).
+    indexer_capturer: Any = None
+    experts_capturer: Any = None
+    # The shared TCPStore created during distributed initialization.
+    tcp_store: Any = None
+    # Trace verbosity; the accessor seeds it lazily from SGLANG_TRACE_LEVEL.
+    trace_level: Any = None
 
 
 class ForwardFlags:

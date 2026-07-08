@@ -5,6 +5,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 import dataclasses
+import os
 import unittest
 from unittest.mock import patch
 
@@ -461,6 +462,58 @@ class TestNamedStreams(_IsolatedServerArgs):
         get_context().set_stream("alt", object())
         reset_context()
         self.assertEqual(get_context().resources.streams, {})
+
+    def test_capturer_slots_roundtrip_and_reset(self):
+        from sglang.srt.state_capturer.indexer_topk import (
+            get_global_indexer_capturer,
+            set_global_indexer_capturer,
+        )
+        from sglang.srt.state_capturer.routed_experts import (
+            get_global_experts_capturer,
+            set_global_experts_capturer,
+        )
+
+        reset_context()
+        self.assertIsNone(get_global_indexer_capturer())
+        self.assertIsNone(get_global_experts_capturer())
+        indexer, experts = object(), object()
+        set_global_indexer_capturer(indexer)
+        set_global_experts_capturer(experts)
+        self.assertIs(get_global_indexer_capturer(), indexer)
+        self.assertIs(get_global_experts_capturer(), experts)
+        reset_context()
+        self.assertIsNone(get_global_indexer_capturer())
+        self.assertIsNone(get_global_experts_capturer())
+
+    def test_tcp_store_slot_roundtrip_and_reset(self):
+        from sglang.srt.distributed.utils import (
+            get_global_tcp_store,
+            set_global_tcp_store,
+        )
+
+        reset_context()
+        self.assertIsNone(get_global_tcp_store())
+        store = object()
+        set_global_tcp_store(store)
+        self.assertIs(get_global_tcp_store(), store)
+        reset_context()
+        self.assertIsNone(get_global_tcp_store())
+
+    def test_trace_level_env_seeded_lazy_default(self):
+        from sglang.srt.observability.trace import (
+            get_global_trace_level,
+            set_global_trace_level,
+        )
+
+        reset_context()
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("SGLANG_TRACE_LEVEL", None)
+            self.assertEqual(get_global_trace_level(), 3)
+        set_global_trace_level(5)
+        self.assertEqual(get_global_trace_level(), 5)
+        reset_context()
+        with patch.dict(os.environ, {"SGLANG_TRACE_LEVEL": "1"}):
+            self.assertEqual(get_global_trace_level(), 1)
 
 
 class TestEpBufferState(_IsolatedServerArgs):
