@@ -19,6 +19,7 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    is_in_ci,
     popen_launch_server,
 )
 
@@ -214,6 +215,25 @@ class TestNVFP4ToMXFP4MOETP1(TestOnlineQuantizationMemoryLoad):
         # Requantized NVFP4 -> MXFP4 observed accuracy: ~0.88
         # (BF16 Qwen/Qwen3-30B-A3B reference: ~0.94).
         self._test_gsm8k(accuracy_threshold=0.85)
+
+
+@unittest.skipIf(is_in_ci(), "local test only")
+class TestDeepSeekR10528NVFP4ToMXFP4(TestOnlineQuantizationMemoryLoad):
+    # NVFP4 to MXFP4 online requantization for DeepSeek-R1-0528-NVFP4 on TP=8.
+    # Exercises the MLA attention path (attention_backend=aiter), multi-threaded
+    # weight loading, and the per-expert NVFP4 MoE requantization path.
+    model = "nvidia/DeepSeek-R1-0528-NVFP4"  # NVFP4 model
+    tp = 8
+    runner_args = [
+        "--attention-backend",
+        "aiter",
+        "--model-loader-extra-config",
+        '{"enable_multithread_load": true}',
+    ]
+
+    def test_gsm8k(self):
+        # Requantized NVFP4 -> MXFP4 observed accuracy: ~0.95.
+        self._test_gsm8k(accuracy_threshold=0.90)
 
 
 if __name__ == "__main__":
