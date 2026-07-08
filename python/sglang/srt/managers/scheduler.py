@@ -3833,8 +3833,7 @@ class Scheduler(
             self.metrics_reporter.spec_total_num_accept_tokens = (
                 self.metrics_reporter.spec_total_num_forward_ct
             ) = 0
-            for k, v in server_args_dict.items():
-                setattr(get_server_args(), k, v)
+            get_server_args().override(source="update_server_args", **server_args_dict)
             logger.info(f"Global server args updated! {get_server_args()=}")
 
         server_args = dict(vars(get_server_args()))

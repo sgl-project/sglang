@@ -38,6 +38,10 @@ _MUTATION_PATTERNS = [
     re.compile(r"\bserver_args\.[a-z0-9_]+\s*=(?![=}])"),
     re.compile(r"\bsa\.[a-z0-9_]+\s*=(?![=}])"),
     re.compile(r"get_(?:global_)?server_args\(\)\.[a-z0-9_]+\s*=(?![=}])"),
+    # setattr is the same write with the attribute name behind a variable.
+    re.compile(
+        r"setattr\(\s*(?:[\w.]+\.)?(?:server_args|sa|get_(?:global_)?server_args\(\))\s*,"
+    ),
 ]
 
 # The resolution pipeline itself (mutation is its job) and multimodal_gen,
