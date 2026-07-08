@@ -150,6 +150,9 @@ class HiSparseCoordinator:
         self.token_to_kv_pool_allocator.set_demote_until_hisparse_available(
             self.demote_until_hisparse_available
         )
+        self.token_to_kv_pool_allocator.set_schedulable_hisparse_available(
+            self.schedulable_hisparse_available
+        )
 
         # initialize data structures for swap-in kernel
         layer_num = self.mem_pool_device.layer_num
@@ -277,6 +280,20 @@ class HiSparseCoordinator:
                 return True
 
         return allocator.available_size() >= need_tokens
+
+    def schedulable_hisparse_available(self) -> int:
+        allocator = self.token_to_kv_pool_allocator.hisparse_attn_allocator
+        available = allocator.available_size()
+        reclaimable = 0
+        page_size = self.mem_pool_device.page_size
+        for req_idx, req in self.active_reqs.items():
+            if int(self.req_device_buffer_size[req_idx]) > 0:
+                continue
+            host_len = self.host_token_len(req.kv_allocated_len)
+            alloc_size = self._device_buffer_alloc_size(req.kv_allocated_len)
+            current_size = ((host_len + page_size - 1) // page_size) * page_size
+            reclaimable += max(0, current_size - alloc_size)
+        return max(0, available + reclaimable - page_size)
 
     @staticmethod
     def _has_free_hisparse_pages(allocator, num_new_pages: int) -> bool:

@@ -16,6 +16,19 @@ class HiSparseDemotionMixin:
     def set_demote_until_hisparse_available(self, callback):
         self._demote_until_hisparse_available = weakref.WeakMethod(callback)
 
+    def set_schedulable_hisparse_available(self, callback):
+        self._schedulable_hisparse_available = weakref.WeakMethod(callback)
+
+    def _get_schedulable_hisparse_available(self) -> int:
+        callback_ref = getattr(self, "_schedulable_hisparse_available", None)
+        if callback_ref is None:
+            return self.hisparse_attn_allocator.available_size()
+
+        callback = callback_ref()
+        if callback is None:
+            return self.hisparse_attn_allocator.available_size()
+        return callback()
+
     def _ensure_hisparse_available(self, need_tokens: int) -> bool:
         if self.hisparse_attn_allocator.available_size() >= need_tokens:
             return True
@@ -99,7 +112,7 @@ class HiSparseTokenToKVPoolAllocator(HiSparseDemotionMixin, BaseTokenToKVPoolAll
     def available_size(self) -> int:
         return min(
             self.logical_attn_allocator.available_size(),
-            self.hisparse_attn_allocator.available_size(),
+            self._get_schedulable_hisparse_available(),
         )
 
     def get_kvcache(self):
@@ -388,6 +401,12 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(
         return min(
             self.logical_attn_allocator.full_available_size(),
             self.hisparse_attn_allocator.available_size() * self.compress_ratio,
+        )
+
+    def schedulable_full_available_size(self):
+        return min(
+            self.logical_attn_allocator.full_available_size(),
+            self._get_schedulable_hisparse_available() * self.compress_ratio,
         )
 
     def swa_available_size(self):
