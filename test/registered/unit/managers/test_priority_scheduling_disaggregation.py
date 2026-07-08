@@ -80,6 +80,86 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
         req.time_stats.trace_ctx.abort.assert_called_once()
 
 
+class TestDisaggregationAbortedRequestQueueing(unittest.TestCase):
+    """An already-aborted request (e.g. input too long) must not enter the
+    bootstrap/prealloc queue for KV transfer, otherwise the decode side decodes
+    from uninitialized KV and emits garbage output (issue #30233)."""
+
+    def _new_scheduler(self, disaggregation_mode: DisaggregationMode) -> Scheduler:
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.disaggregation_mode = disaggregation_mode
+        scheduler.enable_priority_scheduling = False
+        scheduler.schedule_low_priority_values_first = False
+        scheduler.abort_on_priority_when_disabled = False
+        scheduler.model_config = SimpleNamespace(num_key_value_heads=8)
+        scheduler._prefetch_kvcache = MagicMock()
+        scheduler.disagg_prefill_bootstrap_queue = MagicMock()
+        scheduler.disagg_decode_prealloc_queue = MagicMock()
+        scheduler.output_streamer = MagicMock()
+        return scheduler
+
+    def _new_aborted_req(self):
+        # Mirror set_finish_with_abort: reason is recorded in to_finish, and the
+        # long input is truncated to a single token.
+        req = MagicMock()
+        req.priority = None
+        req.rid = "req"
+        req.return_logprob = False
+        req.finished_reason = None
+        req.to_finish = FINISH_ABORT("Input is too long")
+        req.origin_input_ids = [0]
+        req.disagg_kv_sender = None
+        req.time_stats = MagicMock()
+        req.time_stats.trace_ctx = MagicMock()
+        return req
+
+    def test_prefill_mode_aborted_req_skips_bootstrap_queue(self):
+        scheduler = self._new_scheduler(DisaggregationMode.PREFILL)
+        req = self._new_aborted_req()
+        req.disagg_kv_sender = None
+
+        def create_sender(req, _num_kv_heads):
+            req.disagg_kv_sender = MagicMock()
+            return True
+
+        scheduler.disagg_prefill_bootstrap_queue.create_sender.side_effect = (
+            create_sender
+        )
+
+        scheduler._add_request_to_queue(req)
+
+        scheduler.disagg_prefill_bootstrap_queue.add.assert_not_called()
+        scheduler.disagg_prefill_bootstrap_queue.create_sender.assert_called_once_with(
+            req, 8
+        )
+        req.disagg_kv_sender.abort.assert_called_once()
+        scheduler._prefetch_kvcache.assert_not_called()
+        scheduler.output_streamer.stream_output.assert_called_once_with([req], False)
+        # to_finish is promoted to finished_reason so stream_output emits it.
+        self.assertIsInstance(req.finished_reason, FINISH_ABORT)
+        self.assertIsNone(req.to_finish)
+
+    def test_decode_mode_aborted_req_skips_prealloc_queue(self):
+        scheduler = self._new_scheduler(DisaggregationMode.DECODE)
+        req = self._new_aborted_req()
+
+        scheduler._add_request_to_queue(req)
+
+        scheduler.disagg_decode_prealloc_queue.add.assert_not_called()
+        scheduler.output_streamer.stream_output.assert_called_once_with([req], False)
+        self.assertIsInstance(req.finished_reason, FINISH_ABORT)
+
+    def test_prefill_mode_healthy_req_still_enqueued(self):
+        scheduler = self._new_scheduler(DisaggregationMode.PREFILL)
+        req = self._new_aborted_req()
+        req.to_finish = None  # not aborted
+
+        scheduler._add_request_to_queue(req)
+
+        scheduler.disagg_prefill_bootstrap_queue.add.assert_called_once_with(req, 8)
+        scheduler.output_streamer.stream_output.assert_not_called()
+
+
 class TestDecodePreallocQueuePriority(unittest.TestCase):
     def _new_decode_req(self, rid: str, priority: int, *, failed: bool = False):
         req = SimpleNamespace(

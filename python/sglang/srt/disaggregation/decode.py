@@ -747,10 +747,16 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             elif poll == KVPoll.Failed:
                 error_message = f"Decode handshake failed for request rank={self.tp_rank} {decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
                 is_propagated = False
+                status_code = HTTPStatus.INTERNAL_SERVER_ERROR
                 try:
                     decode_req.kv_receiver.failure_exception()
                 except Exception as e:
-                    error_message += f" with exception {e}"
+                    propagated_status_code = getattr(e, "status_code", None)
+                    if propagated_status_code is not None:
+                        status_code = propagated_status_code
+                        error_message = getattr(e, "failure_reason", str(e))
+                    else:
+                        error_message += f" with exception {e}"
                     is_propagated = getattr(e, "is_from_another_rank", False)
                 # Mute error message for propagated exceptions to avoid duplicate logging
                 if is_propagated:
@@ -760,7 +766,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 prepare_abort(
                     decode_req.req,
                     error_message,
-                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                    status_code=status_code,
                 )
                 if self.scheduler.metrics_reporter.enable_metrics:
                     self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
@@ -1889,11 +1895,17 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     f"{decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
                 )
                 is_propagated = False
+                status_code = HTTPStatus.INTERNAL_SERVER_ERROR
                 if poll == KVPoll.Failed:
                     try:
                         decode_req.kv_receiver.failure_exception()
                     except Exception as e:
-                        error_message += f" with exception {e}"
+                        propagated_status_code = getattr(e, "status_code", None)
+                        if propagated_status_code is not None:
+                            status_code = propagated_status_code
+                            error_message = getattr(e, "failure_reason", str(e))
+                        else:
+                            error_message += f" with exception {e}"
                         is_propagated = getattr(e, "is_from_another_rank", False)
                 self._clean_hicache_prefetch_resources(decode_req)
                 # Mute error message for propagated exceptions to avoid duplicate logging
@@ -1904,7 +1916,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 prepare_abort(
                     decode_req.req,
                     error_message,
-                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                    status_code=status_code,
                 )
                 self.scheduler.output_streamer.stream_output(
                     [decode_req.req],
