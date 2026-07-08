@@ -177,6 +177,8 @@ class TestDiffusionBCGPadding(unittest.TestCase):
         self.assertEqual(short["caption_valid_lens"].shape, (1,))
         self.assertEqual(short["caption_valid_lens"].item(), 19)
         self.assertEqual(longer["caption_valid_lens"].item(), 47)
+        self.assertTrue(short["_use_caption_valid_mask"])
+        self.assertTrue(longer["_use_caption_valid_mask"])
         self.assertFalse(short["encoder_hidden_states_mask"][0, 19:].any())
         self.assertFalse(longer["encoder_hidden_states_mask"][0, 47:].any())
         self.assertEqual(short["freqs_cis"][0].shape, (64, 8))

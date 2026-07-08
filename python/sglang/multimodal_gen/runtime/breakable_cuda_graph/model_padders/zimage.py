@@ -157,6 +157,7 @@ def pad_zimage_prompt_kwargs(
     caption_mask = _caption_mask(call_kwargs, caption=caption, seq=seq, bucket=bucket)
     out["encoder_hidden_states_mask"] = caption_mask
     out["caption_valid_lens"] = caption_mask.sum(dim=1).to(dtype=torch.long)
+    out["_use_caption_valid_mask"] = True
     if out.get("encoder_attention_mask") is not None:
         out["encoder_attention_mask"] = out["encoder_hidden_states_mask"]
     out["freqs_cis"] = _pad_caption_freqs(
