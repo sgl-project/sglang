@@ -41,6 +41,7 @@ from sglang.srt.utils import (
     is_musa,
     is_sm100_supported,
     is_sm120_supported,
+    is_xpu,
     log_info_on_rank0,
 )
 from sglang.srt.utils.custom_op import register_custom_op
@@ -50,6 +51,7 @@ _is_hip = is_hip()
 _is_cuda = is_cuda()
 _is_cpu = is_cpu()
 _is_musa = is_musa()
+_is_xpu = is_xpu()
 _is_sm100_supported = is_sm100_supported()
 _is_sm120_supported = is_sm120_supported()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
@@ -1832,6 +1834,64 @@ if _is_hip:
                 torch.ops._C.static_scaled_fp8_quant(output, input, scale)
             else:
                 _native_static_quant_fp8(output, input, scale)
+
+        return output, scale
+
+elif _is_xpu:
+    try:
+        from sgl_kernel import sgl_per_tensor_quant_fp8 as _sgl_per_tensor_quant_fp8_xpu
+        from sgl_kernel import sgl_per_token_quant_fp8 as _sgl_per_token_quant_fp8_xpu
+
+        _has_sgl_kernel_xpu = True
+    except ImportError:
+        _has_sgl_kernel_xpu = False
+
+    def scaled_fp8_quant(
+        input: torch.Tensor,
+        scale: Optional[torch.Tensor] = None,
+        num_token_padding: Optional[int] = None,
+        use_per_token_if_dynamic: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """XPU path: use sgl-kernel-xpu SYCL kernels when available, else pure PyTorch."""
+        assert input.ndim == 2, f"Expected 2D input tensor, got {input.ndim}D"
+        shape = input.shape
+        if num_token_padding:
+            shape = (max(num_token_padding, input.shape[0]), shape[1])
+        output = torch.empty(shape, device=input.device, dtype=fp8_dtype)
+
+        if scale is None:
+            # Dynamic scaling
+            if use_per_token_if_dynamic:
+                if _has_sgl_kernel_xpu:
+                    scale = torch.empty(
+                        (shape[0], 1), device=input.device, dtype=torch.float32
+                    )
+                    _sgl_per_token_quant_fp8_xpu(input, output, scale)
+                else:
+                    absmax = input.abs().max(dim=1, keepdim=True).values
+                    scale = torch.clamp(absmax, min=1e-12) / fp8_max
+                    output.copy_(
+                        torch.clamp(input / scale, fp8_min, fp8_max).to(fp8_dtype)
+                    )
+            else:
+                scale = torch.zeros(1, device=input.device, dtype=torch.float32)
+                if _has_sgl_kernel_xpu:
+                    _sgl_per_tensor_quant_fp8_xpu(input, output, scale, is_static=False)
+                else:
+                    absmax = input.abs().max()
+                    scale.fill_(torch.clamp(absmax, min=1e-12).item() / fp8_max)
+                    output.copy_(
+                        torch.clamp(input / scale, fp8_min, fp8_max).to(fp8_dtype)
+                    )
+        else:
+            # Static scaling
+            assert (
+                scale.numel() == 1
+            ), f"Expected scalar scale, got numel={scale.numel()}"
+            if _has_sgl_kernel_xpu:
+                _sgl_per_tensor_quant_fp8_xpu(input, output, scale, is_static=True)
+            else:
+                output.copy_(torch.clamp(input / scale, fp8_min, fp8_max).to(fp8_dtype))
 
         return output, scale
 

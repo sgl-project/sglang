@@ -565,6 +565,15 @@ class XPUAttentionBackend(AttentionBackend):
             value_cache = value_cache.view(
                 -1, self.page_size, layer.tp_v_head_num, layer.head_dim
             )
+            # XPU flash-attn does not support fp8 inputs; cast fp8 kv cache
+            # back to the compute dtype (bf16/fp16) before calling flash_attn.
+            # This only fires when kv_cache_quant_algo=FP8 is set in the model
+            # config (e.g. nvidia/Llama-3.3-70B-Instruct-FP8).  All other models
+            # have key_cache.dtype == q.dtype already so the branch is skipped.
+            _prefill_compute_dtype = q.dtype
+            if key_cache.dtype != _prefill_compute_dtype:
+                key_cache = key_cache.to(_prefill_compute_dtype)
+                value_cache = value_cache.to(_prefill_compute_dtype)
             if layer.is_cross_attention:
                 page_table = metadata.encoder_page_table
                 cache_seqlens = metadata.encoder_lens_int32
@@ -834,6 +843,8 @@ class XPUAttentionBackend(AttentionBackend):
             kwargs["sinks"] = sinks
 
         k_descale, v_descale = None, None
+        # Save compute dtype before any fp8 cast (XPU flash-attn does not support fp8 natively)
+        compute_dtype = q.dtype
         # only use kv scaling if: 1) fp8 kv is explicitly enabled, 2) RadixAttention
         # has corresponding quantization method so that layer.k_scale is not None,
         # 3) layer.head_dim <= 256 since fa3 kernel require fp16 and bf16 data type in this case.
@@ -855,6 +866,15 @@ class XPUAttentionBackend(AttentionBackend):
             value_cache = value_cache.view(
                 -1, self.page_size, layer.tp_v_head_num, layer.head_dim
             )
+
+            # XPU flash-attn does not support fp8 inputs; cast fp8 kv cache
+            # and q back to compute dtype before any flash_attn call.
+            # compute_dtype was saved before q was cast to kv_cache_dtype above.
+            # Only fires for models with kv_cache_quant_algo=FP8 (e.g. Llama-3.3-FP8).
+            if key_cache.dtype != compute_dtype or q.dtype != compute_dtype:
+                key_cache = key_cache.to(compute_dtype)
+                value_cache = value_cache.to(compute_dtype)
+                q = q.to(compute_dtype)
 
             if layer.is_cross_attention:
                 # Always use non-chunked logic for cross-attention
