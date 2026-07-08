@@ -32,7 +32,6 @@ import torch
 import torch.distributed as dist
 from torch import nn
 
-from sglang.jit_kernel.ngram_embedding import update_token_table_decode
 from sglang.srt.configs import (
     BailingHybridConfig,
     FalconH1Config,
@@ -164,6 +163,9 @@ from sglang.srt.model_executor.graph_shared_output import GraphSharedOutput
 from sglang.srt.model_executor.hook_manager import register_forward_hooks
 from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
     ModelRunnerKVCacheMixin,
+)
+from sglang.srt.model_executor.ngram_token_table import (
+    update_ngram_token_table_after_sampling,
 )
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 from sglang.srt.model_executor.runner import (
@@ -1328,7 +1330,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if is_npu():
                 register_sgl_tp_rank(self.gpu_id)
 
-            # Pre-warm NCCL/RCCL to eliminate cold-start latency in first request
+            # Pre-warm NCCL/RCCL/HCCL to eliminate cold-start latency in first request
             # Controlled by --pre-warm-nccl flag (default: enabled on AMD GPUs)
             if self.server_args.pre_warm_nccl and (
                 self.tp_size > 1 or self.pp_size > 1 or self.moe_ep_size > 1
@@ -1336,14 +1338,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 warmup_start = time.perf_counter()
                 tp_group_handle = get_tp_group().device_group
 
-                # Single warmup all_reduce to initialize NCCL/RCCL communicator
+                # Single warmup all_reduce to initialize NCCL/RCCL/HCCL communicator
                 warmup_tensor = torch.zeros(1, device=torch.cuda.current_device())
                 dist.all_reduce(warmup_tensor, group=tp_group_handle)
                 current_platform.synchronize()
 
                 warmup_elapsed = time.perf_counter() - warmup_start
                 logger.info(
-                    f"NCCL/RCCL warmup completed in {warmup_elapsed:.3f}s "
+                    f"NCCL/RCCL/HCCL warmup completed in {warmup_elapsed:.3f}s "
                     f"(tp_size={self.tp_size}, pp_size={self.pp_size}, ep_size={self.moe_ep_size})"
                 )
 
@@ -2483,6 +2485,22 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 f"Unsupported kv_cache_dtype: {self.server_args.kv_cache_dtype}."
             )
 
+        # DFLASH: fa4 draft attention can't read the target's fp8 KV (needs K.dtype == Q.dtype),
+        # so give the fa4 draft its own compute-dtype KV. fp8-capable backends keep the target dtype.
+        if (
+            self.is_draft_worker
+            and self.spec_algorithm.is_dflash()
+            and self.server_args.speculative_draft_attention_backend == "fa4"
+            and self.kv_cache_dtype != self.dtype
+        ):
+            logger.info(
+                "DFLASH fa4 draft: overriding KV cache dtype %s -> %s "
+                "(fa4 needs K.dtype == Q.dtype; cannot read the target's quantized KV).",
+                self.kv_cache_dtype,
+                self.dtype,
+            )
+            self.kv_cache_dtype = self.dtype
+
     def init_cublas(self):
         """We need to run a small matmul to init cublas. Otherwise, it will raise some errors later."""
         dtype = torch.float16
@@ -2606,15 +2624,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         ngram_embedding_info = forward_batch.ngram_embedding_info
         if ngram_embedding_info is None:
             return
-        ngram_embedding_info.out_column_starts[: forward_batch.batch_size] = (
-            forward_batch.seq_lens
-        )
-        ngram_embedding_info.out_req_lens[: forward_batch.batch_size] = 1
-        update_token_table_decode(
-            ne_token_table=ngram_embedding_info.token_table,
-            tokens=next_token_ids.to(torch.int32),
-            row_indices=forward_batch.req_pool_indices,
-            column_starts=ngram_embedding_info.out_column_starts,
+        update_ngram_token_table_after_sampling(
+            ngram_embedding_info=ngram_embedding_info,
+            next_token_ids=next_token_ids,
+            req_pool_indices=forward_batch.req_pool_indices,
+            seq_lens=forward_batch.seq_lens,
+            batch_size=forward_batch.batch_size,
         )
 
     def init_decode_cuda_graph(self):
@@ -2755,12 +2770,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.model.model = resolve_language_model(self.model)
         language_model = getattr(self.model, "language_model", self.model)
 
-        # Resolve model with layers: handle CausalLM wrapper (.model.layers) and direct TextModel (.layers)
-        if hasattr(language_model, "model") and hasattr(language_model.model, "layers"):
-            layer_model = language_model.model
-        elif hasattr(language_model, "layers"):
-            layer_model = language_model
-        else:
+        # Find the module that owns the decoder `layers`. Models wrap it at
+        # varying depths: a direct text model exposes `.layers`, a CausalLM
+        # wraps it as `.model.layers`, and some multimodal models add another
+        # level (e.g. DeepSeek-OCR: OCR wrapper -> Deepseek*ForCausalLM ->
+        # text model -> `.layers`). Descend the `.model` chain until we find it.
+        layer_model = language_model
+        while not hasattr(layer_model, "layers") and hasattr(layer_model, "model"):
+            layer_model = layer_model.model
+
+        if not hasattr(layer_model, "layers"):
             logger.warning(
                 "Disable prefill CUDA graph because the model does not have a 'layers' attribute"
             )

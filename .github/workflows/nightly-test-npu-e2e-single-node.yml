@@ -30,6 +30,16 @@ on:
         type: boolean
         default: false
         description: use sglang from source code or from docker image
+      install_sglang_deps:
+        required: false
+        type: boolean
+        default: false
+        description: install sglang dependencies (e.g. PyTorch, CANN packages) when using source installation
+      device_type_for_deps:
+        required: false
+        type: string
+        default: 'a3'
+        description: device type for dependency installation (a3 or 910b)
       transformers_version:
         required: false
         type: string
@@ -54,8 +64,25 @@ jobs:
         run: |
           npu-smi info
 
+      - name: Install sglang dependencies
+        if: ${{ inputs.install_sglang_deps == true }}
+        shell: bash
+        env:
+          TORCH_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/whl/cpu"
+          PYPI_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple"
+          UV_INDEX_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple"
+          GITHUB_PROXY_URL: "https://gh-proxy.test.osinfra.cn/"
+          RUSTUP_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local:8082"
+        run: |
+          CACHING_URL="cache-service.nginx-pypi-cache.svc.cluster.local"
+          sed -Ei "s@(ports|archive).ubuntu.com@${CACHING_URL}:8081@g" /etc/apt/sources.list
+          pip config set global.index-url http://${CACHING_URL}/pypi/simple
+          pip config set global.trusted-host "${CACHING_URL}"
+          bash scripts/ci/npu/npu_ci_install_dependency.sh ${{ inputs.device_type_for_deps }}
+          cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
+
       - name: Run test
-        timeout-minutes: 120
+        timeout-minutes: 300
         env:
           SGLANG_USE_MODELSCOPE: true
           HF_ENDPOINT: https://hf-mirror.com
