@@ -75,6 +75,7 @@ def get_rope_index(
         or model_type.startswith("qwen3_vl_moe")
         or model_type.startswith("qwen3_5")
         or model_type.startswith("interns2_mobius")
+        or model_type.startswith("cosmos3_omni")
     ) and video_grid_thw is not None:
         video_grid_thw = torch.repeat_interleave(
             video_grid_thw, video_grid_thw[:, 0], dim=0
@@ -162,6 +163,7 @@ def get_rope_index(
                     "qwen3_5_moe",
                     "intern_s2_preview",
                     "interns2_mobius",
+                    "cosmos3_omni",
                 ):
                     t_index = (
                         torch.arange(llm_grid_t, device=position_ids.device)
