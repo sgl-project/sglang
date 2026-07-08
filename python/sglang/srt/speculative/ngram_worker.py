@@ -3,6 +3,7 @@ from typing import List, Optional
 
 import numpy as np
 import torch
+from sgl_kernel.speculative import reconstruct_indices_from_tree_mask
 
 from sglang.srt.layers.utils.logprob import compute_spec_v2_logprobs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -29,13 +30,6 @@ from sglang.srt.utils import is_cpu
 from sglang.srt.utils.async_probe import maybe_detect_inf, maybe_detect_nan
 
 _is_cpu = is_cpu()
-
-if _is_cpu:
-    from sgl_kernel.speculative import (
-        reconstruct_indices_from_tree_mask_cpu as reconstruct_indices_from_tree_mask,
-    )
-else:
-    from sgl_kernel.speculative import reconstruct_indices_from_tree_mask
 
 logger = logging.getLogger(__name__)
 

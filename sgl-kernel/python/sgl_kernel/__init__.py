@@ -123,7 +123,6 @@ else:
         fill_accept_out_cache_loc_cpu,
         fill_bonus_tokens_cpu,
         reconstruct_indices_from_tree_mask,
-        reconstruct_indices_from_tree_mask_cpu,
         rotate_input_ids_cpu,
         segment_packbits,
         tree_speculative_sampling_target_only,

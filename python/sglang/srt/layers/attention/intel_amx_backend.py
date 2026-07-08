@@ -99,10 +99,13 @@ class IntelAMXAttnBackend(AttentionBackend):
             # attend to its ancestors among the draft tokens (the committed
             # prefix stays fully visible).
             #
-            # tree_topk == 1 means a simple chain, which equals the kernel's
-            # built-in causal masking, so no explicit mask is needed. EAGLE
-            # has tree_topk == topk (>1 for trees); NGRAM has tree_topk == -1
-            # (irregular tree).
+            # NOTE: unlike triton_backend.py, which forwards spec_info.custom_mask
+            # unconditionally, the mask is gated on tree_topk here. tree_topk == 1
+            # means the draft tokens form a simple chain whose visibility is
+            # exactly the kernel's built-in causal masking, and skipping the explicit
+            # mask lets extend_attention_cpu take its faster mask-free path. EAGLE
+            # has tree_topk == topk (> 1 for real trees); NGRAM has tree_topk == -1
+            # (irregular tree); both need the mask.
             if spec_info.tree_topk != 1:
                 custom_mask = spec_info.custom_mask
                 if custom_mask is not None and custom_mask.numel() > 0:

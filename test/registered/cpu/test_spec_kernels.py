@@ -757,6 +757,58 @@ class TestBuildTreeKernelEfficient(CustomTestCase):
             )
 
 
+class TestReconstructIndicesFromTreeMask(CustomTestCase):
+    """reconstruct_indices_from_tree_mask on CPU (NGRAM verify metadata),
+    called through the device-dispatching sgl_kernel wrapper."""
+
+    def test_tree_and_chain(self):
+        from sgl_kernel.speculative import reconstruct_indices_from_tree_mask
+
+        bs, draft_token_num = 2, 4
+        seq_lens = torch.tensor([12, 5], dtype=torch.int64)
+        # Request 0: root(0) -> {1, 2}, 2 -> 3 (golden case from
+        # sgl-kernel/tests/speculative/test_ngram_utils.py).
+        # Request 1: plain chain 0 -> 1 -> 2 -> 3.
+        tree_mask = torch.tensor(
+            # fmt: off
+            [
+                1, 0, 0, 0,
+                1, 1, 0, 0,
+                1, 0, 1, 0,
+                1, 0, 1, 1,
+
+                1, 0, 0, 0,
+                1, 1, 0, 0,
+                1, 1, 1, 0,
+                1, 1, 1, 1,
+            ],
+            # fmt: on
+            dtype=torch.bool,
+        )
+        retrieve_index = torch.full((bs, draft_token_num), -1, dtype=torch.int64)
+        retrieve_next_token = torch.full((bs, draft_token_num), -1, dtype=torch.int64)
+        retrieve_next_sibling = torch.full((bs, draft_token_num), -1, dtype=torch.int64)
+        positions = torch.empty((bs * draft_token_num,), dtype=torch.int64)
+
+        reconstruct_indices_from_tree_mask(
+            tree_mask,
+            seq_lens,
+            positions,  # mutable
+            retrieve_index,  # mutable
+            retrieve_next_token,  # mutable
+            retrieve_next_sibling,  # mutable
+            bs,
+            draft_token_num,
+        )
+
+        self.assertEqual(retrieve_index.tolist(), [[0, 1, 2, 3], [4, 5, 6, 7]])
+        self.assertEqual(retrieve_next_token.tolist(), [[1, -1, 3, -1], [1, 2, 3, -1]])
+        self.assertEqual(
+            retrieve_next_sibling.tolist(), [[-1, 2, -1, -1], [-1, -1, -1, -1]]
+        )
+        self.assertEqual(positions.tolist(), [12, 13, 13, 14, 5, 6, 7, 8])
+
+
 class TestFillKernels(CustomTestCase):
     def setUp(self):
         torch.manual_seed(1234)

@@ -99,38 +99,28 @@ def reconstruct_indices_from_tree_mask(
     batch_size: int,
     draft_token_num: int,
 ) -> None:
-    torch.ops.sgl_kernel.reconstruct_indices_from_tree_mask.default(
-        tree_mask,
-        verified_seq_len,
-        positions,
-        retrive_index,
-        retrive_next_token,
-        retrive_next_sibling,
-        batch_size,
-        draft_token_num,
-    )
-
-
-def reconstruct_indices_from_tree_mask_cpu(
-    tree_mask: torch.Tensor,
-    verified_seq_len: torch.Tensor,
-    positions: torch.Tensor,
-    retrive_index: torch.Tensor,
-    retrive_next_token: torch.Tensor,
-    retrive_next_sibling: torch.Tensor,
-    batch_size: int,
-    draft_token_num: int,
-) -> None:
-    torch.ops.sgl_kernel.reconstruct_indices_from_tree_mask_cpu(
-        tree_mask,
-        verified_seq_len,
-        positions,
-        retrive_index,
-        retrive_next_token,
-        retrive_next_sibling,
-        batch_size,
-        draft_token_num,
-    )
+    if tree_mask.is_cpu:
+        torch.ops.sgl_kernel.reconstruct_indices_from_tree_mask_cpu(
+            tree_mask,
+            verified_seq_len,
+            positions,
+            retrive_index,
+            retrive_next_token,
+            retrive_next_sibling,
+            batch_size,
+            draft_token_num,
+        )
+    else:
+        torch.ops.sgl_kernel.reconstruct_indices_from_tree_mask.default(
+            tree_mask,
+            verified_seq_len,
+            positions,
+            retrive_index,
+            retrive_next_token,
+            retrive_next_sibling,
+            batch_size,
+            draft_token_num,
+        )
 
 
 def segment_packbits(
