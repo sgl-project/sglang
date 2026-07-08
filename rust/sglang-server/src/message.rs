@@ -252,6 +252,22 @@ pub struct GenerateBody {
     pub return_hidden_states: Option<bool>,
     #[serde(default)]
     pub return_text_in_logprobs: Option<bool>,
+
+    // Accepted for wire-compat with the native `bench_serving` payload (a full
+    // `GenerateReqInput`) but NOT yet wired into the scheduler — parsed and
+    // dropped in `split`. Declaring them keeps `deny_unknown_fields` (typos still
+    // 400) while letting a benchmark request through. Permissive `Value` types so
+    // any valid shape (str / list / list-of-lists) parses. `dead_code`-allowed:
+    // deserialized then intentionally ignored.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub lora_path: Option<rmpv::Value>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub return_routed_experts: Option<bool>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub image_data: Option<rmpv::Value>,
 }
 
 impl GenerateBody {
@@ -270,6 +286,8 @@ impl GenerateBody {
             token_ids_logprob,
             return_hidden_states,
             return_text_in_logprobs,
+            // Accepted for bench_serving compat, not wired through — see the struct.
+            ..
         } = self;
 
         // Per-item (text, input_ids) columns + whether the input used list form.
@@ -556,11 +574,9 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> bool {
             lens_i(&h.hidden_reqlens, i),
         );
 
-        route(ChunkEvent {
-            rid: h.rids[i],
-            token_ids,
-            finish_reason: h.finish_reasons.get(i).cloned().flatten(),
-            prompt_tokens: h.prompt_tokens.get(i).copied().unwrap_or(0),
+        // Logprob/hidden columns ride behind the boxed extras — allocate only when
+        // this request actually carries some (the common frame stays extras-free).
+        let extras = ChunkExtras {
             out_lp_val,
             out_lp_idx,
             in_lp_val,
@@ -579,6 +595,14 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> bool {
             in_tid_lens,
             hidden_val,
             hidden_lens,
+            ..Default::default()
+        };
+        route(ChunkEvent {
+            rid: h.rids[i],
+            token_ids,
+            finish_reason: h.finish_reasons.get(i).cloned().flatten(),
+            prompt_tokens: h.prompt_tokens.get(i).copied().unwrap_or(0),
+            extras: (!extras.is_empty()).then(|| Box::new(extras)),
             ..Default::default()
         });
     }
@@ -606,91 +630,90 @@ pub fn frame_egress_error(rid: &str, message: &str) -> Bytes {
     Bytes::from(buf)
 }
 
-/// One scheduler output increment. Carries the request across the detok boundary:
-/// fields above `text` arrive from Python (pre-decode); the detok shard fills
-/// `text` + `*_txt` in place. Deltas — fold with `OutputAccumulator` for cumulative.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// One scheduler output increment — the common, always-present frame. `token_ids`
+/// / `prompt_tokens` / `finish_reason` arrive from Python (pre-decode); the detok
+/// shard fills `text` in place. Deltas — fold with `OutputAccumulator` for
+/// cumulative. Logprobs + hidden states (rare, and large) live behind the boxed
+/// [`ChunkExtras`] (`None` unless requested) so this frame stays small even when
+/// the decoder builds an inline array at up to batch 4096 per step.
+///
+/// Not a wire type — built by `for_each_chunk` from the columnar [`BatchHeader`]
+/// frame and moved between stages in-process (never serialized), so no serde.
+#[derive(Debug, Clone, Default)]
 pub struct ChunkEvent {
     /// Request id as raw `u64` — the shard routing key; no parse, no clone.
     pub rid: u64,
-    pub seq: u64,
     /// New token ids for this step. Empty allowed (e.g. metadata-only frames).
     pub token_ids: Vec<i32>,
     /// `None` while streaming, the full finish-reason dict on the final chunk.
     pub finish_reason: Option<serde_json::Value>,
     /// Prompt token count for this request (constant across its chunks).
-    /// `#[serde(default)]` keeps the wire backward-compatible with 4-field frames.
-    #[serde(default)]
     pub prompt_tokens: u32,
-    /// Output-token logprobs for this step (columnar: parallel `val`/`idx`
-    /// buffers, one entry per new output token). Empty unless `return_logprob`.
-    #[serde(default)]
+    /// Decoded text **delta** for this chunk (empty in skip mode / on partial UTF-8),
+    /// filled by the detok shard. `token_ids` doubles as `output_ids`;
+    /// `completion_tokens` is this chunk's count.
+    pub text: String,
+    pub completion_tokens: u64,
+    /// Logprob + hidden-state columns — `None` unless the request asked for them.
+    /// Boxed to keep the common token/text/finish frame small at large decode
+    /// batches (the decoder allocates it only when a column is non-empty).
+    pub extras: Option<Box<ChunkExtras>>,
+}
+
+/// Logprob + hidden-state columns for a [`ChunkEvent`], allocated only when the
+/// request enabled logprobs / hidden states. Columnar `val`/`idx` (+ ragged `lens`)
+/// buffers arrive pre-decode; the detok shard fills the parallel `*_txt` columns
+/// when `return_text_in_logprobs` is set. In-process only — no serde (see
+/// [`ChunkEvent`]).
+#[derive(Debug, Clone, Default)]
+pub struct ChunkExtras {
+    /// Output-token logprobs (parallel `val`/`idx`, one entry per new output token).
     pub out_lp_val: Vec<f32>,
-    #[serde(default)]
     pub out_lp_idx: Vec<i32>,
-    /// Input (prefill) token logprobs, sent once on the first chunk. Empty
-    /// otherwise.
-    #[serde(default)]
+    /// Input (prefill) token logprobs, sent once on the first chunk.
     pub in_lp_val: Vec<f32>,
-    #[serde(default)]
     pub in_lp_idx: Vec<i32>,
     /// Top-k logprobs (2-level ragged): flat `val`/`idx` + per-position `lens` (0 =
     /// null). Output = per-step delta, input = once on the first chunk.
-    #[serde(default)]
     pub out_top_val: Vec<f32>,
-    #[serde(default)]
     pub out_top_idx: Vec<i32>,
-    #[serde(default)]
     pub out_top_lens: Vec<u32>,
-    #[serde(default)]
     pub in_top_val: Vec<f32>,
-    #[serde(default)]
     pub in_top_idx: Vec<i32>,
-    #[serde(default)]
     pub in_top_lens: Vec<u32>,
-    /// Token-ids logprobs (same 2-level ragged layout). Empty unless
-    /// `token_ids_logprob` was set on the request.
-    #[serde(default)]
+    /// Token-ids logprobs (same ragged layout); set only when `token_ids_logprob` was.
     pub out_tid_val: Vec<f32>,
-    #[serde(default)]
     pub out_tid_idx: Vec<i32>,
-    #[serde(default)]
     pub out_tid_lens: Vec<u32>,
-    #[serde(default)]
     pub in_tid_val: Vec<f32>,
-    #[serde(default)]
     pub in_tid_idx: Vec<i32>,
-    #[serde(default)]
     pub in_tid_lens: Vec<u32>,
     /// Hidden states (dense f32): flat buffer + per-row lengths. Last-writer-wins
     /// across chunks (the final message has the full set).
-    #[serde(default)]
     pub hidden_val: Vec<f32>,
-    #[serde(default)]
     pub hidden_lens: Vec<u32>,
-
-    // --- Detok-stage outputs: empty on the wire (a pre-decode frame), filled in
-    // place by the detok shard so the same struct carries the decoded result. ---
-    /// Decoded text **delta** for this chunk (empty in skip mode / on partial UTF-8).
-    /// `token_ids` doubles as `output_ids`; `completion_tokens` is this chunk's count.
-    #[serde(default)]
-    pub text: String,
-    #[serde(default)]
-    pub completion_tokens: u64,
-    /// Decoded logprob token text (`return_text_in_logprobs`), parallel to the `*_idx`
-    /// buffers; empty when not requested (the tuple's text slot stays null).
-    #[serde(default)]
+    /// Decoded logprob token text (`return_text_in_logprobs`), parallel to the
+    /// `*_idx` buffers; empty when not requested (the tuple's text slot stays null).
     pub out_lp_txt: Vec<String>,
-    #[serde(default)]
     pub in_lp_txt: Vec<String>,
-    #[serde(default)]
     pub out_top_txt: Vec<String>,
-    #[serde(default)]
     pub in_top_txt: Vec<String>,
-    #[serde(default)]
     pub out_tid_txt: Vec<String>,
-    #[serde(default)]
     pub in_tid_txt: Vec<String>,
+}
+
+impl ChunkExtras {
+    /// True when no logprob / hidden column carries data — lets the decoder skip the
+    /// box allocation for the common (extras-free) frame.
+    fn is_empty(&self) -> bool {
+        self.out_lp_val.is_empty()
+            && self.in_lp_val.is_empty()
+            && self.out_top_lens.is_empty()
+            && self.in_top_lens.is_empty()
+            && self.out_tid_lens.is_empty()
+            && self.in_tid_lens.is_empty()
+            && self.hidden_lens.is_empty()
+    }
 }
 
 #[cfg(test)]
@@ -768,6 +791,24 @@ mod tests {
             serde_json::from_str::<GenerateBody>(r#"{"text": "hi", "bogus": 1}"#).is_err(),
             "GenerateBody must deny unknown fields"
         );
+    }
+
+    /// The native `bench_serving` payload (a `GenerateReqInput` superset) parses:
+    /// its `lora_path`/`return_routed_experts`/`image_data` are accepted-but-ignored,
+    /// so `split` succeeds and drops them while the real fields survive.
+    #[test]
+    fn accepts_bench_serving_payload() {
+        let (ps, is_batch) = split(
+            r#"{"text": "hi", "sampling_params": {"max_new_tokens": 8},
+                "stream": true, "lora_path": null, "return_logprob": false,
+                "return_routed_experts": false, "logprob_start_len": -1,
+                "image_data": null}"#,
+        )
+        .unwrap();
+        assert!(!is_batch);
+        assert_eq!(ps.len(), 1);
+        assert_eq!(ps[0].text.as_deref(), Some("hi"));
+        assert!(ps[0].stream);
     }
 
     /// Concatenating N data columns produces the exact same frame as one joined
@@ -894,15 +935,31 @@ mod tests {
         assert!(for_each_chunk(&framed[1..], |ev| events.push(ev)));
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].token_ids, vec![10]);
-        assert_eq!(events[0].out_lp_val, vec![-0.5, -0.6]);
-        assert_eq!(events[0].out_lp_idx, vec![10, 99]);
-        assert_eq!(events[0].out_top_val, vec![-0.1, -0.2]);
-        assert_eq!(events[0].out_top_lens, vec![2]);
-        assert_eq!(events[0].hidden_val, vec![0.1, 0.2, 0.3]);
-        assert_eq!(events[0].hidden_lens, vec![3]);
-        // req1 has token id but no numeric columns.
+        let ex0 = events[0]
+            .extras
+            .as_deref()
+            .expect("req0 has logprob/hidden extras");
+        assert_eq!(ex0.out_lp_val, vec![-0.5, -0.6]);
+        assert_eq!(ex0.out_lp_idx, vec![10, 99]);
+        assert_eq!(ex0.out_top_val, vec![-0.1, -0.2]);
+        assert_eq!(ex0.out_top_lens, vec![2]);
+        assert_eq!(ex0.hidden_val, vec![0.1, 0.2, 0.3]);
+        assert_eq!(ex0.hidden_lens, vec![3]);
+        // req1 has a token id but no numeric columns → no extras box allocated.
         assert_eq!(events[1].token_ids, vec![20]);
-        assert!(events[1].out_lp_val.is_empty() && events[1].hidden_val.is_empty());
+        assert!(events[1].extras.is_none());
+    }
+
+    /// The common frame must stay small: logprob/hidden columns are boxed behind
+    /// `ChunkExtras`, so the inline decode array is a few KiB — not MiB — even at
+    /// batch 4096. A regression that inlines a rare column would blow this up.
+    #[test]
+    fn chunk_event_frame_stays_small() {
+        let sz = std::mem::size_of::<ChunkEvent>();
+        assert!(
+            sz <= 128,
+            "ChunkEvent grew to {sz} bytes; keep rare columns behind ChunkExtras"
+        );
     }
 
     #[test]
