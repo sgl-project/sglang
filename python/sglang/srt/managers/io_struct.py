@@ -86,6 +86,9 @@ class BaseBatchReq(msgspec.Struct, tag=True, kw_only=True, array_like=True):
     """Base for batched IPC payloads."""
 
     rids: Optional[List[str]] = None
+    # Used by batch messages whose items are parallel arrays, such as scheduler
+    # outputs. Tokenized input batches store routing on batch[i].http_worker_ipc
+    # because the scheduler unpacks them into single-request handlers.
     http_worker_ipcs: Optional[List[Optional[str]]] = None
 
     @classmethod
@@ -806,7 +809,7 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     return_indexer_topk: bool = False
 
     # Session info for continual prompting
-    session_id: Optional[str] = field(default=None, kw_only=True)
+    session_id: Optional[str] = None
     session_params: Optional[SessionParams] = None
 
     # LoRA related
@@ -881,6 +884,7 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
 
 class BatchTokenizedGenerateReqInput(BaseBatchReq, kw_only=True):
     # The batch of tokenized requests
+    # Routing for request i is batch[i].http_worker_ipc, not http_worker_ipcs[i].
     batch: List[TokenizedGenerateReqInput]
 
     def __len__(self):
@@ -1166,6 +1170,7 @@ class TokenizedEmbeddingReqInput(BaseReq, kw_only=True):
 
 class BatchTokenizedEmbeddingReqInput(BaseBatchReq, kw_only=True):
     # The batch of tokenized embedding requests
+    # Routing for request i is batch[i].http_worker_ipc, not http_worker_ipcs[i].
     batch: List[TokenizedEmbeddingReqInput]
 
     def __len__(self):
