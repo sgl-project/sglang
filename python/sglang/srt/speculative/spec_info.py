@@ -307,7 +307,10 @@ def create_dummy_verify_input(
         from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
         if is_draft_worker:
-            raise RuntimeError("This should not happen.")
+            raise RuntimeError(
+                f"{spec_algorithm.name} builds verify inputs only on the target worker, "
+                "but a dummy verify input was requested on the draft worker."
+            )
         else:
             spec_info = EagleVerifyInput(
                 draft_token=None,
