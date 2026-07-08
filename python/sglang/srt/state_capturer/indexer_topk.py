@@ -43,16 +43,16 @@ class IndexerTopkCapturer(BaseTopkCapturer):
         )
 
 
-_global_indexer_capturer: Optional[IndexerTopkCapturer] = None
-
-
 def get_global_indexer_capturer() -> Optional[IndexerTopkCapturer]:
-    return _global_indexer_capturer
+    from sglang.srt.runtime_context import get_resources
+
+    return get_resources().indexer_capturer
 
 
 def set_global_indexer_capturer(capturer: Optional[IndexerTopkCapturer]):
-    global _global_indexer_capturer
-    _global_indexer_capturer = capturer
+    from sglang.srt.runtime_context import get_resources
+
+    get_resources().indexer_capturer = capturer
 
 
 def maybe_capture_indexer_topk(
