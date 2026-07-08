@@ -16,7 +16,17 @@ from sglang.test.test_utils import (
     run_bench_one_batch,
 )
 
-register_xpu_ci(est_time=600, suite="stage-b-test-1-gpu-xpu")
+register_xpu_ci(
+    est_time=600,
+    suite="stage-b-test-1-gpu-xpu",
+    disabled="test_mla_decode_attention_backend fails with KeyError: 'sglang' — "
+    "sglang Transformers fallback for DeepseekV2 sets "
+    "config._attn_implementation='sglang', which the trust-remote-code "
+    "modeling_deepseek.py in gaunernst/DeepSeek-V2-Lite-Chat-FP8 does not "
+    "recognize. Re-enable after fixing the fallback path in "
+    "sglang/srt/models/transformers.py and/or the transitive cutlass import "
+    "on sglang/srt/models/deepseek_v2.py.",
+)
 
 
 def intel_xpu_benchmark(
