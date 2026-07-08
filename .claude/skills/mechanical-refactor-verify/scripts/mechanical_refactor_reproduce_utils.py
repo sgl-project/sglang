@@ -250,9 +250,7 @@ class Repro:
     PASS on an empty diff, otherwise the residual -- exactly what the relocation does not
     account for (a bundled change, or a re-derived scaffold a human must confirm)."""
 
-    def __init__(
-        self, base: str, target: str, repo_root: str | None = None
-    ) -> None:
+    def __init__(self, base: str, target: str, repo_root: str | None = None) -> None:
         self.base = base
         self.target = target
         self.repo_root = repo_root
@@ -283,7 +281,9 @@ class Repro:
                         keywords=node.keywords,
                     )
 
-                _write_source(path, _rewrite_calls(_read_source(path), predicate, build))
+                _write_source(
+                    path, _rewrite_calls(_read_source(path), predicate, build)
+                )
 
         self.ops.append(op)
         return self
@@ -312,7 +312,9 @@ class Repro:
                         keywords=node.keywords,
                     )
 
-                _write_source(path, _rewrite_calls(_read_source(path), predicate, build))
+                _write_source(
+                    path, _rewrite_calls(_read_source(path), predicate, build)
+                )
 
         self.ops.append(op)
         return self
@@ -414,7 +416,9 @@ class Repro:
             for node in ast.parse("".join(lines)).body:
                 if isinstance(node, (ast.Import, ast.ImportFrom)):
                     last = max(last, node.end_lineno)
-            _write_source(path, "".join(lines[:last] + [import_stmt + nl] + lines[last:]))
+            _write_source(
+                path, "".join(lines[:last] + [import_stmt + nl] + lines[last:])
+            )
 
         self.ops.append(op)
         return self
@@ -434,7 +438,9 @@ class Repro:
                 ):
                     indent = " " * node.body[0].col_offset
                     at = node.body[-1].end_lineno
-                    lines.insert(at, indent + import_stmt + _newline_style("".join(lines)))
+                    lines.insert(
+                        at, indent + import_stmt + _newline_style("".join(lines))
+                    )
                     _write_source(path, "".join(lines))
                     return
             raise AssertionError(f"no `if TYPE_CHECKING:` block in {rel}")
