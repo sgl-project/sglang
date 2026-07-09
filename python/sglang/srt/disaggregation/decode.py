@@ -580,6 +580,16 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.queue.append(decode_req)
         return decode_req
 
+    def _release_kv_receiver(self, decode_req: DecodeRequest) -> None:
+        """Release a request's KV receiver and keep pending bookkeeping in sync."""
+        if decode_req.kv_receiver is not None:
+            decode_req.kv_receiver.clear()
+            decode_req.kv_receiver = None
+        if self.pending_reqs:
+            self.pending_reqs = [
+                pending for pending in self.pending_reqs if pending is not decode_req
+            ]
+
     def hold_rebootstrap(self, req: Req) -> None:
         """Stage a retracted request for rebootstrap without enqueuing it yet.
 
@@ -793,9 +803,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 error_msg = f"Could not fetch prefill parallel info from {bootstrap_addr} after {count} attempts"
                 logger.error(error_msg)
                 for decode_req in reqs:
-                    # kv_receiver may be None from a prior self.queue cleanup
-                    if decode_req.kv_receiver is not None:
-                        decode_req.kv_receiver.abort()
+                    decode_req.kv_receiver.abort()
                 del self._ensure_retry_count[bootstrap_addr]
                 del self._ensure_last_attempt_time[bootstrap_addr]
             else:
@@ -903,18 +911,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         [decode_req.req],
                         decode_req.req.return_logprob,
                     )
-                decode_req.kv_receiver.clear()
-                decode_req.kv_receiver = None
+                self._release_kv_receiver(decode_req)
                 failed_reqs.append(decode_req)
                 indices_to_remove.add(i)
-
-        # DecodeRequest is shared between self.queue and self.pending_reqs;
-        # drop failed reqs from both
-        if failed_reqs:
-            failed_ids = {id(r) for r in failed_reqs}
-            self.pending_reqs = [
-                r for r in self.pending_reqs if id(r) not in failed_ids
-            ]
 
         # HiSparse physical constraint: max requests by device buffer capacity.
         # Each admitted req needs padded_buffer_size from hisparse device pool.
@@ -1596,6 +1595,11 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 ):
                     self.staging_handler.register_decode_req(dr.req.bootstrap_room, dr)
 
+    def _release_kv_receiver(self, decode_req: DecodeRequest) -> None:
+        if decode_req.kv_receiver is not None:
+            decode_req.kv_receiver.clear()
+            decode_req.kv_receiver = None
+
     def _commit_transfer_to_req(self, decode_req: DecodeRequest):
         idx = decode_req.metadata_buffer_index
         (
@@ -1636,8 +1640,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 "(bootstrap_room=0)",
                 status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
             )
-            decode_req.kv_receiver.clear()
-            decode_req.kv_receiver = None
+            self._release_kv_receiver(decode_req)
             return
         elif actual_room != expected_room:
             # Real corruption detected (mismatch)
@@ -1655,8 +1658,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 "Metadata corruption detected - bootstrap_room mismatch",
                 status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
             )
-            decode_req.kv_receiver.clear()
-            decode_req.kv_receiver = None
+            self._release_kv_receiver(decode_req)
             return
 
         self._commit_hicache_local_restore_to_req(decode_req)
@@ -1720,8 +1722,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 ].tolist()
             )
 
-        decode_req.kv_receiver.clear()
-        decode_req.kv_receiver = None
+        self._release_kv_receiver(decode_req)
         decode_req.req.time_stats.set_wait_queue_entry_time()
         return
 
@@ -1818,8 +1819,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     self.scheduler.hisparse_coordinator.request_finished(decode_req.req)
                 # release pre-allocated kv cache, but don't insert into the tree since it's failed
                 release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
-                decode_req.kv_receiver.clear()
-                decode_req.kv_receiver = None
+                self._release_kv_receiver(decode_req)
                 indices_to_remove.add(i)
                 if self.scheduler.metrics_reporter.enable_metrics:
                     self.scheduler.metrics_collector.increment_transfer_failed_reqs()

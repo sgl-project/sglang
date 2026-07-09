@@ -4,6 +4,7 @@ from unittest.mock import MagicMock, patch
 
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.decode import (
+    DecodeRequest,
     DecodePreallocQueue,
     DecodeTransferQueue,
     HiCacheRestoreResult,
@@ -29,7 +30,9 @@ class FakeReceiver:
 
 
 class TestDecodeQueueCleanup(CustomTestCase):
-    def test_prealloc_abort_clears_receiver_before_removing_request(self):
+    def test_given_pending_prealloc_abort_when_popping_then_receiver_is_released_and_pending_request_is_removed(
+        self,
+    ):
         receiver = FakeReceiver()
         req = SimpleNamespace(
             rid="abort-prealloc",
@@ -40,7 +43,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
 
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
         queue.queue = [decode_req]
-        queue.pending_reqs = []
+        queue.pending_reqs = [decode_req]
         queue.retracted_queue = []
         queue._resolve_pending_reqs = MagicMock()
         queue._update_handshake_waiters = MagicMock()
@@ -60,75 +63,32 @@ class TestDecodeQueueCleanup(CustomTestCase):
         self.assertEqual(preallocated, [])
         self.assertEqual(failed, [decode_req])
         self.assertEqual(queue.queue, [])
+        self.assertEqual(queue.pending_reqs, [])
         self.assertTrue(receiver.clear_called)
         self.assertIsNone(decode_req.kv_receiver)
         scheduler.output_streamer.stream_output.assert_called_once_with(
             [req], req.return_logprob
         )
 
-    def test_prealloc_abort_also_drops_from_pending_reqs(self):
-        # Same DecodeRequest lives in both queue and pending_reqs (add() slow
-        # path). Aborting must drop it from both, and compare by identity since
-        # DecodeRequest's dataclass __eq__ would compare the tensor receiver.
-        class BadEqReceiver(FakeReceiver):
-            def __eq__(self, other):
-                raise TypeError("use identity comparison, not value equality")
-
-            __hash__ = object.__hash__
-
-        receiver = BadEqReceiver()
-        req = SimpleNamespace(
-            rid="abort-shared",
-            finished_reason=FINISH_ABORT("aborted"),
-            return_logprob=False,
-        )
-        decode_req = SimpleNamespace(req=req, kv_receiver=receiver)
+    def test_given_equal_pending_requests_when_releasing_receiver_then_only_same_object_is_removed(
+        self,
+    ):
+        receiver = FakeReceiver()
+        req = SimpleNamespace(rid="release-by-identity")
+        decode_req = DecodeRequest(req=req, kv_receiver=receiver)
+        equal_decode_req = DecodeRequest(req=req, kv_receiver=receiver)
 
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
-        queue.queue = [decode_req]
-        queue.pending_reqs = [decode_req]  # same object, dual ownership
-        queue.retracted_queue = []
-        queue._resolve_pending_reqs = MagicMock()
-        queue._update_handshake_waiters = MagicMock()
-        queue._uses_swa_tail_prealloc = MagicMock(return_value=False)
-        queue._allocatable_token_budgets = MagicMock(return_value=0)
-        queue._hicache_pending_restore_tokens = MagicMock(return_value=0)
+        queue.pending_reqs = [equal_decode_req, decode_req]
 
-        scheduler = MagicMock()
-        scheduler.running_batch.reqs = []
-        scheduler.enable_priority_scheduling = False
-        scheduler.enable_hisparse = False
-        scheduler.output_streamer = MagicMock()
-        queue.scheduler = scheduler
+        self.assertEqual(equal_decode_req, decode_req)
 
-        # Must not raise on the receiver __eq__ above.
-        preallocated, failed = queue.pop_preallocated()
+        queue._release_kv_receiver(decode_req)
 
-        self.assertEqual(preallocated, [])
-        self.assertEqual(failed, [decode_req])
-        self.assertEqual(queue.queue, [])
-        self.assertTrue(all(r is not decode_req for r in queue.pending_reqs))
+        self.assertEqual(queue.pending_reqs, [equal_decode_req])
+        self.assertIs(queue.pending_reqs[0], equal_decode_req)
+        self.assertTrue(receiver.clear_called)
         self.assertIsNone(decode_req.kv_receiver)
-
-    def test_ensure_prefill_info_tolerates_cleared_receiver(self):
-        # A req whose kv_receiver was already cleared must not crash on .abort().
-        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
-        queue._max_ensure_retries = 1
-        queue._ensure_retry_interval = 0
-        queue._ensure_retry_count = {"127.0.0.1:11500": 0}
-        queue._ensure_last_attempt_time = {}
-        queue.kv_manager = MagicMock()
-        queue.kv_manager.try_ensure_parallel_info.return_value = False
-
-        cleared_req = SimpleNamespace(
-            req=SimpleNamespace(rid="cleared"), kv_receiver=None
-        )
-        addr_to_reqs = {"127.0.0.1:11500": [cleared_req]}
-
-        ready, remaining = queue._ensure_prefill_info(addr_to_reqs)
-
-        self.assertEqual(ready, {})
-        self.assertEqual(remaining, [])
 
     @patch("sglang.srt.disaggregation.decode.release_kv_cache")
     @patch("sglang.srt.disaggregation.decode.prepare_abort")
