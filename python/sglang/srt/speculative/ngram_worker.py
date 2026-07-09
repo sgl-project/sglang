@@ -26,7 +26,10 @@ from sglang.srt.speculative.spec_utils import (
     prepare_mamba_track_for_verify,
     record_stream_for_v2_verify,
 )
+from sglang.srt.utils import is_cpu
 from sglang.srt.utils.async_probe import maybe_detect_inf, maybe_detect_nan
+
+_is_cpu = is_cpu()
 
 logger = logging.getLogger(__name__)
 
@@ -68,7 +71,7 @@ class NGRAMWorker(BaseSpecWorker):
         self.speculative_num_steps = server_args.speculative_num_steps
         # req_to_token_pool / token_to_kv_pool_allocator are set in
         # alloc_memory_pool(), after the target pools are allocated.
-        self.device = f"cuda:{gpu_id}" if gpu_id >= 0 else "cuda"
+        self.device = server_args.device
 
         self.adaptive_controller = None
         # rids of the last decode batch; used to erase corpus match state for
@@ -298,7 +301,7 @@ class NGRAMWorker(BaseSpecWorker):
 
         # NOTE: QLEN_MASK is faster than FULL_MASK, but requires corresponding changes in flashinfer.
         # Testing shows about 8% performance improvement (the effect is roughly proportional to batch size).
-        if USE_FULL_MASK:
+        if USE_FULL_MASK and not _is_cpu:
             tree_mask = []
             mask = mask.reshape(bs, self.draft_token_num, self.draft_token_num)
             # TODO(siyuan): the for loop here leads to significant overhead in large batch size. Can be written into a kernel.

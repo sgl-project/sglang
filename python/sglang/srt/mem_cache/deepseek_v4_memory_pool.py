@@ -21,7 +21,7 @@ from sglang.srt.layers.attention.dsv4.index_buf_accessor import NopeFp8RopeBf16P
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.memory_pool import KVCache
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import ceil_div, is_hip
 
 logger = logging.getLogger(__name__)
@@ -276,7 +276,7 @@ class DeepSeekV4IndexerPool(KVCache):
             end_layer,
         )
         self.index_head_dim = index_head_dim
-        self.use_fp4_indexer = get_global_server_args().enable_deepseek_v4_fp4_indexer
+        self.use_fp4_indexer = get_server_args().enable_deepseek_v4_fp4_indexer
 
         self._create_buffer()
 
@@ -569,7 +569,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             self.swa_kv_pool = None
             self.c4_kv_pool = None
             self.c128_kv_pool = None
-            server_args = get_global_server_args()
+            server_args = get_server_args()
             spec_extra = (
                 (server_args.speculative_num_draft_tokens - 1)
                 if server_args.speculative_algorithm is not None
@@ -651,7 +651,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         self.full_to_swa_index_mapping = full_to_swa_index_mapping
 
     def get_ring_size(self, compress_ratio: int) -> int:
-        server_args = get_global_server_args()
+        server_args = get_server_args()
         is_speculative = server_args.speculative_algorithm is not None
         return get_compress_state_ring_size(compress_ratio, is_speculative)
 

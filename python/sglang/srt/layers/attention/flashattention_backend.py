@@ -28,7 +28,7 @@ from sglang.srt.layers.utils.cp_utils import (
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_server_args
 from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 from sglang.srt.utils import get_compiler_backend
 
@@ -43,6 +43,10 @@ from sglang.jit_kernel.flash_attention import (
     flash_attn_with_kvcache,
 )
 from sglang.srt.model_executor.cuda_graph_config import cuda_graph_fully_disabled
+
+
+def _should_disable_scheduler_metadata_precompute(server_args) -> bool:
+    return bool(server_args.enable_prefill_cp or server_args.enable_dp_attention)
 
 
 @triton.jit
@@ -361,14 +365,13 @@ class FlashAttentionBackend(AttentionBackend):
             and not self.use_mla
         )
 
-        # Skip the FA3 scheduler_metadata precompute (PR #21104) under DP
-        # attention. The precomputed buffer can become inconsistent with the
-        # num_splits the C++ mha_fwd kernel derives from live cache_seqlens
-        # during decode, leading to an OOB read in the split-KV combine kernel
-        # (flash_fwd_combine_launch_template.h:52). Leaving scheduler_metadata
-        # unset uses the existing per-layer metadata path.
-        self._disable_scheduler_metadata_precompute = bool(
-            getattr(server_args, "enable_dp_attention", False)
+        # Skip the FA3 scheduler_metadata precompute (PR #21104) when distributed
+        # attention modes can change live cache_seqlens/num_splits across ranks.
+        # A stale precomputed buffer can lead to an OOB read in the split-KV
+        # combine kernel (flash_fwd_combine_launch_template.h:52). Leaving
+        # scheduler_metadata unset uses the existing per-layer metadata path.
+        self._disable_scheduler_metadata_precompute = (
+            _should_disable_scheduler_metadata_precompute(server_args)
         )
 
     def _compute_scheduler_metadata(
@@ -1339,7 +1342,7 @@ class FlashAttentionBackend(AttentionBackend):
             ):
                 # Do multi-head attention with chunked prefix cache
                 if forward_batch.attn_attend_prefix_cache:
-                    assert not get_global_server_args().disable_chunked_prefix_cache
+                    assert not get_server_args().disable_chunked_prefix_cache
                     # MHA for chunked prefix kv cache when running model with MLA
                     assert forward_batch.prefix_chunk_idx is not None
                     assert forward_batch.prefix_chunk_cu_seq_lens is not None
