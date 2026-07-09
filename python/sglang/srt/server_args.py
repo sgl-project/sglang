@@ -916,6 +916,11 @@ class ServerArgs:
             choices=("zigzag", "interleave"),
         ),
     ] = None
+    # Split DSA GPU KV/indexer cache layers across CP ranks.
+    enable_dsa_cache_layer_split: A[
+        bool,
+        "Split DSA (DeepSeek Sparse Attention) GPU KV/indexer cache layers across context-parallel ranks to reduce per-rank KV memory. Currently only supported with the mooncake transfer backend (mooncake / mooncake_tcp); mori/nixl support will be added later by the community.",
+    ] = False
     enable_dsa_prefill_context_parallel: A[bool, Arg(no_cli=True)] = False
     dsa_prefill_cp_mode: A[str, Arg(no_cli=True)] = "round-robin-split"
     enable_prefill_context_parallel: A[bool, Arg(no_cli=True)] = False
@@ -4058,6 +4063,12 @@ class ServerArgs:
         hf_config = self.get_model_config().hf_config
         model_arch = hf_config.architectures[0]
 
+        if self.enable_dsa_cache_layer_split and not is_deepseek_dsa(hf_config):
+            raise ValueError(
+                "--enable-dsa-cache-layer-split is only supported for DSA "
+                "(DeepSeek Sparse Attention) models."
+            )
+
         _hybrid_spec = get_linear_attn_spec_by_arch(model_arch)
         if _hybrid_spec is not None and _hybrid_spec.uses_mamba_radix_cache:
             self._handle_mamba_radix_cache(model_arch=model_arch)
@@ -4158,6 +4169,52 @@ class ServerArgs:
                     assert (
                         self.disaggregation_mode != "decode"
                     ), "CP is only supported for prefill when PD disaggregation, please remove --enable-prefill-cp."
+                if (
+                    self.enable_dsa_cache_layer_split
+                    and self.disaggregation_mode != "prefill"
+                ):
+                    if self.disaggregation_mode == "decode":
+                        raise ValueError(
+                            "--enable-dsa-cache-layer-split is not supported on "
+                            "decode workers. This flag is a prefill-CP "
+                            "optimization; decode receives full cache shards "
+                            "through PD transfer."
+                        )
+                    raise ValueError(
+                        "--enable-dsa-cache-layer-split is only supported on PD "
+                        "prefill workers. Non-PD workers also run decode and "
+                        "require ordinary local decode cache semantics."
+                    )
+                if self.enable_dsa_cache_layer_split and (
+                    not self.enable_prefill_cp or self.cp_strategy != "interleave"
+                ):
+                    raise ValueError(
+                        "--enable-dsa-cache-layer-split requires "
+                        "--enable-prefill-cp and --cp-strategy interleave "
+                        "(or legacy --enable-nsa-prefill-context-parallel with "
+                        "--nsa-prefill-cp-mode round-robin-split)."
+                    )
+                # Layer split relies on the mooncake all-CP-rank KV/indexer
+                # transfer path. mori/nixl support is a temporary limitation
+                # and will be added later by the community.
+                if (
+                    self.enable_dsa_cache_layer_split
+                    and self.disaggregation_transfer_backend != "mooncake"
+                ):
+                    raise ValueError(
+                        "--enable-dsa-cache-layer-split currently only supports "
+                        "the mooncake transfer backend (mooncake / mooncake_tcp). "
+                        f"Got --disaggregation-transfer-backend "
+                        f"{self.disaggregation_transfer_backend!r}. mori/nixl "
+                        "support will be added later by the community."
+                    )
+                if self.enable_dsa_cache_layer_split and self.pp_size > 1:
+                    raise ValueError(
+                        "--enable-dsa-cache-layer-split is not supported with "
+                        "pipeline parallelism (pp_size > 1) yet. It requires "
+                        "prefill context parallelism, and CP + PP has not been "
+                        "validated for this feature."
+                    )
 
             else:
                 # DeepSeek V3/R1/V3.1
