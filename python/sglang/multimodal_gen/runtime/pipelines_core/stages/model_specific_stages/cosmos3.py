@@ -398,11 +398,21 @@ class Cosmos3TimestepPreparationStage(PipelineStage, RolloutTimestepPreparationM
         rollout_template = self._resolve_rollout_scheduler(batch)
         if rollout_template is not None:
             scheduler = get_or_create_request_scheduler(batch, rollout_template)
-            # Reuse the serving scheduler's sigma grid (sans terminal sigma) so
-            # rollout noise levels match serving exactly, whatever the grid.
-            scheduler.set_timesteps(
-                sigmas=self.scheduler.sigmas[:-1].tolist(), device=device
-            )
+            explicit_shift = getattr(batch, "flow_shift", None)
+            if explicit_shift is None:
+                explicit_shift = server_args.pipeline_config.flow_shift
+            if explicit_shift is not None:
+                # An explicit flow_shift selects a plain shifted grid — the
+                # checkpoint's karras schedule ignores flow_shift entirely,
+                # and its dense head starves the RL gradient (dt ~ 1e-3).
+                scheduler.set_shift(float(explicit_shift))
+                scheduler.set_timesteps(num_inference_steps, device=device)
+            else:
+                # Reuse the serving scheduler's sigma grid (sans terminal
+                # sigma) so rollout noise levels match serving exactly.
+                scheduler.set_timesteps(
+                    sigmas=self.scheduler.sigmas[:-1].tolist(), device=device
+                )
             batch.timesteps = scheduler.timesteps
             self._check_rollout_timesteps(scheduler)
 
