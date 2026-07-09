@@ -18,6 +18,12 @@ import triton.language as tl
 from sglang.srt.utils import is_npu
 
 _is_npu = is_npu()
+from sglang.srt.utils import is_cpu
+
+_is_cpu = is_cpu()
+
+if _is_cpu:
+    from sgl_kernel import rotate_input_ids_cpu
 
 
 @triton.jit
@@ -57,9 +63,19 @@ def rotate_input_ids_kernel(
         tl.store(last_pos_ptr, new_token)
 
 
-def rotate_input_ids_triton(
+def rotate_input_ids(
     input_ids, extend_start_loc, extend_seq_lens, topk_index, select_index=None
 ):
+    if _is_cpu:
+        rotate_input_ids_cpu(
+            input_ids,
+            extend_start_loc,
+            extend_seq_lens,
+            topk_index,
+            select_index,
+        )
+        return input_ids
+
     batch_size = extend_seq_lens.shape[0]
 
     # rotate_input_ids_triton skipped: batch_size=0 (empty extend_seq_lens).
