@@ -24,9 +24,7 @@ def _shift_out_of_place(input_ids, extend_lens, tail_tokens):
     pt = 0
     for i, extend_len in enumerate(extend_lens):
         chunk = input_ids[pt : pt + extend_len]
-        new_input_ids_parts.append(
-            torch.cat((chunk[1:], tail_tokens[i].reshape(1)))
-        )
+        new_input_ids_parts.append(torch.cat((chunk[1:], tail_tokens[i].reshape(1))))
         pt += extend_len
     assert pt == input_ids.numel()
     return torch.cat(new_input_ids_parts)
