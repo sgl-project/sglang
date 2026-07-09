@@ -625,14 +625,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         cls,
         batch: ScheduleBatch,
         model_runner: ModelRunner,
+        *,
+        capture_hidden_mode: Optional[CaptureHiddenMode] = None,
+        return_hidden_states_before_norm: bool = False,
     ):
-        # Consume one-shot per-forward overrides from SB; reset to defaults so
-        # the next forward on the same SB starts clean. See SB field comment
-        # for the contract.
-        capture_hidden_mode = batch.capture_hidden_mode
-        batch.capture_hidden_mode = None
-        return_hidden_states_before_norm = batch.return_hidden_states_before_norm
-        batch.return_hidden_states_before_norm = False
+        # init_new must not mutate the input ScheduleBatch; per-forward
+        # overrides go through explicit keyword arguments.
 
         # capture_hidden_mode default: derive from SB.return_hidden_states /
         # spec_info.capture_hidden_mode when caller did not override.

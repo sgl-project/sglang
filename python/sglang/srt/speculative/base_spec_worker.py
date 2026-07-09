@@ -97,6 +97,8 @@ class EagleDraftWorkerBase(ABC):
         num_draft_tokens: int,
         draft_model_runner: Any,
         cuda_graph_runner: Any,
+        *,
+        return_hidden_states_before_norm: bool = False,
     ):
         from sglang.srt.model_executor.forward_batch_info import (
             CaptureHiddenMode,
@@ -144,8 +146,12 @@ class EagleDraftWorkerBase(ABC):
             if batch.forward_mode.is_idle()
             else ForwardMode.DRAFT_EXTEND_V2
         )
-        batch.capture_hidden_mode = capture_mode
-        forward_batch = ForwardBatch.init_new(batch, draft_model_runner)
+        forward_batch = ForwardBatch.init_new(
+            batch,
+            draft_model_runner,
+            capture_hidden_mode=capture_mode,
+            return_hidden_states_before_norm=return_hidden_states_before_norm,
+        )
         # Forward sees post-write length (draft extend writes num_draft_tokens
         # slots); mutation stays on forward_batch to preserve SB.seq_lens.
         forward_batch.seq_lens = forward_batch.seq_lens + num_draft_tokens
@@ -263,8 +269,9 @@ class EagleDraftWorkerBase(ABC):
             else CaptureHiddenMode.LAST
         )
         draft_input.positions = batch.seq_lens.repeat_interleave(topk, dim=0)
-        batch.capture_hidden_mode = capture_mode
-        forward_batch = ForwardBatch.init_new(batch, draft_model_runner)
+        forward_batch = ForwardBatch.init_new(
+            batch, draft_model_runner, capture_hidden_mode=capture_mode
+        )
         can_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run_graph(
             forward_batch
         )

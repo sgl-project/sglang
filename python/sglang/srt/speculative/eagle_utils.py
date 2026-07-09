@@ -513,8 +513,9 @@ def eagle_prepare_for_verify(
         if target_worker.model_runner.spec_algorithm.is_standalone()
         else CaptureHiddenMode.FULL
     )
-    batch.capture_hidden_mode = capture_mode
-    verify_forward_batch = ForwardBatch.init_new(batch, target_worker.model_runner)
+    verify_forward_batch = ForwardBatch.init_new(
+        batch, target_worker.model_runner, capture_hidden_mode=capture_mode
+    )
 
     # Run attention backend plan and cuda graph preparation
     can_run_cuda_graph = bool(

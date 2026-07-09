@@ -26,7 +26,11 @@ from sglang.srt.hardware_backend.mlx.model_runner import (
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.utils import GenerationBatchResult
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    PPProxyTensors,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -99,6 +103,8 @@ class MlxTpModelWorker(TpModelWorker):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
         is_verify: bool = False,
         skip_attn_backend_init: Optional[bool] = None,  # deprecated
+        *,
+        capture_hidden_mode: Optional[CaptureHiddenMode] = None,
     ) -> GenerationBatchResult:
         """Override to route through MLX model runner."""
         if batch is not None:
@@ -112,6 +118,7 @@ class MlxTpModelWorker(TpModelWorker):
             pp_proxy_tensors,
             is_verify,
             skip_attn_backend_init,
+            capture_hidden_mode=capture_hidden_mode,
         )
 
     def _cleanup_stale_rids(self, forward_mode, current_rids: set[str]) -> None:
