@@ -37,6 +37,14 @@ Hard lines ("prep" below = the prepare phase):
   logic, restructuring control flow, redesigning an API → its **own commit**, reviewed for
   **equivalence** (tests or a written argument). Never smuggled into prep as a "small
   reshape".
+- **"Semantic" is not banned from prepare — oversized or hidden semantics are.** prepare's
+  own edits *are* meaning-carrying (de-self, retype-`self`, co-locating bookkeeping);
+  "minimal" caps their **size**, it does not forbid semantics. The two bans are narrower:
+  (1) no semantic change inside the **move** commit — the move is a pure relocation; and
+  (2) don't pass a **large** reshape off as a trivial "small reshape" to dodge the
+  equivalence review. A large but honestly-labeled, equivalence-reviewed reshape placed
+  *before* the move is legitimate — that is exactly what "its own commit" means, and it
+  may serve as the prepare.
 
 - The prep's shape depends on the destination: a module-level function (§3.1) or a class
   (§3.2).
