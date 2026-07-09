@@ -29,10 +29,10 @@ from sglang.srt.configs.model_config import (
     is_minimax_sparse,
 )
 from sglang.srt.environ import envs
-from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.mem_cache.common import get_alloc_len_per_decode
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import get_compress_state_ring_size
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.common import (
     ceil_align,
     ceil_div,
@@ -176,14 +176,21 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         # args to config cell size
         model_config = mr.model_config
         kv_cache_dtype = mr.kv_cache_dtype
+        from sglang.srt.layers.cp.utils import (
+            get_glm_dsa_layer_split_effective_num_layers,
+        )
+
+        effective_num_layers = get_glm_dsa_layer_split_effective_num_layers(
+            mr, num_layers
+        )
 
         kv_size = torch._utils._element_size(kv_cache_dtype)
-        tp_size = get_attention_tp_size()
+        tp_size = get_parallel().attn_tp_size
 
         if mr.use_mla_backend:
             cell_size = (
                 (model_config.kv_lora_rank + model_config.qk_rope_head_dim)
-                * num_layers
+                * effective_num_layers
                 * kv_size
             )
             if is_float4_e2m1fn_x2(kv_cache_dtype):
@@ -194,7 +201,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                         (model_config.kv_lora_rank + model_config.qk_rope_head_dim)
                         // scale_block_size
                     )
-                    * num_layers
+                    * effective_num_layers
                     * kv_size
                 )
 
@@ -208,7 +215,9 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 element_size = torch._utils._element_size(
                     DSATokenToKVPool.index_k_with_scale_buffer_dtype
                 )
-                cell_size += indexer_size_per_token * num_layers * element_size
+                cell_size += (
+                    indexer_size_per_token * effective_num_layers * element_size
+                )
         elif is_minimax_sparse(model_config.hf_config):
             # Mirrors MiniMaxSparseKVPool: main pool (K+V all layers) + indexer pool
             # (sparse-only, single-head; kv layers store K+V, k-only layers store K).
@@ -231,7 +240,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             )
             num_indexer_kv = num_sparse - num_indexer_k_only
 
-            kv_heads = model_config.get_num_kv_heads(get_attention_tp_size())
+            kv_heads = model_config.get_num_kv_heads(get_parallel().attn_tp_size)
             head_dim = model_config.head_dim
             indexer_head_dim = sparse_cfg["sparse_index_dim"]
             indexer_dtype_size = torch._utils._element_size(mr.dtype)
@@ -251,7 +260,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             cell_size = (
                 model_config.get_num_kv_heads(tp_size)
                 * (model_config.head_dim + model_config.v_head_dim)
-                * num_layers
+                * effective_num_layers
                 * kv_size
             )
 
@@ -261,7 +270,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 n = model_config.get_num_kv_heads(tp_size)
                 k = model_config.head_dim
                 cell_size = (cell_size // 2) + (
-                    (n * k * num_layers * 2 * kv_size) // scale_block_size
+                    (n * k * effective_num_layers * 2 * kv_size) // scale_block_size
                 )
 
         return cell_size
@@ -291,7 +300,7 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         model_config = mr.model_config
         kv_cache_dtype = mr.kv_cache_dtype
         kv_size = torch._utils._element_size(kv_cache_dtype)
-        tp_size = get_attention_tp_size()
+        tp_size = get_parallel().attn_tp_size
 
         self._full_layers_num = len(model_config.full_attention_layer_ids)
         self._swa_layers_num = len(model_config.swa_attention_layer_ids)

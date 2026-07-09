@@ -651,13 +651,13 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
         )
 
     if threshold_single is None:
-        from sglang.srt.server_args import get_global_server_args
+        from sglang.srt.runtime_context import get_server_args
 
-        threshold_single = get_global_server_args().speculative_accept_threshold_single
+        threshold_single = get_server_args().speculative_accept_threshold_single
     if threshold_acc is None:
-        from sglang.srt.server_args import get_global_server_args
+        from sglang.srt.runtime_context import get_server_args
 
-        threshold_acc = get_global_server_args().speculative_accept_threshold_acc
+        threshold_acc = get_server_args().speculative_accept_threshold_acc
     threshold_single = float(threshold_single)
     threshold_acc = max(float(threshold_acc), 1e-9)
 

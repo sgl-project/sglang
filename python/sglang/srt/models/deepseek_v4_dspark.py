@@ -11,7 +11,6 @@ from torch import nn
 from sglang.jit_kernel.dsv4 import fused_q_norm_rope, fused_rope_inplace
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.environ import envs
-from sglang.srt.layers.dp_attention import get_attention_tp_group
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -341,7 +340,7 @@ class DSparkV4MarkovHead(nn.Module):
                 f"num_embeddings_per_partition({per_partition}) * tp_size({tp_size}) != "
                 f"num_embeddings_padded({num_padded})."
             )
-        attn_tp_size = get_attention_tp_group().world_size
+        attn_tp_size = get_parallel().attn_tp_group.world_size
         if attn_tp_size != tp_size:
             raise ValueError(
                 "DSpark markov_w2 TP-shard needs the attn-TP group (used for the per-step "
@@ -403,7 +402,7 @@ class DSparkV4MarkovHead(nn.Module):
             bias = F.linear(latent.float(), weight_local)
         step_local = BuildStepLocal.execute(bias=bias, base_local=base_local)
         if shard.tp_size > 1:
-            full = get_attention_tp_group().all_gather(step_local, dim=-1)
+            full = get_parallel().attn_tp_group.all_gather(step_local, dim=-1)
         else:
             full = step_local
         return full[..., : self.vocab_size]

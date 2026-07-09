@@ -7,10 +7,10 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 import torch
 
 import sglang.srt.sampling.penaltylib as penaltylib
+from sglang.srt.runtime_context import get_server_args
 from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
 from sglang.srt.sampling.penaltylib.repetition_penalty import apply_scaling_penalties
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
-from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils.common import is_pin_memory_available
 
 if TYPE_CHECKING:
@@ -77,7 +77,7 @@ class SamplingBatchInfo:
 
     @classmethod
     def from_schedule_batch(cls, batch: ScheduleBatch, vocab_size: int):
-        global_server_args = get_global_server_args()
+        global_server_args = get_server_args()
         enable_deterministic = global_server_args.enable_deterministic_inference
 
         reqs = batch.reqs

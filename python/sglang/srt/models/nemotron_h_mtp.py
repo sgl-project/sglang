@@ -21,7 +21,6 @@ from sglang.srt.configs import NemotronHConfig
 from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_reduce,
-    get_attention_tp_group,
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layernorm import RMSNorm
@@ -104,7 +103,7 @@ class NemotronHMTPAttentionDecoderLayer(NemotronHAttentionDecoderLayer):
             )
             hidden_states, _ = self.eh_proj(fused)
             if is_dp_attention_enabled():
-                hidden_states = get_attention_tp_group().all_gather(
+                hidden_states = get_parallel().attn_tp_group.all_gather(
                     hidden_states, dim=-1
                 )
 
@@ -190,7 +189,7 @@ class NemotronHMTPMoEDecoderLayer(NemotronHMoEDecoderLayer):
             )
             hidden_states, _ = self.eh_proj(fused)
             if is_dp_attention_enabled():
-                hidden_states = get_attention_tp_group().all_gather(
+                hidden_states = get_parallel().attn_tp_group.all_gather(
                     hidden_states, dim=-1
                 )
 

@@ -5,7 +5,6 @@ from typing import Optional
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.dp_attention import get_attention_tp_group
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -14,6 +13,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     compute_position,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
@@ -393,7 +393,7 @@ class DSparkWorkerV2(BaseSpecWorker):
 
     def _draft_context(self):
         if self._draft_dp_context_enabled:
-            return draft_tp_context(get_attention_tp_group())
+            return draft_tp_context(get_parallel().attn_tp_group)
         return nullcontext()
 
     def alloc_memory_pool(

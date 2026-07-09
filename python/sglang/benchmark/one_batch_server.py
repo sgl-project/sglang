@@ -19,6 +19,7 @@ import json
 import random
 import re
 import time
+from functools import lru_cache
 from types import SimpleNamespace
 from typing import Callable, List, Optional, Tuple
 
@@ -122,7 +123,7 @@ class BenchArgs:
     dataset_path: str = ""
     dataset_name: str = "random"
     fixed_prompt_file: str = ""
-    fixed_prompt_apply_chat_template: bool = False
+    apply_chat_template: bool = False
     gsp_num_groups: int = 1
     gsp_system_prompt_len: int = 2048
     gsp_question_len: int = 128
@@ -224,17 +225,14 @@ class BenchArgs:
             "--fixed-prompt-file",
             type=str,
             default=BenchArgs.fixed_prompt_file,
-            help="If set, every request in the batch uses this file's prompt "
-            "(tokenized, replicated batch_size times) instead of --dataset-name, "
-            "so the accept length is a controlled constant across bs and arms.",
+            help="Use this file's prompt for every request in the batch, "
+            "bypassing --dataset-name.",
         )
         parser.add_argument(
-            "--fixed-prompt-apply-chat-template",
+            "--apply-chat-template",
             action="store_true",
-            help="Encode --fixed-prompt-file through the DeepSeek-V4 chat encoder "
-            "(encoding_dsv4) as a single user message, instead of raw tokenization, "
-            "so the accept length matches the /v1/chat/completions serving "
-            "distribution. Only DeepseekV4 models are supported (asserted at start).",
+            help="Encode the prompt as a single user message through the "
+            "model's chat template. Requires --fixed-prompt-file.",
         )
         parser.add_argument(
             "--gsp-num-groups",
@@ -378,8 +376,6 @@ class BenchOneCaseResult(BaseModel):
     last_ttft: float
     last_gen_throughput: float
     acc_length: float
-    iter_time: float = -1.0
-    n_decode_steps: int = 0
     cache_hit_rate: Optional[float] = None
     profile_link: Optional[str] = None
 
@@ -397,8 +393,6 @@ class BenchOneCaseResult(BaseModel):
                 "last_ttft": round(self.last_ttft, 4),
                 "last_gen_throughput": round(self.last_gen_throughput, 2),
                 "acc_length": round(self.acc_length, 2),
-                "iter_time": round(self.iter_time, 6),
-                "n_decode_steps": self.n_decode_steps,
                 "cache_hit_rate": (
                     round(self.cache_hit_rate, 4)
                     if self.cache_hit_rate is not None
@@ -489,16 +483,21 @@ def _flush_cache_with_retry(url: str, endpoint: str, max_retries: int = 3):
         time.sleep(2)
 
 
-def _assert_fixed_prompt_chat_template_supported(tokenizer_source: str) -> None:
+@lru_cache(maxsize=None)
+def _load_hf_config(name_or_path: str):
+    if not name_or_path:
+        return None
+
     from transformers import AutoConfig
 
-    hf_config = AutoConfig.from_pretrained(tokenizer_source, trust_remote_code=True)
-    architectures = hf_config.architectures or []
-    arch = architectures[0] if architectures else ""
-    assert "DeepseekV4" in arch, (
-        f"--fixed-prompt-apply-chat-template only supports DeepseekV4 models, "
-        f"got architecture {arch!r}"
-    )
+    try:
+        return AutoConfig.from_pretrained(name_or_path, trust_remote_code=True)
+    except Exception as e:
+        print(
+            f"Warning: could not load config for {name_or_path!r} ({e}); "
+            "falling back to the HF chat template for --apply-chat-template."
+        )
+        return None
 
 
 def _encode_fixed_prompt(
@@ -507,11 +506,22 @@ def _encode_fixed_prompt(
     if not apply_chat_template:
         return tok_inner.encode(prompt_text)
 
-    from sglang.srt.entrypoints.openai import encoding_dsv4
+    from sglang.srt.entrypoints.openai.chat_encoding import (
+        encode_simple_chat,
+        resolve_chat_encoding_spec,
+    )
 
-    messages = [{"role": "user", "content": prompt_text}]
-    real_input = encoding_dsv4.encode_messages(messages, thinking_mode="chat")
-    return tok_inner.encode(real_input)
+    hf_config = _load_hf_config(getattr(tok_inner, "name_or_path", "") or "")
+    spec = (
+        resolve_chat_encoding_spec(hf_config=hf_config, tokenizer=tok_inner)
+        if hf_config is not None
+        else None
+    )
+    return encode_simple_chat(
+        tokenizer=tok_inner,
+        spec=spec,
+        messages=[{"role": "user", "content": prompt_text}],
+    )
 
 
 def run_one_case(
@@ -564,6 +574,7 @@ def run_one_case(
         input_len = len(prompt_ids)
         image_data = None
     else:
+        # Load input token ids via benchmark.datasets.get_dataset
         supported_datasets = ("random", "random-ids", "mmmu", "generated-shared-prefix")
         if dataset_name not in supported_datasets:
             raise ValueError(
@@ -588,6 +599,8 @@ def run_one_case(
             gsp_system_prompt_len=gsp_system_prompt_len,
             gsp_question_len=gsp_question_len,
             gsp_output_len=gsp_output_len,
+            # The generated-shared-prefix dataset's from_args requires these; the
+            # batch-bench path only ever uses the uniform group distribution.
             gsp_group_distribution="uniform",
             gsp_zipf_alpha=None,
         )
@@ -782,14 +795,6 @@ def run_one_case(
                 internal_state.get("last_gen_throughput", None) or last_gen_throughput
             )
 
-    n_decode_steps = 0
-    iter_time = -1.0
-    decode_wall = latency - last_ttft
-    if acc_length > 0 and output_len > 1 and decode_wall > 0:
-        steps = output_len / acc_length
-        iter_time = decode_wall / steps
-        n_decode_steps = round(steps)
-
     # Calculate cache hit rate from before/after metrics delta
     metrics_after = get_cache_tokens_from_metrics(url)
     metrics_cache_hit_rate = calculate_cache_hit_rate(metrics_before, metrics_after)
@@ -822,13 +827,9 @@ def run_one_case(
         last_ttft=last_ttft,
         last_gen_throughput=last_gen_throughput,
         acc_length=acc_length,
-        iter_time=iter_time,
-        n_decode_steps=n_decode_steps,
         cache_hit_rate=metrics_cache_hit_rate,
         profile_link=profile_link,
     )
-    if iter_time > 0:
-        print(f"iter_time: {iter_time*1e3:.3f} ms/step ({n_decode_steps} steps)")
 
     # Save and return the results
     if result_filename:
@@ -1052,11 +1053,12 @@ def run_benchmark_internal(
         bench_args.lora_zipf_alpha > 1
     ), f"--lora-zipf-alpha must be > 1, got {bench_args.lora_zipf_alpha}"
 
-    if bench_args.fixed_prompt_apply_chat_template:
-        tokenizer_source = (
-            model_name if bench_args.backend == "vllm" else tokenizer_path
+    if bench_args.apply_chat_template and not bench_args.fixed_prompt_file:
+        raise ValueError(
+            "--apply-chat-template requires --fixed-prompt-file: the other "
+            "datasets generate token ids directly, so there is no prompt text "
+            "to run through a chat template."
         )
-        _assert_fixed_prompt_chat_template_supported(tokenizer_source)
 
     gsp_kwargs = dict(
         gsp_num_groups=bench_args.gsp_num_groups,
@@ -1093,7 +1095,7 @@ def run_benchmark_internal(
                 lora_request_distribution=bench_args.lora_request_distribution,
                 lora_zipf_alpha=bench_args.lora_zipf_alpha,
                 fixed_prompt_file=bench_args.fixed_prompt_file,
-                apply_chat_template=bench_args.fixed_prompt_apply_chat_template,
+                apply_chat_template=bench_args.apply_chat_template,
                 **gsp_kwargs,
             )
         print("=" * 8 + " Warmup End   " + "=" * 8 + "\n")
@@ -1138,7 +1140,7 @@ def run_benchmark_internal(
                     lora_request_distribution=bench_args.lora_request_distribution,
                     lora_zipf_alpha=bench_args.lora_zipf_alpha,
                     fixed_prompt_file=bench_args.fixed_prompt_file,
-                    apply_chat_template=bench_args.fixed_prompt_apply_chat_template,
+                    apply_chat_template=bench_args.apply_chat_template,
                     **gsp_kwargs,
                 )
             )

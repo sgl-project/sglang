@@ -37,7 +37,6 @@ from torch.profiler import ProfilerActivity, profile
 
 from sglang.srt.compilation import torch_compile_decoration
 from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
-from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.distributed.parallel_state import (
     graph_capture,
     set_pdmux_status,
@@ -47,8 +46,6 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
-    get_attention_tp_rank,
-    get_attention_tp_size,
     set_dp_buffer_len,
     set_is_extend_in_batch,
 )
@@ -94,7 +91,7 @@ from sglang.srt.model_executor.runner_utils.deepep_adapter import (
     DeepEPCudaGraphRunnerAdapter,
 )
 from sglang.srt.multiplex.pdmux_context import get_current_stream_idx, get_stream_groups
-from sglang.srt.runtime_context import get_flags
+from sglang.srt.runtime_context import get_flags, get_parallel
 from sglang.srt.utils import (
     empty_context,
     get_available_gpu_memory,
@@ -223,8 +220,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
         self.enable_pdmux = model_runner.server_args.enable_pdmux
 
-        self.attn_tp_size = get_attention_tp_size()
-        self.attn_tp_rank = get_attention_tp_rank()
+        self.attn_tp_size = get_parallel().attn_tp_size
+        self.attn_tp_rank = get_parallel().attn_tp_rank
         # True if a DSACPLayerCommunicator-style prefill-CP flavor is active
         # (DSA or MLA). These flavors feed a zigzag-split rank-local layout
         # into the runner; MHA-arch prefill CP (Qwen3/Qwen2 MoE via PR
@@ -646,7 +643,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         export_cuda_graph_capture_trace(
             prof_context,
             runner_name=type(self).__name__,
-            tp_rank=get_tensor_model_parallel_rank(),
+            tp_rank=get_parallel().tp_rank,
         )
 
     def capture_prepare(
@@ -866,7 +863,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # Reverse so cuda graphs share memory better.
         capture_range = (
             tqdm.tqdm(list(reversed(self.capture_bs)))
-            if get_tensor_model_parallel_rank() == 0
+            if get_parallel().tp_rank == 0
             else reversed(self.capture_bs)
         )
         lora_variants = (
@@ -875,7 +872,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             else [(None, None)]
         )
         for bs in capture_range:
-            if get_tensor_model_parallel_rank() == 0:
+            if get_parallel().tp_rank == 0:
                 avail_mem = get_available_gpu_memory(
                     self.model_runner.device,
                     self.model_runner.gpu_id,

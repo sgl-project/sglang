@@ -6,10 +6,8 @@ python3 -m sglang.test.run_eval --port 30000 --eval-name mmlu --num-examples 10
 import argparse
 import json
 import os
-import random
 import statistics
 import time
-import traceback
 
 from sglang.test.simple_eval_common import (
     ChatCompletionSampler,
@@ -79,7 +77,6 @@ def run_eval_once(args, base_url: str, eval_obj: Eval) -> dict:
         sampler = CompletionSampler(
             **common_kwargs,
             stop=stop,
-            record_meta_info=True,
         )
     else:
         sampler = ChatCompletionSampler(
@@ -97,46 +94,12 @@ def run_eval_once(args, base_url: str, eval_obj: Eval) -> dict:
     return result, latency, sampler
 
 
-def _extract_choice_meta_info(response: dict) -> dict:
-    if not isinstance(response, dict):
-        return {}
-    choices = response.get("choices") or []
-    if not choices or not isinstance(choices[0], dict):
-        return {}
-    return choices[0].get("meta_info") or {}
-
-
-def dump_and_analyze_records(args, samplers: list) -> None:
-    records = []
-    for sampler in samplers:
-        records.extend(getattr(sampler, "_records", []))
-    if not records:
-        return
-
-    if getattr(args, "dump_records", False):
-        stamp = time.strftime("%Y%m%d-%H%M%S")
-        rand = f"{random.randint(0, 1 << 32):08x}"
-        dump_path = os.path.expanduser(
-            f"~/{stamp}-{rand}-run_eval-{args.eval_name}.json"
-        )
-        try:
-            with open(dump_path, "w") as f:
-                json.dump(records, f, indent=2, default=str)
-            print(f"Wrote {len(records)} raw request/response records to {dump_path}")
-        except OSError:
-            traceback.print_exc()
-
+def print_accept_length_summary(samplers: list) -> None:
     accept_lengths = [
         m["spec_accept_length"]
-        for r in records
-        if (m := _extract_choice_meta_info(r.get("response")))
-        and m.get("spec_accept_length") is not None
-    ]
-    accept_rates = [
-        m["spec_accept_rate"]
-        for r in records
-        if (m := _extract_choice_meta_info(r.get("response")))
-        and m.get("spec_accept_rate") is not None
+        for sampler in samplers
+        for m in getattr(sampler, "_meta_infos", [])
+        if m.get("spec_accept_length") is not None
     ]
     print("=" * 20)
     if not accept_lengths:
@@ -152,8 +115,6 @@ def dump_and_analyze_records(args, samplers: list) -> None:
             f"min={min(accept_lengths):.4f} "
             f"max={max(accept_lengths):.4f}"
         )
-        if accept_rates:
-            print(f"Speculative accept rate: mean={statistics.fmean(accept_rates):.4f}")
     print("=" * 20)
 
 
@@ -334,7 +295,7 @@ def run_eval(args):
 
         executor.shutdown()
 
-    dump_and_analyze_records(args, samplers)
+    print_accept_length_summary(samplers)
 
     # Dump reports
     file_stem = f"{args.eval_name}_{sampler.model.replace('/', '_')}"
@@ -405,12 +366,6 @@ if __name__ == "__main__":
         help="JSON object string for chat_template_kwargs, e.g. '{\"enable_thinking\": true}'",
     )
     parser.add_argument("--reasoning-effort", type=str)
-    parser.add_argument(
-        "--dump-records",
-        action="store_true",
-        help="Dump every raw request/response record (including prompts and "
-        "generations) to a JSON file under the home directory after the eval.",
-    )
     parser.add_argument(
         "--thinking-mode",
         default=None,

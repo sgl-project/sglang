@@ -3,13 +3,13 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.layers.dp_attention import get_attention_tp_group
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
     ForwardMode,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dspark_components.dspark_draft import (
     resolve_greedy_mask,
@@ -49,7 +49,7 @@ class DraftBlockProposer:
 
     def _base_logits_context(self):
         if self._dp_moe_sync:
-            return draft_tp_context(get_attention_tp_group())
+            return draft_tp_context(get_parallel().attn_tp_group)
         return nullcontext()
 
     def propose(

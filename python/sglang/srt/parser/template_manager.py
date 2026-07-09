@@ -23,14 +23,6 @@ import logging
 import os
 from typing import Dict, Optional
 
-from sglang.srt.managers.template_detection import (
-    REASONING_PARSER_RULES,
-    TOOL_CALL_PARSER_RULES,
-    ReasoningToggleConfig,
-    build_detection_context,
-    detect_reasoning_pattern,
-    match_rules,
-)
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.parser.code_completion_parser import (
     CompletionTemplate,
@@ -47,6 +39,14 @@ from sglang.srt.parser.conversation import (
     register_conv_template,
 )
 from sglang.srt.parser.jinja_template_utils import detect_jinja_template_content_format
+from sglang.srt.parser.template_detection import (
+    REASONING_PARSER_RULES,
+    TOOL_CALL_PARSER_RULES,
+    ReasoningToggleConfig,
+    build_detection_context,
+    detect_reasoning_pattern,
+    match_rules,
+)
 
 logger = logging.getLogger(__name__)
 

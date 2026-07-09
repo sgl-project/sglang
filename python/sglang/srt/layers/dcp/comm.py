@@ -31,10 +31,9 @@ from sglang.srt.distributed.parallel_state import (
     GroupCoordinator,
     get_dcp_group,
     get_dcp_group_no_assert,
-    get_dcp_rank,
-    get_dcp_world_size,
 )
 from sglang.srt.layers.dcp.kernels import CPTritonContext, correct_attn_out
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_cuda
 
 
@@ -46,19 +45,19 @@ def dcp_enabled() -> bool:
         return False
     if not is_cuda():
         return False
-    return get_dcp_world_size() > 1
+    return get_parallel().dcp_size > 1
 
 
 def get_attention_dcp_world_size() -> int:
     if not dcp_enabled():
         return 1
-    return get_dcp_world_size()
+    return get_parallel().dcp_size
 
 
 def get_attention_dcp_rank() -> int:
     if not dcp_enabled():
         return 0
-    return get_dcp_rank()
+    return get_parallel().dcp_rank
 
 
 def _ag_lse(cp_attn_lse: torch.Tensor, cp_group: GroupCoordinator) -> torch.Tensor:
@@ -133,7 +132,7 @@ def cp_lse_ag_out_rs_mla(
 
 
 def _all_gather_dcp_kv_cache(kv_a: torch.Tensor):
-    dcp_world_size = get_dcp_world_size()
+    dcp_world_size = get_parallel().dcp_size
     # not use symmetric_memory unless torch mem_pool updated, see https://github.com/pytorch/pytorch/issues/178138
     gathered_kv_a = kv_a.new_empty(
         (kv_a.shape[0] * dcp_world_size, *kv_a.shape[1:]),
@@ -282,8 +281,8 @@ def all_gather_kv_cache_for_dcp(
     if not dcp_enabled():
         return torch.cat([prefix_kv_a, prefix_k_pe], dim=-1)
     # 1. compute max kv_lens for each seq
-    dcp_world_size = get_dcp_world_size()
-    dcp_rank = get_dcp_rank()
+    dcp_world_size = get_parallel().dcp_size
+    dcp_rank = get_parallel().dcp_rank
 
     if prefix_starts_cpu is None:
         prefix_starts_cpu = torch.zeros_like(prefix_kv_lens_cpu)

@@ -5,17 +5,14 @@ import torch
 
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.environ import envs
-from sglang.srt.layers.dp_attention import (
-    get_attention_cp_size,
-    get_attention_tp_size,
-    is_dp_attention_enabled,
-)
+from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.managers.overlap_utils import (
     CONFIDENCE_RELAY_RING_LAG,
     FutureMap,
     ResolvedConfidence,
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.dspark_components.dspark_confidence import (
     compute_confidence,
@@ -189,8 +186,8 @@ class DSparkVerifyPlanner:
             self._dp_tier_gather_enabled = (
                 self._ragged_verify_mode is RaggedVerifyMode.COMPACT
                 and is_dp_attention_enabled()
-                and get_attention_tp_size() == 1
-                and get_attention_cp_size() == 1
+                and get_parallel().attn_tp_size == 1
+                and get_parallel().attn_cp_size == 1
                 and require_mlp_tp_gather(self.server_args)
                 and not self.server_args.disable_overlap_schedule
                 and not self.server_args.speculative_skip_dp_mlp_sync

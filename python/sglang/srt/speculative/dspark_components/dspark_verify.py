@@ -5,12 +5,9 @@ from typing import Optional
 import torch
 
 from sglang.srt.distributed import get_tp_group
-from sglang.srt.layers.dp_attention import (
-    get_attention_tp_group,
-    get_attention_tp_size,
-    is_dp_attention_enabled,
-)
+from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.dflash_utils import apply_dflash_verify_logits_adjustments
 from sglang.srt.speculative.dspark_components.dspark_info import VerifyWindow
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout, RaggedVerifyMode
@@ -135,7 +132,7 @@ def uniform_ragged_layout(
 
 def verify_lens_broadcast_group(*, tp_size: int) -> tuple:
     if is_dp_attention_enabled():
-        return get_attention_tp_group(), get_attention_tp_size()
+        return get_parallel().attn_tp_group, get_parallel().attn_tp_size
     return get_tp_group(), tp_size
 
 
