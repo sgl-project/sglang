@@ -7,6 +7,7 @@ from unittest.mock import patch
 import msgspec
 
 import sglang.srt.observability.req_time_stats as req_time_stats_module
+import sglang.srt.observability.trace as trace_module
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers import io_struct
 from sglang.srt.managers.io_struct import (
@@ -164,11 +165,13 @@ class TestReqTimeStatsTransport(CustomTestCase):
                         )
 
     def test_tracing_time_stats_with_128_bit_id_round_trip(self):
+        trace_id = (1 << 127) + 1
+        span_id = (1 << 63) + 1
         trace_state = {
             "tracing_enable": True,
             "last_span_context": {
-                "trace_id": (1 << 127) + 1,
-                "span_id": (1 << 63) + 1,
+                "trace_id": f"{trace_id:032x}",
+                "span_id": f"{span_id:016x}",
             },
         }
 
@@ -199,16 +202,82 @@ class TestReqTimeStatsTransport(CustomTestCase):
                 encoded_span_context = decoded.time_stats.trace_ctx_state[
                     "last_span_context"
                 ]
-                self.assertEqual(len(encoded_span_context["trace_id"]), 32)
-                self.assertEqual(len(encoded_span_context["span_id"]), 16)
-
-                decoded_trace_state = APIServerReqTimeStats._decode_trace_ctx_ids(
-                    decoded.time_stats.trace_ctx_state
-                )
                 self.assertEqual(
-                    decoded_trace_state["last_span_context"],
+                    encoded_span_context,
                     trace_state["last_span_context"],
                 )
+
+    def test_legacy_trace_state_relay_is_msgpack_safe(self):
+        trace_id = (1 << 127) + 1
+        span_id = (1 << 63) + 1
+        legacy_trace_state = {
+            "tracing_enable": True,
+            "last_span_context": {
+                "trace_id": trace_id,
+                "span_id": span_id,
+            },
+        }
+
+        with patch.object(trace_module, "opentelemetry_initialized", False):
+            constructed = APIServerReqTimeStats(trace_ctx_state=legacy_trace_state)
+            restored = APIServerReqTimeStats()
+            restored.__setstate__({"trace_ctx_state": legacy_trace_state})
+
+        for source, time_stats in (("constructor", constructed), ("state", restored)):
+            with self.subTest(source=source):
+                encoded = msgspec.msgpack.encode(time_stats.to_ipc())
+                decoded = msgspec.msgpack.decode(encoded)
+                span_context = decoded["trace_ctx_state"]["last_span_context"]
+                self.assertEqual(span_context["trace_id"], f"{trace_id:032x}")
+                self.assertEqual(span_context["span_id"], f"{span_id:016x}")
+
+        self.assertEqual(legacy_trace_state["last_span_context"]["trace_id"], trace_id)
+        self.assertEqual(legacy_trace_state["last_span_context"]["span_id"], span_id)
+
+    def test_time_stats_init_converts_clock_for_all_request_types(self):
+        with patch.object(
+            req_time_stats_module, "global_diff_realtime_monotonic", 90.0
+        ):
+            api_time_stats = APIServerReqTimeStats(
+                created_time=10.0,
+                diff_realtime_monotonic=100.0,
+            )
+            dp_time_stats = DPControllerReqTimeStats(
+                dpc_dispatch_time=10.0,
+                diff_realtime_monotonic=100.0,
+            )
+            empty_time_stats = APIServerReqTimeStats(
+                created_time=0.0,
+                diff_realtime_monotonic=100.0,
+            )
+
+        self.assertEqual(api_time_stats.created_time, 20.0)
+        self.assertEqual(dp_time_stats.dpc_dispatch_time, 20.0)
+        self.assertEqual(empty_time_stats.created_time, 0.0)
+        self.assertEqual(api_time_stats.diff_realtime_monotonic, 90.0)
+        self.assertEqual(dp_time_stats.diff_realtime_monotonic, 90.0)
+        self.assertEqual(empty_time_stats.diff_realtime_monotonic, 90.0)
+
+    def test_time_stats_setstate_converts_clock_without_mutating_state(self):
+        state = {
+            "disagg_mode": DisaggregationMode.DECODE.value,
+            "created_time": 10.0,
+            "trace_ctx": {"tracing_enable": False},
+            "diff_realtime_monotonic": 100.0,
+        }
+        with patch.object(
+            req_time_stats_module, "global_diff_realtime_monotonic", 90.0
+        ):
+            time_stats = APIServerReqTimeStats()
+            time_stats.__setstate__(state)
+
+        self.assertEqual(time_stats.disagg_mode, DisaggregationMode.DECODE)
+        self.assertEqual(time_stats.created_time, 20.0)
+        self.assertEqual(time_stats.diff_realtime_monotonic, 90.0)
+        self.assertEqual(state["disagg_mode"], DisaggregationMode.DECODE.value)
+        self.assertEqual(state["created_time"], 10.0)
+        self.assertIn("trace_ctx", state)
+        self.assertEqual(state["diff_realtime_monotonic"], 100.0)
 
     def test_scheduler_time_stats_round_trip_converts_clock(self):
         with patch.object(
@@ -316,33 +385,45 @@ class TestReqTimeStatsTransport(CustomTestCase):
             msgspec.msgpack.decode(msgspec.msgpack.encode(snapshot)),
             {"type": "SchedulerReqTimeStats"},
         )
+        pickle_snapshot = pickle.loads(pickle.dumps(snapshot))
+        self.assertFalse(pickle_snapshot.enable_metrics)
+        self.assertEqual(pickle_snapshot.wait_queue_entry_time, 0.0)
+        self.assertEqual(pickle_snapshot.forward_entry_time, 0.0)
+        self.assertEqual(pickle_snapshot.prefill_finished_time, 0.0)
+        self.assertEqual(pickle_snapshot.diff_realtime_monotonic, 0.0)
 
     def test_new_from_obj_copies_shared_and_runtime_state(self):
         metrics_collector = object()
-        api_time_stats = APIServerReqTimeStats(
-            enable_metrics=True,
-            disagg_mode=DisaggregationMode.DECODE,
-            diff_realtime_monotonic=1.0,
-            created_time=11.0,
-            api_server_dispatch_time=12.0,
-        )
+        with patch.object(
+            req_time_stats_module, "global_diff_realtime_monotonic", 100.0
+        ):
+            api_time_stats = APIServerReqTimeStats(
+                enable_metrics=True,
+                disagg_mode=DisaggregationMode.DECODE,
+                diff_realtime_monotonic=100.0,
+                created_time=11.0,
+                api_server_dispatch_time=12.0,
+            )
         api_time_stats.metrics_collector = metrics_collector
 
-        dp_time_stats = DPControllerReqTimeStats.new_from_obj(api_time_stats)
-        dp_time_stats.dpc_dispatch_time = 13.0
-        dp_time_stats_copy = DPControllerReqTimeStats.new_from_obj(dp_time_stats)
-        scheduler_time_stats = SchedulerReqTimeStats.new_from_obj(dp_time_stats)
+        with patch.object(
+            req_time_stats_module, "global_diff_realtime_monotonic", 90.0
+        ), patch.object(req_time_stats_module, "calibrate_time_diff"):
+            dp_time_stats = DPControllerReqTimeStats.new_from_obj(api_time_stats)
+            dp_time_stats.dpc_dispatch_time = 13.0
+            dp_time_stats_copy = DPControllerReqTimeStats.new_from_obj(dp_time_stats)
+            scheduler_time_stats = SchedulerReqTimeStats.new_from_obj(dp_time_stats)
 
         self.assertTrue(scheduler_time_stats.enable_metrics)
         self.assertEqual(scheduler_time_stats.disagg_mode, DisaggregationMode.DECODE)
-        self.assertEqual(scheduler_time_stats.diff_realtime_monotonic, 1.0)
+        self.assertEqual(scheduler_time_stats.diff_realtime_monotonic, 90.0)
         self.assertIs(scheduler_time_stats.metrics_collector, metrics_collector)
         self.assertIs(scheduler_time_stats.trace_ctx, api_time_stats.trace_ctx)
-        self.assertEqual(dp_time_stats.created_time, 11.0)
-        self.assertEqual(dp_time_stats.api_server_dispatch_time, 12.0)
+        self.assertEqual(dp_time_stats.created_time, 21.0)
+        self.assertEqual(dp_time_stats.api_server_dispatch_time, 22.0)
         self.assertEqual(dp_time_stats_copy.dpc_dispatch_time, 13.0)
-        self.assertEqual(scheduler_time_stats.created_time, 11.0)
-        self.assertEqual(scheduler_time_stats.api_server_dispatch_time, 12.0)
+        self.assertEqual(scheduler_time_stats.created_time, 21.0)
+        self.assertEqual(scheduler_time_stats.api_server_dispatch_time, 22.0)
         self.assertEqual(scheduler_time_stats.dpc_dispatch_time, 13.0)
 
 

@@ -358,6 +358,21 @@ class TraceReqContext:
 
         return thread_context
 
+    @staticmethod
+    def _normalize_state_for_transport(state: Dict[str, Any]) -> Dict[str, Any]:
+        state = state.copy()
+        last_span_context = state.get("last_span_context")
+        if isinstance(last_span_context, dict):
+            last_span_context = last_span_context.copy()
+            trace_id = last_span_context.get("trace_id")
+            span_id = last_span_context.get("span_id")
+            if isinstance(trace_id, int):
+                last_span_context["trace_id"] = f"{trace_id:032x}"
+            if isinstance(span_id, int):
+                last_span_context["span_id"] = f"{span_id:016x}"
+            state["last_span_context"] = last_span_context
+        return state
+
     def __getstate__(self) -> Optional[Dict[str, Any]]:
         if not self.tracing_enable:
             return {"tracing_enable": False}
@@ -396,7 +411,7 @@ class TraceReqContext:
                 "trace_id": prev_span_context.trace_id,
             }
 
-        return state
+        return self._normalize_state_for_transport(state)
 
     def __setstate__(self, state: Dict[str, Any]):
         self.__dict__.update(state)
@@ -409,9 +424,15 @@ class TraceReqContext:
         self.pid = threading.get_native_id()
         self.root_span_context = propagate.extract(self.root_span_context)
         if self.last_span_context:
+            trace_id = self.last_span_context["trace_id"]
+            span_id = self.last_span_context["span_id"]
+            if isinstance(trace_id, str):
+                trace_id = int(trace_id, 16)
+            if isinstance(span_id, str):
+                span_id = int(span_id, 16)
             self.last_span_context = trace.span.SpanContext(
-                trace_id=self.last_span_context["trace_id"],
-                span_id=self.last_span_context["span_id"],
+                trace_id=trace_id,
+                span_id=span_id,
                 is_remote=True,
             )
         self.events_cache = []

@@ -237,6 +237,11 @@ class ReqTimeStatsBase(
     trace_ctx_state: Optional[Dict[str, Any]] = None
 
     def __post_init__(self):
+        if self.trace_ctx_state is not None:
+            self.trace_ctx_state = TraceReqContext._normalize_state_for_transport(
+                self.trace_ctx_state
+            )
+
         self.metrics_collector: Optional[
             Union[
                 SchedulerMetricsCollector,
@@ -248,18 +253,32 @@ class ReqTimeStatsBase(
             self._decode_trace_ctx_state(self.trace_ctx_state)
         )
 
+        old_diff = self.diff_realtime_monotonic
+        new_diff = global_diff_realtime_monotonic
+        if old_diff and old_diff != new_diff:
+            for field in msgspec.structs.fields(type(self)):
+                if field.name.endswith("time"):
+                    value = getattr(self, field.name)
+                    if value > 0.0:
+                        setattr(
+                            self,
+                            field.name,
+                            convert_time_cross_thread(value, old_diff, new_diff),
+                        )
+            self.diff_realtime_monotonic = new_diff
+
     @classmethod
     def new_from_obj(cls, obj: Optional[ReqTimeStatsBase], *args, **kwargs) -> Self:
         calibrate_time_diff()
-        new_obj = cls(*args, **kwargs)
         if obj is None:
-            return new_obj
+            return cls(*args, **kwargs)
 
-        new_fields = {field.name for field in msgspec.structs.fields(type(new_obj))}
+        new_fields = {field.name for field in msgspec.structs.fields(cls)}
         for field in msgspec.structs.fields(type(obj)):
             if field.name in new_fields:
-                setattr(new_obj, field.name, getattr(obj, field.name))
+                kwargs[field.name] = getattr(obj, field.name)
 
+        new_obj = cls(*args, **kwargs)
         new_obj.metrics_collector = obj.metrics_collector
         new_obj.trace_ctx = obj.trace_ctx
 
@@ -273,43 +292,14 @@ class ReqTimeStatsBase(
         trace_ctx_state: Optional[Dict[str, Any]],
     ) -> Union[TraceReqContext, TraceNullContext]:
         if isinstance(trace_ctx_state, dict) and trace_ctx_state.get("tracing_enable"):
-            trace_ctx_state = ReqTimeStatsBase._decode_trace_ctx_ids(trace_ctx_state)
             trace_ctx = object.__new__(TraceReqContext)
             trace_ctx.__setstate__(trace_ctx_state)
             return trace_ctx
         return TraceNullContext()
 
-    @staticmethod
-    def _encode_trace_ctx_ids(trace_ctx_state: Dict[str, Any]) -> Dict[str, Any]:
-        trace_ctx_state = trace_ctx_state.copy()
-        last_span_context = trace_ctx_state.get("last_span_context")
-        if isinstance(last_span_context, dict):
-            last_span_context = last_span_context.copy()
-            trace_id = last_span_context.get("trace_id")
-            span_id = last_span_context.get("span_id")
-            if isinstance(trace_id, int):
-                last_span_context["trace_id"] = f"{trace_id:032x}"
-            if isinstance(span_id, int):
-                last_span_context["span_id"] = f"{span_id:016x}"
-            trace_ctx_state["last_span_context"] = last_span_context
-        return trace_ctx_state
-
-    @staticmethod
-    def _decode_trace_ctx_ids(trace_ctx_state: Dict[str, Any]) -> Dict[str, Any]:
-        trace_ctx_state = trace_ctx_state.copy()
-        last_span_context = trace_ctx_state.get("last_span_context")
-        if isinstance(last_span_context, dict):
-            last_span_context = last_span_context.copy()
-            for key in ("trace_id", "span_id"):
-                value = last_span_context.get(key)
-                if isinstance(value, str):
-                    last_span_context[key] = int(value, 16)
-            trace_ctx_state["last_span_context"] = last_span_context
-        return trace_ctx_state
-
     def _get_trace_ctx_state(self) -> Dict[str, Any]:
         if self.trace_ctx.tracing_enable:
-            return self._encode_trace_ctx_ids(self.trace_ctx.__getstate__())
+            return self.trace_ctx.__getstate__()
         if self.trace_ctx_state is not None:
             return self.trace_ctx_state
         return {"tracing_enable": False}
@@ -397,32 +387,40 @@ class ReqTimeStatsBase(
     def __reduce_ex__(self, protocol: int):
         return _restore_req_time_stats, (type(self), self.__getstate__())
 
-    def __setstate__(self, state: object):
-        # Reconstruct disagg_mode from string value if needed
-        disagg_mode_val = state.get("disagg_mode")
-        if isinstance(disagg_mode_val, str):
-            state["disagg_mode"] = DisaggregationMode(disagg_mode_val)
-
-        # Reconstruct trace_ctx from serialized dict if needed
-        trace_ctx_state = state.pop("trace_ctx", state.get("trace_ctx_state", None))
+    def __setstate__(self, state: Dict[str, Any]):
+        trace_ctx_state = state.get("trace_ctx", state.get("trace_ctx_state"))
         if isinstance(trace_ctx_state, dict):
+            trace_ctx_state = TraceReqContext._normalize_state_for_transport(
+                trace_ctx_state
+            )
             self.trace_ctx_state = trace_ctx_state
             self.trace_ctx = self._decode_trace_ctx_state(trace_ctx_state)
 
-        for key in state.keys():
-            if key.endswith("time") and state[key] > 0.0:
-                state[key] = convert_time_cross_thread(
-                    state[key],
-                    state["diff_realtime_monotonic"],
+        struct_fields = {field.name for field in msgspec.structs.fields(type(self))}
+        old_diff = state.get("diff_realtime_monotonic", 0.0)
+        for key, value in state.items():
+            if key not in struct_fields:
+                continue
+
+            if key == "disagg_mode" and isinstance(value, str):
+                value = DisaggregationMode(value)
+            elif key == "trace_ctx_state" and isinstance(trace_ctx_state, dict):
+                value = trace_ctx_state
+            elif key == "diff_realtime_monotonic" and old_diff:
+                value = global_diff_realtime_monotonic
+            elif (
+                key.endswith("time")
+                and value > 0.0
+                and old_diff
+                and old_diff != global_diff_realtime_monotonic
+            ):
+                value = convert_time_cross_thread(
+                    value,
+                    old_diff,
                     global_diff_realtime_monotonic,
                 )
 
-        struct_fields = {field.name for field in msgspec.structs.fields(type(self))}
-        for key, value in state.items():
-            if key == "diff_realtime_monotonic":
-                value = global_diff_realtime_monotonic
-            if key in struct_fields:
-                setattr(self, key, value)
+            setattr(self, key, value)
 
     def encode_json(self) -> Dict[str, Any]:
         return self.__getstate__()
@@ -689,28 +687,6 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     # other
     transfer_speed_gb_s: float = 0.0
     transfer_total_mb: float = 0.0
-
-    def __post_init__(self):
-        super().__post_init__()
-        if (
-            self.diff_realtime_monotonic
-            and self.diff_realtime_monotonic != global_diff_realtime_monotonic
-        ):
-            old_diff = self.diff_realtime_monotonic
-            new_diff = global_diff_realtime_monotonic
-            if self.wait_queue_entry_time > 0.0:
-                self.wait_queue_entry_time = convert_time_cross_thread(
-                    self.wait_queue_entry_time, old_diff, new_diff
-                )
-            if self.forward_entry_time > 0.0:
-                self.forward_entry_time = convert_time_cross_thread(
-                    self.forward_entry_time, old_diff, new_diff
-                )
-            if self.prefill_finished_time > 0.0:
-                self.prefill_finished_time = convert_time_cross_thread(
-                    self.prefill_finished_time, old_diff, new_diff
-                )
-            self.diff_realtime_monotonic = new_diff
 
     def __getstate__(self) -> object:
         # send to detokenizer/tokenizer

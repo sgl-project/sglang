@@ -157,6 +157,8 @@ class TestDisaggTracePropagation(unittest.TestCase):
         with _srt_trace_server_args():
             ctx = TraceReqContext(rid="test-on", role="server", module_name="request")
             ctx.trace_req_start()
+            ctx.trace_slice_start("dispatch", level=1)
+            ctx.trace_slice_end("dispatch", level=1)
             self.assertTrue(ctx.tracing_enable)
             self.assertFalse(ctx.is_copy)
 
@@ -170,6 +172,8 @@ class TestDisaggTracePropagation(unittest.TestCase):
             self.assertTrue(state.get("tracing_enable"))
             # W3C carrier must be present so downstream roles can nest spans.
             self.assertIn("traceparent", state.get("root_span_context", {}))
+            self.assertEqual(len(state["last_span_context"]["trace_id"]), 32)
+            self.assertEqual(len(state["last_span_context"]["span_id"]), 16)
 
             decoded = _roundtrip_scalar_fields(scalar_fields)
             self.assertEqual(decoded["_trace_state"], state)
@@ -183,6 +187,14 @@ class TestDisaggTracePropagation(unittest.TestCase):
             self.assertEqual(
                 _traceparent_from(rebuilt.root_span_context),
                 state["root_span_context"]["traceparent"],
+            )
+            self.assertEqual(
+                rebuilt.last_span_context.trace_id,
+                int(state["last_span_context"]["trace_id"], 16),
+            )
+            self.assertEqual(
+                rebuilt.last_span_context.span_id,
+                int(state["last_span_context"]["span_id"], 16),
             )
             ctx.trace_req_finish()
 
