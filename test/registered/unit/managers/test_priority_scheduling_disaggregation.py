@@ -1,8 +1,11 @@
+import json
 import sys
+import threading
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import numpy as np
 import torch
 
 from sglang.srt.disaggregation.decode import (  # noqa: E402
@@ -10,11 +13,12 @@ from sglang.srt.disaggregation.decode import (  # noqa: E402
     SchedulerDisaggregationDecodeMixin,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode  # noqa: E402
-from sglang.srt.managers.schedule_batch import FINISH_ABORT  # noqa: E402
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req  # noqa: E402
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=5, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=5, suite="stage-b-test-1-gpu-small-amd")
 
 
 class TestDisaggregationPriorityQueueing(unittest.TestCase):
@@ -95,6 +99,7 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
             waiting_for_input=True,
             kv_receiver=MagicMock(),
             metadata_buffer_index=-1,
+            is_rebootstrap=False,
         )
 
     def _new_queue(self, decode_reqs, *, low_priority_values_first: bool = False):
@@ -204,6 +209,204 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
         )
 
 
+class TestDecodePreallocQueueRebootstrapPayload(unittest.TestCase):
+    """The decode scheduler builds the rebootstrap ``/generate`` payload; the
+    dispatch itself now lives on the kv manager (see
+    ``TestCommonKVManagerPrefillRecompute``)."""
+
+    def _sampling_params(self):
+        return SimpleNamespace(
+            temperature=0.0,
+            top_p=1.0,
+            top_k=-1,
+            min_p=0.0,
+            frequency_penalty=0.0,
+            presence_penalty=0.0,
+            repetition_penalty=1.0,
+            ignore_eos=False,
+            skip_special_tokens=True,
+            spaces_between_special_tokens=True,
+            no_stop_trim=False,
+        )
+
+    def _new_req(self):
+        return SimpleNamespace(
+            rid="rid-0",
+            origin_input_ids=np.array([1, 2], dtype=np.int32),
+            output_ids=[np.int32(3), np.int32(4)],
+            sampling_params=self._sampling_params(),
+            bootstrap_host="127.0.0.1",
+            bootstrap_port=30000,
+            bootstrap_room=7,
+            priority=10,
+            extra_key=None,
+            routing_key=None,
+            disagg_prefill_dp_rank=None,
+        )
+
+    def test_build_rebootstrap_payload_converts_numpy_ids_to_json_lists(self):
+        req = self._new_req()
+
+        # build_rebootstrap_payload lives on Req; exercise it unbound with a
+        # namespace that carries the attributes it reads.
+        payload = Req.build_rebootstrap_payload(req)
+
+        # origin_input_ids + output_ids, coerced to plain python ints.
+        self.assertEqual(payload["input_ids"], [1, 2, 3, 4])
+        self.assertTrue(all(type(x) is int for x in payload["input_ids"]))
+        self.assertEqual(payload["sampling_params"]["max_new_tokens"], 1)
+        self.assertEqual(payload["bootstrap_room"], 7)
+        # The prefill /generate URL is derived from bootstrap info on the decode
+        # side, not sent in the payload; and the boundary token is replayed via
+        # the decode-side override, so neither belongs in the payload.
+        self.assertNotIn("pd_rebootstrap_prefill_url", payload)
+        self.assertNotIn("pd_rebootstrap_forced_output_id", payload)
+        # Must be JSON-serializable (numpy scalars would raise here).
+        json.dumps(payload)
+
+
+class TestCommonKVManagerPrefillRecompute(unittest.TestCase):
+    """The kv manager owns the shared executor + HTTP session and routes any
+    rebootstrap ``/generate`` failure through ``kv_receiver.abort()`` ->
+    ``KVPoll.Failed`` so the scheduler's normal transfer-failure streaming runs.
+    """
+
+    def _new_manager(self):
+        from sglang.srt.disaggregation.common.conn import CommonKVManager
+
+        mgr = CommonKVManager.__new__(CommonKVManager)
+        mgr._prefill_recompute_executor = None
+        mgr._prefill_recompute_executor_lock = threading.Lock()
+        mgr._prefill_recompute_sessions = threading.local()
+        mgr.waiting_timeout = 300
+        mgr.failure_records = {}
+        mgr.failure_lock = threading.Lock()
+        # Only the attn-tp/attn-cp group leader on the first PP stage issues the
+        # single rebootstrap /generate; default the mock manager to that leader.
+        mgr.attn_tp_rank = 0
+        mgr.attn_cp_rank = 0
+        mgr.pp_rank = 0
+        # Decode-side prefill info cache; the rebootstrap /generate URL is derived
+        # from here (bootstrap_addr host + self-registered prefill_http_port)
+        # instead of a router-injected pd_rebootstrap_prefill_url.
+        mgr.prefill_info_table = {}
+        return mgr
+
+    def _register_prefill_info(self, mgr, bootstrap_addr, http_port):
+        from sglang.srt.disaggregation.common.conn import PrefillServerInfo
+
+        mgr.prefill_info_table[bootstrap_addr] = PrefillServerInfo(
+            attn_tp_size=1,
+            attn_cp_size=1,
+            dp_size=1,
+            pp_size=1,
+            page_size=1,
+            kv_cache_dtype=None,
+            follow_bootstrap_room=True,
+            prefill_http_port=http_port,
+        )
+
+    def _payload(self):
+        return {
+            "input_ids": [1, 2, 3, 4],
+            "rid": "rid-0",
+        }
+
+    def test_submit_dispatches_run_to_shared_executor(self):
+        mgr = self._new_manager()
+        mgr._prefill_recompute_executor = MagicMock()
+        receiver = MagicMock(bootstrap_room=7, bootstrap_addr="127.0.0.1:8998")
+        self._register_prefill_info(mgr, "127.0.0.1:8998", 30000)
+
+        mgr.submit_prefill_recompute(receiver, self._payload())
+
+        mgr._prefill_recompute_executor.submit.assert_called_once()
+        args = mgr._prefill_recompute_executor.submit.call_args[0]
+        self.assertEqual(args[0], mgr._run_prefill_recompute)
+        self.assertIs(args[1], receiver)
+        # URL derived from bootstrap_addr host + registered prefill_http_port.
+        self.assertEqual(args[2], "http://127.0.0.1:30000")
+        receiver.abort.assert_not_called()
+
+    def test_submit_is_noop_on_non_leader_ranks(self):
+        # A retracted request is replicated across every rank in its attention
+        # TP/CP group and every PP stage; only the group/first-stage leader must
+        # POST the single /generate, or the prefill recomputes it once per rank.
+        for attn_tp_rank, attn_cp_rank, pp_rank in (
+            (1, 0, 0),
+            (0, 1, 0),
+            (0, 0, 1),
+        ):
+            with self.subTest(
+                attn_tp_rank=attn_tp_rank,
+                attn_cp_rank=attn_cp_rank,
+                pp_rank=pp_rank,
+            ):
+                mgr = self._new_manager()
+                mgr.attn_tp_rank = attn_tp_rank
+                mgr.attn_cp_rank = attn_cp_rank
+                mgr.pp_rank = pp_rank
+                mgr._prefill_recompute_executor = MagicMock()
+                receiver = MagicMock(bootstrap_room=7, bootstrap_addr="127.0.0.1:8998")
+                self._register_prefill_info(mgr, "127.0.0.1:8998", 30000)
+
+                mgr.submit_prefill_recompute(receiver, self._payload())
+
+                mgr._prefill_recompute_executor.submit.assert_not_called()
+                receiver.abort.assert_not_called()
+                self.assertEqual(mgr.failure_records, {})
+
+    def test_submit_unresolved_url_fails_via_abort(self):
+        mgr = self._new_manager()
+        mgr._prefill_recompute_executor = MagicMock()
+        # No prefill_info registered for this bootstrap_addr -> URL unresolved.
+        receiver = MagicMock(bootstrap_room=7, bootstrap_addr="127.0.0.1:8998")
+
+        mgr.submit_prefill_recompute(receiver, self._payload())
+
+        receiver.abort.assert_called_once()
+        mgr._prefill_recompute_executor.submit.assert_not_called()
+        self.assertIn(7, mgr.failure_records)
+
+    def test_run_aborts_on_http_error(self):
+        mgr = self._new_manager()
+        session = MagicMock()
+        session.post.return_value = SimpleNamespace(status_code=500, text="boom")
+        mgr._prefill_recompute_sessions.session = session
+        receiver = MagicMock(bootstrap_room=7)
+
+        mgr._run_prefill_recompute(receiver, "http://prefill", self._payload())
+
+        session.post.assert_called_once()
+        receiver.abort.assert_called_once()
+        self.assertIn(7, mgr.failure_records)
+
+    def test_run_aborts_on_exception(self):
+        mgr = self._new_manager()
+        session = MagicMock()
+        session.post.side_effect = RuntimeError("network down")
+        mgr._prefill_recompute_sessions.session = session
+        receiver = MagicMock(bootstrap_room=7)
+
+        mgr._run_prefill_recompute(receiver, "http://prefill", self._payload())
+
+        receiver.abort.assert_called_once()
+        self.assertIn(7, mgr.failure_records)
+
+    def test_run_success_does_not_abort(self):
+        mgr = self._new_manager()
+        session = MagicMock()
+        session.post.return_value = SimpleNamespace(status_code=200, text="")
+        mgr._prefill_recompute_sessions.session = session
+        receiver = MagicMock(bootstrap_room=7)
+
+        mgr._run_prefill_recompute(receiver, "http://prefill", self._payload())
+
+        session.post.assert_called_once()
+        receiver.abort.assert_not_called()
+        self.assertEqual(mgr.failure_records, {})
+
+
 class TestDecodePrebuiltPriority(unittest.TestCase):
     def test_waiting_queue_is_sorted_before_prebuilt_selection(self):
         scheduler = Scheduler.__new__(Scheduler)
@@ -228,8 +431,8 @@ class TestDecodePrebuiltPriority(unittest.TestCase):
         )
         scheduler.future_map = MagicMock()
         scheduler.policy = MagicMock()
-        scheduler.policy.calc_priority.side_effect = (
-            lambda waiting_queue, _: waiting_queue.sort(key=lambda req: -req.priority)
+        scheduler.policy.calc_priority.side_effect = lambda waiting_queue, _: (
+            waiting_queue.sort(key=lambda req: -req.priority)
         )
 
         new_batch = MagicMock()

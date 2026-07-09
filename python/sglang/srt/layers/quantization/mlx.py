@@ -73,7 +73,7 @@ class MlxQuantizationConfig(QuantizationConfig):
         return []
 
     @classmethod
-    def from_config(cls, config: Dict[str, Any]) -> "MlxQuantizationConfig":
+    def from_config(cls, config: Dict[str, Any]) -> MlxQuantizationConfig:
         raise NotImplementedError(cls._ERR)
 
     @classmethod

@@ -5,11 +5,11 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.layers import dp_attention as _dp_attn
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cuda_ci
 
-# Patch DP-attention globals before importing backends
-_dp_attn.get_attention_tp_size = lambda: 1  # TP size = 1 for unit test
+_parallel_override = get_parallel().override(attn_tp_size=1)
+_parallel_override.__enter__()
 
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.dsa.dsa_indexer import (
@@ -260,6 +260,7 @@ class MockModelRunner:
                 "dsa_prefill_backend": "flashmla_sparse",
                 "dsa_decode_backend": "fa3",
                 "dsa_topk_backend": "sgl-kernel",
+                "dsa_paged_mqa_logits_backend": "auto",
             },
         )()
         self.hisparse_coordinator = None
@@ -321,8 +322,8 @@ class TestDSAIndexer(CustomTestCase):
         params.update(kwargs)
 
         torch.set_default_dtype(self.dtype)
-        indexer = Indexer(**params)
-        # Move indexer to CUDA device
+        with torch.device(self.device):
+            indexer = Indexer(**params)
         indexer = indexer.to(device=self.device)
 
         # Convert linear layer weights to bfloat16 (but preserve LayerNorm's float32
@@ -639,6 +640,12 @@ class TestDSAIndexer(CustomTestCase):
             )
         ).contiguous()
 
+        # The fused v2 PAGED dispatch requires the per-forward plan to be
+        # preprocessed alongside the metadata (it asserts rather than silently
+        # recomputing it) -- mirror what init_forward_metadata /
+        # _build_forward_metadata_cuda_graph do.
+        from sglang.jit_kernel.dsv4.topk import plan_topk_v2
+
         attn_metadata = DSAMetadata(
             page_size=1,
             cache_seqlens_int32=seq_lens_expanded.clone(),
@@ -653,6 +660,7 @@ class TestDSAIndexer(CustomTestCase):
             dsa_cu_seqlens_k=dsa_cu_seqlens_k,
             dsa_extend_seq_lens_list=seq_lens_expanded.cpu().tolist(),
             dsa_seqlens_expanded=seq_lens_expanded,
+            topk_v2_plan=plan_topk_v2(seq_lens_expanded),
             topk_indices_offset=(
                 topk_indices_offset
                 if topk_transform_method == TopkTransformMethod.RAGGED

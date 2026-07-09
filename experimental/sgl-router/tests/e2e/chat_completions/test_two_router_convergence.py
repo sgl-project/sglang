@@ -43,12 +43,15 @@ import time
 import httpx
 import pytest
 from infra.gateway import Gateway
-from infra.model_pool import PASSTHROUGH_CHAT_TEMPLATE_PATH, spawn_worker
+from infra.model_pool import spawn_worker
 from infra.model_specs import get_model_spec
 
-# Disjoint prefixes — share no common opening text, so block 0 hashes
-# differ from the first block onward and each worker's HashTree
-# contribution is uniquely identifying.
+# Disjoint prefixes — share no common content. Under the chat template both
+# render with the same leading role header (``<|im_start|>user`` ...; Qwen3 has
+# no BOS token), so the first block(s) may hash identically; the disjoint
+# content then diverges
+# well within the matched region, making each worker's HashTree contribution
+# uniquely identifying.
 #
 # Length matters: each prefix must span ≥2 SGLang blocks at the default
 # block_size of 64 tokens so the worker actually emits BlockStored
@@ -71,7 +74,7 @@ PREFIX_Y = (_PREFIX_Y_BODY * 8).strip()
 
 
 _REQ_TOTAL_RE = re.compile(
-    r"^sgl_router_requests_total\{([^}]*)\}\s+(\d+(?:\.\d+)?)\s*$"
+    r"^sgl_router_worker_requests_total\{([^}]*)\}\s+(\d+(?:\.\d+)?)\s*$"
 )
 _LABEL_RE = re.compile(r'(\w+)="([^"]*)"')
 
@@ -127,21 +130,12 @@ def _direct_warm(worker_url: str, model_id: str, prefix: str) -> None:
     worker to populate, so the two workers' HashTree state would no
     longer be uniquely identifying.
 
-    Token alignment with the router — ``cache_aware_zmq`` hashes
-    ``messages[*].content`` RAW (``cache_aware_zmq.rs::extract_prompt_text``)
-    using ``add_special_tokens=false``. By default SGLang's chat
-    endpoint would wrap ``prefix`` in the model's chat template before
-    tokenizing — adding role tags, end-of-turn markers, and a
-    generation prompt — and the resulting block hashes would never
-    match what the router computes from raw content.
-
-    The test launches each worker with ``--chat-template
-    <PASSTHROUGH_CHAT_TEMPLATE_PATH>``: a Jinja template that emits
-    only ``messages[*].content`` (the same shape the router extracts),
-    and which combines with Transformers' ``apply_chat_template(
-    tokenize=True, add_special_tokens=False)`` to produce the same
-    token stream the router will compute. So warm and route hash the
-    same blocks via the same endpoint.
+    Token alignment with the router — the workers run with the model's
+    real chat template (no override), so the engine caches blocks keyed
+    on chat-templated tokens (role markers + content + generation prompt).
+    ``cache_aware_zmq`` mirrors this: for a chat request on a model that
+    ships a chat template, it renders the same template and tokenizes the
+    result before hashing, so warm and route hash the same blocks.
     """
     r = httpx.post(
         f"{worker_url}/v1/chat/completions",
@@ -194,24 +188,22 @@ def test_two_routers_route_by_prefix_content(
     """
     spec = get_model_spec("qwen3-0.6b")
     gpus = gpu_allocator.acquire(2)
-    # Passthrough chat template — see _direct_warm for the rationale. Both
-    # workers must run with the same template; otherwise their KV blocks
-    # would hash template-wrapped tokens while the router hashes raw
-    # content, and every lookup would miss the tree.
-    worker_chat_template_args = ["--chat-template", PASSTHROUGH_CHAT_TEMPLATE_PATH]
+    # Workers run with the model's REAL chat template (no override): the engine
+    # caches chat-templated tokens, and the router renders the same template
+    # (loaded from the model's tokenizer_config.json) before hashing. This
+    # exercises the production chat-template tokenization path, which aligns
+    # router query hashes with the engine's templated blocks.
     try:
         with (
             spawn_worker(
                 "qwen3-0.6b",
                 gpu_ids=[gpus[0]],
                 enable_kv_events=True,
-                extra_args=worker_chat_template_args,
             ) as worker_x,
             spawn_worker(
                 "qwen3-0.6b",
                 gpu_ids=[gpus[1]],
                 enable_kv_events=True,
-                extra_args=worker_chat_template_args,
             ) as worker_y,
             Gateway() as router_a,
             Gateway() as router_b,

@@ -562,6 +562,7 @@ def test_raw_rgb_realtime_output_adapter_offloads_preview_encoding(monkeypatch):
     async def run():
         ws = _WebSocket()
         adapter = RawRGBRealtimeOutputAdapter()
+        frame_count = realtime_output_adapter.ENCODED_PREVIEW_FRAMES_PER_WS_MESSAGE + 1
         batch = SimpleNamespace(
             block_idx=0,
             request_id="req-webp-offload",
@@ -575,8 +576,8 @@ def test_raw_rgb_realtime_output_adapter_offloads_preview_encoding(monkeypatch):
         result = OutputBatch(
             raw_frame_batches=[
                 [
-                    bytes([255, 0, 0, 0, 255, 0]),
-                    bytes([0, 0, 255, 255, 255, 0]),
+                    bytes([idx % 256, 0, 0, 0, 255, idx % 256])
+                    for idx in range(frame_count)
                 ]
             ],
             raw_frame_content_type=RAW_RGB_CONTENT_TYPE,
@@ -595,18 +596,31 @@ def test_raw_rgb_realtime_output_adapter_offloads_preview_encoding(monkeypatch):
     payloads = asyncio.run(run())
 
     assert [call[0] for call in calls] == [
-        realtime_output_adapter._encode_rgb_frame_to_webp,
-        realtime_output_adapter._encode_rgb_frame_to_webp,
-    ]
-    [(header, payload)] = _unpack_frame_batch_messages(payloads)
-    assert header["content_type"] == WEBP_FRAME_CONTENT_TYPE
-    assert header["encoding"] == "webp"
-    assert header["num_frames"] == 2
-    assert header["frame_batch_index"] == 0
-    assert header["num_frame_batches"] == 1
-    assert header["is_final_frame_batch"] is True
-    assert len(header["payload_lengths"]) == 2
-    assert payload.startswith(b"RIFF")
+        realtime_output_adapter._encode_rgb_frame_to_webp
+    ] * (realtime_output_adapter.ENCODED_PREVIEW_FRAMES_PER_WS_MESSAGE + 1)
+    (first_header, first_payload), (second_header, second_payload) = (
+        _unpack_frame_batch_messages(payloads)
+    )
+    assert first_header["content_type"] == WEBP_FRAME_CONTENT_TYPE
+    assert first_header["encoding"] == "webp"
+    assert first_header["num_frames"] == (
+        realtime_output_adapter.ENCODED_PREVIEW_FRAMES_PER_WS_MESSAGE
+    )
+    assert first_header["frame_batch_index"] == 0
+    assert first_header["num_frame_batches"] == 2
+    assert first_header["is_final_frame_batch"] is False
+    assert len(first_header["payload_lengths"]) == (
+        realtime_output_adapter.ENCODED_PREVIEW_FRAMES_PER_WS_MESSAGE
+    )
+    assert second_header["content_type"] == WEBP_FRAME_CONTENT_TYPE
+    assert second_header["encoding"] == "webp"
+    assert second_header["num_frames"] == 1
+    assert second_header["frame_batch_index"] == 1
+    assert second_header["num_frame_batches"] == 2
+    assert second_header["is_final_frame_batch"] is True
+    assert len(second_header["payload_lengths"]) == 1
+    assert first_payload.startswith(b"RIFF")
+    assert second_payload.startswith(b"RIFF")
 
 
 def test_raw_rgb_realtime_output_adapter_can_send_jpeg_preview_frames():

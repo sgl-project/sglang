@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING
 
 from sglang.srt.configs.model_config import ModelImpl
 from sglang.srt.environ import envs
+from sglang.srt.layers.dcp import dcp_enabled
 from sglang.srt.managers.mm_utils import init_mm_embedding_cache
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.registry import TreeCacheBuildContext, create_tree_cache
@@ -45,48 +46,40 @@ if TYPE_CHECKING:
 
 def get_draft_kv_pool(
     *,
-    draft_worker: "BaseTpWorker",
+    draft_worker: BaseTpWorker,
     spec_algorithm: SpeculativeAlgorithm,
     server_args: ServerArgs,
-    enable_overlap: bool,
 ):
-    """Return (draft_token_to_kv_pool, draft_model_config) for the current
-    draft worker, or (None, None) when no draft KV pool is available."""
+    """Return the draft token-to-KV pool for the current draft worker,
+    or None when no draft KV pool is available."""
     if draft_worker is None or spec_algorithm.is_ngram():
-        return None, None
+        return None
 
-    if spec_algorithm.supports_spec_v2() and enable_overlap:
-        if server_args.enable_multi_layer_eagle:
-            draft_runner = draft_worker.draft_worker.draft_runner_list[0]
-        else:
-            draft_runner = draft_worker.draft_worker.draft_runner
-        return draft_runner.token_to_kv_pool, draft_runner.model_config
-
-    return (
-        draft_worker.model_runner.token_to_kv_pool,
-        draft_worker.model_config,
-    )
+    # V2 workers nest the draft runner under `.draft_worker`.
+    if server_args.enable_multi_layer_eagle:
+        draft_runner = draft_worker.draft_worker.draft_runner_list[0]
+    else:
+        draft_runner = draft_worker.draft_worker.draft_runner
+    return draft_runner.token_to_kv_pool
 
 
 def maybe_register_hicache_draft(
     *,
-    tree_cache: "BasePrefixCache",
-    draft_worker: "BaseTpWorker",
+    tree_cache: BasePrefixCache,
+    draft_worker: BaseTpWorker,
     spec_algorithm: SpeculativeAlgorithm,
     server_args: ServerArgs,
     enable_hierarchical_cache: bool,
-    enable_overlap: bool,
     page_size: int,
 ) -> None:
     """Register draft KV pool with HiCacheController for piggyback L2/L3 ops."""
     if not enable_hierarchical_cache:
         return
 
-    draft_kv_pool, _ = get_draft_kv_pool(
+    draft_kv_pool = get_draft_kv_pool(
         draft_worker=draft_worker,
         spec_algorithm=spec_algorithm,
         server_args=server_args,
-        enable_overlap=enable_overlap,
     )
     if draft_kv_pool is None:
         return
@@ -96,10 +89,8 @@ def maybe_register_hicache_draft(
         MHATokenToKVPool,
         MLATokenToKVPool,
     )
-    from sglang.srt.mem_cache.memory_pool_host import (
-        MHATokenToKVPoolHost,
-        MLATokenToKVPoolHost,
-    )
+    from sglang.srt.mem_cache.memory_pool_host import MLATokenToKVPoolHost
+    from sglang.srt.mem_cache.pool_host.mha import get_mha_host_pool_cls
 
     pool = draft_kv_pool
     if isinstance(pool, HybridLinearKVPool):
@@ -113,9 +104,10 @@ def maybe_register_hicache_draft(
         host_size=0,
         page_size=page_size,
         layout=server_args.hicache_mem_layout,
+        allocator_type=server_args.hicache_storage_backend,
     )
     if isinstance(pool, MHATokenToKVPool):
-        draft_host_pool = MHATokenToKVPoolHost(pool, **kw)
+        draft_host_pool = get_mha_host_pool_cls(pool)(pool, **kw)
     elif isinstance(pool, MLATokenToKVPool):
         draft_host_pool = MLATokenToKVPoolHost(pool, **kw)
     else:
@@ -130,21 +122,21 @@ def maybe_register_hicache_draft(
 
 def build_kv_cache(
     *,
-    server_args: "ServerArgs",
-    model_config: "ModelConfig",
-    tp_worker: "BaseTpWorker",
+    server_args: ServerArgs,
+    model_config: ModelConfig,
+    tp_worker: BaseTpWorker,
     page_size: int,
-    spec_algorithm: "SpeculativeAlgorithm",
-    attn_tp_cpu_group: "ProcessGroup",
-    tp_cpu_group: "ProcessGroup",
-    attn_cp_cpu_group: "ProcessGroup",
+    spec_algorithm: SpeculativeAlgorithm,
+    attn_tp_cpu_group: ProcessGroup,
+    tp_cpu_group: ProcessGroup,
+    attn_cp_cpu_group: ProcessGroup,
     enable_metrics: bool,
     enable_kv_cache_events: bool,
-    ps: "ParallelState",
-    tp_group: "GroupCoordinator",
-    pp_group: "GroupCoordinator",
+    ps: ParallelState,
+    tp_group: GroupCoordinator,
+    pp_group: GroupCoordinator,
     enable_hierarchical_cache: bool,
-) -> "KVCacheBuildResult":
+) -> KVCacheBuildResult:
     sliding_window_size: Optional[int] = None
     full_tokens_per_layer: Optional[int] = None
     swa_tokens_per_layer: Optional[int] = None
@@ -208,7 +200,12 @@ def build_kv_cache(
         disable=disable_radix_cache,
         req_to_token_pool=req_to_token_pool,
         token_to_kv_pool_allocator=token_to_kv_pool_allocator,
-        page_size=page_size,
+        # When dcp enabled, kv_pool_allocator.page_size is page_size * dcp_size.
+        # TreeCache.page_size should keep the same as allocator.page_size to
+        # avoid kv page eviction conflicts.
+        page_size=(
+            page_size if not dcp_enabled() else token_to_kv_pool_allocator.page_size
+        ),
         is_eagle=spec_algorithm.is_eagle(),
         tp_cache_group=(
             attn_tp_cpu_group if server_args.enable_dp_attention else tp_cpu_group
@@ -219,6 +216,7 @@ def build_kv_cache(
         eviction_policy=server_args.radix_eviction_policy,
         enable_metrics=enable_metrics,
         enable_kv_cache_events=enable_kv_cache_events,
+        enable_session_radix_cache=server_args.enable_session_radix_cache,
         enable_mamba_extra_buffer=server_args.enable_mamba_extra_buffer(),
         enable_mamba_extra_buffer_lazy=server_args.enable_mamba_extra_buffer_lazy(),
         pp_rank=ps.pp_rank,
@@ -232,6 +230,7 @@ def build_kv_cache(
             server_args=server_args,
             params=params,
             is_hybrid_swa=is_hybrid_swa,
+            full_tokens_per_layer=full_tokens_per_layer,
             is_hybrid_ssm=is_hybrid_ssm,
             enable_hierarchical_cache=enable_hierarchical_cache,
             disable_radix_cache=disable_radix_cache,
