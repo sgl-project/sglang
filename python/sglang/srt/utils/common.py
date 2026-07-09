@@ -3364,14 +3364,8 @@ class BumpAllocator:
 
 
 def log_info_on_rank0(logger, msg):
-    """
-    Log an info message only on tensor model parallel rank 0.
-    Falls back to logging if distributed is not initialized or error occurs.
-    """
-    from sglang.srt.distributed import model_parallel_is_initialized
-
     try:
-        if not model_parallel_is_initialized() or get_parallel().tp_rank == 0:
+        if torch.distributed.is_initialized() and get_parallel().tp_rank == 0:
             logger.info(msg)
     except Exception as e:
         if torch.distributed.is_initialized():
@@ -3381,33 +3375,14 @@ def log_info_on_rank0(logger, msg):
             logger.info(f"{msg} (rank-check failed: {e})")
 
 
-def log_warning_on_rank0(logger, msg):
-    """
-    Log a warning message only on tensor model parallel rank 0.
-    Falls back to logging if distributed is not initialized or error occurs.
-    """
-    from sglang.srt.distributed import model_parallel_is_initialized
-
-    try:
-        if not model_parallel_is_initialized() or get_parallel().tp_rank == 0:
-            logger.warning(msg)
-    except Exception as e:
-        if torch.distributed.is_initialized():
-            if torch.distributed.get_rank() == 0:
-                logger.warning(f"{msg} (rank-check failed: {e})")
-        else:
-            logger.warning(f"{msg} (rank-check failed: {e})")
-
-
 def log_debug_on_rank0(logger, msg):
     """
     Log a debug message only on tensor model parallel rank 0.
     Falls back to logging if distributed is not initialized or error occurs.
     """
-    from sglang.srt.distributed import model_parallel_is_initialized
 
     try:
-        if not model_parallel_is_initialized() or get_parallel().tp_rank == 0:
+        if torch.distributed.is_initialized() and get_parallel().tp_rank == 0:
             logger.debug(msg)
     except Exception as e:
         if torch.distributed.is_initialized():

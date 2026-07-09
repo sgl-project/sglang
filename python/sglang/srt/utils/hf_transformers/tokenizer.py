@@ -26,7 +26,7 @@ from transformers import (
 )
 
 from sglang.srt.connector import create_remote_connector
-from sglang.srt.utils import is_remote_url, logger, print_warning_once
+from sglang.srt.utils import is_remote_url, logger
 from sglang.srt.utils.patch_tokenizer import patch_tokenizer
 
 from ..hf_transformers_patches import _ensure_gguf_version
@@ -232,10 +232,11 @@ def _resolve_tokenizers_backend(tokenizer_name, *args, **common_kwargs):
 
     if type(tokenizer).__name__ == _TOKENIZERS_BACKEND:
         if common_kwargs.get("trust_remote_code"):
-            print_warning_once(
-                f"Tokenizer for {tokenizer_name} is still TokenizersBackend after retries "
+            logger.warning(
+                "Tokenizer for %s is still TokenizersBackend after retries "
                 "with --trust-remote-code. Model-specific tokenizer attributes "
-                "may be missing."
+                "may be missing.",
+                tokenizer_name,
             )
         else:
             logger.debug(

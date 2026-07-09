@@ -115,7 +115,6 @@ from sglang.srt.utils import (
     get_device_capability,
     is_npu,
     is_pin_memory_available,
-    log_info_on_rank0,
     rank0_log,
     set_weight_attrs,
 )
@@ -2627,7 +2626,7 @@ class IncModelLoader(DefaultModelLoader):
 
         # Check if model is already quantized
         if model_config._is_already_quantized():
-            log_info_on_rank0(logger, "Model is already quantized, loading directly...")
+            logger.info("Model is already quantized, loading directly...")
             # Use default loading for pre-quantized models
             return super().load_model(
                 model_config=model_config, device_config=device_config
@@ -2896,7 +2895,7 @@ class ModelOptModelLoader(DefaultModelLoader):
 
         # Check if model is already quantized
         if model_config._is_already_quantized():
-            log_info_on_rank0(logger, "Model is already quantized, loading directly...")
+            logger.info("Model is already quantized, loading directly...")
             # Use default loading for pre-quantized models
             return super().load_model(
                 model_config=model_config, device_config=device_config
@@ -3247,9 +3246,7 @@ def get_model_loader(
         or model_config.quantization
         in ["modelopt_fp8", "modelopt_fp4", "modelopt_mixed", "modelopt"]
     ):
-        log_info_on_rank0(
-            logger, "Using ModelOptModelLoader due to ModelOpt quantization config."
-        )
+        logger.info("Using ModelOptModelLoader due to ModelOpt quantization config.")
         return ModelOptModelLoader(load_config)
 
     # Use ModelOptModelLoader for unified quantization flags
