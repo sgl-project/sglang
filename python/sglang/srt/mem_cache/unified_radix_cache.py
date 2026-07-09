@@ -496,7 +496,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # Direct IO layout fixup (must happen before pool creation)
         if server_args.hicache_io_backend == "direct":
             if server_args.hicache_mem_layout == "page_first":
-                server_args.hicache_mem_layout = "page_first_direct"
+                server_args.override(
+                    "hicache.mem_layout_force", hicache_mem_layout="page_first_direct"
+                )
                 logger.warning(
                     "Page first layout is not supported with direct IO backend, "
                     "switching to page first direct layout"
@@ -2278,10 +2280,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 labels.update(extra_metric_labels)
             existing_collector = self.storage_metrics_collector
             if existing_collector is None:
-                from sglang.srt.server_args import get_global_server_args
+                from sglang.srt.runtime_context import get_server_args
 
                 storage_cls = resolve_collector_class(
-                    get_global_server_args(),
+                    get_server_args(),
                     STAT_LOGGER_ROLE_STORAGE,
                     StorageMetricsCollector,
                 )

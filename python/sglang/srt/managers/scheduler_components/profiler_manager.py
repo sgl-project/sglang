@@ -18,7 +18,7 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import ProfileReq, ProfileReqOutput, ProfileReqType
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import is_mps, is_npu
 from sglang.srt.utils.profile_merger import ProfileMerger
 from sglang.srt.utils.profile_utils import ProfileManager
@@ -245,7 +245,7 @@ class SchedulerProfilerManager:
             self.profile_in_progress = True
 
         if "CUDA_PROFILER" in activities:
-            if self.ps.gpu_id == get_global_server_args().base_gpu_id:
+            if self.ps.gpu_id == get_server_args().base_gpu_id:
                 torch.cuda.cudart().cudaProfilerStart()
             self.profile_in_progress = True
 
@@ -355,7 +355,7 @@ class SchedulerProfilerManager:
             torch.cuda.memory._record_memory_history(enabled=None)
 
         if "CUDA_PROFILER" in self.profiler_activities:
-            if self.ps.gpu_id == get_global_server_args().base_gpu_id:
+            if self.ps.gpu_id == get_server_args().base_gpu_id:
                 torch.cuda.cudart().cudaProfilerStop()
 
         merge_message = self._merge_profile_traces()

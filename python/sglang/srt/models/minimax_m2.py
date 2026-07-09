@@ -45,7 +45,6 @@ from sglang.srt.layers.communicator import (
 )
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_reduce,
-    get_attention_tp_group,
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layernorm import RMSNorm
@@ -81,8 +80,7 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
     narrow_padded_param_and_loaded_weight,
 )
-from sglang.srt.runtime_context import get_parallel
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_parallel, get_server_args
 
 # get_bool_env_var is defined in sglang.srt.utils.common, not sglang.srt.distributed.
 # Importing from the wrong module causes this file to fail import, which prevents the
@@ -427,7 +425,7 @@ class MiniMaxM2QKRMSNorm:
 
         props = torch.cuda.get_device_properties(device)
         # probe the maximum tokens for one prefill
-        server_args = get_global_server_args()
+        server_args = get_server_args()
         max_tokens = server_args.chunked_prefill_size
         if max_tokens is None:
             max_tokens = server_args.model_config.context_len
@@ -437,7 +435,7 @@ class MiniMaxM2QKRMSNorm:
         # typically, this should not exceed 1M, since max_tokens is usually less than 16384
         max_size = ((8 * max_tokens + ALIGN - 1) // ALIGN) * ALIGN
         comm = CustomAllReduceV2(
-            group=get_attention_tp_group().cpu_group,
+            group=get_parallel().attn_tp_group.cpu_group,
             device=device,
             max_pull_size=0,
             max_pull_blocks=0,
@@ -515,7 +513,7 @@ class MiniMaxM2MoE(nn.Module):
 
         self.experts = get_moe_impl_class(quant_config)(
             num_experts=config.num_local_experts
-            + get_global_server_args().ep_num_redundant_experts,
+            + get_server_args().ep_num_redundant_experts,
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
@@ -877,7 +875,7 @@ class MiniMaxM2Attention(nn.Module):
                 rotary_dim=self.rotary_dim,
                 eps=self.q_norm.variance_epsilon,
                 tp_world=self.q_norm.attn_tp_size,
-                tp_group=get_attention_tp_group().device_group,
+                tp_group=get_parallel().attn_tp_group.device_group,
             )
         else:
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
