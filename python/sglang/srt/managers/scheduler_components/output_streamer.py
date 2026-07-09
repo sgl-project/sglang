@@ -505,11 +505,23 @@ class _GenerationStreamAccumulator:
                 req.indexer_topk if req.return_indexer_topk else None
             )
 
+        current_output_len = len(self.output_ids[-1])
         if req.customized_info is not None:
-            for k, v in req.customized_info.items():
-                if k not in self.customized_info:
-                    self.customized_info[k] = []
-                self.customized_info[k].append(v[send_token_offset : len(output_ids_)])
+            for key, req_values in req.customized_info.items():
+                if key not in self.customized_info:
+                    self.customized_info[key] = [
+                        [None] * len(prev_output_ids)
+                        for prev_output_ids in self.output_ids[:-1]
+                    ]
+                self.customized_info[key].append(
+                    [None] * current_output_len
+                    if req_values is None
+                    else req_values[send_token_offset : len(output_ids_)]
+                )
+
+        for per_request_values in self.customized_info.values():
+            if len(per_request_values) < len(self.output_ids):
+                per_request_values.append([None] * current_output_len)
 
     def to_payload(
         self, *, dp_rank: int, is_idle_batch: bool

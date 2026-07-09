@@ -8,6 +8,7 @@ from sglang.srt.distributed import get_tp_group
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -124,6 +125,12 @@ class DFlashWorkerV2(BaseSpecWorker):
         self.nccl_port = nccl_port
         self._target_worker = target_worker
         self.model_runner = target_worker.model_runner
+        self._need_mamba_verify_commit = (
+            self.model_runner.mambaish_config is not None
+            and hasattr(
+                self.model_runner.attn_backend, "update_mamba_state_after_mtp_verify"
+            )
+        )
         self.page_size = server_args.page_size
         # Normalized in arg_groups.speculative_hook.handle_speculative_decoding.
         self.draft_window_size: Optional[int] = (
@@ -281,7 +288,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._draft_worker.init_attention_backends()
 
     def init_cuda_graphs(self):
-        capture_decode_cuda_graph = not self.server_args.disable_cuda_graph
+        capture_decode_cuda_graph = (
+            self.server_args.cuda_graph_config.decode.backend != Backend.DISABLED
+        )
         if is_cuda() and capture_decode_cuda_graph:
             available_mem = get_available_gpu_memory(self.device, self.gpu_id)
             if available_mem < 1.0:
@@ -346,6 +355,18 @@ class DFlashWorkerV2(BaseSpecWorker):
 
             if len(layers) == 0:
                 fused_disable_reason = "no layers found"
+            elif not getattr(self.draft_model, "supports_fused_context_kv", True):
+                fused_disable_reason = "draft model does not support fused context KV"
+
+            if fused_disable_reason is not None:
+                if self.tp_rank == 0:
+                    logger.info(
+                        "DFLASH fused KV materialization disabled: %s",
+                        fused_disable_reason,
+                    )
+                self._use_fused_kv_materialize = False
+                self._fused_kv_helper = None
+                return
 
             for layer_idx, layer in enumerate(layers):
                 attn = layer.self_attn
@@ -962,7 +983,10 @@ class DFlashWorkerV2(BaseSpecWorker):
 
                 for layer in self.draft_model.layers:
                     attn = layer.self_attn
-                    k, v = attn.kv_proj_only(ctx_hidden)
+                    layer_ctx_hidden = self.draft_model.prepare_context_hidden_for_kv(
+                        layer, ctx_hidden
+                    )
+                    k, v = attn.kv_proj_only(layer_ctx_hidden)
                     k = attn.apply_k_norm(k)
                     k = attn.apply_k_rope(positions, k)
                     k = k.view(-1, attn.num_kv_heads, attn.head_dim)
@@ -1009,10 +1033,13 @@ class DFlashWorkerV2(BaseSpecWorker):
     ) -> None:
         for layer in self.draft_model.layers:
             attn = layer.self_attn
+            layer_ctx_hidden = self.draft_model.prepare_context_hidden_for_kv(
+                layer, ctx_hidden
+            )
             if _is_npu:
-                _, k, v = attn.forward_prepare_npu(ctx_positions, ctx_hidden)
+                _, k, v = attn.forward_prepare_npu(ctx_positions, layer_ctx_hidden)
             else:
-                k, v = attn.kv_proj_only(ctx_hidden)
+                k, v = attn.kv_proj_only(layer_ctx_hidden)
                 k = attn.apply_k_norm(k)
                 k = attn.apply_k_rope(ctx_positions, k)
             k = k.view(-1, attn.num_kv_heads, attn.head_dim)
@@ -1084,9 +1111,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         cache per-step intermediate states. After acceptance, we need to commit the
         state corresponding to each request's last accepted step.
         """
-        attn_backend = self.target_worker.model_runner.attn_backend
-        if not hasattr(attn_backend, "update_mamba_state_after_mtp_verify"):
+        if not self._need_mamba_verify_commit:
             return
+        attn_backend = self.target_worker.model_runner.attn_backend
 
         last_correct_step_indices = commit_lens.to(torch.int64) - 1
         mamba_steps_to_track = None
@@ -1499,12 +1526,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         batch.out_cache_loc = verify_out_cache_loc
         sampling_info = batch.sampling_info
 
-        need_mamba_verify_commit = hasattr(
-            self.target_worker.model_runner.attn_backend,
-            "update_mamba_state_after_mtp_verify",
-        )
         seq_lens_pre_verify = (
-            batch.seq_lens.clone() if need_mamba_verify_commit else None
+            batch.seq_lens.clone() if self._need_mamba_verify_commit else None
         )
         seq_lens_cpu_backup = batch.seq_lens_cpu
         seq_lens_sum_backup = batch.seq_lens_sum
@@ -1624,7 +1647,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                     1, accept_len.to(torch.int64)[:, None], bonus[:, None]
                 )
 
-        if need_mamba_verify_commit:
+        if self._need_mamba_verify_commit:
             assert seq_lens_pre_verify is not None
             self._update_target_mamba_state_after_verify(
                 batch=batch,

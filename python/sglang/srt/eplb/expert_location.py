@@ -290,6 +290,9 @@ class ExpertLocationMetadata:
     ) -> List[int]:
         # Use CPU copy to avoid GPU→CPU sync on every call, which is expensive in update weights scenario
         cpu_map = self.logical_to_all_physical_map_cpu
+        # Draft workers can query MoE layers whose layer_id lies beyond the
+        # target-sized expert map; fall back to the identity mapping (no EPLB
+        # rebalancing for those layers) instead of indexing out of range.
         if layer_id >= cpu_map.shape[0]:
             if require_global_experts:
                 num_physical_experts = cpu_map.shape[-1]
@@ -313,17 +316,18 @@ class ExpertLocationMetadata:
         ]
 
 
-_global_expert_location_metadata: Optional[ExpertLocationMetadata] = None
-
-
 def get_global_expert_location_metadata():
-    return _global_expert_location_metadata
+    from sglang.srt.runtime_context import get_resources
+
+    return get_resources().expert_location_metadata
 
 
 def set_global_expert_location_metadata(value):
-    global _global_expert_location_metadata
-    assert _global_expert_location_metadata is None
-    _global_expert_location_metadata = value
+    from sglang.srt.runtime_context import get_resources
+
+    resources = get_resources()
+    assert resources.expert_location_metadata is None
+    resources.expert_location_metadata = value
 
 
 def broadcast_global_expert_location_metadata(

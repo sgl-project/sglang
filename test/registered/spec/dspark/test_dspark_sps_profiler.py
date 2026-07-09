@@ -1,14 +1,16 @@
 import unittest
 
 from sglang.benchmark.dspark_sps_profiler import (
+    SPS_RECORD_SOURCE,
     LoadInfo,
     ServerContext,
     SpsRow,
     build_request_count_sweep,
-    build_table_from_rounds,
+    build_table_from_summaries,
     count_aligned_steps,
     postprocess_round,
     resolve_cuda_graph_max_bs,
+    round_summary_dict,
     validate_sweep_against_server,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -53,6 +55,7 @@ def make_context(**overrides) -> ServerContext:
         cuda_graph_max_bs=128,
         skip_max_running_requests_threshold=float("inf"),
         skip_token_capacity_threshold=float("inf"),
+        record_source=SPS_RECORD_SOURCE,
     )
     values.update(overrides)
     return ServerContext(**values)
@@ -171,10 +174,13 @@ class TestPostprocessRoundCrossRank(CustomTestCase):
                 load_info=make_load_info(),
             )
 
-    def test_cross_rank_verify_token_mismatch_raises(self):
+    def test_rank_below_expected_verify_tokens_raises(self):
+        # A rank reporting fewer verify tokens than bs_per_rank * K is not
+        # running the uniform static verify; above-expected counts are
+        # tolerated (the recorded count is the replayed graph tier).
         with self.assertRaisesRegex(RuntimeError, "num_verify_tokens"):
             postprocess_round(
-                rank_rows=[make_rows(), make_rows(num_verify_tokens=40)],
+                rank_rows=[make_rows(), make_rows(num_verify_tokens=24)],
                 batch_size_per_rank=4,
                 dp_size=2,
                 verify_num_draft_tokens=8,
@@ -207,7 +213,14 @@ class TestTableAssembly(CustomTestCase):
             )
             for step_time in (0.01, 0.02, 0.04)
         ]
-        table = build_table_from_rounds(rounds=rounds, max_batch_tokens=None)
+        table = build_table_from_summaries(
+            summaries=[
+                round_summary_dict(outcome=outcome, repeat=repeat)
+                for repeat, outcome in enumerate(rounds)
+            ],
+            max_batch_tokens=None,
+            offdiag=False,
+        )
         self.assertEqual(table.sample_batch_tokens, [32])
         self.assertAlmostEqual(table.sample_steps_per_sec[0], 50.0)
 
@@ -228,7 +241,13 @@ class TestTableAssembly(CustomTestCase):
             )
             for batch_size in (8, 2, 4)
         ]
-        table = build_table_from_rounds(rounds=rounds, max_batch_tokens=None)
+        table = build_table_from_summaries(
+            summaries=[
+                round_summary_dict(outcome=outcome, repeat=0) for outcome in rounds
+            ],
+            max_batch_tokens=None,
+            offdiag=False,
+        )
         self.assertEqual(table.sample_batch_tokens, [16, 32, 64])
 
 

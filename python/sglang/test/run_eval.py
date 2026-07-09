@@ -113,15 +113,18 @@ def dump_and_analyze_records(args, samplers: list) -> None:
     if not records:
         return
 
-    stamp = time.strftime("%Y%m%d-%H%M%S")
-    rand = f"{random.randint(0, 1 << 32):08x}"
-    dump_path = os.path.expanduser(f"~/{stamp}-{rand}-run_eval-{args.eval_name}.json")
-    try:
-        with open(dump_path, "w") as f:
-            json.dump(records, f, indent=2, default=str)
-        print(f"Wrote {len(records)} raw request/response records to {dump_path}")
-    except OSError:
-        traceback.print_exc()
+    if getattr(args, "dump_records", False):
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        rand = f"{random.randint(0, 1 << 32):08x}"
+        dump_path = os.path.expanduser(
+            f"~/{stamp}-{rand}-run_eval-{args.eval_name}.json"
+        )
+        try:
+            with open(dump_path, "w") as f:
+                json.dump(records, f, indent=2, default=str)
+            print(f"Wrote {len(records)} raw request/response records to {dump_path}")
+        except OSError:
+            traceback.print_exc()
 
     accept_lengths = [
         m["spec_accept_length"]
@@ -402,6 +405,12 @@ if __name__ == "__main__":
         help="JSON object string for chat_template_kwargs, e.g. '{\"enable_thinking\": true}'",
     )
     parser.add_argument("--reasoning-effort", type=str)
+    parser.add_argument(
+        "--dump-records",
+        action="store_true",
+        help="Dump every raw request/response record (including prompts and "
+        "generations) to a JSON file under the home directory after the eval.",
+    )
     parser.add_argument(
         "--thinking-mode",
         default=None,

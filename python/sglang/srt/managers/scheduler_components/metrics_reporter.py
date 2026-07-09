@@ -217,7 +217,10 @@ class SchedulerMetricsReporter:
             if base_endpoint is None:
                 ipc_path = tempfile.NamedTemporaryFile(delete=False).name
                 base_endpoint = f"ipc://{ipc_path}"
-                self.scheduler.server_args.forward_pass_metrics_ipc_name = base_endpoint
+                self.scheduler.server_args.override(
+                    "metrics_reporter.ipc_endpoint",
+                    forward_pass_metrics_ipc_name=base_endpoint,
+                )
             endpoint = f"{base_endpoint}.{self.scheduler._fpm_dp_rank}"
             self.scheduler._fpm_publisher = _FpmPublisherThread(
                 endpoint,

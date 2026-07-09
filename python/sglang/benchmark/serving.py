@@ -2181,6 +2181,7 @@ def cli_main():
         type=str,
         default="sharegpt",
         choices=[
+            "agentic-trace",
             "autobench",
             "sharegpt",
             "custom",
@@ -2198,6 +2199,21 @@ def cli_main():
     )
     parser.add_argument(
         "--dataset-path", type=str, default="", help="Path to the dataset."
+    )
+    parser.add_argument(
+        "--dataset-offset",
+        type=int,
+        default=0,
+        help="Rotate the conversation list by this many entries before sampling "
+        "(agentic-trace dataset), so successive sweep steps start on fresh "
+        "conversations.",
+    )
+    parser.add_argument(
+        "--agentic-max-turns",
+        type=int,
+        default=None,
+        help="Cap each conversation to at most this many turns (agentic-trace "
+        "dataset). Default: use all turns in the trace.",
     )
     parser.add_argument(
         "--speed-bench-category",
