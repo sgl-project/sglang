@@ -2270,7 +2270,15 @@ class DeepseekV4Model(nn.Module):
                         )
                     else:
                         completed = hidden_states
-                    dspark_aux_hidden_states.append(completed.mean(dim=1))
+                    aux_hidden = completed.mean(dim=1)
+                    if self.pp_group.is_last_rank and dsa_use_prefill_cp(forward_batch):
+                        aux_hidden = cp_all_gather_rerange_output(
+                            aux_hidden,
+                            self.cp_size,
+                            forward_batch,
+                            torch.cuda.current_stream(),
+                        )
+                    dspark_aux_hidden_states.append(aux_hidden)
             if use_fused and last_layer is not None:
                 hidden_states = last_layer.hc_post(
                     hidden_states, prev_residual, prev_post, prev_comb
