@@ -10,11 +10,6 @@ import torch
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_build_dsv4_verify_bundle,
 )
-from sglang.srt.mem_cache.allocation import (
-    ALLOC_EXTEND_FUNCS,
-    alloc_token_slots,
-    get_last_loc,
-)
 from sglang.srt.mem_cache.allocation_sizing import get_alloc_reserve_per_decode
 from sglang.srt.speculative.triton_ops.spec_tree import (
     sgl_build_tree_kernel_efficient_triton,
@@ -759,8 +754,6 @@ def eagle_sample(
 def eagle_prepare_for_decode(batch: ScheduleBatch):
     batch.maybe_evict_swa()
 
-    from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
-
     bs = batch.batch_size()
 
     # Accumulate penalty
@@ -813,37 +806,15 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
     reqs = batch.reqs
     cur_kv_lens = cur_kv_lens_device
     nxt_kv_lens = nxt_kv_lens_device
-    if num_needed_tokens > 0:
-        if tree_cache.token_to_kv_pool_allocator.page_size == 1:
-            out_cache_loc = alloc_token_slots(tree_cache, num_needed_tokens)
-        else:
-            last_loc = get_last_loc(
-                req_to_token_pool.req_to_token, req_pool_indices, cur_kv_lens
-            )
-            device_type = getattr(
-                batch.device, "type", str(batch.device).split(":", 1)[0]
-            )
-            out_cache_loc = ALLOC_EXTEND_FUNCS[device_type](
-                tree_cache,
-                cur_kv_lens,
-                cur_kv_lens_cpu,
-                nxt_kv_lens,
-                nxt_kv_lens_cpu,
-                last_loc,
-                num_needed_tokens,
-                req_pool_indices=req_pool_indices,
-                batch=batch,
-            )
-        # Updating req_to_token is a write to a shared tensor: it must not overlap
-        # with the previous batch's forward, which also reads req_to_token.
-        assign_req_to_token_pool_func(
-            req_pool_indices,
-            req_to_token_pool.req_to_token,
-            cur_kv_lens,
-            nxt_kv_lens,
-            out_cache_loc,
-            len(reqs),
-        )
-
-    for i, req in enumerate(reqs):
-        req.kv.kv_allocated_len = max(req.kv.kv_allocated_len, int(nxt_kv_lens_cpu[i]))
+    alloc_for_spec_decode(
+        tree_cache,
+        req_to_token_pool,
+        reqs=reqs,
+        req_pool_indices=req_pool_indices,
+        cur_kv_lens=cur_kv_lens,
+        cur_kv_lens_cpu=cur_kv_lens_cpu,
+        nxt_kv_lens=nxt_kv_lens,
+        nxt_kv_lens_cpu=nxt_kv_lens_cpu,
+        num_needed_tokens=num_needed_tokens,
+        batch=batch,
+    )

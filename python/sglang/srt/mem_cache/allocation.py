@@ -538,3 +538,52 @@ ALLOC_EXTEND_FUNCS = defaultdict(
     lambda: alloc_paged_token_slots_extend,
     {"npu": _alloc_paged_token_slots_extend_npu},
 )
+
+
+def alloc_for_spec_decode(
+    tree_cache: BasePrefixCache,
+    req_to_token_pool: ReqToTokenPool,
+    *,
+    reqs: list[Req],
+    req_pool_indices: torch.Tensor,
+    cur_kv_lens: torch.Tensor,
+    cur_kv_lens_cpu: torch.Tensor,
+    nxt_kv_lens: torch.Tensor,
+    nxt_kv_lens_cpu: torch.Tensor,
+    num_needed_tokens: int,
+    batch: Optional[ScheduleBatch] = None,
+) -> None:
+    if num_needed_tokens > 0:
+        if tree_cache.token_to_kv_pool_allocator.page_size == 1:
+            out_cache_loc = alloc_token_slots(tree_cache, num_needed_tokens)
+        else:
+            last_loc = get_last_loc(
+                req_to_token_pool.req_to_token, req_pool_indices, cur_kv_lens
+            )
+            device_type = getattr(
+                batch.device, "type", str(batch.device).split(":", 1)[0]
+            )
+            out_cache_loc = ALLOC_EXTEND_FUNCS[device_type](
+                tree_cache,
+                cur_kv_lens,
+                cur_kv_lens_cpu,
+                nxt_kv_lens,
+                nxt_kv_lens_cpu,
+                last_loc,
+                num_needed_tokens,
+                req_pool_indices=req_pool_indices,
+                batch=batch,
+            )
+        # Updating req_to_token is a write to a shared tensor: it must not overlap
+        # with the previous batch's forward, which also reads req_to_token.
+        assign_req_to_token_pool_func(
+            req_pool_indices,
+            req_to_token_pool.req_to_token,
+            cur_kv_lens,
+            nxt_kv_lens,
+            out_cache_loc,
+            len(reqs),
+        )
+
+    for i, req in enumerate(reqs):
+        req.kv.kv_allocated_len = max(req.kv.kv_allocated_len, int(nxt_kv_lens_cpu[i]))
