@@ -318,6 +318,9 @@ def maybe_load_fsdp_model(
         # move to device to perform postprocessing
         model.to(weight_postprocess_device)
 
+    local_torch_device = get_local_torch_device()
+    use_device_loading_context = load_cpu_offload and weight_postprocess_device is None
+
     for _, module in model.named_modules():
         quant_method = getattr(module, "quant_method", None)
         if quant_method is not None and hasattr(
@@ -327,7 +330,13 @@ def maybe_load_fsdp_model(
                 # Activate the NZ format for storing weights,
                 # which is a specific optimization for Ascend NPU
                 torch.npu.config.allow_internal_format = True
-            quant_method.process_weights_after_loading(module)
+            if use_device_loading_context:
+                # Some quant methods need temporary device tensors for post-load
+                # repacking even when the component's runtime residency is CPU.
+                with device_loading_context(module, local_torch_device):
+                    quant_method.process_weights_after_loading(module)
+            else:
+                quant_method.process_weights_after_loading(module)
             if _is_npu:
                 torch.npu.empty_cache()
     model.post_load_weights()
@@ -338,19 +347,6 @@ def maybe_load_fsdp_model(
         # Avoid unintended computation graph accumulation during inference
         if isinstance(p, torch.nn.Parameter):
             p.requires_grad = False
-    local_torch_device = get_local_torch_device()
-    for _, module in model.named_modules():
-        quant_method = getattr(module, "quant_method", None)
-        if quant_method is not None:
-            if use_fsdp and isinstance(quant_method, UnquantizedLinearMethod):
-                continue
-            # When quant methods need to process weights after loading
-            # (for repacking, quantizing, etc), they expect parameters
-            # to be on the global target device. This scope is for the
-            # case where cpu offloading is used, where we will move the
-            # parameters onto device for processing and back off after.
-            with device_loading_context(module, local_torch_device):
-                quant_method.process_weights_after_loading(module)
 
     # 4. deferred cpu offload
     if defer_cpu_offload:
