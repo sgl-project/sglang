@@ -5,6 +5,9 @@ from typing import Any
 
 import torch
 
+from sglang.multimodal_gen.runtime.managers.dreamzero_session_cache import (
+    session_metadata_from_batch,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
@@ -31,9 +34,12 @@ class DreamZeroActionUnnormalizeStage(PipelineStage):
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         normalized_action = batch.dreamzero_action_pred.float()
+        session_metadata_kind = "slot_pool"
         unapply = self.unapply or batch.extra.get("dreamzero_unapply")
         if unapply is None:
             batch.output = normalized_action
+            batch.dreamzero_session_metadata = session_metadata_from_batch(batch)
+            batch.dreamzero_session_metadata_kind = session_metadata_kind
             return batch
 
         try:
@@ -48,4 +54,6 @@ class DreamZeroActionUnnormalizeStage(PipelineStage):
                 batch.output = result
         except ImportError:
             batch.output = unapply(normalized_action)
+        batch.dreamzero_session_metadata = session_metadata_from_batch(batch)
+        batch.dreamzero_session_metadata_kind = session_metadata_kind
         return batch

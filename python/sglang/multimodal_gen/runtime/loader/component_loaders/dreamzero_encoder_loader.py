@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Fallback DreamZero text/image encoder loaders.
+"""DreamZero text/image encoder loaders.
 
-These loaders intentionally keep the Groot encoder implementations for Phase 3.
-SGLang has a UMT5 encoder and OpenAI-style CLIP modules, but the DROID checkpoint
-stores Groot's custom WanTextEncoder and open-clip XLM-RoBERTa ViT-H weights.
+DreamZero-DROID stores custom Wan text encoder and open-clip XLM-RoBERTa
+ViT-H weights, so these loaders instantiate the SGLang-local compatible
+implementations and copy checkpoint tensors into matching state_dict keys.
 """
 
 from __future__ import annotations
@@ -212,7 +212,9 @@ def build_dreamzero_text_encoder(
     *,
     dtype: torch.dtype = torch.bfloat16,
 ) -> nn.Module:
-    from groot.vla.model.dreamzero.modules.wan_video_text_encoder import WanTextEncoder
+    from sglang.multimodal_gen.runtime.models.encoders.dreamzero_text import (
+        WanTextEncoder,
+    )
 
     with torch.device("meta"):
         model = WanTextEncoder().to(dtype=dtype)
@@ -225,7 +227,7 @@ def build_dreamzero_image_encoder(
     dtype: torch.dtype = torch.bfloat16,
     device: torch.device | None = None,
 ) -> nn.Module:
-    from groot.vla.model.dreamzero.modules.wan_video_image_encoder import (
+    from sglang.multimodal_gen.runtime.models.encoders.dreamzero_image import (
         WanImageEncoder,
     )
 
@@ -250,7 +252,7 @@ def load_dreamzero_text_encoder_checkpoint(
             pth_path,
             device=device,
             strict=strict,
-            fallback_impl="groot.WanTextEncoder",
+            fallback_impl="sglang.WanTextEncoder",
         )
     return _load_prefixed_checkpoint(
         model,
@@ -258,7 +260,7 @@ def load_dreamzero_text_encoder_checkpoint(
         prefix=_DROID_TEXT_ENCODER_PREFIX,
         device=device,
         strict=strict,
-        fallback_impl="groot.WanTextEncoder",
+        fallback_impl="sglang.WanTextEncoder",
     )
 
 
@@ -276,7 +278,7 @@ def load_dreamzero_image_encoder_checkpoint(
             pth_path,
             device=device,
             strict=False,
-            fallback_impl="groot.WanImageEncoder",
+            fallback_impl="sglang.WanImageEncoder",
         )
     return _load_prefixed_checkpoint(
         model,
@@ -284,7 +286,7 @@ def load_dreamzero_image_encoder_checkpoint(
         prefix=_DROID_IMAGE_ENCODER_PREFIX,
         device=device,
         strict=strict,
-        fallback_impl="groot.WanImageEncoder",
+        fallback_impl="sglang.WanImageEncoder",
     )
 
 

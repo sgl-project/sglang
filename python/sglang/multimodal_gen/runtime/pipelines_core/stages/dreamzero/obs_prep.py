@@ -1,11 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import time
 from collections.abc import Callable, Mapping
 from typing import Any
 
 import torch
 
+from sglang.multimodal_gen.runtime.managers.dreamzero_session_cache import (
+    normalize_batched_session_fields,
+    record_session_timing,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
@@ -19,8 +24,8 @@ class DreamZeroObsPrepStage(PipelineStage):
 
     The stage accepts already-normalized model inputs via
     ``Req.extra["dreamzero_normalized_input"]``. For integration probes that keep
-    Groot's transform object around, ``obs_transform`` may be supplied and will be
-    called with ``Req.extra["dreamzero_obs"]``.
+    an external transform object around, ``obs_transform`` may be supplied and
+    will be called with ``Req.extra["dreamzero_obs"]``.
     """
 
     def __init__(self, obs_transform: Callable[[Any], Mapping[str, Any]] | None = None):
@@ -35,6 +40,28 @@ class DreamZeroObsPrepStage(PipelineStage):
             lambda value: isinstance(value, dict),
         )
         return result
+
+    @staticmethod
+    def _infer_model_input_batch_size(model_inputs: Mapping[str, Any]) -> int:
+        for key in (
+            "images",
+            "videos",
+            "state",
+            "text",
+            "text_negative",
+            "clip_feature",
+            "y",
+            "latent_video",
+        ):
+            value = model_inputs.get(key)
+            if torch.is_tensor(value) and value.ndim > 0:
+                return int(value.shape[0])
+        prompt_embs = model_inputs.get("prompt_embs")
+        if isinstance(prompt_embs, (list, tuple)):
+            for value in prompt_embs:
+                if torch.is_tensor(value) and value.ndim > 0:
+                    return int(value.shape[0])
+        raise ValueError("Cannot infer DreamZero batch size from normalized input")
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         normalized_input = batch.extra.get("dreamzero_normalized_input")
@@ -63,6 +90,7 @@ class DreamZeroObsPrepStage(PipelineStage):
                 )
 
         model_inputs = dict(normalized_input)
+        normalize_start = time.perf_counter()
         target_dtype = torch.bfloat16
         if not server_args.pipeline_config.disable_autocast:
             for key, value in list(model_inputs.items()):
@@ -71,24 +99,17 @@ class DreamZeroObsPrepStage(PipelineStage):
 
         batch.dreamzero_inputs = model_inputs
         batch.dreamzero_original_obs = original_obs
-        sampling_params = getattr(batch, "sampling_params", None)
-        requested_session_id = getattr(batch, "session_id", None)
-        if sampling_params is not None:
-            requested_session_id = (
-                getattr(sampling_params, "session_id", None)
-                or requested_session_id
-            )
-        batch.dreamzero_session_id = batch.extra.get(
-            "dreamzero_session_id",
-            requested_session_id,
+        batch_size = self._infer_model_input_batch_size(model_inputs)
+        session_ids, reset_mask = normalize_batched_session_fields(
+            session_ids=batch.extra.get("dreamzero_session_ids"),
+            reset_mask=batch.extra.get("dreamzero_reset_mask"),
+            batch_size=batch_size,
         )
-        batch.reset_session = bool(
-            getattr(batch, "reset_session", False)
-            or (
-                getattr(sampling_params, "reset_session", False)
-                if sampling_params is not None
-                else False
-            )
-            or batch.extra.get("dreamzero_reset_session", False)
+        batch.dreamzero_session_ids = session_ids
+        batch.dreamzero_reset_mask = reset_mask
+        record_session_timing(
+            batch,
+            "session_normalize_ms",
+            (time.perf_counter() - normalize_start) * 1000,
         )
         return batch

@@ -18,7 +18,9 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_sp_world_size,
     model_parallel_is_initialized,
 )
-from sglang.multimodal_gen.runtime.managers.dreamzero_session_store import SessionStore
+from sglang.multimodal_gen.runtime.managers.dreamzero_session_cache import (
+    DreamZeroCachePoolManager,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
@@ -57,6 +59,43 @@ def _compile_component_forward(forward):
     )(forward)
 
 
+def _resolve_attr(root: Any, attr_path: str) -> tuple[Any, str] | None:
+    parent = root
+    parts = attr_path.split(".")
+    for part in parts[:-1]:
+        parent = getattr(parent, part, None)
+        if parent is None:
+            return None
+    leaf = parts[-1]
+    if not hasattr(parent, leaf):
+        return None
+    return parent, leaf
+
+
+def _compile_first_available_method(
+    module: Any,
+    *,
+    component_name: str,
+    method_paths: tuple[str, ...],
+) -> str | None:
+    for method_path in method_paths:
+        resolved = _resolve_attr(module, method_path)
+        if resolved is None:
+            continue
+        parent, leaf = resolved
+        method = getattr(parent, leaf)
+        if not callable(method):
+            continue
+        setattr(parent, leaf, _compile_component_forward(method))
+        return method_path
+    logger.warning(
+        "Skipping DreamZero %s compile; none of the expected methods exist: %s",
+        component_name,
+        ", ".join(method_paths),
+    )
+    return None
+
+
 class DreamZeroPipeline(ComposedPipelineBase):
     """Pipeline that composes DreamZero obs prep, text encoding, DiT and action output."""
 
@@ -73,17 +112,7 @@ class DreamZeroPipeline(ComposedPipelineBase):
     sampling_params_cls = DreamZeroSamplingParams
 
     def _build_scheduler(self, server_args: ServerArgs) -> FlowUniPCMultistepScheduler:
-        scheduler_cls = FlowUniPCMultistepScheduler
-        try:
-            from groot.vla.model.dreamzero.modules.flow_unipc_multistep_scheduler import (
-                FlowUniPCMultistepScheduler as GrootFlowUniPCMultistepScheduler,
-            )
-
-            scheduler_cls = GrootFlowUniPCMultistepScheduler
-        except ImportError:
-            pass
-
-        return scheduler_cls(
+        return FlowUniPCMultistepScheduler(
             shift=server_args.pipeline_config.flow_shift,
         )
 
@@ -181,14 +210,27 @@ class DreamZeroPipeline(ComposedPipelineBase):
 
         if getattr(pc, "dreamzero_compile_components", True):
             logger.info("Compiling DreamZero text/image/VAE components")
-            text_encoder.forward = _compile_component_forward(text_encoder.forward)
-            image_encoder.model.visual.forward = _compile_component_forward(
-                image_encoder.model.visual.forward
+            compiled = {
+                "text_encoder": _compile_first_available_method(
+                    text_encoder,
+                    component_name="text_encoder",
+                    method_paths=("forward",),
+                ),
+                "image_encoder": _compile_first_available_method(
+                    image_encoder,
+                    component_name="image_encoder",
+                    method_paths=("model.visual.forward", "encode_image", "forward"),
+                ),
+                "vae": _compile_first_available_method(
+                    vae,
+                    component_name="vae",
+                    method_paths=("model.encode", "encode"),
+                ),
+            }
+            logger.info(
+                "Compiled DreamZero component methods: %s",
+                {name: path for name, path in compiled.items() if path is not None},
             )
-            # Groot compiles the inner encode method rather than the wrapper.
-            # Keep this exact boundary to preserve its BF16 kernel selection
-            # and output numerics.
-            vae.model.encode = _compile_component_forward(vae.model.encode)
         return modules
 
     def initialize_pipeline(self, server_args: ServerArgs) -> None:
@@ -207,7 +249,7 @@ class DreamZeroPipeline(ComposedPipelineBase):
             raise RuntimeError(
                 "DreamZero SP requires initialized model-parallel process groups"
             )
-        self.session_store = SessionStore(
+        self.cache_manager = DreamZeroCachePoolManager(
             max_sessions=server_args.pipeline_config.dreamzero_max_sessions
         )
 
@@ -216,7 +258,7 @@ class DreamZeroPipeline(ComposedPipelineBase):
         self.add_stage(
             DreamZeroTextEncodingStage(
                 self.get_module("text_encoder"),
-                session_store=self.session_store,
+                cache_manager=self.cache_manager,
             ),
             "dreamzero_text_encoding_stage",
         )
@@ -224,7 +266,7 @@ class DreamZeroPipeline(ComposedPipelineBase):
             DreamZeroVisualEncodingStage(
                 image_encoder=self.get_module("image_encoder"),
                 vae=self.get_module("vae"),
-                session_store=self.session_store,
+                cache_manager=self.cache_manager,
             ),
             "dreamzero_visual_encoding_stage",
         )
@@ -232,7 +274,7 @@ class DreamZeroPipeline(ComposedPipelineBase):
             DreamZeroCausalDenoisingStage(
                 transformer=self.get_module("transformer"),
                 scheduler=self.get_module("scheduler"),
-                session_store=self.session_store,
+                cache_manager=self.cache_manager,
             ),
             "dreamzero_causal_denoising_stage",
         )

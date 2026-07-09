@@ -39,6 +39,9 @@ _DIT_CONFIG_KEYS = {
     "concat_first_frame_latent",
 }
 
+_DREAMZERO_VAE_TARGET = "WanVideoVAE"
+_DREAMZERO_VAE38_TARGET = "WanVideoVAE38"
+
 
 def dreamzero_checkpoint_config_path(model_path: str | os.PathLike[str]) -> Path:
     return Path(model_path) / "config.json"
@@ -75,7 +78,7 @@ def _vae_config(config: dict[str, Any]) -> dict[str, Any]:
     diffusion_cfg = _diffusion_config(config)
     if int(diffusion_cfg.get("in_dim", 0) or 0) == 48:
         return {
-            "_target_": "groot.vla.model.dreamzero.modules.wan_video_vae.WanVideoVAE38",
+            "_target_": _DREAMZERO_VAE38_TARGET,
             "z_dim": 48,
             "dim": 160,
         }
@@ -114,7 +117,7 @@ def dreamzero_dit_init_kwargs_from_config(
     if "patch_size" in kwargs:
         kwargs["patch_size"] = tuple(kwargs["patch_size"])
     else:
-        # CausalWanModel's runtime default.  Several Groot configs omit it,
+        # CausalWanModel's runtime default.  Several checkpoint configs omit it,
         # but stages need the same value materialized into arch_config.
         kwargs["patch_size"] = (1, 2, 2)
     kwargs.setdefault("frame_seqlen", 50 if is_ti2v else 880)
@@ -142,13 +145,9 @@ def dreamzero_vae_runtime_config_from_config(
     config: dict[str, Any],
 ) -> dict[str, Any]:
     vae_cfg = _vae_config(config)
-    target = str(
-        vae_cfg.get(
-            "_target_",
-            "groot.vla.model.dreamzero.modules.wan_video_vae.WanVideoVAE",
-        )
-    )
-    is_vae38 = target.endswith("WanVideoVAE38")
+    raw_target = str(vae_cfg.get("_target_", _DREAMZERO_VAE_TARGET))
+    target = raw_target.rsplit(".", 1)[-1]
+    is_vae38 = target == _DREAMZERO_VAE38_TARGET
     return {
         "runtime_target": target,
         "z_dim": int(vae_cfg.get("z_dim", 48 if is_vae38 else 16)),
@@ -205,7 +204,7 @@ def materialize_arch_configs_from_checkpoint(
     _set_existing_or_extra(
         vae_arch,
         "scale_factor_spatial",
-        16 if vae_runtime["runtime_target"].endswith("WanVideoVAE38") else 8,
+        16 if vae_runtime["runtime_target"] == _DREAMZERO_VAE38_TARGET else 8,
     )
     _set_existing_or_extra(
         vae_arch,
@@ -214,7 +213,7 @@ def materialize_arch_configs_from_checkpoint(
             getattr(
                 vae_arch,
                 "scale_factor_spatial",
-                16 if vae_runtime["runtime_target"].endswith("WanVideoVAE38") else 8,
+                16 if vae_runtime["runtime_target"] == _DREAMZERO_VAE38_TARGET else 8,
             )
         ),
     )

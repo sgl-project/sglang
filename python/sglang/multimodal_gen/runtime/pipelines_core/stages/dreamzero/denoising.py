@@ -14,9 +14,12 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_classifier_free_guidance_rank,
     get_classifier_free_guidance_world_size,
 )
-from sglang.multimodal_gen.runtime.managers.dreamzero_session_store import (
-    SessionStore,
-    get_request_session_state,
+from sglang.multimodal_gen.runtime.managers.dreamzero_session_cache import (
+    BRANCH_COND,
+    BRANCH_UNCOND,
+    DreamZeroCachePoolManager,
+    enter_request_cache,
+    record_session_timing,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
@@ -44,12 +47,12 @@ class DreamZeroCausalDenoisingStage(PipelineStage):
         self,
         transformer: torch.nn.Module,
         scheduler: Any | None = None,
-        session_store: SessionStore | None = None,
+        cache_manager: DreamZeroCachePoolManager | None = None,
     ) -> None:
         super().__init__()
         self.transformer = transformer
         self.scheduler = scheduler
-        self.session_store = session_store
+        self.cache_manager = cache_manager
 
     @property
     def parallelism_type(self) -> StageParallelismType:
@@ -136,21 +139,6 @@ class DreamZeroCausalDenoisingStage(PipelineStage):
             ],
         )
 
-    def _create_single_kv_cache(
-        self,
-        *,
-        batch_size: int,
-        dtype: torch.dtype,
-        device: torch.device,
-        local_heads: int | None = None,
-    ) -> list[torch.Tensor]:
-        return self._create_kv_caches(
-            batch_size=batch_size,
-            dtype=dtype,
-            device=device,
-            local_heads=local_heads,
-        )[0]
-
     def _create_crossattn_caches(
         self, *, batch_size: int, dtype: torch.dtype, device: torch.device
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -160,8 +148,73 @@ class DreamZeroCausalDenoisingStage(PipelineStage):
             [{"is_init": False} for _ in range(model.num_layers)],
         )
 
-    def _create_single_crossattn_cache(self) -> list[dict[str, Any]]:
-        return [{"is_init": False} for _ in range(self.transformer.num_layers)]
+    @staticmethod
+    def _cfg_parallel_active(server_args: ServerArgs, num_branches: int) -> bool:
+        if not getattr(server_args, "enable_cfg_parallel", False):
+            return False
+        cfg_world_size = get_classifier_free_guidance_world_size()
+        if cfg_world_size != 2 or num_branches != 2:
+            raise RuntimeError(
+                "DreamZero CFG parallel currently supports exactly two CFG ranks "
+                f"and two branches, got cfg_world_size={cfg_world_size}, "
+                f"branches={num_branches}"
+            )
+        return True
+
+    @staticmethod
+    def _cfg_local_branch_indices(
+        server_args: ServerArgs, branch_indices: list[int]
+    ) -> tuple[list[int], int | None, int]:
+        if not DreamZeroCausalDenoisingStage._cfg_parallel_active(
+            server_args,
+            len(branch_indices),
+        ):
+            return branch_indices, None, 1
+        cfg_rank = get_classifier_free_guidance_rank()
+        if cfg_rank >= len(branch_indices):
+            raise RuntimeError(
+                "DreamZero CFG rank has no branch assignment: "
+                f"cfg_rank={cfg_rank}, branches={branch_indices}"
+            )
+        return (
+            [branch_indices[cfg_rank]],
+            cfg_rank,
+            get_classifier_free_guidance_world_size(),
+        )
+
+    @staticmethod
+    def _combine_cfg_parallel_predictions(
+        *,
+        local_prediction: tuple[torch.Tensor, torch.Tensor],
+        cfg_rank: int,
+        cfg_scale: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        video, action = local_prediction
+        if cfg_rank not in (0, 1):
+            raise ValueError(
+                "DreamZero two-branch CFG only supports cfg ranks 0 and 1, "
+                f"got {cfg_rank}"
+            )
+        branches = cfg_model_parallel_all_gather(
+            video,
+            dim=0,
+            separate_tensors=True,
+        )
+        if not isinstance(branches, list) or len(branches) != 2:
+            raise RuntimeError(
+                "DreamZero CFG all-gather must return cond/uncond tensors"
+            )
+        flow_pred_cond, flow_pred_uncond = branches
+        flow_pred = flow_pred_uncond + cfg_scale * (
+            flow_pred_cond - flow_pred_uncond
+        )
+
+        flow_pred_action_cond = action if cfg_rank == 0 else torch.empty_like(action)
+        flow_pred_action_cond = get_cfg_group().broadcast(
+            flow_pred_action_cond,
+            src=0,
+        )
+        return flow_pred, flow_pred_action_cond
 
     def _run_diffusion_steps(
         self,
@@ -212,7 +265,7 @@ class DreamZeroCausalDenoisingStage(PipelineStage):
             )
             if update_kv_cache:
                 for block_index, updated in enumerate(updated_kv_caches):
-                    kv_cache[block_index] = updated.clone()
+                    kv_cache[block_index] = updated.detach()
             if action_noise_pred is None:
                 action_noise_pred = obs_noise_pred.new_zeros(())
             debug_call_capture_limit = int(
@@ -264,44 +317,8 @@ class DreamZeroCausalDenoisingStage(PipelineStage):
                         "layers": debug_layers if debug_layers is not None else [],
                     }
                 )
-            predictions.append((obs_noise_pred.clone(), action_noise_pred.clone()))
+            predictions.append((obs_noise_pred.detach(), action_noise_pred.detach()))
         return predictions
-
-    @staticmethod
-    def _combine_cfg_parallel_predictions(
-        *,
-        video: torch.Tensor,
-        action: torch.Tensor,
-        cfg_scale: float,
-        cfg_rank: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if cfg_rank not in (0, 1):
-            raise ValueError(
-                "DreamZero two-branch CFG only supports cfg ranks 0 and 1, "
-                f"got {cfg_rank}"
-            )
-        branches = cfg_model_parallel_all_gather(
-            video,
-            dim=0,
-            separate_tensors=True,
-        )
-        if not isinstance(branches, list) or len(branches) != 2:
-            raise RuntimeError(
-                "DreamZero CFG all-gather must return cond/uncond tensors"
-            )
-        flow_pred_cond, flow_pred_uncond = branches
-        flow_pred = flow_pred_uncond + cfg_scale * (
-            flow_pred_cond - flow_pred_uncond
-        )
-
-        flow_pred_action_cond = (
-            action if cfg_rank == 0 else torch.empty_like(action)
-        )
-        flow_pred_action_cond = get_cfg_group().broadcast(
-            flow_pred_action_cond,
-            src=0,
-        )
-        return flow_pred, flow_pred_action_cond
 
     @staticmethod
     def _should_run_model(
@@ -364,18 +381,11 @@ class DreamZeroCausalDenoisingStage(PipelineStage):
         return value
 
     def _new_unipc_scheduler(self) -> Any:
-        if os.environ.get("DREAMZERO_USE_GROOT_UNIPC_SCHEDULER", "0") == "1":
-            from groot.vla.model.dreamzero.modules.flow_unipc_multistep_scheduler import (
-                FlowUniPCMultistepScheduler as GrootFlowUniPCMultistepScheduler,
-            )
-
-            scheduler_cls = GrootFlowUniPCMultistepScheduler
-        else:
-            scheduler_cls = (
-                self.scheduler.__class__
-                if self.scheduler is not None
-                else FlowUniPCMultistepScheduler
-            )
+        scheduler_cls = (
+            self.scheduler.__class__
+            if self.scheduler is not None
+            else FlowUniPCMultistepScheduler
+        )
         return scheduler_cls(
             num_train_timesteps=self._scheduler_train_timesteps(self.scheduler),
             shift=1,
@@ -437,32 +447,19 @@ class DreamZeroCausalDenoisingStage(PipelineStage):
             batch.dreamzero_y = y_full
             batch.dreamzero_latent_video = latent_video
             batch_size = latent_video.shape[0]
-            cfg_parallel = bool(
-                getattr(server_args, "enable_cfg_parallel", False)
-            )
-            cfg_rank = 0
-            cfg_world_size = 1
-            if cfg_parallel:
-                cfg_world_size = get_classifier_free_guidance_world_size()
-                if cfg_world_size != 2:
-                    raise ValueError(
-                        "DreamZero CFG parallel requires cfg_parallel_degree=2, "
-                        f"got {cfg_world_size}"
-                    )
-                cfg_rank = get_classifier_free_guidance_rank()
-                # This is the second CFG_PARALLEL stage. ParallelExecutor has
-                # broadcast rank 0's batch again, so switch back to this
-                # worker's SessionStore entry. The text stage marked any
-                # explicit reset as consumed, preventing a second reset here.
-                if hasattr(batch, "dreamzero_session_state"):
-                    delattr(batch, "dreamzero_session_state")
-            session_state = get_request_session_state(
+            local_attn_size = int(getattr(self.transformer, "local_attn_size", -1))
+            request_cache, session_state = enter_request_cache(
                 batch,
-                self.session_store,
-                local_attn_size=int(
-                    getattr(self.transformer, "local_attn_size", -1)
-                ),
+                self.cache_manager,
+                local_attn_size=local_attn_size,
+                batch_size=batch_size,
             )
+            slots = request_cache.slot_indices
+            current_start_frame = request_cache.uniform_current_start_frame(
+                self.cache_manager
+            )
+            initial_current_start_frame = current_start_frame
+            record_session_timing(batch, "kv_layout_materialize_ms", 0.0)
 
             action_dim = server_args.pipeline_config.dit_config.arch_config.action_dim
             max_state_dim = (
@@ -497,109 +494,64 @@ class DreamZeroCausalDenoisingStage(PipelineStage):
                 noise_obs.shape[3] // patch_size[1]
             ) * (noise_obs.shape[4] // patch_size[2])
             seq_len = num_frame_per_block * frame_seqlen
+            cfg_parallel = bool(getattr(server_args, "enable_cfg_parallel", False))
             source_prompt_embs = batch.dreamzero_prompt_embs
-            if cfg_parallel and session_state.cached_prompt_embs is not None:
-                source_prompt_embs = session_state.cached_prompt_embs
             prompt_embs = [
                 emb.to(device=device, dtype=dtype) for emb in source_prompt_embs
             ]
+            if not cfg_parallel and len(prompt_embs) == 1:
+                prompt_embs = [prompt_embs[0], prompt_embs[0]]
             if cfg_parallel:
-                if len(prompt_embs) != 1:
-                    if len(prompt_embs) < 2:
-                        raise ValueError(
-                            "DreamZero CFG parallel requires one rank-local prompt "
-                            "embedding or both CFG prompt embeddings"
-                        )
-                    prompt_embs = [prompt_embs[cfg_rank]]
-                branch_indices = [cfg_rank]
+                if len(prompt_embs) not in (1, 2):
+                    raise RuntimeError(
+                        "DreamZero CFG parallel expects either one rank-local "
+                        "prompt embedding or both cond/uncond prompt embeddings, "
+                        f"got {len(prompt_embs)}"
+                    )
+                branch_indices = [BRANCH_COND, BRANCH_UNCOND]
             else:
-                if len(prompt_embs) == 1:
-                    prompt_embs = [prompt_embs[0], prompt_embs[0]]
                 branch_indices = list(range(len(prompt_embs)))
+            local_branch_indices, cfg_rank, cfg_world_size = self._cfg_local_branch_indices(
+                server_args,
+                branch_indices,
+            )
+            if cfg_rank is not None and len(prompt_embs) == 1:
+                local_prompt_embs = prompt_embs
+            else:
+                local_prompt_embs = [
+                    prompt_embs[branch_indices.index(branch_index)]
+                    for branch_index in local_branch_indices
+                ]
 
-            if cfg_parallel and session_state.current_start_frame == 0:
-                local_kv_cache = self._create_single_kv_cache(
-                    batch_size=batch_size,
-                    dtype=dtype,
-                    device=device,
-                )
-                local_crossattn_cache = self._create_single_crossattn_cache()
-                if cfg_rank == 0:
-                    session_state.kv_cache1 = local_kv_cache
-                    session_state.kv_cache_neg.clear()
-                    session_state.crossattn_cache = local_crossattn_cache
-                    session_state.crossattn_cache_neg.clear()
-                else:
-                    session_state.kv_cache1.clear()
-                    session_state.kv_cache_neg = local_kv_cache
-                    session_state.crossattn_cache.clear()
-                    session_state.crossattn_cache_neg = local_crossattn_cache
-            elif session_state.current_start_frame == 0:
-                (
-                    session_state.kv_cache1,
-                    session_state.kv_cache_neg,
-                ) = self._create_kv_caches(
-                    batch_size=batch_size,
-                    dtype=dtype,
-                    device=device,
-                )
-                if (
-                    not session_state.crossattn_cache
-                    or not session_state.crossattn_cache_neg
-                ):
-                    (
-                        session_state.crossattn_cache,
-                        session_state.crossattn_cache_neg,
-                    ) = self._create_crossattn_caches(
+            if current_start_frame == 0:
+                kv_cache_pair = list(
+                    self._create_kv_caches(
                         batch_size=batch_size,
                         dtype=dtype,
                         device=device,
                     )
-            elif cfg_parallel:
-                local_kv_cache = (
-                    session_state.kv_cache1
-                    if cfg_rank == 0
-                    else session_state.kv_cache_neg
                 )
-                local_crossattn_cache = (
-                    session_state.crossattn_cache
-                    if cfg_rank == 0
-                    else session_state.crossattn_cache_neg
-                )
-                if not local_kv_cache or not local_crossattn_cache:
-                    raise RuntimeError(
-                        "DreamZero streaming session is missing rank-local CFG "
-                        f"cache state for cfg_rank={cfg_rank}"
+                crossattn_cache_pair = list(
+                    self._create_crossattn_caches(
+                        batch_size=batch_size,
+                        dtype=dtype,
+                        device=device,
                     )
-            elif (
-                not session_state.kv_cache1
-                or not session_state.kv_cache_neg
-                or not session_state.crossattn_cache
-                or not session_state.crossattn_cache_neg
-            ):
-                raise RuntimeError(
-                    "DreamZero streaming session is missing DiT cache state"
                 )
-
-            if cfg_parallel:
+                if cfg_rank is None:
+                    kv_caches = kv_cache_pair
+                    crossattn_caches = crossattn_cache_pair
+                else:
+                    kv_caches = [kv_cache_pair[cfg_rank]]
+                    crossattn_caches = [crossattn_cache_pair[cfg_rank]]
+            elif current_start_frame != 0:
                 kv_caches = [
-                    session_state.kv_cache1
-                    if cfg_rank == 0
-                    else session_state.kv_cache_neg
+                    session_state.gather_kv(branch_index, slots)
+                    for branch_index in local_branch_indices
                 ]
                 crossattn_caches = [
-                    session_state.crossattn_cache
-                    if cfg_rank == 0
-                    else session_state.crossattn_cache_neg
-                ]
-            else:
-                kv_caches = [
-                    session_state.kv_cache1,
-                    session_state.kv_cache_neg,
-                ]
-                crossattn_caches = [
-                    session_state.crossattn_cache,
-                    session_state.crossattn_cache_neg,
+                    session_state.gather_crossattn(branch_index, slots)
+                    for branch_index in local_branch_indices
                 ]
             debug_dit_calls = (
                 []
@@ -607,7 +559,20 @@ class DreamZeroCausalDenoisingStage(PipelineStage):
                 else None
             )
 
-            if session_state.current_start_frame == 0:
+            def scatter_active_branch_caches() -> None:
+                for local_index, branch_index in enumerate(local_branch_indices):
+                    session_state.scatter_kv(
+                        branch_index,
+                        slots,
+                        kv_caches[local_index],
+                    )
+                    session_state.scatter_crossattn(
+                        branch_index,
+                        slots,
+                        crossattn_caches[local_index],
+                    )
+
+            if current_start_frame == 0:
                 zero_timestep = torch.zeros(
                     [batch_size, 1], device=device, dtype=torch.int64
                 )
@@ -617,7 +582,7 @@ class DreamZeroCausalDenoisingStage(PipelineStage):
                     action=None,
                     timestep_action=None,
                     state=None,
-                    context=prompt_embs,
+                    context=local_prompt_embs,
                     seq_len=frame_seqlen,
                     y=y_full[:, :, 0:1],
                     clip_feature=clip_feature,
@@ -625,12 +590,13 @@ class DreamZeroCausalDenoisingStage(PipelineStage):
                     crossattn_caches=crossattn_caches,
                     current_start_frame=0,
                     update_kv_cache=True,
-                    branch_indices=branch_indices,
+                    branch_indices=local_branch_indices,
                     debug_calls=debug_dit_calls,
                 )
-                session_state.current_start_frame = 1
-            if session_state.current_start_frame != 1:
-                current_start_frame = session_state.current_start_frame
+                scatter_active_branch_caches()
+                request_cache.mark_current_start_frame(self.cache_manager, 1)
+                current_start_frame = 1
+            if current_start_frame != 1:
                 current_ref_latents = latent_video[:, :, -num_frame_per_block:]
                 y_start = current_start_frame - num_frame_per_block
                 if current_start_frame <= y_full.shape[2]:
@@ -648,7 +614,7 @@ class DreamZeroCausalDenoisingStage(PipelineStage):
                     action=None,
                     timestep_action=None,
                     state=None,
-                    context=prompt_embs,
+                    context=local_prompt_embs,
                     seq_len=seq_len,
                     y=y_prefill,
                     clip_feature=clip_feature,
@@ -656,9 +622,10 @@ class DreamZeroCausalDenoisingStage(PipelineStage):
                     crossattn_caches=crossattn_caches,
                     current_start_frame=y_start,
                     update_kv_cache=True,
-                    branch_indices=branch_indices,
+                    branch_indices=local_branch_indices,
                     debug_calls=debug_dit_calls,
                 )
+                scatter_active_branch_caches()
             if os.environ.get("DREAMZERO_SELF_CONTAINED_PREFILL_ONLY", "0") == "1":
                 batch.dreamzero_prefill_only = True
                 batch.dreamzero_action_pred = torch.zeros(
@@ -670,14 +637,16 @@ class DreamZeroCausalDenoisingStage(PipelineStage):
                 )
                 if debug_dit_calls is not None:
                     batch.dreamzero_dit_debug_calls = debug_dit_calls
-                batch.dreamzero_current_start_frame = (
-                    session_state.current_start_frame
-                )
+                batch.dreamzero_current_start_frame = current_start_frame
                 batch.dreamzero_cfg_rank = cfg_rank
                 batch.dreamzero_cfg_world_size = cfg_world_size
-                batch.dreamzero_cfg_branches_per_step = (
-                    1 if cfg_parallel else len(prompt_embs)
+                batch.dreamzero_cfg_branches_per_step = len(local_branch_indices)
+                record_session_timing(batch, "kv_split_append_ms", 0.0)
+                record_session_timing(batch, "session_scatter_ms", 0.0)
+                batch.dreamzero_current_start_frame = (
+                    request_cache.current_start_frames(self.cache_manager)
                 )
+                self._record_session_cache_overhead(batch)
                 batch.output = batch.dreamzero_action_pred
                 return batch
 
@@ -720,7 +689,7 @@ class DreamZeroCausalDenoisingStage(PipelineStage):
                     device=device,
                     dtype=torch.int64,
                 ) * action_timestep
-                y_start = session_state.current_start_frame
+                y_start = current_start_frame
                 y_end = y_start + num_frame_per_block
                 y = y_full[:, :, y_start:y_end]
                 if y.shape[2] < num_frame_per_block:
@@ -745,33 +714,31 @@ class DreamZeroCausalDenoisingStage(PipelineStage):
                         action=noisy_action,
                         timestep_action=timestep_action,
                         state=state,
-                        context=prompt_embs,
+                        context=local_prompt_embs,
                         seq_len=seq_len,
                         y=y,
                         clip_feature=clip_feature,
                         kv_caches=kv_caches,
                         crossattn_caches=crossattn_caches,
-                        current_start_frame=session_state.current_start_frame,
+                        current_start_frame=current_start_frame,
                         update_kv_cache=False,
-                        branch_indices=branch_indices,
+                        branch_indices=local_branch_indices,
                         debug_calls=debug_dit_calls,
                     )
                     cfg_scale = server_args.pipeline_config.cfg_scale
-                    if cfg_parallel:
-                        local_video, local_action = predictions[0]
-                        flow_pred, flow_pred_action_cond = (
-                            self._combine_cfg_parallel_predictions(
-                                video=local_video,
-                                action=local_action,
-                                cfg_scale=cfg_scale,
-                                cfg_rank=cfg_rank,
-                            )
-                        )
-                    else:
+                    if cfg_rank is None:
                         flow_pred_cond, flow_pred_action_cond = predictions[0]
                         flow_pred_uncond, _ = predictions[1]
                         flow_pred = flow_pred_uncond + cfg_scale * (
                             flow_pred_cond - flow_pred_uncond
+                        )
+                    else:
+                        flow_pred, flow_pred_action_cond = (
+                            self._combine_cfg_parallel_predictions(
+                                local_prediction=predictions[0],
+                                cfg_rank=cfg_rank,
+                                cfg_scale=cfg_scale,
+                            )
                         )
                     prev_predictions.append(
                         (video_timestep, flow_pred, flow_pred_action_cond)
@@ -800,25 +767,60 @@ class DreamZeroCausalDenoisingStage(PipelineStage):
                 )
 
             batch.dreamzero_action_pred = noisy_action.float()
-            if session_state.current_start_frame == 1:
+            prev_predictions.clear()
+            predictions = None
+            flow_pred = None
+            flow_pred_action_cond = None
+            flow_pred_cond = None
+            flow_pred_uncond = None
+            if current_start_frame == 1:
                 batch.dreamzero_video_pred = torch.cat(
                     [latent_video.transpose(1, 2), noisy_input], dim=1
                 ).transpose(1, 2)
             else:
                 batch.dreamzero_video_pred = noisy_input.transpose(1, 2)
-            session_state.current_start_frame += num_frame_per_block
-            session_state.latent_video = latent_video
-            batch.dreamzero_kv_caches = kv_caches
-            batch.dreamzero_crossattn_caches = crossattn_caches
-            batch.dreamzero_current_start_frame = (
-                session_state.current_start_frame
+            current_start_frame += num_frame_per_block
+            request_cache.mark_current_start_frame(
+                self.cache_manager,
+                current_start_frame,
+            )
+            session_state.scatter_visual(slots, latent_video=latent_video)
+            record_session_timing(batch, "kv_split_append_ms", 0.0)
+            record_session_timing(batch, "session_scatter_ms", 0.0)
+            self._record_session_cache_overhead(batch)
+            if hasattr(batch, "dreamzero_kv_caches"):
+                delattr(batch, "dreamzero_kv_caches")
+            if hasattr(batch, "dreamzero_crossattn_caches"):
+                delattr(batch, "dreamzero_crossattn_caches")
+            kv_caches = None
+            crossattn_caches = None
+            kv_cache_pair = None
+            crossattn_cache_pair = None
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            batch.dreamzero_current_start_frame = request_cache.current_start_frames(
+                self.cache_manager
             )
             batch.dreamzero_cfg_rank = cfg_rank
             batch.dreamzero_cfg_world_size = cfg_world_size
-            batch.dreamzero_cfg_branches_per_step = (
-                1 if cfg_parallel else len(prompt_embs)
-            )
+            batch.dreamzero_cfg_branches_per_step = len(local_branch_indices)
             if debug_dit_calls is not None:
                 batch.dreamzero_dit_debug_calls = debug_dit_calls
             batch.output = batch.dreamzero_action_pred
             return batch
+
+    @staticmethod
+    def _record_session_cache_overhead(batch: Req) -> None:
+        timing = getattr(batch, "dreamzero_session_timing", {})
+        overhead_ms = sum(
+            float(timing.get(key, 0.0))
+            for key in (
+                "session_gather_ms",
+                "kv_layout_materialize_ms",
+                "kv_split_append_ms",
+                "session_scatter_ms",
+            )
+        )
+        timing["session_cache_overhead_ms"] = overhead_ms
+        timing["session_store_overhead_ms"] = overhead_ms
+        batch.dreamzero_session_timing = timing

@@ -2,9 +2,9 @@
 """DreamZero causal Wan DiT pieces.
 
 This module starts with the single-block parity surface. It intentionally keeps
-the parameter names aligned with Groot's `CausalWanAttentionBlock` so Phase 2
-tests can transfer weights with a strict state-dict load before TP sharding is
-introduced.
+the parameter names aligned with the original `CausalWanAttentionBlock` so
+Phase 2 tests can transfer weights with a strict state-dict load before TP
+sharding is introduced.
 """
 
 from __future__ import annotations
@@ -339,7 +339,7 @@ def assemble_action_state_tokens(
 ) -> tuple[torch.Tensor, torch.Tensor, int | None, int]:
     """Append DreamZero action/state registers to video tokens.
 
-    Groot order is:
+    Reference order is:
       tokens:    [video_tokens, action_features, state_features]
       timesteps: [video_timestep, timestep_action, timestep_state]
     where timestep_state is a stride sample from timestep_action.

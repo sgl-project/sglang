@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """DreamZero-DROID Wan VAE checkpoint loader.
 
-DreamZero uses Groot's original Wan VAE implementation by default. The native
-SGLang key-remapping helpers remain available for parity tests, but the runtime
-fallback avoids numerical drift from executing a rewritten module graph.
+DreamZero uses its original Wan VAE module graph by default. The native SGLang
+key-remapping helpers remain available for parity tests, but the runtime path
+keeps the original graph to avoid numerical drift from executing a rewritten
+module layout.
 """
 
 from __future__ import annotations
@@ -118,7 +119,7 @@ def _map_decoder_upsample_key(key: str) -> str:
 
 
 def remap_dreamzero_vae_model_key(model_key: str) -> str:
-    """Map Groot ``WanVideoVAE.model`` keys to SGLang ``AutoencoderKLWan`` keys."""
+    """Map original ``WanVideoVAE.model`` keys to SGLang ``AutoencoderKLWan`` keys."""
 
     key = model_key
     if key.startswith("model."):
@@ -269,7 +270,7 @@ def build_dreamzero_vae_from_checkpoint(
     dtype: torch.dtype = torch.bfloat16,
     strict: bool = True,
 ) -> tuple[nn.Module, DreamZeroVAELoadReport]:
-    from groot.vla.model.dreamzero.modules.wan_video_vae import (
+    from sglang.multimodal_gen.runtime.models.vaes.dreamzero_vae import (
         WanVideoVAE,
         WanVideoVAE38,
     )
@@ -283,7 +284,7 @@ def build_dreamzero_vae_from_checkpoint(
     if vae_cls is WanVideoVAE38:
         kwargs["dim"] = inner_dim
 
-    # Match Groot WANPolicyHead construction and post_initialize exactly:
+    # Match the original WANPolicyHead construction and post_initialize exactly:
     # instantiate real parameters, then move the complete wrapper to BF16/CUDA
     # before copying checkpoint tensors into the existing parameter objects.
     if device.type == "cuda":
@@ -304,11 +305,11 @@ def build_dreamzero_vae_from_checkpoint(
             missing_keys=list(incompatible.missing_keys),
             unexpected_keys=list(incompatible.unexpected_keys),
             shape_mismatches={},
-            fallback_impl=f"groot.{vae_cls.__name__}",
+            fallback_impl=f"sglang.dreamzero_vae.{vae_cls.__name__}",
         )
         if strict and (report.missing_keys or report.unexpected_keys):
             raise RuntimeError(
-                f"DreamZero Groot VAE checkpoint load failed: {report.as_dict()}"
+                f"DreamZero original VAE checkpoint load failed: {report.as_dict()}"
             )
         return model, report
 
@@ -344,13 +345,13 @@ def build_dreamzero_vae_from_checkpoint(
         missing_keys=sorted(set(state_dict) - set(loaded_keys)),
         unexpected_keys=unexpected_keys,
         shape_mismatches=shape_mismatches,
-        fallback_impl=f"groot.{vae_cls.__name__}",
+        fallback_impl=f"sglang.dreamzero_vae.{vae_cls.__name__}",
     )
     if strict and (
         report.missing_keys or report.unexpected_keys or report.shape_mismatches
     ):
         raise RuntimeError(
-            f"DreamZero Groot VAE checkpoint load failed: {report.as_dict()}"
+            f"DreamZero original VAE checkpoint load failed: {report.as_dict()}"
         )
     return model, report
 

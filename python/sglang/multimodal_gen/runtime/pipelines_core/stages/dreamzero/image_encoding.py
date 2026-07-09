@@ -6,9 +6,11 @@ from typing import Any
 import torch
 
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
-from sglang.multimodal_gen.runtime.managers.dreamzero_session_store import (
-    SessionStore,
-    get_request_session_state,
+from sglang.multimodal_gen.runtime.managers.dreamzero_session_cache import (
+    DreamZeroCachePoolManager,
+    DreamZeroCachePool,
+    DreamZeroRequestCache,
+    enter_request_cache,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
@@ -39,6 +41,10 @@ def _as_bcthw(videos: torch.Tensor) -> torch.Tensor:
         raise ValueError(f"DreamZero images must be 5D, got {tuple(videos.shape)}")
     if videos.shape[-1] in (1, 3):
         videos = videos.permute(0, 4, 1, 2, 3)
+    elif videos.shape[2] in (1, 3) and videos.shape[1] != 3:
+        videos = videos.permute(0, 2, 1, 3, 4)
+    elif videos.shape[1] in (1, 3):
+        pass
     if videos.dtype == torch.uint8:
         videos = videos.float() / 255.0
     return videos
@@ -81,12 +87,12 @@ class DreamZeroVisualEncodingStage(PipelineStage):
         self,
         image_encoder: torch.nn.Module | None = None,
         vae: torch.nn.Module | None = None,
-        session_store: SessionStore | None = None,
+        cache_manager: DreamZeroCachePoolManager | None = None,
     ) -> None:
         super().__init__()
         self.image_encoder = image_encoder
         self.vae = vae
-        self.session_store = session_store
+        self.cache_manager = cache_manager
 
     @property
     def role_affinity(self):
@@ -195,9 +201,9 @@ class DreamZeroVisualEncodingStage(PipelineStage):
                     "concat_first_frame_latent=False: "
                     f"in_dim={in_dim}, latent_channels={latent_channels}"
                 )
-            # Groot's encode_image always returns ys=[mask, latent]. TI2V does not
-            # concatenate ys into the DiT video input, but tests and session state
-            # still compare this Groot-shaped tensor.
+            # The original image path always returns ys=[mask, latent]. TI2V
+            # does not concatenate ys into the DiT video input, but tests and
+            # session state still compare this reference-shaped tensor.
             batch.dreamzero_y = conditioning_y
             return batch
 
@@ -317,7 +323,7 @@ class DreamZeroVisualEncodingStage(PipelineStage):
             if y.shape[1] != latent_channels + 4:
                 raise ValueError(
                     "DreamZero precomputed y must be either VAE latent channels "
-                    "or Groot ys=[mask, latent]: "
+                    "or DreamZero ys=[mask, latent]: "
                     f"got {y.shape[1]}, latent_channels={latent_channels}"
                 )
             batch.dreamzero_y = y
@@ -430,6 +436,13 @@ class DreamZeroVisualEncodingStage(PipelineStage):
                     dtype=dtype
                 )
 
+    @staticmethod
+    def _infer_batch_size(inputs: dict[str, Any]) -> int:
+        for value in inputs.values():
+            if torch.is_tensor(value):
+                return int(value.shape[0])
+        raise ValueError("DreamZero visual stage cannot infer batch size")
+
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         arch = server_args.pipeline_config.dit_config.arch_config
         max_chunk_size = int(getattr(arch, "max_chunk_size", -1))
@@ -438,11 +451,23 @@ class DreamZeroVisualEncodingStage(PipelineStage):
             if max_chunk_size == -1
             else max_chunk_size * int(arch.num_frame_per_block) + 1
         )
-        state = get_request_session_state(
+        inputs: dict[str, Any] = batch.dreamzero_inputs
+        request_cache, _ = enter_request_cache(
             batch,
-            self.session_store,
+            self.cache_manager,
             local_attn_size=local_attn_size,
+            batch_size=self._infer_batch_size(inputs),
         )
+        return self._forward_cache_manager(batch, server_args, request_cache)
+
+    def _forward_cache_manager(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+        request_cache: DreamZeroRequestCache,
+    ):
+        state: DreamZeroCachePool = request_cache.pool(self.cache_manager)
+        slots = request_cache.slot_indices
         dtype = _dit_dtype(server_args)
         device: torch.device | None = None
         if self.image_encoder is not None:
@@ -453,6 +478,7 @@ class DreamZeroVisualEncodingStage(PipelineStage):
         videos = None
         image = None
         inputs: dict[str, Any] = batch.dreamzero_inputs
+        arch = server_args.pipeline_config.dit_config.arch_config
         needs_image = "clip_feature" not in inputs or not all(
             key in inputs for key in ("y", "latent_video")
         )
@@ -471,7 +497,10 @@ class DreamZeroVisualEncodingStage(PipelineStage):
             )
             batch.dreamzero_image_context_input = image
 
-        if state.current_start_frame == 0:
+        current_start_frame = request_cache.uniform_current_start_frame(
+            self.cache_manager
+        )
+        if current_start_frame == 0:
             batch.dreamzero_clip_feature = self._encode_clip_feature(
                 batch,
                 server_args,
@@ -483,21 +512,22 @@ class DreamZeroVisualEncodingStage(PipelineStage):
                 image=image,
                 videos=videos,
             )
-            state.clip_feas = batch.dreamzero_clip_feature
-            state.ys = batch.dreamzero_y
-            state.latent_video = batch.dreamzero_latent_video
+            state.scatter_visual(
+                slots,
+                clip_feas=batch.dreamzero_clip_feature,
+                ys=batch.dreamzero_y,
+                latent_video=batch.dreamzero_latent_video,
+            )
             return batch
 
-        if state.clip_feas is None or state.ys is None:
-            raise RuntimeError(
-                "DreamZero streaming session is missing anchor visual state"
-            )
-        state.latent_video = self._encode_current_video(
+        clip_feas, ys, _ = state.gather_visual(slots)
+        latent_video = self._encode_current_video(
             batch,
             server_args,
             videos=videos,
         )
-        batch.dreamzero_clip_feature = state.clip_feas
-        batch.dreamzero_y = state.ys
-        batch.dreamzero_latent_video = state.latent_video
+        state.scatter_visual(slots, latent_video=latent_video)
+        batch.dreamzero_clip_feature = clip_feas
+        batch.dreamzero_y = ys
+        batch.dreamzero_latent_video = latent_video
         return batch

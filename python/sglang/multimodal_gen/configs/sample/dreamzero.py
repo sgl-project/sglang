@@ -30,8 +30,6 @@ class DreamZeroSamplingParams(SamplingParams):
     dreamzero_obs: dict[str, Any] | None = field(
         default=None, metadata={"batch_sig_exclude": True}
     )
-    session_id: str | None = field(default=None, metadata={"batch_sig_exclude": True})
-    reset_session: bool = field(default=False, metadata={"batch_sig_exclude": True})
     embodiment_tag: str | None = field(
         default=None, metadata={"batch_sig_exclude": True}
     )
@@ -43,10 +41,6 @@ class DreamZeroSamplingParams(SamplingParams):
         extra = super().build_request_extra()
         if self.dreamzero_obs is not None:
             extra["dreamzero_obs"] = self.dreamzero_obs
-        if self.session_id is not None:
-            extra["dreamzero_session_id"] = self.session_id
-        if self.reset_session:
-            extra["dreamzero_reset_session"] = True
         if self.embodiment_tag is not None:
             extra["dreamzero_embodiment_tag"] = self.embodiment_tag
         if self.language is not None:
