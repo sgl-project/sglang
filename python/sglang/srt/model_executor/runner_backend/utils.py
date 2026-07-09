@@ -115,10 +115,5 @@ def resolve_prefill_backend(
             enable_memory_saver=model_runner.server_args.enable_memory_saver,
             debug_eager=model_runner.server_args.debug_cuda_graph,
         )
-    if backend_name == Backend.FULL:
-        return FullCudaGraphBackend(
-            cuda_graph_runner,
-            enable_memory_saver=model_runner.server_args.enable_memory_saver,
-        )
-    # Default: tc_piecewise.
+    # Default: tc_piecewise. (prefill, full) is rejected at config validation.
     return TcPiecewiseCudaGraphBackend(cuda_graph_runner)

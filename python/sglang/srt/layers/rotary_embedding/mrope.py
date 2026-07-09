@@ -18,7 +18,6 @@ from sglang.srt.layers.rotary_embedding.yarn import (
     yarn_get_mscale_simple,
     yarn_linear_ramp_mask,
 )
-from sglang.srt.runtime_context import get_flags
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
@@ -227,7 +226,7 @@ class MRotaryEmbedding(RotaryEmbedding):
         last_dim = cos_sin.size()[-1]
         cos, sin = cos_sin.chunk(2, dim=-1)
         if self.mrope_interleaved:
-            if support_triton(get_flags().attn.backend):
+            if support_triton(get_global_server_args().attention_backend):
                 cos = apply_interleaved_rope_triton(cos, self.mrope_section)
                 sin = apply_interleaved_rope_triton(sin, self.mrope_section)
             else:

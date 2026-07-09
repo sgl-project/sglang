@@ -44,7 +44,7 @@ from sglang.srt.model_executor.runner.flashinfer_autotune import (
     run_flashinfer_autotune_forward,
     should_run_flashinfer_autotune,
 )
-from sglang.srt.runtime_context import get_flags, get_parallel
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.spec_info import create_dummy_verify_input
 from sglang.srt.utils import (
     empty_context,
@@ -370,7 +370,7 @@ class BaseRunner(ABC):
 
         seq_len_fill_value = mr.attn_backend.get_cuda_graph_seq_len_fill_value()
 
-        if get_flags().capture.enable_torch_compile:
+        if mr.server_args.enable_torch_compile:
             set_torch_compile_config()
             should_disable_torch_compile = not getattr(
                 mr.model, "_can_torch_compile", True
@@ -381,7 +381,7 @@ class BaseRunner(ABC):
                     "Transformers backend model reports it is not torch.compile "
                     "compatible (e.g. dynamic rope scaling). Disabling torch.compile.",
                 )
-                get_flags().capture.enable_torch_compile = False
+                mr.server_args.enable_torch_compile = False
 
         # NOTE: aux hidden state capture (eagle3/dflash) is already
         # configured by init_aux_hidden_state_capture() in initialize().

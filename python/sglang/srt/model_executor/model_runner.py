@@ -180,7 +180,6 @@ from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_flags
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import (
     ServerArgs,
@@ -533,13 +532,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # only, so a draft init cannot clobber target-derived global state).
         if not self.is_draft_worker:
             set_global_server_args_for_scheduler(server_args)
+            # FIXME: hacky set `use_mla_backend`
+            get_global_server_args().use_mla_backend = self.use_mla_backend
 
         # Init OpenMP threads binding for CPU
         if self.device == "cpu":
             self.init_threads_binding()
 
         # Set float32 matmul precision
-        if get_flags().enable_tf32_matmul:
+        if server_args.enable_tf32_matmul:
             torch.set_float32_matmul_precision("high")
 
         # Get available memory before model loading.
@@ -2426,23 +2427,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         result = self._get_linear_attn_registry_result()
         return result[1] if result else None
 
-    def _record_kv_cache_dtype(self, resolved: str) -> None:
-        # Load-time resolution transition: the weight-resolved kv-cache dtype
-        # is declared into the flags tier; the dual-apply inside the helper
-        # replaces the legacy in-place write. Mock runners whose server_args
-        # is not the published object keep the plain write.
-        from sglang.srt.runtime_context import get_context
-
-        if get_context()._server_args is self.server_args:
-            from sglang.srt.arg_groups.overrides import declare_load_time_override
-
-            declare_load_time_override(
-                "ModelRunner.configure_kv_cache_dtype",
-                {"kv_cache_dtype": resolved},
-            )
-        else:
-            self.server_args.kv_cache_dtype = resolved
-
     def configure_kv_cache_dtype(self):
         if self.server_args.kv_cache_dtype == "auto":
             quant_config = getattr(self.model, "quant_config", None)
@@ -2451,10 +2435,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 isinstance(kv_cache_quant_algo, str)
                 and kv_cache_quant_algo.upper() == "FP8"
             ):
-                self.kv_cache_dtype = fp8_dtype if _is_hip else torch.float8_e4m3fn
-                self._record_kv_cache_dtype(
-                    TORCH_DTYPE_TO_KV_CACHE_STR[self.kv_cache_dtype]
-                )
+                if _is_hip:
+                    self.kv_cache_dtype = fp8_dtype
+                    self.server_args.kv_cache_dtype = TORCH_DTYPE_TO_KV_CACHE_STR[
+                        self.kv_cache_dtype
+                    ]
+                else:
+                    self.kv_cache_dtype = torch.float8_e4m3fn
+                    self.server_args.kv_cache_dtype = TORCH_DTYPE_TO_KV_CACHE_STR[
+                        self.kv_cache_dtype
+                    ]
             else:
                 self.kv_cache_dtype = self.dtype
         elif self.server_args.kv_cache_dtype == "fp8_e5m2":
@@ -2634,7 +2624,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         ):
             return
 
-        if self.device == "cpu" and not get_flags().capture.enable_torch_compile:
+        if self.device == "cpu" and not self.server_args.enable_torch_compile:
             return
 
         tic = time.perf_counter()
@@ -3010,115 +3000,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         forward_batch.apply_deprecated_skip_attn_backend_init(skip_attn_backend_init)
 
         self.forward_pass_id += 1
-
-        # --- DIAGNOSTIC (env-gated): localize the Kimi-K2.6 non-MTP disagg GSM8K
-        # drop. The warmup-probe pass showed the MORI-transferred prefix KV reads
-        # as exactly 0 in the decode KV pool. Here we skip the short warmup probe
-        # (seq_len < 64), inspect a real (long, GSM8K) prefix across several
-        # layers, and page-bucket the zero rows to test whether the gaps are
-        # page-aligned (page_size=256) or a boundary. No-op unless the env is set.
-        if (
-            os.environ.get("SGLANG_DEBUG_DISAGG_DECODE_DUMP", "0") == "1"
-            and forward_batch.forward_mode.is_decode()
-        ):
-            fb = forward_batch
-            seq_cpu = (
-                fb.seq_lens_cpu
-                if fb.seq_lens_cpu is not None
-                else fb.seq_lens.detach().cpu()
-            )
-            s0 = int(seq_cpu[0].item()) if seq_cpu.numel() else 0
-            if s0 >= 64 and getattr(self, "_disagg_decode_dump_count", 0) < 3:
-                self._disagg_decode_dump_count = (
-                    getattr(self, "_disagg_decode_dump_count", 0) + 1
-                )
-                try:
-                    page_size = int(
-                        getattr(
-                            self.token_to_kv_pool,
-                            "page_size",
-                            getattr(self.server_args, "page_size", 1),
-                        )
-                        or 1
-                    )
-                    r0 = int(fb.req_pool_indices[0].item())
-                    slots = self.req_to_token_pool.req_to_token[r0, :s0]
-                    translate = getattr(
-                        self.token_to_kv_pool_allocator, "translate_kv_loc", None
-                    )
-                    phys = (translate(slots) if translate is not None else slots).to(
-                        "cpu"
-                    ).long()
-                    # Exclude the current (last) token: its KV is written later
-                    # this forward, so it is legitimately 0 here.
-                    pref = phys[:-1]
-                    neg = int((pref < 0).sum().item())
-                    nlayers = int(
-                        getattr(
-                            self.token_to_kv_pool,
-                            "layer_num",
-                            getattr(self.model_config, "num_hidden_layers", 1),
-                        )
-                    )
-                    layers = sorted({0, nlayers // 2, max(0, nlayers - 1)})
-                    msgs = []
-                    zero_idx0 = []
-                    for li, lyr in enumerate(layers):
-                        try:
-                            kbuf = self.token_to_kv_pool.get_key_buffer(lyr)
-                            rows = (
-                                kbuf[pref.to(kbuf.device)]
-                                .float()
-                                .reshape(pref.numel(), -1)
-                            )
-                            rn = rows.norm(dim=-1)
-                            zmask = rn == 0
-                            msgs.append(
-                                f"L{lyr}:zero={int(zmask.sum().item())}/{pref.numel()} "
-                                f"mean={rows.abs().mean().item():.3e}"
-                            )
-                            if li == 0:
-                                zero_idx0 = torch.nonzero(zmask).flatten().tolist()
-                        except Exception as e:
-                            msgs.append(f"L{lyr}:ERR {e!r}")
-                    zpages = sorted({i // page_size for i in zero_idx0})
-                    npages = (pref.numel() + page_size - 1) // page_size
-                    # RoPE/position check: decode's current-token position must be
-                    # seq_len-1 per request; an off-by-one here (vs the absolute
-                    # positions the transferred keys were RoPE'd with at prefill)
-                    # corrupts attention scores while leaving KV norms untouched.
-                    pos = getattr(fb, "positions", None)
-                    pos_cpu = pos.detach().cpu() if pos is not None else None
-                    pos0 = (
-                        int(pos_cpu[0].item())
-                        if pos_cpu is not None and pos_cpu.numel()
-                        else -1
-                    )
-                    pos_mismatch = (
-                        int((pos_cpu != (seq_cpu.to(pos_cpu.dtype) - 1)).sum().item())
-                        if pos_cpu is not None and pos_cpu.numel() == seq_cpu.numel()
-                        else -1
-                    )
-                    logger.warning(
-                        "[DISAGG_DECODE_DUMP #%d rank=%s] seq_len=%d prefix=%d "
-                        "page_size=%d neg_slots=%d | %s | zero_pages=%d/%d %s | "
-                        "pos0=%d exp=%d pos_vs_(seq-1)_mismatch=%d",
-                        self._disagg_decode_dump_count,
-                        getattr(self, "tp_rank", "?"),
-                        s0,
-                        pref.numel(),
-                        page_size,
-                        neg,
-                        " ".join(msgs),
-                        len(zpages),
-                        npages,
-                        zpages[:20],
-                        pos0,
-                        s0 - 1,
-                        pos_mismatch,
-                    )
-                except Exception as e:  # never let the probe break a run
-                    logger.warning("[DISAGG_DECODE_DUMP] failed: %r", e)
 
         # Try msprob debugger
         if self.msprobe_debugger is not None:

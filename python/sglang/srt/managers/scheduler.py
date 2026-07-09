@@ -553,14 +553,6 @@ class Scheduler(
 
         self.init_batch_result_processor()
 
-        # The config-resolution lifecycle of this scheduler process ends
-        # here: every load-time stage has run (target and draft model init,
-        # weight-resolved kv-cache dtype), so lock the static flag groups.
-        # flags.capture stays writable; late resolution writes now raise.
-        from sglang.srt.runtime_context import get_context
-
-        get_context().freeze_flags()
-
         self.is_initializing = False
 
     def init_zbal_on_npu(self):
@@ -3920,9 +3912,6 @@ class Scheduler(
             for req in self.disagg_prefill_bootstrap_queue.queue:
                 if recv_req.abort_all or req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort bootstrap queue request. {req.rid=}")
-                    if self.enable_hicache_storage:
-                        self.tree_cache.release_aborted_request(req.rid)
-
                     if hasattr(req.disagg_kv_sender, "abort"):
                         req.disagg_kv_sender.abort()
 

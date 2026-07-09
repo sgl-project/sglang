@@ -18,7 +18,7 @@ from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.glm4_moe import Glm4MoeModel
 from sglang.srt.models.glm4v import Glm4vForConditionalGeneration, Glm4vVisionModel
-from sglang.srt.runtime_context import get_flags, get_parallel
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, get_device_sm, is_cuda, log_info_on_rank0
 from sglang.srt.utils.hf_transformers_utils import get_processor
@@ -70,7 +70,7 @@ class Glm4vMoeForConditionalGeneration(Glm4vForConditionalGeneration):
                     config.hidden_size,
                     quant_config=quant_config,
                     prefix=add_prefix("lm_head", prefix),
-                    use_attn_tp_group=get_flags().enable_dp_lm_head,
+                    use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
                 )
         else:
             # ranks other than the last rank will have a placeholder layer
@@ -84,7 +84,7 @@ class Glm4vMoeForConditionalGeneration(Glm4vForConditionalGeneration):
         self.capture_aux_hidden_states = False
 
     def determine_num_fused_shared_experts(self):
-        if get_flags().disable_shared_experts_fusion:
+        if get_global_server_args().disable_shared_experts_fusion:
             return
 
         disable_reason = None
@@ -100,12 +100,7 @@ class Glm4vMoeForConditionalGeneration(Glm4vForConditionalGeneration):
             disable_reason = "Shared experts fusion is not supported when Deepep MoE backend is enabled."
 
         if disable_reason is not None:
-            from sglang.srt.arg_groups.overrides import declare_load_time_override
-
-            declare_load_time_override(
-                "Glm4vMoeForConditionalGeneration.determine_num_fused_shared_experts",
-                {"disable_shared_experts_fusion": True},
-            )
+            get_global_server_args().disable_shared_experts_fusion = True
             log_info_on_rank0(
                 logger,
                 f"{disable_reason} Shared experts fusion optimization is disabled.",

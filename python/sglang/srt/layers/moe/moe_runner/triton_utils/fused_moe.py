@@ -790,14 +790,11 @@ def _fused_moe_kernel_sequence(
                     routed_scaling_factor,
                 )
     elif _is_xpu:
-        if topk == 1 and routed_scaling_factor == 1.0 and not _use_intermediate:
-            pass  # we wrote directly into out_hidden_states
-        else:
-            moe_sum_reduce(
-                intermediate_cache3.view(*intermediate_cache3.shape),
-                out_hidden_states,
-                routed_scaling_factor,
-            )
+        moe_sum_reduce(
+            intermediate_cache3.view(*intermediate_cache3.shape),
+            out_hidden_states,
+            routed_scaling_factor,
+        )
     else:
         if _has_vllm_ops:
             vllm_ops.moe_sum(

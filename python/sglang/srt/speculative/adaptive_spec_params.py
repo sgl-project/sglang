@@ -49,8 +49,6 @@ DEFAULT_ADAPTIVE_CONFIG: dict[str, dict] = {
 
 def adaptive_unsupported_reason(server_args: ServerArgs) -> str | None:
     """Return why adaptive spec cannot run under the given server args, or None if supported."""
-    from sglang.srt.arg_groups.overrides import resolved_view
-
     if server_args.speculative_algorithm not in ("EAGLE", "EAGLE3"):
         return (
             f"speculative_algorithm={server_args.speculative_algorithm} "
@@ -64,12 +62,12 @@ def adaptive_unsupported_reason(server_args: ServerArgs) -> str | None:
             f"speculative_eagle_topk={server_args.speculative_eagle_topk} "
             "(only topk=1 is supported)"
         )
-    if resolved_view(server_args).enable_dp_attention:
+    if server_args.enable_dp_attention:
         return (
             "enable_dp_attention=True is not supported "
             "(adaptive tier decisions are not synchronized across DP ranks)"
         )
-    if resolved_view(server_args).enable_multi_layer_eagle:
+    if server_args.enable_multi_layer_eagle:
         return (
             "enable_multi_layer_eagle=True is not supported "
             "(MultiLayerEagleWorkerV2 does not implement adaptive)"

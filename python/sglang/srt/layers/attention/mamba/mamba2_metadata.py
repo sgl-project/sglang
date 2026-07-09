@@ -241,6 +241,11 @@ class Mamba2Metadata(ForwardMetadata):
         context_lens_tensor = forward_batch.extend_prefix_lens
         assert context_lens_tensor is not None
         has_initial_states = context_lens_tensor > 0
+        mamba_track_mask = getattr(forward_batch, "mamba_track_mask", None)
+        if mamba_track_mask is not None:
+            has_initial_states = (
+                has_initial_states & mamba_track_mask[: has_initial_states.shape[0]]
+            )
         prep_initial_states = torch.any(has_initial_states[:num_prefills]).item()
 
         query_start_loc = forward_metadata.query_start_loc[: num_prefills + 1]
