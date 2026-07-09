@@ -810,7 +810,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             else CaptureHiddenMode.LAST
         )
         forward_batch = ForwardBatch.init_new(
-            batch, self.draft_runner, capture_hidden_mode=capture_hidden_mode
+            batch,
+            self.draft_runner,
+            capture_hidden_mode=capture_hidden_mode,
+            return_hidden_states_before_norm=False,
         )
         forward_batch.return_logprob = False
         if mm_input_embeds is not None:
@@ -926,6 +929,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 self.speculative_num_draft_tokens,
                 self.draft_runner,
                 self.cuda_graph_runner_for_draft_extend,
+                return_hidden_states_before_norm=False,
             )
 
         if self.plan_stream:
@@ -1175,7 +1179,16 @@ class EAGLEWorkerV2(BaseSpecWorker):
         # allocator and kv cache pool are shared with target worker, which are cleared in scheduler
         pass
 
-    def forward_batch_generation(self, batch: ScheduleBatch, on_publish=None):
+    def forward_batch_generation(
+        self,
+        batch: ScheduleBatch,
+        on_publish=None,
+        *,
+        capture_hidden_mode: Optional[CaptureHiddenMode],
+    ):
+        assert (
+            capture_hidden_mode is None
+        ), "spec workers derive capture_hidden_mode internally"
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             # Target prefill
             target_capture_mode = (
@@ -1619,6 +1632,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             batch=None,
             forward_batch=verify_forward_batch,
             is_verify=True,
+            capture_hidden_mode=None,
         )
         logits_output = forward_batch_output.logits_output
 
