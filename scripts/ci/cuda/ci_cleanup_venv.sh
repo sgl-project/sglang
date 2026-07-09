@@ -10,6 +10,18 @@
 set +e
 set -u
 
+# Sweep stale /dev/shm files left by crashed/cancelled/leaky jobs. Runs
+# independent of venv mode (before the USE_VENV early-exit below). Leaked shm —
+# loky pool semaphores (sem.loky-*), sglang shm segments (sglang_loads_*),
+# cuda.shm.* — accumulates across jobs and, on a runner with a small --shm-size,
+# eventually fills /dev/shm so the next scheduler SIGBUSes at init ("Fatal
+# Python error: Bus error", scheduler died exit code -7). The 4h age floor never
+# touches a running job's shm (same rationale as the stale-venv sweep below).
+if [ -d /dev/shm ]; then
+    shm_swept=$(find /dev/shm -maxdepth 1 -type f -mmin +240 -print -delete 2>/dev/null | wc -l)
+    [ "${shm_swept:-0}" -gt 0 ] && echo "Swept $shm_swept stale /dev/shm file(s) older than 4h"
+fi
+
 # Skip entirely when venv mode is disabled — no /tmp/sglang-ci-* dir exists
 # and there's nothing to sweep. Matches the USE_VENV parsing in
 # ci_install_dependency.sh (accepts 1/true/yes, case-insensitive).
