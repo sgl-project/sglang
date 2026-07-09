@@ -494,11 +494,11 @@ class SchedulerDisaggregationPrefillMixin:
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
+            if self._engine_paused:
+                continue
             self.waiting_queue.extend(
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
             )
-            if self._engine_paused:
-                continue
 
             # Get the next batch to run
             batch = self.get_next_disagg_prefill_batch_to_run()
@@ -526,11 +526,11 @@ class SchedulerDisaggregationPrefillMixin:
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
+            if self._engine_paused:
+                continue
             self.waiting_queue.extend(
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
             )
-            if self._engine_paused:
-                continue
 
             self._apply_war_barrier()
 
