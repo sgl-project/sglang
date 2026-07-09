@@ -4,7 +4,9 @@ Multi-modality utils
 
 import copy
 import hashlib
+import os
 import pickle
+import sys
 from abc import abstractmethod
 from collections import defaultdict
 from multiprocessing import shared_memory
@@ -1249,8 +1251,12 @@ def tensor_hash(tensor_list) -> int:
 
 def hash_feature(f):
     if isinstance(f, list):
-        if len(f) > 0 and isinstance(f[0], ShmPointerMMData):
-            return tensor_hash([x.tensor for x in f])
+        # A list may mix ShmPointerMMData and plain tensors, since wrapping
+        # falls back to inline transport per element when shm allocation fails.
+        if len(f) > 0 and any(isinstance(x, ShmPointerMMData) for x in f):
+            return tensor_hash(
+                [x.tensor if isinstance(x, ShmPointerMMData) else x for x in f]
+            )
         if len(f) > 0 and isinstance(f[0], torch.Tensor):
             return tensor_hash(f)
         return data_hash(tuple(flatten_nested_list(f)))
@@ -1688,6 +1694,12 @@ class ShmPointerMMData:
             create=True, size=nbytes, name=make_shm_name("mm")
         )
         try:
+            if sys.platform == "linux":
+                # SharedMemory only ftruncates the segment, so tmpfs pages are
+                # allocated lazily at write time; if /dev/shm fills up mid-copy
+                # the process is killed with SIGBUS. Reserving the pages up
+                # front turns exhaustion into a catchable OSError (ENOSPC).
+                os.posix_fallocate(shm._fd, 0, nbytes)
             dst = torch.frombuffer(shm.buf, dtype=torch.uint8)
             dst.copy_(tensor.view(torch.uint8).reshape(-1))
         except BaseException:
@@ -1749,6 +1761,21 @@ def _get_is_default_transport():
     return _is_default_tensor_transport
 
 
+def _wrap_shm_or_inline(tensor: torch.Tensor, precomputed_hash: Optional[int] = None):
+    """Wrap a tensor in ShmPointerMMData, falling back to inline (pickled)
+    transport when shared memory cannot be allocated, e.g. /dev/shm is full
+    under a burst of multimodal requests."""
+    try:
+        return ShmPointerMMData(tensor, precomputed_hash=precomputed_hash)
+    except OSError as e:
+        print_warning_once(
+            f"Failed to allocate shared memory for multimodal feature transport "
+            f"({e}); falling back to inline transport. "
+            f"Consider increasing /dev/shm size."
+        )
+        return tensor
+
+
 def _wrap_tensor_or_list(value, precomputed_hash: Optional[int] = None):
     """Wrap a CPU tensor (or list of CPU tensors) in ShmPointerMMData.
 
@@ -1757,10 +1784,10 @@ def _wrap_tensor_or_list(value, precomputed_hash: Optional[int] = None):
     so per-element hashes are not applicable.
     """
     if isinstance(value, torch.Tensor) and value.is_cpu:
-        return ShmPointerMMData(value, precomputed_hash=precomputed_hash)
+        return _wrap_shm_or_inline(value, precomputed_hash=precomputed_hash)
     elif isinstance(value, (list, tuple)):
         wrapped = [
-            (ShmPointerMMData(t) if isinstance(t, torch.Tensor) and t.is_cpu else t)
+            (_wrap_shm_or_inline(t) if isinstance(t, torch.Tensor) and t.is_cpu else t)
             for t in value
         ]
         return type(value)(wrapped) if isinstance(value, tuple) else wrapped
