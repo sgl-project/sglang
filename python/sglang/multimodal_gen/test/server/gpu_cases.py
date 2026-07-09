@@ -935,6 +935,9 @@ FILE_SUITES = {
     "1-gpu-b200": [
         "test_server_b200.py",
     ],
+    "bcg-diffusion": [
+        "../single_test_file/test_diffusion_bcg_zimage_turbo.py",
+    ],
 }
 
 PARAMETRIZED_CASE_GROUPS = {
@@ -983,7 +986,7 @@ SUITES = {
     },
 }
 
-STRICT_SUITES = {"unit"}
+STRICT_SUITES = {"unit", "bcg-diffusion"}
 COMPONENT_ACCURACY_SUITES = {
     "component-accuracy",
     "component-accuracy-1-gpu",

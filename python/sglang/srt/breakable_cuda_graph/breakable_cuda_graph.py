@@ -261,13 +261,17 @@ def eager_on_graph(enable: bool):
             # writes real data into them.
             output = inner(*args, **kwargs)
 
-            # Weak-ref the closure state. Storage lives with the segment
-            # CUDAGraphs' mempool pin; Python refs don't need to prevent
-            # pool reuse across layers.
+            # Weak-ref captured inputs produced by graph segments. Their storage
+            # is pinned by the segment CUDAGraphs' mempool use-count, so Python
+            # refs do not need to keep every intermediate alive.
             captured_inner = inner
             captured_args = tuple(_weak_ref_if_tensor(a) for a in args)
             captured_kwargs = {k: _weak_ref_if_tensor(v) for k, v in kwargs.items()}
-            captured_output = _weak_ref_if_tensor(output)
+            # The eager break output is different: it is allocated between graph
+            # captures and is the static input address consumed by the next
+            # captured segment. Keep a strong reference so replay can safely
+            # copy fresh eager output into that bridge buffer.
+            captured_output = output
 
             def replay_fn():
                 new_out = captured_inner(*captured_args, **captured_kwargs)

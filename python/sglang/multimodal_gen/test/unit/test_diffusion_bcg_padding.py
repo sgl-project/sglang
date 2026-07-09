@@ -248,6 +248,23 @@ class TestDiffusionBCGPadding(unittest.TestCase):
             BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS,
         )
 
+    def test_image_generation_models_are_registered_as_bcg_supported(self):
+        for model_id in (
+            "qwen/qwen-image",
+            "qwen/qwen-image-2512",
+            "tongyi-mai/z-image",
+            "tongyi-mai/z-image-turbo",
+            "zai-org/glm-image",
+        ):
+            self.assertIn(model_id, BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS)
+
+        for config_name in (
+            "GlmImagePipelineConfig",
+            "QwenImagePipelineConfig",
+            "ZImagePipelineConfig",
+        ):
+            self.assertIn(config_name, BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS)
+
     def test_dynamic_varlen_mask_meta_rebuilds_once_per_replay_token(self):
         builder = DynamicVarlenMaskMeta()
         mask = torch.tensor([[True, True, False, False]])
