@@ -14,8 +14,10 @@ reduce into one call and consume *global* top-k expert ids together with
 ``rank_ep`` / ``num_expert_total``, so expert parallelism with contiguous
 expert partitioning works without a local-expert remap.
 
-Only supported on NVIDIA Hopper / Blackwell (sm90+). Enable it explicitly with
-``--moe-runner-backend hpc_ops``.
+Only supported on NVIDIA Hopper / Blackwell (sm90+). Note that the HPC-Ops
+kernels are currently tuned primarily for H20: on other GPUs (H100/H200/B200,
+...) the speedup over the default MoE runner may be limited or absent. Enable
+it explicitly with ``--moe-runner-backend hpc_ops``.
 """
 
 import functools
