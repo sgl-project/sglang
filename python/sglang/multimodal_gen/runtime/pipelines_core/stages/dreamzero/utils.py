@@ -78,7 +78,7 @@ def remove_redundant_action_register(
     seq_len_without_action = seq_len_with_action - action_register_length
     other_dims = tensor.shape[3:]
     front = tensor[: sp_size - 1, :, :seq_len_without_action]
-    front = front.reshape(
+    front = front.permute(1, 0, 2, *range(3, tensor.dim())).reshape(
         batch, (sp_size - 1) * seq_len_without_action, *other_dims
     )
     last = tensor[sp_size - 1].reshape(batch, seq_len_with_action, *other_dims)
@@ -99,4 +99,6 @@ def flatten_dim_sp_into_sequence(tensor: torch.Tensor) -> torch.Tensor:
     if tensor.dim() < 3:
         raise ValueError("DreamZero gathered SP tensor must have at least 3 dimensions")
     sp_size, batch, seq_len = tensor.shape[:3]
-    return tensor.reshape(batch, seq_len * sp_size, *tensor.shape[3:])
+    return tensor.permute(1, 0, 2, *range(3, tensor.dim())).reshape(
+        batch, seq_len * sp_size, *tensor.shape[3:]
+    )
