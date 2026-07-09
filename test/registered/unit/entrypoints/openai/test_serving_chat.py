@@ -28,7 +28,7 @@ from sglang.srt.entrypoints.openai.serving_chat import (
     normalize_tool_content,
 )
 from sglang.srt.managers.io_struct import GenerateReqInput
-from sglang.srt.managers.template_detection import ReasoningToggleConfig
+from sglang.srt.parser.template_detection import ReasoningToggleConfig
 from sglang.srt.utils import get_or_create_event_loop
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -1164,7 +1164,7 @@ class ServingChatTestCase(unittest.TestCase):
 
     def test_dpsk_v32_encoding_path(self):
         """Test DeepSeek V3.2 encoding path detection and application."""
-        from sglang.srt.managers.template_manager import TemplateManager
+        from sglang.srt.parser.template_manager import TemplateManager
 
         # Only mock the fields that _use_dpsk_v32_encoding() actually reads:
         # tokenizer.chat_template and hf_config.architectures
