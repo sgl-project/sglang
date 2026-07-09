@@ -41,9 +41,17 @@ from sglang.srt.speculative.triton_ops.cache_locs import (
     get_target_cache_loc as get_target_cache_loc,
 )
 from sglang.srt.speculative.triton_ops.eagle import (
-    fill_accept_out_cache_loc as fill_accept_out_cache_loc,
+    fill_accept_out_cache_loc_func as fill_accept_out_cache_loc_func,
 )
-from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu, next_power_of_2
+from sglang.srt.utils import (
+    is_cpu,
+    is_cuda,
+    is_hip,
+    is_musa,
+    is_npu,
+    is_xpu,
+    next_power_of_2,
+)
 from sglang.srt.utils.async_probe import maybe_detect_oob
 from sglang.srt.utils.nvtx_utils import profile_range
 
@@ -51,6 +59,8 @@ _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_musa = is_musa()
+_is_xpu = is_xpu()
+_is_cpu = is_cpu()
 
 if TYPE_CHECKING:
     from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
@@ -67,6 +77,9 @@ elif _is_hip:
     from sgl_kernel import fast_topk
 else:
     from sglang.srt.utils.common import fast_topk
+
+if _is_cpu:
+    from sgl_kernel import assign_extend_cache_locs_cpu
 
 
 logger = logging.getLogger(__name__)
@@ -94,9 +107,22 @@ def renorm_draft_probs(
     return torch.softmax(next_token_logits / sampling_info.temperatures, dim=-1)
 
 
+def sample_draft_proposal(next_token_logits: torch.Tensor, temperatures: torch.Tensor):
+    """Leviathan draft proposal: q = softmax(logits / T), X ~ q.
+
+    Returns (q, q(X), X). The verify's accept test coin*q(X) < p(X) is unbiased
+    only if q is exactly the distribution X was drawn from, so callers must hand
+    the returned q (not a recomputed one) to the verify.
+    """
+    probs = torch.softmax(next_token_logits / temperatures, dim=-1)
+    topk_p, topk_index = fast_sample(probs, num_samples=1)
+    return probs, topk_p, topk_index
+
+
 # Simulate acceptance length for benchmarking purposes
 SIMULATE_ACC_LEN = envs.SGLANG_SIMULATE_ACC_LEN.get()  # turn off if < 0
 SIMULATE_ACC_METHOD = envs.SGLANG_SIMULATE_ACC_METHOD.get()
+SIMULATE_ACC_TOKEN_MODE = envs.SGLANG_SIMULATE_ACC_TOKEN_MODE.get()
 
 TREE_TRAVERSE_TIME_THRESHOLD = 1  # TODO: set this properly
 TREE_SPEC_KERNEL_AVAILABLE = (
@@ -188,7 +214,7 @@ def spec_need_hidden_states(server_args: Optional[ServerArgs] = None) -> bool:
     return not server_args.enable_multi_layer_eagle
 
 
-@torch.compile(dynamic=True, disable=_is_npu)
+@torch.compile(dynamic=True, disable=_is_npu or _is_xpu)
 def create_num_accept_tokens_filter(
     num_correct_drafts: torch.Tensor,
     unfinished_index_device: torch.Tensor,
@@ -222,7 +248,7 @@ def _select_top_k_tokens_first(
     return input_ids, hidden_states, topk_p, tree_info
 
 
-@torch.compile(dynamic=True, disable=_is_npu)
+@torch.compile(dynamic=True, disable=_is_npu or _is_xpu)
 def _select_top_k_tokens_later(
     i: int,
     topk_p: torch.Tensor,
@@ -316,11 +342,16 @@ def generate_simulated_accept_index(
     accept_index,
     predict,
     num_correct_drafts,
+    candidates,
+    target_predict,
     bs,
     spec_steps,
     simulate_acc_len: float = SIMULATE_ACC_LEN,
     simulate_acc_method: str = SIMULATE_ACC_METHOD,
+    simulate_acc_token_mode: str = SIMULATE_ACC_TOKEN_MODE,
 ):
+    use_real_draft_tokens = simulate_acc_token_mode == "real-draft-token"
+
     assert simulate_acc_len > 0.0
     simulate_acc_len = _sample_simulated_acc_len(
         simulate_acc_len, simulate_acc_method, spec_steps + 1
@@ -328,13 +359,27 @@ def generate_simulated_accept_index(
 
     accept_indx_first_col = accept_index[:, 0].view(-1, 1)
     sim_accept_index = torch.full(
-        (bs, spec_steps + 1), -1, dtype=torch.int32, device="cuda"
+        (bs, spec_steps + 1), -1, dtype=torch.int32, device=accept_index.device
     )
     sim_accept_index[:, :simulate_acc_len] = accept_indx_first_col + torch.arange(
         simulate_acc_len, device=accept_index.device
     )
     num_correct_drafts.fill_(simulate_acc_len - 1)
-    predict.fill_(100)  # some legit token id
+
+    if not use_real_draft_tokens:
+        predict.fill_(100)  # some legit token id
+        return sim_accept_index
+
+    # Use the topk=1 draft chain for forced acceptance, then a target-derived bonus.
+    if simulate_acc_len > 1:
+        draft_node_indices = sim_accept_index[:, : simulate_acc_len - 1].long()
+        predict[draft_node_indices] = candidates[:, 1:simulate_acc_len].to(
+            dtype=predict.dtype
+        )
+    bonus_node_indices = sim_accept_index[:, simulate_acc_len - 1].long()
+    predict[bonus_node_indices] = target_predict[:, simulate_acc_len - 1].to(
+        dtype=predict.dtype
+    )
     return sim_accept_index
 
 
@@ -538,20 +583,30 @@ def move_accept_tokens_to_target_kvcache(
         device=device,
     )
     accept_out_cache_loc = torch.zeros(size, dtype=torch.int64, device=device)
-    assign_extend_cache_locs[(bs,)](
-        batch.req_pool_indices,
-        batch.req_to_token_pool.req_to_token,
-        batch.seq_lens,
-        batch.seq_lens + num_correct_drafts + 1,
-        tgt_cache_loc,
-        batch.req_to_token_pool.req_to_token.shape[1],
-        next_power_of_2(bs),
-    )
-    fill_accept_out_cache_loc[(size,)](
+    if _is_cpu:
+        assign_extend_cache_locs_cpu(
+            batch.req_pool_indices,
+            batch.req_to_token_pool.req_to_token,
+            batch.seq_lens,
+            batch.seq_lens + num_correct_drafts + 1,
+            tgt_cache_loc,
+            batch.req_to_token_pool.req_to_token.shape[1],
+        )
+    else:
+        assign_extend_cache_locs[(bs,)](
+            batch.req_pool_indices,
+            batch.req_to_token_pool.req_to_token,
+            batch.seq_lens,
+            batch.seq_lens + num_correct_drafts + 1,
+            tgt_cache_loc,
+            batch.req_to_token_pool.req_to_token.shape[1],
+            next_power_of_2(bs),
+        )
+    fill_accept_out_cache_loc_func(
         accept_index,
         batch.out_cache_loc,
         accept_out_cache_loc,
-        next_power_of_2(size),
+        size,
     )
     token_to_kv_pool_allocator.get_kvcache().move_kv_cache(
         tgt_cache_loc, accept_out_cache_loc
