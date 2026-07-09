@@ -2634,6 +2634,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if current_platform.is_out_of_tree():
             GraphRunnerCls = current_platform.get_graph_runner_cls()
             self.decode_cuda_graph_runner = GraphRunnerCls(self)
+        elif self.device == "cpu" and isinstance(
+            self.prefill_cuda_graph_runner, CPUGraphRunner
+        ):
+            # CPUGraphRunner handles both phases in one object and prefill is
+            # always initialized first (init_cuda_graphs calls
+            # init_prefill_cuda_graph before init_decode_cuda_graph) -- reuse
+            # that instance instead of compiling everything a second time.
+            self.decode_cuda_graph_runner = self.prefill_cuda_graph_runner
         else:
             from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
                 DecodeCudaGraphRunner,
@@ -2660,6 +2668,26 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def init_prefill_cuda_graph(self, force_for_draft_worker: bool = False):
         """Initialize prefill CUDA graph runner."""
         self.prefill_cuda_graph_runner = None
+
+        # CPU has no literal CUDA graph capture and none of the FX-split /
+        # attention-layer-collection machinery below applies to it. CPUGraphRunner
+        # handles both decode and prefill in one object (see its module
+        # docstring); prefill is initialized first, so just construct it here --
+        # init_decode_cuda_graph's CPU branch reuses this same instance.
+        if self.device == "cpu":
+            if not self.is_generation:
+                return
+            if not get_flags().capture.enable_torch_compile:
+                return
+            if self.is_draft_worker and not force_for_draft_worker:
+                return
+            # CPUGraphRunner decides internally whether prefill.bs / the
+            # 'disabled' backend leaves it with no prefill buckets to build
+            # (can_run_graph then rejects EXTEND batches and callers fall back
+            # to eager). Always construct it here -- init_decode_cuda_graph's
+            # CPU branch reuses this same instance for decode.
+            self.prefill_cuda_graph_runner = CPUGraphRunner(self)
+            return
 
         if check_cuda_graph_backend(Phase.PREFILL, Backend.DISABLED):
             logger.info(
