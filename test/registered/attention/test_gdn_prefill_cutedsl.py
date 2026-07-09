@@ -346,6 +346,128 @@ def test_l2norm_qk_fusion_launch_count():
     assert old == 2 and new == 1
 
 
+@pytest.mark.parametrize("num_seqs", [1, 5, 257])
+@pytest.mark.parametrize("pad_last", [False, True])
+def test_cutedsl_extend_prep_hoist_equiv(num_seqs: int, pad_last: bool):
+    """P2c: precomputed (hoisted) prep passed via extend(prep=...) must yield
+    bit-identical core-attn output AND ssm-state writeback vs the per-layer
+    recompute path (prep=None), for single & multi-request, incl. -1 padding
+    (remapped to sentinel slot N-1)."""
+    from sglang.srt.layers.attention.linear.kernels.gdn_cutedsl import (
+        CuteDSLGDNKernel,
+    )
+
+    kernel = CuteDSLGDNKernel()
+    if not kernel.supports_prefill:
+        pytest.skip("CuteDSL GDN prefill unsupported on this device")
+
+    inp = _build_extend_inputs(num_seqs)
+    if pad_last:
+        # Poison the last row: extend()/build_extend_prep must remap -1 to the
+        # trailing sentinel slot (ssm_states.shape[0] - 1 == num_seqs).
+        inp["cache_indices"][-1] = -1
+
+    prep = kernel.build_extend_prep(
+        head_k_dim=inp["k"].shape[-1],
+        query_start_loc=inp["query_start_loc"],
+        cache_indices=inp["cache_indices"],
+        ssm_states=inp["ssm_states"],
+        total_seq_len=inp["total_tokens"],
+    )
+
+    # The hoisted ssm_cache_indices must equal the in-kernel where() remap.
+    _, ssm_cache_indices, _, _ = prep
+    expected = torch.where(
+        inp["cache_indices"] >= 0,
+        inp["cache_indices"],
+        inp["ssm_states"].shape[0] - 1,
+    ).to(torch.long)
+    assert torch.equal(ssm_cache_indices, expected)
+
+    def run(prep_arg):
+        ssm = inp["ssm_states"].clone()
+        o, s1, s2 = kernel.extend(
+            q=inp["q"],
+            k=inp["k"],
+            v=inp["v"],
+            g=inp["g"],
+            beta=inp["beta"],
+            ssm_states=ssm,
+            cache_indices=inp["cache_indices"],
+            query_start_loc=inp["query_start_loc"],
+            prep=prep_arg,
+        )
+        torch.cuda.synchronize()
+        assert s1 is None and s2 is None
+        return o, ssm
+
+    o_ref, ssm_ref = run(None)  # today's per-layer recompute
+    o_hoist, ssm_hoist = run(prep)  # hoisted reuse
+
+    assert (o_hoist.float() - o_ref.float()).abs().max().item() == 0
+    assert (ssm_hoist - ssm_ref).abs().max().item() == 0
+
+
+def test_cutedsl_extend_prep_hoist_launch_count():
+    """P2c: reusing hoisted prep across N layers collapses the
+    prepare_metadata_cutedsl (PrepMetaKernel) call from N -> 1."""
+    from sglang.srt.layers.attention.linear.kernels.gdn_cutedsl import (
+        CuteDSLGDNKernel,
+    )
+
+    kernel = CuteDSLGDNKernel()
+    if not kernel.supports_prefill:
+        pytest.skip("CuteDSL GDN prefill unsupported on this device")
+
+    inp = _build_extend_inputs(5)
+    kernel._ensure_extend_loaded(inp["k"].shape[-1])  # load _prepare_meta_fn
+
+    calls = {"n": 0}
+    orig = kernel._prepare_meta_fn
+
+    def counting(*a, **kw):
+        calls["n"] += 1
+        return orig(*a, **kw)
+
+    kernel._prepare_meta_fn = counting
+
+    def one_layer(prep_arg):
+        kernel.extend(
+            q=inp["q"],
+            k=inp["k"],
+            v=inp["v"],
+            g=inp["g"],
+            beta=inp["beta"],
+            ssm_states=inp["ssm_states"].clone(),
+            cache_indices=inp["cache_indices"],
+            query_start_loc=inp["query_start_loc"],
+            prep=prep_arg,
+        )
+
+    N_LAYERS = 45
+
+    # Per-layer recompute path: one prepare_meta per layer.
+    calls["n"] = 0
+    for _ in range(N_LAYERS):
+        one_layer(None)
+    torch.cuda.synchronize()
+    assert calls["n"] == N_LAYERS
+
+    # Hoist path: build once, reuse -> exactly one prepare_meta for all layers.
+    calls["n"] = 0
+    prep = kernel.build_extend_prep(
+        head_k_dim=inp["k"].shape[-1],
+        query_start_loc=inp["query_start_loc"],
+        cache_indices=inp["cache_indices"],
+        ssm_states=inp["ssm_states"],
+        total_seq_len=inp["total_tokens"],
+    )
+    for _ in range(N_LAYERS):
+        one_layer(prep)
+    torch.cuda.synchronize()
+    assert calls["n"] == 1
+
+
 if __name__ == "__main__":
     import sys
 

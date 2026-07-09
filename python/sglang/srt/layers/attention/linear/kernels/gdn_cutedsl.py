@@ -161,6 +161,36 @@ class CuteDSLGDNKernel(LinearAttnKernelBase):
             softplus_threshold=20.0,
         )
 
+    def build_extend_prep(
+        self,
+        *,
+        head_k_dim: int,
+        query_start_loc: torch.Tensor,
+        cache_indices: torch.Tensor,
+        ssm_states: torch.Tensor,
+        total_seq_len: int,
+    ) -> tuple:
+        """Compute the layer-invariant extend metadata once per forward.
+
+        These three quantities depend only on per-request data (query start
+        locations, cache slot indices, sequence structure), which is identical
+        across all GDN layers in a forward, so the caller (forward_extend) builds
+        this once and reuses it across the 45 per-layer extend() calls (P2c).
+        Bit-identical to the recompute in extend()'s prep=None fallback.
+        """
+        self._ensure_extend_loaded(head_k_dim)
+        cu_seqlens = query_start_loc.to(torch.int32)
+        # Pool gather indices: remap padding (-1) to the last (sentinel) slot.
+        ssm_cache_indices = torch.where(
+            cache_indices >= 0,
+            cache_indices,
+            ssm_states.shape[0] - 1,
+        ).to(torch.long)
+        chunk_indices, chunk_offsets = self._prepare_meta_fn(
+            cu_seqlens, total_seq_len, chunk_size=64
+        )
+        return cu_seqlens, ssm_cache_indices, chunk_indices, chunk_offsets
+
     def extend(
         self,
         q: torch.Tensor,
@@ -173,6 +203,7 @@ class CuteDSLGDNKernel(LinearAttnKernelBase):
         cache_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
         out: Optional[torch.Tensor] = None,
+        prep: Optional[tuple] = None,
         **kwargs,
     ) -> tuple:
         head_k_dim = k.shape[-1]
@@ -192,19 +223,21 @@ class CuteDSLGDNKernel(LinearAttnKernelBase):
         g_in = g[0].to(torch.float32).unsqueeze(0)
         beta_in = beta[0].to(torch.float32).unsqueeze(0)
 
-        cu_seqlens = query_start_loc.to(torch.int32)
+        if prep is None:
+            # Fallback for direct extend() callers (e.g. unit tests). On the
+            # per-layer hot path, forward_extend passes prep= once per forward
+            # (P2c) so this layer-invariant metadata is not recomputed 45x.
+            prep = self.build_extend_prep(
+                head_k_dim=head_k_dim,
+                query_start_loc=query_start_loc,
+                cache_indices=cache_indices,
+                ssm_states=ssm_states,
+                total_seq_len=total_seq_len,
+            )
+        cu_seqlens, ssm_cache_indices, chunk_indices, chunk_offsets = prep
 
         # Pool gather: remap padding (-1) to the last (sentinel) slot.
-        ssm_cache_indices = torch.where(
-            cache_indices >= 0,
-            cache_indices,
-            ssm_states.shape[0] - 1,
-        ).to(torch.long)
         initial_state = ssm_states[ssm_cache_indices].contiguous()
-
-        chunk_indices, chunk_offsets = self._prepare_meta_fn(
-            cu_seqlens, total_seq_len, chunk_size=64
-        )
 
         # Direct-write epilogue: when the caller supplies its final output slice
         # (shape [1, T, Hv, V]), the o-kernel writes [T, Hv, V] straight into it,

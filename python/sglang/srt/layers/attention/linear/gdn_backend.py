@@ -128,6 +128,13 @@ class GDNKernelDispatcher:
         else:
             raise ValueError(f"Unsupported GDN prefill backend: {prefill_backend}")
 
+        # Whether prefill/extend resolved to the CuteDSL kernel (False for
+        # Triton/FlashInfer and for the SM90 CuteDSL->Triton fallback above).
+        # Gates the P2c per-forward extend-prep hoist to the CuteDSL path only.
+        self.extend_is_cutedsl = (
+            cutedsl_kernel is not None and self.extend_kernel is cutedsl_kernel
+        )
+
         # Verify kernel: use FlashInfer when the selected FlashInfer kernel
         # supports MTP verify. SM90 uses the fp32-state path; SM100 uses the
         # bf16-state adapter in FlashInferGDNKernel.
@@ -222,6 +229,7 @@ class GDNKernelDispatcher:
         ssm_states: torch.Tensor,
         cache_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
+        prep: Optional[tuple] = None,
         **kwargs,
     ) -> tuple:
         return self.extend_kernel.extend(
@@ -233,6 +241,7 @@ class GDNKernelDispatcher:
             ssm_states=ssm_states,
             cache_indices=cache_indices,
             query_start_loc=query_start_loc,
+            prep=prep,
             **kwargs,
         )
 
@@ -284,6 +293,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
         decode_backend = get_linear_attn_decode_backend()
         prefill_backend = get_linear_attn_prefill_backend()
         self.kernel_dispatcher = GDNKernelDispatcher(decode_backend, prefill_backend)
+        # P2c: memoized layer-invariant CuteDSL extend prep, keyed on the
+        # forward_metadata object (rebuilt each forward/replay -> auto-invalidated
+        # by identity; a held reference forecloses id() reuse).
+        self._cutedsl_prep_fm = None
+        self._cutedsl_prep = None
         self.verify_intermediate_state_indices = torch.arange(
             self.req_to_token_pool.size, dtype=torch.int32, device=model_runner.device
         )
@@ -533,6 +547,30 @@ class GDNAttnBackend(MambaAttnBackendBase):
             )
         else:
             g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
+
+            # P2c: hoist the layer-invariant CuteDSL extend prep (cu_seqlens,
+            # ssm_cache_indices, chunk_indices/offsets) out of the 45 per-layer
+            # calls into one compute per forward. Key = the forward_metadata
+            # object (fresh per forward/replay), NOT state_cache_indices (a fresh
+            # arange per layer in the envelope pool). needs_state_gather and pool
+            # contiguity are layer-invariant, so layer-1's tensors are exact for
+            # all layers; build_extend_prep sees the same ssm_states_contig /
+            # state_cache_indices the dispatcher passes to extend.
+            prep = None
+            if self.kernel_dispatcher.extend_is_cutedsl:
+                if self._cutedsl_prep_fm is not forward_metadata:
+                    self._cutedsl_prep = (
+                        self.kernel_dispatcher.extend_kernel.build_extend_prep(
+                            head_k_dim=layer.head_k_dim,
+                            query_start_loc=query_start_loc,
+                            cache_indices=state_cache_indices,
+                            ssm_states=ssm_states_contig,
+                            total_seq_len=int(query.shape[1]),
+                        )
+                    )
+                    self._cutedsl_prep_fm = forward_metadata
+                prep = self._cutedsl_prep
+
             core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
                 q=query,
                 k=key,
@@ -543,6 +581,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 cache_indices=state_cache_indices,
                 query_start_loc=query_start_loc,
                 out=out,
+                prep=prep,
             )
 
             if is_npu() and last_recurrent_state is not None:
