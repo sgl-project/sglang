@@ -77,7 +77,6 @@ def run_eval_once(args, base_url: str, eval_obj: Eval) -> dict:
         sampler = CompletionSampler(
             **common_kwargs,
             stop=stop,
-            record_meta_info=True,
         )
     else:
         sampler = ChatCompletionSampler(

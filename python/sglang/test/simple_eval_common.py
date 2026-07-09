@@ -196,7 +196,6 @@ class CompletionSampler(SamplerBase):
         top_p: float = 1.0,
         max_tokens: int = 2048,
         stop: Optional[List[str]] = None,
-        record_meta_info: bool = False,
     ):
         self.client = OpenAI(base_url=base_url, http_client=LargerHttpxClient())
 
@@ -209,8 +208,6 @@ class CompletionSampler(SamplerBase):
         self.max_tokens = max_tokens
         self.stop = stop
         self._completion_tokens: list[int] = []
-        self.record_meta_info = record_meta_info
-        self._meta_infos: List[Dict[str, Any]] = []
         print(
             f"CompletionSampler initialized with {self.model=} {self.temperature=} {self.max_tokens=} {self.stop=}"
         )
@@ -236,10 +233,6 @@ class CompletionSampler(SamplerBase):
                     max_tokens=self.max_tokens,
                     stop=self.stop,
                 )
-                if self.record_meta_info:
-                    meta_info = getattr(response.choices[0], "meta_info", None)
-                    if meta_info:
-                        self._meta_infos.append(meta_info)
                 if response.usage and response.usage.completion_tokens is not None:
                     self._completion_tokens.append(response.usage.completion_tokens)
                 return response.choices[0].text or ""
