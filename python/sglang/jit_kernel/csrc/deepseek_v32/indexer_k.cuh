@@ -26,7 +26,10 @@
 
 namespace {
 
+using deepseek_v4::fp8::cast_to_ue8m0;
+using deepseek_v4::fp8::inv_scale_ue8m0;
 using deepseek_v4::fp8::pack_fp8;
+using deepseek_v4::fp8::quant_fp4_e2m1;
 
 constexpr uint32_t kFusedKIndexerBlockSize = 128;
 constexpr uint32_t kFusedKIndexerNumWarps = kFusedKIndexerBlockSize / device::kWarpThreads;
@@ -220,9 +223,13 @@ struct FusedKIndexerNormRopeKernel {
   }
 };
 
-// Indexer K + fused store: LayerNorm + RoPE + fp8 quant + paged store in one
-// launch. Page layout matches fused_store_index_cache.cuh: each page is
+// Indexer K + fused store: LayerNorm + RoPE + quant + paged store in one
+// launch. FP8 page layout matches fused_store_index_cache.cuh: each page is
 // 132*page_size bytes (128*page_size fp8 keys, then 4*page_size fp32 scales).
+// MXFP4 (kIsFp4) pages are 68*page_size bytes (64*page_size packed E2M1
+// pairs, then 4*page_size UE8M0 group exponents -- 4 x 32-elem groups per
+// token), matching store_fp4_index_k_cache in
+// srt/layers/attention/dsv4/fp4_indexer.py bit-for-bit.
 struct FusedKIndexerNormRopeStoreParams {
   const void* __restrict__ k_input;         // (B, 128) DType
   void* __restrict__ cache;                 // (num_pages, 132*page_size) uint8
@@ -237,7 +244,7 @@ struct FusedKIndexerNormRopeStoreParams {
   float eps;
 };
 
-template <typename DType, typename PosT, bool kUsePDL, int32_t kPageBits>
+template <typename DType, typename PosT, bool kUsePDL, int32_t kPageBits, bool kIsFp4>
 K_INDEXER_KERNEL void fused_k_indexer_norm_rope_store(const __grid_constant__ FusedKIndexerNormRopeStoreParams params) {
   using namespace device;
 
@@ -245,7 +252,7 @@ K_INDEXER_KERNEL void fused_k_indexer_norm_rope_store(const __grid_constant__ Fu
   constexpr int64_t kRopeDim = 64;
   constexpr int64_t kVecSize = 4;
   constexpr uint32_t kRopeSize = kRopeDim / kVecSize;  // = 16
-  constexpr int64_t kPageBytes = 132ll << kPageBits;
+  constexpr int64_t kPageBytes = (kIsFp4 ? 68ll : 132ll) << kPageBits;
   static_assert(kHeadDim == kWarpThreads * kVecSize);
   static_assert(kRopeDim == kWarpThreads * 2);
   static_assert(kRopeSize <= kWarpThreads);
@@ -316,42 +323,60 @@ K_INDEXER_KERNEL void fused_k_indexer_norm_rope_store(const __grid_constant__ Fu
 
   PDLTriggerSecondary<kUsePDL>();
 
-  // part 3: fp8 act-quant + paged store. Round through bf16 first so the fp8
+  // part 3: act-quant + paged store. Round through bf16 first so the quant
   // scale matches the un-fused path.
 #pragma unroll
   for (int i = 0; i < kVecSize; ++i)
     data[i] = cast<float>(cast<DType>(data[i]));
 
-  float local_max = math::abs(data[0]);
-#pragma unroll
-  for (int i = 1; i < kVecSize; ++i)
-    local_max = math::max(local_max, math::abs(data[i]));
-  const auto abs_max = warp::reduce_max(local_max);
-  const auto scale = fmaxf(1e-4f, abs_max) / math::FP8_E4M3_MAX;
-  const auto inv_scale = 1.0f / scale;
-
   const auto index = static_cast<const int64_t*>(params.indices)[work_id];
   const int32_t page = static_cast<int32_t>(index >> kPageBits);
   const int32_t offset = static_cast<int32_t>(index & ((1 << kPageBits) - 1));
   const auto page_ptr = static_cast<uint8_t*>(params.cache) + page * kPageBytes;
-  const auto value_ptr = page_ptr + offset * kHeadDim;
-  const auto scale_ptr = page_ptr + (kHeadDim << kPageBits) + offset * 4;
 
-  OutStorage result;
-  result[0] = pack_fp8(data[0] * inv_scale, data[1] * inv_scale);
-  result[1] = pack_fp8(data[2] * inv_scale, data[3] * inv_scale);
-  reinterpret_cast<OutStorage*>(value_ptr)[lane_id] = result;
-  if (lane_id == 0) *reinterpret_cast<float*>(scale_ptr) = scale;
+  float local_max = math::abs(data[0]);
+#pragma unroll
+  for (int i = 1; i < kVecSize; ++i)
+    local_max = math::max(local_max, math::abs(data[i]));
+
+  if constexpr (kIsFp4) {
+    // MXFP4: per-32-elem-group (8 lanes) amax -> ceil UE8M0 scale -> packed
+    // E2M1 pairs. `group_max / 6.0f` then the 1e-4 floor matches the Triton
+    // quantizer's operation order (bit parity with the un-fused store).
+    const float group_max = warp::reduce_max<8>(local_max);
+    const float scale_raw = fmaxf(group_max / 6.0f, 1e-4f);
+    const auto scale_exp = static_cast<uint8_t>(cast_to_ue8m0(scale_raw));
+    const float inv_scale = inv_scale_ue8m0(scale_exp);
+    const uint8_t packed0 = quant_fp4_e2m1(data[0] * inv_scale) | (quant_fp4_e2m1(data[1] * inv_scale) << 4);
+    const uint8_t packed1 = quant_fp4_e2m1(data[2] * inv_scale) | (quant_fp4_e2m1(data[3] * inv_scale) << 4);
+    const uint16_t packed = static_cast<uint16_t>(packed0) | (static_cast<uint16_t>(packed1) << 8);
+    const auto value_ptr = page_ptr + offset * (kHeadDim / 2);
+    const auto scale_ptr = page_ptr + ((kHeadDim / 2) << kPageBits) + offset * 4;
+    reinterpret_cast<uint16_t*>(value_ptr)[lane_id] = packed;
+    if ((lane_id & 7) == 0) scale_ptr[lane_id >> 3] = scale_exp;
+  } else {
+    const auto abs_max = warp::reduce_max(local_max);
+    const auto scale = fmaxf(1e-4f, abs_max) / math::FP8_E4M3_MAX;
+    const auto inv_scale = 1.0f / scale;
+    const auto value_ptr = page_ptr + offset * kHeadDim;
+    const auto scale_ptr = page_ptr + (kHeadDim << kPageBits) + offset * 4;
+
+    OutStorage result;
+    result[0] = pack_fp8(data[0] * inv_scale, data[1] * inv_scale);
+    result[1] = pack_fp8(data[2] * inv_scale, data[3] * inv_scale);
+    reinterpret_cast<OutStorage*>(value_ptr)[lane_id] = result;
+    if (lane_id == 0) *reinterpret_cast<float*>(scale_ptr) = scale;
+  }
 }
 
-template <typename DType, bool kUsePDL, uint32_t kPageSize>
+template <typename DType, bool kUsePDL, uint32_t kPageSize, bool kIsFp4 = false>
 struct FusedKIndexerNormRopeStoreKernel {
   static constexpr int32_t kPageBits = std::countr_zero(kPageSize);
-  static constexpr int64_t kPageBytes = 132ll * kPageSize;
+  static constexpr int64_t kPageBytes = (kIsFp4 ? 68ll : 132ll) * kPageSize;
   static_assert(std::has_single_bit(kPageSize), "kPageSize must be a power of 2");
 
   template <typename PosT>
-  static constexpr auto kernel = fused_k_indexer_norm_rope_store<DType, PosT, kUsePDL, kPageBits>;
+  static constexpr auto kernel = fused_k_indexer_norm_rope_store<DType, PosT, kUsePDL, kPageBits, kIsFp4>;
 
   static void forward(
       const tvm::ffi::TensorView k_input,

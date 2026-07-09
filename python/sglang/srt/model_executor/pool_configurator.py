@@ -202,10 +202,15 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             # Add indexer KV cache overhead for DSA models (DeepSeek V3.2)
             if is_deepseek_dsa(model_config.hf_config):
                 index_head_dim = get_dsa_index_head_dim(model_config.hf_config)
-                indexer_size_per_token = (
-                    index_head_dim
-                    + index_head_dim // DSATokenToKVPool.quant_block_size * 4
-                )
+                if mr.server_args.enable_dsa_fp4_indexer:
+                    # MXFP4 index cache: 2 E2M1 elems/byte + 4 packed UE8M0
+                    # group scales per token.
+                    indexer_size_per_token = index_head_dim // 2 + 4
+                else:
+                    indexer_size_per_token = (
+                        index_head_dim
+                        + index_head_dim // DSATokenToKVPool.quant_block_size * 4
+                    )
                 element_size = torch._utils._element_size(
                     DSATokenToKVPool.index_k_with_scale_buffer_dtype
                 )

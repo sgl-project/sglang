@@ -1557,6 +1557,13 @@ class ServerArgs:
         bool,
         "Enable the experimental FP4 C4 indexer path for DeepSeek V4. Default keeps the existing indexer implementation.",
     ] = False
+    enable_dsa_fp4_indexer: A[
+        bool,
+        "Enable the experimental MXFP4 index-K cache for DSA models (DeepSeek-V3.2 / "
+        "GLM-5.x): stores the indexer K cache as E2M1 + UE8M0 (68 B/token/layer vs "
+        "132 B for FP8) and routes indexer logits through DeepGEMM's FP8/FP4 MQA "
+        "kernels. Opt-in; requires SM100+ and the DeepGEMM FP4 MQA-logits kernels.",
+    ] = False
     disable_custom_all_reduce: A[
         bool,
         "Disable the custom all-reduce kernel and fall back to NCCL.",
@@ -5991,6 +5998,24 @@ class ServerArgs:
                 "--enable-deepseek-v4-fp4-indexer requires SM100 GPUs with "
                 "DeepGEMM FP4 indexer support."
             )
+        if self.enable_dsa_fp4_indexer:
+            if not is_sm100_supported():
+                raise ValueError(
+                    "--enable-dsa-fp4-indexer requires SM100 GPUs with "
+                    "DeepGEMM FP4 MQA-logits support."
+                )
+            if self.enable_hisparse:
+                raise ValueError(
+                    "--enable-dsa-fp4-indexer is not supported together with "
+                    "--enable-hisparse (the HiSparse host mirror assumes the "
+                    "FP8 index-K layout)."
+                )
+            if self.dsa_paged_mqa_logits_backend not in ("auto", "deepgemm"):
+                raise ValueError(
+                    "--enable-dsa-fp4-indexer only supports "
+                    "--dsa-paged-mqa-logits-backend auto/deepgemm; got "
+                    f"{self.dsa_paged_mqa_logits_backend!r}."
+                )
         # FP8 W_o GEMM requires Blackwell (sm100+). Auto-disable on Hopper.
         if is_cuda() and envs.SGLANG_OPT_FP8_WO_A_GEMM.get() and get_device_sm() < 100:
             if envs.SGLANG_OPT_FP8_WO_A_GEMM.is_set():

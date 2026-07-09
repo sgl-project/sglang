@@ -73,6 +73,7 @@ from sglang.srt.mem_cache.utils import (
     set_mla_kv_scale_buffer_triton,
 )
 from sglang.srt.platforms import current_platform
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
@@ -3152,6 +3153,13 @@ class DSATokenToKVPool(MLATokenToKVPool):
             index_buf_size = size
         # num head == 1 and head dim == 128 for index_k in DSA
         assert index_head_dim == 128
+        # Bytes of quantized key data stored per token. FP8 stores one byte per
+        # element (128 B) + 4 B fp32 scale; the opt-in MXFP4 index cache packs two
+        # E2M1 elements per byte (64 B) + 4 packed UE8M0 group scales (4 B).
+        self.use_fp4_index_k = get_global_server_args().enable_dsa_fp4_indexer
+        self.index_k_bytes_per_token = (
+            index_head_dim // 2 if self.use_fp4_index_k else index_head_dim
+        )
 
         if _is_hip:
             if aiter_can_use_preshuffle_paged_mqa():
@@ -3173,16 +3181,16 @@ class DSATokenToKVPool(MLATokenToKVPool):
                 torch.zeros(
                     # Layout:
                     #     ref: test_attention.py :: kv_cache_cast_to_fp8
-                    #     shape: (num_pages, page_size 64 * head_dim 128 + page_size 64 * fp32_nbytes 4)
+                    #     shape: (num_pages, page_size 64 * k_bytes + page_size 64 * 4)
+                    #       where k_bytes = 128 (FP8, one byte/elem) or 64 (MXFP4,
+                    #       two E2M1 elems/byte)
                     #     data: for page i,
-                    #         * buf[i, :page_size * head_dim] for fp8 data
-                    #         * buf[i, page_size * head_dim:].view(float32) for scale
+                    #         * buf[i, :page_size * k_bytes] for quantized key data
+                    #         * buf[i, page_size * k_bytes:] for the per-token 4 B
+                    #           scale (fp32 for FP8; 4 packed UE8M0 exps for MXFP4)
                     (
                         (index_buf_size + page_size + 1) // self.page_size,
-                        self.page_size
-                        * (
-                            index_head_dim + index_head_dim // self.quant_block_size * 4
-                        ),
+                        self.page_size * (self.index_k_bytes_per_token + 4),
                     ),
                     dtype=self.index_k_with_scale_buffer_dtype,
                     device=device,

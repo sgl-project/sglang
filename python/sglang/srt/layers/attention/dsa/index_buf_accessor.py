@@ -96,7 +96,9 @@ class GetK:
             page_indices=page_indices,
             seq_len=seq_len,
             page_size=pool.page_size,
-            index_head_dim=pool.index_head_dim,
+            # Byte width of the stored key data per token (128 for FP8, 64 for
+            # the packed MXFP4 index cache).
+            index_head_dim=pool.index_k_bytes_per_token,
         )
 
 
@@ -165,7 +167,7 @@ class GetS:
             page_indices=page_indices,
             seq_len=seq_len,
             page_size=pool.page_size,
-            index_head_dim=pool.index_head_dim,
+            index_head_dim=pool.index_k_bytes_per_token,
         )
 
 
@@ -249,7 +251,7 @@ class GetKAndS:
             seq_len_sum=seq_len_sum,
             max_seq_len=max_seq_len,
             page_size=pool.page_size,
-            index_head_dim=pool.index_head_dim,
+            index_head_dim=pool.index_k_bytes_per_token,
         )
 
 

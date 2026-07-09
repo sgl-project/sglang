@@ -31,6 +31,24 @@ SGL_DEVICE float inv_scale_ue8m0(int32_t exp) {
   return __uint_as_float((127 + 127 - exp) << 23);
 }
 
+// Encode one already-scaled value as an FP4 E2M1 code (round-to-nearest via
+// the midpoint thresholds; ties round toward zero, negative zero encodes as
+// +0). Matches the Triton `_fp4_e2m1_code` reference in
+// srt/layers/attention/dsv4/fp4_indexer.py bit-for-bit.
+SGL_DEVICE uint8_t quant_fp4_e2m1(float x) {
+  const float ax = fminf(fabsf(x), 6.0f);
+  uint8_t idx = 0;
+  idx += ax > 0.25f;
+  idx += ax > 0.75f;
+  idx += ax > 1.25f;
+  idx += ax > 1.75f;
+  idx += ax > 2.5f;
+  idx += ax > 3.5f;
+  idx += ax > 5.0f;
+  if (x < 0.0f && idx != 0) idx |= 0x8;
+  return idx;
+}
+
 // Clamp to [-FP8_E4M3_MAX, FP8_E4M3_MAX].
 // Uses platform-specific max from type.cuh (448 for E4M3FN, 224 for E4M3FNUZ).
 SGL_DEVICE float fp8_e4m3_clip(float val) {
