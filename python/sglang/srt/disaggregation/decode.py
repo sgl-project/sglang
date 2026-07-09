@@ -54,6 +54,7 @@ from sglang.srt.disaggregation.utils import (
     get_kv_class,
     is_dsv4_c128_online_enabled,
     is_mla_backend,
+    merge_main_and_draft_kv_layout,
     poll_and_all_reduce,
     poll_and_all_reduce_with_staging,
     prepare_abort,
@@ -427,9 +428,30 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
                 self.draft_token_to_kv_pool.get_contiguous_buf_infos()
             )
-            kv_data_ptrs += draft_kv_data_ptrs
-            kv_data_lens += draft_kv_data_lens
-            kv_item_lens += draft_kv_item_lens
+            draft_layout_validation = getattr(
+                self.scheduler.server_args,
+                "enable_disagg_draft_layout_validation",
+                False,
+            )
+            if draft_layout_validation:
+                kv_args.num_main_kv_layers = len(kv_data_ptrs) // (
+                    1 if self.is_mla_backend else 2
+                )
+                kv_data_ptrs, kv_data_lens, kv_item_lens = (
+                    merge_main_and_draft_kv_layout(
+                        kv_data_ptrs,
+                        kv_data_lens,
+                        kv_item_lens,
+                        draft_kv_data_ptrs,
+                        draft_kv_data_lens,
+                        draft_kv_item_lens,
+                        is_mla_backend=self.is_mla_backend,
+                    )
+                )
+            else:
+                kv_data_ptrs += draft_kv_data_ptrs
+                kv_data_lens += draft_kv_data_lens
+                kv_item_lens += draft_kv_item_lens
             kv_data_mem_kinds += ["VRAM"] * len(draft_kv_data_ptrs)
 
         kv_args.kv_data_ptrs = kv_data_ptrs

@@ -74,6 +74,10 @@ class KVArgs:
     kv_buf_groups: int
     # Only used of npu, for decode total kv layers
     total_kv_layers: int
+    # Main-model KV layer count when draft ptrs are appended.
+    prefill_num_main_kv_layers: Optional[int] = None
+    # Local main-model KV layer count; None means no draft pool.
+    num_main_kv_layers: Optional[int] = None
 
 
 class KVPoll:
@@ -100,6 +104,10 @@ class BaseKVManager(ABC):
     def register_to_bootstrap(self):
         """Register prefill server info to the bootstrap server."""
         ...
+
+    def make_layer_pipeline_hook_for_reqs(self, reqs_with_indices):
+        """Build a per-batch LP hook; non-Mooncake backends opt out."""
+        return None
 
 
 class BaseKVSender(ABC):
@@ -133,6 +141,10 @@ class BaseKVSender(ABC):
 
     def pop_decode_prefix_len(self) -> int:
         return 0
+
+    def send_draft_kv(self, kv_indices: npt.NDArray[np.int32]) -> None:
+        """Ship draft KV when the backend has a separate draft pool."""
+        return
 
     def should_send_kv_chunk(self, num_pages: int, last_chunk: bool) -> bool:
         return num_pages > 0

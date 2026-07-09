@@ -25,7 +25,7 @@ from collections import deque
 from contextlib import contextmanager, nullcontext
 from functools import partial
 from http import HTTPStatus
-from typing import Any, Deque, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Deque, Dict, List, Optional, Tuple, Union
 
 from sglang.srt.utils.common import suppress_noisy_warnings  # isort: skip
 
@@ -3192,6 +3192,43 @@ class Scheduler(
             else:
                 batch.sampling_info = sched_sampling_info
 
+    def _maybe_build_layer_pipeline_hook(
+        self, batch: ScheduleBatch
+    ) -> Optional[Callable]:
+        if self.disaggregation_mode != DisaggregationMode.PREFILL:
+            return None
+        # Short-circuit when LP is off to avoid iterating reqs or the
+        # hook builder's .cpu().numpy() syncs.
+        bootstrap_queue = getattr(self, "disagg_prefill_bootstrap_queue", None)
+        kv_mgr = (
+            getattr(bootstrap_queue, "kv_manager", None)
+            if bootstrap_queue
+            else None
+        )
+        if kv_mgr is None or not getattr(kv_mgr, "layer_pipeline_enabled", False):
+            return None
+        builder = getattr(self, "build_layer_pipeline_hook", None)
+        if builder is None:
+            return None
+        return builder(batch)
+
+    def _maybe_build_layer_pipeline_hook_for_worker(
+        self, batch: ScheduleBatch
+    ) -> Optional[Callable]:
+        if (
+            not batch.spec_algorithm.is_none()
+            and not getattr(self.model_worker, "supports_layer_pipeline_hook", False)
+        ):
+            return None
+        return self._maybe_build_layer_pipeline_hook(batch)
+
+    def _add_layer_pipeline_hook_kwarg(
+        self, batch: ScheduleBatch, kwargs: Dict[str, Any]
+    ) -> None:
+        hook = self._maybe_build_layer_pipeline_hook_for_worker(batch)
+        if hook is not None:
+            kwargs["layer_pipeline_hook"] = hook
+
     @scheduler_nvtx_method("scheduler.run_batch")
     def run_batch(
         self,
@@ -3250,10 +3287,12 @@ class Scheduler(
                             if not batch.spec_algorithm.is_none()
                             else {}
                         )
+                        self._add_layer_pipeline_hook_kwarg(batch, fwd_kwargs)
 
                         # FIXME: pp is not compatible with overlap
                         batch_result = self.model_worker.forward_batch_generation(
-                            batch, **fwd_kwargs
+                            batch,
+                            **fwd_kwargs,
                         )
                         if batch.spec_algorithm.is_none():
                             self.future_map.publish(future_indices, batch.seq_lens + 1)
@@ -3318,7 +3357,11 @@ class Scheduler(
                 # future_map relay / on_publish).
                 resolve_forward_inputs(batch, self.future_map)
                 with self._forward_isolation(batch, overlap=False):
-                    batch_result = self.model_worker.forward_batch_generation(batch)
+                    fwd_kwargs = {}
+                    self._add_layer_pipeline_hook_kwarg(batch, fwd_kwargs)
+                    batch_result = self.model_worker.forward_batch_generation(
+                        batch, **fwd_kwargs
+                    )
                 # The isolation restore reverted the worker's in-forward SB edits;
                 # re-apply what must carry to the next iter.
                 batch.spec_info = batch_result.next_draft_input
@@ -3342,6 +3385,7 @@ class Scheduler(
                     else {}
                 )
                 resolve_forward_inputs(batch, self.future_map)
+                self._add_layer_pipeline_hook_kwarg(batch, kwargs)
                 batch_result = self.model_worker.forward_batch_generation(
                     batch, **kwargs
                 )

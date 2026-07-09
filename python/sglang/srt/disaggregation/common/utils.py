@@ -25,6 +25,14 @@ class TransferKVChunk:
     prefill_aux_index: Optional[int]
     state_indices: Optional[List]
     chunk_id: Optional[int] = None
+    layer_group_id: int = 0
+    layer_range: Optional[Tuple[int, int]] = None
+    total_layer_groups: int = 1
+    kv_dtype: str = "auto"
+    total_chunks_in_request: Optional[int] = None
+    transfer_event: Optional[object] = None
+    enqueue_ns: int = 0
+    skip_aux_rdma: bool = False
     trace_ctx: Union[TraceReqContext, TraceNullContext] = dataclasses.field(
         default_factory=TraceNullContext
     )

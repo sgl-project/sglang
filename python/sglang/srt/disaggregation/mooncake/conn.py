@@ -8,7 +8,7 @@ import struct
 import threading
 import time
 from collections import defaultdict
-from typing import List, Optional, Tuple, Union
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import numpy.typing as npt
@@ -39,7 +39,10 @@ from sglang.srt.disaggregation.common.utils import (
 from sglang.srt.disaggregation.mooncake.utils import (
     check_mooncake_custom_mem_pool_enabled,
 )
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.utils import (
+    DisaggregationMode,
+    filter_kv_indices_for_cp_rank,
+)
 from sglang.srt.distributed.parallel_state import get_mooncake_transfer_engine
 from sglang.srt.environ import envs
 from sglang.srt.observability.mooncake_trace import (
@@ -61,6 +64,49 @@ FAILED_SESSION_RECOVERIES = Counter(
     "sglang:failed_session_recoveries_total",
     "Number of mooncake_session_ids un-blacklisted via probe.",
 )
+
+# Draft KV is outside the main layer-group sequence.
+DRAFT_LAYER_GROUP_ID = -1
+DRAFT_TOTAL_LAYER_GROUPS_SENTINEL = -1
+
+
+@dataclasses.dataclass
+class _RoomLayerPipelineProgress:
+    """Per-room LP watermark: every dst must finish chunks and aux."""
+
+    chunks_done_per_dst: Dict[Tuple[str, int], int] = dataclasses.field(
+        default_factory=dict
+    )
+    aux_results_per_dst: Dict[Tuple[str, int], int] = dataclasses.field(
+        default_factory=dict
+    )
+    # From the trailing aux finalizer; chunks may arrive before this is known.
+    total_chunks_expected: Optional[int] = None
+    # Number of dst ranks in the request fan-out.
+    required_dst_info_num: Optional[int] = None
+    success_synced: bool = False
+
+
+@dataclasses.dataclass
+class _LayerPipelineRequestDispatch:
+    room: int
+    sender: "MooncakeKVSender"
+    page_indices: npt.NDArray[np.int32]
+    index_slice: slice
+    state_indices: Optional[npt.NDArray[np.int32]] = None
+
+
+def split_layer_groups(
+    num_layers: int, layer_group_size: int
+) -> List[Tuple[int, int]]:
+    if num_layers <= 0:
+        return []
+    if layer_group_size <= 0 or layer_group_size >= num_layers:
+        return [(0, num_layers)]
+    return [
+        (start, min(start + layer_group_size, num_layers))
+        for start in range(0, num_layers, layer_group_size)
+    ]
 
 
 # decode
@@ -123,6 +169,11 @@ class KVArgsRegisterInfo:
     # for mamba state different tp slice transfer
     dst_state_item_lens: List[List[int]]
     dst_state_dim_per_tensor: List[List[int]]
+    layer_pipeline_enabled: bool = False
+    layer_group_size: int = 0
+    kv_dtype: str = "auto"
+    # Logical main-layer count; None keeps legacy length-based inference.
+    dst_num_main_kv_layers: Optional[int] = None
     # Note: always put the staging field at the final (since the staging field is optional and contains multiple inputs)
     staging: Optional[StagingRegisterInfo] = None
 
@@ -145,8 +196,22 @@ class KVArgsRegisterInfo:
             dst_state_dim_per_tensor=(
                 unpack_int_lists(msg[11], "I") if len(msg) > 11 else []
             ),
+            layer_pipeline_enabled=(
+                msg[12].decode("ascii") == "1" if len(msg) > 12 else False
+            ),
+            layer_group_size=(
+                int(msg[13].decode("ascii"))
+                if len(msg) > 13 and len(msg[13]) > 0
+                else 0
+            ),
+            kv_dtype=msg[14].decode("ascii") if len(msg) > 14 else "auto",
+            dst_num_main_kv_layers=(
+                int(msg[17].decode("ascii"))
+                if len(msg) > 17 and len(msg[17]) > 0
+                else None
+            ),
             # Note: always put the staging field at the final
-            staging=StagingRegisterInfo.from_zmq_fields(msg, 12),
+            staging=StagingRegisterInfo.from_zmq_fields(msg, 15),
         )
 
 
@@ -170,6 +235,23 @@ class MooncakeKVManager(CommonKVManager):
             self.session_failures = defaultdict(int)
             self.failed_sessions = set()
             self.session_lock = threading.Lock()
+            # Reserved for staging-path GPU copies.
+            try:
+                import torch as _torch
+                self.transfer_stream = (
+                    _torch.cuda.Stream() if _torch.cuda.is_available() else None
+                )
+            except ImportError:
+                self.transfer_stream = None
+            # LP-only state; absent when LP is disabled.
+            if self.layer_pipeline_enabled:
+                self.layer_pipeline_progress: Dict[int, _RoomLayerPipelineProgress] = {}
+                self.layer_pipeline_progress_lock = threading.Lock()
+                self._lp_metrics_lock = threading.Lock()
+                self._lp_chunks_total: int = 0
+                self._lp_chunks_periodic: int = 0
+                self._lp_chunk_ms_samples: List[float] = []
+                self._LP_SAMPLE_BUFFER_CAP: int = 4096
             # Determine the number of threads to use for kv sender
             cpu_count = os.cpu_count()
             transfer_thread_pool_size = (
@@ -383,6 +465,68 @@ class MooncakeKVManager(CommonKVManager):
         except Exception:
             pass
 
+    def _room_supports_layer_pipeline(self, room: int) -> bool:
+        if not self.layer_pipeline_enabled:
+            return False
+        for req in self.transfer_infos.get(room, {}).values():
+            if req.is_dummy:
+                continue
+            target_info = self.decode_kv_args_table.get(req.mooncake_session_id)
+            if target_info is None:
+                return False
+            if not target_info.layer_pipeline_enabled:
+                return False
+            if (
+                target_info.layer_group_size > 0
+                and target_info.layer_group_size != self.layer_group_size
+            ):
+                return False
+            if target_info.kv_dtype != self.server_args.kv_cache_dtype:
+                return False
+        return True
+
+    def _maybe_warn_lp_handshake_mismatch(
+        self,
+        mooncake_session_id: str,
+        target_info: "KVArgsRegisterInfo",
+    ) -> None:
+        """Warn once when handshake settings would silently disable LP."""
+        if not self.layer_pipeline_enabled:
+            return
+        if not getattr(target_info, "layer_pipeline_enabled", False):
+            logger.warning(
+                "Layer-pipeline handshake mismatch with decode session "
+                "%s: prefill has --enable-disagg-layer-pipeline but the "
+                "decode side does NOT. LP is disabled for transfers to "
+                "this session; KV transfer falls back to the legacy "
+                "single-chunk fan-out.",
+                mooncake_session_id,
+            )
+            return
+        dec_group_size = getattr(target_info, "layer_group_size", 0)
+        if dec_group_size > 0 and dec_group_size != self.layer_group_size:
+            logger.warning(
+                "Layer-pipeline group-size mismatch with decode session "
+                "%s: prefill --disagg-layer-group-size=%d vs decode "
+                "--disagg-layer-group-size=%d. LP is disabled for "
+                "transfers to this session; both sides must agree on "
+                "the group size for LP to engage.",
+                mooncake_session_id,
+                self.layer_group_size,
+                dec_group_size,
+            )
+            return
+        dec_kv_dtype = getattr(target_info, "kv_dtype", None)
+        if dec_kv_dtype and dec_kv_dtype != self.server_args.kv_cache_dtype:
+            logger.warning(
+                "KV dtype mismatch with decode session %s: prefill "
+                "kv_cache_dtype=%r vs decode kv_cache_dtype=%r. LP is "
+                "disabled for transfers to this session.",
+                mooncake_session_id,
+                self.server_args.kv_cache_dtype,
+                dec_kv_dtype,
+            )
+
     def _do_staging_transfer(
         self,
         staging_strategy,
@@ -438,6 +582,7 @@ class MooncakeKVManager(CommonKVManager):
                 target_info.dst_attn_tp_size,
                 target_info.dst_kv_item_len,
                 executor,
+                dst_num_main=target_info.dst_num_main_kv_layers,
             )
         elif ret == 0 and not kv_chunk.is_last_chunk:
             self._send_chunk_ready(req, chunk_idx, kv_chunk, prefill_unique_rank)
@@ -588,15 +733,9 @@ class MooncakeKVManager(CommonKVManager):
         executor: concurrent.futures.ThreadPoolExecutor,
         state_type: Optional[StateType] = None,
         force_flat: bool = False,
+        dst_num_main: Optional[int] = None,
     ) -> int:
-        """
-        Generic KV cache transfer supporting both MHA and MLA architectures.
-        This method is used by both send_kvcache (full pool) and maybe_send_extra.
-
-        ``force_flat`` uses the MLA-style flat (single-buffer-per-layer) layout
-        even on a non-MLA backend, for K-only state buffers (e.g. MiniMax sparse
-        index) whose per-layer list must not be half-split into K/V.
-        """
+        """Generic MHA/MLA transfer; `force_flat` keeps K-only state flat."""
         # Group by indices for optimization
         prefill_kv_blocks, dst_kv_blocks = group_concurrent_contiguous(
             prefill_data_indices, dst_data_indices
@@ -604,10 +743,19 @@ class MooncakeKVManager(CommonKVManager):
 
         layers_params = None
 
+        num_main_local = getattr(
+            self.kv_args, "prefill_num_main_kv_layers", None
+        )
         # Decode pp size should be equal to prefill pp size or 1
         if self.is_mla_backend or force_flat:
             src_kv_ptrs, dst_kv_ptrs, layers_current_pp_stage = (
-                self.get_mla_kv_ptrs_with_pp(src_data_ptrs, dst_data_ptrs, state_type)
+                self.get_mla_kv_ptrs_with_pp(
+                    src_data_ptrs,
+                    dst_data_ptrs,
+                    state_type,
+                    num_main_local=num_main_local,
+                    dst_num_main=dst_num_main,
+                )
             )
             layers_params = [
                 (
@@ -619,7 +767,12 @@ class MooncakeKVManager(CommonKVManager):
             ]
         else:
             src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage = (
-                self.get_mha_kv_ptrs_with_pp(src_data_ptrs, dst_data_ptrs)
+                self.get_mha_kv_ptrs_with_pp(
+                    src_data_ptrs,
+                    dst_data_ptrs,
+                    num_main_local=num_main_local,
+                    dst_num_main=dst_num_main,
+                )
             )
             # item_lens structure: [k_layer0, k_layer1, ..., k_layerN, v_layer0, v_layer1, ..., v_layerN]
             # Use correct item lengths for K and V separately
@@ -685,11 +838,115 @@ class MooncakeKVManager(CommonKVManager):
                     for f in futures:
                         f.cancel()
                     return status
-            return 0
+            ret = 0
         else:
             # Combining all layers' params in one batch transfer is more efficient
             # compared to using multiple threads
-            return process_layers(layers_params)
+            ret = process_layers(layers_params)
+
+        return ret
+
+    def _send_kvcache_layer_group(
+        self,
+        mooncake_session_id: str,
+        src_data_ptrs: list[int],
+        dst_data_ptrs: list[int],
+        item_lens: list[int],
+        prefill_data_indices: npt.NDArray[np.int32],
+        dst_data_indices: npt.NDArray[np.int32],
+        executor: concurrent.futures.ThreadPoolExecutor,
+        layer_range: Optional[Tuple[int, int]],
+        dst_num_main: Optional[int] = None,
+    ) -> int:
+        if layer_range is None:
+            return self._send_kvcache_generic(
+                mooncake_session_id=mooncake_session_id,
+                src_data_ptrs=src_data_ptrs,
+                dst_data_ptrs=dst_data_ptrs,
+                item_lens=item_lens,
+                prefill_data_indices=prefill_data_indices,
+                dst_data_indices=dst_data_indices,
+                executor=executor,
+                dst_num_main=dst_num_main,
+            )
+
+        layer_start, layer_end = layer_range
+        if layer_start < 0 or layer_end <= layer_start:
+            logger.error("Invalid layer transfer range: %s", layer_range)
+            return -1
+
+        num_main_local = getattr(
+            self.kv_args, "prefill_num_main_kv_layers", None
+        )
+        if self.is_mla_backend:
+            src_kv_ptrs, dst_kv_ptrs, layers_current_pp_stage = (
+                self.get_mla_kv_ptrs_with_pp(
+                    src_data_ptrs,
+                    dst_data_ptrs,
+                    num_main_local=num_main_local,
+                    dst_num_main=dst_num_main,
+                )
+            )
+            if layer_end > layers_current_pp_stage:
+                logger.error(
+                    "Layer transfer range %s exceeds current PP stage layers %s",
+                    layer_range,
+                    layers_current_pp_stage,
+                )
+                return -1
+            src_data_ptrs = src_kv_ptrs[layer_start:layer_end]
+            dst_data_ptrs = dst_kv_ptrs[layer_start:layer_end]
+            item_lens = item_lens[layer_start:layer_end]
+        else:
+            src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage = (
+                self.get_mha_kv_ptrs_with_pp(
+                    src_data_ptrs,
+                    dst_data_ptrs,
+                    num_main_local=num_main_local,
+                    dst_num_main=dst_num_main,
+                )
+            )
+            if layer_end > layers_current_pp_stage:
+                logger.error(
+                    "Layer transfer range %s exceeds current PP stage layers %s",
+                    layer_range,
+                    layers_current_pp_stage,
+                )
+                return -1
+            # `item_lens` is expected to be the [K_0..K_{N-1}, V_0..V_{N-1}]
+            # concatenated layout produced by MHATokenToKVPool. The slicing below
+            # depends on this contiguous K-then-V layout — guard against silent
+            # corruption if the layout ever changes (issue #8).
+            assert len(item_lens) == 2 * layers_current_pp_stage, (
+                f"MHA item_lens layout assumption violated: "
+                f"len(item_lens)={len(item_lens)} expected={2 * layers_current_pp_stage}"
+            )
+            src_data_ptrs = (
+                src_k_ptrs[layer_start:layer_end]
+                + src_v_ptrs[layer_start:layer_end]
+            )
+            dst_data_ptrs = (
+                dst_k_ptrs[layer_start:layer_end]
+                + dst_v_ptrs[layer_start:layer_end]
+            )
+            item_lens = (
+                item_lens[layer_start:layer_end]
+                + item_lens[
+                    layers_current_pp_stage + layer_start : layers_current_pp_stage
+                    + layer_end
+                ]
+            )
+
+        return self._send_kvcache_generic(
+            mooncake_session_id=mooncake_session_id,
+            src_data_ptrs=src_data_ptrs,
+            dst_data_ptrs=dst_data_ptrs,
+            item_lens=item_lens,
+            prefill_data_indices=prefill_data_indices,
+            dst_data_indices=dst_data_indices,
+            executor=executor,
+            dst_num_main=dst_num_main,
+        )
 
     def send_kvcache(
         self,
@@ -698,8 +955,10 @@ class MooncakeKVManager(CommonKVManager):
         dst_kv_ptrs: list[int],
         dst_kv_indices: npt.NDArray[np.int32],
         executor: concurrent.futures.ThreadPoolExecutor,
+        layer_range: Optional[Tuple[int, int]] = None,
+        dst_num_main: Optional[int] = None,
     ):
-        return self._send_kvcache_generic(
+        return self._send_kvcache_layer_group(
             mooncake_session_id=mooncake_session_id,
             src_data_ptrs=self.kv_args.kv_data_ptrs,
             dst_data_ptrs=dst_kv_ptrs,
@@ -707,6 +966,8 @@ class MooncakeKVManager(CommonKVManager):
             prefill_data_indices=prefill_kv_indices,
             dst_data_indices=dst_kv_indices,
             executor=executor,
+            layer_range=layer_range,
+            dst_num_main=dst_num_main,
         )
 
     def send_kvcache_slice(
@@ -719,6 +980,8 @@ class MooncakeKVManager(CommonKVManager):
         dst_attn_tp_size: int,
         dst_kv_item_len: int,
         executor: concurrent.futures.ThreadPoolExecutor,
+        layer_range: Optional[Tuple[int, int]] = None,
+        dst_num_main: Optional[int] = None,
     ):
         """
         Sends KV cache slices from this Prefill rank to a target Decode rank,
@@ -767,7 +1030,14 @@ class MooncakeKVManager(CommonKVManager):
             dst_head_start_offset = 0
 
         src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage = (
-            self.get_mha_kv_ptrs_with_pp(self.kv_args.kv_data_ptrs, dst_kv_ptrs)
+            self.get_mha_kv_ptrs_with_pp(
+                self.kv_args.kv_data_ptrs,
+                dst_kv_ptrs,
+                num_main_local=getattr(
+                    self.kv_args, "prefill_num_main_kv_layers", None
+                ),
+                dst_num_main=dst_num_main,
+            )
         )
 
         # Calculate precise byte offset and length for the sub-slice within the token
@@ -813,12 +1083,24 @@ class MooncakeKVManager(CommonKVManager):
                 mooncake_session_id, src_addr_list, dst_addr_list, length_list
             )
 
+        if layer_range is None:
+            layer_start, layer_end = 0, layers_current_pp_stage
+        else:
+            layer_start, layer_end = layer_range
+            if layer_start < 0 or layer_end > layers_current_pp_stage:
+                logger.error(
+                    "Layer transfer range %s exceeds current PP stage layers %s",
+                    layer_range,
+                    layers_current_pp_stage,
+                )
+                return -1
+
         futures = []
-        for i in range(layers_current_pp_stage):
+        for i in range(layer_start, layer_end):
             futures.append(
                 executor.submit(process_layer_tp_aware, src_k_ptrs[i], dst_k_ptrs[i])
             )
-        for i in range(layers_current_pp_stage):
+        for i in range(layer_start, layer_end):
             futures.append(
                 executor.submit(process_layer_tp_aware, src_v_ptrs[i], dst_v_ptrs[i])
             )
@@ -930,9 +1212,27 @@ class MooncakeKVManager(CommonKVManager):
         prefill_state_indices: List,
         executor: concurrent.futures.ThreadPoolExecutor,
         target_rank_registration_info: Optional[KVArgsRegisterInfo] = None,
+        layer_range: Optional[Tuple[int, int]] = None,
+        dst_state_index_slice: Optional[slice] = None,
     ):
         rc = 0
         state_types = getattr(self.kv_args, "state_types", [])
+        if (
+            layer_range is not None
+            and not (
+                isinstance(prefill_state_indices, list)
+                and len(prefill_state_indices) == len(state_types)
+                and (
+                    len(prefill_state_indices) == 0
+                    or prefill_state_indices[0] is None
+                    or isinstance(prefill_state_indices[0], (list, np.ndarray))
+                )
+            )
+        ):
+            prefill_state_indices = [
+                prefill_state_indices if st == StateType.DSA else None
+                for st in state_types
+            ]
         for i, st in enumerate(state_types):
             indices = (
                 prefill_state_indices[i] if i < len(prefill_state_indices) else None
@@ -967,8 +1267,15 @@ class MooncakeKVManager(CommonKVManager):
             dst_indices = (
                 req.dst_state_indices[i] if i < len(req.dst_state_indices) else []
             )
+            if dst_state_index_slice is not None and st == StateType.DSA:
+                dst_indices = dst_indices[dst_state_index_slice]
 
             if st == StateType.MAMBA:
+                if layer_range is not None:
+                    logger.warning(
+                        "maybe_send_extra: layer_range=%s ignored for mamba state",
+                        layer_range,
+                    )
                 if (
                     target_rank_registration_info is not None
                     and self.attn_tp_size
@@ -1026,11 +1333,11 @@ class MooncakeKVManager(CommonKVManager):
                 ):
                     continue
                 if len(src_indices) != len(dst_indices_local):
-                    # These components are position- or request-indexed:
-                    # truncating silently misaligns rows and corrupts KV.
-                    # Paged SWA/DSA tolerate a 1-page drift -> keep the
-                    # lenient truncation below.
-                    if st in (StateType.SWA_RING, StateType.C128_STATE):
+                    # Positional state layouts cannot be safely truncated.
+                    if st in (StateType.SWA_RING, StateType.C128_STATE) or (
+                        st == StateType.DSA
+                        and getattr(self, "layer_pipeline_enabled", False)
+                    ):
                         raise RuntimeError(
                             f"{st.upper()} state index length mismatch: "
                             f"prefill={len(src_indices)}, dst={len(dst_indices_local)}"
@@ -1042,16 +1349,62 @@ class MooncakeKVManager(CommonKVManager):
                         src_indices = src_indices[: len(dst_indices_local)]
                     else:
                         dst_indices_local = dst_indices_local[: len(src_indices)]
+                transfer_src_ptrs = src_data_ptrs
+                transfer_dst_ptrs = dst_data_ptrs
+                transfer_item_lens = src_item_lens
+                if layer_range is not None and st is StateType.DSA:
+                    # DSA LP state uses the same local layer_range as main KV;
+                    # align the dst PP slice before applying that range.
+                    num_main_local = getattr(
+                        self.kv_args, "prefill_num_main_kv_layers", None
+                    )
+                    dst_num_main = (
+                        target_rank_registration_info.dst_num_main_kv_layers
+                        if target_rank_registration_info is not None
+                        else None
+                    )
+                    (
+                        transfer_src_ptrs,
+                        transfer_dst_ptrs,
+                        transfer_item_lens,
+                    ) = self.get_state_ptrs_with_pp(
+                        transfer_src_ptrs,
+                        transfer_dst_ptrs,
+                        transfer_item_lens,
+                        num_main_local=num_main_local,
+                        dst_num_main=dst_num_main,
+                    )
+                    layer_start, layer_end = layer_range
+                    if layer_start < 0 or layer_end <= layer_start:
+                        logger.error(
+                            "maybe_send_extra: invalid layer_range=%s", layer_range
+                        )
+                        return -1
+                    if layer_end > len(transfer_src_ptrs):
+                        logger.error(
+                            "maybe_send_extra: layer_end=%s exceeds state ptr count=%s",
+                            layer_end,
+                            len(transfer_src_ptrs),
+                        )
+                        return -1
+                    transfer_src_ptrs = transfer_src_ptrs[layer_start:layer_end]
+                    transfer_dst_ptrs = transfer_dst_ptrs[layer_start:layer_end]
+                    transfer_item_lens = transfer_item_lens[layer_start:layer_end]
                 rc = (
                     self._send_kvcache_generic(
                         mooncake_session_id=req.mooncake_session_id,
-                        src_data_ptrs=src_data_ptrs,
-                        dst_data_ptrs=dst_data_ptrs,
-                        item_lens=src_item_lens,
+                        src_data_ptrs=transfer_src_ptrs,
+                        dst_data_ptrs=transfer_dst_ptrs,
+                        item_lens=transfer_item_lens,
                         prefill_data_indices=np.array(src_indices, dtype=np.int32),
                         dst_data_indices=np.array(dst_indices_local, dtype=np.int32),
                         executor=executor,
                         state_type=st,
+                        dst_num_main=(
+                            target_rank_registration_info.dst_num_main_kv_layers
+                            if target_rank_registration_info is not None
+                            else None
+                        ),
                     )
                     or rc
                 )
@@ -1209,6 +1562,273 @@ class MooncakeKVManager(CommonKVManager):
             ]
         )
 
+    # Layer-pipeline completion watermark.
+
+    def _record_chunk_done(
+        self,
+        room: int,
+        dst: Tuple[str, int],
+        required_dst_info_num: int,
+        prefill_unique_rank: int,
+    ) -> None:
+        """Record one KV chunk completion and maybe close the watermark."""
+        with self.layer_pipeline_progress_lock:
+            prog = self.layer_pipeline_progress.setdefault(
+                room, _RoomLayerPipelineProgress()
+            )
+            prog.required_dst_info_num = required_dst_info_num
+            prog.chunks_done_per_dst[dst] = prog.chunks_done_per_dst.get(dst, 0) + 1
+            sync = self._maybe_sync_success_locked(room, prog, prefill_unique_rank)
+        if sync is not None:
+            self._dispatch_sync_outside_lock(room, prefill_unique_rank, *sync)
+
+    def _record_aux_sent(
+        self,
+        room: int,
+        dst: Tuple[str, int],
+        total_chunks_in_request: Optional[int],
+        required_dst_info_num: int,
+        aux_ret: int,
+        prefill_unique_rank: int,
+    ) -> None:
+        """Record aux completion and maybe close the watermark."""
+        with self.layer_pipeline_progress_lock:
+            prog = self.layer_pipeline_progress.setdefault(
+                room, _RoomLayerPipelineProgress()
+            )
+            prog.required_dst_info_num = required_dst_info_num
+            if total_chunks_in_request is not None:
+                prog.total_chunks_expected = total_chunks_in_request
+            prog.aux_results_per_dst[dst] = aux_ret
+            sync = self._maybe_sync_success_locked(room, prog, prefill_unique_rank)
+        if sync is not None:
+            self._dispatch_sync_outside_lock(room, prefill_unique_rank, *sync)
+
+    def _maybe_sync_success_locked(
+        self,
+        room: int,
+        prog: _RoomLayerPipelineProgress,
+        prefill_unique_rank: int,
+    ) -> Optional[Tuple[int, List[Tuple[str, int]]]]:
+        """Return final status/endpoints when the locked watermark closes."""
+        if prog.success_synced:
+            return None
+        if (
+            prog.total_chunks_expected is None
+            or prog.required_dst_info_num is None
+        ):
+            return None
+        if len(prog.aux_results_per_dst) < prog.required_dst_info_num:
+            return None
+        for dst, _aux_ret in prog.aux_results_per_dst.items():
+            if (
+                prog.chunks_done_per_dst.get(dst, 0)
+                < prog.total_chunks_expected
+            ):
+                return None
+        any_aux_failed = any(r != 0 for r in prog.aux_results_per_dst.values())
+        final_status = KVPoll.Failed if any_aux_failed else KVPoll.Success
+        prog.success_synced = True
+        return final_status, list(prog.aux_results_per_dst.keys())
+
+    def _dispatch_sync_outside_lock(
+        self,
+        room: int,
+        prefill_unique_rank: int,
+        final_status: int,
+        endpoints: List[Tuple[str, int]],
+    ) -> None:
+        """Notify decode endpoints outside `layer_pipeline_progress_lock`."""
+        self.update_status(room, final_status)
+        for endpoint, dst_port in endpoints:
+            self.sync_status_to_decode_endpoint(
+                endpoint,
+                dst_port,
+                room,
+                final_status,
+                prefill_unique_rank,
+            )
+        self._clear_layer_pipeline_progress(room)
+
+    def _clear_layer_pipeline_progress(self, room: int) -> None:
+        """Drop a room's LP watermark state if it exists."""
+        progress = getattr(self, "layer_pipeline_progress", None)
+        if progress is not None:
+            with self.layer_pipeline_progress_lock:
+                progress.pop(room, None)
+
+    def _record_layer_group_metric(self, enqueue_ns: int) -> None:
+        """Record one successful LP chunk for periodic metrics."""
+        if enqueue_ns <= 0:
+            return
+        metrics_lock = getattr(self, "_lp_metrics_lock", None)
+        if metrics_lock is None:
+            return
+        elapsed_ms = (time.monotonic_ns() - enqueue_ns) / 1_000_000.0
+        with metrics_lock:
+            self._lp_chunks_total += 1
+            self._lp_chunks_periodic += 1
+            if len(self._lp_chunk_ms_samples) < self._LP_SAMPLE_BUFFER_CAP:
+                self._lp_chunk_ms_samples.append(elapsed_ms)
+
+    def pop_layer_pipeline_metrics(self) -> Tuple[int, List[float]]:
+        """Snapshot and reset periodic LP metrics."""
+        metrics_lock = getattr(self, "_lp_metrics_lock", None)
+        if metrics_lock is None:
+            return 0, []
+        with metrics_lock:
+            delta = self._lp_chunks_periodic
+            samples = self._lp_chunk_ms_samples
+            self._lp_chunks_periodic = 0
+            self._lp_chunk_ms_samples = []
+        return delta, samples
+
+    def make_layer_pipeline_hook(
+        self,
+        dispatch: List["_LayerPipelineRequestDispatch"],
+    ) -> Callable[[int, "ForwardBatch"], None]:
+        """Build the per-batch hook that enqueues LP layer-group chunks."""
+        group_size = self.layer_group_size
+        if group_size <= 0:
+            return lambda layer_id, _fb: None
+        if getattr(self, "is_dummy_cp_rank", False):
+            return lambda layer_id, _fb: None
+        import torch as _torch
+
+        num_layers = self.local_num_kv_layers()
+        if group_size > num_layers:
+            raise ValueError(
+                f"--disagg-layer-group-size={group_size} exceeds the "
+                f"current PP stage's KV layer count ({num_layers}). "
+                f"Pick a value in [1, {num_layers}] — typically a "
+                f"divisor of num_layers_per_pp_stage so groups are "
+                f"evenly sized. With PP > 1, num_layers_per_pp_stage = "
+                f"total_kv_layers / pp_size, NOT the global model's "
+                f"layer count."
+            )
+        num_main_kv_layers = getattr(
+            self.kv_args, "prefill_num_main_kv_layers", None
+        )
+        if num_main_kv_layers is None or num_main_kv_layers > num_layers:
+            num_main_kv_layers = num_layers
+        last_layer_idx = num_main_kv_layers - 1
+        prefill_start_layer = self.kv_args.prefill_start_layer
+        layer_groups = split_layer_groups(num_main_kv_layers, group_size)
+        total_layer_groups = len(layer_groups)
+        if not getattr(self, "_lp_layer_geom_logged", False):
+            logger.info(
+                "[layer-pipeline GEOM] num_kv_layers=%d "
+                "num_main_kv_layers=%d num_draft_kv_layers=%d "
+                "group_size=%d total_layer_groups=%d "
+                "prefill_start_layer=%d last_main_group=%s main_groups=%s "
+                "draft_sent_via=send_draft_kv",
+                num_layers, num_main_kv_layers,
+                num_layers - num_main_kv_layers,
+                group_size, total_layer_groups,
+                prefill_start_layer,
+                layer_groups[-1] if layer_groups else None,
+                layer_groups,
+            )
+            self._lp_layer_geom_logged = True
+
+        # Snapshot CP layer-shard ownership into the hook closure.
+        use_layer_cp_shard = getattr(
+            self, "use_layer_cp_shard_for_transfer", lambda: False
+        )()
+        cp_size_for_shard = (
+            getattr(self, "attn_cp_size", 1) if use_layer_cp_shard else 1
+        )
+        cp_rank_for_shard = (
+            getattr(self, "attn_cp_rank", 0) if use_layer_cp_shard else 0
+        )
+
+        def _hook(layer_id: int, _fb: "ForwardBatch") -> None:
+            if not _fb.forward_mode.is_extend():
+                return
+            local_id = layer_id - prefill_start_layer
+            if local_id < 0 or local_id >= num_main_kv_layers:
+                return
+            is_group_boundary = (local_id + 1) % group_size == 0
+            is_last = local_id == last_layer_idx
+            if not is_group_boundary and not is_last:
+                return
+            layer_end = local_id + 1
+            if is_last and not is_group_boundary:
+                layer_start, _ = layer_groups[-1]
+            else:
+                layer_start = layer_end - group_size
+            ev = _torch.cuda.Event()
+            ev.record()
+            layer_group_id = local_id // group_size
+            if (
+                cp_size_for_shard > 1
+                and layer_group_id % cp_size_for_shard != cp_rank_for_shard
+            ):
+                return
+            for entry in dispatch:
+                self.add_transfer_request(
+                    bootstrap_room=entry.room,
+                    kv_indices=entry.page_indices,
+                    index_slice=entry.index_slice,
+                    is_last_chunk=False,
+                    aux_index=None,
+                    state_indices=entry.state_indices,
+                    layer_group_id=layer_group_id,
+                    layer_range=(layer_start, layer_end),
+                    total_layer_groups=total_layer_groups,
+                    total_chunks_in_request=None,
+                    transfer_event=ev,
+                )
+                entry.sender._hook_enqueued_chunks += 1
+
+        return _hook
+
+    def make_layer_pipeline_hook_for_reqs(
+        self,
+        reqs_with_indices: List[
+            Tuple[
+                "MooncakeKVSender",
+                npt.NDArray[np.int32],
+                slice,
+                Optional[npt.NDArray[np.int32]],
+            ]
+        ],
+    ) -> Optional[Callable[[int, "ForwardBatch"], None]]:
+        """Filter eligible senders and build the batch LP hook."""
+        if not self.layer_pipeline_enabled or self.is_dummy_cp_rank:
+            return None
+        dispatches: List[_LayerPipelineRequestDispatch] = []
+        for tup in reqs_with_indices:
+            if len(tup) == 3:
+                sender, page_indices, index_slice = tup
+                state_indices = None
+            else:
+                sender, page_indices, index_slice, state_indices = tup
+            if len(page_indices) == 0:
+                continue
+            layer_groups = sender._layer_groups_for_send()
+            if len(layer_groups) == 1 and layer_groups[0] is None:
+                continue
+            sender._hook_handled_in_current_send = True
+            sender._hook_handles_state = state_indices is not None
+            if state_indices is not None:
+                sender._hook_handles_state_persistent = True
+            sender._hook_layer_shard_active = getattr(
+                self, "rank_owns_no_main_groups_for_transfer", lambda: False
+            )()
+            dispatches.append(
+                _LayerPipelineRequestDispatch(
+                    room=sender.bootstrap_room,
+                    sender=sender,
+                    page_indices=page_indices,
+                    index_slice=index_slice,
+                    state_indices=state_indices,
+                )
+            )
+        if not dispatches:
+            return None
+        return self.make_layer_pipeline_hook(dispatches)
+
     def transfer_worker(
         self,
         queue: FastQueue,
@@ -1217,7 +1837,8 @@ class MooncakeKVManager(CommonKVManager):
         worker_index=0,
     ):
         staging_strategy = None
-        if self.enable_trace:
+        trace_enabled = getattr(self, "enable_trace", False)
+        if trace_enabled:
             trace_set_thread_info(
                 f"mooncake transfer worker {worker_index}",
                 tp_rank=self.attn_tp_rank,
@@ -1227,21 +1848,20 @@ class MooncakeKVManager(CommonKVManager):
         while True:
             try:
                 kv_chunk: TransferKVChunk = queue.get()
-                if self.enable_trace:
+                if trace_enabled:
                     kv_chunk.trace_ctx.rebuild_thread_context()
                     kv_chunk.trace_ctx.trace_slice_start(
                         MooncakeRequestStage.MOONCAKE_WORKER_SEND.stage_name,
                         MooncakeRequestStage.MOONCAKE_WORKER_SEND.level,
                     )
 
-                if (
-                    kv_chunk.room not in self.request_status
-                    or self.check_status(kv_chunk.room) == KVPoll.Failed
-                ):
+                _status = self.request_status.get(kv_chunk.room)
+                if _status is None or _status in (KVPoll.Failed, KVPoll.Success):
                     logger.debug(
                         f"Skipping chunk for room {kv_chunk.room} because it has already failed or been aborted"
                     )
-                    if self.enable_trace:
+                    self._clear_layer_pipeline_progress(kv_chunk.room)
+                    if trace_enabled:
                         kv_chunk.trace_ctx.trace_slice_end(
                             MooncakeRequestStage.MOONCAKE_WORKER_SEND.stage_name,
                             MooncakeRequestStage.MOONCAKE_WORKER_SEND.level,
@@ -1249,6 +1869,38 @@ class MooncakeKVManager(CommonKVManager):
                         )
                     continue
 
+                # Mooncake RDMA is CPU-side, so wait on the recorded CUDA event.
+                if kv_chunk.transfer_event is not None:
+                    try:
+                        kv_chunk.transfer_event.synchronize()
+                    except Exception as exc:
+                        logger.error(
+                            "transfer_event.synchronize() failed "
+                            "for room=%s: %s. Marking room failed and "
+                            "continuing — other rooms on this worker are "
+                            "unaffected.",
+                            kv_chunk.room,
+                            exc,
+                        )
+                        self.record_failure(
+                            kv_chunk.room,
+                            f"layer-pipeline event sync failed: {exc!r}",
+                        )
+                        self.update_status(kv_chunk.room, KVPoll.Failed)
+                        self._clear_layer_pipeline_progress(kv_chunk.room)
+                        if trace_enabled:
+                            kv_chunk.trace_ctx.trace_slice_end(
+                                MooncakeRequestStage.MOONCAKE_WORKER_SEND.stage_name,
+                                MooncakeRequestStage.MOONCAKE_WORKER_SEND.level,
+                                thread_finish_flag=True,
+                            )
+                        continue
+                # Hook already enqueued KV; this chunk only closes aux/state.
+                is_aux_only_chunk = (
+                    kv_chunk.layer_range is None
+                    and len(kv_chunk.prefill_kv_indices) == 0
+                    and kv_chunk.is_last_chunk
+                )
                 if (
                     self.enable_staging
                     and staging_strategy is None
@@ -1260,17 +1912,15 @@ class MooncakeKVManager(CommonKVManager):
                     if kv_chunk.room in self.transfer_infos
                     else []
                 )
-                polls = []
-                dst_ranks_infos = []
-                # Unique id per prefill sender so decode's response set size matches expected_response_num.
                 prefill_unique_rank = (
                     self.attn_tp_rank * (self.pp_size * self.attn_cp_size)
                     + self.pp_rank * self.attn_cp_size
                     + self.attn_cp_rank
                 )
-                # When staging transfer is not yet ready (watermark/allocation pending),
-                # the chunk is re-enqueued and we break out of the req loop to retry later.
                 staging_deferred = False
+                use_lp_completion = self.layer_pipeline_enabled
+                polls: List[bool] = []
+                dst_ranks_infos: List[Tuple[str, int, int]] = []
                 for req in reqs_to_be_processed:
                     start_ts = time.perf_counter()
                     if not req.is_dummy:
@@ -1289,12 +1939,12 @@ class MooncakeKVManager(CommonKVManager):
                                     KVPoll.Failed,
                                     prefill_unique_rank,
                                 )
+                                self._clear_layer_pipeline_progress(kv_chunk.room)
                                 break
 
                         chunked_dst_kv_indice = req.dst_kv_indices[kv_chunk.index_slice]
 
-                        # NOTE: This is temporarily a workaround to deal with the case where the prefill_kv_indices
-                        # is mismatched with the dst_kv_indices when page size > 1, this should never happen.
+                        # Temporary guard for page-size > 1 index mismatches.
                         if len(chunked_dst_kv_indice) < len(
                             kv_chunk.prefill_kv_indices
                         ):
@@ -1308,7 +1958,7 @@ class MooncakeKVManager(CommonKVManager):
                         target_rank_registration_info: KVArgsRegisterInfo = (
                             self.decode_kv_args_table[req.mooncake_session_id]
                         )
-                        if len(kv_chunk.prefill_kv_indices) == 0:
+                        if is_aux_only_chunk:
                             ret = 0
                         elif self.is_mla_backend or (
                             self.attn_tp_size
@@ -1320,6 +1970,8 @@ class MooncakeKVManager(CommonKVManager):
                                 target_rank_registration_info.dst_kv_ptrs,
                                 chunked_dst_kv_indice,
                                 executor,
+                                layer_range=kv_chunk.layer_range,
+                                dst_num_main=target_rank_registration_info.dst_num_main_kv_layers,
                             )
                         elif (
                             self.enable_staging
@@ -1338,7 +1990,6 @@ class MooncakeKVManager(CommonKVManager):
                             )
                             if deferred:
                                 staging_deferred = True
-                                # Chunk re-enqueued; stop processing remaining reqs for this chunk
                                 break
                         else:
                             ret = self.send_kvcache_slice(
@@ -1350,11 +2001,27 @@ class MooncakeKVManager(CommonKVManager):
                                 target_rank_registration_info.dst_attn_tp_size,
                                 target_rank_registration_info.dst_kv_item_len,
                                 executor,
+                                layer_range=kv_chunk.layer_range,
+                                dst_num_main=target_rank_registration_info.dst_num_main_kv_layers,
+                            )
+
+                        # Hook-dispatched LP state follows the matching KV slice.
+                        if (
+                            ret == 0
+                            and kv_chunk.layer_range is not None
+                            and kv_chunk.state_indices is not None
+                        ):
+                            ret = self.maybe_send_extra(
+                                req,
+                                kv_chunk.state_indices,
+                                executor,
+                                target_rank_registration_info,
+                                layer_range=kv_chunk.layer_range,
+                                dst_state_index_slice=kv_chunk.index_slice,
                             )
                         if ret != 0:
                             with self.session_lock:
                                 self.session_failures[req.mooncake_session_id] += 1
-                                # Failures should never happen if the session is not dead, if the session fails once, mark it as failed
                                 if self.session_failures[req.mooncake_session_id] >= 1:
                                     self.failed_sessions.add(req.mooncake_session_id)
                                     logger.error(
@@ -1373,7 +2040,17 @@ class MooncakeKVManager(CommonKVManager):
                                 KVPoll.Failed,
                                 prefill_unique_rank,
                             )
+                            self._clear_layer_pipeline_progress(kv_chunk.room)
                             break
+
+                        if use_lp_completion:
+                            self._record_chunk_done(
+                                kv_chunk.room,
+                                (req.endpoint, req.dst_port),
+                                req.required_dst_info_num,
+                                prefill_unique_rank,
+                            )
+                            self._record_layer_group_metric(kv_chunk.enqueue_ns)
 
                         if kv_chunk.is_last_chunk:
                             if kv_chunk.state_indices:
@@ -1384,43 +2061,55 @@ class MooncakeKVManager(CommonKVManager):
                                     target_rank_registration_info,
                                 )
 
-                            # Only the last chunk we need to send the aux data
-                            ret = self.send_aux(
-                                req,
-                                kv_chunk.prefill_aux_index,
-                                target_rank_registration_info.dst_aux_ptrs,
-                            )
-                            polls.append(True if ret == 0 else False)
-                            dst_ranks_infos.append(
-                                (req.endpoint, req.dst_port, req.room)
-                            )
-
-                            # Only sync status when all the dst ranks have received the kvcache
-                            if len(polls) == req.required_dst_info_num:
-                                status = KVPoll.Success if all(polls) else KVPoll.Failed
-                                self.update_status(req.room, status)
-                                for endpoint, dst_port, room in dst_ranks_infos:
-                                    self.sync_status_to_decode_endpoint(
-                                        endpoint,
-                                        dst_port,
-                                        room,
-                                        status,
-                                        prefill_unique_rank,
+                            # In layer-shard CP mode, only CP0 writes aux bytes.
+                            if kv_chunk.skip_aux_rdma:
+                                aux_ret = 0
+                            else:
+                                aux_ret = self.send_aux(
+                                    req,
+                                    kv_chunk.prefill_aux_index,
+                                    target_rank_registration_info.dst_aux_ptrs,
+                                )
+                            if use_lp_completion:
+                                self._record_aux_sent(
+                                    kv_chunk.room,
+                                    (req.endpoint, req.dst_port),
+                                    kv_chunk.total_chunks_in_request,
+                                    req.required_dst_info_num,
+                                    aux_ret,
+                                    prefill_unique_rank,
+                                )
+                            else:
+                                polls.append(True if aux_ret == 0 else False)
+                                dst_ranks_infos.append(
+                                    (req.endpoint, req.dst_port, req.room)
+                                )
+                                if len(polls) == req.required_dst_info_num:
+                                    status = (
+                                        KVPoll.Success if all(polls) else KVPoll.Failed
                                     )
+                                    self.update_status(req.room, status)
+                                    for endpoint, dst_port, room in dst_ranks_infos:
+                                        self.sync_status_to_decode_endpoint(
+                                            endpoint,
+                                            dst_port,
+                                            room,
+                                            status,
+                                            prefill_unique_rank,
+                                        )
                     else:
-                        # Dummy request means the decode instance is not used, so its status can be marked as success directly
-                        # Dummy request does not need to sync status to decode endpoint
+                        # Dummy decode ranks are local bookkeeping only.
                         if kv_chunk.is_last_chunk and req.room in self.request_status:
                             self.update_status(req.room, KVPoll.Success)
 
-                    if self.enable_trace:
+                    if trace_enabled:
                         mooncake_trace_slice(
                             kv_chunk.trace_ctx,
                             MooncakeRequestStage.MOONCAKE_WORKER_SEND_SESSION,
                             start_ts,
                         )
 
-                if self.enable_trace:
+                if trace_enabled:
                     kv_chunk.trace_ctx.trace_slice_end(
                         MooncakeRequestStage.MOONCAKE_WORKER_SEND.stage_name,
                         MooncakeRequestStage.MOONCAKE_WORKER_SEND.level,
@@ -1436,7 +2125,9 @@ class MooncakeKVManager(CommonKVManager):
                 ):
                     if kv_chunk.room in self.transfer_infos:
                         self.transfer_infos.pop(kv_chunk.room)
-                    self.req_to_decode_prefix_len.pop(kv_chunk.room, None)
+                    if hasattr(self, "req_to_decode_prefix_len"):
+                        self.req_to_decode_prefix_len.pop(kv_chunk.room, None)
+                    self._clear_layer_pipeline_progress(kv_chunk.room)
 
             except Exception as e:
                 # NOTE(shangming): Remove this when we make sure the transfer thread is bug-free
@@ -1515,6 +2206,11 @@ class MooncakeKVManager(CommonKVManager):
                             self.failed_sessions.remove(mooncake_session_id)
                         if mooncake_session_id in self.session_failures:
                             del self.session_failures[mooncake_session_id]
+                    # Surface LP handshake mismatches once per session.
+                    self._maybe_warn_lp_handshake_mismatch(
+                        mooncake_session_id,
+                        self.decode_kv_args_table[mooncake_session_id],
+                    )
                     logger.debug(
                         f"Register KVArgs from {mooncake_session_id} successfully"
                     )
@@ -1623,6 +2319,12 @@ class MooncakeKVManager(CommonKVManager):
         aux_index: Optional[int] = None,
         state_indices: Optional[List] = None,
         trace_ctx: Optional[Union[TraceReqContext, TraceNullContext]] = None,
+        layer_group_id: int = 0,
+        layer_range: Optional[Tuple[int, int]] = None,
+        total_layer_groups: int = 1,
+        total_chunks_in_request: Optional[int] = None,
+        transfer_event: Optional["torch.cuda.Event"] = None,
+        skip_aux_rdma: bool = False,
     ):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
         assert not is_last_chunk or (is_last_chunk and aux_index is not None)
@@ -1661,6 +2363,16 @@ class MooncakeKVManager(CommonKVManager):
                 prefill_aux_index=aux_index,
                 state_indices=state_indices,
                 trace_ctx=trace_ctx,
+                layer_group_id=layer_group_id,
+                layer_range=layer_range,
+                total_layer_groups=total_layer_groups,
+                kv_dtype=self.server_args.kv_cache_dtype,
+                total_chunks_in_request=total_chunks_in_request,
+                transfer_event=transfer_event,
+                # Stamped only on LP chunks; legacy / aux-only carry 0
+                # so the metric doesn't double-count.
+                enqueue_ns=(time.monotonic_ns() if layer_range is not None else 0),
+                skip_aux_rdma=skip_aux_rdma,
             )
         )
 
@@ -1726,6 +2438,136 @@ class MooncakeKVSender(CommonKVSender):
         self.conclude_state = None
         self.init_time = time.time()
         self._init_trace_ctx()
+        # Total chunks across chunked-prefill sends; finalizer carries it.
+        self._chunks_sent: int = 0
+        # Hook-enqueued KV chunks; the aux finalizer adds one.
+        self._hook_enqueued_chunks: int = 0
+        # Per-send hook contract state.
+        self._hook_handled_in_current_send: bool = False
+        self._hook_chunks_at_last_send: int = 0
+        self._hook_handles_state: bool = False
+        self._hook_handles_state_persistent: bool = False
+        self._hook_layer_shard_active: bool = False
+
+    def _layer_groups_for_send(self) -> List[Optional[Tuple[int, int]]]:
+        prefill_len = self.num_kv_indices * self.kv_mgr.kv_args.page_size
+        # Non-MLA staging may need runtime TP-dependent fallback.
+        staging_path_active = (
+            self.kv_mgr.enable_staging and not self.kv_mgr.is_mla_backend
+        )
+        if (
+            not self.kv_mgr.layer_pipeline_enabled
+            or staging_path_active
+            or not self.kv_mgr._room_supports_layer_pipeline(self.bootstrap_room)
+            or self.kv_mgr.layer_group_size <= 0
+            or prefill_len < self.kv_mgr.layer_pipeline_min_prefill_len
+        ):
+            return [None]
+        return split_layer_groups(
+            self.kv_mgr.local_num_kv_layers(), self.kv_mgr.layer_group_size
+        )
+
+    def _draft_layer_range(self) -> Optional[Tuple[int, int]]:
+        """Return the appended draft KV layer range, if any."""
+        num_total = self.kv_mgr.local_num_kv_layers()
+        num_main = getattr(
+            self.kv_mgr.kv_args, "prefill_num_main_kv_layers", None
+        )
+        if num_main is None or num_main >= num_total or num_main < 0:
+            return None
+        return (num_main, num_total)
+
+    def send_draft_kv(
+        self,
+        kv_indices: npt.NDArray[np.int32],
+    ) -> None:
+        """Ship draft KV after draft forward; main LP hook does not cover it."""
+        if len(kv_indices) == 0:
+            return
+        draft_range = self._draft_layer_range()
+        if draft_range is None:
+            return
+        if self.kv_mgr.is_dummy_cp_rank:
+            return
+        layer_groups = self._layer_groups_for_send()
+        lp_active = not (len(layer_groups) == 1 and layer_groups[0] is None)
+        if not lp_active:
+            return
+        use_layer_cp_shard = self.kv_mgr.use_layer_cp_shard_for_transfer()
+        if use_layer_cp_shard:
+            num_main_kv_layers = getattr(
+                self.kv_mgr.kv_args, "prefill_num_main_kv_layers", None
+            )
+            if num_main_kv_layers is not None and num_main_kv_layers > 0:
+                group_size = self.kv_mgr.layer_group_size
+                total_main_layer_groups = (
+                    num_main_kv_layers + group_size - 1
+                ) // group_size
+                draft_group_id = total_main_layer_groups
+                if (
+                    draft_group_id % self.kv_mgr.attn_cp_size
+                    != self.kv_mgr.attn_cp_rank
+                ):
+                    return
+        index_slice = slice(self.curr_idx, self.curr_idx + len(kv_indices))
+        if (
+            self.kv_mgr.enable_all_cp_ranks_for_transfer
+            and not use_layer_cp_shard
+        ):
+            kv_indices, index_slice = filter_kv_indices_for_cp_rank(
+                self.kv_mgr,
+                kv_indices,
+                index_slice,
+                total_pages=self.num_kv_indices,
+            )
+            if len(kv_indices) == 0:
+                return
+        ev = None
+        try:
+            import torch as _torch
+
+            if _torch.cuda.is_available():
+                ev = _torch.cuda.Event()
+                ev.record()
+        except ImportError:
+            ev = None
+        self._hook_enqueued_chunks += 1
+        self.kv_mgr.add_transfer_request(
+            self.bootstrap_room,
+            kv_indices,
+            index_slice,
+            is_last_chunk=False,
+            aux_index=None,
+            state_indices=kv_indices,
+            layer_group_id=DRAFT_LAYER_GROUP_ID,
+            layer_range=draft_range,
+            total_layer_groups=DRAFT_TOTAL_LAYER_GROUPS_SENTINEL,
+            total_chunks_in_request=None,
+            transfer_event=ev,
+        )
+
+    def _enqueue_aux_only_finalizer(
+        self,
+        index_slice: slice,
+        state_indices: Optional[List],
+        total_chunks: int,
+        skip_aux_rdma: bool,
+    ) -> None:
+        self.kv_mgr.add_transfer_request(
+            self.bootstrap_room,
+            kv_indices=np.array([], dtype=np.int32),
+            index_slice=index_slice,
+            is_last_chunk=True,
+            aux_index=self.aux_index,
+            state_indices=state_indices,
+            layer_group_id=0,
+            layer_range=None,
+            total_layer_groups=1,
+            total_chunks_in_request=total_chunks,
+            transfer_event=None,
+            trace_ctx=self.trace_ctx.copy_for_thread(),
+            skip_aux_rdma=skip_aux_rdma,
+        )
 
     @mooncake_trace_func(MooncakeRequestStage.MOONCAKE_SEND)
     def send(
@@ -1733,29 +2575,79 @@ class MooncakeKVSender(CommonKVSender):
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List] = None,
     ):
+        hook_expected = self._hook_handled_in_current_send
+        self._hook_handled_in_current_send = False
+        hook_handled_state = self._hook_handles_state
+        self._hook_handles_state = False
+        hook_layer_shard = self._hook_layer_shard_active
+        self._hook_layer_shard_active = False
+
+        use_layer_cp_shard = self.kv_mgr.use_layer_cp_shard_for_transfer()
+        skip_aux_rdma = use_layer_cp_shard and self.kv_mgr.attn_cp_rank != 0
         kv_indices, index_slice, is_last_chunk, should_skip = (
             self._prepare_send_indices(kv_indices, state_indices)
         )
         if should_skip:
             return
 
-        if not is_last_chunk:
-            self.kv_mgr.add_transfer_request(
-                self.bootstrap_room,
-                kv_indices,
-                index_slice,
-                False,
-                trace_ctx=self.trace_ctx.copy_for_thread(),
+        try:
+            if hook_expected:
+                if self._hook_enqueued_chunks <= self._hook_chunks_at_last_send:
+                    if not hook_layer_shard:
+                        raise RuntimeError(
+                            f"Layer-pipeline contract violated for room "
+                            f"{self.bootstrap_room}: scheduler dispatched hook "
+                            f"mode (set _hook_handled_in_current_send=True) but "
+                            f"no hook fire enqueued KV "
+                            f"(_hook_enqueued_chunks={self._hook_enqueued_chunks}, "
+                            f"baseline={self._hook_chunks_at_last_send}). "
+                            f"Refusing to fall through — would corrupt "
+                            f"receiver-side watermark accounting."
+                        )
+                if not is_last_chunk:
+                    return
+                self._chunks_sent = self._hook_enqueued_chunks + 1
+                aux_state_indices = None if hook_handled_state else state_indices
+                self._enqueue_aux_only_finalizer(
+                    index_slice, aux_state_indices, self._chunks_sent, skip_aux_rdma
+                )
+                return
+        finally:
+            self._hook_chunks_at_last_send = self._hook_enqueued_chunks
+
+        # Empty final chunk after prior LP hook sends: emit only the finalizer.
+        if (
+            is_last_chunk
+            and len(kv_indices) == 0
+            and self._hook_enqueued_chunks > 0
+            and self._layer_groups_for_send() != [None]
+        ):
+            self._chunks_sent = self._hook_enqueued_chunks + 1
+            aux_state_indices = (
+                None if self._hook_handles_state_persistent else state_indices
             )
-        else:
+            self._enqueue_aux_only_finalizer(
+                index_slice, aux_state_indices, self._chunks_sent, skip_aux_rdma
+            )
+            return
+
+        layer_groups = self._layer_groups_for_send()
+        for layer_group_id, layer_range in enumerate(layer_groups):
+            is_last_layer_group = layer_group_id == len(layer_groups) - 1
+            chunk_is_last = is_last_chunk and is_last_layer_group
+            self._chunks_sent += 1
             self.kv_mgr.add_transfer_request(
                 self.bootstrap_room,
                 kv_indices,
                 index_slice,
-                True,
-                aux_index=self.aux_index,
-                state_indices=state_indices,
+                chunk_is_last,
+                aux_index=self.aux_index if chunk_is_last else None,
+                state_indices=state_indices if chunk_is_last else None,
                 trace_ctx=self.trace_ctx.copy_for_thread(),
+                layer_group_id=layer_group_id,
+                layer_range=layer_range,
+                total_layer_groups=len(layer_groups),
+                total_chunks_in_request=self._chunks_sent if chunk_is_last else None,
             )
         self._record_transfer_indices(kv_indices, state_indices)
 
@@ -1791,7 +2683,7 @@ class MooncakeKVSender(CommonKVSender):
         )
 
     def _init_trace_ctx(self):
-        if self.kv_mgr.enable_trace:
+        if getattr(self.kv_mgr, "enable_trace", False):
             self.trace_ctx = TraceReqContext(
                 rid=str(hex(self.bootstrap_room)),
                 bootstrap_room=self.bootstrap_room,
@@ -1845,6 +2737,21 @@ class MooncakeKVReceiver(CommonKVReceiver):
             dst_tp_rank = str(tp_rank).encode("ascii")
             dst_attn_tp_size = str(self.kv_mgr.attn_tp_size).encode("ascii")
             dst_kv_item_len = str(kv_item_len).encode("ascii")
+            layer_pipeline_enabled = (
+                b"1" if self.kv_mgr.layer_pipeline_enabled else b"0"
+            )
+            layer_group_size = str(self.kv_mgr.layer_group_size).encode("ascii")
+            kv_dtype = self.kv_mgr.server_args.kv_cache_dtype.encode("ascii")
+            # Empty means legacy/no draft; prefill falls back to length inference.
+            num_main_kv_layers_attr = getattr(
+                self.kv_mgr.kv_args, "num_main_kv_layers", None
+            )
+            num_main_kv_layers_str = (
+                str(num_main_kv_layers_attr).encode("ascii")
+                if num_main_kv_layers_attr is not None
+                else b""
+            )
+
             if (
                 self.kv_mgr.enable_staging
                 and self.kv_mgr._staging_ctx.allocator is not None
@@ -1872,10 +2779,20 @@ class MooncakeKVReceiver(CommonKVReceiver):
                         dst_kv_item_len,
                         packed_state_item_lens,
                         packed_state_dim_per_tensor,
+                        layer_pipeline_enabled,
+                        layer_group_size,
+                        kv_dtype,
                         packed_staging_base_ptr,
                         staging_total_size_str,
+                        num_main_kv_layers_str,
                     ]
                 )
+
+    def init(
+        self,
+        prefill_dp_rank: int,
+    ):
+        super().init(prefill_dp_rank)
 
     def send_metadata(
         self,

@@ -24,7 +24,7 @@ import logging
 from array import array
 from collections import deque
 from http import HTTPStatus
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Callable, List, Optional
 
 import numpy as np
 import torch
@@ -39,11 +39,13 @@ from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
+    filter_kv_indices_for_cp_rank,
     get_dsv4_c128_state_indices,
     get_kv_class,
     is_aborted,
     is_dsv4_c128_online_enabled,
     is_mla_backend,
+    merge_main_and_draft_kv_layout,
     poll_and_all_reduce_attn_cp_tp_group,
     prepare_abort,
     setup_state_kv_args,
@@ -62,6 +64,7 @@ from sglang.srt.mem_cache.common import (
     release_kv_cache,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 from sglang.srt.observability.req_time_stats import set_schedule_time_batch
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 
@@ -160,6 +163,16 @@ class PrefillBootstrapQueue:
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
             self.token_to_kv_pool.get_contiguous_buf_infos()
         )
+        draft_layout_validation = getattr(
+            self.scheduler.server_args,
+            "enable_disagg_draft_layout_validation",
+            False,
+        )
+        if draft_layout_validation:
+            kv_args.prefill_num_main_kv_layers = len(kv_data_ptrs) // (
+                1 if self.is_mla_backend else 2
+            )
+            kv_args.num_main_kv_layers = kv_args.prefill_num_main_kv_layers
 
         if self.draft_token_to_kv_pool is not None:
             # We should also transfer draft model kv cache. The indices are
@@ -167,9 +180,22 @@ class PrefillBootstrapQueue:
             draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
                 self.draft_token_to_kv_pool.get_contiguous_buf_infos()
             )
-            kv_data_ptrs += draft_kv_data_ptrs
-            kv_data_lens += draft_kv_data_lens
-            kv_item_lens += draft_kv_item_lens
+            if draft_layout_validation:
+                kv_data_ptrs, kv_data_lens, kv_item_lens = (
+                    merge_main_and_draft_kv_layout(
+                        kv_data_ptrs,
+                        kv_data_lens,
+                        kv_item_lens,
+                        draft_kv_data_ptrs,
+                        draft_kv_data_lens,
+                        draft_kv_item_lens,
+                        is_mla_backend=self.is_mla_backend,
+                    )
+                )
+            else:
+                kv_data_ptrs += draft_kv_data_ptrs
+                kv_data_lens += draft_kv_data_lens
+                kv_item_lens += draft_kv_item_lens
 
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
@@ -962,6 +988,16 @@ class SchedulerDisaggregationPrefillMixin:
         ):
             return
 
+        # DSA state ships via LP; cached-prefix early-send would skip that state.
+        bootstrap_queue = getattr(self, "disagg_prefill_bootstrap_queue", None)
+        kv_mgr = getattr(bootstrap_queue, "kv_manager", None)
+        if kv_mgr is not None and getattr(
+            kv_mgr, "layer_pipeline_enabled", False
+        ):
+            kvcache = self.token_to_kv_pool_allocator.get_kvcache()
+            if isinstance(kvcache, DSATokenToKVPool):
+                return
+
         # Device-resident prefix only; page-aligned so start_send_idx stays exact.
         cached_end = len(req.prefix_indices) - req.host_hit_length
         if cached_end <= req.start_send_idx:
@@ -1101,8 +1137,92 @@ class SchedulerDisaggregationPrefillMixin:
         page_indices = kv_to_page_indices(kv_indices, page_size)
         if not req.disagg_kv_sender.should_send_kv_chunk(len(page_indices), last_chunk):
             return
+        kv_mgr = getattr(self.disagg_prefill_bootstrap_queue, "kv_manager", None)
+        sender = req.disagg_kv_sender
+        main_hook_fired = getattr(sender, "_hook_enqueued_chunks", 0) > getattr(
+            sender, "_hook_chunks_at_last_send", 0
+        )
+        hook_layer_shard = getattr(sender, "_hook_layer_shard_active", False)
+        if (
+            kv_mgr is not None
+            and getattr(kv_mgr, "layer_pipeline_enabled", False)
+            and (main_hook_fired or hook_layer_shard)
+        ):
+            sender.send_draft_kv(page_indices)
         req.disagg_kv_sender.send(page_indices, state_indices)
         req.start_send_idx = end_idx
+
+    def build_layer_pipeline_hook(
+        self: Scheduler, batch: ScheduleBatch
+    ) -> Optional[Callable]:
+        bootstrap_queue = getattr(self, "disagg_prefill_bootstrap_queue", None)
+        if bootstrap_queue is None:
+            return None
+        kv_mgr = bootstrap_queue.kv_manager
+        if not getattr(kv_mgr, "layer_pipeline_enabled", False):
+            return None
+        builder = getattr(kv_mgr, "make_layer_pipeline_hook_for_reqs", None)
+        if builder is None:
+            return None
+        if not batch.forward_mode.is_extend():
+            return None
+
+        page_size = self.token_to_kv_pool_allocator.page_size
+        kvcache = self.token_to_kv_pool_allocator.get_kvcache()
+        ship_state_via_lp = isinstance(kvcache, DSATokenToKVPool)
+        if not getattr(self, "_lp_ship_state_logged", False):
+            logger.info(
+                "[layer-pipeline] kvcache_type=%s ship_state_via_lp=%s",
+                type(kvcache).__name__,
+                ship_state_via_lp,
+            )
+            self._lp_ship_state_logged = True
+        reqs_with_indices: List = []
+        for req in batch.reqs:
+            sender = getattr(req, "disagg_kv_sender", None)
+            bootstrap_room = getattr(req, "bootstrap_room", None)
+            if sender is None or bootstrap_room is None:
+                continue
+            if not hasattr(sender, "bootstrap_room"):
+                continue
+            last_chunk = req.inflight_middle_chunks <= 0
+            start_idx = req.start_send_idx
+            end_idx = min(req.extend_range.end, len(req.origin_input_ids))
+            if not last_chunk:
+                end_idx -= end_idx % page_size
+            if end_idx <= start_idx:
+                continue
+            kv_indices = (
+                self.req_to_token_pool.req_to_token[
+                    req.req_pool_idx, start_idx:end_idx
+                ]
+                .cpu()
+                .numpy()
+            )
+            page_indices = kv_to_page_indices(kv_indices, page_size)
+            if len(page_indices) == 0:
+                continue
+            page_start = start_idx // page_size
+            index_slice = slice(page_start, page_start + len(page_indices))
+            if getattr(kv_mgr, "enable_all_cp_ranks_for_transfer", False):
+                use_layer_cp_shard = getattr(
+                    kv_mgr, "use_layer_cp_shard_for_transfer", lambda: False
+                )()
+                if not use_layer_cp_shard:
+                    page_indices, index_slice = filter_kv_indices_for_cp_rank(
+                        kv_mgr, page_indices, index_slice,
+                        total_pages=sender.num_kv_indices,
+                    )
+                    if len(page_indices) == 0:
+                        continue
+            state_indices = page_indices if ship_state_via_lp else None
+            reqs_with_indices.append(
+                (sender, page_indices, index_slice, state_indices)
+            )
+
+        if not reqs_with_indices:
+            return None
+        return builder(reqs_with_indices)
 
     def optimistic_release_and_requeue(self: Scheduler, req: Req) -> None:
         """Release KV cache and requeue an optimistic prefill request."""

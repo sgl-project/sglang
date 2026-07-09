@@ -120,6 +120,13 @@ class CommonKVManager(BaseKVManager):
         self.is_mla_backend = is_mla_backend
         self.disaggregation_mode = disaggregation_mode
         self.server_args = server_args
+        self.layer_pipeline_enabled = getattr(
+            server_args, "enable_disagg_layer_pipeline", False
+        )
+        self.layer_group_size = getattr(server_args, "disagg_layer_group_size", 4)
+        self.layer_pipeline_min_prefill_len = (
+            getattr(server_args, "disagg_layer_pipeline_min_prefill_len", 2048)
+        )
         # for p/d multi node infer
         self.bootstrap_host = server_args.host
         self.bootstrap_port = server_args.disaggregation_bootstrap_port
@@ -142,6 +149,8 @@ class CommonKVManager(BaseKVManager):
         self.enable_all_cp_ranks_for_transfer = (
             envs.SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER.get()
         )
+        self.cp_transfer_shard_mode = self._resolve_cp_transfer_shard_mode()
+        self._validate_cp_transfer_shard_mode()
 
         # bind zmq socket
         self._zmq_ctx = zmq.Context()
@@ -489,55 +498,163 @@ class CommonKVManager(BaseKVManager):
             )
             return sock
 
+    @staticmethod
+    def _resolve_main_draft_layout(
+        helper_name: str,
+        src_count: int,
+        dst_total_count: int,
+        start_layer: int,
+        num_main_local: Optional[int],
+        dst_num_main: Optional[int],
+    ) -> Tuple[int, int, int, bool]:
+        if num_main_local is not None and num_main_local < 0:
+            raise ValueError(
+                f"{helper_name}: num_main_local must be >= 0, "
+                f"got {num_main_local}"
+            )
+
+        local_main_count = (
+            src_count
+            if num_main_local is None or num_main_local >= src_count
+            else num_main_local
+        )
+        local_draft_count = src_count - local_main_count
+        same_layout = (
+            src_count == dst_total_count
+            and (
+                dst_num_main == local_main_count
+                if local_draft_count
+                else dst_num_main is None or dst_num_main >= local_main_count
+            )
+        )
+        if same_layout:
+            return local_main_count, local_draft_count, dst_total_count, True
+
+        if dst_num_main is not None and dst_num_main < 0:
+            raise ValueError(
+                f"{helper_name}: dst_num_main must be >= 0, got {dst_num_main}"
+            )
+
+        if local_draft_count > 0:
+            if dst_num_main is None:
+                raise ValueError(
+                    f"{helper_name}: src has a draft tail but decode did "
+                    "not advertise num_main_kv_layers."
+                )
+            dst_draft_count = dst_total_count - dst_num_main
+            if dst_draft_count < local_draft_count:
+                raise ValueError(
+                    f"{helper_name}: src has {local_draft_count} draft ptr(s) "
+                    f"but dst exposes only {dst_draft_count}."
+                )
+            dst_main_count = dst_num_main
+        else:
+            dst_main_count = (
+                dst_num_main if dst_num_main is not None else dst_total_count
+            )
+
+        if dst_main_count < start_layer + local_main_count:
+            raise ValueError(
+                f"{helper_name}: dst has {dst_main_count} main ptrs, "
+                f"but prefill PP rank covers "
+                f"[{start_layer}, {start_layer + local_main_count})."
+            )
+        return local_main_count, local_draft_count, dst_main_count, False
+
+    @staticmethod
+    def _slice_main_then_draft(
+        ptrs: List[int],
+        main_start: int,
+        local_main_count: int,
+        draft_start: int,
+        local_draft_count: int,
+    ) -> List[int]:
+        sliced = list(ptrs[main_start : main_start + local_main_count])
+        if local_draft_count > 0:
+            sliced.extend(ptrs[draft_start : draft_start + local_draft_count])
+        return sliced
+
     def get_mha_kv_ptrs_with_pp(
-        self, src_kv_ptrs: List[int], dst_kv_ptrs: List[int]
+        self,
+        src_kv_ptrs: List[int],
+        dst_kv_ptrs: List[int],
+        *,
+        num_main_local: Optional[int] = None,
+        dst_num_main: Optional[int] = None,
     ) -> Tuple[List[int], List[int], List[int], List[int], int]:
+        """Align MHA KV ptrs across PP and optional draft-tail layouts."""
         start_layer = self.kv_args.prefill_start_layer
         num_kv_layers = len(src_kv_ptrs) // 2
-        end_layer = start_layer + num_kv_layers
         dst_num_total_layers = len(dst_kv_ptrs) // 2
         src_k_ptrs = src_kv_ptrs[:num_kv_layers]
         src_v_ptrs = src_kv_ptrs[num_kv_layers:]
-        if num_kv_layers == dst_num_total_layers:
+        layers_current_pp_stage = len(src_k_ptrs)
+
+        local_main_count, local_draft_count, dst_main_count, same_layout = (
+            CommonKVManager._resolve_main_draft_layout(
+                "get_mha_kv_ptrs_with_pp",
+                num_kv_layers,
+                dst_num_total_layers,
+                start_layer,
+                num_main_local,
+                dst_num_main,
+            )
+        )
+
+        if same_layout:
             dst_k_ptrs = dst_kv_ptrs[:dst_num_total_layers]
             dst_v_ptrs = dst_kv_ptrs[dst_num_total_layers:]
-        elif (
-            num_kv_layers < dst_num_total_layers
-            and dst_num_total_layers % num_kv_layers != 0
-        ):
-            # Case: Decode has draft model KV while Prefill is deployed without speculative decoding
-            # dst_kv_ptrs layout: [K_main..., V_main..., draft_K..., draft_V...]
-            multiplier_ratio = dst_num_total_layers // num_kv_layers
-            dst_k_ptrs = dst_kv_ptrs[start_layer:end_layer]
-            v_ptr_offset = num_kv_layers * multiplier_ratio
-            dst_v_ptrs = dst_kv_ptrs[
-                v_ptr_offset + start_layer : v_ptr_offset + end_layer
-            ]
-        else:
-            # Decode pp size should be equal to prefill pp size or 1
-            dst_k_ptrs = dst_kv_ptrs[start_layer:end_layer]
-            dst_v_ptrs = dst_kv_ptrs[
-                dst_num_total_layers + start_layer : dst_num_total_layers + end_layer
-            ]
-        layers_current_pp_stage = len(src_k_ptrs)
-        return src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage
+            return (
+                src_k_ptrs,
+                src_v_ptrs,
+                dst_k_ptrs,
+                dst_v_ptrs,
+                layers_current_pp_stage,
+            )
+
+        dst_k_ptrs = CommonKVManager._slice_main_then_draft(
+            dst_kv_ptrs,
+            start_layer,
+            local_main_count,
+            dst_main_count,
+            local_draft_count,
+        )
+        dst_v_all = dst_kv_ptrs[dst_num_total_layers:]
+        dst_v_ptrs = CommonKVManager._slice_main_then_draft(
+            dst_v_all,
+            start_layer,
+            local_main_count,
+            dst_main_count,
+            local_draft_count,
+        )
+        return (
+            src_k_ptrs,
+            src_v_ptrs,
+            dst_k_ptrs,
+            dst_v_ptrs,
+            layers_current_pp_stage,
+        )
 
     def get_mla_kv_ptrs_with_pp(
         self,
         src_kv_ptrs: List[int],
         dst_kv_ptrs: List[int],
         state_type: Optional[StateType] = None,
+        *,
+        num_main_local: Optional[int] = None,
+        dst_num_main: Optional[int] = None,
     ) -> Tuple[List[int], List[int], int]:
-        # Fast path: both sides use exactly the same PP layout
-        if len(src_kv_ptrs) == len(dst_kv_ptrs):
-            return src_kv_ptrs, dst_kv_ptrs, len(src_kv_ptrs)
-
+        """Align MLA KV ptrs across PP and optional draft-tail layouts."""
         mla_ratios = getattr(self.kv_args, "mla_compression_ratios", None)
         if mla_ratios:
-            # Compressed-MLA (e.g. DeepSeek V4): the flat list is organized
-            # by buffer type (compression-ratio bucket) rather than by
-            # layer, so we locate the sub-range for this PP stage inside each
-            # section of the dst flat list.
+            # Compressed-MLA groups ptrs by buffer type; draft tail is not
+            # supported because it would need bucket-aware draft slicing.
+            if num_main_local is not None and num_main_local < len(src_kv_ptrs):
+                raise ValueError(
+                    "get_mla_kv_ptrs_with_pp: compressed-MLA "
+                    "(mla_compression_ratios set) does not yet support a "
+                    "draft tail in src."
+                )
             sliced_src_kv_ptrs, sliced_dst_kv_ptrs = self._mla_slice_ptrs_for_pp(
                 src_kv_ptrs, dst_kv_ptrs, mla_ratios, state_type
             )
@@ -549,10 +666,66 @@ class CommonKVManager(BaseKVManager):
 
         # Regular MLA PP slicing
         start_layer = self.kv_args.prefill_start_layer
-        end_layer = start_layer + len(src_kv_ptrs)
-        # Decode pp size should be equal to prefill pp size or 1
-        sliced_dst_kv_ptrs = dst_kv_ptrs[start_layer:end_layer]
+        src_len = len(src_kv_ptrs)
+
+        local_main_count, local_draft_count, dst_main_count, same_layout = (
+            CommonKVManager._resolve_main_draft_layout(
+                "get_mla_kv_ptrs_with_pp",
+                src_len,
+                len(dst_kv_ptrs),
+                start_layer,
+                num_main_local,
+                dst_num_main,
+            )
+        )
+
+        if same_layout:
+            return src_kv_ptrs, dst_kv_ptrs, len(src_kv_ptrs)
+
+        sliced_dst_kv_ptrs = CommonKVManager._slice_main_then_draft(
+            dst_kv_ptrs,
+            start_layer,
+            local_main_count,
+            dst_main_count,
+            local_draft_count,
+        )
         return src_kv_ptrs, sliced_dst_kv_ptrs, len(src_kv_ptrs)
+
+    def get_state_ptrs_with_pp(
+        self,
+        src_state_ptrs: List[int],
+        dst_state_ptrs: List[int],
+        src_state_item_lens: List[int],
+        *,
+        num_main_local: Optional[int] = None,
+        dst_num_main: Optional[int] = None,
+    ) -> Tuple[List[int], List[int], List[int]]:
+        """Align per-layer state ptrs across PP and optional draft tails."""
+        start_layer = getattr(self.kv_args, "prefill_start_layer", 0) or 0
+        src_len = len(src_state_ptrs)
+
+        local_main_count, local_draft_count, dst_main_count, same_layout = (
+            CommonKVManager._resolve_main_draft_layout(
+                "get_state_ptrs_with_pp",
+                src_len,
+                len(dst_state_ptrs),
+                start_layer,
+                num_main_local,
+                dst_num_main,
+            )
+        )
+
+        if same_layout:
+            return src_state_ptrs, dst_state_ptrs, src_state_item_lens
+
+        aligned_dst = CommonKVManager._slice_main_then_draft(
+            dst_state_ptrs,
+            start_layer,
+            local_main_count,
+            dst_main_count,
+            local_draft_count,
+        )
+        return src_state_ptrs, aligned_dst, src_state_item_lens
 
     def _mla_slice_ptrs_for_pp(
         self,
@@ -561,36 +734,12 @@ class CommonKVManager(BaseKVManager):
         mla_ratios: List[int],
         state_type: Optional[StateType] = None,
     ) -> Tuple[List[int], List[int]]:
-        """Produce aligned (src, dst) pointer lists for compressed-MLA
-        pools (e.g. DeepSeek V4) under PP.
+        """Slice compressed-MLA dst ptrs for this PP stage.
 
-        The pool produces two possible flat-list layouts (selected via dst
-        length):
-
-        - kv_data layout, length = 2 * c4_L + c128_L:
-            [c4_layer_{0..c4_L-1},
-             c4_indexer_layer_{0..c4_L-1},
-             c128_layer_{0..c128_L-1}]
-          Each section is indexed by compressed-layer id within that
-          compression bucket.
-
-        - SWA state_data layout, length = swa_L + 2 * c4_L:
-            [swa_layer_{0..swa_L-1},
-             c4_compress_state_{0..c4_L-1},
-             c4_indexer_compress_state_{0..c4_L-1}]
-          ``swa_L`` is the SWA pool's actual buffer count
-          (``num_effective_layers``), which can be smaller than
-          ``len(mla_ratios)`` when the HF config's ``compress_ratios``
-          list contains entries for layers not materialized into the SWA
-          pool (e.g. an MTP/nextn slot at the tail).
-
-        - C128_STATE layout, length = c128_L:
-            [c128_compress_state_{0..c128_L-1}]
-
-        src is already PP-filtered on the prefill side. dst is the
-        decode-side full-model list (when decode is PP=1). We slice dst to
-        match src's PP stage. If src itself is also full-model, it is
-        returned unchanged.
+        dst can be either KV layout (c4, c4-indexer, c128) or state layout
+        (SWA, compressed state, indexer compressed state, or C128 state).
+        Offsets are derived from compression ratios and the prefill stage's
+        start/end layer.
         """
         start_layer = self.kv_args.prefill_start_layer
         end_layer = getattr(self.kv_args, "prefill_end_layer", None)
@@ -763,6 +912,109 @@ class CommonKVManager(BaseKVManager):
             f"{len(affected_rooms)} requests affected"
         )
 
+    def local_num_kv_layers(self) -> int:
+        if self.is_mla_backend:
+            return len(self.kv_args.kv_data_ptrs)
+        return len(self.kv_args.kv_data_ptrs) // 2
+
+    def use_layer_cp_shard_for_transfer(self) -> bool:
+        """Whether CP ranks shard LP layer groups instead of pages."""
+        return (
+            self.layer_pipeline_enabled
+            and self.enable_all_cp_ranks_for_transfer
+            and self.attn_cp_size > 1
+            and self.cp_transfer_shard_mode == "layer"
+        )
+
+    def rank_owns_no_main_groups_for_transfer(self) -> bool:
+        if not self.use_layer_cp_shard_for_transfer():
+            return False
+        group_size = self.layer_group_size
+        if group_size <= 0:
+            return False
+        num_main_kv_layers = getattr(
+            self.kv_args, "prefill_num_main_kv_layers", None
+        )
+        if num_main_kv_layers is None or num_main_kv_layers <= 0:
+            # No reliable main-layer count: keep the guard strict.
+            num_main_kv_layers = self.local_num_kv_layers()
+            if num_main_kv_layers <= 0:
+                return False
+        total_main_groups = (num_main_kv_layers + group_size - 1) // group_size
+        return self.attn_cp_rank >= total_main_groups
+
+    def _validate_cp_transfer_shard_mode(self) -> None:
+        if self.disaggregation_mode != DisaggregationMode.PREFILL:
+            return
+
+        ready_for_layer = (
+            self.layer_pipeline_enabled
+            and self.enable_all_cp_ranks_for_transfer
+            and self.attn_cp_size > 1
+            and self._has_nsa_prefill_cp()
+        )
+        if self.cp_transfer_shard_mode == "page":
+            if ready_for_layer:
+                logger.warning(
+                    "Layer pipeline with all-CP-ranks transfer and NSA/DSA CP "
+                    "should use --disaggregation-cp-transfer-shard-mode=layer."
+                )
+            return
+
+        if not ready_for_layer:
+            raise ValueError(
+                "--disaggregation-cp-transfer-shard-mode=layer requires "
+                "--enable-disagg-layer-pipeline, "
+                "SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER=1, attention CP "
+                "size > 1, and NSA/DSA prefill CP."
+            )
+
+    def _has_nsa_prefill_cp(self) -> bool:
+        sa = self.server_args
+        return bool(
+            getattr(sa, "enable_dsa_prefill_context_parallel", False)
+            or (
+                getattr(sa, "enable_prefill_cp", False)
+                and getattr(sa, "attention_backend", None) in ("nsa", "dsa", "dsv4")
+            )
+        )
+
+    def _resolve_cp_transfer_shard_mode(self) -> str:
+        cli_mode = self._normalize_cp_transfer_shard_mode(
+            getattr(self.server_args, "disaggregation_cp_transfer_shard_mode", "page")
+        )
+        if not envs.SGLANG_DISAGGREGATION_CP_TRANSFER_SHARD_MODE.is_set():
+            return cli_mode
+
+        raw_mode = envs.SGLANG_DISAGGREGATION_CP_TRANSFER_SHARD_MODE.get()
+        env_mode = self._normalize_cp_transfer_shard_mode(raw_mode)
+        logger.warning(
+            "SGLANG_DISAGGREGATION_CP_TRANSFER_SHARD_MODE=%r is deprecated "
+            "and overrides --disaggregation-cp-transfer-shard-mode=%r.",
+            raw_mode,
+            cli_mode,
+        )
+        if (
+            isinstance(raw_mode, str)
+            and raw_mode.strip()
+            and raw_mode.strip().lower() != env_mode
+        ):
+            logger.warning(
+                "Unknown SGLANG_DISAGGREGATION_CP_TRANSFER_SHARD_MODE=%r, "
+                "falling back to 'page'.",
+                raw_mode,
+            )
+        return env_mode
+
+    @staticmethod
+    def _normalize_cp_transfer_shard_mode(raw_value: object) -> str:
+        if not isinstance(raw_value, str):
+            return "page"
+        canonical = raw_value.strip().lower()
+        if canonical not in ("page", "layer"):
+            return "page"
+        return canonical
+
 
 class CommonKVSender(BaseKVSender):
     def __init__(
@@ -857,9 +1109,24 @@ class CommonKVSender(BaseKVSender):
     ):
         self._transfer_num_kv_indices += len(kv_indices)
         if state_indices:
-            for component_indices in state_indices:
-                if component_indices is not None:
-                    self._transfer_num_state_indices += len(component_indices)
+            self._transfer_num_state_indices += sum(
+                self._index_count(component_indices)
+                for component_indices in state_indices
+            )
+
+    @staticmethod
+    def _index_count(indices) -> int:
+        if indices is None:
+            return 0
+        if hasattr(indices, "numel"):
+            return int(indices.numel())
+        size = getattr(indices, "size", None)
+        if isinstance(size, (int, np.integer)):
+            return int(size)
+        try:
+            return len(indices)
+        except TypeError:
+            return 1
 
     def _prepare_send_indices(
         self,
@@ -876,7 +1143,12 @@ class CommonKVSender(BaseKVSender):
         self.curr_idx += len(kv_indices)
         is_last_chunk = self.curr_idx == self.num_kv_indices
 
-        if self.kv_mgr.enable_all_cp_ranks_for_transfer:
+        if (
+            self.kv_mgr.enable_all_cp_ranks_for_transfer
+            and not getattr(
+                self.kv_mgr, "use_layer_cp_shard_for_transfer", lambda: False
+            )()
+        ):
             kv_indices, index_slice = filter_kv_indices_for_cp_rank(
                 self.kv_mgr,
                 kv_indices,

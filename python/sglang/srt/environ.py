@@ -337,6 +337,13 @@ class Envs:
     SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX = EnvBool(True)
     SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER = EnvBool(False)
     SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK = EnvBool(False)
+    # CP transfer sharding mode under ALL_CP_RANKS_TRANSFER=1. "page" (default)
+    # keeps the legacy per-page split; "layer" shards layer GROUPS — only when
+    # LP is active and CP ranks hold identical KV (e.g. NSA prefill CP).
+    SGLANG_DISAGGREGATION_CP_TRANSFER_SHARD_MODE = EnvStr("page")
+    SGLANG_DISAGG_LAYER_PIPELINE = EnvBool(False)
+    SGLANG_DISAGG_LAYER_GROUP_SIZE = EnvInt(4)
+    SGLANG_DISAGG_LAYER_PIPELINE_MIN_PREFILL_LEN = EnvInt(2048)
 
     # Scheduler: others:
     # in seconds. Set if you observe high memory accumulation over a long serving period.

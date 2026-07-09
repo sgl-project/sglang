@@ -14,9 +14,39 @@ logger = logging.getLogger(__name__)
 
 def handle_pd_disaggregation(server_args: ServerArgs) -> None:
     """Validate and normalize PD-disaggregation server args."""
-    # "mooncake_tcp" is mooncake with the TCP transport forced: set MC_FORCE_TCP
-    # so mooncake installs TcpTransport instead of RDMA, rewrite the backend to
-    # mooncake, and skip RDMA HCA selection. Must run before backend-name checks.
+    for env, attr in (
+        (envs.SGLANG_DISAGG_LAYER_PIPELINE, "enable_disagg_layer_pipeline"),
+        (envs.SGLANG_DISAGG_LAYER_GROUP_SIZE, "disagg_layer_group_size"),
+        (
+            envs.SGLANG_DISAGG_LAYER_PIPELINE_MIN_PREFILL_LEN,
+            "disagg_layer_pipeline_min_prefill_len",
+        ),
+    ):
+        if env.is_set():
+            setattr(server_args, attr, env.get())
+
+    if server_args.enable_disagg_layer_pipeline:
+        server_args.enable_disagg_draft_layout_validation = True
+        if server_args.disaggregation_mode not in ("prefill", "decode"):
+            raise ValueError(
+                "--enable-disagg-layer-pipeline requires --disaggregation-mode "
+                "prefill or decode."
+            )
+        if server_args.disagg_layer_group_size < 0:
+            raise ValueError("--disagg-layer-group-size must be >= 0.")
+        if server_args.disagg_layer_pipeline_min_prefill_len < 0:
+            raise ValueError(
+                "--disagg-layer-pipeline-min-prefill-len must be >= 0."
+            )
+        if server_args.enable_hisparse:
+            raise ValueError(
+                "--enable-disagg-layer-pipeline does not currently support "
+                "--enable-hisparse. Disable one of these flags."
+            )
+
+    # "mooncake_tcp" forces mooncake's TCP transport: set MC_FORCE_TCP, rewrite
+    # the backend to mooncake, and skip RDMA HCA selection. Must run before
+    # backend-name checks.
     if server_args.disaggregation_transfer_backend == "mooncake_tcp":
         os.environ.setdefault("MC_FORCE_TCP", "1")
         server_args.disaggregation_transfer_backend = "mooncake"
@@ -24,6 +54,15 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
         logger.info(
             "disaggregation transfer backend 'mooncake_tcp' -> mooncake "
             "with MC_FORCE_TCP=1 (TCP transport, no RDMA)"
+        )
+
+    if (
+        server_args.enable_disagg_layer_pipeline
+        and server_args.disaggregation_transfer_backend != "mooncake"
+    ):
+        raise ValueError(
+            "--enable-disagg-layer-pipeline currently requires "
+            "--disaggregation-transfer-backend=mooncake."
         )
 
     if server_args.disaggregation_mode == "decode":

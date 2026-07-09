@@ -851,6 +851,57 @@ def setup_state_kv_args(
             )
 
 
+def merge_main_and_draft_kv_layout(
+    main_ptrs: List[int],
+    main_lens: List[int],
+    main_item_lens: List[int],
+    draft_ptrs: List[int],
+    draft_lens: List[int],
+    draft_item_lens: List[int],
+    *,
+    is_mla_backend: bool,
+) -> Tuple[List[int], List[int], List[int]]:
+    """Merge main/draft KV descriptors while preserving MHA K/V halves."""
+    if len(main_ptrs) != len(main_lens) or len(main_ptrs) != len(main_item_lens):
+        raise ValueError(
+            "main_ptrs / main_lens / main_item_lens length mismatch: "
+            f"{len(main_ptrs)} / {len(main_lens)} / {len(main_item_lens)}"
+        )
+    if len(draft_ptrs) != len(draft_lens) or len(draft_ptrs) != len(draft_item_lens):
+        raise ValueError(
+            "draft_ptrs / draft_lens / draft_item_lens length mismatch: "
+            f"{len(draft_ptrs)} / {len(draft_lens)} / {len(draft_item_lens)}"
+        )
+    if is_mla_backend:
+        return (
+            main_ptrs + draft_ptrs,
+            main_lens + draft_lens,
+            main_item_lens + draft_item_lens,
+        )
+    # MHA pools are [K_*, V_*]; merged layout must be [K_main, K_draft, V_main, V_draft].
+    if len(main_ptrs) % 2 != 0:
+        raise ValueError(
+            "MHA main_ptrs length must be even (each layer contributes K + V); "
+            f"got {len(main_ptrs)}"
+        )
+    if len(draft_ptrs) % 2 != 0:
+        raise ValueError(
+            "MHA draft_ptrs length must be even (each layer contributes K + V); "
+            f"got {len(draft_ptrs)}"
+        )
+    n_main = len(main_ptrs) // 2
+    n_draft = len(draft_ptrs) // 2
+
+    def _reorder(m: List, d: List) -> List:
+        return m[:n_main] + d[:n_draft] + m[n_main:] + d[n_draft:]
+
+    return (
+        _reorder(main_ptrs, draft_ptrs),
+        _reorder(main_lens, draft_lens),
+        _reorder(main_item_lens, draft_item_lens),
+    )
+
+
 def prepare_abort(req: Req, error_message: str, status_code=None):
     from sglang.srt.managers.schedule_batch import FINISH_ABORT
 
