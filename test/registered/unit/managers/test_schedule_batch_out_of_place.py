@@ -13,6 +13,7 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.managers.schedule_batch import ScheduleBatch  # noqa: E402
 from sglang.srt.model_executor.forward_batch_info import ForwardMode  # noqa: E402
+from sglang.srt.utils.common import Range  # noqa: E402
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -70,9 +71,7 @@ class _FakeReq:
         self.full_untruncated_fill_ids = self.origin_input_ids + self.output_ids
 
     def set_extend_range(self, start, end):
-        self.extend_range = types.SimpleNamespace(
-            start=start, end=end, length=end - start
-        )
+        self.extend_range = Range(start, end)
 
 
 class TestMergeBatchOutOfPlace(unittest.TestCase):
@@ -173,13 +172,13 @@ class TestPrepareEncoderInfoExtendOutOfPlace(unittest.TestCase):
             rid="img",
             multimodal_inputs=types.SimpleNamespace(num_image_tokens=2),
             prefix_indices=[],
-            extend_range=types.SimpleNamespace(length=5),
+            extend_range=Range(0, 5),
         )
         req_text_only = types.SimpleNamespace(
             rid="txt",
             multimodal_inputs=None,
             prefix_indices=[],
-            extend_range=types.SimpleNamespace(length=4),
+            extend_range=Range(0, 4),
         )
         batch = make_schedule_batch(
             2,
