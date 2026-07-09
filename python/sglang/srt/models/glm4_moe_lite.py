@@ -72,7 +72,7 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
     DeepseekV2WeightLoaderMixin,
 )
-from sglang.srt.models.deepseek_common.utils import _is_cuda, is_npu, _use_aiter
+from sglang.srt.models.deepseek_common.utils import _is_cuda, _use_aiter
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 from sglang.srt.runtime_context import get_parallel, get_server_args, get_stream
 from sglang.srt.server_args import get_global_server_args
@@ -81,6 +81,7 @@ from sglang.srt.utils import (
     LazyValue,
     add_prefix,
     is_non_idle_and_non_empty,
+    is_npu,
     log_info_on_rank0,
     make_layers,
 )
