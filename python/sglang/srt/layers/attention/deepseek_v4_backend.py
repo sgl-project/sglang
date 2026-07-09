@@ -457,9 +457,6 @@ class DeepseekV4AttnBackend(
 ):
     use_captured_forward_metadata_for_breakable_cuda_graph: bool = True
 
-    # Class-level so the target and MTP draft workers (both use this backend)
-    # give decide_needs_cpu_seq_lens a consistent value. Hot replay paths run
-    # without the host mirror; cold paths sync on demand below.
     needs_cpu_seq_lens: bool = False
 
     def __init__(
@@ -514,6 +511,9 @@ class DeepseekV4AttnBackend(
             DSV4RawDecodeMetadata,
         ] = None
         self.online_c128_mtp = OnlineC128MTPController(self)
+        # The online-c128 verify planner is host-side; keep the relay publish.
+        if self.online_c128_mtp.enabled():
+            self.needs_cpu_seq_lens = True
         self.sparse_prefill_workspace = SparsePrefillWorkspace(self.device)
 
     def _move_to_device(self, x: List[int]) -> torch.Tensor:
@@ -710,14 +710,9 @@ class DeepseekV4AttnBackend(
     ) -> Union[DSV4Metadata, DSV4RawVerifyMetadata]:
         if envs.SGLANG_PREP_IN_CUDA_GRAPH.get():
             assert out_cache_loc is not None
-            if seq_lens_cpu is not None:
-                seq_lens_cpu_list = seq_lens_cpu.tolist()
-            elif self.online_c128_mtp.enabled():
-                # The c128 compress metadata genuinely needs host lengths;
-                # sync on demand instead of relying on the published mirror.
-                seq_lens_cpu_list = seq_lens.detach().cpu().tolist()
-            else:
-                seq_lens_cpu_list = None
+            seq_lens_cpu_list = (
+                seq_lens_cpu.tolist() if seq_lens_cpu is not None else None
+            )
             if not hasattr(self, "extend_seq_lens_buffer"):
                 self.extend_seq_lens_buffer = torch.tensor(
                     [self.speculative_num_draft_tokens] * 1025, device=self.device
