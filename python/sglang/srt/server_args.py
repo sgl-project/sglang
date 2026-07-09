@@ -5120,8 +5120,10 @@ class ServerArgs:
             ), "attn_cp_size != moe_dp_size is only supported when moe_dp_size == 1"
 
         from sglang.srt.layers.cp.base import init_cp_strategy
+        from sglang.srt.layers.dcp import init_dcp_strategy
 
         init_cp_strategy(self)
+        init_dcp_strategy(self)
 
     def _handle_data_parallelism(self):
         # The dp_size==1 resets moved to the resolution pipeline
