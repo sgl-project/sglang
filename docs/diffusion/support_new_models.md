@@ -81,6 +81,33 @@ task mappings. Shared request fields such as `Req.session_id` and `Req.reset_ses
 default to no session state; non-action pipelines should ignore them unless they
 explicitly implement a session cache.
 
+#### DreamZero Integration Boundary
+
+DreamZero's initial integration is scoped to evaluation workers that call SGLang
+through the Python pipeline or local scheduler-client boundary. The supported request
+shape is a `Req` with `DreamZeroSamplingParams` plus DreamZero-specific entries in
+`Req.extra`, including normalized observation tensors, session ids, reset masks, and
+prompt cache keys. This matches the current RLinf evaluation path:
+
+```
+RLinf DreamZero eval worker
+  -> DreamZeroSamplingParams + Req(extra=...)
+  -> DreamZeroPipeline.forward(...) or local scheduler client
+  -> action tensor output
+```
+
+This integration does not expose DreamZero as a public OpenAI-compatible HTTP action
+endpoint. In particular, the existing image and video HTTP routes should not be used
+as the action surface because they materialize outputs as media files, while DreamZero
+returns action tensors. A server or nightly testcase that registers an `action`
+modality and validator should be added once the public HTTP action contract is
+defined. Until then, DreamZero coverage should focus on:
+
+- registry and config detection for `ModelTaskType.ACTION` and `DataType.ACTION`;
+- unit coverage for session cache allocation, reset, and prompt reuse behavior;
+- scheduler and text/image construction smoke coverage with fake tensors or modules;
+- end-to-end validation through the RLinf DreamZero evaluation worker.
+
 ## Key Components for Implementation
 
 To add support for a new diffusion model, you will need to define or configure the following components:
