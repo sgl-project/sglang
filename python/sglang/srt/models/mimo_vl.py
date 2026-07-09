@@ -279,7 +279,7 @@ class MiMoVisionTransformer(nn.Module):
                     num_heads=num_heads,
                     hidden_act=vision_config.hidden_act,
                     norm_layer=norm_layer,
-                    attn_implementation="flash_attention_3",
+                    attn_implementation=None,
                     quant_config=quant_config,
                     prefix=add_prefix(f"blocks.{i}", prefix),
                     use_sink=(
