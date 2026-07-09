@@ -20,6 +20,7 @@ from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
     EAGLEDraftExtendCudaGraphRunner,
 )
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
+from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import fast_topk
 
@@ -149,7 +150,7 @@ def _make_eagle_draft_extend_v2_input(case, batch, *, device: str):
 
 def _set_draft_extend_v2_prefix_lens(batch, case, *, device: str):
     # Production sets seq_lens = prefix + extend before init_forward_metadata
-    # (eagle_info_v2.py bumps seq_lens by num_draft_tokens). Match that here.
+    # (the draft-extend path bumps seq_lens by num_draft_tokens). Match that here.
     seq_lens = tuple(p + e for p, e in zip(case.prefix_lens, case.input_lens))
     batch.seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device=device)
     batch.seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int32, device="cpu")
@@ -496,6 +497,7 @@ class _EagleDraftExtendV2WorkerHarness:
         self.eagle_use_aux_hidden_state = False
         self.hot_token_id = None
         self.draft_runner.model = model_forward
+        EagleDraftWorker._init_dsa_index_share_state(self)
 
 
 def _build_eagle_draft_extend_fixture(
@@ -821,7 +823,7 @@ def _set_draft_extend_v2_prefix_lens(
     device: str,
 ) -> None:
     # Production sets seq_lens = prefix + extend before init_forward_metadata
-    # (eagle_info_v2.py bumps seq_lens by num_draft_tokens). Match that here.
+    # (the draft-extend path bumps seq_lens by num_draft_tokens). Match that here.
     seq_lens = tuple(p + e for p, e in zip(case.prefix_lens, case.input_lens))
     batch.seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device=device)
     batch.seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int32, device="cpu")
