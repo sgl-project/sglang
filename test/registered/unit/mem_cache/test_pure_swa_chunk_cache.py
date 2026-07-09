@@ -37,7 +37,7 @@ class TestPureSWAChunkCache(CustomTestCase):
         )
         cache.token_to_kv_pool_allocator = _FakeAllocator()
 
-        cache.cache_finished_req(_FakeReq())
+        cache.cache_finished_req(_FakeReq(), kv_len_to_handle=8)
 
         self.assertEqual(len(cache.token_to_kv_pool_allocator.freed), 1)
         freed = cache.token_to_kv_pool_allocator.freed[0]

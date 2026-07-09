@@ -116,7 +116,6 @@ def _make_req(req_pool_idx, token_ids, cache_protected_len, tree):
         prefix_indices=torch.tensor([], dtype=torch.int64, device=tree.device),
         _kv_committed_len=len(token_ids),
     )
-    req.pop_committed_kv_cache = lambda: req._kv_committed_len
     return req
 
 
@@ -191,7 +190,9 @@ class TestSWAEvictionBoundary(unittest.TestCase):
             insert_len = seq_len // page_size * page_size
             self.assertLess(req.kv.swa_evicted_seqlen, insert_len)
 
-            tree.cache_finished_req(req, is_insert=True)
+            tree.cache_finished_req(
+                req, is_insert=True, kv_len_to_handle=req._kv_committed_len
+            )
             tree.sanity_check()
 
     # -- Eviction formula: page_size == 1 --
@@ -216,7 +217,9 @@ class TestSWAEvictionBoundary(unittest.TestCase):
                 req.kv.swa_evicted_seqlen, max(0, seq_len - 1 - max(window, page_size))
             )
 
-            tree.cache_finished_req(req, is_insert=True)
+            tree.cache_finished_req(
+                req, is_insert=True, kv_len_to_handle=req._kv_committed_len
+            )
             tree.sanity_check()
 
     # -- Eviction formula: no-op when seq too short --
@@ -253,7 +256,9 @@ class TestSWAEvictionBoundary(unittest.TestCase):
         kv1 = _swa_alloc(allocator, first_len)
         pool.write((0, slice(0, first_len)), kv1)
         req1 = _make_req(0, list(range(first_len)), 0, tree)
-        tree.cache_finished_req(req1, is_insert=True)
+        tree.cache_finished_req(
+            req1, is_insert=True, kv_len_to_handle=req1._kv_committed_len
+        )
         tree.sanity_check()
 
         # Second request: 24 tokens, first 16 overlap with tree
@@ -269,7 +274,9 @@ class TestSWAEvictionBoundary(unittest.TestCase):
         self.assertLessEqual(req2.kv.swa_evicted_seqlen, first_len)
 
         swa_evictable_before = tree.swa_evictable_size_
-        tree.cache_finished_req(req2, is_insert=True)
+        tree.cache_finished_req(
+            req2, is_insert=True, kv_len_to_handle=req2._kv_committed_len
+        )
 
         # New tokens [16, 24) should all be non-tombstone
         new_tokens = second_len // page_size * page_size - first_len
@@ -300,7 +307,9 @@ class TestSWAEvictionBoundary(unittest.TestCase):
         self.assertGreater(req.kv.swa_evicted_seqlen, 0, "Should have some eviction")
         self.assertLess(req.kv.swa_evicted_seqlen, insert_len, "Should be partial")
 
-        tree.cache_finished_req(req, is_insert=True)
+        tree.cache_finished_req(
+            req, is_insert=True, kv_len_to_handle=req._kv_committed_len
+        )
 
         non_tombstone = insert_len - req.kv.swa_evicted_seqlen
         self.assertEqual(tree.swa_evictable_size_, swa_evictable_before + non_tombstone)
@@ -338,7 +347,9 @@ class TestSWAEvictionBoundary(unittest.TestCase):
         req.kv.swa_evicted_seqlen = old_evicted
         swa_evictable_before = tree.swa_evictable_size_
 
-        tree.cache_finished_req(req, is_insert=True)
+        tree.cache_finished_req(
+            req, is_insert=True, kv_len_to_handle=req._kv_committed_len
+        )
 
         self.assertEqual(tree.swa_evictable_size_, swa_evictable_before)
 
@@ -367,7 +378,9 @@ class TestSWAEvictionBoundary(unittest.TestCase):
             insert_len = seq_len // page_size * page_size
             self.assertLess(req.kv.swa_evicted_seqlen, insert_len, f"turn {turn}")
 
-            tree.cache_finished_req(req, is_insert=True)
+            tree.cache_finished_req(
+                req, is_insert=True, kv_len_to_handle=req._kv_committed_len
+            )
             tree.sanity_check()
 
     # -- Integration: page_size=1 full flow --
@@ -391,7 +404,9 @@ class TestSWAEvictionBoundary(unittest.TestCase):
                 req.kv.swa_evicted_seqlen, max(0, seq_len - 1 - max(window, page_size))
             )
 
-            tree.cache_finished_req(req, is_insert=True)
+            tree.cache_finished_req(
+                req, is_insert=True, kv_len_to_handle=req._kv_committed_len
+            )
             tree.sanity_check()
 
 

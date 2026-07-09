@@ -325,7 +325,6 @@ class StreamingSession(BasePrefixCache):
             self.release_session(session_id)
             req.req_pool_idx = None
             req.session.abort_req()
-            self._mark_kv_freed(req)
             return True
 
         if is_first:
@@ -348,7 +347,6 @@ class StreamingSession(BasePrefixCache):
         # Update req_nodes to this successfully finished request.
         req.session.finish_req(req)
 
-        self._mark_kv_freed(req)
         return True
 
     def try_cache_unfinished_req(
@@ -569,14 +567,6 @@ class StreamingSession(BasePrefixCache):
         if start < end:
             tail = self.req_to_token_pool.req_to_token[pool_idx, start:end]
             self.token_to_kv_pool_allocator.free(tail)
-
-    @staticmethod
-    def _mark_kv_freed(req: Req) -> None:
-        """Set bookkeeping flags so busy check skips this finished req."""
-        if not req.kv_committed_freed:
-            req.pop_committed_kv_cache()
-        if not req.kv_overallocated_freed:
-            req.pop_overallocated_kv_cache()
 
     # -- Pass-through methods --
 

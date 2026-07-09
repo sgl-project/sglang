@@ -255,7 +255,7 @@ class DecodeKVCacheOffloadManager:
         if req.req_pool_idx is None or req.req_pool_idx == -1:
             return
 
-        kv_committed_len = req.pop_committed_kv_cache()
+        kv_committed_len = req.effective_kv_committed_len()
 
         # Free the prefill-aligned slots. Previously this was done
         # eagerly in offload_kv_cache (mid-decode), which raced with
@@ -276,7 +276,7 @@ class DecodeKVCacheOffloadManager:
 
         # Free over-allocated KV cache slots (e.g. from speculative decoding v2).
         # Without spec v2, start_p == end_p so this is a no-op.
-        start_p, end_p = req.pop_overallocated_kv_cache()
+        start_p, end_p = kv_committed_len, req.kv.kv_allocated_len
         if self.page_size > 1:
             start_p = ceil_align(start_p, self.page_size)
         if start_p < end_p:

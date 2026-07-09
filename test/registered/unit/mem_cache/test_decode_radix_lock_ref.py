@@ -83,17 +83,9 @@ class MockReq:
         self.priority = 0
         self.kv_committed_len = len(fill_ids)
         self.kv = SimpleNamespace(kv_allocated_len=len(fill_ids))
-        self.kv_committed_freed = False
 
     def get_fill_ids(self):
         return self.full_untruncated_fill_ids[: self.extend_range.end]
-
-    def pop_committed_kv_cache(self):
-        self.kv_committed_freed = True
-        return self.kv_committed_len
-
-    def pop_overallocated_kv_cache(self):
-        return (self.kv_committed_len, self.kv.kv_allocated_len)
 
 
 def _make_req(fill_ids, req_pool_idx=0, cache_protected_len=0, last_node=None):
@@ -152,7 +144,7 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         cache.cache_unfinished_req(req)
 
         # Step 3: cache_finished_req with is_insert=True (dec lock)
-        cache.cache_finished_req(req)
+        cache.cache_finished_req(req, kv_len_to_handle=req.kv_committed_len)
 
         # Verify: all non-root nodes should have lock_ref == 0
         # (root always has lock_ref == 1)
@@ -201,7 +193,7 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         cache.cache_unfinished_req(req)
 
         # Step 3: cache_finished_req (dec leaf)
-        cache.cache_finished_req(req)
+        cache.cache_finished_req(req, kv_len_to_handle=req.kv_committed_len)
 
         # Root lock unchanged, all nodes unlocked
         self.assertEqual(cache.root_node.lock_ref, root_lock_before)
@@ -244,7 +236,9 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
 
         # Transfer fails -> cache_finished_req with is_insert=False
         # This frees delta tokens and dec_lock_ref on last_node
-        cache.cache_finished_req(req, is_insert=False)
+        cache.cache_finished_req(
+            req, is_insert=False, kv_len_to_handle=req.kv_committed_len
+        )
 
         # The prefix node should be unlocked (back to evictable)
         self.assertEqual(cache.root_node.lock_ref, 1)
@@ -289,7 +283,9 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
 
         # Transfer fails -> cache_finished_req with is_insert=False
         # dec_lock_ref(root) is a no-op
-        cache.cache_finished_req(req, is_insert=False)
+        cache.cache_finished_req(
+            req, is_insert=False, kv_len_to_handle=req.kv_committed_len
+        )
 
         # Root lock unchanged, nothing protected or evictable
         self.assertEqual(cache.root_node.lock_ref, root_lock_before)
@@ -400,7 +396,7 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
             )
 
             cache.cache_unfinished_req(req)
-            cache.cache_finished_req(req)
+            cache.cache_finished_req(req, kv_len_to_handle=req.kv_committed_len)
 
         # After all iterations, root lock should be 1, no protected nodes
         self.assertEqual(cache.root_node.lock_ref, 1)
