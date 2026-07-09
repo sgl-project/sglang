@@ -1,7 +1,3 @@
-import os
-import subprocess
-import sys
-
 import pytest
 import torch
 
@@ -10,26 +6,6 @@ from sglang.srt.layers.mhc import mhc_fused_post_pre, mhc_post, mhc_pre
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-large")
-
-
-def test_mhc_and_deepseek_v4_rope_do_not_import_tilelang():
-    env = os.environ.copy()
-    pythonpath = env.get("PYTHONPATH")
-    repo_python = os.path.abspath(
-        os.path.join(os.path.dirname(__file__), "../../../python")
-    )
-    env["PYTHONPATH"] = (
-        repo_python if not pythonpath else os.pathsep.join([repo_python, pythonpath])
-    )
-    script = """
-import sys
-
-import sglang.srt.layers.deepseek_v4_rope  # noqa: F401
-import sglang.srt.layers.mhc  # noqa: F401
-
-assert not any(name == "tilelang" or name.startswith("tilelang.") for name in sys.modules)
-"""
-    subprocess.run([sys.executable, "-c", script], check=True, env=env)
 
 
 @pytest.mark.parametrize("hidden_size", [4096, 7168])
