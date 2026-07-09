@@ -2673,10 +2673,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # attention-layer-collection machinery below applies to it. CPUGraphRunner
         # handles both decode and prefill in one object (see its module
         # docstring); prefill is initialized first, so just construct it here --
-        # init_decode_cuda_graph's CPU branch reuses this same instance.
+        # init_decode_cuda_graph's CPU branch reuses this same instance. Unlike
+        # decode, prefill is meaningful for non-generation (embedding / reward /
+        # classification) models too -- they only ever run EXTEND -- so this
+        # branch deliberately does *not* gate on `self.is_generation` the way
+        # init_decode_cuda_graph does; CPUGraphRunner itself skips building
+        # decode-only state when the model isn't a generation model.
         if self.device == "cpu":
-            if not self.is_generation:
-                return
             if not get_flags().capture.enable_torch_compile:
                 return
             if self.is_draft_worker and not force_for_draft_worker:

@@ -634,6 +634,12 @@ class CPUGraphRunner:
         # Parse args
         self.model_runner = model_runner
         self.device = model_runner.device
+        # Decode steps (and hence decode graphs) only exist for generation
+        # models -- embedding/reward/classification models only ever run
+        # EXTEND. Gate the decode-only setup below on this instead of
+        # skipping construction entirely (that would also deny non-generation
+        # models the prefill graph, which *is* meaningful for them).
+        self.is_generation = model_runner.is_generation
         # bs -> compiled fn (text-only / skip_cross_attention=True)
         self.graphs = {}
         # bs -> compiled fn (cross-attention / skip_cross_attention=False, enc-dec only)
@@ -687,54 +693,71 @@ class CPUGraphRunner:
         assert self.dp_size == 1, "CPUGraphRunner does not support DP yet."
         assert self.pp_size == 1, "CPUGraphRunner does not support PP yet."
 
-        # Batch sizes to capture
-        self.capture_bs = get_batch_sizes_to_capture(model_runner)
-        log_info_on_rank0(logger, f"Capture cpu graph bs {self.capture_bs}")
-        # bs -> ForwardBatch (text-only / skip_cross_attention=True)
-        self.captured_forward_batches = {}
-        # bs -> ForwardBatch (cross-attention / skip=False, enc-dec only)
-        self.captured_forward_batches_cross = {}
-        # Attention backend
-        self.max_bs = max(self.capture_bs)
-        self.max_num_token = self.max_bs * self.num_tokens_per_bs
-        self.model_runner.attn_backend.init_cpu_graph_state(
-            self.max_bs, self.max_num_token
-        )
+        if self.is_generation:
+            # Batch sizes to capture
+            self.capture_bs = get_batch_sizes_to_capture(model_runner)
+            log_info_on_rank0(logger, f"Capture cpu graph bs {self.capture_bs}")
+            # bs -> ForwardBatch (text-only / skip_cross_attention=True)
+            self.captured_forward_batches = {}
+            # bs -> ForwardBatch (cross-attention / skip=False, enc-dec only)
+            self.captured_forward_batches_cross = {}
+            # Attention backend
+            self.max_bs = max(self.capture_bs)
+            self.max_num_token = self.max_bs * self.num_tokens_per_bs
+            self.model_runner.attn_backend.init_cpu_graph_state(
+                self.max_bs, self.max_num_token
+            )
 
-        self.encoder_len_fill_value = 0
-        self.seq_len_fill_value = (
-            self.model_runner.attn_backend.get_cpu_graph_seq_len_fill_value()
-        )
+            self.encoder_len_fill_value = 0
+            self.seq_len_fill_value = (
+                self.model_runner.attn_backend.get_cpu_graph_seq_len_fill_value()
+            )
+        else:
+            # No decode steps for non-generation (embedding/reward/classification)
+            # models -- leave decode state empty; can_run_graph rejects DECODE
+            # mode below and everything falls through to the prefill path.
+            self.capture_bs = []
+            self.captured_forward_batches = {}
+            self.captured_forward_batches_cross = {}
+            self.max_bs = 0
+            self.max_num_token = 0
+            self.encoder_len_fill_value = 0
+            self.seq_len_fill_value = 0
 
         if self.enable_torch_compile:
             register_fake_ops(self.tp_size)
             set_torch_compile_config()
 
-        # Graph inputs
-        with torch.device(self.device):
-            self.input_ids = torch.zeros((self.max_num_token,), dtype=torch.int64)
-            self.req_pool_indices = torch.zeros((self.max_bs,), dtype=torch.int64)
-            self.seq_lens = torch.full(
-                (self.max_bs,), self.seq_len_fill_value, dtype=torch.int64
-            )
-            self.out_cache_loc = torch.zeros((self.max_num_token,), dtype=torch.int64)
-            self.positions = torch.zeros((self.max_num_token,), dtype=torch.int64)
-            self.mrope_positions = torch.zeros((3, self.max_bs), dtype=torch.int64)
-            self.num_token_non_padded = torch.zeros((1,), dtype=torch.int64)
-            self.custom_mask = torch.ones(
-                (
-                    (self.seq_lens.sum().item() + self.max_num_token)
-                    * self.num_tokens_per_bs
-                ),
-                dtype=torch.bool,
-                device=self.device,
-            )
-            if self.is_encoder_decoder:
-                self.encoder_lens = torch.full(
-                    (self.max_bs,), self.encoder_len_fill_value, dtype=torch.int64
+        if self.is_generation:
+            # Graph inputs
+            with torch.device(self.device):
+                self.input_ids = torch.zeros((self.max_num_token,), dtype=torch.int64)
+                self.req_pool_indices = torch.zeros((self.max_bs,), dtype=torch.int64)
+                self.seq_lens = torch.full(
+                    (self.max_bs,), self.seq_len_fill_value, dtype=torch.int64
                 )
-            else:
-                self.encoder_lens = None
+                self.out_cache_loc = torch.zeros(
+                    (self.max_num_token,), dtype=torch.int64
+                )
+                self.positions = torch.zeros((self.max_num_token,), dtype=torch.int64)
+                self.mrope_positions = torch.zeros((3, self.max_bs), dtype=torch.int64)
+                self.num_token_non_padded = torch.zeros((1,), dtype=torch.int64)
+                self.custom_mask = torch.ones(
+                    (
+                        (self.seq_lens.sum().item() + self.max_num_token)
+                        * self.num_tokens_per_bs
+                    ),
+                    dtype=torch.bool,
+                    device=self.device,
+                )
+                if self.is_encoder_decoder:
+                    self.encoder_lens = torch.full(
+                        (self.max_bs,), self.encoder_len_fill_value, dtype=torch.int64
+                    )
+                else:
+                    self.encoder_lens = None
+        else:
+            self.encoder_lens = None
 
         # --- Prefill (EXTEND) graph state -------------------------------
         # bs is NOT the bucket axis here (num_tokens is) -- see class
