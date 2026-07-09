@@ -1556,7 +1556,12 @@ class Indexer(MultiPlatformOp):
                 layer_id=layer_id
             )
             kv_cache = buf.view(-1, page_size, 132).view(fp8_dtype)
-            out_loc = forward_batch.out_cache_loc
+            out_loc = out_cache_loc
+            assert out_loc is not None, "DSA indexer cache store requires out_cache_loc"
+            assert out_loc.numel() == key.shape[0], (
+                f"DSA indexer cache store got out_cache_loc tokens={out_loc.numel()} "
+                f"but key tokens={key.shape[0]}"
+            )
             if not out_loc.is_contiguous():
                 out_loc = out_loc.contiguous()
             indexer_k_quant_and_cache(

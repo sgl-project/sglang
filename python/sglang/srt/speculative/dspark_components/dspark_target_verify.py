@@ -70,12 +70,13 @@ class TargetVerifyExecutor:
         seq_lens_cpu_backup = batch.seq_lens_cpu
         seq_lens_sum_backup = batch.seq_lens_sum
         if not self._verify_backend_self_adds_seq_lens():
-            if seq_lens_cpu_backup is not None:
-                batch.seq_lens_cpu = seq_lens_cpu_backup + verify_w
-                batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
-            elif draft_input.reserved_seq_lens_cpu is not None:
-                batch.seq_lens_cpu = draft_input.reserved_seq_lens_cpu
-                batch.seq_lens_sum = int(draft_input.reserved_seq_lens_sum)
+            base_seq_lens_cpu = (
+                seq_lens_cpu_backup
+                if seq_lens_cpu_backup is not None
+                else batch.seq_lens.cpu()
+            )
+            batch.seq_lens_cpu = base_seq_lens_cpu
+            batch.seq_lens_sum = int(base_seq_lens_cpu.sum())
 
         verify_forward_batch, _ = verify_input.prepare_for_verify(
             batch, self.target_worker
@@ -156,16 +157,14 @@ class TargetVerifyExecutor:
         batch.out_cache_loc = ragged_window.verify_cache_loc
         seq_lens_cpu_backup = batch.seq_lens_cpu
         seq_lens_sum_backup = batch.seq_lens_sum
-        if seq_lens_cpu_backup is not None:
-            verify_lens_cpu = (
-                layout.verify_lens_cpu
-                if layout.verify_lens_cpu is not None
-                else layout.verify_lens.cpu().tolist()
+        if not self._verify_backend_self_adds_seq_lens():
+            base_seq_lens_cpu = (
+                seq_lens_cpu_backup
+                if seq_lens_cpu_backup is not None
+                else batch.seq_lens.cpu()
             )
-            batch.seq_lens_cpu = seq_lens_cpu_backup + torch.tensor(
-                verify_lens_cpu, dtype=seq_lens_cpu_backup.dtype
-            )
-            batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+            batch.seq_lens_cpu = base_seq_lens_cpu
+            batch.seq_lens_sum = int(base_seq_lens_cpu.sum())
 
         verify_forward_batch, _ = verify_input.prepare_for_verify(
             batch, self.target_worker

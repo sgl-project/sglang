@@ -28,6 +28,7 @@ from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.cuda_graph_config import cuda_graph_fully_disabled
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_buffer_width,
     draft_kv_indices_used_len,
@@ -148,6 +149,16 @@ class TritonAttnBackend(AttentionBackend):
         self.token_to_kv_pool_allocator = model_runner.token_to_kv_pool_allocator
         self.use_sliding_window_kv_pool = isinstance(self.token_to_kv_pool, SWAKVPool)
         self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
+        if self.num_draft_tokens is not None and model_runner.is_draft_worker:
+            spec_algo = SpeculativeAlgorithm.from_string(
+                model_runner.server_args.speculative_algorithm
+            )
+            if spec_algo.is_dspark():
+                self.num_draft_tokens = (
+                    spec_algo.get_num_tokens_per_bs_for_target_verify(
+                        int(self.num_draft_tokens), is_draft_worker=True
+                    )
+                )
         self.speculative_num_steps = model_runner.server_args.speculative_num_steps
         self.topk = model_runner.server_args.speculative_eagle_topk or 0
         # Split-KV verify matches extend_attention_fwd only when the EAGLE tree

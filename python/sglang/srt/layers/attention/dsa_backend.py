@@ -50,6 +50,7 @@ from sglang.srt.layers.attention.utils import (
     seqlens_expand_triton,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     get_bool_env_var,
     is_cuda,
@@ -407,6 +408,20 @@ class DeepseekSparseAttnBackend(
         self.speculative_num_draft_tokens = (
             model_runner.server_args.speculative_num_draft_tokens
         )
+        if (
+            self.speculative_num_draft_tokens is not None
+            and model_runner.is_draft_worker
+        ):
+            spec_algo = SpeculativeAlgorithm.from_string(
+                model_runner.server_args.speculative_algorithm
+            )
+            if spec_algo.is_dspark():
+                self.speculative_num_draft_tokens = (
+                    spec_algo.get_num_tokens_per_bs_for_target_verify(
+                        int(self.speculative_num_draft_tokens),
+                        is_draft_worker=True,
+                    )
+                )
         self.speculative_step_id = speculative_step_id
 
         self.device_capability = torch.cuda.get_device_capability()
@@ -647,7 +662,14 @@ class DeepseekSparseAttnBackend(
 
         cache_seqlens_int32 = (forward_batch.seq_lens + draft_token_num).to(torch.int32)
         cu_seqlens_k = compute_cu_seqlens(cache_seqlens_int32)
-        if forward_batch.seq_lens_cpu is not None:
+        if forward_batch.forward_mode.is_target_verify():
+            if forward_batch.seq_lens_cpu is not None:
+                max_seqlen_k = int(
+                    forward_batch.seq_lens_cpu.max().item() + draft_token_num
+                )
+            else:
+                max_seqlen_k = int(cache_seqlens_int32.max().item())
+        elif forward_batch.seq_lens_cpu is not None:
             max_seqlen_k = int(
                 forward_batch.seq_lens_cpu.max().item() + draft_token_num
             )
@@ -657,6 +679,12 @@ class DeepseekSparseAttnBackend(
             # eager (e.g. over-capture-bs) fallback needs a length here.
             max_seqlen_k = int(forward_batch.seq_lens.max().item()) + draft_token_num
         # [b, max_seqlen_k]
+        row_width = self.req_to_token_pool.req_to_token.shape[1]
+        assert max_seqlen_k <= row_width, (
+            f"DSA metadata max_seqlen_k={max_seqlen_k} exceeds req_to_token "
+            f"row width={row_width}; mode={forward_batch.forward_mode}, "
+            f"draft_token_num={draft_token_num}."
+        )
         page_table = self.req_to_token_pool.req_to_token[
             forward_batch.req_pool_indices, :max_seqlen_k
         ]
@@ -705,8 +733,25 @@ class DeepseekSparseAttnBackend(
             extend_seq_lens_cpu = [self.speculative_num_draft_tokens] * batch_size
             forward_batch.extend_seq_lens_cpu = extend_seq_lens_cpu
 
+            layout = getattr(forward_batch.spec_info, "ragged_verify_layout", None)
+            if layout is None:
+                expected_out_tokens = batch_size * self.speculative_num_draft_tokens
+                assert (
+                    forward_batch.out_cache_loc is not None
+                    and forward_batch.out_cache_loc.numel() >= expected_out_tokens
+                ), (
+                    f"DSA target verify expects at least {expected_out_tokens} "
+                    f"out_cache_loc entries, got "
+                    f"{None if forward_batch.out_cache_loc is None else forward_batch.out_cache_loc.numel()}."
+                )
+
             seqlens_expanded = seqlens_expand_triton(
-                torch.tensor(extend_seq_lens_cpu, dtype=torch.int32, device=device),
+                torch.full(
+                    (batch_size,),
+                    self.speculative_num_draft_tokens,
+                    dtype=torch.int32,
+                    device=device,
+                ),
                 cache_seqlens_int32,
                 self.speculative_num_draft_tokens * batch_size,
                 self.speculative_num_draft_tokens,
