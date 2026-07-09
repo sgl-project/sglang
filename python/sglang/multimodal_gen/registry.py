@@ -29,6 +29,7 @@ if TYPE_CHECKING:
 
 from sglang.multimodal_gen.configs.pipeline_configs import (
     Cosmos3Config,
+    DreamZeroPipelineConfig,
     FastHunyuanConfig,
     FluxPipelineConfig,
     HeliosDistilledConfig,
@@ -100,6 +101,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     Wan2_2_TI2V_5B_Config,
 )
 from sglang.multimodal_gen.configs.sample.cosmos3 import Cosmos3SamplingParams
+from sglang.multimodal_gen.configs.sample.dreamzero import DreamZeroSamplingParams
 from sglang.multimodal_gen.configs.sample.ernie_image import ErnieImageSamplingParams
 from sglang.multimodal_gen.configs.sample.flux import (
     Flux2KleinBaseSamplingParams,
@@ -643,6 +645,14 @@ def _register_configs():
             lambda hf_id: "pi05" in hf_id.lower(),
             lambda hf_id: "pi0.5" in hf_id.lower(),
         ],
+    )
+
+    # DreamZero
+    register_configs(
+        sampling_param_cls=DreamZeroSamplingParams,
+        pipeline_config_cls=DreamZeroPipelineConfig,
+        hf_model_paths=["nvidia/DreamZero-DROID"],
+        model_detectors=[lambda hf_id: "dreamzero" in hf_id.lower()],
     )
 
     # LTX-2

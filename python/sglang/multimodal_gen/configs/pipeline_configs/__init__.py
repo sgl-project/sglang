@@ -8,6 +8,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.cosmos3 import Cosmos3Config
 from sglang.multimodal_gen.configs.pipeline_configs.diffusers_generic import (
     DiffusersGenericPipelineConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.dreamzero import (
+    DreamZeroPipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.flux import (
     Flux2KleinPipelineConfig,
     Flux2PipelineConfig,
@@ -57,6 +60,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.zimage import ZImagePipeline
 __all__ = [
     "Cosmos3Config",
     "DiffusersGenericPipelineConfig",
+    "DreamZeroPipelineConfig",
     "HeliosDistilledConfig",
     "HeliosMidConfig",
     "HeliosT2VConfig",
