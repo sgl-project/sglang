@@ -61,7 +61,7 @@ from sglang.srt.mem_cache.layout.page_major import (
     mha_entry_bytes,
 )
 from sglang.srt.mem_cache.triton_ops.cache_move import (
-    copy_all_layer_kv_cache_tiled,
+    copy_all_layer_kv_cache_func,
     set_kv_buffer_prefix_valid_tiled,
     store_cache_4d,
 )
@@ -1479,18 +1479,14 @@ class MHATokenToKVPool(KVCache):
         }
 
         dummy_loc = torch.zeros(chunk_upper, dtype=torch.int64, device=self.device)
-        grid = (self.data_ptrs.numel(), self._kv_copy_config["byte_tiles"])
-
-        copy_all_layer_kv_cache_tiled[grid](
+        copy_all_layer_kv_cache_func(
             self.data_ptrs,
             self.data_strides,
             dummy_loc,
             dummy_loc,
             1,
             chunk_upper,
-            BYTES_PER_TILE=self._kv_copy_config["bytes_per_tile"],
-            num_warps=self._kv_copy_config["num_warps"],
-            num_stages=2,
+            self._kv_copy_config,
         )
 
     def _create_buffers(self):
@@ -1998,20 +1994,16 @@ class MHATokenToKVPool(KVCache):
 
         cfg = self._kv_copy_config
         cap = int(cfg.get("num_locs_upper", 256))
-        grid = (self.data_ptrs.numel(), cfg["byte_tiles"])
 
         if N <= cap:
-            upper = next_power_of_2(N)
-            copy_all_layer_kv_cache_tiled[grid](
+            copy_all_layer_kv_cache_func(
                 self.data_ptrs,
                 self.data_strides,
                 tgt_loc,
                 src_loc,
                 N,
-                upper,
-                BYTES_PER_TILE=cfg["bytes_per_tile"],
-                num_warps=cfg["num_warps"],
-                num_stages=2,
+                next_power_of_2(N),
+                cfg,
             )
             return
 
@@ -2019,17 +2011,14 @@ class MHATokenToKVPool(KVCache):
         for start in range(0, N, cap):
             end = min(start + cap, N)
             chunk_len = end - start
-            upper = next_power_of_2(chunk_len)
-            copy_all_layer_kv_cache_tiled[grid](
+            copy_all_layer_kv_cache_func(
                 self.data_ptrs,
                 self.data_strides,
                 tgt_loc[start:end],
                 src_loc[start:end],
                 chunk_len,
-                upper,
-                BYTES_PER_TILE=cfg["bytes_per_tile"],
-                num_warps=cfg["num_warps"],
-                num_stages=2,
+                next_power_of_2(chunk_len),
+                cfg,
             )
 
 
