@@ -528,7 +528,7 @@ class DeepseekV4AttnBackend(
         assert self.topk in [0, 1], "MTP Topk > 1 not supported for DeepSeek V4"
         self.mtp_enabled = self.topk > 0
         self.speculative_num_steps = speculative_num_steps
-        self.speculative_num_draft_tokens: int = (
+        self.speculative_num_draft_tokens: Optional[int] = (
             model_runner.server_args.speculative_num_draft_tokens
         )
         if self.speculative_num_draft_tokens is not None:
@@ -562,7 +562,8 @@ class DeepseekV4AttnBackend(
         if not spec_alg.is_none() and not spec_alg.is_dspark():
             self.needs_cpu_seq_lens = True
         self.sparse_prefill_workspace = SparsePrefillWorkspace(self.device)
-        self._init_verify_bs_buffers()
+        if self.speculative_num_draft_tokens is not None:
+            self._init_verify_bs_buffers()
 
         self.is_dspark_draft = model_runner.is_draft_worker and spec_alg.is_dspark()
 
@@ -788,6 +789,7 @@ class DeepseekV4AttnBackend(
         )
 
     def _init_verify_bs_buffers(self) -> None:
+        assert self.speculative_num_draft_tokens is not None
         num_reqs = self.req_to_token.shape[0]
         self.extend_seq_lens_buffer = torch.full(
             (num_reqs,),
