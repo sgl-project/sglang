@@ -4098,6 +4098,10 @@ class ServerArgs:
         ]:
             # Set attention backend for DeepSeek
             if is_deepseek_dsa(hf_config):  # DeepSeek 3.2/GLM 5
+                # Keep DSA on the legacy top-k path by default until top-k v2
+                # supports all DSA decode shapes safely.
+                envs.SGLANG_OPT_USE_TOPK_V2.set(False)
+
                 if envs.SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.is_set():
                     logger.warning(
                         f"Dense attention kv len threshold is manually set to {envs.SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.get()} for DSA. Caution: This may cause performance regression if the threshold is larger than the index topk of model."
