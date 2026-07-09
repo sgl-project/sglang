@@ -248,6 +248,7 @@ class DeepSeekR1Detector(BaseReasoningFormatDetector):
         force_reasoning: bool = True,
         continue_final_message: bool = False,
         previous_content: str = "",
+        force_nonempty_content: bool = False,
     ):
         # DeepSeek-R1 is assumed to be reasoning until `</think>` token
         super().__init__(
@@ -257,6 +258,7 @@ class DeepSeekR1Detector(BaseReasoningFormatDetector):
             stream_reasoning=stream_reasoning,
             continue_final_message=continue_final_message,
             previous_content=previous_content,
+            force_nonempty_content=force_nonempty_content,
         )
         # https://github.com/sgl-project/sglang/pull/3202#discussion_r1950153599
 
@@ -283,6 +285,7 @@ class Qwen3Detector(BaseReasoningFormatDetector):
         force_reasoning: bool = False,
         continue_final_message: bool = False,
         previous_content: str = "",
+        force_nonempty_content: bool = False,
     ):
         think_excluded_tokens = [
             "<tool_call>",
@@ -303,6 +306,7 @@ class Qwen3Detector(BaseReasoningFormatDetector):
             previous_content=previous_content,
             thinks_internally=True,
             reasoning_default="enable_thinking",
+            force_nonempty_content=force_nonempty_content,
         )
 
 
@@ -321,6 +325,7 @@ class KimiDetector(BaseReasoningFormatDetector):
         force_reasoning: bool = False,
         continue_final_message: bool = False,
         previous_content: str = "",
+        force_nonempty_content: bool = False,
     ):
         super().__init__(
             "◁think▷",
@@ -329,6 +334,7 @@ class KimiDetector(BaseReasoningFormatDetector):
             stream_reasoning=stream_reasoning,
             continue_final_message=continue_final_message,
             previous_content=previous_content,
+            force_nonempty_content=force_nonempty_content,
         )
 
 
@@ -348,6 +354,7 @@ class KimiK2Detector(BaseReasoningFormatDetector):
         force_reasoning: bool = False,
         continue_final_message: bool = False,
         previous_content: str = "",
+        force_nonempty_content: bool = False,
     ):
         think_excluded_tokens = [
             "<think>",
@@ -371,6 +378,7 @@ class KimiK2Detector(BaseReasoningFormatDetector):
             continue_final_message=continue_final_message,
             previous_content=previous_content,
             reasoning_default="thinking",
+            force_nonempty_content=force_nonempty_content,
         )
 
 
@@ -387,7 +395,12 @@ class Glm45Detector(BaseReasoningFormatDetector):
             If True, streams reasoning content as it arrives.
     """
 
-    def __init__(self, stream_reasoning: bool = True, force_reasoning: bool = False):
+    def __init__(
+        self,
+        stream_reasoning: bool = True,
+        force_reasoning: bool = False,
+        force_nonempty_content: bool = False,
+    ):
         think_excluded_tokens = [
             "<tool_call>",
             "</tool_call>",
@@ -404,6 +417,7 @@ class Glm45Detector(BaseReasoningFormatDetector):
             tool_start_token="<tool_call>",
             thinks_internally=True,
             reasoning_default="enable_thinking",
+            force_nonempty_content=force_nonempty_content,
         )
 
 
@@ -418,6 +432,7 @@ class GptOssDetector(BaseReasoningFormatDetector):
         force_reasoning: bool = True,
         continue_final_message: bool = False,
         previous_content: str = "",
+        force_nonempty_content: bool = False,
     ):
         super().__init__(
             "<|channel|>analysis<|message|>",
@@ -426,6 +441,7 @@ class GptOssDetector(BaseReasoningFormatDetector):
             stream_reasoning=stream_reasoning,
             continue_final_message=continue_final_message,
             previous_content=previous_content,
+            force_nonempty_content=force_nonempty_content,
         )
         self.parser = HarmonyParser()
 
@@ -447,9 +463,11 @@ class GptOssDetector(BaseReasoningFormatDetector):
         normal_text = "".join(normal_parts)
         # Tool call events preserve raw text with structural markers
 
-        return StreamingParseResult(
-            normal_text=normal_text,
-            reasoning_text=reasoning_text,
+        return self._apply_force_nonempty_content(
+            StreamingParseResult(
+                normal_text=normal_text,
+                reasoning_text=reasoning_text,
+            )
         )
 
     def parse_streaming_increment(self, new_text: str) -> StreamingParseResult:
@@ -484,6 +502,7 @@ class MiniMaxAppendThinkDetector(BaseReasoningFormatDetector):
         force_reasoning: bool = False,
         continue_final_message: bool = False,
         previous_content: str = "",
+        force_nonempty_content: bool = False,
     ):
         # scheduler.py need `reasoning_parser.detector.think_end_token`
         super().__init__(
@@ -493,6 +512,7 @@ class MiniMaxAppendThinkDetector(BaseReasoningFormatDetector):
             stream_reasoning=stream_reasoning,
             continue_final_message=continue_final_message,
             previous_content=previous_content,
+            force_nonempty_content=force_nonempty_content,
         )
         self.is_first_chunk = False
 
@@ -550,6 +570,7 @@ class MistralDetector(BaseReasoningFormatDetector):
         force_reasoning: bool = False,
         continue_final_message: bool = False,
         previous_content: str = "",
+        force_nonempty_content: bool = False,
     ):
         super().__init__(
             "[THINK]",
@@ -559,6 +580,7 @@ class MistralDetector(BaseReasoningFormatDetector):
             continue_final_message=continue_final_message,
             previous_content=previous_content,
             reasoning_default="mistral",
+            force_nonempty_content=force_nonempty_content,
         )
 
 
@@ -576,6 +598,7 @@ class HunyuanDetector(BaseReasoningFormatDetector):
         continue_final_message: bool = False,
         previous_content: str = "",
         tokenizer=None,
+        force_nonempty_content: bool = False,
     ):
         t = resolve_hunyuan_tokens(tokenizer)
         think_open = t["think"]
@@ -590,6 +613,7 @@ class HunyuanDetector(BaseReasoningFormatDetector):
             tool_start_token=t["tool_calls"],
             continue_final_message=continue_final_message,
             previous_content=previous_content,
+            force_nonempty_content=force_nonempty_content,
         )
 
 
@@ -602,6 +626,7 @@ class Gemma4Detector(BaseReasoningFormatDetector):
         force_reasoning: bool = False,
         continue_final_message: bool = False,
         previous_content: str = "",
+        force_nonempty_content: bool = False,
     ):
         super().__init__(
             "<|channel>",
@@ -611,6 +636,7 @@ class Gemma4Detector(BaseReasoningFormatDetector):
             continue_final_message=continue_final_message,
             previous_content=previous_content,
             reasoning_default="explicit_enable_thinking",
+            force_nonempty_content=force_nonempty_content,
         )
         self.think_start_self_label = "thought\n"
 
@@ -894,6 +920,7 @@ class CohereCommand4Detector(BaseReasoningFormatDetector):
         force_reasoning: bool = True,
         continue_final_message: bool = False,
         previous_content: str = "",
+        force_nonempty_content: bool = False,
     ):
         # The chat template puts <|START_THINKING|> in the assistant prefix
         # when reasoning is enabled, so the *generated* text usually starts
@@ -907,6 +934,7 @@ class CohereCommand4Detector(BaseReasoningFormatDetector):
             stream_reasoning=stream_reasoning,
             continue_final_message=continue_final_message,
             previous_content=previous_content,
+            force_nonempty_content=force_nonempty_content,
         )
         # Streaming state machine. The model emits, in order:
         #   1. reasoning  (between START_THINKING [in prefix] and END_THINKING)
@@ -985,9 +1013,11 @@ class CohereCommand4Detector(BaseReasoningFormatDetector):
         if reasoning.startswith(think_start_text):
             reasoning = reasoning[len(think_start_text) :]
 
-        return StreamingParseResult(
-            normal_text=self._strip_text_markers(rest),
-            reasoning_text=reasoning,
+        return self._apply_force_nonempty_content(
+            StreamingParseResult(
+                normal_text=self._strip_text_markers(rest),
+                reasoning_text=reasoning,
+            )
         )
 
     def parse_streaming_increment(self, new_text: str) -> StreamingParseResult:
