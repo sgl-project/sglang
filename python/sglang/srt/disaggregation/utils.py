@@ -668,6 +668,7 @@ def setup_state_kv_args(
     from sglang.srt.disaggregation.base.conn import StateType
     from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
     from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
+    from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
     from sglang.srt.mem_cache.memory_pool import (
         DSATokenToKVPool,
         HybridLinearKVPool,
@@ -756,6 +757,82 @@ def setup_state_kv_args(
                 append_state_component(
                     kv_args, StateType.DSA, data_ptrs, data_lens, item_lens
                 )
+
+    # DSV4 NextN shares the target allocator, so target and draft use the same
+    # local SWA indices. Keep draft buffers in a separate positional component
+    # to avoid mixing them into the target's heterogeneous state layout, while
+    # reusing the existing SWA transport dispatch. NPU has a different paged
+    # state layout and is intentionally left unchanged.
+    if (
+        not is_npu()
+        and isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
+        and isinstance(draft_token_to_kv_pool, DeepSeekV4TokenToKVPool)
+    ):
+        if not draft_token_to_kv_pool.compression_ratios or not all(
+            ratio == 0 for ratio in draft_token_to_kv_pool.compression_ratios
+        ):
+            raise RuntimeError(
+                "DSV4 draft state transfer expects SWA-only NextN layers"
+            )
+        if token_to_kv_pool._unified_kv != draft_token_to_kv_pool._unified_kv:
+            raise RuntimeError(
+                "DSV4 target and draft pools must use the same unified-KV mode"
+            )
+
+        if token_to_kv_pool._unified_kv:
+            target_geometry = (
+                token_to_kv_pool.unified_swa_window,
+                token_to_kv_pool.unified_swa_ring_size,
+                token_to_kv_pool.unified_swa_pages,
+            )
+            draft_geometry = (
+                draft_token_to_kv_pool.unified_swa_window,
+                draft_token_to_kv_pool.unified_swa_ring_size,
+                draft_token_to_kv_pool.unified_swa_pages,
+            )
+            if target_geometry != draft_geometry:
+                raise RuntimeError(
+                    "DSV4 target and draft pools must share SWA ring geometry: "
+                    f"target={target_geometry}, draft={draft_geometry}"
+                )
+            draft_ptrs, draft_lens, draft_item_lens = (
+                draft_token_to_kv_pool.get_unified_swa_ring_buf_infos()
+            )
+            draft_state_type = StateType.SWA_RING
+        else:
+            if (
+                token_to_kv_pool.full_to_swa_index_mapping
+                is not draft_token_to_kv_pool.full_to_swa_index_mapping
+            ):
+                raise RuntimeError(
+                    "DSV4 target and draft pools must share the SWA index mapping"
+                )
+            target_geometry = (
+                token_to_kv_pool.page_size,
+                token_to_kv_pool.sliding_window,
+            )
+            draft_geometry = (
+                draft_token_to_kv_pool.page_size,
+                draft_token_to_kv_pool.sliding_window,
+            )
+            if target_geometry != draft_geometry:
+                raise RuntimeError(
+                    "DSV4 target and draft pools must share paged SWA geometry: "
+                    f"target={target_geometry}, draft={draft_geometry}"
+                )
+            draft_ptrs, draft_lens, draft_item_lens = (
+                draft_token_to_kv_pool.get_state_buf_infos()
+            )
+            draft_state_type = StateType.SWA
+
+        if draft_ptrs:
+            append_state_component(
+                kv_args,
+                draft_state_type,
+                draft_ptrs,
+                draft_lens,
+                draft_item_lens,
+            )
 
     if (
         StateType.MAMBA not in kv_args.state_types
