@@ -713,6 +713,7 @@ class DeepseekV2MoE(nn.Module):
             # not divisible by the global TP size.
             _shared_expert_use_tp1 = (
                 get_moe_a2a_backend().is_deepep()
+                or get_moe_a2a_backend().is_pplx()
                 or get_moe_a2a_backend().is_mooncake()
                 or get_moe_a2a_backend().is_nixl()
                 or get_moe_a2a_backend().is_mori()
