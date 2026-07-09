@@ -17,6 +17,9 @@ from sglang.jit_kernel.diffusion.triton.varlen_pack_pad import (
     fused_scatter_to_padded,
 )
 from sglang.jit_kernel.flash_attention import flash_attn_varlen_func
+from sglang.multimodal_gen.runtime.breakable_cuda_graph.replay_token import (
+    get_current_replay_token,
+)
 from sglang.multimodal_gen.runtime.distributed.communication_op import (
     sequence_model_parallel_all_gather,
     sequence_model_parallel_all_to_all_4D,
@@ -53,9 +56,6 @@ from sglang.multimodal_gen.runtime.managers.forward_context import (
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.utils import get_compute_dtype
-from sglang.multimodal_gen.runtime.breakable_cuda_graph.replay_token import (
-    get_current_replay_token,
-)
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
     is_in_breakable_cuda_graph,
@@ -1194,9 +1194,7 @@ class _BCGBoxedTupleOutput:
             setattr(self, f"value_{i}", value)
 
     def astuple(self) -> tuple:
-        return tuple(
-            getattr(self, f"value_{i}") for i in range(self.num_values)
-        )
+        return tuple(getattr(self, f"value_{i}") for i in range(self.num_values))
 
 
 def _make_breakable_attention_forward(forward_method):
@@ -1209,6 +1207,7 @@ def _make_breakable_attention_forward(forward_method):
     cannot (or should not) be captured into a static CUDA graph. When BCG is
     disabled this is a transparent pass-through to the original method.
     """
+
     def _forward_boxing_tuples(*args, **kwargs):
         out = forward_method(*args, **kwargs)
         return _BCGBoxedTupleOutput(out) if isinstance(out, tuple) else out
@@ -1219,9 +1218,7 @@ def _make_breakable_attention_forward(forward_method):
     def forward(self, *args, **kwargs):
         if is_in_breakable_cuda_graph():
             out = bcg_forward(self, *args, **kwargs)
-            return (
-                out.astuple() if isinstance(out, _BCGBoxedTupleOutput) else out
-            )
+            return out.astuple() if isinstance(out, _BCGBoxedTupleOutput) else out
         return forward_method(self, *args, **kwargs)
 
     return forward
