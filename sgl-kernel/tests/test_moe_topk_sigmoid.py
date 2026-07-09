@@ -6,6 +6,7 @@ import torch
 from sgl_kernel import topk_sigmoid
 
 _IS_HIP = torch.version.hip is not None
+# ci-trigger: no-op, forces sgl-kernel path gate for do-not-merge PR
 
 
 @pytest.fixture(autouse=True)
