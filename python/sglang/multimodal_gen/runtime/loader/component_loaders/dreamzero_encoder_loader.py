@@ -8,16 +8,18 @@ implementations and copy checkpoint tensors into matching state_dict keys.
 
 from __future__ import annotations
 
-import json
 import os
-from collections.abc import Iterator
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 import torch
-from safetensors.torch import safe_open
 from torch import nn
+
+from sglang.multimodal_gen.runtime.loader.component_loaders.dreamzero_checkpoint_utils import (
+    DreamZeroCheckpointLoadReport,
+    iter_prefixed_safetensors,
+    load_matching_tensors,
+    raise_for_strict_report,
+)
 
 _DROID_TEXT_ENCODER_PREFIX = "action_head.text_encoder."
 _DROID_IMAGE_ENCODER_PREFIX = "action_head.image_encoder."
@@ -25,81 +27,8 @@ _WAN_TEXT_ENCODER_NAME = "models_t5_umt5-xxl-enc-bf16.pth"
 _WAN_IMAGE_ENCODER_NAME = "models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth"
 
 
-@dataclass
-class DreamZeroEncoderLoadReport:
-    loaded_keys: list[str]
-    missing_keys: list[str]
-    unexpected_keys: list[str]
-    shape_mismatches: dict[str, tuple[tuple[int, ...], tuple[int, ...]]]
-    fallback_impl: str
-
-    @property
-    def loaded_count(self) -> int:
-        return len(self.loaded_keys)
-
-    @property
-    def missing_count(self) -> int:
-        return len(self.missing_keys)
-
-    @property
-    def unexpected_count(self) -> int:
-        return len(self.unexpected_keys)
-
-    @property
-    def shape_mismatch_count(self) -> int:
-        return len(self.shape_mismatches)
-
-    def as_dict(self) -> dict[str, Any]:
-        return {
-            "fallback_impl": self.fallback_impl,
-            "loaded_count": self.loaded_count,
-            "missing_count": self.missing_count,
-            "unexpected_count": self.unexpected_count,
-            "shape_mismatch_count": self.shape_mismatch_count,
-            "missing_keys": self.missing_keys,
-            "unexpected_keys": self.unexpected_keys,
-            "shape_mismatches": {
-                key: {"target": target, "checkpoint": checkpoint}
-                for key, (target, checkpoint) in self.shape_mismatches.items()
-            },
-        }
-
-
-def _iter_prefixed_safetensors(
-    model_path: str | os.PathLike[str],
-    prefix: str,
-) -> Iterator[tuple[str, torch.Tensor]]:
-    model_dir = Path(model_path)
-    index_path = model_dir / "model.safetensors.index.json"
-    with index_path.open() as f:
-        weight_map = json.load(f)["weight_map"]
-
-    files: list[str] = []
-    seen_files: set[str] = set()
-    for key, file_name in weight_map.items():
-        if not key.startswith(prefix) or file_name in seen_files:
-            continue
-        seen_files.add(file_name)
-        files.append(file_name)
-
-    for file_name in files:
-        file_path = model_dir / file_name
-        with safe_open(file_path, framework="pt", device="cpu") as handle:
-            for checkpoint_key in handle.keys():
-                if checkpoint_key.startswith(prefix):
-                    yield checkpoint_key, handle.get_tensor(checkpoint_key)
-
-
-def _assign_tensor(model: nn.Module, name: str, tensor: torch.Tensor) -> None:
-    parent_name, _, leaf_name = name.rpartition(".")
-    parent = model.get_submodule(parent_name) if parent_name else model
-    if leaf_name in parent._parameters:
-        parent._parameters[leaf_name] = nn.Parameter(tensor, requires_grad=False)
-        return
-    if leaf_name in parent._buffers:
-        parent._buffers[leaf_name] = tensor
-        return
-    raise KeyError(f"{name} is neither a parameter nor a buffer")
+class DreamZeroEncoderLoadReport(DreamZeroCheckpointLoadReport):
+    include_fallback_impl = True
 
 
 def _resolve_named_pth(
@@ -124,40 +53,18 @@ def _load_plain_pth_checkpoint(
     fallback_impl: str,
 ) -> DreamZeroEncoderLoadReport:
     state_dict = torch.load(checkpoint_path, map_location="cpu")
-    meta_sd = model.state_dict()
-    loaded_keys: list[str] = []
-    unexpected_keys: list[str] = []
-    shape_mismatches: dict[str, tuple[tuple[int, ...], tuple[int, ...]]] = {}
-
-    with torch.no_grad():
-        for checkpoint_key, full_tensor in state_dict.items():
-            meta_tensor = meta_sd.get(checkpoint_key)
-            if meta_tensor is None:
-                unexpected_keys.append(checkpoint_key)
-                continue
-            if tuple(full_tensor.shape) != tuple(meta_tensor.shape):
-                shape_mismatches[checkpoint_key] = (
-                    tuple(meta_tensor.shape),
-                    tuple(full_tensor.shape),
-                )
-                continue
-            target_tensor = full_tensor.to(device=device, dtype=meta_tensor.dtype)
-            _assign_tensor(model, checkpoint_key, target_tensor)
-            loaded_keys.append(checkpoint_key)
-
-    report = DreamZeroEncoderLoadReport(
-        loaded_keys=loaded_keys,
-        missing_keys=sorted(set(meta_sd) - set(loaded_keys)),
-        unexpected_keys=unexpected_keys,
-        shape_mismatches=shape_mismatches,
+    report = load_matching_tensors(
+        model,
+        state_dict.items(),
+        device=device,
+        report_cls=DreamZeroEncoderLoadReport,
         fallback_impl=fallback_impl,
     )
-    if strict and (
-        report.missing_keys or report.unexpected_keys or report.shape_mismatches
-    ):
-        raise RuntimeError(
-            f"DreamZero encoder checkpoint load failed: {report.as_dict()}"
-        )
+    raise_for_strict_report(
+        report,
+        strict=strict,
+        error_prefix="DreamZero encoder checkpoint load failed",
+    )
     return report
 
 
@@ -170,41 +77,19 @@ def _load_prefixed_checkpoint(
     strict: bool,
     fallback_impl: str,
 ) -> DreamZeroEncoderLoadReport:
-    meta_sd = model.state_dict()
-    loaded_keys: list[str] = []
-    unexpected_keys: list[str] = []
-    shape_mismatches: dict[str, tuple[tuple[int, ...], tuple[int, ...]]] = {}
-
-    with torch.no_grad():
-        for checkpoint_key, full_tensor in _iter_prefixed_safetensors(model_path, prefix):
-            target_name = checkpoint_key[len(prefix) :]
-            meta_tensor = meta_sd.get(target_name)
-            if meta_tensor is None:
-                unexpected_keys.append(target_name)
-                continue
-            if tuple(full_tensor.shape) != tuple(meta_tensor.shape):
-                shape_mismatches[target_name] = (
-                    tuple(meta_tensor.shape),
-                    tuple(full_tensor.shape),
-                )
-                continue
-            target_tensor = full_tensor.to(device=device, dtype=meta_tensor.dtype)
-            _assign_tensor(model, target_name, target_tensor)
-            loaded_keys.append(target_name)
-
-    report = DreamZeroEncoderLoadReport(
-        loaded_keys=loaded_keys,
-        missing_keys=sorted(set(meta_sd) - set(loaded_keys)),
-        unexpected_keys=unexpected_keys,
-        shape_mismatches=shape_mismatches,
+    report = load_matching_tensors(
+        model,
+        iter_prefixed_safetensors(model_path, prefix),
+        device=device,
+        key_mapper=lambda checkpoint_key: checkpoint_key[len(prefix) :],
+        report_cls=DreamZeroEncoderLoadReport,
         fallback_impl=fallback_impl,
     )
-    if strict and (
-        report.missing_keys or report.unexpected_keys or report.shape_mismatches
-    ):
-        raise RuntimeError(
-            f"DreamZero encoder checkpoint load failed: {report.as_dict()}"
-        )
+    raise_for_strict_report(
+        report,
+        strict=strict,
+        error_prefix="DreamZero encoder checkpoint load failed",
+    )
     return report
 
 

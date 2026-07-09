@@ -9,21 +9,23 @@ module layout.
 
 from __future__ import annotations
 
-import json
 import os
-from collections.abc import Iterator
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import torch
-from safetensors.torch import safe_open
 from torch import nn
 
 from sglang.multimodal_gen.configs.models.vaes.wanvae import WanVAEConfig
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     ComponentLoader,
+)
+from sglang.multimodal_gen.runtime.loader.component_loaders.dreamzero_checkpoint_utils import (
+    DreamZeroCheckpointLoadReport,
+    iter_prefixed_safetensors,
+    load_matching_tensors,
+    raise_for_strict_report,
 )
 from sglang.multimodal_gen.runtime.loader.component_loaders.dreamzero_config import (
     dreamzero_vae_runtime_config_from_checkpoint_config,
@@ -39,44 +41,8 @@ _WAN22_VAE_NAME = "Wan2.2_VAE.pth"
 _WAN21_VAE_NAME = "Wan2.1_VAE.pth"
 
 
-@dataclass
-class DreamZeroVAELoadReport:
-    loaded_keys: list[str]
-    missing_keys: list[str]
-    unexpected_keys: list[str]
-    shape_mismatches: dict[str, tuple[tuple[int, ...], tuple[int, ...]]]
-    fallback_impl: str | None = None
-
-    @property
-    def loaded_count(self) -> int:
-        return len(self.loaded_keys)
-
-    @property
-    def missing_count(self) -> int:
-        return len(self.missing_keys)
-
-    @property
-    def unexpected_count(self) -> int:
-        return len(self.unexpected_keys)
-
-    @property
-    def shape_mismatch_count(self) -> int:
-        return len(self.shape_mismatches)
-
-    def as_dict(self) -> dict[str, Any]:
-        return {
-            "fallback_impl": self.fallback_impl,
-            "loaded_count": self.loaded_count,
-            "missing_count": self.missing_count,
-            "unexpected_count": self.unexpected_count,
-            "shape_mismatch_count": self.shape_mismatch_count,
-            "missing_keys": self.missing_keys,
-            "unexpected_keys": self.unexpected_keys,
-            "shape_mismatches": {
-                key: {"target": target, "checkpoint": checkpoint}
-                for key, (target, checkpoint) in self.shape_mismatches.items()
-            },
-        }
+class DreamZeroVAELoadReport(DreamZeroCheckpointLoadReport):
+    include_fallback_impl = True
 
 
 def _map_residual_block_key(key: str) -> str:
@@ -151,30 +117,6 @@ def remap_dreamzero_vae_checkpoint_key(checkpoint_key: str) -> str | None:
     return remap_dreamzero_vae_model_key(checkpoint_key[len(_DROID_VAE_PREFIX) :])
 
 
-def _iter_indexed_safetensors(
-    model_path: str | os.PathLike[str],
-) -> Iterator[tuple[str, torch.Tensor]]:
-    model_dir = Path(model_path)
-    index_path = model_dir / "model.safetensors.index.json"
-    with index_path.open() as f:
-        weight_map = json.load(f)["weight_map"]
-
-    files: list[str] = []
-    seen_files: set[str] = set()
-    for key, file_name in weight_map.items():
-        if not key.startswith(_DROID_VAE_PREFIX) or file_name in seen_files:
-            continue
-        seen_files.add(file_name)
-        files.append(file_name)
-
-    for file_name in files:
-        file_path = model_dir / file_name
-        with safe_open(file_path, framework="pt", device="cpu") as handle:
-            for checkpoint_key in handle.keys():
-                if checkpoint_key.startswith(_DROID_VAE_PREFIX):
-                    yield checkpoint_key, handle.get_tensor(checkpoint_key)
-
-
 def _resolve_wan_vae_pth(model_path: str | os.PathLike[str]) -> Path | None:
     path = Path(model_path)
     if path.is_file() and path.suffix == ".pth":
@@ -184,18 +126,6 @@ def _resolve_wan_vae_pth(model_path: str | os.PathLike[str]) -> Path | None:
         if candidate.is_file():
             return candidate
     return None
-
-
-def _assign_tensor(model: nn.Module, name: str, tensor: torch.Tensor) -> None:
-    parent_name, _, leaf_name = name.rpartition(".")
-    parent = model.get_submodule(parent_name) if parent_name else model
-    if leaf_name in parent._parameters:
-        parent._parameters[leaf_name] = nn.Parameter(tensor, requires_grad=False)
-        return
-    if leaf_name in parent._buffers:
-        parent._buffers[leaf_name] = tensor
-        return
-    raise KeyError(f"{name} is neither a parameter nor a buffer")
 
 
 def build_dreamzero_vae(
@@ -223,43 +153,18 @@ def load_dreamzero_vae_checkpoint(
     device: torch.device,
     strict: bool = False,
 ) -> DreamZeroVAELoadReport:
-    meta_sd = model.state_dict()
-    loaded_keys: list[str] = []
-    unexpected_keys: list[str] = []
-    shape_mismatches: dict[str, tuple[tuple[int, ...], tuple[int, ...]]] = {}
-
-    with torch.no_grad():
-        for checkpoint_key, full_tensor in _iter_indexed_safetensors(model_path):
-            target_name = remap_dreamzero_vae_checkpoint_key(checkpoint_key)
-            if target_name is None:
-                continue
-            meta_tensor = meta_sd.get(target_name)
-            if meta_tensor is None:
-                unexpected_keys.append(target_name)
-                continue
-
-            if tuple(full_tensor.shape) != tuple(meta_tensor.shape):
-                shape_mismatches[target_name] = (
-                    tuple(meta_tensor.shape),
-                    tuple(full_tensor.shape),
-                )
-                continue
-
-            target_tensor = full_tensor.to(device=device, dtype=meta_tensor.dtype)
-            _assign_tensor(model, target_name, target_tensor)
-            loaded_keys.append(target_name)
-
-    missing_keys = sorted(set(meta_sd) - set(loaded_keys))
-    report = DreamZeroVAELoadReport(
-        loaded_keys=loaded_keys,
-        missing_keys=missing_keys,
-        unexpected_keys=unexpected_keys,
-        shape_mismatches=shape_mismatches,
+    report = load_matching_tensors(
+        model,
+        iter_prefixed_safetensors(model_path, _DROID_VAE_PREFIX),
+        device=device,
+        key_mapper=remap_dreamzero_vae_checkpoint_key,
+        report_cls=DreamZeroVAELoadReport,
     )
-    if strict and (
-        report.missing_keys or report.unexpected_keys or report.shape_mismatches
-    ):
-        raise RuntimeError(f"DreamZero VAE checkpoint load failed: {report.as_dict()}")
+    raise_for_strict_report(
+        report,
+        strict=strict,
+        error_prefix="DreamZero VAE checkpoint load failed",
+    )
     return report
 
 
@@ -320,7 +225,9 @@ def build_dreamzero_vae_from_checkpoint(
     unexpected_keys: list[str] = []
     shape_mismatches: dict[str, tuple[tuple[int, ...], tuple[int, ...]]] = {}
     with torch.no_grad():
-        for checkpoint_key, full_tensor in _iter_indexed_safetensors(model_path):
+        for checkpoint_key, full_tensor in iter_prefixed_safetensors(
+            model_path, _DROID_VAE_PREFIX
+        ):
             target_name = checkpoint_key[len(_DROID_VAE_PREFIX) :]
             target = parameters.get(target_name)
             if target is None:
@@ -335,9 +242,7 @@ def build_dreamzero_vae_from_checkpoint(
                     tuple(full_tensor.shape),
                 )
                 continue
-            target.copy_(
-                full_tensor.to(device=target.device, dtype=target.dtype)
-            )
+            target.copy_(full_tensor.to(device=target.device, dtype=target.dtype))
             loaded_keys.append(target_name)
 
     report = DreamZeroVAELoadReport(

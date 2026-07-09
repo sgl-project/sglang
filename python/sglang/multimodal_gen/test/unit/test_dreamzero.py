@@ -31,6 +31,10 @@ from sglang.multimodal_gen.runtime.models.encoders.dreamzero_text import (
     WanTextEncoder,
     WanTextEncoderStateDictConverter,
 )
+from sglang.multimodal_gen.runtime.loader.component_loaders.dreamzero_checkpoint_utils import (
+    DreamZeroCheckpointLoadReport,
+    load_matching_tensors,
+)
 from sglang.multimodal_gen.runtime.pipelines.dreamzero_pipeline import DreamZeroPipeline
 from sglang.multimodal_gen.runtime.pipelines_core.stages.dreamzero.text_encoding import (
     DreamZeroTextEncodingStage,
@@ -251,6 +255,40 @@ def test_dreamzero_text_encoding_masks_padding_without_python_seq_len_sync():
         output[1, :3],
         torch.tensor([[8, 9], [10, 11], [12, 13]], dtype=torch.bfloat16),
     )
+
+
+def test_dreamzero_checkpoint_helper_loads_parameters_buffers_and_reports_errors():
+    class Report(DreamZeroCheckpointLoadReport):
+        include_fallback_impl = True
+
+    class SmallModule(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.zeros(2, 2))
+            self.mismatch = torch.nn.Parameter(torch.zeros(2))
+            self.register_buffer("scale", torch.zeros(2))
+
+    model = SmallModule()
+    report = load_matching_tensors(
+        model,
+        [
+            ("prefix.weight", torch.ones(2, 2)),
+            ("prefix.scale", torch.ones(2) * 2),
+            ("prefix.mismatch", torch.ones(3)),
+            ("prefix.unused", torch.ones(1)),
+        ],
+        device=torch.device("cpu"),
+        key_mapper=lambda key: key.removeprefix("prefix."),
+        report_cls=Report,
+        fallback_impl="test.Loader",
+    )
+
+    assert torch.equal(model.weight, torch.ones(2, 2))
+    assert torch.equal(model.scale, torch.ones(2) * 2)
+    assert report.loaded_keys == ["weight", "scale"]
+    assert report.unexpected_keys == ["unused"]
+    assert report.shape_mismatches == {"mismatch": ((2,), (3,))}
+    assert report.as_dict()["fallback_impl"] == "test.Loader"
 
 
 def test_dreamzero_encoder_converters_and_lightweight_text_forward():

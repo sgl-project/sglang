@@ -11,7 +11,6 @@ from __future__ import annotations
 import json
 import os
 from collections.abc import Iterator
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +21,10 @@ from torch import nn
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     ComponentLoader,
+)
+from sglang.multimodal_gen.runtime.loader.component_loaders.dreamzero_checkpoint_utils import (
+    DreamZeroCheckpointLoadReport,
+    assign_tensor,
 )
 from sglang.multimodal_gen.runtime.loader.component_loaders.dreamzero_config import (
     dreamzero_dit_init_kwargs_from_checkpoint_config,
@@ -42,42 +45,8 @@ _WAN_DIT_INDEX_NAME = "diffusion_pytorch_model.safetensors.index.json"
 _WAN_DIT_SINGLE_NAME = "diffusion_pytorch_model.safetensors"
 
 
-@dataclass
-class DreamZeroDiTLoadReport:
-    loaded_keys: list[str]
-    missing_keys: list[str]
-    unexpected_keys: list[str]
-    shape_mismatches: dict[str, tuple[tuple[int, ...], tuple[int, ...]]]
-
-    @property
-    def loaded_count(self) -> int:
-        return len(self.loaded_keys)
-
-    @property
-    def missing_count(self) -> int:
-        return len(self.missing_keys)
-
-    @property
-    def unexpected_count(self) -> int:
-        return len(self.unexpected_keys)
-
-    @property
-    def shape_mismatch_count(self) -> int:
-        return len(self.shape_mismatches)
-
-    def as_dict(self) -> dict[str, Any]:
-        return {
-            "loaded_count": self.loaded_count,
-            "missing_count": self.missing_count,
-            "unexpected_count": self.unexpected_count,
-            "shape_mismatch_count": self.shape_mismatch_count,
-            "missing_keys": self.missing_keys,
-            "unexpected_keys": self.unexpected_keys,
-            "shape_mismatches": {
-                key: {"target": target, "checkpoint": checkpoint}
-                for key, (target, checkpoint) in self.shape_mismatches.items()
-            },
-        }
+class DreamZeroDiTLoadReport(DreamZeroCheckpointLoadReport):
+    pass
 
 
 def remap_dreamzero_dit_key(checkpoint_key: str) -> str | None:
@@ -173,18 +142,6 @@ def _copy_weight_loader_attrs(src: torch.Tensor, dst: torch.Tensor) -> None:
             setattr(dst, attr, getattr(src, attr))
 
 
-def _assign_tensor(model: nn.Module, name: str, tensor: torch.Tensor) -> None:
-    parent_name, _, leaf_name = name.rpartition(".")
-    parent = model.get_submodule(parent_name) if parent_name else model
-    if leaf_name in parent._parameters:
-        parent._parameters[leaf_name] = nn.Parameter(tensor, requires_grad=False)
-        return
-    if leaf_name in parent._buffers:
-        parent._buffers[leaf_name] = tensor
-        return
-    raise KeyError(f"{name} is neither a parameter nor a buffer")
-
-
 def _materialize_rope_tensors(model: DreamZeroCausalWanModel, device: torch.device) -> None:
     head_dim = model.dim // model.num_heads
     model.freqs_action = rope_params(1024 * 10, head_dim).to(device)
@@ -245,7 +202,7 @@ def load_dreamzero_dit_checkpoint(
                 )
                 continue
 
-            _assign_tensor(model, target_name, target_tensor)
+            assign_tensor(model, target_name, target_tensor)
             loaded_keys.append(target_name)
 
     missing_keys = sorted(set(meta_sd) - set(loaded_keys))
