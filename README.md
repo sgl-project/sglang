@@ -9,6 +9,8 @@
   <a href="https://huggingface.co/trymirai/weaver"><img src="https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Weaver-FFD21E?style=for-the-badge" alt="Hugging Face"></a>
 </p>
 
+---
+
 <p align="center">
   <img src="assets/tfm-throughput.png" alt="Per-dataset Qwen3.6-27B throughput comparison for autoregressive decoding, DFlash, DDTree, and DFlash-TfM." width="760">
 </p>
