@@ -27,6 +27,9 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_sp_world_size,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
+from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils import (
+    get_or_create_request_scheduler,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
@@ -39,6 +42,12 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.post_training.rollout_denoising_mixin import (
+    RolloutDenoisingMixin,
+)
+from sglang.multimodal_gen.runtime.post_training.rollout_timestep_mixin import (
+    RolloutTimestepPreparationMixin,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
@@ -313,6 +322,8 @@ class Cosmos3LatentPreparationStage(PipelineStage):
         generator = batch.generator
         if generator is None and batch.seed is not None:
             generator = torch.Generator(device=device).manual_seed(batch.seed)
+            # The rollout SDE step draws its variance noise from this generator.
+            batch.generator = generator
 
         noise = torch.randn(shape, generator=generator, device=device, dtype=dtype)
 
@@ -350,7 +361,7 @@ class Cosmos3LatentPreparationStage(PipelineStage):
         return batch
 
 
-class Cosmos3TimestepPreparationStage(PipelineStage):
+class Cosmos3TimestepPreparationStage(PipelineStage, RolloutTimestepPreparationMixin):
     """
     Timestep preparation stage for Cosmos3.
 
@@ -359,12 +370,15 @@ class Cosmos3TimestepPreparationStage(PipelineStage):
 
     parallelism_type = StageParallelismType.REPLICATED
 
-    def __init__(self, scheduler):
+    def __init__(self, scheduler, rollout_scheduler_factory=None):
         super().__init__()
         self.scheduler = scheduler
         self.default_flow_shift = getattr(
             getattr(scheduler, "config", None), "flow_shift", None
         )
+        # See RolloutTimestepPreparationMixin.
+        self.rollout_scheduler_factory = rollout_scheduler_factory
+        self._rollout_scheduler = None
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         """Prepare scheduler timesteps."""
@@ -381,13 +395,34 @@ class Cosmos3TimestepPreparationStage(PipelineStage):
         self.scheduler.set_timesteps(num_inference_steps, device=device)
         batch.timesteps = self.scheduler.timesteps
 
+        rollout_template = self._resolve_rollout_scheduler(batch)
+        if rollout_template is not None:
+            scheduler = get_or_create_request_scheduler(batch, rollout_template)
+            explicit_shift = getattr(batch, "flow_shift", None)
+            if explicit_shift is None:
+                explicit_shift = server_args.pipeline_config.flow_shift
+            if explicit_shift is not None:
+                # An explicit flow_shift selects a plain shifted grid — the
+                # checkpoint's karras schedule ignores flow_shift entirely,
+                # and its dense head starves the RL gradient (dt ~ 1e-3).
+                scheduler.set_shift(float(explicit_shift))
+                scheduler.set_timesteps(num_inference_steps, device=device)
+            else:
+                # Reuse the serving scheduler's sigma grid (sans terminal
+                # sigma) so rollout noise levels match serving exactly.
+                scheduler.set_timesteps(
+                    sigmas=self.scheduler.sigmas[:-1].tolist(), device=device
+                )
+            batch.timesteps = scheduler.timesteps
+            self._check_rollout_timesteps(scheduler)
+
         self.log_info(
             f"Prepared {len(batch.timesteps)} timesteps (flow_shift={flow_shift})"
         )
         return batch
 
 
-class Cosmos3DenoisingStage(PipelineStage):
+class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
     """Cosmos3 denoise loop, including CFG and the parallelism modes.
 
     The UND pathway runs once and its K/V is cached per cache_key (``cond`` /
@@ -578,6 +613,31 @@ class Cosmos3DenoisingStage(PipelineStage):
         image_latent = batch.image_latent
         guidance_interval = getattr(batch.sampling_params, "guidance_interval", None)
 
+        scheduler = batch.scheduler if batch.scheduler is not None else self.scheduler
+        if batch.rollout:
+            if image_latent is not None:
+                raise ValueError(
+                    "Cosmos3 rollout supports T2V/T2I only; I2V frame-0 "
+                    "re-injection breaks the Gaussian transition assumption."
+                )
+            self._maybe_prepare_rollout(batch)
+            self._maybe_init_denoising_env_collection(
+                batch=batch,
+                pipeline_config=server_args.pipeline_config,
+                image_kwargs={},
+                pos_cond_kwargs={
+                    "text_ids": cond_text_ids,
+                    "text_mask": cond_text_mask,
+                    "fps": fps,
+                },
+                neg_cond_kwargs={
+                    "text_ids": uncond_text_ids,
+                    "text_mask": uncond_text_mask,
+                    "fps": fps,
+                },
+                guidance=None,
+            )
+
         do_cfg = guidance_scale > 1.0
 
         enable_cfg_parallel = server_args.enable_cfg_parallel and do_cfg
@@ -696,18 +756,44 @@ class Cosmos3DenoisingStage(PipelineStage):
             if velocity_mask is not None:
                 noise_pred = noise_pred * velocity_mask
 
-            latents = self.scheduler.step(
-                noise_pred,
-                t,
-                latents,
-                return_dict=False,
-            )[0]
+            if batch.rollout:
+                batch._rollout_loop_step_index = i
+                self._maybe_append_dit_trajectory_step(
+                    batch=batch,
+                    latents=latents,
+                    timestep_value=t,
+                    step_index=i,
+                )
+                latents = scheduler.step(
+                    noise_pred,
+                    t,
+                    latents,
+                    generator=batch.generator,
+                    batch=batch,
+                    return_dict=False,
+                )[0]
+            else:
+                latents = scheduler.step(
+                    noise_pred,
+                    t,
+                    latents,
+                    return_dict=False,
+                )[0]
 
             if image_latent is not None:
                 latents[:, :, 0:1, :, :] = image_latent
 
             if batch.profile and not batch.is_warmup:
                 self.step_profile()
+
+        if batch.rollout:
+            self._postprocess_rollout_outputs(
+                batch=batch,
+                latents=latents,
+                num_inference_steps=len(timesteps),
+                final_timestep=timesteps.new_zeros(()).cpu(),
+                server_args=server_args,
+            )
 
         batch.latents = latents
         self.log_info("Denoising complete")
@@ -938,4 +1024,5 @@ class Cosmos3DecodingStage(PipelineStage):
         return OutputBatch(
             output=output,
             metrics=batch.metrics if hasattr(batch, "metrics") else None,
+            rollout_trajectory_data=batch.rollout_trajectory_data,
         )

@@ -8,6 +8,9 @@ cross-attends to the cached UND K/V at each denoising step.
 
 import os
 
+from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_match_euler_discrete import (
+    FlowMatchEulerDiscreteScheduler,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
@@ -84,7 +87,14 @@ class Cosmos3Pipeline(ComposedPipelineBase):
 
             self.add_stage(Cosmos3TextGuardrailStage())
         self.add_stage(Cosmos3LatentPreparationStage(vae, transformer))
-        self.add_stage(Cosmos3TimestepPreparationStage(scheduler))
+        # rollout=True requests lazily bind a flow-match Euler scheduler (RL SDE
+        # path); it inherits the serving scheduler's sigma grid per request.
+        self.add_stage(
+            Cosmos3TimestepPreparationStage(
+                scheduler,
+                rollout_scheduler_factory=FlowMatchEulerDiscreteScheduler,
+            )
+        )
         self.add_stage(Cosmos3DenoisingStage(transformer, scheduler, server_args))
         self.add_stage(Cosmos3DecodingStage(vae, guardrails=guardrails_on))
 
