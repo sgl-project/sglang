@@ -1617,6 +1617,10 @@ class ServerArgs:
         bool,
         "Enable using torch symm mem for all-reduce kernel and fall back to NCCL. Only supports CUDA device SM90 and above. SM90 supports world size 4, 6, 8. SM100 supports world size 6, 8.",
     ] = False
+    enable_flashinfer_pure_allreduce: A[
+        bool,
+        "Route pure (non-fused) tensor-parallel all-reduce through FlashInfer kAllReduce when the flashinfer allreduce workspace is already initialized (requires --flashinfer-allreduce-fusion-backend). Falls back to NCCL for non-2D tensors or when the workspace is unavailable.",
+    ] = False
     pre_warm_nccl: A[
         bool,
         "Pre-warm NCCL/RCCL communicators during startup to reduce P99 TTFT cold-start latency. Default: enabled for AMD/HIP (RCCL), disabled for NVIDIA/CUDA (NCCL).",

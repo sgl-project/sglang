@@ -633,6 +633,16 @@ class GroupCoordinator:
                 self.pynccl_comm.all_reduce(input_)
                 return input_
 
+        fi_hint = getattr(self, "_fi_workspace_hint", None)
+        if fi_hint is not None and input_.ndim == 2 and input_.is_contiguous():
+            from sglang.srt.layers.flashinfer_comm_fusion import flashinfer_allreduce
+
+            result = flashinfer_allreduce(
+                input_, use_attn_tp_group=(fi_hint == "attn_tp")
+            )
+            if result is not None:
+                return result
+
         outplace_all_reduce_method = None
         if (
             self.ca_comm is not None
@@ -1814,6 +1824,7 @@ logger = logging.getLogger(__name__)
 _ENABLE_CUSTOM_ALL_REDUCE = True
 _ENABLE_MSCCLPP_ALL_REDUCE = False
 _ENABLE_TORCH_SYMM_MEM_ALL_REDUCE = False
+_ENABLE_FLASHINFER_PURE_ALL_REDUCE = False
 
 
 def set_custom_all_reduce(enable: bool):
@@ -1829,6 +1840,26 @@ def set_mscclpp_all_reduce(enable: bool):
 def set_torch_symm_mem_all_reduce(enable: bool):
     global _ENABLE_TORCH_SYMM_MEM_ALL_REDUCE
     _ENABLE_TORCH_SYMM_MEM_ALL_REDUCE = enable
+
+
+def set_flashinfer_pure_all_reduce(enable: bool):
+    global _ENABLE_FLASHINFER_PURE_ALL_REDUCE
+    _ENABLE_FLASHINFER_PURE_ALL_REDUCE = enable
+
+
+def _tag_groups_for_flashinfer_pure_allreduce():
+    """Stamp _fi_workspace_hint on each group coordinator so all_reduce() can dispatch
+    to flashinfer_allreduce() without touching the call sites."""
+    if not _ENABLE_FLASHINFER_PURE_ALL_REDUCE:
+        return
+    for group, hint in (
+        (_TP, "attn_tp"),
+        (_ATTN_TP, "attn_tp"),
+        (_MOE_TP, "moe_tp"),
+        (_MOE_EP, "moe_ep"),
+    ):
+        if group is not None:
+            setattr(group, "_fi_workspace_hint", hint)
 
 
 # TODO: refactor in-tree platforms to get rid of this wrapper

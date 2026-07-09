@@ -825,6 +825,42 @@ def flashinfer_allreduce_residual_rmsnorm(
     return norm_out, residual_out
 
 
+def flashinfer_allreduce(
+    input_: torch.Tensor,
+    use_attn_tp_group: bool = True,
+) -> Optional[torch.Tensor]:
+    """Pure allreduce via FlashInfer kAllReduce. Returns None to signal fallback to NCCL."""
+    if _flashinfer_allreduce_unavailable or _flashinfer_comm is None:
+        return None
+
+    if input_.ndim != 2 or not input_.is_contiguous():
+        return None
+
+    workspace_manager = _get_workspace_manager(use_attn_tp_group)
+    if not workspace_manager.initialized or workspace_manager.workspace is None:
+        return None
+
+    token_num, hidden_dim = input_.shape
+    if not workspace_manager.is_buffer_size_sufficient(
+        token_num=token_num,
+        hidden_dim=hidden_dim,
+        dtype=input_.dtype,
+    ):
+        return None
+
+    try:
+        return _flashinfer_comm.allreduce_fusion(
+            input=input_,
+            workspace=workspace_manager.workspace,
+            pattern=_flashinfer_comm.AllReduceFusionPattern.kAllReduce,
+            launch_with_pdl=True,
+            fp32_acc=True,
+        )
+    except Exception as e:
+        logger.debug("flashinfer_allreduce failed: %s", e)
+        return None
+
+
 def pre_initialize_workspaces(
     max_token_num: int,
     hidden_dim: int,
