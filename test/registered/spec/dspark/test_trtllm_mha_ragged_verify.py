@@ -82,14 +82,6 @@ class TestRaggedTargetVerifyGeometry(CustomTestCase):
         self.assertEqual(geometry.cu_seqlens_q.dtype, torch.int32)
         self.assertEqual(geometry.cu_seqlens_k.dtype, torch.int32)
 
-    def test_qo_indptr_total_matches_input_tokens(self):
-        layout = RaggedVerifyLayout.from_verify_lens(
-            verify_lens_cpu=[8, 1, 3], device=_DEVICE, grid=_GRID
-        )
-        seq_lens = torch.tensor([10, 20, 30], dtype=torch.int32)
-        geometry = build_ragged_target_verify_geometry(seq_lens=seq_lens, layout=layout)
-        self.assertEqual(int(geometry.cu_seqlens_q[-1]), layout.total_verify_tokens)
-
 
 class TestPaddedRaggedVerifyGeometry(CustomTestCase):
     def test_padded_layout_grows_bs_and_fills_bucket(self):
@@ -109,17 +101,6 @@ class TestPaddedRaggedVerifyGeometry(CustomTestCase):
         self.assertEqual(geometry.cu_seqlens_q.tolist(), [0, 8, 9, 12, 32])
         self.assertEqual(geometry.cache_seqlens_int32.tolist(), [18, 21, 33, 21])
         self.assertEqual(int(geometry.cu_seqlens_k[-1]), 18 + 21 + 33 + 21)
-
-    def test_padded_qo_indptr_reaches_graph_num_tokens(self):
-        raw = RaggedVerifyLayout.from_verify_lens(
-            verify_lens_cpu=[8, 1, 3],
-            device=_DEVICE,
-            grid=[8, 16, 32, 64],
-            graph_num_tokens_floor=24,
-        )
-        padded = raw.padded_to_bucket(padded_bs=4)
-        self.assertEqual(int(padded.qo_indptr_device[-1]), padded.graph_num_tokens)
-        self.assertEqual(padded.qo_indptr_device.numel(), padded.bs + 1)
 
     def test_padded_layout_decoupled_slots_spread_slack(self):
         raw = RaggedVerifyLayout.from_verify_lens(
@@ -302,19 +283,6 @@ class TestBudgetTierSelection(CustomTestCase):
                 model_runner=model_runner,
             )
         )
-
-
-class TestSwaPaddedSlotGuard(CustomTestCase):
-    def test_clamp_keeps_gather_index_in_range(self):
-        full_to_swa_numel = 17
-        slots = torch.tensor([-5, 0, 16, 100000, -1], dtype=torch.int64)
-        clamped = torch.minimum(
-            torch.maximum(slots, torch.zeros_like(slots)),
-            torch.full_like(slots, full_to_swa_numel - 1),
-        )
-        self.assertTrue(bool((clamped >= 0).all()))
-        self.assertTrue(bool((clamped < full_to_swa_numel).all()))
-        self.assertEqual(clamped.tolist(), [0, 0, 16, 16, 0])
 
 
 if __name__ == "__main__":

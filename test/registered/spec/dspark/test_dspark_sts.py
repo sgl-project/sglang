@@ -30,12 +30,16 @@ class TestApplySts(CustomTestCase):
 
     def test_per_position_temperature_scales_each_column(self):
         head = DSparkConfidenceHead(hidden_size=8, markov_rank=4, with_markov=False)
-        temperatures = torch.tensor([0.5, 1.0, 2.0, 4.0, 0.25])
-        head.sts_temperatures = temperatures
-        confidence_raw = torch.randn(3, 5) * 9.0
+        head.sts_temperatures = torch.tensor([0.5, 1.0, 2.0])
+        confidence_raw = torch.full((2, 3), 2.0)
         out = head.apply_sts(confidence_raw)
-        expected = torch.sigmoid(confidence_raw.float() / temperatures)
-        self.assertTrue(torch.equal(out, expected))
+        # Hand-computed sigmoid(2.0 / T) per column: identical raw logits with
+        # distinct per-column T catch wrong-axis broadcasts, and dividing (not
+        # multiplying) by T is what separates 0.982 from 0.731 in column 0.
+        expected_row = [0.98201379, 0.88079708, 0.73105858]
+        for row in out.tolist():
+            for got, want in zip(row, expected_row):
+                self.assertAlmostEqual(got, want, places=6)
 
     def test_apply_sts_stashes_raw_logit(self):
         head = DSparkConfidenceHead(hidden_size=8, markov_rank=4, with_markov=False)

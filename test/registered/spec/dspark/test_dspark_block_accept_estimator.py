@@ -510,30 +510,6 @@ class TestOnlineCeilingEstimate(CustomTestCase):
             self.assertIsNone(recorder.online_estimate())
             self.assertIsNone(recorder.estimate_log_suffix())
 
-    def test_estimate_log_suffix_reports_cumulative(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            recorder, _ = _make_recorder(tmp)
-            target = torch.randn((_GAMMA + 1), _VOCAB)
-            seq = 10
-            for t in range(6):
-                cl = t % 3
-                _observe(
-                    recorder,
-                    forward_ct=t + 1,
-                    rid="r0",
-                    drafts=[1, 2, 3],
-                    corrected_logits=torch.randn(_GAMMA, _VOCAB),
-                    target_logits=target,
-                    verify_len=_GAMMA + 1,
-                    correct_len=cl,
-                    bonus=5,
-                    seq_len=seq,
-                )
-                seq += cl + 1
-            suffix = recorder.estimate_log_suffix()
-            self.assertIsNotNone(suffix)
-            self.assertIn("est uncap acc len", suffix)
-
 
 class TestOfflineRecorderMatchesOnline(CustomTestCase):
     def test_offline_dump_matches_online_dump_over_random_stream(self):

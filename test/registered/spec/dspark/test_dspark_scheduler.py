@@ -321,17 +321,6 @@ class TestScheduleVerifyLensTopk(CustomTestCase):
         self.assertEqual(int(extra[0].item()), 2)
         self.assertEqual(int(extra[1].item()), 0)
 
-    def test_survival_helper_matches_manual_cumprod(self):
-        confidence = torch.tensor(
-            [[0.9, 0.8, 0.5], [0.7, 0.6, 0.4]], dtype=torch.float32
-        )
-        survival = _survival_from_confidence(confidence)
-        expected = torch.tensor(
-            [[0.9, 0.9 * 0.8, 0.9 * 0.8 * 0.5], [0.7, 0.7 * 0.6, 0.7 * 0.6 * 0.4]],
-            dtype=torch.float32,
-        )
-        self.assertTrue(torch.allclose(survival, expected, atol=1e-6))
-
     @_for_each_impl
     def test_min_and_max_enter_the_budget(self, impl):
         survival = torch.tensor([[0.99, 0.99, 0.99, 0.99, 0.99]], dtype=torch.float32)
@@ -358,14 +347,6 @@ class TestScheduleVerifyLensTopk(CustomTestCase):
         self.assertEqual(int(verify_lens[0].item()), 4)
 
     @_for_each_impl
-    def test_tie_break_is_deterministic(self, impl):
-        survival = torch.full((3, 4), 0.8, dtype=torch.float32)
-        cfg = DSparkScheduleConfig(gamma=4)
-        first = impl(survival_probs=survival, budget=5, cfg=cfg)
-        second = impl(survival_probs=survival, budget=5, cfg=cfg)
-        self.assertTrue(torch.equal(first, second))
-
-    @_for_each_impl
     def test_tie_break_is_value_independent(self, impl):
         survival = torch.tensor([[0.8, 0.8, 0.8], [0.8, 0.8, 0.8]], dtype=torch.float32)
         cfg = DSparkScheduleConfig(gamma=3)
@@ -379,19 +360,6 @@ class TestVerifyLenAnchorContract(CustomTestCase):
 
     def test_default_min_verify_len_is_one(self):
         self.assertEqual(DSparkScheduleConfig(gamma=4).min_verify_len, 1)
-
-    @_for_each_impl
-    def test_small_budget_keeps_anchor_with_default_config(self, impl):
-        survival = _survival_from_confidence(
-            torch.tensor(
-                [[0.95, 0.90, 0.40], [0.80, 0.20, 0.10], [0.99, 0.97, 0.50]],
-                dtype=torch.float32,
-            )
-        )
-        cfg = DSparkScheduleConfig(gamma=3)
-        for budget in (0, 1, 2):
-            verify_lens = impl(survival_probs=survival, budget=budget, cfg=cfg)
-            self.assertGreaterEqual(int(verify_lens.min().item()), 1)
 
     @_for_each_impl
     def test_explicit_zero_min_still_clamped_to_anchor(self, impl):

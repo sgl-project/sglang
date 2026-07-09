@@ -15,7 +15,12 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=600, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(
+    est_time=600,
+    stage="base-b",
+    runner_config="1-gpu-large",
+    disabled="dspark draft checkpoint not yet published",
+)
 
 TARGET_MODEL = "Qwen/Qwen3-14B"
 DRAFT_MODEL = "deepseek-ai/dspark_qwen3_14b_block7"
@@ -95,7 +100,8 @@ class TestBasicSanityDSpark(
 
     @classmethod
     def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
+        if hasattr(cls, "process") and cls.process:
+            kill_process_tree(cls.process.pid)
 
 
 if __name__ == "__main__":

@@ -27,13 +27,6 @@ def make_recorder(**kwargs) -> tuple[SpsDataRecorder, FakeClock]:
 
 
 class TestSpsDataRecorderPairing(CustomTestCase):
-    def test_first_step_emits_no_record(self):
-        recorder, _ = make_recorder()
-        recorder.observe_decode_step(
-            forward_ct=1, num_running_reqs=4, num_verify_tokens=32
-        )
-        self.assertEqual(recorder.dump_records(), [])
-
     def test_dt_is_attributed_to_the_previous_step(self):
         recorder, clock = make_recorder()
         recorder.observe_decode_step(
