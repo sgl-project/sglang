@@ -699,7 +699,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 
 # Install pre-built gateway artifacts from parallel builder
-COPY --from=gateway_builder /build/sgl-model-gateway-bin /usr/local/bin/sgl-model-gateway
+COPY --from=gateway_builder /build/sgl-model-gateway-bin /opt/sglang/bin/sgl-model-gateway
 COPY --from=gateway_builder /build/gateway_wheels /tmp/gateway_wheels
 # When ai-dynamo is installed (dev image), reinstall the gateway wheel with
 # --no-deps so it cannot re-resolve and replace Dynamo's shared dependencies.
