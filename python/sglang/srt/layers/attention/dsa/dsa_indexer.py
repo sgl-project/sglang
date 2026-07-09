@@ -814,6 +814,7 @@ class Indexer(MultiPlatformOp):
             return pool.get_broadcastable_index_k_with_scale_buffer(layer_id)
         return pool.get_index_k_with_scale_buffer(layer_id=layer_id)
 
+    @staticmethod
     def _pad_heads_for_deep_gemm(q_fp8, weights):
         """Pad q and weights to 32 heads when num_heads < 32,
         so that block_q = 128/num_heads doesn't exceed seq_len_alignment(4)."""
