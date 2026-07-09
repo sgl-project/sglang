@@ -13,9 +13,13 @@ its sub-objects.
   (e.g. `capture_hidden_mode`, `return_hidden_states_before_norm`). Do not
   reintroduce the old pattern of writing a ScheduleBatch field and having
   `init_new` consume-and-reset it.
-- Callers that need to influence a forward launched by
-  `TpModelWorker.forward_batch_generation` pass the override through its
-  kw-only parameters instead of writing onto the batch.
+- Callers that need a one-shot per-forward override (a field written solely so
+  that `init_new` consumes it once, like the old `capture_hidden_mode` pattern)
+  pass it through the kw-only parameters of `init_new` /
+  `TpModelWorker.forward_batch_generation` instead of writing onto the batch.
+- Regular writes to batch execution-state fields (`out_cache_loc`,
+  `seq_lens_*`, `return_hidden_states`, ...) by code that prepares the batch
+  before calling `init_new` are outside the scope of this rule.
 
 Temporary exceptions (do not add new ones):
 
