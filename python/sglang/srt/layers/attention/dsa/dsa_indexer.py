@@ -70,7 +70,7 @@ else:
     cutedsl_paged_mqa_logits = None
     deepgemm_paged_mqa_logits_native = None
     deepgemm_paged_mqa_logits_split = None
-    
+
 if not _is_hip and not _is_npu:
     # Preserve the original eager import behavior on non-ROCm platforms.
     from sglang.jit_kernel.dsa import pick_dsl_expand
