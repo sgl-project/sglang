@@ -127,7 +127,6 @@ class TestForwardSplitPrefill(CustomTestCase):
         forward_batch = ForwardBatch.init_new(
             batch,
             self.model_runner,
-            capture_hidden_mode=None,
             return_hidden_states_before_norm=False,
         )
 
