@@ -100,8 +100,7 @@ jobs:
           rm -f python/pyproject.toml
           mv python/pyproject_other.toml python/pyproject.toml
           uv venv
-          uv pip install -e "python[srt_mps]"
-          uv pip install pytest
+          uv pip install -e "python[srt_mps,test]"
 
       - name: Report MLX / torch versions
         run: |
@@ -115,8 +114,7 @@ jobs:
 
   stage-b-e2e-test-mlx:
     needs: [check-changes, pr-gate]
-    # Inert until a self hosted Apple Silicon runner registers and #29440
-    # merges. Activate by adding the change detection terms back to if.
+    # Manual-only: no self hosted Apple Silicon runner is generally available; hosted runners are too small for e2e.
     if: |
       !cancelled() && inputs.target_stage == 'stage-b-e2e-test-mlx'
     runs-on: [self-hosted, macOS, ARM64]
@@ -146,8 +144,7 @@ jobs:
           rm -f python/pyproject.toml
           mv python/pyproject_other.toml python/pyproject.toml
           uv venv --python 3.11
-          uv pip install -e "python[srt_mps]"
-          uv pip install pytest
+          uv pip install -e "python[srt_mps,test]"
 
       # Needs a warm HF cache or network and roughly 24 GB of unified memory.
       - name: Run MLX e2e smoke tests
