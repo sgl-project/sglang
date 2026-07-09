@@ -273,6 +273,9 @@ class TestCreateGrammarBackend(unittest.TestCase):
         self, backend="none", reasoning_parser=None, enable_strict_thinking=False
     ):
         args = MagicMock()
+        args.override = lambda source, **updates: [
+            setattr(args, key, value) for key, value in updates.items()
+        ]
         args.grammar_backend = backend
         args.reasoning_parser = reasoning_parser
         args.enable_strict_thinking = enable_strict_thinking

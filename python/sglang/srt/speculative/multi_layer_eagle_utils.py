@@ -13,21 +13,11 @@
 # ==============================================================================
 
 from sglang.srt.speculative.triton_ops.multi_layer_eagle import (
-    assign_hidden_states_pool_kernel,
-    assign_hidden_states_pool_torch,
-    assign_hidden_states_pool_triton,
-    assign_new_state_kernel,
-    assign_new_state_triton,
+    rotate_input_ids,
     rotate_input_ids_kernel,
-    rotate_input_ids_triton,
 )
 
 __all__ = [
-    "assign_hidden_states_pool_kernel",
-    "assign_hidden_states_pool_torch",
-    "assign_hidden_states_pool_triton",
-    "assign_new_state_kernel",
-    "assign_new_state_triton",
+    "rotate_input_ids",
     "rotate_input_ids_kernel",
-    "rotate_input_ids_triton",
 ]

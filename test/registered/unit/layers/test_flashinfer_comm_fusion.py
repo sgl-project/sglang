@@ -80,11 +80,11 @@ class TestFlashInferCommFusion(unittest.TestCase):
             flashinfer_allreduce_fusion_backend="auto", nnodes=2
         )
 
-        # Blackwell: trtllm on single-node, mnnvl on multi-node.
+        # Blackwell: mnnvl on both single-node and multi-node.
         with patch.object(fusion, "is_sm100_supported", return_value=True):
             self.assertEqual(
                 fusion.resolve_flashinfer_allreduce_fusion_backend(single_node),
-                "trtllm",
+                "mnnvl",
             )
             self.assertEqual(
                 fusion.resolve_flashinfer_allreduce_fusion_backend(multi_node), "mnnvl"
@@ -174,8 +174,12 @@ class TestFlashInferCommFusion(unittest.TestCase):
         fake_comm = _FakeFlashInferComm()
         original_comm = fusion._flashinfer_comm
         original_create = fusion._create_allreduce_fusion_workspace
-        original_manager = fusion._attn_tp_workspace_manager
         original_unavailable = fusion._flashinfer_allreduce_unavailable
+        from sglang.srt.runtime_context import get_resources
+
+        buffers = get_resources().buffers
+        manager_key = "flashinfer_fusion_attn_tp_workspace"
+        original_manager = buffers.get(manager_key)
         try:
             fusion._flashinfer_comm = fake_comm
             fusion._create_allreduce_fusion_workspace = (
@@ -189,7 +193,7 @@ class TestFlashInferCommFusion(unittest.TestCase):
                     manager = fusion.FlashInferWorkspaceManager()
                     manager.workspace = _FakeWorkspace(backend, world_size)
                     manager.initialized = True
-                    fusion._attn_tp_workspace_manager = manager
+                    buffers[manager_key] = manager
                     if not torch.cuda.is_available():
                         self.skipTest("FlashInfer allreduce custom op is CUDA-only")
                     device = torch.device("cuda")
@@ -229,7 +233,10 @@ class TestFlashInferCommFusion(unittest.TestCase):
         finally:
             fusion._flashinfer_comm = original_comm
             fusion._create_allreduce_fusion_workspace = original_create
-            fusion._attn_tp_workspace_manager = original_manager
+            if original_manager is None:
+                buffers.pop(manager_key, None)
+            else:
+                buffers[manager_key] = original_manager
             fusion._flashinfer_allreduce_unavailable = original_unavailable
 
 

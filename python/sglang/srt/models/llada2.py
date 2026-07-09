@@ -76,8 +76,7 @@ from sglang.srt.models.utils import (
     create_fused_set_kv_buffer_arg,
     enable_fused_set_kv_buffer,
 )
-from sglang.srt.runtime_context import get_parallel
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_parallel, get_server_args, get_stream
 from sglang.srt.utils import (
     add_prefix,
     is_cuda,
@@ -220,7 +219,7 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
             self.router_dtype = torch.bfloat16
 
         # TODO global_server_args.ep_num_redundant_experts is used for eplb, not supported now
-        assert get_global_server_args().ep_num_redundant_experts == 0
+        assert get_server_args().ep_num_redundant_experts == 0
         # check group topk
         self.num_expert_group = getattr(config, "n_group", 0)
         self.topk_group = getattr(config, "topk_group", 0)
@@ -235,7 +234,7 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
             self.use_grouped_topk = False
 
         self.num_experts = (
-            config.num_experts + get_global_server_args().ep_num_redundant_experts
+            config.num_experts + get_server_args().ep_num_redundant_experts
         )
 
         self.gate = LLaDA2MoeGate(
@@ -262,6 +261,7 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
             # num_fused_shared_experts=self.num_fused_shared_experts,
             topk_group=self.topk_group,
             correction_bias=self.correction_bias,
+            scoring_func=self.score_function,
             routed_scaling_factor=self.routed_scaling_factor,
         )
 
@@ -777,7 +777,7 @@ class LLaDA2MoeModelLM(nn.Module):
         self.pp_group = get_pp_group()
         self.config = config
         self.quant_config = quant_config
-        alt_stream = torch.cuda.Stream() if _is_cuda else None
+        alt_stream = get_stream("alt") if _is_cuda else None
 
         self.model = LLaDA2MoeModel(
             config,
@@ -795,7 +795,7 @@ class LLaDA2MoeModelLM(nn.Module):
                 config.hidden_size,
                 quant_config=quant_config,
                 prefix=add_prefix("lm_head", prefix),
-                use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+                use_attn_tp_group=get_server_args().enable_dp_lm_head,
             )
         self.logits_processor = LogitsProcessor(config, return_full_logits=True)
 
