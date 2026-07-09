@@ -16,6 +16,7 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.attention.fla.fused_norm_gate import FusedRMSNormGated
+from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelBatchedLinear,
@@ -30,6 +31,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
+from sglang.srt.layers.moe.utils import should_skip_post_experts_all_reduce
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.utils import PPMissingLayer
@@ -126,7 +128,13 @@ class KimiMoE(nn.Module):
                 reduce_results=False,
             )
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: Optional[ForwardBatch] = None,
+        should_allreduce_fusion: bool = False,
+        use_reduce_scatter: bool = False,
+    ) -> torch.Tensor:
         num_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_size)
 
@@ -159,7 +167,11 @@ class KimiMoE(nn.Module):
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
 
-        if self.tp_size > 1:
+        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
+            is_tp_path=True,
+            use_reduce_scatter=use_reduce_scatter,
+            should_allreduce_fusion=should_allreduce_fusion,
+        ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states.view(num_tokens, hidden_size)
 
@@ -309,6 +321,7 @@ class KimiDeltaAttention(nn.Module):
             self.hidden_size,
             bias=False,
             quant_config=quant_config,
+            reduce_results=False,
             prefix=f"{prefix}.o_proj",
         )
 
@@ -409,6 +422,18 @@ class KimiDeltaAttention(nn.Module):
         return self.o_proj(core_attn_out)[0]
 
 
+def _kimi_is_sparse_layer(config: KimiLinearConfig, layer_idx: int) -> bool:
+    """Whether the given layer is a MoE (sparse) layer. Mirrors the predicate
+    used to construct KimiMoE vs the dense KimiMLP in KimiDecoderLayer."""
+    return (
+        config.is_moe
+        and config.num_experts is not None
+        and 0 <= layer_idx < config.num_hidden_layers
+        and layer_idx >= config.first_k_dense_replace
+        and layer_idx % config.moe_layer_freq == 0
+    )
+
+
 class KimiDecoderLayer(nn.Module):
     def __init__(
         self,
@@ -446,6 +471,7 @@ class KimiDecoderLayer(nn.Module):
                 q_lora_rank=config.q_lora_rank,
                 kv_lora_rank=config.kv_lora_rank,
                 skip_rope=True,
+                reduce_results=False,
             )
 
         if (
@@ -475,6 +501,22 @@ class KimiDecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
+        self.is_layer_sparse = _kimi_is_sparse_layer(config, layer_idx)
+        self.layer_scatter_modes = LayerScatterModes.init_new(
+            layer_id=layer_idx,
+            num_layers=config.num_hidden_layers,
+            is_layer_sparse=self.is_layer_sparse,
+            is_previous_layer_sparse=_kimi_is_sparse_layer(config, layer_idx - 1),
+            is_next_layer_sparse=_kimi_is_sparse_layer(config, layer_idx + 1),
+        )
+        self.layer_communicator = LayerCommunicator(
+            layer_scatter_modes=self.layer_scatter_modes,
+            input_layernorm=self.input_layernorm,
+            post_attention_layernorm=self.post_attention_layernorm,
+            allow_reduce_scatter=True,
+            is_last_layer=(layer_idx == config.num_hidden_layers - 1),
+        )
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -483,23 +525,62 @@ class KimiDecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
         zero_allocator: BumpAllocator,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # Self Attention
-        if residual is None:
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
-        else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
-
-        hidden_states = self.self_attn(
-            hidden_states=hidden_states,
-            positions=positions,
-            forward_batch=forward_batch,
-            zero_allocator=zero_allocator,
+        hidden_states, residual = (
+            self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
+                hidden_states, residual, forward_batch
+            )
         )
 
+        # Self Attention (KDA vs MLA differ only in call kwargs)
+        if isinstance(self.self_attn, KimiDeltaAttention):
+            hidden_states = self.self_attn(
+                hidden_states=hidden_states,
+                positions=positions,
+                forward_batch=forward_batch,
+                zero_allocator=zero_allocator,
+            )
+        else:  # MLA
+            hidden_states = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+                zero_allocator=zero_allocator,
+                layer_scatter_modes=self.layer_scatter_modes,
+            )
+
         # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states, residual = self.layer_communicator.prepare_mlp(
+            hidden_states, residual, forward_batch
+        )
+        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+            forward_batch
+        )
+        should_allreduce_fusion = (
+            self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
+                forward_batch
+            )
+        )
+
+        if isinstance(self.mlp, KimiMoE):
+            hidden_states = self.mlp(
+                hidden_states,
+                forward_batch,
+                should_allreduce_fusion=should_allreduce_fusion,
+                use_reduce_scatter=use_reduce_scatter,
+            )
+        else:
+            hidden_states = self.mlp(
+                hidden_states,
+                forward_batch,
+                use_reduce_scatter=should_allreduce_fusion or use_reduce_scatter,
+            )
+
+        if should_allreduce_fusion:
+            hidden_states._sglang_needs_allreduce_fusion = True
+        else:
+            hidden_states, residual = self.layer_communicator.postprocess_layer(
+                hidden_states, residual, forward_batch
+            )
         return hidden_states, residual
 
 

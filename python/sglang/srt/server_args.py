@@ -4414,6 +4414,7 @@ class ServerArgs:
                 "Qwen3VLMoeForConditionalGeneration",
                 "Qwen3NextForCausalLM",
                 "KimiK25ForConditionalGeneration",
+                "KimiLinearForCausalLM",
                 "Qwen3_5MoeForConditionalGeneration",
                 "InternS2PreviewForConditionalGeneration",
                 "Qwen3_5ForConditionalGeneration",
