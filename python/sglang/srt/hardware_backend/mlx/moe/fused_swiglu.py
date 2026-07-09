@@ -51,6 +51,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from sglang.srt.hardware_backend.mlx import metal_jit
+from sglang.srt.hardware_backend.mlx.metal_jit import NotFusable
 
 logger = logging.getLogger(__name__)
 
@@ -210,24 +211,32 @@ class FusedGateQmvSiluMulKernel(metal_jit.MetalJitOp):
 
     source = _KERNEL_SOURCE
 
-    def can_fuse(
+    def _check_eligibility(
         self,
         x: mx.array,
         gate_w: mx.array,
         gate_s: mx.array,
         gate_b: mx.array,
-        indices: mx.array,
-        x_up: mx.array,
-    ) -> bool:
-        """Regime predicate over the same checks dispatch_fallback diagnoses."""
+    ) -> None:
+        """Regime checks shared by dispatch_fused (pre-flight) and
+        dispatch_fallback (the diagnostic path _fused_gate_or_fallback catches).
+        """
         K = gate_s.shape[-1] * _GROUP_SIZE
         N = gate_w.shape[-2]
-        return (
-            K % _BLOCK_SIZE == 0
-            and N % _ROWS_PER_TG == 0
-            and gate_s.dtype == x.dtype
-            and gate_b.dtype == x.dtype
-        )
+        if K % _BLOCK_SIZE != 0:
+            raise NotFusable(
+                f"fused_gate_qmv_silu_mul: K={K} not divisible by {_BLOCK_SIZE}. "
+                f"Use the unfused path."
+            )
+        if N % _ROWS_PER_TG != 0:
+            raise NotFusable(
+                f"fused_gate_qmv_silu_mul: N={N} not divisible by {_ROWS_PER_TG}."
+            )
+        if gate_s.dtype != x.dtype or gate_b.dtype != x.dtype:
+            raise NotFusable(
+                f"fused_gate_qmv_silu_mul: dtype mismatch x={x.dtype} "
+                f"s={gate_s.dtype} b={gate_b.dtype}"
+            )
 
     def dispatch_fused(
         self,
@@ -259,6 +268,7 @@ class FusedGateQmvSiluMulKernel(metal_jit.MetalJitOp):
         up to floating-point ordering of accumulations (which matches MLX's own
         qmv_fast_impl exactly).
         """
+        self._check_eligibility(x, gate_w, gate_s, gate_b)
         K = gate_s.shape[-1] * _GROUP_SIZE
         N = gate_w.shape[-2]
 
@@ -321,27 +331,9 @@ class FusedGateQmvSiluMulKernel(metal_jit.MetalJitOp):
 
         The unfused gate path needs the gate module and the sorted flag,
         neither of which the op receives; _fused_gate_or_fallback catches
-        this ValueError and runs it.
+        this NotFusable and runs it.
         """
-        # Validate the regime this kernel supports. Outside it, the caller should
-        # fall back to the unfused MLX path.
-        K = gate_s.shape[-1] * _GROUP_SIZE
-        N = gate_w.shape[-2]
-        if K % _BLOCK_SIZE != 0:
-            raise ValueError(
-                f"fused_gate_qmv_silu_mul: K={K} not divisible by {_BLOCK_SIZE}. "
-                f"Use the unfused path."
-            )
-        if N % _ROWS_PER_TG != 0:
-            raise ValueError(
-                f"fused_gate_qmv_silu_mul: N={N} not divisible by {_ROWS_PER_TG}."
-            )
-        # Scales/biases dtype must match x dtype for in-kernel float() conversion.
-        if gate_s.dtype != x.dtype or gate_b.dtype != x.dtype:
-            raise ValueError(
-                f"fused_gate_qmv_silu_mul: dtype mismatch x={x.dtype} "
-                f"s={gate_s.dtype} b={gate_b.dtype}"
-            )
+        self._check_eligibility(x, gate_w, gate_s, gate_b)
 
 
 _OP = FusedGateQmvSiluMulKernel()
@@ -478,7 +470,7 @@ _fallback_warned = False
 
 
 def _fused_gate_or_fallback(gate_proj, x, idx, x_up, sorted_indices=False):
-    """silu(gate_qmv(x)) * x_up via the fused kernel; on ValueError fall back to
+    """silu(gate_qmv(x)) * x_up via the fused kernel; on NotFusable fall back to
     the unfused gate projection. gather_qmm tolerates the activation dtype the
     fused kernel rejects, which can_fuse cannot pre-check at patch time. Warns
     once.
@@ -494,7 +486,7 @@ def _fused_gate_or_fallback(gate_proj, x, idx, x_up, sorted_indices=False):
     gb = gate_proj.get("biases")
     try:
         return fused_gate_qmv_silu_mul(x, gw, gs, gb, gate_idx, x_up)
-    except ValueError as e:
+    except NotFusable as e:
         global _fallback_warned
         if not _fallback_warned:
             logger.warning(

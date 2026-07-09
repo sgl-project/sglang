@@ -416,7 +416,7 @@ def test_unsorted_dtype_mismatch_fallback_matches_reference(monkeypatch):
 
 
 def test_forced_kernel_rejection_falls_back_correctly(monkeypatch):
-    """Any ValueError from the fused kernel, not just a dtype mismatch, must
+    """Any NotFusable from the fused kernel, not just a dtype mismatch, must
     take the identical fallback: force one via monkeypatch and check both
     routing paths against the unpatched module."""
     import types
@@ -445,7 +445,7 @@ def test_forced_kernel_rejection_falls_back_correctly(monkeypatch):
     assert fused_swiglu.patch_switch_glu_with_fused_swiglu(model) == 1
 
     def raiser(*args, **kwargs):
-        raise ValueError("forced rejection")
+        raise fused_swiglu.NotFusable("forced rejection")
 
     monkeypatch.setattr(fused_swiglu, "fused_gate_qmv_silu_mul", raiser)
 
@@ -462,3 +462,41 @@ def test_forced_kernel_rejection_falls_back_correctly(monkeypatch):
                 atol=1e-6,
             ).item()
         ), f"forced rejection {label}: max_abs={max_abs:.3e} rel={rel:.2%}"
+
+
+def test_ineligible_input_surfaces_pre_change_message_through_wrapper(
+    monkeypatch, caplog
+):
+    """The K-divisibility diagnostic, the first check in the regime chain,
+    must still reach the wrapper's warning log with the same string the
+    pre-change ValueError carried, now raised as NotFusable."""
+    import logging
+
+    import sglang.srt.hardware_backend.mlx.moe.fused_swiglu as fused_swiglu
+
+    monkeypatch.setattr(fused_swiglu, "_fallback_warned", False)
+    mx.random.seed(0)
+    # in_dim=64 -> K=64, not divisible by BLOCK_SIZE (512): the K check trips
+    # before the N or dtype checks are ever reached.
+    in_dim, hidden, n_experts, top_k, B = 64, 64, 4, 2, 2
+    sw = _quantized_switch_glu(in_dim, hidden, n_experts, gate_bias=False)
+    gate_proj = sw.gate_proj
+
+    x = mx.random.normal((B, 1, 1, in_dim)).astype(mx.float32)
+    idx = mx.random.randint(0, n_experts, shape=(B, top_k)).astype(mx.uint32)
+    x_up = mx.random.normal((B, top_k, 1, hidden)).astype(mx.float32)
+
+    # Verbatim from the pre-change dispatch_fallback ValueError string.
+    expected = (
+        "fused_gate_qmv_silu_mul: K=64 not divisible by 512. Use the unfused path."
+    )
+
+    with caplog.at_level(logging.WARNING):
+        out = fused_swiglu._fused_gate_or_fallback(
+            gate_proj, x, idx, x_up, sorted_indices=False
+        )
+    mx.eval(out)
+
+    assert any(
+        expected in record.getMessage() for record in caplog.records
+    ), f"expected message not in log: {[r.getMessage() for r in caplog.records]}"

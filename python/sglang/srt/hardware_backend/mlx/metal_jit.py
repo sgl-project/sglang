@@ -80,6 +80,12 @@ class WarmupSpec(NamedTuple):
     shapes: tuple = ()
 
 
+class NotFusable(ValueError):
+    """Raised by can_fuse or dispatch_fused when the fused path cannot
+    handle the inputs. Subclasses ValueError so existing catch sites
+    keep working."""
+
+
 class MetalJitOp:
     """Declarative JIT kernel: subclass, set ``source``, register with
     ``@metal_jit.kernel(...)``.
@@ -93,15 +99,21 @@ class MetalJitOp:
 
     source: str  # Body only Metal source; the decorator validates presence.
 
-    def dispatch(self, *args, **kwargs):
-        """Run the op: fused kernel when eligible, reference fallback otherwise."""
-        if self.can_fuse(*args, **kwargs):
-            return self.dispatch_fused(*args, **kwargs)
-        return self.dispatch_fallback(*args, **kwargs)
+    def can_fuse(self, *args, **kwargs) -> bool:
+        return True  # optimistic default; forward ops override with a cheap predicate
 
-    def can_fuse(self, *args, **kwargs):
-        """Eligibility guard: True routes dispatch to the fused kernel."""
-        raise NotImplementedError
+    def dispatch(self, *args, **kwargs):
+        """Run the op: fused when eligible, fallback otherwise.
+
+        dispatch_fused must raise NotFusable before any observable
+        effect, so silent fallback stays safe.
+        """
+        try:
+            if self.can_fuse(*args, **kwargs):
+                return self.dispatch_fused(*args, **kwargs)
+        except NotFusable:
+            pass
+        return self.dispatch_fallback(*args, **kwargs)
 
     def dispatch_fused(self, *args, **kwargs):
         """Fused path: launch geometry plus the kernel call."""

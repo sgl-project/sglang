@@ -266,6 +266,31 @@ class TestMetalJitOpDispatchTemplate(unittest.TestCase):
             self._stub_op(False).dispatch(1, k=2), ("fallback", (1,), {"k": 2})
         )
 
+    def test_dispatch_routes_to_fallback_when_dispatch_fused_raises_not_fusable(self):
+        class _Stub(metal_jit.MetalJitOp):
+            def dispatch_fused(self, *args, **kwargs):
+                raise metal_jit.NotFusable("ineligible")
+
+            def dispatch_fallback(self, *args, **kwargs):
+                return ("fallback", args, kwargs)
+
+        self.assertEqual(_Stub().dispatch(1, k=2), ("fallback", (1,), {"k": 2}))
+
+    def test_not_fusable_is_a_value_error_subclass(self):
+        self.assertTrue(issubclass(metal_jit.NotFusable, ValueError))
+
+    def test_dispatch_propagates_non_not_fusable_value_error(self):
+        class _Stub(metal_jit.MetalJitOp):
+            def dispatch_fused(self, *args, **kwargs):
+                raise ValueError("not a NotFusable")
+
+            def dispatch_fallback(self, *args, **kwargs):
+                return ("fallback", args, kwargs)
+
+        with self.assertRaises(ValueError) as ctx:
+            _Stub().dispatch(1, k=2)
+        self.assertNotIsInstance(ctx.exception, metal_jit.NotFusable)
+
 
 if __name__ == "__main__":
     unittest.main()
