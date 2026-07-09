@@ -133,9 +133,7 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
         scheduler.server_args = MagicMock()
         reqs_before = scheduler.running_batch.reqs
 
-        with patch(
-            "sglang.srt.managers.scheduler.retract_all"
-        ) as mock_retract_all:
+        with patch("sglang.srt.managers.scheduler.retract_all") as mock_retract_all:
             scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
 
         self.assertTrue(scheduler._engine_paused)
