@@ -157,6 +157,9 @@ def cal_padded_tokens(forward_batch: "ForwardBatch"):
     dp_padding_mode = DpPaddingMode.get_dp_padding_mode(
         forward_batch.is_extend_in_batch, global_num_tokens
     )
+    attn_tp_size = get_parallel().attn_tp_size
+    for i in range(sync_group_size):
+        global_num_tokens[i] = ceil_align(global_num_tokens[i], attn_tp_size)
     if dp_padding_mode.is_max_len():
         tokens = max(global_num_tokens)
     elif len(global_num_tokens) > 1:
