@@ -724,7 +724,6 @@ class TboForwardBatchPreparer:
         for key in [
             "forward_mode",
             "is_extend_in_batch",
-            "all_extend_in_batch",
             "return_logprob",
             "can_run_dp_cuda_graph",
             "can_run_dp_breakable_cuda_graph",
