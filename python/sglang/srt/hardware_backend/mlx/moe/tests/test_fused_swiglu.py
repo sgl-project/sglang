@@ -585,3 +585,117 @@ def test_warmup_specs_enumerates_declared_dtypes():
         (dtype,) = spec.dtypes
         assert dtype in _DTYPES
         assert spec.shapes == ()
+
+
+def test_compile_failure_falls_back_via_wrapper(monkeypatch, caplog):
+    """A Metal compile failure inside MetalJitKernel.get() must not crash or
+    silently return None: dispatch_fallback's "unavailable" diagnostic
+    (eligible inputs, fused path unusable) reaches the wrapper's warning log
+    the same way the regime diagnostics do, and the wrapper's except
+    NotFusable still runs the real nn path, matching the unfused reference.
+    """
+    import logging
+
+    import mlx.nn as nn
+
+    import sglang.srt.hardware_backend.mlx.moe.fused_swiglu as fused_swiglu
+    from sglang.srt.hardware_backend.mlx import metal_jit
+
+    monkeypatch.setattr(fused_swiglu, "_fallback_warned", False)
+    mx.random.seed(0)
+    # in_dim=512 -> K=512 (%512==0), hidden=64 -> N=64 (%8==0): in regime.
+    # bf16 scales/biases are inside _DTYPES (unlike _quantized_switch_glu's
+    # default fp32), so this reaches the real kernel dispatch instead of
+    # tripping the dtype-membership NotFusable first.
+    in_dim, hidden, n_experts, top_k, B = 512, 64, 4, 2, 2
+    sw = _bf16_quantized_switch_glu(in_dim, hidden, n_experts)
+    gate_proj = sw.gate_proj
+    dtype = gate_proj.scales.dtype
+    assert dtype in fused_swiglu._DTYPES
+
+    entry = metal_jit._REGISTRY["affine_gather_qmv_silu_mul_4bit_gs64"]
+    monkeypatch.setattr(entry, "_cache", {})
+    monkeypatch.setattr(entry, "_compile_failed", set())
+
+    def failing(*args, **kwargs):
+        raise RuntimeError("forced compile failure")
+
+    monkeypatch.setattr(mx.fast, "metal_kernel", failing)
+
+    x = mx.random.normal((B, 1, 1, in_dim)).astype(dtype)
+    idx = mx.random.randint(0, n_experts, shape=(B, top_k)).astype(mx.uint32)
+    x_up = mx.random.normal((B, top_k, 1, hidden)).astype(dtype)
+
+    with caplog.at_level(logging.WARNING):
+        out = fused_swiglu._fused_gate_or_fallback(
+            gate_proj, x, idx, x_up, sorted_indices=False
+        )
+    mx.eval(out)
+    assert out is not None, "compile failure must not surface as a silent None"
+
+    x_gate = mx.gather_qmm(
+        x,
+        gate_proj["weight"],
+        gate_proj["scales"],
+        gate_proj.get("biases"),
+        rhs_indices=idx,
+        transpose=True,
+        group_size=64,
+        bits=4,
+        mode="affine",
+    )
+    expected = nn.silu(x_gate) * x_up
+    mx.eval(expected)
+    assert bool(
+        mx.array_equal(out, expected).item()
+    ), "compile-failure fallback != unfused reference"
+    assert any(
+        "unavailable" in record.getMessage() for record in caplog.records
+    ), f"expected unavailable message not in log: {[r.getMessage() for r in caplog.records]}"
+
+
+def test_aot_warm_skips_and_logs_on_compile_failure(monkeypatch, caplog):
+    """A Metal compile failure during the AOT warm dispatch surfaces as
+    NotFusable like any other ineligibility; _aot_warm_kernel's existing
+    except NotFusable already catches it, skips the warm, and logs -- this
+    only adds the assertion that Change 1's guard routes here correctly.
+    """
+    import logging
+    import types
+
+    import sglang.srt.hardware_backend.mlx.moe.fused_swiglu as fused_swiglu
+    from sglang.srt.hardware_backend.mlx import metal_jit
+
+    mx.random.seed(0)
+    in_dim, hidden, n_experts, top_k = 512, 64, 4, 4
+    # bf16 scales/biases are inside _DTYPES (unlike _quantized_switch_glu's
+    # default fp32), so this reaches the real kernel dispatch instead of
+    # tripping the dtype-membership NotFusable first.
+    sw = _bf16_quantized_switch_glu(in_dim, hidden, n_experts)
+    assert sw.gate_proj.scales.dtype in fused_swiglu._DTYPES
+
+    entry = metal_jit._REGISTRY["affine_gather_qmv_silu_mul_4bit_gs64"]
+    monkeypatch.setattr(entry, "_cache", {})
+    monkeypatch.setattr(entry, "_compile_failed", set())
+    # Other tests in this file warm this exact (dtype, K, N, T) shape with a
+    # real, successfully-compiled kernel; without resetting _warmed too,
+    # warm_once short-circuits before ever calling dispatch, and the
+    # monkeypatched compile failure below is never reached.
+    monkeypatch.setattr(entry, "_warmed", set())
+
+    def failing(*args, **kwargs):
+        raise RuntimeError("forced compile failure")
+
+    monkeypatch.setattr(mx.fast, "metal_kernel", failing)
+
+    mlp = types.SimpleNamespace(switch_mlp=sw, top_k=top_k)
+    layer = types.SimpleNamespace(mlp=mlp)
+    model = types.SimpleNamespace(model=types.SimpleNamespace(layers=[layer]))
+
+    with caplog.at_level(logging.DEBUG, logger=fused_swiglu.logger.name):
+        n_patched = fused_swiglu.patch_switch_glu_with_fused_swiglu(model)
+
+    assert n_patched == 1, "compile failure at warm time must not block patching"
+    assert any(
+        "skipping warm" in record.getMessage() for record in caplog.records
+    ), f"expected skip-warm debug log not found: {[r.getMessage() for r in caplog.records]}"

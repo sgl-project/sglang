@@ -8,9 +8,12 @@ precompiled kernels.
 
 from __future__ import annotations
 
+import logging
 from typing import Callable, Iterable, NamedTuple
 
 import mlx.core as mx
+
+logger = logging.getLogger(__name__)
 
 
 def dtype_tag(dtype: mx.Dtype) -> str:
@@ -38,18 +41,35 @@ class MetalJitKernel:
         self._output_names = output_names
         self._source = source
         self._cache: dict[tuple[mx.Dtype, ...], object] = {}
+        self._compile_failed: set[tuple[mx.Dtype, ...]] = set()
         self._warmed: set[tuple] = set()
 
     def get(self, *dtypes: mx.Dtype):
-        """Compiled kernel for this dtype key, cached per instance."""
+        """Compiled kernel for this dtype key, cached per instance.
+
+        A Metal compile failure is memoized as NotFusable (mirrors
+        ``can_use_moe_fused_gate`` in jit_kernel/moe_fused_gate.py): the
+        first failing key logs once, and every later call for that key
+        raises immediately without retrying the compile.
+        """
+        if dtypes in self._compile_failed:
+            raise NotFusable(
+                f"metal_jit: {self._name_template!r} previously failed to "
+                f"compile for dtypes={dtypes}"
+            )
         if dtypes not in self._cache:
             name = self._name_template.format(*(dtype_tag(d) for d in dtypes))
-            self._cache[dtypes] = mx.fast.metal_kernel(
-                name=name,
-                input_names=self._input_names,
-                output_names=self._output_names,
-                source=self._source,
-            )
+            try:
+                self._cache[dtypes] = mx.fast.metal_kernel(
+                    name=name,
+                    input_names=self._input_names,
+                    output_names=self._output_names,
+                    source=self._source,
+                )
+            except Exception as e:
+                self._compile_failed.add(dtypes)
+                logger.warning("metal_jit: %s failed to compile: %s", name, e)
+                raise NotFusable(f"metal_jit: {name} failed to compile: {e}") from e
         return self._cache[dtypes]
 
     def warm_once(self, key: tuple, dispatch: Callable[[], mx.array]) -> bool:
@@ -81,9 +101,10 @@ class WarmupSpec(NamedTuple):
 
 
 class NotFusable(ValueError):
-    """Raised by can_fuse or dispatch_fused when the fused path cannot
-    handle the inputs. Subclasses ValueError so existing catch sites
-    keep working."""
+    """Raised by dispatch_fused: its own eligibility checks, or a Metal
+    compile failure surfaced through MetalJitKernel.get, when the fused
+    path cannot handle the inputs. Subclasses ValueError so existing catch
+    sites keep working."""
 
 
 class MetalJitOp:
@@ -106,7 +127,9 @@ class MetalJitOp:
         """Run the op: fused when eligible, fallback otherwise.
 
         dispatch_fused must raise NotFusable before any observable
-        effect, so silent fallback stays safe.
+        effect, so silent fallback stays safe. A NotFusable raised by
+        dispatch_fallback itself is not caught here; it propagates to the
+        caller by design.
         """
         try:
             if self.can_fuse(*args, **kwargs):
@@ -120,7 +143,15 @@ class MetalJitOp:
         raise NotImplementedError
 
     def dispatch_fallback(self, *args, **kwargs):
-        """Reference path for inputs can_fuse declines."""
+        """Reference path for inputs can_fuse declines.
+
+        Two sanctioned shapes: (1) compute and return the reference result
+        (see FusedMoeCombineKernel), or (2) when the real fallback lives
+        at the wrapper layer, must always raise NotFusable and never
+        return a value (see FusedGateQmvSiluMulKernel) -- callers are
+        documented to catch it. Falling off the end and returning None is
+        not a sanctioned outcome for either shape.
+        """
         raise NotImplementedError
 
     def warmup_specs(self, model) -> Iterable[WarmupSpec]:

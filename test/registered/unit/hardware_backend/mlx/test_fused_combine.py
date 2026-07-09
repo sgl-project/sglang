@@ -311,6 +311,39 @@ class TestFusedCombine(unittest.TestCase):
                     ).item()
                 )
 
+    def test_compile_failure_falls_back_and_memoizes(self):
+        """A Metal compile failure degrades to the reference result instead
+        of crashing (DSV4 can_use_moe_fused_gate pattern: catch, log once,
+        memoize); the failing compile is attempted exactly once across two
+        calls sharing the same dtype key.
+        """
+        entry = metal_jit._REGISTRY["fused_moe_combine"]
+        orig_cache, orig_failed = entry._cache, entry._compile_failed
+        orig_metal_kernel = mx.fast.metal_kernel
+        entry._cache = {}
+        entry._compile_failed = set()
+        calls = []
+
+        def failing(*args, **kwargs):
+            calls.append(1)
+            raise RuntimeError("forced compile failure")
+
+        mx.fast.metal_kernel = failing
+        try:
+            y, scores = self._make_inputs((1, 8, 256), "float16", "float16", 42)
+            self.assertTrue(fc.can_fuse(y, scores))
+            expected = (y * scores[..., None]).sum(axis=-2).astype(y.dtype)
+            out1 = fc.fused_combine(y, scores)
+            out2 = fc.fused_combine(y, scores)
+            mx.eval(out1, out2)
+            self.assertTrue(bool(mx.array_equal(out1, expected).item()))
+            self.assertTrue(bool(mx.array_equal(out2, expected).item()))
+            self.assertEqual(len(calls), 1, "compile must be attempted exactly once")
+        finally:
+            mx.fast.metal_kernel = orig_metal_kernel
+            entry._cache = orig_cache
+            entry._compile_failed = orig_failed
+
     @classmethod
     def tearDownClass(cls):
         if not cls._results:

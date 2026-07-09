@@ -286,6 +286,23 @@ class TestMetalJitOpDispatchTemplate(unittest.TestCase):
             _Stub().dispatch(1, k=2)
         self.assertNotIsInstance(ctx.exception, metal_jit.NotFusable)
 
+    def test_dispatch_lets_fallback_not_fusable_propagate(self):
+        """dispatch_fallback re-raising NotFusable is a sanctioned pattern
+        (see FusedGateQmvSiluMulKernel): dispatch must not swallow it or
+        loop back into dispatch_fused.
+        """
+
+        class _Stub(metal_jit.MetalJitOp):
+            def dispatch_fused(self, *args, **kwargs):
+                raise metal_jit.NotFusable("ineligible")
+
+            def dispatch_fallback(self, *args, **kwargs):
+                raise metal_jit.NotFusable("no in-op fallback")
+
+        with self.assertRaises(metal_jit.NotFusable) as ctx:
+            _Stub().dispatch(1, k=2)
+        self.assertEqual(str(ctx.exception), "no in-op fallback")
+
 
 if __name__ == "__main__":
     unittest.main()

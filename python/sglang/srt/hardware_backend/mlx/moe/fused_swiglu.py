@@ -31,7 +31,7 @@ Qwen1.5-MoE-A2.7B-4bit:
 - bits=4, mode='affine', group_size=64
 - K (input_dim) divisible by 512  (Qwen3: 2048, Qwen1.5: 2048)
 - N (output_dim) divisible by 8   (Qwen3: 768, Qwen1.5: 1408)
-- Scales/biases dtype matches the input dtype (bf16 or fp16)
+- Scales/biases dtype matches the input dtype; see `_DTYPES`
 
 Anything outside that falls back to the unfused mlx_lm path.
 
@@ -332,13 +332,21 @@ class FusedGateQmvSiluMulKernel(metal_jit.MetalJitOp):
         indices: mx.array,
         x_up: mx.array,
     ):
-        """Raise the regime diagnostic; this op has no in-op reference path.
+        """Always raise; this op has no in-op reference path.
 
         The unfused gate path needs the gate module and the sorted flag,
         neither of which the op receives; _fused_gate_or_fallback catches
-        this NotFusable and runs it.
+        this NotFusable and runs it. Re-raises the regime diagnostic when
+        the inputs are themselves ineligible; otherwise dispatch_fused's
+        NotFusable came from something eligibility cannot see (e.g. a
+        Metal compile failure), so raise the "unavailable" diagnostic
+        instead of falling off the end and returning None.
         """
         self._check_eligibility(x, gate_w, gate_s, gate_b)
+        raise NotFusable(
+            "fused_gate_qmv_silu_mul: eligible inputs but fused path "
+            "unavailable (kernel compile failed); falling back"
+        )
 
     def warmup_specs(self, model) -> list[metal_jit.WarmupSpec]:
         """One spec per dtype this op's affine gs64 regime accepts.
