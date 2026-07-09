@@ -145,6 +145,7 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.multi_tokenizer_mixin import (
     MultiTokenizerRouter,
     TokenizerWorker,
+    get_tokenizer_worker_class,
     get_main_process_id,
     read_from_shared_memory,
     write_data_for_multi_tokenizer,
@@ -236,7 +237,8 @@ async def init_multi_tokenizer() -> ServerArgs:
     )
 
     # Launch multi-tokenizer manager process
-    tokenizer_manager = TokenizerWorker(server_args, port_args)
+    tokenizer_worker_class = get_tokenizer_worker_class(server_args)
+    tokenizer_manager = tokenizer_worker_class(server_args, port_args)
     template_manager = TemplateManager()
     template_manager.initialize_templates(
         tokenizer_manager=tokenizer_manager,
