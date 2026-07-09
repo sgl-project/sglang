@@ -48,6 +48,7 @@ def _prefill_bnsd_score_kernel(
     qb_to_qstart_ptr,  # [all_seqblock_q]
     qb_to_qblock_ptr,  # [all_seqblock_q]
     qb_seq_lens_ptr,  # [all_seqblock_q]
+    qb_qend_ptr,  # [all_seqblock_q] exclusive q upper bound (cu_seqlens[r+1])
     score_ptr,  # [num_idx_heads, total_q, max_seqblock_k]
     # scalars
     total_q,
@@ -104,6 +105,7 @@ def _prefill_bnsd_score_kernel(
 
     q_start = tl.load(qb_to_qstart_ptr + pid_qb).to(tl.int32)
     q_block_local = tl.load(qb_to_qblock_ptr + pid_qb).to(tl.int32)
+    q_end = tl.load(qb_qend_ptr + pid_qb).to(tl.int32)
 
     off_d = tl.arange(0, BLOCK_SIZE_D)  # [D]
     off_n = tl.arange(0, BLOCK_SIZE_N)  # [N]
@@ -114,11 +116,17 @@ def _prefill_bnsd_score_kernel(
     qi = off_qh // BLOCK_SIZE_H  # query row within the block
     hh = off_qh % BLOCK_SIZE_H  # head index within the GQA group
     pid_h_base = pid_kh * gqa_group_size
-    q_token_flat = q_start + q_block_local * BLOCK_SIZE_Q + qi  # [BSQ*H]
+    q_token_raw = q_start + q_block_local * BLOCK_SIZE_Q + qi  # [BSQ*H]
     head_flat = pid_h_base + hh  # actual idx-head index per row
-    row_valid = (q_token_flat < total_q) & (hh < gqa_group_size)
+    # q_end (= cu_seqlens[r+1]) bounds to THIS request's real tokens so phantom
+    # rows of a partial-tail q-block (block_size_q>1, extend not a BLOCK_SIZE_Q
+    # multiple) are masked. Clamp q_token for the Q load to [q_start, q_end-1] so
+    # phantom rows never read across the request boundary into the next request's
+    # Q data, wasting memory bandwidth. q_end <= total_q always.
+    row_valid = (q_token_raw < q_end) & (hh < gqa_group_size)
+    q_token_flat = tl.maximum(q_start, tl.minimum(q_token_raw, q_end - 1))
 
-    # Q load: [BSQ*H, D]
+    # Q load: [BSQ*H, D]  (clamped q_token keeps reads in-request)
     q_offsets = (
         q_token_flat[:, None] * stride_q_n
         + head_flat[:, None] * stride_q_h
@@ -156,8 +164,9 @@ def _prefill_bnsd_score_kernel(
 
         qk = tl.dot(q, k) * sm_scale_log2e  # [BSQ*H, N], 2D dot -- no 3D reshape
 
-        # Causal: query token >= key position. Broadcast over heads.
-        causal = q_token_flat[:, None] >= key_pos[None, :]
+        # Causal: query token >= key position (use q_token_raw for correct per-
+        # token position; phantom rows are masked by row_valid downstream).
+        causal = q_token_raw[:, None] >= key_pos[None, :]
         qk = tl.where(causal & pos_mask[None, :], qk, float("-inf"))
 
         sub_max = tl.max(qk, axis=1)  # [BSQ*H]
@@ -169,7 +178,7 @@ def _prefill_bnsd_score_kernel(
 
         s_offsets = (
             head_flat * stride_s_h
-            + q_token_flat * stride_s_q
+            + q_token_raw * stride_s_q
             + logical_block * stride_s_n
         )
         tl.store(
@@ -188,6 +197,7 @@ def _prefill_bnsd_score_attn_kernel(
     qb_to_qstart_ptr,  # [all_seqblock_q]
     qb_to_qblock_ptr,  # [all_seqblock_q]
     qb_seq_lens_ptr,  # [all_seqblock_q]
+    qb_qend_ptr,  # [all_seqblock_q] exclusive q upper bound (cu_seqlens[r+1])
     score_ptr,  # [num_idx_heads, total_q, max_seqblock_k]
     idx_o_ptr,  # [total_q, num_idx_heads, head_dim]
     # scalars
@@ -246,6 +256,7 @@ def _prefill_bnsd_score_attn_kernel(
 
     q_start = tl.load(qb_to_qstart_ptr + pid_qb).to(tl.int32)
     q_block_local = tl.load(qb_to_qblock_ptr + pid_qb).to(tl.int32)
+    q_end = tl.load(qb_qend_ptr + pid_qb).to(tl.int32)
 
     off_d = tl.arange(0, BLOCK_SIZE_D)
     off_n = tl.arange(0, BLOCK_SIZE_N)
@@ -253,9 +264,15 @@ def _prefill_bnsd_score_attn_kernel(
     qi = off_qh // BLOCK_SIZE_H
     hh = off_qh % BLOCK_SIZE_H
     pid_h_base = pid_kh * gqa_group_size
-    q_token_flat = q_start + q_block_local * BLOCK_SIZE_Q + qi
+    # q_end (= cu_seqlens[r+1]) bounds to THIS request's real tokens so phantom
+    # rows of a partial-tail q-block (block_size_q>1, extend not a BLOCK_SIZE_Q
+    # multiple) are masked. Clamp q_token for the Q load to [q_start, q_end-1] so
+    # phantom rows never read across the request boundary into the next request's
+    # Q data, wasting memory bandwidth. q_end <= total_q always.
+    q_token_raw = q_start + q_block_local * BLOCK_SIZE_Q + qi
+    row_valid = (q_token_raw < q_end) & (hh < gqa_group_size)
+    q_token_flat = tl.maximum(q_start, tl.minimum(q_token_raw, q_end - 1))
     head_flat = pid_h_base + hh
-    row_valid = (q_token_flat < total_q) & (hh < gqa_group_size)
 
     q_offsets = (
         q_token_flat[:, None] * stride_q_n
@@ -292,7 +309,7 @@ def _prefill_bnsd_score_attn_kernel(
             other=0.0,
         )
         qk = tl.dot(q, k) * sm_scale_log2e  # [M, N]
-        causal = q_token_flat[:, None] >= key_pos[None, :]
+        causal = q_token_raw[:, None] >= key_pos[None, :]
         qk = tl.where(causal & pos_mask[None, :], qk, float("-inf"))
 
         # per-block score (same as the score-only kernel)
@@ -303,7 +320,7 @@ def _prefill_bnsd_score_attn_kernel(
             score = sub_max + tl.log2(tl.sum(tl.exp2(qk - sub_max[:, None]), axis=1))
             score = tl.where(score != score, float("-inf"), score)
         s_offsets = (
-            head_flat * stride_s_h + q_token_flat * stride_s_q + logical_block * stride_s_n
+            head_flat * stride_s_h + q_token_raw * stride_s_q + logical_block * stride_s_n
         )
         tl.store(
             score_ptr + s_offsets, score.to(score_ptr.dtype.element_ty), mask=row_valid
@@ -334,7 +351,7 @@ def _prefill_bnsd_score_attn_kernel(
 
     idx_o = acc_o / l_i[:, None]
     o_offsets = (
-        q_token_flat[:, None] * stride_o_n
+        q_token_raw[:, None] * stride_o_n
         + head_flat[:, None] * stride_o_h
         + off_d[None, :] * stride_o_d
     )
@@ -371,6 +388,13 @@ def _build_qblock_mappings(
     # Owning request + q-start (token) per query-block.
     qb_to_req = reqs.repeat_interleave(qb_per_req)  # [all_seqblock_q]
     qb_to_qstart = cu_q[:-1].repeat_interleave(qb_per_req)
+    # Per-q-block exclusive upper bound on q_token_flat (= cu_seqlens[r+1] for
+    # request r's blocks). Masks the partial tail of a request's last q-block at
+    # block_size_q>1: without it, phantom rows (qi past the request's real
+    # q_len) have q_token_flat < total_q (== next request's tokens) and would
+    # read the next request's Q + score it against THIS request's KV, corrupting
+    # the next request's score rows (cross-request contamination).
+    qb_qend = cu_q[1:].repeat_interleave(qb_per_req)
     qb_seq_lens = seq_lens_l.repeat_interleave(qb_per_req)
     # Local q-block index within its request.
     cu_blocks = torch.zeros_like(qb_per_req)
@@ -395,6 +419,7 @@ def _build_qblock_mappings(
         qb_to_qstart.to(torch.int32),
         qb_to_qblock.to(torch.int32),
         qb_seq_lens.to(torch.int32),
+        qb_qend.to(torch.int32),
         block_table,
         all_seqblock_q,
     )
@@ -433,6 +458,7 @@ def flash_prefill_bnsd_score(
         qb_to_qstart,
         qb_to_qblock,
         qb_seq_lens,
+        qb_qend,
         block_table,
         all_seqblock_q,
     ) = _build_qblock_mappings(
@@ -476,6 +502,7 @@ def flash_prefill_bnsd_score(
         qb_to_qstart,
         qb_to_qblock,
         qb_seq_lens,
+        qb_qend,
         score,
         total_q,
         num_kv_heads,
@@ -539,6 +566,7 @@ def flash_prefill_bnsd_score_attn(
         qb_to_qstart,
         qb_to_qblock,
         qb_seq_lens,
+        qb_qend,
         block_table,
         all_seqblock_q,
     ) = _build_qblock_mappings(
@@ -557,7 +585,7 @@ def flash_prefill_bnsd_score_attn(
         grid = (all_seqblock_q, num_kv_heads)
         _prefill_bnsd_score_attn_kernel[grid](
             q, k_cache_bnsd, v_cache_bnsd, block_table,
-            qb_to_qstart, qb_to_qblock, qb_seq_lens, score, idx_o,
+            qb_to_qstart, qb_to_qblock, qb_seq_lens, qb_qend, score, idx_o,
             total_q, num_kv_heads, gqa_group_size, head_dim, all_seqblock_q, sm_scale,
             q.stride(0), q.stride(1), q.stride(2),
             k_cache_bnsd.stride(0), k_cache_bnsd.stride(1), k_cache_bnsd.stride(2), k_cache_bnsd.stride(3),

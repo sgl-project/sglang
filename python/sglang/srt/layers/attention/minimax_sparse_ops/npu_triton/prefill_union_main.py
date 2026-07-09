@@ -158,6 +158,12 @@ def _gqa_share_sparse_prefill_union_kernel(
     stride_l_c,
     stride_l_n,
     stride_l_h,
+    # precomputed qi/hhi [BSQ_KERNEL * H_TILE] (host-computed to avoid divmod
+    # which compiles poorly on Ascend TBE)
+    qi_arr_ptr,
+    hhi_arr_ptr,
+    stride_qi,  # == 1
+    stride_hhi,  # == 1
     # meta
     BSQ_KERNEL: tl.constexpr,
     H_TILE: tl.constexpr,
@@ -192,12 +198,12 @@ def _gqa_share_sparse_prefill_union_kernel(
 
     pid_h_base = pid_kh * gqa_group_size + pid_ht * H_TILE
 
-    # Flattened (token-in-tile, head-in-tile) -> [BSQ*H_TILE], kept 1D: a
-    # [BSQ, H] int32 2D tensor with a small H fails the Ascend TBE stride-
-    # alignment check ("cannot align 0 axis").
+    # Load precomputed qi/hhi lookup tables (host-computed to avoid divmod
+    # which compiles poorly on Ascend TBE). These are tiny (<=32 elements for
+    # BSQ=4,H_TILE=8) and reside in L1 cache after the first access.
     off_qh = tl.arange(0, BSQ_KERNEL * H_TILE)  # [BSQ*H_TILE]
-    qi = off_qh // H_TILE  # token-in-tile [0, BSQ_KERNEL)
-    hhi = off_qh % H_TILE  # head-in-tile [0, H_TILE)
+    qi = tl.load(qi_arr_ptr + off_qh * stride_qi)    # token-in-tile [0, BSQ_KERNEL)
+    hhi = tl.load(hhi_arr_ptr + off_qh * stride_hhi) # head-in-tile  [0, H_TILE)
 
     q_token = q_start + qi  # global q-token index [BSQ*H_TILE]
     head_idx = pid_h_base + hhi  # global q-head index [BSQ*H_TILE]
@@ -657,6 +663,12 @@ def flash_prefill_union_main_bnsd(
 
     sink_arg = sink if sink is not None else q  # typed placeholder for dead branch
 
+    # Precompute qi/hhi lookup tables (avoid divmod in the kernel, which
+    # compiles poorly on Ascend TBE). These are tiny (<=32 elements for
+    # BSQ=4,H_TILE=8) and broadcast-read by every program.
+    qi_arr = torch.arange(bsq_kernel, device=device, dtype=torch.int32).repeat_interleave(h_tile)
+    hhi_arr = torch.arange(h_tile, device=device, dtype=torch.int32).repeat(bsq_kernel)
+
     grid = (all_qtile * num_union_chunks, num_kv_heads * num_h_tiles)
     _gqa_share_sparse_prefill_union_kernel[grid](
         q,
@@ -711,6 +723,10 @@ def flash_prefill_union_main_bnsd(
         lse_partial.stride(0),
         lse_partial.stride(1),
         lse_partial.stride(2),
+        qi_arr,
+        hhi_arr,
+        1,  # stride_qi
+        1,  # stride_hhi
         BSQ_KERNEL=bsq_kernel,
         H_TILE=h_tile,
         NUM_H_TILES=num_h_tiles,
