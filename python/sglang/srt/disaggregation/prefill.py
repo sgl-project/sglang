@@ -648,7 +648,9 @@ class SchedulerDisaggregationPrefillMixin:
                 if self.spec_algorithm.is_eagle() and draft_input is not None:
                     req.output_topk_p = draft_input.topk_p[i]
                     req.output_topk_index = draft_input.topk_index[i]
-                    req.hidden_states_tensor = draft_input.hidden_states[i].cpu().clone()
+                    req.hidden_states_tensor = (
+                        draft_input.hidden_states[i].cpu().clone()
+                    )
                 else:
                     req.hidden_states_tensor = None
                 if req.return_logprob:
