@@ -325,9 +325,6 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
 
     def test_retract_empty_post_fold_keeps_chunked_req(self):
         """retract with nothing to retract leaves chunked_req and batch_is_full alone."""
-        # Suspected bug kept for equivalence (B2): when the post-fold running
-        # batch is empty, chunked_req is not cleared and batch_is_full is not
-        # reset. See the pause-retract existing-bugs note.
         scheduler = self._new_scheduler()
         scheduler.running_batch = ScheduleBatch(reqs=[], batch_is_full=True)
         chunked_req = MagicMock()
