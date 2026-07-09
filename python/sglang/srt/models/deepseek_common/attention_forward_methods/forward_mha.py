@@ -15,6 +15,9 @@ from sglang.srt.layers.dcp import (
     dcp_enabled,
     filter_dcp_local_kv_indices,
 )
+from sglang.srt.layers.quantization.fp8_utils import (
+    materialize_bpreshuffle_fp8_scale_tuple,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
@@ -159,8 +162,10 @@ class DeepseekMHAForwardMixin:
                         dtype_quant=torch.float8_e4m3fn,
                         res1=None,
                         output_unquantized_inp1=True,
-                        transpose_scale=_use_aiter_bpreshuffle_gfx95,
+                        transpose_scale=False,
                     )
+                    if _use_aiter_bpreshuffle_gfx95:
+                        q_quanted = materialize_bpreshuffle_fp8_scale_tuple(q_quanted)
                     q = self.q_b_proj(q_quanted)[0].view(
                         -1, self.num_local_heads, self.qk_head_dim
                     )
@@ -202,8 +207,10 @@ class DeepseekMHAForwardMixin:
                     dtype_quant=torch.float8_e4m3fn,
                     res1=None,
                     output_unquantized_inp1=False,
-                    transpose_scale=_use_aiter_bpreshuffle_gfx95,
+                    transpose_scale=False,
                 )
+                if _use_aiter_bpreshuffle_gfx95:
+                    q = materialize_bpreshuffle_fp8_scale_tuple(q)
                 q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
             else:
                 q = self.q_a_layernorm(q)
@@ -232,8 +239,10 @@ class DeepseekMHAForwardMixin:
                 dtype_quant=torch.float8_e4m3fn,
                 res1=None,
                 output_unquantized_inp1=True,  # return unqaunt kv_a
-                transpose_scale=_use_aiter_bpreshuffle_gfx95,
+                transpose_scale=False,
             )
+            if _use_aiter_bpreshuffle_gfx95:
+                kv_a_quanted = materialize_bpreshuffle_fp8_scale_tuple(kv_a_quanted)
 
         else:
             kv_a = self.kv_a_layernorm(kv_a)
