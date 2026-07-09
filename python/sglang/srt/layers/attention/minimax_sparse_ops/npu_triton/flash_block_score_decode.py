@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import logging
 from typing import Optional
 
 import torch
 import triton
 import triton.language as tl
+
+logger = logging.getLogger(__name__)
 
 
 def _next_power_of_2(x: int) -> int:
@@ -72,7 +75,7 @@ def _choose_num_kv_chunks(
 def _choose_num_score_chunks(
     max_seqblock: int,
     blocks_per_chunk: int = 16,
-    max_chunks: int = 16,
+    max_chunks: int = 32,
     all_seqblock_q: int = 1,
     num_kv_heads: int = 1,
     program_cap: int = 32768,
@@ -1059,6 +1062,16 @@ def flash_decode_bnsd_with_topk_idx(
     # Current serving (context-length=10240 -> max_seqblock<=80) stays on triton.
     if use_triton_topk is None:
         use_triton_topk = max_seqblock <= 256
+    elif use_triton_topk and max_seqblock > 256:
+        # Hard guard: triton streaming topk does a serial O(max_seqblock) scan
+        # with num_warps=1 and would be catastrophic (>1024 serial iterations at
+        # 128K). Force torch.topk path instead.
+        logger.warning(
+            f"[MiniMaxSparse] use_triton_topk=True forced but max_seqblock="
+            f"{max_seqblock} > 256 — overriding to False (torch path) to avoid "
+            f"serial-scan catastrophe"
+        )
+        use_triton_topk = False
 
     # Trivial-skip gate: only skip score writes when the downstream topk backend
     # does not read score for trivial batches (num_blocks <= topk). The streaming
