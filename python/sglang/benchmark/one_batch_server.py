@@ -485,6 +485,9 @@ def _flush_cache_with_retry(url: str, endpoint: str, max_retries: int = 3):
 
 @lru_cache(maxsize=None)
 def _load_hf_config(name_or_path: str):
+    if not name_or_path:
+        return None
+
     from transformers import AutoConfig
 
     try:
