@@ -159,6 +159,14 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
     # read seq_lens_cpu / seq_lens_sum; opt out of the D2H sync.
     needs_cpu_seq_lens: bool = False
 
+    def update_verify_buffers_to_fill_after_draft(self, spec_info, cuda_graph_bs):
+        # Plan-stream fixup hook: nothing to redo. Plan-time metadata (paged
+        # block tables from req_to_token / seq_lens) is draft-output
+        # independent, and the draft-dependent inputs (input_ids / positions)
+        # are re-copied on the compute stream by load_batch's pre-planned fast
+        # path. Chain (topk=1) verify consumes no tree mask.
+        pass
+
     def __init__(
         self,
         model_runner: ModelRunner,

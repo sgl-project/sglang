@@ -252,6 +252,14 @@ class MambaAttnBackendBase(AttentionBackend):
             mamba_track_indices=getattr(forward_batch, "mamba_track_indices", None),
         )
 
+    def update_verify_buffers_to_fill_after_draft(
+        self, spec_info: SpecInput, cuda_graph_bs: Optional[int]
+    ):
+        # Plan-stream fixup hook: mamba plan-time metadata (state slot indices,
+        # per-bs static query_start_loc) is draft-output independent — nothing
+        # to redo. Mirrors AscendHybridLinearAttnBackend.
+        pass
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         self.forward_metadata = self._forward_metadata(forward_batch)
 
@@ -915,6 +923,17 @@ class HybridLinearAttnBackend(AttentionBackend):
         for attn_backend in self.attn_backend_list:
             attn_backend.init_forward_metadata_out_graph(
                 forward_batch, in_capture=in_capture
+            )
+
+    def update_verify_buffers_to_fill_after_draft(
+        self, spec_info: SpecInput, cuda_graph_bs: Optional[int]
+    ):
+        # Plan-stream fixup after draft completes: forward to both children.
+        # Sub-backends that cannot run under the plan stream keep the
+        # fail-loud NotImplementedError base behavior.
+        for attn_backend in self.attn_backend_list:
+            attn_backend.update_verify_buffers_to_fill_after_draft(
+                spec_info, cuda_graph_bs
             )
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
