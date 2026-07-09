@@ -80,10 +80,14 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.deepseek_nextn import DeepseekV3ForCausalLMNextN
 from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
-from sglang.srt.models.utils import apply_qk_norm
-from sglang.srt.runtime_context import get_parallel, get_server_args, get_stream
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.models.utils import WeightsMapper, apply_qk_norm
+from sglang.srt.runtime_context import (
+    get_parallel,
+    get_server_args,
+    get_stream,
+)
 from sglang.srt.utils import (
     add_prefix,
     cpu_has_amx_support,
@@ -525,8 +529,7 @@ class Glm4MoeSparseMoeBlock(nn.Module):
             # TODO: we will support tp < ep in the future
             self.ep_size = get_parallel().moe_ep_size
             self.num_experts = (
-                config.n_routed_experts
-                + get_global_server_args().ep_num_redundant_experts
+                config.n_routed_experts + get_server_args().ep_num_redundant_experts
             )
             self.renormalize = config.norm_topk_prob
             self.topk_group = config.topk_group
@@ -1484,4 +1487,72 @@ class GlmMoeDsaForCausalLM(DeepseekV2ForCausalLM):
         super().determine_num_fused_shared_experts("GlmMoeDsaForCausalLM")
 
 
-EntryClass = [Glm4MoeForCausalLM, GlmMoeDsaForCausalLM]
+class GlmMoeDsaForCausalLMNextN(DeepseekV3ForCausalLMNextN):
+    # GLM-5.2's MTP layer index differs from DeepSeek's (61), so the inherited
+    # substr mapping would wrongly rewrite GLM's real layer-61 weights.
+    # exclude_layers remapping for the MTP layer is handled explicitly in
+    # _resolve_nextn_quant_config below instead.
+    hf_to_sglang_mapper = WeightsMapper()
+
+    _NEXTN_SPEC_WEIGHT_NAMES = ("shared_head.norm", "eh_proj", "enorm", "hnorm")
+
+    @classmethod
+    def _map_mtp_ckpt_name(cls, name: str, layer_prefix: str) -> str:
+        # Keep this mapping in sync with DeepseekV2WeightLoaderMixin's
+        # NextN rule: MTP-specific weights live under model.*, while the
+        # decoder block weights live under model.decoder.*.
+        if any(part in name for part in cls._NEXTN_SPEC_WEIGHT_NAMES):
+            return name.replace(layer_prefix, "model", 1)
+        return name.replace(layer_prefix, "model.decoder", 1)
+
+    def _resolve_nextn_quant_config(self, config, quant_config):
+        if quant_config is None or quant_config.get_name() != "quark":
+            return quant_config
+
+        layer_prefix = f"model.layers.{config.num_hidden_layers}"
+
+        # Quark's per-module scheme selection (e.g. MTP self_attn in PTPC-FP8
+        # while MTP MoE is MXFP4) is keyed by "layer_quant_config" patterns
+        # using the checkpoint's "model.layers.<N>.*" naming. SGLang queries
+        # schemes by the runtime "model.*"/"model.decoder.*" prefix, so those
+        # keys need the same remap as exclude_layers below, or they silently
+        # fall back to the wrong (layer-type/global) scheme.
+        layer_quant_config = quant_config.quant_config.get("layer_quant_config")
+        if layer_quant_config:
+            quant_config.quant_config["layer_quant_config"] = {
+                (
+                    self._map_mtp_ckpt_name(pattern, layer_prefix)
+                    if pattern.startswith(layer_prefix + ".")
+                    else pattern
+                ): pattern_config
+                for pattern, pattern_config in layer_quant_config.items()
+            }
+
+        mtp_excluded = [
+            name
+            for name in quant_config.exclude_layers
+            if name.startswith(layer_prefix + ".")
+        ]
+        if not mtp_excluded:
+            return quant_config
+
+        names = set(quant_config.exclude_layers)
+        for name in mtp_excluded:
+            names.add(self._map_mtp_ckpt_name(name, layer_prefix))
+
+        # Fused routed experts are queried by the coarse module prefix
+        # "model.decoder.mlp.experts". Expanded per-expert leaf excludes do not
+        # match that prefix, so add the coarse prefix when any routed expert in
+        # the MTP layer is excluded. This keeps only that fused MoE module bf16
+        # while allowing the remaining draft modules to use their quant config.
+        if any(".mlp.experts." in name for name in mtp_excluded):
+            names.add("model.decoder.mlp.experts")
+
+        import copy
+
+        quant_config = copy.copy(quant_config)
+        quant_config.exclude_layers = list(names)
+        return quant_config
+
+
+EntryClass = [Glm4MoeForCausalLM, GlmMoeDsaForCausalLM, GlmMoeDsaForCausalLMNextN]
