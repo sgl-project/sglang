@@ -523,9 +523,7 @@ def get_tokenizer(
                     *args,
                     **{**common_kwargs, "use_fast": False},
                 )
-                if slow is not None and not isinstance(
-                    slow, PreTrainedTokenizerFast
-                ):
+                if slow is not None and not isinstance(slow, PreTrainedTokenizerFast):
                     logger.warning(
                         "Fast tokenizer for %s was created via slow to fast "
                         "conversion (no tokenizer.json). Falling back to "
