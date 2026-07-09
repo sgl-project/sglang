@@ -1,0 +1,53 @@
+[
+  {
+    "model_path": "openai/gpt-oss-120b",
+    "run_name": "MXFP4+Parsers+EAGLE3",
+    "batch_size": 1,
+    "input_len": 4096,
+    "output_len": 512,
+    "latency": 1.1018331218510866,
+    "input_throughput": 49769.57046976964,
+    "output_throughput": 502.19029603896684,
+    "overall_throughput": 4182.1215106136315,
+    "last_ttft": 0.08229928370565176,
+    "last_gen_throughput": 527.5836226514156,
+    "acc_length": 2.05,
+    "profile_link_extend": "/data/users/lmzheng/gitrepos/sglang/performance_profiles_gpt_oss_120b/openai_gpt-oss-120b_MXFP4+Parsers+EAGLE3_1780805144/1780805187.063785/bs-1-il-4096-1780805187.0764258-TP-0-EXTEND.trace.json.gz",
+    "profile_link_decode": "/data/users/lmzheng/gitrepos/sglang/performance_profiles_gpt_oss_120b/openai_gpt-oss-120b_MXFP4+Parsers+EAGLE3_1780805144/1780805187.063785/bs-1-il-4096-1780805187.0764258-TP-0-DECODE.trace.json.gz",
+    "server_args": []
+  },
+  {
+    "model_path": "openai/gpt-oss-120b",
+    "run_name": "MXFP4+Parsers+EAGLE3",
+    "batch_size": 8,
+    "input_len": 4096,
+    "output_len": 512,
+    "latency": 2.18560847081244,
+    "input_throughput": 220903.0162186706,
+    "output_throughput": 2010.5318476355571,
+    "overall_throughput": 16866.698904354456,
+    "last_ttft": 0.14833658933639526,
+    "last_gen_throughput": 496.42846155838214,
+    "acc_length": 1.8717361429225836,
+    "profile_link_extend": "/data/users/lmzheng/gitrepos/sglang/performance_profiles_gpt_oss_120b/openai_gpt-oss-120b_MXFP4+Parsers+EAGLE3_1780805144/1780805194.2642078/bs-8-il-4096-1780805194.2730176-TP-0-EXTEND.trace.json.gz",
+    "profile_link_decode": "/data/users/lmzheng/gitrepos/sglang/performance_profiles_gpt_oss_120b/openai_gpt-oss-120b_MXFP4+Parsers+EAGLE3_1780805144/1780805194.2642078/bs-8-il-4096-1780805194.2730176-TP-0-DECODE.trace.json.gz",
+    "server_args": []
+  },
+  {
+    "model_path": "openai/gpt-oss-120b",
+    "run_name": "MXFP4+Parsers+EAGLE3",
+    "batch_size": 16,
+    "input_len": 4096,
+    "output_len": 512,
+    "latency": 2.402800758369267,
+    "input_throughput": 235102.58803711334,
+    "output_throughput": 3856.790564889787,
+    "overall_throughput": 30684.192080094785,
+    "last_ttft": 0.2787549067288637,
+    "last_gen_throughput": 551.7100373156017,
+    "acc_length": 2.0966097374458323,
+    "profile_link_extend": "/data/users/lmzheng/gitrepos/sglang/performance_profiles_gpt_oss_120b/openai_gpt-oss-120b_MXFP4+Parsers+EAGLE3_1780805144/1780805200.714155/bs-16-il-4096-1780805200.723077-TP-0-EXTEND.trace.json.gz",
+    "profile_link_decode": "/data/users/lmzheng/gitrepos/sglang/performance_profiles_gpt_oss_120b/openai_gpt-oss-120b_MXFP4+Parsers+EAGLE3_1780805144/1780805200.714155/bs-16-il-4096-1780805200.723077-TP-0-DECODE.trace.json.gz",
+    "server_args": []
+  }
+]

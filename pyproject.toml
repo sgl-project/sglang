@@ -1,0 +1,17 @@
+[project]
+name = "sglang-workspace"
+version = "0.1.0"
+description = "SGLang dev workspace"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "sglang",
+]
+
+[tool.uv.workspace]
+members = ["python"]
+
+[tool.uv]
+override-dependencies = []
+
+[tool.uv.sources]
+sglang = { workspace = true }
