@@ -786,6 +786,23 @@ class DeepseekV4AttnBackend(
             c128_compress_metadata=c128_compress_metadata,
         )
 
+    def _ensure_verify_bs_buffers(self) -> None:
+        if hasattr(self, "extend_seq_lens_buffer") and not (
+            self.extend_seq_lens_buffer.is_inference()
+            or self.extend_start_loc_buffer.is_inference()
+        ):
+            return
+        num_reqs = self.req_to_token.shape[0]
+        with torch.inference_mode(False):
+            self.extend_seq_lens_buffer = torch.full(
+                (num_reqs,),
+                self.speculative_num_draft_tokens,
+                **self.cuda_int32_kwargs,
+            )
+            self.extend_start_loc_buffer = torch.zeros(
+                num_reqs, **self.cuda_int32_kwargs
+            )
+
     def init_forward_metadata_target_verify(
         self,
         max_seq_len: int,
