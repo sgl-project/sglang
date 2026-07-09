@@ -1501,6 +1501,24 @@ class UpdateWeightFromDiskReqOutput(BaseReq):
 
 
 @dataclass
+class PullWeightsReqInput(BaseReq):
+    # Host-local checkpoint dir the pulled weights land in; seeded from the
+    # server's model path when the published stream has no full version.
+    local_checkpoint_dir: str
+    # Shared dir the publisher writes weight_v{N:06d}/ version dirs under; each
+    # version is a full HF checkpoint or a delta against the previous version.
+    source_dir: str
+    # The version to bring the local checkpoint up to.
+    target_version: int
+
+
+@dataclass
+class PullWeightsReqOutput(BaseReq):
+    success: bool
+    message: str
+
+
+@dataclass
 class UpdateWeightsFromDistributedReqInput(BaseReq):
     names: List[str]
     dtypes: List[str]
