@@ -1239,7 +1239,12 @@ class DFlashWorkerV2(BaseSpecWorker):
         self,
         batch: ScheduleBatch,
         on_publish=None,
+        *,
+        capture_hidden_mode: Optional[CaptureHiddenMode],
     ) -> GenerationBatchResult:
+        assert (
+            capture_hidden_mode is None
+        ), "spec workers derive capture_hidden_mode internally"
         if getattr(batch, "return_logprob", False):
             raise ValueError(
                 "DFLASH speculative decoding does not support return_logprob yet."
@@ -1562,6 +1567,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             forward_batch=verify_forward_batch,
             is_verify=True,
             skip_attn_backend_init=True,
+            capture_hidden_mode=None,
         )
         logits_output = target_out.logits_output
         can_run_cuda_graph = target_out.can_run_cuda_graph
