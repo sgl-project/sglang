@@ -21,7 +21,7 @@ from sglang.srt.layers.attention.dsv4.index_buf_accessor import NopeFp8RopeBf16P
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.memory_pool import KVCache
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import ceil_div, is_hip
 
 logger = logging.getLogger(__name__)
@@ -276,7 +276,7 @@ class DeepSeekV4IndexerPool(KVCache):
             end_layer,
         )
         self.index_head_dim = index_head_dim
-        self.use_fp4_indexer = get_global_server_args().enable_deepseek_v4_fp4_indexer
+        self.use_fp4_indexer = get_server_args().enable_deepseek_v4_fp4_indexer
 
         self._create_buffer()
 
@@ -321,12 +321,19 @@ class DeepSeekV4IndexerPool(KVCache):
     def get_index_k_scale_buffer(
         self,
         layer_id: int,
-        seq_len: int,
+        seq_len_tensor: torch.Tensor,
         page_indices: torch.Tensor,
+        seq_len_sum: int,
+        max_seq_len: int,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         buf = self.index_k_with_scale_buffer[layer_id]
         return index_buf_accessor.GetKAndS.execute(
-            self, buf, seq_len=seq_len, page_indices=page_indices
+            self,
+            buf,
+            page_indices=page_indices,
+            seq_len_tensor=seq_len_tensor,
+            seq_len_sum=seq_len_sum,
+            max_seq_len=max_seq_len,
         )
 
     def set_index_k_scale_buffer(
@@ -562,7 +569,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             self.swa_kv_pool = None
             self.c4_kv_pool = None
             self.c128_kv_pool = None
-            server_args = get_global_server_args()
+            server_args = get_server_args()
             spec_extra = (
                 (server_args.speculative_num_draft_tokens - 1)
                 if server_args.speculative_algorithm is not None
@@ -644,7 +651,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         self.full_to_swa_index_mapping = full_to_swa_index_mapping
 
     def get_ring_size(self, compress_ratio: int) -> int:
-        server_args = get_global_server_args()
+        server_args = get_server_args()
         is_speculative = server_args.speculative_algorithm is not None
         return get_compress_state_ring_size(compress_ratio, is_speculative)
 
@@ -1055,14 +1062,20 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
     def get_index_k_scale_buffer(
         self,
         layer_id: int,
-        seq_len: int,
+        seq_len_tensor: torch.Tensor,
         page_indices: torch.Tensor,
+        seq_len_sum: int,
+        max_seq_len: int,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         self.wait_layer_transfer(layer_id)
         compress_ratio, compress_layer_id, _ = self.layer_mapping[layer_id]
         assert compress_ratio == 4, f"only c4 has indexer, got {compress_ratio = }"
         return self.c4_indexer_kv_pool.get_index_k_scale_buffer(
-            compress_layer_id, seq_len, page_indices
+            compress_layer_id,
+            seq_len_tensor,
+            page_indices,
+            seq_len_sum,
+            max_seq_len,
         )
 
     def set_index_k_scale_buffer(

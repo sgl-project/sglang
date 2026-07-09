@@ -73,6 +73,17 @@ class ServerArgsAutoTuner:
 
         if args.performance_mode == "speed":
             logger.info("Applying performance_mode=speed")
+            if not args.enable_torch_compile and not args.is_arg_explicitly_set(
+                "enable_torch_compile"
+            ):
+                # speed means fastest: compile by default. An explicit
+                # --enable-torch-compile false still wins (e.g. models where
+                # compile measures slower, like short-step Z-Image runs).
+                args.enable_torch_compile = True
+                logger.info(
+                    "performance_mode=speed enables torch.compile "
+                    "(pass --enable-torch-compile false to opt out)"
+                )
             if args.num_gpus >= 2 and self._can_apply_fsdp_policy(
                 require_memory_headroom=False
             ):
