@@ -781,16 +781,16 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         if not batch.forward_mode.is_idle():
             # Chunked-prefill-aware tail tokens (see PR #26329).
             tail_tokens = _eagle_prefill_tail_tokens(batch, next_token_ids)
-            new_input_ids_parts = []
+            new_input_ids = torch.empty_like(batch.input_ids)
             pt = 0
             for i, extend_len in enumerate(batch.extend_lens):
                 input_ids = batch.input_ids[pt : pt + extend_len]
-                new_input_ids_parts.append(
+                new_input_ids[pt : pt + extend_len].copy_(
                     torch.cat((input_ids[1:], tail_tokens[i].reshape(1)))
                 )
                 pt += extend_len
             assert pt == batch.input_ids.numel()
-            batch.input_ids = torch.cat(new_input_ids_parts)
+            batch.input_ids = new_input_ids
 
         # Draft-extend spec_info for the extend forward; carries only
         # hidden_states + shape info.
