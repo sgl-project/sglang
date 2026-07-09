@@ -33,9 +33,7 @@ def _snapshot_mutable_fields(batch):
 def _assert_snapshot_not_mutated(test_case, snapshot):
     for name, obj, value_copy in snapshot:
         if isinstance(obj, list):
-            test_case.assertEqual(
-                obj, value_copy, f"field {name} was mutated in place"
-            )
+            test_case.assertEqual(obj, value_copy, f"field {name} was mutated in place")
         else:
             test_case.assertTrue(
                 torch.equal(obj, value_copy), f"field {name} was mutated in place"
@@ -54,7 +52,9 @@ class _FakeReq:
         self.full_untruncated_fill_ids = self.origin_input_ids + self.output_ids
 
     def set_extend_range(self, start, end):
-        self.extend_range = types.SimpleNamespace(start=start, end=end, length=end - start)
+        self.extend_range = types.SimpleNamespace(
+            start=start, end=end, length=end - start
+        )
 
 
 def _make_batch(req_names, top_logprobs_nums, token_ids_logprobs):
@@ -188,9 +188,7 @@ class TestPrepareEncoderInfoExtendOutOfPlace(unittest.TestCase):
             torch.equal(batch.out_cache_loc, torch.arange(2, 9, dtype=torch.int64))
         )
         self.assertTrue(
-            torch.equal(
-                batch.encoder_out_cache_loc, torch.arange(2, dtype=torch.int64)
-            )
+            torch.equal(batch.encoder_out_cache_loc, torch.arange(2, dtype=torch.int64))
         )
         self.assertTrue(
             torch.equal(batch.seq_lens_cpu, torch.tensor([3, 4], dtype=torch.int64))
