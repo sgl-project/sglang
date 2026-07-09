@@ -88,7 +88,7 @@ class PrefillStats:
 
 @dataclass(kw_only=True)
 class SchedulerMetricsReporter:
-    scheduler: "Scheduler"
+    scheduler: Scheduler
     tp_rank: int
     pp_rank: int
     dp_rank: Optional[int]
@@ -215,7 +215,10 @@ class SchedulerMetricsReporter:
             if base_endpoint is None:
                 ipc_path = tempfile.NamedTemporaryFile(delete=False).name
                 base_endpoint = f"ipc://{ipc_path}"
-                self.scheduler.server_args.forward_pass_metrics_ipc_name = base_endpoint
+                self.scheduler.server_args.override(
+                    "metrics_reporter.ipc_endpoint",
+                    forward_pass_metrics_ipc_name=base_endpoint,
+                )
             endpoint = f"{base_endpoint}.{self.scheduler._fpm_dp_rank}"
             self.scheduler._fpm_publisher = _FpmPublisherThread(
                 endpoint,
@@ -435,8 +438,10 @@ class SchedulerMetricsReporter:
             num_attn_heads * head_dim * act_bytes * num_layers
         )
 
-    def _estimate_prefill_perf(self, num_tokens: int) -> Tuple[float, float, float]:
-        tokens = max(0, int(num_tokens))
+    def _estimate_prefill_perf(self, batch) -> Tuple[float, float, float]:
+        if batch is None or batch.extend_lens is None:
+            return 0.0, 0.0, 0.0
+        tokens = max(0, int(sum(batch.extend_lens)))
         if tokens == 0:
             return 0.0, 0.0, 0.0
 
@@ -483,6 +488,19 @@ class SchedulerMetricsReporter:
             + tokens * self._ffn_act_bytes_per_token
         )
         return flops, read_bytes, write_bytes
+
+    def _prefill_sol_suffix(self, batch, elapsed_s: float) -> str:
+        """Hook: model-specific speed-of-light % suffix for the prefill log line.
+        ``batch`` carries the per-request extend/prefix lengths a subclass needs
+        for an exact attention pair-count. No model arch here, so returns "";
+        a subclass may override it."""
+        return ""
+
+    def _decode_sol_suffix(self, batch, elapsed_s: float) -> str:
+        """Hook: model-specific speed-of-light % suffix for the decode log line.
+        ``elapsed_s`` is per-iteration. No model arch here, so returns "";
+        a subclass may override it."""
+        return ""
 
     def reset_metrics(self):
         self.forward_ct_decode = 0
@@ -553,9 +571,18 @@ class SchedulerMetricsReporter:
         msg += f"input throughput (token/s): {self.last_input_throughput:.2f}"
 
         if self.enable_mfu_metrics and gap_latency > 0:
-            flops, _, _ = self._estimate_prefill_perf(prefill_stats.log_input_tokens)
-            tflops_per_s = flops / gap_latency / 1e12
-            msg += f", est. prefill TFLOPS/s (per GPU): {tflops_per_s:.2f}"
+            # Prefer the SoL suffix when it carries content: it scores FLOPs against
+            # each forward's actual GPU span (device timer). The wall-clock est.
+            # TFLOPS below divides FLOPs by gap_latency -- the inter-log interval on
+            # the async scheduler loop, which is decoupled from this forward's
+            # execution -- so it disagrees with the SoL. Omit it when SoL is present.
+            sol_suffix = self._prefill_sol_suffix(batch, gap_latency)
+            if sol_suffix:
+                msg += sol_suffix
+            else:
+                flops, _, _ = self._estimate_prefill_perf(batch)
+                tflops_per_s = flops / gap_latency / 1e12
+                msg += f", est. prefill TFLOPS/s (per GPU): {tflops_per_s:.2f}"
 
         if ENABLE_METRICS_DEVICE_TIMER:
             msg += f", fwd occupancy: {self.fwd_occupancy:.2f}%"
@@ -572,9 +599,7 @@ class SchedulerMetricsReporter:
                 dp_cooperation_info=dp_cooperation_info,
             )
             if self.enable_mfu_metrics:
-                flops, read_bytes, write_bytes = self._estimate_prefill_perf(
-                    prefill_stats.log_input_tokens
-                )
+                flops, read_bytes, write_bytes = self._estimate_prefill_perf(batch)
                 self.metrics_collector.increment_estimated_perf(
                     num_flops_per_gpu=flops,
                     num_read_bytes_per_gpu=read_bytes,
@@ -764,6 +789,10 @@ class SchedulerMetricsReporter:
                 f", est. decode TFLOPS/s (per GPU): {tflops_per_s:.2f}, "
                 f"est. read BW (GB/s per GPU): {read_gb_per_s:.2f}, "
                 f"est. write BW (GB/s per GPU): {write_gb_per_s:.2f}"
+            )
+            msg += self._decode_sol_suffix(
+                batch,
+                gap_latency / max(1, self.scheduler.server_args.decode_log_interval),
             )
             self._mfu_log_flops = 0.0
             self._mfu_log_read_bytes = 0.0
@@ -990,17 +1019,19 @@ class SchedulerMetricsReporter:
         self.forward_pass_device_timer._report()
         now = time.perf_counter()
         if self._device_timer_window_batch_count == 0:
+            # Window start: keep the last published value instead of NaN-ing
+            # the gauge. Readers sample it asynchronously, and the window
+            # boundary can phase-lock with the decode-log cadence, turning a
+            # one-tick NaN into NaN on every log line. NaN is published only
+            # when truly stale (reset_device_timer_window after idle).
             self._device_timer_window_start = now
             self._device_timer_window_gpu_time = 0.0
-            cpu_time = 0
-            self.fwd_occupancy = float("nan")
         else:
             cpu_time = now - self._device_timer_window_start
-            self.fwd_occupancy = min(
-                self._device_timer_window_gpu_time / cpu_time * 100, 100
-            )
-        # ratio = self._device_timer_window_gpu_time / cpu_time if cpu_time > 0 else float("nan")
-        # print(f"{self._device_timer_window_batch_count=} {self.fwd_occupancy=}, {self._device_timer_window_gpu_time=}, {cpu_time=}, {ratio=}")
+            if cpu_time > 0:
+                self.fwd_occupancy = min(
+                    self._device_timer_window_gpu_time / cpu_time * 100, 100
+                )
         self._device_timer_window_batch_count += 1
         if (
             self._device_timer_window_batch_count

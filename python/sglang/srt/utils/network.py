@@ -15,9 +15,10 @@ logger = logging.getLogger(__name__)
 
 
 def get_open_port() -> int:
-    port = os.getenv("SGLANG_PORT")
+    from sglang.srt.environ import envs
+
+    port = envs.SGLANG_PORT.get()
     if port is not None:
-        port = int(port)
         while True:
             if is_port_available(port):
                 return port
@@ -49,9 +50,19 @@ def find_process_using_port(port: int) -> Optional[psutil.Process]:
     return None
 
 
+MAX_VALID_PORT = 65535
+
+
 def wait_port_available(
     port: int, port_name: str, timeout_s: int = 30, raise_exception: bool = True
 ) -> bool:
+    if port < 0 or port > MAX_VALID_PORT:
+        raise ValueError(
+            f"{port_name} has invalid port number {port}. "
+            f"Valid TCP port range is 0-{MAX_VALID_PORT}."
+        )
+
+    error_message = f"{port_name} at {port} is not available"
     for i in range(timeout_s):
         if is_port_available(port):
             return True
@@ -62,12 +73,12 @@ def wait_port_available(
                 logger.warning(
                     f"The port {port} is in use, but we could not find the process that uses it."
                 )
-
-            pid = process.pid
-            error_message = f"{port_name} is used by a process already. {process.name()=}' {process.cmdline()=} {process.status()=} {pid=}"
-            logger.info(
-                f"port {port} is in use. Waiting for {i} seconds for {port_name} to be available. {error_message}"
-            )
+            else:
+                pid = process.pid
+                error_message = f"{port_name} is used by a process already. {process.name()=}' {process.cmdline()=} {process.status()=} {pid=}"
+                logger.info(
+                    f"port {port} is in use. Waiting for {i} seconds for {port_name} to be available. {error_message}"
+                )
         time.sleep(0.1)
 
     if raise_exception:
@@ -231,7 +242,7 @@ def config_socket(socket, socket_type: zmq.SocketType):
         set_send_opt()
     elif socket_type == zmq.PULL:
         set_recv_opt()
-    elif socket_type in [zmq.DEALER, zmq.REQ, zmq.REP]:
+    elif socket_type in [zmq.DEALER, zmq.REQ, zmq.REP, zmq.PAIR]:
         set_send_opt()
         set_recv_opt()
     else:
@@ -533,3 +544,20 @@ class NetworkAddress:
 
     def __repr__(self) -> str:
         return f"NetworkAddress({self.host!r}, {self.port})"
+
+
+def resolve_base_url(base_url: str, host: str, port: int) -> str:
+    """Base URL a client sends to: ``base_url`` if set, else ``http://host:port``
+    (IPv6-correct via :class:`NetworkAddress`)."""
+    if base_url:
+        return base_url
+    return NetworkAddress(host, port).to_url()
+
+
+def resolve_host_port(base_url: str, host: str, port: int) -> str:
+    """Like :func:`resolve_base_url` but returns the scheme-less ``host:port``
+    form (for gRPC-style endpoints): ``base_url`` if set, else ``host:port``
+    (IPv6-correct via :class:`NetworkAddress`)."""
+    if base_url:
+        return base_url
+    return NetworkAddress(host, port).to_host_port_str()

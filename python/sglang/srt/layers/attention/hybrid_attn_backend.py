@@ -37,12 +37,12 @@ class HybridAttnBackend(AttentionBackend):
 
         Note:
             - decode_or_idle: Always uses decode backend
-            - target_verify or draft_extend: Uses decode backend if speculative_attention_mode is "decode", otherwise prefill backend
+            - target_verify: Uses decode backend if speculative_attention_mode is "decode", otherwise prefill backend
             - prefill: Always uses prefill backend
         """
         if forward_mode.is_decode_or_idle():
             return self.decode_backend
-        elif forward_mode.is_target_verify() or forward_mode.is_draft_extend():
+        elif forward_mode.is_target_verify():
             return (
                 self.decode_backend
                 if self.model_runner.server_args.speculative_attention_mode == "decode"
@@ -58,6 +58,10 @@ class HybridAttnBackend(AttentionBackend):
     ):
         backend = self._select_backend(forward_batch.forward_mode)
         backend.init_forward_metadata_out_graph(forward_batch, in_capture=in_capture)
+
+    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
+        backend = self._select_backend(forward_batch.forward_mode)
+        backend.init_forward_metadata_in_graph(forward_batch)
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         backend = self._select_backend(forward_batch.forward_mode)
@@ -138,6 +142,13 @@ class HybridAttnBackend(AttentionBackend):
     ) -> Optional[BaseIndexerMetadata]:
         backend = self._select_backend(forward_batch.forward_mode)
         return backend.get_indexer_metadata(layer_id, forward_batch)
+
+    def update_mamba_state_after_mtp_verify(self, *args, **kwargs):
+        if self.model_runner.server_args.speculative_attention_mode == "decode":
+            backend = self.decode_backend
+        else:
+            backend = self.prefill_backend
+        return backend.update_mamba_state_after_mtp_verify(*args, **kwargs)
 
     def forward(
         self,

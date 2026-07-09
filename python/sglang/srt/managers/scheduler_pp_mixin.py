@@ -23,6 +23,7 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
     set_is_extend_in_batch,
 )
+from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.utils import (
     GenerationBatchResult,
@@ -606,9 +607,11 @@ class SchedulerPPMixin:
                     origin_input_ids=input_ids,
                     sampling_params=sampling_params,
                 )
-                req.fill_ids = req.origin_input_ids
+                req.full_untruncated_fill_ids = req.origin_input_ids
                 req.logprob_start_len = -1
-                req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
+                req.set_extend_range(
+                    len(req.prefix_indices), len(req.full_untruncated_fill_ids)
+                )
 
                 # Prepare batch
                 batch = ScheduleBatch.init_new(
@@ -621,7 +624,7 @@ class SchedulerPPMixin:
                     self.spec_algorithm,
                 )
 
-                current_seq_len = len(req.fill_ids)
+                current_seq_len = req.extend_range.end
 
                 if is_dp_attention_enabled():
                     # For profiling, we only have one request on PP0
@@ -649,6 +652,13 @@ class SchedulerPPMixin:
                         device=self.device,
                     ),
                 }
+                pp_proxy_topk_size = model_runner.get_pp_proxy_topk_size()
+                if pp_proxy_topk_size is not None:
+                    proxy_tensors["topk_indices"] = torch.zeros(
+                        (current_seq_len, pp_proxy_topk_size),
+                        dtype=torch.int32,
+                        device=self.device,
+                    )
 
                 pp_proxy = PPProxyTensors(proxy_tensors)
 
@@ -685,7 +695,7 @@ class SchedulerPPMixin:
                 # Release KV cache
                 if req.req_pool_idx is not None:
                     kv_indices = self.req_to_token_pool.req_to_token[
-                        req.req_pool_idx, : len(req.fill_ids)
+                        req.req_pool_idx, : req.extend_range.end
                     ]
                     self.token_to_kv_pool_allocator.free(kv_indices)
                     self.req_to_token_pool.free(req)
@@ -917,7 +927,9 @@ class SchedulerPPMixin:
     def _pp_send_pyobj_to_next_stage(self: Scheduler, data, async_send: bool = False):
         p2p_work = []
         if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
-            dp_offset = self.ps.attn_dp_rank * self.ps.attn_tp_size
+            dp_offset = (
+                self.ps.attn_dp_rank * self.ps.attn_cp_size * self.ps.attn_tp_size
+            )
             p2p_work = point_to_point_pyobj(
                 data,
                 self.ps.pp_rank * self.ps.tp_size + dp_offset,
@@ -930,7 +942,9 @@ class SchedulerPPMixin:
 
     def _pp_recv_pyobj_from_prev_stage(self: Scheduler):
         if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
-            dp_offset = self.ps.attn_dp_rank * self.ps.attn_tp_size
+            dp_offset = (
+                self.ps.attn_dp_rank * self.ps.attn_cp_size * self.ps.attn_tp_size
+            )
             data = point_to_point_pyobj(
                 [],
                 self.ps.pp_rank * self.ps.tp_size + dp_offset,
@@ -1101,7 +1115,9 @@ class SchedulerPPMixin:
         # PP rank 0 also relays into output_tokens_buf so the next iter's
         # resolve_forward_inputs finds these tokens for the decode portion
         # of mixed-chunk batches (which gather via mix_running_indices).
-        self.future_map.stash(batch.req_pool_indices, batch.input_ids)
+        self.future_map.stash(
+            batch.req_pool_indices, RelayPayload(bonus_tokens=batch.input_ids)
+        )
         output_result = GenerationBatchResult(
             logits_output=logits_output,
             pp_hidden_states_proxy_tensors=None,
@@ -1392,6 +1408,9 @@ class SchedulerPPMixin:
             released_reqs = self.disagg_decode_transfer_queue.pop_transferred(
                 release_rids
             )
+            if self.enable_hisparse:
+                for req in released_reqs:
+                    self.hisparse_coordinator.admit_request_direct(req)
             self.waiting_queue.extend(released_reqs)
             return [req.rid for req in released_reqs]
         return None
@@ -1464,11 +1483,11 @@ class ChunkSizePredictor:
     def set_target_latency(self, base_chunk_size: int):
         """Set target latency based on base chunk size: target = f(base_chunk_size) - f(0)."""
 
-        def f(l: float) -> float:
-            """Total latency function: f(l) = al^2 + bl + c (or bl + c for linear)"""
+        def f(length: float) -> float:
+            """Total latency function: f(length) = a*length^2 + b*length + c."""
             return (
-                self.quadratic_coeff_a * l * l
-                + self.linear_coeff_b * l
+                self.quadratic_coeff_a * length * length
+                + self.linear_coeff_b * length
                 + self.constant_coeff_c
             )
 

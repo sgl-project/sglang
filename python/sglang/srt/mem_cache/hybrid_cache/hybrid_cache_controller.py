@@ -163,14 +163,13 @@ class HybridCacheController(BaseHiCacheController):
         load_cache_event: threading.Event,
         attn_cp_group: Optional[torch.distributed.ProcessGroup] = None,
         attn_tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        pp_group: Optional[torch.distributed.ProcessGroup] = None,
         write_policy: str = "write_through_selective",
         io_backend: str = "",
         storage_backend: Optional[str] = None,
         prefetch_threshold: int = 256,
         model_name: Optional[str] = None,
         storage_backend_extra_config: Optional[dict] = None,
-        pp_rank: int = 0,
-        pp_size: int = 1,
         transfer_layer_num: Optional[int] = None,
         enable_storage_metrics: bool = False,
     ):
@@ -184,14 +183,13 @@ class HybridCacheController(BaseHiCacheController):
             load_cache_event=load_cache_event,
             attn_cp_group=attn_cp_group,
             attn_tp_group=attn_tp_group,
+            pp_group=pp_group,
             write_policy=write_policy,
             io_backend=io_backend,
             storage_backend=None,
             prefetch_threshold=prefetch_threshold,
             model_name=model_name,
             storage_backend_extra_config=storage_backend_extra_config,
-            pp_rank=pp_rank,
-            pp_size=pp_size,
             enable_storage_metrics=enable_storage_metrics,
         )
         # Override layer_num: hybrid models transfer all layers (For example, Linear Model (KV + Mamba)),
@@ -396,9 +394,19 @@ class HybridCacheController(BaseHiCacheController):
         if not self.write_queue:
             return
         op = CacheOperation.merge_ops(self.write_queue)
-        host_indices, device_indices, resolved_pool_transfers = (
-            self.move_hybrid_indices(op)
-        )
+        # Page-first write-back JIT kernels can keep destination host indices on CPU.
+        if (
+            self.io_backend == "kernel"
+            and self.mem_pool_host.layout == "page_first"
+            and getattr(self.mem_pool_host, "can_use_write_back_jit", False)
+        ):
+            host_indices = op.host_indices
+            device_indices = op.device_indices
+            resolved_pool_transfers = op.pool_transfers
+        else:
+            host_indices, device_indices, resolved_pool_transfers = (
+                self.move_hybrid_indices(op)
+            )
         self.write_queue.clear()
         start_event = device_module.Event()
         finish_event = device_module.Event()
@@ -412,6 +420,13 @@ class HybridCacheController(BaseHiCacheController):
                 self.io_backend,
                 pool_transfers=resolved_pool_transfers,
             )
+            if self.has_draft and host_indices.numel() > 0:
+                self.mem_pool_host_draft.backup_from_device_all_layer(
+                    self.mem_pool_device_draft,
+                    host_indices,
+                    device_indices,
+                    self.io_backend,
+                )
             finish_event.record()
             self._record_transfer_indices_on_stream(
                 self.write_stream,
@@ -486,6 +501,18 @@ class HybridCacheController(BaseHiCacheController):
                     self.io_backend,
                     pool_transfers=resolved_pool_transfers,
                 )
+                if (
+                    self.has_draft
+                    and host_indices.numel() > 0
+                    and i < self.mem_pool_host_draft.layer_num
+                ):
+                    self.mem_pool_host_draft.load_to_device_per_layer(
+                        self.mem_pool_device_draft,
+                        host_indices,
+                        device_indices,
+                        i,
+                        self.io_backend,
+                    )
                 producer_event.complete(i)
             self._record_transfer_indices_on_stream(
                 self.load_stream,
@@ -558,13 +585,9 @@ class HybridCacheController(BaseHiCacheController):
         return operation.id
 
     def _storage_hit_query(self, operation) -> tuple[list[str], int]:
-        last_hash = operation.last_hash
-        hash_value = []
-        for start in range(0, len(operation.token_ids), self.page_size):
-            last_hash = self.get_hash_str(
-                operation.token_ids[start : start + self.page_size], last_hash
-            )
-            hash_value.append(last_hash)
+        hash_value = self.get_hash_str(
+            operation.token_ids, operation.last_hash, page_size=self.page_size
+        )
 
         extra_info = HiCacheStorageExtraInfo(
             prefix_keys=operation.prefix_keys.copy() if operation.prefix_keys else None

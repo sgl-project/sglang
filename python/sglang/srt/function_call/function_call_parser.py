@@ -1,3 +1,4 @@
+import inspect
 import logging
 from typing import Dict, List, Literal, Optional, Set, Tuple, Type, Union
 
@@ -10,6 +11,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ToolChoice,
 )
 from sglang.srt.environ import ToolStrictLevel, envs
+from sglang.srt.function_call.apertus2509_detector import Apertus2509Detector
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.cohere_command4_detector import CohereCommand4Detector
 from sglang.srt.function_call.core_types import ToolCallItem
@@ -56,6 +58,7 @@ class FunctionCallParser:
     """
 
     ToolCallParserEnum: Dict[str, Type[BaseFormatDetector]] = {
+        "apertus2509": Apertus2509Detector,
         "cohere_command4": CohereCommand4Detector,
         "deepseekv3": DeepSeekV3Detector,
         "deepseekv31": DeepSeekV31Detector,
@@ -87,10 +90,15 @@ class FunctionCallParser:
         "gemma4": Gemma4Detector,
     }
 
-    def __init__(self, tools: List[Tool], tool_call_parser: str):
+    def __init__(self, tools: List[Tool], tool_call_parser: str, tokenizer=None):
         detector_class = self.ToolCallParserEnum.get(tool_call_parser)
         if detector_class:
-            detector = detector_class()
+            kwargs = {}
+            if tokenizer is not None:
+                sig = inspect.signature(detector_class)
+                if "tokenizer" in sig.parameters:
+                    kwargs["tokenizer"] = tokenizer
+            detector = detector_class(**kwargs)
         else:
             raise ValueError(f"Unsupported tool_call_parser: {tool_call_parser}")
 

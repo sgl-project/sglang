@@ -184,40 +184,62 @@ def forward_mla_prepare_npu(
     else:
         q_lora = None
         if m.q_lora_rank is not None:
-            q, latent_cache = (
-                get_attn_tp_context()
-                .fetch_qkv_latent()
-                .split(
-                    [m.q_lora_rank, m.kv_lora_rank + m.qk_rope_head_dim],
-                    dim=-1,
-                )
-            )
-            k_nope = latent_cache[..., : m.kv_lora_rank]
-
-            q = m.q_a_layernorm(q)
+            qkv_latent = get_attn_tp_context().fetch_qkv_latent()
             if (
                 _use_ag_after_qlora
                 and layer_scatter_modes.layer_input_mode == ScatterMode.SCATTERED
                 and layer_scatter_modes.attn_mode == ScatterMode.TP_ATTN_FULL
             ):
+                q, latent_cache = qkv_latent.split(
+                    [m.q_lora_rank, m.kv_lora_rank + m.qk_rope_head_dim],
+                    dim=-1,
+                )
+                k_nope = latent_cache[..., : m.kv_lora_rank]
+
+                q = m.q_a_layernorm(q)
                 q = scattered_to_tp_attn_full(q, forward_batch)
                 latent_cache = scattered_to_tp_attn_full(latent_cache, forward_batch)
-            k_nope = m.kv_a_layernorm(k_nope)
+
+                k_nope = m.kv_a_layernorm(k_nope).unsqueeze(1)
+                k_pe = latent_cache[..., m.kv_lora_rank :].unsqueeze(1)
+            else:
+                if qkv_latent.shape[0] < 65536 and not dsa_use_prefill_cp(
+                    forward_batch
+                ):
+                    q, k_nope, k_pe = fused_split_qk_norm(
+                        qkv_latent,
+                        m.q_a_layernorm,
+                        m.kv_a_layernorm,
+                        m.q_lora_rank,
+                        m.kv_lora_rank,
+                        m.qk_rope_head_dim,
+                        eps=m.q_a_layernorm.variance_epsilon,
+                    )
+                else:
+                    q, latent_cache = qkv_latent.split(
+                        [m.q_lora_rank, m.kv_lora_rank + m.qk_rope_head_dim],
+                        dim=-1,
+                    )
+                    k_nope = latent_cache[..., : m.kv_lora_rank]
+
+                    q = m.q_a_layernorm(q)
+
+                    k_nope = m.kv_a_layernorm(k_nope).unsqueeze(1)
+                    k_pe = latent_cache[..., m.kv_lora_rank :].unsqueeze(1)
 
             # q_lora needed by indexer
             if m.use_dsa:
                 q_lora = q
 
-            k_nope = k_nope.unsqueeze(1)
             q = m.q_b_proj(q)[0].view(-1, m.num_local_heads, m.qk_head_dim)
         else:
             q = m.q_proj(hidden_states)[0].view(-1, m.num_local_heads, m.qk_head_dim)
             latent_cache = m.kv_a_proj_with_mqa(hidden_states)[0]
             k_nope = latent_cache[..., : m.kv_lora_rank]
             k_nope = m.kv_a_layernorm(k_nope).unsqueeze(1)
+            k_pe = latent_cache[..., m.kv_lora_rank :].unsqueeze(1)
 
         q_nope, q_pe = q.split([m.qk_nope_head_dim, m.qk_rope_head_dim], dim=-1)
-        k_pe = latent_cache[..., m.kv_lora_rank :].unsqueeze(1)
 
         q_nope_out = torch.bmm(q_nope.transpose(0, 1), m.w_kc)
 
@@ -403,9 +425,7 @@ def forward_dsa_prepare_npu(
                 latent_cache, forward_batch, k_nope, k_pe
             )
 
-    if m.skip_topk:
-        topk_indices = prev_topk_indices
-    else:
+    if not m.skip_topk or (m.is_nextn and prev_topk_indices is None):
         topk_indices = m.indexer(
             hidden_states,
             q_lora,
@@ -415,6 +435,8 @@ def forward_dsa_prepare_npu(
             layer_scatter_modes,
             dynamic_scale,
         )
+    else:
+        topk_indices = prev_topk_indices
 
     return (
         q_pe,
@@ -459,7 +481,7 @@ def forward_dsa_core_npu(
 
     if (
         forward_batch.forward_mode.is_extend()
-        and not forward_batch.forward_mode.is_draft_extend(include_v2=True)
+        and not forward_batch.forward_mode.is_draft_extend_v2()
         and not forward_batch.forward_mode.is_target_verify()
     ):
         attn_output = attn_output.transpose(0, 1)

@@ -16,8 +16,13 @@ from transformers.modeling_outputs import BaseModelOutputWithPast
 from transformers.utils import TransformersKwargs, is_torchdynamo_compiling
 
 from sglang.multimodal_gen.configs.models.encoders.qwen_image import Qwen2_5VLConfig
+from sglang.multimodal_gen.runtime.distributed import (
+    get_tp_world_size,
+    model_parallel_is_initialized,
+)
 from sglang.multimodal_gen.runtime.layers.attention import LocalAttention
 from sglang.multimodal_gen.runtime.layers.linear import (
+    ColumnParallelLinear,
     MergedColumnParallelLinear,
     RowParallelLinear,
 )
@@ -52,7 +57,7 @@ from sglang.multimodal_gen.runtime.utils.common import add_prefix
 # limitations under the License.
 """Inference-only Qwen2-VL model compatible with HuggingFace weights."""
 import logging
-from typing import Callable, Iterable, Optional, Tuple, Union
+from typing import Iterable, Optional, Tuple, Union
 
 try:
     from typing import Unpack  # type: ignore[attr-defined]
@@ -70,12 +75,54 @@ from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
     Qwen2_5_VLCausalLMOutputWithPast,
     Qwen2_5_VLModelOutputWithPast,
     Qwen2_5_VLRotaryEmbedding,
-    Qwen2MLP,
     apply_multimodal_rotary_pos_emb,
-    eager_attention_forward,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _tp_world_size() -> int:
+    if not model_parallel_is_initialized():
+        return 1
+    return get_tp_world_size()
+
+
+def _linear_output(linear: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    output = linear(x)
+    return output[0] if isinstance(output, tuple) else output
+
+
+def _make_column_linear(
+    in_features: int,
+    out_features: int,
+    *,
+    bias: bool,
+    use_tensor_parallel: bool,
+):
+    if use_tensor_parallel:
+        return ColumnParallelLinear(
+            in_features,
+            out_features,
+            bias=bias,
+            gather_output=False,
+        )
+    return nn.Linear(in_features, out_features, bias=bias)
+
+
+def _make_row_linear(
+    in_features: int,
+    out_features: int,
+    *,
+    bias: bool,
+    use_tensor_parallel: bool,
+):
+    if use_tensor_parallel:
+        return RowParallelLinear(
+            in_features,
+            out_features,
+            bias=bias,
+        )
+    return nn.Linear(in_features, out_features, bias=bias)
 
 
 class Qwen2_5_VLAttention(nn.Module):
@@ -96,31 +143,63 @@ class Qwen2_5_VLAttention(nn.Module):
             )
 
         self.hidden_size = config.hidden_size
-        self.num_heads = config.num_attention_heads
-        self.head_dim = self.hidden_size // self.num_heads
-        self.num_key_value_heads = config.num_key_value_heads
+        self.total_num_heads = config.num_attention_heads
+        self.head_dim = self.hidden_size // self.total_num_heads
+        self.total_num_key_value_heads = config.num_key_value_heads
+        if (self.head_dim * self.total_num_heads) != self.hidden_size:
+            raise ValueError(
+                f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
+                f" and `num_heads`: {self.total_num_heads})."
+            )
+        tp_size = _tp_world_size()
+        q_size = self.total_num_heads * self.head_dim
+        kv_size = self.total_num_key_value_heads * self.head_dim
+        self.use_tensor_parallel = (
+            tp_size > 1
+            and self.total_num_heads % tp_size == 0
+            and self.total_num_key_value_heads % tp_size == 0
+            and q_size % tp_size == 0
+            and kv_size % tp_size == 0
+        )
+        self.num_heads = (
+            self.total_num_heads // tp_size
+            if self.use_tensor_parallel
+            else self.total_num_heads
+        )
+        self.num_key_value_heads = (
+            self.total_num_key_value_heads // tp_size
+            if self.use_tensor_parallel
+            else self.total_num_key_value_heads
+        )
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.is_causal = True
         self.attention_dropout = config.attention_dropout
         self.rope_scaling = config.rope_scaling
         self.scaling = self.head_dim**-0.5
 
-        if (self.head_dim * self.num_heads) != self.hidden_size:
-            raise ValueError(
-                f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
-                f" and `num_heads`: {self.num_heads})."
-            )
-        self.q_proj = nn.Linear(
-            self.hidden_size, self.num_heads * self.head_dim, bias=True
+        self.q_proj = _make_column_linear(
+            self.hidden_size,
+            q_size,
+            bias=True,
+            use_tensor_parallel=self.use_tensor_parallel,
         )
-        self.k_proj = nn.Linear(
-            self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True
+        self.k_proj = _make_column_linear(
+            self.hidden_size,
+            kv_size,
+            bias=True,
+            use_tensor_parallel=self.use_tensor_parallel,
         )
-        self.v_proj = nn.Linear(
-            self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True
+        self.v_proj = _make_column_linear(
+            self.hidden_size,
+            kv_size,
+            bias=True,
+            use_tensor_parallel=self.use_tensor_parallel,
         )
-        self.o_proj = nn.Linear(
-            self.num_heads * self.head_dim, self.hidden_size, bias=False
+        self.o_proj = _make_row_linear(
+            q_size,
+            self.hidden_size,
+            bias=False,
+            use_tensor_parallel=self.use_tensor_parallel,
         )
         self.sliding_window = (
             config.sliding_window
@@ -157,9 +236,9 @@ class Qwen2_5_VLAttention(nn.Module):
     ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
         bsz, q_len, _ = hidden_states.size()
 
-        query_states = self.q_proj(hidden_states)
-        key_states = self.k_proj(hidden_states)
-        value_states = self.v_proj(hidden_states)
+        query_states = _linear_output(self.q_proj, hidden_states)
+        key_states = _linear_output(self.k_proj, hidden_states)
+        value_states = _linear_output(self.v_proj, hidden_states)
 
         query_states = query_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
         key_states = key_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
@@ -180,30 +259,46 @@ class Qwen2_5_VLAttention(nn.Module):
                 key_states, value_states, self.layer_idx, cache_kwargs
             )
 
-        attention_interface: Callable = eager_attention_forward
-        # if self.config._attn_implementation != "eager":
-        # attention_interface = ALL_ATTENTION_FUNCTIONS["sdpa"]
         query_states = query_states.transpose(1, 2)
         key_states = key_states.transpose(1, 2)
         value_states = value_states.transpose(1, 2)
         attn_output = self.attn(query_states, key_states, value_states)
-        #
-        # attn_output, attn_weights = attention_interface(
-        #     self,
-        #     query_states,
-        #     key_states,
-        #     value_states,
-        #     attention_mask,
-        #     dropout=0.0 if not self.training else self.attention_dropout,
-        #     scaling=self.scaling,
-        #     sliding_window=self.sliding_window,
-        #     position_ids=position_ids,  # pass positions for FA2
-        #     **kwargs,
-        # )
 
         attn_output = attn_output.reshape(bsz, q_len, -1).contiguous()
-        attn_output = self.o_proj(attn_output)
+        attn_output = _linear_output(self.o_proj, attn_output)
         return attn_output
+
+
+class Qwen2_5_VLTextMLP(nn.Module):
+    def __init__(self, config: Qwen2_5_VLTextConfig):
+        super().__init__()
+        tp_size = _tp_world_size()
+        use_tensor_parallel = tp_size > 1 and config.intermediate_size % tp_size == 0
+        self.gate_proj = _make_column_linear(
+            config.hidden_size,
+            config.intermediate_size,
+            bias=False,
+            use_tensor_parallel=use_tensor_parallel,
+        )
+        self.up_proj = _make_column_linear(
+            config.hidden_size,
+            config.intermediate_size,
+            bias=False,
+            use_tensor_parallel=use_tensor_parallel,
+        )
+        self.down_proj = _make_row_linear(
+            config.intermediate_size,
+            config.hidden_size,
+            bias=False,
+            use_tensor_parallel=use_tensor_parallel,
+        )
+        self.act_fn = ACT2FN[config.hidden_act]
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.act_fn(_linear_output(self.gate_proj, x)) * _linear_output(
+            self.up_proj, x
+        )
+        return _linear_output(self.down_proj, x)
 
 
 class Qwen2_5_VLDecoderLayer(nn.Module):
@@ -221,7 +316,7 @@ class Qwen2_5_VLDecoderLayer(nn.Module):
             )
         self.self_attn = Qwen2_5_VLAttention(config, layer_idx)
 
-        self.mlp = Qwen2MLP(config)
+        self.mlp = Qwen2_5_VLTextMLP(config)
         self.input_layernorm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = Qwen2RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
@@ -435,7 +530,6 @@ class Qwen2_5_VLTextModel(nn.Module):
                 "config": self.config,
                 "inputs_embeds": inputs_embeds,
                 "attention_mask": attention_mask,
-                "cache_position": cache_position,
                 "past_key_values": past_key_values,
                 "position_ids": text_position_ids,
             }

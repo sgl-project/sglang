@@ -77,6 +77,26 @@ pip install 'git+https://github.com/sgl-project/sglang.git#subdirectory=python'
 pip install 'git+https://github.com/huggingface/transformers.git@1423d22f7a3b62e8c70ad67b58ec25cd9b675897'
 ```
 
+### Docker (prebuilt dev image)
+
+Prebuilt development images bundle SGLang together with the matching transformers commit preinstalled, so no manual install is needed. All tags are multi-arch (`amd64` + `arm64`):
+
+| Tag | CUDA | Hardware |
+| --- | --- | --- |
+| `lmsysorg/sglang:dev-gemma-4-12B` | 13.0 | Default — amd64 (H200 / B200) + arm64 (GB200 / GB300) |
+| `lmsysorg/sglang:dev-cu13-gemma-4-12B` | 13.0 | Alias of the default tag |
+| `lmsysorg/sglang:dev-cu12-gemma-4-12B` | 12.9 | CUDA 12.x hosts |
+
+```bash Command
+docker run --gpus all --ipc=host --shm-size 32g \
+  -v ~/.cache/huggingface:/root/.cache/huggingface \
+  -p 30000:30000 \
+  lmsysorg/sglang:dev-gemma-4-12B \
+  sglang serve --model-path google/gemma-4-12B-it \
+    --reasoning-parser gemma4 --tool-call-parser gemma4 \
+    --host 0.0.0.0 --port 30000
+```
+
 For other installation methods, please refer to the [official SGLang installation guide](../../../docs/get-started/install).
 
 ## 3. Model Deployment
@@ -91,8 +111,10 @@ For other installation methods, please refer to the [official SGLang installatio
 
 - SGLang automatically selects the Triton attention backend for Gemma 4 models (required for bidirectional image-token attention during prefill).
 - **Attention backend on Blackwell (B200/sm100)**: SGLang defaults to the `trtllm_mha` backend on sm100, which is fastest for text but applies *causal* attention to image tokens. For multimodal (image) workloads on B200, pass `--attention-backend triton` to restore bidirectional image-token attention and full vision quality. Text-only and audio workloads are unaffected by the default.
+- **Gemma 4 26B-A4B on B200**: Use `--mem-fraction-static 0.75` to leave workspace headroom for the Triton MoE path.
 - For the 26B-A4B MoE model, consider `--tp 2` for high-throughput workloads.
 - **Speculative Decoding (MTP)**: Each Gemma 4 variant ships with a paired `*-assistant` draft model that enables NEXTN multi-token prediction. Enable it via the selector above, or pass `--speculative-algorithm NEXTN --speculative-draft-model-path google/gemma-4-<variant>-it-assistant --speculative-num-steps 5 --speculative-num-draft-tokens 6 --speculative-eagle-topk 1`. MTP can significantly reduce latency for interactive use cases. The 26B-A4B MoE model requires `--tp 2` when MTP is enabled.
+- **QAT checkpoints**: Toggle **Checkpoint → QAT** in the selector to target the `qat-q4_0-unquantized` releases. These keep bf16 weights, so memory and TP requirements match the standard checkpoints, and each has a matching `*-qat-q4_0-unquantized-assistant` draft model for MTP.
 - Hardware requirements:
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
@@ -111,27 +133,27 @@ For other installation methods, please refer to the [official SGLang installatio
   <tbody>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>gemma-4-E2B-it</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1x H200 / 1x MI300X / 1x MI325X / 1x MI355X</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1x H200 / 1x B200 / 1x B300 / 1x MI300X / 1x MI325X / 1x MI355X</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>1</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>gemma-4-E4B-it</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1x H200 / 1x MI300X / 1x MI325X / 1x MI355X</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1x H200 / 1x B200 / 1x B300 / 1x MI300X / 1x MI325X / 1x MI355X</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>1</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>gemma-4-12B-it</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1x H200 / 1x B200</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1x H200 / 1x B200 / 1x B300</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>1</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>gemma-4-31B-it</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>2x H200 / 1x MI300X / 1x MI325X / 1x MI355X</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>2 (H200) / 1 (AMD)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>2x H200 / 1x B200 / 1x B300 / 1x MI300X / 1x MI325X / 1x MI355X</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>2 (H200) / 1 (B200/B300/AMD)</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>gemma-4-26B-A4B-it</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1x H200 / 1x MI300X / 1x MI325X / 1x MI355X</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1x H200 / 1x B200 / 1x B300 / 1x MI300X / 1x MI325X / 1x MI355X</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>1</td>
     </tr>
   </tbody>

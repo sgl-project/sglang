@@ -16,7 +16,7 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
-register_amd_ci(est_time=3600, suite="stage-c-test-large-8-gpu-amd-mi35x")
+register_amd_ci(est_time=1300, suite="stage-c-test-large-8-gpu-amd-mi35x")
 
 DEEPSEEK_R1_MODEL_PATH = "amd/DeepSeek-R1-MXFP4-Preview"
 SERVER_LAUNCH_TIMEOUT = 1800
@@ -40,6 +40,11 @@ class TestDeepseekR1MXFP4(CustomTestCase):
             "131072",
             "--model-loader-extra-config",
             '{"enable_multithread_load": true}',
+            "--enforce-piecewise-cuda-graph",
+            "--piecewise-cuda-graph-compiler",
+            "eager",
+            "--piecewise-cuda-graph-max-tokens",
+            "8192",
         ]
         cls.process = popen_launch_server(
             cls.model,
@@ -73,7 +78,7 @@ class TestDeepseekR1MXFP4(CustomTestCase):
             write_github_step_summary(
                 f"### test_gsm8k (deepseek-r1-mxfp4)\n" f'{metrics["accuracy"]=:.3f}\n'
             )
-            self.assertGreater(metrics["accuracy"], 0.94)
+        self.assertGreater(metrics["accuracy"], 0.94)
 
     def test_bs_1_speed(self):
         args = BenchArgs(port=int(self.base_url.split(":")[-1]), max_new_tokens=2048)
@@ -85,7 +90,7 @@ class TestDeepseekR1MXFP4(CustomTestCase):
             write_github_step_summary(
                 f"### test_bs_1_speed (deepseek-r1-mxfp4)\n" f"{speed=:.2f} token/s\n"
             )
-            self.assertGreater(speed, 75)
+        self.assertGreater(speed, 75)
 
 
 class TestDeepseekR1MXFP4MTP(CustomTestCase):

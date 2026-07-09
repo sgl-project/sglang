@@ -18,7 +18,7 @@ from sglang.test.test_utils import (
 
 register_xpu_ci(
     est_time=360,
-    suite="stage-a-test-1-gpu-xpu",
+    suite="stage-b-test-1-gpu-xpu",
     disabled="Temporarily disabled until Triton-XPU upgrade",
 )
 

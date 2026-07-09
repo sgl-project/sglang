@@ -38,7 +38,15 @@ from sglang.multimodal_gen.runtime.models.parameter import (
 from sglang.multimodal_gen.runtime.models.utils import set_weight_attrs
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
+from sglang.srt.utils import (
+    cpu_has_amx_support,
+    is_cpu,
+    use_intel_amx_backend,
+)
 
+_is_cpu_amx_available = cpu_has_amx_support()
+_is_cpu = is_cpu()
 logger = init_logger(__name__)
 
 IS_AMP_SUPPORTED = current_platform.is_amp_supported()
@@ -152,9 +160,26 @@ class UnquantizedLinearMethod(LinearMethodBase):
         layer.register_parameter("weight", weight)
         set_weight_attrs(weight, extra_weight_attrs)
 
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if _is_cpu and _is_cpu_amx_available:
+            _amx_process_weight_after_loading(layer, ["weight"])
+
     def apply(
         self, layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None
     ) -> torch.Tensor:
+        if use_intel_amx_backend(layer):
+            x_shapes = x.shape
+            if len(x_shapes) == 3:
+                x = x.view(-1, x.shape[-1])
+            output = torch.ops.sgl_kernel.weight_packed_linear(
+                x.to(layer.weight.dtype),
+                layer.weight,
+                bias,
+                True,  # is_vnni
+            )
+            if len(x_shapes) == 3:
+                output = output.view(x_shapes[0], x_shapes[1], -1)
+            return output
         output = (
             F.linear(x, layer.weight, bias)
             if IS_AMP_SUPPORTED or bias is None
@@ -479,6 +504,9 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         prefix: str = "",
         tp_group: dist.ProcessGroup = None,
     ):
+        tp_group = tp_group or get_tp_group()
+        if get_group_size(tp_group) > 1:
+            self.output_sizes = output_sizes
         super().__init__(
             input_size=input_size,
             output_size=sum(output_sizes),
@@ -621,6 +649,12 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
 
         if loaded_shard_id is None:
             if isinstance(param, PerTensorScaleParameter):
+                if loaded_weight.numel() == 1 and param.data.numel() > 1:
+                    param.data.fill_(loaded_weight.reshape(-1)[0])
+                    return
+                if loaded_weight.shape == param.data.shape:
+                    param.data.copy_(loaded_weight)
+                    return
                 param.load_merged_column_weight(loaded_weight=loaded_weight, shard_id=0)
                 return
             elif type(param) in (RowvLLMParameter, BasevLLMParameter):
@@ -838,6 +872,12 @@ class QKVParallelLinear(ColumnParallelLinear):
     ):
         if loaded_shard_id is None:  # special case for certain models
             if isinstance(param, PerTensorScaleParameter):
+                if loaded_weight.numel() == 1 and param.data.numel() > 1:
+                    param.data.fill_(loaded_weight.reshape(-1)[0])
+                    return
+                if loaded_weight.shape == param.data.shape:
+                    param.data.copy_(loaded_weight)
+                    return
                 param.load_qkv_weight(loaded_weight=loaded_weight, shard_id=0)
                 return
             elif type(param) in (RowvLLMParameter, BasevLLMParameter):

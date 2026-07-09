@@ -13,6 +13,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
+from sglang.srt.mem_cache.common import free_swa_out_of_window_slots
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -49,7 +50,7 @@ class SWAComponent(TreeComponent):
     """
 
     def __init__(self, cache: UnifiedRadixCache, params: CacheInitParams):
-        from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
+        from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 
         assert isinstance(
             cache.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator
@@ -100,6 +101,19 @@ class SWAComponent(TreeComponent):
         self.cache.lru_lists[ct].insert_mru(node)
         self.cache.component_evictable_size_[ct] += len(value)
 
+    def _restore_device_value_with_locked_full(
+        self,
+        node: UnifiedTreeNode,
+        full_value: torch.Tensor,
+        incoming_full_value: torch.Tensor,
+    ) -> None:
+        allocator = self.cache.token_to_kv_pool_allocator
+        swa_value = self._translate_full_to_swa(incoming_full_value)
+        allocator.set_full_to_swa_mapping(full_value, swa_value)
+        allocator.full_to_swa_index_mapping[incoming_full_value.to(torch.int64)] = 0
+        allocator.full_attn_allocator.free(incoming_full_value)
+        self._restore_device_value(node, swa_value)
+
     def create_match_validator(
         self, match_device_only: bool = False
     ) -> Callable[[UnifiedTreeNode], bool]:
@@ -128,20 +142,29 @@ class SWAComponent(TreeComponent):
     ) -> MatchResult:
         ct = self.component_type
         n_swa = 0
+        swa_host_hit = 0
         node = result.best_match_node
         root = self.cache.root_node
         while node is not root and n_swa < self.sliding_window_size:
             cd = node.component_data[ct]
-            if cd.value is None and cd.host_value is not None:
-                # TODO(ispobock): refactor host_hit_length usage
-                return result._replace(host_hit_length=max(result.host_hit_length, 1))
             if cd.value is not None:
                 n_swa += len(cd.value)
             elif cd.host_value is not None:
+                # TODO(hzh): load_back may currently restore a full host-tombstone
+                # segment whose length exceeds sliding_window_size. Once
+                # load_back is constrained to fetch only one sliding window
+                # worth of pages, cap swa_host_hit at sliding_window_size
+                # here so the scheduler budget matches the actual device-pool
+                # consumption.
+                swa_host_hit += len(cd.host_value)
                 n_swa += len(cd.host_value)
             else:
                 break
             node = node.parent
+        if swa_host_hit > 0:
+            return result._replace(
+                swa_host_hit_length=max(result.swa_host_hit_length, swa_host_hit)
+            )
         return result
 
     def update_component_on_insert_overlap(
@@ -159,6 +182,7 @@ class SWAComponent(TreeComponent):
         if not is_tombstone:
             return prefix_len
 
+        full_cd = node.component_data[BASE_COMPONENT_TYPE]
         swa_evicted_seqlen = params.swa_evicted_seqlen
         assert (
             node.component_data[self.component_type].lock_ref == 0
@@ -169,21 +193,27 @@ class SWAComponent(TreeComponent):
 
         if swa_evicted_seqlen <= total_prefix_len:
             # Branch 1: entire value_slice is within SWA window — recover
-            self.cache.token_to_kv_pool_allocator.free(
-                node.component_data[BASE_COMPONENT_TYPE].value
-            )
-            node.component_data[BASE_COMPONENT_TYPE].value = value_slice.clone()
-            swa_value = self._translate_full_to_swa(
-                node.component_data[BASE_COMPONENT_TYPE].value
-            )
+            if full_cd.lock_ref > 0:
+                self._restore_device_value_with_locked_full(
+                    node, full_cd.value, value_slice
+                )
+                return 0
+            self.cache.token_to_kv_pool_allocator.free(full_cd.value)
+            full_cd.value = value_slice.clone()
+            swa_value = self._translate_full_to_swa(full_cd.value)
             self._restore_device_value(node, swa_value)
             return 0
         elif swa_evicted_seqlen < total_prefix_len + prefix_len:
             # Branch 2: value_slice[start_idx:] is within SWA window — partial recover
             start_idx = swa_evicted_seqlen - total_prefix_len
-            self.cache.token_to_kv_pool_allocator.free(
-                node.component_data[BASE_COMPONENT_TYPE].value[start_idx:]
-            )
+            if full_cd.lock_ref > 0:
+                self.cache._split_node(node.key, node, start_idx)
+                full_cd = node.component_data[BASE_COMPONENT_TYPE]
+                self._restore_device_value_with_locked_full(
+                    node, full_cd.value, value_slice[start_idx:]
+                )
+                return start_idx
+            self.cache.token_to_kv_pool_allocator.free(full_cd.value[start_idx:])
             self.cache._split_node(node.key, node, start_idx)
             node.component_data[BASE_COMPONENT_TYPE].value = value_slice[
                 start_idx:
@@ -196,11 +226,6 @@ class SWAComponent(TreeComponent):
         else:
             # Branch 3: entire value_slice is outside SWA window — not consumed
             return prefix_len
-
-    def should_skip_leaf_creation(
-        self, total_prefix_len: int, key_len: int, params: InsertParams
-    ) -> bool:
-        return params.swa_evicted_seqlen >= total_prefix_len + key_len
 
     def recover_after_unevict(
         self,
@@ -504,6 +529,49 @@ class SWAComponent(TreeComponent):
                 dec_swa = False
             cur = cur.parent
 
+    def release_window_lock(
+        self,
+        node: UnifiedTreeNode,
+        swa_uuid_for_lock: Optional[int] = None,
+    ) -> None:
+        """Early-release the SWA lock along [node, swa_uuid_for_lock] while
+        leaving Full and Mamba locks intact.
+
+        Called when a request's decode position has advanced past the sliding
+        window — the SWA portion of the tree lock is no longer needed but the
+        Full lock must stay so the request's prefix is protected.
+
+        Caller (UnifiedRadixCache.dec_swa_lock_only) must ensure this is
+        invoked at most once per (node, swa_uuid_for_lock) pair.
+        """
+        ct = self.component_type
+        root = self.cache.root_node
+
+        cur = node
+        while cur is not root:
+            cd = cur.component_data[ct]
+            # Acquire skips tombstoned nodes; release must skip them too. Same
+            # for nodes with lock_ref == 0 — acquire never credited them.
+            if cd.value is None or cd.lock_ref == 0:
+                if swa_uuid_for_lock and cd.metadata.get("uuid") == swa_uuid_for_lock:
+                    break
+                cur = cur.parent
+                continue
+
+            cd.lock_ref -= 1
+            if cd.lock_ref == 0:
+                key_len = len(cur.key)
+                self.cache.component_protected_size_[ct] -= key_len
+                self.cache.component_evictable_size_[ct] += key_len
+                if self.cache._is_device_leaf(cur):
+                    self.cache._evict_component_and_detach_lru(
+                        cur, self, target=EvictLayer.DEVICE
+                    )
+
+            if swa_uuid_for_lock and cd.metadata.get("uuid") == swa_uuid_for_lock:
+                break
+            cur = cur.parent
+
     def prepare_for_caching_req(
         self,
         req: Req,
@@ -511,9 +579,24 @@ class SWAComponent(TreeComponent):
         token_ids_len: int,
         is_finished: bool,
     ) -> Optional[int]:
-        if is_finished:
-            insert_params.swa_evicted_seqlen = req.swa_evicted_seqlen
+        # Unfinished requests can already have an SWA-evicted prefix; preserve
+        # that boundary so insertion creates a tombstone instead of live SWA KV.
+        insert_params.swa_evicted_seqlen = req.swa_evicted_seqlen
         return None
+
+    def free_out_of_window_slots(
+        self, req: Req, pre_len: int, insert_params: InsertParams
+    ) -> None:
+        if self.sliding_window_size is not None:
+            free_swa_out_of_window_slots(
+                req,
+                pre_len,
+                sliding_window_size=self.sliding_window_size,
+                page_size=self.cache.page_size,
+                req_to_token_pool=self.cache.req_to_token_pool,
+                token_to_kv_pool_allocator=self.cache.token_to_kv_pool_allocator,
+            )
+        insert_params.swa_evicted_seqlen = req.swa_evicted_seqlen
 
     # ---- HiCache Hooks ----
 
@@ -594,14 +677,13 @@ class SWAComponent(TreeComponent):
             ]
 
         if phase == CacheTransferPhase.PREFETCH:
-            num_pages = min(
-                prefetch_tokens // self.cache.page_size,
-                (self.sliding_window_size + self.cache.page_size - 1)
-                // self.cache.page_size,
-            )
-            if num_pages == 0:
+            # Require a full sliding window.
+            sw_pages = (
+                self.sliding_window_size + self.cache.page_size - 1
+            ) // self.cache.page_size
+            if sw_pages == 0 or prefetch_tokens // self.cache.page_size < sw_pages:
                 return None
-            num_tokens = num_pages * self.cache.page_size
+            num_tokens = sw_pages * self.cache.page_size
             host_indices = self._swa_kv_pool_host.alloc(num_tokens)
             if host_indices is None:
                 self.cache.evict_host(num_tokens, ComponentType.SWA)
@@ -612,7 +694,7 @@ class SWAComponent(TreeComponent):
                 PoolTransfer(
                     name=PoolName.SWA,
                     host_indices=host_indices,
-                    keys=["__placeholder__"] * num_pages,
+                    keys=["__placeholder__"] * sw_pages,
                     hit_policy=PoolHitPolicy.TRAILING_PAGES,
                 )
             ]
@@ -673,7 +755,7 @@ class SWAComponent(TreeComponent):
             )
 
     def _attach_swa_host_value(
-        self, node: "UnifiedTreeNode", host_indices: torch.Tensor
+        self, node: UnifiedTreeNode, host_indices: torch.Tensor
     ) -> None:
         """Write host_indices into node's SWA host_value and refresh tree state."""
         ct = self.component_type
@@ -694,33 +776,38 @@ class SWAComponent(TreeComponent):
         insert_result: Optional[InsertResult] = None,
         pool_storage_result: Optional[PoolTransferResult] = None,
     ) -> None:
-        """Distribute the prefetched SWA buffer onto the leaf→anchor path.
+        """Fill the prefetched SWA window onto the leaf→anchor path.
 
-        The buffer holds the trailing ``loaded_pages`` of the completed KV
-        prefix, mapped to token range ``[loaded_start, total_len)``. We walk
-        upward from ``inserted_host_node`` to ``anchor`` and, for each node
-        whose token range overlaps the buffer:
-          - SWA tombstone (host_value is None) → fill from buffer (split if
-            the node only partially overlaps at the buffer's left edge)
-          - already has SWA host_value → release the corresponding slice
-        Any leftover buffer beyond the walked range is also released.
+        All-or-nothing over one full window: ``loaded_pages`` is the cross-rank
+        MIN, so ``loaded_pages < window_pages`` drops the whole window (keeps the
+        tree identical across TP ranks). Otherwise map the buffer to token range
+        ``[loaded_start, total_len)`` and walk leaf→anchor, filling SWA
+        tombstones and releasing slices that already have host_value.
         """
         if not transfers:
             return
         ct = self.component_type
+        page_size = self.cache.page_size
         host_indices = transfers[0].host_indices
+        window_require_pages = (
+            host_indices.numel() // page_size if host_indices is not None else 0
+        )
         loaded_pages = (
             pool_storage_result.extra_pool_hit_pages.get(PoolName.SWA, 0)
             if pool_storage_result
             else 0
         )
         target = insert_result.inserted_host_node if insert_result else None
-        if not loaded_pages or target is None:
+        if (
+            target is None
+            or window_require_pages == 0
+            or loaded_pages < window_require_pages
+        ):
             self._release_swa_host(host_indices)
             return
 
         # Buffer covers token range [loaded_start, total_len).
-        loaded_start = insert_result.total_len - loaded_pages * self.cache.page_size
+        loaded_start = insert_result.total_len - window_require_pages * page_size
 
         # Walk leaf → anchor; ``pos`` is the right edge of ``cur`` in tokens.
         pos, cur = insert_result.total_len, target
@@ -757,9 +844,9 @@ class SWAComponent(TreeComponent):
         Host leaves: atomic eviction via _evict_host_leaf."""
         ct = self.component_type
         host_lru = self.cache.host_lru_lists[ct]
-        x = host_lru.get_lru_no_lock()
+        x = host_lru.get_lru_no_host_lock()
         while tracker[ct] < num_tokens and x is not None and host_lru.in_list(x):
-            x_next = host_lru.get_prev_no_lock(x)
+            x_next = host_lru.get_prev_no_host_lock(x)
             cd = x.component_data[ct]
             if x in self.cache.evictable_host_leaves:
                 self.cache._evict_host_leaf(x, tracker)

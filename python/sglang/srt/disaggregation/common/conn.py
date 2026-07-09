@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import dataclasses
 import logging
 import threading
 import time
 from collections import defaultdict
-from functools import cache
 from typing import Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
@@ -24,6 +24,7 @@ from sglang.srt.disaggregation.base.conn import (
     KVArgs,
     KVPoll,
     KVTransferMetric,
+    StateType,
 )
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
@@ -49,6 +50,22 @@ from sglang.srt.utils.network import (
 logger = logging.getLogger(__name__)
 
 
+class KVTransferError(Exception):
+    def __init__(
+        self,
+        bootstrap_room: int,
+        failure_reason: str,
+        is_from_another_rank: bool = False,
+    ):
+        super().__init__(failure_reason)
+        self.bootstrap_room = bootstrap_room
+        self.failure_reason = failure_reason
+        self.is_from_another_rank = is_from_another_rank
+
+    def __str__(self):
+        return f"KVTransferError(bootstrap_room={self.bootstrap_room}): {self.failure_reason}"
+
+
 @dataclasses.dataclass
 class PrefillServerInfo:
     # Topology fields (fetched from bootstrap server)
@@ -59,6 +76,12 @@ class PrefillServerInfo:
     page_size: Optional[int]
     kv_cache_dtype: Optional[str]
     follow_bootstrap_room: bool
+
+    # PD true-retraction rebootstrap: the prefill's HTTP API port. The decode
+    # already knows the prefill host (the bootstrap_addr host), so it can POST
+    # /generate to http://{bootstrap_host}:{prefill_http_port} to trigger a KV
+    # recompute -- no router-injected pd_rebootstrap_prefill_url needed.
+    prefill_http_port: Optional[int] = None
 
     # Pre-computed rank mapping (set by try_ensure_parallel_info on decode side)
     target_tp_rank: Optional[int] = None
@@ -78,6 +101,9 @@ class PrefillServerInfo:
             str(self.kv_cache_dtype) if self.kv_cache_dtype is not None else None
         )
         self.follow_bootstrap_room = bool(self.follow_bootstrap_room)
+        self.prefill_http_port = (
+            int(self.prefill_http_port) if self.prefill_http_port is not None else None
+        )
 
 
 @dataclasses.dataclass
@@ -128,13 +154,16 @@ class CommonKVManager(BaseKVManager):
         )
 
         # bind zmq socket
-        context = zmq.Context()
+        self._zmq_ctx = zmq.Context()
         self.rank_port, self.server_socket = get_zmq_socket_on_host(
-            context, zmq.PULL, host=self.local_ip
+            self._zmq_ctx, zmq.PULL, host=self.local_ip
         )
         logger.debug(f"kv manager bind to {self.local_ip}:{self.rank_port}")
 
         self.request_status: Dict[int, KVPoll] = {}
+        self._socket_cache: Dict[str, zmq.Socket] = {}
+        self._monitor_cache: Dict[str, zmq.Socket] = {}
+        self._socket_lock = threading.Lock()
         self.failure_records: Dict[int, str] = {}
         self.failure_lock = threading.Lock()
 
@@ -185,6 +214,16 @@ class CommonKVManager(BaseKVManager):
             # fail to receive the KV Cache transfer done signal after bootstrapping.
             # These timeout requests should be aborted to release the tree cache.
             self.waiting_timeout = envs.SGLANG_DISAGGREGATION_WAITING_TIMEOUT.get()
+            # PD true-retraction rebootstrap: a shared executor + per-thread HTTP
+            # sessions used to drive the original prefill worker's ``/generate``
+            # endpoint so it recomputes a retracted request's prefix KV under the
+            # current weights. Created lazily on first use so deployments that
+            # never retract pay nothing.
+            self._prefill_recompute_executor: Optional[
+                concurrent.futures.ThreadPoolExecutor
+            ] = None
+            self._prefill_recompute_executor_lock = threading.Lock()
+            self._prefill_recompute_sessions = threading.local()
         else:
             raise ValueError(
                 f"Unsupported DisaggregationMode: {self.disaggregation_mode}"
@@ -213,6 +252,151 @@ class CommonKVManager(BaseKVManager):
     def record_failure(self, bootstrap_room: int, failure_reason: str):
         with self.failure_lock:
             self.failure_records[bootstrap_room] = failure_reason
+
+    def _ensure_prefill_recompute_executor(
+        self,
+    ) -> concurrent.futures.ThreadPoolExecutor:
+        """Lazily create the shared executor that drives PD-retract rebootstrap
+        ``/generate`` calls. One executor per (decode) kv manager, shared across
+        all receivers."""
+        executor = self._prefill_recompute_executor
+        if executor is not None:
+            return executor
+        with self._prefill_recompute_executor_lock:
+            if self._prefill_recompute_executor is None:
+                workers = envs.SGLANG_DISAGGREGATION_THREAD_POOL_SIZE.get()
+                if workers is None:
+                    workers = 16
+                self._prefill_recompute_executor = (
+                    concurrent.futures.ThreadPoolExecutor(
+                        max_workers=max(1, workers),
+                        thread_name_prefix="pd-rebootstrap-prefill",
+                    )
+                )
+            return self._prefill_recompute_executor
+
+    def _get_prefill_recompute_session(self) -> requests.Session:
+        """Per-thread ``requests.Session`` for the rebootstrap executor threads
+        (``requests.Session`` is not safe for concurrent cross-thread use)."""
+        session = getattr(self._prefill_recompute_sessions, "session", None)
+        if session is None:
+            session = requests.Session()
+            self._prefill_recompute_sessions.session = session
+        return session
+
+    def _resolve_rebootstrap_prefill_url(
+        self, kv_receiver: CommonKVReceiver
+    ) -> Optional[str]:
+        """Derive the prefill ``/generate`` base URL for a PD true-retraction
+        rebootstrap from bootstrap info.
+
+        The decode already knows the prefill host (the ``bootstrap_addr`` host,
+        which the router/client set to the prefill's HTTP host), and the prefill
+        self-registers its HTTP API port in ``PrefillServerInfo`` at bootstrap
+        registration. Combining them yields ``http://{host}:{prefill_http_port}``
+        with no router-injected ``pd_rebootstrap_prefill_url``.
+        """
+        prefill_info = self.prefill_info_table.get(kv_receiver.bootstrap_addr)
+        if prefill_info is None or prefill_info.prefill_http_port is None:
+            return None
+        host = NetworkAddress.parse(kv_receiver.bootstrap_addr).host
+        return NetworkAddress(host, prefill_info.prefill_http_port).to_url()
+
+    def submit_prefill_recompute(
+        self, kv_receiver: CommonKVReceiver, payload: dict
+    ) -> None:
+        """Dispatch a PD true-retraction rebootstrap ``/generate`` to the
+        original prefill worker so it recomputes the retracted request's prefix
+        KV under the current weights and transfers it back over the
+        already-bootstrapped channel.
+
+        The target prefill ``/generate`` URL is derived from bootstrap info (the
+        prefill self-registered its HTTP port), not from a router-injected field.
+
+        Non-blocking from the scheduler's perspective: the HTTP POST runs on the
+        shared executor. Any failure (unresolved URL, HTTP error, exception) is
+        surfaced through the standard ``KVPoll.Failed`` path via
+        ``kv_receiver.abort()`` so the scheduler's existing transfer-failure
+        handling streams the aborted request back to the client. ``payload`` is
+        prebuilt by the decode scheduler (``Req.build_rebootstrap_payload``) so
+        HTTP/sampling concerns stay on the kv manager.
+
+        The decode scheduler broadcasts each retracted request to every rank in
+        its attention TP/CP group and every PP stage, so all of them reach this
+        call and would each POST an identical ``/generate`` -- making the prefill
+        worker recompute the same request once per decode rank. The ``/generate``
+        is a server-level call: the prefill frontend fans it out to its own
+        workers and transfers the recomputed KV back to *all* decode ranks, so
+        exactly one decode rank must issue it. Elect the same leader the request
+        receiver uses (attn-tp/attn-cp group leader, first PP stage); the other
+        ranks still bootstrap and receive their KV shard as usual, and on failure
+        the leader-only abort matches the leader-only output streaming (other
+        ranks fall back to the per-request waiting-timeout safety net).
+        """
+        if self.attn_tp_rank != 0 or self.attn_cp_rank != 0 or self.pp_rank != 0:
+            return
+        prefill_url = self._resolve_rebootstrap_prefill_url(kv_receiver)
+        if not prefill_url:
+            logger.error(
+                "PD retract rebootstrap could not resolve the prefill /generate "
+                "URL from bootstrap info (rid=%s bootstrap_room=%s bootstrap_addr=%s).",
+                payload.get("rid"),
+                payload.get("bootstrap_room"),
+                kv_receiver.bootstrap_addr,
+            )
+            self._fail_prefill_recompute(
+                kv_receiver,
+                "PD retract rebootstrap could not resolve the prefill /generate "
+                "URL from bootstrap info.",
+            )
+            return
+        self._ensure_prefill_recompute_executor().submit(
+            self._run_prefill_recompute, kv_receiver, prefill_url, payload
+        )
+
+    def _fail_prefill_recompute(
+        self, kv_receiver: CommonKVReceiver, reason: str
+    ) -> None:
+        """Fail a rebootstrap request via the standard ``KVPoll.Failed`` path.
+
+        ``abort()`` transitions the receiver to Failed and notifies the prefill
+        worker to release its orphaned bootstrap entry, but records a generic
+        reason; we overwrite it with a descriptive one so the eventual
+        ``failure_exception`` (and the client-facing abort message) explains that
+        the rebootstrap ``/generate`` failed rather than reporting a spurious
+        ``AbortReq``.
+        """
+        kv_receiver.abort()
+        self.record_failure(kv_receiver.bootstrap_room, reason)
+
+    def _run_prefill_recompute(
+        self, kv_receiver: CommonKVReceiver, prefill_url: str, payload: dict
+    ) -> None:
+        rid = payload.get("rid")
+        try:
+            response = self._get_prefill_recompute_session().post(
+                prefill_url.rstrip("/") + "/generate",
+                json=payload,
+                timeout=self.waiting_timeout,
+            )
+            if response.status_code >= 400:
+                logger.error(
+                    "PD rebootstrap prefill failed for rid=%s status=%s body=%s",
+                    rid,
+                    response.status_code,
+                    response.text[:512],
+                )
+                self._fail_prefill_recompute(
+                    kv_receiver,
+                    f"PD retract rebootstrap /generate failed for rid={rid} "
+                    f"(status={response.status_code}).",
+                )
+        except Exception:
+            logger.exception("PD rebootstrap prefill request failed for rid=%s", rid)
+            self._fail_prefill_recompute(
+                kv_receiver,
+                f"PD retract rebootstrap /generate request errored for rid={rid}.",
+            )
 
     def try_ensure_parallel_info(self, bootstrap_addr: str) -> bool:
         """Single non-blocking attempt to fetch and cache prefill parallel info.
@@ -376,6 +560,12 @@ class CommonKVManager(BaseKVManager):
         else:
             # Single-node case: bootstrap server's host is the same as http server's host
             host = self.bootstrap_host
+            # A wildcard bind address (0.0.0.0 / ::) is not a valid HTTP Host
+            # and can't be connected to; rewrite it to the same-family loopback,
+            # which the wildcard listener also binds.  (self.local_ip is wrong
+            # here — it can resolve to a different family than the listener,
+            # e.g. IPv6 while the server is bound to 0.0.0.0.)
+            host = {"0.0.0.0": "127.0.0.1", "::": "::1"}.get(host, host)
 
         bootstrap_na = NetworkAddress(host, self.bootstrap_port)
         url = f"{bootstrap_na.to_url()}/route"
@@ -395,6 +585,10 @@ class CommonKVManager(BaseKVManager):
             "page_size": self.kv_args.page_size,
             "kv_cache_dtype": self.server_args.kv_cache_dtype,
             "load_balance_method": self.server_args.load_balance_method,
+            # Self-register the HTTP API port so the decode can derive the PD
+            # retract rebootstrap /generate URL from bootstrap info instead of a
+            # router-injected pd_rebootstrap_prefill_url.
+            "prefill_http_port": self.server_args.port,
         }
 
         max_retries, initial_delay, max_delay = 5, 1.0, 30.0
@@ -425,13 +619,44 @@ class CommonKVManager(BaseKVManager):
             f"Prefill instance failed to register to bootstrap server after {max_retries} retries"
         )
 
-    @cache
     def _connect(self, endpoint: str, is_ipv6: bool = False):
-        socket = zmq.Context().socket(zmq.PUSH)
-        if is_ipv6:
-            socket.setsockopt(zmq.IPV6, 1)
-        socket.connect(endpoint)
-        return socket
+        with self._socket_lock:
+            sock = self._socket_cache.get(endpoint)
+            if sock is not None:
+                monitor = self._monitor_cache.get(endpoint)
+                disconnected = False
+                if monitor is not None:
+                    try:
+                        monitor.recv_multipart(zmq.NOBLOCK)
+                        disconnected = True
+                    except zmq.Again:
+                        pass
+                    except zmq.ZMQError:
+                        disconnected = True
+                if not disconnected:
+                    return sock
+                sock.close(linger=0)
+                if monitor is not None:
+                    monitor.close()
+                self._socket_cache.pop(endpoint, None)
+                self._monitor_cache.pop(endpoint, None)
+
+            sock = self._zmq_ctx.socket(zmq.PUSH)
+            if is_ipv6:
+                sock.setsockopt(zmq.IPV6, 1)
+            sock.setsockopt(zmq.RECONNECT_IVL, -1)
+            sock.setsockopt(zmq.SNDTIMEO, 30000)
+            sock.setsockopt(zmq.LINGER, 0)
+            sock.setsockopt(zmq.TCP_KEEPALIVE, 1)
+            sock.setsockopt(zmq.TCP_KEEPALIVE_IDLE, 30)
+            sock.setsockopt(zmq.TCP_KEEPALIVE_INTVL, 5)
+            sock.setsockopt(zmq.TCP_KEEPALIVE_CNT, 3)
+            sock.connect(endpoint)
+            self._socket_cache[endpoint] = sock
+            self._monitor_cache[endpoint] = sock.get_monitor_socket(
+                zmq.EVENT_DISCONNECTED
+            )
+            return sock
 
     def get_mha_kv_ptrs_with_pp(
         self, src_kv_ptrs: List[int], dst_kv_ptrs: List[int]
@@ -467,7 +692,10 @@ class CommonKVManager(BaseKVManager):
         return src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage
 
     def get_mla_kv_ptrs_with_pp(
-        self, src_kv_ptrs: List[int], dst_kv_ptrs: List[int]
+        self,
+        src_kv_ptrs: List[int],
+        dst_kv_ptrs: List[int],
+        state_type: Optional[StateType] = None,
     ) -> Tuple[List[int], List[int], int]:
         # Fast path: both sides use exactly the same PP layout
         if len(src_kv_ptrs) == len(dst_kv_ptrs):
@@ -480,7 +708,7 @@ class CommonKVManager(BaseKVManager):
             # layer, so we locate the sub-range for this PP stage inside each
             # section of the dst flat list.
             sliced_src_kv_ptrs, sliced_dst_kv_ptrs = self._mla_slice_ptrs_for_pp(
-                src_kv_ptrs, dst_kv_ptrs, mla_ratios
+                src_kv_ptrs, dst_kv_ptrs, mla_ratios, state_type
             )
             return (
                 sliced_src_kv_ptrs,
@@ -500,6 +728,7 @@ class CommonKVManager(BaseKVManager):
         src_kv_ptrs: List[int],
         dst_kv_ptrs: List[int],
         mla_ratios: List[int],
+        state_type: Optional[StateType] = None,
     ) -> Tuple[List[int], List[int]]:
         """Produce aligned (src, dst) pointer lists for compressed-MLA
         pools (e.g. DeepSeek V4) under PP.
@@ -514,15 +743,18 @@ class CommonKVManager(BaseKVManager):
           Each section is indexed by compressed-layer id within that
           compression bucket.
 
-        - state_data layout, length = swa_L + 2 * c4_L + c128_L:
+        - SWA state_data layout, length = swa_L + 2 * c4_L:
             [swa_layer_{0..swa_L-1},
-             compress_state_{non-None, c4_L + c128_L},
-             indexer_compress_state_{non-None, c4_L}]
+             c4_compress_state_{0..c4_L-1},
+             c4_indexer_compress_state_{0..c4_L-1}]
           ``swa_L`` is the SWA pool's actual buffer count
           (``num_effective_layers``), which can be smaller than
           ``len(mla_ratios)`` when the HF config's ``compress_ratios``
           list contains entries for layers not materialized into the SWA
           pool (e.g. an MTP/nextn slot at the tail).
+
+        - C128_STATE layout, length = c128_L:
+            [c128_compress_state_{0..c128_L-1}]
 
         src is already PP-filtered on the prefill side. dst is the
         decode-side full-model list (when decode is PP=1). We slice dst to
@@ -531,10 +763,9 @@ class CommonKVManager(BaseKVManager):
         """
         start_layer = self.kv_args.prefill_start_layer
         end_layer = getattr(self.kv_args, "prefill_end_layer", None)
-        assert end_layer is not None, (
-            "KVArgs.prefill_end_layer must be set when using "
-            "compressed-MLA PD with PP"
-        )
+        assert (
+            end_layer is not None
+        ), "KVArgs.prefill_end_layer must be set when using compressed-MLA PD with PP"
 
         c4_full = sum(1 for r in mla_ratios if r == 4)
         c128_full = sum(1 for r in mla_ratios if r == 128)
@@ -545,7 +776,18 @@ class CommonKVManager(BaseKVManager):
         c128_off_s = sum(1 for r in mla_ratios[:start_layer] if r == 128)
         c128_off_e = sum(1 for r in mla_ratios[:end_layer] if r == 128)
 
-        if len(dst_kv_ptrs) == kv_layout_len:
+        if state_type == StateType.C128_STATE:
+            return src_kv_ptrs, list(dst_kv_ptrs[c128_off_s:c128_off_e])
+
+        if state_type == StateType.SWA_RING:
+            swa_s = min(start_layer, len(dst_kv_ptrs))
+            swa_e = min(end_layer, len(dst_kv_ptrs))
+            return src_kv_ptrs, list(dst_kv_ptrs[swa_s:swa_e])
+
+        if (
+            state_type not in (StateType.SWA, StateType.SWA_RING, StateType.C128_STATE)
+            and len(dst_kv_ptrs) == kv_layout_len
+        ):
             sliced_dst = (
                 list(dst_kv_ptrs[c4_off_s:c4_off_e])
                 + list(dst_kv_ptrs[c4_full + c4_off_s : c4_full + c4_off_e])
@@ -553,39 +795,33 @@ class CommonKVManager(BaseKVManager):
             )
             return src_kv_ptrs, sliced_dst
 
-        # State-data layout. ``swa_L`` is derived from the actual dst
-        # length so we tolerate cases where the SWA pool has fewer
-        # buffers than ``len(mla_ratios)`` (e.g. nextn padding).
-        swa_L = len(dst_kv_ptrs) - 2 * c4_full - c128_full
+        # SWA state-data layout. ``swa_L`` is derived from the actual dst
+        # length so we tolerate cases where the SWA pool has fewer buffers
+        # than ``len(mla_ratios)`` (e.g. nextn padding). C128 state ships as
+        # a separate StateType.C128_STATE component and must not be counted
+        # here.
+        swa_L = len(dst_kv_ptrs) - 2 * c4_full
         if swa_L < 0 or swa_L > len(mla_ratios):
             raise ValueError(
                 f"Unexpected compressed-MLA dst_kv_ptrs length "
                 f"{len(dst_kv_ptrs)}; expected either {kv_layout_len} "
-                f"(kv_data) or swa_L + {2 * c4_full + c128_full} "
+                f"(kv_data) or swa_L + {2 * c4_full} "
                 f"(state_data) given compression_ratios "
                 f"(c4={c4_full}, c128={c128_full}, "
                 f"total={len(mla_ratios)})."
             )
-        # Guard against asking the prefill side to read past the SWA
-        # pool boundary.
-        assert end_layer <= swa_L, (
-            f"prefill_end_layer ({end_layer}) exceeds dst SWA pool "
-            f"buffer count ({swa_L}); compression_ratios may include "
-            f"layers (e.g. nextn) that the SWA pool does not cover."
-        )
 
-        # compress_state non-None count up to L = count(r != 0).
-        c_non_zero_s = sum(1 for r in mla_ratios[:start_layer] if r != 0)
-        c_non_zero_e = sum(1 for r in mla_ratios[:end_layer] if r != 0)
+        swa_s = min(start_layer, swa_L)
+        swa_e = min(end_layer, swa_L)
         compress_section_start = swa_L
-        indexer_section_start = swa_L + (c4_full + c128_full)
+        indexer_section_start = swa_L + c4_full
         sliced_dst = (
-            list(dst_kv_ptrs[start_layer:end_layer])
+            list(dst_kv_ptrs[swa_s:swa_e])
             + list(
                 dst_kv_ptrs[
                     compress_section_start
-                    + c_non_zero_s : compress_section_start
-                    + c_non_zero_e
+                    + c4_off_s : compress_section_start
+                    + c4_off_e
                 ]
             )
             + list(
@@ -656,6 +892,15 @@ class CommonKVManager(BaseKVManager):
             keys_to_remove = [
                 k for k in self.connection_pool if k.startswith(failed_bootstrap_addr)
             ]
+            # Collect TCP endpoints from cached bootstrap_infos before deletion
+            stale_endpoints = set()
+            for k in keys_to_remove:
+                for info in self.connection_pool[k]:
+                    ip = info.get("rank_ip")
+                    port = info.get("rank_port")
+                    if ip and port:
+                        na = NetworkAddress(ip, int(port))
+                        stale_endpoints.add(na.to_tcp())
             for k in keys_to_remove:
                 del self.connection_pool[k]
             self.prefill_info_table.pop(failed_bootstrap_addr, None)
@@ -664,6 +909,9 @@ class CommonKVManager(BaseKVManager):
                 failed_bootstrap_addr, []
             )
             self.addr_to_rooms_tracker.pop(failed_bootstrap_addr, None)
+
+        for endpoint in stale_endpoints:
+            CommonKVReceiver.disconnect_endpoint(endpoint)
 
         affected_rooms = []
         for room in possible_affected_rooms:
@@ -801,6 +1049,7 @@ class CommonKVSender(BaseKVSender):
                 self.kv_mgr,
                 kv_indices,
                 index_slice,
+                total_pages=self.num_kv_indices,
             )
         elif self.kv_mgr.is_dummy_cp_rank:
             if not is_last_chunk:
@@ -877,6 +1126,7 @@ class CommonKVReceiver(BaseKVReceiver):
         self.conclude_state: Optional[KVPoll] = None
         self.require_staging: bool = False
         self.init_time: Optional[float] = None
+        self.abort_notified: bool = False
         self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].add(self.bootstrap_room)
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Bootstrapping)
 
@@ -1022,10 +1272,25 @@ class CommonKVReceiver(BaseKVReceiver):
                 sock = cls._ctx.socket(zmq.PUSH)
                 if is_ipv6:
                     sock.setsockopt(zmq.IPV6, 1)
+                sock.setsockopt(zmq.RECONNECT_IVL, -1)
+                sock.setsockopt(zmq.LINGER, 0)
                 sock.connect(endpoint)
                 cls._socket_cache[endpoint] = sock
                 cls._socket_locks[endpoint] = threading.Lock()
             return cls._socket_cache[endpoint], cls._socket_locks[endpoint]
+
+    @classmethod
+    def disconnect_endpoint(cls, endpoint: str):
+        with cls._global_lock:
+            sock = cls._socket_cache.pop(endpoint, None)
+            lock = cls._socket_locks.pop(endpoint, None)
+        if sock:
+            if lock:
+                with lock:
+                    sock.close()
+            else:
+                sock.close()
+            logger.debug(f"Disconnected stale ZMQ PUSH socket (receiver): {endpoint}")
 
     @classmethod
     def _connect_to_bootstrap_server(cls, bootstrap_info: dict):
@@ -1043,6 +1308,7 @@ class CommonKVReceiver(BaseKVReceiver):
         kv_indices: npt.NDArray[np.int32],
         aux_index: Optional[int] = None,
         state_indices: Optional[List[int]] = None,
+        decode_prefix_len: Optional[int] = None,
     ):
         raise NotImplementedError
 
@@ -1062,6 +1328,13 @@ class CommonKVReceiver(BaseKVReceiver):
             f"in KVPoll.WaitingForInput",
         )
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+        if (
+            not self.abort_notified
+            and hasattr(self, "bootstrap_infos")
+            and self.bootstrap_infos is not None
+        ):
+            self._send_abort_notification()
+            self.abort_notified = True
         return KVPoll.Failed
 
     def failure_exception(self):
@@ -1079,6 +1352,36 @@ class CommonKVReceiver(BaseKVReceiver):
         )
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
         self.conclude_state = KVPoll.Failed
+        if (
+            not self.abort_notified
+            and hasattr(self, "bootstrap_infos")
+            and self.bootstrap_infos is not None
+        ):
+            self._send_abort_notification()
+            self.abort_notified = True
+
+    def _send_abort_notification(self):
+        for bootstrap_info in self.bootstrap_infos:
+            # Best-effort notification to prefill side that this request was aborted.
+            try:
+                sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
+                with lock:
+                    sock.send_multipart(
+                        [
+                            b"ABORT",
+                            str(self.bootstrap_room).encode("ascii"),
+                            self.kv_mgr.local_ip.encode("ascii"),
+                            str(self.kv_mgr.rank_port).encode("ascii"),
+                        ]
+                    )
+                logger.debug(
+                    f"Sent abort notification for room {self.bootstrap_room} "
+                    f"to {bootstrap_info.get('rank_ip', 'unknown')}:{bootstrap_info.get('rank_port', 'unknown')}"
+                )
+            except Exception as e:
+                logger.debug(
+                    f"Failed to send abort notification for room {self.bootstrap_room}: {e}"
+                )
 
 
 class CommonKVBootstrapServer(BaseKVBootstrapServer):
@@ -1096,6 +1399,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.page_size = None
         self.kv_cache_dtype: Optional[str] = None
         self.follow_bootstrap_room: Optional[bool] = None
+        self.prefill_http_port: Optional[int] = None
         self.prefill_port_table: Dict[
             int, Dict[int, Dict[int, Dict[int, PrefillRankInfo]]]
         ] = {}
@@ -1162,6 +1466,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         rank_port = int(data["rank_port"])
         page_size = int(data["page_size"])
         kv_cache_dtype = data["kv_cache_dtype"]
+        prefill_http_port = data.get("prefill_http_port")
 
         if self.attn_tp_size is None:
             self.attn_tp_size = attn_tp_size
@@ -1180,6 +1485,9 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
 
         if self.kv_cache_dtype is None and kv_cache_dtype is not None:
             self.kv_cache_dtype = kv_cache_dtype
+
+        if self.prefill_http_port is None and prefill_http_port is not None:
+            self.prefill_http_port = int(prefill_http_port)
 
         if self.follow_bootstrap_room is None:
             load_balance_method = data.get(
@@ -1250,6 +1558,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                     if self.follow_bootstrap_room is not None
                     else True
                 ),
+                prefill_http_port=self.prefill_http_port,
             )
             return web.json_response(dataclasses.asdict(info), status=200)
 
