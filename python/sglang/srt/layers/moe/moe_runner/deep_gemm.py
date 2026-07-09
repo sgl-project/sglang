@@ -137,7 +137,9 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         if envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.get():
             assert envs.SGLANG_OPT_SWIGLU_CLAMP_FUSION.get()
             assert envs.SGLANG_OPT_USE_JIT_EP_ACTIVATION.get()
-            self.use_swizzle = True
+            # SM120 DeepGEMM contiguous GEMM consumes standard-layout
+            # activations only.
+            self.use_swizzle = False
 
     def run(
         self,
