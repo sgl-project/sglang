@@ -1,3 +1,16 @@
+"""End-to-end accuracy tests for the ``pplx`` MoE all-to-all backend.
+
+Besides the throughput GSM8K run, each server also runs a **single-stream**
+GSM8K eval (``num_threads=1``). That is deliberate: the pplx EP combine already
+reduces each token's expert outputs back to the source rank, so the model must
+skip the post-experts all-reduce (see
+``should_skip_post_experts_all_reduce`` / ``is_pplx()``). When it does not, the
+extra all-reduce folds *idle* DP ranks' fabricated outputs into the real tokens
+-- which only happens when fewer requests are in flight than ``dp_size``. The
+high-concurrency run keeps every rank busy and hides that bug; the single-stream
+run leaves ranks idle and is the regression guard for it.
+"""
+
 import unittest
 from types import SimpleNamespace
 
@@ -12,7 +25,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=300, stage="base-c", runner_config="deepep-4-gpu-h100")
+register_cuda_ci(est_time=420, stage="base-c", runner_config="deepep-4-gpu-h100")
 
 
 class TestPureDP(CustomTestCase):
@@ -46,7 +59,8 @@ class TestPureDP(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
+        if hasattr(cls, "process") and cls.process:
+            kill_process_tree(cls.process.pid)
 
     def test_gsm8k(self):
         args = SimpleNamespace(
@@ -62,6 +76,26 @@ class TestPureDP(CustomTestCase):
         print(metrics)
 
         self.assertGreater(metrics["score"], 0.60)
+
+    def test_gsm8k_single_stream(self):
+        # Regression guard for the post-experts all-reduce double-count: with
+        # num_threads=1 only one DP rank has a real request at a time, leaving
+        # the others idle. If pplx does not skip the post-experts all-reduce,
+        # those idle ranks' outputs corrupt the answer and the score collapses
+        # (~0). Keep this serial + low example count so it stays cheap.
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="gsm8k",
+            api="completion",
+            max_tokens=512,
+            num_examples=40,
+            num_threads=1,
+        )
+        metrics = run_eval(args)
+        print(metrics)
+
+        self.assertGreater(metrics["score"], 0.50)
 
 
 class TestHybridDPTP(CustomTestCase):
@@ -95,7 +129,8 @@ class TestHybridDPTP(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
+        if hasattr(cls, "process") and cls.process:
+            kill_process_tree(cls.process.pid)
 
     def test_gsm8k(self):
         args = SimpleNamespace(

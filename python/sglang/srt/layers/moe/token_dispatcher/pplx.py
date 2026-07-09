@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import logging
-import os
 from enum import Enum, auto
 from typing import NamedTuple, Optional, Tuple
 
@@ -28,8 +26,6 @@ from sglang.srt.layers.moe.utils import (
     get_deepep_output_dtype,
 )
 from sglang.srt.environ import envs
-
-logger = logging.getLogger(__name__)
 
 # Block size used by pplx-kernels for FP8 block-wise scales, matching the
 # DeepSeek / DeepGEMM block quantization convention.
@@ -195,18 +191,6 @@ class PplxAllToAllManager:
             )
             return cls._all_to_all
 
-        if os.environ.get("SGLANG_PPLX_DEBUG"):
-            num_local_experts = -(-num_experts // world_size)
-            num_dp_groups = -(-world_size // dp_size)
-            logger.warning(
-                f"[PPLX rank={rank}] build AllToAll: world_size={world_size} "
-                f"dp_size={dp_size} num_dp_groups={num_dp_groups} "
-                f"num_experts={num_experts} num_local_experts={num_local_experts} "
-                f"experts_per_token={experts_per_token} hidden_dim={hidden_dim} "
-                f"max_num_tokens={max_num_tokens} scale_bytes={hidden_dim_scale_bytes} "
-                f"internode={world_size > torch.cuda.device_count()}"
-            )
-
         cls._ensure_nvshmem(group)
 
         # Use the single-node NVLink path when the EP group fits on one node,
@@ -350,24 +334,15 @@ class _PplxEPDispatcherImpl:
         max_batch_tokens = self.num_max_dispatch_tokens_per_rank * num_dp_groups
         device = hidden_states.device
 
-        if os.environ.get("SGLANG_PPLX_DEBUG"):
-            rank = dist.get_rank()
-            imin = int(topk_ids.min().item()) if topk_ids.numel() else -1
-            imax = int(topk_ids.max().item()) if topk_ids.numel() else -1
-            logger.warning(
-                f"[PPLX rank={rank}] dispatch_a: num_tokens={num_tokens} "
-                f"topk_ids.shape={tuple(topk_ids.shape)} idx_range=[{imin},{imax}] "
-                f"num_experts={self.num_experts} max_num_tokens="
-                f"{self.num_max_dispatch_tokens_per_rank} use_fp8={self.use_fp8}"
-            )
-
         dp_x, dp_x_scale = self._quantize(hidden_states)
 
         # pplx pre-allocates dispatch outputs (masked / per-expert batched).
-        out_expert_num_tokens = torch.empty(
+        # Zero-init: unwritten padding slots (beyond masked_m per expert) must
+        # be zero so the expert GEMM + combine never read uninitialized memory.
+        out_expert_num_tokens = torch.zeros(
             self.num_local_experts, dtype=torch.int32, device=device
         )
-        out_expert_x = torch.empty(
+        out_expert_x = torch.zeros(
             (self.num_local_experts, max_batch_tokens, self.hidden_size),
             dtype=dp_x.dtype,
             device=device,
@@ -441,7 +416,7 @@ class _PplxEPDispatcherImpl:
         num_tokens = topk_ids.shape[0]
         device = topk_ids.device
 
-        out_tokens = torch.empty(
+        out_tokens = torch.zeros(
             (self.num_max_dispatch_tokens_per_rank, self.hidden_size),
             dtype=self.params_dtype,
             device=device,
