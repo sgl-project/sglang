@@ -633,8 +633,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # for the contract.
         capture_hidden_mode = batch.capture_hidden_mode
         batch.capture_hidden_mode = None
-        seq_lens_cpu_cache = batch.seq_lens_cpu_cache
-        batch.seq_lens_cpu_cache = None
         return_hidden_states_before_norm = batch.return_hidden_states_before_norm
         batch.return_hidden_states_before_norm = False
 
@@ -669,18 +667,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # ScheduleBatch.sampling_info is already swapped to the forward-only
         # copy by Scheduler.run_batch under overlap mode (see save/restore
         # block there). Use it directly.
-        if seq_lens_cpu_cache is not None:
-            # Stale-cache guard: shape must match current GPU seq_lens. Mismatch
-            # means caller forgot to refresh the override after batch size
-            # changed (e.g. filter/merge_batch); using a stale cache would
-            # propagate wrong CPU mirror to downstream DP / cudagraph logic.
-            assert seq_lens_cpu_cache.shape == batch.seq_lens.shape, (
-                f"seq_lens_cpu_cache shape {seq_lens_cpu_cache.shape} != "
-                f"seq_lens {batch.seq_lens.shape}; stale override on batch?"
-            )
-            seq_lens_cpu = seq_lens_cpu_cache
-        else:
-            seq_lens_cpu = batch.seq_lens_cpu
+        seq_lens_cpu = batch.seq_lens_cpu
 
         if batch.seq_lens_sum is None and seq_lens_cpu is not None:
             batch.seq_lens_sum = int(seq_lens_cpu.sum())

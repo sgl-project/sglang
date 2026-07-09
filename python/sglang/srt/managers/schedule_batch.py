@@ -1842,7 +1842,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     spec_info: Optional[SpecInput] = None
 
     # === One-shot per-forward overrides; init_new consumes and resets ===
-    seq_lens_cpu_cache: torch.Tensor = None
     capture_hidden_mode: Optional[CaptureHiddenMode] = None
     return_hidden_states_before_norm: bool = False
 
