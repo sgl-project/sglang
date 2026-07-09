@@ -33,6 +33,7 @@ class BaseReasoningFormatDetector:
         previous_content: str = "",
         thinks_internally: bool = False,
         reasoning_default: str = "always",
+        force_nonempty_content: bool = False,
     ):
         self.think_start_token = think_start_token
         self.think_end_token = think_end_token
@@ -48,6 +49,9 @@ class BaseReasoningFormatDetector:
         self.stripped_think_start = False
         self.think_start_self_label = ""
 
+        self._force_nonempty_content = force_nonempty_content
+        self._accumulated_reasoning = ""
+
         self.continue_final_message = continue_final_message
         if self.continue_final_message:
             self.previous_content = previous_content
@@ -61,11 +65,21 @@ class BaseReasoningFormatDetector:
         if self.think_end_token in self.previous_content:
             self._in_reasoning = False
 
+    def _apply_force_nonempty_content(
+        self, ret: StreamingParseResult
+    ) -> StreamingParseResult:
+        if self._force_nonempty_content and not ret.normal_text:
+            ret.normal_text, ret.reasoning_text = ret.reasoning_text, ret.normal_text
+        return ret
+
     def detect_and_parse(self, text: str) -> StreamingParseResult:
         """
         One-time parsing: Detects and parses reasoning sections in the provided text.
         Returns both reasoning content and normal text separately.
         """
+        return self._apply_force_nonempty_content(self._detect_and_parse_impl(text))
+
+    def _detect_and_parse_impl(self, text: str) -> StreamingParseResult:
         in_reasoning = self._in_reasoning or self.think_start_token in text
 
         if not in_reasoning:
@@ -121,6 +135,15 @@ class BaseReasoningFormatDetector:
         If stream_reasoning is True:
             Streams reasoning content as it arrives
         """
+        ret = self._parse_streaming_increment_impl(new_text)
+        if self._force_nonempty_content:
+            if self._in_reasoning:
+                self._accumulated_reasoning += ret.reasoning_text
+            else:
+                self._accumulated_reasoning = ""
+        return ret
+
+    def _parse_streaming_increment_impl(self, new_text: str) -> StreamingParseResult:
         self._buffer += new_text
         current_text = self._buffer
 
@@ -185,10 +208,16 @@ class BaseReasoningFormatDetector:
 
     def finish(self) -> StreamingParseResult:
         """
-        Called once when the stream ends. Subclasses may override to flush
-        buffered state (e.g. reclassify accumulated reasoning as content).
-        Default: no-op.
+        Called once when the stream ends. If force_nonempty_content is set
+        and the stream ended mid-reasoning, reclassifies the accumulated
+        reasoning (plus any partial token still buffered) as normal text.
         """
+        if self._force_nonempty_content and self._in_reasoning:
+            normal_text = self._accumulated_reasoning + self._buffer
+            self._accumulated_reasoning = ""
+            self._buffer = ""
+            if normal_text:
+                return StreamingParseResult(normal_text=normal_text)
         return StreamingParseResult()
 
 
@@ -501,39 +530,8 @@ class Nemotron3Detector(BaseReasoningFormatDetector):
             continue_final_message=continue_final_message,
             previous_content=previous_content,
             reasoning_default="enable_thinking",
+            force_nonempty_content=force_nonempty_content,
         )
-        self._force_nonempty_content = force_nonempty_content
-        self._accumulated_reasoning = ""
-
-    def detect_and_parse(self, text: str) -> StreamingParseResult:
-        ret = super().detect_and_parse(text)
-        if self._force_nonempty_content and not ret.normal_text:
-            ret.normal_text, ret.reasoning_text = ret.reasoning_text, ret.normal_text
-        return ret
-
-    def parse_streaming_increment(self, new_text: str) -> StreamingParseResult:
-        ret = super().parse_streaming_increment(new_text)
-        if self._force_nonempty_content:
-            if self._in_reasoning:
-                self._accumulated_reasoning += ret.reasoning_text
-            else:
-                self._accumulated_reasoning = ""
-        return ret
-
-    def finish(self) -> StreamingParseResult:
-        """
-        The model sometimes never emits a closing `</think>` (e.g. it hits
-        max_tokens mid-reasoning). When that happens with force_nonempty_content
-        set, reclassify whatever reasoning content was streamed (plus any
-        partial token still buffered) as content so the response isn't empty.
-        """
-        if self._force_nonempty_content and self._in_reasoning:
-            normal_text = self._accumulated_reasoning + self._buffer
-            self._accumulated_reasoning = ""
-            self._buffer = ""
-            if normal_text:
-                return StreamingParseResult(normal_text=normal_text)
-        return StreamingParseResult()
 
 
 class MistralDetector(BaseReasoningFormatDetector):
@@ -665,9 +663,9 @@ class Apertus2509Detector(BaseReasoningFormatDetector):
             stream_reasoning=stream_reasoning,
             continue_final_message=continue_final_message,
             previous_content=previous_content,
+            force_nonempty_content=force_nonempty_content,
         )
         self._force_reasoning = force_reasoning
-        self._force_nonempty_content = force_nonempty_content
         self._tool_start_token = "<|tools_prefix|>["
         self._tool_end_token = "<|tools_suffix|>"
         self._reasoning_acc: str = ""
@@ -688,9 +686,7 @@ class Apertus2509Detector(BaseReasoningFormatDetector):
             normal_text="".join(text_parts),
             reasoning_text="".join(reasoning_parts),
         )
-        if self._force_nonempty_content and not ret.normal_text:
-            ret.normal_text, ret.reasoning_text = ret.reasoning_text, ret.normal_text
-        return ret
+        return self._apply_force_nonempty_content(ret)
 
     def detect_and_parse_block_sequence(self, text: str) -> list[tuple[str, str]]:
         """Return an ordered sequence of blocks: [("reasoning"|"text", content), ...]"""
