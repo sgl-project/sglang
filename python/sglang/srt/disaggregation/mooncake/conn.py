@@ -170,7 +170,9 @@ class MooncakeKVManager(CommonKVManager):
         self.enable_trace = server_args.enable_trace
         self.failure_timestamps: dict[int, float] = {}
         self.orphan_failed_room_ttl = envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT.get()
-        self._orphan_failed_room_cleanup_interval = 60.0
+        self._orphan_failed_room_cleanup_interval = min(
+            60.0, self.orphan_failed_room_ttl
+        )
         self._next_orphan_failed_room_cleanup_time = 0.0
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.start_prefill_thread()
