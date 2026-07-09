@@ -5052,15 +5052,22 @@ class ServerArgs:
 
     def _handle_context_parallelism(self):
         if parse_connector_type(self.model_path) != ConnectorType.INSTANCE:
+            from sglang.srt.configs.model_config import is_deepseek_dsa
             from sglang.srt.layers.cp.utils import CP_V2_DEFAULT_MODEL_CLASSES
 
             model_config = self.get_model_config()
-            model_arch = model_config.hf_config.architectures[0]
-            if (
-                model_arch in CP_V2_DEFAULT_MODEL_CLASSES
-                and not envs.SGLANG_ENABLE_CP_V2.is_set()
-            ):
-                envs.SGLANG_ENABLE_CP_V2.set(True)
+            hf_config = model_config.hf_config
+            model_arch = hf_config.architectures[0]
+            if model_arch in CP_V2_DEFAULT_MODEL_CLASSES:
+                is_dsa_default_model = is_deepseek_dsa(hf_config)
+                # TODO: CP-v2 for DSA models currently only supports the
+                # interleave strategy; other strategies (e.g. zigzag) will be
+                # supported later.
+                enable_default_cp_v2 = not is_dsa_default_model or (
+                    self.enable_prefill_cp and self.cp_strategy == "interleave"
+                )
+                if enable_default_cp_v2 and not envs.SGLANG_ENABLE_CP_V2.is_set():
+                    envs.SGLANG_ENABLE_CP_V2.set(True)
 
         if self.enable_prefill_cp and self.cp_strategy is None:
             raise ValueError(

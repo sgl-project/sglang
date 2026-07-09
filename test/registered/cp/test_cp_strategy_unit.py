@@ -5,6 +5,9 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.layers.attention.dsa.utils import (
+    can_dsa_prefill_cp_round_robin_split,
+)
 from sglang.srt.layers.cp.base import (
     ContextParallelStrategyKind,
     get_cp_strategy,
@@ -579,6 +582,26 @@ class TestCPInterleaveStrategy(CustomTestCase):
             return_value=True,
         ):
             self.assertFalse(is_cp_v2_active(small_batch))
+
+    def test_dsa_round_robin_helper_uses_strategy_under_interleave_cp_v2(self):
+        active_batch = SimpleNamespace(
+            input_ids=torch.arange(8),
+            forward_mode=_ExtendMode(),
+            extend_seq_lens_cpu=[8],
+        )
+
+        with (
+            get_parallel().override(attn_cp_size=4),
+            patch(
+                "sglang.srt.environ.envs.SGLANG_ENABLE_CP_V2.get",
+                return_value=True,
+            ),
+            patch(
+                "sglang.srt.layers.attention.dsa.utils.is_dsa_prefill_cp_round_robin_split",
+                return_value=False,
+            ),
+        ):
+            self.assertTrue(can_dsa_prefill_cp_round_robin_split(active_batch))
 
     def test_interleave_shards_hidden_states_and_position_ids(self):
         cp_size = 4
