@@ -343,9 +343,13 @@ class CudaPlatformBase(Platform):
         if cls.is_sm120():
             # SM12.x (RTX PRO 6000 Blackwell / RTX 50xx / DGX Spark GB10):
             # FlashInfer's trtllm fp4 GEMM raises BackendSupportedError with
-            # capability 120; cudnn and cutlass both work (within noise of
-            # each other on Cosmos3-Nano GEMM shapes, 2.5-3.3x over BF16),
-            # while "auto" mis-tunes some shapes. Prefer cudnn.
+            # capability 120; cudnn and cutlass both work. cudnn is the
+            # strongest overall (within noise of cutlass on sm_120, ~2x faster
+            # on GB10/sm_121 qkv/gate_up shapes; 2.0-3.3x over BF16 on
+            # Cosmos3-Nano GEMM shapes across both), while "auto" mis-tunes
+            # some shapes. Note: on sm_121 the cudnn heuristic needs a
+            # FlashInfer autotune(True) warmup for the qkv shape
+            # (0.9x untuned -> 2.6x tuned). Prefer cudnn.
             default_backend = "cudnn"
         else:
             default_backend = "trtllm"
