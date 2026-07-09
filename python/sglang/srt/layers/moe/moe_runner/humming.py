@@ -73,6 +73,7 @@ class HummingRunnerInput(RunnerInput):
     gemm_type: HummingGemmType
     expert_num_tokens: torch.Tensor | None = None
     expected_m: int | None = None
+    apply_routed_scaling_factor: bool = True
 
     @property
     def runner_backend(self) -> MoeRunnerBackend:
@@ -102,6 +103,7 @@ def humming_moe_runner_core_run(
     topk_ids: torch.Tensor,
     expert_num_tokens: torch.Tensor | None = None,
     expected_m: int | None = None,
+    apply_routed_scaling_factor: bool = True,
 ) -> torch.Tensor:
     runner = HummingRunnerCore.runner_cores[moe_runner_id]
     if gemm_type == "indexed":
@@ -109,12 +111,14 @@ def humming_moe_runner_core_run(
             hidden_states=hidden_states,
             topk_ids=topk_ids,
             topk_weights=topk_weights,
+            apply_routed_scaling_factor=apply_routed_scaling_factor,
         )
     elif gemm_type == "grouped_contiguous":
         return runner._run_grouped_contiguous_gemm(
             hidden_states=hidden_states,
             topk_ids=topk_ids,
             topk_weights=topk_weights,
+            apply_routed_scaling_factor=apply_routed_scaling_factor,
         )
     elif gemm_type == "grouped_masked":
         assert expected_m is not None and expert_num_tokens is not None
@@ -416,6 +420,7 @@ class HummingRunnerCore(MoeRunnerCore):
             topk_ids=runner_input.topk_ids,
             expected_m=runner_input.expected_m,
             expert_num_tokens=runner_input.expert_num_tokens,
+            apply_routed_scaling_factor=runner_input.apply_routed_scaling_factor,
         )
 
         return HummingRunnerOutput(hidden_states=output)
@@ -466,6 +471,7 @@ class HummingRunnerCore(MoeRunnerCore):
         hidden_states: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
+        apply_routed_scaling_factor: bool = True,
     ):
         hidden_states = hidden_states.view(-1, hidden_states.size(-1))
         buffers = self.prepare_buffers(
@@ -513,12 +519,15 @@ class HummingRunnerCore(MoeRunnerCore):
             **moe_kwargs2,
         )
 
+        routed_scaling_factor = (
+            self.config.routed_scaling_factor if apply_routed_scaling_factor else None
+        )
         moe_fused_mul_sum(
             inputs=buffers["down_output"].view(*topk_ids.shape, -1),
             topk_weights=topk_weights,
             topk_ids=topk_ids,
             is_ep=self.num_experts != self.global_num_experts,
-            routed_scaling_factor=self.config.routed_scaling_factor,
+            routed_scaling_factor=routed_scaling_factor,
             outputs=buffers["output"],
         )
 
@@ -529,6 +538,7 @@ class HummingRunnerCore(MoeRunnerCore):
         hidden_states: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
+        apply_routed_scaling_factor: bool = True,
     ):
         configs = self.get_humming_gemm_configs(HummingGemmType.GROUPED_CONTIGUOUS)
         valid_shape_m = self.estimate_local_valid_shape_m(topk_ids)
@@ -589,13 +599,16 @@ class HummingRunnerCore(MoeRunnerCore):
             sublayer_name="w2",
         )
 
+        routed_scaling_factor = (
+            self.config.routed_scaling_factor if apply_routed_scaling_factor else None
+        )
         moe_unpermute(
             outputs=buffers["output"],
             inputs=buffers["down_output"],
             topk_weights=topk_weights,
             topk_ids=topk_ids,
             src2dst=src2dst,
-            routed_scaling_factor=self.config.routed_scaling_factor,
+            routed_scaling_factor=routed_scaling_factor,
         )
 
         return buffers["output"]
@@ -710,6 +723,7 @@ def pre_permute_deepep_ll_to_humming(
         expert_num_tokens=dispatch_output.masked_m,
         expected_m=dispatch_output.expected_m,
         gemm_type=HummingGemmType.GROUPED_MASKED,
+        apply_routed_scaling_factor=False,
     )
 
 
@@ -751,6 +765,7 @@ def pre_permute_deepep_normal_to_humming(
         topk_weights=topk_weights,
         topk_ids=topk_ids.int(),
         gemm_type=get_standard_humming_moe_gemm_type(),
+        apply_routed_scaling_factor=False,
     )
 
 
