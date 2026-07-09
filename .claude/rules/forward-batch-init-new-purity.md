@@ -17,9 +17,13 @@ its sub-objects.
   `TpModelWorker.forward_batch_generation` pass the override through its
   kw-only parameters instead of writing onto the batch.
 
-Known object-sharing note (do not add new exceptions):
+Known object-sharing notes (do not add new exceptions):
 
 - `init_new` no longer rebinds or mutates ScheduleBatch fields; it still
   writes `ret.sampling_info` sub-object attributes (grammars, canary ids),
   which is the same object as `batch.sampling_info` until the sampling
   forward-copy op lands.
+- `_expand_mrope_from_input` lazily fills
+  `mm_input.mrope_position_delta_repeated_cache` on the ScheduleBatch-owned
+  `MultimodalInputs` object (pre-existing memoization). Relocating this cache
+  off the ScheduleBatch is a candidate follow-up op.
