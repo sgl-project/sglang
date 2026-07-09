@@ -59,7 +59,7 @@ class TestQwen35BNVFP4KVCacheSM120(CustomTestCase):
                     "--linear-attn-decode-backend",
                     "flashinfer",
                     "--linear-attn-prefill-backend",
-                    "flashinfer",
+                    "triton",
                     "--model-loader-extra-config",
                     '{"enable_multithread_load": true,"num_threads": 64}',
                     "--mem-fraction-static",
