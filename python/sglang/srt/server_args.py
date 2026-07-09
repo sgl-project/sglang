@@ -187,9 +187,12 @@ QUANTIZATION_CHOICES = [
     "unquant",
 ]
 
-# TODO: support other online quantization merhods, now supports only Ascend w8a8_int8 MoE
+# Online quantization methods supported by Ascend MoE.
 ONLINE_QUANTIZATION_CHOICES = [
     "w8a8_int8",
+    "w8a8_mxfp8",
+    "w4a8_mxfp4",
+    "w4a4_mxfp4",
 ]
 
 

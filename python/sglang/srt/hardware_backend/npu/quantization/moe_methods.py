@@ -5,7 +5,7 @@ import torch
 import torch_npu
 
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.npu.utils import npu_format_cast
+from sglang.srt.hardware_backend.npu.utils import NPUACLFormat, npu_format_cast
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 from sglang.srt.server_args import get_global_server_args
 
@@ -957,9 +957,9 @@ class NPUUnquantMoEMethod(_NPUMoEMethodBase):
         elif online_quant == "w8a8_mxfp8":
             self._apply_online_mxfp8(layer, weight_prefix, weight_name)
             self._quant_mode = "w8a8_mxfp8"
-        elif online_quant == "w4a8_mxfp8":
+        elif online_quant == "w4a8_mxfp4":
             self._apply_online_mxfp4_w4a8(layer, weight_prefix, weight_name)
-            self._quant_mode = "w4a8_mxfp8"
+            self._quant_mode = "w4a8_mxfp4"
         elif online_quant == "w4a4_mxfp4":
             self._apply_online_mxfp4_w4a4(layer, weight_prefix, weight_name)
             self._quant_mode = "w4a4_mxfp4"
@@ -1020,13 +1020,47 @@ class NPUUnquantMoEMethod(_NPUMoEMethodBase):
 
     # --------------- W4A8 MXFP4 ---------------
     def _apply_online_mxfp4_w4a8(self, layer, weight_prefix, weight_name):
-        self._apply_online_mxfp4_common(
-            layer,
-            weight_prefix,
-            weight_name,
-            act_quant_dtype=torch.float8_e4m3fn,
-            use_nz_cast=True,  # W4A8 requires FRACTAL_NZ
+        weight_fp = getattr(layer, weight_name)
+        if weight_fp.dtype not in (torch.float16, torch.bfloat16):
+            weight_fp = weight_fp.to(torch.bfloat16)
+        if not weight_fp.is_npu:
+            weight_fp = weight_fp.to(f"npu:{torch.npu.current_device()}")
+
+        fp4_dtype = torch_npu.float4_e2m1fn_x2
+        quant_weight, weight_scale = torch.ops.npu.npu_dynamic_mx_quant(
+            weight_fp, dst_type=fp4_dtype, round_mode="round"
         )
+
+        quant_weight = npu_format_cast(
+            quant_weight.view(torch.uint8),
+            NPUACLFormat.ACL_FORMAT_FRACTAL_NZ,
+            customize_dtype=torch.float8_e4m3fn,
+            input_dtype=fp4_dtype,
+        )
+        quant_weight = quant_weight.transpose(-1, -2)
+
+        # torch_npu versions may return either one scale value per group or
+        # pairs in the trailing dimension. Normalize both to [..., groups, N, 2].
+        if weight_scale.dim() == 3:
+            num_experts, output_size, num_groups = weight_scale.shape
+            weight_scale = weight_scale.reshape(
+                num_experts, output_size, num_groups // 2, 2
+            )
+        weight_scale = weight_scale.transpose(-3, -2)
+
+        quant_weight = torch.nn.Parameter(quant_weight, requires_grad=False)
+        weight_scale = torch.nn.Parameter(weight_scale, requires_grad=False)
+        setattr(layer, weight_name, quant_weight)
+        layer.register_parameter(f"{weight_name}_scale", weight_scale)
+        setattr(self, weight_name, quant_weight)
+        setattr(self, f"{weight_name}_scale", weight_scale)
+
+        torch.npu.empty_cache()
+        self.hidden_states_quantizer = HiddenStatesDynamicQuant(
+            quant_dtype=torch.float8_e4m3fn
+        )
+        if weight_prefix == "w13":
+            self._set_dispatcher_output_dtype(layer, "bf16")
 
     # --------------- W4A4 MXFP4 ---------------
     def _apply_online_mxfp4_w4a4(self, layer, weight_prefix, weight_name):
@@ -1131,7 +1165,7 @@ class NPUUnquantMoEMethod(_NPUMoEMethodBase):
         if self._quant_mode == "w8a8_mxfp8":
             scale_args["scale_dtype"] = torch_npu.float8_e8m0fnu
             scale_args["per_token_scale_dtype"] = torch_npu.float8_e8m0fnu
-        elif self._quant_mode == "w4a8_mxfp8":
+        elif self._quant_mode == "w4a8_mxfp4":
             scale_args["weight_dtype"] = torch_npu.float4_e2m1fn_x2
             scale_args["scale_dtype"] = torch_npu.float8_e8m0fnu
             scale_args["per_token_scale_dtype"] = torch_npu.float8_e8m0fnu
