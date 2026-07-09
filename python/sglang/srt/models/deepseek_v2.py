@@ -931,12 +931,10 @@ class DeepseekV2MoE(nn.Module):
         # Note(kpham-sgl): issue order satisfies 3 constraints:
         # - no stream explosion: main (routed) issued before alt block -> capture reuses 1 alt stream;
         # - PDL overlap: routed is the last main-stream kernel (fuses w/ residual add);
-        # - dispose_tensor: shared reads shared_in (ref taken pre-dispose) to avoid null data_ptr.
+        # - dispose_tensor: disabled during capture (CaptureFlags.disable_dispose_tensor) so the routed
+        #   deep_gemm does not free hidden_states, which the shared expert reads on the alt stream.
         current_stream = torch.cuda.current_stream()
         self.alt_stream.wait_stream(current_stream)
-        # Alias taken pre-dispose so shared survives the routed deep_gemm's dispose_tensor `set_()`.
-        # Lost free is negligible: decode/verify hidden_states is tiny (bs*num_draft_tokens rows).
-        shared_in = hidden_states[:]
         has_shared_output = (
             hidden_states.shape[0] > 0 and self.num_fused_shared_experts == 0
         )
@@ -991,7 +989,7 @@ class DeepseekV2MoE(nn.Module):
         # Shared expert on alt stream, issued AFTER the main (routed) branch. See note above.
         with torch.cuda.stream(self.alt_stream):
             shared_output = self._forward_shared_experts(
-                shared_in, gemm_output_zero_allocator
+                hidden_states, gemm_output_zero_allocator
             )
 
         current_stream.wait_stream(self.alt_stream)

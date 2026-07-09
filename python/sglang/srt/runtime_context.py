@@ -269,6 +269,11 @@ class CaptureFlags(_FlagGroupBase):
     # False clears it during warmup (the only post-publish writer).
     enable_torch_compile: bool = False
 
+    # Set for the duration of decode/spec graph capture (model_capture_mode).
+    # While set, dispose_tensor() is a no-op so deep_gemm's pre-permute does not
+    # free hidden_states that the dual-stream MoE shared expert reads afterward.
+    disable_dispose_tensor: bool = False
+
 
 @dataclasses.dataclass
 class MoeFlags(_FlagGroupBase):
