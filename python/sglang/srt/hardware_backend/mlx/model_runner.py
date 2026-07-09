@@ -677,8 +677,16 @@ class MlxModelRunner:
         )
         self._attention_kv_pool.set_kv_all_layers(slot_ids_mx, k_all, v_all)
 
-    def _sync_decode_kv_to_pool(self, req_id: str) -> None:
-        """Sync un-flushed decode KV for *req_id* to the shared pool."""
+    def _sync_decode_kv_to_pool(
+        self, req_id: str, needed_slots: set[int] | None = None
+    ) -> None:
+        """Sync un-flushed decode KV for *req_id* to the shared pool.
+
+        When *needed_slots* is given, skip the sync (and leave
+        ``_req_synced_offset`` untouched) if none of this request's un-synced
+        slots are read by the current extend batch — a later batch that does
+        read them will flush them then.
+        """
         if self._attention_kv_pool is None or self._req_to_token_pool is None:
             return
         cache = self._req_caches.get(req_id)
@@ -699,15 +707,19 @@ class MlxModelRunner:
             .to(dtype=int)
             .tolist()
         )
+        if needed_slots is not None and needed_slots.isdisjoint(slot_ids):
+            return
         self._sync_new_kv_to_pool(cache, synced_offset, slot_ids)
         self._req_synced_offset[req_id] = current_offset
 
-    def flush_all_decode_kv(self) -> None:
-        """Sync all active requests' un-flushed decode KV to the pool."""
+    def flush_decode_kv_for_slots(self, needed_slots: set[int]) -> None:
+        """Sync only decode KV that lands in slots this extend batch will read."""
         if self.disable_radix_cache or self._attention_kv_pool is None:
             return
+        if not needed_slots:
+            return
         for req_id in list(self._req_caches.keys()):
-            self._sync_decode_kv_to_pool(req_id)
+            self._sync_decode_kv_to_pool(req_id, needed_slots)
 
     def decode_batch(
         self,

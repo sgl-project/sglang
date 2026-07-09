@@ -54,13 +54,14 @@ class _FakeRunner:
         self.calls: list[tuple[str, str]] = []  # (op, rid)
         self._req_caches: dict[str, list] = {}
         self._counter = 0
+        self.flushed_slots: list[set[int]] = []  # needed_slots per flush call
 
     # --- shared ---
     def has_request(self, rid):
         return rid in self._known
 
-    def flush_all_decode_kv(self):
-        pass
+    def flush_decode_kv_for_slots(self, needed_slots):
+        self.flushed_slots.append(set(needed_slots))
 
     def ops_for(self, rid):
         return [op for op, r in self.calls if r == rid]
@@ -135,9 +136,9 @@ class _FakeRunner:
 
 
 class _FakeReq:
-    def __init__(self, rid, req_pool_idx=0):
+    def __init__(self, rid, req_pool_idx=0, prefix_indices=None):
         self.rid = rid
-        self.prefix_indices = torch.empty(0, dtype=torch.long)
+        self.prefix_indices = torch.tensor(prefix_indices or [], dtype=torch.long)
         self.fill_ids = [0]
         self.req_pool_idx = req_pool_idx
 
@@ -209,6 +210,16 @@ class TestMlxExtendRouting(unittest.TestCase):
         runner = self._run_sync([p, d], [4, 1], {"d1"}, [d], ForwardMode.MIXED)
         self.assertEqual(runner.ops_for("p1"), ["prefill"])
         self.assertEqual(runner.ops_for("d1"), ["decode"])
+
+    def test_sync_flush_only_uses_prefill_prefix_slots(self):
+        """Flush is fed only the prefix slots of prefill-routed reqs."""
+        prefill = _FakeReq("p1", prefix_indices=[5, 2, 7])
+        continuation = _FakeReq("c1", prefix_indices=[9])
+        runner = self._run_sync(
+            [prefill, continuation], [4, 4], {"c1"}, None, ForwardMode.EXTEND
+        )
+        # Exactly one flush, carrying only the prefill's prefix slots.
+        self.assertEqual(runner.flushed_slots, [{5, 2, 7}])
 
     # ---------- async path: _async_extend_batch ----------
 

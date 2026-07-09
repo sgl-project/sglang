@@ -215,6 +215,45 @@ class TestMlxAttentionPatching(unittest.TestCase):
             self.assertEqual(keys[0, 0, t, 0].item(), float(t))
             self.assertEqual(values[0, 0, t, 0].item(), float(-t))
 
+    def test_flush_decode_kv_for_slots_syncs_only_overlapping_requests(self):
+        runner = object.__new__(MlxModelRunner)
+        runner.disable_radix_cache = False
+        runner._attention_kv_pool = object()  # non-None sentinel
+        runner._cache_layout = SimpleNamespace(first_attention_layer_index=0)
+        # req "a" occupies pool slots [10, 11, 12]; req "b" occupies [20, 21, 22].
+        runner._req_to_token_pool = SimpleNamespace(
+            req_to_token=torch.tensor(
+                [
+                    [0, 0, 0],  # padding row
+                    [10, 11, 12],  # req a (req_pool_idx 1)
+                    [20, 21, 22],  # req b (req_pool_idx 2)
+                ],
+                dtype=torch.int32,
+            )
+        )
+        runner._req_caches = {
+            "a": [SimpleNamespace(offset=3)],
+            "b": [SimpleNamespace(offset=3)],
+        }
+        runner._req_pool_idx = {"a": 1, "b": 2}
+        runner._req_synced_offset = {"a": 0, "b": 0}
+
+        synced_calls: list[list[int]] = []
+        runner._sync_new_kv_to_pool = (
+            lambda cache, start, slot_ids: synced_calls.append(list(slot_ids))
+        )
+
+        # Only req "a"'s slots are read this batch -> only "a" is synced.
+        runner.flush_decode_kv_for_slots({11})
+        self.assertEqual(synced_calls, [[10, 11, 12]])
+        self.assertEqual(runner._req_synced_offset["a"], 3)
+        self.assertEqual(runner._req_synced_offset["b"], 0)  # untouched
+
+        # A later batch reads "b"'s slots -> "b" syncs; "a" is already caught up.
+        runner.flush_decode_kv_for_slots({21})
+        self.assertEqual(synced_calls, [[10, 11, 12], [20, 21, 22]])
+        self.assertEqual(runner._req_synced_offset["b"], 3)
+
     def test_attn_config_uses_float_dtype_for_quantized_projection(self):
         runner = object.__new__(MlxModelRunner)
         attn = FakeAttention()
