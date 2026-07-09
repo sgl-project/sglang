@@ -266,14 +266,33 @@ install_sglang() {
     echo "Installing python extras: [${EXTRAS}]"
     $PIP_CMD install -e "python[${EXTRAS}]" $PIP_INSTALL_SUFFIX
 
-    # Defensive: some runners ended up with nvidia-cusparselt-cu13 metadata
-    # present but libcusparseLt.so.0 missing on disk, breaking any torch import.
-    # If the file is missing, force-reinstall the wheel before downstream steps.
-    SITE_PACKAGES=$(python3 -c "import site; print(site.getsitepackages()[0])")
-    if [ ! -f "$SITE_PACKAGES/nvidia/cusparselt/lib/libcusparseLt.so.0" ] \
-       && pip show nvidia-cusparselt-cu13 >/dev/null 2>&1; then
-        echo "WARNING: nvidia-cusparselt-cu13 metadata present but libcusparseLt.so.0 missing — reinstalling"
-        $PIP_CMD install --reinstall nvidia-cusparselt-cu13 $PIP_INSTALL_SUFFIX
+    # Defensive self-heal: some runners end up with nvidia-* CUDA lib packages
+    # whose metadata is present but whose .so payload is missing on disk (an
+    # interrupted force-reinstall or a disk cleanup strips the libs, leaving the
+    # dist-info behind). pip then treats them as satisfied and won't restore
+    # them, so `import torch` fails at job start with e.g.
+    #   libcudnn.so.9 / libnvshmem_host.so.3 / libcusparseLt.so.0:
+    #   cannot open shared object file
+    # and prepare_runner.sh's prevalidate step dies before any test runs.
+    # (torch is reinstalled --no-deps above, so it never restores these.)
+    # If torch is installed but not importable, force-reinstall every nvidia-*
+    # package to restore the .so files.
+    if pip show torch >/dev/null 2>&1 && ! python3 -c "import torch" >/dev/null 2>&1; then
+        echo "WARNING: torch is installed but not importable — restoring nvidia CUDA libs"
+        NV_PKGS=$(pip list --format=freeze 2>/dev/null | grep -iE '^nvidia-' || true)
+        if [ -n "$NV_PKGS" ]; then
+            # Use pip --force-reinstall, NOT uv's --reinstall: uv restores from
+            # its content-addressed cache and does not re-materialize .so files
+            # that were deleted on disk (verified — it leaves the import broken),
+            # whereas pip --force-reinstall always re-extracts the wheel.
+            # --break-system-packages is a no-op inside the CI venv and needed on
+            # bare Ubuntu 24.04 runners.
+            # shellcheck disable=SC2086
+            python3 -m pip install --force-reinstall --no-deps --break-system-packages $NV_PKGS
+            python3 -c "import torch" >/dev/null 2>&1 \
+                && echo "torch import recovered after nvidia lib reinstall" \
+                || echo "::warning::torch still not importable after nvidia lib reinstall"
+        fi
     fi
 
     mark_step_done "${FUNCNAME[0]}"
