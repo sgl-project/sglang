@@ -525,12 +525,6 @@ class Envs:
 
     # NPU
     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
-    # Online W4A4 MXFP4 (`--quantization mxfp4`): use dual-level MX quantization
-    # (finer FP8 L0 block scales + L1 scales via npu_dynamic_dual_level_mx_quant /
-    # npu_dual_level_quant_matmul) instead of the default single-level path. Higher
-    # accuracy at some throughput cost; requires Ascend 950 (A5) — A2/A3 lack the
-    # DualLevelQuantBatchMatmul op.
-    SGLANG_NPU_MXFP4_W4A4_DUAL_LEVEL = EnvBool(False)
     SGLANG_NPU_USE_MULTI_STREAM = EnvBool(False)
     SGLANG_NPU_USE_MLAPO = EnvBool(False)
     # Forward native implementation for activation gelu tanh for model Skywork-Reward-Gemma-2-27B-v0.2

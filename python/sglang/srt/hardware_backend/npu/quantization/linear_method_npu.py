@@ -804,12 +804,13 @@ class NPUSingleLevelMXFP4OfflineLinearMethod(NPUSingleLevelMXFP4LinearMethod):
 class NPUDualLevelMXFP4LinearMethod(NPUSingleLevelMXFP4LinearMethod):
     """Ascend NPU W4A4 online quantization: dual-level MXFP4 (higher accuracy).
 
-    Opt-in via ``SGLANG_NPU_MXFP4_W4A4_DUAL_LEVEL=1`` (default is the single-level
-    :class:`NPUSingleLevelMXFP4LinearMethod`). Instead of a single UE8M0 (power-of-2)
-    block scale, dual-level MX quant produces a finer L0 (FP8 E4M3) block scale plus
-    a coarser L1 scale, so per-block dynamic range is captured far more accurately —
-    this narrows the online-RTN quality gap and helps avoid degenerate decoding
-    (e.g. reasoning loops that never emit EOS under greedy sampling).
+    This is the sole online ``--quantization mxfp4`` linear path. Instead of a single
+    UE8M0 (power-of-2) block scale, dual-level MX quant produces a finer L0 (FP8 E4M3)
+    block scale plus a coarser L1 scale, so per-block dynamic range is captured far
+    more accurately — this fixed the online-RTN degradation that made single-level
+    decoding loop (never emitting EOS) under greedy sampling. (The single-level
+    :class:`NPUSingleLevelMXFP4LinearMethod` is retained only as the offline path's
+    base — msmodelslim checkpoints ship single-level UE8M0 scales.)
 
     All NPU ops go through ``torch.ops.npu.*`` (no top-level ``torch_npu``). Only
     ``create_weights`` (the BF16/FP16 placeholder) is shared with the single-level

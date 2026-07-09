@@ -1,4 +1,4 @@
-"""MXFP4 W4A4 online quantization config (single-level MXFP4 weights + activations).
+"""MXFP4 W4A4 online quantization config (dual-level MXFP4 weights + activations).
 
 Triggered by ``--quantization mxfp4`` on the Ascend NPU backend. On CUDA / AMD /
 CPU the ``mxfp4`` key resolves to the upstream :class:`Mxfp4Config` (OCP MXFP4
@@ -6,13 +6,18 @@ MoE) instead; the per-device split is done at registration time in
 ``sglang.srt.layers.quantization.__init__`` (this config is only registered
 inside the ``is_npu()`` block, mirroring ``GPTQAscendConfig``).
 
-Online mode: FP16/BF16 weights are quantised to single-level MXFP4 in
-``process_weights_after_loading``; activations are dynamically quantised to
-MXFP4 at inference time and the matmul runs via ``npu_quant_matmul`` with
-``group_sizes=[1, 1, MXFP4_BLOCK_SIZE]`` (``x1_dtype = x2_dtype = float4_e2m1fn_x2``).
+Online mode: FP16/BF16 weights are quantised to **dual-level** MXFP4 in
+``process_weights_after_loading`` (a finer FP8 E4M3 L0 block scale plus a coarser
+L1 scale); activations are dynamically quantised the same way and the matmul runs
+via ``npu_dual_level_quant_matmul`` (see :class:`NPUDualLevelMXFP4LinearMethod`).
+Dual-level is the sole online path — it captures per-block dynamic range far more
+accurately than a single-level UE8M0 scale, avoiding the RTN degradation that made
+single-level online decoding loop under greedy sampling. Requires Ascend 950 (A5).
 
-Offline (msmodelslim ``W4A4_MXFP4``) checkpoints are handled separately by the
-``modelslim`` config (``ModelSlimMXFP4Scheme``), not this class.
+Offline (msmodelslim ``W4A4_MXFP4``) checkpoints are single-level (the checkpoint
+stores UE8M0 scales) and are handled separately by the ``modelslim`` config
+(``ModelSlimMXFP4Scheme`` → ``NPUSingleLevelMXFP4OfflineLinearMethod``), not this
+class.
 """
 
 from __future__ import annotations
@@ -104,17 +109,15 @@ class Mxfp4W4A4Config(QuantizationConfig):
             ):
                 return UnquantizedLinearMethod()
             if is_npu():
-                from sglang.srt.environ import envs
                 from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
                     NPUDualLevelMXFP4LinearMethod,
-                    NPUSingleLevelMXFP4LinearMethod,
                 )
 
-                # Dual-level (finer FP8 L0 scales) trades some throughput for
-                # accuracy; opt in on Ascend 950 (A5) where the op is available.
-                if envs.SGLANG_NPU_MXFP4_W4A4_DUAL_LEVEL.get():
-                    return NPUDualLevelMXFP4LinearMethod(self)
-                return NPUSingleLevelMXFP4LinearMethod(self)
+                # Online W4A4 always uses dual-level MXFP4 (finer FP8 L0 scales):
+                # single-level RTN was too lossy and degenerated under greedy
+                # decoding. Requires Ascend 950 (A5). The single-level kernel is
+                # retained only for the offline msmodelslim path.
+                return NPUDualLevelMXFP4LinearMethod(self)
             raise NotImplementedError(
                 "mxfp4 W4A4 (single-level MXFP4 weights + activations) is currently "
                 "only implemented for the Ascend NPU backend; no CUDA/other-device "
