@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from collections import defaultdict
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -533,3 +534,17 @@ def assign_req_to_token_pool_func(
         req_to_token.shape[1],
         next_power_of_2(batch_size),
     )
+
+
+def _alloc_paged_token_slots_extend_npu(*args, **kwargs):
+    from sglang.srt.hardware_backend.npu.dsv4.dsv4_allocator import (
+        alloc_paged_token_slots_extend_npu,
+    )
+
+    return alloc_paged_token_slots_extend_npu(*args, **kwargs)
+
+
+ALLOC_EXTEND_FUNCS = defaultdict(
+    lambda: alloc_paged_token_slots_extend,
+    {"npu": _alloc_paged_token_slots_extend_npu},
+)
