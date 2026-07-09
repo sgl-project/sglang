@@ -35,11 +35,13 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_cpu_ci, register_mlx_ci
 
-# AST-parsed "this test exists" marker; actual execution is gated by the
-# @skipUnless guard below (mirrors test_quantization.py in this directory).
+# CPU marker is AST-parsed "this test exists"; actual CPU-side execution is
+# gated by the @skipUnless guard below. MLX marker runs for real on the MLX
+# lane's stage-a (model-free: mocks the runner, loads no model).
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_mlx_ci(est_time=10, suite="stage-a-unit-test-mlx")
 
 _IS_APPLE_SILICON = platform.system() == "Darwin" and platform.machine() == "arm64"
 _HAS_MLX = importlib.util.find_spec("mlx") is not None

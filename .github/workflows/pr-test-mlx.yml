@@ -5,11 +5,17 @@ on:
     branches: [ main ]
   workflow_dispatch:
     inputs:
+      # target_stage is the job id (e.g. stage-b-e2e-test-mlx), distinct from
+      # the run_suite.py suite name it dispatches (e.g. stage-b-e2e-mlx).
       target_stage:
-        description: "Specific test stage to run (Optional)"
+        description: "Select a stage to run from dropdown (leave empty for auto-detect)"
         required: false
-        type: string
-        default: ""
+        type: choice
+        default: ''
+        options:
+          - ''
+          - stage-a-unit-test-mlx
+          - stage-b-e2e-test-mlx
 
 concurrency:
   group: pr-test-mlx-${{ github.ref }}
