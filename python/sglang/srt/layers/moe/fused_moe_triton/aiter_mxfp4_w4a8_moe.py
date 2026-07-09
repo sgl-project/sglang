@@ -184,7 +184,7 @@ def aiter_w4a8_gfx1250_forward(
         scatter_indx=None,
         gammas=None,
         swizzle_mx_scale=None,
-        out_dtype=torch.float8_e4m3fn,
+        out_dtype=x_fp8.dtype,
         apply_swiglu=True,
         alpha=gemm1_alpha,
         limit=gemm1_limit,
