@@ -145,6 +145,19 @@ def _select_image_variant_cloud_url(item: dict, variant: str | None) -> str | No
     return None
 
 
+def _raise_if_image_variant_not_found(item: dict, variant: str | None) -> None:
+    file_paths = item.get("file_paths")
+    if not file_paths:
+        return
+
+    variant_idx = _image_variant_index(variant)
+    if variant_idx is None or variant_idx < 0 or variant_idx >= len(file_paths):
+        raise HTTPException(
+            status_code=404,
+            detail=f"Image variant {variant} not found",
+        )
+
+
 def _build_image_response_kwargs(
     save_file_path_list: list[str],
     resp_format: str,
@@ -513,6 +526,7 @@ async def download_image_content(
     if not item:
         raise HTTPException(status_code=404, detail="Image not found")
 
+    _raise_if_image_variant_not_found(item, variant)
     file_path = _select_image_variant_path(item, variant)
     if not file_path:
         cloud_url = _select_image_variant_cloud_url(item, variant)

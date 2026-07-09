@@ -1,7 +1,10 @@
 import os
 
+from fastapi import HTTPException
+
 from sglang.multimodal_gen.runtime.entrypoints.openai.image_api import (
     _build_image_response_kwargs,
+    _raise_if_image_variant_not_found,
     _fallback_image_urls,
     _select_image_variant_cloud_url,
     _select_image_variant_path,
@@ -60,6 +63,21 @@ def test_select_image_variant_path_reads_indexed_file_paths():
 
     assert _select_image_variant_path(item, None) == "first.png"
     assert _select_image_variant_path(item, "1") == "second.png"
+
+
+def test_raise_if_image_variant_not_found_handles_out_of_range_variant():
+    item = {
+        "file_path": "first.png",
+        "file_paths": ["first.png", "second.png"],
+    }
+
+    try:
+        _raise_if_image_variant_not_found(item, "5")
+    except HTTPException as exc:
+        assert exc.status_code == 404
+        assert exc.detail == "Image variant 5 not found"
+    else:
+        raise AssertionError("Expected HTTPException")
 
 
 def test_select_image_variant_path_returns_none_for_cloud_only_variant():
