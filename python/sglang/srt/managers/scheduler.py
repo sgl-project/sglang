@@ -1202,22 +1202,23 @@ class Scheduler(
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
             dspark_target_layer_ids = _infer_dspark_target_layer_ids()
             if dspark_target_layer_ids:
-                dspark_hidden_size = len(dspark_target_layer_ids) * int(
-                    self.model_config.hidden_size
-                )
-                disagg_hidden_states_dtype = self.model_config.dtype
-                default_dspark_prefill_tokens = int(
-                    self.server_args.max_prefill_buffer_tokens()
-                    or self.max_prefill_tokens
-                )
-                dspark_prefill_tokens_env = os.getenv(
-                    "SGLANG_DSPARK_PD_HIDDEN_POOL_TOKENS",
-                    str(max(1, default_dspark_prefill_tokens)),
-                )
-                dspark_hidden_pool_size = max(0, int(dspark_prefill_tokens_env))
-                self.tp_worker.model_runner.dflash_or_dspark_target_layer_ids = (
-                    dspark_target_layer_ids
-                )
+                if self.ps.pp_size == 1:
+                    dspark_hidden_size = len(dspark_target_layer_ids) * int(
+                        self.model_config.hidden_size
+                    )
+                    disagg_hidden_states_dtype = self.model_config.dtype
+                    default_dspark_prefill_tokens = int(
+                        self.server_args.max_prefill_buffer_tokens()
+                        or self.max_prefill_tokens
+                    )
+                    dspark_prefill_tokens_env = os.getenv(
+                        "SGLANG_DSPARK_PD_HIDDEN_POOL_TOKENS",
+                        str(max(1, default_dspark_prefill_tokens)),
+                    )
+                    dspark_hidden_pool_size = max(0, int(dspark_prefill_tokens_env))
+                    self.tp_worker.model_runner.dflash_or_dspark_target_layer_ids = (
+                        dspark_target_layer_ids
+                    )
         elif self.spec_algorithm.carries_draft_hidden_states():
             # `draft_runner` aliases `draft_runner_list[0]` in the multi-layer
             # worker, so a single accessor covers both shapes.
