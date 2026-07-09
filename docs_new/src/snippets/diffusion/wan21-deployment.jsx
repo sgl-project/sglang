@@ -47,6 +47,8 @@ export const Wan21Deployment = () => {
         { id: 'mi300x', label: 'MI300X', default: false },
         { id: 'mi325x', label: 'MI325X', default: false },
         { id: 'mi355x', label: 'MI355X', default: false },
+        { id: 'ascend2', label: 'A2', default: false },
+        { id: 'ascend3', label: 'A3', default: false }
       ],
     },
     task: {
@@ -114,6 +116,22 @@ export const Wan21Deployment = () => {
     return () => observer.disconnect();
   }, []);
 
+  useEffect(() => {
+    const isAscend = values.hardware === 'ascend2' || values.hardware === 'ascend3';
+    
+    const targetTabName = isAscend ? 'Ascend A2 / A3' : 'NVIDIA B200';
+
+    const allTabs = document.querySelectorAll('button, [role="tab"]');
+    
+    allTabs.forEach((tab) => {
+      const text = tab.textContent.trim();
+      
+      if (text === targetTabName && tab.getAttribute('aria-selected') !== 'true') {
+        tab.click();
+      }
+    });
+  }, [values.hardware]);
+
   const handleRadioChange = (optionName, itemId) => {
     setValues((prev) => {
       let next = { ...prev, [optionName]: itemId };
@@ -154,12 +172,22 @@ export const Wan21Deployment = () => {
   };
 
   const generateCommand = () => {
-    const { task, modelsize, selectedLoraPath, bestPractice } = values;
+    const { hardware, task, modelsize, selectedLoraPath, bestPractice } = values;
     const configKey = `${task}-${modelsize}`;
     const config = modelConfigs[configKey];
 
     if (!config) {
       return '# Error: Invalid configuration';
+    }
+
+    if (hardware === 'ascend3') {
+      if (task === 't2v') {
+        return `sglang generate \\\n  --model-path ${config.repoId} \\\n  --prompt "A curious raccoon" \\\n  ЗАГЛУШКА`;
+      } 
+      
+      if (task === 'i2v') {
+        return `sglang generate \\\n  --model-path ${config.repoId} \\\n  --prompt "A curious raccoon" \\\n  --image-path ЗАГЛУШКА \\\n  ЗАГЛУШКА`;
+      } 
     }
 
     let command = `sglang serve \\\n  --model-path ${config.repoId} \\\n  --dit-layerwise-offload true`;

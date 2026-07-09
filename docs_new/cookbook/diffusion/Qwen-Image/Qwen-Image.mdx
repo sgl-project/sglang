@@ -24,7 +24,7 @@ This section provides deployment configurations optimized for different hardware
 
 ### 3.1 Basic Configuration
 
-Qwen-Image is a text-to-image model. The recommended launch configurations vary by hardware.
+Qwen-Image is a text-to-image model. The recommended launch configurations vary by hardware. SGLang supports serving Qwen-Image on NVIDIA B200, B300, H200, H100, AMD MI300X, MI325X, MI355X GPUs and Ascend A2, A3 NPUs.
 
 **Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform.
 
@@ -221,73 +221,145 @@ Test Environment:
 
 #### 5.1.1 Generate an image
 
-**Server Command**:
+<Tabs>
+  <Tab title="AMD MI300X">
+    **Server Command**:
 
-```shell Command
-sglang serve --model-path Qwen/Qwen-Image \
-    --ulysses-degree=1 --ring-degree=1 --port 30000
-```
+    ```shell Command
+    sglang serve --model-path Qwen/Qwen-Image \
+        --ulysses-degree=1 --ring-degree=1 --port 30000
+    ```
 
-**Benchmark Command**:
+    **Benchmark Command**:
 
-```shell Command
-python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
-    --backend sglang-image --dataset vbench --task text-to-image --num-prompts 1 --max-concurrency 1
-```
+    ```shell Command
+    python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
+        --backend sglang-image --dataset vbench --task text-to-image --num-prompts 1 --max-concurrency 1
+    ```
 
-**Result**:
+    **Result**:
 
-```text Output
-================= Serving Benchmark Result =================
-Task:                                    text-to-image
-Model:                                   Qwen/Qwen-Image
-Dataset:                                 vbench
---------------------------------------------------
-Benchmark duration (s):                  29.04
-Request rate:                            inf
-Max request concurrency:                 1
-Successful requests:                     1/1
---------------------------------------------------
-Request throughput (req/s):              0.03
-Latency Mean (s):                        29.0378
-Latency Median (s):                      29.0378
-Latency P99 (s):                         29.0378
---------------------------------------------------
-Peak Memory Max (MB):                    48018.83
-Peak Memory Mean (MB):                   48018.83
-Peak Memory Median (MB):                 48018.83
-============================================================
-```
+    ```text Output
+    ================= Serving Benchmark Result =================
+    Task:                                    text-to-image
+    Model:                                   Qwen/Qwen-Image
+    Dataset:                                 vbench
+    --------------------------------------------------
+    Benchmark duration (s):                  29.04
+    Request rate:                            inf
+    Max request concurrency:                 1
+    Successful requests:                     1/1
+    --------------------------------------------------
+    Request throughput (req/s):              0.03
+    Latency Mean (s):                        29.0378
+    Latency Median (s):                      29.0378
+    Latency P99 (s):                         29.0378
+    --------------------------------------------------
+    Peak Memory Max (MB):                    48018.83
+    Peak Memory Mean (MB):                   48018.83
+    Peak Memory Median (MB):                 48018.83
+    ============================================================
+    ```
+  </Tab>
+  <Tab title="Ascend A2">
+    **Server Command**:
+
+    ```shell Command
+    ЗАГЛУШКА
+    ```
+
+    **Benchmark Command**:
+
+    ```shell Command
+    ЗАГЛУШКА
+    ```
+
+    **Result**:
+
+    ```text Output
+    ЗАГЛУШКА
+    ```
+  </Tab>
+  <Tab title="Ascend A3">
+    **Server Command**:
+
+    ```shell Command
+    ЗАГЛУШКА
+    ```
+
+    **Benchmark Command**:
+
+    ```shell Command
+    ЗАГЛУШКА
+    ```
+
+    **Result**:
+
+    ```text Output
+    ЗАГЛУШКА
+    ```
+  </Tab>
+</Tabs>
 
 #### 5.1.2 Generate images with high concurrency
 
-**Benchmark Command**:
+<Tabs>
+  <Tab title="AMD MI300X">
+    **Benchmark Command**:
 
-```shell Command
-python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
-    --backend sglang-image --dataset vbench --task text-to-image --num-prompts 20 --max-concurrency 20
-```
+    ```shell Command
+    python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
+        --backend sglang-image --dataset vbench --task text-to-image --num-prompts 20 --max-concurrency 20
+    ```
 
-**Result**:
+    **Result**:
 
-```text Output
-================= Serving Benchmark Result =================
-Task:                                    text-to-image
-Model:                                   Qwen/Qwen-Image
-Dataset:                                 vbench
---------------------------------------------------
-Benchmark duration (s):                  300.79
-Request rate:                            inf
-Max request concurrency:                 20
-Successful requests:                     14/20
---------------------------------------------------
-Request throughput (req/s):              0.05
-Latency Mean (s):                        154.5368
-Latency Median (s):                      154.8363
-Latency P99 (s):                         285.4603
---------------------------------------------------
-Peak Memory Max (MB):                    48030.31
-Peak Memory Mean (MB):                   48030.30
-Peak Memory Median (MB):                 48030.29
-============================================================
-```
+    ```text Output
+    ================= Serving Benchmark Result =================
+    Task:                                    text-to-image
+    Model:                                   Qwen/Qwen-Image
+    Dataset:                                 vbench
+    --------------------------------------------------
+    Benchmark duration (s):                  300.79
+    Request rate:                            inf
+    Max request concurrency:                 20
+    Successful requests:                     14/20
+    --------------------------------------------------
+    Request throughput (req/s):              0.05
+    Latency Mean (s):                        154.5368
+    Latency Median (s):                      154.8363
+    Latency P99 (s):                         285.4603
+    --------------------------------------------------
+    Peak Memory Max (MB):                    48030.31
+    Peak Memory Mean (MB):                   48030.30
+    Peak Memory Median (MB):                 48030.29
+    ============================================================
+    ```
+  </Tab>
+  <Tab title="Ascend A2">
+    **Benchmark Command**:
+
+    ```shell Command
+    ЗАГЛУШКА
+    ```
+
+    **Result**:
+
+    ```text Output
+    ЗАГЛУШКА
+    ```
+  </Tab>
+  <Tab title="Ascend A3">
+    **Benchmark Command**:
+
+    ```shell Command
+    ЗАГЛУШКА
+    ```
+
+    **Result**:
+
+    ```text Output
+    ЗАГЛУШКА
+    ```
+  </Tab>
+</Tabs>

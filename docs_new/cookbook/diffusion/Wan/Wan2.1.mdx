@@ -35,7 +35,7 @@ This section provides deployment configurations optimized for different hardware
 
 ### 3.1 Basic Configuration
 
-The Wan2.1 series offers models in multiple sizes and resolutions. SGLang supports Wan2.1 deployment on NVIDIA B200, B300, H200, H100, and AMD MI300X, MI325X, MI355X GPUs. The recommended launch configurations vary by hardware, model size, and memory headroom.
+The Wan2.1 series offers models in multiple sizes and resolutions. SGLang supports Wan2.1 deployment on NVIDIA B200, B300, H200, H100, and AMD MI300X, MI325X, MI355X GPUs and Ascend A2, A3 NPUs. The recommended launch configurations vary by hardware, model size, and memory headroom.
 
 **Interactive Command Generator**: Use the configuration selector below to automatically generate an appropriate deployment command for your model variant and options.
 
@@ -62,43 +62,88 @@ For more API usage and request examples, please refer to:
 
 #### 4.1.1 Launch a server and then send requests
 
-```bash Command
-sglang serve --model-path Wan-AI/Wan2.1-T2V-14B-Diffusers --port 30000
+<Tabs>
+  <Tab title="NVIDIA B200">
+    ```bash Command
+    sglang serve --model-path Wan-AI/Wan2.1-T2V-14B-Diffusers --port 30000
 
-curl http://127.0.0.1:30000/v1/images/generations \
-  -o >(jq -r '.data[0].b64_json' | base64 --decode > example.png) \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer $OPENAI_API_KEY" \
-  -d '{
-    "model": "Wan-AI/Wan2.1-T2V-14B-Diffusers",
-    "prompt": "A cute baby sea otter",
-    "n": 1,
-    "size": "1024x1024",
-    "response_format": "b64_json"
-  }'
-```
+    curl http://127.0.0.1:30000/v1/images/generations \
+      -o >(jq -r '.data[0].b64_json' | base64 --decode > example.png) \
+      -H "Content-Type: application/json" \
+      -H "Authorization: Bearer $OPENAI_API_KEY" \
+      -d '{
+        "model": "Wan-AI/Wan2.1-T2V-14B-Diffusers",
+        "prompt": "A cute baby sea otter",
+        "n": 1,
+        "size": "1024x1024",
+        "response_format": "b64_json"
+      }'
+    ```
+  </Tab>
+  <Tab title="Ascend A2 / A3">
+    ```bash Command
+    sglang serve --model-path Wan-AI/Wan2.1-T2V-14B-Diffusers --port 30000 ЗАГЛУШКА
+
+    curl http://127.0.0.1:30000/v1/images/generations \
+      -o >(jq -r '.data[0].b64_json' | base64 --decode > example.png) \
+      -H "Content-Type: application/json" \
+      -H "Authorization: Bearer $OPENAI_API_KEY" \
+      -d '{
+        "model": "Wan-AI/Wan2.1-T2V-14B-Diffusers",
+        "prompt": "A cute baby sea otter",
+        "n": 1,
+        "size": "1024x1024",
+        "response_format": "b64_json"
+      }'
+    ```
+  </Tab>
+</Tabs>
 
 #### 4.1.2 Generate a video without launching a server
 
-```bash Command
-SERVER_ARGS=(
-  --model-path Wan-AI/Wan2.1-T2V-14B-Diffusers
-  --text-encoder-cpu-offload
-  --pin-cpu-memory
-  --num-gpus 4
-  --ulysses-degree=2
-  --enable-cfg-parallel
-)
+<Tabs>
+  <Tab title="NVIDIA B200">
+    ```bash Command
+    SERVER_ARGS=(
+      --model-path Wan-AI/Wan2.1-T2V-14B-Diffusers
+      --text-encoder-cpu-offload
+      --pin-cpu-memory
+      --num-gpus 4
+      --ulysses-degree=2
+      --enable-cfg-parallel
+    )
 
-SAMPLING_ARGS=(
-  --prompt "A curious raccoon"
-  --save-output
-  --output-path outputs
-  --output-file-name "A curious raccoon.mp4"
-)
+    SAMPLING_ARGS=(
+      --prompt "A curious raccoon"
+      --save-output
+      --output-path outputs
+      --output-file-name "A curious raccoon.mp4"
+    )
 
-sglang generate "${SERVER_ARGS[@]}" "${SAMPLING_ARGS[@]}"
-```
+    sglang generate "${SERVER_ARGS[@]}" "${SAMPLING_ARGS[@]}"
+    ```
+  </Tab>
+  <Tab title="Ascend A2 / A3">
+    ```bash Command
+    SERVER_ARGS=(
+      --model-path Wan-AI/Wan2.1-T2V-14B-Diffusers
+      --device npu
+      --dit-layerwise-offload false
+      --num-gpus 4
+      ЗАГЛУШКА
+    )
+
+    SAMPLING_ARGS=(
+      --prompt "A curious raccoon"
+      --save-output
+      --output-path outputs
+      --output-file-name "A curious raccoon.mp4"
+    )
+
+    sglang generate "${SERVER_ARGS[@]}" "${SAMPLING_ARGS[@]}"
+    ```
+  </Tab>
+</Tabs>
 
 ### 4.2 Advanced Usage
 
@@ -108,24 +153,50 @@ SGLang integrates [Cache-DiT](https://github.com/vipshop/cache-dit), a caching a
 
 **Basic Usage**
 
-```bash Command
-SGLANG_CACHE_DIT_ENABLED=true sglang serve --model-path Wan-AI/Wan2.1-T2V-14B-Diffusers
-```
+<Tabs>
+  <Tab title="NVIDIA B200">
+    ```bash Command
+    SGLANG_CACHE_DIT_ENABLED=true sglang serve --model-path Wan-AI/Wan2.1-T2V-14B-Diffusers
+    ```
+  </Tab>
+  <Tab title="Ascend A2 / A3">
+    ```bash Command
+    SGLANG_CACHE_DIT_ENABLED=true sglang serve --model-path Wan-AI/Wan2.1-T2V-14B-Diffusers ЗАГЛУШКА
+    ```
+  </Tab>
+</Tabs>
 
 **Advanced Usage**
 
   Combined Configuration Example:
-  ```bash Command
-  SGLANG_CACHE_DIT_ENABLED=true \
-  SGLANG_CACHE_DIT_FN=2 \
-  SGLANG_CACHE_DIT_BN=1 \
-  SGLANG_CACHE_DIT_WARMUP=4 \
-  SGLANG_CACHE_DIT_RDT=0.4 \
-  SGLANG_CACHE_DIT_MC=4 \
-  SGLANG_CACHE_DIT_TAYLORSEER=true \
-  SGLANG_CACHE_DIT_TS_ORDER=2 \
-  sglang serve --model-path Wan-AI/Wan2.1-T2V-14B-Diffusers
-  ```
+<Tabs>
+  <Tab title="NVIDIA B200">
+    ```bash Command
+    SGLANG_CACHE_DIT_ENABLED=true \
+    SGLANG_CACHE_DIT_FN=2 \
+    SGLANG_CACHE_DIT_BN=1 \
+    SGLANG_CACHE_DIT_WARMUP=4 \
+    SGLANG_CACHE_DIT_RDT=0.4 \
+    SGLANG_CACHE_DIT_MC=4 \
+    SGLANG_CACHE_DIT_TAYLORSEER=true \
+    SGLANG_CACHE_DIT_TS_ORDER=2 \
+    sglang serve --model-path Wan-AI/Wan2.1-T2V-14B-Diffusers
+    ```
+  </Tab>
+  <Tab title="Ascend A2 / A3">
+    ```bash Command
+    SGLANG_CACHE_DIT_ENABLED=true \
+    SGLANG_CACHE_DIT_FN=2 \
+    SGLANG_CACHE_DIT_BN=1 \
+    SGLANG_CACHE_DIT_WARMUP=4 \
+    SGLANG_CACHE_DIT_RDT=0.4 \
+    SGLANG_CACHE_DIT_MC=4 \
+    SGLANG_CACHE_DIT_TAYLORSEER=true \
+    SGLANG_CACHE_DIT_TS_ORDER=2 \
+    sglang serve --model-path Wan-AI/Wan2.1-T2V-14B-Diffusers ЗАГЛУШКА
+    ```
+  </Tab>
+</Tabs>
 
 #### 4.2.2 GPU Optimization
 
@@ -185,86 +256,139 @@ You can use the built-in SGLang diffusion benchmark script to evaluate Wan2.1 pe
 
 #### 5.1.1 Generate a single video
 
-**Server Command**:
+<Tabs>
+  <Tab title="NVIDIA B200">
+    **Server Command**:
 
-```bash Command
-sglang serve --model-path Wan-AI/Wan2.1-T2V-14B-Diffusers
-```
+    ```bash Command
+    sglang serve --model-path Wan-AI/Wan2.1-T2V-14B-Diffusers
+    ```
 
-**Benchmark Command**:
+    **Benchmark Command**:
 
-```bash Command
-python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
-    --backend sglang-video --dataset vbench --task text-to-video --num-prompts 1 --max-concurrency 1
-```
+    ```bash Command
+    python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
+        --backend sglang-video --dataset vbench --task text-to-video --num-prompts 1 --max-concurrency 1
+    ```
 
-**Result**:
+    **Result**:
 
-```text Output
-================= Serving Benchmark Result =================
-Task:                                    text-to-video
-Model:                                   Wan-AI/Wan2.1-T2V-14B-Diffusers
-Dataset:                                 vbench
---------------------------------------------------
-Benchmark duration (s):                  1958.41
-Request rate:                            inf
-Max request concurrency:                 1
-Successful requests:                     1/1
---------------------------------------------------
-Request throughput (req/s):              0.00
-Latency Mean (s):                        1958.4059
-Latency Median (s):                      1958.4059
-Latency P99 (s):                         1958.4059
---------------------------------------------------
-Peak Memory Max (MB):                    59662.00
-Peak Memory Mean (MB):                   59662.00
-Peak Memory Median (MB):                 59662.00
-============================================================
-```
+    ```text Output
+    ================= Serving Benchmark Result =================
+    Task:                                    text-to-video
+    Model:                                   Wan-AI/Wan2.1-T2V-14B-Diffusers
+    Dataset:                                 vbench
+    --------------------------------------------------
+    Benchmark duration (s):                  1958.41
+    Request rate:                            inf
+    Max request concurrency:                 1
+    Successful requests:                     1/1
+    --------------------------------------------------
+    Request throughput (req/s):              0.00
+    Latency Mean (s):                        1958.4059
+    Latency Median (s):                      1958.4059
+    Latency P99 (s):                         1958.4059
+    --------------------------------------------------
+    Peak Memory Max (MB):                    59662.00
+    Peak Memory Mean (MB):                   59662.00
+    Peak Memory Median (MB):                 59662.00
+    ============================================================
+    ```
+  </Tab>
+
+  <Tab title="Ascend A2 / A3">
+    **Server Command**:
+
+    ```bash Command
+    sglang serve --model-path Wan-AI/Wan2.1-T2V-14B-Diffusers --device npu --dit-layerwise-offload false ЗАГЛУШКА
+    ```
+
+    **Benchmark Command**:
+
+    ```bash Command
+    python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
+        --backend sglang-video --dataset vbench --task text-to-video --num-prompts 1 --max-concurrency 1 --device npu ЗАГЛУШКА
+    ```
+
+    **Result**:
+
+    ```text Output
+    ================= Serving Benchmark Result =================
+    ЗАГЛУШКА (Здесь будут результаты бенчмарка)
+    ============================================================
+    ```
+  </Tab>
+</Tabs>
 
 #### 5.1.2 Generate videos with Cache-DiT acceleration
 
-**Server Command**:
+<Tabs>
+  <Tab title="NVIDIA B200">
+    **Server Command**:
 
-```bash Command
-SGLANG_CACHE_DIT_ENABLED=true \
-SGLANG_CACHE_DIT_FN=2 \
-SGLANG_CACHE_DIT_BN=1 \
-SGLANG_CACHE_DIT_WARMUP=4 \
-SGLANG_CACHE_DIT_RDT=0.4 \
-SGLANG_CACHE_DIT_MC=4 \
-SGLANG_CACHE_DIT_TAYLORSEER=true \
-SGLANG_CACHE_DIT_TS_ORDER=2 \
-sglang serve --model-path Wan-AI/Wan2.1-T2V-14B-Diffusers
-```
+    ```bash Command
+    SGLANG_CACHE_DIT_ENABLED=true \
+    SGLANG_CACHE_DIT_FN=2 \
+    SGLANG_CACHE_DIT_BN=1 \
+    SGLANG_CACHE_DIT_WARMUP=4 \
+    SGLANG_CACHE_DIT_RDT=0.4 \
+    SGLANG_CACHE_DIT_MC=4 \
+    SGLANG_CACHE_DIT_TAYLORSEER=true \
+    SGLANG_CACHE_DIT_TS_ORDER=2 \
+    sglang serve --model-path Wan-AI/Wan2.1-T2V-14B-Diffusers
+    ```
 
-**Benchmark Command**:
+    **Benchmark Command**:
 
-```bash Command
-python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
-    --backend sglang-video --dataset vbench --task text-to-video --num-prompts 1 --max-concurrency 1
-```
+    ```bash Command
+    python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
+        --backend sglang-video --dataset vbench --task text-to-video --num-prompts 1 --max-concurrency 1
+    ```
 
-**Result**:
+    **Result**:
 
-```text Output
-================= Serving Benchmark Result =================
-Task:                                    text-to-video
-Model:                                   Wan-AI/Wan2.1-T2V-14B-Diffusers
-Dataset:                                 vbench
---------------------------------------------------
-Benchmark duration (s):                  556.99
-Request rate:                            inf
-Max request concurrency:                 1
-Successful requests:                     1/1
---------------------------------------------------
-Request throughput (req/s):              0.00
-Latency Mean (s):                        556.9885
-Latency Median (s):                      556.9885
-Latency P99 (s):                         556.9885
---------------------------------------------------
-Peak Memory Max (MB):                    69306.00
-Peak Memory Mean (MB):                   69306.00
-Peak Memory Median (MB):                 69306.00
-============================================================
-```
+    ```text Output
+    ================= Serving Benchmark Result =================
+    Task:                                    text-to-video
+    Model:                                   Wan-AI/Wan2.1-T2V-14B-Diffusers
+    Dataset:                                 vbench
+    --------------------------------------------------
+    Benchmark duration (s):                  556.99
+    Request rate:                            inf
+    Max request concurrency:                 1
+    Successful requests:                     1/1
+    --------------------------------------------------
+    Request throughput (req/s):              0.00
+    Latency Mean (s):                        556.9885
+    Latency Median (s):                      556.9885
+    Latency P99 (s):                         556.9885
+    --------------------------------------------------
+    Peak Memory Max (MB):                    69306.00
+    Peak Memory Mean (MB):                   69306.00
+    Peak Memory Median (MB):                 69306.00
+    ============================================================
+    ```
+  </Tab>
+  
+  <Tab title="Ascend A3">
+    **Server Command**:
+
+    ```bash Command
+    sglang serve --model-path Wan-AI/Wan2.1-T2V-14B-Diffusers ЗАГЛУШКА
+    ```
+
+    **Benchmark Command**:
+
+    ```bash Command
+    python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
+        --backend sglang-video --dataset vbench --task text-to-video --num-prompts 1 --max-concurrency 1 ЗАГЛУШКА
+    ```
+
+    **Result**:
+
+    ```text Output
+    ЗАГЛУШКА (Здесь будут результаты бенчмарка для A3)
+    ```
+  </Tab>
+</Tabs>
+
