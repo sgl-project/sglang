@@ -9,11 +9,11 @@
   <a href="https://huggingface.co/trymirai/weaver"><img src="https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Weaver-FFD21E?style=for-the-badge" alt="Hugging Face"></a>
 </p>
 
-To run it, you also need:
+<p align="center">
+  <img src="assets/tfm-throughput.png" alt="Per-dataset Qwen3.6-27B throughput comparison for autoregressive decoding, DFlash, DDTree, and DFlash-TfM." width="760">
+</p>
 
-- the Qwen3.6-27B target model;
-- the Qwen3.6-27B DFlash drafter;
-- the Qwen3.6-27B [Weaver checkpoint](https://huggingface.co/trymirai/);
+### Method
 
 Weaver has 56.7M trainable parameters. At inference time, DFlash produces future-state lookaheads in one forward pass; Weaver conditions on the realized draft tokens and scores only the top-512 marginal candidates instead of projecting over the full vocabulary.
 
@@ -21,7 +21,7 @@ Weaver has 56.7M trainable parameters. At inference time, DFlash produces future
   <img src="assets/tfm-architecture.png" alt="DFlash-TfM uses DFlash marginals in parallel, then conditions tree proposals autoregressively with Weaver." width="760">
 </p>
 
-### Reproducing the headline number
+### Results
 
 We evaluate on Qwen3.6-27B over chat, math, and code workloads: MTBench, ShareChat, GSM8K, MATH500, AIME25, HumanEval, MBPP, and LiveCodeBench. All runs use BF16 precision on a single B200 with batch size 1, temperature 1.0, reasoning enabled, maximum output length 4096, and the server cache flushed between requests.
 
@@ -33,15 +33,19 @@ Throughput is computed as total generated tokens divided by wall-clock runtime, 
 | DFlash | tuned chain baseline | 315.0 tok/s/seq | 3.50x |
 | DFlash-TfM + Weaver | tree budget 64 | 392.8 tok/s/seq | 4.37x |
 
-DFlash-TfM with Weaver is the fastest configuration on every task in this sweep. The gap comes from acceptance: Weaver's trees lengthen the mean accepted draft by 77% relative to the chain DFlash baseline and by 32% relative to DDTree at the same tree size.
-
-<p align="center">
-  <img src="assets/tfm-throughput.png" alt="Per-dataset Qwen3.6-27B throughput comparison for autoregressive decoding, DFlash, DDTree, and DFlash-TfM." width="760">
-</p>
-
 <p align="center">
   <img src="assets/tfm-results-table.png" alt="Full DFlash-TfM table with speedup and accepted-token statistics across sampling and reasoning settings." width="900">
 </p>
+
+DFlash-TfM with Weaver is the fastest configuration on every task in this sweep. The gap comes from acceptance: Weaver's trees lengthen the mean accepted draft by 77% relative to the chain DFlash baseline and by 32% relative to DDTree at the same tree size.
+
+### Reproducing the headline number
+
+To run it, you also need:
+
+- the Qwen3.6-27B target model;
+- the Qwen3.6-27B DFlash drafter;
+- the Qwen3.6-27B [Weaver checkpoint](https://huggingface.co/trymirai/);
 
 > See [`reproduction.sh`](./reproduction.sh) for the pinned reproduction commands.
 
