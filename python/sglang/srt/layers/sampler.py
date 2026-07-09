@@ -180,6 +180,16 @@ class Sampler(nn.Module):
                 # Standard path: do softmax and sample from probs.
                 logits.div_(sampling_info.temperatures)
 
+                if (
+                    return_logprob
+                    and self.enable_deterministic
+                    and logprobs_via_logsoftmax_kernel is None
+                    and not SGLANG_RETURN_ORIGINAL_LOGPROB
+                ):
+                    logprobs_via_logsoftmax_kernel = torch.nn.functional.log_softmax(
+                        logits, dim=-1
+                    )
+
                 # In-place op to save memory
                 logits[:] = torch.softmax(logits, dim=-1)
                 probs = logits
