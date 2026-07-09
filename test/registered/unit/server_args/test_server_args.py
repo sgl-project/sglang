@@ -13,6 +13,7 @@ from sglang.srt.layers.cp.base import is_cp_enabled, is_interleave
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     CudaGraphConfig,
+    Phase,
     PhaseConfig,
 )
 from sglang.srt.server_args import PortArgs, ServerArgs, prepare_server_args
@@ -1267,6 +1268,60 @@ class TestCudaGraphConfigDataclassAccess(CustomTestCase):
 
         self.assertEqual(config.get_capture_sizes(), [32, 64])
         self.assertEqual(config.compiler, "eager")
+
+
+class TestCudaGraphDisaggregationRoles(CustomTestCase):
+    def _handled_args(self, **overrides):
+        args = ServerArgs(model_path="dummy", **overrides)
+        args.model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=["LlamaForCausalLM"]),
+            is_piecewise_cuda_graph_disabled_model=False,
+            is_multimodal=False,
+            is_multimodal_piecewise_cuda_graph_supported=False,
+        )
+        with (
+            patch("sglang.srt.utils.is_cuda", return_value=True),
+            patch.object(ServerArgs, "use_mla_backend", return_value=False),
+        ):
+            args._handle_cuda_graph_config()
+        return args
+
+    def test_cuda_graph_prefill_role_defaults_disable_decode_graph(self):
+        args = self._handled_args(disaggregation_mode="prefill")
+
+        self.assertFalse(args.disable_cuda_graph)
+        self.assertEqual(args.cuda_graph_config.decode.backend, Backend.DISABLED)
+        self.assertEqual(args.cuda_graph_config.prefill.backend, Backend.BREAKABLE)
+
+    def test_cuda_graph_decode_role_defaults_disable_prefill_graph(self):
+        args = self._handled_args(disaggregation_mode="decode")
+
+        self.assertEqual(args.cuda_graph_config.prefill.backend, Backend.DISABLED)
+        self.assertNotEqual(args.cuda_graph_config.decode.backend, Backend.DISABLED)
+
+    def test_cuda_graph_global_disable_still_disables_both_phases_for_all_roles(self):
+        for disaggregation_mode in ("prefill", "decode", "null"):
+            with self.subTest(disaggregation_mode=disaggregation_mode):
+                args = self._handled_args(
+                    disaggregation_mode=disaggregation_mode,
+                    disable_cuda_graph=True,
+                )
+
+                self.assertEqual(
+                    args.cuda_graph_config.decode.backend, Backend.DISABLED
+                )
+                self.assertEqual(
+                    args.cuda_graph_config.prefill.backend, Backend.DISABLED
+                )
+
+    def test_cuda_graph_explicit_decode_backend_survives_prefill_role(self):
+        args = self._handled_args(
+            disaggregation_mode="prefill",
+            cuda_graph_backend_decode=Backend.FULL,
+        )
+
+        self.assertEqual(args.cuda_graph_config.decode.backend, Backend.FULL)
+        self.assertIn((Phase.DECODE, "backend"), args._cuda_graph_config_locked)
 
 
 class TestCutedslMoeMaxNumTokens(CustomTestCase):
