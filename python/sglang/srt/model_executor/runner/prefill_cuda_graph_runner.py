@@ -458,9 +458,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             ),
         ):
             if self.layer_model is not None:
+                positions = self._get_layer_model_positions(forward_batch)
                 return self.layer_model.forward(
                     forward_batch.input_ids,
-                    forward_batch.positions,
+                    positions,
                     forward_batch,
                     forward_batch.input_embeds,
                 )
@@ -469,6 +470,21 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 forward_batch.positions,
                 forward_batch,
             )
+
+    def _get_layer_model_positions(self, forward_batch: ForwardBatch) -> torch.Tensor:
+        """Mirror outer multimodal wrappers when BCG captures layer_model directly."""
+        if forward_batch.mrope_positions is None:
+            return forward_batch.positions
+
+        model = self.model_runner.model
+        if getattr(model, "is_mrope_enabled", False):
+            return forward_batch.mrope_positions
+
+        language_model = getattr(model, "language_model", None)
+        if getattr(language_model, "is_mrope_enabled", False):
+            return forward_batch.mrope_positions
+
+        return forward_batch.positions
 
     def _run_dummy_forward(self, num_tokens: int) -> None:
         """Build a dummy ForwardBatch at this shape, init attn metadata,
