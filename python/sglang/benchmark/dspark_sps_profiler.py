@@ -61,7 +61,7 @@ except ImportError as exc:
     should_skip_due_to_max_running_requests = None
     should_skip_due_to_token_capacity = None
 
-DEFAULT_OUT = "~/main/artifacts/sglang/dspark_sps_table.json"
+DEFAULT_OUT = "dspark_sps_table.json"
 DEFAULT_MAX_BATCH_SIZE = 256
 DEFAULT_INPUT_LEN = 16
 DEFAULT_TEMPERATURE = 1.0

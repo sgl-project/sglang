@@ -394,8 +394,7 @@ class DFlashDraftModel(nn.Module):
                 "This usually means the target model is capturing a different number of layer features than "
                 "the draft checkpoint/config expects."
             )
-        out = self.hidden_norm(self.fc(target_hidden))
-        return out
+        return self.hidden_norm(self.fc(target_hidden))
 
     @torch.no_grad()
     def forward(
@@ -414,7 +413,7 @@ class DFlashDraftModel(nn.Module):
         hidden_states = input_embeds
         residual: Optional[torch.Tensor] = None
 
-        for layer_id, layer in enumerate(self.layers):
+        for layer in self.layers:
             hidden_states, residual = layer(
                 positions, hidden_states, forward_batch, residual
             )
