@@ -982,6 +982,7 @@ STANDALONE_FILES = {
     ],
     "2-gpu": [
         "../single_test_file/test_disagg_server.py",
+        "../single_test_file/test_ar_models.py",
     ],
 }
 
@@ -996,6 +997,7 @@ STANDALONE_FILE_EST_TIMES = {
         # Two disagg clusters × (~3 min startup + ~1 min generate) ≈ 8 min.
         # Raise if CI reports a higher measured time.
         "../single_test_file/test_disagg_server.py": 600.0,
+        "../single_test_file/test_ar_models.py": 600.0,
     },
 }
 

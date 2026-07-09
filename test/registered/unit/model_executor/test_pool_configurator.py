@@ -10,6 +10,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -27,10 +28,7 @@ def mock_cpu_env(kv_size=2, tp_size=1, swa_eviction_interval=4):
 
     with (
         patch("torch._utils._element_size", return_value=kv_size),
-        patch(
-            "sglang.srt.model_executor.pool_configurator.get_attention_tp_size",
-            return_value=tp_size,
-        ),
+        get_parallel().override(attn_tp_size=tp_size),
         envs.SGLANG_SWA_EVICTION_INTERVAL.override(swa_eviction_interval),
     ):
         yield
@@ -102,10 +100,6 @@ def _make_model_runner(
 
     sa = SimpleNamespace()
     sa.swa_full_tokens_ratio = swa_full_tokens_ratio
-    # The configurator reads the resolved ratio from the flags tier.
-    from sglang.srt.runtime_context import get_flags
-
-    get_flags().swa_full_tokens_ratio = swa_full_tokens_ratio
     sa.page_size = page_size
     sa.disable_radix_cache = disable_radix_cache
     sa.chunked_prefill_size = chunked_prefill_size
@@ -120,6 +114,7 @@ def _make_model_runner(
     sa.disaggregation_mode = disaggregation_mode
     sa.max_running_requests = max_running_requests
     sa.disaggregation_decode_extra_slots = disaggregation_decode_extra_slots
+    sa.enable_dsa_cache_layer_split = False
     mr.server_args = sa
 
     spec = MagicMock()
