@@ -376,8 +376,6 @@ class BenchOneCaseResult(BaseModel):
     last_ttft: float
     last_gen_throughput: float
     acc_length: float
-    iter_time: float = -1.0
-    n_decode_steps: int = 0
     cache_hit_rate: Optional[float] = None
     profile_link: Optional[str] = None
 
@@ -395,8 +393,6 @@ class BenchOneCaseResult(BaseModel):
                 "last_ttft": round(self.last_ttft, 4),
                 "last_gen_throughput": round(self.last_gen_throughput, 2),
                 "acc_length": round(self.acc_length, 2),
-                "iter_time": round(self.iter_time, 6),
-                "n_decode_steps": self.n_decode_steps,
                 "cache_hit_rate": (
                     round(self.cache_hit_rate, 4)
                     if self.cache_hit_rate is not None
@@ -800,14 +796,6 @@ def run_one_case(
                 internal_state.get("last_gen_throughput", None) or last_gen_throughput
             )
 
-    n_decode_steps = 0
-    iter_time = -1.0
-    decode_wall = latency - last_ttft
-    if acc_length > 0 and output_len > 1 and decode_wall > 0 and last_ttft > 0:
-        steps = output_len / acc_length
-        iter_time = decode_wall / steps
-        n_decode_steps = round(steps)
-
     # Calculate cache hit rate from before/after metrics delta
     metrics_after = get_cache_tokens_from_metrics(url)
     metrics_cache_hit_rate = calculate_cache_hit_rate(metrics_before, metrics_after)
@@ -840,13 +828,9 @@ def run_one_case(
         last_ttft=last_ttft,
         last_gen_throughput=last_gen_throughput,
         acc_length=acc_length,
-        iter_time=iter_time,
-        n_decode_steps=n_decode_steps,
         cache_hit_rate=metrics_cache_hit_rate,
         profile_link=profile_link,
     )
-    if iter_time > 0:
-        print(f"iter_time: {iter_time*1e3:.3f} ms/step ({n_decode_steps} steps)")
 
     # Save and return the results
     if result_filename:
