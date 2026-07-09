@@ -3419,6 +3419,11 @@ def dispose_tensor(x: torch.Tensor):
     if is_in_tc_piecewise_cuda_graph():
         return
 
+    from sglang.srt.runtime_context import get_flags
+
+    if get_flags().capture.disable_dispose_tensor:
+        return
+
     x.set_(torch.empty((0,), device=x.device, dtype=x.dtype))
 
 
