@@ -13,6 +13,9 @@ from sglang.multimodal_gen.runtime.layers.attention import (
     DynamicVarlenMaskMeta,
     build_varlen_mask_meta,
 )
+from sglang.multimodal_gen.runtime.models.dits.qwen_image import (
+    _attn_mask_meta_local_pad,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
     DenoisingStage,
 )
@@ -108,6 +111,11 @@ class TestDiffusionBCGPadding(unittest.TestCase):
             )
         )
         self.assertEqual(_signature_kwargs(first), _signature_kwargs(second))
+
+    def test_qwen_dynamic_varlen_meta_is_not_tail_pad_meta(self):
+        self.assertEqual(_attn_mask_meta_local_pad(None), 0)
+        self.assertEqual(_attn_mask_meta_local_pad({"local_pad": 7}), 7)
+        self.assertEqual(_attn_mask_meta_local_pad(DynamicVarlenMaskMeta()), 0)
 
     def test_qwen_default_bucket_preserves_mask(self):
         def kwargs(valid_len: int):
