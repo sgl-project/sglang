@@ -373,21 +373,36 @@ class HeliosCrossAttention(nn.Module):
             skip_sequence_parallel=True,
         )
 
-    def forward(self, hidden_states, encoder_hidden_states):
-        q, _ = self.to_q(hidden_states)
+    def project_kv(self, encoder_hidden_states):
+        """Project encoder states to this block's cross-attn (key, value)."""
         k, _ = self.to_k(encoder_hidden_states)
         v, _ = self.to_v(encoder_hidden_states)
-
         if self.tp_rmsnorm:
-            q = tensor_parallel_rms_norm(q, self.norm_q)
             k = tensor_parallel_rms_norm(k, self.norm_k)
         else:
-            q = self.norm_q(q)
             k = self.norm_k(k)
-
-        q = q.unflatten(2, (self.local_num_heads, self.head_dim))
         k = k.unflatten(2, (self.local_num_heads, self.head_dim))
         v = v.unflatten(2, (self.local_num_heads, self.head_dim))
+        return k, v
+
+    def forward(
+        self, hidden_states, encoder_hidden_states=None, encoder_key_value=None
+    ):
+        q, _ = self.to_q(hidden_states)
+        if self.tp_rmsnorm:
+            q = tensor_parallel_rms_norm(q, self.norm_q)
+        else:
+            q = self.norm_q(q)
+        q = q.unflatten(2, (self.local_num_heads, self.head_dim))
+
+        if encoder_key_value is None:
+            if encoder_hidden_states is None:
+                raise ValueError(
+                    "encoder_hidden_states is required when encoder_key_value"
+                    " is not provided."
+                )
+            encoder_key_value = self.project_kv(encoder_hidden_states)
+        k, v = encoder_key_value
 
         x = self.attn(q, k, v)
         x = x.flatten(2)
@@ -466,6 +481,7 @@ class HeliosTransformerBlock(nn.Module):
         temb,
         rotary_emb,
         original_context_length=None,
+        cross_attn_key_value=None,
     ):
         if temb.ndim == 4:
             shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = (
@@ -500,7 +516,11 @@ class HeliosTransformerBlock(nn.Module):
             norm_hidden_states = self.self_attn_residual_norm(
                 current_hidden_states.float()
             ).type_as(current_hidden_states)
-            attn_output = self.attn2(norm_hidden_states, encoder_hidden_states)
+            attn_output = self.attn2(
+                norm_hidden_states,
+                encoder_hidden_states,
+                encoder_key_value=cross_attn_key_value,
+            )
             current_hidden_states = current_hidden_states + attn_output
             hidden_states = torch.cat(
                 [history_hidden_states, current_hidden_states], dim=1
@@ -509,7 +529,11 @@ class HeliosTransformerBlock(nn.Module):
             norm_hidden_states = self.self_attn_residual_norm(
                 hidden_states.float()
             ).type_as(hidden_states)
-            attn_output = self.attn2(norm_hidden_states, encoder_hidden_states)
+            attn_output = self.attn2(
+                norm_hidden_states,
+                encoder_hidden_states,
+                encoder_key_value=cross_attn_key_value,
+            )
             hidden_states = hidden_states + attn_output
 
         # 3. Feed-forward
@@ -640,6 +664,53 @@ class HeliosTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         self.layer_names = ["blocks"]
         self.sp_size = get_sp_world_size()
 
+    # Cross-attention K/V cache.
+    #
+    # Text conditioning is constant across the denoise loop, so the text
+    # projection and every block's cross-attn K/V are computed once per request
+    # (keyed by encoder-tensor identity) and reused across steps.
+
+    @staticmethod
+    def _request_cache(forward_batch, name):
+        """Per-request cache dict on ``forward_batch.extra``.
+
+        Returns None (-> caller recomputes, caching disabled) when there is no
+        forward batch or gradients are enabled."""
+        if forward_batch is None or torch.is_grad_enabled():
+            return None
+        extra = getattr(forward_batch, "extra", None)
+        return None if extra is None else extra.setdefault(name, {})
+
+    @staticmethod
+    def _tensor_key(t):
+        """Identity key for ``t``; equal only for the same underlying tensor."""
+        return (
+            t.data_ptr(),
+            tuple(t.shape),
+            tuple(t.stride()),
+            t.dtype,
+            t.device.type,
+            t.device.index,
+        )
+
+    def _get_cross_attn_key_values(self, encoder_hidden_states, forward_batch):
+        """Per-block cross-attn (key, value) for ``encoder_hidden_states``.
+
+        Cached per request, keyed on the encoder tensor's identity
+        (``_tensor_key``). The same object — ``batch.prompt_embeds`` — is passed
+        every denoise step, so the key is stable and steps after the first hit
+        the cache.
+        """
+        cache = self._request_cache(forward_batch, "helios_cross_attn_kv")
+        key = self._tensor_key(encoder_hidden_states) if cache is not None else None
+        kvs = cache.get(key) if key is not None else None
+        if kvs is None:
+            projected = self.condition_embedder.text_embedder(encoder_hidden_states)
+            kvs = [block.attn2.project_kv(projected) for block in self.blocks]
+            if key is not None:
+                cache[key] = kvs
+        return kvs
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -655,7 +726,6 @@ class HeliosTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         latents_history_long=None,
         **kwargs,
     ) -> torch.Tensor:
-        orig_dtype = hidden_states.dtype
         if not isinstance(encoder_hidden_states, torch.Tensor):
             encoder_hidden_states = encoder_hidden_states[0]
 
@@ -826,8 +896,14 @@ class HeliosTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 .expand(batch_size, -1, history_context_length, -1)
             )
 
-        temb, timestep_proj, encoder_hidden_states = self.condition_embedder(
-            timestep, encoder_hidden_states
+        # Take only the time embeddings (temb, timestep_proj); skip the text
+        # projection (is_return_encoder_hidden_states=False) since it is computed
+        # once per request and cached by _get_cross_attn_key_values below.
+        temb, timestep_proj, _ = self.condition_embedder(
+            timestep, encoder_hidden_states, is_return_encoder_hidden_states=False
+        )
+        cross_attn_key_values = self._get_cross_attn_key_values(
+            encoder_hidden_states, forward_batch
         )
         timestep_proj = timestep_proj.unflatten(-1, (6, -1))
 
@@ -852,13 +928,14 @@ class HeliosTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         encoder_hidden_states = encoder_hidden_states.contiguous()
         rotary_emb = rotary_emb.contiguous()
 
-        for block in self.blocks:
+        for block, key_value in zip(self.blocks, cross_attn_key_values):
             hidden_states = block(
                 hidden_states,
                 encoder_hidden_states,
                 timestep_proj,
                 rotary_emb,
                 effective_context_length,
+                cross_attn_key_value=key_value,
             )
 
         self.cnt += 1

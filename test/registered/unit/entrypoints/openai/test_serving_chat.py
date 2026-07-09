@@ -28,7 +28,7 @@ from sglang.srt.entrypoints.openai.serving_chat import (
     normalize_tool_content,
 )
 from sglang.srt.managers.io_struct import GenerateReqInput
-from sglang.srt.managers.template_detection import ReasoningToggleConfig
+from sglang.srt.parser.template_detection import ReasoningToggleConfig
 from sglang.srt.utils import get_or_create_event_loop
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -102,6 +102,7 @@ class ServingChatTestCase(unittest.TestCase):
         self.basic_req = ChatCompletionRequest(
             model="x",
             messages=[{"role": "user", "content": "Hi?"}],
+            session_id="session-1",
             temperature=0.7,
             max_tokens=100,
             stream=False,
@@ -145,6 +146,7 @@ class ServingChatTestCase(unittest.TestCase):
             adapted, processed = self.chat._convert_to_internal_request(self.basic_req)
             self.assertIsInstance(adapted, GenerateReqInput)
             self.assertFalse(adapted.stream)
+            self.assertEqual(adapted.session_id, "session-1")
             self.assertEqual(processed, self.basic_req)
 
     def test_convert_to_internal_request_rejects_stream_return_prompt_token_ids(self):
@@ -1162,7 +1164,7 @@ class ServingChatTestCase(unittest.TestCase):
 
     def test_dpsk_v32_encoding_path(self):
         """Test DeepSeek V3.2 encoding path detection and application."""
-        from sglang.srt.managers.template_manager import TemplateManager
+        from sglang.srt.parser.template_manager import TemplateManager
 
         # Only mock the fields that _use_dpsk_v32_encoding() actually reads:
         # tokenizer.chat_template and hf_config.architectures
@@ -1448,6 +1450,203 @@ class ServingChatTestCase(unittest.TestCase):
         self.assertEqual(len(chunks), 2)
         self.assertIn("error", chunks[0])
 
+    def _run_chat_stream(self, adapted_request, req):
+        async def run_stream():
+            chunks = []
+            async for chunk in self.chat._generate_chat_stream(
+                adapted_request, req, self.fastapi_request
+            ):
+                chunks.append(chunk)
+            return chunks
+
+        return get_or_create_event_loop().run_until_complete(run_stream())
+
+    def _parse_chunks(self, chunks):
+        parsed = []
+        for c in chunks:
+            if c.startswith("data: ") and c != "data: [DONE]\n\n":
+                parsed.append(json.loads(c[len("data: ") :]))
+        return parsed
+
+    async def _collect_stream_content(self, content, choice_logprobs, req):
+        chunks = []
+        async for chunk in self.chat._generate_stream_content(
+            content=content,
+            index=0,
+            request=req,
+            stream_offsets={},
+            reasoning_parser_dict={},
+            parser_dict={},
+            has_tool_calls={},
+            choice_logprobs=choice_logprobs,
+            finish_reason_type="stop",
+            continuous_usage_stats=False,
+            prompt_tokens={0: 5},
+            reasoning_tokens={0: 0},
+            completion_tokens={0: 1},
+        ):
+            chunks.append(chunk)
+        return chunks
+
+    def test_streaming_logprobs_attached_with_reasoning_parser(self):
+        """Logprobs must ride on the reasoning chunk when a reasoning parser is active."""
+        self.chat.reasoning_parser = "qwen3"
+
+        content = {
+            "text": "thinking...",
+            "meta_info": {
+                "id": "chatcmpl-reasoning",
+                "prompt_tokens": 5,
+                "completion_tokens": 2,
+                "cached_tokens": 0,
+                "finish_reason": {"type": "stop", "matched": None},
+                "output_token_logprobs": [(0.1, 1, "think"), (0.2, 2, "ing")],
+                "output_top_logprobs": [],
+                "output_token_logprobs_length": 2,
+            },
+            "index": 0,
+        }
+        choice_logprobs = self.chat._process_streaming_logprobs(
+            content, 0, 2
+        ).model_dump()
+
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            stream=True,
+            logprobs=True,
+            separate_reasoning=True,
+        )
+
+        with patch.object(self.chat, "_process_reasoning_stream") as proc_mock:
+            proc_mock.return_value = ("Let me think", "")
+            chunks = get_or_create_event_loop().run_until_complete(
+                self._collect_stream_content(content, choice_logprobs, req)
+            )
+
+        parsed = self._parse_chunks(chunks)
+        reasoning_chunks = [
+            c
+            for c in parsed
+            if c["choices"][0]["delta"].get("reasoning_content") is not None
+        ]
+        self.assertTrue(
+            reasoning_chunks, "reasoning_parser did not emit a reasoning_content chunk"
+        )
+        logprob_chunks = [
+            c for c in parsed if c["choices"][0].get("logprobs") is not None
+        ]
+        self.assertTrue(
+            logprob_chunks,
+            "logprobs dropped: no chunk carried logprobs with reasoning_parser active",
+        )
+
+    def test_streaming_logprobs_flushed_when_tool_parser_buffers_delta(self):
+        """Logprobs must be flushed on a standalone chunk when the tool parser emits no content delta."""
+        self.chat.tool_call_parser = "hermes"
+
+        content = {
+            "text": "(<",
+            "meta_info": {
+                "id": "chatcmpl-tool",
+                "prompt_tokens": 5,
+                "completion_tokens": 1,
+                "cached_tokens": 0,
+                "finish_reason": {"type": "stop", "matched": None},
+                "output_token_logprobs": [(0.3, 9, "(<")],
+                "output_top_logprobs": [],
+                "output_token_logprobs_length": 1,
+            },
+            "index": 0,
+        }
+        choice_logprobs = self.chat._process_streaming_logprobs(
+            content, 0, 1
+        ).model_dump()
+
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            tools=[{"type": "function", "function": {"name": "get_weather"}}],
+            stream=True,
+            logprobs=True,
+        )
+
+        async def _empty_tool_stream(*args, **kwargs):
+            return
+            yield  # make it an async generator
+
+        with patch.object(self.chat, "_process_tool_call_stream", _empty_tool_stream):
+            chunks = get_or_create_event_loop().run_until_complete(
+                self._collect_stream_content(content, choice_logprobs, req)
+            )
+
+        parsed = self._parse_chunks(chunks)
+        logprob_chunks = [
+            c for c in parsed if c["choices"][0].get("logprobs") is not None
+        ]
+        self.assertTrue(
+            logprob_chunks,
+            "logprobs dropped: no flush chunk carried logprobs when tool parser buffered the delta",
+        )
+
+    def test_streaming_logprobs_not_flushed_on_empty_delta_step_without_parser(self):
+        """With no parser active, an empty-delta step must not emit a standalone
+        empty-delta logprobs chunk — clients expect each chunk to carry real
+        content/reasoning/tool_calls or a finish_reason."""
+        self.chat.reasoning_parser = None
+        self.chat.tool_call_parser = None
+
+        async def _mock_generate():
+            yield {
+                "text": "",
+                "meta_info": {
+                    "id": "chatcmpl-empty",
+                    "prompt_tokens": 5,
+                    "completion_tokens": 1,
+                    "cached_tokens": 0,
+                    "finish_reason": {"type": "stop", "matched": None},
+                    "output_token_logprobs": [(0.5, 7, "")],
+                    "output_top_logprobs": [],
+                    "output_token_logprobs_length": 1,
+                },
+                "index": 0,
+            }
+
+        self.tm.generate_request.return_value = _mock_generate()
+
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            stream=True,
+            logprobs=True,
+        )
+
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_chat.generate_chat_conv"
+        ) as conv_mock:
+            conv_ins = Mock()
+            conv_ins.get_prompt.return_value = "Test prompt"
+            conv_mock.return_value = conv_ins
+            adapted_request, _ = self.chat._convert_to_internal_request(
+                req, self.fastapi_request
+            )
+            chunks = self._run_chat_stream(adapted_request, req)
+
+        parsed = self._parse_chunks(chunks)
+        empty_logprob_chunks = [
+            c
+            for c in parsed
+            if c["choices"][0].get("logprobs") is not None
+            and not c["choices"][0]["delta"].get("content")
+            and not c["choices"][0]["delta"].get("reasoning_content")
+            and not c["choices"][0]["delta"].get("tool_calls")
+            and not c["choices"][0].get("finish_reason")
+        ]
+        self.assertFalse(
+            empty_logprob_chunks,
+            "empty-delta logprobs chunk emitted without a parser; would break client chunk-shape assumptions",
+        )
+
     def test_non_streaming_cached_tokens_details_emits_sglext(self):
         """Test that non-streaming chat responses emit cached token details in sglext."""
 
@@ -1601,6 +1800,63 @@ class ServingChatTestCase(unittest.TestCase):
             },
         )
 
+    def _collect_continuous_usage(self, cached_tokens):
+        content = {
+            "text": "Hello",
+            "meta_info": {
+                "id": "chatcmpl-cont-usage",
+                "prompt_tokens": 10,
+                "completion_tokens": 2,
+                "cached_tokens": cached_tokens,
+                "finish_reason": {"type": "stop", "matched": None},
+                "output_token_logprobs": None,
+                "output_top_logprobs": None,
+            },
+            "index": 0,
+        }
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            stream=True,
+        )
+
+        async def _collect():
+            chunks = []
+            async for chunk in self.chat._generate_stream_content(
+                content=content,
+                index=0,
+                request=req,
+                stream_offsets={},
+                reasoning_parser_dict={},
+                parser_dict={},
+                has_tool_calls={},
+                choice_logprobs=None,
+                finish_reason_type="stop",
+                continuous_usage_stats=True,
+                prompt_tokens={0: 10},
+                reasoning_tokens={0: 0},
+                completion_tokens={0: 2},
+            ):
+                chunks.append(chunk)
+            return chunks
+
+        chunks = get_or_create_event_loop().run_until_complete(_collect())
+        return [c["usage"] for c in self._parse_chunks(chunks) if c.get("usage")]
+
+    def test_continuous_usage_reports_cached_tokens(self):
+        """continuous_usage_stats chunks include cached tokens when cache reporting is on."""
+        self.tm.server_args.enable_cache_report = True
+        usages = self._collect_continuous_usage(cached_tokens=6)
+        self.assertTrue(usages, "continuous_usage_stats attached no usage")
+        self.assertEqual(usages[0]["prompt_tokens_details"]["cached_tokens"], 6)
+
+    def test_continuous_usage_omits_cached_tokens_when_report_disabled(self):
+        """With cache reporting off, continuous_usage_stats must not leak cached tokens."""
+        self.tm.server_args.enable_cache_report = False
+        usages = self._collect_continuous_usage(cached_tokens=6)
+        self.assertTrue(usages, "continuous_usage_stats attached no usage")
+        self.assertIsNone(usages[0].get("prompt_tokens_details"))
+
     # ------------- incremental streaming output tests -------------
     def test_incremental_streaming_output_delta(self):
         """Test that streaming with incremental_streaming_output produces correct deltas.
@@ -1744,6 +2000,67 @@ class ServingChatTestCase(unittest.TestCase):
             with self.subTest(effort=effort):
                 req.reasoning_effort = effort
                 self.assertEqual(chat._get_reasoning_from_request(req), expected)
+
+    def _setup_nemotron_super(self):
+        """Drive _apply_jinja_template (chat_template_name=None) with a
+        Nemotron-3 Super reasoning_config carrying effort_kwarg."""
+        self.tm.server_args.reasoning_parser = "nemotron_3"
+        self.chat.reasoning_parser = "nemotron_3"
+        self.tm.server_args.served_model_name = (
+            "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16"
+        )
+        self.template_manager.chat_template_name = None
+        self.template_manager.reasoning_config = ReasoningToggleConfig(
+            toggle_param="enable_thinking",
+            default_enabled=True,
+            effort_kwarg="low_effort",
+        )
+        self.chat.chat_encoding_spec = None
+
+    def _run_jinja_with_effort(self, effort):
+        req = ChatCompletionRequest(
+            model="nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16",
+            messages=[{"role": "user", "content": "hi"}],
+            reasoning_effort=effort,
+        )
+        with (
+            patch.object(self.chat, "_encode_messages", return_value=None),
+            patch.object(
+                self.chat,
+                "_handle_last_assistant_message",
+                return_value=([{"role": "user", "content": "hi"}], None),
+            ),
+        ):
+            self.chat._process_messages(req, False)
+        _, kwargs = self.tm.tokenizer.apply_chat_template.call_args
+        return kwargs
+
+    def test_nemotron_super_low_effort_mapped_to_kwarg(self):
+        self._setup_nemotron_super()
+        kwargs = self._run_jinja_with_effort("low")
+        self.assertTrue(kwargs.get("low_effort"))
+
+    def test_nemotron_super_high_effort_warns_without_kwarg(self):
+        self._setup_nemotron_super()
+        with self.assertLogs(
+            "sglang.srt.entrypoints.openai.serving_chat", level="WARNING"
+        ) as logs:
+            kwargs = self._run_jinja_with_effort("high")
+        self.assertNotIn("low_effort", kwargs)
+        self.assertTrue(any("only 'low' reasoning effort" in m for m in logs.output))
+
+    def test_nemotron_nano_no_effort_kwarg(self):
+        # Nano template has no low_effort, so effort_kwarg stays None and no
+        # warning is emitted even for non-low effort.
+        self.tm.server_args.reasoning_parser = "nemotron_3"
+        self.chat.reasoning_parser = "nemotron_3"
+        self.template_manager.chat_template_name = None
+        self.template_manager.reasoning_config = ReasoningToggleConfig(
+            toggle_param="enable_thinking", default_enabled=True
+        )
+        self.chat.chat_encoding_spec = None
+        kwargs = self._run_jinja_with_effort("high")
+        self.assertNotIn("low_effort", kwargs)
 
     def test_non_stream_reasoning_response_preserves_payload_whitespace(self):
         self.chat.reasoning_parser = "qwen3"
