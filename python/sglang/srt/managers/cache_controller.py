@@ -1188,6 +1188,12 @@ class HiCacheController:
         Manage backup operations from host memory to storage backend.
         """
         while not self.storage_stop_event.is_set():
+            renew = getattr(self.storage_backend, "renew_retained_pages", None)
+            if renew is not None:
+                try:
+                    renew()
+                except Exception:
+                    logger.warning("Storage retention renewal failed", exc_info=True)
             try:
                 operation = self.backup_queue.get(block=True, timeout=1)
                 if operation is None:

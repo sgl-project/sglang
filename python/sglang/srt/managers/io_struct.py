@@ -152,6 +152,17 @@ MultimodalDataInputFormat = Union[
 
 
 @dataclass
+class KvRetentionHint:
+    prefix_tokens: int
+    ttl_seconds: int
+
+
+@dataclass
+class KvHintEnvelope:
+    retention: List[KvRetentionHint] = field(default_factory=list)
+
+
+@dataclass
 class GenerateReqInput:
     # Request ID(s). If omitted, generated during normalization. For batch
     # requests, a string is expanded to per-item IDs using it as a prefix.
@@ -252,6 +263,8 @@ class GenerateReqInput:
     disagg_prefill_dp_rank: Optional[int] = None
     # Routing key for routing-key schedule policy
     routing_key: Optional[str] = None
+    # Provider-neutral KV cache intent supplied by an upstream router.
+    kv_hints: Optional[Union[KvHintEnvelope, List[Optional[KvHintEnvelope]]]] = None
     # Conversation id used for tracking requests
     conversation_id: Optional[str] = None
     # Internal IPC endpoint of the HTTP/tokenizer worker that owns this request.
@@ -347,6 +360,7 @@ class GenerateReqInput:
         if self.session_id is not None and self.session_params is not None:
             raise ValueError("session_id and session_params cannot both be set.")
         self._handle_parallel_sampling()
+        self._coerce_kv_hints()
 
         if self.is_single:
             self._normalize_single_inputs()
@@ -457,6 +471,7 @@ class GenerateReqInput:
         self._normalize_logprob_params(num)
         self._normalize_custom_logit_processor(num)
         self._normalize_extra_key(num)
+        self._normalize_kv_hints()
         self._normalize_bootstrap_params(num)
 
     def _expand_inputs(self, num):
@@ -641,6 +656,28 @@ class GenerateReqInput:
         else:
             raise ValueError("extra_key should be a list or a string.")
 
+    def _normalize_kv_hints(self):
+        if not isinstance(self.kv_hints, list):
+            return
+        if len(self.kv_hints) != self.batch_size:
+            raise ValueError(
+                "The length of kv_hints should be equal to the batch size."
+            )
+        self.kv_hints = self.kv_hints * self.parallel_sample_num
+
+    def _coerce_kv_hints(self):
+        if isinstance(self.kv_hints, dict):
+            self.kv_hints = msgspec.convert(self.kv_hints, type=KvHintEnvelope)
+        elif isinstance(self.kv_hints, list):
+            self.kv_hints = [
+                (
+                    msgspec.convert(hint, type=KvHintEnvelope)
+                    if isinstance(hint, dict)
+                    else hint
+                )
+                for hint in self.kv_hints
+            ]
+
     def _normalize_bootstrap_params(self, num):
         """Normalize bootstrap parameters for batch processing."""
         # Normalize bootstrap_host
@@ -757,6 +794,9 @@ class GenerateReqInput:
             routed_dp_rank=self.routed_dp_rank,
             disagg_prefill_dp_rank=self.disagg_prefill_dp_rank,
             conversation_id=self.conversation_id,
+            kv_hints=(
+                self.kv_hints[i] if isinstance(self.kv_hints, list) else self.kv_hints
+            ),
             http_worker_ipc=self.http_worker_ipc,
             priority=self.priority,
             extra_key=self.extra_key[i] if self.extra_key is not None else None,
@@ -870,6 +910,9 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # For observability
     # Pickled Optional[Union[APIServerReqTimeStats, DPControllerReqTimeStats]]
     time_stats: Optional[PickleWrapper] = None
+    # Provider-neutral KV cache intent. Keep new IPC fields at the end because
+    # BaseReq uses positional array-like encoding.
+    kv_hints: Optional[KvHintEnvelope] = None
 
     def wrap_pickle_fields(self):
         self.mm_inputs = wrap_as_pickle(self.mm_inputs)

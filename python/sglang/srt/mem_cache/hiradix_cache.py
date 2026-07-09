@@ -202,6 +202,8 @@ class HiRadixCache(RadixCache):
             1 if server_args.hicache_write_policy == "write_through" else 2
         )
         self.load_back_threshold = 10
+        self._retention_unsupported_logged = False
+        self._retention_apply_failed_logged = False
 
         # Detach storage backend automatically on process shutdown
         atexit.register(self.shutdown)
@@ -209,6 +211,68 @@ class HiRadixCache(RadixCache):
         self.evictable_host_leaves = set()
 
         super().__init__(params=params)
+
+    def apply_kv_hints(self, req) -> int:
+        """Apply bounded L3 retention intent after its prefix is committed."""
+        hints = getattr(req, "kv_hints", None)
+        retention = (
+            hints.get("retention", [])
+            if isinstance(hints, dict)
+            else getattr(hints, "retention", [])
+        )
+        backend = getattr(self.cache_controller, "storage_backend", None)
+        supported = (
+            retention
+            and self.enable_storage
+            and self.cache_controller.storage_backend_type == "mooncake"
+            and self.cache_controller.write_policy == "write_through"
+            and getattr(backend, "_can_use_group_semantics", lambda: False)()
+        )
+        if not supported:
+            if retention and not self._retention_unsupported_logged:
+                logger.warning(
+                    "Ignoring KV retention hints: requires HiCache write_through "
+                    "with Mooncake group semantics"
+                )
+                self._retention_unsupported_logged = True
+            return 0
+
+        accepted = 0
+        for hint in retention:
+            try:
+                prefix_tokens = (
+                    hint.get("prefix_tokens")
+                    if isinstance(hint, dict)
+                    else hint.prefix_tokens
+                )
+                ttl_seconds = (
+                    hint.get("ttl_seconds")
+                    if isinstance(hint, dict)
+                    else hint.ttl_seconds
+                )
+                prefix_tokens = min(int(prefix_tokens), len(req.origin_input_ids))
+                prefix_tokens -= prefix_tokens % self.page_size
+                if prefix_tokens <= 0 or int(ttl_seconds) <= 0:
+                    continue
+
+                key = RadixKey(
+                    req.origin_input_ids[:prefix_tokens],
+                    req.extra_key,
+                    is_bigram=self.is_eagle,
+                ).page_aligned(self.page_size)
+                match = self.match_prefix(MatchPrefixParams(key=key))
+                if len(match.device_indices) != len(key):
+                    continue
+                node = match.last_device_node
+                page_hashes = node.get_prefix_hash_values(node)
+                if len(page_hashes) != len(key) // self.page_size:
+                    continue
+                accepted += backend.retain_pages(page_hashes, int(ttl_seconds))
+            except Exception:
+                if not self._retention_apply_failed_logged:
+                    logger.warning("Failed to apply KV retention hint", exc_info=True)
+                    self._retention_apply_failed_logged = True
+        return accepted
 
     def _all_reduce_attn_groups(self, tensor: torch.Tensor, op):
         reduced = False

@@ -117,6 +117,9 @@ def maybe_cache_unfinished_req(req: Req, tree_cache: BasePrefixCache, **kwargs):
         return
 
     tree_cache.cache_unfinished_req(req, **kwargs)
+    apply_kv_hints = getattr(tree_cache, "apply_kv_hints", None)
+    if apply_kv_hints is not None:
+        apply_kv_hints(req)
 
 
 def write_cache_indices(
@@ -644,10 +647,11 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
             req.mamba_pool_idx = None
         return
 
-    tree_cache.cache_finished_req(
-        req,
-        is_insert=is_insert and not getattr(req, "skip_radix_cache_insert", False),
-    )
+    should_insert = is_insert and not getattr(req, "skip_radix_cache_insert", False)
+    tree_cache.cache_finished_req(req, is_insert=should_insert)
+    apply_kv_hints = getattr(tree_cache, "apply_kv_hints", None)
+    if should_insert and apply_kv_hints is not None:
+        apply_kv_hints(req)
 
     # StreamingSession.cache_finished_req handles speculative tail trim
     # and bookkeeping flag sync internally, then sets req_pool_idx = None.

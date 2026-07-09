@@ -1,7 +1,21 @@
 import copy
+import json
 import unittest
+from array import array
+from pathlib import Path
 
-from sglang.srt.managers.io_struct import GenerateReqInput
+import msgspec
+from pydantic import TypeAdapter
+
+from sglang.srt.managers.io_struct import (
+    GenerateReqInput,
+    KvHintEnvelope,
+    KvRetentionHint,
+    TokenizedGenerateReqInput,
+    _msgpack_decoder,
+    _msgpack_encoder,
+)
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import (
     register_amd_ci,
     register_cpu_ci,
@@ -50,6 +64,73 @@ class TestGenerateReqInputNormalization(CustomTestCase):
 
         # Check modalities
         self.assertEqual(req.modalities, ["image", "image"])
+
+    def test_kv_hints_match_cross_language_fixture(self):
+        fixture_path = Path(__file__).with_name("data") / "kv_hint_envelope.json"
+        fixture = json.loads(fixture_path.read_text())
+        hints = msgspec.convert(fixture["kv_hints"], type=KvHintEnvelope)
+
+        self.assertEqual(
+            hints.retention,
+            [
+                KvRetentionHint(prefix_tokens=2, ttl_seconds=300),
+                KvRetentionHint(prefix_tokens=4, ttl_seconds=3600),
+            ],
+        )
+
+        req = GenerateReqInput(
+            input_ids=[fixture["token_ids"], fixture["token_ids"]],
+            sampling_params=[{}, {}],
+            kv_hints=hints,
+        )
+        req.normalize_batch_and_arguments()
+        self.assertEqual(req[0].kv_hints, hints)
+        self.assertEqual(req[1].kv_hints, hints)
+
+        parsed = TypeAdapter(GenerateReqInput).validate_python(
+            {"input_ids": fixture["token_ids"], "kv_hints": fixture["kv_hints"]}
+        )
+        self.assertIsInstance(parsed.kv_hints, KvHintEnvelope)
+
+    def test_kv_hints_follow_parallel_sampling_expansion(self):
+        first = KvHintEnvelope(
+            retention=[KvRetentionHint(prefix_tokens=2, ttl_seconds=300)]
+        )
+        second = KvHintEnvelope(
+            retention=[KvRetentionHint(prefix_tokens=4, ttl_seconds=3600)]
+        )
+        req = GenerateReqInput(
+            input_ids=[[1, 2], [3, 4]],
+            sampling_params={"n": 2},
+            kv_hints=[first, second],
+        )
+
+        req.normalize_batch_and_arguments()
+
+        self.assertEqual(req.kv_hints, [first, second, first, second])
+
+    def test_tokenized_kv_hints_survive_ipc_round_trip(self):
+        hints = KvHintEnvelope(
+            retention=[KvRetentionHint(prefix_tokens=2, ttl_seconds=300)]
+        )
+        req = TokenizedGenerateReqInput(
+            input_text="",
+            input_ids=array("q", [1, 2]),
+            input_embeds=None,
+            mm_inputs=None,
+            token_type_ids=None,
+            sampling_params=SamplingParams(),
+            return_logprob=False,
+            logprob_start_len=0,
+            top_logprobs_num=0,
+            token_ids_logprob=None,
+            stream=False,
+            kv_hints=hints,
+        )
+
+        decoded = _msgpack_decoder.decode(_msgpack_encoder.encode(req))
+
+        self.assertEqual(decoded.kv_hints, hints)
 
     def test_list_of_images_to_list_of_lists(self):
         """Test that a list of images is converted to a list of single-image lists."""
