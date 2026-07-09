@@ -80,6 +80,18 @@ _AITER_GFX95_CK_W8A8_MAX_SAFE_M = {
 }
 
 
+class _MXFP4QuantizedData(MXFP4QuantizeUtil):
+    def __init__(
+        self,
+        original_shape: torch.Size,
+        original_dtype: torch.dtype,
+        quantized_data: torch.Tensor,
+    ):
+        self.original_shape = original_shape
+        self.original_dtype = original_dtype
+        self.quantized_data = quantized_data
+
+
 # Force CK bpreshuffle (not Triton) for the dense w8a8-block GEMMs (MLA q/kv/o
 # projections), to match ATOM (CK preshuffle; Triton FP8 blockscale is slower).
 # Default OFF; DeepseekV4 enables it via set_force_ck_w8a8(True). The env var
@@ -90,6 +102,22 @@ _FORCE_CK_W8A8: bool = False
 def set_force_ck_w8a8(enabled: bool = True) -> None:
     global _FORCE_CK_W8A8
     _FORCE_CK_W8A8 = enabled
+
+
+def materialize_bpreshuffle_fp8_scale(scale: torch.Tensor) -> torch.Tensor:
+    """Materialize the physical scale layout consumed by gfx95 bpreshuffle GEMM."""
+    return scale.t().contiguous().t() if scale.dim() == 2 else scale
+
+
+def materialize_bpreshuffle_fp8_scale_tuple(
+    value: Tuple[torch.Tensor, ...],
+) -> Tuple[torch.Tensor, ...]:
+    """Materialize the scale slot in FP8 ``(q_input, x_scale, ...)`` tuples."""
+    return (
+        value[0],
+        materialize_bpreshuffle_fp8_scale(value[1]),
+        *value[2:],
+    )
 
 
 def use_aiter_triton_gemm_w8a8_tuned_gfx950(n: int, k: int) -> bool:
@@ -855,16 +883,21 @@ def aiter_w8a8_block_fp8_linear(
     if input_scale is not None:
         q_input = input_2d
         x_scale = input_scale
+        if _use_aiter_bpreshuffle_gfx95 and not use_triton:
+            x_scale = materialize_bpreshuffle_fp8_scale(x_scale)
         # On ROCm >= 7.2, scale is in bpreshuffle's transposed layout.
         # Triton needs a row-major view, so adjust strides only. No copy.
-        if use_triton and _use_aiter_bpreshuffle_gfx95:
+        elif use_triton and _use_aiter_bpreshuffle_gfx95:
             x_scale = torch.as_strided(x_scale, x_scale.shape, (1, x_scale.shape[0]))
     else:
+        materialize_bpreshuffle_scale = _use_aiter_bpreshuffle_gfx95 and not use_triton
         q_input, x_scale = aiter_per1x128_quant(
             input_2d,
             quant_dtype=aiter.dtypes.fp8,
-            transpose_scale=(_use_aiter_bpreshuffle_gfx95 and not use_triton),
+            transpose_scale=False,
         )
+        if materialize_bpreshuffle_scale:
+            x_scale = materialize_bpreshuffle_fp8_scale(x_scale)
 
     if use_triton:
         gemm_a8w8_blockscale_op = triton_gemm_a8w8_blockscale
@@ -1281,6 +1314,30 @@ def block_quant_dequant(
     x_scale_repeat = x_scale_repeat[..., :n, :k]
 
     return (x_q_block.to(torch.float32) * x_scale_repeat).to(dtype)
+
+
+def quantize_block_fp8_weight_to_mxfp4(
+    fp8_weight: torch.Tensor,
+    fp8_scale: torch.Tensor,
+    weight_block_size: List[int],
+    mxfp4_block_size: int = 32,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    fp8_weight_dequant = block_quant_dequant(
+        fp8_weight,
+        fp8_scale.to(torch.float32),
+        weight_block_size,
+        torch.bfloat16,
+    )
+    fp4_weight, fp4_scale = _MXFP4QuantizedData.quantize(
+        fp8_weight_dequant, block_size=mxfp4_block_size
+    )
+    fp4_weight = fp4_weight.quantized_data
+    fp4_weight = fp4_weight.contiguous().view(torch.int8)
+    fp4_scale = fp4_scale.view(
+        *fp8_weight_dequant.shape[:-1],
+        fp8_weight_dequant.shape[-1] // mxfp4_block_size,
+    )
+    return fp4_weight, fp4_scale.contiguous().view(torch.float8_e8m0fnu)
 
 
 def requant_weight_ue8m0_inplace(weight, weight_scale_inv, weight_block_size):

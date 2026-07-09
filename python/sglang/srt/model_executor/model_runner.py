@@ -32,7 +32,6 @@ import torch
 import torch.distributed as dist
 from torch import nn
 
-from sglang.jit_kernel.ngram_embedding import update_token_table_decode
 from sglang.srt.configs import (
     BailingHybridConfig,
     FalconH1Config,
@@ -165,6 +164,9 @@ from sglang.srt.model_executor.hook_manager import register_forward_hooks
 from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
     ModelRunnerKVCacheMixin,
 )
+from sglang.srt.model_executor.ngram_token_table import (
+    update_ngram_token_table_after_sampling,
+)
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 from sglang.srt.model_executor.runner import (
     EagerRunner,
@@ -180,9 +182,12 @@ from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.platforms import current_platform
+from sglang.srt.runtime_context import get_flags, get_server_args
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-from sglang.srt.server_args import (
+from sglang.srt.server_args import (  # noqa: F401  (re-export)
+    CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS,
     ServerArgs,
+    add_chunked_prefix_cache_attention_backend,
     get_global_server_args,
     set_global_server_args_for_scheduler,
 )
@@ -268,16 +273,6 @@ MLA_ATTENTION_BACKENDS = [
     "intel_xpu",
 ]
 
-CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS = [
-    "flashinfer",
-    "fa3",
-    "fa4",
-    "flashmla",
-    "cutedsl_mla",
-    "cutlass_mla",
-    "trtllm_mla",
-    "tokenspeed_mla",
-]
 
 TORCH_DTYPE_TO_KV_CACHE_STR = {
     torch.float8_e4m3fn: "fp8_e4m3",
@@ -291,14 +286,6 @@ def add_mla_attention_backend(backend_name):
     if backend_name not in MLA_ATTENTION_BACKENDS:
         MLA_ATTENTION_BACKENDS.append(backend_name)
         logger.info(f"Added {backend_name} to MLA_ATTENTION_BACKENDS.")
-
-
-def add_chunked_prefix_cache_attention_backend(backend_name):
-    if backend_name not in CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS:
-        CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS.append(backend_name)
-        logger.info(
-            f"Added {backend_name} to CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS."
-        )
 
 
 # Detect stragger ranks in model loading
@@ -525,22 +512,36 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if server_args.show_time_cost:
             enable_show_time_cost()
 
-        # Model-specific adjustment
-        self.model_specific_adjustment()
+        # Chunked prefix caching requires an MLA model on a backend whose
+        # kernels read that layout. This is a load-time gate, not a
+        # resolution-time one: out-of-tree platforms register their supported
+        # backends in init_backend(), which runs when this module is imported
+        # — after ServerArgs.__post_init__. Target runner only: a draft
+        # model's (often non-MLA) config must not flip the shared setting.
+        if not self.is_draft_worker and (
+            not self.use_mla_backend
+            or server_args.attention_backend
+            not in CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS
+        ):
+            if not server_args.disable_chunked_prefix_cache:
+                server_args.override(
+                    "model_runner.chunked_prefix_cache_gate",
+                    disable_chunked_prefix_cache=True,
+                )
+        if not self.is_draft_worker and not server_args.disable_chunked_prefix_cache:
+            logger.info("Chunked prefix cache is turned on.")
 
-        # Set the global server_args in the scheduler process
-        set_global_server_args_for_scheduler(server_args)
-        global_server_args = get_global_server_args()
-
-        # FIXME: hacky set `use_mla_backend`
-        global_server_args.use_mla_backend = self.use_mla_backend
+        # Set the global server_args in the scheduler process (target worker
+        # only, so a draft init cannot clobber target-derived global state).
+        if not self.is_draft_worker:
+            set_global_server_args_for_scheduler(server_args)
 
         # Init OpenMP threads binding for CPU
         if self.device == "cpu":
             self.init_threads_binding()
 
         # Set float32 matmul precision
-        if server_args.enable_tf32_matmul:
+        if get_server_args().enable_tf32_matmul:
             torch.set_float32_matmul_precision("high")
 
         # Get available memory before model loading.
@@ -1127,60 +1128,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 f"Failed to register transfer engine info for tp_rank={self.tp_rank}: {e}"
             )
 
-    def model_specific_adjustment(self):
-        server_args = self.server_args
-
-        # HRM-Text needs bidirectional prompt attention (prefill), which only the
-        # Triton backend honors and only with cuda graph / chunked prefill off
-        # (TritonAttnBackend.allow_bidirectional_attention_in_extend). Radix cache
-        # is also unsafe: the recurrent forward writes direction-dependent KV
-        # across many slots.
-        hf_config = self.model_config.hf_config
-        is_hrm_text = getattr(
-            hf_config, "model_type", None
-        ) == "hrm_text" or "HrmTextForCausalLM" in getattr(
-            hf_config, "architectures", []
-        )
-        # prefix_lm defaults to True upstream; defaulting False would skip the
-        # bidirectional-attention forcing and silently produce junk output.
-        is_prefix_lm_recurrent = is_hrm_text and getattr(hf_config, "prefix_lm", True)
-        if is_prefix_lm_recurrent:
-            if server_args.attention_backend not in (None, "triton"):
-                logger.warning(
-                    f"Overriding --attention-backend "
-                    f"{server_args.attention_backend!r} -> 'triton': only the "
-                    "Triton backend supports HRM-Text's bidirectional prefix "
-                    "attention."
-                )
-            server_args.attention_backend = "triton"
-            server_args.chunked_prefill_size = -1
-            server_args.disable_radix_cache = True
-            server_args.disable_cuda_graph = True
-            logger.warning(
-                "HRM-Text (prefix_lm) detected: forcing --attention-backend "
-                "triton, --chunked-prefill-size -1, --disable-radix-cache, and "
-                "--disable-cuda-graph for correctness of the bidirectional "
-                "prompt attention."
-            )
-
-        if self.is_multimodal:
-            if not self.is_multimodal_chunked_prefill_supported:
-                server_args.chunked_prefill_size = -1
-                logger.info(
-                    f"Automatically turn off --chunked-prefill-size as it is not supported for "
-                    f"{self.model_config.hf_config.model_type}"
-                )
-
-        if (
-            not self.use_mla_backend
-            or server_args.attention_backend
-            not in CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS
-        ):
-            server_args.disable_chunked_prefix_cache = True
-
-        if not server_args.disable_chunked_prefix_cache:
-            log_info_on_rank0(logger, "Chunked prefix cache is turned on.")
-
     def check_quantized_moe_compatibility(self):
         if (
             quantization_config := getattr(
@@ -1319,7 +1266,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if is_npu():
                 register_sgl_tp_rank(self.gpu_id)
 
-            # Pre-warm NCCL/RCCL to eliminate cold-start latency in first request
+            # Pre-warm NCCL/RCCL/HCCL to eliminate cold-start latency in first request
             # Controlled by --pre-warm-nccl flag (default: enabled on AMD GPUs)
             if self.server_args.pre_warm_nccl and (
                 self.tp_size > 1 or self.pp_size > 1 or self.moe_ep_size > 1
@@ -1327,14 +1274,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 warmup_start = time.perf_counter()
                 tp_group_handle = get_tp_group().device_group
 
-                # Single warmup all_reduce to initialize NCCL/RCCL communicator
+                # Single warmup all_reduce to initialize NCCL/RCCL/HCCL communicator
                 warmup_tensor = torch.zeros(1, device=torch.cuda.current_device())
                 dist.all_reduce(warmup_tensor, group=tp_group_handle)
                 current_platform.synchronize()
 
                 warmup_elapsed = time.perf_counter() - warmup_start
                 logger.info(
-                    f"NCCL/RCCL warmup completed in {warmup_elapsed:.3f}s "
+                    f"NCCL/RCCL/HCCL warmup completed in {warmup_elapsed:.3f}s "
                     f"(tp_size={self.tp_size}, pp_size={self.pp_size}, ep_size={self.moe_ep_size})"
                 )
 
@@ -1425,7 +1372,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 logger.info(
                     "Compute capability below sm80. Use float16 due to lack of bfloat16 support."
                 )
-                self.server_args.dtype = "float16"
+                from sglang.srt.arg_groups.overrides import (
+                    declare_load_time_override,
+                )
+
+                declare_load_time_override(
+                    "ModelRunner._sm80_dtype_fallback", {"dtype": "float16"}
+                )
                 self.model_config.dtype = torch.float16
                 if torch.cuda.get_device_capability()[1] < 5:
                     raise RuntimeError("SGLang only supports sm75 and above.")
@@ -1883,8 +1836,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 return False, message
 
         self.model = model
-        self.server_args.model_path = model_path
-        self.server_args.load_format = load_format
+        self.server_args.override(
+            "model_runner.update_weights",
+            model_path=model_path,
+            load_format=load_format,
+        )
         self.load_config = load_config
 
         if recapture_cuda_graph and (
@@ -2417,6 +2373,25 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         result = self._get_linear_attn_registry_result()
         return result[1] if result else None
 
+    def _record_kv_cache_dtype(self, resolved: str) -> None:
+        # Load-time resolution transition: the weight-resolved kv-cache dtype
+        # is declared into the flags tier; the dual-apply inside the helper
+        # replaces the legacy in-place write. Mock runners whose server_args
+        # is not the published object keep the plain write.
+        from sglang.srt.runtime_context import get_context
+
+        if get_context()._server_args is self.server_args:
+            from sglang.srt.arg_groups.overrides import declare_load_time_override
+
+            declare_load_time_override(
+                "ModelRunner.configure_kv_cache_dtype",
+                {"kv_cache_dtype": resolved},
+            )
+        else:
+            self.server_args.override(
+                "ModelRunner.configure_kv_cache_dtype", kv_cache_dtype=resolved
+            )
+
     def configure_kv_cache_dtype(self):
         if self.server_args.kv_cache_dtype == "auto":
             quant_config = getattr(self.model, "quant_config", None)
@@ -2425,16 +2400,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 isinstance(kv_cache_quant_algo, str)
                 and kv_cache_quant_algo.upper() == "FP8"
             ):
-                if _is_hip:
-                    self.kv_cache_dtype = fp8_dtype
-                    self.server_args.kv_cache_dtype = TORCH_DTYPE_TO_KV_CACHE_STR[
-                        self.kv_cache_dtype
-                    ]
-                else:
-                    self.kv_cache_dtype = torch.float8_e4m3fn
-                    self.server_args.kv_cache_dtype = TORCH_DTYPE_TO_KV_CACHE_STR[
-                        self.kv_cache_dtype
-                    ]
+                self.kv_cache_dtype = fp8_dtype if _is_hip else torch.float8_e4m3fn
+                self._record_kv_cache_dtype(
+                    TORCH_DTYPE_TO_KV_CACHE_STR[self.kv_cache_dtype]
+                )
             else:
                 self.kv_cache_dtype = self.dtype
         elif self.server_args.kv_cache_dtype == "fp8_e5m2":
@@ -2462,6 +2431,22 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             raise ValueError(
                 f"Unsupported kv_cache_dtype: {self.server_args.kv_cache_dtype}."
             )
+
+        # DFLASH: fa4 draft attention can't read the target's fp8 KV (needs K.dtype == Q.dtype),
+        # so give the fa4 draft its own compute-dtype KV. fp8-capable backends keep the target dtype.
+        if (
+            self.is_draft_worker
+            and self.spec_algorithm.is_dflash()
+            and self.server_args.speculative_draft_attention_backend == "fa4"
+            and self.kv_cache_dtype != self.dtype
+        ):
+            logger.info(
+                "DFLASH fa4 draft: overriding KV cache dtype %s -> %s "
+                "(fa4 needs K.dtype == Q.dtype; cannot read the target's quantized KV).",
+                self.kv_cache_dtype,
+                self.dtype,
+            )
+            self.kv_cache_dtype = self.dtype
 
     def init_cublas(self):
         """We need to run a small matmul to init cublas. Otherwise, it will raise some errors later."""
@@ -2586,15 +2571,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         ngram_embedding_info = forward_batch.ngram_embedding_info
         if ngram_embedding_info is None:
             return
-        ngram_embedding_info.out_column_starts[: forward_batch.batch_size] = (
-            forward_batch.seq_lens
-        )
-        ngram_embedding_info.out_req_lens[: forward_batch.batch_size] = 1
-        update_token_table_decode(
-            ne_token_table=ngram_embedding_info.token_table,
-            tokens=next_token_ids.to(torch.int32),
-            row_indices=forward_batch.req_pool_indices,
-            column_starts=ngram_embedding_info.out_column_starts,
+        update_ngram_token_table_after_sampling(
+            ngram_embedding_info=ngram_embedding_info,
+            next_token_ids=next_token_ids,
+            req_pool_indices=forward_batch.req_pool_indices,
+            seq_lens=forward_batch.seq_lens,
+            batch_size=forward_batch.batch_size,
         )
 
     def init_decode_cuda_graph(self):
@@ -2614,7 +2596,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         ):
             return
 
-        if self.device == "cpu" and not self.server_args.enable_torch_compile:
+        if self.device == "cpu" and not get_flags().capture.enable_torch_compile:
             return
 
         tic = time.perf_counter()
@@ -2735,12 +2717,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.model.model = resolve_language_model(self.model)
         language_model = getattr(self.model, "language_model", self.model)
 
-        # Resolve model with layers: handle CausalLM wrapper (.model.layers) and direct TextModel (.layers)
-        if hasattr(language_model, "model") and hasattr(language_model.model, "layers"):
-            layer_model = language_model.model
-        elif hasattr(language_model, "layers"):
-            layer_model = language_model
-        else:
+        # Find the module that owns the decoder `layers`. Models wrap it at
+        # varying depths: a direct text model exposes `.layers`, a CausalLM
+        # wraps it as `.model.layers`, and some multimodal models add another
+        # level (e.g. DeepSeek-OCR: OCR wrapper -> Deepseek*ForCausalLM ->
+        # text model -> `.layers`). Descend the `.model` chain until we find it.
+        layer_model = language_model
+        while not hasattr(layer_model, "layers") and hasattr(layer_model, "model"):
+            layer_model = layer_model.model
+
+        if not hasattr(layer_model, "layers"):
             logger.warning(
                 "Disable prefill CUDA graph because the model does not have a 'layers' attribute"
             )
