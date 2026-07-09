@@ -4544,8 +4544,6 @@ class TestEntrypointDpAttentionMissingAlias:
             "attn_tp_size": 1,
             "attn_dp_rank": tp_rank,
             "attn_dp_size": 2,
-            "local_attn_dp_rank": tp_rank,
-            "local_attn_dp_size": 2,
             "attn_cp_rank": 0,
             "attn_cp_size": 1,
         }

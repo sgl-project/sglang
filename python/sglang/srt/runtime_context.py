@@ -81,6 +81,8 @@ _PARALLEL_FIELDS = frozenset(
         "attn_cp_rank",
         "attn_dp_size",
         "attn_dp_rank",
+        "dcp_size",
+        "dcp_rank",
         "world_group",
         "tp_group",
         "pp_group",
@@ -89,6 +91,7 @@ _PARALLEL_FIELDS = frozenset(
         "moe_tp_group",
         "attn_tp_group",
         "attn_cp_group",
+        "dcp_group",
     }
 )
 
@@ -184,6 +187,14 @@ class ParallelContext:
         return self._v("attn_cp_rank", _ps().get_attn_context_model_parallel_rank)
 
     @property
+    def dcp_size(self) -> int:
+        return self._v("dcp_size", _ps().get_dcp_world_size)
+
+    @property
+    def dcp_rank(self) -> int:
+        return self._v("dcp_rank", _ps().get_dcp_rank)
+
+    @property
     def attn_dp_size(self) -> int:
         return self._v("attn_dp_size", _dp().get_attention_dp_size)
 
@@ -222,6 +233,10 @@ class ParallelContext:
     @property
     def attn_cp_group(self) -> Any:
         return self._v("attn_cp_group", _ps().get_attn_cp_group)
+
+    @property
+    def dcp_group(self) -> Any:
+        return self._v("dcp_group", _ps().get_dcp_group)
 
 
 class _FlagGroupBase:
@@ -304,6 +319,11 @@ class DpFlags(_FlagGroupBase):
     # Hybrid-SSM models materialize idle ranks via the MAX_LEN fabricated-row
     # conversion (set when hf_config has hybrid_override_pattern).
     max_len_with_idle: bool = False
+    # DP gathered-buffer allocation metadata (model hidden size / dtype /
+    # device), set by initialize_dp_attention alongside the flags above.
+    buffer_hidden_size: Any = None
+    buffer_dtype: Any = None
+    buffer_device: Any = None
 
 
 @dataclasses.dataclass
@@ -346,19 +366,143 @@ class Resources(_FlagGroupBase):
     # Persistent reusable CUDA events for non-EP DP TBO, keyed by
     # (kind, subbatch) — see dp_attention._tbo_event for why reuse matters.
     tbo_event_pool: dict = dataclasses.field(default_factory=dict)
+    # State capturers (installed by their subsystems when capture is on).
+    indexer_capturer: Any = None
+    experts_capturer: Any = None
+    # The shared TCPStore created during distributed initialization.
+    tcp_store: Any = None
+    # Trace verbosity; the accessor seeds it lazily from SGLANG_TRACE_LEVEL.
+    trace_level: Any = None
+
+
+class ForwardFlags:
+    """Per-forward runtime flags with one API and two backings.
+
+    Flags read only from eager Python are backed by context variables, so
+    nested scopes and threads stay isolated (a new thread sees the defaults).
+    Flags that are read or written *inside torch.compile-traced model code*
+    (``_GRAPH_VISIBLE``) are backed by plain dict slots instead: dynamo
+    cannot trace ``ContextVar.get``/``set``, while plain reads it guards on
+    — the storage form these flags had before joining the tier. Their
+    writers and readers are single-threaded per process (TBO interleaves
+    ubatches on one thread; attention-TP input scattering excludes TBO), so
+    context isolation is not needed for correctness.
+
+    ``scoped(**kw)`` — the one regular write path — restores on exit for
+    both backings. ``set()`` exists for the legacy unscoped setters' shims.
+    """
+
+    _DEFAULTS = {
+        "multi_stream": False,
+        "moe_output_buffer": None,
+        # Attention-TP input-scattering (set per forward by
+        # AttnTpContext.maybe_input_scattered / set_attn_inputs).
+        "attn_input_scattered": False,
+        "attn_inputs": None,
+        # Sticky across forwards: every ForwardBatch construction writes it;
+        # graph runners force False around capture.
+        "is_extend_in_batch": False,
+    }
+
+    # Read/written inside compiled graphs (vocab embedding, communicator,
+    # EP dispatch, DP gather/scatter): plain-slot backed. Before moving a
+    # flag out of this set, prove no read/write site sits under
+    # torch.compile.
+    _GRAPH_VISIBLE = frozenset(
+        {
+            "attn_input_scattered",
+            "attn_inputs",
+            "is_extend_in_batch",
+        }
+    )
+
+    __slots__ = ("_vars", "_plain")
+
+    def __init__(self):
+        import contextvars
+
+        object.__setattr__(
+            self,
+            "_plain",
+            {
+                name: default
+                for name, default in self._DEFAULTS.items()
+                if name in self._GRAPH_VISIBLE
+            },
+        )
+        object.__setattr__(
+            self,
+            "_vars",
+            {
+                name: contextvars.ContextVar(f"forward.{name}", default=default)
+                for name, default in self._DEFAULTS.items()
+                if name not in self._GRAPH_VISIBLE
+            },
+        )
+
+    def __getattr__(self, name: str) -> Any:
+        plain = self._plain
+        if name in plain:
+            return plain[name]
+        try:
+            return self._vars[name].get()
+        except KeyError:
+            raise AttributeError(
+                f"ForwardFlags has no flag '{name}' (flags are declared in "
+                "ForwardFlags._DEFAULTS; check for typos)"
+            ) from None
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        raise AttributeError(
+            "ForwardFlags is written through scoped(**kw) (or the legacy "
+            "set() shim), never by attribute assignment"
+        )
+
+    def set(self, name: str, value: Any) -> None:
+        """Unscoped write for legacy setter shims; persists until the next
+        write (current context only, for contextvar-backed flags)."""
+        if name in self._plain:
+            self._plain[name] = value
+        else:
+            self._vars[name].set(value)
+
+    @contextmanager
+    def scoped(self, **kwargs):
+        """Set flags for the current scope, restoring on exit. Transactional
+        (keys validated before any write) and exception-safe."""
+        unknown = set(kwargs) - set(self._DEFAULTS)
+        if unknown:
+            raise ValueError(f"unknown forward flag(s): {sorted(unknown)}")
+        plain_saved = [
+            (name, self._plain[name]) for name in kwargs if name in self._plain
+        ]
+        tokens = []
+        for name, value in kwargs.items():
+            if name in self._plain:
+                self._plain[name] = value
+            else:
+                tokens.append((self._vars[name], self._vars[name].set(value)))
+        try:
+            yield self
+        finally:
+            for var, token in reversed(tokens):
+                var.reset(token)
+            for name, value in reversed(plain_saved):
+                self._plain[name] = value
 
 
 class RuntimeContext:
     """Container for the structured runtime accessors; exposes ``parallel``,
-    ``server_args``, ``flags``, and ``resources``."""
+    ``server_args``, ``flags``, ``resources``, and ``forward``."""
 
-    __slots__ = ("parallel", "_server_args", "flags", "resources")
+    __slots__ = ("parallel", "_server_args", "flags", "resources", "forward")
 
     def __init__(self, parallel: ParallelContext):
         self.parallel = parallel
         self._server_args: ServerArgs | None = None
         self.flags = Flags()
         self.resources = Resources()
+        self.forward = ForwardFlags()
 
     def get_stream(self, name: str) -> Any:
         """Named process-level CUDA side stream: get-or-create, shared by
@@ -414,6 +558,87 @@ class RuntimeContext:
         )
         self._server_args = server_args
 
+    def override_server_args(self, **fields) -> _ServerArgsOverride:
+        """Test-only scoped override for the config tier — the sibling of
+        ``get_parallel().override()`` and the flag groups' ``override()``:
+        tests force execution paths by overriding the context instead of
+        hand-building config objects.
+
+        ``install()`` (or entering it as a context manager) publishes a fresh
+        dummy-boundary ``ServerArgs`` carrying ``fields`` and returns it;
+        ``restore()`` (or exiting) reinstates whatever the slot held before.
+
+        Transitional — to be deprecated: it exists because production code
+        still branches on raw ``server_args`` fields at runtime, so forcing a
+        path needs a full config in the slot. As those readers migrate onto
+        the named runtime tiers (flags / resources / forward), prefer the
+        finer-grained overrides; once they cover the branching surface this
+        override loses its clients and goes away.
+        """
+        return _ServerArgsOverride(self, fields)
+
+
+class _ServerArgsOverride:
+    """Scoped config override (see ``RuntimeContext.override_server_args``).
+
+    Deliberately a plain class rather than a generator context manager:
+    fixtures that live for a whole test case install the override without a
+    ``with`` block, and a suspended generator would run its restore whenever
+    the garbage collector closes it — un-publishing the active config at a
+    nondeterministic point.
+    """
+
+    __slots__ = ("_context", "_fields", "_previous", "_previous_capture", "_installed")
+
+    def __init__(self, context: RuntimeContext, fields: dict):
+        self._context = context
+        self._fields = fields
+        self._previous: ServerArgs | None = None
+        self._previous_capture = False
+        self._installed = False
+
+    def install(self) -> ServerArgs:
+        """Publish a fresh dummy-boundary ``ServerArgs`` carrying the
+        overrides (written through ``ServerArgs.override`` for provenance);
+        returns the published instance."""
+        from sglang.srt.server_args import ServerArgs
+
+        assert not self._installed, "override_server_args already installed"
+        self._previous = self._context._server_args
+        self._previous_capture = self._context.flags.capture.enable_torch_compile
+        server_args = ServerArgs(model_path="dummy")
+        if self._fields:
+            server_args.override(source="test-override", **self._fields)
+        # The dummy boundary skips materialization, which would leave the
+        # strict mutation guard unarmed on the published object — mark it
+        # materialized so bare post-publish writes raise like they do on a
+        # fully resolved config.
+        object.__setattr__(server_args, "_declarations_materialized", True)
+        self._context.set_server_args(server_args)
+        self._installed = True
+        return server_args
+
+    def restore(self) -> None:
+        """Reinstate the previously published config (or the empty slot)."""
+        if not self._installed:
+            return
+        self._installed = False
+        previous, self._previous = self._previous, None
+        if previous is None:
+            self._context._server_args = None
+        else:
+            self._context.set_server_args(previous)
+        # set_server_args reseeds the capture tier from the published object
+        # (and the empty-slot path does not touch it at all); the snapshot
+        # puts back the exact pre-install runtime state either way.
+        self._context.flags.capture.enable_torch_compile = self._previous_capture
+
+    def __enter__(self) -> ServerArgs:
+        return self.install()
+
+    def __exit__(self, *exc) -> None:
+        self.restore()
+
 
 _PARALLEL = ParallelContext()
 _CONTEXT = RuntimeContext(parallel=_PARALLEL)
@@ -439,6 +664,10 @@ def get_resources() -> Resources:
     return _CONTEXT.resources
 
 
+def get_forward() -> ForwardFlags:
+    return _CONTEXT.forward
+
+
 def get_stream(name: str) -> Any:
     return _CONTEXT.get_stream(name)
 
@@ -460,3 +689,4 @@ def reset_context() -> None:
     _CONTEXT._server_args = None
     _CONTEXT.flags = Flags()
     _CONTEXT.resources = Resources()
+    _CONTEXT.forward = ForwardFlags()

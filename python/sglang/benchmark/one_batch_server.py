@@ -19,6 +19,7 @@ import json
 import random
 import re
 import time
+from functools import lru_cache
 from types import SimpleNamespace
 from typing import Callable, List, Optional, Tuple
 
@@ -121,6 +122,8 @@ class BenchArgs:
     profile_output_dir: Optional[str] = None
     dataset_path: str = ""
     dataset_name: str = "random"
+    fixed_prompt_file: str = ""
+    apply_chat_template: bool = False
     gsp_num_groups: int = 1
     gsp_system_prompt_len: int = 2048
     gsp_question_len: int = 128
@@ -217,6 +220,19 @@ class BenchArgs:
             default=BenchArgs.dataset_name,
             choices=["mmmu", "random", "random-ids", "generated-shared-prefix"],
             help="Name of the dataset to benchmark on.",
+        )
+        parser.add_argument(
+            "--fixed-prompt-file",
+            type=str,
+            default=BenchArgs.fixed_prompt_file,
+            help="Use this file's prompt for every request in the batch, "
+            "bypassing --dataset-name.",
+        )
+        parser.add_argument(
+            "--apply-chat-template",
+            action="store_true",
+            help="Encode the prompt as a single user message through the "
+            "model's chat template. Requires --fixed-prompt-file.",
         )
         parser.add_argument(
             "--gsp-num-groups",
@@ -467,6 +483,51 @@ def _flush_cache_with_retry(url: str, endpoint: str, max_retries: int = 3):
         time.sleep(2)
 
 
+# FIXME: this mirrors the chat-encoding dispatch in
+# serving_chat._resolve_chat_encoding_spec (DeepSeek-V4 custom encoding vs HF
+# chat template) so the benchmark reproduces the serving token stream. Unify
+# the dispatch into a shared resolver instead of duplicating it client-side.
+@lru_cache(maxsize=None)
+def _is_deepseek_v4_model(name_or_path: str) -> bool:
+    from transformers import AutoConfig
+
+    from sglang.srt.configs.model_config import is_deepseek_v4
+
+    try:
+        hf_config = AutoConfig.from_pretrained(name_or_path, trust_remote_code=True)
+    except Exception as e:
+        print(
+            f"Warning: could not load config for {name_or_path!r} ({e}); "
+            "assuming a non-DeepSeek-V4 model for --apply-chat-template."
+        )
+        return False
+    return is_deepseek_v4(hf_config)
+
+
+def _encode_fixed_prompt(
+    tok_inner, prompt_text: str, apply_chat_template: bool
+) -> List[int]:
+    if not apply_chat_template:
+        return tok_inner.encode(prompt_text)
+
+    messages = [{"role": "user", "content": prompt_text}]
+    # DeepSeek-V4 chat encoding does not go through the HF chat template; use
+    # its own encoder so the token stream matches /v1/chat/completions.
+    if _is_deepseek_v4_model(getattr(tok_inner, "name_or_path", "") or ""):
+        from sglang.srt.entrypoints.openai import encoding_dsv4
+
+        real_input = encoding_dsv4.encode_messages(messages, thinking_mode="chat")
+        return tok_inner.encode(real_input)
+    if getattr(tok_inner, "chat_template", None) is None:
+        raise ValueError(
+            "--apply-chat-template requires a tokenizer with a chat template, "
+            f"but {getattr(tok_inner, 'name_or_path', tok_inner)!r} has none."
+        )
+    return tok_inner.apply_chat_template(
+        messages, add_generation_prompt=True, tokenize=True
+    )
+
+
 def run_one_case(
     url: str,
     batch_size: int,
@@ -500,6 +561,8 @@ def run_one_case(
     lora_name: Optional[List[str]] = None,
     lora_request_distribution: str = BenchArgs.lora_request_distribution,
     lora_zipf_alpha: float = BenchArgs.lora_zipf_alpha,
+    fixed_prompt_file: str = "",
+    apply_chat_template: bool = False,
 ):
     if backend == "vllm":
         # You need to have export VLLM_SERVER_DEV_MODE=1 in your environment to use this endpoint.
@@ -507,51 +570,60 @@ def run_one_case(
     else:
         _flush_cache_with_retry(url, "/flush_cache")
 
-    # Load input token ids via benchmark.datasets.get_dataset
-    supported_datasets = ("random", "random-ids", "mmmu", "generated-shared-prefix")
-    if dataset_name not in supported_datasets:
-        raise ValueError(
-            f"Unsupported dataset for batch benchmark: {dataset_name}. "
-            f"Supported: {supported_datasets}"
-        )
-
-    actual_gsp_groups = min(gsp_num_groups, batch_size)
-    dataset_args = SimpleNamespace(
-        dataset_name=dataset_name,
-        num_prompts=batch_size,
-        random_input_len=input_len,
-        random_output_len=output_len,
-        random_range_ratio=1.0,
-        dataset_path=dataset_path,
-        tokenize_prompt=dataset_name not in ("mmmu", "generated-shared-prefix"),
-        backend=backend,
-        seed=BenchArgs.seed,
-        gsp_num_groups=actual_gsp_groups,
-        gsp_prompts_per_group=(batch_size + actual_gsp_groups - 1) // actual_gsp_groups,
-        gsp_system_prompt_len=gsp_system_prompt_len,
-        gsp_question_len=gsp_question_len,
-        gsp_output_len=gsp_output_len,
-        # The generated-shared-prefix dataset's from_args requires these; the
-        # batch-bench path only ever uses the uniform group distribution.
-        gsp_group_distribution="uniform",
-        gsp_zipf_alpha=None,
-    )
-    tok_inner = getattr(tokenizer, "tokenizer", tokenizer)
-    dataset_model_id = model_name or getattr(tok_inner, "name_or_path", None)
-    input_requests = get_dataset(dataset_args, tokenizer, model_id=dataset_model_id)
-
-    if dataset_name == "generated-shared-prefix":
-        input_requests = input_requests[:batch_size]
-        input_ids = [tokenizer.encode(req.prompt) for req in input_requests]
-        input_len = sum(len(ids) for ids in input_ids) // len(input_ids)
-        output_len = gsp_output_len
+    if fixed_prompt_file:
+        tok_inner = getattr(tokenizer, "tokenizer", tokenizer)
+        with open(fixed_prompt_file) as f:
+            prompt_ids = _encode_fixed_prompt(tok_inner, f.read(), apply_chat_template)
+        input_ids = [list(prompt_ids) for _ in range(batch_size)]
+        input_len = len(prompt_ids)
         image_data = None
-    elif dataset_name == "mmmu":
-        input_ids = [tok_inner.encode(req.prompt) for req in input_requests]
-        image_data = [req.image_data for req in input_requests]
     else:
-        input_ids = [req.prompt for req in input_requests]
-        image_data = None
+        # Load input token ids via benchmark.datasets.get_dataset
+        supported_datasets = ("random", "random-ids", "mmmu", "generated-shared-prefix")
+        if dataset_name not in supported_datasets:
+            raise ValueError(
+                f"Unsupported dataset for batch benchmark: {dataset_name}. "
+                f"Supported: {supported_datasets}"
+            )
+
+        actual_gsp_groups = min(gsp_num_groups, batch_size)
+        dataset_args = SimpleNamespace(
+            dataset_name=dataset_name,
+            num_prompts=batch_size,
+            random_input_len=input_len,
+            random_output_len=output_len,
+            random_range_ratio=1.0,
+            dataset_path=dataset_path,
+            tokenize_prompt=dataset_name not in ("mmmu", "generated-shared-prefix"),
+            backend=backend,
+            seed=BenchArgs.seed,
+            gsp_num_groups=actual_gsp_groups,
+            gsp_prompts_per_group=(batch_size + actual_gsp_groups - 1)
+            // actual_gsp_groups,
+            gsp_system_prompt_len=gsp_system_prompt_len,
+            gsp_question_len=gsp_question_len,
+            gsp_output_len=gsp_output_len,
+            # The generated-shared-prefix dataset's from_args requires these; the
+            # batch-bench path only ever uses the uniform group distribution.
+            gsp_group_distribution="uniform",
+            gsp_zipf_alpha=None,
+        )
+        tok_inner = getattr(tokenizer, "tokenizer", tokenizer)
+        dataset_model_id = model_name or getattr(tok_inner, "name_or_path", None)
+        input_requests = get_dataset(dataset_args, tokenizer, model_id=dataset_model_id)
+
+        if dataset_name == "generated-shared-prefix":
+            input_requests = input_requests[:batch_size]
+            input_ids = [tokenizer.encode(req.prompt) for req in input_requests]
+            input_len = sum(len(ids) for ids in input_ids) // len(input_ids)
+            output_len = gsp_output_len
+            image_data = None
+        elif dataset_name == "mmmu":
+            input_ids = [tok_inner.encode(req.prompt) for req in input_requests]
+            image_data = [req.image_data for req in input_requests]
+        else:
+            input_ids = [req.prompt for req in input_requests]
+            image_data = None
 
     # Build payload based on backend
     if backend == "vllm":
@@ -979,6 +1051,13 @@ def run_benchmark_internal(
         bench_args.lora_zipf_alpha > 1
     ), f"--lora-zipf-alpha must be > 1, got {bench_args.lora_zipf_alpha}"
 
+    if bench_args.apply_chat_template and not bench_args.fixed_prompt_file:
+        raise ValueError(
+            "--apply-chat-template requires --fixed-prompt-file: the other "
+            "datasets generate token ids directly, so there is no prompt text "
+            "to run through a chat template."
+        )
+
     gsp_kwargs = dict(
         gsp_num_groups=bench_args.gsp_num_groups,
         gsp_system_prompt_len=bench_args.gsp_system_prompt_len,
@@ -1013,6 +1092,8 @@ def run_benchmark_internal(
                 lora_name=bench_args.lora_name,
                 lora_request_distribution=bench_args.lora_request_distribution,
                 lora_zipf_alpha=bench_args.lora_zipf_alpha,
+                fixed_prompt_file=bench_args.fixed_prompt_file,
+                apply_chat_template=bench_args.apply_chat_template,
                 **gsp_kwargs,
             )
         print("=" * 8 + " Warmup End   " + "=" * 8 + "\n")
@@ -1056,6 +1137,8 @@ def run_benchmark_internal(
                     lora_name=bench_args.lora_name,
                     lora_request_distribution=bench_args.lora_request_distribution,
                     lora_zipf_alpha=bench_args.lora_zipf_alpha,
+                    fixed_prompt_file=bench_args.fixed_prompt_file,
+                    apply_chat_template=bench_args.apply_chat_template,
                     **gsp_kwargs,
                 )
             )
