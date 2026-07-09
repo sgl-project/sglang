@@ -226,17 +226,35 @@ class MambaAttnBackendBase(AttentionBackend):
         forward_batch: ForwardBatch,
         in_capture: bool = False,
     ):
+        if in_capture and forward_batch.forward_mode.is_extend_without_speculative():
+            # Full-prefill-backend capture: capture_prepare puts real tokens
+            # only in slot 0; slots 1..bs-1 are permanent zero-length
+            # sentinels (see PrefillCudaGraphRunner.capture_prepare). Poison
+            # their mamba cache indices to -1 instead of leaving them at
+            # req_pool slot 0's (zero-initialized / possibly live) mapping,
+            # which would otherwise alias every sentinel row onto the same
+            # mamba cache slot during the dummy capture forward. Decode
+            # capture has no such sentinel concept (every capture slot is a
+            # real dummy request), so it keeps num_padding=0 below.
+            num_padding = forward_batch.batch_size - 1
+        elif in_capture:
+            num_padding = 0
+        else:
+            num_padding = getattr(forward_batch, "num_padding", None)
         self.forward_metadata = self._replay_metadata(
             forward_batch.batch_size,
             forward_batch.req_pool_indices,
             forward_batch.forward_mode,
             forward_batch.spec_info,
             forward_batch.seq_lens_cpu if not in_capture else None,
-            num_padding=(
-                0 if in_capture else getattr(forward_batch, "num_padding", None)
-            ),
+            num_padding=num_padding,
             in_capture=in_capture,
             mamba_track_indices=getattr(forward_batch, "mamba_track_indices", None),
+            # Only the Full prefill backend's EXTEND replay needs these; the
+            # decode replay view (a SimpleNamespace, see build_replay_fb_view)
+            # doesn't carry extend_* fields at all, so fall back to None.
+            extend_start_loc=getattr(forward_batch, "extend_start_loc", None),
+            extend_seq_lens=getattr(forward_batch, "extend_seq_lens", None),
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -365,21 +383,54 @@ class MambaAttnBackendBase(AttentionBackend):
             max_num_tokens % max_bs == 0
         ), f"max_num_tokens={max_num_tokens} must be divisible by max_bs={max_bs}"
         draft_token_num = max_num_tokens // max_bs
-        # Per-bs static write-cursor / force-flush buffers, captured by pointer +
-        # refreshed in-place each replay; sized like state_indices_list. None when off.
+        # This backend instance is shared by the prefill and decode cuda-graph
+        # runners (both point at model_runner.attn_backend) and each calls
+        # this method independently with its own max_bs -- e.g. the Full
+        # prefill backend's request-slot count vs decode's capture bs.
+        # state_indices_list / query_start_loc_list / mamba_track_indices_buf
+        # are read by pointer inside already-captured graphs, so entries that
+        # exist must never be reallocated or overwritten here, only extended.
+        prev_max_bs = len(self.state_indices_list)
+        if max_bs > prev_max_bs:
+            if self.mamba_track_indices_buf is None:
+                # int64 to match DecodeInputBuffers.mamba_track_indices + the
+                # track-save kernel's int64 index load. Refreshed in-place by
+                # _replay_metadata.
+                self.mamba_track_indices_buf = torch.zeros(
+                    (max_bs,), dtype=torch.int64, device=self.device
+                )
+            elif self.mamba_track_indices_buf.shape[0] < max_bs:
+                grown = torch.zeros((max_bs,), dtype=torch.int64, device=self.device)
+                grown[:prev_max_bs].copy_(self.mamba_track_indices_buf)
+                self.mamba_track_indices_buf = grown
+            for i in range(prev_max_bs, max_bs):
+                self.state_indices_list.append(
+                    torch.full(
+                        (i + 1,),
+                        self.pad_slot_id,
+                        dtype=torch.int32,
+                        device=self.device,
+                    )
+                )
+                self.query_start_loc_list.append(
+                    torch.zeros((i + 2,), dtype=torch.int32, device=self.device)
+                )
+            self.cached_cuda_graph_decode_query_start_loc = torch.arange(
+                0, max_bs + 1, dtype=torch.int32, device=self.device
+            )
+
+        # The retrieve_*/replayssm_* tables are draft_token_num-shaped and are
+        # only read by decode's target-verify / GDN-replayssm-ring replay
+        # path, never by a captured prefill (EXTEND) graph, so it is safe to
+        # fully rebuild them on every call -- the last caller's draft_token_num
+        # (i.e. decode's, since decode is always constructed/captured after
+        # prefill) wins.
         self.replayssm_write_pos_list = [] if self._replayssm_enabled() else None
         self.replayssm_force_flush_list = [] if self._replayssm_enabled() else None
-        # int64 to match DecodeInputBuffers.mamba_track_indices + the track-save
-        # kernel's int64 index load. Refreshed in-place by _replay_metadata.
-        self.mamba_track_indices_buf = torch.zeros(
-            (max_bs,), dtype=torch.int64, device=self.device
-        )
+        self.retrieve_next_token_list = []
+        self.retrieve_next_sibling_list = []
+        self.retrieve_parent_token_list = []
         for i in range(max_bs):
-            self.state_indices_list.append(
-                torch.full(
-                    (i + 1,), self.pad_slot_id, dtype=torch.int32, device=self.device
-                )
-            )
             if self.replayssm_write_pos_list is not None:
                 self.replayssm_write_pos_list.append(
                     torch.zeros((i + 1,), dtype=torch.int32, device=self.device)
@@ -388,9 +439,6 @@ class MambaAttnBackendBase(AttentionBackend):
                 self.replayssm_force_flush_list.append(
                     torch.zeros((i + 1,), dtype=torch.int32, device=self.device)
                 )
-            self.query_start_loc_list.append(
-                torch.zeros((i + 2,), dtype=torch.int32, device=self.device)
-            )
             self.retrieve_next_token_list.append(
                 torch.zeros(
                     (i + 1, draft_token_num), dtype=torch.int32, device=self.device
@@ -406,9 +454,6 @@ class MambaAttnBackendBase(AttentionBackend):
                     (i + 1, draft_token_num), dtype=torch.int32, device=self.device
                 )
             )
-        self.cached_cuda_graph_decode_query_start_loc = torch.arange(
-            0, max_bs + 1, dtype=torch.int32, device=self.device
-        )
         self.cached_cuda_graph_verify_query_start_loc = torch.arange(
             0,
             max_bs * draft_token_num + 1,
@@ -499,6 +544,8 @@ class MambaAttnBackendBase(AttentionBackend):
         num_padding: Optional[int] = None,
         in_capture: bool = False,
         mamba_track_indices: Optional[torch.Tensor] = None,
+        extend_start_loc: Optional[torch.Tensor] = None,
+        extend_seq_lens: Optional[torch.Tensor] = None,
     ):
         if num_padding is None:
             if seq_lens_cpu is None:
@@ -611,6 +658,17 @@ class MambaAttnBackendBase(AttentionBackend):
                 self.query_start_loc_list[bs - 1][bs - num_padding :].fill_(
                     (bs - num_padding) * spec_info.draft_token_num
                 )
+        elif forward_mode.is_extend_without_speculative():
+            # Full-prefill-backend EXTEND capture/replay: mirror the eager
+            # _forward_metadata EXTEND branch, but write into the static
+            # per-bs buffer (captured graphs read query_start_loc_list by
+            # pointer) instead of allocating a fresh tensor.
+            assert (
+                extend_start_loc is not None and extend_seq_lens is not None
+            ), "EXTEND cuda-graph replay requires extend_start_loc/extend_seq_lens"
+            qsl = self.query_start_loc_list[bs - 1]
+            qsl[:bs].copy_(extend_start_loc)
+            qsl[bs].copy_(extend_start_loc[-1] + extend_seq_lens[-1])
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
 

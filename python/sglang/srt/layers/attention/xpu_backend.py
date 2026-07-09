@@ -1050,24 +1050,38 @@ class XPUAttentionBackend(AttentionBackend):
         init_forward_metadata_capture_cuda_graph /
         init_forward_metadata_replay_cuda_graph pair).
 
-        Called by DecodeCudaGraphRunner:
+        Called by DecodeCudaGraphRunner (decode/idle) and by
+        PrefillCudaGraphRunner's FullXPUGraphBackend path (plain EXTEND):
           - capture: in_capture=True  → bind static metadata buffer slices, then fill
           - replay:  in_capture=False → update pre-allocated buffers in-place
           - eager:   via init_forward_metadata() default wrapper
         """
+        spec_info = forward_batch.spec_info
+        assert (
+            spec_info is None
+        ), "XPUAttentionBackend does not support speculative decoding in XPU graph"
+
+        forward_mode = forward_batch.forward_mode
+        if forward_mode.is_extend():
+            self._init_full_cg_prefill_metadata(forward_batch, in_capture)
+            return
+
+        assert forward_mode.is_decode_or_idle(), (
+            "XPUAttentionBackend XPU graph only supports decode/idle mode or "
+            "plain EXTEND (full prefill graph) mode"
+        )
+        self._init_full_cg_decode_metadata(forward_batch, in_capture)
+
+    def _init_full_cg_decode_metadata(
+        self,
+        forward_batch: ForwardBatch,
+        in_capture: bool,
+    ):
+        """Capture/replay metadata for decode/idle mode under XPU full graph."""
         bs = forward_batch.batch_size
         req_pool_indices = forward_batch.req_pool_indices
         seq_lens = forward_batch.seq_lens
         seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
-        forward_mode = forward_batch.forward_mode
-        spec_info = forward_batch.spec_info
-
-        assert (
-            spec_info is None
-        ), "XPUAttentionBackend does not support speculative decoding in XPU graph"
-        assert (
-            forward_mode.is_decode_or_idle()
-        ), "XPUAttentionBackend XPU graph only supports decode mode"
 
         if in_capture:
             # Bind static-shape slices of the pre-allocated buffers so the
@@ -1198,6 +1212,76 @@ class XPUAttentionBackend(AttentionBackend):
                 metadata.swa_page_table = swa_page_table[:bs, :]
 
         self.forward_metadata = metadata
+
+    def _init_full_cg_prefill_metadata(
+        self,
+        forward_batch: ForwardBatch,
+        in_capture: bool,
+    ):
+        """Capture/replay metadata for plain EXTEND under XPU full prefill
+        graph. Mirrors CUDA's FlashAttentionBackend._init_full_cg_prefill_metadata,
+        plus page_size > 1 support (CUDA's version is page_size=1 only; the
+        `intel_xpu` attention backend forces page_size into {64, 128} — or
+        {16, 32, 64, 128} for MLA — via
+        arg_groups/overrides.py::_intel_xpu_page_constraint, so page_size=1
+        essentially never happens here and must be supported):
+
+        - all tensors live in dedicated preallocated buffers (the captured
+          kernels hold their addresses; refilled in place each replay);
+        - cu_seqlens_q gets its own buffer (never aliased to cu_seqlens_k,
+          unlike the eager no-prefix path) so prefix replays stay correct;
+        - max_seq_len_q / max_seq_len_k are baked at capture as upper bounds
+          (num_tokens in this bucket / max_context_len): the kernel reads real
+          work extents from the cu_seqlens / cache_seqlens device buffers;
+        - page_table is page-granularity (one column per `page_size` tokens),
+          converted from the token-granularity req_to_token table via strided
+          sampling + integer division, exactly like _init_full_cg_decode_metadata.
+        """
+        bs = forward_batch.batch_size
+        if in_capture and getattr(self, "full_cg_prefill_metadata", None) is None:
+            device = forward_batch.seq_lens.device
+            max_num_pages = (
+                self.max_context_len + self.page_size - 1
+            ) // self.page_size
+            m = FlashAttentionMetadata()
+            m.cache_seqlens_int32 = torch.zeros((bs,), dtype=torch.int32, device=device)
+            m.cu_seqlens_q = torch.zeros((bs + 1,), dtype=torch.int32, device=device)
+            m.cu_seqlens_k = torch.zeros((bs + 1,), dtype=torch.int32, device=device)
+            m.page_table = torch.zeros(
+                (bs, max_num_pages), dtype=torch.int32, device=device
+            )
+            self.full_cg_prefill_metadata = m
+            self.full_cg_prefill_strided_indices = torch.arange(
+                0, self.max_context_len, self.page_size, device=device
+            )
+        m = self.full_cg_prefill_metadata
+        assert m is not None and bs == m.cache_seqlens_int32.shape[0], (
+            "full-CG prefill metadata must be created at capture with the same "
+            "fixed request-slot count used at replay"
+        )
+
+        seq_lens = forward_batch.seq_lens[:bs]
+        m.cache_seqlens_int32.copy_(seq_lens.to(torch.int32))
+        m.cu_seqlens_k[1:].copy_(torch.cumsum(seq_lens.to(torch.int32), dim=0))
+        m.cu_seqlens_q[1:].copy_(
+            torch.cumsum(forward_batch.extend_seq_lens[:bs].to(torch.int32), dim=0)
+        )
+        max_seq_len_k = int(forward_batch.seq_lens_cpu[:bs].max().item())
+        if max_seq_len_k > 0:
+            num_pages = (max_seq_len_k + self.page_size - 1) // self.page_size
+            raw_page = self.req_to_token_pool.req_to_token[
+                forward_batch.req_pool_indices[:bs][:, None],
+                self.full_cg_prefill_strided_indices[:num_pages][None, :],
+            ]
+            if self.page_size > 1:
+                raw_page = raw_page // self.page_size
+            m.page_table[:, :num_pages].copy_(raw_page.to(torch.int32))
+            m.page_table[:, num_pages:].zero_()
+        if in_capture:
+            # Baked into the captured kernel launches; upper bounds only.
+            m.max_seq_len_q = forward_batch.positions.numel()
+            m.max_seq_len_k = self.max_context_len
+        self.forward_metadata = m
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
         """Graph-recordable ops for XPU graph (no-op: all metadata setup is

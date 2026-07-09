@@ -108,7 +108,16 @@ class ShortConvAttnBackend(MambaAttnBackendBase):
 
     def _alloc_cache_indices_buf(self, max_bs: int):
         # Persistent int64 index buffer, refilled in place per step so the
-        # captured (cuda or cpu) graph reads a stable address.
+        # captured (cuda or cpu) graph reads a stable address. This backend
+        # may have init_cuda_graph_state called more than once (prefill and
+        # decode graph runners share the same backend instance), so only grow
+        # the buffer -- reallocating it would strand any already-captured
+        # graph's baked-in pointer to the old storage.
+        if (
+            self._cache_indices_buf is not None
+            and self._cache_indices_buf.shape[0] >= max_bs
+        ):
+            return
         self._cache_indices_buf = torch.empty(
             max_bs, dtype=torch.int64, device=self.device
         )
