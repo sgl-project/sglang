@@ -1,0 +1,84 @@
+# MI355X Kimi-K2.6 (FP8) 2-node 1P1D disaggregation recipe (DIAGNOSTIC:
+# non-MTP with decode split-KV forced to nsplit=1).
+#
+# Tests whether the triton MLA decode split-KV online-softmax reduction is the
+# source of the non-MTP disagg GSM8K drop (~0.88 vs single-node 0.947). The
+# split-KV reduction is DECODE-ONLY (extend/verify use no split-KV -> stay
+# ~0.95) and reduces partial softmax states across KV splits over the long
+# MORI-transferred prefix — a plausible precision-loss site.
+#
+# Forces a single KV split (no cross-split reduction):
+#   * --triton-attention-num-kv-splits 1      -> base max_kv_splits = 1
+#   * SGLANG_DEBUG_MLA_DECODE_NO_SPLIT_CAP    -> skip the MLA split floor that
+#                                                would otherwise raise it back up
+#   * SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS -> static fill (every seq = 1)
+# If accuracy returns to ~0.94, the split-KV reduction is the culprit.
+#
+# Consumed by:
+#   * scripts/ci/slurm/process_result.py reads `resources` and
+#     `backend.sglang_config` (TP/EP/DP + worker counts) for the summary table.
+#   * scripts/ci/slurm/launch_mi355x.sh reads `runtime`, `bench`, `model`, `mtp`.
+
+resources:
+  prefill_workers: 1
+  decode_workers: 1
+
+backend:
+  sglang_config:
+    prefill:
+      tensor-parallel-size: 8
+      expert-parallel-size: 1
+      data-parallel-size: 1
+    decode:
+      tensor-parallel-size: 8
+      expert-parallel-size: 1
+      data-parallel-size: 1
+
+model:
+  env:
+    SGLANG_USE_AITER: 1
+    SGLANG_ROCM_FUSED_DECODE_MLA: 0
+    # Force decode nsplit=1 (see triton_backend _mla_decode_kv_splits_cap).
+    SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS: true
+    SGLANG_DEBUG_MLA_DECODE_NO_SPLIT_CAP: true
+  server_args:
+    - --model-loader-extra-config
+    - '{"enable_multithread_load": true}'
+    - --watchdog-timeout
+    - 1200
+    - --reasoning-parser
+    - kimi_k2
+    - --tool-call-parser
+    - kimi_k2
+    # Base number of KV splits = 1; combined with the no-split-cap env this
+    # keeps decode at a single KV split.
+    - --triton-attention-num-kv-splits
+    - 1
+
+runtime:
+  image: lmsysorg/sglang-rocm:v0.5.13.post1-rocm720-mi35x-20260623
+  prefill_attention_backend: aiter
+  decode_attention_backend: triton
+  ib_devices: rdma0,rdma1,rdma2,rdma3
+  prefill_port: 30025
+  decode_port: 30026
+  prefill_bootstrap_port: 8998
+  decode_bootstrap_port: 9001
+  lb_port: 8000
+  mem_fraction_static: 0.90
+  page_size: 256
+  max_running_requests: 256
+  chunked_prefill_size: 8192
+
+bench:
+  # Diagnostic run: only the GSM8K accuracy gate matters, so the perf sweep is
+  # trimmed to a single concurrency to keep the cluster allocation short.
+  concurrencies: [1]
+  num_prompts_factor: 4
+  random_range_ratio: 1.0
+
+  accuracy:
+    enabled: true
+    num_shots: 8
+    num_questions: 1319
+    threshold: 0.92
