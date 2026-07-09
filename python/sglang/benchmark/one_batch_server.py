@@ -491,11 +491,13 @@ def _flush_cache_with_retry(url: str, endpoint: str, max_retries: int = 3):
 def _is_deepseek_v4_model(name_or_path: str) -> bool:
     from transformers import AutoConfig
 
+    from sglang.srt.configs.model_config import is_deepseek_v4
+
     try:
         hf_config = AutoConfig.from_pretrained(name_or_path, trust_remote_code=True)
     except Exception:
         return False
-    return any("DeepseekV4" in arch for arch in (hf_config.architectures or []))
+    return is_deepseek_v4(hf_config)
 
 
 def _encode_fixed_prompt(
