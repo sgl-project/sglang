@@ -48,6 +48,7 @@ Some other notes:
     c4_sparse: means "compressed by 4" but only attend to top-512 tokens.
                all related length will be clipped to 512.
 """
+_LARGE_INDEXER_QUERY_THRESHOLD = 11673
 
 
 def copy_metadata(
@@ -95,12 +96,28 @@ def copy_metadata(
 
 
 @dataclass
+class NonPagedIndexerPlan:
+    page_table: torch.Tensor
+    gather_seq_lens: torch.Tensor
+    ks: torch.Tensor
+    ke: torch.Tensor
+    seq_len_sum: int
+    max_seq_len: int
+    max_seqlen_k: int
+    query_rows: int
+
+
+@dataclass
 class PagedIndexerMetadata:
     page_size: int
     page_table: torch.Tensor
     c4_seq_lens: torch.Tensor
+    use_prefill_cuda_graph: bool = False
     deep_gemm_metadata: Any = field(init=False, repr=False)
     topk_metadata: torch.Tensor = field(init=False, repr=False)
+    nonpaged_plan: Optional[NonPagedIndexerPlan] = field(
+        init=False, repr=False, default=None
+    )
 
     def __post_init__(self):
         if (
@@ -112,7 +129,11 @@ class PagedIndexerMetadata:
         else:
             import deep_gemm
 
-            if envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.get():
+            use_jit_indexer = (
+                envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.get()
+                or self.c4_seq_lens.numel() > _LARGE_INDEXER_QUERY_THRESHOLD
+            )
+            if use_jit_indexer:
                 from sglang.jit_kernel.dsv4 import get_paged_mqa_logits_metadata
             else:
                 from deep_gemm import get_paged_mqa_logits_metadata
@@ -151,21 +172,22 @@ class PagedIndexerMetadata:
     def max_c4_seq_len(self) -> int:
         return self.page_table.shape[1] * self.c4_page_size
 
-    def copy_(self, other: "PagedIndexerMetadata"):
+    def copy_(self, other: PagedIndexerMetadata):
         if is_hip():
             copy_fields = ["page_table", "c4_seq_lens"]
-            assign_fields = ["deep_gemm_metadata"]
+            assign_fields = ["deep_gemm_metadata", "nonpaged_plan"]
         else:
             copy_fields = ["page_table", "c4_seq_lens", "deep_gemm_metadata"]
-            assign_fields = []
+            assign_fields = ["nonpaged_plan"]
         copy_fields += ["topk_metadata"]
         copy_metadata(
             src=other,
             dst=self,
-            check_eq_fields=["page_size"],
+            check_eq_fields=["page_size", "use_prefill_cuda_graph"],
             copy_fields=copy_fields,
             assign_fields=assign_fields,
         )
+        self.nonpaged_plan = None
 
 
 def maybe_copy_inplace(dst, *, src) -> None:

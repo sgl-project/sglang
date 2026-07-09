@@ -1,9 +1,129 @@
 ---
 title: DeepSeek-V4
-metatags:
-    description: "Deploy DeepSeek-V4 with SGLang — a next-generation MoE model from DeepSeek."
+description: "Deploy DeepSeek-V4 with SGLang — verified launch commands, benchmarks, and tuning for the Flash (284B) and Pro (1.6T) Mixture-of-Experts models."
 tag: NEW
 ---
+
+## Deployment
+
+<a id="install" />
+
+<Accordion title="Install SGLang">
+
+For all methods and hardware platforms, see the [official SGLang installation guide](../../../docs/get-started/install). The two paths below match the **Python / Docker** toggle in the command panel.
+
+<Tabs>
+
+<Tab title="Python (pip / uv)">
+
+```bash Command
+pip install --upgrade pip
+pip install uv
+uv pip install sglang
+```
+
+Then run the **Python** output of the command panel below in that environment.
+
+</Tab>
+
+<Tab title="Docker">
+
+For how to launch the image, see [Install → Method 3: Using Docker](../../../docs/get-started/install#method-3-using-docker). A minimal example (substitute the inner `sglang serve ...` with whatever the command generator below produces):
+
+**NVIDIA GPUs**
+
+A single image — `lmsysorg/sglang:latest` — covers the **datacenter GPUs** in this cookbook (B200 / B300 / GB200 / GB300 / H100 / H200 / RTX PRO 6000).
+
+```bash Command
+docker pull lmsysorg/sglang:latest
+
+docker run --gpus all \
+    --shm-size 32g \
+    -p 30000:30000 \
+    -v ~/.cache/huggingface:/root/.cache/huggingface \
+    --env "HF_TOKEN=<your-hf-token>" \
+    --ipc=host \
+    lmsysorg/sglang:latest \
+    sglang serve <use args below>
+```
+
+**AMD GPUs (ROCm)**
+
+AMD uses the daily-updated `lmsysorg/sglang-rocm` images. You can find the latest images on [Docker Hub](https://hub.docker.com/r/lmsysorg/sglang-rocm/tags). We recommend the ROCm 7.2 version.
+
+For example:
+- **MI355X** → `lmsysorg/sglang-rocm:v0.5.13.post1-rocm720-mi35x-20260623`
+- **MI300X** → `lmsysorg/sglang-rocm:v0.5.13.post1-rocm720-mi30x-20260623`
+
+```bash Command
+docker pull lmsysorg/sglang-rocm:v0.5.13.post1-rocm720-mi35x-20260623
+
+docker run \
+    --device=/dev/kfd --device=/dev/dri \
+    --group-add video \
+    --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
+    --shm-size 32g --ipc=host \
+    -p 30000:30000 \
+    -v ~/.cache/huggingface:/root/.cache/huggingface \
+    --env "HF_TOKEN=<your-hf-token>" \
+    lmsysorg/sglang-rocm:v0.5.13.post1-rocm720-mi35x-20260623 \
+    sglang serve <use args below>
+```
+
+</Tab>
+
+</Tabs>
+
+</Accordion>
+
+Pick your hardware + recipe to generate the launch command. The three serving strategies cover the common operating points:
+
+- **Low-Latency** — fastest reply for a single user. Pick for chat.
+- **Balanced** — good speed with several users at once. Use for typical multi-user serving.
+- **High-Throughput** — most tokens per second across many users. Best for batch jobs.
+
+import { Deployment } from "/src/snippets/_deployment.jsx";
+import { config }     from "/src/snippets/configs/deepseek-ai/deepseek-v4.jsx";
+import { benchmarks } from "/src/snippets/configs/deepseek-ai/deepseek-v4-benchmarks.jsx";
+
+<Deployment config={config} benchmarks={benchmarks} />
+
+<Note>
+  For a runnable end-to-end example, see the [DeepSeek-V4-Flash demo notebook](https://github.com/sgl-project/sglang/blob/main/docs_new/demo/deepseek_v4_flash.ipynb).
+</Note>
+
+<div style={{fontSize: "0.85em", lineHeight: "1.55", color: "#6b7280", margin: "0.5rem 0 1rem 0"}}>
+  <p style={{margin: "0 0 0.3rem 0"}}><strong>Panel controls</strong> (top of the command box):</p>
+  <ul style={{margin: 0, paddingLeft: "1.25rem"}}>
+    <li style={{marginBottom: "0.2rem"}}><strong>Python / Docker</strong> — bare <code>sglang serve …</code> for an existing SGLang env, or a <code>docker run … sglang serve …</code> wrap against the per-hardware image from the <a href="#install">Install SGLang</a> panel above.</li>
+    <li style={{marginBottom: "0.2rem"}}><strong>⧉ Copy</strong> — copies the current command (with whichever framing is active) to your clipboard.</li>
+    <li style={{marginBottom: "0.2rem"}}><strong>$ cURL</strong> — a sample request against <code>localhost:30000</code> to confirm the server is up.</li>
+    <li style={{marginBottom: "0.2rem"}}><strong>⚙ Env</strong> — edits the placeholders (<code>HOST_IP</code>, <code>PORT</code>, <code>HF_TOKEN</code>, <code>NODE_RANK</code>, <code>NODE0_IP</code>) the command and cURL share. Persists in localStorage across cookbooks.</li>
+    <li><strong>Verified / Not Verified</strong> badge — green when the <code>(hw, variant, quant, strategy, nodes)</code> combo has been run end-to-end on real hardware; yellow when auto-derived from a neighbor and not yet re-checked.</li>
+  </ul>
+</div>
+
+## Playground
+
+The Playground is where you experiment with **SGLang features beyond the verified matrix**. The Deploy panel above only emits combinations the SGLang team has signed off on; the Playground lets you turn on additional knobs on top of whichever cell the Deploy panel is currently showing. The base is read live from your Deploy selection — only your overrides change.
+
+The knobs come in two flavors:
+
+- **Built-in SGLang features** — parallelism overrides (TP / CP / DP-Attention — DP-Attention's value is the DP degree, with `off` to disable), MoE backend + EP, reasoning / tool-call parsers, speculative-decoding presets, prefill/decode disaggregation, HiCache tiers, and HiSparse hierarchical sparse attention (decode-role only — the card appears once PD-Disagg mode is set to decode).
+- **DeepSeek-V4 specific features** — MegaMoE W4A8 / W4A4 fused kernel (Blackwell only).
+
+Lines highlighted **green** are added by your overrides; lines with **red strikethrough** were in the verified base but stripped by an override. When no override differs from the base cell, the playground inherits the base's **Verified** badge; any actual change flips it to **Not Verified** until the new configuration is run end-to-end and submitted back.
+
+import { Playground } from "/src/snippets/_playground.jsx";
+
+<Playground config={config} />
+
+<div style={{fontSize: "0.85em", lineHeight: "1.55", color: "#6b7280", margin: "0.5rem 0 1rem 0"}}>
+  <p style={{margin: "0 0 0.3rem 0"}}><strong>Panel controls</strong> reuse <strong>Python / Docker</strong> · <strong>⧉ Copy</strong> · <strong>$ cURL</strong> · <strong>⚙ Env</strong> from the Deploy panel, plus one extra:</p>
+  <ul style={{margin: 0, paddingLeft: "1.25rem"}}>
+    <li><strong>Submit ↗</strong> — opens a pre-filled GitHub issue so you can land your override combo as a new verified cookbook cell. Shown only while the badge says <strong>Not Verified</strong>; click it once you've actually run the command on your hardware and confirmed it works.</li>
+  </ul>
+</div>
 
 ## 1. Model Introduction
 
@@ -29,82 +149,32 @@ tag: NEW
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong><a href="https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash">DeepSeek-V4-Flash</a></strong></td>
       <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.05)"}}><strong>284B</strong></td>
       <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.02)"}}>13B</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>single-node serving: B200 / GB200 / GB300 / H200 on 4 GPUs</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>single-node serving on B200 / B300 / GB200 / GB300 / H200 (TP=4); H100 (TP=8)</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong><a href="https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro">DeepSeek-V4-Pro</a></strong></td>
       <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.05)"}}><strong>1.6T</strong></td>
       <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.02)"}}>49B</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>high-capacity: B200 8 GPU / GB200 8 GPU (2 nodes) / GB300 4 GPU / H200 8 GPU (FP4) or 16 GPU (SGLang FP8)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>high-capacity: B200 / B300 (TP=8) · GB300 (TP=4) · H200 FP4 (TP=8) · GB200 (2-node, TP=8) · H200 FP8 (2-node, TP=16) · H100 (2-node, TP=16)</td>
     </tr>
   </tbody>
 </table>
 
-The Instruct repos ship **FP4 MoE experts + FP8 attention / dense** (one mixed-precision checkpoint covers all GPUs that support FP4). The Base (pre-trained only) variants — `DeepSeek-V4-Flash-Base`, `DeepSeek-V4-Pro-Base` — ship pure FP8 mixed and are **not** for chat / tool calling.
+Both Instruct repos ship as **FP4 MoE experts + FP8 attention / dense** (one mixed-precision checkpoint covers every FP4-capable GPU). Matching `*-Base` repos ship pure FP8 mixed and are for further pre-training only — not for chat or tool calling.
 
-**Key Features** (per the official model card):
+**Highlights:** hybrid CSA + HCA attention (~27% inference FLOPs / ~10% KV cache vs DSv3.2 at 1M context), manifold-constrained hyper-connections (mHC), Muon optimizer, **1M-token context** (32T+ pre-training tokens), three reasoning modes (*Non-think* / *Think High* / *Think Max* — use ≥ 384K context for Think Max), and a dedicated `encoding_dsv4.encode_messages` Python encoder + DSML tool-call grammar.
 
-- **Hybrid Attention Architecture** — combines Compressed Sparse Attention (CSA) and Heavily Compressed Attention (HCA) for long-context efficiency. At 1M-token context, DeepSeek-V4-Pro uses only ~27% of per-token inference FLOPs and ~10% of KV cache compared with DeepSeek-V3.2.
-- **Manifold-Constrained Hyper-Connections (mHC)** — strengthens residual connections, improving signal-propagation stability across layers while preserving expressivity.
-- **Muon optimizer** — faster convergence and greater training stability.
-- **Context length: 1M tokens**; pre-trained on 32T+ diverse, high-quality tokens.
-- **Three reasoning modes**: *Non-think* (fast, intuitive responses), *Think High* (conscious logical analysis, slower but more accurate), *Think Max* (push reasoning to its fullest extent). Recommend a ≥ 384K context window when running Think Max.
-- Ships with a dedicated `encoding_dsv4.encode_messages` Python encoder + DSML tool-call grammar (`<｜DSML｜tool_calls>` / `<｜DSML｜invoke>` / `<｜DSML｜parameter>`).
+**Recommended generation:** `temperature=1.0`, `top_p=1.0`.
 
-**Recommended Generation Parameters:** `temperature=1.0`, `top_p=1.0` (per the official model card).
+**Resources:** HuggingFace · [Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash) · [Pro](https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro)  ·  ModelScope · [Flash](https://modelscope.cn/models/deepseek-ai/DeepSeek-V4-Flash) · [Pro](https://modelscope.cn/models/deepseek-ai/DeepSeek-V4-Pro).
 
-**License:** MIT.
-
-**Resources:**
-
-- HuggingFace: [DeepSeek-V4-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash), [DeepSeek-V4-Pro](https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro)
-- ModelScope: [DeepSeek-V4-Flash](https://modelscope.cn/models/deepseek-ai/DeepSeek-V4-Flash), [DeepSeek-V4-Pro](https://modelscope.cn/models/deepseek-ai/DeepSeek-V4-Pro)
-
-## 2. SGLang Installation
-
-SGLang offers multiple installation methods. Choose based on your hardware platform.
-
-Please refer to the [official SGLang installation guide](../../../docs/get-started/install) for installation instructions.
-
-**Docker Image:** Use `lmsysorg/sglang:latest` for all supported hardware platforms (B300 / B200 / GB200 / GB300 / H200 / H100).
-
-```bash Command
-docker pull lmsysorg/sglang:latest
-```
-
-For how to actually launch the image, see [Install → Method 3: Using Docker](../../../docs/get-started/install#method-3-using-docker). A minimal example (substitute the inner `sglang serve ...` with whatever the [command generator](#3-model-deployment) below produces):
-
-```bash Command
-docker run --gpus all \
-    --shm-size 32g \
-    -p 30000:30000 \
-    -v ~/.cache/huggingface:/root/.cache/huggingface \
-    --env "HF_TOKEN=<your-hf-token>" \
-    --ipc=host \
-    lmsysorg/sglang:latest \
-    sglang serve <use args below>
-```
-
-## 3. Model Deployment
-
-SGLang supports three main serving recipes for DeepSeek-V4 with different latency/throughput trade-offs (`low-latency`, `balanced`, `max-throughput`), plus specialized recipes for long-context (`cp`, prefill context-parallel) and prefill/decode disaggregation (`pd-disagg`). The interactive generator below emits the exact launch command for any `(hardware, variant, recipe)` combination.
-
-
-### 3.1 Basic Configuration
-
-**Interactive Command Generator**: Use the selector below to generate the deployment command for your hardware + recipe combination.
-
-import { DeepSeekV4Deployment } from "/src/snippets/autoregressive/deepseek-v4-deployment.jsx";
-
-<DeepSeekV4Deployment />
-
-### 3.2 Configuration Tips
+## 2. Configuration Tips
 
 {/* TODO: expand this section as more recipes are validated end-to-end. */}
 
 **Concurrency & DeepEP dispatch buffer**
 
-Must hold: `max-running-requests × MTP_draft_tokens ≤ SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK`. Violating it blows DeepEP's dispatch buffer at steady-state load (`deep_ep.cpp:1105`). When tuning, move `--cuda-graph-max-bs`, `--max-running-requests`, and the env together.
+Must hold: `max-running-requests × MTP_draft_tokens ≤ SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK`. Violating it blows DeepEP's dispatch buffer at steady-state load (`deep_ep.cpp:1105`). When tuning, move `--cuda-graph-max-bs-decode`, `--max-running-requests`, and the env together.
 
 The generator currently picks values on the **conservative** side (mirroring an internal stress-test matrix). They run safely out of the box but likely leave throughput on the table — please tune them up toward your actual workload's peak concurrency and report findings back so the defaults can be revised.
 
@@ -112,30 +182,136 @@ The generator currently picks values on the **conservative** side (mirroring an 
 
 - `low-latency`: steps=3, draft-tokens=4 → largest win at bs=1.
 - `balanced`: steps=1, draft-tokens=2 → gentler MTP, reduces throughput hit at higher batch.
-- `max-throughput`: MTP disabled — at saturation the verify step costs more than it saves.
-- MTP currently requires `SGLANG_ENABLE_SPEC_V2=1`.
+- `high-throughput`: MTP disabled — at saturation the verify step costs more than it saves.
+- MTP runs on the v2 speculative path.
+
+**Compressed attention state dtype**
+
+DeepSeek-V4 uses hybrid compressed attention for long-context efficiency. `SGLANG_DSV4_COMPRESS_STATE_DTYPE` controls the dtype of the C4 / C128 compressed attention state pools. Supported values are `float32` / `fp32` (default: `float32`) and `bfloat16` / `bf16`. For BF16 on the offline compression path:
+
+```bash Command
+SGLANG_DSV4_COMPRESS_STATE_DTYPE=bf16 \
+sglang serve \
+  --model-path deepseek-ai/DeepSeek-V4-Flash \
+  <other args>
+```
+
+This BF16 setting applies only to the compressed attention state pools and reduces the GPU memory footprint of each compressed-state slot. It does not change model weight precision or the main KV cache dtype. With automatic pool sizing and no explicit capacity cap, the same memory budget holds more slots, and the startup log shows larger `c4_state` and `c128_state` pool sizes. Keep the default `float32` setting for the most conservative behavior.
+
+**EPLB + DeepEP Waterfill (Experimental)**
+
+For recorded/static EPLB reproduction, first record an expert-distribution file by following
+[Capture expert selection distribution in MoE models](../../../docs/basic_usage/native_api.mdx#capture-expert-selection-distribution-in-moe-models).
+For reproduction runs, use the generated `expert_distribution_recorder_*.pt` as
+the initial expert location. **Please checkout to latest main branch for this feature.**
+
+For non-PD reproduction, use:
+
+```bash Command
+--moe-a2a-backend deepep \
+--deepep-mode auto \
+--init-expert-location /path/to/expert_distribution_recorder_*.pt \
+--enable-deepep-waterfill
+```
+
+For PD-Disagg reproduction, use `normal` mode on the prefill server and
+`low_latency` mode on the decode server. Add the same `--init-expert-location`
+flag to both commands:
+
+```bash Command
+# prefill
+--moe-a2a-backend deepep \
+--deepep-mode normal \
+--init-expert-location /path/to/expert_distribution_recorder_*.pt \
+--enable-deepep-waterfill
+
+# decode
+--moe-a2a-backend deepep \
+--deepep-mode low_latency \
+--init-expert-location /path/to/expert_distribution_recorder_*.pt \
+--enable-deepep-waterfill
+```
+
+You can also add `--ep-num-redundant-experts` and `--eplb-algorithm` to customize
+EPLB placement.
+
+MegaMoE is not supported with this DeepEP Waterfill recipe yet. Waterfill routes
+the shared expert through DeepEP for load balancing, so `--enable-deepep-waterfill`
+requires `--moe-a2a-backend deepep`.
+
+**FP4 Indexer (Experimental)**
+
+DeepSeek-V4 uses the default indexer path unless `--enable-deepseek-v4-fp4-indexer` is set. Enable this flag to use the experimental FP4 C4 indexer on SM100 GPUs with DeepGEMM FP4 indexer support. This path is intended for decode-heavy long-context workloads where reducing indexer cache bandwidth is beneficial.
+
+```bash Command
+# Please use the latest main branch for this feature.
+sglang serve \
+  --model-path deepseek-ai/DeepSeek-V4-Flash \
+  --tp 4 \
+  --moe-runner-backend flashinfer_mxfp4 \
+  --enable-deepseek-v4-fp4-indexer
+```
+
+**NVFP4 Hybrid Checkpoints**
+
+The [`nvidia/DeepSeek-V4-Pro-NVFP4`](https://huggingface.co/nvidia/DeepSeek-V4-Pro-NVFP4) and
+[`nvidia/DeepSeek-V4-Flash-NVFP4`](https://huggingface.co/nvidia/DeepSeek-V4-Flash-NVFP4) checkpoints
+quantize MoE experts to **NVFP4** while keeping attention and dense layers in
+**FP8**. It requires `--moe-runner-backend flashinfer_trtllm_routed` which will be automatically selected if not provided.
+
+```bash Command
+sglang serve \
+  --model-path nvidia/DeepSeek-V4-Pro-NVFP4 \
+  --tp 8
+```
+
+or
+
+```bash Command
+sglang serve \
+  --model-path nvidia/DeepSeek-V4-Flash-NVFP4 \
+  --tp 8
+```
+
+Requires Blackwell (SM100+). The MTP layer in this checkpoint stays
+MXFP4-packed and is routed through the `Mxfp4FlashinferTrtllmMoEMethod` path
+automatically.
 
 <a id="hopper-note" />
 
-**Hopper (H200) note**
+**Hopper (H100 / H200) note**
 
-We provide two different options for running DeepSeek-V4 models on Hopper devices (H200)
-- Original FP4 checkpoints: To run original FP4 checkpoints, we provide two different options for w4a16 MoE kernels: Marlin (`--moe-runner-backend marlin`) and Flashinfer (`--moe-runner-backend flashinfer_mxfp4`). For this variant we only support Tensor Parallelism. Complete Pro model can be run on a single H200 node with this option.
-- Converted FP8 checkpoints: We also provide pre-converted FP8 checkpoints (`sgl-project/DeepSeek-V4-Flash-FP8`, `sgl-project/DeepSeek-V4-Pro-FP8`), which support more parallelism and features.
+Two options are available for running DeepSeek-V4 on Hopper:
+
+- **Original FP4 checkpoints** — apply the W4A16 MoE kernels (Marlin) as the command generator picks for Hopper cells. This path works on both H100 and H200 and is the only option for H100 (no FP8 path). It is TP-only; on H200 the Pro variant fits on a single 8-GPU node, while H100 Pro needs 2 nodes (TP=16).
+- **Converted FP8 checkpoints** (H100 and H200 only) — pre-repackaged FP8 weights at [`sgl-project/DeepSeek-V4-Flash-FP8`](https://huggingface.co/sgl-project/DeepSeek-V4-Flash-FP8) and [`sgl-project/DeepSeek-V4-Pro-FP8`](https://huggingface.co/sgl-project/DeepSeek-V4-Pro-FP8) unlock DP-attention + DeepEP and richer parallelism (e.g. Pro TP=16 across 2 nodes).
 
 PD-Disagg recipes on H200 may require `docker run --privileged --ulimit memlock=-1`
 (or `--device /dev/infiniband:/dev/infiniband --cap-add IPC_LOCK`) so mooncake
 can discover the IB HCAs; without IB exposure mooncake silently falls back to
 TCP, which can lead to garbled KV transfer on large checkpoints.
 
+**RTX PRO 6000 (SM120 / Blackwell Desktop) note**
+
+RTX PRO 6000 (96 GB) runs **Flash only** — V4-Pro doesn't fit on 8× 96 GB. It uses the
+**low-latency / TP-only** recipe (TP=4, single node) with the **Marlin** W4A16 MoE runner and
+`--mem-fraction-static 0.70`; the Deploy panel greys out the other recipes for this card.
+HiCache and MegaMoE are **not** supported on RTX PRO 6000.
+
+**AMD (MI300X / MI355X) note**
+
+- **Model checkpoints** — for correct accuracy, the FP4 model uses the stock `deepseek-ai/DeepSeek-V4-{Flash,Pro}`, and the FP8 model uses the repackaged `sgl-project/DeepSeek-V4-{Flash,Pro}-FP8`.
+- **Supported models** — **MI300X** supports DeepSeek-V4-Flash in FP8; **MI355X** supports DeepSeek-V4-Flash / Pro in both FP4 and FP8. All recipes run single-node.
+- **TP / DP setting** — both TP=4 and TP=8 are supported. At low concurrency we recommend **TP-only**; at high concurrency use **TP + DP**, which additionally needs `--dp 8 --enable-dp-attention --enable-prefill-delayer --prefill-delayer-max-delay-ms 5000`.
+- **MTP** — speculative decoding is supported; add `--speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4`.
+- **Kernels** — uses the Unified KV attention and the flydsl MoE.
+
 **MegaMoE**
 
 MegaMoE fuses expert dispatch + GEMM into a single kernel for higher throughput
-on MoE layers. To enable it, use the **MegaMoE** toggle in the
-[command generator above](#3-model-deployment) — the generator will swap
-`--moe-a2a-backend deepep` for `--moe-a2a-backend megamoe` and add the
-relevant env vars automatically.
-
+on MoE layers. To enable it, use the **MegaMoE** chip in the Playground
+below — the playground will swap `--moe-a2a-backend deepep` for
+`--moe-a2a-backend megamoe` and add the relevant env vars automatically.
 
 Two variants are exposed:
 - **W4A8** — default MegaMoE kernel (FP4 weights, FP8 activations).
@@ -145,8 +321,10 @@ Two variants are exposed:
   (~89.5 GPQA on Pro).
 
 Notes:
-- MegaMoE is **not** supported on Hopper (H100 / H200) nor on the `low-latency` / `balanced` / `cp` settings — it is only wired into the `max-throughput` recipe on Blackwell. When running MegaMoE, don't set `--moe-runner-backend` manually.
-- Adjust `SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK` based on your workload and memory usage. Setting higher number of tokens for MegaMoE requires more HBM space. (recommended: 8320 for max-throughput).
+- MegaMoE is **only supported on Blackwell GPUs** (B200 / B300 / GB200 / GB300). The chip is hidden when the Deploy panel's base cell sits on Hopper (H100 / H200).
+- MegaMoE is **only wired into the `high-throughput` recipe** on Blackwell (per [sgl-project/sglang#26451](https://github.com/sgl-project/sglang/pull/26451)). The chip is hidden on `low-latency` and `balanced` — switch to `high-throughput` to expose it.
+- When running MegaMoE, don't set `--moe-runner-backend` manually.
+- Adjust `SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK` based on your workload and memory usage. Setting higher number of tokens for MegaMoE requires more HBM space (recommended: 8320 for high-throughput).
 
 **GB300 PD-Disagg cross-pod MNNVL**
 
@@ -155,32 +333,11 @@ fail with `nvlink_transport.cpp:497 Requested address ... not found!`. If
 this happens, prepend `MC_FORCE_MNNVL=1 NCCL_MNNVL_ENABLE=1 NCCL_CUMEM_ENABLE=1`
 to both prefill and decode `sglang serve` commands.
 
-## 4. Model Invocation
+## 3. Advanced Usage
 
-### 4.1 Basic Usage
+### 3.1 Reasoning
 
-For basic API usage and request examples, see:
-
-- [Basic API Usage](../../../docs/basic_usage/send_request)
-
-Once the server is running (for example via the command generator above), send a request:
-
-```shell Command
-curl http://localhost:30000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "deepseek-ai/DeepSeek-V4-Flash",
-    "messages": [{"role": "user", "content": "What is 15% of 240?"}]
-  }'
-```
-
-> **PD-Disagg note**: if you deployed with the `pd-disagg` recipe from the generator above, the prefill server is on port `30000`, the decode server on `30001`, and the **router** on port `8000` — client traffic should target `http://localhost:8000`, not `:30000`.
-
-### 4.2 Advanced Usage
-
-#### 4.2.1 Reasoning Parser
-
-Enable the `deepseek-v4` reasoning parser (check the box in the [command panel above](#3-model-deployment)) to separate thinking from the final answer into `reasoning_content` vs `content`.
+Enable the `deepseek-v4` reasoning parser (toggle **Reasoning Parser** in the **Parsers** card of the [Playground above](#playground)) to separate thinking from the final answer into `reasoning_content` vs `content`.
 
 <Accordion title="Streaming with Thinking Process (Python)">
 
@@ -252,9 +409,9 @@ Multiply the decimal form by 240:
 
 </Accordion>
 
-#### 4.2.2 Tool Calling
+### 3.2 Tool Calling
 
-Enable the `deepseekv4` tool-call parser (check the box in the [command panel above](#3-model-deployment)) to surface structured tool calls via `message.tool_calls`.
+Enable the `deepseekv4` tool-call parser (toggle **Tool Call Parser** in the **Parsers** card of the [Playground above](#playground)) to surface structured tool calls via `message.tool_calls`.
 
 <Accordion title="Python Example with Thinking Process">
 
@@ -348,339 +505,15 @@ The user wants to know the weather in Beijing. I'll use the get_weather function
 
 </Accordion>
 
-#### 4.2.3 HiCache (Hierarchical KV Caching)
+### 3.3 HiCache (Hierarchical KV Caching)
 
 HiCache enables multi-tier KV cache offloading (GPU → CPU → Storage), significantly expanding effective context capacity for long-context and multi-turn scenarios. Combined with UnifiedRadixTree, it provides intelligent prefix caching across all tiers.
 
-To enable HiCache, use the **HiCache** toggle in the [command generator above](#3-model-deployment):
+To enable HiCache, open the **HiCache** card in the [Playground above](#playground) and flip **Enable**:
 
-- **L2 (GPU + CPU):** Offloads cold KV pages to CPU memory. Enables `SGLANG_ENABLE_UNIFIED_RADIX_TREE=1` for intelligent hierarchical prefix caching.
-- **L3 (GPU + CPU + Storage):** Coming soon.
+- **L2 (GPU + CPU)** — leave Storage on `auto` (default). Cold KV pages spill to CPU pinned memory only.
+- **L3 (GPU + CPU + Storage)** — pick a Storage backend (`file` / `mooncake` / `hf3fs` / `nixl`); the Playground emits the canonical `page_first_direct` mem-layout + `direct` IO backend + `wait_complete` prefetch policy, matching the [HiCache best-practices recipe](../../../docs/advanced_features/hicache_best_practices).
+
+The Write policy knob defaults to `write_through` (the upstream default); switch to `write_back` / `write_through_selective` to trade durability for write speed when the storage tier is slow.
 
 For more details, see the [HiCache documentation](../../../docs/advanced_features/hicache).
-
-## 5. Benchmark
-
-### 5.1 Accuracy Benchmark
-
-For accuracy benchmarking on DeepSeek-V4 models, please make sure that:
-- `SGLANG_DEFAULT_THINKING=1 SGLANG_REASONING_EFFORT=max` are set when launching model.
-- For GPQA and AIME25 benchmarks, run at least 16 turns to reduce randomness.
-
-#### 5.1.1 GSM8K Benchmark
-
-- **Benchmark Command:**
-
-```shell Command
-python3 -m sglang.test.few_shot_gsm8k --num-questions 200 --port 30000
-```
-
-- **Test Results:**
-  - DeepSeek-V4-Pro (FP4, B300, low-latency)
-    ```
-    Accuracy: 0.965
-    Invalid: 0.000
-    ```
-  - DeepSeek-V4-Pro (FP4, H200, low-latency)
-    ```
-    Accuracy: 0.975
-    Invalid: 0.000
-    ```
-
-#### 5.1.2 GPQA Diamond Benchmark
-
-For GPQA Diamond benchmark, we recommend applying [sgl-eval](https://github.com/sgl-project/sgl-eval) as the benchmark tool.
-
-```shell Command
-# Install
-pip install git+https://github.com/sgl-project/sgl-eval
-
-# For Flash model, reference accuracy: 88.1%
-sgl-eval run gpqa --model deepseek-ai/DeepSeek-V4-Flash --api-key <api-key> --n-repeats 16 --max-tokens 200000 --temperature 1.0 --top-p 1.0 --thinking --out-dir /sgl-workspace/logs --base-url http://localhost:30000/v1
-
-# For Pro model, reference accuracy: 90.1%
-sgl-eval run gpqa --model deepseek-ai/DeepSeek-V4-Pro --api-key <api-key> --n-repeats 16 --max-tokens 400000 --temperature 1.0 --top-p 1.0 --thinking --out-dir /sgl-workspace/logs --base-url http://localhost:30000/v1
-```
-
-#### 5.1.3 AIME25 Benchmark
-
-For AIME25 benchmark, we recommend applying [sgl-eval](https://github.com/sgl-project/sgl-eval) as the benchmark tool.
-
-```shell Command
-# Install
-pip install git+https://github.com/sgl-project/sgl-eval
-
-# For Flash model, reference accuracy: ~95%
-sgl-eval run aime25 --model deepseek-ai/DeepSeek-V4-Flash --api-key <api-key> --n-repeats 16 --max-tokens 200000 --temperature 1.0 --top-p 1.0 --thinking --out-dir /sgl-workspace/logs --base-url http://localhost:30000/v1
-
-# For Pro model, reference accuracy: ~97.5%
-sgl-eval run aime25 --model deepseek-ai/DeepSeek-V4-Pro --api-key <api-key> --n-repeats 16 --max-tokens 400000 --temperature 1.0 --top-p 1.0 --thinking --out-dir /sgl-workspace/logs --base-url http://localhost:30000/v1
-```
-
-### 5.2 Speed Benchmark
-
-We use SGLang's built-in benchmarking tool with its `random` dataset — real prompts sampled from [ShareGPT_Vicuna_unfiltered](https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered) and then truncated/padded to a controlled length. This dataset contains real conversation data and can better reflect performance in actual use scenarios. To simulate real-world usage patterns, we configure each request with 1024 input tokens and 1024 output tokens, representing typical medium-length conversations with detailed responses.
-
-#### 5.2.1 Hopper
-
-**Test Environment:**
-
-- Hardware: NVIDIA H200 GPU (4x)
-- Model: DeepSeek-V4-Flash (FP4)
-- Tensor Parallelism: 4
-- sglang version: 0.5.12
-
-##### Latency-Sensitive Benchmark
-
-- **Model Deployment Command:** H200 · DeepSeek-V4-Flash · FP4 · Low-Latency. See the [command panel above](#3-model-deployment).
-
-- Benchmark Command:
-
-```shell Command
-python3 -m sglang.bench_serving \
-  --backend sglang \
-  --host 127.0.0.1 \
-  --port 30000 \
-  --model deepseek-ai/DeepSeek-V4-Flash \
-  --dataset-name random \
-  --random-input-len 1024 \
-  --random-output-len 1024 \
-  --num-prompts 10 \
-  --max-concurrency 1
-```
-
-- **Test Results:**
-
-```text Output
-============ Serving Benchmark Result ============
-Backend:                                 sglang
-Traffic request rate:                    inf
-Max request concurrency:                 1
-Successful requests:                     10
-Benchmark duration (s):                  15.98
-Total input tokens:                      6101
-Total input text tokens:                 6101
-Total generated tokens:                  4220
-Total generated tokens (retokenized):    4220
-Request throughput (req/s):              0.63
-Input token throughput (tok/s):          381.86
-Output token throughput (tok/s):         264.13
-Peak output token throughput (tok/s):    324.00
-Peak concurrent requests:                3
-Total token throughput (tok/s):          645.98
-Concurrency:                             1.00
-Accept length:                           2.96
-----------------End-to-End Latency----------------
-Mean E2E Latency (ms):                   1596.65
-Median E2E Latency (ms):                 1274.48
-P90 E2E Latency (ms):                    2950.70
-P99 E2E Latency (ms):                    3333.18
----------------Time to First Token----------------
-Mean TTFT (ms):                          147.26
-Median TTFT (ms):                        132.22
-P99 TTFT (ms):                           181.37
------Time per Output Token (excl. 1st token)------
-Mean TPOT (ms):                          3.50
-Median TPOT (ms):                        3.48
-P99 TPOT (ms):                           4.18
----------------Inter-Token Latency----------------
-Mean ITL (ms):                           3.44
-Median ITL (ms):                         3.36
-P95 ITL (ms):                            5.06
-P99 ITL (ms):                            5.15
-Max ITL (ms):                            35.31
-==================================================
-```
-
-##### Throughput-Sensitive Benchmark
-
-- **Model Deployment Command:** H200 · DeepSeek-V4-Flash · FP4 · Max-Throughput. See the [command panel above](#3-model-deployment).
-
-- Benchmark Command:
-
-```shell Command
-python3 -m sglang.bench_serving \
-  --backend sglang \
-  --host 127.0.0.1 \
-  --port 30000 \
-  --model deepseek-ai/DeepSeek-V4-Flash \
-  --dataset-name random \
-  --random-input-len 1024 \
-  --random-output-len 1024 \
-  --num-prompts 1000 \
-  --max-concurrency 100
-```
-
-- **Test Results:**
-
-```text Output
-============ Serving Benchmark Result ============
-Backend:                                 sglang
-Traffic request rate:                    inf
-Max request concurrency:                 100
-Successful requests:                     1000
-Benchmark duration (s):                  198.42
-Total input tokens:                      512842
-Total input text tokens:                 512842
-Total generated tokens:                  510855
-Total generated tokens (retokenized):    510765
-Request throughput (req/s):              5.04
-Input token throughput (tok/s):          2584.65
-Output token throughput (tok/s):         2574.64
-Peak output token throughput (tok/s):    4400.00
-Peak concurrent requests:                110
-Total token throughput (tok/s):          5159.28
-Concurrency:                             96.21
-----------------End-to-End Latency----------------
-Mean E2E Latency (ms):                   19090.29
-Median E2E Latency (ms):                 18328.71
-P90 E2E Latency (ms):                    35698.68
-P99 E2E Latency (ms):                    39161.43
----------------Time to First Token----------------
-Mean TTFT (ms):                          302.41
-Median TTFT (ms):                        131.35
-P99 TTFT (ms):                           2172.03
------Time per Output Token (excl. 1st token)------
-Mean TPOT (ms):                          37.46
-Median TPOT (ms):                        37.72
-P99 TPOT (ms):                           55.72
----------------Inter-Token Latency----------------
-Mean ITL (ms):                           36.85
-Median ITL (ms):                         21.75
-P95 ITL (ms):                            107.64
-P99 ITL (ms):                            134.58
-Max ITL (ms):                            1930.74
-==================================================
-```
-
-#### 5.2.2 Blackwell
-
-**Test Environment:**
-
-- Hardware: NVIDIA B200 GPU (4x)
-- Model: DeepSeek-V4-Flash (FP4)
-- Tensor Parallelism: 4
-- sglang version: 0.5.12
-
-##### Latency-Sensitive Benchmark
-
-- **Model Deployment Command:** B200 · DeepSeek-V4-Flash · FP4 · Low-Latency. See the [command panel above](#3-model-deployment).
-
-- Benchmark Command:
-
-```shell Command
-python3 -m sglang.bench_serving \
-  --backend sglang \
-  --host 127.0.0.1 \
-  --port 30000 \
-  --model deepseek-ai/DeepSeek-V4-Flash \
-  --dataset-name random \
-  --random-input-len 1024 \
-  --random-output-len 1024 \
-  --num-prompts 10 \
-  --max-concurrency 1
-```
-
-- **Test Results:**
-
-```text Output
-============ Serving Benchmark Result ============
-Backend:                                 sglang
-Traffic request rate:                    inf
-Max request concurrency:                 1
-Successful requests:                     10
-Benchmark duration (s):                  15.25
-Total input tokens:                      6101
-Total input text tokens:                 6101
-Total generated tokens:                  4220
-Total generated tokens (retokenized):    4220
-Request throughput (req/s):              0.66
-Input token throughput (tok/s):          400.06
-Output token throughput (tok/s):         276.72
-Peak output token throughput (tok/s):    308.00
-Peak concurrent requests:                2
-Total token throughput (tok/s):          676.78
-Concurrency:                             1.00
-Accept length:                           2.73
-----------------End-to-End Latency----------------
-Mean E2E Latency (ms):                   1523.83
-Median E2E Latency (ms):                 1173.50
-P90 E2E Latency (ms):                    2770.33
-P99 E2E Latency (ms):                    3233.82
----------------Time to First Token----------------
-Mean TTFT (ms):                          102.72
-Median TTFT (ms):                        85.94
-P99 TTFT (ms):                           134.79
------Time per Output Token (excl. 1st token)------
-Mean TPOT (ms):                          3.40
-Median TPOT (ms):                        3.42
-P99 TPOT (ms):                           4.00
----------------Inter-Token Latency----------------
-Mean ITL (ms):                           3.38
-Median ITL (ms):                         3.06
-P95 ITL (ms):                            4.60
-P99 ITL (ms):                            4.95
-Max ITL (ms):                            34.64
-==================================================
-```
-
-##### Throughput-Sensitive Benchmark
-
-- **Model Deployment Command:** B200 · DeepSeek-V4-Flash · FP4 · Max-Throughput (MegaMoE W4A4). See the [command panel above](#3-model-deployment) — flip the **MegaMoE** toggle to **W4A4** to reproduce these numbers; the default Max-Throughput recipe uses `--moe-a2a-backend deepep` and runs slower.
-
-- Benchmark Command:
-
-```shell Command
-python3 -m sglang.bench_serving \
-  --backend sglang \
-  --host 127.0.0.1 \
-  --port 30000 \
-  --model deepseek-ai/DeepSeek-V4-Flash \
-  --dataset-name random \
-  --random-input-len 1024 \
-  --random-output-len 1024 \
-  --num-prompts 1000 \
-  --max-concurrency 100
-```
-
-- **Test Results:**
-
-```text Output
-============ Serving Benchmark Result ============
-Backend:                                 sglang
-Traffic request rate:                    inf
-Max request concurrency:                 100
-Successful requests:                     1000
-Benchmark duration (s):                  105.10
-Total input tokens:                      512842
-Total input text tokens:                 512842
-Total generated tokens:                  510855
-Total generated tokens (retokenized):    510682
-Request throughput (req/s):              9.51
-Input token throughput (tok/s):          4879.44
-Output token throughput (tok/s):         4860.54
-Peak output token throughput (tok/s):    6600.00
-Peak concurrent requests:                117
-Total token throughput (tok/s):          9739.98
-Concurrency:                             94.34
-----------------End-to-End Latency----------------
-Mean E2E Latency (ms):                   9915.50
-Median E2E Latency (ms):                 9521.19
-P90 E2E Latency (ms):                    17726.66
-P99 E2E Latency (ms):                    24910.72
----------------Time to First Token----------------
-Mean TTFT (ms):                          349.95
-Median TTFT (ms):                        68.23
-P99 TTFT (ms):                           4581.26
------Time per Output Token (excl. 1st token)------
-Mean TPOT (ms):                          19.86
-Median TPOT (ms):                        17.96
-P99 TPOT (ms):                           61.58
----------------Inter-Token Latency----------------
-Mean ITL (ms):                           18.76
-Median ITL (ms):                         13.23
-P95 ITL (ms):                            44.79
-P99 ITL (ms):                            88.25
-Max ITL (ms):                            2499.49
-==================================================
-```

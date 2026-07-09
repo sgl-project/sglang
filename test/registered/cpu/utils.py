@@ -560,11 +560,14 @@ class MXFP4QuantizeUtil:
 
 
 def make_non_contiguous(x: torch.Tensor) -> torch.Tensor:
-    """
-    Make a tensor non-contiguous by slicing it via last dimension.
-    """
+    # Make a tensor non-contiguous without changing shape.
+    if not x.is_contiguous():
+        return x
+
     last_dim = x.shape[-1]
-    return x[..., : last_dim // 2] if x.is_contiguous() else x
+    expanded = torch.empty(*x.shape[:-1], last_dim + 32, dtype=x.dtype, device=x.device)
+    expanded[..., :last_dim].copy_(x)
+    return expanded.narrow(-1, 0, last_dim)
 
 
 def awq_reverse_reorder_int_tensor(int_tensor, bits: int):

@@ -16,6 +16,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-b-test-cpu")
+register_cpu_ci(est_time=10, suite="base-b-test-cpu-arm64")
 
 torch.manual_seed(1234)
 
@@ -327,7 +328,7 @@ class TestROPE(CustomTestCase):
             num_kv_heads: int,
         ):
             set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
-            torch.manual_seed(100)
+            torch.manual_seed(1234)
             rope_ref = RotaryEmbedding(
                 head_size,
                 rotary_dim,

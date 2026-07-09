@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 import torch
 
-from sglang.srt.layers.quantization.kvfp4_tensor import KVFP4QuantizeUtil
+from sglang.srt.layers.quantization.kvfp4_tensor import BlockFP4KVQuantizeUtil
 
 
 def calculate_accuracy_metrics(
@@ -52,18 +52,18 @@ def run_benchmark(m, n, k, num_runs=100) -> dict[str, dict[str, float]]:
     fp8_metrics = calculate_accuracy_metrics(tensor_bf16, tensor_fp8_dequant)
 
     # --- KVFP4 ---
-    tensor_fp4, scale_factors = KVFP4QuantizeUtil.batched_quantize(tensor_bf16)
-    _ = KVFP4QuantizeUtil.batched_dequantize(tensor_fp4, scale_factors)
+    tensor_fp4, scale_factors = BlockFP4KVQuantizeUtil.batched_quantize(tensor_bf16)
+    _ = BlockFP4KVQuantizeUtil.batched_dequantize(tensor_fp4, scale_factors)
 
     start = time.time()
     for _ in range(num_runs):
-        tensor_fp4, scale_factors = KVFP4QuantizeUtil.batched_quantize(tensor_bf16)
+        tensor_fp4, scale_factors = BlockFP4KVQuantizeUtil.batched_quantize(tensor_bf16)
     torch.cuda.synchronize()
     fp4_quant_time = (time.time() - start) / num_runs
 
     start = time.time()
     for _ in range(num_runs):
-        tensor_fp4_dequant = KVFP4QuantizeUtil.batched_dequantize(
+        tensor_fp4_dequant = BlockFP4KVQuantizeUtil.batched_dequantize(
             tensor_fp4, scale_factors
         )
     torch.cuda.synchronize()

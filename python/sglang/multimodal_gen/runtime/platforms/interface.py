@@ -42,6 +42,7 @@ class AttentionBackendEnum(enum.Enum):
     BLOCK_SPARSE_ATTN = enum.auto()
     RAIN_FUSION_ATTN = enum.auto()
     NO_ATTENTION = enum.auto()
+    AMX_ATTN = enum.auto()
 
     def __str__(self):
         return self.name.lower()
@@ -384,7 +385,7 @@ class Platform:
     @classmethod
     def get_available_gpu_memory(
         cls,
-        device_id: int = 0,
+        device_id: int | None = None,
         distributed: bool = False,
         empty_cache: bool = True,
         cpu_group: Any = None,

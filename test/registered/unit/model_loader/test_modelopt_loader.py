@@ -8,14 +8,19 @@ applies NVIDIA Model Optimizer quantization to models during loading.
 import unittest
 from unittest.mock import MagicMock, patch
 
+import torch
 import torch.nn as nn
 
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
 from sglang.srt.layers.modelopt_utils import QUANT_CFG_CHOICES
 from sglang.srt.layers.quantization.modelopt_quant import (
+    ModelOptFp4Config,
+    ModelOptFp4LinearMethod,
     ModelOptMixedPrecisionConfig,
+    ModelOptNvFp4A16LinearMethod,
 )
 from sglang.srt.model_loader.loader import ModelOptModelLoader
 from sglang.srt.models.utils import WeightsMapper
@@ -625,14 +630,56 @@ class TestParseQuantHfConfig(CustomTestCase):
 
 
 class TestModelOptMixedPrecisionConfig(CustomTestCase):
-    def test_nemotron_mixed_precision_uses_modelopt_mixed(self):
+    def test_nemotron_mixed_precision_with_nvfp4_layers_uses_modelopt_mixed(self):
         model_config = ModelConfig.__new__(ModelConfig)
         model_config.hf_config = MagicMock()
         model_config.hf_config.model_type = "nemotron_h"
         model_config.hf_config.architectures = ["NemotronHForCausalLM"]
 
         result = model_config._parse_modelopt_quant_config(
-            {"quantization": {"quant_algo": "MIXED_PRECISION"}}
+            {
+                "quantization": {
+                    "quant_algo": "MIXED_PRECISION",
+                    "quantized_layers": {
+                        "backbone.layers.0.mixer.in_proj": {"quant_algo": "FP8"},
+                        "backbone.layers.0.mixer.out_proj": {"quant_algo": "FP8"},
+                        "backbone.layers.1.mixer.experts.0.up_proj": {
+                            "quant_algo": "NVFP4",
+                            "group_size": 16,
+                        },
+                        "backbone.layers.1.mixer.experts.0.down_proj": {
+                            "quant_algo": "NVFP4",
+                            "group_size": 16,
+                        },
+                    },
+                }
+            }
+        )
+
+        self.assertEqual(result["quant_method"], "modelopt_mixed")
+
+    def test_qwen_mixed_precision_with_nvfp4a16_layers_uses_modelopt_mixed(self):
+        model_config = ModelConfig.__new__(ModelConfig)
+        model_config.hf_config = MagicMock()
+        model_config.hf_config.model_type = "qwen3_5_moe"
+        model_config.hf_config.architectures = ["Qwen3_5MoeForConditionalGeneration"]
+
+        result = model_config._parse_modelopt_quant_config(
+            {
+                "quantization": {
+                    "quant_algo": "MIXED_PRECISION",
+                    "quantized_layers": {
+                        "lm_head": {"quant_algo": "W4A16_NVFP4", "group_size": 16},
+                        "model.language_model.layers.0.mlp.shared_expert.up_proj": {
+                            "quant_algo": "W4A16_NVFP4",
+                            "group_size": 16,
+                        },
+                        "model.language_model.layers.0.linear_attn.in_proj_qkv": {
+                            "quant_algo": "FP8"
+                        },
+                    },
+                }
+            }
         )
 
         self.assertEqual(result["quant_method"], "modelopt_mixed")
@@ -645,8 +692,62 @@ class TestModelOptMixedPrecisionConfig(CustomTestCase):
             )
         )
 
+    @patch(
+        "sglang.srt.layers.quantization.modelopt_quant.envs.SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION.get",
+        return_value=True,
+    )
+    def test_explicit_nvfp4_per_token_activation_false_overrides_env(self, _):
+        config = ModelOptFp4Config(use_per_token_activation=False)
+
+        self.assertFalse(config.use_per_token_activation)
+
+    def test_lm_head_guard_accepts_modelopt_fp4_marlin_runtime_state(self):
+        lm_head = nn.Module()
+        lm_head.weight = nn.Parameter(
+            torch.empty(128, 496640, dtype=torch.int32), requires_grad=False
+        )
+        lm_head.weight_scale = nn.Parameter(torch.empty(1))
+        lm_head.weight_global_scale = nn.Parameter(torch.empty(1))
+        lm_head.workspace = torch.empty(1)
+        lm_head.input_size_per_partition = 2048
+        lm_head.output_size_per_partition = 128000
+
+        self.assertTrue(
+            should_apply_lm_head_quant_method(
+                lm_head, ModelOptNvFp4A16LinearMethod(ModelOptFp4Config())
+            )
+        )
+
+    def test_lm_head_guard_rejects_stale_modelopt_fp4_method_on_dense_head(self):
+        lm_head = nn.Module()
+        lm_head.weight = nn.Parameter(torch.empty(128000, 2048))
+
+        self.assertFalse(
+            should_apply_lm_head_quant_method(
+                lm_head, ModelOptFp4LinearMethod(ModelOptFp4Config())
+            )
+        )
+
+    def test_lm_head_guard_rejects_stale_modelopt_fp4_attrs_on_dense_head(self):
+        lm_head = nn.Module()
+        lm_head.weight = nn.Parameter(torch.empty(128000, 2048))
+        lm_head.weight_scale = nn.Parameter(torch.empty(1))
+        lm_head.weight_global_scale = nn.Parameter(torch.empty(1))
+        lm_head.workspace = torch.empty(1)
+        lm_head.input_size_per_partition = 2048
+        lm_head.output_size_per_partition = 128000
+
+        self.assertFalse(
+            should_apply_lm_head_quant_method(
+                lm_head, ModelOptNvFp4A16LinearMethod(ModelOptFp4Config())
+            )
+        )
+
     def test_mixed_precision_uses_nvfp4_min_capability(self):
-        self.assertEqual(ModelOptMixedPrecisionConfig.get_min_capability(), 100)
+        self.assertEqual(
+            ModelOptMixedPrecisionConfig.get_min_capability(),
+            ModelOptFp4Config.get_min_capability(),
+        )
 
     def test_mixed_precision_quant_layer_resolution_after_mapping(self):
         quant_config = ModelOptMixedPrecisionConfig.from_config(

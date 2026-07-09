@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import heapq
-from typing import TYPE_CHECKING, Callable, Optional
+from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
 import torch
 
@@ -9,10 +9,15 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     EvictParams,
     IncLockRefResult,
+    InsertResult,
     MatchPrefixParams,
     MatchResult,
 )
-from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+from sglang.srt.mem_cache.hicache_storage import (
+    PoolName,
+    PoolTransfer,
+    PoolTransferResult,
+)
 from sglang.srt.mem_cache.unified_cache_components.tree_component import (
     CacheTransferPhase,
     ComponentType,
@@ -21,6 +26,7 @@ from sglang.srt.mem_cache.unified_cache_components.tree_component import (
 )
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.unified_radix_cache import (
         UnifiedTreeNode,
     )
@@ -246,7 +252,14 @@ class FullComponent(TreeComponent):
     # ---- HiCache Hooks ----
 
     def build_hicache_transfers(
-        self, node: UnifiedTreeNode, phase: CacheTransferPhase, **kw
+        self,
+        node: UnifiedTreeNode,
+        phase: CacheTransferPhase,
+        *,
+        req: Optional[Req] = None,
+        token_ids: Optional[Sequence[int]] = None,
+        prefetch_tokens: int = 0,
+        last_hash: Optional[str] = None,
     ) -> Optional[list[PoolTransfer]]:
         ct = self.component_type
 
@@ -290,7 +303,9 @@ class FullComponent(TreeComponent):
         node: UnifiedTreeNode,
         phase: CacheTransferPhase,
         transfers: list[PoolTransfer] = (),
-        **kw,
+        *,
+        insert_result: Optional[InsertResult] = None,
+        pool_storage_result: Optional[PoolTransferResult] = None,
     ) -> None:
         ct = self.component_type
 

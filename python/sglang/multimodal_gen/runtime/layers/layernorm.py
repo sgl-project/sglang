@@ -33,6 +33,7 @@ _is_npu = current_platform.is_npu()
 _is_musa = current_platform.is_musa()
 _is_cpu = current_platform.is_cpu()
 _is_xpu = current_platform.is_xpu()
+_use_rocm_flydsl = get_bool_env_var("SGLANG_USE_ROCM_FLYDSL")
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _is_cuda or _is_xpu:
@@ -40,6 +41,9 @@ if _is_cuda or _is_xpu:
 
 if _is_npu:
     import torch_npu
+    from sgl_kernel_npu.norm.rmsnorm_without_weight import (
+        fused_rmsnorm_without_weight,
+    )
 
 if _is_musa:
     from sgl_kernel import fused_add_rmsnorm
@@ -291,6 +295,18 @@ class RMSNorm(CustomOp):
         return f"hidden_size={self.hidden_size}, eps={self.variance_epsilon}"
 
 
+@CustomOp.register("rms_norm_no_weight")
+class RMSNormNoWeight(CustomOp):
+    def forward_native(self, x: torch.Tensor, eps: float) -> torch.Tensor:
+        return F.rms_norm(x, normalized_shape=(x.shape[-1],), eps=eps)
+
+    def forward_cuda(self, x: torch.Tensor, eps: float) -> torch.Tensor:
+        return self.forward_native(x, eps=eps)
+
+    def forward_npu(self, x: torch.Tensor, eps: float) -> torch.Tensor:
+        return fused_rmsnorm_without_weight(x, eps)
+
+
 # Copied and adapted from sglang
 @CustomOp.register("layer_norm")
 class LayerNorm(CustomOp):
@@ -350,7 +366,10 @@ class LayerNorm(CustomOp):
         x = x.view(-1, self.hidden_size)
         return self.forward_triton(x).view(shape)
 
-    @torch.compile(backend="inductor", disable=current_platform.is_npu())
+    @torch.compile(
+        backend="inductor",
+        disable=current_platform.is_npu() or current_platform.is_rocm(),
+    )
     def forward_native(
         self,
         x: torch.Tensor,
@@ -506,10 +525,39 @@ class _ScaleResidualNormScaleShift(CustomOp):
             self.eps,
         )
 
-    def forward_hip(self, *args, **kwargs):
-        # ROCm does not support CUDA/CUTLASS-based fused kernels yet,
-        # so we fall back to the native PyTorch implementation.
-        return self.forward_native(*args, **kwargs)
+    def forward_hip(
+        self,
+        residual: torch.Tensor,
+        x: torch.Tensor,
+        gate: torch.Tensor | int,
+        shift: torch.Tensor,
+        scale: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not _use_rocm_flydsl:
+            return self.forward_native(residual, x, gate, shift, scale)
+
+        try:
+            from sglang.jit_kernel.diffusion.flydsl.fused_residual_norm import (
+                FLYDSL_NORM_MIN_ALIGNED_DIM,
+                flydsl_fused_residual_norm_scale_shift,
+            )
+        except ImportError:
+            return self.forward_native(residual, x, gate, shift, scale)
+
+        if x.shape[-1] % FLYDSL_NORM_MIN_ALIGNED_DIM != 0:
+            return self.forward_native(residual, x, gate, shift, scale)
+
+        return flydsl_fused_residual_norm_scale_shift(
+            residual.contiguous(),
+            x.contiguous(),
+            gate.contiguous() if isinstance(gate, torch.Tensor) else None,
+            _ensure_contiguous(getattr(self.norm, "weight", None)),
+            _ensure_contiguous(getattr(self.norm, "bias", None)),
+            scale.contiguous(),
+            shift.contiguous(),
+            self.norm_type,
+            self.eps,
+        )
 
     def forward_musa(self, *args, **kwargs):
         # MUSA does not support CUDA/CUTLASS-based fused kernels yet,
@@ -521,7 +569,7 @@ class _ScaleResidualNormScaleShift(CustomOp):
         # so we fall back to the native PyTorch implementation.
         return self.forward_native(*args, **kwargs)
 
-    @torch.compile(disable=current_platform.is_npu())
+    @torch.compile(disable=current_platform.is_npu() or current_platform.is_rocm())
     def forward_native(
         self,
         residual: torch.Tensor,
@@ -648,10 +696,36 @@ class _NormScaleShift(CustomOp):
             self.eps,
         )
 
-    def forward_hip(self, *args, **kwargs):
-        # ROCm does not support CUDA/CUTLASS-based fused kernels yet,
-        # so we fall back to the native PyTorch implementation.
-        return self.forward_native(*args, **kwargs)
+    def forward_hip(
+        self,
+        x: torch.Tensor,
+        shift: torch.Tensor,
+        scale: torch.Tensor,
+    ) -> torch.Tensor:
+        if not _use_rocm_flydsl:
+            return self.forward_native(x, shift, scale)
+
+        try:
+            from sglang.jit_kernel.diffusion.flydsl.fused_residual_norm import (
+                FLYDSL_NORM_MIN_ALIGNED_DIM,
+                flydsl_norm_scale_shift,
+            )
+        except ImportError:
+            return self.forward_native(x, shift, scale)
+
+        if x.shape[-1] % FLYDSL_NORM_MIN_ALIGNED_DIM != 0:
+            return self.forward_native(x, shift, scale)
+
+        result = flydsl_norm_scale_shift(
+            x.contiguous(),
+            _ensure_contiguous(getattr(self.norm, "weight", None)),
+            _ensure_contiguous(getattr(self.norm, "bias", None)),
+            scale.contiguous(),
+            shift.contiguous(),
+            self.norm_type,
+            self.eps,
+        )
+        return result.to(x.dtype)
 
     def forward_musa(self, *args, **kwargs):
         # MUSA does not support CUDA/CUTLASS-based fused kernels yet,
@@ -663,7 +737,7 @@ class _NormScaleShift(CustomOp):
         # so we fall back to the native PyTorch implementation.
         return self.forward_native(*args, **kwargs)
 
-    @torch.compile(disable=current_platform.is_npu())
+    @torch.compile(disable=current_platform.is_npu() or current_platform.is_rocm())
     def forward_native(
         self, x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor
     ) -> torch.Tensor:
@@ -674,11 +748,23 @@ class _NormScaleShift(CustomOp):
     def forward_npu(
         self, x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor
     ) -> torch.Tensor:
-        from sgl_kernel_npu.norm.scale_shift import fused_scale_shift
+        hidden_size = x.shape[-1]
+        x_numel = x.numel()
 
-        normalized = self.norm(x)
-        modulated = fused_scale_shift(normalized, scale, shift)
-        return modulated.to(x.dtype)
+        if scale.numel() in (1, hidden_size) and shift.numel() in (
+            1,
+            hidden_size,
+            x_numel,
+        ):
+            from sgl_kernel_npu.norm.scale_shift import fused_scale_shift
+
+            normalized = self.norm(x)
+            modulated = fused_scale_shift(
+                normalized, scale.contiguous(), shift.contiguous()
+            )
+            return modulated.to(x.dtype)
+
+        return self.forward_native(x, shift, scale)
 
 
 class LayerNormScaleShift(_NormScaleShift):
@@ -748,7 +834,7 @@ class _NormTanhMulAdd(CustomOp):
         # Fallback to native because ROCm does not support CuTeDSL.
         return self.forward_native(*args, **kwargs)
 
-    @torch.compile(disable=current_platform.is_npu())
+    @torch.compile(disable=current_platform.is_npu() or current_platform.is_rocm())
     def forward_native(
         self, x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor
     ) -> torch.Tensor:
@@ -869,15 +955,27 @@ def apply_qk_norm_rope(
         raise ValueError(
             f"apply_qk_norm_rope expects 4D q/k tensors, got q:{tuple(q.shape)} k:{tuple(k.shape)}"
         )
-    if q.shape != k.shape:
+    if q.shape[:2] != k.shape[:2] or q.shape[-1] != k.shape[-1]:
         raise ValueError(
-            f"apply_qk_norm_rope expects q/k to have the same shape, got {q.shape} vs {k.shape}"
+            "apply_qk_norm_rope expects q/k to share batch, sequence, and head size, "
+            f"got {q.shape} vs {k.shape}"
+        )
+    if not (isinstance(cos_sin_cache, torch.Tensor) and cos_sin_cache.dim() == 2):
+        raise ValueError("cos_sin_cache must be a 2D torch.Tensor")
+    if k.device != q.device or cos_sin_cache.device != q.device:
+        raise ValueError(
+            "q, k, and cos_sin_cache must be on the same device, "
+            f"got q={q.device}, k={k.device}, cos_sin_cache={cos_sin_cache.device}"
         )
 
     batch_size, seq_len, _, _ = q.shape
     q_eps = q_norm.variance_epsilon
     k_eps = k_norm.variance_epsilon
     rope_dim = cos_sin_cache.size(-1)
+    if rope_dim % 2 != 0 or rope_dim > head_dim:
+        raise ValueError(
+            f"cos_sin_cache width must be even and <= head_dim, got {rope_dim} vs {head_dim}"
+        )
     fused_enabled = os.getenv("SGLANG_ENABLE_FUSED_QKNORM_ROPE", "1").lower() not in {
         "0",
         "false",
@@ -898,6 +996,7 @@ def apply_qk_norm_rope(
             raise ValueError(
                 f"positions must be 1D of length {batch_size * seq_len}, got shape={tuple(positions.shape)}"
             )
+        positions = positions.to(device=q.device, dtype=torch.long)
 
     if (
         fused_enabled

@@ -39,7 +39,7 @@ class CompressorCPU(_CompressorBase):
         self,
         forward_batch: ForwardBatch,
         attn_backend: AttentionBackend,
-    ) -> "KVAndScoreSeparate | CompressStatePool":
+    ) -> KVAndScoreSeparate | CompressStatePool:
         """Return the per-layer compress-state for this Compressor.
 
         When the radix path is on this is a paged ``CompressStatePool``;
@@ -97,7 +97,7 @@ class CompressorCPU(_CompressorBase):
 
     def compress_decode_separate(
         self,
-        kv_and_scores: "KVAndScoreSeparate",
+        kv_and_scores: KVAndScoreSeparate,
         forward_batch: ForwardBatch,
         attn_backend: AttentionBackend,
     ) -> torch.Tensor:
@@ -171,7 +171,7 @@ class CompressorCPU(_CompressorBase):
 
     def compress_extend_separate(
         self,
-        kv_and_scores: "KVAndScoreSeparate",
+        kv_and_scores: KVAndScoreSeparate,
         forward_batch: ForwardBatch,
         attn_backend: AttentionBackend,
     ) -> torch.Tensor:

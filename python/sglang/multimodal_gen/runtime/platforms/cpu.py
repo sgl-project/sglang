@@ -17,7 +17,13 @@ from sglang.multimodal_gen.runtime.platforms.interface import (
     PlatformEnum,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.utils import (
+    cpu_has_amx_support,
+    is_cpu,
+)
 
+_is_cpu_amx_available = cpu_has_amx_support()
+_is_cpu = is_cpu()
 logger = init_logger(__name__)
 
 
@@ -26,6 +32,14 @@ class CpuPlatform(Platform):
     device_name = "CPU"
     device_type = "cpu"
     dispatch_key = "CPU"
+
+    @classmethod
+    def get_local_torch_device(cls) -> torch.device:
+        return torch.device("cpu")
+
+    @classmethod
+    def get_torch_distributed_backend_str(cls) -> str:
+        return "gloo"
 
     @classmethod
     def get_cpu_architecture(cls) -> CpuArchEnum:
@@ -37,10 +51,6 @@ class CpuPlatform(Platform):
             return CpuArchEnum.ARM
         else:
             return CpuArchEnum.UNSPECIFIED
-
-    @classmethod
-    def get_local_torch_device(cls) -> torch.device:
-        return torch.device("cpu")
 
     @classmethod
     def get_device_name(cls, device_id: int = 0) -> str:
@@ -70,7 +80,7 @@ class CpuPlatform(Platform):
     @classmethod
     def get_available_gpu_memory(
         cls,
-        device_id: int = 0,
+        device_id: int | None = None,
         distributed: bool = False,
         empty_cache: bool = True,
         cpu_group: Any = None,
@@ -92,21 +102,32 @@ class CpuPlatform(Platform):
         return free_memory / (1 << 30)
 
     @classmethod
-    def get_device_communicator_cls(cls) -> str:
-        return "sglang.multimodal_gen.runtime.distributed.device_communicators.cpu_communicator.CpuCommunicator"
-
-    @classmethod
     def get_attn_backend_cls_str(
         cls,
         selected_backend: AttentionBackendEnum | None,
         head_size: int,
         dtype: torch.dtype,
     ) -> str:
-
-        logger.info("Using Torch SDPA backend")
+        if selected_backend not in (
+            None,
+            AttentionBackendEnum.TORCH_SDPA,
+            AttentionBackendEnum.AMX_ATTN,
+        ):
+            logger.warning(
+                "%s is not supported on CPU; falling back to auto selection SDPA or AMX_ATTN",
+                selected_backend,
+            )
+        if _is_cpu and _is_cpu_amx_available:
+            logger.info("Using AMX Attention backend for CPU.")
+            return "sglang.multimodal_gen.runtime.layers.attention.backends.amx_attn.AMXAttentionBackend"
+        logger.info("Using Torch SDPA backend for CPU.")
         return (
             "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
         )
+
+    @classmethod
+    def get_device_communicator_cls(cls) -> str:
+        return "sglang.multimodal_gen.runtime.distributed.device_communicators.cpu_communicator.CpuCommunicator"
 
     @classmethod
     def enable_dit_layerwise_offload_for_wan_by_default(cls) -> bool:
