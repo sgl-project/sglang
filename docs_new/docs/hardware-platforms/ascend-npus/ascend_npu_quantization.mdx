@@ -387,9 +387,9 @@ python3 -m sglang.launch_server \
 
 **MXFP4 W4A4 for LLM dense models (e.g. Qwen3 / Qwen3.5):**
 
-LLM dense W4A4 (single-level MXFP4 4-bit weights + 4-bit activations) Linear support was added in [PR #23795](https://github.com/sgl-project/sglang/pull/23795). Requires Ascend A5 series or newer. On the Ascend NPU backend `--quantization mxfp4` selects this W4A4 path (on GPU the same flag selects the upstream OCP MXFP4 MoE config instead).
+LLM dense W4A4 (MXFP4 4-bit weights + 4-bit activations) Linear support was added in [PR #23795](https://github.com/sgl-project/sglang/pull/23795). Requires Ascend A5 series (Ascend 950) or newer — the dual-level online path uses the `DualLevelQuantBatchMatmul` op, which A2/A3 lack. On the Ascend NPU backend `--quantization mxfp4` selects this W4A4 path (on GPU the same flag selects the upstream OCP MXFP4 MoE config instead).
 
-- Online W4A4 quantization (BF16/FP16 weights → MXFP4 at load time):
+- Online W4A4 quantization (BF16/FP16 weights → dual-level MXFP4 at load time):
 
 ```bash Command
 python3 -m sglang.launch_server \
@@ -403,10 +403,10 @@ python3 -m sglang.launch_server \
 - Offline W4A4 quantization (msmodelslim pre-quantized weights, `W4A4_MXFP4` scheme; no `--quantization` flag needed — auto-detected from `quant_model_description.json`).
 
 > **Implementation Notes:**
-> - Both weights and activations are single-level MXFP4 (`float4_e2m1fn_x2`) with a UE8M0 per-block shared exponent (block_size = 32). Matmul runs via `npu_quant_matmul(..., x1_dtype=x2_dtype=torch_npu.float4_e2m1fn_x2, group_sizes=[1, 1, 32])`.
+> - **Online** (`NPUDualLevelMXFP4LinearMethod`) uses **dual-level** MXFP4: both weights and activations are quantized with a fine FP8 (E4M3) L0 block scale plus a coarser L1 scale via `npu_dynamic_dual_level_mx_quant`, and the matmul runs via `npu_dual_level_quant_matmul` (weight in FRACTAL_NZ). Dual-level captures per-block dynamic range far better than a single UE8M0 (power-of-2) scale, which is what made an earlier single-level RTN online path degenerate (greedy decoding could loop without emitting EOS).
+> - **Offline** (`ModelSlimMXFP4Scheme` → `NPUSingleLevelMXFP4OfflineLinearMethod`) is **single-level**: msmodelslim's `W4A4_MXFP4` checkpoint ships single-level UE8M0 block scales (block_size = 32), so the matmul runs via `npu_quant_matmul(..., x1_dtype=x2_dtype=torch_npu.float4_e2m1fn_x2, group_sizes=[1, 1, 32])`. The online and offline paths therefore use different matmul kernels — they no longer share the matmul path.
 > - As with W4A8, the packed-FP4 dtype passed to the NPU ops (`dst_type` / `x2_dtype`) must be resolved from `torch_npu.float4_e2m1fn_x2` (an int enum), not the `torch.float4_e2m1fn_x2` dtype object, which recent op-plugin builds reject.
-> - Online (`NPUSingleLevelMXFP4LinearMethod`, RTN at load) and offline (`ModelSlimMXFP4Scheme` → `NPUSingleLevelMXFP4OfflineLinearMethod`, msmodelslim fp8-container FP4 checkpoint) share the same matmul path; they differ only in the weight source.
-> - Not yet end-to-end validated on A5 hardware (tracked as WIP).
+> - Validated end-to-end on Ascend A5 hardware.
 
 ## Diffusion Model Quantization on Ascend NPU
 
