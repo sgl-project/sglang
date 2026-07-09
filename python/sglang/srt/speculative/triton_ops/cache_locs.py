@@ -14,60 +14,6 @@ _is_xpu = is_xpu()
 
 
 @triton.jit
-def assign_req_to_token_pool(
-    req_pool_indices,
-    req_to_token,
-    start_offset,
-    end_offset,
-    out_cache_loc,
-    pool_len: tl.constexpr,
-    bs_upper: tl.constexpr,
-):
-    BLOCK_SIZE: tl.constexpr = 32
-    pid = tl.program_id(axis=0)
-    kv_start = tl.load(start_offset + pid)
-    kv_end = tl.load(end_offset + pid)
-    token_pool = req_to_token + tl.load(req_pool_indices + pid) * pool_len
-
-    length_offset = tl.arange(0, bs_upper)
-    start = tl.load(start_offset + length_offset, mask=length_offset < pid, other=0)
-    end = tl.load(end_offset + length_offset, mask=length_offset < pid, other=0)
-    out_offset = tl.sum(end - start, axis=0)
-
-    out_cache_ptr = out_cache_loc + out_offset
-
-    save_offset = tl.arange(0, BLOCK_SIZE) + kv_start
-    load_offset = tl.arange(0, BLOCK_SIZE)
-
-    num_loop = tl.cdiv(kv_end - kv_start, BLOCK_SIZE)
-    for _ in range(num_loop):
-        mask = save_offset < kv_end
-        data = tl.load(out_cache_ptr + load_offset, mask=mask)
-        tl.store(token_pool + save_offset, data, mask=mask)
-        save_offset += BLOCK_SIZE
-        load_offset += BLOCK_SIZE
-
-
-def assign_req_to_token_pool_func(
-    req_pool_indices: torch.Tensor,
-    req_to_token: torch.Tensor,
-    start_offset: torch.Tensor,
-    end_offset: torch.Tensor,
-    out_cache_loc: torch.Tensor,
-    batch_size: int,
-):
-    assign_req_to_token_pool[(batch_size,)](
-        req_pool_indices,
-        req_to_token,
-        start_offset,
-        end_offset,
-        out_cache_loc,
-        req_to_token.shape[1],
-        next_power_of_2(batch_size),
-    )
-
-
-@triton.jit
 def assign_draft_cache_locs_contiguous(
     req_pool_indices,
     req_to_token,
