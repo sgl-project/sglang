@@ -202,7 +202,7 @@ INDEXER_KERNEL void fused_norm_rope_indexer(const __grid_constant__ FusedNormRop
       local_max = math::max(local_max, math::abs(data[i]));
     }
     const auto abs_max = warp::reduce_max(local_max);
-    const auto scale = fmaxf(1e-4f, abs_max) / math::FP8_E4M3_MAX;
+    const auto scale = fmaxf(1e-4f, abs_max) / kFP8E4M3Max;
     const auto inv_scale = 1.0f / scale;
     const int64_t page = out_loc >> kPageBits;
     const int64_t offset = out_loc & ((1 << kPageBits) - 1);
@@ -488,7 +488,7 @@ FLASHMLA_KERNEL void fused_norm_rope_flashmla(const __grid_constant__ FusedNormR
     const auto x = cast<float>(cast<bf16_t>(data[0]));
     const auto y = cast<float>(cast<bf16_t>(data[1]));
     const auto abs_max = warp::reduce_max(fmaxf(fabs(x), fabs(y)));
-    const auto scale_raw = fmaxf(1e-4f, abs_max) / math::FP8_E4M3_MAX;
+    const auto scale_raw = fmaxf(1e-4f, abs_max) / kFP8E4M3Max;
     const auto scale_ue8m0 = cast_to_ue8m0(scale_raw);
     const auto inv_scale = inv_scale_ue8m0(scale_ue8m0);
     const auto result = pack_fp8(x * inv_scale, y * inv_scale);
@@ -693,7 +693,7 @@ FLASHMLA_KERNEL void fused_norm_rope_flashmla_bf16(const __grid_constant__ Fused
 
   const auto input = static_cast<DType*>(params.input) + work_id * kHeadDim;
   int32_t position;
-  int32_t out_loc;
+  int64_t out_loc;
   if constexpr (kMode == CompressExtend) {
     const auto plan = static_cast<const PlanC*>(params.handle)[work_id];
     if (plan.is_invalid()) return;
@@ -742,8 +742,8 @@ FLASHMLA_KERNEL void fused_norm_rope_flashmla_bf16(const __grid_constant__ Fused
     }
   }
 
-  const int32_t page = out_loc >> kPageBits;
-  const int32_t offset = out_loc & ((1 << kPageBits) - 1);
+  const int64_t page = out_loc >> kPageBits;
+  const int64_t offset = out_loc & ((1 << kPageBits) - 1);
   const auto page_ptr = params.kvcache + page * kPageBytes;
   // BF16 layout: each token occupies 1024 bytes contiguously
   // [0..895] = 448 BF16 nope values, [896..1023] = 64 BF16 rope values

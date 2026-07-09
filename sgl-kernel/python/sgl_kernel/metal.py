@@ -32,19 +32,19 @@ else:
 
 
 def rope_pool_fused(
-    q: "mx.array",
-    k: "mx.array",
-    v: "mx.array",
-    positions: "mx.array",
-    slots: "mx.array",
-    k_pool: "mx.array",
-    v_pool: "mx.array",
+    q: mx.array,
+    k: mx.array,
+    v: mx.array,
+    positions: mx.array,
+    slots: mx.array,
+    k_pool: mx.array,
+    v_pool: mx.array,
     *,
     head_dim: int,
     num_qo_heads: int,
     num_kv_heads: int,
     rope_base: float,
-) -> tuple["mx.array", "mx.array", "mx.array", "mx.array"]:
+) -> tuple[mx.array, mx.array, mx.array, mx.array]:
     """Apply NeoX RoPE to Q/K and scatter K/V into the MLX KV pool.
 
     Args:

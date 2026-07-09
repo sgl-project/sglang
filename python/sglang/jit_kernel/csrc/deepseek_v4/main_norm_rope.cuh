@@ -46,6 +46,20 @@ constexpr uint32_t kFusedKNumWarps = kFusedKBlockSize / device::kWarpThreads;
 #define Q_KERNEL __global__ __launch_bounds__(kFusedQBlockSize, 16)
 #define K_KERNEL __global__ __launch_bounds__(kFusedKBlockSize, 8)
 
+template <int64_t kRopeDim>
+SGL_DEVICE device::AlignedVector<float, 4>
+load_rope_first_cos_sin(const float* __restrict__ cos_sin_cache, int32_t lane_id) {
+  constexpr int64_t kHalfRopeDim = kRopeDim / 2;
+  const int32_t pair0 = lane_id * 2;
+  const int32_t pair1 = pair0 + 1;
+  device::AlignedVector<float, 4> freq;
+  freq[0] = cos_sin_cache[pair0];
+  freq[1] = cos_sin_cache[kHalfRopeDim + pair0];
+  freq[2] = cos_sin_cache[pair1];
+  freq[3] = cos_sin_cache[kHalfRopeDim + pair1];
+  return freq;
+}
+
 // ============================================================================
 // Q kernel: warp-per-(token, head) rmsnorm-self + RoPE + write to q_out.
 // ============================================================================
@@ -563,16 +577,21 @@ struct FusedQIndexerRopeHadamardQuantParams {
   // weights_out[b, h] = weight[b, h] * weight_scale * q_scale[b, h].
   // q_scale is computed internally and not exposed -- the only consumer of
   // it is `weights_out`.
-  const void* __restrict__ weight;      // (B, num_heads) DType
-  float* __restrict__ weights_out;      // (B, num_heads) fp32 (== (B, H, 1) flat)
-  float weight_scale;                   // scalar c4_indexer.weight_scale
-  const float* __restrict__ freqs_cis;  // (max_pos, 64) fp32
-  const void* __restrict__ positions;   // (B,) PosT
+  const void* __restrict__ weight;  // (B, num_heads) DType
+  float* __restrict__ weights_out;  // (B, num_heads) fp32 (== (B, H, 1) flat)
+  float weight_scale;               // scalar c4_indexer.weight_scale
+  // Template-dependent layout:
+  //   kRopeFirst=false: (max_pos, 64) fp32 interleaved [cos0, sin0, ...]
+  //   kRopeFirst=true : (max_pos, 64) fp32 halves [cos..., sin...]
+  const float* __restrict__ rope_cache;
+  const void* __restrict__ positions;  // (B,) PosT
+  // Row stride for `weight` (caller passes the non-contiguous wk slice directly).
+  int64_t weight_stride_batch;
   uint32_t batch_size;
   uint32_t num_heads;
 };
 
-template <typename DType, typename PosT, bool kUsePDL>
+template <typename DType, typename PosT, bool kUsePDL, bool kRopeFirst = false, bool kHadamard = true>
 Q_KERNEL void fused_q_indexer_rope_hadamard_quant(const __grid_constant__ FusedQIndexerRopeHadamardQuantParams params) {
   using namespace device;
 
@@ -591,9 +610,9 @@ Q_KERNEL void fused_q_indexer_rope_hadamard_quant(const __grid_constant__ FusedQ
   const auto warp_id = threadIdx.x / kWarpThreads;
   const auto lane_id = threadIdx.x % kWarpThreads;
   const auto work_id = blockIdx.x * kFusedQNumWarps + warp_id;
-  // Last `kRopeSize` lanes own the rope tail; their 4-elem packs cover the
-  // trailing kRopeDim elements.
-  const bool is_rope_lane = lane_id >= kWarpThreads - kRopeSize;
+  // V4 ropes the trailing kRopeDim dims (kRopeFirst=false); V3.2 ropes the
+  // leading kRopeDim dims (kRopeFirst=true). Select the owning lanes per layout.
+  const bool is_rope_lane = kRopeFirst ? (lane_id < kRopeSize) : (lane_id >= kWarpThreads - kRopeSize);
 
   const uint32_t total_works = params.batch_size * params.num_heads;
   if (work_id >= total_works) return;
@@ -601,7 +620,7 @@ Q_KERNEL void fused_q_indexer_rope_hadamard_quant(const __grid_constant__ FusedQ
   const uint32_t batch_id = work_id / params.num_heads;
   const auto input_ptr = static_cast<const DType*>(params.q_input) + work_id * kHeadDim;
   const auto position = static_cast<int32_t>(static_cast<const PosT*>(params.positions)[batch_id]);
-  const auto freqs_cis = params.freqs_cis + position * kRopeDim;
+  const auto rope_cache = params.rope_cache + position * kRopeDim;
 
   // Lane 0 prefetches the weight scalar for this (token, head) work item.
   // Weight is (B, num_heads) DType; we need one scalar per warp -- offload
@@ -610,13 +629,21 @@ Q_KERNEL void fused_q_indexer_rope_hadamard_quant(const __grid_constant__ FusedQ
 
   PDLWaitPrimary<kUsePDL>();
   Float4 data, freq;
-  const auto weight_val = cast<float>(static_cast<const DType*>(params.weight)[work_id]);
+  const uint32_t head_id = work_id - batch_id * params.num_heads;
+  const auto weight_val =
+      cast<float>(static_cast<const DType*>(params.weight)[batch_id * params.weight_stride_batch + head_id]);
 
   // part 1: load (no norm). Each lane owns a 4-elem pack.
   {
     Storage input_vec;
     input_vec.load(input_ptr, lane_id);
-    if (is_rope_lane) freq.load(freqs_cis, lane_id - (kWarpThreads - kRopeSize));
+    if (is_rope_lane) {
+      if constexpr (kRopeFirst) {
+        freq = load_rope_first_cos_sin<kRopeDim>(rope_cache, lane_id);
+      } else {
+        freq.load(rope_cache, lane_id - (kWarpThreads - kRopeSize));
+      }
+    }
 #pragma unroll
     for (int i = 0; i < kVecSize; ++i) {
       data[i] = cast<float>(input_vec[i]);
@@ -643,8 +670,10 @@ Q_KERNEL void fused_q_indexer_rope_hadamard_quant(const __grid_constant__ FusedQ
 
   // part 3: 128-point Hadamard (2 local stages + 5 cross-lane shfl_xor stages).
   // Same recipe as `fused_norm_rope_indexer`; see comments there for the
-  // butterfly invariants and the early-return safety argument.
-  {
+  // butterfly invariants and the early-return safety argument. V3.2 omits the
+  // rotation (kHadamard=false): it is logit-preserving (H orthonormal, applied
+  // to both q and k), so dropping it only trades fp8 quant accuracy.
+  if constexpr (kHadamard) {
     {
       const float a0 = data[0], a1 = data[1], a2 = data[2], a3 = data[3];
       data[0] = a0 + a1;
@@ -693,10 +722,10 @@ Q_KERNEL void fused_q_indexer_rope_hadamard_quant(const __grid_constant__ FusedQ
   }
 }
 
-template <typename DType, bool kUsePDL>
+template <typename DType, bool kUsePDL, bool kRopeFirst = false, bool kHadamard = true>
 struct FusedQIndexerRopeHadamardQuantKernel {
   template <typename PosT>
-  static constexpr auto kernel = fused_q_indexer_rope_hadamard_quant<DType, PosT, kUsePDL>;
+  static constexpr auto kernel = fused_q_indexer_rope_hadamard_quant<DType, PosT, kUsePDL, kRopeFirst, kHadamard>;
 
   static void forward(
       const tvm::ffi::TensorView q_input,
@@ -704,7 +733,7 @@ struct FusedQIndexerRopeHadamardQuantKernel {
       const tvm::ffi::TensorView weight,
       const tvm::ffi::TensorView weights_out,
       double weight_scale,
-      const tvm::ffi::TensorView freqs_cis,
+      const tvm::ffi::TensorView rope_cache,
       const tvm::ffi::TensorView positions) {
     using namespace host;
     constexpr int64_t kHeadDim = 128;
@@ -729,6 +758,7 @@ struct FusedQIndexerRopeHadamardQuantKernel {
         .with_device(device_)
         .verify(q_fp8);
     TensorMatcher({B, H})  //
+        .with_strides({-1, 1})
         .with_dtype<DType>()
         .with_device(device_)
         .verify(weight);
@@ -739,7 +769,7 @@ struct FusedQIndexerRopeHadamardQuantKernel {
     TensorMatcher({-1, kRopeDim})  //
         .with_dtype<float>()
         .with_device(device_)
-        .verify(freqs_cis);
+        .verify(rope_cache);
     auto pos_dtype = SymbolicDType{};
     TensorMatcher({B})  //
         .with_dtype<int32_t, int64_t>(pos_dtype)
@@ -768,8 +798,9 @@ struct FusedQIndexerRopeHadamardQuantKernel {
         .weight = weight.data_ptr(),
         .weights_out = static_cast<float*>(weights_out.data_ptr()),
         .weight_scale = static_cast<float>(weight_scale),
-        .freqs_cis = static_cast<const float*>(freqs_cis.data_ptr()),
+        .rope_cache = static_cast<const float*>(rope_cache.data_ptr()),
         .positions = positions.data_ptr(),
+        .weight_stride_batch = weight.stride(0),
         .batch_size = batch_size,
         .num_heads = num_heads,
     };

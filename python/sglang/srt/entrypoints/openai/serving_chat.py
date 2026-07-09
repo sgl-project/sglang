@@ -38,6 +38,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     FunctionResponse,
     LogProbs,
     MessageProcessingResult,
+    PromptTokensDetails,
     ResponseParserProtocol,
     SglExt,
     ToolCall,
@@ -70,8 +71,8 @@ from sglang.srt.parser.jinja_template_utils import process_content_for_template_
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.template_manager import TemplateManager
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
+    from sglang.srt.parser.template_manager import TemplateManager
 
 logger = logging.getLogger(__name__)
 
@@ -174,7 +175,9 @@ class OpenAIServingChat(OpenAIServingBase):
         if self.reasoning_parser:
             try:
                 rp = ReasoningParser(
-                    model_type=self.reasoning_parser, stream_reasoning=True
+                    model_type=self.reasoning_parser,
+                    stream_reasoning=True,
+                    tokenizer=self.tokenizer_manager.tokenizer,
                 )
                 self._reasoning_detector = rp.detector
             except ValueError as e:
@@ -336,6 +339,15 @@ class OpenAIServingChat(OpenAIServingBase):
         """Post-process reasoning and tool_calls before building response."""
         return reasoning_text, tool_calls
 
+    def _continuous_usage_cached_details(
+        self, content: Dict[str, Any]
+    ) -> Optional[PromptTokensDetails]:
+        if not self.tokenizer_manager.server_args.enable_cache_report:
+            return None
+        return UsageProcessor._details_if_cached(
+            content["meta_info"].get("cached_tokens", 0)
+        )
+
     async def _generate_stream_content(
         self,
         content: Dict[str, Any],
@@ -360,6 +372,11 @@ class OpenAIServingChat(OpenAIServingBase):
             delta = content["text"][offset:]
             stream_offsets[index] = len(content["text"])
 
+        # Attach logprobs to the first chunk emitted this step (reasoning,
+        # tool-call, or content) so they aren't dropped when a parser is active
+        # nor duplicated across chunks; flush any leftover at the end.
+        remaining_logprobs = choice_logprobs
+
         # Handle reasoning content
         if self.reasoning_parser and request.separate_reasoning:
             reasoning_text, delta = self._process_reasoning_stream(
@@ -372,6 +389,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         prompt_tokens=prompt_tokens.get(index, 0),
                         reasoning_tokens=reasoning_tokens.get(index, 0),
                         completion_tokens=completion_tokens.get(index, 0),
+                        cached_tokens=self._continuous_usage_cached_details(content),
                     ).model_dump()
 
                 yield build_sse_content(
@@ -380,8 +398,10 @@ class OpenAIServingChat(OpenAIServingBase):
                     model=request.model,
                     index=index,
                     reasoning_content=reasoning_text,
+                    logprobs=remaining_logprobs,
                     usage=usage,
                 )
+                remaining_logprobs = None
 
         # Handle tool calls
         if request.tool_choice != "none" and request.tools and self.tool_call_parser:
@@ -415,6 +435,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         prompt_tokens=prompt_tokens.get(index, 0),
                         reasoning_tokens=reasoning_tokens.get(index, 0),
                         completion_tokens=completion_tokens.get(index, 0),
+                        cached_tokens=self._continuous_usage_cached_details(content),
                     ).model_dump()
 
                 yield build_sse_content(
@@ -423,9 +444,36 @@ class OpenAIServingChat(OpenAIServingBase):
                     model=request.model,
                     index=index,
                     content=delta,
-                    logprobs=choice_logprobs,
+                    logprobs=remaining_logprobs,
                     usage=usage,
                 )
+                remaining_logprobs = None
+
+        # Flush logprobs still unattached this step — only when a parser is
+        # active, since _process_tool_call_stream may consume the delta and emit
+        # no content chunk. On the plain path an empty-delta step has no chunk
+        # to attach to either way, and a standalone empty-delta logprobs chunk
+        # is not a shape clients expect.
+        if remaining_logprobs is not None and (
+            self.reasoning_parser or self.tool_call_parser
+        ):
+            usage = None
+            if continuous_usage_stats:
+                usage = UsageProcessor.calculate_token_usage(
+                    prompt_tokens=prompt_tokens.get(index, 0),
+                    reasoning_tokens=reasoning_tokens.get(index, 0),
+                    completion_tokens=completion_tokens.get(index, 0),
+                    cached_tokens=self._continuous_usage_cached_details(content),
+                ).model_dump()
+
+            yield build_sse_content(
+                chunk_id=content["meta_info"]["id"],
+                created=int(time.time()),
+                model=request.model,
+                index=index,
+                logprobs=remaining_logprobs,
+                usage=usage,
+            )
 
     def _validate_request(self, request: ChatCompletionRequest) -> Optional[str]:
         """Validate that the input is valid."""
@@ -573,12 +621,14 @@ class OpenAIServingChat(OpenAIServingBase):
             return_routed_experts=request.return_routed_experts,
             routed_experts_start_len=request.routed_experts_start_len,
             rid=request.rid,
+            session_id=request.session_id,
             extra_key=self._compute_extra_key(request),
             require_reasoning=require_reasoning,
             priority=request.priority,
             routing_key=self.extract_routing_key(raw_request),
             custom_labels=custom_labels,
             custom_logit_processor=request.custom_logit_processor,
+            images_config=getattr(request, "images_config", None),
             image_max_dynamic_patch=img_max_dynamic_patch,
             video_max_dynamic_patch=vid_max_dynamic_patch,
             max_dynamic_patch=getattr(request, "max_dynamic_patch", None),
@@ -620,7 +670,11 @@ class OpenAIServingChat(OpenAIServingBase):
             else:
                 tools = [item.model_dump() for item in request.tools]
             if self.tool_call_parser:
-                parser = FunctionCallParser(request.tools, self.tool_call_parser)
+                parser = FunctionCallParser(
+                    request.tools,
+                    self.tool_call_parser,
+                    tokenizer=self.tokenizer_manager.tokenizer,
+                )
                 tool_call_constraint = parser.get_structure_constraint(
                     request.tool_choice,
                     parallel_tool_calls=request.parallel_tool_calls,
@@ -797,6 +851,18 @@ class OpenAIServingChat(OpenAIServingBase):
             if request.chat_template_kwargs:
                 extra_template_kwargs.update(request.chat_template_kwargs)
 
+            rc = self.template_manager.reasoning_config
+            if rc is not None and rc.effort_kwarg is not None:
+                if request.reasoning_effort == "low":
+                    extra_template_kwargs.setdefault(rc.effort_kwarg, True)
+                elif request.reasoning_effort in ("medium", "high", "max"):
+                    logger.warning(
+                        "Model '%s' supports only 'low' reasoning effort; "
+                        "requested '%s' treated as default thinking",
+                        self.tokenizer_manager.server_args.served_model_name,
+                        request.reasoning_effort,
+                    )
+
             # Split apply_chat_template(tokenize=True) into render + encode so we
             # can skip add_special_tokens=False on tokenizers that don't auto-add
             # specials (Kimi-like, OpenAI-chat analogue of #25265). Chat
@@ -819,7 +885,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 prompt_ids = self.tokenizer_manager.tokenizer.encode(
                     rendered_prompt, **encode_kwargs
                 )
-            except Exception as e:
+            except Exception:
                 # If the first attempt fails, try with flat function-only format.
                 # Some templates (e.g. Mistral) expect tools without the OpenAI wrapper.
                 tools = (
@@ -1279,6 +1345,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         stream_reasoning=False,
                         force_reasoning=force_reasoning,
                         request=request,
+                        tokenizer=self.tokenizer_manager.tokenizer,
                     )
                     reasoning_text, text = parser.parse_non_stream(text)
                 except Exception as e:
@@ -1462,7 +1529,9 @@ class OpenAIServingChat(OpenAIServingBase):
         # For required/named: only use parser when structural_tag was used
         # as constraint (mirrors the streaming path). For auto: always try.
         if self.tool_call_parser:
-            parser = FunctionCallParser(tools, self.tool_call_parser)
+            parser = FunctionCallParser(
+                tools, self.tool_call_parser, tokenizer=self.tokenizer_manager.tokenizer
+            )
             should_try_parser = (
                 not is_required or parser.detector.supports_structural_tag()
             )
@@ -1575,6 +1644,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 request.stream_reasoning,
                 is_force_reasoning,
                 request,
+                tokenizer=self.tokenizer_manager.tokenizer,
             )
         reasoning_parser = reasoning_parser_dict[index]
         return reasoning_parser.parse_stream_chunk(delta)
@@ -1819,6 +1889,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     probe = FunctionCallParser(
                         tools=request.tools,
                         tool_call_parser=self.tool_call_parser,
+                        tokenizer=self.tokenizer_manager.tokenizer,
                     )
                     use_native_parser = probe.detector.supports_structural_tag()
                 if use_native_parser:
@@ -1829,6 +1900,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 parser_dict[index] = FunctionCallParser(
                     tools=request.tools,
                     tool_call_parser=self.tool_call_parser,
+                    tokenizer=self.tokenizer_manager.tokenizer,
                 )
 
         parser = parser_dict[index]
@@ -1863,6 +1935,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     prompt_tokens=prompt_tokens,
                     completion_tokens=completion_tokens,
                     reasoning_tokens=reasoning_tokens,
+                    cached_tokens=self._continuous_usage_cached_details(content),
                 )
 
             yield f"data: {chunk.model_dump_json()}\n\n"
@@ -1915,6 +1988,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     prompt_tokens=prompt_tokens,
                     completion_tokens=completion_tokens,
                     reasoning_tokens=reasoning_tokens,
+                    cached_tokens=self._continuous_usage_cached_details(content),
                 )
 
             yield f"data: {chunk.model_dump_json()}\n\n"

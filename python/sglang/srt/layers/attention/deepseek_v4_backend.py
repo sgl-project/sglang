@@ -18,27 +18,19 @@ from typing import (
 import torch
 import torch.nn.functional as F
 
+from sglang.jit_kernel.dsv4.online_c128_mtp import OnlineC128MTPController
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.runtime_context import get_parallel
-
-if envs.SGLANG_OPT_USE_COMPRESSOR_V2.get():
-    # NOTE: should eventually be the only compressor backend
-    from sglang.srt.layers.attention.dsv4.compressor_v2 import (
-        CompressorBackendMixin,
-        FusedCompressMetadata,
-        create_paged_compressor_data,
-    )
-else:
-    from sglang.srt.layers.attention.dsv4.compressor import (
-        CompressorBackendMixin,
-        FusedCompressMetadata,
-        create_paged_compressor_data,
-    )
-
-from sglang.jit_kernel.dsv4.online_c128_mtp import OnlineC128MTPController
+from sglang.srt.layers.attention.dsv4.compressor_v2 import (
+    CompressorBackendMixin,
+    FusedCompressMetadata,
+    create_paged_compressor_data,
+)
 from sglang.srt.layers.attention.dsv4.dequant_k_cache import (
     dequantize_k_cache_paged,
+)
+from sglang.srt.layers.attention.dsv4.gather_bf16_k_cache import (
+    gather_bf16_k_cache_paged,
 )
 from sglang.srt.layers.attention.dsv4.indexer import C4IndexerBackendMixin
 from sglang.srt.layers.attention.dsv4.metadata import (
@@ -56,11 +48,13 @@ from sglang.srt.layers.attention.dsv4.quant_k_cache import (
 )
 from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
     SparsePrefillChunkCache,
+    SparsePrefillWorkspace,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc
-from sglang.srt.utils import ceil_align
+from sglang.srt.utils import ceil_align, is_xpu
 from sglang.srt.utils.common import is_sm120_supported
 
 if TYPE_CHECKING:
@@ -70,6 +64,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 _is_sm120 = is_sm120_supported()
+_is_xpu = is_xpu()
 
 logger = logging.getLogger(__name__)
 
@@ -121,7 +116,7 @@ def _pad_last_dim(x: T, multiples_of: int = PAGE_INDEX_ALIGNED_SIZE) -> T:
 
 
 def _create_flashmla_metadata():
-    if _is_sm120:
+    if _is_sm120 or _is_xpu:
         return None
     import sgl_kernel.flash_mla as flash_mla
 
@@ -374,8 +369,8 @@ class DSV4Metadata:
     c128_compress_metadata: Optional[FusedCompressMetadata] = None
 
     # Lazily populated on the first call to ``_forward_prefill_sparse`` and
-    # reused across every layer in the chunk. Reset to ``None`` on copy_ so
-    # cuda-graph replay rebuilds it for the next forward.
+    # reused across every layer in the chunk. Reset to ``None`` when graph
+    # metadata is refreshed so replay rebuilds it from the live batch.
     sparse_prefill_cache: Optional[SparsePrefillChunkCache] = None
 
     @property
@@ -408,6 +403,7 @@ class DSV4Metadata:
                 self.c128_compress_metadata,
                 src=static_metadata.c128_compress_metadata,
             )
+        self.sparse_prefill_cache = None
 
 
 @dataclass
@@ -518,6 +514,7 @@ class DeepseekV4AttnBackend(
             DSV4RawDecodeMetadata,
         ] = None
         self.online_c128_mtp = OnlineC128MTPController(self)
+        self.sparse_prefill_workspace = SparsePrefillWorkspace(self.device)
 
     def _move_to_device(self, x: List[int]) -> torch.Tensor:
         pin_tensor = torch.tensor(x, dtype=torch.int32, pin_memory=True)
@@ -552,11 +549,17 @@ class DeepseekV4AttnBackend(
             online_state_slot_offset=online_c128_state_slot_offset,
         )
 
-    def init_forward_metadata_indexer(self, core_attn_metadata: DSV4AttnMetadata):
+    def init_forward_metadata_indexer(
+        self,
+        core_attn_metadata: DSV4AttnMetadata,
+        *,
+        use_prefill_cuda_graph: bool = False,
+    ):
         return PagedIndexerMetadata(
             page_size=self.page_size,
             page_table=core_attn_metadata.page_table,
             c4_seq_lens=core_attn_metadata.c4_topk_lengths_raw,
+            use_prefill_cuda_graph=use_prefill_cuda_graph,
         )
 
     def init_forward_metadata_decode(
@@ -639,7 +642,10 @@ class DeepseekV4AttnBackend(
             is_prefill=True,
         )
         indexer_metadata = (
-            self.init_forward_metadata_indexer(core_attn_metadata)
+            self.init_forward_metadata_indexer(
+                core_attn_metadata,
+                use_prefill_cuda_graph=use_prefill_cuda_graph,
+            )
             if need_compress
             else None
         )
@@ -1441,9 +1447,12 @@ class DeepseekV4AttnBackend(
                     extra_topk_length=extra_topk_lengths,
                 )[0]
             else:
-                import sgl_kernel.flash_mla as flash_mla
+                if _is_xpu:
+                    from sgl_kernel import flash_mla_with_kvcache
+                else:
+                    from sgl_kernel.flash_mla import flash_mla_with_kvcache
 
-                o = flash_mla.flash_mla_with_kvcache(
+                o = flash_mla_with_kvcache(
                     q=q,
                     k_cache=swa_k_cache,
                     head_dim_v=self.head_dim_v,
@@ -1461,127 +1470,6 @@ class DeepseekV4AttnBackend(
                 )[0]
 
             o = o.squeeze(1)
-            # # PyTorch reference implementation of flash_mla sparse decode attention
-            # # for BF16 KV cache. Correctness-first; performance will be addressed
-            # # later with a dedicated FlashMLA kernel for SM100.
-            # #
-            # # q: (batch_size, 1, num_heads_q, head_dim)
-            # # swa_k_cache: (num_pages, page_size, 1, head_dim) bf16
-            # # swa_page_indices: (batch_size, 1, topk) -- encodes page_idx * page_size + offset
-            # # swa_topk_lengths: (batch_size,)
-            # # extra_k_cache: (num_pages, extra_page_size, 1, head_dim) bf16 or None
-            # # extra_indices: (batch_size, 1, extra_topk) or None
-            # # extra_topk_lengths: (batch_size,) or None
-            # # attn_sink: (num_heads_q,) float32
-
-            # batch_size = q.shape[0]
-            # num_heads_q = q.shape[2]  # q is (B, 1, H, D)
-            # head_dim = q.shape[-1]
-
-            # # Flatten swa_k_cache: (num_pages, page_size, 1, head_dim) -> (total_tokens, head_dim)
-            # flat_swa_kv = swa_k_cache.reshape(
-            #     -1, head_dim
-            # )  # (num_pages * page_size, head_dim)
-
-            # # Gather SWA KV tokens using indices
-            # # swa_page_indices: (batch_size, 1, topk)
-            # swa_topk = swa_page_indices.shape[-1]
-            # flat_swa_indices = swa_page_indices.reshape(
-            #     batch_size, swa_topk
-            # )  # (B, topk)
-
-            # # Mark invalid indices (negative) and clamp for safe gather
-            # swa_valid_mask = flat_swa_indices >= 0  # (B, topk)
-            # safe_swa_indices = flat_swa_indices.clamp(min=0)  # (B, topk)
-
-            # # Gather: (B, topk, head_dim)
-            # gathered_swa_kv = flat_swa_kv[safe_swa_indices.reshape(-1)].reshape(
-            #     batch_size, swa_topk, head_dim
-            # )
-
-            # # Build topk validity mask from swa_topk_lengths
-            # topk_range = torch.arange(swa_topk, device=q.device).unsqueeze(
-            #     0
-            # )  # (1, topk)
-            # swa_length_mask = topk_range < swa_topk_lengths.unsqueeze(1)  # (B, topk)
-            # swa_mask = swa_valid_mask & swa_length_mask  # (B, topk)
-
-            # # Handle extra KV cache (C4 or C128 compressed tokens)
-            # if extra_k_cache is not None and extra_indices is not None:
-            #     flat_extra_kv = extra_k_cache.reshape(-1, head_dim)
-            #     extra_topk = extra_indices.shape[-1]
-            #     flat_extra_indices = extra_indices.reshape(batch_size, extra_topk)
-
-            #     extra_valid_mask = flat_extra_indices >= 0
-            #     safe_extra_indices = flat_extra_indices.clamp(min=0)
-
-            #     gathered_extra_kv = flat_extra_kv[
-            #         safe_extra_indices.reshape(-1)
-            #     ].reshape(batch_size, extra_topk, head_dim)
-
-            #     extra_range = torch.arange(extra_topk, device=q.device).unsqueeze(0)
-            #     extra_length_mask = extra_range < extra_topk_lengths.unsqueeze(1)
-            #     extra_mask = extra_valid_mask & extra_length_mask  # (B, extra_topk)
-
-            #     # Concatenate SWA and extra KV tokens
-            #     all_kv = torch.cat(
-            #         [gathered_swa_kv, gathered_extra_kv], dim=1
-            #     )  # (B, topk+extra_topk, D)
-            #     all_mask = torch.cat(
-            #         [swa_mask, extra_mask], dim=1
-            #     )  # (B, topk+extra_topk)
-            # else:
-            #     all_kv = gathered_swa_kv  # (B, topk, D)
-            #     all_mask = swa_mask  # (B, topk)
-
-            # # Compute attention scores
-            # # q: (B, 1, num_heads_q, head_dim) -> (B, num_heads_q, 1, head_dim)
-            # q_for_attn = q.squeeze(1).unsqueeze(2)  # (B, num_heads_q, 1, head_dim)
-            # # all_kv: (B, total_kv, head_dim) -> (B, 1, total_kv, head_dim) broadcast over heads
-            # kv_for_attn = all_kv.unsqueeze(1)  # (B, 1, total_kv, head_dim)
-
-            # # scores: (B, num_heads_q, 1, total_kv)
-            # scores = (
-            #     torch.matmul(q_for_attn, kv_for_attn.transpose(-2, -1))
-            #     * self.softmax_scale
-            # )
-
-            # # Apply mask: set invalid positions to -inf
-            # # all_mask: (B, total_kv) -> (B, 1, 1, total_kv)
-            # attn_mask = all_mask.unsqueeze(1).unsqueeze(2)
-            # scores = scores.masked_fill(~attn_mask, float("-inf"))
-
-            # # Softmax
-            # attn_weights = torch.softmax(
-            #     scores, dim=-1
-            # )  # (B, num_heads_q, 1, total_kv)
-            # # Handle all-masked rows (NaN from softmax of all -inf)
-            # attn_weights = attn_weights.nan_to_num(0.0)
-
-            # # Compute output: (B, num_heads_q, 1, head_dim_v)
-            # # V = KV[:, :head_dim_v]
-            # v_for_attn = kv_for_attn[
-            #     ..., : self.head_dim_v
-            # ]  # (B, 1, total_kv, head_dim_v)
-            # o = torch.matmul(
-            #     attn_weights, v_for_attn
-            # )  # (B, num_heads_q, 1, head_dim_v)
-            # o = o.squeeze(2)  # (B, num_heads_q, head_dim_v)
-
-            # # Apply attn_sink scaling: output *= exp(lse) / (exp(lse) + exp(attn_sink))
-            # # which equals sigmoid(lse - attn_sink)
-            # if attn_sink is not None:
-            #     # Compute lse = log(sum(exp(scores))) for valid positions
-            #     # scores: (B, num_heads_q, 1, total_kv)
-            #     lse = torch.logsumexp(scores, dim=-1).squeeze(-1)  # (B, num_heads_q)
-            #     # attn_sink: (num_heads_q,) -> (1, num_heads_q)
-            #     sink = attn_sink.unsqueeze(0)  # (1, num_heads_q)
-            #     # scale = exp(lse) / (exp(lse) + exp(attn_sink)) = sigmoid(lse - attn_sink)
-            #     scale = torch.sigmoid(lse - sink)  # (B, num_heads_q)
-            #     o = o * scale.unsqueeze(-1)  # (B, num_heads_q, head_dim_v)
-
-            # # Ensure output dtype matches input q dtype
-            # o = o.to(q.dtype)
 
             return o
 
@@ -1612,6 +1500,8 @@ class DeepseekV4AttnBackend(
 
         cache = self.forward_metadata.sparse_prefill_cache
         if cache is None:
+            seq_lens_cpu = forward_batch.seq_lens_cpu
+            assert seq_lens_cpu is not None
             # ``swa_window_size`` on the pool is its storage page size, not
             # the model's SWA window — pass both explicitly.
             cache = SparsePrefillChunkCache.build(
@@ -1623,6 +1513,7 @@ class DeepseekV4AttnBackend(
                 swa_window_size=SWA_WINDOW,
                 swa_page_size=token_to_kv_pool.swa_window_size,
                 num_qo_tokens=q_flat.shape[0],
+                max_seq_len=int(seq_lens_cpu.max().item()),
             )
             self.forward_metadata.sparse_prefill_cache = cache
 
@@ -1633,7 +1524,7 @@ class DeepseekV4AttnBackend(
         extra_page_size = None
         flat_token_ids = None
         if compress_ratio == 0:
-            workspace = cache.c0_workspace
+            workspace = self.sparse_prefill_workspace.get(cache.swa_token_ids.shape[0])
             combined_indices = cache.c0_combined_indices
             combined_lens = cache.c0_combined_lens
             swa_slice = workspace
@@ -1644,7 +1535,6 @@ class DeepseekV4AttnBackend(
                 assert core_attn_metadata.c128_page_indices is not None
                 cache.ensure_c128(core_attn_metadata.c128_page_indices)
                 flat_token_ids = cache.c128_flat_token_ids
-                workspace = cache.c128_workspace
                 combined_indices = cache.c128_combined_indices
                 combined_lens = cache.c128_combined_lens
             else:
@@ -1654,22 +1544,32 @@ class DeepseekV4AttnBackend(
                 )
                 cache.ensure_c4(core_attn_metadata.page_table, extra_page_size)
                 flat_token_ids = cache.c4_flat_token_ids
-                workspace = cache.c4_workspace
                 combined_indices, combined_lens = cache.combine_c4_layer(
-                    c4_sparse_raw_indices=core_attn_metadata.c4_sparse_raw_indices,
+                    c4_sparse_raw_indices=core_attn_metadata.c4_sparse_raw_indices[
+                        : cache.num_qo_tokens
+                    ],
                 )
             n_compressed = flat_token_ids.shape[0]
+            workspace = self.sparse_prefill_workspace.get(
+                n_compressed + cache.swa_token_ids.shape[0]
+            )
             compressed_slice = workspace[:n_compressed]
             swa_slice = workspace[n_compressed:]
 
+        populate_kv_workspace = (
+            gather_bf16_k_cache_paged
+            if self.is_bf16_kv_cache
+            else dequantize_k_cache_paged
+        )
+
         if compressed_slice is not None:
-            dequantize_k_cache_paged(
+            populate_kv_workspace(
                 extra_k_cache,
                 flat_token_ids,
                 page_size=extra_page_size,
                 out=compressed_slice,
             )
-        dequantize_k_cache_paged(
+        populate_kv_workspace(
             token_to_kv_pool.get_swa_key_buffer_radix(layer_id),
             cache.swa_token_ids,
             page_size=cache.swa_page_size,
