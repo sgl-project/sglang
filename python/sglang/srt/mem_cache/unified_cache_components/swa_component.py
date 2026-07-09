@@ -581,7 +581,7 @@ class SWAComponent(TreeComponent):
     ) -> Optional[int]:
         # Unfinished requests can already have an SWA-evicted prefix; preserve
         # that boundary so insertion creates a tombstone instead of live SWA KV.
-        insert_params.swa_evicted_seqlen = req.swa_evicted_seqlen
+        insert_params.swa_evicted_seqlen = req.kv.swa_evicted_seqlen
         return None
 
     def free_out_of_window_slots(
@@ -596,7 +596,7 @@ class SWAComponent(TreeComponent):
                 req_to_token_pool=self.cache.req_to_token_pool,
                 token_to_kv_pool_allocator=self.cache.token_to_kv_pool_allocator,
             )
-        insert_params.swa_evicted_seqlen = req.swa_evicted_seqlen
+        insert_params.swa_evicted_seqlen = req.kv.swa_evicted_seqlen
 
     # ---- HiCache Hooks ----
 

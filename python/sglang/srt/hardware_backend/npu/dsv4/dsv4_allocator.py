@@ -663,7 +663,7 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
 
         if req is None or req_to_token_pool is None:
             return
-        kv_len = max(req.kv_committed_len, req.kv_allocated_len)
+        kv_len = max(req.kv_committed_len, req.kv.kv_allocated_len)
         req_pool_idx = req.req_pool_idx
         if kv_len <= 0 or req_pool_idx is None:
             return
