@@ -16,7 +16,7 @@
 from __future__ import annotations
 
 import os
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -58,6 +58,36 @@ def _apply_mega_moe_dg_env() -> None:
     _MEGA_MOE_DG_ENV_APPLIED = True
 
 
+def _resolve_mega_moe_deep_gemm_num_sms(current_num_sms: int) -> int:
+    explicit_num_sms = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_SMS.get()
+    if explicit_num_sms > 0:
+        target_num_sms = min(explicit_num_sms, current_num_sms)
+    else:
+        reserved_num_sms = max(envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_RESERVED_SMS.get(), 0)
+        target_num_sms = current_num_sms - reserved_num_sms
+
+    target_num_sms = max(1, min(target_num_sms, current_num_sms))
+    if current_num_sms >= 2:
+        target_num_sms = max(2, target_num_sms)
+        target_num_sms -= target_num_sms % 2
+    return target_num_sms
+
+
+@contextmanager
+def _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
+    current_num_sms = deep_gemm.get_num_sms()
+    target_num_sms = _resolve_mega_moe_deep_gemm_num_sms(current_num_sms)
+    if target_num_sms == current_num_sms:
+        yield current_num_sms
+        return
+
+    deep_gemm.set_num_sms(target_num_sms)
+    try:
+        yield target_num_sms
+    finally:
+        deep_gemm.set_num_sms(current_num_sms)
+
+
 def _get_mega_moe_symm_buffer(
     group,
     num_experts: int,
@@ -65,6 +95,7 @@ def _get_mega_moe_symm_buffer(
     num_topk: int,
     hidden: int,
     intermediate_hidden: int,
+    num_sms: int,
 ) -> SymmBuffer:
     import deep_gemm
 
@@ -77,6 +108,7 @@ def _get_mega_moe_symm_buffer(
         num_topk,
         hidden,
         intermediate_hidden,
+        num_sms,
     )
     buf = _MEGA_MOE_SYMM_BUFFER.get(key)
     if buf is None:
@@ -197,69 +229,71 @@ def _run_mega_routed(
         f"cuda_graph_max_bs / chunked_prefill_size accordingly"
     )
 
-    buf = _get_mega_moe_symm_buffer(
-        ep_group,
-        num_experts=num_experts,
-        num_max_tokens_per_rank=num_max_tokens_per_rank,
-        num_topk=top_k,
-        hidden=hidden_size,
-        intermediate_hidden=intermediate_size,
-    )
-
-    if num_tokens > 0:
-        topk_ids_in = topk_ids.to(torch.int32)
-        topk_weights_in = topk_weights.to(torch.float32)
-    else:
-        topk_ids_in = hidden_states.new_empty((0, top_k), dtype=torch.int32)
-        topk_weights_in = hidden_states.new_empty((0, top_k), dtype=torch.float32)
-
-    use_fp4_acts = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS.get()
-    if use_fp4_acts:
-        # FP4 path goes through DeepGEMM's mega_moe_pre_dispatch which
-        # handles the E2M1 packing variant. The jit implementation
-        # only emits FP8.
-        deep_gemm.mega_moe_pre_dispatch(
-            hidden_states,
-            topk_ids_in,
-            topk_weights_in,
-            buf.x,
-            buf.x_sf,
-            buf.topk_idx,
-            buf.topk_weights,
-            num_tokens=num_tokens,
-            group_size=32,
-            use_fp4_acts=True,
-        )
-    else:
-        mega_moe_pre_dispatch(
-            hidden_states,
-            topk_ids_in,
-            topk_weights_in,
-            buf.x,
-            buf.x_sf,
-            buf.topk_idx,
-            buf.topk_weights,
-            quant_group_size=32,
+    with _configure_mega_moe_deep_gemm_num_sms(deep_gemm) as num_sms:
+        buf = _get_mega_moe_symm_buffer(
+            ep_group,
+            num_experts=num_experts,
+            num_max_tokens_per_rank=num_max_tokens_per_rank,
+            num_topk=top_k,
+            hidden=hidden_size,
+            intermediate_hidden=intermediate_size,
+            num_sms=num_sms,
         )
 
-    # Allocate at least one row so y has a non-null CUDA data_ptr;
-    # the DeepGEMM tvm-ffi binding rejects nullptr in convert_to_torch_tensor().
-    y = torch.empty(
-        (max(num_tokens, 1), hidden_size),
-        dtype=torch.bfloat16,
-        device=hidden_states.device,
-    )
-    swiglu_limit = getattr(moe.config, "swiglu_limit", None)
-    deep_gemm.fp8_fp4_mega_moe(
-        y,
-        moe.experts.mega_l1_weights,
-        moe.experts.mega_l2_weights,
-        buf,
-        recipe=(1, 1, 32),
-        activation="swiglu",
-        activation_clamp=swiglu_limit,
-        fast_math=True,
-    )
+        if num_tokens > 0:
+            topk_ids_in = topk_ids.to(torch.int32)
+            topk_weights_in = topk_weights.to(torch.float32)
+        else:
+            topk_ids_in = hidden_states.new_empty((0, top_k), dtype=torch.int32)
+            topk_weights_in = hidden_states.new_empty((0, top_k), dtype=torch.float32)
+
+        use_fp4_acts = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS.get()
+        if use_fp4_acts:
+            # FP4 path goes through DeepGEMM's mega_moe_pre_dispatch which
+            # handles the E2M1 packing variant. The jit implementation
+            # only emits FP8.
+            deep_gemm.mega_moe_pre_dispatch(
+                hidden_states,
+                topk_ids_in,
+                topk_weights_in,
+                buf.x,
+                buf.x_sf,
+                buf.topk_idx,
+                buf.topk_weights,
+                num_tokens=num_tokens,
+                group_size=32,
+                use_fp4_acts=True,
+            )
+        else:
+            mega_moe_pre_dispatch(
+                hidden_states,
+                topk_ids_in,
+                topk_weights_in,
+                buf.x,
+                buf.x_sf,
+                buf.topk_idx,
+                buf.topk_weights,
+                quant_group_size=32,
+            )
+
+        # Allocate at least one row so y has a non-null CUDA data_ptr;
+        # the DeepGEMM tvm-ffi binding rejects nullptr in convert_to_torch_tensor().
+        y = torch.empty(
+            (max(num_tokens, 1), hidden_size),
+            dtype=torch.bfloat16,
+            device=hidden_states.device,
+        )
+        swiglu_limit = getattr(moe.config, "swiglu_limit", None)
+        deep_gemm.fp8_fp4_mega_moe(
+            y,
+            moe.experts.mega_l1_weights,
+            moe.experts.mega_l2_weights,
+            buf,
+            recipe=(1, 1, 32),
+            activation="swiglu",
+            activation_clamp=swiglu_limit,
+            fast_math=True,
+        )
     y = y[:num_tokens]
 
     if not moe.experts.should_fuse_routed_scaling_factor_in_topk:
