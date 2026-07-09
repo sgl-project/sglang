@@ -59,6 +59,7 @@ def build_kv_host_pool(
     server_args: ServerArgs,
     use_mla: bool,
     override_kv_cache_dim: Optional[int] = None,
+    host_page_num: Optional[int] = None,
 ):
     kv_host_pool_cls = (
         MLATokenToKVPoolHost if use_mla else get_mha_host_pool_cls(kv_pool)
@@ -73,6 +74,7 @@ def build_kv_host_pool(
         page_size,
         server_args.hicache_mem_layout,
         allocator_type=server_args.hicache_storage_backend,
+        host_page_num=host_page_num,
         **kwargs,
     )
 
@@ -130,6 +132,7 @@ def build_kv_only_stack(
         server_args=server_args,
         use_mla=use_mla,
         override_kv_cache_dim=override_kv_cache_dim,
+        host_page_num=params.hicache_host_page_num,
     )
     entries = [
         build_pool_entry(
@@ -593,6 +596,7 @@ def build_anchor_sidecar_stack(
         server_args=server_args,
         use_mla=use_mla,
         override_kv_cache_dim=override_kv_cache_dim,
+        host_page_num=params.hicache_host_page_num,
     )
     sidecar_host_pool = sidecar_host_pool_factory(kv_host_pool)
     entries = [

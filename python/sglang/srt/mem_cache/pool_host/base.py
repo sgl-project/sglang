@@ -3,8 +3,10 @@ from __future__ import annotations
 import abc
 import logging
 import threading
+from dataclasses import dataclass
 from functools import wraps
-from typing import Optional
+from pathlib import Path
+from typing import Mapping, Optional, Sequence
 
 import psutil
 import torch
@@ -24,7 +26,211 @@ _is_hip = is_hip()
 # Host RAM to leave free when sizing HiCache pools (OS, other processes).
 HICACHE_HOST_MEMORY_RESERVE_BYTES: int = 10 * (1024**3)
 
+_CGROUP_MEMORY_FILES: tuple[tuple[Path, Path, str], ...] = (
+    (
+        Path("/sys/fs/cgroup/memory.max"),
+        Path("/sys/fs/cgroup/memory.current"),
+        "cgroup v2",
+    ),
+    (
+        Path("/sys/fs/cgroup/memory/memory.limit_in_bytes"),
+        Path("/sys/fs/cgroup/memory/memory.usage_in_bytes"),
+        "cgroup v1",
+    ),
+)
+_CGROUP_UNLIMITED_THRESHOLD = 1 << 60
+
 _WRITE_BACK_STAGING_PAGE_CHUNK = 64
+
+
+@dataclass(frozen=True, slots=True)
+class HiCacheMemoryPlan:
+    page_num: int
+    page_size: int
+    budget_bytes: Optional[int]
+    component_bytes: tuple[tuple[str, int], ...]
+    pool_bytes: int
+    local_process_count: int
+    total_pool_bytes: int
+    reserve_bytes: int
+    available_bytes: int
+    available_source: str
+
+
+def _read_cgroup_memory_value(path: Path) -> Optional[int]:
+    try:
+        value = path.read_text().strip()
+    except (FileNotFoundError, OSError):
+        return None
+    if value == "max":
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        logger.warning("Ignoring invalid cgroup memory value in %s: %r", path, value)
+        return None
+
+
+def get_hicache_available_memory(
+    *,
+    host_available_bytes: Optional[int] = None,
+    cgroup_memory_files: Optional[Sequence[tuple[Path, Path, str]]] = None,
+) -> tuple[int, str]:
+    """Return memory currently available to this process.
+
+    psutil reports node-wide memory in many containers, so cap it by the
+    remaining cgroup allowance when a finite v1 or v2 limit is present.
+    """
+    if host_available_bytes is None:
+        host_available_bytes = psutil.virtual_memory().available
+
+    candidates = [(host_available_bytes, "host")]
+    memory_files = (
+        _CGROUP_MEMORY_FILES if cgroup_memory_files is None else cgroup_memory_files
+    )
+    for limit_path, usage_path, source in memory_files:
+        limit = _read_cgroup_memory_value(limit_path)
+        usage = _read_cgroup_memory_value(usage_path)
+        if limit is None or usage is None:
+            continue
+        if limit >= _CGROUP_UNLIMITED_THRESHOLD:
+            continue
+        candidates.append((max(0, limit - usage), source))
+
+    return min(candidates, key=lambda item: item[0])
+
+
+def validate_hicache_memory(
+    requested_bytes: int,
+    *,
+    description: str,
+    reserve_bytes: int = HICACHE_HOST_MEMORY_RESERVE_BYTES,
+) -> None:
+    available_bytes, available_source = get_hicache_available_memory()
+    usable_bytes = max(0, available_bytes - reserve_bytes)
+    if requested_bytes > usable_bytes:
+        raise ValueError(
+            f"Not enough host memory for {description}. Requesting "
+            f"{requested_bytes / 1e9:.2f} GB plus "
+            f"{reserve_bytes / 1e9:.2f} GB reserve, but only "
+            f"{available_bytes / 1e9:.2f} GB is available from "
+            f"{available_source}. Please reduce the size of the hierarchical cache."
+        )
+
+
+def build_hicache_memory_plan(
+    *,
+    page_size: int,
+    component_bytes_per_token: Mapping[str, int],
+    host_size_gb: Optional[int] = None,
+    page_num: Optional[int] = None,
+    available_memory: Optional[tuple[int, str]] = None,
+    reserve_bytes: int = HICACHE_HOST_MEMORY_RESERVE_BYTES,
+    local_process_count: Optional[int] = None,
+) -> HiCacheMemoryPlan:
+    """Derive and validate one shared page count for all HiCache pools."""
+    if (host_size_gb is None) == (page_num is None):
+        raise ValueError(
+            "HiCache memory plan requires exactly one of host_size_gb or page_num."
+        )
+    if page_size <= 0:
+        raise ValueError(f"HiCache page size must be positive, got {page_size}.")
+    if not component_bytes_per_token:
+        raise ValueError("HiCache memory plan requires at least one host pool.")
+
+    components = tuple(component_bytes_per_token.items())
+    invalid = [(name, value) for name, value in components if value <= 0]
+    if invalid:
+        raise ValueError(f"HiCache bytes per token must be positive: {invalid}.")
+
+    combined_bytes_per_page = sum(value for _, value in components) * page_size
+    budget_bytes = None
+    if host_size_gb is not None:
+        if host_size_gb <= 0:
+            raise ValueError("A fixed HiCache memory plan requires --hicache-size > 0.")
+        budget_bytes = int(host_size_gb * 1e9)
+        page_num = budget_bytes // combined_bytes_per_page
+        page_num = sync_fixed_hicache_page_num(page_num, host_size_gb)
+    assert page_num is not None
+    if page_num <= 0:
+        if host_size_gb is not None:
+            raise ValueError(
+                f"--hicache-size={host_size_gb} GB cannot fit one shared page "
+                f"({combined_bytes_per_page / 1e9:.2f} GB)."
+            )
+        raise ValueError(f"HiCache page count must be positive, got {page_num}.")
+
+    component_bytes = tuple(
+        (name, page_num * page_size * bytes_per_token)
+        for name, bytes_per_token in components
+    )
+    pool_bytes = sum(value for _, value in component_bytes)
+    if local_process_count is None:
+        local_process_count = 1
+    if local_process_count <= 0:
+        raise ValueError(
+            f"HiCache local process count must be positive, got {local_process_count}."
+        )
+    total_pool_bytes = pool_bytes * local_process_count
+    available_bytes, available_source = (
+        available_memory
+        if available_memory is not None
+        else get_hicache_available_memory()
+    )
+    required_bytes = total_pool_bytes + reserve_bytes
+    breakdown = ", ".join(
+        f"{name}={value / 1e9:.2f} GB" for name, value in component_bytes
+    )
+    if required_bytes > available_bytes:
+        sizing = (
+            f"The {host_size_gb} GB total budget resolves to"
+            if host_size_gb is not None
+            else "The configured HiCache ratio resolves to"
+        )
+        size_option = (
+            "--hicache-size" if host_size_gb is not None else "--hicache-ratio"
+        )
+        raise ValueError(
+            f"Not enough host memory for HiCache. {sizing} "
+            f"{pool_bytes / 1e9:.2f} GB per rank of pools "
+            f"({breakdown}), {total_pool_bytes / 1e9:.2f} GB across "
+            f"{local_process_count} local ranks, plus "
+            f"{reserve_bytes / 1e9:.2f} GB reserve, but only "
+            f"{available_bytes / 1e9:.2f} GB is available from "
+            f"{available_source}. Please reduce {size_option}."
+        )
+
+    sizing = (
+        f"budget={budget_bytes / 1e9:.2f} GB"
+        if budget_bytes is not None
+        else "ratio-based"
+    )
+    logger.info(
+        "HiCache total host-memory plan: %s, pages=%d, %s, "
+        "pools=%.2f GB/rank, local_ranks=%d, local_pools=%.2f GB, "
+        "reserve=%.2f GB, available=%.2f GB (%s).",
+        sizing,
+        page_num,
+        breakdown,
+        pool_bytes / 1e9,
+        local_process_count,
+        total_pool_bytes / 1e9,
+        reserve_bytes / 1e9,
+        available_bytes / 1e9,
+        available_source,
+    )
+    return HiCacheMemoryPlan(
+        page_num=page_num,
+        page_size=page_size,
+        budget_bytes=budget_bytes,
+        component_bytes=component_bytes,
+        pool_bytes=pool_bytes,
+        local_process_count=local_process_count,
+        total_pool_bytes=total_pool_bytes,
+        reserve_bytes=reserve_bytes,
+        available_bytes=available_bytes,
+        available_source=available_source,
+    )
 
 
 def sync_fixed_hicache_size(size: int, host_size: int) -> int:
@@ -69,6 +275,11 @@ def sync_fixed_hicache_size(size: int, host_size: int) -> int:
     return synced_size
 
 
+def sync_fixed_hicache_page_num(page_num: int, host_size: int) -> int:
+    """Sync a total-budget HiCache page count across PP ranks."""
+    return sync_fixed_hicache_size(page_num, host_size)
+
+
 def synchronized(func):
     @wraps(func)
     def wrapper(self, *args, **kwargs):
@@ -90,6 +301,7 @@ class HostKVCache(abc.ABC):
         pin_memory: bool,
         device: str,
         allocator_type: str = "default",
+        host_page_num: Optional[int] = None,
     ):
         self.device_pool = device_pool
         self.page_size = page_size
@@ -101,15 +313,23 @@ class HostKVCache(abc.ABC):
 
         self.dtype = device_pool.store_dtype
         self.size_per_token = self.get_size_per_token()
-        if host_size > 0:
+        if host_page_num is not None:
+            if host_page_num <= 0:
+                raise ValueError(
+                    f"HiCache host page count must be positive, got {host_page_num}."
+                )
+            self.page_num = host_page_num
+            self.size = self.page_num * self.page_size
+        elif host_size > 0:
             self.size = sync_fixed_hicache_size(
                 int(host_size * 1e9 // self.size_per_token), host_size
             )
         else:
             self.size = int(device_pool.size * host_to_device_ratio)
-        # Align up the host memory pool size to the page size
-        self.page_num = self.size // self.page_size + 1
-        self.size = self.page_num * self.page_size
+        if host_page_num is None:
+            # Align up the host memory pool size to the page size
+            self.page_num = self.size // self.page_size + 1
+            self.size = self.page_num * self.page_size
         self.start_layer = device_pool.start_layer
         self.end_layer = device_pool.end_layer
 
@@ -122,21 +342,12 @@ class HostKVCache(abc.ABC):
                 device_pool.size,
             )
 
-        # Verify there is enough available host memory.
-        host_mem = psutil.virtual_memory()
         requested_bytes = self.size * self.size_per_token
-        available_bytes = host_mem.available - HICACHE_HOST_MEMORY_RESERVE_BYTES
-        if requested_bytes > available_bytes:
-            raise ValueError(
-                f"Not enough host memory available. Requesting "
-                f"{requested_bytes / 1e9:.2f} GB but only have "
-                f"{available_bytes / 1e9:.2f} GB free. Please reduce the "
-                f"size of the hierarchical cache."
-            )
-        else:
-            logger.info(
-                f"Allocating {requested_bytes / 1e9:.2f} GB host memory for hierarchical KV cache."
-            )
+        validate_hicache_memory(requested_bytes, description="hierarchical KV cache")
+        logger.info(
+            "Allocating %.2f GB host memory for hierarchical KV cache.",
+            requested_bytes / 1e9,
+        )
 
         self.kv_buffer = self.init_kv_buffer()
 

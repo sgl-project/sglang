@@ -90,6 +90,8 @@ class TestDSAHiCacheTransfer(unittest.TestCase):
                 device="cpu",
                 allocator_type="default",
             )
+            self.assertEqual(indexer_host.page_num, mla_host.page_num)
+            self.assertEqual(indexer_host.indexer_page_num, mla_host.page_num)
         finally:
             ALLOC_MEMORY_FUNCS["cuda"] = original_alloc
 

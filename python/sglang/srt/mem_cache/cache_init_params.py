@@ -44,6 +44,9 @@ class CacheInitParams:
 
     chunked_prefill_size: Optional[int] = None
 
+    # Shared host-pool page count derived during HiCache memory planning.
+    hicache_host_page_num: Optional[int] = None
+
     sliding_window_size: Optional[int] = None
 
     # Time-to-live for cache entries in seconds. If None, TTL is disabled.

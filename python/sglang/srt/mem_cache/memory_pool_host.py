@@ -60,6 +60,7 @@ from sglang.srt.mem_cache.pool_host.base import (
     HICACHE_HOST_MEMORY_RESERVE_BYTES,
     sync_fixed_hicache_size,
     synchronized,
+    validate_hicache_memory,
 )
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
@@ -82,6 +83,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         device: str = "cpu",
         allocator_type: str = "default",
         override_kv_cache_dim: Optional[int] = None,
+        host_page_num: Optional[int] = None,
     ):
         self.override_kv_cache_dim = override_kv_cache_dim
         super().__init__(
@@ -93,6 +95,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             pin_memory,
             device,
             allocator_type,
+            host_page_num=host_page_num,
         )
         self.can_use_jit = _is_cuda and can_use_hicache_jit_kernel(
             element_size=self.kv_cache_dim * self.dtype.itemsize
@@ -1951,6 +1954,7 @@ class HostPoolGroup:
 
         self.layout = self.anchor_entry.host_pool.layout
         self.page_size = self.anchor_entry.host_pool.page_size
+        self.page_num = self.anchor_entry.host_pool.page_num
         self.device = self.anchor_entry.host_pool.device
         self.size = self.anchor_entry.host_pool.size
         self.can_use_write_back_jit = all(
@@ -2117,21 +2121,16 @@ class DSAIndexerPoolHost(HostKVCache):
             self.indexer_size_per_token * self.page_size * self.indexer_dtype.itemsize
         )
         self.indexer_layout_dim = self.indexer_page_stride_size * self.layer_num
-        self.indexer_page_num = (self.size + self.page_size + 1) // self.page_size
+        self.indexer_page_num = self.page_num
         self.size_per_token = (
             self.indexer_size_per_token * self.layer_num * self.indexer_dtype.itemsize
         )
 
         buf_elem_size = self.page_num * self.layer_num * self.indexer_page_stride_size
         requested_bytes = buf_elem_size * self.indexer_dtype.itemsize
-        host_mem = psutil.virtual_memory()
-        available_bytes = host_mem.available - HICACHE_HOST_MEMORY_RESERVE_BYTES
-        if requested_bytes > available_bytes:
-            raise ValueError(
-                f"Not enough host memory for DSA indexer hierarchical cache. "
-                f"Requesting {requested_bytes / 1e9:.2f} GB but only have "
-                f"{available_bytes / 1e9:.2f} GB free."
-            )
+        validate_hicache_memory(
+            requested_bytes, description="DSA indexer hierarchical cache"
+        )
         logger.info(
             "Allocating %.2f GB host memory for DSA indexer (layout=%s).",
             requested_bytes / 1e9,
