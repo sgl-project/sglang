@@ -124,8 +124,8 @@ SGL_DEVICE float coarse_bin_lower_bound(uint32_t bin) {
   if (bin == 0) return -FLT_MAX;
   if (bin >= (1u << kBits)) return FLT_MAX;
   const auto to_val = [&](uint32_t okey) -> float {
-    constexpr float kInf = std::numeric_limits<float>::infinity();
-    if (okey < 0x03FFu) return -kInf;
+    constexpr float k_Inf = std::numeric_limits<float>::infinity();
+    if (okey < 0x03FFu) return -k_Inf;
     if (okey == 0x03FFu) return -65536.0f;
     if (okey == 0xFC00u) return 65536.0f;
     if (okey > 0xFC00u) return FLT_MAX;
