@@ -235,8 +235,8 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
         self.assertFalse(scheduler.running_batch.batch_is_full)
         self.assertIsNone(scheduler.chunked_req)
 
-    def test_retract_releases_through_batch_side_hisparse_coordinator(self):
-        """retract with empty running + last fold-in must not touch the scheduler-owned hisparse coordinator."""
+    def test_retract_fold_in_releases_via_scheduler_hisparse_coordinator(self):
+        """retract of a folded-in last extend batch must release through the scheduler-owned hisparse coordinator."""
         scheduler = self._new_scheduler()
         scheduler.hisparse_coordinator = MagicMock()
         last_req = self._make_req("last")
@@ -251,7 +251,7 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
 
         scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
 
-        scheduler.hisparse_coordinator.retract_req.assert_not_called()
+        scheduler.hisparse_coordinator.retract_req.assert_called_once_with(last_req)
         self.assertEqual([entry["req"] for entry in requeue_log], [last_req])
 
     def test_retract_disagg_prefill_excludes_last_batch(self):
@@ -323,19 +323,18 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
         self.assertFalse(req_finished.is_retracted)
         self.assertEqual(scheduler.running_batch.reqs, [])
 
-    def test_retract_empty_post_fold_keeps_chunked_req(self):
-        """retract with nothing to retract leaves chunked_req and batch_is_full alone."""
+    def test_retract_empty_post_fold_clears_chunked_req_and_batch_is_full(self):
+        """retract with nothing to retract still clears chunked_req and batch_is_full."""
         scheduler = self._new_scheduler()
         scheduler.running_batch = ScheduleBatch(reqs=[], batch_is_full=True)
-        chunked_req = MagicMock()
-        scheduler.chunked_req = chunked_req
+        scheduler.chunked_req = MagicMock()
         requeue_log = self._spy_requeue(scheduler)
 
         scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
 
         self.assertEqual(requeue_log, [])
-        self.assertIs(scheduler.chunked_req, chunked_req)
-        self.assertTrue(scheduler.running_batch.batch_is_full)
+        self.assertIsNone(scheduler.chunked_req)
+        self.assertFalse(scheduler.running_batch.batch_is_full)
 
     def test_retract_all_finished_clears_fields_without_requeue(self):
         """retract with only finished reqs clears fields but releases nothing."""
@@ -389,13 +388,12 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
     def test_retract_empty_running_batch_requeues_nothing(self):
         """retract with empty running_batch must not release or requeue any request."""
         scheduler = self._new_scheduler()
-        original_reqs = scheduler.running_batch.reqs
 
         scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
 
         self.assertTrue(scheduler._engine_paused)
         self.assertEqual(len(scheduler.waiting_queue), 0)
-        self.assertIs(scheduler.running_batch.reqs, original_reqs)
+        self.assertEqual(scheduler.running_batch.reqs, [])
 
     def test_retract_drains_overlap_queue(self):
         """retract with overlap enabled should drain the result_queue."""

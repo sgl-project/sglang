@@ -4027,48 +4027,31 @@ class Scheduler(
             tmp_batch, tmp_result = self.result_queue.popleft()
             self.process_batch_result(tmp_batch, tmp_result)
 
-        last_fold_in_reqs: List[Req] = []
+        retract_reqs = [r for r in self.running_batch.reqs if not r.finished()]
         if (
             self.last_batch is not None
             and self.last_batch.forward_mode.is_extend()
             and self.disaggregation_mode != DisaggregationMode.PREFILL
         ):
-            last_fold_in_reqs = [r for r in self.last_batch.reqs if not r.finished()]
-
-        post_fold_nonempty = (len(self.running_batch.reqs) + len(last_fold_in_reqs)) > 0
-        retract_reqs = [
-            r for r in self.running_batch.reqs if not r.finished()
-        ] + last_fold_in_reqs
-
-        release_hisparse_coordinator = self.running_batch.hisparse_coordinator
-        if (
-            self.last_batch is not None
-            and self.last_batch.forward_mode.is_extend()
-            and not self.last_batch.is_empty()
-            and self.disaggregation_mode != DisaggregationMode.PREFILL
-            and len(self.running_batch.reqs) == 0
-        ):
-            release_hisparse_coordinator = self.last_batch.hisparse_coordinator
+            retract_reqs += [r for r in self.last_batch.reqs if not r.finished()]
 
         self.last_batch = None
         self.cur_batch_for_debug = None
 
-        if post_fold_nonempty:
-            if len(retract_reqs) != 0:
-                retract_all(
-                    reqs=retract_reqs,
-                    server_args=self.server_args,
-                    req_to_token_pool=self.req_to_token_pool,
-                    token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                    tree_cache=self.tree_cache,
-                    hisparse_coordinator=release_hisparse_coordinator,
-                )
-            self.running_batch.reqs = []
-            for req in retract_reqs:
-                self._add_request_to_queue(req)
-
-            self.running_batch.batch_is_full = False
-            self.chunked_req = None
+        if retract_reqs:
+            retract_all(
+                reqs=retract_reqs,
+                server_args=self.server_args,
+                req_to_token_pool=self.req_to_token_pool,
+                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                tree_cache=self.tree_cache,
+                hisparse_coordinator=self.hisparse_coordinator,
+            )
+        self.running_batch.reqs = []
+        for req in retract_reqs:
+            self._add_request_to_queue(req)
+        self.running_batch.batch_is_full = False
+        self.chunked_req = None
 
         # Surface the paused state to dashboards immediately. The scheduler
         # event loop short-circuits before reaching ``on_idle`` while paused,
