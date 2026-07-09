@@ -85,9 +85,21 @@ class _DummyPublisherThread:
         pass
 
 
+def _fake_server_args(**fields):
+    """server_args stand-in: carries fields and the override() entry point."""
+    ns = types.SimpleNamespace(**fields)
+
+    def _override(source, **updates):
+        for key, value in updates.items():
+            setattr(ns, key, value)
+
+    ns.override = _override
+    return ns
+
+
 def _make_reporter(scheduler) -> SchedulerMetricsReporter:
     if not hasattr(scheduler, "server_args"):
-        scheduler.server_args = types.SimpleNamespace(
+        scheduler.server_args = _fake_server_args(
             enable_metrics=False,
             enable_metrics_for_all_schedulers=False,
             kv_events_config=None,
@@ -275,7 +287,7 @@ class TestForwardPassMetrics(unittest.TestCase):
 
     def test_init_metrics_uses_server_worker_id(self):
         scheduler = types.SimpleNamespace()
-        scheduler.server_args = types.SimpleNamespace(
+        scheduler.server_args = _fake_server_args(
             enable_metrics=False,
             enable_metrics_for_all_schedulers=False,
             extra_metric_labels=None,
@@ -303,7 +315,7 @@ class TestForwardPassMetrics(unittest.TestCase):
 
     def test_init_fpm_disabled_on_non_last_pp_rank(self):
         scheduler = types.SimpleNamespace()
-        scheduler.server_args = types.SimpleNamespace(
+        scheduler.server_args = _fake_server_args(
             enable_metrics=False,
             enable_metrics_for_all_schedulers=False,
             extra_metric_labels=None,
