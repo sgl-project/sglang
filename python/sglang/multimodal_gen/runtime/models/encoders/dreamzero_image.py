@@ -11,6 +11,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.transforms as T
 
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
+
 
 def flash_attention(
     q: torch.Tensor,
@@ -29,7 +33,7 @@ def flash_attention(
     return out.transpose(1, 2).reshape(batch, seq_len, channels)
 
 
-class SelfAttention(nn.Module):
+class XLMRobertaSelfAttention(nn.Module):
 
     def __init__(self, dim, num_heads, dropout=0.1, eps=1e-5):
         assert dim % num_heads == 0
@@ -68,7 +72,7 @@ class SelfAttention(nn.Module):
         return x
 
 
-class AttentionBlock(nn.Module):
+class XLMRobertaAttentionBlock(nn.Module):
 
     def __init__(self, dim, num_heads, post_norm, dropout=0.1, eps=1e-5):
         super().__init__()
@@ -78,7 +82,7 @@ class AttentionBlock(nn.Module):
         self.eps = eps
 
         # layers
-        self.attn = SelfAttention(dim, num_heads, dropout, eps)
+        self.attn = XLMRobertaSelfAttention(dim, num_heads, dropout, eps)
         self.norm1 = nn.LayerNorm(dim, eps=eps)
         self.ffn = nn.Sequential(
             nn.Linear(dim, dim * 4), nn.GELU(), nn.Linear(dim * 4, dim),
@@ -130,7 +134,7 @@ class XLMRoberta(nn.Module):
 
         # blocks
         self.blocks = nn.ModuleList([
-            AttentionBlock(dim, num_heads, post_norm, dropout, eps)
+            XLMRobertaAttentionBlock(dim, num_heads, post_norm, dropout, eps)
             for _ in range(num_layers)
         ])
 
@@ -249,7 +253,7 @@ class LayerNorm(nn.LayerNorm):
         return super().forward(x).type_as(x)
 
 
-class SelfAttention(nn.Module):
+class VisionSelfAttention(nn.Module):
 
     def __init__(self,
                  dim,
@@ -304,7 +308,7 @@ class SwiGLU(nn.Module):
         return x
 
 
-class AttentionBlock(nn.Module):
+class VisionAttentionBlock(nn.Module):
 
     def __init__(self,
                  dim,
@@ -327,8 +331,8 @@ class AttentionBlock(nn.Module):
 
         # layers
         self.norm1 = LayerNorm(dim, eps=norm_eps)
-        self.attn = SelfAttention(dim, num_heads, causal, attn_dropout,
-                                  proj_dropout)
+        self.attn = VisionSelfAttention(dim, num_heads, causal, attn_dropout,
+                                        proj_dropout)
         self.norm2 = LayerNorm(dim, eps=norm_eps)
         if activation == 'swi_glu':
             self.mlp = SwiGLU(dim, int(dim * mlp_ratio))
@@ -420,9 +424,7 @@ class VisionTransformer(nn.Module):
                  embedding_dropout=0.0,
                  norm_eps=1e-5):
         if image_size % patch_size != 0:
-            print(
-                '[WARNING] image_size is not divisible by patch_size',
-                flush=True)
+            logger.warning("image_size is not divisible by patch_size")
         assert pool_type in ('token', 'token_fc', 'attn_pool')
         out_dim = out_dim or dim
         super().__init__()
@@ -456,8 +458,8 @@ class VisionTransformer(nn.Module):
         # transformer
         self.pre_norm = LayerNorm(dim, eps=norm_eps) if pre_norm else None
         self.transformer = nn.Sequential(*[
-            AttentionBlock(dim, mlp_ratio, num_heads, post_norm, False,
-                           activation, attn_dropout, proj_dropout, norm_eps)
+            VisionAttentionBlock(dim, mlp_ratio, num_heads, post_norm, False,
+                                 activation, attn_dropout, proj_dropout, norm_eps)
             for _ in range(num_layers)
         ])
         self.post_norm = LayerNorm(dim, eps=norm_eps)
@@ -476,8 +478,6 @@ class VisionTransformer(nn.Module):
 
         # embeddings
         x = self.patch_embedding(x).flatten(2).permute(0, 2, 1)
-        # print("x in forward: ", x[0,0,100:105], x.shape)
-        # print("patch_embedding: ", self.patch_embedding.module.weight[0:10, 0, 0, 3], self.patch_embedding.module.weight.shape)     
         if self.pool_type in ('token', 'token_fc'):
             x = torch.cat([self.cls_embedding.expand(b, -1, -1).to(dtype=x.dtype, device=x.device), x], dim=1)
         if interpolation:
@@ -491,11 +491,9 @@ class VisionTransformer(nn.Module):
 
         # transformer
         if use_31_block:
-            # print("x before transformer: ", x[0,0,100:105], x.shape)
             x = self.transformer[:-1](x)
             return x
         else:
-            # print("x before transformer: ", x[0,0,100:105], x.shape)
             x = self.transformer(x)
             return x
 
@@ -903,19 +901,19 @@ class WanImageEncoder(torch.nn.Module):
         # The outputs of torch compile always need to be cloned before being used.
         out = out.clone()
         return out
-        
+
     @staticmethod
     def state_dict_converter():
         return WanImageEncoderStateDictConverter()
-    
-    
+
+
 class WanImageEncoderStateDictConverter:
     def __init__(self):
         pass
 
     def from_diffusers(self, state_dict):
         return state_dict
-    
+
     def from_civitai(self, state_dict):
         state_dict_ = {}
         for name, param in state_dict.items():

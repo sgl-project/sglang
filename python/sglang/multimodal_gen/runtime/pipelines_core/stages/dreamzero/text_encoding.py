@@ -112,8 +112,9 @@ class DreamZeroTextEncodingStage(PipelineStage):
         prompt_emb = self._fit_text_len(prompt_emb.clone(), text_len)
         attention_mask = attention_mask[:, : prompt_emb.shape[1]]
         seq_lens = attention_mask.gt(0).sum(dim=1).long()
-        for batch_index, seq_len in enumerate(seq_lens):
-            prompt_emb[batch_index, int(seq_len) :] = 0
+        positions = torch.arange(prompt_emb.shape[1], device=prompt_emb.device)
+        valid = positions.unsqueeze(0) < seq_lens.unsqueeze(1)
+        prompt_emb = prompt_emb.masked_fill(~valid.unsqueeze(-1), 0)
         return prompt_emb.to(dtype=torch.bfloat16)
 
     @staticmethod

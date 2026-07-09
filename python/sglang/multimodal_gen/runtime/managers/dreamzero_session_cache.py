@@ -542,6 +542,27 @@ def _normalize_optional_reason_list(value: Any, size: int) -> list[str | None]:
     return values
 
 
+def _normalize_optional_hashes(
+    value: Any,
+    size: int,
+    field_name: str,
+) -> list[str | None]:
+    if value is None:
+        return [None] * size
+    if isinstance(value, str):
+        return [value] * size
+    if isinstance(value, (list, tuple)):
+        values = [None if item is None else str(item) for item in value]
+    else:
+        raise TypeError(f"{field_name} must be a string or a list")
+    if len(values) != size:
+        raise ValueError(
+            f"{field_name} length must match batch size: "
+            f"got {len(values)} values for batch_size={size}"
+        )
+    return values
+
+
 def _batch_prompt_hashes(batch, batch_size: int) -> tuple[list[str | None], list[str | None]]:
     extra = getattr(batch, "extra", {})
     prompts = normalize_batched_prompt_fields(
@@ -551,12 +572,29 @@ def _batch_prompt_hashes(batch, batch_size: int) -> tuple[list[str | None], list
         extra.get("dreamzero_negative_prompts"), batch_size
     )
     inputs = getattr(batch, "dreamzero_inputs", {})
+    explicit_prompt_hashes = _normalize_optional_hashes(
+        extra.get("dreamzero_prompt_hashes", inputs.get("prompt_hashes")),
+        batch_size,
+        "dreamzero_prompt_hashes",
+    )
+    explicit_neg_prompt_hashes = _normalize_optional_hashes(
+        extra.get(
+            "dreamzero_negative_prompt_hashes",
+            inputs.get("negative_prompt_hashes"),
+        ),
+        batch_size,
+        "dreamzero_negative_prompt_hashes",
+    )
     prompt_hashes = [
-        _prompt_hash(prompt, inputs.get("text"), index)
+        _prompt_hash(prompt, inputs.get("text"), explicit_prompt_hashes[index])
         for index, prompt in enumerate(prompts)
     ]
     neg_prompt_hashes = [
-        _prompt_hash(neg_prompt, inputs.get("text_negative"), index)
+        _prompt_hash(
+            neg_prompt,
+            inputs.get("text_negative"),
+            explicit_neg_prompt_hashes[index],
+        )
         for index, neg_prompt in enumerate(neg_prompts)
     ]
     return prompt_hashes, neg_prompt_hashes
@@ -745,12 +783,19 @@ def session_metadata_from_batch(batch) -> list[dict[str, Any]]:
     raise ValueError("DreamZero session metadata requires resolved request cache")
 
 
-def _prompt_hash(prompt: str | None, tensor: Any, index: int) -> str | None:
+def _prompt_hash(
+    prompt: str | None,
+    tensor: Any,
+    explicit_hash: str | None,
+) -> str | None:
     if prompt is not None:
         return "str:" + hashlib.sha1(prompt.encode("utf-8")).hexdigest()
+    if explicit_hash is not None:
+        return "key:" + explicit_hash
+    # Tensor prompt embeddings may already live on GPU. Do not hash their contents
+    # here because doing so would synchronize the request path.
     if torch.is_tensor(tensor):
-        row = tensor[index].detach().cpu().contiguous()
-        return "tensor:" + hashlib.sha1(row.numpy().tobytes()).hexdigest()
+        return None
     return None
 
 

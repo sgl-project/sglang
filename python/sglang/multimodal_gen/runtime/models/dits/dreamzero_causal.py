@@ -1,36 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
-"""DreamZero causal Wan DiT pieces.
-
-This module starts with the single-block parity surface. It intentionally keeps
-the parameter names aligned with the original `CausalWanAttentionBlock` so
-Phase 2 tests can transfer weights with a strict state-dict load before TP
-sharding is introduced.
-"""
+"""DreamZero causal Wan DiT pieces."""
 
 from __future__ import annotations
 
 import math
-import os
-from functools import cache
-
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from sglang.multimodal_gen.runtime.distributed import (
     divide,
     get_sp_parallel_rank,
-    get_tp_group,
-    get_tp_rank,
     get_tp_world_size,
-    split_tensor_along_last_dim,
-    tensor_model_parallel_all_reduce,
 )
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     RowParallelLinear,
 )
-from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
 from sglang.multimodal_gen.runtime.pipelines_core.stages.dreamzero.utils import (
     flatten_dim_sp_into_sequence,
     gather_full_sequence_parallel_tensor,
@@ -38,683 +23,22 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.dreamzero.utils import 
     shard_sequence_parallel_sequence,
     shard_sequence_parallel_time_embedding,
 )
-from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.utils import STR_BACKEND_ENV_VAR
 
-
-logger = init_logger(__name__)
-
-ENABLE_TENSORRT = os.getenv("ENABLE_TENSORRT", "False").lower() == "true"
-DREAMZERO_TP_FP32_ROW_REDUCE = (
-    os.getenv("DREAMZERO_TP_FP32_ROW_REDUCE", "0").lower() not in ("0", "false", "no")
+from sglang.multimodal_gen.runtime.models.dits.dreamzero_causal_ops import (
+    CategorySpecificMLP,
+    MultiEmbodimentActionEncoder,
+    WanLayerNorm,
+    WanRMSNorm,
+    _attention,
+    _linear,
+    _maybe_qk_norm,
+    _residual_add,
+    align_modulation,
+    causal_rope_action_apply,
+    rope_action_apply,
+    rope_params,
+    sinusoidal_embedding_1d,
 )
-DREAMZERO_DEBUG_DIT_LAYERS = os.getenv("DREAMZERO_DEBUG_DIT_LAYERS", "0") == "1"
-DREAMZERO_SP_FULL_FFN_DIAGNOSTIC = (
-    os.getenv("DREAMZERO_SP_FULL_FFN_DIAGNOSTIC", "0").lower()
-    not in ("0", "false", "no")
-)
-DREAMZERO_TP_FP32_RESIDUAL = (
-    os.getenv("DREAMZERO_TP_FP32_RESIDUAL", "0").lower() not in ("0", "false", "no")
-)
-DREAMZERO_DEBUG_FFN_ROW_CHANNEL = int(
-    os.getenv("DREAMZERO_DEBUG_FFN_ROW_CHANNEL", "4394")
-)
-_DREAMZERO_ATTENTION_BACKEND_ALIASES = {
-    "FA2": AttentionBackendEnum.FA2,
-    "FLASH_ATTN": AttentionBackendEnum.FA2,
-    "FLASH_ATTENTION": AttentionBackendEnum.FA2,
-    "FLA": AttentionBackendEnum.FA2,
-    "SDPA": AttentionBackendEnum.TORCH_SDPA,
-    "TORCH": AttentionBackendEnum.TORCH_SDPA,
-    "TORCH_SDPA": AttentionBackendEnum.TORCH_SDPA,
-}
-
-
-def _debug_block_indices() -> set[int]:
-    raw = os.getenv(
-        "DREAMZERO_DEBUG_DIT_STEP_BLOCKS",
-        os.getenv("DREAMZERO_DEBUG_DIT_STEP_BLOCK", "0"),
-    )
-    indices: set[int] = set()
-    for item in raw.split(","):
-        item = item.strip()
-        if item:
-            indices.add(int(item))
-    return indices
-
-
-def _debug_layer_call_indices() -> set[int] | None:
-    raw = os.getenv("DREAMZERO_DEBUG_DIT_LAYER_CALL_INDICES", "").strip()
-    if not raw:
-        return None
-    return {int(item.strip()) for item in raw.split(",") if item.strip()}
-
-
-def _debug_step_append(module: nn.Module, name: str, x: torch.Tensor) -> None:
-    debug_steps = getattr(module, "_dreamzero_debug_steps", None)
-    if debug_steps is not None:
-        debug_x = x
-        if getattr(module, "_dreamzero_debug_full_sequence", False):
-            if get_sp_parallel_rank() != 0:
-                return
-        elif (
-            getattr(module, "_dreamzero_debug_sp_gather", False)
-            and debug_x.dim() >= 3
-        ):
-            gathered_debug_x = gather_full_sequence_parallel_tensor(debug_x)
-            action_register_length = getattr(
-                module,
-                "_dreamzero_debug_sp_action_register_length",
-                None,
-            )
-            if action_register_length is not None:
-                debug_x = remove_redundant_action_register(
-                    gathered_debug_x,
-                    action_register_length,
-                )
-            else:
-                debug_x = flatten_dim_sp_into_sequence(gathered_debug_x)
-            if get_sp_parallel_rank() != 0:
-                return
-        debug_steps.append({"name": name, "x": debug_x.detach().cpu().clone()})
-
-
-def _residual_add(
-    x: torch.Tensor,
-    y: torch.Tensor,
-    scale: torch.Tensor | None = None,
-    *,
-    tensor_parallel: bool,
-) -> torch.Tensor:
-    if DREAMZERO_TP_FP32_RESIDUAL and tensor_parallel:
-        src_dtype = x.dtype
-        if scale is None:
-            return (x.float() + y.float()).to(src_dtype)
-        return (x.float() + y.float() * scale.float()).to(src_dtype)
-    if scale is None:
-        return x + y
-    return x + (y * scale)
-
-
-def _residual_branch(
-    y: torch.Tensor,
-    scale: torch.Tensor | None = None,
-    *,
-    tensor_parallel: bool,
-) -> torch.Tensor:
-    if scale is None:
-        return y
-    if DREAMZERO_TP_FP32_RESIDUAL and tensor_parallel:
-        return (y.float() * scale.float()).to(y.dtype)
-    return y * scale
-
-
-def sinusoidal_embedding_1d(dim: int, position: torch.Tensor) -> torch.Tensor:
-    assert dim % 2 == 0
-    half = dim // 2
-    position = position.type(torch.float64)
-    sinusoid = torch.outer(
-        position,
-        torch.pow(
-            10000,
-            -torch.arange(half, dtype=position.dtype, device=position.device).div(
-                half
-            ),
-        ),
-    )
-    return torch.cat([torch.cos(sinusoid), torch.sin(sinusoid)], dim=1)
-
-
-def rope_params(max_seq_len: int, dim: int, theta: int = 10000) -> torch.Tensor:
-    if ENABLE_TENSORRT:
-        return rope_params_no_polar(max_seq_len, dim, theta)
-    return rope_params_polar(max_seq_len, dim, theta)
-
-
-def rope_params_polar(max_seq_len: int, dim: int, theta: int = 10000) -> torch.Tensor:
-    assert dim % 2 == 0
-    freqs = torch.outer(
-        torch.arange(max_seq_len),
-        1.0
-        / torch.pow(
-            theta,
-            torch.arange(0, dim, 2).to(torch.float64).div(dim),
-        ),
-    )
-    return torch.polar(torch.ones_like(freqs), freqs)
-
-
-def rope_params_no_polar(
-    max_seq_len: int, dim: int, theta: int = 10000
-) -> torch.Tensor:
-    assert dim % 2 == 0
-    inv_freq = 1.0 / torch.pow(
-        theta, torch.arange(0, dim, 2).to(torch.float32) / dim
-    )
-    timesteps = torch.arange(max_seq_len, dtype=inv_freq.dtype)
-    freqs = torch.outer(timesteps, inv_freq)
-    return torch.stack((freqs.cos(), freqs.sin()), dim=-1).flatten(-2)
-
-
-def swish(x: torch.Tensor) -> torch.Tensor:
-    return x * torch.sigmoid(x)
-
-
-def _linear(layer: nn.Module, x: torch.Tensor) -> torch.Tensor:
-    if (
-        DREAMZERO_TP_FP32_ROW_REDUCE
-        and isinstance(layer, RowParallelLinear)
-        and layer.tp_size > 1
-    ):
-        if layer.input_is_parallel:
-            input_parallel = x
-        else:
-            input_parallel = split_tensor_along_last_dim(
-                x, num_partitions=layer.tp_size
-            )[layer.tp_rank].contiguous()
-
-        # Preserve the normal RowParallelLinear GEMM and bias epilogue. Only
-        # promote the partial output while summing it across TP ranks.
-        bias = None if (layer.tp_rank > 0 or layer.skip_bias_add) else layer.bias
-        output_parallel = layer.quant_method.apply(
-            layer, input_parallel, bias=bias
-        )
-        if layer.reduce_results:
-            output = layer.tp_group.all_reduce(output_parallel.float()).to(
-                output_parallel.dtype
-            )
-        else:
-            output = output_parallel
-        if layer.skip_bias_add and layer.bias is not None:
-            output = output + layer.bias
-        return output
-
-    out = layer(x)
-    if not isinstance(out, tuple):
-        return out
-    output, output_bias = out
-    if output_bias is not None:
-        output = output + output_bias
-    return output
-
-
-def _tp_wan_rms_norm(x: torch.Tensor, norm: "WanRMSNorm") -> torch.Tensor:
-    tp_size = get_tp_world_size()
-    tp_rank = get_tp_rank()
-    src_dtype = x.dtype
-    weight = norm.weight.tensor_split(tp_size)[tp_rank]
-    x_fp32 = x.float()
-    variance = x_fp32.pow(2).sum(dim=-1, keepdim=True)
-    variance = get_tp_group().all_reduce(variance)
-    variance = variance / (x.shape[-1] * tp_size)
-    return (x_fp32 * torch.rsqrt(variance + norm.eps)).to(src_dtype) * weight
-
-
-def _maybe_qk_norm(
-    x: torch.Tensor, norm: nn.Module, *, tensor_parallel: bool
-) -> torch.Tensor:
-    if isinstance(norm, nn.Identity):
-        return x
-    if tensor_parallel:
-        return _tp_wan_rms_norm(x, norm)
-    return norm(x)
-
-
-class SinusoidalPositionalEncoding(nn.Module):
-    def __init__(self, embedding_dim: int):
-        super().__init__()
-        self.embedding_dim = embedding_dim
-
-    def forward(self, timesteps: torch.Tensor) -> torch.Tensor:
-        timesteps = timesteps.float()
-        _, _ = timesteps.shape
-        half_dim = self.embedding_dim // 2
-        exponent = -torch.arange(
-            half_dim, dtype=torch.float, device=timesteps.device
-        ) * (torch.log(torch.tensor(10000.0, device=timesteps.device)) / half_dim)
-        freqs = timesteps.unsqueeze(-1) * exponent.exp()
-        return torch.cat([torch.sin(freqs), torch.cos(freqs)], dim=-1)
-
-
-class CategorySpecificLinear(nn.Module):
-    def __init__(self, num_categories: int, input_dim: int, hidden_dim: int):
-        super().__init__()
-        self.num_categories = num_categories
-        self.W = nn.Parameter(0.02 * torch.randn(num_categories, input_dim, hidden_dim))
-        self.b = nn.Parameter(torch.zeros(num_categories, hidden_dim))
-
-    def forward(self, x: torch.Tensor, cat_ids: torch.Tensor) -> torch.Tensor:
-        selected_w = self.W[cat_ids]
-        selected_b = self.b[cat_ids]
-        return torch.bmm(x, selected_w) + selected_b.unsqueeze(1)
-
-
-class CategorySpecificMLP(nn.Module):
-    def __init__(
-        self,
-        num_categories: int,
-        input_dim: int,
-        hidden_dim: int,
-        output_dim: int,
-    ):
-        super().__init__()
-        self.num_categories = num_categories
-        self.layer1 = CategorySpecificLinear(num_categories, input_dim, hidden_dim)
-        self.layer2 = CategorySpecificLinear(num_categories, hidden_dim, output_dim)
-
-    def forward(self, x: torch.Tensor, cat_ids: torch.Tensor) -> torch.Tensor:
-        hidden = F.relu(self.layer1(x, cat_ids))
-        return self.layer2(hidden, cat_ids)
-
-
-class MultiEmbodimentActionEncoder(nn.Module):
-    def __init__(self, action_dim: int, hidden_size: int, num_embodiments: int):
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.num_embodiments = num_embodiments
-        self.W1 = CategorySpecificLinear(num_embodiments, action_dim, hidden_size)
-        self.W2 = CategorySpecificLinear(
-            num_embodiments, 2 * hidden_size, hidden_size
-        )
-        self.W3 = CategorySpecificLinear(num_embodiments, hidden_size, hidden_size)
-        self.pos_encoding = SinusoidalPositionalEncoding(hidden_size)
-
-    def forward(
-        self, actions: torch.Tensor, timesteps: torch.Tensor, cat_ids: torch.Tensor
-    ) -> torch.Tensor:
-        action_emb = self.W1(actions, cat_ids)
-        timestep_emb = self.pos_encoding(timesteps).to(dtype=action_emb.dtype)
-        x = torch.cat([action_emb, timestep_emb], dim=-1)
-        x = swish(self.W2(x, cat_ids))
-        return self.W3(x, cat_ids)
-
-
-def assemble_action_state_tokens(
-    video_tokens: torch.Tensor,
-    video_timestep: torch.Tensor,
-    action_features: torch.Tensor | None,
-    state_features: torch.Tensor | None,
-    timestep_action: torch.Tensor | None,
-) -> tuple[torch.Tensor, torch.Tensor, int | None, int]:
-    """Append DreamZero action/state registers to video tokens.
-
-    Reference order is:
-      tokens:    [video_tokens, action_features, state_features]
-      timesteps: [video_timestep, timestep_action, timestep_state]
-    where timestep_state is a stride sample from timestep_action.
-    """
-    if action_features is None:
-        return video_tokens, video_timestep, None, 0
-
-    assert state_features is not None
-    assert timestep_action is not None
-    action_register = torch.cat([action_features, state_features], dim=1)
-    action_length = action_features.shape[1]
-    action_register_length = action_register.shape[1]
-    tokens = torch.cat([video_tokens, action_register], dim=1)
-
-    stride = timestep_action.shape[1] // state_features.shape[1]
-    timestep_state = timestep_action[:, ::stride]
-    timesteps = torch.cat([video_timestep, timestep_action, timestep_state], dim=1)
-    return tokens, timesteps, action_register_length, action_length
-
-
-def _attention(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    *,
-    causal: bool = False,
-    attention_dtype: torch.dtype | None = None,
-) -> torch.Tensor:
-    out_dtype = q.dtype
-    if attention_dtype is None:
-        attention_dtype = q.dtype if q.dtype == torch.float32 else torch.bfloat16
-    q = q.to(attention_dtype)
-    k = k.to(attention_dtype)
-    v = v.to(attention_dtype)
-    backend = _dreamzero_attention_backend()
-    if backend == AttentionBackendEnum.FA2:
-        try:
-            out = _dreamzero_flash_attention_varlen(q, k, v, causal=causal)
-        except ImportError:
-            if _dreamzero_attention_backend_is_explicit():
-                raise
-            _warn_dreamzero_fa2_fallback_once()
-        else:
-            return out.contiguous().to(out_dtype)
-
-    impl = _dreamzero_attention_impl(
-        q.shape[-2],
-        q.shape[-1],
-        causal,
-        attention_dtype,
-        AttentionBackendEnum.TORCH_SDPA,
-    )
-    return impl.forward(q, k, v, attn_metadata=None).contiguous().to(out_dtype)
-
-
-def _dreamzero_flash_attention_varlen(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    *,
-    causal: bool,
-) -> torch.Tensor:
-    from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (
-        flash_attn_varlen_func,
-    )
-
-    return flash_attn_varlen_func(
-        q=q,
-        k=k,
-        v=v,
-        cu_seqlens_q=None,
-        cu_seqlens_k=None,
-        max_seqlen_q=q.shape[1],
-        max_seqlen_k=k.shape[1],
-        softmax_scale=q.shape[-1] ** -0.5,
-        causal=causal,
-        return_softmax_lse=False,
-    )
-
-
-def _dreamzero_attention_backend_raw() -> str | None:
-    raw = os.environ.get("DREAMZERO_ATTENTION_BACKEND")
-    if raw is None:
-        raw = os.environ.get(STR_BACKEND_ENV_VAR)
-    return raw
-
-
-def _dreamzero_attention_backend_is_explicit() -> bool:
-    return _dreamzero_attention_backend_raw() is not None
-
-
-@cache
-def _warn_dreamzero_fa2_fallback_once() -> None:
-    logger.warning(
-        "DreamZero FA2 backend requested by default, but SGLang FlashAttention "
-        "kernel is unavailable; falling back to TORCH_SDPA. Set "
-        "DREAMZERO_ATTENTION_BACKEND=FA2 to require FA2 and fail fast."
-    )
-
-
-def _dreamzero_attention_backend() -> AttentionBackendEnum:
-    raw = _dreamzero_attention_backend_raw()
-    if raw is None:
-        # Prefer SGLang FlashAttention by default; _attention falls back to SDPA
-        # only when the default FA kernel is unavailable.
-        return AttentionBackendEnum.FA2
-
-    normalized = raw.strip().upper().replace("-", "_")
-    try:
-        return _DREAMZERO_ATTENTION_BACKEND_ALIASES[normalized]
-    except KeyError as exc:
-        raise ValueError(
-            "DreamZero supports only FA2 and TORCH_SDPA attention backends, "
-            f"got {raw!r}"
-        ) from exc
-
-
-@cache
-def _dreamzero_attention_impl(
-    num_heads: int,
-    head_size: int,
-    causal: bool,
-    dtype: torch.dtype,
-    selected_backend: AttentionBackendEnum,
-):
-    backend_cls = get_attn_backend(
-        head_size,
-        dtype,
-        supported_attention_backends={
-            AttentionBackendEnum.FA2,
-            AttentionBackendEnum.TORCH_SDPA,
-        },
-        selected_attention_backend=selected_backend,
-    )
-    backend = backend_cls.get_enum()
-    logger.info_once(
-        "DreamZero attention backend: "
-        f"{backend.name} (requested={selected_backend.name}, causal={causal})"
-    )
-    return backend_cls.get_impl_cls()(
-        num_heads=num_heads,
-        head_size=head_size,
-        num_kv_heads=num_heads,
-        softmax_scale=head_size**-0.5,
-        causal=causal,
-    )
-
-
-def rope_action_apply(
-    x: torch.Tensor,
-    freqs: torch.Tensor,
-    freqs_action: torch.Tensor,
-    freqs_state: torch.Tensor,
-    action_register_length: int | None,
-    num_action_per_block: int = 32,
-    num_state_per_block: int = 1,
-) -> torch.Tensor:
-    if ENABLE_TENSORRT:
-        return rope_action_apply_no_polar(
-            x,
-            freqs,
-            freqs_action,
-            freqs_state,
-            action_register_length,
-            num_action_per_block,
-            num_state_per_block,
-        )
-    return rope_action_apply_polar(
-        x,
-        freqs,
-        freqs_action,
-        freqs_state,
-        action_register_length,
-        num_action_per_block,
-        num_state_per_block,
-    )
-
-
-def rope_action_apply_no_polar(
-    x: torch.Tensor,
-    freqs: torch.Tensor,
-    freqs_action: torch.Tensor,
-    freqs_state: torch.Tensor,
-    action_register_length: int | None,
-    num_action_per_block: int = 32,
-    num_state_per_block: int = 1,
-) -> torch.Tensor:
-    batch, seq_len, num_heads, dim = x.shape
-
-    if action_register_length is not None:
-        chunk_size = action_register_length // (
-            num_action_per_block + num_state_per_block
-        )
-        freqs = torch.cat(
-            [
-                freqs,
-                freqs_action[: chunk_size * num_action_per_block],
-                freqs_state[: chunk_size * num_state_per_block],
-            ],
-            dim=0,
-        )
-
-    freqs = freqs.unsqueeze(0).unsqueeze(2)
-    x0, x1 = x.chunk(2, dim=-1)
-    freqs_cos, freqs_sin = freqs.chunk(2, dim=-1)
-    return torch.cat(
-        (x0 * freqs_cos - x1 * freqs_sin, x1 * freqs_cos + x0 * freqs_sin),
-        dim=-1,
-    )
-
-
-def rope_action_apply_polar(
-    x: torch.Tensor,
-    freqs: torch.Tensor,
-    freqs_action: torch.Tensor,
-    freqs_state: torch.Tensor,
-    action_register_length: int | None,
-    num_action_per_block: int | None = None,
-    num_state_per_block: int | None = None,
-) -> torch.Tensor:
-    batch, seq_len, num_heads, _ = x.shape
-    out_dtype = x.dtype
-    x = torch.view_as_complex(x.to(torch.float64).reshape(batch, seq_len, num_heads, -1, 2))
-
-    if action_register_length is not None:
-        assert num_action_per_block is not None
-        assert num_state_per_block is not None
-        chunk_size = action_register_length // (
-            num_action_per_block + num_state_per_block
-        )
-        freqs_action = freqs_action[: chunk_size * num_action_per_block].view(
-            chunk_size * num_action_per_block, 1, -1
-        )
-        freqs_state = freqs_state[: chunk_size * num_state_per_block].view(
-            chunk_size * num_state_per_block, 1, -1
-        )
-        freqs = torch.cat([freqs, freqs_action, freqs_state], dim=0)
-
-    freqs = freqs.unsqueeze(0)
-    return torch.view_as_real(x * freqs).flatten(3).to(out_dtype)
-
-
-def causal_rope_action_apply(
-    x: torch.Tensor,
-    freqs: torch.Tensor,
-    freqs_action: torch.Tensor,
-    freqs_state: torch.Tensor,
-    action_register_length: int | None,
-    num_action_per_block: int,
-    num_state_per_block: int,
-    action_state_index: int,
-) -> torch.Tensor:
-    if ENABLE_TENSORRT:
-        return causal_rope_action_apply_no_polar(
-            x,
-            freqs,
-            freqs_action,
-            freqs_state,
-            action_register_length,
-            num_action_per_block,
-            num_state_per_block,
-            action_state_index,
-        )
-    return causal_rope_action_apply_polar(
-        x,
-        freqs,
-        freqs_action,
-        freqs_state,
-        action_register_length,
-        num_action_per_block,
-        num_state_per_block,
-        action_state_index,
-    )
-
-
-def causal_rope_action_apply_no_polar(
-    x: torch.Tensor,
-    freqs: torch.Tensor,
-    freqs_action: torch.Tensor,
-    freqs_state: torch.Tensor,
-    action_register_length: int | None,
-    num_action_per_block: int,
-    num_state_per_block: int,
-    action_state_index: int,
-) -> torch.Tensor:
-    batch, seq_len, num_heads, _ = x.shape
-    out_dtype = x.dtype
-    x = x.reshape(batch, seq_len, num_heads, -1, 2)
-    x_real = x[..., 0]
-    x_imag = x[..., 1]
-    freqs = freqs.unsqueeze(0).view(1, freqs.shape[0], 1, -1, 2)
-    freqs_cos = freqs[..., 0]
-    freqs_sin = freqs[..., 1]
-
-    if action_register_length is not None:
-        assert action_register_length == (num_action_per_block + num_state_per_block)
-        freqs_action = freqs_action[
-            action_state_index
-            * num_action_per_block : (action_state_index + 1)
-            * num_action_per_block
-        ]
-        freqs_state = freqs_state[
-            action_state_index
-            * num_state_per_block : (action_state_index + 1)
-            * num_state_per_block
-        ]
-        freqs_1d = torch.cat([freqs_action, freqs_state], dim=0).view(
-            action_register_length, 1, -1, 2
-        )
-        freqs_cos = torch.cat([freqs_cos[0], freqs_1d[..., 0]], dim=0).unsqueeze(0)
-        freqs_sin = torch.cat([freqs_sin[0], freqs_1d[..., 1]], dim=0).unsqueeze(0)
-
-    x_rotated = torch.stack(
-        (
-            x_real * freqs_cos - x_imag * freqs_sin,
-            x_real * freqs_sin + x_imag * freqs_cos,
-        ),
-        dim=-1,
-    )
-    return x_rotated.flatten(3).to(out_dtype)
-
-
-def causal_rope_action_apply_polar(
-    x: torch.Tensor,
-    freqs: torch.Tensor,
-    freqs_action: torch.Tensor,
-    freqs_state: torch.Tensor,
-    action_register_length: int | None,
-    num_action_per_block: int,
-    num_state_per_block: int,
-    action_state_index: int,
-) -> torch.Tensor:
-    batch, seq_len, num_heads, _ = x.shape
-    out_dtype = x.dtype
-    x = torch.view_as_complex(x.to(torch.float64).reshape(batch, seq_len, num_heads, -1, 2))
-
-    if action_register_length is not None:
-        assert action_register_length == (num_action_per_block + num_state_per_block)
-        freqs_action = freqs_action[
-            action_state_index
-            * num_action_per_block : (action_state_index + 1)
-            * num_action_per_block
-        ]
-        freqs_state = freqs_state[
-            action_state_index
-            * num_state_per_block : (action_state_index + 1)
-            * num_state_per_block
-        ]
-        freqs_1d = torch.cat([freqs_action, freqs_state], dim=0).view(
-            action_register_length, 1, -1
-        )
-        freqs = torch.cat([freqs, freqs_1d], dim=0)
-
-    freqs = freqs.unsqueeze(0)
-    return torch.view_as_real(x * freqs).flatten(3).to(out_dtype)
-
-
-class WanRMSNorm(nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-5):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(dim))
-        self.eps = eps
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out_dtype = x.dtype
-        x = x.float()
-        x = x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
-        return x.to(out_dtype) * self.weight
-
-
-class WanLayerNorm(nn.LayerNorm):
-    def __init__(
-        self, dim: int, eps: float = 1e-6, elementwise_affine: bool = False
-    ):
-        super().__init__(dim, elementwise_affine=elementwise_affine, eps=eps)
 
 
 class DreamZeroT2VCrossAttention(nn.Module):
@@ -757,6 +81,34 @@ class DreamZeroT2VCrossAttention(nn.Module):
         self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
+    def _project_query(self, x: torch.Tensor, batch: int) -> torch.Tensor:
+        return _maybe_qk_norm(
+            _linear(self.q, x), self.norm_q, tensor_parallel=self.use_tensor_parallel
+        ).view(batch, -1, self.local_num_heads, self.head_dim)
+
+    def _project_text_kv(
+        self,
+        context: torch.Tensor,
+        batch: int,
+        crossattn_cache: dict | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if crossattn_cache is not None and crossattn_cache["is_init"]:
+            return crossattn_cache["k"], crossattn_cache["v"]
+
+        k = _maybe_qk_norm(
+            _linear(self.k, context),
+            self.norm_k,
+            tensor_parallel=self.use_tensor_parallel,
+        ).view(batch, -1, self.local_num_heads, self.head_dim)
+        v = _linear(self.v, context).view(
+            batch, -1, self.local_num_heads, self.head_dim
+        )
+        if crossattn_cache is not None:
+            crossattn_cache["is_init"] = True
+            crossattn_cache["k"] = k
+            crossattn_cache["v"] = v
+        return k, v
+
     def forward(
         self,
         x: torch.Tensor,
@@ -767,36 +119,8 @@ class DreamZeroT2VCrossAttention(nn.Module):
         if context_lens is not None:
             raise NotImplementedError("context_lens masking is not part of Phase 2.1")
         batch = x.shape[0]
-        q = _maybe_qk_norm(
-            _linear(self.q, x), self.norm_q, tensor_parallel=self.use_tensor_parallel
-        ).view(batch, -1, self.local_num_heads, self.head_dim)
-        if crossattn_cache is not None:
-            if not crossattn_cache["is_init"]:
-                crossattn_cache["is_init"] = True
-                k = _maybe_qk_norm(
-                    _linear(self.k, context),
-                    self.norm_k,
-                    tensor_parallel=self.use_tensor_parallel,
-                ).view(
-                    batch, -1, self.local_num_heads, self.head_dim
-                )
-                v = _linear(self.v, context).view(
-                    batch, -1, self.local_num_heads, self.head_dim
-                )
-                crossattn_cache["k"] = k
-                crossattn_cache["v"] = v
-            else:
-                k = crossattn_cache["k"]
-                v = crossattn_cache["v"]
-        else:
-            k = _maybe_qk_norm(
-                _linear(self.k, context),
-                self.norm_k,
-                tensor_parallel=self.use_tensor_parallel,
-            ).view(batch, -1, self.local_num_heads, self.head_dim)
-            v = _linear(self.v, context).view(
-                batch, -1, self.local_num_heads, self.head_dim
-            )
+        q = self._project_query(x, batch)
+        k, v = self._project_text_kv(context, batch, crossattn_cache)
         return _linear(self.o, _attention(q, k, v).flatten(2))
 
 
@@ -837,41 +161,9 @@ class DreamZeroI2VCrossAttention(DreamZeroT2VCrossAttention):
         context_img = context[:, :257]
         context = context[:, 257:]
         batch = x.shape[0]
-        q = _maybe_qk_norm(
-            _linear(self.q, x), self.norm_q, tensor_parallel=self.use_tensor_parallel
-        ).view(batch, -1, self.local_num_heads, self.head_dim)
-        if crossattn_cache is not None:
-            if not crossattn_cache["is_init"]:
-                crossattn_cache["is_init"] = True
-                k = _maybe_qk_norm(
-                    _linear(self.k, context),
-                    self.norm_k,
-                    tensor_parallel=self.use_tensor_parallel,
-                ).view(
-                    batch, -1, self.local_num_heads, self.head_dim
-                )
-                v = _linear(self.v, context).view(
-                    batch, -1, self.local_num_heads, self.head_dim
-                )
-                crossattn_cache["k"] = k
-                crossattn_cache["v"] = v
-            else:
-                k = crossattn_cache["k"]
-                v = crossattn_cache["v"]
-        else:
-            k = _maybe_qk_norm(
-                _linear(self.k, context),
-                self.norm_k,
-                tensor_parallel=self.use_tensor_parallel,
-            ).view(batch, -1, self.local_num_heads, self.head_dim)
-            v = _linear(self.v, context).view(
-                batch, -1, self.local_num_heads, self.head_dim
-            )
-        _debug_step_append(self, "cross_attn.q", q)
-        _debug_step_append(self, "cross_attn.text_k", k)
-        _debug_step_append(self, "cross_attn.text_v", v)
+        q = self._project_query(x, batch)
+        k, v = self._project_text_kv(context, batch, crossattn_cache)
         text_x = _attention(q, k, v).flatten(2)
-        _debug_step_append(self, "cross_attn.text_attn_out", text_x)
         k_img = _maybe_qk_norm(
             _linear(self.k_img, context_img),
             self.norm_k_img,
@@ -880,14 +172,9 @@ class DreamZeroI2VCrossAttention(DreamZeroT2VCrossAttention):
         v_img = _linear(self.v_img, context_img).view(
             batch, -1, self.local_num_heads, self.head_dim
         )
-        _debug_step_append(self, "cross_attn.img_k", k_img)
-        _debug_step_append(self, "cross_attn.img_v", v_img)
         img_x = _attention(q, k_img, v_img).flatten(2)
-        _debug_step_append(self, "cross_attn.img_attn_out", img_x)
         merged_x = text_x + img_x
-        _debug_step_append(self, "cross_attn.text_img_sum", merged_x)
         out = _linear(self.o, merged_x)
-        _debug_step_append(self, "cross_attn.o_proj_out", out)
         return out
 
 
@@ -1638,141 +925,10 @@ class DreamZeroCausalWanTransformerBlock(nn.Module):
 
     def _run_ffn(self, x: torch.Tensor) -> torch.Tensor:
         if not self.use_tensor_parallel:
-            col = self.ffn[0](x)
-            _debug_step_append(self, "ffn_col", col)
-            act = self.ffn[1](col)
-            _debug_step_append(self, "ffn_gelu", act)
-            row = self.ffn[2](act)
-            _debug_step_append(self, "ffn_row", row)
-            return row
+            return self.ffn(x)
         col = _linear(self.ffn[0], x)
-        _debug_step_append(self, "ffn_col", col)
         act = self.ffn[1](col)
-        _debug_step_append(self, "ffn_gelu", act)
-        if getattr(self, "_dreamzero_debug_row_collectives", False):
-            row_layer = self.ffn[2]
-            gathered_cols = get_tp_group().all_gather(
-                col.contiguous(),
-                separate_tensors=True,
-            )
-            if isinstance(gathered_cols, list):
-                for rank_index, col_shard in enumerate(gathered_cols):
-                    _debug_step_append(
-                        self,
-                        f"ffn_col_rank{rank_index}",
-                        col_shard,
-                    )
-            gathered_acts = get_tp_group().all_gather(
-                act.contiguous(),
-                separate_tensors=True,
-            )
-            if isinstance(gathered_acts, list):
-                for rank_index, act_shard in enumerate(gathered_acts):
-                    _debug_step_append(
-                        self,
-                        f"ffn_gelu_rank{rank_index}",
-                        act_shard,
-                    )
-            local_partial = F.linear(act, row_layer.weight, bias=None)
-            gathered_local_partials = get_tp_group().all_gather(
-                local_partial.contiguous(),
-                separate_tensors=True,
-            )
-            reduced_no_bias = tensor_model_parallel_all_reduce(
-                local_partial.clone(), tp_group=row_layer.tp_group
-            )
-            row_channel = DREAMZERO_DEBUG_FFN_ROW_CHANNEL
-            _debug_step_append(self, "ffn_row_local_partial", local_partial)
-            if isinstance(gathered_local_partials, list):
-                for rank_index, partial in enumerate(gathered_local_partials):
-                    _debug_step_append(
-                        self,
-                        f"ffn_row_local_partial_rank{rank_index}",
-                        partial,
-                    )
-                    _debug_step_append(
-                        self,
-                        f"ffn_row_channel{row_channel}_local_partial_rank"
-                        f"{rank_index}",
-                        partial[..., row_channel],
-                    )
-            _debug_step_append(self, "ffn_row_reduced_no_bias", reduced_no_bias)
-            _debug_step_append(
-                self,
-                f"ffn_row_channel{row_channel}_reduced_no_bias",
-                reduced_no_bias[..., row_channel],
-            )
-            if row_layer.bias is not None:
-                _debug_step_append(
-                    self,
-                    "ffn_row_bias_added",
-                    reduced_no_bias + row_layer.bias,
-                )
-            local_partial_fp32 = F.linear(
-                act.float(),
-                row_layer.weight.float(),
-                bias=None,
-            )
-            gathered_local_partials_fp32 = get_tp_group().all_gather(
-                local_partial_fp32.contiguous(),
-                separate_tensors=True,
-            )
-            reduced_fp32_no_bias = tensor_model_parallel_all_reduce(
-                local_partial_fp32.clone(), tp_group=row_layer.tp_group
-            )
-            _debug_step_append(
-                self,
-                "ffn_row_local_partial_fp32",
-                local_partial_fp32,
-            )
-            if isinstance(gathered_local_partials_fp32, list):
-                for rank_index, partial in enumerate(gathered_local_partials_fp32):
-                    _debug_step_append(
-                        self,
-                        f"ffn_row_local_partial_fp32_rank{rank_index}",
-                        partial,
-                    )
-                    _debug_step_append(
-                        self,
-                        f"ffn_row_channel{row_channel}_local_partial_fp32_rank"
-                        f"{rank_index}",
-                        partial[..., row_channel],
-                    )
-            _debug_step_append(
-                self,
-                "ffn_row_reduced_fp32_no_bias",
-                reduced_fp32_no_bias,
-            )
-            _debug_step_append(
-                self,
-                f"ffn_row_channel{row_channel}_reduced_fp32_no_bias",
-                reduced_fp32_no_bias[..., row_channel],
-            )
-            if row_layer.bias is not None:
-                _debug_step_append(
-                    self,
-                    "ffn_row_fp32_bias_added",
-                    reduced_fp32_no_bias + row_layer.bias.float(),
-                )
-        row = _linear(self.ffn[2], act)
-        _debug_step_append(self, "ffn_row", row)
-        return row
-
-    @staticmethod
-    def _align_modulation(
-        parts: tuple[torch.Tensor, ...], target_len: int
-    ) -> tuple[torch.Tensor, ...]:
-        aligned = []
-        for part in parts:
-            part_len = part.shape[1]
-            if part_len == target_len:
-                aligned.append(part)
-            elif part_len >= target_len:
-                aligned.append(part[:, :target_len])
-            else:
-                repeat = (target_len + part_len - 1) // part_len
-                aligned.append(part.repeat_interleave(repeat, dim=1)[:, :target_len])
-        return tuple(aligned)
+        return _linear(self.ffn[2], act)
 
     def forward(
         self,
@@ -1789,14 +945,12 @@ class DreamZeroCausalWanTransformerBlock(nn.Module):
         is_tf: bool = True,
         enable_sequence_parallel: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        debug_steps = getattr(self, "_dreamzero_debug_steps", None)
         e_parts = (self.modulation.unsqueeze(1) + e).chunk(6, dim=2)
-        e_parts = self._align_modulation(e_parts, x.shape[1])
+        e_parts = align_modulation(e_parts, x.shape[1])
 
         self_attn_input = (
             self.norm1(x) * (1 + e_parts[1].squeeze(2)) + e_parts[0].squeeze(2)
         )
-        _debug_step_append(self, "self_attn_input", self_attn_input)
         y, updated_kv_cache = self.self_attn(
             x=self_attn_input,
             freqs=freqs,
@@ -1808,108 +962,25 @@ class DreamZeroCausalWanTransformerBlock(nn.Module):
             current_start_frame=current_start_frame,
             enable_sequence_parallel=enable_sequence_parallel,
         )
-        if debug_steps is not None:
-            _debug_step_append(self, "self_attn", y)
-        _debug_step_append(self, "self_residual_scale", e_parts[2].squeeze(2))
-        self_residual_branch = _residual_branch(
-            y,
-            e_parts[2].squeeze(2),
-            tensor_parallel=self.use_tensor_parallel,
-        )
-        _debug_step_append(self, "self_residual_branch", self_residual_branch)
         x = _residual_add(
             x,
             y,
             e_parts[2].squeeze(2),
             tensor_parallel=self.use_tensor_parallel,
         )
-        _debug_step_append(self, "after_self_residual", x)
         cross_attn_input = self.norm3(x)
-        _debug_step_append(self, "cross_attn_input", cross_attn_input)
-        if debug_steps is not None:
-            self.cross_attn._dreamzero_debug_steps = debug_steps
-            self.cross_attn._dreamzero_debug_full_sequence = getattr(
-                self, "_dreamzero_debug_full_sequence", False
-            )
-            self.cross_attn._dreamzero_debug_sp_gather = getattr(
-                self, "_dreamzero_debug_sp_gather", False
-            )
-            self.cross_attn._dreamzero_debug_sp_action_register_length = getattr(
-                self, "_dreamzero_debug_sp_action_register_length", None
-            )
-        try:
-            cross = self.cross_attn(
-                cross_attn_input,
-                context,
-                crossattn_cache=crossattn_cache,
-            )
-        finally:
-            if debug_steps is not None:
-                self.cross_attn._dreamzero_debug_steps = None
-        if debug_steps is not None:
-            _debug_step_append(self, "cross_attn", cross)
-        cross_residual_branch = _residual_branch(
-            cross,
-            tensor_parallel=self.use_tensor_parallel,
+        cross = self.cross_attn(
+            cross_attn_input,
+            context,
+            crossattn_cache=crossattn_cache,
         )
-        _debug_step_append(self, "cross_residual_branch", cross_residual_branch)
         x = _residual_add(
             x,
             cross,
             tensor_parallel=self.use_tensor_parallel,
         )
         norm2_input = self.norm2(x) * (1 + e_parts[4].squeeze(2)) + e_parts[3].squeeze(2)
-        _debug_step_append(self, "norm2_input", norm2_input)
-        ffn_input = norm2_input
-        _debug_step_append(self, "ffn_input", ffn_input)
-        if enable_sequence_parallel and DREAMZERO_SP_FULL_FFN_DIAGNOSTIC:
-            if (
-                not getattr(self, "_dreamzero_full_ffn_diagnostic_logged", False)
-                and get_sp_parallel_rank() == 0
-            ):
-                print(
-                    "[DreamZero SP Diagnostic] running each FFN on the gathered "
-                    "full sequence",
-                    flush=True,
-                )
-                self._dreamzero_full_ffn_diagnostic_logged = True
-            gathered_ffn_input = gather_full_sequence_parallel_tensor(ffn_input)
-            if action_register_length is not None:
-                full_ffn_input = remove_redundant_action_register(
-                    gathered_ffn_input,
-                    action_register_length,
-                )
-            else:
-                full_ffn_input = flatten_dim_sp_into_sequence(gathered_ffn_input)
-
-            self._dreamzero_debug_full_sequence = True
-            try:
-                full_y = self._run_ffn(full_ffn_input)
-                _debug_step_append(self, "ffn_full_sequence", full_y)
-            finally:
-                self._dreamzero_debug_full_sequence = False
-
-            local_video_length = ffn_input.shape[1] - (
-                action_register_length or 0
-            )
-            local_video_begin = get_sp_parallel_rank() * local_video_length
-            local_video_end = local_video_begin + local_video_length
-            y = full_y[:, local_video_begin:local_video_end]
-            if action_register_length is not None:
-                y = torch.cat(
-                    [y, full_y[:, -action_register_length:]],
-                    dim=1,
-                )
-        else:
-            y = self._run_ffn(ffn_input)
-        _debug_step_append(self, "ffn", y)
-        _debug_step_append(self, "ffn_residual_scale", e_parts[5].squeeze(2))
-        ffn_residual_branch = _residual_branch(
-            y,
-            e_parts[5].squeeze(2),
-            tensor_parallel=self.use_tensor_parallel,
-        )
-        _debug_step_append(self, "ffn_residual_branch", ffn_residual_branch)
+        y = self._run_ffn(norm2_input)
         x = _residual_add(
             x,
             y,
@@ -1932,18 +1003,7 @@ class DreamZeroCausalHead(nn.Module):
 
     def forward(self, x: torch.Tensor, e: torch.Tensor) -> torch.Tensor:
         e_parts = (self.modulation.unsqueeze(1) + e).chunk(2, dim=2)
-        target_len = x.shape[1]
-        aligned = []
-        for part in e_parts:
-            part_len = part.shape[1]
-            if part_len == target_len:
-                aligned.append(part)
-            elif part_len >= target_len:
-                aligned.append(part[:, :target_len])
-            else:
-                repeat = (target_len + part_len - 1) // part_len
-                aligned.append(part.repeat_interleave(repeat, dim=1)[:, :target_len])
-        shift, scale = aligned
+        shift, scale = align_modulation(e_parts, x.shape[1])
         return self.head(self.norm(x) * (1 + scale.squeeze(2)) + shift.squeeze(2))
 
 
@@ -2205,41 +1265,8 @@ class DreamZeroCausalWanModel(nn.Module):
         if clip_feature is not None:
             context = torch.cat([self.img_emb(clip_feature), context], dim=1)
 
-        debug_layers = getattr(self, "_dreamzero_current_layer_debug", None)
-        debug_layer_output_limit = max(
-            0,
-            int(
-                os.getenv(
-                    "DREAMZERO_DEBUG_DIT_LAYER_OUTPUT_LIMIT",
-                    os.getenv("DREAMZERO_PRECCOMPARE_LAYER_LIMIT", "5"),
-                )
-            ),
-        )
         updated_kv_caches: list[torch.Tensor] = []
-        debug_step_blocks = _debug_block_indices()
-        enable_debug_collectives = getattr(
-            self, "_dreamzero_enable_debug_collectives", False
-        )
-        capture_sp_layer_debug = getattr(
-            self, "_dreamzero_capture_sp_layer_debug", False
-        )
         for block_index, block in enumerate(self.blocks):
-            is_debug_step_block = (
-                (enable_debug_collectives or capture_sp_layer_debug)
-                and block_index in debug_step_blocks
-                and block_index < debug_layer_output_limit
-            )
-            block._dreamzero_debug_row_collectives = is_debug_step_block
-            block._dreamzero_debug_sp_gather = (
-                capture_sp_layer_debug and is_debug_step_block
-            )
-            block._dreamzero_debug_sp_action_register_length = (
-                action_register_length
-            )
-            if is_debug_step_block:
-                block._dreamzero_debug_steps = []
-            elif hasattr(block, "_dreamzero_debug_steps"):
-                block._dreamzero_debug_steps = None
             x, updated_kv_cache = block(
                 x=x,
                 e=e0,
@@ -2257,38 +1284,6 @@ class DreamZeroCausalWanModel(nn.Module):
                 current_start_frame=current_start_frame,
                 enable_sequence_parallel=enable_sequence_parallel,
             )
-            capture_layer = block_index < debug_layer_output_limit and (
-                debug_layers is not None or capture_sp_layer_debug
-            )
-            if capture_layer:
-                debug_x = x
-                if capture_sp_layer_debug:
-                    gathered_debug_x = gather_full_sequence_parallel_tensor(debug_x)
-                    if action_register_length is not None:
-                        debug_x = remove_redundant_action_register(
-                            gathered_debug_x, action_register_length
-                        )
-                    else:
-                        debug_x = flatten_dim_sp_into_sequence(gathered_debug_x)
-            if debug_layers is not None and capture_layer:
-                layer_debug = {
-                    "index": block_index,
-                    "x": debug_x.detach().cpu().clone(),
-                    "video_token_length": (
-                        debug_x.shape[1] - (action_register_length or 0)
-                    ),
-                    "action_token_length": action_length,
-                    "action_register_length": action_register_length,
-                }
-                debug_steps = getattr(block, "_dreamzero_debug_steps", None)
-                if debug_steps:
-                    layer_debug["steps"] = debug_steps
-                debug_layers.append(layer_debug)
-            if hasattr(block, "_dreamzero_debug_steps"):
-                block._dreamzero_debug_steps = None
-            block._dreamzero_debug_row_collectives = False
-            block._dreamzero_debug_sp_gather = False
-            block._dreamzero_debug_sp_action_register_length = None
             updated_kv_caches.append(updated_kv_cache)
 
         if action is not None:
@@ -2320,7 +1315,7 @@ class DreamZeroCausalWanModel(nn.Module):
         context: torch.Tensor,
         seq_len: int,
         kv_cache: list[torch.Tensor],
-        crossattn_cache: list[torch.Tensor] | None,
+        crossattn_cache: list[dict] | None,
         current_start_frame: int,
         y: torch.Tensor | None = None,
         clip_feature: torch.Tensor | None = None,
@@ -2333,34 +1328,6 @@ class DreamZeroCausalWanModel(nn.Module):
         if self.model_type == "i2v":
             assert clip_feature is not None and y is not None
         assert context.shape[1] == self.text_len
-        debug_layer_call_limit = int(
-            os.getenv("DREAMZERO_DEBUG_DIT_LAYER_CALL_LIMIT", "1")
-        )
-        debug_call_index = int(getattr(self, "_dreamzero_debug_call_index", 0))
-        debug_action_only = (
-            os.getenv("DREAMZERO_DEBUG_DIT_ACTION_ONLY", "0") == "1"
-        )
-        eligible_debug_call = not debug_action_only or action is not None
-        selected_debug_calls = _debug_layer_call_indices()
-        selected_debug_call = (
-            debug_call_index in selected_debug_calls
-            if selected_debug_calls is not None
-            else debug_call_index < debug_layer_call_limit
-        )
-        capture_layer_call = (
-            DREAMZERO_DEBUG_DIT_LAYERS
-            and eligible_debug_call
-            and selected_debug_call
-        )
-        capture_layers = capture_layer_call and os.getenv("RANK", "0") == "0"
-        debug_collectives = capture_layer_call and not enable_sequence_parallel
-        if eligible_debug_call:
-            self._dreamzero_debug_call_index = debug_call_index + 1
-        self._dreamzero_current_layer_debug = [] if capture_layers else None
-        self._dreamzero_enable_debug_collectives = debug_collectives
-        self._dreamzero_capture_sp_layer_debug = (
-            capture_layer_call and enable_sequence_parallel
-        )
 
         if y is not None and self.concat_first_frame_latent:
             x = torch.cat([x, y.to(dtype=x.dtype)], dim=1)
@@ -2389,9 +1356,6 @@ class DreamZeroCausalWanModel(nn.Module):
         if action_noise_pred is not None:
             action_noise_pred = action_noise_pred.clone()
         video_noise_pred = self.unpatchify(x_video, grid_size)
-        self._dreamzero_last_layer_debug = self._dreamzero_current_layer_debug
-        self._dreamzero_current_layer_debug = None
-        self._dreamzero_capture_sp_layer_debug = False
         return video_noise_pred, action_noise_pred, updated_kv_caches
 
     def forward(self, *args, **kwargs):

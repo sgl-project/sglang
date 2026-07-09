@@ -129,15 +129,8 @@ class FlowMatchScheduler(BaseScheduler):
     def add_noise(self, original_samples, noise, timestep):
         if isinstance(timestep, torch.Tensor):
             timestep = timestep.cpu()
-        timestep_id = torch.argmin(
-            (self.timesteps.unsqueeze(1) - timestep.unsqueeze(0)).abs(),
-            dim=0,
-        )
-        sigma = self.sigmas[timestep_id].to(
-            device=original_samples.device, dtype=original_samples.dtype
-        )
-        while len(sigma.shape) < len(original_samples.shape):
-            sigma = sigma.unsqueeze(-1)
+        timestep_id = torch.argmin((self.timesteps - timestep).abs())
+        sigma = self.sigmas[timestep_id]
         sample = (1 - sigma) * original_samples + sigma * noise
         return sample
 
@@ -147,11 +140,7 @@ class FlowMatchScheduler(BaseScheduler):
 
     def training_weight(self, timestep):
         timestep_id = torch.argmin(
-            (
-                self.timesteps.unsqueeze(1)
-                - timestep.unsqueeze(0).to(self.timesteps.device)
-            ).abs(),
-            dim=0,
+            (self.timesteps - timestep.to(self.timesteps.device)).abs()
         )
         weights = self.linear_timesteps_weights[timestep_id]
         return weights

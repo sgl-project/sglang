@@ -143,7 +143,6 @@ class T5SelfAttention(nn.Module):
             x.size(1), x.size(1))
         x = fp16_clamp(x + self.attn(self.norm1(x), mask=mask, pos_bias=e))
         x = fp16_clamp(x + self.ffn(self.norm2(x)))
-        # print("x after attn: ", x[0, 0:10], x.shape)
         return x
 
 
@@ -265,18 +264,18 @@ class WanTextEncoder(torch.nn.Module):
         x = self.norm(x)
         x = self.dropout(x)
         return x
-    
+
     @staticmethod
     def state_dict_converter():
         return WanTextEncoderStateDictConverter()
-    
-    
+
+
 class WanTextEncoderStateDictConverter:
     def __init__(self):
         pass
 
     def from_diffusers(self, state_dict):
         return state_dict
-    
+
     def from_civitai(self, state_dict):
         return state_dict

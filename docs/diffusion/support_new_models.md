@@ -51,6 +51,36 @@ This style is appropriate when:
 | Adding a variant of an existing model that shares most logic | **Modular** — reuse existing stages, customize via PipelineConfig callbacks |
 | A specific pre-processing step needs special parallelism or profiling isolation | **Modular** — extract that step as a dedicated stage |
 
+### Exception: Action and Streaming Denoising Loops
+
+Most image/video diffusion pipelines should keep denoising in the framework-standard
+`DenoisingStage`. A model-specific denoising stage is acceptable only when the
+model's output contract or cache lifecycle does not fit the standard latent-to-pixel
+loop.
+
+DreamZero is one such exception. It predicts action chunks from robot observations,
+not images or videos for final materialization. Its denoising loop owns additional
+state that must stay aligned across request lifecycles:
+
+- action-token noise and video-latent noise are updated together;
+- per-session KV and cross-attention caches are reused across observation windows;
+- the causal block layout depends on action, state, and observation token groups;
+- CFG and sequence-parallel branches need branch-local cache scatter/gather before
+  outputs are combined.
+
+For these models, keep the custom stage narrow and documented: preprocessing stages
+should still isolate observation/text/image encoding, while the denoising stage should
+own only the model-specific rollout, cache lifecycle, and output assembly that cannot
+be expressed through the standard `DenoisingStage` callbacks.
+
+Action models may add shared request and output vocabulary, but those additions must
+remain opt-in. `DataType.ACTION` is for action JSON outputs and does not change the
+default video output type used by `SamplingParams`. `ModelTaskType.ACTION` is for
+observation-to-action pipelines and must not change the existing image, video, or mesh
+task mappings. Shared request fields such as `Req.session_id` and `Req.reset_session`
+default to no session state; non-action pipelines should ignore them unless they
+explicitly implement a session cache.
+
 ## Key Components for Implementation
 
 To add support for a new diffusion model, you will need to define or configure the following components:
