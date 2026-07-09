@@ -1,12 +1,6 @@
 """Unit tests for the MetalJitKernel JIT declaration surface and its
 name-keyed registry.
 
-Covers per-key compile caching, kernel name formatting, dtype_tag output,
-warm_once dedupe and its non-array assertion, one on-device dispatch through
-a trivial kernel, the registry's get/warm_once round trip via decorator
-registration, per-name cache isolation, duplicate-name rejection, and the
-@kernel decorator's validation plus the MetalJitOp default surface.
-
 Hermetic: tiny synthetic kernels only; skips off Darwin/arm64 or without
 ``mlx``.
 """

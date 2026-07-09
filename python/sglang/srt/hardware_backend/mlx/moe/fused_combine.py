@@ -10,12 +10,8 @@ threadgroup, 4 contiguous outputs per thread in the flat [B*H] space, so
 256 outputs per threadgroup; TOP_K is looped in registers and accumulated
 in fp32. No threadgroup memory, no barriers.
 
-Fused when:
-- y is fp16 or bf16, rank >= 3, shaped [..., TOP_K, H]
-- scores is fp16, bf16, or fp32 (independent template dtype TS), shaped
-  like y's leading dims: scores.shape == y.shape[:-1]
-- every dim nonzero
-- H % 256 == 0, so threadgroups tile rows exactly
+Eligibility: see ``can_fuse``. H must be a multiple of 256 so threadgroups
+tile rows exactly.
 
 Leading dims are flattened into the kernel's row dim B before dispatch, so
 the mlx-lm combine site's [batch, seq, TOP_K, H] passes through unchanged.
@@ -129,9 +125,6 @@ class FusedMoeCombineKernel(metal_jit.MetalJitOp):
         ``y.dtype`` only on the final write. The fused path is therefore strictly
         closer to the fp32 ground truth; the two paths can differ in the last
         fp16/bf16 ULPs on a given layer depending on which one can_fuse selects.
-
-        Falls back to the broadcast/sum reference, narrowed to ``y.dtype``, when
-        can_fuse(y, scores) is False; both paths return ``y.dtype``.
 
         Leading dims (everything before TOP_K) are flattened into the kernel's
         row dim and restored on the output, so rank 3 [B, TOP_K, H] and the

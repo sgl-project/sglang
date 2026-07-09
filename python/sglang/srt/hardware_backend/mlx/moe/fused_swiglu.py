@@ -1,7 +1,5 @@
 """Path B fusion for SwitchGLU: gate gather_qmv with silu(gate) * x_up epilogue.
 
-Why this exists
----------------
 The existing `FusedSwitchUpGate` (fused_switch_glu.py) concatenates up_proj
 and gate_proj weights along the output dim and runs one gather_qmm. That saves
 one kernel launch per layer but doubles the matmul's output dim, which pushes
@@ -28,9 +26,8 @@ K=12 interleaved trials on Qwen3-30B-A3B-4bit: on minus off 0.4%, a quarter of
 the noise band), so v1 lands off by default as a correct fusion substrate, not
 a measured speedup.
 
-Scope of v1
------------
-Targets the configuration shared by Qwen3-30B-A3B-4bit and Qwen1.5-MoE-A2.7B-4bit:
+Scope of v1 targets the configuration shared by Qwen3-30B-A3B-4bit and
+Qwen1.5-MoE-A2.7B-4bit:
 - bits=4, mode='affine', group_size=64
 - K (input_dim) divisible by 512  (Qwen3: 2048, Qwen1.5: 2048)
 - N (output_dim) divisible by 8   (Qwen3: 768, Qwen1.5: 1408)
