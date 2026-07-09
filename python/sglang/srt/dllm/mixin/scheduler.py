@@ -119,9 +119,7 @@ class SchedulerDllmMixin:
             self.dllm_manager.add_waiting_reqs(requests_to_add)
             self.waiting_queue = self.waiting_queue[num_requests_to_add:]
 
-    def _should_skip_prefill(
-        self: Scheduler, running_batch: ScheduleBatch
-    ) -> bool:
+    def _should_skip_prefill(self: Scheduler, running_batch: ScheduleBatch) -> bool:
         """Check if DLLM prefill should be skipped."""
         if (
             running_batch.batch_is_full or not self.waiting_queue
