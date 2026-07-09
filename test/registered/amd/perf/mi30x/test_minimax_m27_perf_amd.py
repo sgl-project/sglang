@@ -19,12 +19,7 @@ from sglang.test.nightly_bench_utils import BenchmarkResult
 from sglang.test.nightly_utils import NightlyBenchmarkRunner
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, _parse_int_list_env
 
-register_amd_ci(
-    est_time=5400,
-    suite="nightly-perf-8-gpu-minimax-m27",
-    nightly=True,
-    disabled="Temporarily disabled to save MI325 8-GPU runners; MiniMax-M2.7 runs on MI355 (nightly-8-gpu-mi35x-minimax-m27)",
-)
+register_amd_ci(est_time=5400, suite="nightly-perf-8-gpu-minimax-m27", nightly=True)
 
 
 def generate_simple_markdown_report(results: List[BenchmarkResult]) -> str:

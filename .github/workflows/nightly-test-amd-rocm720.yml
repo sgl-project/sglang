@@ -87,8 +87,8 @@ on:
           - nightly-8-gpu-mi35x-glm5-mxfp4-rocm720
           # 4-GPU MiniMax-M2.5 (MI35x)
           - nightly-4-gpu-mi35x-minimax-m25-rocm720
-          # 8-GPU MiniMax-M2.7 (MI35x)
-          - nightly-8-gpu-mi35x-minimax-m27-rocm720
+          # 8-GPU MiniMax-M2.7 (MI30x only)
+          - nightly-8-gpu-minimax-m27-rocm720
           # Diffusion (MI30x)
           - nightly-1-gpu-zimage-turbo-rocm720
       job_filter:
@@ -1896,12 +1896,12 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
   # ==============================================================================
-  # 8-GPU MiniMax-M2.7 (MI35x)
+  # 8-GPU MiniMax-M2.7 (MI30x only)
   # ==============================================================================
 
-  nightly-8-gpu-mi35x-minimax-m27-rocm720:
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-minimax-m27-rocm720,'))
-    runs-on: linux-mi35x-gpu-8
+  nightly-8-gpu-minimax-m27-rocm720:
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-minimax-m27-rocm720,'))
+    runs-on: linux-mi325-8gpu-sglang
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -1920,23 +1920,20 @@ jobs:
           ENABLE_CACHE_HOST: "1"
 
       - name: Install dependencies
-        run: |
-          bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
-          # Install tabulate for run_suite.py (missing in MI35x container)
-          bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
+        run: bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
 
-      - name: Accuracy Test MI35x ROCm 7.2 (8-GPU MiniMax-M2.7)
+      - name: Accuracy Test ROCm 7.2 (8-GPU MiniMax-M2.7)
         timeout-minutes: 120
         run: |
           > github_summary.md  # Clear summary file
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
             -e SGLANG_USE_AITER=1 \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
-            python3 run_suite.py --hw amd --suite nightly-amd-8-gpu-mi35x-minimax-m27 --nightly --timeout-per-file 3600 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
+            python3 run_suite.py --hw amd --suite nightly-amd-accuracy-8-gpu-minimax-m27 --nightly --timeout-per-file 3600 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
-      - name: Performance Test MI35x ROCm 7.2 (8-GPU MiniMax-M2.7)
+      - name: Performance Test ROCm 7.2 (8-GPU MiniMax-M2.7)
         timeout-minutes: 120
         continue-on-error: true  # Perf test failure doesn't fail the job if accuracy passed
         run: |
@@ -1944,7 +1941,7 @@ jobs:
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
             -e SGLANG_USE_AITER=1 \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
-            python3 run_suite.py --hw amd --suite nightly-perf-8-gpu-mi35x-minimax-m27 --nightly --timeout-per-file 5400 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
+            python3 run_suite.py --hw amd --suite nightly-perf-8-gpu-minimax-m27 --nightly --timeout-per-file 5400 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
@@ -2053,8 +2050,8 @@ jobs:
       - nightly-8-gpu-mi35x-glm5-mxfp4-rocm720
       # 4-GPU MiniMax-M2.5 (MI35x)
       - nightly-4-gpu-mi35x-minimax-m25-rocm720
-      # 8-GPU MiniMax-M2.7 (MI35x)
-      - nightly-8-gpu-mi35x-minimax-m27-rocm720
+      # 8-GPU MiniMax-M2.7 (MI30x only)
+      - nightly-8-gpu-minimax-m27-rocm720
       # Diffusion (MI30x)
       - nightly-1-gpu-zimage-turbo-rocm720
     runs-on: ubuntu-latest
