@@ -47,7 +47,6 @@ from sglang.srt.layers.attention.dsa.quant_k_cache import (
 from sglang.srt.layers.attention.dsa.utils import aiter_can_use_preshuffle_paged_mqa
 from sglang.srt.layers.dcp import (
     dcp_enabled,
-    get_attention_dcp_rank,
     get_attention_dcp_world_size,
 )
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
@@ -2828,16 +2827,19 @@ class MLATokenToKVPool(KVCache):
         cache_v: torch.Tensor,
     ):
         loc, _, _ = unwrap_write_loc(loc_info)
-        maybe_detect_oob(loc, 0, self.size + self.page_size, "set_kv_buffer (MLA)")
         layer_id = layer.layer_id
         assert not self.dsa_kv_cache_store_fp8
         if dcp_enabled():
-            valid_mask = (
-                loc % get_attention_dcp_world_size() == get_attention_dcp_rank()
+            # Delegate to the in-kernel masked write; a host-side mask/gather
+            # would sync and break cuda-graph capture.
+            self.set_mla_kv_buffer(
+                layer,
+                loc,
+                cache_k[..., : self.kv_lora_rank],
+                cache_k[..., self.kv_lora_rank :],
             )
-            if not valid_mask.all():
-                loc = loc[valid_mask]
-                cache_k = cache_k[valid_mask]
+            return
+        maybe_detect_oob(loc, 0, self.size + self.page_size, "set_kv_buffer (MLA)")
 
         if cache_k.dtype != self.dtype:
             cache_k = cache_k.to(self.dtype)
@@ -2856,7 +2858,11 @@ class MLATokenToKVPool(KVCache):
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
     ):
-        maybe_detect_oob(loc, 0, self.size + self.page_size, "set_mla_kv_buffer (MLA)")
+        # DCP locations are virtual, so the bound scales by dcp world size.
+        virtual_capacity = (self.size + self.page_size) * (
+            get_attention_dcp_world_size() if dcp_enabled() else 1
+        )
+        maybe_detect_oob(loc, 0, virtual_capacity, "set_mla_kv_buffer (MLA)")
         layer_id = layer.layer_id
 
         if _is_hip and self.use_dsa and self.dtype == fp8_dtype:

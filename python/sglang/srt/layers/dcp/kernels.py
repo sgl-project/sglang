@@ -26,6 +26,10 @@ import torch
 import triton
 import triton.language as tl
 
+# correct_attn_out works in base-2 (tl.exp2 / tl.log2); natural-log lse
+# producers (the Triton decode kernel) must rescale by log2(e) before merging.
+LOG2_E = 1.4426950408889634
+
 
 # ---------------------------------------------------------------------------
 # KV-index build (PR #25090, Triton/MHA): per-rank local KV indices.
