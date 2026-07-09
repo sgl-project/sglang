@@ -15,11 +15,9 @@
 import triton
 import triton.language as tl
 
-from sglang.srt.utils import is_npu
+from sglang.srt.utils import is_cpu, is_npu
 
 _is_npu = is_npu()
-from sglang.srt.utils import is_cpu
-
 _is_cpu = is_cpu()
 
 if _is_cpu:
