@@ -38,8 +38,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
-from sglang.srt.runtime_context import get_parallel
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_buffer, get_parallel, get_server_args
 from sglang.srt.utils import is_flashinfer_available, is_float4_e2m1fn_x2
 
 if is_flashinfer_available():
@@ -93,7 +92,6 @@ def _quantize_fp8_qkv(q, k, v, layer):
     return q, k, v, k_scale, v_scale
 
 
-global_zero_init_workspace_buffer = None
 # cute-dsl needs its own workspace: it overwrites the buffer with split-KV
 # partials, which corrupts the trtllm-gen multiCtasKv counters that rely on the
 # zero-init buffer (they share it under attention-backend=cutedsl_mla, where
@@ -182,14 +180,14 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 )
             self.workspace_buffer = global_cute_dsl_workspace_buffer
         else:
-            global global_zero_init_workspace_buffer
-            if global_zero_init_workspace_buffer is None:
-                global_zero_init_workspace_buffer = torch.zeros(
+            self.workspace_buffer = get_buffer(
+                "trtllm_mla_zero_workspace",
+                lambda: torch.zeros(
                     self.workspace_size,
                     dtype=torch.int8,
                     device=model_runner.device,
-                )
-            self.workspace_buffer = global_zero_init_workspace_buffer
+                ),
+            )
 
         # CUDA graph state
         self.decode_cuda_graph_metadata = {}
@@ -200,7 +198,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         self.forward_decode_metadata: Union[TRTLLMMLADecodeMetadata, None] = None
 
         self.disable_chunked_prefix_cache = (
-            get_global_server_args().disable_chunked_prefix_cache
+            get_server_args().disable_chunked_prefix_cache
         )
 
         self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens

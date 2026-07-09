@@ -26,7 +26,7 @@ from sglang.srt.mem_cache.unified_cache_components.tree_component import (
     TreeComponent,
     get_and_increase_time_counter,
 )
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_server_args
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -84,7 +84,7 @@ class MambaComponent(TreeComponent):
         # states. We temporarily skip branching-state fill in that mode and can
         # add a HiCache-aware branching policy later.
         if self.cache.cache_controller is None and len(value_chunks) > best_value_len:
-            chunk_size = get_global_server_args().mamba_cache_chunk_size
+            chunk_size = get_server_args().mamba_cache_chunk_size
             aligned_seqlen = (
                 sum(len(v) for v in value_chunks) // chunk_size
             ) * chunk_size
