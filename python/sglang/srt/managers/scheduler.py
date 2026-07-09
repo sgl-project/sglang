@@ -4057,7 +4057,7 @@ class Scheduler(
                     req_to_token_pool=self.running_batch.req_to_token_pool,
                     token_to_kv_pool_allocator=self.running_batch.token_to_kv_pool_allocator,
                     tree_cache=self.running_batch.tree_cache,
-                    hisparse_coordinator=self.running_batch.hisparse_coordinator,
+                    hisparse_coordinator=self.hisparse_coordinator,
                 )
                 self.running_batch.reqs = []
                 for req in retracted_reqs:
