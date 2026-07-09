@@ -31,6 +31,7 @@ register_amd_ci(
     est_time=3600,
     suite="nightly-amd-accuracy-8-gpu-minimax-m27",
     nightly=True,
+    disabled="Temporarily disabled to save MI325 8-GPU runners; MiniMax-M2.7 runs on MI355 (nightly-8-gpu-mi35x-minimax-m27)",
 )
 
 INVALID = -9999999
