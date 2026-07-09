@@ -76,20 +76,34 @@ class DsparkDraftSampler:
         )
 
     def __call__(self, hidden_states, input_ids):
-        bs = hidden_states.shape[0] // self.gamma
-        base_logits, confidence_tap = self.model.compute_base_logits(hidden_states)
+        draft_width = self.gamma + 1
+        if hidden_states.shape[0] % draft_width != 0:
+            raise RuntimeError(
+                "DSpark folded draft sampler expects full blocks with "
+                f"anchor + gamma tokens, got {hidden_states.shape[0]} rows "
+                f"for gamma={self.gamma}."
+            )
+        bs = hidden_states.shape[0] // draft_width
+        hidden_3d = hidden_states.view(bs, draft_width, -1)
+        ids_2d = input_ids.view(bs, draft_width)
+        anchor = ids_2d[:, 0]
+        # Slot 0 conditions the block. Slots 1..gamma are the draft tokens
+        # used by the verifier and confidence scheduler.
+        draft_hidden = hidden_3d[:, 1:, :].contiguous()
+        hidden_for_logits = draft_hidden.reshape(bs * self.gamma, -1)
+
+        base_logits, confidence_tap = self.model.compute_base_logits(hidden_for_logits)
         base_logits = base_logits.view(bs, self.gamma, -1)
-        anchor = input_ids.view(bs, self.gamma)[:, 0]
         draft_tokens, _ = self.markov_head.sample_block(
             base_logits,
             first_prev_tokens=anchor,
-            hidden_states=hidden_states.view(bs, self.gamma, -1),
+            hidden_states=draft_hidden,
             sampler=greedy_step_sampler,
         )
         self.out[: draft_tokens.numel()].copy_(draft_tokens.reshape(-1))
         if self.confidence_out is not None:
             confidence = self.confidence_fn(
-                draft_hidden=hidden_states.view(bs, self.gamma, -1),
+                draft_hidden=draft_hidden,
                 anchor_tokens=anchor,
                 draft_tokens=draft_tokens,
                 confidence_tap=confidence_tap,
@@ -345,16 +359,20 @@ class DraftBlockProposer:
         embed_module,
     ) -> DraftForwardResult:
         gamma = self.gamma
+        draft_width = gamma + 1
         prefix_lens = batch.seq_lens
         positions_2d = verify_window.positions_2d
         verify_cache_loc_2d = verify_window.verify_cache_loc_2d
 
         draft_block_ids = torch.full(
-            (bs, gamma), int(self._mask_token_id), dtype=torch.long, device=device
+            (bs, draft_width),
+            int(self._mask_token_id),
+            dtype=torch.long,
+            device=device,
         )
         draft_block_ids[:, 0].copy_(draft_input.bonus_tokens.view(-1))
-        draft_positions = positions_2d[:, :gamma].reshape(-1)
-        draft_cache_loc = verify_cache_loc_2d[:, :gamma].reshape(-1)
+        draft_positions = positions_2d[:, :draft_width].reshape(-1)
+        draft_cache_loc = verify_cache_loc_2d[:, :draft_width].reshape(-1)
 
         draft_owns_embed = hasattr(self.draft_model, "forward_embed")
         draft_input_embeds: Optional[torch.Tensor] = None
@@ -393,7 +411,11 @@ class DraftBlockProposer:
         raw_hidden = logits_output.hidden_states
         if raw_hidden is None:
             raise RuntimeError("DSpark draft model returned no hidden states.")
-        draft_hidden_3d = raw_hidden.view(bs, gamma, -1)
+        # Slot 0 is the anchor token used to condition semi-autoregressive
+        # drafting. Only slots 1..gamma are speculative token hidden states.
+        raw_hidden_3d = raw_hidden.view(bs, draft_width, -1)
+        draft_hidden_3d = raw_hidden_3d[:, 1:, :].contiguous()
+        raw_hidden = draft_hidden_3d.reshape(bs * gamma, -1)
         return DraftForwardResult(
             draft_block_ids=draft_block_ids,
             raw_hidden=raw_hidden,
