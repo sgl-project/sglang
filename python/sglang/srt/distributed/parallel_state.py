@@ -517,7 +517,7 @@ class GroupCoordinator:
     def graph_capture(
         self,
         graph_capture_context: Optional[GraphCaptureContext] = None,
-        stream: Optional[torch.cuda.Stream] = None,
+        stream=None,
     ):
         if graph_capture_context is None:
             if stream is None:
@@ -606,7 +606,15 @@ class GroupCoordinator:
             return self.hpu_communicator.all_reduce(input_)
 
         if self.xpu_communicator is not None and not self.xpu_communicator.disabled:
-            return self.xpu_communicator.all_reduce(input_)
+            # Route through inplace_all_reduce custom op so Dynamo treats this as
+            # an opaque call and does not decompose it into _c10d_functional primitives
+            # (which invoke sycl_event.wait() and break XPU graph capture).
+            # Keeps the operation in-place; the all-reduce is performed by
+            # _all_reduce_in_place, which for XPU falls through to
+            # torch.distributed.all_reduce on self.device_group (the same group
+            # used by xpu_communicator).
+            inplace_all_reduce(input_, group_name=self.unique_name)
+            return input_
 
         if self.npu_communicator is not None and not self.npu_communicator.disabled:
             return self.npu_communicator.all_reduce(input_)
@@ -945,7 +953,8 @@ class GroupCoordinator:
         # 16B alignment, weak-contiguous, supported topology, and per-rank
         # size <= max_size/(world*2).
         # On a hit, writes directly into the caller's pre-allocated `output` via
-        # all_gather_reg during CUDA-graph capture and all_gather_unreg otherwise.
+        # all_gather_reg during CUDA-graph capture, and all_gather_unreg
+        # under torch_memory_saver and other paths.
         ca_comm = self.ca_comm
         if (
             is_hip()
@@ -958,7 +967,10 @@ class GroupCoordinator:
         ):
             if getattr(ca_comm, "_IS_CAPTURING", False):
                 if torch.cuda.is_current_stream_capturing():
-                    ca_comm.all_gather_reg(input, out=output, dim=0)
+                    if envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get():
+                        ca_comm.all_gather_unreg(input, out=output, dim=0)
+                    else:
+                        ca_comm.all_gather_reg(input, out=output, dim=0)
                 elif is_in_tc_piecewise_cuda_graph():
                     ca_comm.all_gather_unreg(input, out=output, dim=0)
                 else:
@@ -1002,9 +1014,13 @@ class GroupCoordinator:
         return envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
 
     def all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
-        if _is_npu or _is_xpu:
+        if _is_npu:
             self._all_gather_into_tensor(output, input)
         else:
+            # XPU and CUDA both go through reg_all_gather_into_tensor (custom_op) to
+            # stay opaque to Dynamo. Calling torch.distributed.all_gather_into_tensor
+            # directly causes Dynamo to rewrite it as _c10d_functional.all_gather_into_tensor
+            # + wait_tensor, which invokes sycl_event.wait() and breaks XPU graph capture.
             reg_all_gather_into_tensor(output, input, group_name=self.unique_name)
 
     def cp_all_gather_into_tensor_async(
@@ -1762,7 +1778,7 @@ def get_mooncake_transfer_engine():
 
 
 @contextmanager
-def graph_capture(stream: Optional[torch.cuda.Stream] = None):
+def graph_capture(stream=None):
     """
     `graph_capture` is a context manager which should surround the code that
     is capturing the CUDA graph. Its main purpose is to ensure that the
@@ -2116,11 +2132,6 @@ def initialize_model_parallel(
         if get_tensor_model_parallel_rank() == 0:
             logger.info(
                 f"DCP enabled, dcp_size={decode_context_parallel_size}, tp_size={tensor_model_parallel_size}"
-            )
-    else:
-        if get_tensor_model_parallel_rank() == 0:
-            logger.info(
-                f"DCP disabled, dcp_size={decode_context_parallel_size}, tp_size={tensor_model_parallel_size}"
             )
 
     attn_dp_size = attention_data_parallel_size

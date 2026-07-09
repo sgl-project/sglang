@@ -6,7 +6,11 @@ from typing import List, Literal, NamedTuple, Optional, Tuple
 
 import torch
 
-from sglang.jit_kernel.dsv4 import fused_k_norm_rope_flashmla, fused_store_cache
+from sglang.jit_kernel.dsv4 import (
+    clear_unaccepted_c128_draft_states,
+    fused_k_norm_rope_flashmla,
+    fused_store_cache,
+)
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa import index_buf_accessor
@@ -17,7 +21,7 @@ from sglang.srt.layers.attention.dsv4.index_buf_accessor import NopeFp8RopeBf16P
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.memory_pool import KVCache
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import ceil_div, is_hip
 
 logger = logging.getLogger(__name__)
@@ -272,7 +276,7 @@ class DeepSeekV4IndexerPool(KVCache):
             end_layer,
         )
         self.index_head_dim = index_head_dim
-        self.use_fp4_indexer = get_global_server_args().enable_deepseek_v4_fp4_indexer
+        self.use_fp4_indexer = get_server_args().enable_deepseek_v4_fp4_indexer
 
         self._create_buffer()
 
@@ -317,12 +321,19 @@ class DeepSeekV4IndexerPool(KVCache):
     def get_index_k_scale_buffer(
         self,
         layer_id: int,
-        seq_len: int,
+        seq_len_tensor: torch.Tensor,
         page_indices: torch.Tensor,
+        seq_len_sum: int,
+        max_seq_len: int,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         buf = self.index_k_with_scale_buffer[layer_id]
         return index_buf_accessor.GetKAndS.execute(
-            self, buf, seq_len=seq_len, page_indices=page_indices
+            self,
+            buf,
+            page_indices=page_indices,
+            seq_len_tensor=seq_len_tensor,
+            seq_len_sum=seq_len_sum,
+            max_seq_len=max_seq_len,
         )
 
     def set_index_k_scale_buffer(
@@ -494,15 +505,27 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         self.c4_logical_size = c4_logical_size
         self.c128_size = c128_size
         self.c4_state_pool_size = c4_state_pool_size
+        c128_ring_size = self.get_ring_size(128)
+        if ONLINE_C128:
+            # Request-scoped online C128 state is indexed by req_pool_idx.
+            # PD decode can allocate pre-transfer slots beyond
+            # max_num_reqs, so size to the actual req_to_token row count.
+            c128_state_pool_size = max(c128_state_pool_size, self.num_req_slots)
+        else:
+            # Offline C128 keeps a per-request raw state ring.
+            c128_state_pool_size = max(
+                c128_state_pool_size, self.num_req_slots * c128_ring_size
+            )
         self.c128_state_pool_size = c128_state_pool_size
         self.c4_state_dtype = c4_state_dtype
         self.c128_state_dtype = c128_state_dtype
         self.compression_ratios = compression_ratios
         self.online_mtp_max_draft_tokens = online_mtp_max_draft_tokens
+        self.online_c128_state_num_req_slots = c128_state_pool_size
         self.online_c128_mtp_pending_seq_lens: Optional[torch.Tensor] = None
         if ONLINE_C128 and envs.SGLANG_EXPERIMENTAL_ONLINE_C128_MTP.get():
             self.online_c128_mtp_pending_seq_lens = torch.empty(
-                max_num_reqs, dtype=torch.int64, device=device
+                self.online_c128_state_num_req_slots, dtype=torch.int64, device=device
             )
 
         # Determine this PP stage's absolute layer range
@@ -546,7 +569,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             self.swa_kv_pool = None
             self.c4_kv_pool = None
             self.c128_kv_pool = None
-            server_args = get_global_server_args()
+            server_args = get_server_args()
             spec_extra = (
                 (server_args.speculative_num_draft_tokens - 1)
                 if server_args.speculative_algorithm is not None
@@ -603,11 +626,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 global_page_size=page_size,
             )
 
-        indexer_size = (
-            self.c4_logical_size
-            if (not _is_hip or envs.SGLANG_OPT_USE_COMPRESSOR_V2.get())
-            else c4_size
-        )
+        indexer_size = self.c4_logical_size
         self.c4_indexer_kv_pool = self._make_indexer_pool(
             indexer_size,
             c4_page_size,
@@ -632,7 +651,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         self.full_to_swa_index_mapping = full_to_swa_index_mapping
 
     def get_ring_size(self, compress_ratio: int) -> int:
-        server_args = get_global_server_args()
+        server_args = get_server_args()
         is_speculative = server_args.speculative_algorithm is not None
         return get_compress_state_ring_size(compress_ratio, is_speculative)
 
@@ -732,12 +751,30 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             for pool in pools:
                 if pool is None:
                     continue
+                if pool.ratio == 128:
+                    continue
                 t = pool.kv_score_buffer.kv_score
                 assert t.ndim == 2, f"expected 2D buffer, got {t.ndim}D"
                 data_ptrs.append(t.data_ptr())
                 data_lens.append(t.nbytes)
                 item_lens.append(t[0].nbytes * pool.ring_size)
 
+        return data_ptrs, data_lens, item_lens
+
+    def get_c128_state_buf_infos(
+        self,
+    ) -> Tuple[List[int], List[int], List[int]]:
+        data_ptrs: List[int] = []
+        data_lens: List[int] = []
+        item_lens: List[int] = []
+        for pool in self.compress_state_pools:
+            if pool is None or pool.ratio != 128:
+                continue
+            t = pool.kv_score_buffer.kv_score
+            assert t.ndim == 2, f"expected 2D buffer, got {t.ndim}D"
+            data_ptrs.append(t.data_ptr())
+            data_lens.append(t.nbytes)
+            item_lens.append(t[0].nbytes if ONLINE_C128 else t[0].nbytes * 128)
         return data_ptrs, data_lens, item_lens
 
     def _make_kv_pool(
@@ -910,9 +947,56 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 return int(pool.online_mtp_max_draft_tokens)
         return 0
 
+    def get_online_c128_state_num_req_slots(self) -> int:
+        return self.online_c128_state_num_req_slots
+
     def get_online_c128_mtp_pending_seq_lens(self) -> torch.Tensor:
         assert self.online_c128_mtp_pending_seq_lens is not None
         return self.online_c128_mtp_pending_seq_lens
+
+    def clear_c128_req_state(self, req_pool_idx: int) -> None:
+        """Reset request-scoped C128 state for one req slot."""
+        for pool in self.compress_state_pools:
+            if pool is None or pool.ratio != 128:
+                continue
+
+            state = pool.kv_score_buffer.kv_score
+            if ONLINE_C128:
+                row = state[req_pool_idx]
+                head_dim = row.shape[-1] // 3
+                row[:head_dim].fill_(float("-inf"))
+                row[head_dim:].zero_()
+            else:
+                start = req_pool_idx * pool.ring_size
+                rows = state[start : start + pool.ring_size]
+                half = rows.shape[-1] // 2
+                rows[:, :half].zero_()
+                rows[:, half:].fill_(float("-inf"))
+
+    def clear_unaccepted_c128_draft_states(
+        self,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        accept_lens: torch.Tensor,
+        num_draft_tokens: int,
+    ) -> None:
+        """Clear offline C128 ring slots written for rejected speculative tokens."""
+        if ONLINE_C128 or num_draft_tokens <= 1 or req_pool_indices.numel() == 0:
+            return
+
+        bs = req_pool_indices.numel()
+        for pool in self.compress_state_pools:
+            if pool is None or pool.ratio != 128:
+                continue
+
+            clear_unaccepted_c128_draft_states(
+                pool.kv_score_buffer.kv_score,
+                req_pool_indices,
+                seq_lens,
+                accept_lens,
+                ring_size=pool.ring_size,
+                num_draft_tokens=num_draft_tokens,
+            )
 
     def get_indexer_compress_states(self, layer_id: int) -> CompressStatePool:
         self.wait_layer_transfer(layer_id)
@@ -978,14 +1062,20 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
     def get_index_k_scale_buffer(
         self,
         layer_id: int,
-        seq_len: int,
+        seq_len_tensor: torch.Tensor,
         page_indices: torch.Tensor,
+        seq_len_sum: int,
+        max_seq_len: int,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         self.wait_layer_transfer(layer_id)
         compress_ratio, compress_layer_id, _ = self.layer_mapping[layer_id]
         assert compress_ratio == 4, f"only c4 has indexer, got {compress_ratio = }"
         return self.c4_indexer_kv_pool.get_index_k_scale_buffer(
-            compress_layer_id, seq_len, page_indices
+            compress_layer_id,
+            seq_len_tensor,
+            page_indices,
+            seq_len_sum,
+            max_seq_len,
         )
 
     def set_index_k_scale_buffer(

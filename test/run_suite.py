@@ -44,6 +44,7 @@ PER_COMMIT_SUITES = {
         "stage-b-test-1-gpu-large-amd",
         "stage-b-test-2-gpu-large-amd",
         "jit-kernel-unit-test-amd",
+        "jit-kernel-benchmark-test-amd",
         "sgl-kernel-unit-test-2-gpu-amd",
         "stage-c-test-4-gpu-amd",
         "stage-c-test-large-8-gpu-amd",
@@ -169,7 +170,11 @@ NIGHTLY_SUITES = {
         "full-8-npu-a3",
         "full-16-npu-a3",
     ],
-    HWBackend.XPU: [],
+    HWBackend.XPU: [
+        "nightly-xpu-1-gpu",
+        "nightly-xpu-2-gpu",
+        "nightly-xpu-4-gpu",
+    ],
 }
 
 

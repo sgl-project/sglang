@@ -179,7 +179,7 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
         layer_id_override: Optional[int] = None,
         dcp_kv_mask: Optional[torch.Tensor] = None,
     ):
-        loc, _ = unwrap_write_loc(loc_info)
+        loc, _, _ = unwrap_write_loc(loc_info)
         if layer_id_override is not None:
             layer_id = layer_id_override
         else:
@@ -441,7 +441,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
     ):
-        loc, _ = unwrap_write_loc(loc_info)
+        loc, _, _ = unwrap_write_loc(loc_info)
         layer_id = layer.layer_id
         if cache_k.dtype != self.dtype:
             cache_k = cache_k.to(self.dtype)
