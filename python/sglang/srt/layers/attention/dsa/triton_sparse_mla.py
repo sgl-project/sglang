@@ -197,13 +197,13 @@ def _sparse_mla_fwd_split_dim_kernel(
                 q_nope_ptr.dtype.element_ty
             )
         if NUM_GROUPS >= 3:
-            kv2 = tl.load(kbase + (2 * _G + g)[None, :], mask=valid[:, None], other=0.0).to(
-                q_nope_ptr.dtype.element_ty
-            )
+            kv2 = tl.load(
+                kbase + (2 * _G + g)[None, :], mask=valid[:, None], other=0.0
+            ).to(q_nope_ptr.dtype.element_ty)
         if NUM_GROUPS >= 4:
-            kv3 = tl.load(kbase + (3 * _G + g)[None, :], mask=valid[:, None], other=0.0).to(
-                q_nope_ptr.dtype.element_ty
-            )
+            kv3 = tl.load(
+                kbase + (3 * _G + g)[None, :], mask=valid[:, None], other=0.0
+            ).to(q_nope_ptr.dtype.element_ty)
         kv_tail = tl.load(
             kbase + (D_V + dt)[None, :], mask=valid[:, None], other=0.0
         ).to(q_nope_ptr.dtype.element_ty)
@@ -228,11 +228,17 @@ def _sparse_mla_fwd_split_dim_kernel(
         p_fp8 = (p * fp8_max).to(q_nope_ptr.dtype.element_ty)
         acc0 = acc0 * alpha[:, None] + tl.dot(p_fp8, kv0).to(tl.float32) * inv_fp8_max
         if NUM_GROUPS >= 2:
-            acc1 = acc1 * alpha[:, None] + tl.dot(p_fp8, kv1).to(tl.float32) * inv_fp8_max
+            acc1 = (
+                acc1 * alpha[:, None] + tl.dot(p_fp8, kv1).to(tl.float32) * inv_fp8_max
+            )
         if NUM_GROUPS >= 3:
-            acc2 = acc2 * alpha[:, None] + tl.dot(p_fp8, kv2).to(tl.float32) * inv_fp8_max
+            acc2 = (
+                acc2 * alpha[:, None] + tl.dot(p_fp8, kv2).to(tl.float32) * inv_fp8_max
+            )
         if NUM_GROUPS >= 4:
-            acc3 = acc3 * alpha[:, None] + tl.dot(p_fp8, kv3).to(tl.float32) * inv_fp8_max
+            acc3 = (
+                acc3 * alpha[:, None] + tl.dot(p_fp8, kv3).to(tl.float32) * inv_fp8_max
+            )
         m_i = m_new
 
     l_safe = tl.where(l_i == 0.0, 1.0, l_i)
@@ -249,7 +255,8 @@ def _sparse_mla_fwd_split_dim_kernel(
     tl.store(o_base + h[:, None] * D_V + g[None, :], acc0.to(o_ptr.dtype.element_ty))
     if NUM_GROUPS >= 2:
         tl.store(
-            o_base + h[:, None] * D_V + (_G + g)[None, :], acc1.to(o_ptr.dtype.element_ty)
+            o_base + h[:, None] * D_V + (_G + g)[None, :],
+            acc1.to(o_ptr.dtype.element_ty),
         )
     if NUM_GROUPS >= 3:
         tl.store(
