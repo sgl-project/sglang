@@ -311,7 +311,9 @@ def fused_experts_none_to_flashinfer_mxfp4(
     x = dispatch_output.hidden_states
     topk_output = dispatch_output.topk_output
 
-    # CUTLASS requires explicit routing tensors.
+    # Under ``--moe-runner-backend flashinfer_mxfp4`` topk may be in bypassed
+    # form (the SM100 trtllm-gen path does routing internally). The CUTLASS
+    # SM90 path needs explicit topk_ids / topk_weights; materialize here.
     if TopKOutputChecker.format_is_bypassed(topk_output):
         topk_output = topk_output.to_standard()
     topk_ids = topk_output.topk_ids

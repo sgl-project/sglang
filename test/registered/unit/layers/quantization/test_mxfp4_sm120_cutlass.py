@@ -59,7 +59,6 @@ def test_dsv4_sm120_load_contract(monkeypatch):
     import sglang.srt.layers.quantization.mxfp4_flashinfer_cutlass_moe as adapter_module
 
     monkeypatch.setattr(adapter_module, "is_sm120_supported", lambda: True)
-    monkeypatch.setattr(adapter_module, "_FI_HAS_SM120_CUTLASS_MXFP4", True)
 
     captured = {}
 
@@ -144,6 +143,8 @@ def test_dsv4_sm120_matches_direct_flashinfer(monkeypatch):
 
     w13_parameter = layer.w13_weight
     w2_parameter = layer.w2_weight
+    w13_scale_parameter = layer.w13_weight_scale_inv
+    w2_scale_parameter = layer.w2_weight_scale_inv
     method.process_weights_after_loading(layer)
 
     expected_w13_scale = block_scale_interleave(w31_scale.view(torch.uint8)).reshape_as(
@@ -154,8 +155,10 @@ def test_dsv4_sm120_matches_direct_flashinfer(monkeypatch):
     )
     assert layer.w13_weight is w13_parameter
     assert layer.w2_weight is w2_parameter
-    assert torch.equal(layer.w13_weight_scale_inv, expected_w13_scale)
-    assert torch.equal(layer.w2_weight_scale_inv, expected_w2_scale)
+    assert layer.w13_weight_scale_inv is w13_scale_parameter
+    assert layer.w2_weight_scale_inv is w2_scale_parameter
+    assert torch.equal(layer.w13_weight_scale_inv.view(torch.uint8), expected_w13_scale)
+    assert torch.equal(layer.w2_weight_scale_inv.view(torch.uint8), expected_w2_scale)
 
     generator = torch.Generator(device="cuda").manual_seed(1)
     x = (

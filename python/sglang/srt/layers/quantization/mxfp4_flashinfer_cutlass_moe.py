@@ -8,50 +8,22 @@ from __future__ import annotations
 
 import logging
 import os
-from inspect import signature
 from typing import TYPE_CHECKING
 
 import torch
+from flashinfer import block_scale_interleave
+from flashinfer.fused_moe import (
+    interleave_moe_scales_for_sm90_mixed_gemm,
+    interleave_moe_weights_for_sm90_mixed_gemm,
+)
 from torch.nn import Module
 from torch.nn.parameter import Parameter
 
-from sglang.srt.utils import is_flashinfer_available, log_info_on_rank0
+from sglang.srt.utils import log_info_on_rank0
 from sglang.srt.utils.common import is_sm120_supported
 
 # Suppress TRT-LLM CUTLASS trace logs without overriding user configuration.
 os.environ.setdefault("TLLM_LOG_LEVEL", "INFO")
-
-if is_flashinfer_available():
-    try:
-        from flashinfer.fused_moe import (
-            interleave_moe_scales_for_sm90_mixed_gemm,
-            interleave_moe_weights_for_sm90_mixed_gemm,
-        )
-
-        _FI_HAS_SM90_CUTLASS_MXFP4 = True
-    except ImportError:
-        interleave_moe_scales_for_sm90_mixed_gemm = None
-        interleave_moe_weights_for_sm90_mixed_gemm = None
-        _FI_HAS_SM90_CUTLASS_MXFP4 = False
-
-    try:
-        import flashinfer
-        from flashinfer.fused_moe import cutlass_fused_moe as _cutlass_fused_moe
-
-        block_scale_interleave = flashinfer.block_scale_interleave
-        try:
-            _FI_HAS_SM120_CUTLASS_MXFP4 = (
-                callable(flashinfer.mxfp8_quantize)
-                and "use_mxfp8_act_scaling" in signature(_cutlass_fused_moe).parameters
-            )
-        except (TypeError, ValueError):
-            _FI_HAS_SM120_CUTLASS_MXFP4 = False
-    except (AttributeError, ImportError):
-        block_scale_interleave = None
-        _FI_HAS_SM120_CUTLASS_MXFP4 = False
-else:
-    _FI_HAS_SM90_CUTLASS_MXFP4 = False
-    _FI_HAS_SM120_CUTLASS_MXFP4 = False
 
 logger = logging.getLogger(__name__)
 
@@ -67,19 +39,6 @@ class Mxfp4FlashinferCutlassMoEMethod:
 
     def __init__(self, fp8_method, prefix: str):
         self._use_mxfp8_act_scaling = is_sm120_supported()
-        if self._use_mxfp8_act_scaling and not _FI_HAS_SM120_CUTLASS_MXFP4:
-            raise RuntimeError(
-                "Mxfp4FlashinferCutlassMoEMethod on SM120 requires a "
-                "FlashInfer build with MXFP8 activation scaling support."
-            )
-        if not self._use_mxfp8_act_scaling and not _FI_HAS_SM90_CUTLASS_MXFP4:
-            raise RuntimeError(
-                "Mxfp4FlashinferCutlassMoEMethod requires FlashInfer >= 0.6.11 "
-                "(PR #3084 SM90 mixed-input helpers). Older builds lack "
-                "interleave_moe_{weights,scales}_for_sm90_mixed_gemm; "
-                "either upgrade flashinfer-python or fall back to "
-                "--moe-runner-backend marlin."
-            )
         self._fp8 = fp8_method
         self.prefix = prefix
         self._swiglu_limit_tensor: torch.Tensor | None = None
@@ -178,8 +137,8 @@ class Mxfp4FlashinferCutlassMoEMethod:
                 or not layer.w2_weight.is_contiguous()
             ):
                 raise ValueError("SM120 FlashInfer MXFP4 weights must be contiguous.")
-            w13_s_il = block_scale_interleave(w13_scale_u8).reshape_as(w13_scale_u8)
-            w2_s_il = block_scale_interleave(w2_scale_u8).reshape_as(w2_scale_u8)
+            for scale_u8 in (w13_scale_u8, w2_scale_u8):
+                scale_u8.copy_(block_scale_interleave(scale_u8).reshape_as(scale_u8))
         else:
             w13_il = interleave_moe_weights_for_sm90_mixed_gemm(
                 layer.w13_weight.data.view(torch.uint8).contiguous(), "fp4"
@@ -195,9 +154,8 @@ class Mxfp4FlashinferCutlassMoEMethod:
             )
             layer.w13_weight = Parameter(w13_il, requires_grad=False)
             layer.w2_weight = Parameter(w2_il, requires_grad=False)
-
-        layer.w13_weight_scale_inv = Parameter(w13_s_il, requires_grad=False)
-        layer.w2_weight_scale_inv = Parameter(w2_s_il, requires_grad=False)
+            layer.w13_weight_scale_inv = Parameter(w13_s_il, requires_grad=False)
+            layer.w2_weight_scale_inv = Parameter(w2_s_il, requires_grad=False)
 
         layer._dsv4_mxfp4_backend = (
             "flashinfer_cutlass_sm120"
