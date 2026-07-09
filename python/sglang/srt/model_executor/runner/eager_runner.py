@@ -305,6 +305,8 @@ class EagerRunner(BaseRunner):
             )
             kwargs["input_embeds"] = sharded_hidden_states
             forward_positions = sharded_positions
+        else:
+            forward_batch.attn_cp_metadata = None
 
         category = (
             "target_verify"
