@@ -37,7 +37,13 @@ _use_rocm_flydsl = get_bool_env_var("SGLANG_USE_ROCM_FLYDSL")
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _is_cuda or _is_xpu:
-    from sgl_kernel import fused_add_rmsnorm, rmsnorm
+    try:
+        from sgl_kernel import fused_add_rmsnorm, rmsnorm
+    except ImportError:
+        # sgl_kernel wheels may be unavailable or ABI-incompatible on new
+        # architectures (e.g. SM12.x: RTX PRO 6000 Blackwell, RTX 50xx,
+        # DGX Spark GB10). RMSNorm falls back to the Triton path below.
+        fused_add_rmsnorm = rmsnorm = None
 
 if _is_npu:
     import torch_npu
@@ -83,6 +89,10 @@ class RMSNorm(CustomOp):
             self._forward_method = self.forward_native
         elif _use_aiter:
             self._forward_method = self.forward_aiter
+        elif (_is_cuda or _is_xpu) and rmsnorm is None:
+            # sgl_kernel rmsnorm kernels unavailable (e.g. SM12.x): use the
+            # JIT Triton implementation, which handles residual fusion too.
+            self._forward_method = self.forward_triton
 
     def forward_triton(self, x: torch.Tensor, residual: Optional[torch.Tensor] = None):
         return rms_norm_fn(

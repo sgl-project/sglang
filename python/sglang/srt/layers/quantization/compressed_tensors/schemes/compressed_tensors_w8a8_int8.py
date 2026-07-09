@@ -27,7 +27,12 @@ __all__ = ["CompressedTensorsW8A8Int8", "NPUCompressedTensorsW8A8Int8"]
 
 _is_cuda = is_cuda()
 if _is_cuda:
-    from sgl_kernel import int8_scaled_mm
+    try:
+        from sgl_kernel import int8_scaled_mm
+    except ImportError:
+        # sgl_kernel unavailable/ABI-incompatible (e.g. SM12.x GPUs); the
+        # diffusion runtime does not use these LLM kernels.
+        int8_scaled_mm = None
 
 
 class CompressedTensorsW8A8Int8(CompressedTensorsLinearScheme):

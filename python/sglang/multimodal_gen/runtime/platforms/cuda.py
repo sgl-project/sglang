@@ -340,7 +340,15 @@ class CudaPlatformBase(Platform):
     @lru_cache(maxsize=1)
     def get_modelopt_flashinfer_fp4_backend(cls) -> str:
         backend = envs.SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND
-        default_backend = "trtllm"
+        if cls.is_sm120():
+            # SM12.x (RTX PRO 6000 Blackwell / RTX 50xx / DGX Spark GB10):
+            # FlashInfer's trtllm fp4 GEMM raises BackendSupportedError with
+            # capability 120; cudnn and cutlass both work (within noise of
+            # each other on Cosmos3-Nano GEMM shapes, 2.5-3.3x over BF16),
+            # while "auto" mis-tunes some shapes. Prefer cudnn.
+            default_backend = "cudnn"
+        else:
+            default_backend = "trtllm"
         if backend is None:
             return default_backend
 
@@ -361,6 +369,13 @@ class CudaPlatformBase(Platform):
                 default_backend,
             )
             return default_backend
+        if backend == "trtllm" and cls.is_sm120():
+            logger.warning(
+                "FlashInfer fp4 GEMM backend 'trtllm' does not support SM12.x "
+                "(BackendSupportedError with capability 120). Falling back to "
+                "'cudnn'."
+            )
+            return "cudnn"
         return backend
 
     @classmethod

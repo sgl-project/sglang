@@ -20,7 +20,12 @@ from sglang.srt.utils import is_cuda
 
 _is_cuda = is_cuda()
 if _is_cuda:
-    from sgl_kernel import qserve_w4a8_per_chn_gemm, qserve_w4a8_per_group_gemm
+    try:
+        from sgl_kernel import qserve_w4a8_per_chn_gemm, qserve_w4a8_per_group_gemm
+    except ImportError:
+        # sgl_kernel unavailable/ABI-incompatible (e.g. SM12.x GPUs); the
+        # diffusion runtime does not use these LLM kernels.
+        qserve_w4a8_per_chn_gemm = qserve_w4a8_per_group_gemm = None
 
 
 QoQ_SUPPORTED_WEIGHT_BITS = [4]

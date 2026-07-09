@@ -36,27 +36,45 @@ _is_musa = is_musa()
 _is_npu = is_npu()
 
 if _is_cuda:
-    from sgl_kernel import moe_align_block_size, moe_sum
-    from sgl_kernel.quantization import (
-        ggml_dequantize,
-        ggml_moe_a8,
-        ggml_moe_a8_vec,
-        ggml_moe_get_block_size,
-        ggml_mul_mat_a8,
-        ggml_mul_mat_vec_a8,
-    )
+    try:
+        from sgl_kernel import moe_align_block_size, moe_sum
+    except ImportError:
+        # sgl_kernel unavailable/ABI-incompatible (e.g. SM12.x GPUs); the
+        # diffusion runtime does not use these LLM kernels.
+        moe_align_block_size = moe_sum = None
+    try:
+        from sgl_kernel.quantization import (
+            ggml_dequantize,
+            ggml_moe_a8,
+            ggml_moe_a8_vec,
+            ggml_moe_get_block_size,
+            ggml_mul_mat_a8,
+            ggml_mul_mat_vec_a8,
+        )
+    except ImportError:
+        ggml_dequantize = ggml_moe_a8 = ggml_moe_a8_vec = None
+        ggml_moe_get_block_size = ggml_mul_mat_a8 = ggml_mul_mat_vec_a8 = None
 
     from sglang.jit_kernel.activation import gelu_and_mul, silu_and_mul
 elif _is_musa:
-    from sgl_kernel import gelu_and_mul, moe_align_block_size, moe_sum, silu_and_mul
-    from sgl_kernel.quantization import (
-        ggml_dequantize,
-        ggml_moe_a8,
-        ggml_moe_a8_vec,
-        ggml_moe_get_block_size,
-        ggml_mul_mat_a8,
-        ggml_mul_mat_vec_a8,
-    )
+    try:
+        from sgl_kernel import gelu_and_mul, moe_align_block_size, moe_sum, silu_and_mul
+    except ImportError:
+        # sgl_kernel unavailable/ABI-incompatible (e.g. SM12.x GPUs); the
+        # diffusion runtime does not use these LLM kernels.
+        gelu_and_mul = moe_align_block_size = moe_sum = silu_and_mul = None
+    try:
+        from sgl_kernel.quantization import (
+            ggml_dequantize,
+            ggml_moe_a8,
+            ggml_moe_a8_vec,
+            ggml_moe_get_block_size,
+            ggml_mul_mat_a8,
+            ggml_mul_mat_vec_a8,
+        )
+    except ImportError:
+        ggml_dequantize = ggml_moe_a8 = ggml_moe_a8_vec = None
+        ggml_moe_get_block_size = ggml_mul_mat_a8 = ggml_mul_mat_vec_a8 = None
 elif _is_npu:
     from gguf import dequantize as gguf_dequantize
 else:

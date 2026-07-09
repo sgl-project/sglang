@@ -43,7 +43,12 @@ _is_cpu = is_cpu()
 _is_cpu_arm64 = is_host_cpu_arm64()
 
 if _is_cuda:
-    from sgl_kernel import int8_scaled_mm
+    try:
+        from sgl_kernel import int8_scaled_mm
+    except ImportError:
+        # sgl_kernel unavailable/ABI-incompatible (e.g. SM12.x GPUs); the
+        # diffusion runtime does not use these LLM kernels.
+        int8_scaled_mm = None
 
     @register_fake_if_exists("sgl_kernel::int8_scaled_mm")
     def _int8_scaled_mm_abstract(
