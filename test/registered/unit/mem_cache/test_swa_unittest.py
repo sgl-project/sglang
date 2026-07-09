@@ -38,9 +38,6 @@ class _DummyReq:
         self.swa_prefix_lock_released = False
         self.kv = SimpleNamespace(swa_evicted_seqlen=0)
 
-    def pop_committed_kv_cache(self):
-        return self._kv_committed_len
-
 
 def _build_swa_tree(
     is_eagle: bool,
@@ -592,7 +589,9 @@ class TestSWA(unittest.TestCase):
             return original_insert(params)
 
         tree.insert = wrapped_insert
-        tree.cache_finished_req(req, is_insert=True)
+        tree.cache_finished_req(
+            req, is_insert=True, kv_len_to_handle=req._kv_committed_len
+        )
 
         self.assertEqual(captured["prev_prefix_len"], req.cache_protected_len)
         self.assertTrue(captured["is_bigram"])
@@ -624,7 +623,9 @@ class TestSWA(unittest.TestCase):
             return original_free(indices)
 
         allocator.free = wrapped_free
-        tree.cache_finished_req(req2, is_insert=False)
+        tree.cache_finished_req(
+            req2, is_insert=False, kv_len_to_handle=req2._kv_committed_len
+        )
 
         # EAGLE + page_size=1 => page_aligned_len = committed_len - 1 = 5
         # Expected frees:
