@@ -119,7 +119,13 @@ def parse_arguments(
     # Strategy 3: ast.literal_eval
     try:
         parsed_value = ast.literal_eval(json_value)
-        return parsed_value, True
+        # ast.literal_eval strips underscores from numeric literals (PEP 515),
+        # e.g. "123_456" -> 123456. If the schema expects a string, don't accept
+        # a numeric result.
+        if arg_type == "string" and not isinstance(parsed_value, str):
+            pass
+        else:
+            return parsed_value, True
     except (ValueError, SyntaxError):
         pass
 

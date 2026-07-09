@@ -19,7 +19,7 @@ from sglang.srt.function_call.gemma4_detector import (
     _parse_gemma4_value,
 )
 from sglang.srt.function_call.gigachat3_detector import GigaChat3Detector
-from sglang.srt.function_call.glm4_moe_detector import Glm4MoeDetector
+from sglang.srt.function_call.glm4_moe_detector import Glm4MoeDetector, parse_arguments
 from sglang.srt.function_call.glm47_moe_detector import Glm47MoeDetector
 from sglang.srt.function_call.gpt_oss_detector import GptOssDetector
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
@@ -3050,6 +3050,31 @@ class TestGlm4MoeDetector(unittest.TestCase):
         params = json.loads(result.calls[0].parameters)
         self.assertEqual(params["old_string"], "    indented code")
         self.assertEqual(params["new_string"], "        also indented")
+
+    def test_parse_arguments_preserves_underscore_in_string_args(self):
+        """parse_arguments should keep underscores in string-typed arguments.
+
+        PEP 515 allows ast.literal_eval to parse "123_456" as the integer
+        123456. When the tool schema says the argument is a string, the
+        raw value must be preserved verbatim.
+        """
+        # Numeric-looking string with underscores
+        value, is_good = parse_arguments("123_456", arg_type="string")
+        self.assertTrue(is_good)
+        self.assertIsInstance(value, str)
+        self.assertEqual(value, "123_456")
+
+        # With underscores that also look like a float
+        value, is_good = parse_arguments("1_000.5", arg_type="string")
+        self.assertTrue(is_good)
+        self.assertIsInstance(value, str)
+        self.assertEqual(value, "1_000.5")
+
+        # Without arg_type hint: the integer behavior is unchanged
+        value, is_good = parse_arguments("123_456")
+        self.assertTrue(is_good)
+        self.assertIsInstance(value, int)
+        self.assertEqual(value, 123456)
 
 
 class TestGlm47MoeDetector(unittest.TestCase):
