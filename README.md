@@ -224,7 +224,7 @@ If you find our work helpful, feel free to give us a cite.
 
 ```bibtex
 @misc{dflash-tfm,
-    title  = {{Trees from Marginals}: Autoregressive Drafting with Factorized Priors},
+    title  = {{Trees from Marginals}: Autoregressive drafting with factorized priors},
     author = {Yuma Oda and Ryan Mathieu and Roman Knyazhitskiy and Artur Chakhvadze},
     note   = {In collaboration with others at Mirai Labs},
     month  = {July},
