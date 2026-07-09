@@ -1226,6 +1226,7 @@ class KvBufferDesc:
 
 
 class KVCache(abc.ABC):
+    layer_shard_enabled: bool = False
     post_capture_active: bool = False
 
     @abc.abstractmethod
@@ -2838,7 +2839,6 @@ class MLATokenToKVPool(KVCache):
             if not valid_mask.all():
                 loc = loc[valid_mask]
                 cache_k = cache_k[valid_mask]
-
         if cache_k.dtype != self.dtype:
             cache_k = cache_k.to(self.dtype)
 
@@ -2849,21 +2849,18 @@ class MLATokenToKVPool(KVCache):
         else:
             self.kv_buffer[layer_id - self.start_layer][loc] = cache_k
 
-    def set_mla_kv_buffer(
+    def _write_mla_kv_buffer(
         self,
-        layer: RadixAttention,
+        dst_buffer: torch.Tensor,
         loc: torch.Tensor,
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
-    ):
-        maybe_detect_oob(loc, 0, self.size + self.page_size, "set_mla_kv_buffer (MLA)")
-        layer_id = layer.layer_id
-
+    ) -> None:
         if _is_hip and self.use_dsa and self.dtype == fp8_dtype:
             # HIP FP8 path uses raw MLA KV layout (nope + rope) without per-block scales.
             # Fuse BF16/FP16 -> FP8 cast with paged KV write.
             set_mla_kv_buffer_triton_fp8_quant(
-                self.kv_buffer[layer_id - self.start_layer],
+                dst_buffer,
                 loc,
                 cache_k_nope,
                 cache_k_rope,
@@ -2881,7 +2878,7 @@ class MLATokenToKVPool(KVCache):
             # cache_k_nope_fp8: (num_tokens, 1, 528) uint8 [nope_fp8(512) | scales(16)]
             # cache_k_rope_fp8: (num_tokens, 1, 128) uint8 [rope_bf16_bytes(128)]
             set_mla_kv_buffer_triton(
-                self.kv_buffer[layer_id - self.start_layer],
+                dst_buffer,
                 loc,
                 cache_k_nope_fp8,
                 cache_k_rope_fp8,
@@ -2895,11 +2892,27 @@ class MLATokenToKVPool(KVCache):
                 cache_k_rope = cache_k_rope.view(self.store_dtype)
 
             set_mla_kv_buffer_triton(
-                self.kv_buffer[layer_id - self.start_layer],
+                dst_buffer,
                 loc,
                 cache_k_nope,
                 cache_k_rope,
             )
+
+    def set_mla_kv_buffer(
+        self,
+        layer: RadixAttention,
+        loc: torch.Tensor,
+        cache_k_nope: torch.Tensor,
+        cache_k_rope: torch.Tensor,
+    ):
+        maybe_detect_oob(loc, 0, self.size + self.page_size, "set_mla_kv_buffer (MLA)")
+        layer_id = layer.layer_id
+        self._write_mla_kv_buffer(
+            self.kv_buffer[layer_id - self.start_layer],
+            loc,
+            cache_k_nope,
+            cache_k_rope,
+        )
 
     def get_mla_kv_buffer(
         self,
@@ -3150,6 +3163,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
         self.index_head_dim = index_head_dim
         if index_buf_size is None:
             index_buf_size = size
+        self.index_buf_size = index_buf_size
         # num head == 1 and head dim == 128 for index_k in DSA
         assert index_head_dim == 128
 
@@ -3164,6 +3178,18 @@ class DSATokenToKVPool(MLATokenToKVPool):
                 ), f"HIP legacy DSA path requires page_size == 1, got {self.page_size}"
         else:
             assert self.page_size == 64
+        self._create_index_buffers()
+        self._finalize_allocation_log(size)
+
+    def _index_buffer_shape(self, num_pages: int) -> tuple[int, int]:
+        return (
+            num_pages,
+            self.page_size
+            * (self.index_head_dim + self.index_head_dim // self.quant_block_size * 4),
+        )
+
+    def _create_index_buffers(self):
+        num_pages = (self.index_buf_size + self.page_size + 1) // self.page_size
         with (
             torch.cuda.use_mem_pool(self.custom_mem_pool)
             if self.custom_mem_pool
@@ -3177,22 +3203,15 @@ class DSATokenToKVPool(MLATokenToKVPool):
                     #     data: for page i,
                     #         * buf[i, :page_size * head_dim] for fp8 data
                     #         * buf[i, page_size * head_dim:].view(float32) for scale
-                    (
-                        (index_buf_size + page_size + 1) // self.page_size,
-                        self.page_size
-                        * (
-                            index_head_dim + index_head_dim // self.quant_block_size * 4
-                        ),
-                    ),
+                    self._index_buffer_shape(num_pages),
                     dtype=self.index_k_with_scale_buffer_dtype,
-                    device=device,
+                    device=self.device,
                 )
-                for _ in range(layer_num)
+                for _ in range(self.layer_num)
             ]
-        self._finalize_allocation_log(size)
 
     def _clear_buffers(self):
-        del self.kv_buffer
+        super()._clear_buffers()
         del self.index_k_with_scale_buffer
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):

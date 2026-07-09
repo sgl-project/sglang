@@ -526,10 +526,10 @@ def prewarm_mhc_pre(
     the TileLang/DeepGEMM on-disk JIT cache, so this cost is paid only on a cold
     cache; later server runs hit the cache. Driven once per process from load_weights.
     """
-    from sglang.srt.server_args import get_global_server_args
+    from sglang.srt.runtime_context import get_server_args
 
     hc_mult, hidden_size = residual.shape[-2], residual.shape[-1]
-    max_num_tokens = get_global_server_args().chunked_prefill_size
+    max_num_tokens = get_server_args().chunked_prefill_size
     buckets = get_mhc_pre_token_count_representatives(
         max_num_tokens, hc_mult * hidden_size
     )

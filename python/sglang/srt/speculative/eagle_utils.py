@@ -20,6 +20,7 @@ from sglang.srt.mem_cache.common import (
     get_alloc_reserve_per_decode,
     get_last_loc,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.triton_ops.spec_tree import (
     sgl_build_tree_kernel_efficient_triton,
     verify_tree_greedy_kernel_triton,
@@ -591,13 +592,12 @@ def eagle_sample(
 
     from sglang.srt.distributed import get_tp_group
     from sglang.srt.layers.dp_attention import (
-        get_attention_tp_group,
         is_dp_attention_enabled,
     )
+    from sglang.srt.runtime_context import get_server_args
     from sglang.srt.sampling.penaltylib.repetition_penalty import (
         apply_scaling_penalties,
     )
-    from sglang.srt.server_args import get_global_server_args
     from sglang.srt.speculative.spec_utils import (
         SIMULATE_ACC_LEN,
         SIMULATE_ACC_TOKEN_MODE,
@@ -684,9 +684,7 @@ def eagle_sample(
             chain_speculative_sampling_triton,
         )
 
-        use_rejection_sampling = (
-            get_global_server_args().speculative_use_rejection_sampling
-        )
+        use_rejection_sampling = get_server_args().speculative_use_rejection_sampling
 
         # Apply temperature and get target probs
         expanded_temperature = torch.repeat_interleave(
@@ -752,8 +750,8 @@ def eagle_sample(
             uniform_samples_for_final_sampling=coins_for_final_sampling,
             target_probs=target_probs,
             draft_probs=draft_probs,
-            threshold_single=get_global_server_args().speculative_accept_threshold_single,
-            threshold_acc=get_global_server_args().speculative_accept_threshold_acc,
+            threshold_single=get_server_args().speculative_accept_threshold_single,
+            threshold_acc=get_server_args().speculative_accept_threshold_acc,
             deterministic=True,
         )
 
@@ -762,7 +760,9 @@ def eagle_sample(
         # non-determinism in softmax/top_k/top_p, causing different
         # sampled tokens. Broadcast from rank 0 to ensure consistency.
         tp_group = (
-            get_attention_tp_group() if is_dp_attention_enabled() else get_tp_group()
+            get_parallel().attn_tp_group
+            if is_dp_attention_enabled()
+            else get_tp_group()
         )
         if tp_group.world_size > 1:
             tp_group.broadcast(predict, src=0)
@@ -847,9 +847,9 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
     # (get_alloc_reserve_per_decode) outgrows the req_to_token row: the write below
     # would OOB and free would leak KV. The row is widened to hold it in _init_pools
     # (PR #26972); fail here with a clear error, not on a later cryptic CUDA assert.
-    from sglang.srt.server_args import get_global_server_args
+    from sglang.srt.runtime_context import get_server_args
 
-    if page_size > 1 and (get_global_server_args().speculative_eagle_topk or 1) > 1:
+    if page_size > 1 and (get_server_args().speculative_eagle_topk or 1) > 1:
         max_alloc_len = int(nxt_kv_lens_cpu.max())
         row_width = batch.req_to_token_pool.req_to_token.shape[1]
         assert max_alloc_len <= row_width, (
