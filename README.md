@@ -3,8 +3,7 @@
     <h1 style="margin:0 0 12px">Trees from Marginals: DFlash-TfM</h1>
     <p style="margin:0">An implementation of DFlash-TfM, a tree-based speculative decoding method. A DFlash drafter produces factorized token marginals; Weaver, a lightweight autoregressive Transformer, expands them into a proposal tree; and fused, rollback-free kernels verify it against hybrid Gated Delta Net target models. On Qwen3.6-27B, DFlash-TfM reaches 392.8 tokens/s per sequence on a single B200: 4.37× over autoregressive decoding and 24.7% over tuned DFlash.</p>
     <p style="margin:10px 0 0;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-      <a href="#"><img src="https://img.shields.io/badge/arXiv-coming%20soon-b31b1b?style=for-the-badge&logo=arxiv&logoColor=white" alt="arXiv coming soon"></a>
-      <a href="#"><img src="https://img.shields.io/badge/PDF-coming%20soon-374151?style=for-the-badge&logo=readthedocs&logoColor=white" alt="PDF coming soon"></a>
+      <a href="https://arxiv.org/abs/2607.06763"><img src="https://img.shields.io/badge/arXiv-2607.06763-b31b1b?style=for-the-badge&logo=arxiv&logoColor=white" alt="arXiv"></a>
       <a href="https://huggingface.co/trymirai/weaver"><img src="https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Weaver-FFD21E?style=for-the-badge" alt="Hugging Face"></a>
     </p>
   </div>
