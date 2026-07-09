@@ -191,7 +191,7 @@ class ModelOptFp8Config(ModelOptQuantConfig):
         cls,
         config: Dict[str, Any],
         ignore_remap: Optional[Dict[str, str]] = None,
-    ) -> "ModelOptFp8Config":
+    ) -> ModelOptFp8Config:
         quant_method = config.get("quant_algo")
         exclude_modules = config.get("ignore")
         if quant_method is None:
