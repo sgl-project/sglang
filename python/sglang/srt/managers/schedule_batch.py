@@ -1168,6 +1168,14 @@ class Req(ReqDllmMixin):
         if tree_cache is not None:
             if cow_mamba is None:
                 cow_mamba = tree_cache.supports_mamba()
+            # unified_kv SWA lives in a per-request ring that is not content-stable
+            # and never cached in the radix tree, so a reused prefix carries stale
+            # SWA. Cap the match by the trailing sliding window so it is re-prefilled
+            # into this request's ring. No-op for other layouts (returns 0).
+            reprefill_tail = tree_cache.swa_reprefill_tail_tokens()
+            if reprefill_tail:
+                capped = max(0, input_len - reprefill_tail)
+                key_limit = capped if key_limit is None else min(key_limit, capped)
             match_result = tree_cache.match_prefix(
                 MatchPrefixParams(
                     key=RadixKey(
