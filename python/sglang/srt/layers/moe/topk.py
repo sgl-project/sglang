@@ -109,6 +109,7 @@ from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
     get_compiler_backend,
+    get_device_capability,
     is_cpu,
     is_cuda,
     is_hip,
@@ -1429,6 +1430,9 @@ def biased_grouped_topk_gpu(
         )
     if (
         _is_cuda
+        # fused_topk_deepseek only supports the following architectures: 89, 90, 100, 103, 120, 121
+        and get_device_capability()
+        in [(8, 9), (9, 0), (10, 0), (10, 3), (12, 0), (12, 1)]
         and fused_topk_deepseek is not None
         and is_power_of_two(num_experts)
         # flashinfer constraints (applied to routed experts only)
