@@ -57,6 +57,23 @@ impl Config {
         if let Some(msg) = retry_without_cap_advisory(&self.retry, &self.admission) {
             tracing::warn!("{msg}");
         }
+        // Retry ITL/deadline knobs only take effect with retry enabled, and the
+        // relative factor must be a sane positive multiplier.
+        if self.retry.enabled
+            && (!self.retry.itl_rel_factor.is_finite() || self.retry.itl_rel_factor <= 0.0)
+        {
+            return Err(anyhow!(
+                "retry.itl_rel_factor must be a finite value > 0 (got {})",
+                self.retry.itl_rel_factor
+            ));
+        }
+        if !self.retry.enabled
+            && (self.retry.max_target_itl_ms.is_some() || self.retry.attempt_deadline_ms.is_some())
+        {
+            return Err(anyhow!(
+                "--retry-max-target-itl-ms / --retry-attempt-deadline-ms require --enable-retry"
+            ));
+        }
         match &self.discovery {
             DiscoveryBackend::StaticUrls(s) => {
                 if s.urls.is_empty() {
@@ -217,8 +234,14 @@ mod tests {
 
     #[test]
     fn retry_without_cap_advisory_warns_only_for_enabled_retry_without_admission() {
-        let enabled = RetryConfig { enabled: true };
-        let disabled = RetryConfig { enabled: false };
+        let enabled = RetryConfig {
+            enabled: true,
+            ..RetryConfig::default()
+        };
+        let disabled = RetryConfig {
+            enabled: false,
+            ..RetryConfig::default()
+        };
         let cap = AdmissionConfig::Enabled {
             max_concurrent_per_worker: std::num::NonZeroUsize::new(4).unwrap(),
             max_queued_requests: None,

@@ -4,6 +4,7 @@
 use crate::config::Config;
 
 use crate::policies::active_load::ActiveLoadRegistry;
+use crate::policies::itl::ItlTable;
 use crate::policies::PolicyRegistry;
 use crate::proxy::Proxy;
 use crate::server::admission::AdmissionQueue;
@@ -35,6 +36,10 @@ pub struct AppContext {
     /// requests per worker and parks (or sheds with 503) excess. A pass-through
     /// when no per-worker cap is configured.
     pub admission: Arc<AdmissionQueue>,
+    /// Per-worker router-observed inter-token latency (ITL), fed from the SSE
+    /// pump's `on_inter_chunk` hook and read by the retry path to avoid
+    /// re-dispatching onto a decode-congested worker.
+    pub itl: Arc<ItlTable>,
     ready: AtomicBool,
 }
 
@@ -95,6 +100,7 @@ impl AppContext {
             active_load,
             metrics,
             admission,
+            itl: ItlTable::new(),
             ready: AtomicBool::new(false),
         }
     }
@@ -161,6 +167,7 @@ impl AppContext {
                 Arc::clone(&metrics),
             )),
             metrics,
+            itl: ItlTable::new(),
             ready: AtomicBool::new(false),
         }
     }

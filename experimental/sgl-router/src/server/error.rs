@@ -131,6 +131,16 @@ pub enum ApiError {
     #[error("stale request expired for model {model}")]
     StaleRequestExpired { model: String },
 
+    /// A single dispatch attempt exceeded the per-attempt response deadline
+    /// (`retry.attempt_deadline_ms`) before the worker produced a response — a
+    /// slow/wedged worker. Distinct from `StaleRequestExpired` (whole-request
+    /// budget) and `UpstreamTimeout` (the proxy's per-request timeout): this is
+    /// the shorter, retry-scoped deadline whose purpose is to fail over off a
+    /// slow worker. Retryable (see [`Self::is_retryable_upstream`]); classed as
+    /// [`ErrorClass::Timeout`].
+    #[error("attempt deadline exceeded for model {model}")]
+    AttemptTimeout { model: String },
+
     /// The per-model policy returned `None` despite the candidate set
     /// being non-empty.  Almost always a router bug or an unsupported
     /// policy state; surfaced as 503 (not 500) so retry-on-failure clients
@@ -184,6 +194,7 @@ impl ApiError {
             ApiError::NoPrefillWorkersAvailable { .. } => ErrorClass::NoTarget,
             ApiError::NoDecodeWorkersAvailable { .. } => ErrorClass::NoTarget,
             ApiError::StaleRequestExpired { .. } => ErrorClass::Timeout,
+            ApiError::AttemptTimeout { .. } => ErrorClass::Timeout,
             ApiError::PolicySelectionFailed { .. } => ErrorClass::NoTarget,
             ApiError::BreakerOpen { .. } => ErrorClass::NoTarget,
             ApiError::WorkerMisconfigured { .. } => ErrorClass::NoTarget,
@@ -210,6 +221,7 @@ impl ApiError {
             ApiError::NoPrefillWorkersAvailable { .. } => "no_prefill_workers_available",
             ApiError::NoDecodeWorkersAvailable { .. } => "no_decode_workers_available",
             ApiError::StaleRequestExpired { .. } => "stale_request_expired",
+            ApiError::AttemptTimeout { .. } => "attempt_timeout",
             ApiError::PolicySelectionFailed { .. } => "policy_selection_failed",
             ApiError::BreakerOpen { .. } => "breaker_open",
             ApiError::WorkerMisconfigured { .. } => "worker_misconfigured",
@@ -269,6 +281,7 @@ impl ApiError {
         match self {
             ApiError::UpstreamUnreachable { .. }
             | ApiError::UpstreamTimeout { .. }
+            | ApiError::AttemptTimeout { .. }
             | ApiError::BreakerOpen { .. }
             | ApiError::WorkerMisconfigured { .. } => true,
             ApiError::UpstreamStatus { .. }
@@ -301,6 +314,7 @@ impl ApiError {
             | ApiError::NoPrefillWorkersAvailable { .. }
             | ApiError::NoDecodeWorkersAvailable { .. }
             | ApiError::StaleRequestExpired { .. }
+            | ApiError::AttemptTimeout { .. }
             | ApiError::PolicySelectionFailed { .. }
             | ApiError::BreakerOpen { .. }
             | ApiError::WorkerMisconfigured { .. }
@@ -386,6 +400,14 @@ impl IntoResponse for ApiError {
                     "stale-request janitor expired in-flight request",
                 );
                 "request expired before completion".to_string()
+            }
+            ApiError::AttemptTimeout { model } => {
+                tracing::warn!(
+                    model = %model,
+                    reason = "attempt_timeout",
+                    "dispatch attempt exceeded the per-attempt response deadline",
+                );
+                "upstream did not respond within the per-attempt deadline".to_string()
             }
             ApiError::PolicySelectionFailed { model } => {
                 tracing::warn!(model = %model, reason = "policy_selection_failed", "service unavailable");

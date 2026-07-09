@@ -194,7 +194,10 @@ async fn retry_recovers_request_that_lands_on_a_dead_worker() {
         // Admission disabled → no per-worker cap, so the load gate is a no-op
         // and the single retry always proceeds to a different worker.
         admission: AdmissionConfig::default(),
-        retry: RetryConfig { enabled: true },
+        retry: RetryConfig {
+            enabled: true,
+            ..RetryConfig::default()
+        },
     };
 
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
@@ -338,7 +341,10 @@ async fn retry_skipped_when_the_only_other_worker_is_full() {
             max_concurrent_per_worker: std::num::NonZeroUsize::new(1).unwrap(),
             max_queued_requests: None,
         },
-        retry: RetryConfig { enabled: true },
+        retry: RetryConfig {
+            enabled: true,
+            ..RetryConfig::default()
+        },
     };
 
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
@@ -494,7 +500,10 @@ async fn retry_recovers_streaming_request_that_lands_on_a_dead_worker() {
         proxy: ProxyConfig::default(),
         active_load: ActiveLoadConfig::default(),
         admission: AdmissionConfig::default(),
-        retry: RetryConfig { enabled: true },
+        retry: RetryConfig {
+            enabled: true,
+            ..RetryConfig::default()
+        },
     };
 
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
@@ -635,7 +644,10 @@ async fn retry_is_bounded_to_one_when_every_worker_is_dead() {
         // Admission disabled → the retry load gate always admits, so the only
         // thing bounding attempts is the at-most-one-retry flag.
         admission: AdmissionConfig::default(),
-        retry: RetryConfig { enabled: true },
+        retry: RetryConfig {
+            enabled: true,
+            ..RetryConfig::default()
+        },
     };
 
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
@@ -779,7 +791,10 @@ async fn engine_error_status_is_forwarded_verbatim_and_never_retried() {
         proxy: ProxyConfig::default(),
         active_load: ActiveLoadConfig::default(),
         admission: AdmissionConfig::default(),
-        retry: RetryConfig { enabled: true },
+        retry: RetryConfig {
+            enabled: true,
+            ..RetryConfig::default()
+        },
     };
 
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
@@ -846,5 +861,276 @@ async fn engine_error_status_is_forwarded_verbatim_and_never_retried() {
     assert_eq!(
         retried, 0,
         "a well-formed engine non-2xx must never be retried; metrics:\n{metrics}"
+    );
+}
+
+/// The ITL load gate: a retry never lands on a decode-congested worker. Two
+/// workers — one dead, one alive but seeded with a high router-observed ITL —
+/// with a retry ITL ceiling below that value. Requests that round-robin onto
+/// the dead worker fail and find the only alternative ITL-hot, so the retry is
+/// SKIPPED (no re-dispatch); requests that land on the live worker succeed. The
+/// point: `retries_total` stays 0 because every would-be retry is blocked by
+/// ITL — contrast `retry_recovers_*`, where the same dead-worker hit IS
+/// recovered when no ITL ceiling applies.
+#[tokio::test]
+async fn retry_skipped_when_only_alternative_is_itl_hot() {
+    let w_dead = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let w_hot = crate::common::mock_worker::MockWorker::start(vec![]).await;
+
+    let cfg = Config {
+        server: ServerConfig {
+            host: "0".into(),
+            port: 0,
+            ..Default::default()
+        },
+        observability: Default::default(),
+        model: ModelConfig {
+            id: "tiny".into(),
+            tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
+            tokenizer_shards: 1,
+            tokenizer_backend: Default::default(),
+            tokenizer_l1_cache_mb: 0,
+            policy: PolicyKind::RoundRobin,
+            // High threshold so the dead worker stays a round-robin candidate.
+            circuit_breaker: Some(CircuitBreakerConfig {
+                threshold: std::num::NonZeroU32::new(u32::MAX).unwrap(),
+                cool_down_secs: 30,
+            }),
+            cache_aware: None,
+            sticky: None,
+        },
+        discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
+            urls: vec![w_dead.url.clone(), w_hot.url.clone()],
+        }),
+        proxy: ProxyConfig::default(),
+        active_load: ActiveLoadConfig::default(),
+        admission: AdmissionConfig::default(),
+        retry: RetryConfig {
+            enabled: true,
+            // Ceiling well below the seeded ITL, so w_hot is never eligible.
+            max_target_itl_ms: Some(100),
+            ..RetryConfig::default()
+        },
+    };
+
+    let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
+    let registry = Arc::new(WorkerRegistry::default());
+    let policies = Arc::new(build_policy_registry(&cfg).unwrap());
+    let (event_rx, _disc) = spawn_discovery(&cfg).await.unwrap();
+    let _mgr = tokio::spawn(manager::run_with_config(
+        event_rx,
+        registry.clone(),
+        Some(Arc::new(cfg.clone())),
+        None,
+        None,
+    ));
+    let converged = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if registry.workers_for(&ModelId("tiny".into())).len() == 2 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(converged.is_ok(), "registry should contain both workers");
+
+    let proxy = Arc::new(Proxy::new(Duration::from_secs(5)).unwrap());
+    let ctx = Arc::new(AppContext::new(
+        cfg,
+        tokenizers,
+        proxy,
+        registry.clone(),
+        policies,
+    ));
+    ctx.mark_ready();
+
+    // Seed w_hot with a high router-observed ITL (5 s/token) so the ITL gate
+    // rules it out as a retry target. Non-streaming requests below never feed
+    // the pump, so this seeded value stays put for the whole test.
+    ctx.itl
+        .record(&w_hot.url, 5000.0, std::time::Instant::now());
+
+    let app = build_router(ctx.clone());
+
+    // Kill w_dead; it stays a round-robin candidate (high breaker threshold).
+    let dead_url = w_dead.url.clone();
+    drop(w_dead);
+    let host_port = dead_url.trim_start_matches("http://");
+    let down = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if tokio::net::TcpStream::connect(host_port).await.is_err() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(down.is_ok(), "w_dead socket never went down");
+
+    let mut errs = 0usize;
+    for i in 0..4 {
+        let body = serde_json::to_vec(&serde_json::json!({
+            "model": "tiny",
+            "messages": [{"role": "user", "content": format!("hi {i}")}],
+        }))
+        .unwrap();
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let res = app.clone().oneshot(req).await.unwrap();
+        if !res.status().is_success() {
+            errs += 1;
+        }
+    }
+    // Round-robin puts ~half the requests on the dead worker; each of those
+    // cannot be recovered because the only alternative is ITL-hot.
+    assert!(
+        errs >= 1,
+        "dead-worker hits must NOT be recovered (ITL-blocked)"
+    );
+
+    let metrics = ctx.metrics.render();
+    let count = |name: &str| -> u64 {
+        metrics
+            .lines()
+            .find_map(|l| l.strip_prefix(name))
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(0)
+    };
+    assert_eq!(
+        count("sgl_router_retries_total{model_id=\"tiny\"} "),
+        0,
+        "every retry must be blocked by the ITL gate; metrics:\n{metrics}"
+    );
+    assert!(
+        count("sgl_router_retries_exhausted_total{model_id=\"tiny\"} ") >= 1,
+        "ITL-blocked retries must be recorded as exhausted; metrics:\n{metrics}"
+    );
+}
+
+/// The per-attempt response deadline (`retry.attempt_deadline_ms`) fails over
+/// off a slow/wedged worker: a worker that accepts the connection but never
+/// sends a response would otherwise hang the request until the (long)
+/// request-timeout. With a short attempt deadline, the attempt is abandoned
+/// pre-commit and retried onto a healthy worker, so the request still succeeds.
+#[tokio::test]
+async fn attempt_deadline_fails_over_a_wedged_worker() {
+    // Wedges after accepting the TCP connection: never sends response headers.
+    let w_hang =
+        crate::common::mock_worker::MockWorker::start_hanging(Duration::from_secs(30)).await;
+    let w_live = crate::common::mock_worker::MockWorker::start(vec![]).await;
+
+    let cfg = Config {
+        server: ServerConfig {
+            host: "0".into(),
+            port: 0,
+            ..Default::default()
+        },
+        observability: Default::default(),
+        model: ModelConfig {
+            id: "tiny".into(),
+            tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
+            tokenizer_shards: 1,
+            tokenizer_backend: Default::default(),
+            tokenizer_l1_cache_mb: 0,
+            policy: PolicyKind::RoundRobin,
+            // High threshold so the wedged worker stays a round-robin candidate
+            // (the deadline cancels the attempt without recording a breaker
+            // failure, but keep it unreachable for robustness).
+            circuit_breaker: Some(CircuitBreakerConfig {
+                threshold: std::num::NonZeroU32::new(u32::MAX).unwrap(),
+                cool_down_secs: 30,
+            }),
+            cache_aware: None,
+            sticky: None,
+        },
+        discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
+            urls: vec![w_hang.url.clone(), w_live.url.clone()],
+        }),
+        proxy: ProxyConfig::default(),
+        active_load: ActiveLoadConfig::default(),
+        admission: AdmissionConfig::default(),
+        retry: RetryConfig {
+            enabled: true,
+            // Short deadline: fires long before the 5 s proxy request timeout.
+            attempt_deadline_ms: Some(200),
+            ..RetryConfig::default()
+        },
+    };
+
+    let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
+    let registry = Arc::new(WorkerRegistry::default());
+    let policies = Arc::new(build_policy_registry(&cfg).unwrap());
+    let (event_rx, _disc) = spawn_discovery(&cfg).await.unwrap();
+    let _mgr = tokio::spawn(manager::run_with_config(
+        event_rx,
+        registry.clone(),
+        Some(Arc::new(cfg.clone())),
+        None,
+        None,
+    ));
+    let converged = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if registry.workers_for(&ModelId("tiny".into())).len() == 2 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(converged.is_ok(), "registry should contain both workers");
+
+    let proxy = Arc::new(Proxy::new(Duration::from_secs(5)).unwrap());
+    let ctx = Arc::new(AppContext::new(
+        cfg,
+        tokenizers,
+        proxy,
+        registry.clone(),
+        policies,
+    ));
+    ctx.mark_ready();
+    let app = build_router(ctx.clone());
+
+    let mut oks = 0usize;
+    for i in 0..4 {
+        let body = serde_json::to_vec(&serde_json::json!({
+            "model": "tiny",
+            "messages": [{"role": "user", "content": format!("hi {i}")}],
+        }))
+        .unwrap();
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        // Whole call must finish well under the 5 s proxy timeout — proof the
+        // 200 ms attempt deadline (not the request timeout) drove the failover.
+        let res = tokio::time::timeout(Duration::from_secs(3), app.clone().oneshot(req))
+            .await
+            .expect("request must complete via the attempt deadline, not hang")
+            .unwrap();
+        if res.status().is_success() {
+            oks += 1;
+        }
+    }
+    assert_eq!(
+        oks, 4,
+        "every request should succeed — wedged-worker hits fail over via the deadline"
+    );
+
+    let metrics = ctx.metrics.render();
+    let retried = metrics
+        .lines()
+        .find_map(|l| l.strip_prefix("sgl_router_retries_total{model_id=\"tiny\"} "))
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    assert!(
+        retried >= 1,
+        "the attempt deadline must have triggered at least one retry; metrics:\n{metrics}"
     );
 }

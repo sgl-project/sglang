@@ -49,7 +49,12 @@ pub async fn metrics(State(ctx): State<Arc<AppContext>>) -> impl IntoResponse {
             }
         })
         .collect();
-    let body = ctx.metrics.render_with_workers(&workers);
+    let mut body = ctx.metrics.render_with_workers(&workers);
+    // Per-worker ITL gauge, sampled from the shared table at scrape time (same
+    // pull-on-scrape model as the worker gauges above; a worker with no fresh
+    // ITL sample emits no series).
+    let itl_samples = ctx.itl.snapshot_fresh(std::time::Instant::now());
+    body.push_str(&ctx.metrics.render_worker_itl(&itl_samples));
     (
         StatusCode::OK,
         [(CONTENT_TYPE, PROMETHEUS_CONTENT_TYPE)],

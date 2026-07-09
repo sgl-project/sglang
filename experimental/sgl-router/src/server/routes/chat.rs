@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::config::RetryConfig;
 use crate::discovery::{ModelId, WorkerMode};
 use crate::policies::registry::{PdPoolResolver, PdResolveError};
 use crate::policies::{request_tokens_for, RequestTokens, SelectionContext};
@@ -421,11 +422,18 @@ async fn chat_completions_inner(
     // between successive upstream chunks. Installed only on the streaming
     // arms below, and only armed by the proxy for 2xx responses — the same
     // gate as TTFT.
-    let make_itl_hook = || -> Box<dyn Fn(f64) + Send + 'static> {
+    // Takes the serving worker's URL so the same per-chunk gap feeds both the
+    // per-model `sgl_router_itl_seconds` histogram AND the per-worker `ItlTable`
+    // that the retry load gate reads. Called fresh per streaming arm / retry
+    // attempt with the current worker.
+    let make_itl_hook = |worker_url: &str| -> Box<dyn Fn(f64) + Send + 'static> {
         let metrics = Arc::clone(&ctx.metrics);
         let model = metrics_model.clone();
+        let itl = Arc::clone(&ctx.itl);
+        let url = worker_url.to_owned();
         Box::new(move |gap_seconds: f64| {
             metrics.observe_itl(&model, gap_seconds);
+            itl.record(&url, gap_seconds * 1000.0, std::time::Instant::now());
         })
     };
 
@@ -665,7 +673,7 @@ async fn chat_completions_inner(
                 // of scope here — see the request_id comment above.
                 request_id.as_deref(),
                 Some(make_stream_end_hook(&decode_worker.url)),
-                Some(make_itl_hook()),
+                Some(make_itl_hook(&decode_worker.url)),
             );
             tokio::select! {
                 biased;
@@ -768,7 +776,7 @@ async fn chat_completions_inner(
                     // it; here we only supply the rid the engine knows this request by.
                     request_id.as_deref(),
                     Some(make_stream_end_hook(&metrics_worker_url)),
-                    Some(make_itl_hook()),
+                    Some(make_itl_hook(&worker.url)),
                 );
                 // Bias `fetch` over the cancellation branch: a successful
                 // response that completes in the same poll as the token firing
@@ -780,6 +788,12 @@ async fn chat_completions_inner(
                     biased;
                     r = fetch => r,
                     _ = stale_token.cancelled() => Err(ApiError::StaleRequestExpired { model: model_str.clone() }),
+                    // Per-attempt response deadline (retry.attempt_deadline_ms):
+                    // a slow/wedged worker that hasn't produced a response yet is
+                    // abandoned pre-commit and retried. `None` → never fires.
+                    _ = attempt_deadline(ctx.config.retry.attempt_deadline_ms) => {
+                        Err(ApiError::AttemptTimeout { model: model_str.clone() })
+                    }
                 };
                 // A received response (any status) means responsibility has passed
                 // to `forward_streaming_to`'s own guard (or nothing, for non-2xx) —
@@ -834,6 +848,12 @@ async fn chat_completions_inner(
                     biased;
                     r = fetch => r,
                     _ = stale_token.cancelled() => Err(ApiError::StaleRequestExpired { model: model_str.clone() }),
+                    // Per-attempt response deadline (retry.attempt_deadline_ms):
+                    // a slow/wedged worker that hasn't produced a response yet is
+                    // abandoned pre-commit and retried. `None` → never fires.
+                    _ = attempt_deadline(ctx.config.retry.attempt_deadline_ms) => {
+                        Err(ApiError::AttemptTimeout { model: model_str.clone() })
+                    }
                 };
                 // A complete response (any status) means the engine is done with this
                 // request — don't abort it. Only an early drop (client disconnect) or
@@ -891,6 +911,35 @@ async fn chat_completions_inner(
                             failed_worker = %worker.url,
                             error = %e,
                             "retry skipped: no other worker to fail over to",
+                        );
+                        ctx.metrics.record_retries_exhausted(&metrics_model);
+                        break Err(e);
+                    }
+                    // ITL load gate: drop candidates whose router-observed decode
+                    // latency is over the ceiling (opt-in via
+                    // `retry.max_target_itl_ms`) so a re-dispatch never lands on a
+                    // decode-congested worker. A worker with no fresh ITL sample is
+                    // eligible (missing data must not block failover); with the gate
+                    // unconfigured every worker passes, leaving the count-based path.
+                    let now = std::time::Instant::now();
+                    let source_itl = ctx.itl.get_fresh(&worker.url, now);
+                    let remaining: Vec<Arc<Worker>> = remaining
+                        .into_iter()
+                        .filter(|w| {
+                            itl_target_eligible(
+                                &ctx.config.retry,
+                                ctx.itl.get_fresh(&w.url, now),
+                                source_itl,
+                            )
+                        })
+                        .collect();
+                    if remaining.is_empty() {
+                        // Every other worker is ITL-hot.
+                        tracing::debug!(
+                            model = %model_str,
+                            failed_worker = %worker.url,
+                            error = %e,
+                            "retry skipped: every other worker is ITL-hot (above the retry ITL ceiling)",
                         );
                         ctx.metrics.record_retries_exhausted(&metrics_model);
                         break Err(e);
@@ -1102,6 +1151,45 @@ async fn chat_completions_inner(
 /// Map a worker's [`WorkerMode`] to the metrics [`WorkerModeLabel`]. Used at
 /// the initial dispatch and again after a plain-mode retry reselects a worker,
 /// so both sites agree on the mapping.
+/// A future that resolves after `ms` milliseconds, or never (`pending`) when
+/// `None`. Used as the per-attempt response-deadline arm of the dispatch
+/// `select!`: with `None` the arm can never win, so the deadline is a no-op.
+async fn attempt_deadline(ms: Option<u64>) {
+    match ms {
+        Some(ms) => tokio::time::sleep(std::time::Duration::from_millis(ms)).await,
+        None => std::future::pending::<()>().await,
+    }
+}
+
+/// Whether a retry target passes the ITL load gate. The gate is opt-in: it
+/// engages ONLY when a ceiling (`max_target_itl_ms`) is set — with no ceiling
+/// every worker passes and retry behaves exactly as the count-based path. When
+/// engaged, a target with a known ITL must be at or below the ceiling AND (when
+/// the failed worker's ITL is also known) at or below it times the relative
+/// factor. A target with unknown ITL always passes — missing data must never
+/// block a failover.
+fn itl_target_eligible(
+    retry: &RetryConfig,
+    target_itl: Option<f64>,
+    source_itl: Option<f64>,
+) -> bool {
+    let Some(ceiling) = retry.max_target_itl_ms else {
+        return true;
+    };
+    let Some(t) = target_itl else {
+        return true;
+    };
+    if t > ceiling as f64 {
+        return false;
+    }
+    if let Some(s) = source_itl {
+        if t > s * retry.itl_rel_factor as f64 {
+            return false;
+        }
+    }
+    true
+}
+
 fn mode_label(mode: WorkerMode) -> WorkerModeLabel {
     match mode {
         WorkerMode::Prefill => WorkerModeLabel::Prefill,
@@ -1413,6 +1501,62 @@ mod tests {
     use anyhow::anyhow;
     use axum::http::StatusCode;
     use reqwest::Url;
+
+    fn retry_cfg(max_target_itl_ms: Option<u64>, itl_rel_factor: f32) -> RetryConfig {
+        RetryConfig {
+            enabled: true,
+            max_target_itl_ms,
+            itl_rel_factor,
+            attempt_deadline_ms: None,
+        }
+    }
+
+    #[test]
+    fn itl_gate_off_accepts_everything() {
+        // No ceiling → gate disabled → any target passes, even a very slow one.
+        let cfg = retry_cfg(None, 1.0);
+        assert!(itl_target_eligible(&cfg, Some(9999.0), Some(10.0)));
+        assert!(itl_target_eligible(&cfg, None, None));
+    }
+
+    #[test]
+    fn itl_ceiling_excludes_hot_targets_but_not_unknown() {
+        let cfg = retry_cfg(Some(100), 1.0);
+        assert!(
+            !itl_target_eligible(&cfg, Some(150.0), None),
+            "over ceiling → excluded"
+        );
+        assert!(
+            itl_target_eligible(&cfg, Some(80.0), None),
+            "under ceiling → eligible"
+        );
+        // Unknown target ITL must NOT be excluded — missing data can't block failover.
+        assert!(itl_target_eligible(&cfg, None, Some(10.0)));
+    }
+
+    #[test]
+    fn itl_relative_gate_requires_target_no_worse_than_source() {
+        // Ceiling high so the absolute check never bites — isolates the relative
+        // gate (which only engages because a ceiling is set).
+        let cfg = retry_cfg(Some(1000), 1.0);
+        assert!(
+            !itl_target_eligible(&cfg, Some(120.0), Some(100.0)),
+            "slower than source → excluded"
+        );
+        assert!(
+            itl_target_eligible(&cfg, Some(90.0), Some(100.0)),
+            "faster than source → eligible"
+        );
+        // Relative gate only applies when BOTH are known.
+        assert!(itl_target_eligible(&cfg, Some(120.0), None));
+    }
+
+    #[test]
+    fn itl_relative_factor_loosens_the_bound() {
+        let cfg = retry_cfg(Some(1000), 2.0);
+        assert!(itl_target_eligible(&cfg, Some(180.0), Some(100.0)));
+        assert!(!itl_target_eligible(&cfg, Some(210.0), Some(100.0)));
+    }
 
     /// Every `ApiError` variant must map deterministically to exactly one
     /// `AbortReason`. This test pins the mapping so:

@@ -137,11 +137,45 @@ impl Default for AdmissionConfig {
 /// `enabled: false, max_retries: 5` state). The at-most-once invariant is
 /// currently structural in the chat handler (a `retried` bool and a
 /// single-worker URL exclusion), so multi-retry is a redesign, not a knob.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct RetryConfig {
     /// Whether the router retries a failed plain-mode dispatch once, onto a
     /// different not-full worker. `false` (default) disables retry.
     pub enabled: bool,
+    /// ITL load gate: a retry target's router-observed inter-token latency must
+    /// be at or below this ceiling (ms). `None` (default) disables the ITL gate
+    /// entirely — retry falls over to any below-cap worker (count-based only).
+    /// The gate needs streaming traffic for the router to observe ITL; a worker
+    /// with no fresh ITL sample is treated as eligible (unknown ≠ hot).
+    pub max_target_itl_ms: Option<u64>,
+    /// When the ITL gate is on, a retry target's ITL must also be at or below
+    /// the failed worker's ITL times this factor (default `1.0` — no worse than
+    /// the worker we just left). Applied only when BOTH ITLs are known.
+    pub itl_rel_factor: f32,
+    /// Per-attempt deadline (ms) on producing a response (headers for streaming,
+    /// full body for non-streaming). If it elapses before the attempt yields a
+    /// response, the attempt is treated as a retryable timeout so a slow/wedged
+    /// worker is failed over. `None` (default) disables it. Bounds
+    /// time-to-response, NOT post-commit inter-token latency: a streaming
+    /// response's headers are returned to the client before the first token, so
+    /// once committed the request can't be retried (true TTFT-triggered retry is
+    /// out of scope). Set below `proxy.request_timeout_secs` to matter.
+    pub attempt_deadline_ms: Option<u64>,
+}
+
+pub fn default_retry_itl_rel_factor() -> f32 {
+    1.0
+}
+
+impl Default for RetryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_target_itl_ms: None,
+            itl_rel_factor: default_retry_itl_rel_factor(),
+            attempt_deadline_ms: None,
+        }
+    }
 }
 
 /// Routing policy selector — the enum form lets `clap` reject unknown

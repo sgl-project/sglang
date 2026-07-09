@@ -5,6 +5,7 @@ pub mod active_load;
 pub mod cache_aware_zmq;
 pub mod engine_load;
 pub mod factory;
+pub mod itl;
 pub mod kv_events;
 pub mod load_based;
 pub mod power_of_two;

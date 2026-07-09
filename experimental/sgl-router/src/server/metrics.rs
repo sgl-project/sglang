@@ -40,6 +40,7 @@
 //! | `sgl_router_engine_aborts_total` | Counter | `reason` |
 //! | `sgl_router_retries_total` | Counter | `model_id` |
 //! | `sgl_router_retries_exhausted_total` | Counter | `model_id` |
+//! | `sgl_router_worker_itl_ms` | Gauge | `worker_url` |
 //! | `sgl_router_queued_requests` | Gauge | (none) |
 //! | `sgl_router_admission_wait_seconds` | Histogram | `model_id` |
 //!
@@ -890,6 +891,30 @@ impl MetricsRegistry {
     /// (and tests) that have no [`crate::workers::WorkerRegistry`] handy.
     pub fn render(&self) -> String {
         self.render_with_workers(&[])
+    }
+
+    /// Render the per-worker router-observed ITL gauge from a scrape-time
+    /// snapshot (`worker_url -> mean inter-token latency ms`), sampled from the
+    /// shared [`crate::policies::itl::ItlTable`] by the `/metrics` route and
+    /// appended to the main body. Distinct from the per-model
+    /// `sgl_router_itl_seconds` histogram: this is the per-worker signal the
+    /// retry load gate reads, exposed so operators can see/tune the ceiling.
+    pub fn render_worker_itl(&self, samples: &[(String, f64)]) -> String {
+        let mut out = String::new();
+        out.push_str(
+            "# HELP sgl_router_worker_itl_ms Router-observed mean inter-token latency per worker (ms), EWMA over recent streaming chunks; the signal the retry ITL gate reads.\n",
+        );
+        out.push_str("# TYPE sgl_router_worker_itl_ms gauge\n");
+        let mut entries: Vec<&(String, f64)> = samples.iter().collect();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        for (url, ms) in entries {
+            out.push_str(&format!(
+                "sgl_router_worker_itl_ms{{worker_url=\"{}\"}} {}\n",
+                escape_label(url),
+                ms,
+            ));
+        }
+        out
     }
 
     /// Render the full exposition, sampling the supplied per-worker
