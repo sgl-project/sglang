@@ -621,6 +621,18 @@ class HiRadixCache(RadixCache):
                     self.evict_host(operation.storage_hit_count)
                     host_indices = cc.mem_pool_host.alloc(operation.storage_hit_count)
                 if host_indices is None:
+                    available_size = cc.mem_pool_host.available_size()
+                    prefetch_length = min(
+                        operation.storage_hit_count,
+                        available_size - (available_size % self.page_size),
+                    )
+                    if prefetch_length >= self.prefetch_threshold:
+                        operation.storage_hit_count = prefetch_length
+                        operation.hash_value = operation.hash_value[
+                            : prefetch_length // self.page_size
+                        ]
+                        host_indices = cc.mem_pool_host.alloc(prefetch_length)
+                if host_indices is None:
                     self._revoke_pending_prefetch(req_id)
                     logger.debug(
                         f"Revoking prefetch for request {req_id} due to host memory allocation failure."
@@ -1831,8 +1843,8 @@ class HiRadixCache(RadixCache):
 
         last_host_node, prefetch_key, operation = self.ongoing_prefetch[rid]
         if operation.host_indices is None:
-            # Mark terminated. Delay the cleaning process in `drain_storage_control_queues`
             self.cache_controller.terminate_prefetch(operation)
+            self._revoke_pending_prefetch(rid)
             return
 
         completed_tokens, _ = self.cache_controller.terminate_prefetch(operation)
