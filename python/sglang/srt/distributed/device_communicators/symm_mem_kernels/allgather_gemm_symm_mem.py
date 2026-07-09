@@ -9,21 +9,14 @@ import dataclasses
 from typing import List, Optional, Tuple
 import triton
 import triton.language as tl
+from triton.language import core
 
 logger = logging.getLogger(__name__)
 
 
-@triton.jit
-def __syncthreads():
-    """PTX bar.sync (block-level __syncthreads)."""
-    tl.inline_asm_elementwise(
-        asm="bar.sync 0;",
-        constraints=("=r"),
-        args=[],
-        dtype=tl.int32,
-        is_pure=False,
-        pack=1
-    )
+@core.extern
+def __syncthreads(_semantic=None):
+    return tl.tensor(_semantic.builder.create_barrier(), tl.void)
 
 
 @triton.jit
