@@ -66,17 +66,18 @@ def get_glm_dsa_cp_layer_shard_info(
 
     ``(None, 1)`` disables sharding (feature off or only one CP rank).
     """
-    from sglang.srt.layers.dp_attention import (
-        get_attention_cp_rank,
-        get_attention_cp_size,
-    )
-
     if not is_glm_dsa_cache_layer_split_enabled(model_runner):
         return None, 1
-    shard_size = get_attention_cp_size()
+
+    from sglang.srt.distributed import (
+        get_attn_context_model_parallel_rank,
+        get_attn_context_model_parallel_world_size,
+    )
+
+    shard_size = get_attn_context_model_parallel_world_size()
     if shard_size <= 1:
         return None, 1
-    return get_attention_cp_rank(), shard_size
+    return get_attn_context_model_parallel_rank(), shard_size
 
 
 def get_glm_dsa_layer_split_effective_num_layers(
@@ -88,11 +89,12 @@ def get_glm_dsa_layer_split_effective_num_layers(
     layers, plus one extra layer for the remote scratch buffer used when reading
     a layer owned by another CP rank.
     """
-    from sglang.srt.layers.dp_attention import get_attention_cp_size
-
     if not is_glm_dsa_cache_layer_split_enabled(model_runner):
         return num_layers
-    shard_size = get_attention_cp_size()
+
+    from sglang.srt.distributed import get_attn_context_model_parallel_world_size
+
+    shard_size = get_attn_context_model_parallel_world_size()
     if shard_size <= 1:
         return num_layers
     owned_layers_upper_bound = (num_layers + shard_size - 1) // shard_size
