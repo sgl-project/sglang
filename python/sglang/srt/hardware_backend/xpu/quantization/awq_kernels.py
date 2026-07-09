@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""AWQ int4 dense linear for Intel XPU.
-"""
+"""AWQ int4 dense linear for Intel XPU."""
 
 from __future__ import annotations
 
@@ -22,7 +21,7 @@ if TYPE_CHECKING:
 
 
 class AWQXPULinearKernel:
-    def __init__(self, quant_config: Optional["QuantizationConfig"] = None):
+    def __init__(self, quant_config: Optional[QuantizationConfig] = None):
         self.quant_config = quant_config
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:

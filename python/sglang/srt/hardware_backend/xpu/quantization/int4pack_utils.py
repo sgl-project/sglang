@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Helpers for lowering GPTQ/AWQ int4 weights to the torch XPU int4pack layout.
-"""
+"""Helpers for lowering GPTQ/AWQ int4 weights to the torch XPU int4pack layout."""
 
 from __future__ import annotations
 
@@ -61,9 +60,7 @@ def unpack_gptq_qzeros(qzeros: torch.Tensor) -> torch.Tensor:
     return codes.reshape(rows, -1)  # [K // gs, N]
 
 
-def build_qscale_and_zeros(
-    scales: torch.Tensor, zp: torch.Tensor
-) -> torch.Tensor:
+def build_qscale_and_zeros(scales: torch.Tensor, zp: torch.Tensor) -> torch.Tensor:
     """Build the ``[K // gs, N, 2]`` qScaleAndZeros tensor.
 
     ``scales`` and ``zp`` are both ``[K // gs, N]`` (zp in code space ``[0, 15]``).

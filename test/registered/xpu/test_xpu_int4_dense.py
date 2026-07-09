@@ -1,5 +1,4 @@
-"""Numeric unit tests for the XPU int4 *dense* linear kernels (GPTQ / AWQ).
-"""
+"""Numeric unit tests for the XPU int4 *dense* linear kernels (GPTQ / AWQ)."""
 
 import unittest
 

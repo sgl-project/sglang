@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""GPTQ int4 dense linear for Intel XPU.
-"""
+"""GPTQ int4 dense linear for Intel XPU."""
 
 from __future__ import annotations
 
@@ -23,11 +22,9 @@ if TYPE_CHECKING:
 
 
 class GPTQXPULinearKernel:
-    def __init__(self, quant_config: Optional["QuantizationConfig"] = None):
+    def __init__(self, quant_config: Optional[QuantizationConfig] = None):
         self.quant_config = quant_config
-        self.use_v2_format = (
-            getattr(quant_config, "checkpoint_format", "") == "gptq_v2"
-        )
+        self.use_v2_format = getattr(quant_config, "checkpoint_format", "") == "gptq_v2"
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         group_size = self.quant_config.group_size
