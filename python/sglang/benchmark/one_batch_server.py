@@ -487,6 +487,10 @@ def _flush_cache_with_retry(url: str, endpoint: str, max_retries: int = 3):
         time.sleep(2)
 
 
+# FIXME: this mirrors the chat-encoding dispatch in
+# serving_chat._resolve_chat_encoding_spec (DeepSeek-V4 custom encoding vs HF
+# chat template) so the benchmark reproduces the serving token stream. Unify
+# the dispatch into a shared resolver instead of duplicating it client-side.
 @lru_cache(maxsize=None)
 def _is_deepseek_v4_model(name_or_path: str) -> bool:
     from transformers import AutoConfig
