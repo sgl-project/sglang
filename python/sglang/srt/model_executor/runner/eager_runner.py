@@ -366,6 +366,15 @@ class EagerRunner(BaseRunner):
                         forward_batch,
                         torch.cuda.current_stream(),
                     )
+                    if aux_hidden_states is not None:
+                        aux_hidden_states = [
+                            cp_gather_after_forward(
+                                aux_hidden,
+                                forward_batch,
+                                torch.cuda.current_stream(),
+                            )
+                            for aux_hidden in aux_hidden_states
+                        ]
                     ret = model_runner.model.logits_processor(
                         forward_batch.input_ids,
                         hidden_states,

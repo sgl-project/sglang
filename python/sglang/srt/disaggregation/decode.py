@@ -255,6 +255,8 @@ class DecodeRequest:
     kv_receiver: CommonKVReceiver
     waiting_for_input: bool = False
     metadata_buffer_index: int = -1
+    dspark_hidden_dst_indices: Optional[List[int]] = None
+    dspark_hidden_start: int = 0
 
     # HiCache Status
     prefix_match: Optional[DecodePrefixMatch] = None
@@ -449,6 +451,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self.draft_token_to_kv_pool,
             total_kv_layers=self.scheduler.model_config.num_hidden_layers,
             req_to_token_pool=getattr(self, "req_to_token_pool", None),
+            dspark_hidden_pool=getattr(
+                self.metadata_buffers, "dspark_hidden_pool", None
+            ),
         )
 
         kv_args.ib_device = self.scheduler.server_args.disaggregation_ib_device
@@ -960,12 +965,67 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         self.tree_cache.dec_lock_ref(decode_req.req.last_node)
                     break
 
+            dspark_hidden_dst_indices = None
+            dspark_hidden_start = total_prefix_len
+            dspark_hidden_len = origin_input_len - total_prefix_len
+            state_types = self.kv_manager.kv_args.state_types
+            if self.scheduler.spec_algorithm.is_dspark() and (
+                StateType.DSPARK_HIDDEN in state_types and dspark_hidden_len > 0
+            ):
+                dspark_pool = getattr(self.metadata_buffers, "dspark_hidden_pool", None)
+                if dspark_pool is None:
+                    message = (
+                        "DSpark decode requires a hidden row pool for PD "
+                        "metadata transfer, but none was initialized."
+                    )
+                    logger.error(message)
+                    prepare_abort(
+                        decode_req.req,
+                        message,
+                        status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                    )
+                    self.scheduler.output_streamer.stream_output(
+                        [decode_req.req], decode_req.req.return_logprob
+                    )
+                    if prefix_len > 0:
+                        self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                    failed_reqs.append(decode_req)
+                    indices_to_remove.add(i)
+                    continue
+                if dspark_hidden_len > dspark_pool.size:
+                    message = (
+                        "Request requires more DSpark hidden rows than the "
+                        f"decode pool capacity: required={dspark_hidden_len}, "
+                        f"capacity={dspark_pool.size}"
+                    )
+                    logger.error(message)
+                    prepare_abort(
+                        decode_req.req,
+                        message,
+                        status_code=HTTPStatus.BAD_REQUEST,
+                    )
+                    self.scheduler.output_streamer.stream_output(
+                        [decode_req.req], decode_req.req.return_logprob
+                    )
+                    if prefix_len > 0:
+                        self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                    failed_reqs.append(decode_req)
+                    indices_to_remove.add(i)
+                    continue
+                dspark_hidden_dst_indices = dspark_pool.alloc(dspark_hidden_len)
+                if dspark_hidden_dst_indices is None:
+                    if prefix_len > 0:
+                        self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                    break
+
             dst_kv_indices = self._pre_alloc(
                 decode_req.req,
                 prefix_indices,
                 prefix_len,
                 total_prefix_len,
             )
+            decode_req.dspark_hidden_dst_indices = dspark_hidden_dst_indices
+            decode_req.dspark_hidden_start = dspark_hidden_start
             decode_req.prefix_match = prefix_match
             if self.scheduler.enable_decode_hicache:
                 self._start_hicache_prefetch(decode_req.req, prefix_match)
@@ -1071,7 +1131,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     ring_size=ring_size,
                 )
 
-            state_types = self.kv_manager.kv_args.state_types
             state_indices: Optional[List] = []
             if StateType.C128_STATE in state_types:
                 clear_c128_state = getattr(
@@ -1094,8 +1153,39 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     state_indices.append(_swa_ring_payload())
                 elif st == StateType.C128_STATE:
                     state_indices.append(_c128_state_payload())
+                elif st == StateType.DSPARK_HIDDEN:
+                    state_indices.append(
+                        None
+                        if dspark_hidden_dst_indices is None
+                        else np.asarray(dspark_hidden_dst_indices, dtype=np.int32)
+                    )
                 else:
                     state_indices.append(None)
+            if state_indices and not any(
+                idx is not None and len(idx) > 0 for idx in state_indices
+            ):
+                state_indices = None
+
+            spec_metadata = None
+            if dspark_hidden_dst_indices is not None:
+                target_layer_ids = (
+                    getattr(
+                        self.scheduler.tp_worker.model_runner,
+                        "dflash_or_dspark_target_layer_ids",
+                        None,
+                    )
+                    or []
+                )
+                spec_metadata = {
+                    "dspark_hidden": True,
+                    "hidden_start": int(dspark_hidden_start),
+                    "hidden_len": int(dspark_hidden_len),
+                    "dst_indices": [int(x) for x in dspark_hidden_dst_indices],
+                    "hidden_size": int(
+                        self.metadata_buffers.dspark_hidden_pool.hidden_size
+                    ),
+                    "target_layer_ids": [int(x) for x in target_layer_ids],
+                }
 
             decode_req.metadata_buffer_index = (
                 self.req_to_metadata_buffer_idx_allocator.alloc()
@@ -1107,6 +1197,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 decode_req.metadata_buffer_index,
                 state_indices,
                 decode_prefix_len=total_prefix_len,
+                spec_metadata=spec_metadata,
             )
             if (
                 self.transfer_queue.enable_staging
@@ -1518,6 +1609,15 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 ):
                     self.staging_handler.register_decode_req(dr.req.bootstrap_room, dr)
 
+    def _release_dspark_hidden_rows(self, decode_req: DecodeRequest) -> None:
+        indices = decode_req.dspark_hidden_dst_indices
+        if indices is None:
+            return
+        pool = getattr(self.metadata_buffers, "dspark_hidden_pool", None)
+        if pool is not None:
+            pool.free(indices)
+        decode_req.dspark_hidden_dst_indices = None
+
     def _commit_transfer_to_req(self, decode_req: DecodeRequest):
         idx = decode_req.metadata_buffer_index
         metadata = self.metadata_buffers.get_buf(idx)
@@ -1566,6 +1666,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             )
             decode_req.kv_receiver.clear()
             decode_req.kv_receiver = None
+            self._release_dspark_hidden_rows(decode_req)
             return
         elif actual_room != expected_room:
             # Real corruption detected (mismatch)
@@ -1585,6 +1686,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             )
             decode_req.kv_receiver.clear()
             decode_req.kv_receiver = None
+            self._release_dspark_hidden_rows(decode_req)
             return
 
         self._commit_hicache_local_restore_to_req(decode_req)
@@ -1611,12 +1713,34 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             decode_req.req.output_topk_p = output_topk_p
             decode_req.req.output_topk_index = output_topk_index
             decode_req.req.hidden_states_tensor = output_hidden_states
-            decode_req.req.prefill_tail_hidden_states_tensor = (
-                output_dspark_prefill_tail_hidden_states
-            )
-            decode_req.req.prefill_tail_valid_mask = (
-                output_dspark_prefill_tail_valid_mask
-            )
+            if decode_req.dspark_hidden_dst_indices is not None:
+                dspark_pool = getattr(self.metadata_buffers, "dspark_hidden_pool", None)
+                if dspark_pool is None:
+                    raise RuntimeError("DSpark hidden row pool disappeared on decode.")
+                hidden = dspark_pool.read(decode_req.dspark_hidden_dst_indices)
+                logger.info(
+                    "DSpark PD hidden received on decode: "
+                    f"rid={decode_req.req.rid}, "
+                    f"bootstrap_room={decode_req.req.bootstrap_room}, "
+                    f"hidden_shape={tuple(hidden.shape)}, "
+                    f"hidden_start={decode_req.dspark_hidden_start}, "
+                    f"row_count={len(decode_req.dspark_hidden_dst_indices)}"
+                )
+                decode_req.req.prefill_tail_hidden_states_tensor = hidden
+                decode_req.req.prefill_tail_valid_mask = torch.ones(
+                    (hidden.shape[0],), dtype=torch.bool, device="cpu"
+                )
+                decode_req.req.prefill_tail_hidden_start = (
+                    decode_req.dspark_hidden_start
+                )
+            else:
+                decode_req.req.prefill_tail_hidden_states_tensor = (
+                    output_dspark_prefill_tail_hidden_states
+                )
+                decode_req.req.prefill_tail_valid_mask = (
+                    output_dspark_prefill_tail_valid_mask
+                )
+                decode_req.req.prefill_tail_hidden_start = 0
 
         if decode_req.req.return_logprob:
             decode_req.req.logprob.output_token_logprobs_val.append(
@@ -1734,6 +1858,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     self.scheduler.hisparse_coordinator.request_finished(decode_req.req)
                 # release pre-allocated kv cache, but don't insert into the tree since it's failed
                 release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
+                self._release_dspark_hidden_rows(decode_req)
                 decode_req.kv_receiver.clear()
                 decode_req.kv_receiver = None
                 indices_to_remove.add(i)
@@ -1786,6 +1911,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             # instead of the stale value, avoiding a false-positive mismatch.
             self.metadata_buffers.bootstrap_room[idx] = 0
             self.req_to_metadata_buffer_idx_allocator.free(idx)
+            self._release_dspark_hidden_rows(self.queue[i])
 
         self.queue = [
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove

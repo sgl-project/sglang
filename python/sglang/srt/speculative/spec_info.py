@@ -181,29 +181,56 @@ class SpeculativeAlgorithm(Enum):
             tail_mask = [
                 getattr(req, "prefill_tail_valid_mask", None) for req in batch.reqs
             ]
+            tail_start = [
+                int(getattr(req, "prefill_tail_hidden_start", 0))
+                for req in batch.reqs
+            ]
             if (
                 tail_hidden
                 and all(t is not None for t in tail_hidden)
                 and all(t is not None for t in tail_mask)
             ):
-                prefill_tail_hidden_states = torch.stack(tail_hidden, dim=0).to(
-                    device=batch.device, non_blocking=True
+                max_len = max(int(t.shape[0]) for t in tail_hidden)
+                hidden_size = int(tail_hidden[0].shape[-1])
+                prefill_tail_hidden_states = torch.zeros(
+                    (len(tail_hidden), max_len, hidden_size),
+                    dtype=tail_hidden[0].dtype,
+                    device=batch.device,
                 )
-                prefill_tail_valid_mask = torch.stack(tail_mask, dim=0).to(
-                    device=batch.device, non_blocking=True
+                prefill_tail_valid_mask = torch.zeros(
+                    (len(tail_hidden), max_len),
+                    dtype=torch.bool,
+                    device=batch.device,
                 )
+                for i, (hidden, mask) in enumerate(zip(tail_hidden, tail_mask)):
+                    cur_len = int(hidden.shape[0])
+                    if cur_len == 0:
+                        continue
+                    prefill_tail_hidden_states[i, :cur_len].copy_(
+                        hidden.to(device=batch.device, non_blocking=True)
+                    )
+                    prefill_tail_valid_mask[i, :cur_len].copy_(
+                        mask.to(device=batch.device, non_blocking=True).bool()
+                    )
                 if not bool(prefill_tail_valid_mask.any()):
                     prefill_tail_hidden_states = None
                     prefill_tail_valid_mask = None
+                    prefill_tail_start_positions = None
+                else:
+                    prefill_tail_start_positions = torch.tensor(
+                        tail_start, dtype=torch.int64, device=batch.device
+                    )
             else:
                 prefill_tail_hidden_states = None
                 prefill_tail_valid_mask = None
+                prefill_tail_start_positions = None
 
             spec_info = make_next_draft_input(
                 bonus_tokens=last_tokens_tensor,
                 new_seq_lens=batch.seq_lens,
                 prefill_tail_hidden_states=prefill_tail_hidden_states,
                 prefill_tail_valid_mask=prefill_tail_valid_mask,
+                prefill_tail_start_positions=prefill_tail_start_positions,
                 prefill_tail_hidden_projected=False,
             )
             spec_info.future_indices = batch.req_pool_indices
