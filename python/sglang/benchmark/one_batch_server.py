@@ -499,7 +499,11 @@ def _is_deepseek_v4_model(name_or_path: str) -> bool:
 
     try:
         hf_config = AutoConfig.from_pretrained(name_or_path, trust_remote_code=True)
-    except Exception:
+    except Exception as e:
+        print(
+            f"Warning: could not load config for {name_or_path!r} ({e}); "
+            "assuming a non-DeepSeek-V4 model for --apply-chat-template."
+        )
         return False
     return is_deepseek_v4(hf_config)
 
@@ -799,7 +803,7 @@ def run_one_case(
     n_decode_steps = 0
     iter_time = -1.0
     decode_wall = latency - last_ttft
-    if acc_length > 0 and output_len > 1 and decode_wall > 0:
+    if acc_length > 0 and output_len > 1 and decode_wall > 0 and last_ttft > 0:
         steps = output_len / acc_length
         iter_time = decode_wall / steps
         n_decode_steps = round(steps)
