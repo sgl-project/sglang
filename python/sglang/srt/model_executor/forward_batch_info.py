@@ -652,14 +652,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             extend_prefix_lens = batch.prefix_lens
             extend_logprob_start_lens = batch.extend_logprob_start_lens
 
-        # Mirror the grammars-population behavior previously done in
-        # ScheduleBatch.get_model_worker_batch.
-        if batch.sampling_info is not None:
-            if batch.has_grammar:
-                batch.sampling_info.grammars = [req.grammar for req in batch.reqs]
-            else:
-                batch.sampling_info.grammars = None
-
         # ScheduleBatch.sampling_info is already swapped to the forward-only
         # copy by Scheduler.run_batch under overlap mode (see save/restore
         # block there). Use it directly.
@@ -717,6 +709,19 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             spec_info=batch.spec_info,
         )
 
+        # Populate the grammars of the forward's sampling_info (mirrors what
+        # ScheduleBatch.get_model_worker_batch used to do). ret.sampling_info
+        # is the same object as batch.sampling_info: under isolation it is a
+        # forward-only copy; on non-isolation paths (plain non-overlap gen,
+        # embedding) the write lands on the ScheduleBatch's own sampling_info
+        # and stays harmless because every forward repopulates it and
+        # embedding has no grammar.
+        if ret.sampling_info is not None:
+            if batch.has_grammar:
+                ret.sampling_info.grammars = [req.grammar for req in batch.reqs]
+            else:
+                ret.sampling_info.grammars = None
+
         ret._maybe_init_non_generation_fields(batch)
 
         device = model_runner.device
@@ -730,8 +735,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 bootstrap_rooms=[req.bootstrap_room for req in batch.reqs],
                 device=device,
             )
-            batch.sampling_info.rids_int = hashed
-            batch.sampling_info.bootstrap_room_ids_int = bootstrap_room_ids
+            ret.sampling_info.rids_int = hashed
+            ret.sampling_info.bootstrap_room_ids_int = bootstrap_room_ids
             ret.rids_int = hashed
             ret.bootstrap_room_ids_int = bootstrap_room_ids
 
