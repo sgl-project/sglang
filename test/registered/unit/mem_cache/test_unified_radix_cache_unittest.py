@@ -2832,33 +2832,16 @@ class UnifiedRadixCacheSuite:
 
         storage_extra_config = None
         if storage_backend == "file":
-            import sglang.srt.managers.cache_controller as cache_controller
+            from sglang.srt.runtime_context import get_parallel
 
-            # The file-backend storage config records TP/PP rank/size.  These unit
+            # The file-backend storage config records TP/PP rank/size. These unit
             # fixtures run without initializing distributed parallel state, so
-            # provide the local single-rank values that the fixture represents.
-            tp_rank_patcher = mock.patch.object(
-                cache_controller, "get_tensor_model_parallel_rank", return_value=0
+            # force the local single-rank topology the fixture represents.
+            parallel_override = get_parallel().override(
+                tp_rank=0, tp_size=1, pp_rank=0, pp_size=1
             )
-            tp_size_patcher = mock.patch.object(
-                cache_controller, "get_tensor_model_parallel_world_size", return_value=1
-            )
-            pp_rank_patcher = mock.patch.object(
-                cache_controller, "get_pipeline_model_parallel_rank", return_value=0
-            )
-            pp_size_patcher = mock.patch.object(
-                cache_controller,
-                "get_pipeline_model_parallel_world_size",
-                return_value=1,
-            )
-            tp_rank_patcher.start()
-            tp_size_patcher.start()
-            pp_rank_patcher.start()
-            pp_size_patcher.start()
-            self.addCleanup(tp_rank_patcher.stop)
-            self.addCleanup(tp_size_patcher.stop)
-            self.addCleanup(pp_rank_patcher.stop)
-            self.addCleanup(pp_size_patcher.stop)
+            parallel_override.__enter__()
+            self.addCleanup(parallel_override.__exit__, None, None, None)
 
             assert storage_dir is not None, "file backend needs a storage_dir"
             # HiCacheFile reads the directory from this env var.

@@ -438,14 +438,10 @@ def _capture_eagle_draft_graph_runner(
             _single_rank_graph_capture,
         ),
         patch(
-            "sglang.srt.model_executor.runner.decode_cuda_graph_runner.get_tensor_model_parallel_rank",
-            lambda: 0,
-        ),
-        patch(
             "sglang.srt.model_executor.runner.decode_cuda_graph_runner.get_available_gpu_memory",
             lambda *args, **kwargs: 0.0,
         ),
-        get_parallel().override(attn_cp_size=1),
+        get_parallel().override(attn_cp_size=1, tp_rank=0),
     ):
         _reset_cuda_graph_test_buffers()
         return EAGLEDraftCudaGraphRunner(
@@ -464,14 +460,10 @@ def _capture_frozen_kv_mtp_graph_runner(
             _single_rank_graph_capture,
         ),
         patch(
-            "sglang.srt.model_executor.runner.decode_cuda_graph_runner.get_tensor_model_parallel_rank",
-            lambda: 0,
-        ),
-        patch(
             "sglang.srt.model_executor.runner.decode_cuda_graph_runner.get_available_gpu_memory",
             lambda *args, **kwargs: 0.0,
         ),
-        get_parallel().override(attn_cp_size=1),
+        get_parallel().override(attn_cp_size=1, tp_rank=0),
     ):
         _reset_cuda_graph_test_buffers()
         return FrozenKVMTPCudaGraphRunner(worker)

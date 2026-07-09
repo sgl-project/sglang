@@ -27,7 +27,6 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 import torch
 from numpy import float64
 
-from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.mem_cache.allocator import (
     PagedTokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
@@ -58,6 +57,8 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 
 import logging
+
+from sglang.srt.runtime_context import get_parallel
 
 logger = logging.getLogger(__name__)
 
@@ -412,7 +413,7 @@ class LRUList:
                 evictable_size == lru_list_evictable_size
             ), f"{self.mamba=}, total nodes: {total_nodes}, total lru: {total_lru}, evictable size: {evictable_size} != lru list evictable size: {lru_list_evictable_size}"
         except Exception as e:
-            if get_tensor_model_parallel_rank() == 0:
+            if get_parallel().tp_rank == 0:
                 msg = f"Mamba Radix tree sanity check failed, ping @yizhang2077: {e}"
                 logger.error(msg)
                 tree_cache.pretty_print()
