@@ -14,9 +14,13 @@ import torch.nn.functional as F
 import triton.language as tl
 
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+from sglang.srt.distributed import get_tp_group
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    use_symmetric_memory,
+)
 from sglang.srt.environ import envs
+from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
-from sglang.srt.layers.moe.moe_runner.base import _moe_output_buf
 from sglang.srt.layers.moe.utils import get_moe_padding_size
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
@@ -486,15 +490,13 @@ def _fused_moe_kernel_sequence(
     elif inplace:
         out_hidden_states = hidden_states
     else:
-        _provided = _moe_output_buf.get()
-        if (
-            _provided is not None
-            and _provided.shape == hidden_states.shape
-            and _provided.dtype == hidden_states.dtype
-            and _provided.device == hidden_states.device
+        # Allocate the MoE output in the NCCL symmetric memory pool when symmetric
+        # allocation is required, so the downstream all-reduce takes the low-latency
+        # symmetric path. Only this output enters the pool; the intermediate caches
+        # below stay on the default allocator to bound pool occupancy.
+        with use_symmetric_memory(
+            get_tp_group(), disabled=not is_allocation_symmetric()
         ):
-            out_hidden_states = _provided
-        else:
             out_hidden_states = torch.empty_like(hidden_states)
 
     use_fused_moe_sum_all_reduce = (

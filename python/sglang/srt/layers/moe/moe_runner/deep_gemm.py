@@ -7,15 +7,19 @@ import einops
 import torch
 
 from sglang.jit_kernel.dsv4 import silu_and_mul_masked_post_quant
+from sglang.srt.distributed import get_tp_group
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    use_symmetric_memory,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
+from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeQuantInfo,
     MoeRunnerConfig,
     MoeRunnerCore,
     RunnerInput,
     RunnerOutput,
-    _moe_output_buf,
     register_post_permute,
     register_pre_permute,
 )
@@ -276,15 +280,13 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             )
             del down_input
 
-        _provided = _moe_output_buf.get()
-        if (
-            _provided is not None
-            and _provided.shape == (all_tokens, K)
-            and _provided.dtype == torch.bfloat16
-            and _provided.device == hidden_states_device
+        # Allocate the MoE output in the NCCL symmetric memory pool when symmetric
+        # allocation is required, so the downstream all-reduce takes the low-latency
+        # symmetric path. Only this final output enters the pool; intermediate
+        # buffers stay on the default allocator to bound pool occupancy.
+        with use_symmetric_memory(
+            get_tp_group(), disabled=not is_allocation_symmetric()
         ):
-            down_output = _provided
-        else:
             down_output = torch.empty(
                 (all_tokens, K),
                 device=hidden_states_device,
@@ -355,15 +357,9 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         del gateup_output
 
         # GroupGemm-2: (M, N/2) (E, K, N/2) -> (M, K)
-        _provided = _moe_output_buf.get()
-        if (
-            _provided is not None
-            and _provided.shape == (all_tokens, K)
-            and _provided.dtype == torch.bfloat16
-            and _provided.device == hidden_states_device
+        with use_symmetric_memory(
+            get_tp_group(), disabled=not is_allocation_symmetric()
         ):
-            down_output = _provided
-        else:
             down_output = torch.empty(
                 (all_tokens, K),
                 device=hidden_states_device,
@@ -477,15 +473,9 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 down_input_scale
             )
 
-        _provided = _moe_output_buf.get()
-        if (
-            _provided is not None
-            and _provided.shape == (num_groups, m, n)
-            and _provided.dtype == torch.bfloat16
-            and _provided.device == hidden_states_device
+        with use_symmetric_memory(
+            get_tp_group(), disabled=not is_allocation_symmetric()
         ):
-            down_output = _provided
-        else:
             down_output = torch.empty(
                 (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
             )
@@ -573,15 +563,9 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         # GroupGemm-1
         n = w2_weight.shape[1]
 
-        _provided = _moe_output_buf.get()
-        if (
-            _provided is not None
-            and _provided.shape == (num_groups, m, n)
-            and _provided.dtype == torch.bfloat16
-            and _provided.device == hidden_states_device
+        with use_symmetric_memory(
+            get_tp_group(), disabled=not is_allocation_symmetric()
         ):
-            down_output = _provided
-        else:
             down_output = torch.empty(
                 (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
             )
@@ -675,15 +659,9 @@ def post_permute_deep_gemm_to_standard(
     topk_ids = running_state["topk_ids"]
     topk_weights = running_state["topk_weights"]
 
-    _provided = _moe_output_buf.get()
-    if (
-        _provided is not None
-        and _provided.shape == hidden_states_shape
-        and _provided.dtype == hidden_states_dtype
-        and _provided.device == hidden_states_device
+    with use_symmetric_memory(
+        get_tp_group(), disabled=not is_allocation_symmetric()
     ):
-        output = _provided
-    else:
         output = torch.empty(
             hidden_states_shape, dtype=hidden_states_dtype, device=hidden_states_device
         )
