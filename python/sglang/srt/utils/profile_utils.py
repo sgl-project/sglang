@@ -13,7 +13,7 @@ from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import ProfileReqOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import is_npu
 from sglang.srt.utils.torch_npu_patch_utils import apply_torch_npu_patches
 
@@ -62,7 +62,7 @@ class ProfileManager:
         )
         self.ps = ps
         self.cpu_group = cpu_group
-        self.first_rank_in_node = ps.gpu_id == get_global_server_args().base_gpu_id
+        self.first_rank_in_node = ps.gpu_id == get_server_args().base_gpu_id
         self.profiler_kwargs = None
         self.profiler = None
 

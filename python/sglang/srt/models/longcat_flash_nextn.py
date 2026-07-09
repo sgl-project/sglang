@@ -68,7 +68,7 @@ from sglang.srt.model_loader.utils import should_deepgemm_weight_requant_ue8m0
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 from sglang.srt.models.longcat_flash import LongcatFlashForCausalLM, LongcatFlashMLP
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, get_stream
 from sglang.srt.utils import (
     BumpAllocator,
     add_prefix,
@@ -207,7 +207,7 @@ class LongcatFlashModelNextN(nn.Module):
     ) -> None:
         super().__init__()
         self.vocab_size = config.vocab_size
-        self.alt_stream = torch.cuda.Stream()
+        self.alt_stream = get_stream("alt")
 
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,

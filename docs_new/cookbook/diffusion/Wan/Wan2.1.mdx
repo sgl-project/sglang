@@ -35,7 +35,7 @@ This section provides deployment configurations optimized for different hardware
 
 ### 3.1 Basic Configuration
 
-The Wan2.1 series offers models in multiple sizes and resolutions, optimized for different hardware platforms. The recommended launch configurations vary by hardware and model size.
+The Wan2.1 series offers models in multiple sizes and resolutions. SGLang supports Wan2.1 deployment on NVIDIA B200, B300, H200, H100, and AMD MI300X, MI325X, MI355X GPUs. The recommended launch configurations vary by hardware, model size, and memory headroom.
 
 **Interactive Command Generator**: Use the configuration selector below to automatically generate an appropriate deployment command for your model variant and options.
 
@@ -169,7 +169,9 @@ sglang serve --model-path Wan-AI/Wan2.1-T2V-14B-Diffusers --port 30000 \
     --lora-path NIVEDAN/wan2.1-lora
 ```
 
-## 5. Benchmark
+## 5. Reference Benchmark
+
+The following benchmark is a point-in-time reference for one model, hardware platform, SGLang image, and parameter set. It is not a complete hardware support matrix.
 
 Test Environment:
 

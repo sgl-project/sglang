@@ -582,7 +582,7 @@ def save_materialized_output(
     if not save_output:
         return
     if not save_file_path:
-        logger.info(f"No output path provided, output not saved")
+        logger.info("No output path provided, output not saved")
         return
 
     os.makedirs(os.path.dirname(save_file_path), exist_ok=True)

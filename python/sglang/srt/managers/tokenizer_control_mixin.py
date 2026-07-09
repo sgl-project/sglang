@@ -33,7 +33,6 @@ from sglang.srt.managers.io_struct import (
     FlushCacheReqOutput,
     GetInternalStateReq,
     GetInternalStateReqOutput,
-    GetLoadsReqOutput,
     GetWeightsByNameReqInput,
     GetWeightsByNameReqOutput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
@@ -71,12 +70,13 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromIPCReqOutput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
-    async_sock_send,
-    sock_send,
 )
 from sglang.srt.managers.load_snapshot import LoadSnapshot
 from sglang.srt.server_args import LoRARef, ServerArgs
-from sglang.srt.utils import get_bool_env_var
+from sglang.srt.utils import (
+    get_bool_env_var,
+    normalize_serialized_named_tensor_payloads,
+)
 from sglang.utils import TypeBasedDispatcher
 
 if TYPE_CHECKING:
@@ -115,7 +115,6 @@ _COMMUNICATOR_SPECS = [
     ("set_internal_state", SetInternalStateReqOutput),
     ("expert_distribution", ExpertDistributionReqOutput),
     ("update_lora_adapter", LoRAUpdateOutput),
-    ("get_loads", GetLoadsReqOutput, "watching"),
     ("dumper_control", DumperControlReqOutput),
 ]
 
@@ -131,7 +130,11 @@ class TokenizerControlMixin:
         for spec in _COMMUNICATOR_SPECS:
             name, resp_type = spec[0], spec[1]
             mode = spec[2] if len(spec) > 2 else "queueing"
-            comm = FanOutCommunicator(self.send_to_scheduler, server_args.dp_size, mode)
+            comm = FanOutCommunicator(
+                self._dispatch_to_scheduler,
+                server_args.dp_size,
+                mode,
+            )
             setattr(self, f"{name}_communicator", comm)
             dispatch_pairs.append((resp_type, comm.handle_recv))
         self._result_dispatcher += TypeBasedDispatcher(dispatch_pairs)
@@ -287,17 +290,18 @@ class TokenizerControlMixin:
         # TODO: partial rollback if failed
         if all_success:
             # Keep tokenizer side server_info consistent with scheduler side.
-            self.server_args.hicache_storage_backend = hicache_storage_backend
+            hicache_fields = {"hicache_storage_backend": hicache_storage_backend}
             if hicache_storage_backend_extra_config_json is not None:
-                self.server_args.hicache_storage_backend_extra_config = (
+                hicache_fields["hicache_storage_backend_extra_config"] = (
                     hicache_storage_backend_extra_config_json
                 )
             if hicache_storage_prefetch_policy is not None:
-                self.server_args.hicache_storage_prefetch_policy = (
+                hicache_fields["hicache_storage_prefetch_policy"] = (
                     hicache_storage_prefetch_policy
                 )
             if hicache_write_policy is not None:
-                self.server_args.hicache_write_policy = hicache_write_policy
+                hicache_fields["hicache_write_policy"] = hicache_write_policy
+            self.server_args.override("tokenizer.attach_hicache", **hicache_fields)
         return out
 
     async def detach_hicache_storage(
@@ -313,51 +317,34 @@ class TokenizerControlMixin:
         out = DetachHiCacheStorageReqOutput(success=all_success, message=all_message)
         # TODO: partial rollback if failed
         if all_success:
-            self.server_args.hicache_storage_backend = None
-            self.server_args.hicache_storage_backend_extra_config = None
+            self.server_args.override(
+                "tokenizer.detach_hicache",
+                hicache_storage_backend=None,
+                hicache_storage_backend_extra_config=None,
+            )
         return out
 
     async def start_profile(
         self: TokenizerManager,
-        output_dir: Optional[str] = None,
-        start_step: Optional[int] = None,
-        num_steps: Optional[int] = None,
-        activities: Optional[List[str]] = None,
-        with_stack: Optional[bool] = None,
-        record_shapes: Optional[bool] = None,
-        profile_by_stage: bool = False,
-        merge_profiles: bool = False,
-        profile_prefix: Optional[str] = None,
-        profile_stages: Optional[List[str]] = None,
-        shape_discovery: bool = False,
+        req: Optional[ProfileReq] = None,
     ):
         self.auto_create_handle_loop()
+        req = req or ProfileReq()
+        req.req_type = ProfileReqType.START_PROFILE
         env_with_stack: bool = get_bool_env_var("SGLANG_PROFILE_WITH_STACK", "true")
-        with_stack = False if with_stack is False or env_with_stack is False else True
+        req.with_stack = (
+            False if req.with_stack is False or env_with_stack is False else True
+        )
         env_record_shapes: bool = get_bool_env_var(
             "SGLANG_PROFILE_RECORD_SHAPES", "true"
         )
-        record_shapes = (record_shapes is not False) and env_record_shapes
-        req = ProfileReq(
-            type=ProfileReqType.START_PROFILE,
-            output_dir=output_dir,
-            start_step=start_step,
-            num_steps=num_steps,
-            activities=activities,
-            with_stack=with_stack,
-            record_shapes=record_shapes,
-            profile_by_stage=profile_by_stage,
-            profile_id=str(time.time()),
-            merge_profiles=merge_profiles,
-            profile_prefix=profile_prefix,
-            profile_stages=profile_stages,
-            shape_discovery=shape_discovery,
-        )
+        req.record_shapes = (req.record_shapes is not False) and env_record_shapes
+        req.profile_id = req.profile_id or str(time.time())
         return await self._execute_profile(req)
 
     async def stop_profile(self: TokenizerManager):
         self.auto_create_handle_loop()
-        req = ProfileReq(type=ProfileReqType.STOP_PROFILE)
+        req = ProfileReq(req_type=ProfileReqType.STOP_PROFILE)
         return await self._execute_profile(req)
 
     async def _execute_profile(self: TokenizerManager, req: ProfileReq):
@@ -477,6 +464,10 @@ class TokenizerControlMixin:
 
         if obj.abort_all_requests:
             self.abort_request(abort_all=True)
+
+        obj.serialized_named_tensors = normalize_serialized_named_tensor_payloads(
+            obj.serialized_named_tensors
+        )
 
         async with self.is_pause_cond:
             is_paused = self.is_pause
@@ -861,7 +852,7 @@ class TokenizerControlMixin:
 
         future = asyncio.Future()
         self.session_futures[obj.session_id] = future
-        sock_send(self.send_to_scheduler, obj)
+        self._dispatch_to_scheduler(obj)
 
         try:
             return await future
@@ -873,11 +864,13 @@ class TokenizerControlMixin:
         obj: CloseSessionReqInput,
         request: Optional[fastapi.Request] = None,
     ):
-        await async_sock_send(self.send_to_scheduler, obj)
+        await self._async_dispatch_to_scheduler(obj)
 
     def _update_weight_version_if_provided(
         self: TokenizerManager, weight_version: Optional[str]
     ) -> None:
         """Update weight version if provided."""
         if weight_version is not None:
-            self.server_args.weight_version = weight_version
+            self.server_args.override(
+                "tokenizer.weight_version", weight_version=weight_version
+            )

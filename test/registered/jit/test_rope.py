@@ -5,10 +5,12 @@ import torch
 import triton
 
 from sglang.jit_kernel.utils import get_ci_test_range
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.srt.utils import is_hip
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=64, suite="base-b-kernel-unit-1-gpu-large")
+register_cuda_ci(est_time=64, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_cuda_ci(est_time=256, suite="nightly-kernel-1-gpu", nightly=True)
+register_amd_ci(est_time=64, suite="jit-kernel-unit-test-amd")
 
 DEVICE = "cuda"
 DTYPE = torch.bfloat16
@@ -78,6 +80,31 @@ def flashinfer_rope(
     )
 
 
+def _rope_rotate(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, is_neox: bool):
+    """Rotate the first ``rotary_dim`` channels of ``x`` in place.
+
+    ``x``: [nnz, num_heads, head_size]; ``cos``/``sin``: [nnz, rotary_dim // 2].
+    Matches flashinfer's ``apply_rope_with_cos_sin_cache_inplace`` convention:
+    NeoX splits the rotary block into halves; non-NeoX (GPT-J) uses interleaved
+    even/odd pairs. Channels beyond ``rotary_dim`` are left untouched.
+    """
+    rotary_dim = cos.shape[-1] * 2
+    xf = x[..., :rotary_dim].to(torch.float32)
+    cos = cos[:, None, :]  # [nnz, 1, rotary_dim // 2]
+    sin = sin[:, None, :]
+    if is_neox:
+        x1, x2 = xf[..., : rotary_dim // 2], xf[..., rotary_dim // 2 :]
+        out1 = x1 * cos - x2 * sin
+        out2 = x2 * cos + x1 * sin
+        rotated = torch.cat((out1, out2), dim=-1)
+    else:
+        x1, x2 = xf[..., 0::2], xf[..., 1::2]
+        out1 = x1 * cos - x2 * sin
+        out2 = x2 * cos + x1 * sin
+        rotated = torch.stack((out1, out2), dim=-1).flatten(-2)
+    x[..., :rotary_dim] = rotated.to(x.dtype)
+
+
 def torch_impl_rope(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -85,8 +112,29 @@ def torch_impl_rope(
     positions: torch.Tensor,
     is_neox: bool,
 ) -> None:
-    # TODO: implement a pure-PyTorch reference for extra coverage
-    pass
+    """Pure-PyTorch RoPE reference (in place), used as the ROCm fallback."""
+    rotary_dim = cos_sin_cache.shape[-1]
+    half = rotary_dim // 2
+    gathered = cos_sin_cache[positions.long()]
+    cos, sin = gathered[:, :half], gathered[:, half:]
+    _rope_rotate(q, cos, sin, is_neox)
+    _rope_rotate(k, cos, sin, is_neox)
+
+
+def reference_rope(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    is_neox: bool,
+) -> None:
+    # NVIDIA uses flashinfer (the reference); flashinfer is CUDA-only, so on
+    # ROCm fall back to the torch reference (matches flashinfer's cos/sin-cache
+    # application semantics).
+    if is_hip():
+        torch_impl_rope(q, k, cos_sin_cache, positions, is_neox)
+    else:
+        flashinfer_rope(q, k, cos_sin_cache, positions, is_neox)
 
 
 # ---------------------------------------------------------------------------
@@ -132,7 +180,7 @@ def test_rope(
     q_fi, k_fi = q.clone(), k.clone()
     q_jit, k_jit = q.clone(), k.clone()
 
-    flashinfer_rope(q_fi, k_fi, cos_sin_cache, positions, is_neox)
+    reference_rope(q_fi, k_fi, cos_sin_cache, positions, is_neox)
     sglang_jit_rope(q_jit, k_jit, cos_sin_cache, positions, is_neox)
 
     atol = rtol = 1e-2
@@ -154,7 +202,7 @@ def test_rope_position_dtypes(dtype: torch.dtype) -> None:
     q_fi, k_fi = q.clone(), k.clone()
     q_jit, k_jit = q.clone(), k.clone()
 
-    flashinfer_rope(q_fi, k_fi, cos_sin_cache, positions.long(), is_neox)
+    reference_rope(q_fi, k_fi, cos_sin_cache, positions.long(), is_neox)
     sglang_jit_rope(q_jit, k_jit, cos_sin_cache, positions, is_neox)
 
     atol = rtol = 1e-2
@@ -180,7 +228,7 @@ def test_partial_rope(batch_size: int, is_neox: bool, rope_dim: int, head_dim: i
     q_jit, k_jit = q.clone(), k.clone()
     rope = ..., slice(rope_dim)  # NOTE: flashinfer by default apply to first rope_dim
 
-    flashinfer_rope(q_fi, k_fi, cos_sin_cache, positions.long(), is_neox)
+    reference_rope(q_fi, k_fi, cos_sin_cache, positions.long(), is_neox)
     sglang_jit_rope(q_jit[rope], k_jit[rope], cos_sin_cache, positions, is_neox)
 
     atol = rtol = 1e-2
@@ -223,7 +271,7 @@ def test_fused_rope_store(
 
     # --- reference: separate RoPE then manual scatter ---
     q_ref, k_ref = q.clone(), k.clone()
-    flashinfer_rope(q_ref, k_ref, cos_sin_cache, positions, is_neox)
+    reference_rope(q_ref, k_ref, cos_sin_cache, positions, is_neox)
     k_cache_ref[out_loc] = k_ref.view(batch_size, -1)
     v_cache_ref[out_loc] = v.view(batch_size, -1)
 

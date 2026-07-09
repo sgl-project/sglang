@@ -30,11 +30,17 @@ from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
     BaseCudaGraphBackend,
 )
+from sglang.srt.model_executor.runner_backend.cuda_graph_dedup_mixin import (
+    DedupedCudaGraphMixin,
+)
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     BreakableCUDAGraph,
     BreakableCUDAGraphCapture,
     eager_on_graph,
     enable_breakable_cuda_graph,
+)
+from sglang.srt.model_executor.runner_utils.pool import (
+    get_or_create_global_graph_memory_pool,
 )
 from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -47,7 +53,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.runner.shape_key import ShapeKey
 
 
-class BreakableCudaGraphBackend(BaseCudaGraphBackend):
+class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
     """Segmented capture: graphs break at attention / mamba boundaries;
     attention metadata is recomputed at replay outside captured segments.
     """
@@ -59,6 +65,7 @@ class BreakableCudaGraphBackend(BaseCudaGraphBackend):
         enable_memory_saver: bool = False,
         debug_eager: bool = False,
     ) -> None:
+        self._model_runner = cuda_graph_runner.model_runner
         self._graphs: Dict[Any, BreakableCUDAGraph] = {}
         self._outputs: Dict[Any, Any] = {}
         self._pool = None
@@ -82,15 +89,19 @@ class BreakableCudaGraphBackend(BaseCudaGraphBackend):
     @contextmanager
     def capture_session(self, stream: torch.cuda.Stream):
         if self._pool is None:
-            self._pool = self._device_module.graph_pool_handle()
+            self._pool = get_or_create_global_graph_memory_pool(self._device_module)
         set_graph_pool_id(self._pool)
         self._capture_stream = stream
         self._shared_output_buffer = None
+        self.begin_cuda_graph_capture()
         try:
             with self.replay_session():
                 yield
         finally:
-            self._capture_stream = None
+            try:
+                self.end_cuda_graph_capture()
+            finally:
+                self._capture_stream = None
 
     def capture_one(
         self,
@@ -202,6 +213,7 @@ class BreakableCudaGraphBackend(BaseCudaGraphBackend):
         return self._outputs[shape_key]
 
     def cleanup(self) -> None:
+        self.close()
         self._graphs.clear()
         self._outputs.clear()
         self._pool = None
