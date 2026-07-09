@@ -468,6 +468,7 @@ class PiGemmaAttention(nn.Module):
             if (
                 self.sp_attn is not None
                 and hasattr(past_key_values, "get_prefix")
+                and getattr(past_key_values, "read_only", False)
                 and attention_mask is None
             ):
                 prefix_key_states, prefix_value_states = past_key_values.get_prefix(
