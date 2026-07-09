@@ -57,6 +57,19 @@ def get_rope_index(
     second_per_grid_ts: Optional[torch.Tensor] = None,
     **kwargs,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    if model_type == "qwen2_5_omni":
+        return get_rope_index_qwen2_5_omni(
+            spatial_merge_size,
+            image_token_id,
+            video_token_id,
+            vision_start_token_id,
+            tokens_per_second,
+            input_ids,
+            image_grid_thw,
+            video_grid_thw,
+            second_per_grid_ts,
+            **kwargs,
+        )
     if model_type == "qwen3_omni_moe":
         return get_rope_index_qwen3_omni(
             spatial_merge_size,
@@ -209,6 +222,282 @@ def get_rope_index(
         max_position_ids = position_ids.amax(dim=0, keepdim=False)
         mrope_position_deltas = max_position_ids.amax(-1, keepdim=True) + 1 - s
         return position_ids, mrope_position_deltas
+
+
+def _get_qwen2_5_omni_audio_output_lengths(input_lengths):
+    return ((input_lengths - 1) // 2 + 1 - 2) // 2 + 1
+
+
+def get_rope_index_qwen2_5_omni(
+    spatial_merge_size: int,
+    image_token_id: int,
+    video_token_id: int,
+    vision_start_token_id: int,
+    tokens_per_second: Optional[int] = None,
+    input_ids: Optional[torch.LongTensor] = None,
+    image_grid_thw: Optional[torch.LongTensor] = None,
+    video_grid_thw: Optional[torch.LongTensor] = None,
+    second_per_grid_ts: Optional[torch.Tensor] = None,
+    **kwargs,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    audio_token_id = kwargs["audio_token_id"]
+    audio_start_token_id = kwargs["audio_start_token_id"]
+    position_id_per_seconds = kwargs.get("position_id_per_seconds", None) or 1
+    use_audio_in_video = kwargs.get("use_audio_in_video", False)
+    audio_seqlens = kwargs.get("audio_seqlens", None)
+
+    if use_audio_in_video:
+        raise NotImplementedError(
+            "Qwen2.5-Omni SGLang mrope currently supports separate video/audio "
+            "inputs only. Set use_audio_in_video=False."
+        )
+
+    def _find_from(tokens, token_id, start, remain):
+        if token_id is None or remain <= 0:
+            return len(tokens) + 1
+        try:
+            return tokens.index(token_id, start)
+        except ValueError:
+            return len(tokens) + 1
+
+    has_audio_tokens = bool(
+        input_ids is not None
+        and audio_start_token_id is not None
+        and torch.any(input_ids == audio_start_token_id).item()
+    )
+    if input_ids is not None and (
+        image_grid_thw is not None
+        or video_grid_thw is not None
+        or audio_seqlens is not None
+        or has_audio_tokens
+    ):
+        total_input_ids = input_ids
+        position_ids = torch.ones(
+            3,
+            input_ids.shape[0],
+            input_ids.shape[1],
+            dtype=input_ids.dtype,
+            device=input_ids.device,
+        )
+        mrope_position_deltas = []
+        image_idx, video_idx, audio_idx = 0, 0, 0
+        for i, current_input_ids in enumerate(total_input_ids):
+            vision_start_indices = torch.argwhere(
+                current_input_ids == vision_start_token_id
+            ).squeeze(1)
+            if vision_start_indices.numel() > 0:
+                vision_tokens = current_input_ids[vision_start_indices + 1]
+                image_nums = int((vision_tokens == image_token_id).sum().item())
+                video_nums = int((vision_tokens == video_token_id).sum().item())
+            else:
+                image_nums = 0
+                video_nums = 0
+            audio_nums = int(torch.sum(current_input_ids == audio_start_token_id).item())
+
+            if audio_nums > 0:
+                if audio_seqlens is None:
+                    raise ValueError(
+                        "Qwen2.5-Omni mrope received audio tokens but "
+                        "`audio_seqlens` is None."
+                    )
+                if audio_idx + audio_nums > int(audio_seqlens.shape[0]):
+                    raise ValueError(
+                        "Qwen2.5-Omni mrope audio count mismatch: "
+                        f"tokens need {audio_idx + audio_nums} lengths, "
+                        f"but audio_seqlens has {int(audio_seqlens.shape[0])}."
+                    )
+            if image_nums > 0:
+                if image_grid_thw is None:
+                    raise ValueError(
+                        "Qwen2.5-Omni mrope received image tokens but "
+                        "`image_grid_thw` is None."
+                    )
+                if image_idx + image_nums > int(image_grid_thw.shape[0]):
+                    raise ValueError(
+                        "Qwen2.5-Omni mrope image count mismatch: "
+                        f"tokens need {image_idx + image_nums} grids, "
+                        f"but image_grid_thw has {int(image_grid_thw.shape[0])}."
+                    )
+            if video_nums > 0:
+                if video_grid_thw is None:
+                    raise ValueError(
+                        "Qwen2.5-Omni mrope received video tokens but "
+                        "`video_grid_thw` is None."
+                    )
+                if second_per_grid_ts is None:
+                    raise ValueError(
+                        "Qwen2.5-Omni mrope received video tokens but "
+                        "`second_per_grid_ts` is None."
+                    )
+                if video_idx + video_nums > int(video_grid_thw.shape[0]):
+                    raise ValueError(
+                        "Qwen2.5-Omni mrope video count mismatch: "
+                        f"tokens need {video_idx + video_nums} grids, "
+                        f"but video_grid_thw has {int(video_grid_thw.shape[0])}."
+                    )
+                if video_idx + video_nums > int(second_per_grid_ts.shape[0]):
+                    raise ValueError(
+                        "Qwen2.5-Omni mrope video timing mismatch: "
+                        f"tokens need {video_idx + video_nums} timings, "
+                        f"but second_per_grid_ts has {int(second_per_grid_ts.shape[0])}."
+                    )
+
+            input_tokens = current_input_ids.tolist()
+            llm_pos_ids_list = []
+            st = 0
+            remain_images, remain_videos, remain_audios = (
+                image_nums,
+                video_nums,
+                audio_nums,
+            )
+            for _ in range(image_nums + video_nums + audio_nums):
+                ed_image = _find_from(input_tokens, image_token_id, st, remain_images)
+                ed_video = _find_from(input_tokens, video_token_id, st, remain_videos)
+                ed_audio = _find_from(input_tokens, audio_token_id, st, remain_audios)
+
+                min_ed = min(ed_image, ed_video, ed_audio)
+                if min_ed > len(input_tokens):
+                    raise ValueError(
+                        "Qwen2.5-Omni mrope could not locate the next "
+                        "multimodal placeholder token."
+                    )
+                text_len = min_ed - st - 1
+                if text_len != 0:
+                    st_idx = (
+                        llm_pos_ids_list[-1].max() + 1
+                        if len(llm_pos_ids_list) > 0
+                        else 0
+                    )
+                    llm_pos_ids_list.append(
+                        torch.arange(text_len, device=input_ids.device)
+                        .view(1, -1)
+                        .expand(3, -1)
+                        + st_idx
+                    )
+
+                st_idx = (
+                    llm_pos_ids_list[-1].max() + 1
+                    if len(llm_pos_ids_list) > 0
+                    else 0
+                )
+                bos_len = 1
+                llm_pos_ids_list.append(
+                    torch.arange(bos_len, device=input_ids.device)
+                    .view(1, -1)
+                    .expand(3, -1)
+                    + st_idx
+                )
+                st_idx = llm_pos_ids_list[-1].max() + 1
+
+                if min_ed == ed_audio:
+                    audio_len = _get_qwen2_5_omni_audio_output_lengths(
+                        audio_seqlens[audio_idx]
+                    )
+                    llm_pos_ids_list.append(
+                        torch.arange(audio_len, device=input_ids.device)
+                        .view(1, -1)
+                        .expand(3, -1)
+                        + st_idx
+                    )
+                    data_len = audio_len
+                    audio_idx += 1
+                    remain_audios -= 1
+                elif min_ed == ed_image:
+                    grid_t = image_grid_thw[image_idx][0]
+                    grid_hs = image_grid_thw[:, 1]
+                    grid_ws = image_grid_thw[:, 2]
+                    t_index = (
+                        torch.arange(grid_t, device=input_ids.device)
+                        * position_id_per_seconds
+                    ).long()
+                    llm_pos_ids = _get_llm_pos_ids_for_vision(
+                        st_idx,
+                        image_idx,
+                        spatial_merge_size,
+                        t_index,
+                        grid_hs,
+                        grid_ws,
+                        input_ids.device,
+                    )
+                    llm_pos_ids_list.append(llm_pos_ids)
+                    data_len = image_grid_thw[image_idx].prod() // (
+                        spatial_merge_size**2
+                    )
+                    image_idx += 1
+                    remain_images -= 1
+                else:
+                    grid_t = video_grid_thw[video_idx][0]
+                    grid_hs = video_grid_thw[:, 1]
+                    grid_ws = video_grid_thw[:, 2]
+                    t_index = (
+                        torch.arange(grid_t, device=input_ids.device)
+                        * second_per_grid_ts[video_idx].cpu().float()
+                        * position_id_per_seconds
+                    ).long()
+                    llm_pos_ids = _get_llm_pos_ids_for_vision(
+                        st_idx,
+                        video_idx,
+                        spatial_merge_size,
+                        t_index,
+                        grid_hs,
+                        grid_ws,
+                        input_ids.device,
+                    )
+                    llm_pos_ids_list.append(llm_pos_ids)
+                    data_len = video_grid_thw[video_idx].prod() // (
+                        spatial_merge_size**2
+                    )
+                    video_idx += 1
+                    remain_videos -= 1
+
+                st_idx = llm_pos_ids_list[-1].max() + 1
+                eos_len = 1
+                llm_pos_ids_list.append(
+                    torch.arange(eos_len, device=input_ids.device)
+                    .view(1, -1)
+                    .expand(3, -1)
+                    + st_idx
+                )
+                st += int(text_len + bos_len + data_len + eos_len)
+
+            if st < len(input_tokens):
+                st_idx = (
+                    llm_pos_ids_list[-1].max() + 1
+                    if len(llm_pos_ids_list) > 0
+                    else 0
+                )
+                text_len = len(input_tokens) - st
+                llm_pos_ids_list.append(
+                    torch.arange(text_len, device=input_ids.device)
+                    .view(1, -1)
+                    .expand(3, -1)
+                    + st_idx
+                )
+
+            llm_positions = torch.cat(llm_pos_ids_list, dim=1).reshape(3, -1)
+            if llm_positions.shape[1] != len(current_input_ids):
+                raise ValueError(
+                    "Qwen2.5-Omni mrope position length mismatch: "
+                    f"positions={llm_positions.shape[1]}, "
+                    f"input_ids={len(current_input_ids)}."
+                )
+            position_ids[..., i, :] = llm_positions.to(position_ids.device)
+            mrope_position_deltas.append(
+                llm_positions.max() + 1 - len(current_input_ids)
+            )
+
+        mrope_position_deltas = torch.tensor(
+            mrope_position_deltas, device=input_ids.device
+        ).unsqueeze(1)
+        return position_ids, mrope_position_deltas
+
+    s = input_ids.shape[1]
+    position_ids = torch.arange(s, device=input_ids.device)
+    position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
+    mrope_position_deltas = torch.zeros(
+        [input_ids.shape[0], 1], device=input_ids.device, dtype=input_ids.dtype
+    )
+    return position_ids, mrope_position_deltas
 
 
 def get_rope_index_qwen3_omni(

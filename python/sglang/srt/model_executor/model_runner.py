@@ -298,7 +298,11 @@ _UNSET: Any = object()
 
 def resolve_language_model(model: nn.Module) -> nn.Module:
     model_cls_name = model.__class__.__name__
-    if model_cls_name == "Qwen3OmniMoeForConditionalGeneration":
+    if model_cls_name in (
+        "Qwen2_5OmniForConditionalGeneration",
+        "Qwen2_5OmniModel",
+        "Qwen3OmniMoeForConditionalGeneration",
+    ):
         return model.thinker.model
     if hasattr(model, "model"):
         return model.model

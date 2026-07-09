@@ -420,6 +420,7 @@ class BaseMultimodalProcessor(ABC):
                 "Gemma4UnifiedProcessor",
                 "GlmAsrProcessor",
                 "Qwen2AudioProcessor",
+                "Qwen2_5OmniProcessor",
                 "Qwen3ASRProcessor",
                 "Qwen3OmniMoeProcessor",
             }:
