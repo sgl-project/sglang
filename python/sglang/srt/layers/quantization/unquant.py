@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from enum import Enum
 from typing import TYPE_CHECKING, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -46,6 +47,7 @@ if TYPE_CHECKING:
         DispatchOutput,
         StandardDispatchOutput,
     )
+    from sglang.srt.server_args import ServerArgs
 
 
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -60,6 +62,53 @@ if _use_aiter:
 
 if _is_npu:
     from sglang.srt.hardware_backend.npu.utils import npu_format_cast
+
+
+class Bf16GemmBackend(Enum):
+    AUTO = "auto"
+    CUTEDSL = "cutedsl"
+
+    def is_auto(self) -> bool:
+        return self == Bf16GemmBackend.AUTO
+
+    def is_cutedsl(self) -> bool:
+        return self == Bf16GemmBackend.CUTEDSL
+
+
+_BF16_GEMM_BACKEND: Optional[Bf16GemmBackend] = None
+_cutedsl_bf16_gemm = None
+_use_cutedsl_bf16_gemm = None
+
+
+def initialize_bf16_gemm_config(server_args: ServerArgs) -> None:
+    global _BF16_GEMM_BACKEND, _cutedsl_bf16_gemm, _use_cutedsl_bf16_gemm
+
+    backend = Bf16GemmBackend(server_args.bf16_gemm_backend)
+
+    if backend.is_cutedsl():
+        from sglang.srt.utils import is_sm100_supported
+
+        if not is_sm100_supported():
+            raise ValueError(
+                "--bf16-gemm-backend cutedsl requires SM100/SM103 (Blackwell)"
+            )
+
+        from sglang.jit_kernel.cutedsl_bf16_gemm import (
+            cutedsl_bf16_gemm,
+            use_cutedsl_bf16_gemm,
+        )
+
+        _cutedsl_bf16_gemm = cutedsl_bf16_gemm
+        _use_cutedsl_bf16_gemm = use_cutedsl_bf16_gemm
+
+    _BF16_GEMM_BACKEND = backend
+
+
+def get_bf16_gemm_backend() -> Bf16GemmBackend:
+    global _BF16_GEMM_BACKEND
+    if _BF16_GEMM_BACKEND is None:
+        _BF16_GEMM_BACKEND = Bf16GemmBackend.AUTO
+    return _BF16_GEMM_BACKEND
 
 
 class UnquantizedEmbeddingMethod(QuantizeMethodBase):
@@ -151,6 +200,22 @@ class UnquantizedLinearMethod(LinearMethodBase):
 
         elif _use_aiter and type(layer.weight.data) is torch.Tensor:
             return tgemm.mm(x, layer.weight, bias, otype=x.dtype)
+
+        elif (
+            get_bf16_gemm_backend().is_cutedsl()
+            and x.is_cuda
+            and x.dtype == torch.bfloat16
+            and layer.weight.dtype == torch.bfloat16
+            and (bias is None or bias.dtype == torch.bfloat16)
+            and _use_cutedsl_bf16_gemm(
+                x.numel() // x.shape[-1],
+                layer.weight.shape[0],
+                layer.weight.shape[1],
+            )
+        ):
+            x_shapes = x.shape
+            output = _cutedsl_bf16_gemm(x.view(-1, x_shapes[-1]), layer.weight, bias)
+            return output.view(*x_shapes[:-1], -1)
 
         return F.linear(x, layer.weight, bias)
 
@@ -337,14 +402,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             layer.w2_weight.data = layer.w2_weight.data.reshape(
                 layer.num_local_experts, *new_shape_w2
             )
-
         if _is_npu:
             for weight_name in ["w13_weight", "w2_weight"]:
                 weight = getattr(layer, weight_name)
-                origin_weight = weight.data.transpose(1, 2)
-                new_weight = origin_weight.contiguous()
-                origin_weight.untyped_storage().resize_(0)
-                weight.data = npu_format_cast(new_weight)
+                weight.data = npu_format_cast(weight)
 
         return
 
@@ -697,7 +758,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         # gmm1: gate_up_proj
         hidden_states = torch.ops.npu.npu_grouped_matmul(
             x=[hidden_states],
-            weight=[layer.w13_weight],
+            weight=[layer.w13_weight.transpose(1, 2)],
             bias=w13_bias,
             split_item=2,
             group_list_type=1,
@@ -733,7 +794,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         # gmm2: down_proj
         hidden_states = torch.ops.npu.npu_grouped_matmul(
             x=[hidden_states],
-            weight=[layer.w2_weight],
+            weight=[layer.w2_weight.transpose(1, 2)],
             bias=w2_bias,
             split_item=2,
             group_list_type=1,

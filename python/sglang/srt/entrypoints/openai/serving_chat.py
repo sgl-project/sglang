@@ -38,6 +38,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     FunctionResponse,
     LogProbs,
     MessageProcessingResult,
+    PromptTokensDetails,
     ResponseParserProtocol,
     SglExt,
     ToolCall,
@@ -70,8 +71,8 @@ from sglang.srt.parser.jinja_template_utils import process_content_for_template_
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.template_manager import TemplateManager
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
+    from sglang.srt.parser.template_manager import TemplateManager
 
 logger = logging.getLogger(__name__)
 
@@ -174,7 +175,9 @@ class OpenAIServingChat(OpenAIServingBase):
         if self.reasoning_parser:
             try:
                 rp = ReasoningParser(
-                    model_type=self.reasoning_parser, stream_reasoning=True
+                    model_type=self.reasoning_parser,
+                    stream_reasoning=True,
+                    tokenizer=self.tokenizer_manager.tokenizer,
                 )
                 self._reasoning_detector = rp.detector
             except ValueError as e:
@@ -336,6 +339,15 @@ class OpenAIServingChat(OpenAIServingBase):
         """Post-process reasoning and tool_calls before building response."""
         return reasoning_text, tool_calls
 
+    def _continuous_usage_cached_details(
+        self, content: Dict[str, Any]
+    ) -> Optional[PromptTokensDetails]:
+        if not self.tokenizer_manager.server_args.enable_cache_report:
+            return None
+        return UsageProcessor._details_if_cached(
+            content["meta_info"].get("cached_tokens", 0)
+        )
+
     async def _generate_stream_content(
         self,
         content: Dict[str, Any],
@@ -377,6 +389,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         prompt_tokens=prompt_tokens.get(index, 0),
                         reasoning_tokens=reasoning_tokens.get(index, 0),
                         completion_tokens=completion_tokens.get(index, 0),
+                        cached_tokens=self._continuous_usage_cached_details(content),
                     ).model_dump()
 
                 yield build_sse_content(
@@ -422,6 +435,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         prompt_tokens=prompt_tokens.get(index, 0),
                         reasoning_tokens=reasoning_tokens.get(index, 0),
                         completion_tokens=completion_tokens.get(index, 0),
+                        cached_tokens=self._continuous_usage_cached_details(content),
                     ).model_dump()
 
                 yield build_sse_content(
@@ -449,6 +463,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     prompt_tokens=prompt_tokens.get(index, 0),
                     reasoning_tokens=reasoning_tokens.get(index, 0),
                     completion_tokens=completion_tokens.get(index, 0),
+                    cached_tokens=self._continuous_usage_cached_details(content),
                 ).model_dump()
 
             yield build_sse_content(
@@ -655,7 +670,11 @@ class OpenAIServingChat(OpenAIServingBase):
             else:
                 tools = [item.model_dump() for item in request.tools]
             if self.tool_call_parser:
-                parser = FunctionCallParser(request.tools, self.tool_call_parser)
+                parser = FunctionCallParser(
+                    request.tools,
+                    self.tool_call_parser,
+                    tokenizer=self.tokenizer_manager.tokenizer,
+                )
                 tool_call_constraint = parser.get_structure_constraint(
                     request.tool_choice,
                     parallel_tool_calls=request.parallel_tool_calls,
@@ -832,6 +851,18 @@ class OpenAIServingChat(OpenAIServingBase):
             if request.chat_template_kwargs:
                 extra_template_kwargs.update(request.chat_template_kwargs)
 
+            rc = self.template_manager.reasoning_config
+            if rc is not None and rc.effort_kwarg is not None:
+                if request.reasoning_effort == "low":
+                    extra_template_kwargs.setdefault(rc.effort_kwarg, True)
+                elif request.reasoning_effort in ("medium", "high", "max"):
+                    logger.warning(
+                        "Model '%s' supports only 'low' reasoning effort; "
+                        "requested '%s' treated as default thinking",
+                        self.tokenizer_manager.server_args.served_model_name,
+                        request.reasoning_effort,
+                    )
+
             # Split apply_chat_template(tokenize=True) into render + encode so we
             # can skip add_special_tokens=False on tokenizers that don't auto-add
             # specials (Kimi-like, OpenAI-chat analogue of #25265). Chat
@@ -854,7 +885,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 prompt_ids = self.tokenizer_manager.tokenizer.encode(
                     rendered_prompt, **encode_kwargs
                 )
-            except Exception as e:
+            except Exception:
                 # If the first attempt fails, try with flat function-only format.
                 # Some templates (e.g. Mistral) expect tools without the OpenAI wrapper.
                 tools = (
@@ -1314,6 +1345,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         stream_reasoning=False,
                         force_reasoning=force_reasoning,
                         request=request,
+                        tokenizer=self.tokenizer_manager.tokenizer,
                     )
                     reasoning_text, text = parser.parse_non_stream(text)
                 except Exception as e:
@@ -1497,7 +1529,9 @@ class OpenAIServingChat(OpenAIServingBase):
         # For required/named: only use parser when structural_tag was used
         # as constraint (mirrors the streaming path). For auto: always try.
         if self.tool_call_parser:
-            parser = FunctionCallParser(tools, self.tool_call_parser)
+            parser = FunctionCallParser(
+                tools, self.tool_call_parser, tokenizer=self.tokenizer_manager.tokenizer
+            )
             should_try_parser = (
                 not is_required or parser.detector.supports_structural_tag()
             )
@@ -1610,6 +1644,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 request.stream_reasoning,
                 is_force_reasoning,
                 request,
+                tokenizer=self.tokenizer_manager.tokenizer,
             )
         reasoning_parser = reasoning_parser_dict[index]
         return reasoning_parser.parse_stream_chunk(delta)
@@ -1854,6 +1889,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     probe = FunctionCallParser(
                         tools=request.tools,
                         tool_call_parser=self.tool_call_parser,
+                        tokenizer=self.tokenizer_manager.tokenizer,
                     )
                     use_native_parser = probe.detector.supports_structural_tag()
                 if use_native_parser:
@@ -1864,6 +1900,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 parser_dict[index] = FunctionCallParser(
                     tools=request.tools,
                     tool_call_parser=self.tool_call_parser,
+                    tokenizer=self.tokenizer_manager.tokenizer,
                 )
 
         parser = parser_dict[index]
@@ -1898,6 +1935,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     prompt_tokens=prompt_tokens,
                     completion_tokens=completion_tokens,
                     reasoning_tokens=reasoning_tokens,
+                    cached_tokens=self._continuous_usage_cached_details(content),
                 )
 
             yield f"data: {chunk.model_dump_json()}\n\n"
@@ -1950,6 +1988,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     prompt_tokens=prompt_tokens,
                     completion_tokens=completion_tokens,
                     reasoning_tokens=reasoning_tokens,
+                    cached_tokens=self._continuous_usage_cached_details(content),
                 )
 
             yield f"data: {chunk.model_dump_json()}\n\n"
