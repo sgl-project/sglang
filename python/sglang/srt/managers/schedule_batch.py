@@ -2412,7 +2412,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.extend_lens = self.extend_lens + [1] * running_bs
         self.extend_num_tokens = self.extend_num_tokens + running_bs
         # TODO (lianmin): Revisit this. It should be seq_len - 1
-        self.extend_logprob_start_lens = self.extend_logprob_start_lens + [0] * running_bs
+        self.extend_logprob_start_lens = (
+            self.extend_logprob_start_lens + [0] * running_bs
+        )
         self.is_prefill_only = False
 
     def new_tokens_required_next_decode(
