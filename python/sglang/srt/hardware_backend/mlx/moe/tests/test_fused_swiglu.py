@@ -437,7 +437,10 @@ def test_forced_kernel_rejection_falls_back_correctly(monkeypatch):
         mx.eval(out_ref)
         cases.append((label, x, indices, out_ref))
 
-    mlp = types.SimpleNamespace(switch_mlp=sw, top_k=top_k)
+    # top_k=None skips _aot_warm_kernel: _quantized_switch_glu's fp32 scales
+    # are outside _DTYPES, and warm dispatch hits the real kernel with no
+    # exception handling, before the raiser below is installed.
+    mlp = types.SimpleNamespace(switch_mlp=sw, top_k=None)
     layer = types.SimpleNamespace(mlp=mlp)
     model = types.SimpleNamespace(model=types.SimpleNamespace(layers=[layer]))
     # Patch before installing the raiser: _aot_warm_kernel dispatches the real
@@ -500,3 +503,85 @@ def test_ineligible_input_surfaces_pre_change_message_through_wrapper(
     assert any(
         expected in record.getMessage() for record in caplog.records
     ), f"expected message not in log: {[r.getMessage() for r in caplog.records]}"
+
+
+def test_matched_fp32_triple_falls_back_with_membership_message(monkeypatch, caplog):
+    """A matched fp32 triple (x, gate_s, gate_b all float32) passes the K, N,
+    and mutual-match checks but fails the dtype membership check; the wrapper
+    must still fall back cleanly and surface the membership message."""
+    import logging
+
+    import sglang.srt.hardware_backend.mlx.moe.fused_swiglu as fused_swiglu
+
+    monkeypatch.setattr(fused_swiglu, "_fallback_warned", False)
+    mx.random.seed(0)
+    # in_dim=512 -> K=512 (%512==0), hidden=64 -> N=64 (%8==0): in regime.
+    # _quantized_switch_glu's default construction quantizes to fp32
+    # scales/biases, matching x's fp32 dtype below.
+    in_dim, hidden, n_experts, top_k, B = 512, 64, 4, 2, 2
+    sw = _quantized_switch_glu(in_dim, hidden, n_experts, gate_bias=False)
+    gate_proj = sw.gate_proj
+    assert gate_proj.scales.dtype == mx.float32
+
+    x = mx.random.normal((B, 1, 1, in_dim)).astype(mx.float32)
+    idx = mx.random.randint(0, n_experts, shape=(B, top_k)).astype(mx.uint32)
+    x_up = mx.random.normal((B, top_k, 1, hidden)).astype(mx.float32)
+
+    expected = (
+        f"fused_gate_qmv_silu_mul: dtype {mx.float32} not in {fused_swiglu._DTYPES}."
+    )
+
+    with caplog.at_level(logging.WARNING):
+        out = fused_swiglu._fused_gate_or_fallback(
+            gate_proj, x, idx, x_up, sorted_indices=False
+        )
+    mx.eval(out)
+
+    assert any(
+        expected in record.getMessage() for record in caplog.records
+    ), f"expected message not in log: {[r.getMessage() for r in caplog.records]}"
+
+
+def test_patch_skips_warm_and_logs_for_out_of_regime_dtype(monkeypatch, caplog):
+    """A matched fp32 SwitchGLU is eligible per can_fuse (which does not check
+    dtype membership) and must still patch successfully; _aot_warm_kernel has
+    to catch the membership NotFusable at warm time, skip warming, and log
+    it, rather than letting the patch crash."""
+    import logging
+    import types
+
+    import sglang.srt.hardware_backend.mlx.moe.fused_swiglu as fused_swiglu
+
+    mx.random.seed(0)
+    # in_dim=512 -> K=512 (%512==0), hidden=64 -> N=64 (%8==0): in regime for
+    # can_fuse, which does not check dtype membership against _DTYPES.
+    in_dim, hidden, n_experts, top_k = 512, 64, 4, 4
+    sw = _quantized_switch_glu(in_dim, hidden, n_experts, gate_bias=False)
+    assert sw.gate_proj.scales.dtype == mx.float32
+
+    mlp = types.SimpleNamespace(switch_mlp=sw, top_k=top_k)
+    layer = types.SimpleNamespace(mlp=mlp)
+    model = types.SimpleNamespace(model=types.SimpleNamespace(layers=[layer]))
+
+    with caplog.at_level(logging.DEBUG, logger=fused_swiglu.logger.name):
+        n_patched = fused_swiglu.patch_switch_glu_with_fused_swiglu(model)
+
+    assert n_patched == 1, "matched fp32 model should still patch"
+    assert any(
+        "skipping warm" in record.getMessage() for record in caplog.records
+    ), f"expected skip-warm debug log not found: {[r.getMessage() for r in caplog.records]}"
+
+
+def test_warmup_specs_enumerates_declared_dtypes():
+    from sglang.srt.hardware_backend.mlx.moe.fused_swiglu import (
+        _DTYPES,
+        FusedGateQmvSiluMulKernel,
+    )
+
+    specs = list(FusedGateQmvSiluMulKernel().warmup_specs(model=None))
+    assert len(specs) > 0
+    assert len(specs) == len(_DTYPES)
+    for spec in specs:
+        (dtype,) = spec.dtypes
+        assert dtype in _DTYPES
+        assert spec.shapes == ()

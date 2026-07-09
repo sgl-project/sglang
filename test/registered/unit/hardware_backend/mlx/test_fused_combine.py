@@ -345,9 +345,15 @@ class TestFusedMoeCombineKernelOp(unittest.TestCase):
         # function rather than the bound method object.
         self.assertIs(fc.can_fuse.__func__, fc.FusedMoeCombineKernel.can_fuse)
 
-    def test_warmup_specs_default_empty(self):
-        # Inherited default; the AOT policy layer lands in a follow up PR.
-        self.assertEqual(list(fc.FusedMoeCombineKernel().warmup_specs(model=None)), [])
+    def test_warmup_specs_enumerates_declared_dtypes(self):
+        specs = list(fc.FusedMoeCombineKernel().warmup_specs(model=None))
+        self.assertGreater(len(specs), 0)
+        self.assertEqual(len(specs), len(fc._Y_DTYPES) * len(fc._SCORES_DTYPES))
+        for spec in specs:
+            y_dtype, s_dtype = spec.dtypes
+            self.assertIn(y_dtype, fc._Y_DTYPES)
+            self.assertIn(s_dtype, fc._SCORES_DTYPES)
+            self.assertEqual(spec.shapes, ())
 
 
 @unittest.skipUnless(_IS_APPLE_SILICON and _HAS_MLX, _SKIP_REASON)

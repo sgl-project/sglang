@@ -71,6 +71,10 @@ _VALUES_PER_THREAD = _PACK_FACTOR * _PACKS_PER_THREAD  # 16
 _BLOCK_SIZE = _VALUES_PER_THREAD * _SIMD_SIZE  # 512
 _ROWS_PER_TG = _NUM_SIMDGROUPS * _RESULTS_PER_SIMDGROUP  # 8
 
+# Scope of v1 (see module docstring): scales/biases dtype matches the input
+# dtype, bf16 or fp16.
+_DTYPES = (mx.float16, mx.bfloat16)
+
 
 # Metal source for the fused kernel.
 # Body only — mx.fast.metal_kernel auto-generates the kernel signature
@@ -237,6 +241,10 @@ class FusedGateQmvSiluMulKernel(metal_jit.MetalJitOp):
                 f"fused_gate_qmv_silu_mul: dtype mismatch x={x.dtype} "
                 f"s={gate_s.dtype} b={gate_b.dtype}"
             )
+        if x.dtype not in _DTYPES:
+            raise NotFusable(
+                f"fused_gate_qmv_silu_mul: dtype {x.dtype} not in {_DTYPES}."
+            )
 
     def dispatch_fused(
         self,
@@ -335,6 +343,14 @@ class FusedGateQmvSiluMulKernel(metal_jit.MetalJitOp):
         """
         self._check_eligibility(x, gate_w, gate_s, gate_b)
 
+    def warmup_specs(self, model) -> list[metal_jit.WarmupSpec]:
+        """One spec per dtype this op's affine gs64 regime accepts.
+
+        Shapes are left empty: K and N are not derivable from ``model``
+        without introspection no existing code in this backend performs.
+        """
+        return [metal_jit.WarmupSpec(dtypes=(dtype,)) for dtype in _DTYPES]
+
 
 _OP = FusedGateQmvSiluMulKernel()
 
@@ -386,9 +402,25 @@ def _aot_warm_kernel(switch_mlp, top_k: int) -> None:
                 x_up_dummy,
             )
 
-        if metal_jit.warm_once(
-            "affine_gather_qmv_silu_mul_4bit_gs64", (dtype, K, N, T), _dispatch
-        ):
+        try:
+            warmed = metal_jit.warm_once(
+                "affine_gather_qmv_silu_mul_4bit_gs64", (dtype, K, N, T), _dispatch
+            )
+        except NotFusable as e:
+            # can_fuse already validated K/N before the patch loop reaches
+            # here, so this is the dtype membership check: skip the warm for
+            # out-of-regime dtypes and let the runtime path fall back.
+            logger.debug(
+                "Path B AOT: skipping warm for dtype=%s K=%d N=%d T=%d (%s); "
+                "out of regime, runtime falls back.",
+                dtype,
+                K,
+                N,
+                T,
+                e,
+            )
+            continue
+        if warmed:
             logger.info(
                 "Path B AOT: warmed fused kernel dtype=%s K=%d N=%d T=%d",
                 dtype,

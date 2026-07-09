@@ -26,6 +26,7 @@ Otherwise: ``(y * scores[..., None]).sum(axis=-2).astype(y.dtype)``.
 from __future__ import annotations
 
 import importlib
+import itertools
 import logging
 
 import mlx.core as mx
@@ -162,6 +163,17 @@ class FusedMoeCombineKernel(metal_jit.MetalJitOp):
     def dispatch_fallback(self, y: mx.array, scores: mx.array) -> mx.array:
         """Broadcast multiply and sum reference, narrowed to ``y.dtype``."""
         return (y * scores[..., None]).sum(axis=-2).astype(y.dtype)
+
+    def warmup_specs(self, model) -> list[metal_jit.WarmupSpec]:
+        """One spec per (y_dtype, scores_dtype) pair this op accepts.
+
+        Shapes are left empty: H is not derivable from ``model`` without
+        introspection no existing code in this backend performs.
+        """
+        return [
+            metal_jit.WarmupSpec(dtypes=(y_dtype, s_dtype))
+            for y_dtype, s_dtype in itertools.product(_Y_DTYPES, _SCORES_DTYPES)
+        ]
 
 
 _OP = FusedMoeCombineKernel()
