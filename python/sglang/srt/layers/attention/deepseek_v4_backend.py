@@ -511,8 +511,10 @@ class DeepseekV4AttnBackend(
             DSV4RawDecodeMetadata,
         ] = None
         self.online_c128_mtp = OnlineC128MTPController(self)
-        # The online-c128 verify planner is host-side; keep the relay publish.
-        if self.online_c128_mtp.enabled():
+        # Draft-extend and online-c128 verify metadata are host-planned, so
+        # spec runs keep the relay publish (the mirror only exists under
+        # spec-v2; without spec the flag has no consumer either way).
+        if model_runner.server_args.speculative_algorithm is not None:
             self.needs_cpu_seq_lens = True
         self.sparse_prefill_workspace = SparsePrefillWorkspace(self.device)
 
