@@ -22,6 +22,8 @@ from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
     is_dsa_enable_prefill_cp,
 )
+from sglang.srt.distributed import get_tp_group
+
 from sglang.srt.layers.communicator import (
     CommunicateContext,
     CommunicateSimpleFn,
@@ -197,7 +199,9 @@ class DSACPCommunicateWithAllReduceAndLayerNormFn(
             hidden_states, residual = layernorm(hidden_states, residual)
         # for prefill: attn tp scattered -> full
         # for decode: attn tp full -> full
-        if dsa_use_prefill_cp(forward_batch) or mla_use_prefill_cp(forward_batch):
+        _comm = get_tp_group().torch_symm_mem_comm
+
+        if (dsa_use_prefill_cp(forward_batch) or mla_use_prefill_cp(forward_batch)) and (_comm is None or not _comm.use_cp):
             hidden_states = dsa_cp_gather_hidden_states(hidden_states)
         return hidden_states, residual
 
@@ -242,6 +246,7 @@ class DSACPCommunicateSummableTensorPairFn(CommunicateSummableTensorPairFn):
     ):
         # for prefill: full -> attn tp scattered
         # for decode: full -> attn tp full
-        if dsa_use_prefill_cp(forward_batch) or mla_use_prefill_cp(forward_batch):
+        _comm = get_tp_group().torch_symm_mem_comm
+        if (dsa_use_prefill_cp(forward_batch) or mla_use_prefill_cp(forward_batch)) and (_comm is None or not _comm.use_cp):
             hidden_states = dsa_cp_reduce_scatter_hidden_states(hidden_states)
         return hidden_states, residual
