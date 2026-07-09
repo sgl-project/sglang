@@ -93,7 +93,7 @@ class PureSWARadixCache(RadixCache):
 
         old_prefix_len = req.cache_protected_len
         swa_evict_floor = req.swa_evict_floor
-        swa_evicted_seqlen = req.swa_evicted_seqlen
+        swa_evicted_seqlen = req.kv.swa_evicted_seqlen
 
         if self.page_size > 1 and swa_evict_floor > 0:
             swa_evict_floor = -(-swa_evict_floor // self.page_size) * self.page_size

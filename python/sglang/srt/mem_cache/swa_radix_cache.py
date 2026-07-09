@@ -486,7 +486,7 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                     key=radix_key,
                     value=values,
                     prev_prefix_len=old_prefix_len,
-                    swa_evicted_seqlen=req.swa_evicted_seqlen,
+                    swa_evicted_seqlen=req.kv.swa_evicted_seqlen,
                 )
             )
         else:

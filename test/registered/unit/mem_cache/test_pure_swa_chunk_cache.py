@@ -23,7 +23,7 @@ class _FakeAllocator:
 class _FakeReq:
     req_pool_idx = 0
     swa_evict_floor = 3
-    swa_evicted_seqlen = 6
+    kv = SimpleNamespace(swa_evicted_seqlen=6)
 
     def pop_committed_kv_cache(self):
         return 8

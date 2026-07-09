@@ -665,6 +665,17 @@ class ReqLogprob:
     output_token_ids_logprobs_idx: Optional[list] = None
 
 
+@dataclasses.dataclass(slots=True, kw_only=True)
+class ReqKvInfo:
+    kv_allocated_len: int
+    # The length of KV that have been removed in swa cache.
+    # SWA KV cache eviction behavior differs by cache type:
+    # - Radix cache: KV in range [cache_protected_len, swa_evicted_seqlen) is freed manually in
+    #   `ScheduleBatch.maybe_evict_swa`; KV in range [0, cache_protected_len) is freed during radix cache eviction.
+    # - Chunk cache: KV in range [0, swa_evicted_seqlen) is freed manually in `ScheduleBatch.maybe_evict_swa`.
+    swa_evicted_seqlen: int
+
+
 class Req(ReqDllmMixin):
     """The input and output status of a request."""
 
@@ -741,19 +752,13 @@ class Req(ReqDllmMixin):
 
         # For req-level memory management
         self.kv_committed_len = 0
-        self.kv_allocated_len = 0
+        self.kv: ReqKvInfo = ReqKvInfo(kv_allocated_len=0, swa_evicted_seqlen=0)
         self.kv_committed_freed = False
         self.kv_overallocated_freed = False
 
         # for cross-encoder model
         self.token_type_ids = token_type_ids
 
-        # The length of KV that have been removed in swa cache.
-        # SWA KV cache eviction behavior differs by cache type:
-        # - Radix cache: KV in range [cache_protected_len, swa_evicted_seqlen) is freed manually in
-        #   `ScheduleBatch.maybe_evict_swa`; KV in range [0, cache_protected_len) is freed during radix cache eviction.
-        # - Chunk cache: KV in range [0, swa_evicted_seqlen) is freed manually in `ScheduleBatch.maybe_evict_swa`.
-        self.swa_evicted_seqlen = 0
         # Tokens in [0, swa_evict_floor) are protected from SWA window eviction.
         # This is used by prefill-aware SWA models such as Unlimited-OCR to keep prompt/image KV visible during decode.
         self.swa_evict_floor: int = 0
@@ -1098,9 +1103,9 @@ class Req(ReqDllmMixin):
         # e.g., speculative decoding may allocate more KV cache than actually used.
         assert (
             not self.kv_overallocated_freed
-        ), f"Overallocated KV cache already freed, {self.kv_committed_len=}, {self.kv_allocated_len=}"
+        ), f"Overallocated KV cache already freed, {self.kv_committed_len=}, {self.kv.kv_allocated_len=}"
         self.kv_overallocated_freed = True
-        return self._cache_commit_len(), self.kv_allocated_len
+        return self._cache_commit_len(), self.kv.kv_allocated_len
 
     def update_spec_correct_drafts_histogram(self, num_correct_drafts: int):
         """Update the speculative decoding acceptance histogram.
@@ -1522,11 +1527,11 @@ class Req(ReqDllmMixin):
         self.mamba_cow_src_index = None
         self.mamba_needs_clear = False
         self.already_computed = 0
-        self.kv_allocated_len = 0
+        self.kv.kv_allocated_len = 0
         self.kv_committed_len = 0
         self.kv_committed_freed = False
         self.kv_overallocated_freed = False
-        self.swa_evicted_seqlen = 0
+        self.kv.swa_evicted_seqlen = 0
         self.extend_batch_idx = 0
         self.decode_batch_idx = 0
 
@@ -2193,7 +2198,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
             # update req-level memory management fields
             req.kv_committed_len = seq_len
-            req.kv_allocated_len = seq_len
+            req.kv.kv_allocated_len = seq_len
 
             # If input_embeds are available, store them
             if req.input_embeds is not None:
@@ -2561,8 +2566,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         reserve = get_alloc_reserve_per_decode()
         total = 0
         for r in requests:
-            x = max(0, r.kv_committed_len + reserve - r.kv_allocated_len)
-            cur = r.kv_allocated_len
+            x = max(0, r.kv_committed_len + reserve - r.kv.kv_allocated_len)
+            cur = r.kv.kv_allocated_len
             nxt = cur + x
             total += ceil_align(nxt, page_size) - ceil_align(cur, page_size)
         return total
@@ -2806,7 +2811,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         for req in self.reqs:
             req.decode_batch_idx += 1
             req.kv_committed_len += 1
-            req.kv_allocated_len += 1
+            req.kv.kv_allocated_len += 1
 
         if self.enable_overlap:
             # New-tensor avoids racing model_worker_batch refs queued for
