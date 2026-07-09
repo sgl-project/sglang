@@ -61,7 +61,7 @@ from sglang.srt.disaggregation.utils import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_size
-from sglang.srt.managers.schedule_batch import FINISH_ABORT, ScheduleBatch
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, ReqKvInfo, ScheduleBatch
 from sglang.srt.managers.schedule_policy import match_prefix_for_req
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -1342,15 +1342,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         ), "req_pool_indices is full! There is a bug in memory estimation."
 
         fill_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
-        # TODO(th4): co-locate this req.kv bookkeeping with the real KV
-        # allocation; the pool alloc above and the kv_allocated_len assignment
-        # below should become a single owned-kv allocation step.
-        if req.kv is None:
-            from sglang.srt.managers.schedule_batch import ReqKvInfo
-
-            req.kv = ReqKvInfo(kv_allocated_len=fill_len, swa_evicted_seqlen=0)
-        else:
-            req.kv.kv_allocated_len = fill_len
         req.kv_committed_len = fill_len
 
         if prefix_len > 0:
@@ -1388,6 +1379,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     f"req={req.rid}"
                 )
 
+        allocator = self.token_to_kv_pool_allocator
         if self.scheduler.enable_hisparse:
             # HiSparse is incompatible with decode-side L1 radix cache. Keep
             # this path on the upstream full-allocation semantics.
@@ -1396,8 +1388,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             # Direct-to-host path: only allocate logical indices (no hisparse
             # device indices) and allocate host indices for RDMA destination.
             coordinator = self.scheduler.hisparse_coordinator
-            device = self.token_to_kv_pool_allocator.device
-            kv_loc = self.token_to_kv_pool_allocator.alloc_logical_only(
+            if req.kv is None:
+                req.kv = ReqKvInfo(kv_allocated_len=fill_len, swa_evicted_seqlen=0)
+            else:
+                req.kv.kv_allocated_len = fill_len
+            device = allocator.device
+            kv_loc = allocator.alloc_logical_only(
                 prefix_lens=torch.tensor([0], dtype=torch.int64, device=device),
                 prefix_lens_cpu=torch.tensor([0], dtype=torch.int64),
                 seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),
@@ -1414,41 +1410,54 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 0,
                 coordinator.host_token_len(fill_len),
             )
-        elif self.token_to_kv_pool_allocator.page_size == 1:
-            kv_loc = self.token_to_kv_pool_allocator.alloc(delta_len)
         else:
-            device = self.token_to_kv_pool_allocator.device
-            last_loc = (
-                prefix_indices[-1:].to(dtype=torch.int64, device=device)
-                if prefix_len > 0
-                else torch.tensor([-1], dtype=torch.int64, device=device)
-            )
-            if self._uses_swa_tail_prealloc() and prefix_len == 0:
-                # Tail-only SWA allocation: only valid when prefix_len == 0.
-                # When prefix_len > 0 (radix cache hit), we fall back to
-                # alloc_extend which allocates SWA at full page count; the
-                # SWA budget in that case may slightly under-estimate.
-                kv_loc = self.token_to_kv_pool_allocator.alloc_extend_swa_tail(
-                    prefix_lens=torch.tensor([0], dtype=torch.int64, device=device),
-                    prefix_lens_cpu=torch.tensor([0], dtype=torch.int64),
-                    seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),
-                    seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
-                    last_loc=last_loc,
-                    extend_num_tokens=fill_len,
-                    swa_tail_len=self._swa_tail_len(fill_len),
-                )
-                req.kv.swa_evicted_seqlen = fill_len - self._swa_tail_len(fill_len)
+            uses_swa_tail = self._uses_swa_tail_prealloc() and prefix_len == 0
+            swa_tail_len = self._swa_tail_len(fill_len)
+            if req.kv is None:
+                req.kv = ReqKvInfo(kv_allocated_len=fill_len, swa_evicted_seqlen=0)
             else:
-                kv_loc = self.token_to_kv_pool_allocator.alloc_extend(
-                    prefix_lens=torch.tensor(
-                        [total_prefix_len], dtype=torch.int64, device=device
-                    ),
-                    prefix_lens_cpu=torch.tensor([total_prefix_len], dtype=torch.int64),
-                    seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),
-                    seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
-                    last_loc=last_loc,
-                    extend_num_tokens=delta_len,
+                req.kv.kv_allocated_len = fill_len
+            if allocator.page_size == 1:
+                kv_loc = allocator.alloc(delta_len)
+            else:
+                device = allocator.device
+                last_loc = (
+                    prefix_indices[-1:].to(dtype=torch.int64, device=device)
+                    if prefix_len > 0
+                    else torch.tensor([-1], dtype=torch.int64, device=device)
                 )
+                if uses_swa_tail:
+                    # Tail-only SWA allocation: only valid when prefix_len == 0.
+                    # When prefix_len > 0 (radix cache hit), we fall back to
+                    # alloc_extend which allocates SWA at full page count; the
+                    # SWA budget in that case may slightly under-estimate.
+                    kv_loc = allocator.alloc_extend_swa_tail(
+                        prefix_lens=torch.tensor([0], dtype=torch.int64, device=device),
+                        prefix_lens_cpu=torch.tensor([0], dtype=torch.int64),
+                        seq_lens=torch.tensor(
+                            [fill_len], dtype=torch.int64, device=device
+                        ),
+                        seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
+                        last_loc=last_loc,
+                        extend_num_tokens=fill_len,
+                        swa_tail_len=swa_tail_len,
+                    )
+                    req.kv.swa_evicted_seqlen = fill_len - swa_tail_len
+                else:
+                    kv_loc = allocator.alloc_extend(
+                        prefix_lens=torch.tensor(
+                            [total_prefix_len], dtype=torch.int64, device=device
+                        ),
+                        prefix_lens_cpu=torch.tensor(
+                            [total_prefix_len], dtype=torch.int64
+                        ),
+                        seq_lens=torch.tensor(
+                            [fill_len], dtype=torch.int64, device=device
+                        ),
+                        seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
+                        last_loc=last_loc,
+                        extend_num_tokens=delta_len,
+                    )
 
         assert kv_loc is not None, (
             f"KV cache is full! Bug in memory estimation. "
