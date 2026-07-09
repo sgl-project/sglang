@@ -6,6 +6,7 @@ import torch
 from sglang.srt.debug_utils.comparator.tensor_comparator.comparator import (
     QUANTILE_NUMEL_THRESHOLD,
     SAMPLE_DIFF_THRESHOLD,
+    FailureDisplayBudget,
     _compute_tensor_stats,
     compare_tensor_pair,
     compute_diff,
@@ -540,6 +541,137 @@ class TestCompareTensorPairPredicate:
         )
         assert info.diff_downcast is not None
         assert info.diff_downcast.predicate == "rel <= 0.0085 or max_abs <= 1e-4"
+
+
+class TestFailureDisplayBudget:
+    @staticmethod
+    def _failing_pair() -> tuple[torch.Tensor, torch.Tensor]:
+        return torch.zeros(4, 4), torch.ones(4, 4)
+
+    def test_take_grants_exactly_max_detail_units(self) -> None:
+        """take() grants exactly max_detail units, then denies."""
+        budget = FailureDisplayBudget(max_detail=2)
+        assert budget.take() is True
+        assert budget.take() is True
+        assert budget.take() is False
+        assert budget.num_emitted == 2
+
+    def test_negative_max_detail_disables_limit(self) -> None:
+        """A negative max_detail always grants detail and never counts."""
+        budget = FailureDisplayBudget(max_detail=-1)
+        assert all(budget.take() for _ in range(100))
+        assert budget.num_emitted == 0
+
+    def test_no_budget_always_emits_detail(self) -> None:
+        """Without a budget object, every failing comparison gets full detail."""
+        x, y = self._failing_pair()
+        for _ in range(3):
+            info = compare_tensor_pair(x_baseline=x, x_target=y, name="fail")
+            assert info.diff is not None and 50 in info.diff.abs_diff_percentiles
+
+    def test_passing_tensor_skips_percentiles_and_budget(self) -> None:
+        """A passing comparison emits no percentile detail and consumes no budget."""
+        budget = FailureDisplayBudget()
+        x = torch.randn(4, 4)
+        info = compare_tensor_pair(
+            x_baseline=x, x_target=x.clone(), name="pass", failure_display_budget=budget
+        )
+        assert info.diff is not None and info.diff.passed is True
+        assert info.diff.abs_diff_percentiles == {}
+        assert info.baseline.stats.percentiles == {}
+        assert info.target.stats.percentiles == {}
+        assert budget.num_emitted == 0
+
+    def test_failing_tensor_within_budget_has_percentiles(self) -> None:
+        """A failing comparison within budget emits stats and diff percentiles."""
+        budget = FailureDisplayBudget()
+        x, y = self._failing_pair()
+        info = compare_tensor_pair(
+            x_baseline=x, x_target=y, name="fail", failure_display_budget=budget
+        )
+        assert info.diff is not None and info.diff.passed is False
+        assert 50 in info.diff.abs_diff_percentiles
+        assert 50 in info.baseline.stats.percentiles
+        assert 50 in info.target.stats.percentiles
+        assert budget.num_emitted == 1
+
+    def test_failing_tensor_beyond_budget_keeps_verdict_drops_detail(self) -> None:
+        """A failing comparison over budget keeps its verdict and metrics but drops percentiles."""
+        budget = FailureDisplayBudget(max_detail=1)
+        x, y = self._failing_pair()
+        first = compare_tensor_pair(
+            x_baseline=x, x_target=y, name="first", failure_display_budget=budget
+        )
+        second = compare_tensor_pair(
+            x_baseline=x, x_target=y, name="second", failure_display_budget=budget
+        )
+        assert first.diff is not None and 50 in first.diff.abs_diff_percentiles
+        assert second.diff is not None and second.diff.passed is False
+        assert second.diff.max_abs_diff == pytest.approx(1.0)
+        assert second.diff.abs_diff_percentiles == {}
+        assert second.baseline.stats.percentiles == {}
+        assert second.target.stats.percentiles == {}
+
+    def test_shape_mismatch_consumes_budget_and_emits_stats_detail(self) -> None:
+        """A shape mismatch counts as a failure and gets full stats percentile detail."""
+        budget = FailureDisplayBudget(max_detail=1)
+        info = compare_tensor_pair(
+            x_baseline=torch.randn(3, 4),
+            x_target=torch.randn(5, 6),
+            name="mismatch",
+            failure_display_budget=budget,
+        )
+        assert info.shape_mismatch is True and info.diff is None
+        assert 50 in info.baseline.stats.percentiles
+        assert 50 in info.target.stats.percentiles
+        assert budget.num_emitted == 1
+
+    def test_sample_still_emitted_beyond_budget(self) -> None:
+        """Sample emission for large diffs is independent of the detail budget."""
+        budget = FailureDisplayBudget(max_detail=0)
+        x, y = self._failing_pair()
+        info = compare_tensor_pair(
+            x_baseline=x, x_target=y, name="big", failure_display_budget=budget
+        )
+        assert info.baseline.sample is not None
+        assert info.target.sample is not None
+
+    def test_downcast_diff_detail_follows_budget(self) -> None:
+        """The downcast diff carries percentiles only when the failure is within budget."""
+        x = torch.zeros(4, 4, dtype=torch.float32)
+        y = torch.ones(4, 4, dtype=torch.bfloat16)
+        within = compare_tensor_pair(
+            x_baseline=x,
+            x_target=y,
+            name="within",
+            failure_display_budget=FailureDisplayBudget(),
+        )
+        assert within.diff_downcast is not None
+        assert 50 in within.diff_downcast.abs_diff_percentiles
+        beyond = compare_tensor_pair(
+            x_baseline=x,
+            x_target=y,
+            name="beyond",
+            failure_display_budget=FailureDisplayBudget(max_detail=0),
+        )
+        assert beyond.diff_downcast is not None
+        assert beyond.diff_downcast.abs_diff_percentiles == {}
+
+    def test_compute_diff_include_percentiles_flag(self) -> None:
+        """compute_diff with include_percentiles=False omits abs_diff_percentiles."""
+        x, y = self._failing_pair()
+        without = compute_diff(x_baseline=x, x_target=y, include_percentiles=False)
+        with_detail = compute_diff(x_baseline=x, x_target=y, include_percentiles=True)
+        assert without.abs_diff_percentiles == {}
+        assert 50 in with_detail.abs_diff_percentiles
+        assert without.passed == with_detail.passed
+        assert without.rel_diff == with_detail.rel_diff
+
+    def test_compute_tensor_info_include_percentiles_flag(self) -> None:
+        """compute_tensor_info with include_percentiles=False omits stats percentiles."""
+        t = torch.randn(16)
+        assert compute_tensor_info(t, include_percentiles=False).stats.percentiles == {}
+        assert 50 in compute_tensor_info(t, include_percentiles=True).stats.percentiles
 
 
 if __name__ == "__main__":
