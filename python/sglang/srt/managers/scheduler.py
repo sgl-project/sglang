@@ -3269,7 +3269,7 @@ class Scheduler(
 
                         # FIXME: pp is not compatible with overlap
                         batch_result = self.model_worker.forward_batch_generation(
-                            batch, capture_hidden_mode=None, **fwd_kwargs
+                            batch, **fwd_kwargs
                         )
                         if batch.spec_algorithm.is_none():
                             self.future_map.publish(future_indices, batch.seq_lens + 1)
@@ -3334,9 +3334,7 @@ class Scheduler(
                 # future_map relay / on_publish).
                 resolve_forward_inputs(batch, self.future_map)
                 with self._forward_isolation(batch, overlap=False):
-                    batch_result = self.model_worker.forward_batch_generation(
-                        batch, capture_hidden_mode=None
-                    )
+                    batch_result = self.model_worker.forward_batch_generation(batch)
                 # The isolation restore reverted the worker's in-forward SB edits;
                 # re-apply what must carry to the next iter.
                 batch.spec_info = batch_result.next_draft_input
@@ -3361,7 +3359,7 @@ class Scheduler(
                 )
                 resolve_forward_inputs(batch, self.future_map)
                 batch_result = self.model_worker.forward_batch_generation(
-                    batch, capture_hidden_mode=None, **kwargs
+                    batch, **kwargs
                 )
                 if batch_result.has_sampled_token_ids:
                     # Non-spec: relay via future_map, gathered next iter.
@@ -4011,11 +4009,7 @@ class Scheduler(
         raise NotImplementedError()
 
     def pause_generation(self, recv_req: PauseGenerationReqInput):
-        assert recv_req.mode in ("in_place", "retract"), (
-            f"Scheduler.pause_generation only handles in_place/retract; "
-            f"mode='abort' is fully handled by TokenizerManager and never "
-            f"dispatched here. Got mode={recv_req.mode!r}."
-        )
+        assert recv_req.mode in ("in_place", "retract")
         self._engine_paused = True
 
         if recv_req.mode == "in_place":
@@ -4029,18 +4023,9 @@ class Scheduler(
             return
 
         if self.enable_overlap and self.last_batch:
-            # Process the results of the last batch. The unfinished predicate
-            # below relies on this drain refreshing finish flags exactly once;
-            # see the pause-retract existing-bugs note (B3) before changing
-            # this condition.
             tmp_batch, tmp_result = self.result_queue.popleft()
             self.process_batch_result(tmp_batch, tmp_result)
 
-        # Unfinished requests from the last extend batch fold into the retract
-        # set. Skip them for disagg prefill: completed prefill requests are
-        # already in disagg_prefill_inflight_queue, and retracting them here
-        # would leak them, since the prefill event loop never calls
-        # update_running_batch to clean them up.
         last_fold_in_reqs: List[Req] = []
         if (
             self.last_batch is not None
@@ -4054,12 +4039,6 @@ class Scheduler(
             r for r in self.running_batch.reqs if not r.finished()
         ] + last_fold_in_reqs
 
-        # Replicate the old post-fold coordinator source for strict
-        # equivalence: the batch-level path released through the (often None)
-        # batch-side coordinator of whichever batch object survived the fold
-        # swap, not the scheduler-owned one. Releasing through the
-        # scheduler-owned coordinator may well be the correct behavior, but
-        # that change belongs to a separate op.
         release_hisparse_coordinator = self.running_batch.hisparse_coordinator
         if (
             self.last_batch is not None
