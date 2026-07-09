@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import dataclasses
 import logging
 import threading
@@ -32,13 +33,10 @@ from sglang.srt.disaggregation.utils import (
 from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
-    get_attention_cp_rank,
-    get_attention_cp_size,
     get_attention_dp_rank,
     get_attention_dp_size,
-    get_attention_tp_rank,
-    get_attention_tp_size,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.network import (
     NetworkAddress,
@@ -76,6 +74,12 @@ class PrefillServerInfo:
     kv_cache_dtype: Optional[str]
     follow_bootstrap_room: bool
 
+    # PD true-retraction rebootstrap: the prefill's HTTP API port. The decode
+    # already knows the prefill host (the bootstrap_addr host), so it can POST
+    # /generate to http://{bootstrap_host}:{prefill_http_port} to trigger a KV
+    # recompute -- no router-injected pd_rebootstrap_prefill_url needed.
+    prefill_http_port: Optional[int] = None
+
     # Pre-computed rank mapping (set by try_ensure_parallel_info on decode side)
     target_tp_rank: Optional[int] = None
     target_tp_ranks: Optional[List[int]] = None
@@ -94,6 +98,9 @@ class PrefillServerInfo:
             str(self.kv_cache_dtype) if self.kv_cache_dtype is not None else None
         )
         self.follow_bootstrap_room = bool(self.follow_bootstrap_room)
+        self.prefill_http_port = (
+            int(self.prefill_http_port) if self.prefill_http_port is not None else None
+        )
 
 
 @dataclasses.dataclass
@@ -124,10 +131,10 @@ class CommonKVManager(BaseKVManager):
         self.bootstrap_host = server_args.host
         self.bootstrap_port = server_args.disaggregation_bootstrap_port
         self.dist_init_addr = server_args.dist_init_addr
-        self.attn_tp_size = get_attention_tp_size()
-        self.attn_tp_rank = get_attention_tp_rank()
-        self.attn_cp_size = get_attention_cp_size()
-        self.attn_cp_rank = get_attention_cp_rank()
+        self.attn_tp_size = get_parallel().attn_tp_size
+        self.attn_tp_rank = get_parallel().attn_tp_rank
+        self.attn_cp_size = get_parallel().attn_cp_size
+        self.attn_cp_rank = get_parallel().attn_cp_rank
         self.attn_dp_size = get_attention_dp_size()
         self.attn_dp_rank = get_attention_dp_rank()
         self.system_dp_size = (
@@ -204,6 +211,16 @@ class CommonKVManager(BaseKVManager):
             # fail to receive the KV Cache transfer done signal after bootstrapping.
             # These timeout requests should be aborted to release the tree cache.
             self.waiting_timeout = envs.SGLANG_DISAGGREGATION_WAITING_TIMEOUT.get()
+            # PD true-retraction rebootstrap: a shared executor + per-thread HTTP
+            # sessions used to drive the original prefill worker's ``/generate``
+            # endpoint so it recomputes a retracted request's prefix KV under the
+            # current weights. Created lazily on first use so deployments that
+            # never retract pay nothing.
+            self._prefill_recompute_executor: Optional[
+                concurrent.futures.ThreadPoolExecutor
+            ] = None
+            self._prefill_recompute_executor_lock = threading.Lock()
+            self._prefill_recompute_sessions = threading.local()
         else:
             raise ValueError(
                 f"Unsupported DisaggregationMode: {self.disaggregation_mode}"
@@ -232,6 +249,151 @@ class CommonKVManager(BaseKVManager):
     def record_failure(self, bootstrap_room: int, failure_reason: str):
         with self.failure_lock:
             self.failure_records[bootstrap_room] = failure_reason
+
+    def _ensure_prefill_recompute_executor(
+        self,
+    ) -> concurrent.futures.ThreadPoolExecutor:
+        """Lazily create the shared executor that drives PD-retract rebootstrap
+        ``/generate`` calls. One executor per (decode) kv manager, shared across
+        all receivers."""
+        executor = self._prefill_recompute_executor
+        if executor is not None:
+            return executor
+        with self._prefill_recompute_executor_lock:
+            if self._prefill_recompute_executor is None:
+                workers = envs.SGLANG_DISAGGREGATION_THREAD_POOL_SIZE.get()
+                if workers is None:
+                    workers = 16
+                self._prefill_recompute_executor = (
+                    concurrent.futures.ThreadPoolExecutor(
+                        max_workers=max(1, workers),
+                        thread_name_prefix="pd-rebootstrap-prefill",
+                    )
+                )
+            return self._prefill_recompute_executor
+
+    def _get_prefill_recompute_session(self) -> requests.Session:
+        """Per-thread ``requests.Session`` for the rebootstrap executor threads
+        (``requests.Session`` is not safe for concurrent cross-thread use)."""
+        session = getattr(self._prefill_recompute_sessions, "session", None)
+        if session is None:
+            session = requests.Session()
+            self._prefill_recompute_sessions.session = session
+        return session
+
+    def _resolve_rebootstrap_prefill_url(
+        self, kv_receiver: CommonKVReceiver
+    ) -> Optional[str]:
+        """Derive the prefill ``/generate`` base URL for a PD true-retraction
+        rebootstrap from bootstrap info.
+
+        The decode already knows the prefill host (the ``bootstrap_addr`` host,
+        which the router/client set to the prefill's HTTP host), and the prefill
+        self-registers its HTTP API port in ``PrefillServerInfo`` at bootstrap
+        registration. Combining them yields ``http://{host}:{prefill_http_port}``
+        with no router-injected ``pd_rebootstrap_prefill_url``.
+        """
+        prefill_info = self.prefill_info_table.get(kv_receiver.bootstrap_addr)
+        if prefill_info is None or prefill_info.prefill_http_port is None:
+            return None
+        host = NetworkAddress.parse(kv_receiver.bootstrap_addr).host
+        return NetworkAddress(host, prefill_info.prefill_http_port).to_url()
+
+    def submit_prefill_recompute(
+        self, kv_receiver: CommonKVReceiver, payload: dict
+    ) -> None:
+        """Dispatch a PD true-retraction rebootstrap ``/generate`` to the
+        original prefill worker so it recomputes the retracted request's prefix
+        KV under the current weights and transfers it back over the
+        already-bootstrapped channel.
+
+        The target prefill ``/generate`` URL is derived from bootstrap info (the
+        prefill self-registered its HTTP port), not from a router-injected field.
+
+        Non-blocking from the scheduler's perspective: the HTTP POST runs on the
+        shared executor. Any failure (unresolved URL, HTTP error, exception) is
+        surfaced through the standard ``KVPoll.Failed`` path via
+        ``kv_receiver.abort()`` so the scheduler's existing transfer-failure
+        handling streams the aborted request back to the client. ``payload`` is
+        prebuilt by the decode scheduler (``Req.build_rebootstrap_payload``) so
+        HTTP/sampling concerns stay on the kv manager.
+
+        The decode scheduler broadcasts each retracted request to every rank in
+        its attention TP/CP group and every PP stage, so all of them reach this
+        call and would each POST an identical ``/generate`` -- making the prefill
+        worker recompute the same request once per decode rank. The ``/generate``
+        is a server-level call: the prefill frontend fans it out to its own
+        workers and transfers the recomputed KV back to *all* decode ranks, so
+        exactly one decode rank must issue it. Elect the same leader the request
+        receiver uses (attn-tp/attn-cp group leader, first PP stage); the other
+        ranks still bootstrap and receive their KV shard as usual, and on failure
+        the leader-only abort matches the leader-only output streaming (other
+        ranks fall back to the per-request waiting-timeout safety net).
+        """
+        if self.attn_tp_rank != 0 or self.attn_cp_rank != 0 or self.pp_rank != 0:
+            return
+        prefill_url = self._resolve_rebootstrap_prefill_url(kv_receiver)
+        if not prefill_url:
+            logger.error(
+                "PD retract rebootstrap could not resolve the prefill /generate "
+                "URL from bootstrap info (rid=%s bootstrap_room=%s bootstrap_addr=%s).",
+                payload.get("rid"),
+                payload.get("bootstrap_room"),
+                kv_receiver.bootstrap_addr,
+            )
+            self._fail_prefill_recompute(
+                kv_receiver,
+                "PD retract rebootstrap could not resolve the prefill /generate "
+                "URL from bootstrap info.",
+            )
+            return
+        self._ensure_prefill_recompute_executor().submit(
+            self._run_prefill_recompute, kv_receiver, prefill_url, payload
+        )
+
+    def _fail_prefill_recompute(
+        self, kv_receiver: CommonKVReceiver, reason: str
+    ) -> None:
+        """Fail a rebootstrap request via the standard ``KVPoll.Failed`` path.
+
+        ``abort()`` transitions the receiver to Failed and notifies the prefill
+        worker to release its orphaned bootstrap entry, but records a generic
+        reason; we overwrite it with a descriptive one so the eventual
+        ``failure_exception`` (and the client-facing abort message) explains that
+        the rebootstrap ``/generate`` failed rather than reporting a spurious
+        ``AbortReq``.
+        """
+        kv_receiver.abort()
+        self.record_failure(kv_receiver.bootstrap_room, reason)
+
+    def _run_prefill_recompute(
+        self, kv_receiver: CommonKVReceiver, prefill_url: str, payload: dict
+    ) -> None:
+        rid = payload.get("rid")
+        try:
+            response = self._get_prefill_recompute_session().post(
+                prefill_url.rstrip("/") + "/generate",
+                json=payload,
+                timeout=self.waiting_timeout,
+            )
+            if response.status_code >= 400:
+                logger.error(
+                    "PD rebootstrap prefill failed for rid=%s status=%s body=%s",
+                    rid,
+                    response.status_code,
+                    response.text[:512],
+                )
+                self._fail_prefill_recompute(
+                    kv_receiver,
+                    f"PD retract rebootstrap /generate failed for rid={rid} "
+                    f"(status={response.status_code}).",
+                )
+        except Exception:
+            logger.exception("PD rebootstrap prefill request failed for rid=%s", rid)
+            self._fail_prefill_recompute(
+                kv_receiver,
+                f"PD retract rebootstrap /generate request errored for rid={rid}.",
+            )
 
     def try_ensure_parallel_info(self, bootstrap_addr: str) -> bool:
         """Single non-blocking attempt to fetch and cache prefill parallel info.
@@ -420,6 +582,10 @@ class CommonKVManager(BaseKVManager):
             "page_size": self.kv_args.page_size,
             "kv_cache_dtype": self.server_args.kv_cache_dtype,
             "load_balance_method": self.server_args.load_balance_method,
+            # Self-register the HTTP API port so the decode can derive the PD
+            # retract rebootstrap /generate URL from bootstrap info instead of a
+            # router-injected pd_rebootstrap_prefill_url.
+            "prefill_http_port": self.server_args.port,
         }
 
         max_retries, initial_delay, max_delay = 5, 1.0, 30.0
@@ -594,10 +760,9 @@ class CommonKVManager(BaseKVManager):
         """
         start_layer = self.kv_args.prefill_start_layer
         end_layer = getattr(self.kv_args, "prefill_end_layer", None)
-        assert end_layer is not None, (
-            "KVArgs.prefill_end_layer must be set when using "
-            "compressed-MLA PD with PP"
-        )
+        assert (
+            end_layer is not None
+        ), "KVArgs.prefill_end_layer must be set when using compressed-MLA PD with PP"
 
         c4_full = sum(1 for r in mla_ratios if r == 4)
         c128_full = sum(1 for r in mla_ratios if r == 128)
@@ -1231,6 +1396,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.page_size = None
         self.kv_cache_dtype: Optional[str] = None
         self.follow_bootstrap_room: Optional[bool] = None
+        self.prefill_http_port: Optional[int] = None
         self.prefill_port_table: Dict[
             int, Dict[int, Dict[int, Dict[int, PrefillRankInfo]]]
         ] = {}
@@ -1297,6 +1463,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         rank_port = int(data["rank_port"])
         page_size = int(data["page_size"])
         kv_cache_dtype = data["kv_cache_dtype"]
+        prefill_http_port = data.get("prefill_http_port")
 
         if self.attn_tp_size is None:
             self.attn_tp_size = attn_tp_size
@@ -1315,6 +1482,9 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
 
         if self.kv_cache_dtype is None and kv_cache_dtype is not None:
             self.kv_cache_dtype = kv_cache_dtype
+
+        if self.prefill_http_port is None and prefill_http_port is not None:
+            self.prefill_http_port = int(prefill_http_port)
 
         if self.follow_bootstrap_room is None:
             load_balance_method = data.get(
@@ -1385,6 +1555,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                     if self.follow_bootstrap_room is not None
                     else True
                 ),
+                prefill_http_port=self.prefill_http_port,
             )
             return web.json_response(dataclasses.asdict(info), status=200)
 

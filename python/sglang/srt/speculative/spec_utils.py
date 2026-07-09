@@ -15,7 +15,7 @@ from sglang.srt.distributed.parallel_state import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import set_mamba_track_indices_from_reqs
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_server_args
 from sglang.srt.speculative.triton_ops.cache_locs import (
     align_evict_mask_to_page_size as align_evict_mask_to_page_size,
 )
@@ -204,7 +204,7 @@ def record_stream_for_v2_verify(batch, verify_input, fwd_stream):
 
 def spec_need_hidden_states(server_args: Optional[ServerArgs] = None) -> bool:
     if server_args is None:
-        server_args = get_global_server_args()
+        server_args = get_server_args()
 
     # STANDALONE drafts don't consume `spec_info.hidden_states` (vanilla LLM).
     # multi_layer_eagle and DFLASH don't relay hidden_states through FutureMap.
@@ -622,7 +622,7 @@ def prepare_mamba_track_for_verify(batch: ScheduleBatch) -> None:
     tracking during TARGET_VERIFY; tracking is done in
     commit_mamba_states_after_verify instead.
     """
-    if not get_global_server_args().enable_mamba_extra_buffer():
+    if not get_server_args().enable_mamba_extra_buffer():
         return
     set_mamba_track_indices_from_reqs(batch)
     batch.mamba_track_mask = None
@@ -677,7 +677,7 @@ def commit_mamba_states_after_verify(
             # we need to update the mamba state for the request at the crossing point.
             seq_lens_pre_verify = batch.seq_lens
             seq_lens_post_verify = batch.seq_lens + accept_lens
-            mamba_track_interval = get_global_server_args().mamba_track_interval
+            mamba_track_interval = get_server_args().mamba_track_interval
             to_track_mask = (
                 seq_lens_pre_verify // mamba_track_interval
                 != seq_lens_post_verify // mamba_track_interval
