@@ -15,7 +15,8 @@ COMMON_ARGS = [
     "--trust-remote-code",
     "--reasoning-parser=glm45",
     "--tool-call-parser=glm47",
-    "--mem-fraction-static=0.8",
+    "--mem-fraction-static=0.85",
+    "--max-running-requests=256",
     "--enable-metrics",
 ]
 
