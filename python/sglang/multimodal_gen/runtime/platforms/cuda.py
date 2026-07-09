@@ -30,6 +30,10 @@ logger = init_logger(__name__)
 _SDPA_BACKEND_CLS_STR = (
     "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
 )
+_CUDNN_SDPA_BACKEND_CLS_STR = (
+    "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.CudnnSDPABackend"
+)
+_DYNAMIC_CUDNN_SDPA_BACKEND_CLS_STR = "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.DynamicCudnnSDPABackend"
 
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
@@ -98,6 +102,16 @@ class _AITerAttentionBackendResolver(_DirectCudaAttentionBackendResolver):
 class _TorchSDPAAttentionBackendResolver(_DirectCudaAttentionBackendResolver):
     backend = AttentionBackendEnum.TORCH_SDPA
     backend_cls_str = _SDPA_BACKEND_CLS_STR
+
+
+class _TorchCudnnSDPAAttentionBackendResolver(_DirectCudaAttentionBackendResolver):
+    backend = AttentionBackendEnum.TORCH_CUDNN_SDPA
+    backend_cls_str = _CUDNN_SDPA_BACKEND_CLS_STR
+
+
+class _DynamicCudnnSDPAAttentionBackendResolver(_DirectCudaAttentionBackendResolver):
+    backend = AttentionBackendEnum.DYNAMIC_CUDNN_SDPA
+    backend_cls_str = _DYNAMIC_CUDNN_SDPA_BACKEND_CLS_STR
 
 
 class _SparseLinearAttentionBackendResolver(_DirectCudaAttentionBackendResolver):
@@ -270,6 +284,8 @@ _CUDA_ATTENTION_BACKEND_RESOLVERS = {
     for resolver in (
         _AITerAttentionBackendResolver,
         _TorchSDPAAttentionBackendResolver,
+        _TorchCudnnSDPAAttentionBackendResolver,
+        _DynamicCudnnSDPAAttentionBackendResolver,
         _SparseLinearAttentionBackendResolver,
         _SageSparseLinearAttentionBackendResolver,
         _SlidingTileAttentionBackendResolver,

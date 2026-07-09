@@ -211,9 +211,8 @@ def _cached_get_attn_backend(
         pass
     elif selected_backend is None and len(supported_attention_backends) == 1:
         selected_backend = next(iter(supported_attention_backends))
-    elif (
-        selected_backend is not None
-        and selected_backend not in supported_attention_backends
+    elif selected_backend is not None and not _is_backend_supported(
+        selected_backend, supported_attention_backends
     ):
         supported_attention_backends_str = [
             supported_attention_backend.__str__()
@@ -234,6 +233,22 @@ def _cached_get_attn_backend(
             f"Invalid attention backend for {current_platform.device_name}"
         )
     return cast(type[AttentionBackend], resolve_obj_by_qualname(attention_cls))
+
+
+def _is_backend_supported(
+    selected_backend: AttentionBackendEnum,
+    supported_attention_backends: set[AttentionBackendEnum],
+) -> bool:
+    if selected_backend in supported_attention_backends:
+        return True
+    if selected_backend == AttentionBackendEnum.TORCH_CUDNN_SDPA:
+        return AttentionBackendEnum.TORCH_SDPA in supported_attention_backends
+    if selected_backend == AttentionBackendEnum.DYNAMIC_CUDNN_SDPA:
+        return (
+            AttentionBackendEnum.FA in supported_attention_backends
+            and AttentionBackendEnum.TORCH_SDPA in supported_attention_backends
+        )
+    return False
 
 
 @contextmanager
