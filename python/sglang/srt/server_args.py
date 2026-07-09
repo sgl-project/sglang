@@ -227,13 +227,6 @@ DETERMINISTIC_ATTENTION_BACKEND_CHOICES = [
     "ascend",
 ]
 
-DEEPSEEK_DETERMINISTIC_ATTENTION_BACKEND_CHOICES = [
-    "fa3",
-    "fa4",
-    "triton",
-    "ascend",
-]
-
 RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND = ["fa3", "fa4", "triton", "ascend"]
 
 DISAGG_TRANSFER_BACKEND_CHOICES = [
@@ -6104,11 +6097,11 @@ class ServerArgs:
             attention_backend = resolved_view(self).attention_backend
             if is_deepseek_model:
                 if (
-                    self.attention_backend
-                    not in DEEPSEEK_DETERMINISTIC_ATTENTION_BACKEND_CHOICES
+                    attention_backend
+                    not in RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND
                 ):
                     raise ValueError(
-                        f"Currently only {DEEPSEEK_DETERMINISTIC_ATTENTION_BACKEND_CHOICES} attention backends are supported for deterministic inference with DeepSeek models. But you're using {self.attention_backend}."
+                        f"Currently only {RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND} attention backends are supported for deterministic inference with DeepSeek models. But you're using {attention_backend}."
                     )
 
             if attention_backend not in RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND:
