@@ -21,6 +21,7 @@ from sglang.srt.observability.trace import (
     TraceThreadContext,
     TraceThreadInfo,
     extract_trace_headers,
+    get_global_trace_level,
     get_global_tracing_enabled,
     process_tracing_init,
     set_global_trace_level,
@@ -51,19 +52,29 @@ class TestTraceFunctions(unittest.TestCase):
         self.assertEqual(extract_trace_headers({}), {})
 
     def test_set_global_trace_level(self):
-        orig = mod.global_trace_level
-        set_global_trace_level(5)
-        self.assertEqual(mod.global_trace_level, 5)
-        mod.global_trace_level = orig
+        from sglang.srt.runtime_context import get_resources
+
+        orig = get_resources().trace_level
+        try:
+            set_global_trace_level(5)
+            self.assertEqual(get_global_trace_level(), 5)
+        finally:
+            get_resources().trace_level = orig
 
     def test_global_trace_level_env_var(self):
-        import importlib
+        # The level lives on ctx.resources and is seeded lazily from the env
+        # on first read after a reset (no module reload involved).
+        from sglang.srt.runtime_context import get_resources
 
-        with patch.dict(os.environ, {"SGLANG_TRACE_LEVEL": "2"}):
-            importlib.reload(mod)
-            self.assertEqual(mod.global_trace_level, 2)
-        importlib.reload(mod)  # restore default (SGLANG_TRACE_LEVEL unset → 3)
-        self.assertEqual(mod.global_trace_level, 3)
+        orig = get_resources().trace_level
+        try:
+            with patch.dict(os.environ, {"SGLANG_TRACE_LEVEL": "2"}):
+                get_resources().trace_level = None
+                self.assertEqual(get_global_trace_level(), 2)
+            get_resources().trace_level = None  # SGLANG_TRACE_LEVEL unset → 3
+            self.assertEqual(get_global_trace_level(), 3)
+        finally:
+            get_resources().trace_level = orig
 
     def test_get_global_tracing_enabled(self):
         self.assertEqual(get_global_tracing_enabled(), mod.opentelemetry_initialized)
@@ -244,7 +255,9 @@ class TestTraceReqContextEnabled(unittest.TestCase):
         self.orig_initialized = mod.opentelemetry_initialized
         self.orig_tracer = mod.tracer
         self.orig_threads = mod.threads_info.copy()
-        self.orig_level = mod.global_trace_level
+        from sglang.srt.runtime_context import get_resources
+
+        self.orig_level = get_resources().trace_level
 
         # Reset OTel global TracerProvider so set_tracer_provider works each test
         otel_trace._TRACER_PROVIDER_SET_ONCE._done = False
@@ -254,14 +267,16 @@ class TestTraceReqContextEnabled(unittest.TestCase):
         otel_trace.set_tracer_provider(self.provider)
         mod.opentelemetry_initialized = True
         mod.tracer = otel_trace.get_tracer("test")
-        mod.global_trace_level = 3
+        set_global_trace_level(3)
 
     def tearDown(self):
         mod.opentelemetry_initialized = self.orig_initialized
         mod.tracer = self.orig_tracer
         mod.threads_info.clear()
         mod.threads_info.update(self.orig_threads)
-        mod.global_trace_level = self.orig_level
+        from sglang.srt.runtime_context import get_resources
+
+        get_resources().trace_level = self.orig_level
 
     def test_trace_set_thread_info(self):
         trace_set_thread_info("scheduler", tp_rank=0, dp_rank=0)
