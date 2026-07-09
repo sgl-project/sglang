@@ -161,7 +161,7 @@ sgl-eval run aime25 \\
     // AMD daily-updated lmsysorg/sglang-rocm images. Bump the dated tag when you
     // re-verify on a newer build.
     mi300x: "lmsysorg/sglang-rocm:v0.5.13.post1-rocm720-mi30x-20260623",
-    mi355x: "lmsysorg/sglang-rocm:v0.5.13.post1-rocm720-mi35x-20260623",
+    mi355x: "lmsysorg/sglang-rocm:v0.5.14-rocm720-mi35x-20260701",
   },
 
   // Pre-selects the issue template's `model` dropdown on "Submit verified cell".
@@ -289,6 +289,9 @@ sgl-eval run aime25 \\
           ],
           envWhen: { hw: ["gb200", "gb300"] } },
         { id: "nixl",     label: "NiXL" },
+        { id: "mori",     label: "MORI",
+          flags: ["--disaggregation-transfer-backend mori"],
+          requiresHw: ["mi300x", "mi355x"] },
       ],
       // `auto` is a sentinel (emits no --disaggregation-ib-device flag).
       ibDevices: [{ id: "auto", label: "Auto" }, "mlx5_0", "mlx5_7"],
