@@ -12,6 +12,7 @@ from sglang.srt.debug_utils.comparator.tensor_comparator.comparator import (
     compute_tensor_info,
 )
 from sglang.srt.debug_utils.comparator.tensor_comparator.types import DiffInfo
+from sglang.srt.debug_utils.comparator.threshold_dsl import DiffThresholdRule
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu", nightly=True)
@@ -269,9 +270,7 @@ class TestComputeDiff:
         x: torch.Tensor = torch.randn(8, 16)
         y: torch.Tensor = x + torch.randn_like(x) * 0.01
 
-        diff: DiffInfo = compute_diff(
-            x_baseline=x, x_target=y, diff_threshold=1e-3, seq_dim=0
-        )
+        diff: DiffInfo = compute_diff(x_baseline=x, x_target=y, seq_dim=0)
 
         assert diff.per_token_rel_diff is not None
         assert isinstance(diff.per_token_rel_diff, list)
@@ -283,7 +282,7 @@ class TestComputeDiff:
         x: torch.Tensor = torch.randn(8, 16)
         y: torch.Tensor = x + torch.randn_like(x) * 0.01
 
-        diff: DiffInfo = compute_diff(x_baseline=x, x_target=y, diff_threshold=1e-3)
+        diff: DiffInfo = compute_diff(x_baseline=x, x_target=y)
 
         assert diff.per_token_rel_diff is None
 
@@ -293,9 +292,7 @@ class TestComputeDiff:
         x: torch.Tensor = torch.randn(4, 8)
         y: torch.Tensor = x + torch.randn_like(x) * 0.01
 
-        diff: DiffInfo = compute_diff(
-            x_baseline=x, x_target=y, diff_threshold=1e-3, seq_dim=0
-        )
+        diff: DiffInfo = compute_diff(x_baseline=x, x_target=y, seq_dim=0)
 
         json_str: str = diff.model_dump_json()
         assert "per_token_rel_diff" in json_str
@@ -374,6 +371,161 @@ class TestCompareTensors:
         assert info.diff.max_abs_diff < SAMPLE_DIFF_THRESHOLD
         assert info.baseline.sample is None
         assert info.target.sample is None
+
+
+class TestComputeDiffPredicate:
+    @staticmethod
+    def _near_zero_pair() -> tuple[torch.Tensor, torch.Tensor]:
+        """Sign-flipped near-zero pair: rel_diff == 2.0 but max_abs/mean_abs == 2e-5."""
+        x = torch.tensor([1e-5, -1e-5, 1e-5, -1e-5])
+        return x, -x
+
+    def test_default_predicate(self) -> None:
+        """No predicate → the default 'rel <= 0.001'; near-zero pair fails and the string is recorded."""
+        x, y = self._near_zero_pair()
+        diff = compute_diff(x_baseline=x, x_target=y)
+
+        assert diff.rel_diff == pytest.approx(2.0, abs=1e-4)
+        assert diff.max_abs_diff == pytest.approx(2e-5, abs=1e-7)
+        assert diff.predicate == "rel <= 0.001"
+        assert diff.passed is False
+
+    def test_predicate_rescues_near_zero_via_max_abs(self) -> None:
+        """A 'rel or max_abs' predicate passes the near-zero pair despite a failing rel."""
+        x, y = self._near_zero_pair()
+        diff = compute_diff(
+            x_baseline=x, x_target=y, predicate="rel <= 0.0085 or max_abs <= 1e-4"
+        )
+
+        assert diff.rel_diff > 1.0  # relative term still fails
+        assert diff.passed is True
+        assert diff.predicate == "rel <= 0.0085 or max_abs <= 1e-4"
+
+    def test_predicate_does_not_rescue_real_magnitude_diff(self) -> None:
+        """A real-magnitude diff fails both terms of a 'rel or max_abs' predicate."""
+        x = torch.ones(10)
+        y = x.clone()
+        y[0] = 2.0  # max_abs_diff == 1.0, rel_diff ~0.043
+        diff = compute_diff(
+            x_baseline=x, x_target=y, predicate="rel <= 0.0085 or max_abs <= 1e-3"
+        )
+
+        assert diff.max_abs_diff == pytest.approx(1.0, abs=1e-4)
+        assert diff.passed is False
+
+    def test_and_predicate_requires_both(self) -> None:
+        """'rel and max_abs' fails the near-zero pair (rel huge) but passes a small-both diff."""
+        x, y = self._near_zero_pair()
+        assert (
+            compute_diff(
+                x_baseline=x, x_target=y, predicate="rel <= 0.0085 and max_abs <= 1e-4"
+            ).passed
+            is False
+        )
+        small = torch.ones(10)
+        small_y = small + 1e-4  # rel ~5e-9, max_abs 1e-4
+        assert (
+            compute_diff(
+                x_baseline=small,
+                x_target=small_y,
+                predicate="rel <= 0.0085 and max_abs <= 1e-3",
+            ).passed
+            is True
+        )
+
+    def test_mean_abs_variable(self) -> None:
+        """A mean_abs predicate uses the mean absolute diff (2e-5 for the near-zero pair)."""
+        x, y = self._near_zero_pair()
+        assert (
+            compute_diff(x_baseline=x, x_target=y, predicate="mean_abs <= 1e-4").passed
+            is True
+        )
+        assert (
+            compute_diff(x_baseline=x, x_target=y, predicate="mean_abs <= 1e-6").passed
+            is False
+        )
+
+    def test_boundary_le_inclusive(self) -> None:
+        """<= includes the boundary, < excludes it (max_abs_diff == 0.5 exactly)."""
+        x = torch.tensor([1.0, 1.0])
+        y = torch.tensor([1.5, 1.5])
+        assert (
+            compute_diff(x_baseline=x, x_target=y, predicate="max_abs <= 0.5").passed
+            is True
+        )
+        assert (
+            compute_diff(x_baseline=x, x_target=y, predicate="max_abs < 0.5").passed
+            is False
+        )
+
+    def test_predicate_recorded_for_empty_tensor(self) -> None:
+        """Empty tensors short-circuit to passed=True and still record the predicate."""
+        empty = torch.empty(0)
+        diff = compute_diff(x_baseline=empty, x_target=empty, predicate="rel <= 0")
+
+        assert diff.passed is True
+        assert diff.predicate == "rel <= 0"
+
+    def test_predicate_json_roundtrip(self) -> None:
+        """DiffInfo.predicate survives JSON serialization."""
+        x, y = self._near_zero_pair()
+        diff = compute_diff(
+            x_baseline=x, x_target=y, predicate="rel <= 0.0085 or max_abs <= 1e-4"
+        )
+
+        roundtripped = DiffInfo.model_validate_json(diff.model_dump_json())
+        assert roundtripped.predicate == "rel <= 0.0085 or max_abs <= 1e-4"
+        assert roundtripped.passed is True
+
+
+class TestCompareTensorPairPredicate:
+    def test_predicate_resolved_per_name(self) -> None:
+        """compare_tensor_pair resolves the per-regex predicate by tensor name into the verdict."""
+        x = torch.tensor([1e-5, -1e-5, 1e-5, -1e-5])
+        y = -x
+
+        without = compare_tensor_pair(x_baseline=x, x_target=y, name="g.expert.0")
+        assert without.diff is not None
+        assert without.diff.passed is False
+
+        with_pred = compare_tensor_pair(
+            x_baseline=x,
+            x_target=y,
+            name="g.expert.0",
+            diff_threshold_rules=[
+                DiffThresholdRule(".*expert.*", "rel <= 0.0085 or max_abs <= 1e-4")
+            ],
+        )
+        assert with_pred.diff is not None
+        assert with_pred.diff.passed is True
+        assert with_pred.diff.predicate == "rel <= 0.0085 or max_abs <= 1e-4"
+
+    def test_unmatched_name_raises(self) -> None:
+        """A tensor matching no pattern raises (fail-closed)."""
+        x = torch.tensor([1e-5, -1e-5, 1e-5, -1e-5])
+        with pytest.raises(ValueError, match="matched no --diff-threshold pattern"):
+            compare_tensor_pair(
+                x_baseline=x,
+                x_target=-x,
+                name="g.attn.qkv",
+                diff_threshold_rules=[
+                    DiffThresholdRule(".*expert.*", "rel <= 0.0085 or max_abs <= 1e-4")
+                ],
+            )
+
+    def test_predicate_propagates_to_downcast_diff(self) -> None:
+        """When baseline/target dtypes differ, the resolved predicate also drives the downcast diff."""
+        x = torch.tensor([1e-5, -1e-5, 1e-5, -1e-5])
+        info = compare_tensor_pair(
+            x_baseline=x,
+            x_target=(-x).to(torch.bfloat16),
+            name="g.expert.0",
+            diff_threshold_rules=[
+                DiffThresholdRule(".*expert.*", "rel <= 0.0085 or max_abs <= 1e-4")
+            ],
+        )
+        assert info.diff_downcast is not None
+        assert info.diff_downcast.predicate == "rel <= 0.0085 or max_abs <= 1e-4"
 
 
 if __name__ == "__main__":
