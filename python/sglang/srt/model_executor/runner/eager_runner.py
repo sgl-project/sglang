@@ -367,8 +367,15 @@ class EagerRunner(BaseRunner):
                         torch.cuda.current_stream(),
                     )
                     if aux_hidden_states is not None:
+                        gathered_len = (
+                            int(hidden_states[0].shape[0])
+                            if isinstance(hidden_states, tuple)
+                            else int(hidden_states.shape[0])
+                        )
                         aux_hidden_states = [
-                            cp_gather_after_forward(
+                            aux_hidden
+                            if int(aux_hidden.shape[0]) == gathered_len
+                            else cp_gather_after_forward(
                                 aux_hidden,
                                 forward_batch,
                                 torch.cuda.current_stream(),
