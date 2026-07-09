@@ -210,7 +210,11 @@ If you find our work helpful, feel free to give us a cite.
     author = {Yuma Oda and Ryan Mathieu and Roman Knyazhitskiy and Artur Chakhvadze},
     note   = {In collaboration with others at Mirai Labs},
     month  = {July},
-    year   = {2026}
+    year   = {2026},
+    eprint = {2607.06763},
+    archivePrefix = {arXiv},
+    primaryClass  = {cs.LG},
+    url    = {https://arxiv.org/abs/2607.06763}
 }
 ```
 
