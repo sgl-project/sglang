@@ -17,7 +17,7 @@ from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
 from sglang.srt.layers.moe.utils import get_moe_padding_size
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -488,7 +488,7 @@ def _fused_moe_kernel_sequence(
         out_hidden_states = torch.empty_like(hidden_states)
 
     use_fused_moe_sum_all_reduce = (
-        get_global_server_args().enable_fused_moe_sum_all_reduce
+        get_server_args().enable_fused_moe_sum_all_reduce
         and (not no_combine)
         and (topk > 2)
         and (not use_int8_w8a16)
