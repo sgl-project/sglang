@@ -42,7 +42,7 @@ class ScriptedReqHandle:
     @property
     def kv_pages(self) -> int:
         req = self.req
-        if req is None or req.req_pool_idx is None:
+        if req is None or req.kv is None:
             return 0
         page_size = self.context.scheduler.page_size
         return (req.kv.kv_allocated_len + page_size - 1) // page_size
