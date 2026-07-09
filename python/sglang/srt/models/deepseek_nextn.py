@@ -14,6 +14,7 @@
 
 """Inference-only DeepSeek NextN Speculative Decoding."""
 
+import copy
 import logging
 import os
 from contextlib import ExitStack
@@ -287,15 +288,36 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
     )
 
     def _resolve_nextn_quant_config(self, config, quant_config):
-        if quant_config is None or quant_config.get_name() != "quark":
+        if quant_config is None:
             return quant_config
 
-        from sglang.srt.layers.quantization.quark.utils import should_ignore_layer
-
         ckpt_prefix = f"model.layers.{config.num_hidden_layers}"
-        mapped_prefix = self.hf_to_sglang_mapper._map_name(ckpt_prefix)
-        if should_ignore_layer(mapped_prefix, quant_config.exclude_layers):
-            return None
+
+        if quant_config.get_name() == "quark":
+            from sglang.srt.layers.quantization.quark.utils import should_ignore_layer
+
+            mapped_prefix = self.hf_to_sglang_mapper._map_name(ckpt_prefix)
+            if should_ignore_layer(mapped_prefix, quant_config.exclude_layers):
+                return None
+            return quant_config
+
+        # The nextn layer is built with the sglang prefix "model.decoder.*", but
+        # an fp8 ignore-list keys the un-quantized nextn attention by its on-disk
+        # name "model.layers.{N}.*", so is_layer_skipped("model.decoder", ...)
+        # never matches and the nextn attention is wrongly quantized (then crashes
+        # loading the bf16 weights). Mirror that rename onto the ignore list.
+        if isinstance(quant_config, Fp8Config) and quant_config.ignored_layers:
+            remapped = [
+                entry.replace(ckpt_prefix, "model.decoder", 1)
+                for entry in quant_config.ignored_layers
+                if entry == ckpt_prefix or entry.startswith(ckpt_prefix + ".")
+            ]
+            if remapped:
+                quant_config = copy.copy(quant_config)
+                quant_config.ignored_layers = [
+                    *quant_config.ignored_layers,
+                    *remapped,
+                ]
         return quant_config
 
     def __init__(
