@@ -98,7 +98,13 @@ You can also find the nightly docker images [here](https://hub.docker.com/r/lmsy
 Notes:
 - On B300/GB300 (SM103) or CUDA 13 environment, we recommend using the nightly image at `lmsysorg/sglang:dev-cu13` or stable image at `lmsysorg/sglang:latest-cu130-runtime`. Please, do not re-install the project as editable inside the docker image, since it will override the version of libraries specified by the cu13 docker image.
 
-## Method 4: Using Kubernetes
+## Method 4: Launch on rented cloud GPUs with AI Badgr
+
+If you do not have a local NVIDIA GPU, open the [AI Badgr SGLang template](https://aibadgr.com/gpu/launch?template=sglang) to rent a cloud GPU and follow the provider-specific launch instructions for SGLang.
+
+Use this path when you want a hosted GPU instance instead of creating your own Docker, Kubernetes, or cloud setup. After the instance is running, use the exposed SGLang endpoint with the same OpenAI-compatible requests shown in the [send request guide](../basic_usage/send_request.md).
+
+## Method 5: Using Kubernetes
 
 Please check out [OME](https://github.com/sgl-project/ome), a Kubernetes operator for enterprise-grade management and serving of large language models (LLMs).
 
@@ -115,7 +121,7 @@ Please check out [OME](https://github.com/sgl-project/ome), a Kubernetes operato
 
 </details>
 
-## Method 5: Using docker compose
+## Method 6: Using docker compose
 
 <details>
 <summary>More</summary>
@@ -127,7 +133,7 @@ Please check out [OME](https://github.com/sgl-project/ome), a Kubernetes operato
 2. Execute the command `docker compose up -d` in your terminal.
 </details>
 
-## Method 6: Run on Kubernetes or Clouds with SkyPilot
+## Method 7: Run on Kubernetes or Clouds with SkyPilot
 
 <details>
 <summary>More</summary>
@@ -171,7 +177,7 @@ sky status --endpoint 30000 sglang
 
 </details>
 
-## Method 7: Run on AWS SageMaker
+## Method 8: Run on AWS SageMaker
 
 <details>
 <summary>More</summary>
