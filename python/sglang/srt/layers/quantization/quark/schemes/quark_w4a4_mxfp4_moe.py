@@ -16,7 +16,7 @@ from sglang.srt.utils import (
     is_hip,
     set_weight_attrs,
 )
-from sglang.srt.utils.common import mxfp_supported
+from sglang.srt.utils.common import is_gfx1250_supported, mxfp_supported
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -37,19 +37,10 @@ if _use_aiter:
     from aiter.utility.fp4_utils import e8m0_shuffle
 
 
-def _detect_is_gfx1250() -> bool:
-    if not _is_hip:
-        return False
-    try:
-        return "gfx1250" in torch.cuda.get_device_properties(0).gcnArchName
-    except Exception:
-        return False
-
-
 # gfx1250's grouped MoE GEMM reads weight scales in the n32k4 layout
 # (moe_shuffle_scale -> shuffle_scale_n32k4), not the e8m0_shuffle layout used by
 # gfx950. Using the wrong layout silently corrupts the dequant scales.
-_is_gfx1250 = _detect_is_gfx1250()
+_is_gfx1250 = is_gfx1250_supported()
 
 if _is_hip:
     from aiter.ops.triton.quant import dynamic_mxfp4_quant
