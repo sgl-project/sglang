@@ -116,7 +116,7 @@ def _resolve_quant_method_name(quant_cfg: dict) -> str:
             "ModelOpt mixed precision is not supported by the current SGLang diffusion runtime."
         )
     if "FP8" in quant_algo:
-        return "modelopt"
+        return "modelopt_fp8"
     if "FP4" in quant_algo or "NVFP4" in quant_algo:
         return "modelopt_fp4"
     raise ValueError(f"Unsupported ModelOpt quant_algo for diffusion: {quant_algo}")

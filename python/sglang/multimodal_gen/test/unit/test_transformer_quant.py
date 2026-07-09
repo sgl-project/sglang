@@ -50,9 +50,6 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config i
     NunchakuConfig,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8Config
-from sglang.multimodal_gen.runtime.layers.quantization.modelopt_fp8 import (
-    ModelOptFp8Config as ModelOptFp8DiffusionConfig,
-)
 from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
     ModelOptFp8Config,
@@ -460,7 +457,7 @@ class TestTransformerQuantHelpers(unittest.TestCase):
             ["single_transformer_blocks.*.proj_mlp*"],
         )
 
-    def test_modelopt_fp8_diffusion_config_resolves_from_hf_config(self):
+    def test_modelopt_fp8_hf_config_uses_general_modelopt_fp8(self):
         config = get_quant_config(
             {
                 "quantization_config": {
@@ -473,8 +470,8 @@ class TestTransformerQuantHelpers(unittest.TestCase):
             quant_ignore_remap={"vae2llm": "proj_in", "llm2vae": "proj_out"},
         )
 
-        self.assertIsInstance(config, ModelOptFp8DiffusionConfig)
-        self.assertEqual(config.ignore, ["proj_in", "proj_out"])
+        self.assertIsInstance(config, ModelOptFp8Config)
+        self.assertEqual(config.exclude_modules, ["proj_in", "proj_out"])
 
     def test_modelopt_fp8_explicit_config_uses_general_modelopt_fp8(self):
         config = get_quant_config(
