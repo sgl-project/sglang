@@ -92,14 +92,28 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
         last_batch.filter_batch.assert_not_called()
         scheduler.running_batch.merge_batch.assert_not_called()
 
-    def test_abort_clears_state(self):
-        """abort mode should clear last_batch and cur_batch_for_debug."""
+    def test_abort_mode_rejected_at_scheduler(self):
+        """abort mode must be rejected by the scheduler-side assert."""
+        scheduler = self._new_scheduler()
+
+        with self.assertRaises(AssertionError):
+            scheduler.pause_generation(PauseGenerationReqInput(mode="abort"))
+
+    def test_default_mode_rejected_at_scheduler(self):
+        """bare PauseGenerationReqInput defaults to abort and must be rejected."""
+        scheduler = self._new_scheduler()
+
+        with self.assertRaises(AssertionError):
+            scheduler.pause_generation(PauseGenerationReqInput())
+
+    def test_retract_clears_last_batch_state(self):
+        """retract mode should clear last_batch and cur_batch_for_debug."""
         scheduler = self._new_scheduler()
         scheduler.last_batch = MagicMock()
         scheduler.last_batch.forward_mode.is_extend.return_value = False
         scheduler.cur_batch_for_debug = MagicMock()
 
-        scheduler.pause_generation(PauseGenerationReqInput(mode="abort"))
+        scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
 
         self.assertTrue(scheduler._engine_paused)
         self.assertIsNone(scheduler.last_batch)
@@ -127,8 +141,8 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
         self.assertEqual(scheduler._add_request_to_queue.call_count, 2)
         self.assertIsNone(scheduler.chunked_req)
 
-    def test_abort_drains_overlap_queue(self):
-        """abort with overlap enabled should drain the result_queue."""
+    def test_retract_drains_overlap_queue(self):
+        """retract with overlap enabled should drain the result_queue."""
         scheduler = self._new_scheduler()
         scheduler.enable_overlap = True
         mock_batch = MagicMock()
@@ -137,7 +151,7 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
         scheduler.result_queue = deque([(MagicMock(), MagicMock())])
         scheduler.process_batch_result = MagicMock()
 
-        scheduler.pause_generation(PauseGenerationReqInput(mode="abort"))
+        scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
 
         scheduler.process_batch_result.assert_called_once()
         self.assertEqual(len(scheduler.result_queue), 0)

@@ -4008,6 +4008,11 @@ class Scheduler(
         raise NotImplementedError()
 
     def pause_generation(self, recv_req: PauseGenerationReqInput):
+        assert recv_req.mode in ("in_place", "retract"), (
+            f"Scheduler.pause_generation only handles in_place/retract; "
+            f"mode='abort' is fully handled by TokenizerManager and never "
+            f"dispatched here. Got mode={recv_req.mode!r}."
+        )
         self._engine_paused = True
 
         if recv_req.mode == "in_place":
@@ -4046,7 +4051,7 @@ class Scheduler(
         self.last_batch = None
         self.cur_batch_for_debug = None
 
-        if recv_req.mode == "retract" and not self.running_batch.is_empty():
+        if not self.running_batch.is_empty():
             self.running_batch.filter_batch()
             if len(self.running_batch.reqs) != 0:
                 retracted_reqs = self.running_batch.retract_all(self.server_args)
