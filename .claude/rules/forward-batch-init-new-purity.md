@@ -5,29 +5,19 @@ paths:
 
 # `ForwardBatch.init_new` must not mutate the ScheduleBatch
 
-`ForwardBatch.init_new` (and any ForwardBatch factory) must treat the input
-`ScheduleBatch` as read-only: do not rebind its fields and do not write into
-its sub-objects.
-
-- Per-forward overrides go through explicit kw-only parameters of `init_new`
-  (e.g. `capture_hidden_mode`, `return_hidden_states_before_norm`). Do not
-  reintroduce the old pattern of writing a ScheduleBatch field and having
-  `init_new` consume-and-reset it.
-- Callers that need a one-shot per-forward override (a field written solely so
-  that `init_new` consumes it once, like the old `capture_hidden_mode` pattern)
-  pass it through the kw-only parameters of `init_new` /
-  `TpModelWorker.forward_batch_generation` instead of writing onto the batch.
-- Regular writes to batch execution-state fields (`out_cache_loc`,
-  `seq_lens_*`, `return_hidden_states`, ...) by code that prepares the batch
-  before calling `init_new` are outside the scope of this rule.
+`init_new` (and any ForwardBatch factory) treats the input `ScheduleBatch` as
+read-only: no field rebinds, no sub-object writes. Per-forward overrides go
+through the kw-only parameters of `init_new` /
+`TpModelWorker.forward_batch_generation`, never through a ScheduleBatch field
+that `init_new` consumes. Regular batch-preparation writes (`out_cache_loc`,
+`seq_lens_*`, ...) before calling `init_new` are out of scope.
 
 Known object-sharing notes (do not add new exceptions):
 
-- `init_new` no longer rebinds or mutates ScheduleBatch fields; it still
-  writes `ret.sampling_info` sub-object attributes (grammars, canary ids),
-  which is the same object as `batch.sampling_info` until the sampling
+- `init_new` writes `ret.sampling_info` sub-object attributes (grammars,
+  canary ids); same object as `batch.sampling_info` until the sampling
   forward-copy op lands.
 - `_expand_mrope_from_input` lazily fills
   `mm_input.mrope_position_delta_repeated_cache` on the ScheduleBatch-owned
-  `MultimodalInputs` object (pre-existing memoization). Relocating this cache
-  off the ScheduleBatch is a candidate follow-up op.
+  `MultimodalInputs` (pre-existing memoization; relocation is a candidate
+  follow-up op).
