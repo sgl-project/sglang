@@ -409,6 +409,8 @@ class DeepSeekV4UnifiedKVPool:
         memory_saver_adapter,
         custom_mem_pool,
         swa_ring_size: int,
+        dcp_size: int = 1,
+        dcp_rank: int = 0,
     ):
         self.swa_ring_size = swa_ring_size
         self.head_dim = qk_nope_head_dim + qk_rope_head_dim
@@ -416,6 +418,24 @@ class DeepSeekV4UnifiedKVPool:
         self.swa_pages = num_slots * self.swa_ring_size
         self.num_blocks = num_blocks
         self.k_per_block = dict(self.K_PER_BLOCK)
+
+        # Physical DCP: shard only the COMPRESSED region (the big, context-scaled
+        # part) across the DCP group; keep the SWA ring REPLICATED (small).
+        # Layout per layer: [ swa_pages (replicated) | compress_local (1/dcp) | DEAD(1) ].
+        #   compress page p (0-based within compress region) -> owner p % dcp,
+        #   local row swa_pages + p // dcp; non-owned writes go to the DEAD row.
+        # Read masks owner per slot; SWA slot s owner = s % dcp (read from the
+        # full replicated ring). Gated by SGLANG_DSV4_DCP_PHYSICAL.
+        from sglang.srt.layers.attention.dsv4.unified_kv_kernels.env_gate import (
+            is_dcp_physical,
+        )
+
+        self.dcp_size = dcp_size if (dcp_size and dcp_size > 1) else 1
+        self.dcp_rank = dcp_rank if self.dcp_size > 1 else 0
+        self.physical_dcp = self.dcp_size > 1 and is_dcp_physical()
+        # ratio -> DEAD row index (only for physical_dcp; same across layers of
+        # a ratio since compress_pages depends only on num_blocks/k_per_block).
+        self.compress_dead_row: dict = {}
 
         bufs = []
         with memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
@@ -426,9 +446,17 @@ class DeepSeekV4UnifiedKVPool:
             ):
                 for ratio in stage_ratios:
                     compress_pages = self.num_blocks * self.k_per_block[ratio]
+                    if self.physical_dcp and compress_pages > 0:
+                        local_compress = (
+                            compress_pages + self.dcp_size - 1
+                        ) // self.dcp_size
+                        rows = self.swa_pages + local_compress + 1  # +1 DEAD row
+                        self.compress_dead_row[ratio] = self.swa_pages + local_compress
+                    else:
+                        rows = self.swa_pages + compress_pages
                     bufs.append(
                         torch.zeros(
-                            self.swa_pages + compress_pages,
+                            rows,
                             self.head_dim,
                             dtype=torch.bfloat16,
                             device=device,
@@ -474,7 +502,11 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         enable_hisparse: bool = False,
         online_mtp_max_draft_tokens: int = 0,
         num_req_slots: Optional[int] = None,
+        dcp_size: int = 1,
+        dcp_rank: int = 0,
     ):
+        self.dcp_size = dcp_size if (dcp_size and dcp_size > 1) else 1
+        self.dcp_rank = dcp_rank if self.dcp_size > 1 else 0
         super().__init__(
             swa_size,
             page_size,
@@ -585,11 +617,16 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 memory_saver_adapter=self.memory_saver_adapter,
                 custom_mem_pool=self.custom_mem_pool,
                 swa_ring_size=self.sliding_window + spec_extra,
+                dcp_size=self.dcp_size,
+                dcp_rank=self.dcp_rank,
             )
 
             self.unified_swa_window = self.sliding_window
             self.unified_swa_ring_size = self.sliding_window + spec_extra
             self.unified_swa_pages = self.unified_kv_pool.swa_pages
+            # Physical-DCP knobs surfaced for the attention backend.
+            self.unified_physical_dcp = self.unified_kv_pool.physical_dcp
+            self.unified_compress_dead_row = self.unified_kv_pool.compress_dead_row
         else:
             self.unified_kv_pool = None
             self.swa_kv_pool = self._make_kv_pool(

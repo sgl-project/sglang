@@ -186,6 +186,39 @@ def _kv_splits_heuristic(
 
 
 @triton.jit
+def _dcp_row_owner(
+    slot,
+    k_pos,
+    valid,
+    DCP_SIZE: tl.constexpr,
+    DCP_RANK: tl.constexpr,
+    PHYSICAL: tl.constexpr,
+    SWA_PAGES: tl.constexpr,
+):
+    """Map a global unified slot to (physical row, owner-masked valid).
+
+    - PHYSICAL: SWA region [0,SWA_PAGES) is replicated -> row=slot, owner=slot%dcp;
+      compressed region is sharded -> row=SWA_PAGES + (slot-SWA_PAGES)//dcp,
+      owner=(slot-SWA_PAGES)%dcp. Each rank reads only owned rows.
+    - read-only DCP (DCP_SIZE>1, not PHYSICAL): mask by stream position k_pos%dcp,
+      row=slot (full replicated pool).
+    - else: row=slot.
+    """
+    if PHYSICAL:
+        is_swa = slot < SWA_PAGES
+        page = slot - SWA_PAGES
+        owner = tl.where(is_swa, slot % DCP_SIZE, page % DCP_SIZE)
+        row = tl.where(is_swa, slot, SWA_PAGES + page // DCP_SIZE)
+        valid = valid & (owner == DCP_RANK)
+    elif DCP_SIZE > 1:
+        valid = valid & ((k_pos % DCP_SIZE) == DCP_RANK)
+        row = slot
+    else:
+        row = slot
+    return row, valid
+
+
+@triton.jit
 def _paged_decode_fused_kernel(
     q_ptr,  # [N, H, D]
     unified_kv_ptr,  # [total_pages, D] bf16/fp16, or fp8 when QUANT_KV
@@ -194,6 +227,7 @@ def _paged_decode_fused_kernel(
     kv_indptr_ptr,  # [N+1] int32
     attn_sink_ptr,  # [H]
     out_ptr,  # [N, H, D]
+    lse_ptr,  # [N, H] fp32 (natural-log LSE), written only when RETURN_LSE
     q_stride_t,
     q_stride_h,
     q_stride_d,
@@ -203,6 +237,8 @@ def _paged_decode_fused_kernel(
     out_stride_t,
     out_stride_h,
     out_stride_d,
+    lse_stride_t,
+    lse_stride_h,
     qk_scale,  # = softmax_scale * LOG2E
     log2e,  # = LOG2E, to lift natural-log sink into log2 domain
     H: tl.constexpr,
@@ -213,6 +249,12 @@ def _paged_decode_fused_kernel(
     QUANT_KV: tl.constexpr,  # True → dequant fp8 KV via kv_scales
     GROUP_SIZE: tl.constexpr,  # scale block width along D (e.g. 64)
     NUM_GROUPS: tl.constexpr,  # D // GROUP_SIZE (constexpr; D % GROUP_SIZE == 0)
+    APPLY_SINK: tl.constexpr,  # fold attn_sink into the denom (False under DCP)
+    RETURN_LSE: tl.constexpr,  # write per-(token,head) natural-log LSE
+    DCP_SIZE: tl.constexpr,  # decode-context-parallel group size (1 = no DCP)
+    DCP_RANK: tl.constexpr,  # this rank within the DCP group
+    PHYSICAL: tl.constexpr,  # physical-DCP: rows physically sharded (slot//dcp)
+    SWA_PAGES: tl.constexpr,  # boundary between replicated SWA and sharded compress
 ):
     """Single-pass online-softmax with sink folded inline — fast path for
     cases where ``kv_splits = 1`` (base grid already saturates the GPU). Skips
@@ -268,11 +310,12 @@ def _paged_decode_fused_kernel(
             mask=valid,
             other=0,  # any in-bounds slot; the read is masked out below
         )
+        row, valid = _dcp_row_owner(
+            slot, k_pos, valid, DCP_SIZE, DCP_RANK, PHYSICAL, SWA_PAGES
+        )
 
         kv_raw = tl.load(
-            unified_kv_ptr
-            + slot[:, None] * kv_stride_n
-            + d_offs[None, :] * kv_stride_d,
+            unified_kv_ptr + row[:, None] * kv_stride_n + d_offs[None, :] * kv_stride_d,
             mask=valid[:, None] & d_mask[None, :],
             other=0.0,
         )
@@ -284,7 +327,7 @@ def _paged_decode_fused_kernel(
             # [BLOCK_K, BLOCK_D] scales tile but in IR is a coalesced
             # NUM_GROUPS-wide load per row.
             scales_full = tl.load(
-                kv_scales_ptr + slot[:, None] * ks_stride_n + g_idx_per_d[None, :],
+                kv_scales_ptr + row[:, None] * ks_stride_n + g_idx_per_d[None, :],
                 mask=valid[:, None] & d_mask[None, :],
                 other=0.0,
             ).to(q.dtype)
@@ -314,14 +357,20 @@ def _paged_decode_fused_kernel(
 
     # Fold attn_sink as a virtual K of weight 1. sink is a natural-log bias;
     # multiply by log2e so it lives in the same log2 domain as our online m_i.
-    sink_raw = tl.load(attn_sink_ptr + h_offs, mask=h_mask, other=neg_large).to(
-        tl.float32
-    )
-    sink = sink_raw * log2e
-    m_final = tl.maximum(m_i, sink)
-    alpha_kv = tl.exp2(m_i - m_final)
-    alpha_sink = tl.exp2(sink - m_final)
-    l_final = l_i * alpha_kv + alpha_sink
+    # Under DCP, the sink is applied once after the cross-rank merge, so each
+    # shard runs sink-less here (APPLY_SINK=False) and emits pre-sink LSE.
+    if APPLY_SINK:
+        sink_raw = tl.load(attn_sink_ptr + h_offs, mask=h_mask, other=neg_large).to(
+            tl.float32
+        )
+        sink = sink_raw * log2e
+        m_final = tl.maximum(m_i, sink)
+        alpha_kv = tl.exp2(m_i - m_final)
+        alpha_sink = tl.exp2(sink - m_final)
+        l_final = l_i * alpha_kv + alpha_sink
+    else:
+        alpha_kv = tl.full((BLOCK_H,), 1.0, dtype=tl.float32)
+        l_final = l_i
 
     denom = tl.maximum(l_final, 1.0e-30)
     out = tl.where(
@@ -335,6 +384,17 @@ def _paged_decode_fused_kernel(
         out.to(out_ptr.dtype.element_ty),
         mask=h_mask[:, None] & d_mask[None, :],
     )
+    if RETURN_LSE:
+        # Natural-log LSE of this shard's softmax denom (pre-sink):
+        #   lse = ln(Σ exp(qk)) = (m_i + log2(l_i)) / log2e.
+        # Empty shard (l_i == 0, e.g. DCP rank owns no entries) → -inf, which
+        # contributes 0 to the cross-rank logsumexp merge.
+        lse_val = tl.where(l_i > 0.0, (m_i + tl.log2(l_i)) / log2e, neg_large)
+        tl.store(
+            lse_ptr + t * lse_stride_t + h_offs * lse_stride_h,
+            lse_val,
+            mask=h_mask,
+        )
 
 
 @triton.jit
@@ -373,6 +433,10 @@ def _paged_decode_split_kernel(
     QUANT_KV: tl.constexpr,  # True → dequant fp8 KV via kv_scales
     GROUP_SIZE: tl.constexpr,  # scale block width along D (e.g. 64)
     NUM_GROUPS: tl.constexpr,  # D // GROUP_SIZE
+    DCP_SIZE: tl.constexpr,  # decode-context-parallel group size (1 = no DCP)
+    DCP_RANK: tl.constexpr,  # this rank within the DCP group
+    PHYSICAL: tl.constexpr,  # physical-DCP: rows physically sharded (slot//dcp)
+    SWA_PAGES: tl.constexpr,  # boundary between replicated SWA and sharded compress
 ):
     """3D split-K + exp2-softmax sparse paged-decode. Grid: (N, ceil(H/BLOCK_H), KV_SPLITS).
 
@@ -434,17 +498,18 @@ def _paged_decode_split_kernel(
             mask=valid,
             other=0,  # any in-bounds slot; masked out below
         )
+        row, valid = _dcp_row_owner(
+            slot, k_pos, valid, DCP_SIZE, DCP_RANK, PHYSICAL, SWA_PAGES
+        )
 
         kv_raw = tl.load(
-            unified_kv_ptr
-            + slot[:, None] * kv_stride_n
-            + d_offs[None, :] * kv_stride_d,
+            unified_kv_ptr + row[:, None] * kv_stride_n + d_offs[None, :] * kv_stride_d,
             mask=valid[:, None] & d_mask[None, :],
             other=0.0,
         )
         if QUANT_KV:
             scales_full = tl.load(
-                kv_scales_ptr + slot[:, None] * ks_stride_n + g_idx_per_d[None, :],
+                kv_scales_ptr + row[:, None] * ks_stride_n + g_idx_per_d[None, :],
                 mask=valid[:, None] & d_mask[None, :],
                 other=0.0,
             ).to(q.dtype)
@@ -489,6 +554,7 @@ def _paged_decode_reduce_kernel(
     attn_sink_ptr,  # [H]
     kv_indptr_ptr,  # [N+1] int32
     out_ptr,  # [N, H, D]
+    lse_ptr,  # [N, H] fp32 (natural-log LSE), written only when RETURN_LSE
     mp_stride_t,
     mp_stride_k,
     mp_stride_h,
@@ -502,6 +568,8 @@ def _paged_decode_reduce_kernel(
     out_stride_t,
     out_stride_h,
     out_stride_d,
+    lse_stride_t,
+    lse_stride_h,
     log2e,  # = LOG2E, used to convert natural-log sink → log2 domain
     H: tl.constexpr,
     D: tl.constexpr,
@@ -509,6 +577,8 @@ def _paged_decode_reduce_kernel(
     BLOCK_D: tl.constexpr,
     D_CHUNK: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    APPLY_SINK: tl.constexpr,  # fold attn_sink (False under DCP)
+    RETURN_LSE: tl.constexpr,  # write per-(token,head) natural-log LSE
 ):
     """2D-tile reduce: combine KV_SPLITS partials, fold attn_sink, write
     final output. Grid: ``(T, H, ceil(D / D_CHUNK))`` — one CTA owns one
@@ -563,6 +633,8 @@ def _paged_decode_reduce_kernel(
             tl.zeros([D_CHUNK], dtype=out_ptr.dtype.element_ty),
             mask=d_mask,
         )
+        if RETURN_LSE and dc == 0:
+            tl.store(lse_ptr + t * lse_stride_t + h * lse_stride_h, neg_large)
         return
     tiles_per_segment = tl.cdiv(kv_len, KV_SPLITS * BLOCK_K)
     act_num_segments = tl.cdiv(kv_len, tl.maximum(tiles_per_segment, 1) * BLOCK_K)
@@ -597,13 +669,25 @@ def _paged_decode_reduce_kernel(
     l_combined = tl.sum(l_p * alpha_split, axis=0)  # scalar
     acc_combined = tl.sum(a_p * alpha_split[:, None], axis=0)  # [D_CHUNK]
 
-    # Fold attn_sink (recomputed across dc — scalar work, negligible).
-    sink_raw = tl.load(attn_sink_ptr + h).to(tl.float32)
-    sink = sink_raw * log2e
-    m_final = tl.maximum(m_max, sink)
-    alpha_kv = tl.exp2(m_max - m_final)
-    alpha_sink = tl.exp2(sink - m_final)
-    l_final = l_combined * alpha_kv + alpha_sink
+    # Fold attn_sink (recomputed across dc — scalar work, negligible). Under
+    # DCP the sink is applied once after the cross-rank merge, so skip it here
+    # and emit the pre-sink LSE for the merge.
+    if APPLY_SINK:
+        sink_raw = tl.load(attn_sink_ptr + h).to(tl.float32)
+        sink = sink_raw * log2e
+        m_final = tl.maximum(m_max, sink)
+        alpha_kv = tl.exp2(m_max - m_final)
+        alpha_sink = tl.exp2(sink - m_final)
+        l_final = l_combined * alpha_kv + alpha_sink
+    else:
+        alpha_kv = 1.0
+        l_final = l_combined
+
+    if RETURN_LSE and dc == 0:
+        lse_val = tl.where(
+            l_combined > 0.0, (m_max + tl.log2(l_combined)) / log2e, neg_large
+        )
+        tl.store(lse_ptr + t * lse_stride_t + h * lse_stride_h, lse_val)
 
     denom = tl.maximum(l_final, 1.0e-30)
     # Direct divide (acc*alpha_kv)/denom, matching the single-CTA reference.
@@ -638,7 +722,13 @@ def _sparse_attn_v4_paged_decode_triton(
     block_h: int | None = None,
     kv_splits: int | None = None,
     block_k: int | None = None,
-) -> torch.Tensor:
+    apply_sink: bool = True,
+    return_lse: bool = False,
+    dcp_size: int = 1,
+    dcp_rank: int = 0,
+    physical: bool = False,
+    swa_pages: int = 0,
+):
     """V4 sparse decode Triton implementation: split-K with FUSED fast path,
     exp2 softmax, CG-safe heuristic. ``block_h`` and ``kv_splits`` are
     escape hatches for benchmarks; production callers pass neither.
@@ -687,6 +777,17 @@ def _sparse_attn_v4_paged_decode_triton(
 
     T, H, D = q.shape
     out = torch.empty_like(q)
+    # LSE buffer (natural-log) for cross-rank DCP merge. Always shape [T, H] so
+    # cuda-graph capture/replay sees a static allocation; the bf16 path passes a
+    # 1-elem dummy to keep one launch signature.
+    if return_lse:
+        lse = torch.empty((T, H), dtype=torch.float32, device=q.device)
+        lse_stride_t = lse.stride(0)
+        lse_stride_h = lse.stride(1)
+    else:
+        lse = q.new_empty(1, dtype=torch.float32)
+        lse_stride_t = 0
+        lse_stride_h = 0
 
     if block_h is None:
         block_h = triton.next_power_of_2(min(H, 64))
@@ -737,6 +838,7 @@ def _sparse_attn_v4_paged_decode_triton(
             kv_indptr,
             attn_sink,
             out,
+            lse,
             q.stride(0),
             q.stride(1),
             q.stride(2),
@@ -746,6 +848,8 @@ def _sparse_attn_v4_paged_decode_triton(
             out.stride(0),
             out.stride(1),
             out.stride(2),
+            lse_stride_t,
+            lse_stride_h,
             qk_scale,
             LOG2E,
             H,
@@ -756,10 +860,16 @@ def _sparse_attn_v4_paged_decode_triton(
             QUANT_KV=quant_kv,
             GROUP_SIZE=_FP8_GROUP_SIZE,
             NUM_GROUPS=num_groups_arg,
+            APPLY_SINK=apply_sink,
+            RETURN_LSE=return_lse,
+            DCP_SIZE=dcp_size,
+            DCP_RANK=dcp_rank,
+            PHYSICAL=physical,
+            SWA_PAGES=swa_pages,
             num_warps=num_warps,
             num_stages=num_stages,
         )
-        return out
+        return (out, lse) if return_lse else out
 
     # Split-K path: split kernel writes (m, l, acc) partials in log2 domain;
     # reduce kernel combines them, folds attn_sink, writes final output.
@@ -809,6 +919,10 @@ def _sparse_attn_v4_paged_decode_triton(
         QUANT_KV=quant_kv,
         GROUP_SIZE=_FP8_GROUP_SIZE,
         NUM_GROUPS=num_groups_arg,
+        DCP_SIZE=dcp_size,
+        DCP_RANK=dcp_rank,
+        PHYSICAL=physical,
+        SWA_PAGES=swa_pages,
         num_warps=num_warps,
         num_stages=num_stages,
     )
@@ -839,6 +953,7 @@ def _sparse_attn_v4_paged_decode_triton(
         attn_sink,
         kv_indptr,
         out,
+        lse,
         m_partial.stride(0),
         m_partial.stride(1),
         m_partial.stride(2),
@@ -852,6 +967,8 @@ def _sparse_attn_v4_paged_decode_triton(
         out.stride(0),
         out.stride(1),
         out.stride(2),
+        lse_stride_t,
+        lse_stride_h,
         LOG2E,
         H,
         D,
@@ -859,9 +976,11 @@ def _sparse_attn_v4_paged_decode_triton(
         BLOCK_D=block_d,
         D_CHUNK=d_chunk,
         BLOCK_K=block_k,
+        APPLY_SINK=apply_sink,
+        RETURN_LSE=return_lse,
         num_warps=4,
     )
-    return out
+    return (out, lse) if return_lse else out
 
 
 def sparse_attn_v4_paged_decode(
@@ -872,11 +991,23 @@ def sparse_attn_v4_paged_decode(
     attn_sink: torch.Tensor,
     softmax_scale: float,
     kv_scales: torch.Tensor | None = None,
-) -> torch.Tensor:
+    apply_sink: bool = True,
+    return_lse: bool = False,
+    dcp_size: int = 1,
+    dcp_rank: int = 0,
+    physical: bool = False,
+    swa_pages: int = 0,
+):
     """V4 decode sparse attention over a unified KV pool with paged indices.
 
     When ``kv_scales`` is provided, ``unified_kv`` must be fp8 (e4m3fnuz) and
     will be dequantized in-kernel using 1xGROUP_SIZE (default 64) block scales.
+
+    Decode context parallel (DCP): pass ``dcp_size>1`` so each rank attends only
+    its round-robin shard of every token's KV stream, ``apply_sink=False`` to
+    defer the attn_sink fold to the cross-rank merge, and ``return_lse=True`` to
+    also return the per-(token,head) natural-log LSE used by that merge. Returns
+    ``out`` (or ``(out, lse)`` when ``return_lse``).
     """
     return _sparse_attn_v4_paged_decode_triton(
         q,
@@ -886,4 +1017,10 @@ def sparse_attn_v4_paged_decode(
         attn_sink,
         softmax_scale,
         kv_scales=kv_scales,
+        apply_sink=apply_sink,
+        return_lse=return_lse,
+        dcp_size=dcp_size,
+        dcp_rank=dcp_rank,
+        physical=physical,
+        swa_pages=swa_pages,
     )
