@@ -36,6 +36,7 @@ from sglang.multimodal_gen.configs.pipeline_configs import (
     HeliosT2VConfig,
     HunyuanConfig,
     LingBotWorldCausalDMDConfig,
+    LingBotWorldV2CausalDMDConfig,
     WanI2V480PConfig,
     WanI2V720PConfig,
     WanT2V480PConfig,
@@ -59,6 +60,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.hunyuan3d import (
 )
 from sglang.multimodal_gen.configs.pipeline_configs.ideogram import (
     Ideogram4PipelineConfig,
+)
+from sglang.multimodal_gen.configs.pipeline_configs.joy_echo import (
+    JoyEchoPipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.joy_image import (
     JoyImageEditPipelineConfig,
@@ -114,6 +118,7 @@ from sglang.multimodal_gen.configs.sample.hunyuan import (
 )
 from sglang.multimodal_gen.configs.sample.hunyuan3d import Hunyuan3DSamplingParams
 from sglang.multimodal_gen.configs.sample.ideogram import Ideogram4SamplingParams
+from sglang.multimodal_gen.configs.sample.joy_echo import JoyEchoSamplingParams
 from sglang.multimodal_gen.configs.sample.joy_image import (
     JoyImageEditSamplingParams,
 )
@@ -761,6 +766,13 @@ def _register_configs():
         ],
     )
     register_configs(
+        sampling_param_cls=LingBotWorldSamplingParams,
+        pipeline_config_cls=LingBotWorldV2CausalDMDConfig,
+        hf_model_paths=[
+            "robbyant/lingbot-world-v2-14b-causal-fast-diffusers",
+        ],
+    )
+    register_configs(
         sampling_param_cls=FastWanT2V480PConfig,
         pipeline_config_cls=FastWan2_1_T2V_480P_Config,
         hf_model_paths=[
@@ -1058,6 +1070,17 @@ def _register_configs():
         ],
         model_detectors=[
             lambda hf_id: "joyai-image-edit" in hf_id.lower(),
+        ],
+    )
+    register_configs(
+        sampling_param_cls=JoyEchoSamplingParams,
+        pipeline_config_cls=JoyEchoPipelineConfig,
+        hf_model_paths=[
+            "jdopensource/JoyAI-Echo",
+        ],
+        model_detectors=[
+            lambda hf_id: ("joy-echo" in hf_id.lower() or "joyai-echo" in hf_id.lower())
+            and "image-edit" not in hf_id.lower(),
         ],
     )
 

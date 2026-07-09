@@ -39,8 +39,8 @@ from sglang.srt.debug_utils.dumper import (
     get_tensor_info,
     get_truncated_value,
 )
-from sglang.srt.environ import temp_set_env
 from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils.common import temp_set_env
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -2344,8 +2344,6 @@ class TestDumperE2E:
                 "attn_tp_size",
                 "attn_dp_rank",
                 "attn_dp_size",
-                "local_attn_dp_rank",
-                "local_attn_dp_size",
                 "attn_cp_rank",
                 "attn_cp_size",
             ]

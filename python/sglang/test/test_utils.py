@@ -8,6 +8,10 @@ import inspect
 import json
 import logging
 import os
+
+# Registered tests run with the strict config-mutation guard: bare
+# server_args assignments after resolution raise (use ServerArgs.override).
+os.environ.setdefault("SGLANG_STRICT_CONFIG_MUTATION", "1")
 import random
 import re
 import shlex
@@ -66,6 +70,8 @@ DEFAULT_MODEL_NAME_FOR_TEST_MLA_NEXTN = "lmsys/sglang-ci-dsv3-test-NextN"
 
 # Hybrid Mamba models
 DEFAULT_HYBRID_MAMBA_MODEL_NAME_FOR_TEST = "Qwen/Qwen3-Next-80B-A3B-Instruct"
+# Small GDN-hybrid (gated delta net) model that fits a single GPU
+DEFAULT_HYBRID_GDN_SMALL_MODEL_NAME_FOR_TEST = "Qwen/Qwen3.5-4B"
 # VL test models
 DEFAULT_MODEL_NAME_FOR_TEST_VL_PP = "Qwen/Qwen3-VL-2B-Thinking"
 DEFAULT_MODEL_NAME_FOR_TEST_GLM_41V_PP = "zai-org/GLM-4.1V-9B-Thinking"

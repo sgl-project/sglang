@@ -165,7 +165,7 @@ server_process, port = launch_server_cmd(
     """
     python3 -m sglang.launch_server --model-path meta-llama/Meta-Llama-3.1-8B-Instruct \
     --enable-lora \
-    --cuda-graph-max-bs 2 \
+    --cuda-graph-max-bs-decode 2 \
     --max-loras-per-batch 2 \
     --max-lora-rank 256
     --lora-target-modules all
@@ -314,7 +314,7 @@ server_process, port = launch_server_cmd(
     """
     python3 -m sglang.launch_server --model-path meta-llama/Meta-Llama-3.1-8B-Instruct \
     --enable-lora \
-    --cuda-graph-max-bs 8 \
+    --cuda-graph-max-bs-decode 8 \
     --max-loras-per-batch 3 \
     --max-lora-rank 256 \
     --lora-target-modules all \
