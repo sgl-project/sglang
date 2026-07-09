@@ -463,6 +463,43 @@ class TestNamedStreams(_IsolatedServerArgs):
         self.assertEqual(get_context().resources.streams, {})
 
 
+class TestEpBufferState(_IsolatedServerArgs):
+    """EP dispatcher buffer managers: state lives on ctx.resources; the
+    facade keeps the mode-transition and clean semantics."""
+
+    def test_deepep_dispatch_mode_transitions_and_reset(self):
+        try:
+            from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPBuffer
+        except ImportError:
+            self.skipTest("deep_ep not installed")
+
+        reset_context()
+        cleans = []
+
+        class _FakeBuffer:
+            low_latency_mode = True
+
+            def clean_low_latency_buffer(self, *args):
+                cleans.append(args)
+
+        state = DeepEPBuffer._state()
+        state.buffer = _FakeBuffer()
+        state.hidden_size = 7168
+        state.num_max_dispatch_tokens_per_rank = 128
+        state.num_experts = 256
+
+        DeepEPBuffer.set_dispatch_mode_as_normal()
+        # NORMAL -> LOW_LATENCY must clean the low-latency buffer once.
+        DeepEPBuffer.set_dispatch_mode_as_low_latency()
+        self.assertEqual(cleans, [(128, 7168, 256)])
+        # LOW_LATENCY -> LOW_LATENCY must not clean again.
+        DeepEPBuffer.set_dispatch_mode_as_low_latency()
+        self.assertEqual(len(cleans), 1)
+
+        reset_context()
+        self.assertIsNone(DeepEPBuffer._state().buffer)
+
+
 class TestPublishLifecycle(_IsolatedServerArgs):
     """Publish installs the resolved server_args and seeds the capture tier."""
 
