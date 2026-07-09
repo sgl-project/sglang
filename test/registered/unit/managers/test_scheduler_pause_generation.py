@@ -235,6 +235,25 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
         self.assertFalse(scheduler.running_batch.batch_is_full)
         self.assertIsNone(scheduler.chunked_req)
 
+    def test_retract_releases_through_batch_side_hisparse_coordinator(self):
+        """retract with empty running + last fold-in must not touch the scheduler-owned hisparse coordinator."""
+        scheduler = self._new_scheduler()
+        scheduler.hisparse_coordinator = MagicMock()
+        last_req = self._make_req("last")
+        scheduler.running_batch = ScheduleBatch(reqs=[], batch_is_full=True)
+        scheduler.last_batch = self._make_batch(
+            scheduler,
+            reqs=[last_req],
+            forward_mode=ForwardMode.EXTEND,
+            with_tensors=True,
+        )
+        requeue_log = self._spy_requeue(scheduler)
+
+        scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
+
+        scheduler.hisparse_coordinator.retract_req.assert_not_called()
+        self.assertEqual([entry["req"] for entry in requeue_log], [last_req])
+
     def test_retract_disagg_prefill_excludes_last_batch(self):
         """retract under disagg prefill must not release or requeue last extend reqs."""
         scheduler = self._new_scheduler()
