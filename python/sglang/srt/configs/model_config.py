@@ -247,6 +247,7 @@ class ModelConfig:
         language_only: bool = False,
         disable_hybrid_swa_memory: bool = False,
         model_config_parser: str = "auto",
+        model_loader_extra_config: Optional[dict] = None,
     ) -> None:
         # Parse args
         self.model_path = model_path
@@ -259,6 +260,20 @@ class ModelConfig:
         self.is_multi_layer_eagle = is_multi_layer_eagle
         self.disable_hybrid_swa_memory = disable_hybrid_swa_memory
         self.model_config_parser = model_config_parser
+        if isinstance(model_loader_extra_config, str):
+            self.model_loader_extra_config = json.loads(
+                model_loader_extra_config or "{}"
+            )
+        else:
+            self.model_loader_extra_config = model_loader_extra_config or {}
+        if self.model_loader_extra_config.get("mooncake_weight_store_config"):
+            os.environ["MOONCAKE_WEIGHT_STORE_CONFIG"] = self.model_loader_extra_config[
+                "mooncake_weight_store_config"
+            ]
+        if self.model_loader_extra_config.get("materialize_dir"):
+            os.environ["MOONCAKE_MODEL_MATERIALIZE_DIR"] = (
+                self.model_loader_extra_config["materialize_dir"]
+            )
 
         # Validate quantize_and_serve configuration
         self._validate_quantize_and_serve_config()
@@ -528,6 +543,7 @@ class ModelConfig:
             is_draft_model=is_draft_model,
             disable_hybrid_swa_memory=server_args.disable_hybrid_swa_memory,
             model_config_parser=server_args.model_config_parser,
+            model_loader_extra_config=server_args.model_loader_extra_config,
             **kwargs,
         )
 
@@ -1527,11 +1543,23 @@ class ModelConfig:
             # BaseConnector implements __del__() to clean up the local dir.
             # Since config files need to exist all the time, so we DO NOT use
             # with statement to avoid closing the client.
-            client = create_remote_connector(self.model_path)
+            client = create_remote_connector(
+                self.model_path, **self.model_loader_extra_config
+            )
             if is_remote_url(self.model_path):
-                client.pull_files(allow_pattern=["*config.json"])
+                client.pull_files(ignore_pattern=["*.pt", "*.safetensors", "*.bin"])
                 self.model_weights = self.model_path
                 self.model_path = client.get_local_dir()
+
+
+def resolve_remote_tokenizer_path(server_args, model_config: ModelConfig) -> None:
+    from sglang.srt.utils import is_remote_url
+
+    if (
+        is_remote_url(server_args.model_path)
+        and server_args.tokenizer_path == server_args.model_path
+    ):
+        server_args.tokenizer_path = model_config.model_path
 
 
 # adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/config.py

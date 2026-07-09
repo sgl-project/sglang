@@ -29,6 +29,7 @@ import socket
 import tempfile
 import uuid
 from functools import cached_property
+from urllib.parse import urlparse
 from typing import Any, Callable, Dict, List, Literal, Optional, Union
 
 from sglang.jit_kernel.kv_canary.consts import RealKvHashMode
@@ -3177,7 +3178,11 @@ class ServerArgs:
         if self.tokenizer_path is None:
             self.tokenizer_path = self.model_path
         if self.served_model_name is None:
-            self.served_model_name = self.model_path
+            self.served_model_name = (
+                self._default_remote_served_model_name(self.model_path)
+                if is_remote_url(self.model_path)
+                else self.model_path
+            )
         if self.device is None:
             self.device = get_device()
         # strip device index from user if any (e.g. "cuda:0" -> "cuda")
@@ -3207,6 +3212,12 @@ class ServerArgs:
             self._quantization_explicitly_unset = False
         if self.speculative_draft_model_quantization == "unquant":
             self.speculative_draft_model_quantization = None
+
+    @staticmethod
+    def _default_remote_served_model_name(model_path: str) -> str:
+        parsed = urlparse(model_path)
+        name = os.path.basename(parsed.path.rstrip("/")) or parsed.netloc
+        return name.replace(":", "_") or model_path.replace(":", "_")
 
     def _handle_modelscope_paths(self):
         """Resolve model / tokenizer / speculative-draft paths from the local

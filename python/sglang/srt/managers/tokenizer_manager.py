@@ -304,6 +304,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.model_path = server_args.model_path
         self.served_model_name = server_args.served_model_name
         self.model_config = model_config_class.from_server_args(server_args)
+        if model_config_class is ModelConfig:
+            from sglang.srt.configs.model_config import resolve_remote_tokenizer_path
+
+            resolve_remote_tokenizer_path(server_args, self.model_config)
         self.is_generation = self.model_config.is_generation
         self.context_len = self.model_config.context_len
         self.image_token_id = self.model_config.image_token_id
@@ -3075,6 +3079,13 @@ async def print_exception_wrapper(func):
 
 
 def _get_processor_wrapper(server_args):
+    from sglang.srt.utils import is_remote_url
+
+    processor_model_name = (
+        server_args.tokenizer_path
+        if is_remote_url(server_args.model_path)
+        else server_args.model_path
+    )
     try:
         processor = get_processor(
             server_args.tokenizer_path,
@@ -3083,7 +3094,7 @@ def _get_processor_wrapper(server_args):
             revision=server_args.revision,
             use_fast=not server_args.disable_fast_image_processor,
             tokenizer_backend=server_args.tokenizer_backend,
-            model_name=server_args.model_path,
+            model_name=processor_model_name,
         )
     except ValueError as e:
         error_message = str(e)
@@ -3098,7 +3109,7 @@ def _get_processor_wrapper(server_args):
                 revision=server_args.revision,
                 use_fast=True,
                 tokenizer_backend=server_args.tokenizer_backend,
-                model_name=server_args.model_path,
+                model_name=processor_model_name,
             )
         else:
             raise e

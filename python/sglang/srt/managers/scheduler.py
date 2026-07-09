@@ -568,6 +568,9 @@ class Scheduler(
 
     def init_model_config(self):
         self.model_config = ModelConfig.from_server_args(self.server_args)
+        from sglang.srt.configs.model_config import resolve_remote_tokenizer_path
+
+        resolve_remote_tokenizer_path(self.server_args, self.model_config)
         if _is_npu:
             # make sure the page size is not larger than block_size and chunked_prefill_size on NPU backend
             # the npu backend request the defined page size to be no larger than block_size and chunked_prefill_size
@@ -670,6 +673,8 @@ class Scheduler(
             self.tokenizer = self.processor = None
         else:
             if self.model_config.is_multimodal:
+                from sglang.srt.utils import is_remote_url
+
                 self.processor = get_processor(
                     server_args.tokenizer_path,
                     tokenizer_mode=server_args.tokenizer_mode,
@@ -677,7 +682,11 @@ class Scheduler(
                     revision=server_args.revision,
                     use_fast=not server_args.disable_fast_image_processor,
                     tokenizer_backend=server_args.tokenizer_backend,
-                    model_name=server_args.model_path,
+                    model_name=(
+                        self.model_config.model_path
+                        if is_remote_url(server_args.model_path)
+                        else server_args.model_path
+                    ),
                 )
                 self.tokenizer = get_tokenizer_from_processor(self.processor)
             else:
