@@ -22,6 +22,7 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
     SetLoraReq,
     ShutdownReq,
     UnmergeLoraWeightsReq,
+    expand_request_outputs,
     format_lora_message,
     save_outputs,
 )
@@ -343,8 +344,13 @@ async def process_generation_batch(
     batch,
 ) -> tuple[list[str], OutputBatch]:
     total_start_time = time.perf_counter()
+    expanded_batch = expand_request_outputs(batch)
+    scheduler_payload = (
+        [expanded_batch] if len(expanded_batch) > 1 else [expanded_batch[0]]
+    )
+
     with trace_req(batch.trace_ctx), log_generation_timer(logger, batch.prompt):
-        result = await scheduler_client.forward([batch])
+        result = await scheduler_client.forward(scheduler_payload)
 
         if (
             result.output is None
