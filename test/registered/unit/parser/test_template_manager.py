@@ -4,7 +4,7 @@ import unittest
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
 
-from sglang.srt.managers.template_detection import (
+from sglang.srt.parser.template_detection import (
     REASONING_PARSER_RULES,
     TOOL_CALL_PARSER_RULES,
     ReasoningToggleConfig,
@@ -100,6 +100,24 @@ class TestTemplateManagerReasoningDetection(unittest.TestCase):
         self.assertEqual(
             config,
             ReasoningToggleConfig(toggle_param="enable_thinking", default_enabled=True),
+        )
+        self.assertEqual(parser, "nemotron_3")
+
+    def test_nemotron_super_detects_low_effort_kwarg(self):
+        template = """
+        {% set enable_thinking = enable_thinking if enable_thinking is defined else True %}
+        {%- set low_effort = low_effort if low_effort is defined else False %}
+        {% set truncate_history_thinking = truncate_history_thinking if truncate_history_thinking is defined else True %}
+        """
+        _, config, parser = self._detect(template, [""])
+
+        self.assertEqual(
+            config,
+            ReasoningToggleConfig(
+                toggle_param="enable_thinking",
+                default_enabled=True,
+                effort_kwarg="low_effort",
+            ),
         )
         self.assertEqual(parser, "nemotron_3")
 
@@ -584,10 +602,18 @@ class TestResolveAutoParsers(unittest.TestCase):
 
     qwen3_template = "{% set enable_thinking = enable_thinking if enable_thinking is defined else true %}"
 
+    class _Args(SimpleNamespace):
+        # Write-through override, per the runtime-context testing idiom:
+        # production adjusts parsers through override(source, ...), so the
+        # stand-in needs the method (a bare SimpleNamespace would raise).
+        def override(self, source, **fields):
+            for key, value in fields.items():
+                setattr(self, key, value)
+
     def _make_server_args(
         self, reasoning_parser=None, tool_call_parser=None, chat_template=None
     ):
-        return SimpleNamespace(
+        return self._Args(
             reasoning_parser=reasoning_parser,
             tool_call_parser=tool_call_parser,
             model_path="Qwen/Qwen3-0.6B",
@@ -632,12 +658,8 @@ class TestResolveAutoParsers(unittest.TestCase):
         self.assertEqual(args.tool_call_parser, "qwen")
 
     def test_nonexistent_model_disables_both_parsers(self):
-        args = SimpleNamespace(
-            reasoning_parser="auto",
-            tool_call_parser="auto",
-            model_path="nonexistent/model-does-not-exist-xyz",
-            trust_remote_code=False,
-        )
+        args = self._make_server_args(reasoning_parser="auto", tool_call_parser="auto")
+        args.model_path = "nonexistent/model-does-not-exist-xyz"
         with _patch_hf_transformers_utils(
             Mock(side_effect=RuntimeError("tokenizer unavailable")),
             Mock(side_effect=RuntimeError("config unavailable")),
