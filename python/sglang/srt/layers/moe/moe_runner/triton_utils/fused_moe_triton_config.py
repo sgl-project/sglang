@@ -10,7 +10,7 @@ import torch
 import triton
 
 from sglang.srt.environ import envs
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import get_device_name, is_hip
 
 logger = logging.getLogger(__name__)
@@ -70,7 +70,7 @@ def get_moe_configs(
     kernel on a given batch size bs, the closest batch size in the grid should
     be picked and the associated configuration chosen to invoke the kernel.
     """
-    if get_global_server_args().enable_deterministic_inference:
+    if get_server_args().enable_deterministic_inference:
         logger.warning(
             "Deterministic inference is enabled, using default MoE kernel config."
         )
@@ -171,7 +171,7 @@ def get_default_config(
     is_marlin: bool,
     block_shape: Optional[List[int]] = None,
 ) -> Dict[str, int]:
-    if get_global_server_args().enable_deterministic_inference:
+    if get_server_args().enable_deterministic_inference:
         config = {
             "BLOCK_SIZE_M": 64,
             "BLOCK_SIZE_N": 64,

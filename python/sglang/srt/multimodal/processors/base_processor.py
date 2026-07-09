@@ -19,7 +19,7 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputFormat,
     MultimodalProcessorOutput,
 )
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import (
     envs,
     is_cpu,
@@ -438,12 +438,12 @@ class BaseMultimodalProcessor(ABC):
             and isinstance(processor.image_processor, BaseImageProcessor)
             and not self.server_args.disable_fast_image_processor
         ):
-            if _is_cpu or get_global_server_args().rl_on_policy_target is not None:
+            if _is_cpu or get_server_args().rl_on_policy_target is not None:
                 kwargs["device"] = "cpu"
             elif _is_xpu:
                 kwargs["device"] = "xpu"
             elif not _is_npu:
-                base_gpu_id = get_global_server_args().base_gpu_id
+                base_gpu_id = get_server_args().base_gpu_id
                 kwargs["device"] = f"cuda:{base_gpu_id}"
             elif processor.__class__.__name__ not in {
                 "Glm4vProcessor",

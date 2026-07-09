@@ -19,7 +19,7 @@ _is_npu = is_npu()
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_server_args
 
 logger = logging.getLogger(__name__)
 
@@ -205,7 +205,7 @@ def get_deepep_output_dtype(self) -> DeepEPOutputDtype:
     """
 
     # 0. Parse server argument.
-    server_args = get_global_server_args()
+    server_args = get_server_args()
     if server_args and server_args.deepep_dispatcher_output_dtype != "auto":
         return DeepEPOutputDtype(server_args.deepep_dispatcher_output_dtype)
 

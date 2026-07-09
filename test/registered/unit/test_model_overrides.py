@@ -312,12 +312,11 @@ class TestGoldenModelOverrides(_IsolatedPublish):
 
     def _publish(self, server_args):
         from sglang.srt.server_args import (
-            get_global_server_args,
             set_global_server_args_for_scheduler,
         )
 
         set_global_server_args_for_scheduler(server_args)
-        return get_global_server_args()
+        return get_server_args()
 
     def test_mistral_large3_forces_bfloat16(self):
         sa = self._construct("MistralLarge3ForCausalLM", "mistral")
