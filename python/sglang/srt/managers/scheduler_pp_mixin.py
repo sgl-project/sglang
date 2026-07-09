@@ -1133,9 +1133,9 @@ class SchedulerPPMixin:
                 extend_logprob_start_len_per_req,
             ) = get_logprob_from_pp_outputs(pp_outputs)
         next_token_ids = pp_outputs["next_token_ids"].to(torch.int64)
-        # Relay into output_tokens_buf; the next iter's resolve_forward_inputs
-        # gathers these tokens (None gate for pure decode, mix_running_indices
-        # for the decode portion of mixed-chunk batches).
+        # PP rank 0 also relays into output_tokens_buf so the next iter's
+        # resolve_forward_inputs finds these tokens for the decode portion
+        # of mixed-chunk batches (which gather via mix_running_indices).
         self.future_map.stash(
             batch.req_pool_indices, RelayPayload(bonus_tokens=next_token_ids)
         )
