@@ -7,15 +7,6 @@ from typing import TYPE_CHECKING, Any, List
 
 import regex as re
 import torch
-from humming.dtypes import DataType
-from humming.layer import HummingMethod
-from humming.schema import (
-    BaseInputSchema,
-    BaseWeightSchema,
-    HummingInputSchema,
-    HummingWeightSchema,
-)
-from humming.utils.weight import quantize_weight
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.linear import LinearBase, set_weight_attrs
@@ -49,6 +40,52 @@ from sglang.srt.layers.quantization.unquant import (
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
     from sglang.srt.models.utils import WeightsMapper
+
+
+DataType = None
+HummingMethod = None
+BaseInputSchema = None
+BaseWeightSchema = None
+HummingInputSchema = None
+HummingWeightSchema = None
+quantize_weight = None
+
+
+def _lazy_import_humming():
+    global DataType, HummingMethod, BaseInputSchema, BaseWeightSchema
+    global HummingInputSchema, HummingWeightSchema, quantize_weight
+
+    if HummingMethod is not None:
+        return
+
+    try:
+        from humming.dtypes import DataType as _DataType
+        from humming.layer import HummingMethod as _HummingMethod
+        from humming.schema import BaseInputSchema as _BaseInputSchema
+        from humming.schema import BaseWeightSchema as _BaseWeightSchema
+        from humming.schema import HummingInputSchema as _HummingInputSchema
+        from humming.schema import HummingWeightSchema as _HummingWeightSchema
+        from humming.utils.weight import quantize_weight as _quantize_weight
+    except ImportError as err:
+        if isinstance(err, ModuleNotFoundError) and err.name == "humming":
+            message = (
+                "Humming quantization requires `humming-kernels`. "
+                "Please install it to use `--quantization humming`."
+            )
+        else:
+            message = (
+                "Failed to import Humming quantization dependencies from "
+                f"`humming-kernels`: {err}"
+            )
+        raise ImportError(message) from err
+
+    DataType = _DataType
+    HummingMethod = _HummingMethod
+    BaseInputSchema = _BaseInputSchema
+    BaseWeightSchema = _BaseWeightSchema
+    HummingInputSchema = _HummingInputSchema
+    HummingWeightSchema = _HummingWeightSchema
+    quantize_weight = _quantize_weight
 
 
 def prepare_padded_shape(shape, x):
@@ -161,6 +198,7 @@ class HummingConfig(QuantizationConfig):
     packed_modules_mapping = {}
 
     def __init__(self, full_config: dict[str, Any] | None = None):
+        _lazy_import_humming()
         self.full_config: dict[str, Any] = full_config or {}
         self.is_fp4_experts: bool = False
 
@@ -353,6 +391,7 @@ class HummingLayerQuantizationConfig(HummingConfig):
         force_input_schema: "HummingInputSchema | None" = None,
         is_online_quant: bool = False,
     ):
+        _lazy_import_humming()
         self.weight_schema = weight_schema
         self.weight_block_size = getattr(weight_schema, "weight_block_size", None)
         if input_schema is None:
@@ -364,6 +403,7 @@ class HummingLayerQuantizationConfig(HummingConfig):
 
     @classmethod
     def from_config(cls, config):
+        _lazy_import_humming()
         weight_schema = BaseWeightSchema.from_config(config)
         return cls(weight_schema)
 
