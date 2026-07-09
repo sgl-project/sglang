@@ -1,4 +1,4 @@
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_cuda
 
 from .paged_mqa_logits import (
     aiter_paged_mqa_logits,
@@ -7,8 +7,9 @@ from .paged_mqa_logits import (
     deepgemm_paged_mqa_logits_split,
 )
 
-if not is_hip():
-    # Preserve the original eager import behavior on non-ROCm platforms.
+# The CuTe DSL runner requires `cutlass`, which is CUDA-only. Import it eagerly
+# only on CUDA; other platforms (ROCm, XPU, CPU) do not import it.
+if is_cuda():
     from .cutedsl_paged_mqa_logits import CuteDSLPagedMQALogitsRunner, pick_dsl_expand
 
 __all__ = [
