@@ -710,6 +710,8 @@ class Envs:
     SGLANG_VIT_ENABLE_VECTORIZED_POS_EMBED = EnvBool(True)
     SGLANG_MM_SKIP_COMPUTE_HASH = EnvBool(False)
     SGLANG_MM_EMBEDDING_CACHE_DIR = EnvStr("/tmp/sglang_embedding_cache")
+    SGLANG_MM_EMBEDDING_CACHE_CLEAR_ON_START = EnvBool(True)
+    SGLANG_MM_EMBEDDING_CACHE_MAX_SIZE = EnvStr(None)
     # For pre-tokenized (list[int]) multimodal prompts,
     # preserve the user's original tokens to avoid retokenization drift.
     SGLANG_MM_AVOID_RETOKENIZE = EnvBool(True)
