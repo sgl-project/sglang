@@ -1,7 +1,6 @@
-import os
 import unittest
 
-from sglang.srt.utils import find_local_repo_dir, kill_process_tree
+from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.basic_api_contract_kit import BasicAPIContractMixin
 from sglang.test.kits.basic_decode_correctness_kit import BasicDecodeCorrectnessMixin
@@ -15,28 +14,10 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(
-    est_time=600,
-    stage="base-b",
-    runner_config="1-gpu-large",
-    disabled="dspark draft checkpoint not yet published",
-)
+register_cuda_ci(est_time=600, stage="base-b", runner_config="1-gpu-large")
 
 TARGET_MODEL = "Qwen/Qwen3-14B"
 DRAFT_MODEL = "deepseek-ai/dspark_qwen3_14b_block7"
-
-
-def _checkpoints_available(*model_paths: str) -> bool:
-    for path in model_paths:
-        if os.path.isdir(path):
-            continue
-        try:
-            snapshot_dir = find_local_repo_dir(path, revision=None)
-        except Exception:
-            return False
-        if not snapshot_dir or not os.path.isdir(snapshot_dir):
-            return False
-    return True
 
 
 class TestBasicSanityDSpark(
@@ -61,13 +42,10 @@ class TestBasicSanityDSpark(
     attention_backend = "trtllm_mha"
     draft_attention_backend = "fa4"
 
+    process = None
+
     @classmethod
     def setUpClass(cls):
-        if not _checkpoints_available(TARGET_MODEL, DRAFT_MODEL):
-            raise unittest.SkipTest(
-                f"Checkpoint(s) unavailable (gated/missing/offline): "
-                f"{TARGET_MODEL}, {DRAFT_MODEL}."
-            )
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             TARGET_MODEL,
@@ -100,7 +78,7 @@ class TestBasicSanityDSpark(
 
     @classmethod
     def tearDownClass(cls):
-        if hasattr(cls, "process") and cls.process:
+        if cls.process is not None:
             kill_process_tree(cls.process.pid)
 
 
