@@ -217,7 +217,12 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         self.in_proj_ba = self.create_ba_proj(
             hidden_size=self.hidden_size,
             num_v_heads=self.num_v_heads,
-            quant_config=quant_config,
+            # GDN a/b gate: drives recurrent-state decay, numerically
+            # sensitive. Official static-FP8 checkpoints (quantization_config
+            # ignore list) always exclude in_proj_a/in_proj_b/in_proj_ba from
+            # quantization; mirror that for on-the-fly quant too (conv1d
+            # above already gets the same treatment).
+            quant_config=None,
             prefix=add_prefix("in_proj_ba", prefix),
             tp_rank=self.attn_tp_rank,
             tp_size=self.attn_tp_size,
