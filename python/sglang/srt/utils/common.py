@@ -1869,7 +1869,27 @@ def suppress_other_loggers():
     logging.getLogger("vllm.config").setLevel(logging.ERROR)
 
 
+_KERNEL_VERSION_CHECK_PACKAGES = frozenset(
+    {
+        "flashinfer-python",
+        "flashinfer_python",
+        "sglang-kernel",
+        "sglang_kernel",
+    }
+)
+
+
+def _should_skip_kernel_pkg_version_check(pkg: str) -> bool:
+    return (
+        pkg in _KERNEL_VERSION_CHECK_PACKAGES
+        and envs.SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK.get()
+    )
+
+
 def assert_pkg_version(pkg: str, min_version: str, message: str):
+    if _should_skip_kernel_pkg_version_check(pkg):
+        return
+
     try:
         installed_version = version(pkg)
         if pkg_version.parse(installed_version) < pkg_version.parse(min_version):
@@ -1895,6 +1915,9 @@ def check_pkg_version_at_least(pkg: str, min_version: str) -> bool:
     Returns:
         True if package is installed and version >= min_version, False otherwise
     """
+    if _should_skip_kernel_pkg_version_check(pkg):
+        return True
+
     try:
         installed_version = version(pkg)
         return pkg_version.parse(installed_version) >= pkg_version.parse(min_version)

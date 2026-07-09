@@ -2117,7 +2117,6 @@ def select_experts(
         assert (
             num_token_non_padded is None
         ), "num_token_non_padded is not yet supported in custom_routing_function"
-        assert expert_location_dispatch_info is None
         assert not apply_routed_scaling_factor_on_output, "Not implemented"
         topk_weights, topk_ids = custom_routing_function(
             hidden_states=hidden_states,

@@ -19,9 +19,6 @@ import torch
 
 from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import is_hip
-
-_is_hip = is_hip()
 
 
 @dataclass
@@ -102,7 +99,7 @@ def _topk_ids_logical_to_physical_static(
     topk_ids: torch.Tensor, info: Optional[ExpertLocationDispatchInfo]
 ) -> torch.Tensor:
     physical_topk_ids = info.partial_logical_to_rank_dispatch_physical_map[topk_ids]
-    if _is_hip:
+    if physical_topk_ids.dtype != topk_ids.dtype:
         physical_topk_ids = physical_topk_ids.to(topk_ids.dtype)
     return physical_topk_ids
 
@@ -120,7 +117,7 @@ def _topk_ids_logical_to_physical_dynamic(
         % info.partial_logical_to_all_physical_map_num_valid[topk_ids]
     )
     topk_ids = info.partial_logical_to_all_physical_map[topk_ids, chosen_dispatch_index]
-    if _is_hip:
+    if topk_ids.dtype != original_dtype:
         topk_ids = topk_ids.to(original_dtype)
 
     topk_ids = topk_ids.view(topk_ids_original_shape)

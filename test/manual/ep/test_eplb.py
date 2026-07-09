@@ -1,4 +1,6 @@
+import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,6 +16,29 @@ from sglang.test.test_utils import (
     CustomTestCase,
     popen_launch_server,
 )
+
+
+def get_a2a_backend_config():
+    # On Blackwell or machines where DeepEP is hard to compile, set
+    # SGLANG_EPLB_TEST_MOE_A2A_BACKEND=flashinfer to use FlashInfer A2A.
+    moe_a2a_backend = os.environ.get("SGLANG_EPLB_TEST_MOE_A2A_BACKEND", "deepep")
+    args = ["--moe-a2a-backend", moe_a2a_backend]
+    kwargs = {"moe_a2a_backend": moe_a2a_backend}
+    if moe_a2a_backend == "deepep":
+        args.extend(["--deepep-mode", "normal"])
+        kwargs["deepep_mode"] = "normal"
+    elif moe_a2a_backend == "flashinfer":
+        args.extend(["--moe-runner-backend", "flashinfer_cutlass"])
+        kwargs["moe_runner_backend"] = "flashinfer_cutlass"
+    return args, kwargs
+
+
+def get_a2a_backend_args():
+    return get_a2a_backend_config()[0]
+
+
+def get_a2a_backend_kwargs():
+    return get_a2a_backend_config()[1]
 
 
 class _BaseTestDynamicEPLB(CustomTestCase):
@@ -38,10 +63,7 @@ class _BaseTestDynamicEPLB(CustomTestCase):
                     "--dp",
                     "2",
                     "--enable-dp-attention",
-                    "--moe-a2a-backend",
-                    "deepep",
-                    "--deepep-mode",
-                    "normal",
+                    *get_a2a_backend_args(),
                     "--disable-cuda-graph",
                     "--enable-eplb",
                     "--ep-num-redundant-experts",
@@ -64,6 +86,7 @@ class _BaseTestDynamicEPLB(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
+        time.sleep(5)
 
     def test_mmlu(self):
         args = SimpleNamespace(
@@ -96,7 +119,6 @@ class TestStaticEPLB(CustomTestCase):
                 trust_remote_code=True,
                 ep_num_redundant_experts=4,
                 enable_dp_attention=True,
-                moe_a2a_backend="deepep",
                 disable_cuda_graph=True,
                 expert_distribution_recorder_mode="stat",
                 tp_size=2,
@@ -105,6 +127,7 @@ class TestStaticEPLB(CustomTestCase):
                 # TODO pr-chain: enable later
                 # enable_expert_distribution_metrics=True,
             )
+            engine_kwargs.update(get_a2a_backend_kwargs())
 
             print(f"Action: start engine")
             envs.SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR.set(tmp_dir)
@@ -123,6 +146,7 @@ class TestStaticEPLB(CustomTestCase):
 
             print(f"Action: shutdown engine")
             engine.shutdown()
+            time.sleep(5)
             del engine
 
             print(f"Action: start engine with init_expert_location")
@@ -136,6 +160,7 @@ class TestStaticEPLB(CustomTestCase):
             self._assert_engine_generate_correct(engine)
             print(f"Action: shutdown engine")
             engine.shutdown()
+            time.sleep(5)
             del engine
 
     def _assert_engine_generate_correct(self, engine: sgl.Engine):
