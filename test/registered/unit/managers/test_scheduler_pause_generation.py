@@ -187,6 +187,18 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
         self.assertEqual(len(scheduler.waiting_queue), 0)
         self.assertIs(scheduler.running_batch.reqs, original_reqs)
 
+    def test_retract_empty_clears_chunked_req_and_batch_is_full(self):
+        """retract with everything empty must still clear chunked_req and batch_is_full."""
+        scheduler = self._new_scheduler()
+        scheduler.waiting_queue = []
+        scheduler.chunked_req = MagicMock()
+        scheduler.running_batch.batch_is_full = True
+
+        scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
+
+        self.assertIsNone(scheduler.chunked_req)
+        self.assertFalse(scheduler.running_batch.batch_is_full)
+
     def test_retract_drains_overlap_queue(self):
         """retract with overlap enabled should drain the result_queue."""
         scheduler = self._new_scheduler()

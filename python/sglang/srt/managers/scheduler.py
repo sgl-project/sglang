@@ -4063,8 +4063,8 @@ class Scheduler(
                 for req in retracted_reqs:
                     self._add_request_to_queue(req)
 
-            self.running_batch.batch_is_full = False
-            self.chunked_req = None
+        self.running_batch.batch_is_full = False
+        self.chunked_req = None
 
         # Surface the paused state to dashboards immediately. The scheduler
         # event loop short-circuits before reaching ``on_idle`` while paused,
