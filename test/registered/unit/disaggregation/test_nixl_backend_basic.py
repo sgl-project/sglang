@@ -16,6 +16,7 @@ from sglang.srt.disaggregation.common.conn import CommonKVManager
 from sglang.srt.disaggregation.common.staging_handler import PrefillStagingContext
 from sglang.srt.disaggregation.common.utils import pack_int_lists
 from sglang.srt.disaggregation.nixl.conn import (
+    GUARD,
     KVArgsRegisterInfo,
     NixlKVManager,
     NixlKVReceiver,
@@ -183,6 +184,114 @@ class TestNixlTransferInfo(CustomTestCase):
         )
 
         self.assertTrue(info.is_dummy())
+
+
+class TestNixlBootstrapMessages(CustomTestCase):
+    def _new_manager(self):
+        mgr = NixlKVManager.__new__(NixlKVManager)
+        mgr.enable_staging = False
+        mgr.transfer_infos = {}
+        mgr.req_to_decode_prefix_len = {}
+        mgr.update_status = MagicMock()
+        mgr._add_remote_peer = MagicMock()
+        return mgr
+
+    def test_ignores_foreign_bootstrap_message(self):
+        mgr = self._new_manager()
+
+        mgr._handle_bootstrap_message([b"GET / HTTP/1.1"])
+
+        self.assertEqual(mgr.transfer_infos, {})
+        self.assertEqual(mgr.req_to_decode_prefix_len, {})
+        mgr.update_status.assert_not_called()
+
+    def test_ignores_malformed_guarded_bootstrap_message(self):
+        mgr = self._new_manager()
+
+        mgr._handle_bootstrap_message([GUARD])
+
+        self.assertEqual(mgr.transfer_infos, {})
+        mgr.update_status.assert_not_called()
+        mgr._add_remote_peer.assert_not_called()
+
+    def test_ignores_short_registration_message(self):
+        mgr = self._new_manager()
+
+        mgr._handle_bootstrap_message(
+            [GUARD, b"None", b"127.0.0.1", b"12345", b"decode_agent"]
+        )
+
+        self.assertEqual(mgr.transfer_infos, {})
+        mgr.update_status.assert_not_called()
+        mgr._add_remote_peer.assert_not_called()
+
+    def test_ignores_short_transfer_message(self):
+        mgr = self._new_manager()
+
+        mgr._handle_bootstrap_message(
+            [GUARD, b"17", b"127.0.0.1", b"12345", b"decode_agent", b""]
+        )
+
+        self.assertEqual(mgr.transfer_infos, {})
+        mgr.update_status.assert_not_called()
+
+    def test_ignores_non_ascii_bootstrap_metadata(self):
+        mgr = self._new_manager()
+
+        mgr._handle_bootstrap_message(
+            [GUARD, b"\xff", b"127.0.0.1", b"12345", b"decode_agent"]
+        )
+
+        self.assertEqual(mgr.transfer_infos, {})
+        mgr.update_status.assert_not_called()
+        mgr._add_remote_peer.assert_not_called()
+
+    def test_ignores_invalid_room_id(self):
+        mgr = self._new_manager()
+
+        mgr._handle_bootstrap_message(
+            [
+                GUARD,
+                b"not-int",
+                b"127.0.0.1",
+                b"12345",
+                b"decode_agent",
+                b"",
+                b"4",
+                b"1",
+            ]
+        )
+
+        self.assertEqual(mgr.transfer_infos, {})
+        mgr.update_status.assert_not_called()
+
+    def test_processes_valid_message_after_foreign_message(self):
+        mgr = self._new_manager()
+        kv_indices = np.array([3, 5, 8], dtype=np.int32)
+
+        mgr._handle_bootstrap_message([b"unexpected"])
+        mgr._handle_bootstrap_message(
+            [
+                GUARD,
+                b"17",
+                b"127.0.0.1",
+                b"12345",
+                b"decode_agent",
+                kv_indices.tobytes(),
+                b"4",
+                b"1",
+                b"",
+                b"11",
+            ]
+        )
+
+        self.assertIn(17, mgr.transfer_infos)
+        self.assertIn("decode_agent", mgr.transfer_infos[17])
+        np.testing.assert_array_equal(
+            mgr.transfer_infos[17]["decode_agent"].dst_kv_indices, kv_indices
+        )
+        self.assertEqual(mgr.req_to_decode_prefix_len[17], 11)
+        mgr.update_status.assert_called_once_with(17, KVPoll.WaitingForInput)
 
 
 class TestNixlKVArgsRegisterInfo(CustomTestCase):
