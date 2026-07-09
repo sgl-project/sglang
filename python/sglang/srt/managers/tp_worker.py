@@ -221,7 +221,12 @@ class BaseTpWorker(ABC):
         return result
 
     def forward_batch_embedding(self, batch: ScheduleBatch):
-        forward_batch = ForwardBatch.init_new(batch, self.model_runner)
+        forward_batch = ForwardBatch.init_new(
+            batch,
+            self.model_runner,
+            capture_hidden_mode=None,
+            return_hidden_states_before_norm=False,
+        )
         output = self.model_runner.forward(forward_batch).logits_output
         return output  # Returns EmbeddingPoolerOutput
 
@@ -498,7 +503,7 @@ class TpModelWorker(BaseTpWorker):
         is_verify: bool = False,
         skip_attn_backend_init: Optional[bool] = None,  # deprecated
         *,
-        capture_hidden_mode: Optional[CaptureHiddenMode] = None,
+        capture_hidden_mode: Optional[CaptureHiddenMode],
     ) -> GenerationBatchResult:
         # Get forward batch from schedule batch
         if batch is not None:
@@ -506,7 +511,10 @@ class TpModelWorker(BaseTpWorker):
             self.set_hicache_consumer(batch.hicache_consumer_index)
 
             forward_batch = ForwardBatch.init_new(
-                batch, self.model_runner, capture_hidden_mode=capture_hidden_mode
+                batch,
+                self.model_runner,
+                capture_hidden_mode=capture_hidden_mode,
+                return_hidden_states_before_norm=False,
             )
         else:
             # FIXME(lsyin): unify the interface of forward_batch
@@ -591,7 +599,12 @@ class TpModelWorker(BaseTpWorker):
 
     def forward_batch_split_prefill(self, batch: ScheduleBatch):
         if batch.split_index == 0:
-            forward_batch = ForwardBatch.init_new(batch, self.model_runner)
+            forward_batch = ForwardBatch.init_new(
+                batch,
+                self.model_runner,
+                capture_hidden_mode=None,
+                return_hidden_states_before_norm=False,
+            )
             batch.split_forward_batch = forward_batch
 
         out = self.model_runner.forward(

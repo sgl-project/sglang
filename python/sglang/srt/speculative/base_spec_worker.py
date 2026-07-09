@@ -98,7 +98,7 @@ class EagleDraftWorkerBase(ABC):
         draft_model_runner: Any,
         cuda_graph_runner: Any,
         *,
-        return_hidden_states_before_norm: bool = False,
+        return_hidden_states_before_norm: bool,
     ):
         from sglang.srt.model_executor.forward_batch_info import (
             CaptureHiddenMode,
@@ -270,7 +270,10 @@ class EagleDraftWorkerBase(ABC):
         )
         draft_input.positions = batch.seq_lens.repeat_interleave(topk, dim=0)
         forward_batch = ForwardBatch.init_new(
-            batch, draft_model_runner, capture_hidden_mode=capture_mode
+            batch,
+            draft_model_runner,
+            capture_hidden_mode=capture_mode,
+            return_hidden_states_before_norm=False,
         )
         can_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run_graph(
             forward_batch
