@@ -298,6 +298,17 @@ class PrefillBootstrapQueue:
         return True
 
     def _finalize_dspark_hidden_bootstrap(self, req: Req, dspark_meta: dict) -> bool:
+        if self.pp_size > 1:
+            message = (
+                "DSpark PD compact hidden transfer does not support prefill "
+                f"pipeline parallelism yet: pp_size={self.pp_size}. "
+                "The required aux hidden layers may live on different PP stages "
+                "and need PP-aware slice assembly before transfer."
+            )
+            logger.error(message)
+            prepare_abort(req, message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
+            return False
+
         pool = getattr(self.metadata_buffers, "dspark_hidden_pool", None)
         if pool is None:
             message = (
