@@ -709,13 +709,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             spec_info=batch.spec_info,
         )
 
-        # Populate the grammars of the forward's sampling_info (mirrors what
-        # ScheduleBatch.get_model_worker_batch used to do). ret.sampling_info
-        # is the same object as batch.sampling_info: under isolation it is a
-        # forward-only copy; on non-isolation paths (plain non-overlap gen,
-        # embedding) the write lands on the ScheduleBatch's own sampling_info
-        # and stays harmless because every forward repopulates it and
-        # embedding has no grammar.
+        # Mirror the grammars-population behavior previously done in
+        # ScheduleBatch.get_model_worker_batch.
         if ret.sampling_info is not None:
             if batch.has_grammar:
                 ret.sampling_info.grammars = [req.grammar for req in batch.reqs]
