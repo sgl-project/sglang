@@ -110,7 +110,8 @@ def _sparse_mla_fwd_kernel(
 
 
 # ---------------------------------------------------------------------------
-# 4×128 split-dim kernel: breaks MFMA accumulation chains for better ILP
+# N×128 split-dim kernel: breaks MFMA accumulation chains for better ILP
+# NUM_GROUPS = D_V // 128 (e.g. 4 for D_V=512, 2 for D_V=256)
 # ---------------------------------------------------------------------------
 
 _G = tl.constexpr(128)
@@ -142,6 +143,7 @@ def _sparse_mla_fwd_split_dim_kernel(
     DIM: tl.constexpr,
     D_V: tl.constexpr,
     D_TAIL: tl.constexpr,
+    NUM_GROUPS: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
     s_i = tl.program_id(0)
@@ -152,15 +154,18 @@ def _sparse_mla_fwd_split_dim_kernel(
 
     q_base = q_nope_ptr + s_i * H * D_V
     q0 = tl.load(q_base + h[:, None] * D_V + g[None, :]).to(q_nope_ptr.dtype.element_ty)
-    q1 = tl.load(q_base + h[:, None] * D_V + (_G + g)[None, :]).to(
-        q_nope_ptr.dtype.element_ty
-    )
-    q2 = tl.load(q_base + h[:, None] * D_V + (2 * _G + g)[None, :]).to(
-        q_nope_ptr.dtype.element_ty
-    )
-    q3 = tl.load(q_base + h[:, None] * D_V + (3 * _G + g)[None, :]).to(
-        q_nope_ptr.dtype.element_ty
-    )
+    if NUM_GROUPS >= 2:
+        q1 = tl.load(q_base + h[:, None] * D_V + (_G + g)[None, :]).to(
+            q_nope_ptr.dtype.element_ty
+        )
+    if NUM_GROUPS >= 3:
+        q2 = tl.load(q_base + h[:, None] * D_V + (2 * _G + g)[None, :]).to(
+            q_nope_ptr.dtype.element_ty
+        )
+    if NUM_GROUPS >= 4:
+        q3 = tl.load(q_base + h[:, None] * D_V + (3 * _G + g)[None, :]).to(
+            q_nope_ptr.dtype.element_ty
+        )
     q_tail = tl.load(
         q_rope_ptr + s_i * H * D_TAIL + h[:, None] * D_TAIL + dt[None, :]
     ).to(q_nope_ptr.dtype.element_ty)
@@ -168,9 +173,12 @@ def _sparse_mla_fwd_split_dim_kernel(
     m_i = tl.full([H], -float("inf"), tl.float32)
     l_i = tl.zeros([H], tl.float32)
     acc0 = tl.zeros([H, _G], tl.float32)
-    acc1 = tl.zeros([H, _G], tl.float32)
-    acc2 = tl.zeros([H, _G], tl.float32)
-    acc3 = tl.zeros([H, _G], tl.float32)
+    if NUM_GROUPS >= 2:
+        acc1 = tl.zeros([H, _G], tl.float32)
+    if NUM_GROUPS >= 3:
+        acc2 = tl.zeros([H, _G], tl.float32)
+    if NUM_GROUPS >= 4:
+        acc3 = tl.zeros([H, _G], tl.float32)
 
     inv_fp8_max = 1.0 / fp8_max
     n = tl.arange(0, BLOCK_N)
@@ -184,23 +192,29 @@ def _sparse_mla_fwd_split_dim_kernel(
         kv0 = tl.load(kbase + g[None, :], mask=valid[:, None], other=0.0).to(
             q_nope_ptr.dtype.element_ty
         )
-        kv1 = tl.load(kbase + (_G + g)[None, :], mask=valid[:, None], other=0.0).to(
-            q_nope_ptr.dtype.element_ty
-        )
-        kv2 = tl.load(kbase + (2 * _G + g)[None, :], mask=valid[:, None], other=0.0).to(
-            q_nope_ptr.dtype.element_ty
-        )
-        kv3 = tl.load(kbase + (3 * _G + g)[None, :], mask=valid[:, None], other=0.0).to(
-            q_nope_ptr.dtype.element_ty
-        )
+        if NUM_GROUPS >= 2:
+            kv1 = tl.load(kbase + (_G + g)[None, :], mask=valid[:, None], other=0.0).to(
+                q_nope_ptr.dtype.element_ty
+            )
+        if NUM_GROUPS >= 3:
+            kv2 = tl.load(kbase + (2 * _G + g)[None, :], mask=valid[:, None], other=0.0).to(
+                q_nope_ptr.dtype.element_ty
+            )
+        if NUM_GROUPS >= 4:
+            kv3 = tl.load(kbase + (3 * _G + g)[None, :], mask=valid[:, None], other=0.0).to(
+                q_nope_ptr.dtype.element_ty
+            )
         kv_tail = tl.load(
             kbase + (D_V + dt)[None, :], mask=valid[:, None], other=0.0
         ).to(q_nope_ptr.dtype.element_ty)
 
         qk = tl.dot(q0, tl.trans(kv0))
-        qk += tl.dot(q1, tl.trans(kv1))
-        qk += tl.dot(q2, tl.trans(kv2))
-        qk += tl.dot(q3, tl.trans(kv3))
+        if NUM_GROUPS >= 2:
+            qk += tl.dot(q1, tl.trans(kv1))
+        if NUM_GROUPS >= 3:
+            qk += tl.dot(q2, tl.trans(kv2))
+        if NUM_GROUPS >= 4:
+            qk += tl.dot(q3, tl.trans(kv3))
         qk += tl.dot(q_tail, tl.trans(kv_tail))
         qk = qk * qk_scale
         qk = tl.where(valid[None, :], qk, -float("inf"))
@@ -213,31 +227,40 @@ def _sparse_mla_fwd_split_dim_kernel(
 
         p_fp8 = (p * fp8_max).to(q_nope_ptr.dtype.element_ty)
         acc0 = acc0 * alpha[:, None] + tl.dot(p_fp8, kv0).to(tl.float32) * inv_fp8_max
-        acc1 = acc1 * alpha[:, None] + tl.dot(p_fp8, kv1).to(tl.float32) * inv_fp8_max
-        acc2 = acc2 * alpha[:, None] + tl.dot(p_fp8, kv2).to(tl.float32) * inv_fp8_max
-        acc3 = acc3 * alpha[:, None] + tl.dot(p_fp8, kv3).to(tl.float32) * inv_fp8_max
+        if NUM_GROUPS >= 2:
+            acc1 = acc1 * alpha[:, None] + tl.dot(p_fp8, kv1).to(tl.float32) * inv_fp8_max
+        if NUM_GROUPS >= 3:
+            acc2 = acc2 * alpha[:, None] + tl.dot(p_fp8, kv2).to(tl.float32) * inv_fp8_max
+        if NUM_GROUPS >= 4:
+            acc3 = acc3 * alpha[:, None] + tl.dot(p_fp8, kv3).to(tl.float32) * inv_fp8_max
         m_i = m_new
 
     l_safe = tl.where(l_i == 0.0, 1.0, l_i)
     inv_l = 1.0 / l_safe
     acc0 = acc0 * inv_l[:, None]
-    acc1 = acc1 * inv_l[:, None]
-    acc2 = acc2 * inv_l[:, None]
-    acc3 = acc3 * inv_l[:, None]
+    if NUM_GROUPS >= 2:
+        acc1 = acc1 * inv_l[:, None]
+    if NUM_GROUPS >= 3:
+        acc2 = acc2 * inv_l[:, None]
+    if NUM_GROUPS >= 4:
+        acc3 = acc3 * inv_l[:, None]
 
     o_base = o_ptr + s_i * H * D_V
     tl.store(o_base + h[:, None] * D_V + g[None, :], acc0.to(o_ptr.dtype.element_ty))
-    tl.store(
-        o_base + h[:, None] * D_V + (_G + g)[None, :], acc1.to(o_ptr.dtype.element_ty)
-    )
-    tl.store(
-        o_base + h[:, None] * D_V + (2 * _G + g)[None, :],
-        acc2.to(o_ptr.dtype.element_ty),
-    )
-    tl.store(
-        o_base + h[:, None] * D_V + (3 * _G + g)[None, :],
-        acc3.to(o_ptr.dtype.element_ty),
-    )
+    if NUM_GROUPS >= 2:
+        tl.store(
+            o_base + h[:, None] * D_V + (_G + g)[None, :], acc1.to(o_ptr.dtype.element_ty)
+        )
+    if NUM_GROUPS >= 3:
+        tl.store(
+            o_base + h[:, None] * D_V + (2 * _G + g)[None, :],
+            acc2.to(o_ptr.dtype.element_ty),
+        )
+    if NUM_GROUPS >= 4:
+        tl.store(
+            o_base + h[:, None] * D_V + (3 * _G + g)[None, :],
+            acc3.to(o_ptr.dtype.element_ty),
+        )
 
 
 def _triton_sparse_mla_fwd_single(
@@ -251,6 +274,7 @@ def _triton_sparse_mla_fwd_single(
     """Single-pass prefill: grid=(seq,), loops over all topk per CTA."""
     seq, H, d_v_in = q_nope.shape
     assert d_v_in == d_v
+    assert d_v % 128 == 0, f"Triton sparse MLA requires d_v divisible by 128, got {d_v}"
     d_tail = q_rope.shape[-1]
     dim = kv.shape[-1]
     topk = indices.shape[-1]
@@ -259,6 +283,7 @@ def _triton_sparse_mla_fwd_single(
     idx_flat = indices.squeeze(1).contiguous() if indices.dim() == 3 else indices
     out = torch.empty(seq, H, d_v, device=q_nope.device, dtype=torch.bfloat16)
     qk_scale = float(sm_scale) * _LOG2E
+    num_groups = d_v // 128
     _sparse_mla_fwd_split_dim_kernel[(seq,)](
         q_nope,
         q_rope,
@@ -272,6 +297,7 @@ def _triton_sparse_mla_fwd_single(
         DIM=dim,
         D_V=d_v,
         D_TAIL=d_tail,
+        NUM_GROUPS=num_groups,
     )
     return out.unsqueeze(0)
 
@@ -607,6 +633,7 @@ def triton_sparse_mla_fwd(
     """
     seq, H, d_v_in = q_nope.shape
     assert d_v_in == d_v
+    assert d_v % 128 == 0, f"Triton sparse MLA requires d_v divisible by 128, got {d_v}"
     d_tail = q_rope.shape[-1]
     dim = kv.shape[-1]
     topk = indices.shape[-1]
