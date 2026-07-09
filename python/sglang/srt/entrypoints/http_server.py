@@ -145,8 +145,8 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.multi_tokenizer_mixin import (
     MultiTokenizerRouter,
     TokenizerWorker,
-    get_tokenizer_worker_class,
     get_main_process_id,
+    get_tokenizer_worker_class,
     read_from_shared_memory,
     write_data_for_multi_tokenizer,
 )
