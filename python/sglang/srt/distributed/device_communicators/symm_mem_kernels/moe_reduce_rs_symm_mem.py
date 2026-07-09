@@ -9,6 +9,12 @@ import torch.distributed._symmetric_memory as symm_mem
 
 import triton
 import triton.language as tl
+from triton.language import core
+
+
+@core.extern
+def __syncthreads(_semantic=None):
+    return tl.tensor(_semantic.builder.create_barrier(), tl.void)
 
 
 @triton.jit
@@ -123,6 +129,7 @@ def barrier_on_this_grid(barrier_ptr):
     All CTAs atomically increment, CTA-0 spins until count == expected
     then sets high-bit to release everyone.
     """
+    __syncthreads()
     pid_size_x = tl.num_programs(axis=0)
     pid_size_y = tl.num_programs(axis=1)
     pid_size_z = tl.num_programs(axis=2)
@@ -138,7 +145,7 @@ def barrier_on_this_grid(barrier_ptr):
             while (_load_acquire(barrier_ptr) & 0x80000000) == 0:
                 pass
 
-    tl.debug_barrier()
+    __syncthreads()
 
 
 @triton.jit
@@ -199,6 +206,7 @@ def barrier_all_intra_node_atomic_cas_block(
     Phase 1: CAS remote peer's flag[local_rank] 0->1 (notify peer).
     Phase 2: CAS local flag[thread_idx] 1->0 (wait for peer, reset).
     """
+    __syncthreads()
     flat_tid = _get_flat_tid()
     local_rank_offset = rank - local_rank
 
@@ -215,7 +223,7 @@ def barrier_all_intra_node_atomic_cas_block(
         local_addr = local_base + flat_tid
         _cas_sys_acquire(local_addr, 1, 0)
 
-    tl.debug_barrier()
+    __syncthreads()
 
 
 @dataclass
@@ -674,8 +682,6 @@ def maybe_fused_shared_add_rs(
     if comm is None:
         return None
 
-    '''if shared_output is None:
-        return None'''
     M, _, N = final_hidden_states.shape
     if M == 0 or (M % tp_size) != 0:
         return None
