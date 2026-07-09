@@ -72,6 +72,7 @@ class DFlashVerifyInput(SpecInput):
             batch,
             target_worker.model_runner,
             capture_hidden_mode=self.capture_hidden_mode,
+            return_hidden_states_before_norm=False,
         )
 
         can_run_cuda_graph = bool(
