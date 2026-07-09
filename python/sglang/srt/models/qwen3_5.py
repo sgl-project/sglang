@@ -168,17 +168,11 @@ def _enable_qwen35_fused_ar_quant() -> bool:
     Opt-out: set ``SGLANG_DISABLE_FUSED_AR_QUANT=1`` to fall back to the
     unmodified AR+RMSNorm fusion path.
     """
-    # Imported locally so this gate keeps resolving after upstream moved most
-    # of qwen3_5's flag reads to ``get_flags`` and dropped the module-level
-    # ``get_global_server_args`` import; ``enable_aiter_allreduce_fusion`` still
-    # lives on the server args, not on ``get_flags()``.
-    from sglang.srt.server_args import get_global_server_args
-
     if not _use_aiter:
         return False
     if get_bool_env_var("SGLANG_DISABLE_FUSED_AR_QUANT", default="false"):
         return False
-    return bool(get_global_server_args().enable_aiter_allreduce_fusion)
+    return bool(get_server_args().enable_aiter_allreduce_fusion)
 
 
 def _linear_accepts_fp8_tuple(linear: nn.Module) -> bool:
