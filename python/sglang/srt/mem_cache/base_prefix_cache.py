@@ -328,6 +328,9 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def supports_swa(self) -> bool:
         return False
 
+    def swa_reprefill_tail_tokens(self) -> int:
+        return 0
+
     def supports_mamba(self) -> bool:
         return False
 

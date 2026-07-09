@@ -100,9 +100,15 @@ def match_prefix_for_req(
     if token_ids is None:
         token_ids = req.origin_input_ids + req.output_ids
 
+    # unified_kv SWA lives in a per-request ring (not content-stable, never cached
+    # in the radix tree), so a reused prefix carries stale SWA. Cap the match by the
+    # trailing sliding window so it is re-prefilled. No-op for other layouts.
+    reprefill_tail = tree_cache.swa_reprefill_tail_tokens()
+    key_limit = max(0, len(token_ids) - reprefill_tail) if reprefill_tail else None
+
     match_result = tree_cache.match_prefix(
         MatchPrefixParams(
-            key=RadixKey(token_ids=token_ids, extra_key=req.extra_key),
+            key=RadixKey(token_ids=token_ids, extra_key=req.extra_key, limit=key_limit),
             cow_mamba=cow_mamba,
             req=req if include_req else None,
         )
