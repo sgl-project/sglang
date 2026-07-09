@@ -34,7 +34,7 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _AUTOROUND_GPTQ_DESC_ACT = False
 
 
-def get_layer_config(config: "AutoRoundConfig", layer, layer_name: str):
+def get_layer_config(config: AutoRoundConfig, layer, layer_name: str):
     from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 
     def get_config(name: str, quantized: bool = True):
@@ -124,7 +124,7 @@ def get_layer_config(config: "AutoRoundConfig", layer, layer_name: str):
 
 
 def apply_awq_quant_layer(
-    config: "AutoRoundConfig", layer, prefix: str, backend: str = "auto"
+    config: AutoRoundConfig, layer, prefix: str, backend: str = "auto"
 ):
     from sglang.srt.layers.linear import LinearBase
     from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
@@ -239,7 +239,7 @@ def apply_awq_quant_layer(
 
 
 def apply_gptq_quant_layer(
-    config: "AutoRoundConfig", layer, prefix: str, backend: str = "auto"
+    config: AutoRoundConfig, layer, prefix: str, backend: str = "auto"
 ):
     from sglang.srt.layers.linear import LinearBase
     from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
@@ -381,7 +381,7 @@ def apply_gptq_quant_layer(
     return None
 
 
-def get_quant_method(config: "AutoRoundConfig", layer: torch.nn.Module, prefix: str):
+def get_quant_method(config: AutoRoundConfig, layer: torch.nn.Module, prefix: str):
     if "gptq" in config.packing_format or "gptq" in config.backend:
         return apply_gptq_quant_layer(config, layer, prefix, config.backend)
     if "awq" in config.packing_format or "awq" in config.backend:
