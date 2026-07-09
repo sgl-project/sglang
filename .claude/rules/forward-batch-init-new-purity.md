@@ -1,3 +1,8 @@
+---
+paths:
+  - "**/*.py"
+---
+
 # `ForwardBatch.init_new` must not mutate the ScheduleBatch
 
 `ForwardBatch.init_new` (and any ForwardBatch factory) must treat the input
