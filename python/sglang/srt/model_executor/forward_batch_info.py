@@ -665,8 +665,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # block there). Use it directly.
         seq_lens_cpu = batch.seq_lens_cpu
 
-        if batch.seq_lens_sum is None and seq_lens_cpu is not None:
-            batch.seq_lens_sum = int(seq_lens_cpu.sum())
+        seq_lens_sum = batch.seq_lens_sum
+        if seq_lens_sum is None and seq_lens_cpu is not None:
+            seq_lens_sum = int(seq_lens_cpu.sum())
 
         ret = cls(
             # Required core inputs
@@ -676,7 +677,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             req_pool_indices=batch.req_pool_indices,
             seq_lens=batch.seq_lens,
             out_cache_loc=batch.out_cache_loc,
-            seq_lens_sum=batch.seq_lens_sum,
+            seq_lens_sum=seq_lens_sum,
             # Inputs aliased by reference from ScheduleBatch
             seq_lens_cpu=seq_lens_cpu,
             orig_seq_lens=batch.orig_seq_lens,
