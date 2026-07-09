@@ -108,7 +108,6 @@ class _DpGatheredBufferWrapper:
     _local_dp_buffer_len: int
     _dp_max_padding: bool
     _global_num_tokens: Optional[List[int]]
-    _is_extend_in_batch: bool
 
     @classmethod
     def set_metadata(cls, hidden_size: int, dtype: torch.dtype, device: torch.device):
@@ -174,14 +173,6 @@ class _DpGatheredBufferWrapper:
         return cls._device
 
     @classmethod
-    def set_is_extend_in_batch(cls, is_extend_in_batch: bool):
-        cls._is_extend_in_batch = is_extend_in_batch
-
-    @classmethod
-    def get_is_extend_in_batch(cls) -> bool:
-        return cls._is_extend_in_batch
-
-    @classmethod
     def is_dp_max_padding(cls) -> bool:
         return cls._dp_max_padding
 
@@ -230,11 +221,18 @@ def get_dp_device() -> torch.device:
 
 
 def set_is_extend_in_batch(is_extend_in_batch: bool):
-    _DpGatheredBufferWrapper.set_is_extend_in_batch(is_extend_in_batch)
+    # Sticky within the thread: every ForwardBatch construction writes it,
+    # graph runners force False around capture; readers are the EP
+    # dispatchers on the same (single) forward thread.
+    from sglang.srt.runtime_context import get_forward
+
+    get_forward().set("is_extend_in_batch", is_extend_in_batch)
 
 
 def get_is_extend_in_batch() -> bool:
-    return _DpGatheredBufferWrapper.get_is_extend_in_batch()
+    from sglang.srt.runtime_context import get_forward
+
+    return get_forward().is_extend_in_batch
 
 
 def is_dp_max_padding() -> bool:

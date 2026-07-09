@@ -348,17 +348,134 @@ class Resources(_FlagGroupBase):
     tbo_event_pool: dict = dataclasses.field(default_factory=dict)
 
 
+class ForwardFlags:
+    """Per-forward runtime flags with one API and two backings.
+
+    Flags read only from eager Python are backed by context variables, so
+    nested scopes and threads stay isolated (a new thread sees the defaults).
+    Flags that are read or written *inside torch.compile-traced model code*
+    (``_GRAPH_VISIBLE``) are backed by plain dict slots instead: dynamo
+    cannot trace ``ContextVar.get``/``set``, while plain reads it guards on
+    — the storage form these flags had before joining the tier. Their
+    writers and readers are single-threaded per process (TBO interleaves
+    ubatches on one thread; attention-TP input scattering excludes TBO), so
+    context isolation is not needed for correctness.
+
+    ``scoped(**kw)`` — the one regular write path — restores on exit for
+    both backings. ``set()`` exists for the legacy unscoped setters' shims.
+    """
+
+    _DEFAULTS = {
+        "multi_stream": False,
+        "moe_output_buffer": None,
+        # Attention-TP input-scattering (set per forward by
+        # AttnTpContext.maybe_input_scattered / set_attn_inputs).
+        "attn_input_scattered": False,
+        "attn_inputs": None,
+        # Sticky across forwards: every ForwardBatch construction writes it;
+        # graph runners force False around capture.
+        "is_extend_in_batch": False,
+    }
+
+    # Read/written inside compiled graphs (vocab embedding, communicator,
+    # EP dispatch, DP gather/scatter): plain-slot backed. Before moving a
+    # flag out of this set, prove no read/write site sits under
+    # torch.compile.
+    _GRAPH_VISIBLE = frozenset(
+        {
+            "attn_input_scattered",
+            "attn_inputs",
+            "is_extend_in_batch",
+        }
+    )
+
+    __slots__ = ("_vars", "_plain")
+
+    def __init__(self):
+        import contextvars
+
+        object.__setattr__(
+            self,
+            "_plain",
+            {
+                name: default
+                for name, default in self._DEFAULTS.items()
+                if name in self._GRAPH_VISIBLE
+            },
+        )
+        object.__setattr__(
+            self,
+            "_vars",
+            {
+                name: contextvars.ContextVar(f"forward.{name}", default=default)
+                for name, default in self._DEFAULTS.items()
+                if name not in self._GRAPH_VISIBLE
+            },
+        )
+
+    def __getattr__(self, name: str) -> Any:
+        plain = self._plain
+        if name in plain:
+            return plain[name]
+        try:
+            return self._vars[name].get()
+        except KeyError:
+            raise AttributeError(
+                f"ForwardFlags has no flag '{name}' (flags are declared in "
+                "ForwardFlags._DEFAULTS; check for typos)"
+            ) from None
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        raise AttributeError(
+            "ForwardFlags is written through scoped(**kw) (or the legacy "
+            "set() shim), never by attribute assignment"
+        )
+
+    def set(self, name: str, value: Any) -> None:
+        """Unscoped write for legacy setter shims; persists until the next
+        write (current context only, for contextvar-backed flags)."""
+        if name in self._plain:
+            self._plain[name] = value
+        else:
+            self._vars[name].set(value)
+
+    @contextmanager
+    def scoped(self, **kwargs):
+        """Set flags for the current scope, restoring on exit. Transactional
+        (keys validated before any write) and exception-safe."""
+        unknown = set(kwargs) - set(self._DEFAULTS)
+        if unknown:
+            raise ValueError(f"unknown forward flag(s): {sorted(unknown)}")
+        plain_saved = [
+            (name, self._plain[name]) for name in kwargs if name in self._plain
+        ]
+        tokens = []
+        for name, value in kwargs.items():
+            if name in self._plain:
+                self._plain[name] = value
+            else:
+                tokens.append((self._vars[name], self._vars[name].set(value)))
+        try:
+            yield self
+        finally:
+            for var, token in reversed(tokens):
+                var.reset(token)
+            for name, value in reversed(plain_saved):
+                self._plain[name] = value
+
+
 class RuntimeContext:
     """Container for the structured runtime accessors; exposes ``parallel``,
-    ``server_args``, ``flags``, and ``resources``."""
+    ``server_args``, ``flags``, ``resources``, and ``forward``."""
 
-    __slots__ = ("parallel", "_server_args", "flags", "resources")
+    __slots__ = ("parallel", "_server_args", "flags", "resources", "forward")
 
     def __init__(self, parallel: ParallelContext):
         self.parallel = parallel
         self._server_args: ServerArgs | None = None
         self.flags = Flags()
         self.resources = Resources()
+        self.forward = ForwardFlags()
 
     def get_stream(self, name: str) -> Any:
         """Named process-level CUDA side stream: get-or-create, shared by
@@ -439,6 +556,10 @@ def get_resources() -> Resources:
     return _CONTEXT.resources
 
 
+def get_forward() -> ForwardFlags:
+    return _CONTEXT.forward
+
+
 def get_stream(name: str) -> Any:
     return _CONTEXT.get_stream(name)
 
@@ -460,3 +581,4 @@ def reset_context() -> None:
     _CONTEXT._server_args = None
     _CONTEXT.flags = Flags()
     _CONTEXT.resources = Resources()
+    _CONTEXT.forward = ForwardFlags()
