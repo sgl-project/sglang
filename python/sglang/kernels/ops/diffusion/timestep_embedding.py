@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+import math
 from typing import TYPE_CHECKING
 
 import torch
@@ -19,6 +21,34 @@ try:
     _HAS_SGL_KERNEL_JIT = True
 except ImportError:
     _HAS_SGL_KERNEL_JIT = False
+
+
+logger = logging.getLogger(__name__)
+
+
+def _native_timestep_embedding(
+    t: torch.Tensor,
+    dim: int,
+    flip_sin_to_cos: bool,
+    downscale_freq_shift: float,
+    scale: float,
+    max_period: int,
+) -> torch.Tensor:
+    """Generic PyTorch sinusoidal timestep embedding (XPU fallback)."""
+    half_dim = dim // 2
+    exponent = -math.log(max_period) * torch.arange(
+        0, half_dim, dtype=torch.float32, device=t.device
+    )
+    exponent = exponent / (half_dim - downscale_freq_shift)
+    emb = torch.exp(exponent)
+    emb = t.float()[:, None] * emb[None, :]
+    emb = scale * emb
+    emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=-1)
+    if flip_sin_to_cos:
+        emb = torch.cat([emb[:, half_dim:], emb[:, :half_dim]], dim=-1)
+    if dim % 2 == 1:
+        emb = torch.nn.functional.pad(emb, (0, 1, 0, 0))
+    return emb
 
 
 @cache_once
@@ -50,17 +80,24 @@ def timestep_embedding(
     if t.dtype not in (torch.float16, torch.bfloat16, torch.float32):
         t = t.to(dtype)
     
-    # XPU path - delegate to sgl_kernel.jit
+    # XPU path - delegate to sgl_kernel.jit with fallback
     if is_xpu() and t.device.type == "xpu":
         if _HAS_SGL_KERNEL_JIT:
-            return _xpu_timestep_embedding(
-                t, dim, flip_sin_to_cos, downscale_freq_shift, scale, max_period, dtype
-            )
+            try:
+                return _xpu_timestep_embedding(
+                    t, dim, flip_sin_to_cos, downscale_freq_shift, scale, max_period, dtype
+                )
+            except (ValueError, RuntimeError) as e:
+                logger.warning(
+                    f"XPU JIT kernel failed ({e}), falling back to native implementation"
+                )
         else:
-            raise RuntimeError(
-                "XPU JIT kernels require sgl-kernel-xpu to be installed.\n"
-                "Install it with: pip install sgl-kernel-xpu"
-            )
+            logger.debug("sgl-kernel-xpu not installed, using native implementation")
+
+        # Generic PyTorch fallback for XPU
+        return _native_timestep_embedding(
+            t, dim, flip_sin_to_cos, downscale_freq_shift, scale, max_period
+        )
     else:
         # Original CUDA path
         output = torch.empty((t.shape[0], dim), dtype=torch.float32, device=t.device)
