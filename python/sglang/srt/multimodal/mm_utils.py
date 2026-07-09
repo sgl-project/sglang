@@ -40,11 +40,8 @@ import pybase64
 import torch
 from PIL import Image
 
-from sglang.srt.distributed import (
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-)
 from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import flatten_nested_list
 
 
@@ -452,12 +449,12 @@ def run_dp_sharded_vision_model(
     """
 
     num_chunks = image_input.shape[0]
-    mp_world_size = get_tensor_model_parallel_world_size()
+    mp_world_size = get_parallel().tp_size
     num_chunks_per_rank = (num_chunks + mp_world_size - 1) // mp_world_size
     num_padded_chunks = num_chunks_per_rank * mp_world_size - num_chunks
     pad = (0,) * (2 * (image_input.dim() - 1)) + (0, num_padded_chunks)
     image_input_padded = torch.nn.functional.pad(image_input, pad)
-    rank = get_tensor_model_parallel_rank()
+    rank = get_parallel().tp_rank
     image_input_per_rank = image_input_padded[
         rank * num_chunks_per_rank : (rank + 1) * num_chunks_per_rank, ...
     ]
@@ -504,19 +501,13 @@ def run_dp_sharded_mrope_vision_model(
         ```
 
     """
-    from sglang.srt.layers.dp_attention import (
-        get_attention_tp_group,
-        get_attention_tp_rank,
-        get_attention_tp_size,
-    )
-
-    tp_size = get_attention_tp_size()
+    tp_size = get_parallel().attn_tp_size
     if tp_size == 1:
         return vision_model(pixel_values, grid_thw=torch.tensor(grid_thw_list))
 
     # GPU_0 tp_rank_local = 0
     # GPU_1 tp_rank_local = 1
-    tp_rank_local = get_attention_tp_rank()
+    tp_rank_local = get_parallel().attn_tp_rank
 
     # patches_per_image = [1000, 100, 200, 50]
     patches_per_image = [math.prod(grid_thw) for grid_thw in grid_thw_list]
@@ -628,7 +619,7 @@ def run_dp_sharded_mrope_vision_model(
         image_embeds_local_padded = image_embeds_local
 
     # Do all_gather to collect embeddings from all ranks
-    gathered_embeds = get_attention_tp_group().all_gather(
+    gathered_embeds = get_parallel().attn_tp_group.all_gather(
         image_embeds_local_padded, dim=0
     )
 

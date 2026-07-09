@@ -1749,8 +1749,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
     def _update_model_path_info(self, model_path: str, load_format: str):
         self.served_model_name = model_path
-        self.server_args.model_path = model_path
-        self.server_args.load_format = load_format
+        self.server_args.override(
+            "tokenizer.update_weights", model_path=model_path, load_format=load_format
+        )
         self.model_path = model_path
 
     async def _wait_for_model_update_from_disk(
@@ -3153,5 +3154,10 @@ class SignalHandler:
 def stamp_http_worker_ipc(obj: Any, ipc_name: str) -> None:
     if isinstance(obj, BaseReq):
         obj.http_worker_ipc = ipc_name
+    elif isinstance(
+        obj, (BatchTokenizedGenerateReqInput, BatchTokenizedEmbeddingReqInput)
+    ):
+        for req in obj:
+            req.http_worker_ipc = ipc_name
     elif isinstance(obj, BaseBatchReq):
         obj.http_worker_ipcs = [ipc_name] * len(obj.rids)
