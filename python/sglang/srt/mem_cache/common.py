@@ -634,6 +634,8 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
 
 
 def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
+    # the two resources currently have the same lifecycle, thus simplify logic below
+    assert (req.req_pool_idx is None) == (req.kv is None)
     # MambaRadixCache may alloc mamba state before alloc KV cache
     if req.req_pool_idx is None:
         assert (
@@ -656,7 +658,8 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
 
     # StreamingSession.cache_finished_req handles speculative tail trim
     # internally, then sets req_pool_idx = None.
-    if req.req_pool_idx is None:
+    assert (req.req_pool_idx is None) == (req.kv is None)
+    if req.req_pool_idx is None and req.kv is None:
         return
 
     start_p, end_p = effective_kv_committed_len, req.kv.kv_allocated_len
