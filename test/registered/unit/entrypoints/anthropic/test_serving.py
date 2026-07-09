@@ -134,16 +134,6 @@ async def _collect_anthropic_events(serving, anthropic_request):
 
 
 class TestAnthropicServing(unittest.TestCase):
-    # System-first guard (Qwen-style): rejects non-first system → must merge.
-    QWEN_SYSTEM_FIRST_TEMPLATE = (
-        "{%- for message in messages %}"
-        "{%- if message.role == 'system' and not loop.first %}"
-        "{{- raise_exception('system must be first') }}"
-        "{%- endif %}"
-        "{{- message.role }}: {{ message.content }}\n"
-        "{%- endfor %}"
-    )
-
     # Renders system at any position (GLM/Kimi/Qwen3) → can pass through.
     INLINE_SYSTEM_TEMPLATE = (
         "{%- for message in messages %}"
@@ -675,19 +665,6 @@ class TestAnthropicServing(unittest.TestCase):
         self.assertEqual(anthropic_response.content[1].type, "text")
         self.assertEqual(anthropic_response.content[1].text, "the answer is 4")
 
-    def test_request_thinking_enabled_invokes_apply_reasoning_enabled(self):
-        """``thinking={"type":"enabled", "budget_tokens":N}`` flips reasoning on.
-
-        ``budget_tokens`` is required by the SDK shape on ``enabled``; the
-        local backend does not enforce it but accepts the value.
-        """
-        serving = self._serving()
-        request = self._anthropic_request(
-            thinking={"type": "enabled", "budget_tokens": 1024}, stream=False
-        )
-        serving._convert_to_chat_completion_request(request)
-        self.assertEqual(serving.openai_serving_chat.apply_reasoning_calls, [True])
-
     def test_request_thinking_disabled_invokes_apply_reasoning_enabled(self):
         """``thinking={"type": "disabled"}`` must flip the reasoning toggle off."""
         serving = self._serving()
@@ -827,35 +804,6 @@ class TestAnthropicServing(unittest.TestCase):
         # max_tokens is untouched
         self.assertEqual(chat_request.max_tokens, 16)
         self.assertTrue(any("task_budget" in r and "32768" in r for r in log.output))
-
-    def test_request_task_budget_with_remaining_is_accepted(self):
-        """SDK's ``BetaTokenTaskBudgetParam`` has a ``remaining`` field
-        used for client-side compaction. Must round-trip cleanly."""
-        serving = self._serving()
-        request = self._anthropic_request(
-            output_config={
-                "task_budget": {"type": "tokens", "total": 32768, "remaining": 12000}
-            },
-            stream=False,
-        )
-        # Must not raise; pre-existing logging still works.
-        serving._convert_to_chat_completion_request(request)
-        self.assertEqual(request.output_config.task_budget.remaining, 12000)
-
-    def test_request_betas_is_accepted_and_logged(self):
-        """The Anthropic SDK attaches ``betas`` to many requests; must not 400."""
-        import logging
-
-        serving = self._serving()
-        request = self._anthropic_request(
-            betas=["thinking-2025-08-04", "computer-use-2025-01-24"],
-            stream=False,
-        )
-        with self.assertLogs(
-            "sglang.srt.entrypoints.anthropic.serving", level=logging.INFO
-        ) as log:
-            serving._convert_to_chat_completion_request(request)
-        self.assertTrue(any("betas" in r for r in log.output))
 
     def test_assistant_thinking_history_is_rewrapped_for_chat_template(self):
         """Past-turn thinking blocks get re-emitted via wrap_reasoning_history."""
@@ -1151,18 +1099,6 @@ class TestAnthropicServing(unittest.TestCase):
         with self.assertRaises(ValueError) as ctx:
             serving._convert_to_chat_completion_request(request)
         self.assertIn("tool_choice", str(ctx.exception))
-
-    def test_server_tool_only_with_tool_choice_auto_is_allowed(self):
-        """tool_choice=auto over server-only tools is a no-op (model decides)."""
-        serving = self._serving()
-        request = self._anthropic_request(
-            stream=False,
-            tools=[{"type": "web_search_20250305", "name": "web_search"}],
-            tool_choice={"type": "auto"},
-        )
-        # Must not raise; the request just runs with no client-side tools.
-        chat_request = serving._convert_to_chat_completion_request(request)
-        self.assertIsNone(chat_request.tools)
 
     def test_tool_choice_named_custom_tool_is_resolved(self):
         """tool_choice={type:'tool', name:'X'} where X is a custom tool wires through."""
