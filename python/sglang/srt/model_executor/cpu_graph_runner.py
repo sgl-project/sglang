@@ -26,7 +26,6 @@ import psutil
 import torch
 import tqdm
 
-from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import (
@@ -38,6 +37,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.runner_utils.capture_mode import model_capture_mode
+from sglang.srt.runtime_context import get_flags, get_parallel
 from sglang.srt.utils import (
     empty_context,
     log_info_on_rank0,
@@ -534,7 +534,8 @@ def register_fake_ops(tp_size: int):
         cu_seqlens,
         head_first,
         use_qk_l2norm_in_kernel,
-        eps,
+        initial_state_indices,
+        eps=1e-6,
     ):
         output = torch.empty_like(value)
         assert initial_state is not None
@@ -557,7 +558,7 @@ class CPUGraphRunner:
         # bs -> compiled fn (cross-attention / skip_cross_attention=False, enc-dec only)
         self.graphs_cross = {}
         self.output_buffers = {}
-        self.enable_torch_compile = model_runner.server_args.enable_torch_compile
+        self.enable_torch_compile = get_flags().capture.enable_torch_compile
         self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
         self.is_encoder_decoder = model_runner.model_config.is_encoder_decoder
         self.require_gathered_buffer = require_gathered_buffer(model_runner.server_args)
@@ -682,7 +683,7 @@ class CPUGraphRunner:
             return True
         return bool(forward_batch.encoder_lens.max() == 0)
 
-    def can_run(self, forward_batch: ForwardBatch):
+    def can_run_graph(self, forward_batch: ForwardBatch):
         is_bs_supported = (
             forward_batch.batch_size in self.graphs
             if self.disable_padding
@@ -708,11 +709,11 @@ class CPUGraphRunner:
     def capture(self) -> None:
         capture_range = (
             tqdm.tqdm(list(reversed(self.capture_bs)))
-            if get_tensor_model_parallel_rank() == 0
+            if get_parallel().tp_rank == 0
             else reversed(self.capture_bs)
         )
         for bs in capture_range:
-            if get_tensor_model_parallel_rank() == 0:
+            if get_parallel().tp_rank == 0:
                 avail_mem = psutil.virtual_memory().available / (1 << 30)
                 capture_range.set_description(
                     f"Capturing batches ({bs=} {avail_mem=:.2f} GB)"
@@ -952,7 +953,7 @@ class CPUGraphRunner:
         self.model_runner.attn_backend.init_forward_metadata(captured_forward_batch)
         return captured_forward_batch
 
-    def replay(
+    def execute(
         self,
         forward_batch: ForwardBatch,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,

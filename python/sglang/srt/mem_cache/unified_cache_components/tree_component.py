@@ -190,13 +190,6 @@ class TreeComponent(ABC):
         portion: value_slice[dup_start:consumed_from]."""
         return prefix_len
 
-    def should_skip_leaf_creation(
-        self, total_prefix_len: int, key_len: int, params: InsertParams
-    ) -> bool:
-        """Return True to veto leaf creation when the entire new leaf would
-        be a tombstone for this component."""
-        return False
-
     def recover_after_unevict(
         self,
         node: UnifiedTreeNode,
@@ -378,6 +371,11 @@ class TreeComponent(ABC):
         or effective_cache_len <= 0); treat as "no insert happened".
         ``insert_params`` is None only on the disabled path; on early-return
         paths it is still provided so components can free their resources."""
+        pass
+
+    def free_out_of_window_slots(
+        self, req: Req, pre_len: int, insert_params: InsertParams
+    ) -> None:
         pass
 
     # ---- HiCache Hooks ----

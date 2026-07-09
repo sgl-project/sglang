@@ -6,6 +6,7 @@ python3 -m sglang.test.run_eval --port 30000 --eval-name mmlu --num-examples 10
 import argparse
 import json
 import os
+import statistics
 import subprocess
 import time
 import uuid
@@ -85,6 +86,7 @@ def run_eval_once(args, base_url: str, eval_obj: Eval) -> dict:
             **common_kwargs,
             reasoning_effort=getattr(args, "reasoning_effort", None),
             extra_body=extra_body if extra_body else None,
+            record_meta_info=True,
         )
 
     # Run eval
@@ -192,6 +194,30 @@ def _run_sgl_eval(eval_name, args) -> dict:
     print(f"Output throughput: {metrics['output_throughput']:.3f} token/s")
     print(f"sgl-eval metrics: {metrics_files[0]}")
     return metrics
+
+
+def print_accept_length_summary(samplers: list) -> None:
+    accept_lengths = [
+        m["spec_accept_length"]
+        for sampler in samplers
+        for m in getattr(sampler, "_meta_infos", [])
+        if m.get("spec_accept_length") is not None
+    ]
+    print("=" * 20)
+    if not accept_lengths:
+        print(
+            "Speculative decoding: no per-request spec_accept_length in responses "
+            "(non-speculative server, or --api completion which lacks return_meta_info)."
+        )
+    else:
+        print(
+            f"Speculative accept length (per-request, from meta_info): "
+            f"n={len(accept_lengths)} "
+            f"mean={statistics.fmean(accept_lengths):.4f} "
+            f"min={min(accept_lengths):.4f} "
+            f"max={max(accept_lengths):.4f}"
+        )
+    print("=" * 20)
 
 
 def run_eval(args):
@@ -303,6 +329,7 @@ def run_eval(args):
 
     if getattr(args, "repeat", 1) == 1:
         result, latency, sampler = run_eval_once(args, base_url, eval_obj)
+        samplers = [sampler]
         metrics = result.metrics | {"score": result.score}
         metrics["latency"] = latency
         print(f"Total latency: {latency:.3f} s")
@@ -338,9 +365,11 @@ def run_eval(args):
         scores_repeat = []
         latencies = []
         total_completion_tokens = 0
+        samplers = []
 
         for f in futures:
             result, latency, sampler = f.result()
+            samplers.append(sampler)
             scores_repeat.append(result.score)
             latencies.append(latency)
             total_completion_tokens += sum(sampler._completion_tokens)
@@ -374,6 +403,8 @@ def run_eval(args):
         )
 
         executor.shutdown()
+
+    print_accept_length_summary(samplers)
 
     # Dump reports
     file_stem = f"{args.eval_name}_{sampler.model.replace('/', '_')}"

@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.platforms import current_platform
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -24,6 +26,8 @@ from sglang.srt.utils import (
 
 if TYPE_CHECKING:
     from sglang.jit_kernel.rope import FusedSetKVBufferArg  # For type check-only
+
+logger = logging.getLogger(__name__)
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -40,7 +44,25 @@ if _is_cuda:
 
 if _is_npu:
     import torch_npu
-    from sgl_kernel_npu.norm.fused_rope_qk_mqa import fused_rope_qk_mqa
+
+    # `fused_rope_qk_mqa` is an optional fast-path kernel shipped with
+    # `sgl_kernel_npu`. Older NPU CANN / sgl_kernel_npu builds may not include
+    # it. If we let the ImportError propagate, importing this module fails,
+    # which in turn causes `ModelRegistry` to silently skip every model that
+    # depends on it (and fall back to HF Transformers without quantisation
+    # awareness — see PR #22352). We tolerate the missing kernel so model
+    # loading still works; call sites must check for `None` and use the
+    # generic rope path. A warning is emitted so the missing kernel is
+    # visible in logs instead of being silently swallowed.
+    try:
+        from sgl_kernel_npu.norm.fused_rope_qk_mqa import fused_rope_qk_mqa
+    except ImportError:
+        fused_rope_qk_mqa = None
+        logger.warning(
+            "sgl_kernel_npu.norm.fused_rope_qk_mqa is unavailable; "
+            "falling back to the generic rope implementation. Upgrade "
+            "sgl_kernel_npu to enable the fused kernel."
+        )
 
 if _is_hip:
     from sglang.srt.layers.attention.utils import (
@@ -72,8 +94,8 @@ class RotaryEmbedding(MultiPlatformOp):
         self.dtype = dtype
 
         cache = self._compute_cos_sin_cache()
-        # NOTE(ByronHsu): cache needs to be in FP32 for numerical stability
-        if not _is_cuda:
+        # NOTE(ByronHsu): cache needs to be in FP32 for numerical stability.
+        if not (_is_cuda or envs.SGLANG_ROPE_CACHE_FP32.get()):
             cache = cache.to(dtype)
 
         if (
@@ -105,11 +127,12 @@ class RotaryEmbedding(MultiPlatformOp):
         self._apply_rotary_emb_wrapped = apply_rotary_emb
 
         # XXX (MUSA): Implement sgl_kernel.rotary_embedding support for MUSA backend
-        if get_global_server_args().rl_on_policy_target is not None or _is_musa:
+        if get_server_args().rl_on_policy_target is not None or _is_musa:
             self._forward_method = self.forward_native
-            self._apply_rotary_emb_wrapped = torch.compile(dynamic=True)(
-                apply_rotary_emb
-            )
+            self._apply_rotary_emb_wrapped = torch.compile(
+                dynamic=True,
+                disable=_is_npu,
+            )(apply_rotary_emb)
         self.position_cos, self.position_sin = None, None
 
     def _match_cos_sin_cache_dtype(self, query: torch.Tensor) -> None:
@@ -128,7 +151,7 @@ class RotaryEmbedding(MultiPlatformOp):
         # create the cache on GPU for faster initialization. This may cause
         # a slight numerical difference between the HF implementation and ours.
         init_device = (
-            "cpu" if get_global_server_args().rl_on_policy_target is not None else None
+            "cpu" if get_server_args().rl_on_policy_target is not None else None
         )
         inv_freq = 1.0 / (
             base
@@ -139,7 +162,7 @@ class RotaryEmbedding(MultiPlatformOp):
                 / self.rotary_dim
             )
         )
-        if get_global_server_args().rl_on_policy_target is not None:
+        if get_server_args().rl_on_policy_target is not None:
             inv_freq = inv_freq.cuda()
         return inv_freq
 
@@ -156,8 +179,6 @@ class RotaryEmbedding(MultiPlatformOp):
 
     def _ensure_cos_sin_cache_length(self, needed_max_pos: int):
         """Ensure cos_sin_cache length > needed_max_pos."""
-        from sglang.srt.environ import envs
-
         cur_len = int(self.cos_sin_cache.shape[0])
         if needed_max_pos < cur_len:
             return
@@ -272,7 +293,7 @@ class RotaryEmbedding(MultiPlatformOp):
             else:
                 cos_sin = self.cos_sin_cache.index_select(0, positions)
 
-            if query.shape[0] * query.shape[1] < 65535:
+            if fused_rope_qk_mqa is not None and query.shape[0] < 65535:
                 return fused_rope_qk_mqa(
                     query,
                     key,

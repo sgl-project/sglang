@@ -33,7 +33,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import get_current_device_stream_fast, is_cuda, is_hip
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -55,7 +55,7 @@ class WeightsMapper:
     orig_to_new_prefix: WeightsMapping = field(default_factory=dict)
     orig_to_new_suffix: WeightsMapping = field(default_factory=dict)
 
-    def __or__(self, other: "WeightsMapper") -> "WeightsMapper":
+    def __or__(self, other: WeightsMapper) -> WeightsMapper:
         return WeightsMapper(
             orig_to_new_substr={**self.orig_to_new_substr, **other.orig_to_new_substr},
             orig_to_new_prefix={**self.orig_to_new_prefix, **other.orig_to_new_prefix},
@@ -293,7 +293,12 @@ def enable_fused_set_kv_buffer(forward_batch: ForwardBatch):
         and pool.dtype == torch.bfloat16
         and not isinstance(pool, SWAKVPool)
         and not is_prefill_context_parallel_enabled()
-    ) or (_is_hip and not is_prefill_context_parallel_enabled())
+        and getattr(forward_batch, "dcp_kv_mask", None) is None
+    ) or (
+        _is_hip
+        and not is_prefill_context_parallel_enabled()
+        and getattr(forward_batch, "dcp_kv_mask", None) is None
+    )
 
 
 def create_fused_set_kv_buffer_arg(
@@ -429,7 +434,7 @@ def _reshape_for_qk_norm(x: torch.Tensor, head_dim: int) -> torch.Tensor:
 
     if (
         _is_cuda
-        and get_global_server_args().cuda_graph_config.prefill.tc_compiler == "inductor"
+        and get_server_args().cuda_graph_config.prefill.tc_compiler == "inductor"
     ):
         return x.view(*x.shape[:-1], -1, head_dim)
     return x.reshape(-1, head_dim)
@@ -470,7 +475,7 @@ def apply_qk_norm(
         and allow_inplace  # TODO(dark): this can be relaxed if needed
         and (q_eps == k_eps)  # TODO(dark): this can also be relaxed
         and not envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
-        and get_global_server_args().cuda_graph_config.prefill.tc_compiler
+        and get_server_args().cuda_graph_config.prefill.tc_compiler
         != "inductor"  # let inductor fuse QK norm
         and can_use_fused_inplace_qknorm(head_dim, q.dtype)
     ):

@@ -17,6 +17,7 @@ import sys
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
@@ -34,15 +35,10 @@ from sglang.test.kits.attention_unittest.attention_methods.dsv4_attention import
     make_dsv4_cases,
     run_dsv4_attention_case,
     run_dsv4_compress_attention_case,
-    run_dsv4_draft_extend_attention_case,
     run_dsv4_target_verify_attention_case,
 )
 from sglang.test.kits.attention_unittest.runner_modes.cuda_graph_decode_runner import (  # noqa: E402
     run_dsv4_cuda_graph_decode_case,
-)
-from sglang.test.kits.attention_unittest.runner_modes.speculative_draft_extend_runner import (  # noqa: E402
-    run_dsv4_eagle_draft_extend_cuda_graph_case,
-    run_dsv4_eagle_draft_extend_cuda_graph_runner_case,
 )
 from sglang.test.kits.attention_unittest.runner_modes.speculative_draft_runner import (  # noqa: E402
     run_dsv4_eagle_draft_cuda_graph_runner_case,
@@ -187,13 +183,27 @@ class TestDSV4AttentionBackendCorrectness(CustomTestCase):
     )
 
     def test_compress_attention_cases(self):
+        # Pinned to the dense extend path; the sparse prefill path is covered
+        # by test_compress_attention_cases_sparse_prefill below.
         for case in self.COMPRESS_CASES:
             with self.subTest(
                 case=case.name,
                 backend=case.backend,
                 compress_ratio=case.compress_ratio,
             ):
-                run_dsv4_compress_attention_case(self, case)
+                run_dsv4_compress_attention_case(self, case, sparse_prefill=False)
+
+    def test_compress_attention_cases_sparse_prefill(self):
+        # `_forward_prefill_sparse` extend path; decode never reaches it.
+        for case in self.COMPRESS_CASES:
+            if not case.forward_mode.is_extend_without_speculative():
+                continue
+            with self.subTest(
+                case=case.name,
+                backend=case.backend,
+                compress_ratio=case.compress_ratio,
+            ):
+                run_dsv4_compress_attention_case(self, case, sparse_prefill=True)
 
     def test_eagle_target_verify_chain_cases(self):
         for case in self.TARGET_VERIFY_CASES:
@@ -246,48 +256,6 @@ class TestDSV4AttentionBackendCorrectness(CustomTestCase):
             ):
                 run_dsv4_eagle_verify_cuda_graph_case(self, case, topk=1)
 
-    # EAGLE DRAFT_EXTEND is SWA-only for DSV4 (see runner docstring).
-    DRAFT_EXTEND_CASES = (
-        DSV4AttentionCase(
-            name="dsv4_swa_eagle_draft_extend",
-            backend="dsv4",
-            forward_mode=ForwardMode.DRAFT_EXTEND,
-            num_heads=64,
-            page_size=DSV4_PAGE_SIZE,
-            prefix_lens=(64, 96),
-            extend_lens=(2, 4),
-        ),
-    )
-
-    def test_eagle_draft_extend_cases(self):
-        for case in self.DRAFT_EXTEND_CASES:
-            with self.subTest(case=case.name, backend=case.backend):
-                run_dsv4_draft_extend_attention_case(self, case)
-
-    # CUDA-graph capture/replay for EAGLE DRAFT_EXTEND — SWA only
-    # (init_forward_metadata_draft_extend uses need_compress=False; see
-    # `Production-Unsupported` in dsv4/README.md). Uniform `extend_lens`
-    # because DSV4 `forward(compress_ratio=0)` asserts
-    # `swa_page_indices.shape[0] == q.shape[0]` and the graph metadata
-    # builder uses uniform `num_tokens_per_bs = max_num_tokens // max_bs`
-    # (see `deepseek_v4_backend.py:646-647`).
-    EAGLE_DRAFT_EXTEND_CUDA_GRAPH_CASES = (
-        DSV4AttentionCase(
-            name="runner_cuda_graph_dsv4_swa_eagle_draft_extend",
-            backend="dsv4",
-            forward_mode=ForwardMode.DRAFT_EXTEND,
-            num_heads=64,
-            page_size=DSV4_PAGE_SIZE,
-            prefix_lens=(64, 96),
-            extend_lens=(4, 4),
-        ),
-    )
-
-    def test_runner_mode_eagle_draft_extend_cuda_graph_cases(self):
-        for case in self.EAGLE_DRAFT_EXTEND_CUDA_GRAPH_CASES:
-            with self.subTest(case=case.name, backend=case.backend):
-                run_dsv4_eagle_draft_extend_cuda_graph_case(self, case)
-
     # Production EAGLE draft graph runner (chain only, SWA only). The runner
     # routes through `DeepseekV4MultiStepBackend` (one `DeepseekV4AttnBackend`
     # per draft step), captures a fixed batch, and replays distinct request
@@ -309,37 +277,30 @@ class TestDSV4AttentionBackendCorrectness(CustomTestCase):
             with self.subTest(case=case.name, backend=case.backend):
                 run_dsv4_eagle_draft_cuda_graph_runner_case(self, case)
 
-    # Production EAGLE draft-extend graph runner (SWA only). Routes through
-    # the prefill-side `DeepseekV4AttnBackend` (single backend, not
-    # multi-step); `init_forward_metadata_draft_extend` forces
-    # `need_compress=False` so C4/C128 is structurally unreachable for this
-    # path.
-    # Uniform `extend_lens` because the DSV4 graph contract requires
-    # `q.shape[0] == swa_page_indices.shape[0]` and the
-    # `init_forward_metadata_draft_extend` graph path uses
-    # `num_tokens_per_bs = max_num_tokens // max_bs` (see
-    # `deepseek_v4_backend.py:646-647`). Same constraint as the metadata-
-    # style draft_extend CG case.
-    PRODUCTION_EAGLE_DRAFT_EXTEND_RUNNER_CASES = (
-        DSV4AttentionCase(
-            name="runner_production_eagle_draft_extend_dsv4_swa",
-            backend="dsv4",
-            forward_mode=ForwardMode.DRAFT_EXTEND,
-            num_heads=64,
-            page_size=DSV4_PAGE_SIZE,
-            prefix_lens=(64, 96),
-            extend_lens=(4, 4),
-        ),
-    )
-
-    def test_runner_mode_production_eagle_draft_extend_cuda_graph_runner_cases(self):
-        for case in self.PRODUCTION_EAGLE_DRAFT_EXTEND_RUNNER_CASES:
-            with self.subTest(case=case.name, backend=case.backend):
-                run_dsv4_eagle_draft_extend_cuda_graph_runner_case(self, case)
-
 
 class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
     """CPU-only checks for the DSV4 BCG metadata replay contract."""
+
+    @staticmethod
+    def _make_sparse_prefill_cache(max_seq_len):
+        from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
+            SparsePrefillChunkCache,
+        )
+
+        int32 = dict(dtype=torch.int32)
+        return SparsePrefillChunkCache(
+            num_reqs=2,
+            num_qo_tokens=2,
+            max_seq_len=max_seq_len,
+            swa_window_size=128,
+            swa_page_size=128,
+            seq_lens=torch.tensor([max_seq_len, max_seq_len], **int32),
+            query_start_loc=torch.tensor([0, 1, 2], **int32),
+            swa_token_ids=torch.empty(0, **int32),
+            swa_first_pos=torch.zeros(2, **int32),
+            swa_gather_lens=torch.zeros(2, **int32),
+            swa_offsets=torch.zeros(3, **int32),
+        )
 
     def _make_core_metadata(self, base: int):
         from sglang.srt.layers.attention.deepseek_v4_backend import DSV4AttnMetadata
@@ -401,8 +362,6 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
         sa = ServerArgs(model_path="dummy")
         self.assertNotEqual(sa.cuda_graph_backend_decode, "breakable")
         self.assertNotEqual(sa.cuda_graph_backend_prefill, "breakable")
-        self.assertNotEqual(sa.decode_cuda_graph_backend, "breakable")
-        self.assertNotEqual(sa.prefill_cuda_graph_backend, "breakable")
         self.assertFalse(
             AttentionBackend.use_captured_forward_metadata_for_breakable_cuda_graph
         )
@@ -477,6 +436,7 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
         capture_metadata = DSV4Metadata(
             self._make_core_metadata(0), indexer_metadata=None
         )
+        capture_metadata.sparse_prefill_cache = object()
         replay_metadata = DSV4Metadata(
             self._make_core_metadata(1000), indexer_metadata=None
         )
@@ -504,12 +464,67 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
         self.assertEqual(calls[0][1], backend.MAX_SEQ_LEN_FOR_CAPTURE)
         self.assertTrue(calls[0][2])
         self.assertIs(backend.forward_metadata, capture_metadata)
+        self.assertIsNone(capture_metadata.sparse_prefill_cache)
         self.assertTrue(
             torch.equal(
                 capture_metadata.core_attn_metadata.seq_lens_casual,
                 replay_metadata.core_attn_metadata.seq_lens_casual,
             )
         )
+
+    def test_sparse_prefill_workspace_reuses_and_grows(self):
+        from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
+            SparsePrefillWorkspace,
+        )
+
+        workspace = SparsePrefillWorkspace(torch.device("cpu"))
+        first = workspace.get(3)
+        reused = workspace.get(2)
+        grown = workspace.get(7)
+
+        self.assertEqual(first.shape, (3, 1, 512))
+        self.assertEqual(reused.data_ptr(), first.data_ptr())
+        self.assertEqual(grown.shape, (7, 1, 512))
+        self.assertNotEqual(grown.data_ptr(), first.data_ptr())
+        self.assertEqual(workspace._buffer.data_ptr(), grown.data_ptr())
+
+    def test_sparse_prefill_c4_uses_live_extent(self):
+        page_table = torch.zeros((2, 4096), dtype=torch.int32)
+        for max_seq_len in (3, 4, 255, 256, 259, 260):
+            with self.subTest(max_seq_len=max_seq_len):
+                cache = self._make_sparse_prefill_cache(max_seq_len)
+                cache.ensure_c4(page_table, c4_page_size=64)
+                expected_extent = max(max_seq_len // 4, 1)
+                self.assertEqual(cache.c4_flat_token_ids.numel(), 2 * expected_extent)
+                self.assertEqual(
+                    cache.c4_compressed_base.tolist(), [0, expected_extent]
+                )
+
+    def test_sparse_prefill_c128_uses_live_extent(self):
+        from sglang.srt.layers.attention.dsv4 import sparse_prefill_utils
+
+        page_indices = torch.full((2, 8192), -1, dtype=torch.int32)
+        for max_seq_len in (127, 128, 255, 256):
+            with self.subTest(max_seq_len=max_seq_len):
+                cache = self._make_sparse_prefill_cache(max_seq_len)
+                expected_extent = max(max_seq_len // 128, 1)
+                combined = (
+                    torch.empty((2, 256), dtype=torch.int32),
+                    torch.empty(2, dtype=torch.int32),
+                )
+                with mock.patch.object(
+                    sparse_prefill_utils,
+                    "combine_topk_swa_indices",
+                    return_value=combined,
+                ) as combine:
+                    cache.ensure_c128(page_indices)
+
+                self.assertEqual(cache.c128_flat_token_ids.numel(), 2 * expected_extent)
+                self.assertEqual(combine.call_args.kwargs["topk"], expected_extent)
+                self.assertEqual(
+                    combine.call_args.kwargs["topk_indices"].shape,
+                    (2, expected_extent),
+                )
 
 
 class TestDSV4SwaOutCacheLocResolution(CustomTestCase):

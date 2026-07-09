@@ -5,7 +5,7 @@ import triton
 import triton.language as tl
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["bs", "c128_cur_max_seq_len"])
 def _init_compressed_attn_metadata_kernel(
     seq_lens_ptr,
     positions_ptr,
@@ -22,8 +22,7 @@ def _init_compressed_attn_metadata_kernel(
     c128_page_indices_ptr,
     bs,
     max_pages,
-    page_size: tl.constexpr,
-    c128_max_seq_len: tl.constexpr,
+    c128_cur_max_seq_len,
     c128_page_size: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     COMPUTE_PAGE_INDICES: tl.constexpr,
@@ -59,10 +58,10 @@ def _init_compressed_attn_metadata_kernel(
     tl.store(c128_seq_lens_clamp1_ptr + batch_id, c128_seq_lens_clamp1)
 
     if COMPUTE_PAGE_INDICES:
-        page_indices_base = batch_id * c128_max_seq_len
-        for block_start in range(0, c128_max_seq_len, BLOCK_SIZE):
+        page_indices_base = batch_id * c128_cur_max_seq_len
+        for block_start in tl.range(0, c128_cur_max_seq_len, BLOCK_SIZE):
             offsets = block_start + tl.arange(0, BLOCK_SIZE)
-            mask = offsets < c128_max_seq_len
+            mask = offsets < c128_cur_max_seq_len
 
             page_idx = offsets // c128_page_size
             offset_in_page = offsets % c128_page_size
@@ -107,12 +106,12 @@ def _init_compressed_attn_metadata_triton(
     bs = seq_lens.shape[0]
     device = seq_lens.device
 
-    c4_out_loc = torch.empty(bs, dtype=torch.int32, device=device)
+    c4_out_loc = torch.empty(bs, dtype=torch.int64, device=device)
     c4_positions = torch.empty(bs, dtype=torch.int32, device=device)
     c4_seq_lens_raw = torch.empty(bs, dtype=torch.int32, device=device)
     c4_seq_lens_clamp1 = torch.empty(bs, dtype=torch.int32, device=device)
 
-    c128_out_loc = torch.empty(bs, dtype=torch.int32, device=device)
+    c128_out_loc = torch.empty(bs, dtype=torch.int64, device=device)
     c128_positions = torch.empty(bs, dtype=torch.int32, device=device)
     c128_seq_lens_raw = torch.empty(bs, dtype=torch.int32, device=device)
     c128_seq_lens_clamp1 = torch.empty(bs, dtype=torch.int32, device=device)
@@ -121,18 +120,20 @@ def _init_compressed_attn_metadata_triton(
         assert (
             page_table is not None
         ), "page_table required when compute_page_indices=True"
-        assert page_size > 0, "page_size required when compute_page_indices=True"
+        assert (
+            page_size >= 128 and page_size % 128 == 0
+        ), "page_size must be a multiple of 128 when compute_page_indices=True"
         max_pages = page_table.shape[1]
         c128_page_size = page_size // 128
-        c128_max_seq_len = c128_page_size * max_pages
+        c128_cur_max_seq_len = c128_page_size * max_pages
         c128_page_indices = torch.empty(
-            bs, c128_max_seq_len, dtype=torch.int32, device=device
+            bs, c128_cur_max_seq_len, dtype=torch.int32, device=device
         )
         BLOCK_SIZE = triton.next_power_of_2(max(c128_page_size, 64))
     else:
         max_pages = 0
         c128_page_size = 1
-        c128_max_seq_len = 0
+        c128_cur_max_seq_len = 0
         c128_page_indices = None
         BLOCK_SIZE = 64
         if page_table is None:
@@ -159,8 +160,7 @@ def _init_compressed_attn_metadata_triton(
         ),
         bs,
         max_pages,
-        page_size if page_size > 0 else 128,
-        c128_max_seq_len,
+        c128_cur_max_seq_len,
         c128_page_size,
         BLOCK_SIZE,
         compute_page_indices,

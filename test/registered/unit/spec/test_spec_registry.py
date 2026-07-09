@@ -1,8 +1,10 @@
 """Unit tests for the speculative algorithm plugin registry."""
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_registry import (
     _REGISTRY,
@@ -162,16 +164,22 @@ class TestCustomSpecAlgoInterface(_RegistryIsolated):
         self.assertEqual(self.algo.is_some(), not self.algo.is_none())
         self.assertEqual(SpeculativeAlgorithm.EAGLE.is_some(), self.algo.is_some())
 
-    def test_supports_spec_v2_follows_supports_overlap(self):
-        # Plugin registered with supports_overlap=False -> not spec_v2.
-        self.assertFalse(self.algo.supports_spec_v2())
+    def test_supports_overlap_false_warns_deprecation(self):
+        # supports_overlap=False plugins run the V2 schema synchronously; the
+        # removed V1 path is surfaced as a deprecation warning at create time.
+        server_args = MagicMock()
+        server_args.disable_overlap_schedule = True
+        with self.assertLogs("sglang.srt.speculative.spec_registry", "WARNING") as logs:
+            self.algo.create_worker(server_args)
+        self.assertTrue(any("deprecated" in line for line in logs.output))
 
         @SpeculativeAlgorithm.register("MY_V2", supports_overlap=True)
         def _factory(server_args):
             return MagicMock
 
         v2 = SpeculativeAlgorithm.from_string("MY_V2")
-        self.assertTrue(v2.supports_spec_v2())
+        server_args.disable_overlap_schedule = False
+        self.assertIs(v2.create_worker(server_args), MagicMock)
 
     def test_create_worker_calls_factory(self):
         server_args = MagicMock()
@@ -199,6 +207,39 @@ class TestValidatorHook(_RegistryIsolated):
         # Callers (e.g. ServerArgs.__post_init__) must invoke the hook themselves;
         # CustomSpecAlgo does not call it from create_worker.
         validator.assert_not_called()
+
+
+class TestServerArgsHook(_RegistryIsolated):
+    def test_handle_speculative_decoding_invokes_custom_handle_server_args(self):
+        class CustomHandleServerArgs(CustomSpecAlgo):
+            def handle_server_args(self, server_args):
+                server_args.custom_spec_handle_seen = self.name
+                server_args.speculative_num_draft_tokens = 7
+
+        @SpeculativeAlgorithm.register(
+            "MY_HANDLE_ARGS", supports_overlap=True, spec_class=CustomHandleServerArgs
+        )
+        def _factory(server_args):
+            return MagicMock
+
+        server_args = SimpleNamespace(
+            speculative_draft_model_path=None,
+            speculative_draft_model_revision=None,
+            speculative_moe_runner_backend=None,
+            moe_runner_backend="auto",
+            speculative_algorithm="my_handle_args",
+            decrypted_draft_config_file=None,
+            trust_remote_code=False,
+            speculative_draft_window_size=None,
+            speculative_skip_dp_mlp_sync=False,
+            speculative_adaptive=False,
+        )
+
+        handle_speculative_decoding(server_args)
+
+        self.assertEqual(server_args.speculative_algorithm, "MY_HANDLE_ARGS")
+        self.assertEqual(server_args.custom_spec_handle_seen, "MY_HANDLE_ARGS")
+        self.assertEqual(server_args.speculative_num_draft_tokens, 7)
 
 
 class TestSubclassOverride(_RegistryIsolated):
