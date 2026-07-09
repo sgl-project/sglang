@@ -1,0 +1,68 @@
+{
+  "metadata": {
+    "model_path": "fixture-model",
+    "dataset_name": "fixture/source-trajectories",
+    "split": "train",
+    "only_resolved": false,
+    "padded": true,
+    "pad_source": "random",
+    "pad_dataset_name": null,
+    "first_turn_length": 32,
+    "subsequent_turn_length": 8,
+    "num_turns": 3,
+    "num_conversations": 3
+  },
+  "conversations": [
+    [
+      {
+        "messages": [
+          {"role": "system", "content": "fixture pad alpha alpha alpha alpha alpha alpha alpha"},
+          {"role": "user", "content": "fix the failing login test in repo one"}
+        ],
+        "prompt_tokens": 40
+      },
+      {
+        "messages": [{"role": "user", "content": "test still fails see log"}],
+        "prompt_tokens": 268
+      },
+      {
+        "messages": [{"role": "user", "content": "apply the patch and rerun"}],
+        "prompt_tokens": 496
+      }
+    ],
+    [
+      {
+        "messages": [
+          {"role": "system", "content": "fixture pad bravo bravo bravo bravo bravo bravo bravo"},
+          {"role": "user", "content": "resolve the import error in repo two"}
+        ],
+        "prompt_tokens": 41
+      },
+      {
+        "messages": [{"role": "user", "content": "traceback points to utils"}],
+        "prompt_tokens": 269
+      },
+      {
+        "messages": [{"role": "user", "content": "lint is clean now merge"}],
+        "prompt_tokens": 497
+      }
+    ],
+    [
+      {
+        "messages": [
+          {"role": "system", "content": "fixture pad charlie charlie charlie charlie charlie charlie"},
+          {"role": "user", "content": "update the schema migration in repo three"}
+        ],
+        "prompt_tokens": 42
+      },
+      {
+        "messages": [{"role": "user", "content": "migration ran on staging"}],
+        "prompt_tokens": 270
+      },
+      {
+        "messages": [{"role": "user", "content": "ship it to production"}],
+        "prompt_tokens": 498
+      }
+    ]
+  ]
+}
