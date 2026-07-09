@@ -34,7 +34,7 @@ from sglang.kernels.ops.speculative.cache_locs import (
     get_target_cache_loc as get_target_cache_loc,
 )
 from sglang.kernels.ops.speculative.eagle import (
-    fill_accept_out_cache_loc as fill_accept_out_cache_loc,
+    fill_accept_out_cache_loc_func as fill_accept_out_cache_loc_func,
 )
 from sglang.srt.distributed.parallel_state import (
     GroupCoordinator,
