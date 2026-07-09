@@ -17,7 +17,7 @@
 
 ### Method
 
-Weaver has 56.7M trainable parameters. At inference time, DFlash produces future-state lookaheads in one forward pass; Weaver conditions on the realized draft tokens and scores only the top-512 marginal candidates instead of projecting over the full vocabulary.
+Weaver has 56.7M trainable parameters. At inference time, DFlash produces future-token marginals in one forward pass; Weaver conditions on the realized draft tokens, predicts residual logits over the top-512 DFlash candidates, and avoids a full-vocabulary projection.
 
 <p align="center">
   <img src="assets/tfm-architecture.png" alt="DFlash-TfM uses DFlash marginals in parallel, then conditions tree proposals autoregressively with Weaver." width="760">
@@ -39,17 +39,33 @@ Throughput is computed as total generated tokens divided by wall-clock runtime, 
   <img src="assets/tfm-results-table.png" alt="Full DFlash-TfM table with speedup and accepted-token statistics across sampling and reasoning settings." width="900">
 </p>
 
-DFlash-TfM with Weaver is the fastest configuration on every task in this sweep. The gap comes from acceptance: Weaver's trees lengthen the mean accepted draft by 77% relative to the chain DFlash baseline and by 32% relative to DDTree at the same tree size.
+DFlash-TfM with Weaver is the fastest configuration on every task in this sweep. The gap comes from acceptance length: Weaver's trees increase the mean acceptance length by 77% relative to the chain DFlash baseline and by 32% relative to DDTree at the same tree size.
 
 ### Reproducing the headline number
 
-To run it, you also need:
+You will need:
 
 - the Qwen3.6-27B target model;
-- the Qwen3.6-27B DFlash drafter;
-- the Qwen3.6-27B [Weaver checkpoint](https://huggingface.co/trymirai/);
+- the Qwen3.6-27B DFlash drafter; and
+- the Qwen3.6-27B [Weaver checkpoint](https://huggingface.co/trymirai/weaver).
 
-> See [`reproduction.sh`](./reproduction.sh) for the pinned reproduction commands.
+#### Quick reproduction
+
+The pinned script uses the release container, fetches and verifies the Weaver checkpoint, launches DFlash-TfM, and runs the headline benchmark pass:
+
+```bash
+git clone https://github.com/trymirai/sglang
+cd sglang
+./reproduction.sh serve-tfm
+```
+
+In a second terminal, once the server is ready:
+
+```bash
+./reproduction.sh bench
+```
+
+The detailed steps below expand the same commands with artifact revisions, baseline servers, and measurement settings.
 
 #### 1. Install the SGLang fork
 
@@ -83,7 +99,7 @@ python3 -m pip install -U pip
 python3 -m pip install -e "python[all]"
 ```
 
-The source build path expects Python 3.11, the CUDA 13 runtime expected by the package, `torch==2.11.0`, FlashInfer `0.6.12`, and the TensorRT-LLM / FA4 kernels installed by the tagged SGLang package.
+The source build path expects Python 3.11, the CUDA 13 runtime used by the package, `torch==2.11.0`, FlashInfer `0.6.12`, and the TensorRT-LLM / FA4 kernels installed by the tagged SGLang package.
 
 #### 2. Select the model artifacts
 
@@ -102,7 +118,7 @@ hf download trymirai/weaver \
 ```
 
 - The DFlash drafter checkpoint is `model.safetensors` from `z-lab/Qwen3.6-27B-DFlash` at revision `0919688658996800f86b895034249700e9481106`. Its SHA-256 is `e0c050b34798d32728a164d2c3f1681746ff85c11945701b0205b654e2f1fdbe`.
-- The Weaver checkpoint is the `weaver/qwen36_27b_weaver.pth` file in this repository at the same release tag. Its SHA-256 is `71f540b143fb6bab14ba724c20e97a72ce198de103cfd228d31c3ce339227833`.
+- The Weaver checkpoint is the `weaver/qwen36_27b_weaver.pth` file in `trymirai/weaver` at the pinned revision. Its SHA-256 is `71f540b143fb6bab14ba724c20e97a72ce198de103cfd228d31c3ce339227833`.
 
 #### 3. Launch the three serving configurations
 
@@ -133,7 +149,7 @@ python3 -m sglang.launch_server \
 
 **DFlash baseline:**
 
-> Note: DFlash uses `--attention-backend trtllm_mha` rather than split decode/prefill backends, because, in our experiments, the FlashInfer prefill reduced the DFlash acceptance length. This configuration gave the best DFlash tokens/step and throughput.
+> Note: DFlash uses `--attention-backend trtllm_mha` rather than split decode/prefill backends; in our experiments, FlashInfer prefill reduced the DFlash acceptance length. This configuration gave the best DFlash tokens/step and throughput.
 
 ```bash
 python3 -m sglang.launch_server \
