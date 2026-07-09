@@ -1920,7 +1920,11 @@ class MooncakeKVReceiver(CommonKVReceiver):
                             else b""
                         ),
                         str(self.required_dst_info_num).encode("ascii"),
-                        str(decode_prefix_len or 0).encode("ascii"),
+                        (
+                            str(decode_prefix_len).encode("ascii")
+                            if not is_dummy and decode_prefix_len is not None
+                            else b""
+                        ),
                     ]
                 )
         self.init_time = time.time()
