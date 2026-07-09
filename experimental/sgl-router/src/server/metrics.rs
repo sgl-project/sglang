@@ -23,6 +23,7 @@
 //! | `sgl_router_stream_outcome_total` | Counter | `worker_url`, `model_id`, `outcome` |
 //! | `sgl_router_request_duration_seconds` | Histogram | `model_id` |
 //! | `sgl_router_ttft_seconds` | Histogram | `model_id` |
+//! | `sgl_router_ttft_overhead_seconds` | Histogram | `model_id` |
 //! | `sgl_router_itl_seconds` | Histogram | `model_id` |
 //! | `sgl_router_responses_total` | Counter | `route`, `method`, `status_code` |
 //! | `sgl_router_overlap_blocks` | Histogram | `model_id` |
@@ -120,6 +121,22 @@ const ITL_BUCKETS: &[f64] = &[
 /// request-duration ladder (capped at 30 s) would dump those into `+Inf`,
 /// hiding them from `histogram_quantile`.
 const ADMISSION_WAIT_BUCKETS: &[f64] = &[
+    0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0,
+];
+
+/// Histogram bucket upper bounds (seconds) for
+/// `sgl_router_ttft_overhead_seconds` — the router's pre-dispatch, self-
+/// attributable share of TTFT (tokenize + admission wait + request build,
+/// measured before the request is sent to the engine).
+///
+/// The range currently mirrors [`ADMISSION_WAIT_BUCKETS`] (1 ms → 120 s):
+/// admission wait is the dominant term of this overhead and can park for a
+/// long time under sustained saturation, so a shorter ladder would dump the
+/// saturated tail into `+Inf` and hide it from `histogram_quantile`. Kept as a
+/// separate named const (not an alias) so the two grids can diverge later
+/// without silently coupling admission-wait tuning to overhead tuning — no
+/// check enforces the equality, so treat the shared range as incidental.
+const TTFT_OVERHEAD_BUCKETS: &[f64] = &[
     0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0,
 ];
 
@@ -319,6 +336,12 @@ pub struct MetricsRegistry {
     // on `worker_requests_total` / the worker gauges instead.
     request_duration: Mutex<HashMap<String, Histogram>>,
     ttft_seconds: Mutex<HashMap<String, Histogram>>,
+    /// Pre-dispatch router overhead (tokenize + admission wait + build), per
+    /// model — the router-attributable component of TTFT, a sub-term of
+    /// `ttft_seconds`. Recorded on the streaming-2xx path, at response-headers
+    /// time; see [`Self::observe_ttft_overhead`] for how its sample set relates
+    /// to `ttft_seconds`.
+    ttft_overhead_seconds: Mutex<HashMap<String, Histogram>>,
     itl_seconds: Mutex<HashMap<String, Histogram>>,
     // Edge responses by route/method/status (incl. early-exit 400/413/503 and the
     // CatchPanicLayer-synthesized 500).
@@ -380,6 +403,7 @@ impl Default for MetricsRegistry {
             stream_outcome_total: Default::default(),
             request_duration: Default::default(),
             ttft_seconds: Default::default(),
+            ttft_overhead_seconds: Default::default(),
             itl_seconds: Default::default(),
             responses_total: Default::default(),
             overlap_blocks: Default::default(),
@@ -596,6 +620,36 @@ impl MetricsRegistry {
         let hist = guard
             .entry(model_id.to_owned())
             .or_insert_with(|| Histogram::new(TTFT_BUCKETS));
+        hist.observe(seconds);
+    }
+
+    /// Observe the router's pre-dispatch TTFT overhead (seconds) for
+    /// `sgl_router_ttft_overhead_seconds` — the interval from request receipt
+    /// to just before the request is dispatched to the engine (tokenize +
+    /// admission wait + request build). This is the router-attributable share
+    /// of TTFT and a sub-term of `sgl_router_ttft_seconds`: `overhead +
+    /// dispatch-to-first-byte ≈ ttft`. Connect + request-send are NOT included
+    /// here (they fall in the dispatch-to-first-byte remainder); the full span
+    /// is exposed separately on the `Server-Timing: router.ttfb` response
+    /// header.
+    ///
+    /// Recorded on the streaming-2xx path like `observe_ttft`, but at
+    /// response-headers time rather than from the SSE pump's first-chunk hook.
+    /// Its sample set is therefore a SUPERSET of `ttft_seconds`: a 2xx stream
+    /// that returns headers but yields no first chunk (engine closes early,
+    /// transport error, client disconnect before the first token) records
+    /// overhead but not ttft. Treat `overhead_count ≥ ttft_count`, not equal —
+    /// the gap is the count of first-byteless 2xx streams. Uses
+    /// [`TTFT_OVERHEAD_BUCKETS`].
+    pub fn observe_ttft_overhead(&self, model_id: &str, seconds: f64) {
+        // See `observe_request_duration` — drop non-finite before the map.
+        if !seconds.is_finite() {
+            return;
+        }
+        let mut guard = self.ttft_overhead_seconds.lock();
+        let hist = guard
+            .entry(model_id.to_owned())
+            .or_insert_with(|| Histogram::new(TTFT_OVERHEAD_BUCKETS));
         hist.observe(seconds);
     }
 
@@ -956,6 +1010,26 @@ impl MetricsRegistry {
             let hist = guard.get(model_id).unwrap();
             let label_body = format!("model_id=\"{}\"", escape_label(model_id));
             render_histogram(&mut out, "sgl_router_ttft_seconds", &label_body, hist);
+        }
+        drop(guard);
+
+        // ttft_overhead histogram
+        out.push_str(
+            "# HELP sgl_router_ttft_overhead_seconds Router-internal time-to-first-token overhead (tokenize + admission wait + request build) before dispatch to the engine, in seconds; the router-attributable component of TTFT.\n",
+        );
+        out.push_str("# TYPE sgl_router_ttft_overhead_seconds histogram\n");
+        let guard = self.ttft_overhead_seconds.lock();
+        let mut models: Vec<&String> = guard.keys().collect();
+        models.sort();
+        for model_id in models {
+            let hist = guard.get(model_id).unwrap();
+            let label_body = format!("model_id=\"{}\"", escape_label(model_id));
+            render_histogram(
+                &mut out,
+                "sgl_router_ttft_overhead_seconds",
+                &label_body,
+                hist,
+            );
         }
         drop(guard);
 
@@ -1617,6 +1691,31 @@ mod tests {
         );
         // le=0.2 (an engine-aligned edge) is cumulative over both observations.
         assert!(out.contains(r#"sgl_router_ttft_seconds_bucket{model_id="tiny",le="0.2"} 2"#));
+    }
+
+    #[test]
+    fn observe_ttft_overhead_writes_buckets_sum_and_count() {
+        let reg = MetricsRegistry::new();
+        reg.observe_ttft_overhead("tiny", 0.04);
+        reg.observe_ttft_overhead("tiny", 0.2);
+        let out = reg.render();
+        assert!(
+            out.contains("# TYPE sgl_router_ttft_overhead_seconds histogram"),
+            "expected overhead TYPE header; got:\n{out}",
+        );
+        assert!(
+            out.contains(r#"sgl_router_ttft_overhead_seconds_count{model_id="tiny"} 2"#),
+            "expected overhead count=2; got:\n{out}",
+        );
+        // 0.04 <= 0.05, so the le=0.05 bucket is 1 (cumulative); 0.2 exceeds it.
+        assert!(
+            out.contains(r#"sgl_router_ttft_overhead_seconds_bucket{model_id="tiny",le="0.05"} 1"#),
+            "expected le=0.05 bucket = 1; got:\n{out}",
+        );
+        // le=0.25 is cumulative over both observations.
+        assert!(
+            out.contains(r#"sgl_router_ttft_overhead_seconds_bucket{model_id="tiny",le="0.25"} 2"#)
+        );
     }
 
     #[test]

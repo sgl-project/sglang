@@ -60,6 +60,17 @@ const PHASE_LOG_SAMPLE: u64 = 64;
 /// stays grouped.
 const X_SGL_DECODE_URL: HeaderName = HeaderName::from_static("x-sgl-decode-url");
 
+/// `Server-Timing` response header. On streaming 2xx responses the router
+/// attaches a single `router.ttfb;dur=<ms>` metric: the router's
+/// ingress → upstream-response-headers span (`at_post_dispatch`). This is the
+/// whole span the router synchronously owns before the SSE pump takes over, so
+/// a downstream hop that also measures the engine's own generation latency can
+/// separate router-incurred time from engine-incurred time on a per-request
+/// basis (something aggregate histograms can't do per-request). It is a
+/// response header, so it must be readable at header-flush time — hence
+/// to-headers rather than to-first-token (the first token has not arrived yet).
+const SERVER_TIMING: HeaderName = HeaderName::from_static("server-timing");
+
 /// Coarse char-count → token-count divisor used to estimate prefill load
 /// from the request body when no real tokenizer count is available. Four
 /// bytes per token is the standard SGLang upstream estimate; it
@@ -1048,6 +1059,40 @@ async fn chat_completions_inner(
         // middleware records those as pre-routing rejections (empty worker_url).
         (Err(e), _) => e.into_response(),
     };
+    // Router TTFT observability — streaming responses that reached a worker and
+    // got 2xx headers. Gated on `streaming` because on a non-streaming response
+    // "time to first byte" is just total latency (there is no first token to be
+    // early for); on `is_success()` to exclude forwarded engine errors. Two
+    // artifacts, both from timestamps already taken above:
+    //   - `sgl_router_ttft_overhead_seconds` = `at_post_build` = the router's
+    //     pre-dispatch, self-attributable share of TTFT (tokenize + admission
+    //     wait + build), a sub-term of `ttft`, retry-independent. Recorded here
+    //     at headers time, so its sample set is a SUPERSET of `ttft_seconds`
+    //     (which additionally needs the first chunk to arrive from the SSE
+    //     pump); the two diverge only for a 2xx stream that yields no first
+    //     byte.
+    //   - `Server-Timing: router.ttfb;dur=<ms>` = `at_post_dispatch` = the full
+    //     ingress → upstream-headers span (see `SERVER_TIMING`). Carries the
+    //     whole span, not the pre-dispatch subset, so a downstream hop can do
+    //     its own per-request router-vs-engine split.
+    if streaming && response.status().is_success() {
+        ctx.metrics
+            .observe_ttft_overhead(&log_ctx.model_id, at_post_build.as_secs_f64());
+        let ttfb_ms = at_post_dispatch.as_secs_f64() * 1000.0;
+        match HeaderValue::from_str(&format!("router.ttfb;dur={ttfb_ms:.1}")) {
+            // `append`, not `insert`: `Server-Timing` is a list-valued header,
+            // so we add our metric without clobbering any the upstream set.
+            Ok(v) => {
+                response.headers_mut().append(SERVER_TIMING, v);
+            }
+            // Fully controlled ASCII value — unreachable in practice; log
+            // rather than silently drop so a future format change is visible.
+            Err(e) => {
+                tracing::warn!(error = %e, "Server-Timing router.ttfb header rejected by parser; omitting");
+            }
+        }
+    }
+
     // Tag the routed response so the middleware records its per-worker labels
     // and logs it with the worker/model it was dispatched to.
     response.extensions_mut().insert(log_ctx);

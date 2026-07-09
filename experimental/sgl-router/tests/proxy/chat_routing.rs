@@ -108,7 +108,7 @@ async fn await_metrics_containing(ctx: &Arc<AppContext>, needle: &str) -> String
 async fn non_streaming_returns_200() {
     let worker = crate::common::mock_worker::MockWorker::start(vec![]).await;
     let ctx = build_ctx_with_worker(&worker.url);
-    let app = build_router(ctx);
+    let app = build_router(ctx.clone());
 
     let req = Request::builder()
         .method("POST")
@@ -125,9 +125,22 @@ async fn non_streaming_returns_200() {
         .unwrap();
     let res = app.oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
+    // Non-streaming 2xx: neither the `router.ttfb` header nor the overhead
+    // metric applies — there is no first token to be early for, so the whole
+    // TTFT family is streaming-gated.
+    assert!(
+        res.headers().get("server-timing").is_none(),
+        "non-streaming responses must not carry a router.ttfb Server-Timing header",
+    );
     let bytes = res.into_body().collect().await.unwrap().to_bytes();
     let v: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(v["choices"][0]["message"]["content"], "ok");
+    assert!(
+        !ctx.metrics
+            .render()
+            .contains("sgl_router_ttft_overhead_seconds_count{"),
+        "overhead metric must not be recorded for a non-streaming request",
+    );
 }
 
 #[tokio::test]
@@ -287,6 +300,127 @@ async fn streaming_2xx_request_records_ttft_and_duration() {
     assert!(
         m.contains(r#"sgl_router_request_duration_seconds_count{model_id="tiny"} 1"#),
         "request_duration must be recorded at stream completion; got:\n{m}",
+    );
+}
+
+/// A 2xx streaming response carries `Server-Timing: router.ttfb;dur=<ms>` — the
+/// router's ingress → upstream-response-headers span. Locks the header name and
+/// `router.ttfb;dur=<ms>` format so a rename/format change fails loudly.
+#[tokio::test]
+async fn streaming_2xx_request_sets_server_timing_router_ttfb_header() {
+    let chunks: Vec<&'static str> = vec![
+        "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+        "data: [DONE]\n\n",
+    ];
+    let worker = crate::common::mock_worker::MockWorker::start(chunks).await;
+    let ctx = build_ctx_with_worker(&worker.url);
+    let app = build_router(ctx);
+
+    let res = app.oneshot(streaming_chat_request()).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let server_timing = res
+        .headers()
+        .get("server-timing")
+        .expect("2xx streaming response must carry a Server-Timing header")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    // Exactly `router.ttfb;dur=<ms>` with a parseable, non-negative duration.
+    let dur = server_timing
+        .strip_prefix("router.ttfb;dur=")
+        .unwrap_or_else(|| {
+            panic!("Server-Timing must be `router.ttfb;dur=<ms>`; got: {server_timing}")
+        });
+    let ms: f64 = dur
+        .parse()
+        .unwrap_or_else(|_| panic!("router.ttfb dur must be numeric; got: {server_timing}"));
+    assert!(
+        ms >= 0.0,
+        "router.ttfb dur must be non-negative; got: {server_timing}"
+    );
+
+    // Drain so the spawned pump task completes before the worker is dropped.
+    let _ = res.into_body().collect().await.unwrap().to_bytes();
+}
+
+/// The handler records `sgl_router_ttft_overhead_seconds` on a 2xx streaming
+/// request (synchronously, before the response returns — no pump-task wait),
+/// and the pre-dispatch overhead is a sub-term of the full `router.ttfb` span,
+/// so `overhead_sum ≤ ttfb`. Guards the metric's handler wiring and the
+/// ordering of its two source timestamps: a swap (`at_post_dispatch` into the
+/// metric, `at_post_build` into the header) would push overhead above ttfb.
+#[tokio::test]
+async fn streaming_2xx_request_records_ttft_overhead_metric() {
+    let chunks: Vec<&'static str> = vec![
+        "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+        "data: [DONE]\n\n",
+    ];
+    let worker = crate::common::mock_worker::MockWorker::start(chunks).await;
+    let ctx = build_ctx_with_worker(&worker.url);
+    let app = build_router(ctx.clone());
+
+    let res = app.oneshot(streaming_chat_request()).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let ttfb_secs: f64 = res
+        .headers()
+        .get("server-timing")
+        .expect("2xx streaming response must carry a Server-Timing header")
+        .to_str()
+        .unwrap()
+        .strip_prefix("router.ttfb;dur=")
+        .and_then(|d| d.parse::<f64>().ok())
+        .map(|ms| ms / 1000.0)
+        .expect("Server-Timing must be `router.ttfb;dur=<ms>`");
+    let _ = res.into_body().collect().await.unwrap().to_bytes();
+
+    // Recorded synchronously in the handler — readable without polling the pump.
+    let m = ctx.metrics.render();
+    assert!(
+        m.contains(r#"sgl_router_ttft_overhead_seconds_count{model_id="tiny"} 1"#),
+        "overhead must be recorded once for a 2xx streaming request; got:\n{m}",
+    );
+    let overhead_sum: f64 = m
+        .lines()
+        .find_map(|l| l.strip_prefix(r#"sgl_router_ttft_overhead_seconds_sum{model_id="tiny"} "#))
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .expect("overhead _sum line must render");
+    // `ttfb` is rounded to 0.1 ms in the header; allow that much slack.
+    assert!(
+        overhead_sum <= ttfb_secs + 1e-4,
+        "pre-dispatch overhead ({overhead_sum}s) must be ≤ the full router.ttfb span ({ttfb_secs}s)",
+    );
+}
+
+/// A non-2xx response (streaming request to a dead upstream → gateway error)
+/// records neither artifact: both are gated on a 2xx dispatch (successful
+/// response headers), so an error hop emits no `router.ttfb` header and no
+/// overhead sample.
+#[tokio::test]
+async fn streaming_error_response_omits_server_timing_header() {
+    // Bind a port, drop it — a guaranteed closed/refused TCP destination.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dead_url = format!("http://{}", listener.local_addr().unwrap());
+    drop(listener);
+
+    let ctx = build_ctx_with_worker(&dead_url);
+    let app = build_router(ctx.clone());
+
+    let res = app.oneshot(streaming_chat_request()).await.unwrap();
+    assert!(
+        !res.status().is_success(),
+        "a dead upstream must not yield a 2xx; got {}",
+        res.status(),
+    );
+    assert!(
+        res.headers().get("server-timing").is_none(),
+        "error responses must not carry a router.ttfb Server-Timing header",
+    );
+    assert!(
+        !ctx.metrics
+            .render()
+            .contains("sgl_router_ttft_overhead_seconds_count{"),
+        "overhead metric must not be recorded for an error response",
     );
 }
 
@@ -541,6 +675,11 @@ async fn streaming_5xx_request_records_duration_and_status_but_not_ttft() {
         !m.contains("sgl_router_itl_seconds_count{"),
         "ITL must NOT be recorded for a non-2xx streaming response (error-body \
          chunk pacing is not a token cadence); got:\n{m}",
+    );
+    assert!(
+        !m.contains("sgl_router_ttft_overhead_seconds_count{"),
+        "overhead must NOT be recorded for a non-2xx streaming response \
+         (the `is_success()` gate); got:\n{m}",
     );
     assert!(
         m.contains(
