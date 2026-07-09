@@ -156,6 +156,7 @@ class HiCacheNixl(HiCacheStorage):
         self._bounce_set: Optional[torch.Tensor] = None
         self._bounce_get: Optional[torch.Tensor] = None
         self._bounce_page_bytes: Optional[int] = None
+        self._logical_anchor = False
         self._hybrid_pool_ctx: dict[PoolName, _HybridPoolContext] = {}
         self.registered_pools: dict[PoolName, HostKVCache] = {}
         cleanup_dirs = (
@@ -333,12 +334,37 @@ class HiCacheNixl(HiCacheStorage):
 
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         super().register_mem_pool_host(mem_pool_host)
+        self._logical_anchor = False
 
         # enable zero-copy automatically if mem layout is page_first or page_first_direct
         self.is_zero_copy = self.mem_pool_host.layout in [
             "page_first",
             "page_first_direct",
         ]
+
+        kv = getattr(mem_pool_host, "kv_buffer", None)
+        if kv is None:
+            # DeepSeek V4 uses a LogicalHostPool as the KV anchor. It has no
+            # actual KV bytes; component pools carry the data through v2 APIs.
+            # Still write a small marker object per page so batch_exists_v2 can
+            # use the anchor key to gate sidecar lookups.
+            self.is_zero_copy = False
+            self._logical_anchor = True
+            marker_numel = 4096 if self.needs_page_alignment else 1
+            pin_memory = bool(getattr(mem_pool_host, "pin_memory", False))
+            self._bounce_page_bytes = marker_numel
+            self._bounce_set = self._alloc_registered(
+                marker_numel, torch.uint8, pin_memory, "logical_anchor_set"
+            )
+            self._bounce_get = self._alloc_registered(
+                marker_numel, torch.uint8, pin_memory, "logical_anchor_get"
+            )
+            self._bounce_set.fill_(1)
+            logger.info(
+                "HiCacheNixl: registered logical anchor pool with %d-byte markers",
+                self._bounce_page_bytes,
+            )
+            return
 
         if self.needs_page_alignment and self.is_zero_copy:
             # Check that the kv_buffer base AND per-page strides are multiples of
@@ -357,7 +383,6 @@ class HiCacheNixl(HiCacheStorage):
                 self.is_zero_copy = False
 
         if self.is_zero_copy:
-            kv = mem_pool_host.kv_buffer
             self._pre_register_host(
                 kv.data_ptr(), kv.numel() * kv.element_size(), "kv_buffer"
             )
@@ -705,11 +730,14 @@ class HiCacheNixl(HiCacheStorage):
 
         bounce = self._bounce_set if op == "set" else self._bounce_get
         if op == "set":
-            for i in range(page_num):
-                src = self.mem_pool_host.get_data_page(
-                    host_indices[i * page_size], flat=True
-                )
-                bounce[i].copy_(src)
+            if self._logical_anchor:
+                bounce[:page_num].fill_(1)
+            else:
+                for i in range(page_num):
+                    src = self.mem_pool_host.get_data_page(
+                        host_indices[i * page_size], flat=True
+                    )
+                    bounce[i].copy_(src)
 
         host_buffers = self._bounce_slot_buffers(bounce, page_num)
         key_list = [self._get_suffixed_key(key) for key in keys]
@@ -758,6 +786,9 @@ class HiCacheNixl(HiCacheStorage):
             if self.is_mla_model:
                 return results
             return [(results[2 * i] and results[2 * i + 1]) for i in range(page_num)]
+
+        if self._logical_anchor:
+            return results
 
         # non zero copy: copy data from the get-side bounce buffer to mem_pool_host
         for i in range(page_num):
