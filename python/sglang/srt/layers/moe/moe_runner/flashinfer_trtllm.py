@@ -10,6 +10,7 @@ from torch.nn import Module
 from torch.nn.parameter import Parameter
 
 # Import to register custom ops for torch.compile compatibility
+from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     is_symmetric_memory_enabled,
@@ -34,6 +35,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
 )
 from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import PackTopkIds
 from sglang.srt.layers.utils import copy_or_rebind_param
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils.common import (
     is_cuda_alike,
     is_flashinfer_available,
@@ -88,6 +90,28 @@ def finalize_flashinfer_trtllm_deferred_output(
 def round_up_to_multiple(x: int, m: int) -> int:
     """Round up *x* to the nearest multiple of *m*."""
     return (x + m - 1) // m * m
+
+
+def _trtllm_tune_max_num_tokens(num_tokens: int) -> int:
+    tune_max_num_tokens = next_power_of_2(num_tokens)
+    if not is_batch_invariant_mode_enabled():
+        return tune_max_num_tokens
+
+    server_args = get_global_server_args()
+    max_running_tokens = server_args.max_running_requests or 0
+    if server_args.speculative_algorithm:
+        max_running_tokens *= server_args.speculative_num_draft_tokens or 1
+    stable_token_bound = max(
+        server_args.max_prefill_tokens,
+        server_args.max_prefill_buffer_tokens(),
+        max_running_tokens,
+    )
+    if stable_token_bound > 0:
+        tune_max_num_tokens = max(
+            tune_max_num_tokens,
+            next_power_of_2(stable_token_bound),
+        )
+    return tune_max_num_tokens
 
 
 if TYPE_CHECKING:
@@ -751,7 +775,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
                     else routing_method_type
                 ),
                 use_shuffled_weight=use_shuffled_weight,
-                tune_max_num_tokens=next_power_of_2(a_q.shape[0]),
+                tune_max_num_tokens=_trtllm_tune_max_num_tokens(a_q.shape[0]),
                 fp8_quantization_type=int(fp8_quantization_type),
                 activation_type=quant_info.activation_type,
             )
@@ -781,7 +805,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
                 ),
                 routing_method_type=routing_method_type,
                 use_shuffled_weight=use_shuffled_weight,
-                tune_max_num_tokens=next_power_of_2(a_q.shape[0]),
+                tune_max_num_tokens=_trtllm_tune_max_num_tokens(a_q.shape[0]),
                 fp8_quantization_type=int(fp8_quantization_type),
                 activation_type=quant_info.activation_type,
             )
@@ -840,7 +864,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
             ),
             use_routing_scales_on_input=False,
             routing_method_type=routing_method_type,
-            tune_max_num_tokens=next_power_of_2(a_q.shape[0]),
+            tune_max_num_tokens=_trtllm_tune_max_num_tokens(a_q.shape[0]),
             activation_type=quant_info.activation_type,
         )
         symm_output.copy_(output)
@@ -1060,7 +1084,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
             routing_method_type=1,  # Unused, but must be 1 to pass validation.
             do_finalize=True,
             activation_type=activation_type,
-            tune_max_num_tokens=next_power_of_2(hs_fp4.shape[0]),
+            tune_max_num_tokens=_trtllm_tune_max_num_tokens(hs_fp4.shape[0]),
             output=symm_output,
         )[0]
     else:
@@ -1104,7 +1128,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
             ),
             do_finalize=not defer_finalize,
             activation_type=activation_type,
-            tune_max_num_tokens=next_power_of_2(hs_fp4.shape[0]),
+            tune_max_num_tokens=_trtllm_tune_max_num_tokens(hs_fp4.shape[0]),
         )
         if not defer_finalize:
             moe_kwargs["output"] = symm_output
@@ -1225,7 +1249,7 @@ def fused_experts_none_to_flashinfer_trtllm_bf16(
                     if runner_config.routed_scaling_factor is not None
                     else 1.0
                 ),
-                tune_max_num_tokens=next_power_of_2(hidden_states.shape[0]),
+                tune_max_num_tokens=_trtllm_tune_max_num_tokens(hidden_states.shape[0]),
                 activation_type=activation_type,
             )
         else:
@@ -1248,7 +1272,7 @@ def fused_experts_none_to_flashinfer_trtllm_bf16(
                 local_num_experts=runner_config.num_local_experts,
                 routing_method_type=runner_config.routing_method_type,
                 routed_scaling_factor=runner_config.routed_scaling_factor,
-                tune_max_num_tokens=next_power_of_2(hidden_states.shape[0]),
+                tune_max_num_tokens=_trtllm_tune_max_num_tokens(hidden_states.shape[0]),
                 activation_type=activation_type,
             )
 

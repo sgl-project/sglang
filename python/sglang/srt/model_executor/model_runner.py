@@ -3235,6 +3235,19 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         """
         self._preprocess_logits(logits_output, forward_batch.sampling_info)
 
+        # For prefill, we only use the position of the last token. DP-attention
+        # MLP-sync padding appends dummy rows to positions/seq_lens while
+        # sampling_info only covers the real requests, so slice back to the
+        # sampled rows (real rows come first; padding is appended).
+        positions = (
+            forward_batch.positions
+            if forward_batch.forward_mode.is_decode()
+            else forward_batch.seq_lens - 1
+        )
+        num_sampled = forward_batch.sampling_info.temperatures.shape[0]
+        if positions.shape[0] != num_sampled:
+            positions = positions[:num_sampled]
+
         # Sample the next tokens
         next_token_ids = self.sampler(
             logits_output,
@@ -3242,12 +3255,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             forward_batch.return_logprob,
             forward_batch.top_logprobs_nums,
             forward_batch.token_ids_logprobs,
-            # For prefill, we only use the position of the last token.
-            (
-                forward_batch.positions
-                if forward_batch.forward_mode.is_decode()
-                else forward_batch.seq_lens - 1
-            ),
+            positions,
         )
         self.maybe_update_ngram_token_table(next_token_ids, forward_batch)
         return next_token_ids
