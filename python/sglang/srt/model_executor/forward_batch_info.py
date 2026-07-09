@@ -49,8 +49,7 @@ from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
     ForwardBatchDeepSeekMHAMixin,
 )
 from sglang.srt.model_executor.triton_ops.position import compute_position_triton
-from sglang.srt.runtime_context import get_parallel
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import (
     is_cuda,
     is_hip,
@@ -286,6 +285,9 @@ class NgramEmbeddingInfo:
     req_lens: torch.Tensor
     out_column_starts: torch.Tensor
     out_req_lens: torch.Tensor
+    # Mask marking chunked (not-yet-finished) prefill requests whose sampled
+    # pseudo next-token must NOT be written into the token table.
+    skip_token_table_update: Optional[torch.Tensor] = None
 
     @classmethod
     def create(
@@ -295,6 +297,7 @@ class NgramEmbeddingInfo:
         device: torch.device,
         column_starts=None,
         req_lens=None,
+        skip_token_table_update=None,
     ) -> NgramEmbeddingInfo:
         info = cls(
             token_table=token_table,
@@ -302,6 +305,7 @@ class NgramEmbeddingInfo:
             req_lens=torch.empty(batch_size, dtype=torch.int32, device=device),
             out_column_starts=torch.empty(batch_size, dtype=torch.int32, device=device),
             out_req_lens=torch.empty(batch_size, dtype=torch.int32, device=device),
+            skip_token_table_update=skip_token_table_update,
         )
         if column_starts is not None:
             info.column_starts[:] = column_starts
@@ -316,6 +320,11 @@ class NgramEmbeddingInfo:
             req_lens=self.req_lens[:bs],
             out_column_starts=self.out_column_starts[:bs],
             out_req_lens=self.out_req_lens[:bs],
+            skip_token_table_update=(
+                self.skip_token_table_update[:bs]
+                if self.skip_token_table_update is not None
+                else None
+            ),
         )
 
 
@@ -431,8 +440,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     return_hidden_states_before_norm: bool = False
 
     # Gate for reusing the first MTP draft step's indexer topk across steps;
-    # the carried topk lives on spec_info (see EagleDraftInput.mtp_topk_indices).
-    reuse_mtp_topk_indices: Optional[bool] = False
+    # the carried topk lives on spec_info (see EagleDraftInput.dsa_topk_indices).
+    reuse_dsa_topk_indices: Optional[bool] = False
 
     # === Forward-derived (built in init_new on the forward stream; FB-owned) ===
     # Position information
@@ -900,7 +909,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             # --enable-mis: every request must carry delimiter indices (the score
             # endpoint always produces MIS-structured requests; consumers index
             # without None-checking).
-            if get_global_server_args().enable_mis and any(
+            if get_server_args().enable_mis and any(
                 r.multi_item_delimiter_indices is not None for r in batch.reqs
             ):
                 assert all(
@@ -1003,6 +1012,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             device,
             column_starts=column_starts,
             req_lens=req_lens,
+            skip_token_table_update=batch.ne_skip_token_table_update,
         )
 
     def compute_spec_mrope_positions(
@@ -1044,6 +1054,18 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         mm_input: MultimodalInputs,
         seq_len: int,
     ) -> torch.Tensor:
+        # Some generation models precompute decode positions for future tokens.
+        # For example, GLM-Image needs 2D spatial MRoPE positions instead of
+        # sequential delta-based positions.
+        # This is needed for image generation models (e.g. GlmImage) where
+        # decode tokens require 2D spatial MRoPE positions, not sequential.
+        if (
+            mm_input.mrope_positions is not None
+            and mm_input.mrope_positions.shape[1] >= seq_len
+        ):
+            pos = mm_input.mrope_positions[:, seq_len - 1 : seq_len]
+            return pos
+
         # doing below compute on cpu to avoid frequent small kernels
         if mm_input.mrope_position_delta_repeated_cache is None:
             mm_input.mrope_position_delta_repeated_cache = (
@@ -1062,7 +1084,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 # 3 * N
                 if (
                     mm_input is None
-                    or get_global_server_args().rl_on_policy_target is not None
+                    or get_server_args().rl_on_policy_target is not None
                 ):
                     mrope_positions_list[batch_idx] = torch.full(
                         (3, 1),
@@ -1081,7 +1103,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 )
                 if (
                     mm_input is None
-                    or get_global_server_args().rl_on_policy_target is not None
+                    or get_server_args().rl_on_policy_target is not None
                 ):
                     # text only
                     mrope_positions = torch.tensor(

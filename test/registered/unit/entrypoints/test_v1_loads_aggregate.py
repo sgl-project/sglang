@@ -15,7 +15,9 @@ from sglang.srt.managers.load_snapshot import (
     SLOT_LEN_STRUCT,
     SLOT_SIZE,
     VERSION,
+    DisaggregationMetrics,
     LoadSnapshot,
+    QueueMetrics,
     ShmLoadSnapshotReader,
     ShmLoadSnapshotWriter,
     slot_offset,
@@ -150,14 +152,10 @@ class TestGetLoads(CustomTestCase):
                     cache_hit_rate=0.75,
                     utilization=0.5,
                     max_running_requests=128,
-                    has_disaggregation=1,
-                    disagg_mode=2,
-                    decode_transfer_queue_reqs=4,
-                    has_queues=1,
-                    queue_waiting=2,
-                    queue_grammar=1,
-                    queue_paused=0,
-                    queue_retracted=3,
+                    disaggregation=DisaggregationMetrics(
+                        mode="decode", decode_transfer_queue_reqs=4
+                    ),
+                    queues=QueueMetrics(waiting=2, grammar=1, paused=0, retracted=3),
                 )
             )
 

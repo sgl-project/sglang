@@ -1149,6 +1149,7 @@ class TestMlxOverlapScheduler(unittest.TestCase):
         self.assertTrue(torch.equal(schedule_batch.input_ids, token_ids))
         self.assertIs(scheduler.processed_batch, batch_copy)
         self.assertIs(scheduler.processed_result, scheduler.tp_worker.result)
+        self.assertEqual(scheduler.forward_ct, 1)
 
     def test_overlap_loop_materializes_prefill_input_ids(self):
         # Regression: the MLX overlap loop must materialize batch.input_ids
@@ -1256,7 +1257,7 @@ class TestMlxOverlapScheduler(unittest.TestCase):
         logits_output = SimpleNamespace(customized_info=None)
         original_release = batch_result_processor_module.release_kv_cache
         original_get_indexer = batch_result_processor_module.get_global_indexer_capturer
-        original_get_server_args = batch_result_processor_module.get_global_server_args
+        original_get_server_args = batch_result_processor_module.get_server_args
 
         def fake_release_kv_cache(release_req, tree_cache, is_insert=False):
             events.append(("release", release_req.rid))
@@ -1264,7 +1265,7 @@ class TestMlxOverlapScheduler(unittest.TestCase):
 
         batch_result_processor_module.release_kv_cache = fake_release_kv_cache
         batch_result_processor_module.get_global_indexer_capturer = lambda: None
-        batch_result_processor_module.get_global_server_args = lambda: SimpleNamespace(
+        batch_result_processor_module.get_server_args = lambda: SimpleNamespace(
             enable_mamba_extra_buffer_lazy=lambda: False
         )
         try:
@@ -1278,9 +1279,7 @@ class TestMlxOverlapScheduler(unittest.TestCase):
             batch_result_processor_module.get_global_indexer_capturer = (
                 original_get_indexer
             )
-            batch_result_processor_module.get_global_server_args = (
-                original_get_server_args
-            )
+            batch_result_processor_module.get_server_args = original_get_server_args
 
         self.assertEqual(
             events,

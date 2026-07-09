@@ -26,7 +26,6 @@ import psutil
 import torch
 import tqdm
 
-from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import (
@@ -38,7 +37,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.runner_utils.capture_mode import model_capture_mode
-from sglang.srt.runtime_context import get_flags
+from sglang.srt.runtime_context import get_flags, get_parallel
 from sglang.srt.utils import (
     empty_context,
     log_info_on_rank0,
@@ -710,11 +709,11 @@ class CPUGraphRunner:
     def capture(self) -> None:
         capture_range = (
             tqdm.tqdm(list(reversed(self.capture_bs)))
-            if get_tensor_model_parallel_rank() == 0
+            if get_parallel().tp_rank == 0
             else reversed(self.capture_bs)
         )
         for bs in capture_range:
-            if get_tensor_model_parallel_rank() == 0:
+            if get_parallel().tp_rank == 0:
                 avail_mem = psutil.virtual_memory().available / (1 << 30)
                 capture_range.set_description(
                     f"Capturing batches ({bs=} {avail_mem=:.2f} GB)"
