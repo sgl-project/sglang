@@ -485,6 +485,43 @@ class UMBPStore(HiCacheStorage):
                 "exclusive (distributed vs. standalone-process mode)."
             )
 
+        def _resolve_worker_node_address() -> str:
+            node_address = extra.get(
+                "node_address", _optional_env_str("UMBP_NODE_ADDRESS")
+            )
+            if node_address is None:
+                return _default_node_address()
+            return _select_rank_config_value(
+                node_address,
+                unique_rank,
+                "node_address",
+                str,
+            )
+
+        def _resolve_worker_node_id(node_address: str) -> str:
+            node_id = extra.get("node_id", _optional_env_str("UMBP_NODE_ID"))
+            if node_id is None:
+                return (
+                    f"{node_address}:dp{dp_rank_hint if dp_rank_hint is not None else 0}"
+                    f":pp{self.pp_rank}:tp{self.local_rank}"
+                )
+            return _select_rank_config_value(
+                node_id,
+                unique_rank,
+                "node_id",
+                str,
+            )
+
+        def _resolve_worker_tags() -> List[str]:
+            raw_tags = extra.get("node_tags", extra.get("tags"))
+            if raw_tags is None:
+                raw_tags = _optional_env_str("UMBP_NODE_TAGS")
+            if raw_tags is None:
+                return []
+            if isinstance(raw_tags, str):
+                return [tag.strip() for tag in raw_tags.split(",") if tag.strip()]
+            return [str(tag) for tag in raw_tags]
+
         _warn_extra_config_scope(extra, distributed_enabled=bool(master_address))
         if master_address and UMBPDistributedConfig is not None:
             dist_cfg = UMBPDistributedConfig()
@@ -493,33 +530,12 @@ class UMBPStore(HiCacheStorage):
             if "ssd_copy_worker_threads" not in extra:
                 cfg.copy_pipeline.worker_threads = 1
 
-            node_address = extra.get(
-                "node_address", _optional_env_str("UMBP_NODE_ADDRESS")
-            )
-            if node_address is None:
-                node_address = _default_node_address()
-            else:
-                node_address = _select_rank_config_value(
-                    node_address,
-                    unique_rank,
-                    "node_address",
-                    str,
-                )
+            node_address = _resolve_worker_node_address()
             dist_cfg.master_config.node_address = node_address
 
-            node_id = extra.get("node_id", _optional_env_str("UMBP_NODE_ID"))
-            if node_id is None:
-                dist_cfg.master_config.node_id = (
-                    f"{node_address}:dp{dp_rank_hint if dp_rank_hint is not None else 0}"
-                    f":pp{self.pp_rank}:tp{self.local_rank}"
-                )
-            else:
-                dist_cfg.master_config.node_id = _select_rank_config_value(
-                    node_id,
-                    unique_rank,
-                    "node_id",
-                    str,
-                )
+            dist_cfg.master_config.node_id = _resolve_worker_node_id(node_address)
+            if hasattr(dist_cfg.master_config, "tags"):
+                dist_cfg.master_config.tags = _resolve_worker_tags()
 
             if "auto_heartbeat" in extra:
                 dist_cfg.master_config.auto_heartbeat = _strict_bool(
@@ -681,12 +697,35 @@ class UMBPStore(HiCacheStorage):
                     _optional_env_str("UMBP_STANDALONE_STARTUP_TIMEOUT_MS") or 30000,
                 )
             )
+            worker_node_address = _resolve_worker_node_address()
+            worker_node_id = _resolve_worker_node_id(worker_node_address)
+            worker_tags = _resolve_worker_tags()
+            worker_identity_passed = all(
+                hasattr(standalone_cfg, field)
+                for field in ("worker_node_address", "worker_node_id", "tags")
+            )
+            if worker_identity_passed:
+                standalone_cfg.worker_node_address = worker_node_address
+                standalone_cfg.worker_node_id = worker_node_id
+                standalone_cfg.tags = worker_tags
+            else:
+                logger.warning(
+                    "UMBPStore standalone-process mode: mori.umbp does not expose "
+                    "worker_node_id/worker_node_address/tags on "
+                    "UMBPStandaloneProcessConfig. Core standalone-process data path "
+                    "can still run, but distributed-backed per-worker external-KV "
+                    "identity will not be enabled until mori is rebuilt."
+                )
             cfg.standalone_process = standalone_cfg
             logger.info(
-                "UMBPStore standalone-process mode: address=%s auto_start=%s timeout_ms=%d",
+                "UMBPStore standalone-process mode: address=%s auto_start=%s timeout_ms=%d "
+                "worker_identity_passed=%s worker_node_id=%s worker_node_address=%s",
                 standalone_cfg.address,
                 standalone_cfg.auto_start,
                 standalone_cfg.startup_timeout_ms,
+                worker_identity_passed,
+                worker_node_id,
+                worker_node_address,
             )
 
         self.storage_config = storage_config
