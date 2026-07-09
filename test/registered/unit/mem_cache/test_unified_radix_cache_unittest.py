@@ -92,6 +92,7 @@ class CacheConfig:
     mamba_head_dim: int = 16
     mamba_state_size: int = 16
     mamba_conv_kernel: int = 4
+    enable_int8_mamba_checkpoint: bool = False
 
     # Model / pool
     kv_size: int = 256
@@ -215,7 +216,11 @@ class TestUnifiedTreeNodeGetPrefixHashValues(CustomTestCase):
 
 def build_fixture(cfg: CacheConfig, *, enable_kv_cache_events: bool = False):
     """Create (tree, allocator, req_to_token_pool) from a CacheConfig."""
-    server_args = ServerArgs(model_path="dummy", page_size=cfg.page_size)
+    server_args = ServerArgs(
+        model_path="dummy",
+        page_size=cfg.page_size,
+        enable_int8_mamba_checkpoint=cfg.enable_int8_mamba_checkpoint,
+    )
     # MambaRadixCache reads mamba_cache_chunk_size, whose property otherwise
     # loads the HF config for self.model_path — impossible for the dummy model.
     # Mirror the property's default for a dummy HF config: FLA_CHUNK_SIZE.
@@ -4413,6 +4418,73 @@ class UnifiedLRUListBoundedRefreshTest(CustomTestCase):
             c, root, window_size=0, should_include=lambda _n: True
         )
         self.assertEqual(self._lru_order(lru), before)
+
+
+class TestUnifiedRadixCacheInt8MambaCheckpoint(CustomTestCase):
+    cfg = CacheConfig(
+        components=(ComponentType.FULL, ComponentType.MAMBA),
+        enable_mamba_extra_buffer=True,
+        enable_int8_mamba_checkpoint=True,
+        mamba_cache_size=8,
+        kv_size=64,
+        max_context_len=64,
+    )
+
+    def _make_req(self, req_to_token_pool, tokens):
+        req = Req(
+            rid="int8-mamba",
+            origin_input_text="",
+            origin_input_ids=array("q", tokens),
+            sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
+        )
+        req_to_token_pool.alloc([req])
+        req.output_ids = array("q")
+        req.kv_committed_len = len(tokens)
+        req.kv_allocated_len = len(tokens)
+        req.cache_protected_len = 0
+        req.swa_uuid_for_lock = None
+        req.extra_key = None
+        req.mamba_last_track_seqlen = len(tokens)
+        return req
+
+    def _cache_finished(self, cache, allocator, req_to_token_pool, tokens):
+        req = self._make_req(req_to_token_pool, tokens)
+        kv_indices = allocator.alloc(len(tokens))
+        self.assertIsNotNone(kv_indices)
+        req_to_token_pool.write((req.req_pool_idx, slice(0, len(tokens))), kv_indices)
+        req.last_node = cache.root_node
+
+        cache.cache_finished_req(req, is_insert=True)
+
+    def test_finished_req_stores_radix_mamba_state_in_int8_pool(self):
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        ckpt_pool = req_to_token_pool.mamba_ckpt_pool
+        self.assertIsNotNone(ckpt_pool)
+        active_initial = req_to_token_pool.mamba_allocator.available_size()
+        ckpt_initial = ckpt_pool.available_size()
+        tokens = [1, 2, 3, 4]
+
+        self._cache_finished(cache, allocator, req_to_token_pool, tokens)
+        self.assertEqual(
+            req_to_token_pool.mamba_allocator.available_size(), active_initial
+        )
+        self.assertEqual(ckpt_pool.available_size(), ckpt_initial - 1)
+        self.assertEqual(cache.mamba_evictable_size(), 1)
+
+        self._cache_finished(cache, allocator, req_to_token_pool, tokens)
+        self.assertEqual(
+            req_to_token_pool.mamba_allocator.available_size(), active_initial
+        )
+        self.assertEqual(ckpt_pool.available_size(), ckpt_initial - 1)
+        self.assertEqual(cache.mamba_evictable_size(), 1)
+
+        result = cache.evict(EvictParams(mamba_num=1))
+        self.assertEqual(result.mamba_num_evicted, 1)
+        self.assertEqual(
+            req_to_token_pool.mamba_allocator.available_size(), active_initial
+        )
+        self.assertEqual(ckpt_pool.available_size(), ckpt_initial)
+        self.assertEqual(cache.mamba_evictable_size(), 0)
 
 
 _CONFIGS: list[CacheConfig] = [
