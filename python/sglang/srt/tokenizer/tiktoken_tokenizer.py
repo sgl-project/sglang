@@ -113,6 +113,13 @@ class TiktokenTokenizer:
     def decode(self, x, *args, **kwargs):
         return self.tokenizer.decode(x)
 
+    def num_special_tokens_to_add(self, *args, **kwargs) -> int:
+        # `encode` does not add special tokens (add_special_tokens is ignored and
+        # tiktoken's encode adds none), so no length budget needs to be reserved.
+        # Required by callers such as sglang.bench_serving's random dataset sampler
+        # (benchmark/datasets/random.py) which otherwise raises AttributeError.
+        return 0
+
     def batch_decode(
         self, batch, skip_special_tokens=True, spaces_between_special_tokens=False
     ):
