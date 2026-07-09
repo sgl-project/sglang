@@ -11,6 +11,7 @@ from sglang.srt.models.deepseek_common.attention_forward_methods.forward_methods
     AttnForwardMethod,
 )
 from sglang.srt.models.deepseek_common.utils import _is_hip
+from sglang.srt.runtime_context import get_server_args
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import use_intel_amx_backend
 
@@ -129,7 +130,7 @@ def handle_attention_cutlass_mla(attn, forward_batch):
 
 
 def handle_attention_fa4(attn, forward_batch):
-    if get_global_server_args().enable_deterministic_inference:
+    if get_server_args().enable_deterministic_inference:
         return _dispatch_mla_subtype(attn, forward_batch)
     return _handle_attention_backend(attn, forward_batch, "fa4")
 

@@ -7,7 +7,6 @@ import einops
 import torch
 
 from sglang.jit_kernel.dsv4 import silu_and_mul_masked_post_quant
-from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.moe.moe_runner.base import (
@@ -20,6 +19,7 @@ from sglang.srt.layers.moe.moe_runner.base import (
     register_pre_permute,
 )
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
+from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import (
     ceil_div,
     dispose_tensor,
@@ -65,7 +65,10 @@ _DEEPGEMM_ON_H20 = get_bool_env_var("SGLANG_DEEPGEMM_ON_H20")
 def _batch_invariant_deepep_normal_expert_m(
     num_recv_tokens_per_expert: List[int], runner_config: MoeRunnerConfig
 ) -> Optional[int]:
-    if not num_recv_tokens_per_expert or not is_batch_invariant_mode_enabled():
+    if (
+        not num_recv_tokens_per_expert
+        or not get_server_args().enable_deterministic_inference
+    ):
         return None
 
     num_experts = runner_config.num_experts
@@ -777,7 +780,7 @@ def pre_permute_deepep_normal_to_deep_gemm(
         device=hidden_states.device,
         dtype=hidden_states.dtype,
     )
-    if is_batch_invariant_mode_enabled():
+    if get_server_args().enable_deterministic_inference:
         input_tensor.zero_()
     if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
         # TODO check whether need `zeros`
@@ -792,10 +795,10 @@ def pre_permute_deepep_normal_to_deep_gemm(
             device=hidden_states.device,
             dtype=torch.float32,
         )
-        if is_batch_invariant_mode_enabled():
+        if get_server_args().enable_deterministic_inference:
             input_tensor_scale.zero_()
     m_indices = torch.empty(all_tokens, device=hidden_states.device, dtype=torch.int32)
-    if is_batch_invariant_mode_enabled():
+    if get_server_args().enable_deterministic_inference:
         m_indices.zero_()
     output_index = torch.empty_like(topk_ids)
 

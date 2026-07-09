@@ -10,7 +10,6 @@ from torch.nn import Module
 from torch.nn.parameter import Parameter
 
 # Import to register custom ops for torch.compile compatibility
-from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     is_symmetric_memory_enabled,
@@ -36,7 +35,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
 )
 from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import PackTopkIds
 from sglang.srt.layers.utils import copy_or_rebind_param
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils.common import (
     is_cuda_alike,
     is_flashinfer_available,
@@ -95,10 +94,10 @@ def round_up_to_multiple(x: int, m: int) -> int:
 
 def _trtllm_tune_max_num_tokens(num_tokens: int) -> int:
     tune_max_num_tokens = next_power_of_2(num_tokens)
-    if not is_batch_invariant_mode_enabled():
+    if not get_server_args().enable_deterministic_inference:
         return tune_max_num_tokens
 
-    server_args = get_global_server_args()
+    server_args = get_server_args()
     max_running_tokens = server_args.max_running_requests or 0
     if server_args.speculative_algorithm:
         max_running_tokens *= server_args.speculative_num_draft_tokens or 1
