@@ -172,6 +172,180 @@ def test_gdn_chunk_cutedsl_correctness(num_seqs: int, state_dtype: torch.dtype):
     assert buffer_state_error.max().item() == 0
 
 
+def _build_extend_inputs(num_seqs: int):
+    """Synthetic GDN extend inputs mirroring the kernel test's init."""
+    seq_lens = torch.randint(1, 130, (num_seqs,), dtype=torch.int32)
+    cu_seqlens = torch.zeros(num_seqs + 1, device="cuda", dtype=torch.int32)
+    cu_seqlens[1:] = seq_lens.to(device="cuda").cumsum(0)
+    total_tokens = int(cu_seqlens[-1].item())
+
+    num_k_heads = 4
+    num_v_heads = 8
+    head_k_dim = 128
+    head_v_dim = 128
+    dtype = torch.bfloat16
+
+    # extend() l2-normalizes q/k internally, so pass raw (un-normalized) q/k.
+    q = torch.randn(
+        1, total_tokens, num_k_heads, head_k_dim, device="cuda", dtype=dtype
+    )
+    k = torch.randn_like(q)
+    v = torch.randn(
+        1, total_tokens, num_v_heads, head_v_dim, device="cuda", dtype=dtype
+    )
+    a = torch.randn(1, total_tokens, num_v_heads, device="cuda", dtype=dtype)
+    b = torch.randn(1, total_tokens, num_v_heads, device="cuda", dtype=dtype)
+
+    A = torch.empty(num_v_heads, device="cuda", dtype=torch.float32).uniform_(0, 16)
+    A_log = torch.log(A)
+    dt = torch.exp(
+        torch.rand(num_v_heads, device="cuda", dtype=torch.float32)
+        * (math.log(0.1) - math.log(0.001))
+        + math.log(0.001)
+    )
+    dt = torch.clamp(dt, min=1e-4)
+    dt_bias = dt + torch.log(-torch.expm1(-dt))
+    # Log-space gate + sigmoid beta, matching fused_gdn_gating's output contract.
+    g = -A_log.exp().view(1, 1, num_v_heads) * F.softplus(
+        a.float() + dt_bias.view(1, 1, num_v_heads)
+    )
+    beta = torch.sigmoid(b.float())
+
+    # One SSM slot per sequence plus a trailing sentinel slot (extend maps a
+    # cache index of -1 to the last slot).
+    ssm_states = (
+        torch.randn(
+            num_seqs + 1,
+            num_v_heads,
+            head_v_dim,
+            head_k_dim,
+            device="cuda",
+            dtype=torch.float32,
+        )
+        * 0.05
+    )
+    cache_indices = torch.arange(num_seqs, device="cuda", dtype=torch.int32)
+    return dict(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        ssm_states=ssm_states,
+        cache_indices=cache_indices,
+        query_start_loc=cu_seqlens,
+        total_tokens=total_tokens,
+        num_v_heads=num_v_heads,
+        head_v_dim=head_v_dim,
+    )
+
+
+@pytest.mark.parametrize("num_seqs", [1, 5, 257])
+def test_cutedsl_extend_direct_write(num_seqs: int):
+    """P1: `CuteDSLGDNKernel.extend(out=...)` must (1) produce bit-identical
+    output and SSM-state writeback as the fresh-allocation path, and (2) return
+    a tensor that aliases the supplied buffer so the caller can skip its copy."""
+    from sglang.srt.layers.attention.linear.kernels.gdn_cutedsl import (
+        CuteDSLGDNKernel,
+    )
+
+    kernel = CuteDSLGDNKernel()
+    if not kernel.supports_prefill:
+        pytest.skip("CuteDSL GDN prefill unsupported on this device")
+
+    inp = _build_extend_inputs(num_seqs)
+
+    def run(out):
+        ssm = inp["ssm_states"].clone()
+        o, s1, s2 = kernel.extend(
+            q=inp["q"],
+            k=inp["k"],
+            v=inp["v"],
+            g=inp["g"],
+            beta=inp["beta"],
+            ssm_states=ssm,
+            cache_indices=inp["cache_indices"],
+            query_start_loc=inp["query_start_loc"],
+            out=out,
+        )
+        torch.cuda.synchronize()
+        assert s1 is None and s2 is None
+        return o, ssm
+
+    o_ref, ssm_ref = run(None)
+
+    out_buf = torch.empty(
+        1,
+        inp["total_tokens"],
+        inp["num_v_heads"],
+        inp["head_v_dim"],
+        device="cuda",
+        dtype=o_ref.dtype,
+    )
+    o_buf, ssm_buf = run(out_buf)
+
+    # (1) direct-write is numerically identical to fresh-allocation.
+    assert (o_buf.float() - o_ref.float()).abs().max().item() == 0
+    assert (ssm_buf - ssm_ref).abs().max().item() == 0
+    # (2) the returned output aliases the caller's buffer (data_ptr identity is
+    # exactly what lets `unified_linear_attention_with_output` skip its copy).
+    assert o_buf.data_ptr() == out_buf.data_ptr()
+    assert (out_buf.squeeze(0) - o_buf.squeeze(0)).abs().max().item() == 0
+
+    # A mis-shaped out buffer must fail loud, not silently corrupt.
+    with pytest.raises(AssertionError):
+        run(out_buf[:, :-1] if inp["total_tokens"] > 1 else out_buf.unsqueeze(0))
+
+
+@pytest.mark.parametrize("total_tokens", [1, 3, 127, 1024, 4096])
+def test_l2norm_qk_fusion_bitexact(total_tokens: int):
+    """P2: the fused q/k l2norm must be bit-identical (0-ULP) to the two
+    separate ``fla.l2norm.l2norm_fwd`` calls it replaces, including token counts
+    that are not multiples of the BT=16 row block."""
+    from sglang.srt.layers.attention.fla.l2norm import l2norm_fwd  # unmodified ref
+    from sglang.srt.layers.attention.linear.kernels.gdn_cutedsl import l2norm_fwd_qk
+
+    num_k_heads, head_k_dim, dtype = 4, 128, torch.bfloat16
+    q = torch.randn(
+        1, total_tokens, num_k_heads, head_k_dim, device="cuda", dtype=dtype
+    )
+    k = torch.randn_like(q)
+
+    old_q = l2norm_fwd(q[0].contiguous())
+    old_k = l2norm_fwd(k[0].contiguous())
+    new_q, new_k = l2norm_fwd_qk(q[0].contiguous(), k[0].contiguous())
+    torch.cuda.synchronize()
+
+    assert (new_q.float() - old_q.float()).abs().max().item() == 0
+    assert (new_k.float() - old_k.float()).abs().max().item() == 0
+    assert new_q.dtype == dtype and new_k.dtype == dtype
+    assert tuple(new_q.shape) == (total_tokens, num_k_heads, head_k_dim)
+    assert tuple(new_k.shape) == (total_tokens, num_k_heads, head_k_dim)
+
+
+def test_l2norm_qk_fusion_launch_count():
+    """P2: the fusion must actually collapse 2 kernel launches into 1."""
+    from torch.profiler import ProfilerActivity, profile
+
+    from sglang.srt.layers.attention.fla.l2norm import l2norm_fwd
+    from sglang.srt.layers.attention.linear.kernels.gdn_cutedsl import l2norm_fwd_qk
+
+    q = torch.randn(4096, 4, 128, device="cuda", dtype=torch.bfloat16).reshape(-1, 128)
+    k = torch.randn_like(q)
+
+    def count(name_substr, fn):
+        fn()
+        torch.cuda.synchronize()  # warmup: excludes Triton JIT-compile launches
+        with profile(activities=[ProfilerActivity.CUDA]) as prof:
+            fn()
+            torch.cuda.synchronize()
+        return sum(e.count for e in prof.key_averages() if name_substr in e.key)
+
+    old = count("l2norm_fwd_kernel", lambda: (l2norm_fwd(q), l2norm_fwd(k)))
+    new = count("l2norm_fwd_qk_kernel", lambda: l2norm_fwd_qk(q, k))
+    assert old == 2 and new == 1
+
+
 if __name__ == "__main__":
     import sys
 

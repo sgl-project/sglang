@@ -398,6 +398,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         mixed_qkv: Union[torch.Tensor, Tuple[torch.Tensor, ...]],
         a: torch.Tensor,
         b: torch.Tensor,
+        out: Optional[torch.Tensor] = None,
         **kwargs,
     ):
         assert isinstance(mixed_qkv, torch.Tensor)
@@ -541,6 +542,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 ssm_states=ssm_states_contig,
                 cache_indices=state_cache_indices,
                 query_start_loc=query_start_loc,
+                out=out,
             )
 
             if is_npu() and last_recurrent_state is not None:

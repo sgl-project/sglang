@@ -143,16 +143,24 @@ def unified_linear_attention_with_output(
     # this backend call so model/backend state is still written to the same batch.
     forward_batch.out_cache_loc = original_out_cache_loc[:real_num_tokens]
 
+    # Offer the real (unpadded) output slice as a direct-write target. Backends
+    # that honor `out` (CuteDSL GDN prefill) point their final o-kernel straight
+    # at this buffer, so `ret` aliases it and the device-to-device copy below is
+    # skipped; backends that ignore `out` return a fresh tensor and we fall back
+    # to the copy.
+    out_view = output[:, :real_num_tokens]
     ret = get_attn_backend().forward(
         layer=attention_layer,
         forward_batch=forward_batch,
         mixed_qkv=mixed_qkv[:real_num_tokens],
         a=a[:real_num_tokens],
         b=b[:real_num_tokens],
+        out=out_view,
     )
     forward_batch.out_cache_loc = original_out_cache_loc
 
-    output[:, :real_num_tokens].copy_(ret)
+    if ret.data_ptr() != out_view.data_ptr():
+        out_view.copy_(ret)
     return
 
 
