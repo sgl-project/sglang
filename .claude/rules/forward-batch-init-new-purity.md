@@ -12,9 +12,9 @@ its sub-objects.
   `TpModelWorker.forward_batch_generation` pass the override through its
   kw-only parameters instead of writing onto the batch.
 
-Temporary exceptions (do not add new ones):
+Known object-sharing note (do not add new exceptions):
 
-- `seq_lens_sum` lazy backfill inside `init_new` — scheduled for removal in a
-  follow-up op.
-- `sampling_info` sub-object writes inside `init_new` — documented exception
-  until the sampling forward-copy op lands.
+- `init_new` no longer rebinds or mutates ScheduleBatch fields; it still
+  writes `ret.sampling_info` sub-object attributes (grammars, canary ids),
+  which is the same object as `batch.sampling_info` until the sampling
+  forward-copy op lands.
