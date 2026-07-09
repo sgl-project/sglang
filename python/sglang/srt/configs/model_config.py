@@ -1401,13 +1401,15 @@ class ModelConfig:
             # MXFP8 stores E8M0 block scales that DeepGemm consumes losslessly, so skip the warning there.
             self.use_scale_ue8m0 = quant_cfg.get("scale_fmt", None) == "ue8m0"
             from sglang.srt.layers import deep_gemm_wrapper
+            from sglang.srt.utils import print_warning_once
 
             if (
                 not self.use_scale_ue8m0
+                and quant_cfg.get("weight_block_size") is not None
                 and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
                 and self.quantization != "mxfp8"
             ):
-                logger.warning(
+                print_warning_once(
                     "DeepGemm is enabled but the scale_fmt of checkpoint is not ue8m0. This might cause accuracy degradation on Blackwell."
                 )
 

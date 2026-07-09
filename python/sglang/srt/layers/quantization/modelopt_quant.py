@@ -64,6 +64,7 @@ from sglang.srt.utils.common import (
     is_flashinfer_available,
     is_sm100_supported,
     is_sm120_supported,
+    log_warning_on_rank0,
     round_up,
     set_weight_attrs,
 )
@@ -409,8 +410,9 @@ class ModelOptFp8Config(ModelOptQuantConfig):
         super().__init__(kv_cache_quant_method, exclude_modules, packed_modules_mapping)
         self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized
         if is_checkpoint_fp8_serialized:
-            logger.warning(
-                "Detected ModelOpt FP8 checkpoint. The format is experimental and subject to change."
+            log_warning_on_rank0(
+                logger,
+                "Detected ModelOpt FP8 checkpoint. The format is experimental and subject to change.",
             )
 
     @classmethod
@@ -1196,9 +1198,10 @@ class ModelOptFp4Config(ModelOptQuantConfig):
         super().__init__(kv_cache_quant_algo, exclude_modules, packed_modules_mapping)
         self.is_checkpoint_nvfp4_serialized = is_checkpoint_nvfp4_serialized
         if is_checkpoint_nvfp4_serialized:
-            logger.warning(
+            log_warning_on_rank0(
+                logger,
                 "Detected nvfp4 checkpoint. Please note that the "
-                "format is experimental and subject to change."
+                "format is experimental and subject to change.",
             )
         self.group_size = group_size
         self.use_per_token_activation = (

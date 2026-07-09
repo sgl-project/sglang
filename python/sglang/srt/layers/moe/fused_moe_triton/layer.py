@@ -73,7 +73,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     is_cpu,
     is_hip,
-    print_info_once,
+    log_info_on_rank0,
     round_up,
 )
 from sglang.srt.utils.custom_op import register_custom_op
@@ -127,6 +127,9 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
         )
     else:
         raise NotImplementedError(f"Unsupported a2a backend: {a2a_backend}")
+
+
+logger = logging.getLogger(__name__)
 
 
 class FusedMoeWeightScaleSupported(Enum):
@@ -298,11 +301,12 @@ class FusedMoE(torch.nn.Module):
             and get_moe_runner_backend().is_flashinfer_trtllm()
             and isinstance(self.quant_method, ModelOptNvFp4FusedMoEMethod)
         )
-        print_info_once(
+        log_info_on_rank0(
+            logger,
             "FlashInfer TRTLLM MoE deferred finalize is "
             f"{'enabled' if self.supports_deferred_finalize else 'disabled'} "
             f"(moe_runner_backend={server_args.moe_runner_backend}, "
-            f"quant_method={type(self.quant_method).__name__})."
+            f"quant_method={type(self.quant_method).__name__}).",
         )
 
         self.quant_method.create_weights(
@@ -329,8 +333,9 @@ class FusedMoE(torch.nn.Module):
             or get_moe_runner_backend().is_flashinfer_trtllm()
         ):
             if self.moe_runner_config.inplace:
-                print_info_once(
-                    "Setting inplace to False for FlashInfer TRTLLM MoE backend."
+                log_info_on_rank0(
+                    logger,
+                    "Setting inplace to False for FlashInfer TRTLLM MoE backend.",
                 )
             self.moe_runner_config.inplace = False
 

@@ -218,6 +218,7 @@ from sglang.srt.utils import (
     is_host_cpu_arm64,
     is_npu,
     log_info_on_rank0,
+    log_warning_on_rank0,
     monkey_patch_p2p_access_check,
     require_gathered_buffer,
     reserve_rope_cache_for_long_sequences,
@@ -1490,10 +1491,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         self.model.__class__,
                     )
             else:
-                logger.warning(
+                log_warning_on_rank0(
+                    logger,
                     "Using FP8 KV cache but no scaling factors "
-                    "provided. Defaulting to scaling factors of 1.0. "
-                    "This may lead to less accurate results!"
+                    "provided. Defaulting to scaling factors of 1.0.",
                 )
 
         # Parse other args
