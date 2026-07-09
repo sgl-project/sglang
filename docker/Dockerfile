@@ -57,6 +57,10 @@ RUN --mount=type=cache,target=/var/cache/apt,id=base-apt \
     && cd /usr/lib/python3/dist-packages/ \
     && ln -s apt_pkg.cpython-312-*-linux-gnu.so apt_pkg.so
 
+# create virtual env for sglang to avoid conflict with system python packages
+RUN python3 -m venv /opt/sglang
+ENV PATH="/opt/sglang/bin:${PATH}"
+
 # Install system dependencies (organized by category for better caching)
 RUN --mount=type=cache,target=/var/cache/apt,id=base-apt \
     apt-get update && apt-get install -y --no-install-recommends \
@@ -344,8 +348,8 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     && mkdir -p /flashinfer_jit_output \
     && if [ "$INSTALL_FLASHINFER_JIT_CACHE" = "1" ]; then \
         python3 -m pip install flashinfer-jit-cache==${FLASHINFER_VERSION} --index-url https://flashinfer.ai/whl/cu${CUINDEX} \
-        && cp -r /usr/local/lib/python3.12/dist-packages/flashinfer_jit_cache /flashinfer_jit_output/ \
-        && cp -r /usr/local/lib/python3.12/dist-packages/flashinfer_jit_cache-*.dist-info /flashinfer_jit_output/ ; \
+        && cp -r /opt/sglang/lib/python3.12/site-packages/flashinfer_jit_cache /flashinfer_jit_output/ \
+        && cp -r /opt/sglang/lib/python3.12/site-packages/flashinfer_jit_cache-*.dist-info /flashinfer_jit_output/ ; \
     fi
 
 ########################################################
@@ -459,7 +463,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     pip install /tmp/wheels/deepep/*.whl && rm -rf /tmp/wheels/deepep
 
 # Copy flashinfer jit-cache package (if installed)
-COPY --from=flashinfer_cache /flashinfer_jit_output/ /usr/local/lib/python3.12/dist-packages/
+COPY --from=flashinfer_cache /flashinfer_jit_output/ /opt/sglang/lib/python3.12/site-packages/
 
 # Copy dev tools
 COPY --from=devtools_builder /tools/diff-so-fancy /usr/local/bin/
@@ -691,7 +695,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
          [ "$success" = "1" ] ) \
     && mkdir -p /root/.cache/huggingface /root/.cache/sglang \
     && ( if [ -f python/kernels.lock ]; then mv python/kernels.lock /root/.cache/sglang/; fi ) \
-    && ( find /usr/local/lib/python3.12/dist-packages -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true )
+    && ( find /opt/sglang/lib/python3.12/site-packages -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true )
 
 
 # Install pre-built gateway artifacts from parallel builder
@@ -815,6 +819,10 @@ RUN --mount=type=cache,target=/var/cache/apt,id=runtime-apt \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 
+# create virtual env for sglang to avoid conflict with system python packages
+RUN python3 -m venv /opt/sglang
+ENV PATH="/opt/sglang/bin:${PATH}"
+
 # Set up locale
 RUN apt-get update && apt-get install -y --no-install-recommends locales \
     && locale-gen en_US.UTF-8 \
@@ -836,19 +844,19 @@ RUN --mount=type=cache,target=/var/cache/apt,id=runtime-apt \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy Python site-packages from framework (already cleaned of __pycache__/tests/pyc files)
-COPY --from=framework_final /usr/local/lib/python3.12/dist-packages /usr/local/lib/python3.12/dist-packages
+COPY --from=framework_final /opt/sglang/lib/python3.12/site-packages /opt/sglang/lib/python3.12/site-packages
 
 # Copy SGLang workspace
 COPY --from=framework_final /sgl-workspace /sgl-workspace
 
 # Copy sgl-model-gateway binary
-COPY --from=framework_final /usr/local/bin/sgl-model-gateway /usr/local/bin/sgl-model-gateway
+COPY --from=framework_final /opt/sglang/bin/sgl-model-gateway /opt/sglang/bin/sgl-model-gateway
 
 # Copy sglang binary
-COPY --from=framework_final /usr/local/bin/sglang /usr/local/bin/sglang
+COPY --from=framework_final /opt/sglang/bin/sglang /opt/sglang/bin/sglang
 
 # Copy py-spy binary
-COPY --from=framework_final /usr/local/bin/py-spy /usr/local/bin/py-spy
+COPY --from=framework_final /opt/sglang/bin/py-spy /opt/sglang/bin/py-spy
 
 # Copy cache for kernels from kernels community
 COPY --from=framework_final /root/.cache/huggingface /root/.cache/huggingface
