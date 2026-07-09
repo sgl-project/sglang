@@ -156,7 +156,7 @@ class TritonKDAKernel(LinearAttnKernelBase):
         dt_bias: Optional[torch.Tensor] = None,
         lower_bound: Optional[float] = None,
         **kwargs,
-    ) -> torch.Tensor:
+    ) -> tuple:
         return chunk_kda(
             q=q,
             k=k,
@@ -170,4 +170,5 @@ class TritonKDAKernel(LinearAttnKernelBase):
             A_log=A_log,
             dt_bias=dt_bias,
             lower_bound=lower_bound,
+            output_intermediate_states=True,
         )

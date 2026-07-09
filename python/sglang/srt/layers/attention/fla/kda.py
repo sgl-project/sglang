@@ -1128,9 +1128,9 @@ def chunk_kda_fwd(
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
     )
-    del Aqk, v_new, h
+    del Aqk, v_new
 
-    return o
+    return o, h
 
 
 def chunk_kda(
@@ -1147,6 +1147,7 @@ def chunk_kda(
     A_log: Optional[torch.Tensor] = None,
     dt_bias: Optional[torch.Tensor] = None,
     lower_bound: Optional[float] = None,
+    output_intermediate_states: bool = False,
     **kwargs,
 ):
     if scale is None:
@@ -1156,7 +1157,7 @@ def chunk_kda(
         q = l2norm_fwd(q.contiguous())
         k = l2norm_fwd(k.contiguous())
 
-    o = chunk_kda_fwd(
+    o, h = chunk_kda_fwd(
         q=q,
         k=k,
         v=v.contiguous(),
@@ -1170,4 +1171,6 @@ def chunk_kda(
         dt_bias=dt_bias,
         lower_bound=lower_bound,
     )
+    if output_intermediate_states:
+        return o, h
     return o

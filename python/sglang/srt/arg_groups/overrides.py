@@ -1089,6 +1089,7 @@ _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
         "BailingMoeV2_5ForCausalLM",
         "FalconH1ForCausalLM",
         "GraniteMoeHybridForCausalLM",
+        "KimiLinearForCausalLM",
         "NemotronHForCausalLM",
         "NemotronHPuzzleForCausalLM",
     }
