@@ -225,18 +225,14 @@ class BenchArgs:
             "--fixed-prompt-file",
             type=str,
             default=BenchArgs.fixed_prompt_file,
-            help="If set, every request in the batch uses this file's prompt "
-            "(tokenized, replicated batch_size times) instead of --dataset-name, "
-            "so the accept length is a controlled constant across bs and arms.",
+            help="Use this file's prompt for every request in the batch, "
+            "bypassing --dataset-name.",
         )
         parser.add_argument(
             "--apply-chat-template",
             action="store_true",
-            help="Encode the prompt as a single user message through the model's "
-            "chat template instead of raw tokenization, so the accept length "
-            "matches the /v1/chat/completions serving distribution. Currently "
-            "only effective with --fixed-prompt-file (the other datasets "
-            "generate token ids, not text).",
+            help="Encode the prompt as a single user message through the "
+            "model's chat template. Requires --fixed-prompt-file.",
         )
         parser.add_argument(
             "--gsp-num-groups",
