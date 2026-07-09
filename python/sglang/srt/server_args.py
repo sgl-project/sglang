@@ -4319,7 +4319,6 @@ class ServerArgs:
                 if is_gfx1250_supported():
                     envs.SGLANG_OPT_USE_AITER_MHC_PRE.set(False)
                     envs.SGLANG_OPT_USE_AITER_MHC_POST.set(False)
-                    envs.SGLANG_OPT_USE_AITER_INDEXER.set(False)
                     envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.set(True)
 
         elif model_arch in ["GptOssForCausalLM"]:
