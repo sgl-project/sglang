@@ -2807,6 +2807,9 @@ class ServerArgs:
         # Must run after the attention backend is resolved so the trtllm_mla
         # default (auto-selected for DeepseekV3ForCausalLM on sm100) is visible.
         self._disable_prefill_cuda_graph_for_deepseek_trtllm_mla()
+        # Must run after cuda graph config resolution so it has the final say
+        # over any prefill graph backend (default or explicit).
+        self._disable_prefill_cuda_graph_for_layer_pipeline()
         self._handle_mamba_backend()
         self._handle_int8_mamba_checkpoint()
         self._handle_linear_attn_backend()
@@ -3611,6 +3614,28 @@ class ServerArgs:
             "the trtllm_mla attention backend (a captured prefill graph forces a "
             "FlashAttention fallback that regresses prefill). Set the prefill cuda graph "
             "backend explicitly (e.g. --cuda-graph-backend-prefill tc_piecewise) to override.",
+            self.cuda_graph_config.prefill.backend,
+        )
+        self.cuda_graph_config.prefill.backend = Backend.DISABLED
+
+    def _disable_prefill_cuda_graph_for_layer_pipeline(self):
+        """Disable prefill CUDA graph when layer pipeline is enabled.
+
+        Layer pipeline ships each layer group's KV via a Python hook fired
+        inside ``RadixAttention.forward``. A captured prefill CUDA graph
+        (breakable or tc_piecewise) replays without executing that Python
+        call, so the hook never fires, ``_hook_enqueued_chunks`` stays 0, and
+        the sender trips its fail-loud contract guard. Force prefill eager;
+        the decode CUDA graph is untouched.
+        """
+        if not self.enable_disagg_layer_pipeline:
+            return
+        if self.cuda_graph_config.prefill.backend == Backend.DISABLED:
+            return
+        logger.warning(
+            "Disabling prefill CUDA graph (was %s) because "
+            "--enable-disagg-layer-pipeline requires eager prefill so the "
+            "per-layer KV-transfer hook runs.",
             self.cuda_graph_config.prefill.backend,
         )
         self.cuda_graph_config.prefill.backend = Backend.DISABLED
