@@ -751,7 +751,7 @@ async def server_info():
 async def get_load():
     """Get load metrics (deprecated - use /v1/loads instead).
 
-    Legacy shim backed by /v1/loads. Projects GetLoadsReqOutput down to the
+    Legacy shim backed by /v1/loads. Projects the load snapshot down to the
     historical field shape (dp_rank, num_reqs, num_waiting_reqs, num_tokens,
     num_pending_tokens, ts_tic) so existing clients keep working.
     """
