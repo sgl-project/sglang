@@ -18,6 +18,10 @@ constraints:
 - default softmax scaling (``head_dim ** -0.5``), no sliding window,
   no logit cap, decoder-only attention
 
+Note that the HPC-Ops kernels are currently tuned primarily for H20: on other
+GPUs (H100/H200/B200, ...) the speedup over the default attention backend may
+be limited or absent.
+
 Enable it explicitly with ``--attention-backend hpc_ops``.
 """
 
