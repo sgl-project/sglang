@@ -3364,6 +3364,7 @@ class BumpAllocator:
 
 
 def log_info_on_rank0(logger, msg):
+
     try:
         if torch.distributed.is_initialized() and get_parallel().tp_rank == 0:
             logger.info(msg)
