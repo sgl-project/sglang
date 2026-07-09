@@ -700,16 +700,22 @@ class NPUSingleLevelMXFP4LinearMethod(_NPULinearMethodBase):
         qw, w_scale = torch.ops.npu.npu_dynamic_mx_quant(
             weight_fp, dst_type=fp4_dtype, round_mode="round"
         )
-        # Pre-transpose weight/scale to [in//2, out] / [in//32, out] for
-        # npu_quant_matmul; use .data= to preserve the non-contiguous transpose
-        # view (npu_quant_matmul reads strides directly — .contiguous() would
-        # reorder data and break block-scale alignment). The activation-side FP4
-        # path keeps the scale 2D here (the offline path re-layouts to 3D to match
-        # its packed-checkpoint format).
+        # Pre-transpose the weight to [in//2, out] for npu_quant_matmul; use
+        # .data= to preserve the non-contiguous transpose view (npu_quant_matmul
+        # reads strides directly — .contiguous() would reorder data and break
+        # block-scale alignment).
         layer.weight = Parameter(qw, requires_grad=False)
         layer.weight.data = layer.weight.data.transpose(0, 1)
-        layer.weight_scale = Parameter(w_scale, requires_grad=False)
-        layer.weight_scale.data = layer.weight_scale.data.transpose(0, 1)
+
+        # weight_scale -> [in//64, out, 2] (3D), matching the offline W4A4 path,
+        # the W4A8 path and vllm-ascend's W4A4_MXFP4 layout. npu_dynamic_mx_quant
+        # already returns the scale as [out, in//64, 2] (3D) on current builds;
+        # older builds may return [out, in//32] (2D) — reshape those first so the
+        # transpose always yields the 3D layout npu_quant_matmul requires.
+        if w_scale.dim() == 2:
+            n, k = w_scale.shape
+            w_scale = w_scale.reshape(n, k // 2, 2)
+        layer.weight_scale = Parameter(w_scale.transpose(-3, -2), requires_grad=False)
 
     def apply(
         self,
