@@ -7,6 +7,7 @@ a fake tokenizer; pure CPU. Each test guards a distinct branch of
 
 import unittest
 from array import array
+from unittest.mock import patch
 
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -135,6 +136,32 @@ class TestStopStrSpeculative(unittest.TestCase):
         self.assertTrue(req.finished())
         self.assertEqual(req.finished_reason.matched, r"\.$")
         self.assertEqual(req.finished_len, 2)
+
+    def test_stop_regex_prefix_timeout_uses_full_tail_match(self):
+        # Spec decode may accept the full regex match in one multi-token step,
+        # then scan shorter prefixes to locate the earliest finished_len. Those
+        # prefix probes must use the guarded matcher too; a timeout means that
+        # prefix is not a usable earlier stop point.
+        req = _make_req([60, 60, 60, 60, 60, 62], stop_regex=[r"(a+)+b"])
+        seen = []
+
+        def fake_match_stop_regex(stop_regex, text):
+            seen.append(text)
+            if text.endswith("b"):
+                return True
+            raise TimeoutError
+
+        with patch(
+            "sglang.srt.managers.schedule_batch.match_stop_regex",
+            side_effect=fake_match_stop_regex,
+        ):
+            req.update_finish_state(new_accepted_len=6)
+
+        self.assertTrue(req.finished())
+        self.assertEqual(req.finished_reason.matched, r"(a+)+b")
+        self.assertEqual(req.finished_len, 6)
+        self.assertGreater(len(seen), 1)
+        self.assertIn("a", seen)
 
     # --- decoded_text-only branch ---
     def test_stop_str_only_in_decoded_text_sets_no_finished_len(self):

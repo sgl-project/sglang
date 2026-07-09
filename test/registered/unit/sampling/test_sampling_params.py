@@ -7,6 +7,7 @@ register_cpu_ci(est_time=7, suite="base-c-test-cpu")
 register_xpu_ci(est_time=10, suite="stage-a-test-1-gpu-xpu")
 
 import copy
+import time
 import unittest
 from unittest.mock import MagicMock
 
@@ -14,9 +15,11 @@ import msgspec
 
 from sglang.srt.sampling.sampling_params import (
     MAX_LEN,
+    STOP_REGEX_MATCH_TIMEOUT,
     TOP_K_ALL,
     SamplingParams,
     get_max_seq_length,
+    match_stop_regex,
 )
 from sglang.test.test_utils import CustomTestCase
 
@@ -518,6 +521,47 @@ class TestRegexMaxLength(CustomTestCase):
         """Test that lookbehind (?<=x) hits the unhandled-token fallback (MAX_LEN)."""
         result = get_max_seq_length("(?<=x)y")
         self.assertGreaterEqual(result, MAX_LEN)
+
+
+class TestMatchStopRegex(CustomTestCase):
+    """Tests for the stop_regex matcher guarded against ReDoS."""
+
+    def test_matches_normal_pattern(self):
+        """A normal pattern present in the tail returns True."""
+        self.assertTrue(match_stop_regex(r"\d+", "abc123"))
+
+    def test_no_match_normal_pattern(self):
+        """A normal pattern absent from the tail returns False."""
+        self.assertFalse(match_stop_regex(r"\d+", "abcdef"))
+
+    def test_catastrophic_backtracking_pattern_returns_fast(self):
+        """A classic ReDoS pattern must not stall the scheduler loop.
+
+        `(a+)+b` against a long run of 'a' with no trailing 'b' is the
+        catastrophic-backtracking case that hangs Python's stdlib `re` for
+        minutes (exponential in the input length). The guarded matcher must
+        return promptly instead of blocking the engine.
+        """
+        start = time.monotonic()
+        matched = match_stop_regex("(a+)+b", "a" * 80)
+        elapsed = time.monotonic() - start
+        self.assertFalse(matched)
+        self.assertLess(elapsed, 5.0)
+
+    def test_pathological_pattern_raises_timeout(self):
+        """A pattern exceeding the time budget raises TimeoutError.
+
+        Req._check_str_based_finish catches this and aborts only the offending
+        request, so a single adversarial stop_regex cannot block the engine for
+        every other request. The budget is small, so this resolves well under
+        the asserted bound.
+        """
+        self.assertLessEqual(STOP_REGEX_MATCH_TIMEOUT, 1.0)
+        start = time.monotonic()
+        with self.assertRaises(TimeoutError):
+            match_stop_regex("(?:a|a|a|a){1,40}b", "a" * 60)
+        elapsed = time.monotonic() - start
+        self.assertLess(elapsed, 5.0)
 
 
 if __name__ == "__main__":
