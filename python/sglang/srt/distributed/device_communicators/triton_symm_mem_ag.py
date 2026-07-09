@@ -19,7 +19,6 @@ import triton.language as tl
 from sglang.srt.utils.common import is_cuda
 
 logger = logging.getLogger(__name__)
-_is_cuda = is_cuda()
 
 # Each thread moves _NUMEL_PER_THREAD bf16 via one 128-bit multimem op; the
 # grid-strided block count is tunable in [_MIN_BLOCKS, _MAX_BLOCKS].
@@ -464,7 +463,7 @@ class MultimemAllGatherer:
         self._max_tokens = int(max_tokens)
         self._skip_entry_sync = skip_entry_sync
         # None => always NCCL; _UNINIT => build on first eager call.
-        self._state = self._UNINIT if enabled and _is_cuda else None
+        self._state = self._UNINIT if enabled and is_cuda() else None
         if self._state is self._UNINIT:
             # Lazy import avoids a module-load dependency on the distributed facade.
             from sglang.srt.distributed import get_tp_group
