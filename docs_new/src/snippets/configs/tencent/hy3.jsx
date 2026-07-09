@@ -246,6 +246,7 @@ sgl-eval run aime26 \\
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
+        "--dtype bfloat16",
         "--reasoning-parser auto",
         "--tool-call-parser auto",
         "--tp 8",
@@ -263,6 +264,7 @@ sgl-eval run aime26 \\
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
+        "--dtype bfloat16",
         "--reasoning-parser auto",
         "--tool-call-parser auto",
         "--tp 8",
@@ -279,6 +281,7 @@ sgl-eval run aime26 \\
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
+        "--dtype bfloat16",
         "--reasoning-parser auto",
         "--tool-call-parser auto",
         "--tp 4",
@@ -295,6 +298,7 @@ sgl-eval run aime26 \\
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
+        "--dtype bfloat16",
         "--reasoning-parser auto",
         "--tool-call-parser auto",
         "--tp 4",
@@ -311,6 +315,7 @@ sgl-eval run aime26 \\
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
+        "--dtype bfloat16",
         "--reasoning-parser auto",
         "--tool-call-parser auto",
         "--tp 4",
@@ -327,6 +332,7 @@ sgl-eval run aime26 \\
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
+        "--dtype bfloat16",
         "--reasoning-parser auto",
         "--tool-call-parser auto",
         "--tp 4",
@@ -343,6 +349,7 @@ sgl-eval run aime26 \\
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
+        "--dtype bfloat16",
         "--reasoning-parser auto",
         "--tool-call-parser auto",
         "--tp 4",
@@ -359,6 +366,7 @@ sgl-eval run aime26 \\
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
+        "--dtype bfloat16",
         "--reasoning-parser auto",
         "--tool-call-parser auto",
         "--tp 4",
@@ -375,6 +383,7 @@ sgl-eval run aime26 \\
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
+        "--dtype bfloat16",
         "--reasoning-parser auto",
         "--tool-call-parser auto",
         "--tp 4",
@@ -391,6 +400,7 @@ sgl-eval run aime26 \\
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
+        "--dtype bfloat16",
         "--reasoning-parser auto",
         "--tool-call-parser auto",
         "--tp 4",
@@ -407,6 +417,7 @@ sgl-eval run aime26 \\
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
+        "--dtype bfloat16",
         "--reasoning-parser auto",
         "--tool-call-parser auto",
         "--tp 4",
@@ -423,6 +434,7 @@ sgl-eval run aime26 \\
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
+        "--dtype bfloat16",
         "--reasoning-parser auto",
         "--tool-call-parser auto",
         "--tp 4",
@@ -435,6 +447,7 @@ sgl-eval run aime26 \\
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
+        "--dtype bfloat16",
         "--reasoning-parser auto",
         "--tool-call-parser auto",
         "--tp 4",
@@ -451,6 +464,7 @@ sgl-eval run aime26 \\
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
+        "--dtype bfloat16",
         "--reasoning-parser auto",
         "--tool-call-parser auto",
         "--tp 4",
@@ -463,6 +477,7 @@ sgl-eval run aime26 \\
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
+        "--dtype bfloat16",
         "--reasoning-parser auto",
         "--tool-call-parser auto",
         "--tp 2",
@@ -479,6 +494,7 @@ sgl-eval run aime26 \\
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
+        "--dtype bfloat16",
         "--reasoning-parser auto",
         "--tool-call-parser auto",
         "--tp 2",
@@ -491,6 +507,7 @@ sgl-eval run aime26 \\
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
+        "--dtype bfloat16",
         "--reasoning-parser auto",
         "--tool-call-parser auto",
         "--tp 2",
@@ -507,6 +524,7 @@ sgl-eval run aime26 \\
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
+        "--dtype bfloat16",
         "--reasoning-parser auto",
         "--tool-call-parser auto",
         "--tp 2",
@@ -519,6 +537,7 @@ sgl-eval run aime26 \\
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
+        "--dtype bfloat16",
         "--reasoning-parser auto",
         "--tool-call-parser auto",
         "--tp 2",
@@ -535,6 +554,7 @@ sgl-eval run aime26 \\
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
+        "--dtype bfloat16",
         "--reasoning-parser auto",
         "--tool-call-parser auto",
         "--tp 2",

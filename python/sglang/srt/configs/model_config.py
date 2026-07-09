@@ -1577,6 +1577,17 @@ def _get_and_verify_dtype(
                         "want to use float16."
                     )
                     torch_dtype = torch.bfloat16
+                elif model_type == "hy_v3":
+                    # Hunyuan V3 checkpoints (tencent/Hy3, Hy3-FP8, Hy3-preview)
+                    # ship without a dtype in config.json but are bf16 models.
+                    # Defaulting to float16 breaks bf16-only kernels and
+                    # changes numerics, so downcast to bfloat16 instead.
+                    logger.info(
+                        "For Hunyuan V3, we downcast float32 to bfloat16 instead "
+                        "of float16 by default. Please specify `dtype` if you "
+                        "want to use float16."
+                    )
+                    torch_dtype = torch.bfloat16
                 else:
                     # Following the common practice, we use float16 for float32
                     # models.

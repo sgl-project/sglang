@@ -205,6 +205,7 @@ Enable the reasoning parser during deployment so the thinking section is separat
 ```bash Command
 sglang serve \
   --model-path tencent/Hy3 \
+  --dtype bfloat16 \
   --tp 8 \
   --reasoning-parser auto \
   --tool-call-parser auto
@@ -277,6 +278,7 @@ Hy3 supports streaming OpenAI-compatible tool calls. Enable both parsers togethe
 ```bash Command
 sglang serve \
   --model-path tencent/Hy3 \
+  --dtype bfloat16 \
   --tp 8 \
   --reasoning-parser auto \
   --tool-call-parser auto

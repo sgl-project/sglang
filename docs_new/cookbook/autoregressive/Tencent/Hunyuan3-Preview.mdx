@@ -155,6 +155,7 @@ import { Hunyuan3PreviewDeployment } from '/src/snippets/autoregressive/hunyuan3
 ```bash Command
 sglang serve \
   --model-path tencent/Hy3-preview \
+  --dtype bfloat16 \
   --tp 8 \
   --speculative-algorithm EAGLE \
   --speculative-num-steps 3 \
@@ -183,6 +184,7 @@ For basic API usage and request examples, please refer to:
 ```bash Command
 sglang serve \
   --model-path tencent/Hy3-preview \
+  --dtype bfloat16 \
   --tp 8 \
   --reasoning-parser hunyuan \
   --tool-call-parser hunyuan \
@@ -252,6 +254,7 @@ Enable the reasoning parser during deployment so that the thinking section (`<th
 ```bash Command
 sglang serve \
   --model-path tencent/Hy3-preview \
+  --dtype bfloat16 \
   --tp 8 \
   --reasoning-parser hunyuan \
   --trust-remote-code \
@@ -339,6 +342,7 @@ Hy3-preview supports streaming OpenAI-compatible tool calls. Enable both parsers
 ```bash Command
 sglang serve \
   --model-path tencent/Hy3-preview \
+  --dtype bfloat16 \
   --tp 8 \
   --reasoning-parser hunyuan \
   --tool-call-parser hunyuan \
