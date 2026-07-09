@@ -395,11 +395,10 @@ class TopK(MultiPlatformOp):
             assert num_expert_group is not None and topk_group is not None
 
         self.layer_id = layer_id
-        from sglang.srt.server_args import get_global_server_args
+        from sglang.srt.runtime_context import get_server_args
 
         self.enable_deepep_waterfill = (
-            num_fused_shared_experts > 0
-            and get_global_server_args().enable_deepep_waterfill
+            num_fused_shared_experts > 0 and get_server_args().enable_deepep_waterfill
         )
 
         self.deepep_waterfill_balancer = None
@@ -475,9 +474,9 @@ class TopK(MultiPlatformOp):
         # ===== TO BE REFACTORED ====
         elif get_moe_runner_backend().is_experimental_sgl_trtllm():
             try:
-                from sglang.srt.server_args import get_global_server_args
+                from sglang.srt.runtime_context import get_server_args
 
-                use_standard_for_lora = bool(get_global_server_args().enable_lora)
+                use_standard_for_lora = bool(get_server_args().enable_lora)
             except ValueError:
                 use_standard_for_lora = False
             output_format = (
@@ -1286,10 +1285,10 @@ def _eplb_remap_enabled() -> bool:
     # initial expert placement is non-trivial, or there are redundant physical
     # experts. Otherwise the map is identity and the remap must be skipped (it is
     # both unnecessary and not well-defined over the padded region of topk_ids).
-    from sglang.srt.server_args import get_global_server_args
+    from sglang.srt.runtime_context import get_server_args
 
     try:
-        server_args = get_global_server_args()
+        server_args = get_server_args()
     except ValueError:
         # Global server args are not initialized outside the server runtime
         # (e.g. in unit tests that call select_experts directly). In that case

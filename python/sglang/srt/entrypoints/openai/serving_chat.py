@@ -293,24 +293,15 @@ class OpenAIServingChat(OpenAIServingBase):
 
         Override in subclass to add custom encoding specs.
         """
-        if self.tool_call_parser == "deepseekv4":
-            return "dsv4"
-        if self.tool_call_parser == "deepseekv32":
-            return "dsv32"
-
-        architectures = self.tokenizer_manager.model_config.hf_config.architectures
-        arch = architectures[0] if architectures else ""
-
-        if "DeepseekV4" in arch:
-            return "dsv4"
-
-        has_chat_template = (
-            self.tokenizer_manager.tokenizer is not None
-            and self.tokenizer_manager.tokenizer.chat_template is not None
+        from sglang.srt.entrypoints.openai.chat_encoding import (
+            resolve_chat_encoding_spec,
         )
-        if "DeepseekV3" in arch and not has_chat_template:
-            return "dsv32"
-        return None
+
+        return resolve_chat_encoding_spec(
+            hf_config=self.tokenizer_manager.model_config.hf_config,
+            tokenizer=self.tokenizer_manager.tokenizer,
+            tool_call_parser=self.tool_call_parser,
+        )
 
     def _request_id_prefix(self) -> str:
         return "chatcmpl-"

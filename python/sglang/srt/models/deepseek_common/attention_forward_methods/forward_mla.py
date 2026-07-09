@@ -67,7 +67,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _use_aiter_bpreshuffle_gfx95,
     _use_aiter_gfx95,
 )
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_server_args
 from sglang.srt.state_capturer.indexer_topk import (
     maybe_capture_indexer_topk,
 )
@@ -178,7 +178,7 @@ def _should_defer_dsa_cp_kv_gather(
 class DeepseekMLAForwardMixin:
     def init_mla_forward(self: DeepseekV2AttentionMLA):
         self.flashinfer_mla_disable_ragged = (
-            get_global_server_args().flashinfer_mla_disable_ragged
+            get_server_args().flashinfer_mla_disable_ragged
         )
 
     def should_run_indexer(
@@ -1002,8 +1002,8 @@ class DeepseekMLAForwardMixin:
         """
         if self.current_attention_backend in ("dsa", "nsa"):
             return (
-                get_global_server_args().dsa_decode_backend == "trtllm"
-                or get_global_server_args().dsa_prefill_backend == "trtllm"
+                get_server_args().dsa_decode_backend == "trtllm"
+                or get_server_args().dsa_prefill_backend == "trtllm"
             ) and get_attn_backend().kv_cache_dtype == torch.float8_e4m3fn
 
         return (
@@ -1020,7 +1020,7 @@ class DeepseekMLAForwardMixin:
         """
         Check if we should skip rope and use fused rope+cache path for TileLang DSA on gfx95.
         """
-        server_args = get_global_server_args()
+        server_args = get_server_args()
         return (
             _use_aiter_gfx95
             and self.current_attention_backend in ("dsa", "nsa")

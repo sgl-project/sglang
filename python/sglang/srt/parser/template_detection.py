@@ -558,7 +558,7 @@ def _resolve_auto_parser(
     """Resolve a single auto parser, updating server_args in place."""
     detected = match_rules(ctx, rules, label)
     if detected:
-        setattr(server_args, attr, detected)
+        server_args.override(source="template-detection", **{attr: detected})
         logger.info(
             f"Auto-detected --{attr.replace('_', '-')} as '{detected}' from chat template"
         )
@@ -567,7 +567,7 @@ def _resolve_auto_parser(
             f"--{attr.replace('_', '-')}=auto specified but could not detect "
             f"{label} from chat template. Disabling {label}."
         )
-        setattr(server_args, attr, None)
+        server_args.override(source="template-detection", **{attr: None})
 
 
 def _load_explicit_jinja_template(chat_template_arg: Optional[str]) -> Optional[str]:
@@ -586,7 +586,7 @@ def _disable_auto_parser(server_args, attr: str, label: str) -> None:
         f"--{attr.replace('_', '-')}=auto specified but could not detect "
         f"{label} from chat template. Disabling {label}."
     )
-    setattr(server_args, attr, None)
+    server_args.override(source="template-detection", **{attr: None})
 
 
 def _resolve_architecture_auto_parsers(server_args) -> None:
@@ -613,7 +613,7 @@ def _resolve_architecture_auto_parsers(server_args) -> None:
         ("tool_call_parser", tool_call_parser),
     ):
         if getattr(server_args, attr) == "auto":
-            setattr(server_args, attr, detected)
+            server_args.override(source="template-detection", **{attr: detected})
             logger.info(
                 f"Auto-detected --{attr.replace('_', '-')} as '{detected}' "
                 f"from model architecture '{arch}'"

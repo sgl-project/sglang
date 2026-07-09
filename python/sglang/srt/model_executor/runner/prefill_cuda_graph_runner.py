@@ -43,7 +43,6 @@ from typing import TYPE_CHECKING, Dict, Optional, Union
 import torch
 import tqdm
 
-from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.distributed.parallel_state import graph_capture
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
@@ -91,6 +90,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
 from sglang.srt.model_executor.runner_utils.buffers import (
     PrefillInputBuffers,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.eagle_utils import get_draft_input_from_target_hidden_dim
 from sglang.srt.utils import (
     get_available_gpu_memory,
@@ -761,11 +761,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         )
         capture_range = (
             tqdm.tqdm(list(reversed(self.capture_num_tokens)))
-            if get_tensor_model_parallel_rank() == 0
+            if get_parallel().tp_rank == 0
             else reversed(self.capture_num_tokens)
         )
         for num_tokens in capture_range:
-            if get_tensor_model_parallel_rank() == 0:
+            if get_parallel().tp_rank == 0:
                 avail_mem = get_available_gpu_memory(
                     self.model_runner.device,
                     self.model_runner.gpu_id,
