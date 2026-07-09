@@ -342,6 +342,8 @@ def maybe_load_fsdp_model(
     for _, module in model.named_modules():
         quant_method = getattr(module, "quant_method", None)
         if quant_method is not None:
+            if use_fsdp and isinstance(quant_method, UnquantizedLinearMethod):
+                continue
             # When quant methods need to process weights after loading
             # (for repacking, quantizing, etc), they expect parameters
             # to be on the global target device. This scope is for the

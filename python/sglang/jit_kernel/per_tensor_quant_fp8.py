@@ -42,4 +42,4 @@ def per_tensor_quant_fp8(
         is_static: If True, assumes scale is pre-computed and skips absmax computation
     """
     module = _jit_per_tensor_quant_fp8_module(is_static, input.dtype)
-    module.per_tensor_quant_fp8(input.view(-1), output_q.view(-1), output_s.view(-1))
+    module.per_tensor_quant_fp8(input.reshape(-1), output_q.view(-1), output_s.view(-1))
