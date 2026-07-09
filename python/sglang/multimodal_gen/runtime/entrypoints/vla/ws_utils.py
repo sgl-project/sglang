@@ -47,6 +47,11 @@ async def run_action_msgpack_ws(
         except WebSocketDisconnect:
             break
         except Exception:
-            await websocket.send_text(traceback.format_exc())
+            try:
+                await websocket.send_bytes(
+                    pack_msgpack({"error": traceback.format_exc()})
+                )
+            except Exception:
+                pass
             await websocket.close(code=1011, reason="Internal server error")
             raise

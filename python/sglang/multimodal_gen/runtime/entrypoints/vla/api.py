@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Request, Response, WebSocket
+from fastapi import APIRouter, HTTPException, Request, Response, WebSocket
 
 from sglang.multimodal_gen.runtime.entrypoints.vla.protocol import (
     action_generation_response,
@@ -43,22 +43,25 @@ def _prefer_numpy_output(payload: dict) -> None:
 @router.post("/generations")
 async def create_action_generation(request: Request):
     server_args: ServerArgs = request.app.state.server_args
-    if "msgpack" in request.headers.get("content-type", "").lower():
-        payload = unpack_msgpack(await request.body())
-    else:
-        payload = await request.json()
-    wants_msgpack = _wants_msgpack(request)
-    if wants_msgpack:
-        _prefer_numpy_output(payload)
-    output = await infer_action(payload, server_args)
-    if _response_format(payload) == "raw":
-        response = action_raw_response(output, preserve_numpy=wants_msgpack)
-    else:
-        response = action_generation_response(
-            output,
-            server_args,
-            preserve_numpy=wants_msgpack,
-        )
+    try:
+        if "msgpack" in request.headers.get("content-type", "").lower():
+            payload = unpack_msgpack(await request.body())
+        else:
+            payload = await request.json()
+        wants_msgpack = _wants_msgpack(request)
+        if wants_msgpack:
+            _prefer_numpy_output(payload)
+        output = await infer_action(payload, server_args)
+        if _response_format(payload) == "raw":
+            response = action_raw_response(output, preserve_numpy=wants_msgpack)
+        else:
+            response = action_generation_response(
+                output,
+                server_args,
+                preserve_numpy=wants_msgpack,
+            )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     if wants_msgpack:
         return Response(
             content=pack_msgpack(response), media_type="application/msgpack"

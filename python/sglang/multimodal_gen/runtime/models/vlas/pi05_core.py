@@ -194,7 +194,12 @@ class PiGemmaRMSNorm(nn.Module):
         dtype = x.dtype
         variance = torch.mean(torch.square(x.float()), dim=-1, keepdim=True)
         normed = x * torch.rsqrt(variance + self.eps)
-        if cond is None or self.dense is None:
+        if cond is None:
+            if self.dense is not None:
+                return normed.type_as(x), None
+            normed = normed * (1.0 + self.weight.float())
+            return normed.type_as(x), None
+        if self.dense is None:
             normed = normed * (1.0 + self.weight.float())
             return normed.type_as(x), None
 

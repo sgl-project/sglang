@@ -741,16 +741,18 @@ class Pi05PolicyModel(nn.Module):
                 loaded_keys.add(target_key)
 
         missing = [key for key in target_state if key not in loaded_keys]
-        if missing or unexpected or mismatched:
-            logger.warning(
-                "Pi05 weight load: %d loaded, %d missing, %d unexpected, %d mismatched",
-                len(loaded_keys),
-                len(missing),
-                unexpected,
-                mismatched,
+        if missing or mismatched:
+            raise RuntimeError(
+                f"Pi05 weight load failed: {len(missing)} missing weights, "
+                f"{mismatched} mismatched weights. Running a robot policy with "
+                "uninitialized or partially loaded weights is unsafe."
             )
-            if missing:
-                logger.warning("First missing Pi05 weights: %s", missing[:8])
+        if unexpected:
+            logger.warning(
+                "Pi05 weight load: %d loaded, %d unexpected",
+                len(loaded_keys),
+                unexpected,
+            )
         else:
             logger.info("Pi05 weights loaded successfully")
 

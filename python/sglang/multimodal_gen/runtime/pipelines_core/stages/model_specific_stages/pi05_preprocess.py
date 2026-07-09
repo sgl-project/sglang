@@ -34,8 +34,9 @@ def _tensor_from_image(value: Any) -> torch.Tensor:
             raise ValueError(
                 f"Could not infer image channels from shape {tensor.shape}"
             )
+        is_integer = not tensor.is_floating_point()
         tensor = tensor.to(dtype=torch.float32)
-        if tensor.max() > 2.0:
+        if is_integer or tensor.max() > 2.0:
             tensor = tensor / 255.0
         return tensor
 
@@ -57,8 +58,9 @@ def _tensor_from_image(value: Any) -> torch.Tensor:
             raise ValueError(
                 f"Could not infer image channels from shape {tensor.shape}"
             )
+        is_integer = not tensor.is_floating_point()
         tensor = tensor.to(dtype=torch.float32)
-        if tensor.max() > 2.0:
+        if is_integer or tensor.max() > 2.0:
             tensor = tensor / 255.0
         return tensor
 
