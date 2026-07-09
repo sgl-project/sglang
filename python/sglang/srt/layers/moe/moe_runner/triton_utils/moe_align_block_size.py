@@ -6,7 +6,7 @@ import torch
 import triton
 
 from sglang.srt.environ import envs
-from sglang.srt.utils import is_cuda, is_hip, is_musa, is_xpu
+from sglang.srt.utils import is_cuda, is_hip, is_musa, is_rdna_supported, is_xpu
 
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 
@@ -14,6 +14,7 @@ _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_xpu = is_xpu()
 _is_musa = is_musa()
+_is_rdna = _is_hip and is_rdna_supported()
 
 if _is_cuda or _is_hip or _is_xpu or _is_musa:
     from sgl_kernel import moe_align_block_size as sgl_moe_align_block_size
@@ -78,11 +79,16 @@ def moe_align_block_size(
     )
 
     # ===== TO BE REFACTORED ====
-    use_jit_align = False
+    # RDNA (gfx11xx/gfx12xx) always uses the JIT kernel: it hardcodes WARP_SIZE=32
+    # for both host and device compile passes, avoiding the host/device WARP_SIZE
+    # split that the sgl-kernel C++ moe_align_kernel.cu has on RDNA fat builds.
+    use_jit_align = _is_rdna
     if _SGLANG_EXPERIMENTAL_LORA_OPTI:
         from sglang.srt.lora.trtllm_lora_temp.environ import lora_envs
 
-        use_jit_align = lora_envs.SGLANG_OPT_USE_JIT_KERNEL_MOE_ALIGN.get()
+        use_jit_align = (
+            use_jit_align or lora_envs.SGLANG_OPT_USE_JIT_KERNEL_MOE_ALIGN.get()
+        )
     if use_jit_align:
         from sglang.jit_kernel.moe_align import (
             moe_align_block_size as jit_moe_align_block_size,

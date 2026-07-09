@@ -109,6 +109,7 @@ from sglang.srt.utils import (
     is_hip,
     is_musa,
     is_npu,
+    is_rdna_supported,
     is_xpu,
 )
 from sglang.srt.utils.patch_torch import register_fake_if_exists
@@ -129,6 +130,7 @@ _is_npu = is_npu()
 _is_xpu = is_xpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_musa = is_musa()
+_is_rdna = _is_hip and is_rdna_supported()
 
 if _is_cuda:
     from sgl_kernel import moe_fused_gate
@@ -500,7 +502,10 @@ class TopK(MultiPlatformOp):
                 expert_location_dispatch_info=expert_location_dispatch_info,
             )
         else:
-            self.topk_config.torch_native = False
+            # WARP_SIZE in the sgl-kernel topk_softmax/topk_sigmoid kernels resolves
+            # differently for host vs. device compile passes on RDNA (wave32) fat
+            # builds, so route RDNA through the pure-PyTorch fallback instead.
+            self.topk_config.torch_native = _is_rdna
             with use_symmetric_memory(
                 get_tp_group(), disabled=not is_allocation_symmetric()
             ):

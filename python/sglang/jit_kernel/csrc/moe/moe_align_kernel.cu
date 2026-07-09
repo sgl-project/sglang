@@ -43,7 +43,7 @@ inline uint32_t next_pow2(uint32_t x) noexcept {
 
 namespace moe {
 
-__device__ __forceinline__ int warp_exclusive_scan(int v, unsigned mask = 0xffffffffu) {
+__device__ __forceinline__ int warp_exclusive_scan(int v, uint64_t mask = 0xffffffffffffffffull) {
   int original = v;
 #pragma unroll
   for (int offset = 1; offset < WARP_SIZE; offset <<= 1) {
