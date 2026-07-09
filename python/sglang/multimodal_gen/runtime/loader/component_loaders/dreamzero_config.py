@@ -14,7 +14,6 @@ import os
 from pathlib import Path
 from typing import Any
 
-
 _DIT_CONFIG_KEYS = {
     "model_type",
     "patch_size",

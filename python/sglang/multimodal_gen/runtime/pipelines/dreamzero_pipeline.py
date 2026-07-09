@@ -11,15 +11,15 @@ from sglang.multimodal_gen.configs.pipeline_configs.dreamzero import (
     DreamZeroPipelineConfig,
 )
 from sglang.multimodal_gen.configs.sample.dreamzero import DreamZeroSamplingParams
-from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_unipc_multistep import (
-    FlowUniPCMultistepScheduler,
-)
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_sp_world_size,
     model_parallel_is_initialized,
 )
 from sglang.multimodal_gen.runtime.managers.dreamzero_session_cache import (
     DreamZeroCachePoolManager,
+)
+from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_unipc_multistep import (
+    FlowUniPCMultistepScheduler,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
@@ -191,7 +191,9 @@ class DreamZeroPipeline(ComposedPipelineBase):
             dtype=_dtype_from_precision(pc.text_encoder_precisions[0]),
             strict=True,
         )
-        logger.info("Loaded DreamZero text encoder checkpoint: %s", text_report.as_dict())
+        logger.info(
+            "Loaded DreamZero text encoder checkpoint: %s", text_report.as_dict()
+        )
         modules["text_encoder"] = text_encoder
 
         image_path = _component_path(

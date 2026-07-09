@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import math
+
 import torch
 import torch.nn as nn
 
@@ -16,14 +17,6 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     RowParallelLinear,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.dreamzero.utils import (
-    flatten_dim_sp_into_sequence,
-    gather_full_sequence_parallel_tensor,
-    remove_redundant_action_register,
-    shard_sequence_parallel_sequence,
-    shard_sequence_parallel_time_embedding,
-)
-
 from sglang.multimodal_gen.runtime.models.dits.dreamzero_causal_ops import (
     CategorySpecificMLP,
     MultiEmbodimentActionEncoder,
@@ -38,6 +31,13 @@ from sglang.multimodal_gen.runtime.models.dits.dreamzero_causal_ops import (
     rope_action_apply,
     rope_params,
     sinusoidal_embedding_1d,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.dreamzero.utils import (
+    flatten_dim_sp_into_sequence,
+    gather_full_sequence_parallel_tensor,
+    remove_redundant_action_register,
+    shard_sequence_parallel_sequence,
+    shard_sequence_parallel_time_embedding,
 )
 
 
@@ -58,8 +58,8 @@ class DreamZeroT2VCrossAttention(nn.Module):
         )
         self.head_dim = dim // num_heads
         self.use_tensor_parallel = use_tensor_parallel
-        linear_out = (
-            lambda: RowParallelLinear(
+        linear_out = lambda: (
+            RowParallelLinear(
                 dim,
                 dim,
                 input_is_parallel=True,
@@ -69,8 +69,8 @@ class DreamZeroT2VCrossAttention(nn.Module):
             if use_tensor_parallel
             else nn.Linear(dim, dim)
         )
-        linear_in = (
-            lambda: ColumnParallelLinear(dim, dim, gather_output=False)
+        linear_in = lambda: (
+            ColumnParallelLinear(dim, dim, gather_output=False)
             if use_tensor_parallel
             else nn.Linear(dim, dim)
         )
@@ -477,8 +477,13 @@ class DreamZeroCausalWanSelfAttention(nn.Module):
             q[:, :first_image_len], k[:, :first_image_len], v[:, :first_image_len]
         )
         for block_idx in range(num_image_blocks):
-            block_start = image_blocks_start + block_idx * num_frame_per_block * frame_seqlen
-            block_end = image_blocks_start + (block_idx + 1) * num_frame_per_block * frame_seqlen
+            block_start = (
+                image_blocks_start + block_idx * num_frame_per_block * frame_seqlen
+            )
+            block_end = (
+                image_blocks_start
+                + (block_idx + 1) * num_frame_per_block * frame_seqlen
+            )
             image_kv_start = (
                 max(
                     image_blocks_start,
@@ -579,9 +584,7 @@ class DreamZeroCausalWanSelfAttention(nn.Module):
         k = _maybe_qk_norm(
             _linear(self.k, x), self.norm_k, tensor_parallel=self.use_tensor_parallel
         ).view(batch, seq_len, self.local_num_heads, self.head_dim)
-        v = _linear(self.v, x).view(
-            batch, seq_len, self.local_num_heads, self.head_dim
-        )
+        v = _linear(self.v, x).view(batch, seq_len, self.local_num_heads, self.head_dim)
         updated_kv_cache: torch.Tensor | None = None
 
         if kv_cache is None:
@@ -641,9 +644,7 @@ class DreamZeroCausalWanSelfAttention(nn.Module):
                     clean_frames = clean_image_seq_len // self.frame_seqlen
                     noisy_image_seq_len = half_seq_len
                     noisy_frames = noisy_image_seq_len // self.frame_seqlen
-                    num_image_blocks = (
-                        noisy_frames - 1
-                    ) // self.num_frame_per_block
+                    num_image_blocks = (noisy_frames - 1) // self.num_frame_per_block
                     action_horizon = num_image_blocks * self.num_action_per_block
                     state_horizon = num_image_blocks * self.num_state_per_block
                     expected_len = (
@@ -669,12 +670,17 @@ class DreamZeroCausalWanSelfAttention(nn.Module):
                     noisy_state_start = noisy_action_start + action_horizon
                     noisy_image_outputs = self._process_noisy_image_blocks(
                         roped_query[
-                            :, noisy_image_start : noisy_image_start + noisy_image_seq_len
+                            :,
+                            noisy_image_start : noisy_image_start + noisy_image_seq_len,
                         ],
                         roped_key[
-                            :, noisy_image_start : noisy_image_start + noisy_image_seq_len
+                            :,
+                            noisy_image_start : noisy_image_start + noisy_image_seq_len,
                         ],
-                        v[:, noisy_image_start : noisy_image_start + noisy_image_seq_len],
+                        v[
+                            :,
+                            noisy_image_start : noisy_image_start + noisy_image_seq_len,
+                        ],
                         roped_key[:, :clean_image_seq_len],
                         v[:, :clean_image_seq_len],
                         roped_key[
@@ -701,9 +707,13 @@ class DreamZeroCausalWanSelfAttention(nn.Module):
                         roped_key[:, :clean_image_seq_len],
                         v[:, :clean_image_seq_len],
                         roped_key[
-                            :, noisy_image_start : noisy_image_start + noisy_image_seq_len
+                            :,
+                            noisy_image_start : noisy_image_start + noisy_image_seq_len,
                         ],
-                        v[:, noisy_image_start : noisy_image_start + noisy_image_seq_len],
+                        v[
+                            :,
+                            noisy_image_start : noisy_image_start + noisy_image_seq_len,
+                        ],
                         roped_key[:, noisy_state_start:],
                         v[:, noisy_state_start:],
                         noisy_frames,
@@ -948,9 +958,9 @@ class DreamZeroCausalWanTransformerBlock(nn.Module):
         e_parts = (self.modulation.unsqueeze(1) + e).chunk(6, dim=2)
         e_parts = align_modulation(e_parts, x.shape[1])
 
-        self_attn_input = (
-            self.norm1(x) * (1 + e_parts[1].squeeze(2)) + e_parts[0].squeeze(2)
-        )
+        self_attn_input = self.norm1(x) * (1 + e_parts[1].squeeze(2)) + e_parts[
+            0
+        ].squeeze(2)
         y, updated_kv_cache = self.self_attn(
             x=self_attn_input,
             freqs=freqs,
@@ -979,7 +989,9 @@ class DreamZeroCausalWanTransformerBlock(nn.Module):
             cross,
             tensor_parallel=self.use_tensor_parallel,
         )
-        norm2_input = self.norm2(x) * (1 + e_parts[4].squeeze(2)) + e_parts[3].squeeze(2)
+        norm2_input = self.norm2(x) * (1 + e_parts[4].squeeze(2)) + e_parts[3].squeeze(
+            2
+        )
         y = self._run_ffn(norm2_input)
         x = _residual_add(
             x,
@@ -1162,9 +1174,7 @@ class DreamZeroCausalWanModel(nn.Module):
         self.gradient_checkpointing = True
         self.independent_first_frame = False if self.num_frame_per_block == 1 else True
 
-    def _create_freqs(
-        self, grid_size: torch.Tensor, start_frame: int
-    ) -> torch.Tensor:
+    def _create_freqs(self, grid_size: torch.Tensor, start_frame: int) -> torch.Tensor:
         device = self.patch_embedding.weight.device
         if any(freq.device != device for freq in self.freqs):
             self.freqs = [freq.to(device) for freq in self.freqs]
@@ -1296,9 +1306,7 @@ class DreamZeroCausalWanModel(nn.Module):
         if enable_sequence_parallel:
             video_e = e[:, :seq_len]
             sp_rank = get_sp_parallel_rank()
-            e_video = video_e[
-                :, sp_rank * sp_seq_len : (sp_rank + 1) * sp_seq_len
-            ]
+            e_video = video_e[:, sp_rank * sp_seq_len : (sp_rank + 1) * sp_seq_len]
         else:
             e_video = e[:, :seq_len]
         x_video = self.head(x_video, e_video.unsqueeze(2))

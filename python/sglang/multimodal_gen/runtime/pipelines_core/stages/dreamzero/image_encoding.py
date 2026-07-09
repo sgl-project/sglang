@@ -5,13 +5,13 @@ from typing import Any
 
 import torch
 
-from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.managers.dreamzero_session_cache import (
-    DreamZeroCachePoolManager,
     DreamZeroCachePool,
+    DreamZeroCachePoolManager,
     DreamZeroRequestCache,
     enter_request_cache,
 )
+from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
 )
@@ -115,7 +115,9 @@ class DreamZeroVisualEncodingStage(PipelineStage):
             ComponentUse(
                 stage_name,
                 "vae",
-                target_dtype=PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision],
+                target_dtype=PRECISION_TO_TYPE[
+                    server_args.pipeline_config.vae_precision
+                ],
             ),
         ]
 
@@ -229,9 +231,14 @@ class DreamZeroVisualEncodingStage(PipelineStage):
         )
         target_h = int(getattr(server_args.pipeline_config, "synthetic_height", 0) or 0)
         target_w = int(getattr(server_args.pipeline_config, "synthetic_width", 0) or 0)
-        if target_h > 0 and target_w > 0 and tuple(videos.shape[-2:]) != (
-            target_h,
-            target_w,
+        if (
+            target_h > 0
+            and target_w > 0
+            and tuple(videos.shape[-2:])
+            != (
+                target_h,
+                target_w,
+            )
         ):
             batch_size, channels, num_frames, height, width = videos.shape
             videos = torch.nn.functional.interpolate(
@@ -384,7 +391,9 @@ class DreamZeroVisualEncodingStage(PipelineStage):
         inputs: dict[str, Any] = batch.dreamzero_inputs
         precomputed = inputs.get("latent_video")
         if precomputed is not None:
-            device = _module_device(self.vae) if self.vae is not None else precomputed.device
+            device = (
+                _module_device(self.vae) if self.vae is not None else precomputed.device
+            )
             return precomputed.to(device=device, dtype=_dit_dtype(server_args))
 
         with self.use_declared_component(component_name="vae", module=self.vae) as vae:
@@ -416,9 +425,7 @@ class DreamZeroVisualEncodingStage(PipelineStage):
                             "DreamZero observation contains more VAE blocks than "
                             "num_frame_per_block"
                         )
-                    videos = torch.repeat_interleave(
-                        videos, repeat_factor, dim=2
-                    )
+                    videos = torch.repeat_interleave(videos, repeat_factor, dim=2)
                     videos = torch.cat([videos[:, :, :1], videos], dim=2)
                 else:
                     raise ValueError(
@@ -432,9 +439,7 @@ class DreamZeroVisualEncodingStage(PipelineStage):
                 enabled=device.type == "cuda",
             ):
                 posterior = vae.encode(videos)
-                return self._normalize_sglang_wan_latent(vae, posterior).to(
-                    dtype=dtype
-                )
+                return self._normalize_sglang_wan_latent(vae, posterior).to(dtype=dtype)
 
     @staticmethod
     def _infer_batch_size(inputs: dict[str, Any]) -> int:
@@ -491,9 +496,7 @@ class DreamZeroVisualEncodingStage(PipelineStage):
             )
             image = _select_image_context(
                 videos,
-                first_frame=not bool(
-                    getattr(arch, "concat_first_frame_latent", True)
-                ),
+                first_frame=not bool(getattr(arch, "concat_first_frame_latent", True)),
             )
             batch.dreamzero_image_context_input = image
 

@@ -9,17 +9,17 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_classifier_free_guidance_rank,
     get_classifier_free_guidance_world_size,
 )
-from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
-    ComponentUse,
-)
 from sglang.multimodal_gen.runtime.managers.dreamzero_session_cache import (
     BRANCH_COND,
     BRANCH_UNCOND,
-    DreamZeroCachePoolManager,
     DreamZeroCachePool,
+    DreamZeroCachePoolManager,
     DreamZeroRequestCache,
     apply_request_lifecycle_resets,
     resolve_request_cache,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
+    ComponentUse,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
@@ -88,8 +88,26 @@ class DreamZeroTextEncodingStage(PipelineStage):
             return tensor
         if tensor.shape[1] > text_len:
             return tensor[:, :text_len]
-        pad = tensor.new_zeros(tensor.shape[0], text_len - tensor.shape[1], tensor.shape[2])
+        pad = tensor.new_zeros(
+            tensor.shape[0], text_len - tensor.shape[1], tensor.shape[2]
+        )
         return torch.cat([tensor, pad], dim=1)
+
+    @staticmethod
+    def _set_prompt_metadata(
+        batch: Req,
+        prompt_embs: list[torch.Tensor],
+        *,
+        cfg_parallel: bool,
+        cfg_rank: int | None,
+    ) -> None:
+        batch.dreamzero_cfg_branch_index = cfg_rank if cfg_parallel else None
+        batch.prompt_embeds = prompt_embs[0]
+        if cfg_parallel and cfg_rank == 1:
+            batch.negative_prompt_embeds = prompt_embs[0]
+        elif len(prompt_embs) > 1:
+            batch.negative_prompt_embeds = prompt_embs[1]
+        batch.dreamzero_prompt_embs = prompt_embs
 
     def _encode_prompt(
         self,
@@ -234,10 +252,7 @@ class DreamZeroTextEncodingStage(PipelineStage):
         apply_request_lifecycle_resets(batch, self.cache_manager, request_cache)
         reset_reasons = batch.dreamzero_session_reset_reason
         prompt_reusable = [
-            bool(
-                reusable
-                and not (reset and not preserve_text)
-            )
+            bool(reusable and not (reset and not preserve_text))
             for reusable, reset, preserve_text in zip(
                 request_cache.prompt_reusable,
                 lifecycle_reset_mask,
@@ -246,10 +261,7 @@ class DreamZeroTextEncodingStage(PipelineStage):
             )
         ]
         neg_prompt_reusable = [
-            bool(
-                reusable
-                and not (reset and not preserve_text)
-            )
+            bool(reusable and not (reset and not preserve_text))
             for reusable, reset, preserve_text in zip(
                 request_cache.neg_prompt_reusable,
                 lifecycle_reset_mask,
@@ -271,7 +283,9 @@ class DreamZeroTextEncodingStage(PipelineStage):
         text_len = server_args.pipeline_config.dit_config.arch_config.text_len
         prompt_embs: list[torch.Tensor] = []
 
-        def get_branch_prompt(branch: int, *, ids, mask, hashes, reusable) -> torch.Tensor:
+        def get_branch_prompt(
+            branch: int, *, ids, mask, hashes, reusable
+        ) -> torch.Tensor:
             cached = state.gather_prompt(branch, slots)
             if cached is not None and all(reusable):
                 return cached
@@ -352,18 +366,11 @@ class DreamZeroTextEncodingStage(PipelineStage):
                         reusable=neg_prompt_reusable,
                     )
                 )
-        batch.dreamzero_cfg_branch_index = cfg_rank if cfg_parallel else None
-        batch.prompt_embeds = prompt_embs[0]
-        if cfg_parallel and cfg_rank == 1:
-            batch.negative_prompt_embeds = prompt_embs[0]
-        elif len(prompt_embs) > 1:
-            batch.negative_prompt_embeds = prompt_embs[1]
         batch.dreamzero_session_reset_reason = reset_reasons
-        batch.dreamzero_prompt_embs = prompt_embs
-        batch.dreamzero_cfg_branch_index = cfg_rank if cfg_parallel else None
-        batch.prompt_embeds = prompt_embs[0]
-        if cfg_parallel and cfg_rank == 1:
-            batch.negative_prompt_embeds = prompt_embs[0]
-        elif len(prompt_embs) > 1:
-            batch.negative_prompt_embeds = prompt_embs[1]
+        self._set_prompt_metadata(
+            batch,
+            prompt_embs,
+            cfg_parallel=cfg_parallel,
+            cfg_rank=cfg_rank,
+        )
         return batch

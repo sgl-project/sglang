@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import math
 import os
 from functools import cache
 
@@ -17,11 +16,11 @@ from sglang.multimodal_gen.runtime.distributed import (
     get_tp_world_size,
     split_tensor_along_last_dim,
 )
-from sglang.multimodal_gen.runtime.layers.linear import RowParallelLinear
 from sglang.multimodal_gen.runtime.layers.attention.selector import (
     backend_name_to_enum,
     get_attn_backend,
 )
+from sglang.multimodal_gen.runtime.layers.linear import RowParallelLinear
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import STR_BACKEND_ENV_VAR
@@ -29,12 +28,12 @@ from sglang.multimodal_gen.utils import STR_BACKEND_ENV_VAR
 logger = init_logger(__name__)
 
 ENABLE_TENSORRT = os.getenv("ENABLE_TENSORRT", "False").lower() == "true"
-DREAMZERO_TP_FP32_ROW_REDUCE = (
-    os.getenv("DREAMZERO_TP_FP32_ROW_REDUCE", "0").lower() not in ("0", "false", "no")
-)
-DREAMZERO_TP_FP32_RESIDUAL = (
-    os.getenv("DREAMZERO_TP_FP32_RESIDUAL", "0").lower() not in ("0", "false", "no")
-)
+DREAMZERO_TP_FP32_ROW_REDUCE = os.getenv(
+    "DREAMZERO_TP_FP32_ROW_REDUCE", "0"
+).lower() not in ("0", "false", "no")
+DREAMZERO_TP_FP32_RESIDUAL = os.getenv(
+    "DREAMZERO_TP_FP32_RESIDUAL", "0"
+).lower() not in ("0", "false", "no")
 _DREAMZERO_SUPPORTED_ATTENTION_BACKENDS = {
     AttentionBackendEnum.FA2,
     AttentionBackendEnum.TORCH_SDPA,
@@ -66,9 +65,7 @@ def sinusoidal_embedding_1d(dim: int, position: torch.Tensor) -> torch.Tensor:
         position,
         torch.pow(
             10000,
-            -torch.arange(half, dtype=position.dtype, device=position.device).div(
-                half
-            ),
+            -torch.arange(half, dtype=position.dtype, device=position.device).div(half),
         ),
     )
     return torch.cat([torch.cos(sinusoid), torch.sin(sinusoid)], dim=1)
@@ -97,9 +94,7 @@ def rope_params_no_polar(
     max_seq_len: int, dim: int, theta: int = 10000
 ) -> torch.Tensor:
     assert dim % 2 == 0
-    inv_freq = 1.0 / torch.pow(
-        theta, torch.arange(0, dim, 2).to(torch.float32) / dim
-    )
+    inv_freq = 1.0 / torch.pow(theta, torch.arange(0, dim, 2).to(torch.float32) / dim)
     timesteps = torch.arange(max_seq_len, dtype=inv_freq.dtype)
     freqs = torch.outer(timesteps, inv_freq)
     return torch.stack((freqs.cos(), freqs.sin()), dim=-1).flatten(-2)
@@ -121,9 +116,7 @@ def _linear(layer: nn.Module, x: torch.Tensor) -> torch.Tensor:
         # Preserve the normal RowParallelLinear GEMM and bias epilogue. Only
         # promote the partial output while summing it across TP ranks.
         bias = None if (layer.tp_rank > 0 or layer.skip_bias_add) else layer.bias
-        output_parallel = layer.quant_method.apply(
-            layer, input_parallel, bias=bias
-        )
+        output_parallel = layer.quant_method.apply(layer, input_parallel, bias=bias)
         if layer.reduce_results:
             output = layer.tp_group.all_reduce(output_parallel.float()).to(
                 output_parallel.dtype
@@ -143,7 +136,7 @@ def _linear(layer: nn.Module, x: torch.Tensor) -> torch.Tensor:
     return output
 
 
-def _tp_wan_rms_norm(x: torch.Tensor, norm: "WanRMSNorm") -> torch.Tensor:
+def _tp_wan_rms_norm(x: torch.Tensor, norm: WanRMSNorm) -> torch.Tensor:
     tp_size = get_tp_world_size()
     tp_rank = get_tp_rank()
     src_dtype = x.dtype
@@ -233,9 +226,7 @@ class MultiEmbodimentActionEncoder(nn.Module):
         self.hidden_size = hidden_size
         self.num_embodiments = num_embodiments
         self.W1 = CategorySpecificLinear(num_embodiments, action_dim, hidden_size)
-        self.W2 = CategorySpecificLinear(
-            num_embodiments, 2 * hidden_size, hidden_size
-        )
+        self.W2 = CategorySpecificLinear(num_embodiments, 2 * hidden_size, hidden_size)
         self.W3 = CategorySpecificLinear(num_embodiments, hidden_size, hidden_size)
         self.pos_encoding = SinusoidalPositionalEncoding(hidden_size)
 
@@ -436,7 +427,9 @@ def rope_action_apply_polar(
 ) -> torch.Tensor:
     batch, seq_len, num_heads, _ = x.shape
     out_dtype = x.dtype
-    x = torch.view_as_complex(x.to(torch.float64).reshape(batch, seq_len, num_heads, -1, 2))
+    x = torch.view_as_complex(
+        x.to(torch.float64).reshape(batch, seq_len, num_heads, -1, 2)
+    )
 
     if action_register_length is not None:
         assert num_action_per_block is not None
@@ -548,7 +541,9 @@ def causal_rope_action_apply_polar(
 ) -> torch.Tensor:
     batch, seq_len, num_heads, _ = x.shape
     out_dtype = x.dtype
-    x = torch.view_as_complex(x.to(torch.float64).reshape(batch, seq_len, num_heads, -1, 2))
+    x = torch.view_as_complex(
+        x.to(torch.float64).reshape(batch, seq_len, num_heads, -1, 2)
+    )
 
     if action_register_length is not None:
         assert action_register_length == (num_action_per_block + num_state_per_block)
@@ -585,7 +580,5 @@ class WanRMSNorm(nn.Module):
 
 
 class WanLayerNorm(nn.LayerNorm):
-    def __init__(
-        self, dim: int, eps: float = 1e-6, elementwise_affine: bool = False
-    ):
+    def __init__(self, dim: int, eps: float = 1e-6, elementwise_affine: bool = False):
         super().__init__(dim, elementwise_affine=elementwise_affine, eps=eps)

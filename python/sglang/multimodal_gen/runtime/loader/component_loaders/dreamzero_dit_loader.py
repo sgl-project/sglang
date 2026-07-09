@@ -57,10 +57,9 @@ def remap_dreamzero_dit_key(checkpoint_key: str) -> str | None:
 
 def _has_wan_component_dit(model_path: str | os.PathLike[str]) -> bool:
     model_dir = Path(model_path)
-    return (
-        (model_dir / _WAN_DIT_INDEX_NAME).is_file()
-        or (model_dir / _WAN_DIT_SINGLE_NAME).is_file()
-    )
+    return (model_dir / _WAN_DIT_INDEX_NAME).is_file() or (
+        model_dir / _WAN_DIT_SINGLE_NAME
+    ).is_file()
 
 
 def _load_config(model_path: str | os.PathLike[str]) -> dict[str, Any]:
@@ -124,7 +123,9 @@ def _iter_dit_tensors(
         yield from _iter_indexed_safetensors(model_path)
 
 
-def _remap_dit_key(model_path: str | os.PathLike[str], checkpoint_key: str) -> str | None:
+def _remap_dit_key(
+    model_path: str | os.PathLike[str], checkpoint_key: str
+) -> str | None:
     if _has_wan_component_dit(model_path):
         return checkpoint_key
     return remap_dreamzero_dit_key(checkpoint_key)
@@ -142,7 +143,9 @@ def _copy_weight_loader_attrs(src: torch.Tensor, dst: torch.Tensor) -> None:
             setattr(dst, attr, getattr(src, attr))
 
 
-def _materialize_rope_tensors(model: DreamZeroCausalWanModel, device: torch.device) -> None:
+def _materialize_rope_tensors(
+    model: DreamZeroCausalWanModel, device: torch.device
+) -> None:
     head_dim = model.dim // model.num_heads
     model.freqs_action = rope_params(1024 * 10, head_dim).to(device)
     model.freqs_state = rope_params(1024, head_dim).to(device)

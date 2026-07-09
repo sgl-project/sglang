@@ -99,6 +99,64 @@ class SchedulerStepState:
     skip_state: dict[str, int]
 
 
+def _validate_optional_int_extra(
+    extra: dict[str, Any],
+    field_name: str,
+    expected_value: int,
+) -> None:
+    request_value = extra.get(field_name)
+    if request_value is None:
+        return
+    if isinstance(request_value, bool):
+        raise ValueError(f"{field_name} must be an integer, got bool")
+    try:
+        normalized_value = int(request_value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} must be an integer") from exc
+    if normalized_value != expected_value:
+        config_name = field_name.removeprefix("dreamzero_")
+        raise ValueError(
+            f"{field_name}={normalized_value} does not match "
+            f"pipeline_config.{config_name}={expected_value}. Per-request "
+            "DreamZero action shapes are not supported; update the pipeline "
+            "config instead."
+        )
+
+
+def _validate_optional_bool_extra(
+    extra: dict[str, Any],
+    field_name: str,
+    expected_value: bool,
+) -> None:
+    request_value = extra.get(field_name)
+    if request_value is None:
+        return
+    if not isinstance(request_value, bool):
+        raise ValueError(f"{field_name} must be a bool")
+    if request_value != expected_value:
+        config_name = field_name.removeprefix("dreamzero_")
+        raise ValueError(
+            f"{field_name}={request_value} does not match "
+            f"pipeline_config.{config_name}={expected_value}. Per-request "
+            "DreamZero action conversion is not supported; update the pipeline "
+            "config instead."
+        )
+
+
+def validate_dreamzero_request_config(batch: Req, pipeline_config: Any) -> None:
+    extra = getattr(batch, "extra", {}) or {}
+    _validate_optional_int_extra(
+        extra,
+        "dreamzero_action_horizon",
+        int(pipeline_config.action_horizon),
+    )
+    _validate_optional_bool_extra(
+        extra,
+        "dreamzero_relative_action_per_horizon",
+        bool(pipeline_config.relative_action_per_horizon),
+    )
+
+
 class DreamZeroCausalDenoisingStage(PipelineStage):
     """One-shot DreamZero causal video/action denoising stage."""
 
@@ -133,7 +191,9 @@ class DreamZeroCausalDenoisingStage(PipelineStage):
             ComponentUse(
                 stage_name,
                 "transformer",
-                target_dtype=PRECISION_TO_TYPE[server_args.pipeline_config.dit_precision],
+                target_dtype=PRECISION_TO_TYPE[
+                    server_args.pipeline_config.dit_precision
+                ],
             )
         ]
 
@@ -258,9 +318,7 @@ class DreamZeroCausalDenoisingStage(PipelineStage):
                 "DreamZero CFG all-gather must return cond/uncond tensors"
             )
         flow_pred_cond, flow_pred_uncond = branches
-        flow_pred = flow_pred_uncond + cfg_scale * (
-            flow_pred_cond - flow_pred_uncond
-        )
+        flow_pred = flow_pred_uncond + cfg_scale * (flow_pred_cond - flow_pred_uncond)
 
         flow_pred_action_cond = action if cfg_rank == 0 else torch.empty_like(action)
         flow_pred_action_cond = get_cfg_group().broadcast(
@@ -462,6 +520,7 @@ class DreamZeroCausalDenoisingStage(PipelineStage):
         device: torch.device,
     ) -> DreamZeroNoiseContext:
         arch_config = server_args.pipeline_config.dit_config.arch_config
+        validate_dreamzero_request_config(batch, server_args.pipeline_config)
         action_dim = arch_config.action_dim
         max_state_dim = arch_config.max_state_dim
         action_horizon = server_args.pipeline_config.action_horizon
@@ -507,9 +566,7 @@ class DreamZeroCausalDenoisingStage(PipelineStage):
     ) -> DreamZeroDenoisingContext:
         dtype = self._module_dtype(self.transformer)
         device = self._module_device(self.transformer)
-        input_ctx = self._materialize_input_tensors(
-            batch, dtype=dtype, device=device
-        )
+        input_ctx = self._materialize_input_tensors(batch, dtype=dtype, device=device)
         local_attn_size = int(getattr(self.transformer, "local_attn_size", -1))
         request_cache, session_state = enter_request_cache(
             batch,
@@ -760,16 +817,22 @@ class DreamZeroCausalDenoisingStage(PipelineStage):
         noisy_action: torch.Tensor,
         step_state: SchedulerStepState,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        timestep = torch.ones(
-            [ctx.inputs.batch_size, ctx.noise.num_frame_per_block],
-            device=ctx.inputs.device,
-            dtype=torch.int64,
-        ) * step_state.video_timestep
-        timestep_action = torch.ones(
-            [ctx.inputs.batch_size, ctx.noise.action_horizon],
-            device=ctx.inputs.device,
-            dtype=torch.int64,
-        ) * step_state.action_timestep
+        timestep = (
+            torch.ones(
+                [ctx.inputs.batch_size, ctx.noise.num_frame_per_block],
+                device=ctx.inputs.device,
+                dtype=torch.int64,
+            )
+            * step_state.video_timestep
+        )
+        timestep_action = (
+            torch.ones(
+                [ctx.inputs.batch_size, ctx.noise.action_horizon],
+                device=ctx.inputs.device,
+                dtype=torch.int64,
+            )
+            * step_state.action_timestep
+        )
         y_start = ctx.cache.current_start_frame
         y_end = y_start + ctx.noise.num_frame_per_block
         y = ctx.inputs.y_full[:, :, y_start:y_end]
@@ -789,9 +852,9 @@ class DreamZeroCausalDenoisingStage(PipelineStage):
             skip_state=step_state.skip_state,
         )
         if not should_run_model:
-            assert step_state.prev_predictions, (
-                "prev_predictions must be set when DreamZero skips a DiT step"
-            )
+            assert (
+                step_state.prev_predictions
+            ), "prev_predictions must be set when DreamZero skips a DiT step"
             _, flow_pred, flow_pred_action_cond = step_state.prev_predictions[-1]
             return flow_pred, flow_pred_action_cond
 

@@ -1,5 +1,6 @@
 import types
 
+import pytest
 import torch
 
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
@@ -7,23 +8,30 @@ from sglang.multimodal_gen.configs.pipeline_configs.dreamzero import (
     DreamZeroPipelineConfig,
 )
 from sglang.multimodal_gen.configs.sample.dreamzero import DreamZeroSamplingParams
-from sglang.multimodal_gen.configs.sample.sampling_params import DataType, SamplingParams
+from sglang.multimodal_gen.configs.sample.sampling_params import (
+    DataType,
+    SamplingParams,
+)
 from sglang.multimodal_gen.registry import (
     get_model_info,
     get_non_diffusers_pipeline_name,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.loader.component_loaders.dreamzero_checkpoint_utils import (
+    DreamZeroCheckpointLoadReport,
+    load_matching_tensors,
+)
 from sglang.multimodal_gen.runtime.managers.dreamzero_session_cache import (
     BRANCH_COND,
     BRANCH_UNCOND,
     DreamZeroCachePoolManager,
     apply_request_lifecycle_resets,
+    normalize_batched_session_fields,
     resolve_request_cache,
 )
 from sglang.multimodal_gen.runtime.models.encoders.dreamzero_image import (
-    WanImageEncoderStateDictConverter,
     VisionAttentionBlock,
     VisionSelfAttention,
+    WanImageEncoderStateDictConverter,
     XLMRobertaAttentionBlock,
     XLMRobertaSelfAttention,
 )
@@ -31,11 +39,12 @@ from sglang.multimodal_gen.runtime.models.encoders.dreamzero_text import (
     WanTextEncoder,
     WanTextEncoderStateDictConverter,
 )
-from sglang.multimodal_gen.runtime.loader.component_loaders.dreamzero_checkpoint_utils import (
-    DreamZeroCheckpointLoadReport,
-    load_matching_tensors,
-)
 from sglang.multimodal_gen.runtime.pipelines.dreamzero_pipeline import DreamZeroPipeline
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.pipelines_core.stages.dreamzero.denoising import (
+    DreamZeroCausalDenoisingStage,
+    validate_dreamzero_request_config,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.dreamzero.text_encoding import (
     DreamZeroTextEncodingStage,
 )
@@ -63,6 +72,29 @@ def test_dreamzero_config_and_sampling_defaults_are_action_typed():
     assert params.build_request_extra()["dreamzero_action_horizon"] == 24
 
 
+def test_dreamzero_request_action_config_must_match_pipeline_config():
+    config = DreamZeroPipelineConfig()
+    matching_batch = types.SimpleNamespace(
+        extra=DreamZeroSamplingParams().build_request_extra()
+    )
+
+    validate_dreamzero_request_config(matching_batch, config)
+
+    mismatched_horizon = types.SimpleNamespace(
+        extra=DreamZeroSamplingParams(action_horizon=12).build_request_extra()
+    )
+    with pytest.raises(ValueError, match="dreamzero_action_horizon"):
+        validate_dreamzero_request_config(mismatched_horizon, config)
+
+    mismatched_relative = types.SimpleNamespace(
+        extra=DreamZeroSamplingParams(
+            relative_action_per_horizon=True
+        ).build_request_extra()
+    )
+    with pytest.raises(ValueError, match="dreamzero_relative_action_per_horizon"):
+        validate_dreamzero_request_config(mismatched_relative, config)
+
+
 def test_action_api_additions_do_not_change_non_dreamzero_defaults():
     req = Req(sampling_params=SamplingParams())
 
@@ -75,8 +107,108 @@ def test_action_api_additions_do_not_change_non_dreamzero_defaults():
     assert ModelTaskType.I2V.requires_image_input() is True
     assert ModelTaskType.ACTION.requires_image_input() is False
     assert ModelTaskType.ACTION.accepts_image_input() is False
-    assert req.session_id is None
-    assert req.reset_session is False
+
+
+def test_dreamzero_single_request_session_fields_still_use_batched_contract():
+    session_ids, reset_mask = normalize_batched_session_fields(
+        session_ids=["session-a"],
+        reset_mask=[True],
+        batch_size=1,
+    )
+
+    assert session_ids == ["session-a"]
+    assert reset_mask == [True]
+
+    try:
+        normalize_batched_session_fields(
+            session_ids="session-a",
+            reset_mask=True,
+            batch_size=1,
+        )
+    except TypeError as exc:
+        assert "dreamzero_session_ids must be a list" in str(exc)
+    else:
+        raise AssertionError("DreamZero session ids must use explicit batched lists")
+
+
+def test_dreamzero_denoising_skip_schedule_reuses_previous_predictions():
+    skip_state = {"countdown": 0}
+    predictions = [
+        (
+            torch.zeros(1, 1),
+            torch.tensor([[1.0, 0.0]]),
+            torch.zeros(1, 1),
+        ),
+        (
+            torch.zeros(1, 1),
+            torch.tensor([[0.99, 0.01]]),
+            torch.zeros(1, 1),
+        ),
+    ]
+
+    should_run = DreamZeroCausalDenoisingStage._should_run_model(
+        step_index=2,
+        current_timestep=torch.tensor(2),
+        prev_predictions=predictions,
+        dit_step_mask=None,
+        dynamic_cache_schedule=True,
+        skip_state=skip_state,
+    )
+
+    assert should_run is False
+    assert skip_state["countdown"] == 4
+    assert (
+        DreamZeroCausalDenoisingStage._should_run_model(
+            step_index=3,
+            current_timestep=torch.tensor(1),
+            prev_predictions=predictions,
+            dit_step_mask=None,
+            dynamic_cache_schedule=True,
+            skip_state=skip_state,
+        )
+        is False
+    )
+    assert skip_state["countdown"] == 3
+
+
+def test_dreamzero_scheduler_step_supports_optional_step_index():
+    class SchedulerWithStepIndex:
+        def step(self, *, model_output, timestep, sample, step_index, return_dict):
+            assert step_index == 7
+            assert return_dict is False
+            del timestep
+            return (sample - model_output,)
+
+    class SchedulerWithoutStepIndex:
+        def step(self, *, model_output, timestep, sample, return_dict):
+            assert return_dict is False
+            del timestep
+            return (sample + model_output,)
+
+    sample = torch.tensor([3.0])
+    model_output = torch.tensor([1.0])
+    timestep = torch.tensor(4)
+
+    assert torch.equal(
+        DreamZeroCausalDenoisingStage._scheduler_step(
+            SchedulerWithStepIndex(),
+            model_output=model_output,
+            timestep=timestep,
+            sample=sample,
+            step_index=7,
+        ),
+        torch.tensor([2.0]),
+    )
+    assert torch.equal(
+        DreamZeroCausalDenoisingStage._scheduler_step(
+            SchedulerWithoutStepIndex(),
+            model_output=model_output,
+            timestep=timestep,
+            sample=sample,
+            step_index=7,
+        ),
+        torch.tensor([4.0]),
+    )
 
 
 def test_dreamzero_session_cache_allocates_reuses_and_resets_slots():
@@ -292,9 +424,9 @@ def test_dreamzero_checkpoint_helper_loads_parameters_buffers_and_reports_errors
 
 
 def test_dreamzero_encoder_converters_and_lightweight_text_forward():
-    assert XLMRobertaAttentionBlock(dim=4, num_heads=2, post_norm=True).attn.__class__ is (
-        XLMRobertaSelfAttention
-    )
+    assert XLMRobertaAttentionBlock(
+        dim=4, num_heads=2, post_norm=True
+    ).attn.__class__ is (XLMRobertaSelfAttention)
     assert VisionAttentionBlock(dim=4, mlp_ratio=2, num_heads=2).attn.__class__ is (
         VisionSelfAttention
     )

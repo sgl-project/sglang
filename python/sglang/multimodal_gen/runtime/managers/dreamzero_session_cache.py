@@ -49,21 +49,11 @@ class DreamZeroCachePool:
         self.session_ids = [None] * self.capacity
         self.current_start_frames = [0] * self.capacity
         self.visual_valid = [False] * self.capacity
-        self.prompt_hashes = {
-            branch: [None] * self.capacity for branch in BRANCHES
-        }
-        self.prompt_valid = {
-            branch: [False] * self.capacity for branch in BRANCHES
-        }
-        self.kv_valid = {
-            branch: [False] * self.capacity for branch in BRANCHES
-        }
-        self.kv_lengths = {
-            branch: [0] * self.capacity for branch in BRANCHES
-        }
-        self.crossattn_valid = {
-            branch: [False] * self.capacity for branch in BRANCHES
-        }
+        self.prompt_hashes = {branch: [None] * self.capacity for branch in BRANCHES}
+        self.prompt_valid = {branch: [False] * self.capacity for branch in BRANCHES}
+        self.kv_valid = {branch: [False] * self.capacity for branch in BRANCHES}
+        self.kv_lengths = {branch: [0] * self.capacity for branch in BRANCHES}
+        self.crossattn_valid = {branch: [False] * self.capacity for branch in BRANCHES}
         self.cached_prompt_embs = {branch: None for branch in BRANCHES}
 
     def branch_kv_cache(self, branch: int) -> list[torch.Tensor]:
@@ -77,9 +67,7 @@ class DreamZeroCachePool:
 
     def branch_crossattn_cache(self, branch: int) -> list[dict[str, Any]]:
         return (
-            self.crossattn_cache
-            if branch == BRANCH_COND
-            else self.crossattn_cache_neg
+            self.crossattn_cache if branch == BRANCH_COND else self.crossattn_cache_neg
         )
 
     def set_branch_crossattn_cache(
@@ -136,7 +124,10 @@ class DreamZeroCachePool:
         prompt_hashes: list[str | None],
     ) -> None:
         if self.cached_prompt_embs[branch] is None:
-            shape = (_pool_capacity_for_slots(None, slots, self.capacity), *values.shape[1:])
+            shape = (
+                _pool_capacity_for_slots(None, slots, self.capacity),
+                *values.shape[1:],
+            )
             self.cached_prompt_embs[branch] = values.new_zeros(shape)
         prompt_pool = self.cached_prompt_embs[branch]
         if prompt_pool is None:
@@ -231,7 +222,9 @@ class DreamZeroCachePool:
             gathered.append(tensor[:, index, :length].contiguous())
         return gathered
 
-    def scatter_kv(self, branch: int, slots: list[int], values: list[torch.Tensor]) -> None:
+    def scatter_kv(
+        self, branch: int, slots: list[int], values: list[torch.Tensor]
+    ) -> None:
         pool = self.branch_kv_cache(branch)
         if not pool:
             pool = [None] * len(values)
@@ -257,10 +250,10 @@ class DreamZeroCachePool:
         if not cache:
             raise RuntimeError("DreamZero cross-attention cache pool is empty")
         if not all(self.crossattn_valid[branch][slot] for slot in slots):
-            missing = [
-                slot for slot in slots if not self.crossattn_valid[branch][slot]
-            ]
-            raise RuntimeError(f"DreamZero cross-attention cache missing slots {missing}")
+            missing = [slot for slot in slots if not self.crossattn_valid[branch][slot]]
+            raise RuntimeError(
+                f"DreamZero cross-attention cache missing slots {missing}"
+            )
         gathered: list[dict[str, Any]] = []
         for layer_cache in cache:
             if not layer_cache.get("is_init", False):
@@ -343,7 +336,9 @@ class DreamZeroCachePoolManager:
         self.pool.local_attn_size = local_attn_size
         return slot, False
 
-    def reset_slot(self, logical_session_id: str, *, preserve_text: bool = False) -> None:
+    def reset_slot(
+        self, logical_session_id: str, *, preserve_text: bool = False
+    ) -> None:
         slot = self._sessions.get(logical_session_id)
         if slot is not None:
             self.pool.reset_slot(slot, preserve_text=preserve_text)
@@ -379,7 +374,9 @@ class DreamZeroRequestCache:
     def has_logical_batch(self) -> bool:
         return self.batch_size > 1
 
-    def pool(self, cache_manager: DreamZeroCachePoolManager | None) -> DreamZeroCachePool:
+    def pool(
+        self, cache_manager: DreamZeroCachePoolManager | None
+    ) -> DreamZeroCachePool:
         if cache_manager is None:
             raise RuntimeError(
                 "DreamZero request cache view requires a rank-local cache manager"
@@ -563,7 +560,9 @@ def _normalize_optional_hashes(
     return values
 
 
-def _batch_prompt_hashes(batch, batch_size: int) -> tuple[list[str | None], list[str | None]]:
+def _batch_prompt_hashes(
+    batch, batch_size: int
+) -> tuple[list[str | None], list[str | None]]:
     extra = getattr(batch, "extra", {})
     prompts = normalize_batched_prompt_fields(
         extra.get("dreamzero_prompts"), batch_size
@@ -629,14 +628,18 @@ def resolve_request_cache(
         slot_indices.append(slot)
         cache_hit.append(bool(hit and not reset_mask[index]))
         prompt_reusable.append(
-            bool(hit and not reset_mask[index] and state.prompt_reusable(
-                BRANCH_COND, slot, prompt_hashes[index]
-            ))
+            bool(
+                hit
+                and not reset_mask[index]
+                and state.prompt_reusable(BRANCH_COND, slot, prompt_hashes[index])
+            )
         )
         neg_prompt_reusable.append(
-            bool(hit and not reset_mask[index] and state.prompt_reusable(
-                BRANCH_UNCOND, slot, neg_prompt_hashes[index]
-            ))
+            bool(
+                hit
+                and not reset_mask[index]
+                and state.prompt_reusable(BRANCH_UNCOND, slot, neg_prompt_hashes[index])
+            )
         )
 
     request_cache = DreamZeroRequestCache(
@@ -905,9 +908,7 @@ def _scatter_kv_pool(
         or existing.shape[3:] != values.shape[3:]
         or existing.shape[2] < seq_len
     ):
-        pool = values.new_zeros(
-            (values.shape[0], capacity, seq_len, *values.shape[3:])
-        )
+        pool = values.new_zeros((values.shape[0], capacity, seq_len, *values.shape[3:]))
         seq_copy = min(existing.shape[2], seq_len)
         slot_copy = min(existing.shape[1], capacity)
         pool[:, :slot_copy, :seq_copy] = existing[:, :slot_copy, :seq_copy]

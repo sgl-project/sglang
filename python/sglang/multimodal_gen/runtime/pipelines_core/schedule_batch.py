@@ -77,8 +77,6 @@ class Req:
     """
 
     sampling_params: SamplingParams | None = None
-    session_id: str | None = None
-    reset_session: bool = False
 
     generator: torch.Generator | list[torch.Generator] | None = None
 
