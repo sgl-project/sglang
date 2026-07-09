@@ -2552,11 +2552,25 @@ class NixlKVReceiver(CommonKVReceiver):
             logger.debug(
                 f"Sending to prefill server with bootstrap room {self.bootstrap_room} {is_dummy=}"
             )
+            local_state_indices = state_indices
+            if spec_metadata and spec_metadata.get("pp_slices"):
+                pp_rank = int(bootstrap_info.get("pp_rank", 0))
+                pp_slice = spec_metadata["pp_slices"].get(str(pp_rank), {})
+                local_state_indices = list(
+                    state_indices
+                    if state_indices is not None
+                    else [None] * len(self.kv_mgr.kv_args.state_types)
+                )
+                for idx, state_type in enumerate(self.kv_mgr.kv_args.state_types):
+                    if state_type == StateType.DSPARK_HIDDEN:
+                        local_state_indices[idx] = pp_slice.get("dst_indices", [])
+                        break
             packed_state_indices = (
                 pack_int_lists(
-                    [(idx if idx is not None else []) for idx in state_indices], "i"
+                    [(idx if idx is not None else []) for idx in local_state_indices],
+                    "i",
                 )
-                if not is_dummy and state_indices is not None
+                if not is_dummy and local_state_indices is not None
                 else b""
             )
             with lock:
