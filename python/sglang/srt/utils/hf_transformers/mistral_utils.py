@@ -12,8 +12,9 @@ from transformers import AutoConfig, PretrainedConfig, WhisperConfig
 from sglang.srt.utils import logger
 
 from .common import (
+    _cached_file_exists,
     _ensure_sub_configs,
-    _resolve_local_or_cached_file,
+    _remote_file_exists,
     download_from_hf,
 )
 
@@ -444,14 +445,22 @@ def is_bare_tekken_checkpoint(tokenizer_name, revision=None) -> bool:
     mistral-common backed tokenizer instead.
     """
 
-    def _has(filename):
-        try:
-            _resolve_local_or_cached_file(tokenizer_name, filename, revision)
-            return True
-        except Exception:
-            return False
+    local_dir = Path(tokenizer_name)
+    if local_dir.is_dir():
+        return (local_dir / "tekken.json").is_file() and not (
+            local_dir / "tokenizer.json"
+        ).is_file()
 
-    return _has("tekken.json") and not _has("tokenizer.json")
+    if _cached_file_exists(tokenizer_name, "tokenizer.json", revision):
+        return False
+    if _cached_file_exists(tokenizer_name, "tekken.json", revision):
+        return True
+
+    # Cold cache: the tokenizer loads before weights, so tekken.json isn't
+    # cached yet on a first launch — HEAD-probe the hub to still detect it.
+    if not _remote_file_exists(tokenizer_name, "tekken.json", revision):
+        return False
+    return not _remote_file_exists(tokenizer_name, "tokenizer.json", revision)
 
 
 def retry_without_mistral_common_kwargs(tokenizer_name, *args, **common_kwargs):

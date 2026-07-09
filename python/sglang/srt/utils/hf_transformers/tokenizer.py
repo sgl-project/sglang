@@ -502,6 +502,14 @@ def get_tokenizer(
                 MistralCommonTokenizer,
             )
 
+            logger.info(
+                "Detected bare-tekken checkpoint %s (tekken.json, no "
+                "tokenizer.json); loading via mistral-common MistralCommonTokenizer, "
+                "ignoring tokenizer_backend=%r.",
+                tokenizer_name,
+                tokenizer_backend,
+            )
+
             tokenizer = MistralCommonTokenizer.from_pretrained(
                 tokenizer_name, revision=tokenizer_revision
             )
