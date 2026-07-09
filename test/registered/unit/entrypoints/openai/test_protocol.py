@@ -210,6 +210,20 @@ class TestChatCompletionRequest(unittest.TestCase):
             {"thinking": True, "enable_thinking": True},
         )
 
+    def test_chat_completion_reasoning_effort_high_enables_thinking(self):
+        """Top-level reasoning_effort='high' enables thinking."""
+        messages = [{"role": "user", "content": "Hello"}]
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=messages,
+            reasoning_effort="high",
+        )
+        self.assertEqual(request.reasoning_effort, "high")
+        self.assertEqual(
+            request.chat_template_kwargs,
+            {"thinking": True, "enable_thinking": True},
+        )
+
     def test_chat_completion_reasoning_effort_none(self):
         """Test reasoning_effort='none' disables thinking"""
         messages = [{"role": "user", "content": "Hello"}]
@@ -229,6 +243,17 @@ class TestChatCompletionRequest(unittest.TestCase):
             model="test-model",
             messages=messages,
             reasoning={"effort": "none"},
+        )
+        self.assertEqual(request.reasoning_effort, "none")
+        self.assertFalse(request.chat_template_kwargs.get("thinking"))
+        self.assertFalse(request.chat_template_kwargs.get("enable_thinking"))
+
+    def test_chat_completion_reasoning_effort_none_overrides_enabled(self):
+        messages = [{"role": "user", "content": "Hello"}]
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=messages,
+            reasoning={"enabled": True, "effort": "none"},
         )
         self.assertEqual(request.reasoning_effort, "none")
         self.assertFalse(request.chat_template_kwargs.get("thinking"))

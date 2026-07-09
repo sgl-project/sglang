@@ -18,7 +18,7 @@ from sglang.srt.entrypoints.openai.protocol import (  # noqa: E402
     ChatCompletionRequest,
     ChatCompletionResponse,
 )
-from sglang.srt.managers.template_detection import (  # noqa: E402
+from sglang.srt.parser.template_detection import (  # noqa: E402
     detect_inline_system_support,
 )
 from sglang.test.ci.ci_register import register_cpu_ci  # noqa: E402
