@@ -294,7 +294,12 @@ class RotaryEmbedding(MultiPlatformOp):
             else:
                 cos_sin = self.cos_sin_cache.index_select(0, positions)
 
-            if fused_rope_qk_mqa is not None and query.shape[0] < 65535:
+            if (
+                fused_rope_qk_mqa is not None
+                and query.ndim == 3
+                and key.ndim == 3
+                and query.shape[0] < 65535
+            ):
                 return fused_rope_qk_mqa(
                     query,
                     key,
