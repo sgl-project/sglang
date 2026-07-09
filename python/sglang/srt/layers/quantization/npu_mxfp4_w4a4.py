@@ -104,10 +104,16 @@ class Mxfp4W4A4Config(QuantizationConfig):
             ):
                 return UnquantizedLinearMethod()
             if is_npu():
+                from sglang.srt.environ import envs
                 from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
+                    NPUDualLevelMXFP4LinearMethod,
                     NPUSingleLevelMXFP4LinearMethod,
                 )
 
+                # Dual-level (finer FP8 L0 scales) trades some throughput for
+                # accuracy; opt in on Ascend 950 (A5) where the op is available.
+                if envs.SGLANG_NPU_MXFP4_W4A4_DUAL_LEVEL.get():
+                    return NPUDualLevelMXFP4LinearMethod(self)
                 return NPUSingleLevelMXFP4LinearMethod(self)
             raise NotImplementedError(
                 "mxfp4 W4A4 (single-level MXFP4 weights + activations) is currently "

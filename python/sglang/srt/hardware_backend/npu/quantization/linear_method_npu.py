@@ -799,3 +799,98 @@ class NPUSingleLevelMXFP4OfflineLinearMethod(NPUSingleLevelMXFP4LinearMethod):
             weight_scale.reshape(n_dim, k_dim // 2, 2).transpose(0, 1),
             requires_grad=False,
         )
+
+
+class NPUDualLevelMXFP4LinearMethod(NPUSingleLevelMXFP4LinearMethod):
+    """Ascend NPU W4A4 online quantization: dual-level MXFP4 (higher accuracy).
+
+    Opt-in via ``SGLANG_NPU_MXFP4_W4A4_DUAL_LEVEL=1`` (default is the single-level
+    :class:`NPUSingleLevelMXFP4LinearMethod`). Instead of a single UE8M0 (power-of-2)
+    block scale, dual-level MX quant produces a finer L0 (FP8 E4M3) block scale plus
+    a coarser L1 scale, so per-block dynamic range is captured far more accurately —
+    this narrows the online-RTN quality gap and helps avoid degenerate decoding
+    (e.g. reasoning loops that never emit EOS under greedy sampling).
+
+    All NPU ops go through ``torch.ops.npu.*`` (no top-level ``torch_npu``). Only
+    ``create_weights`` (the BF16/FP16 placeholder) is shared with the single-level
+    base; weight post-processing and the matmul are fully dual-level.
+
+    Weight quantization (process_weights_after_loading):
+        BF16/FP16 weight → npu_dynamic_dual_level_mx_quant
+        → (packed FP4 weight, L0 scale, L1 scale); weight cast to FRACTAL_NZ,
+          L0 scale transposed to [in//l0_block, out].
+
+    Inference (apply):
+        BF16/FP16 activation → npu_dynamic_dual_level_mx_quant  (A4, dual-level)
+        → npu_dual_level_quant_matmul(act, weight, act_l0, w_l0, act_l1, w_l1)
+
+    Reference: Diffusion ``NPUMXFP4DiffusionLinearMethod`` / MindIE-SD
+    ``W4A4MXFP4DualQuantLinear``. Hardware: Ascend 950 (A5) only — the
+    ``DualLevelQuantBatchMatmul`` op is unavailable on A2/A3.
+    """
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        weight_fp = layer.weight.data
+        if weight_fp.dtype not in (torch.float16, torch.bfloat16):
+            weight_fp = weight_fp.to(torch.bfloat16)
+        # Move to NPU if needed (cpu offload may have put it on CPU).
+        if not weight_fp.is_npu:
+            weight_fp = weight_fp.to(f"npu:{torch.npu.current_device()}")
+
+        # Dual-level MXFP4 weight quant: packed FP4 weight + L0 (fine, FP8 E4M3)
+        # and L1 (coarse) block scales.
+        qw, w_l0_scale, w_l1_scale = torch.ops.npu.npu_dynamic_dual_level_mx_quant(
+            weight_fp, smooth_scale=None
+        )
+
+        # npu_dual_level_quant_matmul requires the weight (x2) in FRACTAL_NZ.
+        # View the packed FP4 as int8 first (npu_format_cast takes int dtypes).
+        qw_nz = npu_format_cast(
+            qw.view(torch.int8),
+            NPUACLFormat.ACL_FORMAT_FRACTAL_NZ,
+            customize_dtype=torch.int8,
+        )
+
+        # L0 scale -> [in//l0_block, out] (op returns [out, in//l0_block, 1]).
+        w_l0_scale = w_l0_scale.squeeze(-1).transpose(0, 1).contiguous()
+
+        layer.weight = Parameter(qw_nz, requires_grad=False)
+        layer.weight_l0_scale = Parameter(w_l0_scale, requires_grad=False)
+        layer.weight_l1_scale = Parameter(w_l1_scale, requires_grad=False)
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        original_dtype = x.dtype
+        if original_dtype not in (torch.float16, torch.bfloat16):
+            x = x.to(torch.bfloat16)
+            original_dtype = torch.bfloat16
+
+        # Flatten to 2D [tokens, hidden] for the quant operators.
+        input_shape = x.shape
+        x_2d = x.reshape(-1, x.shape[-1])
+
+        # Dynamic dual-level MXFP4 activation quant (A4): packed FP4 + L0/L1 scales.
+        qx, act_l0_scale, act_l1_scale = torch.ops.npu.npu_dynamic_dual_level_mx_quant(
+            x_2d, smooth_scale=None
+        )
+
+        # Dual-level matmul. Arg order (act, weight, act_l0, w_l0, act_l1, w_l1);
+        # the weight is NOT transposed here (unlike the single-level path).
+        output = torch.ops.npu.npu_dual_level_quant_matmul(
+            qx,
+            layer.weight,
+            act_l0_scale,
+            layer.weight_l0_scale,
+            act_l1_scale,
+            layer.weight_l1_scale,
+            bias=bias.to(torch.float32) if bias is not None else None,
+            output_dtype=original_dtype,
+        )
+
+        # Restore original shape (replace last dim with output features).
+        output_shape = list(input_shape[:-1]) + [output.shape[-1]]
+        return output.reshape(output_shape)
