@@ -108,6 +108,7 @@ class RequestFuncOutput:
     start_time: float = 0.0
     cached_tokens: int = 0
     cached_tokens_details: Optional[Dict[str, Any]] = None
+    response_bytes: int = 0
 
     @staticmethod
     def init_new(request_func_input: RequestFuncInput):
@@ -778,8 +779,12 @@ async def async_request_openai_embeddings(
                 url=api_url, json=payload, headers=headers
             ) as response:
                 if response.status == 200:
-                    await response.json()
+                    body = await response.read()
+                    # Stop the clock at transfer completion; parsing below is
+                    # excluded so encoding_format comparisons stay client-neutral.
                     output.latency = time.perf_counter() - st
+                    json.loads(body)
+                    output.response_bytes = len(body)
                     output.success = True
                     output.output_len = 0
                 else:
@@ -989,6 +994,10 @@ class BenchmarkMetrics:
     max_output_tokens_per_s: float = 0.0
     max_concurrent_requests: int = 0
 
+    # Response payload size in bytes (non-streaming backends, e.g. sglang-embedding)
+    total_response_bytes: int = 0
+    mean_response_bytes: float = 0.0
+
 
 async def get_request(
     input_requests: List[DatasetRow],
@@ -1057,10 +1066,12 @@ def calculate_metrics(
         and backend in ("sglang-oai", "sglang-oai-chat")
     )
 
+    total_response_bytes = 0
     for i in range(len(outputs)):
         if outputs[i].success:
             output_len = outputs[i].output_len
             output_lens.append(output_len)
+            total_response_bytes += outputs[i].response_bytes
             retokenized_output_len = len(
                 tokenizer.encode(outputs[i].generated_text, add_special_tokens=False)
             )
@@ -1206,6 +1217,8 @@ def calculate_metrics(
         concurrency=np.sum(e2e_latencies) / dur_s,
         max_output_tokens_per_s=max_output_tokens_per_s,
         max_concurrent_requests=max_concurrent_requests,
+        total_response_bytes=total_response_bytes,
+        mean_response_bytes=total_response_bytes / completed if completed else 0.0,
     )
 
     return metrics, output_lens
@@ -1586,6 +1599,12 @@ async def benchmark(
             "Input token throughput (tok/s):", metrics.input_throughput
         )
     )
+    if is_embedding:
+        print(
+            "{:<40} {:<10.2f}".format(
+                "Mean response KB per request:", metrics.mean_response_bytes / 1024
+            )
+        )
     if not is_embedding:
         print(
             "{:<40} {:<10.2f}".format(
@@ -1769,6 +1788,8 @@ async def benchmark(
             "accept_length": accept_length,
             "max_output_tokens_per_s": metrics.max_output_tokens_per_s,
             "max_concurrent_requests": metrics.max_concurrent_requests,
+            "total_response_bytes": metrics.total_response_bytes,
+            "mean_response_bytes": metrics.mean_response_bytes,
         }
 
         if args.cache_report:
