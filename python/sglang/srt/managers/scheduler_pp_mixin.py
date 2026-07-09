@@ -717,6 +717,7 @@ class SchedulerPPMixin:
                     ]
                     self.token_to_kv_pool_allocator.free(kv_indices)
                     self.req_to_token_pool.free(req)
+                    req.kv = None
 
             logger.info(
                 f"[PP Dynamic Chunk] [PP0] Profiled {len(seq_lens)} samples: "

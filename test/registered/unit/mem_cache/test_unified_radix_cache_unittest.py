@@ -20,7 +20,7 @@ from sglang.srt.disaggregation.kv_events import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
-from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -649,6 +649,7 @@ class UnifiedRadixCacheSuite:
         )
         self._rid += 1
         req_to_token_pool.alloc([req])
+        req.kv = ReqKvInfo(kv_allocated_len=0, swa_evicted_seqlen=0)
         return req
 
     def _apply_match_to_req(self, req, match):
@@ -883,7 +884,7 @@ class UnifiedRadixCacheSuite:
         kv_indices = self._alloc(allocator, kv_len)
         req_to_token_pool.write((req.req_pool_idx, slice(0, kv_len)), kv_indices)
         req.kv_committed_len = kv_len
-        req.kv.kv_allocated_len = kv_len
+        req.kv = ReqKvInfo(kv_allocated_len=kv_len, swa_evicted_seqlen=0)
         req.last_node = cache.root_node
         req.cache_protected_len = 0
         req.swa_uuid_for_lock = None
@@ -1769,7 +1770,7 @@ class UnifiedRadixCacheSuite:
         req.cache_protected_len = 0
         req.swa_uuid_for_lock = None
         req.extra_key = None
-        req.kv.swa_evicted_seqlen = 0
+        req.kv = ReqKvInfo(kv_allocated_len=0, swa_evicted_seqlen=0)
 
         swa_avail_before = allocator.swa_attn_allocator.available_size()
 
@@ -1821,7 +1822,7 @@ class UnifiedRadixCacheSuite:
         req.cache_protected_len = 0
         req.swa_uuid_for_lock = None
         req.extra_key = None
-        req.kv.swa_evicted_seqlen = 0
+        req.kv = ReqKvInfo(kv_allocated_len=0, swa_evicted_seqlen=0)
 
         with envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.override(True):
             cache.cache_unfinished_req(req)

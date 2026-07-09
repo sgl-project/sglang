@@ -752,7 +752,7 @@ class Req(ReqDllmMixin):
 
         # For req-level memory management
         self.kv_committed_len = 0
-        self.kv: ReqKvInfo = ReqKvInfo(kv_allocated_len=0, swa_evicted_seqlen=0)
+        self.kv: Optional[ReqKvInfo] = None
 
         # for cross-encoder model
         self.token_type_ids = token_type_ids
@@ -1505,9 +1505,8 @@ class Req(ReqDllmMixin):
         self.mamba_cow_src_index = None
         self.mamba_needs_clear = False
         self.already_computed = 0
-        self.kv.kv_allocated_len = 0
+        assert self.kv is None, "expect it is already released"
         self.kv_committed_len = 0
-        self.kv.swa_evicted_seqlen = 0
         self.extend_batch_idx = 0
         self.decode_batch_idx = 0
 
@@ -2173,8 +2172,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             req.extend_batch_idx += 1
 
             # update req-level memory management fields
+            # TODO(th4): co-locate this req.kv bookkeeping with the real KV
+            # allocation in alloc_for_extend above; they are currently a few
+            # steps apart and should become one owned-kv allocation step.
             req.kv_committed_len = seq_len
-            req.kv.kv_allocated_len = seq_len
+            if req.kv is None:
+                req.kv = ReqKvInfo(kv_allocated_len=seq_len, swa_evicted_seqlen=0)
+            else:
+                req.kv.kv_allocated_len = seq_len
 
             # If input_embeds are available, store them
             if req.input_embeds is not None:

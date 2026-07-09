@@ -37,12 +37,6 @@ class _VirtualNode:
     pass
 
 
-def _new_kv() -> ReqKvInfo:
-    from sglang.srt.managers.schedule_batch import ReqKvInfo
-
-    return ReqKvInfo(kv_allocated_len=0, swa_evicted_seqlen=0)
-
-
 @dataclass
 class SessionSlot:
     """Holds KV state between streaming session turns."""
@@ -52,7 +46,7 @@ class SessionSlot:
     # KV pool state (None means no KV is currently held by this slot)
     req_pool_idx: Optional[int] = None
     kv_committed_len: int = 0
-    kv: ReqKvInfo = field(default_factory=_new_kv)
+    kv: Optional[ReqKvInfo] = None
 
     # First req's radix tree node (for dec_lock_ref on session close)
     last_node: Any = None
@@ -97,6 +91,7 @@ class SessionSlot:
         # the slot's tensor to be reused by a new req and leaked when
         # the slot is later freed.
         req.req_pool_idx = None
+        req.kv = None
         req.mamba_pool_idx = None
         req.mamba_ping_pong_track_buffer = None
         req.mamba_next_track_idx = None
@@ -324,6 +319,7 @@ class StreamingSession(BasePrefixCache):
             )
             self.release_session(session_id)
             req.req_pool_idx = None
+            req.kv = None
             req.session.abort_req()
             return True
 
