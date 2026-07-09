@@ -372,6 +372,8 @@ PI05_ACTION_CI_sampling_params = DiffusionSamplingParams(
         "seed": 0,
         "enable_prefix_cache": False,
         "enable_cuda_graph": True,
+        "action_max_abs_diff_threshold": 0.05,
+        "action_mean_abs_diff_threshold": 0.005,
     },
 )
 
