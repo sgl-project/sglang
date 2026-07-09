@@ -136,7 +136,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             length=self.verify_num_draft_tokens, device=self.device
         )
         self._draft_block_spec_info = make_draft_block_spec_info(
-            draft_token_num=int(self.gamma), device=self.device
+            draft_token_num=int(self.verify_num_draft_tokens), device=self.device
         )
 
         target_model = self.target_worker.model_runner.model
