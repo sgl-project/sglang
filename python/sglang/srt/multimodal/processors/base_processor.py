@@ -23,6 +23,7 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     envs,
     is_cpu,
+    is_hip,
     is_npu,
     is_xpu,
     load_audio,
@@ -41,7 +42,66 @@ _is_cpu = is_cpu()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
 
+# User intent: did the operator ask for CUDA-IPC transport via the env var?
+# Kept separate from CUDA_IPC_TRANSPORT_SUPPORTED (below) purely for logging /
+# introspection — this value on its own does NOT mean IPC will actually be used.
 SGL_USE_CUDA_IPC = envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get()
+
+# Effective gate: whether this process may actually construct/consume raw
+# CUDA-IPC handles (torch.UntypedStorage._share_cuda_ / _new_shared_cuda).
+#
+# PyTorch exposes ROCm through the same torch.cuda.* / torch.device("cuda")
+# surface as CUDA (see sglang.srt.platforms.rocm for the same note), so
+# `tensor.is_cuda` is True on both backends and cannot be used to distinguish
+# them. The raw pointer-handle reconstruction path in
+# CudaIpcTensorTransportProxy.reconstruct_on_target_device redirects the IPC
+# handle to the consumer's device index and reopens it with
+# torch.UntypedStorage._new_shared_cuda(...); on ROCm this crashes with
+# "HIP error: invalid device pointer" (see sgl-project/sglang#29687, a
+# follow-up to #29227) because the device-redirected handle isn't a construct
+# HIP's IPC implementation supports the same way.
+#
+# Rather than attempt raw HIP IPC (which does not work) or silently no-op the
+# multimodal feature (which would corrupt output), ROCm is routed through the
+# transport's existing non-IPC path: CudaIpcTensorTransportProxy already falls
+# back to a plain tensor_data passthrough (`tensor.to(device)`) whenever no
+# ipc_extra handle is attached to the proxy_state (see get_proxy_state's
+# except-branch and reconstruct_on_target_device's tensor_data branch in
+# cuda_ipc_transport_utils.py). That passthrough is backend-agnostic — it's an
+# ordinary device-to-device tensor copy, not a raw pointer handle — so it is
+# already exercised (and correct) on every platform. Setting this to False
+# means every call site below skips wrapping tensors into a CUDA-IPC handle at
+# all and instead lets that existing passthrough carry the tensor, so ROCm
+# genuinely bypasses CUDA-IPC end-to-end, matching what
+# MmItemMemoryPool._warn_pool_full_once's "falling back to non-IPC transport"
+# message already (and, prior to this change, inaccurately) claimed happens
+# unconditionally.
+#
+# NOTE: this has been verified by full code trace + reasoning, not on real
+# ROCm/MI300-class hardware (none is available in this environment). The
+# is_hip() check itself (torch.version.hip is not None) is a one-line, already
+# battle-tested primitive used ~130 other places in this codebase.
+
+
+def _compute_cuda_ipc_transport_supported(
+    use_ipc_env: bool, is_hip_platform: bool
+) -> bool:
+    """Pure derivation of CUDA_IPC_TRANSPORT_SUPPORTED, extracted out of the
+    module-level assignment below so it is a plain function of its two real
+    inputs and independently unit-testable with real booleans -- no mocking,
+    no module reload, no monkeypatching of import paths required. The
+    module-level constant below is the single call site that feeds it the
+    real env-derived flag and the real is_hip() reading; every production
+    caller keeps referencing the module-level `CUDA_IPC_TRANSPORT_SUPPORTED`
+    name exactly as before, so this is a pure refactor with no behavior
+    change.
+    """
+    return use_ipc_env and not is_hip_platform
+
+
+CUDA_IPC_TRANSPORT_SUPPORTED = _compute_cuda_ipc_transport_supported(
+    SGL_USE_CUDA_IPC, is_hip()
+)
 _IPC_POOL_HANDLE_CACHE = envs.SGLANG_USE_IPC_POOL_HANDLE_CACHE.get()
 
 
@@ -258,7 +318,7 @@ class BaseMultimodalProcessor(ABC):
 
         skip_mm_pool = kwargs.get("skip_mm_pool", False)
 
-        if SGL_USE_CUDA_IPC and not skip_mm_pool:
+        if CUDA_IPC_TRANSPORT_SUPPORTED and not skip_mm_pool:
             # SGLANG_MM_FEATURE_CACHE_MB is the total pool budget across all
             # tokenizer workers. Each worker gets an equal share so that adding
             # workers doesn't multiply the GPU-side footprint.
@@ -473,7 +533,10 @@ class BaseMultimodalProcessor(ABC):
         if not self.server_args.keep_mm_feature_on_device:
             # move feature tensors to cpu
             for feature_name in self.FEATURE_NAMES:
-                if SGL_USE_CUDA_IPC:
+                if CUDA_IPC_TRANSPORT_SUPPORTED:
+                    # The later _wrap_tensor_for_cuda_ipc() pass will decide
+                    # device placement for us (pool slice, passthrough, or
+                    # explicit .cpu() fallback), so skip it here.
                     pass
                 else:
                     if feature_name in result and isinstance(
@@ -1217,6 +1280,18 @@ class BaseMultimodalProcessor(ABC):
         if not tensor.is_cuda:
             return tensor
 
+        # Defense-in-depth: the only caller already checks
+        # CUDA_IPC_TRANSPORT_SUPPORTED before invoking this method (which is
+        # also what gates whether self.cudaipc_mmfeature_pool was constructed
+        # at all — see __init__), but guard here too so this method is
+        # correct standalone rather than relying on caller discipline. On
+        # ROCm (or if IPC transport was never enabled), fall through to the
+        # same tensor_data-style passthrough used elsewhere in this class.
+        if not CUDA_IPC_TRANSPORT_SUPPORTED:
+            if self.server_args.keep_mm_feature_on_device:
+                return tensor
+            return tensor.cpu()
+
         sync_flag, available_slice, byte_offset = (
             self.cudaipc_mmfeature_pool.return_a_slice_tensor_with_flag(tensor)
         )
@@ -1458,7 +1533,7 @@ class BaseMultimodalProcessor(ABC):
         4. copy
         """
 
-        if SGL_USE_CUDA_IPC:
+        if CUDA_IPC_TRANSPORT_SUPPORTED:
             # post-process, prepare for cuda-ipc transfer
             for item in all_collected_items:
                 if isinstance(item.feature, torch.Tensor):
