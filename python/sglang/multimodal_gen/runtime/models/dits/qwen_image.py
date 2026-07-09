@@ -62,6 +62,10 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config i
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     apply_flashinfer_rope_qk_inplace,
 )
+from sglang.multimodal_gen.runtime.layers.tp_shard_planner import (
+    ShardScheme,
+    get_tp_shard_planner,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
@@ -977,24 +981,33 @@ class QwenImageTransformerBlock(nn.Module):
                 activation_fn="gelu-approximate",
             )
         else:
+            # Layouts (shard vs replicate) come from the TP shard planner; the
+            # measured crossovers and their evidence live in
+            # tp_shard_planner.MEASURED_RULES.
+            planner = get_tp_shard_planner()
             self.img_mlp = QwenImageFeedForward(
                 dim=dim,
                 dim_out=dim,
                 quant_config=quant_config,
                 prefix=f"{prefix}.img_mlp",
+                replicated=planner.decide_ffn(
+                    model_family="qwen_image",
+                    branch="image",
+                    prefix=f"{prefix}.img_mlp",
+                )
+                is ShardScheme.REPLICATE,
             )
             self.txt_mlp = QwenImageFeedForward(
                 dim=dim,
                 dim_out=dim,
                 quant_config=quant_config,
                 prefix=f"{prefix}.txt_mlp",
-                # The text branch is ~1K tokens regardless of image size, so
-                # sharding its FFN saves less GEMM time than the per-block
-                # all-reduce it adds. Measured e2e crossover (H100, 1024x1024):
-                # tp=2 replication wins (5.58s -> 5.12s, -8%) but at tp=4 the
-                # duplicated GEMM outgrows the all-reduce saved (~1% loss), so
-                # gate on the TP degree.
-                replicated=get_tp_world_size() <= 2,
+                replicated=planner.decide_ffn(
+                    model_family="qwen_image",
+                    branch="text",
+                    prefix=f"{prefix}.txt_mlp",
+                )
+                is ShardScheme.REPLICATE,
             )
 
         if nunchaku_enabled:

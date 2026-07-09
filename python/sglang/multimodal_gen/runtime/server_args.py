@@ -205,6 +205,11 @@ class ServerArgs(DisaggServerArgsMixin):
     base_gpu_id: int = 0
     gpu_ids: list[int] | None = None
     tp_size: Optional[int] = None
+    # Per-layer TP layout plan for DiT linears (see layers/tp_shard_planner.py):
+    # "auto" | "full" | "aggressive" | path to a plan JSON.
+    dit_tp_plan: str = "auto"
+    # Expected output shape "WxH"/"WxHxF" used by workload-gated plan rules.
+    dit_tp_plan_workload: Optional[str] = None
     sp_degree: Optional[int] = None
     # sequence parallelism
     ulysses_degree: Optional[int] = None
@@ -1385,6 +1390,25 @@ class ServerArgs(DisaggServerArgsMixin):
             type=int,
             default=None,
             help="The tensor parallelism size. Defaults to 1 if not specified.",
+        )
+        parser.add_argument(
+            "--dit-tp-plan",
+            type=str,
+            default=ServerArgs.dit_tp_plan,
+            help="Per-layer TP layout plan for DiT linears: 'auto' (measured "
+            "per-model defaults, conservative full-shard for un-measured "
+            "models), 'full' (shard every projection), 'aggressive' (also "
+            "apply workload-gated replication rules; combine with "
+            "--dit-tp-plan-workload), or a path to a plan JSON produced by "
+            "tools/tune_dit_tp_plan.py.",
+        )
+        parser.add_argument(
+            "--dit-tp-plan-workload",
+            type=str,
+            default=ServerArgs.dit_tp_plan_workload,
+            help="Expected output shape 'WxH' (or 'WxHxF' for video), used by "
+            "workload-gated rules of --dit-tp-plan. Unset means only "
+            "workload-independent rules apply.",
         )
         parser.add_argument(
             "--sp-degree",
