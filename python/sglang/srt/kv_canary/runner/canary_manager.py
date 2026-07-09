@@ -31,6 +31,7 @@ from sglang.srt.kv_canary.state import CanaryDeviceState
 from sglang.srt.kv_canary.token_oracle.oracle_manager import TokenOracleManager
 
 if TYPE_CHECKING:
+    from sglang.srt.kv_canary.hicache.bridge import CanaryHiCacheBridge
     from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -61,6 +62,7 @@ class CanaryManager:
         self._swa_allocator: Optional[SWATokenToKVPoolAllocator] = swa_allocator
         self._outer_step_counter: int = 0
         self._active_single_forward_manager_index: Optional[int] = None
+        self._hicache_bridge: Optional[CanaryHiCacheBridge] = None
 
         self._buffer_groups: tuple[CanaryBufferGroup, ...] = tuple(buffer_groups)
 
@@ -267,6 +269,20 @@ class CanaryManager:
     def attach_radix_cache(self, radix_cache: BasePrefixCache) -> None:
         self._sweep_orchestrator.attach_radix_cache(radix_cache)
         self._perturb_manager.attach_radix_cache(radix_cache)
+        cache_controller = getattr(radix_cache, "cache_controller", None)
+        if cache_controller is None:
+            return
+        if self._hicache_bridge is not None:
+            raise RuntimeError("kv-canary: HiCache bridge already attached")
+
+        from sglang.srt.kv_canary.hicache.bridge import CanaryHiCacheBridge
+
+        bridge = CanaryHiCacheBridge.from_cache_controller(
+            buffer_groups=self._buffer_groups,
+            cache_controller=cache_controller,
+        )
+        cache_controller.register_canary_hicache_bridge(bridge)
+        self._hicache_bridge = bridge
 
     def _get_outer_step_counter(self) -> int:
         return self._outer_step_counter
