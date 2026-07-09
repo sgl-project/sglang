@@ -1176,16 +1176,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         # allocator and kv cache pool are shared with target worker, which are cleared in scheduler
         pass
 
-    def forward_batch_generation(
-        self,
-        batch: ScheduleBatch,
-        on_publish=None,
-        *,
-        capture_hidden_mode: Optional[CaptureHiddenMode],
-    ):
-        assert (
-            capture_hidden_mode is None
-        ), "spec workers derive capture_hidden_mode internally"
+    def forward_batch_generation(self, batch: ScheduleBatch, on_publish=None):
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             # Target prefill
             target_capture_mode = (
@@ -1629,7 +1620,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
             batch=None,
             forward_batch=verify_forward_batch,
             is_verify=True,
-            capture_hidden_mode=None,
         )
         logits_output = forward_batch_output.logits_output
 

@@ -224,7 +224,6 @@ class BaseTpWorker(ABC):
         forward_batch = ForwardBatch.init_new(
             batch,
             self.model_runner,
-            capture_hidden_mode=None,
             return_hidden_states_before_norm=False,
         )
         output = self.model_runner.forward(forward_batch).logits_output
@@ -503,7 +502,7 @@ class TpModelWorker(BaseTpWorker):
         is_verify: bool = False,
         skip_attn_backend_init: Optional[bool] = None,  # deprecated
         *,
-        capture_hidden_mode: Optional[CaptureHiddenMode],
+        capture_hidden_mode: Optional[CaptureHiddenMode] = None,
     ) -> GenerationBatchResult:
         # Get forward batch from schedule batch
         if batch is not None:
@@ -602,7 +601,6 @@ class TpModelWorker(BaseTpWorker):
             forward_batch = ForwardBatch.init_new(
                 batch,
                 self.model_runner,
-                capture_hidden_mode=None,
                 return_hidden_states_before_norm=False,
             )
             batch.split_forward_batch = forward_batch
