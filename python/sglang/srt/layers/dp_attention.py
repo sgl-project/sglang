@@ -29,6 +29,7 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.runtime_context import get_flags
 from sglang.srt.utils import get_bool_env_var, is_hip
 
 if TYPE_CHECKING:
@@ -44,8 +45,6 @@ _ATTN_DP_RANK: Optional[int] = None
 _ATTN_DP_SIZE: Optional[int] = None
 _LOCAL_ATTN_DP_SIZE: Optional[int] = None
 _LOCAL_ATTN_DP_RANK: Optional[int] = None
-_ENABLE_DP_ATTENTION_FLAG: bool = False
-_DP_MAX_LEN_WITH_IDLE = False
 
 _is_hip = is_hip()
 _USE_ROCM700A_WA = _is_hip and get_bool_env_var("SGLANG_USE_ROCM700A")
@@ -77,7 +76,7 @@ class DpPaddingMode(IntEnum):
         if is_extend_in_batch and dp_size > 1:
             # Hybrid-SSM models materialize idle ranks via the MAX_LEN
             # fabricated-row conversion; other models keep mainline SUM_LEN.
-            if _DP_MAX_LEN_WITH_IDLE and min(global_num_tokens) == 0:
+            if get_flags().dp.max_len_with_idle and min(global_num_tokens) == 0:
                 return DpPaddingMode.MAX_LEN
             return DpPaddingMode.SUM_LEN
 
@@ -281,9 +280,9 @@ def initialize_dp_attention(
     model_config: ModelConfig,
 ):
     global _ATTN_DP_RANK, _ATTN_DP_SIZE
-    global _LOCAL_ATTN_DP_SIZE, _LOCAL_ATTN_DP_RANK, _ENABLE_DP_ATTENTION_FLAG
-    global _DP_MAX_LEN_WITH_IDLE
-    _DP_MAX_LEN_WITH_IDLE = (
+    global _LOCAL_ATTN_DP_SIZE, _LOCAL_ATTN_DP_RANK
+    dp = get_flags().dp
+    dp.max_len_with_idle = (
         getattr(model_config.hf_config, "hybrid_override_pattern", None) is not None
     )
     enable_dp_attention = server_args.enable_dp_attention
@@ -291,7 +290,7 @@ def initialize_dp_attention(
     moe_dense_tp_size = server_args.moe_dense_tp_size
     attn_cp_size = server_args.attn_cp_size
 
-    _ENABLE_DP_ATTENTION_FLAG = enable_dp_attention
+    dp.enabled = enable_dp_attention
 
     tp_rank = get_tensor_model_parallel_rank()
     tp_size = get_tensor_model_parallel_world_size()
@@ -321,7 +320,7 @@ def initialize_dp_attention(
 
 
 def is_dp_attention_enabled() -> bool:
-    return _ENABLE_DP_ATTENTION_FLAG
+    return get_flags().dp.enabled
 
 
 def is_allocation_symmetric() -> bool:
@@ -703,14 +702,10 @@ def dp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
 # stream -> their collectives serialize in-order (no concurrent-collective
 # deadlock on the RCCL communicator), each overlapping the other's compute.
 # ---------------------------------------------------------------------------
-_DP_TBO_COMM_STREAM: Optional[torch.cuda.Stream] = None
-
-
 def get_dp_tbo_comm_stream() -> torch.cuda.Stream:
-    global _DP_TBO_COMM_STREAM
-    if _DP_TBO_COMM_STREAM is None:
-        _DP_TBO_COMM_STREAM = torch.cuda.Stream()
-    return _DP_TBO_COMM_STREAM
+    from sglang.srt.runtime_context import get_stream
+
+    return get_stream("dp_tbo_comm")
 
 
 # Persistent reusable CUDA events for non-EP DP TBO, keyed by (kind, subbatch).
@@ -719,14 +714,14 @@ def get_dp_tbo_comm_stream() -> torch.cuda.Stream:
 # pool is exhausted after a few hundred forwards -> HSA_STATUS_ERROR_OUT_OF_RESOURCES
 # ("...create internal OS-specific events"). Reuse one event per (kind, subbatch)
 # and just re-record it (mirrors the mori CommStreamPool event reuse).
-_TBO_EVENT_POOL: dict = {}
-
-
 def _tbo_event(key) -> torch.cuda.Event:
-    ev = _TBO_EVENT_POOL.get(key)
+    from sglang.srt.runtime_context import get_resources
+
+    pool = get_resources().tbo_event_pool
+    ev = pool.get(key)
     if ev is None:
         ev = torch.cuda.Event()
-        _TBO_EVENT_POOL[key] = ev
+        pool[key] = ev
     return ev
 
 
