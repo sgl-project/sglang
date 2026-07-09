@@ -289,6 +289,11 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         self.audio_start_token_id = getattr(hf_config, "audio_start_token_id", None)
         self.audio_token_id = getattr(hf_config, "audio_token_id", None)
 
+        self._spatial_merge_size = self.hf_config.vision_config.spatial_merge_size
+        self._tokens_per_second = getattr(
+            self.hf_config.vision_config, "tokens_per_second", None
+        )
+
         self.mm_tokens = MultimodalSpecialTokens(
             image_token="<|vision_start|><|image_pad|><|vision_end|>",
             image_token_id=hf_config.image_token_id,
@@ -299,6 +304,10 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             video_token_id=self.VIDEO_TOKEN_ID,
             audio_token_id=self.audio_token_id,
         ).build(_processor)
+
+    @property
+    def spatial_merge_size(self):
+        return self._spatial_merge_size
 
     def build_input_ids_with_timestamps(
         self, prompt, embeddings, img_grid_thw, video_grid_thw, video_timestamps
@@ -401,14 +410,12 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
 
         input_ids_tensor = torch.tensor(input_ids, dtype=torch.long).unsqueeze(0)
         mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index(
-            spatial_merge_size=self.hf_config.vision_config.spatial_merge_size,
+            spatial_merge_size=self._spatial_merge_size,
             image_token_id=self.mm_tokens.image_token_id,
             video_token_id=self.mm_tokens.video_token_id,
             vision_start_token_id=self.vision_start_token_id,
             model_type=self.model_type,
-            tokens_per_second=getattr(
-                self.hf_config.vision_config, "tokens_per_second", None
-            ),
+            tokens_per_second=self._tokens_per_second,
             input_ids=input_ids_tensor,
             image_grid_thw=image_grid_thw,
             video_grid_thw=video_grid_thw,
@@ -474,7 +481,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         if not image_items or len(image_items) != len(mm_items):
             return None
 
-        spatial_merge_size = self.hf_config.vision_config.spatial_merge_size
+        spatial_merge_size = self._spatial_merge_size
         sorted_items = sorted(image_items, key=lambda item: item.offsets[0][0])
         position_segments = []
         st = 0
@@ -615,7 +622,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         assert all(isinstance(modality, Modality) for modality in modality_list)
 
         mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index(
-            spatial_merge_size=self.hf_config.vision_config.spatial_merge_size,
+            spatial_merge_size=self._spatial_merge_size,
             image_token_id=self.mm_tokens.image_token_id,
             video_token_id=self.mm_tokens.video_token_id,
             vision_start_token_id=self.vision_start_token_id,
@@ -633,9 +640,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             position_id_per_seconds=getattr(
                 self.hf_config, "position_id_per_seconds", None
             ),
-            tokens_per_second=getattr(
-                self.hf_config.vision_config, "tokens_per_second", None
-            ),
+            tokens_per_second=self._tokens_per_second,
         )
         mrope_positions = mrope_positions.squeeze(1)
 
@@ -783,14 +788,12 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
                 )
         if mrope_result is None:
             mrope_result = MRotaryEmbedding.get_rope_index(
-                spatial_merge_size=self.hf_config.vision_config.spatial_merge_size,
+                spatial_merge_size=self._spatial_merge_size,
                 image_token_id=self.mm_tokens.image_token_id,
                 video_token_id=self.mm_tokens.video_token_id,
                 vision_start_token_id=self.vision_start_token_id,
                 model_type=self.model_type,
-                tokens_per_second=getattr(
-                    self.hf_config.vision_config, "tokens_per_second", None
-                ),
+                tokens_per_second=self._tokens_per_second,
                 # use the expanded token ids
                 input_ids=input_ids.unsqueeze(0),
                 image_grid_thw=image_grid_thw,
