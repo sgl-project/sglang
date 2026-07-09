@@ -40,6 +40,7 @@ import copy
 import dataclasses
 import logging
 import re
+import sys
 from array import array
 from concurrent.futures import Future
 from enum import Enum, auto
@@ -2542,21 +2543,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self, server_args: ServerArgs
     ) -> Tuple[List[Req], float, List[Req]]:
         """Retract the decoding requests when there is not enough memory."""
-        sorted_indices = list(range(len(self.reqs)))
-
-        # TODO(lsyin): improve retraction policy for radix cache
-        # For spec decoding, filter_batch API can only filter
-        # requests from the back, so we can only retract from the back.
-        # TODO(sang): Clean up finish path and support better retract
-        # policy.
-        if not server_args.speculative_algorithm:
-            sorted_indices.sort(
-                key=lambda i: (
-                    len(self.reqs[i].output_ids),
-                    -len(self.reqs[i].origin_input_ids),
-                ),
-                reverse=True,
-            )
+        sorted_indices = self._get_decode_retraction_order(
+            self.reqs,
+            server_args,
+            allow_policy_sort=(
+                self.spec_algorithm is None or self.spec_algorithm.is_none()
+            ),
+        )
 
         retracted_reqs = []
         first_iter = True
@@ -2601,6 +2594,52 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
 
         return retracted_reqs, new_estimate_ratio, reqs_to_abort
+
+    @staticmethod
+    def _get_decode_retraction_order(
+        reqs: List[Req], server_args: ServerArgs, *, allow_policy_sort: bool
+    ) -> List[int]:
+        """Return indices ordered from most-preferred to least-preferred to keep.
+
+        The retraction loop pops from the end of this list, so the least-preferred
+        request is retracted first.
+        """
+        sorted_indices = list(range(len(reqs)))
+
+        # TODO(lsyin): improve retraction policy for radix cache
+        # For spec decoding, filter_batch API can only filter requests from the
+        # back, so we can only retract from the back.
+        # TODO(sang): Clean up finish path and support better retract policy.
+        if not allow_policy_sort:
+            return sorted_indices
+
+        def length_key(req: Req) -> Tuple[int, int]:
+            return (len(req.output_ids), -len(req.origin_input_ids))
+
+        if server_args.retraction_policy == "priority":
+            priority_sign = 1 if server_args.schedule_low_priority_values_first else -1
+
+            def retraction_key(req: Req) -> Tuple[int, int, int]:
+                priority = req.priority
+                if priority is None:
+                    priority = (
+                        sys.maxsize
+                        if server_args.schedule_low_priority_values_first
+                        else -sys.maxsize - 1
+                    )
+                return (priority * (-priority_sign), *length_key(req))
+
+            sorted_indices.sort(
+                key=lambda i: retraction_key(reqs[i]),
+                reverse=True,
+            )
+            return sorted_indices
+
+        sorted_indices.sort(
+            key=lambda i: length_key(reqs[i]),
+            reverse=True,
+        )
+        return sorted_indices
 
     def release_req(self, idx: int, remaing_req_count: int, server_args: ServerArgs):
         release_req(
