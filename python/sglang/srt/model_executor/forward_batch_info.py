@@ -433,7 +433,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For dumper: request IDs for cross-step sequence tracking
     rids: Optional[List[str]] = None
 
-    # === Resolved from SB one-shot overrides (consumed + reset by init_new) ===
+    # === Per-forward overrides passed explicitly to init_new ===
     capture_hidden_mode: CaptureHiddenMode = None
     # For hidden states before normal
     return_hidden_states_before_norm: bool = False
