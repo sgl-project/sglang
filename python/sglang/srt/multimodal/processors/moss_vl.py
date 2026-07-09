@@ -16,7 +16,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.models.moss_vl import MossVLForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
-    SGL_USE_CUDA_IPC,
+    CUDA_IPC_TRANSPORT_SUPPORTED,
 )
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
@@ -551,7 +551,7 @@ class MossVLImageProcessor(SGLangBaseProcessor):
             if mm_items and vision_token_info:
                 mm_items[0].set("vision_token_info", vision_token_info[0])
 
-            if SGL_USE_CUDA_IPC:
+            if CUDA_IPC_TRANSPORT_SUPPORTED:
                 for item in mm_items:
                     if isinstance(item.feature, torch.Tensor) and item.feature.is_cuda:
                         sync_flag, available_slice = (

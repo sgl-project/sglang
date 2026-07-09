@@ -14,16 +14,29 @@ from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
 from sglang.srt.managers.schedule_batch import MultimodalProcessorOutput
 from sglang.srt.models.ernie45_vl import Ernie4_5_VLMoeForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
+    CUDA_IPC_TRANSPORT_SUPPORTED,
+)
+from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
 from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
 )
-from sglang.srt.utils import get_bool_env_var, is_npu, logger
+from sglang.srt.utils import is_npu, logger
 
 _is_npu = is_npu()
 
-SGL_USE_CUDA_IPC = get_bool_env_var("SGLANG_USE_CUDA_IPC_TRANSPORT")
+# Import CUDA_IPC_TRANSPORT_SUPPORTED (not a locally re-derived env-var flag)
+# so this file's "skip the CPU move, IPC will place the tensor" decision below
+# stays in sync with base_processor's actual platform-gated behavior (this
+# file never constructs a CudaIpcTensorTransportProxy directly -- it relies on
+# BaseMultimodalProcessor.process_mm_data's post-process step to do that, so
+# the two flags must never drift apart). Previously this module re-derived the
+# raw env var independently via get_bool_env_var and had no ROCm awareness,
+# which would have made it skip the CPU move (assuming IPC would place the
+# tensor) even on platforms where IPC transport is not actually attempted --
+# leaving GPU tensors un-placed when the caller asked for
+# keep_mm_feature_on_device=False.
 
 
 IMAGE_FACTOR = 28
@@ -352,7 +365,7 @@ class Ernie4_5_VLImageProcessor(SGLangBaseProcessor):
         if not self.server_args.keep_mm_feature_on_device:
             # move feature tensors to cpu
             for feature_name in self.FEATURE_NAMES:
-                if SGL_USE_CUDA_IPC:
+                if CUDA_IPC_TRANSPORT_SUPPORTED:
                     pass
                 else:
                     if feature_name in result and isinstance(

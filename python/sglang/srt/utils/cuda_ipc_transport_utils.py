@@ -3,13 +3,14 @@ import logging
 import threading
 import time
 from multiprocessing import shared_memory
-from typing import Any, Tuple
+from typing import Any, Optional, Tuple
 
 import numpy as np
 import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.utils.common import is_hip
 from sglang.srt.utils.stale_shm_cleanup import make_shm_name
 
 logger = logging.getLogger(__name__)
@@ -36,7 +37,41 @@ def _normalize_pool_cache_key(pool_handle, pool_device_index: int) -> tuple[Any,
     return (pool_device_index, normalized_handle)
 
 
+def _cuda_device_for_index(device_idx: int) -> torch.device:
+    """Pure helper: the single canonical mapping from a CUDA/HIP device index
+    to the `torch.device` reconstruction targets. Extracted out of
+    reconstruct_on_target_device (which used to inline
+    `torch.device(f"cuda:{rebuild_device_idx}")` twice) so it is one
+    source of truth and independently unit-testable -- constructing a
+    torch.device object requires no real accelerator, it is pure metadata
+    (verified: `torch.device("cuda:0")` succeeds even on a CPU-only torch
+    build; only *using* the device, e.g. `.to(device)`, needs real hardware).
+    """
+    return torch.device(f"cuda:{device_idx}")
+
+
 def _open_pooled_storage_uncached(pool_handle):
+    # This reopens a raw CUDA IPC handle (torch.UntypedStorage._new_shared_cuda),
+    # which is only expected to be reached on genuine NVIDIA CUDA. PyTorch has
+    # no separate device type for HIP -- ROCm tensors also report
+    # tensor.is_cuda == True and use torch.device("cuda") -- so callers cannot
+    # rely on device-string checks to keep ROCm out of this path; is_hip() is
+    # this codebase's canonical (torch.version.hip is not None) check instead.
+    # Every known producer (base_processor.py / moss_vl.py) already gates on
+    # CUDA_IPC_TRANSPORT_SUPPORTED = SGL_USE_CUDA_IPC and not is_hip() before
+    # constructing a CudaIpcTensorTransportProxy with a pool handle attached,
+    # so this assertion should be unreachable in practice; it exists to turn a
+    # ROCm "hipErrorInvalidDevicePointer" hardware crash (sgl-project/sglang
+    # #29687) into an immediate, diagnosable Python-level error instead, in
+    # case a future call site is added without going through that gate.
+    assert not is_hip(), (
+        "_open_pooled_storage_uncached() reached on a HIP/ROCm build -- this "
+        "would attempt raw CUDA IPC handle reconstruction, which crashes with "
+        "'HIP error: invalid device pointer' (see sgl-project/sglang#29687). "
+        "The caller should have gated this on CUDA_IPC_TRANSPORT_SUPPORTED "
+        "(sglang.srt.multimodal.processors.base_processor) before ever "
+        "constructing a pooled CudaIpcTensorTransportProxy."
+    )
     return torch.UntypedStorage._new_shared_cuda(*pool_handle)
 
 
@@ -381,7 +416,7 @@ class CudaIpcTensorTransportProxy:
         # CUDAGuard stays there; peer access handles the cross-GPU open.
         pool_handle = ipc_extra["pool_handle"]
         redirected_handle = (rebuild_device_idx,) + tuple(pool_handle)[1:]
-        target_device = torch.device(f"cuda:{rebuild_device_idx}")
+        target_device = _cuda_device_for_index(rebuild_device_idx)
         cache_key = _normalize_pool_cache_key(pool_handle, rebuild_device_idx)
 
         with torch.cuda.device(target_device):
@@ -429,8 +464,30 @@ class CudaIpcTensorTransportProxy:
 
         return reconstructed_tensor
 
-    def reconstruct_on_target_device(self, rebuild_device_idx):
-        rebuild_device = torch.device(f"cuda:{rebuild_device_idx}")
+    def reconstruct_on_target_device(
+        self,
+        rebuild_device_idx,
+        *,
+        _rebuild_device_override: Optional[torch.device] = None,
+    ):
+        # _rebuild_device_override is a test-only seam: every production call
+        # site (schedule_batch.py, mm_utils.py) passes only rebuild_device_idx
+        # and gets the real `cuda:{idx}` device exactly as before. It exists
+        # because the tensor_data (non-IPC) branch below is an ordinary
+        # `Tensor.to(device)` copy with no raw pointer handles involved, so it
+        # is the one branch of this method that is genuinely backend-agnostic
+        # and safely exercisable against a real "cpu" torch.device in a
+        # sandbox with no GPU -- see
+        # test/registered/unit/utils/test_cuda_ipc_transport_rocm_gate.py.
+        # The IPC branches (pool and non-pooled) always ignore this override
+        # and use the real CUDA/HIP device, because they call
+        # torch.cuda.device(...) and torch.UntypedStorage._new_shared_cuda(...)
+        # directly, which have no CPU-side meaning to fall back to.
+        rebuild_device = (
+            _rebuild_device_override
+            if _rebuild_device_override is not None
+            else _cuda_device_for_index(rebuild_device_idx)
+        )
         if (
             isinstance(self.reconstruct_tensor, torch.Tensor)
             and self.reconstruct_tensor.device == rebuild_device
@@ -478,12 +535,36 @@ class CudaIpcTensorTransportProxy:
                         _pool_handle_cache_set(cache_key, storage_to_cache)
             else:
                 # Non-pooled path: redirect handle[0] the same way as the pooled path.
+                #
+                # See _open_pooled_storage_uncached's docstring/comment for why
+                # this is asserted rather than silently attempted: on ROCm,
+                # tensor.is_cuda is also True (PyTorch has no separate HIP
+                # device type), so a HIP-sourced handle can reach here unless
+                # every producer gates on CUDA_IPC_TRANSPORT_SUPPORTED first.
+                # This is the exact call (torch.UntypedStorage._new_shared_cuda
+                # on a device-redirected handle) that crashes with
+                # "HIP error: invalid device pointer" per sgl-project/sglang
+                # #29687 -- fail loudly here instead of reproducing that crash.
+                assert not is_hip(), (
+                    "Reached the non-pooled CUDA IPC reconstruction path on a "
+                    "HIP/ROCm build -- this would crash with 'HIP error: "
+                    "invalid device pointer' (sgl-project/sglang#29687). The "
+                    "producer should have gated this on "
+                    "CUDA_IPC_TRANSPORT_SUPPORTED before attaching a raw IPC "
+                    "handle to this proxy."
+                )
                 try:
                     original_handle = ipc_extra["handle"]
                     redirected_handle = (rebuild_device_idx,) + tuple(original_handle)[
                         1:
                     ]
-                    target_device = torch.device(f"cuda:{rebuild_device_idx}")
+                    # Always the real device here -- raw IPC handle reopening
+                    # has no meaning on a non-accelerator device, so this
+                    # branch intentionally does NOT consult
+                    # _rebuild_device_override (see the constructor comment
+                    # above the assertion for why this branch is unreachable
+                    # on ROCm in the first place).
+                    target_device = _cuda_device_for_index(rebuild_device_idx)
                     with torch.cuda.device(target_device):
                         storage = torch.UntypedStorage._new_shared_cuda(
                             *redirected_handle
