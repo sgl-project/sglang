@@ -659,9 +659,7 @@ def post_permute_deep_gemm_to_standard(
     topk_ids = running_state["topk_ids"]
     topk_weights = running_state["topk_weights"]
 
-    with use_symmetric_memory(
-        get_tp_group(), disabled=not is_allocation_symmetric()
-    ):
+    with use_symmetric_memory(get_tp_group(), disabled=not is_allocation_symmetric()):
         output = torch.empty(
             hidden_states_shape, dtype=hidden_states_dtype, device=hidden_states_device
         )

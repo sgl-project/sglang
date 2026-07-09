@@ -72,7 +72,7 @@ from sglang.srt.layers.dp_attention import (
     get_local_dp_buffer,
     get_local_dp_buffer_len,
     get_tbo_persistent_buffer,
-    is_allocation_symmetric,  
+    is_allocation_symmetric,
     is_dp_attention_enabled,
     is_dp_gatherv_active,
 )
