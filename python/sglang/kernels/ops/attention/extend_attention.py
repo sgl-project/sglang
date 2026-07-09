@@ -478,8 +478,8 @@ def _fwd_kernel(
                 mask=mask_n[:, None] & mask_dv[None, :],
                 other=0.0,
             )
-            p = p.to(v.dtype)
-            acc = acc * re_scale[:, None] + tl.dot(p, v) * v_scale
+            # keep softmax weights p in fp32 for the P·V dot (do not downcast to bf16)
+            acc = acc * re_scale[:, None] + tl.dot(p, v.to(tl.float32), out_dtype=tl.float32) * v_scale
 
             e_max = n_e_max
 
@@ -583,8 +583,8 @@ def _fwd_kernel(
             v = tl.load(
                 V_Extend + offs_v, mask=mask_n[:, None] & mask_dv[None, :], other=0.0
             )
-            p = p.to(v.dtype)
-            acc = acc * re_scale[:, None] + tl.dot(p, v)
+            # keep softmax weights p in fp32 for the P·V dot (do not downcast to bf16)
+            acc = acc * re_scale[:, None] + tl.dot(p, v.to(tl.float32), out_dtype=tl.float32)
 
             e_max = n_e_max
 

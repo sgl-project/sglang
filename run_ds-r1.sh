@@ -12,6 +12,7 @@ ENABLE_CK=0 \
 SGLANG_USE_AITER=1 \
 AITER_FORCE_A8W4=1 \
 AITER_GROUPED_FORCE_SPLIT_K1=1 \
+SGLANG_MOE_SHUFFLE_GFX1250=1 \
 ROCM_QUICK_REDUCE_QUANTIZATION=NONE \
 SGLANG_AITER_FP8_PREFILL_ATTN=0 \
 SGLANG_AITER_MLA_PERSIST=0 \
@@ -21,7 +22,7 @@ SGLANG_SET_CPU_AFFINITY=1 \
 SGLANG_ROCM_FUSED_DECODE_MLA=0 \
 SGLANG_USE_ROCM700A=1 \
 python3 -m sglang.launch_server \
-  --model-path /dockerx/models/amd/DeepSeek-R1-0528-MXFP4 \
+  --model-path /dockerx/data/models/DeepSeek-R1-0528-MXFP4 \
   --tensor-parallel-size 1 \
   --trust-remote-code \
   --host 0.0.0.0 \

@@ -42,6 +42,21 @@ if _use_aiter:
 # gfx950. Using the wrong layout silently corrupts the dequant scales.
 _is_gfx1250 = is_gfx1250_supported()
 
+# The gfx1250 a8w4 grouped MoE kernel consumes (16,16)-preshuffled FP4 weights
+# (see aiter op_tests/test_flydsl_grouped_gemm_gfx1250.py, which always does
+# shuffle_weight(w, layout=(16,16)); the DSv4 fp8.py path shuffles the same way
+# when AITER_FORCE_A8W4 is set). Historically this scheme only shuffled on gfx95
+# (_is_shuffle_moe_mxfp4), so on gfx1250 the raw (unshuffled) weight layout was
+# fed to a kernel expecting the shuffled one -> garbage. Mirror DSv4: shuffle
+# whenever the a8w4 path is forced on gfx1250. SGLANG_MOE_SHUFFLE_GFX1250=false
+# reproduces the old (unshuffled) behavior for A/B comparison.
+_use_aiter_a8w4 = get_bool_env_var("AITER_FORCE_A8W4", "false")
+_shuffle_moe_gfx1250 = (
+    _is_gfx1250
+    and _use_aiter_a8w4
+    and get_bool_env_var("SGLANG_MOE_SHUFFLE_GFX1250", "true")
+)
+
 if _is_hip:
     from aiter.ops.triton.quant import dynamic_mxfp4_quant
 else:
@@ -245,7 +260,7 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             w2_weight_scale = e8m0_shuffle(w2_weight_scale)
             layer.w2_weight_scale.data = w2_weight_scale.view(s0, s1, -1)
         # Pre-shuffle weight
-        if _is_shuffle_moe_mxfp4:
+        if _is_shuffle_moe_mxfp4 or _shuffle_moe_gfx1250:
             layer.w13_weight.data = shuffle_weight(
                 layer.w13_weight.contiguous(), (16, 16)
             )

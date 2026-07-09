@@ -524,7 +524,10 @@ def _fwd_grouped_kernel_stage1(
             re_scale = tl.exp(e_max - n_e_max)
             p = tl.exp(qk - n_e_max[:, None])
             acc *= re_scale[:, None]
-            acc += tl.dot(p.to(v.dtype), v)
+            # Keep the softmax weights p in fp32 for the P·V dot (do NOT downcast p to
+            # bf16). The bf16 downcast of p was the accuracy loss vs a torch fp32 SDPA
+            # reference (recovers gfx1250 R1 GSM8K ~0.82 -> ~0.92 with attention idealized).
+            acc += tl.dot(p, v.to(tl.float32), out_dtype=tl.float32)
 
             e_sum = e_sum * re_scale + tl.sum(p, 1)
             e_max = n_e_max
