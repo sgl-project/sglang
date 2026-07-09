@@ -4,9 +4,35 @@ export const Llama4MaverickDeployment = () => {
       name: 'hardware',
       title: 'Hardware Platform',
       items: [
+        { id: 'b200', label: 'B200', default: false },
+        { id: 'h200', label: 'H200', default: false },
         { id: 'mi300x', label: 'MI300x', default: true },
         { id: 'mi325x', label: 'MI325x', default: false },
         { id: 'mi355x', label: 'MI355x', default: false }
+      ]
+    },
+    quantization: {
+      name: 'quantization',
+      title: 'Quantization',
+      items: [
+        { id: 'bf16', label: 'BF16', default: true },
+        { id: 'fp8', label: 'FP8', default: false }
+      ]
+    },
+    toolcall: {
+      name: 'toolcall',
+      title: 'Tool Call Parser',
+      items: [
+        { id: 'disabled', label: 'Disabled', default: true },
+        { id: 'enabled', label: 'Enabled', default: false }
+      ]
+    },
+    speculative: {
+      name: 'speculative',
+      title: 'Speculative Decoding (EAGLE3)',
+      items: [
+        { id: 'disabled', label: 'Disabled', default: true },
+        { id: 'enabled', label: 'Enable EAGLE3', default: false }
       ]
     },
     host: {
@@ -29,9 +55,9 @@ export const Llama4MaverickDeployment = () => {
     const { hardware, quantization, toolcall, speculative, host, port } = values;
 
     let cmd = 'python -m sglang.launch_server \\\n';
-    cmd += `  --model-path meta-llama/Llama-4-Scout-17B-16E-Instruct`;
+    cmd += `  --model-path meta-llama/Llama-4-Maverick-17B-128E-Instruct`;
 
-    if (hardware === 'h100' || hardware === 'h200') {
+    if (hardware === 'h200') {
       cmd += ` \\\n  --tp 8`;
     } else if (hardware === 'b200') {
       cmd += ` \\\n  --tp 8`;
@@ -49,12 +75,12 @@ export const Llama4MaverickDeployment = () => {
 
     if (speculative === 'enabled') {
       cmd += ` \\\n  --speculative-algorithm EAGLE3 \\\n`;
-      cmd += `  --speculative-draft-model-path lmsys/sglang-EAGLE3-Llama-4-Scout-17B-16E-Instruct-v1 \\\n`;
+      cmd += `  --speculative-draft-model-path lmsys/sglang-EAGLE3-Llama-4-Maverick-17B-128E-Instruct-v1 \\\n`;
       cmd += `  --speculative-num-steps 3 \\\n`;
       cmd += `  --speculative-eagle-topk 1 \\\n`;
       cmd += `  --speculative-num-draft-tokens 4 \\\n`;
       cmd += `  --mem-fraction-static 0.75 \\\n`;
-      cmd += `  --cuda-graph-max-bs 2`;
+      cmd += `  --cuda-graph-max-bs-decode 2`;
     }
 
     cmd += ` \\\n  --enable-multimodal`;

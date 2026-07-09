@@ -28,7 +28,17 @@ from sglang.multimodal_gen.configs.pipeline_configs.hunyuan import (
 from sglang.multimodal_gen.configs.pipeline_configs.hunyuan3d import (
     Hunyuan3D2PipelineConfig,
 )
-from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import LTX2PipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.ideogram import (
+    Ideogram4PipelineConfig,
+)
+from sglang.multimodal_gen.configs.pipeline_configs.lingbot_world import (
+    LingBotWorldCausalDMDConfig,
+    LingBotWorldV2CausalDMDConfig,
+)
+from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
+    LTX2PipelineConfig,
+    LTX23PipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.mova import MOVAPipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.sana import SanaPipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.stablediffusion3 import (
@@ -52,6 +62,7 @@ __all__ = [
     "HunyuanConfig",
     "FastHunyuanConfig",
     "Hunyuan3D2PipelineConfig",
+    "Ideogram4PipelineConfig",
     "FluxPipelineConfig",
     "Flux2PipelineConfig",
     "Flux2KleinPipelineConfig",
@@ -68,4 +79,7 @@ __all__ = [
     "SelfForcingWanT2V480PConfig",
     "ZImagePipelineConfig",
     "LTX2PipelineConfig",
+    "LTX23PipelineConfig",
+    "LingBotWorldCausalDMDConfig",
+    "LingBotWorldV2CausalDMDConfig",
 ]

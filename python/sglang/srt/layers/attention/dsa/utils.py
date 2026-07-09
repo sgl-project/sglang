@@ -8,12 +8,15 @@ import triton.language as tl
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
-    get_attention_cp_rank,
-    get_attention_cp_size,
-    get_attention_dp_rank,
 )
-from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import get_bool_env_var, is_hip
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    is_in_breakable_cuda_graph,
+)
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+    is_in_tc_piecewise_cuda_graph,
+)
+from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip
 from sglang.srt.utils.common import ceil_align, ceil_div
 
 
@@ -65,27 +68,40 @@ def compute_dsa_seqlens(original_seq_lens, dsa_index_topk: int):
 
 
 def is_dsa_enable_prefill_cp():
-    return get_global_server_args().enable_dsa_prefill_context_parallel
+    return get_server_args().enable_dsa_prefill_context_parallel
 
 
 def is_dsa_prefill_cp_in_seq_split():
     return (
         is_dsa_enable_prefill_cp()
-        and get_global_server_args().dsa_prefill_cp_mode == "in-seq-split"
+        and get_server_args().dsa_prefill_cp_mode == "in-seq-split"
     )
 
 
 def is_dsa_prefill_cp_round_robin_split():
     return (
         is_dsa_enable_prefill_cp()
-        and get_global_server_args().dsa_prefill_cp_mode == "round-robin-split"
+        and get_server_args().dsa_prefill_cp_mode == "round-robin-split"
+    )
+
+
+# Structural surface where the graph DSA split-op dispatch (DSA indexer) and the
+# MLA BMM-into-attention fusion apply: a non-speculative extend (prefill) running
+# inside a piecewise/breakable CUDA graph. Both fusions are now on by default on
+# this surface (no feature flag); each adds its own extra carve-outs at its call
+# site (e.g. the indexer also excludes DSA prefill context parallelism).
+def is_graph_dsa_split_op_surface(forward_batch: "ForwardBatch") -> bool:
+    return (
+        is_cuda()
+        and (is_in_tc_piecewise_cuda_graph() or is_in_breakable_cuda_graph())
+        and forward_batch.forward_mode.is_extend_without_speculative()
     )
 
 
 def can_dsa_prefill_cp_round_robin_split(forward_batch: "ForwardBatch"):
     if not forward_batch.forward_mode.is_context_parallel_extend():
         return False
-    cp_size = get_attention_cp_size()
+    cp_size = get_parallel().attn_cp_size
     seq_len = sum(forward_batch.extend_seq_lens_cpu)
     return (
         is_dsa_prefill_cp_round_robin_split()
@@ -108,8 +124,8 @@ def dsa_cp_round_robin_split_data(input_: Union[torch.Tensor, List]):
     | dp_atten_tp3: token3, token7, token11, token15, token19, ... |
     |   +-------------------------+
     """
-    cp_size = get_attention_cp_size()
-    cp_rank = get_attention_cp_rank()
+    cp_size = get_parallel().attn_cp_size
+    cp_rank = get_parallel().attn_cp_rank
     if isinstance(input_, (tuple, list)):
         indices = range(cp_rank, len(input_), cp_size)
         return input_[indices]
@@ -129,20 +145,22 @@ def dsa_cp_round_robin_split_data(input_: Union[torch.Tensor, List]):
 def cal_padded_tokens(forward_batch: "ForwardBatch"):
     # Consistent with the padding calculation logic in ForwardBatch.prepare_mlp_sync_batch,
     # calculate the actual token length after padding when attn_tp_size > 1 or in the MAX_LEN padding mode.
+    from sglang.srt.layers.utils.cp_utils import get_cp_padding_align_size
+
     global_num_tokens = forward_batch.global_num_tokens_cpu.copy()
     sync_group_size = len(global_num_tokens)
-    attn_cp_size = get_attention_cp_size()
+    attn_cp_size = get_parallel().attn_cp_size
+    # Must match the CP padding in ForwardBatch.prepare_mlp_sync_batch.
+    cp_align_size = get_cp_padding_align_size()
     for i in range(sync_group_size):
-        # Must match ForwardBatch.prepare_mlp_sync_batch, which pads to
-        # attn_cp_size * 2 (tokens are split into 2 * CP chunks for load balance).
-        global_num_tokens[i] = ceil_align(global_num_tokens[i], attn_cp_size * 2)
+        global_num_tokens[i] = ceil_align(global_num_tokens[i], cp_align_size)
     dp_padding_mode = DpPaddingMode.get_dp_padding_mode(
         forward_batch.is_extend_in_batch, global_num_tokens
     )
     if dp_padding_mode.is_max_len():
         tokens = max(global_num_tokens)
     elif len(global_num_tokens) > 1:
-        tokens = global_num_tokens[get_attention_dp_rank()]
+        tokens = global_num_tokens[get_parallel().attn_dp_rank]
     else:
         tokens = global_num_tokens[0]
     if can_dsa_prefill_cp_round_robin_split(forward_batch):
@@ -151,7 +169,7 @@ def cal_padded_tokens(forward_batch: "ForwardBatch"):
 
 
 def pad_dsa_cache_seqlens(forward_batch: "ForwardBatch", dsa_cache_seqlens):
-    attn_cp_size = get_attention_cp_size()
+    attn_cp_size = get_parallel().attn_cp_size
     needs_cp_pad = attn_cp_size > 1 and can_dsa_prefill_cp_round_robin_split(
         forward_batch
     )
@@ -217,8 +235,8 @@ def dsa_cp_round_robin_split_q_seqs_kernel(
 
 
 def dsa_cp_round_robin_split_q_seqs_cpu(extend_seqs):
-    cp_size = get_attention_cp_size()
-    cp_rank = get_attention_cp_rank()
+    cp_size = get_parallel().attn_cp_size
+    cp_rank = get_parallel().attn_cp_rank
     extra_seq = 0
     q_seqs = []
     for bs, cur_len in enumerate(extend_seqs):
@@ -243,8 +261,8 @@ def dsa_cp_round_robin_split_q_seqs(
     bs_idx_cpu(List) and bs_idx(torch.Tensor): marks which sequences are ultimately selected,
         i.e., those with a partitioned length greater than zero.
     """
-    cp_size = get_attention_cp_size()
-    cp_rank = get_attention_cp_rank()
+    cp_size = get_parallel().attn_cp_size
+    cp_rank = get_parallel().attn_cp_rank
     # len(ret_q_lens_cpu) == len(bs_idx_cpu)
     ret_q_lens_cpu, bs_idx_cpu = dsa_cp_round_robin_split_q_seqs_cpu(extend_seqs_cpu)
     ret_q_lens = torch.empty(
@@ -271,3 +289,29 @@ def dsa_use_prefill_cp(forward_batch, dsa_enable_prefill_cp=None):
         return True
     else:
         return False
+
+
+def fp8_mqa_logits_ceil_to_ue8m0(x: torch.Tensor) -> torch.Tensor:
+    return torch.pow(2.0, torch.ceil(torch.log2(x.abs())))
+
+
+def fp8_mqa_logits_make_fused_kv(
+    kv_fp8: torch.Tensor,
+    kv_scales: torch.Tensor,
+    block_kv: int,
+    head_dim: int,
+) -> torch.Tensor:
+    num_phys_blocks = kv_fp8.shape[0]
+    per_token_size = head_dim + 4
+    block_bytes = block_kv * per_token_size
+    scale_offset = block_kv * head_dim
+
+    fused = torch.zeros(
+        num_phys_blocks, block_bytes, dtype=torch.uint8, device=kv_fp8.device
+    )
+    for blk in range(num_phys_blocks):
+        fused[blk, :scale_offset] = kv_fp8[blk].view(torch.uint8).reshape(-1)
+        fused[blk, scale_offset:] = (
+            kv_scales[blk].float().contiguous().view(torch.uint8).reshape(-1)
+        )
+    return fused.view(num_phys_blocks, block_kv, 1, per_token_size)

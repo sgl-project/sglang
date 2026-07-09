@@ -26,7 +26,12 @@ from sglang.srt.batch_invariant_ops import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.utils import MultiPlatformOp
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    Phase,
+    check_cuda_graph_backend,
+)
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -148,9 +153,6 @@ def _forward_with_allreduce_fusion(
     """Shared allreduce-fused RMSNorm logic usable by any norm."""
     if residual is not None:
         from sglang.srt.distributed import (
-            get_attn_tensor_model_parallel_world_size,
-            get_moe_expert_parallel_world_size,
-            get_moe_tensor_parallel_world_size,
             tensor_model_parallel_all_reduce,
             tensor_model_parallel_fused_allreduce_rmsnorm,
         )
@@ -159,12 +161,12 @@ def _forward_with_allreduce_fusion(
         )
 
         if use_attn_tp_group:
-            world_size = get_attn_tensor_model_parallel_world_size()
+            world_size = get_parallel().attn_tp_size
         else:
-            if get_moe_expert_parallel_world_size() > 1:
-                world_size = get_moe_expert_parallel_world_size()
+            if get_parallel().moe_ep_size > 1:
+                world_size = get_parallel().moe_ep_size
             else:
-                world_size = get_moe_tensor_parallel_world_size()
+                world_size = get_parallel().moe_tp_size
 
         if world_size > 1:
             if post_residual_addition is not None:
@@ -190,7 +192,7 @@ def _forward_with_allreduce_fusion(
                     return fused_result
 
             # For AITER route, preserve correctness when fused path is unavailable.
-            if _use_aiter and get_global_server_args().enable_aiter_allreduce_fusion:
+            if _use_aiter and get_server_args().enable_aiter_allreduce_fusion:
                 x = tensor_model_parallel_all_reduce(x)
                 return norm_module.forward(x, residual, None)
 
@@ -208,6 +210,7 @@ class RMSNorm(MultiPlatformOp):
         has_weight: bool = True,
         weight_dtype: Optional = None,
         override_orig_dtype: Optional = None,
+        x_pad_to_multiple: int = 0,
     ) -> None:
         super().__init__()
         self.has_weight = has_weight
@@ -223,7 +226,25 @@ class RMSNorm(MultiPlatformOp):
         self.variance_size_override = (
             None if var_hidden_size == hidden_size else var_hidden_size
         )
+        # When > 0, fuse a zero-pad of the last dim out to a multiple of
+        # this value into the rmsnorm kernel via aiter's
+        # `fused_add_rmsnorm_pad` Triton kernel. The padded output has
+        # shape (M, ceil(N/x_pad_to_multiple)*x_pad_to_multiple); the
+        # residual_out stays at the original (M, N) shape.
+
         if _use_aiter:
+            self.x_pad_to_multiple = x_pad_to_multiple
+            self._fused_pad_kernel = None
+
+            if x_pad_to_multiple > 0:
+                try:
+                    from aiter.ops.triton.fused_add_rmsnorm_pad import (
+                        fused_add_rmsnorm_pad as _fused_add_rmsnorm_pad,
+                    )
+
+                    self._fused_pad_kernel = _fused_add_rmsnorm_pad
+                except ImportError:
+                    self._fused_pad_kernel = None
             self._forward_method = self.forward_aiter
 
     def forward_cuda(
@@ -249,7 +270,7 @@ class RMSNorm(MultiPlatformOp):
             if (
                 residual is not None
                 or self.cast_x_before_out_mul
-                or get_global_server_args().rl_on_policy_target == "fsdp"
+                or get_server_args().rl_on_policy_target == "fsdp"
             ):
                 return self.forward_native(x, residual, post_residual_addition)
             return rms_norm_batch_invariant(
@@ -345,6 +366,38 @@ class RMSNorm(MultiPlatformOp):
             x = x.contiguous().reshape(-1, original_shape[-1])
         elif not x.is_contiguous():
             x = x.contiguous()
+        if is_batch_invariant_mode_enabled():
+            if (
+                residual is not None
+                or self.cast_x_before_out_mul
+                or get_server_args().rl_on_policy_target == "fsdp"
+                or (self._fused_pad_kernel is not None and self.x_pad_to_multiple > 0)
+            ):
+                return self.forward_native(x, residual, post_residual_addition)
+            out = rms_norm_batch_invariant(
+                x,
+                self.weight.data,
+                self.variance_epsilon,
+            )
+            if needs_reshape:
+                out = out.reshape(original_shape)
+            return out
+        # Fused (add +) rmsnorm + zero-pad path. Triggered when caller
+        # constructed RMSNorm with x_pad_to_multiple > 0. Output last
+        # dim is padded up; residual_out stays at original width. Used
+        # by callers (e.g. GPT-OSS MXFP4 MoE) whose immediate consumer
+        # needs a padded hidden_size — folding the pad in here removes a
+        # separate launch.
+        if self._fused_pad_kernel is not None and self.x_pad_to_multiple > 0:
+            if post_residual_addition is not None and residual is not None:
+                residual = residual + post_residual_addition
+            return self._fused_pad_kernel(
+                x,
+                self.weight.data,
+                self.variance_epsilon,
+                residual,
+                self.x_pad_to_multiple,
+            )
         if residual is not None:
             residual_out = torch.empty_like(x)
             output = torch.empty_like(x)
@@ -374,6 +427,19 @@ class RMSNorm(MultiPlatformOp):
         if not _has_vllm_rms_norm:
             return self.forward_native(x, residual, post_residual_addition)
 
+        if is_batch_invariant_mode_enabled():
+            if (
+                residual is not None
+                or self.cast_x_before_out_mul
+                or get_server_args().rl_on_policy_target == "fsdp"
+            ):
+                return self.forward_native(x, residual, post_residual_addition)
+            return rms_norm_batch_invariant(
+                x,
+                self.weight.data,
+                self.variance_epsilon,
+            )
+
         if not x.is_contiguous():
             # NOTE: Remove this if aiter kernel supports discontinuous input
             x = x.contiguous()
@@ -396,6 +462,9 @@ class RMSNorm(MultiPlatformOp):
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE):
+            return self.forward_native(x, residual, post_residual_addition)
+
         if not x.is_contiguous():
             x = x.contiguous()
 
@@ -489,10 +558,7 @@ class RMSNorm(MultiPlatformOp):
         if self.variance_size_override is not None:
             return self.forward_native(x, residual, post_residual_addition)
         if is_batch_invariant_mode_enabled():
-            if (
-                residual is not None
-                or get_global_server_args().rl_on_policy_target == "fsdp"
-            ):
+            if residual is not None or get_server_args().rl_on_policy_target == "fsdp":
                 return self.forward_native(x, residual, post_residual_addition)
             return rms_norm_batch_invariant(
                 x,
@@ -876,6 +942,15 @@ class Gemma4RMSNorm(MultiPlatformOp):
 
         if needs_reshape:
             out = out.reshape(original_shape)
+        return out
+
+    def forward_xpu(self, x: torch.Tensor) -> torch.Tensor:
+        if x.numel() == 0:
+            return x
+        if self.with_scale and self.scale_shift == 1.0:
+            out = gemma_rmsnorm(x, self.weight.data, self.eps)
+        else:
+            out = rmsnorm(x, self.weight.data, self.eps)
         return out
 
     def forward_hip(self, x: torch.Tensor) -> torch.Tensor:
