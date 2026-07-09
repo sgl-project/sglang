@@ -64,6 +64,10 @@ class MistralLarge3EagleModel(DeepseekV2Model):
         )
         self.start_layer = 0
         self.end_layer = self.config.num_hidden_layers
+        local_layer_ids = list(range(self.start_layer, self.end_layer))
+        self.next_full_attention_layer_id = dict(
+            zip(local_layer_ids, local_layer_ids[1:])
+        )
 
         self.fc = RowParallelLinear(
             self.config.hidden_size * 2,

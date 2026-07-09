@@ -108,7 +108,6 @@ def is_deepseek_dsa(config) -> bool:
             "DeepseekV32ForCausalLM",
             "DeepseekV3ForCausalLMNextN",
             "MistralLarge3ForCausalLM",
-            "MistralLarge3ForCausalLMEagle",
             "PixtralForConditionalGeneration",
             "GlmMoeDsaForCausalLM",
             "GlmMoeDsaForCausalLMNextN",
