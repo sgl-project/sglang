@@ -27,13 +27,15 @@ class KernelBackend(str, Enum):
     and the pure-``torch`` fallback path.
     """
 
-    TORCH = "torch"
+    TORCH = "torch"  # pure-torch reference (forward_native)
+    TORCH_COMPILE = "torch_compile"  # torch.compile(forward_native)
     TRITON = "triton"
     CUDA_JIT = "cuda_jit"  # sglang.jit_kernel
     CUDA_AOT = "cuda_aot"  # sgl_kernel wheel
     CUTE_DSL = "cute_dsl"
     FLASHINFER = "flashinfer"
     DEEPGEMM = "deepgemm"
+    # TODO(RFC #29630): backends for other hardware (hip_c / npu / cpu-avx, ...)
 
 
 class PlatformInfo(msgspec.Struct, frozen=True):
@@ -132,7 +134,10 @@ class KernelSpec(msgspec.Struct, frozen=True):
         Which :class:`KernelBackend` provides this implementation.
     target:
         Import path of the callable in ``"module:attr"`` form, resolved lazily
-        by :meth:`load` (e.g. ``"sgl_kernel:rmsnorm"``).
+        by :meth:`load` (e.g. ``"sgl_kernel:rmsnorm"``). ``attr`` may be a
+        dotted path into a module-level object, e.g.
+        ``"sglang.kernels.ops.layernorm:_RMSNORM.forward_cuda_aot"`` for a
+        bound :class:`~sglang.kernels.fused_op.BaseFusedOp` backend method.
     capability:
         Hardware requirement used by the selector to skip unusable backends.
     format_signature:
@@ -174,5 +179,7 @@ class KernelSpec(msgspec.Struct, frozen=True):
             raise ValueError(
                 f"KernelSpec.target must be 'module:attr', got {self.target!r}"
             )
-        module = importlib.import_module(module_path)
-        return getattr(module, attr)
+        obj = importlib.import_module(module_path)
+        for part in attr.split("."):
+            obj = getattr(obj, part)
+        return obj

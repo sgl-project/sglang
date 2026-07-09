@@ -17,6 +17,7 @@ sglang/kernels/
                  # CapabilityRequirement, PlatformInfo
   registry.py    # process-wide KernelRegistry + register_kernel()
   selector.py    # heuristic select_kernel() and cached get_kernel()
+  fused_op.py    # BaseFusedOp: per-operator multi-backend contract
   ops/
     <group>/     # one subpackage per operator group
 ```
@@ -54,6 +55,49 @@ explicitly, e.g.:
 from sglang.kernels import select_kernel, KernelBackend
 jit_rmsnorm = select_kernel("layernorm.rmsnorm", backend=KernelBackend.CUDA_JIT).load()
 ```
+
+## `BaseFusedOp` — the per-operator implementation contract
+
+Multi-backend operators (currently the `layernorm` and `activation` groups)
+are implemented as `BaseFusedOp` subclasses: one logical operator with one
+`forward_<backend>` method per backend, all sharing one signature behind a
+single `forward()`:
+
+- `forward_native` — **required**; the pure-`torch` correctness reference
+  every other backend is checked against.
+- `forward_torch_compile` — inherited for free as
+  `torch.compile(forward_native)`.
+- `forward_triton` / `forward_cuda_jit` / `forward_cuda_aot` /
+  `forward_cute_dsl` / `forward_flashinfer` / `forward_deepgemm` — opt-in
+  overrides. A backend is *available* iff its method is overridden.
+
+`forward()` auto-selects the best available backend by the class's `priority`,
+filtered per call through `backend_eligible()` (a
+`CapabilityRequirement`-vs-`PlatformInfo` check, extensible with per-call
+shape/dtype gates), and degrades to the native reference when no optimized
+backend fits. The public `ops.<group>` functions stay thin wrappers over
+module-level instances, so the import surface is unchanged; each instance also
+registers all of its backends as `KernelSpec`s so the registry inventory and
+`select_kernel(..., backend=...)` keep working.
+
+What this buys (see the
+[RFC discussion](https://github.com/sgl-project/sglang/issues/29630#issuecomment-4920387930)):
+
+- **Unified correctness testing** — a generic harness enumerates
+  `available_backends()` and asserts each one matches `forward_native`
+  (`test/registered/kernels/test_fused_op_gpu_parity.py`); new backends are
+  picked up automatically.
+- **One-switch debugging** — `SGLANG_FORCE_FUSED_OP_BACKEND=torch` (or
+  `set_fused_op_backend(KernelBackend.TORCH)`) flips *every* fused op to its
+  reference implementation for numerical-bug bisection.
+- **Safe fallbacks** — a missing / ineligible optimized kernel degrades to
+  `native` instead of scattering `if`/`else` at call sites.
+- **Incremental optimization** — land `forward_native` first, add `triton` /
+  `cuda_jit` / `cuda_aot` later without touching call sites; alternative
+  implementations of the same op live side by side for A/B.
+- **Tracing** — `enable_fused_op_trace()` records every call's op, backend,
+  and tensor shapes/dtypes, giving an accurate inventory of what a model
+  actually exercises.
 
 ## Review rule (RFC #29630)
 

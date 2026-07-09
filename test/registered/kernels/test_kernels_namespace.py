@@ -18,18 +18,30 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 # registry holds many more entries (every migrated Triton kernel), so this is
 # checked as a subset, not an exact match.
 EXPECTED_OPS = {
+    # BaseFusedOp-backed ops: native + torch_compile always available,
+    # plus the overridden CUDA backends.
+    "activation.silu_and_mul": {"cuda_aot", "cuda_jit", "torch", "torch_compile"},
+    "activation.gelu_and_mul": {"cuda_aot", "cuda_jit", "torch", "torch_compile"},
+    "activation.gelu_tanh_and_mul": {
+        "cuda_aot",
+        "cuda_jit",
+        "torch",
+        "torch_compile",
+    },
+    "layernorm.rmsnorm": {"cuda_aot", "cuda_jit", "torch", "torch_compile"},
+    "layernorm.fused_add_rmsnorm": {
+        "cuda_aot",
+        "cuda_jit",
+        "torch",
+        "torch_compile",
+    },
+    "layernorm.gemma_rmsnorm": {"cuda_aot", "torch", "torch_compile"},
+    "layernorm.gemma_fused_add_rmsnorm": {"cuda_aot", "torch", "torch_compile"},
     # curated dual/single-backend wrapper ops
-    "activation.silu_and_mul": {"cuda_aot", "cuda_jit"},
-    "activation.gelu_and_mul": {"cuda_aot", "cuda_jit"},
-    "activation.gelu_tanh_and_mul": {"cuda_aot", "cuda_jit"},
     "gemm.fp8_scaled_mm": {"cuda_aot"},
     "gemm.dsv3_fused_a_gemm": {"cuda_aot", "cuda_jit"},
     "gemm.dsv3_router_gemm": {"cuda_jit"},
     "kvcache.reshape_and_cache_flash": {"triton"},
-    "layernorm.rmsnorm": {"cuda_aot", "cuda_jit"},
-    "layernorm.fused_add_rmsnorm": {"cuda_aot", "cuda_jit"},
-    "layernorm.gemma_rmsnorm": {"cuda_aot"},
-    "layernorm.gemma_fused_add_rmsnorm": {"cuda_aot"},
     "moe.moe_align_block_size": {"cuda_aot", "cuda_jit"},
     "moe.topk_softmax": {"cuda_aot"},
     "quantization.sgl_per_token_quant_fp8": {"cuda_aot"},
@@ -187,7 +199,9 @@ class TestKernelsNamespace(unittest.TestCase):
         spec = self.K.select_kernel(
             "layernorm.rmsnorm", backend=self.K.KernelBackend.CUDA_JIT
         )
-        self.assertEqual(spec.target, "sglang.jit_kernel.norm:rmsnorm")
+        self.assertEqual(
+            spec.target, "sglang.kernels.ops.layernorm:_RMSNORM.forward_cuda_jit"
+        )
 
     def test_selector_unknown_op_raises(self):
         with self.assertRaises(KeyError):
