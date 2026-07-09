@@ -170,6 +170,7 @@ from sglang.srt.managers.schedule_batch import (
     NextBatchPlan,
     Req,
     ScheduleBatch,
+    retract_all,
 )
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
@@ -4054,7 +4055,15 @@ class Scheduler(
         if not self.running_batch.is_empty():
             self.running_batch.filter_batch()
             if len(self.running_batch.reqs) != 0:
-                retracted_reqs = self.running_batch.retract_all(self.server_args)
+                retracted_reqs = retract_all(
+                    reqs=self.running_batch.reqs,
+                    server_args=self.server_args,
+                    req_to_token_pool=self.running_batch.req_to_token_pool,
+                    token_to_kv_pool_allocator=self.running_batch.token_to_kv_pool_allocator,
+                    tree_cache=self.running_batch.tree_cache,
+                    hisparse_coordinator=self.running_batch.hisparse_coordinator,
+                )
+                self.running_batch.reqs = []
                 for req in retracted_reqs:
                     self._add_request_to_queue(req)
 

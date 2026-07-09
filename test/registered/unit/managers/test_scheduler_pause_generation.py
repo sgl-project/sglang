@@ -1,6 +1,6 @@
 import unittest
 from collections import deque
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import maybe_stub_sgl_kernel
@@ -130,15 +130,22 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
         scheduler._add_request_to_queue = MagicMock()
 
         retracted = [MagicMock(), MagicMock()]
-        scheduler.running_batch.retract_all.return_value = retracted
         scheduler.running_batch.filter_batch = MagicMock()
         scheduler.server_args = MagicMock()
 
-        scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
+        with patch(
+            "sglang.srt.managers.scheduler.retract_all", return_value=retracted
+        ) as mock_retract_all:
+            scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
 
         self.assertTrue(scheduler._engine_paused)
-        scheduler.running_batch.retract_all.assert_called_once()
+        mock_retract_all.assert_called_once()
+        self.assertEqual(scheduler.running_batch.reqs, [])
         self.assertEqual(scheduler._add_request_to_queue.call_count, 2)
+        self.assertEqual(
+            [call.args[0] for call in scheduler._add_request_to_queue.call_args_list],
+            retracted,
+        )
         self.assertIsNone(scheduler.chunked_req)
 
     def test_retract_empty_running_batch_requeues_nothing(self):

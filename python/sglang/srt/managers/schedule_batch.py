@@ -2455,18 +2455,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         evict_from_tree_cache(self.tree_cache, num_tokens)
         return self.token_to_kv_pool_allocator.available_size() >= num_tokens
 
-    def retract_all(self, server_args: ServerArgs):
-        retracted_reqs = retract_all(
-            reqs=self.reqs,
-            server_args=server_args,
-            req_to_token_pool=self.req_to_token_pool,
-            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-            tree_cache=self.tree_cache,
-            hisparse_coordinator=self.hisparse_coordinator,
-        )
-        self.reqs = []
-        return retracted_reqs
-
     def retract_decode(
         self, server_args: ServerArgs
     ) -> Tuple[List[Req], float, List[Req]]:
