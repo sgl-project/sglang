@@ -16,6 +16,24 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode  # noqa: E4
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
+AUTO_FILL_EXCLUDED_FIELDS = ["reqs"]
+
+
+def make_schedule_batch(bs: int, **overrides) -> ScheduleBatch:
+    batch = ScheduleBatch(reqs=overrides.pop("reqs"))
+    for field in dataclasses.fields(ScheduleBatch):
+        name = field.name
+        if name in overrides or name in AUTO_FILL_EXCLUDED_FIELDS:
+            continue
+        annotation = str(field.type)
+        if "List" in annotation or "list[" in annotation:
+            setattr(batch, name, [f"{name}-{i}" for i in range(bs)])
+        elif "Tensor" in annotation:
+            setattr(batch, name, torch.arange(bs, dtype=torch.int64))
+    for name, value in overrides.items():
+        setattr(batch, name, value)
+    return batch
+
 
 def _snapshot_mutable_fields(batch):
     snapshot = []
@@ -57,31 +75,27 @@ class _FakeReq:
         )
 
 
-def _make_batch(req_names, top_logprobs_nums, token_ids_logprobs):
-    reqs = [types.SimpleNamespace(rid=name) for name in req_names]
-    bs = len(reqs)
-    batch = ScheduleBatch(reqs=reqs)
-    batch.model_config = types.SimpleNamespace(is_encoder_decoder=False)
-    batch.sampling_info = MagicMock()
-    batch.req_pool_indices = torch.arange(bs, dtype=torch.int64)
-    batch.req_pool_indices_cpu = batch.req_pool_indices.clone()
-    batch.seq_lens = torch.full((bs,), 8, dtype=torch.int64)
-    batch.seq_lens_cpu = batch.seq_lens.clone()
-    batch.orig_seq_lens = batch.seq_lens.to(torch.int32)
-    batch.input_ids = torch.arange(bs, dtype=torch.int64)
-    batch.return_logprob = True
-    batch.top_logprobs_nums = top_logprobs_nums
-    batch.token_ids_logprobs = token_ids_logprobs
-    batch.multimodal_inputs = [None] * bs
-    batch.spec_info = None
-    return batch
-
-
 class TestMergeBatchOutOfPlace(unittest.TestCase):
     def test_merge_batch_rebinds_lists_without_mutating_either_side(self):
         """merge_batch must build new list objects; no field of either side may be mutated in place."""
-        self_batch = _make_batch(["a", "b"], [1, 2], [[10], [20]])
-        other_batch = _make_batch(["c"], [3], [[30]])
+        self_batch = make_schedule_batch(
+            2,
+            reqs=[types.SimpleNamespace(rid="a"), types.SimpleNamespace(rid="b")],
+            model_config=types.SimpleNamespace(is_encoder_decoder=False),
+            sampling_info=MagicMock(),
+            return_logprob=True,
+            top_logprobs_nums=[1, 2],
+            token_ids_logprobs=[[10], [20]],
+        )
+        other_batch = make_schedule_batch(
+            1,
+            reqs=[types.SimpleNamespace(rid="c")],
+            model_config=types.SimpleNamespace(is_encoder_decoder=False),
+            sampling_info=MagicMock(),
+            return_logprob=True,
+            top_logprobs_nums=[3],
+            token_ids_logprobs=[[30]],
+        )
 
         self_reqs_before = self_batch.reqs
         self_top_before = self_batch.top_logprobs_nums
@@ -102,22 +116,30 @@ class TestMergeBatchOutOfPlace(unittest.TestCase):
 class TestMixWithRunningOutOfPlace(unittest.TestCase):
     def test_mix_with_running_rebinds_extend_fields_without_mutating_either_side(self):
         """mix_with_running must append via rebound lists; no field of either side may be mutated in place."""
-        extend_batch = _make_batch(["e1", "e2"], None, None)
-        extend_batch.return_logprob = False
-        extend_batch.forward_mode = ForwardMode.EXTEND
-        extend_batch.enable_overlap = False
-        extend_batch.is_prefill_only = True
-        extend_batch.out_cache_loc = torch.arange(6, dtype=torch.int64)
-        extend_batch.prefix_lens = [0, 0]
-        extend_batch.extend_lens = [3, 3]
-        extend_batch.extend_num_tokens = 6
-        extend_batch.extend_logprob_start_lens = [0, 0]
-
-        running_batch = _make_batch(["r1"], None, None)
-        running_batch.reqs = [_FakeReq("r1", origin_len=4, output_len=2)]
-        running_batch.return_logprob = False
-        running_batch.forward_mode = ForwardMode.DECODE
-        running_batch.out_cache_loc = torch.arange(6, 7, dtype=torch.int64)
+        extend_batch = make_schedule_batch(
+            2,
+            reqs=[types.SimpleNamespace(rid="e1"), types.SimpleNamespace(rid="e2")],
+            model_config=types.SimpleNamespace(is_encoder_decoder=False),
+            sampling_info=MagicMock(),
+            return_logprob=False,
+            forward_mode=ForwardMode.EXTEND,
+            enable_overlap=False,
+            is_prefill_only=True,
+            out_cache_loc=torch.arange(6, dtype=torch.int64),
+            prefix_lens=[0, 0],
+            extend_lens=[3, 3],
+            extend_num_tokens=6,
+            extend_logprob_start_lens=[0, 0],
+        )
+        running_batch = make_schedule_batch(
+            1,
+            reqs=[_FakeReq("r1", origin_len=4, output_len=2)],
+            model_config=types.SimpleNamespace(is_encoder_decoder=False),
+            sampling_info=MagicMock(),
+            return_logprob=False,
+            forward_mode=ForwardMode.DECODE,
+            out_cache_loc=torch.arange(6, 7, dtype=torch.int64),
+        )
 
         extend_prefix_before = extend_batch.prefix_lens
         extend_lens_before = extend_batch.extend_lens
@@ -159,15 +181,18 @@ class TestPrepareEncoderInfoExtendOutOfPlace(unittest.TestCase):
             prefix_indices=[],
             extend_range=types.SimpleNamespace(length=4),
         )
-        batch = ScheduleBatch(reqs=[req_with_image, req_text_only])
-        batch.device = "cpu"
-        batch.forward_mode = ForwardMode.EXTEND
-        batch.out_cache_loc = torch.arange(9, dtype=torch.int64)
-        batch.prefix_lens = [0, 0]
-        batch.extend_lens = [5, 4]
-        batch.extend_num_tokens = 9
-        batch.extend_logprob_start_lens = [0, 0]
-        batch.extend_input_logprob_token_ids = torch.arange(9, dtype=torch.int64)
+        batch = make_schedule_batch(
+            2,
+            reqs=[req_with_image, req_text_only],
+            device="cpu",
+            forward_mode=ForwardMode.EXTEND,
+            out_cache_loc=torch.arange(9, dtype=torch.int64),
+            prefix_lens=[0, 0],
+            extend_lens=[5, 4],
+            extend_num_tokens=9,
+            extend_logprob_start_lens=[0, 0],
+            extend_input_logprob_token_ids=torch.arange(9, dtype=torch.int64),
+        )
 
         prefix_before = batch.prefix_lens
         extend_before = batch.extend_lens
