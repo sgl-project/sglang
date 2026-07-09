@@ -869,15 +869,14 @@ class DeepseekV4AttnBackend(
 
     def _init_verify_bs_buffers(self) -> None:
         num_reqs = self.req_to_token.shape[0]
-        with torch.inference_mode(False):
-            self.extend_seq_lens_buffer = torch.full(
-                (num_reqs,),
-                self.speculative_num_draft_tokens,
-                **self.cuda_int32_kwargs,
-            )
-            self.extend_start_loc_buffer = torch.zeros(
-                num_reqs, **self.cuda_int32_kwargs
-            )
+        self.extend_seq_lens_buffer = torch.full(
+            (num_reqs,),
+            self.speculative_num_draft_tokens,
+            **self.cuda_int32_kwargs,
+        )
+        self.extend_start_loc_buffer = torch.zeros(
+            num_reqs, **self.cuda_int32_kwargs
+        )
 
     def _ensure_verify_bs_buffers(self) -> None:
         num_reqs = self.req_to_token.shape[0]
