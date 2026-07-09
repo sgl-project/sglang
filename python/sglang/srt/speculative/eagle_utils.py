@@ -14,12 +14,12 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_allocator import (
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_build_dsv4_verify_bundle,
 )
-from sglang.srt.mem_cache.common import (
+from sglang.srt.mem_cache.allocation import (
     alloc_paged_token_slots_extend,
     alloc_token_slots,
-    get_alloc_reserve_per_decode,
     get_last_loc,
 )
+from sglang.srt.mem_cache.allocation_sizing import get_alloc_reserve_per_decode
 from sglang.srt.speculative.triton_ops.spec_tree import (
     sgl_build_tree_kernel_efficient_triton,
     verify_tree_greedy_kernel_triton,

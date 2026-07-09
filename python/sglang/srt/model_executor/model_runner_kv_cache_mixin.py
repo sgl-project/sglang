@@ -18,6 +18,7 @@ from sglang.srt.configs.model_config import (
 from sglang.srt.distributed.parallel_state import get_world_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_size
+from sglang.srt.mem_cache.allocation_sizing import get_req_to_token_extra_context_len
 from sglang.srt.mem_cache.allocator import (
     PagedTokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
@@ -30,7 +31,6 @@ from sglang.srt.mem_cache.allocator.swa import (
     PureSWATokenToKVPoolAllocator,
     SWATokenToKVPoolAllocator,
 )
-from sglang.srt.mem_cache.common import get_req_to_token_extra_context_len
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
 from sglang.srt.mem_cache.memory_pool import (
