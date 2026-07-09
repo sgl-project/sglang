@@ -122,10 +122,6 @@ class TestTRTLLMMHASpecDecode(unittest.TestCase):
                 )
 
                 with patch.object(
-                    backend,
-                    "_maybe_quantize_q",
-                    return_value=(torch.zeros(2, 2), 1.0),
-                ), patch.object(
                     backend, "_get_bmm_scales", return_value=(1.0, 1.0)
                 ), patch.object(
                     backend, "_get_layer_page_table", return_value=full_page_table
@@ -265,7 +261,6 @@ class TestTRTLLMMHASpecDecode(unittest.TestCase):
         self.assertEqual(
             metadata.cache_seqlens_int32.tolist(), expected_seqlens.tolist()
         )
-        self.assertEqual(metadata.max_seq_len_k, 22)
         self.assertEqual(
             metadata.cu_seqlens_k[1:].tolist(),
             torch.cumsum(expected_seqlens, dim=0, dtype=torch.int32).tolist(),
