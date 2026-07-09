@@ -148,6 +148,8 @@ _INCREMENTAL_STREAMING_META_INFO_KEYS = (
     "output_token_ids_logprobs",
 )
 
+_VALID_PAUSE_MODES = ("abort", "in_place", "retract")
+
 
 @dataclasses.dataclass
 class ReqState:
@@ -1694,6 +1696,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
 
     async def pause_generation(self, obj: PauseGenerationReqInput):
+        if obj.mode not in _VALID_PAUSE_MODES:
+            raise ValueError(
+                f"Invalid pause_generation mode: {obj.mode!r}; "
+                f"expected one of {_VALID_PAUSE_MODES}."
+            )
         async with self.is_pause_cond:
             self.is_pause = True
             if obj.mode != "abort":
