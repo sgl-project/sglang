@@ -4052,6 +4052,22 @@ class Scheduler(
             r for r in self.running_batch.reqs if not r.finished()
         ] + last_fold_in_reqs
 
+        # Replicate the old post-fold coordinator source for strict
+        # equivalence: the batch-level path released through the (often None)
+        # batch-side coordinator of whichever batch object survived the fold
+        # swap, not the scheduler-owned one. Releasing through the
+        # scheduler-owned coordinator may well be the correct behavior, but
+        # that change belongs to a separate op.
+        release_hisparse_coordinator = self.running_batch.hisparse_coordinator
+        if (
+            self.last_batch is not None
+            and self.last_batch.forward_mode.is_extend()
+            and not self.last_batch.is_empty()
+            and self.disaggregation_mode != DisaggregationMode.PREFILL
+            and len(self.running_batch.reqs) == 0
+        ):
+            release_hisparse_coordinator = self.last_batch.hisparse_coordinator
+
         self.last_batch = None
         self.cur_batch_for_debug = None
 
@@ -4063,7 +4079,7 @@ class Scheduler(
                     req_to_token_pool=self.req_to_token_pool,
                     token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                     tree_cache=self.tree_cache,
-                    hisparse_coordinator=self.hisparse_coordinator,
+                    hisparse_coordinator=release_hisparse_coordinator,
                 )
             self.running_batch.reqs = []
             for req in retract_reqs:
