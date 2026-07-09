@@ -173,12 +173,14 @@ class TestPrepareEncoderInfoExtendOutOfPlace(unittest.TestCase):
             multimodal_inputs=types.SimpleNamespace(num_image_tokens=2),
             prefix_indices=[],
             extend_range=Range(0, 5),
+            logprob_start_len=0,
         )
         req_text_only = types.SimpleNamespace(
             rid="txt",
             multimodal_inputs=None,
             prefix_indices=[],
             extend_range=Range(0, 4),
+            logprob_start_len=0,
         )
         batch = make_schedule_batch(
             2,
