@@ -70,7 +70,10 @@ from sglang.srt.layers.communicator import (
     enable_moe_dense_fully_dp,
     get_attn_tp_context,
 )
-from sglang.srt.layers.communicator_dsa_cp import DSACPLayerCommunicator
+from sglang.srt.layers.communicator_dsa_cp import (
+    DSACPLayerCommunicator,
+    maybe_prefetch_next_full_attention_kv,
+)
 from sglang.srt.layers.dcp import dcp_enabled, get_attention_dcp_world_size
 from sglang.srt.layers.dcp.planner import (
     prepare_decode_context_parallel_metadata,
@@ -111,6 +114,9 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.fp8_kernel import (
     create_per_token_group_quant_fp8_output_scale,
+)
+from sglang.srt.layers.quantization.fp8_utils import (
+    materialize_bpreshuffle_fp8_scale,
 )
 from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
     maybe_fuse_routed_scale_and_shared_add,
@@ -177,7 +183,6 @@ from sglang.srt.models.deepseek_common.utils import (
     _use_aiter_gfx95,
 )
 from sglang.srt.runtime_context import get_flags, get_parallel, get_server_args
-from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     BumpAllocator,
@@ -394,8 +399,10 @@ class DeepseekV2MLP(nn.Module):
                     swiglu_limit=self.swiglu_limit,
                     activation="silu",
                     dtype_quant=dtypes.fp8,
-                    transpose_scale=_use_aiter_bpreshuffle_gfx95,
+                    transpose_scale=False,
                 )
+                if _use_aiter_bpreshuffle_gfx95:
+                    x_scale = materialize_bpreshuffle_fp8_scale(x_scale)
                 x = (x_fp8, x_scale)
             else:
                 x = fused_clamp_act_mul(
@@ -479,7 +486,7 @@ class MoEGate(nn.Module):
                 True,  # is_vnni
             )
 
-        if get_global_server_args().enable_deterministic_inference:
+        if get_server_args().enable_deterministic_inference:
             return F.linear(hidden_states, self.weight, None)
 
         if (
@@ -490,7 +497,11 @@ class MoEGate(nn.Module):
                 or mla_use_prefill_cp(forward_batch, self.mla_enable_prefill_cp)
             )
         ):
-            logits = F.linear(hidden_states, self.weight, None)
+            if _is_cuda:
+                from sglang.jit_kernel.dsv4 import linear_bf16_fp32
+
+                return linear_bf16_fp32(hidden_states, self.weight)
+            return F.linear(hidden_states, self.weight, None)
         else:
             # NOTE(b8zhong): this threshold has been empirically verified
             max_router_gemm_tokens = 4 if _device_sm in (100, 103) else 16
@@ -612,7 +623,7 @@ class DeepseekV2MoE(nn.Module):
 
         self.experts = get_moe_impl_class(quant_config)(
             num_experts=num_experts_for_moe
-            + get_global_server_args().ep_num_redundant_experts,
+            + get_server_args().ep_num_redundant_experts,
             num_fused_shared_experts=self.num_fused_shared_experts,
             top_k=top_k_for_moe,
             hidden_size=config.hidden_size,
@@ -785,8 +796,7 @@ class DeepseekV2MoE(nn.Module):
             # TODO: we will support tp < ep in the future
             self.ep_size = get_parallel().moe_ep_size
             self.num_experts = (
-                config.n_routed_experts
-                + get_global_server_args().ep_num_redundant_experts
+                config.n_routed_experts + get_server_args().ep_num_redundant_experts
             )
             self.renormalize = config.norm_topk_prob
             self.topk_group = config.topk_group
@@ -827,7 +837,7 @@ class DeepseekV2MoE(nn.Module):
         self, hidden_states: torch.Tensor, server_args=None
     ) -> bool:
         if server_args is None:
-            server_args = get_global_server_args()
+            server_args = get_server_args()
         return (
             _enable_pcg_dsv2_dual_stream
             and (is_in_tc_piecewise_cuda_graph() or is_in_breakable_cuda_graph())
@@ -865,7 +875,7 @@ class DeepseekV2MoE(nn.Module):
             )
 
         if not self._enable_a2a_moe:
-            server_args = get_global_server_args()
+            server_args = get_server_args()
             if self._can_dual_stream_graph(hidden_states, server_args):
                 return dsv2_flashinfer_moe_dual_stream_graph(
                     hidden_states,
@@ -926,7 +936,7 @@ class DeepseekV2MoE(nn.Module):
         # into the decode CUDA graph and replays from null.
         current_stream = torch.cuda.current_stream()
         self.alt_stream.wait_stream(current_stream)
-        server_args = get_global_server_args()
+        server_args = get_server_args()
         dispatch_info = (
             ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
             if server_args.enable_eplb
@@ -1023,7 +1033,7 @@ class DeepseekV2MoE(nn.Module):
             self.shared_experts.gate_up_proj
         ):
             return self.forward_cpu(hidden_states, should_allreduce_fusion)
-        server_args = get_global_server_args()
+        server_args = get_server_args()
         dispatch_info = (
             ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
             if server_args.enable_eplb
@@ -1590,7 +1600,7 @@ class DeepseekV2AttentionMLA(
         self.scaling = self.qk_head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
-        self.kv_cache_dtype = get_global_server_args().kv_cache_dtype
+        self.kv_cache_dtype = get_server_args().kv_cache_dtype
 
         # NOTE modification to rope_scaling must be done early enough, b/c e.g. Indexer needs it
         if rope_scaling:
@@ -1702,7 +1712,7 @@ class DeepseekV2AttentionMLA(
                 base=rope_theta,
                 rope_scaling=rope_scaling,
                 is_neox_style=is_neox_style,
-                device=get_global_server_args().device,
+                device=get_server_args().device,
             )
 
             if rope_scaling and rope_scaling.get("apply_yarn_scaling", True):
@@ -1789,7 +1799,7 @@ class DeepseekV2AttentionMLA(
         # Determine attention backend name for current forward batch: prefer the
         # name stamped per-runner on the backend object, else resolve from server args.
         backend = get_attn_backend()
-        server_args = get_global_server_args()
+        server_args = get_server_args()
         default_prefill_str, default_decode_str = server_args.get_attention_backends()
         prefill_backend_str = (
             backend.prefill_attention_backend_str or default_prefill_str
@@ -2062,7 +2072,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             rope_scaling = config.rope_scaling
         max_position_embeddings = config.max_position_embeddings
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
-            get_global_server_args().speculative_algorithm
+            get_server_args().speculative_algorithm
         )
         self.dsa_enable_prefill_cp = dsa_enable_prefill_cp
         self.mla_enable_prefill_cp = mla_enable_prefill_cp
@@ -2200,6 +2210,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         llama_4_scaling: Optional[torch.Tensor] = None,
         prev_topk_indices: Optional[torch.Tensor] = None,
         captured_last_layer_outputs: Optional[List[torch.Tensor]] = None,
+        next_full_attention_layer_id: Optional[int] = None,
     ) -> torch.Tensor:
         hidden_states_orig = hidden_states
         hidden_states, residual = (
@@ -2226,6 +2237,10 @@ class DeepseekV2DecoderLayer(nn.Module):
         else:
             topk_indices = None
         get_attn_tp_context().clear_attn_inputs()
+
+        maybe_prefetch_next_full_attention_kv(
+            forward_batch, next_full_attention_layer_id
+        )
 
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
@@ -2422,6 +2437,11 @@ class DeepseekV2Model(nn.Module):
                 ),
             ),
         )
+
+        local_layer_ids = list(range(self.start_layer, self.end_layer))
+        self.next_full_attention_layer_id = dict(
+            zip(local_layer_ids, local_layer_ids[1:])
+        )
         if self.pp_group.is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
@@ -2590,6 +2610,9 @@ class DeepseekV2Model(nn.Module):
                     captured_last_layer_outputs=(
                         aux_hidden_states if i in self.layers_to_capture else None
                     ),
+                    next_full_attention_layer_id=self.next_full_attention_layer_id.get(
+                        i
+                    ),
                 )
 
         if normal_end_layer != self.end_layer:
@@ -2740,7 +2763,7 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         self, architecture: str = "DeepseekV3ForCausalLM"
     ):
         self.num_fused_shared_experts = 0
-        server_args = get_global_server_args()
+        server_args = get_server_args()
 
         if get_server_args().disable_shared_experts_fusion:
             return

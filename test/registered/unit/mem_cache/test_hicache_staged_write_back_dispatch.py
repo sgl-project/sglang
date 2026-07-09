@@ -25,15 +25,16 @@ from sglang.srt.mem_cache.memory_pool_host import (
     HostPoolGroup,
     LogicalHostPool,
     MambaPoolHost,
-    MHATokenToKVPoolHost,
     MLATokenToKVPoolHost,
     PoolEntry,
 )
+from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 MEMORY_POOL_HOST_MODULE = "sglang.srt.mem_cache.memory_pool_host"
+MHA_POOL_HOST_MODULE = "sglang.srt.mem_cache.pool_host.mha"
 
 
 def _indices(start: int, end: int) -> torch.Tensor:
@@ -46,6 +47,15 @@ def _ptr_key_from_layers(src_layers) -> tuple[int, ...]:
 
 def _ptr_key_from_tensor(ptrs: torch.Tensor) -> tuple[int, ...]:
     return tuple(int(ptr) for ptr in ptrs.cpu().tolist())
+
+
+def _device_pool_stub(*, layer_num: int, **fields) -> SimpleNamespace:
+    """Minimal device-pool stand-in with layer-split fields real pools expose."""
+    return SimpleNamespace(
+        layer_num=layer_num,
+        layer_shard_enabled=False,
+        **fields,
+    )
 
 
 def _cpu_staged_lf_pf_copy(
@@ -191,7 +201,8 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
         ]
         expected_k = [layer[device_indices].clone() for layer in k_layers]
         expected_v = [layer[device_indices].clone() for layer in v_layers]
-        device_pool = SimpleNamespace(
+        device_pool = _device_pool_stub(
+            layer_num=layer_num,
             k_buffer=k_layers,
             v_buffer=v_layers,
             k_data_ptrs=torch.tensor(
@@ -230,21 +241,21 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
 
         with (
             mock.patch(
-                f"{MEMORY_POOL_HOST_MODULE}.jit_transfer_hicache_all_layer_staged_lf_pf",
+                f"{MHA_POOL_HOST_MODULE}.jit_transfer_hicache_all_layer_staged_lf_pf",
                 side_effect=lambda **kwargs: _cpu_staged_mha_lf_pf_copy(
                     src_registry, **kwargs
                 ),
             ) as staged,
             mock.patch(
-                f"{MEMORY_POOL_HOST_MODULE}.transfer_kv_all_layer_lf_pf",
+                f"{MHA_POOL_HOST_MODULE}.transfer_kv_all_layer_lf_pf",
                 create=True,
             ) as fallback,
             mock.patch(
-                f"{MEMORY_POOL_HOST_MODULE}.jit_transfer_hicache_one_layer",
+                f"{MHA_POOL_HOST_MODULE}.jit_transfer_hicache_one_layer",
                 side_effect=_cpu_jit_one_layer_mha_copy,
             ) as load,
             mock.patch(
-                f"{MEMORY_POOL_HOST_MODULE}.can_use_write_back_jit_kernel",
+                f"{MHA_POOL_HOST_MODULE}.can_use_write_back_jit_kernel",
                 return_value=True,
             ) as can_use_write_back_jit_kernel,
         ):
@@ -292,7 +303,8 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
             for layer_id in range(layer_num)
         ]
         expected = [layer[device_indices].clone() for layer in device_layers]
-        device_pool = SimpleNamespace(
+        device_pool = _device_pool_stub(
+            layer_num=layer_num,
             kv_buffer=device_layers,
             data_ptrs=torch.tensor(
                 [layer.data_ptr() for layer in device_layers], dtype=torch.uint64
@@ -300,6 +312,7 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
         )
 
         host = MLATokenToKVPoolHost.__new__(MLATokenToKVPoolHost)
+        host.device_pool = device_pool
         host.layout = "page_first"
         host.page_size = 1
         host.layer_num = layer_num
@@ -581,9 +594,13 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
             for layer_id in range(layer_num)
         ]
         expected = [buffer[device_page_indices].clone() for buffer in device_layers]
-        device_pool = SimpleNamespace(index_k_with_scale_buffer=device_layers)
+        device_pool = _device_pool_stub(
+            layer_num=layer_num,
+            index_k_with_scale_buffer=device_layers,
+        )
 
         host = DSAIndexerPoolHost.__new__(DSAIndexerPoolHost)
+        host.device_pool = device_pool
         host.layout = "page_first"
         host.page_size = page_size
         host.layer_num = layer_num
