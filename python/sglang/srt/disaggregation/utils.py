@@ -267,8 +267,15 @@ class DSparkHiddenRowPool:
                 "DSpark hidden row count mismatch: "
                 f"hidden={hidden.shape[0]}, indices={len(indices)}"
             )
+        if hidden.shape[-1] > self.hidden_size:
+            raise ValueError(
+                "DSpark hidden width exceeds row pool width: "
+                f"hidden={hidden.shape[-1]}, pool={self.hidden_size}"
+            )
         index_tensor = torch.as_tensor(indices, dtype=torch.long, device=self.device)
-        self.buffer[index_tensor].copy_(
+        rows = self.buffer[index_tensor]
+        rows.zero_()
+        rows[:, : hidden.shape[-1]].copy_(
             hidden.to(device=self.device, dtype=self.dtype, non_blocking=True)
         )
 

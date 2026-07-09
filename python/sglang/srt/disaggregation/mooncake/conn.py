@@ -1931,6 +1931,19 @@ class MooncakeKVReceiver(CommonKVReceiver):
         for bootstrap_info in self.bootstrap_infos:
             sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
             is_dummy = bootstrap_info["is_dummy"]
+            local_state_indices = state_indices
+            if spec_metadata and spec_metadata.get("pp_slices"):
+                pp_rank = int(bootstrap_info.get("pp_rank", 0))
+                pp_slice = spec_metadata["pp_slices"].get(str(pp_rank), {})
+                local_state_indices = list(
+                    state_indices
+                    if state_indices is not None
+                    else [None] * len(self.kv_mgr.kv_args.state_types)
+                )
+                for idx, state_type in enumerate(self.kv_mgr.kv_args.state_types):
+                    if state_type == StateType.DSPARK_HIDDEN:
+                        local_state_indices[idx] = pp_slice.get("dst_indices", [])
+                        break
 
             with lock:
                 sock.send_multipart(
@@ -1942,8 +1955,8 @@ class MooncakeKVReceiver(CommonKVReceiver):
                         kv_indices.tobytes() if not is_dummy else b"",
                         str(aux_index).encode("ascii") if not is_dummy else b"",
                         (
-                            pack_int_lists(state_indices, "i")
-                            if not is_dummy and state_indices
+                            pack_int_lists(local_state_indices, "i")
+                            if not is_dummy and local_state_indices
                             else b""
                         ),
                         str(self.required_dst_info_num).encode("ascii"),

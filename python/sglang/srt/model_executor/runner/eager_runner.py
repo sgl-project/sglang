@@ -358,7 +358,9 @@ class EagerRunner(BaseRunner):
                 capture_aux_hidden_states = getattr(
                     model_runner.model, "capture_aux_hidden_states", False
                 )
-                if capture_aux_hidden_states:
+                if capture_aux_hidden_states and not isinstance(
+                    hidden_states, PPProxyTensors
+                ):
                     hidden_states, aux_hidden_states = hidden_states
                 if model_runner.model.pp_group.is_last_rank:
                     hidden_states = cp_gather_after_forward(

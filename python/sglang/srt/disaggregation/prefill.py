@@ -298,17 +298,6 @@ class PrefillBootstrapQueue:
         return True
 
     def _finalize_dspark_hidden_bootstrap(self, req: Req, dspark_meta: dict) -> bool:
-        if self.pp_size > 1:
-            message = (
-                "DSpark PD compact hidden transfer does not support prefill "
-                f"pipeline parallelism yet: pp_size={self.pp_size}. "
-                "The required aux hidden layers may live on different PP stages "
-                "and need PP-aware slice assembly before transfer."
-            )
-            logger.error(message)
-            prepare_abort(req, message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
-            return False
-
         pool = getattr(self.metadata_buffers, "dspark_hidden_pool", None)
         if pool is None:
             message = (
@@ -323,11 +312,42 @@ class PrefillBootstrapQueue:
 
         hidden_start = int(dspark_meta.get("hidden_start", 0))
         hidden_len = int(dspark_meta.get("hidden_len", len(req.origin_input_ids)))
-        dst_indices = [int(x) for x in dspark_meta.get("dst_indices", [])]
+        pp_slices = dspark_meta.get("pp_slices") or {}
+        local_pp_slice = pp_slices.get(str(self.pp_rank)) if pp_slices else None
+        dst_indices = [
+            int(x)
+            for x in (
+                local_pp_slice.get("dst_indices", [])
+                if local_pp_slice
+                else ([] if pp_slices else dspark_meta.get("dst_indices", []))
+            )
+        ]
+        local_layer_ids = (
+            [int(x) for x in local_pp_slice.get("layer_ids", [])]
+            if local_pp_slice
+            else (
+                []
+                if pp_slices
+                else [int(x) for x in dspark_meta.get("target_layer_ids", [])]
+            )
+        )
+        local_slice_len = (
+            int(local_pp_slice.get("slice_len", 0))
+            if local_pp_slice
+            else len(local_layer_ids) * int(self.scheduler.model_config.hidden_size)
+        )
+        if not local_layer_ids:
+            req.dspark_hidden_meta = dict(dspark_meta)
+            req.dspark_hidden_src_indices = []
+            req.dspark_hidden_dst_indices = []
+            req.dspark_hidden_written = []
+            return True
+
         if hidden_len != len(dst_indices):
             message = (
                 "Invalid DSpark hidden metadata from decode: "
-                f"hidden_len={hidden_len}, dst_indices={len(dst_indices)}"
+                f"hidden_len={hidden_len}, dst_indices={len(dst_indices)}, "
+                f"pp_rank={self.pp_rank}"
             )
             logger.error(message)
             prepare_abort(req, message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
@@ -350,10 +370,9 @@ class PrefillBootstrapQueue:
         if src_indices is None:
             return False
 
-        target_layer_ids = [int(x) for x in dspark_meta.get("target_layer_ids", [])]
         try:
             self._configure_dspark_hidden_capture(
-                req, target_layer_ids, pool.hidden_size
+                req, local_layer_ids, local_slice_len, dspark_meta
             )
         except Exception as exc:
             pool.free(src_indices)
@@ -368,7 +387,11 @@ class PrefillBootstrapQueue:
         return True
 
     def _configure_dspark_hidden_capture(
-        self, req: Req, target_layer_ids: List[int], hidden_size: int
+        self,
+        req: Req,
+        target_layer_ids: List[int],
+        hidden_size: int,
+        dspark_meta: dict,
     ) -> None:
         if not target_layer_ids:
             raise RuntimeError(
@@ -386,12 +409,34 @@ class PrefillBootstrapQueue:
 
         model_runner = self.scheduler.tp_worker.model_runner
         configured = getattr(model_runner, "dflash_or_dspark_target_layer_ids", None)
-        if configured is not None and list(configured) != target_layer_ids:
+        all_target_layer_ids = [
+            int(x) for x in dspark_meta.get("target_layer_ids", target_layer_ids)
+        ]
+        if configured is not None and list(configured) != all_target_layer_ids:
             raise RuntimeError(
                 "DSpark target layer mismatch between prefill config and decode "
-                f"metadata: prefill={configured}, decode={target_layer_ids}"
+                f"metadata: prefill={configured}, decode={all_target_layer_ids}"
             )
-        model_runner.dflash_or_dspark_target_layer_ids = target_layer_ids
+        model_runner.dflash_or_dspark_target_layer_ids = all_target_layer_ids
+        start_layer = int(getattr(model_runner, "start_layer", 0))
+        end_layer = int(
+            getattr(
+                model_runner,
+                "end_layer",
+                self.scheduler.model_config.num_hidden_layers,
+            )
+        )
+        outside = [
+            layer_id
+            for layer_id in target_layer_ids
+            if layer_id < start_layer or layer_id >= end_layer
+        ]
+        if outside:
+            raise RuntimeError(
+                "DSpark local layer slice does not match this prefill PP rank: "
+                f"pp_rank={self.pp_rank}, range=[{start_layer}, {end_layer}), "
+                f"outside={outside}"
+            )
 
         model = getattr(model_runner, "model", None)
         if model is None:
@@ -676,10 +721,20 @@ class SchedulerDisaggregationPrefillMixin:
     def _write_dspark_hidden_rows_for_batch(
         self: Scheduler,
         batch: ScheduleBatch,
-        logits_output,
+        result: GenerationBatchResult,
     ) -> None:
         pool = getattr(self.disagg_metadata_buffers, "dspark_hidden_pool", None)
+        logits_output = result.logits_output
         hidden_states = getattr(logits_output, "hidden_states", None)
+        if hidden_states is None and result.pp_hidden_states_proxy_tensors is not None:
+            proxy_tensors = result.pp_hidden_states_proxy_tensors.tensors
+            aux_keys = sorted(
+                key
+                for key in proxy_tensors
+                if key.startswith("dspark_aux_hidden_states_")
+            )
+            if aux_keys:
+                hidden_states = torch.cat([proxy_tensors[key] for key in aux_keys], dim=-1)
         if pool is None or hidden_states is None or batch.extend_lens is None:
             return
 
@@ -754,7 +809,7 @@ class SchedulerDisaggregationPrefillMixin:
             batch=batch,
             logits_output=logits_output,
         )
-        self._write_dspark_hidden_rows_for_batch(batch, logits_output)
+        self._write_dspark_hidden_rows_for_batch(batch, result)
 
         def advance_logprob_pt(i: int, req: Req) -> None:
             nonlocal logprob_pt
