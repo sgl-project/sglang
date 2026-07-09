@@ -79,6 +79,12 @@ class TestPythonicDetector(unittest.TestCase):
         ]
         self.detector = PythonicDetector()
 
+    def test_has_tool_call_detects_marker(self):
+        # Guards the pythonic ``[func(kw=v)]`` regex predicate, which
+        # detect_and_parse does not exercise in isolation.
+        self.assertTrue(self.detector.has_tool_call('[get_weather(location="Tokyo")]'))
+        self.assertFalse(self.detector.has_tool_call("plain text only"))
+
     def test_parse_streaming_no_brackets(self):
         """Test parsing text with no brackets (no tool calls)."""
         text = "This is just normal text without any tool calls."
@@ -2249,6 +2255,16 @@ class TestGptOssDetector(unittest.TestCase):
         ]
         self.detector = GptOssDetector()
 
+    def test_has_tool_call_detects_marker(self):
+        # Guards the bot_token substring predicate, which detect_and_parse
+        # does not exercise in isolation.
+        self.assertTrue(
+            self.detector.has_tool_call(
+                "<|start|>assistant<|channel|>commentary to=get_weather<|return|>"
+            )
+        )
+        self.assertFalse(self.detector.has_tool_call("no tool call here"))
+
     def test_get_model_structural_tag(self):
         import xgrammar as xgr
 
@@ -3433,6 +3449,13 @@ class TestGigaChat3Detector(unittest.TestCase):
             ),
         ]
         self.detector = GigaChat3Detector()
+
+    def test_has_tool_call_detects_both_markers(self):
+        # Guards both marker forms the regex ORs together; the parser exercises
+        # each via detect_and_parse but never the bare predicate.
+        self.assertTrue(self.detector.has_tool_call("function call<|role_sep|>\n{}"))
+        self.assertTrue(self.detector.has_tool_call("<|function_call|>{}"))
+        self.assertFalse(self.detector.has_tool_call("No tool call here"))
 
     def test_detect_and_parse_no_tool_call(self):
         """Test parsing text without tool calls."""

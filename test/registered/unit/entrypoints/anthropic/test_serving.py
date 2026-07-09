@@ -805,6 +805,18 @@ class TestAnthropicServing(unittest.TestCase):
         self.assertEqual(chat_request.max_tokens, 16)
         self.assertTrue(any("task_budget" in r and "32768" in r for r in log.output))
 
+    def test_request_betas_is_accepted_and_logged(self):
+        """``betas`` is accepted and logged; the local backend has no beta system."""
+        import logging
+
+        serving = self._serving()
+        request = self._anthropic_request(betas=["thinking-2025-08-04"], stream=False)
+        with self.assertLogs(
+            "sglang.srt.entrypoints.anthropic.serving", level=logging.INFO
+        ) as log:
+            serving._convert_to_chat_completion_request(request)
+        self.assertTrue(any("thinking-2025-08-04" in r for r in log.output))
+
     def test_assistant_thinking_history_is_rewrapped_for_chat_template(self):
         """Past-turn thinking blocks get re-emitted via wrap_reasoning_history."""
         serving = self._serving()
