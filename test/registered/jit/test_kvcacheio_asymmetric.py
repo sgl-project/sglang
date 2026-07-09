@@ -4,14 +4,14 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from sglang.srt.mem_cache.memory_pool_host import AsymmetricMHATokenToKVPoolHost
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.srt.mem_cache.pool_host.mha import AsymmetricMHATokenToKVPoolHost
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=10, suite="base-b-kernel-unit-1-gpu-large")
+register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_amd_ci(est_time=10, suite="nightly-amd-kernel-1-gpu", nightly=True)
 
 # These tests use AsymmetricMHATokenToKVPoolHost methods and let that class call
-# the real sgl-kernel transfer ops. The asymmetric host pool is kernel-only;
-# direct/page_first_direct is intentionally rejected in the CPU dispatch tests.
+# the real sgl-kernel transfer ops.
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="asymmetric host-pool tests require CUDA."
 )
@@ -45,22 +45,27 @@ def fill_with_offset(tensor, offset):
     tensor.copy_((data + offset).view_as(tensor))
 
 
-def make_host_pool(dtype):
+def make_host_pool(dtype, layout="page_first"):
     host = AsymmetricMHATokenToKVPoolHost.__new__(AsymmetricMHATokenToKVPoolHost)
-    host.layout = "page_first"
+    host.layout = layout
     host.page_size = PAGE_SIZE
+    host.page_num = TOTAL_ITEMS // PAGE_SIZE
     host.layer_num = NUM_LAYERS
     host.head_num = HEAD_NUM
     host.head_dim = K_HEAD_DIM
     host.v_head_dim = V_HEAD_DIM
     host.dtype = dtype
+    if layout == "page_first":
+        k_dims = (TOTAL_ITEMS, NUM_LAYERS, HEAD_NUM, K_HEAD_DIM)
+        v_dims = (TOTAL_ITEMS, NUM_LAYERS, HEAD_NUM, V_HEAD_DIM)
+    elif layout == "page_first_direct":
+        k_dims = (host.page_num, NUM_LAYERS, PAGE_SIZE, HEAD_NUM, K_HEAD_DIM)
+        v_dims = (host.page_num, NUM_LAYERS, PAGE_SIZE, HEAD_NUM, V_HEAD_DIM)
+    else:
+        raise ValueError(f"Unsupported layout: {layout}")
     host.kv_buffer = (
-        torch.zeros(
-            TOTAL_ITEMS, NUM_LAYERS, HEAD_NUM, K_HEAD_DIM, dtype=dtype
-        ).pin_memory(),
-        torch.zeros(
-            TOTAL_ITEMS, NUM_LAYERS, HEAD_NUM, V_HEAD_DIM, dtype=dtype
-        ).pin_memory(),
+        torch.zeros(k_dims, dtype=dtype).pin_memory(),
+        torch.zeros(v_dims, dtype=dtype).pin_memory(),
     )
     return host
 
@@ -90,14 +95,28 @@ def make_device_pool(dtype):
     )
 
 
+def _host_k_tokens(host, indices, layer_id):
+    if host.layout == "page_first":
+        return host.k_buffer[indices, layer_id]
+    pages = indices[::PAGE_SIZE] // PAGE_SIZE
+    return host.k_buffer[pages, layer_id].reshape(-1, HEAD_NUM, K_HEAD_DIM)
+
+
+def _host_v_tokens(host, indices, layer_id):
+    if host.layout == "page_first":
+        return host.v_buffer[indices, layer_id]
+    pages = indices[::PAGE_SIZE] // PAGE_SIZE
+    return host.v_buffer[pages, layer_id].reshape(-1, HEAD_NUM, V_HEAD_DIM)
+
+
 def assert_backup_matches_device(host, device_pool, host_indices_host, device_indices):
     for layer_id in range(NUM_LAYERS):
         torch.testing.assert_close(
-            host.k_buffer[host_indices_host, layer_id],
+            _host_k_tokens(host, host_indices_host, layer_id),
             device_pool.k_buffer[layer_id][device_indices].cpu(),
         )
         torch.testing.assert_close(
-            host.v_buffer[host_indices_host, layer_id],
+            _host_v_tokens(host, host_indices_host, layer_id),
             device_pool.v_buffer[layer_id][device_indices].cpu(),
         )
 
@@ -106,11 +125,11 @@ def assert_load_matches_host(host, device_pool, host_indices_host, load_indices)
     for layer_id in range(NUM_LAYERS):
         torch.testing.assert_close(
             device_pool.k_buffer[layer_id][load_indices],
-            host.k_buffer[host_indices_host, layer_id].to(DEVICE),
+            _host_k_tokens(host, host_indices_host, layer_id).to(DEVICE),
         )
         torch.testing.assert_close(
             device_pool.v_buffer[layer_id][load_indices],
-            host.v_buffer[host_indices_host, layer_id].to(DEVICE),
+            _host_v_tokens(host, host_indices_host, layer_id).to(DEVICE),
         )
 
 
@@ -146,6 +165,46 @@ def test_asymmetric_mha_kernel_page_first_roundtrip(dtype):
             device_pool, host_indices, load_indices, layer_id, io_backend="kernel"
         )
     torch.cuda.synchronize()
+    assert_load_matches_host(host, device_pool, host_indices_host, load_indices_host)
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_asymmetric_mha_direct_page_first_direct_roundtrip(dtype):
+    # Covers D2H backup + H2D load through AsymmetricMHATokenToKVPoolHost using
+    # page_first_direct/direct. K and V are copied through separate direct calls
+    # because their per-token strides differ.
+    host = make_host_pool(dtype, layout="page_first_direct")
+    device_pool = make_device_pool(dtype)
+    direct_stream = torch.cuda.Stream()
+
+    device_pages = torch.tensor([1, 2, 3], dtype=torch.int64)
+    host_pages = torch.tensor([0, 1, 2], dtype=torch.int64)
+    load_pages = torch.tensor([4, 5, 6], dtype=torch.int64)
+    device_indices_host = token_indices_for_pages(device_pages)
+    host_indices_host = token_indices_for_pages(host_pages)
+    load_indices_host = token_indices_for_pages(load_pages)
+
+    with torch.cuda.stream(direct_stream):
+        host.backup_from_device_all_layer(
+            device_pool, host_indices_host, device_indices_host, io_backend="direct"
+        )
+    direct_stream.synchronize()
+    assert_backup_matches_device(
+        host, device_pool, host_indices_host, device_indices_host
+    )
+
+    with torch.cuda.stream(direct_stream):
+        for layer_id in range(NUM_LAYERS):
+            device_pool.k_buffer[layer_id].zero_()
+            device_pool.v_buffer[layer_id].zero_()
+            host.load_to_device_per_layer(
+                device_pool,
+                host_indices_host,
+                load_indices_host,
+                layer_id,
+                io_backend="direct",
+            )
+    direct_stream.synchronize()
     assert_load_matches_host(host, device_pool, host_indices_host, load_indices_host)
 
 

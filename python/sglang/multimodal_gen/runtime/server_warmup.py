@@ -21,7 +21,16 @@ from sglang.multimodal_gen.runtime.warmup_request_builder import (
 
 logger = init_logger(__name__)
 
-MINIMUM_PICTURE_BASE64_FOR_WARMUP = "data:image/jpg;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAACXBIWXMAAA7EAAAOxAGVKw4bAAAAbUlEQVRYhe3VsQ2AMAxE0Y/lIgNQULD/OqyCMgCihCKSG4yRuKuiNH6JLsoEbMACOGBcua9HOR7Y6w6swBwMy0qLTpkeI77qdEBpBFAHBBDAGH8WrwJKI4AAegUCfAKgEgpQDvh3CR3oQCuav58qlAw73kKCSgAAAABJRU5ErkJggg=="
+# a 64x64 image because some pipelines reject smaller inputs (e.g. FLUX.2's
+# diffusers image processor requires both dimensions >= 64px)
+MINIMUM_PICTURE_BASE64_FOR_WARMUP = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAS0lEQVR42u3PMQ0AAAwDoEqv9ErYvQQckD4XAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAYHLAB8+AWnmfUycAAAAAElFTkSuQmCC"
+
+
+def _is_ci_log_env() -> bool:
+    return (
+        os.environ.get("GITHUB_ACTIONS", "").lower() == "true"
+        or os.environ.get("CI", "").lower() == "true"
+    )
 
 
 def get_first_generation_req(req_or_group: Any) -> Req | None:
@@ -120,9 +129,10 @@ def build_client_warmup_reqs(
         return_warmup_result=True,
         server_based_warmup=True,
     )
-    warmup_total = len(warmup_reqs)
+    warmup_total = sum(1 for req in warmup_reqs if req.is_warmup)
     for req in warmup_reqs:
-        req.extra["warmup_total"] = warmup_total
+        if req.is_warmup:
+            req.extra["warmup_total"] = warmup_total
     return warmup_reqs
 
 
@@ -145,7 +155,9 @@ async def run_async_client_warmup(
                 raise RuntimeError(response.error)
     except Exception as e:
         if fail_open:
-            logger.warning("Synthetic server warmup failed; continuing startup: %s", e)
+            logger.warning(
+                "Synthetic server warmup failed; continuing startup", exc_info=True
+            )
             return
         raise
 
@@ -197,12 +209,20 @@ class SchedulerWarmupMixin:
         if not self._show_warmup_progress:
             return
 
+        ci_log_env = _is_ci_log_env()
         if self._warmup_progress_bar is None:
             self._warmup_progress_bar = tqdm(
                 total=self._warmup_progress_total(req_or_group),
                 desc="Warmup requests",
                 unit="req",
+                disable=ci_log_env,
             )
+            if ci_log_env:
+                logger.info(
+                    "Warmup requests: 0/%s %s",
+                    self._warmup_progress_bar.total,
+                    self._format_warmup_req(req_or_group),
+                )
         self._warmup_progress_bar.set_postfix_str(
             self._format_warmup_req(req_or_group), refresh=False
         )
@@ -223,6 +243,13 @@ class SchedulerWarmupMixin:
                 refresh=False,
             )
         self._warmup_progress_bar.update(1)
+        if _is_ci_log_env():
+            logger.info(
+                "Warmup requests: %s/%s %s",
+                self._warmup_progress_bar.n,
+                self._warmup_progress_bar.total,
+                self._format_warmup_req(req_or_group),
+            )
 
         if self._warmup_progress_bar.n >= self._warmup_progress_bar.total:
             self._warmup_progress_bar.close()
@@ -254,7 +281,7 @@ class SchedulerWarmupMixin:
                 self._logged_server_ready_after_warmup = True
         else:
             warmup_desc = self._format_warmup_req(req_or_group)
-            logger.info(f"{warmup_desc} processing failed")
+            logger.warning("%s processing failed: %s", warmup_desc, output_batch.error)
 
     def process_received_reqs_with_req_based_warmup(
         self, recv_reqs: list[tuple[bytes, Any]]

@@ -23,8 +23,6 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import (
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.layers.activation import GeluAndMul
@@ -60,6 +58,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.runtime_context import get_parallel, get_stream
 from sglang.srt.utils import add_prefix, is_npu
 
 _is_npu = is_npu()
@@ -333,8 +332,8 @@ class Grok1Attention(nn.Module):
         self.config = config
         self.layer_id = layer_id
         self.hidden_size = hidden_size
-        attn_tp_rank = get_tensor_model_parallel_rank()
-        attn_tp_size = get_tensor_model_parallel_world_size()
+        attn_tp_rank = get_parallel().tp_rank
+        attn_tp_size = get_parallel().tp_size
         self.total_num_heads = num_heads
         assert self.total_num_heads % attn_tp_size == 0
         self.num_heads = self.total_num_heads // attn_tp_size
@@ -542,7 +541,7 @@ class Grok1DecoderLayer(nn.Module):
             if self.residual_moe:
                 # NOTE: self.block_sparse_moe modifies the input in-place,
                 # so we have to call it later. Be aware of any possible related errors.
-                if get_tensor_model_parallel_world_size() > 1:
+                if get_parallel().tp_size > 1:
                     self.ffn = lambda x: tensor_model_parallel_all_reduce(
                         self.moe_with_rmoe(x)
                     )
@@ -593,7 +592,7 @@ class Grok1DecoderLayer(nn.Module):
             forward_batch=forward_batch,
         )
 
-        if get_tensor_model_parallel_world_size() > 1:
+        if get_parallel().tp_size > 1:
             hidden_states = tensor_model_parallel_all_reduce(hidden_states)
 
         hidden_states, residual = fused_dual_residual_rmsnorm(
@@ -647,7 +646,7 @@ class Grok1Model(nn.Module):
             prefix=add_prefix("embed_tokens", prefix),
         )
 
-        self.alt_stream = torch.cuda.Stream()
+        self.alt_stream = get_stream("alt")
         self.layers = nn.ModuleList(
             [
                 Grok1DecoderLayer(
@@ -710,7 +709,7 @@ class Grok1ForCausalLM(nn.Module):
         self.load_presharded_moe = (
             getattr(config, "load_presharded_moe", True)
             and self.config.num_local_experts > 0
-            and get_tensor_model_parallel_world_size() > 1
+            and get_parallel().tp_size > 1
         )
         self.load_presharded_attn = getattr(config, "load_presharded_attn", False)
         self.load_presharded_embedding = getattr(
@@ -722,7 +721,7 @@ class Grok1ForCausalLM(nn.Module):
             config, "replicate_lm_head", default_replicate_lm_head
         )
 
-        if get_tensor_model_parallel_world_size() > 1:
+        if get_parallel().tp_size > 1:
             setattr(DefaultModelLoader, "_prepare_weights", _prepare_presharded_weights)
 
         self.replicate_embedding = getattr(config, "replicate_embedding", False)
@@ -939,10 +938,7 @@ class Grok1ForCausalLM(nn.Module):
         return wq + wkv + out + ffn1 + ffn2 + embed
 
     def get_num_params_torch(self):
-        return (
-            sum(p.numel() for p in self.parameters())
-            * get_tensor_model_parallel_world_size()
-        )
+        return sum(p.numel() for p in self.parameters()) * get_parallel().tp_size
 
 
 old_prepare_weights = getattr(DefaultModelLoader, "_prepare_weights")
@@ -954,7 +950,7 @@ def _prepare_presharded_weights(
     import glob
     import os
 
-    if get_tensor_model_parallel_world_size() == 1:
+    if get_parallel().tp_size == 1:
         return old_prepare_weights(self, model_name_or_path, revision, fall_back_to_pt)
 
     if not os.path.isdir(model_name_or_path):
@@ -971,7 +967,7 @@ def _prepare_presharded_weights(
     else:
         hf_folder = model_name_or_path
 
-    tp_rank = get_tensor_model_parallel_rank()
+    tp_rank = get_parallel().tp_rank
 
     # The old format
     allow_patterns = [f"*-{tp_rank:03d}.bin"]

@@ -16,6 +16,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.input_buffers import _forward_input_buffer_pool
 from sglang.srt.model_executor.runner import set_global_graph_memory_pool
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import set_global_server_args_for_scheduler
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
@@ -187,6 +188,7 @@ class _EagleDraftWorkerHarness:
         self._topk1_parents_prealloc = None
         self._topk1_score_indices_prealloc = None
         EagleDraftWorker._rebuild_topk1_chain_buffers(self)
+        EagleDraftWorker._init_dsa_index_share_state(self)
 
     @property
     def draft_model_runner(self):
@@ -388,7 +390,9 @@ def _build_frozen_kv_mtp_fixture(
         runner_batch_size=settings.capture_batch_size,
     )
     _configure_runner_for_eagle_draft(fixture.runner, case, settings)
-    fixture.runner.server_args.speculative_algorithm = "FROZEN_KV_MTP"
+    fixture.runner.server_args.override(
+        "attention_unittest.frozen_kv_draft", speculative_algorithm="FROZEN_KV_MTP"
+    )
     fixture.runner.spec_algorithm = SpeculativeAlgorithm.FROZEN_KV_MTP
     fixture.runner.draft_attn_backend = fixture.backend
     fixture.runner.attn_backend = fixture.backend
@@ -441,10 +445,7 @@ def _capture_eagle_draft_graph_runner(
             "sglang.srt.model_executor.runner.decode_cuda_graph_runner.get_available_gpu_memory",
             lambda *args, **kwargs: 0.0,
         ),
-        patch(
-            "sglang.srt.model_executor.runner.base_cuda_graph_runner.get_attention_cp_size",
-            lambda: 1,
-        ),
+        get_parallel().override(attn_cp_size=1),
     ):
         _reset_cuda_graph_test_buffers()
         return EAGLEDraftCudaGraphRunner(
@@ -470,10 +471,7 @@ def _capture_frozen_kv_mtp_graph_runner(
             "sglang.srt.model_executor.runner.decode_cuda_graph_runner.get_available_gpu_memory",
             lambda *args, **kwargs: 0.0,
         ),
-        patch(
-            "sglang.srt.model_executor.runner.base_cuda_graph_runner.get_attention_cp_size",
-            lambda: 1,
-        ),
+        get_parallel().override(attn_cp_size=1),
     ):
         _reset_cuda_graph_test_buffers()
         return FrozenKVMTPCudaGraphRunner(worker)
@@ -540,8 +538,8 @@ def run_eagle_draft_cuda_graph_runner_case(
         )
         adapter.prepare_replay_state(graph_fixture, case, draft_inputs, settings)
 
-        testcase.assertTrue(graph_runner.can_run(graph_batch))
-        actual = graph_runner.replay(graph_batch)
+        testcase.assertTrue(graph_runner.can_run_graph(graph_batch))
+        actual = graph_runner.execute(graph_batch)
         adapter.assert_outputs_close(actual, expected, settings)
     finally:
         _reset_cuda_graph_test_buffers()
@@ -586,8 +584,8 @@ def run_frozen_kv_mtp_cuda_graph_runner_case(
         graph_runner = _capture_frozen_kv_mtp_graph_runner(graph_worker)
         adapter.prepare_replay_state(graph_fixture, case, draft_inputs, settings)
 
-        testcase.assertTrue(graph_runner.can_run(graph_batch))
-        actual = graph_runner.replay(graph_batch)
+        testcase.assertTrue(graph_runner.can_run_graph(graph_batch))
+        actual = graph_runner.execute(graph_batch)
         adapter.assert_outputs_close(actual, expected, settings)
     finally:
         _reset_cuda_graph_test_buffers()

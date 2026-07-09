@@ -163,9 +163,9 @@ __global__ void fusedActivationQuantKernel(
     if constexpr (SF_LAYOUT == tensorrt_llm::QuantizationSFLayout::LINEAR) {
       sfOffset = vecOffset;
     } else if constexpr (SF_LAYOUT == tensorrt_llm::QuantizationSFLayout::SWIZZLED_128x4) {
-      sfOffset = tk::get_sf_out_offset_128x4(std::nullopt, permutedIdx, vecIdx, m, num_vecs_per_row);
+      sfOffset = tk::get_sf_out_offset_128x4(/*batchIdx=*/0, permutedIdx, vecIdx, m, num_vecs_per_row);
     } else {
-      sfOffset = tk::get_sf_out_offset_8x4(std::nullopt, permutedIdx, vecIdx, m, num_vecs_per_row);
+      sfOffset = tk::get_sf_out_offset_8x4(/*batchIdx=*/0, permutedIdx, vecIdx, m, num_vecs_per_row);
     }
     scaleOutput[sfOffset] = fp8Scale;
   }

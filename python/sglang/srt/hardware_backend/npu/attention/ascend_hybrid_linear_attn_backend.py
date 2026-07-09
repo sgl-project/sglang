@@ -130,6 +130,11 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
+        num_padding: Optional[int] = None,
+        in_capture: bool = False,
+        mamba_track_indices: Optional[torch.Tensor] = None,
+        *args,
+        **kwargs,
     ):
         # out_graph passes seq_lens_cpu=None at capture; mirror the base guard.
         if seq_lens_cpu is None:
@@ -143,6 +148,9 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
         mamba_indices = self.req_to_token_pool.get_mamba_indices(req_pool_indices)
         mamba_indices[bs - num_padding :] = 0
         self.state_indices_list[bs - 1][: len(mamba_indices)].copy_(mamba_indices)
+        track_buf = None
+        if mamba_track_indices is not None:
+            track_buf = mamba_track_indices
         if forward_mode.is_decode_or_idle():
             if num_padding == 0:
                 self.query_start_loc_list[bs - 1].copy_(
@@ -188,6 +196,7 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
             return ForwardMetadata(
                 query_start_loc=self.query_start_loc_list[bs - 1],
                 mamba_cache_indices=self.state_indices_list[bs - 1],
+                mamba_track_indices=track_buf,
                 retrieve_next_token=self.retrieve_next_token_list[bs - 1],
                 retrieve_next_sibling=self.retrieve_next_sibling_list[bs - 1],
                 retrieve_parent_token=self.retrieve_parent_token_list[bs - 1],
@@ -197,6 +206,7 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
                 query_start_loc=self.query_start_loc_list[bs - 1],
                 mamba_cache_indices=self.state_indices_list[bs - 1],
                 mamba_cache_indices_gdn=self.state_indices_list_gdn[bs - 1],
+                mamba_track_indices=track_buf,
             )
 
     def get_cuda_graph_seq_len_fill_value(self):

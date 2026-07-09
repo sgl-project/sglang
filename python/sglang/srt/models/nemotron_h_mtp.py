@@ -22,8 +22,6 @@ from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_reduce,
     get_attention_tp_group,
-    get_attention_tp_rank,
-    get_attention_tp_size,
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layernorm import RMSNorm
@@ -41,7 +39,7 @@ from sglang.srt.models.nemotron_h import (
     NemotronHMoEDecoderLayer,
 )
 from sglang.srt.models.nemotron_h_utils import is_attn_layer
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import add_prefix
 
 
@@ -74,8 +72,8 @@ class NemotronHMTPAttentionDecoderLayer(NemotronHAttentionDecoderLayer):
                 output_size=config.hidden_size,
                 bias=False,
                 gather_output=not _dp_attn,
-                tp_rank=get_attention_tp_rank() if _dp_attn else None,
-                tp_size=get_attention_tp_size() if _dp_attn else None,
+                tp_rank=get_parallel().attn_tp_rank if _dp_attn else None,
+                tp_size=get_parallel().attn_tp_size if _dp_attn else None,
                 params_dtype=(
                     config.dtype if hasattr(config, "dtype") else torch.bfloat16
                 ),
@@ -148,6 +146,7 @@ class NemotronHMTPMoEDecoderLayer(NemotronHMoEDecoderLayer):
         self.prev_layer_is_attn = layer_idx > 0 and is_attn_layer(
             _pat[(layer_idx - 1) % len(_pat)]
         )
+        self.layer_communicator.is_last_layer = True
 
         if has_start_projections:
             self.enorm = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
@@ -159,8 +158,8 @@ class NemotronHMTPMoEDecoderLayer(NemotronHMoEDecoderLayer):
                 output_size=config.hidden_size,
                 bias=False,
                 gather_output=not _dp_attn,
-                tp_rank=get_attention_tp_rank() if _dp_attn else None,
-                tp_size=get_attention_tp_size() if _dp_attn else None,
+                tp_rank=get_parallel().attn_tp_rank if _dp_attn else None,
+                tp_size=get_parallel().attn_tp_size if _dp_attn else None,
                 params_dtype=(
                     config.dtype if hasattr(config, "dtype") else torch.bfloat16
                 ),
@@ -340,7 +339,7 @@ class NemotronHForCausalLMMTP(NemotronHForCausalLM):
             self.config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("lm_head", prefix),
-            use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+            use_attn_tp_group=get_server_args().enable_dp_lm_head,
         )
 
         self.logits_processor = LogitsProcessor(config)

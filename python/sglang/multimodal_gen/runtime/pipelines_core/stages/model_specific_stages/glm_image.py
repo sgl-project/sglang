@@ -24,6 +24,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.precision import (
+    align_tensor_to_module_dtype,
+    get_module_dtype,
+)
 
 logger = init_logger(__name__)
 
@@ -304,12 +308,26 @@ class GlmImageAR(PipelineStage):
             width = width or ar_condition_images[0].width
 
         time_start = time.time()
-        prior_token_id, prior_token_image_ids = self.generate_prior_tokens(
-            prompt=prompt,
-            image=ar_condition_images,
-            height=height,
-            width=width,
-        )
+        seed = getattr(batch, "seed", None)
+        if seed is None:
+            prior_token_id, prior_token_image_ids = self.generate_prior_tokens(
+                prompt=prompt,
+                image=ar_condition_images,
+                height=height,
+                width=width,
+            )
+        else:
+            rng_devices = []
+            if device.type == "cuda":
+                rng_devices.append(torch.cuda.current_device())
+            with torch.random.fork_rng(devices=rng_devices, enabled=True):
+                torch.manual_seed(int(seed))
+                prior_token_id, prior_token_image_ids = self.generate_prior_tokens(
+                    prompt=prompt,
+                    image=ar_condition_images,
+                    height=height,
+                    width=width,
+                )
         prior_token_id = prior_token_id.to(device=device)
         time_end = time.time()
         logger.info(f"generate_prior_tokens time: {time_end - time_start}")
@@ -733,7 +751,7 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
         attention_kwargs = {}
         prompt_embeds = None
         do_classifier_free_guidance = True
-        dtype = torch.bfloat16
+        dtype = get_module_dtype(self.transformer, torch.bfloat16)
 
         self._guidance_scale = guidance_scale
         self._current_timestep = None
@@ -799,14 +817,15 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
                 1, self.vae.config.latent_channels, 1, 1
             )
 
-            latents_mean = latents_mean.to(device=device, dtype=prompt_embeds.dtype)
-            latents_std = latents_std.to(device=device, dtype=prompt_embeds.dtype)
+            vae_dtype = get_module_dtype(self.vae, prompt_embeds.dtype)
+            latents_mean = latents_mean.to(device=device, dtype=vae_dtype)
+            latents_std = latents_std.to(device=device, dtype=vae_dtype)
 
             for condition_image, condition_image_prior_token_id in zip(
                 ar_condition_images, prior_token_image_ids
             ):
-                condition_image = condition_image.to(
-                    device=device, dtype=prompt_embeds.dtype
+                condition_image = align_tensor_to_module_dtype(
+                    condition_image, self.vae, device=device
                 )
 
                 condition_latent = retrieve_latents(

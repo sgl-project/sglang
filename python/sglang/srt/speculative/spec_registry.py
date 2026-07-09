@@ -89,6 +89,9 @@ class CustomSpecAlgo:
         # Conservative default: the larger KV reserve.
         return True
 
+    def handle_server_args(self, server_args: ServerArgs) -> None:
+        pass
+
     def create_worker(self, server_args: ServerArgs) -> Type:
         if not server_args.disable_overlap_schedule and not self.supports_overlap:
             raise ValueError(

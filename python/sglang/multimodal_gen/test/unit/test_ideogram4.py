@@ -37,6 +37,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.weight_only_fp8 import (
     W8A8_FP8_GEMM_ENV,
     WeightOnlyFP8ColumnParallelLinear,
     WeightOnlyFP8Linear,
+    WeightOnlyFP8RowParallelLinear,
     dequantize_rowwise_fp8_weight,
 )
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
@@ -52,6 +53,7 @@ from sglang.multimodal_gen.runtime.loader.fsdp_load import (
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.models.dits.ideogram import (
+    Ideogram4RowParallelLinear,
     Ideogram4Transformer2DModel,
 )
 from sglang.multimodal_gen.runtime.models.encoders.ideogram import (
@@ -61,7 +63,11 @@ from sglang.multimodal_gen.runtime.pipelines.ideogram import (
     _resolve_ideogram4_unconditional_transformer_weights_path,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
-from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import DenoisingStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
+    DenoisingContext,
+    DenoisingStage,
+    DenoisingStepState,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ideogram import (
     IMAGE_POSITION_OFFSET,
     LLM_TOKEN_INDICATOR,
@@ -151,6 +157,7 @@ def _fake_server_args(cfg=None):
         pipeline_config=cfg or Ideogram4PipelineConfig(),
         comfyui_mode=False,
         enable_torch_compile=False,
+        enable_breakable_cuda_graph=False,
         attention_backend="torch_sdpa",
         enable_layerwise_nvtx_marker=False,
         model_loaded={"transformer": True},
@@ -762,7 +769,7 @@ class TestIdeogram4(unittest.TestCase):
             (1,),
         )
 
-    def test_ideogram_dit_tp_nvfp4_uses_column_parallel_quant_linears(self):
+    def test_ideogram_dit_tp_nvfp4_uses_megatron_parallel_quant_linears(self):
         import sglang.multimodal_gen.runtime.server_args as server_args_module
 
         fake_tp_group = SimpleNamespace(world_size=2, rank_in_group=1)
@@ -802,7 +809,7 @@ class TestIdeogram4(unittest.TestCase):
         finally:
             set_global_server_args(prev_args)
 
-        self.assertTrue(model.layers[0].attention.qkv.gather_output)
+        self.assertFalse(model.layers[0].attention.qkv.gather_output)
         self.assertEqual(
             tuple(model.layers[0].attention.qkv.weight.shape), (6912, 2304)
         )
@@ -810,6 +817,14 @@ class TestIdeogram4(unittest.TestCase):
             model.layers[0].attention.qkv.quant_method,
             ModelOptFp4LinearMethod,
         )
+        self.assertIsInstance(model.layers[0].attention.o, Ideogram4RowParallelLinear)
+        self.assertTrue(model.layers[0].attention.o.input_is_parallel)
+        self.assertFalse(model.layers[0].feed_forward.w1.gather_output)
+        self.assertFalse(model.layers[0].feed_forward.w3.gather_output)
+        self.assertIsInstance(
+            model.layers[0].feed_forward.w2, Ideogram4RowParallelLinear
+        )
+        self.assertTrue(model.layers[0].feed_forward.w2.input_is_parallel)
 
     def test_bitsandbytes_tp_quant_state_uses_local_output_shard(self):
         param = torch.nn.Parameter(
@@ -998,7 +1013,7 @@ class TestIdeogram4(unittest.TestCase):
             any(isinstance(module, torch.nn.Linear) for module in encoder.modules())
         )
 
-    def test_ideogram_text_encoder_tp_fp8_uses_column_parallel_linears(self):
+    def test_ideogram_text_encoder_tp_fp8_uses_megatron_parallel_linears(self):
         config = Ideogram4TextEncoderConfig()
         config.post_diffusers_config_update()
         config.arch_config.text_config = Qwen3VLTextConfig(
@@ -1044,12 +1059,18 @@ class TestIdeogram4(unittest.TestCase):
         self.assertEqual(layer.self_attn.num_key_value_heads, 2)
         self.assertIsInstance(layer.self_attn.q_proj, WeightOnlyFP8ColumnParallelLinear)
         self.assertFalse(layer.self_attn.q_proj.gather_output)
-        self.assertTrue(layer.self_attn.o_proj.gather_output)
+        self.assertIsInstance(layer.self_attn.o_proj, WeightOnlyFP8RowParallelLinear)
+        self.assertTrue(layer.self_attn.o_proj.input_is_parallel)
+        self.assertTrue(layer.self_attn.o_proj.reduce_results)
         self.assertIsInstance(layer.mlp.gate_proj, WeightOnlyFP8ColumnParallelLinear)
         self.assertFalse(layer.mlp.gate_proj.gather_output)
-        self.assertTrue(layer.mlp.down_proj.gather_output)
+        self.assertIsInstance(layer.mlp.up_proj, WeightOnlyFP8ColumnParallelLinear)
+        self.assertFalse(layer.mlp.up_proj.gather_output)
+        self.assertIsInstance(layer.mlp.down_proj, WeightOnlyFP8RowParallelLinear)
+        self.assertTrue(layer.mlp.down_proj.input_is_parallel)
+        self.assertTrue(layer.mlp.down_proj.reduce_results)
 
-    def test_denoise_and_decode_shape_smoke(self):
+    def test_denoise_and_decode_shape_check(self):
         import sglang.multimodal_gen.runtime.server_args as server_args_module
 
         cfg = Ideogram4PipelineConfig()
@@ -1100,6 +1121,127 @@ class TestIdeogram4(unittest.TestCase):
             set_global_server_args(prev_args)
 
         self.assertEqual(tuple(decoded.output.shape), (1, 3, 2, 2))
+
+    def test_ideogram_bcg_padded_positive_output_is_cropped(self):
+        import sglang.multimodal_gen.runtime.server_args as server_args_module
+
+        cfg = Ideogram4PipelineConfig()
+        args = _fake_server_args(cfg)
+        device = get_local_torch_device()
+        prev_args = server_args_module._global_server_args
+        try:
+            set_global_server_args(args)
+            transformer = FakeIdeogramTransformer()
+            unconditional_transformer = FakeIdeogramTransformer()
+            stage = Ideogram4DenoisingStage(
+                transformer=transformer,
+                unconditional_transformer=unconditional_transformer,
+                pipeline=_fake_ideogram_pipeline(
+                    transformer, unconditional_transformer
+                ),
+            )
+            batch = Req(
+                sampling_params=Ideogram4SamplingParams(
+                    prompt="11 12",
+                    height=256,
+                    width=512,
+                    preset="V4_TURBO_12",
+                    suppress_logs=True,
+                )
+            )
+            batch.prompt_embeds = [torch.zeros(1, 3, 8, device=device)]
+            batch.extra["ideogram4"] = {
+                "max_text_tokens": 1,
+                "num_image_tokens": 2,
+                "position_ids": torch.zeros(1, 3, 3, dtype=torch.long, device=device),
+                "segment_ids": torch.ones(1, 3, dtype=torch.long, device=device),
+                "indicator": torch.tensor(
+                    [
+                        [
+                            LLM_TOKEN_INDICATOR,
+                            OUTPUT_IMAGE_INDICATOR,
+                            OUTPUT_IMAGE_INDICATOR,
+                        ]
+                    ],
+                    dtype=torch.long,
+                    device=device,
+                ),
+            }
+            ctx = DenoisingContext(
+                scheduler=None,
+                extra_step_kwargs={},
+                target_dtype=torch.float32,
+                autocast_enabled=False,
+                timesteps=torch.tensor([0], device=device),
+                num_inference_steps=1,
+                num_warmup_steps=0,
+                image_kwargs={},
+                pos_cond_kwargs={},
+                neg_cond_kwargs={},
+                latents=torch.zeros(1, 2, 128, device=device),
+                boundary_timestep=None,
+                z=None,
+                reserved_frames_mask=None,
+                seq_len=None,
+                guidance=torch.ones(1, device=device),
+                is_warmup=False,
+                extra={
+                    "ideogram4_schedule_values": torch.tensor(
+                        [1.0, 0.0], device=device
+                    ),
+                    "ideogram4_schedule_deltas": torch.tensor([1.0], device=device),
+                    "ideogram4_guidance_schedule": torch.tensor([1.0], device=device),
+                    "ideogram4_text_z_padding": torch.zeros(1, 1, 128, device=device),
+                    "ideogram4_attn_mask": torch.ones(
+                        1, 3, dtype=torch.bool, device=device
+                    ),
+                    "ideogram4_attn_mask_meta": None,
+                    "ideogram4_neg_position_ids": torch.zeros(
+                        1, 2, 3, dtype=torch.long, device=device
+                    ),
+                    "ideogram4_neg_segment_ids": torch.ones(
+                        1, 2, dtype=torch.long, device=device
+                    ),
+                    "ideogram4_neg_indicator": torch.full(
+                        (1, 2),
+                        OUTPUT_IMAGE_INDICATOR,
+                        dtype=torch.long,
+                        device=device,
+                    ),
+                    "ideogram4_neg_attn_mask": torch.ones(
+                        1, 2, dtype=torch.bool, device=device
+                    ),
+                    "ideogram4_neg_attn_mask_meta": None,
+                    "ideogram4_neg_llm_features": torch.zeros(1, 2, 8, device=device),
+                },
+            )
+            step = DenoisingStepState(
+                step_index=0,
+                t_host=torch.tensor(0),
+                t_device=torch.tensor(0, device=device),
+                t_int=0,
+                current_model=transformer,
+                current_guidance_scale=None,
+                attn_metadata=None,
+            )
+
+            def fake_run(current_model, call_kwargs):
+                if current_model is transformer:
+                    out = torch.zeros(1, 5, 128, device=device)
+                    out[:, 1:3] = 4.0
+                    out[:, 3:] = 99.0
+                    return out
+                return torch.ones(1, 2, 128, device=device)
+
+            with patch.object(stage, "_run_ideogram_transformer", side_effect=fake_run):
+                stage._run_denoising_step(ctx, step, batch, args)
+        finally:
+            set_global_server_args(prev_args)
+
+        self.assertEqual(tuple(ctx.latents.shape), (1, 2, 128))
+        self.assertTrue(
+            torch.allclose(ctx.latents, torch.full((1, 2, 128), 4.0, device=device))
+        )
 
     def test_text_input_builder_matches_official_layout(self):
         prev_args = None
