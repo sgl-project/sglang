@@ -256,6 +256,42 @@ class VLAPrefixEncodingStage(PipelineStage):
 
         return [result for result in results if result is not None]
 
+    def _recv_prefix_result(self, batch: Req, split: Any) -> Req:
+        batch.extra[self.keys.prefix_context] = broadcast_prefix_context(
+            None,
+            split,
+            src=split.prefix_root,
+            device=self.policy_model.device,
+        )
+        batch.extra[self.keys.cache] = split.broadcast_object_from_rank(
+            None,
+            src=split.prefix_root,
+        )
+        timings = split.broadcast_object_from_rank(None, src=split.prefix_root)
+        vla_timings(batch, self.keys).update(timings)
+        return batch
+
+    def _send_prefix_result(
+        self,
+        batch: Req,
+        split: Any,
+        prefix_context: Any,
+    ) -> None:
+        broadcast_prefix_context(
+            prefix_context,
+            split,
+            src=split.prefix_root,
+            device=self.policy_model.device,
+        )
+        split.broadcast_object_from_rank(
+            batch.extra[self.keys.cache],
+            src=split.prefix_root,
+        )
+        split.broadcast_object_from_rank(
+            vla_timings(batch, self.keys),
+            src=split.prefix_root,
+        )
+
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         if batch.is_warmup:
             batch.extra[self.keys.prefix_context] = None
@@ -264,23 +300,7 @@ class VLAPrefixEncodingStage(PipelineStage):
 
         split = get_vla_split_group()
         if split is not None and not split.is_prefix_rank:
-            prefix_context = broadcast_prefix_context(
-                None,
-                split,
-                src=split.prefix_root,
-                device=self.policy_model.device,
-            )
-            batch.extra[self.keys.prefix_context] = prefix_context
-            batch.extra[self.keys.cache] = split.broadcast_object_from_rank(
-                None,
-                src=split.prefix_root,
-            )
-            timings = split.broadcast_object_from_rank(
-                None,
-                src=split.prefix_root,
-            )
-            vla_timings(batch, self.keys).update(timings)
-            return batch
+            return self._recv_prefix_result(batch, split)
 
         observation = batch.extra[self.keys.observation_batch]
         options = vla_options(batch, self.keys)
@@ -306,20 +326,7 @@ class VLAPrefixEncodingStage(PipelineStage):
                 "full_prefix_len": lookup.full_prefix_len,
             }
             if split is not None:
-                broadcast_prefix_context(
-                    lookup.context,
-                    split,
-                    src=split.prefix_root,
-                    device=self.policy_model.device,
-                )
-                split.broadcast_object_from_rank(
-                    batch.extra[self.keys.cache],
-                    src=split.prefix_root,
-                )
-                split.broadcast_object_from_rank(
-                    vla_timings(batch, self.keys),
-                    src=split.prefix_root,
-                )
+                self._send_prefix_result(batch, split, lookup.context)
             return batch
 
         prefix_start = time.perf_counter()
@@ -339,20 +346,7 @@ class VLAPrefixEncodingStage(PipelineStage):
         if cache_enabled and server_args.pipeline_config.enable_global_prefix_cache:
             self.prefix_cache.put(cache_key, prefix_context)
         if split is not None:
-            broadcast_prefix_context(
-                prefix_context,
-                split,
-                src=split.prefix_root,
-                device=self.policy_model.device,
-            )
-            split.broadcast_object_from_rank(
-                batch.extra[self.keys.cache],
-                src=split.prefix_root,
-            )
-            split.broadcast_object_from_rank(
-                vla_timings(batch, self.keys),
-                src=split.prefix_root,
-            )
+            self._send_prefix_result(batch, split, prefix_context)
         if (
             server_args.pipeline_config.empty_cache_after_prefix
             and torch.cuda.is_available()

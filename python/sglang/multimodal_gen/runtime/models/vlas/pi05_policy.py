@@ -6,7 +6,7 @@ import json
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import torch
 from safetensors import safe_open
@@ -621,6 +621,37 @@ class Pi05PolicyModel(nn.Module):
                 return candidate, shard_id
         return None
 
+    @staticmethod
+    def _target_tensor_for_key(
+        target_key: str,
+        target_state: dict[str, torch.Tensor],
+        target_params: dict[str, nn.Parameter],
+    ) -> torch.Tensor:
+        target = target_params.get(target_key)
+        if target is not None:
+            return target
+        return target_state[target_key]
+
+    @staticmethod
+    def _load_tensor_to_target(
+        target: torch.Tensor,
+        tensor: torch.Tensor,
+        shard_id: Any | None,
+    ) -> bool:
+        if tensor.dtype != target.dtype:
+            tensor = tensor.to(dtype=target.dtype)
+        weight_loader = getattr(target, "weight_loader", None)
+        if weight_loader is not None:
+            if shard_id is None:
+                weight_loader(target, tensor)
+            else:
+                weight_loader(target, tensor, shard_id)
+            return True
+        if tuple(target.shape) != tuple(tensor.shape):
+            return False
+        target.copy_(tensor, non_blocking=target.device.type == "cuda")
+        return True
+
     def _should_stream_weights_to_gpu(
         self,
         target_state: dict[str, torch.Tensor],
@@ -644,12 +675,21 @@ class Pi05PolicyModel(nn.Module):
                         continue
                     target_key, _ = target_weight
                     has_weight = True
-                    target = target_params.get(target_key)
-                    if target is None:
-                        target = target_state[target_key]
+                    target = self._target_tensor_for_key(
+                        target_key,
+                        target_state,
+                        target_params,
+                    )
                     if target.device.type != "cuda":
                         return False
         return has_weight
+
+    def _cpu_weights_iterator(self) -> Iterator[tuple[str, torch.Tensor]]:
+        for filename in self.manifest.safetensor_files:
+            with safe_open(filename, framework="pt", device="cpu") as f:
+                for source_key in f.keys():
+                    if self._should_read_source_key(source_key):
+                        yield source_key, f.get_tensor(source_key)
 
     def _load_weights(self) -> None:
         target_state = self.core_model.state_dict()
@@ -677,69 +717,28 @@ class Pi05PolicyModel(nn.Module):
                     key_filter=self._should_read_source_key,
                     clone_streamed_tensors=False,
                 )
-                for source_key, tensor in weights:
-                    target_weight = self._resolve_target_weight(
-                        source_key,
-                        target_state,
-                        target_params,
-                    )
-                    if target_weight is None:
-                        unexpected += 1
-                        continue
-                    target_key, shard_id = target_weight
-                    target = target_params.get(target_key)
-                    if target is None:
-                        target = target_state[target_key]
-                    if tensor.dtype != target.dtype:
-                        tensor = tensor.to(dtype=target.dtype)
-                    weight_loader = getattr(target, "weight_loader", None)
-                    if weight_loader is not None:
-                        if shard_id is None:
-                            weight_loader(target, tensor)
-                        else:
-                            weight_loader(target, tensor, shard_id)
-                    elif tuple(target.shape) == tuple(tensor.shape):
-                        target.copy_(tensor, non_blocking=True)
-                    else:
-                        mismatched += 1
-                        continue
-                    loaded_keys.add(target_key)
             else:
-                for filename in self.manifest.safetensor_files:
-                    with safe_open(filename, framework="pt", device="cpu") as f:
-                        for source_key in f.keys():
-                            if not self._should_read_source_key(source_key):
-                                continue
-                            target_weight = self._resolve_target_weight(
-                                source_key,
-                                target_state,
-                                target_params,
-                            )
-                            if target_weight is None:
-                                unexpected += 1
-                                continue
-                            target_key, shard_id = target_weight
-                            tensor = f.get_tensor(source_key)
-                            target = target_params.get(target_key)
-                            if target is None:
-                                target = target_state[target_key]
-                            if tensor.dtype != target.dtype:
-                                tensor = tensor.to(dtype=target.dtype)
-                            weight_loader = getattr(target, "weight_loader", None)
-                            if weight_loader is not None:
-                                if shard_id is None:
-                                    weight_loader(target, tensor)
-                                else:
-                                    weight_loader(target, tensor, shard_id)
-                            elif tuple(target.shape) == tuple(tensor.shape):
-                                target.copy_(
-                                    tensor,
-                                    non_blocking=target.device.type == "cuda",
-                                )
-                            else:
-                                mismatched += 1
-                                continue
-                            loaded_keys.add(target_key)
+                weights = self._cpu_weights_iterator()
+
+            for source_key, tensor in weights:
+                target_weight = self._resolve_target_weight(
+                    source_key,
+                    target_state,
+                    target_params,
+                )
+                if target_weight is None:
+                    unexpected += 1
+                    continue
+                target_key, shard_id = target_weight
+                target = self._target_tensor_for_key(
+                    target_key,
+                    target_state,
+                    target_params,
+                )
+                if not self._load_tensor_to_target(target, tensor, shard_id):
+                    mismatched += 1
+                    continue
+                loaded_keys.add(target_key)
 
         missing = [key for key in target_state if key not in loaded_keys]
         if missing or unexpected or mismatched:
