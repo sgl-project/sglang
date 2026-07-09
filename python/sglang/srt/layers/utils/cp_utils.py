@@ -15,8 +15,7 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
-from sglang.srt.runtime_context import get_parallel
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_parallel, get_server_args
 
 
 @dataclass
@@ -59,13 +58,13 @@ class ContextParallelMetadata:
 
 
 def is_prefill_context_parallel_enabled():
-    return get_global_server_args().enable_prefill_context_parallel
+    return get_server_args().enable_prefill_context_parallel
 
 
 def is_prefill_cp_in_seq_split():
     return (
         is_prefill_context_parallel_enabled()
-        and get_global_server_args().prefill_cp_mode == "in-seq-split"
+        and get_server_args().prefill_cp_mode == "in-seq-split"
     )
 
 
@@ -85,7 +84,7 @@ def get_cp_padding_align_size() -> int:
 
 
 def is_mla_prefill_cp_enabled() -> bool:
-    sa = get_global_server_args()
+    sa = get_server_args()
     return sa.enable_prefill_context_parallel and sa.use_mla_backend()
 
 

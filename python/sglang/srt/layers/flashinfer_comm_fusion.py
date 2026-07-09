@@ -13,8 +13,7 @@ from sglang.srt.distributed import (
     get_tp_group,
 )
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
-from sglang.srt.runtime_context import get_parallel
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import (
     ceil_align,
     get_cuda_driver_bindings,
@@ -673,7 +672,7 @@ def ensure_workspace_initialized(
     token_num = token_num or max_token_num
     group_key = (device_group, cpu_group)
     effective_dtype = dtype or torch.bfloat16
-    server_args = get_global_server_args()
+    server_args = get_server_args()
     backend = resolve_flashinfer_allreduce_fusion_backend(server_args)
     if backend is None:
         return False
