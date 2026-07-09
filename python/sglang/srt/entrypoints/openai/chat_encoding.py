@@ -1,15 +1,8 @@
-"""Shared chat-encoding dispatch.
+"""Single home for the chat-encoding dispatch.
 
 Which encoder turns chat messages into prompt tokens is a property of the
-model, not of the caller: DeepSeek-V4 (and template-less DeepSeek-V3) use
-Python chat encoders that bypass the HF chat template, everything else renders
-through ``tokenizer.apply_chat_template``. This module owns that dispatch so
-the serving path and offline tools (benchmarks, evals) resolve it identically
-instead of re-deriving it from model architectures themselves.
-
-``encode_simple_chat`` is the minimal encode for offline tools: plain-text
-messages only -- no tools, no multimodal content, no continue_final_message.
-The serving path keeps its full request-level pipeline in ``serving_chat``.
+model, so the serving path and offline tools (benchmarks, evals) must resolve
+it here instead of re-deriving it from model architectures themselves.
 """
 
 from __future__ import annotations
@@ -53,7 +46,9 @@ def encode_simple_chat(
 ) -> List[int]:
     """Encode a plain-text chat conversation into prompt token ids.
 
-    Minimal parity with the serving path for text-only messages: like
+    Minimal encode for offline tools: no tools, no multimodal content, no
+    continue_final_message; the serving path keeps its full request-level
+    pipeline in ``serving_chat``. Like
     ``serving_chat``, an empty system message is prepended when the
     conversation does not start with one (for the dsv4/dsv32 encoders this
     currently renders to zero tokens, but keeping the insertion explicit ties
