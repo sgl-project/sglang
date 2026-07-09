@@ -481,7 +481,12 @@ def extend(reqs, model_runner):
         )
         batch.prefill_input_ids_cpu = None
 
-    forward_batch = ForwardBatch.init_new(batch, model_runner)
+    forward_batch = ForwardBatch.init_new(
+        batch,
+        model_runner,
+        capture_hidden_mode=None,
+        return_hidden_states_before_norm=False,
+    )
     logits_output = model_runner.forward(forward_batch).logits_output
     next_token_ids = model_runner.sample(logits_output, forward_batch)
     return next_token_ids, logits_output.next_token_logits, batch
@@ -492,7 +497,12 @@ def decode(input_token_ids, batch, model_runner):
     batch.input_ids = input_token_ids.to(torch.int64)
     batch.prepare_for_decode()
     _maybe_prepare_mlp_sync_batch(batch, model_runner)
-    forward_batch = ForwardBatch.init_new(batch, model_runner)
+    forward_batch = ForwardBatch.init_new(
+        batch,
+        model_runner,
+        capture_hidden_mode=None,
+        return_hidden_states_before_norm=False,
+    )
     logits_output = model_runner.forward(forward_batch).logits_output
     next_token_ids = model_runner.sample(logits_output, forward_batch)
     return next_token_ids, logits_output.next_token_logits
