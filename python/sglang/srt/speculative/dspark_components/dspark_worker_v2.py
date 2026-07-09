@@ -1053,23 +1053,50 @@ class DSparkWorkerV2(BaseSpecWorker):
             return
 
         device = torch.device(self.device)
+        req_pool_indices = getattr(draft_input, "future_indices", None)
+        if req_pool_indices is None or req_pool_indices.numel() == 0:
+            req_pool_indices = batch.req_pool_indices
+        if int(req_pool_indices.numel()) != bs:
+            raise RuntimeError(
+                "DSpark PD prefill hidden batch size mismatch: "
+                f"hidden_bs={bs}, req_indices={int(req_pool_indices.numel())}, "
+                f"running_bs={int(batch.req_pool_indices.numel())}"
+            )
+        req_pool_indices = req_pool_indices.to(
+            device=device, dtype=torch.long, non_blocking=True
+        )
+
         row = torch.arange(tail_len, device=device).view(1, tail_len)
         tail_start_positions = getattr(
             draft_input, "prefill_tail_start_positions", None
         )
         if tail_start_positions is None or tail_start_positions.numel() == 0:
+            if int(batch.seq_lens.numel()) != bs:
+                raise RuntimeError(
+                    "DSpark PD hidden injection requires explicit start positions "
+                    "when draft input is not aligned with the running batch: "
+                    f"hidden_bs={bs}, running_bs={int(batch.seq_lens.numel())}"
+                )
             valid_counts = tail_mask.sum(dim=1).to(torch.int64)
             start_pos = batch.seq_lens.to(torch.int64).view(-1, 1) - valid_counts.view(
                 -1, 1
             )
         else:
+            if int(tail_start_positions.numel()) != bs:
+                raise RuntimeError(
+                    "DSpark PD hidden start position size mismatch: "
+                    f"start_positions={int(tail_start_positions.numel())}, "
+                    f"hidden_bs={bs}"
+                )
             start_pos = tail_start_positions.to(
                 device=device, dtype=torch.int64, non_blocking=True
             ).view(-1, 1)
         positions_2d = start_pos + row
 
         req_to_token = self.model_runner.req_to_token_pool.req_to_token
-        cache_loc_2d = req_to_token[batch.req_pool_indices, positions_2d.clamp_min(0)]
+        cache_loc_2d = req_to_token[
+            req_pool_indices.view(-1, 1), positions_2d.clamp_min(0)
+        ]
 
         flat_mask = tail_mask.reshape(-1)
         if not bool(flat_mask.any()):
