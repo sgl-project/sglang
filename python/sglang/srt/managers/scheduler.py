@@ -4023,18 +4023,9 @@ class Scheduler(
             return
 
         if self.enable_overlap and self.last_batch:
-            # Process the results of the last batch. The unfinished predicate
-            # below relies on this drain refreshing finish flags exactly once;
-            # see the pause-retract existing-bugs note (B3) before changing
-            # this condition.
             tmp_batch, tmp_result = self.result_queue.popleft()
             self.process_batch_result(tmp_batch, tmp_result)
 
-        # Unfinished requests from the last extend batch fold into the retract
-        # set. Skip them for disagg prefill: completed prefill requests are
-        # already in disagg_prefill_inflight_queue, and retracting them here
-        # would leak them, since the prefill event loop never calls
-        # update_running_batch to clean them up.
         last_fold_in_reqs: List[Req] = []
         if (
             self.last_batch is not None
@@ -4048,12 +4039,6 @@ class Scheduler(
             r for r in self.running_batch.reqs if not r.finished()
         ] + last_fold_in_reqs
 
-        # Replicate the old post-fold coordinator source for strict
-        # equivalence: the batch-level path released through the (often None)
-        # batch-side coordinator of whichever batch object survived the fold
-        # swap, not the scheduler-owned one. Releasing through the
-        # scheduler-owned coordinator may well be the correct behavior, but
-        # that change belongs to a separate op.
         release_hisparse_coordinator = self.running_batch.hisparse_coordinator
         if (
             self.last_batch is not None
