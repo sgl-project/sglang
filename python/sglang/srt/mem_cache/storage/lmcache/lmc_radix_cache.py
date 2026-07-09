@@ -12,11 +12,17 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     EvictResult,
     InitLoadBackParams,
+    InsertParams,
     MatchPrefixParams,
     MatchResult,
 )
+from sglang.srt.mem_cache.memory_pool import (
+    DSATokenToKVPool,
+    MHATokenToKVPool,
+    MLATokenToKVPool,
+)
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.server_args import get_global_server_args
 
 try:
     from lmcache.integration.sglang.multi_process_adapter import LMCacheMPConnector
@@ -40,14 +46,41 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _extract_kv_pools(kvcache) -> list[list[torch.Tensor]]:
+    """Classify a sglang KV pool and return the per-group tensor lists.
+
+    sglang has three per-layer KV layouts we care about:
+
+    * MHA / GQA (``MHATokenToKVPool``): two disjoint per-layer lists
+      → ``[k_buffer, v_buffer]``
+    * MLA (``MLATokenToKVPool``): a single fused per-layer list
+      → ``[kv_buffer]``
+    * DSA (``DSATokenToKVPool``): fused ``kv_buffer`` + an additional
+      per-layer ``index_k_with_scale_buffer`` for sparse attention
+      → ``[kv_buffer, index_k_with_scale_buffer]``
+    """
+    if isinstance(kvcache, DSATokenToKVPool):
+        return [
+            kvcache.kv_buffer,
+            kvcache.index_k_with_scale_buffer,
+        ]
+    if isinstance(kvcache, MLATokenToKVPool):
+        return [kvcache.kv_buffer]
+    if isinstance(kvcache, MHATokenToKVPool):
+        return [kvcache.k_buffer, kvcache.v_buffer]
+
+    raise RuntimeError(
+        f"Unsupported KV pool type {type(kvcache).__name__}"
+    )
+
+
 @dataclass
 class _LMCacheLoadBackMarker:
     """Carries the data ``init_load_back`` needs from the
     ``match_prefix`` call in MP mode.
     """
 
-    key: RadixKey  # detached snapshot of the matched key (the live query key
-    # aliases the req's growing fill_ids and must not be retained)
+    key: RadixKey  # page-aligned key the scheduler matched on
     value_numel: int  # number of tokens already in radix at match time
 
 
@@ -101,33 +134,22 @@ class LMCRadixCache(RadixCache):
     def __init__(
         self,
         params: CacheInitParams,
-        model_config: Optional[ModelConfig] = None,
+        model_config: Optional["ModelConfig"] = None,
         tp_size: int = 1,
         rank: int = 0,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         super().__init__(params)
 
-        cli_lmc_cfg = get_server_args().lmcache_config_file or ""
+        cli_lmc_cfg = get_global_server_args().lmcache_config_file or ""
 
         kvcache = self.token_to_kv_pool_allocator.get_kvcache()
+        kv_cache_pools = _extract_kv_pools(kvcache)
         connector_kwargs = dict(
             sgl_config=model_config,
             tp_size=tp_size,
             rank=rank,
-            # NOTE: The original implementation accessed private buffers via
-            # `_kvcache.k_buffer` / `.v_buffer`. We prefer public accessors when
-            # available; fall back to private fields if needed.
-            k_pool=getattr(
-                kvcache,
-                "k_buffer",
-                getattr(self.token_to_kv_pool_allocator._kvcache, "k_buffer"),
-            ),
-            v_pool=getattr(
-                kvcache,
-                "v_buffer",
-                getattr(self.token_to_kv_pool_allocator._kvcache, "v_buffer"),
-            ),
+            kv_cache_pools=kv_cache_pools,
             tp_group=tp_group.device_group if tp_group is not None else None,
         )
 
@@ -217,17 +239,14 @@ class LMCRadixCache(RadixCache):
         LMCache has tokens beyond radix. Otherwise releases
         the held read locks and returns the radix-only result.
         """
-        token_ids = key.raw_token_ids()
-        matched = self.lmcache_connector.lookup_kv(token_ids, req.rid)
+        matched = self.lmcache_connector.lookup_kv(key.token_ids, req.rid)
         if matched <= value.numel():
             # Release the read locks; keep the pending session for end_session.
             self.lmcache_connector.release_pending(req.rid)
             return base_res
 
-        if token_ids is key.token_ids:
-            token_ids = token_ids[:]
         self._mp_load_back_markers[req.rid] = _LMCacheLoadBackMarker(
-            key=RadixKey(token_ids, key.extra_key, key.is_bigram),
+            key=key,
             value_numel=int(value.numel()),
         )
         return MatchResult(
@@ -258,14 +277,13 @@ class LMCRadixCache(RadixCache):
         if uncached_len == 0:
             return base_res
 
-        token_ids = key.raw_token_ids()
         result = self._load_back(
             key=key,
             value_numel=int(value.numel()),
             uncached_len=uncached_len,
             last_node=last_node,
             load_fn=lambda sm, pp: self._ip_load_back(
-                token_ids=token_ids,
+                token_ids=key.token_ids,
                 value_numel=int(value.numel()),
                 slot_mapping=sm,
                 prefix_pad=pp,
@@ -363,19 +381,28 @@ class LMCRadixCache(RadixCache):
 
         if num_retrieved > 0:
             fetched = num_retrieved - prefix_pad
-            new_node = TreeNode(priority=last_node.priority)
             start = value_numel
             end = start + fetched
-            new_node.key = key[start:end]
-            new_node.value = token_slots[:fetched]
-            new_node.parent = last_node
-            last_node.children[new_node.key.child_key(self.page_size)] = new_node
-            self.evictable_size_ += fetched
-            self._update_leaf_status(last_node)
-            self._update_leaf_status(new_node)
 
-            self._record_store_event(new_node.parent)
-            self._record_store_event(new_node)
+            # Use insert() instead of manually attaching a TreeNode so that
+            # evictable_size_, _update_leaf_status, and _record_store_event are
+            # all handled through a single consistent code path.  This prevents
+            # pool <-> tree accounting drift (e.g. double-counting the LMCache-
+            # loaded tokens in evictable_size_ when cache_finished_req later
+            # re-inserts the same key span via the base class).
+            insert_key = key[start:end]
+            insert_value = token_slots[:fetched]
+            self.insert(
+                InsertParams(
+                    key=insert_key,
+                    value=insert_value,
+                    priority=last_node.priority,
+                )
+            )
+            # Locate the just-inserted (or already-existing) tree node so the
+            # caller can use it as req.last_node for lock-ref tracking.
+            match_res = super().match_prefix(MatchPrefixParams(key=insert_key))
+            new_node = match_res.last_device_node
 
             return token_slots[:fetched], new_node
 
@@ -438,7 +465,7 @@ class LMCRadixCache(RadixCache):
                 self.lmcache_connector.end_session(req.rid)
             return
 
-        global_server_args = get_server_args()
+        global_server_args = get_global_server_args()
         topk = global_server_args.speculative_eagle_topk
         enable_kv_committed_len = topk is None or topk == 1
         if enable_kv_committed_len:
@@ -501,3 +528,4 @@ class LMCRadixCache(RadixCache):
             )
         except Exception:  # pragma: no cover
             pass
+
