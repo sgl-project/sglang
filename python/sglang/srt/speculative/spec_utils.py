@@ -95,6 +95,18 @@ def renorm_draft_probs(
     return torch.softmax(next_token_logits / sampling_info.temperatures, dim=-1)
 
 
+def sample_draft_proposal(next_token_logits: torch.Tensor, temperatures: torch.Tensor):
+    """Leviathan draft proposal: q = softmax(logits / T), X ~ q.
+
+    Returns (q, q(X), X). The verify's accept test coin*q(X) < p(X) is unbiased
+    only if q is exactly the distribution X was drawn from, so callers must hand
+    the returned q (not a recomputed one) to the verify.
+    """
+    probs = torch.softmax(next_token_logits / temperatures, dim=-1)
+    topk_p, topk_index = fast_sample(probs, num_samples=1)
+    return probs, topk_p, topk_index
+
+
 # Simulate acceptance length for benchmarking purposes
 SIMULATE_ACC_LEN = envs.SGLANG_SIMULATE_ACC_LEN.get()  # turn off if < 0
 SIMULATE_ACC_METHOD = envs.SGLANG_SIMULATE_ACC_METHOD.get()
