@@ -1517,12 +1517,5 @@
         "can_rerun_stage": true,
         "cooldown_interval_minutes": 0,
         "reason": "custom override"
-    },
-    "pllimax": {
-        "can_tag_run_ci_label": true,
-        "can_rerun_failed_ci": true,
-        "can_rerun_stage": true,
-        "cooldown_interval_minutes": 0,
-        "reason": "custom override"
     }
 }
