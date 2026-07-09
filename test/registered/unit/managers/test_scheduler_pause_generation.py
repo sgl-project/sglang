@@ -1,15 +1,22 @@
 import unittest
 from collections import deque
-from unittest.mock import MagicMock, patch
+from typing import List, Optional
+from unittest.mock import MagicMock
+
+import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.io_struct import PauseGenerationReqInput
+from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.pool_stats_observer import PoolStats
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.sampling.sampling_params import SamplingParams
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 register_cpu_ci(est_time=9, suite="base-c-test-cpu")
@@ -43,11 +50,63 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
                 full_evictable_size=0,
             )
         )
+        scheduler.disaggregation_mode = DisaggregationMode.NULL
+        scheduler.hisparse_coordinator = None
+        scheduler.server_args = MagicMock()
+        scheduler.waiting_queue = []
         # pause_generation zeros gen_throughput and flushes KV events.
         scheduler.metrics_reporter = MagicMock()
         scheduler.metrics_reporter.current_scheduler_metrics_enabled = False
         scheduler.kv_events_publisher = MagicMock()
         return scheduler
+
+    def _make_req(self, rid: str, finished: bool = False) -> Req:
+        req = Req(
+            rid=rid,
+            origin_input_text="",
+            origin_input_ids=[1, 2, 3],
+            sampling_params=SamplingParams(),
+        )
+        if finished:
+            req.finished_reason = MagicMock()
+        return req
+
+    def _make_batch(
+        self,
+        scheduler: Scheduler,
+        reqs: List[Req],
+        forward_mode: Optional[ForwardMode] = None,
+        with_tensors: bool = False,
+    ) -> ScheduleBatch:
+        batch = ScheduleBatch(reqs=reqs)
+        batch.device = "cpu"
+        batch.forward_mode = forward_mode
+        batch.req_to_token_pool = scheduler.req_to_token_pool
+        batch.token_to_kv_pool_allocator = scheduler.token_to_kv_pool_allocator
+        batch.tree_cache = scheduler.tree_cache
+        batch.hisparse_coordinator = None
+        batch.model_config = MagicMock(is_encoder_decoder=False)
+        batch.sampling_info = MagicMock()
+        batch.spec_info = None
+        batch.multimodal_inputs = None
+        if with_tensors:
+            batch_size = len(reqs)
+            batch.req_pool_indices = torch.arange(batch_size, dtype=torch.int64)
+            batch.req_pool_indices_cpu = torch.arange(batch_size, dtype=torch.int64)
+            batch.seq_lens = torch.full((batch_size,), 4, dtype=torch.int64)
+            batch.orig_seq_lens = torch.full((batch_size,), 4, dtype=torch.int32)
+            batch.seq_lens_cpu = torch.full((batch_size,), 4, dtype=torch.int64)
+            batch.input_ids = None
+        return batch
+
+    def _spy_requeue(self, scheduler: Scheduler) -> List[dict]:
+        requeue_log: List[dict] = []
+
+        def record(req):
+            requeue_log.append({"req": req, "is_retracted": req.is_retracted})
+
+        scheduler._add_request_to_queue = MagicMock(side_effect=record)
+        return requeue_log
 
     def test_inplace_only_sets_flag(self):
         """in_place pause should only set _engine_paused and return."""
@@ -119,39 +178,201 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
         self.assertIsNone(scheduler.last_batch)
         self.assertIsNone(scheduler.cur_batch_for_debug)
 
-    def test_retract_clears_running_batch(self):
-        """retract mode should retract all requests from running_batch."""
+    def test_retract_requeues_running_then_last_fold_in(self):
+        """retract requeues running reqs first, then last extend reqs, all released."""
         scheduler = self._new_scheduler()
-        scheduler.last_batch = None
-        scheduler.running_batch.reqs = [MagicMock(), MagicMock()]
-        scheduler.running_batch.__len__ = lambda self: len(self.reqs)
-        scheduler.running_batch.is_empty.return_value = False
-        scheduler.waiting_queue = []
-        scheduler._add_request_to_queue = MagicMock()
-
-        retracted = [MagicMock(), MagicMock()]
-        scheduler.running_batch.filter_batch = MagicMock()
-        scheduler.server_args = MagicMock()
-
-        with patch(
-            "sglang.srt.managers.scheduler.retract_all", return_value=retracted
-        ) as mock_retract_all:
-            scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
-
-        self.assertTrue(scheduler._engine_paused)
-        mock_retract_all.assert_called_once()
-        self.assertEqual(scheduler.running_batch.reqs, [])
-        self.assertEqual(scheduler._add_request_to_queue.call_count, 2)
-        self.assertEqual(
-            [call.args[0] for call in scheduler._add_request_to_queue.call_args_list],
-            retracted,
+        run_req_a = self._make_req("run-a")
+        run_req_b = self._make_req("run-b")
+        last_req = self._make_req("last")
+        scheduler.running_batch = self._make_batch(
+            scheduler, reqs=[run_req_a, run_req_b], with_tensors=True
         )
+        scheduler.running_batch.batch_is_full = True
+        scheduler.last_batch = self._make_batch(
+            scheduler,
+            reqs=[last_req],
+            forward_mode=ForwardMode.EXTEND,
+            with_tensors=True,
+        )
+        scheduler.chunked_req = MagicMock()
+        requeue_log = self._spy_requeue(scheduler)
+
+        scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
+
+        self.assertEqual(
+            [entry["req"] for entry in requeue_log], [run_req_a, run_req_b, last_req]
+        )
+        self.assertTrue(all(entry["is_retracted"] for entry in requeue_log))
+        self.assertEqual(
+            [req.retraction_count for req in (run_req_a, run_req_b, last_req)],
+            [1, 1, 1],
+        )
+        self.assertEqual(scheduler.running_batch.reqs, [])
+        self.assertFalse(scheduler.running_batch.batch_is_full)
         self.assertIsNone(scheduler.chunked_req)
+        self.assertIsNone(scheduler.last_batch)
+
+    def test_retract_with_empty_running_uses_last_batch_reqs(self):
+        """retract with empty running batch releases and requeues the last extend reqs."""
+        scheduler = self._new_scheduler()
+        last_req = self._make_req("last")
+        scheduler.running_batch = ScheduleBatch(reqs=[], batch_is_full=True)
+        scheduler.last_batch = self._make_batch(
+            scheduler,
+            reqs=[last_req],
+            forward_mode=ForwardMode.EXTEND,
+            with_tensors=True,
+        )
+        scheduler.chunked_req = MagicMock()
+        requeue_log = self._spy_requeue(scheduler)
+
+        scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
+
+        self.assertEqual([entry["req"] for entry in requeue_log], [last_req])
+        self.assertTrue(requeue_log[0]["is_retracted"])
+        self.assertEqual(last_req.retraction_count, 1)
+        self.assertEqual(scheduler.running_batch.reqs, [])
+        self.assertFalse(scheduler.running_batch.batch_is_full)
+        self.assertIsNone(scheduler.chunked_req)
+
+    def test_retract_disagg_prefill_excludes_last_batch(self):
+        """retract under disagg prefill must not release or requeue last extend reqs."""
+        scheduler = self._new_scheduler()
+        scheduler.disaggregation_mode = DisaggregationMode.PREFILL
+        run_req = self._make_req("run")
+        last_req = self._make_req("last")
+        scheduler.running_batch = self._make_batch(
+            scheduler, reqs=[run_req], with_tensors=True
+        )
+        scheduler.last_batch = self._make_batch(
+            scheduler,
+            reqs=[last_req],
+            forward_mode=ForwardMode.EXTEND,
+            with_tensors=True,
+        )
+        requeue_log = self._spy_requeue(scheduler)
+
+        scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
+
+        self.assertEqual([entry["req"] for entry in requeue_log], [run_req])
+        self.assertEqual(run_req.retraction_count, 1)
+        self.assertEqual(last_req.retraction_count, 0)
+        self.assertFalse(last_req.is_retracted)
+
+    def test_retract_decode_last_batch_only_retracts_running(self):
+        """retract with a decode last batch only releases and requeues running reqs."""
+        scheduler = self._new_scheduler()
+        run_req = self._make_req("run")
+        running = self._make_batch(
+            scheduler,
+            reqs=[run_req],
+            forward_mode=ForwardMode.DECODE,
+            with_tensors=True,
+        )
+        scheduler.running_batch = running
+        scheduler.last_batch = running
+        requeue_log = self._spy_requeue(scheduler)
+
+        scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
+
+        self.assertEqual([entry["req"] for entry in requeue_log], [run_req])
+        self.assertEqual(run_req.retraction_count, 1)
+        self.assertEqual(scheduler.running_batch.reqs, [])
+
+    def test_retract_partial_finished_running_batch(self):
+        """retract with mixed finished/unfinished reqs only releases the unfinished ones."""
+        scheduler = self._new_scheduler()
+        req_unfinished_a = self._make_req("unfinished-a")
+        req_finished = self._make_req("finished", finished=True)
+        req_unfinished_b = self._make_req("unfinished-b")
+        scheduler.running_batch = self._make_batch(
+            scheduler,
+            reqs=[req_unfinished_a, req_finished, req_unfinished_b],
+            with_tensors=True,
+        )
+        requeue_log = self._spy_requeue(scheduler)
+
+        scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
+
+        self.assertEqual(
+            [entry["req"] for entry in requeue_log],
+            [req_unfinished_a, req_unfinished_b],
+        )
+        self.assertEqual(req_unfinished_a.retraction_count, 1)
+        self.assertEqual(req_unfinished_b.retraction_count, 1)
+        self.assertEqual(req_finished.retraction_count, 0)
+        self.assertFalse(req_finished.is_retracted)
+        self.assertEqual(scheduler.running_batch.reqs, [])
+
+    def test_retract_empty_post_fold_keeps_chunked_req(self):
+        """retract with nothing to retract leaves chunked_req and batch_is_full alone."""
+        # Suspected bug kept for equivalence (B2): when the post-fold running
+        # batch is empty, chunked_req is not cleared and batch_is_full is not
+        # reset. See the pause-retract existing-bugs note.
+        scheduler = self._new_scheduler()
+        scheduler.running_batch = ScheduleBatch(reqs=[], batch_is_full=True)
+        chunked_req = MagicMock()
+        scheduler.chunked_req = chunked_req
+        requeue_log = self._spy_requeue(scheduler)
+
+        scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
+
+        self.assertEqual(requeue_log, [])
+        self.assertIs(scheduler.chunked_req, chunked_req)
+        self.assertTrue(scheduler.running_batch.batch_is_full)
+
+    def test_retract_all_finished_clears_fields_without_requeue(self):
+        """retract with only finished reqs clears fields but releases nothing."""
+        scheduler = self._new_scheduler()
+        req_finished_a = self._make_req("finished-a", finished=True)
+        req_finished_b = self._make_req("finished-b", finished=True)
+        scheduler.running_batch = self._make_batch(
+            scheduler, reqs=[req_finished_a, req_finished_b]
+        )
+        scheduler.running_batch.batch_is_full = True
+        scheduler.chunked_req = MagicMock()
+        requeue_log = self._spy_requeue(scheduler)
+
+        scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
+
+        self.assertEqual(requeue_log, [])
+        self.assertEqual(req_finished_a.retraction_count, 0)
+        self.assertEqual(req_finished_b.retraction_count, 0)
+        self.assertEqual(scheduler.running_batch.reqs, [])
+        self.assertFalse(scheduler.running_batch.batch_is_full)
+        self.assertIsNone(scheduler.chunked_req)
+
+    def test_retract_drain_happens_once_before_release(self):
+        """retract with overlap drains the result_queue once before releasing reqs."""
+        scheduler = self._new_scheduler()
+        scheduler.enable_overlap = True
+        last_req = self._make_req("last")
+        scheduler.running_batch = ScheduleBatch(reqs=[])
+        scheduler.last_batch = self._make_batch(
+            scheduler,
+            reqs=[last_req],
+            forward_mode=ForwardMode.EXTEND,
+            with_tensors=True,
+        )
+        scheduler.result_queue = deque([(MagicMock(), MagicMock())])
+        event_log: List[str] = []
+        scheduler.process_batch_result = MagicMock(
+            side_effect=lambda *args, **kwargs: event_log.append("drain")
+        )
+        scheduler._add_request_to_queue = MagicMock(
+            side_effect=lambda req: event_log.append(
+                "requeue-released" if req.is_retracted else "requeue-unreleased"
+            )
+        )
+
+        scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
+
+        self.assertEqual(event_log, ["drain", "requeue-released"])
+        self.assertEqual(len(scheduler.result_queue), 0)
 
     def test_retract_empty_running_batch_requeues_nothing(self):
         """retract with empty running_batch must not release or requeue any request."""
         scheduler = self._new_scheduler()
-        scheduler.waiting_queue = []
         original_reqs = scheduler.running_batch.reqs
 
         scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
