@@ -320,12 +320,16 @@ class DFlashDraftInputV2(SpecInput):
 
         if self.future_indices is not None:
             assert spec_info.future_indices is not None
+            lhs_bs = int(self.future_indices.numel())
+            rhs_bs = int(spec_info.future_indices.numel())
             self.future_indices = torch.cat(
                 [self.future_indices, spec_info.future_indices]
             )
-            self._merge_prefill_tail(spec_info)
+            self._merge_prefill_tail(spec_info, lhs_bs=lhs_bs, rhs_bs=rhs_bs)
             return
 
+        lhs_bs = int(self.new_seq_lens.numel())
+        rhs_bs = int(spec_info.new_seq_lens.numel())
         self.topk_p = torch.cat([self.topk_p, spec_info.topk_p], dim=0)
         self.topk_index = torch.cat([self.topk_index, spec_info.topk_index], dim=0)
         self.bonus_tokens = torch.cat(
@@ -337,96 +341,118 @@ class DFlashDraftInputV2(SpecInput):
         self.hidden_states = torch.cat(
             [self.hidden_states, spec_info.hidden_states], dim=0
         )
-        self._merge_prefill_tail(spec_info)
+        self._merge_prefill_tail(spec_info, lhs_bs=lhs_bs, rhs_bs=rhs_bs)
 
-    def _merge_prefill_tail(self, spec_info: "DFlashDraftInputV2") -> None:
-        def _pad_tail_hidden(
-            hidden: Optional[torch.Tensor], target_len: int
-        ) -> Optional[torch.Tensor]:
-            if hidden is None or hidden.numel() == 0 or hidden.shape[1] == target_len:
-                return hidden
-            padded = hidden.new_zeros((hidden.shape[0], target_len, hidden.shape[2]))
-            padded[:, : hidden.shape[1]].copy_(hidden)
-            return padded
-
-        def _pad_tail_mask(
-            mask: Optional[torch.Tensor], target_len: int
-        ) -> Optional[torch.Tensor]:
-            if mask is None or mask.numel() == 0 or mask.shape[1] == target_len:
-                return mask
-            padded = mask.new_zeros((mask.shape[0], target_len))
-            padded[:, : mask.shape[1]].copy_(mask)
-            return padded
-
-        lhs_len = (
-            0
-            if self.prefill_tail_valid_mask is None
-            else int(self.prefill_tail_valid_mask.shape[1])
-        )
-        rhs_len = (
-            0
-            if spec_info.prefill_tail_valid_mask is None
-            else int(spec_info.prefill_tail_valid_mask.shape[1])
-        )
-        merged_len = max(lhs_len, rhs_len)
-        if merged_len > 0:
-            self.prefill_tail_hidden_states = _pad_tail_hidden(
-                self.prefill_tail_hidden_states, merged_len
-            )
-            spec_info.prefill_tail_hidden_states = _pad_tail_hidden(
-                spec_info.prefill_tail_hidden_states, merged_len
-            )
-            self.prefill_tail_valid_mask = _pad_tail_mask(
-                self.prefill_tail_valid_mask, merged_len
-            )
-            spec_info.prefill_tail_valid_mask = _pad_tail_mask(
-                spec_info.prefill_tail_valid_mask, merged_len
-            )
-
-        if (
-            self.prefill_tail_hidden_states is None
-            or self.prefill_tail_hidden_states.numel() == 0
-        ):
-            self.prefill_tail_hidden_states = spec_info.prefill_tail_hidden_states
-        elif (
-            spec_info.prefill_tail_hidden_states is not None
-            and spec_info.prefill_tail_hidden_states.numel() > 0
-        ):
-            self.prefill_tail_hidden_states = torch.cat(
-                [self.prefill_tail_hidden_states, spec_info.prefill_tail_hidden_states],
-                dim=0,
-            )
-
-        if (
-            self.prefill_tail_valid_mask is None
-            or self.prefill_tail_valid_mask.numel() == 0
-        ):
-            self.prefill_tail_valid_mask = spec_info.prefill_tail_valid_mask
-        elif (
-            spec_info.prefill_tail_valid_mask is not None
-            and spec_info.prefill_tail_valid_mask.numel() > 0
-        ):
-            self.prefill_tail_valid_mask = torch.cat(
-                [self.prefill_tail_valid_mask, spec_info.prefill_tail_valid_mask],
-                dim=0,
-            )
+    def _merge_prefill_tail(
+        self, spec_info: "DFlashDraftInputV2", *, lhs_bs: int, rhs_bs: int
+    ) -> None:
         self.prefill_tail_hidden_projected = (
             self.prefill_tail_hidden_projected
             and spec_info.prefill_tail_hidden_projected
         )
-        if (
-            self.prefill_tail_start_positions is None
-            or self.prefill_tail_start_positions.numel() == 0
-        ):
-            self.prefill_tail_start_positions = spec_info.prefill_tail_start_positions
-        elif (
-            spec_info.prefill_tail_start_positions is not None
-            and spec_info.prefill_tail_start_positions.numel() > 0
-        ):
-            self.prefill_tail_start_positions = torch.cat(
-                [
-                    self.prefill_tail_start_positions,
-                    spec_info.prefill_tail_start_positions,
-                ],
-                dim=0,
-            )
+
+        lhs_hidden = self.prefill_tail_hidden_states
+        rhs_hidden = spec_info.prefill_tail_hidden_states
+        lhs_mask = self.prefill_tail_valid_mask
+        rhs_mask = spec_info.prefill_tail_valid_mask
+        lhs_has_tail = (
+            lhs_hidden is not None
+            and lhs_mask is not None
+            and lhs_hidden.numel() > 0
+            and lhs_mask.numel() > 0
+        )
+        rhs_has_tail = (
+            rhs_hidden is not None
+            and rhs_mask is not None
+            and rhs_hidden.numel() > 0
+            and rhs_mask.numel() > 0
+        )
+        if not lhs_has_tail and not rhs_has_tail:
+            self.prefill_tail_hidden_states = None
+            self.prefill_tail_valid_mask = None
+            self.prefill_tail_start_positions = None
+            return
+
+        ref_hidden = lhs_hidden if lhs_has_tail else rhs_hidden
+        ref_device = ref_hidden.device
+        hidden_size = int(ref_hidden.shape[-1])
+        lhs_len = int(lhs_mask.shape[1]) if lhs_has_tail else 0
+        rhs_len = int(rhs_mask.shape[1]) if rhs_has_tail else 0
+        merged_len = max(lhs_len, rhs_len)
+
+        def _normalize_tail(
+            *,
+            hidden: Optional[torch.Tensor],
+            mask: Optional[torch.Tensor],
+            start_positions: Optional[torch.Tensor],
+            batch_size: int,
+            has_tail: bool,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            if not has_tail:
+                return (
+                    ref_hidden.new_zeros((batch_size, merged_len, hidden_size)),
+                    torch.zeros(
+                        (batch_size, merged_len), dtype=torch.bool, device=ref_device
+                    ),
+                    torch.zeros((batch_size,), dtype=torch.int64, device=ref_device),
+                )
+
+            if int(hidden.shape[0]) != batch_size or int(mask.shape[0]) != batch_size:
+                raise RuntimeError(
+                    "DFLASH/DSpark prefill tail merge batch size mismatch: "
+                    f"hidden={int(hidden.shape[0])}, mask={int(mask.shape[0])}, "
+                    f"expected={batch_size}"
+                )
+            if int(hidden.shape[-1]) != hidden_size:
+                raise RuntimeError(
+                    "DFLASH/DSpark prefill tail hidden size mismatch: "
+                    f"hidden={int(hidden.shape[-1])}, expected={hidden_size}"
+                )
+
+            if int(hidden.shape[1]) == merged_len:
+                normalized_hidden = hidden
+            else:
+                normalized_hidden = hidden.new_zeros(
+                    (batch_size, merged_len, hidden_size)
+                )
+                normalized_hidden[:, : hidden.shape[1]].copy_(hidden)
+
+            if int(mask.shape[1]) == merged_len:
+                normalized_mask = mask
+            else:
+                normalized_mask = mask.new_zeros((batch_size, merged_len))
+                normalized_mask[:, : mask.shape[1]].copy_(mask)
+
+            if start_positions is None or start_positions.numel() == 0:
+                normalized_start = torch.zeros(
+                    (batch_size,), dtype=torch.int64, device=ref_device
+                )
+            else:
+                if int(start_positions.numel()) != batch_size:
+                    raise RuntimeError(
+                        "DFLASH/DSpark prefill tail start position size mismatch: "
+                        f"start_positions={int(start_positions.numel())}, "
+                        f"expected={batch_size}"
+                    )
+                normalized_start = start_positions.to(
+                    device=ref_device, dtype=torch.int64, non_blocking=True
+                )
+            return normalized_hidden, normalized_mask, normalized_start
+
+        lhs_hidden, lhs_mask, lhs_start = _normalize_tail(
+            hidden=lhs_hidden,
+            mask=lhs_mask,
+            start_positions=self.prefill_tail_start_positions,
+            batch_size=lhs_bs,
+            has_tail=lhs_has_tail,
+        )
+        rhs_hidden, rhs_mask, rhs_start = _normalize_tail(
+            hidden=rhs_hidden,
+            mask=rhs_mask,
+            start_positions=spec_info.prefill_tail_start_positions,
+            batch_size=rhs_bs,
+            has_tail=rhs_has_tail,
+        )
+        self.prefill_tail_hidden_states = torch.cat([lhs_hidden, rhs_hidden], dim=0)
+        self.prefill_tail_valid_mask = torch.cat([lhs_mask, rhs_mask], dim=0)
+        self.prefill_tail_start_positions = torch.cat([lhs_start, rhs_start], dim=0)
