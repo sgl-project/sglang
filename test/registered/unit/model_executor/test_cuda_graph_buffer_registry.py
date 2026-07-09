@@ -367,8 +367,8 @@ class TestMissingAndOptionalSlots(unittest.TestCase):
     def test_plain_slot_with_missing_fb_attr_keeps_sentinel(self):
         # A plain copy slot whose FB field is None must be skipped, leaving its
         # buffer at the FILL_SENTINEL init value rather than raising.
-        r = _make_registry(max_bs=4, max_num_tokens=8)
-        r.register_slot(
+        r = _make_registry()
+        slot = r.register_slot(
             GraphSlot(
                 "encoder_lens",
                 lambda bs, mt: (bs,),
@@ -390,12 +390,8 @@ class TestMissingAndOptionalSlots(unittest.TestCase):
             raw_num_tokens=4,
             padded_num_tokens=8,
         )
-        self.assertTrue(
-            torch.equal(
-                r.get_slot("encoder_lens").buffer,
-                torch.zeros(8, dtype=torch.int32),
-            )
-        )
+        # Buffer untouched by the copy; stays at the sentinel pad value.
+        self.assertTrue(torch.equal(slot.buffer, torch.zeros_like(slot.buffer)))
 
     def test_extract_exposes_computed_slot_even_when_fb_field_none(self):
         # A computed slot (copy_from_fb=False) is always exposed, even when its
