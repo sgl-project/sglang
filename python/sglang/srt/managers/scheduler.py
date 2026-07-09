@@ -4027,45 +4027,47 @@ class Scheduler(
             return
 
         if self.enable_overlap and self.last_batch:
-            # Process the results of the last batch
+            # Process the results of the last batch. The unfinished predicate
+            # below relies on this drain refreshing finish flags exactly once;
+            # see the pause-retract existing-bugs note (B3) before changing
+            # this condition.
             tmp_batch, tmp_result = self.result_queue.popleft()
             self.process_batch_result(tmp_batch, tmp_result)
 
-        if self.last_batch and self.last_batch.forward_mode.is_extend():
-            chunked_req_to_exclude = set()
-            self.last_batch.filter_batch(
-                chunked_req_to_exclude=list(chunked_req_to_exclude)
-            )
-            # Skip merge for disagg prefill: completed prefill requests are
-            # already in disagg_prefill_inflight_queue. Merging them into
-            # running_batch leaks them, since the prefill event loop never
-            # calls update_running_batch to clean them up.
-            if (
-                not self.last_batch.is_empty()
-                and self.disaggregation_mode != DisaggregationMode.PREFILL
-            ):
-                if self.running_batch.is_empty():
-                    self.running_batch = self.last_batch
-                else:
-                    self.running_batch.merge_batch(self.last_batch)
+        # Unfinished requests from the last extend batch fold into the retract
+        # set. Skip them for disagg prefill: completed prefill requests are
+        # already in disagg_prefill_inflight_queue, and retracting them here
+        # would leak them, since the prefill event loop never calls
+        # update_running_batch to clean them up.
+        last_fold_in_reqs: List[Req] = []
+        if (
+            self.last_batch is not None
+            and self.last_batch.forward_mode.is_extend()
+            and self.disaggregation_mode != DisaggregationMode.PREFILL
+        ):
+            last_fold_in_reqs = [r for r in self.last_batch.reqs if not r.finished()]
+
+        post_fold_nonempty = (len(self.running_batch.reqs) + len(last_fold_in_reqs)) > 0
+        retract_reqs = [
+            r for r in self.running_batch.reqs if not r.finished()
+        ] + last_fold_in_reqs
 
         self.last_batch = None
         self.cur_batch_for_debug = None
 
-        if not self.running_batch.is_empty():
-            self.running_batch.filter_batch()
-            if len(self.running_batch.reqs) != 0:
-                retracted_reqs = retract_all(
-                    reqs=self.running_batch.reqs,
+        if post_fold_nonempty:
+            if len(retract_reqs) != 0:
+                retract_all(
+                    reqs=retract_reqs,
                     server_args=self.server_args,
-                    req_to_token_pool=self.running_batch.req_to_token_pool,
-                    token_to_kv_pool_allocator=self.running_batch.token_to_kv_pool_allocator,
-                    tree_cache=self.running_batch.tree_cache,
-                    hisparse_coordinator=self.running_batch.hisparse_coordinator,
+                    req_to_token_pool=self.req_to_token_pool,
+                    token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                    tree_cache=self.tree_cache,
+                    hisparse_coordinator=self.hisparse_coordinator,
                 )
-                self.running_batch.reqs = []
-                for req in retracted_reqs:
-                    self._add_request_to_queue(req)
+            self.running_batch.reqs = []
+            for req in retract_reqs:
+                self._add_request_to_queue(req)
 
             self.running_batch.batch_is_full = False
             self.chunked_req = None
