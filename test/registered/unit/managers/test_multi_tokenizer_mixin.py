@@ -11,9 +11,10 @@ from sglang.srt.managers.multi_tokenizer_mixin import _handle_output_by_index
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
-def _make_batch_str_output() -> BatchStrOutput:
+def _make_batch_str_output(customized_info=None) -> BatchStrOutput:
     return BatchStrOutput(
         rids=["rid-0", "rid-1"],
+        customized_info=customized_info,
         spec_verify_ct=[0, 0],
         spec_num_correct_drafts=[0, 0],
         spec_correct_drafts_histogram=[[], []],
@@ -61,6 +62,18 @@ class TestMultiTokenizerMixin(unittest.TestCase):
         self.assertEqual(
             single_output.cached_tokens_details,
             [{"device": 1, "host": 3}],
+        )
+
+    def test_batch_str_output_keeps_customized_info_rows(self):
+        output = _make_batch_str_output(
+            customized_info={"probe": [[100], [200, 201]], "short": [[300]]}
+        )
+
+        single_output = _handle_output_by_index(output, 1)
+
+        self.assertEqual(
+            single_output.customized_info,
+            {"probe": [[200, 201]], "short": [None]},
         )
 
 

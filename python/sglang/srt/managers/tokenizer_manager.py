@@ -1870,7 +1870,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     ):
         recv_obj.time_stats = unwrap_from_pickle(recv_obj.time_stats)
         if isinstance(recv_obj, (BatchStrOutput, BatchTokenIDOutput)):
-            customized_info = unwrap_from_pickle(recv_obj.customized_info)
+            customized_info = recv_obj.customized_info
         else:
             customized_info = None
         pending_notify: dict[str, ReqState] = {}

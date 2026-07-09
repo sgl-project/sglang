@@ -562,9 +562,7 @@ class _GenerationStreamAccumulator:
             output_hidden_states=self.output_hidden_states,
             routed_experts=self.routed_experts,
             indexer_topk=self.indexer_topk,
-            customized_info=(
-                wrap_as_pickle(self.customized_info) if self.customized_info else None
-            ),
+            customized_info=self.customized_info or None,
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
             retraction_counts=self.retraction_counts,

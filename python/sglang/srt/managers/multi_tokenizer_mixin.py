@@ -124,22 +124,19 @@ def _extract_field_by_index(
     if field is None:
         return None
 
-    should_wrap_result = field_name in ("customized_info", "time_stats")
+    should_wrap_result = field_name == "time_stats"
     if should_wrap_result:
         field = unwrap_from_pickle(field)
         if field is None:
             return None
 
     if isinstance(field, dict):
+        # customized_info: keep one row per request so the single-request
+        # output still maps each key to a list of per-token value lists.
         new_field = {}
         for k, v in field.items():
-            if len(v) > index:
-                new_field[k] = [v[index]] if should_wrap_result else v[index]
-            else:
-                new_field[k] = [None] if should_wrap_result else None
-        if should_wrap_result:
-            return wrap_as_pickle(new_field) if new_field else None
-        return new_field
+            new_field[k] = [v[index]] if len(v) > index else [None]
+        return new_field if new_field else None
 
     if check_length:
         if len(field) <= index:
