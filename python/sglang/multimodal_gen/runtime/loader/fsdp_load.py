@@ -47,8 +47,18 @@ from sglang.srt.model_loader.loader import device_loading_context
 from sglang.srt.utils import is_npu
 
 _is_npu = is_npu()
+_QUANT_WEIGHTS_PROCESSED_ATTR = "_sglang_quant_weights_processed_after_loading"
 
 logger = init_logger(__name__)
+
+
+def _defer_quant_postprocess_until_after_model_post_load(quant_method) -> bool:
+    # ModelOpt NVFP4 repacks weights for the runtime kernel. Running it before
+    # model.post_load_weights() leaves Ideogram-4 NVFP4 on the slow path, while
+    # running it both before and after post_load_weights() corrupts the packed
+    # weights.
+    return type(quant_method).__name__ == "ModelOptFp4LinearMethod"
+
 
 _QUANTIZED_DTYPES = (
     torch.uint8,
@@ -318,16 +328,21 @@ def maybe_load_fsdp_model(
         # move to device to perform postprocessing
         model.to(weight_postprocess_device)
 
+    local_torch_device = get_local_torch_device()
     for _, module in model.named_modules():
         quant_method = getattr(module, "quant_method", None)
         if quant_method is not None and hasattr(
             quant_method, "process_weights_after_loading"
         ):
+            if _defer_quant_postprocess_until_after_model_post_load(quant_method):
+                continue
             if _is_npu and not isinstance(quant_method, UnquantizedLinearMethod):
                 # Activate the NZ format for storing weights,
                 # which is a specific optimization for Ascend NPU
                 torch.npu.config.allow_internal_format = True
-            quant_method.process_weights_after_loading(module)
+            with device_loading_context(module, local_torch_device):
+                quant_method.process_weights_after_loading(module)
+            setattr(module, _QUANT_WEIGHTS_PROCESSED_ATTR, True)
             if _is_npu:
                 torch.npu.empty_cache()
     model.post_load_weights()
@@ -338,10 +353,13 @@ def maybe_load_fsdp_model(
         # Avoid unintended computation graph accumulation during inference
         if isinstance(p, torch.nn.Parameter):
             p.requires_grad = False
-    local_torch_device = get_local_torch_device()
     for _, module in model.named_modules():
         quant_method = getattr(module, "quant_method", None)
-        if quant_method is not None:
+        if (
+            quant_method is not None
+            and hasattr(quant_method, "process_weights_after_loading")
+            and not getattr(module, _QUANT_WEIGHTS_PROCESSED_ATTR, False)
+        ):
             # When quant methods need to process weights after loading
             # (for repacking, quantizing, etc), they expect parameters
             # to be on the global target device. This scope is for the
@@ -349,6 +367,7 @@ def maybe_load_fsdp_model(
             # parameters onto device for processing and back off after.
             with device_loading_context(module, local_torch_device):
                 quant_method.process_weights_after_loading(module)
+            setattr(module, _QUANT_WEIGHTS_PROCESSED_ATTR, True)
 
     # 4. deferred cpu offload
     if defer_cpu_offload:
