@@ -106,33 +106,20 @@ logger = logging.getLogger(__name__)
 torch_release = pkg_version.parse(torch.__version__).release
 
 
-class Range(NamedTuple):
-    start: int
-    end: int
-
-    @property
-    def length(self) -> int:
-        return self.end - self.start
-
-
-def flatten_arrays_to_pinned_cpu(parts: List[array[int]], pin: bool) -> torch.Tensor:
-    """Flatten array.array('q') buffers into one int64 CPU tensor.
-
-    NumPy memcpy instead of a per-element PyLong-to-int64 walk. Stays on
-    (optionally pinned) CPU; H2D is the caller's job.
-    """
-    combined = np.concatenate([np.frombuffer(p, dtype=np.int64) for p in parts])
-    cpu_t = torch.from_numpy(combined)
-    if pin:
-        cpu_t = cpu_t.pin_memory()
-    return cpu_t
-
-
-def flatten_arrays_to_int64_tensor(
-    parts: List[array[int]], device, pin: bool
-) -> torch.Tensor:
-    """Flatten a list of array.array('q') buffers into one int64 tensor on `device`."""
-    return flatten_arrays_to_pinned_cpu(parts, pin).to(device, non_blocking=True)
+# ==============================================================================
+# BEGIN: Multi-Device & CUDA Version Utilities
+# ------------------------------------------------------------------------------
+# Everything about detecting, describing, and selecting the hardware backend
+# lives here: device/backend detection (CUDA, ROCm/HIP, XPU, NPU, HPU, CPU,
+# MUSA, MPS), CPU host-arch detection, GPU architecture / SM-capability and
+# CUDA / HIP / driver version queries, backend feature availability (AMX, XMX,
+# FlashInfer, ...), device enumeration / naming / capability, device-memory
+# probes, and device module / stream / context helpers.
+#
+# FUTURE DEVELOPERS: keep this section focused. ONLY add code here if it detects
+# hardware/backends, queries CUDA/HIP/driver versions or device capabilities, or
+# selects/describes a device. Everything else belongs in its own section below.
+# ==============================================================================
 
 
 # https://pytorch.org/docs/stable/notes/hip.html#checking-for-hip
@@ -151,12 +138,6 @@ FP8_E4M3_MIN = -FP8_E4M3_MAX
 
 builtins.FP8_E4M3_MAX = FP8_E4M3_MAX
 builtins.FP8_E4M3_MIN = FP8_E4M3_MIN
-
-# explicitly use pure text format, with a newline at the end
-# this makes it impossible to see the animation in the progress bar
-# but will avoid messing up with ray or multiprocessing, which wraps
-# each line of output with some prefix.
-BAR_FORMAT = "{desc}: {percentage:3.0f}% Completed | {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]"
 
 
 @lru_cache(maxsize=1)
@@ -388,175 +369,6 @@ def is_nvidia_cublas_version_ge_12_9():
     return False
 
 
-def random_uuid() -> str:
-    return str(uuid.uuid4().hex)
-
-
-_warned_bool_env_var_keys = set()
-
-
-def get_bool_env_var(name: str, default: str = "false") -> bool:
-    # FIXME: move your environment variable to sglang.srt.environ
-    value = os.getenv(name, default)
-    value = value.lower()
-
-    truthy_values = ("true", "1")
-    falsy_values = ("false", "0")
-
-    if (value not in truthy_values) and (value not in falsy_values):
-        # Warn once per env var key (not per value), otherwise different keys that share the
-        # same invalid value may suppress warnings incorrectly.
-        if name not in _warned_bool_env_var_keys:
-            logger.warning(
-                f"get_bool_env_var({name}) encountered unrecognized value={value} and will treat as false"
-            )
-        _warned_bool_env_var_keys.add(name)
-
-    return value in truthy_values
-
-
-def get_int_env_var(name: str, default: int = 0) -> int:
-    # FIXME: move your environment variable to sglang.srt.environ
-    value = os.getenv(name)
-    if value is None or not value.strip():
-        return default
-    try:
-        return int(value)
-    except ValueError:
-        return default
-
-
-def support_triton(backend: str) -> bool:
-    return backend not in ["torch_native", "intel_amx"]
-
-
-_ENABLE_TORCH_INFERENCE_MODE = get_bool_env_var(
-    "SGLANG_ENABLE_TORCH_INFERENCE_MODE", "false"
-)
-
-
-class DynamicGradMode(_DecoratorContextManager):
-    """
-    A combination of torch.no_grad and torch.inference_mode,
-    with their behavior controlled by an environment variable. Just refer to them.
-    """
-
-    @staticmethod
-    def set_inference_mode(mode: bool):
-        if isinstance(mode, bool):
-            global _ENABLE_TORCH_INFERENCE_MODE
-
-            _ENABLE_TORCH_INFERENCE_MODE = mode
-        else:
-            logger.warning("mode is not a boolean object")
-
-    def __init__(self, mode=True):
-        if not torch._jit_internal.is_scripting():
-            super().__init__()
-        if _ENABLE_TORCH_INFERENCE_MODE:
-            self.mode = mode
-        else:
-            self.prev = False
-
-    def __new__(cls, mode_or_orig_func=True if _ENABLE_TORCH_INFERENCE_MODE else None):
-        if mode_or_orig_func is None or isinstance(mode_or_orig_func, bool):
-            return super().__new__(cls)
-        return cls()(mode_or_orig_func)
-
-    def __enter__(self) -> None:
-        if _ENABLE_TORCH_INFERENCE_MODE:
-            self._inference_mode_context = torch._C._InferenceMode(self.mode)
-            self._inference_mode_context.__enter__()
-        else:
-            self.prev = torch.is_grad_enabled()
-            torch.set_grad_enabled(False)
-
-    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
-        if _ENABLE_TORCH_INFERENCE_MODE:
-            self._inference_mode_context.__exit__(exc_type, exc_value, traceback)
-        else:
-            torch.set_grad_enabled(self.prev)
-
-    def clone(self) -> DynamicGradMode:
-        r"""
-        Create a copy of this class
-        """
-        if _ENABLE_TORCH_INFERENCE_MODE:
-            return self.__class__(self.mode)
-        else:
-            return self.__class__()
-
-
-show_time_cost = False
-time_infos = {}
-
-
-def enable_show_time_cost():
-    global show_time_cost
-    show_time_cost = True
-
-
-class TimeInfo:
-    def __init__(self, name, interval=0.1, color=0, indent=0):
-        self.name = name
-        self.interval = interval
-        self.color = color
-        self.indent = indent
-
-        self.acc_time = 0
-        self.last_acc_time = 0
-
-    def check(self):
-        if self.acc_time - self.last_acc_time > self.interval:
-            self.last_acc_time = self.acc_time
-            return True
-        return False
-
-    def pretty_print(self):
-        print(f"\x1b[{self.color}m", end="")
-        print("-" * self.indent * 2, end="")
-        print(f"{self.name}: {self.acc_time:.3f}s\x1b[0m")
-
-
-def mark_start(name, interval=0.1, color=0, indent=0):
-    global time_infos, show_time_cost
-    if not show_time_cost:
-        return
-    torch.cuda.synchronize()
-    if time_infos.get(name, None) is None:
-        time_infos[name] = TimeInfo(name, interval, color, indent)
-    time_infos[name].acc_time -= time.perf_counter()
-
-
-def mark_end(name):
-    global time_infos, show_time_cost
-    if not show_time_cost:
-        return
-    torch.cuda.synchronize()
-    time_infos[name].acc_time += time.perf_counter()
-    if time_infos[name].check():
-        time_infos[name].pretty_print()
-
-
-def calculate_time(show=False, min_cost_ms=0.0):
-    def wrapper(func):
-        def inner_func(*args, **kwargs):
-            torch.cuda.synchronize()
-            if show:
-                start_time = time.perf_counter()
-            result = func(*args, **kwargs)
-            torch.cuda.synchronize()
-            if show:
-                cost_time = (time.perf_counter() - start_time) * 1000
-                if cost_time > min_cost_ms:
-                    print(f"Function {func.__name__} took {cost_time} ms to run.")
-            return result
-
-        return inner_func
-
-    return wrapper
-
-
 def empty_device_cache(device_module: Optional[Any] = None) -> bool:
     """Release unused cached blocks from the active device allocator.
 
@@ -733,6 +545,877 @@ def is_pin_memory_available(device=None) -> bool:
     return True
 
 
+def get_dispatch_device_backend():
+    if is_cuda_alike():
+        dispatch_key = "CUDA"
+    elif is_xpu():
+        dispatch_key = "XPU"
+    elif is_npu():
+        dispatch_key = "NPU"
+    else:
+        raise RuntimeError("No supported accelerator (CUDA/XPU) available")
+    return dispatch_key
+
+
+@lru_cache(maxsize=1)
+def get_device_module():
+    return torch.get_device_module()
+
+
+def get_amdgpu_memory_capacity():
+    try:
+        # Run rocm-smi and capture the output
+        result = subprocess.run(
+            [
+                "rocminfo | grep 'gfx' -A 100 | grep 'Pool 1' -A 5 | grep 'Size:' | awk '{print $2}'"
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            shell=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"rocm-smi error: {result.stderr.strip()}")
+
+        # Parse the output to extract memory values in MiB
+        memory_values = [
+            float(mem.split("(")[0].strip()) / 1024
+            for mem in result.stdout.strip().split("\n")
+        ]
+
+        if not memory_values:
+            raise ValueError("No GPU memory values found.")
+
+        # Return the minimum memory value
+        return min(memory_values)
+
+    except FileNotFoundError:
+        raise RuntimeError(
+            "rocm-smi not found. Ensure AMD ROCm drivers are installed and accessible."
+        )
+
+
+def get_device_sm():
+    if torch.cuda.is_available() or is_musa():
+        major, minor = torch.cuda.get_device_capability()
+        return major * 10 + minor
+    return 0
+
+
+def _cuda_mem_fallback(reason: str) -> int:
+    """Fallback to torch.cuda.mem_get_info() and return total GPU memory in MiB.
+
+    Queries all visible CUDA devices and returns the minimum total memory,
+    consistent with the nvidia-smi path that takes min(memory_values).
+
+    Returns the total memory in MiB, or raises RuntimeError if CUDA is
+    unavailable or mem_get_info() fails.
+    """
+    if not torch.cuda.is_available():
+        raise RuntimeError(reason)
+    try:
+        device_count = torch.cuda.device_count()
+        if device_count == 0:
+            # Include the original failure reason for diagnostics
+            raise RuntimeError(f"{reason} No CUDA devices found via torch.cuda.")
+        memory_values = []
+        for i in range(device_count):
+            total = torch.cuda.mem_get_info(i)[1] // 1024 // 1024  # unit: MiB
+            memory_values.append(total)
+        result = min(memory_values)
+        logger.warning(
+            f"{reason} Falling back to torch.cuda.mem_get_info(). "
+            f"Reported total GPU memory per device (MiB): {memory_values}, "
+            f"using min: {result} MiB."
+        )
+        return result
+    except (RuntimeError, ValueError, OSError) as e:
+        raise RuntimeError(
+            f"{reason} torch.cuda.mem_get_info() fallback also failed: {e}"
+        ) from e
+
+
+def get_nvgpu_memory_capacity():
+    try:
+        # Run nvidia-smi and capture the output
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+        if result.returncode != 0:
+            return _cuda_mem_fallback(
+                f"nvidia-smi failed (exit code {result.returncode}: {result.stderr.strip()})."
+            )
+
+        # Parse the output to extract memory values
+        memory_values = [
+            float(mem)
+            for mem in result.stdout.strip().split("\n")
+            if re.match(r"^\d+(\.\d+)?$", mem.strip())
+        ]
+
+        if not memory_values:
+            # Fallback when nvidia-smi returns no parseable values,
+            # typically in NVIDIA MIG mode.
+            return _cuda_mem_fallback(
+                "Failed to get GPU memory capacity from nvidia-smi."
+            )
+
+        # Return the minimum memory value
+        return min(memory_values)
+
+    except FileNotFoundError:
+        return _cuda_mem_fallback(
+            "nvidia-smi not found. Ensure NVIDIA drivers are installed and accessible."
+        )
+
+
+def get_hpu_memory_capacity():
+    try:
+        # Run hl-smi and capture the output
+        result = subprocess.run(
+            ["hl-smi --query | grep 'Total'"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            shell=True,
+            text=True,
+        )
+
+        if result.returncode != 0:
+            raise RuntimeError(f"hl-smi error: {result.stderr.strip()}")
+
+        # Parse the output to extract memory values in MiB
+        memory_values = [
+            float(mem.split(" ")[-2]) for mem in result.stdout.strip().split("\n")
+        ]
+
+        if not memory_values:
+            raise ValueError("No GPU memory values found.")
+
+        # Return the minimum memory value
+        return min(memory_values)
+
+    except FileNotFoundError:
+        raise RuntimeError(
+            "hl-smi not found. Ensure Habana drivers are installed and accessible."
+        )
+
+
+def get_npu_memory_capacity():
+    try:
+        import torch_npu  # noqa: F401
+
+        if envs.SGLANG_ZBAL_LOCAL_MEM_SIZE.get() > 0:
+            return envs.SGLANG_ZBAL_LOCAL_MEM_SIZE.get()  # unit: MB
+        else:
+            return torch.npu.mem_get_info()[1] // 1024 // 1024  # unit: MB
+    except ImportError:
+        raise ImportError("torch_npu is required when run on npu device.")
+
+
+def get_cpu_memory_capacity():
+    # Per-rank memory capacity cannot be determined for customized core settings
+    if os.environ.get("SGLANG_CPU_OMP_THREADS_BIND", ""):
+        return None
+    n_numa_node: int = len(get_cpu_ids_by_node())
+    if n_numa_node == 0:
+        # Cannot determine NUMA config, fallback to total memory and avoid ZeroDivisionError.
+        return float(psutil.virtual_memory().total // (1 << 20))
+    try:
+        numa_mem_list = list()
+        file_prefix = "/sys/devices/system/node/"
+        for numa_id in range(n_numa_node):
+            file_meminfo = f"node{numa_id}/meminfo"
+            with open(os.path.join(file_prefix, file_meminfo), "r") as f:
+                # MemTotal info is at the 1st line
+                line = f.readline()
+                # Expected format: "Node 0 MemTotal:       100000000 kB"
+                parts = line.split()
+                if len(parts) >= 4 and parts[2] == "MemTotal:":
+                    numa_mem_list.append(int(parts[3]))
+                else:
+                    raise ValueError(f"Unexpected format in {file_meminfo}: {line}")
+        # Retrieved value in KB, need MB
+        numa_mem = float(min(numa_mem_list) // 1024)
+        return numa_mem
+    except (FileNotFoundError, ValueError, IndexError):
+        numa_mem = psutil.virtual_memory().total / n_numa_node
+        # Retrieved value in Byte, need MB
+        return float(numa_mem // (1 << 20))
+
+
+def get_xpu_memory_capacity():
+    try:
+        if torch.xpu.is_available():
+            return torch.xpu.mem_get_info()[1] // 1024 // 1024  # unit: MB
+        raise ValueError("No GPU memory values found.")
+    except AttributeError:
+        raise RuntimeError("torch.xpu is not available.")
+
+
+def get_mtgpu_memory_capacity():
+    try:
+        # Run mthreads-gmi and capture the output
+        result = subprocess.run(
+            [
+                "mthreads-gmi --query | grep 'FB Memory Usage' -A 2 | grep 'Total' | awk -F':' '{print $2}' | awk '{print $1}' | sed 's/MiB//'"
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            shell=True,
+            text=True,
+        )
+
+        if result.returncode != 0:
+            raise RuntimeError(f"mthreads-gmi error: {result.stderr.strip()}")
+
+        # Parse the output to extract memory values
+        memory_values = [
+            float(mem)
+            for mem in result.stdout.strip().split("\n")
+            if re.match(r"^\d+(\.\d+)?$", mem.strip())
+        ]
+
+        if not memory_values:
+            # Fallback to torch.musa.mem_get_info() when failed to get memory capacity from mthreads-gmi.
+            if hasattr(torch, "musa") and torch.musa.is_available():
+                logger.warning(
+                    "Failed to get GPU memory capacity from mthreads-gmi, falling back to torch.musa.mem_get_info()."
+                )
+                return torch.musa.mem_get_info()[1] // 1024 // 1024  # unit: MB
+            raise ValueError("No GPU memory values found.")
+
+        # Return the minimum memory value
+        return min(memory_values)
+
+    except FileNotFoundError:
+        raise RuntimeError(
+            "mthreads-gmi not found. Ensure Moore Threads drivers are installed and accessible."
+        )
+
+
+def get_device_memory_capacity(device: str = None):
+    # OOT platforms provide their own memory query via the platform class.
+    if current_platform.is_out_of_tree():
+        mem_bytes = current_platform.get_device_total_memory()
+        if mem_bytes:
+            return mem_bytes / (1 << 20)  # bytes -> MiB
+        return None
+    if is_cuda():
+        gpu_mem = get_nvgpu_memory_capacity()
+    elif is_hip():
+        gpu_mem = get_amdgpu_memory_capacity()
+    elif device == "hpu":
+        gpu_mem = get_hpu_memory_capacity()
+    elif device == "npu":
+        gpu_mem = get_npu_memory_capacity()
+    elif device == "cpu":
+        gpu_mem = get_cpu_memory_capacity()
+    elif device == "xpu":
+        gpu_mem = get_xpu_memory_capacity()
+    elif device == "musa":
+        gpu_mem = get_mtgpu_memory_capacity()
+    else:
+        # GPU memory is not known yet or no GPU is available.
+        gpu_mem = None
+
+    return gpu_mem
+
+
+def get_device_name(device_id: int = 0) -> str:
+    if (hasattr(torch, "cuda") and torch.cuda.is_available()) or is_musa():
+        return torch.cuda.get_device_name(device_id)
+
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        return torch.xpu.get_device_name(device_id)
+
+    if hasattr(torch, "hpu") and torch.hpu.is_available():
+        return torch.hpu.get_device_name(device_id)
+
+    if hasattr(torch, "npu") and torch.npu.is_available():
+        return torch.npu.get_device_name(device_id)
+
+
+@lru_cache(maxsize=1)
+def is_habana_available() -> bool:
+    return find_spec("habana_frameworks") is not None
+
+
+@lru_cache(maxsize=8)
+def get_device(device_id: Optional[int] = None) -> str:
+    if is_cpu():
+        if cpu_has_amx_support():
+            logger.info("Intel AMX is detected, using CPU with Intel AMX support.")
+        else:
+            logger.warning(
+                "CPU device enabled, using torch native backend, low performance expected."
+            )
+        return "cpu"
+
+    if hasattr(torch, "cuda") and torch.cuda.is_available():
+        if device_id is None:
+            return "cuda"
+        return "cuda:{}".format(device_id)
+
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        if device_id is None:
+            return "xpu"
+        return "xpu:{}".format(device_id)
+
+    if is_npu():
+        if device_id is None:
+            return "npu"
+        return "npu:{}".format(device_id)
+
+    if is_habana_available():
+        try:
+            import habana_frameworks.torch.hpu  # noqa: F401
+
+            if torch.hpu.is_available():
+                if device_id is None:
+                    return "hpu"
+                return "hpu:{}".format(device_id)
+        except ImportError:
+            raise ImportError(
+                "Habana frameworks detected, but failed to import 'habana_frameworks.torch.hpu'."
+            )
+
+    if is_musa():
+        if device_id is None:
+            return "musa"
+        return "musa:{}".format(device_id)
+
+    if is_mps():
+        if device_id is None:
+            return "mps"
+        return "mps:{}".format(device_id)
+
+    try:
+        return current_platform.get_device(device_id)
+    except Exception:
+        raise RuntimeError(
+            "No accelerator (CUDA, XPU, HPU, NPU, MUSA, MPS) or platform plugin is available."
+        )
+
+
+@lru_cache(maxsize=1)
+def get_device_count() -> int:
+    if (hasattr(torch, "cuda") and torch.cuda.is_available()) or is_musa():
+        try:
+            return torch.cuda.device_count()
+        except RuntimeError:
+            return 0
+
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        try:
+            return torch.xpu.device_count()
+        except RuntimeError:
+            return 0
+
+    if is_habana_available():
+        try:
+            import habana_frameworks.torch.hpu  # noqa: F401
+
+            if torch.hpu.is_available():
+                return torch.hpu.device_count()
+        except (ImportError, RuntimeError):
+            return 0
+
+    return 0  # No accelerators available
+
+
+def get_device_core_count(device_id: int = 0) -> int:
+    if (hasattr(torch, "cuda") and torch.cuda.is_available()) or is_musa():
+        return torch.cuda.get_device_properties(device_id).multi_processor_count
+    elif hasattr(torch, "xpu") and torch.xpu.is_available():
+        return torch.xpu.get_device_properties(device_id).gpu_eu_count
+
+    return 0
+
+
+def get_device_capability(device_id: int = 0) -> Tuple[int, int]:
+    major, minor = None, None
+    if (hasattr(torch, "cuda") and torch.cuda.is_available()) or is_musa():
+        major, minor = torch.cuda.get_device_capability(device_id)
+
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        major, minor, *_ = torch.xpu.get_device_capability(device_id)["version"].split(
+            "."
+        )
+        # Currently XPU version does not contain capability information.
+        major, minor = None, None
+
+    if hasattr(torch, "hpu") and torch.hpu.is_available():
+        try:
+            # TODO(HandH1998): `get_device_capability` is not supported by `torch.hpu` for now.
+            # Update this once the support is available.
+            # major, minor = torch.hpu.get_device_capability(device_id)
+            major, minor = None, None
+        except Exception as e:
+            raise RuntimeError(
+                f"An error occurred while getting device capability of hpu: {e}."
+            ) from e
+
+    return major, minor
+
+
+def get_compiler_backend(mode=None) -> str:
+    # OOT platforms provide their own compile backend.
+    if current_platform.is_out_of_tree():
+        return current_platform.get_compile_backend(mode)
+
+    if hasattr(torch, "hpu") and torch.hpu.is_available():
+        return "hpu_backend"
+
+    if hasattr(torch, "npu") and torch.npu.is_available():
+        try:
+            import torchair
+            import torchair.ge_concrete_graph.ge_converter.experimental.patch_for_hcom_allreduce
+            from torchair.configs.compiler_config import CompilerConfig
+        except ImportError:
+            raise ImportError(
+                "NPU detected, but torchair package is not installed. "
+                "Please install torchair for torch.compile support on NPU."
+            )
+        compiler_config = CompilerConfig()
+        compiler_config.mode = "max-autotune"
+        if mode == "npugraph_ex":
+            compiler_config.mode = "reduce-overhead"
+            compiler_config.debug.run_eagerly = True
+        npu_backend = torchair.get_npu_backend(compiler_config=compiler_config)
+        return npu_backend
+
+    return "inductor"
+
+
+def set_cuda_arch():
+    if is_flashinfer_available():
+        capability = torch.cuda.get_device_capability()
+        arch = f"{capability[0]}.{capability[1]}"
+        os.environ["FLASHINFER_CUDA_ARCH_LIST"] = (
+            f"{arch}{'a' if capability[0] >= 9 else ''}"
+        )
+
+
+def mxfp_supported():
+    """
+    Returns whether the current platform supports MX types.
+    """
+    if torch.version.hip:
+        gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
+        return any(gfx in gcn_arch for gfx in ["gfx95"])
+    else:
+        return False
+
+
+@lru_cache(maxsize=1)
+def is_gfx95_supported():
+    """
+    Returns whether the current platform supports MX types.
+    """
+    if torch.version.hip:
+        gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
+        return any(gfx in gcn_arch for gfx in ["gfx95"])
+    else:
+        return False
+
+
+@lru_cache(maxsize=1)
+def is_gfx942_supported():
+    """
+    Returns whether the current platform is AMD CDNA3 (gfx942 — MI300X / MI325X).
+    """
+    if torch.version.hip:
+        gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
+        return any(gfx in gcn_arch for gfx in ["gfx942"])
+    else:
+        return False
+
+
+def get_hip_version():
+    if torch.version.hip:
+        return tuple(map(int, torch.version.hip.split("-")[0].split(".")))
+    return (0, 0, 0)
+
+
+@lru_cache(maxsize=1)
+def get_nvidia_driver_version() -> tuple:
+    """Return the NVIDIA driver version as a tuple of ints, e.g. (595, 58, 3).
+    Returns (0,) on failure."""
+    version_str = get_nvidia_driver_version_str()
+    if version_str is None:
+        return (0,)
+    try:
+        return tuple(int(x) for x in version_str.split("."))
+    except ValueError:
+        return (0,)
+
+
+@lru_cache(maxsize=1)
+def get_nvidia_driver_version_str() -> str | None:
+    """Return the NVIDIA driver version string, e.g. '595.58.03'.
+    Returns None on failure."""
+    try:
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=driver_version",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=10,
+        )
+        version_str = result.stdout.strip().split("\n")[0].strip()
+        return version_str if version_str else None
+    except (subprocess.CalledProcessError, FileNotFoundError, ValueError):
+        return None
+
+
+def check_cuda_result(raw_output):
+    import cuda.bindings.runtime as cuda_rt
+
+    err, *results = raw_output
+    if err != cuda_rt.cudaError_t.cudaSuccess:
+        raise Exception(f"CUDA error: {err}")
+
+    return results
+
+
+def get_cuda_driver_bindings():
+    try:
+        from cuda.bindings import driver as cuda_driver
+    except ImportError:
+        from cuda import cuda as cuda_driver
+
+    return cuda_driver
+
+
+def get_physical_device_id(pytorch_device_id: int) -> int:
+    """
+    Convert PyTorch logical device ID to physical device ID.
+
+    When CUDA_VISIBLE_DEVICES is set, maps the logical device ID (as seen by PyTorch)
+    to the actual physical device ID. If CUDA_VISIBLE_DEVICES is not set, returns
+    the device ID unchanged.
+
+    Args:
+        pytorch_device_id: The logical device ID from PyTorch (e.g., torch.cuda.current_device())
+
+    Returns:
+        The physical device ID
+    """
+    device_idx = int(pytorch_device_id)
+    cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", None)
+    if cuda_visible_devices:
+        device_list = cuda_visible_devices.split(",")
+        return int(device_list[device_idx])
+    else:
+        return device_idx
+
+
+def get_device_sm_nvidia_smi():
+    try:
+        # Run nvidia-smi command and capture output
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+
+        # Get the first line of output (assuming at least one GPU exists)
+        compute_cap_str = result.stdout.strip().split("\n")[0]
+
+        # Convert string (e.g., "9.0") to tuple of integers (9, 0)
+        major, minor = map(int, compute_cap_str.split("."))
+        return (major, minor)
+
+    except (subprocess.CalledProcessError, FileNotFoundError, ValueError) as e:
+        # Handle cases where nvidia-smi isn't available or output is unexpected
+        logger.error("Error getting compute capability: %s", e)
+        return (0, 0)  # Default/fallback value
+
+
+@contextmanager
+def maybe_reindex_device_id(gpu_id: int):
+
+    if envs.SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS.get() is False or not is_cuda_alike():
+        yield gpu_id
+        return
+
+    original_cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if original_cuda_visible_devices:
+        cuda_visible_devices = original_cuda_visible_devices.split(",")
+    else:
+        cuda_visible_devices = []
+
+    str_gpu_id = cuda_visible_devices[gpu_id] if cuda_visible_devices else str(gpu_id)
+    os.environ["CUDA_VISIBLE_DEVICES"] = str_gpu_id
+
+    logger.debug(f"Set CUDA_VISIBLE_DEVICES to {str_gpu_id}")
+
+    yield 0
+
+    if original_cuda_visible_devices:
+        os.environ["CUDA_VISIBLE_DEVICES"] = original_cuda_visible_devices
+    else:
+        del os.environ["CUDA_VISIBLE_DEVICES"]
+
+
+cached_device_index = -1
+
+
+def get_current_device_stream_fast():
+    global cached_device_index
+    if cached_device_index == -1:
+        cached_device_index = torch.get_device_module().current_device()
+    return torch.get_device_module().current_stream(cached_device_index)
+
+
+# ==============================================================================
+# END: Multi-Device & CUDA Version Utilities
+# ==============================================================================
+
+
+class Range(NamedTuple):
+    start: int
+    end: int
+
+    @property
+    def length(self) -> int:
+        return self.end - self.start
+
+
+def flatten_arrays_to_pinned_cpu(parts: List[array[int]], pin: bool) -> torch.Tensor:
+    """Flatten array.array('q') buffers into one int64 CPU tensor.
+
+    NumPy memcpy instead of a per-element PyLong-to-int64 walk. Stays on
+    (optionally pinned) CPU; H2D is the caller's job.
+    """
+    combined = np.concatenate([np.frombuffer(p, dtype=np.int64) for p in parts])
+    cpu_t = torch.from_numpy(combined)
+    if pin:
+        cpu_t = cpu_t.pin_memory()
+    return cpu_t
+
+
+def flatten_arrays_to_int64_tensor(
+    parts: List[array[int]], device, pin: bool
+) -> torch.Tensor:
+    """Flatten a list of array.array('q') buffers into one int64 tensor on `device`."""
+    return flatten_arrays_to_pinned_cpu(parts, pin).to(device, non_blocking=True)
+
+
+# explicitly use pure text format, with a newline at the end
+# this makes it impossible to see the animation in the progress bar
+# but will avoid messing up with ray or multiprocessing, which wraps
+# each line of output with some prefix.
+BAR_FORMAT = "{desc}: {percentage:3.0f}% Completed | {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]"
+
+
+def random_uuid() -> str:
+    return str(uuid.uuid4().hex)
+
+
+_warned_bool_env_var_keys = set()
+
+
+def get_bool_env_var(name: str, default: str = "false") -> bool:
+    # FIXME: move your environment variable to sglang.srt.environ
+    value = os.getenv(name, default)
+    value = value.lower()
+
+    truthy_values = ("true", "1")
+    falsy_values = ("false", "0")
+
+    if (value not in truthy_values) and (value not in falsy_values):
+        # Warn once per env var key (not per value), otherwise different keys that share the
+        # same invalid value may suppress warnings incorrectly.
+        if name not in _warned_bool_env_var_keys:
+            logger.warning(
+                f"get_bool_env_var({name}) encountered unrecognized value={value} and will treat as false"
+            )
+        _warned_bool_env_var_keys.add(name)
+
+    return value in truthy_values
+
+
+def get_int_env_var(name: str, default: int = 0) -> int:
+    # FIXME: move your environment variable to sglang.srt.environ
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
+@contextmanager
+def temp_set_env(*, allow_sglang: bool = False, **env_vars: Any):
+    """Temporarily set environment variables, restoring originals on exit.
+
+    By default, SGLANG_*/SGL_* keys are rejected — use ``Envs`` descriptors
+    for those.  Pass ``allow_sglang=True`` only for special env vars that
+    intentionally bypass ``environ.py``.
+    """
+    if not allow_sglang:
+        for key in env_vars:
+            if key.startswith("SGLANG_") or key.startswith("SGL_"):
+                raise ValueError("temp_set_env should not be used for sglang env vars")
+
+    backup = {key: os.environ.get(key) for key in env_vars}
+    try:
+        for key, value in env_vars.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = str(value)
+        yield
+    finally:
+        for key, value in backup.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def support_triton(backend: str) -> bool:
+    return backend not in ["torch_native", "intel_amx"]
+
+
+_ENABLE_TORCH_INFERENCE_MODE = get_bool_env_var(
+    "SGLANG_ENABLE_TORCH_INFERENCE_MODE", "false"
+)
+
+
+class DynamicGradMode(_DecoratorContextManager):
+    """
+    A combination of torch.no_grad and torch.inference_mode,
+    with their behavior controlled by an environment variable. Just refer to them.
+    """
+
+    @staticmethod
+    def set_inference_mode(mode: bool):
+        if isinstance(mode, bool):
+            global _ENABLE_TORCH_INFERENCE_MODE
+
+            _ENABLE_TORCH_INFERENCE_MODE = mode
+        else:
+            logger.warning("mode is not a boolean object")
+
+    def __init__(self, mode=True):
+        if not torch._jit_internal.is_scripting():
+            super().__init__()
+        if _ENABLE_TORCH_INFERENCE_MODE:
+            self.mode = mode
+        else:
+            self.prev = False
+
+    def __new__(cls, mode_or_orig_func=True if _ENABLE_TORCH_INFERENCE_MODE else None):
+        if mode_or_orig_func is None or isinstance(mode_or_orig_func, bool):
+            return super().__new__(cls)
+        return cls()(mode_or_orig_func)
+
+    def __enter__(self) -> None:
+        if _ENABLE_TORCH_INFERENCE_MODE:
+            self._inference_mode_context = torch._C._InferenceMode(self.mode)
+            self._inference_mode_context.__enter__()
+        else:
+            self.prev = torch.is_grad_enabled()
+            torch.set_grad_enabled(False)
+
+    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
+        if _ENABLE_TORCH_INFERENCE_MODE:
+            self._inference_mode_context.__exit__(exc_type, exc_value, traceback)
+        else:
+            torch.set_grad_enabled(self.prev)
+
+    def clone(self) -> DynamicGradMode:
+        r"""
+        Create a copy of this class
+        """
+        if _ENABLE_TORCH_INFERENCE_MODE:
+            return self.__class__(self.mode)
+        else:
+            return self.__class__()
+
+
+show_time_cost = False
+time_infos = {}
+
+
+def enable_show_time_cost():
+    global show_time_cost
+    show_time_cost = True
+
+
+class TimeInfo:
+    def __init__(self, name, interval=0.1, color=0, indent=0):
+        self.name = name
+        self.interval = interval
+        self.color = color
+        self.indent = indent
+
+        self.acc_time = 0
+        self.last_acc_time = 0
+
+    def check(self):
+        if self.acc_time - self.last_acc_time > self.interval:
+            self.last_acc_time = self.acc_time
+            return True
+        return False
+
+    def pretty_print(self):
+        print(f"\x1b[{self.color}m", end="")
+        print("-" * self.indent * 2, end="")
+        print(f"{self.name}: {self.acc_time:.3f}s\x1b[0m")
+
+
+def mark_start(name, interval=0.1, color=0, indent=0):
+    global time_infos, show_time_cost
+    if not show_time_cost:
+        return
+    torch.cuda.synchronize()
+    if time_infos.get(name, None) is None:
+        time_infos[name] = TimeInfo(name, interval, color, indent)
+    time_infos[name].acc_time -= time.perf_counter()
+
+
+def mark_end(name):
+    global time_infos, show_time_cost
+    if not show_time_cost:
+        return
+    torch.cuda.synchronize()
+    time_infos[name].acc_time += time.perf_counter()
+    if time_infos[name].check():
+        time_infos[name].pretty_print()
+
+
+def calculate_time(show=False, min_cost_ms=0.0):
+    def wrapper(func):
+        def inner_func(*args, **kwargs):
+            torch.cuda.synchronize()
+            if show:
+                start_time = time.perf_counter()
+            result = func(*args, **kwargs)
+            torch.cuda.synchronize()
+            if show:
+                cost_time = (time.perf_counter() - start_time) * 1000
+                if cost_time > min_cost_ms:
+                    print(f"Function {func.__name__} took {cost_time} ms to run.")
+            return result
+
+        return inner_func
+
+    return wrapper
+
+
 class LayerFn(Protocol):
 
     def __call__(self, idx: int, prefix: str) -> torch.nn.Module: ...
@@ -798,23 +1481,6 @@ def make_layers_non_pp(
         )
     )
     return layers
-
-
-def get_dispatch_device_backend():
-    if is_cuda_alike():
-        dispatch_key = "CUDA"
-    elif is_xpu():
-        dispatch_key = "XPU"
-    elif is_npu():
-        dispatch_key = "NPU"
-    else:
-        raise RuntimeError("No supported accelerator (CUDA/XPU) available")
-    return dispatch_key
-
-
-@lru_cache(maxsize=1)
-def get_device_module():
-    return torch.get_device_module()
 
 
 def set_random_seed(seed: int) -> None:
@@ -1721,269 +2387,6 @@ def _get_fastapi_request_path(request) -> Tuple[str, bool]:
     return request.url.path, False
 
 
-def get_amdgpu_memory_capacity():
-    try:
-        # Run rocm-smi and capture the output
-        result = subprocess.run(
-            [
-                "rocminfo | grep 'gfx' -A 100 | grep 'Pool 1' -A 5 | grep 'Size:' | awk '{print $2}'"
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            shell=True,
-            text=True,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(f"rocm-smi error: {result.stderr.strip()}")
-
-        # Parse the output to extract memory values in MiB
-        memory_values = [
-            float(mem.split("(")[0].strip()) / 1024
-            for mem in result.stdout.strip().split("\n")
-        ]
-
-        if not memory_values:
-            raise ValueError("No GPU memory values found.")
-
-        # Return the minimum memory value
-        return min(memory_values)
-
-    except FileNotFoundError:
-        raise RuntimeError(
-            "rocm-smi not found. Ensure AMD ROCm drivers are installed and accessible."
-        )
-
-
-def get_device_sm():
-    if torch.cuda.is_available() or is_musa():
-        major, minor = torch.cuda.get_device_capability()
-        return major * 10 + minor
-    return 0
-
-
-def _cuda_mem_fallback(reason: str) -> int:
-    """Fallback to torch.cuda.mem_get_info() and return total GPU memory in MiB.
-
-    Queries all visible CUDA devices and returns the minimum total memory,
-    consistent with the nvidia-smi path that takes min(memory_values).
-
-    Returns the total memory in MiB, or raises RuntimeError if CUDA is
-    unavailable or mem_get_info() fails.
-    """
-    if not torch.cuda.is_available():
-        raise RuntimeError(reason)
-    try:
-        device_count = torch.cuda.device_count()
-        if device_count == 0:
-            # Include the original failure reason for diagnostics
-            raise RuntimeError(f"{reason} No CUDA devices found via torch.cuda.")
-        memory_values = []
-        for i in range(device_count):
-            total = torch.cuda.mem_get_info(i)[1] // 1024 // 1024  # unit: MiB
-            memory_values.append(total)
-        result = min(memory_values)
-        logger.warning(
-            f"{reason} Falling back to torch.cuda.mem_get_info(). "
-            f"Reported total GPU memory per device (MiB): {memory_values}, "
-            f"using min: {result} MiB."
-        )
-        return result
-    except (RuntimeError, ValueError, OSError) as e:
-        raise RuntimeError(
-            f"{reason} torch.cuda.mem_get_info() fallback also failed: {e}"
-        ) from e
-
-
-def get_nvgpu_memory_capacity():
-    try:
-        # Run nvidia-smi and capture the output
-        result = subprocess.run(
-            ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-
-        if result.returncode != 0:
-            return _cuda_mem_fallback(
-                f"nvidia-smi failed (exit code {result.returncode}: {result.stderr.strip()})."
-            )
-
-        # Parse the output to extract memory values
-        memory_values = [
-            float(mem)
-            for mem in result.stdout.strip().split("\n")
-            if re.match(r"^\d+(\.\d+)?$", mem.strip())
-        ]
-
-        if not memory_values:
-            # Fallback when nvidia-smi returns no parseable values,
-            # typically in NVIDIA MIG mode.
-            return _cuda_mem_fallback(
-                "Failed to get GPU memory capacity from nvidia-smi."
-            )
-
-        # Return the minimum memory value
-        return min(memory_values)
-
-    except FileNotFoundError:
-        return _cuda_mem_fallback(
-            "nvidia-smi not found. Ensure NVIDIA drivers are installed and accessible."
-        )
-
-
-def get_hpu_memory_capacity():
-    try:
-        # Run hl-smi and capture the output
-        result = subprocess.run(
-            ["hl-smi --query | grep 'Total'"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            shell=True,
-            text=True,
-        )
-
-        if result.returncode != 0:
-            raise RuntimeError(f"hl-smi error: {result.stderr.strip()}")
-
-        # Parse the output to extract memory values in MiB
-        memory_values = [
-            float(mem.split(" ")[-2]) for mem in result.stdout.strip().split("\n")
-        ]
-
-        if not memory_values:
-            raise ValueError("No GPU memory values found.")
-
-        # Return the minimum memory value
-        return min(memory_values)
-
-    except FileNotFoundError:
-        raise RuntimeError(
-            "hl-smi not found. Ensure Habana drivers are installed and accessible."
-        )
-
-
-def get_npu_memory_capacity():
-    try:
-        import torch_npu  # noqa: F401
-
-        if envs.SGLANG_ZBAL_LOCAL_MEM_SIZE.get() > 0:
-            return envs.SGLANG_ZBAL_LOCAL_MEM_SIZE.get()  # unit: MB
-        else:
-            return torch.npu.mem_get_info()[1] // 1024 // 1024  # unit: MB
-    except ImportError:
-        raise ImportError("torch_npu is required when run on npu device.")
-
-
-def get_cpu_memory_capacity():
-    # Per-rank memory capacity cannot be determined for customized core settings
-    if os.environ.get("SGLANG_CPU_OMP_THREADS_BIND", ""):
-        return None
-    n_numa_node: int = len(get_cpu_ids_by_node())
-    if n_numa_node == 0:
-        # Cannot determine NUMA config, fallback to total memory and avoid ZeroDivisionError.
-        return float(psutil.virtual_memory().total // (1 << 20))
-    try:
-        numa_mem_list = list()
-        file_prefix = "/sys/devices/system/node/"
-        for numa_id in range(n_numa_node):
-            file_meminfo = f"node{numa_id}/meminfo"
-            with open(os.path.join(file_prefix, file_meminfo), "r") as f:
-                # MemTotal info is at the 1st line
-                line = f.readline()
-                # Expected format: "Node 0 MemTotal:       100000000 kB"
-                parts = line.split()
-                if len(parts) >= 4 and parts[2] == "MemTotal:":
-                    numa_mem_list.append(int(parts[3]))
-                else:
-                    raise ValueError(f"Unexpected format in {file_meminfo}: {line}")
-        # Retrieved value in KB, need MB
-        numa_mem = float(min(numa_mem_list) // 1024)
-        return numa_mem
-    except (FileNotFoundError, ValueError, IndexError):
-        numa_mem = psutil.virtual_memory().total / n_numa_node
-        # Retrieved value in Byte, need MB
-        return float(numa_mem // (1 << 20))
-
-
-def get_xpu_memory_capacity():
-    try:
-        if torch.xpu.is_available():
-            return torch.xpu.mem_get_info()[1] // 1024 // 1024  # unit: MB
-        raise ValueError("No GPU memory values found.")
-    except AttributeError:
-        raise RuntimeError("torch.xpu is not available.")
-
-
-def get_mtgpu_memory_capacity():
-    try:
-        # Run mthreads-gmi and capture the output
-        result = subprocess.run(
-            [
-                "mthreads-gmi --query | grep 'FB Memory Usage' -A 2 | grep 'Total' | awk -F':' '{print $2}' | awk '{print $1}' | sed 's/MiB//'"
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            shell=True,
-            text=True,
-        )
-
-        if result.returncode != 0:
-            raise RuntimeError(f"mthreads-gmi error: {result.stderr.strip()}")
-
-        # Parse the output to extract memory values
-        memory_values = [
-            float(mem)
-            for mem in result.stdout.strip().split("\n")
-            if re.match(r"^\d+(\.\d+)?$", mem.strip())
-        ]
-
-        if not memory_values:
-            # Fallback to torch.musa.mem_get_info() when failed to get memory capacity from mthreads-gmi.
-            if hasattr(torch, "musa") and torch.musa.is_available():
-                logger.warning(
-                    "Failed to get GPU memory capacity from mthreads-gmi, falling back to torch.musa.mem_get_info()."
-                )
-                return torch.musa.mem_get_info()[1] // 1024 // 1024  # unit: MB
-            raise ValueError("No GPU memory values found.")
-
-        # Return the minimum memory value
-        return min(memory_values)
-
-    except FileNotFoundError:
-        raise RuntimeError(
-            "mthreads-gmi not found. Ensure Moore Threads drivers are installed and accessible."
-        )
-
-
-def get_device_memory_capacity(device: str = None):
-    # OOT platforms provide their own memory query via the platform class.
-    if current_platform.is_out_of_tree():
-        mem_bytes = current_platform.get_device_total_memory()
-        if mem_bytes:
-            return mem_bytes / (1 << 20)  # bytes -> MiB
-        return None
-    if is_cuda():
-        gpu_mem = get_nvgpu_memory_capacity()
-    elif is_hip():
-        gpu_mem = get_amdgpu_memory_capacity()
-    elif device == "hpu":
-        gpu_mem = get_hpu_memory_capacity()
-    elif device == "npu":
-        gpu_mem = get_npu_memory_capacity()
-    elif device == "cpu":
-        gpu_mem = get_cpu_memory_capacity()
-    elif device == "xpu":
-        gpu_mem = get_xpu_memory_capacity()
-    elif device == "musa":
-        gpu_mem = get_mtgpu_memory_capacity()
-    else:
-        # GPU memory is not known yet or no GPU is available.
-        gpu_mem = None
-
-    return gpu_mem
-
-
 # Copy from pytorch and OpenRLHF to allow creating multiple main groups.
 # https://github.com/pytorch/pytorch/blob/main/torch/distributed/distributed_c10d.py
 # https://github.com/OpenRLHF/OpenRLHF/blob/main/openrlhf/utils/distributed_util.py
@@ -2072,172 +2475,6 @@ def print_warning_once(msg: str) -> None:
 @functools.lru_cache(None)
 def print_info_once(msg: str) -> None:
     logger.info(msg)
-
-
-def get_device_name(device_id: int = 0) -> str:
-    if (hasattr(torch, "cuda") and torch.cuda.is_available()) or is_musa():
-        return torch.cuda.get_device_name(device_id)
-
-    if hasattr(torch, "xpu") and torch.xpu.is_available():
-        return torch.xpu.get_device_name(device_id)
-
-    if hasattr(torch, "hpu") and torch.hpu.is_available():
-        return torch.hpu.get_device_name(device_id)
-
-    if hasattr(torch, "npu") and torch.npu.is_available():
-        return torch.npu.get_device_name(device_id)
-
-
-@lru_cache(maxsize=1)
-def is_habana_available() -> bool:
-    return find_spec("habana_frameworks") is not None
-
-
-@lru_cache(maxsize=8)
-def get_device(device_id: Optional[int] = None) -> str:
-    if is_cpu():
-        if cpu_has_amx_support():
-            logger.info("Intel AMX is detected, using CPU with Intel AMX support.")
-        else:
-            logger.warning(
-                "CPU device enabled, using torch native backend, low performance expected."
-            )
-        return "cpu"
-
-    if hasattr(torch, "cuda") and torch.cuda.is_available():
-        if device_id is None:
-            return "cuda"
-        return "cuda:{}".format(device_id)
-
-    if hasattr(torch, "xpu") and torch.xpu.is_available():
-        if device_id is None:
-            return "xpu"
-        return "xpu:{}".format(device_id)
-
-    if is_npu():
-        if device_id is None:
-            return "npu"
-        return "npu:{}".format(device_id)
-
-    if is_habana_available():
-        try:
-            import habana_frameworks.torch.hpu  # noqa: F401
-
-            if torch.hpu.is_available():
-                if device_id is None:
-                    return "hpu"
-                return "hpu:{}".format(device_id)
-        except ImportError:
-            raise ImportError(
-                "Habana frameworks detected, but failed to import 'habana_frameworks.torch.hpu'."
-            )
-
-    if is_musa():
-        if device_id is None:
-            return "musa"
-        return "musa:{}".format(device_id)
-
-    if is_mps():
-        if device_id is None:
-            return "mps"
-        return "mps:{}".format(device_id)
-
-    try:
-        return current_platform.get_device(device_id)
-    except Exception:
-        raise RuntimeError(
-            "No accelerator (CUDA, XPU, HPU, NPU, MUSA, MPS) or platform plugin is available."
-        )
-
-
-@lru_cache(maxsize=1)
-def get_device_count() -> int:
-    if (hasattr(torch, "cuda") and torch.cuda.is_available()) or is_musa():
-        try:
-            return torch.cuda.device_count()
-        except RuntimeError:
-            return 0
-
-    if hasattr(torch, "xpu") and torch.xpu.is_available():
-        try:
-            return torch.xpu.device_count()
-        except RuntimeError:
-            return 0
-
-    if is_habana_available():
-        try:
-            import habana_frameworks.torch.hpu  # noqa: F401
-
-            if torch.hpu.is_available():
-                return torch.hpu.device_count()
-        except (ImportError, RuntimeError):
-            return 0
-
-    return 0  # No accelerators available
-
-
-def get_device_core_count(device_id: int = 0) -> int:
-    if (hasattr(torch, "cuda") and torch.cuda.is_available()) or is_musa():
-        return torch.cuda.get_device_properties(device_id).multi_processor_count
-    elif hasattr(torch, "xpu") and torch.xpu.is_available():
-        return torch.xpu.get_device_properties(device_id).gpu_eu_count
-
-    return 0
-
-
-def get_device_capability(device_id: int = 0) -> Tuple[int, int]:
-    major, minor = None, None
-    if (hasattr(torch, "cuda") and torch.cuda.is_available()) or is_musa():
-        major, minor = torch.cuda.get_device_capability(device_id)
-
-    if hasattr(torch, "xpu") and torch.xpu.is_available():
-        major, minor, *_ = torch.xpu.get_device_capability(device_id)["version"].split(
-            "."
-        )
-        # Currently XPU version does not contain capability information.
-        major, minor = None, None
-
-    if hasattr(torch, "hpu") and torch.hpu.is_available():
-        try:
-            # TODO(HandH1998): `get_device_capability` is not supported by `torch.hpu` for now.
-            # Update this once the support is available.
-            # major, minor = torch.hpu.get_device_capability(device_id)
-            major, minor = None, None
-        except Exception as e:
-            raise RuntimeError(
-                f"An error occurred while getting device capability of hpu: {e}."
-            ) from e
-
-    return major, minor
-
-
-def get_compiler_backend(mode=None) -> str:
-    # OOT platforms provide their own compile backend.
-    if current_platform.is_out_of_tree():
-        return current_platform.get_compile_backend(mode)
-
-    if hasattr(torch, "hpu") and torch.hpu.is_available():
-        return "hpu_backend"
-
-    if hasattr(torch, "npu") and torch.npu.is_available():
-        try:
-            import torchair
-            import torchair.ge_concrete_graph.ge_converter.experimental.patch_for_hcom_allreduce
-            from torchair.configs.compiler_config import CompilerConfig
-        except ImportError:
-            raise ImportError(
-                "NPU detected, but torchair package is not installed. "
-                "Please install torchair for torch.compile support on NPU."
-            )
-        compiler_config = CompilerConfig()
-        compiler_config.mode = "max-autotune"
-        if mode == "npugraph_ex":
-            compiler_config.mode = "reduce-overhead"
-            compiler_config.debug.run_eagerly = True
-        npu_backend = torchair.get_npu_backend(compiler_config=compiler_config)
-        return npu_backend
-
-    return "inductor"
 
 
 sglang_lib = Library("sglang", "FRAGMENT")  # noqa
@@ -2829,15 +3066,6 @@ def launch_dummy_health_check_server(host, port, enable_metrics):
     )
 
 
-def set_cuda_arch():
-    if is_flashinfer_available():
-        capability = torch.cuda.get_device_capability()
-        arch = f"{capability[0]}.{capability[1]}"
-        os.environ["FLASHINFER_CUDA_ARCH_LIST"] = (
-            f"{arch}{'a' if capability[0] >= 9 else ''}"
-        )
-
-
 def cdiv(a: int, b: int) -> int:
     """Ceiling division."""
     return -(a // -b)
@@ -3231,6 +3459,16 @@ def require_mlp_tp_gather(server_args: ServerArgs):
         elif not server_args.enable_dp_lm_head:
             return True
         elif get_moe_a2a_backend().is_none():
+            return True
+        elif get_moe_a2a_backend().is_flashinfer():
+            # FlashInfer MoE A2A needs a rank-invariant, DP-synchronized per-rank
+            # token count: MoeAlltoAll uses fixed-geometry buffers and the decode
+            # cuda-graph bucket must be identical across EP ranks, otherwise ranks
+            # replay different-sized graphs -> geometry mismatch -> illegal memory
+            # access (issue #30242). No literal MLP TP-gather happens here -- the
+            # MoE stays SCATTERED and the a2a op owns dispatch/combine -- but we
+            # reuse this flag's DP-sync bookkeeping (uniform global_num_tokens +
+            # max-based graph bucket). See #30432 re: the misleading flag name.
             return True
         else:
             return (
@@ -3748,47 +3986,6 @@ def parse_module_path(module_path, function_name, create_dummy):
     return final_module, None
 
 
-def mxfp_supported():
-    """
-    Returns whether the current platform supports MX types.
-    """
-    if torch.version.hip:
-        gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
-        return any(gfx in gcn_arch for gfx in ["gfx95"])
-    else:
-        return False
-
-
-@lru_cache(maxsize=1)
-def is_gfx95_supported():
-    """
-    Returns whether the current platform supports MX types.
-    """
-    if torch.version.hip:
-        gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
-        return any(gfx in gcn_arch for gfx in ["gfx95"])
-    else:
-        return False
-
-
-@lru_cache(maxsize=1)
-def is_gfx942_supported():
-    """
-    Returns whether the current platform is AMD CDNA3 (gfx942 — MI300X / MI325X).
-    """
-    if torch.version.hip:
-        gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
-        return any(gfx in gcn_arch for gfx in ["gfx942"])
-    else:
-        return False
-
-
-def get_hip_version():
-    if torch.version.hip:
-        return tuple(map(int, torch.version.hip.split("-")[0].split(".")))
-    return (0, 0, 0)
-
-
 # LoRA-related constants and utilities
 SUPPORTED_LORA_TARGET_MODULES = [
     "q_proj",
@@ -3913,106 +4110,6 @@ def is_triton_kernels_available() -> bool:
     return ragged_metadata_spec is not None
 
 
-@lru_cache(maxsize=1)
-def get_nvidia_driver_version() -> tuple:
-    """Return the NVIDIA driver version as a tuple of ints, e.g. (595, 58, 3).
-    Returns (0,) on failure."""
-    version_str = get_nvidia_driver_version_str()
-    if version_str is None:
-        return (0,)
-    try:
-        return tuple(int(x) for x in version_str.split("."))
-    except ValueError:
-        return (0,)
-
-
-@lru_cache(maxsize=1)
-def get_nvidia_driver_version_str() -> str | None:
-    """Return the NVIDIA driver version string, e.g. '595.58.03'.
-    Returns None on failure."""
-    try:
-        result = subprocess.run(
-            [
-                "nvidia-smi",
-                "--query-gpu=driver_version",
-                "--format=csv,noheader,nounits",
-            ],
-            capture_output=True,
-            text=True,
-            check=True,
-            timeout=10,
-        )
-        version_str = result.stdout.strip().split("\n")[0].strip()
-        return version_str if version_str else None
-    except (subprocess.CalledProcessError, FileNotFoundError, ValueError):
-        return None
-
-
-def check_cuda_result(raw_output):
-    import cuda.bindings.runtime as cuda_rt
-
-    err, *results = raw_output
-    if err != cuda_rt.cudaError_t.cudaSuccess:
-        raise Exception(f"CUDA error: {err}")
-
-    return results
-
-
-def get_cuda_driver_bindings():
-    try:
-        from cuda.bindings import driver as cuda_driver
-    except ImportError:
-        from cuda import cuda as cuda_driver
-
-    return cuda_driver
-
-
-def get_physical_device_id(pytorch_device_id: int) -> int:
-    """
-    Convert PyTorch logical device ID to physical device ID.
-
-    When CUDA_VISIBLE_DEVICES is set, maps the logical device ID (as seen by PyTorch)
-    to the actual physical device ID. If CUDA_VISIBLE_DEVICES is not set, returns
-    the device ID unchanged.
-
-    Args:
-        pytorch_device_id: The logical device ID from PyTorch (e.g., torch.cuda.current_device())
-
-    Returns:
-        The physical device ID
-    """
-    device_idx = int(pytorch_device_id)
-    cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", None)
-    if cuda_visible_devices:
-        device_list = cuda_visible_devices.split(",")
-        return int(device_list[device_idx])
-    else:
-        return device_idx
-
-
-def get_device_sm_nvidia_smi():
-    try:
-        # Run nvidia-smi command and capture output
-        result = subprocess.run(
-            ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-
-        # Get the first line of output (assuming at least one GPU exists)
-        compute_cap_str = result.stdout.strip().split("\n")[0]
-
-        # Convert string (e.g., "9.0") to tuple of integers (9, 0)
-        major, minor = map(int, compute_cap_str.split("."))
-        return (major, minor)
-
-    except (subprocess.CalledProcessError, FileNotFoundError, ValueError) as e:
-        # Handle cases where nvidia-smi isn't available or output is unexpected
-        logger.error("Error getting compute capability: %s", e)
-        return (0, 0)  # Default/fallback value
-
-
 def json_list_type(value):
     try:
         return orjson.loads(value)
@@ -4020,32 +4117,6 @@ def json_list_type(value):
         raise argparse.ArgumentTypeError(
             f"Invalid JSON list: {value}. Please provide a valid JSON list."
         )
-
-
-@contextmanager
-def maybe_reindex_device_id(gpu_id: int):
-
-    if envs.SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS.get() is False or not is_cuda_alike():
-        yield gpu_id
-        return
-
-    original_cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
-    if original_cuda_visible_devices:
-        cuda_visible_devices = original_cuda_visible_devices.split(",")
-    else:
-        cuda_visible_devices = []
-
-    str_gpu_id = cuda_visible_devices[gpu_id] if cuda_visible_devices else str(gpu_id)
-    os.environ["CUDA_VISIBLE_DEVICES"] = str_gpu_id
-
-    logger.debug(f"Set CUDA_VISIBLE_DEVICES to {str_gpu_id}")
-
-    yield 0
-
-    if original_cuda_visible_devices:
-        os.environ["CUDA_VISIBLE_DEVICES"] = original_cuda_visible_devices
-    else:
-        del os.environ["CUDA_VISIBLE_DEVICES"]
 
 
 def get_extend_input_len_swa_limit(
@@ -4280,16 +4351,6 @@ def temp_attr_context(obj, attr, value):
         yield
     finally:
         setattr(obj, attr, original_value)
-
-
-cached_device_index = -1
-
-
-def get_current_device_stream_fast():
-    global cached_device_index
-    if cached_device_index == -1:
-        cached_device_index = torch.get_device_module().current_device()
-    return torch.get_device_module().current_stream(cached_device_index)
 
 
 def raise_error_or_warn(obj, strict, counter_name, message, log_interval=1000):

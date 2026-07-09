@@ -80,6 +80,7 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
 from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
+from sglang.srt.layers.quantization.unquant import initialize_bf16_gemm_config
 from sglang.srt.lora.lora_drainer import LoRADrainer
 from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
@@ -577,15 +578,6 @@ class Scheduler(
                 if self.server_args.dllm_algorithm is not None
                 else None
             )
-            if self.dllm_config:
-                if self.dllm_config.block_size < self.page_size:
-                    logger.warning(
-                        "WARNING: "
-                        f"The page size {self.page_size} should not be larger than dllm block size {self.dllm_config.block_size}."
-                        f"Page size now falls back to {self.dllm_config.block_size}"
-                    )
-                    self.page_size = self.dllm_config.block_size
-                    self.server_args.page_size = self.dllm_config.block_size
 
     def init_metrics_collector(
         self, tp_rank: int, pp_rank: int, dp_rank: Optional[int]
@@ -718,7 +710,9 @@ class Scheduler(
         # Set reasoning_parser and think_end_id if --reasoning_parser is enabled
         if self.server_args.reasoning_parser and self.tokenizer:
             reasoning_parser = ReasoningParser(
-                model_type=self.server_args.reasoning_parser, stream_reasoning=False
+                model_type=self.server_args.reasoning_parser,
+                stream_reasoning=False,
+                tokenizer=self.tokenizer,
             )
             self.model_config.think_end_id = self.tokenizer.encode(
                 reasoning_parser.detector.think_end_token, add_special_tokens=False
@@ -747,6 +741,7 @@ class Scheduler(
         # Initialize GEMM-related configuration for FP8 and FP4 backends.
         initialize_fp8_gemm_config(self.server_args)
         initialize_fp4_gemm_config(self.server_args)
+        initialize_bf16_gemm_config(self.server_args)
 
         # This must be called after initialize_moe_config
         self.require_mlp_sync = require_mlp_sync(self.server_args)
@@ -794,8 +789,9 @@ class Scheduler(
         )
 
         if self.server_args.speculative_draft_load_format is not None:
-            self.server_args.load_format = (
-                self.server_args.speculative_draft_load_format
+            self.server_args.override(
+                "scheduler.draft_load_format",
+                load_format=self.server_args.speculative_draft_load_format,
             )
             logger.info(
                 f"Using draft model load_format: '{self.server_args.speculative_draft_load_format}'"
@@ -854,12 +850,15 @@ class Scheduler(
         self.init_tp_model_worker()
         self.maybe_init_draft_worker()
 
-        # Allocate KV cache pools for all workers.
+        # Prepare KV cache pools for all workers
         self.init_memory_pools()
 
-        # TODO: make memory profile consider cuda graph memory as well
         self.init_all_attention_backends()
         self.init_all_cuda_graphs()
+
+        model_runner = self.tp_worker.model_runner
+        if model_runner.token_to_kv_pool.post_capture_active:
+            model_runner.post_capture_resize_kv_pool()
 
         # Dispatch the model worker
         if self.spec_algorithm.is_none():
@@ -895,8 +894,11 @@ class Scheduler(
                 min_free_slots=min_free_slots
             )
         if not get_global_server_args().pp_max_micro_batch_size:
-            get_global_server_args().pp_max_micro_batch_size = max(
-                self.max_running_requests // self.ps.pp_size, 1
+            get_global_server_args().override(
+                "scheduler.pp_max_micro_batch_size_default",
+                pp_max_micro_batch_size=max(
+                    self.max_running_requests // self.ps.pp_size, 1
+                ),
             )
 
         self.tp_group = get_tp_group()
@@ -1330,6 +1332,21 @@ class Scheduler(
                 ),
                 ignore_tokens=None,
             )
+            # Mark the chunked (not-yet-finished) prefill request so sample()
+            # skips writing its pseudo next-token into the ngram token table.
+            # Use self.chunked_req identity (not req.is_chunked) to avoid
+            # overlap-scheduling timing issues.
+            if self.chunked_req is not None:
+                skip_token_table_update = [
+                    req is self.chunked_req for req in batch.reqs
+                ]
+                batch.ne_skip_token_table_update = (
+                    torch.tensor(
+                        skip_token_table_update, dtype=torch.bool, device=device
+                    )
+                    if any(skip_token_table_update)
+                    else None
+                )
         return batch
 
     def init_deterministic_inference_config(self):
@@ -2752,7 +2769,7 @@ class Scheduler(
         # Check if the grammar is ready in the grammar queue
         self._process_ready_grammar_requests_without_pp_consensus()
 
-        if self.enable_hierarchical_cache:
+        if self.enable_hierarchical_cache or self.server_args.enable_flexkv:
             self.tree_cache.check_hicache_events()
 
         if self.enable_priority_preemption or self.is_hybrid_swa:
@@ -3658,17 +3675,20 @@ class Scheduler(
             return AttachHiCacheStorageReqOutput(success=False, message=str(e))
         if ok:
             self.enable_hicache_storage = True
-            self.server_args.hicache_storage_backend = recv_req.hicache_storage_backend
+            hicache_fields = {
+                "hicache_storage_backend": recv_req.hicache_storage_backend
+            }
             if recv_req.hicache_storage_backend_extra_config_json is not None:
-                self.server_args.hicache_storage_backend_extra_config = (
+                hicache_fields["hicache_storage_backend_extra_config"] = (
                     recv_req.hicache_storage_backend_extra_config_json
                 )
             if recv_req.hicache_storage_prefetch_policy is not None:
-                self.server_args.hicache_storage_prefetch_policy = (
+                hicache_fields["hicache_storage_prefetch_policy"] = (
                     recv_req.hicache_storage_prefetch_policy
                 )
             if recv_req.hicache_write_policy is not None:
-                self.server_args.hicache_write_policy = recv_req.hicache_write_policy
+                hicache_fields["hicache_write_policy"] = recv_req.hicache_write_policy
+            self.server_args.override("scheduler.attach_hicache", **hicache_fields)
             logger.info(
                 f"Attached HiCache storage backend: {recv_req.hicache_storage_backend}"
             )
@@ -3709,8 +3729,11 @@ class Scheduler(
         if ok or (not self.enable_hicache_storage):
             # Treat "already disabled / nothing to do" as success for idempotence.
             self.enable_hicache_storage = False
-            self.server_args.hicache_storage_backend = None
-            self.server_args.hicache_storage_backend_extra_config = None
+            self.server_args.override(
+                "scheduler.detach_hicache",
+                hicache_storage_backend=None,
+                hicache_storage_backend_extra_config=None,
+            )
             logger.info("Detached HiCache storage backend.")
             return DetachHiCacheStorageReqOutput(
                 success=True, message=msg or "HiCache storage backend is detached."
@@ -3915,6 +3938,9 @@ class Scheduler(
             for req in self.disagg_prefill_bootstrap_queue.queue:
                 if recv_req.abort_all or req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort bootstrap queue request. {req.rid=}")
+                    if self.enable_hicache_storage:
+                        self.tree_cache.release_aborted_request(req.rid)
+
                     if hasattr(req.disagg_kv_sender, "abort"):
                         req.disagg_kv_sender.abort()
 

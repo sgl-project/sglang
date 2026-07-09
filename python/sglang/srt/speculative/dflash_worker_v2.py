@@ -8,6 +8,7 @@ from sglang.srt.distributed import get_tp_group
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -117,6 +118,12 @@ class DFlashWorkerV2(BaseSpecWorker):
         self.nccl_port = nccl_port
         self._target_worker = target_worker
         self.model_runner = target_worker.model_runner
+        self._need_mamba_verify_commit = (
+            self.model_runner.mambaish_config is not None
+            and hasattr(
+                self.model_runner.attn_backend, "update_mamba_state_after_mtp_verify"
+            )
+        )
         self.page_size = server_args.page_size
         # Normalized in arg_groups.speculative_hook.handle_speculative_decoding.
         self.draft_window_size: Optional[int] = (
@@ -281,7 +288,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._draft_worker.init_attention_backends()
 
     def init_cuda_graphs(self):
-        capture_decode_cuda_graph = not self.server_args.disable_cuda_graph
+        capture_decode_cuda_graph = (
+            self.server_args.cuda_graph_config.decode.backend != Backend.DISABLED
+        )
         if is_cuda() and capture_decode_cuda_graph:
             available_mem = get_available_gpu_memory(self.device, self.gpu_id)
             if available_mem < 1.0:
@@ -1099,9 +1108,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         cache per-step intermediate states. After acceptance, we need to commit the
         state corresponding to each request's last accepted step.
         """
-        attn_backend = self.target_worker.model_runner.attn_backend
-        if not hasattr(attn_backend, "update_mamba_state_after_mtp_verify"):
+        if not self._need_mamba_verify_commit:
             return
+        attn_backend = self.target_worker.model_runner.attn_backend
 
         last_correct_step_indices = commit_lens.to(torch.int64) - 1
         mamba_steps_to_track = None
@@ -1530,12 +1539,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         batch.out_cache_loc = verify_out_cache_loc
         sampling_info = batch.sampling_info
 
-        need_mamba_verify_commit = hasattr(
-            self.target_worker.model_runner.attn_backend,
-            "update_mamba_state_after_mtp_verify",
-        )
         seq_lens_pre_verify = (
-            batch.seq_lens.clone() if need_mamba_verify_commit else None
+            batch.seq_lens.clone() if self._need_mamba_verify_commit else None
         )
         seq_lens_cpu_backup = batch.seq_lens_cpu
         seq_lens_sum_backup = batch.seq_lens_sum
@@ -1655,7 +1660,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                     1, accept_len.to(torch.int64)[:, None], bonus[:, None]
                 )
 
-        if need_mamba_verify_commit:
+        if self._need_mamba_verify_commit:
             assert seq_lens_pre_verify is not None
             self._update_target_mamba_state_after_verify(
                 batch=batch,
