@@ -2,7 +2,6 @@ import ctypes
 import json
 import logging
 import os
-import threading
 import time
 import uuid
 from collections.abc import Sequence
@@ -394,14 +393,6 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 if extra_config
                 else 86400
             )
-            self.retention_renew_interval_seconds = float(
-                extra_config.get("retention_renew_interval_seconds", 1.0)
-                if extra_config
-                else 1.0
-            )
-            self._retained_pages: dict[str, float] = {}
-            self._retention_lock = threading.Lock()
-            self._last_retention_renewal = 0.0
             if self.enable_group_semantics and not self._supports_group_ids:
                 logger.warning(
                     "Mooncake group semantics is enabled, but the installed "
@@ -703,79 +694,21 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         return self._use_group_semantics
 
     def retain_pages(self, logical_keys: List[str], ttl_seconds: int) -> int:
-        """Keep existing Mooncake page groups leased until the requested deadline."""
+        """Ask Mooncake to retain existing page groups for the requested TTL."""
         if not self._can_use_group_semantics() or self.mem_pool_host.kv_buffer is None:
             return 0
         ttl_seconds = min(int(ttl_seconds), self.retention_max_ttl_seconds)
         if ttl_seconds <= 0 or self.retention_max_pages <= 0:
             return 0
-
-        deadline = time.monotonic() + ttl_seconds
-        accepted = 0
-        with self._retention_lock:
-            unique_keys = dict.fromkeys(logical_keys)
-            if len(self._retained_pages) >= self.retention_max_pages and any(
-                key not in self._retained_pages for key in unique_keys
-            ):
-                now = time.monotonic()
-                self._retained_pages = {
-                    key: expiry
-                    for key, expiry in self._retained_pages.items()
-                    if expiry > now
-                }
-            for key in unique_keys:
-                if (
-                    key not in self._retained_pages
-                    and len(self._retained_pages) >= self.retention_max_pages
-                ):
-                    continue
-                self._retained_pages[key] = max(
-                    deadline, self._retained_pages.get(key, 0.0)
-                )
-                accepted += 1
-
-        return accepted
-
-    def _retention_anchor_keys(self, logical_keys: List[str]) -> List[str]:
-        tagged = self._tag_keys(logical_keys)
-        if self.is_mla_backend:
-            return [f"{key}_{self.mla_suffix}_k" for key in tagged]
-        suffix = (
-            self.mha_suffix[0] if isinstance(self.mha_suffix, list) else self.mha_suffix
-        )
-        return [f"{key}_{suffix}_k" for key in tagged]
-
-    def renew_retained_pages(self, force: bool = False) -> int:
-        """Refresh Mooncake read leases for active retained page groups."""
-        now = time.monotonic()
-        with self._retention_lock:
-            if (
-                not force
-                and now - self._last_retention_renewal
-                < self.retention_renew_interval_seconds
-            ):
-                return 0
-            self._last_retention_renewal = now
-            self._retained_pages = {
-                key: expiry
-                for key, expiry in self._retained_pages.items()
-                if expiry > now
-            }
-            logical_keys = list(self._retained_pages)
-
-        if not logical_keys:
-            return 0
+        unique_keys = list(dict.fromkeys(logical_keys))[: self.retention_max_pages]
+        group_ids = [self._make_group_id(key) for key in self._tag_keys(unique_keys)]
         try:
             return sum(
                 result == 1
-                for result in self._batch_exist(
-                    self._retention_anchor_keys(logical_keys)
-                )
+                for result in self.store.retain_groups(group_ids, ttl_seconds * 1000)
             )
         except Exception:
-            logger.warning(
-                "Failed to renew Mooncake KV retention leases", exc_info=True
-            )
+            logger.warning("Failed to retain Mooncake KV page groups", exc_info=True)
             return 0
 
     def _make_group_id(self, logical_key: str) -> str:
@@ -1324,12 +1257,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
     def close(self):
         # MooncakeDistributedStore will automatically call the destructor, so
         # it is unnecessary to close it manually.
-        with self._retention_lock:
-            self._retained_pages.clear()
+        pass
 
     def clear(self) -> None:
-        with self._retention_lock:
-            self._retained_pages.clear()
         self.store.remove_all()
 
     def _put_batch_zero_copy_impl(

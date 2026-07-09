@@ -80,6 +80,7 @@ def _fake_store_class():
         def __init__(self):
             self.batch_put_calls = []
             self.batch_exist_calls = []
+            self.retain_group_calls = []
             self.existing_keys = set()
             self.objects = {}
             type(self).instances.append(self)
@@ -103,6 +104,10 @@ def _fake_store_class():
         def batch_is_exist(self, keys):
             self.batch_exist_calls.append(list(keys))
             return [1 if key in self.existing_keys else 0 for key in keys]
+
+        def retain_groups(self, group_ids, ttl_ms):
+            self.retain_group_calls.append((list(group_ids), ttl_ms))
+            return [1] * len(group_ids)
 
         def batch_put_from(self, keys, ptrs, sizes, *args):
             self.batch_put_calls.append(
@@ -273,29 +278,29 @@ def _make_store(
 
 
 class TestMooncakeGroupSemantics(CustomTestCase):
-    def test_retention_renews_tagged_group_anchor(self):
+    def test_retention_delegates_tagged_groups_and_ttl_to_mooncake(self):
         store, fake_store = _make_store(extra_backend_tag="tag")
         store.register_mem_pool_host(FakeHostKVCache(objects_per_page=2))
-        fake_store.existing_keys.add("tag_page0_0_k")
 
         accepted = store.retain_pages(["page0"], ttl_seconds=300)
-        renewed = store.renew_retained_pages(force=True)
 
         self.assertEqual(accepted, 1)
-        self.assertEqual(renewed, 1)
-        self.assertEqual(fake_store.batch_exist_calls[-1], ["tag_page0_0_k"])
-        self.assertIn("page0", store._retained_pages)
+        self.assertEqual(
+            fake_store.retain_group_calls[-1],
+            (["sglang-hicache:tag_page0"], 300_000),
+        )
 
-    def test_retention_is_bounded_and_uses_max_deadline(self):
-        store, _ = _make_store()
+    def test_retention_request_is_bounded_and_ttl_is_capped(self):
+        store, fake_store = _make_store()
         store.register_mem_pool_host(FakeHostKVCache(objects_per_page=2))
         store.retention_max_pages = 1
+        store.retention_max_ttl_seconds = 15
 
-        self.assertEqual(store.retain_pages(["page0"], ttl_seconds=10), 1)
-        first_deadline = store._retained_pages["page0"]
-        self.assertEqual(store.retain_pages(["page1"], ttl_seconds=10), 0)
-        self.assertEqual(store.retain_pages(["page0"], ttl_seconds=20), 1)
-        self.assertGreater(store._retained_pages["page0"], first_deadline)
+        self.assertEqual(store.retain_pages(["page0", "page1"], ttl_seconds=20), 1)
+        self.assertEqual(
+            fake_store.retain_group_calls[-1],
+            (["sglang-hicache:page0"], 15_000),
+        )
 
     def test_group_id_detection_uses_class_attribute_without_instantiating(self):
         fake_store_cls = _fake_store_class()
