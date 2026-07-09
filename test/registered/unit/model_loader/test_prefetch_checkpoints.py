@@ -271,7 +271,7 @@ class TestPrefetchDispatch(CustomTestCase):
                 return_value=("/dummy", ["f.safetensors"], True),
             ),
             patch(
-                "sglang.srt.model_loader.loader.get_global_server_args",
+                "sglang.srt.model_loader.loader.get_server_args",
                 return_value=self._server_args(prefetch, disable_mmap),
             ),
             patch(
