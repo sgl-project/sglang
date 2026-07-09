@@ -112,7 +112,7 @@ class ChatCompletionSampler(SamplerBase):
         self.image_format = "url"
         self._completion_tokens: list[int] = []
         self.record_meta_info = record_meta_info
-        self._records: List[Dict[str, Any]] = []
+        self._meta_infos: List[Dict[str, Any]] = []
         print(
             f"ChatCompletionSampler initialized with {self.system_message=} {self.temperature=} {self.max_tokens=} {self.reasoning_effort=} {self.extra_body=} {self.record_meta_info=}"
         )
@@ -159,20 +159,9 @@ class ChatCompletionSampler(SamplerBase):
                     extra_body=extra_body,
                 )
                 if self.record_meta_info:
-                    self._records.append(
-                        {
-                            "request": {
-                                "model": self.model,
-                                "messages": message_list,
-                                "temperature": self.temperature,
-                                "top_p": self.top_p,
-                                "max_tokens": self.max_tokens,
-                                "reasoning_effort": self.reasoning_effort,
-                                "extra_body": extra_body,
-                            },
-                            "response": response.model_dump(),
-                        }
-                    )
+                    meta_info = getattr(response.choices[0], "meta_info", None)
+                    if meta_info:
+                        self._meta_infos.append(meta_info)
                 if response.usage and response.usage.completion_tokens is not None:
                     self._completion_tokens.append(response.usage.completion_tokens)
                 return response.choices[0].message.content or ""
@@ -221,7 +210,7 @@ class CompletionSampler(SamplerBase):
         self.stop = stop
         self._completion_tokens: list[int] = []
         self.record_meta_info = record_meta_info
-        self._records: List[Dict[str, Any]] = []
+        self._meta_infos: List[Dict[str, Any]] = []
         print(
             f"CompletionSampler initialized with {self.model=} {self.temperature=} {self.max_tokens=} {self.stop=}"
         )
@@ -248,19 +237,9 @@ class CompletionSampler(SamplerBase):
                     stop=self.stop,
                 )
                 if self.record_meta_info:
-                    self._records.append(
-                        {
-                            "request": {
-                                "model": self.model,
-                                "prompt": prompt,
-                                "temperature": self.temperature,
-                                "top_p": self.top_p,
-                                "max_tokens": self.max_tokens,
-                                "stop": self.stop,
-                            },
-                            "response": response.model_dump(),
-                        }
-                    )
+                    meta_info = getattr(response.choices[0], "meta_info", None)
+                    if meta_info:
+                        self._meta_infos.append(meta_info)
                 if response.usage and response.usage.completion_tokens is not None:
                     self._completion_tokens.append(response.usage.completion_tokens)
                 return response.choices[0].text or ""
