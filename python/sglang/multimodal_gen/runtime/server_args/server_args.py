@@ -347,6 +347,14 @@ class ServerArgs(DisaggServerArgsMixin):
     batching_delay_ms: float = 0.0
     batching_config: str | None = None
     enable_batching_metrics: bool = False
+    # Continuous batching tuning knobs (batching_mode == "continuous").
+    cb_schedule_policy: str = "largest"
+    cb_fold_cfg_branches: bool = True
+    cb_batch_bucket_sizes: str | None = None
+    cb_async_stages: bool = True
+    cb_allow_step_caches: bool = True
+    cb_varlen_packing: bool = False
+    cb_drain_export_dir: str | None = None
 
     # Strict port mode: fail if requested port is unavailable instead of auto-selecting
     strict_ports: bool = False
@@ -1772,6 +1780,61 @@ class ServerArgs(DisaggServerArgsMixin):
             help="Log periodic batch efficiency metrics such as realized batch size and queue wait time.",
         )
         parser.add_argument(
+            "--cb-schedule-policy",
+            type=str,
+            default=ServerArgs.cb_schedule_policy,
+            choices=["rotate", "largest", "srpt"],
+            help=(
+                "Continuous batching step-group policy: largest (default), "
+                "srpt (shortest remaining steps), or rotate (round-robin)."
+            ),
+        )
+        parser.add_argument(
+            "--cb-fold-cfg-branches",
+            type=lambda value: value.lower() in ("1", "true", "yes"),
+            default=ServerArgs.cb_fold_cfg_branches,
+            help="Fold CFG cond/uncond into one packed forward (batch 2B).",
+        )
+        parser.add_argument(
+            "--cb-batch-bucket-sizes",
+            type=str,
+            default=ServerArgs.cb_batch_bucket_sizes,
+            help=(
+                "Comma-separated packed-batch row buckets (e.g. '2,4') for "
+                "stable forward shapes. Empty disables bucketing."
+            ),
+        )
+        parser.add_argument(
+            "--cb-async-stages",
+            type=lambda value: value.lower() in ("1", "true", "yes"),
+            default=ServerArgs.cb_async_stages,
+            help=(
+                "Run encode/decode stages on a side stream so denoising "
+                "keeps running. Disabled when component offload is enabled."
+            ),
+        )
+        parser.add_argument(
+            "--cb-allow-step-caches",
+            type=lambda value: value.lower() in ("1", "true", "yes"),
+            default=ServerArgs.cb_allow_step_caches,
+            help="Allow TeaCache requests in the continuous loop (unpacked).",
+        )
+        parser.add_argument(
+            "--cb-varlen-packing",
+            type=lambda value: value.lower() in ("1", "true", "yes"),
+            default=ServerArgs.cb_varlen_packing,
+            help=(
+                "EXPERIMENTAL: pack different resolutions along the seq dim "
+                "(varlen attention) for supported pipelines."
+            ),
+        )
+        parser.add_argument(
+            "--cb-drain-export-dir",
+            type=str,
+            default=ServerArgs.cb_drain_export_dir,
+            help="Directory to drain/resume in-flight request state.",
+        )
+        parser.add_argument(
             "--host",
             type=str,
             default=ServerArgs.host,
@@ -2382,6 +2445,23 @@ class ServerArgs(DisaggServerArgsMixin):
             raise ValueError("batching_max_size must be >= 1")
         if self.batching_delay_ms < 0:
             raise ValueError("batching_delay_ms must be >= 0")
+        if self.cb_schedule_policy not in ("rotate", "largest", "srpt"):
+            raise ValueError("cb_schedule_policy must be one of: rotate, largest, srpt")
+        if self.cb_batch_bucket_sizes:
+            try:
+                buckets = [
+                    int(item)
+                    for item in str(self.cb_batch_bucket_sizes)
+                    .replace(" ", "")
+                    .split(",")
+                    if item
+                ]
+            except ValueError as e:
+                raise ValueError(
+                    "cb_batch_bucket_sizes must be a comma-separated list of ints"
+                ) from e
+            if any(bucket < 1 for bucket in buckets):
+                raise ValueError("cb_batch_bucket_sizes entries must be >= 1")
         if self.batching_mode == "continuous":
             validate_continuous_batching_config(self)
 

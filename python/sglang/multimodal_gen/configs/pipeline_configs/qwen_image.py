@@ -142,6 +142,11 @@ class QwenImagePipelineConfig(QwenImageRolloutPipelineMixin, ImagePipelineConfig
     """Configuration for the QwenImage pipeline."""
 
     continuous_batching_supported_tasks = (ModelTaskType.T2I,)
+    # Qwen-Image does not branch on is_cfg_negative, so cond/uncond can fold.
+    supports_cfg_batch_folding = True
+    # The DiT accepts per-row image masks and per-token rope positions, so
+    # different resolutions can share one packed forward.
+    supports_varlen_step_packing = True
 
     should_use_guidance: bool = False
     task_type: ModelTaskType = ModelTaskType.T2I

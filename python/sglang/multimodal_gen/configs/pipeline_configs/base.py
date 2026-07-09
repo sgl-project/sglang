@@ -199,6 +199,10 @@ class PipelineConfig:
     """The base configuration class for a generation pipeline."""
 
     continuous_batching_supported_tasks: ClassVar[tuple[ModelTaskType, ...]] = ()
+    # True when cond/uncond can run as one batched forward (batch 2B).
+    supports_cfg_batch_folding: ClassVar[bool] = False
+    # True when different resolutions can pack along the sequence dim (varlen).
+    supports_varlen_step_packing: ClassVar[bool] = False
 
     task_type: ModelTaskType = ModelTaskType.I2I
     skip_input_image_preprocess: bool = False

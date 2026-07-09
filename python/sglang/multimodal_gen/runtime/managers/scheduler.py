@@ -42,6 +42,11 @@ from sglang.multimodal_gen.runtime.managers.continuous_batching import (
     ContinuousDenoisingCoordinator,
     ContinuousResponseGroup,
     DenoisingRequestState,
+    validate_continuous_batching_request,
+)
+from sglang.multimodal_gen.runtime.managers.continuous_stage_worker import (
+    AsyncContinuousStageWorker,
+    async_stages_supported,
 )
 from sglang.multimodal_gen.runtime.managers.cpu_worker import CPUWorker
 from sglang.multimodal_gen.runtime.managers.dynamic_batch_admission import (
@@ -76,6 +81,19 @@ logger = init_logger(__name__)
 
 _MAX_RECV_REQS_PER_POLL = 1024
 _BATCH_METRICS_LOG_INTERVAL = 5
+
+
+@dataclasses.dataclass(slots=True)
+class _PendingAdmission:
+    """A request whose encode stages are running on the stage worker."""
+
+    identity: bytes | None
+    req: "Req"
+    raw_req_snapshot: "Req | None"
+    enqueue_time: float
+    group_id: str | None = None
+    group_index: int = 0
+    group_size: int = 1
 
 
 class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisaggMixin):
@@ -159,6 +177,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         self._batch_metrics_window = BatchMetricsWindow()
         self._batch_admission = BatchAdmissionController(server_args, gpu_id=local_rank)
         self._response_group_counter = 0
+        self._next_admission_ticket = 0
         self._poller = zmq.Poller()
         if self.receiver is not None:
             self._poller.register(self.receiver, zmq.POLLIN)
@@ -1079,8 +1098,13 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         self,
         active_states: list[DenoisingRequestState],
         candidate_reqs: list[Req],
+        pending_reqs: list[Req] | None = None,
     ) -> str | None:
-        proposed = [state.req for state in active_states] + candidate_reqs
+        proposed = (
+            [state.req for state in active_states]
+            + list(pending_reqs or [])
+            + candidate_reqs
+        )
         if not proposed:
             return None
 
@@ -1117,7 +1141,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         req_or_group: Req | list[Req] | None = None,
         is_warmup: bool = False,
     ) -> bool:
-        """Return a continuous-batching result using normal warmup policy."""
+        """Return a continuous-batching result, respecting warmup policy."""
         should_not_return = is_warmup
         if (
             is_warmup
@@ -1169,26 +1193,116 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         active_states: list[DenoisingRequestState],
         denoising_batch: list[DenoisingRequestState],
     ) -> list[DenoisingRequestState]:
-        """Rotate just-run states behind other active requests for fairness."""
+        """Move just-run states to the back of the active list."""
         just_ran = {id(state) for state in denoising_batch}
         return [state for state in active_states if id(state) not in just_ran] + [
             state for state in active_states if id(state) in just_ran
         ]
+
+    def _admit_single_continuous_request(
+        self,
+        continuous_coordinator: ContinuousDenoisingCoordinator,
+        active_states: list[DenoisingRequestState],
+        stage_worker: Any | None,
+        pending_admissions: dict[int, "_PendingAdmission"],
+        *,
+        identity: bytes | None,
+        req: Req,
+        enqueue_time: float,
+        group_id: str | None = None,
+        group_index: int = 0,
+        group_size: int = 1,
+        pending_groups: dict[str, ContinuousResponseGroup] | None = None,
+    ) -> None:
+        """Admit one request synchronously or via the async stage worker."""
+
+        def on_error(e: Exception, log: bool = False) -> None:
+            if log:
+                logger.error(
+                    "Error admitting request for continuous batching: %s",
+                    e,
+                    exc_info=True,
+                )
+                message = f"continuous batching admission failed: {e}"
+            else:
+                message = str(e)
+            if group_id is not None and pending_groups is not None:
+                group = pending_groups.get(group_id)
+                if group is not None:
+                    group.set_member_output(group_index, OutputBatch(error=message))
+                    self._return_response_group_if_complete(group_id, pending_groups)
+            else:
+                self._return_continuous_result(
+                    OutputBatch(error=message),
+                    identity,
+                    req_or_group=req,
+                    is_warmup=req.is_warmup,
+                )
+
+        if stage_worker is None or req.is_warmup:
+            try:
+                state = continuous_coordinator.prepare_request_state(
+                    identity=identity,
+                    req=req,
+                    response_group_id=group_id,
+                    response_index=group_index,
+                    response_group_size=group_size,
+                )
+                state.queue_wait_ms = (time.monotonic() - enqueue_time) * 1000.0
+                active_states.append(state)
+            except ContinuousBatchingError as e:
+                on_error(e)
+            except Exception as e:
+                on_error(e, log=True)
+            return
+
+        # Validate on the scheduler thread, then run encode on the side stream.
+        try:
+            validate_continuous_batching_request(req, self.server_args)
+        except ContinuousBatchingError as e:
+            on_error(e)
+            return
+        raw_req_snapshot = continuous_coordinator._snapshot_raw_request(req)
+        ticket = self._next_admission_ticket
+        self._next_admission_ticket += 1
+        pending_admissions[ticket] = _PendingAdmission(
+            identity=identity,
+            req=req,
+            raw_req_snapshot=raw_req_snapshot,
+            enqueue_time=enqueue_time,
+            group_id=group_id,
+            group_index=group_index,
+            group_size=group_size,
+        )
+        pipeline = continuous_coordinator.pipeline
+        server_args = self.server_args
+        stage_worker.submit(
+            "encode",
+            ticket,
+            lambda: pipeline.run_stages_before_denoising(req, server_args),
+        )
 
     def _admit_waiting_requests_to_continuous_loop(
         self,
         continuous_coordinator: ContinuousDenoisingCoordinator,
         active_states: list[DenoisingRequestState],
         pending_groups: dict[str, ContinuousResponseGroup],
+        stage_worker: Any | None = None,
+        pending_admissions: dict[int, "_PendingAdmission"] | None = None,
     ) -> None:
-        """Move queued requests into the active continuous denoising set."""
+        """Admit queued requests into the active continuous denoising set."""
+        if pending_admissions is None:
+            pending_admissions = {}
         while self.waiting_queue:
             identity, req_or_group, enqueue_time = self.waiting_queue[0]
+            has_inflight = bool(active_states) or bool(pending_admissions)
 
             if any(state.req.is_warmup for state in active_states) or (
-                active_states and self._continuous_item_is_warmup(req_or_group)
+                has_inflight and self._continuous_item_is_warmup(req_or_group)
             ):
                 break
+
+            pending_reqs = [item.req for item in pending_admissions.values()]
 
             if self._is_continuous_request_group(req_or_group):
                 group_reqs = req_or_group
@@ -1207,9 +1321,10 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                 reject_reason = self._get_continuous_admission_reject_reason(
                     active_states,
                     group_reqs,
+                    pending_reqs,
                 )
                 if reject_reason is not None:
-                    if active_states:
+                    if has_inflight:
                         break
                     self._record_batch_reject_metrics(reject_reason)
                     self.waiting_queue.popleft()
@@ -1232,37 +1347,28 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                 group = ContinuousResponseGroup(identity=identity, reqs=group_reqs)
                 pending_groups[group_id] = group
                 for index, req in enumerate(group_reqs):
-                    try:
-                        state = continuous_coordinator.prepare_request_state(
-                            identity=identity,
-                            req=req,
-                            response_group_id=group_id,
-                            response_index=index,
-                            response_group_size=len(group_reqs),
-                        )
-                        state.queue_wait_ms = (time.monotonic() - enqueue_time) * 1000.0
-                        active_states.append(state)
-                    except ContinuousBatchingError as e:
-                        group.set_member_output(index, OutputBatch(error=str(e)))
-                    except Exception as e:
-                        logger.error(
-                            "Error admitting grouped request for continuous batching: %s",
-                            e,
-                            exc_info=True,
-                        )
-                        group.set_member_output(
-                            index,
-                            OutputBatch(
-                                error=f"continuous batching admission failed: {e}"
-                            ),
-                        )
+                    self._admit_single_continuous_request(
+                        continuous_coordinator,
+                        active_states,
+                        stage_worker,
+                        pending_admissions,
+                        identity=identity,
+                        req=req,
+                        enqueue_time=enqueue_time,
+                        group_id=group_id,
+                        group_index=index,
+                        group_size=len(group_reqs),
+                        pending_groups=pending_groups,
+                    )
                 self._return_response_group_if_complete(group_id, pending_groups)
                 if self._continuous_item_is_warmup(group_reqs):
                     break
                 continue
 
             if not isinstance(req_or_group, Req):
-                if active_states and not isinstance(req_or_group, ShutdownReq):
+                if (active_states or pending_admissions) and not isinstance(
+                    req_or_group, ShutdownReq
+                ):
                     break
                 self.waiting_queue.popleft()
                 try:
@@ -1282,9 +1388,10 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             reject_reason = self._get_continuous_admission_reject_reason(
                 active_states,
                 [req_or_group],
+                pending_reqs,
             )
             if reject_reason is not None:
-                if active_states:
+                if has_inflight:
                     break
                 self._record_batch_reject_metrics(reject_reason)
                 self.waiting_queue.popleft()
@@ -1302,34 +1409,17 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                 continue
 
             self.waiting_queue.popleft()
-            try:
-                state = continuous_coordinator.prepare_request_state(
-                    identity=identity,
-                    req=req_or_group,
-                )
-                state.queue_wait_ms = (time.monotonic() - enqueue_time) * 1000.0
-                active_states.append(state)
-                if req_or_group.is_warmup:
-                    break
-            except ContinuousBatchingError as e:
-                self._return_continuous_result(
-                    OutputBatch(error=str(e)),
-                    identity,
-                    req_or_group=req_or_group,
-                    is_warmup=req_or_group.is_warmup,
-                )
-            except Exception as e:
-                logger.error(
-                    "Error admitting request for continuous batching: %s",
-                    e,
-                    exc_info=True,
-                )
-                self._return_continuous_result(
-                    OutputBatch(error=f"continuous batching admission failed: {e}"),
-                    identity,
-                    req_or_group=req_or_group,
-                    is_warmup=req_or_group.is_warmup,
-                )
+            self._admit_single_continuous_request(
+                continuous_coordinator,
+                active_states,
+                stage_worker,
+                pending_admissions,
+                identity=identity,
+                req=req_or_group,
+                enqueue_time=enqueue_time,
+            )
+            if req_or_group.is_warmup:
+                break
 
     def _return_response_group_if_complete(
         self, group_id: str, pending_groups: dict[str, ContinuousResponseGroup]
@@ -1356,7 +1446,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         state: DenoisingRequestState,
         pending_groups: dict[str, ContinuousResponseGroup],
     ) -> None:
-        """Return a completed continuous request or attach it to its group."""
+        """Return a completed request or merge it into its response group."""
         output_batch = state.output_batch or OutputBatch(error=state.error)
         if state.response_group_id is None or state.response_group_size <= 1:
             is_warmup = state.req.is_warmup
@@ -1384,9 +1474,16 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         )
 
     def _should_wait_for_more_initial_requests(
-        self, active_states: list[DenoisingRequestState]
+        self,
+        active_states: list[DenoisingRequestState],
+        pending_admissions: dict[int, "_PendingAdmission"] | None = None,
     ) -> bool:
-        if active_states or not self.waiting_queue or self._batching_delay_s <= 0:
+        if (
+            active_states
+            or pending_admissions
+            or not self.waiting_queue
+            or self._batching_delay_s <= 0
+        ):
             return False
         _identity, req_or_group, enqueue_time = self.waiting_queue[0]
         if isinstance(req_or_group, Req):
@@ -1401,11 +1498,106 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             return False
         return (time.monotonic() - enqueue_time) < self._batching_delay_s
 
+    def _process_stage_worker_results(
+        self,
+        continuous_coordinator: ContinuousDenoisingCoordinator,
+        stage_worker: Any,
+        active_states: list[DenoisingRequestState],
+        pending_groups: dict[str, ContinuousResponseGroup],
+        pending_admissions: dict[int, _PendingAdmission],
+        pending_finalizes: dict[int, DenoisingRequestState],
+        *,
+        block_one: bool = False,
+    ) -> None:
+        """Apply finished async encode/finalize jobs to the active loop."""
+        for result in stage_worker.poll_results(block_one=block_one):
+            if result.kind == "encode":
+                pending = pending_admissions.pop(result.ticket, None)
+                if pending is None:
+                    continue
+                if result.error is not None:
+                    self._fail_pending_admission(pending, pending_groups, result.error)
+                    continue
+                try:
+                    state = continuous_coordinator.prepare_request_state_from_prepared(
+                        identity=pending.identity,
+                        prepared_req=result.value,
+                        raw_req_snapshot=pending.raw_req_snapshot,
+                        response_group_id=pending.group_id,
+                        response_index=pending.group_index,
+                        response_group_size=pending.group_size,
+                    )
+                    state.queue_wait_ms = (
+                        time.monotonic() - pending.enqueue_time
+                    ) * 1000.0
+                    active_states.append(state)
+                except Exception as e:
+                    self._fail_pending_admission(pending, pending_groups, e)
+            elif result.kind == "finalize":
+                state = pending_finalizes.pop(result.ticket, None)
+                if state is None:
+                    continue
+                if result.error is not None and state.output_batch is None:
+                    state.set_error_output(
+                        f"continuous batching completion failed: {result.error}"
+                    )
+                self._safe_return_completed_request_state(state, pending_groups)
+
+    def _fail_pending_admission(
+        self,
+        pending: _PendingAdmission,
+        pending_groups: dict[str, ContinuousResponseGroup],
+        error: BaseException,
+    ) -> None:
+        message = (
+            str(error)
+            if isinstance(error, ContinuousBatchingError)
+            else f"continuous batching admission failed: {error}"
+        )
+        if pending.group_id is not None:
+            group = pending_groups.get(pending.group_id)
+            if group is not None:
+                group.set_member_output(pending.group_index, OutputBatch(error=message))
+                self._return_response_group_if_complete(
+                    pending.group_id, pending_groups
+                )
+            return
+        self._return_continuous_result(
+            OutputBatch(error=message),
+            pending.identity,
+            req_or_group=pending.req,
+            is_warmup=pending.req.is_warmup,
+        )
+
+    def _safe_return_completed_request_state(
+        self,
+        state: DenoisingRequestState,
+        pending_groups: dict[str, ContinuousResponseGroup],
+    ) -> None:
+        try:
+            self._return_completed_request_state(state, pending_groups)
+        except Exception as e:
+            logger.error(
+                "Error returning continuous batching result for request %s: %s",
+                state.request_id,
+                e,
+                exc_info=True,
+            )
+            self._return_continuous_result(
+                OutputBatch(error=f"continuous batching response failed: {e}"),
+                state.identity,
+                req_or_group=state.req,
+                is_warmup=state.req.is_warmup,
+            )
+
     def _run_continuous_batching_loop(self) -> None:
         logger.info(
-            "Continuous batching scheduler enabled (max_active=%d, max_delay=%.2fms)",
+            "Continuous batching scheduler enabled "
+            "(max_active=%d, max_delay=%.2fms, policy=%s, async_stages=%s)",
             self._batching_max_size,
             self._batching_delay_s * 1000.0,
+            getattr(self.server_args, "cb_schedule_policy", "largest"),
+            async_stages_supported(self.server_args),
         )
         continuous_coordinator = ContinuousDenoisingCoordinator(
             worker=self.worker,
@@ -1414,6 +1606,25 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         )
         active_states: list[DenoisingRequestState] = []
         pending_groups: dict[str, ContinuousResponseGroup] = {}
+        pending_admissions: dict[int, _PendingAdmission] = {}
+        pending_finalizes: dict[int, DenoisingRequestState] = {}
+        stage_worker = (
+            AsyncContinuousStageWorker()
+            if async_stages_supported(self.server_args)
+            else None
+        )
+        rotate_policy = continuous_coordinator.schedule_policy == "rotate"
+
+        drain_dir = getattr(self.server_args, "cb_drain_export_dir", None)
+        if drain_dir:
+            resumed = continuous_coordinator.import_states_from_dir(drain_dir)
+            if resumed:
+                logger.info(
+                    "Resumed %d drained continuous batching request(s) from %s",
+                    len(resumed),
+                    drain_dir,
+                )
+                active_states.extend(resumed)
 
         while self._running:
             try:
@@ -1441,7 +1652,19 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                         f"Last error: {e}"
                     ) from e
 
-            if self._should_wait_for_more_initial_requests(active_states):
+            if stage_worker is not None:
+                self._process_stage_worker_results(
+                    continuous_coordinator,
+                    stage_worker,
+                    active_states,
+                    pending_groups,
+                    pending_admissions,
+                    pending_finalizes,
+                )
+
+            if self._should_wait_for_more_initial_requests(
+                active_states, pending_admissions
+            ):
                 oldest_ts = self.waiting_queue[0][2]
                 elapsed_ms = (time.monotonic() - oldest_ts) * 1000.0
                 remaining_ms = max(0, self._batching_delay_s * 1000.0 - elapsed_ms)
@@ -1455,13 +1678,26 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                 continuous_coordinator,
                 active_states,
                 pending_groups,
+                stage_worker,
+                pending_admissions,
             )
 
             denoising_batch = continuous_coordinator.select_next_step_batch(
                 active_states
             )
             if not denoising_batch:
-                if self.waiting_queue and self.receiver is not None:
+                if stage_worker is not None and stage_worker.pending > 0:
+                    # No denoising work yet; block on the next async result.
+                    self._process_stage_worker_results(
+                        continuous_coordinator,
+                        stage_worker,
+                        active_states,
+                        pending_groups,
+                        pending_admissions,
+                        pending_finalizes,
+                        block_one=True,
+                    )
+                elif self.waiting_queue and self.receiver is not None:
                     self._poller.poll(
                         timeout=max(1, int(self._batching_delay_s * 1000))
                     )
@@ -1507,24 +1743,27 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                     completed.append(state)
 
             for state in completed:
-                try:
-                    self._return_completed_request_state(state, pending_groups)
-                except Exception as e:
-                    logger.error(
-                        "Error returning continuous batching result for request %s: %s",
-                        state.request_id,
-                        e,
-                        exc_info=True,
+                if state.is_complete:
+                    # Already failed; return the error immediately.
+                    self._safe_return_completed_request_state(state, pending_groups)
+                elif stage_worker is not None and not state.req.is_warmup:
+                    # Offload VAE decode/postprocessing to keep denoising busy.
+                    ticket = self._next_admission_ticket
+                    self._next_admission_ticket += 1
+                    pending_finalizes[ticket] = state
+                    stage_worker.submit(
+                        "finalize",
+                        ticket,
+                        lambda state=state: (
+                            continuous_coordinator.finalize_completed_request(state)
+                        ),
                     )
-                    self._return_continuous_result(
-                        OutputBatch(error=f"continuous batching response failed: {e}"),
-                        state.identity,
-                        req_or_group=state.req,
-                        is_warmup=state.req.is_warmup,
-                    )
+                else:
+                    continuous_coordinator.finalize_completed_request(state)
+                    self._safe_return_completed_request_state(state, pending_groups)
 
             active_states = [state for state in active_states if not state.is_complete]
-            if len(active_states) > 1:
+            if rotate_policy and len(active_states) > 1:
                 active_states = self._move_recently_run_states_to_back(
                     active_states,
                     denoising_batch,
@@ -1533,6 +1772,32 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                 continuous_coordinator,
                 active_states,
                 pending_groups,
+                stage_worker,
+                pending_admissions,
+            )
+
+        # Flush async work and drain-export remaining in-flight requests.
+        if stage_worker is not None:
+            while stage_worker.pending > 0:
+                self._process_stage_worker_results(
+                    continuous_coordinator,
+                    stage_worker,
+                    active_states,
+                    pending_groups,
+                    pending_admissions,
+                    pending_finalizes,
+                    block_one=True,
+                )
+            stage_worker.shutdown()
+
+        in_flight = [state for state in active_states if not state.is_complete]
+        if in_flight and drain_dir:
+            exported = continuous_coordinator.export_states_to_dir(in_flight, drain_dir)
+            logger.info(
+                "Drain-exported %d/%d in-flight continuous batching request(s) to %s",
+                len(exported),
+                len(in_flight),
+                drain_dir,
             )
 
         self._log_batch_metrics_summary()
