@@ -695,7 +695,9 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             + self.num_experts
         ) // self.num_experts
         hidden_states, masked_m, event, hook = self._dispatch_core(
-            hidden_states, topk_ids, topk_weights
+            hidden_states,
+            topk_ids,
+            topk_weights,
         )
         return (
             hidden_states,
@@ -742,7 +744,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         self,
         hidden_states: torch.Tensor,
         topk_ids: torch.Tensor,
-        topk_weights: Optional[torch.Tensor] = None,
+        topk_weights: torch.Tensor,
     ):
         input_global_scale = self.quant_config.get("input_global_scale", None)
 
