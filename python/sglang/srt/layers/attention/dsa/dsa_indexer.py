@@ -112,7 +112,7 @@ from sglang.srt.model_executor.forward_context import (
     get_token_to_kv_pool,
 )
 from sglang.srt.model_executor.runner import get_is_capture_mode
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_server_args
 
 _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
 if TYPE_CHECKING:
@@ -134,7 +134,7 @@ def _is_in_piecewise_or_breakable_cuda_graph() -> bool:
 
 def _uses_dsa_attention_backend(forward_batch: ForwardBatch) -> bool:
     attn_backend = get_attn_backend()
-    server_args = get_global_server_args()
+    server_args = get_server_args()
     prefill_backend, decode_backend = server_args.get_attention_backends()
     prefill_backend = (
         getattr(attn_backend, "prefill_attention_backend_str", None) or prefill_backend
@@ -394,7 +394,7 @@ class Indexer(MultiPlatformOp):
         if _is_cuda:
             self.sm_count = deep_gemm.get_num_sms()
             self.half_device_sm_count = ceil_align(self.sm_count // 2, 8)
-            pp_size = get_global_server_args().pp_size
+            pp_size = get_server_args().pp_size
             self.logits_with_pp_recv = pp_size > 1 and not get_pp_group().is_last_rank
         else:
             self.logits_with_pp_recv = False
@@ -446,7 +446,7 @@ class Indexer(MultiPlatformOp):
             base=rope_theta,  # type: ignore
             rope_scaling=rope_scaling,
             is_neox_style=is_neox_style,
-            device=get_global_server_args().device,
+            device=get_server_args().device,
         )
         self.block_size = block_size
         self.scale_fmt = scale_fmt
@@ -1032,7 +1032,7 @@ class Indexer(MultiPlatformOp):
         total_mem = torch.cuda.get_device_properties(device_index).total_memory
 
         total_mem_budget = int(total_mem * self._MQA_LOGITS_TOTAL_MEM_FRACTION)
-        mem_fraction_static = get_global_server_args().mem_fraction_static
+        mem_fraction_static = get_server_args().mem_fraction_static
         if mem_fraction_static is None:
             static_budget = total_mem_budget
         else:

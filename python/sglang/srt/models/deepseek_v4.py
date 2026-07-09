@@ -135,7 +135,7 @@ if _is_xpu:
 else:
     from sglang.srt.layers.mhc import hc_split_sinkhorn, mhc_fused_post_pre, npu_hc_pre
 
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
@@ -346,7 +346,7 @@ class MQALayer(nn.Module):
             base=rope_base,
             rope_scaling=rope_scaling,
             is_neox_style=False,
-            device=get_global_server_args().device,
+            device=get_server_args().device,
         )
 
         from sglang.srt.layers.deepseek_v4_rope import precompute_freqs_cis
@@ -2210,7 +2210,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             return
 
         disable_reason = None
-        if get_global_server_args().enforce_shared_experts_fusion:
+        if get_server_args().enforce_shared_experts_fusion:
             if self.config.n_shared_experts != 1:
                 raise ValueError(
                     "DeepSeek V4 shared-experts fusion expects exactly one shared "

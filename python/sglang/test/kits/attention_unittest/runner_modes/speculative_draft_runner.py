@@ -17,7 +17,6 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.model_executor.input_buffers import _forward_input_buffer_pool
 from sglang.srt.model_executor.runner import set_global_graph_memory_pool
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.server_args import set_global_server_args_for_scheduler
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
     EAGLEDraftCudaGraphRunner,
@@ -327,8 +326,7 @@ def _configure_runner_for_eagle_draft(
         "torch_compile_max_bs": 0,
         "use_mla_backend": runner.use_mla_backend,
     }
-    for key, value in updates.items():
-        setattr(server_args, key, value)
+    server_args.override(source="attention-unittest-eagle-draft", **updates)
 
     runner.spec_algorithm = SpeculativeAlgorithm.EAGLE
     runner.is_draft_worker = True
@@ -339,7 +337,6 @@ def _configure_runner_for_eagle_draft(
     runner.model_config.dtype = runner.dtype
     runner.model_config.vocab_size = settings.vocab_size
     runner.model_config.hf_config.vocab_size = settings.vocab_size
-    set_global_server_args_for_scheduler(server_args)
 
 
 def _build_eagle_draft_fixture(

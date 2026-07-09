@@ -1362,9 +1362,9 @@ class DeepseekV4AscendAttnBackend(
             or forward_batch.forward_mode.is_draft_extend_v2()
         ):
             B = forward_batch.batch_size
-            from sglang.srt.server_args import get_global_server_args
+            from sglang.srt.runtime_context import get_server_args
 
-            n_draft = get_global_server_args().speculative_num_draft_tokens or 1
+            n_draft = get_server_args().speculative_num_draft_tokens or 1
             actual_q = torch.arange(
                 n_draft, B * n_draft + 1, n_draft, dtype=torch.int32, device=device
             )
@@ -1409,9 +1409,9 @@ class DeepseekV4AscendAttnBackend(
             forward_batch.forward_mode.is_target_verify()
             or forward_batch.forward_mode.is_draft_extend_v2()
         ):
-            from sglang.srt.server_args import get_global_server_args
+            from sglang.srt.runtime_context import get_server_args
 
-            max_seqlen_q = get_global_server_args().speculative_num_draft_tokens or 1
+            max_seqlen_q = get_server_args().speculative_num_draft_tokens or 1
         else:
             max_seqlen_q = 1
         return self._kernel_metadata_from_parts(

@@ -12,8 +12,7 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.runtime_context import get_parallel
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.state_capturer.base import BaseTopkCapturer
 
 
@@ -58,7 +57,7 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
         topk_size = model_config.hf_text_config.num_experts_per_tok
         num_layers = model_config.hf_text_config.num_hidden_layers
 
-        server_args = get_global_server_args()
+        server_args = get_server_args()
         # Scale by dp_size so the buffer covers the full DP-concatenated batch.
         # _get_local_slice indexes into [attention_dp_rank * cuda_graph_batch, ...)
         # and otherwise overflows on dp_rank > 0 when max_running_requests >
@@ -127,16 +126,16 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
         ]
 
 
-_global_expert_capturer: Optional[RoutedExpertsCapturer] = None
-
-
 def get_global_experts_capturer() -> Optional[RoutedExpertsCapturer]:
-    return _global_expert_capturer
+    from sglang.srt.runtime_context import get_resources
+
+    return get_resources().experts_capturer
 
 
 def set_global_experts_capturer(capturer: Optional[RoutedExpertsCapturer]):
-    global _global_expert_capturer
-    _global_expert_capturer = capturer
+    from sglang.srt.runtime_context import get_resources
+
+    get_resources().experts_capturer = capturer
 
 
 def extract_routed_experts_from_meta_info(data):

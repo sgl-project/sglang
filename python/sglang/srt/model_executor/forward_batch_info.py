@@ -49,8 +49,7 @@ from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
     ForwardBatchDeepSeekMHAMixin,
 )
 from sglang.srt.model_executor.triton_ops.position import compute_position_triton
-from sglang.srt.runtime_context import get_parallel
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import (
     is_cuda,
     is_hip,
@@ -910,7 +909,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             # --enable-mis: every request must carry delimiter indices (the score
             # endpoint always produces MIS-structured requests; consumers index
             # without None-checking).
-            if get_global_server_args().enable_mis and any(
+            if get_server_args().enable_mis and any(
                 r.multi_item_delimiter_indices is not None for r in batch.reqs
             ):
                 assert all(
@@ -1073,7 +1072,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 # 3 * N
                 if (
                     mm_input is None
-                    or get_global_server_args().rl_on_policy_target is not None
+                    or get_server_args().rl_on_policy_target is not None
                 ):
                     mrope_positions_list[batch_idx] = torch.full(
                         (3, 1),
@@ -1092,7 +1091,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 )
                 if (
                     mm_input is None
-                    or get_global_server_args().rl_on_policy_target is not None
+                    or get_server_args().rl_on_policy_target is not None
                 ):
                     # text only
                     mrope_positions = torch.tensor(
