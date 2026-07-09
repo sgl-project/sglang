@@ -4031,6 +4031,10 @@ class Scheduler(
         if (
             self.last_batch is not None
             and self.last_batch.forward_mode.is_extend()
+            # Skip merge for disagg prefill: completed prefill requests are
+            # already in disagg_prefill_inflight_queue. Merging them into
+            # running_batch leaks them, since the prefill event loop never
+            # calls update_running_batch to clean them up.
             and self.disaggregation_mode != DisaggregationMode.PREFILL
         ):
             retract_reqs += [r for r in self.last_batch.reqs if not r.finished()]
