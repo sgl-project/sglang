@@ -15,9 +15,10 @@
 import triton
 import triton.language as tl
 
-from sglang.srt.utils import is_cpu
+from sglang.srt.utils import is_cpu, is_npu
 
 _is_cpu = is_cpu()
+_is_npu = is_npu()
 
 if _is_cpu:
     from sgl_kernel import rotate_input_ids_cpu
@@ -77,7 +78,7 @@ def rotate_input_ids(
 
     # rotate_input_ids_triton skipped: batch_size=0 (empty extend_seq_lens).
     # This is expected when a DP rank has no requests.
-    if batch_size == 0:
+    if batch_size == 0 and _is_npu:
         return input_ids
 
     BLOCK_SIZE = 4096 if select_index is not None else 8
