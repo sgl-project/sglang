@@ -1130,6 +1130,8 @@ class Scheduler(
         dspark_prefill_tail_len = 0
         dspark_hidden_pool_size = 0
         dspark_hidden_size = 0
+        disagg_hidden_size = 16  # minimal padding size for RDMA
+        disagg_hidden_states_dtype = torch.float32
 
         def _cfg_get(config: Any, key: str, default: Any = None) -> Any:
             if config is None:
@@ -1223,9 +1225,6 @@ class Scheduler(
             disagg_hidden_size, disagg_hidden_states_dtype = (
                 get_draft_recurrent_hidden_state_spec(draft_runner)
             )
-        else:
-            disagg_hidden_size = 16  # minimal padding size for RDMA
-            disagg_hidden_states_dtype = torch.float32
 
         if (
             self.disaggregation_mode == DisaggregationMode.DECODE
