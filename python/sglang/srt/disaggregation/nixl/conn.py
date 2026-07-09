@@ -150,6 +150,7 @@ class TransferInfo:
     required_dst_info_num: int
     dst_state_indices: List[List[int]]
     decode_prefix_len: Optional[int] = None  # for decode radix cache
+    spec_metadata: Optional[dict] = None
     # NOTE: optional staging field; populated via STAGING_RSP. Keep at the
     # end so positional construction in from_zmq() continues to work.
     staging: Optional[StagingTransferInfo] = None
@@ -181,6 +182,11 @@ class TransferInfo:
             decode_prefix_len=(
                 int(msg[8].decode("ascii")) if len(msg) > 8 and msg[8] != b"" else None
             ),  # hacky just add it into the message that will be sent
+            spec_metadata=(
+                json.loads(msg[9].decode("utf-8"))
+                if len(msg) > 9 and msg[9] != b""
+                else None
+            ),
         )
 
 
@@ -2026,6 +2032,7 @@ class NixlKVManager(CommonKVManager):
                 StateType.DSA,
                 StateType.SWA_RING,
                 StateType.C128_STATE,
+                StateType.DSPARK_HIDDEN,
             ):
                 if not self.is_mla_backend and self.attn_tp_size != decode_tp_size:
                     raise RuntimeError(
@@ -2377,6 +2384,17 @@ class NixlKVManager(CommonKVManager):
                         ),
                         0,
                     )
+                    dspark_meta = next(
+                        (
+                            info.spec_metadata
+                            for info in self.transfer_infos[room].values()
+                            if info.spec_metadata
+                            and info.spec_metadata.get("dspark_hidden")
+                        ),
+                        None,
+                    )
+                    if dspark_meta:
+                        self.req_to_dspark_hidden_meta[room] = dspark_meta
                     logger.debug(f"{room=} is bootstrapped")
                     self.update_status(room, KVPoll.WaitingForInput)
 
@@ -2506,6 +2524,7 @@ class NixlKVReceiver(CommonKVReceiver):
         aux_index: Optional[int] = None,
         state_indices: Optional[List] = None,
         decode_prefix_len: Optional[int] = None,
+        spec_metadata: Optional[dict] = None,
     ):
         if self.bootstrap_infos is None:
             logger.error(
@@ -2553,6 +2572,11 @@ class NixlKVReceiver(CommonKVReceiver):
                         str(self.required_dst_info_num).encode("ascii"),
                         packed_state_indices,
                         str(decode_prefix_len or 0).encode("ascii"),
+                        (
+                            json.dumps(spec_metadata).encode("utf-8")
+                            if spec_metadata
+                            else b""
+                        ),
                     ]
                 )
 

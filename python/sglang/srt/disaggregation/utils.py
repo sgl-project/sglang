@@ -219,6 +219,71 @@ class ReqToMetadataIdxAllocator:
         self.free_slots.append(free_index)
 
 
+class DSparkHiddenRowPool:
+    """A compact row pool for PD DSpark prefill hidden transfer.
+
+    Each row is one token's target hidden state. The pool is intentionally
+    independent from the per-request metadata slot so long prompts do not force
+    every request slot to reserve the same large hidden capacity.
+    """
+
+    def __init__(
+        self,
+        size: int,
+        hidden_size: int,
+        dtype: torch.dtype,
+        device: str = "cpu",
+    ):
+        self.size = max(0, int(size))
+        self.hidden_size = int(hidden_size)
+        self.dtype = dtype
+        self.device = device
+        self.buffer = torch.zeros(
+            (self.size, self.hidden_size), dtype=dtype, device=device
+        )
+        self.free_slots = deque(range(self.size))
+
+    def available_size(self) -> int:
+        return len(self.free_slots)
+
+    def alloc(self, n: int) -> Optional[List[int]]:
+        n = int(n)
+        if n <= 0:
+            return []
+        if n > len(self.free_slots):
+            return None
+        return [self.free_slots.popleft() for _ in range(n)]
+
+    def free(self, indices: Optional[List[int]]) -> None:
+        if not indices:
+            return
+        self.free_slots.extend(int(i) for i in indices)
+
+    def write(self, indices: List[int], hidden: torch.Tensor) -> None:
+        if not indices:
+            return
+        if hidden.shape[0] != len(indices):
+            raise ValueError(
+                "DSpark hidden row count mismatch: "
+                f"hidden={hidden.shape[0]}, indices={len(indices)}"
+            )
+        index_tensor = torch.as_tensor(indices, dtype=torch.long, device=self.device)
+        self.buffer[index_tensor].copy_(
+            hidden.to(device=self.device, dtype=self.dtype, non_blocking=True)
+        )
+
+    def read(self, indices: List[int]) -> torch.Tensor:
+        if not indices:
+            return torch.empty((0, self.hidden_size), dtype=self.dtype, device="cpu")
+        index_tensor = torch.as_tensor(indices, dtype=torch.long, device=self.device)
+        return self.buffer[index_tensor].cpu().clone()
+
+    def get_state_buf_infos(self):
+        if self.size <= 0:
+            return [], [], []
+        return [self.buffer.data_ptr()], [self.buffer.nbytes], [self.buffer[0].nbytes]
+
+
 class MetadataBuffers:
     def __init__(
         self,
@@ -228,9 +293,22 @@ class MetadataBuffers:
         max_top_logprobs_num: int = 128,
         custom_mem_pool: torch.cuda.MemPool = None,
         dspark_prefill_tail_len: int = 0,
+        dspark_hidden_pool_size: int = 0,
+        dspark_hidden_size: int = 0,
     ):
         self.custom_mem_pool = custom_mem_pool
         self.dspark_prefill_tail_len = max(0, int(dspark_prefill_tail_len))
+        self.dspark_hidden_pool: Optional[DSparkHiddenRowPool] = None
+        if dspark_hidden_pool_size > 0 and dspark_hidden_size > 0:
+            # Keep DSpark hidden rows on CPU by default. They are transient PD
+            # metadata, not KV-cache residency, and pinning them to HBM would
+            # compete with the model/KV pools.
+            self.dspark_hidden_pool = DSparkHiddenRowPool(
+                dspark_hidden_pool_size,
+                dspark_hidden_size,
+                hidden_states_dtype,
+                device="cpu",
+            )
         bootstrap_room_dtype = torch.uint64
         device = "cpu"
         if is_npu():
@@ -375,6 +453,33 @@ class MetadataBuffers:
                 self.output_dspark_prefill_tail_valid_mask[idx].clone(),
             )
         return ret
+
+    def ensure_dspark_hidden_pool(
+        self,
+        *,
+        size: int,
+        hidden_size: int,
+        dtype: torch.dtype,
+    ) -> DSparkHiddenRowPool:
+        if self.dspark_hidden_pool is None:
+            self.dspark_hidden_pool = DSparkHiddenRowPool(
+                size=size,
+                hidden_size=hidden_size,
+                dtype=dtype,
+                device="cpu",
+            )
+        elif self.dspark_hidden_pool.hidden_size != int(hidden_size):
+            raise ValueError(
+                "DSpark hidden pool hidden_size mismatch: "
+                f"existing={self.dspark_hidden_pool.hidden_size}, "
+                f"requested={hidden_size}"
+            )
+        return self.dspark_hidden_pool
+
+    def get_dspark_hidden_state_buf_infos(self):
+        if self.dspark_hidden_pool is None:
+            return [], [], []
+        return self.dspark_hidden_pool.get_state_buf_infos()
 
     def set_buf(self, req: Req):
 
@@ -724,6 +829,7 @@ def setup_state_kv_args(
     draft_token_to_kv_pool=None,
     total_kv_layers: int = None,
     req_to_token_pool=None,
+    dspark_hidden_pool: Optional[DSparkHiddenRowPool] = None,
 ) -> None:
     """Populate ``kv_args`` state-buffer fields from the given pool.
     Shared by prefill and decode bootstrap paths so the state_type dispatch
@@ -916,6 +1022,17 @@ def setup_state_kv_args(
             )
             append_state_component(
                 kv_args, StateType.MAMBA, data_ptrs, data_lens, item_lens, dim
+            )
+
+    if dspark_hidden_pool is not None:
+        data_ptrs, data_lens, item_lens = dspark_hidden_pool.get_state_buf_infos()
+        if data_ptrs:
+            append_state_component(
+                kv_args,
+                StateType.DSPARK_HIDDEN,
+                data_ptrs,
+                data_lens,
+                item_lens,
             )
 
 

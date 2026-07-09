@@ -718,10 +718,18 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         device = torch.device(self.device)
         row = torch.arange(tail_len, device=device).view(1, tail_len)
-        valid_counts = tail_mask.sum(dim=1).to(torch.int64)
-        start_pos = batch.seq_lens.to(torch.int64).view(-1, 1) - valid_counts.view(
-            -1, 1
+        tail_start_positions = getattr(
+            draft_input, "prefill_tail_start_positions", None
         )
+        if tail_start_positions is None or tail_start_positions.numel() == 0:
+            valid_counts = tail_mask.sum(dim=1).to(torch.int64)
+            start_pos = batch.seq_lens.to(torch.int64).view(-1, 1) - valid_counts.view(
+                -1, 1
+            )
+        else:
+            start_pos = tail_start_positions.to(
+                device=device, dtype=torch.int64, non_blocking=True
+            ).view(-1, 1)
         positions_2d = start_pos + row
 
         req_to_token = self.model_runner.req_to_token_pool.req_to_token
@@ -737,6 +745,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
         draft_input.prefill_tail_hidden_states = None
         draft_input.prefill_tail_valid_mask = None
+        draft_input.prefill_tail_start_positions = None
 
     def _simulated_correct_len(
         self, *, bs: int, dtype: torch.dtype, device: torch.device

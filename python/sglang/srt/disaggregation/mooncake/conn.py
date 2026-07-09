@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import dataclasses
+import json
 import logging
 import os
 import struct
@@ -76,6 +77,7 @@ class TransferInfo:
     required_dst_info_num: int
     is_dummy: bool
     decode_prefix_len: Optional[int] = None
+    spec_metadata: Optional[dict] = None
     # Note: always put the optional staging field at the final (it will be set through 'STAGING_RSP' pkg when needed)
     staging: Optional[StagingTransferInfo] = None
 
@@ -103,6 +105,11 @@ class TransferInfo:
             is_dummy=is_dummy,
             decode_prefix_len=(
                 int(msg[8].decode("ascii")) if len(msg) > 8 and msg[8] != b"" else None
+            ),
+            spec_metadata=(
+                json.loads(msg[9].decode("utf-8"))
+                if len(msg) > 9 and msg[9] != b""
+                else None
             ),
         )
 
@@ -1036,6 +1043,7 @@ class MooncakeKVManager(CommonKVManager):
                 StateType.DSA,
                 StateType.SWA_RING,
                 StateType.C128_STATE,
+                StateType.DSPARK_HIDDEN,
             ):
                 if (
                     target_rank_registration_info is not None
@@ -1059,7 +1067,11 @@ class MooncakeKVManager(CommonKVManager):
                     # truncating silently misaligns rows and corrupts KV.
                     # Paged SWA/DSA tolerate a 1-page drift -> keep the
                     # lenient truncation below.
-                    if st in (StateType.SWA_RING, StateType.C128_STATE):
+                    if st in (
+                        StateType.SWA_RING,
+                        StateType.C128_STATE,
+                        StateType.DSPARK_HIDDEN,
+                    ):
                         raise RuntimeError(
                             f"{st.upper()} state index length mismatch: "
                             f"prefill={len(src_indices)}, dst={len(dst_indices_local)}"
@@ -1559,9 +1571,8 @@ class MooncakeKVManager(CommonKVManager):
                     if room not in self.transfer_infos:
                         self.transfer_infos[room] = {}
 
-                    self.transfer_infos[room][mooncake_session_id] = (
-                        TransferInfo.from_zmq(waiting_req_bytes)
-                    )
+                    transfer_info = TransferInfo.from_zmq(waiting_req_bytes)
+                    self.transfer_infos[room][mooncake_session_id] = transfer_info
                     # NOTE: after bootstrapping we can mark the req as waiting for input
                     if len(self.transfer_infos[room]) == required_dst_info_num:
                         self.req_to_decode_prefix_len[room] = next(
@@ -1572,6 +1583,17 @@ class MooncakeKVManager(CommonKVManager):
                             ),
                             0,
                         )
+                        dspark_meta = next(
+                            (
+                                info.spec_metadata
+                                for info in self.transfer_infos[room].values()
+                                if info.spec_metadata
+                                and info.spec_metadata.get("dspark_hidden")
+                            ),
+                            None,
+                        )
+                        if dspark_meta:
+                            self.req_to_dspark_hidden_meta[room] = dspark_meta
                         self.update_status(room, KVPoll.WaitingForInput)
 
         threading.Thread(target=bootstrap_thread).start()
@@ -1925,6 +1947,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
         aux_index: Optional[int] = None,
         state_indices: Optional[List] = None,
         decode_prefix_len: Optional[int] = None,
+        spec_metadata: Optional[dict] = None,
     ):
         if self.bootstrap_infos is None:
             self.kv_mgr.record_failure(
@@ -1963,6 +1986,11 @@ class MooncakeKVReceiver(CommonKVReceiver):
                         ),
                         str(self.required_dst_info_num).encode("ascii"),
                         str(decode_prefix_len or 0).encode("ascii"),
+                        (
+                            json.dumps(spec_metadata).encode("utf-8")
+                            if spec_metadata
+                            else b""
+                        ),
                     ]
                 )
         self.init_time = time.time()

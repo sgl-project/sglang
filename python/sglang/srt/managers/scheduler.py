@@ -1128,6 +1128,46 @@ class Scheduler(
         )
 
         dspark_prefill_tail_len = 0
+        dspark_hidden_pool_size = 0
+        dspark_hidden_size = 0
+
+        def _cfg_get(config: Any, key: str, default: Any = None) -> Any:
+            if config is None:
+                return default
+            if isinstance(config, dict):
+                return config.get(key, default)
+            return getattr(config, key, default)
+
+        def _infer_dspark_target_layer_ids() -> List[int]:
+            model_runner = self.tp_worker.model_runner
+            target_layer_ids = getattr(
+                model_runner, "dflash_or_dspark_target_layer_ids", None
+            )
+            if target_layer_ids:
+                return [int(x) for x in target_layer_ids]
+
+            hf_config = getattr(self.model_config, "hf_config", None)
+            dspark_cfg = _cfg_get(hf_config, "dspark_config", None)
+            target_layer_ids = _cfg_get(hf_config, "dspark_target_layer_ids", None)
+            if target_layer_ids is None:
+                target_layer_ids = _cfg_get(dspark_cfg, "target_layer_ids", None)
+            if target_layer_ids is None:
+                target_layer_ids = _cfg_get(dspark_cfg, "aux_hidden_state_layer_ids", None)
+            if target_layer_ids is None:
+                target_layer_ids = _cfg_get(
+                    hf_config, "aux_hidden_state_layer_ids", None
+                )
+            if target_layer_ids is None:
+                env_layer_ids = os.getenv("SGLANG_DSPARK_PD_TARGET_LAYER_IDS")
+                if env_layer_ids:
+                    target_layer_ids = [
+                        int(x.strip()) for x in env_layer_ids.split(",") if x.strip()
+                    ]
+            if not target_layer_ids:
+                return []
+            return [int(x) for x in target_layer_ids]
+
+        dspark_target_layer_ids: List[int] = []
         if self.spec_algorithm.is_dspark():
             dspark_target_layer_ids = (
                 getattr(
@@ -1135,31 +1175,47 @@ class Scheduler(
                     "dflash_or_dspark_target_layer_ids",
                     None,
                 )
-                or []
+                or _infer_dspark_target_layer_ids()
             )
+            if dspark_target_layer_ids:
+                self.tp_worker.model_runner.dflash_or_dspark_target_layer_ids = (
+                    dspark_target_layer_ids
+                )
             disagg_hidden_size = max(1, len(dspark_target_layer_ids)) * int(
                 self.model_config.hidden_size
             )
+            dspark_hidden_size = disagg_hidden_size
             disagg_hidden_states_dtype = self.model_config.dtype
-            # DSpark PD decode needs the same target hidden states that non-PD
-            # prefill injects into the draft KV cache. Each request copies its
-            # actual extend length into this fixed-capacity metadata slot, so the
-            # default capacity should match the scheduler's prefill chunk ceiling.
+            # DSpark PD decode needs target aux hidden from prefill. Use a compact
+            # row pool instead of a per-request fixed-capacity metadata tensor.
             default_dspark_prefill_tokens = int(
                 self.server_args.max_prefill_buffer_tokens()
                 or self.max_prefill_tokens
             )
             dspark_prefill_tokens_env = os.getenv(
-                "SGLANG_DSPARK_PD_PREFILL_TOKENS",
-                os.getenv(
-                    "SGLANG_DSPARK_PD_PREFILL_TAIL_TOKENS",
+                "SGLANG_DSPARK_PD_HIDDEN_POOL_TOKENS",
+                str(max(1, default_dspark_prefill_tokens)),
+            )
+            dspark_hidden_pool_size = max(0, int(dspark_prefill_tokens_env))
+        elif self.disaggregation_mode == DisaggregationMode.PREFILL:
+            dspark_target_layer_ids = _infer_dspark_target_layer_ids()
+            if dspark_target_layer_ids:
+                dspark_hidden_size = len(dspark_target_layer_ids) * int(
+                    self.model_config.hidden_size
+                )
+                disagg_hidden_states_dtype = self.model_config.dtype
+                default_dspark_prefill_tokens = int(
+                    self.server_args.max_prefill_buffer_tokens()
+                    or self.max_prefill_tokens
+                )
+                dspark_prefill_tokens_env = os.getenv(
+                    "SGLANG_DSPARK_PD_HIDDEN_POOL_TOKENS",
                     str(max(1, default_dspark_prefill_tokens)),
-                ),
-            )
-            dspark_prefill_tail_len = max(
-                0,
-                int(dspark_prefill_tokens_env),
-            )
+                )
+                dspark_hidden_pool_size = max(0, int(dspark_prefill_tokens_env))
+                self.tp_worker.model_runner.dflash_or_dspark_target_layer_ids = (
+                    dspark_target_layer_ids
+                )
         elif self.spec_algorithm.carries_draft_hidden_states():
             # `draft_runner` aliases `draft_runner_list[0]` in the multi-layer
             # worker, so a single accessor covers both shapes.
@@ -1187,6 +1243,8 @@ class Scheduler(
                 hidden_states_dtype=disagg_hidden_states_dtype,
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
                 dspark_prefill_tail_len=dspark_prefill_tail_len,
+                dspark_hidden_pool_size=dspark_hidden_pool_size,
+                dspark_hidden_size=dspark_hidden_size,
             )
 
             # The decode requests polling kv cache
@@ -1233,6 +1291,8 @@ class Scheduler(
                 hidden_states_dtype=disagg_hidden_states_dtype,
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
                 dspark_prefill_tail_len=dspark_prefill_tail_len,
+                dspark_hidden_pool_size=dspark_hidden_pool_size,
+                dspark_hidden_size=dspark_hidden_size,
             )
 
             self.disagg_prefill_bootstrap_queue = PrefillBootstrapQueue(
