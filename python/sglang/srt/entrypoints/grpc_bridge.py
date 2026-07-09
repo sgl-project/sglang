@@ -19,6 +19,8 @@ from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 
 logger = logging.getLogger(__name__)
 
+_VALID_PAUSE_MODES = ("abort", "in_place", "retract")
+
 
 class _BadOpenAIRequest(ValueError):
     pass
@@ -461,6 +463,11 @@ class RuntimeHandle:
         async def _payload():
             from sglang.srt.managers.io_struct import PauseGenerationReqInput
 
+            if mode not in _VALID_PAUSE_MODES:
+                raise ValueError(
+                    f"Invalid pause_generation mode {mode!r}; "
+                    f"expected one of {_VALID_PAUSE_MODES}."
+                )
             await self.tokenizer_manager.pause_generation(
                 PauseGenerationReqInput(mode=mode)
             )
