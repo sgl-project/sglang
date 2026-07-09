@@ -69,9 +69,7 @@ class TestPauseGenerationModeValidation(CustomTestCase):
         """All modes in _VALID_PAUSE_MODES must pass bridge validation and dispatch."""
         for mode in _VALID_PAUSE_MODES:
             result = self._run_payload(mode)
-            self.assertEqual(
-                result, {"message": f"Generation paused (mode={mode})."}
-            )
+            self.assertEqual(result, {"message": f"Generation paused (mode={mode})."})
 
 
 if __name__ == "__main__":
