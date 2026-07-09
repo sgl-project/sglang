@@ -34,6 +34,8 @@ def _import_umbp_client():
     UMBPIoBackend = getattr(umbp_mod, "UMBPIoBackend", None)
     UMBPDurabilityMode = getattr(umbp_mod, "UMBPDurabilityMode", None)
     UMBPDistributedConfig = getattr(umbp_mod, "UMBPDistributedConfig", None)
+    UMBPStandaloneProcessConfig = getattr(umbp_mod, "UMBPStandaloneProcessConfig", None)
+    UMBPDeploymentMode = getattr(umbp_mod, "UMBPDeploymentMode", None)
 
     return (
         UMBPClient,
@@ -42,6 +44,8 @@ def _import_umbp_client():
         UMBPIoBackend,
         UMBPDurabilityMode,
         UMBPDistributedConfig,
+        UMBPStandaloneProcessConfig,
+        UMBPDeploymentMode,
     )
 
 
@@ -157,6 +161,7 @@ _COMMON_EXTRA_KEYS = frozenset(
         "spdk_proxy_allow_borrow",
         "spdk_proxy_reserved_shared_bytes",
         "spdk_passthrough",
+        "disable_zero_copy_register",
         "kv_events_subscriber",
         "kv_events_endpoint",
         "kv_events_topic",
@@ -171,6 +176,9 @@ _STANDALONE_ONLY_EXTRA_KEYS = frozenset(
         "eviction_policy",
         "eviction_candidate_window",
         "auto_promote_on_read",
+        "standalone_address",
+        "standalone_auto_start",
+        "standalone_startup_timeout_ms",
     }
 )
 
@@ -188,7 +196,6 @@ _DISTRIBUTED_ONLY_EXTRA_KEYS = frozenset(
         "peer_service_port",
         "cache_remote_fetches",
         "dram_page_size",
-        "disable_zero_copy_register",
     }
 )
 
@@ -242,6 +249,8 @@ class UMBPStore(HiCacheStorage):
             UMBPIoBackend,
             UMBPDurabilityMode,
             UMBPDistributedConfig,
+            UMBPStandaloneProcessConfig,
+            UMBPDeploymentMode,
         ) = _import_umbp_client()
 
         if storage_config is not None:
@@ -256,6 +265,7 @@ class UMBPStore(HiCacheStorage):
             self.pp_rank = 0
             self.pp_size = 1
             self.tp_size = 1
+        self._umbp_deployment_mode_enum = UMBPDeploymentMode
 
         cfg = UMBPConfig.from_environment()
         # UMBPStore owns role selection explicitly. Do not inherit LOCAL_RANK /
@@ -458,6 +468,22 @@ class UMBPStore(HiCacheStorage):
         master_address = extra.get(
             "master_address", _optional_env_str("UMBP_MASTER_ADDRESS")
         )
+        standalone_extra_address = extra.get("standalone_address")
+        standalone_address = _optional_env_str("UMBP_STANDALONE_ADDRESS")
+        self._standalone_process_expected = bool(standalone_address)
+        if standalone_extra_address and not standalone_address:
+            raise ValueError(
+                "standalone_address in hicache-storage-backend-extra-config is "
+                "not supported for UMBP standalone-process mode. The host "
+                "memory pool allocator chooses Anonymous vs. AnonymousShm "
+                "before extra_config is parsed, so set UMBP_STANDALONE_ADDRESS "
+                "in the process environment instead."
+            )
+        if standalone_address and master_address:
+            raise ValueError(
+                "master_address and UMBP_STANDALONE_ADDRESS are mutually "
+                "exclusive (distributed vs. standalone-process mode)."
+            )
 
         _warn_extra_config_scope(extra, distributed_enabled=bool(master_address))
         if master_address and UMBPDistributedConfig is not None:
@@ -632,6 +658,36 @@ class UMBPStore(HiCacheStorage):
                 dist_cfg.io_engine.port,
                 dist_cfg.peer_service_port,
             )
+        elif standalone_address:
+            if UMBPStandaloneProcessConfig is None:
+                raise RuntimeError(
+                    "mori.umbp does not expose UMBPStandaloneProcessConfig; "
+                    "rebuild mori with standalone-process support."
+                )
+            standalone_cfg = UMBPStandaloneProcessConfig()
+            standalone_cfg.address = str(standalone_address)
+            auto_start = extra.get(
+                "standalone_auto_start",
+                _optional_env_str("UMBP_STANDALONE_AUTO_START"),
+            )
+            standalone_cfg.auto_start = (
+                _strict_bool(auto_start, "standalone_auto_start")
+                if auto_start is not None
+                else False
+            )
+            standalone_cfg.startup_timeout_ms = int(
+                extra.get(
+                    "standalone_startup_timeout_ms",
+                    _optional_env_str("UMBP_STANDALONE_STARTUP_TIMEOUT_MS") or 30000,
+                )
+            )
+            cfg.standalone_process = standalone_cfg
+            logger.info(
+                "UMBPStore standalone-process mode: address=%s auto_start=%s timeout_ms=%d",
+                standalone_cfg.address,
+                standalone_cfg.auto_start,
+                standalone_cfg.startup_timeout_ms,
+            )
 
         self.storage_config = storage_config
 
@@ -642,8 +698,10 @@ class UMBPStore(HiCacheStorage):
         self.is_mla_follower = False
         tp_size = self.tp_size
         use_spdk = cfg.ssd.ssd_backend in ("spdk", "spdk_proxy")
-        distributed_enabled = cfg.distributed is not None
-        if not distributed_enabled and self.is_mla_backend and tp_size > 1:
+        remote_process_enabled = (
+            cfg.distributed is not None or cfg.standalone_process is not None
+        )
+        if not remote_process_enabled and self.is_mla_backend and tp_size > 1:
             cfg.ssd.enabled = True
             if self.local_rank == 0:
                 # Leader: copy every DRAM write to shared SSD.
@@ -867,24 +925,53 @@ class UMBPStore(HiCacheStorage):
             "page_head",
         ], "UMBP store only supports page_first, page_first_direct, or page_head layout"
 
-        # In distributed mode, pre-register the entire host KV buffer with the
-        # underlying RDMA IOEngine so PoolClient can take the zero-copy path
-        # for batch_get_into_ptr / batch_put_from_ptr (skips the staging
-        # buffer memcpy + lock and removes the per-call `staging_buffer_size`
-        # cap).  Standalone returns true as no-op by IUMBPClient contract;
-        # we still gate on is_distributed() below to avoid a pointless call.
+        # Distributed pre-registers the host KV buffer for RDMA zero-copy.
+        # Standalone-process mode also must register it, but for shm fd
+        # handoff instead of RDMA.  Plain local mode still skips the call.
         self._zero_copy_registered = False
         if self.client is None:
             return
+        deployment_mode = None
+        is_standalone_process = False
+        try:
+            deployment_mode = self.client.get_deployment_mode()
+            mode_enum = getattr(self, "_umbp_deployment_mode_enum", None)
+            if mode_enum is not None:
+                is_standalone_process = deployment_mode == mode_enum.StandaloneProcess
+        except Exception as exc:
+            if getattr(self, "_standalone_process_expected", False):
+                raise RuntimeError(
+                    "UMBPStore expected standalone-process mode from "
+                    "UMBP_STANDALONE_ADDRESS, but get_deployment_mode() failed."
+                ) from exc
+            deployment_mode = None
+        if getattr(self, "_standalone_process_expected", False):
+            mode_enum = getattr(self, "_umbp_deployment_mode_enum", None)
+            if mode_enum is None:
+                raise RuntimeError(
+                    "UMBPStore expected standalone-process mode, but "
+                    "UMBPDeploymentMode is not exposed by mori.umbp."
+                )
+            if deployment_mode != mode_enum.StandaloneProcess:
+                raise RuntimeError(
+                    "UMBPStore expected standalone-process mode, but the UMBP "
+                    f"client reported deployment_mode={deployment_mode!r}."
+                )
         try:
             is_distributed = bool(self.client.is_distributed())
         except Exception:
             is_distributed = False
-        if not is_distributed:
+        if not (is_distributed or is_standalone_process):
             return
         if not hasattr(self.client, "register_memory"):
             return
         if getattr(self, "_disable_zero_copy_register", False):
+            if is_standalone_process:
+                raise RuntimeError(
+                    "disable_zero_copy_register is not supported in UMBP "
+                    "standalone-process mode: v0.1 has no staging-buffer "
+                    "fallback path."
+                )
             logger.info(
                 "UMBPStore: skipping host KV buffer RDMA registration because "
                 "disable_zero_copy_register=true (UMBP_DISABLE_ZERO_COPY_REGISTER). "
@@ -911,6 +998,11 @@ class UMBPStore(HiCacheStorage):
                 host_size = mapped_size
             ok = bool(self.client.register_memory(host_ptr, host_size))
         except Exception as exc:
+            if is_standalone_process:
+                raise RuntimeError(
+                    "UMBPStore: register_memory failed in standalone-process "
+                    f"mode and cannot fall back: {exc}"
+                ) from exc
             logger.warning(
                 "UMBPStore: register_memory failed (%s); falling back to staging "
                 "buffer path. Per-transfer size will be capped by "
@@ -927,6 +1019,11 @@ class UMBPStore(HiCacheStorage):
                 host_size // (1024 * 1024),
             )
         else:
+            if is_standalone_process:
+                raise RuntimeError(
+                    "UMBPStore: register_memory returned false in "
+                    "standalone-process mode; no fallback path exists in v0.1."
+                )
             logger.warning(
                 "UMBPStore: register_memory returned false; staying on staging "
                 "buffer fallback path."

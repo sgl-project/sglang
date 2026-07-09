@@ -45,6 +45,7 @@ class UMBPHostTensorAllocator(HostTensorAllocator):
         )
         self._numa_node = _int_env("SGLANG_HICACHE_HOST_NUMA_NODE", -1)
         self._prefault = _bool_env("SGLANG_HICACHE_HOST_PREFAULT", True)
+        self._standalone_process = bool(os.getenv("UMBP_STANDALONE_ADDRESS"))
         self._handles: Dict[int, Any] = {}
 
     def allocate(
@@ -62,11 +63,14 @@ class UMBPHostTensorAllocator(HostTensorAllocator):
         element_size = torch.empty((), dtype=dtype).element_size()
         nbytes = math.prod(int(dim) for dim in dims) * element_size
 
-        requested_backing = (
-            self._mod.UMBPHostBufferBacking.AnonymousHugetlb
-            if self._use_hugepage
-            else self._mod.UMBPHostBufferBacking.Anonymous
-        )
+        if self._standalone_process:
+            requested_backing = self._mod.UMBPHostBufferBacking.AnonymousShm
+        else:
+            requested_backing = (
+                self._mod.UMBPHostBufferBacking.AnonymousHugetlb
+                if self._use_hugepage
+                else self._mod.UMBPHostBufferBacking.Anonymous
+            )
 
         handle = self._allocator.alloc(
             nbytes,
@@ -103,6 +107,7 @@ class UMBPHostTensorAllocator(HostTensorAllocator):
         )
         if (
             self._use_hugepage
+            and not self._standalone_process
             and handle.actual_backing == self._mod.UMBPHostBufferBacking.Anonymous
         ):
             logger.warning(
