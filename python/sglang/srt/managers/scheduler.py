@@ -4008,11 +4008,7 @@ class Scheduler(
         raise NotImplementedError()
 
     def pause_generation(self, recv_req: PauseGenerationReqInput):
-        assert recv_req.mode in ("in_place", "retract"), (
-            f"Scheduler.pause_generation only handles in_place/retract; "
-            f"mode='abort' is fully handled by TokenizerManager and never "
-            f"dispatched here. Got mode={recv_req.mode!r}."
-        )
+        assert recv_req.mode in ("in_place", "retract")
         self._engine_paused = True
 
         if recv_req.mode == "in_place":
