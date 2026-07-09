@@ -93,6 +93,11 @@ class CustomAllreduce:
         if full_nvlink is None:
             return  # fail to get nvlink status
 
+        if world_size == 2 and max_size == self._MAX_CAR_SIZE and not _is_hip:
+            # The 2-GPU one-shot kernel stays ahead of the NCCL ring well past
+            # 8MB; prefill AllReduce messages otherwise fall back to NCCL.
+            max_size = 128 * 1024 * 1024
+
         self.group = group
         self.max_size = max_size
         self.rank = rank
