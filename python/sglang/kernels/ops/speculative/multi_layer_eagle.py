@@ -74,6 +74,12 @@ def rotate_input_ids(
         return input_ids
 
     batch_size = extend_seq_lens.shape[0]
+
+    # rotate_input_ids_triton skipped: batch_size=0 (empty extend_seq_lens).
+    # This is expected when a DP rank has no requests.
+    if batch_size == 0:
+        return input_ids
+
     BLOCK_SIZE = 4096 if select_index is not None else 8
     grid = (batch_size,)
 
