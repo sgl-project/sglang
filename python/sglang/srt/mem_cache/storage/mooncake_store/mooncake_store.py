@@ -703,10 +703,15 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         unique_keys = list(dict.fromkeys(logical_keys))[: self.retention_max_pages]
         group_ids = [self._make_group_id(key) for key in self._tag_keys(unique_keys)]
         try:
-            return sum(
-                result == 1
-                for result in self.store.retain_groups(group_ids, ttl_seconds * 1000)
+            results = self.store.retain_groups(group_ids, ttl_seconds * 1000)
+            accepted = sum(result == 1 for result in results)
+            logger.info(
+                "Mooncake KV retention accepted %d/%d page groups for %d seconds",
+                accepted,
+                len(group_ids),
+                ttl_seconds,
             )
+            return accepted
         except Exception:
             logger.warning("Failed to retain Mooncake KV page groups", exc_info=True)
             return 0

@@ -262,12 +262,26 @@ class HiRadixCache(RadixCache):
                 ).page_aligned(self.page_size)
                 match = self.match_prefix(MatchPrefixParams(key=key))
                 if len(match.device_indices) != len(key):
+                    logger.info(
+                        "Skipped KV retention hint: matched %d of %d prefix tokens",
+                        len(match.device_indices),
+                        len(key),
+                    )
                     continue
                 node = match.last_device_node
                 page_hashes = node.get_prefix_hash_values(node)
                 if len(page_hashes) != len(key) // self.page_size:
                     continue
-                accepted += backend.retain_pages(page_hashes, int(ttl_seconds))
+                retained_pages = backend.retain_pages(
+                    page_hashes, int(ttl_seconds)
+                )
+                accepted += retained_pages
+                logger.info(
+                    "Applied KV retention hint to %d/%d pages for %d seconds",
+                    retained_pages,
+                    len(page_hashes),
+                    int(ttl_seconds),
+                )
             except Exception:
                 if not self._retention_apply_failed_logged:
                     logger.warning("Failed to apply KV retention hint", exc_info=True)
