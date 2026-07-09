@@ -250,7 +250,7 @@ class SchedulerInvariantChecker:
                 if req.kv_committed_freed or req.req_pool_idx is None:
                     continue
 
-                allocated_len = req.kv_allocated_len
+                allocated_len = req.kv.kv_allocated_len
                 if self.page_size > 1:
                     allocated_len = ceil_align(allocated_len, self.page_size)
                     assert req.cache_protected_len % self.page_size == 0
@@ -258,7 +258,7 @@ class SchedulerInvariantChecker:
                 full_uncached += allocated_len - req.cache_protected_len
                 if self.is_hybrid_swa:
                     swa_uncached += allocated_len - max(
-                        req.cache_protected_len, req.swa_evicted_seqlen
+                        req.cache_protected_len, req.kv.swa_evicted_seqlen
                     )
 
         return full_uncached, swa_uncached
@@ -321,7 +321,7 @@ class SchedulerInvariantChecker:
                     f"req {req.rid}",
                     req.req_pool_idx,
                     req.kv_committed_len,
-                    req.kv_allocated_len,
+                    req.kv.kv_allocated_len,
                 )
         sess = getattr(self.tree_cache, "slots", None)
         if sess:
@@ -332,7 +332,7 @@ class SchedulerInvariantChecker:
                         f"slot {sid[:8]}",
                         slot.req_pool_idx,
                         slot.kv_committed_len,
-                        slot.kv_allocated_len,
+                        slot.kv.kv_allocated_len,
                     )
 
         active = [
