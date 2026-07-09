@@ -1426,15 +1426,6 @@ class HiRadixCache(RadixCache):
             or prefetch_length < self.prefetch_threshold
             or self.cache_controller.prefetch_rate_limited()
         ):
-            logger.debug(
-                "HiCache prefetch not enqueued for rid=%s enable_storage=%s prefetch_length=%d "
-                "threshold=%d rate_limited=%s",
-                req_id,
-                self.enable_storage,
-                prefetch_length,
-                self.prefetch_threshold,
-                self.cache_controller.prefetch_rate_limited(),
-            )
             return
 
         last_host_node.protect_host()
@@ -1464,13 +1455,6 @@ class HiRadixCache(RadixCache):
             last_hash,
             prefix_keys,
             **self._get_extra_pools(),
-        )
-        logger.debug(
-            "HiCache prefetch enqueued for rid=%s prefetch_length=%d last_hash=%s prefix_keys=%d",
-            req_id,
-            prefetch_length,
-            last_hash,
-            len(prefix_keys) if prefix_keys is not None else 0,
         )
         self.ongoing_prefetch[req_id] = (
             last_host_node,
