@@ -638,6 +638,7 @@ class DeepseekV4AttnBackend(
         ] = None
         self.online_c128_mtp = OnlineC128MTPController(self)
         self.sparse_prefill_workspace = SparsePrefillWorkspace(self.device)
+        self._init_verify_bs_buffers()
 
         self.is_dspark_draft = bool(
             getattr(model_runner, "is_draft_worker", False)
@@ -866,12 +867,7 @@ class DeepseekV4AttnBackend(
             c128_compress_metadata=c128_compress_metadata,
         )
 
-    def _ensure_verify_bs_buffers(self) -> None:
-        if hasattr(self, "extend_seq_lens_buffer") and not (
-            self.extend_seq_lens_buffer.is_inference()
-            or self.extend_start_loc_buffer.is_inference()
-        ):
-            return
+    def _init_verify_bs_buffers(self) -> None:
         num_reqs = self.req_to_token.shape[0]
         with torch.inference_mode(False):
             self.extend_seq_lens_buffer = torch.full(
@@ -882,6 +878,16 @@ class DeepseekV4AttnBackend(
             self.extend_start_loc_buffer = torch.zeros(
                 num_reqs, **self.cuda_int32_kwargs
             )
+
+    def _ensure_verify_bs_buffers(self) -> None:
+        num_reqs = self.req_to_token.shape[0]
+        if (
+            hasattr(self, "extend_seq_lens_buffer")
+            and self.extend_seq_lens_buffer.shape[0] == num_reqs
+            and self.extend_start_loc_buffer.shape[0] == num_reqs
+        ):
+            return
+        self._init_verify_bs_buffers()
 
     def init_forward_metadata_target_verify(
         self,
