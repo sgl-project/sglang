@@ -37,7 +37,7 @@ import torch
 
 from sglang.srt.layers.attention.dsa import index_buf_accessor
 from sglang.srt.layers.cp.utils import get_layer_owner, get_layer_shard_range
-from sglang.srt.layers.dp_attention import get_attention_cp_group
+from sglang.srt.layers.dp_attention import get_attn_cp_group
 from sglang.srt.mem_cache.memory_pool import (
     GPU_MEMORY_TYPE_KV_CACHE,
     DSATokenToKVPool,
@@ -113,7 +113,7 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
     # ---- broadcast plumbing -----------------------------------------------
 
     def _init_layer_broadcast_comm(self) -> None:
-        cp_group = get_attention_cp_group()
+        cp_group = get_attn_cp_group()
         if cp_group.world_size <= 1 or cp_group.pynccl_comm is None:
             return
 
@@ -143,7 +143,7 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
             if tensor.data_ptr() != src_tensor.data_ptr():
                 tensor.copy_(src_tensor)
 
-        cp_group = get_attention_cp_group()
+        cp_group = get_attn_cp_group()
         comm = (
             self.layer_broadcast_comm
             if use_layer_broadcast_comm and self.layer_broadcast_comm is not None
