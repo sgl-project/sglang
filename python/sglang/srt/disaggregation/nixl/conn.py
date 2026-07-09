@@ -466,6 +466,14 @@ class NixlKVManager(CommonKVManager):
                 f"Unsupported DisaggregationMode: {self.disaggregation_mode}"
             )
 
+    def update_status(self, bootstrap_room: int, status: KVPoll):
+        if (
+            bootstrap_room in self.request_status
+            and self.request_status[bootstrap_room] == KVPoll.Failed
+        ):
+            return
+        super().update_status(bootstrap_room, status)
+
     def _init_staging_prefill_ctx(self):
         from sglang.srt.disaggregation.common.staging_handler import (
             PrefillStagingContext,
@@ -2316,6 +2324,37 @@ class NixlKVManager(CommonKVManager):
             return False
         return self.transfer_statuses[room].is_done()
 
+    def _handle_abort_notification(self, msg: List[bytes]) -> bool:
+        if not msg or msg[0] != b"ABORT":
+            return False
+
+        try:
+            if len(msg) != 4:
+                raise ValueError(f"expected 4 frames, got {len(msg)}")
+            room_to_be_aborted = int(msg[1].decode("ascii"))
+        except Exception as e:
+            logger.debug(f"Ignoring malformed abort notification: {e}")
+            return True
+
+        if (
+            room_to_be_aborted in self.request_status
+            and self.check_status(room_to_be_aborted) != KVPoll.Success
+        ):
+            self.update_status(room_to_be_aborted, KVPoll.Failed)
+            logger.debug(
+                f"Received abort notification for room {room_to_be_aborted}, "
+                f"marked as Failed"
+            )
+        else:
+            logger.debug(
+                f"Received abort notification for room {room_to_be_aborted}, "
+                f"ignoring (already completed or unknown)"
+            )
+
+        # TODO: Define real ACK/deferred-release semantics if decode-side buffer
+        # release needs to wait for prefill-side NIXL transfer quiescence.
+        return True
+
     def _start_bootstrap_thread(self):
         def bootstrap_thread():
             """This thread recvs transfer info from the decode engine"""
@@ -2343,6 +2382,9 @@ class NixlKVManager(CommonKVManager):
                         )
 
                         handle_staging_rsp(waiting_req_bytes, self.transfer_infos)
+                    continue
+
+                if self._handle_abort_notification(waiting_req_bytes):
                     continue
 
                 assert (
