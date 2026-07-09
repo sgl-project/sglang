@@ -1616,8 +1616,7 @@ def retract_all(
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
     tree_cache: BasePrefixCache,
     hisparse_coordinator: Optional[HiSparseCoordinator],
-) -> List[Req]:
-    retracted_reqs = reqs
+) -> None:
     for idx in range(len(reqs)):
         release_req(
             req=reqs[idx],
@@ -1628,7 +1627,6 @@ def retract_all(
             tree_cache=tree_cache,
             hisparse_coordinator=hisparse_coordinator,
         )
-    return retracted_reqs
 
 
 def compute_extend_logprob_start_len(

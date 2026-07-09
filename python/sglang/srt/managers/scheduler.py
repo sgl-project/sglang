@@ -4051,8 +4051,9 @@ class Scheduler(
         if not self.running_batch.is_empty():
             self.running_batch.filter_batch()
             if len(self.running_batch.reqs) != 0:
-                retracted_reqs = retract_all(
-                    reqs=self.running_batch.reqs,
+                retracted_reqs = self.running_batch.reqs
+                retract_all(
+                    reqs=retracted_reqs,
                     server_args=self.server_args,
                     req_to_token_pool=self.running_batch.req_to_token_pool,
                     token_to_kv_pool_allocator=self.running_batch.token_to_kv_pool_allocator,

@@ -131,22 +131,21 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
         scheduler.waiting_queue = []
         scheduler._add_request_to_queue = MagicMock()
 
-        retracted = [MagicMock(), MagicMock()]
         scheduler.running_batch.filter_batch = MagicMock()
         scheduler.server_args = MagicMock()
+        reqs_before = scheduler.running_batch.reqs
 
-        with patch(
-            "sglang.srt.managers.scheduler.retract_all", return_value=retracted
-        ) as mock_retract_all:
+        with patch("sglang.srt.managers.scheduler.retract_all") as mock_retract_all:
             scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
 
         self.assertTrue(scheduler._engine_paused)
         mock_retract_all.assert_called_once()
+        self.assertIs(mock_retract_all.call_args.kwargs["reqs"], reqs_before)
         self.assertEqual(scheduler.running_batch.reqs, [])
         self.assertEqual(scheduler._add_request_to_queue.call_count, 2)
         self.assertEqual(
             [call.args[0] for call in scheduler._add_request_to_queue.call_args_list],
-            retracted,
+            reqs_before,
         )
         self.assertIsNone(scheduler.chunked_req)
 
