@@ -34,12 +34,13 @@ class MistralLarge3EagleModel(DeepseekV2Model):
         nn.Module.__init__(self)
 
         self.config = config
+        self.use_dsa = is_deepseek_dsa(config)
         self.vocab_size = config.vocab_size
         assert get_pp_group().world_size == 1
         self.pp_group = get_pp_group()
         self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
         self.mla_enable_prefill_cp = (
-            is_prefill_context_parallel_enabled() and not is_deepseek_dsa(config)
+            is_prefill_context_parallel_enabled() and not self.use_dsa
         )
 
         self.embed_tokens = VocabParallelEmbedding(
