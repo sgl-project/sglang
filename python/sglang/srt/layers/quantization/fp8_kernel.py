@@ -2256,6 +2256,82 @@ def triton_scaled_mm(
     return result.to(out_dtype)
 
 
+@triton.jit
+def interleave_int4xfp8_Hopper_kernel(
+    ptr_4b,
+    ptr_4b_interleaved,
+    rows,
+    cols,
+    grid_0: tl.constexpr,
+    BLOCK_TX: tl.constexpr,
+    BLOCK_TY: tl.constexpr,
+):
+    blockIdx_x = tl.program_id(0)
+    lane_x = tl.arange(0, BLOCK_TX)
+    lane_y = tl.arange(0, BLOCK_TY)
+
+    rows_half = rows // 2
+    cols_div4 = cols // 4
+
+    block_id = blockIdx_x
+    while block_id < rows_half:
+        partition_id = lane_y
+        mask_partition = partition_id < (cols // 64)
+        while tl.max(mask_partition.to(tl.int32)) > 0:
+            lane_id = lane_x[None, :]
+            partition = partition_id[:, None]
+            row_id = (block_id // 8) * 16 + (block_id % 8)
+            dst_row_id = row_id + ((lane_id % 8) // 4) * 8
+            mma_id = lane_id // 8
+            interleaved_lane_id = mma_id * 8 + (lane_id % 4) * 2
+            col_id = partition * 16 + lane_id
+            dst_col_id = partition * 16 + interleaved_lane_id
+
+            src_id_a = row_id * cols_div4 + col_id
+            src_id_b = (row_id + 8) * cols_div4 + col_id
+
+            dst_id = dst_row_id * cols_div4 + dst_col_id
+
+            valid = (
+                (col_id < cols_div4)
+                & (dst_row_id < rows)
+                & (row_id + 8 < rows)
+                & mask_partition[:, None]
+            )
+
+            fp4x2_a = tl.load(ptr_4b + src_id_a, mask=valid, other=0).to(tl.uint16)
+            fp4x2_b = tl.load(ptr_4b + src_id_b, mask=valid, other=0).to(tl.uint16)
+
+            tl.store(ptr_4b_interleaved + dst_id, fp4x2_a, mask=valid)
+            tl.store(ptr_4b_interleaved + (dst_id + 1), fp4x2_b, mask=valid)
+
+            partition_id = partition_id + BLOCK_TY
+            mask_partition = partition_id < (cols // 64)
+
+        block_id += grid_0
+
+
+def interleave_int4(int4_ptr, int4_interleaved_ptr, rows, cols):
+    BLOCK_TX = 16
+    BLOCK_TY = 32
+    grid_0 = 1024
+
+    int16_ptr = int4_ptr.view(torch.int16)  # reinterpret_cast<const uint16_t*>
+    int16_interleaved_ptr = int4_interleaved_ptr.view(
+        torch.int16
+    )  # reinterpret_cast<uint16_t*>
+
+    interleave_int4xfp8_Hopper_kernel[(grid_0,)](
+        int16_ptr,
+        int16_interleaved_ptr,
+        rows,
+        cols,
+        grid_0=grid_0,
+        BLOCK_TX=BLOCK_TX,
+        BLOCK_TY=BLOCK_TY,
+    )
+
+
 if _is_cuda:
     if enable_sgl_per_token_group_quant_8bit:
 
