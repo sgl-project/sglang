@@ -37,20 +37,34 @@ class DsparkDraftSampler:
         )
 
     def __call__(self, hidden_states, input_ids):
-        bs = hidden_states.shape[0] // self.gamma
-        base_logits, confidence_tap = self.model.compute_base_logits(hidden_states)
+        draft_width = self.gamma + 1
+        if hidden_states.shape[0] % draft_width != 0:
+            raise RuntimeError(
+                "DSpark folded draft sampler expects full blocks with "
+                f"anchor + gamma tokens, got {hidden_states.shape[0]} rows "
+                f"for gamma={self.gamma}."
+            )
+        bs = hidden_states.shape[0] // draft_width
+        hidden_3d = hidden_states.view(bs, draft_width, -1)
+        ids_2d = input_ids.view(bs, draft_width)
+        anchor = ids_2d[:, 0]
+        # Slot 0 conditions the block. Slots 1..gamma are the draft tokens
+        # used by the verifier and confidence scheduler.
+        draft_hidden = hidden_3d[:, 1:, :].contiguous()
+        hidden_for_logits = draft_hidden.reshape(bs * self.gamma, -1)
+
+        base_logits, confidence_tap = self.model.compute_base_logits(hidden_for_logits)
         base_logits = base_logits.view(bs, self.gamma, -1)
-        anchor = input_ids.view(bs, self.gamma)[:, 0]
         draft_tokens, _ = self.markov_head.sample_block(
             base_logits,
             first_prev_tokens=anchor,
-            hidden_states=hidden_states.view(bs, self.gamma, -1),
+            hidden_states=draft_hidden,
             sampler=greedy_step_sampler,
         )
         self.out[: draft_tokens.numel()].copy_(draft_tokens.reshape(-1))
         if self.confidence_out is not None:
             confidence = self.confidence_fn(
-                draft_hidden=hidden_states.view(bs, self.gamma, -1),
+                draft_hidden=draft_hidden,
                 anchor_tokens=anchor,
                 draft_tokens=draft_tokens,
                 confidence_tap=confidence_tap,

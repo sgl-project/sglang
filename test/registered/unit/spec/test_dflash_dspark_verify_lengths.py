@@ -169,9 +169,12 @@ class TestDFlashDSparkVerifyLengths(CustomTestCase):
         self.assertIsNone(batch.seq_lens_cpu)
         self.assertIsNone(batch.seq_lens_sum)
 
-    def test_dspark_draft_proposer_passes_prefix_seq_lens_cpu(self):
+    def test_dspark_draft_proposer_passes_prefix_seq_lens_cpu_and_crops_anchor_hidden(
+        self,
+    ):
         seen = {}
         gamma = 4
+        draft_width = gamma + 1
         bs = 2
 
         class FakeDraftRunner:
@@ -181,10 +184,11 @@ class TestDFlashDSparkVerifyLengths(CustomTestCase):
                 seen["seq_lens"] = forward_batch.seq_lens.clone()
                 seen["seq_lens_cpu"] = forward_batch.seq_lens_cpu.clone()
                 seen["seq_lens_sum"] = forward_batch.seq_lens_sum
+                hidden = torch.arange(
+                    bs * draft_width * 16, dtype=torch.float32
+                ).view(bs * draft_width, 16)
                 return SimpleNamespace(
-                    logits_output=SimpleNamespace(
-                        hidden_states=torch.empty((bs * gamma, 16))
-                    ),
+                    logits_output=SimpleNamespace(hidden_states=hidden),
                     can_run_graph=False,
                 )
 
@@ -205,13 +209,15 @@ class TestDFlashDSparkVerifyLengths(CustomTestCase):
             bonus_tokens=torch.tensor([7, 8], dtype=torch.int64),
         )
         verify_window = SimpleNamespace(
-            positions_2d=torch.arange(bs * gamma, dtype=torch.int64).view(bs, gamma),
-            verify_cache_loc_2d=torch.arange(bs * gamma, dtype=torch.int64).view(
-                bs, gamma
+            positions_2d=torch.arange(bs * draft_width, dtype=torch.int64).view(
+                bs, draft_width
             ),
+            verify_cache_loc_2d=torch.arange(
+                bs * draft_width, dtype=torch.int64
+            ).view(bs, draft_width),
         )
 
-        proposer._run_forward(
+        out = proposer._run_forward(
             batch=batch,
             draft_input=draft_input,
             verify_window=verify_window,
@@ -223,10 +229,14 @@ class TestDFlashDSparkVerifyLengths(CustomTestCase):
         self.assertEqual(seen["seq_lens"].tolist(), [10, 20])
         self.assertEqual(seen["seq_lens_cpu"].tolist(), [10, 20])
         self.assertEqual(seen["seq_lens_sum"], 30)
+        self.assertEqual(tuple(out.draft_block_ids.shape), (bs, draft_width))
+        self.assertEqual(tuple(out.draft_hidden_3d.shape), (bs, gamma, 16))
+        self.assertEqual(out.raw_hidden[0].tolist(), list(range(16, 32)))
 
     def test_dspark_draft_proposer_derives_cpu_lens_from_gpu_only_batch(self):
         seen = {}
         gamma = 4
+        draft_width = gamma + 1
         bs = 2
 
         class FakeDraftRunner:
@@ -238,7 +248,7 @@ class TestDFlashDSparkVerifyLengths(CustomTestCase):
                 seen["seq_lens_sum"] = forward_batch.seq_lens_sum
                 return SimpleNamespace(
                     logits_output=SimpleNamespace(
-                        hidden_states=torch.empty((bs * gamma, 16))
+                        hidden_states=torch.empty((bs * draft_width, 16))
                     ),
                     can_run_graph=False,
                 )
@@ -262,10 +272,12 @@ class TestDFlashDSparkVerifyLengths(CustomTestCase):
             reserved_seq_lens_sum=46,
         )
         verify_window = SimpleNamespace(
-            positions_2d=torch.arange(bs * gamma, dtype=torch.int64).view(bs, gamma),
-            verify_cache_loc_2d=torch.arange(bs * gamma, dtype=torch.int64).view(
-                bs, gamma
+            positions_2d=torch.arange(bs * draft_width, dtype=torch.int64).view(
+                bs, draft_width
             ),
+            verify_cache_loc_2d=torch.arange(
+                bs * draft_width, dtype=torch.int64
+            ).view(bs, draft_width),
         )
 
         proposer._run_forward(
@@ -281,7 +293,7 @@ class TestDFlashDSparkVerifyLengths(CustomTestCase):
         self.assertEqual(seen["seq_lens_cpu"].tolist(), [10, 20])
         self.assertEqual(seen["seq_lens_sum"], 30)
 
-    def test_dspark_draft_dummy_verify_input_uses_gamma_not_verify_window(self):
+    def test_dspark_draft_dummy_verify_input_uses_verify_window(self):
         args = _spec_args(draft_tokens=8)
         spec_algorithm = SpeculativeAlgorithm.DSPARK
 
@@ -289,7 +301,7 @@ class TestDFlashDSparkVerifyLengths(CustomTestCase):
             spec_algorithm=spec_algorithm,
             server_args=args,
             custom_mask=torch.empty(0, dtype=torch.bool),
-            num_tokens_per_bs=7,
+            num_tokens_per_bs=8,
             is_draft_worker=True,
         )
         target_spec = create_dummy_verify_input(
@@ -300,15 +312,15 @@ class TestDFlashDSparkVerifyLengths(CustomTestCase):
             is_draft_worker=False,
         )
 
-        self.assertEqual(draft_spec.draft_token_num, 7)
+        self.assertEqual(draft_spec.draft_token_num, 8)
         self.assertEqual(target_spec.draft_token_num, 8)
 
-    def test_target_verify_width_adjustment_is_dspark_draft_only(self):
+    def test_target_verify_width_adjustment_keeps_dspark_window(self):
         self.assertEqual(
             SpeculativeAlgorithm.DSPARK.get_num_tokens_per_bs_for_target_verify(
                 8, is_draft_worker=True
             ),
-            7,
+            8,
         )
         self.assertEqual(
             SpeculativeAlgorithm.DSPARK.get_num_tokens_per_bs_for_target_verify(

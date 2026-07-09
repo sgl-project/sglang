@@ -156,16 +156,20 @@ class DraftBlockProposer:
         embed_module,
     ) -> DraftForwardResult:
         gamma = self.gamma
+        draft_width = gamma + 1
         prefix_lens = batch.seq_lens
         positions_2d = verify_window.positions_2d
         verify_cache_loc_2d = verify_window.verify_cache_loc_2d
 
         draft_block_ids = torch.full(
-            (bs, gamma), int(self._mask_token_id), dtype=torch.long, device=device
+            (bs, draft_width),
+            int(self._mask_token_id),
+            dtype=torch.long,
+            device=device,
         )
         draft_block_ids[:, 0].copy_(draft_input.bonus_tokens.view(-1))
-        draft_positions = positions_2d[:, :gamma].reshape(-1)
-        draft_cache_loc = verify_cache_loc_2d[:, :gamma].reshape(-1)
+        draft_positions = positions_2d[:, :draft_width].reshape(-1)
+        draft_cache_loc = verify_cache_loc_2d[:, :draft_width].reshape(-1)
 
         draft_owns_embed = hasattr(self.draft_model, "forward_embed")
         draft_input_embeds: Optional[torch.Tensor] = None
@@ -211,7 +215,11 @@ class DraftBlockProposer:
         raw_hidden = logits_output.hidden_states
         if raw_hidden is None:
             raise RuntimeError("DSpark draft model returned no hidden states.")
-        draft_hidden_3d = raw_hidden.view(bs, gamma, -1)
+        # DSpark/DFlash block slot 0 is the anchor token. The draft transformer
+        # must see it, but only slots 1..gamma are emitted as speculative tokens.
+        raw_hidden_3d = raw_hidden.view(bs, draft_width, -1)
+        draft_hidden_3d = raw_hidden_3d[:, 1:, :].contiguous()
+        raw_hidden = draft_hidden_3d.reshape(bs * gamma, -1)
         return DraftForwardResult(
             draft_block_ids=draft_block_ids,
             raw_hidden=raw_hidden,
