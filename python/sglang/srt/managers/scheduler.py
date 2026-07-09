@@ -1461,17 +1461,58 @@ class Scheduler(
             ]
         )
 
+    def _dp_tp_group_world_size(self) -> int:
+        # Size of the request/data-plane coordination group (dp_tp_group). Returns 1
+        # when torch.distributed is unavailable (single-process / unit tests), in
+        # which case the timeout-abort decision is purely local and no broadcast runs.
+        if (
+            torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+            and self.dp_tp_cpu_group is not None
+        ):
+            return torch.distributed.get_world_size(group=self.dp_tp_cpu_group)
+        return 1
+
     def _abort_on_running_timeout(self):
         # NOTE: this should be called before a batch is launched.
         timeout_s = envs.SGLANG_REQ_RUNNING_TIMEOUT.get()
         if timeout_s <= 0:
             return
-        if self.running_batch.is_empty():
+
+        # Same rank-consistency requirement as _abort_on_waiting_timeout: decide the
+        # timed-out set on the dp_tp_group entry rank and broadcast it so all ranks
+        # mark the SAME requests to_finish. A per-rank wall-clock decision would
+        # diverge the running batch across ranks -> NCCL deadlock. The broadcast is
+        # gated ONLY on replicated state (timeout + group size), never on per-rank
+        # running_batch state (e.g. is_empty()), so ranks can never disagree on
+        # whether to enter the collective.
+        group_world_size = self._dp_tp_group_world_size()
+
+        timed_out_rids = []
+        if self.dp_tp_group.rank_in_group == 0 and not self.running_batch.is_empty():
+            deadline = time.perf_counter() - timeout_s
+            for req in self.running_batch.reqs:
+                if (
+                    not req.finished()
+                    and 0 < req.time_stats.forward_entry_time < deadline
+                ):
+                    timed_out_rids.append(req.rid)
+
+        if group_world_size > 1:
+            obj_list = [timed_out_rids]
+            torch.distributed.broadcast_object_list(
+                obj_list,
+                src=self.dp_tp_group.first_rank,
+                group=self.dp_tp_cpu_group,
+            )
+            timed_out_rids = obj_list[0]
+
+        if not timed_out_rids:
             return
 
-        deadline = time.perf_counter() - timeout_s
+        rid_set = set(timed_out_rids)
         for req in self.running_batch.reqs:
-            if not req.finished() and 0 < req.time_stats.forward_entry_time < deadline:
+            if req.rid in rid_set and not req.finished():
                 req.to_finish = FINISH_ABORT(
                     "Request running timeout reached.", HTTPStatus.SERVICE_UNAVAILABLE
                 )
@@ -2403,11 +2444,41 @@ class Scheduler(
         if (timeout_s := envs.SGLANG_REQ_WAITING_TIMEOUT.get()) <= 0:
             return
 
-        deleted_reqs = set()
-        deadline = time.perf_counter() - timeout_s
+        # Decide the timed-out set on the request-plane entry rank (rank 0 of
+        # dp_tp_group) using its single, authoritative clock, then broadcast the rid
+        # list so every rank in the group aborts the SAME requests. If each rank
+        # recomputed this with its own time.perf_counter(), a request whose wait
+        # straddles the deadline would be aborted on some ranks but not others ->
+        # divergent waiting_queue -> divergent batch composition at the same
+        # forward_ct -> NCCL collective shape mismatch -> permanent TP deadlock.
+        # dp_tp_group is the request/data-plane coordination group the waiting_queue
+        # is kept consistent over, so the decision must be replicated over it.
+        group_world_size = self._dp_tp_group_world_size()
+
+        timed_out_rids = []
+        if self.dp_tp_group.rank_in_group == 0:
+            deadline = time.perf_counter() - timeout_s
+            for req in self.waiting_queue:
+                entry_time = req.time_stats.wait_queue_entry_time
+                if 0 < entry_time < deadline:
+                    timed_out_rids.append(req.rid)
+
+        if group_world_size > 1:
+            obj_list = [timed_out_rids]
+            torch.distributed.broadcast_object_list(
+                obj_list,
+                src=self.dp_tp_group.first_rank,
+                group=self.dp_tp_cpu_group,
+            )
+            timed_out_rids = obj_list[0]
+
+        if not timed_out_rids:
+            return
+
+        rid_set = set(timed_out_rids)
+        deleted_reqs = []
         for req in self.waiting_queue:
-            entry_time = req.time_stats.wait_queue_entry_time
-            if 0 < entry_time < deadline:
+            if req.rid in rid_set:
                 if self.enable_hicache_storage:
                     # Release prefetch events associated with the request
                     self.tree_cache.release_aborted_request(req.rid)
@@ -2422,11 +2493,12 @@ class Scheduler(
                     ),
                     req,
                 )
-                deleted_reqs.add(req)
+                deleted_reqs.append(req)
 
         if deleted_reqs:
+            deleted_set = set(deleted_reqs)
             self.waiting_queue = [
-                req for req in self.waiting_queue if req not in deleted_reqs
+                req for req in self.waiting_queue if req not in deleted_set
             ]
 
     def handle_embedding_request(
