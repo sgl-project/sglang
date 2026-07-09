@@ -219,6 +219,7 @@ class Fp8GemmRunnerBackend(Enum):
     FLASHINFER_CUTLASS = "flashinfer_cutlass"
     FLASHINFER_DEEPGEMM = "flashinfer_deepgemm"
     CUTLASS = "cutlass"
+    CUTEDSL = "cutedsl"
     DEEP_GEMM = "deep_gemm"
     TRITON = "triton"
     AITER = "aiter"
@@ -237,6 +238,9 @@ class Fp8GemmRunnerBackend(Enum):
 
     def is_cutlass(self) -> bool:
         return self == Fp8GemmRunnerBackend.CUTLASS
+
+    def is_cutedsl(self) -> bool:
+        return self == Fp8GemmRunnerBackend.CUTEDSL
 
     def is_deep_gemm(self) -> bool:
         return self == Fp8GemmRunnerBackend.DEEP_GEMM
@@ -464,6 +468,16 @@ def _dispatch_explicit_backend(backend: Fp8GemmRunnerBackend) -> Callable:
             )
         return cutlass_w8a8_block_fp8_linear_with_fallback
 
+    elif backend.is_cutedsl():
+        if not is_sm120_supported():
+            raise RuntimeError(
+                "CuTeDSL low-latency block FP8 requested via "
+                "--fp8-gemm-backend=cutedsl, but hardware does not support it. "
+                "This backend requires SM120 (Blackwell, e.g. RTX 50-series) "
+                "GPUs with CUDA 12.8+."
+            )
+        return cutedsl_w8a8_block_fp8_linear_with_fallback
+
     elif backend.is_aiter():
         if not _use_aiter:
             raise RuntimeError(
@@ -494,7 +508,7 @@ def _dispatch_auto_backend() -> Callable:
     # Priority order for auto selection:
     # 1. DeepGEMM (if enabled and available)
     # 2. FlashInfer TRTLLM (if Blackwell GPU and FlashInfer available)
-    # 3. CUTLASS (if SM120 GPU and CUDA 12.8+)
+    # 3. CuTeDSL low-latency + CUTLASS fallback (if SM120 GPU and CUDA 12.8+)
     # 4. AITER (if AMD GPU with AITER enabled)
     # 5. Triton (fallback)
 
@@ -502,8 +516,16 @@ def _dispatch_auto_backend() -> Callable:
         return deepgemm_w8a8_block_fp8_linear_with_fallback
     elif is_blackwell_supported() and is_flashinfer_available():
         return flashinfer_gemm_w8a8_block_fp8_linear_with_fallback
-    elif is_sm120_supported():
-        return cutlass_w8a8_block_fp8_linear_with_fallback
+    # NOTE: cutedsl is intentionally NOT auto-selected here even on SM120.
+    # `_requant_weight_for_ll` permanently caches an extra full-size fp8
+    # weight copy (plus a transient fp32 dequant buffer) the first time each
+    # distinct weight tensor is seen -- for MoE models this means one extra
+    # copy PER EXPERT, materializing unpredictably through decode-graph
+    # warmup as different experts get hit, which has caused real OOM crashes
+    # on memory-constrained deployments. Perf gain over plain cutlass is
+    # marginal/parity for most shapes (see vllm-ll-fp8-block-gemm-test.md),
+    # so it isn't worth this memory risk by default -- require explicit
+    # `--fp8-gemm-backend cutedsl` opt-in instead.
     elif _use_aiter:
         return aiter_w8a8_block_fp8_linear
     else:
@@ -706,6 +728,67 @@ def cutlass_w8a8_block_fp8_linear_with_fallback(
     if bias is not None:
         output += bias
     return output.to(dtype=input_2d.dtype).view(*output_shape)
+
+
+def cutedsl_w8a8_block_fp8_linear_with_fallback(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    block_size: List[int],
+    weight_scale: torch.Tensor,
+    input_scale: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """CuTeDSL low-latency (LL) FP8 block GEMM for tiny M (decode). Falls back
+    to the plain CUTLASS block FP8 path for shapes/M this kernel doesn't
+    support -- see `use_ll_fp8_block_gemm` for the exact constraints (fixed
+    16-wide M tile with no partial-tile perf tuning beyond M<=64, N a multiple
+    of 16, K a multiple of 512).
+
+    Uses the kernel's fp32-scale mode (`ll_fp8_block_scaled_mm_fp32`) by
+    default, not its original ue8m0 (power-of-two) mode: fp32 scales need no
+    weight requantization (the native, arbitrary-precision block scale is
+    used as-is, avoiding `requant_weight_ue8m0`'s lossy round-to-power-of-two
+    step entirely -- verified slightly *more* accurate, cos-sim ~0.9993-0.9995
+    vs ue8m0's ~0.9989-0.9990 against a plain bf16 reference) and is
+    perf-neutral (cold-L2 CUPTI: 0.97-1.07x across production shapes at
+    M=1/4/16 -- the fp32 path's single native multiply roughly offsets the
+    ue8m0 path's PTX bit-trick against 4x more scale smem/DMA traffic).
+    ue8m0 mode was also found to produce NaN/Inf at M=1 on several real
+    production shapes (pre-existing, data-dependent, not yet root-caused --
+    see cutedsl_ll_fp8_block_gemm.py's module docstring); the fp32 path does
+    not reproduce this on any shape tested, which is the main reason to
+    prefer it as the default, not just the accuracy/parity numbers above.
+    """
+    assert input_scale is None
+
+    from sglang.jit_kernel.cutedsl_ll_fp8_block_gemm import (
+        ll_fp8_block_scaled_mm_fp32,
+        use_ll_fp8_block_gemm,
+    )
+
+    input_2d = input.view(-1, input.shape[-1])
+    m, k = input_2d.shape
+    n = weight.shape[0]
+
+    if not (
+        input.dtype == torch.bfloat16
+        and use_ll_fp8_block_gemm(m, n, k)
+        and block_size == [128, 128]
+    ):
+        return cutlass_w8a8_block_fp8_linear_with_fallback(
+            input, weight, block_size, weight_scale, input_scale, bias
+        )
+
+    output_shape = [*input.shape[:-1], n]
+
+    q_input, x_scale = sglang_per_token_group_quant_fp8(input_2d, block_size[1])
+
+    output = ll_fp8_block_scaled_mm_fp32(
+        q_input, x_scale, weight, weight_scale, out_dtype=input_2d.dtype
+    )
+    if bias is not None:
+        output += bias
+    return output.view(*output_shape)
 
 
 def deepgemm_w8a8_block_fp8_linear_with_fallback(

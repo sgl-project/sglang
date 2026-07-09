@@ -275,6 +275,7 @@ FP8_GEMM_RUNNER_BACKEND_CHOICES = [
     "flashinfer_cutlass",
     "flashinfer_deepgemm",
     "cutlass",
+    "cutedsl",
     "triton",
     "aiter",
 ]

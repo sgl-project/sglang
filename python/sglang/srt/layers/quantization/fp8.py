@@ -623,6 +623,15 @@ class Fp8LinearMethod(LinearMethodBase):
                 output_dtype=getattr(layer, "orig_dtype", None),
                 weight_shape=layer.weight.shape,
             )
+
+            # NOTE: the CuTeDSL LL kernel now defaults to fp32 block scales
+            # (`ll_fp8_block_scaled_mm_fp32`, see
+            # `cutedsl_w8a8_block_fp8_linear_with_fallback`'s docstring), which
+            # reuses the native weight/scale as-is -- no eager ue8m0
+            # requantization needed here anymore (that was specifically for
+            # the original ue8m0-mode kernel's extra full-size weight copy,
+            # which is no longer on the default path).
+
             weight, weight_scale = layer.weight.data, layer.weight_scale_inv.data
 
         layer.weight.data = weight.data
