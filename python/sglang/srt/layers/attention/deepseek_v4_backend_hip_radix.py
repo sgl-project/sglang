@@ -458,6 +458,12 @@ class DeepseekV4HipRadixBackend(
         self.speculative_num_draft_tokens: int = (
             model_runner.server_args.speculative_num_draft_tokens
         )
+        if (
+            self.speculative_num_draft_tokens is not None
+            and getattr(model_runner, "is_draft_worker", False)
+            and model_runner.spec_algorithm.is_dspark()
+        ):
+            self.speculative_num_draft_tokens -= 1
         self.speculative_step_id = speculative_step_id
         self.forward_metadata: Union[
             DSV4Metadata,

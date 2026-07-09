@@ -20,6 +20,8 @@ class SoftmaxTemp:
         if _KERNEL_IMPL == "torch":
             return cls.torch(*args, **kwargs)
         if _KERNEL_IMPL == "flashinfer":
+            if _flashinfer_softmax is None:
+                return cls.triton(*args, **kwargs)
             return cls.flashinfer(*args, **kwargs)
         return cls.triton(*args, **kwargs)
 
