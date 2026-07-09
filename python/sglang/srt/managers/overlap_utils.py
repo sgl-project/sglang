@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Sequence, Union
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Optional, Sequence
 
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.speculative.spec_utils import spec_need_hidden_states
 from sglang.srt.speculative.triton_ops.gather_spec_extras import gather_spec_extras
 from sglang.srt.utils import is_cuda, is_hip, is_npu
 
@@ -16,6 +15,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
     from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.eagle_info import EagleDraftInput
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 
 def decide_needs_cpu_seq_lens(
@@ -28,6 +28,10 @@ def decide_needs_cpu_seq_lens(
     CPU mirror outside the backend layer to split the batch) or ngram (its
     USE_FULL_MASK verify path reads the host mirror regardless of backend).
     """
+    # Local import: keep overlap_utils' module-level deps leaf-only so it stays
+    # importable everywhere; spec_info pulls in the spec/schedule_batch graph.
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
     if server_args.enable_two_batch_overlap:
         # FIXME: support TBO without seq lens cpu value
         return True
@@ -96,6 +100,31 @@ def resolve_forward_inputs(batch: ScheduleBatch, future_map: FutureMap) -> None:
         future_map._resolve_spec_extras(batch)
 
 
+@dataclass
+class RelayPayload:
+    """Per-iteration stash payload for the FutureMap bufs. Non-spec fills only
+    `bonus_tokens`; which spec extras get relayed is decided by
+    `FutureMap.spec_algo`, not by this payload's shape."""
+
+    bonus_tokens: torch.Tensor
+    topk_p: Optional[torch.Tensor] = None
+    topk_index: Optional[torch.Tensor] = None
+    hidden_states: Optional[torch.Tensor] = None
+    draft_probs: Optional[torch.Tensor] = None
+    dsa_topk_indices: Optional[torch.Tensor] = None
+
+    @classmethod
+    def from_draft_input(cls, draft_input: EagleDraftInput) -> RelayPayload:
+        return cls(
+            bonus_tokens=draft_input.bonus_tokens,
+            topk_p=draft_input.topk_p,
+            topk_index=draft_input.topk_index,
+            hidden_states=draft_input.hidden_states,
+            draft_probs=getattr(draft_input, "draft_probs", None),
+            dsa_topk_indices=getattr(draft_input, "dsa_topk_indices", None),
+        )
+
+
 class FutureMap:
     """Always-on pool-indexed relay for cross-iter values. Forward writes via
     publish/stash; next iter reads via resolve_forward_inputs / resolve_seq_lens_cpu.
@@ -117,16 +146,21 @@ class FutureMap:
         self.needs_cpu_seq_lens = needs_cpu_seq_lens
         self.req_pool_size = req_to_token_pool.req_to_token.shape[0]
 
-        self.output_tokens_buf = (
-            torch.full((self.req_pool_size,), -1, dtype=torch.int64, device=self.device)
-            if _DEBUG_ASSERT
-            else torch.empty(
+        if _DEBUG_ASSERT:
+            # Poisoned init: every row must be written before its first gather.
+            self.output_tokens_buf = torch.full(
+                (self.req_pool_size,), -1, dtype=torch.int64, device=self.device
+            )
+            self.new_seq_lens_buf = torch.full(
+                (self.req_pool_size,), -1, dtype=torch.int64, device=self.device
+            )
+        else:
+            self.output_tokens_buf = torch.empty(
                 (self.req_pool_size,), dtype=torch.int64, device=self.device
             )
-        )
-        self.new_seq_lens_buf = torch.empty(
-            (self.req_pool_size,), dtype=torch.int64, device=self.device
-        )
+            self.new_seq_lens_buf = torch.empty(
+                (self.req_pool_size,), dtype=torch.int64, device=self.device
+            )
         # Pinned host copy of new_seq_lens_buf + private stream for fwd-prepare
         # D2H pulls (gated only on publish, off the schedule stream). CUDA-only:
         # recovers occupancy lost to the WAR barrier (also CUDA-only); other
@@ -139,41 +173,32 @@ class FutureMap:
         else:
             self.new_seq_lens_cpu_pinned = None
             self.fwd_prepare_d2h_stream = None
-        if self.spec_algo.is_some():
-            self._forward_buf_initialized = False
+        # Lazy-inited on the first non-empty stash (peeks tensor shapes); non-spec's is a no-op.
+        self._forward_buf_initialized = False
 
         self.publish_ready = None  # lazy device.Event(); only spec_v2 needs it
+        # Debug consume-once state: armed by a recording publish, consumed by
+        # resolve; arm/consume strictly alternate across all batch interleavings.
+        self._publish_fresh = False
 
-    def _lazy_init_forward_buf(self, draft_input: EagleDraftInput):
+    def _lazy_init_forward_buf(self, payload: RelayPayload):
+        # Local import (see decide_needs_cpu_seq_lens): keep module-level deps leaf.
+        from sglang.srt.speculative.spec_utils import spec_need_hidden_states
+
         self._forward_buf_initialized = True
 
-        self.need_verified_id = getattr(draft_input, "verified_id", None) is not None
-        self.need_bonus_tokens = getattr(draft_input, "bonus_tokens", None) is not None
-        self.need_topk = self.spec_algo.need_topk()
+        # Spec extras are gated by spec_algo, not by the payload's shape, so a
+        # non-spec stash allocates no extra bufs (only output_tokens_buf).
+        self.need_topk = self.spec_algo.is_some() and self.spec_algo.need_topk()
         self.need_hidden_states = (
-            spec_need_hidden_states()
-            and getattr(draft_input, "hidden_states", None) is not None
+            self.spec_algo.is_some()
+            and spec_need_hidden_states()
+            and payload.hidden_states is not None
         )
 
-        if self.need_verified_id:
-            verified_id0 = draft_input.verified_id[0]
-            self.verified_id_buf = (
-                torch.full(
-                    (self.req_pool_size, *verified_id0.shape),
-                    -1,
-                    dtype=verified_id0.dtype,
-                    device=self.device,
-                )
-                if _DEBUG_ASSERT
-                else torch.empty(
-                    (self.req_pool_size, *verified_id0.shape),
-                    dtype=verified_id0.dtype,
-                    device=self.device,
-                )
-            )
         if self.need_topk:
-            topk_p0 = draft_input.topk_p[0]
-            topk_index0 = draft_input.topk_index[0]
+            topk_p0 = payload.topk_p[0]
+            topk_index0 = payload.topk_index[0]
             self.topk_p_buf = torch.empty(
                 (self.req_pool_size, *topk_p0.shape),
                 dtype=topk_p0.dtype,
@@ -185,7 +210,7 @@ class FutureMap:
                 device=self.device,
             )
         if self.need_hidden_states:
-            hidden_states0 = draft_input.hidden_states[0]
+            hidden_states0 = payload.hidden_states[0]
             self.hidden_states_buf = torch.empty(
                 (self.req_pool_size, *hidden_states0.shape),
                 dtype=hidden_states0.dtype,
@@ -193,11 +218,20 @@ class FutureMap:
             )
 
         self.draft_probs_buf = None
-        if getattr(draft_input, "draft_probs", None) is not None:
-            draft_probs0 = draft_input.draft_probs[0]
+        if payload.draft_probs is not None:
+            draft_probs0 = payload.draft_probs[0]
             self.draft_probs_buf = torch.empty(
                 (self.req_pool_size, *draft_probs0.shape),
                 dtype=draft_probs0.dtype,
+                device=self.device,
+            )
+
+        self.dsa_topk_indices_buf = None
+        if payload.dsa_topk_indices is not None:
+            seed0 = payload.dsa_topk_indices[0]
+            self.dsa_topk_indices_buf = torch.empty(
+                (self.req_pool_size, *seed0.shape),
+                dtype=payload.dsa_topk_indices.dtype,
                 device=self.device,
             )
 
@@ -209,18 +243,12 @@ class FutureMap:
         if draft_input is None:
             # FIXME(lsyin): only prefill; not compatible with mixed mode
             return
-        if self.spec_algo.is_dflash() and getattr(
-            draft_input, "direct_carry_valid", False
-        ):
-            return
         indices = draft_input.future_indices
         if indices.shape[0] == 0:
             return
         # FIXME: indices = batch.req_pool_indices, pinned 2 iters via
         # record_batch_in_overlap; record_stream here is redundant.
         indices.record_stream(torch.get_device_module(self.device).current_stream())
-        if self.need_verified_id:
-            draft_input.verified_id = self.verified_id_buf[indices]
         if self.need_topk:
             hidden_states_buf = (
                 self.hidden_states_buf if self.need_hidden_states else None
@@ -237,45 +265,39 @@ class FutureMap:
                 self.output_tokens_buf,
                 hidden_states_buf,
             )
-            if self.need_bonus_tokens:
-                draft_input.bonus_tokens = bonus_tokens
+            draft_input.bonus_tokens = bonus_tokens
             if hidden_states is not None:
                 draft_input.hidden_states = hidden_states
             if self.draft_probs_buf is not None and draft_input.draft_probs is not None:
                 draft_input.draft_probs = self.draft_probs_buf[indices]
-        elif self.need_bonus_tokens:
+        else:
             draft_input.bonus_tokens = self.output_tokens_buf[indices]
         if self.need_hidden_states and not self.need_topk:
             draft_input.hidden_states = self.hidden_states_buf[indices]
+        if self.dsa_topk_indices_buf is not None:
+            draft_input.dsa_topk_indices = self.dsa_topk_indices_buf[indices]
         if _DEBUG_ASSERT:
-            if self.need_verified_id:
-                _assert_nonneg_and_invalidate(
-                    draft_input.verified_id, self.verified_id_buf, indices
-                )
-            if self.need_bonus_tokens:
-                _assert_nonneg_and_invalidate(
-                    draft_input.bonus_tokens, self.output_tokens_buf, indices
-                )
+            _assert_nonneg_and_invalidate(
+                draft_input.bonus_tokens, self.output_tokens_buf, indices
+            )
 
     def resolve_seq_lens_cpu(self, batch: ScheduleBatch) -> None:
         # Lazy pull from new_seq_lens_buf for spec_v2 (accept_lens not known to
-        # schedule). DFLASH intentionally keeps host-side lengths lagging and
-        # uses its carried KV allocation watermark for planning, so only the GPU
-        # seq_lens is resolved there. Other spec-v2 algorithms still need the CPU
-        # mirror for host planning; use a private D2H stream for those copies.
+        # schedule). The CPU mirror is gated by needs_cpu_seq_lens; backends that
+        # opt out take the GPU-only path below. A private D2H stream overlaps the copy.
         draft_input = batch.spec_info
         if draft_input is None:
-            return
-        if self.spec_algo.is_dflash() and getattr(
-            draft_input, "direct_carry_valid", False
-        ):
-            batch.seq_lens = draft_input.new_seq_lens
             return
 
         fi = draft_input.future_indices
         if fi is None:
             return
         if self.publish_ready is not None:
+            if _DEBUG_ASSERT:
+                # Consume-once: every event wait must be re-armed by a fresh
+                # forward publish; a stale consume means a publish went missing.
+                assert self._publish_fresh, "resolve without a fresh forward publish"
+                self._publish_fresh = False
             if _is_hip:
                 # Temporary workaround: Event.wait() regresses TPOT on AMD MI355.
                 self.publish_ready.synchronize()
@@ -283,21 +305,23 @@ class FutureMap:
                 self.publish_ready.wait()
         batch.seq_lens = self.new_seq_lens_buf[fi]
 
-        if self.spec_algo.is_dflash():
-            # DFLASH keeps seq_lens_cpu as the lagging committed host view;
-            # planning/reserved host lengths live on DFlashDraftInputV2.
-            return
-
         if not self.needs_cpu_seq_lens:
             # GPU gather above is kept (SB.seq_lens must advance each verify);
             # skip the .cpu() D2H. Downstream takes the GPU-only path.
             batch.seq_lens_cpu = None
             batch.seq_lens_sum = None
+            if _DEBUG_ASSERT:
+                # Poison consumed rows: each row must be re-published/seeded
+                # before the next resolve gathers it (safe here: the forward's
+                # re-publish is fenced behind this stream via wait_stream).
+                _assert_nonneg_and_invalidate(batch.seq_lens, self.new_seq_lens_buf, fi)
             return
 
         if self.fwd_prepare_d2h_stream is None or self.publish_ready is None:
             batch.seq_lens_cpu = batch.seq_lens.cpu()  # bootstrap / non-CUDA
             batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+            if _DEBUG_ASSERT:
+                _assert_nonneg_and_invalidate(batch.seq_lens, self.new_seq_lens_buf, fi)
             return
 
         # Mechanism: don't sync the schedule stream; gate a private stream on the
@@ -310,6 +334,10 @@ class FutureMap:
         # FIXME: fi == batch.req_pool_indices; unify future_indices and req_pool_indices.
         batch.seq_lens_cpu = self.new_seq_lens_cpu_pinned[batch.req_pool_indices_cpu]
         batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+        if _DEBUG_ASSERT:
+            # After the D2H copy completed (synchronize above), so the pinned
+            # mirror is not poisoned.
+            _assert_nonneg_and_invalidate(batch.seq_lens, self.new_seq_lens_buf, fi)
 
     def publish(self, future_indices: torch.Tensor, new_seq_lens: torch.Tensor) -> None:
         indices = future_indices
@@ -318,15 +346,18 @@ class FutureMap:
         self.new_seq_lens_buf[indices] = new_seq_lens.to(self.new_seq_lens_buf.dtype)
         # Only spec_v2 needs the event; it gates the seq_lens D2H on the private stream.
         if self.spec_algo.is_some():
+            device_module = torch.get_device_module(self.device)
             if self.publish_ready is None:
-                self.publish_ready = torch.get_device_module(self.device).Event()
+                self.publish_ready = device_module.Event()
+            else:
+                # Chain the records: event fire implies every prior publish is
+                # visible, so an off-forward-stream publish (PD-decode prebuilt
+                # seeding) cannot drop the in-flight forward's fence.
+                device_module.current_stream().wait_event(self.publish_ready)
             self.publish_ready.record()
+            self._publish_fresh = True
 
-    def stash(
-        self,
-        future_indices: torch.Tensor,
-        payload: Union[torch.Tensor, EagleDraftInput],
-    ) -> None:
+    def stash(self, future_indices: torch.Tensor, payload: RelayPayload) -> None:
         if self.spec_algo.is_ngram():
             # FIXME: remove once precomputed draft is supported.
             return
@@ -334,34 +365,27 @@ class FutureMap:
         if indices.shape[0] == 0:
             # DP idle: payload is empty stub; lazy-init shape peek would IndexError.
             return
-        # Dispatch by payload type, not spec_algo: non-spec decode passes a
-        # token Tensor here.
-        # FIXME(lsyin): unify this relay path with a dataclass instead of the
-        # Tensor / EagleDraftInput type switch.
-        if isinstance(payload, torch.Tensor):
-            self.output_tokens_buf[indices] = payload.to(torch.int64)
-            return
-
-        draft_input: EagleDraftInput = payload
         if not self._forward_buf_initialized:
-            self._lazy_init_forward_buf(draft_input)
-        if self.need_verified_id:
-            self.verified_id_buf[indices] = draft_input.verified_id.to(
-                self.verified_id_buf.dtype
-            )
-        if self.need_bonus_tokens:
-            self.output_tokens_buf[indices] = draft_input.bonus_tokens.to(
-                self.output_tokens_buf.dtype
-            )
+            self._lazy_init_forward_buf(payload)
+        self.output_tokens_buf[indices] = payload.bonus_tokens.to(
+            self.output_tokens_buf.dtype
+        )
 
         if self.need_topk:
-            self.topk_p_buf[indices] = draft_input.topk_p.to(self.topk_p_buf.dtype)
-            self.topk_index_buf[indices] = draft_input.topk_index.to(
+            self.topk_p_buf[indices] = payload.topk_p.to(self.topk_p_buf.dtype)
+            self.topk_index_buf[indices] = payload.topk_index.to(
                 self.topk_index_buf.dtype
             )
         if self.need_hidden_states:
-            self.hidden_states_buf[indices] = draft_input.hidden_states.to(
+            self.hidden_states_buf[indices] = payload.hidden_states.to(
                 self.hidden_states_buf.dtype
             )
-        if self.draft_probs_buf is not None and draft_input.draft_probs is not None:
-            self.draft_probs_buf[indices] = draft_input.draft_probs
+        if self.draft_probs_buf is not None and payload.draft_probs is not None:
+            self.draft_probs_buf[indices] = payload.draft_probs
+        if (
+            self.dsa_topk_indices_buf is not None
+            and payload.dsa_topk_indices is not None
+        ):
+            self.dsa_topk_indices_buf[indices] = payload.dsa_topk_indices.to(
+                self.dsa_topk_indices_buf.dtype
+            )

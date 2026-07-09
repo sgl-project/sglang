@@ -30,9 +30,6 @@ try:
 
     tilelang.set_log_level("WARNING")
 
-    # Set once mhc_pre() has compiled every n_splits bucket at startup.
-    _mhc_pre_warmed = False
-
     pass_configs = {
         tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
         tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
@@ -350,7 +347,6 @@ def mhc_pre_gemm_sqrsum_tilelang(
                 out_frag,
                 transpose_A=False,
                 transpose_B=True,
-                wg_wait=0,
                 clear_accum=False,
             )
         sqrsum_l = T.alloc_fragment(token_block, T.float32)
@@ -431,7 +427,6 @@ def mhc_pre_gemm_sqrsum_splitk_kernel(
                     out_frag,
                     transpose_A=False,
                     transpose_B=True,
-                    wg_wait=0,
                     clear_accum=False,
                 )
 
@@ -511,7 +506,7 @@ def get_mhc_pre_token_count_representatives(
     return tuple(sorted(reps.values()))
 
 
-def _prewarm_mhc_pre(
+def prewarm_mhc_pre(
     residual: torch.Tensor,
     fn: torch.Tensor,
     hc_scale: torch.Tensor,
@@ -529,7 +524,8 @@ def _prewarm_mhc_pre(
     """Compile the prenorm kernel for every n_splits bucket by replaying the
     prenorm with the call's real weights. The compiled kernels are written to
     the TileLang/DeepGEMM on-disk JIT cache, so this cost is paid only on a cold
-    cache; later server runs hit the cache. Runs once (gated in mhc_pre)."""
+    cache; later server runs hit the cache. Driven once per process from load_weights.
+    """
     from sglang.srt.server_args import get_global_server_args
 
     hc_mult, hidden_size = residual.shape[-2], residual.shape[-1]
@@ -541,7 +537,7 @@ def _prewarm_mhc_pre(
     logger.info("DeepSeek V4 MHC prenorm prewarm: %d n_splits buckets", len(buckets))
     with torch.inference_mode():
         for num_tokens in buckets:
-            _mhc_pre_impl(
+            mhc_pre(
                 residual.new_zeros(num_tokens, hc_mult, hidden_size),
                 fn,
                 hc_scale,
@@ -731,64 +727,6 @@ def mhc_pre_big_fuse_with_norm_tilelang(
 
 
 def mhc_pre(
-    residual: torch.Tensor,
-    fn: torch.Tensor,
-    hc_scale: torch.Tensor,
-    hc_base: torch.Tensor,
-    rms_eps: float,
-    hc_pre_eps: float,
-    hc_sinkhorn_eps: float,
-    hc_post_mult_value: float,
-    sinkhorn_repeat: int,
-    n_splits: int = 1,
-    n_splits_pre: int = 32,
-    *,
-    norm_weight: torch.Tensor | None = None,
-    norm_eps: float | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    # One-shot startup prewarm: on the first non-capturing call, compile every
-    # n_splits bucket up front so it isn't JIT-compiled lazily on the first
-    # prefill. Replays the prenorm via _mhc_pre_impl (no re-entry into mhc_pre).
-    global _mhc_pre_warmed
-    if (
-        not _mhc_pre_warmed
-        and envs.SGLANG_DSV4_MHC_PREWARM.get()
-        and not torch.cuda.is_current_stream_capturing()
-    ):
-        _mhc_pre_warmed = True
-        _prewarm_mhc_pre(
-            residual,
-            fn,
-            hc_scale,
-            hc_base,
-            rms_eps,
-            hc_pre_eps,
-            hc_sinkhorn_eps,
-            hc_post_mult_value,
-            sinkhorn_repeat,
-            n_splits,
-            n_splits_pre,
-            norm_weight,
-            norm_eps,
-        )
-    return _mhc_pre_impl(
-        residual,
-        fn,
-        hc_scale,
-        hc_base,
-        rms_eps,
-        hc_pre_eps,
-        hc_sinkhorn_eps,
-        hc_post_mult_value,
-        sinkhorn_repeat,
-        n_splits,
-        n_splits_pre,
-        norm_weight=norm_weight,
-        norm_eps=norm_eps,
-    )
-
-
-def _mhc_pre_impl(
     residual: torch.Tensor,
     fn: torch.Tensor,
     hc_scale: torch.Tensor,

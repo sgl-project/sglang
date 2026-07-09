@@ -366,7 +366,10 @@ class LayerNorm(CustomOp):
         x = x.view(-1, self.hidden_size)
         return self.forward_triton(x).view(shape)
 
-    @torch.compile(backend="inductor", disable=current_platform.is_npu())
+    @torch.compile(
+        backend="inductor",
+        disable=current_platform.is_npu() or current_platform.is_rocm(),
+    )
     def forward_native(
         self,
         x: torch.Tensor,
@@ -566,7 +569,7 @@ class _ScaleResidualNormScaleShift(CustomOp):
         # so we fall back to the native PyTorch implementation.
         return self.forward_native(*args, **kwargs)
 
-    @torch.compile(disable=current_platform.is_npu())
+    @torch.compile(disable=current_platform.is_npu() or current_platform.is_rocm())
     def forward_native(
         self,
         residual: torch.Tensor,
@@ -734,7 +737,7 @@ class _NormScaleShift(CustomOp):
         # so we fall back to the native PyTorch implementation.
         return self.forward_native(*args, **kwargs)
 
-    @torch.compile(disable=current_platform.is_npu())
+    @torch.compile(disable=current_platform.is_npu() or current_platform.is_rocm())
     def forward_native(
         self, x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor
     ) -> torch.Tensor:
@@ -745,11 +748,23 @@ class _NormScaleShift(CustomOp):
     def forward_npu(
         self, x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor
     ) -> torch.Tensor:
-        from sgl_kernel_npu.norm.scale_shift import fused_scale_shift
+        hidden_size = x.shape[-1]
+        x_numel = x.numel()
 
-        normalized = self.norm(x)
-        modulated = fused_scale_shift(normalized, scale, shift)
-        return modulated.to(x.dtype)
+        if scale.numel() in (1, hidden_size) and shift.numel() in (
+            1,
+            hidden_size,
+            x_numel,
+        ):
+            from sgl_kernel_npu.norm.scale_shift import fused_scale_shift
+
+            normalized = self.norm(x)
+            modulated = fused_scale_shift(
+                normalized, scale.contiguous(), shift.contiguous()
+            )
+            return modulated.to(x.dtype)
+
+        return self.forward_native(x, shift, scale)
 
 
 class LayerNormScaleShift(_NormScaleShift):
@@ -819,7 +834,7 @@ class _NormTanhMulAdd(CustomOp):
         # Fallback to native because ROCm does not support CuTeDSL.
         return self.forward_native(*args, **kwargs)
 
-    @torch.compile(disable=current_platform.is_npu())
+    @torch.compile(disable=current_platform.is_npu() or current_platform.is_rocm())
     def forward_native(
         self, x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor
     ) -> torch.Tensor:
