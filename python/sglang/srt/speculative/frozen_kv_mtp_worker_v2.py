@@ -430,7 +430,12 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
         batch.seq_lens_sum = torch.sum(batch.seq_lens).item()
         batch.return_hidden_states = False
 
-        forward_batch = ForwardBatch.init_new(batch, self.draft_model_runner)
+        forward_batch = ForwardBatch.init_new(
+            batch,
+            self.draft_model_runner,
+            capture_hidden_mode=None,
+            return_hidden_states_before_norm=False,
+        )
         assert forward_batch.capture_hidden_mode == CaptureHiddenMode.LAST
         self._set_positions(forward_batch)
         self._expand_for_topk_draft(forward_batch)
@@ -715,7 +720,16 @@ class FrozenKVMTPWorkerV2(EAGLEWorkerV2):
             self._draft_worker.draft_attn_backend,
         )
 
-    def forward_batch_generation(self, batch: ScheduleBatch, on_publish=None):
+    def forward_batch_generation(
+        self,
+        batch: ScheduleBatch,
+        on_publish=None,
+        *,
+        capture_hidden_mode: Optional[CaptureHiddenMode],
+    ):
+        assert (
+            capture_hidden_mode is None
+        ), "spec workers derive capture_hidden_mode internally"
         # Mirrors EAGLEWorkerV2.forward_batch_generation; the only frozen-specific
         # change is the idle draft-input (FrozenKVMTPDraftInput + recurrent hidden
         # size). The draft / seed-based draft-extend hooks are FrozenKVMTPDraftWorker's.

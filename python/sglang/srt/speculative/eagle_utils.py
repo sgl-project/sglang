@@ -514,7 +514,10 @@ def eagle_prepare_for_verify(
         else CaptureHiddenMode.FULL
     )
     verify_forward_batch = ForwardBatch.init_new(
-        batch, target_worker.model_runner, capture_hidden_mode=capture_mode
+        batch,
+        target_worker.model_runner,
+        capture_hidden_mode=capture_mode,
+        return_hidden_states_before_norm=False,
     )
 
     # Run attention backend plan and cuda graph preparation
