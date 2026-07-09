@@ -70,6 +70,7 @@ def test_action_adjust_skips_visual_image_video_logic():
 def test_action_request_schema_builds_pi05_sampling_params():
     image = np.zeros((8, 8, 3), dtype=np.uint8)
     payload = {
+        "request_id": "action-req-1",
         "model": "lerobot/pi05_base",
         "input": {
             "task": "pick up the block",
@@ -103,6 +104,7 @@ def test_action_request_schema_builds_pi05_sampling_params():
     params = build_action_sampling_params(payload, _server_args())
 
     assert params.prompt == "pick up the block"
+    assert params.request_id == "action-req-1"
     assert params.action_horizon == 25
     assert params.action_dim == 32
     assert params.num_inference_steps == 4
@@ -178,6 +180,7 @@ def test_action_metadata_reports_policy_shape_and_capabilities():
 
 def test_action_generation_response_uses_actual_output_parameters():
     output = {
+        "request_id": "action-response-1",
         "actions": [[1.0, 2.0], [3.0, 4.0]],
         "parameters": {"num_inference_steps": 3},
         "timings": {"preprocess_ms": 1.5},
@@ -187,6 +190,7 @@ def test_action_generation_response_uses_actual_output_parameters():
 
     response = action_generation_response(output, _server_args())
 
+    assert response["id"] == "action-response-1"
     assert response["object"] == "action.generation"
     assert response["data"][0]["action"]["shape"] == [2, 2]
     assert response["data"][0]["action"]["values"] == output["actions"]

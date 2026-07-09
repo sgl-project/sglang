@@ -16,16 +16,19 @@ from torch.distributed.fsdp import MixedPrecisionPolicy
 from sglang.multimodal_gen.configs.pipeline_configs.pi05 import Pi05PipelineConfig
 from sglang.multimodal_gen.runtime.cache.vla_prefix_cache import (
     PrefixContext,
+    VLADensePrefixCache,
     VLAPrefixCacheKey,
     VLAPrefixCacheManager,
 )
 from sglang.multimodal_gen.runtime.distributed.communication_op import (
     sequence_model_parallel_all_gather,
+    tensor_model_parallel_all_gather,
 )
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ring_parallel_world_size,
     get_sequence_parallel_world_size,
     get_sp_parallel_rank,
+    get_tp_world_size,
     get_ulysses_parallel_world_size,
     model_parallel_is_initialized,
 )
@@ -97,6 +100,13 @@ class Pi05PolicyModel(nn.Module):
         "action": {"action_expert", "action_heads"},
         "idle": set(),
     }
+    _FUSED_WEIGHT_MAPPINGS = (
+        (".self_attn.qkv_proj.", ".self_attn.q_proj.", "q"),
+        (".self_attn.qkv_proj.", ".self_attn.k_proj.", "k"),
+        (".self_attn.qkv_proj.", ".self_attn.v_proj.", "v"),
+        (".mlp.gate_up_proj.", ".mlp.gate_proj.", 0),
+        (".mlp.gate_up_proj.", ".mlp.up_proj.", 1),
+    )
 
     def __init__(
         self,
@@ -126,8 +136,13 @@ class Pi05PolicyModel(nn.Module):
             output_dtype=dtype,
             mp_policy=mp_policy,
         )
+        prefix_tensor_parallel = self._should_use_prefix_tensor_parallel()
         with set_default_torch_dtype(dtype), skip_init_modules():
-            self.core_model = Pi05CoreModel(config, runtime_role=self.runtime_role)
+            self.core_model = Pi05CoreModel(
+                config,
+                runtime_role=self.runtime_role,
+                prefix_tensor_parallel=prefix_tensor_parallel,
+            )
         self.core_model.eval()
         if device.type == "cuda":
             if self._use_componentwise_empty_init():
@@ -150,6 +165,17 @@ class Pi05PolicyModel(nn.Module):
         self.graph_runner = VLADenoiseGraphRunner(
             enabled=config.enable_action_cuda_graph
         )
+
+    def _should_use_prefix_tensor_parallel(self) -> bool:
+        if self.runtime_role not in ("all", "prefix"):
+            return False
+        if self.config.prefix_parallel_strategy != "tp":
+            return False
+        if get_vla_split_group() is not None:
+            return False
+        if not model_parallel_is_initialized():
+            return False
+        return get_tp_world_size() > 1
 
     @staticmethod
     def _to_empty_preserve_buffers(module: nn.Module, *, device: torch.device) -> None:
@@ -569,22 +595,36 @@ class Pi05PolicyModel(nn.Module):
             self._candidate_weight_keys(key)
         )
 
-    def _resolve_target_key(
+    @classmethod
+    def _candidate_target_weights(cls, source_key: str) -> list[tuple[str, Any | None]]:
+        candidates = []
+        for candidate in cls._candidate_weight_keys(source_key):
+            candidates.append((candidate, None))
+            for target_name, weight_name, shard_id in cls._FUSED_WEIGHT_MAPPINGS:
+                if weight_name in candidate:
+                    candidates.append(
+                        (candidate.replace(weight_name, target_name), shard_id)
+                    )
+        return list(dict.fromkeys(candidates))
+
+    def _resolve_target_weight(
         self,
         source_key: str,
         target_state: dict[str, torch.Tensor],
-    ) -> str | None:
-        candidates = self._candidate_weight_keys(source_key)
+        target_params: dict[str, nn.Parameter],
+    ) -> tuple[str, Any | None] | None:
+        candidates = self._candidate_target_weights(source_key)
         if not candidates:
             return None
-        for candidate in candidates:
-            if candidate in target_state:
-                return candidate
+        for candidate, shard_id in candidates:
+            if candidate in target_params or candidate in target_state:
+                return candidate, shard_id
         return None
 
     def _should_stream_weights_to_gpu(
         self,
         target_state: dict[str, torch.Tensor],
+        target_params: dict[str, nn.Parameter],
     ) -> bool:
         if self.device.type != "cuda":
             return False
@@ -595,20 +635,32 @@ class Pi05PolicyModel(nn.Module):
                 for source_key in f.keys():
                     if not self._should_read_source_key(source_key):
                         continue
-                    target_key = self._resolve_target_key(source_key, target_state)
-                    if target_key is None:
+                    target_weight = self._resolve_target_weight(
+                        source_key,
+                        target_state,
+                        target_params,
+                    )
+                    if target_weight is None:
                         continue
+                    target_key, _ = target_weight
                     has_weight = True
-                    if target_state[target_key].device.type != "cuda":
+                    target = target_params.get(target_key)
+                    if target is None:
+                        target = target_state[target_key]
+                    if target.device.type != "cuda":
                         return False
         return has_weight
 
     def _load_weights(self) -> None:
         target_state = self.core_model.state_dict()
+        target_params = dict(self.core_model.named_parameters())
         loaded_keys: set[str] = set()
         unexpected = 0
         mismatched = 0
-        stream_to_gpu = self._should_stream_weights_to_gpu(target_state)
+        stream_to_gpu = self._should_stream_weights_to_gpu(
+            target_state,
+            target_params,
+        )
         checkpoint_load_device = self.device if stream_to_gpu else torch.device("cpu")
         weight_load_plan = WeightLoadPlan(checkpoint_load_device=checkpoint_load_device)
         if stream_to_gpu:
@@ -626,17 +678,31 @@ class Pi05PolicyModel(nn.Module):
                     clone_streamed_tensors=False,
                 )
                 for source_key, tensor in weights:
-                    target_key = self._resolve_target_key(source_key, target_state)
-                    if target_key is None:
+                    target_weight = self._resolve_target_weight(
+                        source_key,
+                        target_state,
+                        target_params,
+                    )
+                    if target_weight is None:
                         unexpected += 1
                         continue
-                    target = target_state[target_key]
-                    if tuple(target.shape) != tuple(tensor.shape):
-                        mismatched += 1
-                        continue
+                    target_key, shard_id = target_weight
+                    target = target_params.get(target_key)
+                    if target is None:
+                        target = target_state[target_key]
                     if tensor.dtype != target.dtype:
                         tensor = tensor.to(dtype=target.dtype)
-                    target.copy_(tensor, non_blocking=True)
+                    weight_loader = getattr(target, "weight_loader", None)
+                    if weight_loader is not None:
+                        if shard_id is None:
+                            weight_loader(target, tensor)
+                        else:
+                            weight_loader(target, tensor, shard_id)
+                    elif tuple(target.shape) == tuple(tensor.shape):
+                        target.copy_(tensor, non_blocking=True)
+                    else:
+                        mismatched += 1
+                        continue
                     loaded_keys.add(target_key)
             else:
                 for filename in self.manifest.safetensor_files:
@@ -644,24 +710,35 @@ class Pi05PolicyModel(nn.Module):
                         for source_key in f.keys():
                             if not self._should_read_source_key(source_key):
                                 continue
-                            target_key = self._resolve_target_key(
+                            target_weight = self._resolve_target_weight(
                                 source_key,
                                 target_state,
+                                target_params,
                             )
-                            if target_key is None:
+                            if target_weight is None:
                                 unexpected += 1
                                 continue
+                            target_key, shard_id = target_weight
                             tensor = f.get_tensor(source_key)
-                            target = target_state[target_key]
-                            if tuple(target.shape) != tuple(tensor.shape):
-                                mismatched += 1
-                                continue
+                            target = target_params.get(target_key)
+                            if target is None:
+                                target = target_state[target_key]
                             if tensor.dtype != target.dtype:
                                 tensor = tensor.to(dtype=target.dtype)
-                            target.copy_(
-                                tensor,
-                                non_blocking=target.device.type == "cuda",
-                            )
+                            weight_loader = getattr(target, "weight_loader", None)
+                            if weight_loader is not None:
+                                if shard_id is None:
+                                    weight_loader(target, tensor)
+                                else:
+                                    weight_loader(target, tensor, shard_id)
+                            elif tuple(target.shape) == tuple(tensor.shape):
+                                target.copy_(
+                                    tensor,
+                                    non_blocking=target.device.type == "cuda",
+                                )
+                            else:
+                                mismatched += 1
+                                continue
                             loaded_keys.add(target_key)
 
         missing = [key for key in target_state if key not in loaded_keys]
@@ -709,6 +786,45 @@ class Pi05PolicyModel(nn.Module):
             cache_namespace="pi05",
         )
 
+    def _prefix_language_model(self) -> nn.Module | None:
+        paligemma = self.core_model.paligemma_with_expert.paligemma
+        if paligemma is None:
+            return None
+        return paligemma.model.language_model
+
+    def _prefix_tensor_parallel_enabled(self) -> bool:
+        language_model = self._prefix_language_model()
+        return bool(language_model is not None and language_model.tensor_parallel)
+
+    def _prefix_kv_requires_tp_gather(self) -> bool:
+        language_model = self._prefix_language_model()
+        if language_model is None or not language_model.tensor_parallel:
+            return False
+        if not language_model.layers:
+            return False
+        attn = language_model.layers[0].self_attn
+        return attn.total_num_key_value_heads > attn.num_key_value_heads
+
+    def _materialize_prefix_kv_for_action(
+        self,
+        past_key_values: VLADensePrefixCache,
+    ) -> tuple[VLADensePrefixCache, bool]:
+        if not self._prefix_kv_requires_tp_gather():
+            return past_key_values, False
+        return (
+            VLADensePrefixCache(
+                tuple(
+                    (
+                        tensor_model_parallel_all_gather(keys.contiguous(), dim=1),
+                        tensor_model_parallel_all_gather(values.contiguous(), dim=1),
+                        sliding_window,
+                    )
+                    for keys, values, sliding_window in past_key_values
+                )
+            ),
+            True,
+        )
+
     def encode_prefix(self, observation: VLAObservationBatch) -> PrefixContext:
         camera_order = tuple(observation.metadata.get("camera_order", ()))
         images = [
@@ -741,6 +857,9 @@ class Pi05PolicyModel(nn.Module):
                 tokens_trimmed=tokens_trimmed,
             )
         )
+        past_key_values, prefix_kv_tp_gathered = self._materialize_prefix_kv_for_action(
+            past_key_values
+        )
         return PrefixContext(
             past_key_values=past_key_values,
             prefix_pad_masks=prefix_pad_masks,
@@ -751,6 +870,8 @@ class Pi05PolicyModel(nn.Module):
             layout={
                 "camera_order": camera_order,
                 "full_attention": full_attention,
+                "prefix_tensor_parallel": self._prefix_tensor_parallel_enabled(),
+                "prefix_kv_tp_gathered": prefix_kv_tp_gathered,
                 "parallel_layout_version": self.config.parallel_layout_version,
             },
         )

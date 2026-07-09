@@ -24,6 +24,11 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     model_parallel_is_initialized,
 )
 from sglang.multimodal_gen.runtime.layers.attention import LocalAttention, USPAttention
+from sglang.multimodal_gen.runtime.layers.linear import (
+    MergedColumnParallelLinear,
+    QKVParallelLinear,
+    RowParallelLinear,
+)
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import RotaryEmbedding
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
@@ -77,6 +82,11 @@ def layernorm_forward(
     if cond is not None:
         return layernorm(x, cond=cond)
     return layernorm(x)
+
+
+def linear_forward(module: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    output = module(x)
+    return output[0] if isinstance(output, tuple) else output
 
 
 def _use_ulysses_action_attention(num_heads: int) -> bool:
@@ -197,20 +207,51 @@ class PiGemmaRMSNorm(nn.Module):
 
 
 class PiGemmaMLP(nn.Module):
-    def __init__(self, config: GemmaConfig):
+    def __init__(self, config: GemmaConfig, *, tensor_parallel: bool = False):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
-        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+        self.tensor_parallel = tensor_parallel
+        if tensor_parallel:
+            self.gate_up_proj = MergedColumnParallelLinear(
+                input_size=self.hidden_size,
+                output_sizes=[self.intermediate_size] * 2,
+                bias=False,
+            )
+            self.down_proj = RowParallelLinear(
+                input_size=self.intermediate_size,
+                output_size=self.hidden_size,
+                bias=False,
+            )
+            self.gate_proj = None
+            self.up_proj = None
+        else:
+            self.gate_proj = nn.Linear(
+                self.hidden_size, self.intermediate_size, bias=False
+            )
+            self.up_proj = nn.Linear(
+                self.hidden_size, self.intermediate_size, bias=False
+            )
+            self.down_proj = nn.Linear(
+                self.intermediate_size, self.hidden_size, bias=False
+            )
+            self.gate_up_proj = None
         if config.hidden_act != "gelu_pytorch_tanh":
             raise ValueError(f"Unsupported PiGemma activation: {config.hidden_act}")
         self.act_fn = GeluAndMul(approximate="tanh")
 
+    @property
+    def projection_dtype(self) -> torch.dtype:
+        if self.tensor_parallel:
+            return self.gate_up_proj.weight.dtype
+        return self.up_proj.weight.dtype
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gate_up = torch.cat([self.gate_proj(x), self.up_proj(x)], dim=-1)
-        return self.down_proj(self.act_fn(gate_up))
+        if self.tensor_parallel:
+            gate_up = linear_forward(self.gate_up_proj, x)
+        else:
+            gate_up = torch.cat([self.gate_proj(x), self.up_proj(x)], dim=-1)
+        return linear_forward(self.down_proj, self.act_fn(gate_up))
 
 
 class PiGemmaRotaryEmbedding(nn.Module):
@@ -262,46 +303,79 @@ class PiGemmaRotaryEmbedding(nn.Module):
 
 
 class PiGemmaAttention(nn.Module):
-    def __init__(self, config: GemmaConfig, layer_idx: int):
+    def __init__(
+        self,
+        config: GemmaConfig,
+        layer_idx: int,
+        *,
+        tensor_parallel: bool = False,
+    ):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
+        self.tensor_parallel = tensor_parallel
         self.head_dim = getattr(
             config,
             "head_dim",
             config.hidden_size // config.num_attention_heads,
         )
-        self.num_heads = config.num_attention_heads
-        self.num_key_value_heads = config.num_key_value_heads
-        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.scaling = self.head_dim**-0.5
         self.attention_dropout = config.attention_dropout
         self.is_causal = not getattr(config, "use_bidirectional_attention", False)
 
-        self.q_proj = nn.Linear(
-            config.hidden_size,
-            self.num_heads * self.head_dim,
-            bias=config.attention_bias,
-        )
-        self.k_proj = nn.Linear(
-            config.hidden_size,
-            self.num_key_value_heads * self.head_dim,
-            bias=config.attention_bias,
-        )
-        self.v_proj = nn.Linear(
-            config.hidden_size,
-            self.num_key_value_heads * self.head_dim,
-            bias=config.attention_bias,
-        )
-        self.o_proj = nn.Linear(
-            self.num_heads * self.head_dim,
-            config.hidden_size,
-            bias=config.attention_bias,
-        )
+        if tensor_parallel:
+            self.total_num_heads = config.num_attention_heads
+            self.total_num_key_value_heads = config.num_key_value_heads
+            self.qkv_proj = QKVParallelLinear(
+                hidden_size=config.hidden_size,
+                head_size=self.head_dim,
+                total_num_heads=self.total_num_heads,
+                total_num_kv_heads=self.total_num_key_value_heads,
+                bias=config.attention_bias,
+            )
+            self.num_heads = self.qkv_proj.num_heads
+            self.num_key_value_heads = self.qkv_proj.num_kv_heads
+            self.q_size = self.num_heads * self.head_dim
+            self.kv_size = self.num_key_value_heads * self.head_dim
+            self.o_proj = RowParallelLinear(
+                input_size=self.total_num_heads * self.head_dim,
+                output_size=config.hidden_size,
+                bias=config.attention_bias,
+            )
+            self.q_proj = None
+            self.k_proj = None
+            self.v_proj = None
+        else:
+            self.num_heads = config.num_attention_heads
+            self.num_key_value_heads = config.num_key_value_heads
+            self.q_proj = nn.Linear(
+                config.hidden_size,
+                self.num_heads * self.head_dim,
+                bias=config.attention_bias,
+            )
+            self.k_proj = nn.Linear(
+                config.hidden_size,
+                self.num_key_value_heads * self.head_dim,
+                bias=config.attention_bias,
+            )
+            self.v_proj = nn.Linear(
+                config.hidden_size,
+                self.num_key_value_heads * self.head_dim,
+                bias=config.attention_bias,
+            )
+            self.o_proj = nn.Linear(
+                self.num_heads * self.head_dim,
+                config.hidden_size,
+                bias=config.attention_bias,
+            )
+            self.qkv_proj = None
+            self.q_size = self.num_heads * self.head_dim
+            self.kv_size = self.num_key_value_heads * self.head_dim
+        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.attn = LocalAttention(
-            num_heads=config.num_attention_heads,
+            num_heads=self.num_heads,
             head_size=self.head_dim,
-            num_kv_heads=config.num_key_value_heads,
+            num_kv_heads=self.num_key_value_heads,
             softmax_scale=self.scaling,
             causal=self.is_causal,
             supported_attention_backends={
@@ -327,7 +401,38 @@ class PiGemmaAttention(nn.Module):
                 allow_cudnn_sdp=True,
             )
             if _use_ulysses_action_attention(config.num_attention_heads)
+            and not tensor_parallel
             else None
+        )
+
+    @property
+    def projection_dtype(self) -> torch.dtype:
+        if self.tensor_parallel:
+            return self.qkv_proj.weight.dtype
+        return self.q_proj.weight.dtype
+
+    def project_qkv(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        input_shape = hidden_states.shape[:-1]
+        query_shape = (*input_shape, self.num_heads, self.head_dim)
+        kv_shape = (*input_shape, self.num_key_value_heads, self.head_dim)
+
+        if self.tensor_parallel:
+            qkv = linear_forward(self.qkv_proj, hidden_states)
+            query_states, key_states, value_states = qkv.split(
+                [self.q_size, self.kv_size, self.kv_size],
+                dim=-1,
+            )
+        else:
+            query_states = self.q_proj(hidden_states)
+            key_states = self.k_proj(hidden_states)
+            value_states = self.v_proj(hidden_states)
+        return (
+            query_states.view(query_shape).transpose(1, 2),
+            key_states.view(kv_shape).transpose(1, 2),
+            value_states.view(kv_shape).transpose(1, 2),
         )
 
     def _repeat_kv_for_sequence_parallel(
@@ -348,11 +453,7 @@ class PiGemmaAttention(nn.Module):
         **kwargs,
     ) -> tuple[torch.Tensor, None]:
         input_shape = hidden_states.shape[:-1]
-        hidden_shape = (*input_shape, -1, self.head_dim)
-
-        query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-        key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        query_states, key_states, value_states = self.project_qkv(hidden_states)
 
         cos, sin = position_embeddings
         query_states, key_states = native_apply_rotary_pos_emb(
@@ -384,7 +485,7 @@ class PiGemmaAttention(nn.Module):
                     self._repeat_kv_for_sequence_parallel(value_states.transpose(1, 2)),
                 )
                 attn_output = attn_output.reshape(*input_shape, -1).contiguous()
-                return self.o_proj(attn_output), None
+                return linear_forward(self.o_proj, attn_output), None
 
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             key_states, value_states = past_key_values.update(
@@ -401,15 +502,25 @@ class PiGemmaAttention(nn.Module):
             attn_mask=attention_mask,
         )
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
-        return self.o_proj(attn_output), None
+        return linear_forward(self.o_proj, attn_output), None
 
 
 class PiGemmaDecoderLayer(nn.Module):
-    def __init__(self, config: GemmaConfig, layer_idx: int):
+    def __init__(
+        self,
+        config: GemmaConfig,
+        layer_idx: int,
+        *,
+        tensor_parallel: bool = False,
+    ):
         super().__init__()
         self.hidden_size = config.hidden_size
-        self.self_attn = PiGemmaAttention(config=config, layer_idx=layer_idx)
-        self.mlp = PiGemmaMLP(config)
+        self.self_attn = PiGemmaAttention(
+            config=config,
+            layer_idx=layer_idx,
+            tensor_parallel=tensor_parallel,
+        )
+        self.mlp = PiGemmaMLP(config, tensor_parallel=tensor_parallel)
         cond_dim = (
             getattr(config, "adarms_cond_dim", None)
             if getattr(config, "use_adarms", False)
@@ -458,9 +569,16 @@ class PiGemmaDecoderLayer(nn.Module):
 
 
 class PiGemmaModel(nn.Module):
-    def __init__(self, config: GemmaConfig, **kwargs):
+    def __init__(
+        self,
+        config: GemmaConfig,
+        *,
+        tensor_parallel: bool = False,
+        **kwargs,
+    ):
         super().__init__()
         self.config = config
+        self.tensor_parallel = tensor_parallel
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.embed_tokens = nn.Embedding(
@@ -474,7 +592,11 @@ class PiGemmaModel(nn.Module):
         cond_dim = getattr(config, "adarms_cond_dim", None)
         self.layers = nn.ModuleList(
             [
-                PiGemmaDecoderLayer(config, layer_idx)
+                PiGemmaDecoderLayer(
+                    config,
+                    layer_idx,
+                    tensor_parallel=tensor_parallel,
+                )
                 for layer_idx in range(config.num_hidden_layers)
             ]
         )
@@ -618,7 +740,7 @@ class PiGemmaModel(nn.Module):
         hidden_states = inputs_embeds
         if (
             len(self.layers) > 0
-            and self.layers[0].self_attn.q_proj.weight.dtype == torch.bfloat16
+            and self.layers[0].self_attn.projection_dtype == torch.bfloat16
         ):
             hidden_states = hidden_states.to(torch.bfloat16)
 
@@ -660,25 +782,37 @@ class PiGemmaModel(nn.Module):
 
 
 class PiGemmaForCausalLM(nn.Module):
-    def __init__(self, config: GemmaConfig, **kwargs):
+    def __init__(
+        self,
+        config: GemmaConfig,
+        *,
+        tensor_parallel: bool = False,
+        **kwargs,
+    ):
         super().__init__()
         self.config = config
-        self.model = PiGemmaModel(config)
+        self.model = PiGemmaModel(config, tensor_parallel=tensor_parallel)
         self.lm_head = None
 
 
 class PaliGemmaModelWithPiGemma(PaliGemmaModel):
-    def __init__(self, config):
+    def __init__(self, config, *, tensor_parallel: bool = False):
         super().__init__(config)
         del self.language_model
-        self.language_model = PiGemmaModel(config.text_config)
+        self.language_model = PiGemmaModel(
+            config.text_config,
+            tensor_parallel=tensor_parallel,
+        )
 
 
 class PaliGemmaForConditionalGenerationWithPiGemma(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, *, tensor_parallel: bool = False):
         super().__init__()
         self.config = config
-        self.model = PaliGemmaModelWithPiGemma(config)
+        self.model = PaliGemmaModelWithPiGemma(
+            config,
+            tensor_parallel=tensor_parallel,
+        )
         self.lm_head = None
 
     @property
@@ -827,14 +961,10 @@ def compute_layer_complete(
             layer.input_layernorm, hidden_states, adarms_cond[i]
         )
         gates.append(gate)
-        input_shape = hidden_states.shape[:-1]
-        hidden_shape = (*input_shape, -1, layer.self_attn.head_dim)
-        query_state = layer.self_attn.q_proj(hidden_states).view(hidden_shape)
-        key_state = layer.self_attn.k_proj(hidden_states).view(hidden_shape)
-        value_state = layer.self_attn.v_proj(hidden_states).view(hidden_shape)
-        query_states.append(query_state.transpose(1, 2))
-        key_states.append(key_state.transpose(1, 2))
-        value_states.append(value_state.transpose(1, 2))
+        query_state, key_state, value_state = layer.self_attn.project_qkv(hidden_states)
+        query_states.append(query_state)
+        key_states.append(key_state)
+        value_states.append(value_state)
 
     query_states = torch.cat(query_states, dim=2)
     key_states = torch.cat(key_states, dim=2)
@@ -871,15 +1001,18 @@ def compute_layer_complete(
     for i, hidden_states in enumerate(inputs_embeds):
         layer = layers[i]
         end_pos = start_pos + hidden_states.shape[1]
-        if att_output.dtype != layer.self_attn.o_proj.weight.dtype:
-            att_output = att_output.to(layer.self_attn.o_proj.weight.dtype)
-        out_emb = layer.self_attn.o_proj(att_output[:, start_pos:end_pos])
+        if att_output.dtype != layer.self_attn.projection_dtype:
+            att_output = att_output.to(layer.self_attn.projection_dtype)
+        out_emb = linear_forward(
+            layer.self_attn.o_proj,
+            att_output[:, start_pos:end_pos],
+        )
         out_emb = gated_residual(hidden_states, out_emb, gates[i])
         after_first_residual = out_emb.clone()
         out_emb, gate = layernorm_forward(
             layer.post_attention_layernorm, out_emb, adarms_cond[i]
         )
-        if layer.mlp.up_proj.weight.dtype == torch.bfloat16:
+        if layer.mlp.projection_dtype == torch.bfloat16:
             out_emb = out_emb.to(dtype=torch.bfloat16)
         out_emb = layer.mlp(out_emb)
         out_emb = gated_residual(after_first_residual, out_emb, gate)
@@ -898,6 +1031,7 @@ class PaliGemmaWithExpertModel(nn.Module):
         precision: Literal["bfloat16", "float32"],
         image_size: int,
         runtime_role: Literal["all", "prefix", "action", "idle"] = "all",
+        prefix_tensor_parallel: bool = False,
     ):
         super().__init__()
         self.paligemma = None
@@ -929,7 +1063,8 @@ class PaliGemmaWithExpertModel(nn.Module):
             vlm_config_hf.vision_config.projector_hidden_act = "gelu_fast"
             vlm_config_hf.vision_config.dtype = "float32"
             self.paligemma = PaliGemmaForConditionalGenerationWithPiGemma(
-                config=vlm_config_hf
+                config=vlm_config_hf,
+                tensor_parallel=prefix_tensor_parallel,
             )
             vision_tower = self.paligemma.model.vision_tower
             vision_model = getattr(vision_tower, "vision_model", vision_tower)
@@ -955,7 +1090,10 @@ class PaliGemmaWithExpertModel(nn.Module):
                 use_bidirectional_attention=True,
                 adarms_cond_dim=(action_expert_config.width if use_adarms[1] else None),
             )
-            self.gemma_expert = PiGemmaForCausalLM(config=action_config_hf)
+            self.gemma_expert = PiGemmaForCausalLM(
+                config=action_config_hf,
+                tensor_parallel=False,
+            )
             self.gemma_expert.lm_head = None
             self.gemma_expert.model.embed_tokens = None
         self.to_selected_dtype(precision)
@@ -1011,7 +1149,8 @@ class PaliGemmaWithExpertModel(nn.Module):
         output_device = self._prefix_transformer_device()
         if image.device != vision_device or image.dtype != torch.float32:
             image = image.to(device=vision_device, dtype=torch.float32)
-        image_outputs = self.paligemma.model.get_image_features(image)
+        with set_forward_context(current_timestep=0, attn_metadata=None):
+            image_outputs = self.paligemma.model.get_image_features(image)
         features = image_outputs.pooler_output
         if features.device != output_device or features.dtype != out_dtype:
             features = features.to(device=output_device, dtype=out_dtype)
@@ -1035,7 +1174,8 @@ class PaliGemmaWithExpertModel(nn.Module):
             ],
             dim=0,
         )
-        image_outputs = self.paligemma.model.get_image_features(batched_images)
+        with set_forward_context(current_timestep=0, attn_metadata=None):
+            image_outputs = self.paligemma.model.get_image_features(batched_images)
         features = image_outputs.pooler_output
         if features.device != output_device or features.dtype != out_dtype:
             features = features.to(device=output_device, dtype=out_dtype)
@@ -1119,6 +1259,8 @@ class Pi05CoreModel(nn.Module):
         self,
         config: Pi05PipelineConfig,
         runtime_role: Literal["all", "prefix", "action", "idle"] = "all",
+        *,
+        prefix_tensor_parallel: bool = False,
     ):
         super().__init__()
         self.config = config
@@ -1136,6 +1278,7 @@ class Pi05CoreModel(nn.Module):
             precision=precision,
             image_size=config.image_size[0],
             runtime_role=runtime_role,
+            prefix_tensor_parallel=prefix_tensor_parallel,
         )
         if runtime_role in ("all", "action"):
             self.action_in_proj = nn.Linear(config.action_dim, action_config.width)

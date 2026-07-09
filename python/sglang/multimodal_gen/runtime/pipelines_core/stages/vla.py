@@ -528,6 +528,7 @@ class VLAActionPostprocessStage(PipelineStage):
                 actions_out = action_batch[0]
 
         payload = {
+            "request_id": batch.request_id,
             "actions": actions_out,
         }
         payload["parameters"] = {

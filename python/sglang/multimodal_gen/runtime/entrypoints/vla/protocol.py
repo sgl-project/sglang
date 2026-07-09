@@ -319,6 +319,7 @@ def build_action_sampling_params(
 
     sampling_params_cls = _resolve_action_sampling_params_cls(server_args)
     sampling_kwargs = {
+        "request_id": payload.get("request_id") or payload.get("id"),
         "prompt": prompt,
         "images": images,
         "image_masks": observation.get("image_masks"),
@@ -394,7 +395,7 @@ def action_generation_response(
         action_shape = [horizon, action_dim]
         action_values = actions
     response = {
-        "id": f"act_{uuid.uuid4().hex}",
+        "id": output.get("request_id") or f"act_{uuid.uuid4().hex}",
         "object": "action.generation",
         "created": int(time.time()),
         "model": server_args.model_id or server_args.model_path,

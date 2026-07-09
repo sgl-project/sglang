@@ -8,9 +8,6 @@ from sglang.multimodal_gen.configs.pipeline_configs.pi05 import Pi05PipelineConf
 from sglang.multimodal_gen.configs.sample.pi05 import Pi05SamplingParams
 from sglang.multimodal_gen.runtime.cache.vla_prefix_cache import VLAPrefixCacheManager
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
-from sglang.multimodal_gen.runtime.distributed.vla_topology import (
-    VLAParallelTopology,
-)
 from sglang.multimodal_gen.runtime.models.vlas import Pi05PolicyModel
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
@@ -86,10 +83,17 @@ class Pi05Pipeline(ComposedPipelineBase):
             self.model_path,
             pipeline_config,
         )
-        parallel_topology = VLAParallelTopology.from_config(pipeline_config)
-        parallel_topology.validate()
+        if (
+            pipeline_config.prefix_parallel_strategy
+            == pipeline_config.action_parallel_strategy
+            == "tp"
+        ):
+            raise ValueError(
+                "VLA action expert should not share the prefix TP layout. "
+                "Use SP, Ulysses, Ring, DP, or monolithic fallback for the "
+                "action path."
+            )
         return {
-            "parallel_topology": parallel_topology,
             "policy_model": policy_model,
             "preprocessor": Pi05Preprocessor(pipeline_config),
             "prefix_cache": VLAPrefixCacheManager(

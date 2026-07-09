@@ -107,15 +107,36 @@ def test_runai_direct_gpu_loader_does_not_reject_split_roles(monkeypatch):
         safetensor_files=["fake.safetensors"],
     )
     model._should_read_source_key = lambda key: True
-    model._resolve_target_key = lambda source_key, target_state: source_key
     target_state = {
         "action.weight": SimpleNamespace(device=SimpleNamespace(type="cuda")),
     }
 
-    assert model._should_stream_weights_to_gpu(target_state)
+    assert model._should_stream_weights_to_gpu(target_state, {})
 
     model.runtime_role = "idle"
-    assert model._should_stream_weights_to_gpu(target_state)
+    assert model._should_stream_weights_to_gpu(target_state, {})
+
+
+def test_pi05_loader_maps_unfused_prefix_weights_to_parallel_targets():
+    q_key = (
+        "paligemma_with_expert.paligemma.model.language_model.layers.0."
+        "self_attn.q_proj.weight"
+    )
+    gate_key = (
+        "paligemma_with_expert.paligemma.model.language_model.layers.0."
+        "mlp.gate_proj.weight"
+    )
+
+    assert (
+        "paligemma_with_expert.paligemma.model.language_model.layers.0."
+        "self_attn.qkv_proj.weight",
+        "q",
+    ) in Pi05PolicyModel._candidate_target_weights(q_key)
+    assert (
+        "paligemma_with_expert.paligemma.model.language_model.layers.0."
+        "mlp.gate_up_proj.weight",
+        0,
+    ) in Pi05PolicyModel._candidate_target_weights(gate_key)
 
 
 def test_action_parallel_info_reports_single_rank_without_process_group():

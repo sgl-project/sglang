@@ -7,6 +7,8 @@ Each collected request prints a performance log before validation.
 
 from __future__ import annotations
 
+import json
+import math
 import os
 import queue
 import threading
@@ -593,6 +595,10 @@ class DiffusionServerBase:
             )
             return
 
+        if case.server_args.modality == "action":
+            self._validate_action_consistency(case, content)
+            return
+
         num_gpus = case.server_args.num_gpus
         is_video = case.server_args.modality == "video"
         output_format = case.sampling_params.output_format
@@ -727,6 +733,31 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
             f"max_mean_abs_diff={result.max_mean_abs_diff:.4f})"
         )
 
+    def _validate_action_consistency(
+        self,
+        case: DiffusionTestCase,
+        content: bytes,
+    ) -> None:
+        payload = json.loads(content.decode("utf-8"))
+        action = payload["data"][0]["action"]
+        values = action["values"]
+        expected_horizon = int(case.sampling_params.extras.get("action_horizon", 50))
+        expected_dim = int(case.sampling_params.extras.get("action_dim", 32))
+        assert action["shape"] == [expected_horizon, expected_dim]
+        assert len(values) == expected_horizon
+        assert all(len(row) == expected_dim for row in values)
+        assert all(
+            isinstance(value, (int, float)) and math.isfinite(float(value))
+            for row in values
+            for value in row
+        )
+        logger.info(
+            "[Consistency] %s: PASSED action shape/finite check (%sx%s)",
+            case.id,
+            expected_horizon,
+            expected_dim,
+        )
+
     def _save_gt_output(
         self,
         case: DiffusionTestCase,
@@ -748,6 +779,12 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
 
         num_gpus = case.server_args.num_gpus
         is_video = case.server_args.modality == "video"
+
+        if case.server_args.modality == "action":
+            output_path = out_dir / f"{case.id}_{num_gpus}gpu.json"
+            output_path.write_bytes(content)
+            logger.info(f"Saved GT action JSON: {output_path}")
+            return
 
         if is_video:
             # realtime consistency uses websocket raw frames to avoid lossy mp4 drift

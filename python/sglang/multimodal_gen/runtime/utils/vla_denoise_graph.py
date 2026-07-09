@@ -12,9 +12,6 @@ from sglang.multimodal_gen.runtime.cache.vla_prefix_cache import (
     PrefixContext,
     VLADensePrefixCache,
 )
-from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
-    enable_tc_piecewise_cuda_graph,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -134,11 +131,7 @@ class VLADenoiseGraphRunner:
         torch.cuda.current_stream(device=x_t.device).wait_stream(stream)
 
         graph = torch.cuda.CUDAGraph()
-        with (
-            enable_tc_piecewise_cuda_graph(),
-            torch.cuda.graph(graph),
-            torch.inference_mode(),
-        ):
+        with torch.cuda.graph(graph), torch.inference_mode():
             static_output = step_fn(
                 static_prefix_context,
                 static_x_t,
@@ -180,14 +173,12 @@ class VLADenoiseGraphRunner:
         try:
             if captured is None:
                 captured = self._capture(bucket, step_fn, prefix_context, x_t, timestep)
-                with enable_tc_piecewise_cuda_graph():
-                    captured.graph.replay()
+                captured.graph.replay()
             else:
                 self._sync_context_if_needed(captured, prefix_context)
                 captured.static_x_t.copy_(x_t)
                 captured.static_timestep.copy_(timestep)
-                with enable_tc_piecewise_cuda_graph():
-                    captured.graph.replay()
+                captured.graph.replay()
             return captured.static_output
         except Exception:
             self._disabled_buckets.add(bucket)

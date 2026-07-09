@@ -21,6 +21,18 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import get_world_r
 
 @dataclass(frozen=True)
 class VLASplitGroup:
+    """Runtime view for VLA prefix/action split execution.
+
+    This reuses the existing SP group as the coordination group. It is not a
+    separate parallel topology:
+    1. `prefix_root` computes/fetches PrefixContext and broadcasts it once.
+    2. `action_root` owns fallback action denoise and initial noise broadcast.
+    3. `action_ranks` may all participate in action SP when the policy allows it.
+
+    All rank fields are global ranks; GroupCoordinator APIs take group-local
+    ranks, so call `group_rank_for` before collective helpers.
+    """
+
     group: GroupCoordinator
     prefix_root: int
     action_root: int
@@ -61,6 +73,8 @@ def get_vla_split_group() -> VLASplitGroup | None:
     group = get_sp_group()
     if group.world_size <= 1:
         return None
+    # v1 maps the split view onto SP: first rank does prefix encode, last rank
+    # is the action fallback/root, and all SP ranks are eligible action ranks.
     return VLASplitGroup(
         group=group,
         prefix_root=group.ranks[0],
@@ -70,42 +84,6 @@ def get_vla_split_group() -> VLASplitGroup | None:
     )
 
 
-def _tensor_metadata(tensor: torch.Tensor) -> dict[str, object]:
-    transfer_dtype = torch.uint8 if tensor.dtype == torch.bool else tensor.dtype
-    return {
-        "shape": tuple(tensor.shape),
-        "dtype": tensor.dtype,
-        "transfer_dtype": transfer_dtype,
-    }
-
-
-def _broadcast_tensor_with_metadata(
-    tensor: torch.Tensor | None,
-    metadata: dict[str, object],
-    split: VLASplitGroup,
-    *,
-    src: int,
-    device: torch.device,
-) -> torch.Tensor:
-    transfer_dtype = metadata["transfer_dtype"]
-    target_dtype = metadata["dtype"]
-    if split.rank == src:
-        assert tensor is not None
-        payload = tensor.contiguous()
-        if payload.dtype != transfer_dtype:
-            payload = payload.to(transfer_dtype)
-    else:
-        payload = torch.empty(
-            metadata["shape"],
-            dtype=transfer_dtype,
-            device=device,
-        )
-    payload = split.group.broadcast(payload, src=split.group_rank_for(src))
-    if payload.dtype != target_dtype:
-        payload = payload.to(target_dtype)
-    return payload
-
-
 def broadcast_tensor_from_rank(
     tensor: torch.Tensor | None,
     split: VLASplitGroup,
@@ -113,43 +91,19 @@ def broadcast_tensor_from_rank(
     src: int,
     device: torch.device,
 ) -> torch.Tensor | None:
-    metadata = split.broadcast_object_from_rank(
-        _tensor_metadata(tensor) if tensor is not None else None,
-        src=src,
+    payload = (
+        {"is_none": tensor is None, "tensor": tensor} if split.rank == src else None
     )
-    if metadata is None:
+    payload = split.group.broadcast_tensor_dict(
+        payload,
+        src=split.group_rank_for(src),
+    )
+    if payload["is_none"]:
         return None
-    return _broadcast_tensor_with_metadata(
-        tensor,
-        metadata,
-        split,
-        src=src,
-        device=device,
-    )
-
-
-def _prefix_context_metadata(context: PrefixContext | None) -> dict[str, object]:
-    if context is None:
-        return {"is_none": True}
-    layers = []
-    for keys, values, sliding_window in context.past_key_values:
-        layers.append(
-            {
-                "keys": _tensor_metadata(keys),
-                "values": _tensor_metadata(values),
-                "sliding_window": sliding_window,
-            }
-        )
-    return {
-        "is_none": False,
-        "prefix_pad_masks": _tensor_metadata(context.prefix_pad_masks),
-        "prefix_position_ids": _tensor_metadata(context.prefix_position_ids),
-        "prefix_len": context.prefix_len,
-        "dtype": context.dtype,
-        "layout": dict(context.layout),
-        "cache_key_digest": context.cache_key_digest,
-        "layers": layers,
-    }
+    output = payload["tensor"]
+    if output.device != device:
+        output = output.to(device)
+    return output
 
 
 def broadcast_prefix_context(
@@ -159,64 +113,59 @@ def broadcast_prefix_context(
     src: int,
     device: torch.device,
 ) -> PrefixContext | None:
-    metadata = split.broadcast_object_from_rank(
-        _prefix_context_metadata(context),
-        src=src,
+    if split.rank == src and context is None:
+        payload = {"is_none": True}
+    elif split.rank == src:
+        prefix_pad_masks = context.prefix_pad_masks
+        prefix_pad_masks_is_bool = prefix_pad_masks.dtype == torch.bool
+        if prefix_pad_masks_is_bool:
+            prefix_pad_masks = prefix_pad_masks.to(torch.uint8)
+        payload = {
+            "is_none": False,
+            "prefix_pad_masks": prefix_pad_masks,
+            "prefix_pad_masks_is_bool": prefix_pad_masks_is_bool,
+            "prefix_position_ids": context.prefix_position_ids,
+            "prefix_len": context.prefix_len,
+            "dtype": context.dtype,
+            "layout": dict(context.layout),
+            "cache_key_digest": context.cache_key_digest,
+            "num_layers": len(context.past_key_values),
+        }
+        for i, (keys, values, sliding_window) in enumerate(context.past_key_values):
+            payload[f"layer_{i}_keys"] = keys
+            payload[f"layer_{i}_values"] = values
+            payload[f"layer_{i}_sliding_window"] = sliding_window
+    else:
+        payload = None
+
+    payload = split.group.broadcast_tensor_dict(
+        payload,
+        src=split.group_rank_for(src),
     )
-    if metadata["is_none"]:
+    if payload["is_none"]:
         return None
 
-    prefix_pad_masks = _broadcast_tensor_with_metadata(
-        context.prefix_pad_masks if split.rank == src and context is not None else None,
-        metadata["prefix_pad_masks"],
-        split,
-        src=src,
-        device=device,
-    )
-    prefix_position_ids = _broadcast_tensor_with_metadata(
-        (
-            context.prefix_position_ids
-            if split.rank == src and context is not None
-            else None
-        ),
-        metadata["prefix_position_ids"],
-        split,
-        src=src,
-        device=device,
-    )
-
     kv_layers = []
-    source_layers = (
-        list(context.past_key_values)
-        if split.rank == src and context is not None
-        else []
-    )
-    for i, layer_metadata in enumerate(metadata["layers"]):
-        source_keys = source_layers[i][0] if source_layers else None
-        source_values = source_layers[i][1] if source_layers else None
-        keys = _broadcast_tensor_with_metadata(
-            source_keys,
-            layer_metadata["keys"],
-            split,
-            src=src,
-            device=device,
+    for i in range(int(payload["num_layers"])):
+        kv_layers.append(
+            (
+                payload[f"layer_{i}_keys"],
+                payload[f"layer_{i}_values"],
+                payload[f"layer_{i}_sliding_window"],
+            )
         )
-        values = _broadcast_tensor_with_metadata(
-            source_values,
-            layer_metadata["values"],
-            split,
-            src=src,
-            device=device,
-        )
-        kv_layers.append((keys, values, layer_metadata["sliding_window"]))
+
+    prefix_pad_masks = payload["prefix_pad_masks"]
+    if payload.get("prefix_pad_masks_is_bool"):
+        prefix_pad_masks = prefix_pad_masks.to(torch.bool)
 
     return PrefixContext(
         past_key_values=VLADensePrefixCache(tuple(kv_layers)),
         prefix_pad_masks=prefix_pad_masks,
-        prefix_position_ids=prefix_position_ids,
-        prefix_len=int(metadata["prefix_len"]),
-        dtype=metadata["dtype"],
+        prefix_position_ids=payload["prefix_position_ids"],
+        prefix_len=int(payload["prefix_len"]),
+        dtype=payload["dtype"],
         device=device,
-        layout=dict(metadata["layout"]),
-        cache_key_digest=metadata["cache_key_digest"],
+        layout=dict(payload["layout"]),
+        cache_key_digest=payload["cache_key_digest"],
     )
