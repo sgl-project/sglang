@@ -62,7 +62,9 @@ class PureSWARadixCache(RadixCache):
         num_tokens = max(params.num_tokens, params.swa_num_tokens)
         return super().evict(EvictParams(num_tokens=num_tokens))
 
-    def cache_finished_req(self, req: Req, is_insert: bool = True):
+    def cache_finished_req(
+        self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int
+    ):
         """Cache request when it finishes.
 
         Only inserts the prefill portion [0, evict_floor) into the radix tree.
@@ -73,7 +75,7 @@ class PureSWARadixCache(RadixCache):
         if self.disable_finished_insert:
             is_insert = False
 
-        kv_committed_len = req.pop_committed_kv_cache()
+        kv_committed_len = kv_len_to_handle
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, :kv_committed_len
