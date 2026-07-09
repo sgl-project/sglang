@@ -1097,7 +1097,6 @@ class SchedulerPPMixin:
         # next_pp_outputs = None so non-last ranks skip forwarding
         # (pp_outputs is None gate). Placeholder carried in
         # batch_result.next_token_ids for process_batch_result_prefill.
-        batch.output_ids = placeholder
         batch_result = GenerationBatchResult(
             logits_output=None,
             pp_hidden_states_proxy_tensors=None,
