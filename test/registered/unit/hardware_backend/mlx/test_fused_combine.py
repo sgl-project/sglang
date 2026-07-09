@@ -19,12 +19,13 @@ import importlib.util
 import platform
 import unittest
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_cpu_ci, register_mlx_ci
 
-# Registered with the CPU suite (runtime no-op marker, parsed via AST). On
-# non-Apple-Silicon CI runners the whole TestCase skips via the @skipUnless
-# guard below, so this is the harmless "yes this test exists" registry signal.
+# Registered on the CPU suite but skipped wherever mlx is absent; runs for real
+# only on Apple Silicon. Also registered under stage-a-unit-test-mlx, which the
+# macOS CI lane (pr-test-mlx.yml) runs on every PR alongside pr-gate.
 register_cpu_ci(est_time=90, suite="base-a-test-cpu")
+register_mlx_ci(est_time=90, suite="stage-a-unit-test-mlx")
 
 _IS_APPLE_SILICON = platform.system() == "Darwin" and platform.machine() == "arm64"
 _HAS_MLX = importlib.util.find_spec("mlx") is not None
@@ -339,8 +340,10 @@ class TestFusedMoeCombineKernelOp(unittest.TestCase):
     def test_op_class_shape(self):
         self.assertTrue(issubclass(fc.FusedMoeCombineKernel, metal_jit.MetalJitOp))
         self.assertEqual(fc.FusedMoeCombineKernel.source, fc._KERNEL_SOURCE)
-        # The module level guard is the class's own, not a diverging copy.
-        self.assertIs(fc.can_fuse, fc.FusedMoeCombineKernel.can_fuse)
+        # The module level guard is the class's own, not a diverging copy;
+        # can_fuse is now an instance method, so compare the underlying
+        # function rather than the bound method object.
+        self.assertIs(fc.can_fuse.__func__, fc.FusedMoeCombineKernel.can_fuse)
 
     def test_warmup_specs_default_empty(self):
         # Inherited default; the AOT policy layer lands in a follow up PR.

@@ -25,6 +25,7 @@ Otherwise: ``(y * scores[..., None]).sum(axis=-2).astype(y.dtype)``.
 
 from __future__ import annotations
 
+import importlib
 import logging
 
 import mlx.core as mx
@@ -99,8 +100,7 @@ class FusedMoeCombineKernel(metal_jit.MetalJitOp):
 
     source = _KERNEL_SOURCE
 
-    @staticmethod
-    def can_fuse(y: mx.array, scores: mx.array) -> bool:
+    def can_fuse(self, y: mx.array, scores: mx.array) -> bool:
         """Cheap structural check: does this combine match the fast-path regime?"""
         if y.ndim < 3 or scores.ndim != y.ndim - 1:
             return False
@@ -168,7 +168,7 @@ _OP = FusedMoeCombineKernel()
 
 # Module level guard kept as the public seam for callers and tests; dispatch
 # applies the same check inline.
-can_fuse = FusedMoeCombineKernel.can_fuse
+can_fuse = _OP.can_fuse
 
 
 def fused_combine(y: mx.array, scores: mx.array) -> mx.array:
@@ -220,18 +220,15 @@ def patch_moe_combine_with_fused(model) -> int:
     Returns the number of blocks patched.
     """
     targets = []
-    try:
-        from mlx_lm.models.qwen2_moe import Qwen2MoeSparseMoeBlock
-
-        targets.append((Qwen2MoeSparseMoeBlock, _fused_qwen2_moe_call))
-    except ImportError:
-        pass
-    try:
-        from mlx_lm.models.qwen3_moe import Qwen3MoeSparseMoeBlock
-
-        targets.append((Qwen3MoeSparseMoeBlock, _fused_qwen3_moe_call))
-    except ImportError:
-        pass
+    for module_name, class_name, fused_call in (
+        ("mlx_lm.models.qwen2_moe", "Qwen2MoeSparseMoeBlock", _fused_qwen2_moe_call),
+        ("mlx_lm.models.qwen3_moe", "Qwen3MoeSparseMoeBlock", _fused_qwen3_moe_call),
+    ):
+        try:
+            module = importlib.import_module(module_name)
+        except ImportError:
+            continue
+        targets.append((getattr(module, class_name), fused_call))
 
     patched = 0
     for layer in model.model.layers:
