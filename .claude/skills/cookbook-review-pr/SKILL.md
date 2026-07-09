@@ -118,6 +118,11 @@ than restating.
   from the `sglang serve` deploy command.
 - `sglang_version` is a real build the author ran (a release, or `dev`/nightly) — not a
   guessed/placeholder value (no leftover `0.0.0`).
+- **Latency percentile**: `config.latencyPercentile` (default `"P50"`, or `"Mean"`) matches the
+  percentile the TTFT/TPOT values actually are — the card renders `TTFT (<pct>)`. (`"Mean"` is
+  temporary — legacy data is being re-measured to P50.)
+- **Throughput convention**: `tokens_per_sec_per_gpu` is stored as **total (in+out)/GPU**
+  = `output tok/s/GPU × (isl+osl)/osl`, shown by the card as-is. Flag output-only values.
 - **Consistent accuracy harness across entries**: every value under one `accuracyLabels`
   column must be produced by the SAME harness — flag a page that, say, measures one
   platform's GSM8K with `few_shot_gsm8k --num-questions 200` and another's with

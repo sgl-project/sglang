@@ -74,12 +74,11 @@ from sglang.srt.layers.attention.mamba.ops import (
 )
 from sglang.srt.layers.dp_attention import (
     compute_dp_attention_world_info,
-    get_attention_cp_group,
-    get_attention_tp_group,
 )
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
 from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
+from sglang.srt.layers.quantization.unquant import initialize_bf16_gemm_config
 from sglang.srt.lora.lora_drainer import LoRADrainer
 from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
@@ -110,7 +109,6 @@ from sglang.srt.managers.io_struct import (
     FreezeGCReq,
     GetInternalStateReq,
     GetInternalStateReqOutput,
-    GetLoadsReqInput,
     GetWeightsByNameReqInput,
     HealthCheckOutput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
@@ -148,7 +146,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
     sock_send,
 )
-from sglang.srt.managers.load_snapshot import LoadSnapshot, create_load_snapshot_writer
+from sglang.srt.managers.load_snapshot import create_load_snapshot_writer
 from sglang.srt.managers.min_free_slots_delayer import (
     MinFreeSlotsDelayer,
     resolve_min_free_slots,
@@ -238,8 +236,9 @@ from sglang.srt.observability.trace import process_tracing_init, trace_set_threa
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.platforms import current_platform
 from sglang.srt.plugins import load_plugins
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-from sglang.srt.server_args import PortArgs, ServerArgs, get_global_server_args
+from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.session.session_controller import SessionController
 from sglang.srt.speculative.dflash_utils import validate_dflash_request
 from sglang.srt.speculative.eagle_utils import get_draft_recurrent_hidden_state_spec
@@ -553,14 +552,6 @@ class Scheduler(
 
         self.init_batch_result_processor()
 
-        # The config-resolution lifecycle of this scheduler process ends
-        # here: every load-time stage has run (target and draft model init,
-        # weight-resolved kv-cache dtype), so lock the static flag groups.
-        # flags.capture stays writable; late resolution writes now raise.
-        from sglang.srt.runtime_context import get_context
-
-        get_context().freeze_flags()
-
         self.is_initializing = False
 
     def init_zbal_on_npu(self):
@@ -585,15 +576,6 @@ class Scheduler(
                 if self.server_args.dllm_algorithm is not None
                 else None
             )
-            if self.dllm_config:
-                if self.dllm_config.block_size < self.page_size:
-                    logger.warning(
-                        "WARNING: "
-                        f"The page size {self.page_size} should not be larger than dllm block size {self.dllm_config.block_size}."
-                        f"Page size now falls back to {self.dllm_config.block_size}"
-                    )
-                    self.page_size = self.dllm_config.block_size
-                    self.server_args.page_size = self.dllm_config.block_size
 
     def init_metrics_collector(
         self, tp_rank: int, pp_rank: int, dp_rank: Optional[int]
@@ -670,13 +652,9 @@ class Scheduler(
                 return
         writer.publish_counter = 0
         try:
-            result = self.load_inquirer.get_loads(GetLoadsReqInput(include=["all"]))
-            writer.write(LoadSnapshot.from_get_loads_output(result))
+            writer.write(self.load_inquirer.get_loads())
         except Exception as e:
             logger.warning("load snapshot publish failed: %s", e)
-
-    def handle_get_loads_req(self, req: GetLoadsReqInput):
-        return self.load_inquirer.get_loads(req)
 
     def init_tokenizer(self):
         server_args = self.server_args
@@ -757,6 +735,7 @@ class Scheduler(
         # Initialize GEMM-related configuration for FP8 and FP4 backends.
         initialize_fp8_gemm_config(self.server_args)
         initialize_fp4_gemm_config(self.server_args)
+        initialize_bf16_gemm_config(self.server_args)
 
         # This must be called after initialize_moe_config
         self.require_mlp_sync = require_mlp_sync(self.server_args)
@@ -804,8 +783,9 @@ class Scheduler(
         )
 
         if self.server_args.speculative_draft_load_format is not None:
-            self.server_args.load_format = (
-                self.server_args.speculative_draft_load_format
+            self.server_args.override(
+                "scheduler.draft_load_format",
+                load_format=self.server_args.speculative_draft_load_format,
             )
             logger.info(
                 f"Using draft model load_format: '{self.server_args.speculative_draft_load_format}'"
@@ -864,12 +844,15 @@ class Scheduler(
         self.init_tp_model_worker()
         self.maybe_init_draft_worker()
 
-        # Allocate KV cache pools for all workers.
+        # Prepare KV cache pools for all workers
         self.init_memory_pools()
 
-        # TODO: make memory profile consider cuda graph memory as well
         self.init_all_attention_backends()
         self.init_all_cuda_graphs()
+
+        model_runner = self.tp_worker.model_runner
+        if model_runner.token_to_kv_pool.post_capture_active:
+            model_runner.post_capture_resize_kv_pool()
 
         # Dispatch the model worker
         if self.spec_algorithm.is_none():
@@ -904,16 +887,19 @@ class Scheduler(
             self.min_free_slots_delayer = MinFreeSlotsDelayer(
                 min_free_slots=min_free_slots
             )
-        if not get_global_server_args().pp_max_micro_batch_size:
-            get_global_server_args().pp_max_micro_batch_size = max(
-                self.max_running_requests // self.ps.pp_size, 1
+        if not get_server_args().pp_max_micro_batch_size:
+            get_server_args().override(
+                "scheduler.pp_max_micro_batch_size_default",
+                pp_max_micro_batch_size=max(
+                    self.max_running_requests // self.ps.pp_size, 1
+                ),
             )
 
         self.tp_group = get_tp_group()
         self.tp_cpu_group = self.tp_group.cpu_group
-        self.attn_tp_group = get_attention_tp_group()
+        self.attn_tp_group = get_parallel().attn_tp_group
         self.attn_tp_cpu_group = self.attn_tp_group.cpu_group
-        self.attn_cp_group = get_attention_cp_group()
+        self.attn_cp_group = get_parallel().attn_cp_group
         self.attn_cp_cpu_group = self.attn_cp_group.cpu_group
         self.pp_group = get_pp_group()
         self.world_group = get_world_group()
@@ -1340,6 +1326,21 @@ class Scheduler(
                 ),
                 ignore_tokens=None,
             )
+            # Mark the chunked (not-yet-finished) prefill request so sample()
+            # skips writing its pseudo next-token into the ngram token table.
+            # Use self.chunked_req identity (not req.is_chunked) to avoid
+            # overlap-scheduling timing issues.
+            if self.chunked_req is not None:
+                skip_token_table_update = [
+                    req is self.chunked_req for req in batch.reqs
+                ]
+                batch.ne_skip_token_table_update = (
+                    torch.tensor(
+                        skip_token_table_update, dtype=torch.bool, device=device
+                    )
+                    if any(skip_token_table_update)
+                    else None
+                )
         return batch
 
     def init_deterministic_inference_config(self):
@@ -1438,7 +1439,6 @@ class Scheduler(
                     self.load_lora_adapter_from_tensors,
                 ),
                 (UnloadLoRAAdapterReqInput, self.unload_lora_adapter),
-                (GetLoadsReqInput, self.handle_get_loads_req),
                 (PauseGenerationReqInput, self.pause_generation),
                 (ContinueGenerationReqInput, self.continue_generation),
                 (ConfigureLoggingReq, self.configure_logging),
@@ -2724,7 +2724,7 @@ class Scheduler(
         return ret
 
     def get_num_allocatable_reqs(self, running_bs):
-        res = get_global_server_args().pp_max_micro_batch_size - running_bs
+        res = get_server_args().pp_max_micro_batch_size - running_bs
         res = min(res, self.req_to_token_pool.available_size())
         return res
 
@@ -2757,7 +2757,7 @@ class Scheduler(
             for req in ready_grammar_requests:
                 self._add_request_to_queue(req)
 
-        if self.enable_hierarchical_cache:
+        if self.enable_hierarchical_cache or self.server_args.enable_flexkv:
             self.tree_cache.check_hicache_events()
 
         if self.enable_priority_preemption or self.is_hybrid_swa:
@@ -3663,17 +3663,20 @@ class Scheduler(
             return AttachHiCacheStorageReqOutput(success=False, message=str(e))
         if ok:
             self.enable_hicache_storage = True
-            self.server_args.hicache_storage_backend = recv_req.hicache_storage_backend
+            hicache_fields = {
+                "hicache_storage_backend": recv_req.hicache_storage_backend
+            }
             if recv_req.hicache_storage_backend_extra_config_json is not None:
-                self.server_args.hicache_storage_backend_extra_config = (
+                hicache_fields["hicache_storage_backend_extra_config"] = (
                     recv_req.hicache_storage_backend_extra_config_json
                 )
             if recv_req.hicache_storage_prefetch_policy is not None:
-                self.server_args.hicache_storage_prefetch_policy = (
+                hicache_fields["hicache_storage_prefetch_policy"] = (
                     recv_req.hicache_storage_prefetch_policy
                 )
             if recv_req.hicache_write_policy is not None:
-                self.server_args.hicache_write_policy = recv_req.hicache_write_policy
+                hicache_fields["hicache_write_policy"] = recv_req.hicache_write_policy
+            self.server_args.override("scheduler.attach_hicache", **hicache_fields)
             logger.info(
                 f"Attached HiCache storage backend: {recv_req.hicache_storage_backend}"
             )
@@ -3714,8 +3717,11 @@ class Scheduler(
         if ok or (not self.enable_hicache_storage):
             # Treat "already disabled / nothing to do" as success for idempotence.
             self.enable_hicache_storage = False
-            self.server_args.hicache_storage_backend = None
-            self.server_args.hicache_storage_backend_extra_config = None
+            self.server_args.override(
+                "scheduler.detach_hicache",
+                hicache_storage_backend=None,
+                hicache_storage_backend_extra_config=None,
+            )
             logger.info("Detached HiCache storage backend.")
             return DetachHiCacheStorageReqOutput(
                 success=True, message=msg or "HiCache storage backend is detached."
@@ -3754,7 +3760,7 @@ class Scheduler(
         return success
 
     def get_internal_state(self, recv_req: GetInternalStateReq):
-        ret = dict(vars(get_global_server_args()))  # vars returns a ref to obj.__dict__
+        ret = dict(vars(get_server_args()))  # vars returns a ref to obj.__dict__
         ret["last_gen_throughput"] = self.metrics_reporter.last_gen_throughput
         ret["memory_usage"] = {
             "weight": round(self.tp_worker.model_runner.weight_load_mem_usage, 2),
@@ -3823,9 +3829,8 @@ class Scheduler(
             self.metrics_reporter.spec_total_num_accept_tokens = (
                 self.metrics_reporter.spec_total_num_forward_ct
             ) = 0
-            for k, v in server_args_dict.items():
-                setattr(get_global_server_args(), k, v)
-            logger.info(f"Global server args updated! {get_global_server_args()=}")
+            get_server_args().override(source="update_server_args", **server_args_dict)
+            logger.info(f"Global server args updated! {get_server_args()=}")
 
         return SetInternalStateReqOutput(updated=if_success)
 
@@ -4017,9 +4022,22 @@ class Scheduler(
         if recv_req.mode == "retract" and not self.running_batch.is_empty():
             self.running_batch.filter_batch()
             if len(self.running_batch.reqs) != 0:
-                retracted_reqs = self.running_batch.retract_all(self.server_args)
+                # Decode-side retract always rebootstraps (recomputes the KV from
+                # the prefill), so skip the device->host KV offload that release_req
+                # would otherwise do; the offloaded copy would be immediately
+                # discarded. Non-decode modes ignore offload_kv (they never offload).
+                retracted_reqs = self.running_batch.retract_all(
+                    self.server_args, offload_kv=False
+                )
                 for req in retracted_reqs:
-                    self._add_request_to_queue(req)
+                    if self.disaggregation_mode == DisaggregationMode.DECODE:
+                        if req.output_ids:
+                            req.pd_rebootstrap_forced_output_id = req.output_ids.pop()
+                        req.pd_rebootstrap_in_progress = True
+                        req.time_stats.set_retract_time()
+                        self.disagg_decode_prealloc_queue.hold_rebootstrap(req)
+                    else:
+                        self._add_request_to_queue(req)
 
             self.running_batch.batch_is_full = False
             self.chunked_req = None
@@ -4047,6 +4065,16 @@ class Scheduler(
                 f"reserved {before_mb:.1f} MB -> {after_mb:.1f} MB "
                 f"(freed {before_mb - after_mb:.1f} MB)"
             )
+        # Enqueue any rebootstrap requests that were staged during a
+        # retract-mode pause. Deferring until resume keeps the preallocation
+        # queue empty during the pause window (so an intervening weight update
+        # can flush the cache) and recomputes the prefix KV under the updated
+        # weights.
+        if (
+            self.disaggregation_mode == DisaggregationMode.DECODE
+            and self.disagg_decode_prealloc_queue is not None
+        ):
+            self.disagg_decode_prealloc_queue.enqueue_held_rebootstrap()
         self._engine_paused = False
 
     def load_lora_adapter(

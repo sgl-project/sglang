@@ -953,7 +953,8 @@ class GroupCoordinator:
         # 16B alignment, weak-contiguous, supported topology, and per-rank
         # size <= max_size/(world*2).
         # On a hit, writes directly into the caller's pre-allocated `output` via
-        # all_gather_reg during CUDA-graph capture and all_gather_unreg otherwise.
+        # all_gather_reg during CUDA-graph capture, and all_gather_unreg
+        # under torch_memory_saver and other paths.
         ca_comm = self.ca_comm
         if (
             is_hip()
@@ -966,7 +967,10 @@ class GroupCoordinator:
         ):
             if getattr(ca_comm, "_IS_CAPTURING", False):
                 if torch.cuda.is_current_stream_capturing():
-                    ca_comm.all_gather_reg(input, out=output, dim=0)
+                    if envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get():
+                        ca_comm.all_gather_unreg(input, out=output, dim=0)
+                    else:
+                        ca_comm.all_gather_reg(input, out=output, dim=0)
                 elif is_in_tc_piecewise_cuda_graph():
                     ca_comm.all_gather_unreg(input, out=output, dim=0)
                 else:
@@ -2128,11 +2132,6 @@ def initialize_model_parallel(
         if get_tensor_model_parallel_rank() == 0:
             logger.info(
                 f"DCP enabled, dcp_size={decode_context_parallel_size}, tp_size={tensor_model_parallel_size}"
-            )
-    else:
-        if get_tensor_model_parallel_rank() == 0:
-            logger.info(
-                f"DCP disabled, dcp_size={decode_context_parallel_size}, tp_size={tensor_model_parallel_size}"
             )
 
     attn_dp_size = attention_data_parallel_size

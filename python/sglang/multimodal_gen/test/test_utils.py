@@ -34,10 +34,10 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-SGL_TEST_FILES_CI_DATA_REVISION = "46b9b53a429606cb6739c861f275c1277c314a10"
+SGL_TEST_FILES_CI_DATA_REVISION = "77bd016251220fee8917a30ec92e89da03794a8a"
 
 if current_platform.is_npu():
-    SGL_TEST_FILES_CI_DATA_REVISION = "670d66a8a290b62c0c3c077b3e9b0f4a4d9a44e7"
+    SGL_TEST_FILES_CI_DATA_REVISION = "6b62f4b6825c76a25fd2ba28248df68f2b400e65"
 
 SGL_TEST_FILES_CONSISTENCY_GT_ROOT = (
     "https://raw.githubusercontent.com/"
@@ -96,6 +96,9 @@ DEFAULT_MEAN_ABS_DIFF_THRESHOLD_VIDEO = 10.0
 _clip_model_cache: dict[str, Any] = {}
 _consistency_gt_cache: dict[str, Any] = {}
 _official_consistency_gt_outputs_cache: dict[str, frozenset[str]] | None = None
+CONSISTENCY_GT_CASE_ALIASES = {
+    "fsdp-inference": "zimage_image_t2i_2_gpus",
+}
 OFFICIAL_CONSISTENCY_GT_SKIP_CASES = frozenset(
     {
         # Official references for these cases need regeneration or parity triage.
@@ -148,6 +151,7 @@ def _load_clip_processor_with_roberta_processing_compat(
 # ---------------------------------------------------------------------------
 
 DEFAULT_SMALL_MODEL_NAME_FOR_TEST = "Tongyi-MAI/Z-Image-Turbo"
+DEFAULT_AR_MODEL_NAME_FOR_TEST = "zai-org/GLM-Image"
 
 # Cosmos3 generation models
 DEFAULT_COSMOS3_NANO_MODEL_NAME_FOR_TEST = "nvidia/Cosmos3-Nano"
@@ -1016,10 +1020,15 @@ def output_format_to_ext(output_format: str | None) -> str:
     return "png"
 
 
+def get_consistency_gt_case_id(case_id: str) -> str:
+    return CONSISTENCY_GT_CASE_ALIASES.get(case_id, case_id)
+
+
 def _consistency_gt_filenames(
     case_id: str, num_gpus: int, is_video: bool, output_format: str | None = None
 ) -> list[str]:
     """Return the list of GT image filenames for a case. Reused by GT generation and consistency check."""
+    case_id = get_consistency_gt_case_id(case_id)
     n = num_gpus
     if is_video:
         return [
@@ -1034,6 +1043,7 @@ def _consistency_gt_filenames(
 def _base_consistency_gt_candidates(
     case_id: str, num_gpus: int, is_video: bool, output_format: str | None = None
 ) -> list[str]:
+    case_id = get_consistency_gt_case_id(case_id)
     n = num_gpus
     if is_video:
         return [
@@ -1053,9 +1063,9 @@ def get_consistency_gt_candidate_sets(
     candidates = _base_consistency_gt_candidates(
         case_id, num_gpus, is_video, output_format
     )
-    platform = get_consistency_platform()
-    if platform == "h100":
+    if _is_ascend_consistency_case(case_id) or current_platform.is_npu():
         return [candidates]
+    platform = get_consistency_platform()
     return [[f"{platform}/{candidate}" for candidate in candidates], candidates]
 
 
@@ -1157,7 +1167,8 @@ def _is_official_consistency_gt_base_url(base_url: str) -> bool:
 
 
 def _official_consistency_gt_candidate_is_declared(case_id: str, filename: str) -> bool:
-    return filename in _official_consistency_gt_outputs_for_case(case_id)
+    outputs = _official_consistency_gt_outputs_for_case(case_id)
+    return filename in outputs or filename.rsplit("/", 1)[-1] in outputs
 
 
 def _remote_consistency_gt_base_urls(case_id: str) -> tuple[str, ...]:

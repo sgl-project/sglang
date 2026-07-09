@@ -46,7 +46,7 @@ from sglang.srt.layers.dcp.layout import (
 from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
 
 # NOTE: planner.py is intentionally NOT imported here. It depends on server_args
-# (get_global_server_args), whereas this package-init executes at module-load time
+# (get_server_args), whereas this package-init executes at module-load time
 # for every eager importer of the DCP primitives — triton_backend,
 # mem_cache.memory_pool, mem_cache.triton_ops.mla_buffer, mem_cache.kv_cache_builder,
 # the FlashInfer-MLA / FlashMLA backends, and the deepseek forward methods. Keeping

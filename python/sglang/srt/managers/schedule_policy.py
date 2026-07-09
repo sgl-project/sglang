@@ -56,7 +56,8 @@ from sglang.srt.mem_cache.multi_ended_allocator import (
     UnifiedMambaTokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
-from sglang.srt.server_args import ServerArgs, get_global_server_args
+from sglang.srt.runtime_context import get_server_args
+from sglang.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -185,7 +186,7 @@ class SchedulePolicy:
         if (
             not isinstance(policy, CacheAwarePolicy)
             and self.tree_cache.supports_fast_match_prefix()
-            and get_global_server_args().disaggregation_mode != "decode"
+            and get_server_args().disaggregation_mode != "decode"
         ):
             for r in waiting_queue:
                 match_prefix_for_req(self.tree_cache, r, include_req=True)
