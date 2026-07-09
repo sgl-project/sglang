@@ -484,7 +484,6 @@ def extend(reqs, model_runner):
     forward_batch = ForwardBatch.init_new(
         batch,
         model_runner,
-        capture_hidden_mode=None,
         return_hidden_states_before_norm=False,
     )
     logits_output = model_runner.forward(forward_batch).logits_output
@@ -500,7 +499,6 @@ def decode(input_token_ids, batch, model_runner):
     forward_batch = ForwardBatch.init_new(
         batch,
         model_runner,
-        capture_hidden_mode=None,
         return_hidden_states_before_norm=False,
     )
     logits_output = model_runner.forward(forward_batch).logits_output

@@ -626,7 +626,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         batch: ScheduleBatch,
         model_runner: ModelRunner,
         *,
-        capture_hidden_mode: Optional[CaptureHiddenMode],
+        capture_hidden_mode: Optional[CaptureHiddenMode] = None,
         return_hidden_states_before_norm: bool,
     ):
         # init_new must not mutate the input ScheduleBatch; per-forward
