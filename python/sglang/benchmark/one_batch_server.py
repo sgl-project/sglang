@@ -578,6 +578,7 @@ def run_one_case(
         input_len = len(prompt_ids)
         image_data = None
     else:
+        # Load input token ids via benchmark.datasets.get_dataset
         supported_datasets = ("random", "random-ids", "mmmu", "generated-shared-prefix")
         if dataset_name not in supported_datasets:
             raise ValueError(
@@ -602,6 +603,8 @@ def run_one_case(
             gsp_system_prompt_len=gsp_system_prompt_len,
             gsp_question_len=gsp_question_len,
             gsp_output_len=gsp_output_len,
+            # The generated-shared-prefix dataset's from_args requires these; the
+            # batch-bench path only ever uses the uniform group distribution.
             gsp_group_distribution="uniform",
             gsp_zipf_alpha=None,
         )
