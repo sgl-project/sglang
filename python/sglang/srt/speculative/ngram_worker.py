@@ -9,7 +9,7 @@ from sglang.srt.layers.utils.logprob import compute_spec_v2_logprobs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, EagleDraftWorkerBase
@@ -370,15 +370,8 @@ class NGRAMWorker(BaseSpecWorker):
         self.ngram_corpus.batch_put(batch_tokens)
 
     def forward_batch_generation(
-        self,
-        batch: ScheduleBatch,
-        on_publish=None,
-        *,
-        capture_hidden_mode: Optional[CaptureHiddenMode],
+        self, batch: ScheduleBatch, on_publish=None
     ) -> GenerationBatchResult:
-        assert (
-            capture_hidden_mode is None
-        ), "spec workers derive capture_hidden_mode internally"
         fwd_stream = torch.get_device_module(self.device).current_stream()
         record_stream_for_v2_verify(batch, None, fwd_stream)
         bs = len(batch.reqs)
@@ -400,7 +393,7 @@ class NGRAMWorker(BaseSpecWorker):
                 ).cpu()
 
             batch_result = self.target_worker.forward_batch_generation(
-                batch, is_verify=True, capture_hidden_mode=None
+                batch, is_verify=True
             )
 
             logits_output, can_run_cuda_graph = (
@@ -489,9 +482,7 @@ class NGRAMWorker(BaseSpecWorker):
             batch.forward_mode = ForwardMode.DECODE
 
         else:
-            batch_result = self.target_worker.forward_batch_generation(
-                batch, capture_hidden_mode=None
-            )
+            batch_result = self.target_worker.forward_batch_generation(batch)
             logits_output, predict, can_run_cuda_graph = (
                 batch_result.logits_output,
                 batch_result.next_token_ids,
