@@ -4,7 +4,7 @@ import unittest
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
 
-from sglang.srt.managers.template_detection import (
+from sglang.srt.parser.template_detection import (
     REASONING_PARSER_RULES,
     TOOL_CALL_PARSER_RULES,
     ReasoningToggleConfig,
@@ -100,6 +100,24 @@ class TestTemplateManagerReasoningDetection(unittest.TestCase):
         self.assertEqual(
             config,
             ReasoningToggleConfig(toggle_param="enable_thinking", default_enabled=True),
+        )
+        self.assertEqual(parser, "nemotron_3")
+
+    def test_nemotron_super_detects_low_effort_kwarg(self):
+        template = """
+        {% set enable_thinking = enable_thinking if enable_thinking is defined else True %}
+        {%- set low_effort = low_effort if low_effort is defined else False %}
+        {% set truncate_history_thinking = truncate_history_thinking if truncate_history_thinking is defined else True %}
+        """
+        _, config, parser = self._detect(template, [""])
+
+        self.assertEqual(
+            config,
+            ReasoningToggleConfig(
+                toggle_param="enable_thinking",
+                default_enabled=True,
+                effort_kwarg="low_effort",
+            ),
         )
         self.assertEqual(parser, "nemotron_3")
 
