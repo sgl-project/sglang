@@ -308,21 +308,34 @@ class HiSparseCoordinator:
                 io_backend="kernel",
             )
 
-    def alloc_device_buffer(self, req: Req) -> None:
+    def device_buffer_alloc_size(self, req: Req) -> int:
         if self.is_dsv4_hisparse:
-            allocated_len = req.extend_range.end
+            return self.padded_buffer_size
+
+        allocated_len = req.kv_allocated_len
+        page_size = self.mem_pool_device.page_size
+        # Allocate only enough for current tokens (page-aligned).
+        # When prefill already fills device_buffer_size, include the reserved page.
+        alloc_size = min(
+            ((allocated_len + page_size - 1) // page_size) * page_size,
+            self.device_buffer_size,
+        )
+        if alloc_size == self.device_buffer_size:
             alloc_size = self.padded_buffer_size
-        else:
-            allocated_len = req.kv_allocated_len
-            page_size = self.mem_pool_device.page_size
-            # Allocate only enough for current tokens (page-aligned).
-            # When prefill already fills device_buffer_size, include the reserved page.
-            alloc_size = min(
-                ((allocated_len + page_size - 1) // page_size) * page_size,
-                self.device_buffer_size,
-            )
-            if alloc_size == self.device_buffer_size:
-                alloc_size = self.padded_buffer_size
+        return alloc_size
+
+    def can_allocate_device_buffer(self, req: Req) -> bool:
+        alloc_size = self.device_buffer_alloc_size(req)
+        return (
+            self.token_to_kv_pool_allocator.hisparse_attn_allocator.available_size()
+            >= alloc_size
+        )
+
+    def alloc_device_buffer(self, req: Req) -> None:
+        allocated_len = (
+            req.extend_range.end if self.is_dsv4_hisparse else req.kv_allocated_len
+        )
+        alloc_size = self.device_buffer_alloc_size(req)
 
         compressed_logical_indices = (
             self.mem_pool_device.translate_loc_from_full_to_compressed(
@@ -750,11 +763,109 @@ class HiSparseCoordinator:
         self._skip_first_backup[req.req_pool_idx] = False
         req.hisparse_staging = False
 
-    def retract_req(self, req: Req) -> None:
+    def _release_req_device_buffer(self, req: Req, allocated_len: int) -> None:
+        req_idx = req.req_pool_idx
+        hisparse_locs = []
+
+        current_cap = int(self.req_device_buffer_size[req_idx])
+        if current_cap > 0:
+            side_buf_hi = self.req_to_device_buffer[req_idx, :current_cap]
+            hisparse_locs.append(side_buf_hi[side_buf_hi > 0])
+
+        if allocated_len > 0:
+            allocated_locs = self.req_to_token_pool.req_to_token[
+                req_idx, :allocated_len
+            ]
+            compressed_locs = (
+                self.mem_pool_device.translate_loc_from_full_to_compressed(
+                    allocated_locs
+                )
+            )
+            mapped_hi = self.mem_pool_device.full_to_hisparse_device_index_mapping[
+                compressed_locs
+            ]
+            hisparse_locs.append(mapped_hi[mapped_hi > 0])
+            self.mem_pool_device.full_to_hisparse_device_index_mapping[
+                compressed_locs
+            ] = 0
+
+        if hisparse_locs:
+            all_hi = torch.unique(torch.cat(hisparse_locs))
+            if all_hi.numel() > 0:
+                self.token_to_kv_pool_allocator.free_hisparse_indices(all_hi)
+
+        self.req_device_buffer_tokens[:, req_idx, :] = -1
+        self.req_device_buffer_token_locs[:, req_idx, :] = -1
+        self.req_to_device_buffer[req_idx, :] = 0
+        self.req_device_buffer_size[req_idx] = 0
+        self.lru_slots[:, req_idx, :].copy_(self._lru_init)
+
+    def offload_retracted_req(self, req: Req):
         if req.hisparse_staging:
             self.abort_staging_request(req)
-        else:
-            self.request_finished(req)
+            return None
+
+        self.wait_for_pending_backup()
+        req_idx = req.req_pool_idx
+        allocated_len = req.kv_allocated_len
+
+        host_len = self.host_token_len(req.seqlen - 1)
+        if host_len > 0:
+            latest_pos = host_len - 1
+            current_cap = int(self.req_device_buffer_size[req_idx])
+            buffer_slot = min(latest_pos, self.device_buffer_size)
+            if (
+                current_cap > buffer_slot
+                and self.req_to_host_pool[req_idx, latest_pos] < 0
+            ):
+                host_locs = self.mem_pool_host.alloc_paged_token_slots(
+                    self.req_to_host_pool,
+                    self.req_to_host_pool_allocated_len,
+                    req_idx,
+                    latest_pos,
+                    1,
+                )
+                device_locs = self.req_to_device_buffer[
+                    req_idx, buffer_slot : buffer_slot + 1
+                ]
+                if torch.all(device_locs > 0):
+                    self.mem_pool_host.backup_from_device_all_layer(
+                        self.mem_pool_device,
+                        host_locs,
+                        device_locs,
+                        io_backend="kernel",
+                    )
+
+        host_allocated_len = int(self.req_to_host_pool_allocated_len[req_idx])
+        host_state = {
+            "host_indices": self.req_to_host_pool[req_idx, :host_allocated_len].clone(),
+            "host_allocated_len": host_allocated_len,
+            "skip_first_backup": self._skip_first_backup[req_idx],
+        }
+
+        self._release_req_device_buffer(req, allocated_len)
+        self.req_to_host_pool[req_idx, :] = -1
+        self.req_to_host_pool_allocated_len[req_idx] = 0
+        self._skip_first_backup[req_idx] = False
+        return host_state
+
+    def restore_retracted_req(self, req: Req, host_state) -> None:
+        if host_state is None:
+            return
+        req_idx = req.req_pool_idx
+        host_allocated_len = int(host_state["host_allocated_len"])
+        self.req_to_host_pool[req_idx, :] = -1
+        if host_allocated_len > 0:
+            self.req_to_host_pool[req_idx, :host_allocated_len] = host_state[
+                "host_indices"
+            ].to(device=self.req_to_host_pool.device)
+        self.req_to_host_pool_allocated_len[req_idx] = host_allocated_len
+        self._skip_first_backup[req_idx] = bool(
+            host_state.get("skip_first_backup", False)
+        )
+
+    def retract_req(self, req: Req) -> None:
+        self.offload_retracted_req(req)
 
     def request_finished(self, req: Req):
         # release resources only after the execution of a potential overlapped batch
@@ -770,21 +881,7 @@ class HiSparseCoordinator:
         # re-frees them (double-free into the page allocator's free list).
         allocated_len = req.kv_allocated_len
 
-        # release memory -- only free actually-allocated buffer indices
-        current_cap = int(self.req_device_buffer_size[req.req_pool_idx])
-        if current_cap > 0:
-            side_buf_hi = self.req_to_device_buffer[req.req_pool_idx, :current_cap]
-            all_hi = torch.unique(side_buf_hi[side_buf_hi > 0])
-            if all_hi.numel() > 0:
-                self.token_to_kv_pool_allocator.free_hisparse_indices(all_hi)
-
-        allocated_locs = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, :allocated_len
-        ]
-        compressed_locs = self.mem_pool_device.translate_loc_from_full_to_compressed(
-            allocated_locs
-        )
-        self.mem_pool_device.full_to_hisparse_device_index_mapping[compressed_locs] = 0
+        self._release_req_device_buffer(req, allocated_len)
 
         host_indices = self.mem_pool_host.allocated_host_indices(
             self.req_to_host_pool,
@@ -795,10 +892,6 @@ class HiSparseCoordinator:
             self.mem_pool_host.free(host_indices)
 
         # clear req info
-        self.req_device_buffer_tokens[:, req.req_pool_idx, :] = -1
-        self.req_device_buffer_token_locs[:, req.req_pool_idx, :] = -1
-        self.req_to_device_buffer[req.req_pool_idx, :] = 0
-        self.req_device_buffer_size[req.req_pool_idx] = 0
         self.req_to_host_pool[req.req_pool_idx, :] = -1
         self.req_to_host_pool_allocated_len[req.req_pool_idx] = 0
         self.lru_slots[:, req.req_pool_idx, :].copy_(self._lru_init)

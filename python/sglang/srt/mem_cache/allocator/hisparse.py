@@ -85,6 +85,14 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def get_kvcache(self):
         return self._kvcache
 
+    def get_cpu_copy(self, indices, mamba_indices=None):
+        return self.logical_attn_allocator.get_cpu_copy(indices, mamba_indices)
+
+    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+        return self.logical_attn_allocator.load_cpu_copy(
+            kv_cache_cpu, indices, mamba_indices
+        )
+
     def alloc(self, need_size: int):
         if self.page_size != 1:
             raise NotImplementedError(
@@ -159,9 +167,8 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             extra_indices = self.hisparse_attn_allocator.alloc(
                 need_size - len(hisparse_indices)
             )
-            assert (
-                extra_indices is not None
-            ), "Hisparse allocation failed in alloc_device_buffer"
+            if extra_indices is None:
+                return None
             buffer_indices = torch.cat([hisparse_indices, extra_indices])
         return buffer_indices
 
@@ -356,6 +363,47 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def get_kvcache(self):
         return self._kvcache
 
+    def get_cpu_copy(self, indices, mamba_indices=None):
+        kvcache = self._kvcache
+        c4_indices, _ = kvcache._compressed_indices_from_full(indices, 4)
+        c128_indices, _ = kvcache._compressed_indices_from_full(indices, 128)
+
+        swa_mask = None
+        swa_indices = None
+        full_to_swa_index_mapping = getattr(kvcache, "full_to_swa_index_mapping", None)
+        if full_to_swa_index_mapping is not None:
+            mapped_swa_indices = full_to_swa_index_mapping[indices]
+            swa_mask = mapped_swa_indices > 0
+            if torch.any(swa_mask):
+                swa_indices = mapped_swa_indices[swa_mask]
+                swa_cpu = kvcache.swa_kv_pool.get_cpu_copy(swa_indices)
+                swa_mask = swa_mask.cpu()
+            else:
+                swa_cpu = None
+        else:
+            swa_cpu = None
+
+        return {
+            "swa": swa_cpu,
+            "swa_mask": swa_mask,
+            # HiSparse C4 KV lives in the coordinator-managed host/device pools.
+            # The device pool is only a hot cache and cannot provide a full CPU copy.
+            "c4": None,
+            "c4_indexer": kvcache.c4_indexer_kv_pool.get_cpu_copy(c4_indices),
+            "c128": kvcache.c128_kv_pool.get_cpu_copy(c128_indices),
+            "attention_state": kvcache._get_state_cpu_copy(
+                kvcache.compress_state_pools, swa_indices
+            ),
+            "indexer_state": kvcache._get_state_cpu_copy(
+                kvcache.indexer_compress_state_pools, swa_indices
+            ),
+        }
+
+    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+        return self.logical_attn_allocator.load_cpu_copy(
+            kv_cache_cpu, indices, mamba_indices
+        )
+
     def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor):
         return self.logical_attn_allocator.translate_loc_from_full_to_swa(kv_indices)
 
@@ -400,6 +448,27 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             seq_lens_cpu,
             last_loc,
             extend_num_tokens,
+        )
+
+    def alloc_extend_swa_tail(
+        self,
+        prefix_lens: torch.Tensor,
+        prefix_lens_cpu: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        last_loc: torch.Tensor,
+        extend_num_tokens: int,
+        swa_tail_len: int,
+    ):
+        """Allocate logical full/SWA-tail indices without C4 device pages."""
+        return self.logical_attn_allocator.alloc_extend_swa_tail(
+            prefix_lens,
+            prefix_lens_cpu,
+            seq_lens,
+            seq_lens_cpu,
+            last_loc,
+            extend_num_tokens,
+            swa_tail_len=swa_tail_len,
         )
 
     def alloc_device_buffer(self, allocated_indices, need_size: int):
@@ -447,9 +516,8 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             extra_indices = self.hisparse_attn_allocator.alloc(
                 need_size - len(hisparse_indices)
             )
-            assert (
-                extra_indices is not None
-            ), "Hisparse allocation failed in alloc_device_buffer"
+            if extra_indices is None:
+                return None
             buffer_indices = torch.cat([hisparse_indices, extra_indices])
         return buffer_indices
 

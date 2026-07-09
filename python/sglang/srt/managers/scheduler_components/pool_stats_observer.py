@@ -283,7 +283,16 @@ class SchedulerPoolStatsObserver:
         )
 
     def _get_swa_token_info(self) -> PoolStats:
-        full_available_size = self.token_to_kv_pool_allocator.full_available_size()
+        if self.enable_hisparse and hasattr(
+            self.token_to_kv_pool_allocator, "logical_attn_allocator"
+        ):
+            logical_allocator = self.token_to_kv_pool_allocator.logical_attn_allocator
+            if hasattr(logical_allocator, "full_available_size"):
+                full_available_size = logical_allocator.full_available_size()
+            else:
+                full_available_size = logical_allocator.available_size()
+        else:
+            full_available_size = self.token_to_kv_pool_allocator.full_available_size()
         full_evictable_size = self.tree_cache.full_evictable_size()
         swa_available_size = self.token_to_kv_pool_allocator.swa_available_size()
         swa_evictable_size = self.tree_cache.swa_evictable_size()
