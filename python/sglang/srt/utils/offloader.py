@@ -12,6 +12,7 @@ from sglang.srt.distributed.naive_distributed import (
     set_naive_distributed,
 )
 from sglang.srt.layers.parameter import ModelWeightParameter
+from sglang.srt.runtime_context import get_stream
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import MultiprocessingSerializer, is_pin_memory_available
 from sglang.srt.utils.host_shared_memory import (
@@ -198,7 +199,10 @@ class OffloaderV2(BaseOffloader):
     ):
         assert len(self.offloaders) == 0, "should only call wrap_modules once"
 
-        alt_stream = torch.cuda.Stream()
+        # The offloader's async prefetch/offload copies run on their own
+        # stream — sharing the models' "alt" overlap stream would serialize
+        # unrelated copy and compute work.
+        alt_stream = get_stream("offload")
 
         all_modules = []
         offload_submodules = []
