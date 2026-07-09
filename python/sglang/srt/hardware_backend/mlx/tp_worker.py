@@ -104,7 +104,7 @@ class MlxTpModelWorker(TpModelWorker):
         is_verify: bool = False,
         skip_attn_backend_init: Optional[bool] = None,  # deprecated
         *,
-        capture_hidden_mode: Optional[CaptureHiddenMode],
+        capture_hidden_mode: Optional[CaptureHiddenMode] = None,
     ) -> GenerationBatchResult:
         """Override to route through MLX model runner."""
         if batch is not None:
