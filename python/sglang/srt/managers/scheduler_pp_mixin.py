@@ -927,7 +927,9 @@ class SchedulerPPMixin:
     def _pp_send_pyobj_to_next_stage(self: Scheduler, data, async_send: bool = False):
         p2p_work = []
         if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
-            dp_offset = self.ps.attn_dp_rank * self.ps.attn_tp_size
+            dp_offset = (
+                self.ps.attn_dp_rank * self.ps.attn_cp_size * self.ps.attn_tp_size
+            )
             p2p_work = point_to_point_pyobj(
                 data,
                 self.ps.pp_rank * self.ps.tp_size + dp_offset,
@@ -940,7 +942,9 @@ class SchedulerPPMixin:
 
     def _pp_recv_pyobj_from_prev_stage(self: Scheduler):
         if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
-            dp_offset = self.ps.attn_dp_rank * self.ps.attn_tp_size
+            dp_offset = (
+                self.ps.attn_dp_rank * self.ps.attn_cp_size * self.ps.attn_tp_size
+            )
             data = point_to_point_pyobj(
                 [],
                 self.ps.pp_rank * self.ps.tp_size + dp_offset,
@@ -1479,11 +1483,11 @@ class ChunkSizePredictor:
     def set_target_latency(self, base_chunk_size: int):
         """Set target latency based on base chunk size: target = f(base_chunk_size) - f(0)."""
 
-        def f(l: float) -> float:
-            """Total latency function: f(l) = al^2 + bl + c (or bl + c for linear)"""
+        def f(length: float) -> float:
+            """Total latency function: f(length) = a*length^2 + b*length + c."""
             return (
-                self.quadratic_coeff_a * l * l
-                + self.linear_coeff_b * l
+                self.quadratic_coeff_a * length * length
+                + self.linear_coeff_b * length
                 + self.constant_coeff_c
             )
 

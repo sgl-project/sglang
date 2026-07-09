@@ -4,6 +4,8 @@
 export const config = {
   modelName: "DeepSeek-V4",
 
+  latencyPercentile: "Mean", // temporary; re-measure to P50
+
   supportedHardware: [
     "h100", "h200", "b200", "b300", "gb200", "gb300",
     "rtx6000",

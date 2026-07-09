@@ -14,13 +14,12 @@ import sys
 import tempfile
 from dataclasses import field
 from enum import Enum
-from typing import Any, Literal, Optional
+from typing import Any, List, Literal, Optional
 
 import addict
 import yaml
 
 from sglang.multimodal_gen import envs
-from sglang.multimodal_gen.configs.models.encoders import T5Config
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
     LTX2PipelineConfig,
@@ -122,6 +121,55 @@ class Backend(str, Enum):
 
 WARMUP_MODES = ("off", "request", "server")
 
+# Default prompt sequence-length buckets for breakable CUDA graph (BCG) padding.
+# Prompt-conditioning is padded up to the smallest bucket that fits so prompts
+# of different lengths share one captured graph.
+DEFAULT_BCG_TEXT_BUCKETS = (64, 128, 256, 512, 1024)
+
+BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS = frozenset(
+    {
+        "comfy-org/ideogram-4",
+        "glm-image",
+        "ideogram-4",
+        "ideogram-4-fp8",
+        "ideogram-4-nf4",
+        "ideogram-ai/ideogram-4-fp8",
+        "ideogram-ai/ideogram-4-nf4",
+        "qwen/qwen-image",
+        "qwen/qwen-image-2512",
+        "qwen-image",
+        "qwen-image-2512",
+        "tongyi-mai/z-image",
+        "tongyi-mai/z-image-turbo",
+        "zai-org/glm-image",
+        "z-image",
+        "z-image-turbo",
+    }
+)
+
+BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS = frozenset(
+    {
+        "GlmImagePipelineConfig",
+        "Ideogram4PipelineConfig",
+        "QwenImagePipelineConfig",
+        "ZImagePipelineConfig",
+    }
+)
+
+
+def _normalized_bcg_model_refs(model_ref: str | None) -> set[str]:
+    if not model_ref:
+        return set()
+
+    normalized = str(model_ref).strip().rstrip("/").lower()
+    refs = {normalized, os.path.basename(normalized)}
+
+    if "models--" in normalized:
+        hf_cache_name = normalized.split("models--", 1)[1].split("/", 1)[0]
+        refs.add(hf_cache_name.replace("--", "/"))
+
+    return refs
+
 
 @dataclasses.dataclass
 class ServerArgs(DisaggServerArgsMixin):
@@ -216,6 +264,7 @@ class ServerArgs(DisaggServerArgsMixin):
     dit_layerwise_offload: bool | None = None
     layerwise_offload_components: list[str] | None = None
     dit_offload_prefetch_size: float = 0.0
+    offload_during_compile: bool = True
     text_encoder_cpu_offload: bool | None = None
     image_encoder_cpu_offload: bool | None = None
     vae_cpu_offload: bool | None = False
@@ -229,6 +278,22 @@ class ServerArgs(DisaggServerArgsMixin):
 
     # Compilation
     enable_torch_compile: bool = False
+
+    # Breakable CUDA graph (BCG): capture the DiT forward as CUDA-graph
+    # segments split at attention modules (SP all-to-all / dynamic attention
+    # stay eager). Mutually exclusive with --enable-torch-compile and
+    # Cache-DiT; BCG takes priority when more than one is requested.
+    #
+    # BCG graphs are resolution-specific, so --warmup-resolutions is required
+    # when BCG is enabled: every requested resolution is captured at warmup so
+    # serving never triggers a fresh capture.
+    enable_breakable_cuda_graph: bool = False
+    # Text/prompt sequence-length padding budget for BCG. Prompt-conditioning
+    # inputs are padded up to the smallest bucket that fits, so prompts of
+    # different lengths reuse one captured graph. Warmup captures one graph per
+    # bucket; a prompt longer than the largest bucket falls back to eager.
+    # ``None`` resolves to DEFAULT_BCG_TEXT_BUCKETS.
+    bcg_text_buckets: list[int] = None
 
     # NVTX profiling
     enable_layerwise_nvtx_marker: bool = False
@@ -342,11 +407,20 @@ class ServerArgs(DisaggServerArgsMixin):
 
     # Logging
     log_level: str = "info"
+    log_requests: bool = False
+    log_requests_level: int = 2
+    log_requests_format: str = "text"
+    log_requests_target: Optional[List[str]] = None
     uvicorn_access_log_exclude_prefixes: list[str] = field(default_factory=list)
 
     # Tracing
     enable_trace: bool = False
     otlp_traces_endpoint: str = "localhost:4317"
+
+    # SGLang backend for encoder stage
+    srt_encoder_url: str | None = None
+    srt_encoder_connect_timeout: int = 3.05
+    srt_encoder_timeout: int = 100
 
     @property
     def broker_port(self) -> int:
@@ -378,6 +452,7 @@ class ServerArgs(DisaggServerArgsMixin):
             auto_tuner.maybe_replace_cpu_offloaded_components_with_layerwise()
         self._adjust_path()
         self._adjust_quant_config()
+        self._adjust_breakable_cuda_graph_support()
         self._adjust_warmup()
         self._adjust_network_ports()
         # adjust parallelism before attention backend
@@ -412,6 +487,65 @@ class ServerArgs(DisaggServerArgsMixin):
             self._validate_parallelism()
         self._validate_cfg_parallel()
         self._validate_batching()
+        self._validate_breakable_cuda_graph()
+
+    def resolved_bcg_text_buckets(self) -> tuple[int, ...]:
+        """Sorted, de-duplicated, positive BCG text buckets.
+
+        Falls back to :data:`DEFAULT_BCG_TEXT_BUCKETS` when ``--bcg-text-buckets``
+        is unset, so both prompt padding and warmup capture share one source of
+        truth instead of the legacy ``SGLANG_BCG_TEXT_BUCKETS`` env var.
+        """
+        raw = self.bcg_text_buckets
+        if not raw:
+            return DEFAULT_BCG_TEXT_BUCKETS
+        buckets = sorted({int(b) for b in raw if int(b) > 0})
+        return tuple(buckets) or DEFAULT_BCG_TEXT_BUCKETS
+
+    def _validate_breakable_cuda_graph(self):
+        if not self.enable_breakable_cuda_graph:
+            return
+        # BCG graphs are captured per resolution and only replay for that exact
+        # latent shape, so the user must declare the resolutions up front. We
+        # capture every one of them at warmup; serving then never re-captures.
+        if not self.warmup_resolutions:
+            raise ValueError(
+                "--enable-breakable-cuda-graph requires --warmup-resolutions: "
+                "diffusion CUDA graphs only replay for a fixed resolution, so "
+                "every served resolution must be declared and captured at "
+                "warmup, e.g. --warmup-resolutions 1024x1024 1328x1328."
+            )
+        if self.bcg_text_buckets is not None and not any(
+            int(b) > 0 for b in self.bcg_text_buckets
+        ):
+            raise ValueError(
+                "--bcg-text-buckets must contain at least one positive integer."
+            )
+
+    def _adjust_breakable_cuda_graph_support(self):
+        if not self.enable_breakable_cuda_graph:
+            return
+
+        pipeline_config = getattr(self, "pipeline_config", None)
+        pipeline_config_name = type(pipeline_config).__name__
+        if (
+            pipeline_config_name in BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS
+            and self._is_breakable_cuda_graph_supported_model()
+        ):
+            return
+
+        logger.warning(
+            "[Diffusion BCG] disabled for %s: only Ideogram-4, Qwen/Qwen-Image, "
+            "Qwen/Qwen-Image-2512, Tongyi-MAI/Z-Image/Z-Image-Turbo, "
+            "and zai-org/GLM-Image are currently supported.",
+            pipeline_config_name,
+        )
+        self.enable_breakable_cuda_graph = False
+
+    def _is_breakable_cuda_graph_supported_model(self) -> bool:
+        refs = _normalized_bcg_model_refs(self.model_id)
+        refs.update(_normalized_bcg_model_refs(self.model_path))
+        return bool(refs & BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS)
 
     def _adjust_save_paths(self):
         """Normalize empty-string save paths to None (disabled)."""
@@ -437,24 +571,44 @@ class ServerArgs(DisaggServerArgsMixin):
         self.nunchaku_config = resolution.nunchaku_config
 
     def adjust_pipeline_config(self):
-        # enable parallel folding when SP is enabled
-        if self.tp_size != 1 or self.sp_degree <= 1:
+        # 1. adjust for encoder parallel folding
+        tp_size = self.tp_size or 1
+        dp_size = self.dp_size or 1
+        sp_degree = self.sp_degree or 1
+        # one replica = all its GPUs
+        replica_size = (self.num_gpus or tp_size) // dp_size
+        fold_world = dp_size == 1 and not self.disagg_mode and replica_size > tp_size
+
+        if fold_world:
+            mode = "world"
+        elif tp_size == 1 and sp_degree > 1:
+            # Preserve prior behavior for dp>1 / disaggregated SP runs.
+            mode = "sp"
+        else:
             return
 
-        enabled = False
-        for text_encoder_config in self.pipeline_config.text_encoder_configs:
-            if isinstance(text_encoder_config, T5Config):
-                text_encoder_config.parallel_folding = True
-                enabled = True
-                text_encoder_config.parallel_folding_mode = "sp"
+        # Propose the fold group from the parallelism for every encoder. The
+        # loader keeps it only for encoders wide enough to benefit at their real
+        # (post-load) size and whose dims divide the group -- see
+        # finalize_encoder_folding. Deciding on real size (not architecture)
+        # handles the same encoder family at different parameter counts.
+        encoder_configs = list(self.pipeline_config.text_encoder_configs) + list(
+            getattr(self.pipeline_config, "image_encoder_configs", ()) or ()
+        )
+        for encoder_config in encoder_configs:
+            encoder_config.parallel_folding_mode = mode
 
-        if enabled:
-            logger.info(
-                "Enabled T5 text encoder parallel folding (mode=sp) for %s (tp_size=%s, sp_degree=%s).",
-                self.__class__.__name__,
-                self.tp_size,
-                self.sp_degree,
-            )
+        logger.info(
+            "Proposed encoder parallel folding (mode=%s) for %s "
+            "(tp=%s sp=%s cfg=%s replica=%s); the loader keeps it for encoders "
+            "wide enough to benefit.",
+            mode,
+            self.__class__.__name__,
+            tp_size,
+            sp_degree,
+            self.cfg_parallel_degree or 1,
+            replica_size,
+        )
 
     def _adjust_offload(self):
         if current_platform.is_cpu():
@@ -732,6 +886,28 @@ class ServerArgs(DisaggServerArgsMixin):
         # Explicit resolutions imply warmup is on (request-based).
         if self.warmup_resolutions is not None:
             self.warmup = True
+
+        if (
+            self.enable_torch_compile
+            and self.warmup_mode is None
+            and not mode_explicit
+            and not legacy_explicit
+        ):
+            self.warmup = True
+            self.server_warmup = True
+            logger.info(
+                "Automatically enabled server warmup for torch.compile so first "
+                "real requests do not pay compile latency. Set --warmup-mode off "
+                "to disable this behavior."
+            )
+
+        # BCG captures every graph during a synthetic warmup forward at startup
+        # so that serving never records a fresh graph. That requires
+        # server-based warmup (a real warmup request issued at startup), not
+        # request-based warmup which runs no forward until the first request.
+        if self.enable_breakable_cuda_graph and self.disagg_role == RoleType.MONOLITHIC:
+            self.warmup = True
+            self.server_warmup = True
 
         if self.disagg_role != RoleType.MONOLITHIC:
             self.server_warmup = False
@@ -1294,8 +1470,38 @@ class ServerArgs(DisaggServerArgsMixin):
             "--enable-torch-compile",
             action=StoreBoolean,
             default=ServerArgs.enable_torch_compile,
-            help="Use torch.compile to speed up DiT inference."
+            help="Use torch.compile to speed up diffusion hot paths. "
+            + "When no warmup mode is configured, this enables server warmup "
+            + "so first real requests do not pay compile latency. "
             + "However, will likely cause precision drifts. See (https://github.com/pytorch/pytorch/issues/145213)",
+        )
+        parser.add_argument(
+            "--offload-during-compile",
+            action=StoreBoolean,
+            default=ServerArgs.offload_during_compile,
+            help="Offload components during the torch.compile warmup (the DiT layerwise) so max-autotune fits on tighter-memory GPUs, then restore the configured residency for serving. Skipped when the DiT is already layerwise-offloaded, or under cache-dit / FSDP.",
+        )
+        parser.add_argument(
+            "--enable-breakable-cuda-graph",
+            action=StoreBoolean,
+            default=ServerArgs.enable_breakable_cuda_graph,
+            help="Capture the DiT forward as breakable CUDA graph segments "
+            "(split at attention; SP all-to-all / dynamic attention stay "
+            "eager) to cut per-kernel launch overhead. Mutually exclusive "
+            "with --enable-torch-compile and Cache-DiT (BCG takes priority). "
+            "Requires --warmup-resolutions; all of them are captured at warmup.",
+        )
+        parser.add_argument(
+            "--bcg-text-buckets",
+            type=int,
+            nargs="+",
+            default=ServerArgs.bcg_text_buckets,
+            help="Prompt sequence-length padding budget for breakable CUDA "
+            "graph. Prompt-conditioning is padded up to the smallest bucket "
+            "that fits so different prompt lengths reuse one captured graph; "
+            "warmup captures one graph per bucket. Defaults to "
+            f"{' '.join(map(str, DEFAULT_BCG_TEXT_BUCKETS))}. "
+            "Replaces the legacy SGLANG_BCG_TEXT_BUCKETS env var.",
         )
 
         parser.add_argument(
@@ -1630,6 +1836,38 @@ class ServerArgs(DisaggServerArgsMixin):
             help="OTLP collector endpoint when --enable-trace is set. Format: <host>:<port>",
         )
         parser.add_argument(
+            "--log-requests",
+            action="store_true",
+            help="Log user-facing fields of all requests (default: False). "
+            "Verbosity is controlled by --log-requests-level.",
+        )
+        parser.add_argument(
+            "--log-requests-level",
+            type=int,
+            default=ServerArgs.log_requests_level,
+            choices=[0, 1, 2, 3],
+            help="Verbosity level for request logging. "
+            "0: Log request metadata only (request_id). "
+            "1: Log metadata + sampling config (seed, steps, guidance, resolution, frames, fps, ...). "
+            "2: Log metadata + sampling config + prompt/negative prompt (truncated to 2 KiB). "
+            "3: Log metadata + sampling config + full prompt/negative prompt.",
+        )
+        parser.add_argument(
+            "--log-requests-format",
+            type=str,
+            default=ServerArgs.log_requests_format,
+            choices=["text", "json"],
+            help="Format for request logging: 'text' (human-readable) or 'json' (structured)",
+        )
+        parser.add_argument(
+            "--log-requests-target",
+            type=str,
+            nargs="+",
+            default=ServerArgs.log_requests_target,
+            help="Target(s) for request logging: 'stdout' and/or directory path(s) for file output. "
+            "Can specify multiple targets, e.g., '--log-requests-target stdout /my/path'. ",
+        )
+        parser.add_argument(
             "--uvicorn-access-log-exclude-prefixes",
             type=str,
             nargs="*",
@@ -1646,6 +1884,29 @@ class ServerArgs(DisaggServerArgsMixin):
             help="The model backend to use. 'auto' prefers sglang native and falls back to diffusers. "
             "'sglang' uses native optimized implementation. 'diffusers' uses vanilla diffusers pipeline.",
         )
+
+        # SGLang backend for encoder stage
+        parser.add_argument(
+            "--srt-encoder-url",
+            type=str,
+            default=ServerArgs.srt_encoder_url,
+            help="Url of SGLang server for encoder stage",
+        )
+        parser.add_argument(
+            "--srt-encoder-connection-timeout",
+            type=int,
+            default=ServerArgs.srt_encoder_connect_timeout,
+            help="Timeout (in seconds) for establishing the initial TCP connection to the SGLang encoder server. "
+            "Default value is 3.05.",
+        )
+        parser.add_argument(
+            "--srt-encoder-timeout",
+            type=int,
+            default=ServerArgs.srt_encoder_timeout,
+            help="Timeout (in seconds) for HTTP requests to the SGLang encoder server. "
+            "Increase value if connection between diffusion server and AR model server is slow.",
+        )
+
         return parser
 
     def url(self):

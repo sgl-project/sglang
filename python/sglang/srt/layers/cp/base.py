@@ -195,9 +195,9 @@ class ContextParallelStrategy(ABC):
 
 
 def _is_dsa_active() -> bool:
-    from sglang.srt.server_args import get_global_server_args
+    from sglang.srt.runtime_context import get_server_args
 
-    sa = get_global_server_args()
+    sa = get_server_args()
     return bool(
         getattr(sa, "enable_prefill_cp", False)
         and getattr(sa, "_is_dsa_model_arch", False)
@@ -247,10 +247,10 @@ def get_cp_strategy() -> Optional[ContextParallelStrategy]:
     global _STRATEGY
 
     if _STRATEGY is None:
-        from sglang.srt.server_args import get_global_server_args
+        from sglang.srt.runtime_context import get_server_args
 
         try:
-            server_args = get_global_server_args()
+            server_args = get_server_args()
         except ValueError:
             return None
         if server_args is not None and getattr(server_args, "enable_prefill_cp", False):

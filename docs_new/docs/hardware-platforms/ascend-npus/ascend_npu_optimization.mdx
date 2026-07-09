@@ -390,6 +390,7 @@ The following environment variables are used in other best practice configuratio
 The table shows feature-by-feature compatibility of SGLang capabilities on Ascend NPU. Features that have performance impact on Ascend are included. Each cell at the intersection of two features indicates whether they can be used together.
 
 The symbols used are defined as follows:
+
 - 🟢 = Full compatibility
 - 🟠 = Partial compatibility
 - ❌ = No compatibility
@@ -759,6 +760,10 @@ Breaks large prefill computations into smaller, fixed-size chunks for better sch
 
 Captures the compute graph on NPU and replays it to eliminate kernel launch overhead, analogous to CUDA Graph on NVIDIA GPUs. Internally uses `torch.npu.NPUGraph`. Most effective for decode with stable, predictable batch sizes (via `--cuda-graph-bs`). Has partial compatibility with most features because graph capture requires fixed control flow and tensor shapes.
 
+<Note>
+  `--enable-torch-compile` is incompatible with NPU Graph. When torch.compile is enabled, NPU Graph must be disabled via `--disable-cuda-graph`.
+</Note>
+
 ### Speculative Decoding (`--speculative-algorithm`)
 
 Reduces per-token latency by predicting multiple future tokens in a single forward pass, then verifying them against the model. Ascend supports `NEXTN` (for DeepSeek models, using the model's own hidden states) and `EAGLE3` (for Qwen MoE models, using a separate draft model). Controlled by `--speculative-num-steps`, `--speculative-eagle-topk`, and `--speculative-num-draft-tokens`. On Ascend, `SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1` enables the optimized overlap scheduler for speculative decoding.
@@ -790,7 +795,6 @@ Enables Expert Parallelism Load Balancing to dynamically redistribute experts ac
 ### NZ Weight Format (`SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT`)
 
 Casts model weight tensors to the Ascend NPU ACL FRACTAL_NZ format (format 29) for improved memory access efficiency on Da Vinci AI cores. Enabled by default globally; disable with `SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT=1` when the format conflicts with other features (e.g., EPLB). Applied to linear weights, MoE weights, quantized weights, MLA QKV projections, and KV Cache (via `PA_NZ` / `nzcache` modes for FIA). Related env var: `SGLANG_USE_FIA_NZ=1` (requires `SGLANG_NPU_USE_MLAPO=1`).
-
 
 ## See Also
 

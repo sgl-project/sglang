@@ -28,7 +28,7 @@ from sglang.srt.entrypoints.openai.serving_chat import (
     normalize_tool_content,
 )
 from sglang.srt.managers.io_struct import GenerateReqInput
-from sglang.srt.managers.template_detection import ReasoningToggleConfig
+from sglang.srt.parser.template_detection import ReasoningToggleConfig
 from sglang.srt.utils import get_or_create_event_loop
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -1164,7 +1164,7 @@ class ServingChatTestCase(unittest.TestCase):
 
     def test_dpsk_v32_encoding_path(self):
         """Test DeepSeek V3.2 encoding path detection and application."""
-        from sglang.srt.managers.template_manager import TemplateManager
+        from sglang.srt.parser.template_manager import TemplateManager
 
         # Only mock the fields that _use_dpsk_v32_encoding() actually reads:
         # tokenizer.chat_template and hf_config.architectures
@@ -1800,6 +1800,63 @@ class ServingChatTestCase(unittest.TestCase):
             },
         )
 
+    def _collect_continuous_usage(self, cached_tokens):
+        content = {
+            "text": "Hello",
+            "meta_info": {
+                "id": "chatcmpl-cont-usage",
+                "prompt_tokens": 10,
+                "completion_tokens": 2,
+                "cached_tokens": cached_tokens,
+                "finish_reason": {"type": "stop", "matched": None},
+                "output_token_logprobs": None,
+                "output_top_logprobs": None,
+            },
+            "index": 0,
+        }
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            stream=True,
+        )
+
+        async def _collect():
+            chunks = []
+            async for chunk in self.chat._generate_stream_content(
+                content=content,
+                index=0,
+                request=req,
+                stream_offsets={},
+                reasoning_parser_dict={},
+                parser_dict={},
+                has_tool_calls={},
+                choice_logprobs=None,
+                finish_reason_type="stop",
+                continuous_usage_stats=True,
+                prompt_tokens={0: 10},
+                reasoning_tokens={0: 0},
+                completion_tokens={0: 2},
+            ):
+                chunks.append(chunk)
+            return chunks
+
+        chunks = get_or_create_event_loop().run_until_complete(_collect())
+        return [c["usage"] for c in self._parse_chunks(chunks) if c.get("usage")]
+
+    def test_continuous_usage_reports_cached_tokens(self):
+        """continuous_usage_stats chunks include cached tokens when cache reporting is on."""
+        self.tm.server_args.enable_cache_report = True
+        usages = self._collect_continuous_usage(cached_tokens=6)
+        self.assertTrue(usages, "continuous_usage_stats attached no usage")
+        self.assertEqual(usages[0]["prompt_tokens_details"]["cached_tokens"], 6)
+
+    def test_continuous_usage_omits_cached_tokens_when_report_disabled(self):
+        """With cache reporting off, continuous_usage_stats must not leak cached tokens."""
+        self.tm.server_args.enable_cache_report = False
+        usages = self._collect_continuous_usage(cached_tokens=6)
+        self.assertTrue(usages, "continuous_usage_stats attached no usage")
+        self.assertIsNone(usages[0].get("prompt_tokens_details"))
+
     # ------------- incremental streaming output tests -------------
     def test_incremental_streaming_output_delta(self):
         """Test that streaming with incremental_streaming_output produces correct deltas.
@@ -1943,6 +2000,67 @@ class ServingChatTestCase(unittest.TestCase):
             with self.subTest(effort=effort):
                 req.reasoning_effort = effort
                 self.assertEqual(chat._get_reasoning_from_request(req), expected)
+
+    def _setup_nemotron_super(self):
+        """Drive _apply_jinja_template (chat_template_name=None) with a
+        Nemotron-3 Super reasoning_config carrying effort_kwarg."""
+        self.tm.server_args.reasoning_parser = "nemotron_3"
+        self.chat.reasoning_parser = "nemotron_3"
+        self.tm.server_args.served_model_name = (
+            "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16"
+        )
+        self.template_manager.chat_template_name = None
+        self.template_manager.reasoning_config = ReasoningToggleConfig(
+            toggle_param="enable_thinking",
+            default_enabled=True,
+            effort_kwarg="low_effort",
+        )
+        self.chat.chat_encoding_spec = None
+
+    def _run_jinja_with_effort(self, effort):
+        req = ChatCompletionRequest(
+            model="nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16",
+            messages=[{"role": "user", "content": "hi"}],
+            reasoning_effort=effort,
+        )
+        with (
+            patch.object(self.chat, "_encode_messages", return_value=None),
+            patch.object(
+                self.chat,
+                "_handle_last_assistant_message",
+                return_value=([{"role": "user", "content": "hi"}], None),
+            ),
+        ):
+            self.chat._process_messages(req, False)
+        _, kwargs = self.tm.tokenizer.apply_chat_template.call_args
+        return kwargs
+
+    def test_nemotron_super_low_effort_mapped_to_kwarg(self):
+        self._setup_nemotron_super()
+        kwargs = self._run_jinja_with_effort("low")
+        self.assertTrue(kwargs.get("low_effort"))
+
+    def test_nemotron_super_high_effort_warns_without_kwarg(self):
+        self._setup_nemotron_super()
+        with self.assertLogs(
+            "sglang.srt.entrypoints.openai.serving_chat", level="WARNING"
+        ) as logs:
+            kwargs = self._run_jinja_with_effort("high")
+        self.assertNotIn("low_effort", kwargs)
+        self.assertTrue(any("only 'low' reasoning effort" in m for m in logs.output))
+
+    def test_nemotron_nano_no_effort_kwarg(self):
+        # Nano template has no low_effort, so effort_kwarg stays None and no
+        # warning is emitted even for non-low effort.
+        self.tm.server_args.reasoning_parser = "nemotron_3"
+        self.chat.reasoning_parser = "nemotron_3"
+        self.template_manager.chat_template_name = None
+        self.template_manager.reasoning_config = ReasoningToggleConfig(
+            toggle_param="enable_thinking", default_enabled=True
+        )
+        self.chat.chat_encoding_spec = None
+        kwargs = self._run_jinja_with_effort("high")
+        self.assertNotIn("low_effort", kwargs)
 
     def test_non_stream_reasoning_response_preserves_payload_whitespace(self):
         self.chat.reasoning_parser = "qwen3"
