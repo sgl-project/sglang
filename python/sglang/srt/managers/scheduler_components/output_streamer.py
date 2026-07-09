@@ -409,6 +409,11 @@ class _GenerationStreamAccumulator:
             self.spec_correct_drafts_histogram.append(req.spec_correct_drafts_histogram)
 
         if self.return_logprob:
+            drop_token_ids_logprob_idx = (
+                req.logprob.token_ids_logprob is not None
+                and not req.return_token_ids_in_logprobs
+                and not req.return_text_in_logprobs
+            )
             if (
                 req.return_logprob
                 and not req.input_logprob_sent
@@ -429,7 +434,9 @@ class _GenerationStreamAccumulator:
                     req.logprob.input_token_ids_logprobs_val
                 )
                 self.input_token_ids_logprobs_idx.append(
-                    req.logprob.input_token_ids_logprobs_idx
+                    []
+                    if drop_token_ids_logprob_idx
+                    else req.logprob.input_token_ids_logprobs_idx
                 )
                 req.input_logprob_sent = True
             else:
@@ -468,7 +475,9 @@ class _GenerationStreamAccumulator:
                     ]
                 )
                 self.output_token_ids_logprobs_idx.append(
-                    req.logprob.output_token_ids_logprobs_idx[
+                    []
+                    if drop_token_ids_logprob_idx
+                    else req.logprob.output_token_ids_logprobs_idx[
                         send_output_token_logprobs_offset:logprob_end
                     ]
                 )

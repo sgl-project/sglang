@@ -621,6 +621,27 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         self.assertTrue(req[0].return_prompt_token_ids)
         self.assertTrue(req[1].return_prompt_token_ids)
 
+    def test_return_token_ids_in_logprobs_default_true(self):
+        """Default must stay True for backward compatibility (output unchanged)."""
+        req = GenerateReqInput(text="Hello")
+        req.normalize_batch_and_arguments()
+        self.assertTrue(req.return_token_ids_in_logprobs)
+
+    def test_getitem_preserves_return_token_ids_in_logprobs(self):
+        """Batch subrequests must keep the return_token_ids_in_logprobs flag."""
+        req = GenerateReqInput(
+            input_ids=[[1, 2, 3], [4, 5, 6]],
+            sampling_params=[{}, {}],
+            rid=["id1", "id2"],
+            return_logprob=True,
+            token_ids_logprob=[[7, 8], [4, 5]],
+            return_token_ids_in_logprobs=False,
+        )
+        req.normalize_batch_and_arguments()
+
+        self.assertFalse(req[0].return_token_ids_in_logprobs)
+        self.assertFalse(req[1].return_token_ids_in_logprobs)
+
     def test_regenerate_rid(self):
         """Test the regenerate_rid method."""
         req = GenerateReqInput(text="Hello")
