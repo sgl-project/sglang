@@ -13,7 +13,7 @@
 # ==============================================================================
 """A single structured accessor for process-static runtime state.
 
-``get_parallel()`` returns a ``ParallelContext`` whose attributes — tp / pp /
+``get_parallel()`` returns a ``ParallelContext`` whose attributes — tp / dcp / pp /
 moe / attn size and rank, plus the process-group handles — each delegate live to
 the canonical getter in ``distributed.parallel_state`` / ``layers.dp_attention``.
 Returned values are exactly what those getters return; this is a read-through
@@ -79,10 +79,13 @@ _PARALLEL_FIELDS = frozenset(
         "attn_tp_rank",
         "attn_cp_size",
         "attn_cp_rank",
-        "attn_dp_size",
-        "attn_dp_rank",
+        "dcp_enabled",
         "dcp_size",
         "dcp_rank",
+        "attn_dcp_size",
+        "attn_dcp_rank",
+        "attn_dp_size",
+        "attn_dp_rank",
         "world_group",
         "tp_group",
         "pp_group",
@@ -193,6 +196,27 @@ class ParallelContext:
     @property
     def dcp_rank(self) -> int:
         return self._v("dcp_rank", _ps().get_dcp_rank)
+
+    @property
+    def dcp_enabled(self) -> bool:
+        def getter():
+            if _ps().get_dcp_group_no_assert() is None:
+                return False
+            return self.dcp_size > 1
+
+        return self._v("dcp_enabled", getter)
+
+    @property
+    def attn_dcp_size(self) -> int:
+        return self._v(
+            "attn_dcp_size", lambda: self.dcp_size if self.dcp_enabled else 1
+        )
+
+    @property
+    def attn_dcp_rank(self) -> int:
+        return self._v(
+            "attn_dcp_rank", lambda: self.dcp_rank if self.dcp_enabled else 0
+        )
 
     @property
     def attn_dp_size(self) -> int:

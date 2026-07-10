@@ -74,7 +74,6 @@ from sglang.srt.layers.communicator_dsa_cp import (
     DSACPLayerCommunicator,
     maybe_prefetch_next_full_attention_kv,
 )
-from sglang.srt.layers.dcp import dcp_enabled, get_attention_dcp_world_size
 from sglang.srt.layers.dcp.planner import (
     prepare_decode_context_parallel_metadata,
 )
@@ -1745,9 +1744,9 @@ class DeepseekV2AttentionMLA(
             prefix=add_prefix("attn_mqa", prefix),
         )
         # use num_local_heads * dcp_world_size because q_nope, q_rope is all gathered from dcp ranks
-        if dcp_enabled():
+        if get_parallel().dcp_enabled:
             self.attn_mqa_for_dcp_decode = RadixAttention(
-                self.num_local_heads * get_attention_dcp_world_size(),
+                self.num_local_heads * get_parallel().attn_dcp_size,
                 self.kv_lora_rank + self.qk_rope_head_dim,
                 self.scaling,
                 num_kv_heads=1,
