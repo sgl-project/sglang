@@ -11,7 +11,9 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.allocation import alloc_for_spec_decode
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
-from sglang.srt.utils.common import is_pin_memory_available
+from sglang.srt.utils.common import ceil_align, is_npu, is_pin_memory_available
+
+_is_npu = is_npu()
 
 _OVERLAP_PLAN_STREAMS: dict[str, torch.cuda.Stream] = {}
 
@@ -48,8 +50,9 @@ class DFlashDraftInputV2(SpecInput):
     _prepare_batch_seq_lens_cpu_buf: Optional[torch.Tensor] = None
     _prepare_cur_kv_lens_cpu_buf: Optional[torch.Tensor] = None
     _prepare_nxt_kv_lens_cpu_buf: Optional[torch.Tensor] = None
+    _prepare_alloc_nxt_kv_lens_cpu_buf: Optional[torch.Tensor] = None
     _prepare_cur_kv_lens_gpu_buf: Optional[torch.Tensor] = None
-    _prepare_nxt_kv_lens_gpu_buf: Optional[torch.Tensor] = None
+    _prepare_alloc_nxt_kv_lens_gpu_buf: Optional[torch.Tensor] = None
 
     # Filled by scheduler after dispatch.
     future_indices: Optional[torch.Tensor] = None
@@ -76,8 +79,9 @@ class DFlashDraftInputV2(SpecInput):
             current = 0 if buf is None else int(buf.numel())
             return max(bs, 32, current * 2 if current > 0 else 0)
 
-        # The three CPU scratch buffers grow together; capacity is the only
-        # invariant (batch is int64 non-pinned, cur/nxt are int32 pinned).
+        # The four CPU scratch buffers grow together; capacity is the only
+        # invariant (batch is int64 non-pinned, cur/nxt/alloc_nxt are int32
+        # pinned).
         if needs_cpu_alloc(self._prepare_batch_seq_lens_cpu_buf):
             capacity = grown_capacity(self._prepare_batch_seq_lens_cpu_buf)
             self._prepare_batch_seq_lens_cpu_buf = torch.empty(
@@ -89,13 +93,16 @@ class DFlashDraftInputV2(SpecInput):
             self._prepare_nxt_kv_lens_cpu_buf = torch.empty(
                 (capacity,), dtype=torch.int32, device="cpu", pin_memory=pin_memory
             )
+            self._prepare_alloc_nxt_kv_lens_cpu_buf = torch.empty(
+                (capacity,), dtype=torch.int32, device="cpu", pin_memory=pin_memory
+            )
 
         if needs_gpu_alloc(self._prepare_cur_kv_lens_gpu_buf):
             capacity = grown_capacity(self._prepare_cur_kv_lens_gpu_buf)
             self._prepare_cur_kv_lens_gpu_buf = torch.empty(
                 (capacity,), dtype=torch.int32, device=device
             )
-            self._prepare_nxt_kv_lens_gpu_buf = torch.empty(
+            self._prepare_alloc_nxt_kv_lens_gpu_buf = torch.empty(
                 (capacity,), dtype=torch.int32, device=device
             )
 
@@ -127,8 +134,9 @@ class DFlashDraftInputV2(SpecInput):
         assert self._prepare_batch_seq_lens_cpu_buf is not None
         assert self._prepare_cur_kv_lens_cpu_buf is not None
         assert self._prepare_nxt_kv_lens_cpu_buf is not None
+        assert self._prepare_alloc_nxt_kv_lens_cpu_buf is not None
         assert self._prepare_cur_kv_lens_gpu_buf is not None
-        assert self._prepare_nxt_kv_lens_gpu_buf is not None
+        assert self._prepare_alloc_nxt_kv_lens_gpu_buf is not None
         batch_seq_lens_cpu_t = self._prepare_batch_seq_lens_cpu_buf[:bs]
         cur_kv_lens_cpu_t = self._prepare_cur_kv_lens_cpu_buf[:bs]
 
@@ -139,10 +147,16 @@ class DFlashDraftInputV2(SpecInput):
                 f"DFLASH invalid speculative_num_draft_tokens={block_size}."
             )
         page_size = batch.token_to_kv_pool_allocator.page_size
+        # Dual-purpose split: nxt_kv_lens_cpu_t carries the LOGICAL reserved
+        # lens (it becomes reserved_seq_lens_cpu, the draft batch's real seq
+        # lens) and must NOT be ceiled; alloc_nxt_kv_lens_cpu_t carries the
+        # page-aligned lens fed to the allocator and pool writes only.
         nxt_kv_lens_cpu_t = self._prepare_nxt_kv_lens_cpu_buf[:bs]
+        alloc_nxt_kv_lens_cpu_t = self._prepare_alloc_nxt_kv_lens_cpu_buf[:bs]
         committed_seq_lens_sum = 0
         reserved_seq_lens_sum = 0
         num_needed_tokens = 0
+        max_alloc_len = 0
         max_top_k = 1
         uniform_top_k_value = None
         uniform_top_k = True
@@ -151,15 +165,21 @@ class DFlashDraftInputV2(SpecInput):
             # Read the allocation watermark from the req object like EAGLE.
             cur_alloc_len = int(req.kv.kv_allocated_len)
             reserved_len = max(cur_alloc_len, committed_len + 2 * block_size)
+            alloc_reserved_len = (
+                reserved_len if _is_npu else ceil_align(reserved_len, page_size)
+            )
             top_k = int(req.sampling_params.top_k)
 
             batch_seq_lens_cpu_t[i] = committed_len
             cur_kv_lens_cpu_t[i] = cur_alloc_len
             nxt_kv_lens_cpu_t[i] = reserved_len
+            alloc_nxt_kv_lens_cpu_t[i] = alloc_reserved_len
 
             committed_seq_lens_sum += committed_len
             reserved_seq_lens_sum += reserved_len
-            num_needed_tokens += reserved_len - cur_alloc_len
+            num_needed_tokens += alloc_reserved_len - cur_alloc_len
+            if alloc_reserved_len > max_alloc_len:
+                max_alloc_len = alloc_reserved_len
 
             if top_k > max_top_k:
                 max_top_k = top_k
@@ -167,6 +187,15 @@ class DFlashDraftInputV2(SpecInput):
                 uniform_top_k_value = top_k
             elif uniform_top_k and top_k != uniform_top_k_value:
                 uniform_top_k = False
+
+        if page_size > 1:
+            # Same fail-fast as EAGLE: the aligned reservation must fit the
+            # req_to_token row, else the pool write below would OOB.
+            row_width = batch.req_to_token_pool.req_to_token.shape[1]
+            assert max_alloc_len <= row_width, (
+                f"DFLASH page>1 draft over-allocation ({max_alloc_len}) exceeds "
+                f"req_to_token row width ({row_width}); page_size={page_size}."
+            )
 
         self.max_top_k = max(max_top_k, 1)
         self.uniform_top_k_value = uniform_top_k_value if uniform_top_k else None
@@ -183,9 +212,9 @@ class DFlashDraftInputV2(SpecInput):
                 plan_stream.wait_stream(caller_stream)
 
             cur_kv_lens = self._prepare_cur_kv_lens_gpu_buf[:bs]
-            nxt_kv_lens = self._prepare_nxt_kv_lens_gpu_buf[:bs]
+            alloc_nxt_kv_lens = self._prepare_alloc_nxt_kv_lens_gpu_buf[:bs]
             cur_kv_lens.copy_(cur_kv_lens_cpu_t, non_blocking=True)
-            nxt_kv_lens.copy_(nxt_kv_lens_cpu_t, non_blocking=True)
+            alloc_nxt_kv_lens.copy_(alloc_nxt_kv_lens_cpu_t, non_blocking=True)
 
             alloc_for_spec_decode(
                 batch.tree_cache,
@@ -194,8 +223,8 @@ class DFlashDraftInputV2(SpecInput):
                 req_pool_indices=batch.req_pool_indices,
                 cur_kv_lens=cur_kv_lens,
                 cur_kv_lens_cpu=cur_kv_lens_cpu_t,
-                nxt_kv_lens=nxt_kv_lens,
-                nxt_kv_lens_cpu=nxt_kv_lens_cpu_t,
+                nxt_kv_lens=alloc_nxt_kv_lens,
+                nxt_kv_lens_cpu=alloc_nxt_kv_lens_cpu_t,
                 num_needed_tokens=num_needed_tokens,
                 batch=batch,
             )

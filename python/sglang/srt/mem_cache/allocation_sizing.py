@@ -46,7 +46,10 @@ def get_req_to_token_extra_context_len(server_args: ServerArgs) -> int:
     """req_to_token row headroom beyond the model context length.
 
     Sized to hold the decode over-allocation; the spec v2 page>1 topk>1 holey
-    draft footprint can outgrow the default num_draft_tokens headroom.
+    draft footprint can outgrow the default num_draft_tokens headroom. The
+    trailing alloc_page - 1 covers page-aligned allocation: kv_allocated_len is
+    ceil_align(seq, alloc_page), which can exceed the logical length by up to
+    alloc_page - 1 (the DCP allocator's page is page_size * dcp_size).
     """
     # FIXME(lsyin): temporary fix for the context length issue under spec decoding
     extra = 4 + (server_args.max_speculative_num_draft_tokens or 0)
@@ -56,4 +59,5 @@ def get_req_to_token_extra_context_len(server_args: ServerArgs) -> int:
         and (server_args.speculative_eagle_topk or 1) > 1
     ):
         extra = max(extra, get_alloc_reserve_per_decode(server_args))
-    return extra
+    alloc_page_size = server_args.page_size * max(server_args.dcp_size, 1)
+    return extra + alloc_page_size - 1
