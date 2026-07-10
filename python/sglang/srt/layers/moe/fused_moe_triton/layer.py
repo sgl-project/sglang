@@ -13,6 +13,7 @@ from torch.nn.parameter import UninitializedParameter
 from sglang.srt.batch_overlap.single_batch_overlap import DownGemmOverlapArgs
 from sglang.srt.batch_overlap.two_batch_overlap import MaybeTboDeepEPDispatcher
 from sglang.srt.distributed import (
+    get_moe_ep_group,
     get_tp_group,
     tensor_model_parallel_all_reduce,
 )
@@ -73,6 +74,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     is_cpu,
     is_hip,
+    is_npu,
     print_info_once,
     round_up,
 )
@@ -81,7 +83,20 @@ from sglang.srt.utils.custom_op import register_custom_op
 _is_hip = is_hip()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
+_is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+
+
+def _get_deepep_comm_group(a2a_backend):
+    group = get_tp_group().device_group
+
+    if a2a_backend.is_mori():
+        group = get_tp_group()
+
+    elif _is_npu:
+        group = get_moe_ep_group().device_group
+
+    return group
 
 
 def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
@@ -102,11 +117,7 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
         or a2a_backend.is_nixl()
     ):
         return MaybeTboDeepEPDispatcher(
-            group=(
-                get_tp_group().device_group
-                if not a2a_backend.is_mori()
-                else get_tp_group()
-            ),
+            group=_get_deepep_comm_group(a2a_backend),
             router_topk=moe_runner_config.top_k,
             permute_fusion=True,
             num_experts=moe_runner_config.num_experts,
