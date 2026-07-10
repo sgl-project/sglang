@@ -1348,8 +1348,32 @@ def requant_weight_ue8m0_inplace(weight, weight_scale_inv, weight_block_size):
         weight.to(weight_scale_inv.device), weight_scale_inv, weight_block_size
     )
 
-    offloader.update_param(weight, new_weight)
-    weight_scale_inv.data = new_weight_scale_inv
+    # Reuse existing storage where possible: on weight reloads this re-runs
+    # after the loader refilled raw checkpoint values, and captured CUDA
+    # graphs hold pointers to the buffers of the first pass.
+    if (
+        weight.data.shape == new_weight.shape
+        and weight.data.dtype == new_weight.dtype
+        and weight.device == new_weight.device
+    ):
+        weight.data.copy_(new_weight)
+    else:
+        offloader.update_param(weight, new_weight)
+
+    kernel_buffer = getattr(weight_scale_inv, "_kernel_buffer", None)
+    if (
+        kernel_buffer is not None
+        and kernel_buffer.shape == new_weight_scale_inv.shape
+        and kernel_buffer.dtype == new_weight_scale_inv.dtype
+    ):
+        # restore_weights_before_loading swapped in a checkpoint-shaped buffer
+        # for the refill; put the repacked scales back into the original
+        # kernel-layout storage.
+        kernel_buffer.copy_(new_weight_scale_inv)
+        weight_scale_inv.data = kernel_buffer
+        del weight_scale_inv._kernel_buffer
+    else:
+        weight_scale_inv.data = new_weight_scale_inv
 
 
 def requant_block_scale_ue8m0_for_deepgemm(

@@ -393,6 +393,36 @@ class Fp8Config(QuantizationConfig):
             )
 
 
+def _snapshot_scale_checkpoint_state(scale) -> None:
+    """Record the scale state the first process pass starts from.
+
+    Captured at the first process_weights_after_loading call, i.e. after
+    create_weights and any model-__init__ override, but before the first
+    transform latches the format flag or repacks the layout.
+    restore_weights_before_loading returns to this state so a reloaded
+    checkpoint is loaded and processed exactly like initial loading.
+    """
+    if scale is not None and not hasattr(scale, "_ckpt_format_ue8m0"):
+        scale._ckpt_format_ue8m0 = scale.format_ue8m0
+        scale._ckpt_shape = tuple(scale.data.shape)
+        scale._ckpt_dtype = scale.data.dtype
+
+
+def _restore_scale_checkpoint_state(scale) -> None:
+    if scale is None or not hasattr(scale, "_ckpt_format_ue8m0"):
+        return
+    scale.format_ue8m0 = scale._ckpt_format_ue8m0
+    if tuple(scale.data.shape) != scale._ckpt_shape:
+        # The UE8M0 requant repacked the scale layout. Hand the loader a
+        # checkpoint-shaped buffer to refill, and keep the kernel-layout
+        # buffer so the requant re-fills the SAME storage afterwards (CUDA
+        # graphs hold its pointer).
+        scale._kernel_buffer = scale.data
+        scale.data = torch.empty(
+            scale._ckpt_shape, dtype=scale._ckpt_dtype, device=scale.data.device
+        )
+
+
 class Fp8LinearMethod(LinearMethodBase):
     """Linear method for FP8.
 
@@ -588,7 +618,22 @@ class Fp8LinearMethod(LinearMethodBase):
             else:
                 layer.register_parameter("input_scale", None)
 
+    def restore_weights_before_loading(self, layer: Module) -> None:
+        """Prepare the layer for a fresh checkpoint-layout load.
+
+        format_ue8m0 describes the scale VALUES (set once the first
+        process_weights_after_loading requants them), but a reload overwrites
+        those values with raw checkpoint scales, so the latched flag must be
+        returned to its pre-processing state or the re-run skips the requant
+        and serves raw scales as UE8M0. Restore rather than hard-reset:
+        construction-time opt-outs (e.g. deepseek_v4 wo_a) legitimately
+        start True and must stay True.
+        """
+        if self.block_quant:
+            _restore_scale_checkpoint_state(getattr(layer, "weight_scale_inv", None))
+
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
+        _snapshot_scale_checkpoint_state(getattr(layer, "weight_scale_inv", None))
         # If ROCm, normalize the weights and scales to e4m3fnuz
         if _is_fp8_fnuz:
             # activation_scheme: dynamic
@@ -1238,7 +1283,22 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer.w13_input_scale = None
             layer.w2_input_scale = None
 
+    def restore_weights_before_loading(self, layer: Module) -> None:
+        """Prepare expert weights for a fresh checkpoint-layout load.
+
+        Same contract as Fp8LinearMethod.restore_weights_before_loading: the
+        UE8M0 flags describe the scale values, so they must return to their
+        pre-processing state before a reload refills the scales.
+        """
+        if self.block_quant:
+            _restore_scale_checkpoint_state(
+                getattr(layer, "w13_weight_scale_inv", None)
+            )
+            _restore_scale_checkpoint_state(getattr(layer, "w2_weight_scale_inv", None))
+
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
+        _snapshot_scale_checkpoint_state(getattr(layer, "w13_weight_scale_inv", None))
+        _snapshot_scale_checkpoint_state(getattr(layer, "w2_weight_scale_inv", None))
         # AMD FP4 experts: use aiter's native MXFP4 MoE path
         if _use_aiter and self.is_fp4_expert:
             gu_intv = envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()
