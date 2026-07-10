@@ -111,7 +111,14 @@ def gather_out_cache_loc_extend(
     assert prefix_lens_tensor.shape[0] == prefix_lens_cpu.shape[0] == num_reqs
     assert seq_lens_tensor.shape[0] == seq_lens_cpu.shape[0] == num_reqs
     assert extend_lens_tensor.shape[0] == extend_lens_cpu.shape[0] == num_reqs
-    assert int((seq_lens_cpu - prefix_lens_cpu).sum().item()) == num_out_tokens
+    assert (
+        req_pool_indices_cpu.device.type
+        == prefix_lens_cpu.device.type
+        == seq_lens_cpu.device.type
+        == extend_lens_cpu.device.type
+        == "cpu"
+    )
+    assert torch.equal(seq_lens_cpu - prefix_lens_cpu, extend_lens_cpu)
     assert req_to_token.dtype == torch.int32
     assert (
         req_pool_indices_tensor.device
@@ -139,6 +146,9 @@ def gather_out_cache_loc_extend(
             req_to_token.shape[1],
         )
         return out_cache_loc_i32.to(torch.int64)
+
+    if num_reqs == 0:
+        return torch.empty(0, dtype=torch.int64, device=req_to_token.device)
 
     chunks: list[torch.Tensor] = []
     for i in range(num_reqs):
@@ -507,6 +517,8 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
         out_cache_loc: allocated cache locations
     """
 
+    assert token_per_req == 1
+
     batch.maybe_evict_swa()
 
     seq_lens_gpu = batch.seq_lens
@@ -542,7 +554,6 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
         (batch.req_pool_indices, locs), out_cache_loc.to(torch.int32)
     )
 
-    assert token_per_req == 1
     out_cache_loc_derived = batch.req_to_token_pool.req_to_token[
         batch.req_pool_indices, locs
     ].to(torch.int64)
