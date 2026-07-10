@@ -29,9 +29,7 @@ from sglang.srt.configs.model_config import (
     get_minimax_sparse_layer_ids,
 )
 from sglang.srt.distributed import (
-    get_moe_expert_parallel_world_size,
     get_pp_group,
-    get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.environ import envs
@@ -285,7 +283,7 @@ class MiniMaxM3MoE(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_size = get_parallel().tp_size
         self.n_shared_experts = getattr(config, "n_shared_experts", None)
         self.num_fused_shared_experts = (
             0
@@ -367,7 +365,7 @@ class MiniMaxM3MoE(nn.Module):
         self.layer_id = layer_id
 
         if get_moe_a2a_backend().is_deepep():
-            self.ep_size = get_moe_expert_parallel_world_size()
+            self.ep_size = get_parallel().moe_ep_size
             self.top_k = config.num_experts_per_tok
 
     @staticmethod
@@ -1267,7 +1265,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 forward_batch
             )
         )
-        if self.is_layer_sparse and get_tensor_model_parallel_world_size() > 1:
+        if self.is_layer_sparse and get_parallel().tp_size > 1:
             # Sparse MoE outputs are TP-partial; deferring their all-reduce into the next
             # layer's fusion re-triggers the M3 no-EOS runaway. Force immediate all-reduce.
             should_allreduce_fusion = False
@@ -1466,7 +1464,7 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
             disable_reason = "Shared experts fusion currently requires CUDA devices."
         elif _is_cuda and (_device_sm is not None) and (_device_sm < 80):
             disable_reason = "Shared experts fusion requires SM80 or newer GPUs."
-        elif get_moe_expert_parallel_world_size() > 1:
+        elif get_parallel().moe_ep_size > 1:
             disable_reason = "Shared experts fusion is not supported together with expert parallelism yet."
         elif get_moe_a2a_backend().is_deepep():
             disable_reason = "Shared experts fusion is not supported when Deepep MoE backend is enabled."
