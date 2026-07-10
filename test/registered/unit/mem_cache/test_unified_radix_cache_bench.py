@@ -741,27 +741,6 @@ _CI_BENCH_CONFIGS = [
         kv_size=500_000,
     ),
     dict(
-        label="FULL_SWA_ps1",
-        components=(ComponentType.FULL, ComponentType.SWA),
-        page_size=1,
-        num_seqs=1000,
-        kv_size=100_000,
-    ),
-    dict(
-        label="FULL_ps16",
-        components=(ComponentType.FULL,),
-        page_size=16,
-        num_seqs=1000,
-        kv_size=100_000,
-    ),
-    dict(
-        label="FULL_SWA_ps16",
-        components=(ComponentType.FULL, ComponentType.SWA),
-        page_size=16,
-        num_seqs=1000,
-        kv_size=100_000,
-    ),
-    dict(
         label="FULL_ps128",
         components=(ComponentType.FULL,),
         page_size=128,
