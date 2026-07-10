@@ -657,9 +657,7 @@ class Repro:
                 # would drop the magic comma and collapse an import the target left
                 # multi-line). A lone surviving name collapses to one line by default, unless
                 # keep_exploded says the target preserved the magic comma for it too.
-                if on_own_line and (
-                    len(kept) >= 2 or has_comments or keep_exploded
-                ):
+                if on_own_line and (len(kept) >= 2 or has_comments or keep_exploded):
                     edits.append((own, own, None))
                 elif has_comments and not on_own_line:
                     raise AssertionError(
@@ -731,7 +729,8 @@ class Repro:
         insert immediately after the top-level import statement whose source text contains
         that substring instead -- needed for a file whose imports are split into separate
         isort sections by an intervening statement (e.g. ``_is_hip = is_hip()``), where the
-        sorter will not carry the new import across the boundary into the intended block."""
+        sorter will not carry the new import across the boundary into the intended block.
+        """
 
         def op(root: Path) -> None:
             path = root / rel
@@ -741,9 +740,9 @@ class Repro:
             if after is not None:
                 anchor = None
                 for node in body:
-                    if isinstance(node, (ast.Import, ast.ImportFrom)) and after in "".join(
-                        lines[node.lineno - 1 : node.end_lineno]
-                    ):
+                    if isinstance(
+                        node, (ast.Import, ast.ImportFrom)
+                    ) and after in "".join(lines[node.lineno - 1 : node.end_lineno]):
                         anchor = node
                         break
                 if anchor is None:

@@ -230,7 +230,11 @@ def test_extract_symbols_to_new_module_rejects_a_fictional_header_constant(
     and raises: the audit refuses code the extraction cannot vouch for."""
     (tmp_path / "src.py").write_text("def moved():\n    return 1\n")
     r = Repro("b", "t").extract_symbols_to_new_module(
-        "src.py", "new.py", symbols=["moved"], header="_fake = evil()\n", order=["moved"]
+        "src.py",
+        "new.py",
+        symbols=["moved"],
+        header="_fake = evil()\n",
+        order=["moved"],
     )
     with pytest.raises(AssertionError):
         _apply(r, tmp_path)
