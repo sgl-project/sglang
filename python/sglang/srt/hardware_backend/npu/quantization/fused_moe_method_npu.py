@@ -1443,18 +1443,6 @@ class NPUMXFP8FusedMoEMethod(_NPUFusedMoEMethodBase):
             s2.transpose(1, 2), requires_grad=False
         )
 
-        import logging
-
-        _logger = logging.getLogger(__name__)
-        _logger.info(
-            "NPUMXFP8FusedMoEMethod: weights quantised — "
-            "w13 dtype=%s shape=%s, w2 dtype=%s shape=%s",
-            layer.w13_weight.dtype,
-            tuple(layer.w13_weight.shape),
-            layer.w2_weight.dtype,
-            tuple(layer.w2_weight.shape),
-        )
-
     def apply(
         self,
         layer: torch.nn.Module,
