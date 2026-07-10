@@ -19,6 +19,10 @@ from sglang.kernels.ops.attention.pad import (
 from sglang.kernels.ops.attention.pad import (
     unpad_draft_extend_output as unpad_draft_extend_output_triton,
 )
+from sglang.kernels.ops.attention.utils import (
+    concat_mla_absorb_q_general,
+    mla_quantize_and_rope_for_fp8,
+)
 from sglang.kernels.ops.kvcache.kv_indices import (
     create_flashmla_kv_indices_triton,
     get_num_kv_index_blocks_flashmla,
@@ -28,10 +32,6 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.flashinfer_mla_backend import (
     FlashInferMLAAttnBackend,
     FlashInferMLAMultiStepDraftBackend,
-)
-from sglang.srt.layers.attention.utils import (
-    concat_mla_absorb_q_general,
-    mla_quantize_and_rope_for_fp8,
 )
 from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode

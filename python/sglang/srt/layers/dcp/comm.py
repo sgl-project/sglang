@@ -24,6 +24,7 @@ from typing import Optional
 
 import torch
 
+from sglang.kernels.ops.attention.dcp_kernels import CPTritonContext, correct_attn_out
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -32,7 +33,6 @@ from sglang.srt.distributed.parallel_state import (
     get_dcp_group,
     get_dcp_group_no_assert,
 )
-from sglang.srt.layers.dcp.kernels import CPTritonContext, correct_attn_out
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_cuda
 

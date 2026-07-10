@@ -20,11 +20,11 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.layers.dcp.comm import dcp_enabled
-from sglang.srt.layers.dcp.kernels import (
+from sglang.kernels.ops.attention.dcp_kernels import (
     create_dcp_kv_indices,
     update_kv_lens_and_indices,
 )
+from sglang.srt.layers.dcp.comm import dcp_enabled
 from sglang.srt.layers.dcp.layout import update_local_kv_lens_for_dcp
 from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
 from sglang.srt.runtime_context import get_parallel, get_server_args

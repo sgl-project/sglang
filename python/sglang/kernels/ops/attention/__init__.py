@@ -41,3 +41,24 @@ for _mod, _fn in _TRITON_KERNELS:
 del _mod, _fn
 
 __all__ = []
+
+
+# Generic attention kernels migrated in Phase 2.5 (RFC #29630).
+for _mod, _fn in [
+    ("utils", "mla_quantize_and_rope_for_fp8"),
+    ("utils", "launch_reshape_and_cache_flash"),
+    ("utils", "launch_reshape_and_cache_shuffle_5d"),
+    ("flash_mla_sm120", "flash_mla_with_kvcache_sm120"),
+    ("dcp_kernels", "create_dcp_kv_indices"),
+    ("dcp_kernels", "correct_attn_out"),
+    ("pa_page_table", "_build_pa_page_table"),
+    ("nsa_triton_decode", "triton_sparse_attn_decode"),
+]:
+    register_kernel(
+        KernelSpec(
+            op=f"attention.{_fn.lstrip('_')}",
+            backend=KernelBackend.TRITON,
+            target=f"sglang.kernels.ops.attention.{_mod}:{_fn}",
+        )
+    )
+del _mod, _fn

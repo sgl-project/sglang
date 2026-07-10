@@ -38,7 +38,7 @@ def flash_mla_with_kvcache_entrypoint(backend: str, **kwargs):
         return dpsk_v4_fp8_attention_fwd(**kwargs)
 
     if backend == "triton":
-        from sglang.srt.layers.attention.nsa.triton_decode import (
+        from sglang.kernels.ops.attention.nsa_triton_decode import (
             triton_fp8_attention_fwd,
         )
 

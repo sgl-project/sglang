@@ -33,7 +33,7 @@ except ImportError:  # pragma: no cover - import-time guard mirrors aiter_backen
     pa_decode_gluon = None
     get_recommended_splits = None
 
-from sglang.srt.layers.attention.utils import launch_gather_shuffle_5d_to_linear
+from sglang.kernels.ops.attention.utils import launch_gather_shuffle_5d_to_linear
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
 
 if TYPE_CHECKING:
