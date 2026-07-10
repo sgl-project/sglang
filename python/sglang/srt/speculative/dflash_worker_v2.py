@@ -6,7 +6,6 @@ from typing import List, Optional
 import torch
 
 from sglang.srt.distributed import get_tp_group
-from sglang.srt.layers.dp_attention import get_attention_tp_group
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -33,6 +32,7 @@ from sglang.srt.speculative.dflash_utils import (
     is_dflash_sampling_verify_available,
     parse_dflash_draft_config,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     assign_req_to_token_pool_func,
@@ -163,7 +163,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         # runs its own draft, as in EAGLE3 + dp_attention.
         saved_server_args = get_global_server_args()
         _init_ctx = (
-            draft_tp_context(get_attention_tp_group())
+            draft_tp_context(get_parallel().attn_tp_group)
             if server_args.enable_dp_attention
             else empty_context()
         )
