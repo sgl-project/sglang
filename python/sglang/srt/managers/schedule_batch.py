@@ -2773,7 +2773,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens = self.seq_lens + 1
         self.seq_lens_cpu = self.seq_lens_cpu + 1
         self.orig_seq_lens = self.orig_seq_lens + 1
-        # Consumers recompute the sum from seq_lens_cpu when needed; ForwardBatch.init_new computes its own local sum.
+        # Sum is recomputed lazily by ForwardBatch.init_new.
         self.seq_lens_sum = None
 
         if self.hisparse_coordinator is not None:
@@ -2849,7 +2849,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens = self.seq_lens[keep_indices_device]
         self.orig_seq_lens = self.orig_seq_lens[keep_indices_device]
         self.out_cache_loc = None
-        # Consumers recompute the sum from seq_lens_cpu when needed; ForwardBatch.init_new computes its own local sum.
+        # Sum is recomputed lazily by ForwardBatch.init_new.
         self.seq_lens_sum = None
 
         if self.input_ids is not None:
@@ -2900,7 +2900,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens = torch.cat([self.seq_lens, other.seq_lens])
         self.orig_seq_lens = torch.cat([self.orig_seq_lens, other.orig_seq_lens])
         self.out_cache_loc = None
-        # Consumers recompute the sum from seq_lens_cpu when needed; ForwardBatch.init_new computes its own local sum.
+        # Sum is recomputed lazily by ForwardBatch.init_new.
         self.seq_lens_sum = None
         # Cat only when both sides hold a real token tensor; otherwise drop to
         # None and let resolve_forward_inputs rebuild from the merged

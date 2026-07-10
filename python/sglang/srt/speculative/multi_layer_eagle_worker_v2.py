@@ -274,17 +274,6 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         tree_mask_buf, position_buf = (
             self.target_worker.model_runner.attn_backend.get_verify_buffers_to_fill_after_draft()
         )
-
-        seq_lens_sum = batch.seq_lens_sum
-        if seq_lens_sum is None:
-            if batch.seq_lens_cpu is not None:
-                seq_lens_sum = int(batch.seq_lens_cpu.sum())
-            else:
-                max_context_len = (
-                    self.target_worker.model_runner.attn_backend.max_context_len
-                )
-                seq_lens_sum = batch.seq_lens.shape[0] * max_context_len
-
         (
             tree_mask,
             position,
@@ -298,7 +287,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             top_scores_index,
             draft_tokens,
             batch.seq_lens,
-            seq_lens_sum,
+            batch.seq_lens_sum,
             self.topk,
             self.speculative_num_steps,
             self.speculative_num_draft_tokens,
