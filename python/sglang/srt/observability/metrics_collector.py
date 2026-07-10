@@ -572,6 +572,32 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         )
 
         # =================================================================
+        # MinFreeSlotsDelayer
+        # =================================================================
+        self.min_free_slots_delay_total = Counter(
+            name="sglang:min_free_slots_delay_total",
+            documentation="Total number of prefill admissions delayed by MinFreeSlotsDelayer.",
+            labelnames=labels.keys(),
+        )
+        self.min_free_slots_checks_total = Counter(
+            name="sglang:min_free_slots_checks_total",
+            documentation="Total number of MinFreeSlotsDelayer.should_delay checks.",
+            labelnames=labels.keys(),
+        )
+        self.min_free_slots_running_bs = Histogram(
+            name="sglang:min_free_slots_running_bs",
+            documentation="Histogram of running batch size at MinFreeSlotsDelayer check.",
+            labelnames=labels.keys(),
+            buckets=(0, 1, 2, 4, 8, 16, 32, 64, 128),
+        )
+        self.min_free_slots_allocatable = Histogram(
+            name="sglang:min_free_slots_allocatable",
+            documentation="Histogram of allocatable request slots at MinFreeSlotsDelayer check.",
+            labelnames=labels.keys(),
+            buckets=(0, 1, 2, 4, 8, 16, 32, 64, 128),
+        )
+
+        # =================================================================
         # Utilization
         # =================================================================
         self.utilization = Gauge(
@@ -1167,6 +1193,15 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
     def observe_future_map_resolve(self, latency_ms: float) -> None:
         self.num_future_map_resolve_total.labels(**self.labels).inc(1)
         self._log_histogram(self.future_map_relay_latency_ms, latency_ms)
+
+    def observe_min_free_slots_check(
+        self, *, running_bs: int, num_allocatable_reqs: int, delayed: bool
+    ) -> None:
+        self.min_free_slots_checks_total.labels(**self.labels).inc(1)
+        self._log_histogram(self.min_free_slots_running_bs, running_bs)
+        self._log_histogram(self.min_free_slots_allocatable, num_allocatable_reqs)
+        if delayed:
+            self.min_free_slots_delay_total.labels(**self.labels).inc(1)
 
     def observe_per_stage_req_latency(self, stage: str, latency: float) -> None:
         labels_with_stage = {**self.labels, "stage": stage}

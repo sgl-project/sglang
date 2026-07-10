@@ -904,7 +904,12 @@ class Scheduler(
         )
         if min_free_slots is not None:
             self.min_free_slots_delayer = MinFreeSlotsDelayer(
-                min_free_slots=min_free_slots
+                min_free_slots=min_free_slots,
+                metrics_collector=(
+                    self.metrics_collector
+                    if self.metrics_reporter.enable_metrics
+                    else None
+                ),
             )
         if not get_server_args().pp_max_micro_batch_size:
             get_server_args().override(
