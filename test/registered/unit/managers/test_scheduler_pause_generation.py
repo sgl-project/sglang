@@ -1,7 +1,8 @@
 import unittest
 from collections import deque
+from types import SimpleNamespace
 from typing import List, Optional
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -11,7 +12,10 @@ from sglang.test.test_utils import maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.managers.io_struct import PauseGenerationReqInput
+from sglang.srt.managers.io_struct import (
+    ContinueGenerationReqInput,
+    PauseGenerationReqInput,
+)
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.pool_stats_observer import PoolStats
@@ -38,6 +42,7 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
         scheduler.tree_cache.protected_size.return_value = 0
         scheduler.req_to_token_pool = MagicMock()
         scheduler.result_queue = deque()
+        scheduler.disaggregation_mode = DisaggregationMode.NULL
         # Support _kv_snap diagnostic logging in patched schedulers
         scheduler.token_to_kv_pool_allocator = MagicMock()
         scheduler.token_to_kv_pool_allocator.available_size.return_value = 1000
@@ -409,6 +414,50 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
 
         scheduler.process_batch_result.assert_called_once()
         self.assertEqual(len(scheduler.result_queue), 0)
+
+    def test_pd_decode_retract_requeues_for_rebootstrap(self):
+        """PD decode retract should rebootstrap instead of resuming stale CPU KV."""
+        scheduler = self._new_scheduler()
+        scheduler.disaggregation_mode = DisaggregationMode.DECODE
+        scheduler.last_batch = None
+        scheduler._add_request_to_queue = MagicMock()
+        scheduler.disagg_decode_prealloc_queue = MagicMock()
+
+        req = SimpleNamespace(
+            finished=lambda: False,
+            output_ids=[10, 11, 12],
+            time_stats=MagicMock(),
+        )
+        scheduler.running_batch.reqs = [req]
+
+        with patch("sglang.srt.managers.scheduler.retract_all") as mock_retract_all:
+            scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
+
+        scheduler._add_request_to_queue.assert_not_called()
+        scheduler.disagg_decode_prealloc_queue.hold_rebootstrap.assert_called_once_with(
+            req
+        )
+        self.assertEqual(req.output_ids, [10, 11])
+        self.assertEqual(req.pd_rebootstrap_forced_output_id, 12)
+        self.assertTrue(req.pd_rebootstrap_in_progress)
+        # Rebootstrap recomputes the KV from the prefill, so the retract must skip
+        # the device->host KV offload rather than offload-then-delete it.
+        mock_retract_all.assert_called_once()
+        self.assertEqual(mock_retract_all.call_args.kwargs["offload_kv"], False)
+
+    def test_pd_decode_continue_releases_held_rebootstrap(self):
+        """continue_generation must enqueue staged rebootstrap reqs on resume."""
+        scheduler = self._new_scheduler()
+        scheduler.disaggregation_mode = DisaggregationMode.DECODE
+        scheduler.disagg_decode_prealloc_queue = MagicMock()
+        scheduler._engine_paused = True
+
+        scheduler.continue_generation(
+            ContinueGenerationReqInput(torch_empty_cache=False)
+        )
+
+        scheduler.disagg_decode_prealloc_queue.enqueue_held_rebootstrap.assert_called_once_with()
+        self.assertFalse(scheduler._engine_paused)
 
 
 if __name__ == "__main__":

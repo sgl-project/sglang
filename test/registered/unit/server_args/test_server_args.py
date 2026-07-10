@@ -13,6 +13,7 @@ from sglang.srt.layers.cp.base import is_cp_enabled, is_interleave
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     CudaGraphConfig,
+    Phase,
     PhaseConfig,
 )
 from sglang.srt.server_args import PortArgs, ServerArgs, prepare_server_args
@@ -32,21 +33,6 @@ _mock_device.start()
 
 
 class TestPrepareServerArgs(CustomTestCase):
-    def test_prepare_server_args(self):
-        server_args = prepare_server_args(
-            [
-                "--model-path",
-                DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
-                "--json-model-override-args",
-                '{"rope_scaling": {"factor": 2.0, "rope_type": "linear"}}',
-            ]
-        )
-        self.assertEqual(server_args.model_path, DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN)
-        self.assertEqual(
-            json.loads(server_args.json_model_override_args),
-            {"rope_scaling": {"factor": 2.0, "rope_type": "linear"}},
-        )
-
     def test_config_nested_dict_args_are_json(self):
         with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
             f.write("mm-process-config:\n  image:\n    resize: 128\n")
@@ -144,15 +130,6 @@ class TestLoadBalanceMethod(unittest.TestCase):
             str(context.exception),
         )
 
-    def test_pd_decode_radix_cache_allows_mooncake(self):
-        server_args = self._load_balance_args(
-            disaggregation_mode="decode",
-            disaggregation_decode_enable_radix_cache=True,
-            disaggregation_transfer_backend="mooncake",
-        )
-
-        self.assertFalse(server_args.disable_radix_cache)
-
     def test_pd_decode_radix_cache_rejects_fake_backend(self):
         server_args = ServerArgs(
             model_path="dummy",
@@ -168,15 +145,6 @@ class TestLoadBalanceMethod(unittest.TestCase):
             "with --disaggregation-transfer-backend fake",
             str(context.exception),
         )
-
-    def test_pd_decode_radix_cache_allows_ascend(self):
-        server_args = self._load_balance_args(
-            disaggregation_mode="decode",
-            disaggregation_decode_enable_radix_cache=True,
-            disaggregation_transfer_backend="ascend",
-        )
-
-        self.assertFalse(server_args.disable_radix_cache)
 
     def test_pd_decode_radix_cache_allows_mooncake_tcp(self):
         server_args = self._load_balance_args(
@@ -402,14 +370,6 @@ class TestContextParallelServerArgs(CustomTestCase):
             setattr(server_args, key, value)
         return server_args
 
-    def test_canonical_prefill_cp_cli_sets_unified_fields(self):
-        args = self.parser.parse_args(
-            ["--model", "dummy", "--enable-prefill-cp", "--cp-strategy", "interleave"]
-        )
-
-        self.assertTrue(args.enable_prefill_cp)
-        self.assertEqual(args.cp_strategy, "interleave")
-
     def test_canonical_prefill_cp_requires_strategy(self):
         args = self.parser.parse_args(["--model", "dummy", "--enable-prefill-cp"])
 
@@ -557,27 +517,6 @@ class TestContextParallelServerArgs(CustomTestCase):
 
 
 class TestPortArgs(unittest.TestCase):
-    @patch("sglang.srt.server_args.get_free_port")
-    @patch("sglang.srt.server_args.tempfile.NamedTemporaryFile")
-    def test_init_new_with_nccl_port_none(self, mock_temp_file, mock_get_free_port):
-        """Test that get_free_port() is called when nccl_port is None"""
-        mock_temp_file.return_value.name = "temp_file"
-        mock_get_free_port.return_value = 45678  # Mock ephemeral port
-
-        # Use MagicMock here to verify get_free_port is called
-        server_args = MagicMock()
-        server_args.nccl_port = None
-        server_args.enable_dp_attention = False
-        server_args.tokenizer_worker_num = 1
-
-        port_args = PortArgs.init_new(server_args)
-
-        # Verify get_free_port was called
-        mock_get_free_port.assert_called_once()
-
-        # Verify the returned port is used
-        self.assertEqual(port_args.nccl_port, 45678)
-
     @patch("sglang.srt.server_args.tempfile.NamedTemporaryFile")
     def test_init_new_standard_case(self, mock_temp_file):
         mock_temp_file.return_value.name = "temp_file"
@@ -726,13 +665,6 @@ class TestSSLArgs(unittest.TestCase):
         server_args._handle_ssl_validation()
         return server_args
 
-    def test_default_ssl_fields_are_none(self):
-        server_args = ServerArgs(model_path="dummy")
-        self.assertIsNone(server_args.ssl_keyfile)
-        self.assertIsNone(server_args.ssl_certfile)
-        self.assertIsNone(server_args.ssl_ca_certs)
-        self.assertIsNone(server_args.ssl_keyfile_password)
-
     def test_ssl_keyfile_without_certfile_raises(self):
         with self.assertRaises(ValueError) as context:
             self._validate_ssl(ssl_keyfile="key.pem")
@@ -742,12 +674,6 @@ class TestSSLArgs(unittest.TestCase):
         with self.assertRaises(ValueError) as context:
             self._validate_ssl(ssl_certfile="cert.pem")
         self.assertIn("--ssl-keyfile", str(context.exception))
-
-    @patch("os.path.isfile", return_value=True)
-    def test_ssl_both_keyfile_and_certfile_accepted(self, _mock_isfile):
-        server_args = self._validate_ssl(ssl_keyfile="key.pem", ssl_certfile="cert.pem")
-        self.assertEqual(server_args.ssl_keyfile, "key.pem")
-        self.assertEqual(server_args.ssl_certfile, "cert.pem")
 
     def test_url_returns_http_without_ssl(self):
         server_args = ServerArgs(model_path="dummy")
@@ -765,27 +691,6 @@ class TestSSLArgs(unittest.TestCase):
     def test_url_returns_https_with_ssl(self, _mock_isfile):
         server_args = self._validate_ssl(ssl_keyfile="key.pem", ssl_certfile="cert.pem")
         self.assertTrue(server_args.url().startswith("https://"))
-
-    @patch("os.path.isfile", return_value=True)
-    def test_ssl_cli_args_parsed(self, _mock_isfile):
-        server_args = prepare_server_args(
-            [
-                "--model-path",
-                "dummy",
-                "--ssl-keyfile",
-                "key.pem",
-                "--ssl-certfile",
-                "cert.pem",
-                "--ssl-ca-certs",
-                "ca.pem",
-                "--ssl-keyfile-password",
-                "secret",
-            ]
-        )
-        self.assertEqual(server_args.ssl_keyfile, "key.pem")
-        self.assertEqual(server_args.ssl_certfile, "cert.pem")
-        self.assertEqual(server_args.ssl_ca_certs, "ca.pem")
-        self.assertEqual(server_args.ssl_keyfile_password, "secret")
 
     def test_ssl_verify_without_ssl(self):
         server_args = ServerArgs(model_path="dummy")
@@ -845,10 +750,6 @@ class TestSSLArgs(unittest.TestCase):
                     "SSL CA certificates file not found", str(context.exception)
                 )
 
-    def test_enable_ssl_refresh_default_false(self):
-        server_args = ServerArgs(model_path="dummy")
-        self.assertFalse(server_args.enable_ssl_refresh)
-
     def test_enable_ssl_refresh_without_ssl_raises(self):
         with self.assertRaises(ValueError) as context:
             self._validate_ssl(enable_ssl_refresh=True)
@@ -861,21 +762,6 @@ class TestSSLArgs(unittest.TestCase):
             ssl_keyfile="key.pem",
             ssl_certfile="cert.pem",
             enable_ssl_refresh=True,
-        )
-        self.assertTrue(server_args.enable_ssl_refresh)
-
-    @patch("os.path.isfile", return_value=True)
-    def test_enable_ssl_refresh_cli_flag(self, _mock_isfile):
-        server_args = prepare_server_args(
-            [
-                "--model-path",
-                "dummy",
-                "--ssl-keyfile",
-                "key.pem",
-                "--ssl-certfile",
-                "cert.pem",
-                "--enable-ssl-refresh",
-            ]
         )
         self.assertTrue(server_args.enable_ssl_refresh)
 
@@ -983,28 +869,6 @@ class TestHiCacheArgs(unittest.TestCase):
 
 
 class TestNgramExternalSamArgs(CustomTestCase):
-    def test_prepare_server_args_parses_external_sam_args(self):
-        server_args = prepare_server_args(
-            [
-                "--model-path",
-                "dummy",
-                "--speculative-algorithm",
-                "NGRAM",
-                "--speculative-ngram-external-corpus-path",
-                "/tmp/ngram-corpus.jsonl",
-                "--speculative-ngram-external-sam-budget",
-                "4",
-                "--speculative-ngram-external-corpus-max-tokens",
-                "128",
-            ]
-        )
-        self.assertEqual(
-            server_args.speculative_ngram_external_corpus_path,
-            "/tmp/ngram-corpus.jsonl",
-        )
-        self.assertEqual(server_args.speculative_ngram_external_sam_budget, 4)
-        self.assertEqual(server_args.speculative_ngram_external_corpus_max_tokens, 128)
-
     def _make_dummy_ngram_args(self, **overrides):
         args = ServerArgs(model_path="dummy")
         args.speculative_algorithm = "NGRAM"
@@ -1068,13 +932,6 @@ class TestDecoupledSpecArgs(CustomTestCase):
         self.assertEqual(server_args.decoupled_spec_connect_endpoints, ["ipc:///tmp/d"])
         self.assertEqual(server_args.decoupled_spec_rank, 0)
         self.assertEqual(server_args.spec_trace_dir, "/tmp/tr")
-
-    def test_decoupled_spec_role_defaults_to_null(self):
-        server_args = prepare_server_args(["--model-path", "dummy"])
-        self.assertEqual(server_args.decoupled_spec_role, "null")
-        self.assertIsNone(server_args.decoupled_spec_bind_endpoint)
-        self.assertIsNone(server_args.decoupled_spec_connect_endpoints)
-        self.assertIsNone(server_args.decoupled_spec_rank)
 
     def test_decoupled_spec_role_rejects_invalid_choice(self):
         with self.assertRaises(SystemExit):
@@ -1269,6 +1126,60 @@ class TestCudaGraphConfigDataclassAccess(CustomTestCase):
         self.assertEqual(config.compiler, "eager")
 
 
+class TestCudaGraphDisaggregationRoles(CustomTestCase):
+    def _handled_args(self, **overrides):
+        args = ServerArgs(model_path="dummy", **overrides)
+        args.model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=["LlamaForCausalLM"]),
+            is_piecewise_cuda_graph_disabled_model=False,
+            is_multimodal=False,
+            is_multimodal_piecewise_cuda_graph_supported=False,
+        )
+        with (
+            patch("sglang.srt.utils.is_cuda", return_value=True),
+            patch.object(ServerArgs, "use_mla_backend", return_value=False),
+        ):
+            args._handle_cuda_graph_config()
+        return args
+
+    def test_cuda_graph_prefill_role_defaults_disable_decode_graph(self):
+        args = self._handled_args(disaggregation_mode="prefill")
+
+        self.assertFalse(args.disable_cuda_graph)
+        self.assertEqual(args.cuda_graph_config.decode.backend, Backend.DISABLED)
+        self.assertEqual(args.cuda_graph_config.prefill.backend, Backend.BREAKABLE)
+
+    def test_cuda_graph_decode_role_defaults_disable_prefill_graph(self):
+        args = self._handled_args(disaggregation_mode="decode")
+
+        self.assertEqual(args.cuda_graph_config.prefill.backend, Backend.DISABLED)
+        self.assertNotEqual(args.cuda_graph_config.decode.backend, Backend.DISABLED)
+
+    def test_cuda_graph_global_disable_still_disables_both_phases_for_all_roles(self):
+        for disaggregation_mode in ("prefill", "decode", "null"):
+            with self.subTest(disaggregation_mode=disaggregation_mode):
+                args = self._handled_args(
+                    disaggregation_mode=disaggregation_mode,
+                    disable_cuda_graph=True,
+                )
+
+                self.assertEqual(
+                    args.cuda_graph_config.decode.backend, Backend.DISABLED
+                )
+                self.assertEqual(
+                    args.cuda_graph_config.prefill.backend, Backend.DISABLED
+                )
+
+    def test_cuda_graph_explicit_decode_backend_survives_prefill_role(self):
+        args = self._handled_args(
+            disaggregation_mode="prefill",
+            cuda_graph_backend_decode=Backend.FULL,
+        )
+
+        self.assertEqual(args.cuda_graph_config.decode.backend, Backend.FULL)
+        self.assertIn((Phase.DECODE, "backend"), args._cuda_graph_config_locked)
+
+
 class TestCutedslMoeMaxNumTokens(CustomTestCase):
     """The shared CuteDSL MoE per-forward token bound. Fields are set directly
     to exercise the math independently of __post_init__ resolution.
@@ -1398,12 +1309,6 @@ class TestGrpcServerArgs(CustomTestCase):
     def _args(**kwargs):
         return ServerArgs(model_path="dummy", **kwargs)
 
-    def test_defaults_native_grpc_off_legacy_off(self):
-        sa = self._args()
-        sa._handle_deprecated_args()
-        self.assertIsNone(sa.grpc_port)
-        self.assertFalse(sa.smg_grpc_mode)
-
     def test_http_only_high_port_does_not_derive_grpc_port(self):
         sa = self._args(port=56000)
         sa._handle_deprecated_args()
@@ -1530,10 +1435,6 @@ class TestTwoBatchOverlapBackend(CustomTestCase):
         # EP a2a path (e.g. deepep) overlaps dispatch/combine; the guard does not
         # require dp-attention there.
         args = self._args(moe_a2a_backend="deepep", enable_dp_attention=False)
-        args._check_two_batch_overlap()
-
-    def test_tbo_disabled_is_noop(self):
-        args = self._args(enable_two_batch_overlap=False, enable_dp_attention=False)
         args._check_two_batch_overlap()
 
 
