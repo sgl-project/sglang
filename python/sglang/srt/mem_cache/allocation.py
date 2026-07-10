@@ -27,12 +27,23 @@ from sglang.srt.mem_cache.common import (
 )
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.runtime_context import get_server_args
-from sglang.srt.utils import is_cuda, is_hip, is_npu, next_power_of_2, support_triton
+from sglang.srt.utils import (
+    is_cpu,
+    is_cuda,
+    is_hip,
+    is_npu,
+    next_power_of_2,
+    support_triton,
+)
 from sglang.srt.utils.common import is_pin_memory_available
 
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_cuda = is_cuda()
+_is_cpu = is_cpu()
+
+if _is_cpu:
+    from sgl_kernel import assign_req_to_token_pool_cpu
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
@@ -363,6 +374,14 @@ def alloc_for_extend(
             batch.seq_lens_cpu,
         )
 
+    from sglang.srt.managers.schedule_batch import ReqKvInfo
+
+    for req, seq_len in zip(batch.reqs, batch.seq_lens_cpu.tolist()):
+        if req.kv is None:
+            req.kv = ReqKvInfo(kv_allocated_len=seq_len, swa_evicted_seqlen=0)
+        else:
+            req.kv.kv_allocated_len = seq_len
+
     return out_cache_loc, req_pool_indices_device, req_pool_indices_cpu
 
 
@@ -468,6 +487,9 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
             batch.seq_lens_cpu + token_per_req,
             token_per_req,
         )
+
+    for req in batch.reqs:
+        req.kv.kv_allocated_len += token_per_req
 
     return out_cache_loc
 

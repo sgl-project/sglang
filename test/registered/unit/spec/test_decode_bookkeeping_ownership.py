@@ -50,32 +50,36 @@ _OWNER_SITES = {
     # non-spec scheduler
     (_SB, "ScheduleBatch.prepare_for_decode", "decode_batch_idx"): 1,
     (_SB, "ScheduleBatch.prepare_for_decode", "kv_committed_len"): 1,
-    (_SB, "ScheduleBatch.prepare_for_decode", "kv_allocated_len"): 1,
     (_SB, "ScheduleBatch.prepare_for_extend", "extend_batch_idx"): 1,
     (_SB, "ScheduleBatch.prepare_for_extend", "kv_committed_len"): 1,
-    (_SB, "ScheduleBatch.prepare_for_extend", "kv_allocated_len"): 1,
+    # kv_allocated_len is settled inside the owned-kv alloc functions (op28).
     ("mem_cache/allocation.py", "alloc_for_extend", "evict"): 1,
+    ("mem_cache/allocation.py", "alloc_for_extend", "kv_allocated_len"): 1,
     ("mem_cache/allocation.py", "alloc_for_decode", "evict"): 1,
+    ("mem_cache/allocation.py", "alloc_for_decode", "kv_allocated_len"): 1,
     # spec v2: no pre-claim; resolve commits the full accepted run uniformly.
+    # kv_allocated_len for spec v2 draft decode (eagle + dflash) is settled
+    # inside the owned-kv alloc_for_spec_decode function (op42).
     (*_EAGLE_DECODE, "decode_batch_idx"): 1,
     (*_EAGLE_DECODE, "evict"): 1,
-    (*_EAGLE_DECODE, "kv_allocated_len"): 1,
-    (*_RESOLVE, "kv_committed_len"): 1,
-    (*_RESOLVE, "spec_verify_ct"): 1,
     (
-        "speculative/dflash_info_v2.py",
-        "DFlashDraftInputV2.prepare_for_decode",
+        "mem_cache/allocation.py",
+        "alloc_for_spec_decode",
         "kv_allocated_len",
     ): 1,
-    # disaggregation decode prealloc
+    (*_RESOLVE, "kv_committed_len"): 1,
+    (*_RESOLVE, "spec_verify_ct"): 1,
+    # disaggregation decode prealloc: kv_allocated_len is settled inside the
+    # owned-kv alloc_for_decode_prealloc(_hisparse) functions (op42).
     (
         "disaggregation/decode.py",
         "DecodePreallocQueue._pre_alloc",
         "kv_committed_len",
     ): 1,
+    ("disaggregation/decode.py", "alloc_for_decode_prealloc", "kv_allocated_len"): 1,
     (
         "disaggregation/decode.py",
-        "DecodePreallocQueue._pre_alloc",
+        "alloc_for_decode_prealloc_hisparse",
         "kv_allocated_len",
     ): 1,
     # streaming session slot save/restore and tail trimming
