@@ -16,6 +16,10 @@
 Enabled via the ``SGLANG_ENABLE_NVTX`` environment variable (off by default).
 When disabled, the decorator/context manager add zero runtime overhead so they
 are safe to leave on hot scheduler paths.
+
+Extended by JoyFuture: added markers for the overlap event loop, running batch
+update, and prefill batch selection so the full scheduler pipeline is visible
+in Nsight Systems.
 """
 
 import logging
@@ -50,6 +54,11 @@ _NVTX_COLOR_MAP = {
     "scheduler.get_next_batch_to_run": "green",
     "scheduler.run_batch": "red",
     "scheduler.process_batch_result": "cyan",
+    # === Extended markers (JoyFuture) ===
+    "scheduler.event_loop_normal": "dark_blue",
+    "scheduler.event_loop_overlap": "teal",
+    "scheduler.update_running_batch": "orange",
+    "scheduler.get_new_batch_prefill": "magenta",
 }
 
 

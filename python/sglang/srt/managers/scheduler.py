@@ -1468,6 +1468,7 @@ class Scheduler(
             dispatch_event_loop(self)
 
     @DynamicGradMode()
+    @nvtx_annotated_method("scheduler.event_loop_normal")
     def event_loop_normal(self):
         """A normal scheduler loop."""
         while True:
@@ -1495,6 +1496,7 @@ class Scheduler(
                 self.invariant_checker.self_check_during_busy()
 
     @DynamicGradMode()
+    @nvtx_annotated_method("scheduler.event_loop_overlap")
     def event_loop_overlap(self):
         """A scheduler loop that overlaps the CPU processing and GPU computation."""
         self.result_queue: Deque[
@@ -2609,6 +2611,7 @@ class Scheduler(
             prefill_refill_target=self.dflash_prefill_refill_target,
         )
 
+    @nvtx_annotated_method("scheduler.get_new_batch_prefill")
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
         prefill_delayer_single_pass = None
         if self.prefill_delayer:
@@ -2902,6 +2905,7 @@ class Scheduler(
                 new_lora_set
             )
 
+    @nvtx_annotated_method("scheduler.update_running_batch")
     def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
         """Update the current running decoding batch."""
         initial_bs = batch.batch_size()
