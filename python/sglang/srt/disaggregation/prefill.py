@@ -924,10 +924,25 @@ class SchedulerDisaggregationPrefillMixin:
                 idx: poll for (idx, _), poll in zip(optimistic_reqs, polls)
             }
 
-        for i, (req, next_token_id) in enumerate(
-            zip(batch.reqs, next_token_ids, strict=True)
-        ):
+        full_batch_next_tokens = len(next_token_ids) == len(batch.reqs)
+        compact_next_token_pt = 0
+        for i, req in enumerate(batch.reqs):
             if req.inflight_middle_chunks <= 0:
+                if full_batch_next_tokens:
+                    next_token_id = next_token_ids[i]
+                else:
+                    if compact_next_token_pt >= len(next_token_ids):
+                        raise RuntimeError(
+                            "Disagg prefill PP output token count mismatch: "
+                            f"num_reqs={len(batch.reqs)}, "
+                            f"num_next_token_ids={len(next_token_ids)}, "
+                            f"consumed_next_token_ids={compact_next_token_pt}, "
+                            f"rids={[req.rid for req in batch.reqs]}, "
+                            "inflight_middle_chunks="
+                            f"{[req.inflight_middle_chunks for req in batch.reqs]}"
+                        )
+                    next_token_id = next_token_ids[compact_next_token_pt]
+                    compact_next_token_pt += 1
                 req.time_stats.set_prefill_finished_time()
 
                 # For optimistic requests, check bootstrap before side effects
@@ -1026,6 +1041,20 @@ class SchedulerDisaggregationPrefillMixin:
                     ), f"Req {req.rid} does not have metadata buffer allocated"
                     self.send_kv_chunk(req, last_chunk=False, end_idx=req.tmp_end_idx)
                 req.time_stats.set_last_chunked_prefill_finish_time()
+
+        if (
+            not full_batch_next_tokens
+            and compact_next_token_pt != len(next_token_ids)
+        ):
+            raise RuntimeError(
+                "Disagg prefill PP output has unused compact next tokens: "
+                f"num_reqs={len(batch.reqs)}, "
+                f"num_next_token_ids={len(next_token_ids)}, "
+                f"consumed_next_token_ids={compact_next_token_pt}, "
+                f"rids={[req.rid for req in batch.reqs]}, "
+                "inflight_middle_chunks="
+                f"{[req.inflight_middle_chunks for req in batch.reqs]}"
+            )
 
         can_run_cuda_graph = result.can_run_cuda_graph
         self.metrics_reporter.report_prefill_stats(
