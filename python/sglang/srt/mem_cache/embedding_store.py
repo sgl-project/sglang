@@ -116,7 +116,9 @@ class FileEmbeddingStore(EmbeddingStore):
                         f"Failed to remove stale embedding cache file {entry.path}"
                     )
         if removed:
-            logger.info(f"Cleared {removed} embedding cache files from {self.storage_dir}")
+            logger.info(
+                f"Cleared {removed} embedding cache files from {self.storage_dir}"
+            )
 
     def _put_buffers(self, h: str, ptrs: List[int], sizes: List[int]) -> bool:
         path = self._path_for_key(self.get_key(h))
