@@ -222,7 +222,8 @@ uninstall_stale_flashinfer() {
     # - flashinfer-cubin: 150+ MB
     # - flashinfer-jit-cache: 1.2+ GB
     FLASHINFER_PYTHON_REQUIRED=$(grep -Po -m1 'flashinfer_python(\[[^]]+\])?==\K[0-9A-Za-z\.\-]+' python/pyproject.toml || echo "")
-    FLASHINFER_CUBIN_REQUIRED=$(grep -Po -m1 'flashinfer_cubin(\[[^]]+\])?==\K[0-9A-Za-z\.\-]+' python/pyproject.toml || echo "")
+    # flashinfer-cubin is no longer a pyproject dependency (installed explicitly below), tracks the same version as flashinfer_python
+    FLASHINFER_CUBIN_REQUIRED="$FLASHINFER_PYTHON_REQUIRED"
     FLASHINFER_CUBIN_INSTALLED=$(pip show flashinfer-cubin 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "")
     FLASHINFER_JIT_INSTALLED=$(pip show flashinfer-jit-cache 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed 's/+.*//' || echo "")
     FLASHINFER_JIT_CU_VERSION=$(pip show flashinfer-jit-cache 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed -n 's/.*+//p' || echo "")
@@ -367,6 +368,17 @@ install_sglang_kernel() {
 install_sglang_router() {
     $PIP_CMD install sglang-router $PIP_INSTALL_SUFFIX
     $PIP_CMD list
+
+    mark_step_done "${FUNCNAME[0]}"
+}
+
+install_flashinfer_cubin() {
+    if [ "$UNINSTALL_CUBIN" = false ]; then
+        echo "flashinfer-cubin==${FLASHINFER_CUBIN_REQUIRED} already installed, skipping install"
+    else
+        # flashinfer-cubin is CUDA-version-agnostic, unlike jit-cache, so its index-url has no cu${CU_VERSION} suffix
+        $PIP_CMD install "flashinfer-cubin==${FLASHINFER_CUBIN_REQUIRED}" --index-url https://flashinfer.ai/whl $PIP_INSTALL_SUFFIX
+    fi
 
     mark_step_done "${FUNCNAME[0]}"
 }
@@ -583,6 +595,7 @@ main() {
     fi
     install_sglang_kernel
     install_sglang_router
+    install_flashinfer_cubin
     download_flashinfer_cache
     force_reinstall_cutlass_dsl_libs_cu13
     stabilize_flashinfer_jit_paths
