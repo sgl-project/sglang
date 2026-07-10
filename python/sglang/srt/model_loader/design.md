@@ -305,6 +305,76 @@ welcome; add mapping unit tests and a manual or CI equiv test where a small chec
 
 ---
 
+## Parallel development
+
+### Hard gate
+
+**PR1 only.** All other PRs need the core stack (`auto_loader.py`, `WeightLoadResult`, dispatch
+tables, env gate, `qwen2.py` reference pattern). Downstream branches should stack on PR1 until it
+merges.
+
+### Parallel after PR1 merges
+
+These tracks can be owned by different people at the same time if they touch **disjoint model
+files** and coordinate **shared infra** (`auto_loader.py`, `deepseek_weight_loader.py`):
+
+| Track | PR | Parallel-safe because |
+|-------|-----|----------------------|
+| Dense bulk | PR2 (~40 files) | Mechanical `stacked_params_mapping` only; no file overlap with PR3/5/6/7 |
+| MoE bulk | PR3 (~22 files) | Standard `ExpertParamsDispatch`; disjoint model list from PR2 |
+| MLA / DeepSeek V2 | PR4 (~5 files) | Own mixin + `post_load_weights`; small isolated file set |
+| Qwen3.5 fused ckpt | PR5 (`qwen3_5.py`) | Single file; adds `FusedExpertDispatch` in `auto_loader.py` |
+| Qwen3-Next hybrid | PR6 (`qwen3_next.py`) | Single file; mamba + MoE submodule loaders |
+| DeepSeek V4 | PR7 (`deepseek_v4.py`) | Single file; mostly self-contained bespoke loader |
+
+**Suggested wave 1 (max parallelism):** PR2 + PR3 + PR4 + PR5 + PR6 in parallel.
+
+PR7 can start with wave 1 but **reuses PR4 `post_load_weights` protocol** — easiest stacked on
+PR4 or merged after PR4.
+
+### Sequential / later
+
+| PR | Waits on | Reason |
+|----|----------|--------|
+| PR8 (MM ~25) | PR2 + PR3 (text trunk); PR5 for VL-MoE fused experts | Trunk uses dense/MoE walker; VL-MoE needs `FusedExpertDispatch` |
+| PR9 (wrappers ~35) | Parent model PR per wrapper | No new loader logic; smoke once parent is migrated |
+
+PR9 is highly parallel **within itself** once parents land (e.g. Qwen wrappers after PR2/5/6,
+DeepSeek wrappers after PR4/7).
+
+### Within-PR parallelism
+
+| PR | How to split |
+|----|--------------|
+| PR2 | By family: Llama/Mistral, Gemma, Qwen3, GLM, encoders — ~8–10 independent slices |
+| PR3 | One file per model — embarrassingly parallel |
+| PR8 | Per tower / per VL model |
+| PR9 | Per wrapper file — parallel once parent merges |
+
+### Infra conflict hotspots
+
+Serialize or pair-review when multiple tracks touch the same file:
+
+- `auto_loader.py` — PR5 adds `FusedExpertDispatch`; PR3/PR4 may extend expert/remap behavior
+- `deepseek_common/deepseek_weight_loader.py` — PR4 refactors mixin; PR7 may touch shared patterns
+- PR2 cherry-picks from brayden branch — one owner for conflict resolution, then parallel model files
+
+### Suggested merge order
+
+```
+PR1 (merge)
+    ├─ PR2  ─┐
+    ├─ PR3  ─┼─ wave 1 (parallel)
+    ├─ PR4  ─┤
+    ├─ PR5  ─┤
+    └─ PR6  ─┘
+         ├─ PR7 (stack on PR4)
+         ├─ PR8 (after PR2 + PR3; VL-MoE after PR5)
+         └─ PR9 (sharded by parent; ongoing as parents land)
+```
+
+---
+
 ## Checklist
 
 - [ ] PR1: infra + post_load protocol + `qwen2.py` + `transformers.py` (walker)
