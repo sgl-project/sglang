@@ -1506,11 +1506,11 @@ class ChunkSizePredictor:
     def set_target_latency(self, base_chunk_size: int):
         """Set target latency based on base chunk size: target = f(base_chunk_size) - f(0)."""
 
-        def f(l: float) -> float:
-            """Total latency function: f(l) = al^2 + bl + c (or bl + c for linear)"""
+        def f(length: float) -> float:
+            """Total latency function: f(length) = a*length^2 + b*length + c."""
             return (
-                self.quadratic_coeff_a * l * l
-                + self.linear_coeff_b * l
+                self.quadratic_coeff_a * length * length
+                + self.linear_coeff_b * length
                 + self.constant_coeff_c
             )
 
