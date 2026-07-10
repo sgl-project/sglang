@@ -1,6 +1,11 @@
+from typing import Optional
+
 import torch
 
-from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.base import (
+    BaseTokenToKVPoolAllocator,
+    expand_page_ids_to_token_ids,
+)
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
@@ -174,6 +179,66 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             and num_swa_pages
             <= self.swa_attn_allocator.available_size() // self.page_size
         )
+
+    def alloc_pages(self, num_pages: int) -> Optional[torch.Tensor]:
+        assert self.page_size > 1
+
+        if not self.new_pages_available(num_pages, num_pages):
+            return None
+
+        full_pages = self.full_attn_allocator.alloc_pages(num_pages)
+        swa_pages = self.swa_attn_allocator.alloc_pages(num_pages)
+        assert full_pages is not None
+        assert swa_pages is not None
+
+        # Whole-page mapping write: in-page reuse of an already-allocated page
+        # keeps the mapping written when that page was first allocated, so no
+        # per-step mapping update is needed on the alloc_pages path.
+        self.set_full_to_swa_mapping(
+            expand_page_ids_to_token_ids(full_pages, self.page_size),
+            expand_page_ids_to_token_ids(swa_pages, self.page_size),
+        )
+        return full_pages
+
+    def alloc_pages_swa_tail(
+        self, num_full_pages: int, swa_tail_len: int, fill_len: int
+    ) -> Optional[torch.Tensor]:
+        """Page-granular reformulation of ``alloc_extend_swa_tail`` (bs=1):
+        allocate ``num_full_pages`` full pages for the whole fill and SWA pages
+        only for the ``swa_tail_len``-token tail ending at ``fill_len``. Only
+        the full tokens at positions [fill_len - swa_tail_len, fill_len) map to
+        the swa tokens [0, swa_tail_len); the head and the page-alignment
+        padding [fill_len, num_full_pages * page_size) get mapping 0.
+        Returns full page ids.
+        """
+        assert self.page_size > 1
+        assert 0 <= swa_tail_len <= fill_len <= num_full_pages * self.page_size
+
+        num_swa_pages = (swa_tail_len + self.page_size - 1) // self.page_size
+        if not self.new_pages_available(num_full_pages, num_swa_pages):
+            return None
+
+        full_pages = self.full_attn_allocator.alloc_pages(num_full_pages)
+        assert full_pages is not None
+
+        if swa_tail_len == 0:
+            return full_pages
+
+        swa_pages = self.swa_attn_allocator.alloc_pages(num_swa_pages)
+        assert swa_pages is not None
+
+        full_tokens = expand_page_ids_to_token_ids(full_pages, self.page_size)
+        swa_tokens = expand_page_ids_to_token_ids(swa_pages, self.page_size)
+        swa_tail_start = fill_len - swa_tail_len
+        self.set_full_to_swa_mapping(
+            full_tokens[swa_tail_start:fill_len], swa_tokens[:swa_tail_len]
+        )
+        non_tail_full_tokens = torch.cat(
+            [full_tokens[:swa_tail_start], full_tokens[fill_len:]]
+        )
+        if non_tail_full_tokens.numel() > 0:
+            self.full_to_swa_index_mapping[non_tail_full_tokens.to(torch.int64)] = 0
+        return full_pages
 
     def alloc_extend(
         self,
@@ -510,6 +575,18 @@ class PureSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         )
 
     def alloc_extend_swa_tail(self, *args, **kwargs):
+        raise NotImplementedError(
+            "PureSWATokenToKVPoolAllocator does not support page_size > 1."
+        )
+
+    def alloc_pages(self, num_pages: int):
+        raise NotImplementedError(
+            "PureSWATokenToKVPoolAllocator does not support page_size > 1."
+        )
+
+    def alloc_pages_swa_tail(
+        self, num_full_pages: int, swa_tail_len: int, fill_len: int
+    ):
         raise NotImplementedError(
             "PureSWATokenToKVPoolAllocator does not support page_size > 1."
         )
