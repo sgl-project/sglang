@@ -27,6 +27,7 @@ from xgrammar import (
     StructuralTagItem,
     TokenizerInfo,
     allocate_token_bitmask,
+    apply_token_bitmask_inplace,
 )
 
 from sglang.srt.constrained.base_grammar_backend import (
@@ -35,7 +36,7 @@ from sglang.srt.constrained.base_grammar_backend import (
     GrammarStats,
     InvalidGrammarObject,
 )
-from sglang.srt.constrained.utils import is_legacy_structural_tag
+from sglang.srt.constrained.utils import is_legacy_structural_tag, set_token_filter
 from sglang.srt.utils import is_hip
 
 _is_hip = is_hip()
@@ -47,13 +48,24 @@ else:
         apply_token_bitmask_inplace_triton,
     )
 
-from sglang.srt.constrained.torch_ops.token_filter_torch_ops import (
-    set_token_filter_torch,
-)
-from sglang.srt.constrained.triton_ops.token_filter_ops import set_token_filter_triton
-
 logger = logging.getLogger(__name__)
 MAX_ROLLBACK_TOKENS = 200
+
+
+def _apply_vocab_mask(logits: torch.Tensor, vocab_mask: torch.Tensor) -> None:
+    if logits.device.type in {"cuda", "xpu", "musa"}:
+        if _is_hip:
+            apply_token_bitmask_inplace_cuda(logits, vocab_mask)
+        else:
+            apply_token_bitmask_inplace_triton(logits, vocab_mask)
+    elif logits.device.type == "cpu":
+        apply_token_bitmask_inplace(logits, vocab_mask)
+    elif logits.device.type == "npu":
+        import sgl_kernel_npu  # noqa: F401
+
+        torch.ops.npu.apply_token_bitmask(logits, vocab_mask)
+    else:
+        raise RuntimeError(f"Unsupported device: {logits.device.type}")
 
 
 class XGrammarGrammar(BaseGrammarObject):
@@ -110,17 +122,7 @@ class XGrammarGrammar(BaseGrammarObject):
         return vocab_mask.to(device, non_blocking=True)
 
     def apply_vocab_mask(self, logits: torch.Tensor, vocab_mask: torch.Tensor) -> None:
-        if logits.device.type in {"cuda", "xpu", "musa"}:
-            if _is_hip:
-                apply_token_bitmask_inplace_cuda(logits, vocab_mask)
-            else:
-                apply_token_bitmask_inplace_triton(logits, vocab_mask)
-        elif logits.device.type == "npu":
-            import sgl_kernel_npu  # noqa: F401
-
-            torch.ops.npu.apply_token_bitmask(logits, vocab_mask)
-        else:
-            raise RuntimeError(f"Unsupported device: {logits.device.type}")
+        _apply_vocab_mask(logits, vocab_mask)
 
     def copy(self):
         matcher = GrammarMatcher(
@@ -236,13 +238,7 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
 
     @staticmethod
     def apply_vocab_mask(logits: torch.Tensor, vocab_mask: torch.Tensor) -> None:
-        if logits.device.type in {"cuda", "npu", "xpu", "musa"}:
-            if _is_hip:
-                apply_token_bitmask_inplace_cuda(logits, vocab_mask)
-            else:
-                apply_token_bitmask_inplace_triton(logits, vocab_mask)
-        else:
-            raise RuntimeError(f"Unsupported device: {logits.device.type}")
+        _apply_vocab_mask(logits, vocab_mask)
 
     @staticmethod
     def set_token_filter(
@@ -252,22 +248,13 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
         is_allowed: bool = True,
         reset_vocab_mask: bool = True,
     ):
-        if _is_hip or (vocab_mask.device.type != "cuda"):
-            set_token_filter_torch(
-                vocab_mask,
-                token_ids,
-                batch_idx,
-                is_allowed=is_allowed,
-                reset_vocab_mask=reset_vocab_mask,
-            )
-        else:
-            set_token_filter_triton(
-                vocab_mask,
-                token_ids,
-                batch_idx,
-                is_allowed=is_allowed,
-                reset_vocab_mask=reset_vocab_mask,
-            )
+        set_token_filter(
+            vocab_mask,
+            token_ids,
+            batch_idx,
+            is_allowed=is_allowed,
+            reset_vocab_mask=reset_vocab_mask,
+        )
 
     @staticmethod
     def _sanitize_structural_format(structural_format):

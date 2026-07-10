@@ -1,7 +1,7 @@
 import os
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -14,6 +14,7 @@ from sglang.srt.constrained.torch_ops.token_filter_torch_ops import (
     set_token_filter_torch,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(2.0, "base-a-test-cpu")
 register_cpu_ci(est_time=7, suite="base-c-test-cpu")
@@ -71,7 +72,11 @@ def _allowed_token_ids(vocab_mask, token_ids):
     return allowed
 
 
-class TestReasonerGrammarObject(unittest.TestCase):
+def _allowed_dense_token_ids(vocab_mask, token_ids):
+    return [token_id for token_id in token_ids if not vocab_mask[0, token_id].item()]
+
+
+class TestReasonerGrammarObject(CustomTestCase):
     def _make_strict_object(self):
         return ReasonerGrammarObject(
             grammar=None,
@@ -118,7 +123,7 @@ class TestReasonerGrammarObject(unittest.TestCase):
         self.assertIsNotNone(obj.apply_vocab_mask)
 
 
-class TestReasonerGrammarBackend(unittest.TestCase):
+class TestReasonerGrammarBackend(CustomTestCase):
     def setUp(self):
         self._prev_budget = os.environ.get("SGLANG_MAX_THINK_TOKENS")
 
@@ -162,6 +167,110 @@ class TestReasonerGrammarBackend(unittest.TestCase):
         self.assertTrue(obj.enable_token_filter)
         self.assertEqual(obj.max_think_tokens, 2)
         self.assertEqual(obj.think_excluded_token_ids, [3, 4])
+
+    def test_init_strict_reasoning_grammar_supports_llguidance_masks(self):
+        from sglang.srt.constrained import llguidance_backend
+
+        os.environ["SGLANG_MAX_THINK_TOKENS"] = "0"
+
+        tokenizer = self._make_tokenizer()
+        with patch.object(
+            llguidance_backend,
+            "from_tokenizer",
+            return_value=SimpleNamespace(vocab_size=65),
+        ):
+            backend = llguidance_backend.GuidanceBackend(tokenizer=tokenizer)
+        reasoner = ReasonerGrammarBackend(
+            backend,
+            self._make_parser(),
+            tokenizer,
+            enable_strict_thinking=True,
+        )
+
+        obj = reasoner.init_strict_reasoning_grammar(reasoning=True)
+        mask = obj.allocate_vocab_mask(65, 1, "cpu")
+        mask = obj.move_vocab_mask(mask, "cpu")
+        obj.fill_vocab_mask(mask, 0)
+
+        self.assertEqual(mask.shape, (1, 3))
+        self.assertEqual(mask.device.type, "cpu")
+        self.assertEqual(_allowed_token_ids(mask, [0, 1, 2, 3, 4, 7]), [2])
+
+        logits = torch.zeros(1, 65, dtype=torch.float32)
+        obj.apply_vocab_mask(logits, mask)
+
+        self.assertEqual(logits[0, 2].item(), 0)
+        self.assertTrue(torch.all(torch.isneginf(logits[0, :2])))
+        self.assertTrue(torch.all(torch.isneginf(logits[0, 3:])))
+
+    def test_init_strict_reasoning_grammar_supports_xgrammar_masks(self):
+        from sglang.srt.constrained import xgrammar_backend
+
+        os.environ["SGLANG_MAX_THINK_TOKENS"] = "0"
+
+        tokenizer = self._make_tokenizer()
+        tokenizer.init_xgrammar = MagicMock(return_value=(SimpleNamespace(), None))
+        with patch.object(
+            xgrammar_backend, "GrammarCompiler", return_value=SimpleNamespace()
+        ):
+            backend = xgrammar_backend.XGrammarGrammarBackend(
+                tokenizer=tokenizer, vocab_size=65
+            )
+        reasoner = ReasonerGrammarBackend(
+            backend,
+            self._make_parser(),
+            tokenizer,
+            enable_strict_thinking=True,
+        )
+
+        obj = reasoner.init_strict_reasoning_grammar(reasoning=True)
+        mask = obj.allocate_vocab_mask(65, 1, "cpu")
+        mask = obj.move_vocab_mask(mask, "cpu")
+        obj.fill_vocab_mask(mask, 0)
+
+        self.assertEqual(mask.shape, (1, 3))
+        self.assertEqual(mask.device.type, "cpu")
+        self.assertEqual(_allowed_token_ids(mask, [0, 1, 2, 3, 4, 7]), [2])
+
+        logits = torch.zeros(1, 65, dtype=torch.float32)
+        obj.apply_vocab_mask(logits, mask)
+
+        self.assertEqual(logits[0, 2].item(), 0)
+        self.assertTrue(torch.all(torch.isneginf(logits[0, :2])))
+        self.assertTrue(torch.all(torch.isneginf(logits[0, 3:])))
+
+    def test_init_strict_reasoning_grammar_supports_outlines_masks(self):
+        from sglang.srt.constrained import outlines_backend
+
+        os.environ["SGLANG_MAX_THINK_TOKENS"] = "0"
+        tokenizer = self._make_tokenizer()
+        with patch.object(
+            outlines_backend, "TransformerTokenizer", return_value=SimpleNamespace()
+        ):
+            backend = outlines_backend.OutlinesGrammarBackend(
+                tokenizer=tokenizer, whitespace_pattern=None
+            )
+        reasoner = ReasonerGrammarBackend(
+            backend,
+            self._make_parser(),
+            tokenizer,
+            enable_strict_thinking=True,
+        )
+
+        obj = reasoner.init_strict_reasoning_grammar(reasoning=True)
+        mask = obj.allocate_vocab_mask(100, 1, "cpu")
+        mask = obj.move_vocab_mask(mask, "cpu")
+        obj.fill_vocab_mask(mask, 0)
+
+        self.assertEqual(mask.device.type, "cpu")
+        self.assertEqual(_allowed_dense_token_ids(mask, [0, 1, 2, 3, 4, 7]), [2])
+
+        logits = torch.zeros(1, 100, dtype=torch.float32)
+        obj.apply_vocab_mask(logits, mask)
+
+        self.assertEqual(logits[0, 2].item(), 0)
+        self.assertTrue(torch.all(torch.isneginf(logits[0, :2])))
+        self.assertTrue(torch.all(torch.isneginf(logits[0, 3:])))
 
     def test_init_strict_reasoning_grammar_none_when_strict_disabled(self):
         backend = _DummyGrammarBackend(support_token_filter=True)
@@ -247,7 +356,7 @@ class TestReasonerGrammarBackend(unittest.TestCase):
             )
 
 
-class TestReasonerGrammarObjectRollback(unittest.TestCase):
+class TestReasonerGrammarObjectRollback(CustomTestCase):
     """Tests for rollback correctness at the THINKING→GENERATION boundary."""
 
     def _make_object_with_mock_grammar(self):
@@ -371,7 +480,7 @@ class TestReasonerGrammarObjectRollback(unittest.TestCase):
         self.assertTrue(copy._is_thinking())
 
 
-class TestReasonerGrammarObjectFillVocabMask(unittest.TestCase):
+class TestReasonerGrammarObjectFillVocabMask(CustomTestCase):
     """Tests for fill_vocab_mask behavior in different states."""
 
     def test_thinking_phase_does_not_consult_inner_grammar(self):
