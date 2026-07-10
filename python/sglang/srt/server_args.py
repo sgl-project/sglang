@@ -268,6 +268,13 @@ MOE_A2A_BACKEND_CHOICES = [
     "megamoe",
 ]
 
+MXFP8_MOE_RUNNER_BACKEND_CHOICES = [
+    "cutlass",
+    "deep_gemm",
+    "flashinfer_trtllm",
+    "flashinfer_trtllm_routed",
+]
+
 FP8_GEMM_RUNNER_BACKEND_CHOICES = [
     "auto",
     "deep_gemm",
@@ -365,6 +372,10 @@ def add_grammar_backend_choices(choices):
 
 def add_moe_runner_backend_choices(choices):
     MOE_RUNNER_BACKEND_CHOICES.extend(choices)
+
+
+def add_mxfp8_moe_runner_backend_choices(choices):
+    MXFP8_MOE_RUNNER_BACKEND_CHOICES.extend(choices)
 
 
 def add_fp8_gemm_runner_backend_choices(choices):
