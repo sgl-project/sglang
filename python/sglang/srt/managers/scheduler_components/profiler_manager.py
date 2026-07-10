@@ -123,7 +123,17 @@ class SchedulerProfilerManager:
         if activities is None:
             activities = ["CPU", "GPU"]
 
-        self.torch_profiler_output_dir = Path(output_dir).expanduser()
+        # Security: sanitize output_dir to prevent path traversal. The
+        # output_dir comes from the /start_profile API request body and could
+        # contain ../ sequences to write trace files to arbitrary locations.
+        resolved = Path(output_dir).expanduser().resolve()
+        # Only allow absolute paths under a known-safe root (default /tmp).
+        safe_root = Path(os.getenv("SGLANG_TORCH_PROFILER_DIR", "/tmp")).resolve()
+        if not str(resolved).startswith(str(safe_root)):
+            raise ValueError(
+                f"output_dir must be under {safe_root}, got: {output_dir}"
+            )
+        self.torch_profiler_output_dir = resolved
         self.torch_profiler_with_stack = with_stack
         self.torch_profiler_record_shapes = record_shapes
         self.profiler_activities = activities
