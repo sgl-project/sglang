@@ -1148,9 +1148,13 @@ class Scheduler(
             if target_layer_ids:
                 return [int(x) for x in target_layer_ids]
 
+            from sglang.srt.speculative.dspark_components.dspark_utils import (
+                get_dspark_target_layer_ids,
+            )
+
             hf_config = getattr(self.model_config, "hf_config", None)
+            target_layer_ids = get_dspark_target_layer_ids(hf_config)
             dspark_cfg = _cfg_get(hf_config, "dspark_config", None)
-            target_layer_ids = _cfg_get(hf_config, "dspark_target_layer_ids", None)
             if target_layer_ids is None:
                 target_layer_ids = _cfg_get(dspark_cfg, "target_layer_ids", None)
             if target_layer_ids is None:
@@ -1199,6 +1203,14 @@ class Scheduler(
                 str(max(1, default_dspark_prefill_tokens)),
             )
             dspark_hidden_pool_size = max(0, int(dspark_prefill_tokens_env))
+            if dspark_target_layer_ids:
+                logger.info(
+                    "Initialized DSpark PD hidden row pool on decode: "
+                    "target_layer_ids=%s, hidden_size=%s, pool_rows=%s",
+                    dspark_target_layer_ids,
+                    dspark_hidden_size,
+                    dspark_hidden_pool_size,
+                )
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
             dspark_target_layer_ids = _infer_dspark_target_layer_ids()
             if dspark_target_layer_ids:
@@ -1217,6 +1229,13 @@ class Scheduler(
                 dspark_hidden_pool_size = max(0, int(dspark_prefill_tokens_env))
                 self.tp_worker.model_runner.dflash_or_dspark_target_layer_ids = (
                     dspark_target_layer_ids
+                )
+                logger.info(
+                    "Initialized DSpark PD hidden row pool on prefill: "
+                    "target_layer_ids=%s, hidden_size=%s, pool_rows=%s",
+                    dspark_target_layer_ids,
+                    dspark_hidden_size,
+                    dspark_hidden_pool_size,
                 )
         elif self.spec_algorithm.carries_draft_hidden_states():
             # `draft_runner` aliases `draft_runner_list[0]` in the multi-layer

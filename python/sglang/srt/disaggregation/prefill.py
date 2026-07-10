@@ -472,6 +472,15 @@ class PrefillBootstrapQueue:
             raise RuntimeError(
                 f"Model {model.__class__.__name__} cannot capture DSpark aux hidden."
             )
+        logger.info(
+            "Configured DSpark PD hidden capture on prefill: rid=%s, pp_rank=%s, "
+            "local_layer_ids=%s, all_target_layer_ids=%s, hidden_size=%s",
+            req.rid,
+            self.pp_rank,
+            target_layer_ids,
+            all_target_layer_ids,
+            hidden_size,
+        )
 
     def add(self, req: Req, num_kv_heads: int) -> None:
         if not self.create_sender(req, num_kv_heads):
