@@ -6,8 +6,8 @@ from pathlib import Path
 
 import torch
 
-from sglang.srt.speculative.dspark_components.dspark_block_accept_estimator_online import (
-    OnlineBlockAcceptEstimateRecorder as BlockAcceptEstimateRecorder,
+from sglang.srt.speculative.dspark_components.dspark_block_accept_estimator import (
+    BlockAcceptEstimateRecorder,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase

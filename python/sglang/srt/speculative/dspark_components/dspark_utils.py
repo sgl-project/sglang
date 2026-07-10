@@ -1,14 +1,10 @@
 from __future__ import annotations
 
-import logging
 from typing import Any, List, Optional
 
 import msgspec
-import torch
 
 from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
-
-logger = logging.getLogger(__name__)
 
 DEFAULT_DSPARK_GAMMA = 7
 SUPPORTED_DSPARK_MARKOV_HEAD_TYPES = ("vanilla", "gated", "rnn")
@@ -206,59 +202,3 @@ def parse_dspark_draft_config(*, draft_hf_config: Any) -> DSparkDraftConfig:
         markov_rank=markov_rank,
         markov_head_type=markov_head_type,
     )
-
-
-# --- shared block-accept estimator bookkeeping (online + offline recorders) ---
-
-SKIP_STEP_WARNING = (
-    "skipping step: {} (pending blocks of affected requests "
-    "are dropped by the seq-len continuity check)"
-)
-
-
-def block_accept_skip_reason(
-    *,
-    logits_adjustments_are_noop: bool,
-    corrected_logits: Optional[Any],
-) -> Optional[str]:
-    if not logits_adjustments_are_noop:
-        return (
-            "non-noop logits adjustments (penalizer/logit_bias/grammar) "
-            "in batch; cross-step conditioning of the gathered target "
-            "probabilities would be state-dependent"
-        )
-    if corrected_logits is None:
-        return "corrected_logits unavailable (folded draft path)"
-    return None
-
-
-def warn_once(warned_reasons: set, *, reason: str) -> None:
-    if reason not in warned_reasons:
-        warned_reasons.add(reason)
-        logger.warning(
-            "DSPARK block accept estimate recorder: %s (warned once)", reason
-        )
-
-
-def gather_chunked_token_logprobs(
-    *,
-    logits,
-    row_indices,
-    token_indices,
-    per_row_temps,
-    chunk_size: int,
-):
-    """Chunked per-row token logprob gather: logprob of token_indices[i] under
-    logits[row_indices[i]] / per_row_temps[i], computed chunk_size rows at a
-    time to bound the fp32 softmax workspace."""
-    results = []
-    for start in range(0, row_indices.shape[0], chunk_size):
-        end = start + chunk_size
-        rows = logits[row_indices[start:end]].to(torch.float32)
-        rows = rows / per_row_temps[start:end, None]
-        log_norm = torch.logsumexp(rows, dim=-1)
-        token_logits = rows.gather(dim=1, index=token_indices[start:end, None]).squeeze(
-            1
-        )
-        results.append(token_logits - log_norm)
-    return torch.cat(results)
