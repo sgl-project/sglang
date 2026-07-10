@@ -9,6 +9,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsv4.indexer import FP8_DTYPE, C4IndexerBackendMixin
 from sglang.srt.layers.attention.dsv4.metadata import NonPagedIndexerPlan
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -39,7 +40,7 @@ class TestDSV4NonPagedIndexer(CustomTestCase):
             envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.override(False),
             patch(f"{_INDEXER}.is_cuda", return_value=True),
             patch(f"{_INDEXER}.is_hip", return_value=False),
-            patch(f"{_INDEXER}.get_attention_cp_size", return_value=1),
+            get_parallel().override(attn_cp_size=1),
             patch(
                 f"{_INDEXER}.is_in_tc_piecewise_cuda_graph",
                 return_value=overrides.get("piecewise_graph", False),
