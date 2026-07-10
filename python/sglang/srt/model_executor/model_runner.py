@@ -101,6 +101,7 @@ from sglang.srt.eplb.expert_location import (
     ExpertLocationMetadata,
     broadcast_global_expert_location_metadata,
     compute_initial_expert_location_metadata,
+    format_expert_location_layout,
     get_global_expert_location_metadata,
     set_global_expert_location_metadata,
 )
@@ -127,7 +128,6 @@ from sglang.srt.layers.cp.utils import (
     get_cp_strategy,
 )
 from sglang.srt.layers.dp_attention import (
-    get_attention_tp_group,
     initialize_dp_attention,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -182,10 +182,12 @@ from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_flags
+from sglang.srt.runtime_context import get_flags, get_parallel, get_server_args
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-from sglang.srt.server_args import (
+from sglang.srt.server_args import (  # noqa: F401  (re-export)
+    CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS,
     ServerArgs,
+    add_chunked_prefix_cache_attention_backend,
     get_global_server_args,
     set_global_server_args_for_scheduler,
 )
@@ -271,16 +273,6 @@ MLA_ATTENTION_BACKENDS = [
     "intel_xpu",
 ]
 
-CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS = [
-    "flashinfer",
-    "fa3",
-    "fa4",
-    "flashmla",
-    "cutedsl_mla",
-    "cutlass_mla",
-    "trtllm_mla",
-    "tokenspeed_mla",
-]
 
 TORCH_DTYPE_TO_KV_CACHE_STR = {
     torch.float8_e4m3fn: "fp8_e4m3",
@@ -294,14 +286,6 @@ def add_mla_attention_backend(backend_name):
     if backend_name not in MLA_ATTENTION_BACKENDS:
         MLA_ATTENTION_BACKENDS.append(backend_name)
         logger.info(f"Added {backend_name} to MLA_ATTENTION_BACKENDS.")
-
-
-def add_chunked_prefix_cache_attention_backend(backend_name):
-    if backend_name not in CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS:
-        CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS.append(backend_name)
-        logger.info(
-            f"Added {backend_name} to CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS."
-        )
 
 
 # Detect stragger ranks in model loading
@@ -528,8 +512,24 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if server_args.show_time_cost:
             enable_show_time_cost()
 
-        # Model-specific adjustment
-        self.model_specific_adjustment()
+        # Chunked prefix caching requires an MLA model on a backend whose
+        # kernels read that layout. This is a load-time gate, not a
+        # resolution-time one: out-of-tree platforms register their supported
+        # backends in init_backend(), which runs when this module is imported
+        # — after ServerArgs.__post_init__. Target runner only: a draft
+        # model's (often non-MLA) config must not flip the shared setting.
+        if not self.is_draft_worker and (
+            not self.use_mla_backend
+            or server_args.attention_backend
+            not in CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS
+        ):
+            if not server_args.disable_chunked_prefix_cache:
+                server_args.override(
+                    "model_runner.chunked_prefix_cache_gate",
+                    disable_chunked_prefix_cache=True,
+                )
+        if not self.is_draft_worker and not server_args.disable_chunked_prefix_cache:
+            logger.info("Chunked prefix cache is turned on.")
 
         # Set the global server_args in the scheduler process (target worker
         # only, so a draft init cannot clobber target-derived global state).
@@ -541,7 +541,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.init_threads_binding()
 
         # Set float32 matmul precision
-        if get_flags().enable_tf32_matmul:
+        if get_server_args().enable_tf32_matmul:
             torch.set_float32_matmul_precision("high")
 
         # Get available memory before model loading.
@@ -671,7 +671,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
             if self.tp_rank == 0 and envs.SGLANG_LOG_EXPERT_LOCATION_METADATA.get():
                 logger.info(
-                    f"Initial expert_location_metadata: {get_global_expert_location_metadata()}"
+                    "Initial expert_location_metadata:\n%s",
+                    format_expert_location_layout(
+                        get_global_expert_location_metadata()
+                    ),
                 )
 
             set_global_expert_distribution_recorder(
@@ -781,9 +784,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         torchao_applied = getattr(self.model, "torchao_applied", False)
         # In layered loading, torchao may have been applied
         if not torchao_applied:
-            apply_torchao_config_to_model(
-                self.model, get_global_server_args().torchao_config
-            )
+            apply_torchao_config_to_model(self.model, get_server_args().torchao_config)
 
         # Apply torch TP if the model supports it
         supports_torch_tp = getattr(self.model, "supports_torch_tp", False)
@@ -1008,7 +1009,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         set_global_experts_capturer(
             RoutedExpertsCapturer.create(
-                enable=get_global_server_args().enable_return_routed_experts,
+                enable=get_server_args().enable_return_routed_experts,
                 model_config=self.model_config,
                 num_fused_shared_experts=num_fused_shared_experts,
                 num_tokens=self.max_total_num_tokens + self.page_size,
@@ -1018,7 +1019,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
 
     def init_indexer_capturer(self):
-        enable = get_global_server_args().enable_return_indexer_topk
+        enable = get_server_args().enable_return_indexer_topk
         # Producer wiring is CUDA-only (Indexer.forward_cuda + MLA skip_topk
         # path); other backends would create a capturer but never feed it.
         if enable and self.device != "cuda":
@@ -1127,70 +1128,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             logger.error(
                 f"Failed to register transfer engine info for tp_rank={self.tp_rank}: {e}"
             )
-
-    def model_specific_adjustment(self):
-        if self.is_draft_worker:
-            return
-
-        server_args = self.server_args
-
-        # HRM-Text needs bidirectional prompt attention (prefill), which only the
-        # Triton backend honors and only with cuda graph / chunked prefill off
-        # (TritonAttnBackend.allow_bidirectional_attention_in_extend). Radix cache
-        # is also unsafe: the recurrent forward writes direction-dependent KV
-        # across many slots.
-        hf_config = self.model_config.hf_config
-        is_hrm_text = getattr(
-            hf_config, "model_type", None
-        ) == "hrm_text" or "HrmTextForCausalLM" in getattr(
-            hf_config, "architectures", []
-        )
-        # prefix_lm defaults to True upstream; defaulting False would skip the
-        # bidirectional-attention forcing and silently produce junk output.
-        is_prefix_lm_recurrent = is_hrm_text and getattr(hf_config, "prefix_lm", True)
-        if is_prefix_lm_recurrent:
-            if server_args.attention_backend not in (None, "triton"):
-                logger.warning(
-                    f"Overriding --attention-backend "
-                    f"{server_args.attention_backend!r} -> 'triton': only the "
-                    "Triton backend supports HRM-Text's bidirectional prefix "
-                    "attention."
-                )
-            server_args.attention_backend = "triton"
-            server_args.chunked_prefill_size = -1
-            server_args.disable_radix_cache = True
-            server_args.disable_cuda_graph = True
-            logger.warning(
-                "HRM-Text (prefix_lm) detected: forcing --attention-backend "
-                "triton, --chunked-prefill-size -1, --disable-radix-cache, and "
-                "--disable-cuda-graph for correctness of the bidirectional "
-                "prompt attention."
-            )
-
-        if self.is_multimodal:
-            if not self.is_multimodal_chunked_prefill_supported:
-                server_args.chunked_prefill_size = -1
-                logger.info(
-                    f"Automatically turn off --chunked-prefill-size as it is not supported for "
-                    f"{self.model_config.hf_config.model_type}"
-                )
-
-        if (
-            not self.use_mla_backend
-            or server_args.attention_backend
-            not in CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS
-        ):
-            server_args.disable_chunked_prefix_cache = True
-
-        if not server_args.disable_chunked_prefix_cache:
-            log_info_on_rank0(logger, "Chunked prefix cache is turned on.")
-
-        # The imperative adjustments above may overwrite fields the resolution passes
-        # already declared (HRM-Text forces attention_backend); redeclare the
-        # adjusted values so publish parity holds.
-        from sglang.srt.arg_groups.overrides import refresh_declared_fields
-
-        refresh_declared_fields(server_args, ("attention_backend",))
 
     def check_quantized_moe_compatibility(self):
         if (
@@ -1357,7 +1294,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
         self.tp_group = get_tp_group()
         self.pp_group = get_pp_group()
-        self.attention_tp_group = get_attention_tp_group()
+        self.attention_tp_group = get_parallel().attn_tp_group
 
         # Check memory for tensor parallelism
         local_gpu_memory = get_available_gpu_memory(self.device, self.gpu_id)
@@ -1436,7 +1373,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 logger.info(
                     "Compute capability below sm80. Use float16 due to lack of bfloat16 support."
                 )
-                self.server_args.dtype = "float16"
+                from sglang.srt.arg_groups.overrides import (
+                    declare_load_time_override,
+                )
+
+                declare_load_time_override(
+                    "ModelRunner._sm80_dtype_fallback", {"dtype": "float16"}
+                )
                 self.model_config.dtype = torch.float16
                 if torch.cuda.get_device_capability()[1] < 5:
                     raise RuntimeError("SGLang only supports sm75 and above.")
@@ -1768,8 +1711,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             else:
                 # Load the missing weights from disk
                 self.update_weights_from_disk(
-                    get_global_server_args().model_path,
-                    get_global_server_args().load_format,
+                    get_server_args().model_path,
+                    get_server_args().load_format,
                     weight_name_filter=weight_name_filter,
                 )
 
@@ -1894,8 +1837,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 return False, message
 
         self.model = model
-        self.server_args.model_path = model_path
-        self.server_args.load_format = load_format
+        self.server_args.override(
+            "model_runner.update_weights",
+            model_path=model_path,
+            load_format=load_format,
+        )
         self.load_config = load_config
 
         if recapture_cuda_graph and (
@@ -2443,7 +2389,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 {"kv_cache_dtype": resolved},
             )
         else:
-            self.server_args.kv_cache_dtype = resolved
+            self.server_args.override(
+                "ModelRunner.configure_kv_cache_dtype", kv_cache_dtype=resolved
+            )
 
     def configure_kv_cache_dtype(self):
         if self.server_args.kv_cache_dtype == "auto":
@@ -2484,6 +2432,22 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             raise ValueError(
                 f"Unsupported kv_cache_dtype: {self.server_args.kv_cache_dtype}."
             )
+
+        # DFLASH: fa4 draft attention can't read the target's fp8 KV (needs K.dtype == Q.dtype),
+        # so give the fa4 draft its own compute-dtype KV. fp8-capable backends keep the target dtype.
+        if (
+            self.is_draft_worker
+            and self.spec_algorithm.is_dflash()
+            and self.server_args.speculative_draft_attention_backend == "fa4"
+            and self.kv_cache_dtype != self.dtype
+        ):
+            logger.info(
+                "DFLASH fa4 draft: overriding KV cache dtype %s -> %s "
+                "(fa4 needs K.dtype == Q.dtype; cannot read the target's quantized KV).",
+                self.kv_cache_dtype,
+                self.dtype,
+            )
+            self.kv_cache_dtype = self.dtype
 
     def init_cublas(self):
         """We need to run a small matmul to init cublas. Otherwise, it will raise some errors later."""
@@ -2754,12 +2718,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.model.model = resolve_language_model(self.model)
         language_model = getattr(self.model, "language_model", self.model)
 
-        # Resolve model with layers: handle CausalLM wrapper (.model.layers) and direct TextModel (.layers)
-        if hasattr(language_model, "model") and hasattr(language_model.model, "layers"):
-            layer_model = language_model.model
-        elif hasattr(language_model, "layers"):
-            layer_model = language_model
-        else:
+        # Find the module that owns the decoder `layers`. Models wrap it at
+        # varying depths: a direct text model exposes `.layers`, a CausalLM
+        # wraps it as `.model.layers`, and some multimodal models add another
+        # level (e.g. DeepSeek-OCR: OCR wrapper -> Deepseek*ForCausalLM ->
+        # text model -> `.layers`). Descend the `.model` chain until we find it.
+        layer_model = language_model
+        while not hasattr(layer_model, "layers") and hasattr(layer_model, "model"):
+            layer_model = layer_model.model
+
+        if not hasattr(layer_model, "layers"):
             logger.warning(
                 "Disable prefill CUDA graph because the model does not have a 'layers' attribute"
             )
@@ -3086,7 +3054,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.msprobe_debugger.stop()
             self.msprobe_debugger.step()
 
-        if self.server_args.elastic_ep_backend is not None:
+        if self.enable_elastic_ep:
             self.maybe_recover_ep_ranks()
 
         return output
