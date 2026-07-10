@@ -269,7 +269,7 @@ from sglang.srt.utils.hf_transformers_utils import (
 )
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to_node
-from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
+from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method, scheduler_nvtx_range
 from sglang.srt.scheduler_env_vars import scheduler_envs
 from sglang.srt.request_latency_tracker import RequestLatencyTracker
 from sglang.srt.kv_transfer_checksum import KVTransferChecksumVerifier
@@ -3258,7 +3258,8 @@ class Scheduler(
 
         # Place holder handling for pd-disagg decode event loop
         if batch.forward_mode.is_prebuilt():
-            return self._run_batch_prebuilt(batch)
+            with scheduler_nvtx_range("scheduler.run_batch.prebuilt", color="cyan"):
+                return self._run_batch_prebuilt(batch)
 
         # PD prefill: early-send cached prefix KV, overlapping the suffix forward.
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -3272,124 +3273,128 @@ class Scheduler(
                 # no-ops (ForwardBatch.init_new lazily computes the sum).
                 self.future_map.resolve_seq_lens_cpu(batch)
 
-                with self.forward_stream_ctx:
-                    self.forward_stream.wait_stream(self.schedule_stream)
-                    # resolve consumes SB staging (prefill_input_ids_cpu /
-                    # mix_running_indices). Run OUTSIDE isolation so the
-                    # snapshot captures the post-consume state — restoring
-                    # post-forward must not un-consume staging.
-                    resolve_forward_inputs(batch, self.future_map)
+                with scheduler_nvtx_range("scheduler.run_batch.overlap", color="teal"):
+                    with self.forward_stream_ctx:
+                        self.forward_stream.wait_stream(self.schedule_stream)
+                        # resolve consumes SB staging (prefill_input_ids_cpu /
+                        # mix_running_indices). Run OUTSIDE isolation so the
+                        # snapshot captures the post-consume state — restoring
+                        # post-forward must not un-consume staging.
+                        resolve_forward_inputs(batch, self.future_map)
 
-                    with self._forward_isolation(batch, overlap=True):
-                        future_indices = batch.req_pool_indices
+                        with self._forward_isolation(batch, overlap=True):
+                            future_indices = batch.req_pool_indices
 
-                        # Spec_v2 fires on_publish mid-worker (between verify and
-                        # draft_extend) so schedule prep can overlap with draft_extend.
-                        # Non-spec has no later work — scheduler publishes after return.
-                        fwd_kwargs = (
-                            {
-                                "on_publish": partial(
-                                    self.future_map.publish, future_indices
-                                )
-                            }
-                            if not batch.spec_algorithm.is_none()
-                            else {}
-                        )
-
-                        # FIXME: pp is not compatible with overlap
-                        batch_result = self.model_worker.forward_batch_generation(
-                            batch, **fwd_kwargs
-                        )
-                        if batch.spec_algorithm.is_none():
-                            self.future_map.publish(future_indices, batch.seq_lens + 1)
-                        # Park any refs the worker wants kept alive 2 iters
-                        # (cross-stream tensor lifetime; pinned in the same
-                        # ring slot as the SB attr snapshot).
-                        if batch_result.extra_keep_alive_refs:
-                            self.batch_record_buf[self.batch_record_ct].extend(
-                                batch_result.extra_keep_alive_refs
+                            # Spec_v2 fires on_publish mid-worker (between verify and
+                            # draft_extend) so schedule prep can overlap with draft_extend.
+                            # Non-spec has no later work — scheduler publishes after return.
+                            fwd_kwargs = (
+                                {
+                                    "on_publish": partial(
+                                        self.future_map.publish, future_indices
+                                    )
+                                }
+                                if not batch.spec_algorithm.is_none()
+                                else {}
                             )
-                        if self.enable_unified_memory:
-                            # Record a `forward_done` event after the forward (before
-                            # copy_to_cpu); lazy-compaction `_flush` gates src reuse on
-                            # it. Only the unified pool's allocator exposes these hooks.
-                            allocator = self.token_to_kv_pool_allocator
-                            forward_done = self.device_module.Event()
-                            forward_done.record(stream=self.forward_stream)
-                            allocator.set_latest_forward_done_event(forward_done)
-                            # Write-set classification: hand the allocator this
-                            # forward's virtual out_cache_loc as a tensor ref (no GPU work).
-                            allocator.set_inflight_forward(
-                                forward_done,
-                                batch.out_cache_loc,
+
+                            # FIXME: pp is not compatible with overlap
+                            batch_result = self.model_worker.forward_batch_generation(
+                                batch, **fwd_kwargs
                             )
-                        # FIXME(lsyin): maybe move this to forward_batch_generation
-                        batch_result.copy_done = self.device_module.Event()
-                        if batch_result.delay_sample_func is None:
-                            self._relay_forward_payload(future_indices, batch_result)
-                            if _is_hip:
-                                # Cross-stream sync costs more than the tiny D2H it
-                                # overlaps.
-                                batch_result.copy_to_cpu(
-                                    return_logprob=batch.return_logprob,
-                                    return_hidden_states=batch.return_hidden_states,
+                            if batch.spec_algorithm.is_none():
+                                self.future_map.publish(future_indices, batch.seq_lens + 1)
+                            # Park any refs the worker wants kept alive 2 iters
+                            # (cross-stream tensor lifetime; pinned in the same
+                            # ring slot as the SB attr snapshot).
+                            if batch_result.extra_keep_alive_refs:
+                                self.batch_record_buf[self.batch_record_ct].extend(
+                                    batch_result.extra_keep_alive_refs
                                 )
-                            else:
-                                # Result D2H on copy_stream overlaps the next forward
-                                # instead of serializing on forward_stream; it's a leaf
-                                # gated by copy_done, so nothing on forward_stream waits.
-                                self.copy_stream.wait_stream(self.forward_stream)
-                                with self.copy_stream_ctx:
+                            if self.enable_unified_memory:
+                                # Record a `forward_done` event after the forward (before
+                                # copy_to_cpu); lazy-compaction `_flush` gates src reuse on
+                                # it. Only the unified pool's allocator exposes these hooks.
+                                allocator = self.token_to_kv_pool_allocator
+                                forward_done = self.device_module.Event()
+                                forward_done.record(stream=self.forward_stream)
+                                allocator.set_latest_forward_done_event(forward_done)
+                                # Write-set classification: hand the allocator this
+                                # forward's virtual out_cache_loc as a tensor ref (no GPU work).
+                                allocator.set_inflight_forward(
+                                    forward_done,
+                                    batch.out_cache_loc,
+                                )
+                            # FIXME(lsyin): maybe move this to forward_batch_generation
+                            batch_result.copy_done = self.device_module.Event()
+                            if batch_result.delay_sample_func is None:
+                                self._relay_forward_payload(future_indices, batch_result)
+                                if _is_hip:
+                                    # Cross-stream sync costs more than the tiny D2H it
+                                    # overlaps.
                                     batch_result.copy_to_cpu(
                                         return_logprob=batch.return_logprob,
                                         return_hidden_states=batch.return_hidden_states,
                                     )
-                        else:
-                            batch_result.future_indices = future_indices
+                                else:
+                                    # Result D2H on copy_stream overlaps the next forward
+                                    # instead of serializing on forward_stream; it's a leaf
+                                    # gated by copy_done, so nothing on forward_stream waits.
+                                    self.copy_stream.wait_stream(self.forward_stream)
+                                    with self.copy_stream_ctx:
+                                        batch_result.copy_to_cpu(
+                                            return_logprob=batch.return_logprob,
+                                            return_hidden_states=batch.return_hidden_states,
+                                        )
+                            else:
+                                batch_result.future_indices = future_indices
 
-                # Next-iter input_ids relayed via future_map.
-                batch.input_ids = None
+                    # Next-iter input_ids relayed via future_map.
+                    batch.input_ids = None
 
-                if not batch.spec_algorithm.is_none():
-                    batch.spec_info = batch_result.next_draft_input
-                    batch.spec_info.future_indices = future_indices
+                    if not batch.spec_algorithm.is_none():
+                        batch.spec_info = batch_result.next_draft_input
+                        batch.spec_info.future_indices = future_indices
             elif self.enable_pdmux and batch.forward_mode.is_split_prefill():
-                resolve_forward_inputs(batch, self.future_map)
-                batch_result = self.tp_worker.forward_batch_split_prefill(batch)
-                self._relay_forward_payload(batch.req_pool_indices, batch_result)
-                batch.input_ids = None
+                with scheduler_nvtx_range("scheduler.run_batch.pdmux", color="orange"):
+                    resolve_forward_inputs(batch, self.future_map)
+                    batch_result = self.tp_worker.forward_batch_split_prefill(batch)
+                    self._relay_forward_payload(batch.req_pool_indices, batch_result)
+                    batch.input_ids = None
             elif not batch.spec_algorithm.is_none():
                 # Non-overlap: drive the V2 worker synchronously (no
                 # future_map relay / on_publish).
                 resolve_forward_inputs(batch, self.future_map)
-                with self._forward_isolation(batch, overlap=False):
-                    batch_result = self.model_worker.forward_batch_generation(batch)
-                # The isolation restore reverted the worker's in-forward SB edits;
-                # re-apply what must carry to the next iter.
-                batch.spec_info = batch_result.next_draft_input
-                if batch_result.new_seq_lens is not None:
-                    batch.seq_lens = batch_result.new_seq_lens
-                    if batch.seq_lens_cpu is not None:
-                        batch.seq_lens_cpu = batch_result.new_seq_lens.to("cpu")
-                        batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
-                batch.input_ids = None  # rebuilt next iter from draft_token
-                self.update_cache_from_scheduler(batch, batch_result)
-                # Sync D2H so the result processor can read CPU tensors.
-                batch_result.copy_done = self.device_module.Event()
-                batch_result.copy_to_cpu(
-                    return_logprob=batch.return_logprob,
-                    return_hidden_states=batch.return_hidden_states,
-                )
+                with scheduler_nvtx_range("scheduler.run_batch.non_overlap_spec", color="purple"):
+                    with self._forward_isolation(batch, overlap=False):
+                        batch_result = self.model_worker.forward_batch_generation(batch)
+                    # The isolation restore reverted the worker's in-forward SB edits;
+                    # re-apply what must carry to the next iter.
+                    batch.spec_info = batch_result.next_draft_input
+                    if batch_result.new_seq_lens is not None:
+                        batch.seq_lens = batch_result.new_seq_lens
+                        if batch.seq_lens_cpu is not None:
+                            batch.seq_lens_cpu = batch_result.new_seq_lens.to("cpu")
+                            batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+                    batch.input_ids = None  # rebuilt next iter from draft_token
+                    self.update_cache_from_scheduler(batch, batch_result)
+                    # Sync D2H so the result processor can read CPU tensors.
+                    batch_result.copy_done = self.device_module.Event()
+                    batch_result.copy_to_cpu(
+                        return_logprob=batch.return_logprob,
+                        return_hidden_states=batch.return_hidden_states,
+                    )
             else:
                 kwargs = (
                     {"pp_proxy_tensors": pp_proxy_tensors}
                     if self.spec_algorithm.is_none()
                     else {}
                 )
-                resolve_forward_inputs(batch, self.future_map)
-                batch_result = self.model_worker.forward_batch_generation(
-                    batch, **kwargs
-                )
+                with scheduler_nvtx_range("scheduler.run_batch.plain", color="gray"):
+                    resolve_forward_inputs(batch, self.future_map)
+                    batch_result = self.model_worker.forward_batch_generation(
+                        batch, **kwargs
+                    )
                 if batch_result.has_sampled_token_ids:
                     # Non-spec: relay via future_map, gathered next iter.
                     self._relay_forward_payload(batch.req_pool_indices, batch_result)
@@ -3513,18 +3518,24 @@ class Scheduler(
                     self.latency_tracker.end_phase(req.rid, "prefill", num_tokens=num_tokens)
 
         if batch.forward_mode.is_decode():
-            self.batch_result_processor.process_batch_result_decode(batch, result)
+            with scheduler_nvtx_range("scheduler.process_batch_result.decode", color="red"):
+                self.batch_result_processor.process_batch_result_decode(batch, result)
         elif batch.forward_mode.is_extend():
             if batch.is_dllm():
-                self.process_batch_result_dllm(batch, result)
+                with scheduler_nvtx_range("scheduler.process_batch_result.dllm", color="orange"):
+                    self.process_batch_result_dllm(batch, result)
             elif self.disaggregation_mode == DisaggregationMode.PREFILL:
-                self.process_batch_result_disagg_prefill(batch, result)
+                with scheduler_nvtx_range("scheduler.process_batch_result.disagg_prefill", color="magenta"):
+                    self.process_batch_result_disagg_prefill(batch, result)
             else:
-                self.batch_result_processor.process_batch_result_prefill(batch, result)
+                with scheduler_nvtx_range("scheduler.process_batch_result.prefill", color="purple"):
+                    self.batch_result_processor.process_batch_result_prefill(batch, result)
         elif batch.forward_mode.is_prebuilt():
-            self.batch_result_processor.process_batch_result_prebuilt(batch)
+            with scheduler_nvtx_range("scheduler.process_batch_result.prebuilt", color="cyan"):
+                self.batch_result_processor.process_batch_result_prebuilt(batch)
         elif batch.forward_mode.is_idle():
-            self.batch_result_processor.process_batch_result_idle(batch, result)
+            with scheduler_nvtx_range("scheduler.process_batch_result.idle", color="gray"):
+                self.batch_result_processor.process_batch_result_idle(batch, result)
 
         # JoyFuture: end latency tracking for naturally completed requests
         if self.latency_tracker.enabled:

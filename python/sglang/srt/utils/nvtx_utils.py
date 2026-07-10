@@ -77,6 +77,19 @@ _NVTX_COLOR_MAP = {
     "scheduler.event_loop_pp_disagg_decode": "magenta",
     # PP batch launch
     "scheduler._pp_launch_batch": "red",
+    # run_batch sub-stages
+    "scheduler.run_batch.prebuilt": "cyan",
+    "scheduler.run_batch.overlap": "teal",
+    "scheduler.run_batch.pdmux": "orange",
+    "scheduler.run_batch.non_overlap_spec": "purple",
+    "scheduler.run_batch.plain": "gray",
+    # process_batch_result sub-stages
+    "scheduler.process_batch_result.decode": "red",
+    "scheduler.process_batch_result.dllm": "orange",
+    "scheduler.process_batch_result.disagg_prefill": "magenta",
+    "scheduler.process_batch_result.prefill": "purple",
+    "scheduler.process_batch_result.prebuilt": "cyan",
+    "scheduler.process_batch_result.idle": "gray",
 }
 
 _NULL_CONTEXT = nullcontext()
@@ -131,4 +144,5 @@ def profile_method(
 # Pre-bound per-subsystem helpers: torch spans always (under a profiler), nvtx
 # ranges only when that subsystem's gate is on.
 scheduler_nvtx_method = partial(profile_method, nvtx_enabled=NVTX_SCHEDULER_ENABLED)
+scheduler_nvtx_range = partial(profile_range, nvtx_enabled=NVTX_SCHEDULER_ENABLED)
 operations_nvtx_range = partial(profile_range, nvtx_enabled=NVTX_OPERATIONS_ENABLED)
