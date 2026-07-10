@@ -1,6 +1,7 @@
 """Unit tests for EmbeddingStore, FileEmbeddingStore, and EmbeddingStoreFactory."""
 
 import ctypes
+import os
 import shutil
 import tempfile
 import unittest
@@ -103,6 +104,85 @@ class TestFileEmbeddingStore(unittest.TestCase):
 
         results = self.store.batch_is_exist(["exists", "missing"])
         self.assertEqual(results, [True, False])
+
+    def test_batch_is_exist_ignores_directory(self):
+        os.makedirs(self.store._path_for_key(self.store.get_key("dirkey")))
+
+        results = self.store.batch_is_exist(["dirkey"])
+
+        self.assertEqual(results, [False])
+
+    def test_get_into_multi_buffers_returns_false_for_bad_path(self):
+        os.makedirs(self.store._path_for_key(self.store.get_key("badpath")))
+        read_buf = torch.empty(8, dtype=torch.uint8)
+
+        results = self.store.batch_get_into_multi_buffers(
+            ["badpath"], [[read_buf.data_ptr()]], [[8]]
+        )
+
+        self.assertEqual(results, [False])
+
+    def test_max_size_skips_put(self):
+        old_value = os.environ.get("SGLANG_MM_EMBEDDING_CACHE_MAX_SIZE")
+        os.environ["SGLANG_MM_EMBEDDING_CACHE_MAX_SIZE"] = "4"
+        try:
+            store = FileEmbeddingStore(storage_dir=self.test_dir)
+            data = b"too large"
+            buf = self._make_buffer(data)
+
+            results = store.batch_put(["large"], [buf.data_ptr()], [len(data)])
+
+            self.assertEqual(results, [False])
+            self.assertFalse(
+                os.path.exists(store._path_for_key(store.get_key("large")))
+            )
+        finally:
+            if old_value is None:
+                os.environ.pop("SGLANG_MM_EMBEDDING_CACHE_MAX_SIZE", None)
+            else:
+                os.environ["SGLANG_MM_EMBEDDING_CACHE_MAX_SIZE"] = old_value
+
+    def test_clear_on_start_removes_embedding_cache_files(self):
+        keep_path = os.path.join(self.test_dir, "keep.txt")
+        cache_path = self.store._path_for_key(self.store.get_key("old"))
+        tmp_path = cache_path + ".tmp.123"
+        with open(keep_path, "wb") as f:
+            f.write(b"keep")
+        with open(cache_path, "wb") as f:
+            f.write(b"old")
+        with open(tmp_path, "wb") as f:
+            f.write(b"tmp")
+
+        old_value = os.environ.get("SGLANG_MM_EMBEDDING_CACHE_CLEAR_ON_START")
+        os.environ["SGLANG_MM_EMBEDDING_CACHE_CLEAR_ON_START"] = "1"
+        try:
+            FileEmbeddingStore(storage_dir=self.test_dir)
+
+            self.assertTrue(os.path.exists(keep_path))
+            self.assertFalse(os.path.exists(cache_path))
+            self.assertFalse(os.path.exists(tmp_path))
+        finally:
+            if old_value is None:
+                os.environ.pop("SGLANG_MM_EMBEDDING_CACHE_CLEAR_ON_START", None)
+            else:
+                os.environ["SGLANG_MM_EMBEDDING_CACHE_CLEAR_ON_START"] = old_value
+
+    def test_clear_on_start_can_be_disabled(self):
+        cache_path = self.store._path_for_key(self.store.get_key("persist"))
+        with open(cache_path, "wb") as f:
+            f.write(b"persist")
+
+        old_value = os.environ.get("SGLANG_MM_EMBEDDING_CACHE_CLEAR_ON_START")
+        os.environ["SGLANG_MM_EMBEDDING_CACHE_CLEAR_ON_START"] = "0"
+        try:
+            FileEmbeddingStore(storage_dir=self.test_dir)
+
+            self.assertTrue(os.path.exists(cache_path))
+        finally:
+            if old_value is None:
+                os.environ.pop("SGLANG_MM_EMBEDDING_CACHE_CLEAR_ON_START", None)
+            else:
+                os.environ["SGLANG_MM_EMBEDDING_CACHE_CLEAR_ON_START"] = old_value
 
     def test_dedup_on_put(self):
         data1 = b"original"
