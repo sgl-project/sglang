@@ -1348,9 +1348,7 @@ def requant_weight_ue8m0_inplace(weight, weight_scale_inv, weight_block_size):
         weight.to(weight_scale_inv.device), weight_scale_inv, weight_block_size
     )
 
-    # Reuse existing storage where possible: on weight reloads this re-runs
-    # after the loader refilled raw checkpoint values, and captured CUDA
-    # graphs hold pointers to the buffers of the first pass.
+    # Preserve buffers referenced by captured CUDA graphs.
     if (
         weight.data.shape == new_weight.shape
         and weight.data.dtype == new_weight.dtype
@@ -1360,18 +1358,15 @@ def requant_weight_ue8m0_inplace(weight, weight_scale_inv, weight_block_size):
     else:
         offloader.update_param(weight, new_weight)
 
-    kernel_buffer = getattr(weight_scale_inv, "_kernel_buffer", None)
+    kernel_buffer = getattr(weight_scale_inv, "_reload_kernel_buffer", None)
     if (
         kernel_buffer is not None
         and kernel_buffer.shape == new_weight_scale_inv.shape
         and kernel_buffer.dtype == new_weight_scale_inv.dtype
     ):
-        # restore_weights_before_loading swapped in a checkpoint-shaped buffer
-        # for the refill; put the repacked scales back into the original
-        # kernel-layout storage.
         kernel_buffer.copy_(new_weight_scale_inv)
         weight_scale_inv.data = kernel_buffer
-        del weight_scale_inv._kernel_buffer
+        del weight_scale_inv._reload_kernel_buffer
     else:
         weight_scale_inv.data = new_weight_scale_inv
 
@@ -1540,11 +1535,7 @@ def inverse_transform_scale_ue8m0(sf_packed, mn):
 
 # Inverse impl can refer to DeepGEMM's torch impl in get_mn_major_tma_aligned_packed_ue8m0_tensor_torch_impl
 def _inverse_transform_scale_ue8m0_impl(sf_packed):
-    """
-    NOTE: We assume k is aligned
-    :param sf_packed: (scale_mn, scale_k/4) int32
-    :return: (scale_mn, scale_k), float32
-    """
+    """Unpack row-repeated UE8M0 scales into their block grid."""
     if len(sf_packed.shape) == 3:
         return torch.stack(
             [_inverse_transform_scale_ue8m0_impl(x) for x in sf_packed], dim=0
@@ -1554,26 +1545,27 @@ def _inverse_transform_scale_ue8m0_impl(sf_packed):
     assert len(sf_packed.shape) == 2, f"{sf_packed.shape=}"
     assert sf_packed.dtype == torch.int32
 
-    mn_repeat_128, k_div_4 = sf_packed.shape
-    mn = mn_repeat_128 // block_size
+    weight_mn, k_div_4 = sf_packed.shape
+    num_blocks = ceil_div(weight_mn, block_size)
     k = k_div_4 * 4
 
     # packed u8 -> fp32
-    sf_u8 = sf_packed.contiguous().flatten().view(torch.uint8).view(mn_repeat_128, k)
+    sf_u8 = sf_packed.contiguous().flatten().view(torch.uint8).view(weight_mn, k)
     sf_fp32 = (sf_u8.to(torch.int32) << 23).view(torch.float32)
 
-    # remove repeat
-    sf_reshaped = sf_fp32.view(mn, block_size, k)
-    sf_unrepeated = sf_reshaped[:, 0:1, :]
-    if not torch.all(sf_unrepeated == sf_reshaped):
+    # Take one scale row per block and verify the repeated rows.
+    block_first_rows = torch.arange(num_blocks, device=sf_fp32.device) * block_size
+    sf_unrepeated = sf_fp32.index_select(0, block_first_rows)
+    block_ids = torch.arange(weight_mn, device=sf_fp32.device) // block_size
+    if not torch.all(sf_fp32 == sf_unrepeated.index_select(0, block_ids)):
         from sglang.srt.debug_utils.dumper import get_tensor_info
 
         raise AssertionError(
-            f"sf_unrepeated != sf_reshaped ({get_tensor_info(sf_unrepeated)=} {get_tensor_info(sf_reshaped)=})"
+            f"scale rows differ within a block ({get_tensor_info(sf_fp32)=} {get_tensor_info(sf_unrepeated)=})"
         )
-    sf_unrepeated = sf_unrepeated.squeeze(1).contiguous()
+    sf_unrepeated = sf_unrepeated.contiguous()
 
-    assert sf_unrepeated.shape == (mn, k)
+    assert sf_unrepeated.shape == (num_blocks, k)
     return sf_unrepeated
 
 

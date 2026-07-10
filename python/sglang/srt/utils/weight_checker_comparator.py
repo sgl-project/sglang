@@ -7,10 +7,6 @@ from sglang.srt.layers.quantization.fp8_utils import (
     block_quant_dequant,
     inverse_transform_scale_ue8m0,
 )
-from sglang.srt.layers.quantization.modelopt_quant import (
-    ModelOptFp4LinearMethod,
-    ModelOptNvFp4FusedMoEMethod,
-)
 
 # chunk to avoid too high GPU memory peak
 CHUNK_NUMEL = 64 * 1024 * 1024
@@ -154,15 +150,11 @@ def compare_weights(
 
 
 def select_comparable_weight(quant_method) -> Optional[type]:
-    """Map a module's quant_method to its ComparableWeight. None means raw (bitwise equal) compare."""
+    """Return a quantized comparator, or None for bitwise comparison."""
     if (
         isinstance(quant_method, (Fp8LinearMethod, Fp8MoEMethod))
         and quant_method.block_quant
         and not quant_method.use_mxfp8
     ):
         return Fp8BlockComparable
-    if isinstance(quant_method, (ModelOptFp4LinearMethod, ModelOptNvFp4FusedMoEMethod)):
-        raise NotImplementedError(
-            f"weight checker has no ComparableWeight for {type(quant_method).__name__}"
-        )
     return None

@@ -165,8 +165,7 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
             weight = layer.weight
 
             if is_fp8_fnuz() or _use_aiter:
-                # ROCm paths transform the weight destructively (dtype
-                # normalize / aiter shuffle); not reload-safe.
+                # ROCm transforms replace the checkpoint-layout parameters.
                 if is_fp8_fnuz():
                     input_scale = getattr(layer, "input_scale", None)
 
@@ -181,21 +180,17 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
                     weight_scale = layer.weight_scale.data
 
                 if _use_aiter:
-                    # keep the weight as (N, K)
+                    # Keep the weight as (N, K).
                     layer.weight = Parameter(
                         shuffle_weight(weight, (16, 16)), requires_grad=False
                     )
                 else:
                     layer.weight = Parameter(weight.t(), requires_grad=False)
 
-                # required by torch.compile to be torch.nn.Parameter
+                # Required by torch.compile.
                 layer.weight_scale = Parameter(weight_scale, requires_grad=False)
             else:
-                # Keep the checkpoint-layout params (and their weight_loader)
-                # so update_weights_from_disk can refill them; the kernel takes
-                # a transposed VIEW of the same storage, so in-place refills
-                # are visible without re-deriving and pointers stay stable for
-                # CUDA graphs.
+                # Keep loader metadata and storage stable across reloads.
                 layer.weight.requires_grad_(False)
                 layer.weight_scale.requires_grad_(False)
                 layer.weight_t = layer.weight.data.t()
@@ -266,8 +261,6 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
         else:
             return apply_fp8_linear(
                 input=x,
-                # CHANNEL keeps the checkpoint-layout weight and derives the
-                # transposed view; TENSOR still stores the transpose in-place.
                 weight=getattr(layer, "weight_t", layer.weight),
                 weight_scale=layer.weight_scale,
                 input_scale=layer.input_scale,
