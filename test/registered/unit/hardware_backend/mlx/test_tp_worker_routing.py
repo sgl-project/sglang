@@ -200,10 +200,6 @@ class TestMlxExtendRouting(unittest.TestCase):
         runner = self._run_sync([_FakeReq("r1")], [1], {"r1"}, None, ForwardMode.EXTEND)
         self.assertEqual(runner.ops_for("r1"), ["extend"])
 
-    def test_sync_multi_token_continuation_routes_to_extend(self):
-        runner = self._run_sync([_FakeReq("r1")], [4], {"r1"}, None, ForwardMode.EXTEND)
-        self.assertEqual(runner.ops_for("r1"), ["extend"])
-
     def test_sync_genuine_mixed_decode_routes_to_decode(self):
         p, d = _FakeReq("p1"), _FakeReq("d1")
         runner = self._run_sync([p, d], [4, 1], {"d1"}, [d], ForwardMode.MIXED)

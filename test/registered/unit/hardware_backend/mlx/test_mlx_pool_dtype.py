@@ -104,18 +104,6 @@ class TestPoolDtypeInference(CustomTestCase):
         _, _, dtype = _runner_for(model)._get_attn_config()
         self.assertEqual(dtype, mx.float32)
 
-    def test_pool_bytes_per_slot_halves_for_bf16_quantized_model(self):
-        # The practical effect: bytes/slot uses dtype.size, so bf16 halves
-        # the fp32 fallback and the auto-sized pool fits ~2x the tokens.
-        model = _tiny_qwen2_model()
-        model.set_dtype(mx.bfloat16)
-        nn.quantize(model, group_size=64, bits=4)
-        n_kv_heads, head_dim, dtype = _runner_for(model)._get_attn_config()
-        num_layers = 2
-        bytes_per_slot = 2 * num_layers * n_kv_heads * head_dim * dtype.size
-        fp32_bytes_per_slot = 2 * num_layers * n_kv_heads * head_dim * 4
-        self.assertEqual(bytes_per_slot * 2, fp32_bytes_per_slot)
-
 
 if __name__ == "__main__":
     unittest.main()

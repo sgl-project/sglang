@@ -25,8 +25,7 @@ class IndexKeyCache:
 
     def __init__(self, pool: DSATokenToKVPool, index_buf_size: int):
         self.pool = pool
-        page_size = pool.page_size
-        index_head_dim = pool.index_head_dim
+        num_pages = (index_buf_size + pool.page_size + 1) // pool.page_size
         with (
             torch.cuda.use_mem_pool(pool.custom_mem_pool)
             if pool.custom_mem_pool
@@ -40,18 +39,23 @@ class IndexKeyCache:
                     #     data: for page i,
                     #         * buf[i, :page_size * head_dim] for fp8 data
                     #         * buf[i, page_size * head_dim:].view(float32) for scale
-                    (
-                        (index_buf_size + page_size + 1) // page_size,
-                        page_size
-                        * (
-                            index_head_dim + index_head_dim // pool.quant_block_size * 4
-                        ),
-                    ),
+                    self._buffer_shape(self._layer_num_pages(i, num_pages)),
                     dtype=pool.index_k_with_scale_buffer_dtype,
                     device=pool.device,
                 )
-                for _ in range(pool.layer_num)
+                for i in range(pool.layer_num)
             ]
+
+    def _buffer_shape(self, num_pages: int) -> tuple[int, int]:
+        pool = self.pool
+        return (
+            num_pages,
+            pool.page_size
+            * (pool.index_head_dim + pool.index_head_dim // pool.quant_block_size * 4),
+        )
+
+    def _layer_num_pages(self, layer_idx: int, num_pages: int) -> int:
+        return num_pages
 
     def clear(self) -> None:
         del self.buffer
