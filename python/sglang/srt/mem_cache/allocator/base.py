@@ -27,9 +27,7 @@ if TYPE_CHECKING:
 def expand_page_ids_to_token_ids(
     page_ids: torch.Tensor, page_size: int
 ) -> torch.Tensor:
-    page_offsets = torch.arange(
-        page_size, dtype=page_ids.dtype, device=page_ids.device
-    )
+    page_offsets = torch.arange(page_size, dtype=page_ids.dtype, device=page_ids.device)
     return (page_ids[:, None] * page_size + page_offsets[None, :]).reshape(-1)
 
 
