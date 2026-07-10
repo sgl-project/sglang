@@ -37,32 +37,24 @@ pub enum DetokMsg {
     Register {
         id: RequestId,
         sink: EgressSink,
-        /// Decode logprob token ids to text on this (CPU-bound) shard rather than
-        /// the api-server I/O threads.
+        /// Decode logprob token ids to text here (CPU-bound) not on the api threads.
         decode_logprob_text: bool,
-        /// `SamplingParams.no_stop_trim`: keep the matched stop string/token in the
-        /// output. Default (`false`) trims it, matching the Python detokenizer.
+        /// `SamplingParams.no_stop_trim`: keep the matched stop; default trims it.
         no_stop_trim: bool,
     },
-    Chunk(ChunkEvent),
-    /// Control result: one already-serialized payload delivered to the sink
-    /// verbatim (e.g. `/server_info`).
+    /// One decode step's chunks for *this shard*. Batched because `tm-egress` blocks
+    /// per send, so one message per request cost ~1.3 µs × batch (5.1x at 4096).
+    Chunks(Vec<ChunkEvent>),
+    /// Control result: one already-serialized payload delivered to the sink verbatim.
     Result {
         id: RequestId,
         payload: bytes::Bytes,
     },
-    /// Terminal per-request failure (e.g. an undecodable header): deliver an
-    /// `Error` to the sink and drop it, so the client gets a 400, not a crash.
-    Fail {
-        id: RequestId,
-        message: String,
-    },
-    /// Drop a registration for a request rejected before the scheduler. The
-    /// rejecting stage already notified the client, so this only removes the
-    /// `id -> sink` entry (else `Register` leaks one entry per rejected request).
-    Deregister {
-        id: RequestId,
-    },
+    /// Terminal per-request failure → an `Error` to the sink (a 400, not a crash).
+    Fail { id: RequestId, message: String },
+    /// Drop the `id -> sink` entry for a request rejected before the scheduler (the
+    /// rejecting stage already answered the client); else `Register` leaks one entry.
+    Deregister { id: RequestId },
 }
 
 /// Producer-side handles, cloned into every stage that needs to emit.

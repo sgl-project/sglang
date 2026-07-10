@@ -14,7 +14,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use bytes::Bytes;
 
 use crate::ids::RequestId;
-use crate::message::{EGRESS_TAG_BATCH, EGRESS_TAG_ERROR, EGRESS_TAG_RESULT, for_each_chunk};
+use crate::message::{
+    ChunkEvent, EGRESS_TAG_BATCH, EGRESS_TAG_ERROR, EGRESS_TAG_RESULT, for_each_chunk,
+};
 use crate::runtime::Runnable;
 use crate::runtime::channels::{DetokMsg, Senders, recv};
 use crate::runtime::ring::EgressConsumer;
@@ -52,25 +54,38 @@ impl Egress {
 
 impl Runnable for Egress {
     fn run(self) {
+        // Reused across frames (`clear` keeps capacity) — steady state allocates nothing.
+        let shards = self.senders.detok.len();
+        let mut buckets: Vec<Vec<ChunkEvent>> = (0..shards).map(|_| Vec::new()).collect();
+
         while let Some(bytes) = recv(self.egress.receiver(), &self.shutdown) {
             let Some((&tag, body)) = bytes.split_first() else {
                 continue;
             };
             match tag {
-                // A whole decode batch: decode each request and route it by rid in
-                // one pass (no intermediate `Vec<ChunkEvent>`; routing overlaps
-                // decode, peak memory is one request). The seq/load-balance the
-                // Python side used to track is now implicit in rid-based routing.
+                // A whole decode batch: bucket each request by the shard owning its
+                // rid, then hand each shard its chunks in one send.
                 EGRESS_TAG_BATCH => {
+                    for b in buckets.iter_mut() {
+                        b.clear();
+                    }
                     let ok = for_each_chunk(body, |ev| {
                         // rid is a raw u64 already (numeric column) — no parse.
-                        self.route(RequestId(ev.rid), DetokMsg::Chunk(ev));
+                        buckets[RequestId(ev.rid).shard(shards)].push(ev);
                     });
                     if !ok {
                         tracing::warn!("egress: bad batch frame");
                     }
-                    // Any frame off the ring = the scheduler produced output → the
-                    // pipeline is alive.
+                    for (i, b) in buckets.iter_mut().enumerate() {
+                        if b.is_empty() {
+                            continue;
+                        }
+                        let chunks = DetokMsg::Chunks(std::mem::take(b));
+                        if self.senders.detok[i].send(chunks).is_err() {
+                            tracing::error!("egress: detok shard closed");
+                        }
+                    }
+                    // Any frame off the ring = the scheduler produced output → alive.
                     self.activity.fetch_add(1, Ordering::Relaxed);
                 }
                 EGRESS_TAG_RESULT => {
@@ -90,11 +105,8 @@ impl Runnable for Egress {
 }
 
 impl Egress {
-    /// Route one message to the shard owning `rid`.
-    ///
-    /// HEAD-OF-LINE CEILING: if the HOL blocking is proved to be bottleneck
-    /// during extreme concurrency, we can align the egress dispatch workers
-    /// to detok workers.
+    /// Route one message to the shard owning `rid`. HOL ceiling: a slow shard stalls
+    /// this thread; the fix is a per-shard egress ring (see `threads::TM_CORES`).
     #[inline]
     fn route(&self, rid: RequestId, msg: DetokMsg) {
         if self.senders.detok_for(rid).send(msg).is_err() {
