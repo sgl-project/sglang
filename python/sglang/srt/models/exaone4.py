@@ -7,9 +7,6 @@ from transformers import Exaone4Config
 
 from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.dp_attention import (
-    get_local_attention_dp_size,
-)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -238,7 +235,6 @@ class Exaone4DecoderLayer(nn.Module):
 
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
 
-        self.local_dp_size = get_local_attention_dp_size()
         self.attn_tp_size = get_parallel().attn_tp_size
         self.attn_tp_rank = get_parallel().attn_tp_rank
 

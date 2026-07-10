@@ -36,7 +36,6 @@ from sglang.srt.models.glm4_moe_lite import (
     Glm4MoeLiteForCausalLM,
 )
 from sglang.srt.runtime_context import get_parallel, get_server_args
-from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import BumpAllocator, add_prefix, is_npu
 
 logger = logging.getLogger(__name__)
@@ -140,10 +139,7 @@ class Glm4MoeLiteForCausalLMNextN(Glm4MoeLiteForCausalLM):
         nn.Module.__init__(self)
         self.config = config
         self.tp_size = get_parallel().tp_size
-        if (
-            is_npu()
-            and get_global_server_args().speculative_draft_model_quantization is None
-        ):
+        if is_npu() and get_server_args().speculative_draft_model_quantization is None:
             quant_config = None
         self.quant_config = quant_config
 
