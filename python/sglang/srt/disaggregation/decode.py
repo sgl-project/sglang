@@ -64,8 +64,12 @@ from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, ReqKvInfo, ScheduleBatch
 from sglang.srt.managers.schedule_policy import match_prefix_for_req
 from sglang.srt.managers.utils import GenerationBatchResult
-from sglang.srt.mem_cache.allocation import assert_alloc_extend_lens_page_aligned
+from sglang.srt.mem_cache.allocation import (
+    assert_alloc_extend_lens_page_aligned,
+    use_legacy_paged_extend_alloc,
+)
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.base import expand_page_ids_to_token_ids
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     EvictParams,
@@ -355,7 +359,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         return (
             isinstance(self.token_to_kv_pool, (SWAKVPool, DeepSeekV4TokenToKVPool))
             and self.token_to_kv_pool_allocator.page_size > 1
-            and hasattr(self.token_to_kv_pool_allocator, "alloc_extend_swa_tail")
+            and hasattr(self.token_to_kv_pool_allocator, "alloc_pages_swa_tail")
         )
 
     def _swa_tail_len(self, seq_len: int) -> int:
@@ -1471,28 +1475,40 @@ def alloc_for_decode_prealloc_hisparse(
     *,
     req: Req,
     fill_len: int,
-) -> torch.Tensor:
+) -> Optional[torch.Tensor]:
     alloc_fill_len = fill_len if _is_npu else ceil_align(fill_len, allocator.page_size)
     if req.kv is None:
         req.kv = ReqKvInfo(kv_allocated_len=alloc_fill_len, swa_evicted_seqlen=0)
     else:
         req.kv.kv_allocated_len = alloc_fill_len
-    device = allocator.device
-    assert_alloc_extend_lens_page_aligned(
-        prefix_lens_cpu=torch.tensor([0], dtype=torch.int64),
-        seq_lens_cpu=torch.tensor([alloc_fill_len], dtype=torch.int64),
-        extend_num_tokens=alloc_fill_len,
-        page_size=allocator.page_size,
+    if _is_npu:
+        device = allocator.device
+        assert_alloc_extend_lens_page_aligned(
+            prefix_lens_cpu=torch.tensor([0], dtype=torch.int64),
+            seq_lens_cpu=torch.tensor([alloc_fill_len], dtype=torch.int64),
+            extend_num_tokens=alloc_fill_len,
+            page_size=allocator.page_size,
+        )
+        kv_loc = allocator.alloc_logical_only(
+            prefix_lens=torch.tensor([0], dtype=torch.int64, device=device),
+            prefix_lens_cpu=torch.tensor([0], dtype=torch.int64),
+            seq_lens=torch.tensor([alloc_fill_len], dtype=torch.int64, device=device),
+            seq_lens_cpu=torch.tensor([alloc_fill_len], dtype=torch.int64),
+            last_loc=torch.tensor([-1], dtype=torch.int64, device=device),
+            extend_num_tokens=alloc_fill_len,
+        )
+        return kv_loc
+
+    assert alloc_fill_len % allocator.page_size == 0, (
+        f"alloc_for_decode_prealloc_hisparse expects a page-aligned fill: "
+        f"{alloc_fill_len=}, {allocator.page_size=}"
     )
-    kv_loc = allocator.alloc_logical_only(
-        prefix_lens=torch.tensor([0], dtype=torch.int64, device=device),
-        prefix_lens_cpu=torch.tensor([0], dtype=torch.int64),
-        seq_lens=torch.tensor([alloc_fill_len], dtype=torch.int64, device=device),
-        seq_lens_cpu=torch.tensor([alloc_fill_len], dtype=torch.int64),
-        last_loc=torch.tensor([-1], dtype=torch.int64, device=device),
-        extend_num_tokens=alloc_fill_len,
+    logical_pages = allocator.alloc_logical_pages_only(
+        alloc_fill_len // allocator.page_size
     )
-    return kv_loc
+    if logical_pages is None:
+        return None
+    return expand_page_ids_to_token_ids(logical_pages, allocator.page_size)
 
 
 def alloc_for_decode_prealloc(
@@ -1506,7 +1522,7 @@ def alloc_for_decode_prealloc(
     prefix_indices: Optional[torch.Tensor],
     uses_swa_tail: bool,
     swa_tail_len: int,
-) -> torch.Tensor:
+) -> Optional[torch.Tensor]:
     alloc_fill_len = fill_len if _is_npu else ceil_align(fill_len, allocator.page_size)
     if req.kv is None:
         req.kv = ReqKvInfo(kv_allocated_len=alloc_fill_len, swa_evicted_seqlen=0)
@@ -1514,7 +1530,7 @@ def alloc_for_decode_prealloc(
         req.kv.kv_allocated_len = alloc_fill_len
     if allocator.page_size == 1:
         kv_loc = allocator.alloc(delta_len)
-    else:
+    elif use_legacy_paged_extend_alloc():
         device = allocator.device
         last_loc = (
             prefix_indices[-1:].to(dtype=torch.int64, device=device)
@@ -1563,6 +1579,40 @@ def alloc_for_decode_prealloc(
                 seq_lens_cpu=torch.tensor([alloc_fill_len], dtype=torch.int64),
                 last_loc=last_loc,
                 extend_num_tokens=alloc_fill_len - total_prefix_len,
+            )
+    else:
+        page_size = allocator.page_size
+        if uses_swa_tail:
+            # Tail-only SWA allocation: only valid when prefix_len == 0.
+            # When prefix_len > 0 (radix cache hit), we fall back to
+            # alloc_pages which allocates SWA at full page count; the
+            # SWA budget in that case may slightly under-estimate.
+            full_pages = allocator.alloc_pages_swa_tail(
+                num_full_pages=alloc_fill_len // page_size,
+                swa_tail_len=swa_tail_len,
+                fill_len=fill_len,
+            )
+            kv_loc = (
+                expand_page_ids_to_token_ids(full_pages, page_size)
+                if full_pages is not None
+                else None
+            )
+            req.kv.swa_evicted_seqlen = fill_len - swa_tail_len
+        else:
+            assert (
+                total_prefix_len % page_size == 0
+                and (alloc_fill_len - total_prefix_len) % page_size == 0
+            ), (
+                f"alloc_for_decode_prealloc expects a page-aligned alloc "
+                f"interval: {total_prefix_len=}, {alloc_fill_len=}, {page_size=}"
+            )
+            page_ids = allocator.alloc_pages(
+                (alloc_fill_len - total_prefix_len) // page_size
+            )
+            kv_loc = (
+                expand_page_ids_to_token_ids(page_ids, page_size)
+                if page_ids is not None
+                else None
             )
     return kv_loc
 
