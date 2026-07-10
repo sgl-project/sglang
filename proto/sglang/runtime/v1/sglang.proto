@@ -34,6 +34,20 @@ service SglangService {
   rpc UpdateWeightsFromDisk(UpdateWeightsRequest) returns (UpdateWeightsResponse);
 }
 
+// Disaggregated prefill/decode rendezvous parameters.
+//
+// Carried on Generate/TextGenerate requests when the worker is part of a
+// disaggregated deployment. The prefill leg writes its KV cache to the
+// bootstrap server identified by (bootstrap_host, bootstrap_port) under
+// the room id; the decode leg fetches it from the same room. Both legs
+// receive the same `bootstrap_room` from the router so they rendezvous
+// on the KV transfer.
+message DisaggregatedParams {
+  string bootstrap_host = 1;
+  int32 bootstrap_port = 2;
+  int64 bootstrap_room = 3;
+}
+
 // Sampling parameters shared across text and tokenized RPCs.
 message SamplingParams {
   optional float temperature = 1;
@@ -68,6 +82,8 @@ message TextGenerateRequest {
   optional string routing_key = 10;
   optional int32 routed_dp_rank = 11;
   map<string, string> trace_headers = 12;
+  optional string session_id = 13;
+  optional DisaggregatedParams disaggregated_params = 14;
 }
 
 message TextGenerateResponse {
@@ -90,6 +106,8 @@ message GenerateRequest {
   optional string routing_key = 9;
   optional int32 routed_dp_rank = 10;
   map<string, string> trace_headers = 11;
+  optional string session_id = 12;
+  optional DisaggregatedParams disaggregated_params = 13;
 }
 
 message GenerateResponse {

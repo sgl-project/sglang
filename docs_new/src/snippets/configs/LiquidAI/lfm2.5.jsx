@@ -11,6 +11,9 @@
 export const config = {
   modelName: "LFM2.5",
 
+  // TTFT/TPOT were recorded as Mean (no percentile restated in the source runs).
+  latencyPercentile: "Mean",
+
   supportedHardware: ["h100", "h200", "b200"],
 
   variants: [
@@ -18,6 +21,7 @@ export const config = {
     { id: "instruct", label: "1.2B Instruct", subtitle: "1.17B dense" },
     { id: "thinking", label: "1.2B Thinking", subtitle: "1.17B · reasoning" },
     { id: "350m",     label: "350M",          subtitle: "dense" },
+    { id: "230m",     label: "230M",          subtitle: "dense · compact" },
     { id: "jp",       label: "1.2B JP",       subtitle: "Japanese" },
     { id: "vl",       label: "VL 1.6B",       subtitle: "vision" },
     { id: "vl-450m",  label: "VL 450M",       subtitle: "vision · compact" },
@@ -37,6 +41,7 @@ export const config = {
     "instruct|bf16": "LiquidAI/LFM2.5-1.2B-Instruct",
     "thinking|bf16": "LiquidAI/LFM2.5-1.2B-Thinking",
     "350m|bf16":     "LiquidAI/LFM2.5-350M",
+    "230m|bf16":     "LiquidAI/LFM2.5-230M",
     "jp|bf16":       "LiquidAI/LFM2.5-1.2B-JP-202606",
     "vl|bf16":       "LiquidAI/LFM2.5-VL-1.6B",
     "vl-450m|bf16":  "LiquidAI/LFM2.5-VL-450M",
@@ -122,6 +127,7 @@ sgl-eval run aime25 \\
     thinking:  { mmlu_pct: 63.2, gsm8k_pct: 86.35, gpqa_pct: 39.08, aime25_pct: 27.08 },
     instruct:  { mmlu_pct: 60.33, gsm8k_pct: 75.13, gpqa_pct: 34.41, aime25_pct: 9.58 },
     "350m":    { mmlu_pct: 40.69, gsm8k_pct: 30.63, gpqa_pct: 28.35 },
+    "230m":    { mmlu_pct: 38.45, gsm8k_pct: 31.84, gpqa_pct: 27.78 },
     vl:        { mmmu_pct: 39.12 },
     "vl-450m": { mmmu_pct: 30.56 },
   },
@@ -197,6 +203,19 @@ sgl-eval run aime25 \\
     },
     {
       match: { hw: "h100", variant: "350m", quant: "bf16", strategy: "default", nodes: "single" },
+      verified: true,
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 1",
+        "--tool-call-parser lfm2",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "h100", variant: "230m", quant: "bf16", strategy: "default", nodes: "single" },
       verified: true,
       env: [],
       flags: [
@@ -313,6 +332,19 @@ sgl-eval run aime25 \\
       ],
     },
     {
+      match: { hw: "h200", variant: "230m", quant: "bf16", strategy: "default", nodes: "single" },
+      verified: true,
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 1",
+        "--tool-call-parser lfm2",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
       match: { hw: "h200", variant: "jp", quant: "bf16", strategy: "default", nodes: "single" },
       verified: true,
       env: [],
@@ -410,6 +442,20 @@ sgl-eval run aime25 \\
     },
     {
       match: { hw: "b200", variant: "350m", quant: "bf16", strategy: "default", nodes: "single" },
+      verified: true,
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 1",
+        "--attention-backend trtllm_mha",
+        "--tool-call-parser lfm2",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b200", variant: "230m", quant: "bf16", strategy: "default", nodes: "single" },
       verified: true,
       env: [],
       flags: [

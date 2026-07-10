@@ -86,6 +86,20 @@ def run_performance_test(
             perf_runner.add_report(results, variant=model.variant)
             print(f"✓ Performance test succeeded for {model.model_path}")
 
+            # The cumulative /server_info accept length is reset by the cache
+            # flush before the profiling phase, so it can be missing here. Fall
+            # back to the per-run accept lengths captured during benchmarking.
+            if avg_spec_accept_length is None:
+                run_accept_lengths = [
+                    r.acc_length
+                    for r in results
+                    if r.acc_length is not None and r.acc_length > 0
+                ]
+                if run_accept_lengths:
+                    avg_spec_accept_length = sum(run_accept_lengths) / len(
+                        run_accept_lengths
+                    )
+
             # Validate speculative decoding accept length if threshold is set
             error_msg = None
             passed = True

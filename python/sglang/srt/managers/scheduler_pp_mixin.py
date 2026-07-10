@@ -23,6 +23,7 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
     set_is_extend_in_batch,
 )
+from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.utils import (
     GenerationBatchResult,
@@ -107,10 +108,15 @@ class SchedulerPPMixin:
                             async_send=True,
                         )
                 with torch.profiler.record_function("get_next_batch_to_run"):
-                    self.mbs[mb_id] = self.get_next_batch_to_run()
+                    plan = self.get_next_batch_to_run(
+                        running_batch=self.running_batch, last_batch=self.last_batch
+                    )
+                    self.running_batch = plan.running_batch
+                    self.mbs[mb_id] = plan.batch_to_run
                 self.running_mbs[mb_id] = self.running_batch
-                self.cur_batch: Optional[ScheduleBatch] = self.mbs[mb_id]
-                if self.cur_batch:
+                cur_batch: Optional[ScheduleBatch] = self.mbs[mb_id]
+                self.cur_batch_for_debug = cur_batch
+                if cur_batch:
                     server_is_idle = False
                     pp_proxy_tensors = self._pp_recv_proxy_tensors()
                 next_pp_outputs = None
@@ -124,9 +130,10 @@ class SchedulerPPMixin:
                         )
                     )
                 self._pp_commit_comm_work(self.send_proxy_work)
-                if self.cur_batch:
+                if cur_batch:
                     result, self.launch_event = self._pp_launch_batch(
                         mb_id,
+                        cur_batch,
                         pp_proxy_tensors,
                         self.mb_metadata,
                         self.last_rank_comm_queue,
@@ -147,7 +154,7 @@ class SchedulerPPMixin:
                         )
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
                 if not self.pp_group.is_last_rank:
-                    if self.cur_batch:
+                    if cur_batch:
                         self.device_module.current_stream().wait_event(
                             self.launch_event
                         )
@@ -245,14 +252,19 @@ class SchedulerPPMixin:
                 self._pp_commit_comm_work(send_transfer_work)
                 tmbs[mb_id] = transferred_rids
 
-                self.process_prefill_chunk()
-                batch = self.get_new_batch_prefill()
+                self.process_prefill_chunk(
+                    last_batch=self.last_batch, running_batch=self.running_batch
+                )
+                prefill_plan = self.get_new_batch_prefill(self.running_batch)
+                batch = prefill_plan.batch_to_run
+                self.running_batch = prefill_plan.running_batch
                 batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(batch)
                 self.mbs[mb_id] = batch
                 self.running_mbs[mb_id] = self.running_batch
 
-                self.cur_batch: Optional[ScheduleBatch] = self.mbs[mb_id]
-                if self.cur_batch:
+                cur_batch: Optional[ScheduleBatch] = self.mbs[mb_id]
+                self.cur_batch_for_debug = cur_batch
+                if cur_batch:
                     server_is_idle = False
                     pp_proxy_tensors = self._pp_recv_proxy_tensors()
 
@@ -264,9 +276,10 @@ class SchedulerPPMixin:
                         )
                     )
                 self._pp_commit_comm_work(self.send_proxy_work)
-                if self.cur_batch:
+                if cur_batch:
                     result, self.launch_event = self._pp_launch_batch(
                         mb_id,
+                        cur_batch,
                         pp_proxy_tensors,
                         self.mb_metadata,
                         self.last_rank_comm_queue,
@@ -324,7 +337,7 @@ class SchedulerPPMixin:
                     send_transfer_work = self._pp_send_pyobj_to_next_stage(
                         transferred_rids, async_send=True
                     )
-                    if self.cur_batch:
+                    if cur_batch:
                         self.device_module.current_stream().wait_event(
                             self.launch_event
                         )
@@ -397,15 +410,20 @@ class SchedulerPPMixin:
                 self._pp_commit_comm_work(send_transfer_work)
 
                 # get batch to run and proxy tensors if needed
-                batch = self.get_next_disagg_decode_batch_to_run()
+                plan = self.get_next_disagg_decode_batch_to_run(
+                    running_batch=self.running_batch
+                )
+                self.running_batch = plan.running_batch
+                batch = plan.batch_to_run
                 self.mbs[mb_id] = batch
                 self.running_mbs[mb_id] = self.running_batch
 
-                self.cur_batch: Optional[ScheduleBatch] = self.mbs[mb_id]
-                if self.cur_batch:
+                cur_batch: Optional[ScheduleBatch] = self.mbs[mb_id]
+                self.cur_batch_for_debug = cur_batch
+                if cur_batch:
                     server_is_idle = False
                     pp_proxy_tensors = None
-                    if not self.cur_batch.forward_mode.is_prebuilt():
+                    if not cur_batch.forward_mode.is_prebuilt():
                         pp_proxy_tensors = self._pp_recv_proxy_tensors()
 
                 # early send output if possible
@@ -418,9 +436,10 @@ class SchedulerPPMixin:
                     )
                 self._pp_commit_comm_work(self.send_proxy_work)
 
-                if self.cur_batch:
+                if cur_batch:
                     result, self.launch_event = self._pp_launch_batch(
                         mb_id,
+                        cur_batch,
                         pp_proxy_tensors,
                         self.mb_metadata,
                         self.last_rank_comm_queue,
@@ -507,7 +526,7 @@ class SchedulerPPMixin:
                     send_transfer_work = self._pp_send_pyobj_to_next_stage(
                         transferred_rids, async_send=True
                     )
-                    if self.cur_batch and not self.cur_batch.forward_mode.is_prebuilt():
+                    if cur_batch and not cur_batch.forward_mode.is_prebuilt():
                         self.device_module.current_stream().wait_event(
                             self.launch_event
                         )
@@ -607,9 +626,10 @@ class SchedulerPPMixin:
                     sampling_params=sampling_params,
                 )
                 req.full_untruncated_fill_ids = req.origin_input_ids
-                req.fill_len = len(req.full_untruncated_fill_ids)
                 req.logprob_start_len = -1
-                req.set_extend_input_len(req.fill_len - len(req.prefix_indices))
+                req.set_extend_range(
+                    len(req.prefix_indices), len(req.full_untruncated_fill_ids)
+                )
 
                 # Prepare batch
                 batch = ScheduleBatch.init_new(
@@ -622,7 +642,7 @@ class SchedulerPPMixin:
                     self.spec_algorithm,
                 )
 
-                current_seq_len = req.fill_len
+                current_seq_len = req.extend_range.end
 
                 if is_dp_attention_enabled():
                     # For profiling, we only have one request on PP0
@@ -693,7 +713,7 @@ class SchedulerPPMixin:
                 # Release KV cache
                 if req.req_pool_idx is not None:
                     kv_indices = self.req_to_token_pool.req_to_token[
-                        req.req_pool_idx, : req.fill_len
+                        req.req_pool_idx, : req.extend_range.end
                     ]
                     self.token_to_kv_pool_allocator.free(kv_indices)
                     self.req_to_token_pool.free(req)
@@ -925,7 +945,9 @@ class SchedulerPPMixin:
     def _pp_send_pyobj_to_next_stage(self: Scheduler, data, async_send: bool = False):
         p2p_work = []
         if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
-            dp_offset = self.ps.attn_dp_rank * self.ps.attn_tp_size
+            dp_offset = (
+                self.ps.attn_dp_rank * self.ps.attn_cp_size * self.ps.attn_tp_size
+            )
             p2p_work = point_to_point_pyobj(
                 data,
                 self.ps.pp_rank * self.ps.tp_size + dp_offset,
@@ -938,7 +960,9 @@ class SchedulerPPMixin:
 
     def _pp_recv_pyobj_from_prev_stage(self: Scheduler):
         if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
-            dp_offset = self.ps.attn_dp_rank * self.ps.attn_tp_size
+            dp_offset = (
+                self.ps.attn_dp_rank * self.ps.attn_cp_size * self.ps.attn_tp_size
+            )
             data = point_to_point_pyobj(
                 [],
                 self.ps.pp_rank * self.ps.tp_size + dp_offset,
@@ -1109,7 +1133,9 @@ class SchedulerPPMixin:
         # PP rank 0 also relays into output_tokens_buf so the next iter's
         # resolve_forward_inputs finds these tokens for the decode portion
         # of mixed-chunk batches (which gather via mix_running_indices).
-        self.future_map.stash(batch.req_pool_indices, batch.input_ids)
+        self.future_map.stash(
+            batch.req_pool_indices, RelayPayload(bonus_tokens=batch.input_ids)
+        )
         output_result = GenerationBatchResult(
             logits_output=logits_output,
             pp_hidden_states_proxy_tensors=None,
@@ -1232,6 +1258,7 @@ class SchedulerPPMixin:
     def _pp_launch_batch(
         self: Scheduler,
         mb_id: int,
+        cur_batch: ScheduleBatch,
         pp_proxy_tensors: PPProxyTensors,
         mb_metadata: List[Optional[PPBatchMetadata]],
         last_rank_comm_queue: deque,
@@ -1240,13 +1267,13 @@ class SchedulerPPMixin:
             with self.forward_stream_ctx:
                 self.forward_stream.wait_stream(self.schedule_stream)
                 set_time_batch(
-                    self.cur_batch.reqs,
+                    cur_batch.reqs,
                     "set_run_batch_cpu_start_time",
                     trace_only=True,
                 )
-                result = self.run_batch(self.cur_batch, pp_proxy_tensors)
+                result = self.run_batch(cur_batch, pp_proxy_tensors)
                 set_time_batch(
-                    self.cur_batch.reqs,
+                    cur_batch.reqs,
                     "set_run_batch_cpu_end_time",
                     trace_only=True,
                     attrs={"pp_mb_id": mb_id},
@@ -1262,7 +1289,7 @@ class SchedulerPPMixin:
                         (
                             event,
                             PPProxyTensors(
-                                self._pp_prepare_tensor_dict(result, self.cur_batch)
+                                self._pp_prepare_tensor_dict(result, cur_batch)
                             ),
                         )
                     )
@@ -1475,11 +1502,11 @@ class ChunkSizePredictor:
     def set_target_latency(self, base_chunk_size: int):
         """Set target latency based on base chunk size: target = f(base_chunk_size) - f(0)."""
 
-        def f(l: float) -> float:
-            """Total latency function: f(l) = al^2 + bl + c (or bl + c for linear)"""
+        def f(length: float) -> float:
+            """Total latency function: f(length) = a*length^2 + b*length + c."""
             return (
-                self.quadratic_coeff_a * l * l
-                + self.linear_coeff_b * l
+                self.quadratic_coeff_a * length * length
+                + self.linear_coeff_b * length
                 + self.constant_coeff_c
             )
 

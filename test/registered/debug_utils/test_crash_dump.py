@@ -23,7 +23,7 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=40, suite="nightly-1-gpu", nightly=True)
 register_amd_ci(est_time=40, suite="nightly-amd-1-gpu", nightly=True)
-register_cpu_ci(est_time=225, suite="base-b-test-cpu")
+register_cpu_ci(est_time=225, suite="base-c-test-cpu")
 
 
 class TestCrashDump(CustomTestCase):

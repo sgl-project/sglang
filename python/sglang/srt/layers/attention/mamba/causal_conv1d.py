@@ -96,6 +96,8 @@ def causal_conv1d_fn(
         x = x.contiguous()
     bias = bias.contiguous() if bias is not None else None
 
+    if cache_indices is not None and cache_indices.dtype != torch.int32:
+        cache_indices = cache_indices.to(torch.int32)
     causal_conv1d_fwd(
         x,
         weight,
@@ -162,6 +164,8 @@ def causal_conv1d_update(
     unsqueeze = x.dim() == 2
     if unsqueeze:
         x = x.unsqueeze(-1)
+    if conv_state_indices is not None and conv_state_indices.dtype != torch.int32:
+        conv_state_indices = conv_state_indices.to(torch.int32)
     causal_conv1d_update_kernel(
         x,
         conv_state,

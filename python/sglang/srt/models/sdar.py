@@ -41,8 +41,7 @@ from sglang.srt.models.utils import (
     create_fused_set_kv_buffer_arg,
     enable_fused_set_kv_buffer,
 )
-from sglang.srt.runtime_context import get_parallel
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_parallel, get_server_args, get_stream
 from sglang.srt.utils import add_prefix, is_cuda, make_layers
 
 logger = logging.getLogger(__name__)
@@ -205,7 +204,7 @@ class SDARAttention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
-        if get_global_server_args().rl_on_policy_target is not None:
+        if get_server_args().rl_on_policy_target is not None:
             hidden_states = hidden_states.bfloat16()
 
         qkv, _ = self.qkv_proj(hidden_states)
@@ -233,7 +232,7 @@ class SDARAttention(nn.Module):
             ),
         )
 
-        if get_global_server_args().rl_on_policy_target is not None:
+        if get_server_args().rl_on_policy_target is not None:
             q = q.to(torch.bfloat16)
             k = k.to(torch.bfloat16)
 
@@ -268,7 +267,7 @@ class SDARBlock(nn.Module):
                 override_orig_dtype=torch.float32,
                 fp32_residual=True,
             )
-            if get_global_server_args().rl_on_policy_target is not None
+            if get_server_args().rl_on_policy_target is not None
             else {}
         )
         self.input_layernorm = RMSNorm(
@@ -392,7 +391,7 @@ class SDARModel(nn.Module):
                     override_orig_dtype=torch.float32,
                     fp32_residual=True,
                 )
-                if get_global_server_args().rl_on_policy_target is not None
+                if get_server_args().rl_on_policy_target is not None
                 else {}
             )
             self.norm = RMSNorm(self.embed_dim, eps=config.rms_norm_eps, **norm_kwargs)
@@ -449,7 +448,7 @@ class SDARForCausalLM(nn.Module):
 
         self.config = config
         self.quant_config = quant_config
-        alt_stream = torch.cuda.Stream() if _is_cuda else None
+        alt_stream = get_stream("alt") if _is_cuda else None
 
         self.model = SDARModel(
             config,
@@ -471,7 +470,7 @@ class SDARForCausalLM(nn.Module):
                     config.vocab_size,
                     config.hidden_size,
                     quant_config=quant_config,
-                    use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+                    use_attn_tp_group=get_server_args().enable_dp_lm_head,
                     prefix=add_prefix("lm_head", prefix),
                 )
         else:

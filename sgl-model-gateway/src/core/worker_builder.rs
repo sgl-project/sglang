@@ -5,8 +5,8 @@ use super::{
     model_card::ModelCard,
     model_type::ModelType,
     worker::{
-        BasicWorker, ConnectionMode, DPAwareWorker, HealthConfig, RuntimeType, WorkerMetadata,
-        WorkerRoutingKeyLoad, WorkerType,
+        parse_bootstrap_host_from_url, BasicWorker, ConnectionMode, DPAwareWorker, HealthConfig,
+        RuntimeType, WorkerMetadata, WorkerRoutingKeyLoad, WorkerType,
     },
 };
 use crate::{observability::metrics::Metrics, routers::grpc::client::GrpcClient};
@@ -133,28 +133,7 @@ impl BasicWorkerBuilder {
 
         use tokio::sync::OnceCell;
 
-        let bootstrap_host = match url::Url::parse(&self.url) {
-            Ok(parsed) => parsed.host_str().unwrap_or("localhost").to_string(),
-            Err(_) if !self.url.contains("://") => {
-                match url::Url::parse(&format!("http://{}", self.url)) {
-                    Ok(parsed) => parsed.host_str().unwrap_or("localhost").to_string(),
-                    Err(_) => {
-                        tracing::warn!(
-                            "Failed to parse URL '{}', defaulting to localhost",
-                            self.url
-                        );
-                        "localhost".to_string()
-                    }
-                }
-            }
-            Err(_) => {
-                tracing::warn!(
-                    "Failed to parse URL '{}', defaulting to localhost",
-                    self.url
-                );
-                "localhost".to_string()
-            }
-        };
+        let bootstrap_host = parse_bootstrap_host_from_url(&self.url);
 
         let bootstrap_port = match self.worker_type {
             WorkerType::Prefill { bootstrap_port } => bootstrap_port,

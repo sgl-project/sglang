@@ -26,7 +26,7 @@ class TestQwen317BGPTQInt8(GSM8KAscendMixin, CustomTestCase):
         "--attention-backend",
         "ascend",
         "--disable-cuda-graph",
-        "--cuda-graph-max-bs",
+        "--cuda-graph-max-bs-decode",
         32,
         "--tp-size",
         2,

@@ -212,6 +212,9 @@ class TestNixlKVArgsRegisterInfo(CustomTestCase):
             pack_int_lists(state_dims, "I"),
             struct.pack("Q", staging_ptr),
             b"1048576",
+            b"64",
+            b"DRAM,DRAM",
+            b"".join(struct.pack("Q", item_len) for item_len in [1024, 2048]),
         ]
 
         info = KVArgsRegisterInfo.from_zmq(msg)
@@ -228,6 +231,9 @@ class TestNixlKVArgsRegisterInfo(CustomTestCase):
         self.assertEqual(info.decode_tp_size, 4)
         self.assertEqual(info.decode_tp_rank, 1)
         self.assertEqual(info.dst_kv_item_len, 1024)
+        self.assertEqual(info.dst_kv_item_lens, [1024, 2048])
+        self.assertEqual(info.dst_num_slots, 64)
+        self.assertEqual(info.dst_kv_mem_kinds, ["DRAM", "DRAM"])
         self.assertEqual(info.dst_state_item_lens, state_item_lens)
         self.assertEqual(info.dst_state_dim_per_tensor, state_dims)
         self.assertIsNotNone(info.staging)
@@ -255,6 +261,7 @@ class TestNixlKVArgsRegisterInfo(CustomTestCase):
         self.assertEqual(info.dst_state_data_ptrs, [])
         self.assertEqual(info.dst_state_item_lens, [])
         self.assertEqual(info.dst_state_dim_per_tensor, [])
+        self.assertEqual(info.dst_kv_item_lens, [256])
         self.assertIsNone(info.staging)
 
 
@@ -523,6 +530,33 @@ class TestNixlStaging(CustomTestCase):
         mgr.server_args = SimpleNamespace(chunked_prefill_size=4)
         return mgr
 
+    def test_register_buffer_to_engine_groups_kv_memory_kinds_in_one_pass(self):
+        agent = StagingFakeAgent(register_result=["desc"])
+        mgr = self._make_manager(agent)
+        mgr.kv_args.kv_data_ptrs = [0x1000, 0x2000, 0x3000]
+        mgr.kv_args.kv_data_lens = [64, 128, 256]
+        mgr.kv_args.kv_data_mem_kinds = ["VRAM", "DRAM", "VRAM"]
+        mgr.kv_args.aux_data_ptrs = [0x4000]
+        mgr.kv_args.aux_data_lens = [32]
+        mgr.kv_args.state_data_ptrs = []
+        mgr.kv_args.state_data_lens = []
+
+        mgr.register_buffer_to_engine()
+
+        self.assertEqual(
+            agent.register_memory_calls,
+            [
+                (
+                    [(0x1000, 64, 1, ""), (0x3000, 256, 1, "")],
+                    "VRAM",
+                ),
+                ([(0x2000, 128, 0, "")], "DRAM"),
+                ([(0x4000, 32, 0, "")], "DRAM"),
+            ],
+        )
+        self.assertEqual(mgr.kv_descs, [["desc"], ["desc"]])
+        self.assertEqual(mgr.aux_descs, ["desc"])
+
     def test_register_staging_memory_uses_vram_and_fails_on_empty_descs(self):
         agent = StagingFakeAgent(register_result=["staging"])
         mgr = self._make_manager(agent)
@@ -601,7 +635,12 @@ class TestNixlStaging(CustomTestCase):
             },
         ):
             handle, deferred = mgr._do_staging_transfer(
-                strategy, kv_chunk, req, SimpleNamespace(), queue
+                strategy,
+                kv_chunk,
+                kv_chunk.prefill_kv_indices,
+                req,
+                SimpleNamespace(),
+                queue,
             )
 
         self.assertIsNone(handle)
@@ -640,6 +679,7 @@ class TestNixlStaging(CustomTestCase):
                 mgr._do_staging_transfer(
                     strategy,
                     kv_chunk,
+                    kv_chunk.prefill_kv_indices,
                     SimpleNamespace(room=3, agent_name="decode_agent"),
                     SimpleNamespace(),
                     FakeQueue(),
@@ -666,12 +706,14 @@ class TestNixlStaging(CustomTestCase):
             agent_name="decode_agent",
             agent_metadata=b"",
             dst_kv_ptrs=[],
+            dst_kv_mem_kinds=[],
             dst_aux_ptrs=[],
             dst_state_data_ptrs=[],
             gpu_id=5,
             decode_tp_size=1,
             decode_tp_rank=0,
             dst_kv_item_len=128,
+            dst_kv_item_lens=[],
             staging=SimpleNamespace(base_ptr=0x8000, total_size=4096),
         )
         calls = []
@@ -682,6 +724,7 @@ class TestNixlStaging(CustomTestCase):
         handle, deferred = mgr._do_staging_transfer(
             strategy,
             kv_chunk,
+            kv_chunk.prefill_kv_indices,
             SimpleNamespace(room=3, agent_name="decode_agent"),
             dst_info,
             FakeQueue(),

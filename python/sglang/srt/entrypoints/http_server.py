@@ -28,6 +28,7 @@ import uuid
 from contextlib import asynccontextmanager
 from http import HTTPStatus
 from typing import (
+    Annotated,
     Any,
     AsyncGenerator,
     AsyncIterator,
@@ -43,6 +44,7 @@ import requests
 import uvicorn
 import uvloop
 from fastapi import (
+    Body,
     Depends,
     FastAPI,
     File,
@@ -102,6 +104,7 @@ from sglang.srt.entrypoints.openai.serving_tokenize import (
 from sglang.srt.entrypoints.openai.serving_transcription import (
     OpenAIServingTranscription,
 )
+from sglang.srt.entrypoints.request_headers import apply_header_overrides
 from sglang.srt.entrypoints.warmup import execute_warmups
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
@@ -124,7 +127,7 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqInput,
     ParseFunctionCallReq,
     PauseGenerationReqInput,
-    ProfileReqInput,
+    ProfileReq,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
     SendWeightsToRemoteInstanceReqInput,
@@ -143,10 +146,10 @@ from sglang.srt.managers.multi_tokenizer_mixin import (
     MultiTokenizerRouter,
     TokenizerWorker,
     get_main_process_id,
+    get_tokenizer_worker_class,
     read_from_shared_memory,
     write_data_for_multi_tokenizer,
 )
-from sglang.srt.managers.template_manager import TemplateManager
 from sglang.srt.managers.tokenizer_manager import ServerStatus, TokenizerManager
 from sglang.srt.observability.func_timer import enable_func_timer
 from sglang.srt.observability.trace import (
@@ -155,6 +158,7 @@ from sglang.srt.observability.trace import (
     trace_set_thread_info,
 )
 from sglang.srt.parser.reasoning_parser import ReasoningParser
+from sglang.srt.parser.template_manager import TemplateManager
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     add_prometheus_middleware,
@@ -171,6 +175,7 @@ from sglang.srt.utils.json_response import (
     dumps_json,
     orjson_response,
 )
+from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.srt.utils.watchdog import SubprocessWatchdog
 from sglang.utils import get_exception_traceback
 from sglang.version import __version__
@@ -232,7 +237,8 @@ async def init_multi_tokenizer() -> ServerArgs:
     )
 
     # Launch multi-tokenizer manager process
-    tokenizer_manager = TokenizerWorker(server_args, port_args)
+    tokenizer_worker_class = get_tokenizer_worker_class(server_args)
+    tokenizer_manager = tokenizer_worker_class(server_args, port_args)
     template_manager = TemplateManager()
     template_manager.initialize_templates(
         tokenizer_manager=tokenizer_manager,
@@ -256,6 +262,8 @@ async def init_multi_tokenizer() -> ServerArgs:
 
 @asynccontextmanager
 async def lifespan(fast_api_app: FastAPI):
+    grpc_handle = None
+    warmup_thread = None
     if getattr(fast_api_app, "is_single_tokenizer_mode", False):
         server_args = fast_api_app.server_args
         warmup_thread_kwargs = fast_api_app.warmup_thread_kwargs
@@ -334,6 +342,10 @@ async def lifespan(fast_api_app: FastAPI):
 
         tool_server = MCPToolServer()
         await tool_server.add_tool_server(server_args.tool_server)
+    elif envs.EXA_API_KEY.get():
+        from sglang.srt.entrypoints.openai.tool_server import NativeToolServer
+
+        tool_server = NativeToolServer()
 
     try:
         from sglang.srt.entrypoints.openai.serving_responses import (
@@ -367,18 +379,38 @@ async def lifespan(fast_api_app: FastAPI):
         )
         logger.info("Warmup ended")
 
-    # Execute the general warmup
-    warmup_thread = threading.Thread(
-        target=_wait_and_warmup,
-        kwargs=warmup_thread_kwargs,
-    )
-    warmup_thread.start()
-
-    # Start the HTTP server
+    # Start the native gRPC server and warmup inside the try so a failure in
+    # either still runs the finally cleanup below. Native gRPC is enabled via
+    # --grpc-port / SGLANG_GRPC_PORT; only the single-tokenizer process is
+    # gRPC-capable (__post_init__ rejects --tokenizer-worker-num > 1).
     try:
+        if (
+            getattr(fast_api_app, "is_single_tokenizer_mode", False)
+            and server_args.grpc_port is not None
+            and not (server_args.smg_grpc_mode or server_args.grpc_mode)
+        ):
+            grpc_handle = _start_native_grpc_server_for_runtime(
+                server_args=server_args,
+                tokenizer_manager=_global_state.tokenizer_manager,
+                template_manager=_global_state.template_manager,
+                scheduler_info=_global_state.scheduler_info,
+            )
+
+        # Execute the general warmup
+        warmup_thread = threading.Thread(
+            target=_wait_and_warmup,
+            kwargs=warmup_thread_kwargs,
+        )
+        warmup_thread.start()
+
+        # Start the HTTP server
         yield
     finally:
-        warmup_thread.join()
+        _shutdown_native_grpc_server(grpc_handle)
+        if tool_server is not None and hasattr(tool_server, "aclose"):
+            await tool_server.aclose()
+        if warmup_thread is not None:
+            warmup_thread.join()
 
 
 # Fast API
@@ -393,6 +425,13 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+if envs.SGLANG_ENABLE_REQUEST_DECOMPRESSION.get():
+    from sglang.srt.entrypoints.http_request_decompression import (
+        RequestDecompressionMiddleware,
+    )
+
+    app.add_middleware(RequestDecompressionMiddleware)
 
 # Include routers
 from sglang.srt.entrypoints.v1_loads import router as v1_loads_router
@@ -696,23 +735,25 @@ async def server_info():
     server_args = _global_state.tokenizer_manager.server_args
 
     # server_args.model_config is not serializable but should be excluded by asdict.
-    return {
-        **dataclasses.asdict(server_args),
-        **_global_state.scheduler_info,
-        "internal_states": internal_states,
-        "version": __version__,
-        # Structured KV-event publisher descriptor for KV-aware routers.
-        # `None` when publishing is disabled or misconfigured; see
-        # `ServerArgs.describe_kv_events_publisher` for the precise contract.
-        "kv_events": server_args.describe_kv_events_publisher(),
-    }
+    return msgspec_to_builtins(
+        {
+            **dataclasses.asdict(server_args),
+            **_global_state.scheduler_info,
+            "internal_states": internal_states,
+            "version": __version__,
+            # Structured KV-event publisher descriptor for KV-aware routers.
+            # `None` when publishing is disabled or misconfigured; see
+            # `ServerArgs.describe_kv_events_publisher` for the precise contract.
+            "kv_events": server_args.describe_kv_events_publisher(),
+        }
+    )
 
 
 @app.get("/get_load")
 async def get_load():
     """Get load metrics (deprecated - use /v1/loads instead).
 
-    Legacy shim backed by /v1/loads. Projects GetLoadsReqOutput down to the
+    Legacy shim backed by /v1/loads. Projects the load snapshot down to the
     historical field shape (dp_rank, num_reqs, num_waiting_reqs, num_tokens,
     num_pending_tokens, ts_tic) so existing clients keep working.
     """
@@ -739,7 +780,9 @@ async def get_load():
 # curl -s -X POST http://localhost:30000/set_internal_state -H "Content-Type: application/json" -d '{"server_args": {"pp_max_micro_batch_size": 8}}'
 @app.api_route("/set_internal_state", methods=["POST", "PUT"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def set_internal_state(obj: SetInternalStateReq, request: Request):
+async def set_internal_state(
+    obj: Annotated[SetInternalStateReq, Body()], request: Request
+):
     res = await _global_state.tokenizer_manager.set_internal_state(obj)
     return res
 
@@ -768,6 +811,8 @@ if os.environ.get("DUMPER_SERVER_PORT") == "reuse":
 )
 async def generate_request(obj: GenerateReqInput, request: Request):
     """Handle a generate request."""
+    if envs.SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES.get():
+        apply_header_overrides(obj, request.headers)
     if obj.stream:
 
         async def stream_results() -> AsyncIterator[bytes]:
@@ -950,7 +995,9 @@ async def clear_hicache_storage_backend():
 #   }'
 @app.api_route("/hicache/storage-backend", methods=["PUT"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def attach_hicache_storage_backend(obj: AttachHiCacheStorageReqInput):
+async def attach_hicache_storage_backend(
+    obj: Annotated[AttachHiCacheStorageReqInput, Body()],
+):
     """Attach (enable) HiCache storage backend at runtime.
 
     Only allowed when there are NO running / queued requests.
@@ -964,7 +1011,7 @@ async def attach_hicache_storage_backend(obj: AttachHiCacheStorageReqInput):
         hicache_storage_prefetch_policy=obj.hicache_storage_prefetch_policy,
         hicache_write_policy=obj.hicache_write_policy,
     )
-    msg = getattr(ret, "message", "")
+    msg = ret.message
     return Response(
         content=(
             (
@@ -991,7 +1038,7 @@ async def detach_hicache_storage_backend():
         return _admin_api_key_missing_response()
 
     ret = await _global_state.tokenizer_manager.detach_hicache_storage()
-    msg = getattr(ret, "message", "")
+    msg = ret.message
     return Response(
         content=(
             (
@@ -1024,23 +1071,9 @@ async def hicache_storage_backend_status():
 
 @app.api_route("/start_profile", methods=["GET", "POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def start_profile_async(obj: Optional[ProfileReqInput] = None):
+async def start_profile_async(obj: Annotated[Optional[ProfileReq], Body()] = None):
     """Start profiling."""
-    if obj is None:
-        obj = ProfileReqInput()
-
-    await _global_state.tokenizer_manager.start_profile(
-        output_dir=obj.output_dir,
-        start_step=obj.start_step,
-        num_steps=obj.num_steps,
-        activities=obj.activities,
-        with_stack=obj.with_stack,
-        record_shapes=obj.record_shapes,
-        profile_by_stage=obj.profile_by_stage,
-        merge_profiles=obj.merge_profiles,
-        profile_prefix=obj.profile_prefix,
-        profile_stages=obj.profile_stages,
-    )
+    await _global_state.tokenizer_manager.start_profile(obj or ProfileReq())
     return Response(
         content="Start profiling.\n",
         status_code=200,
@@ -1116,7 +1149,9 @@ async def dump_expert_distribution_record_async():
 
 @app.post("/update_weights_from_disk")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def update_weights_from_disk(obj: UpdateWeightFromDiskReqInput, request: Request):
+async def update_weights_from_disk(
+    obj: Annotated[UpdateWeightFromDiskReqInput, Body()], request: Request
+):
     """Update the weights from disk inplace without re-launching the server."""
     (
         success,
@@ -1144,7 +1179,8 @@ async def update_weights_from_disk(obj: UpdateWeightFromDiskReqInput, request: R
 @app.post("/init_weights_send_group_for_remote_instance")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def init_weights_send_group_for_remote_instance(
-    obj: InitWeightsSendGroupForRemoteInstanceReqInput, request: Request
+    obj: Annotated[InitWeightsSendGroupForRemoteInstanceReqInput, Body()],
+    request: Request,
 ):
     (
         success,
@@ -1162,7 +1198,7 @@ async def init_weights_send_group_for_remote_instance(
 @app.post("/send_weights_to_remote_instance")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def send_weights_to_remote_instance(
-    obj: SendWeightsToRemoteInstanceReqInput, request: Request
+    obj: Annotated[SendWeightsToRemoteInstanceReqInput, Body()], request: Request
 ):
     (
         success,
@@ -1218,7 +1254,7 @@ async def remote_instance_transfer_engine_info(rank: int = None):
 @app.post("/init_weights_update_group")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def init_weights_update_group(
-    obj: InitWeightsUpdateGroupReqInput, request: Request
+    obj: Annotated[InitWeightsUpdateGroupReqInput, Body()], request: Request
 ):
     """Initialize the parameter update group."""
     success, message = await _global_state.tokenizer_manager.init_weights_update_group(
@@ -1234,7 +1270,7 @@ async def init_weights_update_group(
 @app.post("/destroy_weights_update_group")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def destroy_weights_update_group(
-    obj: DestroyWeightsUpdateGroupReqInput, request: Request
+    obj: Annotated[DestroyWeightsUpdateGroupReqInput, Body()], request: Request
 ):
     """Destroy the parameter update group."""
     (
@@ -1250,7 +1286,7 @@ async def destroy_weights_update_group(
 @app.post("/update_weights_from_tensor")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def update_weights_from_tensor(
-    obj: UpdateWeightsFromTensorReqInput, request: Request
+    obj: Annotated[UpdateWeightsFromTensorReqInput, Body()], request: Request
 ):
     """Update the weights from tensor inplace without re-launching the server.
     Notes:
@@ -1272,7 +1308,7 @@ async def update_weights_from_tensor(
 @app.post("/update_weights_from_distributed")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def update_weights_from_distributed(
-    obj: UpdateWeightsFromDistributedReqInput, request: Request
+    obj: Annotated[UpdateWeightsFromDistributedReqInput, Body()], request: Request
 ):
     """Update model parameter from distributed online."""
     (
@@ -1291,7 +1327,9 @@ async def update_weights_from_distributed(
 
 @app.post("/update_weights_from_ipc")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def update_weights_from_ipc(obj: UpdateWeightsFromIPCReqInput, request: Request):
+async def update_weights_from_ipc(
+    obj: Annotated[UpdateWeightsFromIPCReqInput, Body()], request: Request
+):
     """Update the weights from IPC (Inter-Process Communication) for checkpoint-engine integration."""
     success, message = await _global_state.tokenizer_manager.update_weights_from_ipc(
         obj, request
@@ -1308,7 +1346,9 @@ async def update_weights_from_ipc(obj: UpdateWeightsFromIPCReqInput, request: Re
 
 @app.post("/update_weight_version")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def update_weight_version(obj: UpdateWeightVersionReqInput, request: Request):
+async def update_weight_version(
+    obj: Annotated[UpdateWeightVersionReqInput, Body()], request: Request
+):
     """Update the weight version. This operation requires no active requests."""
     if obj.abort_all_requests:
         _global_state.tokenizer_manager.abort_request(abort_all=True)
@@ -1317,7 +1357,9 @@ async def update_weight_version(obj: UpdateWeightVersionReqInput, request: Reque
     # since weight_version update is a simple operation that doesn't affect model weights
     try:
         # Update the weight version in server args (the single source of truth)
-        _global_state.tokenizer_manager.server_args.weight_version = obj.new_version
+        _global_state.tokenizer_manager.server_args.override(
+            "http.update_weight_version", weight_version=obj.new_version
+        )
 
         return ORJSONResponse(
             {
@@ -1339,7 +1381,9 @@ async def update_weight_version(obj: UpdateWeightVersionReqInput, request: Reque
 
 @app.api_route("/get_weights_by_name", methods=["GET", "POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def get_weights_by_name(obj: GetWeightsByNameReqInput, request: Request):
+async def get_weights_by_name(
+    obj: Annotated[GetWeightsByNameReqInput, Body()], request: Request
+):
     """Get model parameter by name."""
     try:
         ret = await _global_state.tokenizer_manager.get_weights_by_name(obj, request)
@@ -1354,7 +1398,7 @@ async def get_weights_by_name(obj: GetWeightsByNameReqInput, request: Request):
 @app.api_route("/release_memory_occupation", methods=["GET", "POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def release_memory_occupation(
-    obj: ReleaseMemoryOccupationReqInput, request: Request
+    obj: Annotated[ReleaseMemoryOccupationReqInput, Body()], request: Request
 ):
     """Release GPU memory occupation temporarily."""
     try:
@@ -1366,7 +1410,7 @@ async def release_memory_occupation(
 @app.api_route("/resume_memory_occupation", methods=["GET", "POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def resume_memory_occupation(
-    obj: ResumeMemoryOccupationReqInput, request: Request
+    obj: Annotated[ResumeMemoryOccupationReqInput, Body()], request: Request
 ):
     """Resume GPU memory occupation."""
     try:
@@ -1378,7 +1422,8 @@ async def resume_memory_occupation(
 @app.api_route("/weights_checker", methods=["GET", "POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def check_weights(
-    obj: Optional[CheckWeightsReqInput] = None, request: Request = None
+    obj: Annotated[Optional[CheckWeightsReqInput], Body()] = None,
+    request: Request = None,
 ):
     if obj is None:
         obj = CheckWeightsReqInput()
@@ -1395,7 +1440,7 @@ async def check_weights(
 
 @app.api_route("/slow_down", methods=["GET", "POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def slow_down(obj: SlowDownReqInput, request: Request):
+async def slow_down(obj: Annotated[SlowDownReqInput, Body()], request: Request):
     """Slow down the system deliberately. Only for testing. Example scenario:
     when we want to test performance of D in large-scale PD disaggregation and have no enough nodes for P,
     we can use this to slow down D to let it have enough running sequences, and then disable slowdown
@@ -1409,57 +1454,40 @@ async def slow_down(obj: SlowDownReqInput, request: Request):
 
 @app.api_route("/load_lora_adapter", methods=["POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def load_lora_adapter(obj: LoadLoRAAdapterReqInput, request: Request):
+async def load_lora_adapter(
+    obj: Annotated[LoadLoRAAdapterReqInput, Body()], request: Request
+):
     """Load a new LoRA adapter without re-launching the server."""
     result = await _global_state.tokenizer_manager.load_lora_adapter(obj, request)
-
-    if result.success:
-        return ORJSONResponse(
-            result,
-            status_code=HTTPStatus.OK,
-        )
-    else:
-        return ORJSONResponse(
-            result,
-            status_code=HTTPStatus.BAD_REQUEST,
-        )
+    status_code = HTTPStatus.OK if result.success else HTTPStatus.BAD_REQUEST
+    return ORJSONResponse(msgspec_to_builtins(result), status_code=status_code)
 
 
 @app.api_route("/load_lora_adapter_from_tensors", methods=["POST"])
 async def load_lora_adapter_from_tensors(
-    obj: LoadLoRAAdapterFromTensorsReqInput, request: Request
+    obj: Annotated[LoadLoRAAdapterFromTensorsReqInput, Body()], request: Request
 ):
     """Load a new LoRA adapter from tensors without re-launching the server."""
     result = await _global_state.tokenizer_manager.load_lora_adapter_from_tensors(
         obj, request
     )
-
-    if result.success:
-        return ORJSONResponse(result, status_code=HTTPStatus.OK)
-    else:
-        return ORJSONResponse(result, status_code=HTTPStatus.BAD_REQUEST)
+    status_code = HTTPStatus.OK if result.success else HTTPStatus.BAD_REQUEST
+    return ORJSONResponse(msgspec_to_builtins(result), status_code=status_code)
 
 
 @app.api_route("/unload_lora_adapter", methods=["POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def unload_lora_adapter(obj: UnloadLoRAAdapterReqInput, request: Request):
+async def unload_lora_adapter(
+    obj: Annotated[UnloadLoRAAdapterReqInput, Body()], request: Request
+):
     """Load a new LoRA adapter without re-launching the server."""
     result = await _global_state.tokenizer_manager.unload_lora_adapter(obj, request)
-
-    if result.success:
-        return ORJSONResponse(
-            result,
-            status_code=HTTPStatus.OK,
-        )
-    else:
-        return ORJSONResponse(
-            result,
-            status_code=HTTPStatus.BAD_REQUEST,
-        )
+    status_code = HTTPStatus.OK if result.success else HTTPStatus.BAD_REQUEST
+    return ORJSONResponse(msgspec_to_builtins(result), status_code=status_code)
 
 
 @app.api_route("/open_session", methods=["GET", "POST"])
-async def open_session(obj: OpenSessionReqInput, request: Request):
+async def open_session(obj: Annotated[OpenSessionReqInput, Body()], request: Request):
     """Open a session, and return its unique session id."""
     try:
         session_id = await _global_state.tokenizer_manager.open_session(obj, request)
@@ -1473,7 +1501,7 @@ async def open_session(obj: OpenSessionReqInput, request: Request):
 
 
 @app.api_route("/close_session", methods=["GET", "POST"])
-async def close_session(obj: CloseSessionReqInput, request: Request):
+async def close_session(obj: Annotated[CloseSessionReqInput, Body()], request: Request):
     """Close the session."""
     try:
         await _global_state.tokenizer_manager.close_session(obj, request)
@@ -1484,7 +1512,9 @@ async def close_session(obj: CloseSessionReqInput, request: Request):
 
 @app.api_route("/configure_logging", methods=["GET", "POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def configure_logging(obj: ConfigureLoggingReq, request: Request):
+async def configure_logging(
+    obj: Annotated[ConfigureLoggingReq, Body()], request: Request
+):
     """Configure the request logging options."""
     _global_state.tokenizer_manager.configure_logging(obj)
     return Response(status_code=200)
@@ -1492,7 +1522,7 @@ async def configure_logging(obj: ConfigureLoggingReq, request: Request):
 
 @app.post("/abort_request")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def abort_request(obj: AbortReq, request: Request):
+async def abort_request(obj: Annotated[AbortReq, Body()], request: Request):
     """Abort a request."""
     try:
         _global_state.tokenizer_manager.abort_request(
@@ -1504,12 +1534,18 @@ async def abort_request(obj: AbortReq, request: Request):
 
 
 @app.post("/parse_function_call")
-async def parse_function_call_request(obj: ParseFunctionCallReq, request: Request):
+async def parse_function_call_request(
+    obj: Annotated[ParseFunctionCallReq, Body()], request: Request
+):
     """
     A native API endpoint to parse function calls from a text.
     """
     # 1) Initialize the parser based on the request body
-    parser = FunctionCallParser(tools=obj.tools, tool_call_parser=obj.tool_call_parser)
+    parser = FunctionCallParser(
+        tools=obj.tools,
+        tool_call_parser=obj.tool_call_parser,
+        tokenizer=get_global_state().tokenizer_manager.tokenizer,
+    )
 
     # 2) Call the non-stream parsing method (non-stream)
     normal_text, calls = parser.parse_non_stream(obj.text)
@@ -1526,15 +1562,21 @@ async def parse_function_call_request(obj: ParseFunctionCallReq, request: Reques
 
 
 @app.post("/separate_reasoning")
-async def separate_reasoning_request(obj: SeparateReasoningReqInput, request: Request):
+async def separate_reasoning_request(
+    obj: Annotated[SeparateReasoningReqInput, Body()], request: Request
+):
     """
     A native API endpoint to separate reasoning from a text.
     """
     # 1) Initialize the parser based on the request body
-    parser = ReasoningParser(model_type=obj.reasoning_parser, request=request)
+    parser = ReasoningParser(
+        model_type=obj.reasoning_parser,
+        request=request,
+        tokenizer=get_global_state().tokenizer_manager.tokenizer,
+    )
 
     # 2) Call the non-stream parsing method (non-stream)
-    if getattr(obj, "return_blocks", False):
+    if obj.return_blocks:
         blocks = parser.parse_non_stream_blocks(obj.text)
         reasoning_blocks = [b["text"] for b in blocks if b["type"] == "reasoning"]
         text_blocks = [b["text"] for b in blocks if b["type"] == "text"]
@@ -1548,7 +1590,7 @@ async def separate_reasoning_request(obj: SeparateReasoningReqInput, request: Re
         "reasoning_text": reasoning_text,
         "text": normal_text,
     }
-    if getattr(obj, "return_blocks", False):
+    if obj.return_blocks:
         response_data["reasoning_blocks"] = reasoning_blocks
         response_data["text_blocks"] = text_blocks
         response_data["blocks"] = blocks
@@ -1558,7 +1600,9 @@ async def separate_reasoning_request(obj: SeparateReasoningReqInput, request: Re
 
 @app.post("/pause_generation")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def pause_generation(obj: PauseGenerationReqInput, request: Request):
+async def pause_generation(
+    obj: Annotated[PauseGenerationReqInput, Body()], request: Request
+):
     """Pause generation."""
     await _global_state.tokenizer_manager.pause_generation(obj)
     return ORJSONResponse(
@@ -1569,7 +1613,9 @@ async def pause_generation(obj: PauseGenerationReqInput, request: Request):
 
 @app.post("/continue_generation")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def continue_generation(obj: ContinueGenerationReqInput, request: Request):
+async def continue_generation(
+    obj: Annotated[ContinueGenerationReqInput, Body()], request: Request
+):
     """Continue generation."""
     await _global_state.tokenizer_manager.continue_generation(obj)
     return ORJSONResponse(
@@ -1908,7 +1954,9 @@ async def sagemaker_chat_completions(
 
 ## Vertex AI API
 @app.post(os.environ.get("AIP_PREDICT_ROUTE", "/vertex_generate"))
-async def vertex_generate(vertex_req: VertexGenerateReqInput, raw_request: Request):
+async def vertex_generate(
+    vertex_req: Annotated[VertexGenerateReqInput, Body()], raw_request: Request
+):
     if not vertex_req.instances:
         return []
     inputs = {}
@@ -2450,6 +2498,51 @@ def _setup_and_run_http_server(
                 multi_tokenizer_args_shm.unlink()
             if _global_state is not None:
                 _global_state.tokenizer_manager.socket_mapping.clear_all_sockets()
+
+
+def _start_native_grpc_server_for_runtime(
+    server_args,
+    tokenizer_manager,
+    template_manager,
+    scheduler_info,
+):
+    try:
+        from sglang.srt.entrypoints.grpc_bridge import RuntimeHandle
+        from sglang.srt.grpc import _core as grpc_native
+    except ImportError as e:
+        raise RuntimeError(
+            "Native gRPC extension (sglang.srt.grpc._core) not found in this wheel, "
+            "but --grpc-port was set. The extension is built from "
+            "rust/sglang-grpc/ via setuptools-rust during wheel build. Either "
+            "install a wheel that includes the extension or unset --grpc-port."
+        ) from e
+
+    runtime_handle = RuntimeHandle(
+        tokenizer_manager=tokenizer_manager,
+        template_manager=template_manager,
+        server_args=server_args,
+        scheduler_info=scheduler_info or {},
+    )
+
+    grpc_handle = grpc_native.start_server(
+        host=server_args.host,
+        port=server_args.grpc_port,
+        runtime_handle=runtime_handle,
+        worker_threads=server_args.grpc_worker_threads,
+    )
+    logger.info(
+        f"Native gRPC server started on {server_args.host}:{server_args.grpc_port}"
+    )
+    return grpc_handle
+
+
+def _shutdown_native_grpc_server(grpc_handle) -> None:
+    if grpc_handle is None:
+        return
+    try:
+        grpc_handle.shutdown()
+    except Exception as e:
+        logger.warning(f"Failed to shut down native gRPC server: {e}")
 
 
 def launch_server(

@@ -29,6 +29,10 @@ BUILTIN_MODEL_OVERLAY_REGISTRY: dict[str, dict[str, Any]] = {
         "overlay_repo_id": "MickJ/LTX-2.3-overlay",
         "overlay_revision": "e0cc94f279ec16bb87c230134d40319f6ce40c5e",
     },
+    "jdopensource/JoyAI-Echo": {
+        "overlay_repo_id": "Niehen6174/JoyAI-Echo-overlay",
+        "overlay_revision": "0a19f315c96532b7a5f61bcd765d1fefdd83dc7d",
+    },
     "Efficient-Large-Model/SANA-WM_bidirectional": {
         "overlay_repo_id": "sjmshsh/SANA-WM_bidirectional-overlay",
         "overlay_revision": "e611beacbcc0cf33c676306ae0eb89f149e044ad",

@@ -57,12 +57,14 @@ class HiSparseCoordinator:
         device: str,
         tp_group,
         host_to_device_ratio: int = 2,
+        swap_in_block_size: int = 960,
     ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.top_k = top_k
         self.device_buffer_size = device_buffer_size
         self.device = device
+        self.swap_in_block_size = swap_in_block_size
         self.compress_ratio = self.token_to_kv_pool_allocator.compress_ratio
 
         self.is_dsv4_hisparse = isinstance(
@@ -217,7 +219,7 @@ class HiSparseCoordinator:
         req.hisparse_staging = True
 
         full_kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : req.fill_len
+            req.req_pool_idx, : req.extend_range.end
         ].to(dtype=torch.int64, copy=True)
         device_indices = (
             self.mem_pool_device.translate_loc_from_full_to_hisparse_device(
@@ -308,7 +310,7 @@ class HiSparseCoordinator:
 
     def alloc_device_buffer(self, req: Req) -> None:
         if self.is_dsv4_hisparse:
-            allocated_len = req.fill_len
+            allocated_len = req.extend_range.end
             alloc_size = self.padded_buffer_size
         else:
             allocated_len = req.kv_allocated_len
@@ -729,7 +731,7 @@ class HiSparseCoordinator:
         # Wait for any in-flight staging DMA to complete before freeing
         self.write_staging_stream.synchronize()
 
-        prefill_len = req.fill_len
+        prefill_len = req.extend_range.end
         allocated_locs = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, :prefill_len
         ]
@@ -815,8 +817,6 @@ class HiSparseCoordinator:
         top_k_indices = self.top_k_device_locs_buffer[:num_reqs]
         top_k_indices.fill_(-1)
 
-        # todo, adjustable for performance
-        block_size = 1024
         swap_in_fn = (
             load_cache_to_device_buffer_dsv4_mla
             if self.is_dsv4_hisparse
@@ -837,7 +837,7 @@ class HiSparseCoordinator:
             num_top_k=self.top_k,
             hot_buffer_size=self.device_buffer_size,
             page_size=1,
-            block_size=block_size,
+            block_size=self.swap_in_block_size,
             num_real_reqs=self.num_real_reqs,
         )
         return top_k_indices

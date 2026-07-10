@@ -3,6 +3,7 @@ This unittest is introduced in #22360, preventing duplicate transformer safetens
 """
 
 import json
+import os
 import sys
 import tempfile
 import types
@@ -48,16 +49,20 @@ from sglang.multimodal_gen.runtime.layers.linear import UnquantizedLinearMethod
 from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config import (
     NunchakuConfig,
 )
+from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8Config
 from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
+    ModelOptFp8Config,
     _prepare_nvfp4_weight_bytes,
 )
 from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
     _filter_duplicate_precision_variant_safetensors,
     _Flux2Nvfp4FallbackAdapter,
+    _needs_device_weight_postprocess,
     resolve_transformer_quant_load_spec,
     resolve_transformer_safetensors_to_load,
 )
+from sglang.multimodal_gen.runtime.loader.weight_load_plan import WeightLoadPlan
 from sglang.multimodal_gen.runtime.models.dits.flux import FluxSingleTransformerBlock
 from sglang.multimodal_gen.runtime.utils.quantization_utils import (
     build_nvfp4_config_from_safetensors_list,
@@ -76,6 +81,18 @@ class _FakeQuantConfig:
     @classmethod
     def get_name(cls):
         return "modelopt_fp4"
+
+
+def _make_quant_config(name: str, **attrs):
+    cls = type(
+        f"_Fake{name.title().replace('_', '')}QuantConfig",
+        (),
+        {"get_name": classmethod(lambda cls: name)},
+    )
+    quant_config = cls()
+    for attr_name, attr_value in attrs.items():
+        setattr(quant_config, attr_name, attr_value)
+    return quant_config
 
 
 class TestTransformerQuantHelpers(unittest.TestCase):
@@ -126,6 +143,34 @@ class TestTransformerQuantHelpers(unittest.TestCase):
 
         self.assertEqual(resolved, [mixed])
 
+    @patch(
+        "sglang.multimodal_gen.runtime.loader.transformer_load_utils.snapshot_download",
+    )
+    @patch(
+        "sglang.multimodal_gen.runtime.loader.transformer_load_utils.maybe_download_model",
+    )
+    def test_resolve_transformer_safetensors_to_load_refreshes_empty_cached_repo(
+        self, mock_download_model, mock_snapshot_download
+    ):
+        with tempfile.TemporaryDirectory() as cached_dir:
+            repo_id = "black-forest-labs/FLUX.2-dev-NVFP4"
+            mixed = os.path.join(cached_dir, "flux2-dev-nvfp4-mixed.safetensors")
+            mock_download_model.return_value = cached_dir
+
+            def _snapshot_download(**_kwargs):
+                open(mixed, "a").close()
+                return cached_dir
+
+            mock_snapshot_download.side_effect = _snapshot_download
+
+            server_args = self._make_server_args(transformer_weights_path=repo_id)
+            resolved = resolve_transformer_safetensors_to_load(
+                server_args, "/unused/component/path"
+            )
+
+        self.assertEqual(resolved, [mixed])
+        mock_snapshot_download.assert_called_once()
+
     def test_filter_transformer_precision_variants_prefers_canonical_file(self):
         files = [
             "/tmp/transformer/diffusion_pytorch_model.fp16.safetensors",
@@ -152,6 +197,41 @@ class TestTransformerQuantHelpers(unittest.TestCase):
         resolved = _filter_duplicate_precision_variant_safetensors(files)
 
         self.assertEqual(resolved, files)
+
+    def test_weight_load_plan_defers_cpu_offload_for_device_postprocess(self):
+        device = torch.device("cuda:0")
+
+        plan = WeightLoadPlan.for_component(
+            checkpoint_load_device=device,
+            needs_device_weight_postprocess=True,
+            component_cpu_offload=True,
+        )
+
+        self.assertEqual(plan.checkpoint_load_device, device)
+        self.assertEqual(plan.weight_postprocess_device, device)
+        self.assertTrue(plan.defer_component_cpu_offload)
+
+    def test_online_fp8_needs_device_weight_postprocess(self):
+        self.assertTrue(_needs_device_weight_postprocess(Fp8Config()))
+        self.assertFalse(
+            _needs_device_weight_postprocess(
+                Fp8Config(is_checkpoint_fp8_serialized=True)
+            )
+        )
+        self.assertTrue(_needs_device_weight_postprocess(_make_quant_config("mxfp8")))
+        self.assertFalse(
+            _needs_device_weight_postprocess(
+                _make_quant_config("mxfp8", is_checkpoint_fp8_serialized=True)
+            )
+        )
+        self.assertTrue(
+            _needs_device_weight_postprocess(_make_quant_config("mxfp4_npu"))
+        )
+        self.assertFalse(
+            _needs_device_weight_postprocess(
+                _make_quant_config("mxfp4_npu", is_checkpoint_mxfp4_npu_serialized=True)
+            )
+        )
 
     @patch(
         "sglang.multimodal_gen.runtime.loader.transformer_load_utils.build_nvfp4_config_from_safetensors_list",
@@ -376,6 +456,37 @@ class TestTransformerQuantHelpers(unittest.TestCase):
             updated["quantization_config"]["ignore"],
             ["single_transformer_blocks.*.proj_mlp*"],
         )
+
+    def test_modelopt_fp8_hf_config_uses_general_modelopt_fp8(self):
+        config = get_quant_config(
+            {
+                "quantization_config": {
+                    "quant_method": "modelopt",
+                    "quant_algo": "FP8",
+                    "ignore": ["vae2llm", "llm2vae"],
+                }
+            },
+            "/unused/component/path",
+            quant_ignore_remap={"vae2llm": "proj_in", "llm2vae": "proj_out"},
+        )
+
+        self.assertIsInstance(config, ModelOptFp8Config)
+        self.assertEqual(config.exclude_modules, ["proj_in", "proj_out"])
+
+    def test_modelopt_fp8_explicit_config_uses_general_modelopt_fp8(self):
+        config = get_quant_config(
+            {
+                "quantization_config": {
+                    "quant_method": "modelopt_fp8",
+                    "quant_algo": "FP8",
+                    "ignore": ["proj_out"],
+                }
+            },
+            "/unused/component/path",
+        )
+
+        self.assertIsInstance(config, ModelOptFp8Config)
+        self.assertEqual(config.exclude_modules, ["proj_out"])
 
     @patch("sglang.multimodal_gen.runtime.layers.linear.get_group_rank", return_value=0)
     @patch("sglang.multimodal_gen.runtime.layers.linear.get_group_size", return_value=1)

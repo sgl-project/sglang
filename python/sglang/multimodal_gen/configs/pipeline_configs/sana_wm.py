@@ -329,7 +329,7 @@ class SanaWMRealtimeConfig(SanaWMPipelineConfig):
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
         return ModelDeploymentConfig(
             auto_dit_layerwise_offload=True,
-            auto_disable_component_offload_min_available_memory_gb=120,
-            auto_disable_component_offload_components=("dit",),
+            keep_resident_min_available_gb=120,
+            keep_resident_components=("dit",),
             auto_enable_cfg_parallel=False,
         )

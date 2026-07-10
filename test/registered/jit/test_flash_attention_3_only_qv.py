@@ -15,7 +15,7 @@ from sglang.jit_kernel.flash_attention import flash_attn_with_kvcache
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=30, suite="base-b-kernel-unit-1-gpu-large")
+register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 # FA3 only_qv path is SM90 (Hopper) only — skip on pre-Hopper and on
 # Blackwell+ (sm100+) where FA3 is not built.

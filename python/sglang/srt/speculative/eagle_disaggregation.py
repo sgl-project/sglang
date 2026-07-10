@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.speculative.eagle_info import EagleDraftInput
 
@@ -60,7 +61,11 @@ def build_eagle_disagg_draft_input(
 
     if batch.enable_overlap:
         spec_info.future_indices = batch.req_pool_indices
+        # Seed the relay buf with the known seq_lens; publish's chained record
+        # keeps the in-flight forward's fence intact (see FutureMap.publish).
         future_map.publish(spec_info.future_indices, batch.seq_lens)
-        future_map.stash(spec_info.future_indices, spec_info)
+        future_map.stash(
+            spec_info.future_indices, RelayPayload.from_draft_input(spec_info)
+        )
 
     return spec_info

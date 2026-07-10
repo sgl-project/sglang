@@ -126,11 +126,12 @@ class AscendTorchNativeAttnBackend:
                     atten_start_kv = int(encoder_lens[seq_idx].item())
                     atten_end_kv = atten_start_kv + extend_seq_len_q
 
-            if (
+            is_swa_self_attn = (
                 sliding_window_size is not None
                 and sliding_window_size > -1
                 and encoder_lens is None
-            ):
+            )
+            if is_swa_self_attn:
                 # For extend, the sliding window must be anchored at the first
                 # query token in this chunk rather than the final sequence
                 # length. Otherwise a large extend chunk can no longer fit in
@@ -140,10 +141,21 @@ class AscendTorchNativeAttnBackend:
                 )
 
             per_req_query = query[:, start_q:end_q, :]
-            query_start_idx = max(prefill_seq_len_q - atten_start_kv, 0)
-            seq_len_kv = atten_end_kv - atten_start_kv
+
+            # SWA crops the front of the KV window, so the redundant query
+            # tensor must match the cropped window to keep Q.len == K.len for
+            # the causal mask. In cross-attention (and non-SWA self-attention)
+            # the original sizing — text seq len — must be preserved, since Q
+            # (text) and KV (encoder) lengths legitimately differ there.
+            if is_swa_self_attn:
+                redundant_len = atten_end_kv - atten_start_kv
+                query_start_idx = max(prefill_seq_len_q - atten_start_kv, 0)
+            else:
+                redundant_len = int(seq_lens[seq_idx].item())
+                query_start_idx = prefill_seq_len_q
+
             per_req_query_redundant = torch.zeros(
-                (per_req_query.shape[0], seq_len_kv, per_req_query.shape[2]),
+                (per_req_query.shape[0], redundant_len, per_req_query.shape[2]),
                 dtype=per_req_query.dtype,
                 device=per_req_query.device,
             )

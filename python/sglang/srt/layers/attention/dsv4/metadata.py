@@ -96,12 +96,28 @@ def copy_metadata(
 
 
 @dataclass
+class NonPagedIndexerPlan:
+    page_table: torch.Tensor
+    gather_seq_lens: torch.Tensor
+    ks: torch.Tensor
+    ke: torch.Tensor
+    seq_len_sum: int
+    max_seq_len: int
+    max_seqlen_k: int
+    query_rows: int
+
+
+@dataclass
 class PagedIndexerMetadata:
     page_size: int
     page_table: torch.Tensor
     c4_seq_lens: torch.Tensor
+    use_prefill_cuda_graph: bool = False
     deep_gemm_metadata: Any = field(init=False, repr=False)
     topk_metadata: torch.Tensor = field(init=False, repr=False)
+    nonpaged_plan: Optional[NonPagedIndexerPlan] = field(
+        init=False, repr=False, default=None
+    )
 
     def __post_init__(self):
         if (
@@ -156,18 +172,19 @@ class PagedIndexerMetadata:
     def copy_(self, other: PagedIndexerMetadata):
         if is_hip():
             copy_fields = ["page_table", "c4_seq_lens"]
-            assign_fields = ["deep_gemm_metadata"]
+            assign_fields = ["deep_gemm_metadata", "nonpaged_plan"]
         else:
             copy_fields = ["page_table", "c4_seq_lens", "deep_gemm_metadata"]
-            assign_fields = []
+            assign_fields = ["nonpaged_plan"]
         copy_fields += ["topk_metadata"]
         copy_metadata(
             src=other,
             dst=self,
-            check_eq_fields=["page_size"],
+            check_eq_fields=["page_size", "use_prefill_cuda_graph"],
             copy_fields=copy_fields,
             assign_fields=assign_fields,
         )
+        self.nonpaged_plan = None
 
 
 def maybe_copy_inplace(dst, *, src) -> None:

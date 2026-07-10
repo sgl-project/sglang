@@ -50,6 +50,15 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("cutlass_mla_get_workspace_size", &cutlass_mla_get_workspace_size);
 
   /*
+   * From csrc/infllm_v2
+   */
+  m.def(
+      "infllm_v2_max_pooling_1d_varlen(Tensor input, Tensor! output, Tensor cu_seqlens_q, Tensor cu_seqlens_k, "
+      "Tensor cache_lens, int max_seqlen_q, int max_seqlen_k, int kernel_size, int stride, int padding, "
+      "int block_size, int local_blocks, int init_blocks, int total_q) -> ()");
+  m.impl("infllm_v2_max_pooling_1d_varlen", torch::kCUDA, &infllm_v2_max_pooling_1d_varlen);
+
+  /*
    * From csrc/elementwise
    */
   m.def("rmsnorm(Tensor! output, Tensor input, Tensor weight, float eps, bool enable_pdl) -> ()");
@@ -135,9 +144,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("dsv3_fused_a_gemm(Tensor! output, Tensor mat_a, Tensor mat_b) -> ()");
   m.impl("dsv3_fused_a_gemm", torch::kCUDA, &dsv3_fused_a_gemm);
 
-  m.def("dsv3_router_gemm(Tensor! output, Tensor mat_a, Tensor mat_b) -> ()");
-  m.impl("dsv3_router_gemm", torch::kCUDA, &dsv3_router_gemm);
-
   /*
    * From csrc/gemm/gptq
    */
@@ -174,17 +180,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("moe_sum(Tensor input, Tensor! output) -> ()");
   m.impl("moe_sum", torch::kCUDA, &moe_sum);
 
-  m.def(
-      "moe_fused_gate(Tensor input, Tensor bias, int num_expert_group, int topk_group, int topk, int "
-      "num_fused_shared_experts, float routed_scaling_factor, bool apply_routed_scaling_factor_on_output) -> "
-      "(Tensor[])");
-  m.impl("moe_fused_gate", torch::kCUDA, &moe_fused_gate);
-
-  m.def(
-      "kimi_k2_moe_fused_gate(Tensor input, Tensor bias, int topk, bool renormalize, "
-      "float routed_scaling_factor, bool apply_routed_scaling_factor_on_output) -> "
-      "(Tensor[])");
-  m.impl("kimi_k2_moe_fused_gate", torch::kCUDA, &kimi_k2_moe_fused_gate);
+  // moe_fused_gate / kimi_k2_moe_fused_gate (AOT) retired: the CUDA gate/topk path
+  // now routes through the unified Triton router
+  // (python/sglang/jit_kernel/moe_fused_gate.py).
 
   m.def(
       "fp8_blockwise_scaled_grouped_mm(Tensor output, Tensor a_ptrs, Tensor b_ptrs, Tensor out_ptrs, Tensor "

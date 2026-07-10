@@ -9,7 +9,6 @@ from sglang.srt.distributed.communication_op import (
 from sglang.srt.layers.attention.fla.layernorm_gated import rms_norm_gated
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_reduce,
-    get_attention_tp_group,
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.utils import MultiPlatformOp
@@ -92,7 +91,7 @@ class Mixer2RMSNormGated(MultiPlatformOp):
                 # To handle the general case, redundantly apply the variance
                 if self.use_attn_tp_group:
                     parts = [torch.empty_like(x) for _ in range(self.tp_size)]
-                    get_attention_tp_group().all_gather(x, output_tensor_list=parts)
+                    get_parallel().attn_tp_group.all_gather(x, output_tensor_list=parts)
                     x = torch.cat(parts, dim=-1)
                 else:
                     x = tensor_model_parallel_all_gather(x, -1)

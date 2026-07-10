@@ -201,6 +201,21 @@ async def generations(
             perf_dump_path=request.perf_dump_path,
             use_pe=_get_extra_field(request, "use_pe"),
             preset=_get_extra_field(request, "preset"),
+            progressive_mode=(
+                request.progressive_mode
+                if request.progressive_mode is not None
+                else _get_extra_field(request, "progressive_mode")
+            ),
+            progressive_levels=(
+                request.progressive_levels
+                if request.progressive_levels is not None
+                else _get_extra_field(request, "progressive_levels")
+            ),
+            progressive_delta=(
+                request.progressive_delta
+                if request.progressive_delta is not None
+                else _get_extra_field(request, "progressive_delta")
+            ),
         )
         trace_headers = extract_trace_headers(raw_request.headers)
         batch = prepare_request(

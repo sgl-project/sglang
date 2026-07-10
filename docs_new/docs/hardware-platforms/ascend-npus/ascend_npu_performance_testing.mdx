@@ -358,7 +358,7 @@ Max ITL (ms):                            2229.30
 
 #### SGLang Serving Benchmark Result — Complete Reference
 
-The output format is **hardcoded in `bench_serving.py`. All formatting decisions — including column widths, alignment, and decimal precision — are statically defined in the source and cannot be changed via command-line arguments.
+The output format is **hardcoded in `bench_serving.py`**. All formatting decisions — including column widths, alignment, and decimal precision — are statically defined in the source and cannot be changed via command-line arguments.
 
 ##### Test Configuration
 
@@ -436,6 +436,7 @@ The output format is **hardcoded in `bench_serving.py`. All formatting decisions
 </table>
 
 ##### Time per Output Token (TPOT) – Excluding First Token
+
 Formula: <code>(E2E Latency - TTFT) / (Number of output tokens - 1)</code>
 
 <table>
@@ -459,7 +460,6 @@ Formula: <code>(E2E Latency - TTFT) / (Number of output tokens - 1)</code>
     <tr><td><code>Max ITL (ms)</code></td><td>Maximum observed inter-token interval; useful for identifying severe blocking events</td><td>2 decimal places</td></tr>
   </tbody>
 </table>
-
 
 ## 3. Online Service: Multimodal Model
 

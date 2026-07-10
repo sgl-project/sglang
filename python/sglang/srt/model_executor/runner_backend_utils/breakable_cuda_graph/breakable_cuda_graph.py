@@ -155,9 +155,10 @@ def _uninstall_wait_stream_hook():
 
 def _weak_ref_if_tensor(x):
     """Return a weak-ref tensor view (shared storage, no refcount) for tensors;
-    pass-through for non-tensors. Weak-ref'ing captured args lets the shared
-    mempool reclaim per-layer intermediates between segments — storage stays
-    alive for each segment CUDAGraph's lifetime via its pool use_count.
+    recurse into tuples/lists; pass-through for non-tensors. Weak-ref'ing
+    captured args lets the shared mempool reclaim per-layer intermediates
+    between segments — storage stays alive for each segment CUDAGraph's
+    lifetime via its pool use_count.
 
     weak_ref_tensors is imported lazily because it hard-raises on
     platforms without a CUDA/HIP/NPU backend; we only reach this code during
@@ -166,19 +167,31 @@ def _weak_ref_if_tensor(x):
         from sglang.srt.compilation.weak_ref_tensor import weak_ref_tensors
 
         return weak_ref_tensors(x)
+    if isinstance(x, tuple):
+        return tuple(_weak_ref_if_tensor(e) for e in x)
+    if isinstance(x, list):
+        return [_weak_ref_if_tensor(e) for e in x]
     return x
 
 
 def _copy_output(dst: Any, src: Any) -> Any:
     """Copy src output into dst in-place where possible.
 
-    Handles plain tensors, dataclass/object with tensor attributes,
-    and dicts of tensors. Returns dst if in-place copy succeeded,
-    otherwise returns src.
+    Handles plain tensors, tuples/lists of tensors, dataclass/object with
+    tensor attributes, and dicts of tensors. Returns dst if in-place copy
+    succeeded, otherwise returns src.
     """
     if torch.is_tensor(dst) and torch.is_tensor(src):
         dst.copy_(src)
         return dst
+
+    if (
+        isinstance(dst, (tuple, list))
+        and isinstance(src, (tuple, list))
+        and len(dst) == len(src)
+    ):
+        copied = [_copy_output(d, s) for d, s in zip(dst, src)]
+        return tuple(copied) if isinstance(dst, tuple) else copied
 
     if hasattr(dst, "__dict__") and hasattr(src, "__dict__"):
         for key, src_val in src.__dict__.items():
@@ -220,13 +233,17 @@ def eager_on_graph(enable: bool):
             # writes real data into them.
             output = inner(*args, **kwargs)
 
-            # Weak-ref the closure state. Storage lives with the segment
-            # CUDAGraphs' mempool pin; Python refs don't need to prevent
-            # pool reuse across layers.
+            # Weak-ref captured inputs produced by graph segments. Their storage
+            # is pinned by the segment CUDAGraphs' mempool use-count, so Python
+            # refs do not need to keep every intermediate alive.
             captured_inner = inner
             captured_args = tuple(_weak_ref_if_tensor(a) for a in args)
             captured_kwargs = {k: _weak_ref_if_tensor(v) for k, v in kwargs.items()}
-            captured_output = _weak_ref_if_tensor(output)
+            # The eager break output is different: it is allocated between graph
+            # captures and is the static input address consumed by the next
+            # captured segment. Keep a strong reference so replay can safely
+            # copy fresh eager output into that bridge buffer.
+            captured_output = output
 
             def replay_fn():
                 new_out = captured_inner(*captured_args, **captured_kwargs)
@@ -247,9 +264,10 @@ class BreakableCUDAGraph:
     """Container holding one torch.cuda.CUDAGraph per segment plus an
     eager break function between consecutive segments."""
 
-    def __init__(self) -> None:
-        self._segments: list[torch.cuda.CUDAGraph] = []
+    def __init__(self, deduped_cuda_graph=None) -> None:
+        self._segments: list[Any] = []
         self._break_fns: list[Callable[[], Any]] = []
+        self._deduped_cuda_graph = deduped_cuda_graph
 
     def replay(self) -> None:
         stream = torch.cuda.current_stream()
@@ -261,6 +279,16 @@ class BreakableCUDAGraph:
                     self._break_fns[i]()
         finally:
             _current_stream_var.reset(token)
+
+    def _append_segment(
+        self, graph: torch.cuda.CUDAGraph, needs_instantiate: bool
+    ) -> None:
+        if self._deduped_cuda_graph is not None:
+            self._segments.append(self._deduped_cuda_graph.register(graph))
+            return
+        if needs_instantiate:
+            graph.instantiate()
+        self._segments.append(graph)
 
 
 class BreakableCUDAGraphCapture:
@@ -292,6 +320,8 @@ class BreakableCUDAGraphCapture:
         self._capture_token = None
         self._stream_token = None
         self._forked_token = None
+        self._current_graph: torch.cuda.CUDAGraph | None = None
+        self._current_graph_needs_instantiate = False
 
     def __enter__(self):
         _install_wait_stream_hook()
@@ -320,11 +350,21 @@ class BreakableCUDAGraphCapture:
         return False
 
     def _begin_new_segment(self) -> None:
-        graph = torch.cuda.CUDAGraph()
+        # keep_graph retains the raw graph for dedup; skip it on the plain path.
+        if self.cuda_graph._deduped_cuda_graph is not None:
+            try:
+                graph = torch.cuda.CUDAGraph(keep_graph=True)
+                self._current_graph_needs_instantiate = True
+            except TypeError:
+                graph = torch.cuda.CUDAGraph()
+                self._current_graph_needs_instantiate = False
+        else:
+            graph = torch.cuda.CUDAGraph()
+            self._current_graph_needs_instantiate = False
         graph.capture_begin(
             pool=self._pool, capture_error_mode=self._capture_error_mode
         )
-        self.cuda_graph._segments.append(graph)
+        self._current_graph = graph
 
     def _end_current_segment(self) -> None:
         # Auto-join any side streams forked during this segment but not joined.
@@ -336,7 +376,12 @@ class BreakableCUDAGraphCapture:
                 if _is_stream_capturing(side):
                     _original_wait_stream(main_stream, side)
             forked.clear()
-        self.cuda_graph._segments[-1].capture_end()
+        graph = self._current_graph
+        assert graph is not None
+        graph.capture_end()
+        self.cuda_graph._append_segment(graph, self._current_graph_needs_instantiate)
+        self._current_graph = None
+        self._current_graph_needs_instantiate = False
 
 
 @eager_on_graph(True)

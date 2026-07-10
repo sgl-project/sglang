@@ -28,11 +28,6 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
     configure_layerwise_offload_modules,
 )
 from sglang.multimodal_gen.runtime.models.vaes.common import ParallelTiledVAE
-from sglang.multimodal_gen.runtime.models.vision_utils import (
-    normalize,
-    numpy_to_pt,
-    pil_to_numpy,
-)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
@@ -49,6 +44,11 @@ from sglang.multimodal_gen.runtime.utils.precision import (
     autocast_enabled,
     resolve_precision,
     temporary_module_dtype,
+)
+from sglang.multimodal_gen.runtime.utils.vision import (
+    normalize,
+    numpy_to_pt,
+    pil_to_numpy,
 )
 
 logger = init_logger(__name__)
@@ -710,7 +710,7 @@ class LTX2ImageEncodingStage(PipelineStage):
         if self.vae is None:
             raise ValueError("VAE must be provided for LTX-2 TI2V.")
 
-        from sglang.multimodal_gen.runtime.models.vision_utils import load_image
+        from sglang.multimodal_gen.runtime.utils.vision import load_image
 
         # 1. Load images, apply codec compression, resize for condition_image
         conditioned_imgs = []

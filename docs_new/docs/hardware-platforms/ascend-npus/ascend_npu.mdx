@@ -1,9 +1,11 @@
 ---
 title: SGLang installation with NPUs support
+description: "Complete installation guide for SGLang on Ascend NPUs, including component version mapping, environment setup, and launching inference services."
 ---
-You can install SGLang using any of the methods below. Please go through `System Settings` section to ensure the clusters are roaring at max performance. Feel free to leave an issue [here at sglang](https://github.com/sgl-project/sglang/issues) if you encounter any issues or have any problems.
+You can install SGLang using any of the methods below. Please go through `System Settings` section to ensure the clusters are operating at optimal performance. Feel free to leave an issue [here at sglang](https://github.com/sgl-project/sglang/issues) if you encounter any issues or have any problems.
 
 ## Component Version Mapping For SGLang
+
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
     <col style={{width: "34%"}} />
@@ -41,7 +43,7 @@ You can install SGLang using any of the methods below. Please go through `System
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Triton</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>3.2.1.dev20260530</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`pip install triton-ascend==3.2.1.dev20260530 \`<br/>`--extra-index-url=https://mirrors.huaweicloud.com/ascend/repos/pypi/nightly \`<br/>`--trusted-host triton-ascend.osinfra.cn`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`pip install triton-ascend==3.2.1.dev20260530 \`<br/>`--extra-index-url=https://mirrors.huaweicloud.com/ascend/repos/pypi/nightly \`<br/>`--trusted-host mirrors.huaweicloud.com`</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>SGLang NPU Kernel</td>
@@ -96,6 +98,7 @@ conda activate sglang_npu
 
 Note on Anaconda repository restrictions
 If you encounter an error like “Terms of Service have not been accepted” during the conda create step, the default Anaconda repository is blocking package downloads. To resolve this, configure a mirror (e.g., Tsinghua Open Source Mirror):
+
 ```bash Command
 # Add Tsinghua mirrors
 conda config --add channels https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/main/
@@ -103,8 +106,10 @@ conda config --add channels https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/
 conda config --set show_channel_urls yes
 conda config --remove channels defaults
 ```
+
 Edit the system-level conda config to remove any hardcoded defaults, e.g. vi ~/miniconda3/.condarc
 Then remove the failed environment and recreate it:
+
 ```bash Command
 conda clean -i
 conda env remove -n sglang_npu
@@ -122,6 +127,17 @@ If you want to use PD disaggregation mode, you need to install MemFabric-Hybrid.
 
 ```bash Command
 pip install memfabric-hybrid==1.0.8
+```
+
+#### MemFabric-zbal
+
+MemFabric-zbal is a Zero Buffer Acceleration Library of high-performance operators for LLM inference and training on Ascend,
+accelerating computation by eliminating intermediate memory buffers; it is required only on **aarch64** clusters and is
+installed in addition to MemFabric-Hybrid.
+
+```bash Command
+# Only needed on aarch64 (arm64) hosts
+pip install memfabric-zbal==1.1.1
 ```
 
 #### Pytorch and Pytorch Framework Adaptor on Ascend
@@ -143,14 +159,17 @@ We provide our own implementation of Triton for Ascend.
 ```bash Command
 pip install triton-ascend==3.2.1.dev20260530 \
   --extra-index-url=https://mirrors.huaweicloud.com/ascend/repos/pypi/nightly \
-  --trusted-host triton-ascend.osinfra.cn
+  --trusted-host mirrors.huaweicloud.com
 ```
+
 For installation of Triton on Ascend nightly builds or from sources, follow [installation guide](https://gitcode.com/Ascend/triton-ascend/blob/master/docs/sources/getting-started/installation.md)
 
 #### SGLang Kernels NPU
+
 We provide SGL kernels for Ascend NPU, check [installation guide](https://github.com/sgl-project/sgl-kernel-npu/blob/main/python/sgl_kernel_npu/README.md).
 
 #### DeepEP-compatible Library
+
 We provide a DeepEP-compatible Library as a drop-in replacement of deepseek-ai's DeepEP library, check the [installation guide](https://github.com/sgl-project/sgl-kernel-npu/blob/main/python/deep_ep/README.md).
 
 #### Some other dependencies
@@ -175,7 +194,9 @@ pip install -e python[all_npu]
 ```
 
 ### Method 2: Using Docker Image
+
 #### Obtain Image
+
 You can download the SGLang image or build an image based on Dockerfile to obtain the Ascend NPU image.
 
 <Warning>
@@ -185,7 +206,7 @@ Ensure sufficient disk space before pulling images. Each Docker image requires a
 1. Download SGLang image
 
 <Tip>
-We publish both **stable releases** and **daily builds**. Choose a stable release tag (e.g., `v0.5.10-npu.rc1-a3`) if you prefer a validated version, or a daily build tag (e.g., `main-cann9.0.0-a3`) if you need the latest development changes.
+We publish both **stable releases** and **daily builds**. Choose a stable release tag (e.g., `v0.5.13.post1-cann9.0.0-a3`) if you prefer a validated version, or a daily build tag (e.g., `main-cann9.0.0-a3`) if you need the latest development changes.
 </Tip>
 
 <Tabs>
@@ -193,7 +214,7 @@ We publish both **stable releases** and **daily builds**. Choose a stable releas
 
 ```bash Command
 # Stable release
-docker pull quay.io/ascend/sglang:v0.5.10-npu.rc1-a3
+docker pull quay.io/ascend/sglang:v0.5.13.post1-cann9.0.0-a3
 
 # Daily build
 docker pull quay.io/ascend/sglang:main-cann9.0.0-a3
@@ -204,7 +225,7 @@ docker pull quay.io/ascend/sglang:main-cann9.0.0-a3
 
 ```bash Command
 # Stable release
-docker pull quay.io/ascend/sglang:v0.5.10-npu.rc1-910b
+docker pull quay.io/ascend/sglang:v0.5.13.post1-cann9.0.0-910b
 
 # Daily build
 docker pull quay.io/ascend/sglang:main-cann9.0.0-910b
@@ -214,6 +235,7 @@ docker pull quay.io/ascend/sglang:main-cann9.0.0-910b
 </Tabs>
 
 2. Build an image based on Dockerfile
+
 ```bash Command
 # Clone the SGLang repository
 git clone https://github.com/sgl-project/sglang.git
@@ -229,6 +251,7 @@ docker build --build-arg TARGETARCH=<arch_tag> -t <image_name> -f npu.Dockerfile
 ```
 
 #### Create Docker
+
 __Notice:__ `--privileged` and `--network=host` are required by RDMA, which is typically needed by Ascend NPU clusters.
 
 <Tabs>
@@ -313,8 +336,11 @@ cat /proc/sys/vm/swappiness # shows 10
 ```
 
 ## Running SGLang Service
+
 ### Running Service For Large Language Models
+
 #### PD Mixed Scene
+
 ```bash Command
 # Enabling CPU Affinity
 export SGLANG_SET_CPU_AFFINITY=1
@@ -326,6 +352,7 @@ python3 -m sglang.launch_server \
 ```
 
 #### PD Disaggregation Scene
+
 1. Launch Prefill Server
 
 <Tabs>
@@ -427,6 +454,7 @@ python3 -m sglang.launch_server \
 </Tabs>
 
 3. Launch Router
+
 ```bash Command
 python3 -m sglang_router.launch_router \
     --pd-disaggregation \
@@ -438,10 +466,12 @@ python3 -m sglang_router.launch_router \
 ```
 
 ### Running Service For Multimodal Language Models
+
 #### PD Mixed Scene
+
 ```bash Command
 python3 -m sglang.launch_server \
-    --model-path Qwen3-VL-30B-A3B-Instruct \
+    --model-path Qwen/Qwen3-VL-30B-A3B-Instruct \
     --host 127.0.0.1 \
     --port 8000 \
     --tp 4 \
@@ -507,6 +537,7 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 ```
 
 Some models return responses accompanied with thinking process content. To disable this output, configure parameters as follows:
+
 ```bash Command
 curl http://127.0.0.1:8000/v1/chat/completions \
   -H "Content-Type: application/json" \

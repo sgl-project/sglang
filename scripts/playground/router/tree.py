@@ -1,6 +1,6 @@
 import time
 from collections import defaultdict
-from typing import Dict, List
+from typing import Dict
 
 
 class Node:
@@ -110,9 +110,6 @@ class MultiTenantRadixTree:
         """
         curr = self.root
         curr_idx = 0
-
-        ret_text = ""
-        ret_tenant = None
 
         while curr_idx < len(s):
             matched_node = None
@@ -227,18 +224,6 @@ class MultiTenantRadixTree:
                 stack.append(c)
 
         return used_size_per_tenant
-
-    def remove_tenant(self, tenant_id: str) -> None:
-        """
-        Remove all data associated with a specific tenant from the tree.
-        This operation maintains the integrity of the shared tree structure while
-        removing only the specified tenant's access information.
-
-        Args:
-            tenant_id: The identifier of the tenant whose data should be removed
-        """
-        # TODO: Implementation needed
-        pass
 
     def pretty_print(self) -> str:
         """

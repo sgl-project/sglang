@@ -23,6 +23,7 @@ def track_mamba_state_if_needed_kernel(
     conv_state_numel_per_row: tl.constexpr,  # total elements per row
     ssm_state_numel_per_row: tl.constexpr,  # total elements per row
     BLOCK_SIZE: tl.constexpr,
+    check_freed_slots: tl.constexpr,  # only the shared/unified KV pool emits -1
 ):
     """
     Track conv_states and ssm_states rows based on track mask.
@@ -43,9 +44,19 @@ def track_mamba_state_if_needed_kernel(
     if not track_mask:
         return
 
-    # Load source and destination indices
-    src_idx = tl.load(cache_indices_ptr + batch_idx)
-    dst_idx = tl.load(mamba_track_indices_ptr + batch_idx)
+    # Cast indices to int64 before they multiply the row stride. The
+    # page-granularity envelope layout makes the conv/ssm row stride large
+    # (stride_0 = entry_bytes / itemsize), so an int32 `idx * stride_0` can
+    # overflow for moderately large idx and wrap to an illegal address. int64 is
+    # harmless for the small-stride (per-layer) case.
+    src_idx = tl.load(cache_indices_ptr + batch_idx).to(tl.int64)
+    dst_idx = tl.load(mamba_track_indices_ptr + batch_idx).to(tl.int64)
+
+    # Skip freed slots (-1): `state_ptr + (-1)*stride` would fault. Only the unified
+    # pool emits -1 tombstones (from the v2p translate); compiled out for static.
+    if check_freed_slots:
+        if src_idx < 0 or dst_idx < 0:
+            return
 
     # Copy conv_states
     # Each thread handles BLOCK_SIZE elements
@@ -78,6 +89,7 @@ def track_mamba_states_if_needed(
     mamba_track_mask: torch.Tensor,
     mamba_track_indices: torch.Tensor,
     batch_size: int,
+    check_freed_slots: bool = False,
 ):
     """
     Track mamba states using Triton kernel for better performance.
@@ -109,6 +121,7 @@ def track_mamba_states_if_needed(
         conv_state_numel_per_row,
         ssm_state_numel_per_row,
         BLOCK_SIZE,
+        check_freed_slots,
     )
 
 

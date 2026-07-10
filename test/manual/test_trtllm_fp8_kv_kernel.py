@@ -6,7 +6,7 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.attention.triton_ops.trtllm_fp8_kv_kernel import (
+from sglang.kernels.ops.kvcache.trtllm_fp8_kv_kernel import (
     fused_fp8_set_kv_buffer,
 )
 from sglang.test.test_utils import CustomTestCase

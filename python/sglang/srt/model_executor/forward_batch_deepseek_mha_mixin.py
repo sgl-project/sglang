@@ -5,11 +5,11 @@ from typing import List, Optional
 
 import torch
 
-from sglang.srt.environ import envs
-from sglang.srt.layers.attention.triton_ops.kv_indices import (
+from sglang.kernels.ops.kvcache.kv_indices import (
     create_chunked_prefix_cache_kv_indices,
     create_flashinfer_kv_indices_triton,
 )
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_context import (
     get_req_to_token_pool,
     get_token_to_kv_pool,
@@ -28,6 +28,10 @@ class ForwardBatchDeepSeekMHAMixin:
     prefix_chunk_len: Optional[int] = None
     # Start positions of prefix cache for each chunk, (num_prefix_chunks, batch_size)
     prefix_chunk_starts: Optional[torch.Tensor] = None
+    # Start positions of prefix cache for each chunk, (num_prefix_chunks, batch_size), need prefix_chunk_starts_cpu for dcp all gather kv cache
+    prefix_chunk_starts_cpu: Optional[torch.Tensor] = None
+    # length of prefix cache for each chunk, (num_prefix_chunks, batch_size)
+    prefix_chunk_seq_lens_cpu: Optional[torch.Tensor] = None
     # Lengths of prefix cache for each chunk, (num_prefix_chunks, batch_size)
     prefix_chunk_seq_lens: Optional[torch.Tensor] = None
     # Accumulated lengths of prefix cache for each chunk, (num_prefix_chunks, batch_size + 1)
@@ -151,14 +155,19 @@ class ForwardBatchDeepSeekMHAMixin:
                 self.prefix_chunk_len,
             )
         )
-        _, prefix_chunk_seq_lens_cpu = self.get_prefix_chunk_seq_lens(
-            torch.tensor(self.extend_prefix_lens_cpu),
-            self.num_prefix_chunks,
-            self.prefix_chunk_len,
+        prefix_chunk_starts_cpu, prefix_chunk_seq_lens_cpu = (
+            self.get_prefix_chunk_seq_lens(
+                torch.tensor(self.extend_prefix_lens_cpu),
+                self.num_prefix_chunks,
+                self.prefix_chunk_len,
+            )
         )
         self.prefix_chunk_starts = prefix_chunk_starts_cuda
         self.prefix_chunk_seq_lens = prefix_chunk_seq_lens_cuda
 
+        # set prefix_chunk_starts_cpu and prefix_chunk_seq_lens_cpu for dcp to gather chunk kv cache with arbitrary lens
+        self.prefix_chunk_starts_cpu = prefix_chunk_starts_cpu
+        self.prefix_chunk_seq_lens_cpu = prefix_chunk_seq_lens_cpu
         # Metadata for attention backend
         self.prefix_chunk_cu_seq_lens = torch.zeros(
             self.num_prefix_chunks,

@@ -1,7 +1,10 @@
 """Unit tests for mem_cache/utils.py — no server, no model loading."""
 
 import hashlib
+import sys
+import types
 import unittest
+from array import array
 from unittest.mock import MagicMock, patch
 
 from sglang.srt.mem_cache.evict_policy import (
@@ -22,12 +25,117 @@ from sglang.srt.mem_cache.utils import (
     split_node_hash_value,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 
-class TestGetEvictionStrategy(CustomTestCase):
+def _legacy_get_hash_str(token_ids, prior_hash=None):
+    hasher = hashlib.sha256()
+    if prior_hash:
+        hasher.update(bytes.fromhex(prior_hash))
+    for t in token_ids:
+        if isinstance(t, tuple):
+            for elem in t:
+                hasher.update(elem.to_bytes(4, byteorder="little", signed=False))
+        else:
+            hasher.update(t.to_bytes(4, byteorder="little", signed=False))
+    return hasher.hexdigest()
+
+
+def _legacy_page_hashes(key, page_size, prior_hash=None):
+    hashes = []
+    running_hash = prior_hash
+    for start in range(0, len(key), page_size):
+        running_hash = _legacy_get_hash_str(
+            key[start : start + page_size], running_hash
+        )
+        hashes.append(running_hash)
+    return hashes
+
+
+class _HashKey:
+    def __init__(self, token_ids, is_bigram=False):
+        self.token_ids = token_ids
+        self.is_bigram = is_bigram
+
+    def __len__(self):
+        if self.is_bigram:
+            return max(0, len(self.token_ids) - 1)
+        return len(self.token_ids)
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            start = index.start or 0
+            stop = index.stop if index.stop is not None else len(self)
+            if self.is_bigram:
+                return _HashKey(self.token_ids[start : stop + 1], is_bigram=True)
+            return _HashKey(self.token_ids[start:stop])
+        if self.is_bigram:
+            return (self.token_ids[index], self.token_ids[index + 1])
+        return self.token_ids[index]
+
+    def raw_token_ids(self):
+        return self.token_ids
+
+    def hash_page(self, start, end, prior_hash=None):
+        return _legacy_get_hash_str(self[start:end], prior_hash)
+
+
+def _single_hash_compatibility_cases():
+    prior_hash = _legacy_get_hash_str([7, 8, 9])
+    return [
+        ("empty_list", [], None),
+        ("plain_list", [1, 2, 3, 4, 5], None),
+        ("array_q", _HashKey(array("q", range(1, 258))), None),
+        ("array_i_with_prior", _HashKey(array("I", range(1, 258))), prior_hash),
+        (
+            "tuple_bigram_with_prior",
+            [(10, 20), (20, 30), (30, 40), (40, 50)],
+            prior_hash,
+        ),
+        (
+            "eagle_bigram_with_prior",
+            _HashKey(
+                array("q", ((i * 2654435761) & 0x00FFFFFF for i in range(258))),
+                is_bigram=True,
+            ),
+            prior_hash,
+        ),
+        ("empty_bigram", _HashKey(array("q"), is_bigram=True), None),
+    ]
+
+
+def _page_hash_compatibility_cases():
+    prior_hash = _legacy_get_hash_str([7, 8, 9])
+    return [
+        ("empty_list", [], 8, None),
+        ("empty_bigram", _HashKey(array("q"), is_bigram=True), 8, None),
+        ("array_q_page_64", _HashKey(array("q", range(1, 258))), 64, None),
+        (
+            "array_i_page_64_with_prior",
+            _HashKey(array("I", range(1, 258))),
+            64,
+            prior_hash,
+        ),
+        (
+            "eagle_bigram_page_64_with_prior",
+            _HashKey(
+                array("q", ((i * 2654435761) & 0x00FFFFFF for i in range(258))),
+                is_bigram=True,
+            ),
+            64,
+            prior_hash,
+        ),
+        (
+            "eagle_bigram_page_1_with_prior",
+            _HashKey(array("q", [11, 22, 33, 44, 55]), is_bigram=True),
+            1,
+            prior_hash,
+        ),
+    ]
+
+
+class TestGetEvictionStrategy(unittest.TestCase):
     def test_lru(self):
         self.assertIsInstance(get_eviction_strategy("lru"), LRUStrategy)
 
@@ -73,7 +181,7 @@ class TestGetEvictionStrategy(CustomTestCase):
         self.assertIsNot(s1, s2)
 
 
-class TestMaybeInitCustomMemPool(CustomTestCase):
+class TestMaybeInitCustomMemPool(unittest.TestCase):
     @patch("sglang.srt.mem_cache.utils.envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get")
     def test_disabled_by_default(self, mock_env_get):
         mock_env_get.return_value = None
@@ -83,69 +191,76 @@ class TestMaybeInitCustomMemPool(CustomTestCase):
         self.assertIsNone(pool_type)
 
     @patch("sglang.srt.mem_cache.utils.envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get")
-    @patch("sglang.srt.disaggregation.mooncake.utils.init_mooncake_custom_mem_pool")
-    def test_enabled_via_env(self, mock_init, mock_env_get):
+    def test_enabled_via_env(self, mock_env_get):
         mock_env_get.return_value = "enabled"
+        mock_init = MagicMock()
         mock_init.return_value = (True, "mock_pool_instance", "mooncake")
 
-        enabled, pool, pool_type = maybe_init_custom_mem_pool("cuda:0")
+        mooncake_pkg = types.ModuleType("sglang.srt.disaggregation.mooncake")
+        mooncake_utils = types.ModuleType("sglang.srt.disaggregation.mooncake.utils")
+        mooncake_utils.init_mooncake_custom_mem_pool = mock_init
+        with patch.dict(
+            sys.modules,
+            {
+                "sglang.srt.disaggregation.mooncake": mooncake_pkg,
+                "sglang.srt.disaggregation.mooncake.utils": mooncake_utils,
+            },
+        ):
+            enabled, pool, pool_type = maybe_init_custom_mem_pool("cuda:0")
         self.assertTrue(enabled)
         self.assertEqual(pool, "mock_pool_instance")
         self.assertEqual(pool_type, "mooncake")
         mock_init.assert_called_once_with("cuda:0")
 
 
-class TestGetHashStr(CustomTestCase):
-    def test_empty_list(self):
-        result = get_hash_str([])
-        self.assertIsInstance(result, str)
-        self.assertEqual(len(result), 64)
-        expected = hashlib.sha256().hexdigest()
-        self.assertEqual(result, expected)
+class TestGetHashStr(unittest.TestCase):
+    def test_hash_str_matches_pre_optimization_per_token_loop(self):
+        for name, tokens, prior_hash in _single_hash_compatibility_cases():
+            with self.subTest(name=name):
+                self.assertEqual(
+                    get_hash_str(tokens, prior_hash),
+                    _legacy_get_hash_str(tokens, prior_hash),
+                )
 
-    def test_different_sequence_different_hash(self):
+    def test_page_hashes_match_pre_optimization_per_token_loop(self):
+        for name, tokens, page_size, prior_hash in _page_hash_compatibility_cases():
+            with self.subTest(name=name):
+                self.assertEqual(
+                    get_hash_str(tokens, prior_hash, page_size=page_size),
+                    _legacy_page_hashes(tokens, page_size, prior_hash),
+                )
+
+    def test_hash_properties(self):
+        self.assertEqual(get_hash_str([]), hashlib.sha256().hexdigest())
+
         h1 = get_hash_str([1, 2, 3])
         h2 = get_hash_str([3, 2, 1])
         self.assertNotEqual(h1, h2)
 
-    def test_different_values_different_hash(self):
-        h1 = get_hash_str([100])
-        h2 = get_hash_str([200])
-        self.assertNotEqual(h1, h2)
+        self.assertNotEqual(get_hash_str([100]), get_hash_str([200]))
+        self.assertEqual(get_hash_str([1, 2]), get_hash_str([(1, 2)]))
+        self.assertNotEqual(get_hash_str([(1, 2)]), get_hash_str([(2, 1)]))
 
-    def test_bigram_vs_flat_token_equivalent(self):
-        h_flat = get_hash_str([1, 2])
-        h_bigram = get_hash_str([(1, 2)])
-        self.assertEqual(h_flat, h_bigram)
-
-    def test_bigram_order_matters(self):
-        h1 = get_hash_str([(1, 2)])
-        h2 = get_hash_str([(2, 1)])
-        self.assertNotEqual(h1, h2)
-
-    def test_prior_hash_chaining(self):
         chained = get_hash_str([3, 4], prior_hash=get_hash_str([1, 2]))
-        # prior_hash must fold into the digest, so chaining differs from
-        # hashing [3, 4] alone...
         self.assertNotEqual(chained, get_hash_str([3, 4]))
-        # ...and a different prior_hash must yield a different chained digest.
         self.assertNotEqual(
             chained, get_hash_str([3, 4], prior_hash=get_hash_str([9, 9]))
         )
-
-    def test_prior_hash_single_step(self):
-        step1 = get_hash_str([1])
-        step2 = get_hash_str([2], prior_hash=step1)
-        direct = get_hash_str([1, 2])
-        self.assertNotEqual(step2, direct)
-
-    def test_returns_64_char_hex(self):
         for tokens in [[], [1], [1, 2, 3], [(1, 2)], [1, 2, 3, 4, 5]]:
-            result = get_hash_str(tokens)
-            self.assertRegex(result, r"^[0-9a-f]{64}$")
+            with self.subTest(tokens=tokens):
+                self.assertRegex(get_hash_str(tokens), r"^[0-9a-f]{64}$")
+
+    def test_hash_key_hash_page_matches_get_hash_str(self):
+        key = _HashKey(array("q", [1, 2, 3, 4, 5, 6]), is_bigram=True)
+        prior_hash = get_hash_str([(9, 10)])
+
+        self.assertEqual(
+            key.hash_page(1, 4, prior_hash),
+            get_hash_str(key[1:4], prior_hash),
+        )
 
 
-class TestHashStrToInt64(CustomTestCase):
+class TestHashStrToInt64(unittest.TestCase):
     def test_zero_hash(self):
         result = hash_str_to_int64("0" * 64)
         self.assertEqual(result, 0)
@@ -178,96 +293,72 @@ class TestHashStrToInt64(CustomTestCase):
         self.assertTrue(-(2**63) <= int64_val < 2**63)
 
 
-class TestComputeNodeHashValues(CustomTestCase):
-    def setUp(self):
-        def mock_hash_page(start, end, parent_hash):
-            parts = [f"p{start}-{end}"]
-            if parent_hash is not None:
-                parts.append(parent_hash)
-            return "-".join(parts)
-
-        self.mock_hash_page = mock_hash_page
-
-    def _make_node(self, key_len, parent=None, parent_hash_values=None):
+class TestComputeNodeHashValues(unittest.TestCase):
+    def _make_node(self, key, parent=None, parent_hash_values=None):
         node = MagicMock()
-        node.key.__len__.return_value = key_len
-        node.key.hash_page = self.mock_hash_page
+        node.key = key
         node.parent = parent
         if parent is not None:
             parent.hash_value = parent_hash_values
         return node
 
-    def test_single_page_root(self):
-        node = self._make_node(key_len=3)
-        result = compute_node_hash_values(node, page_size=16)
-        self.assertEqual(len(result), 1)
-        self.assertIn("p0-3", result[0])
+    def test_root_node_hashes_match_legacy_page_hashes(self):
+        cases = [
+            ("single_page", _HashKey(array("q", [1, 2, 3])), 16),
+            ("multiple_pages", _HashKey(array("q", range(1, 31))), 16),
+            ("page_aligned_boundary", _HashKey(array("q", range(1, 33))), 8),
+            ("shorter_than_page", _HashKey(array("q", [1, 2, 3, 4, 5])), 16),
+        ]
 
-    def test_multiple_pages(self):
-        node = self._make_node(key_len=30)
-        result = compute_node_hash_values(node, page_size=16)
-        self.assertEqual(len(result), 2)
-        self.assertIn("p0-16", result[0])
-        self.assertIn("p16-30", result[1])
+        for name, key, page_size in cases:
+            with self.subTest(name=name):
+                node = self._make_node(key)
+                self.assertEqual(
+                    compute_node_hash_values(node, page_size=page_size),
+                    _legacy_page_hashes(key, page_size=page_size),
+                )
 
-    def test_page_aligned_boundary(self):
-        node = self._make_node(key_len=32)
-        result = compute_node_hash_values(node, page_size=8)
-        self.assertEqual(len(result), 4)
-        self.assertIn("p24-32", result[3])
-
-    def test_key_shorter_than_page_size(self):
-        node = self._make_node(key_len=5)
-        result = compute_node_hash_values(node, page_size=16)
-        self.assertEqual(result, ["p0-5"])
-
-    def test_chained_parent_hash(self):
+    def test_parent_hash_is_used_only_when_parent_has_nonempty_key_and_hash(self):
         parent = MagicMock()
-        parent.key.__len__.return_value = 8
-        parent.hash_value = ["parent_hash_0", "parent_hash_1"]
-        parent.key.hash_page = self.mock_hash_page
+        parent.key = _HashKey(array("q", range(1, 17)))
+        parent.hash_value = _legacy_page_hashes(parent.key, page_size=8)
+        child_key = _HashKey(array("q", range(101, 109)))
+        cases = [
+            ("valid_parent_hash", parent, parent.hash_value, parent.hash_value[-1]),
+            (
+                "empty_parent_key",
+                self._make_node(_HashKey(array("q"))),
+                [get_hash_str([1, 2, 3])],
+                None,
+            ),
+            (
+                "empty_parent_hash",
+                self._make_node(_HashKey(array("q", range(1, 9)))),
+                [],
+                None,
+            ),
+            (
+                "none_parent_hash",
+                self._make_node(_HashKey(array("q", range(1, 9)))),
+                None,
+                None,
+            ),
+        ]
 
-        child = self._make_node(
-            key_len=16, parent=parent, parent_hash_values=parent.hash_value
-        )
-        result = compute_node_hash_values(child, page_size=8)
-        self.assertEqual(result, ["p0-8-parent_hash_1", "p8-16-p0-8-parent_hash_1"])
-
-    def test_parent_with_empty_key(self):
-        parent = MagicMock()
-        parent.key.__len__.return_value = 0
-        parent.hash_value = ["some_hash"]
-        parent.key.hash_page = self.mock_hash_page
-
-        child = self._make_node(
-            key_len=8, parent=parent, parent_hash_values=parent.hash_value
-        )
-        result = compute_node_hash_values(child, page_size=8)
-        self.assertEqual(len(result), 1)
-        self.assertNotIn("some_hash", result[0])
-
-    def test_parent_without_hash_value(self):
-        parent = MagicMock()
-        parent.key.__len__.return_value = 8
-        parent.hash_value = []
-        parent.key.hash_page = self.mock_hash_page
-
-        child = self._make_node(key_len=8, parent=parent, parent_hash_values=[])
-        result = compute_node_hash_values(child, page_size=8)
-        self.assertEqual(result, ["p0-8"])
-
-    def test_parent_with_none_hash_value(self):
-        parent = MagicMock()
-        parent.key.__len__.return_value = 8
-        parent.hash_value = None
-        parent.key.hash_page = self.mock_hash_page
-
-        child = self._make_node(key_len=8, parent=parent, parent_hash_values=None)
-        result = compute_node_hash_values(child, page_size=8)
-        self.assertEqual(result, ["p0-8"])
+        for name, parent, parent_hash_values, expected_prior in cases:
+            with self.subTest(name=name):
+                child = self._make_node(
+                    child_key, parent=parent, parent_hash_values=parent_hash_values
+                )
+                self.assertEqual(
+                    compute_node_hash_values(child, page_size=8),
+                    _legacy_page_hashes(
+                        child_key, page_size=8, prior_hash=expected_prior
+                    ),
+                )
 
 
-class TestSplitNodeHashValue(CustomTestCase):
+class TestSplitNodeHashValue(unittest.TestCase):
     def test_none_input_returns_none_tuple(self):
         result = split_node_hash_value(None, 10, 4)
         self.assertEqual(result, (None, None))

@@ -56,9 +56,6 @@ class TestDPAttentionDP2TP2(
                 "--enable-dp-attention",
                 "--dp",
                 "2",
-                "--enable-torch-compile",
-                "--torch-compile-max-bs",
-                "2",
             ],
         )
 

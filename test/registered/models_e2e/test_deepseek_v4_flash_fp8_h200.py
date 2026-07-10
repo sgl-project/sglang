@@ -66,7 +66,7 @@ class TestDSV4FlashFP8H200(
                 "1",
                 "--speculative-num-draft-tokens",
                 "2",
-                "--cuda-graph-max-bs",
+                "--cuda-graph-max-bs-decode",
                 "128",
                 "--max-running-requests",
                 "128",

@@ -14,8 +14,8 @@ from einops import rearrange, repeat
 from sglang.jit_kernel.flash_attention import flash_attn_varlen_func
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=120, suite="base-b-kernel-unit-1-gpu-large")
-register_cuda_ci(est_time=120, suite="base-b-kernel-unit-1-gpu-b200")
+register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 register_cuda_ci(est_time=900, suite="nightly-kernel-1-gpu", nightly=True)
 
 # Skip this test on Hopper machine

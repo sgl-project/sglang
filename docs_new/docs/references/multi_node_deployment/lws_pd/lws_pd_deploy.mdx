@@ -384,7 +384,7 @@ spec:
           - "32768"
           - --disaggregation-ib-device
           - "mlx5_bond_0,mlx5_bond_1,mlx5_bond_2,mlx5_bond_3"
-          - --cuda-graph-max-bs
+          - --cuda-graph-max-bs-decode
           - "64"
           - --max-running-requests
           - "2048"
@@ -519,7 +519,7 @@ spec:
           - --disaggregation-ib-device
           # should modify according your rdma env
           - "mlx5_bond_0,mlx5_bond_1,mlx5_bond_2,mlx5_bond_3"
-          - --cuda-graph-max-bs
+          - --cuda-graph-max-bs-decode
           - "64"
           - --max-running-requests
           - "2048"

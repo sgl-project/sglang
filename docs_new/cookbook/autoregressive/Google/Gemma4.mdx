@@ -111,6 +111,7 @@ For other installation methods, please refer to the [official SGLang installatio
 
 - SGLang automatically selects the Triton attention backend for Gemma 4 models (required for bidirectional image-token attention during prefill).
 - **Attention backend on Blackwell (B200/sm100)**: SGLang defaults to the `trtllm_mha` backend on sm100, which is fastest for text but applies *causal* attention to image tokens. For multimodal (image) workloads on B200, pass `--attention-backend triton` to restore bidirectional image-token attention and full vision quality. Text-only and audio workloads are unaffected by the default.
+- **Gemma 4 26B-A4B on B200**: Use `--mem-fraction-static 0.75` to leave workspace headroom for the Triton MoE path.
 - For the 26B-A4B MoE model, consider `--tp 2` for high-throughput workloads.
 - **Speculative Decoding (MTP)**: Each Gemma 4 variant ships with a paired `*-assistant` draft model that enables NEXTN multi-token prediction. Enable it via the selector above, or pass `--speculative-algorithm NEXTN --speculative-draft-model-path google/gemma-4-<variant>-it-assistant --speculative-num-steps 5 --speculative-num-draft-tokens 6 --speculative-eagle-topk 1`. MTP can significantly reduce latency for interactive use cases. The 26B-A4B MoE model requires `--tp 2` when MTP is enabled.
 - **QAT checkpoints**: Toggle **Checkpoint → QAT** in the selector to target the `qat-q4_0-unquantized` releases. These keep bf16 weights, so memory and TP requirements match the standard checkpoints, and each has a matching `*-qat-q4_0-unquantized-assistant` draft model for MTP.
@@ -132,27 +133,27 @@ For other installation methods, please refer to the [official SGLang installatio
   <tbody>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>gemma-4-E2B-it</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1x H200 / 1x MI300X / 1x MI325X / 1x MI355X</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1x H200 / 1x B200 / 1x B300 / 1x MI300X / 1x MI325X / 1x MI355X</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>1</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>gemma-4-E4B-it</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1x H200 / 1x MI300X / 1x MI325X / 1x MI355X</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1x H200 / 1x B200 / 1x B300 / 1x MI300X / 1x MI325X / 1x MI355X</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>1</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>gemma-4-12B-it</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1x H200 / 1x B200</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1x H200 / 1x B200 / 1x B300</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>1</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>gemma-4-31B-it</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>2x H200 / 1x MI300X / 1x MI325X / 1x MI355X</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>2 (H200) / 1 (AMD)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>2x H200 / 1x B200 / 1x B300 / 1x MI300X / 1x MI325X / 1x MI355X</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>2 (H200) / 1 (B200/B300/AMD)</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>gemma-4-26B-A4B-it</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1x H200 / 1x MI300X / 1x MI325X / 1x MI355X</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1x H200 / 1x B200 / 1x B300 / 1x MI300X / 1x MI325X / 1x MI355X</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>1</td>
     </tr>
   </tbody>

@@ -42,6 +42,7 @@ class TreeCacheBuildContext:
     tp_size: int
     tp_rank: int
     tp_group: Any
+    full_tokens_per_layer: Optional[int] = None
 
 
 RadixCacheFactory = Callable[[TreeCacheBuildContext], BasePrefixCache]
@@ -84,6 +85,10 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
             from sglang.srt.mem_cache.chunk_cache import ChunkCache
 
             return ChunkCache(params)
+        if ctx.full_tokens_per_layer == 0:
+            from sglang.srt.mem_cache.chunk_cache import PureSWAChunkCache
+
+            return PureSWAChunkCache(params)
         from sglang.srt.mem_cache.chunk_cache import SWAChunkCache
 
         return SWAChunkCache(params)
@@ -112,6 +117,10 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
         return cache
 
     if ctx.is_hybrid_swa:
+        if ctx.full_tokens_per_layer == 0:
+            from sglang.srt.mem_cache.pure_swa_radix_cache import PureSWARadixCache
+
+            return PureSWARadixCache(params=params)
         from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 
         return SWARadixCache(params=params)
@@ -133,6 +142,20 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
             rank=ctx.tp_rank,
             tp_group=ctx.tp_group,
         )
+
+    if server_args.enable_flexkv:
+        # Importing the package side-effect registers the explicit
+        # ``--radix-cache-backend=flexkv`` factory; we then call the
+        # factory directly so --enable-flexkv stands on its own.
+        import os
+
+        from sglang.srt.mem_cache.storage.flexkv import _flexkv_factory
+
+        # Honor a CLI --flexkv-config-file by forwarding it via the env
+        # var that FlexKV's config loader actually reads.
+        if server_args.flexkv_config_file and not os.environ.get("FLEXKV_CONFIG_PATH"):
+            os.environ["FLEXKV_CONFIG_PATH"] = server_args.flexkv_config_file
+        return _flexkv_factory(ctx)
 
     from sglang.srt.mem_cache.radix_cache import RadixCache
 

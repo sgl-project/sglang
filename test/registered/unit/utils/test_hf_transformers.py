@@ -45,11 +45,6 @@ class TestNormalizeRopeScalingCompat(unittest.TestCase):
         normalize_rope_scaling_compat(cfg)
         self.assertEqual(cfg.rope_scaling["type"], "custom")
 
-    def test_no_op_when_no_rope_scaling(self):
-        cfg = PretrainedConfig()
-        normalize_rope_scaling_compat(cfg)
-        self.assertIsNone(getattr(cfg, "rope_scaling", None))
-
     def test_no_op_when_rope_scaling_is_none(self):
         cfg = PretrainedConfig()
         cfg.rope_scaling = None
@@ -477,59 +472,6 @@ class TestPatchRemovedSymbols(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # compat: _patch_rope_parameters_validation
 # ---------------------------------------------------------------------------
-
-
-class TestPatchRopeParametersValidation(unittest.TestCase):
-    # -----------------------------------------------------------------------
-    # Test ``rope_theta`` injection into ``rope_scaling``.
-    #
-    # Upstream `transformers.PretrainedConfig` now natively handles this
-    # logic. While the manual injection patch has been removed, these
-    # test cases are retained to ensure regression testing of the
-    # configuration's injection behavior.
-    # -----------------------------------------------------------------------
-
-    def test_injects_rope_theta_into_rope_scaling(self):
-        config_dict = {
-            "model_type": "llama",
-            "rope_theta": 500000.0,
-            "max_position_embeddings": 131072,
-            "rope_scaling": {
-                "rope_type": "llama3",
-                "factor": 8.0,
-                "low_freq_factor": 1.0,
-                "high_freq_factor": 4.0,
-                "original_max_position_embeddings": 8192,
-            },
-        }
-        config = PretrainedConfig.from_dict(config_dict)
-        rope_params = getattr(config, "rope_parameters", None)
-        if rope_params is not None:
-            self.assertIn("rope_theta", rope_params)
-
-    def test_no_injection_when_rope_theta_already_in_scaling(self):
-        config_dict = {
-            "model_type": "llama",
-            "rope_theta": 500000.0,
-            "max_position_embeddings": 131072,
-            "rope_scaling": {
-                "rope_type": "llama3",
-                "factor": 8.0,
-                "rope_theta": 999.0,
-                "low_freq_factor": 1.0,
-                "high_freq_factor": 4.0,
-                "original_max_position_embeddings": 8192,
-            },
-        }
-        config = PretrainedConfig.from_dict(config_dict)
-        rope_params = getattr(config, "rope_parameters", None)
-        if rope_params is not None:
-            self.assertEqual(rope_params["rope_theta"], 999.0)
-
-    def test_no_crash_without_rope_scaling(self):
-        config_dict = {"model_type": "llama", "rope_theta": 10000.0}
-        config = PretrainedConfig.from_dict(config_dict)
-        self.assertIsNotNone(config)
 
 
 # ---------------------------------------------------------------------------

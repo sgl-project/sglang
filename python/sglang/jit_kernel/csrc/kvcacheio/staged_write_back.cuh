@@ -210,41 +210,41 @@ struct HiCacheStagedWriteBackKernel {
 
     TensorMatcher({T, N, D})  //
         .with_dtype(cache_dtype)
-        .with_device<kDLCUDA>(device_)
+        .with_device<kDLGPU>(device_)
         .verify(staging_k);
     if constexpr (!kIsMLA) {
       TensorMatcher({T, N, D})  //
           .with_dtype(cache_dtype)
-          .with_device<kDLCUDA>(device_)
+          .with_device<kDLGPU>(device_)
           .verify(staging_v);
     }
     TensorMatcher({-1, N, D})  //
         .with_dtype(cache_dtype)
-        .with_device<kDLCPU, kDLCUDAHost>()
+        .with_device<kDLCPU, kDLGPUHost>()
         .verify(k_cache_dst);
     if constexpr (!kIsMLA) {
       TensorMatcher({-1, N, D})  //
           .with_dtype(cache_dtype)
-          .with_device<kDLCPU, kDLCUDAHost>()
+          .with_device<kDLCPU, kDLGPUHost>()
           .verify(v_cache_dst);
     }
     TensorMatcher({N})  //
         .with_dtype<uint64_t>()
-        .with_device<kDLCUDA>(device_)
+        .with_device<kDLGPU>(device_)
         .verify(k_ptr_src);
     if constexpr (!kIsMLA) {
       TensorMatcher({N})  //
           .with_dtype<uint64_t>()
-          .with_device<kDLCUDA>(device_)
+          .with_device<kDLGPU>(device_)
           .verify(v_ptr_src);
     }
     TensorMatcher({P})  //
         .with_dtype<int32_t, int64_t>(indices_dtype)
-        .with_device<kDLCUDA>(device_)
+        .with_device<kDLGPU>(device_)
         .verify(page_indices_src);
     TensorMatcher({T})  //
         .with_dtype<int64_t>(dst_indices_dtype)
-        .with_device<kDLCPU, kDLCUDAHost>()
+        .with_device<kDLCPU, kDLGPUHost>()
         .verify(dst_indices_cpu);
 
     RuntimeCheck(page_size > 0, "HiCache staged relayout: page_size must be positive");

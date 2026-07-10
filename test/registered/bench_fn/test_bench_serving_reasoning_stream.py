@@ -16,7 +16,7 @@ import unittest
 from argparse import Namespace
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-from sglang.bench_serving import (
+from sglang.benchmark.serving import (
     RequestFuncInput,
     async_request_openai_chat_completions,
     calculate_metrics,

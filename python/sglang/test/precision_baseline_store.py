@@ -102,6 +102,10 @@ def _select_latest_run(
     # when a signature is given, mismatched (incl. legacy unsigned) rows are
     # skipped — fetch then returns None and the caller establishes a fresh one
     # instead of erroring on incompatible tensors.
+    # A failed run must not become the next comparison baseline, or a persistent
+    # regression is masked: today's regressed tensors (uploaded as "failed")
+    # would be selected as the reference next run. Prefer non-failed rows and
+    # fall back to a failed one only when no usable baseline exists.
     candidates: list[tuple[tuple[int, int], dict[str, Any]]] = []
     for idx, row in enumerate(rows):
         if row.get("model") != model:
@@ -117,7 +121,9 @@ def _select_latest_run(
     if not candidates:
         return None
     candidates.sort(key=lambda kv: kv[0])
-    return candidates[-1][1]["run_path"]
+    usable = [c for c in candidates if c[1].get("pass_label") != "failed"]
+    chosen = usable or candidates
+    return chosen[-1][1]["run_path"]
 
 
 def fetch_latest_baseline(

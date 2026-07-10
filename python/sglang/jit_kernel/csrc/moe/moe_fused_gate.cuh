@@ -63,6 +63,10 @@ __global__ void moe_fused_gate_kernel_small_token(const MoEFusedGateParams __gri
   uint32_t tid = threadIdx.x;
   uint32_t warp_id = tid / kWarpSize;
   uint32_t lane_id = tid % kWarpSize;
+  // Actual warps launched (<= kWarpsPerToken). num_experts that need fewer than
+  // kWarpsPerToken warps leave the upper warp_maxs/warp_experts slots unwritten,
+  // so the cross-warp reduction below must only read the launched warps.
+  const uint32_t num_warps = blockDim.x / kWarpSize;
 
   extern __shared__ float shared_mem[];
   float* shared_scores = shared_mem;
@@ -116,8 +120,8 @@ __global__ void moe_fused_gate_kernel_small_token(const MoEFusedGateParams __gri
     __syncthreads();
 
     if (warp_id == 0) {
-      float final_max = (lane_id < kWarpsPerToken) ? warp_maxs[lane_id] : -FLT_MAX;
-      int final_expert = (lane_id < kWarpsPerToken) ? warp_experts[lane_id] : -1;
+      float final_max = (lane_id < num_warps) ? warp_maxs[lane_id] : -FLT_MAX;
+      int final_expert = (lane_id < num_warps) ? warp_experts[lane_id] : -1;
 
 #pragma unroll
       for (int offset = 16; offset > 0; offset /= 2) {

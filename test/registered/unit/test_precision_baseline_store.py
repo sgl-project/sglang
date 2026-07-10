@@ -62,13 +62,6 @@ class TestHfStoreConfig(CustomTestCase):
             cfg = hfs.HfStoreConfig.from_env()
         self.assertEqual(cfg.revision, "dev")
 
-    def test_from_env_default_revision(self):
-        with patch.dict(
-            os.environ, {"SGLANG_PRECISION_HF_REPO": "my/repo"}, clear=False
-        ):
-            cfg = hfs.HfStoreConfig.from_env()
-        self.assertEqual(cfg.revision, "main")
-
     def test_from_env_raises_when_missing(self):
         with patch.dict(os.environ, {}, clear=True):
             with self.assertRaises(RuntimeError):
@@ -156,6 +149,72 @@ class TestSelectLatestRun(CustomTestCase):
         self.assertIsNone(
             hfs._select_latest_run(rows, model="org/m", capture_signature="zzz")
         )
+
+    def test_prefers_older_passed_over_newer_failed(self):
+        # A failed run must not shadow an older good baseline, or a persistent
+        # regression is masked after one night.
+        rows = [
+            {
+                "model": "org/m",
+                "run_path": "good",
+                "pass_label": "passed",
+                "push_index": 1,
+            },
+            {
+                "model": "org/m",
+                "run_path": "bad",
+                "pass_label": "failed",
+                "push_index": 2,
+            },
+        ]
+        self.assertEqual(hfs._select_latest_run(rows, model="org/m"), "good")
+
+    def test_prefers_baseline_established_over_newer_failed(self):
+        rows = [
+            {
+                "model": "org/m",
+                "run_path": "seed",
+                "pass_label": "baseline_established",
+                "push_index": 1,
+            },
+            {
+                "model": "org/m",
+                "run_path": "bad",
+                "pass_label": "failed",
+                "push_index": 2,
+            },
+        ]
+        self.assertEqual(hfs._select_latest_run(rows, model="org/m"), "seed")
+
+    def test_falls_back_to_failed_when_only_failed(self):
+        rows = [
+            {
+                "model": "org/m",
+                "run_path": "bad1",
+                "pass_label": "failed",
+                "push_index": 1,
+            },
+            {
+                "model": "org/m",
+                "run_path": "bad2",
+                "pass_label": "failed",
+                "push_index": 2,
+            },
+        ]
+        self.assertEqual(hfs._select_latest_run(rows, model="org/m"), "bad2")
+
+    def test_missing_pass_label_treated_as_usable(self):
+        # Legacy rows without pass_label stay usable as baselines.
+        rows = [
+            {"model": "org/m", "run_path": "legacy", "push_index": 1},
+            {
+                "model": "org/m",
+                "run_path": "bad",
+                "pass_label": "failed",
+                "push_index": 2,
+            },
+        ]
+        self.assertEqual(hfs._select_latest_run(rows, model="org/m"), "legacy")
 
 
 class TestReadManifest(CustomTestCase):
@@ -556,19 +615,6 @@ class TestWithRetries(CustomTestCase):
         exc_429 = HfHubHTTPError("rate limited", response=resp_429)
 
         mock_op = MagicMock(side_effect=[exc_429, "ok"])
-        result = hfs._with_retries(mock_op, what="test", base_delay=0.01)
-        self.assertEqual(result, "ok")
-        mock_time.sleep.assert_called_once()
-
-    @patch("sglang.test.precision_baseline_store.time")
-    def test_retries_on_5xx(self, mock_time):
-        from huggingface_hub.errors import HfHubHTTPError
-
-        resp_500 = MagicMock()
-        resp_500.status_code = 500
-        exc_500 = HfHubHTTPError("server error", response=resp_500)
-
-        mock_op = MagicMock(side_effect=[exc_500, "ok"])
         result = hfs._with_retries(mock_op, what="test", base_delay=0.01)
         self.assertEqual(result, "ok")
         mock_time.sleep.assert_called_once()

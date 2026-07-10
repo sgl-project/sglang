@@ -18,7 +18,7 @@ class TestQwen25VL72B(TestVLMModels):
     mmmu_accuracy = 0.2
     other_args = [
         "--trust-remote-code",
-        "--cuda-graph-max-bs",
+        "--cuda-graph-max-bs-decode",
         "32",
         "--enable-multimodal",
         "--mem-fraction-static",

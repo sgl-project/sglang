@@ -284,7 +284,7 @@ def npu_fused_moe_without_routing_weights_bf16(
     # gmm1: gate_up_proj
     hidden_states = torch.ops.npu.npu_grouped_matmul(
         x=[hidden_states],
-        weight=[layer.w13_weight],
+        weight=[layer.w13_weight.transpose(1, 2)],
         split_item=2,
         group_list_type=group_list_type,
         group_type=0,
@@ -297,7 +297,7 @@ def npu_fused_moe_without_routing_weights_bf16(
     # gmm2: down_proj
     hidden_states = torch.ops.npu.npu_grouped_matmul(
         x=[hidden_states],
-        weight=[layer.w2_weight],
+        weight=[layer.w2_weight.transpose(1, 2)],
         split_item=2,
         group_list_type=group_list_type,
         group_type=0,

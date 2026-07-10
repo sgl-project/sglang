@@ -14,6 +14,7 @@ from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
     resolve_transformer_safetensors_to_load,
 )
 from sglang.multimodal_gen.runtime.loader.utils import _normalize_component_type
+from sglang.multimodal_gen.runtime.loader.weight_load_plan import WeightLoadPlan
 from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
@@ -79,6 +80,19 @@ class TransformerLoader(ComponentLoader):
     ]
     expected_library = "diffusers"
 
+    def should_raise_customized_load_error(
+        self, server_args: ServerArgs, component_name: str
+    ) -> bool:
+        component_server_args = _server_args_for_transformer_component(
+            server_args, component_name
+        )
+        # Don't let a quantized load quietly fall back to the unquantized native
+        # model. That would drop the requested precision and bury the real error.
+        return (
+            component_server_args.transformer_weights_path is not None
+            or component_server_args.quantization is not None
+        )
+
     def load_customized(
         self, component_model_path: str, server_args: ServerArgs, component_name: str
     ):
@@ -142,12 +156,19 @@ class TransformerLoader(ComponentLoader):
         else:
             logger.debug("quantization config: %s", init_params["quant_config"])
 
+        local_torch_device = get_local_torch_device()
+        weight_load_plan = WeightLoadPlan.for_component(
+            checkpoint_load_device=local_torch_device,
+            needs_device_weight_postprocess=quant_spec.needs_device_weight_postprocess,
+            component_cpu_offload=bool(component_server_args.dit_cpu_offload),
+        )
+
         # Load the model using FSDP loader
         model = maybe_load_fsdp_model(
             model_cls=model_cls,
             init_params=init_params,
             weight_dir_list=safetensors_list,
-            device=get_local_torch_device(),
+            device=local_torch_device,
             hsdp_replicate_dim=server_args.hsdp_replicate_dim,
             hsdp_shard_dim=server_args.hsdp_shard_dim,
             cpu_offload=component_server_args.dit_cpu_offload,
@@ -157,6 +178,7 @@ class TransformerLoader(ComponentLoader):
             reduce_dtype=torch.float32,
             output_dtype=None,
             strict=False,
+            weight_load_plan=weight_load_plan,
         )
 
         # post-hooks (e.g., patch scales (nunchaku))

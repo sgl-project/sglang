@@ -5,8 +5,11 @@ from sgl_kernel_npu.norm.l1_norm import l1_norm
 
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location_dispatch import topk_ids_logical_to_physical
-from sglang.srt.layers.moe.topk import StandardTopKOutput, select_experts
-from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
+from sglang.srt.layers.moe.topk import (
+    StandardTopKOutput,
+    capture_routed_experts_if_allowed,
+    select_experts,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
@@ -80,7 +83,8 @@ def fused_topk_npu(
             group_count=topk_config.num_expert_group if use_grouped_topk else 1,
             group_select_mode=(1 if use_grouped_topk else 0),
             renorm=0,
-            norm_type=1,  # 1 for sigmoid, 0 for softmax
+            # 1 for sigmoid, 0 for softmax
+            norm_type=1,
             routed_scaling_factor=(
                 1 if renormalize else topk_config.routed_scaling_factor
             ),
@@ -104,10 +108,6 @@ def fused_topk_npu(
     if expert_location_dispatch_info is not None:
         topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
     get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)
-    if (cap := get_global_experts_capturer()) is not None:
-        cap.capture(
-            layer_id=layer_id,
-            topk_indices=topk_ids,
-        )
+    capture_routed_experts_if_allowed(topk_config, layer_id, topk_ids)
 
     return StandardTopKOutput(topk_weights, topk_ids, router_logits)

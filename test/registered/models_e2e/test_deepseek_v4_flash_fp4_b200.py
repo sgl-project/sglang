@@ -198,7 +198,7 @@ class TestDSV4FlashFP4BreakableCudaGraphB200(
                 "1024",
                 "--mem-fraction-static",
                 "0.80",
-                "--cuda-graph-max-bs",
+                "--cuda-graph-max-bs-decode",
                 "16",
                 "--max-running-requests",
                 "128",

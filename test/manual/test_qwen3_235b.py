@@ -84,7 +84,7 @@ class TestQwen3235BFP8(unittest.TestCase):
         ]
 
         MTP_ARGS = [
-            "--cuda-graph-max-bs=32",
+            "--cuda-graph-max-bs-decode=32",
             "--max-running-requests=32",
         ]
         variants = [

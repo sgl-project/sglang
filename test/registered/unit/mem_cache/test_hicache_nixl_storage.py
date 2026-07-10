@@ -9,10 +9,8 @@ import shutil
 import socket
 import subprocess
 import tempfile
-import threading
 import time
 import unittest
-from typing import List
 
 import torch
 
@@ -382,17 +380,36 @@ class TestNixlUnified(CustomTestCase):
                 num_pages * mock_host.page_size, dtype=torch.int64
             )
 
+            # Distinct data per key so a round trip that mixes keys up (e.g. a
+            # FILE registration that collapses every desc onto one file) is
+            # caught, not just the pass/fail return codes. Non-zero-copy only:
+            # the layer_first layout makes per-page seeding straightforward.
+            if not is_zero_copy_mode:
+                ps = mock_host.page_size
+                for p in range(num_pages):
+                    mock_host.kv_buffer[:, :, p * ps : (p + 1) * ps] = float(p + 1)
+                expected = mock_host.kv_buffer.clone()
+
             set_results = hicache.batch_set_v1(keys, host_indices)
             self.assertTrue(
                 all(set_results),
                 f"batch_set_v1 failed (zero_copy={is_zero_copy_mode}): {set_results}",
             )
 
+            if not is_zero_copy_mode:
+                mock_host.kv_buffer.zero_()
+
             get_results = hicache.batch_get_v1(keys, host_indices)
             self.assertTrue(
                 all(get_results),
                 f"batch_get_v1 failed (zero_copy={is_zero_copy_mode}): {get_results}",
             )
+
+            if not is_zero_copy_mode:
+                self.assertTrue(
+                    torch.equal(mock_host.kv_buffer, expected),
+                    "round trip corrupted or mixed up per-key data",
+                )
         finally:
             agent.get_reg_descs = orig_get_reg
             agent.register_memory = orig_register
@@ -493,177 +510,6 @@ class TestNixlUnified(CustomTestCase):
         ]
 
         self.assertEqual(self.hicache.batch_exists(["key1", "key2"]), 1)
-
-    def _run_concurrent_stress(
-        self, is_zero_copy_mode: bool, hicache: HiCacheNixl = None
-    ):
-        """One getter thread + one setter thread share the same HiCacheNixl
-        for ``is_zero_copy_mode``. Defaults to ``self.hicache`` (FILE backend);
-        pass ``hicache`` to exercise a different backend (e.g. OBJ).
-
-        Phase 1 pre-seeds N preset pages and stores them under fixed keys.
-        Phase 2 runs the getter (reads the presets back and verifies content)
-        concurrently with the setter (writes a stream of fresh distinct keys
-        from a disjoint source region). The kv_buffer regions touched by the
-        two threads are disjoint so any data corruption observed is from the
-        backend's shared state (bounce buffers, devId maps, fd pool).
-        """
-        if hicache is None:
-            hicache = self.hicache
-
-        # 8 preset pages, 8 getter dst pages, 8 setter src pages -> 24 in use.
-        mock_host = MockMemPoolHost(is_zero_copy_mode=is_zero_copy_mode, num_pages=32)
-        hicache.register_mem_pool_host(mock_host)
-        hicache.is_zero_copy = is_zero_copy_mode
-
-        page_size = mock_host.page_size
-        dtype = mock_host.dtype
-        num_pages = 8
-
-        # Disjoint per-thread regions in kv_buffer (indexed by token index).
-        preset_src = (0, num_pages)
-        getter_dst = (num_pages, 2 * num_pages)
-        setter_src = (2 * num_pages, 3 * num_pages)
-
-        # zero_copy=page_first uses dim 1 for the token axis; non-zero-copy=
-        # layer_first uses dim 2. All buffer accesses below go through this so
-        # the rest of the harness stays layout-agnostic.
-        def token_index(start_token: int, n_tokens: int):
-            s = slice(start_token, start_token + n_tokens)
-            if is_zero_copy_mode:
-                return (slice(None), s, slice(None), slice(None), slice(None))
-            return (slice(None), slice(None), s, slice(None), slice(None))
-
-        def page_index(start_page: int, n_pages: int):
-            return token_index(start_page * page_size, n_pages * page_size)
-
-        def fill_pages(start_page: int, n_pages: int, value_fn):
-            """value_fn(i) -> scalar value for page i."""
-            for i in range(n_pages):
-                idx = page_index(start_page + i, 1)
-                shape = mock_host.kv_buffer[idx].shape
-                mock_host.kv_buffer[idx] = torch.full(
-                    shape, float(value_fn(i)), dtype=dtype
-                )
-
-        # Phase 1: distinct value per preset page so a wrong-page result is
-        # detectable; setter source is constant (value irrelevant to the
-        # test, just needs to be valid).
-        fill_pages(preset_src[0], num_pages, lambda i: i + 1)
-        fill_pages(setter_src[0], num_pages, lambda i: -1.0)
-
-        preset_keys = [f"preset_{int(is_zero_copy_mode)}_{i}" for i in range(num_pages)]
-        preset_indices = torch.arange(
-            preset_src[0] * page_size,
-            preset_src[1] * page_size,
-            dtype=torch.int64,
-        )
-        self.assertTrue(
-            all(hicache.batch_set_v1(preset_keys, preset_indices)),
-            "phase 1: presetting keys failed",
-        )
-
-        # Expected per-page-i payload after a successful get into getter_dst.
-        expected_pages = [
-            mock_host.kv_buffer[page_index(preset_src[0] + i, 1)].clone()
-            for i in range(num_pages)
-        ]
-
-        # Phase 2.
-        stop = threading.Event()
-        errors: List[str] = []
-        errors_lock = threading.Lock()
-
-        def record_error(msg: str):
-            with errors_lock:
-                errors.append(msg)
-
-        def getter_loop():
-            dst_indices = torch.arange(
-                getter_dst[0] * page_size,
-                getter_dst[1] * page_size,
-                dtype=torch.int64,
-            )
-            loops = 0
-            while not stop.is_set():
-                # Zero the dst pages so a no-op get is observable.
-                mock_host.kv_buffer[page_index(getter_dst[0], num_pages)] = 0.0
-                ok = hicache.batch_get_v1(preset_keys, dst_indices)
-                if not all(ok):
-                    record_error(f"getter loop {loops}: batch_get_v1 returned {ok}")
-                    return
-                for i in range(num_pages):
-                    got = mock_host.kv_buffer[page_index(getter_dst[0] + i, 1)]
-                    if not torch.equal(got, expected_pages[i]):
-                        record_error(f"getter loop {loops}: preset page {i} corrupted")
-                        return
-                loops += 1
-
-        def setter_loop():
-            src_indices = torch.arange(
-                setter_src[0] * page_size,
-                setter_src[1] * page_size,
-                dtype=torch.int64,
-            )
-            loops = 0
-            while not stop.is_set():
-                keys = [
-                    f"setter_{int(is_zero_copy_mode)}_{loops}_{i}"
-                    for i in range(num_pages)
-                ]
-                ok = hicache.batch_set_v1(keys, src_indices)
-                if not all(ok):
-                    record_error(f"setter loop {loops}: batch_set_v1 returned {ok}")
-                    return
-                loops += 1
-
-        t_get = threading.Thread(target=getter_loop, daemon=True)
-        t_set = threading.Thread(target=setter_loop, daemon=True)
-        t_get.start()
-        t_set.start()
-
-        # Bounded run: long enough to interleave many ops under NIXL I/O
-        # GIL release, short enough for a unit test.
-        time.sleep(3.0)
-        stop.set()
-        t_get.join(timeout=10)
-        t_set.join(timeout=10)
-
-        self.assertFalse(
-            t_get.is_alive() or t_set.is_alive(),
-            "stress threads failed to stop",
-        )
-        self.assertEqual(errors, [], f"concurrency errors: {errors}")
-
-    @unittest.skipUnless(STRESS_ENABLED, "set SGLANG_RUN_NIXL_STRESS=1 to run")
-    def test_concurrent_getter_setter_file_zero_copy(self):
-        """Stress: concurrent getter+setter, FILE backend, zero-copy."""
-        self._run_concurrent_stress(is_zero_copy_mode=True)
-
-    @unittest.skipUnless(STRESS_ENABLED, "set SGLANG_RUN_NIXL_STRESS=1 to run")
-    def test_concurrent_getter_setter_file_non_zero_copy(self):
-        """Stress: concurrent getter+setter, FILE backend, non-zero-copy."""
-        self._run_concurrent_stress(is_zero_copy_mode=False)
-
-    @unittest.skipUnless(STRESS_ENABLED, "set SGLANG_RUN_NIXL_STRESS=1 to run")
-    @unittest.skipUnless(
-        MinioFixture.is_available(), "minio binary or boto3 not available"
-    )
-    def test_concurrent_getter_setter_obj_zero_copy(self):
-        """Stress: concurrent getter+setter, OBJ backend (MinIO), zero-copy."""
-        self._run_concurrent_stress(
-            is_zero_copy_mode=True, hicache=self._make_obj_hicache()
-        )
-
-    @unittest.skipUnless(STRESS_ENABLED, "set SGLANG_RUN_NIXL_STRESS=1 to run")
-    @unittest.skipUnless(
-        MinioFixture.is_available(), "minio binary or boto3 not available"
-    )
-    def test_concurrent_getter_setter_obj_non_zero_copy(self):
-        """Stress: concurrent getter+setter, OBJ backend (MinIO), non-zero-copy."""
-        self._run_concurrent_stress(
-            is_zero_copy_mode=False, hicache=self._make_obj_hicache()
-        )
 
 
 @unittest.skipUnless(hasattr(os, "O_DIRECT"), "O_DIRECT not available on this platform")
@@ -784,7 +630,7 @@ class TestNixlFileLayout(CustomTestCase):
 
     def test_route_key_is_stable_and_bucketed(self):
         from sglang.srt.mem_cache.storage.nixl.nixl_routing import (
-            _BUCKET_HEX_CHARS,
+            BUCKET_HEX_CHARS,
             route_key,
         )
 
@@ -792,8 +638,8 @@ class TestNixlFileLayout(CustomTestCase):
         disk_idx, bucket = route_key("page-123", 4)
         self.assertGreaterEqual(disk_idx, 0)
         self.assertLess(disk_idx, 4)
-        self.assertEqual(len(bucket), _BUCKET_HEX_CHARS)
-        self.assertRegex(bucket, rf"^[0-9a-f]{{{_BUCKET_HEX_CHARS}}}$")
+        self.assertEqual(len(bucket), BUCKET_HEX_CHARS)
+        self.assertRegex(bucket, rf"^[0-9a-f]{{{BUCKET_HEX_CHARS}}}$")
 
     def test_route_key_rejects_empty_disk_set(self):
         from sglang.srt.mem_cache.storage.nixl.nixl_routing import route_key

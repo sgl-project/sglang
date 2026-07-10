@@ -57,7 +57,6 @@ else:
         awq_dequantize,
         bmm_fp8,
         dsv3_fused_a_gemm,
-        dsv3_router_gemm,
         fp8_blockwise_scaled_mm,
         fp8_scaled_mm,
         gptq_gemm,
@@ -72,7 +71,12 @@ else:
         shuffle_rows,
     )
     from sgl_kernel.grammar import apply_token_bitmask_inplace_cuda
+    from sgl_kernel.infllm_v2 import (
+        infllmv2_attn_stage1,
+        max_pooling_1d_varlen,
+    )
     from sgl_kernel.kvcacheio import (
+        copy_all_layer_kv_cache_cpu,
         transfer_kv_all_layer,
         transfer_kv_all_layer_mla,
         transfer_kv_per_layer,
@@ -90,9 +94,7 @@ else:
         apply_shuffle_mul_sum,
         fp8_blockwise_scaled_grouped_mm,
         fused_qk_norm_rope,
-        kimi_k2_moe_fused_gate,
         moe_align_block_size,
-        moe_fused_gate,
         moe_sum,
         moe_sum_reduce,
         prepare_moe_input,
@@ -112,11 +114,20 @@ else:
         top_p_renorm_prob,
     )
     from sgl_kernel.speculative import (
+        assign_draft_cache_locs_contiguous_cpu,
+        assign_extend_cache_locs_cpu,
+        assign_req_to_token_pool_cpu,
+        build_draft_decode_metadata_cpu,
         build_tree_kernel_efficient,
+        build_tree_kernel_efficient_cpu,
+        fill_accept_out_cache_loc_cpu,
+        fill_bonus_tokens_cpu,
         reconstruct_indices_from_tree_mask,
+        rotate_input_ids_cpu,
         segment_packbits,
         tree_speculative_sampling_target_only,
         verify_tree_greedy,
+        verify_tree_greedy_cpu,
     )
     from sgl_kernel.top_k import (
         fast_topk,
@@ -178,10 +189,8 @@ else:
         "gptq_gemm",
         "gptq_shuffle",
         "int8_scaled_mm",
-        "kimi_k2_moe_fused_gate",
         "merge_state_v2",
         "moe_align_block_size",
-        "moe_fused_gate",
         "moe_sum",
         "moe_sum_reduce",
         "prepare_moe_input",

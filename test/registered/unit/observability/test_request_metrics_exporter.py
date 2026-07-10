@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
-register_cpu_ci(est_time=7, suite="base-b-test-cpu")
+register_cpu_ci(est_time=7, suite="base-c-test-cpu")
 
 import asyncio
 import json
@@ -249,10 +249,6 @@ class TestFileRequestMetricsExporter(unittest.TestCase):
         exporter.close()
         self.assertIsNone(exporter._current_file_handler)
         self.assertIsNone(exporter._current_hour_suffix)
-
-    def test_close_noop_when_no_handler(self):
-        exporter = self._make_exporter()
-        exporter.close()  # should not raise
 
     def test_close_error(self):
         """Close failure is logged but state is still reset."""

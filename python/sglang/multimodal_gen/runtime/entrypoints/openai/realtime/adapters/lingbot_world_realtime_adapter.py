@@ -14,7 +14,15 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_adapter 
     build_realtime_sampling_params,
     save_realtime_first_frame,
 )
-from sglang.multimodal_gen.runtime.realtime.control_signals import ControlSignalQueue
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_world.constants import (
+    LINGBOT_CAMERA_ACTIONS_CONDITION,
+    LINGBOT_PROMPT_UPDATED_CONDITION,
+)
+from sglang.multimodal_gen.runtime.realtime.control_signals import (
+    ControlSignalQueue,
+    ParsedControlEventPayload,
+    parse_control_event_payload,
+)
 from sglang.multimodal_gen.runtime.realtime.states import (
     RealtimeCameraControlState,
 )
@@ -29,6 +37,7 @@ if TYPE_CHECKING:
 
 LINGBOT_REALTIME_DEFAULT_NUM_INFERENCE_STEPS = 4
 LINGBOT_REALTIME_MIN_CONDITION_CHUNKS = 2
+COMPOSITE_INPUT_EVENT_KIND = "composite_input"
 
 
 class LingBotWorldRealtimeState(RealtimeCameraControlState):
@@ -47,16 +56,44 @@ class LingBotWorldRealtimeState(RealtimeCameraControlState):
     def receive_prompt(self, prompt: str, *, event_id: int | None = None) -> None:
         self.prompt_queue.push("prompt", prompt, event_id=event_id)
 
+    def parse_camera_control_event_payload(
+        self,
+        payload: Any,
+        *,
+        event_id: int | None,
+    ) -> ParsedControlEventPayload:
+        return parse_control_event_payload(
+            payload,
+            event_id=event_id,
+            kind="camera_actions",
+            normalize_state_payload=self._normalize_state_actions,
+            validate_script_payload=LingBotWorldRealtimeAdapter._validate_camera_actions,
+        )
+
+    def receive_parsed_camera_control_event_payload(
+        self,
+        parsed: ParsedControlEventPayload,
+        *,
+        event_id: int | None,
+    ) -> str:
+        if parsed.mode == "state":
+            transitions = parsed.payload
+            self.receive_camera_state_transitions(transitions)
+            return f"kind=camera_actions, mode=state, transitions={len(transitions)}"
+
+        camera_actions = parsed.payload
+        self.receive_camera_action_script(camera_actions, event_id=event_id)
+        return f"kind=camera_actions, mode=script, frames={len(camera_actions)}"
+
     def receive_camera_control_event_payload(
         self,
         payload: Any,
         *,
         event_id: int | None,
     ) -> str:
-        return super().receive_camera_control_event_payload(
-            payload,
-            event_id=event_id,
-            validate_camera_actions=LingBotWorldRealtimeAdapter._validate_camera_actions,
+        parsed = self.parse_camera_control_event_payload(payload, event_id=event_id)
+        return self.receive_parsed_camera_control_event_payload(
+            parsed, event_id=event_id
         )
 
     def sample_prompt(self) -> str:
@@ -86,7 +123,7 @@ class LingBotWorldRealtimeAdapter(BaseRealtimeModelAdapter):
         request: RealtimeVideoGenerationsRequest,
     ) -> None:
         condition_inputs = request.condition_inputs or {}
-        camera_actions = condition_inputs.get("camera_actions")
+        camera_actions = condition_inputs.get(LINGBOT_CAMERA_ACTIONS_CONDITION)
         if camera_actions is not None:
             state = self._state(session)
             state.receive_camera_action_script(
@@ -113,16 +150,118 @@ class LingBotWorldRealtimeAdapter(BaseRealtimeModelAdapter):
     ) -> str:
         state = self._state(session)
         if event.kind == "camera_actions":
-            return state.receive_camera_control_event_payload(
-                event.payload,
-                event_id=event.event_id,
-            )
+            return self._ingest_camera_actions(state, event.payload, event.event_id)
         elif event.kind == "prompt":
-            if not isinstance(event.payload, str) or not event.payload:
-                raise ValueError("prompt event payload must be a non-empty string")
-            state.receive_prompt(event.payload, event_id=event.event_id)
-            return f"kind=prompt, prompt_len={len(event.payload)}"
+            return self._ingest_prompt(state, event.payload, event.event_id)
+        elif event.kind == COMPOSITE_INPUT_EVENT_KIND:
+            return self._ingest_composite_input(state, event.payload, event.event_id)
         raise ValueError(f"unsupported event kind: {event.kind}")
+
+    def _ingest_camera_actions(
+        self,
+        state: LingBotWorldRealtimeState,
+        payload: Any,
+        event_id: int | None,
+    ) -> str:
+        return state.receive_camera_control_event_payload(
+            payload,
+            event_id=event_id,
+        )
+
+    def _ingest_prompt(
+        self,
+        state: LingBotWorldRealtimeState,
+        payload: Any,
+        event_id: int | None,
+    ) -> str:
+        prompt = self._validate_prompt_payload(payload)
+        state.receive_prompt(prompt, event_id=event_id)
+        return f"kind=prompt, prompt_len={len(prompt)}"
+
+    @staticmethod
+    def _validate_prompt_payload(payload: Any) -> str:
+        if not isinstance(payload, str) or not payload:
+            raise ValueError("prompt event payload must be a non-empty string")
+        return payload
+
+    def _ingest_composite_input(
+        self,
+        state: LingBotWorldRealtimeState,
+        payload: Any,
+        event_id: int | None,
+    ) -> str:
+        if not isinstance(payload, dict):
+            raise ValueError("composite_input event payload must be a map")
+        input_types = payload.get("input_types")
+        if not isinstance(input_types, list) or not input_types:
+            raise ValueError(
+                "composite_input event payload requires non-empty input_types"
+            )
+
+        parsed_inputs = []
+        for input_type in input_types:
+            if not isinstance(input_type, str) or not input_type:
+                raise ValueError(
+                    "composite_input input_types must contain non-empty strings"
+                )
+            if input_type not in payload:
+                raise ValueError(f"composite_input event payload requires {input_type}")
+            parsed_inputs.append(
+                (
+                    input_type,
+                    self._parse_composite_input_item(
+                        state,
+                        input_type,
+                        payload[input_type],
+                        event_id,
+                    ),
+                )
+            )
+
+        input_logs = []
+        for input_type, parsed_payload in parsed_inputs:
+            input_logs.append(
+                self._ingest_parsed_composite_input_item(
+                    state,
+                    input_type,
+                    parsed_payload,
+                    event_id,
+                )
+            )
+        return f"kind=composite_input, inputs={input_logs}"
+
+    def _parse_composite_input_item(
+        self,
+        state: LingBotWorldRealtimeState,
+        input_type: str,
+        payload: Any,
+        event_id: int | None,
+    ) -> Any:
+        if input_type == "camera_actions":
+            return state.parse_camera_control_event_payload(
+                payload,
+                event_id=event_id,
+            )
+        if input_type == "prompt":
+            return self._validate_prompt_payload(payload)
+        raise ValueError(f"unsupported composite_input type: {input_type}")
+
+    def _ingest_parsed_composite_input_item(
+        self,
+        state: LingBotWorldRealtimeState,
+        input_type: str,
+        parsed_payload: Any,
+        event_id: int | None,
+    ) -> str:
+        if input_type == "camera_actions":
+            return state.receive_parsed_camera_control_event_payload(
+                parsed_payload,
+                event_id=event_id,
+            )
+        if input_type == "prompt":
+            state.receive_prompt(parsed_payload, event_id=event_id)
+            return f"kind=prompt, prompt_len={len(parsed_payload)}"
+        raise ValueError(f"unsupported composite_input type: {input_type}")
 
     def sample_chunk_inputs(
         self,
@@ -137,18 +276,22 @@ class LingBotWorldRealtimeAdapter(BaseRealtimeModelAdapter):
         if request is None:
             raise ValueError("realtime request is not initialized")
 
+        prompt_updated = False
         if chunk.index == 0:
             prompt = request.prompt
         elif state.has_prompt():
             prompt = state.sample_prompt()
             request.prompt = prompt
+            prompt_updated = True
         else:
             prompt = request.prompt
 
         condition_inputs = {}
+        if prompt_updated:
+            condition_inputs[LINGBOT_PROMPT_UPDATED_CONDITION] = True
         camera_actions = state.sample_camera_actions(chunk_size)
         if camera_actions is not None:
-            condition_inputs["camera_actions"] = camera_actions
+            condition_inputs[LINGBOT_CAMERA_ACTIONS_CONDITION] = camera_actions
         return RealtimeChunkInputs(prompt=prompt, condition_inputs=condition_inputs)
 
     def build_sampling_params(

@@ -1,0 +1,173 @@
+---
+title: JoyEcho
+description: Run JoyAI-Echo multi-shot audio–video generation with SGLang Diffusion.
+metatags:
+    description: "Deploy and use JoyAI-Echo long-form audio–video generation with SGLang Diffusion, including single-shot and multi-shot memory-bank workflows."
+---
+
+## 1. Model Introduction
+
+[JoyAI-Echo](https://huggingface.co/jdopensource/JoyAI-Echo) (JoyEcho) is a long-form audio–video generation model built on the LTX-2 backbone. Its core idea is a **paired audio–video memory bank**: each shot commits decoded frames and audio latents into a rolling bank, and subsequent shots condition on that memory prefix. This enables **multi-shot, minute-scale generation** with visual and audio continuity across prompts.
+
+Use `jdopensource/JoyAI-Echo` as `--model-path`. SGLang loads the monolithic release through the built-in [JoyAI-Echo-overlay](https://huggingface.co/Niehen6174/JoyAI-Echo-overlay) materialization path, similar to LTX-2.3-overlay.
+
+| Aspect | Standard LTX-2.3 | JoyEcho |
+| --- | --- | --- |
+| Pipeline | `LTX2Pipeline` / `LTX2TwoStageHQPipeline` | `JoyEchoPipeline` (default for this model) |
+| Denoising | Multi-step flow matching + CFG | LTX-2 DMD distilled path (8 steps, `guidance_scale=1.0`) |
+| Multi-shot | Not supported | Paired audio–video memory bank across shots |
+| Sequence parallelism | LTX-2 SP (video/audio sharded) | Ulysses SP (`ulysses_degree=2`): single-shot and multi-shot + memory bank |
+| Post-processing | Optional two-stage HQ upscaling | Per-shot mp4 output |
+
+<Warning>
+Review the model license on the [JoyAI-Echo Hugging Face page](https://huggingface.co/jdopensource/JoyAI-Echo) before production or commercial use. SGLang support does not grant additional model usage rights.
+</Warning>
+
+## 2. SGLang-diffusion Installation
+
+Install SGLang with diffusion dependencies:
+
+```bash
+uv pip install "sglang[diffusion]" --prerelease=allow
+```
+
+For platform-specific setup, see the [SGLang Diffusion installation guide](/docs/sglang-diffusion/installation).
+
+## 3. Model Deployment
+
+JoyEcho uses the default `JoyEchoPipeline` registered for `jdopensource/JoyAI-Echo`. A single high-VRAM GPU (for example H100 or H200) is enough for the common 832x480 / 121-frame / 8-step setting.
+
+```bash
+sglang serve \
+  --model-path jdopensource/JoyAI-Echo
+```
+
+Optional environment variable for long runs:
+
+```bash
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+```
+
+For multi-GPU serving, tensor parallelism (TP) and **Ulysses sequence parallelism (SP)** are supported. JoyEcho SP uses an **asymmetric layout**: video target latents are time-sharded across ranks, while audio (including memory tokens) is **replicated** on every rank so cross-attention stays temporally aligned. Multi-shot runs with `enable_memory_bank=true` are supported on SP.
+
+```bash
+sglang serve \
+  --model-path jdopensource/JoyAI-Echo \
+  --num-gpus 2 \
+  --ulysses-degree 2
+```
+
+<Note>
+JoyEcho SP currently targets **Ulysses-only** parallelism (`ulysses_degree=2`, `ring_degree=1`). Ring SP is not validated for this pipeline. For `sglang generate`, add `--num-gpus 2 --ulysses-degree 2` to the commands in section 4.
+</Note>
+
+## 4. Model Invocation
+
+### 4.1 Default sampling
+
+| Setting | Default |
+| --- | --- |
+| Resolution | 832x480 |
+| Frames | 121 |
+| FPS | 25 |
+| Steps | 8 |
+| Guidance scale | 1.0 |
+| Seed | 12345 |
+
+### 4.2 Single-shot text-to-video
+
+```bash
+sglang generate \
+  --model-path jdopensource/JoyAI-Echo \
+  --prompt "A curious raccoon walks through a sunlit forest path" \
+  --height 480 --width 832 --num-frames 121 --fps 25 \
+  --num-inference-steps 8 --seed 42 \
+  --save-output
+```
+
+Disable the memory bank for standalone clips with a config file:
+
+```bash
+cat > /tmp/joy_echo_single.json <<'EOF'
+{
+  "model_path": "jdopensource/JoyAI-Echo",
+  "prompt": "A curious raccoon walks through a sunlit forest path",
+  "enable_memory_bank": false,
+  "seed": 42,
+  "height": 480,
+  "width": 832,
+  "num_frames": 121,
+  "fps": 25,
+  "num_inference_steps": 8
+}
+EOF
+
+sglang generate --config /tmp/joy_echo_single.json --save-output
+```
+
+### 4.3 Multi-shot generation
+
+JoyEcho does **not** generate all shots in one forward pass. Each shot is one generation request. Continuity is carried by an in-process **memory bank** on the pipeline instance.
+
+Typical workflow:
+
+1. **Shot 0** — memory bank is empty; the model generates a standalone A/V clip.
+2. **After decode** — decoded video frames and packed audio latents are committed to the memory bank (up to 7 slots by default).
+3. **Shot 1+** — prior-shot frames are re-encoded and prepended as a memory prefix before denoising.
+4. **Per-shot seeding** — official semantics use `prompt_seed = base_seed + shot_index`.
+
+Pass multiple prompts as a list in a config file:
+
+```bash
+cat > /tmp/joy_echo_4shot.json <<'EOF'
+{
+  "model_path": "jdopensource/JoyAI-Echo",
+  "prompt": [
+    "Shot 0: A raccoon wakes up in a cozy attic.",
+    "Shot 1: The raccoon climbs down and opens the back door.",
+    "Shot 2: It walks through a rainy alley under neon signs.",
+    "Shot 3: The raccoon finds a warm bakery window and stops."
+  ],
+  "enable_memory_bank": true,
+  "reset_memory_bank": true,
+  "seed": 42,
+  "height": 480,
+  "width": 832,
+  "num_frames": 121,
+  "fps": 25,
+  "num_inference_steps": 8
+}
+EOF
+
+sglang generate --config /tmp/joy_echo_4shot.json --save-output
+```
+
+You can also pass prompts from a text file (one prompt per line) with `--prompt-path`:
+
+```bash
+sglang generate \
+  --model-path jdopensource/JoyAI-Echo \
+  --prompt-path /tmp/joy_echo_shots.txt \
+  --seed 42 \
+  --height 480 --width 832 --num-frames 121 --fps 25 \
+  --num-inference-steps 8 \
+  --save-output
+```
+
+### 4.4 Memory bank controls
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `enable_memory_bank` | `true` | Read/write the paired A/V memory bank between shots. |
+| `reset_memory_bank` | `true` | Clear the bank and shot counter at the start of a new session (`request_id` change or first shot). |
+
+Set `enable_memory_bank=false` when you want independent shots without cross-shot continuity.
+
+## 5. Practical Tips
+
+- Use `--num-inference-steps 8` and `--guidance-scale 1.0` to match the official JoyEcho DMD distilled path.
+- Multi-shot prompts can be passed as a `prompt` list, via `prompt_path`, or as sequential API calls on the same server instance.
+- The memory bank caps at **7 slots**; from shot 8 onward the oldest slots roll off.
+- For **2-GPU latency**, try **Ulysses SP** (`--num-gpus 2 --ulysses-degree 2`) on both single-shot and multi-shot runs. Use **TP** when you need a different sharding strategy or more than two GPUs.
+- Set `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` for long multi-shot SP sessions.
+- JoyEcho outputs per-shot mp4 files with synchronized audio. There is no built-in two-stage HQ upscaling path like LTX-2.3 HQ.

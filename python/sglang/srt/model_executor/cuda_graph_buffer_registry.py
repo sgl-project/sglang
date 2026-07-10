@@ -514,6 +514,7 @@ def build_decode_registry(
     enable_mamba_track: bool = False,
     is_encoder_decoder: bool = False,
     encoder_len_fill_value: int = 0,
+    encoder_lens_dtype: torch.dtype = torch.int32,
     enable_num_token_non_padded: bool = False,
     require_gathered_buffer: bool = False,
     enable_prefill_cp: bool = False,
@@ -632,7 +633,7 @@ def build_decode_registry(
             GraphSlot(
                 "encoder_lens",
                 _bs,
-                torch.int32,
+                encoder_lens_dtype,
                 axis="bs",
                 padding_policy=PaddingPolicy.FILL_ONCE,
                 pad_value=encoder_len_fill_value,
@@ -898,6 +899,7 @@ def build_eager_registry(
     enable_mamba_track: bool = False,
     is_encoder_decoder: bool = False,
     encoder_len_fill_value: int = 0,
+    encoder_lens_dtype: torch.dtype = torch.int32,
     dp_size: int = 1,
 ) -> CudaGraphBufferRegistry:
     """One fixed-max input registry for the ``EagerRunner``, serving BOTH eager
@@ -924,6 +926,7 @@ def build_eager_registry(
         enable_mamba_track=enable_mamba_track,
         is_encoder_decoder=is_encoder_decoder,
         encoder_len_fill_value=encoder_len_fill_value,
+        encoder_lens_dtype=encoder_lens_dtype,
         enable_num_token_non_padded=False,
         register_global_num_tokens=False,
         require_gathered_buffer=False,

@@ -18,7 +18,7 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import ProfileReq, ProfileReqOutput, ProfileReqType
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import is_mps, is_npu
 from sglang.srt.utils.profile_merger import ProfileMerger
 from sglang.srt.utils.profile_utils import ProfileManager
@@ -144,7 +144,7 @@ class SchedulerProfilerManager:
                     self.profiler_start_forward_ct + num_steps
                 )
             else:
-                self.profiler_target_forward_ct = self.get_forward_ct() + num_steps
+                self.profiler_target_forward_ct = self.get_forward_ct() + num_steps + 1
             # The caller will be notified when reaching profiler_target_forward_ct
         else:
             self.profiler_target_forward_ct = None
@@ -245,7 +245,7 @@ class SchedulerProfilerManager:
             self.profile_in_progress = True
 
         if "CUDA_PROFILER" in activities:
-            if self.ps.gpu_id == get_global_server_args().base_gpu_id:
+            if self.ps.gpu_id == get_server_args().base_gpu_id:
                 torch.cuda.cudart().cudaProfilerStart()
             self.profile_in_progress = True
 
@@ -355,7 +355,7 @@ class SchedulerProfilerManager:
             torch.cuda.memory._record_memory_history(enabled=None)
 
         if "CUDA_PROFILER" in self.profiler_activities:
-            if self.ps.gpu_id == get_global_server_args().base_gpu_id:
+            if self.ps.gpu_id == get_server_args().base_gpu_id:
                 torch.cuda.cudart().cudaProfilerStop()
 
         merge_message = self._merge_profile_traces()
@@ -412,7 +412,7 @@ class SchedulerProfilerManager:
                 self._start_profile()
 
     def _profile(self, recv_req: ProfileReq):
-        if recv_req.type == ProfileReqType.START_PROFILE:
+        if recv_req.req_type == ProfileReqType.START_PROFILE:
             if recv_req.profile_by_stage or recv_req.start_step:
                 return self._init_profile(
                     recv_req.output_dir,

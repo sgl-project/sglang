@@ -496,7 +496,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # Direct IO layout fixup (must happen before pool creation)
         if server_args.hicache_io_backend == "direct":
             if server_args.hicache_mem_layout == "page_first":
-                server_args.hicache_mem_layout = "page_first_direct"
+                server_args.override(
+                    "hicache.mem_layout_force", hicache_mem_layout="page_first_direct"
+                )
                 logger.warning(
                     "Page first layout is not supported with direct IO backend, "
                     "switching to page first direct layout"
@@ -1159,21 +1161,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 child_key = key.child_key(self.page_size)
 
         is_new_leaf = False
-        # Create new leaf for remaining suffix
+        # Create new leaf for remaining suffix. A leaf survives on its Full
+        # value alone; auxiliary components (SWA, Mamba) may legitimately hold
+        # only a tombstone for this span (e.g. the whole leaf is outside the SWA
+        # window). Materialize it anyway so the Full KV stays cacheable.
         if len(key):
-            if any(
-                comp.should_skip_leaf_creation(
-                    total_prefix_len=total_prefix_length,
-                    key_len=len(key),
-                    params=params,
-                )
-                for comp in self._components_tuple
-            ):
-                # TODO: When leaf creation is skipped, We should release all component
-                # resources here or propagate a flag so that
-                # cleanup_after_caching_req can free them properly.
-                self.token_to_kv_pool_allocator.free(value)
-                return InsertResult(prefix_len=total_prefix_length)
             target_node = self._add_new_node(node, key, value, priority=priority)
             is_new_leaf = True
         else:
@@ -2288,10 +2280,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 labels.update(extra_metric_labels)
             existing_collector = self.storage_metrics_collector
             if existing_collector is None:
-                from sglang.srt.server_args import get_global_server_args
+                from sglang.srt.runtime_context import get_server_args
 
                 storage_cls = resolve_collector_class(
-                    get_global_server_args(),
+                    get_server_args(),
                     STAT_LOGGER_ROLE_STORAGE,
                     StorageMetricsCollector,
                 )
@@ -2491,6 +2483,23 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     def sliding_window_size(self):
         swa = self.components.get(ComponentType.SWA)
         return swa.sliding_window_size if swa else None
+
+    def swa_reprefill_tail_tokens(self) -> int:
+        """
+        Only unified_kv + HiCache needs this: SWA lives in a per-request ring
+        (state_slot/pos), not content-stable and never offloaded to host, so a
+        reused prefix's trailing sliding window would read another request's
+        stale ring slots. Re-prefilling that window rewrites this request's ring
+        (what plain radix reuse does via its SWA match gate). 0 for every other
+        layout.
+        """
+        swa = self.components.get(ComponentType.SWA)
+        unified_compress_only_hicache = (
+            self.cache_controller is not None
+            and swa is not None
+            and swa._swa_kv_pool_host is None
+        )
+        return swa.sliding_window_size if unified_compress_only_hicache else 0
 
     def supports_swa(self) -> bool:
         return ComponentType.SWA in self.components

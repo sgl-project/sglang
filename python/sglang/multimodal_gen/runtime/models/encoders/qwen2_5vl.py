@@ -57,7 +57,7 @@ from sglang.multimodal_gen.runtime.utils.common import add_prefix
 # limitations under the License.
 """Inference-only Qwen2-VL model compatible with HuggingFace weights."""
 import logging
-from typing import Callable, Iterable, Optional, Tuple, Union
+from typing import Iterable, Optional, Tuple, Union
 
 try:
     from typing import Unpack  # type: ignore[attr-defined]
@@ -76,7 +76,6 @@ from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
     Qwen2_5_VLModelOutputWithPast,
     Qwen2_5_VLRotaryEmbedding,
     apply_multimodal_rotary_pos_emb,
-    eager_attention_forward,
 )
 
 logger = logging.getLogger(__name__)
@@ -260,26 +259,10 @@ class Qwen2_5_VLAttention(nn.Module):
                 key_states, value_states, self.layer_idx, cache_kwargs
             )
 
-        attention_interface: Callable = eager_attention_forward
-        # if self.config._attn_implementation != "eager":
-        # attention_interface = ALL_ATTENTION_FUNCTIONS["sdpa"]
         query_states = query_states.transpose(1, 2)
         key_states = key_states.transpose(1, 2)
         value_states = value_states.transpose(1, 2)
         attn_output = self.attn(query_states, key_states, value_states)
-        #
-        # attn_output, attn_weights = attention_interface(
-        #     self,
-        #     query_states,
-        #     key_states,
-        #     value_states,
-        #     attention_mask,
-        #     dropout=0.0 if not self.training else self.attention_dropout,
-        #     scaling=self.scaling,
-        #     sliding_window=self.sliding_window,
-        #     position_ids=position_ids,  # pass positions for FA2
-        #     **kwargs,
-        # )
 
         attn_output = attn_output.reshape(bsz, q_len, -1).contiguous()
         attn_output = _linear_output(self.o_proj, attn_output)
@@ -547,7 +530,6 @@ class Qwen2_5_VLTextModel(nn.Module):
                 "config": self.config,
                 "inputs_embeds": inputs_embeds,
                 "attention_mask": attention_mask,
-                "cache_position": cache_position,
                 "past_key_values": past_key_values,
                 "position_ids": text_position_ids,
             }

@@ -121,8 +121,8 @@ jobs:
         if: steps.gate.outputs.run_job == 'true'
         timeout-minutes: 30
         run: |
-          pytest python/sglang/multimodal_gen/test/layers/test_musa_rmsnorm.py
-          pytest python/sglang/multimodal_gen/test/layers/test_musa_silu_and_mul.py
+          pytest python/sglang/multimodal_gen/test/unit/musa/layers/test_musa_rmsnorm.py
+          pytest python/sglang/multimodal_gen/test/unit/musa/layers/test_musa_silu_and_mul.py
 
   # ==================== LLM server: 1-GPU ====================
   nightly-test-llm-server-1-gpu-musa:
@@ -219,7 +219,7 @@ jobs:
           RUNAI_STREAMER_MEMORY_LIMIT: 0
         run: |
           cd python
-          python3 sglang/multimodal_gen/test/run_suite_musa.py \
+          python3 sglang/multimodal_gen/test/server/musa/run_suite.py \
             --suite 1-gpu-musa-nightly \
             --partition-id ${{ matrix.part }} \
             --total-partitions 2 \
@@ -268,7 +268,7 @@ jobs:
           RUNAI_STREAMER_MEMORY_LIMIT: 0
         run: |
           cd python
-          python3 sglang/multimodal_gen/test/run_suite_musa.py \
+          python3 sglang/multimodal_gen/test/server/musa/run_suite.py \
             --suite 2-gpu-musa \
             --continue-on-error
 

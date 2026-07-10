@@ -171,7 +171,7 @@ def _build_flashinfer_mxfp4_runner(num_experts, hidden, inter):
     and wires the runner with a minimal MoeRunnerConfig sufficient for the
     cutlass SM90 fused func, which only reads dispatch_output / quant_info.
     """
-    import sglang.srt.layers.moe.moe_runner.flashinfer_mxfp4  # noqa: F401
+    import sglang.srt.layers.moe.moe_runner.flashinfer_cutlass  # noqa: F401
     from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
     from sglang.srt.layers.moe.moe_runner.runner import MoeRunner
     from sglang.srt.layers.moe.utils import MoeRunnerBackend
@@ -325,7 +325,7 @@ def test_apply_sm90_cutlass_matches_flashinfer_direct(
     covered separately by ``test_process_weights_matches_direct_interleave``;
     here we just verify that ``apply`` calls the kernel with the right
     arguments (incl. input padding + output trim)."""
-    import sglang.srt.layers.moe.moe_runner.flashinfer_mxfp4 as fi_mxfp4_mod
+    import sglang.srt.layers.moe.moe_runner.flashinfer_cutlass as fi_cutlass_mod
     import sglang.srt.layers.quantization.mxfp4 as mxfp4_mod
 
     # Bypass symmetric-memory / TP-group in both the legacy quant_method and
@@ -336,10 +336,10 @@ def test_apply_sm90_cutlass_matches_flashinfer_direct(
     monkeypatch.setattr(mxfp4_mod, "is_allocation_symmetric", lambda: False)
     monkeypatch.setattr(mxfp4_mod, "get_tp_group", lambda: None)
     monkeypatch.setattr(
-        fi_mxfp4_mod, "use_symmetric_memory", lambda *a, **kw: nullcontext()
+        fi_cutlass_mod, "use_symmetric_memory", lambda *a, **kw: nullcontext()
     )
-    monkeypatch.setattr(fi_mxfp4_mod, "is_allocation_symmetric", lambda: False)
-    monkeypatch.setattr(fi_mxfp4_mod, "get_tp_group", lambda: None)
+    monkeypatch.setattr(fi_cutlass_mod, "is_allocation_symmetric", lambda: False)
+    monkeypatch.setattr(fi_cutlass_mod, "get_tp_group", lambda: None)
 
     w13, w2, w13_s, w2_s, w13_b, w2_b = _make_random_mxfp4(num_experts, hidden, inter)
     x = torch.randn(tokens, hidden, dtype=torch.bfloat16, device="cuda") * 0.1
@@ -463,17 +463,17 @@ def test_dsv4_apply_matches_flashinfer_direct(
     the equivalent reorder + scale-cast + interleave applied manually."""
     from types import SimpleNamespace
 
-    import sglang.srt.layers.moe.moe_runner.flashinfer_mxfp4 as fi_mxfp4_mod
+    import sglang.srt.layers.moe.moe_runner.flashinfer_cutlass as fi_cutlass_mod
     import sglang.srt.layers.quantization.mxfp4_flashinfer_cutlass_moe as ds_mod
     from sglang.srt.layers.quantization.utils import reorder_w1w3_to_w3w1
 
     # Bypass symmetric-memory / TP-group stack in the new fused-func module
     # (where DSv4 ``apply`` now dispatches the kernel call through).
     monkeypatch.setattr(
-        fi_mxfp4_mod, "use_symmetric_memory", lambda *a, **kw: nullcontext()
+        fi_cutlass_mod, "use_symmetric_memory", lambda *a, **kw: nullcontext()
     )
-    monkeypatch.setattr(fi_mxfp4_mod, "is_allocation_symmetric", lambda: False)
-    monkeypatch.setattr(fi_mxfp4_mod, "get_tp_group", lambda: None)
+    monkeypatch.setattr(fi_cutlass_mod, "is_allocation_symmetric", lambda: False)
+    monkeypatch.setattr(fi_cutlass_mod, "get_tp_group", lambda: None)
 
     w13, w2, w13_s, w2_s = _make_random_dsv4_mxfp4(num_experts, hidden, inter)
     x = torch.randn(tokens, hidden, dtype=torch.bfloat16, device="cuda") * 0.1

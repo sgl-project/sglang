@@ -28,7 +28,7 @@ class TestFlashinferTrtllmGenAttnBackend(CustomTestCase):
             other_args=[
                 "--attention-backend",
                 "trtllm_mha",
-                "--cuda-graph-max-bs",
+                "--cuda-graph-max-bs-decode",
                 "512",
                 "--tp-size",
                 "4",

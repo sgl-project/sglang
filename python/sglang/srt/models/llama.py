@@ -52,8 +52,8 @@ from sglang.srt.model_loader.weight_utils import (
     kv_cache_scales_loader,
     maybe_remap_kv_scale_name,
 )
-from sglang.srt.runtime_context import get_parallel
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.platforms import current_platform
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import add_prefix, is_cuda, is_npu, is_xpu, make_layers
 from sglang.utils import get_exception_traceback
 
@@ -502,7 +502,7 @@ class LlamaForCausalLM(nn.Module):
                 config.hidden_size,
                 quant_config=quant_config,
                 prefix=add_prefix("lm_head", prefix),
-                use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+                use_attn_tp_group=get_server_args().enable_dp_lm_head,
             )
         self.logits_processor = LogitsProcessor(config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
@@ -784,8 +784,8 @@ class LlamaForCausalLM(nn.Module):
             torch.xpu.empty_cache()
             torch.xpu.synchronize()
         else:
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
+            current_platform.empty_cache()
+            current_platform.synchronize()
 
     def get_embed(self):
         return self.model.embed_tokens.weight
@@ -803,8 +803,8 @@ class LlamaForCausalLM(nn.Module):
             torch.xpu.empty_cache()
             torch.xpu.synchronize()
         else:
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
+            current_platform.empty_cache()
+            current_platform.synchronize()
 
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
         self.model.load_kv_cache_scales(quantization_param_path)

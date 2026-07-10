@@ -46,8 +46,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.runtime_context import get_parallel
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_parallel, get_server_args, get_stream
 from sglang.srt.utils import add_prefix, is_cuda, is_non_idle_and_non_empty, make_layers
 
 Step3p5Config = None
@@ -149,7 +148,7 @@ class Step3p5MoEMLP(nn.Module):
 
         self.experts = get_moe_impl_class(quant_config)(
             num_experts=config.moe_num_experts
-            + get_global_server_args().ep_num_redundant_experts,
+            + get_server_args().ep_num_redundant_experts,
             top_k=config.moe_top_k,
             layer_id=layer_id,
             hidden_size=config.hidden_size,
@@ -172,8 +171,7 @@ class Step3p5MoEMLP(nn.Module):
             # TODO: we will support tp < ep in the future
             self.ep_size = get_parallel().moe_ep_size
             self.moe_num_experts = (
-                config.moe_num_experts
-                + get_global_server_args().ep_num_redundant_experts
+                config.moe_num_experts + get_server_args().ep_num_redundant_experts
             )
             self.top_k = config.moe_top_k
 
@@ -670,7 +668,7 @@ class Step3p5Model(nn.Module):
         self.vocab_size = config.vocab_size
         self.pp_group = get_pp_group()
 
-        alt_stream = torch.cuda.Stream() if _is_cuda else None
+        alt_stream = get_stream("alt") if _is_cuda else None
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -681,7 +679,7 @@ class Step3p5Model(nn.Module):
                 prefix=add_prefix("embed_tokens", prefix),
                 params_dtype=(
                     torch.float32
-                    if get_global_server_args().rl_on_policy_target is not None
+                    if get_server_args().rl_on_policy_target is not None
                     else None
                 ),
             )
@@ -826,7 +824,7 @@ class Step3p5ForCausalLM(nn.Module):
                     config.vocab_size,
                     config.hidden_size,
                     quant_config=quant_config,
-                    use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+                    use_attn_tp_group=get_server_args().enable_dp_lm_head,
                     prefix=add_prefix("lm_head", prefix),
                 )
         else:

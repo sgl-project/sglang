@@ -1,12 +1,13 @@
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=10, suite="nightly-amd-kernel-1-gpu", nightly=True)
 
 import unittest
 
 import torch
 
-from sglang.srt.speculative.triton_ops.gather_spec_extras import gather_spec_extras
+from sglang.kernels.ops.speculative.gather_spec_extras import gather_spec_extras
 from sglang.test.test_utils import CustomTestCase
 
 _OUTPUT_NAMES = ("topk_p", "topk_index", "bonus_tokens", "hidden_states")

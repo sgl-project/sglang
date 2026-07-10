@@ -1,0 +1,79 @@
+{
+    "metadata": {
+        "model": "Diffusion Server",
+        "hardware": "CI B200 pool",
+        "description": "Reference estimates for B200-only diffusion cases, split out from the shared diffusion baseline file.",
+        "last_updated": "2026-07-01"
+    },
+    "tolerances": {
+        "long_term": {
+            "e2e": 0.15,
+            "denoise_stage": 0.1,
+            "non_denoise_stage": 0.5,
+            "denoise_step": 0.25,
+            "denoise_agg": 0.15
+        },
+        "pr_test": {
+            "e2e": 0.25,
+            "denoise_stage": 0.25,
+            "non_denoise_stage": 0.8,
+            "denoise_step": 0.3,
+            "denoise_agg": 0.2
+        }
+    },
+    "improvement_reporting": {
+        "threshold": 0.2
+    },
+    "sampling": {
+        "step_fractions": [
+            0.0,
+            0.2,
+            0.4,
+            0.6,
+            0.8,
+            1.0
+        ]
+    },
+    "scenarios": {
+        "flux1_modelopt_nvfp4_t2i": {
+            "stages_ms": {},
+            "denoise_step_ms": {},
+            "expected_e2e_ms": 0.0,
+            "expected_avg_denoise_ms": 0.0,
+            "expected_median_denoise_ms": 0.0,
+            "estimated_full_test_time_s": 71.2
+        },
+        "flux2_modelopt_nvfp4_t2i": {
+            "stages_ms": {},
+            "denoise_step_ms": {},
+            "expected_e2e_ms": 0.0,
+            "expected_avg_denoise_ms": 0.0,
+            "expected_median_denoise_ms": 0.0,
+            "estimated_full_test_time_s": 592.3
+        },
+        "qwen_image_2512_modelopt_nvfp4_t2i": {
+            "stages_ms": {},
+            "denoise_step_ms": {},
+            "expected_e2e_ms": 0.0,
+            "expected_avg_denoise_ms": 0.0,
+            "expected_median_denoise_ms": 0.0,
+            "estimated_full_test_time_s": 120.0
+        },
+        "wan22_modelopt_nvfp4_t2v": {
+            "stages_ms": {},
+            "denoise_step_ms": {},
+            "expected_e2e_ms": 0.0,
+            "expected_avg_denoise_ms": 0.0,
+            "expected_median_denoise_ms": 0.0,
+            "estimated_full_test_time_s": 181.8
+        },
+        "ideogram4_nvfp4_t2i": {
+            "stages_ms": {},
+            "denoise_step_ms": {},
+            "expected_e2e_ms": 0.0,
+            "expected_avg_denoise_ms": 0.0,
+            "expected_median_denoise_ms": 0.0,
+            "estimated_full_test_time_s": 300.0
+        }
+    }
+}

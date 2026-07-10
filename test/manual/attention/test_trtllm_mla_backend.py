@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, get_server_args
 
 _parallel_override = get_parallel().override(attn_tp_size=1)
 _parallel_override.__enter__()
@@ -26,7 +26,6 @@ from sglang.srt.model_executor.forward_context import (
 )
 from sglang.srt.server_args import (
     ServerArgs,
-    get_global_server_args,
     set_global_server_args_for_scheduler,
 )
 from sglang.srt.utils import is_flashinfer_available
@@ -222,7 +221,7 @@ class MockModelRunner:
         self.page_size = config["page_size"]
 
         # Server args stub - needed by attention backends
-        self.server_args = get_global_server_args()
+        self.server_args = get_server_args()
 
         # Model-config stub with MLA attributes
         self.model_config = type(

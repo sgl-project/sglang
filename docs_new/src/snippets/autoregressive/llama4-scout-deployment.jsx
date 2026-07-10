@@ -81,7 +81,7 @@ export const Llama4ScoutDeployment = () => {
       cmd += `  --speculative-eagle-topk 1 \\\n`;
       cmd += `  --speculative-num-draft-tokens 4 \\\n`;
       cmd += `  --mem-fraction-static 0.75 \\\n`;
-      cmd += `  --cuda-graph-max-bs 2`;
+      cmd += `  --cuda-graph-max-bs-decode 2`;
     }
 
     cmd += ` \\\n  --enable-multimodal`;

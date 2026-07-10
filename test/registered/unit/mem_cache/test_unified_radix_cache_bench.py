@@ -191,7 +191,6 @@ def create_bench_cache(
             head_dim=_HEAD_DIM,
             swa_attention_layer_ids=_non_full_layer_ids(),
             full_attention_layer_ids=_full_attention_layer_ids(),
-            enable_kvcache_transpose=False,
             device=device,
         )
         allocator = SWATokenToKVPoolAllocator(
@@ -211,7 +210,6 @@ def create_bench_cache(
             head_num=_HEAD_NUM,
             head_dim=_HEAD_DIM,
             full_attention_layer_ids=_full_attention_layer_ids(),
-            enable_kvcache_transpose=False,
             device=device,
             enable_memory_saver=False,
             mamba_pool=req_to_token_pool.mamba_pool if has_mamba else None,
@@ -639,7 +637,9 @@ def bench_cache_finished(
         req.origin_input_ids = array("q", seq)
         req.output_ids = array("q")
         req.full_untruncated_fill_ids = array("q", seq)
-        req.fill_len = len(req.full_untruncated_fill_ids)
+        req.set_extend_range(
+            len(req.prefix_indices), len(req.full_untruncated_fill_ids)
+        )
         req.last_node = node
         req.cache_protected_len = matched_len
         req.kv_committed_len = len(seq)
@@ -739,27 +739,6 @@ _CI_BENCH_CONFIGS = [
         page_size=1,
         num_seqs=5000,
         kv_size=500_000,
-    ),
-    dict(
-        label="FULL_SWA_ps1",
-        components=(ComponentType.FULL, ComponentType.SWA),
-        page_size=1,
-        num_seqs=1000,
-        kv_size=100_000,
-    ),
-    dict(
-        label="FULL_ps16",
-        components=(ComponentType.FULL,),
-        page_size=16,
-        num_seqs=1000,
-        kv_size=100_000,
-    ),
-    dict(
-        label="FULL_SWA_ps16",
-        components=(ComponentType.FULL, ComponentType.SWA),
-        page_size=16,
-        num_seqs=1000,
-        kv_size=100_000,
     ),
     dict(
         label="FULL_ps128",

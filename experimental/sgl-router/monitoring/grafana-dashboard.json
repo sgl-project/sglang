@@ -89,7 +89,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum(rate(sgl_router_requests_total{model_id=~\"$model_id\",worker_url=~\"$worker_url\"}[$__rate_interval]))",
+          "expr": "sum(rate(sgl_router_worker_requests_total{model_id=~\"$model_id\",worker_url=~\"$worker_url\"}[$__rate_interval]))",
           "range": true,
           "refId": "A",
           "legendFormat": "__auto",
@@ -161,7 +161,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "100 * sum(rate(sgl_router_requests_total{outcome=\"error\",model_id=~\"$model_id\",worker_url=~\"$worker_url\"}[$__rate_interval])) / clamp_min(sum(rate(sgl_router_requests_total{model_id=~\"$model_id\",worker_url=~\"$worker_url\"}[$__rate_interval])), 1e-9)",
+          "expr": "100 * sum(rate(sgl_router_worker_requests_total{outcome=\"error\",model_id=~\"$model_id\",worker_url=~\"$worker_url\"}[$__rate_interval])) / clamp_min(sum(rate(sgl_router_worker_requests_total{model_id=~\"$model_id\",worker_url=~\"$worker_url\"}[$__rate_interval])), 1e-9)",
           "range": true,
           "refId": "A",
           "legendFormat": "__auto",
@@ -407,7 +407,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (outcome) (rate(sgl_router_requests_total{model_id=~\"$model_id\",worker_url=~\"$worker_url\"}[$__rate_interval]))",
+          "expr": "sum by (outcome) (rate(sgl_router_worker_requests_total{model_id=~\"$model_id\",worker_url=~\"$worker_url\"}[$__rate_interval]))",
           "range": true,
           "refId": "A",
           "legendFormat": "{{outcome}}",
@@ -500,7 +500,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (mode) (rate(sgl_router_requests_total{model_id=~\"$model_id\",worker_url=~\"$worker_url\"}[$__rate_interval]))",
+          "expr": "sum by (mode) (rate(sgl_router_worker_requests_total{model_id=~\"$model_id\",worker_url=~\"$worker_url\"}[$__rate_interval]))",
           "range": true,
           "refId": "A",
           "legendFormat": "{{mode}}",
@@ -686,7 +686,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (worker_url) (rate(sgl_router_requests_total{model_id=~\"$model_id\",worker_url=~\"$worker_url\"}[$__rate_interval]))",
+          "expr": "sum by (worker_url) (rate(sgl_router_worker_requests_total{model_id=~\"$model_id\",worker_url=~\"$worker_url\"}[$__rate_interval]))",
           "range": true,
           "refId": "A",
           "legendFormat": "{{worker_url}}",
@@ -2035,7 +2035,7 @@
           "type": "prometheus",
           "uid": "${datasource}"
         },
-        "definition": "label_values(sgl_router_requests_total, model_id)",
+        "definition": "label_values(sgl_router_worker_requests_total, model_id)",
         "hide": 0,
         "includeAll": true,
         "allValue": ".*",
@@ -2044,7 +2044,7 @@
         "name": "model_id",
         "options": [],
         "query": {
-          "query": "label_values(sgl_router_requests_total, model_id)",
+          "query": "label_values(sgl_router_worker_requests_total, model_id)",
           "refId": "StandardVariableQuery"
         },
         "refresh": 2,
@@ -2061,7 +2061,7 @@
           "type": "prometheus",
           "uid": "${datasource}"
         },
-        "definition": "label_values(sgl_router_requests_total, worker_url)",
+        "definition": "label_values(sgl_router_worker_requests_total, worker_url)",
         "hide": 0,
         "includeAll": true,
         "allValue": ".*",
@@ -2070,7 +2070,7 @@
         "name": "worker_url",
         "options": [],
         "query": {
-          "query": "label_values(sgl_router_requests_total, worker_url)",
+          "query": "label_values(sgl_router_worker_requests_total, worker_url)",
           "refId": "StandardVariableQuery"
         },
         "refresh": 2,

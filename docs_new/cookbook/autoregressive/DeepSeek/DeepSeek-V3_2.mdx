@@ -497,7 +497,7 @@ sglang_args=$(echo serve \
   --dsa-decode-backend flashmla_sparse \
   --enable-dsa-prefill-context-parallel \
   --dsa-prefill-cp-mode round-robin-split \
-  --cuda-graph-max-bs 128 \
+  --cuda-graph-max-bs-decode 128 \
   --max-running-requests 128 \
   --trust-remote-code --host "0.0.0.0" --port 30000 \
   --log-requests \

@@ -10,7 +10,7 @@
 //   B200 BF16 (tp8): 91.88%  · perf A/B (cc1, cc128).
 //   B200 FP8  (tp8): 93.78%  — with `--fp8-gemm-backend triton` (DeepGEMM UE8M0 workaround; ~19% slower).
 //   B200 NVFP4 (tp8): 89.38%.
-// (perf tokens_per_sec_per_gpu = measured output tok/s ÷ 8 GPUs; TTFT = median.)
+// (perf tokens_per_sec_per_gpu = total (in+out) tok/s/GPU = measured output tok/s ÷ 8 × (isl+osl)/osl; TTFT = median.)
 //
 // sglang_version = the build the numbers ran on (PR #28400 + #28604, +#28649 for FP8 load,
 // +#28662/triton-workaround for Blackwell FP8). H200 numbers taken on a main build @ 3f668733.
@@ -23,12 +23,12 @@ export const benchmarks = [
     verified: true,
     sglang_version: "main @ 3f668733 (#28400 + #28604)",
     speed: [
-      // cc=1: median TTFT 81.89 ms, median TPOT 8.91 ms, output 109.96 tok/s (÷8 ≈ 13.7/GPU).
+      // cc=1: median TTFT 81.89 ms, median TPOT 8.91 ms, output 109.96 tok/s (÷8 ≈ 13.7 output/GPU → 69 total/GPU).
       { workload: { dataset: "random", isl: 4096, osl: 1024, max_concurrency: 1 },
-        ttft_ms: 81.9, tpot_ms: 8.91, tokens_per_sec_per_gpu: 13.7 },
-      // cc=128: median TTFT 200.11 ms (mean 1221), median TPOT 52.09 ms, output 2266 tok/s (÷8 ≈ 283/GPU).
+        ttft_ms: 81.9, tpot_ms: 8.91, tokens_per_sec_per_gpu: 69 },
+      // cc=128: median TTFT 200.11 ms (mean 1221), median TPOT 52.09 ms, output 2266 tok/s (÷8 ≈ 283 output/GPU → 1415 total/GPU).
       { workload: { dataset: "random", isl: 4096, osl: 1024, max_concurrency: 128 },
-        ttft_ms: 200.1, tpot_ms: 52.1, tokens_per_sec_per_gpu: 283 },
+        ttft_ms: 200.1, tpot_ms: 52.1, tokens_per_sec_per_gpu: 1415 },
     ],
     accuracy: { gsm8k_pct: 93.02 },
   },
@@ -48,9 +48,9 @@ export const benchmarks = [
     sglang_version: "PR #28400 + #28604",
     speed: [
       { workload: { dataset: "random", isl: 4096, osl: 1024, max_concurrency: 1 },
-        ttft_ms: 108, tpot_ms: 9.0, tokens_per_sec_per_gpu: 13.6 },
+        ttft_ms: 108, tpot_ms: 9.0, tokens_per_sec_per_gpu: 68 },
       { workload: { dataset: "random", isl: 4096, osl: 1024, max_concurrency: 128 },
-        ttft_ms: 170, tpot_ms: 43.3, tokens_per_sec_per_gpu: 331 },
+        ttft_ms: 170, tpot_ms: 43.3, tokens_per_sec_per_gpu: 1655 },
     ],
     accuracy: { gsm8k_pct: 91.88 },
   },

@@ -52,7 +52,6 @@ class CustomOp(nn.Module):
     def forward_tpu(self, *args, **kwargs) -> Any:
         # By default, we assume that TPU ops are compatible with the
         # PyTorch-native implementation.
-        # NOTE(woosuk): This is a placeholder for future extensions.
         return self.forward_native(*args, **kwargs)
 
     def forward_musa(self, *args, **kwargs) -> Any:

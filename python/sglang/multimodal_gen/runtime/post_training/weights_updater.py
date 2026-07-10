@@ -7,17 +7,16 @@ LLM engine's ModelRunner.update_weights_from_disk.
 
 Detailed usage of higher level API can be found in
 
-/python/sglang/multimodal_gen/test/server/test_update_weights_from_disk.py
+/python/sglang/multimodal_gen/test/single_test_file/test_update_weights_from_disk.py
 
 Key design decisions:
 
 - All-or-nothing with rollback: modules are updated sequentially.  If
   any module fails (shape mismatch, corrupted file, etc.), every module
   that was already updated is rolled back by reloading its weights from
-  pipeline.model_path (the last successfully-loaded checkpoint).  On
-  success, pipeline.model_path is updated to the new model_path so
-  that future rollbacks target the latest good checkpoint, not the
-  originally-launched model.
+  that module's last successfully-loaded weights directory.  On a full
+  successful update, pipeline.model_path is updated to the new model_path;
+  target_modules updates keep per-module rollback state for hybrid models.
 
 - Rollback failures propagate: if rollback itself fails, the exception is
   not caught so the caller knows the model is in an inconsistent state.
@@ -228,12 +227,16 @@ class WeightsUpdater:
 
     Args:
         pipeline: A ComposedPipelineBase (or DiffusersPipeline) instance
-            whose modules will be updated.  The pipeline's model_path
-            attribute is used for rollback on failure.
+            whose modules will be updated.
     """
 
     def __init__(self, pipeline):
         self.pipeline = pipeline
+        try:
+            self._module_weight_dirs = pipeline._weights_updater_module_weight_dirs
+        except AttributeError:
+            self._module_weight_dirs = {}
+            pipeline._weights_updater_module_weight_dirs = self._module_weight_dirs
 
     def update_weights_from_disk(
         self,
@@ -281,6 +284,12 @@ class WeightsUpdater:
         )
 
         success, message = self._apply_weights(modules_to_update, weights_map)
+
+        if success:
+            for module_name, _ in modules_to_update:
+                self._module_weight_dirs[module_name] = weights_map[module_name]
+            if target_modules is None:
+                self.pipeline.model_path = local_model_path
 
         gc.collect()
         torch.cuda.empty_cache()
@@ -355,12 +364,17 @@ class WeightsUpdater:
         """
         if not updated_modules:
             return
-        original_path = maybe_download_model(self.pipeline.model_path)
+        original_path: str | None = None
         for name in updated_modules:
             module = self.pipeline.get_module(name)
             if module is None:
                 continue
-            weights_dir = Path(original_path) / name
+            weights_dir = self._module_weight_dirs.get(name)
+            if weights_dir is None:
+                if original_path is None:
+                    original_path = maybe_download_model(self.pipeline.model_path)
+                weights_dir = str(Path(original_path) / name)
+            weights_dir = Path(weights_dir)
             if not weights_dir.exists():
                 continue
             weights_iter = _get_weights_iter(str(weights_dir))

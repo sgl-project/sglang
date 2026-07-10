@@ -32,6 +32,21 @@ else:
         return dt
 
 
+@triton.jit
+def convert_rs_fp16x2(x: tl.tensor, rand: tl.tensor) -> tl.tensor:
+    y = tl.inline_asm_elementwise(
+        asm="""{
+cvt.rs.f16x2.f32 $0, $2, $1, $3;
+}""",
+        constraints="=r,r,r,r,r",
+        args=(x, rand),
+        dtype=tl.float16,
+        is_pure=True,
+        pack=2,
+    )
+    return y
+
+
 @triton.heuristics({"HAS_DT_BIAS": lambda args: args["dt_bias_ptr"] is not None})
 @triton.heuristics({"HAS_D": lambda args: args["D_ptr"] is not None})
 @triton.heuristics({"HAS_Z": lambda args: args["z_ptr"] is not None})
@@ -85,6 +100,7 @@ def _selective_scan_update_kernel(
     cache_steps,
     retrieve_parent_token_ptr,
     intermediate_state_indices_ptr,
+    rand_seed_ptr,
     # Matrix dimensions
     batch,
     T,
@@ -143,6 +159,8 @@ def _selective_scan_update_kernel(
     HAS_EAGLE_TREE_CUSTOM_ATTN_MASK: tl.constexpr,
     HAS_INTERMEDIATE_STATE_INDICES: tl.constexpr,
     BLOCK_SIZE_DSTATE: tl.constexpr,
+    USE_RS_ROUNDING: tl.constexpr,
+    PHILOX_ROUNDS: tl.constexpr,
     USE_GDC: tl.constexpr = False,
 ):
     if USE_GDC:
@@ -300,7 +318,31 @@ def _selective_scan_update_kernel(
             z_ptr += stride_z_T
 
     if not DISABLE_STATE_UPDATE:
-        tl.store(state_ptrs, state.to(state_ptrs.dtype.element_ty), mask=mask)
+        if USE_RS_ROUNDING:
+            rand_seed = tl.load(rand_seed_ptr)
+            if HAS_STATE_BATCH_INDICES:
+                rand_offsets = (
+                    state_batch_idx * stride_state_batch + pid_h * stride_state_head
+                )
+            else:
+                rand_offsets = pid_b * stride_state_batch + pid_h * stride_state_head
+            rand_offsets += (
+                offs_m[:, None] * stride_state_dim
+                + offs_n[None, :] * stride_state_dstate
+            )
+            if PHILOX_ROUNDS > 0:
+                rand = tl.randint(rand_seed, rand_offsets, PHILOX_ROUNDS)
+            else:
+                rand = tl.randint(rand_seed, rand_offsets)
+            state_to_store = convert_rs_fp16x2(state, rand)
+            tl.static_assert(state_to_store.dtype == tl.float16, "state must be fp16")
+            tl.static_assert(
+                state_ptrs.dtype.element_ty == tl.float16,
+                "Stochastic rounding only supports fp16 state stores",
+            )
+        else:
+            state_to_store = state.to(state_ptrs.dtype.element_ty)
+        tl.store(state_ptrs, state_to_store, mask=mask)
 
     if USE_GDC:
         tl.extra.cuda.gdc_launch_dependents()
@@ -325,6 +367,8 @@ def selective_state_update(
     cache_steps=None,
     retrieve_parent_token=None,
     intermediate_state_indices=None,
+    enable_stochastic_rounding=False,
+    cache_philox_rounds=0,
 ):
     """
     Argument:
@@ -351,7 +395,17 @@ def selective_state_update(
         retrieve_parent_token: (batch, T) tensor of parent token indices for EAGLE tree attention
         intermediate_state_indices: (batch,) tensor of indices for intermediate_states_buffer operations.
             If provided, uses these indices instead of state_batch_indices for the buffer.
+        enable_stochastic_rounding: Whether to stochastically round final FP16 SSM cache writes.
+        cache_philox_rounds: Number of Philox rounds to use when stochastic rounding is enabled.
     """
+    if cache_philox_rounds < 0:
+        raise ValueError("cache_philox_rounds must be non-negative.")
+    if enable_stochastic_rounding and state.dtype != torch.float16:
+        raise ValueError(
+            "Stochastic rounding for the Mamba SSM cache requires state dtype "
+            f"torch.float16, got {state.dtype}."
+        )
+
     if state.dim() == 3:
         state = state.unsqueeze(1)
     if x.dim() == 2:
@@ -435,6 +489,11 @@ def selective_state_update(
         if retrieve_parent_token is not None
         else (0, 0)
     )
+    rand_seed = (
+        torch.randint(0, 2**32, (1,), device=state.device)
+        if enable_stochastic_rounding
+        else None
+    )
 
     pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
 
@@ -456,6 +515,7 @@ def selective_state_update(
             cache_steps if cache_steps is not None else 0,
             retrieve_parent_token,
             intermediate_state_indices,
+            rand_seed,
             batch,
             T,
             nheads,
@@ -501,6 +561,8 @@ def selective_state_update(
             tie_hdim,
             BLOCK_SIZE_M,
             DISABLE_STATE_UPDATE=disable_state_update,
+            USE_RS_ROUNDING=enable_stochastic_rounding,
+            PHILOX_ROUNDS=cache_philox_rounds,
             num_warps=num_warps,
             **pdl_kwargs,
         )

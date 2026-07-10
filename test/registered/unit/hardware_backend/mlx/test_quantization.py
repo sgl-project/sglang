@@ -3,7 +3,7 @@
 Covers:
   - mlx_q4 / mlx_q8 quantize fp16 weights to QuantizedLinear in-place
   - active-memory drops after quantization
-  - smoke /generate still works post-quantize
+  - /generate still works post-quantize
   - pre-quantized HF repos still load (regression guard for mlx_lm passthrough)
   - mlx_q4 flag on an already-quantized model is a no-op (skip + log)
 

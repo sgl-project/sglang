@@ -1,0 +1,134 @@
+apiVersion: batch.volcano.sh/v1alpha1
+kind: Job
+metadata:
+  name: {{ kube_job_name }}
+  namespace: {{ name_space }}
+  labels:
+    ring-controller.atlas: ascend-1980
+    fault-scheduling: "force"
+spec:
+  minAvailable: 1
+  schedulerName: volcano
+  policies:
+    - event: PodEvicted
+      action: RestartJob
+  {% if env == "green" %}
+  queue: default
+  {% endif %}
+  tasks:
+  - name: "pod"
+    replicas: 1
+    template:
+      metadata:
+        labels:
+          app: sgl-ascend
+          ring-controller.atlas: ascend-1980
+      spec:
+        containers:
+        - image: {{ image }}
+          {% if env == "green" %}
+          imagePullPolicy: IfNotPresent
+          {% else %}
+          imagePullPolicy: Always
+          {% endif %}
+          securityContext:
+            privileged: true
+          name: sgl-ascend
+          env:
+          - name: HOSTNAME
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.name
+          - name: POD_IP
+            valueFrom:
+              fieldRef:
+                fieldPath: status.hostIP
+          - name: INSTALL_SGLANG_FROM_SOURCE
+            value: "{{ install_sglang_from_source }}"
+          - name: METRICS_DATA_FILE
+            value: "{{ metrics_data_file }}"
+          - name: KUBECONFIG
+            value: "{{ kube_config }}"
+          - name: HF_ENDPOINT
+            value: "https://hf-mirror.com"
+          - name: TROUBLE_SHOTTING
+            value: "{{ trouble_shotting }}"
+          - name: TRANSFORMERS_VERSION_FOR_SGLANG
+            value: "{{ transformers_version }}"
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+               bash /root/sglang/python/sglang/test/ascend/e2e/run_npu_testcase.sh {{ test_case }}
+          resources:
+            requests:
+              {% if env in ["ci", "debug"] %}
+              huawei.com/ascend-1980: {{ npu_size }}
+              {% endif %}
+              {% if env == "green" %}
+              huawei.com/Ascend910: {{ npu_size }}
+              memory: 128Gi
+              {% endif %}
+              cpu: "46"
+            limits:
+              {% if env in ["ci", "debug"] %}
+              huawei.com/ascend-1980: {{ npu_size }}
+              {% endif %}
+              {% if env == "green" %}
+              huawei.com/Ascend910: {{ npu_size }}
+              memory: 128Gi
+              {% endif %}
+              cpu: "46"
+          volumeMounts:
+          - name: ascend-driver
+            mountPath: /usr/local/Ascend/driver
+          - name: shm-volume
+            mountPath: /dev/shm
+          - name: localtime
+            mountPath: /etc/localtime
+          - name: share
+            mountPath: /data/ascend-ci-share-pkking-sglang
+          - name: share
+            mountPath: /root/.cache
+          - name: share
+            mountPath: /root/sglang
+            subPath: {{ sglang_source_relative_path }}
+        volumes:
+        {% if env in ["ci", "debug"] %}
+        - name: share
+          persistentVolumeClaim:
+            claimName: sglang-guiyang004
+        {% endif %}
+        {% if env == "green" %}
+        - name: share
+          hostPath:
+            path: /home
+        {% endif %}
+        - name: ascend-driver
+          hostPath:
+            path: /usr/local/Ascend/driver
+        - name: shm-volume
+          emptyDir:
+            medium: Memory
+            sizeLimit: "16Gi"
+        - name: localtime
+          hostPath:
+            path: /etc/localtime
+        {% if env == "debug" %}
+        tolerations:
+          - key: "instance"
+            operator: "Equal"
+            value: "npu-class-service"
+            effect: "NoSchedule"
+        {% endif %}
+        nodeSelector:
+          {% if env in ["ci", "debug"] %}
+          accelerator/huawei-npu: ascend-snt9c
+          {% endif %}
+          {% if env == "debug" %}
+          node-status: debug
+          {% endif %}
+          {% if env == "green" %}
+          accelerator: huawei-Ascend910
+          accelerator-type: module-a3-16
+          {% endif %}
+        restartPolicy: OnFailure

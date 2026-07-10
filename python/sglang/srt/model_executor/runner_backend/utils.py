@@ -71,6 +71,16 @@ def resolve_decode_backend(
         return NPUCudaGraphBackend(
             cuda_graph_runner, enable_memory_saver=enable_memory_saver
         )
+    elif model_runner.device == "xpu":
+        if backend_name not in (Backend.FULL, Backend.DISABLED):
+            raise ValueError(
+                f"XPU only supports cuda_graph_config decode backend 'full', got '{backend_name}'"
+            )
+        from sglang.srt.hardware_backend.xpu.graph_runner.xpu_full_graph_backend import (
+            FullXPUGraphBackend,
+        )
+
+        return FullXPUGraphBackend(cuda_graph_runner)
 
     if backend_name == Backend.BREAKABLE:
         return BreakableCudaGraphBackend(
@@ -105,5 +115,10 @@ def resolve_prefill_backend(
             enable_memory_saver=model_runner.server_args.enable_memory_saver,
             debug_eager=model_runner.server_args.debug_cuda_graph,
         )
-    # Default: tc_piecewise. (prefill, full) is rejected at config validation.
+    if backend_name == Backend.FULL:
+        return FullCudaGraphBackend(
+            cuda_graph_runner,
+            enable_memory_saver=model_runner.server_args.enable_memory_saver,
+        )
+    # Default: tc_piecewise.
     return TcPiecewiseCudaGraphBackend(cuda_graph_runner)

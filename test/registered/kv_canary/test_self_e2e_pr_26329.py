@@ -21,7 +21,7 @@ _EAGLE_CHUNKED_SERVER_ARGS = (
     "EAGLE",
     "--chunked-prefill-size",
     str(_CHUNKED_PREFILL_SIZE),
-    "--cuda-graph-max-bs",
+    "--cuda-graph-max-bs-decode",
     "1",
     "--max-running-requests",
     "4",

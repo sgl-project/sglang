@@ -60,7 +60,7 @@ class GeneratedSharedPrefixDataset(BaseDataset):
 
         # Defensive validation for in-process callers that construct a
         # Namespace by hand and bypass the argparse boundary in
-        # bench_serving.py. The CLI hook enforces the same rules first.
+        # serving.py. The CLI hook enforces the same rules first.
         if group_distribution not in ("uniform", "zipf"):
             raise ValueError(
                 f"--gsp-group-distribution must be 'uniform' or 'zipf', "

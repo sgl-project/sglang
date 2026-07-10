@@ -24,6 +24,7 @@ from sglang.multimodal_gen.runtime.models.parameter import (
     PerTensorScaleParameter,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.platforms.aiter import USE_AITER
 from sglang.multimodal_gen.runtime.utils.common import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -63,9 +64,8 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = current_platform.is_cpu()
 _is_fp8_fnuz = is_fp8_fnuz()
 _use_hip_int4 = get_bool_env_var("SGLANG_INT4_WEIGHT") and _is_hip
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
-if _use_aiter or _use_hip_int4:
+if USE_AITER or _use_hip_int4:
     pass
 
 
@@ -100,7 +100,7 @@ class Fp8Config(QuantizationConfig):
         if weight_block_size is not None:
             if not is_checkpoint_fp8_serialized:
                 raise ValueError(
-                    f"The block-wise quantization only supports fp8-serialized checkpoint for now."
+                    "The block-wise quantization only supports fp8-serialized checkpoint for now."
                 )
             if len(weight_block_size) != 2:
                 raise ValueError(

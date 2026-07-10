@@ -74,6 +74,10 @@ The generator only emits a runnable command for combinations that NVIDIA / SGLan
 
     The SSM state dtype defaults to the model config value. Set `--mamba-ssm-dtype float16` to store the Mamba states in FP16, which reduces mamba cache memory without significant accuracy loss.
 
+- **Mamba SSM stochastic rounding**:
+
+    When storing the Mamba states in FP16, add `--enable-mamba-cache-stochastic-rounding` to round SSM cache writes stochastically and reduce accumulation bias. It requires `--mamba-ssm-dtype float16` and CUDA; with the default `--mamba-backend triton` it additionally requires SM100. Use `--mamba-cache-philox-rounds` to control the number of Philox rounds (`0` uses the backend default).
+
 - **TP support**:
 
     To set tp size, use `--tp <4|8|16>`. Recommended pairings:

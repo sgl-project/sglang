@@ -30,7 +30,8 @@ __global__ void ComputeNGramIdsKernel(
     int max_context_len,                      // max_context_len
     const int64_t* __restrict__ row_indices,  // [batch_size]
     int* column_starts,                       // [batch_size]
-    int* n_gram_ids                           // [ne_n-1,ne_k,token_num]
+    int* n_gram_ids,                          // [ne_n-1,ne_k,token_num]
+    int eos_token_id                          // tokens before an eos are excluded from the n-gram context
 ) {
   // Determine which n, k, and request this block handles.
   /**
@@ -73,12 +74,17 @@ __global__ void ComputeNGramIdsKernel(
         // Out of this request's range, stop computing n_gram_id
         break;
       }
-      if (ne_token_table[current_token_table_index - j] < 0) {
+      const int table_token = ne_token_table[current_token_table_index - j];
+      if (table_token < 0) {
         // Token was marked as ignored during write
         break;
       }
-      const uint64_t term =
-          (uint64_t)ne_token_table[current_token_table_index - j] * (uint64_t)ne_weights[ne_weight_base_idx + j];
+      if (table_token == eos_token_id && j > 0) {
+        // Don't let the n-gram context cross an eos boundary. j==0 (the
+        // current token) is allowed; only break when looking back.
+        break;
+      }
+      const uint64_t term = (uint64_t)table_token * (uint64_t)ne_weights[ne_weight_base_idx + j];
       n_gram_id += term % ne_mod;
     }
     n_gram_id %= ne_mod;
@@ -99,7 +105,8 @@ __global__ void ComputeNGramIdsDecodeKernel(
     int max_context_len,                                     // max_context_len
     const int64_t* __restrict__ row_indices,                 // [batch_size]
     const int* __restrict__ column_starts,                   // [batch_size]
-    int* __restrict__ n_gram_ids                             // [batch_size, (ne_n-1)*ne_k]
+    int* __restrict__ n_gram_ids,                            // [batch_size, (ne_n-1)*ne_k]
+    int eos_token_id  // tokens before an eos are excluded from the n-gram context
 ) {
   const int num_configs = (ne_n - 1) * ne_k;
   const int total_outputs = batch_size * num_configs;
@@ -122,6 +129,11 @@ __global__ void ComputeNGramIdsDecodeKernel(
       }
       const int token = ne_token_table[current_token_table_offset - j];
       if (token < 0) {
+        break;
+      }
+      if (token == eos_token_id && j > 0) {
+        // Don't let the n-gram context cross an eos boundary. j==0 (the
+        // current token) is allowed; only break when looking back.
         break;
       }
       const uint64_t term = static_cast<uint64_t>(token) * static_cast<uint64_t>(ne_weights[weight_offset + j]);
@@ -201,7 +213,8 @@ struct NgramEmbeddingKernel {
       const tvm::ffi::TensorView ne_token_table,
       const tvm::ffi::TensorView row_indices,
       const tvm::ffi::TensorView column_starts,
-      const tvm::ffi::TensorView n_gram_ids) {
+      const tvm::ffi::TensorView n_gram_ids,
+      const int64_t eos_token_id) {
     using namespace host;
 
     auto device_ = SymbolicDevice{};
@@ -209,47 +222,47 @@ struct NgramEmbeddingKernel {
     // Verify tensor shapes and types using -1 (kAnySize) for dynamic dimensions
     TensorMatcher({-1, -1, -1})  // [ne_n-1, ne_k, ne_n]
         .with_dtype<int32_t>()
-        .with_device<kDLCUDA>(device_)
+        .with_device<kDLGPU>(device_)
         .verify(ne_weights);
 
     TensorMatcher({-1, -1})  // [ne_n-1, ne_k]
         .with_dtype<int32_t>()
-        .with_device<kDLCUDA>()
+        .with_device<kDLGPU>()
         .verify(ne_mods);
 
     TensorMatcher({-1})  // [(ne_n-1)*ne_k + 1]
         .with_dtype<int32_t>()
-        .with_device<kDLCUDA>()
+        .with_device<kDLGPU>()
         .verify(exclusive_ne_embeder_size_sums);
 
     TensorMatcher({-1})  // [token_num]
         .with_dtype<int32_t>()
-        .with_device<kDLCUDA>()
+        .with_device<kDLGPU>()
         .verify(tokens);
 
     TensorMatcher({-1})  // [batch_size+1]
         .with_dtype<int32_t>()
-        .with_device<kDLCUDA>()
+        .with_device<kDLGPU>()
         .verify(exclusive_req_len_sums);
 
     TensorMatcher({-1, -1})  // [max_running_reqs, max_context_len]
         .with_dtype<int32_t>()
-        .with_device<kDLCUDA>()
+        .with_device<kDLGPU>()
         .verify(ne_token_table);
 
     TensorMatcher({-1})  // [batch_size]
         .with_dtype<int64_t>()
-        .with_device<kDLCUDA>()
+        .with_device<kDLGPU>()
         .verify(row_indices);
 
     TensorMatcher({-1})  // [batch_size]
         .with_dtype<int32_t>()
-        .with_device<kDLCUDA>()
+        .with_device<kDLGPU>()
         .verify(column_starts);
 
     TensorMatcher({-1, -1})  // [token_num, (ne_n-1)*ne_k]
         .with_dtype<int32_t>()
-        .with_device<kDLCUDA>()
+        .with_device<kDLGPU>()
         .verify(n_gram_ids);
 
     const int batch_size = static_cast<int>(exclusive_req_len_sums.size(0) - 1);
@@ -274,7 +287,8 @@ struct NgramEmbeddingKernel {
         max_context_len,
         static_cast<const int64_t*>(row_indices.data_ptr()),
         static_cast<int*>(column_starts.data_ptr()),
-        static_cast<int*>(n_gram_ids.data_ptr()));
+        static_cast<int*>(n_gram_ids.data_ptr()),
+        static_cast<int>(eos_token_id));
   }
 
   static void compute_n_gram_ids_decode(
@@ -286,7 +300,8 @@ struct NgramEmbeddingKernel {
       const tvm::ffi::TensorView ne_token_table,
       const tvm::ffi::TensorView row_indices,
       const tvm::ffi::TensorView column_starts,
-      const tvm::ffi::TensorView n_gram_ids) {
+      const tvm::ffi::TensorView n_gram_ids,
+      const int64_t eos_token_id) {
     using namespace host;
 
     auto device_ = SymbolicDevice{};
@@ -294,37 +309,37 @@ struct NgramEmbeddingKernel {
 
     TensorMatcher({-1, -1, -1})  // [ne_n-1, ne_k, ne_n]
         .with_dtype<int32_t>()
-        .with_device<kDLCUDA>(device_)
+        .with_device<kDLGPU>(device_)
         .verify(ne_weights);
 
     TensorMatcher({-1, -1})  // [ne_n-1, ne_k]
         .with_dtype<int32_t>()
-        .with_device<kDLCUDA>()
+        .with_device<kDLGPU>()
         .verify(ne_mods);
 
     TensorMatcher({-1})  // [(ne_n-1)*ne_k + 1]
         .with_dtype<int32_t>()
-        .with_device<kDLCUDA>()
+        .with_device<kDLGPU>()
         .verify(exclusive_ne_embeder_size_sums);
 
     TensorMatcher({-1, -1})  // [max_running_reqs, max_context_len]
         .with_dtype<int32_t>()
-        .with_device<kDLCUDA>()
+        .with_device<kDLGPU>()
         .verify(ne_token_table);
 
     TensorMatcher({batch_size})  // [batch_size]
         .with_dtype<int64_t>()
-        .with_device<kDLCUDA>()
+        .with_device<kDLGPU>()
         .verify(row_indices);
 
     TensorMatcher({batch_size})  // [batch_size]
         .with_dtype<int32_t>()
-        .with_device<kDLCUDA>()
+        .with_device<kDLGPU>()
         .verify(column_starts);
 
     TensorMatcher({batch_size, -1})  // [batch_size, (ne_n-1)*ne_k]
         .with_dtype<int32_t>()
-        .with_device<kDLCUDA>()
+        .with_device<kDLGPU>()
         .verify(n_gram_ids);
 
     const int bs = static_cast<int>(batch_size.unwrap());
@@ -354,7 +369,8 @@ struct NgramEmbeddingKernel {
         max_context_len,
         static_cast<const int64_t*>(row_indices.data_ptr()),
         static_cast<const int*>(column_starts.data_ptr()),
-        static_cast<int*>(n_gram_ids.data_ptr()));
+        static_cast<int*>(n_gram_ids.data_ptr()),
+        static_cast<int>(eos_token_id));
   }
 
   static void update_token_table(
@@ -371,27 +387,27 @@ struct NgramEmbeddingKernel {
     // Verify tensor shapes and types using -1 (kAnySize) for dynamic dimensions
     TensorMatcher({-1})  // [token_num]
         .with_dtype<int32_t>()
-        .with_device<kDLCUDA>(device_)
+        .with_device<kDLGPU>(device_)
         .verify(tokens);
 
     TensorMatcher({-1, -1})  // [max_running_reqs, max_context_len]
         .with_dtype<int32_t>()
-        .with_device<kDLCUDA>()
+        .with_device<kDLGPU>()
         .verify(ne_token_table);
 
     TensorMatcher({-1})  // [batch_size]
         .with_dtype<int64_t>()
-        .with_device<kDLCUDA>()
+        .with_device<kDLGPU>()
         .verify(row_indices);
 
     TensorMatcher({-1})  // [batch_size]
         .with_dtype<int32_t>()
-        .with_device<kDLCUDA>()
+        .with_device<kDLGPU>()
         .verify(column_starts);
 
     TensorMatcher({-1})  // [batch_size]
         .with_dtype<int32_t>()
-        .with_device<kDLCUDA>()
+        .with_device<kDLGPU>()
         .verify(req_lens);
 
     // ignore_tokens can be empty or have values
@@ -400,7 +416,7 @@ struct NgramEmbeddingKernel {
     if (has_ignore_tokens) {
       TensorMatcher({-1})  // [ignore_token_num]
           .with_dtype<int32_t>()
-          .with_device<kDLCUDA>()
+          .with_device<kDLGPU>()
           .verify(ignore_tokens);
     }
 
@@ -447,22 +463,22 @@ struct NgramEmbeddingKernel {
 
     TensorMatcher({batch_size})  // [batch_size]
         .with_dtype<int32_t>()
-        .with_device<kDLCUDA>(device_)
+        .with_device<kDLGPU>(device_)
         .verify(tokens);
 
     TensorMatcher({-1, -1})  // [max_running_reqs, max_context_len]
         .with_dtype<int32_t>()
-        .with_device<kDLCUDA>()
+        .with_device<kDLGPU>()
         .verify(ne_token_table);
 
     TensorMatcher({batch_size})  // [batch_size]
         .with_dtype<int64_t>()
-        .with_device<kDLCUDA>()
+        .with_device<kDLGPU>()
         .verify(row_indices);
 
     TensorMatcher({batch_size})  // [batch_size]
         .with_dtype<int32_t>()
-        .with_device<kDLCUDA>()
+        .with_device<kDLGPU>()
         .verify(column_starts);
 
     const int bs = static_cast<int>(batch_size.unwrap());

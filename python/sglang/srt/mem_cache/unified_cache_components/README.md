@@ -125,9 +125,8 @@ Insert a key-value pair into the tree.
      - If partially within window: **splits node** at boundary, recovers SWA on the window portion (returns `start_idx`)
      - If entirely outside window: returns `prefix_len` (no consumption)
    - Mamba: returns `prefix_len` (no consumption, default behavior)
-4. Before creating a new leaf, checks `should_skip_leaf_creation()` per component — any veto aborts leaf creation and frees remaining value
-5. Creates leaf via `_add_new_node` (clones value tensor, updates Full leaf-set tracking)
-6. Calls `commit_insert_component_data()` per component on the final target node (SWA may trigger a secondary split for window boundary; Mamba sets mamba pool indices and inserts into Mamba LRU)
+4. Creates leaf via `_add_new_node` (clones value tensor, updates Full leaf-set tracking). A leaf survives on its Full value alone, so it is materialized even when an auxiliary component holds only a tombstone for the span (e.g. the whole leaf is outside the SWA window)
+5. Calls `commit_insert_component_data()` per component on the final target node (SWA may trigger a secondary split for window boundary; Mamba sets mamba pool indices and inserts into Mamba LRU)
 
 ---
 
@@ -262,7 +261,6 @@ Each component implements these hooks. See `tree_component.py` for the ABC and d
 | Hook | Purpose | Called By | Default |
 |------|---------|-----------|----------|
 | `update_component_on_insert_overlap()` | Handle key overlap with an existing node during insert. Returns the index within `value_slice` from which this component consumed (took ownership of) pool slots. Full/Mamba: no consumption (`prefix_len`). SWA: may recover tombstoned nodes within the sliding window boundary. | `_insert_helper` | returns `prefix_len` |
-| `should_skip_leaf_creation()` | Veto leaf creation when the entire new leaf would be a tombstone for this component. SWA: vetoes if `swa_evicted_seqlen ≥ total_prefix_len + key_len`. | `_insert_helper` | `False` |
 | `recover_after_unevict()` | Rebuild auxiliary component data after `_unevict_node_on_insert()` restores a Full device value from fresh KV indices. SWA uses this to rebuild in-window SWA data. | `_insert_helper` | no-op |
 | `commit_insert_component_data()` | Finalize component data on the target node after the insert walk completes. Full: no-op (handled by `_add_new_node`). SWA: checks window boundary, may split node — parent becomes tombstone, child gets SWA data. Mamba: sets mamba pool indices and inserts into Mamba LRU. | `_insert_helper` | no-op |
 

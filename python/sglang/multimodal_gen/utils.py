@@ -527,21 +527,18 @@ def shallow_asdict(obj) -> dict[str, Any]:
     return {f.name: getattr(obj, f.name) for f in fields(obj)}
 
 
-# TODO: validate that this is fine
 def kill_itself_when_parent_died() -> None:
-    # if sys.platform == "linux":
-    # sigkill this process when parent worker manager dies
-    PR_SET_PDEATHSIG = 1
-    import platform
+    if sys.platform != "linux":
+        return
 
-    if platform.system() == "Linux":
-        libc = ctypes.CDLL("libc.so.6")
-        libc.prctl(PR_SET_PDEATHSIG, signal.SIGKILL)
-    # elif platform.system() == "Darwin":
-    #     libc = ctypes.CDLL("libc.dylib")
-    #     logger.warning("kill_itself_when_parent_died is only supported in linux.")
-    else:
-        logger.warning("kill_itself_when_parent_died is only supported in linux.")
+    # keep GPU workers tied to the CLI process even if the parent is SIGKILLed
+    PR_SET_PDEATHSIG = 1
+    libc = ctypes.CDLL("libc.so.6", use_errno=True)
+    if libc.prctl(PR_SET_PDEATHSIG, signal.SIGKILL) != 0:
+        err = ctypes.get_errno()
+        raise OSError(err, os.strerror(err))
+    if os.getppid() == 1:
+        os.kill(os.getpid(), signal.SIGKILL)
 
 
 def get_exception_traceback() -> str:

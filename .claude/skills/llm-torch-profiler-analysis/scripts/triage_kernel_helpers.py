@@ -530,16 +530,16 @@ FUSION_PATTERN_REGISTRY: Tuple[FusionPatternSpec, ...] = (
         likely_share=0.5,
     ),
     FusionPatternSpec(
-        pattern="DSA fused metadata copy for graph replay",
+        pattern="NSA fused metadata copy for graph replay",
         candidate_path="python/sglang/jit_kernel/fused_metadata_copy.py",
         active_keywords=(
             "fused_metadata_copy",
             "fused_metadata_copy_multi",
-            "fused_dsa_cache_seqlens",
+            "fused_nsa_cache_seqlens",
             "fused_flashmla_metadata",
         ),
         rationale_hint=(
-            "DSA replay metadata copies are already fused into one-kernel" " families."
+            "NSA replay metadata copies are already fused into one-kernel" " families."
         ),
         min_share=0.02,
         likely_share=0.2,
@@ -744,23 +744,23 @@ FUSION_PATTERN_REGISTRY: Tuple[FusionPatternSpec, ...] = (
         likely_share=1.5,
     ),
     FusionPatternSpec(
-        pattern="DSA fused top-k transform / page-table build",
-        candidate_path="python/sglang/srt/layers/attention/dsa_backend.py",
+        pattern="NSA fused top-k transform / page-table build",
+        candidate_path="python/sglang/srt/layers/attention/nsa_backend.py",
         active_keywords=(
             "fast_topk_transform_fused",
             "fast_topk_transform_ragged_fused",
         ),
         rationale_hint=(
-            "DSA top-k metadata preparation already has fused transform kernels."
+            "NSA top-k metadata preparation already has fused transform kernels."
         ),
         min_share=0.05,
         likely_share=0.3,
     ),
     FusionPatternSpec(
-        pattern="DSA fused quantize + indexed K-cache store",
+        pattern="NSA fused quantize + indexed K-cache store",
         candidate_path=(
             "python/sglang/jit_kernel/fused_store_index_cache.py"
-            "<br>python/sglang/srt/layers/attention/dsa/dsa_indexer.py"
+            "<br>python/sglang/srt/layers/attention/nsa/nsa_indexer.py"
         ),
         active_keywords=("fused_store_index_k_cache",),
         split_groups=(
@@ -768,7 +768,7 @@ FUSION_PATTERN_REGISTRY: Tuple[FusionPatternSpec, ...] = (
             ("index_k", "cache", "store"),
         ),
         rationale_hint=(
-            "DSA already has a fused quantize-and-indexed-store kernel family."
+            "NSA already has a fused quantize-and-indexed-store kernel family."
         ),
         min_share=0.2,
         likely_share=1.0,
@@ -854,6 +854,180 @@ FUSION_PATTERN_REGISTRY: Tuple[FusionPatternSpec, ...] = (
         min_share=0.2,
         likely_share=1.0,
         priority=90,
+    ),
+    FusionPatternSpec(
+        pattern="SGLang LTX2 fused Ada values",
+        candidate_path=(
+            "PR #29390"
+            "<br>python/sglang/jit_kernel/diffusion/triton/ltx2_ada_values.py"
+            "<br>python/sglang/multimodal_gen/runtime/models/dits/ltx_2.py"
+        ),
+        active_keywords=(
+            "ltx2_ada_values9",
+            "ltx2_ada_values",
+            "LTX2TransformerBlock",
+        ),
+        split_groups=(
+            ("scale_shift_table", "timestep", "reshape"),
+            ("get_ada_values", "ada", "adaln"),
+            ("slice", "split", "unbind"),
+        ),
+        rationale_hint=(
+            "SGLang mainline fuses LTX-2.3 Ada value materialization for"
+            " video/audio streams; split Ada table add/reshape/slice ladders"
+            " should be checked against this diffusion Triton kernel first."
+        ),
+        origin="upstream",
+        model_include=("ltx", "ltx-2", "ltx2"),
+        min_share=0.2,
+        likely_share=1.0,
+    ),
+    FusionPatternSpec(
+        pattern="SGLang LTX2 residual-gate add CUDA fast path",
+        candidate_path=(
+            "PR #29361"
+            "<br>python/sglang/jit_kernel/diffusion/residual_gate_add.py"
+            "<br>python/sglang/jit_kernel/csrc/diffusion/residual_gate_add.cuh"
+            "<br>python/sglang/multimodal_gen/runtime/models/dits/ltx_2.py"
+        ),
+        active_keywords=(
+            "diffusion_residual_gate_add",
+            "residual_gate_add",
+            "_ltx2_residual_gate_add",
+        ),
+        split_groups=(
+            ("add", "mul", "gate"),
+            ("residual", "update", "gate"),
+            ("hidden_states", "attn_hidden_states", "gate"),
+        ),
+        rationale_hint=(
+            "SGLang mainline fuses LTX2 residual + update * gate sites into"
+            " a CUDA custom op; split add/mul gate ladders should be checked"
+            " against this path before proposing a new diffusion elementwise"
+            " fusion."
+        ),
+        origin="upstream",
+        model_include=("ltx", "ltx-2", "ltx2"),
+        min_share=0.2,
+        likely_share=1.0,
+    ),
+    FusionPatternSpec(
+        pattern="TokenSpeed CuTe DSL MLA prefill / decode",
+        candidate_path=(
+            "python/tokenspeed/runtime/layers/attention/backends/tokenspeed_mla.py"
+            "<br>tokenspeed-mla/python/tokenspeed_mla/mla_decode.py"
+            "<br>tokenspeed-mla/python/tokenspeed_mla/mla_prefill.py"
+            "<br>tokenspeed-kernel/python/tokenspeed_kernel/ops/attention/"
+            "tokenspeed_mla/__init__.py"
+        ),
+        active_keywords=(
+            "tokenspeed_mla_decode",
+            "tokenspeed_mla_prefill",
+            "BlackwellMultiHeadLatentAttentionForward",
+        ),
+        split_groups=(
+            ("mla", "flashmla", "attention", "fmha"),
+            ("prefill", "decode", "verify"),
+            ("fp8", "kv_cache", "page_table"),
+        ),
+        rationale_hint=(
+            "TokenSpeed ships Blackwell CuTe DSL MLA prefill/decode kernels;"
+            " split MLA support kernels should be checked against backend"
+            " selection before being called novel."
+        ),
+        origin="upstream",
+        model_include=("deepseek", "kimi", "qwen3.5", "qwen3_5"),
+        min_share=0.4,
+        likely_share=2.0,
+    ),
+    FusionPatternSpec(
+        pattern="TokenSpeed MLA KV pack + FP8 quantize",
+        candidate_path=(
+            "tokenspeed-mla/python/tokenspeed_mla/mla_kv_pack_quantize_fp8.py"
+            "<br>tokenspeed-kernel/python/tokenspeed_kernel/ops/attention/"
+            "tokenspeed_mla/__init__.py"
+        ),
+        active_keywords=(
+            "_mla_kv_pack_quantize_fp8_kernel",
+            "mla_kv_pack_quantize_fp8",
+        ),
+        split_groups=(
+            ("k_nope", "k_pe", "cat", "concat", "pack"),
+            ("quant", "fp8", "float8"),
+            ("v", "kv", "cache"),
+        ),
+        rationale_hint=(
+            "TokenSpeed fuses MLA K/V pack, concat, and FP8 quantization into"
+            " one Triton kernel for chunked prefill."
+        ),
+        origin="upstream",
+        model_include=("deepseek", "kimi", "qwen3.5", "qwen3_5"),
+        min_share=0.2,
+        likely_share=1.0,
+    ),
+    FusionPatternSpec(
+        pattern="TokenSpeed fused top-k + top-p sampling",
+        candidate_path=(
+            "tokenspeed-kernel/python/tokenspeed_kernel/thirdparty/cuda/"  # codespell:ignore thirdparty
+            "fused_topk_topp.py"
+            "<br>tokenspeed-kernel/python/tokenspeed_kernel/thirdparty/cuda/"  # codespell:ignore thirdparty
+            "csrc/fused_topk_topp/fused_topk_topp.cu"
+        ),
+        active_keywords=("fused_topk_topp", "fused_topk_topp_renorm"),
+        split_groups=(
+            ("topk", "top_k"),
+            ("topp", "top_p"),
+            ("sampling", "renorm", "softmax"),
+        ),
+        rationale_hint=(
+            "TokenSpeed has a fused top-k/top-p renormalization path for"
+            " decode sampling."
+        ),
+        origin="upstream",
+        min_share=0.1,
+        likely_share=0.8,
+    ),
+    FusionPatternSpec(
+        pattern="TokenSpeed persistent lm_head GEMM",
+        candidate_path=(
+            "tokenspeed-kernel/python/tokenspeed_kernel/thirdparty/cuda/"  # codespell:ignore thirdparty
+            "lm_head_gemm.py"
+            "<br>tokenspeed-kernel/python/tokenspeed_kernel/thirdparty/cuda/"  # codespell:ignore thirdparty
+            "csrc/lm_head_gemm.cu"
+        ),
+        active_keywords=("lm_head_gemm",),
+        split_groups=(
+            ("lm_head", "logits", "vocab"),
+            ("gemm", "matmul", "linear"),
+        ),
+        rationale_hint=(
+            "TokenSpeed has a shape-gated persistent lm_head GEMM path; visible"
+            " lm_head matmul ladders should be compared against it."
+        ),
+        origin="upstream",
+        model_include=("kimi", "qwen"),
+        min_share=0.2,
+        likely_share=1.0,
+    ),
+    FusionPatternSpec(
+        pattern="TokenSpeed NVFP4 GEMM + SwiGLU + quant",
+        candidate_path=(
+            "tokenspeed-kernel/python/tokenspeed_kernel/thirdparty/cute_dsl/"  # codespell:ignore thirdparty
+            "nvfp4_gemm_swiglu_nvfp4_quant.py"
+        ),
+        active_keywords=("nvfp4_gemm_swiglu_nvfp4_quant",),
+        split_groups=(
+            ("gemm", "nvfp4", "fp4"),
+            ("swiglu", "silu", "activation", "mul"),
+            ("quant", "scale", "sfc"),
+        ),
+        rationale_hint=(
+            "TokenSpeed's CuTe DSL kernel fuses NVFP4 GEMM, SwiGLU, and"
+            " optional output quantization in one expert-style path."
+        ),
+        origin="upstream",
+        min_share=0.3,
+        likely_share=1.5,
     ),
     FusionPatternSpec(
         pattern="vLLM-origin Attention + Quantization",
@@ -1235,6 +1409,8 @@ def source_location_priority(location: str) -> int:
         return 290 - penalty
     if text.startswith("vllm/"):
         return 285 - penalty
+    if text.startswith("python/tokenspeed/") or text.startswith("tokenspeed/"):
+        return 283 - penalty
     if text.startswith("tensorrt_llm/"):
         return 280 - penalty
     if text.startswith("sgl_kernel/"):
@@ -1254,6 +1430,8 @@ def is_preferred_source_location(location: str) -> bool:
         text.startswith("python/sglang/")
         or text.startswith("sglang/")
         or text.startswith("vllm/")
+        or text.startswith("python/tokenspeed/")
+        or text.startswith("tokenspeed/")
         or text.startswith("tensorrt_llm/")
         or text.startswith("sgl_kernel/")
     )
@@ -1316,6 +1494,10 @@ def frame_priority(frame_name: str) -> int:
         return 290 - penalty
     if normalized_text.startswith("vllm/"):
         return 285 - penalty
+    if normalized_text.startswith("python/tokenspeed/") or normalized_text.startswith(
+        "tokenspeed/"
+    ):
+        return 283 - penalty
     if normalized_text.startswith("tensorrt_llm/"):
         return 280 - penalty
     if normalized_text.startswith("sgl_kernel/"):
@@ -1329,6 +1511,8 @@ def frame_priority(frame_name: str) -> int:
             return 120
         if "/vllm/" in raw_text:
             return 118
+        if "/tokenspeed/" in raw_text or "/TokenSpeed/" in raw_text:
+            return 117
         if "/TensorRT-LLM/" in raw_text or "/tensorrt_llm/" in raw_text:
             return 116
         return 100
@@ -1336,6 +1520,10 @@ def frame_priority(frame_name: str) -> int:
         return 110
     if ".py(" in raw_text and "/vllm/" in raw_text:
         return 108
+    if ".py(" in raw_text and (
+        "/tokenspeed/" in raw_text or "/TokenSpeed/" in raw_text
+    ):
+        return 107
     if ".py(" in raw_text and (
         "/TensorRT-LLM/" in raw_text or "/tensorrt_llm/" in raw_text
     ):
@@ -2438,6 +2626,8 @@ def fusion_framework_hints(spec: FusionPatternSpec) -> set[str]:
     hints: set[str] = set()
     if "vllm/" in text:
         hints.add("vllm")
+    if any(token in text for token in ("tokenspeed/", "tokenspeed-", "tokenspeed_")):
+        hints.add("tokenspeed")
     if "tensorrt_llm/" in text:
         hints.add("trtllm")
     if any(token in text for token in ("python/sglang/", "sgl-kernel/", "sgl_kernel/")):
