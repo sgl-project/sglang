@@ -9,6 +9,8 @@ import pybase64
 import requests
 import torch
 
+from sglang.srt.multimodal.mm_utils import validate_resource_url
+
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
@@ -422,12 +424,15 @@ class MossVLImageProcessor(SGLangBaseProcessor):
 
     def _normalize_video_string(self, value: str) -> Tuple[str, Optional[str]]:
         if value.startswith("file://"):
-            return self._resolve_file_url(value), None
+            raise ValueError(
+                "file:// protocol is not allowed for security reasons"
+            )
 
         if os.path.isfile(value):
             return value, None
 
         if value.startswith(("http://", "https://")):
+            validate_resource_url(value)
             timeout = int(os.getenv("REQUEST_TIMEOUT", "10"))
             response = requests.get(value, stream=True, timeout=timeout)
             response.raise_for_status()
