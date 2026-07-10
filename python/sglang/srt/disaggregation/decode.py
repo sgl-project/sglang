@@ -527,6 +527,16 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 self.scheduler.tp_worker.model_runner.swa_max_total_num_tokens,
             )
 
+    @staticmethod
+    def _dspark_prefix_fingerprint(req: Req) -> Optional[Tuple[int, Tuple[int, ...]]]:
+        input_ids = getattr(req, "origin_input_ids", None)
+        if not input_ids:
+            return None
+        prefix_len = min(len(input_ids), 2048)
+        if prefix_len <= 0:
+            return None
+        return prefix_len, tuple(int(x) for x in input_ids[:prefix_len])
+
     def _uses_swa_tail_prealloc(self) -> bool:
         return (
             isinstance(self.token_to_kv_pool, (SWAKVPool, DeepSeekV4TokenToKVPool))
@@ -1107,6 +1117,20 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 - len(self.transfer_queue.queue),
             )
 
+        dspark_active_full_prefixes = set()
+        if (
+            self.scheduler.spec_algorithm.is_dspark()
+            and StateType.DSPARK_HIDDEN in self.kv_manager.kv_args.state_types
+        ):
+            for active_req in self.transfer_queue.queue:
+                if int(getattr(active_req, "dspark_hidden_start", 0)) != 0:
+                    continue
+                if not getattr(active_req, "dspark_hidden_dst_indices_by_pp", None):
+                    continue
+                prefix_key = self._dspark_prefix_fingerprint(active_req.req)
+                if prefix_key is not None:
+                    dspark_active_full_prefixes.add(prefix_key)
+
         # Then, preallocate the remaining requests if possible
         for i, decode_req in enumerate(self.queue):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
@@ -1217,10 +1241,28 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             dspark_hidden_dynamic_register_handles = None
             dspark_hidden_start = total_prefix_len
             dspark_hidden_len = origin_input_len - total_prefix_len
+            dspark_prefix_key = None
             state_types = self.kv_manager.kv_args.state_types
             if self.scheduler.spec_algorithm.is_dspark() and (
                 StateType.DSPARK_HIDDEN in state_types and dspark_hidden_len > 0
             ):
+                dspark_prefix_key = self._dspark_prefix_fingerprint(decode_req.req)
+                if (
+                    total_prefix_len == 0
+                    and dspark_prefix_key is not None
+                    and dspark_prefix_key in dspark_active_full_prefixes
+                ):
+                    if prefix_len > 0:
+                        self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                    logger.debug(
+                        "Delay DSpark PD full hidden prealloc behind active "
+                        "same-prefix transfer: rid=%s, hidden_len=%s, "
+                        "transfer_queue=%s",
+                        decode_req.req.rid,
+                        dspark_hidden_len,
+                        len(self.transfer_queue.queue),
+                    )
+                    continue
                 dspark_pool = getattr(self.metadata_buffers, "dspark_hidden_pool", None)
                 if dspark_pool is None:
                     message = (
@@ -1645,6 +1687,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     decode_req.req.bootstrap_room, decode_req
                 )
             preallocated_reqs.append(decode_req)
+            if (
+                dspark_prefix_key is not None
+                and dspark_hidden_start == 0
+                and dspark_hidden_dst_indices_by_pp is not None
+            ):
+                dspark_active_full_prefixes.add(dspark_prefix_key)
             indices_to_remove.add(i)
             decode_req.req.time_stats.set_decode_transfer_queue_entry_time()
 
