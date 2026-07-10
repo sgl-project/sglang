@@ -117,6 +117,10 @@ def test_action_request_schema_builds_pi05_sampling_params():
     assert params.images["base_0_rgb"].shape == (8, 8, 3)
     assert params.state.shape == (32,)
 
+    vla_state = params.build_request_extra()["vla"]
+    assert vla_state["observation"]["prompt"] == "pick up the block"
+    assert not vla_state["options"]["enable_prefix_cache"]
+
 
 def test_openpi_raw_observation_compatibility_fields_are_normalized():
     payload = {
@@ -154,7 +158,6 @@ def test_action_metadata_reports_policy_shape_and_capabilities():
         action_horizon=10,
         action_dim=32,
         output_action_dim=7,
-        enable_global_prefix_cache=False,
         enable_action_cuda_graph=True,
     )
 

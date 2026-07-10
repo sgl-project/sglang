@@ -33,13 +33,6 @@ class Pi05SamplingParams(VLASamplingParams):
     observation: dict[str, Any] | None = field(
         default=None, metadata={"batch_sig_exclude": True}
     )
-    normalization_config: dict[str, Any] | None = field(
-        default=None, metadata={"batch_sig_exclude": True}
-    )
-    discretization_config: dict[str, Any] | None = field(
-        default=None, metadata={"batch_sig_exclude": True}
-    )
-    adapter: str | None = field(default=None, metadata={"batch_sig_exclude": True})
 
     def build_request_extra(self) -> dict[str, Any]:
         extra = super().build_request_extra()
@@ -57,18 +50,14 @@ class Pi05SamplingParams(VLASamplingParams):
         if self.noise is not None:
             observation["noise"] = self.noise
 
-        extra["pi05_observation"] = observation
-        extra["pi05_options"] = {
-            "action_horizon": self.action_horizon,
-            "action_dim": self.action_dim,
-            "output_format": self.output_format,
-            "num_inference_steps": self.num_inference_steps,
-            "return_timing": self.return_timing,
-            "enable_prefix_cache": self.enable_prefix_cache,
-            "enable_cuda_graph": self.enable_cuda_graph,
-            "normalization_config": self.normalization_config,
-            "discretization_config": self.discretization_config,
-            "adapter": self.adapter,
+        extra["vla"] = {
+            "observation": observation,
+            "options": {
+                "output_format": self.output_format,
+                "return_timing": self.return_timing,
+                "enable_prefix_cache": self.enable_prefix_cache,
+                "enable_cuda_graph": self.enable_cuda_graph,
+            },
         }
         return extra
 

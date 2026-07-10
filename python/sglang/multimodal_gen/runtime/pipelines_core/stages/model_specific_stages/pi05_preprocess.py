@@ -11,10 +11,7 @@ from PIL import Image
 from transformers import AutoTokenizer
 
 from sglang.multimodal_gen.configs.pipeline_configs.pi05 import Pi05PipelineConfig
-from sglang.multimodal_gen.runtime.vla.observation import (
-    VLAObservationBatch,
-    stable_tensor_sha256,
-)
+from sglang.multimodal_gen.runtime.vla.observation import VLAObservationBatch
 
 
 def _tensor_from_image(value: Any) -> torch.Tensor:
@@ -141,7 +138,6 @@ class Pi05Preprocessor:
 
         images: dict[str, torch.Tensor] = {}
         image_masks: dict[str, torch.Tensor] = {}
-        image_hashes: dict[str, str] = {}
         for key in camera_order:
             value = raw_images.get(key)
             is_present = value is not None and bool(image_masks_in.get(key, True))
@@ -156,7 +152,6 @@ class Pi05Preprocessor:
 
             images[key] = tensor.unsqueeze(0)
             image_masks[key] = torch.tensor([is_present], dtype=torch.bool)
-            image_hashes[key] = stable_tensor_sha256(tensor)
 
         state = raw_observation.get("state")
         state_tensor = None
@@ -213,8 +208,5 @@ class Pi05Preprocessor:
             tokens=tokens_tensor,
             token_masks=token_masks_tensor,
             batch_size=1,
-            metadata={
-                "camera_order": camera_order,
-                "image_hashes": image_hashes,
-            },
+            metadata={"camera_order": camera_order},
         )

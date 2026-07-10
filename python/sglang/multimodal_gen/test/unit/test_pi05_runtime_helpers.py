@@ -32,10 +32,7 @@ def _prefix_context(value: float, digest: str | None) -> PrefixContext:
     return PrefixContext(
         past_key_values=VLADensePrefixCache(((keys, values, None),)),
         prefix_pad_masks=torch.ones(1, 2, dtype=torch.bool),
-        prefix_position_ids=torch.arange(2).unsqueeze(0),
         prefix_len=2,
-        dtype=torch.float32,
-        device=torch.device("cpu"),
         cache_key_digest=digest,
     )
 
@@ -49,7 +46,6 @@ def test_vla_split_group_marks_all_action_ranks():
         rank=0,
     )
 
-    assert split.enabled
     assert split.is_prefix_rank
     assert split.is_action_rank
     assert split.uses_action_sp

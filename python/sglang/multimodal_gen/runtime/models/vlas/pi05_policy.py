@@ -44,7 +44,7 @@ from sglang.multimodal_gen.runtime.vla.denoise_cuda_graph import (
 )
 from sglang.multimodal_gen.runtime.vla.observation import (
     VLAObservationBatch,
-    stable_tensor_sha256,
+    tensor_fingerprint,
 )
 from sglang.multimodal_gen.runtime.vla.parallel import (
     broadcast_tensor_from_rank,
@@ -53,7 +53,6 @@ from sglang.multimodal_gen.runtime.vla.parallel import (
 from sglang.multimodal_gen.runtime.vla.prefix_cache import (
     PrefixContext,
     VLADensePrefixCache,
-    VLAPrefixCacheKey,
     VLAPrefixCacheManager,
 )
 from sglang.multimodal_gen.utils import set_mixed_precision_policy
@@ -759,30 +758,34 @@ class Pi05PolicyModel(nn.Module):
     def build_prefix_cache_key(
         self,
         observation: VLAObservationBatch,
-        options: dict[str, Any],
-    ) -> VLAPrefixCacheKey:
-        state_digest = None
-        if observation.state is not None:
-            state_digest = stable_tensor_sha256(observation.state)
-
+    ) -> str:
+        camera_order = tuple(observation.metadata.get("camera_order", ()))
+        image_hashes = {
+            name: tensor_fingerprint(observation.images[name]) for name in camera_order
+        }
         masks = {
             name: bool(mask.item()) for name, mask in observation.image_masks.items()
         }
+        token_len = int(observation.token_masks.sum(dim=1).max().item())
+        tokens = (
+            observation.tokens[:, :token_len] if token_len > 0 else observation.tokens
+        )
+        token_masks = (
+            observation.token_masks[:, :token_len]
+            if token_len > 0
+            else observation.token_masks
+        )
         model_revision = os.path.basename(os.path.normpath(self.model_path))
         return VLAPrefixCacheManager.make_key(
             model_revision=model_revision,
             tokenizer_id=f"{self.config.paligemma_variant}:{self.config.max_token_len}",
-            normalization_config=options.get("normalization_config"),
-            discretization_config=options.get("discretization_config"),
-            camera_order=tuple(observation.metadata.get("camera_order", ())),
-            image_hashes=observation.metadata.get("image_hashes", {}),
-            prompt=observation.prompt,
-            token_digest=stable_tensor_sha256(observation.tokens),
-            state_digest=state_digest,
+            camera_order=camera_order,
+            image_hashes=image_hashes,
+            token_digest=tensor_fingerprint(tokens),
+            token_mask_digest=tensor_fingerprint(token_masks),
             masks=masks,
             positions_version=self.config.prefix_cache_layout_version,
             dtype=str(self.dtype).replace("torch.", ""),
-            adapter=options.get("adapter"),
             parallel_layout_version=self.config.parallel_layout_version,
             cache_namespace="pi05",
         )
@@ -792,10 +795,6 @@ class Pi05PolicyModel(nn.Module):
         if paligemma is None:
             return None
         return paligemma.model.language_model
-
-    def _prefix_tensor_parallel_enabled(self) -> bool:
-        language_model = self._prefix_language_model()
-        return bool(language_model is not None and language_model.tensor_parallel)
 
     def _prefix_kv_requires_tp_gather(self) -> bool:
         language_model = self._prefix_language_model()
@@ -809,21 +808,18 @@ class Pi05PolicyModel(nn.Module):
     def _materialize_prefix_kv_for_action(
         self,
         past_key_values: VLADensePrefixCache,
-    ) -> tuple[VLADensePrefixCache, bool]:
+    ) -> VLADensePrefixCache:
         if not self._prefix_kv_requires_tp_gather():
-            return past_key_values, False
-        return (
-            VLADensePrefixCache(
-                tuple(
-                    (
-                        tensor_model_parallel_all_gather(keys.contiguous(), dim=1),
-                        tensor_model_parallel_all_gather(values.contiguous(), dim=1),
-                        sliding_window,
-                    )
-                    for keys, values, sliding_window in past_key_values
+            return past_key_values
+        return VLADensePrefixCache(
+            tuple(
+                (
+                    tensor_model_parallel_all_gather(keys.contiguous(), dim=1),
+                    tensor_model_parallel_all_gather(values.contiguous(), dim=1),
+                    sliding_window,
                 )
-            ),
-            True,
+                for keys, values, sliding_window in past_key_values
+            )
         )
 
     def encode_prefix(self, observation: VLAObservationBatch) -> PrefixContext:
@@ -848,7 +844,7 @@ class Pi05PolicyModel(nn.Module):
         prefix_full_attention_hint = all(
             bool(observation.image_masks[name].all().item()) for name in camera_order
         ) and bool(token_masks_cpu.all().item())
-        past_key_values, prefix_pad_masks, prefix_position_ids, full_attention = (
+        past_key_values, prefix_pad_masks, full_attention = (
             self.core_model.encode_prefix(
                 images,
                 image_masks,
@@ -858,23 +854,12 @@ class Pi05PolicyModel(nn.Module):
                 tokens_trimmed=tokens_trimmed,
             )
         )
-        past_key_values, prefix_kv_tp_gathered = self._materialize_prefix_kv_for_action(
-            past_key_values
-        )
+        past_key_values = self._materialize_prefix_kv_for_action(past_key_values)
         return PrefixContext(
             past_key_values=past_key_values,
             prefix_pad_masks=prefix_pad_masks,
-            prefix_position_ids=prefix_position_ids,
             prefix_len=prefix_pad_masks.shape[1],
-            dtype=self.dtype,
-            device=self.device,
-            layout={
-                "camera_order": camera_order,
-                "full_attention": full_attention,
-                "prefix_tensor_parallel": self._prefix_tensor_parallel_enabled(),
-                "prefix_kv_tp_gathered": prefix_kv_tp_gathered,
-                "parallel_layout_version": self.config.parallel_layout_version,
-            },
+            layout={"full_attention": full_attention},
         )
 
     def sample_noise(

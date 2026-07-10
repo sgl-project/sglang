@@ -45,7 +45,7 @@ class Pi05PipelineConfig(PipelineConfig):
     image_normalization_mean: tuple[float, float, float] = (0.5, 0.5, 0.5)
     image_normalization_std: tuple[float, float, float] = (0.5, 0.5, 0.5)
 
-    enable_global_prefix_cache: bool = True
+    enable_global_prefix_cache: bool = False
     enable_action_cuda_graph: bool = True
     prefix_cache_max_entries: int = 1
     prefix_cache_layout_version: str = "pi05-prefix-v1"

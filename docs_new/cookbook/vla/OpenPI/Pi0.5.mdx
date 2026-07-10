@@ -18,6 +18,8 @@ Pi0.5 is an OpenPI / LeRobot diffusion Vision-Language-Action (dVLA) policy. It 
 
 SGLang serves Pi0.5 through the native `multimodal_gen` runtime. The implementation uses a SigLIP/PaliGemma prefix encoder and a Gemma action expert: the prefix is encoded once, then the action expert runs the flow-matching denoising loop. This is not a token decode workload, so the Pi0.5 path does not use the LLM sampler, logits processor, token streaming, paged decode KV cache, or a separate SRT serving engine.
 
+The prefix encoder covers both stages of observation encoding: SigLIP turns resized camera pixels into continuous patch embeddings, then the PaliGemma transformer jointly encodes those patches with tokenized task/state inputs and produces per-layer prefix K/V. At flow timestep `t`, the action expert projects the noisy continuous action chunk `x_t` into action embeddings. Its queries attend to both the fixed prefix K/V and the current action K/V, while the timestep follows a separate sinusoidal-MLP path and conditions every action-expert layer through AdaRMSNorm gates.
+
 Supported public checkpoints:
 
 | Checkpoint | Cameras | State Dim | Output Action Dim | Action Horizon | Denoise Steps |
@@ -78,7 +80,7 @@ These registered LeRobot checkpoints dispatch to the native `multimodal_gen` Pi0
 | `parameters.action_horizon` | integer, optional | Output action horizon. Defaults to the checkpoint config. |
 | `parameters.action_dim` | integer, optional | Internal padded action dimension. Defaults to the checkpoint config. |
 | `runtime.return_timing` | boolean, optional | Return stage timing fields. Defaults to `true`. |
-| `runtime.prefix_cache` | boolean or `"auto"`, optional | Enable exact full-prefix cache lookup for this request. Defaults to `"auto"`. |
+| `runtime.prefix_cache` | boolean or `"auto"`, optional | Enable exact full-prefix lookup for this request when the server has `enable_global_prefix_cache=true`. Defaults to `"auto"`. |
 | `runtime.cuda_graph` | boolean or `"auto"`, optional | Enable the action denoise CUDA graph path for this request when a matching shape bucket is available. Defaults to `"auto"`. |
 | `runtime.output_format` | `"list"` or `"numpy"`, optional | Use `"list"` for JSON compatibility. Use `"numpy"` with msgpack or Python clients to avoid Python-list materialization. Defaults to `"list"`. |
 | `runtime.response_format` | `"envelope"` or `"raw"`, optional | HTTP-only response shape. `"envelope"` returns the generic action envelope. `"raw"` returns the policy payload directly. Defaults to `"envelope"`. |
@@ -257,8 +259,8 @@ asyncio.run(main())
 ## 5. Configuration Tips
 
 - Request-local `PrefixContext` is always reused across all denoise steps in one request. The prefix K/V is not cloned per step.
-- Global prefix cache only accepts exact full-prefix hits. Partial-prefix reuse is intentionally disabled because Pi0.5 prefix blocks combine image, language, and state under full attention rather than causal text-prefix semantics.
-- The prefix cache key includes model revision, tokenizer, camera order, image content, task/state content, masks/positions, dtype, adapter, and parallel layout version. Real robot frames usually change every control cycle, so treat global prefix cache as an optimization rather than the main latency path. The default server-side prefix cache keeps only one exact prefix entry.
+- The optional global prefix cache is a bounded exact-match LRU. It is disabled by default because changing robot frames rarely hit it and enabling it prevents unrelated misses from entering grouped prefix execution. Set `enable_global_prefix_cache=true` for repeated observations, retries, or multiple policy calls over the same camera/state sample; `runtime.prefix_cache` can then disable lookup per request.
+- Partial-prefix reuse is not supported because Pi0.5 combines image and tokenized task/state inputs under full attention. Changing any input can change every deeper-layer prefix K/V tensor. The exact key hashes resized and normalized pixels before SigLIP, plus effective token IDs, token masks, camera masks, model revision, dtype, and parallel layout. Tensor content hashing reuses SRT's CPU/CUDA implementation; hashing the pre-SigLIP input lets an exact hit skip both the vision encoder and prefix transformer.
 - CUDA graph capture targets one action-denoise step by shape bucket, then replays it across the flow-matching loop. Shape buckets include batch size, prefix length, action horizon, action dim, dtype, and parallel layout. With action SP enabled, the graph bucket uses the local action shard length and rank-specific position offset.
 - Cache-DiT is not used in the default Pi0.5 path. The current robot policy target is numerically lossless inference, while Cache-DiT-style reuse is an image/video DiT approximation that needs separate policy-quality validation before it can be recommended for action control.
 - Do not use CFG parallelism to split the 10 Euler steps. Use it only for independent branches such as multiple candidate actions or future conditional/unconditional branches.
@@ -279,7 +281,7 @@ Current H100 pressure validation shows that the bf16 model path fits a 16GB-free
 | Single GPU bf16 | `--num-gpus 1`, no offload | fit with `16383 MiB` free before load in H100 pressure test | Recommended first path for 16GB-class discrete GPUs. |
 | ALOHA bf16 grouped | Python API, batch size 1 / 2 / 4 / 8 | unconstrained H100 | `52.4 ms` single; `65.1 ms / 2`; `91.9 ms / 4`; `147.4 ms / 8`. |
 | ALOHA 16GB-free pressure | Python API, no offload | same 16GB-free pressure | Fit was validated after the bf16 correction; rerun latency on the target because older pressure latency was collected before the final OpenPI precision fix. |
-| Prefix cache disabled | `enable_global_prefix_cache=false` or request `runtime.prefix_cache=false` | avoids cache growth across changing frames | Recommended for tight edge budgets unless repeated exact frames are common. |
+| Global prefix cache disabled | `enable_global_prefix_cache=false` or request `runtime.prefix_cache=false` | avoids cache growth across changing frames | Recommended for tight edge budgets unless repeated exact frames are common. |
 | Offload fallback | config in 6.2 | target-dependent | Use only if the default bf16 path OOMs on the target device. |
 
 Use these knobs first because they do not change action numerics for a fixed input/noise:

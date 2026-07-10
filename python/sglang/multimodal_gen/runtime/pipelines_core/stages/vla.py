@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
@@ -25,54 +24,24 @@ from sglang.multimodal_gen.runtime.vla.parallel import (
     get_vla_split_group,
 )
 from sglang.multimodal_gen.runtime.vla.prefix_cache import (
+    PrefixContext,
     VLAPrefixCacheManager,
     slice_prefix_context,
 )
 
 
-@dataclass(frozen=True)
-class VLAStageKeys:
-    raw_observation: str = "vla_observation"
-    observation_batch: str = "vla_observation_batch"
-    observation_group: str = "vla_observation_group"
-    options: str = "vla_options"
-    timings: str = "vla_timings"
-    prefix_context: str = "vla_prefix_context"
-    prefix_context_group: str = "vla_prefix_context_group"
-    prefix_cache_key: str = "vla_prefix_cache_key"
-    cache: str = "vla_cache"
-    parallel: str = "vla_parallel"
-    group_index: str = "vla_group_index"
-    group_size: str = "vla_group_size"
-    actions: str = "vla_actions"
-    actions_output: str = "vla_actions_output"
+def vla_state(batch: Req) -> dict[str, Any]:
+    """Per-request scratchpad shared by the VLA pipeline stages."""
 
-    @classmethod
-    def for_namespace(cls, namespace: str) -> VLAStageKeys:
-        return cls(
-            raw_observation=f"{namespace}_observation",
-            observation_batch=f"{namespace}_observation_batch",
-            observation_group=f"{namespace}_observation_group",
-            options=f"{namespace}_options",
-            timings=f"{namespace}_timings",
-            prefix_context=f"{namespace}_prefix_context",
-            prefix_context_group=f"{namespace}_prefix_context_group",
-            prefix_cache_key=f"{namespace}_prefix_cache_key",
-            cache=f"{namespace}_cache",
-            parallel=f"{namespace}_parallel",
-            group_index=f"{namespace}_group_index",
-            group_size=f"{namespace}_group_size",
-            actions=f"{namespace}_actions",
-            actions_output=f"{namespace}_actions_output",
-        )
+    return batch.extra["vla"]
 
 
-def vla_timings(batch: Req, keys: VLAStageKeys) -> dict[str, float]:
-    return batch.extra.setdefault(keys.timings, {})
+def vla_timings(batch: Req) -> dict[str, float]:
+    return vla_state(batch).setdefault("timings", {})
 
 
-def vla_options(batch: Req, keys: VLAStageKeys) -> dict[str, Any]:
-    return batch.extra.get(keys.options) or {}
+def vla_options(batch: Req) -> dict[str, Any]:
+    return vla_state(batch).get("options") or {}
 
 
 def materialize_vla_action_batch(
@@ -113,9 +82,8 @@ def synchronize_vla_action_tensor(actions: torch.Tensor | None) -> None:
 def _effective_prefix_cache_enabled(
     batch: Req,
     server_args: ServerArgs,
-    keys: VLAStageKeys,
 ) -> bool:
-    options = vla_options(batch, keys)
+    options = vla_options(batch)
     return bool(options.get("enable_prefix_cache", True)) and bool(
         server_args.pipeline_config.enable_global_prefix_cache
     )
@@ -124,18 +92,16 @@ def _effective_prefix_cache_enabled(
 def _grouped_fingerprint(
     batch: Req,
     server_args: ServerArgs,
-    keys: VLAStageKeys,
 ) -> tuple[Any, ...]:
     if (
         batch.is_warmup
         or get_vla_split_group() is not None
-        or _effective_prefix_cache_enabled(batch, server_args, keys)
+        or _effective_prefix_cache_enabled(batch, server_args)
         or batch.generator is not None
     ):
         return ("single", id(batch))
 
-    observation = batch.extra.get(keys.observation_batch)
-    options = vla_options(batch, keys)
+    observation = vla_state(batch).get("observation_batch")
     camera_order = tuple(observation.metadata.get("camera_order", ()))
     image_shapes = tuple(
         (
@@ -153,22 +119,16 @@ def _grouped_fingerprint(
         None if observation.noise is None else tuple(observation.noise.shape),
         tuple(observation.tokens.shape),
         tuple(observation.token_masks.shape),
-        int(options.get("action_horizon") or batch.action_horizon),
-        int(options.get("action_dim") or batch.action_dim),
-        int(options.get("num_inference_steps") or batch.num_inference_steps),
+        batch.action_horizon,
+        batch.action_dim,
+        batch.num_inference_steps,
     )
 
 
 class VLAObservationPreprocessStage(PipelineStage):
-    def __init__(
-        self,
-        preprocessor: Any,
-        *,
-        keys: VLAStageKeys = VLAStageKeys(),
-    ):
+    def __init__(self, preprocessor: Any):
         super().__init__()
         self.preprocessor = preprocessor
-        self.keys = keys
 
     @property
     def role_affinity(self) -> RoleType:
@@ -176,13 +136,12 @@ class VLAObservationPreprocessStage(PipelineStage):
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         start = time.perf_counter()
-        raw_observation = dict(batch.extra.get(self.keys.raw_observation) or {})
+        state = vla_state(batch)
+        raw_observation = dict(state.get("observation") or {})
         raw_observation.setdefault("prompt", batch.prompt)
         observation = self.preprocessor(raw_observation)
-        batch.extra[self.keys.observation_batch] = observation
-        vla_timings(batch, self.keys)["preprocess_ms"] = (
-            time.perf_counter() - start
-        ) * 1000
+        state["observation_batch"] = observation
+        vla_timings(batch)["preprocess_ms"] = (time.perf_counter() - start) * 1000
         return batch
 
 
@@ -191,13 +150,10 @@ class VLAPrefixEncodingStage(PipelineStage):
         self,
         policy_model: Any,
         prefix_cache: VLAPrefixCacheManager,
-        *,
-        keys: VLAStageKeys = VLAStageKeys(),
     ):
         super().__init__()
         self.policy_model = policy_model
         self.prefix_cache = prefix_cache
-        self.keys = keys
 
     @property
     def role_affinity(self) -> RoleType:
@@ -211,7 +167,7 @@ class VLAPrefixEncodingStage(PipelineStage):
         results: list[Req | None] = [None] * len(batches)
         for fingerprint, group in self._group_requests_by_fingerprint(
             batches,
-            lambda batch: _grouped_fingerprint(batch, server_args, self.keys),
+            lambda batch: _grouped_fingerprint(batch, server_args),
         ):
             group_batches = [batch for _, batch in group]
             if len(group_batches) == 1 or fingerprint[0] == "single":
@@ -221,29 +177,28 @@ class VLAPrefixEncodingStage(PipelineStage):
 
             prefix_start = time.perf_counter()
             observations = [
-                batch.extra[self.keys.observation_batch] for batch in group_batches
+                vla_state(batch)["observation_batch"] for batch in group_batches
             ]
             grouped_observation = collate_vla_observation_batches(observations)
             prefix_context = self.policy_model.encode_prefix(grouped_observation)
             prefix_ms = (time.perf_counter() - prefix_start) * 1000
 
             for offset, (index, batch) in enumerate(group):
-                batch.extra[self.keys.observation_group] = grouped_observation
-                batch.extra[self.keys.prefix_context_group] = prefix_context
-                batch.extra[self.keys.prefix_context] = slice_prefix_context(
+                state = vla_state(batch)
+                state["observation_group"] = grouped_observation
+                state["prefix_context_group"] = prefix_context
+                state["prefix_context"] = slice_prefix_context(
                     prefix_context,
                     offset,
                 )
-                batch.extra[self.keys.group_index] = offset
-                batch.extra[self.keys.group_size] = len(group_batches)
-                batch.extra[self.keys.cache] = {
+                state["cache"] = {
                     "hit": False,
-                    "match_len": 0,
-                    "full_prefix_len": prefix_context.prefix_len,
+                    "scope": "request",
+                    "prefix_len": prefix_context.prefix_len,
                     "grouped": True,
                     "batch_size": len(group_batches),
                 }
-                timings = vla_timings(batch, self.keys)
+                timings = vla_timings(batch)
                 timings["cache_lookup_ms"] = 0.0
                 timings["prefix_ms"] = prefix_ms
                 results[index] = batch
@@ -257,18 +212,18 @@ class VLAPrefixEncodingStage(PipelineStage):
         return [result for result in results if result is not None]
 
     def _recv_prefix_result(self, batch: Req, split: Any) -> Req:
-        batch.extra[self.keys.prefix_context] = broadcast_prefix_context(
+        state = vla_state(batch)
+        state["prefix_context"] = broadcast_prefix_context(
             None,
             split,
             src=split.prefix_root,
-            device=self.policy_model.device,
         )
-        batch.extra[self.keys.cache] = split.broadcast_object_from_rank(
+        state["cache"] = split.broadcast_object_from_rank(
             None,
             src=split.prefix_root,
         )
         timings = split.broadcast_object_from_rank(None, src=split.prefix_root)
-        vla_timings(batch, self.keys).update(timings)
+        vla_timings(batch).update(timings)
         return batch
 
     def _send_prefix_result(
@@ -281,69 +236,84 @@ class VLAPrefixEncodingStage(PipelineStage):
             prefix_context,
             split,
             src=split.prefix_root,
-            device=self.policy_model.device,
         )
         split.broadcast_object_from_rank(
-            batch.extra[self.keys.cache],
+            vla_state(batch)["cache"],
             src=split.prefix_root,
         )
         split.broadcast_object_from_rank(
-            vla_timings(batch, self.keys),
+            vla_timings(batch),
             src=split.prefix_root,
         )
 
+    def get_cached_context(
+        self, batch: Req, server_args: ServerArgs, observation: Any
+    ) -> tuple[str, PrefixContext]:
+        """try querying the cache for PrefixContext with prefix cache key built from observations and other keys"""
+        cache_enabled = _effective_prefix_cache_enabled(batch, server_args)
+        if cache_enabled:
+            cache_key = self.policy_model.build_prefix_cache_key(observation)
+            cached_context = self.prefix_cache.get(cache_key)
+        else:
+            cache_key = None
+            cached_context = None
+        return cache_key, cached_context
+
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
+        state = vla_state(batch)
         if batch.is_warmup:
-            batch.extra[self.keys.prefix_context] = None
-            batch.extra[self.keys.cache] = {"hit": False, "warmup": True}
+            state["prefix_context"] = None
+            state["cache"] = {"hit": False, "warmup": True}
             return batch
 
         split = get_vla_split_group()
         if split is not None and not split.is_prefix_rank:
             return self._recv_prefix_result(batch, split)
 
-        observation = batch.extra[self.keys.observation_batch]
-        options = vla_options(batch, self.keys)
-        cache_key = self.policy_model.build_prefix_cache_key(observation, options)
-        batch.extra[self.keys.prefix_cache_key] = cache_key
-
+        observation = state["observation_batch"]
         cache_start = time.perf_counter()
-        cache_enabled = bool(options.get("enable_prefix_cache", True))
-        lookup = (
-            self.prefix_cache.get(cache_key)
-            if cache_enabled and server_args.pipeline_config.enable_global_prefix_cache
-            else None
+        cache_enabled = _effective_prefix_cache_enabled(batch, server_args)
+
+        # 1. try querying the per-request LRU prefix kv cache
+        cache_key, cached_context = self.get_cached_context(
+            batch, server_args, observation
         )
-        vla_timings(batch, self.keys)["cache_lookup_ms"] = (
+
+        vla_timings(batch)["cache_lookup_ms"] = (
             time.perf_counter() - cache_start
         ) * 1000
 
-        if lookup is not None and lookup.hit:
-            batch.extra[self.keys.prefix_context] = lookup.context
-            batch.extra[self.keys.cache] = {
+        # 2. prepare VLAState
+        if cached_context is not None:
+            state["prefix_context"] = cached_context
+            state["cache"] = {
                 "hit": True,
-                "match_len": lookup.match_len,
-                "full_prefix_len": lookup.full_prefix_len,
+                "scope": "global",
+                "mode": "exact",
+                "prefix_len": cached_context.prefix_len,
             }
             if split is not None:
-                self._send_prefix_result(batch, split, lookup.context)
+                self._send_prefix_result(batch, split, cached_context)
             return batch
 
         prefix_start = time.perf_counter()
+
+        # 3. run encoding
         prefix_context = self.policy_model.encode_prefix(observation)
-        prefix_context.cache_key_digest = cache_key.digest
-        vla_timings(batch, self.keys)["prefix_ms"] = (
-            time.perf_counter() - prefix_start
-        ) * 1000
-        batch.extra[self.keys.prefix_context] = prefix_context
-        batch.extra[self.keys.cache] = {
+        if cache_key is not None:
+            prefix_context.cache_key_digest = cache_key
+
+        vla_timings(batch)["prefix_ms"] = (time.perf_counter() - prefix_start) * 1000
+        state["prefix_context"] = prefix_context
+        state["cache"] = {
             "hit": False,
-            "match_len": 0 if lookup is None else lookup.match_len,
-            "full_prefix_len": cache_key.full_prefix_len,
-            "partial_rejected": False if lookup is None else lookup.partial_rejected,
+            "scope": "global" if cache_enabled else "request",
+            "mode": "exact" if cache_enabled else "disabled",
+            "prefix_len": prefix_context.prefix_len,
         }
 
-        if cache_enabled and server_args.pipeline_config.enable_global_prefix_cache:
+        # 4. update prefix kv cache
+        if cache_key is not None:
             self.prefix_cache.put(cache_key, prefix_context)
         if split is not None:
             self._send_prefix_result(batch, split, prefix_context)
@@ -356,15 +326,9 @@ class VLAPrefixEncodingStage(PipelineStage):
 
 
 class VLAActionDenoisingStage(PipelineStage):
-    def __init__(
-        self,
-        policy_model: Any,
-        *,
-        keys: VLAStageKeys = VLAStageKeys(),
-    ):
+    def __init__(self, policy_model: Any):
         super().__init__()
         self.policy_model = policy_model
-        self.keys = keys
 
     @property
     def role_affinity(self) -> RoleType:
@@ -378,17 +342,14 @@ class VLAActionDenoisingStage(PipelineStage):
         results: list[Req | None] = [None] * len(batches)
 
         def action_fingerprint(batch: Req) -> tuple[Any, ...]:
-            prefix_context = batch.extra.get(self.keys.prefix_context_group)
+            prefix_context = vla_state(batch).get("prefix_context_group")
             if prefix_context is None:
                 return ("single", id(batch))
             return (
                 "grouped",
                 id(prefix_context),
-                int(
-                    vla_options(batch, self.keys).get("num_inference_steps")
-                    or batch.num_inference_steps
-                ),
-                str(vla_options(batch, self.keys).get("output_format") or "list"),
+                batch.num_inference_steps,
+                str(vla_options(batch).get("output_format") or "list"),
             )
 
         for _, group in self._group_requests_by_fingerprint(
@@ -396,23 +357,20 @@ class VLAActionDenoisingStage(PipelineStage):
             action_fingerprint,
         ):
             group_batches = [batch for _, batch in group]
-            prefix_context = group_batches[0].extra.get(self.keys.prefix_context_group)
+            prefix_context = vla_state(group_batches[0]).get("prefix_context_group")
             if len(group_batches) == 1 or prefix_context is None:
                 for index, batch in group:
                     results[index] = self(batch, server_args)
                 continue
 
             start = time.perf_counter()
-            options = vla_options(group_batches[0], self.keys)
-            observation = group_batches[0].extra[self.keys.observation_group]
+            options = vla_options(group_batches[0])
+            observation = vla_state(group_batches[0])["observation_group"]
             actions = self.policy_model.sample_actions(
                 observation,
                 prefix_context,
                 noise=observation.noise,
-                num_steps=int(
-                    options.get("num_inference_steps")
-                    or group_batches[0].num_inference_steps
-                ),
+                num_steps=group_batches[0].num_inference_steps,
                 use_cuda_graph=bool(options.get("enable_cuda_graph", True)),
                 generator=None,
             )
@@ -426,19 +384,20 @@ class VLAActionDenoisingStage(PipelineStage):
             parallel_info = self.policy_model.action_parallel_info(prefix_context)
 
             for offset, (index, batch) in enumerate(group):
-                vla_timings(batch, self.keys)["action_denoise_ms"] = action_ms
-                batch.extra[self.keys.parallel] = parallel_info
-                batch.extra[self.keys.actions] = actions[offset : offset + 1]
-                batch.extra[self.keys.actions_output] = actions_out[offset]
+                state = vla_state(batch)
+                vla_timings(batch)["action_denoise_ms"] = action_ms
+                state["parallel"] = parallel_info
+                state["actions_output"] = actions_out[offset]
                 results[index] = batch
 
         return [result for result in results if result is not None]
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         start = time.perf_counter()
-        observation = batch.extra.get(self.keys.observation_batch)
+        state = vla_state(batch)
+        observation = state.get("observation_batch")
         split = get_vla_split_group()
-        prefix_context = batch.extra.get(self.keys.prefix_context)
+        prefix_context = state.get("prefix_context")
         should_run_action = (
             split is None or self.policy_model.should_run_action_denoise(prefix_context)
         )
@@ -450,15 +409,14 @@ class VLAActionDenoisingStage(PipelineStage):
                 else None
             )
         elif should_run_action:
-            options = vla_options(batch, self.keys)
+            # broadcast PrefixContext from action root rank to action ranks
+            options = vla_options(batch)
             noise = observation.noise if observation is not None else None
             actions = self.policy_model.sample_actions(
                 observation,
                 prefix_context,
                 noise=noise,
-                num_steps=int(
-                    options.get("num_inference_steps") or batch.num_inference_steps
-                ),
+                num_steps=batch.num_inference_steps,
                 use_cuda_graph=bool(options.get("enable_cuda_graph", True)),
                 generator=batch.generator,
             )
@@ -468,7 +426,7 @@ class VLAActionDenoisingStage(PipelineStage):
 
         if split is not None:
             if should_run_action:
-                vla_timings(batch, self.keys)["action_denoise_ms"] = (
+                vla_timings(batch)["action_denoise_ms"] = (
                     time.perf_counter() - start
                 ) * 1000
             actions = broadcast_tensor_from_rank(
@@ -478,40 +436,37 @@ class VLAActionDenoisingStage(PipelineStage):
                 device=self.policy_model.device,
             )
             timings = split.broadcast_object_from_rank(
-                vla_timings(batch, self.keys) if should_run_action else None,
+                vla_timings(batch) if should_run_action else None,
                 src=split.action_root,
             )
-            vla_timings(batch, self.keys).update(timings)
+            vla_timings(batch).update(timings)
             parallel_info = split.broadcast_object_from_rank(
                 parallel_info if should_run_action else None,
                 src=split.action_root,
             )
         else:
-            vla_timings(batch, self.keys)["action_denoise_ms"] = (
+            vla_timings(batch)["action_denoise_ms"] = (
                 time.perf_counter() - start
             ) * 1000
-        batch.extra[self.keys.parallel] = parallel_info
-        batch.extra[self.keys.actions] = actions
+        state["parallel"] = parallel_info
+        state["actions"] = actions
         return batch
 
 
 class VLAActionPostprocessStage(PipelineStage):
-    def __init__(self, *, keys: VLAStageKeys = VLAStageKeys()):
-        super().__init__()
-        self.keys = keys
-
     @property
     def role_affinity(self) -> RoleType:
         return RoleType.DENOISER
 
     def forward(self, batch: Req, server_args: ServerArgs) -> OutputBatch:
         start = time.perf_counter()
+        state = vla_state(batch)
         action_dim = server_args.pipeline_config.output_action_dim
-        options = vla_options(batch, self.keys)
-        actions_out = batch.extra.get(self.keys.actions_output)
+        options = vla_options(batch)
+        actions_out = state.get("actions_output")
         if actions_out is None:
             action_batch = materialize_vla_action_batch(
-                batch.extra[self.keys.actions],
+                state["actions"],
                 action_dim,
                 str(options.get("output_format") or "list"),
             )
@@ -525,19 +480,15 @@ class VLAActionPostprocessStage(PipelineStage):
             "request_id": batch.request_id,
             "actions": actions_out,
         }
-        payload["parameters"] = {
-            "num_inference_steps": int(
-                options.get("num_inference_steps") or batch.num_inference_steps
-            )
-        }
+        payload["parameters"] = {"num_inference_steps": batch.num_inference_steps}
         if options.get("return_timing", True):
-            timings = dict(vla_timings(batch, self.keys))
+            timings = dict(vla_timings(batch))
             timings["postprocess_ms"] = (time.perf_counter() - start) * 1000
             payload["timings"] = timings
         if not batch.is_warmup:
-            payload["cache"] = batch.extra.get(self.keys.cache, {})
-        if batch.extra.get(self.keys.parallel) is not None:
-            payload["parallel"] = batch.extra[self.keys.parallel]
+            payload["cache"] = state.get("cache", {})
+        if state.get("parallel") is not None:
+            payload["parallel"] = state["parallel"]
 
         return OutputBatch(
             output=[payload],

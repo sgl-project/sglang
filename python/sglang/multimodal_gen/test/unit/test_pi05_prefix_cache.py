@@ -1,68 +1,61 @@
 # SPDX-License-Identifier: Apache-2.0
 
-from array import array
-
 import torch
 
 from sglang.multimodal_gen.runtime.vla.prefix_cache import (
     PrefixContext,
-    VLAPrefixCacheKey,
     VLAPrefixCacheManager,
 )
-from sglang.srt.mem_cache.radix_cache import RadixKey
-
-
-def _key(values: list[int], digest: str) -> VLAPrefixCacheKey:
-    radix_key = RadixKey(array("q", values), extra_key="pi05-test")
-    return VLAPrefixCacheKey(
-        digest=digest,
-        radix_key=radix_key,
-        full_prefix_len=len(radix_key),
-    )
 
 
 def _context() -> PrefixContext:
     return PrefixContext(
         past_key_values=("kv",),
         prefix_pad_masks=torch.ones(1, 3, dtype=torch.bool),
-        prefix_position_ids=torch.arange(3).unsqueeze(0),
         prefix_len=3,
-        dtype=torch.bfloat16,
-        device=torch.device("cpu"),
     )
 
 
 def test_pi05_prefix_cache_full_hit_returns_context():
     manager = VLAPrefixCacheManager(max_entries=4)
-    key = _key([1, 2, 3], "a")
+    key = "a"
     context = _context()
 
     manager.put(key, context)
-    lookup = manager.get(key)
+    cached = manager.get(key)
 
-    assert lookup.hit
-    assert lookup.context is context
-    assert lookup.match_len == key.full_prefix_len
+    assert cached is context
+    assert context.cache_key_digest == key
 
 
-def test_pi05_prefix_cache_rejects_partial_hit():
+def test_pi05_prefix_cache_different_key_misses():
     manager = VLAPrefixCacheManager(max_entries=4)
-    manager.put(_key([1, 2, 3], "a"), _context())
+    manager.put("a", _context())
 
-    lookup = manager.get(_key([1, 2, 4], "b"))
-
-    assert not lookup.hit
-    assert lookup.context is None
-    assert lookup.match_len == 2
-    assert lookup.partial_rejected
+    assert manager.get("b") is None
 
 
-def test_pi05_prefix_cache_different_key_does_not_collide():
-    manager = VLAPrefixCacheManager(max_entries=4)
-    manager.put(_key([1, 2, 3], "a"), _context())
+def test_pi05_prefix_cache_zero_capacity_does_not_retain_context():
+    manager = VLAPrefixCacheManager(max_entries=0)
+    context = _context()
 
-    lookup = manager.get(_key([9, 9, 9], "b"))
+    manager.put("a", context)
 
-    assert not lookup.hit
-    assert lookup.match_len == 0
-    assert not lookup.partial_rejected
+    assert manager.get("a") is None
+    assert context.cache_key_digest is None
+
+
+def test_pi05_prefix_cache_evicts_least_recently_used_entry():
+    manager = VLAPrefixCacheManager(max_entries=2)
+    context_a = _context()
+    context_b = _context()
+    context_c = _context()
+    manager.put("a", context_a)
+    manager.put("b", context_b)
+    assert manager.get("a") is context_a
+
+    manager.put("c", context_c)
+
+    assert manager.get("a") is context_a
+    assert manager.get("b") is None
+    assert manager.get("c") is context_c

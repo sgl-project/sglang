@@ -453,8 +453,7 @@ class PiGemmaAttention(nn.Module):
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         attention_mask: torch.Tensor | None = None,
-        past_key_values=None,
-        cache_position: torch.LongTensor | None = None,
+        past_key_values: VLADensePrefixCache | None = None,
         **kwargs,
     ) -> tuple[torch.Tensor, None]:
         input_shape = hidden_states.shape[:-1]
@@ -472,8 +471,7 @@ class PiGemmaAttention(nn.Module):
         if past_key_values is not None:
             if (
                 self.sp_attn is not None
-                and hasattr(past_key_values, "get_prefix")
-                and getattr(past_key_values, "read_only", False)
+                and past_key_values.read_only
                 and attention_mask is None
             ):
                 prefix_key_states, prefix_value_states = past_key_values.get_prefix(
@@ -493,12 +491,10 @@ class PiGemmaAttention(nn.Module):
                 attn_output = attn_output.reshape(*input_shape, -1).contiguous()
                 return linear_forward(self.o_proj, attn_output), None
 
-            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             key_states, value_states = past_key_values.update(
                 key_states,
                 value_states,
                 self.layer_idx,
-                cache_kwargs,
             )
 
         attn_output = self.attn(
@@ -543,10 +539,7 @@ class PiGemmaDecoderLayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
-        position_ids: torch.LongTensor | None = None,
         past_key_values=None,
-        use_cache: bool = False,
-        cache_position: torch.LongTensor | None = None,
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         adarms_cond: torch.Tensor | None = None,
         **kwargs,
@@ -556,10 +549,7 @@ class PiGemmaDecoderLayer(nn.Module):
         hidden_states, _ = self.self_attn(
             hidden_states,
             attention_mask=attention_mask,
-            position_ids=position_ids,
             past_key_values=past_key_values,
-            use_cache=use_cache,
-            cache_position=cache_position,
             position_embeddings=position_embeddings,
             **kwargs,
         )
@@ -761,11 +751,8 @@ class PiGemmaModel(nn.Module):
             layer_outputs = decoder_layer(
                 hidden_states,
                 attention_mask=causal_mask,
-                position_ids=position_ids,
                 past_key_values=past_key_values,
                 output_attentions=output_attentions,
-                use_cache=use_cache,
-                cache_position=cache_position,
                 position_embeddings=position_embeddings,
                 adarms_cond=adarms_cond,
                 **kwargs,
@@ -1490,7 +1477,6 @@ class Pi05CoreModel(nn.Module):
         return (
             past_key_values,
             prefix_pad_masks,
-            prefix_position_ids,
             prefix_full_attention,
         )
 

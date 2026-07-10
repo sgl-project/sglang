@@ -40,10 +40,6 @@ class VLASplitGroup:
     rank: int
 
     @property
-    def enabled(self) -> bool:
-        return self.group.world_size > 1
-
-    @property
     def is_prefix_rank(self) -> bool:
         return self.rank == self.prefix_root
 
@@ -111,7 +107,6 @@ def broadcast_prefix_context(
     split: VLASplitGroup,
     *,
     src: int,
-    device: torch.device,
 ) -> PrefixContext | None:
     if split.rank == src and context is None:
         payload = {"is_none": True}
@@ -124,9 +119,7 @@ def broadcast_prefix_context(
             "is_none": False,
             "prefix_pad_masks": prefix_pad_masks,
             "prefix_pad_masks_is_bool": prefix_pad_masks_is_bool,
-            "prefix_position_ids": context.prefix_position_ids,
             "prefix_len": context.prefix_len,
-            "dtype": context.dtype,
             "layout": dict(context.layout),
             "cache_key_digest": context.cache_key_digest,
             "num_layers": len(context.past_key_values),
@@ -162,10 +155,7 @@ def broadcast_prefix_context(
     return PrefixContext(
         past_key_values=VLADensePrefixCache(tuple(kv_layers)),
         prefix_pad_masks=prefix_pad_masks,
-        prefix_position_ids=payload["prefix_position_ids"],
         prefix_len=int(payload["prefix_len"]),
-        dtype=payload["dtype"],
-        device=device,
         layout=dict(payload["layout"]),
         cache_key_digest=payload["cache_key_digest"],
     )

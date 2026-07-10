@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-import hashlib
 from dataclasses import dataclass, field
 from typing import Any
 
 import torch
+
+from sglang.srt.managers.mm_utils import tensor_hash
 
 
 @dataclass
@@ -22,13 +23,11 @@ class VLAObservationBatch:
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
-def stable_tensor_sha256(tensor: torch.Tensor) -> str:
-    array = tensor.detach().contiguous().cpu().numpy()
-    h = hashlib.sha256()
-    h.update(str(array.shape).encode("utf-8"))
-    h.update(str(array.dtype).encode("utf-8"))
-    h.update(array.tobytes())
-    return h.hexdigest()
+def tensor_fingerprint(tensor: torch.Tensor) -> str:
+    """Hash tensor content with SRT's CPU/CUDA implementation."""
+
+    shape = ",".join(str(dim) for dim in tensor.shape)
+    return f"{tensor.dtype}:{shape}:{tensor_hash(tensor):016x}"
 
 
 def collate_vla_observation_batches(
@@ -73,11 +72,5 @@ def collate_vla_observation_batches(
         tokens=torch.cat([obs.tokens for obs in observations], dim=0),
         token_masks=torch.cat([obs.token_masks for obs in observations], dim=0),
         batch_size=len(observations),
-        metadata={
-            "camera_order": camera_order,
-            "image_hashes": {
-                name: [obs.metadata["image_hashes"][name] for obs in observations]
-                for name in camera_order
-            },
-        },
+        metadata={"camera_order": camera_order},
     )

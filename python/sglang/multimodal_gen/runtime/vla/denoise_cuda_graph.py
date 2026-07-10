@@ -64,10 +64,7 @@ def _clone_prefix_context(prefix_context: PrefixContext) -> PrefixContext:
     return PrefixContext(
         past_key_values=_clone_past_key_values(prefix_context.past_key_values),
         prefix_pad_masks=prefix_context.prefix_pad_masks.detach().clone(),
-        prefix_position_ids=prefix_context.prefix_position_ids.detach().clone(),
         prefix_len=prefix_context.prefix_len,
-        dtype=prefix_context.dtype,
-        device=prefix_context.device,
         layout=dict(prefix_context.layout),
         cache_key_digest=prefix_context.cache_key_digest,
     )
@@ -75,7 +72,6 @@ def _clone_prefix_context(prefix_context: PrefixContext) -> PrefixContext:
 
 def _copy_prefix_context_(dst: PrefixContext, src: PrefixContext) -> None:
     dst.prefix_pad_masks.copy_(src.prefix_pad_masks)
-    dst.prefix_position_ids.copy_(src.prefix_position_ids)
     _copy_past_key_values_(dst.past_key_values, src.past_key_values)
     dst.cache_key_digest = src.cache_key_digest
 

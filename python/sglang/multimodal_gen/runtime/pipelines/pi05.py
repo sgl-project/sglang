@@ -19,15 +19,12 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.vla import (
     VLAActionPostprocessStage,
     VLAObservationPreprocessStage,
     VLAPrefixEncodingStage,
-    VLAStageKeys,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.vla.prefix_cache import VLAPrefixCacheManager
 
 logger = init_logger(__name__)
-
-PI05_STAGE_KEYS = VLAStageKeys.for_namespace("pi05")
 
 
 class Pi05Pipeline(ComposedPipelineBase):
@@ -106,29 +103,22 @@ class Pi05Pipeline(ComposedPipelineBase):
 
     def create_pipeline_stages(self, server_args: ServerArgs):
         self.add_stage(
-            VLAObservationPreprocessStage(
-                self.preprocessor,
-                keys=PI05_STAGE_KEYS,
-            ),
+            VLAObservationPreprocessStage(self.preprocessor),
             "pi05_preprocess",
         )
         self.add_stage(
             VLAPrefixEncodingStage(
                 self.get_module("policy_model"),
                 self.prefix_cache,
-                keys=PI05_STAGE_KEYS,
             ),
             "pi05_prefix",
         )
         self.add_stage(
-            VLAActionDenoisingStage(
-                self.get_module("policy_model"),
-                keys=PI05_STAGE_KEYS,
-            ),
+            VLAActionDenoisingStage(self.get_module("policy_model")),
             "pi05_action_denoise",
         )
         self.add_stage(
-            VLAActionPostprocessStage(keys=PI05_STAGE_KEYS),
+            VLAActionPostprocessStage(),
             "pi05_postprocess",
         )
 
