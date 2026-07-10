@@ -782,7 +782,7 @@ class SchedulerDisaggregationPrefillMixin:
                     dynamic_dst["nbytes"] = int(new_hidden_len * item_len)
                     pp_slice["dynamic_dst"] = dynamic_dst
                 new_meta["pp_slice"] = pp_slice
-                pp_rank = str(pp_slice.get("pp_rank", self.pp_rank))
+                pp_rank = str(pp_slice.get("pp_rank", self.ps.pp_rank))
                 pp_slices = dict(new_meta.get("pp_slices") or {})
                 if pp_rank in pp_slices:
                     pp_slices[pp_rank] = {
