@@ -652,6 +652,19 @@ class DeepseekV4AttnBackend(
             and model_runner.spec_algorithm.is_dspark()
         )
 
+        # Allocated in __init__ (outside inference_mode) deliberately: lazy
+        # allocation inside FlashInfer autotune's inference_mode tags them as
+        # inference tensors, which cannot be inplace-updated during CUDA-graph capture.
+        num_reqs = self.req_to_token.shape[0]
+        self.extend_seq_lens_buffer = torch.full(
+            (num_reqs,),
+            self.speculative_num_draft_tokens,
+            **self.cuda_int32_kwargs,
+        )
+        self.extend_start_loc_buffer = torch.zeros(
+            num_reqs, **self.cuda_int32_kwargs
+        )
+
     def _move_to_device(self, x: List[int]) -> torch.Tensor:
         pin_tensor = torch.tensor(x, dtype=torch.int32, pin_memory=True)
         return pin_tensor.to(self.device, non_blocking=True)
@@ -873,17 +886,6 @@ class DeepseekV4AttnBackend(
             c128_compress_metadata=c128_compress_metadata,
         )
 
-    def _ensure_verify_bs_buffers(self) -> None:
-        if hasattr(self, "extend_seq_lens_buffer"):
-            return
-        num_reqs = self.req_to_token.shape[0]
-        self.extend_seq_lens_buffer = torch.full(
-            (num_reqs,),
-            self.speculative_num_draft_tokens,
-            **self.cuda_int32_kwargs,
-        )
-        self.extend_start_loc_buffer = torch.zeros(num_reqs, **self.cuda_int32_kwargs)
-
     def init_forward_metadata_target_verify(
         self,
         max_seq_len: int,
@@ -901,7 +903,6 @@ class DeepseekV4AttnBackend(
             seq_lens_cpu_list = (
                 seq_lens_cpu.tolist() if seq_lens_cpu is not None else None
             )
-            self._ensure_verify_bs_buffers()
             if ragged_layout is None:
                 self.extend_seq_lens_buffer[:bs].fill_(
                     self.speculative_num_draft_tokens
