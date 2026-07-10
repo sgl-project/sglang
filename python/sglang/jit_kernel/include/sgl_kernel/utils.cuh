@@ -41,6 +41,10 @@ using cudaLaunchConfig_t = hipLaunchConfig_t;
 using cudaLaunchAttribute = hipLaunchAttribute;
 inline constexpr auto cudaSuccess = hipSuccess;
 #define cudaStreamPerThread hipStreamPerThread
+#define cudaDeviceGetAttribute hipDeviceGetAttribute
+#define cudaDevAttrMaxSharedMemoryPerBlockOptin hipDeviceAttributeMaxSharedMemoryPerBlock
+#define cudaFuncSetAttribute hipFuncSetAttribute
+#define cudaFuncAttributeMaxDynamicSharedMemorySize hipFuncAttributeMaxDynamicSharedMemorySize
 #define cudaGetErrorString hipGetErrorString
 #define cudaGetLastError hipGetLastError
 #define cudaLaunchKernel hipLaunchKernel
