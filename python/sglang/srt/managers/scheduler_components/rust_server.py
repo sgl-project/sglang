@@ -282,16 +282,13 @@ class RustServer:
         out_tid_idx = payload.output_token_ids_logprobs_idx or []
         in_tid_val = payload.input_token_ids_logprobs_val or []
         in_tid_idx = payload.input_token_ids_logprobs_idx or []
-        hidden = getattr(payload, "output_hidden_states", None) or []
+        hidden = payload.output_hidden_states or []
 
         def at(seq_, j):
             return seq_[j] if j < len(seq_) else None
 
-        # Hot-path guard: the overwhelming majority of decode steps request no
-        # logprobs / hidden states. Only then do we run the per-request flatten +
-        # raw-buffer packing; otherwise the loop stays as cheap as plain token
-        # streaming (a small header + empty data), which keeps this off the
-        # scheduler/CUDA-launch thread's critical path.
+        # Hot-path guard: almost no decode step wants logprobs / hidden states, so
+        # only then do we pay the per-request flatten + raw-buffer packing.
         has_extra = bool(
             out_lp_val
             or in_lp_val
@@ -302,29 +299,19 @@ class RustServer:
             or hidden
         )
 
-        # Both paths ship the WHOLE batch in one frame: columnar scalars via a
-        # single msgpack header + one concatenated raw `data` buffer + one
-        # `push_batch` FFI. The tm-egress dispatcher fans it out per rid (routing
-        # is by rid, so the old per-rid load-balance seq is no longer tracked
-        # here). Collapsing N per-request encodes + N FFI crossings to one is what
-        # keeps 4k-16k-request PD decode steps off the scheduler's critical path.
-        # rids ship as raw u64 (the Rust `RequestIdGen` counter, stringified only
-        # on the ingress wire) — a numeric column, so the Rust side skips the
-        # per-request string decode + clone + parse. `int()` no-ops if already int.
-        rids = [int(r) for r in payload.rids]
-        # Ship the WHOLE finish-reason dict per request (type + matched + message
-        # + status_code + err_type + length).
-        finish_reasons = [
-            (fr if isinstance(fr, dict) else None) for fr in payload.finished_reasons
-        ]
-        # `chain.from_iterable` flattens the per-request id arrays in C (no
-        # Python-level per-token loop); `tok_lens` splits them back out in Rust.
-        tok_lens = [len(x) if x else 0 for x in output_ids]
-        flat_ids = array("i", chain.from_iterable(x or () for x in output_ids))
+        # Runs on the scheduler's CUDA-launch thread every decode step, so each
+        # Python-level pass over the batch costs inter-token latency: `rids` are
+        # already u64 (`Req.rid_num`) and `finished_reasons` already `dict | None`,
+        # and `output_ids` entries are always `array("i")` (never None) so `map(len)`
+        # and a bare `chain.from_iterable` stay in C.
+        rids = payload.rids
+        finish_reasons = payload.finished_reasons
+        tok_lens = list(map(len, output_ids))
+        flat_ids = array("i", chain.from_iterable(output_ids))
 
         # Column order here MUST match BatchHeader (header_cols) and
         # decode_batch_frame's read order (data_cols).
-        header_cols = [rids, finish_reasons, list(prompt_tokens), tok_lens]
+        header_cols = [rids, finish_reasons, prompt_tokens, tok_lens]
         data_cols = [flat_ids.tobytes()]
 
         if has_extra:

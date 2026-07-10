@@ -384,8 +384,10 @@ class _GenerationStreamAccumulator:
         send_output_token_logprobs_offset = req.send_output_token_logprobs_offset
         # Fields the Rust egress (`push_generation`) actually reads: rids,
         # finished_reasons, output_ids, prompt_tokens (+ the logprob/hidden
-        # blocks below, already gated on their flags).
-        self.rids.append(req.rid)
+        # blocks below, already gated on their flags). Rust mode ships rids as a
+        # numeric column: use the value parsed once at `Req` construction so
+        # `push_generation` needs no per-step `int()` pass over the batch.
+        self.rids.append(req.rid_num if self.rust_mode else req.rid)
         self.finished_reasons.append(
             req.finished_reason.to_json() if req.finished_reason else None
         )
