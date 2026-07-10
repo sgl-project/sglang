@@ -440,7 +440,9 @@ class TestDecodePrebuiltPriority(unittest.TestCase):
             "sglang.srt.disaggregation.decode.ScheduleBatch.init_new",
             return_value=new_batch,
         ) as init_new:
-            ret = SchedulerDisaggregationDecodeMixin.get_new_prebuilt_batch(scheduler)
+            ret = SchedulerDisaggregationDecodeMixin.get_new_prebuilt_batch(
+                scheduler, scheduler.running_batch
+            )
 
         self.assertIs(ret, new_batch)
         scheduler.policy.calc_priority.assert_called_once_with(
