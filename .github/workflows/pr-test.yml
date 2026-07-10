@@ -440,9 +440,7 @@ jobs:
 
   call-multimodal-gen-tests:
     needs: [check-changes, call-gate, sgl-kernel-build-wheels, sgl-deep-gemm-build-wheels]
-    # TEMP: disable multimodal-gen CI due to consistent failures
     if: |
-      false &&
       always() &&
       !cancelled() &&
       ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
