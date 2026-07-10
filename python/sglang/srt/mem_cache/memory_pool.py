@@ -36,6 +36,10 @@ import triton
 import triton.language as tl
 
 from sglang.jit_kernel.kvcache import can_use_store_cache, store_cache
+from sglang.kernels.ops.attention.dsa.quant_k_cache import (
+    quantize_k_cache,
+    quantize_k_cache_separate,
+)
 from sglang.kernels.ops.kvcache.cache_move import (
     copy_all_layer_kv_cache_func,
     set_kv_buffer_prefix_valid_tiled,
@@ -45,10 +49,6 @@ from sglang.srt.configs.mamba_utils import BaseLinearStateParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa import index_buf_accessor
-from sglang.srt.layers.attention.dsa.quant_k_cache import (
-    quantize_k_cache,
-    quantize_k_cache_separate,
-)
 from sglang.srt.layers.attention.dsa.utils import aiter_can_use_preshuffle_paged_mqa
 from sglang.srt.layers.dcp import (
     dcp_enabled,

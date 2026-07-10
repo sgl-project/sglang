@@ -11,7 +11,7 @@ from sglang.jit_kernel.dsv4 import (
     fused_q_indexer_rope_hadamard_fp4_quant,
 )
 from sglang.jit_kernel.hadamard import hadamard_transform
-from sglang.srt.layers.attention.dsv4.fp4_indexer import (
+from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
     quantize_fp4_indexer_tensor,
     store_fp4_index_k_cache,
 )

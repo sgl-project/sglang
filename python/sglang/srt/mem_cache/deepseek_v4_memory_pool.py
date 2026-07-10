@@ -11,13 +11,13 @@ from sglang.jit_kernel.dsv4 import (
     fused_k_norm_rope_flashmla,
     fused_store_cache,
 )
+from sglang.kernels.ops.attention.dsv4.index_buf_accessor import NopeFp8RopeBf16Pack
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa import index_buf_accessor
 from sglang.srt.layers.attention.dsv4 import (
     index_buf_accessor as dsv4_index_buf_accessor,
 )
-from sglang.srt.layers.attention.dsv4.index_buf_accessor import NopeFp8RopeBf16Pack
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.memory_pool import KVCache
@@ -368,7 +368,7 @@ class DeepSeekV4IndexerPool(KVCache):
         loc: torch.Tensor,
         cache_k: torch.Tensor,
     ) -> None:
-        from sglang.srt.layers.attention.dsv4.fp4_indexer import (
+        from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
             store_fp4_index_k_cache,
         )
 
@@ -565,7 +565,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         c4_page_size = page_size // 4
         c128_page_size = page_size // 128
 
-        from sglang.srt.layers.attention.dsv4.unified_kv_kernels.env_gate import (
+        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
             is_unified_kv_triton,
         )
 
