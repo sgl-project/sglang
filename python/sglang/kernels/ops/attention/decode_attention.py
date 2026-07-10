@@ -448,7 +448,12 @@ def _fwd_grouped_kernel_stage1(
 
     if split_kv_end > split_kv_start:
         q = tl.load(Q + offs_q, mask=(mask_h[:, None]) & (mask_d[None, :]), other=0.0)
-        q_k = q.to(K_Buffer.dtype.element_ty)
+        # gfx1250: triton tl.dot(fp8, fp8) returns garbage (~1e34+) for contraction
+        # dim K>=128 (verified K=64 ok, K>=128 broken; bf16 fine at all K). The MLA
+        # nope QK dot has K=512, so an fp8 KV cache MUST NOT be consumed as an fp8 dot
+        # here: keep q in bf16 and upcast the fp8 K to bf16 for the dot. No-op for a
+        # bf16 cache. (Do NOT "optimize" this back to q.to(fp8) on gfx1250.)
+        q_k = q
         if BLOCK_DPE > 0:
             qpe = tl.load(
                 Q + off_qpe, mask=(mask_h[:, None]) & (mask_dpe[None, :]), other=0.0
@@ -476,7 +481,7 @@ def _fwd_grouped_kernel_stage1(
                 mask=(offs_n[None, :] < split_kv_end) & (mask_d[:, None]),
                 other=0.0,
             )
-            qk = tl.dot(q_k, k)
+            qk = tl.dot(q_k, k.to(q_k.dtype))
             if BLOCK_DPE > 0:
                 if PAGE_SIZE == 1:
                     offs_buf_kpe = kv_loc[None, :] * stride_buf_kbs + base_offs_kpe
