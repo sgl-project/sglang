@@ -48,7 +48,7 @@ class Pi05Pipeline(ComposedPipelineBase):
         self,
         server_args: ServerArgs,
         loaded_modules: dict[str, torch.nn.Module] | None = None,
-    ) -> dict:
+    ) -> dict[str, torch.nn.Module]:
         if loaded_modules is not None:
             return loaded_modules
 
@@ -95,16 +95,19 @@ class Pi05Pipeline(ComposedPipelineBase):
             )
         return {
             "policy_model": policy_model,
-            "preprocessor": Pi05Preprocessor(pipeline_config),
-            "prefix_cache": VLAPrefixCacheManager(
-                max_entries=pipeline_config.prefix_cache_max_entries
-            ),
         }
+
+    def initialize_pipeline(self, server_args: ServerArgs) -> None:
+        pipeline_config: Pi05PipelineConfig = server_args.pipeline_config
+        self.preprocessor = Pi05Preprocessor(pipeline_config)
+        self.prefix_cache = VLAPrefixCacheManager(
+            max_entries=pipeline_config.prefix_cache_max_entries
+        )
 
     def create_pipeline_stages(self, server_args: ServerArgs):
         self.add_stage(
             VLAObservationPreprocessStage(
-                self.get_module("preprocessor"),
+                self.preprocessor,
                 keys=PI05_STAGE_KEYS,
             ),
             "pi05_preprocess",
@@ -112,7 +115,7 @@ class Pi05Pipeline(ComposedPipelineBase):
         self.add_stage(
             VLAPrefixEncodingStage(
                 self.get_module("policy_model"),
-                self.get_module("prefix_cache"),
+                self.prefix_cache,
                 keys=PI05_STAGE_KEYS,
             ),
             "pi05_prefix",

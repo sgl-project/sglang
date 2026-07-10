@@ -37,9 +37,6 @@ class PrefixContext:
     layout: dict[str, Any] = field(default_factory=dict)
     cache_key_digest: str | None = None
 
-    def pin_for_request(self) -> PrefixContext:
-        return self
-
 
 class VLADensePrefixCache:
     def __init__(
@@ -241,7 +238,7 @@ class VLAPrefixCacheManager:
         self._contexts.move_to_end(key.digest)
         return VLAPrefixCacheLookup(
             hit=True,
-            context=context.pin_for_request(),
+            context=context,
             match_len=match_len,
             full_prefix_len=key.full_prefix_len,
         )

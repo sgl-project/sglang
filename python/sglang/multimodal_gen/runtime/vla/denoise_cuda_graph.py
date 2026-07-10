@@ -12,6 +12,12 @@ from sglang.multimodal_gen.runtime.vla.prefix_cache import (
     PrefixContext,
     VLADensePrefixCache,
 )
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    set_graph_pool_id,
+)
+from sglang.srt.model_executor.runner_utils.pool import (
+    get_or_create_global_graph_memory_pool,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +91,8 @@ class VLADenoiseGraphRunner:
         self.enabled = enabled
         self._captured: dict[VLADenoiseGraphSignature, _CapturedDenoiseGraph] = {}
         self._disabled_signatures: set[VLADenoiseGraphSignature] = set()
+        self._capture_stream: torch.cuda.Stream | None = None
+        self._graph_pool: Any = None
 
     def _sync_context_if_needed(
         self,
@@ -117,25 +125,38 @@ class VLADenoiseGraphRunner:
         static_x_t = x_t.detach().clone()
         static_timestep = timestep.detach().clone()
 
-        stream = torch.cuda.Stream(device=x_t.device)
-        stream.wait_stream(torch.cuda.current_stream(device=x_t.device))
+        device_module = torch.get_device_module(x_t.device)
+        if self._capture_stream is None:
+            self._capture_stream = device_module.Stream(device=x_t.device)
+        if self._graph_pool is None:
+            self._graph_pool = get_or_create_global_graph_memory_pool(device_module)
+            set_graph_pool_id(self._graph_pool)
 
-        # warm up lazy kernel state and allocator work before graph capture
-        with torch.cuda.stream(stream), torch.inference_mode():
+        # warm up lazy kernels and workspaces before capture
+        device_module.synchronize()
+        with device_module.stream(self._capture_stream), torch.inference_mode():
             step_fn(
                 static_prefix_context,
                 static_x_t,
                 static_timestep,
             )
-        torch.cuda.current_stream(device=x_t.device).wait_stream(stream)
+        self._capture_stream.synchronize()
 
         graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph), torch.inference_mode():
+        with (
+            device_module.graph(
+                cuda_graph=graph,
+                pool=self._graph_pool,
+                stream=self._capture_stream,
+            ),
+            torch.inference_mode(),
+        ):
             static_output = step_fn(
                 static_prefix_context,
                 static_x_t,
                 static_timestep,
             )
+        self._capture_stream.synchronize()
 
         captured = _CapturedDenoiseGraph(
             graph=graph,
