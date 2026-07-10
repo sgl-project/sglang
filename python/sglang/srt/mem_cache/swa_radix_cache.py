@@ -473,7 +473,10 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         ]
 
         radix_key = RadixKey(
-            token_ids, req.extra_key, is_bigram=self.is_eagle
+            token_ids,
+            req.extra_key,
+            is_bigram=self.is_eagle,
+            cache_salt=getattr(req, "cache_salt", None),
         ).page_aligned(self.page_size)
         page_aligned_len = len(radix_key)
         values = kv_indices[:page_aligned_len].to(dtype=torch.int64, copy=True)
@@ -523,7 +526,10 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         ]
 
         radix_key = RadixKey(
-            token_ids, req.extra_key, is_bigram=self.is_eagle
+            token_ids,
+            req.extra_key,
+            is_bigram=self.is_eagle,
+            cache_salt=getattr(req, "cache_salt", None),
         ).page_aligned(self.page_size)
         values = kv_indices[: len(radix_key)].to(dtype=torch.int64, copy=True)
         old_prefix_len = req.cache_protected_len
@@ -1017,6 +1023,7 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                 node.key.token_ids + child.key.token_ids,
                 node.key.extra_key,
                 is_bigram=node.key.is_bigram,
+                cache_salt=node.key.cache_salt,
             )
             node.value = torch.cat([node.value, child.value])
             node.children = child.children

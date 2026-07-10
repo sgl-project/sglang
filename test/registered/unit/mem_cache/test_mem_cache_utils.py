@@ -17,6 +17,7 @@ from sglang.srt.mem_cache.evict_policy import (
     SLRUStrategy,
 )
 from sglang.srt.mem_cache.utils import (
+    compute_node_event_hash_values,
     compute_node_hash_values,
     get_eviction_strategy,
     get_hash_str,
@@ -54,9 +55,10 @@ def _legacy_page_hashes(key, page_size, prior_hash=None):
 
 
 class _HashKey:
-    def __init__(self, token_ids, is_bigram=False):
+    def __init__(self, token_ids, is_bigram=False, cache_salt=None):
         self.token_ids = token_ids
         self.is_bigram = is_bigram
+        self.cache_salt = cache_salt
 
     def __len__(self):
         if self.is_bigram:
@@ -68,8 +70,12 @@ class _HashKey:
             start = index.start or 0
             stop = index.stop if index.stop is not None else len(self)
             if self.is_bigram:
-                return _HashKey(self.token_ids[start : stop + 1], is_bigram=True)
-            return _HashKey(self.token_ids[start:stop])
+                return _HashKey(
+                    self.token_ids[start : stop + 1],
+                    is_bigram=True,
+                    cache_salt=self.cache_salt,
+                )
+            return _HashKey(self.token_ids[start:stop], cache_salt=self.cache_salt)
         if self.is_bigram:
             return (self.token_ids[index], self.token_ids[index + 1])
         return self.token_ids[index]
@@ -317,6 +323,24 @@ class TestComputeNodeHashValues(unittest.TestCase):
                     compute_node_hash_values(node, page_size=page_size),
                     _legacy_page_hashes(key, page_size=page_size),
                 )
+
+    def test_cache_salt_seeds_root_hash_chain(self):
+        key = _HashKey(array("q", range(1, 17)), cache_salt="tenant-a")
+        seed = hashlib.sha256(b"sglang-cache-salt-v1\0tenant-a").hexdigest()
+        self.assertEqual(
+            compute_node_event_hash_values(self._make_node(key), page_size=8),
+            _legacy_page_hashes(key, page_size=8, prior_hash=seed),
+        )
+        self.assertEqual(
+            compute_node_hash_values(self._make_node(key), page_size=8),
+            _legacy_page_hashes(key, page_size=8),
+        )
+
+        other = _HashKey(array("q", range(1, 17)), cache_salt="tenant-b")
+        self.assertNotEqual(
+            compute_node_event_hash_values(self._make_node(key), page_size=8),
+            compute_node_event_hash_values(self._make_node(other), page_size=8),
+        )
 
     def test_parent_hash_is_used_only_when_parent_has_nonempty_key_and_hash(self):
         parent = MagicMock()

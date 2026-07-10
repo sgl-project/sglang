@@ -956,7 +956,12 @@ class HiRadixCache(RadixCache):
             token_ids = []
             for n in chain:
                 token_ids.extend(n.key.token_ids)
-        key = RadixKey(token_ids, top.key.extra_key, top.key.is_bigram)
+        key = RadixKey(
+            token_ids,
+            top.key.extra_key,
+            top.key.is_bigram,
+            cache_salt=top.key.cache_salt,
+        )
 
         if all(n.hash_value is not None for n in chain):
             hash_value = []
@@ -1400,6 +1405,7 @@ class HiRadixCache(RadixCache):
             new_input_tokens,
             extra_key=last_host_node.key.extra_key,
             is_bigram=self.is_eagle,
+            cache_salt=last_host_node.key.cache_salt,
         ).page_aligned(self.page_size)
         if len(prefetch_key) < self.prefetch_threshold:
             return 0
@@ -1685,6 +1691,7 @@ class HiRadixCache(RadixCache):
             new_input_tokens,
             extra_key=last_host_node.key.extra_key,
             is_bigram=self.is_eagle,
+            cache_salt=last_host_node.key.cache_salt,
         )
         # align the number of fetching tokens to the page size
         prefetch_key = prefetch_key.page_aligned(self.page_size)

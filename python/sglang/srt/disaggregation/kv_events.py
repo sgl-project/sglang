@@ -88,6 +88,12 @@ class StorageMedium(str, enum.Enum):
     EXTERNAL = "EXTERNAL"  # L4: shared / remote pool (e.g. Mooncake)
 
 
+class BlockStoredMetadata(msgspec.Struct, omit_defaults=True, gc=False):
+    """Typed request metadata attached to a stored KV block."""
+
+    cache_salt: str
+
+
 class OffloadedState:
     """
     OffloadedState represents the state of a KV cache block offloaded to the hicache.
@@ -112,6 +118,16 @@ class BlockStored(KVCacheEvent):
     block_size: int
     lora_id: Optional[int]
     medium: Optional[str] = None
+
+
+class BlockStoredWithMetadata(BlockStored, tag="BlockStored", kw_only=True):
+    """BlockStored wire extension used only when typed metadata is present.
+
+    A separate struct keeps unsalted events at their legacy array length; an
+    optional field on BlockStored would still serialize a trailing null.
+    """
+
+    metadata: BlockStoredMetadata
 
 
 class BlockRemoved(KVCacheEvent):

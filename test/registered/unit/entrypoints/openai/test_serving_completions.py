@@ -65,6 +65,18 @@ class ServingCompletionTestCase(unittest.TestCase):
         internal, _ = self.sc._convert_to_internal_request(req)
         self.assertEqual(internal.input_ids, [1, 2, 3, 4])
 
+    def test_cache_salt_and_extra_key_remain_distinct(self):
+        req = CompletionRequest(
+            model="x",
+            prompt=[1, 2, 3, 4],
+            max_tokens=1,
+            cache_salt="tenant-a",
+            extra_key="classification",
+        )
+        internal, _ = self.sc._convert_to_internal_request(req)
+        self.assertEqual(internal.cache_salt, "tenant-a")
+        self.assertEqual(internal.extra_key, "classification")
+
     # ---------- echo-handling ----------
     def test_echo_with_list_of_strings_streaming(self):
         req = CompletionRequest(

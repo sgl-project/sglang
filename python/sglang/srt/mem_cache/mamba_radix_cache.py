@@ -625,7 +625,11 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
 
             result = self.insert(
                 InsertParams(
-                    key=RadixKey(token_ids[:page_aligned_len], req.extra_key),
+                    key=RadixKey(
+                        token_ids[:page_aligned_len],
+                        req.extra_key,
+                        cache_salt=getattr(req, "cache_salt", None),
+                    ),
                     value=page_aligned_kv_indices,
                     mamba_value=mamba_value,
                     prev_prefix_len=req.cache_protected_len,
@@ -732,7 +736,11 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         result = self.insert(
             InsertParams(
-                key=RadixKey(page_aligned_token_ids, req.extra_key),
+                key=RadixKey(
+                    page_aligned_token_ids,
+                    req.extra_key,
+                    cache_salt=getattr(req, "cache_salt", None),
+                ),
                 value=page_aligned_kv_indices,
                 mamba_value=mamba_value_donated,
                 prev_prefix_len=req.cache_protected_len,
@@ -745,7 +753,13 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         # The prefix indices could be updated, reuse it
         match_result = self.match_prefix(
-            MatchPrefixParams(key=RadixKey(page_aligned_token_ids, req.extra_key))
+            MatchPrefixParams(
+                key=RadixKey(
+                    page_aligned_token_ids,
+                    req.extra_key,
+                    cache_salt=getattr(req, "cache_salt", None),
+                )
+            )
         )
         new_indices, new_last_node = (
             match_result.device_indices,

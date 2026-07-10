@@ -215,7 +215,12 @@ class FlexKVRadixCache(RadixCache):
         else:
             token_ids_snap = token_ids
         self._load_markers[req.rid] = _LoadBackMarker(
-            key=RadixKey(token_ids_snap, key.extra_key, key.is_bigram),
+            key=RadixKey(
+                token_ids_snap,
+                key.extra_key,
+                key.is_bigram,
+                cache_salt=key.cache_salt,
+            ),
             value_numel=device_len,
         )
         return MatchResult(
@@ -412,7 +417,13 @@ class FlexKVRadixCache(RadixCache):
         # Anchor on the new last_device_node so FlexKV's lock matches
         # the node we'll later unlock when the store completes.
         match_result = super().match_prefix(
-            MatchPrefixParams(key=RadixKey(token_ids, req.extra_key))
+            MatchPrefixParams(
+                key=RadixKey(
+                    token_ids,
+                    req.extra_key,
+                    cache_salt=getattr(req, "cache_salt", None),
+                )
+            )
         )
         new_last_node = match_result.last_device_node
         if new_last_node is None:

@@ -443,6 +443,37 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         req.normalize_batch_and_arguments()
         self.assertEqual(req.extra_key, "solo")
 
+    def test_cache_salt_normalization(self):
+        req = GenerateReqInput(
+            text=["Hello", "World"],
+            cache_salt=["tenant-A", ""],
+            sampling_params=[{}, {}],
+        )
+        req.normalize_batch_and_arguments()
+        self.assertEqual(req.cache_salt, ["tenant-A", None])
+        self.assertEqual(req[0].cache_salt, "tenant-A")
+        self.assertIsNone(req[1].cache_salt)
+
+        req = GenerateReqInput(
+            text=["Hello", "World"],
+            cache_salt="shared",
+            sampling_params={"n": 2},
+        )
+        req.normalize_batch_and_arguments()
+        self.assertEqual(req.cache_salt, ["shared", "shared"] * 2)
+
+        req = GenerateReqInput(text="Hello", cache_salt="")
+        req.normalize_batch_and_arguments()
+        self.assertIsNone(req.cache_salt)
+
+        req = GenerateReqInput(
+            text=["Hello", "World"],
+            cache_salt=["only-one"],
+            sampling_params=[{}, {}],
+        )
+        with self.assertRaisesRegex(ValueError, "batch size"):
+            req.normalize_batch_and_arguments()
+
     def test_logprob_parameters_normalization(self):
         """Test normalization of logprob-related parameters."""
         # Test single example

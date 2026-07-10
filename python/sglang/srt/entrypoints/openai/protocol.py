@@ -379,7 +379,7 @@ class CompletionRequest(BaseModel):
 
     # For request id
     rid: Optional[Union[List[str], str]] = None
-    # Extra key for classifying the request (e.g. cache_salt)
+    # Extra key for caller-defined request classification
     extra_key: Optional[Union[List[str], str]] = None
     # Cache salt for request caching
     cache_salt: Optional[Union[List[str], str]] = None
@@ -808,7 +808,7 @@ class ChatCompletionRequest(BaseModel):
 
     # For request id
     rid: Optional[Union[List[str], str]] = None
-    # Extra key for classifying the request (e.g. cache_salt)
+    # Extra key for caller-defined request classification
     extra_key: Optional[Union[List[str], str]] = None
     # Cache salt for request caching
     cache_salt: Optional[Union[List[str], str]] = None
@@ -1483,7 +1483,7 @@ class ResponsesRequest(BaseModel):
     priority: int = Field(default=0, description="Request priority")
     extra_key: Optional[str] = Field(
         default=None,
-        description="Extra key for classifying the request (e.g. cache_salt)",
+        description="Extra key for caller-defined request classification",
     )
     cache_salt: Optional[str] = Field(
         default=None, description="Cache salt for request caching"

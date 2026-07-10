@@ -1896,6 +1896,7 @@ class HiMambaRadixCache(MambaRadixCache):
             RadixKey(
                 token_ids=fetched_token_ids,
                 extra_key=last_host_node.key.extra_key,
+                cache_salt=last_host_node.key.cache_salt,
             ),
             written_indices,
             hash_value[: min_completed_tokens // self.page_size],

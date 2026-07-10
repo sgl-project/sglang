@@ -99,6 +99,16 @@ class TestRadixKey(unittest.TestCase):
         self.assertEqual(list(key[2:2].token_ids), [])  # Empty slice
         self.assertEqual(list(key[:].token_ids), [1, 2, 3, 4, 5])  # Full slice
 
+    def test_cache_salt_is_preserved_by_slicing(self):
+        key = RadixKey(
+            array("q", [1, 2, 3, 4]),
+            extra_key="classification",
+            cache_salt="tenant-a",
+        )
+        sliced = key[1:3]
+        self.assertEqual(sliced.extra_key, "classification")
+        self.assertEqual(sliced.cache_salt, "tenant-a")
+
     def test_getitem_invalid_index(self):
         """Test __getitem__ with invalid indices."""
         key = RadixKey(array("q", [1, 2, 3]))
@@ -526,6 +536,77 @@ class TestRadixCache(unittest.TestCase):
 
         # Non-existent extra_key should not match
         self.assertEqual(len(result4.device_indices), 0)
+
+    def test_cache_salt_isolation_is_independent_of_extra_key(self):
+        cache = RadixCache.create_simulated()
+        tokens = array("q", [1, 2, 3])
+
+        cache.insert(
+            InsertParams(
+                key=RadixKey(tokens, extra_key="bc", cache_salt="a"),
+                value=torch.tensor([10, 20, 30], dtype=torch.int64),
+            )
+        )
+        cache.insert(
+            InsertParams(
+                key=RadixKey(tokens, extra_key="c", cache_salt="ab"),
+                value=torch.tensor([40, 50, 60], dtype=torch.int64),
+            )
+        )
+
+        first = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(tokens, extra_key="bc", cache_salt="a"))
+        )
+        second = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(tokens, extra_key="c", cache_salt="ab"))
+        )
+        torch.testing.assert_close(
+            first.device_indices, torch.tensor([10, 20, 30], dtype=torch.int64)
+        )
+        torch.testing.assert_close(
+            second.device_indices, torch.tensor([40, 50, 60], dtype=torch.int64)
+        )
+
+    def test_cache_salt_is_included_in_store_and_remove_events(self):
+        mock_allocator = unittest.mock.Mock()
+        mock_allocator.device = torch.device("cpu")
+        cache = RadixCache.create_simulated(
+            mock_allocator=mock_allocator,
+            page_size=2,
+            enable_kv_cache_events=True,
+        )
+        tokens = array("q", [1, 2, 3, 4])
+        cache.insert(
+            InsertParams(
+                key=RadixKey(tokens, cache_salt="tenant-a"),
+                value=torch.tensor([10, 20, 30, 40], dtype=torch.int64),
+            )
+        )
+        cache.evict(EvictParams(num_tokens=len(tokens)))
+        events = cache.take_events()
+        stored = [event for event in events if isinstance(event, BlockStored)]
+        removed = [event for event in events if isinstance(event, BlockRemoved)]
+
+        self.assertEqual(len(stored), 2)
+        self.assertTrue(
+            all(event.metadata.cache_salt == "tenant-a" for event in stored)
+        )
+        self.assertEqual(stored[1].parent_block_hash, stored[0].block_hashes[0])
+        self.assertEqual(
+            removed[0].block_hashes,
+            [event.block_hashes[0] for event in stored],
+        )
+
+        unsalted = RadixCache.create_simulated(page_size=2, enable_kv_cache_events=True)
+        unsalted.insert(InsertParams(key=RadixKey(tokens), value=None))
+        unsalted_hashes = [
+            event.block_hashes[0]
+            for event in unsalted.take_events()
+            if isinstance(event, BlockStored)
+        ]
+        self.assertNotEqual(
+            unsalted_hashes, [event.block_hashes[0] for event in stored]
+        )
 
     def test_lock_ref_operations(self):
         """Test lock reference counting operations."""
