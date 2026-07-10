@@ -5107,7 +5107,7 @@ class ServerArgs:
 
         if model_arch in [
             "DeepseekV3ForCausalLM",
-            "GFusionModelLM",
+            "GFusionForDiffusionLM",
             "DeepseekV32ForCausalLM",
             "KimiK25ForConditionalGeneration",
             "MistralLarge3ForCausalLM",
@@ -7830,7 +7830,7 @@ class ServerArgs:
                     is_deepseek_model = model_arch in [
                         "DeepseekV2ForCausalLM",
                         "DeepseekV3ForCausalLM",
-                        "GFusionModelLM",
+                        "GFusionForDiffusionLM",
                         "DeepseekV32ForCausalLM",
                         "MistralLarge3ForCausalLM",
                         "PixtralForConditionalGeneration",
