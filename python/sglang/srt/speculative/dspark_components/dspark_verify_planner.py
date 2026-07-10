@@ -23,11 +23,7 @@ from sglang.srt.speculative.dspark_components.dspark_scheduler import (
     VerifyBudgetDecision,
     build_sps_cost_table,
 )
-from sglang.srt.speculative.dspark_components.dspark_sps_online import (
-    OnlineSpsProfiler,
-)
 from sglang.srt.speculative.dspark_components.dspark_sps_table import (
-    SpsAdditiveCostTable,
     SpsCostTable,
     is_uninitialized_sps_table,
 )
@@ -148,25 +144,6 @@ class DSparkVerifyPlanner:
                 self._ragged_verify_mode is RaggedVerifyMode.COMPACT
                 and is_uninitialized_sps_table(sps_table)
             )
-            online_profiler = None
-            if envs.SGLANG_DSPARK_ENABLE_SPS_ONLINE_PROFILE.get():
-                if isinstance(sps_table, SpsAdditiveCostTable):
-                    raise ValueError(
-                        "SGLANG_DSPARK_ENABLE_SPS_ONLINE_PROFILE rebuilds a 1D "
-                        "diagonal SPS table and would overwrite the additive "
-                        "T(bs, K) prior loaded from "
-                        "--speculative-dspark-sps-table-path; run one or the "
-                        "other."
-                    )
-                online_profiler = OnlineSpsProfiler(
-                    initial_table=sps_table,
-                    rebuild_interval_steps=(
-                        envs.SGLANG_DSPARK_SPS_ONLINE_REBUILD_INTERVAL.get()
-                    ),
-                    min_bin_samples=(
-                        envs.SGLANG_DSPARK_SPS_ONLINE_MIN_BIN_SAMPLES.get()
-                    ),
-                )
             relay_lag_steps = (
                 0
                 if self.server_args.disable_overlap_schedule
@@ -177,12 +154,8 @@ class DSparkVerifyPlanner:
                 cfg=self._schedule_cfg,
                 model_runner=self.model_runner,
                 relay_lag_steps=relay_lag_steps,
-                online_profiler=online_profiler,
-                log_table_swaps=tp_rank == 0,
             )
-            self._dynamic_graph_tier = not is_dp_attention_enabled() and not (
-                online_profiler is not None and self.server_args.tp_size > 1
-            )
+            self._dynamic_graph_tier = not is_dp_attention_enabled()
             self._dp_tier_gather_enabled = (
                 self._ragged_verify_mode is RaggedVerifyMode.COMPACT
                 and is_dp_attention_enabled()
@@ -202,13 +175,11 @@ class DSparkVerifyPlanner:
                 )
                 logger.info(
                     "DSpark ragged-verify scheduler enabled (mode=%s, lag=%d, "
-                    "relay_lag=%d, sps_table=%s, online_sps_profile=%s, "
-                    "graph_tier=%s).",
+                    "relay_lag=%d, sps_table=%s, graph_tier=%s).",
                     self._ragged_verify_mode.value,
                     self._budget_planner.lag_steps,
                     relay_lag_steps,
                     sps_table_source,
-                    online_profiler is not None,
                     (
                         "dynamic"
                         if self._dynamic_graph_tier
@@ -217,17 +188,13 @@ class DSparkVerifyPlanner:
                         )
                     ),
                 )
-                if (
-                    isinstance(sps_table, SpsCostTable)
-                    and is_uninitialized_sps_table(sps_table)
-                    and online_profiler is None
+                if isinstance(sps_table, SpsCostTable) and is_uninitialized_sps_table(
+                    sps_table
                 ):
                     logger.warning(
-                        "DSpark SPS table is uninitialized (flat) and online "
-                        "profiling is disabled: the verify budget degenerates to "
-                        "verify-all (zero scheduling gain). Pass a profiled "
-                        "--speculative-dspark-sps-table-path or set "
-                        "SGLANG_DSPARK_ENABLE_SPS_ONLINE_PROFILE=1."
+                        "DSpark SPS table is uninitialized (flat): the verify "
+                        "budget degenerates to verify-all (zero scheduling gain). "
+                        "Pass a profiled --speculative-dspark-sps-table-path."
                     )
 
     def _require_prep_in_cuda_graph(self) -> None:

@@ -1690,8 +1690,7 @@ class ServerArgs:
         "sglang.benchmark.dspark_sps_profiler, consumed by the ragged-verify "
         "scheduler (cap-accept / compact). Omit for an uninitialized flat "
         "constant-SPS table: the budget degenerates to verify-all (zero throughput "
-        "gain by itself), which is also the cold start for online profiling "
-        "(SGLANG_DSPARK_ENABLE_SPS_ONLINE_PROFILE).",
+        "gain by itself).",
     ] = None
     speculative_dspark_confidence_sts_path: A[
         Optional[str],

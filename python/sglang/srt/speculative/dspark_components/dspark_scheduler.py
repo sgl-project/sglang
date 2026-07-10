@@ -8,9 +8,6 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.speculative.dspark_components.dspark_sps_online import (
-    OnlineSpsProfiler,
-)
 from sglang.srt.speculative.dspark_components.dspark_sps_table import (
     SpsAdditiveCostTable,
     SpsCostTable,
@@ -137,14 +134,10 @@ class HostConfidenceBudgetPlanner:
         cfg: DSparkScheduleConfig,
         model_runner,
         relay_lag_steps: int = 1,
-        online_profiler: Optional[OnlineSpsProfiler] = None,
-        log_table_swaps: bool = False,
     ) -> None:
         cfg.validate()
         self.sps_table = sps_table
         self.cfg = cfg
-        self._online_profiler = online_profiler
-        self._log_table_swaps = log_table_swaps
         self._model_runner = model_runner
         self.forced_budget_frac: Optional[float] = None
         self.last_decision: Optional[VerifyBudgetDecision] = None
@@ -186,10 +179,6 @@ class HostConfidenceBudgetPlanner:
             cfg=self.cfg,
         )
         self.last_decision = decision
-        if self._online_profiler is not None:
-            self._observe_online_step(
-                batch_tokens=int(survival.shape[0]) + decision.budget
-            )
         return decision.budget
 
     def take_last_decision(self) -> Optional[VerifyBudgetDecision]:
@@ -199,24 +188,6 @@ class HostConfidenceBudgetPlanner:
 
     def note_non_decode_step(self) -> None:
         self.last_decision = None
-        if self._online_profiler is not None:
-            self._online_profiler.note_non_decode_step()
-
-    def _observe_online_step(self, *, batch_tokens: int) -> None:
-        new_table = self._online_profiler.observe_step(batch_tokens=batch_tokens)
-        if new_table is None:
-            return
-        self.sps_table = new_table
-        if self._log_table_swaps:
-            logger.info(
-                "DSpark online SPS table swapped: %d/%d bins measured, "
-                "SPS range [%.3f, %.3f].",
-                self._online_profiler.num_measured_bins(),
-                self._online_profiler.num_bins(),
-                min(new_table.sample_steps_per_sec),
-                max(new_table.sample_steps_per_sec),
-            )
-            logger.debug("DSpark online SPS table json: %s", new_table.to_json())
 
     def _shift_to_lag(
         self,
