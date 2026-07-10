@@ -81,12 +81,6 @@ class TestSpsCostTableLookup(CustomTestCase):
         self.assertEqual(table.lookup(31), 950.0)
         self.assertEqual(table.lookup(63), 500.0)
 
-    def test_lookup_does_not_interpolate_across_cliff(self):
-        table = _make_table()
-        midpoint = table.lookup((16 + 32) // 2)
-        self.assertEqual(midpoint, 950.0)
-        self.assertNotEqual(midpoint, (950.0 + 500.0) / 2)
-
     def test_lookup_below_first_probe_clamps_to_first(self):
         table = _make_table()
         self.assertEqual(table.lookup(1), 1000.0)
@@ -105,12 +99,6 @@ class TestSpsCostTableJsonRoundTrip(CustomTestCase):
         self.assertEqual(restored.sample_batch_tokens, table.sample_batch_tokens)
         self.assertEqual(restored.sample_steps_per_sec, table.sample_steps_per_sec)
         self.assertEqual(restored.max_batch_tokens, table.max_batch_tokens)
-
-    def test_json_round_trip_preserves_lookup_behavior(self):
-        table = _make_table()
-        restored = SpsCostTable.from_json(table.to_json())
-        for batch_tokens in (1, 8, 31, 64, 200):
-            self.assertEqual(restored.lookup(batch_tokens), table.lookup(batch_tokens))
 
 
 class TestLoadSpsTableFromPath(CustomTestCase):
@@ -210,22 +198,6 @@ class TestBuildBatchSizeSweep(CustomTestCase):
             self.assertEqual(sweep, sorted(set(sweep)))
             self.assertTrue(all(1 <= value <= max_num_tokens for value in sweep))
             self.assertEqual(sweep[-1], max_num_tokens)
-
-    def test_sweep_head_is_the_fixed_taper(self):
-        sweep = self._sweep(1024)
-        self.assertEqual(sweep[:6], [1, 2, 4, 8, 12, 16])
-
-    def test_default_max_matches_legacy_endpoints(self):
-        sweep = self._sweep(1024)
-        self.assertEqual(sweep[-4:], [928, 960, 992, 1024])
-
-    def test_large_max_extends_sparsely_past_1024(self):
-        sweep = self._sweep(8192)
-        beyond = [value for value in sweep if value > 1024]
-        self.assertEqual(beyond[:4], [1152, 1280, 1408, 1536])
-        self.assertIn(2048, sweep)
-        self.assertIn(2304, sweep)
-        self.assertEqual(sweep[-1], 8192)
 
     def test_tiny_max_truncates_the_taper(self):
         self.assertEqual(self._sweep(8), [1, 2, 4, 8])

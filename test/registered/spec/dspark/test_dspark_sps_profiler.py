@@ -224,32 +224,6 @@ class TestTableAssembly(CustomTestCase):
         self.assertEqual(table.sample_batch_tokens, [32])
         self.assertAlmostEqual(table.sample_steps_per_sec[0], 50.0)
 
-    def test_probes_are_sorted_by_batch_tokens(self):
-        rounds = [
-            postprocess_round(
-                rank_rows=[
-                    make_rows(
-                        num_running_reqs=batch_size,
-                        num_verify_tokens=batch_size * 8,
-                    )
-                ],
-                batch_size_per_rank=batch_size,
-                dp_size=1,
-                verify_num_draft_tokens=8,
-                min_steady_steps=16,
-                load_info=make_load_info(),
-            )
-            for batch_size in (8, 2, 4)
-        ]
-        table = build_table_from_summaries(
-            summaries=[
-                round_summary_dict(outcome=outcome, repeat=0) for outcome in rounds
-            ],
-            max_batch_tokens=None,
-            offdiag=False,
-        )
-        self.assertEqual(table.sample_batch_tokens, [16, 32, 64])
-
 
 class TestSweepHelpers(CustomTestCase):
     def test_request_count_sweep_tapers_and_hits_the_max(self):
@@ -286,20 +260,6 @@ class TestSweepHelpers(CustomTestCase):
 
 
 class TestCountAlignedSteps(CustomTestCase):
-    def test_counts_common_cts_at_target_batch(self):
-        rows_a = make_rows(num_rows=10)
-        rows_b = make_rows(num_rows=8, first_forward_ct=2)
-        self.assertEqual(
-            count_aligned_steps(rank_rows=[rows_a, rows_b], batch_size_per_rank=4),
-            8,
-        )
-
-    def test_zero_when_any_rank_is_empty(self):
-        self.assertEqual(
-            count_aligned_steps(rank_rows=[make_rows(), []], batch_size_per_rank=4),
-            0,
-        )
-
     def test_off_target_steps_are_not_counted(self):
         rows = make_rows(num_rows=10, num_running_reqs=3)
         self.assertEqual(

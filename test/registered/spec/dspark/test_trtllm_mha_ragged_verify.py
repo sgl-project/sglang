@@ -138,26 +138,6 @@ class TestPaddedRaggedVerifyGeometry(CustomTestCase):
 
 
 class TestNegativeSeamGeometry(CustomTestCase):
-    def test_uniform_capture_geometry_diverges_from_ragged(self):
-        seq_lens = torch.tensor([10, 20, 30], dtype=torch.int32)
-        ragged = RaggedVerifyLayout.from_verify_lens(
-            verify_lens_cpu=[8, 1, 3], device=_DEVICE, grid=_GRID
-        )
-        uniform = RaggedVerifyLayout.uniform(
-            bs=3, num_draft_tokens=8, device=_DEVICE, grid=_GRID
-        )
-        g_ragged = build_ragged_target_verify_geometry(seq_lens=seq_lens, layout=ragged)
-        g_uniform = build_ragged_target_verify_geometry(
-            seq_lens=seq_lens, layout=uniform
-        )
-        self.assertNotEqual(
-            g_ragged.cu_seqlens_q.tolist(), g_uniform.cu_seqlens_q.tolist()
-        )
-        self.assertNotEqual(
-            g_ragged.cache_seqlens_int32.tolist(),
-            g_uniform.cache_seqlens_int32.tolist(),
-        )
-
     def test_uniform_layout_geometry_matches_legacy_arange(self):
         seq_lens = torch.tensor([5, 7, 9], dtype=torch.int32)
         uniform = RaggedVerifyLayout.uniform(

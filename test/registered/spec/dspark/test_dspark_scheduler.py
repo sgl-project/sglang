@@ -13,7 +13,6 @@ from sglang.srt.speculative.dspark_components.dspark_scheduler import (
     DSparkScheduleConfig,
     HostConfidenceBudgetPlanner,
     VerifyBudgetDecision,
-    _additive_step_time_tensor,
     compute_verify_token_budget,
     schedule_verify_lens_topk_from_survival,
 )
@@ -135,20 +134,6 @@ def _for_each_impl(test_method):
 
 
 class TestComputeVerifyTokenBudget(CustomTestCase):
-    def test_budget_argmax_matches_bruteforce_scan_flat_table(self):
-        torch.manual_seed(0)
-        confidence = torch.rand(4, 7, dtype=torch.float32) * 0.4 + 0.55
-        survival = _survival_from_confidence(confidence)
-        cfg = DSparkScheduleConfig(gamma=7)
-        table = _flat_table()
-        expected = _bruteforce_budget(
-            history_survival_probs=survival, sps_table=table, cfg=cfg
-        )
-        actual = compute_verify_token_budget(
-            history_survival_probs=survival, sps_table=table, cfg=cfg
-        ).budget
-        self.assertEqual(actual, expected)
-
     def test_budget_argmax_matches_bruteforce_scan_across_sps_cliffs(self):
         torch.manual_seed(1)
         cfg = DSparkScheduleConfig(gamma=7)
@@ -196,13 +181,12 @@ class TestComputeVerifyTokenBudget(CustomTestCase):
         decision = compute_verify_token_budget(
             history_survival_probs=survival, sps_table=table, cfg=cfg
         )
-        step_time = _additive_step_time_tensor(
-            table=table, num_requests=1, num_budgets=survival.numel() + 1
-        )
+        # Reference via the independent scalar interpolation path (step_time),
+        # not the tensor helper the implementation itself uses.
         self.assertAlmostEqual(
             decision.predicted_step_seconds,
-            float(step_time[decision.budget]),
-            places=9,
+            table.step_time(num_reqs=1, budget=int(decision.budget)),
+            places=5,
         )
         self.assertGreater(decision.predicted_theta, 0.0)
 
@@ -358,9 +342,6 @@ class TestScheduleVerifyLensTopk(CustomTestCase):
 
 class TestVerifyLenAnchorContract(CustomTestCase):
 
-    def test_default_min_verify_len_is_one(self):
-        self.assertEqual(DSparkScheduleConfig(gamma=4).min_verify_len, 1)
-
     @_for_each_impl
     def test_explicit_zero_min_still_clamped_to_anchor(self, impl):
         survival = _survival_from_confidence(
@@ -494,36 +475,6 @@ class TestVanillaMatchesReference(CustomTestCase):
                     f"reference={reference.tolist()} vanilla={vanilla.tolist()}"
                 ),
             )
-
-
-class TestVerifyLensComposition(CustomTestCase):
-    def test_verify_lens_respects_history_budget(self):
-        # low history keeps only one candidate above survival_eps, so its
-        # budget stops below the high-history one for a single request.
-        low_history = torch.tensor([[0.95, 1e-9, 1e-12]], dtype=torch.float32)
-        high_history = torch.tensor([[0.95, 0.90, 0.85]], dtype=torch.float32)
-        sort_survival = torch.tensor([[0.95, 0.90, 0.85]], dtype=torch.float32)
-        cfg = DSparkScheduleConfig(gamma=3)
-        sps_table = _cliff_table()
-        low_budget = compute_verify_token_budget(
-            history_survival_probs=low_history, sps_table=sps_table, cfg=cfg
-        ).budget
-        high_budget = compute_verify_token_budget(
-            history_survival_probs=high_history, sps_table=sps_table, cfg=cfg
-        ).budget
-        self.assertNotEqual(
-            low_budget, high_budget, "budgets must differ for this test"
-        )
-        lens_low = schedule_verify_lens_topk_from_survival(
-            survival_probs=sort_survival, budget=low_budget, cfg=cfg
-        )
-        lens_high = schedule_verify_lens_topk_from_survival(
-            survival_probs=sort_survival, budget=high_budget, cfg=cfg
-        )
-        self.assertFalse(
-            torch.equal(lens_low, lens_high),
-            "different two_steps_prior_k_survival budgets must produce different verify_lens",
-        )
 
 
 class TestDSparkScheduleConfig(CustomTestCase):

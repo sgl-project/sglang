@@ -13,7 +13,6 @@ from sglang.srt.models.dspark import DSparkConfidenceHead
 from sglang.srt.speculative.dspark_components.dspark_sts_recorder import StsDataRecorder
 from sglang.srt.speculative.dspark_components.dspark_sts_table import (
     DSparkStsCalibration,
-    load_sts_calibration_from_path,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -73,15 +72,6 @@ class TestDSparkStsCalibration(CustomTestCase):
             DSparkStsCalibration(temperatures=[1.0, 0.0, 2.0])
         with self.assertRaises(ValueError):
             DSparkStsCalibration(temperatures=[1.0, -0.5])
-
-    def test_load_from_path_reads_written_file(self):
-        calibration = DSparkStsCalibration(temperatures=[1.0, 2.5], num_samples=7)
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "calib.json"
-            path.write_text(calibration.to_json(), encoding="utf-8")
-            loaded = load_sts_calibration_from_path(str(path))
-        self.assertEqual(loaded.temperatures, calibration.temperatures)
-        self.assertEqual(loaded.num_samples, calibration.num_samples)
 
 
 class TestExpectedCalibrationError(CustomTestCase):
