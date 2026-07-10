@@ -274,7 +274,6 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         tree_mask_buf, position_buf = (
             self.target_worker.model_runner.attn_backend.get_verify_buffers_to_fill_after_draft()
         )
-
         (
             tree_mask,
             position,
