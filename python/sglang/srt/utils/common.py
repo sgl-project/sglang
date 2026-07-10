@@ -2721,19 +2721,24 @@ class SafeUnpickler(pickle.Unpickler):
         # --- multiprocessing ---
         "multiprocessing.resource_sharer.",
         "multiprocessing.reduction.",
+        "multiprocessing.",  # for shared memory pickled objects
         "pickletools.",
         # --- PEFT / LoRA ---
         "peft.",
         "transformers.",
         "huggingface_hub.",
-        # --- SGLang & Unitest ---
-        "sglang.srt.weight_sync.tensor_bucket.",
-        "sglang.srt.model_executor.model_runner.",
-        "sglang.srt.layers.",
-        "sglang.srt.utils.",
-        "sglang.srt.disaggregation.",
-        "sglang.srt.managers.",
+        # --- numpy ---
+        "numpy.",
+        # --- SGLang ---
+        "sglang.srt.",
+        "sglang.lang.",
         "torch_npu.",
+        # --- IPC frameworks (ZMQ / msgspec) ---
+        # These serialize data structures, not executable code. Safe to allow
+        # for legitimate inter-process communication channels.
+        "msgspec.",
+        "zmq.",
+        "pyzmq.",
     }
 
     DENY_CLASSES = {
