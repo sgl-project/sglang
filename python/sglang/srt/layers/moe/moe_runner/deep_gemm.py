@@ -632,7 +632,9 @@ def _pre_permute_standard_contig(
     )
     running_state["all_tokens"] = all_tokens
 
-    input_tensor = torch.zeros((all_tokens, K), device=device, dtype=q.dtype)
+    # Pad slots (m_indices == -1) are skipped by the grouped GEMM, so the
+    # buffer needs no zero fill.
+    input_tensor = torch.empty((all_tokens, K), device=device, dtype=q.dtype)
     if ue8m0:
         input_tensor_scale = torch.zeros(
             (ceil_div(K // 128, 4), all_tokens), device=device, dtype=torch.int
