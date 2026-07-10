@@ -849,16 +849,10 @@ class DefaultModelLoader(BaseModelLoader):
                     quant_method.process_weights_after_loading(module)
 
 
-def restore_weights_before_loading(model, target_device):
-    """Return quant state to its checkpoint layout before a weight reload.
-
-    The inverse counterpart of the process_weights_after_loading loop above:
-    quant methods that latch flags or repack parameters during processing opt
-    in via a restore_weights_before_loading hook, so a subsequent
-    load + process pass consumes the refilled checkpoint bytes exactly like
-    initial loading. A no-op for methods without the hook (and therefore at
-    initial load, where nothing has been processed yet).
-    """
+def restore_weights_before_loading(
+    model: nn.Module, target_device: torch.device
+) -> None:
+    """Restore quantized modules to their checkpoint-loading state."""
     for _, module in model.named_modules():
         quant_method = getattr(module, "quant_method", None)
         if quant_method is not None and hasattr(
