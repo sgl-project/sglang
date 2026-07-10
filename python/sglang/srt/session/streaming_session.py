@@ -432,6 +432,15 @@ class StreamingSession(BasePrefixCache):
                 self.inner.dec_lock_ref(lock_node)
 
         if slot.is_holding_kv:
+            assert protected_len % self.page_size == 0, (
+                f"protected_len must be page-aligned, got {protected_len} "
+                f"with page_size={self.page_size}"
+            )
+            # NPU keeps real-lens (non page-aligned) kv_allocated_len (op2).
+            assert _is_npu or slot.kv.kv_allocated_len % self.page_size == 0, (
+                f"kv_allocated_len must be page-aligned, got "
+                f"{slot.kv.kv_allocated_len} with page_size={self.page_size}"
+            )
             start = protected_len
             end = slot.kv.kv_allocated_len
             if start < end:
@@ -537,6 +546,10 @@ class StreamingSession(BasePrefixCache):
         ceil_align(prefix_len)) stays allocated and the watermark keeps the
         page-aligned account.
         """
+        assert prefix_len % self.page_size == 0, (
+            f"prefix_len must be page-aligned, got {prefix_len} "
+            f"with page_size={self.page_size}"
+        )
         bookkeeping_page_size = 1 if _is_npu else self.page_size
         allocated_after_free = min(
             slot.kv.kv_allocated_len, ceil_align(prefix_len, bookkeeping_page_size)
@@ -563,6 +576,11 @@ class StreamingSession(BasePrefixCache):
         self._free_kv_aligned(req.req_pool_idx, target, req.kv.kv_allocated_len)
         req.kv.kv_allocated_len = min(
             req.kv.kv_allocated_len, ceil_align(target, bookkeeping_page_size)
+        )
+        # NPU keeps real-lens (non page-aligned) kv_allocated_len (op2).
+        assert _is_npu or req.kv.kv_allocated_len % self.page_size == 0, (
+            f"kv_allocated_len must stay page-aligned after trim, got "
+            f"{req.kv.kv_allocated_len} with page_size={self.page_size}"
         )
         req.kv_committed_len = min(req.kv_committed_len, target)
         req.kv.swa_evicted_seqlen = min(req.kv.swa_evicted_seqlen, target)
