@@ -222,11 +222,8 @@ export const Qwen36Deployment = () => {
       }
     }
 
-    if (hardware === 'b200') {
+    if (hardware === 'b200' || hardware === 'b300') {
       cmd += ` \\\n  --attention-backend trtllm_mha`;
-    }
-    if (hardware === 'b300') {
-      cmd += ` \\\n  --attention-backend flashinfer`;
     }
     if (hwConfig.mem !== undefined) {
       cmd += ` \\\n  --mem-fraction-static ${hwConfig.mem}`;

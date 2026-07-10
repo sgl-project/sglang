@@ -11,23 +11,24 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.kernels.ops.kvcache.trtllm_mha_graph_metadata import (
+    Q_MODE_NONE,
+    Q_MODE_STRIDED,
+    update_trtllm_mha_graph_metadata,
+)
+from sglang.kernels.ops.kvcache.trtllm_mha_page_table import (
+    build_trtllm_mha_page_table,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.flashinfer_backend import (
     FlashInferAttnBackend,
     FlashInferMultiStepDraftBackend,
 )
-from sglang.srt.layers.attention.triton_ops.trtllm_mha_graph_metadata import (
-    Q_MODE_NONE,
-    Q_MODE_STRIDED,
-    update_trtllm_mha_graph_metadata,
-)
-from sglang.srt.layers.attention.triton_ops.trtllm_mha_page_table import (
-    build_trtllm_mha_page_table,
-)
 from sglang.srt.layers.attention.utils import canonicalize_stride
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.runtime_context import get_buffer
 from sglang.srt.utils import is_flashinfer_available
 from sglang.srt.utils.common import is_sm90_supported, is_sm120_supported
 
@@ -47,7 +48,6 @@ if TYPE_CHECKING:
 DEFAULT_WORKSPACE_SIZE_MB = 512
 
 # Reuse this workspace buffer across all TRTLLM MHA wrappers
-global_zero_init_workspace_buffer = None
 
 
 @dataclass
@@ -113,14 +113,14 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         # Workspace allocation
         self.workspace_size = workspace_size_bytes
         # Allocate buffers
-        global global_zero_init_workspace_buffer
-        if global_zero_init_workspace_buffer is None:
-            global_zero_init_workspace_buffer = torch.zeros(
+        self.workspace_buffer = get_buffer(
+            "trtllm_mha_zero_workspace",
+            lambda: torch.zeros(
                 self.workspace_size,
                 dtype=torch.uint8,
                 device=model_runner.device,
-            )
-        self.workspace_buffer = global_zero_init_workspace_buffer
+            ),
+        )
 
         # CUDA graph state
         self.decode_cuda_graph_metadata = {}

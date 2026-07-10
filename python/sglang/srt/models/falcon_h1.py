@@ -33,7 +33,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.runtime_context import get_flags, get_parallel
+from sglang.srt.runtime_context import get_parallel, get_server_args, get_stream
 from sglang.srt.utils import add_prefix, is_cuda, make_layers
 
 logger = logging.getLogger(__name__)
@@ -387,7 +387,7 @@ class FalconH1Model(nn.Module):
         super().__init__()
         self.config = config
 
-        alt_stream = torch.cuda.Stream() if _is_cuda else None
+        alt_stream = get_stream("alt") if _is_cuda else None
         self.embedding_multiplier = config.embedding_multiplier
 
         self.embed_tokens = VocabParallelEmbedding(
@@ -477,7 +477,7 @@ class FalconH1ForCausalLM(nn.Module):
                 quant_config=quant_config,
                 org_num_embeddings=config.vocab_size,
                 prefix=add_prefix("lm_head", prefix),
-                use_attn_tp_group=get_flags().enable_dp_lm_head,
+                use_attn_tp_group=get_server_args().enable_dp_lm_head,
             )
         self.lm_head = self.lm_head.float()
         self.lm_head_multiplier = config.lm_head_multiplier

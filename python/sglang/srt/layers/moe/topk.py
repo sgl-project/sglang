@@ -116,7 +116,6 @@ from sglang.srt.utils import (
     is_npu,
     is_xpu,
 )
-from sglang.srt.utils.patch_torch import register_fake_if_exists
 
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 
@@ -144,8 +143,6 @@ _skip_hip_pad_mask = get_bool_env_var("SGLANG_MORI_NO_PAD_MASK", "False")
 
 
 if _is_cuda:
-    from sgl_kernel import moe_fused_gate
-
     try:
         from flashinfer.fused_moe import fused_topk_deepseek as _fused_topk_deepseek
 
@@ -182,7 +179,7 @@ if _is_cuda:
         fused_topk_deepseek = None
 
 if _is_cuda or _is_hip or _is_xpu:
-    from sgl_kernel import topk_softmax
+    from sglang.kernels.ops.moe import topk_softmax
 
     try:
         from sgl_kernel import topk_sigmoid
@@ -398,11 +395,10 @@ class TopK(MultiPlatformOp):
             assert num_expert_group is not None and topk_group is not None
 
         self.layer_id = layer_id
-        from sglang.srt.server_args import get_global_server_args
+        from sglang.srt.runtime_context import get_server_args
 
         self.enable_deepep_waterfill = (
-            num_fused_shared_experts > 0
-            and get_global_server_args().enable_deepep_waterfill
+            num_fused_shared_experts > 0 and get_server_args().enable_deepep_waterfill
         )
 
         self.deepep_waterfill_balancer = None
@@ -478,9 +474,9 @@ class TopK(MultiPlatformOp):
         # ===== TO BE REFACTORED ====
         elif get_moe_runner_backend().is_experimental_sgl_trtllm():
             try:
-                from sglang.srt.server_args import get_global_server_args
+                from sglang.srt.runtime_context import get_server_args
 
-                use_standard_for_lora = bool(get_global_server_args().enable_lora)
+                use_standard_for_lora = bool(get_server_args().enable_lora)
             except ValueError:
                 use_standard_for_lora = False
             output_format = (
@@ -1259,10 +1255,10 @@ def _eplb_remap_enabled() -> bool:
     # initial expert placement is non-trivial, or there are redundant physical
     # experts. Otherwise the map is identity and the remap must be skipped (it is
     # both unnecessary and not well-defined over the padded region of topk_ids).
-    from sglang.srt.server_args import get_global_server_args
+    from sglang.srt.runtime_context import get_server_args
 
     try:
-        server_args = get_global_server_args()
+        server_args = get_server_args()
     except ValueError:
         # Global server args are not initialized outside the server runtime
         # (e.g. in unit tests that call select_experts directly). In that case
@@ -1486,24 +1482,28 @@ def biased_grouped_topk_gpu(
 
         return topk_weights, topk_ids
 
-    elif (
-        _is_cuda
-        # moe_fused_gate kernel ensures that num_experts/num_expert_group does not exceed MAX_VPT=32 now. And when kernel can handle MAX_VPT > 32, we can remove this assertion.
-        and experts_per_group <= 32
-        and is_power_of_two(num_experts)
-    ):
-        topk_weights, topk_ids = moe_fused_gate(
-            gating_output.to(dtype=torch.float32),
-            correction_bias,
-            num_expert_group,
-            topk_group,
-            topk,
-            num_fused_shared_experts,
-            routed_scaling_factor if routed_scaling_factor is not None else 1.0,
-            apply_routed_scaling_factor_on_output,
-        )
+    elif _is_cuda and num_expert_group > 1:
+        # CUDA grouped fallback (flashinfer unavailable / constraints unmet): the
+        # unified Triton router replaces the retired AOT moe_fused_gate kernel. It
+        # handles any experts-per-group (no MAX_VPT=32 cap) and any num_experts.
+        from sglang.jit_kernel.moe_fused_gate import moe_fused_gate as jit_grouped_gate
 
-        return topk_weights, topk_ids
+        return jit_grouped_gate(
+            gating_output.to(dtype=torch.float32),
+            correction_bias.to(dtype=torch.float32),
+            topk,
+            scoring_func="sigmoid",
+            num_fused_shared_experts=num_fused_shared_experts,
+            renormalize=renormalize,
+            routed_scaling_factor=(
+                routed_scaling_factor if routed_scaling_factor is not None else 1.0
+            ),
+            apply_routed_scaling_factor_on_output=bool(
+                apply_routed_scaling_factor_on_output
+            ),
+            num_expert_group=num_expert_group,
+            topk_group=topk_group,
+        )
 
     elif _use_aiter:
         assert not apply_routed_scaling_factor_on_output, "Not implemented"
@@ -2185,47 +2185,7 @@ def select_experts(
     return StandardTopKOutput(topk_weights, topk_ids, router_logits)
 
 
-# Register fake implementations for torch.compile support
-if _is_cuda:
-
-    @torch.library.register_fake("sgl_kernel::moe_fused_gate")
-    def _moe_fused_gate(
-        input_tensor,
-        bias,
-        num_expert_group,
-        topk_group,
-        topk,
-        num_fused_shared_experts=0,
-        routed_scaling_factor=0,
-        apply_routed_scaling_factor_on_output=False,
-    ):
-        num_rows = input_tensor.shape[0]
-        topk_weights = torch.empty(
-            (num_rows, topk), dtype=torch.float32, device=input_tensor.device
-        )
-        topk_ids = torch.empty(
-            (num_rows, topk), dtype=torch.int32, device=input_tensor.device
-        )
-        return topk_weights, topk_ids
-
-    @register_fake_if_exists("sgl_kernel::kimi_k2_moe_fused_gate")
-    def _kimi_k2_moe_fused_gate(
-        input_tensor,
-        bias,
-        topk,
-        renormalize,
-        routed_scaling_factor,
-        apply_routed_scaling_factor_on_output,
-    ):
-        num_rows = input_tensor.shape[0]
-        topk_weights = input_tensor.new_empty(
-            num_rows,
-            topk,
-            dtype=torch.float32,
-        )
-        topk_ids = input_tensor.new_empty(
-            num_rows,
-            topk,
-            dtype=torch.int32,
-        )
-        return topk_weights, topk_ids
+# NOTE: the AOT sgl_kernel::moe_fused_gate and sgl_kernel::kimi_k2_moe_fused_gate
+# ops (and their torch.compile fake impls) were retired here — both CUDA gate
+# paths now route through the unified Triton router (jit_kernel/moe_fused_gate.py),
+# whose Python impl is traceable directly, so no register_fake shim is needed.
