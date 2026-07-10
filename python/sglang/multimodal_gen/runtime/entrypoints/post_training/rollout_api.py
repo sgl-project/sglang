@@ -218,7 +218,9 @@ def _build_response(
 
     responses: list[RolloutResponse] = []
     for sample_idx in range(batch_size):
-        out_i = result.output[sample_idx].contiguous()
+        out_i = result.output[sample_idx]
+        if isinstance(out_i, torch.Tensor):
+            out_i = out_i.contiguous()
         serialized_generated_output = _maybe_serialize(out_i)
         if not rollout:
             responses.append(

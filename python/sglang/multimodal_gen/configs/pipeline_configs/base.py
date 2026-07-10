@@ -35,8 +35,8 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_sp_parallel_rank,
     get_sp_world_size,
 )
-from sglang.multimodal_gen.runtime.models.vision_utils import get_default_height_width
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.vision import get_default_height_width
 from sglang.multimodal_gen.utils import (
     FlexibleArgumentParser,
     StoreBoolean,
@@ -195,6 +195,7 @@ class PipelineConfig:
     cfg_policy: CFGPolicy = field(default_factory=CFGPolicy)
     generator_device: str | None = None
     flow_shift: float | None = None
+    scheduler_class_override: str | None = None
     disable_autocast: bool = False
 
     # Model configuration
@@ -710,6 +711,13 @@ class PipelineConfig:
             dest=f"{prefix_with_dot.replace('-', '_')}flow_shift",
             default=PipelineConfig.flow_shift,
             help="Flow shift parameter",
+        )
+        parser.add_argument(
+            f"--{prefix_with_dot}scheduler-class-override",
+            type=str,
+            dest=f"{prefix_with_dot.replace('-', '_')}scheduler_class_override",
+            default=PipelineConfig.scheduler_class_override,
+            help="Override the scheduler class from scheduler_config.json.",
         )
         parser.add_argument(
             f"--{prefix_with_dot}resolution",

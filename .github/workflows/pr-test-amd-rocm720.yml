@@ -39,6 +39,7 @@ on:
           - sgl-kernel-unit-test-2-gpu-amd-rocm720
           - stage-a-test-1-gpu-small-amd-rocm720
           - jit-kernel-unit-test-amd-rocm720
+          - jit-kernel-benchmark-test-amd-rocm720
           - stage-b-test-1-gpu-small-amd-rocm720
           - stage-b-test-1-gpu-small-amd-nondeterministic-rocm720
           - stage-b-test-1-gpu-small-amd-mi35x-rocm720
@@ -393,6 +394,44 @@ jobs:
         timeout-minutes: 30
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite jit-kernel-unit-test-amd ${{ inputs.continue_on_error && '--continue-on-error' || '' }}
+
+  jit-kernel-benchmark-test-amd-rocm720:
+    needs: [check-changes]
+    if: |
+      always() &&
+      (
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',jit-kernel-benchmark-test-amd-rocm720,')) ||
+        (
+          !(inputs.target_stage || inputs.target_stage_select) &&
+          needs.check-changes.outputs.jit_kernel == 'true'
+        )
+      )
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [linux-mi325-1gpu-sglang]
+    runs-on: ${{matrix.runner}}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
+
+      - name: Start CI container
+        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/amd/amd_ci_install_dependency.sh
+      - name: Run JIT kernel benchmarks
+        timeout-minutes: 30
+        run: |
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite jit-kernel-benchmark-test-amd ${{ inputs.continue_on_error && '--continue-on-error' || '' }}
 
   stage-b-test-1-gpu-small-amd-rocm720:
     needs: [check-changes]
@@ -1322,6 +1361,7 @@ jobs:
 
         stage-a-test-1-gpu-small-amd-rocm720,
         jit-kernel-unit-test-amd-rocm720,
+        jit-kernel-benchmark-test-amd-rocm720,
         stage-b-test-1-gpu-small-amd-rocm720,
         stage-b-test-1-gpu-small-amd-nondeterministic-rocm720,
         stage-b-test-1-gpu-small-amd-mi35x-rocm720,
