@@ -810,6 +810,18 @@ class SchedulerPPMixin:
                     + bad_consensus_bootstrapped_rids,
                 )
             )
+            # PP stages must admit the same request order. DSpark PD can make
+            # target-layer PP ranks finalize metadata at a different pace than
+            # non-target ranks, so relying on each rank's local queue order can
+            # pair one stage's positions with another stage's proxy hidden.
+            good_order = {
+                rid: i for i, rid in enumerate(good_consensus_bootstrapped_rids)
+            }
+            bad_order = {
+                rid: i for i, rid in enumerate(bad_consensus_bootstrapped_rids)
+            }
+            good_reqs.sort(key=lambda req: good_order.get(req.rid, len(good_order)))
+            failed_reqs.sort(key=lambda req: bad_order.get(req.rid, len(bad_order)))
             self.waiting_queue.extend(good_reqs)
             return [[req.rid for req in good_reqs], [req.rid for req in failed_reqs]]
         return None
@@ -836,12 +848,16 @@ class SchedulerPPMixin:
                 [KVPoll.WaitingForInput],
                 [KVPoll.Failed],
             )
-            good_bootstrapped_rids = list(
-                set(prev_good_bootstrapped_rids) & set(curr_good_bootstrapped_rids)
-            )
-            bad_bootstrapped_rids = list(
-                set(prev_bad_bootstrapped_rids) | set(curr_bad_bootstrapped_rids)
-            )
+            curr_good_set = set(curr_good_bootstrapped_rids)
+            good_bootstrapped_rids = [
+                rid for rid in prev_good_bootstrapped_rids if rid in curr_good_set
+            ]
+            bad_bootstrapped_rids = list(prev_bad_bootstrapped_rids)
+            seen_bad_rids = set(bad_bootstrapped_rids)
+            for rid in curr_bad_bootstrapped_rids:
+                if rid not in seen_bad_rids:
+                    bad_bootstrapped_rids.append(rid)
+                    seen_bad_rids.add(rid)
         return [good_bootstrapped_rids, bad_bootstrapped_rids]
 
     def _pp_pd_get_prefill_transferred_ids(self: Scheduler):
