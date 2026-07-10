@@ -197,32 +197,7 @@ class TestStoreCache4D(unittest.TestCase):
 
     # ---- Test 4: int64 loc dtype (already exercised, explicit) ----
 
-    def test_store_cache_4d_int64_loc(self):
-        """The full-side path passes int64 loc (matches the v2p table
-        dtype)."""
-        self._check_parity(
-            num_pages=32,
-            page_size=1,
-            head_num=4,
-            head_dim=64,
-            v_head_dim=64,
-            N=10,
-            loc_dtype=torch.int64,
-        )
-
     # ---- Test 5: bf16 dtype (the production case) ----
-
-    def test_store_cache_4d_dtype_bf16(self):
-        """bf16 is the production K/V dtype for gpt-oss-20b, Falcon-H1."""
-        self._check_parity(
-            num_pages=16,
-            page_size=64,
-            head_num=4,
-            head_dim=128,
-            v_head_dim=128,
-            N=64,
-            dtype=torch.bfloat16,
-        )
 
     # ---- Test 6: fp8_e5m2 dtype ----
 

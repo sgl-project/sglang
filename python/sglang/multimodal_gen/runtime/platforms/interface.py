@@ -42,7 +42,6 @@ class AttentionBackendEnum(enum.Enum):
     BLOCK_SPARSE_ATTN = enum.auto()
     RAIN_FUSION_ATTN = enum.auto()
     NO_ATTENTION = enum.auto()
-    AMX_ATTN = enum.auto()
 
     def __str__(self):
         return self.name.lower()
