@@ -777,8 +777,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         elif forward_mode.is_target_verify():
             metadata = self.target_verify_metadata[bs]
             seqlen_offset = metadata.max_seq_len_q
-            if self.topk > 1:
-                self._sync_verify_tree_mask(spec_info, metadata)
+            # Do NOT sync the tree mask here: this body is recorded into the
+            # CUDA graph, so a capture-time pointer-guarded copy would replay
+            # forever and clobber the producer's mask. The host-side hook
+            # update_verify_buffers_to_fill_after_draft owns the sync.
         elif forward_mode.is_draft_extend_v2():
             metadata = self.draft_extend_metadata[bs]
             # Static per-request query width, fixed by the captured graph shape.
@@ -827,48 +829,34 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         self.forward_metadata = metadata
 
-    def _sync_verify_tree_mask(
-        self, spec_info: Optional[SpecInput], metadata: TRTLLMMHAMetadata
-    ) -> None:
-        """Copy the QLEN_ONLY tree mask into the CUDA-graph buffer unless the
-        producer already wrote it there in place (the eagle worker writes
-        through get_verify_buffers_to_fill_after_draft)."""
-        mask = getattr(spec_info, "custom_mask", None)
-        if mask is None or metadata.tree_mask is None:
-            return
-        if mask.data_ptr() != self.cuda_graph_custom_mask.data_ptr():
-            numel = metadata.tree_mask.numel()
-            self.cuda_graph_custom_mask[:numel].copy_(mask.reshape(-1)[:numel])
-
     def get_verify_buffers_to_fill_after_draft(self):
         return [self.cuda_graph_custom_mask, None]
 
     def update_verify_buffers_to_fill_after_draft(
         self, spec_info: SpecInput, cuda_graph_bs: Optional[int]
     ):
-        """Re-sync mask-dependent state after the draft output is known.
+        """Sync the QLEN_ONLY tree mask after the draft output is known.
 
-        The packed-mask conversion runs inside the captured verify forward and
-        reads the persistent QLEN_ONLY buffer at replay, so the CUDA-graph
-        path only needs a copy when the producer wrote a different tensor.
+        Runs on the host every verify step (never recorded into a CUDA
+        graph). The captured verify forward reads the persistent
+        cuda_graph_custom_mask buffer at replay; the eagle worker normally
+        writes the mask there in place (get_verify_buffers_to_fill_after_draft),
+        so a copy is only needed when the producer used a different tensor.
+        Must not depend on self.forward_metadata: at this point it still
+        holds the draft-decode metadata, and the verify metadata body is
+        graph-recorded so it cannot do this sync itself.
         """
-        if self.topk <= 1:
+        if self.topk <= 1 or self.cuda_graph_custom_mask is None:
             return
-        metadata = self.forward_metadata
-        if metadata is None or metadata.tree_mask is None:
+        mask = getattr(spec_info, "custom_mask", None)
+        if mask is None:
             return
         if cuda_graph_bs is not None:
-            self._sync_verify_tree_mask(spec_info, metadata)
-        else:
-            mask = getattr(spec_info, "custom_mask", None)
-            if mask is not None:
-                bs, num_draft_tokens = (
-                    metadata.tree_mask.shape[0],
-                    metadata.tree_mask.shape[1],
-                )
-                metadata.tree_mask = mask[
-                    : bs * num_draft_tokens * num_draft_tokens
-                ].view(bs, num_draft_tokens, num_draft_tokens)
+            if mask.data_ptr() != self.cuda_graph_custom_mask.data_ptr():
+                numel = min(mask.numel(), self.cuda_graph_custom_mask.numel())
+                self.cuda_graph_custom_mask[:numel].copy_(mask.reshape(-1)[:numel])
+        # Eager verify builds metadata.tree_mask directly from
+        # spec_info.custom_mask in init_forward_metadata; nothing to sync.
 
     def get_cuda_graph_seq_len_fill_value(self) -> int:
         """Get the fill value for sequence lengths in CUDA graph."""
@@ -964,9 +952,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                         .repeat_interleave(self.topk)
                         .to(torch.int32)
                     )
-                    metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item() + (
-                        self.speculative_step_id + 1
-                    )
                     metadata.cu_seqlens_q = torch.arange(
                         0,
                         batch_size * self.topk + 1,
@@ -1013,9 +998,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 torch.int32
             )
             metadata.max_seq_len_q = tokens_per_req
-            metadata.max_seq_len_k = (
-                forward_batch.seq_lens_cpu.max().item() + tokens_per_req
-            )
             if self.topk > 1:
                 metadata.tree_mask = forward_batch.spec_info.custom_mask[
                     : batch_size * tokens_per_req * tokens_per_req
@@ -1347,9 +1329,13 @@ class TRTLLMHAAttnMultiStepDraftBackend(FlashInferMultiStepDraftBackend):
             and not forward_batch.forward_mode.is_idle()
             and forward_batch.spec_info is not None
         ):
-            self._update_draft_branch_page_tables(
-                forward_batch, forward_batch.seq_lens_cpu
-            )
+            # The backend opts out of CPU seq lens (needs_cpu_seq_lens=False),
+            # so eager mode may not carry them; the page-count bound needs a
+            # host value, so sync explicitly in that case.
+            seq_lens_cpu = forward_batch.seq_lens_cpu
+            if seq_lens_cpu is None:
+                seq_lens_cpu = forward_batch.seq_lens.cpu()
+            self._update_draft_branch_page_tables(forward_batch, seq_lens_cpu)
         for i in range(self.speculative_num_steps - 1):
             self.attn_backends[i].init_forward_metadata(forward_batch)
 

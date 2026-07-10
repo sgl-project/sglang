@@ -267,6 +267,30 @@ class TestTRTLLMMHASpecDecode(unittest.TestCase):
         )
         self.assertIs(backend.forward_metadata, metadata)
 
+    def test_verify_mask_sync_ignores_stale_draft_forward_metadata(self):
+        """Bug regression: the verify tree-mask sync must run in the host-side
+        update_verify_buffers_to_fill_after_draft hook without depending on
+        self.forward_metadata. At hook time forward_metadata still holds the
+        draft-decode metadata (tree_mask=None), and the verify metadata body
+        is recorded into the CUDA graph, so a sync gated on forward_metadata
+        never copies the producer's mask; the capture-time all-true dummy then
+        replays into every verify, inflating accept length and corrupting
+        outputs (observed E2E as GSM8K 0.04 vs 0.77 baseline)."""
+        backend = object.__new__(TRTLLMHAAttnBackend)
+        backend.topk = 8
+        backend.cuda_graph_custom_mask = torch.ones(2 * 4 * 4, dtype=torch.bool)
+        # Hook fires right after draft: forward_metadata is the draft's.
+        backend.forward_metadata = TRTLLMMHAMetadata()
+
+        producer_mask = torch.zeros(2 * 4 * 4, dtype=torch.bool)
+        spec_info = SimpleNamespace(custom_mask=producer_mask)
+
+        backend.update_verify_buffers_to_fill_after_draft(spec_info, cuda_graph_bs=2)
+
+        self.assertEqual(
+            backend.cuda_graph_custom_mask.tolist(), producer_mask.tolist()
+        )
+
     def test_multistep_draft_falls_back_to_seq_lens_when_cpu_copy_missing(self):
         backend = object.__new__(TRTLLMHAAttnMultiStepDraftBackend)
         backend.topk = 8
