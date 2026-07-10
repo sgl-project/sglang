@@ -150,9 +150,10 @@ def _find_def(tree: ast.AST, name: str) -> ast.AST | None:
 def _find_unique_def(
     tree: ast.AST, name: str, *, from_class: str | None = None, where: str
 ) -> ast.AST:
-    """Resolve ``def name`` and refuse ambiguity: with same-named defs in scope the
-    first-match lookup could silently cut the wrong body, so the caller must scope the
-    search with ``from_class``."""
+    """Resolve ``def name`` (or ``class name``) and refuse ambiguity: with same-named defs in
+    scope the first-match lookup could silently cut the wrong body, so the caller must scope
+    the search with ``from_class``."""
+    definition = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
     root: ast.AST = tree
     if from_class is not None:
         cls = _find_class(tree, from_class)
@@ -162,16 +163,14 @@ def _find_unique_def(
         top_level = [
             node
             for node in tree.body
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-            and node.name == name
+            if isinstance(node, definition) and node.name == name
         ]
         if len(top_level) == 1:
             return top_level[0]
     matches = [
         node
         for node in ast.walk(root)
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        and node.name == name
+        if isinstance(node, definition) and node.name == name
     ]
     assert matches, f"{name} not found in {where}"
     assert (
@@ -1191,8 +1190,15 @@ class Repro:
     def delete_file(self, path: str) -> "Repro":
         """Delete a source module that its symbols' relocation left empty (the chain deletes
         the leftover scaffolding-only file). Run after the moves that empty it. Refuses a
-        file that still holds anything beyond a docstring, imports, or a TYPE_CHECKING
-        block -- deleting live code is not a relocation."""
+        file that still holds anything beyond a docstring, imports, a TYPE_CHECKING block, or
+        a bare module ``logger`` -- deleting live code is not a relocation."""
+
+        def is_module_logger(stmt: ast.stmt) -> bool:
+            return (
+                isinstance(stmt, ast.Assign)
+                and stmt.value is not None
+                and ast.unparse(stmt.value) == "logging.getLogger(__name__)"
+            )
 
         def op(root: Path) -> None:
             target = root / path
@@ -1213,6 +1219,7 @@ class Repro:
                         and ast.unparse(stmt.test)
                         in ("TYPE_CHECKING", "typing.TYPE_CHECKING")
                     )
+                    or is_module_logger(stmt)
                 )
             ]
             assert not leftover, (

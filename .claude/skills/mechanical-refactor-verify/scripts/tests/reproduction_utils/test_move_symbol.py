@@ -357,4 +357,21 @@ def test_move_symbol_negative_dedent_indents_into_the_class(tmp_path: Path) -> N
     assert "    def helper(x):\n        return x\n" in (tmp_path / "dst.py").read_text()
 
 
+def test_move_symbol_relocates_a_top_level_class(tmp_path: Path) -> None:
+    """move_symbol relocates a whole top-level class (with its methods) verbatim."""
+    (tmp_path / "src.py").write_text(
+        "x = 1\n\n\nclass Widget:\n    def get(self, rank):\n        return rank\n"
+    )
+    (tmp_path / "dst.py").write_text("y = 2\n")
+    r = Repro("b", "t").move_symbol(
+        "Widget", src="src.py", dst="dst.py", into_class=None
+    )
+    _apply(r, tmp_path)
+    assert "class Widget:" not in (tmp_path / "src.py").read_text()
+    assert (
+        "class Widget:\n    def get(self, rank):\n        return rank\n"
+        in (tmp_path / "dst.py").read_text()
+    )
+
+
 # --- adversarial audit: leave_delegate stubs -------------------------------------

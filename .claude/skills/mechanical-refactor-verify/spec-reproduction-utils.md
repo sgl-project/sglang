@@ -94,8 +94,8 @@
 
 - `move_symbol(name, *, src, dst, into_class, from_class, dedent, drop_self_annotation,
   before, leave_delegate, delegate_name)`:
-    - cuts a `def` (functions only; a class moves via the extract primitives) with its
-      decorators; drops its own `@staticmethod`/`@classmethod`;
+    - cuts a `def` or a whole `class` (with its methods) with its decorators; drops its own
+      `@staticmethod`/`@classmethod`;
     - shifts indentation uniformly (negative `dedent` indents into a class);
     - pastes at a class end, at module level, or above the named sibling `before`;
     - same-named defs need `from_class`; an ambiguous name or missing anchor raises;
@@ -150,7 +150,7 @@
   `from old import … name …` (relative imports included) in place; module-level repaths
   fall out of add/remove + the sorter.
 - `delete_file(path)` — deletes a source module the relocation emptied; refuses anything
-  beyond a docstring, imports, or a `TYPE_CHECKING` block.
+  beyond a docstring, imports, a `TYPE_CHECKING` block, or a bare module `logger`.
 
 Cross-cutting guarantees:
 
