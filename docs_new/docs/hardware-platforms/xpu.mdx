@@ -162,8 +162,13 @@ python -m sglang.launch_server --model-path <MODEL> --device xpu \
 
 ### Enable Prefill Graph
 
-Prefill graph capture is **opt-in** on XPU and requires `torch.compile`
-and must be enabled explicitly:
+Prefill graph capture is **opt-in** on XPU and must be enabled explicitly.
+Two backends are available: `tc_piecewise` and `breakable`.
+
+#### tc_piecewise
+
+Uses `torch.compile` plus an XPU graph, one graph segment per token-length
+bucket:
 
 ```bash
 python -m sglang.launch_server --model-path <MODEL> --device xpu \
@@ -179,33 +184,22 @@ python -m sglang.launch_server --model-path <MODEL> --device xpu \
     --cuda-graph-tc-compiler inductor
 ```
 
-You can also configure both phases together with a single `--cuda-graph-config` JSON argument:
+#### breakable
 
-```bash
-python -m sglang.launch_server --model-path <MODEL> --device xpu \
-    --cuda-graph-config '{"decode":{"backend":"full"},"prefill":{"backend":"tc_piecewise","tc_compiler":"eager"}}'
-```
-
-### Enable Breakable Prefill Graph
-
-The `breakable` prefill backend captures the transformer stack as a series of
-real `torch.xpu.XPUGraph` **segments** separated by eager break points (at
-attention / MoE boundaries); attention metadata is recomputed at replay outside
-the captured segments. Unlike `tc_piecewise`, it does **not** use `torch.compile`.
-It is **opt-in** and enabled explicitly:
+Captures the transformer stack as segmented `XPUGraph`s with eager break points
+at attention / MoE boundaries, without `torch.compile`:
 
 ```bash
 python -m sglang.launch_server --model-path <MODEL> --device xpu \
     --cuda-graph-backend-prefill breakable
 ```
 
-> **Note:** Executable-graph dedup is CUDA-only (it introspects the raw graph
-> via `cuda-python`), so XPU always takes the plain segmented path. Without
-> dedup, breakable retains roughly `num_shapes × (num_layers + 1)` distinct
-> `XPUGraph` segments for the runner's lifetime, which increases memory use for
-> larger models or higher `max_bs`. On memory-constrained runs, lower
-> `--mem-fraction-static` and/or cap `--cuda-graph-bs-prefill` to reduce the
-> number of captured shapes.
+You can also configure both phases together with a single `--cuda-graph-config` JSON argument:
+
+```bash
+python -m sglang.launch_server --model-path <MODEL> --device xpu \
+    --cuda-graph-config '{"decode":{"backend":"full"},"prefill":{"backend":"tc_piecewise","tc_compiler":"eager"}}'
+```
 
 ### Enable torch.compile for Decode
 
