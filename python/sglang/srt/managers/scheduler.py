@@ -1472,6 +1472,7 @@ class Scheduler(
             ]
         )
 
+    @scheduler_nvtx_method("scheduler._abort_on_running_timeout", color="red")
     def _abort_on_running_timeout(self, running_batch: ScheduleBatch):
         # NOTE: this should be called before a batch is launched.
         timeout_s = envs.SGLANG_REQ_RUNNING_TIMEOUT.get()
@@ -2385,6 +2386,7 @@ class Scheduler(
             return False
         return True
 
+    @scheduler_nvtx_method("scheduler._abort_on_queued_limit", color="orange")
     def _abort_on_queued_limit(self, recv_req: Req) -> bool:
         """Abort an incoming or existing request if the waiting queue is full. Returns True if the incoming request is aborted."""
         if (
@@ -3606,6 +3608,7 @@ class Scheduler(
             if_success = False
         return ClearHiCacheReqOutput(success=if_success)
 
+    @scheduler_nvtx_method("scheduler.on_idle", color="gray")
     def on_idle(self):
         """Idle housekeeping: guard, check, metrics, reset, sleep."""
         if not self.is_fully_idle():
@@ -3947,6 +3950,7 @@ class Scheduler(
         barrier()
         return RpcReqOutput(success=success, message="" if not exec else str(exec))
 
+    @scheduler_nvtx_method("scheduler.abort_request", color="magenta")
     def abort_request(self, recv_req: AbortReq):
         # JoyFuture: end latency tracking for aborted requests
         if self.latency_tracker.enabled:

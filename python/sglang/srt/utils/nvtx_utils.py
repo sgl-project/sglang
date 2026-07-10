@@ -93,6 +93,11 @@ _NVTX_COLOR_MAP = {
     # Request entry points
     "scheduler.handle_generate_request": "blue",
     "scheduler.handle_batch_generate_request": "light_blue",
+    # Timeout / abort / idle paths
+    "scheduler._abort_on_running_timeout": "red",
+    "scheduler._abort_on_queued_limit": "orange",
+    "scheduler.abort_request": "magenta",
+    "scheduler.on_idle": "gray",
 }
 
 _NULL_CONTEXT = nullcontext()
