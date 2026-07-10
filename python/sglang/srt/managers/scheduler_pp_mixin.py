@@ -1141,9 +1141,32 @@ class SchedulerPPMixin:
         # PP rank 0 also relays into output_tokens_buf so the next iter's
         # resolve_forward_inputs finds these tokens for the decode portion
         # of mixed-chunk batches (which gather via mix_running_indices).
-        self.future_map.stash(
-            batch.req_pool_indices, RelayPayload(bonus_tokens=batch.input_ids)
-        )
+        if batch.input_ids.shape[0] == batch.req_pool_indices.shape[0]:
+            stash_indices = batch.req_pool_indices
+            stash_tokens = batch.input_ids
+        else:
+            consuming_indices = [
+                i
+                for i, req in enumerate(batch.reqs)
+                if req.inflight_middle_chunks <= 0
+            ]
+            if len(consuming_indices) != batch.input_ids.shape[0]:
+                raise RuntimeError(
+                    "PP disagg prefill compact output token count mismatch before "
+                    "future-map stash: "
+                    f"num_reqs={len(batch.reqs)}, "
+                    f"num_req_pool_indices={batch.req_pool_indices.shape[0]}, "
+                    f"num_next_token_ids={batch.input_ids.shape[0]}, "
+                    f"consuming_indices={consuming_indices}, "
+                    f"rids={[req.rid for req in batch.reqs]}, "
+                    "inflight_middle_chunks="
+                    f"{[req.inflight_middle_chunks for req in batch.reqs]}"
+                )
+            stash_indices = batch.req_pool_indices[
+                torch.tensor(consuming_indices, device=batch.req_pool_indices.device)
+            ]
+            stash_tokens = batch.input_ids
+        self.future_map.stash(stash_indices, RelayPayload(bonus_tokens=stash_tokens))
         output_result = GenerationBatchResult(
             logits_output=logits_output,
             pp_hidden_states_proxy_tensors=(
