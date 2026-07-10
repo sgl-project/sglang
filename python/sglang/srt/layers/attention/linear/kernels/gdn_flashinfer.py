@@ -270,6 +270,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         query_start_loc: torch.Tensor,
         out: Optional[torch.Tensor] = None,
         prep: Optional[tuple] = None,
+        no_prefix: bool = False,
         **kwargs,
     ) -> tuple:
         from sglang.srt.layers.attention.fla.l2norm import l2norm_fwd_qk
@@ -312,12 +313,24 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             )
             output_buf = out.squeeze(0)
 
+        # When no request in the batch has a prefix (fresh prefills — always the
+        # case with the radix cache disabled), skip the pool gather entirely and
+        # let the kernel zero-seed via initial_state=None. Bit-identical: freed
+        # pool slots are cleared, so the gather would materialize zeros anyway
+        # (and this also insulates fresh prefills from any stale slot content).
+        num_seqs = query_start_loc.numel() - 1
         if self.use_state_pool:
-            initial_state_fi = ssm_states[ssm_cache_indices].contiguous()
-            # Pre-allocate bf16 output_state so the kernel compiles and writes the
-            # bf16 state path directly, avoiding a fp32 allocation and a subsequent
-            # fp32->bf16 conversion in the scatter step.
-            output_state_fi = torch.empty_like(initial_state_fi)
+            if no_prefix:
+                initial_state_fi = None
+                output_state_fi = ssm_states.new_empty(
+                    (num_seqs,) + ssm_states.shape[1:]
+                )
+            else:
+                initial_state_fi = ssm_states[ssm_cache_indices].contiguous()
+                # Pre-allocate bf16 output_state so the kernel compiles and writes
+                # the bf16 state path directly, avoiding a fp32 allocation and a
+                # subsequent fp32->bf16 conversion in the scatter step.
+                output_state_fi = torch.empty_like(initial_state_fi)
             output_fi, output_state_fi = self._prefill_fn(
                 q=q_fi,
                 k=k_fi,
@@ -334,7 +347,10 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             )
         else:
             # State must be float32; kernel requires int64 cu_seqlens.
-            initial_state_fi = ssm_states[ssm_cache_indices].to(torch.float32)
+            if no_prefix:
+                initial_state_fi = None
+            else:
+                initial_state_fi = ssm_states[ssm_cache_indices].to(torch.float32)
             output_fi, output_state_fi = self._prefill_fn(
                 q=q_fi,
                 k=k_fi,

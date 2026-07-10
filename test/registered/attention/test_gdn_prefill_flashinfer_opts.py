@@ -189,6 +189,48 @@ def test_flashinfer_extend_prep_hoist_equiv(num_seqs: int, pad_last: bool):
     assert (ssm_hoist - ssm_ref).abs().max().item() == 0
 
 
+@pytest.mark.parametrize("num_seqs", [1, 5])
+def test_flashinfer_extend_no_prefix_gather_skip(num_seqs: int):
+    """extend(no_prefix=True) skips the SSM pool gather and zero-seeds in-kernel.
+
+    (1) On a cleared pool (the real no-prefix state: freed slots are zeroed) it
+    must be bit-identical to the gather path. (2) With poisoned pool rows it
+    must IGNORE them — fresh prefills never read slot residue. A regression
+    re-introducing the gather on the no_prefix path breaks (2)."""
+    kernel = FlashInferGDNKernel()
+    inp = _build_extend_inputs(num_seqs)
+    inp["ssm_states"].zero_()  # no-prefix reality: slots are cleared
+
+    o_gather, ssm_gather = _run(kernel, inp)
+
+    def run_no_prefix():
+        ssm = inp["ssm_states"].clone()
+        o, s1, s2 = kernel.extend(
+            q=inp["q"],
+            k=inp["k"],
+            v=inp["v"],
+            g=inp["g"],
+            beta=inp["beta"],
+            ssm_states=ssm,
+            cache_indices=inp["cache_indices"],
+            query_start_loc=inp["query_start_loc"],
+            no_prefix=True,
+        )
+        torch.cuda.synchronize()
+        assert s1 is None and s2 is None
+        return o, ssm
+
+    o_np, ssm_np = run_no_prefix()
+    assert (o_np.float() - o_gather.float()).abs().max().item() == 0
+    assert (ssm_np - ssm_gather).abs().max().item() == 0
+
+    # Poison the live rows: no_prefix must not read them.
+    inp["ssm_states"].fill_(float("nan"))
+    o_poison, _ = run_no_prefix()
+    assert (o_poison.float() - o_gather.float()).abs().max().item() == 0
+    assert not torch.isnan(o_poison.float()).any()
+
+
 def test_fused_gdn_gating_exp_gate_parity():
     """fused_gdn_gating(exp_gate=True) must equal torch.exp of the log-space
     output elementwise, with beta byte-identical. Guards the in-kernel exp fold

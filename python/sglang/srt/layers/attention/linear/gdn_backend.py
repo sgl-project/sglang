@@ -275,6 +275,7 @@ class GDNKernelDispatcher:
         cache_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
         prep: Optional[tuple] = None,
+        no_prefix: bool = False,
         **kwargs,
     ) -> tuple:
         return self.extend_kernel.extend(
@@ -287,6 +288,7 @@ class GDNKernelDispatcher:
             cache_indices=cache_indices,
             query_start_loc=query_start_loc,
             prep=prep,
+            no_prefix=no_prefix,
             **kwargs,
         )
 
@@ -352,9 +354,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
         self._extend_prep_fm = None
         self._extend_prep = None
         # Same pattern for the extend-path has_initial_states comparison (all
-        # backends: it feeds causal_conv1d upstream of the kernel dispatch).
+        # backends: it feeds causal_conv1d upstream of the kernel dispatch) and
+        # the CPU-side no-prefix signal derived alongside it.
         self._has_initial_states_fm = None
         self._has_initial_states = None
+        self._extend_no_prefix = False
         self.verify_intermediate_state_indices = torch.arange(
             self.req_to_token_pool.size, dtype=torch.int32, device=model_runner.device
         )
@@ -500,6 +504,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
             # Same identity-keyed memo pattern as the extend prep below.
             if self._has_initial_states_fm is not forward_metadata:
                 self._has_initial_states = forward_batch.extend_prefix_lens > 0
+                # CPU-side "no request has a prefix" signal (no GPU sync): lets
+                # backends skip the SSM initial-state pool gather entirely and
+                # zero-seed in-kernel (bit-identical: freed slots are cleared).
+                self._extend_no_prefix = (
+                    forward_batch.extend_prefix_lens_cpu is not None
+                    and not any(forward_batch.extend_prefix_lens_cpu)
+                )
                 self._has_initial_states_fm = forward_metadata
             has_initial_states = self._has_initial_states
 
@@ -652,6 +663,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 query_start_loc=query_start_loc,
                 out=out,
                 prep=prep,
+                no_prefix=self._extend_no_prefix,
             )
 
             if is_npu() and last_recurrent_state is not None:
