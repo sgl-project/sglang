@@ -589,15 +589,17 @@ class Repro:
                 on_own_line = (
                     own_line.strip().rstrip(",").strip() == alias_text(dropped_alias)
                 )
-                if on_own_line:
-                    # An exploded (parenthesized, one-name-per-line) import: delete just
-                    # this alias's line so the surrounding parens and the magic trailing
-                    # comma survive. The formatter then keeps the import multi-line, which
-                    # is how the target was actually edited. A flat rebuild would drop the
-                    # magic comma and collapse an import the target left multi-line.
-                    # Comments on the surviving lines are preserved for free.
+                has_comments = any("#" in ln for ln in stmt_lines)
+                # Preserve the exploded form -- delete just this alias's line -- when the
+                # import stays multi-line: 2+ surviving names keep the magic trailing comma
+                # exploded, and an import carrying comments must not be rebuilt (a rebuild
+                # would drop them). Both match how the target was edited (a flat rebuild
+                # would drop the magic comma and collapse an import the target left
+                # multi-line). A lone surviving name with no comments collapses to one line
+                # -- the formatter does not keep a single name exploded -- so rebuild it.
+                if on_own_line and (len(kept) >= 2 or has_comments):
                     edits.append((own, own, None))
-                elif any("#" in ln for ln in stmt_lines):
+                elif has_comments and not on_own_line:
                     raise AssertionError(
                         f"cannot drop {name!r}: it shares a line with other text and "
                         f"the import holds comments that a rebuild would delete"

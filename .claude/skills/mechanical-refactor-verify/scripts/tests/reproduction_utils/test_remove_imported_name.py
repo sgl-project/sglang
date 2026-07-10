@@ -91,17 +91,33 @@ def test_remove_imported_name_preserves_the_multiline_form(
     ).read_text() == "from pkg import (\n    a,\n    b,\n)\n\nx = a + b\n"
 
 
-def test_remove_imported_name_multiline_down_to_one_keeps_the_parens(
+def test_remove_imported_name_multiline_down_to_one_collapses(
     tmp_path: Path,
 ) -> None:
-    """Pruning an exploded import down to a single surviving name keeps the parens + magic
-    comma, so the formatter still leaves it exploded."""
+    """Pruning an exploded import down to a single surviving name collapses it to one line:
+    the formatter does not keep a lone name exploded, so a preserved-multiline form would
+    not match the target."""
     (tmp_path / "m.py").write_text(
         "from pkg import (\n    moved,\n    a,\n)\n\nx = a\n"
     )
     r = Repro("b", "t").remove_imported_name("m.py", module="pkg", name="moved")
     _apply(r, tmp_path)
-    assert (tmp_path / "m.py").read_text() == "from pkg import (\n    a,\n)\n\nx = a\n"
+    assert (tmp_path / "m.py").read_text() == "from pkg import a\n\nx = a\n"
+
+
+def test_remove_imported_name_down_to_one_with_a_comment_stays_exploded(
+    tmp_path: Path,
+) -> None:
+    """A lone survivor that carries a comment stays exploded (a rebuild would drop the
+    comment); only its own line is deleted."""
+    (tmp_path / "m.py").write_text(
+        "from pkg import (\n    moved,\n    a,  # keep me\n)\n\nx = a\n"
+    )
+    r = Repro("b", "t").remove_imported_name("m.py", module="pkg", name="moved")
+    _apply(r, tmp_path)
+    assert (
+        tmp_path / "m.py"
+    ).read_text() == "from pkg import (\n    a,  # keep me\n)\n\nx = a\n"
 
 
 def test_remove_imported_name_matches_a_relative_module(tmp_path: Path) -> None:
