@@ -947,16 +947,31 @@ class ModelRunnerKVCacheMixin:
                     end_layer=self.end_layer,
                 )
         elif self.use_mla_backend and is_dsa_model:
-            PoolCls = (
-                HiSparseDSATokenToKVPool if self.enable_hisparse else DSATokenToKVPool
-            )
+            from sglang.srt.layers.cp.utils import get_glm_dsa_cp_layer_shard_info
+
+            (
+                dsa_cp_layer_shard_rank,
+                dsa_cp_layer_shard_size,
+            ) = get_glm_dsa_cp_layer_shard_info(self)
             pool_kwargs = {}
             if self.enable_hisparse:
+                PoolCls = HiSparseDSATokenToKVPool
                 from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
                 pool_kwargs["host_to_device_ratio"] = parse_hisparse_config(
                     self.server_args
                 ).host_to_device_ratio
+            elif dsa_cp_layer_shard_rank is not None:
+                # DSA cache layer split: shard KV/indexer layers across CP ranks.
+                from sglang.srt.mem_cache.dsa_cache_layer_split import (
+                    LayerSplitDSATokenToKVPool,
+                )
+
+                PoolCls = LayerSplitDSATokenToKVPool
+                pool_kwargs["layer_shard_rank"] = dsa_cp_layer_shard_rank
+                pool_kwargs["layer_shard_size"] = dsa_cp_layer_shard_size
+            else:
+                PoolCls = DSATokenToKVPool
             self.token_to_kv_pool = PoolCls(
                 self.max_total_num_tokens,
                 page_size=self.page_size,
