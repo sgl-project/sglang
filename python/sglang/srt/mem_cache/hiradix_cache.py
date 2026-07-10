@@ -214,12 +214,12 @@ class HiRadixCache(RadixCache):
         super().__init__(params=params)
 
     def apply_kv_hints(self, req) -> int:
-        """Queue bounded L3 retention intent after its prefix is committed."""
+        """Queue bounded L3 retention after the full prompt is committed."""
         hints = getattr(req, "kv_hints", None)
         retention = (
-            hints.get("retention", [])
+            hints.get("retain_full_prompt")
             if isinstance(hints, dict)
-            else getattr(hints, "retention", [])
+            else getattr(hints, "retain_full_prompt", None)
         )
         backend = getattr(self.cache_controller, "storage_backend", None)
         supported = (
@@ -238,63 +238,51 @@ class HiRadixCache(RadixCache):
                 self._retention_unsupported_logged = True
             return 0
 
-        max_hints = backend.retention_max_hints
         max_pages = backend.retention_max_pages
         max_ttl_seconds = backend.retention_max_ttl_seconds
-        applied_indices = getattr(req, "_kv_retention_applied_indices", set())
+        if getattr(req, "_kv_retention_applied", False):
+            return 0
         page_ttls = getattr(req, "_kv_retention_page_ttls", {})
         desired_page_ttls = {}
-        matched_indices = set()
 
-        for index, hint in enumerate(retention[:max_hints]):
-            if index in applied_indices:
-                continue
-            try:
-                prefix_tokens = (
-                    hint.get("prefix_tokens")
-                    if isinstance(hint, dict)
-                    else hint.prefix_tokens
-                )
-                ttl_seconds = (
-                    hint.get("ttl_seconds")
-                    if isinstance(hint, dict)
-                    else hint.ttl_seconds
-                )
-                prefix_tokens = min(int(prefix_tokens), len(req.origin_input_ids))
-                prefix_tokens -= prefix_tokens % self.page_size
-                ttl_seconds = min(int(ttl_seconds), max_ttl_seconds)
-                if prefix_tokens <= 0 or ttl_seconds <= 0:
-                    continue
+        try:
+            ttl_seconds = (
+                retention.get("ttl_seconds")
+                if isinstance(retention, dict)
+                else retention.ttl_seconds
+            )
+            prefix_tokens = len(req.origin_input_ids)
+            prefix_tokens -= prefix_tokens % self.page_size
+            ttl_seconds = min(int(ttl_seconds), max_ttl_seconds)
+            if prefix_tokens <= 0 or ttl_seconds <= 0:
+                return 0
 
-                key = RadixKey(
-                    req.origin_input_ids[:prefix_tokens],
-                    req.extra_key,
-                    is_bigram=self.is_eagle,
-                ).page_aligned(self.page_size)
-                match = self.match_prefix(MatchPrefixParams(key=key))
-                if len(match.device_indices) != len(key):
-                    logger.info(
-                        "Skipped KV retention hint: matched %d of %d prefix tokens",
-                        len(match.device_indices),
-                        len(key),
-                    )
-                    continue
-                node = match.last_device_node
-                page_hashes = node.get_prefix_hash_values(node)
-                if len(page_hashes) != len(key) // self.page_size:
-                    continue
-                matched_indices.add(index)
-                for page_hash in page_hashes:
-                    desired_page_ttls[page_hash] = max(
-                        ttl_seconds, desired_page_ttls.get(page_hash, 0)
-                    )
-            except Exception:
-                if not self._retention_apply_failed_logged:
-                    logger.warning("Failed to apply KV retention hint", exc_info=True)
-                    self._retention_apply_failed_logged = True
+            key = RadixKey(
+                req.origin_input_ids[:prefix_tokens],
+                req.extra_key,
+                is_bigram=self.is_eagle,
+            ).page_aligned(self.page_size)
+            match = self.match_prefix(MatchPrefixParams(key=key))
+            if len(match.device_indices) != len(key):
+                logger.info(
+                    "Skipped KV retention hint: matched %d of %d prompt tokens",
+                    len(match.device_indices),
+                    len(key),
+                )
+                return 0
+            node = match.last_device_node
+            page_hashes = node.get_prefix_hash_values(node)
+            if len(page_hashes) != len(key) // self.page_size:
+                return 0
+            desired_page_ttls = {page_hash: ttl_seconds for page_hash in page_hashes}
+        except Exception:
+            if not self._retention_apply_failed_logged:
+                logger.warning("Failed to apply KV retention hint", exc_info=True)
+                self._retention_apply_failed_logged = True
+            return 0
 
         updates_by_ttl = {}
-        bounded = len(retention) > max_hints
+        bounded = False
         for page_hash, ttl_seconds in desired_page_ttls.items():
             previous_ttl = page_ttls.get(page_hash, 0)
             if ttl_seconds <= previous_ttl:
@@ -308,8 +296,7 @@ class HiRadixCache(RadixCache):
         for ttl_seconds, page_hashes in updates_by_ttl.items():
             self.cache_controller.retain_storage(page_hashes, ttl_seconds)
 
-        applied_indices.update(matched_indices)
-        req._kv_retention_applied_indices = applied_indices
+        req._kv_retention_applied = True
         req._kv_retention_page_ttls = page_ttls
         queued_pages = sum(len(page_hashes) for page_hashes in updates_by_ttl.values())
         if queued_pages:
@@ -320,8 +307,7 @@ class HiRadixCache(RadixCache):
             )
         if bounded and not self._retention_bounded_logged:
             logger.warning(
-                "Bounded KV retention hints to %d hints and %d unique pages per request",
-                max_hints,
+                "Bounded KV retention to %d unique pages per request",
                 max_pages,
             )
             self._retention_bounded_logged = True

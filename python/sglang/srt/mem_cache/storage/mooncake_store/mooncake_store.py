@@ -393,14 +393,6 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     else 8192
                 ),
             )
-            self.retention_max_hints = max(
-                0,
-                int(
-                    extra_config.get("retention_max_hints", 4)
-                    if extra_config
-                    else 4
-                ),
-            )
             self.retention_max_ttl_seconds = max(
                 0,
                 int(

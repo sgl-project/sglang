@@ -71,11 +71,8 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         hints = msgspec.convert(fixture["kv_hints"], type=KvHintEnvelope)
 
         self.assertEqual(
-            hints.retention,
-            [
-                KvRetentionHint(prefix_tokens=2, ttl_seconds=300),
-                KvRetentionHint(prefix_tokens=4, ttl_seconds=3600),
-            ],
+            hints.retain_full_prompt,
+            KvRetentionHint(ttl_seconds=3600),
         )
 
         req = GenerateReqInput(
@@ -93,12 +90,8 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         self.assertIsInstance(parsed.kv_hints, KvHintEnvelope)
 
     def test_kv_hints_follow_parallel_sampling_expansion(self):
-        first = KvHintEnvelope(
-            retention=[KvRetentionHint(prefix_tokens=2, ttl_seconds=300)]
-        )
-        second = KvHintEnvelope(
-            retention=[KvRetentionHint(prefix_tokens=4, ttl_seconds=3600)]
-        )
+        first = KvHintEnvelope(retain_full_prompt=KvRetentionHint(ttl_seconds=300))
+        second = KvHintEnvelope(retain_full_prompt=KvRetentionHint(ttl_seconds=3600))
         req = GenerateReqInput(
             input_ids=[[1, 2], [3, 4]],
             sampling_params={"n": 2},
@@ -110,9 +103,7 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         self.assertEqual(req.kv_hints, [first, second, first, second])
 
     def test_tokenized_kv_hints_survive_ipc_round_trip(self):
-        hints = KvHintEnvelope(
-            retention=[KvRetentionHint(prefix_tokens=2, ttl_seconds=300)]
-        )
+        hints = KvHintEnvelope(retain_full_prompt=KvRetentionHint(ttl_seconds=300))
         req = TokenizedGenerateReqInput(
             input_text="",
             input_ids=array("q", [1, 2]),

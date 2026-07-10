@@ -54,9 +54,9 @@ def maybe_apply_kv_hints(req: Req, tree_cache: BasePrefixCache) -> None:
 
     hints = getattr(req, "kv_hints", None)
     retention = (
-        hints.get("retention", [])
+        hints.get("retain_full_prompt")
         if isinstance(hints, dict)
-        else getattr(hints, "retention", [])
+        else getattr(hints, "retain_full_prompt", None)
     )
     if not retention:
         return

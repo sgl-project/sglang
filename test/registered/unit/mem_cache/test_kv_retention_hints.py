@@ -17,7 +17,6 @@ class TestKvRetentionHints(CustomTestCase):
     def test_committed_prefix_is_page_aligned_and_uses_tree_hashes(self):
         backend = SimpleNamespace(
             _can_retain_groups=lambda: True,
-            retention_max_hints=4,
             retention_max_pages=8192,
             retention_max_ttl_seconds=86400,
         )
@@ -44,7 +43,7 @@ class TestKvRetentionHints(CustomTestCase):
             origin_input_ids=array("q", [11, 22, 33, 44, 55]),
             extra_key="tenant",
             kv_hints=KvHintEnvelope(
-                retention=[KvRetentionHint(prefix_tokens=5, ttl_seconds=300)]
+                retain_full_prompt=KvRetentionHint(ttl_seconds=300)
             ),
         )
 
@@ -63,7 +62,6 @@ class TestKvRetentionHints(CustomTestCase):
     def test_retention_is_bounded_across_the_request(self):
         backend = SimpleNamespace(
             _can_retain_groups=lambda: True,
-            retention_max_hints=1,
             retention_max_pages=1,
             retention_max_ttl_seconds=15,
         )
@@ -89,12 +87,7 @@ class TestKvRetentionHints(CustomTestCase):
         req = SimpleNamespace(
             origin_input_ids=array("q", [11, 22, 33, 44]),
             extra_key=None,
-            kv_hints=KvHintEnvelope(
-                retention=[
-                    KvRetentionHint(prefix_tokens=4, ttl_seconds=30),
-                    KvRetentionHint(prefix_tokens=4, ttl_seconds=10),
-                ]
-            ),
+            kv_hints=KvHintEnvelope(retain_full_prompt=KvRetentionHint(ttl_seconds=30)),
         )
 
         self.assertEqual(cache.apply_kv_hints(req), 1)
@@ -117,9 +110,7 @@ class TestKvRetentionHints(CustomTestCase):
 
     def test_unsupported_prefix_cache_warns_once(self):
         req = SimpleNamespace(
-            kv_hints=KvHintEnvelope(
-                retention=[KvRetentionHint(prefix_tokens=2, ttl_seconds=300)]
-            )
+            kv_hints=KvHintEnvelope(retain_full_prompt=KvRetentionHint(ttl_seconds=300))
         )
         common._unsupported_cache_kv_hints_logged = False
 

@@ -153,13 +153,12 @@ MultimodalDataInputFormat = Union[
 
 @dataclass
 class KvRetentionHint:
-    prefix_tokens: int
     ttl_seconds: int
 
 
 @dataclass
 class KvHintEnvelope:
-    retention: List[KvRetentionHint] = field(default_factory=list)
+    retain_full_prompt: Optional[KvRetentionHint] = None
 
 
 @dataclass
