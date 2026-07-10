@@ -114,7 +114,6 @@ section headings, e.g. `W8A8 2P1D 32P` means "W8A8 quantization, 2 prefill nodes
 | --------------------------------- | ----------------------------------------------------------------------------------------- |
 | **TPOT** (Time Per Output Token)  | Average time to generate each output token. Lower is better.                              |
 | **TTFT** (Time To First Token)    | Latency from request arrival to first generated token. Critical for interactive use.      |
-| **GSP** (Generated Shared Prefix) | A benchmark methodology using dataset-wide shared prefixes to simulate caching scenarios. |
 
 ## Model architecture terms
 
@@ -123,7 +122,6 @@ section headings, e.g. `W8A8 2P1D 32P` means "W8A8 quantization, 2 prefill nodes
 | **MoE** (Mixture of Experts)          | Model architecture where only a subset of parameters (experts) is activated per token, reducing compute. Common in DeepSeek, Qwen3-30B-A3B, and MiMo models. |
 | **MLA** (Multi-head Latent Attention) | Attention variant that compresses key-value representations into a lower-dimensional latent space. Used by DeepSeek models.                              |
 | **GQA** (Grouped-Query Attention)     | Attention variant where multiple query heads share a single key-value head. Used by Qwen3 dense models.                                                  |
-| **NSA** (Native Sparse Attention)     | Sparse attention mechanism that reduces KV cache overhead for long contexts.                                                                             |
 | **DSA** (DeepSeek Sparse Attention)   | DeepSeek's sparse attention mechanism; reduces KV cache overhead for long contexts.                                                                      |
 | **FFN** (Feed-Forward Network)        | The non-attention component of each transformer layer. In MoE models, the FFN is replaced by multiple expert FFN layers selected by a router.            |
 
