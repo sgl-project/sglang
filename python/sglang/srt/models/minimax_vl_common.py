@@ -15,11 +15,7 @@ from sglang.srt.layers.attention.vision import (
     FLASHINFER_WORKSPACE_SIZE_BYTES,
     VisionAttention,
 )
-from sglang.srt.layers.dp_attention import (
-    get_attention_tp_rank,
-    get_attention_tp_size,
-    is_dp_attention_enabled,
-)
+from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
     RowParallelLinear,
@@ -29,7 +25,7 @@ from sglang.srt.layers.rotary_embedding.utils import rotate_half
 from sglang.srt.managers.schedule_batch import MultimodalDataItem
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import add_prefix, get_compiler_backend, round_up
 
 logger = logging.getLogger(__name__)
@@ -83,8 +79,8 @@ class MiniMaxVLMultiModalProjector(nn.Module):
             else text_hidden_size
         )
 
-        tp_size = 1 if use_data_parallel else get_attention_tp_size()
-        tp_rank = 0 if use_data_parallel else get_attention_tp_rank()
+        tp_size = 1 if use_data_parallel else get_parallel().attn_tp_size
+        tp_rank = 0 if use_data_parallel else get_parallel().attn_tp_rank
 
         self.linear_1 = ColumnParallelLinear(
             vision_hidden_size,
@@ -138,8 +134,8 @@ class MiniMaxVLPatchMerger(nn.Module):
             else text_hidden_size
         )
 
-        tp_size = 1 if use_data_parallel else get_attention_tp_size()
-        tp_rank = 0 if use_data_parallel else get_attention_tp_rank()
+        tp_size = 1 if use_data_parallel else get_parallel().attn_tp_size
+        tp_rank = 0 if use_data_parallel else get_parallel().attn_tp_rank
 
         self.linear_1 = ColumnParallelLinear(
             text_hidden_size * spatial_merge_size**2,
@@ -260,8 +256,8 @@ class CLIPEncoderLayer(nn.Module):
 
         self.embed_dim = config.hidden_size
         self.use_data_parallel = use_data_parallel
-        tp_size = 1 if use_data_parallel else get_attention_tp_size()
-        tp_rank = 0 if use_data_parallel else get_attention_tp_rank()
+        tp_size = 1 if use_data_parallel else get_parallel().attn_tp_size
+        tp_rank = 0 if use_data_parallel else get_parallel().attn_tp_rank
 
         self.self_attn = VisionAttention(
             embed_dim=config.hidden_size,
@@ -634,7 +630,7 @@ class MiniMaxVLVisionTransformer(nn.Module):
             token_cu_seqlens_np
         )
 
-        attn_tp_size = 1 if self.use_data_parallel else get_attention_tp_size()
+        attn_tp_size = 1 if self.use_data_parallel else get_parallel().attn_tp_size
         elem_per_token = self.config.hidden_size // attn_tp_size
 
         offsets_packed = self._compute_flashinfer_batch_offsets_packed(

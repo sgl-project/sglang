@@ -44,11 +44,7 @@ from sglang.srt.layers.communicator import (
     ScatterMode,
     enable_moe_dense_fully_dp,
 )
-from sglang.srt.layers.dp_attention import (
-    get_attention_tp_rank,
-    get_attention_tp_size,
-    is_dp_attention_enabled,
-)
+from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import GemmaRMSNorm, RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -85,7 +81,7 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.models.minimax_m2 import MiniMaxM2RMSNormTP
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import (
     add_prefix,
     get_device_sm,
@@ -135,8 +131,8 @@ class MultiHeadRMSNorm(nn.Module):
         apply_layernorm_1p: bool = False,
     ) -> None:
         super().__init__()
-        self.tp_world = get_attention_tp_size()
-        self.tp_rank = get_attention_tp_rank()
+        self.tp_world = get_parallel().attn_tp_size
+        self.tp_rank = get_parallel().attn_tp_rank
         self.num_heads = num_heads
         self.num_heads_per_tp = num_heads // self.tp_world
         self.head_dim = head_dim
@@ -152,8 +148,8 @@ class MultiHeadRMSNorm(nn.Module):
         param: nn.Parameter,
         loaded_weight: torch.Tensor,
     ) -> None:
-        tp_world = get_attention_tp_size()
-        tp_rank = get_attention_tp_rank()
+        tp_world = get_parallel().attn_tp_size
+        tp_rank = get_parallel().attn_tp_rank
 
         shard_size = loaded_weight.shape[0] // tp_world
         shard = slice(tp_rank * shard_size, (tp_rank + 1) * shard_size)
@@ -473,8 +469,8 @@ class MiniMaxM3Attention(nn.Module):
         self.is_sparse_attention_layer = is_sparse_attention_layer
         self.disable_index_value = is_sparse_attention_layer and disable_index_value
 
-        attn_tp_rank = get_attention_tp_rank()
-        attn_tp_size = get_attention_tp_size()
+        attn_tp_rank = get_parallel().attn_tp_rank
+        attn_tp_size = get_parallel().attn_tp_size
         self.attn_tp_size = attn_tp_size
         self.attn_tp_rank = attn_tp_rank
 

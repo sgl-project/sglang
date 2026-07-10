@@ -103,10 +103,10 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             )
         self._msa_dec_meta = None
         if self.use_msa:
-            from sglang.srt.layers.dp_attention import get_attention_tp_size
+            from sglang.srt.runtime_context import get_parallel
 
             self.num_q_heads = (
-                runner.model_config.num_attention_heads // get_attention_tp_size()
+                runner.model_config.num_attention_heads // get_parallel().attn_tp_size
             )
             self.num_kv_heads = self.kv_pool.main_pool.head_num
             self._msa_nb_max = (
