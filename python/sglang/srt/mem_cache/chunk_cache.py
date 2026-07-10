@@ -80,6 +80,7 @@ class ChunkCache(BasePrefixCache):
     def cache_finished_req(
         self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int
     ) -> CacheFinishedReqResult:
+        # For decode server: if req.output_ids is empty, we want to free all req.origin_input_ids
         return CacheFinishedReqResult(unhandled_kv_start=0)
 
     def cache_unfinished_req(self, req: Req, chunked=False):
