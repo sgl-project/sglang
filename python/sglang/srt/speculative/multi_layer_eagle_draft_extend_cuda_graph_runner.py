@@ -435,7 +435,7 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
         for step in range(num_steps):
             _, topk_p, topk_index = runner.replay(step)
             if step < num_steps - 1:
-                rotate_input_ids_triton(...)  # advance the draft chain
+                rotate_input_ids(...)  # advance the draft chain
 
     Not itself a DecodeCudaGraphRunner -- it only routes work to the per-step
     runners.
