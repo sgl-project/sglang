@@ -339,13 +339,20 @@ def _multiline_string_interior_lines(top_level_text: str) -> set[int]:
 
 
 def _audit_extract_header(
-    header: str, removed_assigns: dict[str, str | None], where: str
+    header: str,
+    removed_assigns: dict[str, str | None],
+    where: str,
+    rederivable: dict[str, str | None] | None = None,
 ) -> None:
     """Refuse header content the extraction cannot vouch for. The header of a scattered
     extraction is authored text reproduced from the target commit, so anything beyond
-    imports, a TYPE_CHECKING import block, a logger, or a byte-equivalent copy of an
-    assignment deleted from the source would let arbitrary new code ride into the new
+    imports, a TYPE_CHECKING import block, a logger, a byte-equivalent copy of an
+    assignment deleted from the source (``removed_assigns``), or a byte-equivalent copy of
+    a module constant that *survives* in the source (``rederivable`` -- re-derived
+    boilerplate such as ``_is_hip = is_hip()``, provably not fiction because the same
+    statement still exists in the source) would let arbitrary new code ride into the new
     module under a PASS verdict."""
+    rederivable = rederivable or {}
     header_assigned: set[str] = set()
     for stmt in ast.parse(header).body:
         if isinstance(stmt, (ast.Import, ast.ImportFrom)):
@@ -372,6 +379,10 @@ def _audit_extract_header(
                 n in removed_assigns and removed_assigns[n] == value_src for n in names
             ):
                 header_assigned.update(names)
+                continue
+            if names and all(
+                n in rederivable and rederivable[n] == value_src for n in names
+            ):
                 continue
         raise AssertionError(
             f"unverifiable header statement in {where}: {ast.unparse(stmt)!r} is "
@@ -583,7 +594,13 @@ class Repro:
         return self
 
     def remove_imported_name(
-        self, rel: str, *, module: str | None, name: str, asname: str | None = None
+        self,
+        rel: str,
+        *,
+        module: str | None,
+        name: str,
+        asname: str | None = None,
+        keep_exploded: bool = False,
     ) -> "Repro":
         """Drop a single imported ``name`` from a module-level import: from a ``from module
         import a, b`` keep the rest and drop only ``name``; when it was the sole name -- or for
@@ -591,6 +608,12 @@ class Repro:
         home changed, so an importer that no longer references it loses exactly that name; the
         import sorter rewrites the surviving line. An import diff is always whitelisted, so this
         realises a lost name directly instead of relying on the formatter to prune it.
+
+        Removing down to a single surviving name collapses the import to one line by default
+        (the common case). Pass ``keep_exploded`` when the target kept the sole survivor
+        exploded (its magic trailing comma preserved): the alias line is then merely deleted
+        so the surviving name keeps its comma and the formatter leaves the import multi-line.
+        The choice is the commit author's and cannot be inferred from the source.
         """
 
         def alias_text(alias: ast.alias) -> str:
@@ -632,9 +655,11 @@ class Repro:
                 # exploded, and an import carrying comments must not be rebuilt (a rebuild
                 # would drop them). Both match how the target was edited (a flat rebuild
                 # would drop the magic comma and collapse an import the target left
-                # multi-line). A lone surviving name with no comments collapses to one line
-                # -- the formatter does not keep a single name exploded -- so rebuild it.
-                if on_own_line and (len(kept) >= 2 or has_comments):
+                # multi-line). A lone surviving name collapses to one line by default, unless
+                # keep_exploded says the target preserved the magic comma for it too.
+                if on_own_line and (
+                    len(kept) >= 2 or has_comments or keep_exploded
+                ):
                     edits.append((own, own, None))
                 elif has_comments and not on_own_line:
                     raise AssertionError(
@@ -698,15 +723,38 @@ class Repro:
         self.ops.append(op)
         return self
 
-    def add_import(self, rel: str, import_stmt: str) -> "Repro":
+    def add_import(
+        self, rel: str, import_stmt: str, *, after: str | None = None
+    ) -> "Repro":
         """Append an import after the last top-level import; the formatter's import sorter
-        places it (so the exact insertion point does not matter)."""
+        places it (so the exact insertion point does not matter). When ``after`` is given,
+        insert immediately after the top-level import statement whose source text contains
+        that substring instead -- needed for a file whose imports are split into separate
+        isort sections by an intervening statement (e.g. ``_is_hip = is_hip()``), where the
+        sorter will not carry the new import across the boundary into the intended block."""
 
         def op(root: Path) -> None:
             path = root / rel
             lines = _split_keepends(_read_source(path))
             nl = _newline_style("".join(lines))
             body = ast.parse("".join(lines)).body
+            if after is not None:
+                anchor = None
+                for node in body:
+                    if isinstance(node, (ast.Import, ast.ImportFrom)) and after in "".join(
+                        lines[node.lineno - 1 : node.end_lineno]
+                    ):
+                        anchor = node
+                        break
+                if anchor is None:
+                    raise AssertionError(
+                        f"no top-level import containing {after!r} in {rel}"
+                    )
+                at = anchor.end_lineno
+                _write_source(
+                    path, "".join(lines[:at] + [import_stmt + nl] + lines[at:])
+                )
+                return
             last = 0
             if (
                 body
@@ -1093,8 +1141,23 @@ class Repro:
             assert (
                 found_assigns == dropped
             ), f"{dropped - found_assigns} not assigned in {src}"
+            rederivable: dict[str, str | None] = {}
+            for node in tree.body:
+                targets = (
+                    node.targets
+                    if isinstance(node, ast.Assign)
+                    else [node.target] if isinstance(node, ast.AnnAssign) else []
+                )
+                names = [t.id for t in targets if isinstance(t, ast.Name)]
+                if not names or set(names) & dropped:
+                    continue
+                value_src = ast.unparse(node.value) if node.value is not None else None
+                for kept_name in names:
+                    rederivable[kept_name] = value_src
             if header.strip() or removed_assigns:
-                _audit_extract_header(header, removed_assigns, where=dst)
+                _audit_extract_header(
+                    header, removed_assigns, where=dst, rederivable=rederivable
+                )
             cuts = [(start, end, None) for start, end in spans.values()]
             cuts += [(start, end, None) for start, end in assign_spans]
             cuts += assign_rewrites

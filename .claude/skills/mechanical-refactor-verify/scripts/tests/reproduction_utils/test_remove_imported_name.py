@@ -144,3 +144,19 @@ def test_remove_imported_name_preserves_comments_in_a_multiline_import(
     r = Repro("b", "t").remove_imported_name("m.py", module="pkg", name="moved")
     _apply(r, tmp_path)
     assert "# used by frobnicator" in (tmp_path / "m.py").read_text()
+
+
+def test_remove_imported_name_keep_exploded_holds_a_lone_survivor_multiline(
+    tmp_path: Path,
+) -> None:
+    """With keep_exploded, pruning down to a single survivor deletes only the removed line,
+    so the survivor keeps its magic trailing comma and the import stays multi-line (the
+    author's choice, which the source cannot reveal). A regenerating impl would collapse."""
+    (tmp_path / "m.py").write_text("from pkg import (\n    moved,\n    a,\n)\n\nx = a\n")
+    r = Repro("b", "t").remove_imported_name(
+        "m.py", module="pkg", name="moved", keep_exploded=True
+    )
+    _apply(r, tmp_path)
+    assert (
+        tmp_path / "m.py"
+    ).read_text() == "from pkg import (\n    a,\n)\n\nx = a\n"

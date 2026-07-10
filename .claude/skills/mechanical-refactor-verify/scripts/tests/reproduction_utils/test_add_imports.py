@@ -230,3 +230,28 @@ def test_add_typechecking_import_keeps_a_pass_that_is_not_alone(tmp_path: Path) 
         "\n"
         "x = 1\n"
     )
+
+
+# --- add_import(after=...) -----------------------------------------------------
+
+
+def test_add_import_after_anchors_into_a_split_import_block(tmp_path: Path) -> None:
+    """With `after`, the import lands right after the named import -- needed when a
+    statement splits the imports into separate blocks and the default (after the last
+    import) would land in the wrong block."""
+    (tmp_path / "m.py").write_text(
+        "import os\n\n_flag = os.getpid()\n\nfrom pkg import a\n\nx = 1\n"
+    )
+    r = Repro("b", "t").add_import("m.py", "from new import Thing", after="import os")
+    _apply(r, tmp_path)
+    assert (tmp_path / "m.py").read_text() == (
+        "import os\nfrom new import Thing\n\n_flag = os.getpid()\n\nfrom pkg import a\n\nx = 1\n"
+    )
+
+
+def test_add_import_after_raises_when_anchor_absent(tmp_path: Path) -> None:
+    """An `after` substring that matches no top-level import raises."""
+    (tmp_path / "m.py").write_text("import os\n\nx = 1\n")
+    r = Repro("b", "t").add_import("m.py", "from new import Thing", after="import nope")
+    with pytest.raises(AssertionError):
+        _apply(r, tmp_path)

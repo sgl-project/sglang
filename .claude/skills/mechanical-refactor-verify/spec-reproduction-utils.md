@@ -28,9 +28,11 @@
   verbatim, assembled under an **audited authored header**:
     - the byte diff certifies the bodies; the header is reproduced from the target;
     - the header audit accepts only: imports, a docstring, a TYPE_CHECKING import block,
-      a `logging.getLogger(__name__)` logger, or an unparse-equivalent copy of an
-      assignment actually deleted from the source (`drop_assigns`, e.g.
-      `_is_hip = is_hip()`);
+      a `logging.getLogger(__name__)` logger, an unparse-equivalent copy of an assignment
+      actually deleted from the source (`drop_assigns`), or an unparse-equivalent copy of a
+      module constant that **survives verbatim in the source** — re-derived boilerplate such
+      as `_is_hip = is_hip()`, provably not fiction because the same statement remains in the
+      source;
     - every dropped assignment must reappear in the header — anything else raises instead
       of certifying.
 - The **body of an extracted function** — an inline block relocated verbatim into a new
@@ -110,7 +112,10 @@
     - cuts the named defs/classes from **scattered** positions; assembles the new module
       under the audited `header` (§2.1);
     - `drop_assigns` deletes a relocated module-level constant from the source; a chained
-      `A = B = 1` keeps the surviving bindings.
+      `A = B = 1` keeps the surviving bindings;
+    - the header audit also accepts an unparse-equivalent copy of a module constant that
+      **survives** in the source (re-derived boilerplate, e.g. `_is_hip = is_hip()` kept in
+      both modules) — provable because the same statement remains in the source.
 - `extract_function(src, dst, *, name, signature, body, body_indent, call, return_text,
   before, into_class)`:
     - cuts an inline `body` verbatim (must match at a line boundary);
@@ -136,8 +141,10 @@
   the magic trailing comma, and the comments are preserved and the formatter leaves it
   multi-line — a flat rebuild would drop the magic comma and collapse an import the target
   left multi-line. A **lone** surviving name with no comments collapses to a single line
-  (the formatter does not keep one name exploded); a name sharing a line (a flat
-  single-line import) is likewise rebuilt. Dropping the sole name removes the whole
+  (the formatter does not keep one name exploded) **by default**; pass `keep_exploded=True`
+  when the target left the sole survivor exploded (its magic comma preserved) — the choice
+  is the commit author's and cannot be inferred from the source. A name sharing a line (a
+  flat single-line import) is always rebuilt. Dropping the sole name removes the whole
   statement.
 - `add_imported_name(rel, *, module, name, asname)` — the dual of `remove_imported_name`:
   adds one name to an existing `from module import a, b`. Use it (over `add_import`) when the
@@ -145,8 +152,12 @@
   merge a new statement across an intervening non-import (e.g. a module-level assignment
   between two import blocks). An import carrying comments is refused (a rebuild would drop
   them); a name already present fails loudly.
-- `add_import(rel, import_stmt)` — the import sorter places it; with no existing imports
-  it lands below the module docstring.
+- `add_import(rel, import_stmt, *, after)` — the import sorter places it; with no existing
+  imports it lands below the module docstring. `after=<substr>` inserts it immediately below
+  the top-level import statement whose text contains the substring — needed when a statement
+  splits the imports into separate isort sections (e.g. `_is_hip = is_hip()` between two
+  blocks) and the default (after the last import) would land in the wrong block; a substring
+  matching no top-level import raises.
 - `add_typechecking_import(rel, import_stmt)` — appends inside the destination's
   `if TYPE_CHECKING:` block; the sorter orders it. A lone `pass` placeholder (the block's
   only statement) is dropped, since populating an empty block makes its placeholder redundant.

@@ -197,3 +197,40 @@ def test_extract_symbols_drop_assigns_preserves_other_targets_of_chained_assign(
     )
     _apply(r, tmp_path)
     assert "B" in (tmp_path / "src.py").read_text()
+
+
+def test_extract_symbols_to_new_module_allows_a_rederived_surviving_constant(
+    tmp_path: Path,
+) -> None:
+    """A header constant that also survives verbatim in the source (re-derived boilerplate,
+    e.g. `_is_hip = is_hip()`) is allowed: it is provably not fiction because the same
+    statement remains in the source."""
+    (tmp_path / "src.py").write_text(
+        "from pkg import is_hip\n"
+        "\n"
+        "_is_hip = is_hip()\n"
+        "\n"
+        "\n"
+        "def moved():\n"
+        "    return _is_hip\n"
+    )
+    header = "from pkg import is_hip\n\n_is_hip = is_hip()\n"
+    r = Repro("b", "t").extract_symbols_to_new_module(
+        "src.py", "new.py", symbols=["moved"], header=header, order=["moved"]
+    )
+    _apply(r, tmp_path)
+    assert "_is_hip = is_hip()" in (tmp_path / "src.py").read_text()
+    assert "_is_hip = is_hip()" in (tmp_path / "new.py").read_text()
+
+
+def test_extract_symbols_to_new_module_rejects_a_fictional_header_constant(
+    tmp_path: Path,
+) -> None:
+    """A header constant that is neither dropped from nor surviving in the source is fiction
+    and raises: the audit refuses code the extraction cannot vouch for."""
+    (tmp_path / "src.py").write_text("def moved():\n    return 1\n")
+    r = Repro("b", "t").extract_symbols_to_new_module(
+        "src.py", "new.py", symbols=["moved"], header="_fake = evil()\n", order=["moved"]
+    )
+    with pytest.raises(AssertionError):
+        _apply(r, tmp_path)
