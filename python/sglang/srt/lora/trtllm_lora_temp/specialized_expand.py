@@ -6,7 +6,7 @@ It is rank-specialized: the ``R`` dimension (LoRA rank) is a triton
 specialization (R=16, R=32, R=64 are all supported up to the ``R <= 64`` assert,
 with no perf interaction between them — each gets its own kernel).
 
-Called from :mod:`sglang.srt.lora.triton_ops.virtual_experts` when
+Called from :mod:`sglang.kernels.ops.moe.virtual_experts` when
 ``use_direct_expand_add=True`` (the trtllm-lora path uses this when
 ``max_lora_rank <= 64``); the generic ``invoke_fused_moe_kernel`` is used
 when that flag is False (incl. ranks above 64).
