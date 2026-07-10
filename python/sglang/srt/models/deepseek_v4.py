@@ -2214,9 +2214,42 @@ class DeepseekV4Model(nn.Module):
             input_ids_global = input_ids
 
         if dsa_use_prefill_cp(forward_batch):
+            full_positions_len = int(positions.shape[0])
             if self.pp_group.is_first_rank:
+                if int(hidden_states.shape[0]) < full_positions_len:
+                    pad_shape = (
+                        full_positions_len - int(hidden_states.shape[0]),
+                        *hidden_states.shape[1:],
+                    )
+                    hidden_states = torch.cat(
+                        [hidden_states, hidden_states.new_zeros(pad_shape)], dim=0
+                    )
                 hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
             positions = cp_split_and_rebuild_position(forward_batch, positions)
+            if not self.pp_group.is_first_rank and int(hidden_states.shape[0]) != int(
+                positions.shape[0]
+            ):
+                if int(hidden_states.shape[0]) <= full_positions_len:
+                    if int(hidden_states.shape[0]) < full_positions_len:
+                        pad_shape = (
+                            full_positions_len - int(hidden_states.shape[0]),
+                            *hidden_states.shape[1:],
+                        )
+                        hidden_states = torch.cat(
+                            [hidden_states, hidden_states.new_zeros(pad_shape)], dim=0
+                        )
+                    hidden_states = cp_split_and_rebuild_data(
+                        forward_batch, hidden_states
+                    )
+                if int(hidden_states.shape[0]) != int(positions.shape[0]):
+                    raise RuntimeError(
+                        "DeepSeekV4 PP proxy hidden/position shape mismatch under "
+                        "DSA prefill CP: "
+                        f"hidden_len={int(hidden_states.shape[0])}, "
+                        f"position_len={int(positions.shape[0])}, "
+                        f"full_position_len={full_positions_len}, "
+                        f"pp_rank={self.pp_group.rank_in_group}"
+                    )
             input_ids = cp_round_robin_input_ids(input_ids)
             input_ids_global = input_ids
 
