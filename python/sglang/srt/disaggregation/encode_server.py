@@ -66,11 +66,19 @@ def is_health_check_request(rid: Optional[str]) -> bool:
 
 
 rid_lock = asyncio.Lock()
-rid_to_receive_endpoint: Dict[str, List[str]] = dict()
+rid_to_receive_endpoint: Dict[str, Set[str]] = dict()
 rid_to_receive_count: Dict[str, int] = dict()
 rid_to_err_msg: Dict[str, str] = dict()
 cond_dict_lock = asyncio.Lock()
 rid_to_cond: Dict[str, asyncio.Condition] = {}
+
+
+async def _get_receive_condition(req_id: str) -> asyncio.Condition:
+    async with cond_dict_lock:
+        if req_id not in rid_to_cond:
+            rid_to_cond[req_id] = asyncio.Condition()
+        return rid_to_cond[req_id]
+
 
 ENCODER_MAX_BATCH_SIZE = envs.SGLANG_ENCODER_MAX_BATCH_SIZE.get()
 # Watchdog: max time to wait for a batched /encode result. Bounds HTTP latency
@@ -393,6 +401,23 @@ class MMEncoder:
         embedding_to_send = getattr(self, "embedding_to_send", None)
         if embedding_to_send is not None:
             embedding_to_send.pop(req_id, None)
+
+    async def register_embedding_destinations(
+        self,
+        req_id: str,
+        expected_destination_count: int,
+        destination_urls: Iterable[str],
+    ) -> None:
+        async with rid_lock:
+            if req_id not in rid_to_receive_endpoint:
+                rid_to_receive_endpoint[req_id] = set()
+                rid_to_receive_count[req_id] = expected_destination_count
+            assert rid_to_receive_count[req_id] == expected_destination_count
+            rid_to_receive_endpoint[req_id].update(destination_urls)
+
+        cond = await _get_receive_condition(req_id)
+        async with cond:
+            cond.notify_all()
 
     def _infer_embedding_dims(self) -> dict:
         """Infer per-modality embedding dimensions from hf_config at init time."""
@@ -1807,7 +1832,7 @@ class MMEncoder:
         all_tasks: List[Tuple[asyncio.Task, str]] = []
         start_time = asyncio.get_running_loop().time()
         timeout = self.send_timeout
-        cond = await get_condition(req_id)
+        cond = await _get_receive_condition(req_id)
 
         try:
             while True:
