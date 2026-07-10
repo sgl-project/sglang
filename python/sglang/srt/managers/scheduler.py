@@ -357,6 +357,8 @@ class Scheduler(
         )
         self.max_recv_per_poll = envs.SGLANG_SCHEDULER_MAX_RECV_PER_POLL.get()
         self.enable_hisparse = server_args.enable_hisparse
+        self.enable_dp_attention = server_args.enable_dp_attention
+        self.enable_unified_memory = server_args.enable_unified_memory
 
         # Distributed rank info
         attn_tp_rank, attn_tp_size, attn_dp_rank, attn_dp_size = (
@@ -470,7 +472,7 @@ class Scheduler(
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                 tp_group=(
                     self.attn_tp_cpu_group
-                    if self.server_args.enable_dp_attention
+                    if self.enable_dp_attention
                     else self.tp_cpu_group
                 ),
                 tree_cache=self.tree_cache,
@@ -911,9 +913,7 @@ class Scheduler(
         # Use the CPU (gloo) group to broadcast VLM Python objects and avoid CUDA
         # stream/device coupling (#11910).
         self.dp_tp_group = (
-            self.attn_tp_group
-            if self.server_args.enable_dp_attention
-            else self.tp_group
+            self.attn_tp_group if self.enable_dp_attention else self.tp_group
         )
         self.dp_tp_cpu_group = self.dp_tp_group.cpu_group
 
@@ -1604,7 +1604,7 @@ class Scheduler(
                 # Opportunistic flush at the disable_overlap sync boundary:
                 # forward_stream is idle (prev forward drained, next not launched),
                 # so `_flush`'s non-urgent guard compacts freely. Sync-free, best-effort.
-                if self.server_args.enable_unified_memory:
+                if self.enable_unified_memory:
                     try:
                         self.token_to_kv_pool_allocator.flush_opportunistic()
                     except Exception:
@@ -3272,7 +3272,7 @@ class Scheduler(
                             self.batch_record_buf[self.batch_record_ct].extend(
                                 batch_result.extra_keep_alive_refs
                             )
-                        if self.server_args.enable_unified_memory:
+                        if self.enable_unified_memory:
                             # Record a `forward_done` event after the forward (before
                             # copy_to_cpu); lazy-compaction `_flush` gates src reuse on
                             # it. Only the unified pool's allocator exposes these hooks.
@@ -3401,8 +3401,7 @@ class Scheduler(
 
     def _maybe_report_active_ranks(self) -> None:
         if not (
-            self.server_args.enable_dp_attention
-            and self.server_args.elastic_ep_backend is not None
+            self.enable_dp_attention and self.server_args.elastic_ep_backend is not None
         ):
             return
         # Get the tensors indicating rank activeness
@@ -3546,7 +3545,7 @@ class Scheduler(
         if not self.is_fully_idle():
             return
 
-        if self.server_args.enable_unified_memory:
+        if self.enable_unified_memory:
             try:
                 self.token_to_kv_pool_allocator.flush_opportunistic()
             except Exception:
