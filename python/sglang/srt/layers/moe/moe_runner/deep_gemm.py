@@ -62,33 +62,6 @@ _MASKED_GEMM_FAST_ACT = get_bool_env_var("SGLANG_MASKED_GEMM_FAST_ACT")
 _DEEPGEMM_ON_H20 = get_bool_env_var("SGLANG_DEEPGEMM_ON_H20")
 
 
-def _batch_invariant_deepep_normal_expert_m(
-    num_recv_tokens_per_expert: List[int], runner_config: MoeRunnerConfig
-) -> Optional[int]:
-    if (
-        not num_recv_tokens_per_expert
-        or not get_server_args().enable_deterministic_inference
-    ):
-        return None
-
-    num_experts = runner_config.num_experts
-    num_local_experts = runner_config.num_local_experts
-    if not num_experts or not num_local_experts:
-        return None
-
-    expert_alignment = 128
-    ep_size = max(1, ceil_div(num_experts, num_local_experts))
-    max_dispatch_tokens_per_rank = (
-        envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
-    )
-    max_expert_tokens = max_dispatch_tokens_per_rank * ep_size
-    max_actual_tokens = max(num_recv_tokens_per_expert)
-    return max(
-        ceil_div(max_expert_tokens, expert_alignment) * expert_alignment,
-        ceil_div(max_actual_tokens, expert_alignment) * expert_alignment,
-    )
-
-
 # TODO(kaixih@nvidia): ideally we should merge this logic into
 # `fill_gateup_input_triton_kernel` to directly generate e8m0 scale.
 @torch.compile(disable=_is_hip or _is_npu)
@@ -750,17 +723,8 @@ def pre_permute_deepep_normal_to_deep_gemm(
     ) = dispatch_output
     assert runner_config.activation == "silu"
 
-    expert_m = _batch_invariant_deepep_normal_expert_m(
-        num_recv_tokens_per_expert, runner_config
-    )
-    if expert_m is None:
-        scatter_num_recv_tokens_per_expert = num_recv_tokens_per_expert
-        all_tokens = sum(num_recv_tokens_per_expert)
-    else:
-        scatter_num_recv_tokens_per_expert = [
-            expert_m for _ in num_recv_tokens_per_expert
-        ]
-        all_tokens = expert_m * len(num_recv_tokens_per_expert)
+    scatter_num_recv_tokens_per_expert = num_recv_tokens_per_expert
+    all_tokens = sum(num_recv_tokens_per_expert)
     running_state["all_tokens"] = all_tokens
 
     K = hidden_states.shape[1]
