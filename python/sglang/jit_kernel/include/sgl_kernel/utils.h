@@ -163,6 +163,18 @@ inline constexpr auto div_ceil(T a, U b) {
   return (a + b - 1) / b;
 }
 
+/// \brief Smallest power of two >= x (returns 1 for x <= 1, up to 2^31).
+/// Common host-side bit trick shared by the MoE align / sort kernels.
+inline constexpr uint32_t next_pow2(uint32_t x) noexcept {
+  --x;
+  x |= x >> 1;
+  x |= x >> 2;
+  x |= x >> 4;
+  x |= x >> 8;
+  x |= x >> 16;
+  return ++x;
+}
+
 /// \brief Returns the byte width of a DLPack data type.
 inline auto dtype_bytes(DLDataType dtype) -> std::size_t {
   return static_cast<std::size_t>(dtype.bits / 8);
