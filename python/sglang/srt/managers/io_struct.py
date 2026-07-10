@@ -50,6 +50,7 @@ import zmq.asyncio
 from pydantic import PlainValidator
 
 from sglang.srt.environ import envs
+from sglang.srt.utils.common import safe_pickle_loads
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.schedule_batch import Modality
@@ -2079,7 +2080,7 @@ def unwrap_from_pickle(obj: Optional[object]) -> Optional[object]:
     if _USE_PICKLE_IPC:
         return obj
     assert isinstance(obj, PickleWrapper)
-    return pickle.loads(obj.data)
+    return safe_pickle_loads(obj.data)
 
 
 def enc_hook(obj: Any) -> Any:
@@ -2172,7 +2173,7 @@ def _maybe_wrap_pickle(obj: Any) -> Any:
 
 def _maybe_unwrap_pickle(obj: Any) -> Any:
     if isinstance(obj, PickleWrapper):
-        obj = pickle.loads(obj.data)
+        obj = safe_pickle_loads(obj.data)
         if envs.SGLANG_LOG_PICKLE_IPC_OBJECTS.get():
             logger.info(f"Object of type {type(obj)} is unwrapped from PickleWrapper.")
         return obj
@@ -2190,7 +2191,7 @@ def msgpack_decode(data: bytes) -> Any:
 
 def sock_send(socket: zmq.Socket, obj: Any, flags: int = 0) -> None:
     if _USE_PICKLE_IPC:
-        socket.send_pyobj(obj, flags=flags, protocol=pickle.HIGHEST_PROTOCOL)
+        socket.send(pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL), flags=flags)
         return
 
     socket.send(msgpack_encode(obj), flags=flags)
@@ -2198,7 +2199,8 @@ def sock_send(socket: zmq.Socket, obj: Any, flags: int = 0) -> None:
 
 def sock_recv(socket: zmq.Socket, flags: int = 0) -> Any:
     if _USE_PICKLE_IPC:
-        return socket.recv_pyobj(flags=flags)
+        data = socket.recv(flags=flags)
+        return safe_pickle_loads(data)
 
     data = socket.recv(flags=flags)
     return msgpack_decode(data)
@@ -2206,7 +2208,7 @@ def sock_recv(socket: zmq.Socket, flags: int = 0) -> Any:
 
 async def async_sock_send(socket: zmq.asyncio.Socket, obj: Any, flags: int = 0) -> None:
     if _USE_PICKLE_IPC:
-        await socket.send_pyobj(obj, flags=flags, protocol=pickle.HIGHEST_PROTOCOL)
+        await socket.send(pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL), flags=flags)
         return
 
     await socket.send(msgpack_encode(obj), flags=flags)
@@ -2214,7 +2216,8 @@ async def async_sock_send(socket: zmq.asyncio.Socket, obj: Any, flags: int = 0) 
 
 async def async_sock_recv(socket: zmq.asyncio.Socket, flags: int = 0) -> Any:
     if _USE_PICKLE_IPC:
-        return await socket.recv_pyobj(flags=flags)
+        data = await socket.recv(flags=flags)
+        return safe_pickle_loads(data)
 
     data = await socket.recv(flags=flags)
     return msgpack_decode(data)
