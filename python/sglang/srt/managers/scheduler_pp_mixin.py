@@ -982,8 +982,11 @@ class SchedulerPPMixin:
         if (
             result.logits_output is not None
             and result.logits_output.hidden_states is not None
+            and any(getattr(req, "dspark_hidden_meta", None) for req in batch.reqs)
         ):
-            tensor_dict["dspark_aux_hidden_states_0"] = result.logits_output.hidden_states
+            tensor_dict["dspark_aux_hidden_states_0"] = (
+                result.logits_output.hidden_states
+            )
 
         if batch.return_logprob:
             logprob_dict = get_logprob_dict_from_result(result)
