@@ -1,3 +1,4 @@
+import os
 from typing import Optional
 
 import torch
@@ -9,6 +10,25 @@ try:
     _has_flashinfer = True
 except ImportError:
     _has_flashinfer = False
+
+# Allow users to force-disable the FlashInfer norm path and fall back to the
+# native sgl_kernel C++/CUDA norm ops. FlashInfer's norm kernels (via
+# cutlass-dsl) require a CUDA runtime that matches the installed driver; on
+# systems where FlashInfer is importable but its kernels cannot run at runtime
+# (e.g. a CUDA 13 FlashInfer/cutlass-dsl build on a CUDA 12 driver, or a JIT
+# compilation failure), set SGLANG_KERNEL_DISABLE_FLASHINFER_NORM=1 to fall
+# back to the native ops, which have no such driver dependency.
+#
+# Naming follows sgl-kernel's existing SGLANG_KERNEL_* prefix (see
+# debug_utils.SGLANG_KERNEL_API_LOGLEVEL): the SGLANG_ prefix matches sglang's
+# convention, the KERNEL segment namespaces the subpackage. sgl-kernel cannot
+# import sglang.srt.environ (sglang depends on sgl-kernel, not the reverse),
+# so this is read with os.environ directly instead of the Envs descriptor used
+# by sglang-owned env vars. Accepts true/1 (case-insensitive), matching
+# sglang's get_bool_env_var semantics.
+_disable_flashinfer_norm = os.environ.get(
+    "SGLANG_KERNEL_DISABLE_FLASHINFER_NORM", ""
+).lower() in ("true", "1")
 
 _FLASHINFER_NORM_SUPPORTED_DTYPES = {torch.float16, torch.bfloat16}
 
@@ -114,6 +134,7 @@ def rmsnorm(
     #      https://github.com/flashinfer-ai/flashinfer/pull/2733
     if (
         _has_flashinfer
+        and not _disable_flashinfer_norm
         and input.dtype in _FLASHINFER_NORM_SUPPORTED_DTYPES
         and not torch.compiler.is_dynamo_compiling()
     ):
@@ -154,6 +175,7 @@ def fused_add_rmsnorm(
     """
     if (
         _has_flashinfer
+        and not _disable_flashinfer_norm
         and input.dtype in _FLASHINFER_NORM_SUPPORTED_DTYPES
         and not torch.compiler.is_dynamo_compiling()
     ):
@@ -195,6 +217,7 @@ def gemma_rmsnorm(
     """
     if (
         _has_flashinfer
+        and not _disable_flashinfer_norm
         and input.dtype in _FLASHINFER_NORM_SUPPORTED_DTYPES
         and not torch.compiler.is_dynamo_compiling()
     ):
@@ -235,6 +258,7 @@ def gemma_fused_add_rmsnorm(
     """
     if (
         _has_flashinfer
+        and not _disable_flashinfer_norm
         and input.dtype in _FLASHINFER_NORM_SUPPORTED_DTYPES
         and not torch.compiler.is_dynamo_compiling()
     ):
