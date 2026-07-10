@@ -720,6 +720,16 @@ class DSparkWorkerV2(BaseSpecWorker):
                 self._run_idle_verify_participation(batch)
             return self._decode_idle_result(on_publish=on_publish)
 
+        prefill_tail_start_positions = getattr(
+            draft_input, "prefill_tail_start_positions", None
+        )
+        prefill_tail_valid_mask = getattr(draft_input, "prefill_tail_valid_mask", None)
+        prefill_tail_valid_lens = (
+            prefill_tail_valid_mask.to(torch.int64).sum(dim=1)
+            if prefill_tail_valid_mask is not None
+            and prefill_tail_valid_mask.numel() > 0
+            else None
+        )
         self._maybe_inject_pd_prefill_tail(batch, draft_input)
 
         batch.seq_lens.record_stream(
@@ -934,11 +944,14 @@ class DSparkWorkerV2(BaseSpecWorker):
             req_pool_indices=batch.req_pool_indices,
             rids=[req.rid for req in batch.reqs],
             prefix_lens=prefix_lens,
+            anchor_tokens=draft_block_ids[:, 0],
             draft_tokens=draft_tokens,
             bonus_tokens=bonus,
             correct_len=correct_len,
             cap_trim_lens=cap_trim_lens,
             commit_lens=commit_lens,
+            prefill_tail_start_positions=prefill_tail_start_positions,
+            prefill_tail_valid_lens=prefill_tail_valid_lens,
         )
         if self._block_accept_recorder is not None and not proposal.folded:
             self._block_accept_recorder.observe_verify_step(
