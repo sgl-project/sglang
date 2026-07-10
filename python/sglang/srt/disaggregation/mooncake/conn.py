@@ -1971,7 +1971,11 @@ class MooncakeKVReceiver(CommonKVReceiver):
             is_dummy = bootstrap_info["is_dummy"]
             local_state_indices = state_indices
             if spec_metadata and spec_metadata.get("pp_slices"):
-                pp_rank = int(bootstrap_info.get("pp_rank", 0))
+                pp_rank = int(
+                    bootstrap_info.get(
+                        "target_pp_rank", bootstrap_info.get("pp_rank", 0)
+                    )
+                )
                 pp_slice = spec_metadata["pp_slices"].get(str(pp_rank), {})
                 local_state_indices = list(
                     state_indices

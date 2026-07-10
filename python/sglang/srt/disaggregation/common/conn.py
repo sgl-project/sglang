@@ -1209,6 +1209,7 @@ class CommonKVReceiver(BaseKVReceiver):
                             target_pp_rank,
                         )
                         if bootstrap_info is not None:
+                            bootstrap_info["target_pp_rank"] = target_pp_rank
                             if self.kv_mgr.is_mla_backend:
                                 # For MLA: target_tp_rank is the selected real rank, others are dummy ranks
                                 bootstrap_info["is_dummy"] = not bool(
