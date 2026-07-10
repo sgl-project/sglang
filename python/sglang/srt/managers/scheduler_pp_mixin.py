@@ -997,6 +997,11 @@ class SchedulerPPMixin:
         tensor_dict = {
             "next_token_ids": result.next_token_ids,
         }
+        if (
+            result.logits_output is not None
+            and result.logits_output.hidden_states is not None
+        ):
+            tensor_dict["dspark_aux_hidden_states_0"] = result.logits_output.hidden_states
 
         if batch.return_logprob:
             logprob_dict = get_logprob_dict_from_result(result)
@@ -1138,7 +1143,14 @@ class SchedulerPPMixin:
         )
         output_result = GenerationBatchResult(
             logits_output=logits_output,
-            pp_hidden_states_proxy_tensors=None,
+            pp_hidden_states_proxy_tensors=(
+                pp_outputs
+                if any(
+                    key.startswith("dspark_aux_hidden_states_")
+                    for key in pp_outputs.tensors
+                )
+                else None
+            ),
             next_token_ids=pp_outputs["next_token_ids"],
             extend_input_len_per_req=extend_input_len_per_req,
             extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
