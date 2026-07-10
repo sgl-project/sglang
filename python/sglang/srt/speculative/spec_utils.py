@@ -17,12 +17,6 @@ from sglang.kernels.ops.speculative.cache_locs import (
     assign_extend_cache_locs as assign_extend_cache_locs,
 )
 from sglang.kernels.ops.speculative.cache_locs import (
-    assign_req_to_token_pool as assign_req_to_token_pool,
-)
-from sglang.kernels.ops.speculative.cache_locs import (
-    assign_req_to_token_pool_func as assign_req_to_token_pool_func,
-)
-from sglang.kernels.ops.speculative.cache_locs import (
     filter_finished_cache_loc_kernel as filter_finished_cache_loc_kernel,
 )
 from sglang.kernels.ops.speculative.cache_locs import (
@@ -44,6 +38,12 @@ from sglang.srt.distributed.parallel_state import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import set_mamba_track_indices_from_reqs
+from sglang.srt.mem_cache.allocation import (
+    assign_req_to_token_pool as assign_req_to_token_pool,
+)
+from sglang.srt.mem_cache.allocation import (
+    assign_req_to_token_pool_func as assign_req_to_token_pool_func,
+)
 from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import (
     is_cpu,
