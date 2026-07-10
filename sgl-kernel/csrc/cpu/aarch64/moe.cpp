@@ -238,6 +238,10 @@ at::Tensor fused_experts_cpu(
     const std::optional<at::Tensor>& /*w13_zero*/,
     const std::optional<at::Tensor>& /*w2_zero*/,
     const std::optional<std::vector<int64_t>> block_size,
+    const std::optional<at::Tensor>& /*w1_bias*/,
+    const std::optional<at::Tensor>& /*w2_bias*/,
+    const std::optional<double>& /*alpha*/,
+    const std::optional<double>& /*limit*/,
     bool /*is_vnni*/) {
   const auto st = hidden_states.scalar_type();
   CHECK_INPUT(hidden_states);

@@ -10,7 +10,6 @@ from sglang.srt.configs.mamba_utils import (
     Mamba2StateShape,
 )
 from sglang.srt.configs.model_config import AttentionArch
-from sglang.srt.layers import dp_attention as _dp_attention
 from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
 from sglang.srt.layers.attention.linear.lightning_backend import (
     LightningAttentionBackend,
@@ -21,14 +20,18 @@ from sglang.srt.mem_cache.memory_pool import (
     HybridReqToTokenPool,
     MHATokenToKVPool,
 )
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    CudaGraphConfig,
+    PhaseConfig,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.runtime_context import get_context, get_parallel
 
-from ..mock_server_args import make_mock_server_args
-
-_dp_attention.get_attention_tp_size = lambda: 1
-_dp_attention.get_attention_tp_rank = lambda: 0
+_parallel_override = get_parallel().override(attn_tp_size=1, attn_tp_rank=0)
+_parallel_override.__enter__()
 
 # seg_la kernel constraints (see seg_la.py:683-694):
 #   - decode (`seg_la_d_kernel`): K_SPLIT_DIM = 128, so head_dim must be >= 128
@@ -182,6 +185,7 @@ class TinyLightningModelConfig:
         self.is_encoder_decoder = False
         self.is_multimodal = False
         self.is_generation = True
+        self.quantization = None
         self.is_hybrid_swa = False
         self.is_local_attention_model = False
         self.attention_chunk_size = None
@@ -226,14 +230,24 @@ class MockLightningModelRunner(ModelRunner):
         speculative_num_draft_tokens = (
             case.input_lens[0]
             if case.forward_mode.is_target_verify()
-            or case.forward_mode.is_draft_extend(include_v2=True)
+            or case.forward_mode.is_draft_extend_v2()
             else 0
         )
-        self.server_args = make_mock_server_args(
+        self._server_args_override = get_context().override_server_args(
             attention_backend=case.backend,
             chunked_prefill_size=-1,
-            disable_cuda_graph=disable_cuda_graph,
-            disable_piecewise_cuda_graph=disable_piecewise_cuda_graph,
+            cuda_graph_config=CudaGraphConfig(
+                decode=PhaseConfig(
+                    backend=Backend.DISABLED if disable_cuda_graph else Backend.FULL,
+                ),
+                prefill=PhaseConfig(
+                    backend=(
+                        Backend.DISABLED
+                        if (disable_cuda_graph or disable_piecewise_cuda_graph)
+                        else Backend.TC_PIECEWISE
+                    ),
+                ),
+            ),
             dllm_algorithm=None,
             dllm_algorithm_config=None,
             enable_deterministic_inference=False,
@@ -242,9 +256,7 @@ class MockLightningModelRunner(ModelRunner):
             linear_attn_backend="triton",
             linear_attn_decode_backend=None,
             linear_attn_prefill_backend=None,
-            mamba_cache_chunk_size=64,
             max_running_requests=None,
-            model_path=None,
             revision=None,
             speculative_algorithm=None,
             speculative_eagle_topk=1 if case.forward_mode.is_target_verify() else 0,
@@ -252,7 +264,11 @@ class MockLightningModelRunner(ModelRunner):
             speculative_num_steps=max(0, speculative_num_draft_tokens - 1),
             triton_attention_num_kv_splits=8,
             triton_attention_split_tile_size=None,
+            # Pin the lazy mamba_cache_chunk_size property cache: production
+            # derives it from hf_config + page_size, which needs a real model.
+            _mamba_cache_chunk_size=64,
         )
+        self.server_args = self._server_args_override.install()
         # Lightning seg_la temporal state is [num_heads, head_dim, head_dim]; Bailing's
         # mamba2_cache_params sets intermediate_size=0, n_groups=0, conv_kernel=1
         # because seg_la does not use a conv state (the conv shape collapses to (0, 0)).
@@ -304,6 +320,7 @@ class MockLightningModelRunner(ModelRunner):
         self.sliding_window_size = None
         self.use_mla_backend = False
         self.is_draft_worker = False
+        self._kernel_warmed_up = True
 
     @property
     def hybrid_gdn_config(self):

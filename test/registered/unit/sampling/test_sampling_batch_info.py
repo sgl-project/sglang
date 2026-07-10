@@ -3,7 +3,7 @@
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=9, suite="base-a-test-cpu")
-register_cpu_ci(est_time=8, suite="base-b-test-cpu")
+register_cpu_ci(est_time=8, suite="base-c-test-cpu")
 
 import unittest
 from unittest.mock import MagicMock, patch
@@ -452,7 +452,7 @@ class TestFromScheduleBatch(CustomTestCase):
         req.tokenizer.eos_token_id = eos_id
         return req
 
-    @patch("sglang.srt.sampling.sampling_batch_info.get_global_server_args")
+    @patch("sglang.srt.sampling.sampling_batch_info.get_server_args")
     def test_basic_construction(self, mock_server_args):
         """Test that from_schedule_batch correctly extracts sampling params from requests."""
         mock_server_args.return_value.enable_deterministic_inference = False
@@ -469,7 +469,7 @@ class TestFromScheduleBatch(CustomTestCase):
         self.assertAlmostEqual(info.top_ps[0].item(), 0.9, places=5)
         self.assertEqual(info.top_ks[0].item(), 50)
 
-    @patch("sglang.srt.sampling.sampling_batch_info.get_global_server_args")
+    @patch("sglang.srt.sampling.sampling_batch_info.get_server_args")
     def test_greedy_detection(self, mock_server_args):
         """Test that top_k=1 sets is_all_greedy=True."""
         mock_server_args.return_value.enable_deterministic_inference = False
@@ -482,7 +482,7 @@ class TestFromScheduleBatch(CustomTestCase):
         info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
         self.assertTrue(info.is_all_greedy)
 
-    @patch("sglang.srt.sampling.sampling_batch_info.get_global_server_args")
+    @patch("sglang.srt.sampling.sampling_batch_info.get_server_args")
     def test_logit_bias_construction(self, mock_server_args):
         """Test that logit_bias dict is converted to a tensor with correct values."""
         mock_server_args.return_value.enable_deterministic_inference = False
@@ -498,7 +498,7 @@ class TestFromScheduleBatch(CustomTestCase):
         self.assertAlmostEqual(info.logit_bias[0, 10].item(), -1.0)
         self.assertAlmostEqual(info.logit_bias[0, 0].item(), 0.0)
 
-    @patch("sglang.srt.sampling.sampling_batch_info.get_global_server_args")
+    @patch("sglang.srt.sampling.sampling_batch_info.get_server_args")
     def test_deterministic_seed(self, mock_server_args):
         """Test that explicit seed=123 is kept and missing seed defaults to 42."""
         mock_server_args.return_value.enable_deterministic_inference = True
@@ -513,7 +513,7 @@ class TestFromScheduleBatch(CustomTestCase):
         self.assertEqual(info.sampling_seed[0].item(), 123)
         self.assertEqual(info.sampling_seed[1].item(), 42)  # default
 
-    @patch("sglang.srt.sampling.sampling_batch_info.get_global_server_args")
+    @patch("sglang.srt.sampling.sampling_batch_info.get_server_args")
     def test_from_schedule_batch_sampling_flags(self, mock_server_args):
         """Test that sampling flags (need_top_p/top_k/min_p) are set correctly."""
         mock_server_args.return_value.enable_deterministic_inference = False
@@ -529,7 +529,7 @@ class TestFromScheduleBatch(CustomTestCase):
         self.assertTrue(info.need_min_p_sampling)  # 0.1 > 0
         self.assertFalse(info.is_all_greedy)  # top_k=50 > 1
 
-    @patch("sglang.srt.sampling.sampling_batch_info.get_global_server_args")
+    @patch("sglang.srt.sampling.sampling_batch_info.get_server_args")
     def test_no_logit_bias_when_all_none(self, mock_server_args):
         """Test that logit_bias stays None when no request has logit_bias set."""
         mock_server_args.return_value.enable_deterministic_inference = False
@@ -542,7 +542,7 @@ class TestFromScheduleBatch(CustomTestCase):
         info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
         self.assertIsNone(info.logit_bias)
 
-    @patch("sglang.srt.sampling.sampling_batch_info.get_global_server_args")
+    @patch("sglang.srt.sampling.sampling_batch_info.get_server_args")
     def test_custom_logit_processor_merging(self, mock_server_args):
         """Test deserialization and merging of custom logit processors."""
         from sglang.srt.sampling.custom_logit_processor import (

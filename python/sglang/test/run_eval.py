@@ -6,6 +6,7 @@ python3 -m sglang.test.run_eval --port 30000 --eval-name mmlu --num-examples 10
 import argparse
 import json
 import os
+import statistics
 import time
 
 from sglang.test.simple_eval_common import (
@@ -82,6 +83,7 @@ def run_eval_once(args, base_url: str, eval_obj: Eval) -> dict:
             **common_kwargs,
             reasoning_effort=getattr(args, "reasoning_effort", None),
             extra_body=extra_body if extra_body else None,
+            record_meta_info=True,
         )
 
     # Run eval
@@ -90,6 +92,30 @@ def run_eval_once(args, base_url: str, eval_obj: Eval) -> dict:
     latency = time.perf_counter() - tic
 
     return result, latency, sampler
+
+
+def print_accept_length_summary(samplers: list) -> None:
+    accept_lengths = [
+        m["spec_accept_length"]
+        for sampler in samplers
+        for m in getattr(sampler, "_meta_infos", [])
+        if m.get("spec_accept_length") is not None
+    ]
+    print("=" * 20)
+    if not accept_lengths:
+        print(
+            "Speculative decoding: no per-request spec_accept_length in responses "
+            "(non-speculative server, or --api completion which lacks return_meta_info)."
+        )
+    else:
+        print(
+            f"Speculative accept length (per-request, from meta_info): "
+            f"n={len(accept_lengths)} "
+            f"mean={statistics.fmean(accept_lengths):.4f} "
+            f"min={min(accept_lengths):.4f} "
+            f"max={max(accept_lengths):.4f}"
+        )
+    print("=" * 20)
 
 
 def run_eval(args):
@@ -178,11 +204,23 @@ def run_eval(args):
             num_shots=getattr(args, "num_shots", 5),
             data_path=getattr(args, "gsm8k_data_path", None),
         )
+    elif args.eval_name == "mixed_prefix_gsm8k":
+        from sglang.test.simple_eval_mixed_prefix_gsm8k import MixedPrefixGSM8KEval
+
+        eval_obj = MixedPrefixGSM8KEval(
+            num_examples=args.num_examples,
+            num_threads=args.num_threads,
+            num_shots=args.num_shots,
+            secondary_pool_size=args.mixed_prefix_gsm8k_secondary_pool_size,
+            data_path=args.gsm8k_data_path,
+            seed=args.mixed_prefix_gsm8k_seed,
+        )
     else:
         raise ValueError(f"Invalid eval name: {args.eval_name}")
 
     if getattr(args, "repeat", 1) == 1:
         result, latency, sampler = run_eval_once(args, base_url, eval_obj)
+        samplers = [sampler]
         metrics = result.metrics | {"score": result.score}
         metrics["latency"] = latency
         print(f"Total latency: {latency:.3f} s")
@@ -218,9 +256,11 @@ def run_eval(args):
         scores_repeat = []
         latencies = []
         total_completion_tokens = 0
+        samplers = []
 
         for f in futures:
             result, latency, sampler = f.result()
+            samplers.append(sampler)
             scores_repeat.append(result.score)
             latencies.append(latency)
             total_completion_tokens += sum(sampler._completion_tokens)
@@ -254,6 +294,8 @@ def run_eval(args):
         )
 
         executor.shutdown()
+
+    print_accept_length_summary(samplers)
 
     # Dump reports
     file_stem = f"{args.eval_name}_{sampler.model.replace('/', '_')}"
@@ -366,6 +408,18 @@ if __name__ == "__main__":
         type=str,
         default=None,
         help="Path to GSM8K data file (e.g., test.jsonl)",
+    )
+    parser.add_argument(
+        "--mixed-prefix-gsm8k-secondary-pool-size",
+        type=int,
+        default=15,
+        help="Size of secondary example pool for eval_name=mixed_prefix_gsm8k (default: 15)",
+    )
+    parser.add_argument(
+        "--mixed-prefix-gsm8k-seed",
+        type=int,
+        default=42,
+        help="Seed for per-question random sampling in mixed_prefix_gsm8k (default: 42)",
     )
 
     args = parser.parse_args()

@@ -24,7 +24,7 @@ patches:
         replacement: |
           hidden_states = logits_output.hidden_states
 
-  - target: sglang.srt.speculative.eagle_draft_cuda_graph_runner.EAGLEDraftCudaGraphRunner.capture_one_batch_size
+  - target: sglang.srt.speculative.eagle_draft_cuda_graph_runner.EAGLEDraftCudaGraphRunner.capture_one_shape
     edits:
       - match: |
           forward_batch.spec_info.hidden_states = hidden_states_backup

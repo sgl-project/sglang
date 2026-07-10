@@ -6,17 +6,13 @@ metatags:
     description: "Explore SGLang diffusion model cookbooks for image and video generation deployment, invocation, optimization, and benchmarking examples."
 ---
 
-## Offline Diffusion Models
+Choose a recipe by output modality. The sidebar stays organized by model family, while this overview separates image, video, and realtime/world workloads.
 
-Offline models generate each image or video request as a bounded denoising job. Most of them use bidirectional attention over the whole latent sequence.
+## Image Models
+
+Image models generate one image request as a bounded denoising job, usually with bidirectional attention over the whole latent sequence.
 
 <CardGroup cols={3}>
-  <Card
-    title="Cosmos"
-    mode="card"
-    href="/cookbook/diffusion/Cosmos/Cosmos3"
-    img="/cards/logos/nvidia.png"
-  />
   <Card
     title="FLUX"
     mode="card"
@@ -28,18 +24,6 @@ Offline models generate each image or video request as a bounded denoising job. 
     mode="card"
     href="/cookbook/diffusion/Ideogram/Ideogram4"
     img="/cards/logos/ideogram.png"
-  />
-  <Card
-    title="Wan"
-    mode="card"
-    href="/cookbook/diffusion/Wan/Wan2.2"
-    img="/cards/logos/wan.png"
-  />
-  <Card
-    title="LTX"
-    mode="card"
-    href="/cookbook/diffusion/LTX/LTX2 & LTX2.3"
-    img="/cards/logos/ltx.svg"
   />
   <Card
     title="Qwen-Image"
@@ -54,10 +38,47 @@ Offline models generate each image or video request as a bounded denoising job. 
     img="/cards/logos/zimage.png"
   />
   <Card
+    title="Krea"
+    mode="card"
+    href="/cookbook/diffusion/Krea/Krea-2"
+    img="/cards/logos/krea.png"
+  />
+  <Card
     title="ERNIE-Image"
     mode="card"
     href="/cookbook/diffusion/Ernie-Image/Ernie-Image"
     img="/cards/logos/ernie.png"
+  />
+</CardGroup>
+
+## Video Models
+
+Video models denoise a bounded latent video sequence for each request. Use these recipes for offline text-to-video, image-to-video, and video generation serving.
+
+<CardGroup cols={3}>
+  <Card
+    title="Cosmos"
+    mode="card"
+    href="/cookbook/diffusion/Cosmos/Cosmos3"
+    img="/cards/logos/nvidia.png"
+  />
+  <Card
+    title="Wan"
+    mode="card"
+    href="/cookbook/diffusion/Wan/Wan2.2"
+    img="/cards/logos/wan.png"
+  />
+  <Card
+    title="LTX"
+    mode="card"
+    href="/cookbook/diffusion/LTX/LTX2 & LTX2.3"
+    img="/cards/logos/ltx.svg"
+  />
+  <Card
+    title="JoyEcho"
+    mode="card"
+    href="/cookbook/diffusion/JoyEcho/JoyEcho"
+    img="/cards/logos/ltx.svg"
   />
   <Card
     title="MOVA"
@@ -73,9 +94,21 @@ Realtime models keep a session alive and generate chunk by chunk with causal sta
 
 <CardGroup cols={3}>
   <Card
-    title="LingBot World (Realtime)"
+    title="LingBot World"
     mode="card"
     href="/cookbook/diffusion/LingBot-World/LingBot-World"
     img="/cards/logos/inclusionai.png"
+  />
+  <Card
+    title="LingBot World 2.0"
+    mode="card"
+    href="/cookbook/diffusion/LingBot-World/LingBot-World-2.0"
+    img="/cards/logos/inclusionai.png"
+  />
+  <Card
+    title="SANA-WM"
+    mode="card"
+    href="/cookbook/diffusion/SANA-WM/SANA-WM"
+    img="/cards/logos/sana.png"
   />
 </CardGroup>

@@ -5,7 +5,7 @@ import triton.language as tl
 from sglang.srt.lora.utils import LoRABatchInfo
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_segments"])
 def _chunked_embedding_lora_a_kernel(
     # Pointers to tensors
     input_ids,
@@ -39,6 +39,10 @@ def _chunked_embedding_lora_a_kernel(
     # If chunk id is larger than actual number of chunks, skip
     if chunk_idx >= num_segments:
         return
+    chunk_start = tl.load(seg_indptr + chunk_idx)
+    chunk_end = tl.load(seg_indptr + chunk_idx + 1)
+    if chunk_start == chunk_end:
+        return
     # Load LoRA adapter index for this segment, then look up the rank
     lora_index = tl.load(weight_indices + chunk_idx)
     rank_val = tl.load(lora_ranks + lora_index)
@@ -46,8 +50,6 @@ def _chunked_embedding_lora_a_kernel(
     if rank_val == 0:
         return
     # for each token in chunk, load embedding across rank dimension
-    chunk_start = tl.load(seg_indptr + chunk_idx)
-    chunk_end = tl.load(seg_indptr + chunk_idx + 1)
     for c in range(chunk_start, chunk_end):
         s_index = tl.load(permutation + c)
         # Load the token ID
@@ -108,8 +110,13 @@ def chunked_embedding_lora_a_forward(
     # Block size for rank dimension
     BLOCK_RANK = 128
     num_segments = batch_info.num_segments
+    segment_grid = (
+        batch_info.weight_indices.shape[0]
+        if batch_info.use_cuda_graph
+        else num_segments
+    )
     # 1D Grid: one program per chunk of embedding lookup work
-    grid = (batch_info.bs if batch_info.use_cuda_graph else num_segments,)
+    grid = (segment_grid,)
     output = torch.zeros((S, rank), device=input_ids.device, dtype=weights.dtype)
 
     _chunked_embedding_lora_a_kernel[grid](
@@ -127,7 +134,7 @@ def chunked_embedding_lora_a_forward(
         batch_info.seg_indptr,
         batch_info.weight_indices,
         batch_info.lora_ranks,
-        batch_info.num_segments,
+        segment_grid,
         batch_info.permutation,
         BLOCK_RANK,
     )
