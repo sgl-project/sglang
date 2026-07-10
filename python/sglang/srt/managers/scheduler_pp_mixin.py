@@ -114,9 +114,6 @@ class SchedulerPPMixin:
                 if self.cur_batch:
                     server_is_idle = False
                     pp_proxy_tensors = self._pp_recv_proxy_tensors()
-                    self._pp_validate_dspark_proxy_tensors(
-                        self.cur_batch, pp_proxy_tensors
-                    )
                 next_pp_outputs = None
                 next_batch_result = None
                 d2h_event = None
@@ -335,10 +332,7 @@ class SchedulerPPMixin:
                             self.launch_event
                         )
                         self.send_proxy_work = self._pp_send_dict_to_next_stage(
-                            self._pp_with_dspark_proxy_metadata(
-                                result.pp_hidden_states_proxy_tensors.tensors,
-                                self.cur_batch,
-                            ),
+                            result.pp_hidden_states_proxy_tensors.tensors,
                             async_send=True,
                             msg_type="proxy",
                         )
@@ -1003,47 +997,6 @@ class SchedulerPPMixin:
                 **logprob_dict,
             }
         return tensor_dict
-
-    @staticmethod
-    def _pp_batch_dspark_rids(batch: Optional[ScheduleBatch]) -> List[str]:
-        if batch is None:
-            return []
-        return [
-            req.rid
-            for req in batch.reqs
-            if getattr(req, "dspark_hidden_meta", None) is not None
-        ]
-
-    def _pp_with_dspark_proxy_metadata(
-        self: Scheduler, tensor_dict: Dict[str, torch.Tensor], batch: ScheduleBatch
-    ) -> Dict[str, torch.Tensor]:
-        dspark_rids = self._pp_batch_dspark_rids(batch)
-        if not dspark_rids:
-            return tensor_dict
-        hidden_states = tensor_dict.get("hidden_states")
-        tensor_dict["__dspark_proxy_rids__"] = dspark_rids
-        tensor_dict["__dspark_proxy_hidden_len__"] = (
-            int(hidden_states.shape[0]) if hidden_states is not None else None
-        )
-        return tensor_dict
-
-    def _pp_validate_dspark_proxy_tensors(
-        self: Scheduler,
-        batch: ScheduleBatch,
-        pp_proxy_tensors: Optional[PPProxyTensors],
-    ) -> None:
-        dspark_rids = self._pp_batch_dspark_rids(batch)
-        if not dspark_rids or pp_proxy_tensors is None:
-            return
-        proxy = pp_proxy_tensors.tensors
-        proxy_rids = proxy.get("__dspark_proxy_rids__")
-        if proxy_rids is not None and proxy_rids != dspark_rids:
-            raise RuntimeError(
-                "DSpark PP proxy rid mismatch before prefill forward: "
-                f"pp_rank={self.ps.pp_rank}, batch_rids={dspark_rids}, "
-                f"proxy_rids={proxy_rids}, "
-                f"proxy_hidden_len={proxy.get('__dspark_proxy_hidden_len__')}"
-            )
 
     def _pp_send_dict_to_next_stage(
         self: Scheduler,
