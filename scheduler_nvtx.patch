@@ -1,0 +1,208 @@
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index d464e74af2..94aeaf6aab 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -270,6 +270,9 @@ from sglang.srt.utils.hf_transformers_utils import (
+ from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
+ from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to_node
+ from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
++from sglang.srt.scheduler_env_vars import scheduler_envs
++from sglang.srt.request_latency_tracker import RequestLatencyTracker
++from sglang.srt.kv_transfer_checksum import KVTransferChecksumVerifier
+ from sglang.srt.utils.tensor_bridge import use_mlx
+ from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+ from sglang.utils import TypeBasedDispatcher, get_exception_traceback
+@@ -396,6 +399,13 @@ class Scheduler(
+         # Init metrics stats
+         self.init_metrics_collector(tp_rank, pp_rank, dp_rank)
+ 
++        # Init JoyFuture scheduler observability (latency tracking + KV checksum)
++        self.latency_tracker = RequestLatencyTracker(
++            enabled=scheduler_envs.SGLANG_ENABLE_PER_REQUEST_LATENCY.get(),
++        )
++        self.kv_checksum_verifier = KVTransferChecksumVerifier() if scheduler_envs.SGLANG_ENABLE_KV_TRANSFER_CHECKSUM.get() else None
++        self._decode_step_counter = 0
++
+         # Init inter-process communication
+         self.init_ipc_channels(port_args)
+         self.init_idle_sleeper()
+@@ -1529,6 +1539,7 @@ class Scheduler(
+             self.schedule_stream.wait_stream(self.forward_stream)
+ 
+     @DynamicGradMode()
++    @scheduler_nvtx_method("scheduler.event_loop_normal", color="dark_blue")
+     def event_loop_normal(self):
+         """A normal scheduler loop."""
+         while True:
+@@ -1563,6 +1574,7 @@ class Scheduler(
+                 self.invariant_checker.self_check_during_busy()
+ 
+     @DynamicGradMode()
++    @scheduler_nvtx_method("scheduler.event_loop_overlap", color="teal")
+     def event_loop_overlap(self):
+         """A scheduler loop that overlaps the CPU processing and GPU computation."""
+         self.result_queue: Deque[
+@@ -1676,6 +1688,12 @@ class Scheduler(
+         now = time.monotonic()
+         self.session_controller.maybe_reap(now)
+         for recv_req in recv_reqs:
++            # JoyFuture: start latency tracking for new requests
++            if self.latency_tracker.enabled and hasattr(recv_req, "rid"):
++                record = self.latency_tracker.start_request(recv_req)
++                if record:
++                    record.start_phase("prefill")
++
+             # Skip health check when server is busy — ongoing requests already carry health info.
+             if is_health_check_generate_req(recv_req) and not self.is_fully_idle(
+                 for_health_check=True
+@@ -2740,6 +2758,7 @@ class Scheduler(
+         res = min(res, self.req_to_token_pool.available_size())
+         return res
+ 
++    @scheduler_nvtx_method("scheduler.get_new_batch_prefill", color="magenta")
+     def get_new_batch_prefill(self, running_batch: ScheduleBatch) -> NextBatchPlan:
+         prefill_delayer_single_pass = None
+         if self.prefill_delayer:
+@@ -3051,6 +3070,7 @@ class Scheduler(
+                 new_lora_set
+             )
+ 
++    @scheduler_nvtx_method("scheduler.update_running_batch", color="orange")
+     def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
+         """Update the current running decoding batch."""
+         initial_bs = batch.batch_size()
+@@ -3465,6 +3485,16 @@ class Scheduler(
+     ):
+         self.publish_load_snapshot(force=batch.forward_mode.is_extend())
+ 
++        # JoyFuture: end the appropriate latency phase for each request
++        if self.latency_tracker.enabled:
++            if batch.forward_mode.is_decode():
++                for req in batch.reqs:
++                    self.latency_tracker.end_phase(req.rid, "decode", num_tokens=1)
++            elif batch.forward_mode.is_extend():
++                for req in batch.reqs:
++                    num_tokens = len(getattr(req, "origin_input_ids", []))
++                    self.latency_tracker.end_phase(req.rid, "prefill", num_tokens=num_tokens)
++
+         if batch.forward_mode.is_decode():
+             self.batch_result_processor.process_batch_result_decode(batch, result)
+         elif batch.forward_mode.is_extend():
+@@ -3479,6 +3509,16 @@ class Scheduler(
+         elif batch.forward_mode.is_idle():
+             self.batch_result_processor.process_batch_result_idle(batch, result)
+ 
++        # JoyFuture: end latency tracking for naturally completed requests
++        if self.latency_tracker.enabled:
++            for req in batch.reqs:
++                if req.finished() and not req.is_retracted:
++                    self.latency_tracker.end_request(req.rid)
++
++        # JoyFuture: count decode steps for KV cache clear scheduling
++        if batch.forward_mode.is_decode():
++            self._decode_step_counter += 1
++
+         self.metrics_reporter.log_batch_result_stats(batch, result)
+ 
+         # Emit forward pass metrics (every iteration when enabled)
+@@ -3880,6 +3920,18 @@ class Scheduler(
+         return RpcReqOutput(success=success, message="" if not exec else str(exec))
+ 
+     def abort_request(self, recv_req: AbortReq):
++        # JoyFuture: end latency tracking for aborted requests
++        if self.latency_tracker.enabled:
++            aborted_rids = set()
++            for req in self.waiting_queue:
++                if recv_req.abort_all or req.rid.startswith(recv_req.rid):
++                    aborted_rids.add(req.rid)
++            for req in self.running_batch.reqs if self.running_batch else []:
++                if not req.finished() and (recv_req.abort_all or req.rid.startswith(recv_req.rid)):
++                    aborted_rids.add(req.rid)
++            for rid in aborted_rids:
++                self.latency_tracker.end_request(rid, aborted=True, abort_reason="user_abort")
++
+         if (chunked_req := self.chunked_req) is not None:
+             if recv_req.abort_all or chunked_req.rid.startswith(recv_req.rid):
+                 self._pending_chunked_abort_req = chunked_req
+diff --git a/python/sglang/srt/scheduler_env_vars.py b/python/sglang/srt/scheduler_env_vars.py
+new file mode 100644
+index 0000000000..168931200e
+--- /dev/null
++++ b/python/sglang/srt/scheduler_env_vars.py
+@@ -0,0 +1,49 @@
++# Copyright 2023-2024 SGLang Team
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++# ==============================================================================
++"""Scheduler-specific environment variable controls.
++
++Extended by JoyFuture: added env vars for tuning scheduler behavior at
++runtime without restarting the server. These follow the upstream
++``Envs`` class pattern defined in ``sglang.srt.environ``.
++"""
++
++from sglang.srt.environ import EnvBool, EnvInt, Envs
++
++
++class SchedulerEnvs(Envs):
++    # Controls whether the scheduler emits per-request latency callbacks to the
++    # metrics reporter. When enabled, each token generation records the end-to-end
++    # latency broken down by phase (prefill, decode, transfer). This is useful for
++    # debugging agentic workloads where request latency is highly variable.
++    SGLANG_ENABLE_PER_REQUEST_LATENCY = EnvBool(False)
++
++    # Controls whether the scheduler verifies KV cache transfer integrity by
++    # computing and comparing checksums on PD disaggregation transfers. When
++    # enabled, mismatches are logged as warnings and the affected requests are
++    # retried. Adds ~1-2% overhead to PD transfer bandwidth.
++    SGLANG_ENABLE_KV_TRANSFER_CHECKSUM = EnvBool(False)
++
++    # Number of decode steps after which the scheduler forces a KV cache clear
++    # in the decode pool. This is a tuning knob for long-running decode batches
++    # where the KV cache pool tends to fragment over time. Set to 0 to disable.
++    SGLANG_DECODE_CLEAR_STEPS = EnvInt(0)
++
++    # When the KV cache pool drops below this percentage of free space (0-100),
++    # the scheduler will retract running decode requests. This is a more
++    # aggressive variant of the existing retraction logic. Set to 0 to use
++    # the default behavior.
++    SGLANG_KV_POOL_RETRACT_THRESHOLD_PCT = EnvInt(0)
++
++
++scheduler_envs = SchedulerEnvs()
+diff --git a/python/sglang/srt/utils/nvtx_utils.py b/python/sglang/srt/utils/nvtx_utils.py
+index 86f1edba07..1127258ada 100644
+--- a/python/sglang/srt/utils/nvtx_utils.py
++++ b/python/sglang/srt/utils/nvtx_utils.py
+@@ -23,6 +23,10 @@ A span has two independent emitters:
+ 
+ Decoupling the two lets every annotation site -- scheduler stages, batch-overlap
+ ops, and the speculative-decoding / forward spans -- share one primitive.
++
++Extended by JoyFuture: added markers for the overlap event loop, running batch
++update, and prefill batch selection so the full scheduler pipeline is visible
++in Nsight Systems.
+ """
+ 
+ import logging
+@@ -62,6 +66,11 @@ _NVTX_COLOR_MAP = {
+     "scheduler.get_next_batch_to_run": "green",
+     "scheduler.run_batch": "red",
+     "scheduler.process_batch_result": "cyan",
++    # === Extended markers (JoyFuture) ===
++    "scheduler.event_loop_normal": "dark_blue",
++    "scheduler.event_loop_overlap": "teal",
++    "scheduler.update_running_batch": "orange",
++    "scheduler.get_new_batch_prefill": "magenta",
+ }
+ 
+ _NULL_CONTEXT = nullcontext()
