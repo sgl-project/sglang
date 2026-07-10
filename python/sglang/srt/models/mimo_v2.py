@@ -22,9 +22,7 @@ from torch import nn
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.configs.model_config import get_mimo_v2_fused_qkv_expected_tp_size
 from sglang.srt.distributed import (
-    get_moe_expert_parallel_world_size,
     get_pp_group,
-    get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -38,8 +36,6 @@ from sglang.srt.layers.communicator import (
     enable_moe_dense_fully_dp,
 )
 from sglang.srt.layers.dp_attention import (
-    get_attention_tp_rank,
-    get_attention_tp_size,
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layernorm import RMSNorm
@@ -80,7 +76,7 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.mimo_audio import AudioEncoderMixin, MiMoAudioEncoderConfig
 from sglang.srt.models.mimo_vl import MiMoVisionTransformer, MiMoVLVisionConfig
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
@@ -107,8 +103,8 @@ def load_mimo_v2_qkv_proj_weight(
             f"expected sharded {tuple(param.shape)}"
         )
 
-    tp_size = get_attention_tp_size()
-    tp_rank = get_attention_tp_rank()
+    tp_size = get_parallel().attn_tp_size
+    tp_rank = get_parallel().attn_tp_rank
     if expected_fused_tp_size is not None and tp_size != expected_fused_tp_size:
         raise ValueError(
             f"MiMoV2 fused qkv_proj checkpoint is TP={expected_fused_tp_size}-"
@@ -229,7 +225,7 @@ class MiMoV2MoE(nn.Module):
         is_nextn: bool = False,
     ):
         super().__init__()
-        self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_size = get_parallel().tp_size
 
         self.config = config
         self.layer_id = layer_id
@@ -256,7 +252,7 @@ class MiMoV2MoE(nn.Module):
         experts_type = get_moe_impl_class(quant_config)
         self.experts = experts_type(
             num_experts=config.n_routed_experts
-            + get_global_server_args().ep_num_redundant_experts,
+            + get_server_args().ep_num_redundant_experts,
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
@@ -273,6 +269,7 @@ class MiMoV2MoE(nn.Module):
             num_expert_group=config.n_group,
             topk_group=config.topk_group,
             correction_bias=self.gate.e_score_correction_bias,
+            scoring_func=config.scoring_func,
             quant_config=quant_config,
             routed_scaling_factor=1.0,
             apply_routed_scaling_factor_on_output=self.experts.should_fuse_routed_scaling_factor_in_topk,
@@ -288,10 +285,9 @@ class MiMoV2MoE(nn.Module):
             or get_moe_a2a_backend().is_ascend_fuseep()
         ):
             # TODO: we will support tp < ep in the future
-            self.ep_size = get_moe_expert_parallel_world_size()
+            self.ep_size = get_parallel().moe_ep_size
             self.num_experts = (
-                config.n_routed_experts
-                + get_global_server_args().ep_num_redundant_experts
+                config.n_routed_experts + get_server_args().ep_num_redundant_experts
             )
             self.renormalize = config.norm_topk_prob
             self.topk_group = config.topk_group
@@ -469,8 +465,8 @@ class MiMoV2Attention(nn.Module):
         super().__init__()
         self.hidden_size = hidden_size
 
-        attn_tp_rank = get_attention_tp_rank()
-        attn_tp_size = get_attention_tp_size()
+        attn_tp_rank = get_parallel().attn_tp_rank
+        attn_tp_size = get_parallel().attn_tp_size
 
         self.total_num_heads = num_heads
         assert self.total_num_heads % attn_tp_size == 0
@@ -973,8 +969,8 @@ class MiMoV2Model(nn.Module):
     # factors (or else raise an exception). Thus, handled exceptions should
     # make sure to leave KV cache scale factors in a known good (dummy) state
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
-        attn_tp_rank = get_attention_tp_rank()
-        attn_tp_size = get_attention_tp_size()
+        attn_tp_rank = get_parallel().attn_tp_rank
+        attn_tp_size = get_parallel().attn_tp_size
         for layer_idx, scaling_factor in kv_cache_scales_loader(
             quantization_param_path,
             attn_tp_rank,
@@ -1043,7 +1039,7 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
                     config.hidden_size,
                     quant_config=quant_config,
                     prefix=add_prefix("lm_head", prefix),
-                    use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+                    use_attn_tp_group=get_server_args().enable_dp_lm_head,
                 )
             else:
                 self.lm_head = PPMissingLayer()
@@ -1434,7 +1430,7 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
                     if name in params_dict.keys():
                         param = params_dict[name]
                         if "attention_sink_bias" in name:
-                            start = get_attention_tp_rank() * param.numel()
+                            start = get_parallel().attn_tp_rank * param.numel()
                             param.data.copy_(
                                 loaded_weight[start : start + param.numel()]
                             )

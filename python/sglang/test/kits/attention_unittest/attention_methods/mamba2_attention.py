@@ -6,22 +6,13 @@ import torch.nn.functional as F
 from torch import nn
 
 # Patch TP world size / rank before importing modules that read them at __init__.
-import sglang.srt.distributed as _distributed
-import sglang.srt.layers.attention.mamba.mamba as _mamba_mod
-import sglang.srt.layers.attention.mamba.mixer2_rms_norm_gated as _norm_mod
 import sglang.srt.layers.linear as _linear_mod
-from sglang.srt.layers import dp_attention as _dp_attention
+from sglang.srt.runtime_context import get_context, get_parallel
 
-_distributed.get_tensor_model_parallel_world_size = lambda: 1
-_distributed.get_tensor_model_parallel_rank = lambda: 0
-_mamba_mod.get_tensor_model_parallel_world_size = lambda: 1
-_mamba_mod.get_tensor_model_parallel_rank = lambda: 0
-_norm_mod.get_tensor_model_parallel_world_size = lambda: 1
-_norm_mod.get_tensor_model_parallel_rank = lambda: 0
-_linear_mod.get_tensor_model_parallel_world_size = lambda: 1
-_linear_mod.get_tensor_model_parallel_rank = lambda: 0
-_dp_attention.get_attention_tp_size = lambda: 1
-_dp_attention.get_attention_tp_rank = lambda: 0
+_parallel_override = get_parallel().override(
+    tp_size=1, tp_rank=0, attn_tp_size=1, attn_tp_rank=0
+)
+_parallel_override.__enter__()
 
 # RowParallelLinear.forward calls get_tp_group() to manage symmetric memory.
 # Provide a stub group with world_size=1 so use_symmetric_memory short-circuits.
@@ -58,8 +49,6 @@ from sglang.srt.model_executor.forward_context import (  # noqa: E402
     forward_context,
 )
 from sglang.srt.model_executor.model_runner import ModelRunner  # noqa: E402
-
-from ..mock_server_args import make_mock_server_args
 
 # Tiny dims chosen to be the minimum that satisfies MambaMixer2's TP/chunk asserts:
 #   - num_heads % tp_size == 0  (tp_size=1)
@@ -284,6 +273,7 @@ class TinyMamba2ModelConfig:
         self.is_encoder_decoder = False
         self.is_multimodal = False
         self.is_generation = True
+        self.quantization = None
         self.is_hybrid_swa = False
         self.is_local_attention_model = False
         self.attention_chunk_size = None
@@ -338,7 +328,7 @@ class MockMamba2ModelRunner(ModelRunner):
             )
         else:
             speculative_num_draft_tokens = 0
-        self.server_args = make_mock_server_args(
+        self._server_args_override = get_context().override_server_args(
             attention_backend=case.backend,
             chunked_prefill_size=-1,
             cuda_graph_config=CudaGraphConfig(
@@ -359,7 +349,7 @@ class MockMamba2ModelRunner(ModelRunner):
             enable_mis=False,
             # `RowParallelLinear.forward` (called by the production
             # `MambaMixer2.out_proj`) consults
-            # `get_global_server_args().enable_symm_mem` to decide whether
+            # `get_server_args().enable_symm_mem` to decide whether
             # to wrap allocations in a symmetric-memory context. With
             # `world_size=1` the wrapper short-circuits, but the
             # attribute read still happens, so it must exist on the mock
@@ -375,9 +365,7 @@ class MockMamba2ModelRunner(ModelRunner):
             # `MambaMixer2.forward_decode` calls into. Set it explicitly so
             # the DECODE fixture path becomes reachable.
             mamba_backend="triton",
-            mamba_cache_chunk_size=64,
             max_running_requests=None,
-            model_path=None,
             revision=None,
             speculative_algorithm=None,
             speculative_eagle_topk=0,
@@ -385,17 +373,14 @@ class MockMamba2ModelRunner(ModelRunner):
             speculative_num_steps=0,
             triton_attention_num_kv_splits=8,
             triton_attention_split_tile_size=None,
+            # Pin the lazy mamba_cache_chunk_size property cache: production
+            # derives it from hf_config + page_size, which needs a real model.
+            _mamba_cache_chunk_size=64,
         )
-        # Install this fixture's `server_args` as the global so that
-        # `is_symmetric_memory_enabled()` (called from
-        # `RowParallelLinear.forward`) reads our `enable_symm_mem=False`
-        # value. Without this, a previous test in the discover sweep
-        # whose fixture *did* call `set_global_server_args_for_scheduler`
-        # would leave a SimpleNamespace without `enable_symm_mem` as the
-        # global, and the mamba2 forward would AttributeError.
-        from sglang.srt.server_args import set_global_server_args_for_scheduler
-
-        set_global_server_args_for_scheduler(self.server_args)
+        # install() publishes this fixture's config, so production reads
+        # like `is_symmetric_memory_enabled()` (RowParallelLinear.forward)
+        # see our `enable_symm_mem=False` for the fixture's lifetime.
+        self.server_args = self._server_args_override.install()
 
         # Install the selective-state-update backend that
         # `MambaMixer2.forward_decode` requires. In production the
@@ -463,6 +448,7 @@ class MockMamba2ModelRunner(ModelRunner):
         self.sliding_window_size = None
         self.use_mla_backend = False
         self.is_draft_worker = False
+        self._kernel_warmed_up = True
 
     @property
     def hybrid_gdn_config(self):

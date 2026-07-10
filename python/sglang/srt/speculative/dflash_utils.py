@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from dataclasses import dataclass
 from numbers import Integral
 from typing import Any, List, Optional, Tuple
@@ -8,7 +9,6 @@ from typing import Any, List, Optional, Tuple
 import torch
 import torch.nn.functional as F
 
-from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.managers.schedule_batch import Req
@@ -53,36 +53,6 @@ else:
 
 def is_dflash_sampling_verify_available() -> bool:
     return _DFLASH_SAMPLING_VERIFY_AVAILABLE
-
-
-def resolve_dflash_prefill_refill_target(max_running_requests: int) -> int:
-    """Choose how many free running-request slots DFlash waits for before refill."""
-    override = envs.SGLANG_DFLASH_PREFILL_REFILL_TARGET.get()
-    if override is not None:
-        return override
-
-    max_running_requests = max(0, int(max_running_requests))
-    if max_running_requests < 8:
-        return 1
-    return min(4, max(2, (max_running_requests + 5) // 6))
-
-
-def should_delay_dflash_prefill_for_batching(
-    *,
-    running_bs: int,
-    num_allocatable_reqs: int,
-    max_running_requests: int,
-    prefill_refill_target: int,
-) -> bool:
-    if running_bs <= 0:
-        return False
-
-    target_prefill_bs = int(prefill_refill_target)
-    if target_prefill_bs <= 1:
-        return False
-
-    target_prefill_bs = min(target_prefill_bs, int(max_running_requests))
-    return int(num_allocatable_reqs) < target_prefill_bs
 
 
 def scale_kv_cell_size_per_token_for_dflash(
@@ -323,6 +293,36 @@ def build_target_layer_ids(num_target_layers: int, num_draft_layers: int) -> Lis
         int(round(start + (i * span) / (num_draft_layers - 1)))
         for i in range(num_draft_layers)
     ]
+
+
+def get_dflash_layer_types(config: Any) -> Optional[Sequence[str]]:
+    text_config = _get_text_config(config)
+    layer_types = _cfg_get(text_config, "layer_types", _cfg_get(config, "layer_types"))
+    if layer_types is None:
+        return None
+    if isinstance(layer_types, str) or not isinstance(layer_types, Sequence):
+        raise ValueError(
+            "DFLASH config.layer_types must be a sequence of attention type strings."
+        )
+    return layer_types
+
+
+def get_dflash_attention_sliding_window_size(config: Any) -> Optional[int]:
+    layer_types = get_dflash_layer_types(config)
+    if layer_types is None or "sliding_attention" not in layer_types:
+        return None
+
+    text_config = _get_text_config(config)
+    sliding_window = _cfg_get(
+        text_config, "sliding_window", _cfg_get(config, "sliding_window")
+    )
+    if sliding_window is None:
+        raise ValueError(
+            "DFLASH sliding_attention layers require config.sliding_window."
+        )
+
+    # HF sliding windows include the current token; SGLang stores window_left.
+    return int(sliding_window) - 1
 
 
 def _cfg_get(config: Any, key: str, default: Any = None) -> Any:
@@ -634,13 +634,13 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
         )
 
     if threshold_single is None:
-        from sglang.srt.server_args import get_global_server_args
+        from sglang.srt.runtime_context import get_server_args
 
-        threshold_single = get_global_server_args().speculative_accept_threshold_single
+        threshold_single = get_server_args().speculative_accept_threshold_single
     if threshold_acc is None:
-        from sglang.srt.server_args import get_global_server_args
+        from sglang.srt.runtime_context import get_server_args
 
-        threshold_acc = get_global_server_args().speculative_accept_threshold_acc
+        threshold_acc = get_server_args().speculative_accept_threshold_acc
     threshold_single = float(threshold_single)
     threshold_acc = max(float(threshold_acc), 1e-9)
 

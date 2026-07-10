@@ -26,7 +26,7 @@ from sglang.srt.mem_cache.unified_cache_components.tree_component import (
     TreeComponent,
     get_and_increase_time_counter,
 )
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_server_args
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -84,7 +84,7 @@ class MambaComponent(TreeComponent):
         # states. We temporarily skip branching-state fill in that mode and can
         # add a HiCache-aware branching policy later.
         if self.cache.cache_controller is None and len(value_chunks) > best_value_len:
-            chunk_size = get_global_server_args().mamba_cache_chunk_size
+            chunk_size = get_server_args().mamba_cache_chunk_size
             aligned_seqlen = (
                 sum(len(v) for v in value_chunks) // chunk_size
             ) * chunk_size
@@ -301,11 +301,24 @@ class MambaComponent(TreeComponent):
         token_ids_len: int,
         is_finished: bool,
     ) -> Optional[int]:
-        cache_len = (
-            req.mamba_last_track_seqlen
-            if self.enable_mamba_extra_buffer
-            else token_ids_len
-        )
+        if self.enable_mamba_extra_buffer:
+            cache_len = req.mamba_last_track_seqlen
+        else:
+            cache_len = token_ids_len
+            # ReplaySSM (no_buffer): `temporal[slot]` lags the live state by the
+            # slot's unflushed ring depth (`write_pos`), so on request finish cap
+            # the donate to the last flush boundary (where temporal is current)
+            # and reset the cursor, keeping the donated checkpoint consistent with
+            # its key length. page_size is asserted == 1, so no realign. Mirrors
+            # MambaRadixCache.cache_finished_req.
+            if is_finished:
+                write_pos_buf = (
+                    self.cache.req_to_token_pool.mamba_pool.replayssm_write_pos
+                )
+                if write_pos_buf is not None:
+                    cache_len -= int(write_pos_buf[req.mamba_pool_idx].item())
+                    write_pos_buf[req.mamba_pool_idx] = 0
+
         if is_finished:
             if cache_len is None:
                 cache_len = 0
@@ -333,8 +346,12 @@ class MambaComponent(TreeComponent):
                 )
             else:
                 mamba_value_donated = self._alloc_mamba_slot()
+                # mamba_pool is a pure PHYSICAL store; translate both slot ids
+                # virtual->physical (identity for the non-unified memory pool) first.
+                translate = self.cache.req_to_token_pool.translate_mamba_indices
                 self.cache.req_to_token_pool.mamba_pool.copy_from(
-                    req.mamba_pool_idx.unsqueeze(0), mamba_value_donated
+                    translate(req.mamba_pool_idx.unsqueeze(0)),
+                    translate(mamba_value_donated),
                 )
             insert_params.mamba_value = mamba_value_donated
             return cache_len

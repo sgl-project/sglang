@@ -16,7 +16,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_server_args
 
 try:
     from lmcache.integration.sglang.multi_process_adapter import LMCacheMPConnector
@@ -46,7 +46,8 @@ class _LMCacheLoadBackMarker:
     ``match_prefix`` call in MP mode.
     """
 
-    key: RadixKey  # page-aligned key the scheduler matched on
+    key: RadixKey  # detached snapshot of the matched key (the live query key
+    # aliases the req's growing fill_ids and must not be retained)
     value_numel: int  # number of tokens already in radix at match time
 
 
@@ -107,7 +108,7 @@ class LMCRadixCache(RadixCache):
     ):
         super().__init__(params)
 
-        cli_lmc_cfg = get_global_server_args().lmcache_config_file or ""
+        cli_lmc_cfg = get_server_args().lmcache_config_file or ""
 
         kvcache = self.token_to_kv_pool_allocator.get_kvcache()
         connector_kwargs = dict(
@@ -216,14 +217,17 @@ class LMCRadixCache(RadixCache):
         LMCache has tokens beyond radix. Otherwise releases
         the held read locks and returns the radix-only result.
         """
-        matched = self.lmcache_connector.lookup_kv(key.token_ids, req.rid)
+        token_ids = key.raw_token_ids()
+        matched = self.lmcache_connector.lookup_kv(token_ids, req.rid)
         if matched <= value.numel():
             # Release the read locks; keep the pending session for end_session.
             self.lmcache_connector.release_pending(req.rid)
             return base_res
 
+        if token_ids is key.token_ids:
+            token_ids = token_ids[:]
         self._mp_load_back_markers[req.rid] = _LMCacheLoadBackMarker(
-            key=key,
+            key=RadixKey(token_ids, key.extra_key, key.is_bigram),
             value_numel=int(value.numel()),
         )
         return MatchResult(
@@ -254,13 +258,14 @@ class LMCRadixCache(RadixCache):
         if uncached_len == 0:
             return base_res
 
+        token_ids = key.raw_token_ids()
         result = self._load_back(
             key=key,
             value_numel=int(value.numel()),
             uncached_len=uncached_len,
             last_node=last_node,
             load_fn=lambda sm, pp: self._ip_load_back(
-                token_ids=key.token_ids,
+                token_ids=token_ids,
                 value_numel=int(value.numel()),
                 slot_mapping=sm,
                 prefix_pad=pp,
@@ -433,7 +438,7 @@ class LMCRadixCache(RadixCache):
                 self.lmcache_connector.end_session(req.rid)
             return
 
-        global_server_args = get_global_server_args()
+        global_server_args = get_server_args()
         topk = global_server_args.speculative_eagle_topk
         enable_kv_committed_len = topk is None or topk == 1
         if enable_kv_committed_len:

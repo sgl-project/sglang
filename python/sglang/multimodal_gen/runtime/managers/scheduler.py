@@ -11,15 +11,15 @@ from enum import Enum
 from typing import Any, Iterator, List
 
 import zmq
-from tqdm.auto import tqdm
 
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin import (
     SchedulerDisaggMixin,
 )
-from sglang.multimodal_gen.runtime.distributed import get_world_group
 from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
     GetWeightsChecksumReqInput,
+    ReleaseMemoryOccupationReqInput,
+    ResumeMemoryOccupationReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightFromTensorCheckerReqInput,
     UpdateWeightFromTensorReqInput,
@@ -56,20 +56,15 @@ from sglang.multimodal_gen.runtime.server_args import (
     set_global_server_args,
 )
 from sglang.multimodal_gen.runtime.server_warmup import (
+    SchedulerWarmupMixin,
     get_first_generation_req,
-    is_server_based_warmup,
     is_warmup_req,
-    prepare_warmup_image_path_sync,
     should_return_warmup_result,
 )
 from sglang.multimodal_gen.runtime.utils.common import get_zmq_socket
 from sglang.multimodal_gen.runtime.utils.distributed import broadcast_pyobj
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.trace_wrapper import DiffStage, trace_slice
-from sglang.multimodal_gen.runtime.warmup_request_builder import (
-    build_warmup_reqs,
-    should_include_warmup_image,
-)
 
 logger = init_logger(__name__)
 
@@ -77,7 +72,7 @@ _MAX_RECV_REQS_PER_POLL = 1024
 _BATCH_METRICS_LOG_INTERVAL = 5
 
 
-class Scheduler(SchedulerPostTrainingMixin, SchedulerDisaggMixin):
+class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisaggMixin):
     """
     Runs the main event loop for the rank 0 worker.
     It listens for external requests via ZMQ and coordinates with other workers.
@@ -146,6 +141,8 @@ class Scheduler(SchedulerPostTrainingMixin, SchedulerDisaggMixin):
                 self._handle_update_weights_from_tensor_checker
             ),
             GetWeightsChecksumReqInput: self._handle_get_weights_checksum,
+            ReleaseMemoryOccupationReqInput: self._handle_release_memory_occupation,
+            ResumeMemoryOccupationReqInput: self._handle_resume_memory_occupation,
         }
 
         # FIFO queue entries: (identity, request, enqueue_ts_s)
@@ -159,15 +156,12 @@ class Scheduler(SchedulerPostTrainingMixin, SchedulerDisaggMixin):
         if self.receiver is not None:
             self._poller.register(self.receiver, zmq.POLLIN)
 
-        # whether we've send the necessary warmup reqs
-        self.warmed_up = False
+        self.req_based_warmup_scheduled = False
         # warmup progress tracking
         self._warmup_total = 0
         self._warmup_processed = 0
         self._warmup_progress_bar: Any | None = None
         self._logged_server_ready_after_warmup = False
-
-        self.prepare_server_warmup_reqs()
 
         # Maximum consecutive errors before terminating the event loop
         self._max_consecutive_errors = 3
@@ -225,6 +219,15 @@ class Scheduler(SchedulerPostTrainingMixin, SchedulerDisaggMixin):
         req = reqs[0]
         return self.worker.release_realtime_session(req.session_id)
 
+    def _handle_update_weights_from_disk(self, reqs: List[Any]) -> OutputBatch:
+        """Handle update_weights_from_disk request for RL workflows."""
+        if self.worker.is_sleeping():
+            raise RuntimeError(
+                "Cannot update weights while the server is sleeping. "
+                "Call resume_memory_occupation first."
+            )
+        return super()._handle_update_weights_from_disk(reqs)
+
     @staticmethod
     def _normalize_generation_reqs(reqs: list[Any]) -> list[Req]:
         if len(reqs) == 1 and isinstance(reqs[0], list):
@@ -255,108 +258,15 @@ class Scheduler(SchedulerPostTrainingMixin, SchedulerDisaggMixin):
             return [self._dispatch_single_request(req) for req in reqs]
         return self._dispatch_single_request(reqs[0])
 
-    @staticmethod
-    def _format_warmup_req(req_or_group: Any) -> str:
-        req = get_first_generation_req(req_or_group)
-        prefix = (
-            "server warmup req"
-            if is_server_based_warmup(req_or_group)
-            else "warmup req"
-        )
-        if req is None:
-            return prefix
-
-        shape = f"{req.width}x{req.height}"
-        if req.num_frames is not None and req.num_frames > 1:
-            shape += f"x{req.num_frames}f"
-
-        default_steps = req.extra.get("cache_dit_num_inference_steps")
-        if default_steps is not None and default_steps != req.num_inference_steps:
-            steps = f"{req.num_inference_steps}/{default_steps} steps"
-        else:
-            steps = f"{req.num_inference_steps} step"
-            if req.num_inference_steps != 1:
-                steps += "s"
-
-        return f"{prefix} ({shape}, {steps})"
-
-    def _warmup_progress_total(self, req_or_group: Any | None = None) -> int:
-        req = get_first_generation_req(req_or_group)
-        if req is not None:
-            warmup_total = req.extra.get("warmup_total")
-            if warmup_total is not None:
-                return warmup_total
-
-        return max(self._warmup_total, 1)
-
-    def _ensure_warmup_progress_bar(self, req_or_group: Any) -> None:
-        if not self._show_warmup_progress:
-            return
-
-        if self._warmup_progress_bar is None:
-            self._warmup_progress_bar = tqdm(
-                total=self._warmup_progress_total(req_or_group),
-                desc="Warmup requests",
-                unit="req",
-            )
-        self._warmup_progress_bar.set_postfix_str(
-            self._format_warmup_req(req_or_group), refresh=False
-        )
-
-    def _advance_warmup_progress_bar(
-        self, req_or_group: Any, output_batch: OutputBatch
-    ) -> None:
-        if not self._show_warmup_progress:
-            return
-
-        if self._warmup_progress_bar is None:
-            self._ensure_warmup_progress_bar(req_or_group)
-
-        if output_batch.metrics is not None:
-            last_duration_s = output_batch.metrics.total_duration_s
-            self._warmup_progress_bar.set_postfix_str(
-                f"{self._format_warmup_req(req_or_group)}, last={last_duration_s:.2f}s",
-                refresh=False,
-            )
-        self._warmup_progress_bar.update(1)
-
-        if self._warmup_progress_bar.n >= self._warmup_progress_bar.total:
-            self._warmup_progress_bar.close()
-            self._warmup_progress_bar = None
-
-    def _log_warmup_result(
-        self,
-        output_batch: OutputBatch,
-        req_or_group: Any,
-        is_warmup: bool,
-    ) -> None:
-        if not is_warmup:
-            return
-
-        server_based_warmup = is_server_based_warmup(req_or_group)
-        self._warmup_processed += 1
-        self._advance_warmup_progress_bar(req_or_group, output_batch)
-
-        if output_batch.error is None:
-            if (
-                not server_based_warmup
-                and not self._logged_server_ready_after_warmup
-                and (
-                    self._warmup_total <= 0
-                    or self._warmup_processed >= self._warmup_total
-                )
-            ):
-                logger.info("The server is fired up and ready to roll!")
-                self._logged_server_ready_after_warmup = True
-        else:
-            warmup_desc = self._format_warmup_req(req_or_group)
-            logger.info(f"{warmup_desc} processing failed")
-
     def _handle_generation(
         self, reqs: list[Any], *, allow_dynamic_batching: bool = True
     ):
         """Dispatch generation requests, merging compatible requests when allowed."""
         reqs = self._normalize_generation_reqs(reqs)
+        if self.worker.is_sleeping():
+            raise RuntimeError(
+                "Server is sleeping. Call resume_memory_occupation first."
+            )
         warmup_reqs = [req for req in reqs if req.is_warmup]
         if warmup_reqs:
             self._ensure_warmup_progress_bar(warmup_reqs[0])
@@ -662,6 +572,12 @@ class Scheduler(SchedulerPostTrainingMixin, SchedulerDisaggMixin):
     ) -> List[OutputBatch]:
         return [OutputBatch(error=error_msg) for _ in reqs]
 
+    def _should_return_lightweight_warmup_result(self, processed_req: Any) -> bool:
+        req = get_first_generation_req(processed_req)
+        return (req is not None and bool(req.extra.get("server_internal_prewarm"))) or (
+            is_warmup_req(processed_req) and should_return_warmup_result(processed_req)
+        )
+
     def return_result(
         self,
         output_batch: OutputBatch,
@@ -816,6 +732,9 @@ class Scheduler(SchedulerPostTrainingMixin, SchedulerDisaggMixin):
                     output_batch.audio, start, end, total_items
                 ),
                 audio_sample_rate=output_batch.audio_sample_rate,
+                action_pred=self._slice_batched_value(
+                    output_batch.action_pred, start, end, total_items
+                ),
                 trajectory_timesteps=self._slice_batched_value(
                     output_batch.trajectory_timesteps, start, end, total_items
                 ),
@@ -963,90 +882,6 @@ class Scheduler(SchedulerPostTrainingMixin, SchedulerDisaggMixin):
             stop_reason=stop_reason,
         )
         return batch_items
-
-    def prepare_server_warmup_reqs(self):
-        if (
-            not self.server_args.warmup
-            or self.warmed_up
-            or self.server_args.warmup_resolutions is None
-        ):
-            return
-
-        self._warmup_total = len(self.server_args.warmup_resolutions)
-        self._warmup_processed = 0
-
-        warmup_input_path = None
-        if should_include_warmup_image(self.server_args, server_based_warmup=False):
-            warmup_input_path = self._prepare_shared_warmup_image_path()
-
-        warmup_reqs = build_warmup_reqs(
-            self.server_args,
-            warmup_resolutions=self.server_args.warmup_resolutions,
-            warmup_input_path=warmup_input_path,
-        )
-        for req in warmup_reqs:
-            self.waiting_queue.append((None, req, time.monotonic()))
-
-        # if server is warmed-up, set this flag to avoid req-based warmup
-        self.warmed_up = True
-
-    def _prepare_shared_warmup_image_path(self) -> str:
-        world_group = get_world_group()
-        src_rank = world_group.ranks[0]
-
-        warmup_sync: dict[str, str | None]
-        if world_group.rank == src_rank:
-            try:
-                input_path = prepare_warmup_image_path_sync(self.server_args)
-                warmup_sync = {"input_path": input_path, "error": None}
-            except Exception as e:
-                warmup_sync = {"input_path": None, "error": str(e)}
-        else:
-            warmup_sync = {}
-
-        # Sync rank 0's warmup-image write result (path or error) to all ranks.
-        warmup_sync = broadcast_pyobj(
-            warmup_sync,
-            world_group.rank,
-            world_group.cpu_group,
-            src=src_rank,
-        )
-        if not isinstance(warmup_sync, dict):
-            raise RuntimeError("Invalid warmup sync payload received across ranks")
-
-        error = warmup_sync.get("error")
-        if error is not None:
-            raise RuntimeError(
-                f"Warmup image preparation failed on rank {src_rank}: {error}"
-            )
-
-        input_path = warmup_sync.get("input_path")
-        if not isinstance(input_path, str) or not input_path:
-            raise RuntimeError("Warmup image preparation returned empty input path")
-
-        return input_path
-
-    def process_received_reqs_with_req_based_warmup(
-        self, recv_reqs: List[tuple[bytes, Any]]
-    ) -> List[tuple[bytes, Any]]:
-        if (
-            self.warmed_up
-            or not self.server_args.warmup
-            or not recv_reqs
-            or self.server_args.warmup_resolutions is not None
-            or self.server_args.server_warmup
-        ):
-            return recv_reqs
-
-        identity, req_or_group = recv_reqs[0]
-        req = get_first_generation_req(req_or_group)
-        if req is not None:
-            warmup_req = req.copy_as_warmup(self.server_args.warmup_steps)
-            recv_reqs.insert(0, (identity, warmup_req))
-            self._warmup_total = 1
-            self._warmup_processed = 0
-            self.warmed_up = True
-        return recv_reqs
 
     @staticmethod
     def _normalize_received_payload(
@@ -1223,8 +1058,11 @@ class Scheduler(SchedulerPostTrainingMixin, SchedulerDisaggMixin):
                     is_warmup = is_warmup_req(processed_req)
                     self._log_warmup_result(output_batch, processed_req, is_warmup)
 
-                    if is_warmup and should_return_warmup_result(processed_req):
-                        # only keep the necessary lightweight payloads
+                    should_return_lightweight_warmup_result = (
+                        self._should_return_lightweight_warmup_result(processed_req)
+                    )
+                    if should_return_lightweight_warmup_result:
+                        # internal prewarm is a real-path request; reply but drop payloads
                         output_batch.drop_payload_for_warmup()
                         self.return_result(
                             output_batch, identity, should_not_return=False
@@ -1259,3 +1097,11 @@ class Scheduler(SchedulerPostTrainingMixin, SchedulerDisaggMixin):
         for pipe in self.result_pipes_from_slaves:
             results.append(pipe.recv())
         return results
+
+    def _handle_release_memory_occupation(self, _reqs: List[Any]) -> OutputBatch:
+        logger.info(f"[SLEEP] handle_release_memory_occupation on rank={self.gpu_id}")
+        return OutputBatch(output=self.worker.release_memory_occupation())
+
+    def _handle_resume_memory_occupation(self, _reqs: List[Any]) -> OutputBatch:
+        logger.info(f"[WAKE] handle_resume_memory_occupation on rank={self.gpu_id}")
+        return OutputBatch(output=self.worker.resume_memory_occupation())

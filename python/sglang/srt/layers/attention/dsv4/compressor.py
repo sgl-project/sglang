@@ -19,23 +19,20 @@ from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
 from sglang.srt.layers.attention.dsv4.quant_k_cache import (
     quant_to_nope_fp8_rope_bf16_pack_triton,
 )
-from sglang.srt.layers.dp_attention import get_attention_cp_size
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_output
+from sglang.srt.layers.utils.multi_platform import MultiPlatformOp
 from sglang.srt.mem_cache.deepseek_v4_compress_state import (
     CompressStatePool,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.models.deepseek_v2 import _is_hip
-from sglang.srt.utils import add_prefix, get_bool_env_var, set_weight_attrs
+from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils import add_prefix, is_npu, set_weight_attrs
 
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
-_tgemm = None
-if _use_aiter:
-    from aiter.tuned_gemm import tgemm
-
-    _tgemm = tgemm
+_is_npu = is_npu()
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -283,10 +280,13 @@ def create_paged_compressor_data(
 
     def get_raw_loc(positions: torch.Tensor) -> torch.Tensor:
         positions = positions.masked_fill(positions < 0, 0)
-        loc = req_to_token[req_pool_indices, positions]
-        swa_loc = token_to_kv_pool.translate_loc_from_full_to_swa(loc)
-        swa_pages = swa_loc // swa_page_size
-        state_loc = swa_pages * ring_size + swa_loc % ring_size
+        if compress_ratio == 128:
+            state_loc = req_pool_indices * ring_size + positions % ring_size
+        else:
+            loc = req_to_token[req_pool_indices, positions]
+            swa_loc = token_to_kv_pool.translate_loc_from_full_to_swa(loc)
+            swa_pages = swa_loc // swa_page_size
+            state_loc = swa_pages * ring_size + swa_loc % ring_size
         return (state_loc // compress_ratio).to(torch.int32)
 
     is_overlap = is_overlap_compress(compress_ratio)
@@ -341,7 +341,7 @@ def create_paged_compressor_data(
     return FusedCompressMetadata(write_loc=write_loc, extra_data=extra_data, plan=plan)
 
 
-class Compressor(nn.Module):
+class Compressor(MultiPlatformOp):
     def __init__(
         self,
         config: DeepSeekV4Config,
@@ -390,6 +390,9 @@ class Compressor(nn.Module):
     def _apply_ape_hotfix(self):
         self.ape_converted = True
 
+        if _is_npu:
+            return
+
         if self.overlap:
             ape = torch.chunk(self.ape.data, 2, dim=-1)
             ape = torch.cat([ape[0], ape[1]], dim=0)
@@ -416,28 +419,23 @@ class Compressor(nn.Module):
         return ret
 
     def compute_kv_score(self, x: torch.Tensor, forward_batch: ForwardBatch):
-        if _tgemm is not None and not envs.SGLANG_OPT_USE_COMPRESSOR_V2.get():
-            # v1 compress goes through fused_compress_triton, which promotes
-            # bf16->fp32 internally, so skip the .float() cast.
-            kv_score = _tgemm.mm(x, self.wkv_gate.weight, otype=x.dtype)
-        else:
-            kv_score = linear_bf16_fp32(x, self.wkv_gate.weight)
+        kv_score = linear_bf16_fp32(x, self.wkv_gate.weight)
 
         # CUDA path: delegate to backend
         if dsa_use_prefill_cp(forward_batch):
             kv_score = cp_all_gather_rerange_output(
                 kv_score,
-                get_attention_cp_size(),
+                get_parallel().attn_cp_size,
                 forward_batch,
                 torch.cuda.current_stream(),
             )
         return kv_score
 
-    def forward(
+    def forward_native(
         self,
         x: torch.Tensor,
         forward_batch: ForwardBatch,
-        attn_backend: AttentionBackend,
+        attn_backend: Optional[AttentionBackend] = None,
     ) -> torch.Tensor:
         if forward_batch.forward_mode.is_idle():
             assert x.shape[0] == 0
@@ -461,8 +459,22 @@ class Compressor(nn.Module):
             is_paged=True,
         )
 
+    def forward_npu(
+        self,
+        x: torch.Tensor,
+        forward_batch: ForwardBatch,
+        attn_backend: Optional[AttentionBackend] = None,
+    ) -> torch.Tensor:
+        if forward_batch.forward_mode.is_idle():
+            assert x.shape[0] == 0
+            return x.new_empty(0, self.head_dim)
 
-if _is_hip and not envs.SGLANG_OPT_USE_COMPRESSOR_V2.get():
-    from sglang.srt.layers.attention.dsv4.compress_hip import (  # noqa: F811
-        CompressorHip as Compressor,
-    )
+        if dsa_use_prefill_cp(forward_batch):
+            x = cp_all_gather_rerange_output(
+                x,
+                get_parallel().attn_cp_size,
+                forward_batch,
+                torch.cuda.current_stream(),
+            )
+
+        return get_attn_backend().forward_compress(self, x, forward_batch)
