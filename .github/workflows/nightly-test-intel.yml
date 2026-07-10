@@ -71,6 +71,16 @@ jobs:
           docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir "sglang[diffusion]"
           docker exec ci_sglang_xpu /bin/bash -c '/opt/venv/bin/hf auth login --token ${HF_TOKEN}'
 
+      - name: Download olmOCR-bench dataset (for test_deepseek_ocr_2_olmbench)
+        timeout-minutes: 30
+        run: |
+          # PyMuPDF renders the bench PDFs to images; bench_sglang.py errors
+          # every sample without it.
+          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir pymupdf
+          docker exec ci_sglang_xpu /bin/bash -c '
+            /opt/venv/bin/hf download --repo-type dataset allenai/olmOCR-bench \
+              --local-dir /sglang-checkout/olmOCR-bench'
+
       - name: Nightly Test (1-GPU XPU)
         timeout-minutes: 240
         run: |
@@ -78,6 +88,7 @@ jobs:
           docker exec ci_sglang_xpu bash -c "
             source /opt/venv/bin/activate &&
             cd /sglang-checkout/test &&
+            OLMOCR_BENCH_DIR=/sglang-checkout/olmOCR-bench/bench_data \
             GITHUB_STEP_SUMMARY=/sglang-checkout/github_summary.md \
             python3 run_suite.py --hw xpu --suite nightly-xpu-1-gpu --nightly --timeout-per-file 7200 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }}
           " || TEST_EXIT_CODE=$?
