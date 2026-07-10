@@ -495,15 +495,6 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
         resolved_view,
     )
 
-    if (
-        server_args.speculative_algorithm == "STANDALONE"
-        and resolved_view(server_args).enable_dp_attention
-    ):
-        # TODO: support dp attention for standalone speculative decoding
-        raise ValueError(
-            "Currently standalone speculative decoding does not support dp attention."
-        )
-
     if server_args.max_running_requests is None:
         server_args.max_running_requests = 48
         logger.warning(
