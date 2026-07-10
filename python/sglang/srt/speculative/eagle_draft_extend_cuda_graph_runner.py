@@ -296,7 +296,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             cuda_graph_bs = forward_batch.seq_lens.numel()
 
         is_bs_supported = (
-            self.backend.can_run(forward_batch, cuda_graph_bs)
+            self.backend.can_run(forward_batch, self._make_graph_key(cuda_graph_bs))
             if self.disable_padding
             else cuda_graph_bs <= self.max_bs
         )
