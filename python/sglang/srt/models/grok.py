@@ -22,15 +22,15 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.srt.distributed import (
-    tensor_model_parallel_all_reduce,
-)
-from sglang.srt.layers.activation import GeluAndMul
-from sglang.srt.layers.elementwise import (
+from sglang.kernels.ops.layernorm.elementwise import (
     fused_dual_residual_rmsnorm,
     fused_rmsnorm,
     gelu_and_mul_triton,
 )
+from sglang.srt.distributed import (
+    tensor_model_parallel_all_reduce,
+)
+from sglang.srt.layers.activation import GeluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,

@@ -312,7 +312,7 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
         ):
             return self._forward_compress_native(compressor, x, forward_batch)
 
-        from sglang.srt.layers.deepseek_v4_rope import (
+        from sglang.kernels.ops.attention.deepseek_v4_rope import (
             get_fused_compressor_rope_cos_sin,
         )
 
@@ -649,7 +649,7 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
             # Use the same contig cache as the outer rope path; .real/.imag on a
             # complex tensor are strided views and aclnnIndex over them triggers
             # StridedSlice (see _get_contig_freqs_real_imag in deepseek_v4_rope.py).
-            from sglang.srt.layers.deepseek_v4_rope import (
+            from sglang.kernels.ops.attention.deepseek_v4_rope import (
                 _get_contig_freqs_real_imag,
             )
 
@@ -890,7 +890,7 @@ class C4IndexerAscendBackendMixin(C4IndexerBackendMixin):
     def _compute_q_npu(
         self, c4_indexer, q_lora: torch.Tensor, positions: torch.Tensor
     ) -> torch.Tensor:
-        from sglang.srt.layers.deepseek_v4_rope import v4_rope_inplace_npu
+        from sglang.kernels.ops.attention.deepseek_v4_rope import v4_rope_inplace_npu
 
         bs = q_lora.shape[0]
         q, _ = c4_indexer.wq_b(q_lora)
