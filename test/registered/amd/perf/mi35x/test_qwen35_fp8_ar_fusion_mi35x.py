@@ -1,13 +1,13 @@
 """MI35x PR-CI accuracy coverage for Qwen3.5-FP8 aiter AR-fusion.
 
-Sequentially launches one TP8 server per fusion variant on the 8-GPU MI35x
+Sequentially launches one TP4 server per fusion variant on the 8-GPU MI35x
 stage-c suite and runs GSM8K in-process (mirroring the DeepSeek-R1-MXFP4
 AR-fusion eval) to compare accuracy:
 
 * fused AR+RMSNorm+per-group FP8 quant enabled (default), and
 * the same launch with SGLANG_DISABLE_FUSED_AR_QUANT=1 fallback.
 
-Running the variants one at a time (instead of two parallel TP4 servers) keeps
+Running the variants one at a time (instead of two servers in parallel) keeps
 the signal stable and avoids loading two 397B servers at once. The nightly
 throughput/latency perf benchmark lives separately in
 test_qwen35_fp8_perf_mi35x.py.
@@ -51,7 +51,7 @@ GSM8K_DATA_URL = (
 
 COMMON_ARGS: List[str] = [
     "--tensor-parallel-size",
-    "8",
+    "4",
     "--trust-remote-code",
     "--attention-backend",
     "aiter",
@@ -171,7 +171,7 @@ def run_gsm8k_benchmark(
 
 
 class TestQwen35Fp8ArFusionMI35x(CustomTestCase):
-    """Validate Qwen3.5-FP8 AR-fusion accuracy on MI35x (sequential TP8)."""
+    """Validate Qwen3.5-FP8 AR-fusion accuracy on MI35x (sequential TP4)."""
 
     @classmethod
     def setUpClass(cls):
@@ -181,7 +181,7 @@ class TestQwen35Fp8ArFusionMI35x(CustomTestCase):
         cls.num_questions = GSM8K_NUM_QUESTIONS
 
     def test_qwen35_fp8_ar_fusion_accuracy(self):
-        summary = "### Qwen3.5-FP8 aiter AR-fusion (MI35x, sequential TP8)\n\n"
+        summary = "### Qwen3.5-FP8 aiter AR-fusion (MI35x, sequential TP4)\n\n"
         summary += (
             "| Variant | Accuracy | Invalid | Latency (s) | Threshold | Status |\n"
         )
