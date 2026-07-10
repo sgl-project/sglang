@@ -25,7 +25,9 @@ from sglang.jit_kernel.dsv4 import (
 from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=8, suite="base-b-kernel-benchmark-1-gpu-large")
+register_cuda_ci(
+    est_time=8, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
+)
 
 DSV4_NUM_ATTENTION_HEADS = 64
 DSV4_TP_SIZE = 8
