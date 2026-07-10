@@ -22,28 +22,17 @@ from sglang.srt.environ import EnvBool, EnvInt, Envs
 
 
 class SchedulerEnvs(Envs):
-    # Controls whether the scheduler emits per-request latency callbacks to the
-    # metrics reporter. When enabled, each token generation records the end-to-end
-    # latency broken down by phase (prefill, decode, transfer). This is useful for
-    # debugging agentic workloads where request latency is highly variable.
-    SGLANG_ENABLE_PER_REQUEST_LATENCY = EnvBool(False)
+# Controls whether the scheduler emits per-request latency callbacks to the
+# metrics reporter. When enabled, each token generation records the end-to-end
+# latency broken down by phase (prefill, decode, transfer). This is useful for
+# debugging agentic workloads where request latency is highly variable.
+SGLANG_ENABLE_PER_REQUEST_LATENCY = EnvBool(False)
 
-    # Controls whether the scheduler verifies KV cache transfer integrity by
-    # computing and comparing checksums on PD disaggregation transfers. When
-    # enabled, mismatches are logged as warnings and the affected requests are
-    # retried. Adds ~1-2% overhead to PD transfer bandwidth.
-    SGLANG_ENABLE_KV_TRANSFER_CHECKSUM = EnvBool(False)
-
-    # Number of decode steps after which the scheduler forces a KV cache clear
-    # in the decode pool. This is a tuning knob for long-running decode batches
-    # where the KV cache pool tends to fragment over time. Set to 0 to disable.
-    SGLANG_DECODE_CLEAR_STEPS = EnvInt(0)
-
-    # When the KV cache pool drops below this percentage of free space (0-100),
-    # the scheduler will retract running decode requests. This is a more
-    # aggressive variant of the existing retraction logic. Set to 0 to use
-    # the default behavior.
-    SGLANG_KV_POOL_RETRACT_THRESHOLD_PCT = EnvInt(0)
+# Controls whether the scheduler verifies KV cache transfer integrity by
+# computing and comparing checksums on PD disaggregation transfers. When
+# enabled, mismatches are logged as warnings and the affected requests are
+# retried. Adds ~1-2% overhead to PD transfer bandwidth.
+SGLANG_ENABLE_KV_TRANSFER_CHECKSUM = EnvBool(False)
 
 
 scheduler_envs = SchedulerEnvs()

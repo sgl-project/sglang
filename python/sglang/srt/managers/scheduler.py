@@ -272,7 +272,6 @@ from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 from sglang.srt.scheduler_env_vars import scheduler_envs
 from sglang.srt.request_latency_tracker import RequestLatencyTracker
-from sglang.srt.kv_transfer_checksum import KVTransferChecksumVerifier
 from sglang.srt.utils.tensor_bridge import use_mlx
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
@@ -399,12 +398,10 @@ class Scheduler(
         # Init metrics stats
         self.init_metrics_collector(tp_rank, pp_rank, dp_rank)
 
-        # Init JoyFuture scheduler observability (latency tracking + KV checksum)
+        # Init JoyFuture scheduler observability (latency tracking)
         self.latency_tracker = RequestLatencyTracker(
             enabled=scheduler_envs.SGLANG_ENABLE_PER_REQUEST_LATENCY.get(),
         )
-        self.kv_checksum_verifier = KVTransferChecksumVerifier() if scheduler_envs.SGLANG_ENABLE_KV_TRANSFER_CHECKSUM.get() else None
-        self._decode_step_counter = 0
 
         # Init inter-process communication
         self.init_ipc_channels(port_args)
@@ -1620,7 +1617,9 @@ class Scheduler(
                     try:
                         self.token_to_kv_pool_allocator.flush_opportunistic()
                     except Exception:
-                        pass
+                        logger.debug(
+                            "Opportunistic KV pool flush failed (non-critical)"
+                        )
 
             # Launch the current batch
             if batch:
@@ -3515,10 +3514,6 @@ class Scheduler(
                 if req.finished() and not req.is_retracted:
                     self.latency_tracker.end_request(req.rid)
 
-        # JoyFuture: count decode steps for KV cache clear scheduling
-        if batch.forward_mode.is_decode():
-            self._decode_step_counter += 1
-
         self.metrics_reporter.log_batch_result_stats(batch, result)
 
         # Emit forward pass metrics (every iteration when enabled)
@@ -3589,7 +3584,9 @@ class Scheduler(
             try:
                 self.token_to_kv_pool_allocator.flush_opportunistic()
             except Exception:
-                pass
+                logger.debug(
+                    "Opportunistic KV pool flush during idle failed (non-critical)"
+                )
 
         # memory leak check (skipped for hisparse — pool counters intentionally
         # diverge during host-backup, see _get_swa_token_info clamp).

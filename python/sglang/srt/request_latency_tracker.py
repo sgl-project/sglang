@@ -130,10 +130,10 @@ class RequestLatencyTracker:
         self._records: Dict[str, RequestLatencyRecord] = {}
         self._completed: List[RequestLatencyRecord] = []
 
-    def start_request(self, req) -> RequestLatencyRecord:
-        """Start tracking a new request. Returns the latency record."""
+    def start_request(self, req) -> Optional[RequestLatencyRecord]:
+        """Start tracking a new request. Returns the latency record, or None if disabled."""
         if not self.enabled:
-            return None  # type: ignore
+            return None
         record = RequestLatencyRecord(
             request_id=getattr(req, "request_id", str(req.rid)),
             rid=str(req.rid),
