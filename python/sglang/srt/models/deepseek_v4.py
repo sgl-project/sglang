@@ -2466,7 +2466,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             hidden_states, aux_hidden_states = hidden_states
         hidden_states, pre_hc_head = hidden_states
 
-        return self.logits_processor(
+        logits_output = self.logits_processor(
             input_ids,
             hidden_states,
             self.lm_head,
@@ -2476,6 +2476,12 @@ class DeepseekV4ForCausalLM(nn.Module):
                 None if aux_hidden_states is not None else pre_hc_head
             ),
         )
+        if aux_hidden_states is not None:
+            # DSpark PD needs the full per-token aux hidden rows for compact
+            # transfer. Store them explicitly so PP prefill does not depend on
+            # the generic return-hidden-state capture mode being propagated.
+            logits_output.hidden_states = torch.cat(aux_hidden_states, dim=-1)
+        return logits_output
 
     def _setup_fp8_wo_a_scales(self, is_nextn: bool) -> None:
         from deep_gemm import transform_sf_into_required_layout
