@@ -292,6 +292,7 @@ FP4_GEMM_RUNNER_BACKEND_CHOICES = [
 BF16_GEMM_BACKEND_CHOICES = ["auto", "cutedsl"]
 
 RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru", "priority"]
+RETRACTION_POLICY_CHOICES = ["length", "priority"]
 
 RL_ON_POLICY_TARGET_CHOICES = ["fsdp"]
 
@@ -736,6 +737,19 @@ class ServerArgs:
         int,
         "Minimum difference in priorities for an incoming request to have to preempt running request(s).",
     ] = 10
+    retraction_policy: A[
+        str,
+        Arg(
+            help=(
+                "The decode retraction policy to use when the KV cache is full. "
+                "'length' preserves the existing behavior and retracts short-output, "
+                "long-input requests first. 'priority' retracts lower-priority "
+                "requests first, using the same priority direction as priority "
+                "scheduling."
+            ),
+            choices=RETRACTION_POLICY_CHOICES,
+        ),
+    ] = "length"
     schedule_conservativeness: A[
         float,
         "How conservative the schedule policy is. A larger value means more conservative scheduling. Use a larger value if you see requests being retracted frequently.",
@@ -7004,6 +7018,10 @@ class ServerArgs:
                 logger.warning(
                     "--default-priority-value has no effect without --enable-priority-scheduling"
                 )
+        if self.retraction_policy == "priority" and not self.enable_priority_scheduling:
+            raise ValueError(
+                "--retraction-policy priority requires --enable-priority-scheduling"
+            )
 
         # Check hisparse
         # Moved to the resolution pipeline (arg_groups/overrides.py:
