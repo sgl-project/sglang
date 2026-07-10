@@ -77,8 +77,8 @@ wget "${GITHUB_PROXY_URL:=""}https://github.com/sgl-project/sgl-kernel-npu/relea
 unzip custom-ops-${SGLANG_KERNEL_NPU_TAG}-torch${PYTORCH_VERSION}-cann9.0.0-${DEVICE_TYPE}-$(arch).zip && \
 unzip ops-transformer-${SGLANG_KERNEL_NPU_TAG}-torch${PYTORCH_VERSION}-cann9.0.0-${DEVICE_TYPE}-$(arch).zip && \
 chmod +x *.run && \
-./CANN-custom_ops-none-linux.$(arch).run --install-path=/usr/local/Ascend/cann-${CANN_VERSION}/opp && \
-./cann-ops-transformer-custom_linux-$(arch).run --install-path=/usr/local/Ascend/cann-${CANN_VERSION}/opp && \
+./CANN-custom_ops-none-linux.$(arch).run --install-path=/usr/local/Ascend/cann-9.0.0/opp && \
+./cann-ops-transformer-custom_linux-$(arch).run --install-path=/usr/local/Ascend/cann-9.0.0/opp && \
 ${PIP_INSTALL} custom_ops-1.0-cp311-cp311-linux_$(arch).whl)
 rm -rf cann-custom-ops
 
