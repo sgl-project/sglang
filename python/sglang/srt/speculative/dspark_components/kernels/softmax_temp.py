@@ -19,7 +19,7 @@ class SoftmaxTemp:
     def execute(cls, *args, **kwargs) -> torch.Tensor:
         if _KERNEL_IMPL == "torch":
             return cls.torch(*args, **kwargs)
-        if _KERNEL_IMPL == "amd_hip":
+        if _KERNEL_IMPL == "aiter":
             ## Placeholder for amd aiter kernel
             return cls.triton(*args, **kwargs)
         if _KERNEL_IMPL == "flashinfer":
