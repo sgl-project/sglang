@@ -9,3 +9,12 @@ providers:
     allowUiUpdates: false
     options:
       path: /var/lib/grafana/dashboards
+  - name: 'UMBP'
+    orgId: 1
+    folder: 'UMBP Monitoring'
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 10
+    allowUiUpdates: false
+    options:
+      path: /var/lib/grafana/mori_dashboards
