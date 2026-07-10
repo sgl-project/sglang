@@ -10,6 +10,7 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.disaggregation.common import conn
 from sglang.srt.disaggregation.common.conn import CommonKVSender
+from sglang.srt.disaggregation.prefill import PrefillBootstrapQueue
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
@@ -380,6 +381,79 @@ class TestParallelSamplingDpRankRegistration(CustomTestCase):
         register.assert_not_called()
         manager.record_failure.assert_called_once()
         manager.update_status.assert_any_call(5, conn.KVPoll.Failed)
+
+    def test_explicit_route_accepts_modulo_mismatch(self):
+        """An explicit router decision supersedes room-modulo placement."""
+
+        manager = self._manager(attn_dp_rank=2)
+        with (
+            conn.envs.SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK.override(False),
+            patch.object(CommonKVSender, "_register_prefill_dp_rank") as register,
+        ):
+            CommonKVSender(
+                manager,
+                bootstrap_addr="127.0.0.1:12345",
+                bootstrap_room=5,
+                dest_tp_ranks=[],
+                pp_rank=0,
+                routed_dp_rank=2,
+            )
+
+        register.assert_not_called()
+        manager.record_failure.assert_not_called()
+
+    def test_explicit_route_rejects_wrong_worker(self):
+        """An explicit route must agree with the worker that received it."""
+
+        manager = self._manager(attn_dp_rank=2)
+        with patch.object(CommonKVSender, "_register_prefill_dp_rank") as register:
+            CommonKVSender(
+                manager,
+                bootstrap_addr="127.0.0.1:12345",
+                bootstrap_room=5,
+                dest_tp_ranks=[],
+                pp_rank=0,
+                routed_dp_rank=1,
+            )
+
+        register.assert_not_called()
+        manager.record_failure.assert_called_once()
+        manager.update_status.assert_any_call(5, conn.KVPoll.Failed)
+
+    def test_prefill_forwards_explicit_route_to_sender(self):
+        """The request's routed rank must reach the transfer sender."""
+
+        queue = PrefillBootstrapQueue.__new__(PrefillBootstrapQueue)
+        queue.transfer_backend = object()
+        queue.kv_manager = object()
+        queue.tp_rank = 0
+        queue.bootstrap_port = 12345
+        queue.pp_rank = 0
+        queue._check_if_req_exceed_kv_capacity = MagicMock(return_value=False)
+        queue._process_req = MagicMock()
+        request = SimpleNamespace(
+            bootstrap_host="127.0.0.1",
+            bootstrap_room=5,
+            routed_dp_rank=2,
+        )
+        sender = MagicMock()
+
+        with patch(
+            "sglang.srt.disaggregation.prefill.get_kv_class",
+            return_value=sender,
+        ):
+            self.assertTrue(queue.create_sender(request, num_kv_heads=1))
+
+        sender.assert_called_once_with(
+            mgr=queue.kv_manager,
+            bootstrap_addr="127.0.0.1:12345",
+            bootstrap_room=5,
+            dest_tp_ranks=[0],
+            pp_rank=0,
+            routed_dp_rank=2,
+        )
+        queue._process_req.assert_called_once_with(request)
+        self.assertTrue(request.pending_bootstrap)
 
     def test_forced_query_registers_modulo_mismatch(self):
         """Forced discovery still supports externally overridden placement."""

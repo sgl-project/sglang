@@ -269,6 +269,7 @@ class PrefillBootstrapQueue:
             bootstrap_room=req.bootstrap_room,
             dest_tp_ranks=dest_tp_ranks,
             pp_rank=self.pp_rank,
+            routed_dp_rank=req.routed_dp_rank,
         )
         self._process_req(req)
         req.pending_bootstrap = True

@@ -2391,8 +2391,16 @@ class NixlKVSender(CommonKVSender):
         bootstrap_room: int,
         dest_tp_ranks: List[int],
         pp_rank: int,
+        routed_dp_rank: Optional[int] = None,
     ):
-        super().__init__(mgr, bootstrap_addr, bootstrap_room, dest_tp_ranks, pp_rank)
+        super().__init__(
+            mgr,
+            bootstrap_addr,
+            bootstrap_room,
+            dest_tp_ranks,
+            pp_rank,
+            routed_dp_rank,
+        )
         self.has_sent = False
         self.chunk_id = 0
         self._send_failed = False
