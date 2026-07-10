@@ -160,6 +160,15 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # --- core state ------------------------------------------------
         self.quant_config = getattr(self.model_runner.model, "quant_config", None)
         self.is_multimodal = model_runner.is_multimodal
+        # Static buffer width for per-token deepstack embeddings (e.g. Qwen3-VL).
+        # Read from the multimodal model so the prefill registry can register a
+        # stable ``input_deepstack_embeds`` slot whose shape matches what the
+        # outer model injects into the language_model's kwargs at runtime —
+        # keeping dynamo's PCG-warmup guard in sync with replay and avoiding a
+        # runtime recompile / capture-stream fallback.
+        self.num_deepstack_embeddings = int(
+            getattr(model_runner.model, "num_deepstack_embeddings", 0) or 0
+        )
         # Classification/reward forwards branch on return_pooled_hidden_states;
         # capture must use the same flag value as replay for those models.
         self.capture_return_pooled_hidden_states = not model_runner.is_generation
@@ -215,6 +224,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             hidden_size=self.model_runner.model_config.hidden_size,
             dtype=self.model_runner.dtype,
             enable_mamba_track=self.mamba_track_enabled,
+            num_deepstack_embeddings=self.num_deepstack_embeddings,
         )
         self.buffers.share_buffers()
         # Token-axis FB-shared slot registry adopting PrefillInputBuffers
@@ -228,6 +238,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             is_multimodal=self.is_multimodal,
             hidden_size=self.model_runner.model_config.hidden_size,
             embed_dtype=self.model_runner.dtype,
+            num_deepstack_embeddings=self.num_deepstack_embeddings,
             enable_mamba_track=self.mamba_track_enabled,
             source=self.buffers,
         )
@@ -700,6 +711,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                         else None
                     )
                 ),
+                input_deepstack_embeds=(
+                    _slot("input_deepstack_embeds")
+                    if registry.has_slot("input_deepstack_embeds")
+                    else None
+                ),
                 req_pool_indices=shape_inputs["req_pool_indices"],
                 seq_lens=shape_inputs["seq_lens"],
                 next_token_logits_buffer=self._next_token_logits_buffer(bs),
@@ -883,6 +899,15 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             and forward_batch.mrope_positions is not None
             else None
         )
+        # Static slot for Qwen3-VL deepstack embeddings. Exposed on the
+        # static ForwardBatch so the multimodal model's extra_lm_kwargs hook
+        # (e.g. Qwen3VL._ensure_deepstack_kwarg) can pin its language_model
+        # kwarg to a stable buffer matching dynamo's PCG-warmup guard.
+        input_deepstack_embeds = (
+            _slot("input_deepstack_embeds")
+            if registry.has_slot("input_deepstack_embeds")
+            else None
+        )
 
         # Normalize MIXED→EXTEND so dynamo's guard (captured with EXTEND=1)
         # doesn't fail on MIXED=3.
@@ -902,6 +927,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             batch_size=bs,
             input_ids=input_ids,
             input_embeds=input_embeds,
+            input_deepstack_embeds=input_deepstack_embeds,
             req_pool_indices=forward_batch.req_pool_indices,
             seq_lens=forward_batch.seq_lens,
             next_token_logits_buffer=self._next_token_logits_buffer(bs),

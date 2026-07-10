@@ -1035,6 +1035,9 @@ def general_mm_embed_routine(
     data_embedding_funcs: Dict[Modality, DataEmbeddingFunc] = None,
     placeholder_tokens: Optional[dict[Modality, List[int]]] = None,
     use_deepstack: Dict[Modality, bool] = {},
+    extra_lm_kwargs_fn: Optional[
+        Callable[[Optional[torch.Tensor], ForwardBatch, Dict[str, Any]], Dict[str, Any]]
+    ] = None,
     **kwargs,
 ) -> torch.Tensor:
     """
@@ -1047,6 +1050,15 @@ def general_mm_embed_routine(
         data_embedding_funcs: A dictionary mapping from modality type to the corresponding embedding function.
         placeholder_tokens: Token IDs for multimodal placeholders
         use_deepstack: Whether to use deepstack embeddings for each modality, default False
+        extra_lm_kwargs_fn: Optional hook that the outer multimodal model can
+            supply to inject / normalize extra kwargs before they are forwarded
+            to ``language_model``. Receives ``(input_embeds, forward_batch,
+            kwargs)`` and must return the (possibly modified) ``kwargs`` dict.
+            This lets a model like Qwen3-VL guarantee that an
+            ``Optional[Tensor]`` kwarg (e.g. ``input_deepstack_embeds``) is
+            *always* present as a Tensor — including on pure-text requests —
+            so that dynamo's guard built during piecewise cuda-graph warmup
+            keeps matching at runtime and no recompile is triggered.
         **kwargs: Additional arguments passed to language model
 
     Returns:
@@ -1142,6 +1154,14 @@ def general_mm_embed_routine(
             input_embeds = forward_batch.input_embeds
     else:
         input_embeds = None
+
+    # Allow the outer multimodal model (e.g. Qwen3-VL) to normalize the kwargs
+    # passed into the language_model. This is how Qwen3-VL ensures that
+    # ``input_deepstack_embeds`` is always a Tensor — real feature tensor on
+    # multimodal requests, zero-filled dummy on pure-text — so dynamo's guard
+    # built during piecewise cuda-graph warmup keeps matching at runtime.
+    if extra_lm_kwargs_fn is not None:
+        kwargs = extra_lm_kwargs_fn(input_embeds, forward_batch, kwargs)
 
     hidden_states = language_model(
         input_ids=None,
