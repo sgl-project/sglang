@@ -30,7 +30,6 @@ from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.distributed import (
     get_pp_group,
-    get_tensor_model_parallel_world_size,
     get_tp_group,
 )
 from sglang.srt.environ import envs
@@ -53,7 +52,6 @@ from sglang.srt.layers.deepseek_v4_rope import (
     v4_rope_inplace_npu,
 )
 from sglang.srt.layers.dp_attention import (
-    _DpGatheredBufferWrapper,
     _tbo_event,
     attn_tp_all_gather,
     attn_tp_all_reduce,
@@ -125,6 +123,12 @@ from sglang.srt.models.deepseek_v2 import (
     _is_npu,
     _is_xpu,
 )
+
+if not _is_hip:
+    from sglang.srt.layers.utils.cp_utils import (
+        prepare_context_parallel_metadata,
+    )
+
 from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import (
     LazyValue,
@@ -138,13 +142,11 @@ from sglang.srt.utils import (
     make_layers,
     use_intel_amx_backend,
 )
+from sglang.srt.utils.custom_op import register_custom_op
+from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 _is_cpu = is_cpu()
 _cpu_amx = cpu_has_amx_support()
-if not _is_hip:
-    from sglang.srt.layers.utils.cp_utils import (
-        prepare_context_parallel_metadata,
-    )
 
 
 def apply_rotary_emb_cpu(
@@ -195,10 +197,6 @@ if _is_xpu:
     from sgl_kernel import hc_split_sinkhorn
 elif not (_is_cpu and _cpu_amx):
     from sglang.srt.layers.mhc import hc_split_sinkhorn, mhc_fused_post_pre, npu_hc_pre
-
-from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils.custom_op import register_custom_op
-from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 # NPU-only: bind torch_npu here so _compute_q_b / _forward_prepare can call
 # torch_npu.npu_rms_norm directly (imports elsewhere aren't visible in this module).
@@ -398,7 +396,7 @@ class MQALayer(nn.Module):
             base=rope_base,
             rope_scaling=rope_scaling,
             is_neox_style=False,
-            device=get_global_server_args().device,
+            device=get_server_args().device,
         )
 
         from sglang.srt.layers.deepseek_v4_rope import precompute_freqs_cis
@@ -552,8 +550,7 @@ class MQALayer(nn.Module):
             self.hidden_size,
             bias=False,
             quant_config=quant_config,
-            reduce_results=attn_tp_size == get_tensor_model_parallel_world_size()
-            and attn_tp_size > 1,
+            reduce_results=attn_tp_size == get_parallel().tp_size and attn_tp_size > 1,
             prefix=add_prefix("wo_b", prefix),
             tp_rank=attn_tp_rank,
             tp_size=attn_tp_size,
@@ -1276,7 +1273,7 @@ class MQALayer(nn.Module):
             o = torch.einsum("tgd,grd->tgr", o, wo_a)
 
         o, _ = self.wo_b(o.flatten(1))
-        if self.tp_size > 1 and self.tp_size < get_tensor_model_parallel_world_size():
+        if self.tp_size > 1 and self.tp_size < get_parallel().tp_size:
             o = attn_tp_all_reduce(o)
 
         return o
@@ -2250,7 +2247,7 @@ class DeepseekV4Model(nn.Module):
 
         if get_parallel().attn_dp_size > 1 and get_moe_a2a_backend().is_none():
             input_ids_global = torch.empty(
-                (_DpGatheredBufferWrapper._global_dp_buffer_len, 1),
+                (get_global_dp_buffer_len(), 1),
                 dtype=input_ids.dtype,
                 device=input_ids.device,
             )
@@ -2408,7 +2405,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             return
 
         disable_reason = None
-        if get_global_server_args().enforce_shared_experts_fusion:
+        if get_server_args().enforce_shared_experts_fusion:
             if self.config.n_shared_experts != 1:
                 raise ValueError(
                     "DeepSeek V4 shared-experts fusion expects exactly one shared "

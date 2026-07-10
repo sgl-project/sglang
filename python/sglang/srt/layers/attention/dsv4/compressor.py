@@ -23,7 +23,6 @@ from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
 from sglang.srt.layers.attention.dsv4.quant_k_cache import (
     quant_to_nope_fp8_rope_bf16_pack_triton,
 )
-from sglang.srt.layers.dp_attention import get_attention_cp_size
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_output
@@ -514,7 +513,7 @@ class Compressor(MultiPlatformOp):
         if dsa_use_prefill_cp(forward_batch):
             x = cp_all_gather_rerange_output(
                 x,
-                get_attention_cp_size(),
+                get_parallel().attn_cp_size,
                 forward_batch,
                 torch.cuda.current_stream(),
             )

@@ -48,7 +48,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.utils import is_layer_skipped
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
@@ -335,7 +335,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self.use_flashinfer = get_moe_runner_backend().is_flashinfer_mxfp4()
         self.use_marlin = get_moe_runner_backend().is_marlin()
         self.flashinfer_mxfp4_moe_precision = (
-            get_global_server_args().flashinfer_mxfp4_moe_precision
+            get_server_args().flashinfer_mxfp4_moe_precision
         )
         # When `flashinfer_mxfp4` is enabled, dispatch to one of two FlashInfer
         # entry points depending on the GPU:

@@ -22,9 +22,8 @@ from sglang.srt.layers.attention.dsv4.metadata import (
     NonPagedIndexerPlan,
     PagedIndexerMetadata,
 )
-from sglang.srt.layers.attention.nsa.nsa_indexer import rotate_activation
-from sglang.srt.layers.dp_attention import get_attention_cp_size
 from sglang.srt.layers.linear import ReplicatedLinear
+from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
@@ -32,6 +31,7 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.utils import add_prefix, cpu_has_amx_support, is_cpu, is_cuda, is_hip
 from sglang.srt.utils.common import is_sm120_supported
@@ -48,12 +48,8 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
-if is_hip():
-    FP8_DTYPE = torch.float8_e4m3fnuz
-    FP8_MAX = torch.finfo(FP8_DTYPE).max
-else:
-    FP8_DTYPE = torch.float8_e4m3fn
-    FP8_MAX = torch.finfo(FP8_DTYPE).max
+FP8_DTYPE = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
+
 
 if _is_cpu and _cpu_amx:
 
@@ -63,6 +59,7 @@ if _is_cpu and _cpu_amx:
         return torch.ops.sgl_kernel.act_quant_cpu(x, block_size, scale_fmt)
 
     act_quant = act_quant_cpu
+    from sglang.srt.layers.attention.nsa.nsa_indexer import rotate_activation
 
 IndexerQuery: TypeAlias = Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
 
@@ -524,7 +521,7 @@ class C4IndexerBackendMixin:
         ):
             return False
         if (
-            get_attention_cp_size() != 1
+            get_parallel().attn_cp_size != 1
             or self.hisparse_coordinator is not None
             or is_in_tc_piecewise_cuda_graph()
             or is_in_breakable_cuda_graph()
@@ -937,9 +934,9 @@ class C4Indexer(nn.Module):
         self.rotary_emb = rotary_emb
         self.freqs_cis = freqs_cis
         self.weight_scale: float = self.softmax_scale * self.n_heads**-0.5
-        from sglang.srt.server_args import get_global_server_args
+        from sglang.srt.runtime_context import get_server_args
 
-        self.use_fp4_indexer = get_global_server_args().enable_deepseek_v4_fp4_indexer
+        self.use_fp4_indexer = get_server_args().enable_deepseek_v4_fp4_indexer
         self.alt_streams = alt_streams
 
     def compute_q(

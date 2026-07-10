@@ -46,11 +46,10 @@ class HashTopK(nn.Module):
     ):
         super().__init__()
         self.layer_id = layer_id
-        from sglang.srt.server_args import get_global_server_args
+        from sglang.srt.runtime_context import get_server_args
 
         self.enable_deepep_waterfill = (
-            num_fused_shared_experts > 0
-            and get_global_server_args().enable_deepep_waterfill
+            num_fused_shared_experts > 0 and get_server_args().enable_deepep_waterfill
         )
         self.deepep_waterfill_balancer = None
 

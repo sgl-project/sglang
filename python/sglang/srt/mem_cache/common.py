@@ -26,7 +26,7 @@ from sglang.srt.mem_cache.triton_ops.common import (
     write_req_to_token_pool_triton,
 )
 from sglang.srt.runtime_context import get_server_args
-from sglang.srt.server_args import ServerArgs, get_global_server_args
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu, support_triton
 from sglang.srt.utils.common import ceil_align, is_pin_memory_available
 
@@ -215,7 +215,7 @@ def get_last_loc_torch(
 
 def get_alloc_len_per_decode(server_args: Optional[ServerArgs] = None) -> int:
     if server_args is None:
-        server_args = get_global_server_args()
+        server_args = get_server_args()
 
     if server_args.speculative_algorithm is None:
         return 1
@@ -445,7 +445,7 @@ def _alloc_page_size(batch: ScheduleBatch) -> int:
     # DCP swaps in an allocator whose page_size is server_args.page_size *
     # dcp_size, so it can be > 1 even when tree_cache.page_size is 1; branch on
     # the real allocator's page_size there. Elsewhere the two are equal.
-    if (_is_hip or _is_cuda) and get_global_server_args().dcp_size > 1:
+    if (_is_hip or _is_cuda) and get_server_args().dcp_size > 1:
         return batch.tree_cache.token_to_kv_pool_allocator.page_size
     return batch.tree_cache.page_size
 
@@ -659,7 +659,7 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
 
     start_p, end_p = req.pop_overallocated_kv_cache()
 
-    global_server_args = get_global_server_args()
+    global_server_args = get_server_args()
     page_size = global_server_args.page_size
     spec_algo = global_server_args.speculative_algorithm
 
