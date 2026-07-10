@@ -16,6 +16,7 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     MODELOPT_WAN22_NVFP4_B200_ENV_VARS,
     MODELOPT_WAN22_NVFP4_MODEL,
     T2V_PROMPT,
+    COSMOS3_NANO_CI_sampling_params,
     DiffusionSamplingParams,
     DiffusionServerArgs,
     DiffusionTestCase,
@@ -165,21 +166,7 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
             model_path=DEFAULT_COSMOS3_NANO_MODEL_NAME_FOR_TEST,
             modality="image",
         ),
-        DiffusionSamplingParams(
-            prompt="A red cube on a white table, product photo.",
-            output_size="832x480",
-            output_format="png",
-            extras={
-                "num_inference_steps": 35,
-                "seed": 0,
-                "max_sequence_length": 128,
-                "flow_shift": 10.0,
-                "extra_args": {
-                    "guardrails": False,
-                    "use_resolution_template": False,
-                },
-            },
-        ),
+        COSMOS3_NANO_CI_sampling_params,
         run_perf_check=False,
         run_consistency_check=True,
         run_component_accuracy_check=False,
@@ -969,6 +956,7 @@ STANDALONE_FILES = {
     ],
     "2-gpu": [
         "../single_test_file/test_disagg_server.py",
+        "../single_test_file/test_ar_models.py",
     ],
 }
 
@@ -983,6 +971,7 @@ STANDALONE_FILE_EST_TIMES = {
         # Two disagg clusters × (~3 min startup + ~1 min generate) ≈ 8 min.
         # Raise if CI reports a higher measured time.
         "../single_test_file/test_disagg_server.py": 600.0,
+        "../single_test_file/test_ar_models.py": 600.0,
     },
 }
 

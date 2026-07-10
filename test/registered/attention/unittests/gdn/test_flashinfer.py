@@ -11,7 +11,6 @@ from sglang.test.test_utils import CustomTestCase
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
-from sglang.srt.server_args import set_global_server_args_for_scheduler
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.attention_unittest.attention_methods.gdn_attention import (
     GDNAttentionCase,
@@ -362,7 +361,6 @@ class TestFlashInferLinearGDNBackendCorrectness(CustomTestCase):
             max_context_len=320,
             runner_batch_size=6,
         )
-        set_global_server_args_for_scheduler(fixture.runner.server_args)
         batch = fixture.forward_batch
         # Simulate the tracking metadata produced by the extra-buffer scheduler.
         # This test covers checkpoint mapping and state copies, not scheduler setup.

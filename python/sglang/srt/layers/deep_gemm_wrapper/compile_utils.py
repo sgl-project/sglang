@@ -16,6 +16,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.environ import envs
 from sglang.srt.layers.deep_gemm_wrapper.configurer import ENABLE_JIT_DEEPGEMM
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import ceil_align, ceil_div, get_available_gpu_memory, is_musa
 
@@ -435,7 +436,6 @@ def pp_parallel_deep_gemm_warmup(runner) -> None:
     # in-seq-split). _dummy_run does not pad q/hidden like the real flow, so
     # an unaligned bs makes DSA's padded num_splits longer than the q tokens
     # and trips FlashMLA's "num_splits must have shape (b+1)" check.
-    from sglang.srt.layers.dp_attention import get_attention_tp_size
     from sglang.srt.layers.utils.cp_utils import get_cp_padding_align_size
     from sglang.srt.utils.common import require_mlp_sync
 
@@ -443,7 +443,7 @@ def pp_parallel_deep_gemm_warmup(runner) -> None:
     block_m = 64
     cp = max(get_cp_padding_align_size(), 1)
 
-    attn_tp_size = get_attention_tp_size()
+    attn_tp_size = get_parallel().attn_tp_size
     mlp_sync = require_mlp_sync(model_runner.server_args)
 
     def _align(bs: int) -> int:

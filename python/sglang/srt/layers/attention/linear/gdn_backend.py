@@ -18,7 +18,7 @@ from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu
 from sglang.srt.utils.common import rank0_log
 
@@ -382,9 +382,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 and self.forward_metadata.track_ssm_h_src is not None
                 and self.forward_metadata.track_ssm_h_src.numel() > 0
             ):
-                checkpoint_every_n_tokens = (
-                    get_global_server_args().mamba_cache_chunk_size
-                )
+                checkpoint_every_n_tokens = get_server_args().mamba_cache_chunk_size
                 checkpoint_cu_starts, track_checkpoint_src = (
                     _build_flashinfer_checkpoint_plan(
                         forward_batch.extend_seq_lens,

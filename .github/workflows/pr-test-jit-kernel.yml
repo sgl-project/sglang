@@ -39,9 +39,9 @@ env:
 
 jobs:
   jit-kernel-unit-test:
-    if: |
-      github.event_name != 'schedule' &&
-      inputs.test_parallel_dispatch != 'true'
+    # Runs whenever call-jit-kernel-tests dispatches this workflow. That caller is the
+    # single gate (PR jit_kernel changes, or scheduled/parallel-dispatch full runs), so
+    # the sub-jobs no longer re-exclude schedule/parallel-dispatch here.
     runs-on: 1-gpu-h100
     timeout-minutes: 240
     steps:
@@ -79,9 +79,9 @@ jobs:
           python3 run_suite.py --hw cuda --suite base-b-kernel-unit-test-1-gpu-large
 
   jit-kernel-multigpu-unit-test:
-    if: |
-      github.event_name != 'schedule' &&
-      inputs.test_parallel_dispatch != 'true'
+    # Runs whenever call-jit-kernel-tests dispatches this workflow. That caller is the
+    # single gate (PR jit_kernel changes, or scheduled/parallel-dispatch full runs), so
+    # the sub-jobs no longer re-exclude schedule/parallel-dispatch here.
     runs-on: 8-gpu-h200
     timeout-minutes: 240
     steps:
@@ -117,9 +117,9 @@ jobs:
           python3 run_suite.py --hw cuda --suite base-b-kernel-unit-test-8-gpu-h200
 
   jit-kernel-benchmark-test:
-    if: |
-      github.event_name != 'schedule' &&
-      inputs.test_parallel_dispatch != 'true'
+    # Runs whenever call-jit-kernel-tests dispatches this workflow. That caller is the
+    # single gate (PR jit_kernel changes, or scheduled/parallel-dispatch full runs), so
+    # the sub-jobs no longer re-exclude schedule/parallel-dispatch here.
     runs-on: 1-gpu-h100
     timeout-minutes: 240
     steps:
@@ -157,9 +157,9 @@ jobs:
           python3 run_suite.py --hw cuda --suite base-b-kernel-benchmark-test-1-gpu-large
 
   jit-kernel-b200-test:
-    if: |
-      github.event_name != 'schedule' &&
-      inputs.test_parallel_dispatch != 'true'
+    # Runs whenever call-jit-kernel-tests dispatches this workflow. That caller is the
+    # single gate (PR jit_kernel changes, or scheduled/parallel-dispatch full runs), so
+    # the sub-jobs no longer re-exclude schedule/parallel-dispatch here.
     runs-on: ${{ fromJson(inputs.runs_on_map)[inputs.runner_config] }}
     timeout-minutes: 240
     steps:

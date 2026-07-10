@@ -5,12 +5,11 @@ Both SM90 and SM100 use the same pool layout: [pool, HV, V, K] (K-last).
 SM90 (Hopper): full support — decode, prefill, MTP.  State dtype: fp32.
 SM100 (Blackwell): full support — decode, prefill, MTP.
 
-Requires flashinfer >= 0.6.12.
+Requires flashinfer >= 0.6.14.
 """
 
 import logging
 import os
-from importlib import import_module
 from typing import Optional
 
 import torch
@@ -79,12 +78,6 @@ def is_flashinfer_gdn_prefill_available() -> bool:
     return bool(available and prefill_fn is not None)
 
 
-def _get_sm100_checkpoint_state_dtypes() -> tuple[torch.dtype, ...]:
-    """Use native checkpoint dtypes when exposed; 0.6.12 checkpoints are FP32."""
-    gdn_prefill = import_module("flashinfer.gdn_prefill")
-    return getattr(gdn_prefill, "_SM100_STATE_DTYPES", (torch.float32,))
-
-
 # ---------------------------------------------------------------------------
 # Kernel implementation
 # ---------------------------------------------------------------------------
@@ -96,7 +89,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
     SM90 (Hopper): decode uses gather/scatter; prefill and MTP verify supported.
     SM100 (Blackwell): decode uses gather/scatter; prefill and MTP verify supported.
 
-    Requires flashinfer >= 0.6.12.
+    Requires flashinfer >= 0.6.14.
     """
 
     uses_state_checkpoints = True
@@ -121,9 +114,6 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         sm_major = torch.cuda.get_device_capability()[0]
         self.use_state_pool = sm_major >= 10
         self.supports_target_verify = sm_major in (9, 10)
-        self._checkpoint_state_dtypes = (
-            _get_sm100_checkpoint_state_dtypes() if sm_major == 10 else (torch.float32,)
-        )
 
         if sm_major == 9 and self._prefill_fn is None:
             raise RuntimeError("FlashInfer GDN prefill kernel is unavailable.")
@@ -268,13 +258,6 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             # slot) so the FlashInfer kernel never reads out-of-bounds state.
             ssm_cache_indices = cache_indices.clamp(min=0).to(torch.int64)
             initial_state_fi = ssm_states[ssm_cache_indices].contiguous()
-            if (
-                num_state_checkpoints > 0
-                and initial_state_fi.dtype not in self._checkpoint_state_dtypes
-            ):
-                # FlashInfer 0.6.12 requires checkpoints and the state tensors
-                # written alongside them to share the fp32 element width.
-                initial_state_fi = initial_state_fi.to(torch.float32)
             cu_seqlens = query_start_loc  # already int32
         else:
             # SM90: preserve original negative-index handling (remap to last slot).
