@@ -100,6 +100,41 @@ def write_cache_indices(
             pt += alloc_extend_len
 
 
+def write_prefix_cache_indices(
+    req_pool_indices_tensor: torch.Tensor,
+    req_pool_indices_cpu: torch.Tensor,
+    prefix_write_lens_tensor: torch.Tensor,
+    prefix_write_lens_cpu: torch.Tensor,
+    prefix_tensors: list[torch.Tensor],
+    req_to_token_pool: ReqToTokenPool,
+) -> None:
+    """``write_cache_indices`` with an empty alloc segment: only the prefix
+    slice of each request's row is written (the alloc segment is written by
+    ``write_pages_to_req_to_token`` on the alloc_pages path).
+    """
+    zero_lens_cpu = torch.zeros_like(prefix_write_lens_cpu)
+    zero_lens_device = zero_lens_cpu.to(req_to_token_pool.device, non_blocking=True)
+    empty_out_cache_loc = torch.empty(
+        (0,), dtype=torch.int64, device=req_to_token_pool.device
+    )
+
+    write_cache_indices(
+        empty_out_cache_loc,
+        req_pool_indices_tensor,
+        req_pool_indices_cpu,
+        prefix_write_lens_tensor,
+        prefix_write_lens_cpu,
+        prefix_write_lens_tensor,
+        prefix_write_lens_cpu,
+        prefix_write_lens_tensor,
+        prefix_write_lens_cpu,
+        zero_lens_device,
+        zero_lens_cpu,
+        prefix_tensors,
+        req_to_token_pool,
+    )
+
+
 def write_pages_to_req_to_token(
     *,
     req_to_token_pool: ReqToTokenPool,
@@ -515,6 +550,22 @@ def _alloc_page_size(batch: ScheduleBatch) -> int:
     return batch.tree_cache.page_size
 
 
+def use_legacy_paged_extend_alloc() -> bool:
+    """Whether extend-shaped paged allocation must stay on the legacy
+    alloc_extend kernel path instead of alloc_pages + write_pages.
+
+    - NPU keeps real-lens (non page-aligned) alloc requests and bookkeeping
+      (op2), and DSV4-NPU additionally allocates tail-window state pools, so
+      the alloc_pages alignment premise does not hold there.
+    - DCP decision pending (Option A default): under dcp_size > 1 the
+      allocator page is page_size * dcp_size while radix aligns fresh
+      prefixes only to the tree (server) page, so alloc intervals can start
+      mid allocator-page -- exactly the partial-head shape only
+      alloc_extend_kernel handles.
+    """
+    return _is_npu or ((_is_hip or _is_cuda) and get_server_args().dcp_size > 1)
+
+
 def alloc_for_extend(
     batch: ScheduleBatch,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -575,55 +626,96 @@ def alloc_for_extend(
     alloc_end_lens_device = alloc_end_lens_cpu.to(batch.device, non_blocking=True)
     alloc_extend_lens_device = alloc_extend_lens_cpu.to(batch.device, non_blocking=True)
 
-    # Allocate KV cache (throws exception on failure)
-    if page_size == 1:
-        out_cache_loc = alloc_token_slots(batch.tree_cache, alloc_extend_num_tokens)
+    # Allocate KV cache (throws exception on failure) and write the
+    # req_to_token rows.
+    if page_size == 1 or use_legacy_paged_extend_alloc():
+        if page_size == 1:
+            out_cache_loc = alloc_token_slots(batch.tree_cache, alloc_extend_num_tokens)
+        else:
+            # Paged allocation - build last_loc at position alloc_start - 1. Fresh
+            # requests (req.kv is None) must use the prefix tail: their req_to_token
+            # row was just allocated and is stale until write_cache_indices below.
+            req_to_token = batch.req_to_token_pool.req_to_token
+            last_loc = [
+                (
+                    req_to_token[
+                        req.req_pool_idx, alloc_start_len - 1 : alloc_start_len
+                    ].to(torch.int64)
+                    if req.kv is not None and alloc_start_len > 0
+                    else (
+                        t[-1:] if len(t) > 0 else torch.tensor([-1], device=batch.device)
+                    )
+                )
+                for req, t, alloc_start_len in zip(
+                    batch.reqs, prefix_tensors, alloc_start_lens_list
+                )
+            ]
+            out_cache_loc = alloc_paged_token_slots_extend(
+                tree_cache=batch.tree_cache,
+                prefix_lens=alloc_start_lens_device,
+                prefix_lens_cpu=alloc_start_lens_cpu,
+                seq_lens=alloc_end_lens_device,
+                seq_lens_cpu=alloc_end_lens_cpu,
+                last_loc=torch.cat(last_loc),
+                extend_num_tokens=alloc_extend_num_tokens,
+                req_pool_indices=req_pool_indices_device,
+                dsv4_state_lens=_compute_dsv4_state_lens(batch, is_decode=False),
+                batch=batch,
+            )
+
+        # Write to req_to_token_pool
+        write_cache_indices(
+            out_cache_loc,
+            req_pool_indices_device,
+            req_pool_indices_cpu,
+            prefix_lens_device,
+            prefix_lens_cpu,
+            alloc_start_lens_device,
+            alloc_start_lens_cpu,
+            alloc_end_lens_device,
+            alloc_end_lens_cpu,
+            alloc_extend_lens_device,
+            alloc_extend_lens_cpu,
+            prefix_tensors,
+            batch.req_to_token_pool,
+        )
     else:
-        # Paged allocation - build last_loc at position alloc_start - 1. Fresh
-        # requests (req.kv is None) must use the prefix tail: their req_to_token
-        # row was just allocated and is stale until write_cache_indices below.
-        req_to_token = batch.req_to_token_pool.req_to_token
-        last_loc = [
-            (
-                req_to_token[
-                    req.req_pool_idx, alloc_start_len - 1 : alloc_start_len
-                ].to(torch.int64)
-                if req.kv is not None and alloc_start_len > 0
-                else (t[-1:] if len(t) > 0 else torch.tensor([-1], device=batch.device))
+        pages_per_req: list[int] = []
+        for alloc_start_len, alloc_end_len in zip(
+            alloc_start_lens_list, alloc_end_lens_list
+        ):
+            assert (
+                alloc_start_len % page_size == 0
+                and (alloc_end_len - alloc_start_len) % page_size == 0
+            ), (
+                f"alloc_for_extend expects page-aligned alloc intervals: "
+                f"{alloc_start_len=}, {alloc_end_len=}, {page_size=}"
             )
-            for req, t, alloc_start_len in zip(
-                batch.reqs, prefix_tensors, alloc_start_lens_list
-            )
-        ]
-        out_cache_loc = alloc_paged_token_slots_extend(
-            tree_cache=batch.tree_cache,
-            prefix_lens=alloc_start_lens_device,
-            prefix_lens_cpu=alloc_start_lens_cpu,
-            seq_lens=alloc_end_lens_device,
-            seq_lens_cpu=alloc_end_lens_cpu,
-            last_loc=torch.cat(last_loc),
-            extend_num_tokens=alloc_extend_num_tokens,
-            req_pool_indices=req_pool_indices_device,
-            dsv4_state_lens=_compute_dsv4_state_lens(batch, is_decode=False),
-            batch=batch,
+            pages_per_req.append((alloc_end_len - alloc_start_len) // page_size)
+        page_ids = alloc_pages_or_raise(
+            batch.tree_cache, sum(pages_per_req), phase="Prefill"
         )
 
-    # Write to req_to_token_pool
-    write_cache_indices(
-        out_cache_loc,
-        req_pool_indices_device,
-        req_pool_indices_cpu,
-        prefix_lens_device,
-        prefix_lens_cpu,
-        alloc_start_lens_device,
-        alloc_start_lens_cpu,
-        alloc_end_lens_device,
-        alloc_end_lens_cpu,
-        alloc_extend_lens_device,
-        alloc_extend_lens_cpu,
-        prefix_tensors,
-        batch.req_to_token_pool,
-    )
+        # Write to req_to_token_pool: the prefix slice, then the page
+        # expansion over the alloc interval. The gap
+        # [prefix_len, alloc_start) stays unwritten (previous chunk's slots).
+        write_prefix_cache_indices(
+            req_pool_indices_device,
+            req_pool_indices_cpu,
+            prefix_lens_device,
+            prefix_lens_cpu,
+            prefix_tensors,
+            batch.req_to_token_pool,
+        )
+        write_pages_to_req_to_token(
+            req_to_token_pool=batch.req_to_token_pool,
+            req_pool_indices_tensor=req_pool_indices_device,
+            req_pool_indices_cpu=req_pool_indices_cpu,
+            page_ids=page_ids,
+            pages_per_req=pages_per_req,
+            out_starts=alloc_start_lens_list,
+            page_size=page_size,
+        )
 
     out_cache_loc_derived = gather_out_cache_loc_extend(
         req_pool_indices_tensor=req_pool_indices_device,
