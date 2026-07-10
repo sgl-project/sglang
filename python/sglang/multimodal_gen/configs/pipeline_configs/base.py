@@ -145,37 +145,15 @@ def pad_text_embeddings_with_mask(
 
 
 def shard_rotary_emb_for_sp(emb):
-    """
-    Shard rotary embeddings [S, D] along sequence for SP.
-    If S is not divisible by SP degree, pad by repeating the last row.
-    """
-    # Sequence Parallelism: slice image RoPE to local shard if enabled
+    """Shard rotary embeddings [S, D] along the sequence for SP; non-divisible
+    lengths pad by repeating the last row (position labels, never attention
+    K/V, so the pad value only needs to stay finite)."""
     try:
-        from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-            get_sp_parallel_rank,
-            get_sp_world_size,
-        )
+        from sglang.multimodal_gen.runtime.distributed.sp_shard_utils import shard_seq
 
-        sp_world_size = get_sp_world_size()
+        return shard_seq(emb, dim=0, pad_mode="repeat_last")[0]
     except Exception:
-        sp_world_size = 1
-    seq_len = emb.shape[0]
-    if seq_len % sp_world_size != 0:
-        pad_len = sp_world_size - (seq_len % sp_world_size)
-        pad = emb[-1:].repeat(pad_len, 1)
-        emb = torch.cat([emb, pad], dim=0)
-    if sp_world_size > 1:
-        try:
-            rank = get_sp_parallel_rank()
-        except Exception:
-            rank = 0
-        seq_len = emb.shape[0]
-        local_len = seq_len // sp_world_size
-        start = rank * local_len
-        end = start + local_len
-        emb = emb[start:end]
-        return emb
-    else:
+        # Distributed state not initialized (single-process utilities).
         return emb
 
 
@@ -217,6 +195,7 @@ class PipelineConfig:
     cfg_policy: CFGPolicy = field(default_factory=CFGPolicy)
     generator_device: str | None = None
     flow_shift: float | None = None
+    scheduler_class_override: str | None = None
     disable_autocast: bool = False
 
     # Model configuration
@@ -243,9 +222,6 @@ class PipelineConfig:
     # See PRECISION_TO_TYPE for detailed mapping
     text_encoder_precisions: tuple[str, ...] = field(default_factory=lambda: ("fp32",))
     text_encoder_extra_args: list[dict] = field(default_factory=lambda: [{}])
-
-    def get_model_deployment_config(self) -> ModelDeploymentConfig:
-        return ModelDeploymentConfig()
 
     def postprocess_image(self, image):
         return image.last_hidden_state
@@ -310,9 +286,6 @@ class PipelineConfig:
         return image.resize(
             (target_width, target_height), PIL.Image.Resampling.LANCZOS
         ), (target_width, target_height)
-
-    def preprocess_realtime_condition_image(self, batch, _vae_image_processor) -> bool:
-        return False
 
     def prepare_calculated_size(self, image):
         return self.calculate_condition_image_size(image, image.width, image.height)
@@ -543,18 +516,15 @@ class PipelineConfig:
             return latents, False
         time_dim = latents.shape[2]
 
-        # Pad to next multiple of SP degree if needed
+        # Zero-padding a non-divisible time dim would enter self-attention
+        # unmasked (video models pass no attn_mask) and corrupt real tokens;
+        # keep such shapes unsharded until models consume the sp_shard meta.
         if time_dim > 0 and time_dim % sp_world_size != 0:
-            logger.debug(
-                "Padding latents to next multiple of SP degree, performance is sub-optimal"
+            logger.warning_once(
+                f"Latent time dim {time_dim} is not divisible by SP degree "
+                f"{sp_world_size}; skipping sequence shard for correctness."
             )
-            pad_len = sp_world_size - (time_dim % sp_world_size)
-            pad = torch.zeros(
-                (*latents.shape[:2], pad_len, *latents.shape[3:]),
-                dtype=latents.dtype,
-                device=latents.device,
-            )
-            latents = torch.cat([latents, pad], dim=2)
+            return latents, False
 
         assert latents.shape[2] % sp_world_size == 0
         sharded_tensor = rearrange(
@@ -741,6 +711,13 @@ class PipelineConfig:
             dest=f"{prefix_with_dot.replace('-', '_')}flow_shift",
             default=PipelineConfig.flow_shift,
             help="Flow shift parameter",
+        )
+        parser.add_argument(
+            f"--{prefix_with_dot}scheduler-class-override",
+            type=str,
+            dest=f"{prefix_with_dot.replace('-', '_')}scheduler_class_override",
+            default=PipelineConfig.scheduler_class_override,
+            help="Override the scheduler class from scheduler_config.json.",
         )
         parser.add_argument(
             f"--{prefix_with_dot}resolution",

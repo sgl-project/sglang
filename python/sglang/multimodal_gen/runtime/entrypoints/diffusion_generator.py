@@ -54,7 +54,6 @@ from sglang.multimodal_gen.runtime.utils.trace_wrapper import (
 
 logger = init_logger(__name__)
 
-# TODO: move to somewhere appropriate
 try:
     # Set the start method to 'spawn' to avoid CUDA errors in forked processes.
     # This must be done at the top level of the module, before any CUDA context
@@ -437,6 +436,7 @@ class DiffGenerator:
             generation_time=generation_time,
             peak_memory_mb=output_batch.peak_memory_mb,
             metrics=metrics.to_dict() if metrics else {},
+            action=output_batch.action_pred,
             trajectory_latents=output_batch.trajectory_latents,
             trajectory_timesteps=output_batch.trajectory_timesteps,
             rollout_trajectory_data=output_batch.rollout_trajectory_data,
