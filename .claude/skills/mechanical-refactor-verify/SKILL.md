@@ -29,6 +29,9 @@ description: Make mechanical refactoring (file splits, function moves, module ex
 - **Decide whether a change counts as a clean move** → `spec-reproduction-utils.md`: the
   property, the whole whitelist / not-allowed list, and each primitive's contract. The
   source of truth for the reproduction module; if any other file disagrees, it wins.
+- **Change this skill itself** (edit the engine, the generator, or the spec) →
+  `guide-modify-skill.md`: the spec-leads rule, the faithfulness invariant, and the testing
+  bar a change must clear before it is trusted.
 
 ## 3. Files
 
@@ -40,6 +43,8 @@ description: Make mechanical refactoring (file splits, function moves, module ex
   and the audit checklist for authored surfaces.
 - [`spec-reproduction-utils.md`](spec-reproduction-utils.md) — the normative spec of the
   clean-move property and the reproduction primitives.
+- [`guide-modify-skill.md`](guide-modify-skill.md) — change the engine, the generator, or
+  the spec: the spec-leads rule, the byte-faithfulness invariant, and the testing bar.
 - [`scripts/mechanical_refactor_proof_generator.py`](scripts/mechanical_refactor_proof_generator.py) —
   the **generator**: infers a reproduce recipe from a commit's diff and emits/runs a
   standalone, auditable script per commit, with a `PASS` / `RESIDUAL` / `UNSUPPORTED` verdict.
