@@ -93,6 +93,7 @@ from sglang.srt.observability.trace import process_tracing_init, trace_set_threa
 from sglang.srt.parser.template_detection import resolve_auto_parsers
 from sglang.srt.parser.template_manager import TemplateManager
 from sglang.srt.plugins import load_plugins
+from sglang.srt.reasoning_utils import resolve_require_reasoning
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     MultiprocessingSerializer,
@@ -315,6 +316,20 @@ class Engine(EngineScoreMixin, EngineBase):
         logger.debug(f"routed_dp_rank: {routed_dp_rank}")
         return routed_dp_rank
 
+    def _resolve_require_reasoning(
+        self,
+        require_reasoning: Optional[bool],
+        chat_template_kwargs: Optional[Dict[str, Any]],
+        reasoning_effort: Optional[str],
+    ) -> bool:
+        if require_reasoning is not None:
+            return require_reasoning
+        return resolve_require_reasoning(
+            self.server_args.reasoning_parser,
+            chat_template_kwargs=chat_template_kwargs,
+            reasoning_effort=reasoning_effort,
+        )
+
     def generate(
         self,
         # The input prompt. It can be a single prompt or a batch of prompts.
@@ -341,7 +356,7 @@ class Engine(EngineScoreMixin, EngineBase):
         token_ids_logprob: Optional[Union[List[List[int]], List[int]]] = None,
         lora_path: Optional[List[Optional[str]]] = None,
         custom_logit_processor: Optional[Union[List[str], str]] = None,
-        require_reasoning: bool = False,
+        require_reasoning: Optional[bool] = None,
         return_hidden_states: bool = False,
         return_routed_experts: bool = False,
         routed_experts_start_len: int = 0,
@@ -356,6 +371,8 @@ class Engine(EngineScoreMixin, EngineBase):
         external_trace_header: Optional[Dict] = None,
         rid: Optional[Union[List[str], str]] = None,
         session_params: Optional[Dict] = None,
+        chat_template_kwargs: Optional[Dict[str, Any]] = None,
+        reasoning_effort: Optional[str] = None,
         priority: Optional[int] = None,
         session_id: Optional[str] = None,
     ) -> Union[Dict, Iterator[Dict]]:
@@ -365,6 +382,11 @@ class Engine(EngineScoreMixin, EngineBase):
         """
         routed_dp_rank = self._resolve_routed_dp_rank(
             routed_dp_rank, data_parallel_rank
+        )
+        require_reasoning = self._resolve_require_reasoning(
+            require_reasoning,
+            chat_template_kwargs,
+            reasoning_effort,
         )
 
         obj = GenerateReqInput(
@@ -445,7 +467,7 @@ class Engine(EngineScoreMixin, EngineBase):
         token_ids_logprob: Optional[Union[List[List[int]], List[int]]] = None,
         lora_path: Optional[List[Optional[str]]] = None,
         custom_logit_processor: Optional[Union[List[str], str]] = None,
-        require_reasoning: bool = False,
+        require_reasoning: Optional[bool] = None,
         return_hidden_states: bool = False,
         return_routed_experts: bool = False,
         routed_experts_start_len: int = 0,
@@ -460,6 +482,8 @@ class Engine(EngineScoreMixin, EngineBase):
         external_trace_header: Optional[Dict] = None,
         rid: Optional[Union[List[str], str]] = None,
         session_params: Optional[Dict] = None,
+        chat_template_kwargs: Optional[Dict[str, Any]] = None,
+        reasoning_effort: Optional[str] = None,
         priority: Optional[int] = None,
         session_id: Optional[str] = None,
     ) -> Union[Dict, AsyncIterator[Dict]]:
@@ -469,6 +493,11 @@ class Engine(EngineScoreMixin, EngineBase):
         """
         routed_dp_rank = self._resolve_routed_dp_rank(
             routed_dp_rank, data_parallel_rank
+        )
+        require_reasoning = self._resolve_require_reasoning(
+            require_reasoning,
+            chat_template_kwargs,
+            reasoning_effort,
         )
 
         obj = GenerateReqInput(
