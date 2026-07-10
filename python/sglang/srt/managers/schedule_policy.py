@@ -813,12 +813,18 @@ class PrefillAdder:
                 _rem_tokens = min(
                     _rem_tokens, int(self.rem_swa_tokens) - self.page_size
                 )
-            # The chunked_req must be added to the list; otherwise, it will cause a memory leak.
-            # Therefore, in certain cases where _rem_tokens <= 0, it should be replaced with rem_chunk_tokens.
+            # Token budget exhausted (pool full and nothing evictable — running
+            # requests hold the tree locked): park this chunk for the tick
+            # instead of overcommitting. The scheduler keeps self.chunked_req
+            # and calls add_chunked_req again next tick once decode frees
+            # tokens, so there is no leak — this is the same early-return the
+            # hybrid-SWA path uses, and update_running_batch already treats a
+            # parked chunk (fill_len == len(prefix_indices)) as a no-op stash.
+            # Overcommitting past the budget made
+            # alloc_paged_token_slots_extend raise ("Prefill out of memory",
+            # available < chunk) and killed the whole TP group at once.
             if _rem_tokens <= 0:
-                if self.is_hybrid_swa:
-                    return req
-                _rem_tokens = self.rem_chunk_tokens
+                return req
 
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
             req.prefix_indices
