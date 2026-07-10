@@ -824,64 +824,113 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     seq_lens_gpu = batch.seq_lens
     bs = seq_lens_gpu.shape[0]
 
-    page_size = _alloc_page_size(batch)
-    if page_size == 1:
-        # Non-paged allocation
-        out_cache_loc = alloc_token_slots(batch.tree_cache, bs * token_per_req)
-    else:
-        # Paged allocation
-        last_loc = batch.req_to_token_pool.req_to_token[
-            batch.req_pool_indices, seq_lens_gpu - 1
-        ]
-        seq_lens_next = seq_lens_gpu + token_per_req
-        out_cache_loc = alloc_paged_token_slots_decode(
-            tree_cache=batch.tree_cache,
-            seq_lens=seq_lens_next,
-            seq_lens_cpu=batch.seq_lens_cpu + token_per_req,
-            last_loc=last_loc,
-            token_per_req=token_per_req,
-            req_pool_indices=batch.req_pool_indices,
-            dsv4_state_lens=_compute_dsv4_state_lens(batch, is_decode=True),
-            batch=batch,
-        )
-
-    # Write to req_to_token_pool
+    # Row write positions (encoder-offset aware).
     if batch.model_config.is_encoder_decoder:
         locs = batch.encoder_lens + seq_lens_gpu
     else:
         locs = seq_lens_gpu.clone()
 
-    batch.req_to_token_pool.write(
-        (batch.req_pool_indices, locs), out_cache_loc.to(torch.int32)
-    )
+    page_size = _alloc_page_size(batch)
+    if page_size == 1 or _is_npu:
+        if page_size == 1:
+            # Non-paged allocation
+            out_cache_loc = alloc_token_slots(batch.tree_cache, bs * token_per_req)
+        else:
+            # Legacy paged allocation, kept for NPU (real-lens requests +
+            # DSV4-NPU c/state pools).
+            last_loc = batch.req_to_token_pool.req_to_token[
+                batch.req_pool_indices, seq_lens_gpu - 1
+            ]
+            seq_lens_next = seq_lens_gpu + token_per_req
+            out_cache_loc = alloc_paged_token_slots_decode(
+                tree_cache=batch.tree_cache,
+                seq_lens=seq_lens_next,
+                seq_lens_cpu=batch.seq_lens_cpu + token_per_req,
+                last_loc=last_loc,
+                token_per_req=token_per_req,
+                req_pool_indices=batch.req_pool_indices,
+                dsv4_state_lens=_compute_dsv4_state_lens(batch, is_decode=True),
+                batch=batch,
+            )
 
-    if page_size > 1 and not _is_npu:
-        # Page-crossing steps get a whole fresh page from the allocator (the
-        # new slot is the page head since seq % page == 0 there); publish the
-        # full page [slot, slot + page) into the request's row so that
-        # [0, kv_allocated_len) stays fully written. Row positions use `locs`
+        # Write to req_to_token_pool
+        batch.req_to_token_pool.write(
+            (batch.req_pool_indices, locs), out_cache_loc.to(torch.int32)
+        )
+
+        out_cache_loc_derived = batch.req_to_token_pool.req_to_token[
+            batch.req_pool_indices, locs
+        ].to(torch.int64)
+        if envs.SGLANG_DEBUG_MEMORY_POOL.get():
+            assert torch.equal(out_cache_loc_derived, out_cache_loc)
+    else:
+        # alloc_pages path: only page-crossing requests (allocated == seq)
+        # allocate one fresh page and publish it into their rows; in-page
+        # requests need neither allocation nor a pool write (the row slot was
+        # published when its page was allocated). Row positions use `locs`
         # (encoder-offset aware); the crossing test uses the decoder KV length.
-        crossing_idx_cpu = torch.nonzero(batch.seq_lens_cpu % page_size == 0).flatten()
-        if crossing_idx_cpu.numel() > 0:
-            crossing_idx = crossing_idx_cpu.to(batch.device, non_blocking=True)
-            if envs.SGLANG_DEBUG_MEMORY_POOL.get():
-                assert torch.all(out_cache_loc[crossing_idx] % page_size == 0)
-            page_offsets = torch.arange(
-                page_size, dtype=torch.int64, device=batch.device
+        seq_lens_list: list[int] = batch.seq_lens_cpu.tolist()
+        if batch.model_config.is_encoder_decoder:
+            locs_list: list[int] = [
+                encoder_len + seq_len
+                for encoder_len, seq_len in zip(batch.encoder_lens_cpu, seq_lens_list)
+            ]
+        else:
+            locs_list = seq_lens_list
+
+        crossing_indices: list[int] = []
+        crossing_out_starts: list[int] = []
+        for i, (req, seq_len) in enumerate(zip(batch.reqs, seq_lens_list)):
+            allocated_old = req.kv.kv_allocated_len
+            # Alloc-entry page-alignment asserts deferred from op2 c5: the
+            # allocation watermark is page-aligned, and the new token is
+            # either already covered (in-page) or starts a fresh page.
+            assert allocated_old % page_size == 0, (
+                f"alloc_for_decode expects a page-aligned allocation "
+                f"watermark: {allocated_old=}, {page_size=}"
             )
-            crossing_rows = batch.req_pool_indices[crossing_idx]
-            crossing_positions = locs[crossing_idx].unsqueeze(1) + page_offsets
-            crossing_values = out_cache_loc[crossing_idx].unsqueeze(1) + page_offsets
-            batch.req_to_token_pool.write(
-                (crossing_rows.unsqueeze(1), crossing_positions),
-                crossing_values.to(torch.int32),
+            if allocated_old == seq_len:
+                crossing_indices.append(i)
+                crossing_out_starts.append(locs_list[i])
+            else:
+                assert allocated_old >= seq_len + token_per_req, (
+                    f"alloc_for_decode in-page step must be covered by the "
+                    f"allocation watermark: {allocated_old=}, {seq_len=}, "
+                    f"{token_per_req=}"
+                )
+
+        if crossing_indices:
+            page_ids = alloc_pages_or_raise(
+                batch.tree_cache,
+                len(crossing_indices),
+                phase="Decode",
+                decode=True,
+            )
+            crossing_rows_cpu = torch.tensor(
+                [batch.reqs[i].req_pool_idx for i in crossing_indices],
+                dtype=torch.int64,
+            )
+            crossing_rows_device = crossing_rows_cpu.to(
+                batch.device, non_blocking=True
+            )
+            write_pages_to_req_to_token(
+                req_to_token_pool=batch.req_to_token_pool,
+                req_pool_indices_tensor=crossing_rows_device,
+                req_pool_indices_cpu=crossing_rows_cpu,
+                page_ids=page_ids,
+                pages_per_req=[1] * len(crossing_indices),
+                out_starts=crossing_out_starts,
+                page_size=page_size,
             )
 
-    out_cache_loc_derived = batch.req_to_token_pool.req_to_token[
-        batch.req_pool_indices, locs
-    ].to(torch.int64)
-    if envs.SGLANG_DEBUG_MEMORY_POOL.get():
-        assert torch.equal(out_cache_loc_derived, out_cache_loc)
+        out_cache_loc_derived = batch.req_to_token_pool.req_to_token[
+            batch.req_pool_indices, locs
+        ].to(torch.int64)
+        if envs.SGLANG_DEBUG_MEMORY_POOL.get():
+            # The alloc no longer produces a per-token out_cache_loc to compare
+            # against; only check that every gathered slot is a real
+            # (non-padding, non-stale-zero) pool index.
+            assert torch.all(out_cache_loc_derived > 0)
 
     # DSV4-NPU hook: no-op on non-DSV4 paths.
     if _is_npu:
