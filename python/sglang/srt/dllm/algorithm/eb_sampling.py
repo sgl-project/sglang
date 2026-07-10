@@ -16,7 +16,7 @@ class EBSampling(DllmAlgorithm):
         config: DllmConfig,
     ):
         super().__init__(config)
-        self.gamma = config.algorithm_config.get("gamma", 0.0)
+        self.gamma = config.algorithm_config.get("gamma", 0.15)
         if self.gamma < 0:
             raise ValueError("EBSampling requires a non-negative gamma threshold.")
 
@@ -26,6 +26,7 @@ class EBSampling(DllmAlgorithm):
         forward_batch: ForwardBatch,
     ) -> Tuple[Union[LogitsProcessorOutput, torch.Tensor], List[torch.Tensor], bool]:
         batch_size = forward_batch.batch_size
+        assert batch_size == forward_batch.input_ids.shape[0] // self.block_size
         start_list = []
         mask_index = forward_batch.input_ids == self.mask_id
 
@@ -47,8 +48,7 @@ class EBSampling(DllmAlgorithm):
                 break
 
             out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
-            logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
-            assert batch_size == forward_batch.input_ids.shape[0] // self.block_size
+            logits_output = out.logits_output
 
             for batch_id in range(batch_size):
                 curr_block_start = batch_id * self.block_size
