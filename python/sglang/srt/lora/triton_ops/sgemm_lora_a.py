@@ -13,6 +13,7 @@ def _sgemm_lora_a_kernel(
     weights,
     output,
     # Matrix dimensions
+    S,  # total number of rows in x/output (used for OOB clamping)
     N,  # stack_num * r
     K,  # input_dim
     stack_num,
@@ -87,34 +88,44 @@ def _sgemm_lora_a_kernel(
     s_physical = _resolve_token_positions(
         sorted_token_ids, seg_start, s_offset, seg_len, SORTED_BY_ADAPTER
     )
-    x_ptrs = x + (s_physical[:, None] * x_stride_0 + k_offset[None, :] * x_stride_1)
-    w_ptrs = (weights + w_index * w_stride_0) + (
-        k_offset[:, None] * w_stride_2 + n_offset[None, :] * w_stride_1
-    )
+    # Clamp masked-out lane indices into the valid range so that pointer
+    # arithmetic itself stays in-bounds. Without this, when a tile straddles
+    # the segment boundary or `n_offset` exceeds the rank-truncated `N`,
+    # certain Triton/cublas builds materialise the full pointer expression
+    # before applying the load mask, tripping CUDA "illegal memory access"
+    # under wider LoRA target sets (e.g. `q_b_proj`, `kv_b_proj`,
+    # `fused_qkv_a_proj_with_mqa`) where rank-truncated `N` does not align
+    # with `BLOCK_N`.
+    row_mask = s_offset < seg_len
+    safe_row = tl.minimum(s_physical, S - 1)
+    safe_n = tl.minimum(n_offset, N - 1)
 
     # Iterate to compute the block in output matrix
     partial_sum = tl.zeros((BLOCK_S, BLOCK_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_K)):
+        cur_k = k * BLOCK_K + k_offset
+        k_mask = cur_k < K
+        safe_k = tl.minimum(cur_k, K - 1)
         x_tile = tl.load(
-            x_ptrs,
-            mask=(s_offset[:, None] < seg_len) & (k_offset[None, :] < K - k * BLOCK_K),
+            x + safe_row[:, None] * x_stride_0 + safe_k[None, :] * x_stride_1,
+            mask=row_mask[:, None] & k_mask[None, :],
             other=0.0,
         )
         w_tile = tl.load(
-            w_ptrs,
-            mask=(k_offset[:, None] < K - k * BLOCK_K) & (n_offset[None, :] < N),
+            weights
+            + w_index * w_stride_0
+            + safe_k[:, None] * w_stride_2
+            + safe_n[None, :] * w_stride_1,
+            mask=k_mask[:, None] & (n_offset[None, :] < N),
             other=0.0,
         )
         partial_sum += tl.dot(x_tile, w_tile)
 
-        x_ptrs += BLOCK_K * x_stride_1
-        w_ptrs += BLOCK_K * w_stride_2
-
     # Store result to output matrix
     partial_sum = partial_sum.to(x.dtype.element_ty)
-    output_mask = (s_offset[:, None] < seg_len) & (n_offset[None, :] < N)
-    output_ptr = output + (
-        s_physical[:, None] * output_stride_0 + n_offset[None, :] * output_stride_1
+    output_mask = row_mask[:, None] & (n_offset[None, :] < N)
+    output_ptr = (
+        output + safe_row[:, None] * output_stride_0 + safe_n[None, :] * output_stride_1
     )
     tl.store(output_ptr, partial_sum, mask=output_mask)
 
@@ -159,6 +170,7 @@ def sgemm_lora_a_fwd(
         x,
         weights,
         output,
+        S,
         R,
         K,
         stack_num,
