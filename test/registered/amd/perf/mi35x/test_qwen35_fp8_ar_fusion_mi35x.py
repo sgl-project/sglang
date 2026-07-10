@@ -1,25 +1,27 @@
 """MI35x PR-CI accuracy coverage for Qwen3.5-FP8 aiter AR-fusion.
 
-PR-specific fused AR+RMSNorm+per-group-quant accuracy check. The file runs in
-the 8-GPU MI35x stage-c suite and launches two TP4 servers in parallel:
+Sequentially launches one TP8 server per fusion variant on the 8-GPU MI35x
+stage-c suite and runs GSM8K in-process (mirroring the DeepSeek-R1-MXFP4
+AR-fusion eval) to compare accuracy:
 
-* GPUs 0-3: fused AR+RMSNorm+per-group FP8 quant enabled.
-* GPUs 4-7: same launch with SGLANG_DISABLE_FUSED_AR_QUANT=1 fallback.
+* fused AR+RMSNorm+per-group FP8 quant enabled (default), and
+* the same launch with SGLANG_DISABLE_FUSED_AR_QUANT=1 fallback.
 
-Each server runs GSM8K and reports accuracy, invalid rate, latency, and output
-throughput. This is the PR-CI accuracy signal; the nightly throughput/latency
-perf benchmark lives separately in test_qwen35_fp8_perf_mi35x.py.
+Running the variants one at a time (instead of two parallel TP4 servers) keeps
+the signal stable and avoids loading two 397B servers at once. The nightly
+throughput/latency perf benchmark lives separately in
+test_qwen35_fp8_perf_mi35x.py.
 """
 
+import ast
 import os
 import re
-import subprocess
+import time
 import unittest
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
-import requests
+import numpy as np
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci
@@ -30,6 +32,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
     write_github_step_summary,
 )
+from sglang.utils import download_and_cache_file, read_jsonl
 
 register_amd_ci(est_time=4800, suite="stage-c-test-large-8-gpu-amd-mi35x")
 
@@ -40,21 +43,15 @@ QWEN35_FP8_MODEL_PATH = os.environ.get(
 SERVER_LAUNCH_TIMEOUT = 4800
 GSM8K_NUM_QUESTIONS = int(os.environ.get("GSM8K_NUM_QUESTIONS", "1319"))
 ACCURACY_THRESHOLD = 0.94
-
-
-@dataclass
-class FusionVariant:
-    """A Qwen3.5-FP8 AR-fusion configuration to validate."""
-
-    variant: str
-    hip_visible_devices: str
-    port_offset: int
-    env_vars: Dict[str, str] = field(default_factory=dict)
-
+INVALID = -9999999
+GSM8K_DATA_URL = (
+    "https://raw.githubusercontent.com/openai/grade-school-math/"
+    "master/grade_school_math/data/test.jsonl"
+)
 
 COMMON_ARGS: List[str] = [
     "--tensor-parallel-size",
-    "4",
+    "8",
     "--trust-remote-code",
     "--attention-backend",
     "aiter",
@@ -75,17 +72,18 @@ COMMON_ARGS: List[str] = [
 ]
 
 
-def _base_url_with_port_offset(offset: int) -> str:
-    host, port = DEFAULT_URL_FOR_TEST.rsplit(":", 1)
-    return f"{host}:{int(port) + offset}"
+@dataclass
+class FusionVariant:
+    """A Qwen3.5-FP8 AR-fusion configuration to validate."""
+
+    variant: str
+    env_vars: Dict[str, str] = field(default_factory=dict)
 
 
 def get_fusion_variants() -> List[FusionVariant]:
     return [
         FusionVariant(
             variant="fused-ar-rms-per-group-quant",
-            hip_visible_devices="0,1,2,3",
-            port_offset=0,
             env_vars={
                 "SGLANG_USE_AITER": "1",
                 "SGLANG_USE_AITER_UNIFIED_ATTN": "1",
@@ -93,8 +91,6 @@ def get_fusion_variants() -> List[FusionVariant]:
         ),
         FusionVariant(
             variant="disable-fused-ar-quant-opt-out",
-            hip_visible_devices="4,5,6,7",
-            port_offset=1,
             env_vars={
                 "SGLANG_USE_AITER": "1",
                 "SGLANG_USE_AITER_UNIFIED_ATTN": "1",
@@ -104,104 +100,129 @@ def get_fusion_variants() -> List[FusionVariant]:
     ]
 
 
-def _parse_gsm8k_metrics(stdout: str) -> Dict[str, float]:
-    metrics = {}
-    for key, pattern in {
-        "accuracy": r"Accuracy:\s*([0-9.]+)",
-        "invalid": r"Invalid:\s*([0-9.]+)",
-        "latency": r"Latency:\s*([0-9.]+)\s*s",
-        "output_throughput": r"Output throughput:\s*([0-9.]+)\s*token/s",
-    }.items():
-        match = re.search(pattern, stdout)
-        if match is None:
-            raise AssertionError(f"Could not parse {key} from GSM8K output:\n{stdout}")
-        metrics[key] = float(match.group(1))
-    return metrics
+def get_one_example(lines, i, include_answer):
+    ret = "Question: " + lines[i]["question"] + "\nAnswer:"
+    if include_answer:
+        ret += " " + lines[i]["answer"]
+    return ret
+
+
+def get_few_shot_examples(lines, k):
+    ret = ""
+    for i in range(k):
+        ret += get_one_example(lines, i, True) + "\n\n"
+    return ret
+
+
+def get_answer_value(answer_str):
+    answer_str = answer_str.replace(",", "")
+    numbers = re.findall(r"\d+", answer_str)
+    if len(numbers) < 1:
+        return INVALID
+    try:
+        return ast.literal_eval(numbers[-1])
+    except SyntaxError:
+        return INVALID
+
+
+def run_gsm8k_benchmark(
+    base_url: str,
+    num_questions: int,
+    num_shots: int = 5,
+    parallel: int = 64,
+) -> Tuple[float, float, float]:
+    """Run GSM8K few-shot completion benchmark in-process against base_url."""
+    import sglang as sgl
+    from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
+
+    data_path = download_and_cache_file(GSM8K_DATA_URL)
+    lines = list(read_jsonl(data_path))
+    few_shot_examples = get_few_shot_examples(lines, num_shots)
+
+    questions = []
+    labels = []
+    for i in range(len(lines[:num_questions])):
+        questions.append(get_one_example(lines, i, False))
+        labels.append(get_answer_value(lines[i]["answer"]))
+    assert all(l != INVALID for l in labels)
+    arguments = [{"question": q} for q in questions]
+
+    @sgl.function
+    def few_shot_gsm8k(s, question):
+        s += few_shot_examples + question
+        s += sgl.gen(
+            "answer", max_tokens=512, stop=["Question", "Assistant:", "<|separator|>"]
+        )
+
+    backend = RuntimeEndpoint(base_url)
+    sgl.set_default_backend(backend)
+
+    tic = time.perf_counter()
+    states = few_shot_gsm8k.run_batch(
+        arguments, temperature=0, num_threads=parallel, progress_bar=True
+    )
+    latency = time.perf_counter() - tic
+
+    preds = [get_answer_value(states[i]["answer"]) for i in range(len(states))]
+    acc = np.mean(np.array(preds) == np.array(labels))
+    invalid = np.mean(np.array(preds) == INVALID)
+
+    return float(acc), float(invalid), float(latency)
 
 
 class TestQwen35Fp8ArFusionMI35x(CustomTestCase):
-    """Validate Qwen3.5-FP8 AR-fusion accuracy and throughput on MI35x."""
+    """Validate Qwen3.5-FP8 AR-fusion accuracy on MI35x (sequential TP8)."""
 
     @classmethod
     def setUpClass(cls):
         cls.model = QWEN35_FP8_MODEL_PATH
+        cls.base_url = DEFAULT_URL_FOR_TEST
         cls.variants = get_fusion_variants()
+        cls.num_questions = GSM8K_NUM_QUESTIONS
 
-    def _run_gsm8k(self, base_url: str) -> Dict[str, float]:
-        port = int(base_url.rsplit(":", 1)[-1])
-        command = [
-            "python3",
-            "benchmark/gsm8k/bench_sglang.py",
-            "--num-questions",
-            str(GSM8K_NUM_QUESTIONS),
-            "--parallel",
-            str(GSM8K_NUM_QUESTIONS),
-            "--num-shots",
-            "5",
-            "--port",
-            str(port),
-        ]
-        result = subprocess.run(command, capture_output=True, text=True)
-        if result.returncode != 0:
-            raise AssertionError(
-                "GSM8K benchmark failed:\n"
-                f"stdout:\n{result.stdout}\n"
-                f"stderr:\n{result.stderr}"
-            )
-        print(result.stdout)
-        return _parse_gsm8k_metrics(result.stdout)
-
-    def _run_variant(self, variant: FusionVariant) -> Dict[str, float]:
-        env = os.environ.copy()
-        env["HIP_VISIBLE_DEVICES"] = variant.hip_visible_devices
-        env.update(variant.env_vars)
-        base_url = _base_url_with_port_offset(variant.port_offset)
-
-        process = popen_launch_server(
-            self.model,
-            base_url,
-            timeout=SERVER_LAUNCH_TIMEOUT,
-            other_args=list(COMMON_ARGS),
-            env=env,
-        )
-        try:
-            requests.get(base_url + "/flush_cache", timeout=10)
-            metrics = self._run_gsm8k(base_url)
-            print(f"[{variant.variant}] {metrics=}")
-            return metrics
-        finally:
-            kill_process_tree(process.pid)
-
-    def test_qwen35_fp8_ar_fusion_accuracy_and_perf(self):
-        summary = "### Qwen3.5-FP8 aiter AR-fusion (MI35x, parallel TP4)\n\n"
+    def test_qwen35_fp8_ar_fusion_accuracy(self):
+        summary = "### Qwen3.5-FP8 aiter AR-fusion (MI35x, sequential TP8)\n\n"
         summary += (
-            "| Variant | GPUs | Accuracy | Invalid | Latency (s) | Output tok/s | "
-            "Threshold | Status |\n"
+            "| Variant | Accuracy | Invalid | Latency (s) | Threshold | Status |\n"
         )
-        summary += "| ------- | ---- | -------- | ------- | ----------- | ------------ | --------- | ------ |\n"
+        summary += (
+            "| ------- | -------- | ------- | ----------- | --------- | ------ |\n"
+        )
 
         failures = []
-        with ThreadPoolExecutor(max_workers=len(self.variants)) as executor:
-            future_to_variant = {
-                executor.submit(self._run_variant, variant): variant
-                for variant in self.variants
-            }
-            for future in as_completed(future_to_variant):
-                variant = future_to_variant[future]
-                with self.subTest(variant=variant.variant):
-                    metrics = future.result()
-                    accuracy = metrics["accuracy"]
-                    passed = accuracy >= ACCURACY_THRESHOLD
-                    status = "PASS" if passed else "FAIL"
-                    summary += (
-                        f"| {variant.variant} | {variant.hip_visible_devices} | "
-                        f"{accuracy:.3f} | {metrics['invalid']:.3f} | "
-                        f"{metrics['latency']:.2f} | "
-                        f"{metrics['output_throughput']:.2f} | "
-                        f"{ACCURACY_THRESHOLD} | {status} |\n"
+        for variant in self.variants:
+            with self.subTest(variant=variant.variant):
+                env = os.environ.copy()
+                env.update(variant.env_vars)
+
+                process = popen_launch_server(
+                    self.model,
+                    self.base_url,
+                    timeout=SERVER_LAUNCH_TIMEOUT,
+                    other_args=list(COMMON_ARGS),
+                    env=env,
+                )
+                try:
+                    acc, invalid, latency = run_gsm8k_benchmark(
+                        self.base_url,
+                        num_questions=self.num_questions,
+                        parallel=self.num_questions,
                     )
-                    if not passed:
-                        failures.append((variant.variant, accuracy))
+                finally:
+                    kill_process_tree(process.pid)
+
+                passed = acc >= ACCURACY_THRESHOLD
+                status = "PASS" if passed else "FAIL"
+                summary += (
+                    f"| {variant.variant} | {acc:.3f} | {invalid:.3f} | "
+                    f"{latency:.2f} | {ACCURACY_THRESHOLD} | {status} |\n"
+                )
+                print(
+                    f"[{variant.variant}] accuracy={acc:.3f} invalid={invalid:.3f} "
+                    f"latency={latency:.2f}s {status}"
+                )
+                if not passed:
+                    failures.append((variant.variant, acc))
 
         if is_in_ci():
             write_github_step_summary(summary)
