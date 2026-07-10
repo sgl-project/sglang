@@ -25,6 +25,7 @@ from sglang.srt.layers.moe.moe_runner.base import (
     register_pre_permute,
 )
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
+from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import (
     ceil_div,
     dispose_tensor,
@@ -833,6 +834,8 @@ def pre_permute_deepep_normal_to_deep_gemm(
         device=hidden_states.device,
         dtype=hidden_states.dtype,
     )
+    if get_server_args().enable_deterministic_inference:
+        input_tensor.zero_()
     if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
         # TODO check whether need `zeros`
         input_tensor_scale = torch.zeros(
@@ -846,7 +849,11 @@ def pre_permute_deepep_normal_to_deep_gemm(
             device=hidden_states.device,
             dtype=torch.float32,
         )
+        if get_server_args().enable_deterministic_inference:
+            input_tensor_scale.zero_()
     m_indices = torch.empty(all_tokens, device=hidden_states.device, dtype=torch.int32)
+    if get_server_args().enable_deterministic_inference:
+        m_indices.zero_()
     output_index = torch.empty_like(topk_ids)
 
     if get_offloader().forbid_copy_engine_usage:
