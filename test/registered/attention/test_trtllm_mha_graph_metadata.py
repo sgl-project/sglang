@@ -12,7 +12,7 @@ import pytest
 import torch
 
 import sglang.srt.layers.attention.trtllm_mha_backend as trtllm_mha_backend
-from sglang.srt.layers.attention.triton_ops.trtllm_mha_graph_metadata import (
+from sglang.kernels.ops.kvcache.trtllm_mha_graph_metadata import (
     Q_MODE_CUMSUM,
     Q_MODE_NONE,
     Q_MODE_STRIDED,
