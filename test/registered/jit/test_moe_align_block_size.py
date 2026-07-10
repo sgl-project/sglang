@@ -7,9 +7,10 @@ import triton
 import triton.language as tl
 
 from sglang.jit_kernel.moe_align import moe_align_block_size
+from sglang.jit_kernel.utils import get_ci_test_range
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=28, suite="base-b-kernel-unit-1-gpu-large")
+register_cuda_ci(est_time=28, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
 
 
@@ -143,17 +144,29 @@ def moe_align_block_size_triton(
     )
 
 
-@pytest.mark.parametrize(
-    "block_size,num_tokens,topk,num_experts,pad_sorted_token_ids",
+MOE_ALIGN_CASES = get_ci_test_range(
     list(
         itertools.product(
             [32, 64, 128, 256],  # block_size
             [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096],  # num_tokens
             [1, 2, 4, 8, 16, 32, 64],  # topk
-            [64, 160, 256, 257, 260, 264],  # num_experts
+            [64, 128, 160, 256, 257, 260, 264],  # num_experts
             [True, False],  # pad_sorted_token_ids
         )
     ),
+    [
+        (32, 1, 1, 64, True),
+        (128, 48, 1, 128, True),
+        (256, 103, 4, 256, False),
+        (128, 128, 1, 256, True),
+        (256, 4096, 8, 256, False),
+    ],
+)
+
+
+@pytest.mark.parametrize(
+    "block_size,num_tokens,topk,num_experts,pad_sorted_token_ids",
+    MOE_ALIGN_CASES,
 )
 def test_moe_align_block_size_compare_implementations(
     block_size, num_tokens, topk, num_experts, pad_sorted_token_ids

@@ -15,12 +15,9 @@
 
 from __future__ import annotations
 
-import datetime
-import hashlib
 import inspect
 import logging
 from abc import ABC, abstractmethod
-from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Optional, Tuple
 
@@ -43,7 +40,11 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.model_executor.runner.flashinfer_autotune import (
+    run_flashinfer_autotune_forward,
+    should_run_flashinfer_autotune,
+)
+from sglang.srt.runtime_context import get_flags, get_parallel
 from sglang.srt.speculative.spec_info import create_dummy_verify_input
 from sglang.srt.utils import (
     empty_context,
@@ -146,6 +147,7 @@ def _allocate_decode_buffers(
                 req_lens=torch.ones([max_bs], dtype=torch.int32),
                 out_column_starts=torch.zeros([max_bs], dtype=torch.int32),
                 out_req_lens=torch.ones([max_bs], dtype=torch.int32),
+                skip_token_table_update=torch.zeros([max_bs], dtype=torch.bool),
             )
             if ne_token_table is not None
             else None
@@ -213,7 +215,7 @@ class BaseRunner(ABC):
 
         self._pre_initialize_flashinfer_allreduce_workspace()
 
-        if self._should_run_flashinfer_autotune():
+        if should_run_flashinfer_autotune(self.model_runner):
             buffers, batch_size = self._autotune_buffers()
             assert (
                 buffers is not None
@@ -250,77 +252,6 @@ class BaseRunner(ABC):
             dtype=mr.dtype,
         )
 
-    def _should_run_flashinfer_autotune(self) -> bool:
-        """Check if flashinfer autotune should be run."""
-        mr = self.model_runner
-        if mr.server_args.disable_flashinfer_autotune:
-            return False
-
-        # CuteDSL v1 (cutedsl runner + deepep a2a) bypasses MoeRunner and must not
-        # be autotuned -- its _dummy_run would dispatch more tokens per rank than
-        # SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK, tripping a DeepEP assert.
-        # Read server_args directly to avoid depending on initialize_moe_config()
-        # having already populated the MoE backend globals.
-        if (
-            mr.server_args.moe_runner_backend == "flashinfer_cutedsl"
-            and mr.server_args.moe_a2a_backend == "deepep"
-        ):
-            return False
-
-        backend_str = mr.server_args.moe_runner_backend
-
-        # TODO smor- support other cases for flashinfer autotune, such as, mamba backend
-
-        moe_needs_autotune = backend_str in [
-            "flashinfer_trtllm",
-            "flashinfer_trtllm_routed",
-            "flashinfer_mxfp4",
-            "flashinfer_cutedsl",
-            "flashinfer_cutlass",
-        ]
-
-        from sglang.srt.layers.quantization.fp4_utils import (
-            get_fp4_gemm_runner_backend,
-        )
-
-        model_uses_fp4 = mr.model_config.quantization in (
-            "modelopt_fp4",
-            "modelopt_mixed",
-        )
-        fp4_gemm_needs_autotune = model_uses_fp4 and (
-            get_fp4_gemm_runner_backend().is_flashinfer_cutlass()
-            or get_fp4_gemm_runner_backend().is_flashinfer_cutedsl()
-        )
-
-        from sglang.srt.layers.quantization.fp8_utils import (
-            get_fp8_gemm_runner_backend,
-        )
-        from sglang.srt.utils import is_sm100_supported
-
-        model_uses_modelopt_fp8 = mr.model_config.quantization in (
-            "modelopt",
-            "modelopt_fp8",
-            "modelopt_mixed",
-        )
-        fp8_gemm_needs_autotune = (
-            get_fp8_gemm_runner_backend().is_flashinfer_cutlass()
-            or (model_uses_modelopt_fp8 and is_sm100_supported())
-        )
-
-        if not (
-            moe_needs_autotune or fp4_gemm_needs_autotune or fp8_gemm_needs_autotune
-        ):
-            return False
-
-        major, _ = torch.cuda.get_device_capability()
-        if major < 9:
-            return False
-
-        if mr.spec_algorithm.is_speculative():
-            return not mr.is_draft_worker
-
-        return True
-
     def _flashinfer_autotune(self, *, buffers, batch_size):
         """Run flashinfer autotune.
 
@@ -329,77 +260,11 @@ class BaseRunner(ABC):
         Supplied by warmup() (the decode runner's captured buffers when a graph
         runner exists; a freshly-allocated dummy set in the eager path).
         """
-        from flashinfer.autotuner import autotune
 
-        from sglang.srt.layers.logits_processor import autotune_dummy_run_mode
+        def forward_fn():
+            self._dummy_run(batch_size=batch_size, buffers=buffers)
 
-        mr = self.model_runner
-        cache_path = self._flashinfer_autotune_cache_path()
-        if envs.SGLANG_FLASHINFER_AUTOTUNE_CACHE.get():
-            autotune_cache = cache_path
-            logger.info("Running FlashInfer autotune with cache: %s", autotune_cache)
-        else:
-            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            runs_dir = cache_path.parent / "runs"
-            runs_dir.mkdir(parents=True, exist_ok=True)
-            autotune_cache = (
-                runs_dir / f"{cache_path.stem}.{timestamp}{cache_path.suffix}"
-            )
-            logger.info(
-                "Running FlashInfer autotune (cache reuse DISABLED via "
-                "SGLANG_FLASHINFER_AUTOTUNE_CACHE=0); writing fresh result to: %s",
-                autotune_cache,
-            )
-
-        # Run warmup on the non-default stream to avoid NCCL 2.29+ cudaMemcpyBatchAsync
-        # calls on default stream (unsupported by CUDA) when --enable-symm-mem is used.
-        mr.forward_stream.wait_stream(torch.cuda.current_stream())
-        with torch.get_device_module(mr.device).stream(mr.forward_stream):
-            with (
-                torch.inference_mode(),
-                # Autotuning mxfp8_gemm hits an IMA; skip it.
-                autotune(True, cache=str(autotune_cache), skip_ops={"mxfp8_gemm"}),
-                autotune_dummy_run_mode(),
-            ):
-                self._dummy_run(batch_size=batch_size, buffers=buffers)
-        torch.cuda.current_stream().wait_stream(mr.forward_stream)
-        logger.info("FlashInfer autotune completed.")
-
-    def _flashinfer_autotune_cache_path(self) -> Path:
-        import flashinfer
-
-        mr = self.model_runner
-        major, minor = torch.cuda.get_device_capability(mr.device)
-        arch = f"sm{major}{minor}"
-        flashinfer_version = getattr(flashinfer, "__version__", "unknown")
-
-        server_args = mr.server_args
-        model_key = "|".join(
-            [
-                str(server_args.model_path),
-                str(mr.dtype),
-                str(server_args.quantization),
-                str(server_args.moe_runner_backend),
-                str(mr.tp_size),
-                str(mr.pp_size),
-                str(mr.dp_size),
-                str(mr.moe_ep_size),
-                str(mr.model_config.hf_config.__class__.__name__),
-            ]
-        )
-        cache_key = hashlib.sha256(model_key.encode()).hexdigest()[:16]
-        cache_dir = (
-            Path(envs.SGLANG_CACHE_DIR.get())
-            / "flashinfer"
-            / "autotune"
-            / flashinfer_version
-            / arch
-            / cache_key
-        )
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        return (
-            cache_dir / f"rank_tp{mr.tp_rank}_pp{mr.pp_rank}_dp{mr.dp_rank or 0}.json"
-        )
+        run_flashinfer_autotune_forward(self.model_runner, forward_fn, skip_logits=True)
 
     def _alloc_dummy_decode_buffers(self, max_bs: int, *, num_tokens_per_bs: int = 1):
         """Allocate one static decode-buffer set for a dummy forward, sized to
@@ -408,10 +273,9 @@ class BaseRunner(ABC):
         The PP-parallel DeepGEMM warmup sweeps batch sizes far larger than any
         runner's max_bs (up to ~n_sms*block_m), so no pre-allocated runner buffer
         set fits; it builds one here and hands it to _dummy_run (reused across the
-        sweep; _dummy_run slices it per shape). The flashinfer autotune does NOT
-        use this -- it reuses an existing runner's buffers via _autotune_buffers
-        (the eager input registry, or the decode cuda-graph runner's captured
-        buffers).
+        sweep; _dummy_run slices it per shape). Eager FlashInfer autotune also
+        allocates decode-shaped scratch buffers here. Decode cuda-graph autotune
+        reuses the captured runner buffers instead.
         """
         mr = self.model_runner
         return _allocate_decode_buffers(
@@ -434,6 +298,7 @@ class BaseRunner(ABC):
             num_tokens_per_bs=num_tokens_per_bs,
             cache_loc_dtype=torch.int64,
             enable_mamba_track=False,
+            ne_token_table=mr.token_table if mr.use_ngram_embedding else None,
             hc_hidden_size=getattr(mr.model_config, "hc_hidden_size", None),
             pp_proxy_topk_size=mr.get_pp_proxy_topk_size(),
         )
@@ -507,7 +372,7 @@ class BaseRunner(ABC):
 
         seq_len_fill_value = mr.attn_backend.get_cuda_graph_seq_len_fill_value()
 
-        if mr.server_args.enable_torch_compile:
+        if get_flags().capture.enable_torch_compile:
             set_torch_compile_config()
             should_disable_torch_compile = not getattr(
                 mr.model, "_can_torch_compile", True
@@ -518,7 +383,7 @@ class BaseRunner(ABC):
                     "Transformers backend model reports it is not torch.compile "
                     "compatible (e.g. dynamic rope scaling). Disabling torch.compile.",
                 )
-                mr.server_args.enable_torch_compile = False
+                get_flags().capture.enable_torch_compile = False
 
         # NOTE: aux hidden state capture (eagle3/dflash) is already
         # configured by init_aux_hidden_state_capture() in initialize().
@@ -661,6 +526,10 @@ class BaseRunner(ABC):
             global_forward_mode=capture_forward_mode,
             lora_ids=lora_ids,
         )
+        if buffers.ngram_embedding_info is not None:
+            forward_batch.ngram_embedding_info = buffers.ngram_embedding_info.slice(
+                batch_size
+            )
 
         if lora_ids is not None:
             mr.lora_manager.prepare_lora_batch(forward_batch)

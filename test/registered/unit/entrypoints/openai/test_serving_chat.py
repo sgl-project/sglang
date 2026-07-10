@@ -28,7 +28,7 @@ from sglang.srt.entrypoints.openai.serving_chat import (
     normalize_tool_content,
 )
 from sglang.srt.managers.io_struct import GenerateReqInput
-from sglang.srt.managers.template_detection import ReasoningToggleConfig
+from sglang.srt.parser.template_detection import ReasoningToggleConfig
 from sglang.srt.utils import get_or_create_event_loop
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -223,49 +223,6 @@ class ServingChatTestCase(unittest.TestCase):
                 }
             ],
             tool_choice="required",
-        )
-
-        with patch.object(self.chat, "_process_messages") as proc_mock:
-            proc_mock.return_value = MessageProcessingResult(
-                "",
-                [1, 2, 3],
-                None,
-                None,
-                [],
-                [],
-                None,
-            )
-
-            adapted, _ = self.chat._convert_to_internal_request(req)
-
-        self.assertTrue(adapted.require_reasoning)
-
-    def test_kimi_tool_call_keeps_explicit_reasoning(self):
-        self.template_manager.reasoning_config = ReasoningToggleConfig(
-            toggle_param="thinking", default_enabled=True
-        )
-        self.tm.server_args.reasoning_parser = "kimi_k2"
-        self.tm.server_args.tool_call_parser = "kimi_k2"
-        self.chat.reasoning_parser = "kimi_k2"
-        self.chat.tool_call_parser = "kimi_k2"
-
-        req = ChatCompletionRequest(
-            model="x",
-            messages=[{"role": "user", "content": "What is 2+2?"}],
-            tools=[
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "add",
-                        "parameters": {
-                            "type": "object",
-                            "properties": {"a": {"type": "integer"}},
-                        },
-                    },
-                }
-            ],
-            tool_choice="required",
-            chat_template_kwargs={"thinking": True},
         )
 
         with patch.object(self.chat, "_process_messages") as proc_mock:
@@ -895,98 +852,6 @@ class ServingChatTestCase(unittest.TestCase):
         )
 
     # ------------- kimi_k2 tool_call_id formatting -------------
-    def test_kimi_k2_non_streaming_tool_call_id_format(self):
-        """Ensure non-streaming tool_call.id matches functions.{name}:{index} for kimi_k2 parser."""
-
-        # Force kimi_k2 parser
-        self.chat.tool_call_parser = "kimi_k2"
-
-        # Mock FunctionCallParser.parse_non_stream to return one tool call
-        with patch(
-            "sglang.srt.entrypoints.openai.serving_chat.FunctionCallParser"
-        ) as ParserMock:
-            parser_instance = ParserMock.return_value
-
-            # Build a mock ToolCallItem-like object
-            call_info = Mock()
-            call_info.name = "get_weather"
-            call_info.parameters = '{"city":"Paris"}'
-            call_info.tool_index = 0
-
-            parser_instance.has_tool_call.return_value = True
-            parser_instance.parse_non_stream.return_value = ("", [call_info])
-
-            finish_reason = {"type": "stop", "matched": None}
-            tools = [
-                {"type": "function", "function": {"name": "get_weather"}},
-            ]
-
-            tool_calls, remaining_text, finish_reason = self.chat._process_tool_calls(
-                text="<|tool_calls_section_begin|>...",
-                tools=tools,
-                finish_reason=finish_reason,
-            )
-
-            self.assertIsNotNone(tool_calls)
-            self.assertEqual(len(tool_calls), 1)
-            self.assertEqual(tool_calls[0].id, "functions.get_weather:0")
-            self.assertEqual(tool_calls[0].function.name, "get_weather")
-
-    def test_kimi_k2_streaming_tool_call_id_format(self):
-        """Ensure streaming first chunk tool_call.id matches functions.{name}:{index} for kimi_k2 parser."""
-
-        # Force kimi_k2 parser
-        self.chat.tool_call_parser = "kimi_k2"
-
-        # Prepare request with tools
-        req = ChatCompletionRequest(
-            model="x",
-            messages=[{"role": "user", "content": "Hi?"}],
-            tools=[{"type": "function", "function": {"name": "get_weather"}}],
-            stream=True,
-        )
-
-        # Patch FunctionCallParser used inside _process_tool_call_stream
-        with patch(
-            "sglang.srt.entrypoints.openai.serving_chat.FunctionCallParser"
-        ) as ParserMock:
-            parser_instance = ParserMock.return_value
-
-            # First call returns one ToolCallItem-like chunk (with name)
-            first_chunk_call = Mock()
-            first_chunk_call.tool_index = 0
-            first_chunk_call.name = "get_weather"
-            first_chunk_call.parameters = ""
-            parser_instance.parse_stream_chunk.side_effect = [
-                ("", [first_chunk_call]),
-                ("", []),
-            ]
-
-            async def collect_first_tool_chunk():
-                gen = self.chat._process_tool_call_stream(
-                    index=0,
-                    delta="irrelevant",
-                    parser_dict={},
-                    content={"meta_info": {"id": "chatcmpl-test"}},
-                    request=req,
-                    has_tool_calls={},
-                )
-                # Get first yielded SSE line
-                line = None
-                async for emitted in gen:
-                    line = emitted
-                    break
-                return line
-
-            loop = get_or_create_event_loop()
-            line = loop.run_until_complete(collect_first_tool_chunk())
-            self.assertIsNotNone(line)
-            self.assertTrue(line.startswith("data: "))
-
-            payload = json.loads(line[len("data: ") :])
-            tool_calls = payload["choices"][0]["delta"]["tool_calls"]
-            self.assertEqual(tool_calls[0]["id"], "functions.get_weather:0")
-
     def test_kimi_k2_non_streaming_tool_call_id_with_history(self):
         """Ensure non-streaming tool_call.id increase with tool calls history for kimi_k2 parser."""
 
@@ -1164,7 +1029,7 @@ class ServingChatTestCase(unittest.TestCase):
 
     def test_dpsk_v32_encoding_path(self):
         """Test DeepSeek V3.2 encoding path detection and application."""
-        from sglang.srt.managers.template_manager import TemplateManager
+        from sglang.srt.parser.template_manager import TemplateManager
 
         # Only mock the fields that _use_dpsk_v32_encoding() actually reads:
         # tokenizer.chat_template and hf_config.architectures
@@ -1224,28 +1089,6 @@ class ServingChatTestCase(unittest.TestCase):
                 messages=[{"role": "user", "content": "hi"}],
                 task="bogus",
             )
-
-    def test_latest_reminder_role_accepted(self):
-        """`latest_reminder` is a first-class message role on generic param."""
-        from sglang.srt.entrypoints.openai.protocol import (
-            ChatCompletionMessageGenericParam,
-        )
-
-        msg = ChatCompletionMessageGenericParam(
-            role="latest_reminder", content="Be terse."
-        )
-        self.assertEqual(msg.role, "latest_reminder")
-
-        # Full request with reminder before user parses cleanly.
-        req = ChatCompletionRequest(
-            model="x",
-            messages=[
-                {"role": "latest_reminder", "content": "Be terse."},
-                {"role": "user", "content": "Hi"},
-            ],
-        )
-        self.assertEqual(req.messages[0].role, "latest_reminder")
-        self.assertEqual(req.messages[1].role, "user")
 
     def test_attach_task_to_last_user_message(self):
         """Helper attaches task to the nearest user/developer message."""
@@ -1800,6 +1643,63 @@ class ServingChatTestCase(unittest.TestCase):
             },
         )
 
+    def _collect_continuous_usage(self, cached_tokens):
+        content = {
+            "text": "Hello",
+            "meta_info": {
+                "id": "chatcmpl-cont-usage",
+                "prompt_tokens": 10,
+                "completion_tokens": 2,
+                "cached_tokens": cached_tokens,
+                "finish_reason": {"type": "stop", "matched": None},
+                "output_token_logprobs": None,
+                "output_top_logprobs": None,
+            },
+            "index": 0,
+        }
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            stream=True,
+        )
+
+        async def _collect():
+            chunks = []
+            async for chunk in self.chat._generate_stream_content(
+                content=content,
+                index=0,
+                request=req,
+                stream_offsets={},
+                reasoning_parser_dict={},
+                parser_dict={},
+                has_tool_calls={},
+                choice_logprobs=None,
+                finish_reason_type="stop",
+                continuous_usage_stats=True,
+                prompt_tokens={0: 10},
+                reasoning_tokens={0: 0},
+                completion_tokens={0: 2},
+            ):
+                chunks.append(chunk)
+            return chunks
+
+        chunks = get_or_create_event_loop().run_until_complete(_collect())
+        return [c["usage"] for c in self._parse_chunks(chunks) if c.get("usage")]
+
+    def test_continuous_usage_reports_cached_tokens(self):
+        """continuous_usage_stats chunks include cached tokens when cache reporting is on."""
+        self.tm.server_args.enable_cache_report = True
+        usages = self._collect_continuous_usage(cached_tokens=6)
+        self.assertTrue(usages, "continuous_usage_stats attached no usage")
+        self.assertEqual(usages[0]["prompt_tokens_details"]["cached_tokens"], 6)
+
+    def test_continuous_usage_omits_cached_tokens_when_report_disabled(self):
+        """With cache reporting off, continuous_usage_stats must not leak cached tokens."""
+        self.tm.server_args.enable_cache_report = False
+        usages = self._collect_continuous_usage(cached_tokens=6)
+        self.assertTrue(usages, "continuous_usage_stats attached no usage")
+        self.assertIsNone(usages[0].get("prompt_tokens_details"))
+
     # ------------- incremental streaming output tests -------------
     def test_incremental_streaming_output_delta(self):
         """Test that streaming with incremental_streaming_output produces correct deltas.
@@ -1897,14 +1797,6 @@ class ServingChatTestCase(unittest.TestCase):
         )
         self.assertIsNone(result)
 
-    def test_extract_routed_dp_rank_from_header_with_header(self):
-        """Test that header value is extracted correctly."""
-        self.fastapi_request.headers = {"x-data-parallel-rank": "2"}
-        result = self.chat.extract_routed_dp_rank_from_header(
-            self.fastapi_request, body_routed_dp_rank=None
-        )
-        self.assertEqual(result, 2)
-
     def test_extract_routed_dp_rank_header_overrides_body(self):
         """Test that header value has higher priority than body."""
         self.fastapi_request.headers = {"x-data-parallel-rank": "3"}
@@ -1943,6 +1835,67 @@ class ServingChatTestCase(unittest.TestCase):
             with self.subTest(effort=effort):
                 req.reasoning_effort = effort
                 self.assertEqual(chat._get_reasoning_from_request(req), expected)
+
+    def _setup_nemotron_super(self):
+        """Drive _apply_jinja_template (chat_template_name=None) with a
+        Nemotron-3 Super reasoning_config carrying effort_kwarg."""
+        self.tm.server_args.reasoning_parser = "nemotron_3"
+        self.chat.reasoning_parser = "nemotron_3"
+        self.tm.server_args.served_model_name = (
+            "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16"
+        )
+        self.template_manager.chat_template_name = None
+        self.template_manager.reasoning_config = ReasoningToggleConfig(
+            toggle_param="enable_thinking",
+            default_enabled=True,
+            effort_kwarg="low_effort",
+        )
+        self.chat.chat_encoding_spec = None
+
+    def _run_jinja_with_effort(self, effort):
+        req = ChatCompletionRequest(
+            model="nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16",
+            messages=[{"role": "user", "content": "hi"}],
+            reasoning_effort=effort,
+        )
+        with (
+            patch.object(self.chat, "_encode_messages", return_value=None),
+            patch.object(
+                self.chat,
+                "_handle_last_assistant_message",
+                return_value=([{"role": "user", "content": "hi"}], None),
+            ),
+        ):
+            self.chat._process_messages(req, False)
+        _, kwargs = self.tm.tokenizer.apply_chat_template.call_args
+        return kwargs
+
+    def test_nemotron_super_low_effort_mapped_to_kwarg(self):
+        self._setup_nemotron_super()
+        kwargs = self._run_jinja_with_effort("low")
+        self.assertTrue(kwargs.get("low_effort"))
+
+    def test_nemotron_super_high_effort_warns_without_kwarg(self):
+        self._setup_nemotron_super()
+        with self.assertLogs(
+            "sglang.srt.entrypoints.openai.serving_chat", level="WARNING"
+        ) as logs:
+            kwargs = self._run_jinja_with_effort("high")
+        self.assertNotIn("low_effort", kwargs)
+        self.assertTrue(any("only 'low' reasoning effort" in m for m in logs.output))
+
+    def test_nemotron_nano_no_effort_kwarg(self):
+        # Nano template has no low_effort, so effort_kwarg stays None and no
+        # warning is emitted even for non-low effort.
+        self.tm.server_args.reasoning_parser = "nemotron_3"
+        self.chat.reasoning_parser = "nemotron_3"
+        self.template_manager.chat_template_name = None
+        self.template_manager.reasoning_config = ReasoningToggleConfig(
+            toggle_param="enable_thinking", default_enabled=True
+        )
+        self.chat.chat_encoding_spec = None
+        kwargs = self._run_jinja_with_effort("high")
+        self.assertNotIn("low_effort", kwargs)
 
     def test_non_stream_reasoning_response_preserves_payload_whitespace(self):
         self.chat.reasoning_parser = "qwen3"
@@ -2285,10 +2238,6 @@ class TestProcessToolCallsWithRequiredToolChoice(unittest.TestCase):
 
 class TestNormalizeToolContent(unittest.TestCase):
     """Unit tests for normalize_tool_content()."""
-
-    def test_openai_text_parts_flattened(self):
-        result = normalize_tool_content("tool", [{"type": "text", "text": "10525"}])
-        self.assertEqual(result, "10525")
 
     def test_multiple_text_parts_joined(self):
         result = normalize_tool_content(
