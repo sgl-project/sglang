@@ -10,6 +10,15 @@
 set +e
 set -u
 
+# Bound the persistent uv cache (~/.cache/uv, bind-mounted and shared across all
+# runner containers). Nothing else evicts it, so it grows unbounded — on the
+# 5090 hosts it reached ~500 GB and filled the disk, failing jobs with ENOSPC at
+# dependency install. `--ci` drops rebuildable built wheels while keeping
+# downloaded ones. Runs regardless of venv mode; best effort, never fails the job.
+if command -v uv >/dev/null 2>&1; then
+    uv cache prune --ci >/dev/null 2>&1 || true
+fi
+
 # Skip entirely when venv mode is disabled — no /tmp/sglang-ci-* dir exists
 # and there's nothing to sweep. Matches the USE_VENV parsing in
 # ci_install_dependency.sh (accepts 1/true/yes, case-insensitive).
