@@ -3,8 +3,6 @@ from __future__ import annotations
 import dataclasses
 import time
 from abc import ABC, abstractmethod
-
-import msgspec
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -15,6 +13,7 @@ from typing import (
     runtime_checkable,
 )
 
+import msgspec
 import torch
 
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
