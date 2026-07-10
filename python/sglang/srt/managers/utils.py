@@ -69,6 +69,10 @@ class GenerationBatchResult:
     # relay path: forward stream -> next step forward
     next_draft_input: Optional[EagleDraftInput] = None
 
+    # PP+spec: tail-drafted chain tokens (flat bs*num_draft_tokens, root =
+    # bonus) for the NEXT verify round, relayed last stage -> all stages.
+    next_verify_chain: Optional[torch.Tensor] = None
+
     # Refs the worker wants scheduler to keep alive for the same 2-iter window
     # as batch_record_buf. Used for cross-stream tensor lifetime (e.g. a spec
     # V2 verify ForwardBatch whose tensors must outlive mid-iter SB rebinds).

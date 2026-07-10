@@ -6921,9 +6921,13 @@ class ServerArgs:
         )
 
         if self.pp_size > 1:
-            assert (
-                self.disable_overlap_schedule and self.speculative_algorithm is None
-            ), "Pipeline parallelism is not compatible with overlap schedule, speculative decoding"
+            import os as _os
+            if not _os.environ.get("SGLANG_ALLOW_PP_SPEC"):
+                assert (
+                    self.disable_overlap_schedule and self.speculative_algorithm is None
+                ), "Pipeline parallelism is not compatible with overlap schedule, speculative decoding"
+            else:
+                assert self.disable_overlap_schedule
 
         assert not (
             self.dp_size > 1 and self.nnodes != 1 and not self.enable_dp_attention
