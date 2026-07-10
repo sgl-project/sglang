@@ -104,7 +104,7 @@ def is_deepseek_dsa(config) -> bool:
     return (
         _hf_arch(config)
         in (
-            "GFusionModelLM",
+            "GFusionForDiffusionLM",
             "DeepseekV3ForCausalLM",
             "DeepseekV32ForCausalLM",
             "DeepseekV3ForCausalLMNextN",
@@ -245,7 +245,6 @@ class ModelConfig:
         language_only: bool = False,
         disable_hybrid_swa_memory: bool = False,
         model_config_parser: str = "auto",
-        dllm_algorithm: Optional[str] = None,
     ) -> None:
         # Parse args
         self.model_path = model_path
@@ -258,7 +257,6 @@ class ModelConfig:
         self.is_multi_layer_eagle = is_multi_layer_eagle
         self.disable_hybrid_swa_memory = disable_hybrid_swa_memory
         self.model_config_parser = model_config_parser
-        self.dllm_algorithm = dllm_algorithm
 
         # Validate quantize_and_serve configuration
         self._validate_quantize_and_serve_config()
@@ -321,9 +319,6 @@ class ModelConfig:
 
         # Config draft model
         self._config_draft_model()
-
-        # Config diffusion LLM (dLLM) model
-        self._config_dllm_model()
 
         # DSV4 expert layout: env (default True = mxfp4) applies only to V4.
         # Other FP8 MoE models (for example DeepSeek V3.2) must keep the normal
@@ -523,21 +518,8 @@ class ModelConfig:
             is_draft_model=is_draft_model,
             disable_hybrid_swa_memory=server_args.disable_hybrid_swa_memory,
             model_config_parser=server_args.model_config_parser,
-            dllm_algorithm=server_args.dllm_algorithm,
             **kwargs,
         )
-
-    def _config_dllm_model(self):
-        # GFusion diffusion checkpoints declare "GFusionForDiffusionLM"; when
-        # running under a dLLM algorithm, remap them onto SGLang's DeepSeek-MLA
-        # based implementation registered as "GFusionModelLM".
-        if (
-            self.dllm_algorithm is not None
-            and self.hf_config.architectures[0] == "GFusionForDiffusionLM"
-        ):
-            self.hf_config.architectures[0] = "GFusionModelLM"
-            if getattr(self.hf_text_config, "architectures", None) is not None:
-                self.hf_text_config.architectures[0] = "GFusionModelLM"
 
     def _config_draft_model(self):
         is_draft_model = self.is_draft_model
@@ -744,7 +726,7 @@ class ModelConfig:
         # FIXME: temporary special judge for MLA architecture
         if (
             "DeepseekV2ForCausalLM" in self.hf_config.architectures
-            or "GFusionModelLM" in self.hf_config.architectures
+            or "GFusionForDiffusionLM" in self.hf_config.architectures
             or "DeepseekV32ForCausalLM" in self.hf_config.architectures
             or "DeepseekV3ForCausalLM" in self.hf_config.architectures
             or "DeepseekV3ForCausalLMNextN" in self.hf_config.architectures

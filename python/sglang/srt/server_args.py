@@ -3658,7 +3658,7 @@ class ServerArgs:
 
         if model_arch in [
             "DeepseekV3ForCausalLM",
-            "GFusionModelLM",
+            "GFusionForDiffusionLM",
             "DeepseekV32ForCausalLM",
             "KimiK25ForConditionalGeneration",
             "MistralLarge3ForCausalLM",
@@ -3849,7 +3849,7 @@ class ServerArgs:
                     # safetensors header instead of assuming FP8 by arch name.
                     if quant_method is None and model_arch in [
                         "DeepseekV3ForCausalLM",
-                        "GFusionModelLM",
+                        "GFusionForDiffusionLM",
                     ]:
                         if has_fp8_weights_in_checkpoint(self.model_path):
                             self.quantization = "fp8"
@@ -4454,7 +4454,7 @@ class ServerArgs:
             and model_arch
             in [
                 "DeepseekV3ForCausalLM",
-                "GFusionModelLM",
+                "GFusionForDiffusionLM",
                 "DeepseekV32ForCausalLM",
                 "GptOssForCausalLM",
                 "GlmMoeDsaForCausalLM",
@@ -6244,7 +6244,7 @@ class ServerArgs:
                     is_deepseek_model = model_arch in [
                         "DeepseekV2ForCausalLM",
                         "DeepseekV3ForCausalLM",
-                        "GFusionModelLM",
+                        "GFusionForDiffusionLM",
                         "DeepseekV32ForCausalLM",
                         "MistralLarge3ForCausalLM",
                         "PixtralForConditionalGeneration",
