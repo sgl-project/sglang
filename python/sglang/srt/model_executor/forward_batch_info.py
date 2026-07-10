@@ -664,6 +664,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # block there). Use it directly.
         seq_lens_cpu = batch.seq_lens_cpu
 
+        # TODO(seq-lens-removal): the whole ScheduleBatch seq_lens family
+        # (incl. seq_lens_sum) is slated for removal in favor of kv-committed
+        # lengths, so this init_new-time backfill onto the ScheduleBatch is
+        # tolerated for now despite the init_new-must-not-mutate-SB rule.
         if batch.seq_lens_sum is None and seq_lens_cpu is not None:
             batch.seq_lens_sum = int(seq_lens_cpu.sum())
 
