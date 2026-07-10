@@ -125,6 +125,30 @@ LOAD_FORMAT_CHOICES = [
 
 # TODO: this list should likely contain only methods that support online quantization, or that support using custom quantization classes compatible with a given `quant_method` in config.json.
 # Some of the choices here do NOT support online quantization.
+# Attention backends whose kernels read the chunked prefix-cache layout.
+# Out-of-tree platforms may extend this list (via
+# add_chunked_prefix_cache_attention_backend) before ServerArgs construction;
+# the chunked-prefix gate is evaluated during resolution.
+CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS = [
+    "flashinfer",
+    "fa3",
+    "fa4",
+    "flashmla",
+    "cutedsl_mla",
+    "cutlass_mla",
+    "trtllm_mla",
+    "tokenspeed_mla",
+]
+
+
+def add_chunked_prefix_cache_attention_backend(backend_name):
+    if backend_name not in CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS:
+        CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS.append(backend_name)
+        logger.info(
+            f"Added {backend_name} to CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS."
+        )
+
+
 QUANTIZATION_CHOICES = [
     "awq",
     "fp8",  # MOE + linear online quantization.
@@ -268,6 +292,7 @@ FP4_GEMM_RUNNER_BACKEND_CHOICES = [
 BF16_GEMM_BACKEND_CHOICES = ["auto", "cutedsl"]
 
 RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru", "priority"]
+RETRACTION_POLICY_CHOICES = ["length", "priority"]
 
 RL_ON_POLICY_TARGET_CHOICES = ["fsdp"]
 
@@ -712,6 +737,19 @@ class ServerArgs:
         int,
         "Minimum difference in priorities for an incoming request to have to preempt running request(s).",
     ] = 10
+    retraction_policy: A[
+        str,
+        Arg(
+            help=(
+                "The decode retraction policy to use when the KV cache is full. "
+                "'length' preserves the existing behavior and retracts short-output, "
+                "long-input requests first. 'priority' retracts lower-priority "
+                "requests first, using the same priority direction as priority "
+                "scheduling."
+            ),
+            choices=RETRACTION_POLICY_CHOICES,
+        ),
+    ] = "length"
     schedule_conservativeness: A[
         float,
         "How conservative the schedule policy is. A larger value means more conservative scheduling. Use a larger value if you see requests being retracted frequently.",
@@ -892,6 +930,11 @@ class ServerArgs:
             choices=("zigzag", "interleave"),
         ),
     ] = None
+    # Split DSA GPU KV/indexer cache layers across CP ranks.
+    enable_dsa_cache_layer_split: A[
+        bool,
+        "Split DSA (DeepSeek Sparse Attention) GPU KV/indexer cache layers across context-parallel ranks to reduce per-rank KV memory. Currently only supported with the mooncake transfer backend (mooncake / mooncake_tcp); mori/nixl support will be added later by the community.",
+    ] = False
     enable_dsa_prefill_context_parallel: A[bool, Arg(no_cli=True)] = False
     dsa_prefill_cp_mode: A[str, Arg(no_cli=True)] = "round-robin-split"
     enable_prefill_context_parallel: A[bool, Arg(no_cli=True)] = False
@@ -1982,7 +2025,7 @@ class ServerArgs:
     linear_attn_prefill_backend: A[
         Optional[str],
         Arg(
-            help="Override the kernel backend for linear attention prefill/extend. If not set, uses --linear-attn-backend.",
+            help="Override the kernel backend for linear attention prefill/extend. If not set, uses --linear-attn-backend; compatible SM100 GDN models may automatically select FlashInfer.",
             choices=LINEAR_ATTN_KERNEL_BACKEND_CHOICES,
         ),
     ] = None
@@ -2418,7 +2461,7 @@ class ServerArgs:
     ] = False
     weight_loader_prefetch_checkpoints: A[
         bool,
-        "Prefetch checkpoint files into OS page cache before loading. Each rank prefetches a fraction of the shards, reducing total network I/O on shared filesystems (NFS/Lustre) from N*checkpoint to 1*checkpoint. Recommended for models on network storage.",
+        "Prefetch checkpoint files into OS page cache before loading. Each rank prefetches a fraction of the shards, reducing total network I/O on shared filesystems (NFS/Lustre) from N*checkpoint to 1*checkpoint. Recommended for models on network storage. When enabled, multi-threaded safetensors loading is disabled by default to avoid I/O oversubscription with the prefetch threads; set enable_multithread_load=true in --model-loader-extra-config to keep multi-threaded loading (e.g. on local NVMe where prefetch is a no-op).",
     ] = False
     weight_loader_prefetch_num_threads: A[
         int,
@@ -2845,6 +2888,10 @@ class ServerArgs:
         # Handle any other necessary validations.
         self._handle_other_validations()
 
+        # Model-capability adjustments that legacy code applied at model-load
+        # time; last declarations of the resolution, mirroring that order.
+        self._handle_model_capability_adjustments()
+
         # End of resolution: apply the accumulated declarations onto the
         # fields once (gate order). From here on server_args carries the
         # resolved configuration — post-init readers, in any process, read
@@ -2852,6 +2899,54 @@ class ServerArgs:
         from sglang.srt.arg_groups.overrides import materialize_declarations
 
         materialize_declarations(self)
+
+    def _handle_model_capability_adjustments(self):
+        if parse_connector_type(self.model_path) == ConnectorType.INSTANCE:
+            return
+        from sglang.srt.arg_groups.overrides import (
+            _hrm_text_attention_force,
+            run_post_process_pass,
+        )
+
+        model_config = self.get_model_config()
+        hf_config = model_config.hf_config
+
+        # HRM-Text needs bidirectional prompt attention (prefill), which only
+        # the Triton backend honors at the kernel level. Radix/prefix reuse is
+        # also unsafe: the recurrent forward writes direction-dependent KV
+        # across many slots.
+        is_hrm_text = getattr(
+            hf_config, "model_type", None
+        ) == "hrm_text" or "HrmTextForCausalLM" in getattr(
+            hf_config, "architectures", []
+        )
+        # prefix_lm defaults to True upstream; defaulting False would skip the
+        # bidirectional-attention forcing and silently produce junk output.
+        if is_hrm_text and getattr(hf_config, "prefix_lm", True):
+            run_post_process_pass(self, _hrm_text_attention_force)
+            self.chunked_prefill_size = -1
+            self.disable_radix_cache = True
+            self.disable_cuda_graph = True
+            # cuda_graph_config was already parsed from the legacy boolean, so
+            # flipping the boolean alone would not stop graph capture.
+            self.cuda_graph_config.decode.backend = Backend.DISABLED
+            self.cuda_graph_config.prefill.backend = Backend.DISABLED
+            logger.warning(
+                "HRM-Text (prefix_lm) detected: forcing --attention-backend "
+                "triton, --chunked-prefill-size -1, --disable-radix-cache, and "
+                "--disable-cuda-graph for correctness of the bidirectional "
+                "prompt attention."
+            )
+
+        if (
+            model_config.is_multimodal
+            and not model_config.is_multimodal_chunked_prefill_supported
+        ):
+            self.chunked_prefill_size = -1
+            logger.info(
+                f"Automatically turn off --chunked-prefill-size as it is not supported for "
+                f"{hf_config.model_type}"
+            )
 
     def _handle_model_source_paths(self):
         """Resolve model/tokenizer paths backed by remote object stores."""
@@ -3259,11 +3354,10 @@ class ServerArgs:
     # ------------------------------------------------------------------
     # CUDA graph configuration resolution
     # ------------------------------------------------------------------
-    # TODO: add unit tests in test/srt/test_server_args.py covering the
-    # precedence cascade + auto-disable matrix (follow-up PR).
     def _handle_cuda_graph_config(self):
         self._parse_cuda_graph_config()
         self._apply_cuda_graph_compatibility()
+        self._apply_cuda_graph_disaggregation_roles()
         self._validate_cuda_graph_config()
         # Warn on the final resolved config (not inside the compat cascade —
         # that path is skipped when the user explicitly sets the backend,
@@ -3352,6 +3446,14 @@ class ServerArgs:
             self._disable_breakable_cudagraph_if_incompatible()
         elif self.cuda_graph_config.prefill.backend == Backend.FULL:
             self._disable_full_prefill_cudagraph_if_incompatible()
+
+    def _apply_cuda_graph_disaggregation_roles(self):
+        if self.disaggregation_mode == "prefill":
+            if (Phase.DECODE, "backend") not in self._cuda_graph_config_locked:
+                self.cuda_graph_config.decode.backend = Backend.DISABLED
+        elif self.disaggregation_mode == "decode":
+            if (Phase.PREFILL, "backend") not in self._cuda_graph_config_locked:
+                self.cuda_graph_config.prefill.backend = Backend.DISABLED
 
     def _disable_tc_piecewise_cudagraph_if_incompatible(self):
         from sglang.srt.arg_groups.overrides import resolved_view as _resolved_view
@@ -3938,7 +4040,7 @@ class ServerArgs:
 
         run_post_process_pass(self, _dsa_kv_cache_dtype_default)
 
-    def _set_default_dsa_backends(self, kv_cache_dtype: str, major: int) -> None:
+    def _set_default_dsa_backends(self, major: int) -> None:
         # Moved to the resolution pipeline (arg_groups/overrides.py:
         # _dsa_split_backend_resolution), invoked here at its legacy slot.
         from sglang.srt.arg_groups.overrides import (
@@ -3974,6 +4076,12 @@ class ServerArgs:
 
         hf_config = self.get_model_config().hf_config
         model_arch = hf_config.architectures[0]
+
+        if self.enable_dsa_cache_layer_split and not is_deepseek_dsa(hf_config):
+            raise ValueError(
+                "--enable-dsa-cache-layer-split is only supported for DSA "
+                "(DeepSeek Sparse Attention) models."
+            )
 
         _hybrid_spec = get_linear_attn_spec_by_arch(model_arch)
         if _hybrid_spec is not None and _hybrid_spec.uses_mamba_radix_cache:
@@ -4069,12 +4177,58 @@ class ServerArgs:
                     self._set_default_dsa_kv_cache_dtype(
                         major, resolved_view(self).quantization
                     )
-                    self._set_default_dsa_backends(self.kv_cache_dtype, major)
+                    self._set_default_dsa_backends(major)
 
                 if self.enable_prefill_cp:
                     assert (
                         self.disaggregation_mode != "decode"
                     ), "CP is only supported for prefill when PD disaggregation, please remove --enable-prefill-cp."
+                if (
+                    self.enable_dsa_cache_layer_split
+                    and self.disaggregation_mode != "prefill"
+                ):
+                    if self.disaggregation_mode == "decode":
+                        raise ValueError(
+                            "--enable-dsa-cache-layer-split is not supported on "
+                            "decode workers. This flag is a prefill-CP "
+                            "optimization; decode receives full cache shards "
+                            "through PD transfer."
+                        )
+                    raise ValueError(
+                        "--enable-dsa-cache-layer-split is only supported on PD "
+                        "prefill workers. Non-PD workers also run decode and "
+                        "require ordinary local decode cache semantics."
+                    )
+                if self.enable_dsa_cache_layer_split and (
+                    not self.enable_prefill_cp or self.cp_strategy != "interleave"
+                ):
+                    raise ValueError(
+                        "--enable-dsa-cache-layer-split requires "
+                        "--enable-prefill-cp and --cp-strategy interleave "
+                        "(or legacy --enable-nsa-prefill-context-parallel with "
+                        "--nsa-prefill-cp-mode round-robin-split)."
+                    )
+                # Layer split relies on the mooncake all-CP-rank KV/indexer
+                # transfer path. mori/nixl support is a temporary limitation
+                # and will be added later by the community.
+                if (
+                    self.enable_dsa_cache_layer_split
+                    and self.disaggregation_transfer_backend != "mooncake"
+                ):
+                    raise ValueError(
+                        "--enable-dsa-cache-layer-split currently only supports "
+                        "the mooncake transfer backend (mooncake / mooncake_tcp). "
+                        f"Got --disaggregation-transfer-backend "
+                        f"{self.disaggregation_transfer_backend!r}. mori/nixl "
+                        "support will be added later by the community."
+                    )
+                if self.enable_dsa_cache_layer_split and self.pp_size > 1:
+                    raise ValueError(
+                        "--enable-dsa-cache-layer-split is not supported with "
+                        "pipeline parallelism (pp_size > 1) yet. It requires "
+                        "prefill context parallelism, and CP + PP has not been "
+                        "validated for this feature."
+                    )
 
             else:
                 # DeepSeek V3/R1/V3.1
@@ -5093,10 +5247,11 @@ class ServerArgs:
             ], "The expert parallel size must be 1 or the same as the tensor parallel size"
 
         if view.moe_runner_backend == "flashinfer_cutedsl":
+            # modelopt_mixed with non-NVFP4 MoE layers is rejected at load time.
             assert (
-                view.quantization in ["modelopt_fp4"]
+                view.quantization in ["modelopt_fp4", "modelopt_mixed"]
                 or self.get_model_config().nvfp4_moe_meta is not None
-            ), f"Invalid quantization '{view.quantization}'. \nFlashInfer CuteDSL MOE currently supports only: 'modelopt_fp4' or hybrid NVFP4 models."
+            ), f"Invalid quantization '{view.quantization}'. \nFlashInfer CuteDSL MOE currently supports only: 'modelopt_fp4', 'modelopt_mixed' (with NVFP4 MoE layers), or hybrid NVFP4 models."
             assert view.ep_size in [
                 1,
                 self.tp_size,
@@ -5511,26 +5666,6 @@ class ServerArgs:
 
         # Step 2: Storage-layout normalization without changing io backend.
         self._resolve_storage_layout_compatibility()
-
-        # Step 3: HiCache is not yet supported with the DeepSeek-V4 hip unified_kv
-        # layout, so fall back to the default tilelang FlashMLA backend.
-        self._resolve_unified_kv_hicache_compatibility()
-
-    def _resolve_unified_kv_hicache_compatibility(self):
-        # The DeepSeek-V4 unified_kv layout (SGLANG_HACK_FLASHMLA_BACKEND=
-        # unified_kv_triton) keeps swa/c4/c128 in a single per-layer buffer and
-        # has no HiCache host-pool support yet, so reset the backend to the
-        # default (tilelang) so the server still starts.
-        if not self.enable_hierarchical_cache:
-            return
-
-        if envs.SGLANG_HACK_FLASHMLA_BACKEND.get() == "unified_kv_triton":
-            envs.SGLANG_HACK_FLASHMLA_BACKEND.set("tilelang")
-            logger.warning(
-                "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton is not yet "
-                "compatible with --enable-hierarchical-cache; falling back to "
-                "SGLANG_HACK_FLASHMLA_BACKEND=tilelang."
-            )
 
     def _resolve_layout_io_compatibility(self):
         if (
@@ -6549,6 +6684,11 @@ class ServerArgs:
         ]
         return cls(**{attr: getattr(args, attr) for attr in attrs})
 
+    def get_tokenizer_worker_class(self):
+        from sglang.srt.managers.multi_tokenizer_mixin import TokenizerWorker
+
+        return TokenizerWorker
+
     def url(self, port: Optional[int] = None):
         scheme = "https" if self.ssl_certfile else "http"
         # When binding to all interfaces, use loopback for internal requests.
@@ -6606,6 +6746,58 @@ class ServerArgs:
         from sglang.srt.arg_groups.overrides import resolved_view
 
         return resolved_view(self)
+
+    def override(self, source: str, **fields) -> None:
+        """The single post-resolution mutation point.
+
+        After ``__post_init__`` the configuration is resolved; the audited
+        runtime adjustments (load-resolved values, control-plane
+        reconfiguration, deployment wiring) go through here instead of
+        assigning fields. Whitelisted resolvable fields also join the
+        declaration stash, so a republish resolves the same values;
+        everything is recorded with its ``source`` for provenance.
+        """
+        from sglang.srt.arg_groups.arg_utils import resolvable_fields
+
+        whitelist = resolvable_fields(type(self))
+        declared = {k: v for k, v in fields.items() if k in whitelist}
+        rest = {k: v for k, v in fields.items() if k not in whitelist}
+        if declared:
+            stash = getattr(self, "_resolved_overrides", None)
+            if stash is None:
+                stash = []
+                object.__setattr__(self, "_resolved_overrides", stash)
+            stash.append((source, dict(declared)))
+        if rest:
+            log = getattr(self, "_runtime_mutations", None)
+            if log is None:
+                log = []
+                object.__setattr__(self, "_runtime_mutations", log)
+            log.append((source, dict(rest)))
+        object.__setattr__(self, "_in_override", True)
+        try:
+            for field, value in fields.items():
+                setattr(self, field, value)
+        finally:
+            object.__setattr__(self, "_in_override", False)
+
+    def __setattr__(self, name, value):
+        # After materialization the fields are the resolved configuration:
+        # under the strict test harness, a bare assignment outside
+        # ServerArgs.override() (and the resolution pipeline itself) raises.
+        if (
+            not name.startswith("_")
+            and getattr(self, "_declarations_materialized", False)
+            and not getattr(self, "_in_override", False)
+        ):
+            from sglang.srt.environ import envs
+
+            if envs.SGLANG_STRICT_CONFIG_MUTATION.get():
+                raise AttributeError(
+                    f"server_args.{name} assigned after resolution; use "
+                    "server_args.override(source, ...) instead."
+                )
+        object.__setattr__(self, name, value)
 
     def _resolved_attention_backends(self):
         """Mid-resolution (prefill, decode) backends: reads through the pass
@@ -6826,6 +7018,10 @@ class ServerArgs:
                 logger.warning(
                     "--default-priority-value has no effect without --enable-priority-scheduling"
                 )
+        if self.retraction_policy == "priority" and not self.enable_priority_scheduling:
+            raise ValueError(
+                "--retraction-policy priority requires --enable-priority-scheduling"
+            )
 
         # Check hisparse
         # Moved to the resolution pipeline (arg_groups/overrides.py:
@@ -6901,7 +7097,7 @@ class ServerArgs:
         # Enable LoRA if any LoRA paths are provided for backward compatibility.
         if self.lora_paths:
             if self.enable_lora is None:
-                self.enable_lora = True
+                self.override("check_lora_server_args", enable_lora=True)
                 logger.warning(
                     "--enable-lora is set to True because --lora-paths is provided."
                 )
@@ -6912,7 +7108,9 @@ class ServerArgs:
 
         if self.enable_lora:
             if self.enable_lora_overlap_loading is None:
-                self.enable_lora_overlap_loading = False
+                self.override(
+                    "check_lora_server_args", enable_lora_overlap_loading=False
+                )
 
             if self.enable_lora_overlap_loading:
                 # TODO (glenliu21): use some sort of buffer with eviction instead of enforcing a limit
@@ -6933,9 +7131,8 @@ class ServerArgs:
 
             # Parse lora_paths
             if isinstance(self.lora_paths, list):
-                lora_paths = self.lora_paths
-                self.lora_paths = []
-                for lora_path in lora_paths:
+                parsed_lora_paths = []
+                for lora_path in self.lora_paths:
                     if isinstance(lora_path, str):
                         if "=" in lora_path:
                             name, path = lora_path.split("=", 1)
@@ -6969,19 +7166,23 @@ class ServerArgs:
                             f"Invalid type for item in --lora-paths list: {type(lora_path)}. "
                             "Expected a string or a dictionary."
                         )
-                    self.lora_paths.append(lora_ref)
+                    parsed_lora_paths.append(lora_ref)
+                self.override("check_lora_server_args", lora_paths=parsed_lora_paths)
             elif isinstance(self.lora_paths, dict):
-                self.lora_paths = [
-                    LoRARef(
-                        lora_id=LoRARef.deterministic_id(k, v),
-                        lora_name=k,
-                        lora_path=v,
-                        pinned=False,
-                    )
-                    for k, v in self.lora_paths.items()
-                ]
+                self.override(
+                    "check_lora_server_args",
+                    lora_paths=[
+                        LoRARef(
+                            lora_id=LoRARef.deterministic_id(k, v),
+                            lora_name=k,
+                            lora_path=v,
+                            pinned=False,
+                        )
+                        for k, v in self.lora_paths.items()
+                    ],
+                )
             elif self.lora_paths is None:
-                self.lora_paths = []
+                self.override("check_lora_server_args", lora_paths=[])
             else:
                 raise ValueError(
                     f"Invalid type for --lora-paths: {type(self.lora_paths)}. "
@@ -6991,7 +7192,10 @@ class ServerArgs:
             # Normalize target modules to a set; keep {"all"} as a sentinel
             # that gets resolved model-awarely in lora_manager.init_lora_shapes().
             if self.lora_target_modules:
-                self.lora_target_modules = set(self.lora_target_modules)
+                self.override(
+                    "check_lora_server_args",
+                    lora_target_modules=set(self.lora_target_modules),
+                )
                 if "all" in self.lora_target_modules:
                     assert (
                         len(self.lora_target_modules) == 1

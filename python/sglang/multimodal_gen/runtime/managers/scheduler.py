@@ -732,6 +732,9 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                     output_batch.audio, start, end, total_items
                 ),
                 audio_sample_rate=output_batch.audio_sample_rate,
+                action_pred=self._slice_batched_value(
+                    output_batch.action_pred, start, end, total_items
+                ),
                 trajectory_timesteps=self._slice_batched_value(
                     output_batch.trajectory_timesteps, start, end, total_items
                 ),
