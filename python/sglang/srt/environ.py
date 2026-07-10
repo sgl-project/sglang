@@ -648,6 +648,8 @@ class Envs:
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
     SGLANG_DISABLE_DSA_INDEXER_FUSION = EnvBool(False)
+    SGLANG_USE_FUSED_METADATA_COPY = EnvBool(True)
+    SGLANG_DSA_USE_FUSED_METADATA_GENERATION = EnvBool(True)
 
     # sgl-kernel
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)
@@ -656,6 +658,12 @@ class Envs:
     SGLANG_USE_SGL_FA3_KERNEL = EnvBool(True)
 
     # Kernels
+    # Force every sglang.kernels BaseFusedOp onto one backend (a KernelBackend
+    # value, e.g. "torch" / "torch_compile" / "triton" / "cuda_aot"); unset =
+    # auto-select by priority. "torch" flips all fused ops to their pure-torch
+    # reference implementations for numerical-bug bisection.
+    SGLANG_FORCE_FUSED_OP_BACKEND = EnvStr(None)
+    USE_TRITON_W8A8_FP8_KERNEL = EnvBool(False)
     SGLANG_RETURN_ORIGINAL_LOGPROB = EnvBool(False)
     SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN = EnvBool(False)
     SGLANG_MOE_PADDING = EnvBool(False)
