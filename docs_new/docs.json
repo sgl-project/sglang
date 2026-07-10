@@ -1266,7 +1266,7 @@
                 ]
               },
               {
-                "group": "Vision-Language-Action Policies",
+                "group": "VLA (Vision-Language-Action) Models",
                 "pages": [
                   "cookbook/vla/intro",
                   {
