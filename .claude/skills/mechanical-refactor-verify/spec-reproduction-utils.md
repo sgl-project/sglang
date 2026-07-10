@@ -122,6 +122,10 @@
   magic trailing comma survive); nested matching calls are all rewritten.
 - `requalify_call_sites(name, owner, *, paths)` — `Owner.m(args)` → `m(args)`; only the
   qualifier span changes.
+- `route_call_sites_through_field(name, *, field, paths, owner)` — `recv.m(args)` →
+  `recv.field.m(args)` when `m` moved onto a collaborator reached via `self.field`; the
+  call-side dual of `move_symbol(leave_delegate=...)`. A call already routed through `field`
+  is skipped so the pass converges; `owner` restricts to one exact receiver.
 - `remove_import(rel, import_text, *, in_function)` — function-scoped or module-level;
   whole-statement match with token boundaries (`import os` cannot hit `import os.path`);
   removes exactly the matched import even on a semicolon-joined line.

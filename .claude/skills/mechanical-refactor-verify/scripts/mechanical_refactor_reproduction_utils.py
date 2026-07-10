@@ -454,6 +454,44 @@ class Repro:
         self.ops.append(op)
         return self
 
+    def route_call_sites_through_field(
+        self, name: str, *, field: str, paths: list[str], owner: str | None = None
+    ) -> "Repro":
+        """Rewrite ``<recv>.name(args)`` to ``<recv>.field.name(args)`` -- the method moved
+        onto a collaborator reached through ``self.field``, so its callers route through that
+        field. With ``owner`` given, only calls whose receiver text equals ``owner`` are
+        rewritten. A call already routed through ``field`` is skipped, so the pass converges.
+        """
+
+        def op(root: Path) -> None:
+            for rel in paths:
+                path = root / rel
+
+                def predicate(node: ast.Call) -> bool:
+                    return (
+                        isinstance(node.func, ast.Attribute)
+                        and node.func.attr == name
+                        and not (
+                            isinstance(node.func.value, ast.Attribute)
+                            and node.func.value.attr == field
+                        )
+                        and (owner is None or ast.unparse(node.func.value) == owner)
+                    )
+
+                def rewrite(text: str, node: ast.Call) -> str:
+                    call_src = _node_slice(text, node)
+                    func_src = _node_slice(text, node.func)
+                    receiver_src = _node_slice(text, node.func.value)
+                    return receiver_src + f".{field}.{name}" + call_src[len(func_src) :]
+
+                _write_source(
+                    path,
+                    _rewrite_matching_calls(_read_source(path), predicate, rewrite),
+                )
+
+        self.ops.append(op)
+        return self
+
     def remove_import(
         self, rel: str, import_text: str, *, in_function: str | None = None
     ) -> "Repro":
