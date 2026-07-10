@@ -52,6 +52,9 @@ if _use_aiter:
     from aiter import rmsnorm2d_fwd as rms_norm
     from aiter import rmsnorm2d_fwd_with_add as fused_add_rms_norm
 
+if _is_xpu:
+    from sgl_kernel import fused_qk_norm_rope_with_cos_sin_cache_inplace
+
 if not _is_cpu:
     from sglang.jit_kernel.diffusion.triton.norm import norm_infer, rms_norm_fn
 
@@ -945,7 +948,7 @@ def apply_qk_norm_rope(
     position_offset: int = 0,
     allow_inplace: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Apply QK RMSNorm followed by RoPE, fusing both on supported CUDA shapes."""
+    """Apply QK RMSNorm followed by RoPE, fusing both on supported CUDA/XPU shapes."""
 
     from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
         apply_flashinfer_rope_qk_inplace,
@@ -1021,6 +1024,36 @@ def apply_qk_norm_rope(
             eps=q_eps,
             head_dim=head_dim,
             rope_dim=rope_dim,
+        )
+        return q, k
+
+    if (
+        _is_xpu
+        and allow_inplace
+        and (q_eps == k_eps)
+        and q.dtype in (torch.float16, torch.bfloat16)
+        and q_norm.weight.dtype == q.dtype
+        and k_norm.weight.dtype == k.dtype
+        and q.is_contiguous()
+        and k.is_contiguous()
+        and q.shape[-1] == head_dim
+        and q_norm.weight.shape[0] == head_dim
+        and k_norm.weight.shape[0] == head_dim
+        and head_dim in (64, 128, 256)
+        and rope_dim in (32, 64, 128, 256)
+        and rope_dim % (head_dim // 32) == 0
+    ):
+
+        # Keep the fused kernel contract 3D; q/k are flattened without copying.
+        fused_qk_norm_rope_with_cos_sin_cache_inplace(
+            q=q.view(-1, q.shape[-2], head_dim),
+            k=k.view(-1, k.shape[-2], head_dim),
+            q_weight=q_norm.weight,
+            k_weight=k_norm.weight,
+            cos_sin_cache=cos_sin_cache,
+            positions=positions,
+            is_neox=is_neox,
+            eps=q_eps,
         )
         return q, k
 
