@@ -761,6 +761,8 @@ class Envs:
 
     # Ngram
     SGLANG_NGRAM_FORCE_GREEDY_VERIFY = EnvBool(False)
+    # Log ngram precompute hit-rate stats every N forward steps; <=0 disables.
+    SGLANG_LOG_NGRAM_PRECOMPUTE_STATS_INTERVAL = EnvInt(0)
 
     # Warmup
     # in seconds. If a warmup forward batch takes longer than this, the server will crash to prevent hanging.

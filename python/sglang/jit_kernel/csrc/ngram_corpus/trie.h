@@ -77,6 +77,22 @@ class Trie {
       MatchState& state,
       size_t total_len) const;
 
+  std::vector<int32_t> getRootCandidatesRecency(
+      const int32_t* context,
+      size_t len,
+      size_t max_candidates,
+      const Param& param,
+      MatchState& state,
+      size_t total_len) const;
+
+  std::vector<int32_t> getRootCandidatesFrequency(
+      const int32_t* context,
+      size_t len,
+      size_t max_candidates,
+      const Param& param,
+      MatchState& state,
+      size_t total_len) const;
+
   void squeeze(size_t count);
 
   void reset();

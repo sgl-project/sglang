@@ -2,7 +2,7 @@
 
 import logging
 from collections.abc import Iterable, Sequence
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -105,6 +105,74 @@ class NgramCorpus:
     ) -> Tuple[np.ndarray, np.ndarray]:
         state_ids = [self._get_state_id(rid) for rid in req_ids]
         return self._obj.match_stateful(state_ids, batch_tokens, total_lens)
+
+    @staticmethod
+    def direct_child_tokens(
+        tokens: np.ndarray,
+        tree_mask: np.ndarray,
+        parent: int,
+        max_candidates: Optional[int] = None,
+    ) -> List[int]:
+        child_tokens = []
+        seen_tokens = set()
+        for child in range(parent + 1, len(tokens)):
+            if tree_mask[child, child] == 0 or tree_mask[child, parent] == 0:
+                continue
+            ancestor_cols = np.nonzero(tree_mask[child, :child])[0]
+            if len(ancestor_cols) == 0 or ancestor_cols[-1] != parent:
+                continue
+            token = int(tokens[child])
+            if token in seen_tokens:
+                continue
+            seen_tokens.add(token)
+            child_tokens.append(token)
+            if max_candidates is not None and len(child_tokens) >= max_candidates:
+                break
+        return child_tokens
+
+    def precompute_drafts(
+        self,
+        req_ids: List[str],
+        base_tokens: List[List[int]],
+        total_lens: List[int],
+        draft_tokens,
+        tree_mask,
+        bonus_topk: int,
+        max_trie_depth: int,
+    ) -> Tuple[int, int, int]:
+        state_ids = [self._get_state_id(rid) for rid in req_ids]
+        return self._obj.precompute_drafts_stateful_wrapper(
+            state_ids,
+            base_tokens,
+            total_lens,
+            draft_tokens,
+            tree_mask,
+            bonus_topk,
+            max_trie_depth,
+        )
+
+    def precomputed_root_bonus_tokens(self, req_ids: List[str]) -> List[int]:
+        state_ids = [self._get_state_id(rid) for rid in req_ids]
+        return self._obj.precomputed_root_bonus_tokens_stateful_wrapper(state_ids)
+
+    def select_precomputed_drafts(
+        self,
+        req_ids: List[str],
+        accept_tokens,
+        accept_lens,
+        accept_index,
+        fallback_tokens: List[List[int]],
+        fallback_total_lens: List[int],
+    ):
+        state_ids = [self._get_state_id(rid) for rid in req_ids]
+        return self._obj.select_precomputed_drafts_stateful_wrapper(
+            state_ids,
+            accept_tokens,
+            accept_lens,
+            accept_index,
+            fallback_tokens,
+            fallback_total_lens,
+        )
 
     def erase_match_state(self, req_ids: List[str]):
         state_ids = []
