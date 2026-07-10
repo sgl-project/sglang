@@ -12,7 +12,7 @@ Uses optimized causal_conv1d kernels from the mamba package for fast inference.
 """
 
 import logging
-from typing import Iterable, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Iterable, List, Optional, Set, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -23,6 +23,9 @@ from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.attention.mamba.causal_conv1d import (
     causal_conv1d_fn,
     causal_conv1d_update,
+)
+from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
+    causal_conv1d_update as causal_conv1d_update_triton,
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -45,8 +48,14 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     sharded_weight_loader,
 )
+from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix, make_layers, set_weight_attrs
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.attention.linear.short_conv_backend import (
+        ShortConvMetadata,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -200,6 +209,55 @@ class Lfm2Attention(nn.Module):
         return out
 
 
+def register_shortconv_verify_buffers(conv: nn.Module) -> None:
+    """Pre-size the per-module tape slot-index buffer used by TARGET_VERIFY.
+
+    Shared by Lfm2ShortConv and Lfm2MoeShortConv (lfm2_moe.py imports it).
+    """
+    conv.register_buffer(
+        "_intermediate_state_indices",
+        torch.arange(256, dtype=torch.int32),
+        persistent=False,
+    )
+
+
+def shortconv_target_verify(
+    conv: nn.Module,
+    Bx: torch.Tensor,
+    meta: "ShortConvMetadata",
+    draft_token_num: int,
+    arch: str,
+) -> torch.Tensor:
+    """Depthwise short conv over a DFlash TARGET_VERIFY block.
+
+    Shared by Lfm2ShortConv and Lfm2MoeShortConv (lfm2_moe.py imports it).
+    Runs the triton update kernel over the [bs, block] layout, recording the
+    per-step conv windows into the speculative tape
+    (``MambaPool.SpeculativeState.intermediate_conv_window``) so the conv
+    state can roll back to the accept boundary after verification.
+    """
+    assert isinstance(meta.layer_cache, MambaPool.SpeculativeState), (
+        f"{arch} TARGET_VERIFY requires --mamba-radix-cache-strategy extra_buffer."
+    )
+    bs = meta.cache_indices.shape[0]
+    Bx_reshaped = Bx.view(bs, draft_token_num, -1).transpose(1, 2)
+    if conv._intermediate_state_indices.shape[0] < bs:
+        conv._intermediate_state_indices = torch.arange(
+            bs, dtype=torch.int32, device=Bx.device
+        )
+    conv_out = causal_conv1d_update_triton(
+        Bx_reshaped,
+        meta.layer_cache.conv[0],
+        conv.conv_weight,
+        conv.conv_bias,
+        activation=None,
+        conv_state_indices=meta.cache_indices,
+        intermediate_conv_window=meta.layer_cache.intermediate_conv_window[0],
+        intermediate_state_indices=conv._intermediate_state_indices[:bs],
+    )
+    return conv_out.transpose(1, 2).reshape(bs * draft_token_num, -1)
+
+
 class Lfm2ShortConv(nn.Module):
     """
     Gated short convolution layer using optimized causal_conv1d kernels.
@@ -257,6 +315,8 @@ class Lfm2ShortConv(nn.Module):
         else:
             self.register_parameter("conv_bias", None)
 
+        register_shortconv_verify_buffers(self)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -285,6 +345,10 @@ class Lfm2ShortConv(nn.Module):
                 self.conv_bias,
                 activation=None,
                 conv_state_indices=meta.cache_indices,
+            )
+        elif forward_batch.forward_mode.is_target_verify():
+            conv_out = shortconv_target_verify(
+                self, Bx, meta, forward_batch.spec_info.draft_token_num, "LFM2"
             )
         else:
             # Prefill: multiple tokens, use varlen kernel
@@ -317,6 +381,8 @@ class Lfm2DecoderLayer(nn.Module):
         super().__init__()
         self.layer_type = config.layer_types[layer_id]
         self.is_attention_layer = self.layer_type == "full_attention"
+        # Set by Lfm2Model.set_dflash_layers_to_capture for DFlash aux capture.
+        self._is_layer_to_capture = False
 
         self.operator_norm = RMSNorm(config.hidden_size, eps=config.norm_eps)
         self.ffn_norm = RMSNorm(config.hidden_size, eps=config.norm_eps)
@@ -349,9 +415,13 @@ class Lfm2DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: Optional[torch.Tensor],
         forward_batch: ForwardBatch,
+        captured_last_layer_outputs: Optional[List[torch.Tensor]] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if not forward_batch.forward_mode.is_idle():
+            if captured_last_layer_outputs is not None:
+                captured_last_layer_outputs.append(hidden_states)
+
             residual = hidden_states
             normed = self.operator_norm(hidden_states)
 
@@ -402,6 +472,15 @@ class Lfm2Model(nn.Module):
             config.num_hidden_layers, get_layer, prefix=f"{prefix}.layers"
         )
         self.embedding_norm = RMSNorm(config.hidden_size, eps=config.norm_eps)
+        self.layers_to_capture: List[int] = []
+
+    def set_dflash_layers_to_capture(self, layers_to_capture: List[int]):
+        self.layers_to_capture = list(layers_to_capture)
+        for layer_id in self.layers_to_capture:
+            # A tap on the final layer (layer_id == len(self.layers)) is
+            # captured after the loop in forward(); only mark real layers.
+            if layer_id < len(self.layers):
+                self.layers[layer_id]._is_layer_to_capture = True
 
     def forward(
         self,
@@ -415,16 +494,30 @@ class Lfm2Model(nn.Module):
         )
 
         residual = None
+        aux_hidden_states: List[torch.Tensor] = []
         for i in range(len(self.layers)):
-            hidden_states, residual = self.layers[i](
+            layer = self.layers[i]
+            hidden_states, residual = layer(
                 layer_id=i,
                 positions=positions,
                 hidden_states=hidden_states,
                 residual=residual,
                 forward_batch=forward_batch,
+                captured_last_layer_outputs=(
+                    aux_hidden_states if layer._is_layer_to_capture else None
+                ),
             )
 
-        return self.embedding_norm(hidden_states)
+        if (
+            not forward_batch.forward_mode.is_idle()
+            and len(self.layers) in self.layers_to_capture
+        ):
+            aux_hidden_states.append(hidden_states)
+
+        hidden_states = self.embedding_norm(hidden_states)
+        if not aux_hidden_states:
+            return hidden_states
+        return hidden_states, aux_hidden_states
 
 
 class Lfm2ForCausalLM(nn.Module):
@@ -461,6 +554,20 @@ class Lfm2ForCausalLM(nn.Module):
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
 
+    @property
+    def capture_aux_hidden_states(self) -> bool:
+        return bool(self.model.layers_to_capture)
+
+    def set_dflash_layers_to_capture(self, layer_ids: List[int]):
+        if not self.pp_group.is_last_rank:
+            return
+
+        if layer_ids is None:
+            raise ValueError("DFLASH requires explicit layer_ids for aux hidden capture.")
+
+        # Mark layer L to capture its input, which is the output of layer L-1.
+        self.model.set_dflash_layers_to_capture([val + 1 for val in layer_ids])
+
     @torch.no_grad()
     def forward(
         self,
@@ -471,8 +578,14 @@ class Lfm2ForCausalLM(nn.Module):
         **kwargs,
     ):
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
+        aux_hidden_states = None
+        # Capture-enabled idle batches return a bare tensor (layers skip the
+        # append on IDLE), so narrow on the actual return shape.
+        if isinstance(hidden_states, tuple):
+            hidden_states, aux_hidden_states = hidden_states
+
         return self.logits_processor(
-            input_ids, hidden_states, self.lm_head, forward_batch
+            input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
         )
 
     def load_weights(

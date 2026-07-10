@@ -1005,6 +1005,8 @@ _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
         "GraniteMoeHybridForCausalLM",
         "NemotronHForCausalLM",
         "NemotronHPuzzleForCausalLM",
+        "Lfm2ForCausalLM",
+        "Lfm2MoeForCausalLM",
     }
 )
 
