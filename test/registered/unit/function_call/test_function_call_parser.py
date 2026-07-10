@@ -1903,6 +1903,27 @@ class TestQwen3CoderDetector(unittest.TestCase):
                     },
                 ),
             ),
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_current_time",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "cities": {
+                                "anyOf": [
+                                    {
+                                        "type": "array",
+                                        "items": {"type": "string"},
+                                    },
+                                    {"type": "null"},
+                                ],
+                                "default": None,
+                            }
+                        },
+                    },
+                ),
+            ),
         ]
         self.detector = Qwen3CoderDetector()
 
@@ -2106,6 +2127,56 @@ class TestQwen3CoderDetector(unittest.TestCase):
         self.assertEqual(len(params["todos"]), 2)
         self.assertEqual(params["todos"][0]["content"], "Buy groceries")
         self.assertEqual(params["todos"][1]["status"], "completed")
+
+    def test_anyof_array_parameter_conversion(self):
+        """
+        Test array parameter conversion for nullable anyOf schemas.
+
+        Scenario: A Pydantic-style nullable list schema is represented by anyOf.
+        Purpose: Verify array values are parsed as arrays, not JSON-looking strings.
+        """
+        text = """<tool_call>
+<function=get_current_time>
+<parameter=cities>
+["NYC"]
+</parameter>
+</function>
+</tool_call>"""
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        params = json.loads(result.calls[0].parameters)
+        self.assertIsInstance(params["cities"], list)
+        self.assertEqual(params["cities"], ["NYC"])
+
+    def test_streaming_anyof_array_parameter_conversion(self):
+        """
+        Test streaming array parameter conversion for nullable anyOf schemas.
+
+        Scenario: A Pydantic-style nullable list schema is streamed in Qwen3 Coder format.
+        Purpose: Verify the streamed JSON fragments encode an array value, not a string value.
+        """
+        chunks = [
+            "<tool_call>",
+            "<function=get_current_time>",
+            "<parameter=cities>",
+            '["NYC"]',
+            "</parameter>",
+            "</function>",
+            "</tool_call>",
+        ]
+
+        detector = Qwen3CoderDetector()
+        collected_params = ""
+
+        for chunk in chunks:
+            result = detector.parse_streaming_increment(chunk, self.tools)
+            for call in result.calls:
+                if call.parameters:
+                    collected_params += call.parameters
+
+        params = json.loads(collected_params)
+        self.assertIsInstance(params["cities"], list)
+        self.assertEqual(params["cities"], ["NYC"])
 
     # ==================== Edge Cases ====================
 
