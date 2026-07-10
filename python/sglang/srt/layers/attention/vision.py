@@ -77,7 +77,7 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.layers.rotary_embedding import apply_rotary_pos_emb
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import add_prefix, get_bool_env_var
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
@@ -962,10 +962,7 @@ class VisionAttention(nn.Module):
         # Select attention backend via a unified method
         _passed_backend = qkv_backend
         qkv_backend = self._determine_attention_backend(_passed_backend)
-        if (
-            get_global_server_args().mm_attention_backend is None
-            and _passed_backend is None
-        ):
+        if get_server_args().mm_attention_backend is None and _passed_backend is None:
             print_info_once(f"Multimodal attention backend not set. Use {qkv_backend}.")
         print_info_once(f"Using {qkv_backend} as multimodal attention backend.")
 
@@ -1045,7 +1042,7 @@ class VisionAttention(nn.Module):
                 weight_dtype=torch.float32,
                 cast_x_before_out_mul=True,
             )
-            if get_global_server_args().rl_on_policy_target is not None
+            if get_server_args().rl_on_policy_target is not None
             else {}
         )
         q_norm = RMSNorm(
@@ -1073,7 +1070,7 @@ class VisionAttention(nn.Module):
         - CUDA (other): "triton_attn"
         - Non-CUDA: "sdpa"
         """
-        override_backend = get_global_server_args().mm_attention_backend
+        override_backend = get_server_args().mm_attention_backend
         if override_backend is not None:
             backend = override_backend
         elif passed_backend is not None:
@@ -1177,7 +1174,7 @@ class VisionAttention(nn.Module):
             x = x.unsqueeze(0)
         assert x.dim() == 3, x.shape
         if (
-            get_global_server_args().rl_on_policy_target is not None
+            get_server_args().rl_on_policy_target is not None
             and position_embeddings is not None
         ):
             assert isinstance(position_embeddings, tuple), (
