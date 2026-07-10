@@ -6,7 +6,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.kernels.ops.attention.fla.op import exp2
+from sglang.kernels.ops.attention.fla.op import exp
 from sglang.kernels.ops.attention.fla.utils import autotune_cache_kwargs
 
 
@@ -118,7 +118,7 @@ def chunk_kda_fwd_kernel_intra_token_parallel(
         b_kj = tl.load(p_kj, boundary_check=(0, 1)).to(tl.float32)
         b_gj = tl.load(p_gj, boundary_check=(0, 1)).to(tl.float32)
 
-        b_kgj = b_kj * exp2(b_g - b_gj)
+        b_kgj = b_kj * exp(b_g - b_gj)
 
         b_kgj = tl.where(m_k[None, :], b_kgj, 0.0)
         # [BH]
