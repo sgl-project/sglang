@@ -6900,6 +6900,14 @@ class ServerArgs:
                 self.chunked_prefill_size % self.page_size == 0
             ), "chunked_prefill_size must be divisible by page_size"
 
+        # Check encoder-decoder paged KV
+        if self.get_model_config().is_encoder_decoder and self.page_size > 1:
+            raise ValueError(
+                "Encoder-decoder models require --page-size 1: the decode KV "
+                "allocation indexes req_to_token rows without the encoder-token "
+                "offset, so its page math is wrong when page_size > 1."
+            )
+
         # Check pdmux
         if self.enable_pdmux:
             assert (

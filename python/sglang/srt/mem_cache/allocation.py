@@ -256,12 +256,10 @@ def assert_alloc_extend_lens_page_aligned(
     extend_num_tokens: int,
     page_size: int,
 ) -> None:
-    """Guardrail for the op2 request-side alignment: every alloc_extend request
-    must have page-aligned lens. Host-only (CPU mirrors / host ints, no sync).
-    Skipped for DSV4-NPU (real-lens requests by design). Under DCP the
-    allocator page is page_size * dcp_size while radix matches align fresh
-    prefixes only to the tree (server) page, so the check downgrades to
-    tree-page granularity there.
+    """Skipped on NPU (real-lens requests by design). Under DCP the allocator
+    page is page_size * dcp_size while radix matches align fresh prefixes only
+    to the tree (server) page, so the check downgrades to tree-page granularity
+    there.
     """
     if _is_npu or page_size == 1:
         return

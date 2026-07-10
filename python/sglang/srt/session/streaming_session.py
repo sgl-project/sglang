@@ -19,13 +19,15 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
-from sglang.srt.utils.common import ceil_align
+from sglang.srt.utils.common import ceil_align, is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 
 
 logger = logging.getLogger(__name__)
+
+_is_npu = is_npu()
 
 
 class _VirtualNode:
@@ -535,8 +537,9 @@ class StreamingSession(BasePrefixCache):
         ceil_align(prefix_len)) stays allocated and the watermark keeps the
         page-aligned account.
         """
+        bookkeeping_page_size = 1 if _is_npu else self.page_size
         allocated_after_free = min(
-            slot.kv.kv_allocated_len, ceil_align(prefix_len, self.page_size)
+            slot.kv.kv_allocated_len, ceil_align(prefix_len, bookkeeping_page_size)
         )
         self._free_kv_aligned(slot.req_pool_idx, prefix_len, slot.kv.kv_allocated_len)
         slot.kv.kv_allocated_len = allocated_after_free
@@ -556,9 +559,10 @@ class StreamingSession(BasePrefixCache):
         partial page [target, ceil_align(target)) is still attached.
         """
         target = len(req.origin_input_ids) + finished_len
+        bookkeeping_page_size = 1 if _is_npu else self.page_size
         self._free_kv_aligned(req.req_pool_idx, target, req.kv.kv_allocated_len)
         req.kv.kv_allocated_len = min(
-            req.kv.kv_allocated_len, ceil_align(target, self.page_size)
+            req.kv.kv_allocated_len, ceil_align(target, bookkeeping_page_size)
         )
         req.kv_committed_len = min(req.kv_committed_len, target)
         req.kv.swa_evicted_seqlen = min(req.kv.swa_evicted_seqlen, target)
