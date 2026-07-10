@@ -174,7 +174,6 @@ def test_rope(
     is_neox: bool,
     dtype: torch.dtype,
 ) -> None:
-
     num_qo_heads = num_kv_heads * gqa_ratio
     q = torch.randn(batch_size, num_qo_heads, rope_dim, device=DEVICE, dtype=dtype)
     k = torch.randn(batch_size, num_kv_heads, rope_dim, device=DEVICE, dtype=dtype)
@@ -226,7 +225,6 @@ def test_rope_position_dtypes(dtype: torch.dtype) -> None:
 def test_partial_rope(batch_size: int, is_neox: bool, rope_dim: int, head_dim: int):
     if head_dim < rope_dim:
         pytest.skip("Invalid config: head_dim must be >= rope_dim.")
-
     num_qo_heads, num_kv_heads = 8, 2
 
     q = torch.randn(batch_size, num_qo_heads, head_dim, device=DEVICE, dtype=DTYPE)
@@ -242,8 +240,8 @@ def test_partial_rope(batch_size: int, is_neox: bool, rope_dim: int, head_dim: i
     sglang_jit_rope(q_jit[rope], k_jit[rope], cos_sin_cache, positions, is_neox)
 
     atol = rtol = 1e-2
-    triton.testing.assert_close(q_jit, q_fi, atol=atol, rtol=rtol)
-    triton.testing.assert_close(k_jit, k_fi, atol=atol, rtol=rtol)
+    triton.testing.assert_close(q_fi, q_jit, atol=atol, rtol=rtol)
+    triton.testing.assert_close(k_fi, k_jit, atol=atol, rtol=rtol)
 
 
 @pytest.mark.parametrize("batch_size", BS_LIST)
