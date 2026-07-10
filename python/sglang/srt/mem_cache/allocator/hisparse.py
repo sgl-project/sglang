@@ -1,8 +1,12 @@
 import weakref
+from typing import Optional
 
 import torch
 
-from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.base import (
+    BaseTokenToKVPoolAllocator,
+    expand_page_ids_to_token_ids,
+)
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     DeepSeekV4TokenToKVPool,
@@ -107,6 +111,28 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.full_to_hisparse_device_index_mapping[logical_indices] = hisparse_indices
         return logical_indices
 
+    def alloc_pages(self, num_pages: int) -> Optional[torch.Tensor]:
+        if num_pages > self.logical_attn_allocator.available_size() // self.page_size:
+            return None
+        if num_pages > self.hisparse_attn_allocator.available_size() // self.page_size:
+            return None
+
+        logical_pages = self.logical_attn_allocator.alloc_pages(num_pages)
+        assert logical_pages is not None, "Logical allocation failed in alloc_pages"
+        hisparse_pages = self.hisparse_attn_allocator.alloc_pages(num_pages)
+        assert hisparse_pages is not None, "Hisparse allocation failed in alloc_pages"
+
+        self.full_to_hisparse_device_index_mapping[
+            expand_page_ids_to_token_ids(logical_pages, self.page_size)
+        ] = expand_page_ids_to_token_ids(hisparse_pages, self.page_size)
+        return logical_pages
+
+    def alloc_pages_decode(self, num_pages: int) -> Optional[torch.Tensor]:
+        """Decode allocates only the logical side (the hisparse device side is
+        provisioned separately via alloc_device_buffer), matching alloc_decode.
+        """
+        return self.logical_attn_allocator.alloc_pages(num_pages)
+
     def alloc_logical_only(
         self,
         prefix_lens: torch.Tensor,
@@ -129,6 +155,10 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             last_loc,
             extend_num_tokens,
         )
+
+    def alloc_logical_pages_only(self, num_pages: int) -> Optional[torch.Tensor]:
+        """Page-granular variant of alloc_logical_only."""
+        return self.logical_attn_allocator.alloc_pages(num_pages)
 
     def alloc_device_buffer(self, allocated_indices, need_size: int):
         assert need_size % self.page_size == 0
@@ -303,6 +333,12 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         # C4 HiSparse allocation/device-buffer code must use the compressed page size.
         self.page_size = logical_attn_allocator.page_size
         self.hisparse_page_size = self.hisparse_kvcache.page_size
+        # One logical page corresponds to exactly one hisparse page; the paged
+        # alloc_pages path below relies on this 1:1 relation.
+        assert self.page_size == self.compress_ratio * self.hisparse_page_size, (
+            f"DSV4 hisparse page relation broken: {self.page_size=}, "
+            f"{self.compress_ratio=}, {self.hisparse_page_size=}"
+        )
 
         self.logical_attn_allocator = logical_attn_allocator
         self._kvcache = logical_attn_allocator._kvcache
@@ -394,6 +430,43 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             "use alloc_extend or alloc_decode instead."
         )
 
+    def alloc_pages(self, num_pages: int) -> Optional[torch.Tensor]:
+        if num_pages > self.logical_attn_allocator.available_size() // self.page_size:
+            return None
+        if (
+            num_pages
+            > self.hisparse_attn_allocator.available_size() // self.hisparse_page_size
+        ):
+            return None
+
+        logical_pages = self.logical_attn_allocator.alloc_pages(num_pages)
+        assert logical_pages is not None, "Logical allocation failed in alloc_pages"
+        hisparse_pages = self.hisparse_attn_allocator.alloc_pages(num_pages)
+        assert hisparse_pages is not None, "Hisparse allocation failed in alloc_pages"
+
+        # One logical page expands to page_size raw tokens, whose compressed
+        # keys are exactly hisparse_page_size entries (page_size ==
+        # compress_ratio * hisparse_page_size, asserted in __init__), matching
+        # one hisparse page's token expansion 1:1.
+        compressed_logical_indices = (
+            self.hisparse_kvcache.translate_loc_from_full_to_compressed(
+                expand_page_ids_to_token_ids(logical_pages, self.page_size)
+            )
+        )
+        self.full_to_hisparse_device_index_mapping[compressed_logical_indices] = (
+            expand_page_ids_to_token_ids(
+                hisparse_pages, self.hisparse_page_size
+            ).to(torch.int64)
+        )
+        return logical_pages
+
+    def alloc_pages_decode(self, num_pages: int) -> Optional[torch.Tensor]:
+        """Decode allocates only the logical side (the C4 hisparse device side
+        is provisioned separately via alloc_device_buffer), matching
+        alloc_decode.
+        """
+        return self.logical_attn_allocator.alloc_pages(num_pages)
+
     def alloc_logical_only(
         self,
         prefix_lens: torch.Tensor,
@@ -412,6 +485,10 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             last_loc,
             extend_num_tokens,
         )
+
+    def alloc_logical_pages_only(self, num_pages: int) -> Optional[torch.Tensor]:
+        """Page-granular variant of alloc_logical_only."""
+        return self.logical_attn_allocator.alloc_pages(num_pages)
 
     def alloc_device_buffer(self, allocated_indices, need_size: int):
         assert need_size % self.hisparse_page_size == 0
