@@ -492,10 +492,7 @@ def should_skip_post_experts_all_reduce(*, is_tp_path: bool) -> bool:
         return True
     if get_moe_a2a_backend().is_pplx():
         # pplx's AllToAll.combine already sums each token's expert outputs back
-        # to the source rank (complete per-rank result), exactly like the
-        # flashinfer case above. A further EP/TP all-reduce would double-count
-        # and, under DP attention with idle ranks, fold other ranks' (fabricated)
-        # outputs into the real tokens -> garbage. So skip it.
+        # to the source rank
         return True
     return False
 

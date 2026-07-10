@@ -5689,9 +5689,6 @@ class ServerArgs:
                 )
 
         if a2a_backend == "pplx":
-            # pplx-kernels is a low-latency-only masked all-to-all backend, so
-            # force the low-latency dispatch mode (it does not have a normal /
-            # contiguous path).
             if self.deepep_mode == "normal":
                 raise ValueError(
                     "moe_a2a_backend='pplx' only supports low-latency mode; "

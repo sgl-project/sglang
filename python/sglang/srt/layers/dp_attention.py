@@ -85,7 +85,7 @@ class DpPaddingMode(IntEnum):
     ) -> DpPaddingMode:
         dp_size = get_attention_dp_size()
 
-        # The pplx-kernels all-to-all is a symmetric collective: every EP rank
+        # (trangdough) pplx-kernels a2a is a symmetric collective: every EP rank
         # must dispatch the same number of tokens or the device-side handshake
         # deadlocks (idle DP ranks with 0 tokens never signal their peers).
         # Force MAX_LEN so all ranks are padded to equal token counts.
