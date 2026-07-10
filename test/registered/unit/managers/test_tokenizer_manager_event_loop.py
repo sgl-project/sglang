@@ -3,6 +3,7 @@
 import asyncio
 import threading
 import unittest
+from contextvars import ContextVar
 
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
@@ -41,6 +42,7 @@ class TestTokenizerManagerEventLoop(CustomTestCase):
             tokenization_started, release_tokenization
         )
         manager.async_dynamic_batch_tokenizer = None
+        manager.init_request_preprocessor()
 
         def release_after_loop_progress():
             if not tokenization_started.wait(timeout=2):
@@ -65,6 +67,7 @@ class TestTokenizerManagerEventLoop(CustomTestCase):
         finally:
             release_tokenization.set()
             watchdog.join(timeout=2)
+            manager._request_preprocessor_executor.shutdown(wait=True)
 
         self.assertEqual(input_ids, [1])
         self.assertIsNone(token_type_ids)
@@ -74,6 +77,61 @@ class TestTokenizerManagerEventLoop(CustomTestCase):
             loop_was_starved.is_set(),
             "synchronous tokenization blocked the API event loop",
         )
+
+    def test_request_preprocessing_is_serialized(self):
+        first_started = threading.Event()
+        release_first = threading.Event()
+        second_started = threading.Event()
+        manager = TokenizerManager.__new__(TokenizerManager)
+        manager.init_request_preprocessor()
+
+        def first_call():
+            first_started.set()
+            if not release_first.wait(timeout=5):
+                raise TimeoutError("test did not release first preprocessing call")
+
+        def second_call():
+            second_started.set()
+
+        async def run_concurrent_calls():
+            first_task = asyncio.create_task(
+                manager.run_in_request_preprocessor(first_call)
+            )
+            started = await asyncio.to_thread(first_started.wait, 1)
+            self.assertTrue(started)
+
+            second_task = asyncio.create_task(
+                manager.run_in_request_preprocessor(second_call)
+            )
+            await asyncio.sleep(0.05)
+            self.assertFalse(second_started.is_set())
+
+            release_first.set()
+            await asyncio.gather(first_task, second_task)
+
+        try:
+            asyncio.run(run_concurrent_calls())
+        finally:
+            release_first.set()
+            manager._request_preprocessor_executor.shutdown(wait=True)
+
+        self.assertTrue(second_started.is_set())
+
+    def test_request_preprocessing_preserves_context(self):
+        request_context = ContextVar("request_context")
+        manager = TokenizerManager.__new__(TokenizerManager)
+        manager.init_request_preprocessor()
+
+        async def read_context_from_preprocessor():
+            request_context.set("request-value")
+            return await manager.run_in_request_preprocessor(request_context.get)
+
+        try:
+            result = asyncio.run(read_context_from_preprocessor())
+        finally:
+            manager._request_preprocessor_executor.shutdown(wait=True)
+
+        self.assertEqual(result, "request-value")
 
 
 if __name__ == "__main__":

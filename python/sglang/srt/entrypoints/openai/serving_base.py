@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import uuid
@@ -91,7 +90,10 @@ class OpenAIServingBase(ABC):
                 request_logger.log_openai_received_request(request, request=raw_request)
 
             # Chat template rendering and tokenization can block the event loop.
-            adapted_request, processed_request = await asyncio.to_thread(
+            (
+                adapted_request,
+                processed_request,
+            ) = await self.tokenizer_manager.run_in_request_preprocessor(
                 self._convert_to_internal_request, request, raw_request
             )
 

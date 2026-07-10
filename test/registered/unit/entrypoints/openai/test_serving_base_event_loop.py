@@ -10,6 +10,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase  # noqa: E402
+from sglang.srt.managers.tokenizer_manager import TokenizerManager  # noqa: E402
 from sglang.test.ci.ci_register import register_cpu_ci  # noqa: E402
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
@@ -17,11 +18,13 @@ register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 class _BlockingServing(OpenAIServingBase):
     def __init__(self, conversion_started, release_conversion):
-        tokenizer_manager = SimpleNamespace(
-            request_logger=SimpleNamespace(log_requests=False, log_requests_level=0),
-            server_args=SimpleNamespace(
-                tokenizer_metrics_allowed_custom_labels=None,
-            ),
+        tokenizer_manager = TokenizerManager.__new__(TokenizerManager)
+        tokenizer_manager.init_request_preprocessor()
+        tokenizer_manager.request_logger = SimpleNamespace(
+            log_requests=False, log_requests_level=0
+        )
+        tokenizer_manager.server_args = SimpleNamespace(
+            tokenizer_metrics_allowed_custom_labels=None,
         )
         super().__init__(tokenizer_manager)
         self.conversion_started = conversion_started
@@ -77,6 +80,7 @@ class TestServingBaseEventLoop(CustomTestCase):
         finally:
             release_conversion.set()
             watchdog.join(timeout=2)
+            serving.tokenizer_manager._request_preprocessor_executor.shutdown(wait=True)
 
         self.assertEqual(result, "ok")
         self.assertFalse(conversion_did_not_start.is_set())
