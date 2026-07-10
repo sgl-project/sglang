@@ -4043,13 +4043,6 @@ class Scheduler(
         if not self.running_batch.is_empty():
             self.running_batch.filter_batch()
 
-        # Collect reqs to retract unconditionally so a live chunked-prefill
-        # request is rescued even when running_batch is empty. On a disagg-prefill
-        # node running_batch is always empty and the fold-in above skips prefill,
-        # so a mid-chunk request is reachable only via self.chunked_req; without
-        # this it would be lost when the pointer is nulled below. The membership
-        # guard is a no-op in NULL/DECODE (the chunked req is already folded into
-        # running_batch) so it never double-releases.
         retracted_reqs = list(self.running_batch.reqs)
         if (
             self.chunked_req is not None

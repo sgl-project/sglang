@@ -204,13 +204,7 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
         self.assertFalse(scheduler.running_batch.batch_is_full)
 
     def test_retract_disagg_prefill_rescues_live_chunked_req(self):
-        """A live mid-chunk chunked_req on a disagg-prefill node must be released
-        and requeued before the pointer is nulled, not silently dropped.
-
-        On a prefill node running_batch is always empty and the last_batch fold-in
-        is skipped for PREFILL, so a mid-chunk request is reachable only via
-        self.chunked_req. Nulling the pointer without retracting it leaks its KV
-        and hangs the request forever."""
+        """A live mid-chunk chunked_req on a disagg-prefill node is retracted and requeued, not dropped."""
         scheduler = self._new_scheduler()
         scheduler.disaggregation_mode = DisaggregationMode.PREFILL
         scheduler.waiting_queue = []
