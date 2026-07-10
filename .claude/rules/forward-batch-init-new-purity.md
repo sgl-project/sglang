@@ -18,8 +18,8 @@ Known object-sharing notes (do not add new exceptions):
   write on the ScheduleBatch). Tolerated because the whole ScheduleBatch
   `seq_lens` family is slated for removal (moving to kv-committed lengths);
   revisit when that lands.
-- `init_new` writes `ret.sampling_info` sub-object attributes (grammars,
-  canary ids); same object as `batch.sampling_info` until the sampling
+- `init_new` writes `batch.sampling_info` sub-object attributes (grammars,
+  canary ids); same object shared with the ScheduleBatch until the sampling
   forward-copy op lands.
 - `_expand_mrope_from_input` lazily fills
   `mm_input.mrope_position_delta_repeated_cache` on the ScheduleBatch-owned
