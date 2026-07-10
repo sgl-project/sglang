@@ -544,6 +544,17 @@ class HYV3ForCausalLM(nn.Module):
                 if len(parts) >= 3 and int(parts[2]) >= self.config.num_hidden_layers:
                     continue
 
+            # HunyuanV3 checkpoints name the shared expert
+            # `...mlp.shared_experts.{gate,up,down}_proj.*`, but this model
+            # registers the module as `...mlp.shared_mlp.*`. Without this remap
+            # every shared-expert weight fails the `name not in params_dict`
+            # check below and is silently skipped, leaving `shared_mlp` at its
+            # uninitialized values and producing NaN on the first forward. The
+            # remap must run before stacked_params_mapping so gate/up_proj fuse
+            # into `gate_up_proj`.
+            if "mlp.shared_experts." in name:
+                name = name.replace("mlp.shared_experts.", "mlp.shared_mlp.")
+
             is_found = False
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
