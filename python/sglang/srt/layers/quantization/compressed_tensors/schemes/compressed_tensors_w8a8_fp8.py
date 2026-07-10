@@ -164,29 +164,41 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
         elif self.strategy == QuantizationStrategy.CHANNEL:
             weight = layer.weight
 
-            if is_fp8_fnuz():
-                input_scale = getattr(layer, "input_scale", None)
+            if is_fp8_fnuz() or _use_aiter:
+                # ROCm paths transform the weight destructively (dtype
+                # normalize / aiter shuffle); not reload-safe.
+                if is_fp8_fnuz():
+                    input_scale = getattr(layer, "input_scale", None)
 
-                weight, weight_scale, input_scale = normalize_e4m3fn_to_e4m3fnuz(
-                    weight=weight,
-                    weight_scale=layer.weight_scale,
-                    input_scale=input_scale,
-                )
-                if input_scale is not None:
-                    layer.input_scale = Parameter(input_scale, requires_grad=False)
+                    weight, weight_scale, input_scale = normalize_e4m3fn_to_e4m3fnuz(
+                        weight=weight,
+                        weight_scale=layer.weight_scale,
+                        input_scale=input_scale,
+                    )
+                    if input_scale is not None:
+                        layer.input_scale = Parameter(input_scale, requires_grad=False)
+                else:
+                    weight_scale = layer.weight_scale.data
+
+                if _use_aiter:
+                    # keep the weight as (N, K)
+                    layer.weight = Parameter(
+                        shuffle_weight(weight, (16, 16)), requires_grad=False
+                    )
+                else:
+                    layer.weight = Parameter(weight.t(), requires_grad=False)
+
+                # required by torch.compile to be torch.nn.Parameter
+                layer.weight_scale = Parameter(weight_scale, requires_grad=False)
             else:
-                weight_scale = layer.weight_scale.data
-
-            if _use_aiter:
-                # keep the weight as (N, K)
-                layer.weight = Parameter(
-                    shuffle_weight(weight, (16, 16)), requires_grad=False
-                )
-            else:
-                layer.weight = Parameter(weight.t(), requires_grad=False)
-
-            # required by torch.compile to be torch.nn.Parameter
-            layer.weight_scale = Parameter(weight_scale, requires_grad=False)
+                # Keep the checkpoint-layout params (and their weight_loader)
+                # so update_weights_from_disk can refill them; the kernel takes
+                # a transposed VIEW of the same storage, so in-place refills
+                # are visible without re-deriving and pointers stay stable for
+                # CUDA graphs.
+                layer.weight.requires_grad_(False)
+                layer.weight_scale.requires_grad_(False)
+                layer.weight_t = layer.weight.data.t()
 
         elif self.strategy == QuantizationStrategy.BLOCK:
             assert self.is_static_input_scheme is False
@@ -254,7 +266,9 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
         else:
             return apply_fp8_linear(
                 input=x,
-                weight=layer.weight,
+                # CHANNEL keeps the checkpoint-layout weight and derives the
+                # transposed view; TENSOR still stores the transpose in-place.
+                weight=getattr(layer, "weight_t", layer.weight),
                 weight_scale=layer.weight_scale,
                 input_scale=layer.input_scale,
                 bias=bias,
