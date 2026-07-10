@@ -23,9 +23,8 @@ from smg_grpc_proto import sglang_encoder_pb2, sglang_encoder_pb2_grpc
 
 from sglang.srt.disaggregation.encode_http_server import (
     handle_scheduler_receive_url_request,
-    launch_encoder,
 )
-from sglang.srt.disaggregation.encode_server import MMEncoder
+from sglang.srt.disaggregation.encode_server import MMEncoder, launch_encoder
 from sglang.srt.managers.io_struct import async_sock_send, wrap_as_pickle
 from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.server_args import PortArgs, ServerArgs
