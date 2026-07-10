@@ -515,9 +515,8 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> bool {
     let n = h.rids.len();
     let sum = |v: &[u32]| v.iter().map(|&x| x as usize).sum::<usize>();
 
-    // Per-column byte cursors: each starts at that column's base offset in `data`
-    // (columns are concatenated in this exact order, every element 4 bytes) and
-    // advances per request. No whole-column read.
+    // Per-column byte cursors, advanced per request — no whole-column read. Columns
+    // are concatenated in exactly this order, every element 4 bytes.
     let mut base = 0usize;
     let mut col = |count: usize| -> usize {
         let start = base;
@@ -539,14 +538,21 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> bool {
     let mut c_id_i = col(sum(&h.in_tid_poslens));
     let mut c_h_v = col(sum(&h.hidden_poslens));
 
-    // `col` summed every column's byte span into `base`. A header whose lengths
-    // exceed the data buffer is a malformed / positional-ABI-drifted frame: reject
-    // it whole — *before* routing any request — rather than reading out of bounds.
-    // (Out of bounds would panic the sole egress thread and stall every request;
-    // partially-routed misaligned columns would deliver garbage to real requests.)
+    // `col` summed every column's span into `base`. Reject a malformed frame whole,
+    // *before* routing any request: a partial fan-out would deliver garbage.
     if base > data.len() {
         return false;
     }
+
+    // Mirror of Python's `has_extra` guard: checking once per frame lets the
+    // per-request loop skip the extras machinery entirely on a plain decode frame.
+    let has_extras = !(h.out_lp_lens.is_empty()
+        && h.in_lp_lens.is_empty()
+        && h.out_top_reqlens.is_empty()
+        && h.in_top_reqlens.is_empty()
+        && h.out_tid_reqlens.is_empty()
+        && h.in_tid_reqlens.is_empty()
+        && h.hidden_reqlens.is_empty());
 
     // Position cursors into the header's per-request `poslens` (ragged + hidden).
     let (mut p_ot, mut p_it, mut p_od, mut p_id, mut p_h) =
@@ -558,79 +564,88 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> bool {
     // then rejects the frame instead of slicing out of bounds.
     let mut decode_one = |i: usize| -> Option<ChunkEvent> {
         let token_ids = take_i32(data, &mut c_ids, lens_i(&h.tok_lens, i))?;
-        let (out_lp_val, out_lp_idx) =
-            take_flat(data, &mut c_olp_v, &mut c_olp_i, lens_i(&h.out_lp_lens, i))?;
-        let (in_lp_val, in_lp_idx) =
-            take_flat(data, &mut c_ilp_v, &mut c_ilp_i, lens_i(&h.in_lp_lens, i))?;
-        let (out_top_val, out_top_idx, out_top_lens) = take_ragged(
-            data,
-            &mut c_ot_v,
-            &mut c_ot_i,
-            &h.out_top_poslens,
-            &mut p_ot,
-            lens_i(&h.out_top_reqlens, i),
-        )?;
-        let (in_top_val, in_top_idx, in_top_lens) = take_ragged(
-            data,
-            &mut c_it_v,
-            &mut c_it_i,
-            &h.in_top_poslens,
-            &mut p_it,
-            lens_i(&h.in_top_reqlens, i),
-        )?;
-        let (out_tid_val, out_tid_idx, out_tid_lens) = take_ragged(
-            data,
-            &mut c_od_v,
-            &mut c_od_i,
-            &h.out_tid_poslens,
-            &mut p_od,
-            lens_i(&h.out_tid_reqlens, i),
-        )?;
-        let (in_tid_val, in_tid_idx, in_tid_lens) = take_ragged(
-            data,
-            &mut c_id_v,
-            &mut c_id_i,
-            &h.in_tid_poslens,
-            &mut p_id,
-            lens_i(&h.in_tid_reqlens, i),
-        )?;
-        let (hidden_val, hidden_lens) = take_hidden(
-            data,
-            &mut c_h_v,
-            &h.hidden_poslens,
-            &mut p_h,
-            lens_i(&h.hidden_reqlens, i),
-        )?;
 
-        // Logprob/hidden columns ride behind the boxed extras — allocate only when
-        // this request actually carries some (the common frame stays extras-free).
-        let extras = ChunkExtras {
-            out_lp_val,
-            out_lp_idx,
-            in_lp_val,
-            in_lp_idx,
-            out_top_val,
-            out_top_idx,
-            out_top_lens,
-            in_top_val,
-            in_top_idx,
-            in_top_lens,
-            out_tid_val,
-            out_tid_idx,
-            out_tid_lens,
-            in_tid_val,
-            in_tid_idx,
-            in_tid_lens,
-            hidden_val,
-            hidden_lens,
-            ..Default::default()
+        // Plain decode frame (no request in the batch asked for logprobs/hidden):
+        // the extras columns are all zero-width, so skip reading them entirely.
+        let extras = if !has_extras {
+            None
+        } else {
+            let (out_lp_val, out_lp_idx) =
+                take_flat(data, &mut c_olp_v, &mut c_olp_i, lens_i(&h.out_lp_lens, i))?;
+            let (in_lp_val, in_lp_idx) =
+                take_flat(data, &mut c_ilp_v, &mut c_ilp_i, lens_i(&h.in_lp_lens, i))?;
+            let (out_top_val, out_top_idx, out_top_lens) = take_ragged(
+                data,
+                &mut c_ot_v,
+                &mut c_ot_i,
+                &h.out_top_poslens,
+                &mut p_ot,
+                lens_i(&h.out_top_reqlens, i),
+            )?;
+            let (in_top_val, in_top_idx, in_top_lens) = take_ragged(
+                data,
+                &mut c_it_v,
+                &mut c_it_i,
+                &h.in_top_poslens,
+                &mut p_it,
+                lens_i(&h.in_top_reqlens, i),
+            )?;
+            let (out_tid_val, out_tid_idx, out_tid_lens) = take_ragged(
+                data,
+                &mut c_od_v,
+                &mut c_od_i,
+                &h.out_tid_poslens,
+                &mut p_od,
+                lens_i(&h.out_tid_reqlens, i),
+            )?;
+            let (in_tid_val, in_tid_idx, in_tid_lens) = take_ragged(
+                data,
+                &mut c_id_v,
+                &mut c_id_i,
+                &h.in_tid_poslens,
+                &mut p_id,
+                lens_i(&h.in_tid_reqlens, i),
+            )?;
+            let (hidden_val, hidden_lens) = take_hidden(
+                data,
+                &mut c_h_v,
+                &h.hidden_poslens,
+                &mut p_h,
+                lens_i(&h.hidden_reqlens, i),
+            )?;
+
+            // Even in an extras batch, most requests carry none — box only if this
+            // one actually does, so its `ChunkEvent` stays the small common frame.
+            let ex = ChunkExtras {
+                out_lp_val,
+                out_lp_idx,
+                in_lp_val,
+                in_lp_idx,
+                out_top_val,
+                out_top_idx,
+                out_top_lens,
+                in_top_val,
+                in_top_idx,
+                in_top_lens,
+                out_tid_val,
+                out_tid_idx,
+                out_tid_lens,
+                in_tid_val,
+                in_tid_idx,
+                in_tid_lens,
+                hidden_val,
+                hidden_lens,
+                ..Default::default()
+            };
+            (!ex.is_empty()).then(|| Box::new(ex))
         };
+
         Some(ChunkEvent {
             rid: h.rids[i],
             token_ids,
             finish_reason: h.finish_reasons.get(i).cloned().flatten(),
             prompt_tokens: h.prompt_tokens.get(i).copied().unwrap_or(0),
-            extras: (!extras.is_empty()).then(|| Box::new(extras)),
+            extras,
             ..Default::default()
         })
     };
@@ -923,6 +938,10 @@ mod tests {
         assert_eq!(events[2].rid, 3);
         assert_eq!(events[2].token_ids, vec![12]);
         assert_eq!(events[2].prompt_tokens, 6);
+        // A plain decode frame carries no extras columns at all, so the per-frame
+        // `has_extras` guard must skip the extras machinery entirely for every
+        // request (this is the tm-egress hot path — see `for_each_chunk`).
+        assert!(events.iter().all(|e| e.extras.is_none()));
     }
 
     /// A header whose column lengths exceed the data buffer (a Python/Rust
