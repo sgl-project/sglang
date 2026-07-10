@@ -7,8 +7,8 @@ which gives one import, one naming scheme, and the scoped ``override()``
 test primitive. Direct calls to the ``parallel_state`` size/rank getters in
 these directories are regressions against that sweep.
 
-Exemptions, pinned by path: ``layers/dp_attention.py`` is delegation
-substrate (the wrapper's attn-DP dims delegate TO it), while
+Exemptions, pinned by path: ``runtime_context.py`` and
+``layers/dp_attention.py`` are delegation substrate, while
 ``layers/dcp/comm.py`` retains deprecated DCP compatibility shims for
 out-of-tree callers. Sweeping an exempt path must remove it from the pin.
 """
@@ -47,6 +47,7 @@ _SWEPT_DIRS = ("",)
 
 _EXEMPT = (
     "distributed/",  # parallel_state: defines the canonical getters
+    "runtime_context.py",  # delegates DCP reads to canonical getters
     "layers/dp_attention.py",  # delegation substrate for the attn-DP dims
     "layers/dcp/comm.py",  # deprecated out-of-tree DCP compatibility shims
     # The dumper's megatron plugin calls third-party getters that share the

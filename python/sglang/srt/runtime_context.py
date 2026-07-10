@@ -21,11 +21,6 @@ wrapper, not a cache. It gives call-sites one import and one naming scheme in
 place of a dozen free functions, plus a test-only ``override()`` hook to force a
 topology without monkeypatching the underlying getters.
 
-DCP exposes both raw group state (``dcp_size`` / ``dcp_rank`` / ``dcp_group``)
-and attention-safe aliases (``dcp_enabled`` / ``attn_dcp_size`` /
-``attn_dcp_rank``). The aliases preserve the legacy behavior where disabled DCP
-reads as size 1 / rank 0 without requiring the DCP group to be initialized.
-
 ``get_server_args()`` returns the process-wide ``ServerArgs`` (the config
 tier). The context owns the storage: publishing goes through
 ``RuntimeContext.set_server_args`` (the legacy
@@ -64,12 +59,6 @@ def _dp():
     from sglang.srt.layers import dp_attention
 
     return dp_attention
-
-
-def _utils():
-    from sglang.srt import utils
-
-    return utils
 
 
 _PARALLEL_FIELDS = frozenset(
@@ -202,18 +191,16 @@ class ParallelContext:
 
     @property
     def dcp_size(self) -> int:
-        return self._v("dcp_size", _ps()._get_dcp_world_size)
+        return self._v("dcp_size", _ps().get_dcp_world_size)
 
     @property
     def dcp_rank(self) -> int:
-        return self._v("dcp_rank", _ps()._get_dcp_rank)
+        return self._v("dcp_rank", _ps().get_dcp_rank)
 
     @property
     def dcp_enabled(self) -> bool:
         def getter():
-            if _ps()._get_dcp_group_no_assert() is None:
-                return False
-            if not _utils().is_cuda():
+            if _ps().get_dcp_group_no_assert() is None:
                 return False
             return self.dcp_size > 1
 
@@ -273,7 +260,7 @@ class ParallelContext:
 
     @property
     def dcp_group(self) -> Any:
-        return self._v("dcp_group", _ps()._get_dcp_group)
+        return self._v("dcp_group", _ps().get_dcp_group)
 
 
 class _FlagGroupBase:

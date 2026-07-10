@@ -32,8 +32,8 @@ SIZE_RANK_DELEGATIONS = [
     ("world_rank", f"{_PS}.get_world_rank"),
     ("tp_size", f"{_PS}.get_tensor_model_parallel_world_size"),
     ("tp_rank", f"{_PS}.get_tensor_model_parallel_rank"),
-    ("dcp_size", f"{_PS}._get_dcp_world_size"),
-    ("dcp_rank", f"{_PS}._get_dcp_rank"),
+    ("dcp_size", f"{_PS}.get_dcp_world_size"),
+    ("dcp_rank", f"{_PS}.get_dcp_rank"),
     ("pp_size", f"{_PS}.get_pipeline_model_parallel_world_size"),
     ("pp_rank", f"{_PS}.get_pipeline_model_parallel_rank"),
     ("moe_ep_size", f"{_PS}.get_moe_expert_parallel_world_size"),
@@ -53,7 +53,7 @@ SIZE_RANK_DELEGATIONS = [
 GROUP_DELEGATIONS = [
     ("world_group", f"{_PS}.get_world_group"),
     ("tp_group", f"{_PS}.get_tp_group"),
-    ("dcp_group", f"{_PS}._get_dcp_group"),
+    ("dcp_group", f"{_PS}.get_dcp_group"),
     ("pp_group", f"{_PS}.get_pp_group"),
     ("moe_ep_group", f"{_PS}.get_moe_ep_group"),
     ("moe_dp_group", f"{_PS}.get_moe_dp_group"),
@@ -157,10 +157,9 @@ class TestParallelOverride(_IsolatedOverrides):
 class TestParallelDCP(_IsolatedOverrides):
     def test_attn_dcp_defaults_when_group_is_uninitialized(self):
         with (
-            patch(f"{_PS}._get_dcp_group_no_assert", return_value=None),
-            patch("sglang.srt.utils.is_cuda", return_value=True),
-            patch(f"{_PS}._get_dcp_world_size", side_effect=AssertionError),
-            patch(f"{_PS}._get_dcp_rank", side_effect=AssertionError),
+            patch(f"{_PS}.get_dcp_group_no_assert", return_value=None),
+            patch(f"{_PS}.get_dcp_world_size", side_effect=AssertionError),
+            patch(f"{_PS}.get_dcp_rank", side_effect=AssertionError),
         ):
             self.assertFalse(get_parallel().dcp_enabled)
             self.assertEqual(get_parallel().attn_dcp_size, 1)
@@ -168,23 +167,25 @@ class TestParallelDCP(_IsolatedOverrides):
 
     def test_attn_dcp_delegates_when_enabled(self):
         with (
-            patch(f"{_PS}._get_dcp_group_no_assert", return_value=object()),
-            patch("sglang.srt.utils.is_cuda", return_value=True),
-            patch(f"{_PS}._get_dcp_world_size", return_value=8),
-            patch(f"{_PS}._get_dcp_rank", return_value=3),
+            patch(f"{_PS}.get_dcp_group_no_assert", return_value=object()),
+            patch(f"{_PS}.get_dcp_world_size", return_value=8),
+            patch(f"{_PS}.get_dcp_rank", return_value=3),
         ):
             self.assertTrue(get_parallel().dcp_enabled)
             self.assertEqual(get_parallel().attn_dcp_size, 8)
             self.assertEqual(get_parallel().attn_dcp_rank, 3)
 
-    def test_dcp_requires_cuda(self):
+    def test_dcp_enablement_is_platform_agnostic(self):
         with (
-            patch(f"{_PS}._get_dcp_group_no_assert", return_value=object()),
-            patch("sglang.srt.utils.is_cuda", return_value=False),
-            patch(f"{_PS}._get_dcp_world_size", side_effect=AssertionError),
+            patch(f"{_PS}.get_dcp_group_no_assert", return_value=object()),
+            patch("sglang.srt.utils.is_cuda", return_value=False) as is_cuda,
+            patch(f"{_PS}.get_dcp_world_size", return_value=8),
+            patch(f"{_PS}.get_dcp_rank", return_value=3),
         ):
-            self.assertFalse(get_parallel().dcp_enabled)
-            self.assertEqual(get_parallel().attn_dcp_size, 1)
+            self.assertTrue(get_parallel().dcp_enabled)
+            self.assertEqual(get_parallel().attn_dcp_size, 8)
+            self.assertEqual(get_parallel().attn_dcp_rank, 3)
+            is_cuda.assert_not_called()
 
 
 class _IsolatedServerArgs(CustomTestCase):
