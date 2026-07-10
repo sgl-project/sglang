@@ -23,6 +23,12 @@ class LinearAttnKernelBase(ABC):
     # fused_gdn_gating(exp_gate=True), fusing away a separate exp launch.
     extend_gate_form: str = "log"
 
+    # Whether this kernel implements extend_prenormed() — the glue-kernel entry
+    # point that receives ALREADY-L2-NORMALIZED q/k (plus gate in
+    # extend_gate_form). Kernels whose extend() normalizes internally must
+    # leave this False so the caller keeps the legacy split+gating+norm chain.
+    supports_prenormed_extend: bool = False
+
     @abstractmethod
     def decode(
         self,
@@ -54,6 +60,27 @@ class LinearAttnKernelBase(ABC):
         query_start_loc: torch.Tensor,
         **kwargs,
     ) -> tuple: ...
+
+    def extend_prenormed(
+        self,
+        q_normed: torch.Tensor,
+        k_normed: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        *,
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        **kwargs,
+    ) -> tuple:
+        """extend() variant for glue-kernel callers: q/k arrive L2-normalized
+        and ``g`` arrives in :attr:`extend_gate_form`. Implementations must NOT
+        normalize q/k or transform g again. Only kernels declaring
+        ``supports_prenormed_extend = True`` implement this."""
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support extend_prenormed"
+        )
 
     def target_verify(
         self,

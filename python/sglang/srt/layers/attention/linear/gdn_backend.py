@@ -28,6 +28,7 @@ if not is_cpu():
 
 if is_cuda() or is_hip():
     from sglang.jit_kernel.triton.gdn_fused_proj import fused_qkv_split_gdn_prefill
+    from sglang.jit_kernel.triton.gdn_prefill_glue import gdn_prefill_glue
 
 MAX_FUSED_QKV_SPLIT_DIM = 8192
 
@@ -179,6 +180,9 @@ class GDNKernelDispatcher:
         # exp(g) into the gating kernel (FlashInfer). Only ever "exp" on CUDA,
         # so the exp_gate kwarg never reaches the NPU/CPU gating rebinds.
         self.extend_gate_form = self.extend_kernel.extend_gate_form
+        # Whether the resolved extend kernel implements extend_prenormed (the
+        # gdn_prefill_glue path: pre-normalized q/k, gate in extend_gate_form).
+        self.extend_supports_prenormed = self.extend_kernel.supports_prenormed_extend
 
         # Verify kernel: use FlashInfer when the selected FlashInfer kernel
         # supports MTP verify. SM90 uses the fp32-state path; SM100 uses the
@@ -281,6 +285,35 @@ class GDNKernelDispatcher:
         return self.extend_kernel.extend(
             q,
             k,
+            v,
+            g,
+            beta,
+            ssm_states=ssm_states,
+            cache_indices=cache_indices,
+            query_start_loc=query_start_loc,
+            prep=prep,
+            no_prefix=no_prefix,
+            **kwargs,
+        )
+
+    def extend_prenormed(
+        self,
+        q_normed: torch.Tensor,
+        k_normed: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        *,
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        prep: Optional[tuple] = None,
+        no_prefix: bool = False,
+        **kwargs,
+    ) -> tuple:
+        return self.extend_kernel.extend_prenormed(
+            q_normed,
+            k_normed,
             v,
             g,
             beta,
@@ -582,7 +615,22 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
         actual_seq_len = mixed_qkv.shape[0]
         qkv_dim = layer.q_dim + layer.k_dim + layer.v_dim
-        if (is_cuda() or is_hip()) and qkv_dim <= MAX_FUSED_QKV_SPLIT_DIM:
+        # Prologue glue: one launch replacing split + gating + q/k l2norm,
+        # available only when the extend kernel accepts pre-normalized q/k
+        # (extend_prenormed) and the geometry matches the verified clone shape.
+        # Fall back to the legacy chain otherwise — do not generalize the gate.
+        glue_applicable = (
+            not is_target_verify
+            and self.kernel_dispatcher.extend_supports_prenormed
+            and (is_cuda() or is_hip())
+            and qkv_dim <= MAX_FUSED_QKV_SPLIT_DIM
+            and mixed_qkv.stride(1) == 1
+            and layer.num_q_heads == layer.num_k_heads
+            and layer.head_q_dim == layer.head_k_dim == 128
+        )
+        if glue_applicable:
+            pass  # split+gating+norm run fused in the glue branch below
+        elif (is_cuda() or is_hip()) and qkv_dim <= MAX_FUSED_QKV_SPLIT_DIM:
             query, key, value = fused_qkv_split_gdn_prefill(
                 mixed_qkv,
                 layer.num_q_heads,
@@ -620,15 +668,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 retrieve_parent_token=retrieve_parent_token,
             )
         else:
-            if self.kernel_dispatcher.extend_gate_form == "exp":
-                # FlashInfer consumes alpha = exp(g); compute it in-kernel
-                # instead of a separate torch.exp launch per layer.
-                g, beta = fused_gdn_gating(
-                    layer.A_log, a, b, layer.dt_bias, exp_gate=True
-                )
-            else:
-                g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
-
             # Hoist the layer-invariant extend prep (pool-gather indices; for
             # CuteDSL also cu_seqlens + chunk metadata) out of the per-layer
             # calls into one compute per forward. Key = the forward_metadata
@@ -646,25 +685,69 @@ class GDNAttnBackend(MambaAttnBackendBase):
                             query_start_loc=query_start_loc,
                             cache_indices=state_cache_indices,
                             ssm_states=ssm_states_contig,
-                            total_seq_len=int(query.shape[1]),
+                            total_seq_len=actual_seq_len,
                         )
                     )
                     self._extend_prep_fm = forward_metadata
                 prep = self._extend_prep
 
-            core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
-                q=query,
-                k=key,
-                v=value,
-                g=g,
-                beta=beta,
-                ssm_states=ssm_states_contig,
-                cache_indices=state_cache_indices,
-                query_start_loc=query_start_loc,
-                out=out,
-                prep=prep,
-                no_prefix=self._extend_no_prefix,
-            )
+            if glue_applicable:
+                # The glue call and the extend_prenormed dispatch must stay
+                # adjacent in this branch: q/k leave the glue ALREADY normalized
+                # and g in extend_gate_form — routing them through plain
+                # extend() would double-normalize.
+                query, key, value, g, beta = gdn_prefill_glue(
+                    mixed_qkv,
+                    a,
+                    b,
+                    layer.A_log,
+                    layer.dt_bias,
+                    num_qk_heads=layer.num_q_heads,
+                    num_v_heads=layer.num_v_heads,
+                    head_qk_dim=layer.head_q_dim,
+                    head_v_dim=layer.head_v_dim,
+                    exp_gate=(self.kernel_dispatcher.extend_gate_form == "exp"),
+                )
+                core_attn_out, last_recurrent_state, h = (
+                    self.kernel_dispatcher.extend_prenormed(
+                        q_normed=query,
+                        k_normed=key,
+                        v=value,
+                        g=g,
+                        beta=beta,
+                        ssm_states=ssm_states_contig,
+                        cache_indices=state_cache_indices,
+                        query_start_loc=query_start_loc,
+                        out=out,
+                        prep=prep,
+                        no_prefix=self._extend_no_prefix,
+                    )
+                )
+            else:
+                if self.kernel_dispatcher.extend_gate_form == "exp":
+                    # FlashInfer consumes alpha = exp(g); compute it in-kernel
+                    # instead of a separate torch.exp launch per layer.
+                    g, beta = fused_gdn_gating(
+                        layer.A_log, a, b, layer.dt_bias, exp_gate=True
+                    )
+                else:
+                    g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
+
+                core_attn_out, last_recurrent_state, h = (
+                    self.kernel_dispatcher.extend(
+                        q=query,
+                        k=key,
+                        v=value,
+                        g=g,
+                        beta=beta,
+                        ssm_states=ssm_states_contig,
+                        cache_indices=state_cache_indices,
+                        query_start_loc=query_start_loc,
+                        out=out,
+                        prep=prep,
+                        no_prefix=self._extend_no_prefix,
+                    )
+                )
 
             if is_npu() and last_recurrent_state is not None:
                 last_recurrent_state = last_recurrent_state.to(

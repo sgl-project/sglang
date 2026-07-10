@@ -97,6 +97,9 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
     # computes it in-kernel via fused_gdn_gating(exp_gate=True), so no separate
     # exp launch runs per layer.
     extend_gate_form = "exp"
+    # extend_prenormed() is implemented: q/k arrive pre-normalized from the
+    # gdn_prefill_glue kernel and the internal l2norm is skipped.
+    supports_prenormed_extend = True
 
     def __init__(self):
         (
@@ -275,26 +278,92 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
     ) -> tuple:
         from sglang.srt.layers.attention.fla.l2norm import l2norm_fwd_qk
 
-        total_seq_len = q.shape[1]
-        num_v_heads = v.shape[2]
-        head_v_dim = v.shape[3]
-
         # Fused single-launch q/k L2 norm (was two separate l2norm_fwd calls).
         q_fi, k_fi = l2norm_fwd_qk(q[0].contiguous(), k[0].contiguous())
-        v_fi = v[0].contiguous()
 
         # `g` arrives as alpha = exp(g) already (extend_gate_form == "exp": the
         # caller runs fused_gdn_gating(exp_gate=True)), so no exp launch here.
         # Both are fp32 from the gating kernel; the .to() calls are no-op guards.
-        alpha_fi = g[0].to(torch.float32)
-        beta_fi = beta[0].to(torch.float32)
+        return self._extend_core(
+            q_fi=q_fi,
+            k_fi=k_fi,
+            v_fi=v[0].contiguous(),
+            alpha_fi=g[0].to(torch.float32),
+            beta_fi=beta[0].to(torch.float32),
+            ssm_states=ssm_states,
+            cache_indices=cache_indices,
+            query_start_loc=query_start_loc,
+            out=out,
+            prep=prep,
+            no_prefix=no_prefix,
+        )
+
+    def extend_prenormed(
+        self,
+        q_normed: torch.Tensor,
+        k_normed: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        *,
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        out: Optional[torch.Tensor] = None,
+        prep: Optional[tuple] = None,
+        no_prefix: bool = False,
+        **kwargs,
+    ) -> tuple:
+        """Glue-kernel entry point: q/k are ALREADY L2-normalized and ``g`` is
+        already alpha = exp(g) fp32 (gdn_prefill_glue with exp_gate=True). No
+        normalization or gate transform happens here — passing raw q/k or
+        log-space g silently corrupts outputs, hence the loud asserts."""
+        assert (
+            g.dtype == torch.float32 and beta.dtype == torch.float32
+        ), "extend_prenormed expects fp32 alpha/beta straight from the glue kernel"
+        q_fi = q_normed[0]
+        k_fi = k_normed[0]
+        v_fi = v[0]
+        assert q_fi.is_contiguous() and k_fi.is_contiguous() and v_fi.is_contiguous()
+        return self._extend_core(
+            q_fi=q_fi,
+            k_fi=k_fi,
+            v_fi=v_fi,
+            alpha_fi=g[0],
+            beta_fi=beta[0],
+            ssm_states=ssm_states,
+            cache_indices=cache_indices,
+            query_start_loc=query_start_loc,
+            out=out,
+            prep=prep,
+            no_prefix=no_prefix,
+        )
+
+    def _extend_core(
+        self,
+        *,
+        q_fi: torch.Tensor,
+        k_fi: torch.Tensor,
+        v_fi: torch.Tensor,
+        alpha_fi: torch.Tensor,
+        beta_fi: torch.Tensor,
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        out: Optional[torch.Tensor],
+        prep: Optional[tuple],
+        no_prefix: bool,
+    ) -> tuple:
+        total_seq_len = q_fi.shape[0]
+        num_v_heads = v_fi.shape[1]
+        head_v_dim = v_fi.shape[2]
 
         if prep is None:
             # Fallback for direct extend() callers (e.g. unit tests). On the
             # per-layer hot path, forward_extend passes prep= once per forward
             # so this layer-invariant metadata is not recomputed per layer.
             prep = self.build_extend_prep(
-                head_k_dim=k.shape[-1],
+                head_k_dim=q_fi.shape[-1],
                 query_start_loc=query_start_loc,
                 cache_indices=cache_indices,
                 ssm_states=ssm_states,
