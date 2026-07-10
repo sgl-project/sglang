@@ -1397,8 +1397,42 @@ class NPUMXFP8FusedMoEMethod(_NPUFusedMoEMethodBase):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         from torch.nn import Parameter
 
-        w13_bf = layer.w13_weight.data  # [E, 2I, H]
-        w2_bf = layer.w2_weight.data    # [E, H,  I]
+        w13 = layer.w13_weight.data  # [E, 2I, H] (online bf16) or [E, 2I, H] fp8 (offline)
+        w2 = layer.w2_weight.data    # [E, H,  I]
+
+        if w13.dtype == torch.float8_e4m3fn:
+            # ------- offline (ModelSlim) path -------
+            # Weights are pre-quantised float8_e4m3fn; scales are uint8
+            # [E, N, K//32] loaded by the scheme. Only re-layout.
+            w13_scale = layer.w13_weight_scale.data  # [E, 2I, H//32] uint8
+            w2_scale = layer.w2_weight_scale.data    # [E, H,  I//32] uint8
+
+            num_experts = w13.shape[0]
+
+            # Reshape 2D scales to 3D pair-split, then transpose to kernel layout.
+            # w13_scale: [E, 2I, H//32] -> [E, 2I, H//64, 2] -> [E, H//64, 2I, 2]
+            s13 = w13_scale.reshape(num_experts, -1, w13_scale.shape[-1] // 2, 2)
+            layer.w13_weight_scale = Parameter(
+                s13.transpose(1, 2), requires_grad=False
+            )
+            # w2_scale: [E, H, I//32] -> [E, H, I//64, 2] -> [E, I//64, H, 2]
+            s2 = w2_scale.reshape(num_experts, -1, w2_scale.shape[-1] // 2, 2)
+            layer.w2_weight_scale = Parameter(
+                s2.transpose(1, 2), requires_grad=False
+            )
+
+            # Strided transpose views — DO NOT call .contiguous().
+            layer.w13_weight = Parameter(
+                w13.transpose(1, 2), requires_grad=False
+            )
+            layer.w2_weight = Parameter(
+                w2.transpose(1, 2), requires_grad=False
+            )
+            return
+
+        # ------- online path -------
+        w13_bf = w13
+        w2_bf = w2
 
         # Move to NPU if needed (cpu offload may have moved them back).
         if not w13_bf.is_npu:
