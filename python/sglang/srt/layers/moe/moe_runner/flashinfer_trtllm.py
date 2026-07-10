@@ -26,7 +26,6 @@ from sglang.srt.layers.moe.flashinfer_trtllm_moe import (
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeQuantInfo,
     MoeRunnerConfig,
-    _moe_output_buf,
     register_fused_func,
 )
 from sglang.srt.layers.quantization.fp8_kernel import (
@@ -998,7 +997,9 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
         output_dtype = (
             hidden_states.dtype if hidden_states_scale is None else torch.bfloat16
         )
-        _provided = _moe_output_buf.get()
+        from sglang.srt.runtime_context import get_forward
+
+        _provided = get_forward().moe_output_buffer
         _symm_required = is_allocation_symmetric()
         if (
             _provided is not None
