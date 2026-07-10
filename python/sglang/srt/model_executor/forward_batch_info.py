@@ -439,9 +439,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For hidden states before normal
     return_hidden_states_before_norm: bool = False
 
-    # Gate for reusing the first MTP draft step's indexer topk across steps;
-    # the carried topk lives on spec_info (see EagleDraftInput.dsa_topk_indices).
     reuse_dsa_topk_indices: Optional[bool] = False
+    capture_dsa_topk_indices: bool = False
+    topk_indices: Optional[torch.Tensor] = None
 
     minimax_m3_precached_sparse_layers: Optional[Set[int]] = None
 

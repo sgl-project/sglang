@@ -711,6 +711,20 @@ class TboForwardBatchPreparer:
             ), f"{key=} {old_value=} {num_seqs=} {batch=}"
             output_dict[key] = old_value[start_seq_index:end_seq_index]
 
+        topk_indices = getattr(batch, "topk_indices", None)
+        if topk_indices is not None:
+            if topk_indices.shape[0] == num_tokens:
+                output_dict["topk_indices"] = topk_indices[
+                    start_token_index:end_token_index
+                ]
+            else:
+                assert (
+                    topk_indices.shape[0] == num_seqs
+                ), f"{topk_indices.shape=} {num_tokens=} {num_seqs=} {batch=}"
+                output_dict["topk_indices"] = topk_indices[
+                    start_seq_index:end_seq_index
+                ]
+
         spec_info = getattr(batch, "spec_info")
         output_spec_info = split_spec_info(
             spec_info=spec_info,
@@ -737,6 +751,7 @@ class TboForwardBatchPreparer:
             "orig_seq_lens",  # only used by qwen-1m, thus not care
             "return_pooled_hidden_states",
             "reuse_dsa_topk_indices",  # forward-level flag, inherited by both child batches
+            "capture_dsa_topk_indices",
         ]:
             output_dict[key] = getattr(batch, key)
 
