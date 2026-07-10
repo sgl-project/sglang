@@ -52,7 +52,7 @@ class TestPrepareForDecodeSeqLensOwnership(unittest.TestCase):
                 return_value=torch.tensor([6, 7], dtype=torch.int64),
             ),
             patch(
-                "sglang.srt.managers.schedule_batch.get_global_server_args",
+                "sglang.srt.managers.schedule_batch.get_server_args",
                 return_value=server_args,
             ),
         ):

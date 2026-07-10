@@ -4031,6 +4031,18 @@ class Scheduler(
         ):
             retract_reqs += [r for r in self.last_batch.reqs if not r.finished()]
 
+        # Equivalence mirror of op13's chunked_req rescue: a live mid-chunk
+        # chunked_req the fold-in above didn't capture (disagg-prefill skips it,
+        # running_batch is empty there) must still be retracted+requeued, not
+        # dropped when the pointer is nulled below. Membership guard: NULL/DECODE
+        # already have it via last_batch.reqs -> no-op there, never double-releases.
+        if (
+            self.chunked_req is not None
+            and not self.chunked_req.finished()
+            and self.chunked_req not in retract_reqs
+        ):
+            retract_reqs.append(self.chunked_req)
+
         self.last_batch = None
         self.cur_batch_for_debug = None
 
