@@ -49,9 +49,15 @@ def _fused_norm_rope_kernel_stacked(
     kv_size: tl.constexpr,
     rotary_dim: tl.constexpr,
     half_rotary_dim: tl.constexpr,
+    IS_NEOX: tl.constexpr,
     BLOCK_HD: tl.constexpr,
 ):
-    """Fused RMSNorm(K) + RoPE(K) materialization. Grid: (total_ctx, num_kv_heads, n_layers)."""
+    """Fused RMSNorm(K) + RoPE(K) materialization. Grid: (total_ctx, num_kv_heads, n_layers).
+
+    IS_NEOX selects the rotation pairing: neox pairs dims (i, i + rotary/2);
+    interleaved (GPT-J style, e.g. liquid_lfm draft exports) pairs (2i, 2i+1).
+    The cos/sin cache layout is identical for both styles.
+    """
     ctx_id = tl.program_id(0)
     head_id = tl.program_id(1)
     layer_id = tl.program_id(2)
@@ -97,15 +103,25 @@ def _fused_norm_rope_kernel_stacked(
         cos_sin_base + half_rotary_dim + offs, mask=mask_half, other=0.0
     ).to(tl.float32)
 
-    k_first = tl.where(mask_half, k_normed, 0.0)
-    k_second_raw = tl.load(
-        k_base + half_rotary_dim + offs, mask=mask_half, other=0.0
+    if IS_NEOX:
+        first_offs = offs
+        second_offs = half_rotary_dim + offs
+    else:
+        first_offs = 2 * offs
+        second_offs = 2 * offs + 1
+
+    k_first_raw = tl.load(k_base + first_offs, mask=mask_half, other=0.0).to(tl.float32)
+    norm_w_first = tl.load(
+        k_norm_weight_ptr + layer_id * k_norm_weight_stride_layer + first_offs,
+        mask=mask_half,
+        other=1.0,
     ).to(tl.float32)
+    k_first = k_first_raw * inv_rms * norm_w_first
+    k_second_raw = tl.load(k_base + second_offs, mask=mask_half, other=0.0).to(
+        tl.float32
+    )
     norm_w_second = tl.load(
-        k_norm_weight_ptr
-        + layer_id * k_norm_weight_stride_layer
-        + half_rotary_dim
-        + offs,
+        k_norm_weight_ptr + layer_id * k_norm_weight_stride_layer + second_offs,
         mask=mask_half,
         other=1.0,
     ).to(tl.float32)
@@ -115,10 +131,8 @@ def _fused_norm_rope_kernel_stacked(
     k_rot_second = k_second * cos_v + k_first * sin_v
 
     tl.store(v_write + offs, v_raw, mask=mask_hd)
-    tl.store(k_write + offs, k_rot_first.to(v_raw.dtype), mask=mask_half)
-    tl.store(
-        k_write + half_rotary_dim + offs, k_rot_second.to(v_raw.dtype), mask=mask_half
-    )
+    tl.store(k_write + first_offs, k_rot_first.to(v_raw.dtype), mask=mask_half)
+    tl.store(k_write + second_offs, k_rot_second.to(v_raw.dtype), mask=mask_half)
     mask_pass = (offs >= rotary_dim) & (offs < head_dim)
     tl.store(k_write + offs, k_normed.to(v_raw.dtype), mask=mask_pass)
 
@@ -134,6 +148,7 @@ def _fused_norm_rope_stacked(
     rotary_dim: int,
     k_out: Optional[torch.Tensor] = None,
     v_out: Optional[torch.Tensor] = None,
+    is_neox_style: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fused RMSNorm + RoPE materialization for all layers."""
     if kv.ndim != 3:
@@ -234,6 +249,7 @@ def _fused_norm_rope_stacked(
         kv_size,
         rotary_dim,
         half_rotary_dim,
+        is_neox_style,
         BLOCK_HD,
     )
     return k_out, v_out
@@ -266,8 +282,6 @@ class FusedKVMaterializeHelper:
         self.rotary_dim = int(getattr(rotary_emb, "rotary_dim", head_dim))
         self.is_neox_style = bool(getattr(rotary_emb, "is_neox_style", True))
 
-        if not self.is_neox_style:
-            raise NotImplementedError("Only neox-style RoPE is supported.")
         if self.rotary_dim <= 0 or self.rotary_dim > self.head_dim:
             raise ValueError(
                 "Invalid fused KV rotary/head dim pair: "
@@ -452,6 +466,7 @@ class FusedKVMaterializeHelper:
             self.rotary_dim,
             k_out=tmp_k,
             v_out=tmp_v,
+            is_neox_style=self.is_neox_style,
         )
         for layer_idx in range(self.n_layers):
             write_layer_kv(layer_idx, cache_k[layer_idx], cache_v[layer_idx])
