@@ -184,7 +184,7 @@ def _release_overallocated_kv_indices(
     # so they fall into the free path below (#22373).
     if spec_algo is None and not global_server_args.strip_thinking_cache:
         assert (
-            start_p == end_p
+            req.effective_kv_committed_len() == req.kv.kv_allocated_len
         ), f"Unexpected overallocated KV cache, {req.kv_committed_len=}, {req.kv.kv_allocated_len=}"
 
     if page_size > 1:
