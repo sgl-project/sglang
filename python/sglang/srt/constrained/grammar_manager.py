@@ -12,7 +12,7 @@ from sglang.srt.constrained.base_grammar_backend import (
     create_grammar_backend,
 )
 from sglang.srt.constrained.reasoner_grammar_backend import ReasonerGrammarObject
-from sglang.srt.distributed.communication_tags import PpP2PTag
+from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
@@ -93,7 +93,7 @@ class GrammarManager:
         if self.pp_rank > 0:
             data = self.pp_group.recv_object(
                 src=self.pp_rank - 1,
-                tag=PpP2PTag.GRAMMAR_PP_SYNC,
+                tag=P2PTag.GRAMMAR_PP_SYNC,
             )
         if self.pp_rank + 1 < self.pp_size:
             self.grammar_pp_sync_work_list.extend(
@@ -101,7 +101,7 @@ class GrammarManager:
                     data,
                     dst=self.pp_rank + 1,
                     async_send=True,
-                    tag=PpP2PTag.GRAMMAR_PP_SYNC,
+                    tag=P2PTag.GRAMMAR_PP_SYNC,
                 )
             )
         return data
@@ -185,9 +185,10 @@ class GrammarManager:
         """
         Move requests whose grammar objects are ready from grammar_queue to waiting_queue.
 
-        For PP0, TP rank i returns two sets ready_reqs_i, failed_reqs_i.
-        ready_reqs_all = all_gather(ready_reqs_i) within PP0's TP group.
-        failed_reqs_all = all_gather(failed_reqs_i) within PP0's TP group.
+        For PP0, DP/TP group rank i returns two sets ready_reqs_i,
+        failed_reqs_i. ready_reqs_all = all_gather(ready_reqs_i) within
+        PP0's DP/TP group. failed_reqs_all = all_gather(failed_reqs_i)
+        within PP0's DP/TP group.
 
         ready_reqs = intersect(ready_reqs_all)
         failed_reqs = union(failed_reqs_all)

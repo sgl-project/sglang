@@ -2,12 +2,12 @@ from enum import IntEnum, unique
 
 
 @unique
-class PpP2PTag(IntEnum):
+class P2PTag(IntEnum):
     """
-    Tags reserved for PP point-to-point communication protocols.
+    Tags reserved for point-to-point communication protocols.
 
-    PP syncs introduced outside the scheduler loop need explicit tags to avoid
-    being consumed by scheduler PP send/recv paths.
+    Communications introduced outside existing scheduler loops need explicit
+    tags to avoid being consumed by unrelated send/recv paths.
     """
 
     DEFAULT = 0

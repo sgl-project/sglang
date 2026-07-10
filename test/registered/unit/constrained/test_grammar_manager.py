@@ -25,7 +25,7 @@ from sglang.srt.constrained.base_grammar_backend import (
 )
 from sglang.srt.constrained.grammar_manager import GrammarManager
 from sglang.srt.constrained.reasoner_grammar_backend import ReasonerGrammarObject
-from sglang.srt.distributed.communication_tags import PpP2PTag
+from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(2.0, "base-a-test-cpu")
@@ -695,7 +695,7 @@ class TestGrammarManagerPPSync(unittest.TestCase):
         self.assertEqual(pp_group.recv_calls, [])
         self.assertEqual(
             pp_group.send_calls,
-            [(({1}, {3}), 1, True, PpP2PTag.GRAMMAR_PP_SYNC)],
+            [(({1}, {3}), 1, True, P2PTag.GRAMMAR_PP_SYNC)],
         )
 
     def test_middle_pp_rank_receives_and_forwards_pp0_result(self):
@@ -706,10 +706,10 @@ class TestGrammarManagerPPSync(unittest.TestCase):
         data = mgr._pp_sync_ready_failed(set(), set())
 
         self.assertEqual(data, pp0_data)
-        self.assertEqual(pp_group.recv_calls, [(0, PpP2PTag.GRAMMAR_PP_SYNC)])
+        self.assertEqual(pp_group.recv_calls, [(0, P2PTag.GRAMMAR_PP_SYNC)])
         self.assertEqual(
             pp_group.send_calls,
-            [(pp0_data, 2, True, PpP2PTag.GRAMMAR_PP_SYNC)],
+            [(pp0_data, 2, True, P2PTag.GRAMMAR_PP_SYNC)],
         )
 
     def test_last_pp_rank_receives_without_forwarding(self):
@@ -720,7 +720,7 @@ class TestGrammarManagerPPSync(unittest.TestCase):
         data = mgr._pp_sync_ready_failed(set(), set())
 
         self.assertEqual(data, pp0_data)
-        self.assertEqual(pp_group.recv_calls, [(1, PpP2PTag.GRAMMAR_PP_SYNC)])
+        self.assertEqual(pp_group.recv_calls, [(1, P2PTag.GRAMMAR_PP_SYNC)])
         self.assertEqual(pp_group.send_calls, [])
 
     def test_pp_sync_drains_previous_async_send_work(self):
