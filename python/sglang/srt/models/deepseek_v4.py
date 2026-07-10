@@ -2208,10 +2208,7 @@ class DeepseekV4Model(nn.Module):
             ):
                 hidden_len = int(hidden_states.shape[0])
                 position_len = int(positions.shape[0])
-                if (
-                    len(getattr(forward_batch, "rids", []) or []) == 1
-                    and hidden_len > position_len
-                ):
+                if hidden_len > position_len:
                     hidden_states = hidden_states[-position_len:]
                 else:
                     raise RuntimeError(
