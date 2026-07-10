@@ -130,7 +130,9 @@ def _fwd_kernel_stage1(
     xai_temperature_len: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
 ):
-    cur_batch = tl.program_id(0)
+    # int64 to avoid overflow of flat offsets into Mid_O when
+    # batch * num_head * max_kv_splits * head_dim exceeds 2**31.
+    cur_batch = tl.program_id(0).to(tl.int64)
     cur_head = tl.program_id(1)
     split_kv_id = tl.program_id(2)
 
@@ -388,7 +390,9 @@ def _fwd_grouped_kernel_stage1(
     USE_PDL: tl.constexpr = False,
     PAGE_SIZE: tl.constexpr = 1,
 ):
-    cur_batch = tl.program_id(0)
+    # int64 to avoid overflow of flat offsets into Mid_O when
+    # batch * num_head * max_kv_splits * head_dim exceeds 2**31.
+    cur_batch = tl.program_id(0).to(tl.int64)
     cur_head_id = tl.program_id(1)
     cur_kv_head = cur_head_id // tl.cdiv(kv_group_num, BLOCK_H)
     split_kv_id = tl.program_id(2)
@@ -684,7 +688,9 @@ def _fwd_kernel_stage2(
     HAS_SINK: tl.constexpr,
     USE_PDL: tl.constexpr = False,
 ):
-    cur_batch = tl.program_id(0)
+    # int64 to avoid overflow of flat offsets into Mid_O when
+    # batch * num_head * max_kv_splits * head_dim exceeds 2**31.
+    cur_batch = tl.program_id(0).to(tl.int64)
     cur_head = tl.program_id(1)
 
     if USE_PDL:

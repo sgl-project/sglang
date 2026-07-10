@@ -21,7 +21,7 @@ from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
 from transformers.models.qwen2.modeling_qwen2 import Qwen2Model
 
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import is_cuda
 
 if is_cuda():
@@ -1223,7 +1223,7 @@ class AudioEncoderMixin:
         else:
             raise ValueError(f"Invalid projection layers: {config.projection_layers}")
 
-        model_path = get_global_server_args().model_path
+        model_path = get_server_args().model_path
         if not os.path.isdir(model_path):
             from huggingface_hub import snapshot_download
 
