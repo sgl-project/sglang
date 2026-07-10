@@ -1,17 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 from collections.abc import Callable
-from dataclasses import dataclass
 from typing import Any
 
 import torch
 
-from sglang.multimodal_gen.runtime.layers.kvcache.causal_attention_cache import (
-    CausalAttentionKVView,
-    CausalSelfAttentionKVCache,
-)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.causal_denoising import (
+    CAUSAL_BLOCK_PROMPTS_KEY,
+    CAUSAL_SCENE_CUT_MASK_KEY,
+    CAUSAL_SHOT_INDICES_KEY,
     CausalDMDDenoisingStage,
+    expand_causal_block_prompts,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.image_encoding import (
     ImageVAEEncodingStage,
@@ -48,207 +47,6 @@ def _causal_block_count(batch: Req, server_args: ServerArgs) -> int:
     return latent_frames // block_size
 
 
-@dataclass(slots=True)
-class LongLive2CausalSelfAttentionKVCache(CausalSelfAttentionKVCache):
-    global_sink_tokens: int = 0
-    pinned_start: int = -1
-    pinned_len: int = 0
-
-    def reset_indices(self) -> None:
-        super().reset_indices()
-        self.reset_pinned_sink()
-
-    def reset_pinned_sink(self) -> None:
-        self.pinned_start = -1
-        self.pinned_len = 0
-
-    def pin_current_chunk(self, current_num_tokens: int) -> None:
-        if self.sink_tokens <= 0 or current_num_tokens <= 0:
-            self.reset_pinned_sink()
-            return
-        _, local_end_index = self._read_indices()
-        pin_len = min(self.sink_tokens, current_num_tokens)
-        self.pinned_start = local_end_index - current_num_tokens
-        self.pinned_len = pin_len
-
-    def _has_pinned_sink(self) -> bool:
-        return self.pinned_start >= 0 and self.pinned_len > 0
-
-    def _effective_sink_tokens(self) -> int:
-        if self._has_pinned_sink():
-            if self.pinned_start == self.global_sink_tokens:
-                return self.global_sink_tokens + self.pinned_len
-            return self.global_sink_tokens
-        return max(self.global_sink_tokens, self.sink_tokens)
-
-    def update_and_get_attention_kv(
-        self,
-        *,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        current_chunk_start: int,
-        debug_name: str = "LongLive2 causal KV cache",
-    ) -> CausalAttentionKVView:
-        num_new_tokens = key.shape[1]
-        current_chunk_end = current_chunk_start + num_new_tokens
-        kv_cache_size = self.cache_size
-        effective_sink_tokens = self._effective_sink_tokens()
-        global_end_index, local_end_index_prev = self._read_indices()
-        window_start = global_end_index - local_end_index_prev
-
-        if current_chunk_end <= global_end_index:
-            local_start_index = current_chunk_start - window_start
-            local_end_index = local_start_index + num_new_tokens
-            updated_local_end = local_end_index_prev
-            updated_global_end = global_end_index
-        else:
-            appended_tokens = current_chunk_end - global_end_index
-            if self.allow_growth:
-                self._grow_to_fit(local_end_index_prev + appended_tokens)
-                kv_cache_size = self.cache_size
-            if local_end_index_prev + appended_tokens > kv_cache_size:
-                num_evicted_tokens = (
-                    local_end_index_prev + appended_tokens - kv_cache_size
-                )
-                num_rolled_tokens = max(
-                    0,
-                    local_end_index_prev - num_evicted_tokens - effective_sink_tokens,
-                )
-                if num_rolled_tokens > 0:
-                    self.k[
-                        :,
-                        effective_sink_tokens : effective_sink_tokens
-                        + num_rolled_tokens,
-                    ] = self.k[
-                        :,
-                        effective_sink_tokens
-                        + num_evicted_tokens : effective_sink_tokens
-                        + num_evicted_tokens
-                        + num_rolled_tokens,
-                    ].clone()
-                    self.v[
-                        :,
-                        effective_sink_tokens : effective_sink_tokens
-                        + num_rolled_tokens,
-                    ] = self.v[
-                        :,
-                        effective_sink_tokens
-                        + num_evicted_tokens : effective_sink_tokens
-                        + num_evicted_tokens
-                        + num_rolled_tokens,
-                    ].clone()
-                if (
-                    self._has_pinned_sink()
-                    and self.pinned_start >= effective_sink_tokens
-                ):
-                    self.pinned_start -= num_evicted_tokens
-                local_end_index = kv_cache_size
-            else:
-                local_end_index = local_end_index_prev + appended_tokens
-            local_start_index = local_end_index - num_new_tokens
-            updated_local_end = local_end_index
-            updated_global_end = current_chunk_end
-
-        if (
-            local_start_index < 0
-            or local_end_index > kv_cache_size
-            or local_end_index - local_start_index != num_new_tokens
-        ):
-            raise RuntimeError(
-                f"Invalid {debug_name} write range: "
-                f"local=[{local_start_index}, {local_end_index}), "
-                f"global_end={global_end_index}, "
-                f"prev_local_end={local_end_index_prev}, "
-                f"kv_cache_size={kv_cache_size}, "
-                f"num_new_tokens={num_new_tokens}, "
-                f"current_start={current_chunk_start}, current_end={current_chunk_end}"
-            )
-
-        if self.k.requires_grad:
-            self.k = self.k.detach()
-        if self.v.requires_grad:
-            self.v = self.v.detach()
-        self.k[:, local_start_index:local_end_index] = key
-        self.v[:, local_start_index:local_end_index] = value
-
-        attn_start_index = max(0, updated_local_end - self.attention_window_size)
-        self._write_indices(
-            global_end_index=updated_global_end,
-            local_end_index=updated_local_end,
-        )
-        view_k, view_v = self._attention_view(
-            attn_start_index=attn_start_index,
-            updated_local_end=updated_local_end,
-        )
-        return CausalAttentionKVView(
-            k=view_k,
-            v=view_v,
-            local_start_index=local_start_index,
-            local_end_index=local_end_index,
-            visible_local_end=updated_local_end,
-            visible_global_end=updated_global_end,
-        )
-
-    def _cat_cache_slices(
-        self, cache_slices: list[slice]
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        return (
-            torch.cat([self.k[:, cache_slice] for cache_slice in cache_slices], dim=1),
-            torch.cat([self.v[:, cache_slice] for cache_slice in cache_slices], dim=1),
-        )
-
-    def _attention_view(
-        self,
-        *,
-        attn_start_index: int,
-        updated_local_end: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        effective_sink_tokens = self._effective_sink_tokens()
-        prepend_sink = effective_sink_tokens > 0 and attn_start_index > 0
-        prepend_pinned = (
-            self._has_pinned_sink()
-            and self.pinned_start >= effective_sink_tokens
-            and self.pinned_start < attn_start_index
-        )
-
-        if prepend_sink and prepend_pinned:
-            extra_tokens = effective_sink_tokens + self.pinned_len
-            sink = slice(0, effective_sink_tokens)
-            pinned = slice(self.pinned_start, self.pinned_start + self.pinned_len)
-            local_window_size = max(0, self.attention_window_size - extra_tokens)
-            local_window_start = max(
-                effective_sink_tokens,
-                updated_local_end - local_window_size,
-            )
-            window = slice(local_window_start, updated_local_end)
-            return self._cat_cache_slices([sink, pinned, window])
-
-        if prepend_sink:
-            sink = slice(0, effective_sink_tokens)
-            local_window_size = max(
-                0,
-                self.attention_window_size - effective_sink_tokens,
-            )
-            local_window_start = max(
-                effective_sink_tokens,
-                updated_local_end - local_window_size,
-            )
-            window = slice(local_window_start, updated_local_end)
-            return self._cat_cache_slices([sink, window])
-
-        if prepend_pinned:
-            pinned = slice(self.pinned_start, self.pinned_start + self.pinned_len)
-            local_window_size = max(0, self.attention_window_size - self.pinned_len)
-            local_window_start = max(0, updated_local_end - local_window_size)
-            window = slice(local_window_start, updated_local_end)
-            return self._cat_cache_slices([pinned, window])
-
-        return (
-            self.k[:, attn_start_index:updated_local_end],
-            self.v[:, attn_start_index:updated_local_end],
-        )
-
-
 def expand_longlive2_shot_prompts(
     shot_prompts: list[str],
     *,
@@ -257,68 +55,13 @@ def expand_longlive2_shot_prompts(
     chunks_per_shot: int = 0,
     scene_cut_prefix: str = LONG_LIVE2_DEFAULT_SCENE_CUT_PREFIX,
 ) -> list[str]:
-    return _expand_shot_prompts(
+    return expand_causal_block_prompts(
         shot_prompts,
         num_blocks=num_blocks,
         shot_durations=shot_durations,
         chunks_per_shot=chunks_per_shot,
         scene_cut_prefix=scene_cut_prefix,
     )[0]
-
-
-def _expand_shot_prompts(
-    shot_prompts: list[str],
-    *,
-    num_blocks: int,
-    shot_durations: list[int] | None = None,
-    chunks_per_shot: int = 0,
-    scene_cut_prefix: str = LONG_LIVE2_DEFAULT_SCENE_CUT_PREFIX,
-) -> tuple[list[str], list[bool], list[int]]:
-    if not shot_prompts:
-        raise ValueError("shot_prompts must be non-empty")
-    if num_blocks <= 0:
-        raise ValueError("num_blocks must be positive")
-    if shot_durations is not None and len(shot_durations) != len(shot_prompts):
-        raise ValueError("shot_durations must match shot_prompts length")
-
-    if shot_durations is not None:
-        durations = shot_durations[: len(shot_prompts)]
-    elif chunks_per_shot > 0:
-        durations = [chunks_per_shot] * len(shot_prompts)
-    else:
-        base, extra = divmod(num_blocks, len(shot_prompts))
-        durations = [base + (1 if i < extra else 0) for i in range(len(shot_prompts))]
-
-    clamped: list[int] = []
-    remaining = num_blocks
-    for duration in durations:
-        if remaining <= 0:
-            break
-        take = min(int(duration), remaining)
-        clamped.append(take)
-        remaining -= take
-    if remaining > 0 and clamped:
-        clamped[-1] += remaining
-    if not clamped:
-        clamped = [num_blocks]
-
-    block_prompts: list[str] = []
-    scene_cut_mask: list[bool] = []
-    shot_indices: list[int] = []
-    for shot_idx, (caption, duration) in enumerate(zip(shot_prompts, clamped)):
-        for block_in_shot in range(duration):
-            is_scene_cut = shot_idx > 0 and block_in_shot == 0
-            if is_scene_cut and scene_cut_prefix:
-                block_prompts.append(scene_cut_prefix + caption)
-            else:
-                block_prompts.append(caption)
-            scene_cut_mask.append(is_scene_cut)
-            shot_indices.append(shot_idx)
-    return (
-        block_prompts[:num_blocks],
-        scene_cut_mask[:num_blocks],
-        shot_indices[:num_blocks],
-    )
 
 
 class LongLive2TextEncodingStage(TextEncodingStage):
@@ -339,7 +82,7 @@ class LongLive2TextEncodingStage(TextEncodingStage):
         if isinstance(batch.prompt, list):
             raise ValueError("LongLive2 shot_prompts supports one video per request")
 
-        block_prompts, scene_cut_mask, shot_indices = _expand_shot_prompts(
+        block_prompts, scene_cut_mask, shot_indices = expand_causal_block_prompts(
             shot_prompts,
             num_blocks=_causal_block_count(batch, server_args),
             shot_durations=getattr(batch, "shot_durations", None),
@@ -350,9 +93,9 @@ class LongLive2TextEncodingStage(TextEncodingStage):
                 else getattr(batch, "scene_cut_prefix")
             ),
         )
-        batch.extra["longlive2_block_prompts"] = block_prompts
-        batch.extra["longlive2_scene_cut_mask"] = scene_cut_mask
-        batch.extra["longlive2_shot_indices"] = shot_indices
+        batch.extra[CAUSAL_BLOCK_PROMPTS_KEY] = block_prompts
+        batch.extra[CAUSAL_SCENE_CUT_MASK_KEY] = scene_cut_mask
+        batch.extra[CAUSAL_SHOT_INDICES_KEY] = shot_indices
         return block_prompts
 
     @torch.no_grad()
@@ -436,8 +179,6 @@ class LongLive2LatentPreparationStage(LatentPreparationStage):
 class LongLive2CausalDenoisingStage(CausalDMDDenoisingStage):
     def __init__(self, transformer, scheduler) -> None:
         super().__init__(transformer, scheduler)
-        self.causal_kv_cache_neg: list | None = None
-        self.crossattn_cache_neg: list | None = None
         self._rope_temporal_offset = 0.0
         self._i2v_image_latent: torch.Tensor | None = None
 
@@ -501,78 +242,6 @@ class LongLive2CausalDenoisingStage(CausalDMDDenoisingStage):
             },
         )
 
-    @staticmethod
-    def _block_prompt_count(batch: Req) -> int | None:
-        block_prompts = batch.extra.get("longlive2_block_prompts")
-        if block_prompts is None:
-            return None
-        return len(block_prompts)
-
-    @classmethod
-    def _select_block_conditioning(cls, value, block_index: int, block_count: int):
-        if isinstance(value, torch.Tensor) and value.shape[:1] == (block_count,):
-            return value[block_index : block_index + 1]
-        if isinstance(value, list):
-            return [
-                cls._select_block_conditioning(item, block_index, block_count)
-                for item in value
-            ]
-        if isinstance(value, tuple):
-            return tuple(
-                cls._select_block_conditioning(item, block_index, block_count)
-                for item in value
-            )
-        if isinstance(value, dict):
-            return {
-                key: cls._select_block_conditioning(item, block_index, block_count)
-                for key, item in value.items()
-            }
-        return value
-
-    @classmethod
-    def _select_block_prompt_embeds(
-        cls,
-        batch: Req,
-        prompt_embeds,
-        block_index: int,
-    ):
-        block_count = cls._block_prompt_count(batch)
-        if block_count is None:
-            return prompt_embeds
-        return cls._select_block_conditioning(prompt_embeds, block_index, block_count)
-
-    @classmethod
-    def _select_block_cond_kwargs(
-        cls,
-        batch: Req,
-        cond_kwargs: dict[str, Any],
-        block_index: int,
-    ) -> dict[str, Any]:
-        block_count = cls._block_prompt_count(batch)
-        if block_count is None:
-            return cond_kwargs
-        return {
-            key: cls._select_block_conditioning(value, block_index, block_count)
-            for key, value in cond_kwargs.items()
-        }
-
-    def _reset_crossattn_cache_for_block(self, batch: Req, *caches) -> None:
-        if self._block_prompt_count(batch) is None:
-            return
-        for cache in caches:
-            if cache is not None:
-                self._reset_crossattn_cache(cache)
-
-    def _validate_block_prompt_count(self, batch: Req, block_sizes: list[int]) -> None:
-        block_count = self._block_prompt_count(batch)
-        if block_count is None:
-            return
-        if block_count != len(block_sizes):
-            raise ValueError(
-                "LongLive2 multi-shot prompt count must match causal block count, "
-                f"got {block_count} prompts and {len(block_sizes)} blocks"
-            )
-
     def _multi_shot_sink_enabled(self, batch: Req) -> bool:
         return (
             self._block_prompt_count(batch) is not None
@@ -580,187 +249,19 @@ class LongLive2CausalDenoisingStage(CausalDMDDenoisingStage):
             and self.sink_size > 0
         )
 
-    def _cache_needs_reinit_for_batch(self, kv_cache, batch: Req) -> bool:
-        if kv_cache is None or len(kv_cache) != self.num_transformer_blocks:
-            return True
-        has_shot_sink = isinstance(kv_cache[0], LongLive2CausalSelfAttentionKVCache)
-        return has_shot_sink != self._multi_shot_sink_enabled(batch)
+    def _causal_kv_cache_global_sink_tokens_for_batch(self, batch: Req) -> int:
+        if not self._multi_shot_sink_enabled(batch):
+            return 0
+        return self._get_causal_sink_tokens()
 
     def _is_scene_cut(self, batch: Req, block_index: int) -> bool:
         if not self._multi_shot_sink_enabled(batch):
             return False
-        scene_cut_mask = batch.extra.get("longlive2_scene_cut_mask")
-        if not isinstance(scene_cut_mask, list) or block_index >= len(scene_cut_mask):
-            return False
-        return bool(scene_cut_mask[block_index])
-
-    @staticmethod
-    def _shot_index(batch: Req, block_index: int) -> int:
-        shot_indices = batch.extra.get("longlive2_shot_indices")
-        if not isinstance(shot_indices, list) or block_index >= len(shot_indices):
-            return 0
-        return int(shot_indices[block_index])
+        return super()._is_scene_cut(batch, block_index)
 
     def _set_rope_temporal_offset(self, batch: Req, shot_index: int) -> None:
         offset = float(getattr(batch, "multi_shot_rope_offset", 8.0) or 0.0)
         self._rope_temporal_offset = shot_index * offset
-
-    def _pin_current_chunk(self, kv_cache, current_num_frames: int) -> None:
-        if kv_cache is None:
-            return
-        current_num_tokens = current_num_frames * self.num_token_per_frame
-        for cache_block in kv_cache:
-            pin_current_chunk = getattr(cache_block, "pin_current_chunk", None)
-            if callable(pin_current_chunk):
-                pin_current_chunk(current_num_tokens)
-
-    def _initialize_kv_cache(
-        self,
-        batch_size,
-        dtype,
-        device,
-        *,
-        sequence_shard_enabled: bool = False,
-        use_shot_sink: bool = False,
-    ) -> None:
-        if not use_shot_sink:
-            super()._initialize_kv_cache(
-                batch_size,
-                dtype,
-                device,
-                sequence_shard_enabled=sequence_shard_enabled,
-            )
-            return
-
-        num_attention_heads = self._num_causal_cache_attention_heads(
-            sequence_shard_enabled=sequence_shard_enabled
-        )
-        attention_head_dim = self.transformer.attention_head_dim
-        kv_cache_size = self._get_causal_kv_cache_size(
-            sequence_shard_enabled=sequence_shard_enabled
-        )
-        self.causal_kv_cache = self._allocate_shot_kv_cache(
-            batch_size=batch_size,
-            kv_cache_size=kv_cache_size,
-            num_attention_heads=num_attention_heads,
-            attention_head_dim=attention_head_dim,
-            dtype=dtype,
-            device=device,
-            use_int_indices=self._use_causal_cache_int_indices(
-                sequence_shard_enabled=sequence_shard_enabled
-            ),
-            sink_tokens=self._get_causal_sink_tokens(),
-            global_sink_tokens=self._get_causal_sink_tokens(),
-            attention_window_size=self._get_causal_attention_window_size(kv_cache_size),
-        )
-
-    def _allocate_shot_kv_cache(
-        self,
-        *,
-        batch_size: int,
-        kv_cache_size: int,
-        num_attention_heads: int,
-        attention_head_dim: int,
-        dtype: torch.dtype,
-        device,
-        use_int_indices: bool = False,
-        sink_tokens: int = 0,
-        global_sink_tokens: int = 0,
-        attention_window_size: int | None = None,
-        allow_growth: bool = False,
-    ) -> list[LongLive2CausalSelfAttentionKVCache]:
-        causal_kv_cache = []
-        int_index = 0 if use_int_indices else None
-        if attention_window_size is None:
-            attention_window_size = kv_cache_size
-        for _ in range(self.num_transformer_blocks):
-            causal_kv_cache.append(
-                LongLive2CausalSelfAttentionKVCache(
-                    k=torch.zeros(
-                        [
-                            batch_size,
-                            kv_cache_size,
-                            num_attention_heads,
-                            attention_head_dim,
-                        ],
-                        dtype=dtype,
-                        device=device,
-                    ),
-                    v=torch.zeros(
-                        [
-                            batch_size,
-                            kv_cache_size,
-                            num_attention_heads,
-                            attention_head_dim,
-                        ],
-                        dtype=dtype,
-                        device=device,
-                    ),
-                    global_end_index=torch.zeros(1, dtype=torch.long, device=device),
-                    local_end_index=torch.zeros(1, dtype=torch.long, device=device),
-                    global_end_index_int=int_index,
-                    local_end_index_int=int_index,
-                    cache_size=kv_cache_size,
-                    sink_tokens=sink_tokens,
-                    global_sink_tokens=global_sink_tokens,
-                    attention_window_size=attention_window_size,
-                    allow_growth=allow_growth,
-                )
-            )
-        return causal_kv_cache
-
-    def _new_causal_cache_pair(
-        self,
-        *,
-        batch_size: int,
-        max_text_len: int,
-        dtype: torch.dtype,
-        device: torch.device,
-        kv_cache_kwargs: dict[str, Any] | None = None,
-    ) -> tuple[list, list]:
-        prev_kv_cache = self.causal_kv_cache
-        prev_crossattn_cache = self.crossattn_cache
-        try:
-            return self._initialize_causal_caches(
-                batch_size=batch_size,
-                max_text_len=max_text_len,
-                dtype=dtype,
-                device=device,
-                kv_cache_kwargs=kv_cache_kwargs,
-            )
-        finally:
-            self.causal_kv_cache = prev_kv_cache
-            self.crossattn_cache = prev_crossattn_cache
-
-    def _reset_or_init_negative_caches(
-        self,
-        *,
-        batch: Req,
-        batch_size: int,
-        max_text_len: int,
-        dtype: torch.dtype,
-        device: torch.device,
-        kv_cache_kwargs: dict[str, Any] | None = None,
-    ) -> tuple[list, list]:
-        if (
-            self._cache_needs_reinit_for_batch(self.causal_kv_cache_neg, batch)
-            or self.crossattn_cache_neg is None
-        ):
-            self.causal_kv_cache_neg, self.crossattn_cache_neg = (
-                self._new_causal_cache_pair(
-                    batch_size=batch_size,
-                    max_text_len=max_text_len,
-                    dtype=dtype,
-                    device=device,
-                    kv_cache_kwargs=kv_cache_kwargs,
-                )
-            )
-        else:
-            self._reset_causal_caches(
-                kv_cache=self.causal_kv_cache_neg,
-                crossattn_cache=self.crossattn_cache_neg,
-            )
-        return self.causal_kv_cache_neg, self.crossattn_cache_neg
 
     def _forward_one_shot_common(
         self, batch: Req, server_args: ServerArgs, *, use_cfg: bool
@@ -787,8 +288,7 @@ class LongLive2CausalDenoisingStage(CausalDMDDenoisingStage):
 
         independent_first_frame = self.transformer.independent_first_frame
         max_text_len = self._get_max_text_len(server_args)
-        use_shot_sink = self._multi_shot_sink_enabled(batch)
-        kv_cache_kwargs = {"use_shot_sink": True} if use_shot_sink else None
+        kv_cache_kwargs = self._causal_kv_cache_kwargs_for_batch(batch)
         self._rope_temporal_offset = 0.0
 
         if self._cache_needs_reinit_for_batch(self.causal_kv_cache, batch):
