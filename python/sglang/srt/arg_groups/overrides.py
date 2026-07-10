@@ -1712,6 +1712,13 @@ def _fa4_page_constraint(view: Any) -> dict:
         # CUTLASS kernel aborts on at page_size>1. That path only works at
         # page_size==1, so skip the 128 auto-force for it and keep the default.
         and (view.speculative_eagle_topk or 0) <= 1
+        # Full prefill CUDA graph on the FlashAttention backend supports
+        # page_size==1 only (guard shipped with #27988), so auto-forcing 128
+        # here makes fa4 + cuda_graph_config[prefill].backend=full unstartable
+        # at argument validation (#28976 and #27988 crossed in flight). Skip
+        # the auto-force and keep the page_size=1 default for that
+        # combination — the configuration the #27988 fa4 benchmarks ran.
+        and view.cuda_graph_config.prefill.backend != Backend.FULL
     ):
         logger.warning(
             f"FA4 backend only supports page size 128 for non-MLA model architectures, changing page_size from {view.page_size} to 128."
