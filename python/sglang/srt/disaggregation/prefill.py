@@ -946,10 +946,46 @@ class SchedulerDisaggregationPrefillMixin:
             if extend_logprob_start_len < extend_input_len:
                 logprob_pt += extend_input_len - extend_logprob_start_len
 
-        for i, (req, next_token_id) in enumerate(
-            zip(batch.reqs, next_token_ids, strict=True)
-        ):
+        # Poll optimistic prefill requests in this batch.
+        # Note: In overlap scheduling, a chunked request that was still pending
+        # during process_prefill_chunk is not checked again here.
+        # If it becomes ready in the gap, we still retry the request to keep
+        # chunked-prefill state management simple.
+        optimistic_polls = {}
+        optimistic_reqs = [
+            (i, req)
+            for i, req in enumerate(batch.reqs)
+            if req.pending_bootstrap and req.inflight_middle_chunks <= 0
+        ]
+        if optimistic_reqs:
+            polls = poll_and_all_reduce_attn_cp_tp_group(
+                [req.disagg_kv_sender for _, req in optimistic_reqs],
+                self.attn_cp_cpu_group,
+                self.attn_tp_cpu_group,
+            )
+            optimistic_polls = {
+                idx: poll for (idx, _), poll in zip(optimistic_reqs, polls)
+            }
+
+        full_batch_next_tokens = len(next_token_ids) == len(batch.reqs)
+        compact_next_token_pt = 0
+        for i, req in enumerate(batch.reqs):
             if req.inflight_middle_chunks <= 0:
+                if full_batch_next_tokens:
+                    next_token_id = next_token_ids[i]
+                else:
+                    if compact_next_token_pt >= len(next_token_ids):
+                        raise RuntimeError(
+                            "Disagg prefill PP output token count mismatch: "
+                            f"num_reqs={len(batch.reqs)}, "
+                            f"num_next_token_ids={len(next_token_ids)}, "
+                            f"consumed_next_token_ids={compact_next_token_pt}, "
+                            f"rids={[req.rid for req in batch.reqs]}, "
+                            "inflight_middle_chunks="
+                            f"{[req.inflight_middle_chunks for req in batch.reqs]}"
+                        )
+                    next_token_id = next_token_ids[compact_next_token_pt]
+                    compact_next_token_pt += 1
                 req.time_stats.set_prefill_finished_time()
 
                 # Test hook: exercise the release/requeue retry path.
@@ -1056,6 +1092,20 @@ class SchedulerDisaggregationPrefillMixin:
                     ), f"Req {req.rid} does not have metadata buffer allocated"
                     self.send_kv_chunk(req, last_chunk=False, end_idx=req.tmp_end_idx)
                 req.time_stats.set_last_chunked_prefill_finish_time()
+
+        if (
+            not full_batch_next_tokens
+            and compact_next_token_pt != len(next_token_ids)
+        ):
+            raise RuntimeError(
+                "Disagg prefill PP output has unused compact next tokens: "
+                f"num_reqs={len(batch.reqs)}, "
+                f"num_next_token_ids={len(next_token_ids)}, "
+                f"consumed_next_token_ids={compact_next_token_pt}, "
+                f"rids={[req.rid for req in batch.reqs]}, "
+                "inflight_middle_chunks="
+                f"{[req.inflight_middle_chunks for req in batch.reqs]}"
+            )
 
         can_run_cuda_graph = result.can_run_cuda_graph
         self.metrics_reporter.report_prefill_stats(
