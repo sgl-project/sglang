@@ -273,9 +273,8 @@ class DSparkHiddenRowPool:
                 f"hidden={hidden.shape[-1]}, pool={self.hidden_size}"
             )
         index_tensor = torch.as_tensor(indices, dtype=torch.long, device=self.device)
-        rows = self.buffer[index_tensor]
-        rows.zero_()
-        rows[:, : hidden.shape[-1]].copy_(
+        self.buffer[index_tensor, :] = 0
+        self.buffer[index_tensor, : hidden.shape[-1]].copy_(
             hidden.to(device=self.device, dtype=self.dtype, non_blocking=True)
         )
 
