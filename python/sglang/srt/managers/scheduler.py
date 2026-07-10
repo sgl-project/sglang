@@ -4042,31 +4042,46 @@ class Scheduler(
 
         if not self.running_batch.is_empty():
             self.running_batch.filter_batch()
-            if len(self.running_batch.reqs) != 0:
-                # Decode-side retract always rebootstraps (recomputes the KV from
-                # the prefill), so skip the device->host KV offload that release_req
-                # would otherwise do; the offloaded copy would be immediately
-                # discarded. Non-decode modes ignore offload_kv (they never offload).
-                retracted_reqs = self.running_batch.reqs
-                retract_all(
-                    reqs=retracted_reqs,
-                    server_args=self.server_args,
-                    req_to_token_pool=self.running_batch.req_to_token_pool,
-                    token_to_kv_pool_allocator=self.running_batch.token_to_kv_pool_allocator,
-                    tree_cache=self.running_batch.tree_cache,
-                    hisparse_coordinator=self.hisparse_coordinator,
-                    offload_kv=False,
-                )
-                self.running_batch.reqs = []
-                for req in retracted_reqs:
-                    if self.disaggregation_mode == DisaggregationMode.DECODE:
-                        if req.output_ids:
-                            req.pd_rebootstrap_forced_output_id = req.output_ids.pop()
-                        req.pd_rebootstrap_in_progress = True
-                        req.time_stats.set_retract_time()
-                        self.disagg_decode_prealloc_queue.hold_rebootstrap(req)
-                    else:
-                        self._add_request_to_queue(req)
+
+        # Collect reqs to retract unconditionally so a live chunked-prefill
+        # request is rescued even when running_batch is empty. On a disagg-prefill
+        # node running_batch is always empty and the fold-in above skips prefill,
+        # so a mid-chunk request is reachable only via self.chunked_req; without
+        # this it would be lost when the pointer is nulled below. The membership
+        # guard is a no-op in NULL/DECODE (the chunked req is already folded into
+        # running_batch) so it never double-releases.
+        retracted_reqs = list(self.running_batch.reqs)
+        if (
+            self.chunked_req is not None
+            and not self.chunked_req.finished()
+            and self.chunked_req not in retracted_reqs
+        ):
+            retracted_reqs.append(self.chunked_req)
+
+        if retracted_reqs:
+            # Decode-side retract always rebootstraps (recomputes the KV from
+            # the prefill), so skip the device->host KV offload that release_req
+            # would otherwise do; the offloaded copy would be immediately
+            # discarded. Non-decode modes ignore offload_kv (they never offload).
+            retract_all(
+                reqs=retracted_reqs,
+                server_args=self.server_args,
+                req_to_token_pool=self.req_to_token_pool,
+                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                tree_cache=self.tree_cache,
+                hisparse_coordinator=self.hisparse_coordinator,
+                offload_kv=False,
+            )
+            self.running_batch.reqs = []
+            for req in retracted_reqs:
+                if self.disaggregation_mode == DisaggregationMode.DECODE:
+                    if req.output_ids:
+                        req.pd_rebootstrap_forced_output_id = req.output_ids.pop()
+                    req.pd_rebootstrap_in_progress = True
+                    req.time_stats.set_retract_time()
+                    self.disagg_decode_prealloc_queue.hold_rebootstrap(req)
+                else:
+                    self._add_request_to_queue(req)
 
         self.running_batch.batch_is_full = False
         self.chunked_req = None
