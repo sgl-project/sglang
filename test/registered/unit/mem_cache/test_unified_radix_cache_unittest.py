@@ -2392,6 +2392,7 @@ class UnifiedRadixCacheSuite:
         self._backup_node(tree, leaf)
         self.assertTrue(leaf.hash_value)
         tree.take_events()
+        self._write_path_to_l3(tree, leaf)
         self.assertTrue(tree.ongoing_backup)
 
         # Fork off the first two pages while the L3 backup is still in flight.
