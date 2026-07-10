@@ -116,6 +116,7 @@ class TestProcessMmDataKwargs(unittest.TestCase):
         server_args.mm_process_config = mm_process_config
         server_args.disable_fast_image_processor = True
         server_args.keep_mm_feature_on_device = True
+        server_args.skip_tokenizer_init = False
 
         mock_processor = MagicMock()
         mock_processor.__class__.__name__ = "TestProcessor"
@@ -133,6 +134,9 @@ class TestProcessMmDataKwargs(unittest.TestCase):
                 proc = BaseMultimodalProcessor()
 
         proc.server_args = server_args
+        proc.keep_mm_feature_on_device = server_args.keep_mm_feature_on_device
+        proc.disable_fast_image_processor = server_args.disable_fast_image_processor
+        proc.skip_tokenizer_init = server_args.skip_tokenizer_init
         proc._processor = mock_processor
         proc.image_config = mm_process_config.get("image", {})
         proc.video_config = mm_process_config.get("video", {})
@@ -213,6 +217,7 @@ class TestOverrideProcessorsConfigInjection(unittest.TestCase):
         server_args.mm_process_config = mm_process_config
         server_args.disable_fast_image_processor = True
         server_args.keep_mm_feature_on_device = False
+        server_args.skip_tokenizer_init = False
 
         mock_hf_processor = MagicMock()
         mock_hf_processor.__class__.__name__ = "TestProcessor"
@@ -224,6 +229,9 @@ class TestOverrideProcessorsConfigInjection(unittest.TestCase):
             proc = processor_cls()
 
         proc.server_args = server_args
+        proc.keep_mm_feature_on_device = server_args.keep_mm_feature_on_device
+        proc.disable_fast_image_processor = server_args.disable_fast_image_processor
+        proc.skip_tokenizer_init = server_args.skip_tokenizer_init
         proc._processor = mock_hf_processor
         proc.image_config = mm_process_config.get("image", {})
         proc.video_config = mm_process_config.get("video", {})

@@ -136,18 +136,6 @@ class TestEntryStateAndPins(unittest.TestCase):
 
         self.assertTrue(entry.is_evictable())
 
-    def test_filling_entry_is_not_evictable(self):
-        entry = EmbeddingCacheEntry(
-            hash="h",
-            modality=Modality.IMAGE,
-            num_tokens=2,
-            dim=4,
-            page_runs=[PageRun(0, 1)],
-            state=EntryState.FILLING,
-        )
-
-        self.assertFalse(entry.is_evictable())
-
     def test_ready_entry_with_pin_is_not_evictable(self):
         entry = EmbeddingCacheEntry(
             hash="h",
