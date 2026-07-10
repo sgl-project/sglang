@@ -21,6 +21,9 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
 from torch import nn
 
+from sglang.kernels.ops.activation.softcap import (
+    softcap_inplace_logits as fused_softcap,
+)
 from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
@@ -33,7 +36,6 @@ from sglang.srt.layers.dp_attention import (
     get_dp_dtype,
     get_dp_hidden_size,
 )
-from sglang.srt.layers.triton_ops.softcap import softcap_inplace_logits as fused_softcap
 from sglang.srt.layers.utils.logprob import (
     InputLogprobsResult,
     get_token_ids_logprobs_chunk,
@@ -360,6 +362,7 @@ class LogitsProcessor(nn.Module):
 
         self.return_full_logits = return_full_logits
         self.enable_mis = get_server_args().enable_mis
+        self.rl_on_policy_target = get_server_args().rl_on_policy_target
 
         self._logits_gatherer = triton_symm_mem_ag.MultimemAllGatherer(
             max_tokens=triton_symm_mem_ag.recommended_max_tokens(
@@ -969,7 +972,7 @@ class LogitsProcessor(nn.Module):
                     None,  # bias
                     True,  # is_vnni
                 )
-            elif get_server_args().rl_on_policy_target is not None:
+            elif self.rl_on_policy_target is not None:
                 # Due to tie-weight, we may not be able to change lm_head's weight dtype
                 logits = torch.matmul(
                     hidden_states.bfloat16(), lm_head.weight.T.bfloat16()

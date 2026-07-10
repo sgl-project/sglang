@@ -68,10 +68,7 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.managers.schedule_policy import match_prefix_for_req
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-from sglang.srt.mem_cache.base_prefix_cache import (
-    BasePrefixCache,
-    EvictParams,
-)
+from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.common import (
     kv_to_page_indices,
     page_align_floor,
@@ -1285,11 +1282,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             )
 
         if self.scheduler.enable_hisparse:
-            # HiSparse pre-alloc only allocates logical indices (alloc_logical_only),
-            # so the logical pool is the binding constraint for admission control.
-            available_size = (
-                self.token_to_kv_pool_allocator.logical_attn_allocator.available_size()
-            )
+            logical_allocator = self.token_to_kv_pool_allocator.logical_attn_allocator
+            if self._uses_swa_tail_prealloc() and hasattr(
+                logical_allocator, "full_available_size"
+            ):
+                available_size = logical_allocator.full_available_size()
+            else:
+                # HiSparse pre-alloc only allocates logical indices, so the
+                # logical pool is the binding constraint for admission control.
+                available_size = logical_allocator.available_size()
         elif self._uses_swa_tail_prealloc():
             available_size = self.token_to_kv_pool_allocator.full_available_size()
             if self.scheduler.server_args.disaggregation_decode_enable_radix_cache:
@@ -1471,14 +1472,32 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             # device indices) and allocate host indices for RDMA destination.
             coordinator = self.scheduler.hisparse_coordinator
             device = self.token_to_kv_pool_allocator.device
-            kv_loc = self.token_to_kv_pool_allocator.alloc_logical_only(
-                prefix_lens=torch.tensor([0], dtype=torch.int64, device=device),
-                prefix_lens_cpu=torch.tensor([0], dtype=torch.int64),
-                seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),
-                seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
-                last_loc=torch.tensor([-1], dtype=torch.int64, device=device),
-                extend_num_tokens=fill_len,
-            )
+            prefix_lens = torch.tensor([0], dtype=torch.int64, device=device)
+            prefix_lens_cpu = torch.tensor([0], dtype=torch.int64)
+            seq_lens = torch.tensor([fill_len], dtype=torch.int64, device=device)
+            seq_lens_cpu = torch.tensor([fill_len], dtype=torch.int64)
+            last_loc = torch.tensor([-1], dtype=torch.int64, device=device)
+            if self._uses_swa_tail_prealloc():
+                swa_tail_len = self._swa_tail_len(fill_len)
+                kv_loc = self.token_to_kv_pool_allocator.alloc_extend_swa_tail(
+                    prefix_lens=prefix_lens,
+                    prefix_lens_cpu=prefix_lens_cpu,
+                    seq_lens=seq_lens,
+                    seq_lens_cpu=seq_lens_cpu,
+                    last_loc=last_loc,
+                    extend_num_tokens=fill_len,
+                    swa_tail_len=swa_tail_len,
+                )
+                req.swa_evicted_seqlen = fill_len - swa_tail_len
+            else:
+                kv_loc = self.token_to_kv_pool_allocator.alloc_logical_only(
+                    prefix_lens=prefix_lens,
+                    prefix_lens_cpu=prefix_lens_cpu,
+                    seq_lens=seq_lens,
+                    seq_lens_cpu=seq_lens_cpu,
+                    last_loc=last_loc,
+                    extend_num_tokens=fill_len,
+                )
 
             # Allocate host indices for the RDMA transfer target.
             host_indices = coordinator.mem_pool_host.alloc_paged_token_slots(
