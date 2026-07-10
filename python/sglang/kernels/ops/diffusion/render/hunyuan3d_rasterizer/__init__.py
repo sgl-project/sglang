@@ -12,7 +12,8 @@ import os
 from typing import Tuple
 
 import torch
-from sglang.multimodal_gen.csrc.render import load_extension_with_recovery
+
+from sglang.kernels.ops.diffusion.render import load_extension_with_recovery
 
 _abs_path = os.path.dirname(os.path.abspath(__file__))
 _custom_rasterizer_kernel = None
@@ -26,14 +27,15 @@ def _load_custom_rasterizer(
 
     if _custom_rasterizer_kernel is not None:
         return _custom_rasterizer_kernel
-    
+
     cuda_enabled_flag = ["-DCUDA_ENABLED"] if is_cuda else []
-    
+
     _custom_rasterizer_kernel = load_extension_with_recovery(
         name="custom_rasterizer_kernel",
         sources=[
             f"{_abs_path}/rasterizer.cpp",
-        ] + ([f"{_abs_path}/rasterizer_gpu.cu"] if is_cuda else []),
+        ]
+        + ([f"{_abs_path}/rasterizer_gpu.cu"] if is_cuda else []),
         extra_cflags=["-O3"] + cuda_enabled_flag,
         extra_cuda_cflags=["-O3", "--use_fast_math"] + cuda_enabled_flag,
         verbose=False,
@@ -60,7 +62,13 @@ def rasterize(
         pos = pos[0]
 
     findices, barycentric = kernel.rasterize_image(
-        pos.to(device), tri.to(device), clamp_depth.to(device), resolution[1], resolution[0], 1e-6, use_depth_prior
+        pos.to(device),
+        tri.to(device),
+        clamp_depth.to(device),
+        resolution[1],
+        resolution[0],
+        1e-6,
+        use_depth_prior,
     )
 
     findices = findices.to(pos.device)
