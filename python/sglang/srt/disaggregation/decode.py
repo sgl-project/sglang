@@ -263,6 +263,9 @@ class DecodeRequest:
     dspark_hidden_dst_indices: Optional[List[int]] = None
     dspark_hidden_dst_indices_by_pp: Optional[Dict[int, List[int]]] = None
     dspark_hidden_pp_slices: Optional[Dict[int, dict]] = None
+    dspark_hidden_dynamic_buffers_by_pp: Optional[Dict[int, torch.Tensor]] = None
+    dspark_hidden_dynamic_register_handles: Optional[List[Any]] = None
+    dspark_hidden_dynamic_kv_manager: Optional[CommonKVManager] = None
     dspark_hidden_start: int = 0
 
     # HiCache Status
@@ -279,6 +282,47 @@ class DecodeRequest:
     @property
     def priority(self) -> Optional[int]:
         return self.req.priority
+
+
+def _register_dspark_dynamic_buffer(kv_manager: CommonKVManager, tensor: torch.Tensor):
+    ptr = int(tensor.data_ptr())
+    nbytes = int(tensor.numel() * tensor.element_size())
+    engine = getattr(kv_manager, "engine", None)
+    if engine is not None and hasattr(engine, "batch_register"):
+        ret = engine.batch_register([ptr], [nbytes])
+        if ret not in (None, 0):
+            raise RuntimeError(
+                "Failed to register DSpark dynamic hidden buffer with Mooncake: "
+                f"ptr=0x{ptr:x}, nbytes={nbytes}, ret={ret}"
+            )
+        return ("mooncake", ptr)
+
+    agent = getattr(kv_manager, "agent", None)
+    if agent is not None and hasattr(agent, "register_memory"):
+        desc = agent.register_memory([(ptr, nbytes, 0, "")], "DRAM")
+        return ("nixl", desc)
+
+    return None
+
+
+def _deregister_dspark_dynamic_buffers(
+    kv_manager: CommonKVManager,
+    buffers: Optional[Dict[int, torch.Tensor]],
+    handles: Optional[List[Any]],
+) -> None:
+    if not buffers:
+        return
+    engine = getattr(kv_manager, "engine", None)
+    if engine is not None and hasattr(engine, "batch_deregister"):
+        ptrs = [int(tensor.data_ptr()) for tensor in buffers.values()]
+        try:
+            engine.batch_deregister(ptrs)
+        except Exception:
+            logger.exception("Failed to deregister DSpark dynamic hidden buffers.")
+    # NIXL currently has no local deregister wrapper in this backend; clearing the
+    # tensor refs is still required so per-request CPU memory can be released.
+    if handles is not None:
+        handles.clear()
 
 
 class DecodePreallocQueue(DecodeHiCachePreallocMixin):
@@ -1047,6 +1091,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             dspark_hidden_dst_indices = None
             dspark_hidden_dst_indices_by_pp = None
             dspark_hidden_pp_slices = None
+            dspark_hidden_dynamic_buffers_by_pp = None
+            dspark_hidden_dynamic_register_handles = None
             dspark_hidden_start = total_prefix_len
             dspark_hidden_len = origin_input_len - total_prefix_len
             state_types = self.kv_manager.kv_args.state_types
@@ -1133,46 +1179,65 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     indices_to_remove.add(i)
                     continue
 
-                required_rows = dspark_hidden_len * max(1, len(pp_slices))
-                if required_rows > dspark_pool.size:
-                    message = (
-                        "Request requires more DSpark hidden rows than the "
-                        f"decode pool capacity: required={required_rows}, "
-                        f"capacity={dspark_pool.size}"
-                    )
-                    logger.error(message)
-                    prepare_abort(
-                        decode_req.req,
-                        message,
-                        status_code=HTTPStatus.BAD_REQUEST,
-                    )
-                    self.scheduler.output_streamer.stream_output(
-                        [decode_req.req], decode_req.req.return_logprob
-                    )
-                    if prefix_len > 0:
-                        self.tree_cache.dec_lock_ref(decode_req.req.last_node)
-                    failed_reqs.append(decode_req)
-                    indices_to_remove.add(i)
-                    continue
                 dspark_hidden_dst_indices_by_pp = {}
-                allocated_pp_rows = []
+                dspark_hidden_dynamic_buffers_by_pp = {}
+                dspark_hidden_dynamic_register_handles = []
                 for pp_rank, pp_slice in pp_slices.items():
-                    cur_indices = dspark_pool.alloc(dspark_hidden_len)
-                    if cur_indices is None:
-                        for rows in allocated_pp_rows:
-                            dspark_pool.free(rows)
+                    cur_indices = [int(x) for x in range(dspark_hidden_len)]
+                    dynamic_buffer = torch.empty(
+                        (int(dspark_hidden_len), int(dspark_pool.hidden_size)),
+                        dtype=dspark_pool.dtype,
+                        device="cpu",
+                    )
+                    try:
+                        handle = _register_dspark_dynamic_buffer(
+                            self.kv_manager, dynamic_buffer
+                        )
+                    except Exception as e:
+                        _deregister_dspark_dynamic_buffers(
+                            self.kv_manager,
+                            dspark_hidden_dynamic_buffers_by_pp,
+                            dspark_hidden_dynamic_register_handles,
+                        )
+                        message = (
+                            "Failed to register DSpark dynamic hidden receive buffer: "
+                            f"rid={decode_req.req.rid}, pp_rank={pp_rank}, error={e}"
+                        )
+                        logger.exception(message)
+                        prepare_abort(
+                            decode_req.req,
+                            message,
+                            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                        )
+                        self.scheduler.output_streamer.stream_output(
+                            [decode_req.req], decode_req.req.return_logprob
+                        )
+                        if prefix_len > 0:
+                            self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                        failed_reqs.append(decode_req)
+                        indices_to_remove.add(i)
                         dspark_hidden_dst_indices_by_pp = None
                         break
-                    allocated_pp_rows.append(cur_indices)
+                    dspark_hidden_dynamic_buffers_by_pp[pp_rank] = dynamic_buffer
+                    if handle is not None:
+                        dspark_hidden_dynamic_register_handles.append(handle)
                     dspark_hidden_dst_indices_by_pp[pp_rank] = cur_indices
                     pp_slice["dst_indices"] = [int(x) for x in cur_indices]
+                    pp_slice["dynamic_dst"] = {
+                        "ptr": int(dynamic_buffer.data_ptr()),
+                        "nbytes": int(
+                            dynamic_buffer.numel() * dynamic_buffer.element_size()
+                        ),
+                        "item_len": int(
+                            dynamic_buffer.shape[1] * dynamic_buffer.element_size()
+                        ),
+                        "row_count": int(dspark_hidden_len),
+                    }
                 if dspark_hidden_dst_indices_by_pp is None:
-                    if prefix_len > 0:
-                        self.tree_cache.dec_lock_ref(decode_req.req.last_node)
-                    break
+                    continue
                 dspark_hidden_pp_slices = pp_slices
                 logger.info(
-                    "Prepared DSpark PD hidden receive rows: rid=%s, "
+                    "Prepared DSpark PD dynamic hidden receive buffers: rid=%s, "
                     "target_layer_ids=%s, hidden_len=%s, pp_slices=%s",
                     decode_req.req.rid,
                     target_layer_ids,
@@ -1182,6 +1247,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                             "layer_ids": pp_slice.get("layer_ids", []),
                             "slice_start": pp_slice.get("slice_start", 0),
                             "slice_len": pp_slice.get("slice_len", 0),
+                            "dynamic_nbytes": pp_slice.get("dynamic_dst", {}).get(
+                                "nbytes", 0
+                            ),
                         }
                         for pp_rank, pp_slice in pp_slices.items()
                     },
@@ -1198,6 +1266,17 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             decode_req.dspark_hidden_dst_indices = dspark_hidden_dst_indices
             decode_req.dspark_hidden_dst_indices_by_pp = dspark_hidden_dst_indices_by_pp
             decode_req.dspark_hidden_pp_slices = dspark_hidden_pp_slices
+            decode_req.dspark_hidden_dynamic_buffers_by_pp = (
+                dspark_hidden_dynamic_buffers_by_pp
+            )
+            decode_req.dspark_hidden_dynamic_register_handles = (
+                dspark_hidden_dynamic_register_handles
+            )
+            decode_req.dspark_hidden_dynamic_kv_manager = (
+                self.kv_manager
+                if dspark_hidden_dynamic_buffers_by_pp is not None
+                else None
+            )
             decode_req.dspark_hidden_start = dspark_hidden_start
             decode_req.prefix_match = prefix_match
             if self.scheduler.enable_decode_hicache:
@@ -1830,20 +1909,33 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     self.staging_handler.register_decode_req(dr.req.bootstrap_room, dr)
 
     def _release_dspark_hidden_rows(self, decode_req: DecodeRequest) -> None:
+        if decode_req.dspark_hidden_dynamic_kv_manager is not None:
+            _deregister_dspark_dynamic_buffers(
+                decode_req.dspark_hidden_dynamic_kv_manager,
+                decode_req.dspark_hidden_dynamic_buffers_by_pp,
+                decode_req.dspark_hidden_dynamic_register_handles,
+            )
         indices_by_pp = decode_req.dspark_hidden_dst_indices_by_pp
         indices = decode_req.dspark_hidden_dst_indices
         if indices_by_pp is None and indices is None:
+            decode_req.dspark_hidden_dynamic_buffers_by_pp = None
+            decode_req.dspark_hidden_dynamic_register_handles = None
+            decode_req.dspark_hidden_dynamic_kv_manager = None
             return
-        pool = getattr(self.metadata_buffers, "dspark_hidden_pool", None)
-        if pool is not None:
-            if indices_by_pp is not None:
-                for pp_indices in indices_by_pp.values():
-                    pool.free(pp_indices)
-            else:
-                pool.free(indices)
+        if decode_req.dspark_hidden_dynamic_buffers_by_pp is None:
+            pool = getattr(self.metadata_buffers, "dspark_hidden_pool", None)
+            if pool is not None:
+                if indices_by_pp is not None:
+                    for pp_indices in indices_by_pp.values():
+                        pool.free(pp_indices)
+                else:
+                    pool.free(indices)
         decode_req.dspark_hidden_dst_indices = None
         decode_req.dspark_hidden_dst_indices_by_pp = None
         decode_req.dspark_hidden_pp_slices = None
+        decode_req.dspark_hidden_dynamic_buffers_by_pp = None
+        decode_req.dspark_hidden_dynamic_register_handles = None
+        decode_req.dspark_hidden_dynamic_kv_manager = None
 
     def _commit_transfer_to_req(self, decode_req: DecodeRequest):
         idx = decode_req.metadata_buffer_index
@@ -1985,7 +2077,16 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     slice_len = int(pp_slice.get("slice_len", 0))
                     if slice_len <= 0:
                         continue
-                    slice_hidden = dspark_pool.read(dst_indices)[:, :slice_len]
+                    dynamic_buffers = (
+                        decode_req.dspark_hidden_dynamic_buffers_by_pp or {}
+                    )
+                    dynamic_buffer = dynamic_buffers.get(
+                        pp_rank, dynamic_buffers.get(int(pp_rank))
+                    )
+                    if dynamic_buffer is not None:
+                        slice_hidden = dynamic_buffer[:hidden_len, :slice_len]
+                    else:
+                        slice_hidden = dspark_pool.read(dst_indices)[:, :slice_len]
                     hidden[:, slice_start : slice_start + slice_len].copy_(slice_hidden)
                 received_target_layer_ids = []
                 pp_slice_summary = {}

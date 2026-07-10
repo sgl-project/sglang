@@ -2044,6 +2044,20 @@ class NixlKVManager(CommonKVManager):
                     and len(dst_indices) == 0
                 ):
                     continue
+                dynamic_dst = None
+                dst_mem_kind_for_state = "VRAM"
+                if st == StateType.DSPARK_HIDDEN:
+                    dynamic_dst = (
+                        (req.spec_metadata or {})
+                        .get("pp_slice", {})
+                        .get("dynamic_dst")
+                    )
+                    if dynamic_dst:
+                        row_count = int(dynamic_dst.get("row_count", 0))
+                        dst_ptrs = [int(dynamic_dst["ptr"])]
+                        src_lens = [int(dynamic_dst["item_len"])]
+                        dst_indices = list(range(row_count))
+                        dst_mem_kind_for_state = "DRAM"
                 if len(src_indices) != len(dst_indices):
                     raise RuntimeError(
                         f"State index length mismatch at component {i}: "
@@ -2059,6 +2073,7 @@ class NixlKVManager(CommonKVManager):
                     dst_gpu_id=dst_gpu_id,
                     notif=comp_notif,
                     state_type=st,
+                    dst_mem_kind=dst_mem_kind_for_state,
                 )
             elif st == StateType.MINIMAX_INDEX_K:
                 # Equal-TP / PP=1 only. Sub-pools are compacted sparse-layer
@@ -2553,6 +2568,7 @@ class NixlKVReceiver(CommonKVReceiver):
                 f"Sending to prefill server with bootstrap room {self.bootstrap_room} {is_dummy=}"
             )
             local_state_indices = state_indices
+            local_spec_metadata = spec_metadata
             if spec_metadata and spec_metadata.get("pp_slices"):
                 pp_rank = int(
                     bootstrap_info.get(
@@ -2560,6 +2576,11 @@ class NixlKVReceiver(CommonKVReceiver):
                     )
                 )
                 pp_slice = spec_metadata["pp_slices"].get(str(pp_rank), {})
+                local_spec_metadata = {
+                    **spec_metadata,
+                    "target_pp_rank": int(pp_rank),
+                    "pp_slice": pp_slice,
+                }
                 local_state_indices = list(
                     state_indices
                     if state_indices is not None
@@ -2591,8 +2612,8 @@ class NixlKVReceiver(CommonKVReceiver):
                         packed_state_indices,
                         str(decode_prefix_len or 0).encode("ascii"),
                         (
-                            json.dumps(spec_metadata).encode("utf-8")
-                            if spec_metadata
+                            json.dumps(local_spec_metadata).encode("utf-8")
+                            if local_spec_metadata
                             else b""
                         ),
                     ]
