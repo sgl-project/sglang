@@ -171,6 +171,10 @@ def _create_unified_radix_cache(
     from sglang.srt.mem_cache.unified_cache_components import ComponentType
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
+    assert (
+        ctx.full_tokens_per_layer != 0
+    ), "UnifiedRadixCache does not support all-SWA models (full_tokens_per_layer == 0)"
+
     tree_components = [ComponentType.FULL]
     if ctx.is_hybrid_swa:
         tree_components.append(ComponentType.SWA)
@@ -197,6 +201,12 @@ def _create_unified_radix_cache(
 
 def create_tree_cache(ctx: TreeCacheBuildContext) -> BasePrefixCache:
     """Route to the matching factory to construct Radix Cache."""
+    if ctx.full_tokens_per_layer == 0 and ctx.server_args.strip_thinking_cache:
+        raise ValueError(
+            "--strip-thinking-cache is incompatible with all-SWA models "
+            "(every attention layer uses sliding-window attention)"
+        )
+
     name = ctx.server_args.radix_cache_backend
     if name:
         factory = get_radix_cache_factory(name)
