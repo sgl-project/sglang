@@ -53,7 +53,6 @@ from sglang.srt.mem_cache.utils import (
     get_hash_str,
     split_node_hash_value,
 )
-from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -445,13 +444,7 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
             is_insert = False
 
         if self.disable:
-            kv_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, :kv_len_to_handle
-            ]
-            self.token_to_kv_pool_allocator.free(kv_indices)
-            return CacheFinishedReqResult(
-                unhandled_kv_start=ceil_align(kv_len_to_handle, self.page_size)
-            )
+            return CacheFinishedReqResult(unhandled_kv_start=0)
 
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_len_to_handle]
         kv_indices = self.req_to_token_pool.req_to_token[
@@ -481,18 +474,13 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
                 kv_indices[req.cache_protected_len : key_len]
             )
 
-        # free the unaligned tail
-        self.token_to_kv_pool_allocator.free(kv_indices[key_len:])
-
         self._tag_session_leaf(req, radix_key, node=session_leaf)
 
         # Remove req slot release the cache lock
         if req.last_node is not None:
             self.dec_lock_ref(req.last_node)
 
-        return CacheFinishedReqResult(
-            unhandled_kv_start=ceil_align(kv_len_to_handle, self.page_size)
-        )
+        return CacheFinishedReqResult(unhandled_kv_start=key_len)
 
     def cache_unfinished_req(self, req: Req, chunked=False):
         """Cache request when it is unfinished."""

@@ -81,14 +81,7 @@ class ChunkCache(BasePrefixCache):
     def cache_finished_req(
         self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int
     ) -> CacheFinishedReqResult:
-        # For decode server: if req.output_ids is empty, we want to free all req.origin_input_ids
-        kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, :kv_len_to_handle
-        ]
-        self.token_to_kv_pool_allocator.free(kv_indices)
-        return CacheFinishedReqResult(
-            unhandled_kv_start=ceil_align(kv_len_to_handle, self.page_size)
-        )
+        return CacheFinishedReqResult(unhandled_kv_start=0)
 
     def cache_unfinished_req(self, req: Req, chunked=False):
         kv_indices = self.req_to_token_pool.req_to_token[
