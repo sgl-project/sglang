@@ -96,6 +96,53 @@ def _get_dspark_config(config: Any) -> dict:
         return {}
 
 
+def _parse_layer_ids(raw_layer_ids: Any, *, field_name: str) -> Optional[List[int]]:
+    if raw_layer_ids is None:
+        return None
+    if not isinstance(raw_layer_ids, (list, tuple)) or not len(raw_layer_ids):
+        raise ValueError(
+            f"DSpark {field_name} must be a non-empty list of ints, "
+            f"got {raw_layer_ids!r}."
+        )
+    return [int(x) for x in raw_layer_ids]
+
+
+def get_dspark_target_layer_ids(config: Any) -> Optional[List[int]]:
+    """Read DSpark target aux-hidden layers from any supported config layout."""
+    dspark_cfg = _get_dspark_config(config)
+    text_config = _get_text_config(config)
+
+    candidates = (
+        ("dspark_target_layer_ids", _cfg_get(config, "dspark_target_layer_ids", None)),
+        (
+            "text_config.dspark_target_layer_ids",
+            _cfg_get(text_config, "dspark_target_layer_ids", None),
+        ),
+        ("dspark_config.target_layer_ids", dspark_cfg.get("target_layer_ids", None)),
+        (
+            "dspark_config.dspark_target_layer_ids",
+            dspark_cfg.get("dspark_target_layer_ids", None),
+        ),
+        (
+            "dspark_config.aux_hidden_state_layer_ids",
+            dspark_cfg.get("aux_hidden_state_layer_ids", None),
+        ),
+        (
+            "aux_hidden_state_layer_ids",
+            _cfg_get(config, "aux_hidden_state_layer_ids", None),
+        ),
+        (
+            "text_config.aux_hidden_state_layer_ids",
+            _cfg_get(text_config, "aux_hidden_state_layer_ids", None),
+        ),
+    )
+    for field_name, layer_ids in candidates:
+        parsed = _parse_layer_ids(layer_ids, field_name=field_name)
+        if parsed is not None:
+            return parsed
+    return None
+
+
 def parse_dspark_draft_config(*, draft_hf_config: Any) -> DSparkDraftConfig:
     base = parse_dflash_draft_config(draft_hf_config=draft_hf_config)
 
@@ -111,6 +158,10 @@ def parse_dspark_draft_config(*, draft_hf_config: Any) -> DSparkDraftConfig:
     prefixed_target_layer_ids = _cfg_get(
         draft_hf_config, "dspark_target_layer_ids", None
     )
+    if prefixed_target_layer_ids is None:
+        prefixed_target_layer_ids = _cfg_get(
+            text_config, "dspark_target_layer_ids", None
+        )
     uses_prefixed = any(
         value is not None
         for value in (
@@ -181,18 +232,8 @@ def parse_dspark_draft_config(*, draft_hf_config: Any) -> DSparkDraftConfig:
         int(prefixed_block_size) if prefixed_block_size is not None else base.block_size
     )
 
-    if prefixed_target_layer_ids is not None:
-        if not isinstance(prefixed_target_layer_ids, (list, tuple)) or not len(
-            prefixed_target_layer_ids
-        ):
-            raise ValueError(
-                "DSpark dspark_target_layer_ids must be a non-empty list of ints, "
-                f"got {prefixed_target_layer_ids!r}."
-            )
-        target_layer_ids: Optional[List[int]] = [
-            int(x) for x in prefixed_target_layer_ids
-        ]
-    else:
+    target_layer_ids = get_dspark_target_layer_ids(draft_hf_config)
+    if target_layer_ids is None:
         target_layer_ids = base.target_layer_ids
 
     return DSparkDraftConfig(

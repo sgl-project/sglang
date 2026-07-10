@@ -1095,6 +1095,21 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         self.tree_cache.dec_lock_ref(decode_req.req.last_node)
                     break
                 dspark_hidden_pp_slices = pp_slices
+                logger.info(
+                    "Prepared DSpark PD hidden receive rows: rid=%s, "
+                    "target_layer_ids=%s, hidden_len=%s, pp_slices=%s",
+                    decode_req.req.rid,
+                    target_layer_ids,
+                    dspark_hidden_len,
+                    {
+                        int(pp_rank): {
+                            "layer_ids": pp_slice.get("layer_ids", []),
+                            "slice_start": pp_slice.get("slice_start", 0),
+                            "slice_len": pp_slice.get("slice_len", 0),
+                        }
+                        for pp_rank, pp_slice in pp_slices.items()
+                    },
+                )
                 if pp_size == 1:
                     dspark_hidden_dst_indices = dspark_hidden_dst_indices_by_pp.get(0)
 
@@ -1827,7 +1842,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 if dspark_pool is None:
                     raise RuntimeError("DSpark hidden row pool disappeared on decode.")
                 pp_slices = decode_req.dspark_hidden_pp_slices or {}
-                hidden_len = len(next(iter(decode_req.dspark_hidden_dst_indices_by_pp.values())))
+                hidden_len = len(
+                    next(iter(decode_req.dspark_hidden_dst_indices_by_pp.values()))
+                )
                 full_hidden_size = sum(
                     int(pp_slice.get("slice_len", 0)) for pp_slice in pp_slices.values()
                 )
@@ -1836,7 +1853,10 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     dtype=dspark_pool.dtype,
                     device="cpu",
                 )
-                for pp_rank, dst_indices in decode_req.dspark_hidden_dst_indices_by_pp.items():
+                for (
+                    pp_rank,
+                    dst_indices,
+                ) in decode_req.dspark_hidden_dst_indices_by_pp.items():
                     pp_slice = pp_slices.get(pp_rank) or pp_slices.get(str(pp_rank))
                     if not pp_slice:
                         continue
@@ -1846,13 +1866,23 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                         continue
                     slice_hidden = dspark_pool.read(dst_indices)[:, :slice_len]
                     hidden[:, slice_start : slice_start + slice_len].copy_(slice_hidden)
+                received_target_layer_ids = []
+                pp_slice_summary = {}
+                for pp_rank, pp_slice in pp_slices.items():
+                    layer_ids = [int(x) for x in pp_slice.get("layer_ids", [])]
+                    received_target_layer_ids.extend(layer_ids)
+                    pp_slice_summary[int(pp_rank)] = {
+                        "layer_ids": layer_ids,
+                        "slice_len": int(pp_slice.get("slice_len", 0)),
+                    }
                 logger.info(
                     "DSpark PD hidden received on decode: "
                     f"rid={decode_req.req.rid}, "
                     f"bootstrap_room={decode_req.req.bootstrap_room}, "
                     f"hidden_shape={tuple(hidden.shape)}, "
                     f"hidden_start={decode_req.dspark_hidden_start}, "
-                    f"pp_slices={sorted(int(x) for x in decode_req.dspark_hidden_dst_indices_by_pp.keys())}, "
+                    f"target_layer_ids={received_target_layer_ids}, "
+                    f"pp_slices={pp_slice_summary}, "
                     f"row_count={hidden_len}"
                 )
                 decode_req.req.prefill_tail_hidden_states_tensor = hidden

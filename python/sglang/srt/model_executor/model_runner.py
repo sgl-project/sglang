@@ -508,6 +508,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
             if self.spec_algorithm.is_dspark():
                 from sglang.srt.speculative.dspark_components.dspark_utils import (
+                    get_dspark_target_layer_ids,
                     parse_dspark_draft_config,
                 )
 
@@ -521,6 +522,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     )
                 if dspark_draft_config.target_layer_ids is not None:
                     target_layer_ids = list(dspark_draft_config.target_layer_ids)
+                explicit_dspark_layer_ids = get_dspark_target_layer_ids(
+                    draft_model_config.hf_config
+                )
+                if explicit_dspark_layer_ids is not None:
+                    target_layer_ids = explicit_dspark_layer_ids
+                logger.info(
+                    "Resolved DSpark target hidden layers: target_layer_ids=%s, "
+                    "gamma=%s, markov_rank=%s",
+                    target_layer_ids,
+                    dspark_draft_config.gamma,
+                    dspark_draft_config.markov_rank,
+                )
 
             self.dflash_or_dspark_use_aux_hidden_state = True
             self.dflash_or_dspark_draft_num_layers = int(draft_num_layers)
