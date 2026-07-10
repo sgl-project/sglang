@@ -1,6 +1,6 @@
 """Correctness tests for the fused TRTLLM-MLA cuda-graph metadata kernel.
 
-Validates the single-launch triton kernel against the pre-fusion reference
+Validates the single-launch triton kernel against an unfused reference
 pipeline (aten ``seq_lens + offset`` -> ``seq_lens_k`` build plus
 ``create_flashmla_kv_indices_triton``), and pins the init-hook contract: the
 metadata rebuild is recorded inside the captured graph
@@ -143,12 +143,20 @@ class TestTRTLLMMLAGraphMetadataHooks(CustomTestCase):
 
 @unittest.skipIf(not torch.cuda.is_available(), "CUDA required")
 class TestTRTLLMMLAGraphMetadataKernel(CustomTestCase):
-    """Fused kernel must bit-match the pre-fusion reference pipeline."""
+    """Fused kernel must bit-match the unfused reference pipeline."""
 
-    def _run_parity_case(self, bs, page_size, seqlen_offset, with_seq_lens_k, seed):
+    def _run_parity_case(
+        self,
+        bs,
+        page_size,
+        seqlen_offset,
+        with_seq_lens_k,
+        seed,
+        pool_size=8,
+        max_context_len=2048,
+        seq_lens=None,
+    ):
         g = torch.Generator(device="cpu").manual_seed(seed)
-        pool_size = 8
-        max_context_len = 2048
         req_to_token = torch.randint(
             0,
             pool_size * max_context_len,
@@ -159,9 +167,15 @@ class TestTRTLLMMLAGraphMetadataKernel(CustomTestCase):
         req_pool_indices = torch.randperm(pool_size, generator=g)[:bs].to(
             DEVICE, dtype=torch.int64
         )
-        seq_lens = torch.randint(
-            1, max_context_len - seqlen_offset, (bs,), generator=g, dtype=torch.int64
-        ).to(DEVICE)
+        if seq_lens is None:
+            seq_lens = torch.randint(
+                1,
+                max_context_len - seqlen_offset,
+                (bs,),
+                generator=g,
+                dtype=torch.int64,
+            )
+        seq_lens = seq_lens.to(DEVICE)
 
         max_blocks = max_context_len // page_size
         block_kv_indices = torch.full(
@@ -188,8 +202,8 @@ class TestTRTLLMMLAGraphMetadataKernel(CustomTestCase):
             seq_lens_k=seq_lens_k,
         )
 
-        # Pre-fusion reference: aten seq_lens_k build + the original
-        # kv-indices kernel fed with the already-offset lens.
+        # Unfused reference: aten seq_lens_k build + kv-indices kernel fed
+        # with the already-offset lens.
         seq_lens_k_ref = (seq_lens + seqlen_offset).to(torch.int32)
         create_flashmla_kv_indices_triton[
             (bs, get_num_kv_index_blocks_flashmla(max_blocks, page_size))
@@ -233,6 +247,36 @@ class TestTRTLLMMLAGraphMetadataKernel(CustomTestCase):
                                 + seqlen_offset * 7
                                 + int(with_seq_lens_k),
                             )
+
+    def test_large_seqlen_coverage(self):
+        """~1M-token sequences (15k+ pages per row, hundreds of CTAs per row)
+        to catch narrow-int overflow in the page/row index arithmetic."""
+        max_context_len = 1_000_064
+        self._run_parity_case(
+            bs=2,
+            page_size=64,
+            seqlen_offset=4,
+            with_seq_lens_k=True,
+            seed=7,
+            pool_size=2,
+            max_context_len=max_context_len,
+            seq_lens=torch.tensor([1_000_000, 999_983], dtype=torch.int64),
+        )
+
+    def test_large_batch_coverage(self):
+        """16k-request batch to catch grid-axis-0 / row-stride issues."""
+        bs = 16 * 1024
+        seq_lens = torch.arange(bs, dtype=torch.int64) % 257 + 1
+        self._run_parity_case(
+            bs=bs,
+            page_size=32,
+            seqlen_offset=2,
+            with_seq_lens_k=True,
+            seed=8,
+            pool_size=bs,
+            max_context_len=512,
+            seq_lens=seq_lens,
+        )
 
     def test_metadata_update_records_inside_cuda_graph(self):
         """The in-graph hook body must be graph-recordable: replaying the
