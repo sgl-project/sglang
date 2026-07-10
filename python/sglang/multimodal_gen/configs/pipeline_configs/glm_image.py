@@ -48,6 +48,9 @@ class GlmImagePipelineConfig(SpatialImagePipelineConfig):
         self.vae_scale_factor = self.vae_config.get_vae_scale_factor()
         self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor)
 
+    def supports_dynamic_batching(self):
+        return True
+
     def get_freqs_cis(self, batch, device, rotary_emb, dtype):
         height = batch.height // self.vae_scale_factor
         width = batch.width // self.vae_scale_factor
@@ -65,6 +68,11 @@ class GlmImagePipelineConfig(SpatialImagePipelineConfig):
             "target_size": batch.target_size,
             "freqs_cis": self.get_freqs_cis(batch, device, rotary_emb, dtype),
         }
+        if (
+            batch.prompt_embeds_mask is not None
+            and batch.prompt_embeds_mask[0] is not None
+        ):
+            kwargs["attention_mask"] = batch.prompt_embeds_mask[0]
         if getattr(batch, "prior_token_image_ids", None) is not None:
             kwargs["kv_caches"] = batch.kv_caches
             kwargs["kv_caches_mode"] = "read"
@@ -78,6 +86,11 @@ class GlmImagePipelineConfig(SpatialImagePipelineConfig):
             "target_size": batch.target_size,
             "freqs_cis": self.get_freqs_cis(batch, device, rotary_emb, dtype),
         }
+        if (
+            batch.negative_prompt_embeds_mask is not None
+            and batch.negative_prompt_embeds_mask[0] is not None
+        ):
+            kwargs["attention_mask"] = batch.negative_prompt_embeds_mask[0]
         if getattr(batch, "prior_token_image_ids", None) is not None:
             kwargs["kv_caches"] = batch.kv_caches
             kwargs["kv_caches_mode"] = "skip"

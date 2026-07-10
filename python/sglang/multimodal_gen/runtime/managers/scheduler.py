@@ -299,6 +299,9 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                         error_msg=output_batch.error,
                     )
 
+                if self.gpu_id != 0:
+                    return [OutputBatch() for _ in reqs]
+
                 split_outputs = self._split_batched_output(output_batch, reqs)
                 if split_outputs is None:
                     logger.error(

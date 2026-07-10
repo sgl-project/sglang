@@ -549,8 +549,23 @@ class GlmImageAttention(torch.nn.Module):
             assert (
                 text_attn_mask.dim() == 2
             ), "the shape of text_attn_mask should be (batch_size, text_seq_length)"
+            assert text_attn_mask.shape == (
+                batch_size,
+                text_seq_length,
+            ), "the shape of text_attn_mask should match the text hidden states"
+            image_attn_mask = torch.ones(
+                batch_size,
+                image_seq_length,
+                dtype=text_attn_mask.dtype,
+                device=text_attn_mask.device,
+            )
+            attention_mask = torch.cat([text_attn_mask, image_attn_mask], dim=1)
         hidden_states = self.attn(
-            query, key, value, num_replicated_prefix=text_seq_length
+            query,
+            key,
+            value,
+            attn_mask=attention_mask,
+            num_replicated_prefix=text_seq_length,
         )
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.to(query.dtype)
@@ -620,7 +635,7 @@ class GlmImageTransformerBlock(nn.Module):
                 List[Tuple[torch.Tensor, torch.Tensor]],
             ]
         ] = None,
-        attention_mask: Optional[Dict[str, torch.Tensor]] = None,
+        attention_mask: Optional[torch.Tensor] = None,
         attention_kwargs: Optional[Dict[str, Any]] = None,
         kv_cache: Optional[GlmImageLayerKVCache] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -908,10 +923,49 @@ class GlmImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
 
         batch_size, num_channels, height, width = hidden_states.shape
 
-        timestep = timestep - 1.0
-
         if isinstance(encoder_hidden_states, list):
             encoder_hidden_states = encoder_hidden_states[0]
+
+        if current_platform.is_npu() and batch_size > 1 and kv_caches is None:
+
+            def slice_batch(value, index):
+                if (
+                    isinstance(value, torch.Tensor)
+                    and value.dim() > 0
+                    and value.shape[0] == batch_size
+                ):
+                    return value[index : index + 1]
+                return value
+
+            outputs = []
+            for index in range(batch_size):
+                sample_encoder_hidden_states = encoder_hidden_states[index : index + 1]
+                sample_attention_mask = slice_batch(attention_mask, index)
+                if isinstance(sample_attention_mask, torch.Tensor):
+                    valid_text_length = int(sample_attention_mask.sum().item())
+                    sample_encoder_hidden_states = sample_encoder_hidden_states[
+                        :, :valid_text_length
+                    ]
+                    sample_attention_mask = None
+
+                outputs.append(
+                    self.forward(
+                        hidden_states=hidden_states[index : index + 1],
+                        encoder_hidden_states=sample_encoder_hidden_states,
+                        prior_token_id=prior_token_id[index : index + 1],
+                        prior_token_drop=prior_token_drop[index : index + 1],
+                        timestep=slice_batch(timestep, index),
+                        target_size=slice_batch(target_size, index),
+                        crop_coords=slice_batch(crop_coords, index),
+                        attention_kwargs=attention_kwargs,
+                        attention_mask=sample_attention_mask,
+                        freqs_cis=freqs_cis,
+                        guidance=slice_batch(guidance, index),
+                    )
+                )
+            return torch.cat(outputs, dim=0)
+
+        timestep = timestep - 1.0
 
         # 1. RoPE
         image_rotary_emb = freqs_cis

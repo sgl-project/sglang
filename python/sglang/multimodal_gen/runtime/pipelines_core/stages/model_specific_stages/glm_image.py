@@ -9,6 +9,7 @@ import requests
 import torch
 from diffusers.image_processor import VaeImageProcessor
 from diffusers.utils.torch_utils import randn_tensor
+from torch.nn.utils.rnn import pad_sequence
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
@@ -126,6 +127,37 @@ def pooled_image_features_to_tensor(image_features) -> torch.Tensor:
     return torch.cat(tuple(image_features), dim=0)
 
 
+def _expand_prompts_and_seeds(batch: Req) -> tuple[list[str], list[int]]:
+    prompts = batch.prompt if isinstance(batch.prompt, list) else [batch.prompt]
+    num_outputs = int(batch.num_outputs_per_prompt)
+    dynamic_seeds = batch.extra.get("dynamic_batch_seeds")
+
+    if dynamic_seeds is not None:
+        if len(dynamic_seeds) != len(prompts):
+            raise ValueError("dynamic_batch_seeds must contain one seed per prompt")
+        base_seeds = [int(seed) for seed in dynamic_seeds]
+    elif isinstance(batch.seed, list):
+        if len(prompts) != 1 or len(batch.seed) != num_outputs:
+            raise ValueError(
+                "seed list must contain one seed per output for a single prompt"
+            )
+        return [prompts[0]] * num_outputs, [int(seed) for seed in batch.seed]
+    else:
+        base_seed = int(batch.seed)
+        base_seeds = [
+            base_seed + prompt_index * num_outputs
+            for prompt_index in range(len(prompts))
+        ]
+
+    expanded_prompts = []
+    expanded_seeds = []
+    for prompt, base_seed in zip(prompts, base_seeds, strict=True):
+        for output_index in range(num_outputs):
+            expanded_prompts.append(prompt)
+            expanded_seeds.append(base_seed + output_index)
+    return expanded_prompts, expanded_seeds
+
+
 class GlmImageAR(PipelineStage):
     r"""
     Pipeline for text-to-image generation using GLM-Image.
@@ -195,6 +227,7 @@ class GlmImageAR(PipelineStage):
         server_args: ServerArgs,
         image: Optional[List[PIL.Image.Image]] = None,
         factor: int = 32,
+        seed: Optional[int] = None,
     ) -> Tuple[torch.Tensor, int, int]:
         """
         Generate prior tokens using the AR (vision_language_encoder) model.
@@ -258,6 +291,7 @@ class GlmImageAR(PipelineStage):
                     "temperature": 1.0,
                     "max_new_tokens": max_new_tokens,
                     "ignore_eos": True,
+                    "sampling_seed": seed,
                 },
             }
             try:
@@ -361,6 +395,111 @@ class GlmImageAR(PipelineStage):
 
         return prior_token_ids, prior_token_image_ids
 
+    def generate_prior_tokens_batch(
+        self,
+        prompts: list[str],
+        seeds: list[int],
+        height: int,
+        width: int,
+        server_args: ServerArgs,
+        factor: int = 32,
+    ) -> list[torch.Tensor]:
+        device = get_local_torch_device()
+        height = (height // factor) * factor
+        width = (width // factor) * factor
+
+        input_ids = []
+        image_data = []
+        sampling_params = []
+        generation_shapes = []
+        for prompt, seed in zip(prompts, seeds, strict=True):
+            messages = [
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": prompt}],
+                }
+            ]
+            inputs = self.processor.apply_chat_template(
+                messages,
+                tokenize=True,
+                target_h=height,
+                target_w=width,
+                return_dict=True,
+                return_tensors="pt",
+            ).to(device)
+            image_grid_thw = inputs.get("image_grid_thw")
+            max_new_tokens, large_image_offset, token_h, token_w = (
+                self._compute_generation_params(
+                    image_grid_thw=image_grid_thw,
+                    is_text_to_image=True,
+                )
+            )
+            input_ids.append(inputs["input_ids"][0].tolist())
+            image_data.append([{"image_grid_thw": image_grid_thw.tolist()}])
+            sampling_params.append(
+                {
+                    "temperature": 1.0,
+                    "max_new_tokens": max_new_tokens,
+                    "ignore_eos": True,
+                    "sampling_seed": int(seed),
+                }
+            )
+            generation_shapes.append((large_image_offset, token_h, token_w))
+
+        payload = {
+            "input_ids": input_ids,
+            "image_data": image_data,
+            "sampling_params": sampling_params,
+        }
+        try:
+            response = requests.post(
+                server_args.srt_encoder_url + "/generate",
+                json=payload,
+                timeout=(
+                    server_args.srt_encoder_connect_timeout,
+                    server_args.srt_encoder_timeout,
+                ),
+            )
+            response.raise_for_status()
+        except requests.RequestException as e:
+            logger.error(
+                "GLM-Image batched AR request to %s failed: %s",
+                server_args.srt_encoder_url,
+                e,
+            )
+            raise
+
+        data = response.json()
+        if not isinstance(data, list) or len(data) != len(prompts):
+            raise RuntimeError(
+                "GLM-Image AR batch returned an unexpected response: "
+                f"expected {len(prompts)} outputs, got "
+                f"{len(data) if isinstance(data, list) else type(data).__name__}."
+            )
+
+        prior_token_ids = []
+        for item, (large_image_offset, token_h, token_w) in zip(
+            data, generation_shapes, strict=True
+        ):
+            generated_ids = item.get("output_ids")
+            expected_output_len = large_image_offset + token_h * token_w
+            actual_output_len = 0 if generated_ids is None else len(generated_ids)
+            if actual_output_len < expected_output_len:
+                raise RuntimeError(
+                    "GLM-Image AR returned too few output_ids: "
+                    f"got {actual_output_len}, need at least {expected_output_len}."
+                )
+            prior_token_ids_d32 = torch.tensor(
+                generated_ids[
+                    large_image_offset : large_image_offset + token_h * token_w
+                ],
+                device=device,
+            )
+            prior_token_ids.append(
+                self._upsample_token_ids(prior_token_ids_d32, token_h, token_w)
+            )
+        return prior_token_ids
+
     @torch.no_grad()
     def forward(
         self,
@@ -368,7 +507,7 @@ class GlmImageAR(PipelineStage):
         server_args: ServerArgs,
     ) -> Req:
 
-        prompt = batch.prompt
+        prompts, seeds = _expand_prompts_and_seeds(batch)
         height = batch.height
         width = batch.width
         if batch.image_path is not None:
@@ -386,29 +525,49 @@ class GlmImageAR(PipelineStage):
             width = width or ar_condition_images[0].width
 
         time_start = time.time()
-        seed = getattr(batch, "seed", None)
-        if seed is None:
-            prior_token_id, prior_token_image_ids = self.generate_prior_tokens(
-                prompt=prompt,
-                image=ar_condition_images,
+        if server_args.srt_encoder_url is not None and ar_condition_images is None:
+            prior_token_ids = self.generate_prior_tokens_batch(
+                prompts=prompts,
+                seeds=seeds,
                 height=height,
                 width=width,
                 server_args=server_args,
             )
+            prior_token_image_ids = [None] * len(prior_token_ids)
         else:
-            rng_devices = []
-            if device.type == "cuda":
-                rng_devices.append(torch.cuda.current_device())
-            with torch.random.fork_rng(devices=rng_devices, enabled=True):
-                torch.manual_seed(int(seed))
-                prior_token_id, prior_token_image_ids = self.generate_prior_tokens(
-                    prompt=prompt,
-                    image=ar_condition_images,
-                    height=height,
-                    width=width,
-                    server_args=server_args,
-                )
-        prior_token_id = prior_token_id.to(device=device)
+            prior_token_ids = []
+            prior_token_image_ids = []
+            for prompt, seed in zip(prompts, seeds, strict=True):
+                if seed is None:
+                    prior_token_id, image_token_ids = self.generate_prior_tokens(
+                        prompt=prompt,
+                        image=ar_condition_images,
+                        height=height,
+                        width=width,
+                        server_args=server_args,
+                    )
+                else:
+                    rng_devices = []
+                    if device.type == "cuda":
+                        rng_devices.append(torch.cuda.current_device())
+                    with torch.random.fork_rng(devices=rng_devices, enabled=True):
+                        torch.manual_seed(int(seed))
+                        prior_token_id, image_token_ids = self.generate_prior_tokens(
+                            prompt=prompt,
+                            image=ar_condition_images,
+                            height=height,
+                            width=width,
+                            server_args=server_args,
+                            seed=seed,
+                        )
+                prior_token_ids.append(prior_token_id)
+                prior_token_image_ids.append(image_token_ids)
+
+        prior_token_id = torch.cat(prior_token_ids, dim=0).to(device=device)
+        if all(item is None for item in prior_token_image_ids):
+            prior_token_image_ids = None
+        elif len(prior_token_image_ids) == 1:
+            prior_token_image_ids = prior_token_image_ids[0]
         time_end = time.time()
         logger.info(f"generate_prior_tokens time: {time_end - time_start}")
 
@@ -506,36 +665,59 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
         device = device or self._execution_device
         dtype = dtype or self.text_encoder.dtype
 
-        glyph_texts = self.get_glyph_texts(prompt)
-        input_ids = self.tokenizer(
-            glyph_texts if len(glyph_texts) > 0 else [""],
-            max_length=max_sequence_length,
-            truncation=True,
-        ).input_ids
-        input_ids = [
-            [self.tokenizer.pad_token_id] * ((len(input_ids) + 1) % 2) + input_ids_
-            for input_ids_ in input_ids
-        ]
-        max_length = max(len(input_ids_) for input_ids_ in input_ids)
+        prompts = [prompt] if isinstance(prompt, str) else prompt
+        all_input_ids = []
+        glyph_counts = []
+        for prompt_item in prompts:
+            glyph_texts = self.get_glyph_texts(prompt_item)
+            input_ids = self.tokenizer(
+                glyph_texts if len(glyph_texts) > 0 else [""],
+                max_length=max_sequence_length,
+                truncation=True,
+            ).input_ids
+            input_ids = [
+                [self.tokenizer.pad_token_id] * ((len(input_ids) + 1) % 2) + input_ids_
+                for input_ids_ in input_ids
+            ]
+            glyph_counts.append(len(input_ids))
+            all_input_ids.extend(input_ids)
+
+        padded_length = max(len(input_ids) for input_ids in all_input_ids)
         attention_mask = torch.tensor(
             [
-                [1] * len(input_ids_) + [0] * (max_length - len(input_ids_))
-                for input_ids_ in input_ids
+                [1] * len(input_ids) + [0] * (padded_length - len(input_ids))
+                for input_ids in all_input_ids
             ],
             device=device,
         )
         input_ids = torch.tensor(
             [
-                input_ids_
-                + [self.tokenizer.pad_token_id] * (max_length - len(input_ids_))
-                for input_ids_ in input_ids
+                input_ids
+                + [self.tokenizer.pad_token_id] * (padded_length - len(input_ids))
+                for input_ids in all_input_ids
             ],
             device=device,
         )
         outputs = self.text_encoder(input_ids, attention_mask=attention_mask)
-        glyph_embeds = outputs.last_hidden_state[attention_mask.bool()].unsqueeze(0)
 
-        return glyph_embeds.to(device=device, dtype=dtype)
+        glyph_embeds = []
+        start = 0
+        for glyph_count in glyph_counts:
+            end = start + glyph_count
+            glyph_embeds.append(
+                outputs.last_hidden_state[start:end][attention_mask[start:end].bool()]
+            )
+            start = end
+
+        prompt_embeds = pad_sequence(glyph_embeds, batch_first=True)
+        sequence_lengths = [item.shape[0] for item in glyph_embeds]
+        prompt_embeds_mask = None
+        if len(set(sequence_lengths)) > 1:
+            sequence_lengths_tensor = torch.tensor(sequence_lengths, device=device)
+            prompt_embeds_mask = torch.arange(
+                prompt_embeds.shape[1], device=device
+            ).unsqueeze(0) < sequence_lengths_tensor.unsqueeze(1)
+        return prompt_embeds.to(device=device, dtype=dtype), prompt_embeds_mask
 
     def encode_prompt(
         self,
@@ -573,15 +755,18 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
             batch_size = prompt_embeds.shape[0]
 
         if prompt_embeds is None:
-            prompt_embeds = self._get_glyph_embeds(
+            prompt_embeds, prompt_embeds_mask = self._get_glyph_embeds(
                 prompt, max_sequence_length, device, dtype
             )
-
-        seq_len = prompt_embeds.size(1)
-        prompt_embeds = prompt_embeds.repeat(1, 1, 1)
-        prompt_embeds = prompt_embeds.view(1, seq_len, -1)
+        else:
+            prompt_embeds_mask = torch.ones(
+                prompt_embeds.shape[:2],
+                device=prompt_embeds.device,
+                dtype=torch.bool,
+            )
 
         negative_prompt_embeds = None
+        negative_prompt_embeds_mask = None
         if do_classifier_free_guidance:
             negative_prompt = ""
             negative_prompt = (
@@ -602,15 +787,18 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
                     " the batch size of `prompt`."
                 )
 
-            negative_prompt_embeds = self._get_glyph_embeds(
-                negative_prompt, max_sequence_length, device, dtype
+            negative_prompt_embeds, negative_prompt_embeds_mask = (
+                self._get_glyph_embeds(
+                    negative_prompt, max_sequence_length, device, dtype
+                )
             )
 
-            seq_len = negative_prompt_embeds.size(1)
-            negative_prompt_embeds = negative_prompt_embeds.repeat(1, 1, 1)
-            negative_prompt_embeds = negative_prompt_embeds.view(1, seq_len, -1)
-
-        return prompt_embeds, negative_prompt_embeds
+        return (
+            prompt_embeds,
+            negative_prompt_embeds,
+            prompt_embeds_mask,
+            negative_prompt_embeds_mask,
+        )
 
     def prepare_latents(
         self,
@@ -712,7 +900,8 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
     ) -> Req:
 
         guidance_scale = batch.guidance_scale
-        prompt = batch.prompt
+        prompts, seeds = _expand_prompts_and_seeds(batch)
+        batch_size = len(prompts)
         num_inference_steps = batch.num_inference_steps
         if batch.image_path is not None:
             ar_condition_images = [
@@ -727,7 +916,7 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
 
         device = get_local_torch_device()
         max_sequence_length = 1024
-        generator = torch.Generator(device=device).manual_seed(batch.seed)
+        generator = [torch.Generator(device=device).manual_seed(seed) for seed in seeds]
         attention_kwargs = {}
         prompt_embeds = None
         do_classifier_free_guidance = True
@@ -746,8 +935,13 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
         prior_token_id = prior_token_id.to(device)
 
         # 3. Encode input prompt
-        prompt_embeds, negative_prompt_embeds = self.encode_prompt(
-            prompt,
+        (
+            prompt_embeds,
+            negative_prompt_embeds,
+            prompt_embeds_mask,
+            negative_prompt_embeds_mask,
+        ) = self.encode_prompt(
+            prompts,
             do_classifier_free_guidance,
             prompt_embeds=prompt_embeds,
             max_sequence_length=max_sequence_length,
@@ -776,7 +970,7 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
         # 5. Prepare latents and (optional) condition_images kv cache
         latent_channels = self.transformer.config.in_channels
         latents = self.prepare_latents(
-            batch_size=1,
+            batch_size=batch_size,
             num_channels_latents=latent_channels,
             height=height,
             width=width,
@@ -846,10 +1040,14 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
         # 6. Prepare additional timestep conditions
         target_size = (height, width)
         target_size = torch.tensor(
-            [target_size], dtype=prompt_embeds.dtype, device=device
+            [target_size] * batch_size,
+            dtype=prompt_embeds.dtype,
+            device=device,
         )
         crops_coords_top_left = torch.tensor(
-            [(0, 0)], dtype=prompt_embeds.dtype, device=device
+            [(0, 0)] * batch_size,
+            dtype=prompt_embeds.dtype,
+            device=device,
         )
 
         # Prepare timesteps
@@ -877,6 +1075,8 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
 
         batch.prompt_embeds = [prompt_embeds]
         batch.negative_prompt_embeds = [negative_prompt_embeds]
+        batch.prompt_embeds_mask = [prompt_embeds_mask]
+        batch.negative_prompt_embeds_mask = [negative_prompt_embeds_mask]
         batch.latents = latents
         batch.timesteps = timesteps
         batch.scheduler = scheduler
