@@ -6,6 +6,7 @@ from typing import NamedTuple, Optional, Tuple
 import torch
 import torch.distributed as dist
 
+from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.dp_attention import (
     get_attention_dp_size,
@@ -25,7 +26,6 @@ from sglang.srt.layers.moe.utils import (
     DeepEPOutputDtype,
     get_deepep_output_dtype,
 )
-from sglang.srt.environ import envs
 
 # Block size used by pplx-kernels for FP8 block-wise scales, matching the
 # DeepSeek / DeepGEMM block quantization convention.
@@ -38,14 +38,6 @@ try:
     use_pplx = True
 except ImportError:
     use_pplx = False
-
-
-# ------------------------------ Dispatch / Combine formats ------------------
-#
-# pplx-kernels dispatch produces per-expert masked/batched tensors, which are
-# semantically identical to DeepEP's low-latency ("LL") format. We therefore
-# reuse DEEPEP_LL so the existing masked expert-compute + combine path
-# (DeepEPMoE / moe_runner) handles pplx with no new permute registration.
 
 
 class PplxDispatchOutput(NamedTuple):
@@ -81,20 +73,9 @@ class PplxCombineInput(NamedTuple):
 assert isinstance(PplxCombineInput, CombineInput)
 
 
-# ------------------------------ NVSHMEM / AllToAll manager ------------------
-
-
 class PplxAllToAllManager:
-    """Process-wide owner of NVSHMEM init and the pplx-kernels ``AllToAll``.
-
-    Analogous to ``DeepEPBuffer`` / ``EPBuffer``: it is a lazily-initialized
-    singleton so the (expensive) NVSHMEM symmetric-memory workspace is
-    allocated exactly once per process, keyed by the dispatch dtype (bf16 vs
-    fp8-block-scale, which changes ``hidden_dim_scale_bytes``).
-    """
-
     _nvshmem_initialized = False
-    _all_to_all: Optional["AllToAll"] = None
+    _all_to_all: Optional[AllToAll] = None
     _key: Optional[tuple] = None
     _group_name: Optional[str] = None
     _combined_group: Optional[dist.ProcessGroup] = None
@@ -122,17 +103,6 @@ class PplxAllToAllManager:
 
     @classmethod
     def _register_group(cls, group: dist.ProcessGroup) -> str:
-        """Register a combined-backend EP group with c10d and return its name.
-
-        The pplx intranode kernel resolves the process group by name via
-        ``c10d::resolve_process_group`` and drives ``alltoall_base`` on it to
-        exchange CUDA IPC handles (CPU tensors) as well as device data. It
-        therefore needs a single group carrying BOTH a CPU (gloo) and a CUDA
-        (nccl) backend. SGLang's EP ``device_group`` is nccl-only, so we build
-        a fresh ``cpu:gloo,cuda:nccl`` group over the same ranks and register
-        that. Must be called collectively by all ranks of the enclosing world
-        group (``new_group`` is a collective).
-        """
         if cls._group_name is not None:
             return cls._group_name
         ranks = dist.get_process_group_ranks(group)
@@ -155,7 +125,9 @@ class PplxAllToAllManager:
         before any starts layer K+1.
         """
         if cls._combined_group is not None:
-            dist.barrier(group=cls._combined_group, device_ids=[torch.cuda.current_device()])
+            dist.barrier(
+                group=cls._combined_group, device_ids=[torch.cuda.current_device()]
+            )
 
     @classmethod
     def get_all_to_all(
@@ -167,7 +139,7 @@ class PplxAllToAllManager:
         hidden_dim: int,
         hidden_dim_bytes: int,
         hidden_dim_scale_bytes: int,
-    ) -> "AllToAll":
+    ) -> AllToAll:
         world_size = group.size()
         rank = group.rank()
         # pplx dpSize == number of ranks per DP group == attention TP size.
@@ -227,9 +199,6 @@ class PplxAllToAllManager:
         return cls._all_to_all
 
 
-# ------------------------------ Dispatcher implementation -------------------
-
-
 class _PplxEPDispatcherImpl:
     def __init__(
         self,
@@ -265,7 +234,6 @@ class _PplxEPDispatcherImpl:
             envs.SGLANG_PPLX_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
         )
 
-        # Resolved lazily from the quant config (see set_dispatch_dtype).
         self.quant_config: dict = {}
         self.use_fp8 = False
         self.set_dispatch_dtype()
@@ -291,7 +259,7 @@ class _PplxEPDispatcherImpl:
             * torch.float32.itemsize
         )
 
-    def _get_all_to_all(self) -> "AllToAll":
+    def _get_all_to_all(self) -> AllToAll:
         itemsize = 1 if self.use_fp8 else self.params_bytes
         return PplxAllToAllManager.get_all_to_all(
             group=self.group,
@@ -356,9 +324,6 @@ class _PplxEPDispatcherImpl:
                 device=device,
             )
 
-        # bound_m carries the token count. Build it with torch.full (a
-        # scalar-fill kernel) rather than torch.tensor([...]) so it is
-        # CUDA-graph-capturable (a host->device copy of a Python list is not).
         bound_m = torch.full((1,), num_tokens, dtype=torch.uint32, device=device)
         indices = topk_ids.to(torch.uint32)
 
@@ -432,7 +397,6 @@ class _PplxEPDispatcherImpl:
             expert_y=hidden_states,
             bound_m=bound_m,
         )
-        # pplx.combine applies routing weights internally; slice to real tokens.
         return (out_tokens[:num_tokens],)
 
     def combine_b(self, hidden_states):
@@ -441,14 +405,7 @@ class _PplxEPDispatcherImpl:
     def set_quant_config(self, quant_config: dict) -> None:
         self.quant_config = quant_config
         self.set_dispatch_dtype()
-        # Build the NVSHMEM workspace eagerly (during weight post-processing,
-        # in eager mode) so nvshmem_init's CPU collectives do not run inside
-        # CUDA graph capture, which fails with "No backend type associated with
-        # device type cpu". The dispatch dtype is now known.
         self._get_all_to_all()
-
-
-# ------------------------------ Public dispatcher ---------------------------
 
 
 class _Stage(Enum):
@@ -461,9 +418,8 @@ class _Stage(Enum):
 class PplxEPDispatcher(BaseDispatcher):
     """MoE all-to-all dispatcher backed by Perplexity's pplx-kernels.
 
-    Low-latency (masked) only, mirroring ``MooncakeEPDispatcher``. Emits the
-    DEEPEP_LL dispatch/combine format so the existing masked expert-compute
-    path is reused unchanged.
+    Reuse the DEEPEP_LL dispatch/combine format so the existing masked
+    expert-compute path is unchanged.
     """
 
     def __init__(
