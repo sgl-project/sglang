@@ -35,7 +35,6 @@ if _HAS_MLX:
         MlxAuxiliaryStateReqToTokenPool,
         MlxModelCacheLayout,
         find_attention_layers,
-        is_attention_module,
         patch_model_attention,
     )
     from sglang.srt.hardware_backend.mlx.model_runner import (
@@ -156,9 +155,6 @@ class TestMlxAttentionPatching(unittest.TestCase):
         self.assertFalse(isinstance(model.layers[0].linear_attn, MLXAttentionWrapper))
         self.assertIsInstance(model.layers[1].self_attn, MLXAttentionWrapper)
 
-    def test_projection_only_mixer_is_not_attention(self):
-        self.assertFalse(is_attention_module(ProjectionOnlyMixer()))
-
     def test_cache_layout_separates_attention_and_auxiliary_layers(self):
         layout = MlxModelCacheLayout.from_attention_discovery(
             [object(), object(), object(), object()],
@@ -189,6 +185,31 @@ class TestMlxAttentionPatching(unittest.TestCase):
 
         self.assertEqual(out.shape, (1, 1, 4))
         self.assertEqual(inner.o_proj.last_input_shape, (1, 1, 4))
+
+    def test_write_token_grows_buffer_past_max_seq_len(self):
+        max_seq_len = 4
+        cache = ContiguousAttentionKVCache(
+            n_kv_heads=1, head_dim=2, max_seq_len=max_seq_len, dtype=mx.float32
+        )
+        n_tokens = max_seq_len * 2 + 1  # force at least one grow past the boundary
+
+        for t in range(n_tokens):
+            k = mx.full((1, 1, 1, 2), t, dtype=mx.float32)
+            v = mx.full((1, 1, 1, 2), -t, dtype=mx.float32)
+            cache.write_token(k, v)
+
+        self.assertEqual(cache.offset, n_tokens)
+        self.assertGreaterEqual(cache.max_seq_len, n_tokens)
+
+        keys, values = cache.get_kv()
+        mx.eval(keys, values)
+        self.assertEqual(keys.shape, (1, 1, n_tokens, 2))
+        self.assertEqual(values.shape, (1, 1, n_tokens, 2))
+        # Every token (including those written before the grow) is preserved
+        # at its original position.
+        for t in range(n_tokens):
+            self.assertEqual(keys[0, 0, t, 0].item(), float(t))
+            self.assertEqual(values[0, 0, t, 0].item(), float(-t))
 
     def test_attn_config_uses_float_dtype_for_quantized_projection(self):
         runner = object.__new__(MlxModelRunner)
@@ -384,6 +405,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
 
     def test_mlx_scheduler_init_overlap_keeps_future_map_relay(self):
         from sglang.srt.managers import scheduler as scheduler_module
+        from sglang.srt.managers.overlap_utils import RelayPayload
         from sglang.srt.managers.scheduler import Scheduler
         from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -417,7 +439,9 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
 
         self.assertIsNotNone(scheduler.future_map)
         indices = torch.tensor([1], dtype=torch.int64)
-        scheduler.future_map.stash(indices, torch.tensor([7], dtype=torch.int64))
+        scheduler.future_map.stash(
+            indices, RelayPayload(bonus_tokens=torch.tensor([7], dtype=torch.int64))
+        )
         self.assertEqual(int(scheduler.future_map.output_tokens_buf[1].item()), 7)
 
     def test_decode_finalize_does_not_snapshot_auxiliary_state(self):
@@ -984,41 +1008,6 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         self.assertIsNone(req.mamba_last_track_seqlen)
         self.assertEqual(pool.auxiliary_state_pool.available_size(), 2)
 
-    def test_auxiliary_state_component_keeps_new_live_slot_owned_by_radix(self):
-        pool = MlxAuxiliaryStateReqToTokenPool(
-            size=2,
-            max_context_len=8,
-            device="cpu",
-            enable_memory_saver=False,
-            auxiliary_state_size=4,
-        )
-        req = FakeRequest()
-        pool.alloc([req])
-        component = MlxAuxiliaryStateComponent(
-            SimpleNamespace(req_to_token_pool=pool),
-            SimpleNamespace(enable_mamba_extra_buffer=False),
-        )
-        insert_params = InsertParams()
-
-        cache_len = component.prepare_for_caching_req(
-            req=req,
-            insert_params=insert_params,
-            token_ids_len=7,
-            is_finished=True,
-        )
-        component.cleanup_after_caching_req(
-            req=req,
-            is_finished=True,
-            insert_result=InsertResult(prefix_len=0, mamba_exist=False),
-            insert_params=insert_params,
-        )
-
-        self.assertEqual(cache_len, 7)
-        self.assertFalse(getattr(insert_params, "mlx_auxiliary_state_uses_track_slot"))
-        self.assertEqual(insert_params.mamba_value.tolist(), [1])
-        self.assertIsNone(req.mamba_pool_idx)
-        self.assertEqual(pool.auxiliary_state_pool.available_size(), 3)
-
     def test_auxiliary_state_component_frees_stale_track_slot_when_live_slot_inserted(
         self,
     ):
@@ -1121,6 +1110,7 @@ class TestMlxOverlapScheduler(unittest.TestCase):
         self.assertTrue(torch.equal(schedule_batch.input_ids, token_ids))
         self.assertIs(scheduler.processed_batch, batch_copy)
         self.assertIs(scheduler.processed_result, scheduler.tp_worker.result)
+        self.assertEqual(scheduler.forward_ct, 1)
 
     def test_overlap_loop_materializes_prefill_input_ids(self):
         # Regression: the MLX overlap loop must materialize batch.input_ids
@@ -1145,8 +1135,9 @@ class TestMlxOverlapScheduler(unittest.TestCase):
         scheduler.waiting_queue = []
         scheduler.result_queue = deque()
         scheduler.future_map = SimpleNamespace()
-        scheduler.cur_batch = None
+        scheduler.cur_batch_for_debug = None
         scheduler.last_batch = None
+        scheduler.running_batch = None
         scheduler.tp_worker = SimpleNamespace(
             async_forward_batch_generation_mlx=fake_forward
         )
@@ -1159,7 +1150,11 @@ class TestMlxOverlapScheduler(unittest.TestCase):
             spec_algorithm=SpeculativeAlgorithm.NONE,
             device="cpu",
         )
-        scheduler.get_next_batch_to_run = lambda: batch
+        scheduler.get_next_batch_to_run = (
+            lambda running_batch, last_batch: SimpleNamespace(
+                batch_to_run=batch, running_batch=running_batch
+            )
+        )
 
         with self.assertRaises(_StopLoop):
             scheduler.event_loop_overlap_mlx()
@@ -1228,7 +1223,7 @@ class TestMlxOverlapScheduler(unittest.TestCase):
         logits_output = SimpleNamespace(customized_info=None)
         original_release = batch_result_processor_module.release_kv_cache
         original_get_indexer = batch_result_processor_module.get_global_indexer_capturer
-        original_get_server_args = batch_result_processor_module.get_global_server_args
+        original_get_server_args = batch_result_processor_module.get_server_args
 
         def fake_release_kv_cache(release_req, tree_cache, is_insert=False):
             events.append(("release", release_req.rid))
@@ -1236,7 +1231,7 @@ class TestMlxOverlapScheduler(unittest.TestCase):
 
         batch_result_processor_module.release_kv_cache = fake_release_kv_cache
         batch_result_processor_module.get_global_indexer_capturer = lambda: None
-        batch_result_processor_module.get_global_server_args = lambda: SimpleNamespace(
+        batch_result_processor_module.get_server_args = lambda: SimpleNamespace(
             enable_mamba_extra_buffer_lazy=lambda: False
         )
         try:
@@ -1250,9 +1245,7 @@ class TestMlxOverlapScheduler(unittest.TestCase):
             batch_result_processor_module.get_global_indexer_capturer = (
                 original_get_indexer
             )
-            batch_result_processor_module.get_global_server_args = (
-                original_get_server_args
-            )
+            batch_result_processor_module.get_server_args = original_get_server_args
 
         self.assertEqual(
             events,
@@ -1510,6 +1503,13 @@ if _HAS_MLX:
             self.last_batch = None
             self.processed_batch = None
             self.processed_result = None
+            # _finalize_mlx_pending_job now advances forward_ct and runs the
+            # profiler batch predicate (mirroring run_batch); stub both so the
+            # overlap accounting added in #29217 has something to call.
+            self.forward_ct = 0
+            self.profiler_manager = SimpleNamespace(
+                _profile_batch_predicate=lambda batch: None
+            )
 
         def process_batch_result(self, batch, result):
             self.processed_batch = batch

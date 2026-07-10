@@ -10,17 +10,18 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Iterable
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 
-from sglang.srt.configs.laguna import LagunaConfig
+from sglang.srt.configs.laguna import LagunaConfig, normalize_gating
 from sglang.srt.distributed import (
     get_pp_group,
     tensor_model_parallel_all_reduce,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
@@ -52,8 +53,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.utils import apply_qk_norm
-from sglang.srt.runtime_context import get_parallel
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import LazyValue, add_prefix, make_layers
 
 logger = logging.getLogger(__name__)
@@ -68,6 +68,8 @@ class LagunaMLP(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         reduce_results: bool = True,
         prefix: str = "",
+        tp_rank: Optional[int] = None,
+        tp_size: Optional[int] = None,
     ) -> None:
         super().__init__()
         if hidden_act != "silu":
@@ -80,6 +82,8 @@ class LagunaMLP(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("gate_up_proj", prefix),
+            tp_rank=tp_rank,
+            tp_size=tp_size,
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
@@ -88,6 +92,8 @@ class LagunaMLP(nn.Module):
             quant_config=quant_config,
             reduce_results=reduce_results,
             prefix=add_prefix("down_proj", prefix),
+            tp_rank=tp_rank,
+            tp_size=tp_size,
         )
         self.act_fn = SiluAndMul()
 
@@ -154,8 +160,7 @@ class LagunaMoE(nn.Module):
         self.gate = LagunaMoEGate(config, prefix=add_prefix("gate", prefix))
 
         self.experts = get_moe_impl_class(quant_config)(
-            num_experts=config.num_experts
-            + get_global_server_args().ep_num_redundant_experts,
+            num_experts=config.num_experts + get_server_args().ep_num_redundant_experts,
             top_k=config.num_experts_per_tok,
             layer_id=layer_id,
             hidden_size=config.hidden_size,
@@ -177,6 +182,11 @@ class LagunaMoE(nn.Module):
 
         # HF safetensors key is singular `shared_expert.…`; mirror so the
         # default loader picks it up without remapping.
+        # SGLANG_SHARED_EXPERT_TP1 replicates the shared expert instead of
+        # TP-sharding it, for checkpoints whose shared-expert quant scales are
+        # not divisible by the global TP size (e.g. block-FP8 [128,128] with
+        # shared_expert_intermediate_size=512 at TP=8 → 64-per-rank shards).
+        self._shared_expert_tp1 = envs.SGLANG_SHARED_EXPERT_TP1.get()
         self.shared_expert = LagunaMLP(
             hidden_size=config.hidden_size,
             intermediate_size=config.shared_expert_intermediate_size,
@@ -184,6 +194,7 @@ class LagunaMoE(nn.Module):
             quant_config=quant_config,
             reduce_results=False,
             prefix=add_prefix("shared_expert", prefix),
+            **(dict(tp_rank=0, tp_size=1) if self._shared_expert_tp1 else {}),
         )
 
     def get_moe_weights(self):
@@ -212,7 +223,13 @@ class LagunaMoE(nn.Module):
         # so scale routed manually before adding the unscaled shared expert.
         if self.routed_scaling_factor != 1.0:
             routed_out = routed_out * self.routed_scaling_factor
-        final = routed_out + shared_out
+        # A TP1 (replicated) shared expert already holds the full result on
+        # every rank, so it must be added after the all-reduce — adding before
+        # would sum it once per TP rank.
+        if self._shared_expert_tp1:
+            final = routed_out
+        else:
+            final = routed_out + shared_out
 
         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
             is_tp_path=True,
@@ -220,6 +237,8 @@ class LagunaMoE(nn.Module):
             should_allreduce_fusion=should_allreduce_fusion,
         ):
             final = tensor_model_parallel_all_reduce(final)
+        if self._shared_expert_tp1:
+            final = final + shared_out
         return final
 
 
@@ -247,13 +266,9 @@ class LagunaAttention(nn.Module):
         self.hidden_size = hidden_size
         self.head_dim = head_dim
         self.layer_id = layer_id
-        if gating not in (True, False, None, "per-head", "per-element"):
-            raise ValueError(
-                f"Unsupported gating value {gating!r}; expected one of "
-                'True, False, None, "per-head", or "per-element".'
-            )
-        self.gating = bool(gating)
-        self.gate_per_head = gating is True or gating == "per-head"
+        gating = normalize_gating(gating)
+        self.gating = gating != "disabled"
+        self.gate_per_head = gating == "per-head"
 
         attn_tp_rank = get_parallel().attn_tp_rank
         attn_tp_size = get_parallel().attn_tp_size
@@ -553,6 +568,7 @@ class LagunaModel(nn.Module):
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
             self.norm = PPMissingLayer(return_tuple=True)
+        self.layers_to_capture: List[int] = []
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.embed_tokens
@@ -576,7 +592,12 @@ class LagunaModel(nn.Module):
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
 
+        aux_hidden_states = []
         for i in range(self.start_layer, self.end_layer):
+            if i in self.layers_to_capture:
+                aux_hidden_states.append(
+                    hidden_states + residual if residual is not None else hidden_states
+                )
             layer = self.layers[i]
             hidden_states, residual = layer(
                 positions, hidden_states, forward_batch, residual
@@ -588,11 +609,17 @@ class LagunaModel(nn.Module):
             )
 
         if hidden_states.shape[0] != 0:
+            if self.end_layer in self.layers_to_capture:
+                aux_hidden_states.append(
+                    hidden_states + residual if residual is not None else hidden_states
+                )
             if residual is None:
                 hidden_states = self.norm(hidden_states)
             else:
                 hidden_states, _ = self.norm(hidden_states, residual)
-        return hidden_states
+        if len(aux_hidden_states) == 0:
+            return hidden_states
+        return hidden_states, aux_hidden_states
 
 
 class LagunaForCausalLM(nn.Module):
@@ -620,11 +647,12 @@ class LagunaForCausalLM(nn.Module):
                 config.hidden_size,
                 quant_config=quant_config,
                 prefix=add_prefix("lm_head", prefix),
-                use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+                use_attn_tp_group=get_server_args().enable_dp_lm_head,
             )
         else:
             self.lm_head = PPMissingLayer()
         self.logits_processor = LogitsProcessor(config)
+        self.capture_aux_hidden_states = False
 
         # Only walk this rank's local layers — out-of-range entries can be PPMissingLayer.
         self._routed_experts_weights_of_layer = LazyValue(
@@ -663,9 +691,12 @@ class LagunaForCausalLM(nn.Module):
             input_embeds,
             pp_proxy_tensors=pp_proxy_tensors,
         )
+        aux_hidden_states = None
+        if self.capture_aux_hidden_states:
+            hidden_states, aux_hidden_states = hidden_states
         if self.pp_group.is_last_rank:
             return self.logits_processor(
-                input_ids, hidden_states, self.lm_head, forward_batch
+                input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
             )
         return hidden_states
 
@@ -805,6 +836,19 @@ class LagunaForCausalLM(nn.Module):
         self.lm_head.weight = head
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
+
+    def set_dflash_layers_to_capture(self, layer_ids: List[int]):
+        if not self.pp_group.is_last_rank:
+            return
+        if layer_ids is None:
+            raise ValueError(
+                "DFLASH requires explicit layer_ids for aux hidden capture."
+            )
+
+        self.capture_aux_hidden_states = True
+        # SGLang captures "before layer i". To capture the hidden state after
+        # target layer `k` (HF-style), capture before layer `k + 1`.
+        self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
 
 EntryClass = LagunaForCausalLM

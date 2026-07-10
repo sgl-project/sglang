@@ -74,8 +74,8 @@ from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.utils import random_uuid
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.template_manager import TemplateManager
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
+    from sglang.srt.parser.template_manager import TemplateManager
 
 logger = logging.getLogger(__name__)
 
@@ -137,6 +137,10 @@ class OpenAIServingResponses(OpenAIServingChat):
 
         self.background_tasks: dict[str, asyncio.Task] = {}
 
+    @staticmethod
+    def _has_response_tool(request: ResponsesRequest, *tool_types: str) -> bool:
+        return any(tool.type in tool_types for tool in (request.tools or []))
+
     # error helpers dedicated for v1/responses
     def create_error_response(
         self,
@@ -192,6 +196,18 @@ class OpenAIServingResponses(OpenAIServingChat):
             return self.create_error_response(
                 'tool_choice="required" requires at least one tool with '
                 'type="function"; other built-in tool types cannot be forced.'
+            )
+
+        if (
+            self.use_harmony
+            and self._has_response_tool(request, "web_search", "web_search_preview")
+            and not self.supports_browsing
+        ):
+            return self.create_error_response(
+                "web_search requires a browser backend. Set EXA_API_KEY on the "
+                "SGLang server to enable native Exa-backed web search, or "
+                "configure a browser MCP tool server. Create an Exa API key at "
+                "https://dashboard.exa.ai/api-keys."
             )
 
         # Handle the previous response ID
@@ -344,6 +360,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                         sampling_params=sampling_params,
                         stream=request.stream,
                         rid=request.request_id,
+                        session_id=request.session_id,
                         extra_key=self._compute_extra_key(request),
                         background=request.background,
                     )
@@ -655,6 +672,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 stream_reasoning=False,
                 force_reasoning=self._is_thinking_enabled_for_request(request),
                 request=request,
+                tokenizer=self.tokenizer_manager.tokenizer,
             )
             reasoning_content, content = reasoning_parser.parse_non_stream(final_output)
         else:
@@ -697,7 +715,11 @@ class OpenAIServingResponses(OpenAIServingChat):
             and self.tool_call_parser
             and request.tool_choice != "none"
         ):
-            parser = FunctionCallParser(chat_tools, self.tool_call_parser)
+            parser = FunctionCallParser(
+                chat_tools,
+                self.tool_call_parser,
+                tokenizer=self.tokenizer_manager.tokenizer,
+            )
             should_try_native = (
                 not is_required or parser.detector.supports_structural_tag()
             )
@@ -1672,7 +1694,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                     )
 
         async def empty_async_generator():
-            if False:
+            for _ in ():
                 yield
 
         final_response = await self.responses_full_generator(
@@ -1782,14 +1804,22 @@ class OpenAIServingResponses(OpenAIServingChat):
         if chat_tools and request.tool_choice != "none":
             native_supports_structural_tag = False
             if self.tool_call_parser:
-                probe = FunctionCallParser(chat_tools, self.tool_call_parser)
+                probe = FunctionCallParser(
+                    chat_tools,
+                    self.tool_call_parser,
+                    tokenizer=self.tokenizer_manager.tokenizer,
+                )
                 native_supports_structural_tag = (
                     probe.detector.supports_structural_tag()
                 )
             if is_required and not native_supports_structural_tag:
                 tool_parser = JsonArrayParser()
             elif self.tool_call_parser:
-                tool_parser = FunctionCallParser(chat_tools, self.tool_call_parser)
+                tool_parser = FunctionCallParser(
+                    chat_tools,
+                    self.tool_call_parser,
+                    tokenizer=self.tokenizer_manager.tokenizer,
+                )
         reasoning_parser_obj: Optional[ReasoningParser] = None
         if self.reasoning_parser:
             reasoning_parser_obj = ReasoningParser(
@@ -1797,6 +1827,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 stream_reasoning=True,
                 force_reasoning=self._is_thinking_enabled_for_request(request),
                 request=request,
+                tokenizer=self.tokenizer_manager.tokenizer,
             )
 
         current_output_index = -1
@@ -2346,6 +2377,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 sampling_params=sampling_params,
                 stream=adapted_request.stream,
                 rid=request_id,
+                session_id=adapted_request.session_id,
                 extra_key=adapted_request.extra_key,
                 return_logprob=adapted_request.return_logprob,
                 logprob_start_len=adapted_request.logprob_start_len,
