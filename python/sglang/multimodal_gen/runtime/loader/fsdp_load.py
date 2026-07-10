@@ -316,9 +316,6 @@ def maybe_load_fsdp_model(
         # move to device to perform postprocessing
         model.to(weight_postprocess_device)
 
-    local_torch_device = get_local_torch_device()
-    use_device_loading_context = load_cpu_offload and weight_postprocess_device is None
-
     for _, module in model.named_modules():
         quant_method = getattr(module, "quant_method", None)
         if quant_method is not None and hasattr(
@@ -328,13 +325,7 @@ def maybe_load_fsdp_model(
                 # Activate the NZ format for storing weights,
                 # which is a specific optimization for Ascend NPU
                 torch.npu.config.allow_internal_format = True
-            if use_device_loading_context:
-                # Some quant methods need temporary device tensors for post-load
-                # repacking even when the component's runtime residency is CPU.
-                with device_loading_context(module, local_torch_device):
-                    quant_method.process_weights_after_loading(module)
-            else:
-                quant_method.process_weights_after_loading(module)
+            quant_method.process_weights_after_loading(module)
             if _is_npu:
                 torch.npu.empty_cache()
     model.post_load_weights()

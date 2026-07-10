@@ -414,11 +414,10 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
         max_w_scale, quantized_weight = requantize_with_max_scale(
             layer.weight, layer.weight_scale, layer.logical_widths
         )
-        # Rebind to the transposed FP8 view expected by apply_fp8_linear.
-        # Keep the non-contiguous column-major stride; CUTLASS checks it.
-        layer.weight = torch.nn.Parameter(
-            quantized_weight.t().detach(), requires_grad=False
-        )
+        # Preserve the parameter subclass metadata while rebinding to the
+        # transposed FP8 view expected by the runtime.
+        layer.weight.data = quantized_weight.t().detach()
+        layer.weight.requires_grad_(False)
         if self.cutlass_fp8_supported:
             max_w_scale = convert_to_channelwise(max_w_scale, layer.logical_widths)
         copy_or_rebind_param(layer, "weight_scale", max_w_scale)

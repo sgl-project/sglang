@@ -55,7 +55,6 @@ from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
     ModelOptFp8Config,
     _prepare_nvfp4_weight_bytes,
 )
-from sglang.multimodal_gen.runtime.loader.fsdp_load import maybe_load_fsdp_model
 from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
     _filter_duplicate_precision_variant_safetensors,
     _Flux2Nvfp4FallbackAdapter,
@@ -82,35 +81,6 @@ class _FakeQuantConfig:
     @classmethod
     def get_name(cls):
         return "modelopt_fp4"
-
-
-class _CountingTransposeQuantMethod:
-    def __init__(self):
-        self.calls = 0
-
-    def process_weights_after_loading(self, layer):
-        self.calls += 1
-        layer.weight = torch.nn.Parameter(
-            layer.weight.detach().t(), requires_grad=False
-        )
-
-
-class _TinyQuantLayer(torch.nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.weight = torch.nn.Parameter(torch.empty(3, 2))
-        self.quant_method = _CountingTransposeQuantMethod()
-
-
-class _TinyQuantModel(torch.nn.Module):
-    param_names_mapping = {}
-
-    def __init__(self):
-        super().__init__()
-        self.layer = _TinyQuantLayer()
-
-    def post_load_weights(self):
-        pass
 
 
 def _make_quant_config(name: str, **attrs):
@@ -240,30 +210,6 @@ class TestTransformerQuantHelpers(unittest.TestCase):
         self.assertEqual(plan.checkpoint_load_device, device)
         self.assertEqual(plan.weight_postprocess_device, device)
         self.assertTrue(plan.defer_component_cpu_offload)
-
-    def test_maybe_load_fsdp_model_runs_quant_postprocess_once(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            checkpoint_path = os.path.join(tmpdir, "model.safetensors")
-            save_file(
-                {"layer.weight": torch.arange(6, dtype=torch.float32).reshape(3, 2)},
-                checkpoint_path,
-            )
-
-            model = maybe_load_fsdp_model(
-                model_cls=_TinyQuantModel,
-                init_params={},
-                weight_dir_list=[checkpoint_path],
-                device=torch.device("cpu"),
-                hsdp_replicate_dim=1,
-                hsdp_shard_dim=1,
-                param_dtype=torch.float32,
-                reduce_dtype=torch.float32,
-                strict=True,
-            )
-
-        self.assertEqual(model.layer.quant_method.calls, 1)
-        self.assertEqual(tuple(model.layer.weight.shape), (2, 3))
-        self.assertEqual(model.layer.weight.stride(0), 1)
 
     def test_online_fp8_needs_device_weight_postprocess(self):
         self.assertTrue(_needs_device_weight_postprocess(Fp8Config()))
