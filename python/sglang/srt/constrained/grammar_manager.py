@@ -217,6 +217,9 @@ class GrammarManager:
                     if req.grammar.done():
                         ready_req_idxs.add(i)
 
+                if len(ready_req_idxs) == len(self.grammar_queue):
+                    break
+
                 # Sleep a bit to avoid busy waiting
                 time.sleep(self.SGLANG_GRAMMAR_POLL_INTERVAL / 10)
 
