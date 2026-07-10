@@ -947,9 +947,13 @@ PARAMETRIZED_CASE_GROUPS = {
     "2-gpu": [
         ("test_server_2_gpu.py", TWO_GPU_CASES),
     ],
+    "bcg-diffusion": [],
 }
 
 STANDALONE_FILES = {
+    "bcg-diffusion": [
+        "../single_test_file/test_diffusion_bcg_zimage_turbo.py",
+    ],
     "1-gpu": [
         "../single_test_file/test_generate_zimage_turbo_cli.py",
         "../single_test_file/test_update_weights_from_disk.py",
@@ -964,6 +968,9 @@ STANDALONE_FILES = {
 # CI will use a fallback estimate for sharding, run the test, then print a
 # measured value that must be copied into STANDALONE_FILE_EST_TIMES.
 STANDALONE_FILE_EST_TIMES = {
+    "bcg-diffusion": {
+        "../single_test_file/test_diffusion_bcg_zimage_turbo.py": 300.0,
+    },
     "1-gpu": {
         "../single_test_file/test_update_weights_from_disk.py": 1200.0,
     },
@@ -985,7 +992,7 @@ SUITES = {
     },
 }
 
-STRICT_SUITES = {"unit"}
+STRICT_SUITES = {"unit", "bcg-diffusion"}
 COMPONENT_ACCURACY_SUITES = {
     "component-accuracy",
     "component-accuracy-1-gpu",
